@@ -1,0 +1,166 @@
+# Trinity-Mini RL (GRPO), updated env code. 2048 rollouts/step; decensor at 50%.
+# `ratio` is a relative sampling weight: env share = ratio_i / sum(ratios) * batch_size.
+# decensor ratio 4.0 == sum of the four nemotron (1.0 each) -> decensor 1024, each nemotron 256.
+# Launch: uv run rl @ configs/trinity_mini_rl/rl.toml
+
+output_dir = "outputs/trinity_mini_rl"
+clean_output_dir = true
+max_steps = 500
+seq_len = 32768          # prompt + completion budget; matches model max_model_len
+
+[wandb]
+project = "prime-rl"
+name = "trinity-mini-rl-Updated-Env-Code"
+
+[log]
+level = "info"
+
+[model]
+name = "arcee-ai/Trinity-Mini"
+
+# 8x H200: 4 train + 4 infer
+[deployment]
+num_train_gpus = 4
+num_infer_gpus = 4
+
+[ckpt]
+interval = 50
+keep_last = 2
+keep_interval = 100
+
+[orchestrator]
+batch_size = 2048        # rollouts per step
+group_size = 16          # GRPO group -> 128 prompts/step
+oversampling_factor = 1.5  # extra in-flight to backfill failed/truncated rollouts
+
+# Trinity isn't in the renderer map, so DefaultRenderer uses the model chat_template.
+# Tool-call format is Qwen/hermes <tool_call>{...}</tool_call> (registry name "qwen3";
+# vLLM's matching parser is "hermes", set under [inference.model]).
+[orchestrator.renderer]
+name = "default"
+tool_parser = "qwen3"
+
+[orchestrator.train.sampling]
+temperature = 1.0
+max_completion_tokens = 16384   # Trinity is reasoning-verbose; keep high
+
+# decensor env — 1024 rollouts (50%). Multi-turn, simulated user + judge.
+# Takes a raw judge_api_key (not *_var); user_sim defaults to the judge endpoint.
+# Judge knobs and gate toggles surfaced here instead of riding on defaults.
+[[orchestrator.train.env]]
+id = "decensor-env"
+ratio = 4.0
+max_total_completion_tokens = 16384
+timeout = 1800
+args = { judge_model = "google/gemma-4-26B-A4B-it", judge_base_url = "http://198.13.252.41:40002/v1", judge_api_key = "x", judge_temperature = 0.8, judge_min_p = 0.05, judge_timeout = 1200.0, judge_max_retries = 2, judge_retry_backoff = 1.0, max_concurrent_scoring = 32, enable_length_prompts = true, enable_word_count = true, enable_structured_markers = true, enable_markdown_judges = true, enable_reasoning_trace = true, enable_reasoning_coherency = true, enable_meta_commentary = true, reasoning_enabled = true, word_count_tolerance_percent = 0.60, incoherent_penalty_multiplier = 0.1, meta_commentary_multiplier = 0.01 }
+
+# nemotron blend — 256 rollouts each. Shared gemma judge, full guard ON.
+# reasoning_required = true is safe (Trinity always emits a reasoning trace).
+[[orchestrator.train.env]]
+id = "nemotron-knowledge"
+ratio = 1.0
+timeout = 900
+args = { dataset = "all", enable_anti_hacking = true, enable_anti_hacking_judges = true, anti_hacking_reasoning_required = true, anti_hacking_format_reward_weight = 0.0, judge_model = "google/gemma-4-26B-A4B-it", judge_base_url = "http://198.13.252.41:40002/v1", judge_api_key_var = "VLLM_API_KEY" }
+
+# math is graded by math_verify now (not the judge); native python tool OFF to
+# avoid tool_choice=auto aborts on judge nodes without --enable-auto-tool-choice.
+[[orchestrator.train.env]]
+id = "nemotron-reasoning"
+ratio = 1.0
+timeout = 900
+args = { dataset = "all", enable_native_python_tools = false, enable_anti_hacking = true, enable_anti_hacking_judges = true, anti_hacking_reasoning_required = true, anti_hacking_format_reward_weight = 0.0, judge_model = "google/gemma-4-26B-A4B-it", judge_base_url = "http://198.13.252.41:40002/v1", judge_api_key_var = "VLLM_API_KEY" }
+
+[[orchestrator.train.env]]
+id = "nemotron-instruction-following"
+ratio = 1.0
+timeout = 900
+args = { dataset = "all", enable_anti_hacking = true, enable_anti_hacking_judges = true, anti_hacking_reasoning_required = true, anti_hacking_format_reward_weight = 0.0, judge_model = "google/gemma-4-26B-A4B-it", judge_base_url = "http://198.13.252.41:40002/v1", judge_api_key_var = "VLLM_API_KEY" }
+
+# native tool calls work on Trinity (hermes parser); renderer-stripped bare tool
+# calls allowed so reasoning_required doesn't zero them.
+[[orchestrator.train.env]]
+id = "nemotron-tool-calling"
+ratio = 1.0
+timeout = 900
+max_total_completion_tokens = 16384
+args = { dataset = "all", enable_native_tool_calls = true, enable_anti_hacking = true, enable_anti_hacking_judges = true, anti_hacking_reasoning_required = true, anti_hacking_allow_renderer_stripped_tool_calls = true, anti_hacking_format_reward_weight = 0.0, judge_model = "google/gemma-4-26B-A4B-it", judge_base_url = "http://198.13.252.41:40002/v1", judge_api_key_var = "VLLM_API_KEY" }
+
+# eval — small and timed out so it can't hog the pool at step 0
+[orchestrator.eval]
+interval = 50
+
+[orchestrator.eval.sampling]
+temperature = 1.0
+max_completion_tokens = 16384
+
+[[orchestrator.eval.env]]
+id = "nemotron-knowledge"
+num_examples = 16
+group_size = 1
+timeout = 900
+args = { dataset = "all", judge_model = "google/gemma-4-26B-A4B-it", judge_base_url = "http://198.13.252.41:40002/v1", judge_api_key_var = "VLLM_API_KEY" }
+
+[[orchestrator.eval.env]]
+id = "nemotron-tool-calling"
+num_examples = 16
+group_size = 1
+timeout = 900
+args = { dataset = "all", enable_native_tool_calls = true, judge_model = "google/gemma-4-26B-A4B-it", judge_base_url = "http://198.13.252.41:40002/v1", judge_api_key_var = "VLLM_API_KEY" }
+
+# trainer — Trinity afmoe MoE, LoRA
+[trainer]
+dist_timeout_seconds = 1800
+
+[trainer.model]
+impl = "custom"
+attn = "flash_attention_2"
+ep = 4                   # expert parallel across 4 train GPUs (128 experts / 4)
+fsdp_cpu_offload = false
+optim_cpu_offload = true
+cp = 1
+cp_style = "ulysses"
+fused_lm_head_token_chunk_size = 1024
+
+[trainer.model.ac]
+mode = "selective"
+freq = 1
+targets = ["norm", "attn_proj", "linear_attn", "routed_experts"]
+
+# rank 32 -> 128: the max vLLM's fused_moe_lora kernel allows for this MoE
+# (fused_moe_lora_one_shot caps max_lora_rank<=128, hit at 256). Not memory-bound.
+# alpha kept at 2x rank.
+[trainer.model.lora]
+rank = 128
+alpha = 256
+dropout = 0.0
+target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+[trainer.optim]
+type = "muon"            # Trinity-Mini was pretrained with Muon
+lr = 8e-6
+weight_decay = 0.0
+max_norm = 1.0
+
+[trainer.ckpt.weights]
+save_adapter_separately = true
+save_sharded = true
+
+# inference — vLLM, native tools + reasoning parser
+[inference]
+gpu_memory_utilization = 0.90
+enable_lora = true
+enable_prefix_caching = true
+max_loras = 8
+max_cpu_loras = 32
+max_lora_rank = 128      # kernel cap for this MoE (fused_moe_lora_one_shot)
+api_server_count = 1
+enable_expert_parallel = true
+
+[inference.model]
+max_model_len = 32768
+tool_call_parser = "hermes"
+reasoning_parser = "deepseek_r1"
+
+[inference.parallel]
+tp = 1
+dp = 4                   # 4 independent engines across the 4 infer GPUs

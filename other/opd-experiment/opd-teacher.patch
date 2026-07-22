@@ -1,0 +1,588 @@
+diff --git a/src/prime_rl/inference/patches.py b/src/prime_rl/inference/patches.py
+index 24bc6398..96b0a372 100644
+--- a/src/prime_rl/inference/patches.py
++++ b/src/prime_rl/inference/patches.py
+@@ -1,3 +1,5 @@
++import os
++
+ import torch
+ from vllm.triton_utils import tl, triton
+ 
+@@ -22,6 +24,111 @@ def transformers_v5_compat():
+     monkey_patch_vllm_padded_input_scrub()
+     monkey_patch_return_routed_experts_with_nixl_connector()
+     monkey_patch_kv_xfer_finished_tolerate_freed()
++    monkey_patch_cutlass_cute_fmin()
++    monkey_patch_tilelang_after_worker_init()
++
++
++def monkey_patch_cutlass_cute_fmin():
++    """Restore the CuTeDSL floating-point minimum used by DeepSeek-V4."""
++    import cutlass.cute.arch as arch
++    from cutlass import Float32
++
++    if hasattr(arch, "fmin"):
++        return
++
++    def fmin(a, b):
++        return -arch.fmax(-Float32(a), -Float32(b))
++
++    arch.fmin = fmin
++
++
++def monkey_patch_tilelang_nvrtc_cpp20():
++    if os.environ.get("TILELANG_EXECUTION_BACKEND") != "nvrtc":
++        return
++
++    from tilelang.contrib import nvrtc
++
++    original_compile_cuda = nvrtc.compile_cuda
++    if getattr(original_compile_cuda, "_prime_rl_uses_cpp20", False):
++        return
++
++    integral_trait = """
++#ifdef __CUDACC_RTC__
++namespace std {
++template <class T> struct is_integral : false_type {};
++template <> struct is_integral<bool> : true_type {};
++template <> struct is_integral<char> : true_type {};
++template <> struct is_integral<signed char> : true_type {};
++template <> struct is_integral<unsigned char> : true_type {};
++template <> struct is_integral<short> : true_type {};
++template <> struct is_integral<unsigned short> : true_type {};
++template <> struct is_integral<int> : true_type {};
++template <> struct is_integral<unsigned int> : true_type {};
++template <> struct is_integral<long> : true_type {};
++template <> struct is_integral<unsigned long> : true_type {};
++template <> struct is_integral<long long> : true_type {};
++template <> struct is_integral<unsigned long long> : true_type {};
++template <class T> struct is_integral<const T> : is_integral<T> {};
++template <class T> struct is_integral<volatile T> : is_integral<T> {};
++template <class T> struct is_integral<const volatile T> : is_integral<T> {};
++template <class T> inline constexpr bool is_integral_v = is_integral<T>::value;
++}
++#endif
++"""
++
++    def compile_cuda(code, target_format="ptx", arch=None, options=None, verbose=False):
++        if isinstance(options, list):
++            options = ["-std=c++20" if option.startswith("-std=c++") else option for option in options]
++            if not any(option.startswith("-std=c++") for option in options):
++                options.append("-std=c++20")
++        elif isinstance(options, str) and options.startswith("-std=c++"):
++            options = "-std=c++20"
++        elif isinstance(options, str):
++            options = [options, "-std=c++20"]
++        else:
++            options = ["-std=c++20"]
++        return original_compile_cuda(integral_trait + code, target_format, arch, options, verbose)
++
++    compile_cuda._prime_rl_uses_cpp20 = True
++    nvrtc.compile_cuda = compile_cuda
++
++    from tilelang.jit.adapter.nvrtc import libgen
++
++    libgen.compile_cuda = compile_cuda
++
++
++def monkey_patch_cutedsl_fmin():
++    from cutlass import cute
++
++    if hasattr(cute.arch, "fmin"):
++        return
++
++    def fmin(left, right):
++        return -cute.arch.fmax(-left, -right)
++
++    cute.arch.fmin = fmin
++
++
++def monkey_patch_tilelang_after_worker_init():
++    if os.environ.get("TILELANG_EXECUTION_BACKEND") != "nvrtc":
++        return
++
++    from vllm.v1.worker.worker_base import WorkerWrapperBase
++
++    original_init_device = WorkerWrapperBase.init_device
++    if getattr(original_init_device, "_prime_rl_patches_tilelang", False):
++        return
++
++    def init_device(worker):
++        original_init_device(worker)
++        monkey_patch_tilelang_nvrtc_cpp20()
++        monkey_patch_cutedsl_fmin()
++        from vllm.utils.deep_gemm import is_deep_gemm_supported
++
++        is_deep_gemm_supported.cache_clear()
++
++    init_device._prime_rl_patches_tilelang = True
++    WorkerWrapperBase.init_device = init_device
+ 
+ 
+ def monkey_patch_kv_xfer_finished_tolerate_freed():
+diff --git a/src/prime_rl/inference/vllm/server.py b/src/prime_rl/inference/vllm/server.py
+index 47b5b567..e7f84573 100644
+--- a/src/prime_rl/inference/vllm/server.py
++++ b/src/prime_rl/inference/vllm/server.py
+@@ -1,4 +1,6 @@
+ import asyncio
++import os
++import signal
+ from argparse import Namespace
+ from typing import Any
+ 
+@@ -88,6 +90,12 @@ async def resume(request: Request):
+     return {"status": "resumed"}
+ 
+ 
++@router.post("/recycle")
++async def recycle():
++    asyncio.get_running_loop().call_later(0.5, os.kill, os.getpid(), signal.SIGTERM)
++    return {"status": "recycling"}
++
++
+ @router.post("/update_weights")
+ async def update_weights(request: Request):
+     data = await request.json()
+diff --git a/src/prime_rl/inference/vllm/serving_tokens.py b/src/prime_rl/inference/vllm/serving_tokens.py
+index 8b27f205..ffdd7d75 100644
+--- a/src/prime_rl/inference/vllm/serving_tokens.py
++++ b/src/prime_rl/inference/vllm/serving_tokens.py
+@@ -30,11 +30,13 @@ delegates to upstream so we track future vLLM changes for free.
+ 
+ from __future__ import annotations
+ 
++import math
+ from collections.abc import AsyncGenerator, AsyncIterable
+ from functools import cached_property
+ from typing import Any
+ 
+ from fastapi import Request
++from pydantic import Field
+ from vllm.entrypoints.openai.engine.protocol import (
+     ErrorResponse,
+     PromptTokenUsageInfo,
+@@ -52,6 +54,7 @@ from vllm.outputs import RequestOutput
+ from vllm.sampling_params import RequestOutputKind, SamplingParams
+ 
+ from prime_rl.inference.vllm.routed_experts import RoutedExpertsCapture
++from prime_rl.utils.logger import get_logger
+ 
+ 
+ class PrimeRlGenerateResponseChoice(GenerateResponseChoice):
+@@ -60,6 +63,7 @@ class PrimeRlGenerateResponseChoice(GenerateResponseChoice):
+ 
+ class PrimeRlGenerateResponse(GenerateResponse):
+     choices: list[PrimeRlGenerateResponseChoice]
++    non_finite_prompt_logprob_indices: list[int] = Field(default_factory=list)
+     # Upstream ``GenerateResponse`` doesn't declare a ``usage`` field, so the
+     # parent ``ServingTokens.serve_tokens_full_generator`` constructs it and
+     # Pydantic silently drops it on serialization. Declare it here so the
+@@ -68,6 +72,28 @@ class PrimeRlGenerateResponse(GenerateResponse):
+     usage: UsageInfo | None = None
+ 
+ 
++def _sanitize_prompt_logprobs(response: PrimeRlGenerateResponse) -> None:
++    invalid_indices: list[int] = []
++    for index, entry in enumerate(response.prompt_logprobs or []):
++        if not entry:
++            continue
++        invalid = False
++        for logprob in entry.values():
++            if math.isfinite(logprob.logprob):
++                continue
++            logprob.logprob = 0.0
++            invalid = True
++        if invalid:
++            invalid_indices.append(index)
++
++    response.non_finite_prompt_logprob_indices = invalid_indices
++    if invalid_indices:
++        get_logger().warning(
++            f"Sanitized non-finite teacher prompt logprobs at {len(invalid_indices)}/"
++            f"{len(response.prompt_logprobs or [])} token positions"
++        )
++
++
+ class _GenerateRoutedExpertsCapture(RoutedExpertsCapture):
+     def post_process(self, response: GenerateResponse) -> PrimeRlGenerateResponse:
+         choices = [
+@@ -356,4 +382,6 @@ class PrimeRlServingTokens(ServingTokens):
+         if final_capture.final_res is not None:
+             response.usage = _build_usage(final_capture.final_res)
+ 
++        _sanitize_prompt_logprobs(response)
++
+         return response
+diff --git a/tests/unit/inference/test_serving_tokens.py b/tests/unit/inference/test_serving_tokens.py
+index 2929ff20..9ca16e3d 100644
+--- a/tests/unit/inference/test_serving_tokens.py
++++ b/tests/unit/inference/test_serving_tokens.py
+@@ -16,6 +16,7 @@ import numpy as np
+ import pybase64
+ from vllm.entrypoints.openai.engine.protocol import UsageInfo
+ from vllm.entrypoints.serve.disagg.protocol import GenerateResponse, GenerateResponseChoice
++from vllm.logprobs import Logprob
+ 
+ from prime_rl.inference.vllm.routed_experts import serialize_routed_experts
+ from prime_rl.inference.vllm.serving_tokens import (
+@@ -26,6 +27,7 @@ from prime_rl.inference.vllm.serving_tokens import (
+     _client_set_max_tokens,
+     _FinalOutputCapture,
+     _GenerateRoutedExpertsCapture,
++    _sanitize_prompt_logprobs,
+ )
+ 
+ 
+@@ -149,6 +151,27 @@ def test_prime_rl_generate_response_serializes_usage_block():
+     }
+ 
+ 
++def test_sanitize_prompt_logprobs_records_and_replaces_non_finite_positions():
++    response = PrimeRlGenerateResponse(
++        request_id="req-non-finite",
++        choices=[],
++        prompt_logprobs=[
++            None,
++            {1: Logprob(logprob=-0.5)},
++            {2: Logprob(logprob=float("nan")), 3: Logprob(logprob=float("inf"))},
++        ],
++    )
++
++    _sanitize_prompt_logprobs(response)
++
++    assert response.non_finite_prompt_logprob_indices == [2]
++    assert response.prompt_logprobs is not None
++    assert response.prompt_logprobs[1][1].logprob == -0.5
++    assert response.prompt_logprobs[2][2].logprob == 0.0
++    assert response.prompt_logprobs[2][3].logprob == 0.0
++    response.model_dump_json()
++
++
+ def test_build_usage_sums_prompt_and_completion_tokens():
+     final_res = _FakeRequestOutput(
+         prompt_token_ids=[1, 2, 3, 4, 5],
+diff --git a/tests/unit/orchestrator/test_teacher_logprobs.py b/tests/unit/orchestrator/test_teacher_logprobs.py
+index d63fdce7..f53b6e25 100644
+--- a/tests/unit/orchestrator/test_teacher_logprobs.py
++++ b/tests/unit/orchestrator/test_teacher_logprobs.py
+@@ -30,6 +30,80 @@ class _FakeOpenAIClient:
+         )
+ 
+ 
++class _PieceTokenizer:
++    def __init__(self, pieces: dict[int, str], encoding: list[tuple[str, int]]):
++        self.pieces = pieces
++        self.encoding = encoding
++        self.all_special_ids: list[int] = []
++
++    def get_vocab(self) -> dict[str, int]:
++        return {piece: token_id for token_id, piece in self.pieces.items()}
++
++    def decode(self, token_ids, **_kwargs) -> str:
++        return "".join(self.pieces[token_id] for token_id in token_ids)
++
++    def __call__(self, text, *, add_special_tokens, return_offsets_mapping):
++        assert not add_special_tokens
++        assert return_offsets_mapping
++        input_ids = []
++        offsets = []
++        cursor = 0
++        for piece, token_id in self.encoding:
++            assert text.startswith(piece, cursor)
++            input_ids.append(token_id)
++            offsets.append((cursor, cursor + len(piece)))
++            cursor += len(piece)
++        assert cursor == len(text)
++        return {"input_ids": input_ids, "offset_mapping": offsets}
++
++
++class _SequenceTokenizer:
++    def __init__(self, decoded: dict[tuple[int, ...], str]):
++        self.decoded = decoded
++
++    def decode(self, token_ids, **_kwargs) -> str:
++        return self.decoded[tuple(token_ids)]
++
++
++def test_dual_pointer_chunk_alignment_finds_minimal_chunks():
++    student = _PieceTokenizer({1: "a", 2: "bc", 3: "d"}, [])
++    teacher = _PieceTokenizer({10: "ab", 11: "c", 12: "d"}, [])
++
++    chunks = orchestrator_utils.dual_pointer_chunk_alignment([1, 2, 3], [10, 11, 12], student, teacher)
++
++    assert chunks == [(0, 2, 0, 2), (2, 3, 2, 3)]
++
++
++def test_dual_pointer_chunk_alignment_does_not_sync_replacement_fragments():
++    student = _SequenceTokenizer({(1,): "\ufffd", (1, 2): "é"})
++    teacher = _SequenceTokenizer({(10,): "\ufffd", (10, 11): "é"})
++
++    chunks = orchestrator_utils.dual_pointer_chunk_alignment([1, 2], [10, 11], student, teacher)
++
++    assert chunks == [(0, 2, 0, 2)]
++
++
++def test_project_teacher_chunk_logprobs_preserves_budget_and_semantic_prior():
++    projected = orchestrator_utils.project_teacher_chunk_logprobs(
++        student_logprobs=[-1.0, -3.0],
++        teacher_logprobs=[-0.5, -1.5],
++        chunks=[(0, 2, 0, 2)],
++    )
++
++    assert projected == [-0.5, -1.5]
++    assert sum(projected) == -2.0
++
++
++def test_project_teacher_chunk_logprobs_splits_zero_student_budget_evenly():
++    projected = orchestrator_utils.project_teacher_chunk_logprobs(
++        student_logprobs=[0.0, 0.0],
++        teacher_logprobs=[-1.0],
++        chunks=[(0, 2, 0, 1)],
++    )
++
++    assert projected == [-0.5, -0.5]
++
++
+ def test_compute_teacher_logprobs_uses_inference_generate(monkeypatch):
+     async def _run():
+         fake_client = _FakeOpenAIClient(
+@@ -37,7 +111,11 @@ def test_compute_teacher_logprobs_uses_inference_generate(monkeypatch):
+                 "request_id": "gen-test",
+                 "choices": [],
+                 # Upstream wire shape: list[dict[token_id, Logprob] | None]
+-                "prompt_logprobs": [None, {"11": {"logprob": -0.7}}, {"12": {"logprob": -0.3}}],
++                "prompt_logprobs": [
++                    None,
++                    {"999": {"logprob": -0.01}, "2": {"logprob": -0.7}},
++                    {"998": {"logprob": -0.02}, "3": {"logprob": -0.3}},
++                ],
+                 "kv_transfer_params": None,
+             }
+         )
+@@ -59,7 +137,8 @@ def test_compute_teacher_logprobs_uses_inference_generate(monkeypatch):
+             samples=[sample],
+         )
+ 
+-        assert result == [[0.0, -0.7, -0.3]]
++        assert result.values == [[0.0, -0.7, -0.3]]
++        assert result.batch_neutralized is False
+         assert fake_client.calls == [
+             {
+                 "url": "http://fake-host:8000/inference/v1/generate",
+@@ -78,3 +157,133 @@ def test_compute_teacher_logprobs_uses_inference_generate(monkeypatch):
+         ]
+ 
+     asyncio.run(_run())
++
++
++def test_compute_teacher_logprobs_projects_cross_tokenizer_chunks(monkeypatch):
++    async def _run():
++        fake_client = _FakeOpenAIClient(
++            {
++                "request_id": "gen-cross-tokenizer",
++                "choices": [],
++                "prompt_logprobs": [
++                    None,
++                    {11: {"logprob": -0.5}},
++                    {12: {"logprob": -1.5}},
++                ],
++                "kv_transfer_params": None,
++            }
++        )
++        monkeypatch.setattr(orchestrator_utils, "setup_openai_client", lambda _: fake_client)
++        student_tokenizer = _PieceTokenizer({1: "P", 2: "a", 3: "bc"}, [])
++        teacher_tokenizer = _PieceTokenizer(
++            {10: "P", 11: "ab", 12: "c"},
++            [("P", 10), ("ab", 11), ("c", 12)],
++        )
++        sample = TrainingSample(
++            prompt_ids=[1],
++            prompt_mask=[False],
++            completion_ids=[2, 3],
++            completion_mask=[True, True],
++            completion_logprobs=[-1.0, -3.0],
++            completion_temperatures=[1.0, 1.0],
++            env_name="test-env",
++        )
++
++        result = await orchestrator_utils.compute_teacher_logprobs(
++            clients=[vf.ClientConfig()],
++            model_name="teacher-model",
++            samples=[sample],
++            student_tokenizer=student_tokenizer,
++            teacher_tokenizer=teacher_tokenizer,
++        )
++
++        assert result.values == [[0.0, -0.5, -1.5]]
++        assert result.batch_neutralized is False
++        assert fake_client.calls[0]["body"]["token_ids"] == [10, 11, 12]
++
++    asyncio.run(_run())
++
++
++def test_align_teacher_logprobs_distills_visible_content_and_anchors_reasoning_close():
++    student_tokenizer = _PieceTokenizer(
++        {1: "P", 2: "reason", 3: "</think>", 4: "answer", 5: "<eos>"},
++        [],
++    )
++    student_tokenizer.all_special_ids = [5]
++    teacher_tokenizer = _PieceTokenizer(
++        {10: "P", 11: "reason", 12: "</think>", 13: "answer", 14: "<eos>"},
++        [("P", 10), ("reason", 11), ("</think>", 12), ("answer", 13), ("<eos>", 14)],
++    )
++    sample = TrainingSample(
++        prompt_ids=[1],
++        prompt_mask=[False],
++        completion_ids=[2, 3, 4, 5],
++        completion_mask=[True, True, True, True],
++        completion_logprobs=[-1.0, -0.01, -2.0, -0.02],
++        completion_temperatures=[1.0, 1.0, 1.0, 1.0],
++        env_name="test-env",
++    )
++
++    projected = orchestrator_utils.align_and_project_teacher_logprobs(
++        sample=sample,
++        teacher_ids=[10, 11, 12, 13, 14],
++        teacher_offsets=[(0, 1), (1, 7), (7, 15), (15, 21), (21, 26)],
++        teacher_logprobs=[0.0, -0.5, -7.0, -0.25, -9.0],
++        student_tokenizer=student_tokenizer,
++        teacher_tokenizer=teacher_tokenizer,
++        reasoning_close_advantage=1.0,
++    )
++
++    assert projected == [0.0, -1.0, 3.99, -0.25, -0.02]
++
++
++def test_compute_teacher_logprobs_neutralizes_batch_after_severe_non_finite_response(monkeypatch):
++    async def _run():
++        fake_client = _FakeOpenAIClient(
++            {
++                "request_id": "gen-non-finite",
++                "choices": [],
++                "prompt_logprobs": [
++                    None,
++                    {"2": {"logprob": -0.2}},
++                    {"3": {"logprob": 0.0}},
++                    {"4": {"logprob": -0.7}},
++                ],
++                "non_finite_prompt_logprob_indices": [2],
++                "kv_transfer_params": None,
++            }
++        )
++        monkeypatch.setattr(orchestrator_utils, "setup_openai_client", lambda _: fake_client)
++        sample = TrainingSample(
++            prompt_ids=[1, 2],
++            prompt_mask=[False, False],
++            completion_ids=[3, 4],
++            completion_mask=[True, True],
++            completion_logprobs=[-0.4, -1.2],
++            completion_temperatures=[1.0, 1.0],
++            env_name="test-env",
++        )
++
++        result = await orchestrator_utils.compute_teacher_logprobs(
++            clients=[vf.ClientConfig()],
++            model_name="teacher-model",
++            samples=[sample],
++        )
++
++        assert result.values == [[0.0, 0.0, -0.4, -1.2]]
++        assert result.batch_neutralized is True
++        assert result.severe_sample_count == 1
++        assert result.max_non_finite_fraction == 0.25
++
++    asyncio.run(_run())
++
++
++def test_project_teacher_chunk_logprobs_neutralizes_invalid_chunk():
++    projected = orchestrator_utils.project_teacher_chunk_logprobs(
++        student_logprobs=[-1.0, -3.0, -2.0],
++        teacher_logprobs=[-0.5, 0.0, -0.7],
++        chunks=[(0, 2, 0, 2), (2, 3, 2, 3)],
++        invalid_teacher_indices={1},
++    )
++
++    assert projected == [-1.0, -3.0, -0.7]
+diff --git a/tests/unit/train/rl/test_loss.py b/tests/unit/train/rl/test_loss.py
+index 1585dac7..55f9674c 100644
+--- a/tests/unit/train/rl/test_loss.py
++++ b/tests/unit/train/rl/test_loss.py
+@@ -1,8 +1,8 @@
+ import pytest
+ import torch
+ 
+-from prime_rl.configs.trainer import CustomLossConfig, DefaultLossConfig
+-from prime_rl.trainer.rl.loss import LossInputs, LossOutputs, compute_entropy, compute_loss, setup_loss_fns
++from prime_rl.configs.trainer import CustomLossConfig, DefaultLossConfig, OPDLossConfig
++from prime_rl.trainer.rl.loss import LossInputs, LossOutputs, compute_entropy, compute_loss, opd_loss_fn, setup_loss_fns
+ 
+ pytestmark = [pytest.mark.gpu]
+ 
+@@ -121,6 +121,66 @@ def test_sft_loss_override_uses_masked_nll_with_default_loss_config():
+     assert "mismatch_kl" not in metrics
+ 
+ 
++def test_opd_advantage_combines_reward_and_reward_gated_teacher_signal():
++    result = opd_loss_fn(
++        LossInputs(
++            trainer_logprobs=torch.tensor([-0.2], dtype=torch.float32).cuda(),
++            inference_logprobs=torch.tensor([-1.0], dtype=torch.float32).cuda(),
++            teacher_logprobs=torch.tensor([-0.5], dtype=torch.float32).cuda(),
++            advantages=-torch.ones(1, dtype=torch.float32).cuda(),
++            loss_mask=torch.ones(1, dtype=torch.bool).cuda(),
++            rewards=torch.zeros(1, dtype=torch.float32).cuda(),
++        ),
++        OPDLossConfig(reward_tau=0.25, reward_gate_teacher=True),
++    )
++
++    assert torch.isclose(result.metrics["teacher_kl"], torch.tensor(0.5, device=result.loss.device))
++    assert torch.isclose(result.metrics["teacher_gate"], torch.tensor(0.0, device=result.loss.device))
++    assert torch.isclose(result.metrics["reward_advantage"], torch.tensor(-1.0, device=result.loss.device))
++    assert torch.isclose(result.metrics["combined_advantage"], torch.tensor(-0.25, device=result.loss.device))
++    assert torch.isclose(result.metrics["is_masked_low"], torch.tensor(0.0, device=result.loss.device))
++
++    loss_fns = setup_loss_fns(DefaultLossConfig(), OPDLossConfig(reward_gate_teacher=True))
++    loss, metrics = compute_loss(
++        trainer_logprobs=[torch.tensor([-0.2], dtype=torch.float32).cuda()],
++        inference_logprobs=[torch.tensor([-1.0], dtype=torch.float32).cuda()],
++        teacher_logprobs=[torch.tensor([-0.5], dtype=torch.float32).cuda()],
++        advantages=[-torch.ones(1, dtype=torch.float32).cuda()],
++        loss_mask=[torch.ones(1, dtype=torch.bool).cuda()],
++        rewards=[torch.zeros(1, dtype=torch.float32).cuda()],
++        loss_fns=loss_fns,
++        loss_scale=1,
++        training_mode="opd",
++    )
++    assert loss.is_cuda
++    assert torch.isclose(metrics["teacher_gate"], torch.tensor([0.0], device=loss.device)).all()
++
++
++def test_echo_loss_adds_environment_cross_entropy():
++    trainer_logprobs = [torch.tensor([-0.1, -0.5], dtype=torch.float32).cuda()]
++    inference_logprobs = [torch.tensor([-0.1, 0.0], dtype=torch.float32).cuda()]
++    advantages = [torch.zeros(2, dtype=torch.float32).cuda()]
++    loss_mask = [torch.tensor([True, True], dtype=torch.bool).cuda()]
++    environment_mask = [torch.tensor([False, True], dtype=torch.bool).cuda()]
++
++    loss_fns = setup_loss_fns(DefaultLossConfig(echo_alpha=0.2))
++    loss, metrics = compute_loss(
++        trainer_logprobs=trainer_logprobs,
++        inference_logprobs=inference_logprobs,
++        teacher_logprobs=None,
++        advantages=advantages,
++        loss_mask=loss_mask,
++        loss_fns=loss_fns,
++        loss_scale=1,
++        training_mode="echo",
++        environment_mask=environment_mask,
++    )
++
++    assert torch.isclose(loss, torch.tensor(0.1, device=loss.device), atol=1e-6)
++    assert torch.isclose(metrics["echo_nll"], torch.tensor([0.5], device=loss.device), atol=1e-6).all()
++    assert torch.isclose(metrics["echo_token_fraction"], torch.tensor([0.5], device=loss.device)).all()
++
++
+ def _dummy_custom_loss(inputs: LossInputs, multiplier: float = 1.0) -> LossOutputs:
+     """A simple custom loss for testing."""
+     loss = (inputs.trainer_logprobs[inputs.loss_mask].sum() * multiplier).abs()

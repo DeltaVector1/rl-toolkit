@@ -1,0 +1,2919 @@
+diff --git a/packages/prime-rl-configs/src/prime_rl/configs/orchestrator.py b/packages/prime-rl-configs/src/prime_rl/configs/orchestrator.py
+index 65363862..7b2513f2 100644
+--- a/packages/prime-rl-configs/src/prime_rl/configs/orchestrator.py
++++ b/packages/prime-rl-configs/src/prime_rl/configs/orchestrator.py
+@@ -71,6 +71,15 @@ class TrainSamplingConfig(BaseConfig):
+ 
+         return args
+ 
++    @model_validator(mode="after")
++    def validate_extra_body(self):
++        if "max_prompt_len" in self.extra_body:
++            raise ValueError(
++                "sampling.extra_body.max_prompt_len is not an OpenAI/vLLM request field; "
++                "use sampling.extra_body.truncate_prompt_tokens"
++            )
++        return self
++
+     @model_validator(mode="before")
+     @classmethod
+     def _deprecate_max_tokens(cls, data: Any) -> Any:
+@@ -130,6 +139,15 @@ class EvalSamplingConfig(BaseConfig):
+ 
+         return args
+ 
++    @model_validator(mode="after")
++    def validate_extra_body(self):
++        if "max_prompt_len" in self.extra_body:
++            raise ValueError(
++                "sampling.extra_body.max_prompt_len is not an OpenAI/vLLM request field; "
++                "use sampling.extra_body.truncate_prompt_tokens"
++            )
++        return self
++
+     @model_validator(mode="before")
+     @classmethod
+     def _deprecate_max_tokens(cls, data: Any) -> Any:
+@@ -191,7 +209,7 @@ class EnvConfig(BaseConfig):
+     """Extra kwargs passed to the env (e.g. ``seq_len``, ``max_total_completion_tokens``). Auto-populated by the orchestrator; user overrides are generally discouraged. The main use case is matching ``extra_env_kwargs`` when running an env in an isolated environment server."""
+ 
+     address: str | None = None
+-    """ZMQ address of an external env server (e.g. ``tcp://host:5000``). When set, the orchestrator connects to this server instead of spawning one; when None, a subprocess env server is spawned automatically."""
++    """ZMQ address of an RL environment server (e.g. ``tcp://host:5000``). When set, the orchestrator connects to this server instead of spawning one; when None, a subprocess env server is spawned automatically."""
+ 
+     num_workers: int | Literal["auto"] = "auto"
+     """Worker processes for the spawned env server. ``auto`` scales to 1 worker per 256 concurrent rollouts. Ignored when ``address`` is set."""
+@@ -253,6 +271,10 @@ class TrainEnvConfig(EnvConfig):
+     ``orchestrator.advantage`` when unset; set a different ``default``/``custom``
+     config to give this env its own advantage computation."""
+ 
++    echo: bool = False
++    """Use ECHO for this environment: keep GRPO on assistant tokens and add
++    supervised prediction loss on observations appended between turns."""
++
+ 
+ class EvalEnvConfig(EnvConfig):
+     sampling: EvalSamplingConfig = EvalSamplingConfig()
+@@ -426,6 +448,9 @@ class GibberishFilterConfig(BaseConfig):
+     logprob_offset: float = 2.0
+     """Offset from uniform-distribution logprob. Threshold = ``-log(vocab_size) - logprob_offset``."""
+ 
++    min_run: int = 5
++    """Require this many flagged tokens in a row (within one turn) before detecting. A single rare high-entropy token is normal in code/command output; genuine degeneration emits a sustained run. ``1`` restores the old single-token behavior."""
++
+ 
+ # Flags rollouts stuck in a repetition loop: emits high-confidence tokens for an extended stretch.
+ # Flagged when `window` consecutive tokens are each sampled with probability above `prob_threshold`.
+@@ -494,11 +519,20 @@ class RolloutModelConfig(BaseConfig):
+ 
+     client: ClientConfig = ClientConfig()
+ 
++    recycle_after_logprobs: bool = False
++    """Restart this server after each OPD teacher-logprob batch. The server must run under a restart loop."""
++
+ 
+ class OrchestratorConfig(BaseConfig):
+     training_mode: Literal["rl", "opd", "sft"] = "rl"
+     """Training mode. ``rl``: student generates rollouts, no teacher. ``opd``: student generates rollouts, teacher computes logprobs (teacher_tau > 0). ``sft``: teacher generates rollouts, student inference pool used for evals and weight sync."""
+ 
++    opd_reasoning_close_advantage: float | None = Field(None, ge=0)
++    """Optional sequence-normalized OPD advantage for a trainable ``</think>`` token. None uses a zero-logprob teacher target."""
++
++    preserve_reasoning_only_responses: bool = False
++    """Keep reasoning-only native generations as scored token-bearing rollouts instead of replacing them with synthetic non-trainable guards."""
++
+     student: RolloutModelConfig = Field(RolloutModelConfig(), validation_alias=AliasChoices("student", "model"))
+     """Student rollout participant (model + client) — the model being trained."""
+ 
+@@ -765,6 +799,8 @@ class OrchestratorConfig(BaseConfig):
+             raise ValueError("orchestrator.teacher must not be set when training_mode = 'rl'.")
+         if self.training_mode == "opd" and not has_teacher:
+             raise ValueError("orchestrator.teacher must be configured when training_mode = 'opd'.")
++        if self.training_mode != "rl" and any(env.echo for env in self.train.env):
++            raise ValueError("train.env.echo is only supported when orchestrator.training_mode = 'rl'.")
+         return self
+ 
+     @model_validator(mode="after")
+diff --git a/packages/prime-rl-configs/src/prime_rl/configs/shared.py b/packages/prime-rl-configs/src/prime_rl/configs/shared.py
+index ff311f14..81c51aee 100644
+--- a/packages/prime-rl-configs/src/prime_rl/configs/shared.py
++++ b/packages/prime-rl-configs/src/prime_rl/configs/shared.py
+@@ -106,6 +106,9 @@ class ClientConfig(BaseConfig):
+     connect_timeout: float = 30.0
+     """TCP connect timeout in seconds for inference API requests."""
+ 
++    preserve_reasoning_only_responses: bool = False
++    """Forward token-bearing reasoning-only generations to the environment for scoring."""
++
+     wait_for_ready_timeout: int = 1800
+     """Seconds to wait at startup for the inference pool to become ready. Applies to both the static health check and elastic DNS-based discovery."""
+ 
+diff --git a/packages/prime-rl-configs/src/prime_rl/configs/trainer.py b/packages/prime-rl-configs/src/prime_rl/configs/trainer.py
+index f1522d4e..ec353033 100644
+--- a/packages/prime-rl-configs/src/prime_rl/configs/trainer.py
++++ b/packages/prime-rl-configs/src/prime_rl/configs/trainer.py
+@@ -424,6 +424,9 @@ class DefaultLossConfig(BaseConfig):
+     kl_tau: float = Field(1e-3, ge=0)
+     """Temperature for the KL term."""
+ 
++    echo_alpha: float = Field(0.1, ge=0)
++    """Cross-entropy weight for environment-observation tokens in ECHO batches."""
++
+ 
+ class IPOLossConfig(BaseConfig):
+     type: Literal["ipo"] = "ipo"
+@@ -436,6 +439,9 @@ class IPOLossConfig(BaseConfig):
+     kl_tau: float = Field(1e-3, ge=0)
+     """Temperature for the KL term."""
+ 
++    echo_alpha: float = Field(0.1, ge=0)
++    """Cross-entropy weight for environment-observation tokens in ECHO batches."""
++
+ 
+ class CustomLossConfig(BaseConfig):
+     type: Literal["custom"] = "custom"
+@@ -446,10 +452,33 @@ class CustomLossConfig(BaseConfig):
+     kwargs: dict[str, Any] = Field(default_factory=dict)
+     """Kwargs forwarded to the loss function."""
+ 
++    echo_alpha: float = Field(0.1, ge=0)
++    """Cross-entropy weight for environment-observation tokens in ECHO batches."""
++
+ 
+ LossConfig: TypeAlias = Annotated[DefaultLossConfig | IPOLossConfig | CustomLossConfig, Field(discriminator="type")]
+ 
+ 
++class OPDLossConfig(BaseConfig):
++    teacher_tau: float = Field(1.0, ge=0)
++    """Weight for the per-token teacher log-probability advantage."""
++
++    reward_tau: float = Field(0.0, ge=0)
++    """Weight for the rollout's group-relative reward advantage."""
++
++    reward_gate_teacher: bool = False
++    """Apply teacher KL only to trajectories with positive environment reward."""
++
++    dppo_mask_low: float = Field(0.2, ge=0)
++    """Lower DPPO masking threshold."""
++
++    dppo_mask_high: float = Field(0.2, ge=0)
++    """Upper DPPO masking threshold."""
++
++    kl_tau: float = Field(1e-3, ge=0)
++    """Weight for the trainer-to-inference policy KL penalty."""
++
++
+ class FakeDataLoaderConfig(BaseConfig):
+     batch_size: int = Field(2, ge=1)
+     """Batch size of the fake data loader."""
+@@ -510,7 +539,10 @@ class TrainerConfig(BaseConfig):
+     data: DataLoaderConfig = DataLoaderConfig()
+ 
+     loss: LossConfig = DefaultLossConfig()
+-    """Loss config for rl-mode batches. opd and sft batches dispatch to their own loss fns unconditionally and do not read this."""
++    """Loss config for rl-mode batches. SFT batches dispatch to masked NLL unconditionally."""
++
++    opd_loss: OPDLossConfig = OPDLossConfig()
++    """Loss weights and trust-region thresholds for OPD batches."""
+ 
+     optim: OptimizerConfig = AdamWConfig()
+ 
+diff --git a/src/prime_rl/orchestrator/dispatcher.py b/src/prime_rl/orchestrator/dispatcher.py
+index 8842807a..925c9d58 100644
+--- a/src/prime_rl/orchestrator/dispatcher.py
++++ b/src/prime_rl/orchestrator/dispatcher.py
+@@ -12,10 +12,11 @@
+   source's emptiness), so in-flight rollouts of the opposite kind drain
+   naturally on either side of an eval boundary.
+ - ``on_version_pending`` (called by the watcher before the engines pause for
+-  the weight update) bumps ``off_policy_steps`` on in-flight train rollouts and
+-  drops groups past ``max_off_policy_steps``.
+-  Eval rollouts are measurements for the policy version they started with,
+-  so they are allowed to finish even if training advances.
++  the weight update) bumps ``off_policy_steps`` on in-flight train rollouts,
++  drops groups past ``max_off_policy_steps``, and defers a newer weight swap
++  until every request from an older eval epoch has finished.
++  Eval epochs wait for their labeled policy version to load and remain on that
++  exact policy for the whole epoch.
+   Cancellations surface as synthetic ``Cancelled`` markers so the sink's
+   count-to-``group_size`` finalization still fires.
+ """
+@@ -173,6 +174,10 @@ class RolloutDispatcher:
+         self.dispatch_allowed = asyncio.Event()
+         self.dispatch_allowed.set()
+ 
++        # WeightWatcher waits on this when an eval for policy N is still
++        # generating and checkpoint N+1 becomes available.
++        self.eval_work_changed = asyncio.Event()
++
+         self.stopped = asyncio.Event()
+         self.task: asyncio.Task | None = None
+ 
+@@ -293,14 +298,42 @@ class RolloutDispatcher:
+                 "Consider increasing it to avoid this."
+             )
+ 
++        await self.wait_for_eval_before_policy_update(step)
++
++    def has_eval_before(self, policy_version: int) -> bool:
++        """Whether generation from an older fixed-eval epoch is unfinished."""
++        source_pending = self.eval_source is not None and self.eval_source.has_pending_before(policy_version)
++        group_pending = any(
++            group.kind == "eval" and group.eval_step is not None and group.eval_step < policy_version
++            for group in self.groups.values()
++        )
++        inflight_pending = any(
++            meta.kind == "eval" and meta.eval_step is not None and meta.eval_step < policy_version
++            for meta in self.inflight.values()
++        )
++        return source_pending or group_pending or inflight_pending
++
++    async def wait_for_eval_before_policy_update(self, policy_version: int) -> None:
++        """Keep the live student weights fixed while an older eval generates."""
++        if not self.has_eval_before(policy_version):
++            return
++
++        get_logger().info(f"Deferring policy v{policy_version} weight update until the active fixed eval finishes")
++        while self.has_eval_before(policy_version):
++            self.eval_work_changed.clear()
++            if not self.has_eval_before(policy_version):
++                break
++            await self.eval_work_changed.wait()
++        get_logger().info(f"Fixed eval generation drained; policy v{policy_version} update may proceed")
++
+     async def on_new_version(self, step: int) -> None:
+         """No-op: the dispatcher drains in ``on_version_pending`` (pre-pause)."""
+ 
+     async def fill_inflight(self) -> None:
+         """Schedule new rollouts up to ``max_inflight``, honoring
+         ``self.mode``. Eval scheduling ignores the orchestrator's dispatch
+-        gate (evals are version-pinned measurements); only train scheduling
+-        respects it. When ``PREFER_EVAL``'s source exhausts we flip back to
++        gate but waits until the epoch's target policy is loaded; only train
++        scheduling respects the gate. When ``PREFER_EVAL``'s source exhausts we flip back to
+         ``PREFER_TRAIN`` so the eval tail drains alongside fresh train."""
+         while True:
+             if self.available_permits <= 0:
+@@ -367,11 +400,13 @@ class RolloutDispatcher:
+         a ``GroupState``. Returns ``None`` if the source is empty or the
+         picked env's permit cost doesn't fit."""
+         if kind == "train":
+-            source = self.train_source
++            example = self.train_source.next_example(self.available_permits)
+         else:
+             assert self.eval_source is not None
+-            source = self.eval_source
+-        example = source.next_example(self.available_permits)
++            example = self.eval_source.next_example(
++                self.available_permits,
++                policy_version=self.policy.version,
++            )
+         if example is None:
+             return None
+ 
+@@ -523,6 +558,8 @@ class RolloutDispatcher:
+                         f"{r['error'].get('error_chain_repr', err_type)}"
+                     )
+             await self.emit_rollout(meta, group, r)
++        if meta.kind == "eval":
++            self.eval_work_changed.set()
+ 
+     async def emit_rollout(self, meta: InflightRollout, group: GroupState | None, raw: vf.RolloutOutput) -> None:
+         """Build a ``TrainRollout`` / ``EvalRollout`` and put it on ``out_q``.
+@@ -664,6 +701,7 @@ class RolloutDispatcher:
+         self.groups.clear()
+         if tasks:
+             await safe_cancel_all(tasks)
++        self.eval_work_changed.set()
+ 
+     async def cancel_inflight_train_rollouts(self) -> int:
+         """Cancel in-flight train rollouts, leaving eval alone. Used by the
+diff --git a/src/prime_rl/orchestrator/env_server/env_server.py b/src/prime_rl/orchestrator/env_server/env_server.py
+index 8ff057b9..83e88bdd 100644
+--- a/src/prime_rl/orchestrator/env_server/env_server.py
++++ b/src/prime_rl/orchestrator/env_server/env_server.py
+@@ -1,4 +1,5 @@
+ import asyncio
++import os
+ 
+ from verifiers.serve import ZMQEnvServer
+ 
+@@ -30,6 +31,7 @@ def run_server(config: EnvServerConfig):
+         log_dir=log_dir,
+         json_logging=config.log.json_logging,
+         num_workers=config.env.num_workers,
++        worker_heartbeat_timeout=float(os.environ.get("PRIME_ENV_WORKER_HEARTBEAT_TIMEOUT", "300")),
+         **{"address": config.env.address} if config.env.address is not None else {},
+     )
+     asyncio.run(server.run())
+diff --git a/src/prime_rl/orchestrator/envs.py b/src/prime_rl/orchestrator/envs.py
+index 0bf8dc91..7c282345 100644
+--- a/src/prime_rl/orchestrator/envs.py
++++ b/src/prime_rl/orchestrator/envs.py
+@@ -2,6 +2,7 @@ from __future__ import annotations
+ 
+ import atexit
+ import multiprocessing as mp
++import os
+ from collections.abc import Iterator, Sequence
+ from multiprocessing.process import BaseProcess
+ from pathlib import Path
+@@ -15,7 +16,19 @@ from prime_rl.configs.orchestrator import EnvConfig, EvalEnvConfig, TrainEnvConf
+ from prime_rl.orchestrator.advantage import AdvantageFn, setup_advantage_fn
+ from prime_rl.utils.logger import get_logger
+ 
+-REQUIRED_STATE_COLUMNS = ["trajectory"]
++REQUIRED_STATE_COLUMNS = [
++    "trajectory",
++    "reward_breakdown",
++    "anti_hacking_breakdown",
++    "judge_logs",
++    "judge_response",
++    "judge_result",
++    "judge_score",
++    "math_verify_score",
++    "raw_completion",
++    "python_tool_history",
++    "executed_python_tool_calls",
++]
+ 
+ 
+ class Env:
+@@ -75,8 +88,11 @@ class Env:
+             f"num_workers must be resolved before spawn, got {self.config.num_workers!r}"
+         )
+         num_workers = self.config.num_workers
++        worker_heartbeat_timeout = float(os.environ.get("PRIME_ENV_WORKER_HEARTBEAT_TIMEOUT", "300"))
+         address = f"tcp://127.0.0.1:{get_free_port()}"
+-        get_logger().debug(f"Spawning env server {self.name} ({address=}, {num_workers=})")
++        get_logger().debug(
++            f"Spawning env server {self.name} ({address=}, {num_workers=}, {worker_heartbeat_timeout=})"
++        )
+         process = mp.get_context("spawn").Process(
+             target=ZMQEnvServer.run_server,
+             args=(
+@@ -91,6 +107,7 @@ class Env:
+                 json_logging=json_logging,
+                 console_logging=False,
+                 num_workers=num_workers,
++                worker_heartbeat_timeout=worker_heartbeat_timeout,
+             ),
+             daemon=False,
+         )
+diff --git a/src/prime_rl/orchestrator/eval_sink.py b/src/prime_rl/orchestrator/eval_sink.py
+index 2c218416..6ce15146 100644
+--- a/src/prime_rl/orchestrator/eval_sink.py
++++ b/src/prime_rl/orchestrator/eval_sink.py
+@@ -18,6 +18,7 @@ from collections import defaultdict
+ 
+ from prime_rl.orchestrator.envs import EvalEnvs
+ from prime_rl.orchestrator.eval_utils import compute_pass_at_k
++from prime_rl.orchestrator.token_usage import normalize_token_usage, rollout_final_output_tokens
+ from prime_rl.orchestrator.types import EvalBatch, EvalBatchMetrics, EvalRollout
+ from prime_rl.utils.logger import get_logger
+ 
+@@ -87,6 +88,7 @@ class EvalSink:
+         method exists to keep the three-level structure uniform with
+         ``TrainSink``.
+         """
++        normalize_token_usage(rollout.raw)
+         return None
+ 
+     # ── level 2: per-group (move into batch bucket) ───────────────────────
+@@ -128,11 +130,18 @@ class EvalSink:
+             n_cancelled=n_cancelled,
+             n_errored=n_errored,
+         )
++        metrics.group_size = self.group_size_for(env_name)
++
++        non_cancelled = [r for r in rollouts if (r.error or {}).get("error") != "Cancelled"]
++        if non_cancelled:
++            metrics.n_examples_including_errors = len({r.example_id for r in non_cancelled})
++            metrics.reward_mean_including_errors = float(
++                sum(r.reward if r.error is None else 0.0 for r in non_cancelled) / len(non_cancelled)
++            )
+ 
+         if valid:
+             rewards = [r.reward for r in valid]
+-            lens = [r.raw["token_usage"]["final_output_tokens"] for r in valid]
+-            metrics.group_size = self.group_size_for(env_name)
++            lens = [rollout_final_output_tokens(r.raw) for r in valid]
+             metrics.reward_mean = float(sum(rewards) / len(rewards))
+             metrics.completion_len_mean = float(sum(lens) / len(lens))
+             metrics.completion_len_max = float(max(lens))
+diff --git a/src/prime_rl/orchestrator/eval_source.py b/src/prime_rl/orchestrator/eval_source.py
+index 65744fc7..754da405 100644
+--- a/src/prime_rl/orchestrator/eval_source.py
++++ b/src/prime_rl/orchestrator/eval_source.py
+@@ -68,12 +68,14 @@ class EvalSource:
+                 self.queue.append(row)
+         return fired
+ 
+-    def next_example(self, available_permits: int) -> dict | None:
+-        """Pop the next eval example if the head's permit cost fits in
+-        ``available_permits``; otherwise leave it for a later call."""
++    def next_example(self, available_permits: int, *, policy_version: int) -> dict | None:
++        """Pop the next eval example when its target policy is loaded and
++        the head's permit cost fits in ``available_permits``."""
+         if not self.queue:
+             return None
+         head = self.queue[0]
++        if int(head["eval_step"]) > policy_version:
++            return None
+         env = self.eval_envs.get(head["env_name"])
+         cost = env.config.group_size if env.requires_group_scoring else 1
+         if cost > available_permits:
+@@ -85,3 +87,7 @@ class EvalSource:
+ 
+     def __len__(self) -> int:
+         return len(self.queue)
++
++    def has_pending_before(self, policy_version: int) -> bool:
++        """Whether an older eval epoch is still waiting to be dispatched."""
++        return any(int(example["eval_step"]) < policy_version for example in self.queue)
+diff --git a/src/prime_rl/orchestrator/filters.py b/src/prime_rl/orchestrator/filters.py
+index f8deda12..044394c3 100644
+--- a/src/prime_rl/orchestrator/filters.py
++++ b/src/prime_rl/orchestrator/filters.py
+@@ -34,12 +34,18 @@ class RolloutFilter(Protocol):
+ 
+ @dataclass
+ class GibberishFilter:
+-    """Flags rollouts containing rare tokens generated at high entropy.
++    """Flags rollouts with a sustained run of rare tokens generated at high entropy.
+ 
+     A token is flagged when both:
+       - id(token) > token_id_threshold  (rare BPE token)
+       - logprob(token) < -log(vocab_size) - logprob_offset  (high entropy)
+ 
++    Detection requires ``min_run`` such tokens in a row (within one turn). Genuine
++    degeneration emits a long run of near-random rare tokens; an isolated rare
++    token is normal in code / command / technical output (high-id BPE pieces the
++    model emits with lower confidence), so gating on a single token misfires on
++    coherent non-prose. Empirically all single-token hits here are those misfires.
++
+     References:
+       Section 5.2, https://arxiv.org/abs/2510.02387
+     """
+@@ -48,6 +54,7 @@ class GibberishFilter:
+     token_id_threshold: int
+     logprob_threshold: float
+     enforce: bool = False
++    min_run: int = 1
+ 
+     def check(self, rollout: "TrainRollout") -> FilterResult:
+         global_idx = 0
+@@ -55,9 +62,14 @@ class GibberishFilter:
+             tokens = step["tokens"]
+             if tokens is None:
+                 continue
++            run = 0
+             for token_id, logprob in zip(tokens["completion_ids"], tokens["completion_logprobs"]):
+                 if token_id > self.token_id_threshold and logprob < self.logprob_threshold:
+-                    return FilterResult(detected=True, detection_index=global_idx)
++                    run += 1
++                    if run >= self.min_run:
++                        return FilterResult(detected=True, detection_index=global_idx - run + 1)
++                else:
++                    run = 0
+                 global_idx += 1
+         return FilterResult(detected=False)
+ 
+@@ -119,6 +131,7 @@ def setup_filter(config: FilterConfig, vocab_size: int) -> RolloutFilter:
+             token_id_threshold=config.token_id_threshold,
+             logprob_threshold=-math.log(vocab_size) - config.logprob_offset,
+             enforce=config.enforce,
++            min_run=config.min_run,
+         )
+     elif config.type == "repetition":
+         return RepetitionFilter(
+diff --git a/src/prime_rl/orchestrator/metrics.py b/src/prime_rl/orchestrator/metrics.py
+index d32dbc02..c3894241 100644
+--- a/src/prime_rl/orchestrator/metrics.py
++++ b/src/prime_rl/orchestrator/metrics.py
+@@ -13,6 +13,7 @@ import pandas as pd
+ 
+ from prime_rl.configs.orchestrator import OrchestratorConfig
+ from prime_rl.orchestrator.token_export_metrics import collect_next_token_export_metrics
++from prime_rl.orchestrator.token_usage import rollout_token_count
+ from prime_rl.orchestrator.types import Progress, TrainBatchMetrics, TrainRollout
+ 
+ 
+@@ -41,9 +42,7 @@ class MetricsBuilder:
+         existing dashboards / alerts keep working."""
+         num_rollouts = len(rollouts)
+         num_unique_examples = len({r.group_id for r in rollouts})
+-        num_tokens = sum(
+-            r.raw["token_usage"]["final_input_tokens"] + r.raw["token_usage"]["final_output_tokens"] for r in rollouts
+-        )
++        num_tokens = sum(rollout_token_count(r.raw) for r in rollouts)
+ 
+         results_df = pd.DataFrame(
+             {
+@@ -54,10 +53,7 @@ class MetricsBuilder:
+                 "is_truncated": [r.is_truncated for r in rollouts],
+                 "is_filtered": [r.is_filtered for r in rollouts],
+                 "stop_condition": [r.raw.get("stop_condition") for r in rollouts],
+-                "seq_len": [
+-                    r.raw["token_usage"]["final_input_tokens"] + r.raw["token_usage"]["final_output_tokens"]
+-                    for r in rollouts
+-                ],
++                "seq_len": [rollout_token_count(r.raw) for r in rollouts],
+                 "prefill_len": metrics.rollout_prefill_lens,
+                 "decode_len": metrics.rollout_decode_lens,
+                 "samples_per_rollout": metrics.samples_per_rollout,
+@@ -80,8 +76,22 @@ class MetricsBuilder:
+             solve_all = (reward_per_problem == expected).mean()
+             return solve_none, solve_all, 1 - solve_none - solve_all
+ 
++        def compute_soft_solve_rates(df):
++            grouped = df.groupby("group_id")
++            reward_per_problem = grouped.reward.sum()
++            expected = grouped.env_name.first().map(env_group_size).astype(float)
++            reward_fraction = (reward_per_problem / expected).clip(lower=0.0, upper=1.0)
++            return {
++                "soft_solve": reward_fraction.mean(),
++                "solve_nonzero": (reward_per_problem > 0).mean(),
++                "solve_ge_0_25": (reward_fraction >= 0.25).mean(),
++                "solve_ge_0_50": (reward_fraction >= 0.50).mean(),
++                "solve_ge_0_75": (reward_fraction >= 0.75).mean(),
++            }
++
+         by_example = results_df.groupby("group_id")
+         solve_none, solve_all, effective_batch_size = compute_solve_rates(results_df)
++        soft_solve_rates = compute_soft_solve_rates(results_df)
+ 
+         to_log: dict[str, Any] = {
+             "progress/tokens": num_tokens,
+@@ -130,6 +140,7 @@ class MetricsBuilder:
+             "solve_none/all": solve_none,
+             "solve_all/all": solve_all,
+             "effective_batch_size/all": effective_batch_size,
++            **{f"{key}/all": value for key, value in soft_solve_rates.items()},
+             **{f"batch/{env}": r for env, r in results_df.env_name.value_counts(normalize=True).items()},
+             "time/step": step_time,
+             "time/teacher_logprobs": teacher_logprobs_time,
+@@ -151,35 +162,39 @@ class MetricsBuilder:
+         for env, env_df in results_df.groupby("env_name"):
+             env_by_example = env_df.groupby("group_id")
+             for col in per_env_columns:
+-                to_log[f"{col}/{env}/mean"] = env_by_example[col].mean().mean()
+-                to_log[f"{col}/{env}/max"] = env_by_example[col].mean().max()
++                to_log[self.env_metric_key(env, col, "mean")] = env_by_example[col].mean().mean()
++                to_log[self.env_metric_key(env, col, "max")] = env_by_example[col].mean().max()
+                 if col != "is_truncated":
+-                    to_log[f"{col}/{env}/min"] = env_by_example[col].mean().min()
++                    to_log[self.env_metric_key(env, col, "min")] = env_by_example[col].mean().min()
+             env_timing_df = timing_df.loc[env_df.index]
+             for key in timing_df.columns:
+                 per_example = env_timing_df.groupby(env_df["group_id"])[key].mean()
+-                to_log[f"timing/{env}/{key}/mean"] = per_example.mean()
+-                to_log[f"timing/{env}/{key}/max"] = per_example.max()
+-                to_log[f"timing/{env}/{key}/min"] = per_example.min()
+-            to_log[f"reward/{env}/mean"] = env_by_example.reward.mean().mean()
+-            to_log[f"reward/{env}/max"] = env_by_example.reward.mean().max()
+-            to_log[f"reward/{env}/min"] = env_by_example.reward.mean().min()
++                to_log[self.env_metric_key(env, "timing", key, "mean")] = per_example.mean()
++                to_log[self.env_metric_key(env, "timing", key, "max")] = per_example.max()
++                to_log[self.env_metric_key(env, "timing", key, "min")] = per_example.min()
++            to_log[self.env_metric_key(env, "reward", "mean")] = env_by_example.reward.mean().mean()
++            to_log[self.env_metric_key(env, "reward", "max")] = env_by_example.reward.mean().max()
++            to_log[self.env_metric_key(env, "reward", "min")] = env_by_example.reward.mean().min()
+             sn, sa, eb = compute_solve_rates(env_df)
+-            to_log[f"solve_none/{env}"] = sn
+-            to_log[f"solve_all/{env}"] = sa
+-            to_log[f"effective_batch_size/{env}"] = eb
+-            to_log[f"stop_condition/{env}/generation_truncated"] = (
++            to_log[self.env_metric_key(env, "solve_none")] = sn
++            to_log[self.env_metric_key(env, "solve_all")] = sa
++            to_log[self.env_metric_key(env, "effective_batch_size")] = eb
++            for key, value in compute_soft_solve_rates(env_df).items():
++                to_log[self.env_metric_key(env, key)] = value
++            to_log[self.env_metric_key(env, "stop_condition", "generation_truncated")] = (
+                 env_df.is_truncated & (env_df.stop_condition != "prompt_too_long")
+             ).mean()
+             for sc, rate in env_df.stop_condition.dropna().value_counts(normalize=True).items():
+-                to_log[f"stop_condition/{env}/{sc}"] = rate
++                to_log[self.env_metric_key(env, "stop_condition", sc)] = rate
+             env_metrics_df = metrics_df.loc[env_df.index] if not metrics_df.empty else metrics_df
+             for metric in metrics_df.columns:
+-                to_log[f"metrics/{env}/{metric}"] = env_metrics_df.groupby(env_df["group_id"])[metric].mean().mean()
+-            to_log[f"filters/{env}/is_filtered"] = env_df.is_filtered.astype(float).mean()
++                to_log[self.env_metric_key(env, "metrics", metric, "mean")] = (
++                    env_metrics_df.groupby(env_df["group_id"])[metric].mean().mean()
++                )
++            to_log[self.env_metric_key(env, "filters", "is_filtered")] = env_df.is_filtered.astype(float).mean()
+             env_filter_df = filter_df.loc[env_df.index] if not filter_df.empty else filter_df
+             for name in filter_df.columns:
+-                to_log[f"filters/{env}/{name}"] = env_filter_df[name].astype(float).mean()
++                to_log[self.env_metric_key(env, "filters", name)] = env_filter_df[name].astype(float).mean()
+ 
+         # Dispatcher / watcher gauges live on the ``_timestamp`` axis via
+         # the periodic logger — keep this dict step-axis only
+@@ -211,6 +226,11 @@ class MetricsBuilder:
+             self._last_token_export_step_logged = token_export["trainer/step"]
+         return token_export
+ 
++    @staticmethod
++    def env_metric_key(env_name: str, *parts: object) -> str:
++        """W&B key for concrete per-env metrics: env first, then metric path."""
++        return "/".join([env_name, *(str(part) for part in parts)])
++
+     @staticmethod
+     def timing_df(rollouts: list[TrainRollout]) -> pd.DataFrame:
+         return pd.DataFrame(
+diff --git a/src/prime_rl/orchestrator/orchestrator.py b/src/prime_rl/orchestrator/orchestrator.py
+index b1c30902..6be1901b 100644
+--- a/src/prime_rl/orchestrator/orchestrator.py
++++ b/src/prime_rl/orchestrator/orchestrator.py
+@@ -24,13 +24,15 @@ import asyncio
+ import logging
+ import os
+ import time
+-from typing import TYPE_CHECKING
++from collections import defaultdict
++from datetime import datetime, timezone
++from typing import TYPE_CHECKING, Any
+ 
+ import tomli_w
+ 
+ if TYPE_CHECKING:
+     from renderers.base import Renderer
+-    from transformers.tokenization_utils import PreTrainedTokenizer
++    from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+ 
+     from prime_rl.orchestrator.ckpt import CheckpointManager
+     from prime_rl.transport.base import TrainingBatchSender
+@@ -53,6 +55,7 @@ from prime_rl.orchestrator.patches import (
+     monkey_patch_oai_iterable_types,
+ )
+ from prime_rl.orchestrator.periodic_logger import PeriodicLogger
++from prime_rl.orchestrator.token_usage import rollout_token_count
+ from prime_rl.orchestrator.train_sink import TrainSink
+ from prime_rl.orchestrator.train_source import TrainSource
+ from prime_rl.orchestrator.types import (
+@@ -65,6 +68,7 @@ from prime_rl.orchestrator.types import (
+     TrainRollout,
+ )
+ from prime_rl.orchestrator.utils import (
++    append_jsonl_records,
+     compute_teacher_logprobs,
+     get_weight_dir,
+     intercept_vf_logging,
+@@ -145,6 +149,7 @@ class Orchestrator:
+     renderer: Renderer | None
+     mm_token_type_ids_mapping: dict[int, int] | None
+     teacher_inference: InferencePool | None
++    teacher_tokenizer: PreTrainedTokenizerBase | None
+     heart: Heartbeat | None
+     usage_reporter: UsageReporter | None
+     inference_metrics: InferenceMetricsCollector | None
+@@ -158,6 +163,8 @@ class Orchestrator:
+     def __init__(self, config: OrchestratorConfig) -> None:
+         self.config = config
+         setup_logger(config.log.level, json_logging=config.log.json_logging)
++        if config.preserve_reasoning_only_responses:
++            get_logger().info("Preserving reasoning-only generations as scored token-bearing rollouts")
+         # Silence in-process ``verifiers.*`` library noise but keep
+         # ``verifiers.serve`` (env-server lifecycle) through our handler
+         logging.getLogger("verifiers").setLevel(logging.CRITICAL + 1)
+@@ -187,6 +194,7 @@ class Orchestrator:
+         self.renderer = None
+         self.mm_token_type_ids_mapping = None
+         self.teacher_inference = None
++        self.teacher_tokenizer = None
+         self.heart = None
+         self.usage_reporter = None
+         self.inference_metrics = None
+@@ -219,6 +227,15 @@ class Orchestrator:
+ 
+         get_logger().info(f"Initializing tokenizer ({config.tokenizer})")
+         self.tokenizer = setup_tokenizer(config.tokenizer)
++        if config.training_mode == "opd":
++            assert config.teacher is not None
++            from transformers import PreTrainedTokenizerFast
++
++            self.teacher_tokenizer = PreTrainedTokenizerFast.from_pretrained(
++                config.teacher.model.name,
++                trust_remote_code=config.teacher.model.trust_remote_code,
++            )
++            self.teacher_tokenizer.pad_token_id = self.teacher_tokenizer.eos_token_id
+ 
+         # Student inference pool
+         get_logger().info(
+@@ -591,22 +608,28 @@ class Orchestrator:
+         # Materialize at the I/O boundary so prime-rl metadata travels with
+         # the raw vf payload on disk + in wandb sample tables
+         rollout_dicts = [r.to_dict() for r in batch.rollouts]
++        audit_rollouts = batch.audit_rollouts or batch.rollouts
++        audit_rollout_dicts = [r.to_dict() for r in audit_rollouts]
+         step_path = get_step_path(get_rollout_dir(config.output_dir), step)
+-        await asyncio.to_thread(
+-            save_rollouts, rollout_dicts, step_path / "train_rollouts.jsonl", exclude_keys={"trajectory"}
+-        )
++        await asyncio.to_thread(save_rollouts, rollout_dicts, step_path / "train_rollouts.jsonl")
+ 
+         teacher_logprobs_time = 0.0  # opd only
++        teacher_logprobs_metrics: dict[str, float] = {}
+         if config.training_mode == "opd" and self.teacher_inference is not None:
+             assert config.teacher is not None
+             t = time.perf_counter()
+-            teacher_logprobs_list = await compute_teacher_logprobs(
++            teacher_logprobs_batch = await compute_teacher_logprobs(
+                 clients=self.teacher_inference.train_clients,
+                 model_name=config.teacher.model.name,
+                 samples=batch.samples,
++                student_tokenizer=self.tokenizer,
++                teacher_tokenizer=self.teacher_tokenizer,
++                recycle_server=config.teacher.recycle_after_logprobs,
++                reasoning_close_advantage=config.opd_reasoning_close_advantage,
+             )
+-            for ex, lp in zip(batch.samples, teacher_logprobs_list):
++            for ex, lp in zip(batch.samples, teacher_logprobs_batch.values):
+                 ex.teacher_logprobs = lp
++            teacher_logprobs_metrics = teacher_logprobs_batch.metrics()
+             teacher_logprobs_time = time.perf_counter() - t
+ 
+         await self.sender.send(TrainingBatch(examples=batch.samples, step=step))
+@@ -625,6 +648,18 @@ class Orchestrator:
+             pre_filter_dropped=self.train_sink.pre_filter_dropped,
+             pre_filter_dropped_by_name=dict(self.train_sink.pre_filter_dropped_by_name),
+         )
++        metrics.update(teacher_logprobs_metrics)
++        audit_records = self.build_train_audit_records(
++            batch=batch,
++            audit_rollouts=audit_rollouts,
++            audit_rollout_dicts=audit_rollout_dicts,
++            step=step,
++            step_time=step_time,
++            save_ckpt_time=save_ckpt_time,
++            teacher_logprobs_time=teacher_logprobs_time,
++            logged_metrics=metrics,
++        )
++        await asyncio.to_thread(append_jsonl_records, audit_records, self.rollout_audit_path())
+         self.monitor.log(metrics, step=step)
+         self.monitor.log_samples(rollout_dicts, step=step)
+         self.monitor.log_distributions(
+@@ -648,10 +683,7 @@ class Orchestrator:
+ 
+         num_rollouts = len(batch.rollouts)
+         num_unique_examples = len({r.group_id for r in batch.rollouts})
+-        num_tokens = sum(
+-            r.raw["token_usage"]["final_input_tokens"] + r.raw["token_usage"]["final_output_tokens"]
+-            for r in batch.rollouts
+-        )
++        num_tokens = sum(rollout_token_count(r.raw) for r in batch.rollouts)
+         self.progress.total_tokens += num_tokens
+         self.progress.total_samples += num_rollouts
+         self.progress.total_problems += num_unique_examples
+@@ -662,6 +694,266 @@ class Orchestrator:
+         self.progress.step += 1
+         self.maybe_trigger_eval(self.progress.step)
+ 
++    def rollout_audit_path(self):
++        return get_rollout_dir(self.config.output_dir) / "rollouts.jsonl"
++
++    @staticmethod
++    def audit_timestamp() -> str:
++        return datetime.now(timezone.utc).isoformat()
++
++    @staticmethod
++    def error_label(error: object) -> str | None:
++        if error is None:
++            return None
++        if isinstance(error, dict):
++            for key in ("error_type", "exception_type", "type", "class", "message"):
++                value = error.get(key)
++                if value:
++                    return str(value)
++            chain = error.get("error_chain_repr")
++            if chain:
++                return str(chain)
++        return type(error).__name__
++
++    @staticmethod
++    def rollout_judge_logs(rollout: dict[str, Any]) -> list[Any]:
++        logs = rollout.get("judge_logs")
++        if isinstance(logs, list):
++            return logs
++        judge_response = rollout.get("judge_response")
++        if isinstance(judge_response, dict):
++            return [
++                {
++                    "kind": "judge_response",
++                    "prompt": prompt,
++                    "response": response,
++                }
++                for prompt, response in judge_response.items()
++            ]
++        reward_breakdown = rollout.get("reward_breakdown")
++        if isinstance(reward_breakdown, dict):
++            decensor = reward_breakdown.get("decensor")
++            if isinstance(decensor, dict) and isinstance(decensor.get("judge_logs"), list):
++                return decensor["judge_logs"]
++        return []
++
++    @staticmethod
++    def rollout_reward_calculation(rollout: dict[str, Any]) -> dict[str, Any]:
++        reward_breakdown = rollout.get("reward_breakdown")
++        anti_hacking = rollout.get("anti_hacking_breakdown")
++        formulas: list[str] = []
++        components: dict[str, Any] = {}
++        if isinstance(anti_hacking, dict):
++            components["anti_hacking"] = anti_hacking
++            formula = anti_hacking.get("final_reward_formula")
++            if formula:
++                formulas.append(str(formula))
++        if isinstance(reward_breakdown, dict):
++            components["reward_breakdown"] = reward_breakdown
++            for value in reward_breakdown.values():
++                if isinstance(value, dict) and value.get("final_reward_formula"):
++                    formulas.append(str(value["final_reward_formula"]))
++        out: dict[str, Any] = {
++            "reward": rollout.get("reward"),
++            "advantage": rollout.get("advantage"),
++            "metrics": rollout.get("metrics") or {},
++            "judge_result": rollout.get("judge_result"),
++            "judge_score": rollout.get("judge_score"),
++            "math_verify_score": rollout.get("math_verify_score"),
++            "final_reward_formulas": formulas,
++            "components": components,
++        }
++        return out
++
++    def train_drop_reason(
++        self,
++        rollout: TrainRollout,
++        *,
++        in_train_batch: bool,
++        group_rollouts: list[TrainRollout],
++    ) -> str | None:
++        if rollout.error is not None:
++            return "rollout_error"
++        if rollout.raw.get("skip_training"):
++            return "env_non_trainable"
++        if in_train_batch and rollout.is_filtered:
++            return "post_batch_filter"
++        if in_train_batch:
++            return None
++        group_scored_partial = self.train_envs.get(rollout.env_name).requires_group_scoring and any(
++            peer.error is not None for peer in group_rollouts
++        )
++        if group_scored_partial:
++            return "group_scored_partial_error"
++        if rollout.is_filtered:
++            return "pre_batch_filter"
++        return "not_in_trainer_batch"
++
++    def build_train_audit_records(
++        self,
++        *,
++        batch: TrainBatch,
++        audit_rollouts: list[TrainRollout],
++        audit_rollout_dicts: list[dict[str, Any]],
++        step: int,
++        step_time: float,
++        save_ckpt_time: float,
++        teacher_logprobs_time: float,
++        logged_metrics: dict[str, Any],
++    ) -> list[dict[str, Any]]:
++        created_at = self.audit_timestamp()
++        batch_ids = {str(r.rollout_id) for r in batch.rollouts}
++        trainable_ids = {str(r.rollout_id) for r in batch.rollouts if r.error is None and not r.is_filtered}
++        rollout_by_id = {str(r.rollout_id): data for r, data in zip(audit_rollouts, audit_rollout_dicts)}
++
++        group_rollouts: dict[str, list[TrainRollout]] = defaultdict(list)
++        for rollout in audit_rollouts:
++            group_rollouts[str(rollout.group_id)].append(rollout)
++
++        entries: list[tuple[TrainRollout, dict[str, Any], dict[str, Any]]] = []
++        drop_counts: dict[str, int] = defaultdict(int)
++        for rollout in audit_rollouts:
++            rollout_id = str(rollout.rollout_id)
++            in_train_batch = rollout_id in batch_ids
++            drop_reason = self.train_drop_reason(
++                rollout,
++                in_train_batch=in_train_batch,
++                group_rollouts=group_rollouts[str(rollout.group_id)],
++            )
++            if drop_reason:
++                drop_counts[drop_reason] += 1
++            labels = {
++                "env_name": rollout.env_name,
++                "example_id": rollout.example_id,
++                "group_id": str(rollout.group_id),
++                "rollout_id": rollout_id,
++                "policy_version": rollout.policy_version,
++                "off_policy_steps": rollout.off_policy_steps,
++                "in_train_batch": in_train_batch,
++                "is_trainable": rollout_id in trainable_ids,
++                "is_filtered": rollout.is_filtered,
++                "filters": dict(rollout.filter_results),
++                "drop_reason": drop_reason,
++                "error_type": self.error_label(rollout.error),
++                "is_truncated": rollout.is_truncated,
++                "stop_condition": rollout.raw.get("stop_condition"),
++            }
++            entries.append((rollout, rollout_by_id.get(rollout_id, rollout.to_dict()), labels))
++
++        batch_reward_sum = sum(r.reward for r in batch.rollouts)
++        batch_count = len(batch.rollouts)
++        batch_reward_mean = batch_reward_sum / batch_count if batch_count else 0.0
++
++        batch_groups: dict[str, list[TrainRollout]] = defaultdict(list)
++        for rollout in batch.rollouts:
++            batch_groups[str(rollout.group_id)].append(rollout)
++        group_summaries: list[dict[str, Any]] = []
++        for group_id, rollouts in sorted(batch_groups.items()):
++            rewards = [r.reward for r in rollouts]
++            reward_sum = sum(rewards)
++            group_summaries.append(
++                {
++                    "group_id": group_id,
++                    "env_name": rollouts[0].env_name if rollouts else None,
++                    "example_id": rollouts[0].example_id if rollouts else None,
++                    "rollout_count": len(rollouts),
++                    "reward_sum": reward_sum,
++                    "reward_mean": reward_sum / len(rollouts) if rollouts else 0.0,
++                    "rewards": rewards,
++                    "trainable_count": sum(1 for r in rollouts if not r.is_filtered and r.error is None),
++                    "filtered_count": sum(1 for r in rollouts if r.is_filtered),
++                }
++            )
++        wandb_group_mean = (
++            sum(group["reward_mean"] for group in group_summaries) / len(group_summaries) if group_summaries else 0.0
++        )
++
++        env_names = sorted(set(batch.metrics.arrivals_by_env) | {r.env_name for r in audit_rollouts})
++        by_env: dict[str, Any] = {}
++        for env_name in env_names:
++            env_entries = [(r, labels) for r, _data, labels in entries if r.env_name == env_name]
++            env_batch = [r for r in batch.rollouts if r.env_name == env_name]
++            reward_values = [r.reward for r in env_batch]
++            by_env[env_name] = {
++                "arrivals": batch.metrics.arrivals_by_env.get(env_name, 0),
++                "errors": batch.metrics.errors_by_env.get(env_name, 0),
++                "audited_rollouts": len(env_entries),
++                "train_batch_rollouts": len(env_batch),
++                "trainable": sum(1 for r in env_batch if r.error is None and not r.is_filtered),
++                "filtered": sum(1 for _r, labels in env_entries if labels.get("is_filtered")),
++                "truncated": sum(1 for r, _labels in env_entries if r.is_truncated),
++                "reward_sum": sum(reward_values),
++                "reward_mean": (sum(reward_values) / len(reward_values)) if reward_values else 0.0,
++                "drop_counts": {
++                    reason: sum(1 for _r, labels in env_entries if labels.get("drop_reason") == reason)
++                    for reason in sorted(
++                        {str(labels.get("drop_reason")) for _r, labels in env_entries if labels.get("drop_reason")}
++                    )
++                },
++            }
++
++        summary = {
++            "record_type": "train_batch_summary",
++            "schema_version": 1,
++            "kind": "train",
++            "step": step,
++            "created_at": created_at,
++            "output_dir": str(self.config.output_dir),
++            "counts": {
++                "arrivals": sum(batch.metrics.arrivals_by_env.values()),
++                "audited_rollouts": len(audit_rollouts),
++                "train_batch_rollouts": batch_count,
++                "trainable_rollouts": batch.metrics.n_trainable,
++                "samples_shipped": batch.metrics.samples_shipped,
++                "errors": sum(batch.metrics.errors_by_env.values()),
++                "pre_filter_seen": self.train_sink.pre_filter_seen,
++                "pre_filter_dropped": self.train_sink.pre_filter_dropped,
++                "drop_counts": dict(drop_counts),
++            },
++            "reward_mean_calculation": {
++                "console_step_reward": {
++                    "formula": "sum(reward for rollout in train_batch_rollouts) / len(train_batch_rollouts)",
++                    "reward_sum": batch_reward_sum,
++                    "rollout_count": batch_count,
++                    "mean": batch_reward_mean,
++                },
++                "wandb_reward_all_mean": {
++                    "formula": "mean(mean(reward for rollouts in group) for group in train_batch_groups)",
++                    "group_count": len(group_summaries),
++                    "mean": wandb_group_mean,
++                    "logged_value": logged_metrics.get("reward/all/mean"),
++                },
++                "groups": group_summaries,
++            },
++            "filters": {
++                "pre_batch_dropped_by_name": dict(self.train_sink.pre_filter_dropped_by_name),
++            },
++            "timing": {
++                "step": step_time,
++                "save_ckpt": save_ckpt_time,
++                "teacher_logprobs": teacher_logprobs_time,
++            },
++            "by_env": by_env,
++            "logged_metrics": logged_metrics,
++        }
++
++        records = [summary]
++        for rollout, rollout_data, labels in entries:
++            records.append(
++                {
++                    "record_type": "rollout",
++                    "schema_version": 1,
++                    "kind": "train",
++                    "step": step,
++                    "created_at": created_at,
++                    "labels": labels,
++                    "reward_calculation": self.rollout_reward_calculation(rollout_data),
++                    "judge_logs": self.rollout_judge_logs(rollout_data),
++                    "rollout": rollout_data,
++                }
++            )
++        return records
++
+     def maybe_trigger_eval(self, step: int) -> None:
+         """Fire eligible eval epochs and flip to ``PREFER_EVAL`` if anything
+         fires. No-op when eval is not configured."""
+@@ -795,6 +1087,70 @@ class Orchestrator:
+             )
+         get_logger().success("\n\t\t ".join(lines))
+ 
++    def build_eval_audit_records(
++        self, *, batch: EvalBatch, rollout_dicts: list[dict[str, Any]]
++    ) -> list[dict[str, Any]]:
++        created_at = self.audit_timestamp()
++        reward_sum = sum(r.reward for r in batch.rollouts)
++        rollout_count = len(batch.rollouts)
++        summary = {
++            "record_type": "eval_batch_summary",
++            "schema_version": 1,
++            "kind": "eval",
++            "step": batch.step,
++            "env_name": batch.env_name,
++            "created_at": created_at,
++            "output_dir": str(self.config.output_dir),
++            "counts": {
++                "rollouts": rollout_count,
++                "cancelled": batch.metrics.n_cancelled,
++                "errored": batch.metrics.n_errored,
++                "examples": batch.metrics.n_examples,
++                "examples_including_errors": batch.metrics.n_examples_including_errors,
++                "group_size": batch.metrics.group_size,
++            },
++            "reward_mean_calculation": {
++                "valid_only_formula": "sum(valid rollout rewards) / valid rollout count",
++                "including_errors_formula": (
++                    "sum(non-cancelled valid rollout rewards, with errored rollouts assigned 0) "
++                    "/ non-cancelled rollout count"
++                ),
++                "rollout_reward_sum": reward_sum,
++                "rollout_count": rollout_count,
++                "rollout_mean": reward_sum / rollout_count if rollout_count else 0.0,
++                "valid_only_logged_value": batch.metrics.reward_mean,
++                "including_errors_logged_value": batch.metrics.reward_mean_including_errors,
++            },
++            "metrics": batch.metrics.to_wandb_dict(env_name=batch.env_name, step=batch.step),
++        }
++        records: list[dict[str, Any]] = [summary]
++        for rollout, rollout_data in zip(batch.rollouts, rollout_dicts):
++            records.append(
++                {
++                    "record_type": "rollout",
++                    "schema_version": 1,
++                    "kind": "eval",
++                    "step": batch.step,
++                    "created_at": created_at,
++                    "labels": {
++                        "env_name": rollout.env_name,
++                        "example_id": rollout.example_id,
++                        "group_id": str(rollout.group_id),
++                        "rollout_id": str(rollout.rollout_id),
++                        "policy_version": rollout.policy_version,
++                        "off_policy_steps": rollout.off_policy_steps,
++                        "eval_step": rollout.eval_step,
++                        "error_type": self.error_label(rollout.error),
++                        "is_truncated": rollout.is_truncated,
++                        "stop_condition": rollout.raw.get("stop_condition"),
++                    },
++                    "reward_calculation": self.rollout_reward_calculation(rollout_data),
++                    "judge_logs": self.rollout_judge_logs(rollout_data),
++                    "rollout": rollout_data,
++                }
++            )
++        return records
++
+     async def finalize_eval_batch(self, batch: EvalBatch) -> None:
+         """Persist + log one completed eval epoch (save_rollouts,
+         monitor.log_eval_samples, monitor.log)."""
+@@ -808,7 +1164,11 @@ class Orchestrator:
+             save_rollouts,
+             rollout_dicts,
+             step_path / f"eval_rollouts_{batch.env_name}.jsonl",
+-            exclude_keys={"trajectory"},
++        )
++        await asyncio.to_thread(
++            append_jsonl_records,
++            self.build_eval_audit_records(batch=batch, rollout_dicts=rollout_dicts),
++            self.rollout_audit_path(),
+         )
+         self.monitor.log_eval_samples(rollout_dicts, env_name=batch.env_name, step=batch.step)
+         policy_versions = {r.policy_version for r in batch.rollouts}
+diff --git a/src/prime_rl/orchestrator/token_usage.py b/src/prime_rl/orchestrator/token_usage.py
+new file mode 100644
+index 00000000..24eaad2d
+--- /dev/null
++++ b/src/prime_rl/orchestrator/token_usage.py
+@@ -0,0 +1,104 @@
++from __future__ import annotations
++
++from typing import Any
++
++import verifiers as vf
++
++from prime_rl.transport import TrainingSample
++
++TOKEN_USAGE_KEYS = ("input_tokens", "output_tokens", "final_input_tokens", "final_output_tokens")
++
++
++def _as_number(value: Any, default: float = 0.0) -> float:
++    if value is None:
++        return default
++    try:
++        return float(value)
++    except (TypeError, ValueError):
++        return default
++
++
++def _lengths_from_tokens(tokens: dict[str, Any]) -> tuple[float, float]:
++    prompt_len = len(tokens.get("prompt_ids") or [])
++    completion_mask = tokens.get("completion_mask")
++    completion_ids = tokens.get("completion_ids") or []
++    if completion_mask is None:
++        output_len = len(completion_ids)
++        input_len = prompt_len
++    else:
++        output_len = sum(bool(x) for x in completion_mask)
++        input_len = prompt_len + len(completion_mask) - output_len
++    return float(input_len), float(output_len)
++
++
++def _derive_from_samples(samples: list[TrainingSample] | None) -> tuple[float, float] | None:
++    if not samples:
++        return None
++    input_tokens = 0.0
++    output_tokens = 0.0
++    for sample in samples:
++        output_len = sum(sample.completion_mask)
++        input_len = len(sample.prompt_ids) + len(sample.completion_mask) - output_len
++        input_tokens += input_len
++        output_tokens += output_len
++    return input_tokens, output_tokens
++
++
++def _derive_from_trajectory(raw: vf.RolloutOutput) -> tuple[float, float] | None:
++    for step in reversed(raw.get("trajectory") or []):
++        tokens = step.get("tokens") if isinstance(step, dict) else None
++        if isinstance(tokens, dict):
++            return _lengths_from_tokens(tokens)
++    return None
++
++
++def normalize_token_usage(
++    raw: vf.RolloutOutput,
++    *,
++    samples: list[TrainingSample] | None = None,
++) -> dict[str, float]:
++    """Ensure a rollout has stable token accounting keys.
++
++    Some env-side synthetic zero-reward paths can return a valid rollout
++    without verifiers' ``token_usage`` block. Prefer lengths derived from the
++    trainer samples, then from trajectory tokens, and use zeros only when no
++    tokenized content exists.
++    """
++
++    existing = raw.get("token_usage")
++    usage: dict[str, Any] = dict(existing) if isinstance(existing, dict) else {}
++    derived = _derive_from_samples(samples)
++    if derived is None:
++        derived = _derive_from_trajectory(raw)
++    if derived is None:
++        derived = (0.0, 0.0)
++
++    derived_input, derived_output = derived
++    final_input = _as_number(
++        usage.get("final_input_tokens"),
++        _as_number(usage.get("input_tokens"), derived_input),
++    )
++    final_output = _as_number(
++        usage.get("final_output_tokens"),
++        _as_number(usage.get("output_tokens"), derived_output),
++    )
++    input_tokens = _as_number(usage.get("input_tokens"), final_input)
++    output_tokens = _as_number(usage.get("output_tokens"), final_output)
++
++    normalized = {
++        "input_tokens": input_tokens,
++        "output_tokens": output_tokens,
++        "final_input_tokens": final_input,
++        "final_output_tokens": final_output,
++    }
++    raw["token_usage"] = normalized
++    return normalized
++
++
++def rollout_token_count(raw: vf.RolloutOutput) -> float:
++    usage = normalize_token_usage(raw)
++    return usage["final_input_tokens"] + usage["final_output_tokens"]
++
++
++def rollout_final_output_tokens(raw: vf.RolloutOutput) -> float:
++    return normalize_token_usage(raw)["final_output_tokens"]
+diff --git a/src/prime_rl/orchestrator/train_sink.py b/src/prime_rl/orchestrator/train_sink.py
+index f79a0d5e..676b95ce 100644
+--- a/src/prime_rl/orchestrator/train_sink.py
++++ b/src/prime_rl/orchestrator/train_sink.py
+@@ -21,8 +21,10 @@ from prime_rl.configs.orchestrator import OrchestratorConfig
+ from prime_rl.orchestrator.advantage import assign_advantages
+ from prime_rl.orchestrator.envs import TrainEnvs
+ from prime_rl.orchestrator.filters import RolloutFilter, apply_filters
++from prime_rl.orchestrator.token_usage import normalize_token_usage, rollout_token_count
+ from prime_rl.orchestrator.trajectories import (
+     backfill_rollout_tokens,
++    build_environment_prompt_masks,
+     interleave_rollout,
+     offload_images_to_disk,
+ )
+@@ -65,6 +67,7 @@ class TrainSink:
+         # earlier group is still in flight
+         self.pending_groups: dict[uuid.UUID, list[TrainRollout]] = defaultdict(list)
+         self.pending_batch: list[TrainRollout] = []
++        self.audit_rollouts: list[TrainRollout] = []
+ 
+         # Reset by the orchestrator after each ship via ``reset_pre_filter_stats``
+         self.pre_filter_seen = 0
+@@ -103,10 +106,7 @@ class TrainSink:
+         if self.batch_size is not None:
+             return len(self.pending_batch), self.batch_size, "rollouts"
+         assert self.token_batch_size is not None
+-        tokens = sum(
+-            r.raw["token_usage"]["final_input_tokens"] + r.raw["token_usage"]["final_output_tokens"]
+-            for r in self.pending_batch
+-        )
++        tokens = sum(rollout_token_count(r.raw) for r in self.pending_batch)
+         return tokens, self.token_batch_size, "tokens"
+ 
+     def buffered_count(self) -> int:
+@@ -136,11 +136,7 @@ class TrainSink:
+         ready = (
+             len(self.pending_batch) >= self.batch_size
+             if self.batch_size is not None
+-            else sum(
+-                r.raw["token_usage"]["final_input_tokens"] + r.raw["token_usage"]["final_output_tokens"]
+-                for r in self.pending_batch
+-            )
+-            >= (self.token_batch_size or 0)
++            else sum(rollout_token_count(r.raw) for r in self.pending_batch) >= (self.token_batch_size or 0)
+         )
+         if ready:
+             return self.process_batch()
+@@ -156,18 +152,44 @@ class TrainSink:
+         needs_backfill = any(s["tokens"] is None for s in raw.get("trajectory") or [])
+         if needs_backfill:
+             await asyncio.to_thread(backfill_rollout_tokens, raw, self.tokenizer, renderer=self.renderer)
++        environment_supervision = (
++            self.config.training_mode == "rl" and self.train_envs.get(rollout.env_name).config.echo
++        )
++        environment_prompt_masks = None
++        if environment_supervision:
++            environment_prompt_masks = await asyncio.to_thread(
++                build_environment_prompt_masks,
++                raw,
++                self.tokenizer,
++                renderer=self.renderer,
++            )
+         samples = await asyncio.to_thread(
+             interleave_rollout,
+             raw,
+             mm_token_type_ids_mapping=self.mm_token_type_ids_mapping,
+             env_name=rollout.env_name,
++            environment_supervision=environment_supervision,
++            environment_prompt_masks=environment_prompt_masks,
+         )
+         rollout.samples = samples or []
++        normalize_token_usage(raw, samples=rollout.samples)
+         # Offload base64 image bytes to disk as soon as the rollout is
+         # tokenized, so memory stays flat instead of holding every buffered
+         # rollout's images until the batch ships (no-op for text-only).
+         await asyncio.to_thread(offload_images_to_disk, [raw], self.config.output_dir)
+ 
++        sample_lengths = [len(sample.prompt_ids) + len(sample.completion_ids) for sample in rollout.samples]
++        if sample_lengths and max(sample_lengths) > self.config.seq_len:
++            max_length = max(sample_lengths)
++            message = f"Training sample has {max_length} tokens, exceeding seq_len={self.config.seq_len}"
++            raw["error"] = {"type": "TrainingSampleTooLongError", "message": message}
++            raw["reward"] = 0.0
++            raw["is_truncated"] = True
++            raw["stop_condition"] = "training_sample_too_long"
++            raw.setdefault("metrics", {})["training_sample_too_long"] = 1.0
++            rollout.samples = []
++            get_logger().warning(f"Dropping rollout {rollout.rollout_id}: {message}")
++
+     def process_group(self, group_id: uuid.UUID) -> None:
+         """Finalize one GRPO group: drop errored rollouts (the whole group
+         when ``requires_group_scoring`` and any failed), assign advantages,
+@@ -177,6 +199,7 @@ class TrainSink:
+             return
+         env_name = group[0].env_name
+         example_id = group[0].example_id
++        self.audit_rollouts.extend(group)
+         survivors = [r for r in group if r.error is None]
+         num_errored = len(group) - len(survivors)
+ 
+@@ -208,7 +231,7 @@ class TrainSink:
+                 sample.advantage = r.advantage
+                 sample.reward = r.reward
+                 sample.env_name = r.env_name
+-                sample.training_mode = self.config.training_mode
++                sample.training_mode = "echo" if env.config.echo else self.config.training_mode
+                 sample.completion_temperatures = [temperature] * len(sample.completion_ids)
+ 
+         if self.pre_filters:
+@@ -255,7 +278,7 @@ class TrainSink:
+             cut = 0
+             running = 0
+             for i, r in enumerate(self.pending_batch):
+-                running += r.raw["token_usage"]["final_input_tokens"] + r.raw["token_usage"]["final_output_tokens"]
++                running += rollout_token_count(r.raw)
+                 cut = i + 1
+                 if running >= self.token_batch_size:
+                     break
+@@ -265,6 +288,11 @@ class TrainSink:
+         if self.post_filters:
+             apply_filters(self.post_filters, cohort)
+ 
++        for rollout in cohort:
++            if rollout.raw.get("skip_training"):
++                rollout.is_filtered = True
++                rollout.filter_results["env_non_trainable"] = True
++
+         # Samples are pre-built by ``process_rollout``; ``process_group``
+         # already set advantage/reward on each sample
+         samples: list[TrainingSample] = []
+@@ -290,6 +318,8 @@ class TrainSink:
+             num_decode += decode
+ 
+         n_trainable = sum(1 for r in cohort if not r.is_filtered)
++        audit_rollouts = self.audit_rollouts
++        self.audit_rollouts = []
+ 
+         metrics = TrainBatchMetrics(
+             n_trainable=n_trainable,
+@@ -304,7 +334,7 @@ class TrainSink:
+         )
+         self.arrivals_by_env.clear()
+         self.errors_by_env.clear()
+-        return TrainBatch(rollouts=cohort, samples=samples, metrics=metrics)
++        return TrainBatch(rollouts=cohort, samples=samples, metrics=metrics, audit_rollouts=audit_rollouts)
+ 
+     def reset_pre_filter_stats(self) -> None:
+         self.pre_filter_seen = 0
+diff --git a/src/prime_rl/orchestrator/train_source.py b/src/prime_rl/orchestrator/train_source.py
+index db439f75..b05b1f32 100644
+--- a/src/prime_rl/orchestrator/train_source.py
++++ b/src/prime_rl/orchestrator/train_source.py
+@@ -44,11 +44,26 @@ class TrainSource:
+             self.weights: list[float] = [float(r) for r in configured_ratios]  # type: ignore[arg-type]
+         else:
+             self.weights = [float(len(self.examples[name])) for name in self.env_names]
++        self.total_weight = sum(max(0.0, weight) for weight in self.weights)
++        if self.total_weight <= 0.0:
++            raise ValueError("TrainSource needs at least one env with positive ratio or examples")
++        self.current_weights = {name: 0.0 for name in self.env_names}
+ 
+-    def next_example(self, available_permits: int) -> dict | None:
+-        env_name = self.rng.choices(self.env_names, weights=self.weights, k=1)[0]
++    def _next_env_name(self, available_permits: int) -> str | None:
++        next_weights = dict(self.current_weights)
++        for name, weight in zip(self.env_names, self.weights, strict=True):
++            next_weights[name] += max(0.0, weight)
++        env_name = max(self.env_names, key=lambda name: next_weights[name])
+         if self.env_costs[env_name] > available_permits:
+             return None
++        self.current_weights = next_weights
++        self.current_weights[env_name] -= self.total_weight
++        return env_name
++
++    def next_example(self, available_permits: int) -> dict | None:
++        env_name = self._next_env_name(available_permits)
++        if env_name is None:
++            return None
+         rows = self.examples[env_name]
+         cursor = self.cursors[env_name]
+         if cursor >= len(rows):
+diff --git a/src/prime_rl/orchestrator/trajectories.py b/src/prime_rl/orchestrator/trajectories.py
+index 3e8431c1..c654eead 100644
+--- a/src/prime_rl/orchestrator/trajectories.py
++++ b/src/prime_rl/orchestrator/trajectories.py
+@@ -201,11 +201,77 @@ def backfill_rollout_tokens(
+     return True
+ 
+ 
++def build_environment_prompt_masks(
++    output: vf.RolloutOutput,
++    tokenizer: PreTrainedTokenizer,
++    renderer=None,
++) -> list[list[bool]]:
++    """Mark newly returned tool-response tokens in each trajectory prompt."""
++    tools = _convert_tools_to_oai_format(output.get("tool_defs", []))
++    masks: list[list[bool]] = []
++
++    for step_idx, step in enumerate(output["trajectory"]):
++        tokens = step["tokens"]
++        if tokens is None:
++            raise ValueError(f"Missing tokens for ECHO example {output['example_id']} step {step_idx}")
++
++        expected_prompt_ids = list(tokens["prompt_ids"])
++        prompt = _normalize_messages(step.get("prompt"), default_role="user")
++        trailing_tool_indices: list[int] = []
++        if step_idx > 0:
++            for message_idx in range(len(prompt) - 1, -1, -1):
++                if prompt[message_idx].get("role") != "tool":
++                    break
++                trailing_tool_indices.append(message_idx)
++        if not trailing_tool_indices:
++            masks.append([False] * len(expected_prompt_ids))
++            continue
++
++        has_completion = bool(_normalize_messages(step.get("completion"), default_role="assistant"))
++
++        def render_prompt(messages: list[dict[str, Any]]) -> list[int]:
++            if renderer is not None:
++                return list(renderer.render_ids(messages, tools=tools, add_generation_prompt=has_completion))
++            return _render_messages(
++                tokenizer,
++                messages,
++                add_generation_prompt=has_completion,
++                tools=tools,
++            )
++
++        rendered_prompt_ids = render_prompt(prompt)
++        if rendered_prompt_ids != expected_prompt_ids:
++            raise ValueError(
++                f"Cannot align ECHO prompt tokens for example {output['example_id']} step {step_idx}: "
++                f"rendered {len(rendered_prompt_ids)} tokens, rollout recorded {len(expected_prompt_ids)}"
++            )
++
++        mask = [False] * len(rendered_prompt_ids)
++        for message_idx in trailing_tool_indices:
++            counterfactual = [dict(message) for message in prompt]
++            counterfactual[message_idx]["content"] = " "
++            counterfactual_ids = render_prompt(counterfactual)
++
++            start = _common_prefix_len(rendered_prompt_ids, counterfactual_ids)
++            max_suffix = min(len(rendered_prompt_ids), len(counterfactual_ids)) - start
++            suffix = 0
++            while suffix < max_suffix and rendered_prompt_ids[-(suffix + 1)] == counterfactual_ids[-(suffix + 1)]:
++                suffix += 1
++            end = len(rendered_prompt_ids) - suffix
++            mask[start:end] = [True] * (end - start)
++
++        masks.append(mask)
++
++    return masks
++
++
+ def interleave_rollout(
+     output: vf.RolloutOutput,
+     mm_token_type_ids_mapping: dict[int, int] | None = None,
+     *,
+     env_name: str = "",
++    environment_supervision: bool = False,
++    environment_prompt_masks: list[list[bool]] | None = None,
+ ) -> list[TrainingSample] | None:
+     """
+     Convert vf.RolloutOutput to trainable rollouts by interleaving trajectory steps
+@@ -238,6 +304,9 @@ def interleave_rollout(
+         return None
+ 
+     has_error = output["error"] is not None
++    if environment_supervision:
++        assert environment_prompt_masks is not None, "ECHO requires environment prompt masks"
++        assert len(environment_prompt_masks) == len(trajectory)
+ 
+     def prepare_step_tokens(step: vf.TrajectoryStep, step_idx: int) -> dict[str, Any] | None:
+         tokens = step["tokens"]
+@@ -255,6 +324,11 @@ def interleave_rollout(
+             return {
+                 "prompt_ids": list(tokens["prompt_ids"]),
+                 "prompt_mask": list(map(bool, tokens["prompt_mask"])),
++                "prompt_environment_mask": (
++                    list(environment_prompt_masks[step_idx])
++                    if environment_prompt_masks is not None
++                    else [False] * len(tokens["prompt_ids"])
++                ),
+                 "completion_ids": list(tokens["completion_ids"]),
+                 "completion_mask": list(map(bool, tokens["completion_mask"])),
+                 "completion_logprobs": list(tokens["completion_logprobs"]),
+@@ -296,6 +370,8 @@ def interleave_rollout(
+         completion_ids = list(tokens["completion_ids"])
+ 
+         prompt_ids = list(tokens["prompt_ids"])
++        prompt_environment_mask = list(tokens["prompt_environment_mask"])
++        assert len(prompt_environment_mask) == len(prompt_ids)
+         sample = TrainingSample(
+             prompt_ids=prompt_ids,
+             prompt_mask=list(tokens["prompt_mask"]),
+@@ -308,6 +384,8 @@ def interleave_rollout(
+             env_name=env_name,
+             mm_token_type_ids=None,
+             routed_experts=None,  # deferred — finalized at end of interleave_rollout
++            completion_environment_mask=([False] * len(completion_ids) if environment_supervision else None),
++            prompt_environment_mask=(prompt_environment_mask if environment_supervision else None),
+         )
+         # Initialize routed-experts state for this sample. First chunk is the
+         # raw step routed_experts (no pad, no copy). running_len is the
+@@ -375,6 +453,10 @@ def interleave_rollout(
+         sample.completion_ids.extend(new_prompt_ids)
+         sample.completion_mask.extend([False] * len(new_prompt_ids))
+         sample.completion_logprobs.extend([0.0] * len(new_prompt_ids))
++        if sample.completion_environment_mask is not None:
++            new_environment_mask = tokens["prompt_environment_mask"][prefix_len:]
++            assert len(new_environment_mask) == len(new_prompt_ids)
++            sample.completion_environment_mask.extend(new_environment_mask)
+ 
+         # Extend with new completion tokens
+         completion_ids = tokens["completion_ids"]
+@@ -384,6 +466,8 @@ def interleave_rollout(
+         else:
+             sample.completion_mask.extend(tokens["completion_mask"])
+         sample.completion_logprobs.extend(tokens["completion_logprobs"])
++        if sample.completion_environment_mask is not None:
++            sample.completion_environment_mask.extend([False] * len(completion_ids))
+ 
+         step_routed = tokens.get("routed_experts")
+         state = sample_routed_state.get(id(sample))
+diff --git a/src/prime_rl/orchestrator/types.py b/src/prime_rl/orchestrator/types.py
+index 54c3f827..4b5f9fa1 100644
+--- a/src/prime_rl/orchestrator/types.py
++++ b/src/prime_rl/orchestrator/types.py
+@@ -140,11 +140,14 @@ class TrainBatchMetrics:
+ @dataclass
+ class TrainBatch:
+     """``samples`` is the trainer-bound payload (post-filter survivors);
+-    ``rollouts`` is the full cohort kept for orchestrator-side I/O."""
++    ``rollouts`` is the trainer-cohort kept for orchestrator-side I/O.
++    ``audit_rollouts`` includes every finalized-group rollout observed since
++    the previous shipped batch, including errored and pre-filtered rollouts."""
+ 
+     rollouts: list[TrainRollout]
+     samples: list[TrainingSample]
+     metrics: TrainBatchMetrics
++    audit_rollouts: list[TrainRollout] = field(default_factory=list)
+ 
+ 
+ @dataclass
+@@ -156,8 +159,10 @@ class EvalBatchMetrics:
+     n_cancelled: int
+     n_errored: int
+     n_examples: int = 0
++    n_examples_including_errors: int = 0
+     group_size: int = 1
+     reward_mean: float = 0.0
++    reward_mean_including_errors: float = 0.0
+     completion_len_mean: float = 0.0
+     completion_len_max: float = 0.0
+     completion_len_min: float = 0.0
+@@ -187,6 +192,8 @@ class EvalBatchMetrics:
+             out[f"{prefix}/num_turns/max"] = self.num_turns_max
+             for k, v in self.pass_at_k.items():
+                 out[f"{prefix}/{k}"] = v
++        if self.n_examples_including_errors > 0:
++            out[f"{prefix}/avg@{self.group_size}_including_errors"] = self.reward_mean_including_errors
+         return out
+ 
+ 
+diff --git a/src/prime_rl/orchestrator/utils.py b/src/prime_rl/orchestrator/utils.py
+index 9c68f361..d41678b4 100644
+--- a/src/prime_rl/orchestrator/utils.py
++++ b/src/prime_rl/orchestrator/utils.py
+@@ -2,8 +2,10 @@ import asyncio
+ import ctypes
+ import gc
+ import logging
++import math
+ import time
+ from concurrent.futures import ThreadPoolExecutor
++from dataclasses import dataclass
+ from itertools import cycle
+ from pathlib import Path
+ 
+@@ -22,6 +24,23 @@ from prime_rl.utils.utils import (
+     get_step_path,
+ )
+ 
++MAX_TEACHER_NON_FINITE_FRACTION = 0.01
++
++
++@dataclass(frozen=True)
++class TeacherLogprobsBatch:
++    values: list[list[float]]
++    max_non_finite_fraction: float
++    severe_sample_count: int
++    batch_neutralized: bool
++
++    def metrics(self) -> dict[str, float]:
++        return {
++            "opd/teacher_logprobs/non_finite_fraction_max": self.max_non_finite_fraction,
++            "opd/teacher_logprobs/severe_samples": float(self.severe_sample_count),
++            "opd/teacher_logprobs/batch_neutralized": float(self.batch_neutralized),
++        }
++
+ 
+ async def setup_student_inference_pool(*, config: OrchestratorConfig, tokenizer):
+     """Build the student inference pool + matching renderer. Returns
+@@ -29,7 +48,9 @@ async def setup_student_inference_pool(*, config: OrchestratorConfig, tokenizer)
+     MITO path (``config.renderer is None``)."""
+     from renderers.base import create_renderer
+ 
+-    client_config = config.student.client
++    client_config = config.student.client.model_copy(
++        update={"preserve_reasoning_only_responses": config.preserve_reasoning_only_responses}
++    )
+     model_name = config.student.model.name
+ 
+     if config.renderer is not None:
+@@ -83,6 +104,17 @@ def save_rollouts(rollouts: list[vf.RolloutOutput], path: Path, exclude_keys: se
+             f.write(orjson.dumps(row, default=make_serializable, option=opts))
+ 
+ 
++def append_jsonl_records(records: list[dict], path: Path) -> None:
++    """Append JSONL records using the same serializer as rollout saves."""
++    if not records:
++        return
++    path.parent.mkdir(parents=True, exist_ok=True)
++    opts = orjson.OPT_APPEND_NEWLINE | orjson.OPT_SERIALIZE_NUMPY
++    with open(path, "ab") as f:
++        for record in records:
++            f.write(orjson.dumps(record, default=make_serializable, option=opts))
++
++
+ def intercept_vf_logging(logger: str = "verifiers", level: str = "DEBUG", prefix: str | None = None):
+     """Intercepts verifiers logging and routes through prime-rl logger with optional prefix."""
+     vf_logger = logging.getLogger(logger)
+@@ -107,17 +139,282 @@ def trim_process_memory() -> None:
+         get_logger().debug(f"malloc_trim(0) failed: {exc!r}")
+ 
+ 
++def _decode_tokens(tokenizer, token_ids: list[int]) -> str:
++    return tokenizer.decode(token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
++
++
++def dual_pointer_chunk_alignment(
++    student_ids: list[int],
++    teacher_ids: list[int],
++    student_tokenizer,
++    teacher_tokenizer,
++) -> list[tuple[int, int, int, int]]:
++    """Return all minimal decoded-text synchronization chunks."""
++    chunks: list[tuple[int, int, int, int]] = []
++    student_start = teacher_start = 0
++
++    while student_start < len(student_ids) and teacher_start < len(teacher_ids):
++        student_end = student_start + 1
++        teacher_end = teacher_start + 1
++
++        while True:
++            student_text = _decode_tokens(student_tokenizer, student_ids[student_start:student_end])
++            teacher_text = _decode_tokens(teacher_tokenizer, teacher_ids[teacher_start:teacher_end])
++
++            if student_text == teacher_text and not student_text.endswith("\ufffd"):
++                chunks.append((student_start, student_end, teacher_start, teacher_end))
++                student_start = student_end
++                teacher_start = teacher_end
++                break
++
++            if len(student_text) < len(teacher_text):
++                student_end += 1
++            elif len(teacher_text) < len(student_text):
++                teacher_end += 1
++            else:
++                student_incomplete = student_text.endswith("\ufffd")
++                teacher_incomplete = teacher_text.endswith("\ufffd")
++                if student_incomplete and not teacher_incomplete:
++                    student_end += 1
++                elif teacher_incomplete and not student_incomplete:
++                    teacher_end += 1
++                elif student_incomplete and teacher_incomplete:
++                    student_end += 1
++                    teacher_end += 1
++                else:
++                    raise ValueError(
++                        "DPCA reached unequal decoded prefixes with the same length: "
++                        f"student={student_text!r}, teacher={teacher_text!r}"
++                    )
++
++            if student_end > len(student_ids) or teacher_end > len(teacher_ids):
++                raise ValueError(
++                    "DPCA could not synchronize token sequences: "
++                    f"student suffix={_decode_tokens(student_tokenizer, student_ids[student_start:])!r}, "
++                    f"teacher suffix={_decode_tokens(teacher_tokenizer, teacher_ids[teacher_start:])!r}"
++                )
++
++    if student_start != len(student_ids) or teacher_start != len(teacher_ids):
++        raise ValueError(
++            "DPCA exhausted only one token sequence: "
++            f"student={student_start}/{len(student_ids)}, teacher={teacher_start}/{len(teacher_ids)}"
++        )
++    return chunks
++
++
++def project_teacher_chunk_logprobs(
++    student_logprobs: list[float],
++    teacher_logprobs: list[float],
++    chunks: list[tuple[int, int, int, int]],
++    invalid_teacher_indices: set[int] | None = None,
++) -> list[float]:
++    """Project each teacher chunk budget using the student's semantic prior."""
++    invalid_teacher_indices = invalid_teacher_indices or set()
++    projected = [0.0] * len(student_logprobs)
++    for student_start, student_end, teacher_start, teacher_end in chunks:
++        student_chunk = student_logprobs[student_start:student_end]
++        if any(index in invalid_teacher_indices for index in range(teacher_start, teacher_end)):
++            projected[student_start:student_end] = student_chunk
++            continue
++        teacher_budget = sum(teacher_logprobs[teacher_start:teacher_end])
++        student_budget = sum(student_chunk)
++        if student_budget > 0.0:
++            raise ValueError(
++                "DPCA semantic-prior projection requires a non-positive student chunk log-likelihood, "
++                f"got {student_budget} for chunk {student_start}:{student_end}"
++            )
++        if student_budget == 0.0:
++            target = [teacher_budget / len(student_chunk)] * len(student_chunk)
++        else:
++            scale = teacher_budget / student_budget
++            target = [scale * logprob for logprob in student_chunk]
++        if not all(math.isfinite(value) for value in target):
++            raise ValueError(f"DPCA produced non-finite projected logprobs for chunk {student_start}:{student_end}")
++        projected[student_start:student_end] = target
++    return projected
++
++
++def _student_to_teacher_chat_text(text: str, student_tokenizer, teacher_tokenizer) -> str:
++    student_vocab = student_tokenizer.get_vocab()
++    teacher_vocab = teacher_tokenizer.get_vocab()
++    student_is_qwen = "<|im_start|>" in student_vocab and "<|im_end|>" in student_vocab
++    teacher_is_deepseek = all(
++        token in teacher_vocab
++        for token in ("<｜begin▁of▁sentence｜>", "<｜User｜>", "<｜Assistant｜>", "<｜end▁of▁sentence｜>")
++    )
++    if not (student_is_qwen and teacher_is_deepseek):
++        return text
++
++    replacements = [
++        ("<|begin_of_text|><|im_start|>system\n", "<｜begin▁of▁sentence｜>"),
++        (
++            "<|begin_of_text|><|im_start|>user\n",
++            "<｜begin▁of▁sentence｜><｜User｜>",
++        ),
++        ("<|im_start|>system\n", "<｜begin▁of▁sentence｜>"),
++        ("<|im_end|>\n<|im_start|>user\n", "<｜User｜>"),
++        ("<|im_start|>user\n", "<｜begin▁of▁sentence｜><｜User｜>"),
++        ("<|im_end|>\n<|im_start|>assistant\n", "<｜Assistant｜>"),
++        ("<|im_start|>assistant\n", "<｜Assistant｜>"),
++        ("<|im_end|>\n", "<｜end▁of▁sentence｜>"),
++        ("<|im_end|>", "<｜end▁of▁sentence｜>"),
++        ("<|begin_of_text|>", "<｜begin▁of▁sentence｜>"),
++    ]
++    for student_marker, teacher_marker in replacements:
++        text = text.replace(student_marker, teacher_marker)
++    return text
++
++
++def _trainable_content_spans(sample: TrainingSample, student_tokenizer) -> list[tuple[int, int]]:
++    token_ids = list(sample.prompt_ids) + list(sample.completion_ids)
++    mask = [False] * len(sample.prompt_ids) + list(sample.completion_mask)
++    protocol_ids = set(student_tokenizer.all_special_ids)
++    student_vocab = student_tokenizer.get_vocab()
++    protocol_ids.update(student_vocab[token] for token in ("<think>", "</think>") if token in student_vocab)
++    reasoning_close_id = student_vocab.get("</think>")
++    spans: list[tuple[int, int]] = []
++    index = 0
++    while index < len(mask):
++        if not mask[index]:
++            index += 1
++            continue
++
++        run_end = index
++        while run_end < len(mask) and mask[run_end]:
++            run_end += 1
++        if reasoning_close_id is not None:
++            close_index = next(
++                (position for position in range(index, run_end) if token_ids[position] == reasoning_close_id),
++                None,
++            )
++            if close_index is not None:
++                index = close_index + 1
++
++        while index < run_end:
++            if token_ids[index] in protocol_ids:
++                index += 1
++                continue
++            span_start = index
++            while index < run_end and token_ids[index] not in protocol_ids:
++                index += 1
++            spans.append((span_start, index))
++    return spans
++
++
++def _find_teacher_token_span(offsets: list[tuple[int, int]], start: int, end: int) -> tuple[int, int]:
++    indices = [index for index, (left, right) in enumerate(offsets) if left >= start and right <= end and right > left]
++    if not indices or offsets[indices[0]][0] != start or offsets[indices[-1]][1] != end:
++        raise ValueError(f"Teacher tokenization does not preserve trainable text boundary {start}:{end}")
++    if indices != list(range(indices[0], indices[-1] + 1)):
++        raise ValueError(f"Teacher tokenization produced a non-contiguous span for text boundary {start}:{end}")
++    return indices[0], indices[-1] + 1
++
++
++def align_and_project_teacher_logprobs(
++    sample: TrainingSample,
++    teacher_ids: list[int],
++    teacher_offsets: list[tuple[int, int]],
++    teacher_logprobs: list[float],
++    student_tokenizer,
++    teacher_tokenizer,
++    invalid_teacher_indices: set[int] | None = None,
++    reasoning_close_advantage: float | None = None,
++) -> list[float]:
++    student_ids = list(sample.prompt_ids) + list(sample.completion_ids)
++    student_old_logprobs = [0.0] * len(sample.prompt_ids) + list(sample.completion_logprobs)
++    projected = list(student_old_logprobs)
++    teacher_full_text = _decode_tokens(teacher_tokenizer, teacher_ids)
++
++    for student_start, student_end in _trainable_content_spans(sample, student_tokenizer):
++        student_prefix = _decode_tokens(student_tokenizer, student_ids[:student_start])
++        student_through_span = _decode_tokens(student_tokenizer, student_ids[:student_end])
++        teacher_start_char = len(_student_to_teacher_chat_text(student_prefix, student_tokenizer, teacher_tokenizer))
++        teacher_end_char = len(
++            _student_to_teacher_chat_text(student_through_span, student_tokenizer, teacher_tokenizer)
++        )
++        student_text = student_through_span[len(student_prefix) :]
++
++        if teacher_full_text[teacher_start_char:teacher_end_char] != student_text:
++            raise ValueError(
++                "Teacher retokenization changed trainable response text: "
++                f"student={student_text!r}, "
++                f"teacher={teacher_full_text[teacher_start_char:teacher_end_char]!r}"
++            )
++
++        teacher_start, teacher_end = _find_teacher_token_span(teacher_offsets, teacher_start_char, teacher_end_char)
++        student_span_ids = student_ids[student_start:student_end]
++        teacher_span_ids = teacher_ids[teacher_start:teacher_end]
++        chunks = dual_pointer_chunk_alignment(
++            student_span_ids,
++            teacher_span_ids,
++            student_tokenizer,
++            teacher_tokenizer,
++        )
++        target = project_teacher_chunk_logprobs(
++            student_old_logprobs[student_start:student_end],
++            teacher_logprobs[teacher_start:teacher_end],
++            chunks,
++            {
++                index - teacher_start
++                for index in (invalid_teacher_indices or set())
++                if teacher_start <= index < teacher_end
++            },
++        )
++        projected[student_start:student_end] = target
++
++    closing_reasoning_id = student_tokenizer.get_vocab().get("</think>")
++    if closing_reasoning_id is not None:
++        trainable_mask = [False] * len(sample.prompt_ids) + list(sample.completion_mask)
++        trainable_tokens = sum(trainable_mask)
++        for index, (token_id, is_trainable) in enumerate(zip(student_ids, trainable_mask, strict=True)):
++            if is_trainable and token_id == closing_reasoning_id:
++                projected[index] = (
++                    0.0
++                    if reasoning_close_advantage is None
++                    else student_old_logprobs[index] + reasoning_close_advantage * trainable_tokens
++                )
++    return projected
++
++
+ async def compute_teacher_logprobs(
+     clients: list[vf.ClientConfig],
+     model_name: str,
+     samples: list[TrainingSample],
+-) -> list[list[float]]:
++    student_tokenizer=None,
++    teacher_tokenizer=None,
++    recycle_server: bool = False,
++    reasoning_close_advantage: float | None = None,
++) -> TeacherLogprobsBatch:
+     """Compute teacher model logprobs for a batch of training samples via prefill."""
+     import httpx
+-    from vllm.entrypoints.serve.disagg.protocol import GenerateResponse
+ 
+-    async def _compute_single(client_config: vf.ClientConfig, sample: TrainingSample) -> list[float]:
++    from prime_rl.inference.vllm.serving_tokens import PrimeRlGenerateResponse
++
++    cross_tokenizer = (
++        student_tokenizer is not None
++        and teacher_tokenizer is not None
++        and student_tokenizer.get_vocab() != teacher_tokenizer.get_vocab()
++    )
++
++    async def _compute_single(
++        client_config: vf.ClientConfig,
++        sample: TrainingSample,
++    ) -> tuple[list[float], float]:
+         client = setup_openai_client(client_config)
++        student_ids = list(sample.prompt_ids) + list(sample.completion_ids)
++        teacher_offsets = None
++        if cross_tokenizer:
++            student_text = _decode_tokens(student_tokenizer, student_ids)
++            teacher_text = _student_to_teacher_chat_text(student_text, student_tokenizer, teacher_tokenizer)
++            encoding = teacher_tokenizer(
++                teacher_text,
++                add_special_tokens=False,
++                return_offsets_mapping=True,
++            )
++            token_ids = list(encoding["input_ids"])
++            teacher_offsets = [tuple(offset) for offset in encoding["offset_mapping"]]
++        else:
++            token_ids = student_ids
+ 
+         # Two escape hatches from ``AsyncOpenAI.post``:
+         #   1. URL — ``/inference/v1/generate`` is mounted at server root, not
+@@ -136,7 +433,7 @@ async def compute_teacher_logprobs(
+             cast_to=httpx.Response,
+             body={
+                 "model": model_name,
+-                "token_ids": list(sample.prompt_ids) + list(sample.completion_ids),
++                "token_ids": token_ids,
+                 "sampling_params": {
+                     "max_tokens": 1,
+                     "temperature": 1.0,
+@@ -145,22 +442,99 @@ async def compute_teacher_logprobs(
+                 },
+             },
+         )
+-        response = GenerateResponse.model_validate_json(http_response.content)
+-        # ``prompt_logprobs[i]`` is a ``{token_id: Logprob}`` dict for tokens
+-        # the engine could score, or ``None`` for the leading token which has
+-        # no preceding context. Flatten to ``list[float]`` with 0.0 in the
+-        # unscored slot.
++        response = PrimeRlGenerateResponse.model_validate_json(http_response.content)
++        prompt_logprobs = response.prompt_logprobs or []
++        if len(prompt_logprobs) != len(token_ids):
++            raise ValueError(
++                f"Teacher returned {len(prompt_logprobs)} prompt logprobs for {len(token_ids)} input tokens"
++            )
++
++        invalid_indices = set(response.non_finite_prompt_logprob_indices)
++        student_old_logprobs = [0.0] * len(sample.prompt_ids) + list(sample.completion_logprobs)
+         flat: list[float] = []
+-        for entry in response.prompt_logprobs or []:
++        for index, (token_id, entry) in enumerate(zip(token_ids, prompt_logprobs)):
+             if not entry:
+                 flat.append(0.0)
+                 continue
+-            first = next(iter(entry.values()))
+-            lp = first.logprob if hasattr(first, "logprob") else first.get("logprob")
+-            flat.append(float(lp) if lp is not None else 0.0)
+-        return flat
++            token_logprob = entry.get(token_id)
++            if token_logprob is None:
++                raise ValueError(f"Teacher prompt logprobs are missing input token ID {token_id}")
++            lp = token_logprob.logprob if hasattr(token_logprob, "logprob") else token_logprob.get("logprob")
++            value = float(lp) if lp is not None else 0.0
++            if not math.isfinite(value):
++                invalid_indices.add(index)
++                value = 0.0
++            flat.append(value)
++        if invalid_indices:
++            get_logger().warning(
++                f"Teacher returned non-finite prompt logprobs at {len(invalid_indices)}/{len(token_ids)} "
++                f"token positions for {sample.env_name}"
++            )
++        invalid_fraction = len(invalid_indices) / len(token_ids) if token_ids else 0.0
++        if not cross_tokenizer:
++            for index in invalid_indices:
++                flat[index] = student_old_logprobs[index]
++            return flat, invalid_fraction
++        assert teacher_offsets is not None
++        return (
++            align_and_project_teacher_logprobs(
++                sample,
++                token_ids,
++                teacher_offsets,
++                flat,
++                student_tokenizer,
++                teacher_tokenizer,
++                invalid_indices,
++                reasoning_close_advantage,
++            ),
++            invalid_fraction,
++        )
+ 
+-    return await asyncio.gather(*[_compute_single(client, sample) for client, sample in zip(cycle(clients), samples)])
++    computed = await asyncio.gather(
++        *[_compute_single(client, sample) for client, sample in zip(cycle(clients), samples)]
++    )
++    results = [values for values, _ in computed]
++    invalid_fractions = [fraction for _, fraction in computed]
++    severe_sample_count = sum(fraction > MAX_TEACHER_NON_FINITE_FRACTION for fraction in invalid_fractions)
++    batch_neutralized = severe_sample_count > 0
++    if batch_neutralized:
++        get_logger().warning(
++            f"Neutralizing the full OPD teacher batch because {severe_sample_count}/{len(samples)} sample(s) "
++            f"exceeded {MAX_TEACHER_NON_FINITE_FRACTION:.1%} non-finite teacher positions"
++        )
++        results = [[0.0] * len(sample.prompt_ids) + list(sample.completion_logprobs) for sample in samples]
++    if recycle_server:
++        client = setup_openai_client(clients[0])
++        base = str(client.base_url).rstrip("/").removesuffix("/v1")
++        await client.post(
++            f"{base}/recycle",
++            cast_to=httpx.Response,
++            body={},
++        )
++
++        saw_shutdown = False
++        deadline = time.monotonic() + 1800
++        async with httpx.AsyncClient(timeout=2.0) as health_client:
++            while time.monotonic() < deadline:
++                try:
++                    health = await health_client.get(f"{base}/health")
++                    ready = health.status_code == 200
++                except httpx.HTTPError:
++                    ready = False
++                if not ready:
++                    saw_shutdown = True
++                elif saw_shutdown:
++                    get_logger().info("Teacher server recycled and is ready")
++                    break
++                await asyncio.sleep(1)
++            else:
++                raise TimeoutError("Teacher server did not recycle within 1800 seconds")
++    return TeacherLogprobsBatch(
++        values=results,
++        max_non_finite_fraction=max(invalid_fractions, default=0.0),
++        severe_sample_count=severe_sample_count,
++        batch_neutralized=batch_neutralized,
++    )
+ 
+ 
+ def get_weight_dir(output_dir: Path, step: int, check_exists: bool = True, wait_timeout: int | None = None) -> Path:
+diff --git a/src/prime_rl/trainer/batch.py b/src/prime_rl/trainer/batch.py
+index 2c39a83e..2542977b 100644
+--- a/src/prime_rl/trainer/batch.py
++++ b/src/prime_rl/trainer/batch.py
+@@ -47,7 +47,23 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
+     Tokenize and prepare tensors.
+     """
+     input_ids = training_example.prompt_ids + training_example.completion_ids
+-    loss_mask = training_example.prompt_mask + training_example.completion_mask
++    environment_mask = (
++        training_example.prompt_environment_mask
++        if training_example.prompt_environment_mask is not None
++        else [False] * len(training_example.prompt_ids)
++    ) + (
++        training_example.completion_environment_mask
++        if training_example.completion_environment_mask is not None
++        else [False] * len(training_example.completion_ids)
++    )
++    loss_mask = [
++        policy_token or environment_token
++        for policy_token, environment_token in zip(
++            training_example.prompt_mask + training_example.completion_mask,
++            environment_mask,
++            strict=True,
++        )
++    ]
+     inference_logprobs = [0.0] * len(training_example.prompt_ids) + training_example.completion_logprobs
+     advantages = [training_example.advantage] * len(input_ids)
+     reward = training_example.reward if training_example.reward is not None else float("nan")
+@@ -77,6 +93,7 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
+         advantages = advantages[:seq_len]
+         rewards = rewards[:seq_len]
+         temperatures = temperatures[:seq_len]
++        environment_mask = environment_mask[:seq_len]
+         if teacher_logprobs is not None:
+             teacher_logprobs = teacher_logprobs[:seq_len]
+         if routed_experts is not None:
+@@ -126,6 +143,7 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
+         env_names=env_names,
+         mm_kwargs=training_example.mm_kwargs,
+         training_mode=training_example.training_mode,
++        environment_mask=environment_mask,
+     )
+ 
+ 
+@@ -199,6 +217,7 @@ def _materialize_bin(bin_content: _MicroBatchBin, num_loras: int) -> MicroBatch:
+     rewards: list[float] | None = [] if has_rewards else None
+     teacher_logprobs: list[float] | None = [] if has_teacher_logprobs else None
+     mm_token_type_ids: list[int] | None = [] if has_mm_token_type_ids else None
++    environment_mask: list[bool] = []
+     routed_experts: RoutedExperts | None = None
+     lora_num_tokens = [0] * num_loras
+ 
+@@ -211,6 +230,7 @@ def _materialize_bin(bin_content: _MicroBatchBin, num_loras: int) -> MicroBatch:
+         position_ids.extend(sample.position_ids)
+         temperatures.extend(sample.temperatures)
+         env_names.extend(sample.env_names)
++        environment_mask.extend(sample.environment_mask or [False] * sample_len)
+         if rewards is not None:
+             rewards.extend(sample.rewards if sample.rewards is not None else [float("nan")] * sample_len)
+         if teacher_logprobs is not None:
+@@ -251,6 +271,7 @@ def _materialize_bin(bin_content: _MicroBatchBin, num_loras: int) -> MicroBatch:
+         env_names=env_names,
+         mm_kwargs=first_sample.mm_kwargs if _is_multimodal_sample(first_sample) else None,
+         training_mode=first_sample.training_mode,
++        environment_mask=environment_mask,
+     )
+ 
+ 
+@@ -352,6 +373,8 @@ def pad_micro_batch(micro_batch: MicroBatch, pad_to_multiple_of: int) -> MicroBa
+     if micro_batch.rewards is not None:
+         micro_batch.rewards.extend([float("nan")] * padding_size)
+     micro_batch.loss_mask.extend([False] * padding_size)
++    if micro_batch.environment_mask is not None:
++        micro_batch.environment_mask.extend([False] * padding_size)
+     micro_batch.position_ids.extend(list(range(padding_size)))
+     micro_batch.sequence_lengths.append(padding_size)
+     micro_batch.inference_logprobs.extend([0.0] * padding_size)
+diff --git a/src/prime_rl/trainer/model.py b/src/prime_rl/trainer/model.py
+index 2cdf8bbe..48d38ea5 100644
+--- a/src/prime_rl/trainer/model.py
++++ b/src/prime_rl/trainer/model.py
+@@ -1,5 +1,6 @@
+ import logging
+ import os
++import shutil
+ import time
+ from pathlib import Path
+ from typing import cast
+@@ -801,6 +802,9 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
+                 "Found HF weight format in snapshot state dict and PrimeRL weight format in model state dict. Trying to auto-convert..."
+             )
+             snapshot_path = snapshot_path / "prime"
++            if snapshot_path.exists() and not (snapshot_path / "model.safetensors.index.json").exists() and get_world().is_master:
++                logger.warning(f"Removing incomplete PrimeRL conversion cache at {snapshot_path}")
++                shutil.rmtree(snapshot_path)
+             if not snapshot_path.exists() and get_world().is_master:
+                 logger.debug(
+                     f"Converting snapshot state dict to PrimeRL format and saving to {snapshot_path} on master rank. This is a one-time operation."
+@@ -815,6 +819,9 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
+                 "Found PrimeRL weight format in snapshot state dict and HF weight format in model state dict. Trying to auto-convert..."
+             )
+             snapshot_path = snapshot_path / "hf"
++            if snapshot_path.exists() and not (snapshot_path / "model.safetensors.index.json").exists() and get_world().is_master:
++                logger.warning(f"Removing incomplete HF conversion cache at {snapshot_path}")
++                shutil.rmtree(snapshot_path)
+             if not snapshot_path.exists() and get_world().is_master:
+                 logger.debug(
+                     f"Converting snapshot state dict to HF format and saving to {snapshot_path} on master rank. This is a one-time operation."
+diff --git a/src/prime_rl/trainer/rl/data.py b/src/prime_rl/trainer/rl/data.py
+index 7c3189bc..f53da07c 100644
+--- a/src/prime_rl/trainer/rl/data.py
++++ b/src/prime_rl/trainer/rl/data.py
+@@ -30,6 +30,7 @@ class TensorMicroBatch(TypedDict):
+     inference_logprobs: Float[Tensor, "batch seq"]
+     teacher_logprobs: Float[Tensor, "batch seq"] | None
+     loss_mask: Bool[Tensor, "batch seq"]
++    environment_mask: Bool[Tensor, "batch seq"]
+     temperatures: Float[Tensor, "batch seq"]  # Per-token temperatures
+     env_names: list[str]
+     sequence_lengths: list[int]
+@@ -129,6 +130,7 @@ class FakeDataLoader:
+             "env_names": ["fake"] * input_ids.shape[0],
+             "sequence_lengths": sequence_lengths,
+             "loss_mask": loss_mask.unsqueeze(0),
++            "environment_mask": torch.zeros_like(loss_mask).unsqueeze(0),
+             "lora_num_tokens": lora_num_tokens,
+             "routed_experts": None,
+             "mm_kwargs": None,
+@@ -160,6 +162,7 @@ class FakeDataLoader:
+             "env_names": ["fake"] * self.seq_len,
+             "sequence_lengths": [self.seq_len],
+             "loss_mask": torch.ones(self.seq_len, dtype=torch.bool).unsqueeze(0),
++            "environment_mask": torch.zeros(self.seq_len, dtype=torch.bool).unsqueeze(0),
+             "lora_num_tokens": lora_num_tokens,
+             "routed_experts": None,
+             "mm_kwargs": None,
+@@ -255,6 +258,10 @@ class DataLoader:
+             if micro_batch.teacher_logprobs is not None
+             else None,
+             loss_mask=torch.tensor(micro_batch.loss_mask, dtype=torch.bool).unsqueeze(0),
++            environment_mask=torch.tensor(
++                micro_batch.environment_mask or [False] * len(micro_batch.input_ids),
++                dtype=torch.bool,
++            ).unsqueeze(0),
+             temperatures=torch.tensor(micro_batch.temperatures, dtype=torch.float).unsqueeze(0),
+             env_names=micro_batch.env_names,
+             sequence_lengths=micro_batch.sequence_lengths,
+diff --git a/src/prime_rl/trainer/rl/loss.py b/src/prime_rl/trainer/rl/loss.py
+index 7cd5e53b..466f79ee 100644
+--- a/src/prime_rl/trainer/rl/loss.py
++++ b/src/prime_rl/trainer/rl/loss.py
+@@ -6,7 +6,7 @@ from beartype import beartype as typechecker
+ from jaxtyping import Bool, Float, Int, jaxtyped
+ from torch import Tensor
+ 
+-from prime_rl.configs.trainer import CustomLossConfig, DefaultLossConfig, IPOLossConfig, LossConfig
++from prime_rl.configs.trainer import CustomLossConfig, DefaultLossConfig, IPOLossConfig, LossConfig, OPDLossConfig
+ from prime_rl.utils.utils import import_object
+ 
+ 
+@@ -19,6 +19,8 @@ class LossInputs:
+     teacher_logprobs: Float[Tensor, " seq"] | None
+     advantages: Float[Tensor, " seq"]
+     loss_mask: Bool[Tensor, " seq"]
++    rewards: Float[Tensor, " seq"] | None = None
++    environment_mask: Bool[Tensor, " seq"] | None = None
+ 
+ 
+ @dataclass
+@@ -194,12 +196,13 @@ def ipo_loss_fn(inputs: LossInputs, loss_config: IPOLossConfig) -> LossOutputs:
+     return LossOutputs(loss=loss, metrics=metrics)
+ 
+ 
+-def opd_loss_fn(inputs: LossInputs) -> LossOutputs:
++def opd_loss_fn(inputs: LossInputs, loss_config: OPDLossConfig | None = None) -> LossOutputs:
+     """
+-    On-policy distillation loss: the default DPPO+KL math with the tau knobs
+-    hardcoded to drop the reward signal and use the teacher KL as the
+-    per-token policy-gradient signal.
++    On-policy distillation loss combining per-token teacher KL with an
++    optional group-relative rollout reward advantage.
+     """
++    if loss_config is None:
++        loss_config = OPDLossConfig()
+     trainer_logprobs = inputs.trainer_logprobs
+     inference_logprobs = inputs.inference_logprobs
+     teacher_logprobs = inputs.teacher_logprobs
+@@ -213,9 +216,21 @@ def opd_loss_fn(inputs: LossInputs) -> LossOutputs:
+         trainer_logprobs, inference_logprobs
+     )
+ 
++    teacher_kl = teacher_logprobs - inference_logprobs
++    if loss_config.reward_gate_teacher:
++        if inputs.rewards is None:
++            raise ValueError("reward_gate_teacher requires per-token rollout rewards.")
++        teacher_gate = inputs.rewards > 0
++    else:
++        teacher_gate = torch.ones_like(loss_mask)
++    teacher_advantages = torch.where(teacher_gate, teacher_kl, 0.0)
++    reward_advantages = inputs.advantages
++    advantages = (
++        loss_config.teacher_tau * teacher_advantages + loss_config.reward_tau * reward_advantages
++    ).detach()
+     probs_diff = torch.exp(trainer_logprobs) - torch.exp(inference_logprobs)
+-    dppo_invalid_mask_high = probs_diff > 0.2
+-    dppo_invalid_mask_low = probs_diff < -0.2
++    dppo_invalid_mask_high = probs_diff > loss_config.dppo_mask_high
++    dppo_invalid_mask_low = probs_diff < -loss_config.dppo_mask_low
+     positive_advantages = advantages > 0
+     negative_advantages = advantages < 0
+     dppo_invalid_mask = torch.where(positive_advantages, dppo_invalid_mask_high, dppo_invalid_mask_low)
+@@ -226,12 +241,9 @@ def opd_loss_fn(inputs: LossInputs) -> LossOutputs:
+     drop_mask = loss_mask & is_masked
+     keep_mask = loss_mask & ~is_masked
+ 
+-    teacher_kl = teacher_logprobs - trainer_logprobs
+-    advantages = 0.0 * advantages + 1.0 * teacher_kl.detach()
+-
+     pg_loss = keep_mask * advantages * importance_ratio
+     kl_loss = loss_mask * log_importance_ratio**2
+-    loss = (-pg_loss + 1e-3 * kl_loss).sum()
++    loss = (-pg_loss + loss_config.kl_tau * kl_loss).sum()
+ 
+     metrics = {
+         "masked_mismatch_kl": _safe_mean(mismatch_kl, loss_mask & is_masked),
+@@ -242,6 +254,9 @@ def opd_loss_fn(inputs: LossInputs) -> LossOutputs:
+         "masked_advantage_positive": _safe_mean(positive_advantages, drop_mask),
+         "masked_advantage_negative": _safe_mean(negative_advantages, drop_mask),
+         "teacher_kl": _safe_mean(teacher_kl, loss_mask),
++        "teacher_gate": _safe_mean(teacher_gate, loss_mask),
++        "reward_advantage": _safe_mean(reward_advantages, loss_mask),
++        "combined_advantage": _safe_mean(advantages, loss_mask),
+     }
+ 
+     return LossOutputs(loss=loss, metrics=metrics)
+@@ -259,7 +274,35 @@ def sft_loss_fn(inputs: LossInputs) -> LossOutputs:
+     return LossOutputs(loss=loss, metrics=metrics)
+ 
+ 
+-def setup_loss_fns(loss_config: LossConfig) -> dict[str, LossFn]:
++def echo_loss_fn(inputs: LossInputs, rl_loss_fn: LossFn, echo_alpha: float) -> LossOutputs:
++    """GRPO/IPO on policy tokens plus cross-entropy on environment observations."""
++    environment_mask = inputs.environment_mask
++    if environment_mask is None:
++        raise ValueError("echo_loss_fn requires an environment token mask.")
++
++    policy_mask = inputs.loss_mask & ~environment_mask
++    rl_result = rl_loss_fn(
++        LossInputs(
++            trainer_logprobs=inputs.trainer_logprobs,
++            inference_logprobs=inputs.inference_logprobs,
++            teacher_logprobs=inputs.teacher_logprobs,
++            advantages=inputs.advantages,
++            loss_mask=policy_mask,
++            rewards=inputs.rewards,
++            environment_mask=environment_mask,
++        )
++    )
++    environment_nll = -inputs.trainer_logprobs[environment_mask].sum()
++    loss = rl_result.loss + echo_alpha * environment_nll
++    metrics = {
++        **rl_result.metrics,
++        "echo_nll": _safe_mean(-inputs.trainer_logprobs, environment_mask),
++        "echo_token_fraction": environment_mask.sum() / torch.clamp_min(inputs.loss_mask.sum(), 1),
++    }
++    return LossOutputs(loss=loss, metrics=metrics)
++
++
++def setup_loss_fns(loss_config: LossConfig, opd_loss_config: OPDLossConfig | None = None) -> dict[str, LossFn]:
+     """Build the per-training-mode loss fn dispatch table.
+ 
+     Always returns all three modes - the trainer is mode-agnostic and routes
+@@ -289,7 +332,16 @@ def setup_loss_fns(loss_config: LossConfig) -> dict[str, LossFn]:
+         def rl_fn(inputs: LossInputs) -> LossOutputs:
+             return default_loss_fn(inputs, loss_config)
+ 
+-    return {"sft": sft_loss_fn, "opd": opd_loss_fn, "rl": rl_fn}
++    if opd_loss_config is None:
++        opd_loss_config = OPDLossConfig()
++
++    def opd_fn(inputs: LossInputs) -> LossOutputs:
++        return opd_loss_fn(inputs, opd_loss_config)
++
++    def echo_fn(inputs: LossInputs) -> LossOutputs:
++        return echo_loss_fn(inputs, rl_fn, loss_config.echo_alpha)
++
++    return {"sft": sft_loss_fn, "opd": opd_fn, "rl": rl_fn, "echo": echo_fn}
+ 
+ 
+ def compute_loss(
+@@ -301,6 +353,8 @@ def compute_loss(
+     loss_fns: dict[str, LossFn],
+     loss_scale: int,
+     training_mode: str = "rl",
++    environment_mask: list[Bool[Tensor, " seq_i"]] | None = None,
++    rewards: list[Float[Tensor, " seq_i"]] | None = None,
+ ) -> tuple[Float[Tensor, ""], dict[str, Any]]:
+     """
+     Compute loss for packed sequences (batch size = 1, multiple sequences packed along sequence dimension).
+@@ -335,13 +389,20 @@ def compute_loss(
+ 
+     if teacher_logprobs is None:
+         teacher_logprobs = [None] * len(trainer_logprobs)
++    if environment_mask is None:
++        environment_mask = [torch.zeros_like(mask) for mask in loss_mask]
++    if rewards is None:
++        rewards = [None] * len(trainer_logprobs)
+ 
+-    for t_logp, i_logp, teach_logp, adv, mask in zip(
++    for t_logp, i_logp, teach_logp, adv, mask, env_mask, reward in zip(
+         trainer_logprobs,
+         inference_logprobs,
+         teacher_logprobs,
+         advantages,
+         loss_mask,
++        environment_mask,
++        rewards,
++        strict=True,
+     ):
+         inputs = LossInputs(
+             trainer_logprobs=t_logp,
+@@ -349,6 +410,8 @@ def compute_loss(
+             teacher_logprobs=teach_logp,
+             advantages=adv,
+             loss_mask=mask,
++            rewards=reward,
++            environment_mask=env_mask,
+         )
+ 
+         result = effective_loss_fn(inputs)
+diff --git a/src/prime_rl/trainer/rl/packer.py b/src/prime_rl/trainer/rl/packer.py
+index ae0d9863..e479eb65 100644
+--- a/src/prime_rl/trainer/rl/packer.py
++++ b/src/prime_rl/trainer/rl/packer.py
+@@ -181,6 +181,20 @@ class MultiPacker(BasePacker):
+                 False,
+                 f"Run wrote a sample with completion temperatures length != completion ids length ({len(sample.completion_temperatures)} != {len(sample.completion_ids)})",
+             )
++        if sample.completion_environment_mask is not None and len(sample.completion_environment_mask) != len(
++            sample.completion_ids
++        ):
++            return (
++                False,
++                "Run wrote a sample with environment mask length != completion ids length "
++                f"({len(sample.completion_environment_mask)} != {len(sample.completion_ids)})",
++            )
++        if sample.prompt_environment_mask is not None and len(sample.prompt_environment_mask) != len(sample.prompt_ids):
++            return (
++                False,
++                "Prompt environment mask length does not match prompt IDs "
++                f"({len(sample.prompt_environment_mask)} != {len(sample.prompt_ids)})",
++            )
+         if sample_length == 0:
+             return False, "Run wrote a sample with no tokens"
+         if sample_length > self.seq_len:
+diff --git a/src/prime_rl/trainer/rl/train.py b/src/prime_rl/trainer/rl/train.py
+index 3e4aa34a..0af9dd2b 100644
+--- a/src/prime_rl/trainer/rl/train.py
++++ b/src/prime_rl/trainer/rl/train.py
+@@ -47,6 +47,7 @@ from prime_rl.trainer.parallel_dims import get_parallel_dims
+ from prime_rl.trainer.perf import get_perf_counter
+ from prime_rl.trainer.utils import (
+     build_bin_cost,
++    clip_grad_norm_,
+     GarbageCollection,
+     MemoryProfiler,
+     Tensors,
+@@ -67,7 +68,6 @@ from prime_rl.utils.config import cli
+ from prime_rl.utils.process import set_proc_title
+ from prime_rl.utils.utils import clean_exit, resolve_latest_ckpt_step, to_col_format
+ from ring_flash_attn import substitute_hf_flash_attn
+-from torchtitan.distributed.utils import clip_grad_norm_
+ 
+ 
+ @clean_exit
+@@ -150,8 +150,8 @@ def train(config: TrainerConfig):
+     tokenizer = setup_tokenizer(config.tokenizer)
+ 
+     # Set up the loss function
+-    logger.info(f"Setting up loss function ({config.loss})")
+-    loss_fns = setup_loss_fns(config.loss)
++    logger.info(f"Setting up loss functions (rl={config.loss}, opd={config.opd_loss})")
++    loss_fns = setup_loss_fns(config.loss, config.opd_loss)
+ 
+     # Set up the optimizer
+     logger.info(f"Initializing optimizer ({config.optim})")
+@@ -372,7 +372,9 @@ def train(config: TrainerConfig):
+             input_ids = micro_batch["input_ids"].to("cuda")
+             position_ids = micro_batch["position_ids"].to("cuda")
+             advantages = micro_batch["advantages"].to("cuda")
++            rewards = micro_batch["rewards"].to("cuda") if micro_batch["rewards"] is not None else None
+             loss_mask = micro_batch["loss_mask"].to("cuda")
++            environment_mask = micro_batch["environment_mask"].to("cuda")
+             inference_logprobs = micro_batch["inference_logprobs"].to("cuda")
+             teacher_logprobs = (
+                 micro_batch["teacher_logprobs"].to("cuda") if micro_batch["teacher_logprobs"] is not None else None
+@@ -485,6 +487,8 @@ def train(config: TrainerConfig):
+                 loss_fns=loss_fns,
+                 loss_scale=loss_scale,
+                 training_mode=micro_batch["training_mode"],
++                environment_mask=environment_mask.squeeze().split(sequence_lengths),
++                rewards=rewards.squeeze().split(sequence_lengths) if rewards is not None else None,
+             )
+ 
+             # Backward pass
+@@ -508,9 +512,14 @@ def train(config: TrainerConfig):
+             if micro_batch["training_mode"] != "sft":
+                 with torch.no_grad():
+                     _, _, mismatch_kl = compute_importance_ratio_and_mismatch_kl(out["logprobs"], inference_logprobs)
+-                mismatch_kl = mismatch_kl[loss_mask].detach().to("cpu")
++                policy_mask = loss_mask & ~environment_mask
++                mismatch_kl = mismatch_kl[policy_mask].detach().to("cpu")
+                 tensors["mismatch_kl/all"].append(mismatch_kl)
+-                for env_name, indices in env_to_indices.items():
++                policy_env_names = [
++                    env_name for env_name, keep in zip(env_names, policy_mask.flatten().tolist()) if keep
++                ]
++                for env_name in set(policy_env_names):
++                    indices = [i for i, name in enumerate(policy_env_names) if name == env_name]
+                     tensors[f"mismatch_kl/{env_name}"].append(mismatch_kl[indices])
+ 
+             token_exporter.export(
+@@ -603,6 +612,10 @@ def train(config: TrainerConfig):
+         step_message = f"Step {progress.step} | {format_time(step_time):>7} | Loss {tensor_stats['loss/mean']:.4f} | Entropy {tensor_stats['entropy/all/mean']:.4f}"
+         if "mismatch_kl/all/mean" in tensor_stats:
+             step_message += f" | Mismatch KL {tensor_stats['mismatch_kl/all/mean']:.4f}"
++        if "echo_nll/mean" in tensor_stats:
++            step_message += f" | ECHO NLL {tensor_stats['echo_nll/mean']:.4f}"
++        if "echo_token_fraction/mean" in tensor_stats:
++            step_message += f" | Env. Tokens {tensor_stats['echo_token_fraction/mean']:.1%}"
+         if grad_norm is not None:
+             step_message += f" | Grad. Norm {grad_norm:.4f}"
+         step_message += f" | LR {current_lr:.2e} | Throughput {throughput:.0f} tokens/s | MFU {mfu:.1f}% | Peak Mem. {peak_memory:.1f} GiB"
+diff --git a/src/prime_rl/trainer/sft/train.py b/src/prime_rl/trainer/sft/train.py
+index 87a23373..95ff03c9 100644
+--- a/src/prime_rl/trainer/sft/train.py
++++ b/src/prime_rl/trainer/sft/train.py
+@@ -38,6 +38,7 @@ from prime_rl.trainer.sft.data import load_sft_dataset, setup_dataloader, setup_
+ from prime_rl.trainer.utils import (
+     GarbageCollection,
+     MemoryProfiler,
++    clip_grad_norm_,
+     export_benchmark_json,
+     get_zero_gradient_ratio,
+     get_ckpt_disk_metrics,
+@@ -55,8 +56,6 @@ import torch.distributed as dist
+ from liger_kernel.transformers.cross_entropy import LigerCrossEntropyLoss
+ from prime_rl.trainer.models.layers.lm_head import FUSED_CE_IGNORE_INDEX
+ 
+-from torchtitan.distributed.utils import clip_grad_norm_
+-
+ 
+ @clean_exit
+ def train(config: SFTConfig):
+diff --git a/src/prime_rl/trainer/utils.py b/src/prime_rl/trainer/utils.py
+index 2d278a12..98208e78 100644
+--- a/src/prime_rl/trainer/utils.py
++++ b/src/prime_rl/trainer/utils.py
+@@ -30,6 +30,24 @@ from prime_rl.utils.utils import format_num, format_time, get_step_path
+ DEFAULT_TIMEOUT = timedelta(seconds=600)
+ 
+ 
++def clip_grad_norm_(parameters: Iterable[Tensor], max_norm: float, *, ep_enabled: bool) -> Tensor:
++    """Clip gradients without selecting TorchTitan's empty EP bucket path."""
++    from torchtitan.distributed.utils import clip_grad_norm_ as torchtitan_clip_grad_norm_
++
++    parameters = list(parameters)
++    grad_parameters = [parameter for parameter in parameters if parameter.grad is not None]
++    has_ep_grad = any(
++        isinstance(parameter, DTensor) and "ep" in (parameter.device_mesh.mesh_dim_names or ())
++        for parameter in grad_parameters
++    )
++    has_non_ep_grad = any(
++        not isinstance(parameter, DTensor) or "ep" not in (parameter.device_mesh.mesh_dim_names or ())
++        for parameter in grad_parameters
++    )
++    use_ep_path = ep_enabled and has_ep_grad and has_non_ep_grad
++    return torchtitan_clip_grad_norm_(parameters, max_norm=max_norm, ep_enabled=use_ep_path)
++
++
+ def _text_config(model_config: Any) -> Any:
+     """Unwrap a multimodal model's text config, else return the config unchanged."""
+     return getattr(model_config, "text_config", model_config)
+@@ -651,15 +669,24 @@ class MemoryProfiler:
+         self.step_num += 1
+ 
+ 
++# Broadcast dirs must outlive the orchestrator's max_off_policy_steps window: an in-flight
++# rollout up to N policy versions stale still loads its pinned LoRA adapter on every turn.
++# Slow multi-turn rollouts routinely lag several steps, so keeping only the last 2 (the old
++# 1-step-async assumption) deletes an adapter still in use and kills the vLLM engine with
++# LoRAAdapterNotFoundError. Keep enough to cover the default max_off_policy_steps (8) + margin.
++BROADCAST_KEEP_STEPS = 12
++
++
+ def maybe_clean(path: Path, step: int, interval_to_keep: int | None) -> None:
+-    """Delete the broadcast dir from 2 trainer steps ago.
++    """Delete the broadcast dir from ``BROADCAST_KEEP_STEPS`` trainer steps ago.
+ 
+-    With a 1-step async barrier, the orchestrator at trainer step ``step`` is still consuming the
+-    ckpt from ``step - 1``; ``step - 2`` is therefore safe to remove unless it falls on a
++    The orchestrator may still be consuming a broadcast up to ``max_off_policy_steps`` old
++    (in-flight rollouts pinned to an earlier policy), so anything inside that window must be
++    preserved; ``step - BROADCAST_KEEP_STEPS`` is safe to remove unless it falls on a
+     checkpoint interval that we want to preserve.
+     """
+     logger = get_logger()
+-    candidate_step = max(step - 2, 0)
++    candidate_step = max(step - BROADCAST_KEEP_STEPS, 0)
+     candidate_path = get_step_path(path, candidate_step)
+     if interval_to_keep and candidate_step % interval_to_keep == 0:
+         logger.debug(f"Keeping path {candidate_path} (on ckpt interval)")
+diff --git a/src/prime_rl/transport/types.py b/src/prime_rl/transport/types.py
+index 1666c510..39362454 100644
+--- a/src/prime_rl/transport/types.py
++++ b/src/prime_rl/transport/types.py
+@@ -2,7 +2,7 @@ from typing import Literal
+ 
+ import msgspec
+ 
+-TrainingMode = Literal["rl", "opd", "sft"]
++TrainingMode = Literal["rl", "opd", "sft", "echo"]
+ 
+ 
+ # Encoded tensor: {dtype: "float32", shape: [...], data: <bytes>}.
+@@ -36,6 +36,8 @@ class TrainingSample(msgspec.Struct, array_like=True, gc=False, omit_defaults=Tr
+     teacher_logprobs: list[float] | None = None
+     advantage: float | None = None
+     reward: float | None = None
++    completion_environment_mask: list[bool] | None = None
++    prompt_environment_mask: list[bool] | None = None
+ 
+     # Generic multimodal kwargs: flat dict keyed by the kwarg names the
+     # model's forward expects (e.g. {"pixel_values": ..., "image_grid_thw":
+@@ -90,6 +92,7 @@ class MicroBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
+     # sft → sft loss). All samples packed into a micro batch share the same mode.
+     training_mode: TrainingMode = "rl"
+     rewards: list[float] | None = None
++    environment_mask: list[bool] | None = None
+ 
+     # Packer-derived metadata used for run-local token exports.
+     run_id: str | None = None
+diff --git a/src/prime_rl/utils/chat_template.py b/src/prime_rl/utils/chat_template.py
+index a30c5e72..1855eb0b 100644
+--- a/src/prime_rl/utils/chat_template.py
++++ b/src/prime_rl/utils/chat_template.py
+@@ -40,6 +40,8 @@ def normalize_messages(messages: Any, default_role: str) -> list[dict[str, Any]]
+ 
+ def deserialize_tool_calls(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+     def _deserialize_tool_call(tool_call: dict[str, Any]) -> dict[str, Any]:
++        if "function" not in tool_call:
++            return dict(tool_call)
+         function = tool_call.get("function", {})
+         arguments = function.get("arguments")
+         if isinstance(arguments, str):
+diff --git a/src/prime_rl/utils/client.py b/src/prime_rl/utils/client.py
+index 533f6e27..faafdc72 100644
+--- a/src/prime_rl/utils/client.py
++++ b/src/prime_rl/utils/client.py
+@@ -215,6 +215,7 @@ def setup_clients(
+                     max_connections=8192,
+                     max_keepalive_connections=8192,
+                     max_retries=10,
++                    preserve_reasoning_only_responses=client_config.preserve_reasoning_only_responses,
+                     extra_headers=headers,
+                     extra_headers_from_state=client_config.extra_headers_from_state,
+                     **renderer_extra,
+diff --git a/src/prime_rl/utils/elastic.py b/src/prime_rl/utils/elastic.py
+index 951b3673..47bb9cff 100644
+--- a/src/prime_rl/utils/elastic.py
++++ b/src/prime_rl/utils/elastic.py
+@@ -199,6 +199,7 @@ class ElasticInferencePool:
+                 headers_from_env=self.client_config.headers_from_env,
+                 dp_rank_count=self.client_config.dp_rank_count,
+                 extra_headers_from_state=self.client_config.extra_headers_from_state,
++                preserve_reasoning_only_responses=self.client_config.preserve_reasoning_only_responses,
+             )
+             self._train_clients = (
+                 setup_clients(
+diff --git a/src/prime_rl/utils/messages.py b/src/prime_rl/utils/messages.py
+index 13ebf6a6..e13d7944 100644
+--- a/src/prime_rl/utils/messages.py
++++ b/src/prime_rl/utils/messages.py
+@@ -26,6 +26,8 @@ def normalize_messages(messages: Any, default_role: str) -> list[dict[str, Any]]
+ 
+ def deserialize_tool_calls(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+     def _deserialize_tool_call(tool_call: dict[str, Any]) -> dict[str, Any]:
++        if "function" not in tool_call:
++            return dict(tool_call)
+         function = tool_call.get("function", {})
+         arguments = function.get("arguments")
+         if isinstance(arguments, str):
+diff --git a/src/prime_rl/utils/monitor/wandb.py b/src/prime_rl/utils/monitor/wandb.py
+index 7935d13a..e4bbbded 100644
+--- a/src/prime_rl/utils/monitor/wandb.py
++++ b/src/prime_rl/utils/monitor/wandb.py
+@@ -243,5 +243,9 @@ class WandbMonitor(Monitor):
+         assert self.output_dir is not None, "Output directory is required for saving final summary"
+         dir_path = self.output_dir / f"run-{self.wandb.id}"
+         dir_path.mkdir(parents=True, exist_ok=True)
++        try:
++            summary_dict = wandb.summary._as_dict()
++        except (AttributeError, KeyError):
++            summary_dict = dict(wandb.summary)
+         with open(dir_path / filename, "w") as f:
+-            json.dump(wandb.summary._as_dict(), f)
++            json.dump(summary_dict, f, default=str)
+diff --git a/tests/unit/orchestrator/test_dispatcher.py b/tests/unit/orchestrator/test_dispatcher.py
+new file mode 100644
+index 00000000..aef84c97
+--- /dev/null
++++ b/tests/unit/orchestrator/test_dispatcher.py
+@@ -0,0 +1,42 @@
++import asyncio
++from types import SimpleNamespace
++
++from prime_rl.orchestrator.dispatcher import RolloutDispatcher
++
++
++def test_policy_update_waits_for_older_eval_generation_to_drain():
++    async def run() -> None:
++        state = {"queued_step": 25}
++        dispatcher = RolloutDispatcher.__new__(RolloutDispatcher)
++        dispatcher.eval_source = SimpleNamespace(
++            has_pending_before=lambda version: state["queued_step"] is not None and state["queued_step"] < version
++        )
++        dispatcher.groups = {}
++        dispatcher.inflight = {}
++        dispatcher.eval_work_changed = asyncio.Event()
++
++        exact_update = asyncio.create_task(dispatcher.wait_for_eval_before_policy_update(25))
++        await asyncio.sleep(0)
++        assert exact_update.done()
++
++        newer_update = asyncio.create_task(dispatcher.wait_for_eval_before_policy_update(26))
++        await asyncio.sleep(0)
++        assert not newer_update.done()
++
++        state["queued_step"] = None
++        dispatcher.groups["eval-group"] = SimpleNamespace(kind="eval", eval_step=25)
++        dispatcher.eval_work_changed.set()
++        await asyncio.sleep(0)
++        assert not newer_update.done()
++
++        dispatcher.groups.clear()
++        dispatcher.inflight["eval-task"] = SimpleNamespace(kind="eval", eval_step=25)
++        dispatcher.eval_work_changed.set()
++        await asyncio.sleep(0)
++        assert not newer_update.done()
++
++        dispatcher.inflight.clear()
++        dispatcher.eval_work_changed.set()
++        await newer_update
++
++    asyncio.run(run())
+diff --git a/tests/unit/orchestrator/test_metrics.py b/tests/unit/orchestrator/test_metrics.py
+new file mode 100644
+index 00000000..3a96f6de
+--- /dev/null
++++ b/tests/unit/orchestrator/test_metrics.py
+@@ -0,0 +1,143 @@
++import uuid
++from types import SimpleNamespace
++
++import pytest
++
++from prime_rl.configs.orchestrator import OrchestratorConfig
++from prime_rl.orchestrator.eval_sink import EvalSink
++from prime_rl.orchestrator.metrics import MetricsBuilder
++from prime_rl.orchestrator.types import EvalRollout, Progress, TrainBatchMetrics, TrainRollout
++
++
++def _rollout(
++    *,
++    env_name: str,
++    group_id: uuid.UUID,
++    reward: float,
++    custom_score: float,
++    filter_results: dict[str, bool] | None = None,
++    stop_condition: str = "stop",
++) -> TrainRollout:
++    return TrainRollout(
++        raw={
++            "reward": reward,
++            "metrics": {"custom_score": custom_score},
++            "token_usage": {"final_input_tokens": 3, "final_output_tokens": 2},
++            "trajectory": [{}, {}],
++            "timing": {
++                "total": 10.0,
++                "setup": {"duration": 1.0},
++                "generation": {"duration": 2.0},
++                "model": {"duration": 3.0},
++                "env": {"duration": 4.0},
++                "scoring": {"duration": 5.0},
++                "overhead": 6.0,
++            },
++            "stop_condition": stop_condition,
++        },
++        env_name=env_name,
++        example_id=0,
++        group_id=group_id,
++        policy_version=0,
++        off_policy_steps=0,
++        filter_results=filter_results or {"repetition": False},
++    )
++
++
++def test_metrics_builder_logs_concrete_env_metrics_env_first(tmp_path):
++    alpha_group = uuid.uuid4()
++    beta_group = uuid.uuid4()
++    rollouts = [
++        _rollout(env_name="alpha", group_id=alpha_group, reward=1.0, custom_score=0.2),
++        _rollout(env_name="alpha", group_id=alpha_group, reward=0.0, custom_score=0.6),
++        _rollout(env_name="beta", group_id=beta_group, reward=1.0, custom_score=0.8),
++        _rollout(env_name="beta", group_id=beta_group, reward=1.0, custom_score=1.0),
++    ]
++    config = OrchestratorConfig(
++        output_dir=tmp_path,
++        train={
++            "env": [
++                {"id": "dummy-alpha", "name": "alpha", "group_size": 2},
++                {"id": "dummy-beta", "name": "beta", "group_size": 2},
++            ]
++        },
++    )
++    batch_metrics = TrainBatchMetrics(
++        n_trainable=4,
++        num_prefill_tokens=12,
++        num_decode_tokens=8,
++        rollout_prefill_lens=[3, 3, 3, 3],
++        rollout_decode_lens=[2, 2, 2, 2],
++        samples_per_rollout=[1, 1, 1, 1],
++        samples_shipped=4,
++    )
++
++    to_log = MetricsBuilder(config).build(
++        step=0,
++        rollouts=rollouts,
++        metrics=batch_metrics,
++        progress=Progress(),
++        step_time=1.0,
++        save_ckpt_time=0.0,
++        teacher_logprobs_time=0.0,
++        pre_filter_seen=0,
++        pre_filter_dropped=0,
++        pre_filter_dropped_by_name={},
++    )
++
++    assert to_log["alpha/reward/mean"] == pytest.approx(0.5)
++    assert to_log["alpha/seq_len/mean"] == pytest.approx(5.0)
++    assert to_log["alpha/timing/env/mean"] == pytest.approx(4.0)
++    assert to_log["alpha/metrics/custom_score/mean"] == pytest.approx(0.4)
++    assert to_log["alpha/filters/repetition"] == pytest.approx(0.0)
++    assert to_log["alpha/solve_none"] == pytest.approx(0.0)
++    assert to_log["beta/reward/mean"] == pytest.approx(1.0)
++
++    assert "reward/alpha/mean" not in to_log
++    assert "seq_len/alpha/mean" not in to_log
++    assert "timing/alpha/env/mean" not in to_log
++    assert "metrics/alpha/custom_score" not in to_log
++    assert "filters/alpha/repetition" not in to_log
++
++    # Aggregate metrics intentionally keep the reserved "all" pseudo-env shape.
++    assert to_log["reward/all/mean"] == pytest.approx(0.75)
++
++
++def test_eval_metrics_log_model_errors_as_zero_without_counting_cancellations():
++    env = SimpleNamespace(
++        config=SimpleNamespace(group_size=1),
++        examples=[{}, {}, {}],
++        requires_group_scoring=False,
++    )
++    eval_envs = SimpleNamespace(get=lambda _name: env)
++    sink = EvalSink(eval_envs=eval_envs)
++
++    def rollout(example_id: int, *, reward: float, error: dict | None = None) -> EvalRollout:
++        return EvalRollout(
++            raw={
++                "reward": reward,
++                "error": error,
++                "completion": [{"role": "assistant", "content": "answer"}] if error is None else None,
++                "trajectory": [{}] if error is None else [],
++                "token_usage": {"final_output_tokens": 1},
++            },
++            env_name="benchmark",
++            example_id=example_id,
++            group_id=uuid.uuid4(),
++            policy_version=0,
++            off_policy_steps=0,
++            eval_step=0,
++        )
++
++    assert sink.add(rollout(0, reward=1.0)) is None
++    assert sink.add(rollout(1, reward=0.0, error={"error": "EmptyModelResponseError"})) is None
++    batch = sink.add(rollout(2, reward=0.0, error={"error": "Cancelled"}))
++    assert batch is not None
++    assert batch.metrics.reward_mean == pytest.approx(1.0)
++    assert batch.metrics.reward_mean_including_errors == pytest.approx(0.5)
++    assert batch.metrics.n_examples == 1
++    assert batch.metrics.n_examples_including_errors == 2
++
++    logged = batch.metrics.to_wandb_dict(env_name="benchmark", step=0)
++    assert logged["eval/benchmark/avg@1"] == pytest.approx(1.0)
++    assert logged["eval/benchmark/avg@1_including_errors"] == pytest.approx(0.5)
+diff --git a/tests/unit/orchestrator/test_trajectories.py b/tests/unit/orchestrator/test_trajectories.py
+index bda129cd..0e10f91a 100644
+--- a/tests/unit/orchestrator/test_trajectories.py
++++ b/tests/unit/orchestrator/test_trajectories.py
+@@ -74,6 +74,14 @@ def test_deserialize_tool_calls_parses_arguments_when_present():
+     assert deserialized[0]["tool_calls"][0]["function"]["arguments"] == {"x": 1}
+ 
+ 
++def test_deserialize_tool_calls_preserves_compact_native_calls():
++    tool_call = {"id": "1", "name": "lookup", "arguments": '{"x": 1}'}
++
++    deserialized = _deserialize_tool_calls([{"role": "assistant", "tool_calls": [tool_call]}])
++
++    assert deserialized[0]["tool_calls"] == [tool_call]
++
++
+ @pytest.fixture
+ def single_step_trajectory_output():
+     output = vf.RolloutOutput(
+@@ -618,6 +626,27 @@ def test_interleave_rollout_extension_break_creates_multiple_samples(five_step_t
+     assert sample2.completion_logprobs == [-0.7, -0.8, 0, 0, -0.9, -1.0]
+ 
+ 
++def test_interleave_rollout_marks_environment_extensions(five_step_trajectory_with_extension_break):
++    prompt_masks = [
++        [False, False],
++        [False, False, False, False, True, True],
++        [False, False, False, False, False, False, False, False, True, True],
++        [False, False, True, True],
++        [False, False, False, False, False, False, True, True],
++    ]
++    samples = interleave_rollout(
++        five_step_trajectory_with_extension_break,
++        environment_supervision=True,
++        environment_prompt_masks=prompt_masks,
++    )
++
++    assert samples is not None
++    assert samples[0].prompt_environment_mask == [False, False]
++    assert samples[0].completion_environment_mask == [False, False, True, True, False, False, True, True, False, False]
++    assert samples[1].prompt_environment_mask == [False, False, True, True]
++    assert samples[1].completion_environment_mask == [False, False, True, True, False, False]
++
++
+ @pytest.fixture
+ def interleaved_agents_trajectory():
+     """
