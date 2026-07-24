@@ -35,7 +35,7 @@ class EquivalenceJudgeConfig(vf.JudgeConfig):
     """Same local vLLM endpoint the v0 reasoning env graded science answers against."""
 
     model: str = "google/gemma-4-26B-A4B-it"
-    base_url: str = "http://127.0.0.1:8000/v1"
+    base_url: str = "http://198.13.252.41:40002/v1"
     api_key_var: str = "VLLM_API_KEY"
     sampling: vf.JudgeSamplingConfig = vf.JudgeSamplingConfig(temperature=0.0, max_tokens=2048)
 

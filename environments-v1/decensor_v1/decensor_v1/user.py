@@ -18,6 +18,8 @@ import random
 import re
 from typing import Any
 
+from pydantic import Field
+
 import verifiers.v1 as vf
 from verifiers.v1.clients.config import build_async_openai
 from verifiers.v1.mcp.user import UserConfig
@@ -149,8 +151,9 @@ class DecensorUserConfig(UserConfig):
     """User-simulator model + sampling (defaults to the gemma judge endpoint)."""
 
     model: str = "google/gemma-4-26B-A4B-it"
-    base_url: str = "http://216.243.220.158:20003/v1"
-    api_key_var: str = "DECENSOR_JUDGE_API_KEY"
+    base_url: str = "http://198.13.252.41:40002/v1"
+    api_key_var: str = "VLLM_API_KEY"
+    headers: dict[str, str] = Field(default_factory=dict)  # build_async_openai reads this
     temperature: float = 1.0
     min_p: float = 0.0
     max_tokens: int = 256

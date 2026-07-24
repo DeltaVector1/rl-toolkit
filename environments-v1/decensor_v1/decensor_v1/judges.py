@@ -186,8 +186,8 @@ class DecensorJudgeConfig(JudgeConfig):
     """Shared config for every decensor judge (gemma endpoint by default)."""
 
     model: str = "google/gemma-4-26B-A4B-it"
-    base_url: str = "http://216.243.220.158:20003/v1"
-    api_key_var: str = "DECENSOR_JUDGE_API_KEY"
+    base_url: str = "http://198.13.252.41:40002/v1"
+    api_key_var: str = "VLLM_API_KEY"
     sampling: DecensorJudgeSampling = DecensorJudgeSampling()
     min_p: float = 0.05
     disable_thinking: bool = True

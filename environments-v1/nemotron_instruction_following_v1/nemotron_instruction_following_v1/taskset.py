@@ -35,6 +35,8 @@ import json
 import random
 from typing import Any
 
+from pydantic import model_validator
+
 import verifiers.v1 as vf
 from nemotron_guard_v1 import AntiHackingConfig, GuardedTask
 from nemotron_guard_v1.text import strip_think_tags
@@ -99,6 +101,22 @@ class NemotronIFData(vf.TaskData):
     # ultra-judge
     instructions: list[dict[str, Any]] = []
     judge_items: list[dict[str, Any]] = []
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_null_dict_entries(cls, data: Any) -> Any:
+        """The real datasets carry ``null`` where an instruction has no kwargs (and can null a
+        verifier), so the ``dict`` / ``list[dict]`` fields must tolerate None: a null list entry
+        becomes ``{}`` (no-constraint), a null dict field becomes ``{}``. Keeps the row loadable
+        instead of failing the whole taskset build on a single null."""
+        if isinstance(data, dict):
+            for key in ("kwargs_list", "criteria", "instructions", "judge_items"):
+                value = data.get(key)
+                if isinstance(value, list):
+                    data[key] = [item if isinstance(item, dict) else {} for item in value]
+            if "verifier" in data and not isinstance(data["verifier"], dict):
+                data["verifier"] = {}
+        return data
 
 
 class NemotronIFTaskConfig(vf.TaskConfig):
