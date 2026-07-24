@@ -8,6 +8,7 @@ pushed to write long — a short verbose answer zeros the length term, matching 
 
 from __future__ import annotations
 
+import random
 import re
 from typing import Any
 

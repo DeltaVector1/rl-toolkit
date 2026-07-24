@@ -340,7 +340,7 @@ class NemotronReasoningTaskset(
             NemotronReasoningTask(task.data.model_copy(update={"idx": idx}), self.config.task)
             for idx, task in enumerate(tasks)
         ]
-        realized = mix_summary(by_subtask, tasks, lambda task: task.data.subtask)
+        realized = mix_summary(by_subtask, tasks)
         print(f"nemotron-reasoning blend: {realized} (total {len(tasks)})", flush=True)
         return tasks
 

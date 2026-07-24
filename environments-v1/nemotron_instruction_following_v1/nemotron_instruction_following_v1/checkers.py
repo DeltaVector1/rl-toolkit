@@ -594,9 +594,30 @@ CHECKERS: dict[str, Callable[[str, dict], bool]] = {
 
 
 def checker_supported(instruction_id: str) -> bool:
-    """Can this constraint be graded at all? Rows with an ungradeable constraint are dropped
-    at load — an unchecked constraint always counts as failed, making the row unwinnable."""
+    """Is there a checker for this id at all?"""
     return instruction_id in _UPSTREAM_CHECKERS or instruction_id in CHECKERS
+
+
+def constraint_gradeable(instruction_id: str, kwargs: dict | None) -> bool:
+    """Can this constraint actually be evaluated with these kwargs?
+
+    Beyond "a checker exists", the kwargs have to bind: some rows carry a list where the
+    checker wants a string, and `build_description` raises `AttributeError`. At scoring time
+    that is swallowed and the constraint counts as failed — forever, for every rollout — so
+    the row is unwinnable and contributes a zero with no variance. Catch it at load instead.
+    """
+    if not checker_supported(instruction_id):
+        return False
+    instruction_cls = _UPSTREAM_CHECKERS.get(instruction_id)
+    if instruction_cls is None:
+        return True
+    try:
+        instruction_cls(instruction_id).build_description(
+            **{k: v for k, v in (kwargs or {}).items() if v is not None}
+        )
+    except Exception:
+        return False
+    return True
 
 
 def check_instruction(instruction_id: str, text: str, kwargs: dict | None) -> bool | None:

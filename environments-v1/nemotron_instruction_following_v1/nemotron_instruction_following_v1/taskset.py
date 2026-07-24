@@ -42,7 +42,7 @@ from nemotron_guard_v1 import AntiHackingConfig, GuardedTask, SubtaskMix, apply_
 from nemotron_guard_v1.text import strip_think_tags
 from verifiers.v1.types import content_text
 
-from nemotron_instruction_following_v1.checkers import CHECKERS, checker_supported
+from nemotron_instruction_following_v1.checkers import CHECKERS, constraint_gradeable
 from nemotron_instruction_following_v1.judging import (
     ADVERSARIAL_DEFAULT_TEMPLATE,
     CALENDAR_PROMPT,
@@ -436,7 +436,7 @@ class NemotronIFTaskset(vf.Taskset[NemotronIFTask, NemotronIFConfig]):
     def load(self) -> list[NemotronIFTask]:
         by_subtask = {key: self._load_subtask(key) for key in _resolve_datasets(self.config.dataset)}
         tasks = apply_mix(by_subtask, self.config.mix, self.config.seed, self.config.mix_total)
-        realized = mix_summary(by_subtask, tasks, lambda task: task.data.subtask)
+        realized = mix_summary(by_subtask, tasks)
         print(f"nemotron-instruction-following blend: {realized} (total {len(tasks)})", flush=True)
         return tasks
 
@@ -494,9 +494,12 @@ class NemotronIFTaskset(vf.Taskset[NemotronIFTask, NemotronIFConfig]):
                 continue
             # A constraint with no checker always counts as failed, making the row unwinnable;
             # drop rows we cannot actually grade rather than train on constant-zero reward.
-            if not ids or any(not checker_supported(str(cid)) for cid in ids):
+            if not ids or len(ids) != len(kwargs_list):
                 continue
-            if any(_constraint_unsatisfiable(str(cid), kw) for cid, kw in zip(ids, kwargs_list)):
+            if any(
+                not constraint_gradeable(str(cid), kw) or _constraint_unsatisfiable(str(cid), kw)
+                for cid, kw in zip(ids, kwargs_list)
+            ):
                 continue
             tasks.append(self._make(
                 i, prompt, subtask="ifeval", uuid=str(row.get("id", "")),

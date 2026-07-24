@@ -252,7 +252,7 @@ class NemotronKnowledgeTaskset(
             )
 
         tasks = apply_mix(by_subtask, self.config.mix, self.config.seed, self.config.mix_total)
-        realized = mix_summary(by_subtask, tasks, lambda task: task.data.subtask)
+        realized = mix_summary(by_subtask, tasks)
         print(f"nemotron-knowledge blend: {realized} (total {len(tasks)})", flush=True)
         return tasks
 

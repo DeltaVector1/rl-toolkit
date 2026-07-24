@@ -90,6 +90,7 @@ name = "nemotron-knowledge"
 ratio = 1.0
 env.taskset.id = "nemotron-knowledge-v1"
 env.taskset.dataset = "all"
+env.taskset.mix_total = 20000
 env.agent.harness = { id = "null", runtime = { type = "subprocess" } }
 env.agent.timeout.rollout = 900
 
@@ -107,12 +108,15 @@ model = "google/gemma-4-26B-A4B-it"
 api_key_var = "VLLM_API_KEY"
 
 # qa_abstention is 3.1k rows against mcqa's 617k, so without a weight it is ~0.5% of the
-# blend — 4 distinct prompts across 50 steps.
+# blend — 4 distinct prompts across 50 steps. `mix_total` bounds the pool: weights are a
+# share of THIS many prompts, and a subtask with fewer rows than its quota is cycled. 20k is
+# ~2.5x what 500 steps consume, so keep it modest or small sources repeat heavily (qa has
+# only 3.1k unique prompts, so 0.1 already means each is seen ~2x per pass).
 [orchestrator.train.env.env.taskset.mix.mcqa]
-weight = 0.8
+weight = 0.9
 
 [orchestrator.train.env.env.taskset.mix.qa_abstention]
-weight = 0.2
+weight = 0.1
 
 # --- nemotron-reasoning — 256 rollouts. math graded by math-verify; science by judge. ---
 [[orchestrator.train.env]]
@@ -120,6 +124,7 @@ name = "nemotron-reasoning"
 ratio = 1.0
 env.taskset.id = "nemotron-reasoning-v1"
 env.taskset.dataset = "all"
+env.taskset.mix_total = 20000
 env.agent.harness = { id = "null", runtime = { type = "subprocess" } }
 env.agent.timeout.rollout = 900
 
@@ -158,6 +163,7 @@ name = "nemotron-instruction-following"
 ratio = 1.0
 env.taskset.id = "nemotron-instruction-following-v1"
 env.taskset.dataset = "all"
+env.taskset.mix_total = 20000
 env.agent.harness = { id = "null", runtime = { type = "subprocess" } }
 env.agent.timeout.rollout = 900
 
@@ -227,6 +233,7 @@ name = "nemotron-tool-calling"
 ratio = 1.0
 env.taskset.id = "nemotron-tool-calling-v1"
 env.taskset.dataset = "all"
+env.taskset.mix_total = 20000
 env.taskset.exclude_message_actions = true
 env.taskset.max_prompt_chars = 60000
 env.agent.harness = { id = "null", runtime = { type = "subprocess" } }
@@ -341,6 +348,10 @@ enable_expert_parallel = true
 
 [inference.model]
 max_model_len = 32768
+# torch.compile of this model kills the vLLM engine core during startup (the engine core
+# process dies silently mid-Dynamo, `Failed core proc(s): {}`). Eager works and the model
+# is MoE with 3B active, so the throughput cost is modest. Retry compiled on a vLLM bump.
+enforce_eager = true
 tool_call_parser = "hermes"
 reasoning_parser = "deepseek_r1"
 

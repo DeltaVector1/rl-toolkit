@@ -108,10 +108,18 @@ def apply_mix(
     return pool
 
 
-def mix_summary(rows_by_subtask: dict[str, list[T]], pool: Iterable[T], key) -> dict[str, int]:
-    """Realized per-subtask counts, for logging what the blend actually produced."""
+def mix_summary(rows_by_subtask: dict[str, list[T]], pool: Iterable[T]) -> dict[str, int]:
+    """Realized per-subtask counts, for logging what the blend actually produced.
+
+    Counts by which input list a row came from, by identity — not by any field on the row.
+    A taskset's loader key and the `subtask` it stamps on the data need not match (the
+    instruction-following env loads `structured_v2_direct` and stamps
+    `structured_v2_direct_generation`), and keying off the field reports phantom zeros.
+    """
+    origin = {id(row): name for name, rows in rows_by_subtask.items() for row in rows}
     counts = {name: 0 for name in rows_by_subtask}
     for row in pool:
-        name = key(row)
-        counts[name] = counts.get(name, 0) + 1
+        name = origin.get(id(row))
+        if name is not None:
+            counts[name] += 1
     return counts
