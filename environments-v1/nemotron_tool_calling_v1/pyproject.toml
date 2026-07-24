@@ -1,0 +1,22 @@
+[project]
+name = "nemotron-tool-calling-v1"
+version = "0.1.0"
+description = "Nemotron tool-calling taskset (pivot next-action, workplace, prompt-injection) with the anti-hacking guardrail."
+tags = ["nemotron", "tool-calling", "function-calling", "agentic", "v1"]
+requires-python = ">=3.11"
+dependencies = [
+    "verifiers>=0.2.0",
+    "nemotron-guard-v1",
+    "datasets",
+    "huggingface-hub",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["nemotron_tool_calling_v1"]
+
+[tool.uv.sources]
+nemotron-guard-v1 = { workspace = true }

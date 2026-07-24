@@ -1,0 +1,26 @@
+[project]
+name = "nemotron-instruction-following-v1"
+version = "0.1.0"
+description = "Nemotron instruction-following taskset (ifeval + structured + format + judge subtasks) with the anti-hacking guardrail."
+tags = ["nemotron", "instruction-following", "ifeval", "structured-outputs", "llm-judge", "v1"]
+requires-python = ">=3.11"
+dependencies = [
+    "verifiers>=0.2.0",
+    "nemotron-guard-v1",
+    "datasets",
+    "huggingface-hub",
+    "jsonschema",
+    "pyyaml",
+    "pyarrow",
+    "langdetect",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["nemotron_instruction_following_v1"]
+
+[tool.uv.sources]
+nemotron-guard-v1 = { workspace = true }
