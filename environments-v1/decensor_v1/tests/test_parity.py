@@ -7,12 +7,14 @@ stubbed to fixed verdicts, so only the deterministic multiplicative math is comp
     /root/prime/rl_environments/decensor-env, with `_judge_text` monkeypatched.
   * v1: `decensor_v1.scoring.score_decensor` fed the same verdicts.
 
-Most cases assert exact equality. The audit-fix cases assert the *intended* divergence:
-  - FIX #2: "Be verbose" at an unreachable word count — v0 hard-zeros via word_mult=0,
-    v1 floors word_mult to 0.1.
-  - FIX #4: v0's dead `reasoning_coherency` judge (always 1.0) is dropped in v1; parity
-    holds because v0-with-coherency=1 equals v1-without-the-judge.
-  - FIX #5: a judge that errors — v0 hard-zeros (fail-closed), v1 fails open (non-penalizing).
+Most cases assert exact equality. The audit-fix cases assert the *intended* behavior:
+  - FIX #2: "Be verbose" at an unreachable word count is reverted to v0 exactly (plain parity).
+  - reasoning_coherency: re-added as a real working gate fed the true reasoning trace. Both
+    sides enable it, so a stubbed verdict of 0 zeroes the product on both and 1 is a no-op
+    (exact parity either way).
+  - FIX #6: the two judge failure modes are split. A judge ENDPOINT outage tanks the v1
+    reward to 0 (matching v0's zero-on-judge-error) and sets `decensor_judge_endpoint_down`.
+    A received-but-unparseable reply (parse failure) stays fail-open on the v1 side.
 
 Run from the prime-modern venv:
     uv run --project /root/prime-modern pytest \
@@ -50,11 +52,13 @@ class Case:
     include_reasoning: bool = True
     unclosed_think: bool = False
     truncated: bool = False
-    judge_error: str | None = None  # name of a judge that errors
+    judge_error: str | None = None  # name of a judge whose ENDPOINT errors (outage, FIX #6)
+    parse_failure: str | None = None  # name of a judge that replies with an unparseable tag
     reasoning_enabled: bool = True
     # None => assert exact parity; a float => assert v1 equals this (fixed behavior)
     expect_v1: float | None = None
     expect_v0: float | None = None
+    expect_endpoint_down: bool = False  # assert v1 sets decensor_judge_endpoint_down
 
 
 def build_assistant(case: Case) -> str:
@@ -85,7 +89,7 @@ def verdict_strings(case: Case) -> dict:
         "refusal": f"<Refusal_Score>{v.get('refusal', 1)}</Refusal_Score>",
         "coherency": f"<score>{v.get('coherency', 1)}</score>",
         "reasoning_ethics": f"<score>{v.get('reasoning_ethics', 0)}</score>",
-        "reasoning_coherency": "<score>1</score>",  # v0's dead judge, real behavior
+        "reasoning_coherency": f"<score>{v.get('reasoning_coherency', 1)}</score>",
         "meta_commentary": f"<score>{v.get('meta_commentary', 0)}</score>",
         "md_presence": f"<score>{v.get('md_presence', 1)}</score>",
         "md_correctness": f"<score>{v.get('md_correctness', 1)}</score>",
@@ -108,7 +112,11 @@ async def v0_reward(case: Case) -> float:
 
     async def fake_judge_text(name, prompt):
         if case.judge_error == name:
+            # Endpoint outage: gemma unreachable → v0 gates the rollout to 0 on judge error.
             return {"response": None, "error": "simulated judge outage", "attempt_count": 1, "failed_attempts": []}
+        if case.parse_failure == name:
+            # Gemma replied, but the verdict is unparseable (no error) → v0 parses to None.
+            return {"response": "no score tag here", "error": None, "attempt_count": 1, "failed_attempts": []}
         return {"response": strings[name], "error": None, "attempt_count": 1, "failed_attempts": []}
 
     rubric._judge_text = fake_judge_text
@@ -120,19 +128,22 @@ async def v0_reward(case: Case) -> float:
     return reward
 
 
-def v1_reward(case: Case) -> float:
+def v1_reward(case: Case) -> tuple[float, dict]:
     prompt, completion = build_conversation(case)
     v = case.verdicts
 
     def maybe(name, default):
-        if case.judge_error == name:
-            return None  # fail-open
+        # Both an endpoint outage and a parse failure resolve to a None verdict on the v1
+        # side; the outage additionally sets judge_endpoint_down below (FIX #6).
+        if case.judge_error == name or case.parse_failure == name:
+            return None
         return v.get(name, default)
 
     verdicts = Verdicts(
         refusal=maybe("refusal", 1),
         coherency=maybe("coherency", 1),
         reasoning_ethics=maybe("reasoning_ethics", 0),
+        reasoning_coherency=maybe("reasoning_coherency", 1),
         meta_commentary=maybe("meta_commentary", 0),
         md_presence=maybe("md_presence", 1),
         # md_correctness only exists for styles/markdown; plaintext leaves it None (unused)
@@ -142,12 +153,12 @@ def v1_reward(case: Case) -> float:
         incoherent_penalty_multiplier=PENALTY, meta_commentary_multiplier=META_MULT,
         word_count_tolerance_percent=TOL, reasoning_enabled=case.reasoning_enabled,
     )
-    reward, _ = score_decensor(
+    reward, breakdown = score_decensor(
         prompt, completion, verdicts, bucket=case.bucket,
         word_requirement=case.word_requirement, is_truncated=case.truncated,
-        md_exempt=False, config=cfg,
+        md_exempt=False, judge_endpoint_down=case.judge_error is not None, config=cfg,
     )
-    return reward
+    return reward, breakdown
 
 
 CASES: list[Case] = [
@@ -182,6 +193,11 @@ CASES: list[Case] = [
          {"refusal": 1, "coherency": 0, "md_presence": 1}),
     Case("reasoning_ethics_refuses", "markdown", "Respond tersely", 100,
          {"refusal": 1, "reasoning_ethics": 1, "md_presence": 1}),  # => reasoning_mult 0
+    # reasoning_coherency is a real working gate again (both sides enable it).
+    Case("reasoning_incoherent", "markdown", "Respond tersely", 100,
+         {"refusal": 1, "reasoning_coherency": 0, "md_presence": 1}),  # => reasoning_mult 0, product 0
+    Case("reasoning_coherent_noop", "markdown", "Respond tersely", 100,
+         {"refusal": 1, "reasoning_coherency": 1, "md_presence": 1}),  # verdict 1 => no effect
     Case("meta_commentary", "markdown", "Respond tersely", 100,
          {"refusal": 1, "meta_commentary": 1, "md_presence": 1}),
     Case("stacked_penalties", "styles", "Respond in a medium-length response", 300,
@@ -195,15 +211,18 @@ CASES: list[Case] = [
          {"refusal": 1, "md_presence": 1}, include_reasoning=False, expect_v1=0.0, expect_v0=0.0),
     Case("gate_zero_words", "markdown", "Respond tersely", 0,
          {"refusal": 1, "md_presence": 1}, expect_v1=0.0, expect_v0=0.0),
-    # --- AUDIT FIX #2: verbose band unreachable ---
-    # v0 word_mult = 0 (distance == tolerance) => product 0. v1 floors to 0.1.
-    Case("fix2_verbose_unreachable", "markdown", "Be verbose", 500,
-         {"refusal": 1, "md_presence": 1}, expect_v0=0.0, expect_v1=0.9 * 0.1),
-    # --- AUDIT FIX #5: judge outage ---
-    # v0 fails closed (judge_error => 0). v1 fails open (refusal missing => base 0.9).
-    Case("fix5_refusal_judge_outage", "markdown", "Respond tersely", 100,
+    # --- Verbose length falloff: reverted to v0 exactly (a short verbose answer zeros the
+    #     length term), so the model is pushed to write ~2000 words. Plain parity now. ---
+    Case("verbose_short_falloff", "markdown", "Be verbose", 500,
+         {"refusal": 1, "md_presence": 1}),
+    # --- FIX #6: judge ENDPOINT outage tanks the reward + sets the metric (both sides 0) ---
+    Case("fix6_refusal_endpoint_down", "markdown", "Respond tersely", 100,
          {"refusal": 1, "md_presence": 1}, judge_error="refusal",
-         expect_v0=0.0, expect_v1=0.9),
+         expect_v0=0.0, expect_v1=0.0, expect_endpoint_down=True),
+    # --- FIX #6: a parse failure (gemma replied, tag unparseable) stays fail-open on v1.
+    #     reasoning_coherency parse-fail defaults to 1 (no gate) on both sides => parity. ---
+    Case("fix6_reasoning_coherency_parse_fail", "markdown", "Respond tersely", 100,
+         {"refusal": 1, "md_presence": 1}, parse_failure="reasoning_coherency"),
 ]
 
 
@@ -211,7 +230,7 @@ def run() -> int:
     failures = 0
     for case in CASES:
         r0 = asyncio.run(v0_reward(case))
-        r1 = v1_reward(case)
+        r1, breakdown = v1_reward(case)
 
         if case.expect_v0 is not None:
             ok0 = abs(r0 - case.expect_v0) < 1e-9
@@ -226,11 +245,15 @@ def run() -> int:
             ok1 = True
             kind = "PARITY"
 
+        metric_ok = breakdown.get("decensor_judge_endpoint_down", 0.0) == (1.0 if case.expect_endpoint_down else 0.0)
+        parity = parity and metric_ok
+
         status = "OK " if parity else "FAIL"
         if not parity:
             failures += 1
-        print(f"[{status}] {kind:6} {case.name:32} v0={r0:.6f} v1={r1:.6f}"
-              + ("" if case.expect_v1 is None else f" (expect v1={case.expect_v1:.6f})"))
+        metric_note = "" if not case.expect_endpoint_down else " [endpoint_down set]"
+        print(f"[{status}] {kind:6} {case.name:34} v0={r0:.6f} v1={r1:.6f}"
+              + ("" if case.expect_v1 is None else f" (expect v1={case.expect_v1:.6f})") + metric_note)
 
     print()
     if failures:

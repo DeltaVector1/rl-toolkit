@@ -1,12 +1,9 @@
 """Pure text helpers for decensor scoring.
 
 These are copied verbatim from the v0 env (`rl_environments/decensor-env/decensor_env.py`)
-so the ported reward reproduces v0's parsing/word-counting/gate detection exactly. The
-functions here are pure and were not implicated in any audit finding.
-
-The ONE deliberate change lives in `calculate_word_count_multiplier`: the length
-multiplier is floored at 0.1 (audit FIX #2) so response length alone can never
-hard-zero the whole decensoring signal. Everything else matches v0 bit-for-bit.
+so the ported reward reproduces v0's parsing/word-counting/gate detection exactly,
+including `calculate_word_count_multiplier` (verbose targets 2000 words, so the model is
+pushed to write long — a short verbose answer zeros the length term, matching v0).
 """
 
 from __future__ import annotations
@@ -25,12 +22,6 @@ STOPWORDS = {
     "i", "if", "in", "is", "it", "its", "of", "on", "or", "that", "the", "this",
     "to", "with", "will", "would",
 }
-
-# Length-multiplier floor (audit FIX #2). v0 targeted "Be verbose" at 2000 words with a
-# [1900, 2100] band that a reasoning model virtually never reaches, so the length
-# multiplier collapsed to 0.0 and zeroed the entire product on ~94% of verbose rollouts.
-# Flooring the multiplier keeps a live decensoring gradient regardless of length.
-WORD_MULTIPLIER_FLOOR = 0.1
 
 
 def strip_think_tags(text: str) -> str:
@@ -279,13 +270,9 @@ def calculate_word_count_multiplier(
     requirement: str,
     tolerance_percent: float,
 ) -> tuple[float, dict[str, Any]]:
-    """Length multiplier for a word-count requirement.
-
-    Matches v0 within the band and in the linear falloff, with audit FIX #2 applied:
-    a non-empty response's multiplier is floored at ``WORD_MULTIPLIER_FLOOR`` so length
-    alone can never hard-zero the reward. The empty-response case (word_count == 0) stays
-    0.0, but it is already caught by the separate zero-words gate before scoring.
-    """
+    """Length multiplier for a word-count requirement — v0 behavior exactly: full credit
+    inside the band, linear falloff to 0 outside it (verbose targets 2000 words, so the
+    model is pushed to write long)."""
     bounds = {
         "Be verbose": (2000, 1900, 2100),
         "Respond tersely": (163, 75, 250),
@@ -301,7 +288,6 @@ def calculate_word_count_multiplier(
 
     distance = min(abs(word_count - minimum) if word_count < minimum else abs(word_count - maximum), tolerance)
     multiplier = 1.0 - (distance / tolerance)
-    multiplier = max(WORD_MULTIPLIER_FLOOR, multiplier)  # audit FIX #2
     return multiplier, {"multiplier": multiplier, "zero_words": False}
 
 

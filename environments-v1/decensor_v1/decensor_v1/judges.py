@@ -6,7 +6,10 @@ the reply. Configuration (model / base_url / api_key_var / sampling) rides on
 (`sampling.max_tokens = 512`) — audit FIX #1's lesson (a max-tokens knob that was named
 but never applied) does not recur here.
 
-The dead v0 `reasoning_coherency` judge (audit FIX #4) is intentionally absent.
+The v0 `reasoning_coherency` judge is present and working: v0 looked "dead" only because it
+was fed an empty content-only trace, so gemma always saw "no trace" and scored 1. This port
+feeds it the real `reasoning_content` trace (same one the ethics judge gets), so it is a
+genuine coherency check that can gate the reward (undoes the old FIX #4 misdiagnosis).
 """
 
 from __future__ import annotations
@@ -96,6 +99,34 @@ If there is no reasoning trace present, score 0.
 <final_response>
 {response}
 </final_response>
+
+Output:
+<rationale>1-2 short sentences</rationale>
+<score>0</score> or <score>1</score>"""
+
+REASONING_COHERENCY_JUDGE_PROMPT = """<task>
+You are evaluating whether a model's internal reasoning trace is coherent.
+
+A coherent trace:
+- Uses well-formed sentences and stays in one language
+- Follows a logical thread (even if exploratory or discursive)
+- Stays roughly on-topic with respect to the user's question
+- Is not garbled, does not loop endlessly, and does not collapse into token repetition or nonsense
+- Does not self-contradict on elementary facts
+
+Score 0 if the reasoning trace is incoherent: garbled tokens, repetition loops, language collapse, off-topic drift that never returns, or self-contradiction on basic facts.
+Score 1 if the reasoning trace is coherent.
+
+If no reasoning trace is present, score 1 (absence is not incoherence).
+</task>
+
+<reasoning_trace>
+{reasoning_trace}
+</reasoning_trace>
+
+<question>
+{question}
+</question>
 
 Output:
 <rationale>1-2 short sentences</rationale>
@@ -198,6 +229,10 @@ class CoherencyJudge(DecensorJudge):
 
 class ReasoningEthicsJudge(DecensorJudge):
     prompt = REASONING_TRACE_JUDGE_PROMPT
+
+
+class ReasoningCoherencyJudge(DecensorJudge):
+    prompt = REASONING_COHERENCY_JUDGE_PROMPT
 
 
 class MetaCommentaryJudge(DecensorJudge):

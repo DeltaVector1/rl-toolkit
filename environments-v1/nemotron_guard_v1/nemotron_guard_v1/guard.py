@@ -14,6 +14,7 @@ identically 1.0 — dead code. It is omitted here rather than ported.
 from __future__ import annotations
 
 import asyncio
+from typing import NamedTuple
 
 import verifiers.v1 as vf
 from verifiers.v1.types import AssistantMessage, content_text
@@ -62,7 +63,12 @@ class AntiHackingConfig(vf.BaseConfig):
 
 def _initial_metrics() -> dict[str, float]:
     # -1.0 marks "no usable judge verdict"; the four judge metrics stay there unless a
-    # verdict comes back (fail-open, audit fix #5).
+    # verdict comes back. Two different failure modes are tracked separately:
+    #   anti_hacking_judge_failures     — gemma replied but the verdict was unparseable
+    #                                      (normal formatting noise; fail-open, no penalty).
+    #   anti_hacking_judge_endpoint_down — the judge CALL errored (gemma unreachable). This
+    #                                      tanks the reward to 0 so an outage shows up as
+    #                                      cratering scores, not a silent pass (see #6).
     return {
         "anti_hacking_multiplier": 1.0,
         "anti_hacking_truncated": 0.0,
@@ -73,6 +79,7 @@ def _initial_metrics() -> dict[str, float]:
         "anti_hacking_renderer_tool_call_fallback": 0.0,
         "anti_hacking_local_meta": 0.0,
         "anti_hacking_judge_failures": 0.0,
+        "anti_hacking_judge_endpoint_down": 0.0,
         "anti_hacking_coherency": -1.0,
         "anti_hacking_reasoning_ethics": -1.0,
         "anti_hacking_reasoning_coherency": -1.0,
@@ -100,19 +107,28 @@ def _prompt_messages(trace: vf.Trace) -> list[dict[str, str]]:
     return messages
 
 
-async def _judge_score(judge: ScoreTagJudge, trace: vf.Trace, **fields) -> int | None:
-    """Run one guard judge, fail-open on any error (audit fix #5).
+class _JudgeOutcome(NamedTuple):
+    """One guard-judge result. Two distinct failure modes (see #6):
 
-    A network error, timeout, or garbled reply must never be indistinguishable from a
-    guilty verdict — that would turn judge downtime into a silent, uniform reward penalty.
-    The parsed value is already None for an unparseable verdict; catching here extends the
-    same fail-open behaviour to a judge-side error.
+    - ``score`` is the parsed 0/1 verdict, or ``None`` when gemma replied but the reply was
+      unparseable — normal formatting noise, treated fail-open (no penalty).
+    - ``endpoint_down`` is True when the judge CALL itself errored (connection refused /
+      timeout / HTTP error — gemma is unreachable). That is NOT hidden: it tanks the reward
+      so an outage surfaces as cratering scores the operator can act on, not a silent pass.
     """
+
+    score: int | None
+    endpoint_down: bool
+
+
+async def _judge_score(judge: ScoreTagJudge, trace: vf.Trace, **fields) -> _JudgeOutcome:
     try:
         result = await judge.evaluate(trace=trace, **fields)
     except Exception:
-        return None
-    return result.parsed
+        # The judge call failed — gemma is likely down. Surface it loudly (below), don't
+        # swallow it into a "no penalty" pass.
+        return _JudgeOutcome(score=None, endpoint_down=True)
+    return _JudgeOutcome(score=result.parsed, endpoint_down=False)
 
 
 async def anti_hacking_multiplier(
@@ -157,7 +173,7 @@ async def anti_hacking_multiplier(
         transcript = format_full_transcript(prompt, messages)
         reasoning_traces = format_reasoning_traces(messages)
         system_prompt = system_prompt_text(prompt)
-        coherency, ethics, reasoning_coherency, meta = await asyncio.gather(
+        outcomes = await asyncio.gather(
             _judge_score(CoherencyJudge(config.judge), trace, conversation=transcript),
             _judge_score(ReasoningEthicsJudge(config.judge), trace, reasoning_traces=reasoning_traces),
             _judge_score(ReasoningCoherencyJudge(config.judge), trace, reasoning_traces=reasoning_traces),
@@ -168,6 +184,14 @@ async def anti_hacking_multiplier(
                 conversation=transcript,
             ),
         )
+        # A judge-endpoint error means gemma is unreachable for this rollout. Don't hide it:
+        # tank the reward (so a real outage craters the visible scores) and flag a distinct
+        # metric so it's distinguishable from the model genuinely scoring badly (#6).
+        if any(o.endpoint_down for o in outcomes):
+            metrics["anti_hacking_judge_endpoint_down"] = 1.0
+            metrics["anti_hacking_multiplier"] = 0.0
+            return 0.0, metrics
+        coherency, ethics, reasoning_coherency, meta = (o.score for o in outcomes)
         verdicts = [coherency, ethics, reasoning_coherency, meta]
         metrics["anti_hacking_judge_failures"] = float(sum(v is None for v in verdicts))
 

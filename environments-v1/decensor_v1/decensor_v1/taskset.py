@@ -6,15 +6,17 @@ returns the scalar product of the refusal-derived base reward and the coherency 
 reasoning-ethics / meta / length multipliers (v1 sums rewards, so the multiplication happens
 inside the single method). Every factor is logged with `trace.record_metrics`.
 
-Audit fixes baked in (see README): length multiplier floored (#2), dead `reasoning_coherency`
-judge dropped (#4), judges fail-open on transient error (#5).
+Audit fixes baked in (see README): length multiplier floored (#2), `reasoning_coherency`
+re-added as a real working gate fed the true `reasoning_content` trace (undoes the old #4
+misdiagnosis), and judge failures split (#6): an endpoint outage tanks the reward + flags a
+metric, while a received-but-unparseable reply stays fail-open.
 """
 
 from __future__ import annotations
 
 import asyncio
 import random
-from typing import Any
+from typing import Any, NamedTuple
 
 import verifiers.v1 as vf
 
@@ -25,6 +27,7 @@ from decensor_v1.judges import (
     MarkdownCorrectnessJudge,
     MarkdownPresenceJudge,
     MetaCommentaryJudge,
+    ReasoningCoherencyJudge,
     ReasoningEthicsJudge,
     RefusalJudge,
 )
@@ -60,6 +63,7 @@ class DecensorTaskConfig(vf.TaskConfig):
     enable_structured_markers: bool = True
     enable_markdown_judges: bool = True
     enable_reasoning_trace: bool = True
+    enable_reasoning_coherency: bool = True
     enable_meta_commentary: bool = True
     reasoning_enabled: bool = True
 
@@ -87,9 +91,19 @@ def _scoring_config(cfg: DecensorTaskConfig) -> ScoringConfig:
         enable_structured_markers=cfg.enable_structured_markers,
         enable_markdown_judges=cfg.enable_markdown_judges,
         enable_reasoning_trace=cfg.enable_reasoning_trace,
+        enable_reasoning_coherency=cfg.enable_reasoning_coherency,
         enable_meta_commentary=cfg.enable_meta_commentary,
         reasoning_enabled=cfg.reasoning_enabled,
     )
+
+
+class _JudgeOutcome(NamedTuple):
+    """One judge result (FIX #6). `score` is the parsed verdict, or `None` when gemma replied
+    but the reply was unparseable (fail-open). `endpoint_down` is True when the judge CALL
+    itself errored (gemma unreachable) — that outage tanks the reward, it is not fail-open."""
+
+    score: int | None
+    endpoint_down: bool
 
 
 class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
@@ -134,13 +148,17 @@ class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
                 completion.append(m)
         return prompt, completion
 
-    async def _verdict(self, judge: Any, trace: vf.Trace, **fields: Any) -> int | None:
-        """Run one judge, failing open (None) on transient error (FIX #5)."""
+    async def _verdict(self, judge: Any, trace: vf.Trace, **fields: Any) -> "_JudgeOutcome":
+        """Run one judge, distinguishing the two failure modes (FIX #6).
+
+        A raised `evaluate` call means gemma is unreachable (endpoint down) — surfaced so it
+        tanks the reward. A received-but-unparseable reply (verdict None) stays fail-open.
+        """
         try:
             result = await judge.evaluate(trace=trace, **fields)
-            return result.parsed
         except Exception:
-            return None
+            return _JudgeOutcome(score=None, endpoint_down=True)
+        return _JudgeOutcome(score=result.parsed, endpoint_down=False)
 
     @vf.reward(weight=1.0)
     async def decensor_reward(self, trace: vf.Trace) -> float:
@@ -161,7 +179,8 @@ class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
 
         judge_cfg = cfg.judge
         verdict_kwargs = {"refusal": None, "coherency": None, "reasoning_ethics": None,
-                          "meta_commentary": None, "md_presence": None, "md_correctness": None}
+                          "reasoning_coherency": None, "meta_commentary": None,
+                          "md_presence": None, "md_correctness": None}
 
         jobs: list[tuple[str, Any, dict[str, Any]]] = [
             ("refusal", RefusalJudge(judge_cfg), {"question": question, "response": response_text}),
@@ -171,6 +190,11 @@ class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
         if cfg.enable_reasoning_trace:
             jobs.append(("reasoning_ethics", ReasoningEthicsJudge(judge_cfg),
                          {"reasoning_trace": reasoning_trace, "response": response_text}))
+        if cfg.enable_reasoning_coherency:
+            # Fed the SAME real reasoning_content trace the ethics judge gets (not v0's empty
+            # content-only trace) — so this is a genuine coherency gate, not a rubber stamp.
+            jobs.append(("reasoning_coherency", ReasoningCoherencyJudge(judge_cfg),
+                         {"reasoning_trace": reasoning_trace, "question": question}))
         if cfg.enable_meta_commentary:
             jobs.append(("meta_commentary", MetaCommentaryJudge(judge_cfg),
                          {"system_prompt": system_prompt_text, "response": response_text}))
@@ -179,11 +203,16 @@ class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
             if bucket in ("styles", "markdown"):
                 jobs.append(("md_correctness", MarkdownCorrectnessJudge(judge_cfg), {"response": response_text}))
 
-        results = await asyncio.gather(
+        outcomes: list[_JudgeOutcome] = await asyncio.gather(
             *(self._verdict(judge, trace, **fields) for _name, judge, fields in jobs)
         )
-        for (name, _judge, _fields), value in zip(jobs, results):
-            verdict_kwargs[name] = value
+        for (name, _judge, _fields), outcome in zip(jobs, outcomes):
+            verdict_kwargs[name] = outcome.score
+
+        # FIX #6: an endpoint outage (gemma unreachable) tanks the reward; a received-but-
+        # unparseable reply is a parse failure that stays fail-open (verdict None).
+        endpoint_down = any(o.endpoint_down for o in outcomes)
+        parse_failures = sum(o.score is None and not o.endpoint_down for o in outcomes)
 
         md_exempt = (bucket == "styles") and (random.random() < cfg.markdown_exempt_probability)
 
@@ -195,6 +224,7 @@ class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
             word_requirement=self.data.word_requirement,
             is_truncated=trace.is_truncated,
             md_exempt=md_exempt,
+            judge_endpoint_down=endpoint_down,
             config=scfg,
         )
 
@@ -206,6 +236,7 @@ class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
                 if isinstance(value, (int, float)) and not isinstance(value, bool)
             }
         )
+        trace.record_metric("decensor_judge_parse_failures", float(parse_failures))
         trace.record_metric("decensor_gated", 0.0 if breakdown.get("early_termination") is None else 1.0)
         return reward
 
