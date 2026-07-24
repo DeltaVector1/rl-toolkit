@@ -10,8 +10,8 @@ prime-rl uses [`pydantic-config`](https://github.com/PrimeIntellect-ai/pydantic-
 ## Loading and composition
 
 ```bash
-uv run rl @ examples/reverse_text/rl.toml                                  # single TOML
-uv run rl @ examples/reverse_text/rl.toml --max-steps 50                   # CLI override
+uv run rl @ examples/basic/reverse-text/rl.toml                                  # single TOML
+uv run rl @ examples/basic/reverse-text/rl.toml --max-steps 50                   # CLI override
 uv run rl @ base.toml @ overlay.toml                                       # left-to-right merge
 uv run rl --model @ model.toml --data @ data.toml                          # nested section files
 uv run rl @ base.toml --trainer @ trainer.toml --trainer.lr 1e-3           # mixed
@@ -41,17 +41,39 @@ Incompatible combinations (e.g. CP requires flash attention) must raise in a `mo
 **Lists** — TOML uses array of tables; later config files replace lists wholesale, so overlays must include the full desired list:
 
 ```toml
-[[orchestrator.env]]
-id = "reverse-text"
+[[orchestrator.train.env]]
+name = "reverse-text"
+env.taskset = { id = "reverse-text-v1" }
+env.agent.harness = { id = "null", runtime = { type = "subprocess" } }
 ```
 
-CLI: `--env.0.id reverse-text --env.1.id math-env`.
+CLI: `--orchestrator.train.env.0.env.taskset.id reverse-text-v1`.
 
-**Dicts** — TOML uses a section; CLI takes a JSON string: `--vllm-extra '{"key1": "value1"}'`.
+**Subtask blending (nemotron envs)** — `ratio` balances envs against each other; it does
+nothing *inside* an env. A taskset that loads several subtasks concatenates them by default,
+so the blend is set by raw source size — `nemotron-reasoning` ran 83% science / 2% math that
+way. Use `taskset.mix`, keyed by subtask name:
 
-For OpenAI-compatible vLLM sampling, cap prompt tokens with `truncate_prompt_tokens` in the sampling `extra_body`. `max_prompt_len` is a benchmark option, not a chat-completions request field, and vLLM otherwise ignores it.
+```toml
+[orchestrator.train.env.env.taskset.mix.math]
+weight = 0.35          # share of the pool; weights are normalized, so they need not sum to 1
 
-**Discriminated unions** — set the `type` field to pick the variant (`[trainer.loss] type = "sft"`). Omit `type` to keep the default variant.
+[orchestrator.train.env.env.taskset.mix.science]
+max_examples = 20000   # hard cap instead of a share (mutually exclusive with `weight`)
+repeat = 2             # integer upsampling, applied after the cap
+enabled = false        # drop the subtask entirely
+```
+
+Subtasks with fewer rows than their quota are cycled rather than truncated, so a small source
+repeats instead of starving. Available on all four `nemotron-*` tasksets; omitting `mix`
+keeps plain concatenation. `mix_total` sets the pool size to divide up (default: rows
+available). Each taskset logs its realized blend at load.
+
+**Dicts** — TOML uses a section; CLI takes a JSON string: `--vllm-extra '{"key1": "value1"}'`. This works for plain `dict` fields only — nested pydantic-model fields (e.g. `algo`) reject JSON strings; use dotted keys (`--orchestrator.algo.type max_rl`) or a TOML overlay file.
+
+**Discriminated unions** — set the `type` field to pick the variant (`[orchestrator.algo] type = "max_rl"`). Omit `type` to keep the default variant.
+
+**Algorithms** — `[orchestrator.algo] type = "grpo" | "max_rl" | "opd" | "opsd" | "sft" | "echo"` — the type names the algorithm (credit assignment + loss routing, fused), and each type's class defaults are its vetted setting; any other key you set is your own assembly (e.g. `[orchestrator.algo.roles.user] alpha = 0.1` for echo — setting any echo role replaces the whole role table). There is no preset layer, and no config hook that points at user code — a new algorithm is a named class in the repo (subclass `Algorithm`, register it). Per-env override: `[orchestrator.train.env.algo] type = "opd"` (the env assembles its own algorithm). prime-rl only hosts the trainable policy; frozen models are inline external endpoints on the algorithm, named where the model is used — `[orchestrator.algo.teacher]` for opd (the frozen model scored against), `[orchestrator.algo.sampling.source]` for sft (the model it samples from), each with `name` + `base_url`. There is no shared `teacher` slot. opsd declares no model — it self-distills against the live policy. See `docs/algorithms.md`.
 
 **`BaseModel | None` fields** — bare flag enables defaults; nested override enables and sets:
 
@@ -64,7 +86,7 @@ In TOML, an empty section header (`[ckpt]`) does the same.
 
 ## RL trainer token exports
 
-For rollout debugging, enable trainer-side token export with `trainer.enable_token_export = true` (or `--enable-token-export` when running the trainer entrypoint directly). It writes one JSONL record per exported sequence. Single-run/fallback exports go under `output_dir/token_exports/step_<step>/rank_<rank>.jsonl`; multi-run trainer exports with packer metadata go under the owning run directory, `output_dir/<run_id>/token_exports/step_<run_step>/rank_<rank>.jsonl`. Each record stores aligned per-token arrays for token ids, loss mask, advantage, reward, entropy, mismatch KL, inference/trainer logprobs, importance ratios, probability deltas, and masking diagnostics. It does not decode token text in the trainer.
+For rollout debugging, enable trainer-side token export with `trainer.enable_token_export = true` (or `--enable-token-export` when running the trainer entrypoint directly). It writes one JSONL record per exported sequence. Single-run/fallback exports go under `output_dir/token_exports/step_<step>/rank_<rank>.jsonl`; multi-run trainer exports with packer metadata go under the owning run directory, `output_dir/<run_id>/token_exports/step_<run_step>/rank_<rank>.jsonl`. Each record stores aligned per-token arrays for token ids, loss mask, component weight streams (rl/ce/ref_kl), advantages, entropy, mismatch KL, inference/trainer logprobs, importance ratios, probability deltas, and masking diagnostics. It does not decode token text in the trainer.
 
 ```toml
 enable_token_export = true

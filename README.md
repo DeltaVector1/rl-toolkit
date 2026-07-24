@@ -9,10 +9,12 @@ drop this on top.
 
 | Folder | What's in it |
 |---|---|
-| `environments/` | Installable verifiers env packages — `decensor-env` (single-turn, in-use), `decensor-env-multiturn` (old full-conversation version), the four `nemotron-*` envs, and bench envs (`mmlu`, `arcee-ifeval`). Each has its own `pyproject.toml`. |
+| `environments-v1/` | **Current.** The verifiers **v1** ports — `decensor_v1`, `nemotron_guard_v1` (shared guard + subtask blending), and the four `nemotron-*_v1` envs, plus `tests/` (reward parity suites). Each has its own `pyproject.toml`. |
+| `environments/` | **Legacy v0.** `decensor-env`, `decensor-env-multiturn`, the four `nemotron-*` envs, and bench envs (`mmlu`, `arcee-ifeval`). Kept as the parity reference the v1 suites grade against. |
+| `docs/` | `PORTING_GUIDE.md` (v0 → v1 API notes and the reward formulas) and `AUDIT_2026-07-24.md` (plain-English audit of every reward bug found against a real 50-step run, and what was changed). |
 | `patches/submodules/` | Patches against prime-rl's `deps/` submodules — Trinity tokenizer (`renderers`) and multiturn error handling (`verifiers`). Both load-bearing for Trinity. |
-| `patches/prime-rl/` | Our load-bearing edits to prime-rl `src/`, as a git patch. |
-| `configs/` | Working RL configs (`trinity_mini_ichthyo_rl`, `trinity_mini_rl`). |
+| `patches/prime-rl/` | Our load-bearing edits to prime-rl `src/`, as a git patch, plus `hermes_tool_parser.py` — drop-in for `src/prime_rl/utils/tool_parsers.py`. **Required for tool calling on Trinity** (see below). |
+| `configs/` | Working RL configs. `trinity_mini_modern/` is the current one (v1 envs, `arcee-ai/Trinity-Mini`); the others are v0-era. |
 | `skills/` | Our edited Claude Code skills (`configs`, `training/*`). |
 | `other/` | Helper tooling — `rollout_viewer.py`, monitoring/GPU scripts, and the archived OPD distillation experiment. |
 
@@ -63,8 +65,34 @@ git clone --filter=blob:none --sparse https://github.com/<you>/trinity-rl-kit.gi
 cd trinity-rl-kit && git sparse-checkout set environments/decensor-env
 ```
 
+## Trinity tool calling — read this before changing the renderer
+
+Trinity's tokenizer has **no `<tool_call>` special token** (it encodes as four ordinary
+tokens). Every tool parser shipped in `renderers` locates `<tool_call>` by token id, so all
+of them return "no tool calls" for every completion, silently. Confirmed on both
+`arcee-ai/Trinity-Mini` and the NewEden fine-tune.
+
+`patches/prime-rl/hermes_tool_parser.py` registers a text-level `"hermes"` parser — matching
+the `--tool-call-parser hermes` on Trinity's own model card — and the config selects it with
+`[orchestrator.renderer] tool_parser = "hermes"`. `<think>` **is** a real token, so
+`reasoning_parser = "think"` is fine as-is.
+
+## Subtask blending
+
+`ratio` balances envs against each other and does not reach inside an env. A taskset that
+loads several subtasks concatenates them by default, so the blend follows raw source file
+size — `nemotron-reasoning` ran 83% science / 2% math that way. Use `taskset.mix` (see
+`nemotron_guard_v1/mixing.py` and the `configs/trinity_mini_modern/rl.toml` blocks):
+`weight`, `max_examples`, `repeat`, `enabled` per subtask, with small sources cycled rather
+than starved.
+
 ## Notes
 
 - Envs pull their datasets from Hugging Face at runtime — no data is vendored here.
+- The v1 envs depend on `verifiable-instructions` (pinned `f46a5ac`) for the IFEval checkers —
+  the same package NVIDIA's own instruction-following server uses. Don't re-hand-write them.
+- Reward parity suites run under pytest (`python_files = ["test_*.py", "parity_*.py"]`). They
+  assert v1 == v0 *except* where a case declares `expect_v1`, which is how an intentional bug
+  fix is recorded instead of showing up as a failure.
 - `patches/prime-rl/` is the piece that rots when upstream moves; regenerate it
   against a newer base with `git diff <base> -- src/ > patches/prime-rl/prime-rl.patch`.

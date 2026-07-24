@@ -1,0 +1,349 @@
+# Trinity-Mini RL (GRPO) on modern prime-rl (verifiers v1, vLLM 0.24).
+# 2048 rollouts/step; decensor at 50%.
+# `ratio` is a relative sampling weight between envs: env share = ratio_i / sum(ratios) * batch_size.
+# decensor ratio 4.0 == sum of the four nemotron (1.0 each) -> decensor 1024, each nemotron 256.
+# Blending WITHIN an env is `taskset.mix` (see the per-env blocks below) — `ratio` does not
+# reach subtasks, so without `mix` a taskset's blend is dictated by raw source file size.
+# Validate (no GPUs): uv run rl @ configs/trinity_mini_modern/rl.toml --dry-run
+
+output_dir = "outputs/trinity_mini_modern"
+clean_output_dir = true
+max_steps = 500
+seq_len = 32768          # prompt + completion budget; matches model max_model_len
+
+[wandb]
+project = "prime-rl"
+name = "trinity-mini-modern"
+
+[log]
+level = "info"
+
+[model]
+name = "arcee-ai/Trinity-Mini"
+
+# 8x H200: 4 train + 4 infer
+[deployment]
+num_train_gpus = 4
+num_infer_gpus = 4
+
+[ckpt]
+interval = 25           # checkpoint before the ~step-38 weight-swap hang so restarts resume
+resume_step = -1        # -1 = resume from latest ckpt (None if none yet -> fresh)
+keep_last = 2
+keep_interval = 100
+
+[orchestrator]
+batch_size = 2048        # rollouts per step
+group_size = 16          # GRPO group -> 128 prompts/step
+oversampling_factor = 1.0
+
+# Trinity isn't in renderers.base.MODEL_RENDERER_MAP, so DefaultRenderer applies the model
+# chat_template. tool_parser "hermes" matches the model card's `--tool-call-parser hermes`.
+# It must be "hermes", not "qwen3": every parser shipped in `renderers` locates <tool_call>
+# by TOKEN ID, and Trinity's tokenizer has no such token (it encodes as 4 ordinary tokens),
+# so those parsers silently return zero tool calls for every completion. "hermes" is the
+# text-level parser registered by src/prime_rl/utils/tool_parsers.py.
+# reasoning_parser "think" surfaces <think> traces into message.reasoning so the nemotron
+# anti-hacking guards (reasoning_required) can read them — <think> IS a real token here.
+[orchestrator.renderer]
+name = "default"
+tool_parser = "hermes"
+reasoning_parser = "think"
+
+[orchestrator.train.sampling]
+temperature = 1.0
+max_completion_tokens = 16384   # Trinity is reasoning-verbose; keep high
+
+# vLLM-served LoRA adapter name
+[orchestrator.model.lora]
+name = "trinity-mini"
+
+# --- decensor env — 1024 rollouts (50%). Multi-turn, simulated user + judge. ---
+# max_output_tokens = 8192 (v0 max_total_completion_tokens): per-turn 8k -> effectively
+# single-turn, so multi-turn prompt growth can't overflow the 32k context.
+[[orchestrator.train.env]]
+name = "decensor"
+ratio = 4.0
+env.taskset.id = "decensor-v1"
+env.agent.harness = { id = "null", runtime = { type = "subprocess" } }
+env.agent.max_output_tokens = 8192
+env.agent.timeout.rollout = 1800
+
+# per-turn generation cap 8k for decensor only (nemotron keeps the global 16k)
+[orchestrator.train.env.sampling]
+max_completion_tokens = 8192
+
+# decensor judge + simulated user, both on the shared gemma endpoint
+[orchestrator.train.env.env.taskset.task.judge]
+base_url = "http://198.13.252.41:40002/v1"
+model = "google/gemma-4-26B-A4B-it"
+api_key_var = "VLLM_API_KEY"
+
+[orchestrator.train.env.env.taskset.task.user]
+base_url = "http://198.13.252.41:40002/v1"
+model = "google/gemma-4-26B-A4B-it"
+api_key_var = "VLLM_API_KEY"
+
+# --- nemotron-knowledge — 256 rollouts. Shared gemma judge, full guard ON. ---
+[[orchestrator.train.env]]
+name = "nemotron-knowledge"
+ratio = 1.0
+env.taskset.id = "nemotron-knowledge-v1"
+env.taskset.dataset = "all"
+env.agent.harness = { id = "null", runtime = { type = "subprocess" } }
+env.agent.timeout.rollout = 900
+
+[orchestrator.train.env.env.taskset.task.guard]
+reasoning_required = true
+
+[orchestrator.train.env.env.taskset.task.guard.judge]
+base_url = "http://198.13.252.41:40002/v1"
+model = "google/gemma-4-26B-A4B-it"
+api_key_var = "VLLM_API_KEY"
+
+[orchestrator.train.env.env.taskset.task.equivalence_judge]
+base_url = "http://198.13.252.41:40002/v1"
+model = "google/gemma-4-26B-A4B-it"
+api_key_var = "VLLM_API_KEY"
+
+# qa_abstention is 3.1k rows against mcqa's 617k, so without a weight it is ~0.5% of the
+# blend — 4 distinct prompts across 50 steps.
+[orchestrator.train.env.env.taskset.mix.mcqa]
+weight = 0.8
+
+[orchestrator.train.env.env.taskset.mix.qa_abstention]
+weight = 0.2
+
+# --- nemotron-reasoning — 256 rollouts. math graded by math-verify; science by judge. ---
+[[orchestrator.train.env]]
+name = "nemotron-reasoning"
+ratio = 1.0
+env.taskset.id = "nemotron-reasoning-v1"
+env.taskset.dataset = "all"
+env.agent.harness = { id = "null", runtime = { type = "subprocess" } }
+env.agent.timeout.rollout = 900
+
+[orchestrator.train.env.env.taskset.task.guard]
+reasoning_required = true
+
+[orchestrator.train.env.env.taskset.task.guard.judge]
+base_url = "http://198.13.252.41:40002/v1"
+model = "google/gemma-4-26B-A4B-it"
+api_key_var = "VLLM_API_KEY"
+
+[orchestrator.train.env.env.taskset.task.equivalence_judge]
+base_url = "http://198.13.252.41:40002/v1"
+model = "google/gemma-4-26B-A4B-it"
+api_key_var = "VLLM_API_KEY"
+
+# Source sizes are science 150k / rg 15k / arc 10k / math 3.7k, so plain concatenation ran
+# 83% science and 2% math — and routed 83% of the env's compute through the slow judge.
+[orchestrator.train.env.env.taskset.mix.math]
+weight = 0.35
+
+[orchestrator.train.env.env.taskset.mix.science]
+weight = 0.30
+
+[orchestrator.train.env.env.taskset.mix.reasoning_gym]
+weight = 0.25
+
+# arc_agi is exact-match on a full grid and the model is at ~0% — kept small until it shows
+# signal. `difficulty_bucket` filtering is the next lever if it stays flat.
+[orchestrator.train.env.env.taskset.mix.arc_agi]
+weight = 0.10
+
+# --- nemotron-instruction-following — 256 rollouts. ---
+[[orchestrator.train.env]]
+name = "nemotron-instruction-following"
+ratio = 1.0
+env.taskset.id = "nemotron-instruction-following-v1"
+env.taskset.dataset = "all"
+env.agent.harness = { id = "null", runtime = { type = "subprocess" } }
+env.agent.timeout.rollout = 900
+
+[orchestrator.train.env.env.taskset.task.guard]
+reasoning_required = true
+
+[orchestrator.train.env.env.taskset.task.guard.judge]
+base_url = "http://198.13.252.41:40002/v1"
+model = "google/gemma-4-26B-A4B-it"
+api_key_var = "VLLM_API_KEY"
+
+# calendar / adversarial / ultra-judge grader (IFJudgeConfig)
+[orchestrator.train.env.env.taskset.task.judge]
+base_url = "http://198.13.252.41:40002/v1"
+model = "google/gemma-4-26B-A4B-it"
+api_key_var = "VLLM_API_KEY"
+
+# Size-proportional blending starved the judge subtasks to ~0.6% each — 5 distinct rows
+# across 50 steps. ifeval stays dominant since its checkers are deterministic and cheap.
+# (`identity` was removed from the env: its rubric demanded the model claim to be Nemotron.)
+[orchestrator.train.env.env.taskset.mix.ifeval]
+weight = 0.34
+
+[orchestrator.train.env.env.taskset.mix.structured_v2_direct]
+weight = 0.12
+
+[orchestrator.train.env.env.taskset.mix.structured_v2_diversified]
+weight = 0.12
+
+[orchestrator.train.env.env.taskset.mix.citation_format]
+weight = 0.08
+
+[orchestrator.train.env.env.taskset.mix.freeform_formatting]
+weight = 0.08
+
+[orchestrator.train.env.env.taskset.mix.calendar]
+weight = 0.08
+
+[orchestrator.train.env.env.taskset.mix.multichallenge]
+weight = 0.05
+
+[orchestrator.train.env.env.taskset.mix.adversarial]
+weight = 0.05
+
+[orchestrator.train.env.env.taskset.mix.sysbench]
+weight = 0.03
+
+[orchestrator.train.env.env.taskset.mix.cfbench]
+weight = 0.03
+
+[orchestrator.train.env.env.taskset.mix.inverse_ifeval]
+weight = 0.02
+
+# --- nemotron-tool-calling — 256 rollouts. Tools advertised in-prompt (null harness). ---
+# exclude_message_actions ON (default): drops "reply-in-prose, no tool call" rows so they
+# don't fight tool emission under the shared reward.
+#
+# `swe_pivot` is gone from the env entirely (unwinnable exact-match on a shell script), which
+# also removes the over-length prompts; max_prompt_chars is belt-and-braces so a row that
+# can't fit the context is dropped rather than scored 0 for generating nothing.
+#
+# NOTE: allow_renderer_stripped_tool_calls has no effect while tool_parser = "hermes" — that
+# parser resolves <tool_call> by token id, which this tokenizer doesn't have, so zero tool
+# calls are ever parsed structurally. See the audit; the parser still needs replacing.
+[[orchestrator.train.env]]
+name = "nemotron-tool-calling"
+ratio = 1.0
+env.taskset.id = "nemotron-tool-calling-v1"
+env.taskset.dataset = "all"
+env.taskset.exclude_message_actions = true
+env.taskset.max_prompt_chars = 60000
+env.agent.harness = { id = "null", runtime = { type = "subprocess" } }
+env.agent.max_output_tokens = 16384
+env.agent.timeout.rollout = 900
+
+# function_calling has the best signal of the pivot subtasks (21% positive vs 12%) but is
+# only ~9.6k rows against tool_use_pivot's ~50k, so it needs an explicit share.
+[orchestrator.train.env.env.taskset.mix.tool_use_pivot]
+weight = 0.6
+
+[orchestrator.train.env.env.taskset.mix.function_calling]
+weight = 0.4
+
+[orchestrator.train.env.env.taskset.task.guard]
+reasoning_required = true
+allow_renderer_stripped_tool_calls = true
+
+[orchestrator.train.env.env.taskset.task.guard.judge]
+base_url = "http://198.13.252.41:40002/v1"
+model = "google/gemma-4-26B-A4B-it"
+api_key_var = "VLLM_API_KEY"
+
+# --- eval — small and timed out so it can't hog the pool at step 0 ---
+[orchestrator.eval]
+interval = 50
+
+[orchestrator.eval.sampling]
+temperature = 1.0
+max_completion_tokens = 16384
+
+[[orchestrator.eval.env]]
+name = "nemotron-knowledge"
+num_examples = 16
+group_size = 1
+env.taskset.id = "nemotron-knowledge-v1"
+env.taskset.dataset = "all"
+env.agent.harness = { id = "null", runtime = { type = "subprocess" } }
+env.agent.timeout.rollout = 900
+
+[orchestrator.eval.env.env.taskset.task.guard.judge]
+base_url = "http://198.13.252.41:40002/v1"
+model = "google/gemma-4-26B-A4B-it"
+api_key_var = "VLLM_API_KEY"
+
+[orchestrator.eval.env.env.taskset.task.equivalence_judge]
+base_url = "http://198.13.252.41:40002/v1"
+model = "google/gemma-4-26B-A4B-it"
+api_key_var = "VLLM_API_KEY"
+
+[[orchestrator.eval.env]]
+name = "nemotron-tool-calling"
+num_examples = 16
+group_size = 1
+env.taskset.id = "nemotron-tool-calling-v1"
+env.taskset.dataset = "all"
+env.taskset.exclude_message_actions = true
+env.agent.harness = { id = "null", runtime = { type = "subprocess" } }
+env.agent.timeout.rollout = 900
+
+[orchestrator.eval.env.env.taskset.task.guard.judge]
+base_url = "http://198.13.252.41:40002/v1"
+model = "google/gemma-4-26B-A4B-it"
+api_key_var = "VLLM_API_KEY"
+
+# --- trainer — Trinity afmoe MoE, LoRA ---
+[trainer]
+dist_timeout_seconds = 1800
+
+[trainer.model]
+impl = "custom"
+attn = "flash_attention_2"
+ep = 4                   # expert parallel across 4 train GPUs (128 experts / 4)
+fsdp_cpu_offload = false
+optim_cpu_offload = true
+cp = 1
+cp_style = "ulysses"
+fused_lm_head_token_chunk_size = 1024
+
+[trainer.model.ac]
+mode = "selective"
+freq = 1
+targets = ["norm", "attn_proj", "linear_attn", "routed_experts"]
+
+# rank 128: the max vLLM's fused_moe_lora kernel allows for this MoE. alpha kept at 2x rank.
+[trainer.model.lora]
+rank = 128
+alpha = 256
+dropout = 0.0
+target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+[trainer.optim]
+type = "muon"            # Trinity-Mini was pretrained with Muon
+lr = 8e-6
+weight_decay = 0.0
+max_norm = 1.0
+
+[trainer.ckpt.weights]
+save_adapter_separately = true
+save_sharded = true
+
+# --- inference — vLLM, native tools + reasoning parser ---
+[inference]
+gpu_memory_utilization = 0.90
+enable_lora = true
+enable_prefix_caching = true
+max_loras = 8
+max_cpu_loras = 32
+max_lora_rank = 128
+api_server_count = 1
+enable_expert_parallel = true
+
+[inference.model]
+max_model_len = 32768
+tool_call_parser = "hermes"
+reasoning_parser = "deepseek_r1"
+
+[inference.parallel]
+tp = 1
+dp = 4                   # 4 independent engines across the 4 infer GPUs
