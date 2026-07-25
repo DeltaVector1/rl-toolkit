@@ -13,7 +13,7 @@ drop this on top.
 | `environments/` | **Legacy v0.** `decensor-env`, `decensor-env-multiturn`, the four `nemotron-*` envs, and bench envs (`mmlu`, `arcee-ifeval`). Kept as the parity reference the v1 suites grade against. |
 | `docs/` | `PORTING_GUIDE.md` (v0 → v1 API notes and the reward formulas) and `AUDIT_2026-07-24.md` (plain-English audit of every reward bug found against a real 50-step run, and what was changed). |
 | `patches/submodules/` | Patches against prime-rl's `deps/` submodules — Trinity tokenizer (`renderers`) and multiturn error handling (`verifiers`). Both load-bearing for Trinity. |
-| `patches/prime-rl/` | Our load-bearing edits to prime-rl `src/`, as a git patch, plus `hermes_tool_parser.py` — drop-in for `src/prime_rl/utils/tool_parsers.py`. **Required for tool calling on Trinity** (see below). |
+| `patches/prime-rl/` | Our load-bearing edits to prime-rl `src/`, as a git patch. |
 | `configs/` | Working RL configs. `trinity_mini_modern/` is the current one (v1 envs, `arcee-ai/Trinity-Mini`); the others are v0-era. |
 | `skills/` | Our edited Claude Code skills (`configs`, `training/*`). |
 | `other/` | Helper tooling — `rollout_viewer.py`, monitoring/GPU scripts, and the archived OPD distillation experiment. |
@@ -72,10 +72,15 @@ tokens). Every tool parser shipped in `renderers` locates `<tool_call>` by token
 of them return "no tool calls" for every completion, silently. Confirmed on both
 `arcee-ai/Trinity-Mini` and the NewEden fine-tune.
 
-`patches/prime-rl/hermes_tool_parser.py` registers a text-level `"hermes"` parser — matching
-the `--tool-call-parser hermes` on Trinity's own model card — and the config selects it with
-`[orchestrator.renderer] tool_parser = "hermes"`. `<think>` **is** a real token, so
-`reasoning_parser = "think"` is fine as-is.
+`patches/submodules/renderers-hermes-tool-parser.patch` adds a text-level `"hermes"` parser
+to the `renderers` package — matching the `--tool-call-parser hermes` on Trinity's own model
+card — and the config selects it with `[orchestrator.renderer] tool_parser = "hermes"`.
+`<think>` **is** a real token, so `reasoning_parser = "think"` is fine as-is.
+
+It has to live in the `renderers` package itself, not in prime-rl: every env-server
+subprocess builds its own renderer and imports `renderers` without importing `prime_rl`.
+Registering from prime-rl leaves those processes with a stock registry, and every rollout
+fails with `Unknown tool_parser 'hermes'`.
 
 ## Subtask blending
 

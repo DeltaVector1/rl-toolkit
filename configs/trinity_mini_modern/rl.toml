@@ -355,6 +355,15 @@ enforce_eager = true
 tool_call_parser = "hermes"
 reasoning_parser = "deepseek_r1"
 
+# tp=4/dp=1, NOT dp=4: with data parallelism the vLLM engine core dies during startup on
+# this model (`Engine core initialization failed. Failed core proc(s): {}`, no child reports
+# a cause). The Ichthyo fine-tune starts fine under dp=4, so it is specific to these weights.
+# One engine sharded over the 4 infer GPUs instead of 4 independent ones.
+# The weights are cached locally; going offline keeps startup deterministic and stops the
+# Hub rate-limiting us on restarts. Datasets are fetched by the env servers, not here.
+[inference.env_vars]
+HF_HUB_OFFLINE = "1"
+
 [inference.parallel]
-tp = 1
-dp = 4                   # 4 independent engines across the 4 infer GPUs
+tp = 4
+dp = 1

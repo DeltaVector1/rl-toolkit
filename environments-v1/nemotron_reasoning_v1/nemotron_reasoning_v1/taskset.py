@@ -336,11 +336,13 @@ class NemotronReasoningTaskset(
         # idx is verifiers' example identity (dedup, grouping, dashboards). Each loader
         # enumerates from 0, so it has to be reassigned across the blend or the subtasks
         # collide on it.
+        # Summarize BEFORE rebuilding: mix_summary matches rows by identity, and model_copy
+        # produces new objects.
+        realized = mix_summary(by_subtask, tasks)
         tasks = [
             NemotronReasoningTask(task.data.model_copy(update={"idx": idx}), self.config.task)
             for idx, task in enumerate(tasks)
         ]
-        realized = mix_summary(by_subtask, tasks)
         print(f"nemotron-reasoning blend: {realized} (total {len(tasks)})", flush=True)
         return tasks
 

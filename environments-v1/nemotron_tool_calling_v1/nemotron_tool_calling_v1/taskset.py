@@ -373,10 +373,12 @@ class NemotronToolCallingTaskset(
         tasks = apply_mix(by_subtask, self.config.mix, self.config.seed, self.config.mix_total)
         # idx is verifiers' example identity, so it must be assigned after the blend —
         # per-subtask enumeration would collide across subtasks.
+        # Summarize BEFORE rebuilding: mix_summary matches rows by identity, and model_copy
+        # produces new objects.
+        realized = mix_summary(by_subtask, tasks)
         tasks = [
             NemotronToolCallingTask(task.data.model_copy(update={"idx": idx}), self.config.task)
             for idx, task in enumerate(tasks)
         ]
-        realized = mix_summary(by_subtask, tasks)
         print(f"nemotron-tool-calling blend: {realized} (total {len(tasks)})", flush=True)
         return tasks
