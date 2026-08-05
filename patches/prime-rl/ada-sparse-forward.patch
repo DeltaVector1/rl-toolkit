@@ -1,0 +1,11 @@
+--- a/src/prime_rl/trainer/models/kernels/sparse_mla_fwd.py
++++ b/src/prime_rl/trainer/models/kernels/sparse_mla_fwd.py
+@@ -122,7 +122,7 @@
+             # (where local q_i no longer matches the global K position).
+             max_kv_i = seq_len_kv - 2
+ 
+-            H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * 64)
++            H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * H_per_block)
+             H1 = H0 + H_per_block
+ 
+             T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)

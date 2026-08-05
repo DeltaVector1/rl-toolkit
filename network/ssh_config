@@ -1,0 +1,17 @@
+Host china-jump
+    HostName 202.101.73.12
+    Port 31331
+    User dolphin
+    IdentityFile /root/.ssh/china_rollout_ed25519
+    IdentitiesOnly yes
+    StrictHostKeyChecking accept-new
+
+Host china-trainer
+    HostName 10.92.20.82
+    User ubuntu
+    IdentityFile /root/.ssh/china_rollout_ed25519
+    IdentitiesOnly yes
+    ProxyJump china-jump
+    StrictHostKeyChecking accept-new
+    ServerAliveInterval 15
+    ServerAliveCountMax 4

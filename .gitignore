@@ -1,0 +1,23 @@
+# Secrets live outside the repo (/data/trinity/training.env) and must stay out.
+*.env
+!*.env.example
+*_ed25519
+*_ed25519.pub
+*.pem
+id_*
+
+# Run artifacts and logs: regenerated every run, large, and not source of truth.
+logs/
+runs/
+*.jsonl
+*.log
+
+# Model weights / checkpoints must never enter git.
+*.safetensors
+*.bin
+*.pt
+*.tar.gz
+
+__pycache__/
+*.pyc
+.venv/

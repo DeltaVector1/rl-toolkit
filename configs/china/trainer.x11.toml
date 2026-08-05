@@ -1,0 +1,122 @@
+output_dir = "/data/glm52-rl/runs/x11"
+max_steps = 200
+# 5400, not 1800: at 16K the phantom-shmem pressure pushes nodes into
+# transient swap thrash; collectives stall 20-40 min and RECOVER (observed
+# blackouts lifting on their own). 1800s converts a recoverable stall into
+# a watchdog kill -- three attempts died exactly this way.
+dist_timeout_seconds = 5400
+enable_router_replay = true
+
+[log]
+level = "debug"
+ranks_filter = [0]
+
+[swanlab]
+project = "prod-run"
+name = "trainer-x11"
+group = "glm52-decensor-r32"
+tags = ["glm-5.2", "pp7", "decensor", "grpo", "bf16-base", "lora-r32", "56x4090", "b1024", "4096", "cp8", "router-replay", "sparse-ada", "norm-adv", "expert-ac"]
+
+[file_monitor]
+filename = "run_x11/trainer-metrics.jsonl"
+
+[model]
+name = "/data/glm52-rl/model-fp8"
+impl = "custom"
+seq_len = 16384
+attn = "flash_attention_2"
+cp = 8
+pp = 8
+cp_style = "ring"
+ep = 8
+global_ep = false
+dp_replicate = 1
+ep_comm_backend = "torch"
+fsdp_cpu_offload = false
+cold_cpu_offload = false
+optim_cpu_offload = false
+reshard_after_forward = true
+optimization_dtype = "bfloat16"
+reduce_dtype = "bfloat16"
+moe_router_dtype = "float32"
+moe_use_grouped_mm = true
+fused_lm_head_token_chunk_size = 1024
+fp8_embed_head = false
+fp8_lm_head = false
+compile = "None"
+
+[model.quantization]
+type = "fp8"
+# false is REQUIRED here, not an optimization. Device memory is mirrored 1:1
+# into a MAP_SHARED /dev/zero region per rank (confirmed by smaps: 29.51 GB of
+# /dev/zero against 29110 MiB on the GPU, x8 ranks = the node's 237 GB
+# 'shared'). At 16K the GPUs peak near 60 GB, the mirror reaches ~486 GB and
+# the 503 GB node dies. bf16 weights cost 29 GB/GPU, fp8 cost 15, which halves
+# the mirror. The norms.py override fixes the float8 promotion crash that
+# blocked this before.
+# (was: true costs ~14 GB/GPU because apply_quantization
+# returns early at model.py:1256 so no FP8 kernels run despite type = "fp8").
+# false is the memory-correct setting and loads fine, but dies in the first
+# forward: an FP8 linear emits float8_e4m3fn into the residual stream and
+# RMSNorm.forward (norms.py:44, `self.weight * hidden_states.to(input_dtype)`)
+# raises "Promotion for Float8 Types is not supported, attempted to promote
+# BFloat16 and Float8_e4m3fn". Framework bug in the native-FP8 path for
+# glm_moe_dsa; revisit with a norms/linear dtype fix before flipping again.
+dequantize_checkpoint = false
+
+[model.lora]
+rank = 32
+alpha = 64
+dropout = 0.0
+target_modules = [
+    "q_a_proj",
+    "q_b_proj",
+    "kv_a_proj_with_mqa",
+    "o_proj",
+]
+
+[model.ac]
+# Selective, NOT full: full recompute trips
+# "CheckpointError: Recomputed values ... have different metadata" on this
+# MoE+EP stack, because recompute does not reproduce the per-expert token
+# counts the original forward saw. Memory headroom comes from cp=8 instead.
+mode = "selective"
+freq = 1
+# "norm" checkpoints the two per-layer norms: ~600 MB of activations per
+# 12-layer stage at 16K, vs an x1 OOM shortfall of 242 MiB. CPU offloading
+# is out: pinned stashes for 7 in-flight micro-batches x 8 ranks exceeded
+# the 503 GB host RAM and the kernel OOM-killed the trainer on n82.
+# "mlp" is NOT included: only the 3 dense layers support it, and stages
+# without them reject the target at startup.
+# Every supported target except dense-only "mlp": on this driver the kernel
+# charges DEVICE memory as process shmem, so 8 x GPU_used + real host RAM
+# must stay under 503GB. Checkpointing the attention internals cuts both
+# the direct GPU peak and its 8x host shadow.
+targets = ["attention", "attn_proj", "mla_up_proj", "routed_experts", "norm"]
+
+[optim]
+type = "muon"
+lr = 8e-6
+weight_decay = 0.0
+max_norm = 1.0
+
+[scheduler]
+type = "constant"
+
+[weight_broadcast]
+type = "filesystem"
+save_format = "safetensors"
+
+[rollout_transport]
+type = "zmq"
+host = "10.92.20.82"
+port = 29620
+hwm = 16
+
+[ckpt]
+interval = 25
+weights_only = true
+skip_gather_master_weights = true
+keep_last = 2
+keep_interval = 100
+output_dir = "/data/glm52-rl/runs/x11/run_x11"

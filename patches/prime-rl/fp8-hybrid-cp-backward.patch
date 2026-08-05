@@ -1,0 +1,61 @@
+--- a/src/prime_rl/trainer/models/layers/fp8_ada.py
++++ b/src/prime_rl/trainer/models/layers/fp8_ada.py
+@@ -272,8 +272,6 @@
+         dist.all_to_all_single(moved_temperature, inv_temperature, receives, sends, group=self.cp_group)
+         target = moved_target
+         inv_temperature = moved_temperature
+-    logprobs = torch.zeros(b * s, device=hidden_states.device, dtype=torch.float32)
+-    entropy = torch.zeros_like(logprobs)
+     scored, scored_entropy = _FP8LogProb.apply(
+         hidden,
+         self.weight.view(torch.float8_e4m3fn).view(self.out_features, self.in_features),
+@@ -287,11 +285,13 @@
+         restored_entropy = scored_entropy.new_empty(sum(sends))
+         dist.all_to_all_single(restored_entropy, scored_entropy, sends, receives, group=self.cp_group)
+         scored_entropy = restored_entropy
++    logprobs = torch.zeros(b * s, device=hidden_states.device, dtype=torch.float32) + scored.sum() * 0
++    entropy = torch.zeros_like(logprobs) + scored_entropy.sum() * 0
+     logprobs[valid], entropy[valid] = scored, scored_entropy
+     return PrimeLmOutput(logprobs=logprobs.view(b, s), entropy=entropy.view(b, s))
+ 
+ 
+-def replace_linear(model, embed_head=False):
++def replace_linear(model, embed=False, lm_head=False):
+     exclusions = set(model.config.quantization_config["modules_to_not_convert"])
+     for name, module in list(model.named_modules()):
+         if (
+@@ -306,9 +306,10 @@
+         parent_name, attr = name.rsplit(".", 1) if "." in name else ("", name)
+         parent = model.get_submodule(parent_name) if parent_name else model
+         setattr(parent, attr, FP8CheckpointLinear.from_linear(module))
+-    if not embed_head:
++    if embed:
++        model.model.embed_tokens = FP8CheckpointEmbedding.from_embedding(model.model.embed_tokens)
++    if not lm_head:
+         return
+-    model.model.embed_tokens = FP8CheckpointEmbedding.from_embedding(model.model.embed_tokens)
+     model.lm_head.weight = nn.Parameter(
+         torch.empty(
+             model.lm_head.out_features,
+--- a/src/prime_rl/trainer/model.py
++++ b/src/prime_rl/trainer/model.py
+@@ -873,7 +873,7 @@
+         fully_shard(
+             [model.lm_head, norm_module],
+             mesh=hsdp_mesh,
+-            mp_policy=MixedPrecisionPolicy() if native_fp8 and config.fp8_embed_head else mp_policy,
++            mp_policy=MixedPrecisionPolicy() if native_fp8 and (config.fp8_embed_head or config.fp8_lm_head) else mp_policy,
+             offload_policy=cold_offload_policy,
+             reshard_after_forward=False,
+         )
+@@ -1225,7 +1225,7 @@
+ 
+     if isinstance(quant, FP8Config):
+         if getattr(model.config, "fp8_checkpoint", False):
+-            replace_linear_with_fp8_checkpoint(model, embed_head=config.fp8_embed_head)
++            replace_linear_with_fp8_checkpoint(model, embed=config.fp8_embed_head, lm_head=config.fp8_lm_head)
+         else:
+             replace_linear_with_fp8_blockwise_linear(model, ignore_modules=quant.ignore_patterns)
+     elif isinstance(quant, MXFP8Config):
+--- a/packages/prime-rl-configs/src/prime_rl/configs/trainer.py
++++ b/packages/prime-rl-configs/src/prime_rl/configs/trainer.py

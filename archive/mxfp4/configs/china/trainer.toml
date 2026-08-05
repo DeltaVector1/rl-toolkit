@@ -1,0 +1,83 @@
+output_dir = "/data/glm52-rl/runs"
+max_steps = 500
+dist_timeout_seconds = 1800
+
+[log]
+level = "debug"
+ranks_filter = [0]
+
+[swanlab]
+project = "glm52-decensor"
+name = "glm52-decensor-64x4090-r32-dp4"
+group = "glm52-decensor-r32"
+tags = ["glm-5.2", "decensor", "grpo", "mxfp4", "lora-r32", "64x4090"]
+
+[file_monitor]
+filename = "trainer-metrics.jsonl"
+
+[model]
+name = "/data/glm52-rl/model"
+impl = "custom"
+seq_len = 32768
+attn = "flash_attention_2"
+cp = 8
+cp_style = "ring"
+ep = 8
+dp_replicate = 4
+ep_comm_backend = "torch"
+fsdp_cpu_offload = false
+optim_cpu_offload = false
+reshard_after_forward = true
+optimization_dtype = "bfloat16"
+reduce_dtype = "bfloat16"
+moe_router_dtype = "float32"
+moe_use_grouped_mm = true
+fused_lm_head_token_chunk_size = 4096
+ac_offloading = "None"
+
+[model.quantization]
+type = "mxfp4"
+
+[model.lora]
+rank = 32
+alpha = 64
+dropout = 0.0
+target_modules = [
+    "q_a_proj",
+    "q_b_proj",
+    "kv_a_proj_with_mqa",
+    "o_proj",
+]
+
+[model.ac]
+mode = "full"
+freq = 1
+
+[model.compile]
+fullgraph = false
+
+[optim]
+type = "muon"
+lr = 8e-6
+weight_decay = 0.0
+max_norm = 1.0
+
+[scheduler]
+type = "constant"
+
+[weight_broadcast]
+type = "filesystem"
+save_format = "safetensors"
+
+[rollout_transport]
+type = "zmq"
+host = "10.92.20.82"
+port = 29620
+hwm = 16
+
+[ckpt]
+interval = 25
+weights_only = true
+skip_gather_master_weights = true
+keep_last = 2
+keep_interval = 100

@@ -1,0 +1,258 @@
+pool_size = 4
+pre_batch_filters = [
+    { type = "gibberish", enforce = false, token_id_threshold = 100000, logprob_offset = 2.0 },
+    { type = "repetition", enforce = false, window = 3000, prob_threshold = 0.99 },
+    { type = "zero_advantage", enforce = false },
+]
+post_batch_filters = [
+    { type = "gibberish", enforce = false, token_id_threshold = 100000, logprob_offset = 2.0 },
+    { type = "repetition", enforce = false, window = 3000, prob_threshold = 0.99 },
+    { type = "zero_advantage", enforce = true },
+]
+collect_inference_metrics = true
+output_dir = "/data/glm52-rl/runs/run_decensor_64x4090_16xh200_localgemma_tp4x4_w16_i640_ml4_nccl30_seq32"
+batch_size = 1296
+max_inflight_rollouts = 640
+group_size = 12
+seq_len = 32768
+num_train_workers = 1
+max_steps = 500
+max_off_policy_steps = 5
+bench = false
+
+[algo]
+type = "grpo"
+
+[algo.sampling]
+source = "policy"
+
+[model]
+name = "/data/glm52-rl/model"
+trust_remote_code = false
+
+[model.lora]
+name = "glm52-decensor-r32-node-local"
+rank = 32
+alpha = 64.0
+
+[model.client]
+wait_for_ready_timeout = 7200
+base_url = [
+    "http://127.0.0.1:18001/v1",
+    "http://127.0.0.1:18002/v1",
+    "http://127.0.0.1:18003/v1",
+    "http://127.0.0.1:18004/v1",
+    "http://127.0.0.1:18005/v1",
+    "http://127.0.0.1:18006/v1",
+    "http://127.0.0.1:18007/v1",
+    "http://127.0.0.1:18008/v1",
+    "http://127.0.0.1:18009/v1",
+    "http://127.0.0.1:18010/v1",
+    "http://127.0.0.1:18011/v1",
+    "http://127.0.0.1:18012/v1",
+    "http://127.0.0.1:18013/v1",
+    "http://127.0.0.1:18014/v1",
+    "http://127.0.0.1:18015/v1",
+    "http://127.0.0.1:18016/v1",
+]
+api_key_var = "VLLM_API_KEY"
+skip_model_check = true
+dp_rank_count = 1
+admin_base_url = [
+    "http://127.0.0.1:18001/v1",
+    "http://127.0.0.1:18002/v1",
+    "http://127.0.0.1:18003/v1",
+    "http://127.0.0.1:18004/v1",
+]
+
+[model.client.headers]
+
+[model.client.headers_from_env]
+
+[model.client.extra_headers_from_state]
+X-Session-ID = "trajectory_id"
+
+[[train.env]]
+name = "decensor"
+ratio = 1.0
+group_size = 12
+
+[train.env.env]
+id = ""
+
+[train.env.env.taskset]
+id = "decensor-v1"
+dataset_name = "/data/glm52-rl/decensor-data/rl.jsonl"
+num_examples = 2000
+dataset_seed = 42
+turn_decay_ratio = 0.5
+max_turns = 6
+bucket_styles_ratio = 0.25
+bucket_plaintext_ratio = 0.25
+bucket_markdown_ratio = 0.5
+enable_length_prompts = true
+
+[train.env.env.taskset.task]
+judges = []
+incoherent_penalty_multiplier = 0.1
+meta_commentary_multiplier = 0.01
+word_count_tolerance_percent = 0.6
+markdown_exempt_probability = 0.25
+enable_word_count = true
+enable_structured_markers = true
+enable_markdown_judges = true
+enable_reasoning_trace = true
+enable_reasoning_coherency = true
+enable_meta_commentary = true
+reasoning_enabled = true
+
+[train.env.env.taskset.task.user]
+colocated = false
+in_process = true
+model = "google/gemma-4-26B-A4B-it"
+base_url = "http://10.92.20.85:40002/v1"
+api_key_var = "VLLM_API_KEY"
+temperature = 1.0
+min_p = 0.0
+max_tokens = 256
+seed = 0
+
+[train.env.env.taskset.task.user.runtime]
+type = "subprocess"
+
+[train.env.env.taskset.task.user.headers]
+
+[train.env.env.taskset.task.judge]
+base_url = "http://10.92.20.85:40002/v1"
+api_key_var = "VLLM_API_KEY"
+id = ""
+name = ""
+weight = 1.0
+model = "google/gemma-4-26B-A4B-it"
+min_p = 0.05
+disable_thinking = true
+
+[train.env.env.taskset.task.judge.headers]
+
+[train.env.env.taskset.task.judge.sampling]
+temperature = 0.8
+max_tokens = 512
+
+[train.env.env.timeout]
+
+[train.env.env.retries]
+max_retries = 0
+include = []
+exclude = []
+
+[train.env.env.interception]
+type = "elastic"
+multiplex = 32
+
+[train.env.env.agent]
+max_output_tokens = 6144
+
+[train.env.env.agent.harness]
+id = "null"
+forward_env = []
+
+[train.env.env.agent.harness.runtime]
+type = "subprocess"
+
+[train.env.env.agent.harness.env]
+
+[train.env.env.agent.timeout]
+rollout = 1200.0
+
+[train.env.env.agent.retries]
+max_retries = 0
+include = []
+exclude = []
+
+[train.env.pool]
+type = "static"
+num_workers = 16
+
+[train.env.args]
+
+[train.env.extra_env_kwargs]
+
+[train.env.sampling]
+temperature = 1.0
+max_completion_tokens = 6144
+
+[train.env.sampling.extra_body]
+top_k = -1
+min_p = 0.0
+return_token_ids = true
+
+[train.env.algo]
+type = "grpo"
+
+[train.env.algo.sampling]
+source = "policy"
+
+[train.sampling]
+temperature = 1.0
+max_completion_tokens = 6144
+
+[train.sampling.extra_body]
+
+[tokenizer]
+name = "/data/glm52-rl/model"
+trust_remote_code = false
+
+[renderer]
+name = "default"
+tool_parser = "glm"
+reasoning_parser = "think"
+enable_thinking = true
+clear_thinking = true
+
+[optim]
+lr = 8e-06
+
+[log]
+level = "info"
+vf_level = "info"
+json_logging = false
+log_data = false
+interval = 10.0
+
+[env_vars]
+
+[swanlab]
+project = "glm52-decensor"
+name = "glm52-decensor-64x4090-16xh200-localgemma-tp4x4-w16-i640-ml4-nccl30-seq32"
+group = "glm52-decensor-r32"
+tags = [
+    "glm-5.2",
+    "decensor",
+    "grpo",
+    "mxfp4",
+    "lora-r32",
+    "16xh200-rollouts",
+    "64x4090-trainer",
+    "local-gemma",
+]
+mode = "online"
+
+[file_monitor]
+filename = "rollout-metrics.jsonl"
+
+[ckpt]
+interval = 25
+keep_last = 2
+keep_interval = 100
+skip_progress = false
+
+[weight_broadcast]
+type = "filesystem"
+source_url = "http://127.0.0.1:18100"
+source_dir = "/data/glm52-rl/runs"
+
+[rollout_transport]
+type = "zmq"
+host = "10.92.20.82"
+port = 29620
+hwm = 16

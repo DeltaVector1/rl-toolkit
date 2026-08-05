@@ -1,0 +1,41 @@
+diff --git a/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py b/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py
+--- a/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py
++++ b/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py
+@@ -5,7 +5,6 @@
+ import torch
+ import torch.distributed as dist
+ from torch import Tensor, nn
+-from torch.nn.attention.flex_attention import create_block_mask
+ from transformers.cache_utils import Cache
+ from transformers.generation import GenerationMixin
+ from transformers.modeling_layers import GradientCheckpointingLayer
+@@ -257,21 +256,6 @@
+         else:
+             ks, ke = ks_full, ke_full
+ 
+-        block_mask = None
+-        if hidden_states.is_cuda and torch.cuda.get_device_capability(hidden_states.device)[0] < 9:
+-            def mask_mod(batch, head, q_idx, kv_idx):
+-                return (kv_idx >= ks[q_idx]) & (kv_idx < ke[q_idx])
+-
+-            block_mask = create_block_mask(
+-                mask_mod,
+-                B=None,
+-                H=None,
+-                Q_LEN=ks.shape[0],
+-                KV_LEN=S_full,
+-                device=hidden_states.device,
+-                BLOCK_SIZE=16,
+-            )
+-
+         cached_indices = None
+         use_index_cache = getattr(self.config, "use_index_cache", False)
+         for layer_idx, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
+@@ -283,7 +267,6 @@
+                 ks=ks,
+                 ke=ke,
+                 cached_indices=cached_indices,
+                 routed_experts=routed_experts_layer,
+-                block_mask=block_mask,
+             )
+             cached_indices = next_cached_indices if use_index_cache else None

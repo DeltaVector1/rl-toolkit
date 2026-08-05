@@ -1,0 +1,154 @@
+output_dir = "/data/glm52-rl/runs/r35/run_decensor_fp8_r35"
+max_steps = 1091
+seq_len = 4096
+batch_size = 1024
+group_size = 8
+max_inflight_rollouts = 1024
+max_off_policy_steps = 1
+pool_size = 4
+
+[log]
+level = "info"
+
+[swanlab]
+project = "prod-run"
+name = "orchestrator-r35"
+group = "glm52-decensor-r32"
+tags = ["glm-5.2", "decensor", "grpo", "w8a16-rollouts", "bf16-base-trainer", "lora-r32", "16xh200-rollouts", "64x4090-trainer", "local-gemma", "b1024", "4096", "cp4", "router-replay", "sparse-ada", "norm-adv", "expert-ac"]
+
+[file_monitor]
+filename = "rollout-metrics.jsonl"
+
+[model]
+name = "/data/glm52-rl/model-fp8"
+
+[model.lora]
+name = "glm52-decensor-r32-node-local"
+rank = 32
+alpha = 64
+
+[model.client]
+base_url = [
+    "http://127.0.0.1:18001/v1",
+    "http://127.0.0.1:18002/v1",
+    "http://127.0.0.1:18003/v1",
+    "http://127.0.0.1:18004/v1",
+    "http://127.0.0.1:18005/v1",
+    "http://127.0.0.1:18006/v1",
+    "http://127.0.0.1:18007/v1",
+    "http://127.0.0.1:18008/v1",
+    "http://127.0.0.1:18009/v1",
+    "http://127.0.0.1:18010/v1",
+    "http://127.0.0.1:18011/v1",
+    "http://127.0.0.1:18012/v1",
+    "http://127.0.0.1:18013/v1",
+    "http://127.0.0.1:18014/v1",
+    "http://127.0.0.1:18015/v1",
+    "http://127.0.0.1:18016/v1",
+    "http://127.0.0.1:18017/v1",
+    "http://127.0.0.1:18018/v1",
+    "http://127.0.0.1:18019/v1",
+    "http://127.0.0.1:18020/v1",
+    "http://127.0.0.1:18021/v1",
+    "http://127.0.0.1:18022/v1",
+    "http://127.0.0.1:18023/v1",
+    "http://127.0.0.1:18024/v1",
+]
+admin_base_url = [
+    "http://127.0.0.1:18001/v1",
+    "http://127.0.0.1:18002/v1",
+]
+wait_for_ready_timeout = 7200
+skip_model_check = true
+
+[optim]
+lr = 8e-6
+
+[renderer]
+name = "default"
+tool_parser = "glm"
+reasoning_parser = "think"
+enable_thinking = true
+clear_thinking = true
+
+[train.sampling]
+temperature = 1.0
+max_completion_tokens = 4096
+extra_body = { min_tokens = 16 }
+
+[[train.env]]
+name = "decensor"
+ratio = 1.0
+pool = { type = "static", num_workers = 16 }
+env.taskset.id = "decensor-v1"
+env.taskset.dataset_name = "/data/glm52-rl/decensor-data/rl.jsonl"
+env.taskset.num_examples = 2000
+env.agent.harness = { id = "null", runtime = { type = "subprocess" } }
+env.agent.max_output_tokens = 4096
+env.agent.timeout.rollout = 3600
+
+[train.env.sampling]
+max_completion_tokens = 4096
+
+[train.env.env.taskset.task.judge]
+base_url = "http://10.92.20.85:40002/v1"
+model = "google/gemma-4-26B-A4B-it"
+api_key_var = "VLLM_API_KEY"
+
+[train.env.env.taskset.task.user]
+base_url = "http://10.92.20.85:40002/v1"
+model = "google/gemma-4-26B-A4B-it"
+api_key_var = "VLLM_API_KEY"
+
+[eval]
+interval = 10
+num_examples = 32
+group_size = 1
+
+[eval.sampling]
+temperature = 0.0
+max_completion_tokens = 4096
+extra_body = { min_tokens = 16 }
+
+[[eval.env]]
+name = "decensor-fixed"
+pool = { type = "static", num_workers = 4 }
+env.taskset.id = "decensor-v1"
+env.taskset.dataset_name = "/data/glm52-rl/decensor-data/rl.jsonl"
+env.taskset.num_examples = 32
+env.agent.harness = { id = "null", runtime = { type = "subprocess" } }
+env.agent.max_output_tokens = 4096
+env.agent.timeout.rollout = 3600
+
+[eval.env.env.taskset.task.judge]
+base_url = "http://10.92.20.85:40002/v1"
+model = "google/gemma-4-26B-A4B-it"
+api_key_var = "VLLM_API_KEY"
+
+[eval.env.env.taskset.task.judge.sampling]
+temperature = 0.0
+
+[eval.env.env.taskset.task.user]
+base_url = "http://10.92.20.85:40002/v1"
+model = "google/gemma-4-26B-A4B-it"
+api_key_var = "VLLM_API_KEY"
+temperature = 0.0
+seed = 0
+
+[weight_broadcast]
+type = "filesystem"
+source_url = "http://127.0.0.1:18100/r35"
+source_dir = "/data/glm52-rl/runs/r35"
+
+[rollout_transport]
+type = "zmq"
+host = "10.92.20.82"
+port = 29620
+hwm = 16
+
+[ckpt]
+interval = 25
+resume_step = -1
+skip_progress = true
+keep_last = 2
+keep_interval = 100

@@ -1,0 +1,27 @@
+diff --git a/src/prime_rl/trainer/distributed/deepep.py b/src/prime_rl/trainer/distributed/deepep.py
+--- a/src/prime_rl/trainer/distributed/deepep.py
++++ b/src/prime_rl/trainer/distributed/deepep.py
+@@ -14,6 +14,11 @@ _deepep_cuda_ops_registered = False
+ _deepep_cuda_lib: torch.library.Library | None = None
+ 
+ 
++@torch.compile(dynamic=True)
++def _apply_scores(hidden_states: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
++    return (hidden_states.float() * scores.float().reshape(-1, 1)).to(hidden_states.dtype)
++
++
+ def _get_next_handle_id() -> torch.Tensor:
+     global _handle_counter
+     _handle_counter += 1
+@@ -324,10 +329,8 @@ def finalize_dispatch_tokens(pending_state: _PendingDispatchState) -> tuple[torc
+     return hidden_states, num_tokens_per_expert, state
+ 
+ 
+ def combine_tokens(hidden_states: torch.Tensor, state: _DispatchState) -> torch.Tensor:
+     if state.permuted_scores is not None:
+-        hidden_states = (hidden_states.to(torch.float32) * state.permuted_scores.to(torch.float32).reshape(-1, 1)).to(
+-            hidden_states.dtype
+-        )
++        hidden_states = _apply_scores(hidden_states, state.permuted_scores)
+     hidden_states = _unpermute_tokens(hidden_states, state.permuted_indices, state.num_recv_tokens)
+     return _DeepEPCombine.apply(hidden_states, state.handle_id)

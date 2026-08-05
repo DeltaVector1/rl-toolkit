@@ -1,0 +1,37 @@
+--- a/deps/renderers/renderers/client.py
++++ b/deps/renderers/renderers/client.py
+@@ -18,7 +18,7 @@
+ from typing import Any, cast
+ 
+ import httpx
+-from openai import AsyncOpenAI
++from openai import APIConnectionError, AsyncOpenAI
+ 
+ from renderers.base import (
+     Message,
+@@ -284,10 +284,21 @@
+         "cast_to": httpx.Response,
+         "body": body,
+     }
+-    if extra_headers:
+-        post_kwargs["options"] = cast(Any, {"headers": extra_headers})
+-    raw_response = await client.post(endpoint, **post_kwargs)
+-    data = parse_generate_response(raw_response.content)
++    post_kwargs["options"] = cast(
++        Any, {"headers": {"Connection": "close", **(extra_headers or {})}}
++    )
++    for attempt in range(3):
++        try:
++            raw_response = await client.post(endpoint, **post_kwargs)
++            data = parse_generate_response(raw_response.content)
++            break
++        except (APIConnectionError, httpx.TransportError) as exc:
++            if attempt == 2:
++                raise
++            _request_logger.warning(
++                "retrying disconnected generate request (%d/2): %s", attempt + 1, exc
++            )
++            await asyncio.sleep(0.5 * 2**attempt)
+ 
+     choice = (data.get("choices") or [{}])[0]
+     completion_ids = choice.get("token_ids") or []

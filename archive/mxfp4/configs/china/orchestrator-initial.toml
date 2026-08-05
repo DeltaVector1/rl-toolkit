@@ -1,0 +1,110 @@
+output_dir = "/data/glm52-rl/runs/run_decensor_64x4090_16xh200_localgemma_tp4x4_w16_i640_ml4_nccl30_seq32"
+max_steps = 500
+seq_len = 32768
+batch_size = 1296
+group_size = 12
+max_inflight_rollouts = 640
+max_off_policy_steps = 5
+pool_size = 4
+
+[log]
+level = "info"
+
+[swanlab]
+project = "glm52-decensor"
+name = "glm52-decensor-64x4090-16xh200-localgemma-tp4x4-w16-i640-ml4-nccl30-seq32"
+group = "glm52-decensor-r32"
+tags = ["glm-5.2", "decensor", "grpo", "mxfp4", "lora-r32", "16xh200-rollouts", "64x4090-trainer", "local-gemma"]
+
+[file_monitor]
+filename = "rollout-metrics.jsonl"
+
+[model]
+name = "/data/glm52-rl/model"
+
+[model.lora]
+name = "glm52-decensor-r32-node-local"
+rank = 32
+alpha = 64
+
+[model.client]
+base_url = [
+    "http://127.0.0.1:18001/v1",
+    "http://127.0.0.1:18002/v1",
+    "http://127.0.0.1:18003/v1",
+    "http://127.0.0.1:18004/v1",
+    "http://127.0.0.1:18005/v1",
+    "http://127.0.0.1:18006/v1",
+    "http://127.0.0.1:18007/v1",
+    "http://127.0.0.1:18008/v1",
+    "http://127.0.0.1:18009/v1",
+    "http://127.0.0.1:18010/v1",
+    "http://127.0.0.1:18011/v1",
+    "http://127.0.0.1:18012/v1",
+    "http://127.0.0.1:18013/v1",
+    "http://127.0.0.1:18014/v1",
+    "http://127.0.0.1:18015/v1",
+    "http://127.0.0.1:18016/v1",
+]
+admin_base_url = [
+    "http://127.0.0.1:18001/v1",
+    "http://127.0.0.1:18002/v1",
+    "http://127.0.0.1:18003/v1",
+    "http://127.0.0.1:18004/v1",
+]
+wait_for_ready_timeout = 7200
+skip_model_check = true
+
+[optim]
+lr = 8e-6
+
+[renderer]
+name = "default"
+tool_parser = "glm"
+reasoning_parser = "think"
+enable_thinking = true
+clear_thinking = true
+
+[train.sampling]
+temperature = 1.0
+max_completion_tokens = 6144
+
+[[train.env]]
+name = "decensor"
+ratio = 1.0
+pool = { type = "static", num_workers = 16 }
+env.taskset.id = "decensor-v1"
+env.taskset.dataset_name = "/data/glm52-rl/decensor-data/rl.jsonl"
+env.taskset.num_examples = 2000
+env.agent.harness = { id = "null", runtime = { type = "subprocess" } }
+env.agent.max_output_tokens = 6144
+env.agent.timeout.rollout = 1200
+
+[train.env.sampling]
+max_completion_tokens = 6144
+
+[train.env.env.taskset.task.judge]
+base_url = "http://10.92.20.85:40002/v1"
+model = "google/gemma-4-26B-A4B-it"
+api_key_var = "VLLM_API_KEY"
+
+[train.env.env.taskset.task.user]
+base_url = "http://10.92.20.85:40002/v1"
+model = "google/gemma-4-26B-A4B-it"
+api_key_var = "VLLM_API_KEY"
+
+[weight_broadcast]
+type = "filesystem"
+source_url = "http://127.0.0.1:18100"
+source_dir = "/data/glm52-rl/runs"
+
+[rollout_transport]
+type = "zmq"
+host = "10.92.20.82"
+port = 29620
+hwm = 16
+
+[ckpt]
+interval = 25
+keep_last = 2
+keep_interval = 100
