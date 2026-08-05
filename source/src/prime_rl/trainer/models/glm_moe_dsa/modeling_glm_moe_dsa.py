@@ -304,7 +304,12 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
             )
             cached_indices = next_cached_indices if use_index_cache else None
 
-        hidden_states = self.norm(hidden_states)
+        # apply_pp_boundaries sets norm to None on every stage but the last
+        # (pipeline_parallel.py:161) -- the head is ~1.9 GB in bf16 and the
+        # non-final stages never use it. Only the last stage normalizes; the
+        # others hand their hidden states straight to the next stage.
+        if self.norm is not None:
+            hidden_states = self.norm(hidden_states)
         return BaseModelOutputWithPast(last_hidden_state=hidden_states)
 
 
