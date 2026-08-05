@@ -39,6 +39,7 @@ from prime_rl.trainer.rl.loss import (
 )
 from prime_rl.trainer.rl.token_export import setup_token_exporter
 from prime_rl.trainer.model import (
+    DTYPE_MAP,
     forward,
     setup_tokenizer,
     setup_model,
@@ -831,7 +832,18 @@ def train(config: TrainerConfig):
             # exact tensors and skip the metadata-exchange rendezvous.
             _L = pp_side_inputs[0]["input_ids"].shape[1]
             _hs = getattr(model.config, "hidden_size", None) or model.config.text_config.hidden_size
-            _stage_dtype = next(pp_stage_module.model.parameters()).dtype
+            # The inter-stage buffers carry ACTIVATIONS, so their dtype is
+            # optimization_dtype -- NOT the dtype of the first parameter. Those
+            # coincided under bf16 weights, but with
+            # `quantization.dequantize_checkpoint = false` the first parameter is
+            # float8_e4m3fn, which declared every hidden-state buffer fp8 and
+            # failed as
+            #   PipeliningShapeError: Stage 1 forward outputs: value 0 has a
+            #   dtype mismatch: expected torch.float8_e4m3fn actual torch.bfloat16
+            # Scanning for the first "real float" parameter is no better: an fp32
+            # weight_scale_inv can precede the bf16 weights and would declare the
+            # buffers fp32. Read the configured value instead.
+            _stage_dtype = DTYPE_MAP[config.model.optimization_dtype]
             _hidden_ex = torch.empty(1, _L, _hs, dtype=_stage_dtype, device="cuda")
             _is_last = pp_rank == parallel_dims.pp - 1
             pp_schedule = build_pp_schedule(
