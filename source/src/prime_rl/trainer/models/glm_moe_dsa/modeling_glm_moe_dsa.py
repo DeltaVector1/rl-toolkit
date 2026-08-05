@@ -207,7 +207,16 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
         if len(self.layers) == 0:
             return None, 0, 1
 
-        layer = self.layers[0]
+        # Under pipeline parallelism apply_pp_boundaries replaces this
+        # ModuleList with nn.ModuleDict keyed by GLOBAL layer index as a STRING
+        # (pipeline_parallel.py:139), so `self.layers[0]` raises KeyError: 0 --
+        # both because the key is a str and because a non-first stage does not
+        # own layer 0 at all. Every layer on a stage carries the same cp
+        # attributes, so take whichever comes first.
+        if isinstance(self.layers, nn.ModuleDict):
+            layer = next(iter(self.layers.values()))
+        else:
+            layer = self.layers[0]
         return getattr(layer, "_cp_group", None), getattr(layer, "_cp_rank", 0), getattr(layer, "_cp_world_size", 1)
 
     def _gather_position_ids_for_cp(
@@ -273,7 +282,17 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
 
         cached_indices = None
         use_index_cache = getattr(self.config, "use_index_cache", False)
-        for layer_idx, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
+        # Under pipeline parallelism self.layers is an nn.ModuleDict keyed by
+        # GLOBAL layer index as a string (pipeline_parallel.py:139). It cannot be
+        # sliced, and enumerate() would hand back a local 0-based index while
+        # routed_experts is indexed by global layer -- silently replaying the
+        # wrong layer's router on every stage after the first. Keying by global
+        # index is the whole reason that ModuleDict exists, so use it.
+        if isinstance(self.layers, nn.ModuleDict):
+            layer_items = [(int(name), module) for name, module in self.layers.items()]
+        else:
+            layer_items = list(enumerate(self.layers[: self.config.num_hidden_layers]))
+        for layer_idx, decoder_layer in layer_items:
             routed_experts_layer = routed_experts[:, :, layer_idx, :] if routed_experts is not None else None
             hidden_states, next_cached_indices = decoder_layer(
                 hidden_states,
