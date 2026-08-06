@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Keep the trainer and orchestrator alive. Runs on n82.
+#
+# Every component in this stack had a supervisor except the two that matter
+# most. The costs on 2026-08-06 alone:
+#   trainer died 10:13 ("Storage size calculation overflowed with
+#     sizes=[1, 9142729177965406720]", then an NCCL collective timeout as the
+#     other ranks waited on a dead rank 0) -- sat dead SIX HOURS
+#   engines died 03:13 and again 06:0x -- 2.6 hours before anyone noticed
+# Nothing restarted any of it. The engines now self-heal
+# (scripts/h200/engine_watchdog.sh); this does the same for the run itself.
+#
+# A trainer restart is safe here because the orchestrator tolerates the trainer
+# lagging by max_off_policy_steps and the trainer resumes from its last
+# checkpoint. It is NOT safe to restart the orchestrator while the trainer is
+# dead -- a zmq send to a dead peer blocks its event loop -- so the trainer is
+# always brought back first and the orchestrator only after it is listening.
+set -uo pipefail
+
+RUN=${RUN:?set RUN}
+RUN_NAME=${RUN_NAME:?set RUN_NAME}
+TAG=${CONFIG_TAG:?set CONFIG_TAG}
+TRAINER_NODES=${TRAINER_NODES:-"82 76 77 78 80 83 84 85"}
+NODES=${NODES:-"n76 n77 n78 n80 n82 n83 n84 n85"}
+INTERVAL=${INTERVAL:-120}
+CLUSTER=/data/glm52-rl/deployment/scripts/china/cluster.sh
+
+log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
+up() { sudo docker ps --filter "name=$1" --format up 2>/dev/null | head -1; }
+
+log "run supervisor started (RUN=$RUN TAG=$TAG interval=${INTERVAL}s)"
+
+while true; do
+  if [ "$(up glm52-decensor-trainer)" != "up" ]; then
+    log "TRAINER DOWN -- restarting across $NODES"
+    for h in $NODES; do
+      ssh -o BatchMode=yes -o ConnectTimeout=25 "$h" \
+        "sudo pkill -9 -f PRIME-RL 2>/dev/null; sudo docker rm -f glm52-decensor-trainer >/dev/null 2>&1" 2>/dev/null
+    done
+    # Let the host mirror of device memory drain before reloading, or the
+    # relaunch lands on a node still paging out the previous incarnation.
+    sleep 20
+    for h in $NODES; do
+      ( ssh -o BatchMode=yes -o ConnectTimeout=30 "$h" \
+          "TRAINER_NODES='$TRAINER_NODES' RUN=$RUN RUN_NAME=$RUN_NAME CONFIG_TAG=$TAG \
+           PRIME_EP_PROFILE=1 PRIME_EP_AC_CACHE=1 bash $CLUSTER trainer >/dev/null 2>&1" 2>/dev/null ) &
+    done
+    wait
+    log "trainer relaunch issued"
+    sleep 60
+  fi
+
+  if [ "$(up glm52-decensor-orchestrator)" != "up" ]; then
+    if [ "$(up glm52-decensor-trainer)" = "up" ]; then
+      log "ORCHESTRATOR DOWN -- restarting (trainer is up)"
+      RUN=$RUN RUN_NAME=$RUN_NAME CONFIG_TAG=$TAG bash "$CLUSTER" orchestrator >/dev/null 2>&1
+      log "orchestrator relaunch issued"
+    else
+      log "orchestrator down but trainer not up yet; waiting"
+    fi
+  fi
+
+  sleep "$INTERVAL"
+done
