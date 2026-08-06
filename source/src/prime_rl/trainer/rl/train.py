@@ -457,6 +457,34 @@ def train(config: TrainerConfig):
         load_data_time = time.perf_counter() - load_batch_start_time
         logger.debug(f"Loaded batch in {load_data_time:.2f} seconds")
 
+        # Reject a corrupt batch instead of dying on it. On 2026-08-06 10:13 a
+        # micro-batch arrived with input_ids of shape [1, 9142729177965406720]
+        # -- a sequence length just under 2^63, i.e. garbage deserialized as
+        # tensor metadata, not a real length. torch raised "Storage size
+        # calculation overflowed", rank 0 died, and the other ranks then hung
+        # until the NCCL collective timeout. The run sat dead for six hours.
+        #
+        # Sequences are packed to at most seq_len (times cp for the pre-shard
+        # case), so anything past a generous multiple of that is corruption.
+        # Skipping costs one batch; crashing costs the whole run.
+        _max_len = config.model.seq_len * max(config.model.cp, 1) * 4
+        _bad = []
+        for _i, _mb in enumerate(micro_batches):
+            _ids = _mb.get("input_ids") if isinstance(_mb, dict) else None
+            if _ids is None:
+                _bad.append((_i, "missing input_ids"))
+                continue
+            if _ids.dim() != 2 or _ids.shape[0] != 1 or not (0 < _ids.shape[1] <= _max_len):
+                _bad.append((_i, f"input_ids shape {tuple(_ids.shape)} (max len {_max_len})"))
+        if _bad:
+            for _i, _why in _bad[:5]:
+                logger.error(f"Corrupt micro-batch {_i}: {_why}")
+            logger.error(
+                f"Discarding batch at step {progress.step}: {len(_bad)}/{len(micro_batches)} micro-batches corrupt. "
+                "Waiting for the next batch rather than crashing the run."
+            )
+            continue
+
         batch_size = len(micro_batches)
         memory_profiler = None
         if config.memory_profiler_path is not None:
