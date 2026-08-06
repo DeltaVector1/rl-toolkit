@@ -13,11 +13,15 @@
 # one until the request fails. And n82 has no ssh access to these hosts, so it
 # could not restart anything anyway. Hence a local self-healing loop.
 #
-# Container "Up" is deliberately NOT the health signal. Only an actual HTTP
-# reply from the engine counts.
+# Neither container "Up" NOR /v1/models is a sufficient health signal. Observed
+# 2026-08-06 06:05 on h200a: models=200 while gen=000, "Running: 64" with
+# "throughput: 0.0" -- the API server was alive and answering while EngineCore
+# was hung and generating nothing. Only a real completion proves the engine
+# works, so that is what this probes.
 set -uo pipefail
 
 PORT=${PORT:-8000}
+MODEL=${MODEL:-/data/glm52-rl/model-fp8}
 INTERVAL=${INTERVAL:-60}
 TIMEOUT=${TIMEOUT:-15}
 FAILS_BEFORE_RESTART=${FAILS_BEFORE_RESTART:-2}
@@ -28,7 +32,12 @@ log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
 log "engine watchdog started (port=$PORT interval=${INTERVAL}s timeout=${TIMEOUT}s)"
 
 while true; do
-  code=$(curl -s -o /dev/null -m "$TIMEOUT" -w "%{http_code}" "http://127.0.0.1:$PORT/v1/models" 2>/dev/null)
+  # A tiny real generation. max_tokens=3 keeps it cheap; a hung EngineCore
+  # never answers it even though /v1/models still returns 200.
+  code=$(curl -s -o /dev/null -m "$TIMEOUT" -w "%{http_code}" \
+    -X POST "http://127.0.0.1:$PORT/v1/completions" \
+    -H "Content-Type: application/json" \
+    -d "{\"model\":\"$MODEL\",\"prompt\":\"hi\",\"max_tokens\":3}" 2>/dev/null)
   if [ "$code" = "200" ]; then
     [ "$misses" -gt 0 ] && log "engine recovered (was $misses miss(es))"
     misses=0
@@ -47,8 +56,11 @@ while true; do
       # Loading the 745B checkpoint takes minutes; do not thrash it.
       for _ in $(seq 1 40); do
         sleep 30
-        c=$(curl -s -o /dev/null -m "$TIMEOUT" -w "%{http_code}" "http://127.0.0.1:$PORT/v1/models" 2>/dev/null)
-        [ "$c" = "200" ] && { log "engine back up"; break; }
+        c=$(curl -s -o /dev/null -m "$TIMEOUT" -w "%{http_code}" \
+          -X POST "http://127.0.0.1:$PORT/v1/completions" \
+          -H "Content-Type: application/json" \
+          -d "{\"model\":\"$MODEL\",\"prompt\":\"hi\",\"max_tokens\":3}" 2>/dev/null)
+        [ "$c" = "200" ] && { log "engine back up (generation verified)"; break; }
       done
       misses=0
     fi

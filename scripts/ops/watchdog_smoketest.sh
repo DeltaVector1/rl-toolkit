@@ -44,13 +44,18 @@ check "2 consecutive misses -> kill"             "kill"    "$(debounce 2)"
 
 # Engine watchdog: container Up must NOT count as healthy. Only HTTP 200 does.
 echo "== engine watchdog health signal =="
-engine_healthy() { # http_code container_state
+# Health is decided by an actual generation, NOT by container state and NOT by
+# /v1/models. h200a on 2026-08-06 06:05 had models=200 with gen=000: API server
+# alive, EngineCore hung at "Running: 64, throughput: 0.0".
+engine_healthy() { # gen_code models_code container_state
   [ "$1" = "200" ] && echo "healthy" || echo "dead"
 }
-check "http 200, container up -> healthy"        "healthy" "$(engine_healthy 200 up)"
-check "http 000, container UP -> dead (the bug)" "dead"    "$(engine_healthy 000 up)"
-check "http 000, container exited -> dead"       "dead"    "$(engine_healthy 000 exited)"
-check "http 500 -> dead"                         "dead"    "$(engine_healthy 500 up)"
+check "gen 200, models 200, up -> healthy"        "healthy" "$(engine_healthy 200 200 up)"
+check "gen 000, models 200, up -> dead (hung core)" "dead"  "$(engine_healthy 000 200 up)"
+check "gen 000, models 000, up -> dead"           "dead"    "$(engine_healthy 000 000 up)"
+check "gen 000, models 000, exited -> dead"       "dead"    "$(engine_healthy 000 000 exited)"
+check "gen 500 -> dead"                           "dead"    "$(engine_healthy 500 200 up)"
+check "gen times out (000) despite models ok"     "dead"    "$(engine_healthy 000 200 up)"
 
 echo "== engine watchdog restart threshold =="
 eng_action() { # misses threshold

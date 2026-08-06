@@ -30,4 +30,4 @@ docker run -d --name glm52-decensor-h200 --restart unless-stopped \
   --entrypoint /app/.venv/bin/inference \
   prime-rl:glm52-decensor \
   @ "$deployment/configs/h200/inference.toml" \
-  --vllm-extra '{"kv_cache_dtype":"fp8","max_num_seqs":512,"max_num_batched_tokens":65536,"compilation_config":{"max_cudagraph_capture_size":256}}'
+  --vllm-extra '{"kv_cache_dtype":"fp8","max_num_seqs":128,"max_num_batched_tokens":65536,"compilation_config":{"max_cudagraph_capture_size":256}}'
