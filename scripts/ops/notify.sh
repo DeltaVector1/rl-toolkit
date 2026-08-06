@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Telegram notifier for the RL run. Runs on n82.
+# Telegram notifier for the RL run. Runs on h200a, NOT on n82.
+#
+# n82 cannot reach api.telegram.org at all (http=000) -- Telegram is blocked
+# from the China nodes. h200a reaches it fine, so the notifier lives there and
+# pulls the run state over ssh via the existing china-trainer alias.
 #
 #   per step   -> message with step time, reward, running mean, and health
 #   frozen run -> repeated CALL via CallMeBot (Telegram cannot place calls
@@ -22,7 +26,9 @@ FREEZE_MIN=${FREEZE_MIN:-15}
 TG_BOT_TOKEN=${TG_BOT_TOKEN:-}
 TG_CHAT_ID=${TG_CHAT_ID:-}
 CALLMEBOT_KEY=${CALLMEBOT_KEY:-}
-STATE=/data/glm52-rl/notify.state
+STATE=/root/notify.state
+REMOTE=${REMOTE:-china-trainer}
+rsh() { ssh -o BatchMode=yes -o ConnectTimeout=20 "$REMOTE" "$1" 2>/dev/null; }
 
 log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
 
@@ -43,10 +49,10 @@ call() { # text -- rings the phone, for freezes only
     --data-urlencode "rpt=2" >/dev/null 2>&1
 }
 
-tsteps() { sudo docker logs glm52-decensor-trainer 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -ac "SUCCESS Step"; }
-tlast()  { sudo docker logs glm52-decensor-trainer 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -a "SUCCESS Step" | tail -1; }
-rewards(){ sudo docker logs glm52-decensor-orchestrator 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -a "SUCCESS Step" | grep -oE "Reward [0-9.]+" | awk '{print $2}'; }
-batchn() { sudo docker logs --tail 5 glm52-decensor-orchestrator 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -oE "batch [0-9]+/" | tail -1 | grep -oE "[0-9]+"; }
+tsteps() { rsh 'sudo docker logs glm52-decensor-trainer 2>&1 | grep -ac "SUCCESS Step"'; }
+tlast()  { rsh 'sudo docker logs glm52-decensor-trainer 2>&1 | sed "s/\x1b\[[0-9;]*m//g" | grep -a "SUCCESS Step" | tail -1'; }
+rewards(){ rsh 'sudo docker logs glm52-decensor-orchestrator 2>&1 | grep -a "SUCCESS Step" | grep -oE "Reward [0-9.]+"' | awk '{print $2}'; }
+batchn() { rsh 'sudo docker logs --tail 5 glm52-decensor-orchestrator 2>&1 | grep -oE "batch [0-9]+/" | tail -1' | grep -oE "[0-9]+"; }
 
 last_step=$(cat "$STATE" 2>/dev/null || echo 0)
 last_batch=-1
