@@ -53,7 +53,7 @@ tunnel 18101 127.0.0.1:8000 "-p 40051 -i /root/.ssh/china_rollout_ed25519 root@1
 # same 20 MB crossed in 9s with -C, and the live tunnel measured 4.9 MB/s --
 # token ids and logprobs compress well.
 tunnel 29620 10.92.20.82:29620 china-trainer yes
-tunnel 18100 10.92.20.82:18100 china-trainer yes
+tunnel 18100 10.92.20.82:8100 china-trainer yes
 
 sleep 6
 for p in 18101 29620 18100; do
