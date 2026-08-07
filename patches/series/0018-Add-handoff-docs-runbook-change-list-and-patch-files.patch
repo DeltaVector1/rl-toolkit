@@ -1,7 +1,7 @@
 From 980ef9457158b4b0be12aa1aa34d5de3a5776f2e Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Fri, 7 Aug 2026 03:39:26 +0000
-Subject: [PATCH 18/24] Add handoff docs, runbook, change list and patch files
+Subject: [PATCH 18/25] Add handoff docs, runbook, change list and patch files
 
 docs/HANDOFF.md   why: architecture, owner rules, the mistakes made, the
                   software faults found, the limits of the system

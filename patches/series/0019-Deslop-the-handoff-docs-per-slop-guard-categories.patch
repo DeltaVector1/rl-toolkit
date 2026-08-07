@@ -1,7 +1,7 @@
 From a2cd8f6c75aacd1e43633de04a4d408169ba788a Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Fri, 7 Aug 2026 03:44:15 +0000
-Subject: [PATCH 19/24] Deslop the handoff docs per slop-guard categories
+Subject: [PATCH 19/25] Deslop the handoff docs per slop-guard categories
 
 Checked against the slop-guard ruleset. The STE constraint had already removed
 the structural categories: no em dashes, no mid-sentence bold, no bullets, no

@@ -1,0 +1,147 @@
+From 312a7d78d7bfdabf8f0f6f838970e7c2d894fcce Mon Sep 17 00:00:00 2001
+From: DeltaVector1 <DeltaVector1@users.noreply.github.com>
+Date: Fri, 7 Aug 2026 08:35:37 +0000
+Subject: [PATCH 25/25] Lower max_inflight_rollouts to 128; add
+ apply_at_step.sh
+
+The engines were starving while the orchestrator believed it was saturating
+them. Sampled over 3 minutes at 246 in flight: Running oscillated 0 to 27 with
+Waiting at 0 on every sample and throughput between 0 and 890 tok/s. About 220
+requests were sitting in the SSH tunnels rather than at the engines.
+
+batch_size stays 1024, so the experiment is unchanged. Only the tunnel load
+drops: about 5 concurrent per tunnel instead of about 10.
+
+This also corrects a claim in the docs. "256 in flight holds, 1024 collapses"
+was wrong: every healthy reading behind it was sampled at a batch tail with
+single-digit in-flight. 256 oversubscribes as well.
+
+apply_at_step.sh waits for a given trainer step to finish and then restarts the
+orchestrator, which is the only way it re-reads its config. Restarting just
+after a step costs almost nothing because the next batch has barely started.
+It refuses to arm unless the staged value is really in the config, it leaves
+the trainer alone so the policy version stays valid, it defers to
+run_supervisor.sh rather than racing it, and it reports the one failure it
+cannot repair (a dispatcher pause, which needs a new run name).
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017wiESxhziDrnsLnG9aizTd
+---
+ configs/china/orchestrator.x24.toml |  2 +-
+ scripts/china/apply_at_step.sh      | 91 +++++++++++++++++++++++++++++
+ 2 files changed, 92 insertions(+), 1 deletion(-)
+ create mode 100755 scripts/china/apply_at_step.sh
+
+diff --git a/configs/china/orchestrator.x24.toml b/configs/china/orchestrator.x24.toml
+index 3037ffd..4d5615e 100644
+--- a/configs/china/orchestrator.x24.toml
++++ b/configs/china/orchestrator.x24.toml
+@@ -3,7 +3,7 @@ max_steps = 200
+ seq_len = 16384
+ batch_size = 1024
+ group_size = 16
+-max_inflight_rollouts = 256
++max_inflight_rollouts = 128
+ # 4, not 2: batches go out over ZMQ fire-and-forget, so a trainer restart
+ # loses whatever was in flight. With a tight cap the orchestrator then holds
+ # for a policy the restarted trainer cannot publish and both sides wait
+diff --git a/scripts/china/apply_at_step.sh b/scripts/china/apply_at_step.sh
+new file mode 100755
+index 0000000..71ce1f3
+--- /dev/null
++++ b/scripts/china/apply_at_step.sh
+@@ -0,0 +1,91 @@
++#!/usr/bin/env bash
++# Wait until the trainer finishes a given step, then restart the orchestrator
++# so it re-reads its config. Runs on n82.
++#
++# The orchestrator reads orchestrator.<tag>.toml once, at startup. Changing a
++# value such as max_inflight_rollouts therefore needs a restart, and a restart
++# discards whatever the current batch has collected. Restarting immediately
++# after a step completes costs almost nothing, because the next batch has only
++# just begun.
++#
++# This does not restart the trainer. The trainer keeps its checkpoint and its
++# policy version, so the orchestrator resumes against a policy that exists.
++# run_supervisor.sh performs the same orchestrator-only restart whenever the
++# orchestrator dies, so this is a supported path rather than a new one.
++set -uo pipefail
++
++STEP=${STEP:?set STEP -- the step number to wait for}
++TAG=${CONFIG_TAG:?set CONFIG_TAG}
++RUN=${RUN:?set RUN}
++RUN_NAME=${RUN_NAME:?set RUN_NAME}
++EXPECT=${EXPECT:-}          # optional "key = value" line to verify in the config
++GIVE_UP_HOURS=${GIVE_UP_HOURS:-6}
++INTERVAL=${INTERVAL:-60}
++DEPLOY=/data/glm52-rl/deployment
++CFG=$DEPLOY/configs/china/orchestrator${TAG}.toml
++TRAINER_CT=glm52-decensor-trainer
++ORCH_CT=glm52-decensor-orchestrator
++
++log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
++strip() { sed 's/\x1b\[[0-9;]*m//g'; }
++
++log "waiting for trainer step $STEP, then restarting the orchestrator (tag=$TAG)"
++
++# Refuse to arm if the change is not actually staged. Restarting for nothing
++# would discard a batch and change no behaviour.
++if [ -n "$EXPECT" ]; then
++  if grep -qF -- "$EXPECT" "$CFG"; then
++    log "config check ok: '$EXPECT' present in $CFG"
++  else
++    log "ABORT: '$EXPECT' is not in $CFG. Nothing to apply."
++    exit 1
++  fi
++fi
++
++deadline=$(( $(date +%s) + GIVE_UP_HOURS * 3600 ))
++while [ "$(date +%s)" -lt "$deadline" ]; do
++  if sudo docker logs "$TRAINER_CT" 2>&1 | strip | grep -qa "SUCCESS Step $STEP "; then
++    log "trainer step $STEP is complete"
++    break
++  fi
++  sleep "$INTERVAL"
++done
++
++if ! sudo docker logs "$TRAINER_CT" 2>&1 | strip | grep -qa "SUCCESS Step $STEP "; then
++  log "ABORT: gave up after ${GIVE_UP_HOURS}h; step $STEP never completed. Nothing was restarted."
++  exit 1
++fi
++
++before=$(sudo docker logs --tail 40 "$ORCH_CT" 2>&1 | grep -oE 'batch [0-9]+/[0-9]+' | tail -1)
++log "orchestrator was at: ${before:-unknown}. Removing it now."
++sudo docker rm -f "$ORCH_CT" >/dev/null 2>&1
++
++# Prefer the supervisor: it owns the restart and would otherwise race with us.
++# Bracket the last token so this probe cannot match its own command line.
++if pgrep -f 'bash .*[r]un_supervisor.sh' >/dev/null; then
++  log "run supervisor is alive; it restarts the orchestrator within its interval"
++  for _ in $(seq 1 20); do
++    sleep 15
++    [ "$(sudo docker ps --filter "name=$ORCH_CT" --format up | head -1)" = "up" ] && { log "orchestrator is up again"; break; }
++  done
++else
++  log "no run supervisor; starting the orchestrator directly"
++  RUN=$RUN RUN_NAME=$RUN_NAME CONFIG_TAG=$TAG bash "$DEPLOY/scripts/china/cluster.sh" orchestrator >/dev/null 2>&1
++fi
++
++sleep 60
++if [ "$(sudo docker ps --filter "name=$ORCH_CT" --format up | head -1)" != "up" ]; then
++  log "WARNING: the orchestrator is still not up. Start it by hand."
++  exit 1
++fi
++
++# The one restart failure that cannot be repaired in place: the orchestrator
++# waiting for a policy version the trainer cannot produce. The fix is a new run
++# name, so say so loudly rather than pretend the restart worked.
++if sudo docker logs --tail 200 "$ORCH_CT" 2>&1 | grep -qa "Pausing dispatcher"; then
++  log "WARNING: 'Pausing dispatcher' in the orchestrator log. It expects a policy version"
++  log "WARNING: the trainer cannot make. This needs a NEW RUN NAME; it cannot be repaired here."
++fi
++
++log "done. orchestrator restarted with $CFG"
++sudo docker logs --tail 20 "$ORCH_CT" 2>&1 | grep -oE 'batch [0-9]+/[0-9]+[^;]*; [0-9]+ inflight' | tail -1
+-- 
+2.43.0
+
