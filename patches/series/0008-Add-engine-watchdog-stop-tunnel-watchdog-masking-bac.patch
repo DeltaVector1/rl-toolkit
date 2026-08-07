@@ -1,7 +1,7 @@
 From 0b05c1076b8d772d5855ee32caf6e2530c6bbcb7 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Thu, 6 Aug 2026 04:38:53 +0000
-Subject: [PATCH 08/31] Add engine watchdog; stop tunnel watchdog masking
+Subject: [PATCH 08/32] Add engine watchdog; stop tunnel watchdog masking
  backend death
 
 On 2026-08-06 03:13:30 both vLLM engines died with a sample_tokens RPC

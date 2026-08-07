@@ -1,7 +1,7 @@
 From 8e60549e3c112f6fd3634d7bcebb958fcbd85246 Mon Sep 17 00:00:00 2001
 From: DeltaVector1 <DeltaVector1@users.noreply.github.com>
 Date: Fri, 7 Aug 2026 09:01:30 +0000
-Subject: [PATCH 26/31] apply_at_step: fix a pipefail bug that made the trigger
+Subject: [PATCH 26/32] apply_at_step: fix a pipefail bug that made the trigger
  never fire
 
 `sudo docker logs ... | grep -q PATTERN` under `set -o pipefail` returns 141,

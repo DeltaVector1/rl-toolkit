@@ -1,0 +1,49 @@
+From 2675211b77c2018cfdb4cf0fab143219e32454ea Mon Sep 17 00:00:00 2001
+From: DeltaVector1 <DeltaVector1@users.noreply.github.com>
+Date: Fri, 7 Aug 2026 14:08:13 +0000
+Subject: [PATCH 32/32] Set max_inflight_rollouts to 192; the two knobs
+ interact
+
+192 in flight measured 14.1/min on 24 tunnels and 23.2/min on 48, while 128 in
+flight measured the same 14/min on both. Tunnel count does nothing until the
+in-flight count is high enough to need it, which is why doubling the tunnels
+alone read as a null result. Engine concurrency went 26 -> 46 and combined
+token throughput about 899 -> 1126 tok/s.
+
+Also record a methodology fault. Windowed rate measurements are unreliable
+here: two 9-minute windows at the same setting gave 23.18 and 8.10 rollouts a
+minute. A window lands at a random point in a 44 to 84 minute batch cycle, and
+the rate collapses at the tail when the orchestrator stops opening work. Token
+throughput has the same contamination: 1369 then 883 tok/s at one setting.
+
+Use the orchestrator's own per-batch cycle time instead. It averages the whole
+cycle including the tail, and it is the number that sets the step time:
+
+  step 6  137.4 min  78.3% error   (256 in flight, no compression)
+  step 7  118.3 min  18.9% error   (128, compression landed mid-batch)
+  step 8   82.6 min   5.1% error   (128, 24 tunnels, bounded timeouts)
+
+Step 9 is the first batch at 192 in flight on 48 tunnels.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017wiESxhziDrnsLnG9aizTd
+---
+ configs/china/orchestrator.x24.toml | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/configs/china/orchestrator.x24.toml b/configs/china/orchestrator.x24.toml
+index 7760116..d87154a 100644
+--- a/configs/china/orchestrator.x24.toml
++++ b/configs/china/orchestrator.x24.toml
+@@ -3,7 +3,7 @@ max_steps = 200
+ seq_len = 16384
+ batch_size = 1024
+ group_size = 16
+-max_inflight_rollouts = 128
++max_inflight_rollouts = 192
+ # 4, not 2: batches go out over ZMQ fire-and-forget, so a trainer restart
+ # loses whatever was in flight. With a tight cap the orchestrator then holds
+ # for a policy the restarted trainer cannot publish and both sides wait
+-- 
+2.43.0
+
