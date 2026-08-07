@@ -24,7 +24,7 @@ ranks_filter = [0]
 project = "prod-run"
 name = "trainer-x25"
 group = "glm52-decensor-r32"
-tags = ["glm-5.2", "pp7", "decensor", "grpo", "bf16-base", "lora-r32", "56x4090", "b1024", "4096", "cp8", "router-replay", "sparse-ada", "norm-adv", "expert-ac"]
+tags = ["glm-5.2", "pp8", "decensor", "grpo", "bf16-base", "lora-r32", "64x4090", "b1024", "16384", "cp8", "no-router-replay", "sparse-ada", "norm-adv", "expert-ac"]
 
 [file_monitor]
 filename = "run_x25/trainer-metrics.jsonl"
@@ -66,21 +66,8 @@ ac_offloading = "None"
 
 [model.quantization]
 type = "fp8"
-# false is REQUIRED here, not an optimization. Device memory is mirrored 1:1
-# into a MAP_SHARED /dev/zero region per rank (confirmed by smaps: 29.51 GB of
-# /dev/zero against 29110 MiB on the GPU, x8 ranks = the node's 237 GB
-# 'shared'). At 16K the GPUs peak near 60 GB, the mirror reaches ~486 GB and
-# the 503 GB node dies. bf16 weights cost 29 GB/GPU, fp8 cost 15, which halves
-# the mirror. The norms.py override fixes the float8 promotion crash that
-# blocked this before.
-# (was: true costs ~14 GB/GPU because apply_quantization
-# returns early at model.py:1256 so no FP8 kernels run despite type = "fp8").
-# false is the memory-correct setting and loads fine, but dies in the first
-# forward: an FP8 linear emits float8_e4m3fn into the residual stream and
-# RMSNorm.forward (norms.py:44, `self.weight * hidden_states.to(input_dtype)`)
-# raises "Promotion for Float8 Types is not supported, attempted to promote
-# BFloat16 and Float8_e4m3fn". Framework bug in the native-FP8 path for
-# glm_moe_dsa; revisit with a norms/linear dtype fix before flipping again.
+# The source checkpoint is FP8, but the trainer dequantizes it to BF16.
+# Native trainer W8A8 broke the importance ratio.
 dequantize_checkpoint = true
 
 [model.lora]

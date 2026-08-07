@@ -13,14 +13,35 @@ Era 1 is global expert parallelism. `global_ep = true`, `cp = 4`, no pipeline
 parallelism, 88 rollouts each batch. Every MoE dispatch and combine crossed the
 10 Gb/s node link. The all-to-all was 93 percent of a micro-batch.
 
-Era 2 is the current run. `global_ep = false`, `cp = 8`, `pp = 8`, `ep = 8`
+Era 2 is the current trainer topology. `global_ep = false`, `cp = 8`, `pp = 8`, `ep = 8`
 node-local, batch 1024, 16K context. The MoE all-to-all is node-local and about
 80 times faster. The transport analysis in Era 1 no longer sets the step time.
 
-Era 2 measured on run x24 step 3: 31 minutes for the trainer step, 2645 tokens
-per second, 3.2 percent MFU, 46.5 GiB peak of 48 GiB.
+Era 2 run x24 step 3 took 31.4 minutes for the full cycle: 14.6 minutes of
+trainer compute and 16.8 minutes waiting for rollouts. Trainer throughput was
+2645 tokens/s, MFU 3.2 percent, and peak memory 46.5 GiB.
 
 The MFU is 3.2 percent. The step time has much space to decrease.
+
+# X26 EDGE FILESYSTEM TEST
+
+Test x26 ran on 2026-08-07. The orchestrator ran on h200a and sent completed
+batches to n82. The trainer and rollout settings stayed at batch 1024, group
+16, 128 rollouts in flight, and 16K context.
+
+| Step | Collection | Attempts | Trainable | Errors | Batch file | Transfer |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 20m 5s | 1,056 | 1,029 | 2.5% | 84.2 MB | 28.8 s |
+| 2 | 18m 41s | 1,024 | 1,023 | 0.1% | 92.5 MB | 29.4 s |
+
+The measured collection rates were 51.2 and 54.8 trainable rollouts each
+minute. Both destination SHA-256 hashes matched the source. The transfer
+overlapped the next collection.
+
+These results measure rollout collection and file transfer. They do not
+measure a completed trainer step. The trainer failed during its first forward
+pass on two attempts. The first process failure was n80 rank 35. The remaining
+ranks then reported NCCL remote-process errors.
 
 # THE SETTINGS THAT STILL APPLY
 
@@ -54,7 +75,9 @@ Use 1 socket for each rank.
 | 8 (current) | 970 ms | 87% |
 | 16 | 972 ms | 87% |
 
-Use 8. One channel makes the collective hang. Do not set it to 1.
+The measurement favored 8. The current launcher sets 4. This discrepancy is
+unresolved; changing it changes trainer performance and needs a measured run.
+One channel hangs and must not be used.
 
 The value 87 percent is the measured ceiling of this NIC, so almost nothing is
 left on the wire.
@@ -93,19 +116,13 @@ This is a long public link, not a datacentre network. Measured from n82: 217
 milliseconds round trip, and packet loss between 3 and 33 percent that differs
 between the two hosts.
 
-Throughput over a lossy path scales with the number of TCP flows. That is why
-there are 24 tunnels and not 8. Widening from 8 to 24 raised rollout collection
-from about 4 completions each minute to 13 to 16.
+Widening from 8 to 24 tunnels raised historical collection from about 4/min
+to 13-16/min. x25 uses 48 ports, 18001-18048.
 
-The batch cannot cross this link at all. SSH gives each channel a window near 2
-MB, and on a 217 millisecond path the transfer stops at that window. Measured:
-less than 130 KB/s without compression, 4.9 MB/s with compression, and the
-batch transfer never completed. Over the loopback interface on n82 the same
-batch loads in 0.45 seconds.
-
-The orchestrator must therefore run on n82. The cost is that the rollout
-traffic crosses the bad link instead. Accept that cost. The trainer cannot use
-a rollout that does not arrive.
+Uncompressed bulk transfer measured less than 130 KB/s. Compressed transfer
+measured 4.9 MB/s. Therefore a batch can cross the link, but it must use a
+resumable, integrity-checked bulk transport. Individual rollout responses and
+WAN ZMQ do not provide that guarantee. See `docs/ROLLOUT_TRANSPORT.md`.
 
 # THE TUNNEL CONCURRENCY CEILING
 
@@ -183,10 +200,10 @@ and the engines starved behind them.
 
 The step 6 error rate was 78.3 percent. Step 7 was 18.9 percent.
 
-Raising `max_inflight_rollouts` again is the next thing to test. It was lowered
-to 128 because dead requests held the slots. That reason is gone, and the
-engines run 8 to 20 concurrent against a `max_num_seqs` of 128, so they have
-much headroom.
+The current value is 128. A later 192-inflight measurement was not faster and
+had about five times as many errors. Re-test concurrency only after the
+orchestrator moves beside the engines; the WAN result does not measure local
+engine capacity.
 
 # WHAT ACTUALLY CROSSES THE LINK
 
@@ -209,8 +226,8 @@ rollouts a minute, over a path that loses 7.5 percent of its packets.
 
 The useful content, the tokens and their logprobs, is under 5 percent of it.
 
-This is why the batch size cannot be raised. The transport is not carrying
-rollouts, it is carrying expert routing tables.
+This described x24 with router replay enabled. x25 disables router replay and
+routed-expert return together, so this field no longer limits batch size.
 
 `enable_router_replay = true` is what asks for it. The trainer replays the
 engine's expert choices instead of choosing its own, so the two forward passes
@@ -289,7 +306,7 @@ memory and keeps the mismatch KL low. Start at `_dequant_weight` in
 # ERA 1 ARCHIVE
 
 Keep these numbers for reference only. They describe global expert parallelism,
-which the current run does not use.
+which x25 and x26 did not use.
 
 Each node has one 10 Gb/s link, `vlan130`, MTU 1500, shared by its 8 GPUs. The
 second port is not cabled.

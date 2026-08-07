@@ -4,10 +4,12 @@
 
 - Prime-RL commit: `f50ec5c4c8c45864ec535dead2c3b630de50d068`
 - Base image: `ghcr.io/primeintellect-ai/prime-rl:v0.7.1.dev65-amd64`
-- Trainer image on every 4090 node:
+- Historical r33 trainer image:
   `sha256:7d75ba7215c070a1c6d1e1a4ab93b62c48518ff8eb762b85fc36d0c2a4da863b`
-- H200 rollout image:
+  Live x25 uses node-local image IDs and is not reproducibly pinned here.
+- Historical H200 rollout image:
   `sha256:0c8764d53791b651fbf9b028082939eafb80071219a2c2540dbed6480b679fc7`
+  Live h200a and h200b do not currently share one recorded image ID.
 - H200 rollout hosts: `152.236.142.243:40051` and `152.236.142.239:40050`
 - Python: 3.12
 - PyTorch: `2.11.0+cu128`
@@ -28,8 +30,8 @@ The patches under `patches/` are based on the Prime-RL commit above.
 Runtime patch SHA-256 values:
 
 - `reward-and-router-replay.patch`: `e4324d63f40e08939a1f99a8b15a49e038ffb46d0db06ca8deda123cb740b961`
-- `disconnected-generate-retry.patch`: `513ca2bbccb97b9f5c57276b3f2827b147eb7d10d36ae239e7b6d25a832dff00`
-- `disconnected-provider-retry.patch`: `bfc0c4234cb29efeae5f36a011f8901194aef4af35e7f2e029342d7042cfc2c5`
+- `disconnected-generate-retry.patch`: `5acc4fe4f649600275bb1fd03127d5bfb972bdd0d016387bb2d716eb18320683`
+- `disconnected-provider-retry.patch`: `c8927a5310a6182ea776f46627386a2d3774c6f72c99354061b2ecfb456c7754`
 - `fp8-hybrid-cp-backward.patch`: `e5eac3c674485e132b6459daf9c891860dc69d7329bb4495d6759067d8919992`
 - `ada-sparse-parity.patch`: `8e9d6d19698bcfb9669e64c302b182997981facf92179bef0ac52ccb5700db1a`
 - `ada-sparse-forward.patch`: `35976caa86f320171c0f982b22bc9ec4c597bcc663eed5d79802c08785d21fcf`
@@ -43,14 +45,16 @@ Runtime patch SHA-256 values:
   files under `source/` complete r33.
   - SHA-256: `a888463da0ec31397c01a7fe857544bc6a6da8f986b5b82b4d462c93fef287e0`.
 - It applies cleanly to `f50ec5c4c8c45864ec535dead2c3b630de50d068`.
-- Trainer: 64 RTX 4090 GPUs, block-FP8 frozen base, rank-32/alpha-64 LoRA,
-  CP 4, global EP 8, eight data replicas, no CPU or optimizer offload.
-- Rollouts: two 8-GPU H200 nodes, one TP8/EP8 vLLM engine per node, FP8 KV
-  cache, and CUDA graphs.
+- Historical r33 trainer: 64 RTX 4090 GPUs, block-FP8 frozen base,
+  rank-32/alpha-64 LoRA, CP 4, global EP 8, and eight data replicas.
+- Current x25 trainer: the FP8 source checkpoint is dequantized to BF16;
+  optimization and reductions are BF16 and the router is FP32.
+- Rollouts: two 8-GPU H200 nodes, one TP8/EP8 vLLM engine per node, W8A16,
+  FP8 KV cache, and CUDA graphs.
 - The token embedding and output head remain BF16 to match the H200 model.
 - The trainer uses GLM sparse attention and the checkpoint's IndexShare
   schedule on Ada instead of substituting dense causal attention.
-- User and judge: four TP2 Gemma 4 26B servers on n85.
+- Historical r33 user and judge: four TP2 Gemma 4 26B servers on n85.
 
 ## Exact r33 runtime source
 
@@ -59,13 +63,25 @@ Runtime patch SHA-256 values:
 - `train_source.py`: `4d75d25fa10797d02243f61e2a87ce3042254379658d97d1e6cc4c55975fa2f9`
 - `watcher.py`: `7435fd82970264b6be3bd3858da600a5bd872aca9944bddd751b8fcdb6688e95`
 - `utils/client.py`: `a6bded395f7ddf15274fffbfefda899b33bafd6572443f340ae9e91e706a2af3`
-- `renderers/base.py`: `f990822a59bd7c2868f3603416bd742150e7be4b1ba6c1d48a97ac8670bfdf7a`
-- `renderers/client.py`: `b4f47f50ad100223bb33fa1729833f0464044a35b158de7a9832621ab0f9e323`
-- `verifiers/v1/clients/eval.py`: `3e14fa33cf647f800bebff1c9e68b02e283eb88dba7a4d66645d2b3d55b21872`
+- `renderers/base.py`: `5cfb4afd947cff82fb11b2a48c78e225f9342f58a3bc5b7d8336f5779e0719ea`
+- `renderers/client.py`: `ca6093a9ccc1e0f3be7322352cc0cece67efcaa1ac1f0613877cf7ad3d8134bc`
+- `verifiers/v1/clients/eval.py`: `95e03906aaffc41836fed976e761d3b3bf62cddfaf9082c4d0a07e24de4f27da`
 
 The trainer image carries a two-line PyTorch 2.11 FSDP fix so frozen FP8
 parameters preserve `requires_grad = false` in their sharded and post-forward
 wrappers.
 
-RTX 4090 expert and dense FP8 operations use the vLLM Triton block-FP8 kernels.
-The H200 engines use the native H200 FP8 path.
+## Current external runtime overrides
+
+- `runtime/vllm/filesystem.py`:
+  `1237578d5688a1453197547f3992011863f4d77562b8620c53a61cba3a9e315f`
+- `runtime/vllm/server.py`:
+  `29262a8d0cb36ff31e3adfaffa9a64ee42e55a326310ba788a655c84b5600469`
+- `scripts/h200/sync_rollout_batches.sh`:
+  `c6e3893f4425d9a322f712dc0f16fb1c5abcff3e24363c5d554bdd128979d634`
+- `scripts/china/sync_microbatches.sh`:
+  `2534a8fcece653899805d864068d63f1dc3904a16b036578d907ed023391ea7f`
+
+The historical RTX 4090 FP8 path uses vLLM Triton block-FP8 kernels. Current
+x25 does not use that trainer path. The H200 engines use native FP8 weights
+with BF16 activations.

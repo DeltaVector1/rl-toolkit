@@ -37,10 +37,8 @@ common=(
   # NCCL >=2.19 allocates host bounce buffers via cuMem/memfd (invisible in
   # /dev/shm, counted as shmem) -- the 300GB/node "shared" spikes. Legacy path.
   -e NCCL_CUMEM_HOST_ENABLE=0
-  # Eight channels let NCCL pipeline the expert all-to-all across the single
-  # 10 Gb/s link. NCCL's own choice for this topology reaches only about 44% of
-  # line rate; eight channels reach 87%, which is the measured ceiling for this
-  # NIC. Fewer is much worse (four gives 55%, two gives 45%); more does not help.
+  # The current launcher uses four NCCL channels. Historical global-EP tests
+  # favored eight, but that topology is no longer current.
   -e NCCL_MIN_NCHANNELS=4
   -e NCCL_MAX_NCHANNELS=4
   -e TORCH_NCCL_TRACE_BUFFER_SIZE=1048576
@@ -66,6 +64,24 @@ case ${1:-} in
     nnodes=$idx
     if [ "$rank" -lt 0 ]; then
       echo "node $node is not in TRAINER_NODES ($TRAINER_NODES)" >&2; exit 1
+    fi
+    if [ "$rank" -eq 0 ]; then
+      read -r rollout_transport trainer_output < <(
+        python3 - "$config/trainer${CONFIG_TAG}.toml" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as f:
+    config = tomllib.load(f)
+print(config["rollout_transport"]["type"], config["output_dir"])
+PY
+      )
+      if [ "$rollout_transport" = filesystem ]; then
+        sync_log="/data/glm52-rl/microbatch-sync-$RUN.log"
+        nohup setsid env RUN_DIR="$trainer_output" \
+          "$deployment/scripts/china/sync_microbatches.sh" \
+          >>"$sync_log" 2>&1 </dev/null &
+      fi
     fi
     # The default fq_codel qdisc costs about a quarter of the all-to-all
     # throughput on this link (65% of line rate against 87% with fq). Applied

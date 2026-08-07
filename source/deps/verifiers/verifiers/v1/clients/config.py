@@ -103,23 +103,7 @@ def resolve_api_key(config: BaseClientConfig) -> str:
     return api_key or "EMPTY"
 
 
-# Local change. Upstream leaves the OpenAI SDK defaults in place:
-# connect=5.0s, read=600s. Both are wrong for the China link, which has 217 ms
-# of round trip and 10-33% packet loss.
-#
-# connect=5s: a TCP handshake that loses a SYN waits about 1s, then 2s, then 4s
-# for the retransmits, so a connect through a busy tunnel blows the 5s budget
-# while the path is fine.
-#
-# read=600s is the expensive one. The orchestrator runs a fixed number of
-# rollouts in flight, so a wedged request holds one of those slots for ten
-# minutes. Measured 2026-08-07: 121 rollouts in flight while the two engines
-# ran 3 between them, and 78.4% of a step's rollouts ended in ReadTimeout. Most
-# of the "in flight" count was dead requests waiting out this timeout, and the
-# engines starved behind them.
-#
-# 300s still leaves a wide margin: generation averages 54.6s and p90 is 87.8s.
-# Override with PRIME_ROLLOUT_* if a longer generation is ever configured.
+# Tune timeouts for the lossy China rollout link.
 _CONNECT_TIMEOUT_S = float(os.environ.get("PRIME_ROLLOUT_CONNECT_TIMEOUT_S", "30"))
 _READ_TIMEOUT_S = float(os.environ.get("PRIME_ROLLOUT_TIMEOUT_S", "300"))
 

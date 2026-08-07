@@ -160,15 +160,14 @@ class EvalClient(Client):
             )
             try:
                 response = await self.http.send(request, stream=stream)
-                if not stream:
-                    response.content
                 break
             except (httpx.HTTPError, ConnectionResetError) as e:
                 if attempt == 2:
-                    status = 504 if isinstance(e, httpx.TimeoutException) else 503
                     raise model_error(
                         f"{url}: {e}",
-                        status_code=status,
+                        status_code=504
+                        if isinstance(e, httpx.TimeoutException)
+                        else 503,
                     ) from e
                 logger.warning(
                     "retrying disconnected provider request %s (%d/2): %s",

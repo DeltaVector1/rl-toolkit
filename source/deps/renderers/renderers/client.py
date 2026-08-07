@@ -289,10 +289,11 @@ async def generate(
     )
     for attempt in range(3):
         try:
-            raw_response = await client.post(endpoint, **post_kwargs)
-            data = parse_generate_response(raw_response.content)
+            data = parse_generate_response(
+                (await client.post(endpoint, **post_kwargs)).content
+            )
             break
-        except (APIConnectionError, httpx.TransportError) as exc:
+        except APIConnectionError as exc:
             if attempt == 2:
                 raise
             _request_logger.warning(

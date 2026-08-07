@@ -8,9 +8,10 @@ Language: ASD-STE100 Simplified Technical English.
 
 # What the system is
 
-The system trains GLM-5.2-FP8, a 745 billion parameter MoE, with GRPO
-reinforcement learning and a rank-32 LoRA adapter. The goal is to reduce
-refusals.
+The system trains from the GLM-5.2-FP8 checkpoint, a 745 billion parameter
+MoE, with GRPO and a rank-32 LoRA adapter. The H200 engines use FP8 weights
+with BF16 activations. The trainer dequantizes the checkpoint to BF16 weights.
+The goal is to reduce refusals.
 
 There are four parts. Keep them separate when you report anything.
 
@@ -38,10 +39,10 @@ with different causes, and they overlap. Never give one combined number.
 | judge | External, 8x RTX 5090, port 26406 |
 
 The trainer nodes are in China. The engines and the judge are outside China.
-The link between them drops 10 to 33 percent of the packets and adds 217
-milliseconds. The engines reach n82 through 24 reverse SSH tunnels on ports
-18001 to 18024. The batch itself never crosses that link, because the
-orchestrator runs on n82.
+Measurements from different hosts and times found 3 to 33 percent packet loss
+and approximately 217 milliseconds round-trip time. The engines reach n82
+through 48 reverse SSH tunnels on ports 18001 to 18048. The current
+orchestrator runs on n82, so individual rollout responses cross this link.
 
 # How to operate the run
 
@@ -94,7 +95,8 @@ Do not delete the data of the owner. The protected paths are `/data/ZiphuAI`,
 `/data/glm52-rl/model` on n85 is the only copy. Secrets stay in
 `/data/trinity/training.env`, outside this repository.
 
-Do not use QLoRA. Do not use int4 weights.
+Do not use QLoRA. Do not use INT4 weights. The INT4 expert-activation
+transport is separate and is allowed.
 
 Do not use a cached batch. Every attempt is a full production run.
 
@@ -112,30 +114,27 @@ Report the verdict.
 
 # The current run
 
-Run x25, started 2026-08-07 17:04 UTC. Batch 1024, group size 16, 128 rollouts
-in flight, 48 tunnels, 16K context, bf16 trainer weights, `pp=8`, `cp=8`,
-`ep=8` node-local, LoRA rank 32, Muon at 8e-6.
+There is no active run. Test x26 ran from 18:54 to 19:34 UTC on 2026-08-07 and
+is stopped. Its orchestrator ran on h200a. Its trainer used the same 64 GPUs,
+BF16 weights, PP8, CP8, node-local EP8, batch 1024, group 16, and 128 rollouts
+in flight.
 
-Two flags are new and they belong together. `enable_router_replay = false` in
-the trainer, and `enable_return_routed_experts = false` on the engines.
-`routed_experts` was 95.5 percent of every byte crossing the link. Turning it
-off cut a 64-token response from 71064 to 10372 bytes.
+x26 rollout step 1 took 20 minutes 5 seconds. Step 2 took 18 minutes 41
+seconds. The 84.2 MB and 92.5 MB batch transfers to n82 each took about 29
+seconds and passed SHA-256 verification. These are rollout collection and
+transfer times. They are not trainer step times.
 
-This is a TEST. Read `masked_mismatch_kl/mean` at the first step. It sat at
-0.19 to 0.21 with replay on. If it rises to several nats, revert BOTH flags and
-restart the trainer and both engines. See `docs/HANDOFF.md`.
+The trainer did not complete step 1. On two attempts, n80 rank 35 exited about
+44 seconds after the forward pass started. Other ranks then reported an NCCL
+remote-process error. The second attempt used identical verified micro-batch
+files on all eight trainer nodes. The cause of the rank 35 exit is not known.
 
-The step time is set by rollout collection, not by the trainer. The trainer
-computes a step in 6 to 15 minutes and then idles. At 13 rollouts a minute a
-batch of 1024 takes about 79 minutes, and that is the step time. A 15 minute
-step needs 68 rollouts a minute.
+The H200 engines are healthy and idle. The x26 orchestrator and transport
+publishers are stopped. Do not use the n82 supervisor for x26. It assumes that
+the orchestrator runs on n82.
 
-The success criterion is that the reward rises, or that the reward distribution
-rises. Nothing else counts.
-
-Run x24 gave 10 steps and the verdict was "inside the noise": the trend was
-+0.0011 against a residual spread of 0.0178. The step-to-step spread was 0.0178
-against 0.0390 for x22 at batch 256, so batch 1024 does halve the noise.
+x25 is also stopped. Its no-router-replay step measured masked mismatch KL
+0.362. There are too few completed steps for a reward trend.
 
 # Where the rest is
 

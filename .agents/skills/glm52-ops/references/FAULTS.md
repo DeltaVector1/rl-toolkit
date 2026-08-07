@@ -31,7 +31,7 @@ engines. The container state is not a health signal either.
 
 # The tunnels are listening but pass no data
 
-Symptom: fewer than 18 of 24 ports answer. The probe hangs for the whole
+Symptom: fewer than 18 of 48 ports answer. The probe hangs for the whole
 timeout instead of refusing at once.
 
 Cause: the SSH forward stays established while the link drops the packets. The
@@ -46,18 +46,15 @@ hours while the engines were healthy.
 
 # Ten or fewer tunnels answer and the engines are idle
 
-Symptom: 10 of 24 tunnels, engine concurrency 1 to 6, and the rebuild rate
-matches the failure rate.
+Symptom: low tunnel probe count, idle engines, and many rollouts in flight.
 
 Cause: too many rollouts in flight. The tunnels are the limit, not the batch
 size.
 
-Repair: set `max_inflight_rollouts = 256` in the orchestrator config. Do not
-change `batch_size` for this. The two values are independent. `batch_size`
-sets the gradient quality. `max_inflight_rollouts` sets the tunnel load.
-
-At 256 in flight, 20 to 22 tunnels stay healthy and the engines run 45 to 70
-concurrent requests. At 1024 in flight, all 24 wedge.
+Repair: confirm that engine throughput is also low. The current
+`max_inflight_rollouts` is 128. Do not change it or `batch_size` without an
+experiment decision. The older 256/1024 measurements used 24 tunnels and do
+not describe the current 48-port pool.
 
 # The trainer waits and no batch arrives
 

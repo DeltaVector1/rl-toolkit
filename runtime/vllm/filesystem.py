@@ -19,6 +19,37 @@ def adapter_cache_path(source_url: str) -> Path:
     ).hexdigest()
 
 
+def download(source_url: str, destination: Path) -> None:
+    for attempt in range(10):
+        try:
+            with urllib.request.urlopen(
+                urllib.request.Request(source_url, method="HEAD"), timeout=60
+            ) as response:
+                total = int(response.headers["Content-Length"])
+            offset = destination.stat().st_size if destination.exists() else 0
+            if offset == total:
+                return
+            if offset > total:
+                destination.unlink()
+                offset = 0
+            request = urllib.request.Request(
+                source_url, headers={"Range": f"bytes={offset}-"} if offset else {}
+            )
+            with urllib.request.urlopen(request, timeout=60) as response:
+                if offset and response.status != 206:
+                    destination.unlink(missing_ok=True)
+                    raise OSError("adapter server did not honor byte range")
+                with destination.open("ab" if offset else "wb") as output:
+                    shutil.copyfileobj(response, output, length=16 * 1024 * 1024)
+            if destination.stat().st_size != total:
+                raise OSError(f"incomplete adapter file: {destination.name}")
+            return
+        except OSError:
+            if attempt == 9:
+                raise
+            time.sleep(min(2**attempt, 10))
+
+
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_worker import Worker
 
@@ -36,29 +67,15 @@ class FileSystemWeightUpdateWorker(Worker):
 
     def stage_lora_adapter(self, source_url: str) -> None:
         destination = adapter_cache_path(source_url)
-        if (destination / "READY").exists():
-            return
-        if self.rank:
-            deadline = time.monotonic() + 600
-            while not (destination / "READY").exists():
-                if time.monotonic() > deadline:
-                    raise TimeoutError(f"adapter download timed out: {source_url}")
-                time.sleep(0.25)
-            return
         destination.parent.mkdir(parents=True, exist_ok=True)
         with (destination.parent / f"{destination.name}.lock").open("w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             if (destination / "READY").exists():
                 return
-            temporary = destination.with_name(f"{destination.name}.{os.getpid()}")
-            shutil.rmtree(temporary, ignore_errors=True)
-            temporary.mkdir()
+            temporary = destination.with_name(f"{destination.name}.partial")
+            temporary.mkdir(exist_ok=True)
             for filename in ("adapter_config.json", "adapter_model.safetensors"):
-                with urllib.request.urlopen(f"{source_url.rstrip('/')}/{filename}", timeout=600) as response:
-                    with (temporary / filename).open("wb") as output:
-                        shutil.copyfileobj(response, output, length=16 * 1024 * 1024)
-                        if output.tell() != int(response.headers["Content-Length"]):
-                            raise OSError(f"incomplete adapter file: {filename}")
+                download(f"{source_url.rstrip('/')}/{filename}", temporary / filename)
             (temporary / "READY").touch()
             shutil.rmtree(destination, ignore_errors=True)
             temporary.rename(destination)

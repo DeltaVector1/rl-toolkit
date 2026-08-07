@@ -18,7 +18,7 @@ level = "info"
 project = "prod-run"
 name = "orchestrator-x25"
 group = "glm52-decensor-r32"
-tags = ["glm-5.2", "decensor", "grpo", "w8a16-rollouts", "bf16-base-trainer", "lora-r32", "16xh200-rollouts", "56x4090-trainer", "local-gemma", "b1024", "4096", "cp8", "router-replay", "sparse-ada", "norm-adv", "expert-ac"]
+tags = ["glm-5.2", "decensor", "grpo", "w8a16-rollouts", "bf16-base-trainer", "lora-r32", "16xh200-rollouts", "64x4090-trainer", "external-gemma", "b1024", "16384", "cp8", "no-router-replay", "sparse-ada", "norm-adv", "expert-ac"]
 
 [file_monitor]
 filename = "rollout-metrics.jsonl"

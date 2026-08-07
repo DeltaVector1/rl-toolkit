@@ -1378,9 +1378,8 @@ def create_renderer_pool(
     ``trust_remote_code`` policy (default off; Moonshot Kimi-K2 family
     opts in with a pinned ``revision``).
     """
-    # Resolve Transformers' lazy export before worker threads initialize tokenizers.
+    # Resolve the lazy export before tokenizer threads start.
     from transformers import AutoTokenizer  # noqa: F401
-
 
     def factory() -> Renderer:
         tokenizer = load_tokenizer(tokenizer_name_or_path)

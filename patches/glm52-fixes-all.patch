@@ -540,7 +540,7 @@ index 0000000..7760116
 +keep_interval = 100
 diff --git a/configs/china/orchestrator.x25.toml b/configs/china/orchestrator.x25.toml
 new file mode 100644
-index 0000000..7754e7e
+index 0000000..1b872b0
 --- /dev/null
 +++ b/configs/china/orchestrator.x25.toml
 @@ -0,0 +1,147 @@
@@ -564,7 +564,7 @@ index 0000000..7754e7e
 +project = "prod-run"
 +name = "orchestrator-x25"
 +group = "glm52-decensor-r32"
-+tags = ["glm-5.2", "decensor", "grpo", "w8a16-rollouts", "bf16-base-trainer", "lora-r32", "16xh200-rollouts", "56x4090-trainer", "local-gemma", "b1024", "4096", "cp8", "router-replay", "sparse-ada", "norm-adv", "expert-ac"]
++tags = ["glm-5.2", "decensor", "grpo", "w8a16-rollouts", "bf16-base-trainer", "lora-r32", "16xh200-rollouts", "64x4090-trainer", "external-gemma", "b1024", "16384", "cp8", "no-router-replay", "sparse-ada", "norm-adv", "expert-ac"]
 +
 +[file_monitor]
 +filename = "rollout-metrics.jsonl"
@@ -2298,10 +2298,10 @@ index 0000000..d3ac54d
 +output_dir = "/data/glm52-rl/runs/x24/run_x24"
 diff --git a/configs/china/trainer.x25.toml b/configs/china/trainer.x25.toml
 new file mode 100644
-index 0000000..0ecb1c5
+index 0000000..15cfa69
 --- /dev/null
 +++ b/configs/china/trainer.x25.toml
-@@ -0,0 +1,143 @@
+@@ -0,0 +1,130 @@
 +output_dir = "/data/glm52-rl/runs/x25"
 +max_steps = 200
 +# 5400, not 1800: at 16K the phantom-shmem pressure pushes nodes into
@@ -2328,7 +2328,7 @@ index 0000000..0ecb1c5
 +project = "prod-run"
 +name = "trainer-x25"
 +group = "glm52-decensor-r32"
-+tags = ["glm-5.2", "pp7", "decensor", "grpo", "bf16-base", "lora-r32", "56x4090", "b1024", "4096", "cp8", "router-replay", "sparse-ada", "norm-adv", "expert-ac"]
++tags = ["glm-5.2", "pp8", "decensor", "grpo", "bf16-base", "lora-r32", "64x4090", "b1024", "16384", "cp8", "no-router-replay", "sparse-ada", "norm-adv", "expert-ac"]
 +
 +[file_monitor]
 +filename = "run_x25/trainer-metrics.jsonl"
@@ -2370,21 +2370,8 @@ index 0000000..0ecb1c5
 +
 +[model.quantization]
 +type = "fp8"
-+# false is REQUIRED here, not an optimization. Device memory is mirrored 1:1
-+# into a MAP_SHARED /dev/zero region per rank (confirmed by smaps: 29.51 GB of
-+# /dev/zero against 29110 MiB on the GPU, x8 ranks = the node's 237 GB
-+# 'shared'). At 16K the GPUs peak near 60 GB, the mirror reaches ~486 GB and
-+# the 503 GB node dies. bf16 weights cost 29 GB/GPU, fp8 cost 15, which halves
-+# the mirror. The norms.py override fixes the float8 promotion crash that
-+# blocked this before.
-+# (was: true costs ~14 GB/GPU because apply_quantization
-+# returns early at model.py:1256 so no FP8 kernels run despite type = "fp8").
-+# false is the memory-correct setting and loads fine, but dies in the first
-+# forward: an FP8 linear emits float8_e4m3fn into the residual stream and
-+# RMSNorm.forward (norms.py:44, `self.weight * hidden_states.to(input_dtype)`)
-+# raises "Promotion for Float8 Types is not supported, attempted to promote
-+# BFloat16 and Float8_e4m3fn". Framework bug in the native-FP8 path for
-+# glm_moe_dsa; revisit with a norms/linear dtype fix before flipping again.
++# The source checkpoint is FP8, but the trainer dequantizes it to BF16.
++# Native trainer W8A8 broke the importance ratio.
 +dequantize_checkpoint = true
 +
 +[model.lora]
@@ -2445,6 +2432,139 @@ index 0000000..0ecb1c5
 +keep_last = 2
 +keep_interval = 100
 +output_dir = "/data/glm52-rl/runs/x25/run_x25"
+diff --git a/configs/china/trainer.x26.toml b/configs/china/trainer.x26.toml
+new file mode 100644
+index 0000000..473ea1f
+--- /dev/null
++++ b/configs/china/trainer.x26.toml
+@@ -0,0 +1,127 @@
++output_dir = "/data/glm52-rl/runs/x26"
++max_steps = 200
++# 5400, not 1800: at 16K the phantom-shmem pressure pushes nodes into
++# transient swap thrash; collectives stall 20-40 min and RECOVER (observed
++# blackouts lifting on their own). 1800s converts a recoverable stall into
++# a watchdog kill -- three attempts died exactly this way.
++dist_timeout_seconds = 5400
++# TEST 2026-08-07: routed_experts is 95.5% of the bytes crossing the China link
++# (711 B for every generated token, uint8, already minimal). Replay is what asks
++# for it. The router is NOT a LoRA target, so its weights are frozen and
++# identical on both sides; the only divergence is bf16+fp32-router here against
++# W8A16 on the engine.
++# Watch masked_mismatch_kl: 0.19-0.21 with replay on. If it holds, replay is
++# unnecessary and the payload can drop ~20x by also setting
++# enable_return_routed_experts=false in configs/h200/inference.toml.
++# If it blows up (FP8 pushed it to 7-9 nats), revert this line.
++enable_router_replay = false
++
++[log]
++level = "debug"
++ranks_filter = [0]
++
++[swanlab]
++project = "prod-run"
++name = "trainer-x26"
++group = "glm52-decensor-r32"
++tags = ["glm-5.2", "pp8", "decensor", "grpo", "bf16-base", "lora-r32", "64x4090", "b1024", "16384", "cp8", "no-router-replay", "sparse-ada", "norm-adv", "expert-ac"]
++
++[file_monitor]
++filename = "run_x26/trainer-metrics.jsonl"
++
++[model]
++name = "/data/glm52-rl/model-fp8"
++impl = "custom"
++seq_len = 16384
++attn = "flash_attention_2"
++cp = 8
++pp = 8
++cp_style = "ring"
++ep = 8
++global_ep = false
++dp_replicate = 1
++ep_comm_backend = "torch"
++fsdp_cpu_offload = false
++cold_cpu_offload = false
++optim_cpu_offload = false
++reshard_after_forward = true
++optimization_dtype = "bfloat16"
++reduce_dtype = "bfloat16"
++moe_router_dtype = "float32"
++moe_use_grouped_mm = true
++fused_lm_head_token_chunk_size = 1024
++fp8_embed_head = false
++fp8_lm_head = false
++compile = "None"
++# ac_offloading DEFAULTS TO ENABLED (trainer.py:173 is
++# `ActivationOffloadingConfig()`, not None), and nothing here ever turned it
++# off. It stashes activations in PINNED HOST memory, which is what the
++# [model.ac] note below already warned about: "pinned stashes for 7 in-flight
++# micro-batches x 8 ranks exceeded the 503 GB host RAM and the kernel
++# OOM-killed the trainer on n82". Measured on x18: 60 GB of /dev/zero per rank
++# against 17 GB on the GPU -- 3.5:1, and it tracks micro-batches in flight
++# rather than device memory, which is why FP8 and expandable_segments both
++# failed to move it. 8 ranks x 60 GB = 480 GB on a 503 GB node.
++ac_offloading = "None"
++
++[model.quantization]
++type = "fp8"
++# The source checkpoint is FP8, but the trainer dequantizes it to BF16.
++# Native trainer W8A8 broke the importance ratio.
++dequantize_checkpoint = true
++
++[model.lora]
++rank = 32
++alpha = 64
++dropout = 0.0
++target_modules = [
++    "q_a_proj",
++    "q_b_proj",
++    "kv_a_proj_with_mqa",
++    "o_proj",
++]
++
++[model.ac]
++# Selective, NOT full: full recompute trips
++# "CheckpointError: Recomputed values ... have different metadata" on this
++# MoE+EP stack, because recompute does not reproduce the per-expert token
++# counts the original forward saw. Memory headroom comes from cp=8 instead.
++mode = "selective"
++freq = 1
++# "norm" checkpoints the two per-layer norms: ~600 MB of activations per
++# 12-layer stage at 16K, vs an x1 OOM shortfall of 242 MiB. CPU offloading
++# is out: pinned stashes for 7 in-flight micro-batches x 8 ranks exceeded
++# the 503 GB host RAM and the kernel OOM-killed the trainer on n82.
++# "mlp" is NOT included: only the 3 dense layers support it, and stages
++# without them reject the target at startup.
++# Every supported target except dense-only "mlp": on this driver the kernel
++# charges DEVICE memory as process shmem, so 8 x GPU_used + real host RAM
++# must stay under 503GB. Checkpointing the attention internals cuts both
++# the direct GPU peak and its 8x host shadow.
++targets = ["attention", "attn_proj", "mla_up_proj", "routed_experts", "norm"]
++
++[optim]
++type = "muon"
++lr = 8e-6
++weight_decay = 0.0
++max_norm = 1.0
++
++[scheduler]
++type = "constant"
++
++[weight_broadcast]
++type = "filesystem"
++save_format = "safetensors"
++
++[rollout_transport]
++type = "filesystem"
++
++[ckpt]
++interval = 5
++# weights_only=true cannot resume training. At interval=25 no checkpoint
++# existed by step 10, so a trainer restart lost every step.
++weights_only = false
++skip_gather_master_weights = true
++keep_last = 2
++keep_interval = 100
++output_dir = "/data/glm52-rl/runs/x26/run_x26"
 diff --git a/configs/h200/inference.toml b/configs/h200/inference.toml
 index e72de4e..305e4e8 100644
 --- a/configs/h200/inference.toml
@@ -3514,6 +3634,192 @@ index 0000000..d7ad877
 +skip_progress = true
 +keep_last = 2
 +keep_interval = 100
+diff --git a/configs/h200/orchestrator.x26h.toml b/configs/h200/orchestrator.x26h.toml
+new file mode 100644
+index 0000000..d978276
+--- /dev/null
++++ b/configs/h200/orchestrator.x26h.toml
+@@ -0,0 +1,105 @@
++output_dir = "/data/glm52-rl/runs/x26/run_x26"
++max_steps = 200
++seq_len = 16384
++batch_size = 1024
++group_size = 16
++max_inflight_rollouts = 128
++# Keep bounded policy-version headroom while training and generation overlap.
++max_off_policy_steps = 4
++pool_size = 4
++
++[log]
++level = "info"
++
++[swanlab]
++project = "prod-run"
++name = "orchestrator-x26"
++group = "glm52-decensor-r32"
++tags = ["glm-5.2", "decensor", "grpo", "w8a16-rollouts", "bf16-base-trainer", "lora-r32", "16xh200-rollouts", "64x4090-trainer", "edge-gemma", "b1024", "16384", "cp8", "no-router-replay", "sparse-ada", "norm-adv", "expert-ac"]
++
++[file_monitor]
++filename = "rollout-metrics.jsonl"
++
++[model]
++name = "/data/glm52-rl/model-fp8"
++
++[model.lora]
++name = "glm52-decensor-r32-node-local"
++rank = 32
++alpha = 64
++
++[model.client]
++base_url = [
++    "http://127.0.0.1:8000/v1",
++    "http://127.0.0.1:8000/v1",
++    "http://127.0.0.1:8000/v1",
++    "http://127.0.0.1:8000/v1",
++    "http://127.0.0.1:8000/v1",
++    "http://127.0.0.1:8000/v1",
++    "http://127.0.0.1:18101/v1",
++    "http://127.0.0.1:18101/v1",
++    "http://127.0.0.1:18101/v1",
++    "http://127.0.0.1:18101/v1",
++    "http://127.0.0.1:18101/v1",
++    "http://127.0.0.1:18101/v1",
++]
++admin_base_url = [
++    "http://127.0.0.1:8000/v1",
++    "http://127.0.0.1:18101/v1",
++]
++wait_for_ready_timeout = 7200
++skip_model_check = true
++
++[optim]
++lr = 8e-6
++
++[renderer]
++name = "default"
++tool_parser = "glm"
++reasoning_parser = "think"
++enable_thinking = true
++clear_thinking = true
++
++[train.sampling]
++temperature = 1.0
++max_completion_tokens = 16384
++extra_body = { min_tokens = 16 }
++
++[[train.env]]
++name = "decensor"
++ratio = 1.0
++pool = { type = "static", num_workers = 16 }
++env.taskset.id = "decensor-v1"
++env.taskset.dataset_name = "/data/glm52-rl/decensor-data/rl.jsonl"
++env.taskset.num_examples = 2000
++env.agent.harness = { id = "null", runtime = { type = "subprocess" } }
++env.agent.max_output_tokens = 16384
++env.agent.timeout.rollout = 3600
++
++[train.env.sampling]
++max_completion_tokens = 16384
++
++[train.env.env.taskset.task.judge]
++base_url = "http://202.214.223.66:26406/v1"
++model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
++api_key_var = "VLLM_API_KEY"
++
++[train.env.env.taskset.task.user]
++base_url = "http://202.214.223.66:26406/v1"
++model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
++api_key_var = "VLLM_API_KEY"
++
++[weight_broadcast]
++type = "filesystem"
++source_url = "http://127.0.0.1:18100/x26"
++source_dir = "/data/glm52-rl/runs/x26"
++
++[rollout_transport]
++type = "filesystem"
++
++[ckpt]
++interval = 25
++resume_step = -1
++skip_progress = true
++keep_last = 2
++keep_interval = 100
+diff --git a/runtime/vllm/filesystem.py b/runtime/vllm/filesystem.py
+index f13ecf4..3bf013d 100644
+--- a/runtime/vllm/filesystem.py
++++ b/runtime/vllm/filesystem.py
+@@ -19,6 +19,37 @@ def adapter_cache_path(source_url: str) -> Path:
+     ).hexdigest()
+ 
+ 
++def download(source_url: str, destination: Path) -> None:
++    for attempt in range(10):
++        try:
++            with urllib.request.urlopen(
++                urllib.request.Request(source_url, method="HEAD"), timeout=60
++            ) as response:
++                total = int(response.headers["Content-Length"])
++            offset = destination.stat().st_size if destination.exists() else 0
++            if offset == total:
++                return
++            if offset > total:
++                destination.unlink()
++                offset = 0
++            request = urllib.request.Request(
++                source_url, headers={"Range": f"bytes={offset}-"} if offset else {}
++            )
++            with urllib.request.urlopen(request, timeout=60) as response:
++                if offset and response.status != 206:
++                    destination.unlink(missing_ok=True)
++                    raise OSError("adapter server did not honor byte range")
++                with destination.open("ab" if offset else "wb") as output:
++                    shutil.copyfileobj(response, output, length=16 * 1024 * 1024)
++            if destination.stat().st_size != total:
++                raise OSError(f"incomplete adapter file: {destination.name}")
++            return
++        except OSError:
++            if attempt == 9:
++                raise
++            time.sleep(min(2**attempt, 10))
++
++
+ if TYPE_CHECKING:
+     from vllm.v1.worker.gpu_worker import Worker
+ 
+@@ -36,29 +67,15 @@ class FileSystemWeightUpdateWorker(Worker):
+ 
+     def stage_lora_adapter(self, source_url: str) -> None:
+         destination = adapter_cache_path(source_url)
+-        if (destination / "READY").exists():
+-            return
+-        if self.rank:
+-            deadline = time.monotonic() + 600
+-            while not (destination / "READY").exists():
+-                if time.monotonic() > deadline:
+-                    raise TimeoutError(f"adapter download timed out: {source_url}")
+-                time.sleep(0.25)
+-            return
+         destination.parent.mkdir(parents=True, exist_ok=True)
+         with (destination.parent / f"{destination.name}.lock").open("w") as lock:
+             fcntl.flock(lock, fcntl.LOCK_EX)
+             if (destination / "READY").exists():
+                 return
+-            temporary = destination.with_name(f"{destination.name}.{os.getpid()}")
+-            shutil.rmtree(temporary, ignore_errors=True)
+-            temporary.mkdir()
++            temporary = destination.with_name(f"{destination.name}.partial")
++            temporary.mkdir(exist_ok=True)
+             for filename in ("adapter_config.json", "adapter_model.safetensors"):
+-                with urllib.request.urlopen(f"{source_url.rstrip('/')}/{filename}", timeout=600) as response:
+-                    with (temporary / filename).open("wb") as output:
+-                        shutil.copyfileobj(response, output, length=16 * 1024 * 1024)
+-                        if output.tell() != int(response.headers["Content-Length"]):
+-                            raise OSError(f"incomplete adapter file: {filename}")
++                download(f"{source_url.rstrip('/')}/{filename}", temporary / filename)
+             (temporary / "READY").touch()
+             shutil.rmtree(destination, ignore_errors=True)
+             temporary.rename(destination)
 diff --git a/scripts/china/apply_at_step.sh b/scripts/china/apply_at_step.sh
 new file mode 100755
 index 0000000..1f2d2ac
@@ -3618,10 +3924,48 @@ index 0000000..1f2d2ac
 +log "done. orchestrator restarted with $CFG"
 +sudo docker logs --tail 20 "$ORCH_CT" 2>&1 | grep -oE 'batch [0-9]+/[0-9]+[^;]*; [0-9]+ inflight' | tail -1
 diff --git a/scripts/china/cluster.sh b/scripts/china/cluster.sh
-index 41ebaaf..aaa8f8c 100755
+index 41ebaaf..6ed362d 100755
 --- a/scripts/china/cluster.sh
 +++ b/scripts/china/cluster.sh
-@@ -118,7 +118,7 @@ case ${1:-} in
+@@ -37,10 +37,8 @@ common=(
+   # NCCL >=2.19 allocates host bounce buffers via cuMem/memfd (invisible in
+   # /dev/shm, counted as shmem) -- the 300GB/node "shared" spikes. Legacy path.
+   -e NCCL_CUMEM_HOST_ENABLE=0
+-  # Eight channels let NCCL pipeline the expert all-to-all across the single
+-  # 10 Gb/s link. NCCL's own choice for this topology reaches only about 44% of
+-  # line rate; eight channels reach 87%, which is the measured ceiling for this
+-  # NIC. Fewer is much worse (four gives 55%, two gives 45%); more does not help.
++  # The current launcher uses four NCCL channels. Historical global-EP tests
++  # favored eight, but that topology is no longer current.
+   -e NCCL_MIN_NCHANNELS=4
+   -e NCCL_MAX_NCHANNELS=4
+   -e TORCH_NCCL_TRACE_BUFFER_SIZE=1048576
+@@ -67,6 +65,24 @@ case ${1:-} in
+     if [ "$rank" -lt 0 ]; then
+       echo "node $node is not in TRAINER_NODES ($TRAINER_NODES)" >&2; exit 1
+     fi
++    if [ "$rank" -eq 0 ]; then
++      read -r rollout_transport trainer_output < <(
++        python3 - "$config/trainer${CONFIG_TAG}.toml" <<'PY'
++import sys
++import tomllib
++
++with open(sys.argv[1], "rb") as f:
++    config = tomllib.load(f)
++print(config["rollout_transport"]["type"], config["output_dir"])
++PY
++      )
++      if [ "$rollout_transport" = filesystem ]; then
++        sync_log="/data/glm52-rl/microbatch-sync-$RUN.log"
++        nohup setsid env RUN_DIR="$trainer_output" \
++          "$deployment/scripts/china/sync_microbatches.sh" \
++          >>"$sync_log" 2>&1 </dev/null &
++      fi
++    fi
+     # The default fq_codel qdisc costs about a quarter of the all-to-all
+     # throughput on this link (65% of line rate against 87% with fq). Applied
+     # here so it is reapplied after a reboot; both calls are idempotent.
+@@ -118,7 +134,7 @@ case ${1:-} in
        -v "$deployment/source/src/prime_rl/trainer/model.py":/app/src/prime_rl/trainer/model.py:ro \
        -v "$deployment/source/packages/prime-rl-configs/src/prime_rl/configs/trainer.py":/app/packages/prime-rl-configs/src/prime_rl/configs/trainer.py:ro \
        --env-file /data/trinity/training.env \
@@ -3630,7 +3974,7 @@ index 41ebaaf..aaa8f8c 100755
        -e TORCHINDUCTOR_COMPILE_THREADS=8 \
        -e PRIME_EP_PROFILE="${PRIME_EP_PROFILE:-0}" \
        -e PRIME_EP_PROFILE_EVERY="${PRIME_EP_PROFILE_EVERY:-150}" \
-@@ -155,6 +155,7 @@ case ${1:-} in
+@@ -155,6 +171,7 @@ case ${1:-} in
        -v "$deployment/source/deps/renderers/renderers/base.py":/app/deps/renderers/renderers/base.py:ro \
        -v "$deployment/source/deps/renderers/renderers/client.py":/app/deps/renderers/renderers/client.py:ro \
        -v "$deployment/source/deps/verifiers/verifiers/v1/clients/eval.py":/app/deps/verifiers/verifiers/v1/clients/eval.py:ro \
@@ -3640,27 +3984,14 @@ index 41ebaaf..aaa8f8c 100755
        -v "$deployment/source/src/prime_rl/orchestrator/orchestrator.py":/app/src/prime_rl/orchestrator/orchestrator.py:ro \
 diff --git a/scripts/china/run_supervisor.sh b/scripts/china/run_supervisor.sh
 new file mode 100644
-index 0000000..f4f7e70
+index 0000000..5783738
 --- /dev/null
 +++ b/scripts/china/run_supervisor.sh
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,59 @@
 +#!/usr/bin/env bash
 +# Keep the trainer and orchestrator alive. Runs on n82.
-+#
-+# Every component in this stack had a supervisor except the two that matter
-+# most. The costs on 2026-08-06 alone:
-+#   trainer died 10:13 ("Storage size calculation overflowed with
-+#     sizes=[1, 9142729177965406720]", then an NCCL collective timeout as the
-+#     other ranks waited on a dead rank 0) -- sat dead SIX HOURS
-+#   engines died 03:13 and again 06:0x -- 2.6 hours before anyone noticed
-+# Nothing restarted any of it. The engines now self-heal
-+# (scripts/h200/engine_watchdog.sh); this does the same for the run itself.
-+#
-+# A trainer restart is safe here because the orchestrator tolerates the trainer
-+# lagging by max_off_policy_steps and the trainer resumes from its last
-+# checkpoint. It is NOT safe to restart the orchestrator while the trainer is
-+# dead -- a zmq send to a dead peer blocks its event loop -- so the trainer is
-+# always brought back first and the orchestrator only after it is listening.
++# Bring the trainer back before the orchestrator. ZMQ can block an
++# orchestrator that starts against a dead trainer.
 +set -uo pipefail
 +
 +RUN=${RUN:?set RUN}
@@ -3681,18 +4012,26 @@ index 0000000..f4f7e70
 +    log "TRAINER DOWN -- restarting across $NODES"
 +    for h in $NODES; do
 +      ssh -o BatchMode=yes -o ConnectTimeout=25 "$h" \
-+        "sudo pkill -9 -f PRIME-RL 2>/dev/null; sudo docker rm -f glm52-decensor-trainer >/dev/null 2>&1" 2>/dev/null
++        "sudo docker rm -f glm52-decensor-trainer >/dev/null 2>&1 || true" 2>/dev/null
 +    done
-+    # Let the host mirror of device memory drain before reloading, or the
-+    # relaunch lands on a node still paging out the previous incarnation.
 +    sleep 20
++    declare -A launches
 +    for h in $NODES; do
 +      ( ssh -o BatchMode=yes -o ConnectTimeout=30 "$h" \
 +          "TRAINER_NODES='$TRAINER_NODES' RUN=$RUN RUN_NAME=$RUN_NAME CONFIG_TAG=$TAG \
-+           PRIME_EP_PROFILE=1 PRIME_EP_AC_CACHE=1 bash $CLUSTER trainer >/dev/null 2>&1" 2>/dev/null ) &
++           PRIME_EP_PROFILE=1 PRIME_EP_AC_CACHE=1 bash $CLUSTER trainer" ) \
++          >>"/data/glm52-rl/run-supervisor-$h.log" 2>&1 &
++      launches[$h]=$!
 +    done
-+    wait
-+    log "trainer relaunch issued"
++    failed=""
++    for h in $NODES; do
++      wait "${launches[$h]}" || failed="$failed $h"
++    done
++    if [ -n "$failed" ]; then
++      log "trainer relaunch failed on:$failed"
++    else
++      log "trainer relaunch issued"
++    fi
 +    sleep 60
 +  fi
 +
@@ -3708,17 +4047,81 @@ index 0000000..f4f7e70
 +
 +  sleep "$INTERVAL"
 +done
+diff --git a/scripts/china/sync_microbatches.sh b/scripts/china/sync_microbatches.sh
+new file mode 100755
+index 0000000..9a1712f
+--- /dev/null
++++ b/scripts/china/sync_microbatches.sh
+@@ -0,0 +1,59 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++run_dir=${RUN_DIR:?set RUN_DIR}
++nodes=${NODES:-"10.92.20.76 10.92.20.77 10.92.20.78 10.92.20.80 10.92.20.83 10.92.20.84 10.92.20.85"}
++interval=${INTERVAL:-1}
++ssh_opts=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
++mkdir -p "$run_dir"
++exec 9>"$run_dir/.microbatch-sync.lock"
++flock -n 9 || exit 0
++echo "$$" >"$run_dir/.microbatch-sync.pid"
++trap 'rm -f "$run_dir/.microbatch-sync.pid"' EXIT
++
++publish() {
++  local source=$1 host=$2 relative=${1#"$run_dir"/}
++  local final="$run_dir/$relative" partial="$run_dir/.incoming/$relative"
++  local digest remote_digest
++
++  digest=$(sha256sum "$source" | cut -d' ' -f1)
++  remote_digest=$(ssh "${ssh_opts[@]}" "$host" \
++    "sha256sum '$final' 2>/dev/null | cut -d' ' -f1" || true)
++  [ "$remote_digest" = "$digest" ] && return
++  if [ -n "$remote_digest" ]; then
++    echo "$host: refusing to replace $relative: destination hash differs" >&2
++    return 1
++  fi
++
++  ssh "${ssh_opts[@]}" "$host" \
++    "mkdir -p '$(dirname "$partial")' '$(dirname "$final")'"
++  if ssh "${ssh_opts[@]}" "$host" "command -v rsync >/dev/null"; then
++    rsync -a --partial --append-verify --timeout=60 \
++      -e "ssh ${ssh_opts[*]}" "$source" "$host:$partial"
++  else
++    scp "${ssh_opts[@]}" -p "$source" "$host:$partial"
++  fi
++  remote_digest=$(ssh "${ssh_opts[@]}" "$host" \
++    "sha256sum '$partial' | cut -d' ' -f1")
++  [ "$remote_digest" = "$digest" ] || {
++    echo "$host: checksum failed for $relative" >&2
++    return 1
++  }
++  ssh "${ssh_opts[@]}" "$host" "mv '$partial' '$final'"
++  echo "published $relative to $host $digest"
++}
++
++scan() {
++  local file host
++  while IFS= read -r -d '' file; do
++    for host in $nodes; do
++      publish "$file" "$host" || true
++    done
++  done < <(find "$run_dir/rollouts" -type f -name 'rank_*.bin' -print0 2>/dev/null | sort -z)
++}
++
++while true; do
++  scan
++  [ "${ONCE:-0}" = 1 ] && exit
++  sleep "$interval"
++done
 diff --git a/scripts/china/tunnel_watchdog.sh b/scripts/china/tunnel_watchdog.sh
 old mode 100644
 new mode 100755
-index fe501b4..8659494
+index fe501b4..e586a64
 --- a/scripts/china/tunnel_watchdog.sh
 +++ b/scripts/china/tunnel_watchdog.sh
-@@ -1,45 +1,144 @@
+@@ -1,45 +1,96 @@
  #!/usr/bin/env bash
 -# Detect engine tunnels that are listening but not passing data, and kill them.
-+# Rebuild engine tunnels that are listening but not passing data. Runs on n82.
- #
+-#
 -# The H200-side supervisor (scripts/h200/start_tunnel.sh) only rebuilds a tunnel
 -# when its ssh process EXITS. Over the lossy China<->H200 path (10-33% packet
 -# loss measured) a tunnel routinely wedges with the forward still established:
@@ -3726,29 +4129,16 @@ index fe501b4..8659494
 -# ServerAliveCountMax=20 x Interval=15 that state persists for 300s, and wedged
 -# tunnels accumulate -- observed 22 of 24 dead, with h200a taking zero traffic
 -# while h200b carried the whole run.
-+# The H200-side supervisor (scripts/h200/start_tunnel.sh) only rebuilds a
-+# tunnel when its ssh process EXITS. Over the lossy China<->H200 path (10-33%
-+# packet loss measured) a tunnel routinely wedges with the forward still
-+# established: the port accepts connections and then never answers. With
-+# ServerAliveCountMax=20 x Interval=15 that persists for 300s, and wedged
-+# tunnels accumulate -- observed 22 of 24 dead while h200a took zero traffic.
- #
- # Killing the n82-side sshd that holds the port makes the remote ssh exit, so
+-#
+-# Killing the n82-side sshd that holds the port makes the remote ssh exit, so
 -# the existing supervisor loop rebuilds it within ~5s. Nothing to change on the
 -# H200 hosts.
-+# the existing supervisor rebuilds it within ~5s.
- #
+-#
 -# Two consecutive failures are required before killing: a single slow reply
 -# under load is normal and must not trigger a rebuild.
-+# CRITICAL: a dead ENGINE looks exactly like a wedged tunnel from here -- the
-+# SSH forward still accepts the connection either way. On 2026-08-06 both vLLM
-+# engines died (EngineCore RPC timeout) and this script spent 2.6 hours
-+# cheerfully rebuilding all 24 tunnels against a dead backend while the run
-+# sat stalled. n82 has no ssh access to the H200s, so it cannot check or fix
-+# the engines directly; scripts/h200/engine_watchdog.sh does that locally.
-+# What this script must do is NOT mask the problem: when nearly every tunnel
-+# is failing at once the cause is almost certainly upstream, so it stops
-+# churning and says so loudly instead.
++# Rebuild engine tunnels that are listening but not passing data. Runs on n82.
++# Killing the n82 sshd makes the H200 supervisor rebuild the forward.
++# A dead engine looks the same from n82, so mass failures also log a warning.
  set -uo pipefail
  
 -PORTS=${PORTS:-$(seq 18001 18024)}
@@ -3757,30 +4147,12 @@ index fe501b4..8659494
 +PORTS=${PORTS:-$(seq 18001 18048)}
 +TIMEOUT=${TIMEOUT:-20}
 +INTERVAL=${INTERVAL:-60}
-+# Heartbeat. Without it this script logs only when it kills something, so a
-+# healthy idle watchdog and a wedged one look identical from outside -- and the
-+# only other liveness test, `pgrep -fc`, counts its own grep and can never
-+# return zero. A periodic line makes "still checking" observable.
 +HEARTBEAT=${HEARTBEAT:-5}
-+# Rate limits. The /v1/models probe shares each tunnel with rollout traffic, so
-+# a BUSY tunnel misses probes while working perfectly -- and it misses them on
-+# every link at once, because the load arrives everywhere at once. Measured on
-+# 2026-08-07 at 251 rollouts in flight: healthy-tunnel counts tracked the batch
-+# phase (23/24 at the batch tail, 1/24 mid-batch) while both engines held 100%
-+# GPU and ~500 tok/s. A 2-miss threshold with no cap then killed up to 9 live
-+# tunnels in one pass, destroying every rollout in flight on them: 68 kills and
-+# 139 rollout failures in one hour.
-+#
-+# A dead tunnel never recovers on its own, so a slow detection window costs
-+# nothing. A live tunnel killed under load costs every rollout on it. Prefer
-+# the slow window. This is the same conclusion scripts/network/watch_rollout_links.sh
-+# reached (30 misses, one link per pass, 2 minutes apart); do not tighten these
-+# while running large batches.
++# Busy tunnels can miss the shared HTTP probe. Require repeated misses and
++# limit repairs so the watchdog does not destroy live rollouts.
 +MISSES_BEFORE_KILL=${MISSES_BEFORE_KILL:-6}
 +MAX_KILLS_PER_PASS=${MAX_KILLS_PER_PASS:-2}
 +KILL_COOLDOWN=${KILL_COOLDOWN:-120}
-+# Above this fraction of simultaneous failures, blame the backend, not the
-+# tunnels. 24 ports -> 20 failures trips it.
 +MASS_FAILURE_PCT=${MASS_FAILURE_PCT:-80}
  declare -A misses
 +total=0
@@ -3796,11 +4168,7 @@ index fe501b4..8659494
 -  killed=0
 -  for p in $PORTS; do
 -    code=$(curl -s -o /dev/null -m "$TIMEOUT" -w "%{http_code}" "http://127.0.0.1:$p/v1/models" 2>/dev/null)
-+  # Probe every port at once. Serially this loop takes 24 x TIMEOUT in the bad
-+  # case, so one cycle ran 2 to 7 minutes instead of the nominal interval and
-+  # MISSES_BEFORE_KILL meant half an hour rather than a few minutes. Measured
-+  # 2026-08-07: no log line at all for 10 minutes because the first heartbeat
-+  # was still 4 cycles away.
++  # Probe in parallel so a failed cycle takes TIMEOUT, not ports * TIMEOUT.
 +  results=$( for p in $PORTS; do
 +      ( printf '%s %s\n' "$p" \
 +          "$(curl -s -o /dev/null -m "$TIMEOUT" -w '%{http_code}' "http://127.0.0.1:$p/v1/models" 2>/dev/null)" ) &
@@ -3809,8 +4177,7 @@ index fe501b4..8659494
 +
 +  failed=""
 +  nfail=0
-+  # A here-string, not a pipe: a pipe puts the loop in a subshell and every
-+  # update to the misses array is then discarded.
++  # Keep the loop in this shell so updates to misses persist.
 +  while read -r p code; do
 +    [ -z "$p" ] && continue
      if [ "$code" = "200" ]; then
@@ -3822,14 +4189,7 @@ index fe501b4..8659494
      fi
 +  done <<< "$(printf '%s\n' "$results" | sort -n)"
 +
-+  # ALWAYS rebuild. An earlier version refused when >=80% failed, on the theory
-+  # that mass failure meant a dead backend it could not fix. That was wrong and
-+  # it froze the run: at batch 1024 all 24 tunnels wedged at once under 4x the
-+  # rollout load while the engines were healthy and generating, and the
-+  # watchdog sat idle for five hours. The asymmetry is decisive -- rebuilding
-+  # against a dead backend is harmless (it just fails again next cycle), while
-+  # refusing to rebuild against a live backend stalls everything. So warn
-+  # loudly on mass failure, then rebuild anyway.
++  # Warn on mass failure, but continue the rate-limited repair.
 +  if [ "$total" -gt 0 ] && [ $((nfail * 100 / total)) -ge "$MASS_FAILURE_PCT" ]; then
 +    mass_streak=$((mass_streak + 1))
 +    [ $((mass_streak % 5)) -eq 1 ] && log "*** $nfail/$total tunnels failing at once -- check the engines too, but rebuilding regardless"
@@ -3975,51 +4335,124 @@ index 0328cfd..53ea956 100755
 -  --vllm-extra '{"kv_cache_dtype":"fp8","max_num_seqs":512,"max_num_batched_tokens":65536,"compilation_config":{"max_cudagraph_capture_size":256}}'
 +  --vllm-extra '{"kv_cache_dtype":"fp8","max_num_seqs":128,"max_num_batched_tokens":65536,"compilation_config":{"max_cudagraph_capture_size":256}}'
 diff --git a/scripts/h200/start_orchestrator.sh b/scripts/h200/start_orchestrator.sh
-index 3654ec2..7d3ab07 100644
+index 3654ec2..8f0f15a 100644
 --- a/scripts/h200/start_orchestrator.sh
 +++ b/scripts/h200/start_orchestrator.sh
-@@ -53,7 +53,7 @@ tunnel 18101 127.0.0.1:8000 "-p 40051 -i /root/.ssh/china_rollout_ed25519 root@1
- # same 20 MB crossed in 9s with -C, and the live tunnel measured 4.9 MB/s --
- # token ids and logprobs compress well.
- tunnel 29620 10.92.20.82:29620 china-trainer yes
+@@ -1,24 +1,7 @@
+ #!/usr/bin/env bash
+ # Run the orchestrator on h200a instead of n82.
+-#
+-# Why: every rollout turn is an HTTP round trip to an inference engine and to
+-# the judge, and none of those live in China. With the orchestrator on n82 all
+-# of that traffic crossed a 217ms link measuring 10-33% packet loss, through
+-# SSH tunnels that wedge silently -- observed 22 of 24 dead, engines at 8% KV
+-# cache while 256 rollouts sat blocked, ~90 min for a 256-rollout batch.
+-#
+-# Measured paths from h200a:
+-#   own engine        127.0.0.1:8000    5.8ms, no tunnel
+-#   h200b engine      LAN               0.48ms, 0% loss
+-#   judge             202.214.223.66    176ms, 0% loss, no tunnel
+-#   trainer (zmq)     n82:29620         crosses the lossy link, but it is one
+-#                                       bulk stream, not thousands of small
+-#                                       latency-sensitive requests
+-#
+-# ZMQTrainingBatchReceiver binds on the trainer and ZMQTrainingBatchSender
+-# connects from here, so a forward tunnel is the correct direction and the
+-# config sets host = 127.0.0.1. Ports +1/+2 are the trainer's internal
+-# micro-batch fan-out and are not used from this side.
++# Engine traffic stays local. Only adapter and completed batch data cross the
++# China link.
+ set -uo pipefail
+ 
+ CONFIG_TAG=${CONFIG_TAG:-.x7h}
+@@ -27,12 +10,15 @@ RUN_NAME=${RUN_NAME:?set RUN_NAME}
+ deployment=/data/glm52-rl/deployment
+ config=$deployment/configs/h200
+ image=prime-rl:glm52-decensor
++config_file=$config/orchestrator${CONFIG_TAG}.toml
++transport=$(awk '
++  $0 == "[rollout_transport]" { active=1; next }
++  /^\[/ { active=0 }
++  active && $1 == "type" { gsub(/[ "\047]/, "", $3); print $3; exit }
++' "$config_file")
+ 
+ tunnel() { # local_port  target_host:port  ssh_target  [compress]
+   local lp=$1 tgt=$2 via=$3 comp=${4:-no}
+-  # Match on the forward spec, not a SetEnv tag: any tunnel already holding
+-  # this port counts, however it was started. Two supervisors on one port means
+-  # the loser respawns every 3s forever under ExitOnForwardFailure.
+   pgrep -f -- "-L 127.0.0.1:$lp:" >/dev/null && return 0
+   setsid nohup bash -c "while true; do
+       ssh -NT -o BatchMode=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes \
+@@ -43,20 +29,16 @@ tunnel() { # local_port  target_host:port  ssh_target  [compress]
+     done" >/dev/null 2>&1 < /dev/null &
+ }
+ 
+-# h200b's engine over the 0.48ms host-to-host link.
+ tunnel 18101 127.0.0.1:8000 "-p 40051 -i /root/.ssh/china_rollout_ed25519 root@152.236.142.243"
+-# Trainer batch socket and the adapter weight source, both on n82.
+-# Compression is mandatory on 29620, not a tuning knob: the China link does
+-# <130 KB/s of bulk TCP (20 MB failed to cross in 150s) because throughput
+-# collapses as MSS/(RTT*sqrt(loss)) at 217ms and 10-33% loss. Uncompressed, the
+-# trainer starved for 12 minutes while the orchestrator ran 3 steps ahead. The
+-# same 20 MB crossed in 9s with -C, and the live tunnel measured 4.9 MB/s --
+-# token ids and logprobs compress well.
+-tunnel 29620 10.92.20.82:29620 china-trainer yes
 -tunnel 18100 10.92.20.82:18100 china-trainer yes
-+tunnel 18100 10.92.20.82:8100 china-trainer yes
++tunnel 18100 127.0.0.1:8100 china-trainer yes
++ports=(18101 18100)
++if [ "$transport" = zmq ]; then
++  tunnel 29620 10.92.20.82:29620 china-trainer yes
++  ports+=(29620)
++fi
  
  sleep 6
- for p in 18101 29620 18100; do
+-for p in 18101 29620 18100; do
++for p in "${ports[@]}"; do
+   ss -tln 2>/dev/null | grep -q "127.0.0.1:$p" && echo "tunnel :$p up" || echo "tunnel :$p DOWN"
+ done
+ 
+@@ -80,15 +62,20 @@ sudo docker run -d --name glm52-decensor-orchestrator \
+   -v "$deployment/source/src/prime_rl/orchestrator/watcher.py":/app/src/prime_rl/orchestrator/watcher.py:ro \
+   -v "$deployment/source/src/prime_rl/utils/client.py":/app/src/prime_rl/utils/client.py:ro \
+   --entrypoint /app/.venv/bin/orchestrator "$image" \
+-  @ "$config/orchestrator${CONFIG_TAG}.toml"
++  @ "$config_file"
+ echo "orchestrator started on $(hostname) with ${CONFIG_TAG}"
+ 
+-# The trainer reads the orchestrator's control file off its OWN filesystem
+-# (runs.py:232). That was implicit when both ran on n82; with the orchestrator
+-# here it writes control/orch.toml locally and the trainer waits forever with
+-# "No orchestrator config found". Ship it over once it appears -- the file is
+-# written at orchestrator startup and does not change afterwards.
+ ctl=/data/glm52-rl/runs/$RUN/$RUN_NAME/control/orch.toml
++if [ "$transport" = filesystem ]; then
++  pkill -f '[s]ync_rollout_batches.sh' 2>/dev/null || true
++  nohup env SOURCE_RUN_DIR="/data/glm52-rl/runs/$RUN/$RUN_NAME" \
++    DEST_HOST=china-trainer \
++    "$deployment/scripts/h200/sync_rollout_batches.sh" \
++    >>"/data/glm52-rl/batch-sync-$RUN.log" 2>&1 </dev/null &
++  echo "durable batch publisher started"
++  exit
++fi
++
+ for _ in $(seq 1 60); do
+   [ -f "$ctl" ] && break
+   sleep 2
 diff --git a/scripts/h200/start_tunnel.sh b/scripts/h200/start_tunnel.sh
-index 3e33102..7132bb7 100755
+index 3e33102..c6ae0d4 100755
 --- a/scripts/h200/start_tunnel.sh
 +++ b/scripts/h200/start_tunnel.sh
-@@ -5,6 +5,27 @@ remote_port=${1:?usage: start_tunnel.sh REMOTE_PORT LOCAL_PORT}
+@@ -5,6 +5,8 @@ remote_port=${1:?usage: start_tunnel.sh REMOTE_PORT LOCAL_PORT}
  local_port=${2:?usage: start_tunnel.sh REMOTE_PORT LOCAL_PORT}
  health_port=$((remote_port + 1000))
  
-+# Keepalive: 15s x 8 = a dead TCP path is reaped in ~120s.
-+#
-+# This value has now been set three ways, and each was right for the watchdog
-+# that existed at the time. 15 x 20 (300s) was chosen when nothing else could
-+# detect a wedge, and it let wedged tunnels pile up. 10 x 3 (30s) replaced it,
-+# but SSH keepalives are ordinary packets on a link that loses 10-33% of them,
-+# so three consecutive misses happen routinely on a tunnel that is working --
-+# and under load they miss on every tunnel at once. SSH was then killing live
-+# tunnels and every request in flight on them.
-+#
-+# scripts/china/tunnel_watchdog.sh now owns wedge detection from the n82 side,
-+# where it can see the thing SSH cannot: forward alive, no data flowing. So
-+# SSH's only job here is to notice a genuinely dead TCP path, and it should be
-+# patient about it. Exactly one of the two may be impatient; right now neither
-+# is, because a wedge is expensive to misdiagnose in both directions.
-+#
-+# Compression is the reason this link works at all. On the batch tunnel it took
-+# throughput from under 130 KB/s to 4.9 MB/s. Rollout traffic is JSON holding
-+# generated text, which compresses just as well, and on a loss-limited path
-+# fewer bytes means proportionally fewer lost packets. It costs a little CPU on
-+# hosts that have plenty.
++# The n82 watchdog detects wedged forwards. SSH only reaps a dead path.
++# Compression is required on the lossy link.
  while true; do
    ssh -o BatchMode=yes -o ConnectTimeout=30 china-trainer \
      "sudo ss -H -lntp 'sport = :$remote_port' | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | xargs -r sudo kill; sudo ss -H -lntp 'sport = :$health_port' | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | xargs -r sudo kill" || true
-@@ -13,9 +34,10 @@ while true; do
+@@ -13,9 +15,10 @@ while true; do
      -o ConnectTimeout=30 \
      -o ExitOnForwardFailure=yes \
      -o ServerAliveInterval=15 \
@@ -4031,6 +4464,107 @@ index 3e33102..7132bb7 100755
      -R "127.0.0.1:$remote_port:127.0.0.1:$local_port" \
      -R "127.0.0.1:$health_port:127.0.0.1:8000" \
      china-trainer || true
+diff --git a/scripts/h200/sync_rollout_batches.sh b/scripts/h200/sync_rollout_batches.sh
+new file mode 100755
+index 0000000..e68a3a9
+--- /dev/null
++++ b/scripts/h200/sync_rollout_batches.sh
+@@ -0,0 +1,95 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++source_dir=${SOURCE_RUN_DIR:?set SOURCE_RUN_DIR}
++dest_dir=${DEST_RUN_DIR:-$source_dir}
++dest_host=${DEST_HOST:-china-trainer}
++interval=${INTERVAL:-5}
++ssh_opts=(-o BatchMode=yes -o ConnectTimeout=30 -o ServerAliveInterval=15 -o ServerAliveCountMax=8)
++mkdir -p "$source_dir"
++exec 9>"$source_dir/.batch-sync.lock"
++flock -n 9 || exit 0
++echo "$$" >"$source_dir/.batch-sync.pid"
++trap 'rm -f "$source_dir/.batch-sync.pid"' EXIT
++
++remote() {
++  if [ "$dest_host" = local ]; then
++    bash -c "$1"
++  else
++    ssh "${ssh_opts[@]}" "$dest_host" "$1"
++  fi
++}
++
++copy_partial() {
++  local source=$1 destination=$2
++  if [ "$dest_host" = local ]; then
++    cp "$source" "$destination"
++  else
++    rsync -az --partial --append-verify --timeout=120 \
++      -e "ssh ${ssh_opts[*]}" "$source" "$dest_host:$destination"
++  fi
++}
++
++publish() {
++  local source=$1 relative=${1#"$source_dir"/}
++  local final="$dest_dir/$relative" partial="$dest_dir/.incoming/$relative"
++  local digest remote_digest
++
++  digest=$(sha256sum "$source" | cut -d' ' -f1)
++  remote_digest=$(remote "sha256sum '$final' 2>/dev/null | cut -d' ' -f1" || true)
++  if [ "$remote_digest" = "$digest" ]; then
++    printf '%s\n' "$digest" >"$source.delivered"
++    return
++  fi
++  if [ -n "$remote_digest" ]; then
++    echo "refusing to replace $final: destination hash differs" >&2
++    return 1
++  fi
++
++  remote "mkdir -p '$(dirname "$partial")' '$(dirname "$final")'"
++  copy_partial "$source" "$partial"
++  remote_digest=$(remote "sha256sum '$partial' | cut -d' ' -f1")
++  [ "$remote_digest" = "$digest" ] || {
++    echo "checksum failed for $relative" >&2
++    return 1
++  }
++  remote "mv '$partial' '$final'"
++  printf '%s\n' "$digest" >"$source.delivered"
++  echo "published $relative $digest"
++}
++
++scan() {
++  local file
++  if [ -f "$source_dir/control/orch.toml" ] &&
++     [ $(( $(date +%s) - $(stat -c %Y "$source_dir/control/orch.toml") )) -ge 2 ] &&
++     [ ! -f "$source_dir/control/orch.toml.delivered" ]; then
++    publish "$source_dir/control/orch.toml" || true
++  fi
++  while IFS= read -r -d '' file; do
++    [ -f "$file.delivered" ] || publish "$file" || true
++  done < <(find "$source_dir/rollouts" -type f -name train_rollouts.bin -print0 2>/dev/null | sort -z)
++}
++
++pull_stable_markers() {
++  local remote_file relative final partial
++  [ "$dest_host" = local ] && return
++  while IFS= read -r remote_file; do
++    [ -n "$remote_file" ] || continue
++    relative=${remote_file#"$dest_dir"/}
++    final="$source_dir/$relative"
++    [ -f "$final" ] && continue
++    partial="$source_dir/.incoming/$relative"
++    mkdir -p "$(dirname "$partial")" "$(dirname "$final")"
++    rsync -a --partial --timeout=60 -e "ssh ${ssh_opts[*]}" \
++      "$dest_host:$remote_file" "$partial" || continue
++    mv "$partial" "$final"
++    echo "pulled $relative"
++  done < <(remote "find '$dest_dir/broadcasts' -type f -name STABLE -print 2>/dev/null" || true)
++}
++
++while true; do
++  scan
++  pull_stable_markers
++  [ "${ONCE:-0}" = 1 ] && exit
++  sleep "$interval"
++done
 diff --git a/scripts/network/tune_wan.sh b/scripts/network/tune_wan.sh
 new file mode 100755
 index 0000000..d4e6c51
@@ -4487,12 +5021,47 @@ index 0000000..60e1485
 +echo
 +echo "passed=$pass failed=$fail"
 +[ "$fail" -eq 0 ]
+diff --git a/source/deps/renderers/renderers/base.py b/source/deps/renderers/renderers/base.py
+index 2fe107c..52aead1 100644
+--- a/source/deps/renderers/renderers/base.py
++++ b/source/deps/renderers/renderers/base.py
+@@ -1378,10 +1378,9 @@ def create_renderer_pool(
+     ``trust_remote_code`` policy (default off; Moonshot Kimi-K2 family
+     opts in with a pinned ``revision``).
+     """
+-    # Resolve Transformers' lazy export before worker threads initialize tokenizers.
++    # Resolve the lazy export before tokenizer threads start.
+     from transformers import AutoTokenizer  # noqa: F401
+ 
+-
+     def factory() -> Renderer:
+         tokenizer = load_tokenizer(tokenizer_name_or_path)
+         return create_renderer(
+diff --git a/source/deps/renderers/renderers/client.py b/source/deps/renderers/renderers/client.py
+index aaeb751..5679840 100644
+--- a/source/deps/renderers/renderers/client.py
++++ b/source/deps/renderers/renderers/client.py
+@@ -289,10 +289,11 @@ async def generate(
+     )
+     for attempt in range(3):
+         try:
+-            raw_response = await client.post(endpoint, **post_kwargs)
+-            data = parse_generate_response(raw_response.content)
++            data = parse_generate_response(
++                (await client.post(endpoint, **post_kwargs)).content
++            )
+             break
+-        except (APIConnectionError, httpx.TransportError) as exc:
++        except APIConnectionError as exc:
+             if attempt == 2:
+                 raise
+             _request_logger.warning(
 diff --git a/source/deps/verifiers/verifiers/v1/clients/config.py b/source/deps/verifiers/verifiers/v1/clients/config.py
 new file mode 100644
-index 0000000..45b3dbf
+index 0000000..02d89b1
 --- /dev/null
 +++ b/source/deps/verifiers/verifiers/v1/clients/config.py
-@@ -0,0 +1,155 @@
+@@ -0,0 +1,139 @@
 +"""Client configs: describe an OpenAI-compatible endpoint and resolve it to a Client.
 +
 +A `BaseClientConfig` is an OpenAI-compatible endpoint (base_url + API-key env var
@@ -4598,23 +5167,7 @@ index 0000000..45b3dbf
 +    return api_key or "EMPTY"
 +
 +
-+# Local change. Upstream leaves the OpenAI SDK defaults in place:
-+# connect=5.0s, read=600s. Both are wrong for the China link, which has 217 ms
-+# of round trip and 10-33% packet loss.
-+#
-+# connect=5s: a TCP handshake that loses a SYN waits about 1s, then 2s, then 4s
-+# for the retransmits, so a connect through a busy tunnel blows the 5s budget
-+# while the path is fine.
-+#
-+# read=600s is the expensive one. The orchestrator runs a fixed number of
-+# rollouts in flight, so a wedged request holds one of those slots for ten
-+# minutes. Measured 2026-08-07: 121 rollouts in flight while the two engines
-+# ran 3 between them, and 78.4% of a step's rollouts ended in ReadTimeout. Most
-+# of the "in flight" count was dead requests waiting out this timeout, and the
-+# engines starved behind them.
-+#
-+# 300s still leaves a wide margin: generation averages 54.6s and p90 is 87.8s.
-+# Override with PRIME_ROLLOUT_* if a longer generation is ever configured.
++# Tune timeouts for the lossy China rollout link.
 +_CONNECT_TIMEOUT_S = float(os.environ.get("PRIME_ROLLOUT_CONNECT_TIMEOUT_S", "30"))
 +_READ_TIMEOUT_S = float(os.environ.get("PRIME_ROLLOUT_TIMEOUT_S", "300"))
 +
@@ -4648,6 +5201,29 @@ index 0000000..45b3dbf
 +    return EvalClient(
 +        config.base_url, resolve_api_key(config), headers=config.headers or None
 +    )
+diff --git a/source/deps/verifiers/verifiers/v1/clients/eval.py b/source/deps/verifiers/verifiers/v1/clients/eval.py
+index 2565bd3..1ee1567 100644
+--- a/source/deps/verifiers/verifiers/v1/clients/eval.py
++++ b/source/deps/verifiers/verifiers/v1/clients/eval.py
+@@ -160,15 +160,14 @@ class EvalClient(Client):
+             )
+             try:
+                 response = await self.http.send(request, stream=stream)
+-                if not stream:
+-                    response.content
+                 break
+             except (httpx.HTTPError, ConnectionResetError) as e:
+                 if attempt == 2:
+-                    status = 504 if isinstance(e, httpx.TimeoutException) else 503
+                     raise model_error(
+                         f"{url}: {e}",
+-                        status_code=status,
++                        status_code=504
++                        if isinstance(e, httpx.TimeoutException)
++                        else 503,
+                     ) from e
+                 logger.warning(
+                     "retrying disconnected provider request %s (%d/2): %s",
 diff --git a/source/src/prime_rl/trainer/distributed/pipeline_parallel.py b/source/src/prime_rl/trainer/distributed/pipeline_parallel.py
 index 796d8cb..230c088 100644
 --- a/source/src/prime_rl/trainer/distributed/pipeline_parallel.py

@@ -1,127 +1,96 @@
 # GLM-5.2 decensor RL
 
-This folder contains the files used by the GLM-5.2 FP8 rank-32 LoRA run.
+This repository contains the deployment files for a GLM-5.2 rank-32 LoRA GRPO
+run. `AGENTS.md` gives the current operating constraints. `docs/RUNBOOK.md`
+gives commands. `docs/PERFORMANCE.md` contains dated measurements.
 
-## Live layout
+## Current layout
 
-- Trainer: n76, n77, n78, n80, n81, n82, n83, and n84. Each node contributes
-  eight RTX 4090 GPUs, for 64 trainer GPUs total.
-- User and judge: four TP2 Gemma 4 26B servers on n85, behind port 40002.
-- Rollouts: two eight-GPU H200 hosts. Each host runs one TP8/EP8 vLLM engine.
-- Orchestrator and adapter file server: n82.
-- n79 is not used.
+- Trainer: n76, n77, n78, n80, n82, n83, n84, and n85. Each has eight RTX
+  4090 GPUs.
+- Rollouts: h200a and h200b. Each host runs one TP8/EP8 vLLM engine on eight
+  H200 GPUs.
+- Judge: one external host with eight RTX 5090 GPUs, reached through port
+  26406.
+- Latest test orchestrator: h200a. Adapter server: n82.
+- n81 is not in the job because it has no authorized key. Do not touch n79.
 
-The active output folder is:
+There is no active run. The latest test is x26 in
+`/data/glm52-rl/runs/x26`. It used the edge orchestrator and durable filesystem
+transport. It was stopped after two rollout batches because the trainer failed
+twice during its first forward pass.
 
-```text
-/data/glm52-rl/runs/r33/run_decensor_fp8_prod_run_r33
-```
+## Current settings
 
-## Settings
-
-- Model: `zai-org/GLM-5.2-FP8`
+- Source model: `zai-org/GLM-5.2-FP8`
 - Environment: `NewEden/decensor-v1`
 - Dataset: `NewEden/RL-seed-Decensor`
-- LoRA: rank 32, alpha 64, attention projections only
-- Context and trainer pack length: 4,096 tokens
-- Batch: 88 rollouts
-- GRPO group: 8
-- Advantages: group mean centered and divided by group standard deviation
-- Maximum off-policy age: 1 optimizer step
-- Router replay: enabled; distributed padding rows use trainer routing
-- Attention: GLM sparse attention and IndexShare on both trainer and rollout models
-- Token embedding: original BF16 weights
-- Output head: original BF16 weights
-- Maximum live rollouts: 88
-- Minimum policy completion: 16 tokens
-- Optimizer: Muon
-- Learning rate: 8e-6
-- Weight decay: 0
-- Gradient limit: 1.0
-- Trainer mesh: CP 4, global EP 8, eight data replicas
-- CPU and optimizer offload: disabled
-- Checkpoint interval: 25 optimizer steps
-- Rollout KV cache: FP8
-- CUDA graphs: enabled on both H200 rollout engines and the n85 Gemma servers
+- Batch 1024, GRPO group 16, maximum 128 live rollouts
+- Context and trainer pack length 16,384 tokens
+- LoRA rank 32, alpha 64, on `q_a_proj`, `q_b_proj`,
+  `kv_a_proj_with_mqa`, and `o_proj`
+- Muon at 8e-6
+- Trainer mesh: PP 8, CP 8, EP 8 node-local
+- Checkpoints every 5 steps, with optimizer state
+- Router replay off and engine routed-expert return off for x25
+- H200 FP8 weights with BF16 activations (W8A16), FP8 KV cache
+- Trainer checkpoint dequantized to BF16 weights, BF16 compute and reductions,
+  FP32 MoE router
 
-## Trainer speed settings
+“FP8 model” identifies the source checkpoint. It does not mean that the current
+trainer runs FP8 GEMMs. The native trainer W8A8 path produced 7 to 9 nats of
+masked mismatch KL and broke the importance ratio, so x25 sets
+`dequantize_checkpoint = true`.
 
-The trainer is bound by the MoE all-to-all on one 10 Gb/s link per node, not by
-compute. See `AGENTS.md` for the measured breakdown. Two settings control this:
+## Latest result
 
-- `NCCL_MIN_NCHANNELS=8` and `NCCL_MAX_NCHANNELS=8`. The largest single knob:
-  NCCL's automatic choice reaches only about 44% of line rate on this link,
-  eight channels reach 87%. One channel hangs; do not set it.
-- `fq` instead of `fq_codel` on the trainer NIC, applied by `cluster.sh` before
-  the container starts. Worth 65% against 87% once channels are right. BBR was
-  tested and is worse here; stay on `cubic`.
-- `NCCL_SOCKET_NTHREADS=1` and `NCCL_NSOCKS_PERTHREAD=1`. The previous 4 x 4
-  opened 128 TCP flows per node on one NIC and congested it.
-- `PRIME_EP_AC_CACHE=1` reuses the INT4 payload received in the forward pass
-  when activation checkpointing recomputes the routed-expert region, instead of
-  repeating both all-to-alls. Numerically exact; costs about 3.8 GB per GPU.
+x26 rollout step 1 took 20 minutes 5 seconds. Step 2 took 18 minutes 41
+seconds. Keep these rollout collection times separate from trainer compute.
+The two immutable batch files were 84.2 MB and 92.5 MB. Each transfer to n82
+finished in about 29 seconds, and both SHA-256 hashes matched.
 
-`PRIME_EP_PROFILE=1` prints a per-micro-batch all-to-all breakdown from rank 0.
-`PRIME_EP_PROFILE_EVERY` sets how many dispatch calls per report (150 = one
-micro batch). Watch `fwd_dispatch` to confirm the cache is live: with the cache
-off it covers two passes per layer, with it on, one.
+The trainer did not complete a step. On two attempts, n80 rank 35 exited about
+44 seconds after the forward pass started. The other ranks then reported NCCL
+remote-process errors. All trainer nodes read the same verified micro-batch
+file on the second attempt. This result does not identify the reason that rank
+35 exited.
 
-`scripts/china/check_ep_ac_cache.py` verifies the cache on one node's eight
-GPUs. It counts real `all_to_all_single` calls and compares outputs and
-gradients against the uncached path, so it fails if the cache silently stops
-engaging:
+x25 step 1 collected 1,072 attempts in 48 minutes 40 seconds, with 1,032
+trainable attempts and a 3.7 percent error rate. The trainer forward and
+backward pass took 17 minutes 11 seconds. Keep these as separate numbers.
 
-```bash
-torchrun --nnodes=1 --nproc-per-node=8 check_ep_ac_cache.py
-```
+The first no-router-replay step measured masked mismatch KL 0.362. The replay
+baseline was 0.19 to 0.21. This is above the baseline but far below the failed
+W8A8 range of 7 to 9 nats. One step is not a reward trend.
 
-Launcher variables `RUN`, `RUN_NAME`, and `CONFIG_TAG` select the run directory
-and the `configs/china/{trainer,orchestrator}${CONFIG_TAG}.toml` pair, so a new
-run does not need edits to the committed r33 configs.
+The stopped x25 path used 48 reverse SSH tunnels on n82 ports 18001 to
+18048. The x26 test put the orchestrator on h200a and moved completed immutable
+batches to n82 with resumable, verified transfer. `docs/ROLLOUT_TRANSPORT.md`
+gives the design.
 
-
-## Layout
+## Repository layout
 
 ```text
-configs/
-  china/       orchestrator and 4090 trainer settings
-  h200/        H200 rollout settings
+configs/       trainer, orchestrator, and inference settings
+docs/          runbook, handoff, measurements, and transport design
 env/           decensor environment
 network/       SSH and proxy settings
-patches/       source backup patches
+patches/       patch artifacts
 runtime/       runtime file overrides
-scripts/
-  china/       4090 cluster and Gemma launcher
-  h200/        H200 rollout and tunnel launchers
-  network/     rollout link helpers
-source/        exact patched source used to build the image
+scripts/       launch, repair, validation, and transport scripts
+source/        exact patched source used by the images
 ```
 
-Deploy this folder as `/data/glm52-rl/deployment`. Secrets stay outside the
-repository in `/data/trinity/training.env` on the GPU nodes.
+Deploy the repository as `/data/glm52-rl/deployment`. Secrets stay in
+`/data/trinity/training.env`.
 
-## Rebuilding
+## Validation
 
-The base Prime-RL source change set is:
-
-```text
-patches/prime-rl/glm52-fp8.patch
+```bash
+bash -n scripts/china/*.sh scripts/h200/*.sh scripts/network/*.sh
+scripts/ops/watchdog_smoketest.sh
+python3 -m py_compile runtime/vllm/*.py source/deps/renderers/renderers/*.py
 ```
 
-It applies to the Prime-RL commit recorded in `PINS.md`. Apply the additive
-kernel, FP8 parity, reward, renderer, and verifier patches listed in
-`patches/README.md`; the live r33 deployment includes all three Ada
-sparse-attention patches and the BF16 sparse-indexer key projection fix. The
-Dockerfile also applies the PyTorch FSDP fix needed to preserve frozen FP8
-parameters.
-
-## Launchers
-
-- `scripts/china/cluster.sh trainer` starts one eight-rank trainer worker on a
-  4090 node. All eight trainer nodes must start it with the same files.
-- `scripts/china/cluster.sh orchestrator` starts the orchestrator on n82.
-- `scripts/china/cluster.sh gemma` starts the four Gemma servers and proxy on
-  n85.
-- `scripts/h200/start_inference.sh` starts one TP8/EP8 rollout engine on an H200
-  host.
-- `scripts/h200/start_tunnel.sh` creates one rollout data tunnel back to n82.
+Do not deploy a trainer source change unless `scripts/china/cluster.sh` mounts
+that file. Use `glm52_ops.mounted_files()` to check.

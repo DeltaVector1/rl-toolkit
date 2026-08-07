@@ -47,11 +47,11 @@ Use this only if Python is not available. Add a sleep to repeat it.
 ```
 echo "=========== $(date -u +%H:%M:%S) UTC ==========="
 timeout 200 ssh n82 'ok=0
-  for p in $(seq 18001 18024); do
+  for p in $(seq 18001 18048); do
     c=$(curl -s -o /dev/null -m 5 -w "%{http_code}" http://127.0.0.1:$p/v1/models 2>/dev/null)
     [ "$c" = "200" ] && ok=$((ok+1))
   done
-  echo "tunnels: $ok/24"
+  echo "tunnels: $ok/48"
   echo -n "trainer steps: "; sudo docker logs glm52-decensor-trainer 2>&1 | sed "s/\x1b\[[0-9;]*m//g" | grep -ac "SUCCESS Step"
   sudo docker logs glm52-decensor-trainer 2>&1 | sed "s/\x1b\[[0-9;]*m//g" | grep -a "SUCCESS Step" | tail -1
   sudo docker logs glm52-decensor-orchestrator 2>&1 | sed "s/\x1b\[[0-9;]*m//g" | grep -a "SUCCESS Step" | tail -1
@@ -79,7 +79,7 @@ done
 
 # THE HEALTHY VALUES
 
-Tunnels 20 to 22 of 24. Engine generation probe 200 in under 4000 ms. Engine
+The current pool has 48 tunnels. Probe counts fall under load, so confirm them against engine throughput. Engine generation probe 200 in under 4000 ms. Engine
 concurrency 45 to 70. Node GPU memory near 46 GiB of 48. Host memory 400 GB or
 more free. Judge 200. Adapter server 200.
 
@@ -117,12 +117,12 @@ Both hosts must give 200.
 
 # Step 3. Test the tunnels
 
-The count must be 20 or more of 24. If it is low, kill the ports that fail. The
+The current pool has 48 ports. A low probe count is not sufficient evidence of failure. If it is low, kill the ports that fail. The
 supervisors on the H200 hosts rebuild them.
 
 ```
 ssh n82 'k=0
-  for p in $(seq 18001 18024); do
+  for p in $(seq 18001 18048); do
     c=$(curl -s -o /dev/null -m 6 -w "%{http_code}" http://127.0.0.1:$p/v1/models 2>/dev/null)
     if [ "$c" != "200" ]; then
       pid=$(sudo ss -H -lntp "sport = :$p" | sed -n "s/.*pid=\([0-9][0-9]*\).*/\1/p" | head -1)

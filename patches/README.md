@@ -1,5 +1,9 @@
 # Patches
 
+`glm52-fixes-all.patch` is the diff from the initial deployment commit for
+`configs/`, `runtime/`, `scripts/`, and `source/`.
+`glm52-source-only.patch` contains the corresponding `source/` diff.
+
 ## Prime-RL
 
 - `prime-rl/glm52-fp8.patch` is the base GLM-5.2 FP8 change set against the

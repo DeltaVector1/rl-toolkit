@@ -1,7 +1,8 @@
 # Pipeline parallelism
 
-Live in production as run `p4` (`CONFIG_TAG=.p4`): `pp=7, cp=8, ep=8,
-global_ep=false`, batch 1024 over 7 nodes / 56 GPUs. Mesh `['pp','dp_shard_mod_ep','cp'] = [7,1,8]`.
+Historical run p4 used `pp=7, cp=8, ep=8, global_ep=false`, batch 1024
+over 7 nodes / 56 GPUs. Current x25 uses `pp=8, cp=8, ep=8` over 8 nodes /
+64 GPUs. The measurements below are from p4 unless a run is named.
 
 ## What it bought
 

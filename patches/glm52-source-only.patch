@@ -1,9 +1,44 @@
+diff --git a/source/deps/renderers/renderers/base.py b/source/deps/renderers/renderers/base.py
+index 2fe107c..52aead1 100644
+--- a/source/deps/renderers/renderers/base.py
++++ b/source/deps/renderers/renderers/base.py
+@@ -1378,10 +1378,9 @@ def create_renderer_pool(
+     ``trust_remote_code`` policy (default off; Moonshot Kimi-K2 family
+     opts in with a pinned ``revision``).
+     """
+-    # Resolve Transformers' lazy export before worker threads initialize tokenizers.
++    # Resolve the lazy export before tokenizer threads start.
+     from transformers import AutoTokenizer  # noqa: F401
+ 
+-
+     def factory() -> Renderer:
+         tokenizer = load_tokenizer(tokenizer_name_or_path)
+         return create_renderer(
+diff --git a/source/deps/renderers/renderers/client.py b/source/deps/renderers/renderers/client.py
+index aaeb751..5679840 100644
+--- a/source/deps/renderers/renderers/client.py
++++ b/source/deps/renderers/renderers/client.py
+@@ -289,10 +289,11 @@ async def generate(
+     )
+     for attempt in range(3):
+         try:
+-            raw_response = await client.post(endpoint, **post_kwargs)
+-            data = parse_generate_response(raw_response.content)
++            data = parse_generate_response(
++                (await client.post(endpoint, **post_kwargs)).content
++            )
+             break
+-        except (APIConnectionError, httpx.TransportError) as exc:
++        except APIConnectionError as exc:
+             if attempt == 2:
+                 raise
+             _request_logger.warning(
 diff --git a/source/deps/verifiers/verifiers/v1/clients/config.py b/source/deps/verifiers/verifiers/v1/clients/config.py
 new file mode 100644
-index 0000000..45b3dbf
+index 0000000..02d89b1
 --- /dev/null
 +++ b/source/deps/verifiers/verifiers/v1/clients/config.py
-@@ -0,0 +1,155 @@
+@@ -0,0 +1,139 @@
 +"""Client configs: describe an OpenAI-compatible endpoint and resolve it to a Client.
 +
 +A `BaseClientConfig` is an OpenAI-compatible endpoint (base_url + API-key env var
@@ -109,23 +144,7 @@ index 0000000..45b3dbf
 +    return api_key or "EMPTY"
 +
 +
-+# Local change. Upstream leaves the OpenAI SDK defaults in place:
-+# connect=5.0s, read=600s. Both are wrong for the China link, which has 217 ms
-+# of round trip and 10-33% packet loss.
-+#
-+# connect=5s: a TCP handshake that loses a SYN waits about 1s, then 2s, then 4s
-+# for the retransmits, so a connect through a busy tunnel blows the 5s budget
-+# while the path is fine.
-+#
-+# read=600s is the expensive one. The orchestrator runs a fixed number of
-+# rollouts in flight, so a wedged request holds one of those slots for ten
-+# minutes. Measured 2026-08-07: 121 rollouts in flight while the two engines
-+# ran 3 between them, and 78.4% of a step's rollouts ended in ReadTimeout. Most
-+# of the "in flight" count was dead requests waiting out this timeout, and the
-+# engines starved behind them.
-+#
-+# 300s still leaves a wide margin: generation averages 54.6s and p90 is 87.8s.
-+# Override with PRIME_ROLLOUT_* if a longer generation is ever configured.
++# Tune timeouts for the lossy China rollout link.
 +_CONNECT_TIMEOUT_S = float(os.environ.get("PRIME_ROLLOUT_CONNECT_TIMEOUT_S", "30"))
 +_READ_TIMEOUT_S = float(os.environ.get("PRIME_ROLLOUT_TIMEOUT_S", "300"))
 +
@@ -159,6 +178,29 @@ index 0000000..45b3dbf
 +    return EvalClient(
 +        config.base_url, resolve_api_key(config), headers=config.headers or None
 +    )
+diff --git a/source/deps/verifiers/verifiers/v1/clients/eval.py b/source/deps/verifiers/verifiers/v1/clients/eval.py
+index 2565bd3..1ee1567 100644
+--- a/source/deps/verifiers/verifiers/v1/clients/eval.py
++++ b/source/deps/verifiers/verifiers/v1/clients/eval.py
+@@ -160,15 +160,14 @@ class EvalClient(Client):
+             )
+             try:
+                 response = await self.http.send(request, stream=stream)
+-                if not stream:
+-                    response.content
+                 break
+             except (httpx.HTTPError, ConnectionResetError) as e:
+                 if attempt == 2:
+-                    status = 504 if isinstance(e, httpx.TimeoutException) else 503
+                     raise model_error(
+                         f"{url}: {e}",
+-                        status_code=status,
++                        status_code=504
++                        if isinstance(e, httpx.TimeoutException)
++                        else 503,
+                     ) from e
+                 logger.warning(
+                     "retrying disconnected provider request %s (%d/2): %s",
 diff --git a/source/src/prime_rl/trainer/distributed/pipeline_parallel.py b/source/src/prime_rl/trainer/distributed/pipeline_parallel.py
 index 796d8cb..230c088 100644
 --- a/source/src/prime_rl/trainer/distributed/pipeline_parallel.py

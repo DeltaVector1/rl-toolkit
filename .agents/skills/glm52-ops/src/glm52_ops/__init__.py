@@ -31,7 +31,7 @@ ENGINE_HOSTS = ["h200a", "h200b"]
 # it is not in the job. Adding it means changing the pipeline layout as well.
 FORBIDDEN_HOSTS = {"n79"}
 
-TUNNEL_PORTS = list(range(18001, 18025))
+TUNNEL_PORTS = list(range(18001, 18049))
 JUDGE_PORT = 26406
 ADAPTER_PORT = 8100
 BATCH_PORT = 29620
@@ -164,7 +164,7 @@ def _run_dir(run: str) -> str:
 
 _HEAD_PROBE = r"""
 ok=0; bad=""
-for p in $(seq 18001 18024); do
+for p in $(seq __TUNNEL_FIRST__ __TUNNEL_LAST__); do
   c=$(curl -s -o /dev/null -m 5 -w "%{http_code}" http://127.0.0.1:$p/v1/models 2>/dev/null)
   if [ "$c" = "200" ]; then ok=$((ok+1)); else bad="$bad $p"; fi
 done
@@ -215,6 +215,8 @@ def _head_script() -> str:
         .replace("__ORCH__", ORCH_CT)
         .replace("__JUDGE__", str(JUDGE_PORT))
         .replace("__ADAPTER__", str(ADAPTER_PORT))
+        .replace("__TUNNEL_FIRST__", str(TUNNEL_PORTS[0]))
+        .replace("__TUNNEL_LAST__", str(TUNNEL_PORTS[-1]))
     )
 
 
@@ -282,7 +284,7 @@ class Status:
         L.append(
             f"trainer {'up' if self.trainer_up else 'DOWN'} | "
             f"orchestrator {'up' if self.orch_up else 'DOWN'} | "
-            f"tunnels {self.tunnels_ok}/24 | judge {self.judge} | adapter {self.adapter}"
+            f"tunnels {self.tunnels_ok}/{len(TUNNEL_PORTS)} | judge {self.judge} | adapter {self.adapter}"
         )
         L.append(f"steps {self.trainer_steps} | fails/5m {self.fails_5m} | {self.batch or 'no batch line'}")
         if self.trainer_last:
@@ -405,7 +407,7 @@ def _warnings(s: Status) -> list[str]:
         w.append("trainer container is not up")
     if not s.orch_up:
         w.append("orchestrator container is not up")
-    if s.tunnels_ok <= 10:
+    if s.tunnels_ok <= 20:
         # Do not read this as dead tunnels on its own. The probe shares each
         # tunnel with rollout traffic, so under load it starves on links that
         # still carry rollouts. Confirm against the engines before acting:
@@ -413,11 +415,14 @@ def _warnings(s: Status) -> list[str]:
         # engines idle with many rollouts in flight means the requests are
         # stuck in the tunnels and max_inflight_rollouts is too high.
         w.append(
-            f"only {s.tunnels_ok}/24 tunnels answer. Check the engines before you believe this. "
+            f"only {s.tunnels_ok}/{len(TUNNEL_PORTS)} tunnels answer. Check the engines before you believe this. "
             "If they are generating, the probe is starved by load, not by dead tunnels."
         )
-    elif s.tunnels_ok < 18:
-        w.append(f"{s.tunnels_ok}/24 tunnels answer. Compare against the engine concurrency below.")
+    elif s.tunnels_ok < 36:
+        w.append(
+            f"{s.tunnels_ok}/{len(TUNNEL_PORTS)} tunnels answer. "
+            "Compare against the engine concurrency below."
+        )
     # Starvation means the engines are producing nothing while many rollouts are
     # in flight. A low `running` count on its own is not evidence: a rollout in
     # flight may be at the judge or in the environment rather than generating,
@@ -478,10 +483,10 @@ def current_run() -> str:
 
 
 def tunnels() -> dict[int, str]:
-    """HTTP code for each of the 24 rollout tunnel ports."""
+    """HTTP code for each rollout tunnel port."""
     rc, out = _ssh(
         HEAD,
-        'for p in $(seq 18001 18024); do printf "%s " $p; '
+        f'for p in $(seq {TUNNEL_PORTS[0]} {TUNNEL_PORTS[-1]}); do printf "%s " $p; '
         'curl -s -o /dev/null -m 6 -w "%{http_code}\\n" http://127.0.0.1:$p/v1/models 2>/dev/null || echo 000; done',
         timeout=240,
     )
@@ -731,14 +736,9 @@ def repair(what: str) -> str:
 
 
 def _repair_tunnels() -> str:
-    # Always rebuild. An earlier watchdog refused to act when 80 percent of the
-    # tunnels failed at once, on the theory that mass failure meant a dead
-    # backend. At batch 1024 all 24 wedged with healthy engines and the run sat
-    # idle five hours. Rebuilding against a dead backend just fails again next
-    # cycle; refusing to rebuild against a live one stops everything.
     rc, out = _ssh(
         HEAD,
-        'k=0; for p in $(seq 18001 18024); do '
+        f'k=0; for p in $(seq {TUNNEL_PORTS[0]} {TUNNEL_PORTS[-1]}); do '
         'c=$(curl -s -o /dev/null -m 6 -w "%{http_code}" http://127.0.0.1:$p/v1/models 2>/dev/null); '
         'if [ "$c" != "200" ]; then '
         'pid=$(sudo ss -H -lntp "sport = :$p" | sed -n "s/.*pid=\\([0-9][0-9]*\\).*/\\1/p" | head -1); '

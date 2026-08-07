@@ -52,12 +52,12 @@ memory and use for each node, and a real generation probe for each engine.
 
 Healthy values, measured on run x24:
 
-Tunnels 20 to 22 of 24. Engine probe returns 200 in under 4000 ms. Engine
+There are 48 rollout tunnels. Probe counts can fall while busy, so compare them with engine throughput. Engine probe returns 200 in under 4000 ms. Engine
 concurrency 45 to 70. Node GPU memory near 46 GiB of 48. Host memory 400 GB or
 more free. Judge returns 200.
 
-A tunnel count of 10 or less means the rollout load is too high. Check
-`max_inflight_rollouts`. The value 256 works. The value 1024 does not.
+A low tunnel probe count can mean load, not failure. Check engine throughput
+before repair. The current `max_inflight_rollouts` is 128.
 
 # How to answer "is the reward going up"
 
@@ -95,11 +95,10 @@ in three steps.
 ```python
 glm52_ops.repair("tunnels")        # kill wedged tunnels; the H200 side rebuilds
 glm52_ops.repair("engine:h200a")   # rebuild one engine container
-glm52_ops.repair("supervisors")    # restart any supervisor that stopped
+glm52_ops.repair("supervisors")    # restart the tunnel and engine watchdogs that stopped
 ```
 
-`repair` refuses to touch the batch tunnel on port 29620 while the orchestrator
-runs. Stop the orchestrator first. A killed batch tunnel leaves dead zmq
+`repair` never targets the batch tunnel on port 29620. Stop the orchestrator first. A killed batch tunnel leaves dead zmq
 connections and the trainer waits.
 
 A stalled orchestrator has no repair. Start a new run name. See

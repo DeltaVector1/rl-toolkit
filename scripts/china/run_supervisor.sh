@@ -1,20 +1,7 @@
 #!/usr/bin/env bash
 # Keep the trainer and orchestrator alive. Runs on n82.
-#
-# Every component in this stack had a supervisor except the two that matter
-# most. The costs on 2026-08-06 alone:
-#   trainer died 10:13 ("Storage size calculation overflowed with
-#     sizes=[1, 9142729177965406720]", then an NCCL collective timeout as the
-#     other ranks waited on a dead rank 0) -- sat dead SIX HOURS
-#   engines died 03:13 and again 06:0x -- 2.6 hours before anyone noticed
-# Nothing restarted any of it. The engines now self-heal
-# (scripts/h200/engine_watchdog.sh); this does the same for the run itself.
-#
-# A trainer restart is safe here because the orchestrator tolerates the trainer
-# lagging by max_off_policy_steps and the trainer resumes from its last
-# checkpoint. It is NOT safe to restart the orchestrator while the trainer is
-# dead -- a zmq send to a dead peer blocks its event loop -- so the trainer is
-# always brought back first and the orchestrator only after it is listening.
+# Bring the trainer back before the orchestrator. ZMQ can block an
+# orchestrator that starts against a dead trainer.
 set -uo pipefail
 
 RUN=${RUN:?set RUN}
@@ -35,18 +22,26 @@ while true; do
     log "TRAINER DOWN -- restarting across $NODES"
     for h in $NODES; do
       ssh -o BatchMode=yes -o ConnectTimeout=25 "$h" \
-        "sudo pkill -9 -f PRIME-RL 2>/dev/null; sudo docker rm -f glm52-decensor-trainer >/dev/null 2>&1" 2>/dev/null
+        "sudo docker rm -f glm52-decensor-trainer >/dev/null 2>&1 || true" 2>/dev/null
     done
-    # Let the host mirror of device memory drain before reloading, or the
-    # relaunch lands on a node still paging out the previous incarnation.
     sleep 20
+    declare -A launches
     for h in $NODES; do
       ( ssh -o BatchMode=yes -o ConnectTimeout=30 "$h" \
           "TRAINER_NODES='$TRAINER_NODES' RUN=$RUN RUN_NAME=$RUN_NAME CONFIG_TAG=$TAG \
-           PRIME_EP_PROFILE=1 PRIME_EP_AC_CACHE=1 bash $CLUSTER trainer >/dev/null 2>&1" 2>/dev/null ) &
+           PRIME_EP_PROFILE=1 PRIME_EP_AC_CACHE=1 bash $CLUSTER trainer" ) \
+          >>"/data/glm52-rl/run-supervisor-$h.log" 2>&1 &
+      launches[$h]=$!
     done
-    wait
-    log "trainer relaunch issued"
+    failed=""
+    for h in $NODES; do
+      wait "${launches[$h]}" || failed="$failed $h"
+    done
+    if [ -n "$failed" ]; then
+      log "trainer relaunch failed on:$failed"
+    else
+      log "trainer relaunch issued"
+    fi
     sleep 60
   fi
 

@@ -12,8 +12,9 @@ sentence. Active voice.
 
 # WHAT THE SYSTEM IS
 
-The system trains GLM-5.2-FP8, a 745 billion parameter MoE, with GRPO
-reinforcement learning and a rank-32 LoRA adapter. The goal is to reduce
+The system trains from the GLM-5.2-FP8 checkpoint, a 745 billion parameter
+MoE, with GRPO and a rank-32 LoRA adapter. The H200 engines use W8A16 and FP8
+KV cache. The trainer dequantizes the checkpoint to BF16 weights. The goal is to reduce
 refusals.
 
 The trainer computes gradients on 8 nodes of 8 RTX 4090: n76, n77, n78, n80,
@@ -29,7 +30,7 @@ The orchestrator joins them and runs on n82.
 # THE NETWORK, WHICH EXPLAINS ALMOST EVERYTHING
 
 ```
-H200 (docker) --internet, 7.5% loss, 210 ms--> jump 202.101.73.12 --LAN--> n82
+H200 (docker) --internet, measured 3-33% loss, ~217 ms--> jump --LAN--> n82
 ```
 
 n82 has a private address, 10.92.20.82. The engines reach it with `ProxyJump`
@@ -50,7 +51,7 @@ Do not delete the data of the owner. The protected paths are `/data/ZiphuAI`,
 `/data/trinity`, and `/data/nv-community_GLM-5.2-NVFP4`. The model at
 `/data/glm52-rl/model` on n85 is the only copy.
 
-Do not use QLoRA. Do not use int4.
+Do not use QLoRA. Do not use INT4 weights.
 
 Do not use cached batches. Every attempt is a full production run.
 
@@ -69,33 +70,45 @@ Do not run load tests against the engines. The owner refused one on
 
 # THE STATE AT HANDOFF
 
-Run x25, started 2026-08-07 17:04 UTC. It carries every fix below.
+There is no active run. x25 and x26 are stopped. Both H200 engines are healthy
+and idle.
 
-| Setting | Value | Why |
-|---|---|---|
-| `batch_size` | 1024 | the owner's choice |
-| `group_size` | 16 | |
-| `max_inflight_rollouts` | 128 | 192 was no faster and gave 5x the errors |
-| tunnels | 48 | 24 was equal at 128 in flight; these give headroom |
-| `enable_router_replay` | false | UNDER TEST, see below |
-| `enable_return_routed_experts` | false | it was 95.5% of the wire |
-| `ckpt.interval` | 5 | it was 25, and a restart at step 10 lost everything |
-| `ckpt.weights_only` | false | true cannot resume training |
+x26 used the edge filesystem transport with the settings below.
 
-# THE ONE OPEN QUESTION
+| Setting | Value |
+|---|---|
+| `batch_size` | 1024 |
+| `group_size` | 16 |
+| `max_inflight_rollouts` | 128 |
+| orchestrator | h200a |
+| trainer transport | filesystem plus verified LAN fanout |
+| weight discovery | reverse `STABLE` marker pull |
+| `enable_router_replay` | false |
+| `enable_return_routed_experts` | false |
 
-`enable_router_replay = false` is a test and nobody has read the result yet.
+Rollout step 1 took 20 minutes 5 seconds. Step 2 took 18 minutes 41 seconds.
+The batch transfers took 28.8 and 29.4 seconds. The trainer failed twice in
+the first forward pass. n80 rank 35 was the first process failure. Do not state
+a more specific cause without new evidence.
+
+Do not use `run_supervisor.sh` for x26. It assumes that the orchestrator runs
+on n82. Start the edge orchestrator before the trainer and verify that
+`control/orch.toml` reached n82.
+
+# THE ROUTER-REPLAY TEST
+
+`enable_router_replay = false` is under test. x25 step 1 is now available.
 
 Router replay makes the trainer replay the engine's expert choices so both
 forward passes agree. It is also what asks for `routed_experts`, which was
 95.5% of every byte crossing the link.
 
-Read `masked_mismatch_kl/mean` in `trainer-metrics.jsonl` at the first step of
-x25. With replay on it sat at 0.19 to 0.21 and entropy at 0.47.
+Step 1 measured masked mismatch KL mean 0.362 and max 6.252. Unmasked mean
+was 0.0389, entropy 0.4948, and gradient norm 0.0161. The replay-on baseline
+was 0.19 to 0.21 masked and 0.012 unmasked. This is not the several-nat
+catastrophic failure, but it is not parity and its tail is large.
 
-If it holds near 0.2, replay is unnecessary and the payload win is free.
-
-If it rises to several nats, revert both flags together:
+If later steps rise to several nats, revert both flags together:
 `enable_router_replay = true` in `configs/china/trainer.x25.toml` and
 `enable_return_routed_experts = true` in `configs/h200/inference.toml`, then
 restart the trainer and both engines.
@@ -110,9 +123,9 @@ float32 router here against W8A16 on the engine.
 
 # WHAT WAS FOUND ON 2026-08-07
 
-The step time is set by rollout collection, not by the trainer. The trainer
-computes a step in 6 to 15 minutes and then idles. Step 6 was 95 percent idle.
-Do not tune the trainer to reduce the step time.
+On x24, trainer compute took 6 to 15 minutes and rollout collection set the
+cycle time. On x25 step 1, trainer forward/backward took 17.2 minutes and
+collection took 48.7 minutes. Keep both measurements separate.
 
 Every dropped rollout was a transport failure. Step 6 lost 78.4 percent of its
 rollouts and every signature was `ReadTimeout`. The `zero_advantage` filter
@@ -241,12 +254,10 @@ question. Everything else waits on that.
 
 Then, in the order they are worth doing:
 
-Move the orchestrator to the engine side and ship one batch instead of 1024
-round trips. This was rejected before compression existed and before
-`routed_experts` was removed. A rollout is now about 0.13 MB, so a batch is
-about 130 MB, and the batch tunnel moves 4.9 MB/s compressed. The bytes are the
-same either way; the difference is one resumable transfer against 1024
-independent request and response cycles that can each time out.
+Move the orchestrator to the engine side and use a durable filesystem batch.
+`docs/ROLLOUT_TRANSPORT.md` gives the design and the repository includes a
+resumable, hash-checked publisher. Do not use WAN ZMQ: it has no application
+acknowledgment, replay, or durable spool.
 
 Stream the generations. A request that dies at 290 seconds today loses the
 whole generation after the engine already did the work. vLLM streams natively.

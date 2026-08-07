@@ -25,6 +25,32 @@ if you want to apply the changes one at a time:
 git am patches/series/*.patch
 ```
 
+# X26 EDGE FILESYSTEM TRANSPORT
+
+Files:
+
+- `configs/china/trainer.x26.toml`
+- `configs/h200/orchestrator.x26h.toml`
+- `scripts/h200/sync_rollout_batches.sh`
+- `scripts/china/sync_microbatches.sh`
+
+The orchestrator runs on h200a. It writes an immutable `train_rollouts.bin`.
+The H200 publisher resumes interrupted transfers, verifies SHA-256, and renames
+the destination atomically on n82. It also pulls trainer `STABLE` markers back
+to h200a so the weight watcher can discover a new policy. The adapter data
+stays on n82 and is served through port 18100.
+
+Filesystem micro-batches are local files. Rank 0 writes them under the trainer
+`output_dir` on n82. The China publisher copies each immutable `rank_*.bin` to
+the same path on the other seven nodes, verifies it, and renames it atomically.
+It uses SCP on n85 because that node does not have rsync. `cluster.sh` starts
+this publisher on rank 0 only when the trainer transport is `filesystem`.
+
+The live x26 test verified both batch transfers and one micro-batch fanout to
+all eight nodes. The reverse `STABLE` marker path passed a live synthetic test.
+A real policy update did not occur because the trainer failed before it made
+the marker.
+
 # THE CHANGES TO THE TRAINER SOURCE
 
 # configs: ac_offloading = "None"
@@ -132,18 +158,14 @@ the orchestrator event loop.
 
 # scripts/china/tunnel_watchdog.sh
 
-This script runs on n82. It tests each of the 24 tunnel ports. It kills a
-tunnel that does not answer two times. The supervisor on the H200 host then
-rebuilds it.
+This script runs on n82. The current version tests 48 ports. It requires six
+misses and rate-limits repairs to two ports every 120 seconds. The supervisor
+on the H200 host then rebuilds the forward.
 
 An early version refused to rebuild when 80 percent of the tunnels failed.
 That version stopped the run for 5 hours. The script now always rebuilds.
 
-The script also writes a heartbeat line every 4 cycles, which is about every 3
-minutes. Without it the script logged only when it killed a port, so a healthy
-idle watchdog and a wedged one looked the same from outside. The only other
-liveness test, a process count, cannot return zero when the probe matches its
-own command line. `HEARTBEAT=0` turns the line off.
+The script writes a heartbeat every five cycles. `HEARTBEAT=0` turns it off.
 
 # scripts/h200/engine_watchdog.sh
 
@@ -316,12 +338,14 @@ a minute. Prefer the orchestrator's own per-batch cycle time.
 `dequantize_checkpoint = true`. The FP8 path uses W8A8. The engines use W8A16.
 The difference breaks the importance ratio.
 
-`max_inflight_rollouts = 256`. This value is not the batch size. The tunnels
-fail above this value.
+`max_inflight_rollouts = 128`. This value is not the batch size. A later 192
+measurement was no faster and produced more errors.
 
 `batch_size = 1024` and `group_size = 16`. These values give 64 GRPO groups.
 
-The orchestrator must run on n82. The batch cannot cross the link.
+The active x25 orchestrator runs on n82. This is not a transport requirement:
+compressed batches can cross the link. Future runs should use the durable edge
+design in `docs/ROLLOUT_TRANSPORT.md`.
 
 # THE MEASUREMENTS
 
