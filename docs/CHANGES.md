@@ -34,22 +34,22 @@ File: `configs/china/trainer.x*.toml`
 Activation offloading was on by default. It put activations into pinned host
 memory. The host memory then reached 486 GB of 503 GB. The nodes stopped.
 
-This change is the reason that a 16K step is possible.
+Without this change a 16K step does not complete.
 
 # train.py: the stage buffer dtype
 
 The inter-stage buffers hold activations. The code took the dtype from the
 first parameter. With FP8 weights the first parameter is `float8_e4m3fn`.
 
-The fix uses `DTYPE_MAP[config.model.optimization_dtype]`.
+Use `DTYPE_MAP[config.model.optimization_dtype]` instead.
 
 # train.py: discard a corrupt batch
 
 A micro-batch arrived with the shape `[1, 9142729177965406720]`. Torch stopped
 rank 0. The other 7 ranks waited for the NCCL timeout.
 
-The fix tests each micro-batch shape. The limit is `seq_len * cp * 4`. A bad
-batch is discarded. The run continues.
+The code now tests each micro-batch shape against `seq_len * cp * 4`. It
+discards a bad batch and the run continues.
 
 # modeling_glm_moe_dsa.py: the ModuleDict layers
 
@@ -81,7 +81,7 @@ A widening from float8 to bf16 is exact. `bitcast` is always false in
 float8 on the main path. The tensors `cos` and `sin` are float8 through
 `compute_sparse_indices`.
 
-The fix makes all three tensors a real float type. Rope must not use float8.
+The code now makes all three tensors a real float type. Rope must not use float8.
 The e4m3 format has 3 mantissa bits. That is not sufficient for the phase.
 
 # norms.py: the float8 guards
@@ -104,7 +104,7 @@ The new cost is `layers * (weights + activations * in_flight)`.
 Do not use only the activations. That objective gives 32 of 78 layers to the
 last stage. The weights then need 52 GB on a 48 GB card.
 
-The result: the peak changed from 24.6 GB to 21.9 GB for each GPU.
+The peak changed from 24.6 GB to 21.9 GB for each GPU.
 
 # THE NEW SCRIPTS
 
