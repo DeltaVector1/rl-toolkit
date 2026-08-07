@@ -1,7 +1,7 @@
 From e29116eaf904e894e0728acbf38b22236c211336 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 5 Aug 2026 21:02:08 +0000
-Subject: [PATCH 02/26] Guard self.norm for non-final pipeline stages
+Subject: [PATCH 02/28] Guard self.norm for non-final pipeline stages
 
 apply_pp_boundaries sets norm to None on every stage but the last
 (pipeline_parallel.py:161) to avoid keeping a ~1.9 GB head resident on the

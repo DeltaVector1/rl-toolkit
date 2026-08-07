@@ -1,7 +1,7 @@
 From c99483b1013ae8060a988d789587a3e18a31658f Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Thu, 6 Aug 2026 06:25:06 +0000
-Subject: [PATCH 10/26] Adapter URL must resolve on the ENGINE hosts, not just
+Subject: [PATCH 10/28] Adapter URL must resolve on the ENGINE hosts, not just
  the orchestrator
 
 vLLM engine workers fetch the LoRA adapter themselves

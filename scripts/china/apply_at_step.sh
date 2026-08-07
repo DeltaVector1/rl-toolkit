@@ -18,7 +18,8 @@ STEP=${STEP:?set STEP -- the step number to wait for}
 TAG=${CONFIG_TAG:?set CONFIG_TAG}
 RUN=${RUN:?set RUN}
 RUN_NAME=${RUN_NAME:?set RUN_NAME}
-EXPECT=${EXPECT:-}          # optional "key = value" line to verify in the config
+EXPECT=${EXPECT:-}          # optional literal text to verify before arming
+CHECK_FILE=${CHECK_FILE:-}  # file EXPECT must appear in; defaults to the orchestrator config
 GIVE_UP_HOURS=${GIVE_UP_HOURS:-6}
 INTERVAL=${INTERVAL:-60}
 DEPLOY=/data/glm52-rl/deployment
@@ -35,10 +36,11 @@ log "waiting for trainer step $STEP, then restarting the orchestrator (tag=$TAG)
 # Refuse to arm if the change is not actually staged. Restarting for nothing
 # would discard a batch and change no behaviour.
 if [ -n "$EXPECT" ]; then
-  if grep -qF -- "$EXPECT" "$CFG"; then
-    log "config check ok: '$EXPECT' present in $CFG"
+  check_in=${CHECK_FILE:-$CFG}
+  if grep -qF -- "$EXPECT" "$check_in"; then
+    log "pre-flight ok: '$EXPECT' present in $check_in"
   else
-    log "ABORT: '$EXPECT' is not in $CFG. Nothing to apply."
+    log "ABORT: '$EXPECT' is not in $check_in. Nothing to apply."
     exit 1
   fi
 fi

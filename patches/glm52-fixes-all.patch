@@ -3165,10 +3165,10 @@ index 0000000..d7ad877
 +keep_interval = 100
 diff --git a/scripts/china/apply_at_step.sh b/scripts/china/apply_at_step.sh
 new file mode 100755
-index 0000000..5b41595
+index 0000000..1f2d2ac
 --- /dev/null
 +++ b/scripts/china/apply_at_step.sh
-@@ -0,0 +1,95 @@
+@@ -0,0 +1,97 @@
 +#!/usr/bin/env bash
 +# Wait until the trainer finishes a given step, then restart the orchestrator
 +# so it re-reads its config. Runs on n82.
@@ -3189,7 +3189,8 @@ index 0000000..5b41595
 +TAG=${CONFIG_TAG:?set CONFIG_TAG}
 +RUN=${RUN:?set RUN}
 +RUN_NAME=${RUN_NAME:?set RUN_NAME}
-+EXPECT=${EXPECT:-}          # optional "key = value" line to verify in the config
++EXPECT=${EXPECT:-}          # optional literal text to verify before arming
++CHECK_FILE=${CHECK_FILE:-}  # file EXPECT must appear in; defaults to the orchestrator config
 +GIVE_UP_HOURS=${GIVE_UP_HOURS:-6}
 +INTERVAL=${INTERVAL:-60}
 +DEPLOY=/data/glm52-rl/deployment
@@ -3206,10 +3207,11 @@ index 0000000..5b41595
 +# Refuse to arm if the change is not actually staged. Restarting for nothing
 +# would discard a batch and change no behaviour.
 +if [ -n "$EXPECT" ]; then
-+  if grep -qF -- "$EXPECT" "$CFG"; then
-+    log "config check ok: '$EXPECT' present in $CFG"
++  check_in=${CHECK_FILE:-$CFG}
++  if grep -qF -- "$EXPECT" "$check_in"; then
++    log "pre-flight ok: '$EXPECT' present in $check_in"
 +  else
-+    log "ABORT: '$EXPECT' is not in $CFG. Nothing to apply."
++    log "ABORT: '$EXPECT' is not in $check_in. Nothing to apply."
 +    exit 1
 +  fi
 +fi
@@ -3265,7 +3267,7 @@ index 0000000..5b41595
 +log "done. orchestrator restarted with $CFG"
 +sudo docker logs --tail 20 "$ORCH_CT" 2>&1 | grep -oE 'batch [0-9]+/[0-9]+[^;]*; [0-9]+ inflight' | tail -1
 diff --git a/scripts/china/cluster.sh b/scripts/china/cluster.sh
-index 41ebaaf..3eb0c62 100755
+index 41ebaaf..aaa8f8c 100755
 --- a/scripts/china/cluster.sh
 +++ b/scripts/china/cluster.sh
 @@ -118,7 +118,7 @@ case ${1:-} in
@@ -3277,6 +3279,14 @@ index 41ebaaf..3eb0c62 100755
        -e TORCHINDUCTOR_COMPILE_THREADS=8 \
        -e PRIME_EP_PROFILE="${PRIME_EP_PROFILE:-0}" \
        -e PRIME_EP_PROFILE_EVERY="${PRIME_EP_PROFILE_EVERY:-150}" \
+@@ -155,6 +155,7 @@ case ${1:-} in
+       -v "$deployment/source/deps/renderers/renderers/base.py":/app/deps/renderers/renderers/base.py:ro \
+       -v "$deployment/source/deps/renderers/renderers/client.py":/app/deps/renderers/renderers/client.py:ro \
+       -v "$deployment/source/deps/verifiers/verifiers/v1/clients/eval.py":/app/deps/verifiers/verifiers/v1/clients/eval.py:ro \
++      -v "$deployment/source/deps/verifiers/verifiers/v1/clients/config.py":/app/deps/verifiers/verifiers/v1/clients/config.py:ro \
+       -v "$deployment/source/src/prime_rl/orchestrator/algo/grpo.py":/app/src/prime_rl/orchestrator/algo/grpo.py:ro \
+       -v "$deployment/source/src/prime_rl/orchestrator/dispatcher.py":/app/src/prime_rl/orchestrator/dispatcher.py:ro \
+       -v "$deployment/source/src/prime_rl/orchestrator/orchestrator.py":/app/src/prime_rl/orchestrator/orchestrator.py:ro \
 diff --git a/scripts/china/run_supervisor.sh b/scripts/china/run_supervisor.sh
 new file mode 100644
 index 0000000..f4f7e70
@@ -3626,32 +3636,49 @@ index 3654ec2..7d3ab07 100644
  sleep 6
  for p in 18101 29620 18100; do
 diff --git a/scripts/h200/start_tunnel.sh b/scripts/h200/start_tunnel.sh
-index 3e33102..8d73dfb 100755
+index 3e33102..7132bb7 100755
 --- a/scripts/h200/start_tunnel.sh
 +++ b/scripts/h200/start_tunnel.sh
-@@ -5,6 +5,11 @@ remote_port=${1:?usage: start_tunnel.sh REMOTE_PORT LOCAL_PORT}
+@@ -5,6 +5,27 @@ remote_port=${1:?usage: start_tunnel.sh REMOTE_PORT LOCAL_PORT}
  local_port=${2:?usage: start_tunnel.sh REMOTE_PORT LOCAL_PORT}
  health_port=$((remote_port + 1000))
  
-+# 10s x 3 = a dead tunnel is torn down in ~30s. It was 15 x 20 = 300s, and
-+# over a link with 10-33% packet loss the wedged tunnels accumulated faster
-+# than they were reaped: observed 22 of 24 dead with h200a taking zero traffic,
-+# and later all 24 wedged at once. The n82-side watchdog probes for the wedges
-+# SSH itself cannot see (forward alive, no data flowing).
++# Keepalive: 15s x 8 = a dead TCP path is reaped in ~120s.
++#
++# This value has now been set three ways, and each was right for the watchdog
++# that existed at the time. 15 x 20 (300s) was chosen when nothing else could
++# detect a wedge, and it let wedged tunnels pile up. 10 x 3 (30s) replaced it,
++# but SSH keepalives are ordinary packets on a link that loses 10-33% of them,
++# so three consecutive misses happen routinely on a tunnel that is working --
++# and under load they miss on every tunnel at once. SSH was then killing live
++# tunnels and every request in flight on them.
++#
++# scripts/china/tunnel_watchdog.sh now owns wedge detection from the n82 side,
++# where it can see the thing SSH cannot: forward alive, no data flowing. So
++# SSH's only job here is to notice a genuinely dead TCP path, and it should be
++# patient about it. Exactly one of the two may be impatient; right now neither
++# is, because a wedge is expensive to misdiagnose in both directions.
++#
++# Compression is the reason this link works at all. On the batch tunnel it took
++# throughput from under 130 KB/s to 4.9 MB/s. Rollout traffic is JSON holding
++# generated text, which compresses just as well, and on a loss-limited path
++# fewer bytes means proportionally fewer lost packets. It costs a little CPU on
++# hosts that have plenty.
  while true; do
    ssh -o BatchMode=yes -o ConnectTimeout=30 china-trainer \
      "sudo ss -H -lntp 'sport = :$remote_port' | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | xargs -r sudo kill; sudo ss -H -lntp 'sport = :$health_port' | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | xargs -r sudo kill" || true
-@@ -12,8 +17,8 @@ while true; do
-     -o BatchMode=yes \
+@@ -13,9 +34,10 @@ while true; do
      -o ConnectTimeout=30 \
      -o ExitOnForwardFailure=yes \
--    -o ServerAliveInterval=15 \
+     -o ServerAliveInterval=15 \
 -    -o ServerAliveCountMax=20 \
-+    -o ServerAliveInterval=10 \
-+    -o ServerAliveCountMax=3 \
++    -o ServerAliveCountMax=8 \
      -o TCPKeepAlive=yes \
      -o IPQoS=none \
++    -o Compression=yes \
      -R "127.0.0.1:$remote_port:127.0.0.1:$local_port" \
+     -R "127.0.0.1:$health_port:127.0.0.1:8000" \
+     china-trainer || true
 diff --git a/scripts/ops/watchdog_smoketest.sh b/scripts/ops/watchdog_smoketest.sh
 new file mode 100755
 index 0000000..60e1485
@@ -3920,6 +3947,167 @@ index 0000000..60e1485
 +echo
 +echo "passed=$pass failed=$fail"
 +[ "$fail" -eq 0 ]
+diff --git a/source/deps/verifiers/verifiers/v1/clients/config.py b/source/deps/verifiers/verifiers/v1/clients/config.py
+new file mode 100644
+index 0000000..45b3dbf
+--- /dev/null
++++ b/source/deps/verifiers/verifiers/v1/clients/config.py
+@@ -0,0 +1,155 @@
++"""Client configs: describe an OpenAI-compatible endpoint and resolve it to a Client.
++
++A `BaseClientConfig` is an OpenAI-compatible endpoint (base_url + API-key env var
+++ extra headers) that `resolve_client` turns into a `Client`. The default Prime
++endpoint, API key, and team fall back to the active Prime CLI config, so direct
++`uv run eval` calls behave like `prime eval`. Both the eval entrypoint (its model
++client) and in-env LLM calls (e.g. a judge reward) build clients from these.
++`ClientConfig` is the CLI-selectable discriminated union (eval | train).
++"""
++
++import os
++from typing import Annotated, Literal
++from urllib.parse import urlparse
++
++import httpx
++from openai import AsyncOpenAI
++from pydantic import Field, model_validator
++from pydantic_config import BaseConfig
++from renderers import RendererConfig
++
++from verifiers.utils.client_utils import load_prime_config
++from verifiers.v1.clients.client import Client
++from verifiers.v1.clients.eval import EvalClient
++from verifiers.v1.clients.train import TrainClient
++
++DEFAULT_PRIME_INFERENCE_URL = "https://api.pinference.ai/api/v1"
++PRIME_INFERENCE_HOST = "pinference.ai"
++PRIME_TEAM_ID_HEADER = "X-Prime-Team-ID"
++
++
++class BaseClientConfig(BaseConfig):
++    """An OpenAI-compatible endpoint. The API key is read from an env var."""
++
++    base_url: str = DEFAULT_PRIME_INFERENCE_URL
++    api_key_var: str = "PRIME_API_KEY"
++    headers: dict[str, str] = Field(default_factory=dict)
++    """Extra HTTP headers sent on every request."""
++
++    @model_validator(mode="after")
++    def apply_prime_config(self) -> "BaseClientConfig":
++        if self.api_key_var != "PRIME_API_KEY":
++            return self
++        prime_config = load_prime_config()
++        prime_base_url = (
++            os.environ.get("PRIME_INFERENCE_URL")
++            or prime_config.get("inference_url")
++            or DEFAULT_PRIME_INFERENCE_URL
++        )
++        if "base_url" not in self.model_fields_set:
++            self.base_url = prime_base_url
++        host = urlparse(self.base_url).hostname or ""
++        if host != PRIME_INFERENCE_HOST and not host.endswith(
++            f".{PRIME_INFERENCE_HOST}"
++        ):
++            return self
++        team_id = os.environ.get("PRIME_TEAM_ID") or prime_config.get("team_id")
++        if team_id:
++            self.headers.setdefault(PRIME_TEAM_ID_HEADER, team_id)
++        return self
++
++
++class EvalClientConfig(BaseClientConfig):
++    """The default (eval): forward each request to a matching endpoint via `EvalClient`."""
++
++    type: Literal["eval"] = "eval"
++
++
++class TrainClientConfig(BaseClientConfig):
++    """Training: a vLLM `/inference/v1/generate` endpoint with client-side tokenization (via
++    `TrainClient`), so responses carry token ids + logprobs. Needs a running vLLM engine."""
++
++    type: Literal["train"] = "train"
++    renderer: RendererConfig | None = None
++    """The `renderers.RendererConfig` to use (the same shared type prime-rl configures).
++    `None` auto-resolves from the model — which falls back to the default renderer (no
++    tool support) for models not in the renderer map, so set it explicitly for
++    fine-tunes / tool-using envs."""
++    pool_size: int = 1
++    """Renderer slots shared across concurrent rollouts (client-side tokenization)."""
++    renderer_model_name: str | None = None
++    """Model the tokenizer/renderer pool is built for. Pin to the base model so a LoRA
++    adapter name (served only for sampling) never drives tokenizer loading. Falls back to
++    the per-request model when None."""
++
++
++# Discriminated union for a CLI-selectable client (`--client.type eval|train`).
++ClientConfig = Annotated[
++    EvalClientConfig | TrainClientConfig, Field(discriminator="type")
++]
++
++
++def resolve_api_key(config: BaseClientConfig) -> str:
++    """The API key for `config`: its env var, falling back to the Prime CLI config for a
++    `PRIME_API_KEY`-keyed pinference endpoint. `"EMPTY"` when unset."""
++    api_key = os.environ.get(config.api_key_var)
++    host = urlparse(config.base_url).hostname or ""
++    if (
++        not api_key
++        and config.api_key_var == "PRIME_API_KEY"
++        and (host == PRIME_INFERENCE_HOST or host.endswith(f".{PRIME_INFERENCE_HOST}"))
++    ):
++        api_key = load_prime_config().get("api_key")
++    return api_key or "EMPTY"
++
++
++# Local change. Upstream leaves the OpenAI SDK defaults in place:
++# connect=5.0s, read=600s. Both are wrong for the China link, which has 217 ms
++# of round trip and 10-33% packet loss.
++#
++# connect=5s: a TCP handshake that loses a SYN waits about 1s, then 2s, then 4s
++# for the retransmits, so a connect through a busy tunnel blows the 5s budget
++# while the path is fine.
++#
++# read=600s is the expensive one. The orchestrator runs a fixed number of
++# rollouts in flight, so a wedged request holds one of those slots for ten
++# minutes. Measured 2026-08-07: 121 rollouts in flight while the two engines
++# ran 3 between them, and 78.4% of a step's rollouts ended in ReadTimeout. Most
++# of the "in flight" count was dead requests waiting out this timeout, and the
++# engines starved behind them.
++#
++# 300s still leaves a wide margin: generation averages 54.6s and p90 is 87.8s.
++# Override with PRIME_ROLLOUT_* if a longer generation is ever configured.
++_CONNECT_TIMEOUT_S = float(os.environ.get("PRIME_ROLLOUT_CONNECT_TIMEOUT_S", "30"))
++_READ_TIMEOUT_S = float(os.environ.get("PRIME_ROLLOUT_TIMEOUT_S", "300"))
++
++
++def build_async_openai(config: BaseClientConfig) -> AsyncOpenAI:
++    """An `AsyncOpenAI` for `config` (resolved key + extra headers) — for in-env model calls
++    (e.g. a judge) and the training client's engine connection."""
++    return AsyncOpenAI(
++        base_url=config.base_url,
++        api_key=resolve_api_key(config),
++        default_headers=config.headers or None,
++        timeout=httpx.Timeout(
++            connect=_CONNECT_TIMEOUT_S,
++            read=_READ_TIMEOUT_S,
++            write=_READ_TIMEOUT_S,
++            pool=_CONNECT_TIMEOUT_S,
++        ),
++    )
++
++
++def resolve_client(config: BaseClientConfig) -> Client:
++    if isinstance(config, TrainClientConfig):
++        # The renderer calls a vLLM `/inference/v1/generate` engine through the OpenAI SDK.
++        return TrainClient(
++            build_async_openai(config),
++            pool_size=config.pool_size,
++            config=config.renderer,
++            renderer_model_name=config.renderer_model_name,
++        )
++    # The proxy is a raw httpx forwarder; the dialect supplies the auth scheme + upstream path.
++    return EvalClient(
++        config.base_url, resolve_api_key(config), headers=config.headers or None
++    )
 diff --git a/source/src/prime_rl/trainer/distributed/pipeline_parallel.py b/source/src/prime_rl/trainer/distributed/pipeline_parallel.py
 index 796d8cb..230c088 100644
 --- a/source/src/prime_rl/trainer/distributed/pipeline_parallel.py
