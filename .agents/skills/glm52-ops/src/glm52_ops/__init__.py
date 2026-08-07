@@ -903,5 +903,29 @@ def run(argstr: str = "status"):
     return _ACTIONS[parts[0]](parts[1:])
 
 
+_USAGE = f"""glm52-ops <action> [args]
+
+  status [run]        the whole picture in one call
+  reward [run]        the reward series with a trend verdict
+  tunnels             the HTTP code for each of the 24 tunnel ports
+  engines             a real completion probe for each engine
+  watch [hours] [s]   the picture on a loop, in the foreground
+  repair <what>       tunnels | engine:<host> | supervisors
+  deploy <path>       push one repository file to every trainer node
+  mounts              the source paths the container mounts
+  stop                stop the supervisors, orchestrator and trainer
+
+Read {Path(__file__).resolve().parents[2] / 'SKILL.md'} first.
+"""
+
+
 def cli() -> None:
-    sys.exit(0 if run(" ".join(sys.argv[1:]) or "status") is not None else 0)
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(_USAGE)
+        sys.exit(0)
+    try:
+        run(" ".join(args))
+    except Refused as e:
+        print(f"refused: {e}\n\n{_USAGE}", file=sys.stderr)
+        sys.exit(2)

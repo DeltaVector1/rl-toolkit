@@ -1,0 +1,106 @@
+From a472ff6f417a1e1398e43701a59a2c2bd0b9b43a Mon Sep 17 00:00:00 2001
+From: DeltaVector1 <DeltaVector1@users.noreply.github.com>
+Date: Fri, 7 Aug 2026 04:28:33 +0000
+Subject: [PATCH 23/23] glm52-ops: print usage instead of raising on --help
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017wiESxhziDrnsLnG9aizTd
+---
+ .../glm52-ops/src/glm52_ops.egg-info/PKG-INFO |  5 ++++
+ .../src/glm52_ops.egg-info/SOURCES.txt        |  7 +++++
+ .../glm52_ops.egg-info/dependency_links.txt   |  1 +
+ .../src/glm52_ops.egg-info/entry_points.txt   |  2 ++
+ .../src/glm52_ops.egg-info/top_level.txt      |  1 +
+ .../glm52-ops/src/glm52_ops/__init__.py       | 26 ++++++++++++++++++-
+ 6 files changed, 41 insertions(+), 1 deletion(-)
+ create mode 100644 .agents/skills/glm52-ops/src/glm52_ops.egg-info/PKG-INFO
+ create mode 100644 .agents/skills/glm52-ops/src/glm52_ops.egg-info/SOURCES.txt
+ create mode 100644 .agents/skills/glm52-ops/src/glm52_ops.egg-info/dependency_links.txt
+ create mode 100644 .agents/skills/glm52-ops/src/glm52_ops.egg-info/entry_points.txt
+ create mode 100644 .agents/skills/glm52-ops/src/glm52_ops.egg-info/top_level.txt
+
+diff --git a/.agents/skills/glm52-ops/src/glm52_ops.egg-info/PKG-INFO b/.agents/skills/glm52-ops/src/glm52_ops.egg-info/PKG-INFO
+new file mode 100644
+index 0000000..940bc86
+--- /dev/null
++++ b/.agents/skills/glm52-ops/src/glm52_ops.egg-info/PKG-INFO
+@@ -0,0 +1,5 @@
++Metadata-Version: 2.4
++Name: glm52-ops
++Version: 1.0.0
++Summary: Status, reward analysis, repair, and launch control for the GLM-5.2 decensor GRPO run
++Requires-Python: >=3.10
+diff --git a/.agents/skills/glm52-ops/src/glm52_ops.egg-info/SOURCES.txt b/.agents/skills/glm52-ops/src/glm52_ops.egg-info/SOURCES.txt
+new file mode 100644
+index 0000000..92361b7
+--- /dev/null
++++ b/.agents/skills/glm52-ops/src/glm52_ops.egg-info/SOURCES.txt
+@@ -0,0 +1,7 @@
++pyproject.toml
++src/glm52_ops/__init__.py
++src/glm52_ops.egg-info/PKG-INFO
++src/glm52_ops.egg-info/SOURCES.txt
++src/glm52_ops.egg-info/dependency_links.txt
++src/glm52_ops.egg-info/entry_points.txt
++src/glm52_ops.egg-info/top_level.txt
+\ No newline at end of file
+diff --git a/.agents/skills/glm52-ops/src/glm52_ops.egg-info/dependency_links.txt b/.agents/skills/glm52-ops/src/glm52_ops.egg-info/dependency_links.txt
+new file mode 100644
+index 0000000..8b13789
+--- /dev/null
++++ b/.agents/skills/glm52-ops/src/glm52_ops.egg-info/dependency_links.txt
+@@ -0,0 +1 @@
++
+diff --git a/.agents/skills/glm52-ops/src/glm52_ops.egg-info/entry_points.txt b/.agents/skills/glm52-ops/src/glm52_ops.egg-info/entry_points.txt
+new file mode 100644
+index 0000000..c3f904a
+--- /dev/null
++++ b/.agents/skills/glm52-ops/src/glm52_ops.egg-info/entry_points.txt
+@@ -0,0 +1,2 @@
++[console_scripts]
++glm52-ops = glm52_ops:cli
+diff --git a/.agents/skills/glm52-ops/src/glm52_ops.egg-info/top_level.txt b/.agents/skills/glm52-ops/src/glm52_ops.egg-info/top_level.txt
+new file mode 100644
+index 0000000..aa9363f
+--- /dev/null
++++ b/.agents/skills/glm52-ops/src/glm52_ops.egg-info/top_level.txt
+@@ -0,0 +1 @@
++glm52_ops
+diff --git a/.agents/skills/glm52-ops/src/glm52_ops/__init__.py b/.agents/skills/glm52-ops/src/glm52_ops/__init__.py
+index 3f43ece..164020c 100644
+--- a/.agents/skills/glm52-ops/src/glm52_ops/__init__.py
++++ b/.agents/skills/glm52-ops/src/glm52_ops/__init__.py
+@@ -903,5 +903,29 @@ def run(argstr: str = "status"):
+     return _ACTIONS[parts[0]](parts[1:])
+ 
+ 
++_USAGE = f"""glm52-ops <action> [args]
++
++  status [run]        the whole picture in one call
++  reward [run]        the reward series with a trend verdict
++  tunnels             the HTTP code for each of the 24 tunnel ports
++  engines             a real completion probe for each engine
++  watch [hours] [s]   the picture on a loop, in the foreground
++  repair <what>       tunnels | engine:<host> | supervisors
++  deploy <path>       push one repository file to every trainer node
++  mounts              the source paths the container mounts
++  stop                stop the supervisors, orchestrator and trainer
++
++Read {Path(__file__).resolve().parents[2] / 'SKILL.md'} first.
++"""
++
++
+ def cli() -> None:
+-    sys.exit(0 if run(" ".join(sys.argv[1:]) or "status") is not None else 0)
++    args = sys.argv[1:]
++    if not args or args[0] in ("-h", "--help", "help"):
++        print(_USAGE)
++        sys.exit(0)
++    try:
++        run(" ".join(args))
++    except Refused as e:
++        print(f"refused: {e}\n\n{_USAGE}", file=sys.stderr)
++        sys.exit(2)
+-- 
+2.43.0
+

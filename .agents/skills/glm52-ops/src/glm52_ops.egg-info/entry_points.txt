@@ -1,0 +1,2 @@
+[console_scripts]
+glm52-ops = glm52_ops:cli
