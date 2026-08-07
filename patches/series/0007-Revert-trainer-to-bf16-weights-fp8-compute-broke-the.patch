@@ -1,7 +1,7 @@
 From 9e0d963b458397f3eb0631b5df2dabed122f9ea5 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Thu, 6 Aug 2026 00:06:23 +0000
-Subject: [PATCH 07/23] Revert trainer to bf16 weights: fp8 compute broke the
+Subject: [PATCH 07/24] Revert trainer to bf16 weights: fp8 compute broke the
  importance ratio
 
 x19 metrics over 5 steps:

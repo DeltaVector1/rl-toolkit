@@ -30,6 +30,23 @@ INTERVAL=${INTERVAL:-60}
 # only other liveness test, `pgrep -fc`, counts its own grep and can never
 # return zero. A periodic line makes "still checking" observable.
 HEARTBEAT=${HEARTBEAT:-5}
+# Rate limits. The /v1/models probe shares each tunnel with rollout traffic, so
+# a BUSY tunnel misses probes while working perfectly -- and it misses them on
+# every link at once, because the load arrives everywhere at once. Measured on
+# 2026-08-07 at 251 rollouts in flight: healthy-tunnel counts tracked the batch
+# phase (23/24 at the batch tail, 1/24 mid-batch) while both engines held 100%
+# GPU and ~500 tok/s. A 2-miss threshold with no cap then killed up to 9 live
+# tunnels in one pass, destroying every rollout in flight on them: 68 kills and
+# 139 rollout failures in one hour.
+#
+# A dead tunnel never recovers on its own, so a slow detection window costs
+# nothing. A live tunnel killed under load costs every rollout on it. Prefer
+# the slow window. This is the same conclusion scripts/network/watch_rollout_links.sh
+# reached (30 misses, one link per pass, 2 minutes apart); do not tighten these
+# while running large batches.
+MISSES_BEFORE_KILL=${MISSES_BEFORE_KILL:-6}
+MAX_KILLS_PER_PASS=${MAX_KILLS_PER_PASS:-2}
+KILL_COOLDOWN=${KILL_COOLDOWN:-120}
 # Above this fraction of simultaneous failures, blame the backend, not the
 # tunnels. 24 ports -> 20 failures trips it.
 MASS_FAILURE_PCT=${MASS_FAILURE_PCT:-80}
@@ -38,22 +55,36 @@ total=0
 for _p in $PORTS; do total=$((total + 1)); done
 mass_streak=0
 cycle=0
+last_kill=0
 
 log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
 log "tunnel watchdog started (${total} ports, timeout=${TIMEOUT}s, interval=${INTERVAL}s)"
 
 while true; do
+  # Probe every port at once. Serially this loop takes 24 x TIMEOUT in the bad
+  # case, so one cycle ran 2 to 7 minutes instead of the nominal interval and
+  # MISSES_BEFORE_KILL meant half an hour rather than a few minutes. Measured
+  # 2026-08-07: no log line at all for 10 minutes because the first heartbeat
+  # was still 4 cycles away.
+  results=$( for p in $PORTS; do
+      ( printf '%s %s\n' "$p" \
+          "$(curl -s -o /dev/null -m "$TIMEOUT" -w '%{http_code}' "http://127.0.0.1:$p/v1/models" 2>/dev/null)" ) &
+    done
+    wait )
+
   failed=""
   nfail=0
-  for p in $PORTS; do
-    code=$(curl -s -o /dev/null -m "$TIMEOUT" -w "%{http_code}" "http://127.0.0.1:$p/v1/models" 2>/dev/null)
+  # A here-string, not a pipe: a pipe puts the loop in a subshell and every
+  # update to the misses array is then discarded.
+  while read -r p code; do
+    [ -z "$p" ] && continue
     if [ "$code" = "200" ]; then
       misses[$p]=0
     else
       nfail=$((nfail + 1))
       failed="$failed $p"
     fi
-  done
+  done <<< "$(printf '%s\n' "$results" | sort -n)"
 
   # ALWAYS rebuild. An earlier version refused when >=80% failed, on the theory
   # that mass failure meant a dead backend it could not fix. That was wrong and
@@ -70,21 +101,39 @@ while true; do
     mass_streak=0
   fi
 
+  now=$(date +%s)
+  cooling=0
+  [ $((now - last_kill)) -lt "$KILL_COOLDOWN" ] && cooling=1
+
   killed=0
+  deferred=0
   for p in $failed; do
     misses[$p]=$(( ${misses[$p]:-0} + 1 ))
-    # Two consecutive misses: one slow reply under load must not trigger a rebuild.
-    if [ "${misses[$p]}" -ge 2 ]; then
-      pid=$(sudo ss -H -lntp "sport = :$p" 2>/dev/null | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | head -1)
-      if [ -n "$pid" ]; then
-        sudo kill "$pid" 2>/dev/null && { killed=$((killed + 1)); log "killed wedged tunnel on :$p (pid $pid)"; }
-      else
-        log "tunnel :$p failing but nothing holds the port (remote supervisor down?)"
-      fi
+    # Not yet convinced this port is really dead rather than just busy.
+    [ "${misses[$p]}" -lt "$MISSES_BEFORE_KILL" ] && continue
+    # Past the threshold but rate limited. Do NOT reset the miss count here:
+    # the port stays a candidate and gets rebuilt on a later pass.
+    if [ "$cooling" -eq 1 ] || [ "$killed" -ge "$MAX_KILLS_PER_PASS" ]; then
+      deferred=$((deferred + 1))
+      continue
+    fi
+    pid=$(sudo ss -H -lntp "sport = :$p" 2>/dev/null | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | head -1)
+    if [ -n "$pid" ]; then
+      sudo kill "$pid" 2>/dev/null && {
+        killed=$((killed + 1)); misses[$p]=0
+        log "killed wedged tunnel on :$p (pid $pid) after ${MISSES_BEFORE_KILL} misses"
+      }
+    else
+      log "tunnel :$p failing but nothing holds the port (remote supervisor down?)"
       misses[$p]=0
     fi
   done
-  [ "$killed" -gt 0 ] && log "rebuilt $killed tunnel(s)"
+  if [ "$killed" -gt 0 ]; then
+    last_kill=$now
+    log "rebuilt $killed tunnel(s)${deferred:+, deferred $deferred}"
+  elif [ "$deferred" -gt 0 ]; then
+    log "$deferred tunnel(s) past threshold, deferred (rate limit: max ${MAX_KILLS_PER_PASS}/pass, ${KILL_COOLDOWN}s apart)"
+  fi
 
   cycle=$((cycle + 1))
   if [ "$HEARTBEAT" -gt 0 ] && [ $((cycle % HEARTBEAT)) -eq 0 ]; then

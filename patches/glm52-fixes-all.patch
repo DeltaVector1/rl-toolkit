@@ -3249,10 +3249,10 @@ index 0000000..f4f7e70
 diff --git a/scripts/china/tunnel_watchdog.sh b/scripts/china/tunnel_watchdog.sh
 old mode 100644
 new mode 100755
-index fe501b4..89a6bd9
+index fe501b4..d35806f
 --- a/scripts/china/tunnel_watchdog.sh
 +++ b/scripts/china/tunnel_watchdog.sh
-@@ -1,45 +1,95 @@
+@@ -1,45 +1,144 @@
  #!/usr/bin/env bash
 -# Detect engine tunnels that are listening but not passing data, and kill them.
 +# Rebuild engine tunnels that are listening but not passing data. Runs on n82.
@@ -3299,6 +3299,23 @@ index fe501b4..89a6bd9
 +# only other liveness test, `pgrep -fc`, counts its own grep and can never
 +# return zero. A periodic line makes "still checking" observable.
 +HEARTBEAT=${HEARTBEAT:-5}
++# Rate limits. The /v1/models probe shares each tunnel with rollout traffic, so
++# a BUSY tunnel misses probes while working perfectly -- and it misses them on
++# every link at once, because the load arrives everywhere at once. Measured on
++# 2026-08-07 at 251 rollouts in flight: healthy-tunnel counts tracked the batch
++# phase (23/24 at the batch tail, 1/24 mid-batch) while both engines held 100%
++# GPU and ~500 tok/s. A 2-miss threshold with no cap then killed up to 9 live
++# tunnels in one pass, destroying every rollout in flight on them: 68 kills and
++# 139 rollout failures in one hour.
++#
++# A dead tunnel never recovers on its own, so a slow detection window costs
++# nothing. A live tunnel killed under load costs every rollout on it. Prefer
++# the slow window. This is the same conclusion scripts/network/watch_rollout_links.sh
++# reached (30 misses, one link per pass, 2 minutes apart); do not tighten these
++# while running large batches.
++MISSES_BEFORE_KILL=${MISSES_BEFORE_KILL:-6}
++MAX_KILLS_PER_PASS=${MAX_KILLS_PER_PASS:-2}
++KILL_COOLDOWN=${KILL_COOLDOWN:-120}
 +# Above this fraction of simultaneous failures, blame the backend, not the
 +# tunnels. 24 ports -> 20 failures trips it.
 +MASS_FAILURE_PCT=${MASS_FAILURE_PCT:-80}
@@ -3307,16 +3324,32 @@ index fe501b4..89a6bd9
 +for _p in $PORTS; do total=$((total + 1)); done
 +mass_streak=0
 +cycle=0
++last_kill=0
 +
 +log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
 +log "tunnel watchdog started (${total} ports, timeout=${TIMEOUT}s, interval=${INTERVAL}s)"
  
  while true; do
 -  killed=0
+-  for p in $PORTS; do
+-    code=$(curl -s -o /dev/null -m "$TIMEOUT" -w "%{http_code}" "http://127.0.0.1:$p/v1/models" 2>/dev/null)
++  # Probe every port at once. Serially this loop takes 24 x TIMEOUT in the bad
++  # case, so one cycle ran 2 to 7 minutes instead of the nominal interval and
++  # MISSES_BEFORE_KILL meant half an hour rather than a few minutes. Measured
++  # 2026-08-07: no log line at all for 10 minutes because the first heartbeat
++  # was still 4 cycles away.
++  results=$( for p in $PORTS; do
++      ( printf '%s %s\n' "$p" \
++          "$(curl -s -o /dev/null -m "$TIMEOUT" -w '%{http_code}' "http://127.0.0.1:$p/v1/models" 2>/dev/null)" ) &
++    done
++    wait )
++
 +  failed=""
 +  nfail=0
-   for p in $PORTS; do
-     code=$(curl -s -o /dev/null -m "$TIMEOUT" -w "%{http_code}" "http://127.0.0.1:$p/v1/models" 2>/dev/null)
++  # A here-string, not a pipe: a pipe puts the loop in a subshell and every
++  # update to the misses array is then discarded.
++  while read -r p code; do
++    [ -z "$p" ] && continue
      if [ "$code" = "200" ]; then
        misses[$p]=0
 -      continue
@@ -3324,7 +3357,7 @@ index fe501b4..89a6bd9
 +      nfail=$((nfail + 1))
 +      failed="$failed $p"
      fi
-+  done
++  done <<< "$(printf '%s\n' "$results" | sort -n)"
 +
 +  # ALWAYS rebuild. An earlier version refused when >=80% failed, on the theory
 +  # that mass failure meant a dead backend it could not fix. That was wrong and
@@ -3341,24 +3374,46 @@ index fe501b4..89a6bd9
 +    mass_streak=0
 +  fi
 +
++  now=$(date +%s)
++  cooling=0
++  [ $((now - last_kill)) -lt "$KILL_COOLDOWN" ] && cooling=1
++
 +  killed=0
++  deferred=0
 +  for p in $failed; do
      misses[$p]=$(( ${misses[$p]:-0} + 1 ))
-+    # Two consecutive misses: one slow reply under load must not trigger a rebuild.
-     if [ "${misses[$p]}" -ge 2 ]; then
-       pid=$(sudo ss -H -lntp "sport = :$p" 2>/dev/null | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | head -1)
-       if [ -n "$pid" ]; then
+-    if [ "${misses[$p]}" -ge 2 ]; then
+-      pid=$(sudo ss -H -lntp "sport = :$p" 2>/dev/null | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | head -1)
+-      if [ -n "$pid" ]; then
 -        sudo kill "$pid" 2>/dev/null && killed=$((killed+1))
 -        echo "$(date -u +%H:%M:%S) killed wedged tunnel on :$p (pid $pid, code=${code:-none})"
-+        sudo kill "$pid" 2>/dev/null && { killed=$((killed + 1)); log "killed wedged tunnel on :$p (pid $pid)"; }
-+      else
-+        log "tunnel :$p failing but nothing holds the port (remote supervisor down?)"
-       fi
+-      fi
++    # Not yet convinced this port is really dead rather than just busy.
++    [ "${misses[$p]}" -lt "$MISSES_BEFORE_KILL" ] && continue
++    # Past the threshold but rate limited. Do NOT reset the miss count here:
++    # the port stays a candidate and gets rebuilt on a later pass.
++    if [ "$cooling" -eq 1 ] || [ "$killed" -ge "$MAX_KILLS_PER_PASS" ]; then
++      deferred=$((deferred + 1))
++      continue
++    fi
++    pid=$(sudo ss -H -lntp "sport = :$p" 2>/dev/null | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | head -1)
++    if [ -n "$pid" ]; then
++      sudo kill "$pid" 2>/dev/null && {
++        killed=$((killed + 1)); misses[$p]=0
++        log "killed wedged tunnel on :$p (pid $pid) after ${MISSES_BEFORE_KILL} misses"
++      }
++    else
++      log "tunnel :$p failing but nothing holds the port (remote supervisor down?)"
        misses[$p]=0
      fi
    done
 -  [ "$killed" -gt 0 ] && echo "$(date -u +%H:%M:%S) rebuilt $killed tunnel(s)"
-+  [ "$killed" -gt 0 ] && log "rebuilt $killed tunnel(s)"
++  if [ "$killed" -gt 0 ]; then
++    last_kill=$now
++    log "rebuilt $killed tunnel(s)${deferred:+, deferred $deferred}"
++  elif [ "$deferred" -gt 0 ]; then
++    log "$deferred tunnel(s) past threshold, deferred (rate limit: max ${MAX_KILLS_PER_PASS}/pass, ${KILL_COOLDOWN}s apart)"
++  fi
 +
 +  cycle=$((cycle + 1))
 +  if [ "$HEARTBEAT" -gt 0 ] && [ $((cycle % HEARTBEAT)) -eq 0 ]; then
@@ -3498,10 +3553,10 @@ index 3e33102..8d73dfb 100755
      -R "127.0.0.1:$remote_port:127.0.0.1:$local_port" \
 diff --git a/scripts/ops/watchdog_smoketest.sh b/scripts/ops/watchdog_smoketest.sh
 new file mode 100755
-index 0000000..72ac4d6
+index 0000000..60e1485
 --- /dev/null
 +++ b/scripts/ops/watchdog_smoketest.sh
-@@ -0,0 +1,242 @@
+@@ -0,0 +1,262 @@
 +#!/usr/bin/env bash
 +# Drive the REAL watchdog scripts against a fake environment and assert on what
 +# they actually do. Nothing real is touched: curl, ss, kill, sudo, docker,
@@ -3606,6 +3661,7 @@ index 0000000..72ac4d6
 +  # ends each case by signalling the script under test, and the reporting shell
 +  # is this one, not the child.
 +  { PORTS="$*" TIMEOUT=1 INTERVAL=1 HEARTBEAT="${HEARTBEAT:-1}" MASS_FAILURE_PCT=80 \
++    MISSES_BEFORE_KILL="${MISSES:-2}" MAX_KILLS_PER_PASS="${CAP:-99}" KILL_COOLDOWN="${COOL:-0}" \
 +      timeout 30 bash "$TUNNEL_WD" > "$FIX/log" 2>&1; } 2>/dev/null
 +}
 +P24=$(seq 18001 18024 | tr '\n' ' ')
@@ -3619,21 +3675,8 @@ index 0000000..72ac4d6
 +
 +reset; echo 'respond() { [ "$2" = 18007 ] && echo 000 || echo 200; }' > "$FIX/respond.sh"
 +MAXCYCLES=2 run_tunnel $P24
-+check "1 wedged, 2 cycles -> exactly 1 kill"      "1"  "$(nkilled)"
++check "1 wedged, 2 misses -> exactly 1 kill"      "1"  "$(nkilled)"
 +contains "1 wedged -> names the port"             "$FIX/log" "killed wedged tunnel on :18007"
-+
-+# The regression that matters. An earlier rule refused to rebuild above 80%
-+# failure; at batch 1024 all 24 wedged with healthy engines and the run sat
-+# idle five hours. Mass failure must still rebuild.
-+reset; echo 'respond() { echo 000; }' > "$FIX/respond.sh"
-+MAXCYCLES=2 run_tunnel $P24
-+check "24 wedged -> rebuilds ALL of them"         "24" "$(nkilled)"
-+contains "24 wedged -> warns about the backend"   "$FIX/log" "check the engines too, but rebuilding regardless"
-+absent  "24 wedged -> does not refuse to act"     "$FIX/log" "not rebuilding"
-+
-+reset; echo 'respond() { case "$2" in 18001|18002) echo 200 ;; *) echo 000 ;; esac; }' > "$FIX/respond.sh"
-+MAXCYCLES=2 run_tunnel $P24
-+check "the 22-of-24 wedge -> 22 kills"            "22" "$(nkilled)"
 +
 +# Debounce: one slow reply under load must not cost a rebuild.
 +reset
@@ -3645,6 +3688,38 @@ index 0000000..72ac4d6
 +EOF
 +MAXCYCLES=3 run_tunnel $P24
 +check "1 miss then healthy -> no kill"            "0"  "$(nkilled)"
++
++# The miss threshold must actually hold the port back until it is reached.
++reset; echo 'respond() { [ "$2" = 18007 ] && echo 000 || echo 200; }' > "$FIX/respond.sh"
++MISSES=6 MAXCYCLES=3 run_tunnel $P24
++check "wedged 3 cycles, threshold 6 -> no kill"   "0"  "$(nkilled)"
++reset; echo 'respond() { [ "$2" = 18007 ] && echo 000 || echo 200; }' > "$FIX/respond.sh"
++MISSES=6 MAXCYCLES=7 run_tunnel $P24
++check "wedged 7 cycles, threshold 6 -> 1 kill"    "1"  "$(nkilled)"
++
++# Mass failure must still act -- an earlier rule refused to rebuild above 80%
++# failure and froze the run for five hours -- but it must NOT tear down every
++# tunnel at once. At 251 rollouts in flight the probe starves on live tunnels,
++# and killing them destroys every rollout they carry.
++reset; echo 'respond() { echo 000; }' > "$FIX/respond.sh"
++CAP=2 MAXCYCLES=2 run_tunnel $P24
++check "24 wedged -> acts, capped at 2 per pass"   "2"  "$(nkilled)"
++contains "24 wedged -> warns about the backend"   "$FIX/log" "check the engines too, but rebuilding regardless"
++absent  "24 wedged -> does not refuse to act"     "$FIX/log" "not rebuilding"
++contains "24 wedged -> reports what it deferred"  "$FIX/log" "deferred"
++
++# The cooldown must stop a second pass from firing immediately after the first.
++reset; echo 'respond() { echo 000; }' > "$FIX/respond.sh"
++CAP=2 COOL=999 MAXCYCLES=5 run_tunnel $P24
++check "cooldown holds later passes to 2 total"    "2"  "$(nkilled)"
++
++# A deferred port must stay a candidate. If the miss count were reset when the
++# rate limit skipped it, a wedged tunnel would never be rebuilt at all.
++reset; echo 'respond() { echo 000; }' > "$FIX/respond.sh"
++CAP=2 COOL=0 MAXCYCLES=4 run_tunnel $P24
++kills=$(nkilled)
++if [ "$kills" -ge 4 ]; then echo "  PASS  deferred ports stay candidates ($kills killed over 4 passes)"; pass=$((pass+1))
++else echo "  FAIL  deferred ports stay candidates (only $kills killed over 4 passes)"; fail=$((fail+1)); fi
 +
 +reset; echo 'respond() { [ "$2" = 18007 ] && echo 000 || echo 200; }' > "$FIX/respond.sh"
 +echo 18007 > "$FIX/unheld"

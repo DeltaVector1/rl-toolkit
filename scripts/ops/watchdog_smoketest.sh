@@ -102,6 +102,7 @@ run_tunnel() { # ports... ; needs $FIX/respond.sh and $MAXCYCLES
   # ends each case by signalling the script under test, and the reporting shell
   # is this one, not the child.
   { PORTS="$*" TIMEOUT=1 INTERVAL=1 HEARTBEAT="${HEARTBEAT:-1}" MASS_FAILURE_PCT=80 \
+    MISSES_BEFORE_KILL="${MISSES:-2}" MAX_KILLS_PER_PASS="${CAP:-99}" KILL_COOLDOWN="${COOL:-0}" \
       timeout 30 bash "$TUNNEL_WD" > "$FIX/log" 2>&1; } 2>/dev/null
 }
 P24=$(seq 18001 18024 | tr '\n' ' ')
@@ -115,21 +116,8 @@ contains "24 healthy -> heartbeat proves it ran"  "$FIX/log" "heartbeat: 24/24 t
 
 reset; echo 'respond() { [ "$2" = 18007 ] && echo 000 || echo 200; }' > "$FIX/respond.sh"
 MAXCYCLES=2 run_tunnel $P24
-check "1 wedged, 2 cycles -> exactly 1 kill"      "1"  "$(nkilled)"
+check "1 wedged, 2 misses -> exactly 1 kill"      "1"  "$(nkilled)"
 contains "1 wedged -> names the port"             "$FIX/log" "killed wedged tunnel on :18007"
-
-# The regression that matters. An earlier rule refused to rebuild above 80%
-# failure; at batch 1024 all 24 wedged with healthy engines and the run sat
-# idle five hours. Mass failure must still rebuild.
-reset; echo 'respond() { echo 000; }' > "$FIX/respond.sh"
-MAXCYCLES=2 run_tunnel $P24
-check "24 wedged -> rebuilds ALL of them"         "24" "$(nkilled)"
-contains "24 wedged -> warns about the backend"   "$FIX/log" "check the engines too, but rebuilding regardless"
-absent  "24 wedged -> does not refuse to act"     "$FIX/log" "not rebuilding"
-
-reset; echo 'respond() { case "$2" in 18001|18002) echo 200 ;; *) echo 000 ;; esac; }' > "$FIX/respond.sh"
-MAXCYCLES=2 run_tunnel $P24
-check "the 22-of-24 wedge -> 22 kills"            "22" "$(nkilled)"
 
 # Debounce: one slow reply under load must not cost a rebuild.
 reset
@@ -141,6 +129,38 @@ respond() {
 EOF
 MAXCYCLES=3 run_tunnel $P24
 check "1 miss then healthy -> no kill"            "0"  "$(nkilled)"
+
+# The miss threshold must actually hold the port back until it is reached.
+reset; echo 'respond() { [ "$2" = 18007 ] && echo 000 || echo 200; }' > "$FIX/respond.sh"
+MISSES=6 MAXCYCLES=3 run_tunnel $P24
+check "wedged 3 cycles, threshold 6 -> no kill"   "0"  "$(nkilled)"
+reset; echo 'respond() { [ "$2" = 18007 ] && echo 000 || echo 200; }' > "$FIX/respond.sh"
+MISSES=6 MAXCYCLES=7 run_tunnel $P24
+check "wedged 7 cycles, threshold 6 -> 1 kill"    "1"  "$(nkilled)"
+
+# Mass failure must still act -- an earlier rule refused to rebuild above 80%
+# failure and froze the run for five hours -- but it must NOT tear down every
+# tunnel at once. At 251 rollouts in flight the probe starves on live tunnels,
+# and killing them destroys every rollout they carry.
+reset; echo 'respond() { echo 000; }' > "$FIX/respond.sh"
+CAP=2 MAXCYCLES=2 run_tunnel $P24
+check "24 wedged -> acts, capped at 2 per pass"   "2"  "$(nkilled)"
+contains "24 wedged -> warns about the backend"   "$FIX/log" "check the engines too, but rebuilding regardless"
+absent  "24 wedged -> does not refuse to act"     "$FIX/log" "not rebuilding"
+contains "24 wedged -> reports what it deferred"  "$FIX/log" "deferred"
+
+# The cooldown must stop a second pass from firing immediately after the first.
+reset; echo 'respond() { echo 000; }' > "$FIX/respond.sh"
+CAP=2 COOL=999 MAXCYCLES=5 run_tunnel $P24
+check "cooldown holds later passes to 2 total"    "2"  "$(nkilled)"
+
+# A deferred port must stay a candidate. If the miss count were reset when the
+# rate limit skipped it, a wedged tunnel would never be rebuilt at all.
+reset; echo 'respond() { echo 000; }' > "$FIX/respond.sh"
+CAP=2 COOL=0 MAXCYCLES=4 run_tunnel $P24
+kills=$(nkilled)
+if [ "$kills" -ge 4 ]; then echo "  PASS  deferred ports stay candidates ($kills killed over 4 passes)"; pass=$((pass+1))
+else echo "  FAIL  deferred ports stay candidates (only $kills killed over 4 passes)"; fail=$((fail+1)); fi
 
 reset; echo 'respond() { [ "$2" = 18007 ] && echo 000 || echo 200; }' > "$FIX/respond.sh"
 echo 18007 > "$FIX/unheld"

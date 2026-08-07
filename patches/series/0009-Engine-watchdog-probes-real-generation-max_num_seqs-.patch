@@ -1,7 +1,7 @@
 From caeb6ca2c84764dfc18a43ddc3621f33a2d6d7bc Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Thu, 6 Aug 2026 06:11:56 +0000
-Subject: [PATCH 09/23] Engine watchdog probes real generation; max_num_seqs
+Subject: [PATCH 09/24] Engine watchdog probes real generation; max_num_seqs
  512 -> 128
 
 /v1/models is not a health signal. h200a 2026-08-06 06:05: models=200 with
