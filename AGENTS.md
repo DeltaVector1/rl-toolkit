@@ -107,17 +107,30 @@ Report the verdict.
 
 # The current run
 
-Run x24. Batch 1024, group size 16, 256 rollouts in flight, 16K context, bf16
-trainer weights, `pp=8`, `cp=8`, `ep=8` node-local, LoRA rank 32, Muon at 8e-6.
+Run x25, started 2026-08-07 17:04 UTC. Batch 1024, group size 16, 128 rollouts
+in flight, 48 tunnels, 16K context, bf16 trainer weights, `pp=8`, `cp=8`,
+`ep=8` node-local, LoRA rank 32, Muon at 8e-6.
 
-Measured on step 3: 31 minutes for the trainer step, 29 minutes for the rollout
-collection, 2645 tokens per second, 3.2 percent MFU, 46.5 GiB peak of 48.
+Two flags are new and they belong together. `enable_router_replay = false` in
+the trainer, and `enable_return_routed_experts = false` on the engines.
+`routed_experts` was 95.5 percent of every byte crossing the link. Turning it
+off cut a 64-token response from 71064 to 10372 bytes.
+
+This is a TEST. Read `masked_mismatch_kl/mean` at the first step. It sat at
+0.19 to 0.21 with replay on. If it rises to several nats, revert BOTH flags and
+restart the trainer and both engines. See `docs/HANDOFF.md`.
+
+The step time is set by rollout collection, not by the trainer. The trainer
+computes a step in 6 to 15 minutes and then idles. At 13 rollouts a minute a
+batch of 1024 takes about 79 minutes, and that is the step time. A 15 minute
+step needs 68 rollouts a minute.
 
 The success criterion is that the reward rises, or that the reward distribution
-rises. Nothing else counts. The target is a 15 minute step time.
+rises. Nothing else counts.
 
-The open question is whether batch 1024 gives a smaller step-to-step spread
-than the 0.039 that run x22 gave at batch 256. That needs 10 to 15 clean steps.
+Run x24 gave 10 steps and the verdict was "inside the noise": the trend was
++0.0011 against a residual spread of 0.0178. The step-to-step spread was 0.0178
+against 0.0390 for x22 at batch 256, so batch 1024 does halve the noise.
 
 # Where the rest is
 

@@ -2445,6 +2445,22 @@ index 0000000..0ecb1c5
 +keep_last = 2
 +keep_interval = 100
 +output_dir = "/data/glm52-rl/runs/x25/run_x25"
+diff --git a/configs/h200/inference.toml b/configs/h200/inference.toml
+index e72de4e..305e4e8 100644
+--- a/configs/h200/inference.toml
++++ b/configs/h200/inference.toml
+@@ -12,7 +12,10 @@ gpu_memory_utilization = 0.92
+ enable_prefix_caching = true
+ enable_expert_parallel = true
+ enable_eplb = false
+-enable_return_routed_experts = true
++# The trainer discards routed_experts when enable_router_replay=false
++# (train.py:571), yet it was still 95.5% of every response on the wire:
++# 711 bytes for each generated token, 2.79 MB for each rollout.
++enable_return_routed_experts = false
+ api_server_count = 1
+ 
+ [server]
 diff --git a/configs/h200/orchestrator.x13h.toml b/configs/h200/orchestrator.x13h.toml
 new file mode 100644
 index 0000000..b63013a

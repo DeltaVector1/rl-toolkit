@@ -1,7 +1,7 @@
 From ee731856283b04cac52f7620b62f47dc2194a234 Mon Sep 17 00:00:00 2001
 From: DeltaVector1 <DeltaVector1@users.noreply.github.com>
 Date: Fri, 7 Aug 2026 16:52:40 +0000
-Subject: [PATCH 34/35] Find why the link cannot carry more: 95% of it is
+Subject: [PATCH 34/36] Find why the link cannot carry more: 95% of it is
  expert routing
 
 Measured one /inference/v1/generate response. routed_experts is 95.5% of the

@@ -246,6 +246,69 @@ KB/s without compression. It gives 4.9 MB/s with compression.
 A mount for `norms.py` is added. That file had no mount. The container used
 the copy in the image.
 
+# inference.toml: enable_return_routed_experts = false
+
+`routed_experts` was 95.5 percent of every byte the engines sent: 711 bytes for
+each generated token, 2.79 MB for each rollout, across a link measured at 7.5
+percent packet loss. The tokens and their logprobs were under 5 percent.
+
+It is already encoded as tightly as it can be. `dtype` is `uint8`, exactly one
+byte an element, and it gzips only 1.4 times because it is already binary. Its
+shape is `[positions, 78 MoE layers, 8 experts]`, so each token costs 624
+expert indices. There is no encoding win left in it. The only choice is whether
+to send it.
+
+`enable_router_replay = false` in the trainer is what makes it unnecessary.
+With replay off the trainer discards `routed_experts` on arrival, at
+`train.py` line 571, so leaving the engine flag on burned 95 percent of the
+link on data that went straight to the bin.
+
+Measured on h200a after the change: the same 64-token response fell from 71064
+to 10372 bytes.
+
+Both flags must move together. Reverting one alone either breaks the trainer
+("You must set enable_return_routed_experts=True") or wastes the bandwidth
+again.
+
+# scripts/network/tune_wan.sh
+
+New. Tunes the TCP stack for the China to H200 path. Run it on n82 and on both
+engine hosts.
+
+On both ends it sets `tcp_slow_start_after_idle=0`, `tcp_mtu_probing=1`, and a
+32 MB buffer ceiling. Rollout connections idle between requests and were
+restarting in slow start on a 210 millisecond link.
+
+On n82 it loads `tcp_bbr` and applies it PER ROUTE, only for the two engine
+hosts. Do not set it globally. n82 is a trainer node and the NCCL all-to-all
+crosses the same interface, where cubic measured 87 percent wire efficiency
+against BBR's 36 percent.
+
+BBR is not applied on the engine hosts. They are Docker containers with no
+`CAP_SYS_MODULE`, and the underlying host has not loaded the module. The bulk
+data travels from the engines to n82, so their congestion control is the one
+that would matter most.
+
+# ckpt: interval 25 -> 5, weights_only true -> false
+
+A trainer restart at step 10 lost every step. No checkpoint had ever been
+written, because the interval was 25, and `weights_only = true` cannot resume
+training even when a checkpoint exists.
+
+# scripts/ops/sweep_inflight.sh
+
+New. Measures the rollout collection rate at one `max_inflight_rollouts` value.
+
+It warms up until 64 rollouts are accepted rather than for a fixed time. A
+restarted orchestrator starts at zero, rollouts take minutes, and acceptance is
+group-granular, so a fixed 180 second warmup opened the window at accepted=0
+and read 4.57 a minute where the steady rate was 14.
+
+`SKIP_RESTART=1` measures the running value without paying for a restart.
+
+Treat its output with care. Two windows at the same setting gave 23.18 and 8.10
+a minute. Prefer the orchestrator's own per-batch cycle time.
+
 # THE CONFIGURATION VALUES THAT MATTER
 
 `ac_offloading = "None"`. Do not remove this line. The default is not `None`.

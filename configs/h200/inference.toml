@@ -12,7 +12,10 @@ gpu_memory_utilization = 0.92
 enable_prefix_caching = true
 enable_expert_parallel = true
 enable_eplb = false
-enable_return_routed_experts = true
+# The trainer discards routed_experts when enable_router_replay=false
+# (train.py:571), yet it was still 95.5% of every response on the wire:
+# 711 bytes for each generated token, 2.79 MB for each rollout.
+enable_return_routed_experts = false
 api_server_count = 1
 
 [server]

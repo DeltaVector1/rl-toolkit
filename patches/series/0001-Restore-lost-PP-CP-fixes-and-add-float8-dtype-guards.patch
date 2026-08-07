@@ -1,7 +1,7 @@
 From 34003e8b6a4772ec50db5525ccd8017bddca7816 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 5 Aug 2026 20:52:55 +0000
-Subject: [PATCH 01/35] Restore lost PP+CP fixes and add float8 dtype guards
+Subject: [PATCH 01/36] Restore lost PP+CP fixes and add float8 dtype guards
 
 Recovered sparse_mla_attention.py and modeling_glm_moe_dsa.py from the
 2026-08-02 snapshot after they were overwritten with the Docker image's

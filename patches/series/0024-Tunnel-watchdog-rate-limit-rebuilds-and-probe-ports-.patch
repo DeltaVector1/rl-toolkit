@@ -1,7 +1,7 @@
 From 3eaeab25b0696062e3e2eae3e8d8338f44dd6219 Mon Sep 17 00:00:00 2001
 From: DeltaVector1 <DeltaVector1@users.noreply.github.com>
 Date: Fri, 7 Aug 2026 06:57:15 +0000
-Subject: [PATCH 24/35] Tunnel watchdog: rate-limit rebuilds and probe ports in
+Subject: [PATCH 24/36] Tunnel watchdog: rate-limit rebuilds and probe ports in
  parallel
 
 The /v1/models probe shares each tunnel with rollout traffic, so a BUSY tunnel

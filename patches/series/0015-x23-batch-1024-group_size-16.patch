@@ -1,7 +1,7 @@
 From f0eb397106b9470e176b2418b97eec1aa8a490fe Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Thu, 6 Aug 2026 23:57:30 +0000
-Subject: [PATCH 15/35] x23: batch 1024, group_size 16
+Subject: [PATCH 15/36] x23: batch 1024, group_size 16
 
 1024/16 = 64 GRPO groups per step, against 32 at the previous 256/8. Larger
 groups also tighten the within-group advantage estimate, which is where the

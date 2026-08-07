@@ -1,7 +1,7 @@
 From bb7a61a21a67f05d9fe57a35f0bd323e22ce7214 Mon Sep 17 00:00:00 2001
 From: DeltaVector1 <DeltaVector1@users.noreply.github.com>
 Date: Fri, 7 Aug 2026 14:08:13 +0000
-Subject: [PATCH 32/35] Set max_inflight_rollouts to 192; the two knobs
+Subject: [PATCH 32/36] Set max_inflight_rollouts to 192; the two knobs
  interact
 
 192 in flight measured 14.1/min on 24 tunnels and 23.2/min on 48, while 128 in

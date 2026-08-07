@@ -1,7 +1,7 @@
 From 349b39317dfc48d9c13a5f8cfa21a147cbba84b0 Mon Sep 17 00:00:00 2001
 From: DeltaVector1 <DeltaVector1@users.noreply.github.com>
 Date: Fri, 7 Aug 2026 15:04:11 +0000
-Subject: [PATCH 33/35] Settle on 128 in flight; 192 buys nothing and costs
+Subject: [PATCH 33/36] Settle on 128 in flight; 192 buys nothing and costs
  five times the errors
 
 Full-batch cycle times, which is the metric that sets the step time:
