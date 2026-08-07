@@ -1,7 +1,7 @@
 From affcd42cdeeb33eb53eb8f34e96e28b1831db81e Mon Sep 17 00:00:00 2001
 From: DeltaVector1 <DeltaVector1@users.noreply.github.com>
 Date: Fri, 7 Aug 2026 04:28:33 +0000
-Subject: [PATCH 23/32] glm52-ops: print usage instead of raising on --help
+Subject: [PATCH 23/33] glm52-ops: print usage instead of raising on --help
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_017wiESxhziDrnsLnG9aizTd

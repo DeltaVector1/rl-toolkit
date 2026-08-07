@@ -3,7 +3,7 @@ max_steps = 200
 seq_len = 16384
 batch_size = 1024
 group_size = 16
-max_inflight_rollouts = 192
+max_inflight_rollouts = 128
 # 4, not 2: batches go out over ZMQ fire-and-forget, so a trainer restart
 # loses whatever was in flight. With a tight cap the orchestrator then holds
 # for a policy the restarted trainer cannot publish and both sides wait

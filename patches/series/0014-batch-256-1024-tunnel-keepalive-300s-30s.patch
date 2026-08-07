@@ -1,7 +1,7 @@
 From 4fb7dbc353bf02d1af53bcae84c15d43b3c19af9 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Thu, 6 Aug 2026 23:55:31 +0000
-Subject: [PATCH 14/32] batch 256 -> 1024; tunnel keepalive 300s -> 30s
+Subject: [PATCH 14/33] batch 256 -> 1024; tunnel keepalive 300s -> 30s
 
 At batch 256 with group_size 8 there are only 32 GRPO groups per step. Over 36
 steps reward std was 0.039 against a linear trend of +0.013 total -- the

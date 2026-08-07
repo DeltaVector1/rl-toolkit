@@ -1,7 +1,7 @@
 From aa066af067f4b8495a5a04907ed124811b877f72 Mon Sep 17 00:00:00 2001
 From: DeltaVector1 <DeltaVector1@users.noreply.github.com>
 Date: Fri, 7 Aug 2026 13:08:22 +0000
-Subject: [PATCH 31/32] Double the rollout tunnels to 48; add the in-flight
+Subject: [PATCH 31/33] Double the rollout tunnels to 48; add the in-flight
  sweep harness
 
 max_inflight_rollouts is not the lever. Measured two windows at each value,

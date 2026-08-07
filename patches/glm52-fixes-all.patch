@@ -387,7 +387,7 @@ index 0000000..cb528c6
 +keep_interval = 100
 diff --git a/configs/china/orchestrator.x24.toml b/configs/china/orchestrator.x24.toml
 new file mode 100644
-index 0000000..d87154a
+index 0000000..7760116
 --- /dev/null
 +++ b/configs/china/orchestrator.x24.toml
 @@ -0,0 +1,147 @@
@@ -396,7 +396,7 @@ index 0000000..d87154a
 +seq_len = 16384
 +batch_size = 1024
 +group_size = 16
-+max_inflight_rollouts = 192
++max_inflight_rollouts = 128
 +# 4, not 2: batches go out over ZMQ fire-and-forget, so a trainer restart
 +# loses whatever was in flight. With a tight cap the orchestrator then holds
 +# for a policy the restarted trainer cannot publish and both sides wait
