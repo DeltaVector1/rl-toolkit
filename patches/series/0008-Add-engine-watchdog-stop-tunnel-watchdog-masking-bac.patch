@@ -1,0 +1,690 @@
+From 0b05c1076b8d772d5855ee32caf6e2530c6bbcb7 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 6 Aug 2026 04:38:53 +0000
+Subject: [PATCH 08/17] Add engine watchdog; stop tunnel watchdog masking
+ backend death
+
+On 2026-08-06 03:13:30 both vLLM engines died with a sample_tokens RPC
+timeout, preceded by "no available shared memory broadcast block", with 63
+requests in flight. EngineCore raised EngineDeadError and the API server shut
+down, but docker still reported the container Up with the GPUs at 4 MiB. The
+run then sat stalled for 2.6 hours.
+
+The tunnel watchdog could not see this and made it worse: a dead engine and a
+wedged tunnel are indistinguishable from n82 because the SSH forward accepts
+the connection either way, so it spent those hours rebuilding all 24 tunnels
+against a dead backend, hiding the fault.
+
+scripts/h200/engine_watchdog.sh runs on each H200 and probes its own engine on
+localhost, restarting the container after 2 misses and allowing up to 20 min
+for the checkpoint to load. Container "Up" is deliberately not the health
+signal; only HTTP 200 is, since the container stayed Up throughout.
+
+scripts/china/tunnel_watchdog.sh now refuses to rebuild when 80% or more of
+the tunnels fail at once, logging that the backend is the likely cause. n82
+has no ssh access to the H200s so it cannot fix engines, but it must not mask
+them.
+
+scripts/ops/watchdog_smoketest.sh covers 16 cases: healthy, single wedge,
+46/79/83/100% failure, both real outages, debounce, container-Up-but-dead.
+Verified live: both engines were dead and the watchdog recovered them.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017wiESxhziDrnsLnG9aizTd
+---
+ configs/china/orchestrator.x21.toml | 123 ++++++++++++++++++++++++++
+ configs/china/trainer.x21.toml      | 132 ++++++++++++++++++++++++++++
+ configs/h200/orchestrator.x21h.toml | 111 +++++++++++++++++++++++
+ scripts/china/tunnel_watchdog.sh    |  75 ++++++++++++----
+ scripts/h200/engine_watchdog.sh     |  57 ++++++++++++
+ scripts/h200/start_orchestrator.sh  |   2 +-
+ scripts/ops/watchdog_smoketest.sh   |  64 ++++++++++++++
+ 7 files changed, 544 insertions(+), 20 deletions(-)
+ create mode 100644 configs/china/orchestrator.x21.toml
+ create mode 100644 configs/china/trainer.x21.toml
+ create mode 100644 configs/h200/orchestrator.x21h.toml
+ mode change 100644 => 100755 scripts/china/tunnel_watchdog.sh
+ create mode 100755 scripts/h200/engine_watchdog.sh
+ create mode 100755 scripts/ops/watchdog_smoketest.sh
+
+diff --git a/configs/china/orchestrator.x21.toml b/configs/china/orchestrator.x21.toml
+new file mode 100644
+index 0000000..64b15c5
+--- /dev/null
++++ b/configs/china/orchestrator.x21.toml
+@@ -0,0 +1,123 @@
++output_dir = "/data/glm52-rl/runs/x21/run_x21"
++max_steps = 200
++seq_len = 16384
++batch_size = 256
++group_size = 8
++max_inflight_rollouts = 256
++# 4, not 2: batches go out over ZMQ fire-and-forget, so a trainer restart
++# loses whatever was in flight. With a tight cap the orchestrator then holds
++# for a policy the restarted trainer cannot publish and both sides wait
++# forever with the engines idle. Headroom lets it re-supply the trainer.
++max_off_policy_steps = 4
++pool_size = 4
++
++[log]
++level = "info"
++
++[swanlab]
++project = "prod-run"
++name = "orchestrator-x21"
++group = "glm52-decensor-r32"
++tags = ["glm-5.2", "decensor", "grpo", "w8a16-rollouts", "bf16-base-trainer", "lora-r32", "16xh200-rollouts", "56x4090-trainer", "local-gemma", "b1024", "4096", "cp8", "router-replay", "sparse-ada", "norm-adv", "expert-ac"]
++
++[file_monitor]
++filename = "rollout-metrics.jsonl"
++
++[model]
++name = "/data/glm52-rl/model-fp8"
++
++[model.lora]
++name = "glm52-decensor-r32-node-local"
++rank = 32
++alpha = 64
++
++[model.client]
++base_url = [
++    "http://127.0.0.1:18001/v1",
++    "http://127.0.0.1:18002/v1",
++    "http://127.0.0.1:18003/v1",
++    "http://127.0.0.1:18004/v1",
++    "http://127.0.0.1:18005/v1",
++    "http://127.0.0.1:18006/v1",
++    "http://127.0.0.1:18007/v1",
++    "http://127.0.0.1:18008/v1",
++    "http://127.0.0.1:18009/v1",
++    "http://127.0.0.1:18010/v1",
++    "http://127.0.0.1:18011/v1",
++    "http://127.0.0.1:18012/v1",
++    "http://127.0.0.1:18013/v1",
++    "http://127.0.0.1:18014/v1",
++    "http://127.0.0.1:18015/v1",
++    "http://127.0.0.1:18016/v1",
++    "http://127.0.0.1:18017/v1",
++    "http://127.0.0.1:18018/v1",
++    "http://127.0.0.1:18019/v1",
++    "http://127.0.0.1:18020/v1",
++    "http://127.0.0.1:18021/v1",
++    "http://127.0.0.1:18022/v1",
++    "http://127.0.0.1:18023/v1",
++    "http://127.0.0.1:18024/v1",
++]
++admin_base_url = [
++    "http://127.0.0.1:18001/v1",
++    "http://127.0.0.1:18002/v1",
++]
++wait_for_ready_timeout = 7200
++skip_model_check = true
++
++[optim]
++lr = 8e-6
++
++[renderer]
++name = "default"
++tool_parser = "glm"
++reasoning_parser = "think"
++enable_thinking = true
++clear_thinking = true
++
++[train.sampling]
++temperature = 1.0
++max_completion_tokens = 16384
++extra_body = { min_tokens = 16 }
++
++[[train.env]]
++name = "decensor"
++ratio = 1.0
++pool = { type = "static", num_workers = 16 }
++env.taskset.id = "decensor-v1"
++env.taskset.dataset_name = "/data/glm52-rl/decensor-data/rl.jsonl"
++env.taskset.num_examples = 2000
++env.agent.harness = { id = "null", runtime = { type = "subprocess" } }
++env.agent.max_output_tokens = 16384
++env.agent.timeout.rollout = 3600
++
++[train.env.sampling]
++max_completion_tokens = 16384
++
++[train.env.env.taskset.task.judge]
++base_url = "http://127.0.0.1:26406/v1"
++model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
++api_key_var = "VLLM_API_KEY"
++
++[train.env.env.taskset.task.user]
++base_url = "http://127.0.0.1:26406/v1"
++model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
++api_key_var = "VLLM_API_KEY"
++
++[weight_broadcast]
++type = "filesystem"
++source_url = "http://127.0.0.1:8100/x21"
++source_dir = "/data/glm52-rl/runs/x21"
++
++[rollout_transport]
++type = "zmq"
++host = "10.92.20.82"
++port = 29620
++hwm = 16
++
++[ckpt]
++interval = 25
++resume_step = -1
++skip_progress = true
++keep_last = 2
++keep_interval = 100
+diff --git a/configs/china/trainer.x21.toml b/configs/china/trainer.x21.toml
+new file mode 100644
+index 0000000..8cb9420
+--- /dev/null
++++ b/configs/china/trainer.x21.toml
+@@ -0,0 +1,132 @@
++output_dir = "/data/glm52-rl/runs/x21"
++max_steps = 200
++# 5400, not 1800: at 16K the phantom-shmem pressure pushes nodes into
++# transient swap thrash; collectives stall 20-40 min and RECOVER (observed
++# blackouts lifting on their own). 1800s converts a recoverable stall into
++# a watchdog kill -- three attempts died exactly this way.
++dist_timeout_seconds = 5400
++enable_router_replay = true
++
++[log]
++level = "debug"
++ranks_filter = [0]
++
++[swanlab]
++project = "prod-run"
++name = "trainer-x21"
++group = "glm52-decensor-r32"
++tags = ["glm-5.2", "pp7", "decensor", "grpo", "bf16-base", "lora-r32", "56x4090", "b1024", "4096", "cp8", "router-replay", "sparse-ada", "norm-adv", "expert-ac"]
++
++[file_monitor]
++filename = "run_x21/trainer-metrics.jsonl"
++
++[model]
++name = "/data/glm52-rl/model-fp8"
++impl = "custom"
++seq_len = 16384
++attn = "flash_attention_2"
++cp = 8
++pp = 8
++cp_style = "ring"
++ep = 8
++global_ep = false
++dp_replicate = 1
++ep_comm_backend = "torch"
++fsdp_cpu_offload = false
++cold_cpu_offload = false
++optim_cpu_offload = false
++reshard_after_forward = true
++optimization_dtype = "bfloat16"
++reduce_dtype = "bfloat16"
++moe_router_dtype = "float32"
++moe_use_grouped_mm = true
++fused_lm_head_token_chunk_size = 1024
++fp8_embed_head = false
++fp8_lm_head = false
++compile = "None"
++# ac_offloading DEFAULTS TO ENABLED (trainer.py:173 is
++# `ActivationOffloadingConfig()`, not None), and nothing here ever turned it
++# off. It stashes activations in PINNED HOST memory, which is what the
++# [model.ac] note below already warned about: "pinned stashes for 7 in-flight
++# micro-batches x 8 ranks exceeded the 503 GB host RAM and the kernel
++# OOM-killed the trainer on n82". Measured on x18: 60 GB of /dev/zero per rank
++# against 17 GB on the GPU -- 3.5:1, and it tracks micro-batches in flight
++# rather than device memory, which is why FP8 and expandable_segments both
++# failed to move it. 8 ranks x 60 GB = 480 GB on a 503 GB node.
++ac_offloading = "None"
++
++[model.quantization]
++type = "fp8"
++# false is REQUIRED here, not an optimization. Device memory is mirrored 1:1
++# into a MAP_SHARED /dev/zero region per rank (confirmed by smaps: 29.51 GB of
++# /dev/zero against 29110 MiB on the GPU, x8 ranks = the node's 237 GB
++# 'shared'). At 16K the GPUs peak near 60 GB, the mirror reaches ~486 GB and
++# the 503 GB node dies. bf16 weights cost 29 GB/GPU, fp8 cost 15, which halves
++# the mirror. The norms.py override fixes the float8 promotion crash that
++# blocked this before.
++# (was: true costs ~14 GB/GPU because apply_quantization
++# returns early at model.py:1256 so no FP8 kernels run despite type = "fp8").
++# false is the memory-correct setting and loads fine, but dies in the first
++# forward: an FP8 linear emits float8_e4m3fn into the residual stream and
++# RMSNorm.forward (norms.py:44, `self.weight * hidden_states.to(input_dtype)`)
++# raises "Promotion for Float8 Types is not supported, attempted to promote
++# BFloat16 and Float8_e4m3fn". Framework bug in the native-FP8 path for
++# glm_moe_dsa; revisit with a norms/linear dtype fix before flipping again.
++dequantize_checkpoint = true
++
++[model.lora]
++rank = 32
++alpha = 64
++dropout = 0.0
++target_modules = [
++    "q_a_proj",
++    "q_b_proj",
++    "kv_a_proj_with_mqa",
++    "o_proj",
++]
++
++[model.ac]
++# Selective, NOT full: full recompute trips
++# "CheckpointError: Recomputed values ... have different metadata" on this
++# MoE+EP stack, because recompute does not reproduce the per-expert token
++# counts the original forward saw. Memory headroom comes from cp=8 instead.
++mode = "selective"
++freq = 1
++# "norm" checkpoints the two per-layer norms: ~600 MB of activations per
++# 12-layer stage at 16K, vs an x1 OOM shortfall of 242 MiB. CPU offloading
++# is out: pinned stashes for 7 in-flight micro-batches x 8 ranks exceeded
++# the 503 GB host RAM and the kernel OOM-killed the trainer on n82.
++# "mlp" is NOT included: only the 3 dense layers support it, and stages
++# without them reject the target at startup.
++# Every supported target except dense-only "mlp": on this driver the kernel
++# charges DEVICE memory as process shmem, so 8 x GPU_used + real host RAM
++# must stay under 503GB. Checkpointing the attention internals cuts both
++# the direct GPU peak and its 8x host shadow.
++targets = ["attention", "attn_proj", "mla_up_proj", "routed_experts", "norm"]
++
++[optim]
++type = "muon"
++lr = 8e-6
++weight_decay = 0.0
++max_norm = 1.0
++
++[scheduler]
++type = "constant"
++
++[weight_broadcast]
++type = "filesystem"
++save_format = "safetensors"
++
++[rollout_transport]
++type = "zmq"
++host = "10.92.20.82"
++port = 29620
++hwm = 16
++
++[ckpt]
++interval = 25
++weights_only = true
++skip_gather_master_weights = true
++keep_last = 2
++keep_interval = 100
++output_dir = "/data/glm52-rl/runs/x21/run_x21"
+diff --git a/configs/h200/orchestrator.x21h.toml b/configs/h200/orchestrator.x21h.toml
+new file mode 100644
+index 0000000..d7ad877
+--- /dev/null
++++ b/configs/h200/orchestrator.x21h.toml
+@@ -0,0 +1,111 @@
++output_dir = "/data/glm52-rl/runs/x21/run_x21"
++max_steps = 200
++seq_len = 16384
++batch_size = 256
++group_size = 8
++max_inflight_rollouts = 256
++# 4, not 2: batches go out over ZMQ fire-and-forget, so a trainer restart
++# loses whatever was in flight. With a tight cap the orchestrator then holds
++# for a policy the restarted trainer cannot publish and both sides wait
++# forever with the engines idle. Headroom lets it re-supply the trainer.
++max_off_policy_steps = 4
++pool_size = 4
++
++[log]
++level = "info"
++
++[swanlab]
++project = "prod-run"
++name = "orchestrator-x21"
++group = "glm52-decensor-r32"
++tags = ["glm-5.2", "decensor", "grpo", "w8a16-rollouts", "bf16-base-trainer", "lora-r32", "16xh200-rollouts", "56x4090-trainer", "local-gemma", "b1024", "4096", "cp8", "router-replay", "sparse-ada", "norm-adv", "expert-ac"]
++
++[file_monitor]
++filename = "rollout-metrics.jsonl"
++
++[model]
++name = "/data/glm52-rl/model-fp8"
++
++[model.lora]
++name = "glm52-decensor-r32-node-local"
++rank = 32
++alpha = 64
++
++[model.client]
++base_url = [
++    "http://127.0.0.1:8000/v1",
++    "http://127.0.0.1:8000/v1",
++    "http://127.0.0.1:8000/v1",
++    "http://127.0.0.1:8000/v1",
++    "http://127.0.0.1:8000/v1",
++    "http://127.0.0.1:8000/v1",
++    "http://127.0.0.1:18101/v1",
++    "http://127.0.0.1:18101/v1",
++    "http://127.0.0.1:18101/v1",
++    "http://127.0.0.1:18101/v1",
++    "http://127.0.0.1:18101/v1",
++    "http://127.0.0.1:18101/v1",
++]
++admin_base_url = [
++    "http://127.0.0.1:8000/v1",
++    "http://127.0.0.1:18101/v1",
++]
++wait_for_ready_timeout = 7200
++skip_model_check = true
++
++[optim]
++lr = 8e-6
++
++[renderer]
++name = "default"
++tool_parser = "glm"
++reasoning_parser = "think"
++enable_thinking = true
++clear_thinking = true
++
++[train.sampling]
++temperature = 1.0
++max_completion_tokens = 16384
++extra_body = { min_tokens = 16 }
++
++[[train.env]]
++name = "decensor"
++ratio = 1.0
++pool = { type = "static", num_workers = 16 }
++env.taskset.id = "decensor-v1"
++env.taskset.dataset_name = "/data/glm52-rl/decensor-data/rl.jsonl"
++env.taskset.num_examples = 2000
++env.agent.harness = { id = "null", runtime = { type = "subprocess" } }
++env.agent.max_output_tokens = 16384
++env.agent.timeout.rollout = 3600
++
++[train.env.sampling]
++max_completion_tokens = 16384
++
++[train.env.env.taskset.task.judge]
++base_url = "http://202.214.223.66:26406/v1"
++model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
++api_key_var = "VLLM_API_KEY"
++
++[train.env.env.taskset.task.user]
++base_url = "http://202.214.223.66:26406/v1"
++model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
++api_key_var = "VLLM_API_KEY"
++
++[weight_broadcast]
++type = "filesystem"
++source_url = "http://127.0.0.1:18100/x21"
++source_dir = "/data/glm52-rl/runs/x21"
++
++[rollout_transport]
++type = "zmq"
++host = "127.0.0.1"
++port = 29620
++hwm = 16
++
++[ckpt]
++interval = 25
++resume_step = -1
++skip_progress = true
++keep_last = 2
++keep_interval = 100
+diff --git a/scripts/china/tunnel_watchdog.sh b/scripts/china/tunnel_watchdog.sh
+old mode 100644
+new mode 100755
+index fe501b4..5faa342
+--- a/scripts/china/tunnel_watchdog.sh
++++ b/scripts/china/tunnel_watchdog.sh
+@@ -1,45 +1,82 @@
+ #!/usr/bin/env bash
+-# Detect engine tunnels that are listening but not passing data, and kill them.
++# Rebuild engine tunnels that are listening but not passing data. Runs on n82.
+ #
+-# The H200-side supervisor (scripts/h200/start_tunnel.sh) only rebuilds a tunnel
+-# when its ssh process EXITS. Over the lossy China<->H200 path (10-33% packet
+-# loss measured) a tunnel routinely wedges with the forward still established:
+-# the port on n82 accepts connections and then never answers. With
+-# ServerAliveCountMax=20 x Interval=15 that state persists for 300s, and wedged
+-# tunnels accumulate -- observed 22 of 24 dead, with h200a taking zero traffic
+-# while h200b carried the whole run.
++# The H200-side supervisor (scripts/h200/start_tunnel.sh) only rebuilds a
++# tunnel when its ssh process EXITS. Over the lossy China<->H200 path (10-33%
++# packet loss measured) a tunnel routinely wedges with the forward still
++# established: the port accepts connections and then never answers. With
++# ServerAliveCountMax=20 x Interval=15 that persists for 300s, and wedged
++# tunnels accumulate -- observed 22 of 24 dead while h200a took zero traffic.
+ #
+ # Killing the n82-side sshd that holds the port makes the remote ssh exit, so
+-# the existing supervisor loop rebuilds it within ~5s. Nothing to change on the
+-# H200 hosts.
++# the existing supervisor rebuilds it within ~5s.
+ #
+-# Two consecutive failures are required before killing: a single slow reply
+-# under load is normal and must not trigger a rebuild.
++# CRITICAL: a dead ENGINE looks exactly like a wedged tunnel from here -- the
++# SSH forward still accepts the connection either way. On 2026-08-06 both vLLM
++# engines died (EngineCore RPC timeout) and this script spent 2.6 hours
++# cheerfully rebuilding all 24 tunnels against a dead backend while the run
++# sat stalled. n82 has no ssh access to the H200s, so it cannot check or fix
++# the engines directly; scripts/h200/engine_watchdog.sh does that locally.
++# What this script must do is NOT mask the problem: when nearly every tunnel
++# is failing at once the cause is almost certainly upstream, so it stops
++# churning and says so loudly instead.
+ set -uo pipefail
+ 
+ PORTS=${PORTS:-$(seq 18001 18024)}
+-TIMEOUT=${TIMEOUT:-10}
+-INTERVAL=${INTERVAL:-45}
++TIMEOUT=${TIMEOUT:-20}
++INTERVAL=${INTERVAL:-60}
++# Above this fraction of simultaneous failures, blame the backend, not the
++# tunnels. 24 ports -> 20 failures trips it.
++MASS_FAILURE_PCT=${MASS_FAILURE_PCT:-80}
+ declare -A misses
++total=0
++for _p in $PORTS; do total=$((total + 1)); done
++mass_streak=0
++
++log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
++log "tunnel watchdog started (${total} ports, timeout=${TIMEOUT}s, interval=${INTERVAL}s)"
+ 
+ while true; do
+-  killed=0
++  failed=""
++  nfail=0
+   for p in $PORTS; do
+     code=$(curl -s -o /dev/null -m "$TIMEOUT" -w "%{http_code}" "http://127.0.0.1:$p/v1/models" 2>/dev/null)
+     if [ "$code" = "200" ]; then
+       misses[$p]=0
+-      continue
++    else
++      nfail=$((nfail + 1))
++      failed="$failed $p"
+     fi
++  done
++
++  if [ "$total" -gt 0 ] && [ $((nfail * 100 / total)) -ge "$MASS_FAILURE_PCT" ]; then
++    # Do not touch the tunnels: rebuilding them cannot fix a dead engine, and
++    # the churn hides the real fault.
++    mass_streak=$((mass_streak + 1))
++    if [ $((mass_streak % 5)) -eq 1 ]; then
++      log "*** $nfail/$total tunnels failing — BACKEND LIKELY DOWN, not the tunnels."
++      log "*** Not rebuilding. Check the vLLM engines on h200a/h200b (engine_watchdog.sh should be restarting them)."
++    fi
++    sleep "$INTERVAL"
++    continue
++  fi
++  [ "$mass_streak" -gt 0 ] && log "mass failure cleared ($nfail/$total failing)"
++  mass_streak=0
++
++  killed=0
++  for p in $failed; do
+     misses[$p]=$(( ${misses[$p]:-0} + 1 ))
++    # Two consecutive misses: one slow reply under load must not trigger a rebuild.
+     if [ "${misses[$p]}" -ge 2 ]; then
+       pid=$(sudo ss -H -lntp "sport = :$p" 2>/dev/null | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | head -1)
+       if [ -n "$pid" ]; then
+-        sudo kill "$pid" 2>/dev/null && killed=$((killed+1))
+-        echo "$(date -u +%H:%M:%S) killed wedged tunnel on :$p (pid $pid, code=${code:-none})"
++        sudo kill "$pid" 2>/dev/null && { killed=$((killed + 1)); log "killed wedged tunnel on :$p (pid $pid)"; }
++      else
++        log "tunnel :$p failing but nothing holds the port (remote supervisor down?)"
+       fi
+       misses[$p]=0
+     fi
+   done
+-  [ "$killed" -gt 0 ] && echo "$(date -u +%H:%M:%S) rebuilt $killed tunnel(s)"
++  [ "$killed" -gt 0 ] && log "rebuilt $killed tunnel(s)"
+   sleep "$INTERVAL"
+ done
+diff --git a/scripts/h200/engine_watchdog.sh b/scripts/h200/engine_watchdog.sh
+new file mode 100755
+index 0000000..9f0c617
+--- /dev/null
++++ b/scripts/h200/engine_watchdog.sh
+@@ -0,0 +1,57 @@
++#!/usr/bin/env bash
++# Restart the local vLLM engine when it dies. Runs ON each H200 host.
++#
++# vLLM's EngineCore can die while the CONTAINER stays up: a worker RPC times
++# out ("TimeoutError: RPC call to sample_tokens timed out", preceded by "No
++# available shared memory broadcast block found in 60 seconds"), EngineCore
++# raises EngineDeadError, the API server shuts down, and docker still reports
++# the container as Up with the GPUs at 4 MiB. Observed 2026-08-06 03:13:30 on
++# both hosts with 63 requests in flight; the run then sat dead for 2.6 hours.
++#
++# The tunnel watchdog on n82 CANNOT see this -- the SSH forward still accepts
++# connections, so from n82 a dead engine is indistinguishable from a healthy
++# one until the request fails. And n82 has no ssh access to these hosts, so it
++# could not restart anything anyway. Hence a local self-healing loop.
++#
++# Container "Up" is deliberately NOT the health signal. Only an actual HTTP
++# reply from the engine counts.
++set -uo pipefail
++
++PORT=${PORT:-8000}
++INTERVAL=${INTERVAL:-60}
++TIMEOUT=${TIMEOUT:-15}
++FAILS_BEFORE_RESTART=${FAILS_BEFORE_RESTART:-2}
++START=/data/glm52-rl/deployment/scripts/h200/start_inference.sh
++misses=0
++
++log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
++log "engine watchdog started (port=$PORT interval=${INTERVAL}s timeout=${TIMEOUT}s)"
++
++while true; do
++  code=$(curl -s -o /dev/null -m "$TIMEOUT" -w "%{http_code}" "http://127.0.0.1:$PORT/v1/models" 2>/dev/null)
++  if [ "$code" = "200" ]; then
++    [ "$misses" -gt 0 ] && log "engine recovered (was $misses miss(es))"
++    misses=0
++  else
++    misses=$((misses + 1))
++    log "engine probe failed (code=${code:-none}) miss=$misses/$FAILS_BEFORE_RESTART"
++    if [ "$misses" -ge "$FAILS_BEFORE_RESTART" ]; then
++      gpu=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader 2>/dev/null | head -1)
++      log "RESTARTING ENGINE (gpu0=${gpu:-unknown})"
++      sudo docker rm -f glm52-decensor-h200 >/dev/null 2>&1
++      if bash "$START" >/dev/null 2>&1; then
++        log "start_inference.sh returned ok; waiting for engine to load"
++      else
++        log "WARNING start_inference.sh returned non-zero"
++      fi
++      # Loading the 745B checkpoint takes minutes; do not thrash it.
++      for _ in $(seq 1 40); do
++        sleep 30
++        c=$(curl -s -o /dev/null -m "$TIMEOUT" -w "%{http_code}" "http://127.0.0.1:$PORT/v1/models" 2>/dev/null)
++        [ "$c" = "200" ] && { log "engine back up"; break; }
++      done
++      misses=0
++    fi
++  fi
++  sleep "$INTERVAL"
++done
+diff --git a/scripts/h200/start_orchestrator.sh b/scripts/h200/start_orchestrator.sh
+index 3654ec2..7d3ab07 100644
+--- a/scripts/h200/start_orchestrator.sh
++++ b/scripts/h200/start_orchestrator.sh
+@@ -53,7 +53,7 @@ tunnel 18101 127.0.0.1:8000 "-p 40051 -i /root/.ssh/china_rollout_ed25519 root@1
+ # same 20 MB crossed in 9s with -C, and the live tunnel measured 4.9 MB/s --
+ # token ids and logprobs compress well.
+ tunnel 29620 10.92.20.82:29620 china-trainer yes
+-tunnel 18100 10.92.20.82:18100 china-trainer yes
++tunnel 18100 10.92.20.82:8100 china-trainer yes
+ 
+ sleep 6
+ for p in 18101 29620 18100; do
+diff --git a/scripts/ops/watchdog_smoketest.sh b/scripts/ops/watchdog_smoketest.sh
+new file mode 100755
+index 0000000..1b07214
+--- /dev/null
++++ b/scripts/ops/watchdog_smoketest.sh
+@@ -0,0 +1,64 @@
++#!/usr/bin/env bash
++# Smoke-test the watchdog decision logic against every failure mode we have
++# actually hit, using fake probe results so nothing real is touched.
++#
++# The bug this exists to prevent: on 2026-08-06 the tunnel watchdog spent 2.6
++# hours rebuilding all 24 tunnels while both vLLM engines were dead, because a
++# dead engine and a wedged tunnel are indistinguishable from n82. Case 4 is
++# that exact scenario.
++set -uo pipefail
++
++pass=0; fail=0
++check() { # name expected actual
++  if [ "$2" = "$3" ]; then echo "  PASS  $1"; pass=$((pass+1))
++  else echo "  FAIL  $1 (expected '$2', got '$3')"; fail=$((fail+1)); fi
++}
++
++# Mirror of the tunnel watchdog's decision: given N failures out of TOTAL,
++# does it rebuild tunnels, blame the backend, or do nothing?
++decide() { # nfail total pct
++  local nfail=$1 total=$2 pct=${3:-80}
++  [ "$nfail" -eq 0 ] && { echo "none"; return; }
++  [ $((nfail * 100 / total)) -ge "$pct" ] && { echo "backend"; return; }
++  echo "rebuild"
++}
++
++echo "== tunnel watchdog decision logic =="
++check "all healthy -> no action"                 "none"    "$(decide 0 24)"
++check "1 wedged -> rebuild"                      "rebuild" "$(decide 1 24)"
++check "11 wedged (46%) -> rebuild"               "rebuild" "$(decide 11 24)"
++check "19 wedged (79%) -> rebuild"               "rebuild" "$(decide 19 24)"
++check "20 down (83%) -> blame backend"           "backend" "$(decide 20 24)"
++check "24 down (100%) -> blame backend"          "backend" "$(decide 24 24)"
++check "the 2026-08-06 outage (0/24 up)"          "backend" "$(decide 24 24)"
++check "the 22-of-24 wedge (92%) -> backend"      "backend" "$(decide 22 24)"
++
++# Two consecutive misses required before killing, so a single slow reply
++# under load does not trigger a needless rebuild.
++echo "== debounce =="
++debounce() { # miss_count
++  [ "$1" -ge 2 ] && echo "kill" || echo "wait"
++}
++check "1 slow reply -> wait"                     "wait"    "$(debounce 1)"
++check "2 consecutive misses -> kill"             "kill"    "$(debounce 2)"
++
++# Engine watchdog: container Up must NOT count as healthy. Only HTTP 200 does.
++echo "== engine watchdog health signal =="
++engine_healthy() { # http_code container_state
++  [ "$1" = "200" ] && echo "healthy" || echo "dead"
++}
++check "http 200, container up -> healthy"        "healthy" "$(engine_healthy 200 up)"
++check "http 000, container UP -> dead (the bug)" "dead"    "$(engine_healthy 000 up)"
++check "http 000, container exited -> dead"       "dead"    "$(engine_healthy 000 exited)"
++check "http 500 -> dead"                         "dead"    "$(engine_healthy 500 up)"
++
++echo "== engine watchdog restart threshold =="
++eng_action() { # misses threshold
++  [ "$1" -ge "$2" ] && echo "restart" || echo "wait"
++}
++check "1 miss -> wait"                           "wait"    "$(eng_action 1 2)"
++check "2 misses -> restart"                      "restart" "$(eng_action 2 2)"
++
++echo
++echo "passed=$pass failed=$fail"
++[ "$fail" -eq 0 ]
+-- 
+2.43.0
+

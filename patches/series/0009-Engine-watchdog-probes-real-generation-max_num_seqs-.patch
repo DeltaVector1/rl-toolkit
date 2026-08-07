@@ -1,0 +1,115 @@
+From caeb6ca2c84764dfc18a43ddc3621f33a2d6d7bc Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 6 Aug 2026 06:11:56 +0000
+Subject: [PATCH 09/17] Engine watchdog probes real generation; max_num_seqs
+ 512 -> 128
+
+/v1/models is not a health signal. h200a 2026-08-06 06:05: models=200 with
+gen=000, Running: 64, throughput: 0.0 -- API server alive, EngineCore hung.
+The watchdog now issues a 3-token completion instead.
+
+max_num_seqs 512 -> 128: two engine deaths in three hours, both a
+sample_tokens RPC timeout under heavy concurrency. Lower concurrency for
+stability.
+
+Smoke test 18/18 including gen-000-while-models-200.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017wiESxhziDrnsLnG9aizTd
+---
+ scripts/h200/engine_watchdog.sh   | 22 +++++++++++++++++-----
+ scripts/h200/start_inference.sh   |  2 +-
+ scripts/ops/watchdog_smoketest.sh | 15 ++++++++++-----
+ 3 files changed, 28 insertions(+), 11 deletions(-)
+
+diff --git a/scripts/h200/engine_watchdog.sh b/scripts/h200/engine_watchdog.sh
+index 9f0c617..0a7c49b 100755
+--- a/scripts/h200/engine_watchdog.sh
++++ b/scripts/h200/engine_watchdog.sh
+@@ -13,11 +13,15 @@
+ # one until the request fails. And n82 has no ssh access to these hosts, so it
+ # could not restart anything anyway. Hence a local self-healing loop.
+ #
+-# Container "Up" is deliberately NOT the health signal. Only an actual HTTP
+-# reply from the engine counts.
++# Neither container "Up" NOR /v1/models is a sufficient health signal. Observed
++# 2026-08-06 06:05 on h200a: models=200 while gen=000, "Running: 64" with
++# "throughput: 0.0" -- the API server was alive and answering while EngineCore
++# was hung and generating nothing. Only a real completion proves the engine
++# works, so that is what this probes.
+ set -uo pipefail
+ 
+ PORT=${PORT:-8000}
++MODEL=${MODEL:-/data/glm52-rl/model-fp8}
+ INTERVAL=${INTERVAL:-60}
+ TIMEOUT=${TIMEOUT:-15}
+ FAILS_BEFORE_RESTART=${FAILS_BEFORE_RESTART:-2}
+@@ -28,7 +32,12 @@ log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
+ log "engine watchdog started (port=$PORT interval=${INTERVAL}s timeout=${TIMEOUT}s)"
+ 
+ while true; do
+-  code=$(curl -s -o /dev/null -m "$TIMEOUT" -w "%{http_code}" "http://127.0.0.1:$PORT/v1/models" 2>/dev/null)
++  # A tiny real generation. max_tokens=3 keeps it cheap; a hung EngineCore
++  # never answers it even though /v1/models still returns 200.
++  code=$(curl -s -o /dev/null -m "$TIMEOUT" -w "%{http_code}" \
++    -X POST "http://127.0.0.1:$PORT/v1/completions" \
++    -H "Content-Type: application/json" \
++    -d "{\"model\":\"$MODEL\",\"prompt\":\"hi\",\"max_tokens\":3}" 2>/dev/null)
+   if [ "$code" = "200" ]; then
+     [ "$misses" -gt 0 ] && log "engine recovered (was $misses miss(es))"
+     misses=0
+@@ -47,8 +56,11 @@ while true; do
+       # Loading the 745B checkpoint takes minutes; do not thrash it.
+       for _ in $(seq 1 40); do
+         sleep 30
+-        c=$(curl -s -o /dev/null -m "$TIMEOUT" -w "%{http_code}" "http://127.0.0.1:$PORT/v1/models" 2>/dev/null)
+-        [ "$c" = "200" ] && { log "engine back up"; break; }
++        c=$(curl -s -o /dev/null -m "$TIMEOUT" -w "%{http_code}" \
++          -X POST "http://127.0.0.1:$PORT/v1/completions" \
++          -H "Content-Type: application/json" \
++          -d "{\"model\":\"$MODEL\",\"prompt\":\"hi\",\"max_tokens\":3}" 2>/dev/null)
++        [ "$c" = "200" ] && { log "engine back up (generation verified)"; break; }
+       done
+       misses=0
+     fi
+diff --git a/scripts/h200/start_inference.sh b/scripts/h200/start_inference.sh
+index 0328cfd..53ea956 100755
+--- a/scripts/h200/start_inference.sh
++++ b/scripts/h200/start_inference.sh
+@@ -30,4 +30,4 @@ docker run -d --name glm52-decensor-h200 --restart unless-stopped \
+   --entrypoint /app/.venv/bin/inference \
+   prime-rl:glm52-decensor \
+   @ "$deployment/configs/h200/inference.toml" \
+-  --vllm-extra '{"kv_cache_dtype":"fp8","max_num_seqs":512,"max_num_batched_tokens":65536,"compilation_config":{"max_cudagraph_capture_size":256}}'
++  --vllm-extra '{"kv_cache_dtype":"fp8","max_num_seqs":128,"max_num_batched_tokens":65536,"compilation_config":{"max_cudagraph_capture_size":256}}'
+diff --git a/scripts/ops/watchdog_smoketest.sh b/scripts/ops/watchdog_smoketest.sh
+index 1b07214..6e744f1 100755
+--- a/scripts/ops/watchdog_smoketest.sh
++++ b/scripts/ops/watchdog_smoketest.sh
+@@ -44,13 +44,18 @@ check "2 consecutive misses -> kill"             "kill"    "$(debounce 2)"
+ 
+ # Engine watchdog: container Up must NOT count as healthy. Only HTTP 200 does.
+ echo "== engine watchdog health signal =="
+-engine_healthy() { # http_code container_state
++# Health is decided by an actual generation, NOT by container state and NOT by
++# /v1/models. h200a on 2026-08-06 06:05 had models=200 with gen=000: API server
++# alive, EngineCore hung at "Running: 64, throughput: 0.0".
++engine_healthy() { # gen_code models_code container_state
+   [ "$1" = "200" ] && echo "healthy" || echo "dead"
+ }
+-check "http 200, container up -> healthy"        "healthy" "$(engine_healthy 200 up)"
+-check "http 000, container UP -> dead (the bug)" "dead"    "$(engine_healthy 000 up)"
+-check "http 000, container exited -> dead"       "dead"    "$(engine_healthy 000 exited)"
+-check "http 500 -> dead"                         "dead"    "$(engine_healthy 500 up)"
++check "gen 200, models 200, up -> healthy"        "healthy" "$(engine_healthy 200 200 up)"
++check "gen 000, models 200, up -> dead (hung core)" "dead"  "$(engine_healthy 000 200 up)"
++check "gen 000, models 000, up -> dead"           "dead"    "$(engine_healthy 000 000 up)"
++check "gen 000, models 000, exited -> dead"       "dead"    "$(engine_healthy 000 000 exited)"
++check "gen 500 -> dead"                           "dead"    "$(engine_healthy 500 200 up)"
++check "gen times out (000) despite models ok"     "dead"    "$(engine_healthy 000 200 up)"
+ 
+ echo "== engine watchdog restart threshold =="
+ eng_action() { # misses threshold
+-- 
+2.43.0
+

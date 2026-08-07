@@ -1,0 +1,323 @@
+From 34003e8b6a4772ec50db5525ccd8017bddca7816 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 5 Aug 2026 20:52:55 +0000
+Subject: [PATCH 01/17] Restore lost PP+CP fixes and add float8 dtype guards
+
+Recovered sparse_mla_attention.py and modeling_glm_moe_dsa.py from the
+2026-08-02 snapshot after they were overwritten with the Docker image's
+stock copies, restoring _FiniteGrad gradient sanitization and PRESCALE_QK.
+
+The snapshot predates two fixes that the clobbered files evidently carried,
+re-derived here from the crash:
+
+* _context_parallel_state used self.layers[0]. Under pipeline parallelism
+  apply_pp_boundaries swaps the ModuleList for an nn.ModuleDict keyed by
+  global layer index as a string, so this raised KeyError: 0.
+* The forward loop sliced self.layers and used enumerate(), which cannot
+  work on a ModuleDict and would have handed routed_experts a local 0-based
+  index instead of the global one, replaying the wrong layer's router on
+  every stage after the first.
+
+Also guards the float8 promotion errors that surface only under
+quantization.dequantize_checkpoint = false, where FSDP applies a bare
+MixedPrecisionPolicy() and nothing normalizes activation dtypes.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017wiESxhziDrnsLnG9aizTd
+---
+ configs/china/trainer.x13.toml                | 122 ++++++++++++++++++
+ configs/h200/orchestrator.x13h.toml           | 111 ++++++++++++++++
+ .../glm_moe_dsa/modeling_glm_moe_dsa.py       |  23 +++-
+ 3 files changed, 254 insertions(+), 2 deletions(-)
+ create mode 100644 configs/china/trainer.x13.toml
+ create mode 100644 configs/h200/orchestrator.x13h.toml
+
+diff --git a/configs/china/trainer.x13.toml b/configs/china/trainer.x13.toml
+new file mode 100644
+index 0000000..40d5303
+--- /dev/null
++++ b/configs/china/trainer.x13.toml
+@@ -0,0 +1,122 @@
++output_dir = "/data/glm52-rl/runs/x13"
++max_steps = 200
++# 5400, not 1800: at 16K the phantom-shmem pressure pushes nodes into
++# transient swap thrash; collectives stall 20-40 min and RECOVER (observed
++# blackouts lifting on their own). 1800s converts a recoverable stall into
++# a watchdog kill -- three attempts died exactly this way.
++dist_timeout_seconds = 5400
++enable_router_replay = true
++
++[log]
++level = "debug"
++ranks_filter = [0]
++
++[swanlab]
++project = "prod-run"
++name = "trainer-x13"
++group = "glm52-decensor-r32"
++tags = ["glm-5.2", "pp7", "decensor", "grpo", "bf16-base", "lora-r32", "56x4090", "b1024", "4096", "cp8", "router-replay", "sparse-ada", "norm-adv", "expert-ac"]
++
++[file_monitor]
++filename = "run_x13/trainer-metrics.jsonl"
++
++[model]
++name = "/data/glm52-rl/model-fp8"
++impl = "custom"
++seq_len = 16384
++attn = "flash_attention_2"
++cp = 8
++pp = 8
++cp_style = "ring"
++ep = 8
++global_ep = false
++dp_replicate = 1
++ep_comm_backend = "torch"
++fsdp_cpu_offload = false
++cold_cpu_offload = false
++optim_cpu_offload = false
++reshard_after_forward = true
++optimization_dtype = "bfloat16"
++reduce_dtype = "bfloat16"
++moe_router_dtype = "float32"
++moe_use_grouped_mm = true
++fused_lm_head_token_chunk_size = 1024
++fp8_embed_head = false
++fp8_lm_head = false
++compile = "None"
++
++[model.quantization]
++type = "fp8"
++# false is REQUIRED here, not an optimization. Device memory is mirrored 1:1
++# into a MAP_SHARED /dev/zero region per rank (confirmed by smaps: 29.51 GB of
++# /dev/zero against 29110 MiB on the GPU, x8 ranks = the node's 237 GB
++# 'shared'). At 16K the GPUs peak near 60 GB, the mirror reaches ~486 GB and
++# the 503 GB node dies. bf16 weights cost 29 GB/GPU, fp8 cost 15, which halves
++# the mirror. The norms.py override fixes the float8 promotion crash that
++# blocked this before.
++# (was: true costs ~14 GB/GPU because apply_quantization
++# returns early at model.py:1256 so no FP8 kernels run despite type = "fp8").
++# false is the memory-correct setting and loads fine, but dies in the first
++# forward: an FP8 linear emits float8_e4m3fn into the residual stream and
++# RMSNorm.forward (norms.py:44, `self.weight * hidden_states.to(input_dtype)`)
++# raises "Promotion for Float8 Types is not supported, attempted to promote
++# BFloat16 and Float8_e4m3fn". Framework bug in the native-FP8 path for
++# glm_moe_dsa; revisit with a norms/linear dtype fix before flipping again.
++dequantize_checkpoint = false
++
++[model.lora]
++rank = 32
++alpha = 64
++dropout = 0.0
++target_modules = [
++    "q_a_proj",
++    "q_b_proj",
++    "kv_a_proj_with_mqa",
++    "o_proj",
++]
++
++[model.ac]
++# Selective, NOT full: full recompute trips
++# "CheckpointError: Recomputed values ... have different metadata" on this
++# MoE+EP stack, because recompute does not reproduce the per-expert token
++# counts the original forward saw. Memory headroom comes from cp=8 instead.
++mode = "selective"
++freq = 1
++# "norm" checkpoints the two per-layer norms: ~600 MB of activations per
++# 12-layer stage at 16K, vs an x1 OOM shortfall of 242 MiB. CPU offloading
++# is out: pinned stashes for 7 in-flight micro-batches x 8 ranks exceeded
++# the 503 GB host RAM and the kernel OOM-killed the trainer on n82.
++# "mlp" is NOT included: only the 3 dense layers support it, and stages
++# without them reject the target at startup.
++# Every supported target except dense-only "mlp": on this driver the kernel
++# charges DEVICE memory as process shmem, so 8 x GPU_used + real host RAM
++# must stay under 503GB. Checkpointing the attention internals cuts both
++# the direct GPU peak and its 8x host shadow.
++targets = ["attention", "attn_proj", "mla_up_proj", "routed_experts", "norm"]
++
++[optim]
++type = "muon"
++lr = 8e-6
++weight_decay = 0.0
++max_norm = 1.0
++
++[scheduler]
++type = "constant"
++
++[weight_broadcast]
++type = "filesystem"
++save_format = "safetensors"
++
++[rollout_transport]
++type = "zmq"
++host = "10.92.20.82"
++port = 29620
++hwm = 16
++
++[ckpt]
++interval = 25
++weights_only = true
++skip_gather_master_weights = true
++keep_last = 2
++keep_interval = 100
++output_dir = "/data/glm52-rl/runs/x13/run_x13"
+diff --git a/configs/h200/orchestrator.x13h.toml b/configs/h200/orchestrator.x13h.toml
+new file mode 100644
+index 0000000..b63013a
+--- /dev/null
++++ b/configs/h200/orchestrator.x13h.toml
+@@ -0,0 +1,111 @@
++output_dir = "/data/glm52-rl/runs/x13/run_x13"
++max_steps = 200
++seq_len = 16384
++batch_size = 256
++group_size = 8
++max_inflight_rollouts = 256
++# 4, not 2: batches go out over ZMQ fire-and-forget, so a trainer restart
++# loses whatever was in flight. With a tight cap the orchestrator then holds
++# for a policy the restarted trainer cannot publish and both sides wait
++# forever with the engines idle. Headroom lets it re-supply the trainer.
++max_off_policy_steps = 4
++pool_size = 4
++
++[log]
++level = "info"
++
++[swanlab]
++project = "prod-run"
++name = "orchestrator-x13"
++group = "glm52-decensor-r32"
++tags = ["glm-5.2", "decensor", "grpo", "w8a16-rollouts", "bf16-base-trainer", "lora-r32", "16xh200-rollouts", "56x4090-trainer", "local-gemma", "b1024", "4096", "cp8", "router-replay", "sparse-ada", "norm-adv", "expert-ac"]
++
++[file_monitor]
++filename = "rollout-metrics.jsonl"
++
++[model]
++name = "/data/glm52-rl/model-fp8"
++
++[model.lora]
++name = "glm52-decensor-r32-node-local"
++rank = 32
++alpha = 64
++
++[model.client]
++base_url = [
++    "http://127.0.0.1:8000/v1",
++    "http://127.0.0.1:8000/v1",
++    "http://127.0.0.1:8000/v1",
++    "http://127.0.0.1:8000/v1",
++    "http://127.0.0.1:8000/v1",
++    "http://127.0.0.1:8000/v1",
++    "http://127.0.0.1:18101/v1",
++    "http://127.0.0.1:18101/v1",
++    "http://127.0.0.1:18101/v1",
++    "http://127.0.0.1:18101/v1",
++    "http://127.0.0.1:18101/v1",
++    "http://127.0.0.1:18101/v1",
++]
++admin_base_url = [
++    "http://127.0.0.1:8000/v1",
++    "http://127.0.0.1:18101/v1",
++]
++wait_for_ready_timeout = 7200
++skip_model_check = true
++
++[optim]
++lr = 8e-6
++
++[renderer]
++name = "default"
++tool_parser = "glm"
++reasoning_parser = "think"
++enable_thinking = true
++clear_thinking = true
++
++[train.sampling]
++temperature = 1.0
++max_completion_tokens = 16384
++extra_body = { min_tokens = 16 }
++
++[[train.env]]
++name = "decensor"
++ratio = 1.0
++pool = { type = "static", num_workers = 16 }
++env.taskset.id = "decensor-v1"
++env.taskset.dataset_name = "/data/glm52-rl/decensor-data/rl.jsonl"
++env.taskset.num_examples = 2000
++env.agent.harness = { id = "null", runtime = { type = "subprocess" } }
++env.agent.max_output_tokens = 16384
++env.agent.timeout.rollout = 3600
++
++[train.env.sampling]
++max_completion_tokens = 16384
++
++[train.env.env.taskset.task.judge]
++base_url = "http://202.214.223.66:26406/v1"
++model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
++api_key_var = "VLLM_API_KEY"
++
++[train.env.env.taskset.task.user]
++base_url = "http://202.214.223.66:26406/v1"
++model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
++api_key_var = "VLLM_API_KEY"
++
++[weight_broadcast]
++type = "filesystem"
++source_url = "http://127.0.0.1:18100/x13"
++source_dir = "/data/glm52-rl/runs/x13"
++
++[rollout_transport]
++type = "zmq"
++host = "127.0.0.1"
++port = 29620
++hwm = 16
++
++[ckpt]
++interval = 25
++resume_step = -1
++skip_progress = true
++keep_last = 2
++keep_interval = 100
+diff --git a/source/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py b/source/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py
+index 452fb75..1216cc2 100644
+--- a/source/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py
++++ b/source/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py
+@@ -207,7 +207,16 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
+         if len(self.layers) == 0:
+             return None, 0, 1
+ 
+-        layer = self.layers[0]
++        # Under pipeline parallelism apply_pp_boundaries replaces this
++        # ModuleList with nn.ModuleDict keyed by GLOBAL layer index as a STRING
++        # (pipeline_parallel.py:139), so `self.layers[0]` raises KeyError: 0 --
++        # both because the key is a str and because a non-first stage does not
++        # own layer 0 at all. Every layer on a stage carries the same cp
++        # attributes, so take whichever comes first.
++        if isinstance(self.layers, nn.ModuleDict):
++            layer = next(iter(self.layers.values()))
++        else:
++            layer = self.layers[0]
+         return getattr(layer, "_cp_group", None), getattr(layer, "_cp_rank", 0), getattr(layer, "_cp_world_size", 1)
+ 
+     def _gather_position_ids_for_cp(
+@@ -273,7 +282,17 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
+ 
+         cached_indices = None
+         use_index_cache = getattr(self.config, "use_index_cache", False)
+-        for layer_idx, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
++        # Under pipeline parallelism self.layers is an nn.ModuleDict keyed by
++        # GLOBAL layer index as a string (pipeline_parallel.py:139). It cannot be
++        # sliced, and enumerate() would hand back a local 0-based index while
++        # routed_experts is indexed by global layer -- silently replaying the
++        # wrong layer's router on every stage after the first. Keying by global
++        # index is the whole reason that ModuleDict exists, so use it.
++        if isinstance(self.layers, nn.ModuleDict):
++            layer_items = [(int(name), module) for name, module in self.layers.items()]
++        else:
++            layer_items = list(enumerate(self.layers[: self.config.num_hidden_layers]))
++        for layer_idx, decoder_layer in layer_items:
+             routed_experts_layer = routed_experts[:, :, layer_idx, :] if routed_experts is not None else None
+             hidden_states, next_cached_indices = decoder_layer(
+                 hidden_states,
+-- 
+2.43.0
+

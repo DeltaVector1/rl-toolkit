@@ -1,0 +1,60 @@
+From fec05bf0d35fcb06769a0be502bdce440c839c66 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 7 Aug 2026 00:17:27 +0000
+Subject: [PATCH 16/17] Watchdog: always rebuild tunnels, never refuse on mass
+ failure
+
+The >=80%-failure refusal I added earlier froze the run for five hours. At
+batch 1024 all 24 tunnels wedged at once under 4x the rollout load while the
+engines were healthy and generating; the guard read that as a dead backend and
+sat idle. 198 rollout failures per 5 min, all ReadTimeout against dead
+tunnels.
+
+The failure modes are not symmetric: rebuilding against a dead backend costs
+nothing (it fails again next cycle), refusing to rebuild against a live one
+halts everything. Warn on mass failure, rebuild regardless.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017wiESxhziDrnsLnG9aizTd
+---
+ scripts/china/tunnel_watchdog.sh | 21 +++++++++++----------
+ 1 file changed, 11 insertions(+), 10 deletions(-)
+
+diff --git a/scripts/china/tunnel_watchdog.sh b/scripts/china/tunnel_watchdog.sh
+index 5faa342..db14f3d 100755
+--- a/scripts/china/tunnel_watchdog.sh
++++ b/scripts/china/tunnel_watchdog.sh
+@@ -49,19 +49,20 @@ while true; do
+     fi
+   done
+ 
++  # ALWAYS rebuild. An earlier version refused when >=80% failed, on the theory
++  # that mass failure meant a dead backend it could not fix. That was wrong and
++  # it froze the run: at batch 1024 all 24 tunnels wedged at once under 4x the
++  # rollout load while the engines were healthy and generating, and the
++  # watchdog sat idle for five hours. The asymmetry is decisive -- rebuilding
++  # against a dead backend is harmless (it just fails again next cycle), while
++  # refusing to rebuild against a live backend stalls everything. So warn
++  # loudly on mass failure, then rebuild anyway.
+   if [ "$total" -gt 0 ] && [ $((nfail * 100 / total)) -ge "$MASS_FAILURE_PCT" ]; then
+-    # Do not touch the tunnels: rebuilding them cannot fix a dead engine, and
+-    # the churn hides the real fault.
+     mass_streak=$((mass_streak + 1))
+-    if [ $((mass_streak % 5)) -eq 1 ]; then
+-      log "*** $nfail/$total tunnels failing — BACKEND LIKELY DOWN, not the tunnels."
+-      log "*** Not rebuilding. Check the vLLM engines on h200a/h200b (engine_watchdog.sh should be restarting them)."
+-    fi
+-    sleep "$INTERVAL"
+-    continue
++    [ $((mass_streak % 5)) -eq 1 ] && log "*** $nfail/$total tunnels failing at once -- check the engines too, but rebuilding regardless"
++  else
++    mass_streak=0
+   fi
+-  [ "$mass_streak" -gt 0 ] && log "mass failure cleared ($nfail/$total failing)"
+-  mass_streak=0
+ 
+   killed=0
+   for p in $failed; do
+-- 
+2.43.0
+

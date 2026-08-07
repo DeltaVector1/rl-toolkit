@@ -1,0 +1,396 @@
+From 1a44463fe5599e3f69738a20656792b3e0bd5c4e Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 6 Aug 2026 19:28:22 +0000
+Subject: [PATCH 13/17] Add Telegram notifier: per-step stats and freeze
+ call-out
+
+Per step: step time, loss, entropy, grad norm, running mean reward, last 5
+rewards. On freeze: Telegram message plus a CallMeBot phone call.
+
+Freeze requires BOTH the trainer step counter and the orchestrator batch
+counter to be static for FREEZE_MIN minutes. A slow batch alone is normal and
+must not page anyone -- batches have legitimately taken 30+ min tonight.
+
+Credentials come from the environment (TG_BOT_TOKEN, TG_CHAT_ID,
+CALLMEBOT_KEY) so nothing secret enters git.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017wiESxhziDrnsLnG9aizTd
+---
+ configs/china/orchestrator.x22.toml | 123 ++++++++++++++++++++++++++
+ configs/china/trainer.x22.toml      | 132 ++++++++++++++++++++++++++++
+ scripts/ops/notify.sh               |  93 ++++++++++++++++++++
+ 3 files changed, 348 insertions(+)
+ create mode 100644 configs/china/orchestrator.x22.toml
+ create mode 100644 configs/china/trainer.x22.toml
+ create mode 100644 scripts/ops/notify.sh
+
+diff --git a/configs/china/orchestrator.x22.toml b/configs/china/orchestrator.x22.toml
+new file mode 100644
+index 0000000..843fcb4
+--- /dev/null
++++ b/configs/china/orchestrator.x22.toml
+@@ -0,0 +1,123 @@
++output_dir = "/data/glm52-rl/runs/x22/run_x22"
++max_steps = 200
++seq_len = 16384
++batch_size = 256
++group_size = 8
++max_inflight_rollouts = 256
++# 4, not 2: batches go out over ZMQ fire-and-forget, so a trainer restart
++# loses whatever was in flight. With a tight cap the orchestrator then holds
++# for a policy the restarted trainer cannot publish and both sides wait
++# forever with the engines idle. Headroom lets it re-supply the trainer.
++max_off_policy_steps = 4
++pool_size = 4
++
++[log]
++level = "info"
++
++[swanlab]
++project = "prod-run"
++name = "orchestrator-x22"
++group = "glm52-decensor-r32"
++tags = ["glm-5.2", "decensor", "grpo", "w8a16-rollouts", "bf16-base-trainer", "lora-r32", "16xh200-rollouts", "56x4090-trainer", "local-gemma", "b1024", "4096", "cp8", "router-replay", "sparse-ada", "norm-adv", "expert-ac"]
++
++[file_monitor]
++filename = "rollout-metrics.jsonl"
++
++[model]
++name = "/data/glm52-rl/model-fp8"
++
++[model.lora]
++name = "glm52-decensor-r32-node-local"
++rank = 32
++alpha = 64
++
++[model.client]
++base_url = [
++    "http://127.0.0.1:18001/v1",
++    "http://127.0.0.1:18002/v1",
++    "http://127.0.0.1:18003/v1",
++    "http://127.0.0.1:18004/v1",
++    "http://127.0.0.1:18005/v1",
++    "http://127.0.0.1:18006/v1",
++    "http://127.0.0.1:18007/v1",
++    "http://127.0.0.1:18008/v1",
++    "http://127.0.0.1:18009/v1",
++    "http://127.0.0.1:18010/v1",
++    "http://127.0.0.1:18011/v1",
++    "http://127.0.0.1:18012/v1",
++    "http://127.0.0.1:18013/v1",
++    "http://127.0.0.1:18014/v1",
++    "http://127.0.0.1:18015/v1",
++    "http://127.0.0.1:18016/v1",
++    "http://127.0.0.1:18017/v1",
++    "http://127.0.0.1:18018/v1",
++    "http://127.0.0.1:18019/v1",
++    "http://127.0.0.1:18020/v1",
++    "http://127.0.0.1:18021/v1",
++    "http://127.0.0.1:18022/v1",
++    "http://127.0.0.1:18023/v1",
++    "http://127.0.0.1:18024/v1",
++]
++admin_base_url = [
++    "http://127.0.0.1:18001/v1",
++    "http://127.0.0.1:18002/v1",
++]
++wait_for_ready_timeout = 7200
++skip_model_check = true
++
++[optim]
++lr = 8e-6
++
++[renderer]
++name = "default"
++tool_parser = "glm"
++reasoning_parser = "think"
++enable_thinking = true
++clear_thinking = true
++
++[train.sampling]
++temperature = 1.0
++max_completion_tokens = 16384
++extra_body = { min_tokens = 16 }
++
++[[train.env]]
++name = "decensor"
++ratio = 1.0
++pool = { type = "static", num_workers = 16 }
++env.taskset.id = "decensor-v1"
++env.taskset.dataset_name = "/data/glm52-rl/decensor-data/rl.jsonl"
++env.taskset.num_examples = 2000
++env.agent.harness = { id = "null", runtime = { type = "subprocess" } }
++env.agent.max_output_tokens = 16384
++env.agent.timeout.rollout = 3600
++
++[train.env.sampling]
++max_completion_tokens = 16384
++
++[train.env.env.taskset.task.judge]
++base_url = "http://127.0.0.1:26406/v1"
++model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
++api_key_var = "VLLM_API_KEY"
++
++[train.env.env.taskset.task.user]
++base_url = "http://127.0.0.1:26406/v1"
++model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
++api_key_var = "VLLM_API_KEY"
++
++[weight_broadcast]
++type = "filesystem"
++source_url = "http://127.0.0.1:18100/x22"
++source_dir = "/data/glm52-rl/runs/x22"
++
++[rollout_transport]
++type = "zmq"
++host = "10.92.20.82"
++port = 29620
++hwm = 16
++
++[ckpt]
++interval = 25
++resume_step = -1
++skip_progress = true
++keep_last = 2
++keep_interval = 100
+diff --git a/configs/china/trainer.x22.toml b/configs/china/trainer.x22.toml
+new file mode 100644
+index 0000000..4767fd2
+--- /dev/null
++++ b/configs/china/trainer.x22.toml
+@@ -0,0 +1,132 @@
++output_dir = "/data/glm52-rl/runs/x22"
++max_steps = 200
++# 5400, not 1800: at 16K the phantom-shmem pressure pushes nodes into
++# transient swap thrash; collectives stall 20-40 min and RECOVER (observed
++# blackouts lifting on their own). 1800s converts a recoverable stall into
++# a watchdog kill -- three attempts died exactly this way.
++dist_timeout_seconds = 5400
++enable_router_replay = true
++
++[log]
++level = "debug"
++ranks_filter = [0]
++
++[swanlab]
++project = "prod-run"
++name = "trainer-x22"
++group = "glm52-decensor-r32"
++tags = ["glm-5.2", "pp7", "decensor", "grpo", "bf16-base", "lora-r32", "56x4090", "b1024", "4096", "cp8", "router-replay", "sparse-ada", "norm-adv", "expert-ac"]
++
++[file_monitor]
++filename = "run_x22/trainer-metrics.jsonl"
++
++[model]
++name = "/data/glm52-rl/model-fp8"
++impl = "custom"
++seq_len = 16384
++attn = "flash_attention_2"
++cp = 8
++pp = 8
++cp_style = "ring"
++ep = 8
++global_ep = false
++dp_replicate = 1
++ep_comm_backend = "torch"
++fsdp_cpu_offload = false
++cold_cpu_offload = false
++optim_cpu_offload = false
++reshard_after_forward = true
++optimization_dtype = "bfloat16"
++reduce_dtype = "bfloat16"
++moe_router_dtype = "float32"
++moe_use_grouped_mm = true
++fused_lm_head_token_chunk_size = 1024
++fp8_embed_head = false
++fp8_lm_head = false
++compile = "None"
++# ac_offloading DEFAULTS TO ENABLED (trainer.py:173 is
++# `ActivationOffloadingConfig()`, not None), and nothing here ever turned it
++# off. It stashes activations in PINNED HOST memory, which is what the
++# [model.ac] note below already warned about: "pinned stashes for 7 in-flight
++# micro-batches x 8 ranks exceeded the 503 GB host RAM and the kernel
++# OOM-killed the trainer on n82". Measured on x18: 60 GB of /dev/zero per rank
++# against 17 GB on the GPU -- 3.5:1, and it tracks micro-batches in flight
++# rather than device memory, which is why FP8 and expandable_segments both
++# failed to move it. 8 ranks x 60 GB = 480 GB on a 503 GB node.
++ac_offloading = "None"
++
++[model.quantization]
++type = "fp8"
++# false is REQUIRED here, not an optimization. Device memory is mirrored 1:1
++# into a MAP_SHARED /dev/zero region per rank (confirmed by smaps: 29.51 GB of
++# /dev/zero against 29110 MiB on the GPU, x8 ranks = the node's 237 GB
++# 'shared'). At 16K the GPUs peak near 60 GB, the mirror reaches ~486 GB and
++# the 503 GB node dies. bf16 weights cost 29 GB/GPU, fp8 cost 15, which halves
++# the mirror. The norms.py override fixes the float8 promotion crash that
++# blocked this before.
++# (was: true costs ~14 GB/GPU because apply_quantization
++# returns early at model.py:1256 so no FP8 kernels run despite type = "fp8").
++# false is the memory-correct setting and loads fine, but dies in the first
++# forward: an FP8 linear emits float8_e4m3fn into the residual stream and
++# RMSNorm.forward (norms.py:44, `self.weight * hidden_states.to(input_dtype)`)
++# raises "Promotion for Float8 Types is not supported, attempted to promote
++# BFloat16 and Float8_e4m3fn". Framework bug in the native-FP8 path for
++# glm_moe_dsa; revisit with a norms/linear dtype fix before flipping again.
++dequantize_checkpoint = true
++
++[model.lora]
++rank = 32
++alpha = 64
++dropout = 0.0
++target_modules = [
++    "q_a_proj",
++    "q_b_proj",
++    "kv_a_proj_with_mqa",
++    "o_proj",
++]
++
++[model.ac]
++# Selective, NOT full: full recompute trips
++# "CheckpointError: Recomputed values ... have different metadata" on this
++# MoE+EP stack, because recompute does not reproduce the per-expert token
++# counts the original forward saw. Memory headroom comes from cp=8 instead.
++mode = "selective"
++freq = 1
++# "norm" checkpoints the two per-layer norms: ~600 MB of activations per
++# 12-layer stage at 16K, vs an x1 OOM shortfall of 242 MiB. CPU offloading
++# is out: pinned stashes for 7 in-flight micro-batches x 8 ranks exceeded
++# the 503 GB host RAM and the kernel OOM-killed the trainer on n82.
++# "mlp" is NOT included: only the 3 dense layers support it, and stages
++# without them reject the target at startup.
++# Every supported target except dense-only "mlp": on this driver the kernel
++# charges DEVICE memory as process shmem, so 8 x GPU_used + real host RAM
++# must stay under 503GB. Checkpointing the attention internals cuts both
++# the direct GPU peak and its 8x host shadow.
++targets = ["attention", "attn_proj", "mla_up_proj", "routed_experts", "norm"]
++
++[optim]
++type = "muon"
++lr = 8e-6
++weight_decay = 0.0
++max_norm = 1.0
++
++[scheduler]
++type = "constant"
++
++[weight_broadcast]
++type = "filesystem"
++save_format = "safetensors"
++
++[rollout_transport]
++type = "zmq"
++host = "10.92.20.82"
++port = 29620
++hwm = 16
++
++[ckpt]
++interval = 25
++weights_only = true
++skip_gather_master_weights = true
++keep_last = 2
++keep_interval = 100
++output_dir = "/data/glm52-rl/runs/x22/run_x22"
+diff --git a/scripts/ops/notify.sh b/scripts/ops/notify.sh
+new file mode 100644
+index 0000000..6e23a7d
+--- /dev/null
++++ b/scripts/ops/notify.sh
+@@ -0,0 +1,93 @@
++#!/usr/bin/env bash
++# Telegram notifier for the RL run. Runs on n82.
++#
++#   per step   -> message with step time, reward, running mean, and health
++#   frozen run -> repeated CALL via CallMeBot (Telegram cannot place calls
++#                 itself; CallMeBot rings your Telegram account)
++#
++# Credentials come from the environment so nothing secret lands in git:
++#   TG_BOT_TOKEN   from @BotFather
++#   TG_CHAT_ID     from @userinfobot ("Id")
++#   CALLMEBOT_KEY  optional; from @CallMeBot_txtbot, enables the phone call
++#
++# Freeze definition: the TRAINER step counter has not advanced and the
++# ORCHESTRATOR batch counter has not advanced for FREEZE_MIN minutes. Both must
++# be stuck -- a slow batch alone is normal and must not page anyone.
++set -uo pipefail
++
++RUN=${RUN:-x22}
++RUN_NAME=${RUN_NAME:-run_$RUN}
++INTERVAL=${INTERVAL:-60}
++FREEZE_MIN=${FREEZE_MIN:-15}
++TG_BOT_TOKEN=${TG_BOT_TOKEN:-}
++TG_CHAT_ID=${TG_CHAT_ID:-}
++CALLMEBOT_KEY=${CALLMEBOT_KEY:-}
++STATE=/data/glm52-rl/notify.state
++
++log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
++
++send() { # text
++  [ -z "$TG_BOT_TOKEN" ] && { log "TG_BOT_TOKEN unset; would send: $1"; return; }
++  curl -s -m 20 -o /dev/null -X POST \
++    "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
++    --data-urlencode "chat_id=${TG_CHAT_ID}" \
++    --data-urlencode "text=$1" >/dev/null 2>&1
++}
++
++call() { # text -- rings the phone, for freezes only
++  [ -z "$CALLMEBOT_KEY" ] && { log "CALLMEBOT_KEY unset; no call placed"; return; }
++  curl -s -m 25 -o /dev/null -G "https://api.callmebot.com/start.php" \
++    --data-urlencode "user=@${TG_CHAT_ID}" \
++    --data-urlencode "text=$1" \
++    --data-urlencode "lang=en-US-Standard-B" \
++    --data-urlencode "rpt=2" >/dev/null 2>&1
++}
++
++tsteps() { sudo docker logs glm52-decensor-trainer 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -ac "SUCCESS Step"; }
++tlast()  { sudo docker logs glm52-decensor-trainer 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -a "SUCCESS Step" | tail -1; }
++rewards(){ sudo docker logs glm52-decensor-orchestrator 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -a "SUCCESS Step" | grep -oE "Reward [0-9.]+" | awk '{print $2}'; }
++batchn() { sudo docker logs --tail 5 glm52-decensor-orchestrator 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -oE "batch [0-9]+/" | tail -1 | grep -oE "[0-9]+"; }
++
++last_step=$(cat "$STATE" 2>/dev/null || echo 0)
++last_batch=-1
++stuck=0
++frozen_notified=0
++log "notifier started (run=$RUN interval=${INTERVAL}s freeze=${FREEZE_MIN}m)"
++
++while true; do
++  n=$(tsteps 2>/dev/null || echo 0)
++  b=$(batchn 2>/dev/null || echo -1)
++
++  if [ "${n:-0}" -gt "${last_step:-0}" ] 2>/dev/null; then
++    line=$(tlast | grep -oE "Step [0-9]+ \| *[0-9hms ]+\| Loss [^|]*\| Entropy [^|]*\| Grad. Norm [^|]*")
++    rs=$(rewards)
++    mean=$(echo "$rs" | awk 'NF{s+=$1;c++} END{if(c)printf "%.4f (n=%d)",s/c,c; else print "n/a"}')
++    recent=$(echo "$rs" | tail -5 | tr '\n' ' ')
++    send "GLM-5.2 ${RUN} — trainer step ${n}/200
++${line}
++mean reward: ${mean}
++last 5: ${recent}"
++    log "notified step $n"
++    last_step=$n; echo "$n" > "$STATE"
++    stuck=0; frozen_notified=0
++  fi
++
++  # Frozen only if BOTH the step counter and the batch counter are static.
++  if [ "$b" = "$last_batch" ] && [ "${n:-0}" -eq "${last_step:-0}" ]; then
++    stuck=$((stuck + INTERVAL))
++  else
++    stuck=0; frozen_notified=0
++  fi
++  last_batch=$b
++
++  if [ "$stuck" -ge $((FREEZE_MIN * 60)) ] && [ "$frozen_notified" -eq 0 ]; then
++    msg="GLM-5.2 ${RUN} FROZEN: no trainer step and no batch progress for ${FREEZE_MIN} min (step ${n}, batch ${b})"
++    log "FREEZE detected"
++    send "$msg"
++    call "GLM training run frozen. No progress for ${FREEZE_MIN} minutes."
++    frozen_notified=1
++    stuck=0
++  fi
++
++  sleep "$INTERVAL"
++done
+-- 
+2.43.0
+

@@ -1,0 +1,672 @@
+diff --git a/scripts/china/cluster.sh b/scripts/china/cluster.sh
+index 41ebaaf..3eb0c62 100755
+--- a/scripts/china/cluster.sh
++++ b/scripts/china/cluster.sh
+@@ -118,7 +118,7 @@ case ${1:-} in
+       -v "$deployment/source/src/prime_rl/trainer/model.py":/app/src/prime_rl/trainer/model.py:ro \
+       -v "$deployment/source/packages/prime-rl-configs/src/prime_rl/configs/trainer.py":/app/packages/prime-rl-configs/src/prime_rl/configs/trainer.py:ro \
+       --env-file /data/trinity/training.env \
+-      -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False,garbage_collection_threshold:0.8,max_split_size_mb:256 \
++      -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8 \
+       -e TORCHINDUCTOR_COMPILE_THREADS=8 \
+       -e PRIME_EP_PROFILE="${PRIME_EP_PROFILE:-0}" \
+       -e PRIME_EP_PROFILE_EVERY="${PRIME_EP_PROFILE_EVERY:-150}" \
+diff --git a/scripts/china/run_supervisor.sh b/scripts/china/run_supervisor.sh
+new file mode 100644
+index 0000000..f4f7e70
+--- /dev/null
++++ b/scripts/china/run_supervisor.sh
+@@ -0,0 +1,64 @@
++#!/usr/bin/env bash
++# Keep the trainer and orchestrator alive. Runs on n82.
++#
++# Every component in this stack had a supervisor except the two that matter
++# most. The costs on 2026-08-06 alone:
++#   trainer died 10:13 ("Storage size calculation overflowed with
++#     sizes=[1, 9142729177965406720]", then an NCCL collective timeout as the
++#     other ranks waited on a dead rank 0) -- sat dead SIX HOURS
++#   engines died 03:13 and again 06:0x -- 2.6 hours before anyone noticed
++# Nothing restarted any of it. The engines now self-heal
++# (scripts/h200/engine_watchdog.sh); this does the same for the run itself.
++#
++# A trainer restart is safe here because the orchestrator tolerates the trainer
++# lagging by max_off_policy_steps and the trainer resumes from its last
++# checkpoint. It is NOT safe to restart the orchestrator while the trainer is
++# dead -- a zmq send to a dead peer blocks its event loop -- so the trainer is
++# always brought back first and the orchestrator only after it is listening.
++set -uo pipefail
++
++RUN=${RUN:?set RUN}
++RUN_NAME=${RUN_NAME:?set RUN_NAME}
++TAG=${CONFIG_TAG:?set CONFIG_TAG}
++TRAINER_NODES=${TRAINER_NODES:-"82 76 77 78 80 83 84 85"}
++NODES=${NODES:-"n76 n77 n78 n80 n82 n83 n84 n85"}
++INTERVAL=${INTERVAL:-120}
++CLUSTER=/data/glm52-rl/deployment/scripts/china/cluster.sh
++
++log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
++up() { sudo docker ps --filter "name=$1" --format up 2>/dev/null | head -1; }
++
++log "run supervisor started (RUN=$RUN TAG=$TAG interval=${INTERVAL}s)"
++
++while true; do
++  if [ "$(up glm52-decensor-trainer)" != "up" ]; then
++    log "TRAINER DOWN -- restarting across $NODES"
++    for h in $NODES; do
++      ssh -o BatchMode=yes -o ConnectTimeout=25 "$h" \
++        "sudo pkill -9 -f PRIME-RL 2>/dev/null; sudo docker rm -f glm52-decensor-trainer >/dev/null 2>&1" 2>/dev/null
++    done
++    # Let the host mirror of device memory drain before reloading, or the
++    # relaunch lands on a node still paging out the previous incarnation.
++    sleep 20
++    for h in $NODES; do
++      ( ssh -o BatchMode=yes -o ConnectTimeout=30 "$h" \
++          "TRAINER_NODES='$TRAINER_NODES' RUN=$RUN RUN_NAME=$RUN_NAME CONFIG_TAG=$TAG \
++           PRIME_EP_PROFILE=1 PRIME_EP_AC_CACHE=1 bash $CLUSTER trainer >/dev/null 2>&1" 2>/dev/null ) &
++    done
++    wait
++    log "trainer relaunch issued"
++    sleep 60
++  fi
++
++  if [ "$(up glm52-decensor-orchestrator)" != "up" ]; then
++    if [ "$(up glm52-decensor-trainer)" = "up" ]; then
++      log "ORCHESTRATOR DOWN -- restarting (trainer is up)"
++      RUN=$RUN RUN_NAME=$RUN_NAME CONFIG_TAG=$TAG bash "$CLUSTER" orchestrator >/dev/null 2>&1
++      log "orchestrator relaunch issued"
++    else
++      log "orchestrator down but trainer not up yet; waiting"
++    fi
++  fi
++
++  sleep "$INTERVAL"
++done
+diff --git a/scripts/china/tunnel_watchdog.sh b/scripts/china/tunnel_watchdog.sh
+old mode 100644
+new mode 100755
+index fe501b4..db14f3d
+--- a/scripts/china/tunnel_watchdog.sh
++++ b/scripts/china/tunnel_watchdog.sh
+@@ -1,45 +1,83 @@
+ #!/usr/bin/env bash
+-# Detect engine tunnels that are listening but not passing data, and kill them.
++# Rebuild engine tunnels that are listening but not passing data. Runs on n82.
+ #
+-# The H200-side supervisor (scripts/h200/start_tunnel.sh) only rebuilds a tunnel
+-# when its ssh process EXITS. Over the lossy China<->H200 path (10-33% packet
+-# loss measured) a tunnel routinely wedges with the forward still established:
+-# the port on n82 accepts connections and then never answers. With
+-# ServerAliveCountMax=20 x Interval=15 that state persists for 300s, and wedged
+-# tunnels accumulate -- observed 22 of 24 dead, with h200a taking zero traffic
+-# while h200b carried the whole run.
++# The H200-side supervisor (scripts/h200/start_tunnel.sh) only rebuilds a
++# tunnel when its ssh process EXITS. Over the lossy China<->H200 path (10-33%
++# packet loss measured) a tunnel routinely wedges with the forward still
++# established: the port accepts connections and then never answers. With
++# ServerAliveCountMax=20 x Interval=15 that persists for 300s, and wedged
++# tunnels accumulate -- observed 22 of 24 dead while h200a took zero traffic.
+ #
+ # Killing the n82-side sshd that holds the port makes the remote ssh exit, so
+-# the existing supervisor loop rebuilds it within ~5s. Nothing to change on the
+-# H200 hosts.
++# the existing supervisor rebuilds it within ~5s.
+ #
+-# Two consecutive failures are required before killing: a single slow reply
+-# under load is normal and must not trigger a rebuild.
++# CRITICAL: a dead ENGINE looks exactly like a wedged tunnel from here -- the
++# SSH forward still accepts the connection either way. On 2026-08-06 both vLLM
++# engines died (EngineCore RPC timeout) and this script spent 2.6 hours
++# cheerfully rebuilding all 24 tunnels against a dead backend while the run
++# sat stalled. n82 has no ssh access to the H200s, so it cannot check or fix
++# the engines directly; scripts/h200/engine_watchdog.sh does that locally.
++# What this script must do is NOT mask the problem: when nearly every tunnel
++# is failing at once the cause is almost certainly upstream, so it stops
++# churning and says so loudly instead.
+ set -uo pipefail
+ 
+ PORTS=${PORTS:-$(seq 18001 18024)}
+-TIMEOUT=${TIMEOUT:-10}
+-INTERVAL=${INTERVAL:-45}
++TIMEOUT=${TIMEOUT:-20}
++INTERVAL=${INTERVAL:-60}
++# Above this fraction of simultaneous failures, blame the backend, not the
++# tunnels. 24 ports -> 20 failures trips it.
++MASS_FAILURE_PCT=${MASS_FAILURE_PCT:-80}
+ declare -A misses
++total=0
++for _p in $PORTS; do total=$((total + 1)); done
++mass_streak=0
++
++log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
++log "tunnel watchdog started (${total} ports, timeout=${TIMEOUT}s, interval=${INTERVAL}s)"
+ 
+ while true; do
+-  killed=0
++  failed=""
++  nfail=0
+   for p in $PORTS; do
+     code=$(curl -s -o /dev/null -m "$TIMEOUT" -w "%{http_code}" "http://127.0.0.1:$p/v1/models" 2>/dev/null)
+     if [ "$code" = "200" ]; then
+       misses[$p]=0
+-      continue
++    else
++      nfail=$((nfail + 1))
++      failed="$failed $p"
+     fi
++  done
++
++  # ALWAYS rebuild. An earlier version refused when >=80% failed, on the theory
++  # that mass failure meant a dead backend it could not fix. That was wrong and
++  # it froze the run: at batch 1024 all 24 tunnels wedged at once under 4x the
++  # rollout load while the engines were healthy and generating, and the
++  # watchdog sat idle for five hours. The asymmetry is decisive -- rebuilding
++  # against a dead backend is harmless (it just fails again next cycle), while
++  # refusing to rebuild against a live backend stalls everything. So warn
++  # loudly on mass failure, then rebuild anyway.
++  if [ "$total" -gt 0 ] && [ $((nfail * 100 / total)) -ge "$MASS_FAILURE_PCT" ]; then
++    mass_streak=$((mass_streak + 1))
++    [ $((mass_streak % 5)) -eq 1 ] && log "*** $nfail/$total tunnels failing at once -- check the engines too, but rebuilding regardless"
++  else
++    mass_streak=0
++  fi
++
++  killed=0
++  for p in $failed; do
+     misses[$p]=$(( ${misses[$p]:-0} + 1 ))
++    # Two consecutive misses: one slow reply under load must not trigger a rebuild.
+     if [ "${misses[$p]}" -ge 2 ]; then
+       pid=$(sudo ss -H -lntp "sport = :$p" 2>/dev/null | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | head -1)
+       if [ -n "$pid" ]; then
+-        sudo kill "$pid" 2>/dev/null && killed=$((killed+1))
+-        echo "$(date -u +%H:%M:%S) killed wedged tunnel on :$p (pid $pid, code=${code:-none})"
++        sudo kill "$pid" 2>/dev/null && { killed=$((killed + 1)); log "killed wedged tunnel on :$p (pid $pid)"; }
++      else
++        log "tunnel :$p failing but nothing holds the port (remote supervisor down?)"
+       fi
+       misses[$p]=0
+     fi
+   done
+-  [ "$killed" -gt 0 ] && echo "$(date -u +%H:%M:%S) rebuilt $killed tunnel(s)"
++  [ "$killed" -gt 0 ] && log "rebuilt $killed tunnel(s)"
+   sleep "$INTERVAL"
+ done
+diff --git a/scripts/h200/engine_watchdog.sh b/scripts/h200/engine_watchdog.sh
+new file mode 100755
+index 0000000..0a7c49b
+--- /dev/null
++++ b/scripts/h200/engine_watchdog.sh
+@@ -0,0 +1,69 @@
++#!/usr/bin/env bash
++# Restart the local vLLM engine when it dies. Runs ON each H200 host.
++#
++# vLLM's EngineCore can die while the CONTAINER stays up: a worker RPC times
++# out ("TimeoutError: RPC call to sample_tokens timed out", preceded by "No
++# available shared memory broadcast block found in 60 seconds"), EngineCore
++# raises EngineDeadError, the API server shuts down, and docker still reports
++# the container as Up with the GPUs at 4 MiB. Observed 2026-08-06 03:13:30 on
++# both hosts with 63 requests in flight; the run then sat dead for 2.6 hours.
++#
++# The tunnel watchdog on n82 CANNOT see this -- the SSH forward still accepts
++# connections, so from n82 a dead engine is indistinguishable from a healthy
++# one until the request fails. And n82 has no ssh access to these hosts, so it
++# could not restart anything anyway. Hence a local self-healing loop.
++#
++# Neither container "Up" NOR /v1/models is a sufficient health signal. Observed
++# 2026-08-06 06:05 on h200a: models=200 while gen=000, "Running: 64" with
++# "throughput: 0.0" -- the API server was alive and answering while EngineCore
++# was hung and generating nothing. Only a real completion proves the engine
++# works, so that is what this probes.
++set -uo pipefail
++
++PORT=${PORT:-8000}
++MODEL=${MODEL:-/data/glm52-rl/model-fp8}
++INTERVAL=${INTERVAL:-60}
++TIMEOUT=${TIMEOUT:-15}
++FAILS_BEFORE_RESTART=${FAILS_BEFORE_RESTART:-2}
++START=/data/glm52-rl/deployment/scripts/h200/start_inference.sh
++misses=0
++
++log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
++log "engine watchdog started (port=$PORT interval=${INTERVAL}s timeout=${TIMEOUT}s)"
++
++while true; do
++  # A tiny real generation. max_tokens=3 keeps it cheap; a hung EngineCore
++  # never answers it even though /v1/models still returns 200.
++  code=$(curl -s -o /dev/null -m "$TIMEOUT" -w "%{http_code}" \
++    -X POST "http://127.0.0.1:$PORT/v1/completions" \
++    -H "Content-Type: application/json" \
++    -d "{\"model\":\"$MODEL\",\"prompt\":\"hi\",\"max_tokens\":3}" 2>/dev/null)
++  if [ "$code" = "200" ]; then
++    [ "$misses" -gt 0 ] && log "engine recovered (was $misses miss(es))"
++    misses=0
++  else
++    misses=$((misses + 1))
++    log "engine probe failed (code=${code:-none}) miss=$misses/$FAILS_BEFORE_RESTART"
++    if [ "$misses" -ge "$FAILS_BEFORE_RESTART" ]; then
++      gpu=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader 2>/dev/null | head -1)
++      log "RESTARTING ENGINE (gpu0=${gpu:-unknown})"
++      sudo docker rm -f glm52-decensor-h200 >/dev/null 2>&1
++      if bash "$START" >/dev/null 2>&1; then
++        log "start_inference.sh returned ok; waiting for engine to load"
++      else
++        log "WARNING start_inference.sh returned non-zero"
++      fi
++      # Loading the 745B checkpoint takes minutes; do not thrash it.
++      for _ in $(seq 1 40); do
++        sleep 30
++        c=$(curl -s -o /dev/null -m "$TIMEOUT" -w "%{http_code}" \
++          -X POST "http://127.0.0.1:$PORT/v1/completions" \
++          -H "Content-Type: application/json" \
++          -d "{\"model\":\"$MODEL\",\"prompt\":\"hi\",\"max_tokens\":3}" 2>/dev/null)
++        [ "$c" = "200" ] && { log "engine back up (generation verified)"; break; }
++      done
++      misses=0
++    fi
++  fi
++  sleep "$INTERVAL"
++done
+diff --git a/scripts/h200/start_inference.sh b/scripts/h200/start_inference.sh
+index 0328cfd..53ea956 100755
+--- a/scripts/h200/start_inference.sh
++++ b/scripts/h200/start_inference.sh
+@@ -30,4 +30,4 @@ docker run -d --name glm52-decensor-h200 --restart unless-stopped \
+   --entrypoint /app/.venv/bin/inference \
+   prime-rl:glm52-decensor \
+   @ "$deployment/configs/h200/inference.toml" \
+-  --vllm-extra '{"kv_cache_dtype":"fp8","max_num_seqs":512,"max_num_batched_tokens":65536,"compilation_config":{"max_cudagraph_capture_size":256}}'
++  --vllm-extra '{"kv_cache_dtype":"fp8","max_num_seqs":128,"max_num_batched_tokens":65536,"compilation_config":{"max_cudagraph_capture_size":256}}'
+diff --git a/scripts/h200/start_orchestrator.sh b/scripts/h200/start_orchestrator.sh
+index 3654ec2..7d3ab07 100644
+--- a/scripts/h200/start_orchestrator.sh
++++ b/scripts/h200/start_orchestrator.sh
+@@ -53,7 +53,7 @@ tunnel 18101 127.0.0.1:8000 "-p 40051 -i /root/.ssh/china_rollout_ed25519 root@1
+ # same 20 MB crossed in 9s with -C, and the live tunnel measured 4.9 MB/s --
+ # token ids and logprobs compress well.
+ tunnel 29620 10.92.20.82:29620 china-trainer yes
+-tunnel 18100 10.92.20.82:18100 china-trainer yes
++tunnel 18100 10.92.20.82:8100 china-trainer yes
+ 
+ sleep 6
+ for p in 18101 29620 18100; do
+diff --git a/scripts/h200/start_tunnel.sh b/scripts/h200/start_tunnel.sh
+index 3e33102..8d73dfb 100755
+--- a/scripts/h200/start_tunnel.sh
++++ b/scripts/h200/start_tunnel.sh
+@@ -5,6 +5,11 @@ remote_port=${1:?usage: start_tunnel.sh REMOTE_PORT LOCAL_PORT}
+ local_port=${2:?usage: start_tunnel.sh REMOTE_PORT LOCAL_PORT}
+ health_port=$((remote_port + 1000))
+ 
++# 10s x 3 = a dead tunnel is torn down in ~30s. It was 15 x 20 = 300s, and
++# over a link with 10-33% packet loss the wedged tunnels accumulated faster
++# than they were reaped: observed 22 of 24 dead with h200a taking zero traffic,
++# and later all 24 wedged at once. The n82-side watchdog probes for the wedges
++# SSH itself cannot see (forward alive, no data flowing).
+ while true; do
+   ssh -o BatchMode=yes -o ConnectTimeout=30 china-trainer \
+     "sudo ss -H -lntp 'sport = :$remote_port' | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | xargs -r sudo kill; sudo ss -H -lntp 'sport = :$health_port' | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | xargs -r sudo kill" || true
+@@ -12,8 +17,8 @@ while true; do
+     -o BatchMode=yes \
+     -o ConnectTimeout=30 \
+     -o ExitOnForwardFailure=yes \
+-    -o ServerAliveInterval=15 \
+-    -o ServerAliveCountMax=20 \
++    -o ServerAliveInterval=10 \
++    -o ServerAliveCountMax=3 \
+     -o TCPKeepAlive=yes \
+     -o IPQoS=none \
+     -R "127.0.0.1:$remote_port:127.0.0.1:$local_port" \
+diff --git a/scripts/ops/notify.sh b/scripts/ops/notify.sh
+new file mode 100644
+index 0000000..5a7a671
+--- /dev/null
++++ b/scripts/ops/notify.sh
+@@ -0,0 +1,99 @@
++#!/usr/bin/env bash
++# Telegram notifier for the RL run. Runs on h200a, NOT on n82.
++#
++# n82 cannot reach api.telegram.org at all (http=000) -- Telegram is blocked
++# from the China nodes. h200a reaches it fine, so the notifier lives there and
++# pulls the run state over ssh via the existing china-trainer alias.
++#
++#   per step   -> message with step time, reward, running mean, and health
++#   frozen run -> repeated CALL via CallMeBot (Telegram cannot place calls
++#                 itself; CallMeBot rings your Telegram account)
++#
++# Credentials come from the environment so nothing secret lands in git:
++#   TG_BOT_TOKEN   from @BotFather
++#   TG_CHAT_ID     from @userinfobot ("Id")
++#   CALLMEBOT_KEY  optional; from @CallMeBot_txtbot, enables the phone call
++#
++# Freeze definition: the TRAINER step counter has not advanced and the
++# ORCHESTRATOR batch counter has not advanced for FREEZE_MIN minutes. Both must
++# be stuck -- a slow batch alone is normal and must not page anyone.
++set -uo pipefail
++
++RUN=${RUN:-x22}
++RUN_NAME=${RUN_NAME:-run_$RUN}
++INTERVAL=${INTERVAL:-60}
++FREEZE_MIN=${FREEZE_MIN:-15}
++TG_BOT_TOKEN=${TG_BOT_TOKEN:-}
++TG_CHAT_ID=${TG_CHAT_ID:-}
++CALLMEBOT_KEY=${CALLMEBOT_KEY:-}
++STATE=/root/notify.state
++REMOTE=${REMOTE:-china-trainer}
++rsh() { ssh -o BatchMode=yes -o ConnectTimeout=20 "$REMOTE" "$1" 2>/dev/null; }
++
++log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
++
++send() { # text
++  [ -z "$TG_BOT_TOKEN" ] && { log "TG_BOT_TOKEN unset; would send: $1"; return; }
++  curl -s -m 20 -o /dev/null -X POST \
++    "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
++    --data-urlencode "chat_id=${TG_CHAT_ID}" \
++    --data-urlencode "text=$1" >/dev/null 2>&1
++}
++
++call() { # text -- rings the phone, for freezes only
++  [ -z "$CALLMEBOT_KEY" ] && { log "CALLMEBOT_KEY unset; no call placed"; return; }
++  curl -s -m 25 -o /dev/null -G "https://api.callmebot.com/start.php" \
++    --data-urlencode "user=@${TG_CHAT_ID}" \
++    --data-urlencode "text=$1" \
++    --data-urlencode "lang=en-US-Standard-B" \
++    --data-urlencode "rpt=2" >/dev/null 2>&1
++}
++
++tsteps() { rsh 'sudo docker logs glm52-decensor-trainer 2>&1 | grep -ac "SUCCESS Step"'; }
++tlast()  { rsh 'sudo docker logs glm52-decensor-trainer 2>&1 | sed "s/\x1b\[[0-9;]*m//g" | grep -a "SUCCESS Step" | tail -1'; }
++rewards(){ rsh 'sudo docker logs glm52-decensor-orchestrator 2>&1 | grep -a "SUCCESS Step" | grep -oE "Reward [0-9.]+"' | awk '{print $2}'; }
++batchn() { rsh 'sudo docker logs --tail 5 glm52-decensor-orchestrator 2>&1 | grep -oE "batch [0-9]+/" | tail -1' | grep -oE "[0-9]+"; }
++
++last_step=$(cat "$STATE" 2>/dev/null || echo 0)
++last_batch=-1
++stuck=0
++frozen_notified=0
++log "notifier started (run=$RUN interval=${INTERVAL}s freeze=${FREEZE_MIN}m)"
++
++while true; do
++  n=$(tsteps 2>/dev/null || echo 0)
++  b=$(batchn 2>/dev/null || echo -1)
++
++  if [ "${n:-0}" -gt "${last_step:-0}" ] 2>/dev/null; then
++    line=$(tlast | grep -oE "Step [0-9]+ \| *[0-9hms ]+\| Loss [^|]*\| Entropy [^|]*\| Grad. Norm [^|]*")
++    rs=$(rewards)
++    mean=$(echo "$rs" | awk 'NF{s+=$1;c++} END{if(c)printf "%.4f (n=%d)",s/c,c; else print "n/a"}')
++    recent=$(echo "$rs" | tail -5 | tr '\n' ' ')
++    send "GLM-5.2 ${RUN} — trainer step ${n}/200
++${line}
++mean reward: ${mean}
++last 5: ${recent}"
++    log "notified step $n"
++    last_step=$n; echo "$n" > "$STATE"
++    stuck=0; frozen_notified=0
++  fi
++
++  # Frozen only if BOTH the step counter and the batch counter are static.
++  if [ "$b" = "$last_batch" ] && [ "${n:-0}" -eq "${last_step:-0}" ]; then
++    stuck=$((stuck + INTERVAL))
++  else
++    stuck=0; frozen_notified=0
++  fi
++  last_batch=$b
++
++  if [ "$stuck" -ge $((FREEZE_MIN * 60)) ] && [ "$frozen_notified" -eq 0 ]; then
++    msg="GLM-5.2 ${RUN} FROZEN: no trainer step and no batch progress for ${FREEZE_MIN} min (step ${n}, batch ${b})"
++    log "FREEZE detected"
++    send "$msg"
++    call "GLM training run frozen. No progress for ${FREEZE_MIN} minutes."
++    frozen_notified=1
++    stuck=0
++  fi
++
++  sleep "$INTERVAL"
++done
+diff --git a/scripts/ops/watchdog_smoketest.sh b/scripts/ops/watchdog_smoketest.sh
+new file mode 100755
+index 0000000..6e744f1
+--- /dev/null
++++ b/scripts/ops/watchdog_smoketest.sh
+@@ -0,0 +1,69 @@
++#!/usr/bin/env bash
++# Smoke-test the watchdog decision logic against every failure mode we have
++# actually hit, using fake probe results so nothing real is touched.
++#
++# The bug this exists to prevent: on 2026-08-06 the tunnel watchdog spent 2.6
++# hours rebuilding all 24 tunnels while both vLLM engines were dead, because a
++# dead engine and a wedged tunnel are indistinguishable from n82. Case 4 is
++# that exact scenario.
++set -uo pipefail
++
++pass=0; fail=0
++check() { # name expected actual
++  if [ "$2" = "$3" ]; then echo "  PASS  $1"; pass=$((pass+1))
++  else echo "  FAIL  $1 (expected '$2', got '$3')"; fail=$((fail+1)); fi
++}
++
++# Mirror of the tunnel watchdog's decision: given N failures out of TOTAL,
++# does it rebuild tunnels, blame the backend, or do nothing?
++decide() { # nfail total pct
++  local nfail=$1 total=$2 pct=${3:-80}
++  [ "$nfail" -eq 0 ] && { echo "none"; return; }
++  [ $((nfail * 100 / total)) -ge "$pct" ] && { echo "backend"; return; }
++  echo "rebuild"
++}
++
++echo "== tunnel watchdog decision logic =="
++check "all healthy -> no action"                 "none"    "$(decide 0 24)"
++check "1 wedged -> rebuild"                      "rebuild" "$(decide 1 24)"
++check "11 wedged (46%) -> rebuild"               "rebuild" "$(decide 11 24)"
++check "19 wedged (79%) -> rebuild"               "rebuild" "$(decide 19 24)"
++check "20 down (83%) -> blame backend"           "backend" "$(decide 20 24)"
++check "24 down (100%) -> blame backend"          "backend" "$(decide 24 24)"
++check "the 2026-08-06 outage (0/24 up)"          "backend" "$(decide 24 24)"
++check "the 22-of-24 wedge (92%) -> backend"      "backend" "$(decide 22 24)"
++
++# Two consecutive misses required before killing, so a single slow reply
++# under load does not trigger a needless rebuild.
++echo "== debounce =="
++debounce() { # miss_count
++  [ "$1" -ge 2 ] && echo "kill" || echo "wait"
++}
++check "1 slow reply -> wait"                     "wait"    "$(debounce 1)"
++check "2 consecutive misses -> kill"             "kill"    "$(debounce 2)"
++
++# Engine watchdog: container Up must NOT count as healthy. Only HTTP 200 does.
++echo "== engine watchdog health signal =="
++# Health is decided by an actual generation, NOT by container state and NOT by
++# /v1/models. h200a on 2026-08-06 06:05 had models=200 with gen=000: API server
++# alive, EngineCore hung at "Running: 64, throughput: 0.0".
++engine_healthy() { # gen_code models_code container_state
++  [ "$1" = "200" ] && echo "healthy" || echo "dead"
++}
++check "gen 200, models 200, up -> healthy"        "healthy" "$(engine_healthy 200 200 up)"
++check "gen 000, models 200, up -> dead (hung core)" "dead"  "$(engine_healthy 000 200 up)"
++check "gen 000, models 000, up -> dead"           "dead"    "$(engine_healthy 000 000 up)"
++check "gen 000, models 000, exited -> dead"       "dead"    "$(engine_healthy 000 000 exited)"
++check "gen 500 -> dead"                           "dead"    "$(engine_healthy 500 200 up)"
++check "gen times out (000) despite models ok"     "dead"    "$(engine_healthy 000 200 up)"
++
++echo "== engine watchdog restart threshold =="
++eng_action() { # misses threshold
++  [ "$1" -ge "$2" ] && echo "restart" || echo "wait"
++}
++check "1 miss -> wait"                           "wait"    "$(eng_action 1 2)"
++check "2 misses -> restart"                      "restart" "$(eng_action 2 2)"
++
++echo
++echo "passed=$pass failed=$fail"
++[ "$fail" -eq 0 ]
+diff --git a/source/src/prime_rl/trainer/distributed/pipeline_parallel.py b/source/src/prime_rl/trainer/distributed/pipeline_parallel.py
+index 796d8cb..230c088 100644
+--- a/source/src/prime_rl/trainer/distributed/pipeline_parallel.py
++++ b/source/src/prime_rl/trainer/distributed/pipeline_parallel.py
+@@ -68,20 +68,44 @@ def balanced_boundaries(num_layers: int, pp_size: int, allowed: list[int] | None
+     # best[(stage, start)] -> (max_size, sum_sq, boundary_list)
+     from functools import lru_cache
+ 
++    # Balance PEAK MEMORY, not layer count. Under 1F1B stage s keeps
++    # (pp_size - s) micro-batches live, so its footprint is
++    #     layers * (per-layer weights + per-layer activations * in-flight)
++    # Minimising the largest stage ignores the in-flight term and loads the
++    # early stages hardest, which is where the host mirror hits its ceiling
++    # first (measured x16: 488 GB shared on stage 0 versus 112 GB on stage 7).
++    #
++    # Weighting by activations ALONE is worse, not better: it hands the last
++    # stage 32 of 78 layers, and weights dominate at ~1.5 GB/layer, so that
++    # stage needs 52 GB on a 48 GB card. Both terms have to be in the cost.
++    #
++    # Constants measured on x16 (10-layer stage 0, 8 micro-batches in flight):
++    #   at rest 15018 MiB  -> 1.50 GB per layer of weights
++    #   at peak 25938 MiB  -> (25938-15018)/(10*8) = 0.137 GB per layer per
++    #                         in-flight micro-batch
++    # Only their ratio matters to the optimiser, so drift in absolute values is
++    # harmless as long as weights stay roughly an order of magnitude larger.
++    _GB_WEIGHTS_PER_LAYER = 1.50
++    _GB_ACTS_PER_LAYER_PER_MICROBATCH = 0.137
++
++    def _stage_cost(size: int, stage: int) -> float:
++        in_flight = pp_size - stage
++        return size * (_GB_WEIGHTS_PER_LAYER + _GB_ACTS_PER_LAYER_PER_MICROBATCH * in_flight)
++
+     @lru_cache(maxsize=None)
+     def solve(stage: int, start: int):
+         if stage == pp_size - 1:
+-            size = num_layers - start
+-            return (size, size * size, (num_layers,))
++            cost = _stage_cost(num_layers - start, stage)
++            return (cost, cost * cost, (num_layers,))
+         best = (INF, INF, ())
+         for b in cand:
+             if b <= start:
+                 continue
+             if num_layers - b < pp_size - stage - 1:
+                 break
+-            size = b - start
++            cost = _stage_cost(b - start, stage)
+             sub_max, sub_sq, tail = solve(stage + 1, b)
+-            got = (max(size, sub_max), size * size + sub_sq, (b,) + tail)
++            got = (max(cost, sub_max), cost * cost + sub_sq, (b,) + tail)
+             if got[:2] < best[:2]:
+                 best = got
+         return best
+diff --git a/source/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py b/source/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py
+index 452fb75..685e419 100644
+--- a/source/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py
++++ b/source/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py
+@@ -207,7 +207,16 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
+         if len(self.layers) == 0:
+             return None, 0, 1
+ 
+-        layer = self.layers[0]
++        # Under pipeline parallelism apply_pp_boundaries replaces this
++        # ModuleList with nn.ModuleDict keyed by GLOBAL layer index as a STRING
++        # (pipeline_parallel.py:139), so `self.layers[0]` raises KeyError: 0 --
++        # both because the key is a str and because a non-first stage does not
++        # own layer 0 at all. Every layer on a stage carries the same cp
++        # attributes, so take whichever comes first.
++        if isinstance(self.layers, nn.ModuleDict):
++            layer = next(iter(self.layers.values()))
++        else:
++            layer = self.layers[0]
+         return getattr(layer, "_cp_group", None), getattr(layer, "_cp_rank", 0), getattr(layer, "_cp_world_size", 1)
+ 
+     def _gather_position_ids_for_cp(
+@@ -273,7 +282,17 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
+ 
+         cached_indices = None
+         use_index_cache = getattr(self.config, "use_index_cache", False)
+-        for layer_idx, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
++        # Under pipeline parallelism self.layers is an nn.ModuleDict keyed by
++        # GLOBAL layer index as a string (pipeline_parallel.py:139). It cannot be
++        # sliced, and enumerate() would hand back a local 0-based index while
++        # routed_experts is indexed by global layer -- silently replaying the
++        # wrong layer's router on every stage after the first. Keying by global
++        # index is the whole reason that ModuleDict exists, so use it.
++        if isinstance(self.layers, nn.ModuleDict):
++            layer_items = [(int(name), module) for name, module in self.layers.items()]
++        else:
++            layer_items = list(enumerate(self.layers[: self.config.num_hidden_layers]))
++        for layer_idx, decoder_layer in layer_items:
+             routed_experts_layer = routed_experts[:, :, layer_idx, :] if routed_experts is not None else None
+             hidden_states, next_cached_indices = decoder_layer(
+                 hidden_states,
+@@ -285,7 +304,12 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
+             )
+             cached_indices = next_cached_indices if use_index_cache else None
+ 
+-        hidden_states = self.norm(hidden_states)
++        # apply_pp_boundaries sets norm to None on every stage but the last
++        # (pipeline_parallel.py:161) -- the head is ~1.9 GB in bf16 and the
++        # non-final stages never use it. Only the last stage normalizes; the
++        # others hand their hidden states straight to the next stage.
++        if self.norm is not None:
++            hidden_states = self.norm(hidden_states)
+         return BaseModelOutputWithPast(last_hidden_state=hidden_states)
+ 
+ 
+diff --git a/source/src/prime_rl/trainer/rl/train.py b/source/src/prime_rl/trainer/rl/train.py
+index 5532c65..935d11e 100644
+--- a/source/src/prime_rl/trainer/rl/train.py
++++ b/source/src/prime_rl/trainer/rl/train.py
+@@ -39,6 +39,7 @@ from prime_rl.trainer.rl.loss import (
+ )
+ from prime_rl.trainer.rl.token_export import setup_token_exporter
+ from prime_rl.trainer.model import (
++    DTYPE_MAP,
+     forward,
+     setup_tokenizer,
+     setup_model,
+@@ -456,6 +457,34 @@ def train(config: TrainerConfig):
+         load_data_time = time.perf_counter() - load_batch_start_time
+         logger.debug(f"Loaded batch in {load_data_time:.2f} seconds")
+ 
++        # Reject a corrupt batch instead of dying on it. On 2026-08-06 10:13 a
++        # micro-batch arrived with input_ids of shape [1, 9142729177965406720]
++        # -- a sequence length just under 2^63, i.e. garbage deserialized as
++        # tensor metadata, not a real length. torch raised "Storage size
++        # calculation overflowed", rank 0 died, and the other ranks then hung
++        # until the NCCL collective timeout. The run sat dead for six hours.
++        #
++        # Sequences are packed to at most seq_len (times cp for the pre-shard
++        # case), so anything past a generous multiple of that is corruption.
++        # Skipping costs one batch; crashing costs the whole run.
++        _max_len = config.model.seq_len * max(config.model.cp, 1) * 4
++        _bad = []
++        for _i, _mb in enumerate(micro_batches):
++            _ids = _mb.get("input_ids") if isinstance(_mb, dict) else None
++            if _ids is None:
++                _bad.append((_i, "missing input_ids"))
++                continue
++            if _ids.dim() != 2 or _ids.shape[0] != 1 or not (0 < _ids.shape[1] <= _max_len):
++                _bad.append((_i, f"input_ids shape {tuple(_ids.shape)} (max len {_max_len})"))
++        if _bad:
++            for _i, _why in _bad[:5]:
++                logger.error(f"Corrupt micro-batch {_i}: {_why}")
++            logger.error(
++                f"Discarding batch at step {progress.step}: {len(_bad)}/{len(micro_batches)} micro-batches corrupt. "
++                "Waiting for the next batch rather than crashing the run."
++            )
++            continue
++
+         batch_size = len(micro_batches)
+         memory_profiler = None
+         if config.memory_profiler_path is not None:
+@@ -831,7 +860,18 @@ def train(config: TrainerConfig):
+             # exact tensors and skip the metadata-exchange rendezvous.
+             _L = pp_side_inputs[0]["input_ids"].shape[1]
+             _hs = getattr(model.config, "hidden_size", None) or model.config.text_config.hidden_size
+-            _stage_dtype = next(pp_stage_module.model.parameters()).dtype
++            # The inter-stage buffers carry ACTIVATIONS, so their dtype is
++            # optimization_dtype -- NOT the dtype of the first parameter. Those
++            # coincided under bf16 weights, but with
++            # `quantization.dequantize_checkpoint = false` the first parameter is
++            # float8_e4m3fn, which declared every hidden-state buffer fp8 and
++            # failed as
++            #   PipeliningShapeError: Stage 1 forward outputs: value 0 has a
++            #   dtype mismatch: expected torch.float8_e4m3fn actual torch.bfloat16
++            # Scanning for the first "real float" parameter is no better: an fp32
++            # weight_scale_inv can precede the bf16 weights and would declare the
++            # buffers fp32. Read the configured value instead.
++            _stage_dtype = DTYPE_MAP[config.model.optimization_dtype]
+             _hidden_ex = torch.empty(1, _L, _hs, dtype=_stage_dtype, device="cuda")
+             _is_last = pp_rank == parallel_dims.pp - 1
+             pp_schedule = build_pp_schedule(
