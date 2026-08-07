@@ -139,12 +139,65 @@ rebuilds it.
 An early version refused to rebuild when 80 percent of the tunnels failed.
 That version stopped the run for 5 hours. The script now always rebuilds.
 
+The script also writes a heartbeat line every 4 cycles, which is about every 3
+minutes. Without it the script logged only when it killed a port, so a healthy
+idle watchdog and a wedged one looked the same from outside. The only other
+liveness test, a process count, cannot return zero when the probe matches its
+own command line. `HEARTBEAT=0` turns the line off.
+
+# scripts/h200/engine_watchdog.sh
+
+`START`, `RELOAD_TRIES`, and `RELOAD_WAIT` are now environment variables with
+the previous values as defaults.
+
+This lets `watchdog_smoketest.sh` drive the real script against a fake
+launcher. Before this the launcher path was fixed, so the suite could only test
+a copy of the logic.
+
 # scripts/ops/watchdog_smoketest.sh
 
-This script tests the logic of the watchdogs. It uses false input data. It
-does not touch the system.
+This script tests the watchdogs. It does not touch the system.
 
-The script has 18 tests. The tests include the two real failures.
+The first version re-implemented each watchdog's decision as a local shell
+function and tested that copy. It reported 18 of 18 passed while three of its
+cases asserted the opposite of the shipped behaviour: they still expected the
+tunnel watchdog to refuse to rebuild on mass failure, a rule that was removed
+after it froze the run for 5 hours. A test that mirrors the logic cannot detect
+a change to the logic.
+
+The script now runs the real watchdog scripts. It shadows `curl`, `ss`, `kill`,
+`sudo`, `docker`, `nvidia-smi` and `sleep` on PATH, so each case drives the
+real decision path and asserts on what the script does. The fake `sleep` counts
+loop cycles and stops the script under test after an exact number, so no case
+depends on a timeout race.
+
+There are 26 tests. The suite was checked by putting the removed rule back,
+which turned 4 cases red.
+
+Three tests cover the liveness probe itself. They show that the naive pattern
+matches its own shell, that bracketing the first word does not help, and that
+bracketing the last token works.
+
+# .agents/skills/glm52-ops/
+
+A Prime Agent skill that holds the daily operations: `status`, `reward`,
+`watch`, `tunnels`, `engines`, `alive`, `repair`, `deploy`, `start`, and
+`stop`.
+
+The skill puts four rules into code and raises `Refused` instead of obeying a
+request that breaks them: n79 is never touched, `PRIME_BATCH_CACHE` is never
+forwarded, `watch` blocks instead of running in the background, and `reward`
+gives no trend verdict below 10 steps or inside twice the residual spread.
+
+`deploy` reads the mount list out of `cluster.sh` and refuses a `source/` path
+that the container does not mount, because such a change has no effect.
+
+`reward` reports the `effective` series and the `all` series separately, and
+says when a rise in `all` is the falling error rate rather than learning.
+
+`SKILL.md` gives the interface. `references/FAULTS.md` gives the symptom, the
+cause, and the one repair for each fault. `references/RULES.md` gives the rules
+with their reasons.
 
 # THE CHANGES TO THE SCRIPTS
 
@@ -155,6 +208,20 @@ from 20 to 3.
 
 A dead tunnel is now removed in 30 seconds. The old value was 300 seconds. The
 tunnels collected faster than SSH removed them.
+
+This reverses an earlier change, and the earlier change was correct at the
+time. `AGENTS.md` recorded that 15 and 20 took healthy tunnels from 10 of 24 to
+23 of 24. On a link that loses 13 to 17 percent of the packets, three missed
+keepalives happen often, so a short tolerance killed tunnels that still worked.
+
+What changed is that n82 now tests the data path. `tunnel_watchdog.sh` probes
+each port with a real HTTP request and kills only a port that fails two times.
+The SSH keepalive no longer decides health. Its only remaining task is to make
+the remote `ssh` process exit quickly, so the supervisor on the H200 host can
+rebuild.
+
+Do not raise the keepalive again without also removing the data-path probe. One
+of the two must own the decision.
 
 # scripts/h200/start_inference.sh
 
@@ -195,27 +262,8 @@ The orchestrator must run on n82. The batch cannot cross the link.
 
 # THE MEASUREMENTS
 
-Host memory with activation offloading on: 486 GB of 503 GB. The nodes
-stopped.
+The measurements are in `docs/PERFORMANCE.md`. They are written once, there.
 
-Host memory with activation offloading off: 3 GB. The available memory was 460
-GB.
-
-Mismatch KL with FP8 weights: 7 to 9 nats. The positive advantage was 0.003.
-
-Mismatch KL with bf16 weights: 0.2 nats. The positive advantage was 0.3.
-
-Entropy with FP8 weights: 9.2 nats. The vocabulary limit is 11.95 nats.
-
-Entropy with bf16 weights: 0.45 nats.
-
-Gradient norm with FP8 weights: 200000 to 330000. The clip limit is 1.0.
-
-Gradient norm with bf16 weights: 0.013 to 0.043.
-
-Batch transfer over the tunnel: it did not complete. Over the loopback
-interface: 0.45 seconds.
-
-Tunnels healthy at 1024 rollouts in flight: 10 of 24. At 256: 20 of 24.
-
-Engine concurrency at 1024 rollouts in flight: 1 to 6. At 256: 45 to 70.
+That document also marks which numbers came from the earlier topology, which
+used global expert parallelism and `cp = 4`. Those numbers do not apply to the
+current run.

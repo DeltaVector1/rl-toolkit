@@ -25,6 +25,11 @@ set -uo pipefail
 PORTS=${PORTS:-$(seq 18001 18024)}
 TIMEOUT=${TIMEOUT:-20}
 INTERVAL=${INTERVAL:-60}
+# Heartbeat. Without it this script logs only when it kills something, so a
+# healthy idle watchdog and a wedged one look identical from outside -- and the
+# only other liveness test, `pgrep -fc`, counts its own grep and can never
+# return zero. A periodic line makes "still checking" observable.
+HEARTBEAT=${HEARTBEAT:-5}
 # Above this fraction of simultaneous failures, blame the backend, not the
 # tunnels. 24 ports -> 20 failures trips it.
 MASS_FAILURE_PCT=${MASS_FAILURE_PCT:-80}
@@ -32,6 +37,7 @@ declare -A misses
 total=0
 for _p in $PORTS; do total=$((total + 1)); done
 mass_streak=0
+cycle=0
 
 log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
 log "tunnel watchdog started (${total} ports, timeout=${TIMEOUT}s, interval=${INTERVAL}s)"
@@ -79,5 +85,11 @@ while true; do
     fi
   done
   [ "$killed" -gt 0 ] && log "rebuilt $killed tunnel(s)"
+
+  cycle=$((cycle + 1))
+  if [ "$HEARTBEAT" -gt 0 ] && [ $((cycle % HEARTBEAT)) -eq 0 ]; then
+    log "heartbeat: $((total - nfail))/$total tunnels healthy"
+  fi
+
   sleep "$INTERVAL"
 done

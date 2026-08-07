@@ -25,7 +25,11 @@ MODEL=${MODEL:-/data/glm52-rl/model-fp8}
 INTERVAL=${INTERVAL:-60}
 TIMEOUT=${TIMEOUT:-15}
 FAILS_BEFORE_RESTART=${FAILS_BEFORE_RESTART:-2}
-START=/data/glm52-rl/deployment/scripts/h200/start_inference.sh
+# Overridable so scripts/ops/watchdog_smoketest.sh can drive this real script
+# against a fake launcher instead of re-implementing its decisions.
+START=${START:-/data/glm52-rl/deployment/scripts/h200/start_inference.sh}
+RELOAD_TRIES=${RELOAD_TRIES:-40}
+RELOAD_WAIT=${RELOAD_WAIT:-30}
 misses=0
 
 log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
@@ -54,8 +58,8 @@ while true; do
         log "WARNING start_inference.sh returned non-zero"
       fi
       # Loading the 745B checkpoint takes minutes; do not thrash it.
-      for _ in $(seq 1 40); do
-        sleep 30
+      for _ in $(seq 1 "$RELOAD_TRIES"); do
+        sleep "$RELOAD_WAIT"
         c=$(curl -s -o /dev/null -m "$TIMEOUT" -w "%{http_code}" \
           -X POST "http://127.0.0.1:$PORT/v1/completions" \
           -H "Content-Type: application/json" \
