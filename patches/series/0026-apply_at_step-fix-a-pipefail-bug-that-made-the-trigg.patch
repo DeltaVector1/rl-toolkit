@@ -1,0 +1,119 @@
+From 2438632380bf2cbef3c6dcc87b904da8b7d1e624 Mon Sep 17 00:00:00 2001
+From: DeltaVector1 <DeltaVector1@users.noreply.github.com>
+Date: Fri, 7 Aug 2026 09:01:30 +0000
+Subject: [PATCH 26/26] apply_at_step: fix a pipefail bug that made the trigger
+ never fire
+
+`sudo docker logs ... | grep -q PATTERN` under `set -o pipefail` returns 141,
+not 0: grep -q exits at the first match, docker logs takes SIGPIPE, and
+pipefail reports the rightmost non-zero status. The test therefore read false
+exactly when the pattern WAS present, so the applier sat waiting for a step
+that had already finished. Reproduced in isolation before fixing. Use grep -c
+and compare the count.
+
+The same shape was in the dispatcher-pause check.
+
+status(): correct the tunnel warning. It claimed 256 in flight was a safe
+value; measurement showed 256 oversubscribes the tunnels too. A low healthy
+count is now reported as something to confirm against the engines rather than
+as dead tunnels, because the probe starves under load on links that still
+carry rollouts.
+
+status(): warn when many rollouts are in flight while the engines generate
+nothing. Requires near-zero throughput AND zero running, because a rollout in
+flight may be at the judge or in the environment rather than generating, and
+`running` is one sample.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017wiESxhziDrnsLnG9aizTd
+---
+ .../glm52-ops/src/glm52_ops/__init__.py       | 28 +++++++++++++++++--
+ scripts/china/apply_at_step.sh                | 10 +++++--
+ 2 files changed, 32 insertions(+), 6 deletions(-)
+
+diff --git a/.agents/skills/glm52-ops/src/glm52_ops/__init__.py b/.agents/skills/glm52-ops/src/glm52_ops/__init__.py
+index 164020c..ed064e5 100644
+--- a/.agents/skills/glm52-ops/src/glm52_ops/__init__.py
++++ b/.agents/skills/glm52-ops/src/glm52_ops/__init__.py
+@@ -406,12 +406,34 @@ def _warnings(s: Status) -> list[str]:
+     if not s.orch_up:
+         w.append("orchestrator container is not up")
+     if s.tunnels_ok <= 10:
++        # Do not read this as dead tunnels on its own. The probe shares each
++        # tunnel with rollout traffic, so under load it starves on links that
++        # still carry rollouts. Confirm against the engines before acting:
++        # engines generating means the tunnels work and the probe is starved;
++        # engines idle with many rollouts in flight means the requests are
++        # stuck in the tunnels and max_inflight_rollouts is too high.
+         w.append(
+-            f"only {s.tunnels_ok}/24 tunnels answer. This is the signature of too much rollout load. "
+-            "Check max_inflight_rollouts; 256 holds, 1024 collapses."
++            f"only {s.tunnels_ok}/24 tunnels answer. Check the engines before you believe this. "
++            "If they are generating, the probe is starved by load, not by dead tunnels."
+         )
+     elif s.tunnels_ok < 18:
+-        w.append(f"{s.tunnels_ok}/24 tunnels answer; the healthy band is 20 to 22")
++        w.append(f"{s.tunnels_ok}/24 tunnels answer. Compare against the engine concurrency below.")
++    # Starvation means the engines are producing nothing while many rollouts are
++    # in flight. A low `running` count on its own is not evidence: a rollout in
++    # flight may be at the judge or in the environment rather than generating,
++    # and `running` is a single sample from the last log line. Require the
++    # throughput to be near zero as well, and confirm with several samples
++    # before acting on it.
++    inflight = re.search(r"(\d+) inflight", s.batch or "")
++    live = [e for e in s.engines if e.reachable]
++    if inflight and int(inflight.group(1)) > 40 and live:
++        tput = sum(e.throughput for e in live)
++        if tput < 5.0 and sum(e.running for e in live) == 0:
++            w.append(
++                f"{inflight.group(1)} rollouts in flight but the engines generate {tput:.1f} tok/s "
++                "and run nothing. Sample again before acting. If it holds, the requests are queued "
++                "in the tunnels; lower max_inflight_rollouts, which is independent of batch_size."
++            )
+     for e in s.engines:
+         if e.reachable and not e.healthy:
+             w.append(f"{e.host} failed a real completion probe (code {e.gen_code}). Run repair('engine:{e.host}').")
+diff --git a/scripts/china/apply_at_step.sh b/scripts/china/apply_at_step.sh
+index 71ce1f3..5b41595 100755
+--- a/scripts/china/apply_at_step.sh
++++ b/scripts/china/apply_at_step.sh
+@@ -28,6 +28,7 @@ ORCH_CT=glm52-decensor-orchestrator
+ 
+ log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
+ strip() { sed 's/\x1b\[[0-9;]*m//g'; }
++step_done() { sudo docker logs "$TRAINER_CT" 2>&1 | strip | grep -ca "SUCCESS Step $STEP " || true; }
+ 
+ log "waiting for trainer step $STEP, then restarting the orchestrator (tag=$TAG)"
+ 
+@@ -44,14 +45,17 @@ fi
+ 
+ deadline=$(( $(date +%s) + GIVE_UP_HOURS * 3600 ))
+ while [ "$(date +%s)" -lt "$deadline" ]; do
+-  if sudo docker logs "$TRAINER_CT" 2>&1 | strip | grep -qa "SUCCESS Step $STEP "; then
++  # grep -c, never grep -q. With `set -o pipefail`, grep -q exits on the first
++  # match, docker logs takes SIGPIPE, and the pipeline reports 141 -- so the
++  # test reads false exactly when the pattern IS present.
++  if [ "$(step_done)" -gt 0 ]; then
+     log "trainer step $STEP is complete"
+     break
+   fi
+   sleep "$INTERVAL"
+ done
+ 
+-if ! sudo docker logs "$TRAINER_CT" 2>&1 | strip | grep -qa "SUCCESS Step $STEP "; then
++if [ "$(step_done)" -eq 0 ]; then
+   log "ABORT: gave up after ${GIVE_UP_HOURS}h; step $STEP never completed. Nothing was restarted."
+   exit 1
+ fi
+@@ -82,7 +86,7 @@ fi
+ # The one restart failure that cannot be repaired in place: the orchestrator
+ # waiting for a policy version the trainer cannot produce. The fix is a new run
+ # name, so say so loudly rather than pretend the restart worked.
+-if sudo docker logs --tail 200 "$ORCH_CT" 2>&1 | grep -qa "Pausing dispatcher"; then
++if [ "$(sudo docker logs --tail 200 "$ORCH_CT" 2>&1 | grep -ca "Pausing dispatcher" || true)" -gt 0 ]; then
+   log "WARNING: 'Pausing dispatcher' in the orchestrator log. It expects a policy version"
+   log "WARNING: the trainer cannot make. This needs a NEW RUN NAME; it cannot be repaired here."
+ fi
+-- 
+2.43.0
+

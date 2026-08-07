@@ -406,12 +406,34 @@ def _warnings(s: Status) -> list[str]:
     if not s.orch_up:
         w.append("orchestrator container is not up")
     if s.tunnels_ok <= 10:
+        # Do not read this as dead tunnels on its own. The probe shares each
+        # tunnel with rollout traffic, so under load it starves on links that
+        # still carry rollouts. Confirm against the engines before acting:
+        # engines generating means the tunnels work and the probe is starved;
+        # engines idle with many rollouts in flight means the requests are
+        # stuck in the tunnels and max_inflight_rollouts is too high.
         w.append(
-            f"only {s.tunnels_ok}/24 tunnels answer. This is the signature of too much rollout load. "
-            "Check max_inflight_rollouts; 256 holds, 1024 collapses."
+            f"only {s.tunnels_ok}/24 tunnels answer. Check the engines before you believe this. "
+            "If they are generating, the probe is starved by load, not by dead tunnels."
         )
     elif s.tunnels_ok < 18:
-        w.append(f"{s.tunnels_ok}/24 tunnels answer; the healthy band is 20 to 22")
+        w.append(f"{s.tunnels_ok}/24 tunnels answer. Compare against the engine concurrency below.")
+    # Starvation means the engines are producing nothing while many rollouts are
+    # in flight. A low `running` count on its own is not evidence: a rollout in
+    # flight may be at the judge or in the environment rather than generating,
+    # and `running` is a single sample from the last log line. Require the
+    # throughput to be near zero as well, and confirm with several samples
+    # before acting on it.
+    inflight = re.search(r"(\d+) inflight", s.batch or "")
+    live = [e for e in s.engines if e.reachable]
+    if inflight and int(inflight.group(1)) > 40 and live:
+        tput = sum(e.throughput for e in live)
+        if tput < 5.0 and sum(e.running for e in live) == 0:
+            w.append(
+                f"{inflight.group(1)} rollouts in flight but the engines generate {tput:.1f} tok/s "
+                "and run nothing. Sample again before acting. If it holds, the requests are queued "
+                "in the tunnels; lower max_inflight_rollouts, which is independent of batch_size."
+            )
     for e in s.engines:
         if e.reachable and not e.healthy:
             w.append(f"{e.host} failed a real completion probe (code {e.gen_code}). Run repair('engine:{e.host}').")

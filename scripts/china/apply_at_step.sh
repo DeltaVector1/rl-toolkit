@@ -28,6 +28,7 @@ ORCH_CT=glm52-decensor-orchestrator
 
 log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
 strip() { sed 's/\x1b\[[0-9;]*m//g'; }
+step_done() { sudo docker logs "$TRAINER_CT" 2>&1 | strip | grep -ca "SUCCESS Step $STEP " || true; }
 
 log "waiting for trainer step $STEP, then restarting the orchestrator (tag=$TAG)"
 
@@ -44,14 +45,17 @@ fi
 
 deadline=$(( $(date +%s) + GIVE_UP_HOURS * 3600 ))
 while [ "$(date +%s)" -lt "$deadline" ]; do
-  if sudo docker logs "$TRAINER_CT" 2>&1 | strip | grep -qa "SUCCESS Step $STEP "; then
+  # grep -c, never grep -q. With `set -o pipefail`, grep -q exits on the first
+  # match, docker logs takes SIGPIPE, and the pipeline reports 141 -- so the
+  # test reads false exactly when the pattern IS present.
+  if [ "$(step_done)" -gt 0 ]; then
     log "trainer step $STEP is complete"
     break
   fi
   sleep "$INTERVAL"
 done
 
-if ! sudo docker logs "$TRAINER_CT" 2>&1 | strip | grep -qa "SUCCESS Step $STEP "; then
+if [ "$(step_done)" -eq 0 ]; then
   log "ABORT: gave up after ${GIVE_UP_HOURS}h; step $STEP never completed. Nothing was restarted."
   exit 1
 fi
@@ -82,7 +86,7 @@ fi
 # The one restart failure that cannot be repaired in place: the orchestrator
 # waiting for a policy version the trainer cannot produce. The fix is a new run
 # name, so say so loudly rather than pretend the restart worked.
-if sudo docker logs --tail 200 "$ORCH_CT" 2>&1 | grep -qa "Pausing dispatcher"; then
+if [ "$(sudo docker logs --tail 200 "$ORCH_CT" 2>&1 | grep -ca "Pausing dispatcher" || true)" -gt 0 ]; then
   log "WARNING: 'Pausing dispatcher' in the orchestrator log. It expects a policy version"
   log "WARNING: the trainer cannot make. This needs a NEW RUN NAME; it cannot be repaired here."
 fi
