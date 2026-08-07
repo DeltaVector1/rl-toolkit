@@ -146,17 +146,6 @@ does not touch the system.
 
 The script has 18 tests. The tests include the two real failures.
 
-# scripts/ops/notify.sh
-
-This script sends a Telegram message for each step. It sends a message and a
-telephone call when the run stops.
-
-The script runs on h200a. The China nodes cannot reach Telegram.
-
-A stopped run needs two conditions. The trainer step count must not change.
-The orchestrator batch count must not change. One slow batch is normal. A slow
-batch must not send an alarm.
-
 # THE CHANGES TO THE SCRIPTS
 
 # scripts/h200/start_tunnel.sh

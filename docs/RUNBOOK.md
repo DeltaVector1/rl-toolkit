@@ -195,22 +195,6 @@ orchestrator does not.
 
 The repair is a new run name. Do not try to repair the old run directory.
 
-# THE TELEGRAM NOTIFIER
-
-The notifier runs on h200a. The China nodes cannot reach Telegram.
-
-```
-ssh h200a 'nohup setsid env RUN=xNN INTERVAL=60 FREEZE_MIN=15 \
-  TG_BOT_TOKEN=<token> TG_CHAT_ID=<id> CALLMEBOT_KEY=1 \
-  bash /root/notify.sh >> /root/notify.log 2>&1 </dev/null & disown'
-```
-
-The bot is `@primetrainerbot`.
-
-The telephone call needs an authorization in a web browser. The address is
-`https://api2.callmebot.com/txt/auth.php?user=@DeltaAries`. The text messages
-work without this authorization.
-
 # THE KEY FOR n81
 
 n81 is healthy. n81 has no authorized key. Add this key to

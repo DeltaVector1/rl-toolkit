@@ -1,7 +1,7 @@
 From 1a44463fe5599e3f69738a20656792b3e0bd5c4e Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Thu, 6 Aug 2026 19:28:22 +0000
-Subject: [PATCH 13/17] Add Telegram notifier: per-step stats and freeze
+Subject: [PATCH 13/19] Add Telegram notifier: per-step stats and freeze
  call-out
 
 Per step: step time, loss, entropy, grad norm, running mean reward, last 5

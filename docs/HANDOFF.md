@@ -34,9 +34,6 @@ milliseconds of round trip time.
 The engines connect to n82 with 24 SSH reverse tunnels. The ports are 18001 to
 18024.
 
-The China nodes cannot reach api.telegram.org. Telegram is blocked. Send the
-Telegram messages from h200a.
-
 # HOW TO START THE RUN
 
 Do these steps in this sequence. Do not change the sequence.
@@ -317,9 +314,6 @@ noise.
 Add the SSH public key to n81. The key is in `docs/RUNBOOK.md`. The node is
 healthy. The node has no authorized key. n81 gives 72 GPUs. A change of the
 pipeline layout is necessary.
-
-Complete the CallMeBot authorization if you want the telephone call. The web
-page is broken. The Telegram text messages work now.
 
 Make the trainer use W8A16. That change gives back the FP8 memory and keeps
 the mismatch KL low.
