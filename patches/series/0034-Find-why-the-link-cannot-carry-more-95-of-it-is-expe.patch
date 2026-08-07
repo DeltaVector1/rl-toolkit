@@ -1,0 +1,190 @@
+From 132c1c5c8d10f1408376acec8694c08c982799f9 Mon Sep 17 00:00:00 2001
+From: DeltaVector1 <DeltaVector1@users.noreply.github.com>
+Date: Fri, 7 Aug 2026 16:52:40 +0000
+Subject: [PATCH 34/34] Find why the link cannot carry more: 95% of it is
+ expert routing
+
+Measured one /inference/v1/generate response. routed_experts is 95.5% of the
+compressed bytes; tokens and logprobs together are under 5%. It is 711 bytes
+for each generated token, already uint8 at exactly 1 byte an element, and it
+gzips only 1.4x because it is already binary. Shape is [positions, 78 layers,
+8 experts], so every token costs 624 expert indices.
+
+That is 2.79 MB for each rollout on the wire and about 5.2 Mbit/s at 14
+rollouts a minute, across a path measured at 7.5% packet loss and 210 ms.
+
+So the batch size is not limited by tunnels, concurrency, or the engines. It is
+limited by shipping an expert routing table for every token. enable_router_
+replay = true is what asks for it, and turning it off would cut the payload
+about 20x.
+
+Topology found while chasing this: the engines reach n82 through ProxyJump via
+a jump host, so every tunnel is SSH inside SSH and the lossy leg carries two
+layers of flow control. The bulk flows H200 -> n82, so the H200 is the sender
+and its congestion control is the one that matters -- and BBR cannot be loaded
+there because the engine hosts are Docker containers without CAP_SYS_MODULE.
+A userspace FEC tunnel would avoid that, but UDP and arbitrary TCP to the jump
+host both time out; only SSH on 31331 crosses.
+
+scripts/network/tune_wan.sh applies what is available: BBR on n82 for the two
+engine routes only, plus tcp_slow_start_after_idle=0, tcp_mtu_probing=1 and a
+32 MB buffer ceiling on both ends. BBR is deliberately not global on n82: NCCL
+crosses the same interface, where cubic measured 87% against BBR's 36%.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017wiESxhziDrnsLnG9aizTd
+---
+ docs/PERFORMANCE.md         | 65 +++++++++++++++++++++++++++++++++++++
+ scripts/network/tune_wan.sh | 64 ++++++++++++++++++++++++++++++++++++
+ 2 files changed, 129 insertions(+)
+ create mode 100755 scripts/network/tune_wan.sh
+
+diff --git a/docs/PERFORMANCE.md b/docs/PERFORMANCE.md
+index 3b47f4a..61c00dc 100644
+--- a/docs/PERFORMANCE.md
++++ b/docs/PERFORMANCE.md
+@@ -188,6 +188,71 @@ to 128 because dead requests held the slots. That reason is gone, and the
+ engines run 8 to 20 concurrent against a `max_num_seqs` of 128, so they have
+ much headroom.
+ 
++# WHAT ACTUALLY CROSSES THE LINK
++
++Measured on a single `/inference/v1/generate` call, 2026-08-07:
++
++| Field | Share of compressed bytes |
++|---|---:|
++| `routed_experts` | 95.5% |
++| `logprobs` | ~4% |
++| `token_ids`, `finish_reason`, `index` | <1% |
++
++`routed_experts` is 711 bytes for each generated token. It is already encoded
++as tightly as it can be: `dtype` is `uint8`, exactly 1 byte for each element,
++and it gzips only 1.4 times because it is already binary. Its shape is
++`[positions, 78 MoE layers, 8 experts]`, so each token costs 78 x 8 = 624
++expert indices.
++
++That is 2.79 MB for each rollout on the wire, and about 5.2 Mbit/s at 14
++rollouts a minute, over a path that loses 7.5 percent of its packets.
++
++The useful content, the tokens and their logprobs, is under 5 percent of it.
++
++This is why the batch size cannot be raised. The transport is not carrying
++rollouts, it is carrying expert routing tables.
++
++`enable_router_replay = true` is what asks for it. The trainer replays the
++engine's expert choices instead of choosing its own, so the two forward passes
++agree. Without it the payload falls by about 20 times.
++
++The LoRA adapts `q_a_proj`, `q_b_proj`, `kv_a_proj_with_mqa`, and `o_proj`
++only. The router is not adapted and its weights are frozen and identical on
++both sides, so the only source of routing disagreement is numeric: the trainer
++runs bf16 with `moe_router_dtype = "float32"` and the engine runs W8A16. How
++much that actually flips a top-8 selection is not known and has not been
++measured.
++
++Current mismatch KL with replay on: masked 0.19 to 0.21, unmasked 0.012,
++entropy 0.47. Those are the numbers a run without replay must not spoil. For
++comparison, the FP8 trainer experiment pushed masked mismatch KL to 7 to 9
++nats and entropy to 9.2, and the reward collapsed.
++
++# THE TOPOLOGY, AND WHAT IT RULES OUT
++
++```
++H200 (docker) --internet, 7.5% loss, 210 ms--> jump 202.101.73.12 --LAN--> n82
++```
++
++The engines reach n82 through `ProxyJump`, so each tunnel is SSH inside SSH and
++the lossy leg carries two layers of channel flow control.
++
++The bulk data travels H200 to n82, so the H200 is the sender and its congestion
++control is the one that matters. BBR cannot be loaded there: the engine hosts
++are Docker containers without `CAP_SYS_MODULE`, and the host has not loaded
++`tcp_bbr` either.
++
++A userspace FEC tunnel (kcptun, UDPspeeder, frp over KCP) would fix the loss
++without any kernel module, but it needs a port. Measured from an engine host:
++UDP and arbitrary TCP to the jump host both time out. Only SSH on port 31331
++crosses. Ask the provider to open one UDP port if this route is wanted.
++
++`scripts/network/tune_wan.sh` applies what is possible today: BBR on n82 for
++the two engine routes only, and on both ends `tcp_slow_start_after_idle=0`,
++`tcp_mtu_probing=1`, and a 32 MB buffer ceiling. Do not set BBR globally on
++n82. It is a trainer node and NCCL crosses the same interface, where cubic
++measured 87 percent against BBR's 36 percent.
++
+ # THE MEMORY MEASUREMENTS
+ 
+ | Condition | Host memory |
+diff --git a/scripts/network/tune_wan.sh b/scripts/network/tune_wan.sh
+new file mode 100755
+index 0000000..d4e6c51
+--- /dev/null
++++ b/scripts/network/tune_wan.sh
+@@ -0,0 +1,64 @@
++#!/usr/bin/env bash
++# Tune the TCP stack for the China <-> H200 path. Run on n82 and on each H200
++# host. Safe to run repeatedly. Needs sudo for sysctl only.
++#
++# Topology, which is why this is not obvious:
++#
++#   H200 (docker) --internet, 7.5% loss, 210ms RTT--> jump 202.101.73.12
++#                 --LAN--> n82 10.92.20.82
++#
++# The rollout responses travel H200 -> n82, so the H200 is the sender for the
++# bulk data. Congestion control is a sender-side choice, so the algorithm that
++# matters most is the H200's. BBR cannot be loaded there: the "hosts" are
++# Docker containers (systemd-detect-virt reports docker) with no
++# CAP_SYS_MODULE, and the underlying host has not loaded tcp_bbr either.
++#
++# On n82 BBR is applied PER ROUTE, only for the two engine hosts. Do not set it
++# globally. n82 is also a trainer node and its NCCL all-to-all crosses the same
++# interface, where cubic measured 87% wire efficiency against BBR's 36%. See
++# docs/PERFORMANCE.md.
++set -uo pipefail
++
++ENGINE_IPS=${ENGINE_IPS:-"152.236.142.239 152.236.142.243"}
++ROLE=${1:-auto}
++
++if [ "$ROLE" = "auto" ]; then
++  if [ -d /data/glm52-rl/deployment/scripts/china ] && ip -brief addr | grep -q '10\.92\.20\.'; then
++    ROLE=trainer
++  else
++    ROLE=engine
++  fi
++fi
++
++say() { echo "$(date -u +%H:%M:%S) $*"; }
++
++# Both ends. An idle keep-alive socket restarts in slow start, and on a 210ms
++# RTT that costs several round trips before it carries data again. Rollout
++# connections idle between requests constantly. PERFORMANCE.md records this
++# setting makes no measurable difference to NCCL, so it is safe on n82.
++sudo sysctl -qw net.ipv4.tcp_slow_start_after_idle=0
++# Recover from an MTU black hole instead of stalling.
++sudo sysctl -qw net.ipv4.tcp_mtu_probing=1
++# 210ms x a few hundred Mbit needs far more than the 6 MB default ceiling.
++sudo sysctl -qw net.ipv4.tcp_rmem="4096 131072 33554432"
++sudo sysctl -qw net.ipv4.tcp_wmem="4096 65536 33554432"
++say "$ROLE: slow_start_after_idle=0 mtu_probing=1 rmem/wmem ceiling 32MB"
++
++if [ "$ROLE" = "trainer" ]; then
++  if sudo modprobe tcp_bbr 2>/dev/null; then
++    gw=$(ip route get "${ENGINE_IPS%% *}" 2>/dev/null | sed -n 's/.*via \([0-9.]*\).*/\1/p')
++    dev=$(ip route get "${ENGINE_IPS%% *}" 2>/dev/null | sed -n 's/.*dev \([^ ]*\).*/\1/p')
++    if [ -n "$gw" ] && [ -n "$dev" ]; then
++      for ip in $ENGINE_IPS; do
++        sudo ip route replace "$ip" via "$gw" dev "$dev" congctl bbr 2>/dev/null \
++          && say "route $ip -> bbr (global cc stays $(sysctl -n net.ipv4.tcp_congestion_control))"
++      done
++    else
++      say "WARNING: could not resolve gateway/device for the engine routes"
++    fi
++  else
++    say "WARNING: tcp_bbr will not load; leaving the engine routes on cubic"
++  fi
++fi
++
++say "done"
+-- 
+2.43.0
+

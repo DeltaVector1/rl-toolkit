@@ -1,7 +1,7 @@
 From 4b9619059f34264996fc689bef434c6d87a818e8 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Thu, 6 Aug 2026 16:40:31 +0000
-Subject: [PATCH 12/33] Discard corrupt batches instead of crashing the run
+Subject: [PATCH 12/34] Discard corrupt batches instead of crashing the run
 
 2026-08-06 10:13: a micro-batch arrived with input_ids of shape
 [1, 9142729177965406720] -- a sequence length just under 2^63, i.e. garbage

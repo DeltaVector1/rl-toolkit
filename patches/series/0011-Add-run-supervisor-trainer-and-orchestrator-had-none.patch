@@ -1,7 +1,7 @@
 From 3d9255fa51feb18229dcd4a00b12cae429241b12 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Thu, 6 Aug 2026 16:34:51 +0000
-Subject: [PATCH 11/33] Add run supervisor: trainer and orchestrator had none
+Subject: [PATCH 11/34] Add run supervisor: trainer and orchestrator had none
 
 2026-08-06: trainer died 10:13 with "Storage size calculation overflowed with
 sizes=[1, 9142729177965406720]" followed by an NCCL collective timeout, and

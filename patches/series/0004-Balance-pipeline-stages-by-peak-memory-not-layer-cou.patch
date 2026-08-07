@@ -1,7 +1,7 @@
 From 979b847da9afc17e3c4c486d9261a1bb024b7234 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 5 Aug 2026 21:51:20 +0000
-Subject: [PATCH 04/33] Balance pipeline stages by peak memory, not layer count
+Subject: [PATCH 04/34] Balance pipeline stages by peak memory, not layer count
 
 Under 1F1B stage s keeps (pp_size - s) micro-batches live, so its footprint
 is layers * (weights_per_layer + acts_per_layer * in_flight). Minimising the

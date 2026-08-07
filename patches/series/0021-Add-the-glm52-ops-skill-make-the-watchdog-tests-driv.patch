@@ -1,7 +1,7 @@
 From 83ab8f801ccd0fdf5b702a567202ebf9c5d5f532 Mon Sep 17 00:00:00 2001
 From: DeltaVector1 <DeltaVector1@users.noreply.github.com>
 Date: Fri, 7 Aug 2026 04:26:49 +0000
-Subject: [PATCH 21/33] Add the glm52-ops skill; make the watchdog tests drive
+Subject: [PATCH 21/34] Add the glm52-ops skill; make the watchdog tests drive
  the real scripts
 
 Turn the repeated operations into a Prime Agent skill and fix three faults

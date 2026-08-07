@@ -188,6 +188,71 @@ to 128 because dead requests held the slots. That reason is gone, and the
 engines run 8 to 20 concurrent against a `max_num_seqs` of 128, so they have
 much headroom.
 
+# WHAT ACTUALLY CROSSES THE LINK
+
+Measured on a single `/inference/v1/generate` call, 2026-08-07:
+
+| Field | Share of compressed bytes |
+|---|---:|
+| `routed_experts` | 95.5% |
+| `logprobs` | ~4% |
+| `token_ids`, `finish_reason`, `index` | <1% |
+
+`routed_experts` is 711 bytes for each generated token. It is already encoded
+as tightly as it can be: `dtype` is `uint8`, exactly 1 byte for each element,
+and it gzips only 1.4 times because it is already binary. Its shape is
+`[positions, 78 MoE layers, 8 experts]`, so each token costs 78 x 8 = 624
+expert indices.
+
+That is 2.79 MB for each rollout on the wire, and about 5.2 Mbit/s at 14
+rollouts a minute, over a path that loses 7.5 percent of its packets.
+
+The useful content, the tokens and their logprobs, is under 5 percent of it.
+
+This is why the batch size cannot be raised. The transport is not carrying
+rollouts, it is carrying expert routing tables.
+
+`enable_router_replay = true` is what asks for it. The trainer replays the
+engine's expert choices instead of choosing its own, so the two forward passes
+agree. Without it the payload falls by about 20 times.
+
+The LoRA adapts `q_a_proj`, `q_b_proj`, `kv_a_proj_with_mqa`, and `o_proj`
+only. The router is not adapted and its weights are frozen and identical on
+both sides, so the only source of routing disagreement is numeric: the trainer
+runs bf16 with `moe_router_dtype = "float32"` and the engine runs W8A16. How
+much that actually flips a top-8 selection is not known and has not been
+measured.
+
+Current mismatch KL with replay on: masked 0.19 to 0.21, unmasked 0.012,
+entropy 0.47. Those are the numbers a run without replay must not spoil. For
+comparison, the FP8 trainer experiment pushed masked mismatch KL to 7 to 9
+nats and entropy to 9.2, and the reward collapsed.
+
+# THE TOPOLOGY, AND WHAT IT RULES OUT
+
+```
+H200 (docker) --internet, 7.5% loss, 210 ms--> jump 202.101.73.12 --LAN--> n82
+```
+
+The engines reach n82 through `ProxyJump`, so each tunnel is SSH inside SSH and
+the lossy leg carries two layers of channel flow control.
+
+The bulk data travels H200 to n82, so the H200 is the sender and its congestion
+control is the one that matters. BBR cannot be loaded there: the engine hosts
+are Docker containers without `CAP_SYS_MODULE`, and the host has not loaded
+`tcp_bbr` either.
+
+A userspace FEC tunnel (kcptun, UDPspeeder, frp over KCP) would fix the loss
+without any kernel module, but it needs a port. Measured from an engine host:
+UDP and arbitrary TCP to the jump host both time out. Only SSH on port 31331
+crosses. Ask the provider to open one UDP port if this route is wanted.
+
+`scripts/network/tune_wan.sh` applies what is possible today: BBR on n82 for
+the two engine routes only, and on both ends `tcp_slow_start_after_idle=0`,
+`tcp_mtu_probing=1`, and a 32 MB buffer ceiling. Do not set BBR globally on
+n82. It is a trainer node and NCCL crosses the same interface, where cubic
+measured 87 percent against BBR's 36 percent.
+
 # THE MEMORY MEASUREMENTS
 
 | Condition | Host memory |

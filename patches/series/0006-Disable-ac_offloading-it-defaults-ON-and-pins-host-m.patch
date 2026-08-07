@@ -1,7 +1,7 @@
 From 79815a37a68cff7aa5dac7d27f66c99d6f7933fb Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 5 Aug 2026 23:16:12 +0000
-Subject: [PATCH 06/33] Disable ac_offloading: it defaults ON and pins host
+Subject: [PATCH 06/34] Disable ac_offloading: it defaults ON and pins host
  memory
 
 ActivationOffloadingConfig is the DEFAULT for ac_offloading
