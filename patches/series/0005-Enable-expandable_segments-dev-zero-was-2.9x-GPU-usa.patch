@@ -1,7 +1,7 @@
 From 62766372026267afa777375d3ef70fd5c1819f1b Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 5 Aug 2026 23:01:14 +0000
-Subject: [PATCH 05/30] Enable expandable_segments: /dev/zero was 2.9x GPU
+Subject: [PATCH 05/31] Enable expandable_segments: /dev/zero was 2.9x GPU
  usage
 
 smaps on n82 at peak: 59.22 GB of /dev/zero per rank against only 20.3 GB

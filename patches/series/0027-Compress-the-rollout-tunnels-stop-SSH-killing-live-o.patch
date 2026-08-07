@@ -1,7 +1,7 @@
 From 9f9a400531252fc613e0faa538ba4545ef0a1e65 Mon Sep 17 00:00:00 2001
 From: DeltaVector1 <DeltaVector1@users.noreply.github.com>
 Date: Fri, 7 Aug 2026 10:09:09 +0000
-Subject: [PATCH 27/30] Compress the rollout tunnels; stop SSH killing live
+Subject: [PATCH 27/31] Compress the rollout tunnels; stop SSH killing live
  ones
 
 78.4% of step 6's rollouts errored, and every signature was ReadTimeout. The

@@ -1,7 +1,7 @@
 From d50c13b099049dd7469affa7398f8ccdfa9df266 Mon Sep 17 00:00:00 2001
 From: DeltaVector1 <DeltaVector1@users.noreply.github.com>
 Date: Fri, 7 Aug 2026 11:19:37 +0000
-Subject: [PATCH 29/30] Record the rollout transport measurements
+Subject: [PATCH 29/31] Record the rollout transport measurements
 
 The step time is set by rollout collection, not the trainer: it computes in 6
 to 15 minutes and then idles, 95% idle on step 6. A 15 minute step needs 68

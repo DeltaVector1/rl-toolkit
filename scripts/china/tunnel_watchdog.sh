@@ -22,7 +22,7 @@
 # churning and says so loudly instead.
 set -uo pipefail
 
-PORTS=${PORTS:-$(seq 18001 18024)}
+PORTS=${PORTS:-$(seq 18001 18048)}
 TIMEOUT=${TIMEOUT:-20}
 INTERVAL=${INTERVAL:-60}
 # Heartbeat. Without it this script logs only when it kills something, so a
