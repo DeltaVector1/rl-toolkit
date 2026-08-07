@@ -5,7 +5,16 @@ max_steps = 200
 # blackouts lifting on their own). 1800s converts a recoverable stall into
 # a watchdog kill -- three attempts died exactly this way.
 dist_timeout_seconds = 5400
-enable_router_replay = true
+# TEST 2026-08-07: routed_experts is 95.5% of the bytes crossing the China link
+# (711 B for every generated token, uint8, already minimal). Replay is what asks
+# for it. The router is NOT a LoRA target, so its weights are frozen and
+# identical on both sides; the only divergence is bf16+fp32-router here against
+# W8A16 on the engine.
+# Watch masked_mismatch_kl: 0.19-0.21 with replay on. If it holds, replay is
+# unnecessary and the payload can drop ~20x by also setting
+# enable_return_routed_experts=false in configs/h200/inference.toml.
+# If it blows up (FP8 pushed it to 7-9 nats), revert this line.
+enable_router_replay = false
 
 [log]
 level = "debug"

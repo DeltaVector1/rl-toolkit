@@ -884,11 +884,23 @@ def start(run: str, mode: str = "cold", nodes: list[str] | None = None, supervis
         launch_orch()
 
     if supervisors:
+        # Kill any supervisor from a previous run FIRST. It holds the old RUN in
+        # its environment, and it watches the container by name, so after a
+        # switch to a new run name it sits quiet until the trainer dies and then
+        # relaunches it under the OLD run. Observed on 2026-08-07: three
+        # supervisors survived a run change, all carrying RUN=x24.
+        # Separate connections: a pkill and a start in one command line makes the
+        # pkill pattern match its own shell.
+        _ssh(HEAD, "pkill -f '[r]un_supervisor.sh' 2>/dev/null; echo done")
+        time.sleep(3)
         _ssh(
             HEAD,
             f"nohup setsid env RUN={run} RUN_NAME={name} CONFIG_TAG={tag} INTERVAL=120 "
             f"bash {DEPLOY}/scripts/china/run_supervisor.sh >> /data/glm52-rl/run_supervisor.log 2>&1 </dev/null & disown",
         )
+        time.sleep(3)
+        n = _ssh(HEAD, "pgrep -f 'bash .*[r]un_supervisor.sh' | wc -l")[1].strip()
+        print(f"run supervisor: {n} process(es) for {run}")
         _repair_supervisors()
     print(f"started {run} in {mode} mode. Call status() in a few minutes.")
 

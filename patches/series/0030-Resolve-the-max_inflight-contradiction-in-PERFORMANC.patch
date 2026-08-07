@@ -1,7 +1,7 @@
 From b2df75482bcf9090508ba709c0db5db69d470e44 Mon Sep 17 00:00:00 2001
 From: DeltaVector1 <DeltaVector1@users.noreply.github.com>
 Date: Fri, 7 Aug 2026 11:20:00 +0000
-Subject: [PATCH 30/34] Resolve the max_inflight contradiction in
+Subject: [PATCH 30/35] Resolve the max_inflight contradiction in
  PERFORMANCE.md
 
 The older table still said to set max_inflight_rollouts to 256 while the new
