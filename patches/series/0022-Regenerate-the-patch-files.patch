@@ -1,7 +1,7 @@
 From 3ba20ceba1217403a8f5225947aff48e31aaa133 Mon Sep 17 00:00:00 2001
 From: DeltaVector1 <DeltaVector1@users.noreply.github.com>
 Date: Fri, 7 Aug 2026 04:27:11 +0000
-Subject: [PATCH 22/28] Regenerate the patch files
+Subject: [PATCH 22/29] Regenerate the patch files
 
 21 commit patches in patches/series/, plus the combined and source-only
 diffs. All three verified against a clean checkout of the base commit.

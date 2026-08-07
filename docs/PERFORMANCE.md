@@ -122,6 +122,62 @@ again at the same rate.
 
 Set `batch_size` for the gradient quality. Set `max_inflight_rollouts` to 256.
 
+# THE ROLLOUT TRANSPORT
+
+The step time is set by rollout collection, not by the trainer. Measured over
+steps 1 to 7 of run x24:
+
+| Step | Total | Trainer compute | Waiting for rollouts |
+|---|---:|---:|---:|
+| 1 | 96.2m | 11.3m | 84.8m |
+| 2 | 52.2m | 12.3m | 39.8m |
+| 3 | 31.4m | 14.6m | 16.8m |
+| 4 | 65.1m | 14.7m | 50.2m |
+| 5 | 47.7m | 8.4m | 39.2m |
+| 6 | 135.1m | 6.3m | 128.7m |
+| 7 | 183.8m | 12.1m | 171.5m |
+
+The trainer finishes in 6 to 15 minutes and then idles. Step 6 was 95 percent
+idle. Do not tune the trainer to reduce the step time. A 15 minute step needs
+68 rollouts each minute.
+
+# What limited the rollouts
+
+Every dropped rollout was a transport failure. Step 6 lost 78.4 percent of its
+rollouts, and every signature was `ReadTimeout`. The `zero_advantage` filter
+dropped 0.5 percent, gibberish 0.2 percent, and truncation 0 percent. Rollout
+throughput and rollout loss are the same problem.
+
+Three faults, in the order they were found:
+
+The rollout tunnels had no compression, while the batch tunnel had it. The
+batch tunnel measured under 130 KB/s without it and 4.9 MB/s with it.
+
+The SSH keepalive was 10 x 3, so 30 seconds of lost keepalives killed a tunnel.
+Keepalives are ordinary packets on a link that loses 10 to 33 percent of them,
+so SSH killed live tunnels and every request in flight on them.
+
+`build_async_openai` in verifiers left the OpenAI SDK defaults: `connect=5.0s`
+and `read=600s`. A wedged request therefore held one of the fixed in-flight
+slots for 10 minutes. Measured before the fix: 121 rollouts in flight while the
+two engines ran 3 between them. Most of the in-flight count was dead requests
+and the engines starved behind them.
+
+# The effect
+
+| Configuration | Collection | Full batch of 1024 | ReadTimeouts |
+|---|---:|---:|---:|
+| 256 in flight, no compression | 9.7/min | 106 min | 2.2/min |
+| plus compression and patient keepalive | 13.0/min | 79 min | 0.75/min |
+| plus 128 in flight and bounded timeouts | 15.7/min | 65 min | 0.22/min |
+
+The step 6 error rate was 78.3 percent. Step 7 was 18.9 percent.
+
+Raising `max_inflight_rollouts` again is the next thing to test. It was lowered
+to 128 because dead requests held the slots. That reason is gone, and the
+engines run 8 to 20 concurrent against a `max_num_seqs` of 128, so they have
+much headroom.
+
 # THE MEMORY MEASUREMENTS
 
 | Condition | Host memory |

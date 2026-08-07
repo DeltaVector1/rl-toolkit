@@ -1,7 +1,7 @@
 From 792a1aa90033afdda1206a3892ced6c165d5ddb6 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Fri, 7 Aug 2026 00:38:46 +0000
-Subject: [PATCH 17/28] x24: keep batch 1024, cap in-flight rollouts at 256
+Subject: [PATCH 17/29] x24: keep batch 1024, cap in-flight rollouts at 256
 
 At max_inflight_rollouts=1024 the tunnel layer saturated: all 24 tunnels
 wedged at once, and once the watchdog was fixed it settled into an

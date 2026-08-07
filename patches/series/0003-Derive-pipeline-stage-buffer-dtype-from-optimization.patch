@@ -1,7 +1,7 @@
 From 55231eb02667db333bfb452a50d980a6a126cbe5 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 5 Aug 2026 21:12:47 +0000
-Subject: [PATCH 03/28] Derive pipeline stage buffer dtype from
+Subject: [PATCH 03/29] Derive pipeline stage buffer dtype from
  optimization_dtype, not params
 
 The inter-stage buffers carry activations, but their dtype was taken from
