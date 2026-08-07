@@ -55,6 +55,11 @@ glm52_ops.watch(hours=2) # the same picture on a loop, in the foreground
 ```
 
 `.agents/skills/glm52-ops/SKILL.md` describes it.
+
+Prime Agent loads project skills from `<repo>/.prime/agent/skills/`, so that
+path holds a symlink to the same directory. There is one copy, reachable by
+both names. Verified: the loader finds `glm52-ops` and reads it as a
+Python-backed skill with the import name `glm52_ops`.
 `references/FAULTS.md` gives the symptom, the cause, and the one repair for
 each fault that happened.
 `references/RULES.md` gives the rules below with their reasons.
