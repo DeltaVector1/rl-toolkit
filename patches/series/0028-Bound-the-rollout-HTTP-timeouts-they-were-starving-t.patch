@@ -1,7 +1,7 @@
 From 8e1b8e108552e5f009277e2eccb7c47e9c519e69 Mon Sep 17 00:00:00 2001
 From: DeltaVector1 <DeltaVector1@users.noreply.github.com>
 Date: Fri, 7 Aug 2026 10:15:45 +0000
-Subject: [PATCH 28/29] Bound the rollout HTTP timeouts; they were starving the
+Subject: [PATCH 28/30] Bound the rollout HTTP timeouts; they were starving the
  engines
 
 verifiers' build_async_openai left the OpenAI SDK defaults in place:

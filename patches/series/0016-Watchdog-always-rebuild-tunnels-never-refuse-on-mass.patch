@@ -1,7 +1,7 @@
 From fec05bf0d35fcb06769a0be502bdce440c839c66 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Fri, 7 Aug 2026 00:17:27 +0000
-Subject: [PATCH 16/29] Watchdog: always rebuild tunnels, never refuse on mass
+Subject: [PATCH 16/30] Watchdog: always rebuild tunnels, never refuse on mass
  failure
 
 The >=80%-failure refusal I added earlier froze the run for five hours. At

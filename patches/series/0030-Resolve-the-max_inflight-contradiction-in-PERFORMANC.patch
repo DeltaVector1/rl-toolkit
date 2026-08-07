@@ -1,0 +1,42 @@
+From 074812cb0d095f7135fb3b3f2dce0d99051d5500 Mon Sep 17 00:00:00 2001
+From: DeltaVector1 <DeltaVector1@users.noreply.github.com>
+Date: Fri, 7 Aug 2026 11:20:00 +0000
+Subject: [PATCH 30/30] Resolve the max_inflight contradiction in
+ PERFORMANCE.md
+
+The older table still said to set max_inflight_rollouts to 256 while the new
+section says 128. Both rows in that table were sampled at a batch tail with
+only a few rollouts in flight, so they overstated how healthy 256 was.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017wiESxhziDrnsLnG9aizTd
+---
+ docs/PERFORMANCE.md | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/docs/PERFORMANCE.md b/docs/PERFORMANCE.md
+index 662259e..3b47f4a 100644
+--- a/docs/PERFORMANCE.md
++++ b/docs/PERFORMANCE.md
+@@ -120,7 +120,17 @@ size. The two values are independent.
+ At 1024 the watchdog rebuilt 10 to 14 tunnels every 45 seconds and they failed
+ again at the same rate.
+ 
+-Set `batch_size` for the gradient quality. Set `max_inflight_rollouts` to 256.
++Set `batch_size` for the gradient quality. Set `max_inflight_rollouts` for the
++tunnel load. The two are independent.
++
++Read the two rows above with care. Both were sampled at a batch tail, when only
++a few rollouts were in flight, so they overstate how healthy 256 was. Under
++real load at 256 the count fell to 1 to 10 of 24. The current value is 128. See
++"THE ROLLOUT TRANSPORT" below for the measurements that replace this table.
++
++The healthy-tunnel count is also a weak signal on its own. The probe shares
++each tunnel with rollout traffic, so it starves on links that still carry
++rollouts. Confirm against the engines before acting on it.
+ 
+ # THE ROLLOUT TRANSPORT
+ 
+-- 
+2.43.0
+

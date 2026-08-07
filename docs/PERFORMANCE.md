@@ -120,7 +120,17 @@ size. The two values are independent.
 At 1024 the watchdog rebuilt 10 to 14 tunnels every 45 seconds and they failed
 again at the same rate.
 
-Set `batch_size` for the gradient quality. Set `max_inflight_rollouts` to 256.
+Set `batch_size` for the gradient quality. Set `max_inflight_rollouts` for the
+tunnel load. The two are independent.
+
+Read the two rows above with care. Both were sampled at a batch tail, when only
+a few rollouts were in flight, so they overstate how healthy 256 was. Under
+real load at 256 the count fell to 1 to 10 of 24. The current value is 128. See
+"THE ROLLOUT TRANSPORT" below for the measurements that replace this table.
+
+The healthy-tunnel count is also a weak signal on its own. The probe shares
+each tunnel with rollout traffic, so it starves on links that still carry
+rollouts. Confirm against the engines before acting on it.
 
 # THE ROLLOUT TRANSPORT
 

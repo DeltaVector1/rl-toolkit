@@ -1,7 +1,7 @@
 From 3e6b19bcd0950f6a15fe823c239edf77faa8c834 Mon Sep 17 00:00:00 2001
 From: DeltaVector1 <DeltaVector1@users.noreply.github.com>
 Date: Fri, 7 Aug 2026 08:35:37 +0000
-Subject: [PATCH 25/29] Lower max_inflight_rollouts to 128; add
+Subject: [PATCH 25/30] Lower max_inflight_rollouts to 128; add
  apply_at_step.sh
 
 The engines were starving while the orchestrator believed it was saturating
