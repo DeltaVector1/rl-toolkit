@@ -49,19 +49,20 @@ while true; do
     fi
   done
 
+  # ALWAYS rebuild. An earlier version refused when >=80% failed, on the theory
+  # that mass failure meant a dead backend it could not fix. That was wrong and
+  # it froze the run: at batch 1024 all 24 tunnels wedged at once under 4x the
+  # rollout load while the engines were healthy and generating, and the
+  # watchdog sat idle for five hours. The asymmetry is decisive -- rebuilding
+  # against a dead backend is harmless (it just fails again next cycle), while
+  # refusing to rebuild against a live backend stalls everything. So warn
+  # loudly on mass failure, then rebuild anyway.
   if [ "$total" -gt 0 ] && [ $((nfail * 100 / total)) -ge "$MASS_FAILURE_PCT" ]; then
-    # Do not touch the tunnels: rebuilding them cannot fix a dead engine, and
-    # the churn hides the real fault.
     mass_streak=$((mass_streak + 1))
-    if [ $((mass_streak % 5)) -eq 1 ]; then
-      log "*** $nfail/$total tunnels failing — BACKEND LIKELY DOWN, not the tunnels."
-      log "*** Not rebuilding. Check the vLLM engines on h200a/h200b (engine_watchdog.sh should be restarting them)."
-    fi
-    sleep "$INTERVAL"
-    continue
+    [ $((mass_streak % 5)) -eq 1 ] && log "*** $nfail/$total tunnels failing at once -- check the engines too, but rebuilding regardless"
+  else
+    mass_streak=0
   fi
-  [ "$mass_streak" -gt 0 ] && log "mass failure cleared ($nfail/$total failing)"
-  mass_streak=0
 
   killed=0
   for p in $failed; do
