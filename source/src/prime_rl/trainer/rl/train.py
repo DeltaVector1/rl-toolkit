@@ -945,8 +945,9 @@ def train(config: TrainerConfig):
             if param.grad is not None:
                 param.grad.mul_(parallel_dims.fsdp_gradient_divide_factor)
                 grad = param.grad.to_local() if hasattr(param.grad, "to_local") else param.grad
-                found_nonfinite.maximum_(
-                    (~torch.isfinite(grad).all()).to(dtype=torch.int32)
+                found_nonfinite = torch.maximum(
+                    found_nonfinite,
+                    (~torch.isfinite(grad).all()).to(dtype=torch.int32),
                 )
 
         # Do not silently replace NaN/Inf values with zero. That changes the
