@@ -237,24 +237,26 @@ class DecensorUser(vf.User[DecensorUserConfig, DecensorState]):
         extra_body: dict[str, Any] = {"chat_template_kwargs": {"enable_thinking": False}}
         if self.config.min_p:
             extra_body["min_p"] = self.config.min_p
+        text = ""
         async with _shared_openai(self.config) as client:
-            completion = await client.chat.completions.create(
-                model=self.config.model,
-                messages=[{"role": "user", "content": prompt_text}],
-                temperature=self.config.temperature,
-                max_tokens=self.config.max_tokens,
-                # All rollouts for one task see the same simulator sampling
-                # stream.  Different policy responses still produce different
-                # simulator prompts, but identical responses are not assigned
-                # different follow-ups by environment randomness.
-                seed=self._task_seed + produced_turns,
-                extra_body=extra_body,
-            )
-        text = parse_user_turn_output(str(completion.choices[0].message.content or ""))
+            for attempt in range(3):
+                completion = await client.chat.completions.create(
+                    model=self.config.model,
+                    messages=[{"role": "user", "content": prompt_text}],
+                    temperature=self.config.temperature,
+                    max_tokens=self.config.max_tokens,
+                    # Identical policy responses get identical retry streams
+                    # inside a GRPO group. A new seed lets a malformed sampled
+                    # tag recover instead of repeating it byte-for-byte.
+                    seed=self._task_seed + produced_turns + attempt * 10_000_019,
+                    extra_body=extra_body,
+                )
+                text = parse_user_turn_output(
+                    str(completion.choices[0].message.content or "")
+                )
+                if text:
+                    break
         if not text:
-            # End the conversation rather than raise. A raise fails the whole rollout for
-            # retry, throwing away an already-generated multi-turn exchange because the user
-            # simulator hit its token cap mid-tag. Scoring what exists is the better trade.
             self.state.user_sim_failed = True
             self.state.user_done = True
             return []

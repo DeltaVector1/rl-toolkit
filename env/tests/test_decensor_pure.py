@@ -133,6 +133,8 @@ class DeterminismTests(unittest.TestCase):
         ]
         self.assertTrue(create_calls)
         self.assertTrue(any(any(kw.arg == "seed" for kw in call.keywords) for call in create_calls))
+        source = (PKG_ROOT / "user.py").read_text()
+        self.assertIn("for attempt in range(3)", source)
 
     def test_user_simulator_forbids_safety_process_pivots(self):
         source = (PKG_ROOT / "user.py").read_text().lower()
