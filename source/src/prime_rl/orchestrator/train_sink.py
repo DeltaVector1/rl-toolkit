@@ -201,6 +201,7 @@ class TrainSink:
         # Never assign a full-trajectory reward to a prefix that the trainer
         # silently truncates. For group-scored RL, one oversized member makes
         # the whole group unsafe because removing it changes the baseline.
+        oversized_fillers: list[Rollout] = []
         oversized = [
             r
             for r in survivors
@@ -214,17 +215,30 @@ class TrainSink:
             )
             get_logger().warning(
                 f"Finished group | env={env_name} task_idx={task_idx} | "
-                f"dropped: {len(oversized)} rollout(s) exceed trainer seq_len "
-                f"{self.config.seq_len} (longest={longest})"
+                f"dropped training payload: {len(oversized)} rollout(s) exceed "
+                f"trainer seq_len {self.config.seq_len} (longest={longest})"
             )
             if env.requires_group_scoring:
                 return
             oversized_ids = {id(r) for r in oversized}
             survivors = [r for r in survivors if id(r) not in oversized_ids]
+            if self.batch_size is not None:
+                # Keep a sample-free, filtered placeholder in a fixed-rollout
+                # batch. Without it, one rejected member leaves a permanent
+                # one-rollout deficit because the dispatcher opens only whole
+                # GRPO groups. It contributes metrics and batch accounting but
+                # cannot reach the trainer or affect the group baseline.
+                for r in oversized:
+                    r.samples = []
+                    r.is_filtered = True
+                    r.filter_results = {"trainer_seq_len": True}
+                oversized_fillers = oversized
 
         # Untrainable traces carry no samples and must not skew the group baseline.
         survivors = [r for r in survivors if r.trainable]
         if not survivors:
+            if oversized_fillers:
+                self.pending_batch.extend(oversized_fillers)
             get_logger().debug(
                 f"Finished group | env={env_name} task_idx={task_idx} | "
                 f"rollouts={len(group)} (errored={num_errored}) | dropped: no trainable survivors"
@@ -263,6 +277,7 @@ class TrainSink:
             self.pending_batch.append(r)
             if self.token_batch_size is not None:
                 self.pending_tokens += payload_tokens(r)
+        self.pending_batch.extend(oversized_fillers)
 
         # Per-group summary. One line per finalized group; per-filter
         # detection breakdown lives at debug level in ``apply_filters``

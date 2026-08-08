@@ -25,8 +25,17 @@ class TrainSinkLimitTest(unittest.TestCase):
         group = SOURCE.split("    async def process_group", 1)[1].split(
             "\n    def process_batch", 1
         )[0]
-        self.assertIn("dropped:", group)
-        self.assertIn("exceed trainer seq_len", group)
+        self.assertIn("dropped training payload:", group)
+        self.assertIn('f"trainer seq_len {self.config.seq_len}', group)
+        self.assertIn("r.samples = []", group)
+
+    def test_fixed_rollout_batches_get_sample_free_placeholders(self):
+        group = SOURCE.split("    async def process_group", 1)[1].split(
+            "\n    def process_batch", 1
+        )[0]
+        self.assertIn("if self.batch_size is not None:", group)
+        self.assertIn('r.filter_results = {"trainer_seq_len": True}', group)
+        self.assertIn("self.pending_batch.extend(oversized_fillers)", group)
 
 
 if __name__ == "__main__":
