@@ -187,9 +187,23 @@ class FP8CheckpointStorageReaderTest(unittest.TestCase):
         self.assertEqual(native_file.scale_reads, 0)
 
         dequantized, dequantized_file = _process(raw, scale, torch.bfloat16)
-        reference = raw.to(torch.bfloat16) * scale.to(torch.bfloat16)
+        reference = (raw.float() * scale.float()).to(torch.bfloat16)
         torch.testing.assert_close(dequantized, reference, rtol=0, atol=0)
         self.assertEqual(dequantized_file.scale_reads, 1)
+
+    def test_dequantization_applies_fp32_scale_before_bf16_rounding(self):
+        raw = torch.ones((128, 128), dtype=torch.float8_e4m3fn)
+        # This value is not exactly representable in BF16.  Rounding it before
+        # multiplication gives a different result for a non-unit FP8 value.
+        raw.fill_(1.5)
+        scale = torch.tensor([[0.333]], dtype=torch.float32)
+
+        loaded, _ = _process(raw, scale, torch.bfloat16)
+        reference = (raw.float() * scale.float()).to(torch.bfloat16)
+        double_rounded = raw.to(torch.bfloat16) * scale.to(torch.bfloat16)
+
+        torch.testing.assert_close(loaded, reference, rtol=0, atol=0)
+        self.assertFalse(torch.equal(reference, double_rounded))
 
     def test_native_loaded_partial_block_kv_a_matches_fp8_scale_reference(self):
         rows, columns = 576, 6144
@@ -208,9 +222,8 @@ class FP8CheckpointStorageReaderTest(unittest.TestCase):
         expanded_scale = (
             scale.repeat_interleave(128, dim=0)[:rows]
             .repeat_interleave(128, dim=1)[:, :columns]
-            .to(torch.bfloat16)
         )
-        reference = raw.to(torch.bfloat16) * expanded_scale
+        reference = (raw.float() * expanded_scale.float()).to(torch.bfloat16)
 
         self.assertEqual(scale.shape, (5, 48))
         self.assertEqual(expanded_scale.shape, (576, 6144))

@@ -174,10 +174,14 @@ class FP8CheckpointStorageReader(HuggingFaceStorageReader):
             col_slice = slices[2] if info.stacked else slices[1]
             rows = torch.arange(row_slice.start, row_slice.stop) // 128
             cols = torch.arange(col_slice.start, col_slice.stop) // 128
-            block_scale = scale[rows][:, cols].to(target.dtype)
+            block_scale = scale[rows][:, cols]
             if info.stacked:
                 block_scale = block_scale.unsqueeze(0)
-            tensor = tensor.to(target.dtype) * block_scale
+            # Apply the checkpoint's FP32 inverse scales before the final
+            # target-dtype rounding.  Casting the scales to BF16 first causes
+            # a second, avoidable rounding and does not match vLLM's
+            # scaled_dequantize path for fused MLA/indexer weights.
+            tensor = (tensor.float() * block_scale.float()).to(target.dtype)
         elif info.bitcast:
             tensor = tensor.view(torch.uint8)
         if target.size() != tensor.size():
