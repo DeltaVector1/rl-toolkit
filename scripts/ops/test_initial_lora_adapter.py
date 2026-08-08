@@ -11,6 +11,10 @@ from torch import nn
 
 from prime_rl.trainer.lora import load_initial_lora_adapter
 from prime_rl.trainer.models.layers.lora import MultiLoRALinear
+from prime_rl.trainer.models.layers.lora.base import set_lora_num_tokens, set_multilora_scaling
+
+set_lora_num_tokens(torch.zeros(1, dtype=torch.int64), reset_reference=True)
+set_multilora_scaling(torch.ones(1), reset_reference=True)
 
 
 class _Model(nn.Module):
