@@ -42,7 +42,11 @@ H200 hosts now sets the pace; the trainer idles waiting for batches.
    `cached_indices`, which cannot cross a stage boundary -- the stage receives
    `None` and dies inside the attention kernel. `balanced_boundaries` restricts
    splits to "full" layers and still achieves the optimal max stage size (12).
-   The naive even split cuts at 12/23/34/45/56/67, every one a shared layer.
+   For PP8, the native GLM-5.2 schedule gives boundaries
+   `[0, 6, 14, 22, 30, 42, 54, 66, 78]` and layer counts
+   `[6, 8, 8, 8, 12, 12, 12, 12]`. Exhaustive enumeration shows that no
+   cache-safe PP8 split has a maximum below 12 layers. The naive even PP8 split
+   starts stages at 20, 40, 60, and 69 on shared layers.
 4. **Layers are a `ModuleDict` keyed by GLOBAL index.** A dense `ModuleList`
    slice renumbers layers and checkpoint keys stop resolving. Anything walking
    the decoder must go through `model.iter_layers`.
@@ -73,6 +77,36 @@ H200 hosts now sets the pace; the trainer idles waiting for batches.
 14. **Verify the broadcast adapter after ANY change to the weight path**:
    `safe_open(...)` and count distinct layer indices. It must be 78. A truncated
    adapter loads without complaint and serves a partly-unadapted model.
+
+## Balance regression test
+
+Run `python3 -m unittest source/tests/test_pipeline_parallel.py`. The CPU-only
+test checks the exact PP8 plan, proves the 12-layer lower bound under the native
+IndexShare schedule, rejects unsafe even boundaries, and checks that side
+inputs are consumed once in forward FIFO order.
+
+The current measured cost model gives a maximum stage cost of 24.576 GB
+equivalent. The next-best cache-safe split is 25.960 GB equivalent, 5.6 percent
+higher. Thus a boundary-only change cannot reduce current maximum compute or
+memory. The measured x16 change to the current plan reduced peak GPU memory
+from 24.6 GB to 21.9 GB (2.7 GB, 11.0 percent); it did not reduce the
+12-layer maximum, so its expected steady-state decoder stage-rate improvement
+is 0 percent.
+
+An experimental split can send `cached_indices` with the hidden activation at
+a boundary that starts on a shared layer. If the measured cost model accepts
+all integer boundaries and has a hard limit of 10 layers, it selects
+`[0, 9, 18, 28, 38, 48, 58, 68, 78]`, with counts
+`[9, 9, 10, 10, 10, 10, 10, 10]`. Its modeled maximum is 23.364 GB equivalent,
+4.9 percent below 24.576, and its maximum decoder count is 16.7 percent lower
+(an ideal stage-rate change of 1.20 times). These are model results, not
+measurements.
+
+Starts 9, 28, 48, and 68 need the incoming cache. At 16K with CP8, the cache is
+16 MiB of int32 indices for each micro-batch, in addition to a 24 MiB BF16
+hidden activation. Those four forward boundaries would carry 67 percent more
+data and need tuple-I/O backward and numerical validation. Do not use this plan
+in a production run without a separate distributed test.
 
 ## Debug tooling
 

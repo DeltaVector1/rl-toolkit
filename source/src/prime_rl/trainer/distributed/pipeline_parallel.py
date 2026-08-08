@@ -65,7 +65,7 @@ def balanced_boundaries(num_layers: int, pp_size: int, allowed: list[int] | None
 
     cand = sorted({b for b in allowed if 0 < b < num_layers})
     INF = float("inf")
-    # best[(stage, start)] -> (max_size, sum_sq, boundary_list)
+    # best[(stage, start)] -> (max_cost, sum_sq_cost, boundary_list)
     from functools import lru_cache
 
     # Balance PEAK MEMORY, not layer count. Under 1F1B stage s keeps
