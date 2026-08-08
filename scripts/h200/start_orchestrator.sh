@@ -66,7 +66,7 @@ sudo docker run -d --name glm52-decensor-orchestrator \
   -v "$deployment/source/src/prime_rl/utils/client.py":/app/src/prime_rl/utils/client.py:ro \
   --entrypoint /app/.venv/bin/orchestrator "$image" \
   @ "$config_file"
-echo "orchestrator started on $(hostname) with ${CONFIG_TAG}"
+echo "orchestrator started on $(hostname) with $(basename "$config_file")"
 
 ctl=/data/glm52-rl/runs/$RUN/$RUN_NAME/control/orch.toml
 if [ "$transport" = filesystem ]; then
