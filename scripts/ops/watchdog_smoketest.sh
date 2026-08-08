@@ -43,7 +43,10 @@ url=""
 for a in "$@"; do case "$a" in http*) url=$a ;; esac; done
 port=$(printf '%s' "$url" | sed -n 's|.*://[^:]*:\([0-9]*\)/.*|\1|p')
 kind=tunnel
-case "$url" in *completions*) kind=engine ;; esac
+case "$url" in
+  *completions*) kind=engine ;;
+  *metrics*) kind=metrics ;;
+esac
 echo "$kind $port" >> "$FIX/probed"
 # shellcheck disable=SC1090
 . "$FIX/respond.sh"
@@ -221,6 +224,7 @@ contains "1 miss then recovery -> logs recovery"  "$FIX/log" "engine recovered"
 reset
 cat > "$FIX/respond.sh" <<'EOF'
 respond() {
+  [ "$1" = engine ] || { echo; return; }
   n=$(( $(cat "$FIX/n" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$FIX/n"
   [ "$n" -le 2 ] && echo 000 || echo 200
 }
@@ -228,6 +232,27 @@ EOF
 rm -f "$FIX/n"
 MAXCYCLES=4 run_engine
 contains "post-restart health is a generation"    "$FIX/log" "engine back up (generation verified)"
+
+# A real generation probe can queue for more than TIMEOUT when every sequence
+# slot is busy. Rising production token metrics prove this is load, not a dead
+# EngineCore, and the watchdog must not discard the live requests.
+reset
+cat > "$FIX/respond.sh" <<'EOF'
+respond() {
+  if [ "$1" = engine ]; then
+    echo 000
+  elif [ "$1" = metrics ]; then
+    c=$(cat "$FIX/cycles" 2>/dev/null || echo 0)
+    echo "vllm:num_requests_running{engine=\"0\"} 64"
+    echo "vllm:generation_tokens_total{engine=\"0\"} $((1000 + c))"
+  else
+    echo 200
+  fi
+}
+EOF
+MAXCYCLES=3 run_engine
+absent "busy engine with rising tokens -> no restart" "$FIX/log" "RESTARTING ENGINE"
+contains "busy engine -> reports progress" "$FIX/log" "engine busy but progressing"
 
 # ------------------------------------------- liveness probes must not self-match
 

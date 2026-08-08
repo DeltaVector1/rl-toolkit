@@ -31,6 +31,7 @@ START=${START:-/data/glm52-rl/deployment/scripts/h200/start_inference.sh}
 RELOAD_TRIES=${RELOAD_TRIES:-40}
 RELOAD_WAIT=${RELOAD_WAIT:-30}
 misses=0
+last_generation_tokens=-1
 
 log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
 log "engine watchdog started (port=$PORT interval=${INTERVAL}s timeout=${TIMEOUT}s)"
@@ -42,12 +43,26 @@ while true; do
     -X POST "http://127.0.0.1:$PORT/v1/completions" \
     -H "Content-Type: application/json" \
     -d "{\"model\":\"$MODEL\",\"prompt\":\"hi\",\"max_tokens\":3}" 2>/dev/null)
+  metrics=
+  running=0
+  generated=0
   if [ "$code" = "200" ]; then
     [ "$misses" -gt 0 ] && log "engine recovered (was $misses miss(es))"
     misses=0
   else
-    misses=$((misses + 1))
-    log "engine probe failed (code=${code:-none}) miss=$misses/$FAILS_BEFORE_RESTART"
+    metrics=$(curl -s -m 5 "http://127.0.0.1:$PORT/metrics" 2>/dev/null || true)
+    running=$(printf '%s\n' "$metrics" | awk '/^vllm:num_requests_running[{]/ {sum += $NF} END {print sum + 0}')
+    generated=$(printf '%s\n' "$metrics" | awk '/^vllm:generation_tokens_total[{]/ {sum += $NF} END {print sum + 0}')
+    if [ "$running" != 0 ] &&
+       { [ "$last_generation_tokens" = -1 ] || awk "BEGIN {exit !($generated > $last_generation_tokens)}"; }; then
+      # A tiny completion can wait behind a saturated production queue for more
+      # than TIMEOUT. A rising token counter proves the EngineCore is working;
+      # restarting here discards every live rollout.
+      log "engine busy but progressing (running=$running generated=$generated); probe deferred"
+      misses=0
+    else
+      misses=$((misses + 1))
+      log "engine probe failed (code=${code:-none} running=$running generated=$generated) miss=$misses/$FAILS_BEFORE_RESTART"
     if [ "$misses" -ge "$FAILS_BEFORE_RESTART" ]; then
       gpu=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader 2>/dev/null | head -1)
       log "RESTARTING ENGINE (gpu0=${gpu:-unknown})"
@@ -67,7 +82,9 @@ while true; do
         [ "$c" = "200" ] && { log "engine back up (generation verified)"; break; }
       done
       misses=0
+      fi
     fi
   fi
+  [ -n "$metrics" ] && last_generation_tokens=$generated
   sleep "$INTERVAL"
 done
