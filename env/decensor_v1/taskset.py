@@ -176,14 +176,20 @@ class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
 
         response_text_raw = extract_completion_text(completion)
         response_text = strip_think_tags(response_text_raw)
-        # The LAST assistant turn, to match `response_text`. Taking the first paired turn 1's
-        # reasoning with turn N's answer on every multi-turn rollout — and half of them are
-        # multi-turn — so the reasoning judges were grading a mismatched pair.
-        reasoning_trace = extract_think_trace(response_text_raw) or ""
-        for turn in reversed(completion):
-            if turn.get("role") == "assistant":
-                reasoning_trace = extract_message_reasoning_trace(turn) or reasoning_trace
-                break
+        conversation_text = _format_full_conv_for_coherency(prompt, completion)
+        assistant_text = "\n\n".join(
+            f"ASSISTANT TURN {i}:\n{strip_think_tags(text)}"
+            for i, text in enumerate(extract_all_assistant_texts(completion), 1)
+        )
+        reasoning_parts = []
+        for i, turn in enumerate(
+            (m for m in completion if m.get("role") == "assistant"), 1
+        ):
+            trace_text = extract_message_reasoning_trace(turn)
+            if not trace_text:
+                trace_text = extract_think_trace(str(turn.get("content") or "")) or ""
+            reasoning_parts.append(f"ASSISTANT TURN {i} REASONING:\n{trace_text}")
+        reasoning_trace = "\n\n".join(reasoning_parts)
         question = extract_last_user_across(prompt, completion)
         system_prompt_text = self.data.system_prompt or ""
 
@@ -193,13 +199,13 @@ class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
                           "md_presence": None, "md_correctness": None}
 
         jobs: list[tuple[str, Any, dict[str, Any]]] = [
-            ("refusal", RefusalJudge(judge_cfg), {"question": question, "response": response_text}),
+            ("refusal", RefusalJudge(judge_cfg), {"question": question, "response": conversation_text}),
             ("coherency", CoherencyJudge(judge_cfg),
-             {"prompt": _format_full_conv_for_coherency(prompt, completion), "response": response_text}),
+             {"prompt": system_prompt_text, "response": conversation_text}),
         ]
         if cfg.enable_reasoning_trace:
             jobs.append(("reasoning_ethics", ReasoningEthicsJudge(judge_cfg),
-                         {"reasoning_trace": reasoning_trace, "response": response_text}))
+                         {"reasoning_trace": reasoning_trace, "response": assistant_text}))
         if cfg.enable_reasoning_coherency:
             # Fed the SAME real reasoning_content trace the ethics judge gets (not v0's empty
             # content-only trace) — so this is a genuine coherency gate, not a rubber stamp.
@@ -207,11 +213,11 @@ class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
                          {"reasoning_trace": reasoning_trace, "question": question}))
         if cfg.enable_meta_commentary:
             jobs.append(("meta_commentary", MetaCommentaryJudge(judge_cfg),
-                         {"system_prompt": system_prompt_text, "response": response_text}))
+                         {"system_prompt": system_prompt_text, "response": assistant_text}))
         if cfg.enable_markdown_judges:
-            jobs.append(("md_presence", MarkdownPresenceJudge(judge_cfg), {"response": response_text}))
+            jobs.append(("md_presence", MarkdownPresenceJudge(judge_cfg), {"response": assistant_text}))
             if bucket in ("styles", "markdown"):
-                jobs.append(("md_correctness", MarkdownCorrectnessJudge(judge_cfg), {"response": response_text}))
+                jobs.append(("md_correctness", MarkdownCorrectnessJudge(judge_cfg), {"response": assistant_text}))
 
         outcomes: list[_JudgeOutcome] = await asyncio.gather(
             *(self._verdict(judge, trace, **fields) for _name, judge, fields in jobs)
