@@ -20,6 +20,7 @@ _PROJECTIONS = {"gate": "w1", "down": "w2", "up": "w3"}
 class _FP8StorageInfo(_HFStorageInfo):
     source_key: str = ""
     stacked: bool = False
+    quantized: bool = False
     dequantize: bool = False
     bitcast: bool = False
 
@@ -71,6 +72,7 @@ class FP8CheckpointStorageReader(HuggingFaceStorageReader):
                     target,
                     offset,
                     stacked=True,
+                    quantized=source in quantized_weights,
                     dequantize=self.dequantize_all and source in quantized_weights,
                 )
             metadata.state_dict_metadata[target] = TensorStorageMetadata(
@@ -100,16 +102,18 @@ class FP8CheckpointStorageReader(HuggingFaceStorageReader):
                         source,
                         target,
                         torch.Size([0] * len(metadata.state_dict_metadata[target].size)),
+                        quantized=source in quantized_weights,
                         dequantize=self.dequantize_all and source in quantized_weights,
                     )
                     break
 
         for source in metadata.state_dict_metadata:
+            quantized = source in quantized_weights
             dequantize = (
-                self.dequantize_all and source in quantized_weights
+                self.dequantize_all and quantized
             ) or source.endswith((".self_attn.kv_b_proj.weight", ".self_attn.indexer.wk.weight"))
             bitcast = False
-            if dequantize or bitcast:
+            if quantized or dequantize or bitcast:
                 for index in storage_by_fqn[source]:
                     info = metadata.storage_data[index]
                     metadata.storage_data[index] = _FP8StorageInfo(
@@ -117,6 +121,7 @@ class FP8CheckpointStorageReader(HuggingFaceStorageReader):
                         shape=info.shape,
                         dtype=info.dtype,
                         source_key=source,
+                        quantized=quantized,
                         dequantize=dequantize,
                         bitcast=bitcast,
                     )
@@ -130,6 +135,7 @@ class FP8CheckpointStorageReader(HuggingFaceStorageReader):
         target,
         target_offset,
         stacked=False,
+        quantized=False,
         dequantize=False,
     ):
         for index in storage_by_fqn.pop(source, ()):
@@ -140,6 +146,7 @@ class FP8CheckpointStorageReader(HuggingFaceStorageReader):
                 dtype=info.dtype,
                 source_key=source,
                 stacked=stacked,
+                quantized=quantized,
                 dequantize=dequantize,
             )
 
@@ -153,7 +160,13 @@ class FP8CheckpointStorageReader(HuggingFaceStorageReader):
         target = planner.resolve_tensor(request).detach()
         if info.stacked:
             tensor = tensor.unsqueeze(0)
-        if info.dequantize:
+        # Some serialized FP8 matrices cannot use the native 128x128 kernel
+        # because one dimension has a partial final block. Those modules stay
+        # as ordinary BF16 Linear layers. DCP otherwise casts their raw E4M3
+        # values to BF16 without applying weight_scale_inv, corrupting the
+        # model by orders of magnitude (GLM kv_a is [576, 6144]).
+        dequantize = info.dequantize or (info.quantized and target.dtype != tensor.dtype)
+        if dequantize:
             scale = file.get_tensor(
                 info.source_key.removesuffix(".weight") + ".weight_scale_inv"
             )
