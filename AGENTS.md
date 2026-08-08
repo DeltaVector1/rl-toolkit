@@ -122,10 +122,11 @@ x38 uses the BF16-dequantized trainer path, PP8, CP8, node-local EP8, batch
 in flight. The H200 engines use their automatic W8A8 backend. Router replay is
 off.
 
-x38 starts from the exact x37 step-7 LoRA adapter. The adapter SHA-256 is
-`7b35674b34f7a829a22acaff8c3a8fab24dffe7e6963317071136efa5c5790a1`
-on every trainer node and both H200 engines. The Muon optimizer state is new
-because x37 did not save a full trainer checkpoint.
+x38 was intended to start from x37 adapter step 7, but it did not. The first
+loader ran before `MultiRunManager` reset the new slot. The reset erased the
+loaded tensors. x38 therefore started a new LoRA policy and a new Muon
+optimizer. The loader is fixed for future runs by loading from a creation hook
+after the slot reset. Do not describe x38 as a continuation of x37.
 
 x37 completed seven optimizer steps before it failed on trainer step 8. That
 batch had 314 microbatches. n80 rank 32 OOMed in the expert W2 grouped GEMM

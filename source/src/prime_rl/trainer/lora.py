@@ -214,7 +214,15 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> None:
         _set_module_by_name(model, module_name, lora_module)
 
     if config.initial_adapter_path is not None:
-        load_initial_lora_adapter(model, config.initial_adapter_path)
+        # MultiRunManager resets a slot when it discovers a new orchestrator
+        # run. Loading here would be silently erased by that later reset.
+        # The creation hook runs immediately after reset on every rank.
+        initial_adapter_path = config.initial_adapter_path
+
+        def load_after_run_reset(adapter_idx: int, _run_id: str) -> None:
+            load_initial_lora_adapter(model, initial_adapter_path, adapter_idx)
+
+        get_multi_run_manager().register_creation_hook(load_after_run_reset)
 
     freeze_all_except_lora_and_specified(model, config)
 

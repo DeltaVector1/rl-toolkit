@@ -77,12 +77,21 @@ Trainer step 8 contained 314 microbatches. n80 rank 32 OOMed in the expert W2
 other NCCL errors were consequences of this exit.
 
 x38 reduces the sequence length to 8,192, which bounds each CP shard at 1,024
-tokens and reduces this routed-expert output by one third. It initializes its
-LoRA slot from x37 adapter step 7. This preserves the policy, but the Muon
-optimizer state starts new because x37 had no full trainer checkpoint.
-`LoRAConfig.initial_adapter_path` is strict for each local pipeline stage:
-every local adapter key and shape must match before any tensor is copied. Keys
-owned by the other seven stages are ignored on that stage.
+tokens and reduces this routed-expert output by one third.
+
+The first policy-restore implementation loaded x37 adapter step 7 during model
+setup. `MultiRunManager._create_run_hooks()` later reset the newly assigned
+slot, so x38 did not preserve x37's policy. The measured x38 adapter-A delta
+from x37 was 81.60 against an x37 adapter-A norm of 57.68, a relative change
+of 1.414. This is the signature of independent initialization, not one
+optimizer update.
+
+The loader now registers a creation hook and loads immediately after the slot
+reset. `LoRAConfig.initial_adapter_path` is strict for each local pipeline
+stage: every local adapter key and shape must match before any tensor is
+copied. Keys owned by the other seven stages are ignored on that stage.
+Future restart runs can preserve policy weights this way, but optimizer state
+still starts new.
 
 # LARGE WAN BATCHES AND BUSY ENGINE HEALTH
 
