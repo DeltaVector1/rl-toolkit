@@ -114,28 +114,32 @@ Report the verdict.
 
 # The current run
 
-x37 is active. The trainers started at approximately 09:45 UTC on 2026-08-08.
-The H200 orchestrator started at 09:53 UTC.
+x38 is active. Its trainers started at approximately 14:22 UTC on 2026-08-08.
+The H200 orchestrator started at 14:29 UTC.
 
-x37 uses the BF16-dequantized trainer path, PP8, CP8, node-local EP8, batch
-1024, group 16, sequence length 12,288, learning rate 8e-6, and 128 rollouts
+x38 uses the BF16-dequantized trainer path, PP8, CP8, node-local EP8, batch
+1024, group 16, sequence length 8,192, learning rate 8e-6, and 128 rollouts
 in flight. The H200 engines use their automatic W8A8 backend. Router replay is
-off. Full trainer checkpoints are off because the frozen base exceeds the
-remaining disks. Each completed step still exports the LoRA adapter.
+off.
 
-The shorter sequence ceiling is a memory repair. x31 reached 46.6 GiB at
-14,336 tokens and later OOMed with only 179 MiB free. Do not increase the x37
-sequence length while it is active.
+x38 starts from the exact x37 step-7 LoRA adapter. The adapter SHA-256 is
+`7b35674b34f7a829a22acaff8c3a8fab24dffe7e6963317071136efa5c5790a1`
+on every trainer node and both H200 engines. The Muon optimizer state is new
+because x37 did not save a full trainer checkpoint.
 
-Native FP8 training is rejected. x32 had entropy 4.3957, masked mismatch KL
-3.8317, and 48.8 percent masked tokens. x35 route replay still had KL 3.1711.
-x36 forced H200 Triton MoE on a fresh batch-1024 gate and still had entropy
-4.4206, masked mismatch KL 6.5098, unmasked mismatch KL 3.1729, and 48.2
-percent masked tokens. Do not start another native-FP8 trainer run without a
-new measured correction.
+x37 completed seven optimizer steps before it failed on trainer step 8. That
+batch had 314 microbatches. n80 rank 32 OOMed in the expert W2 grouped GEMM
+while requesting 228 MiB with 187.5 MiB free. The other NCCL errors followed
+this exit. x37's first ten rollout rewards were inside the measured noise:
+mean 0.0320, standard deviation 0.0099, and fitted increase 0.0057 against a
+0.0194 threshold.
 
-x36 also proved the 64-GPU native step can run at 2,178 tokens/s with 46.6 GiB
-peak memory. This is a compute and memory result only. It is not policy parity.
+The 8,192-token x38 limit reduces the failed expert output by one third. Do
+not increase it while x38 is active.
+
+Native FP8 training remains rejected. x32 had masked mismatch KL 3.8317; x35
+route replay had 3.1711; x36 with H200 Triton MoE had masked KL 6.5098 and
+unmasked KL 3.1729.
 
 # Where the rest is
 
