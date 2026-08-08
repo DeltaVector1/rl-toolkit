@@ -136,6 +136,15 @@ class DeterminismTests(unittest.TestCase):
         source = (PKG_ROOT / "user.py").read_text()
         self.assertIn("for attempt in range(3)", source)
 
+    def test_policy_timeout_allows_long_context_completion(self):
+        source = (PKG_ROOT / "user.py").read_text()
+        self.assertIn("_rollout_http = httpx.AsyncClient", source)
+        self.assertIn("httpx.Timeout(1800.0, connect=30.0)", source)
+        launch = source.split("async def _shared_null_launch", 1)[1].split(
+            "\\n\\ndef _enable_shared_clients", 1
+        )[0]
+        self.assertIn("await _rollout_http.post", launch)
+
     def test_user_simulator_forbids_safety_process_pivots(self):
         source = (PKG_ROOT / "user.py").read_text().lower()
         self.assertIn("never ask about the assistant's policies", source)

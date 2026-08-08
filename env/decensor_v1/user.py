@@ -128,12 +128,17 @@ Output format (strict):
 _http = httpx.AsyncClient(
     verify=False,
     trust_env=False,
-    # 600s hard cap, NOT None: with no timeout, a judge/user-sim endpoint dying
-    # mid-call (e.g. during a serving upgrade) leaves the await hung forever.
-    # The rollout-level timeout does not cover these awaits; 100 rollouts sat
-    # zombied for 90+ minutes exactly this way. 600s exceeds any legitimate
-    # gemma completion by a wide margin.
+    # Keep a finite cap for judge and user-simulator calls. The rollout-level
+    # timeout does not cover these awaits.
     timeout=httpx.Timeout(600.0, connect=30.0),
+    limits=httpx.Limits(max_connections=None, max_keepalive_connections=1024),
+)
+_rollout_http = httpx.AsyncClient(
+    verify=False,
+    trust_env=False,
+    # A 16K GLM policy completion can legitimately exceed ten minutes. Keep a
+    # finite cap so a dead engine cannot leave the rollout hung indefinitely.
+    timeout=httpx.Timeout(1800.0, connect=30.0),
     limits=httpx.Limits(max_connections=None, max_keepalive_connections=1024),
 )
 _openai_clients = {}
@@ -287,7 +292,7 @@ async def _shared_null_launch(
         messages.append({"role": "user", "content": prompt})
     elif prompt is not None:
         messages.extend(message_to_wire(message) for message in prompt)
-    response = await _http.post(
+    response = await _rollout_http.post(
         f"{endpoint.rstrip('/')}/chat/completions",
         headers={"Authorization": f"Bearer {secret}"},
         json={"model": ctx.model, "messages": messages},
