@@ -149,7 +149,9 @@ def score_decensor(
     else:
         word_multiplier = 1.0
 
-    if word_count == 0:
+    # Keep prose word shaping separate from the empty-response gate. A valid
+    # answer can consist entirely of fenced code or fenced Markdown.
+    if not response_text.strip():
         breakdown["early_termination"] = "zero_words"
         return 0.0, breakdown
 

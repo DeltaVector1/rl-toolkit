@@ -88,6 +88,25 @@ class ScoringTests(unittest.TestCase):
         self.assertAlmostEqual(metrics["word_multiplier"], text.WORD_MULTIPLIER_FLOOR)
         self.assertGreater(reward, 0.0)
 
+    def test_fenced_answer_is_not_misclassified_as_empty(self):
+        reward, metrics = scoring.score_decensor(
+            [{"role": "user", "content": "write the file"}],
+            [assistant("```python\\nprint('complete')\\n```")],
+            scoring.Verdicts(
+                refusal=1,
+                coherency=1,
+                reasoning_ethics=0,
+                reasoning_coherency=1,
+                meta_commentary=0,
+                md_presence=1,
+            ),
+            bucket="markdown",
+            word_requirement="",
+            is_truncated=False,
+        )
+        self.assertIsNone(metrics["early_termination"])
+        self.assertGreater(reward, 0.0)
+
 
 class DeterminismTests(unittest.TestCase):
     def test_judge_temperature_is_zero(self):

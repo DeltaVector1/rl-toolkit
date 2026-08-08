@@ -204,7 +204,10 @@ def assistant_turn_early_termination(message: Any, *, reasoning_required: bool) 
     if has_unclosed_think(content):
         return "unclosed_think"
     visible_text = strip_think_tags(content)
-    if count_words(visible_text) == 0:
+    # Fenced code and fenced Markdown are visible answers. count_words()
+    # deliberately excludes fences from prose-length shaping, but it must not
+    # make a complete fenced answer look empty.
+    if not visible_text.strip():
         return "zero_words"
     if reasoning_required and not extract_message_reasoning_trace(message):
         return "no_reasoning"
