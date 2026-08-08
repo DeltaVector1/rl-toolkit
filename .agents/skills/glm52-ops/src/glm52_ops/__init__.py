@@ -26,6 +26,7 @@ from pathlib import Path
 HEAD = "n82"
 TRAINER_NODES = ["n76", "n77", "n78", "n80", "n82", "n83", "n84", "n85"]
 ENGINE_HOSTS = ["h200a", "h200b"]
+EDGE_ORCH = ENGINE_HOSTS[0]
 
 # Edge orchestrators write their metrics on h200a. Earlier orchestrators ran
 # on HEAD and wrote the same run layout there. Keep the order explicit so an
@@ -46,6 +47,7 @@ ENGINE_MODEL = "/data/glm52-rl/model-fp8"
 DEPLOY = "/data/glm52-rl/deployment"
 RUNS = "/data/glm52-rl/runs"
 CLUSTER = f"{DEPLOY}/scripts/china/cluster.sh"
+EDGE_ORCH_START = f"{DEPLOY}/scripts/h200/start_orchestrator.sh"
 
 TRAINER_CT = "glm52-decensor-trainer"
 ORCH_CT = "glm52-decensor-orchestrator"
@@ -191,6 +193,17 @@ echo "ADAPTER $(curl -s -o /dev/null -m 10 -w '%{http_code}' http://127.0.0.1:__
 echo "SUP_RUN $(pgrep -f 'bash .*[r]un_supervisor.sh' | wc -l)"
 echo "SUP_TUN $(pgrep -f 'bash .*[t]unnel_watchdog.sh' | wc -l)"
 echo "SUP_TUN_LOG $(tail -1 /data/glm52-rl/tunnel_watchdog.log 2>/dev/null | cut -d' ' -f1)"
+"""
+
+
+
+_EDGE_ORCH_PROBE = r"""
+strip() { sed "s/\\x1b\\[[0-9;]*m//g"; }
+echo "ORCH_UP $(sudo docker ps --filter name=__ORCH__ --format up 2>/dev/null | head -1)"
+echo "ORCH_LAST $(sudo docker logs __ORCH__ 2>&1 | strip | grep -a 'SUCCESS Step' | tail -1)"
+echo "BATCH $(sudo docker logs --tail 40 __ORCH__ 2>&1 | grep -oE 'batch [0-9]+/[0-9]+[^;]*; [0-9]+ inflight' | tail -1)"
+echo "FAILS5M $(sudo docker logs --since 5m __ORCH__ 2>&1 | grep -ac 'Rollout failed')"
+echo "ORCH_LOGAGE $(sudo docker logs -t --tail 1 __ORCH__ 2>&1 | tail -1 | cut -d' ' -f1)"
 """
 
 _NODE_PROBE = r"""
@@ -349,13 +362,27 @@ def status(run: str = "", quiet: bool = False) -> Status:
 
     with ThreadPoolExecutor(max_workers=12) as ex:
         f_head = ex.submit(_ssh, HEAD, _head_script(), 300)
+        f_edge_orch = ex.submit(
+            _ssh,
+            EDGE_ORCH,
+            _EDGE_ORCH_PROBE.replace("__ORCH__", ORCH_CT),
+            120,
+        )
         f_nodes = ex.submit(_fan, TRAINER_NODES, node)
         f_engines = ex.submit(_fan, ENGINE_HOSTS, engine)
         head_rc, head_out = f_head.result()
+        edge_orch_rc, edge_orch_out = f_edge_orch.result()
         nodes_out = f_nodes.result()
         engines_out = f_engines.result()
 
     h = _kv(head_out)
+    edge_orch = _kv(edge_orch_out) if edge_orch_rc == 0 else {}
+    # The active filesystem orchestrator runs on h200a. Prefer its state and
+    # metrics. Keep the n82 values only as a legacy fallback for old runs.
+    if edge_orch.get("ORCH_UP") == "up":
+        for key in ("ORCH_UP", "ORCH_LAST", "BATCH", "FAILS5M", "ORCH_LOGAGE"):
+            if key in edge_orch:
+                h[key] = edge_orch[key]
     s.tunnels_ok = int(h.get("TUNNELS_OK", 0) or 0)
     s.tunnels_bad = [int(p) for p in h.get("TUNNELS_BAD", "").split()]
     s.trainer_up = h.get("TRAINER_UP", "") == "up"
@@ -898,6 +925,12 @@ def start(run: str, mode: str = "cold", nodes: list[str] | None = None, supervis
     if HEAD in nodes:  # rank 0 is the rendezvous master and carries the readable log
         nodes = [HEAD] + [n for n in nodes if n != HEAD]
     name, tag = f"run_{run}", f".{run}"
+    edge_tag = f".{run}h"
+    edge_config = f"{DEPLOY}/configs/h200/orchestrator{edge_tag}.toml"
+    if _ssh(EDGE_ORCH, f"test -f {edge_config}")[0] != 0:
+        raise Refused(
+            f"missing edge orchestrator config {edge_config}; refusing to start an orchestrator on n82"
+        )
     trainer_nodes = " ".join(n.lstrip("n") for n in nodes)
     # PRIME_BATCH_CACHE is never forwarded. A value leaking in from the shell
     # would replay one frozen batch for every step while the run looked healthy.
@@ -908,10 +941,22 @@ def start(run: str, mode: str = "cold", nodes: list[str] | None = None, supervis
         _fan(nodes, lambda h: _ssh(h, f"{env} bash {CLUSTER} trainer >/dev/null 2>&1; echo done", 300))
 
     def launch_orch():
-        print("starting orchestrator on n82")
-        _ssh(HEAD, f"RUN={run} RUN_NAME={name} CONFIG_TAG={tag} bash {CLUSTER} orchestrator >/dev/null 2>&1; echo done", 300)
+        print(f"starting edge orchestrator on {EDGE_ORCH}")
+        rc, out = _ssh(
+            EDGE_ORCH,
+            f"RUN={run} RUN_NAME={name} CONFIG_TAG={edge_tag} "
+            f"bash {EDGE_ORCH_START}",
+            300,
+        )
+        if rc:
+            raise RuntimeError(f"edge orchestrator start failed on {EDGE_ORCH}: {out}")
 
     print(f"stopping any previous containers for {run}")
+    _ssh(
+        EDGE_ORCH,
+        f"pkill -f '[s]ync_rollout_batches.sh' 2>/dev/null; "
+        f"sudo docker rm -f {ORCH_CT} >/dev/null 2>&1; echo done",
+    )
     _ssh(HEAD, f"sudo docker rm -f {ORCH_CT} >/dev/null 2>&1; echo done")
     _fan(nodes, lambda h: _ssh(h, f"sudo pkill -9 -f PRIME-RL 2>/dev/null; sudo docker rm -f {TRAINER_CT} >/dev/null 2>&1; echo done"))
     time.sleep(20)  # let the host mirror of device memory drain before reloading
@@ -952,11 +997,17 @@ def start(run: str, mode: str = "cold", nodes: list[str] | None = None, supervis
 
 
 def stop() -> None:
-    """Stop the orchestrator, then the trainer. Supervisors are stopped first."""
+    """Stop the edge orchestrator, then the trainer. Supervisors stop first."""
     _ssh(HEAD, "pkill -f 'bash .*[r]un_supervisor.sh'; pkill -f 'bash .*[t]unnel_watchdog.sh'; echo done")
+    _ssh(
+        EDGE_ORCH,
+        f"pkill -f '[s]ync_rollout_batches.sh' 2>/dev/null; "
+        f"sudo docker rm -f {ORCH_CT} >/dev/null 2>&1; echo done",
+    )
+    # Remove a legacy n82 container if one exists, but never start one there.
     _ssh(HEAD, f"sudo docker rm -f {ORCH_CT} >/dev/null 2>&1; echo done")
     _fan(TRAINER_NODES, lambda h: _ssh(h, f"sudo pkill -9 -f PRIME-RL 2>/dev/null; sudo docker rm -f {TRAINER_CT} >/dev/null 2>&1; echo done"))
-    print("stopped supervisors, orchestrator, and trainer. The engines are still running.")
+    print("stopped supervisors, edge orchestrator, and trainer. The engines are still running.")
 
 
 # ------------------------------------------------------------------ entry
