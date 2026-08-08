@@ -20,7 +20,9 @@ remote() {
   fi
 }
 
-parallel_threshold=${PARALLEL_THRESHOLD:-268435456}
+# One WAN TCP stream collapses under the measured loss. Even ordinary
+# no-router batches are 80-100 MiB, so stripe them too.
+parallel_threshold=${PARALLEL_THRESHOLD:-67108864}
 parallel_streams=${PARALLEL_STREAMS:-16}
 
 copy_parallel() {
