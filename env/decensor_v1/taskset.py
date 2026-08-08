@@ -174,6 +174,47 @@ class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
         prompt, completion = self._split_conversation(trace)
         bucket = self.data.prompt_bucket
 
+        # Reject response-shape failures before spending six or seven remote
+        # judge calls. These gates depend only on the completed trajectory.
+        _, precheck = score_decensor(
+            prompt,
+            completion,
+            Verdicts(),
+            bucket=bucket,
+            word_requirement=self.data.word_requirement,
+            word_target=self.data.word_target,
+            is_truncated=trace.is_truncated,
+            md_exempt=False,
+            judge_endpoint_down=False,
+            config=scfg,
+        )
+        if trace.state.user_sim_failed:
+            precheck["early_termination"] = "user_sim_failed"
+        if precheck.get("early_termination") is not None:
+            precheck["final_reward"] = 0.0
+            trace.info["decensor"] = precheck
+            trace.record_metrics(
+                {
+                    key: float(value)
+                    for key, value in precheck.items()
+                    if isinstance(value, (int, float)) and not isinstance(value, bool)
+                }
+            )
+            reason = precheck["early_termination"]
+            trace.record_metric("decensor_gated", 1.0)
+            trace.record_metric("decensor_zero_reward", 1.0)
+            trace.record_metric("decensor_near_zero_reward", 1.0)
+            trace.record_metric(f"decensor_gate_{reason}", 1.0)
+            trace.record_metric("decensor_target_turns", float(self.data.target_turns))
+            trace.record_metric(
+                "decensor_completed_turns",
+                float(len(extract_all_assistant_texts(completion))),
+            )
+            trace.record_metric(
+                "decensor_user_sim_failed", float(trace.state.user_sim_failed)
+            )
+            return 0.0
+
         response_text_raw = extract_completion_text(completion)
         response_text = strip_think_tags(response_text_raw)
         conversation_text = _format_full_conv_for_coherency(prompt, completion)

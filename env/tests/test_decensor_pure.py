@@ -150,6 +150,11 @@ class DeterminismTests(unittest.TestCase):
         self.assertIn("reasoning_trace =", task_source)
         self.assertIn("join(reasoning_parts)", task_source)
 
+    def test_response_gates_run_before_remote_judges(self):
+        source = (PKG_ROOT / "taskset.py").read_text()
+        self.assertLess(source.index("_, precheck = score_decensor"), source.index("asyncio.gather"))
+        self.assertIn('"user_sim_failed"', source)
+
 
 if __name__ == "__main__":
     unittest.main()
