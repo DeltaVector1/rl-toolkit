@@ -27,6 +27,12 @@ HEAD = "n82"
 TRAINER_NODES = ["n76", "n77", "n78", "n80", "n82", "n83", "n84", "n85"]
 ENGINE_HOSTS = ["h200a", "h200b"]
 
+# Edge orchestrators write their metrics on h200a. Earlier orchestrators ran
+# on HEAD and wrote the same run layout there. Keep the order explicit so an
+# edge copy wins when both hosts contain a run, while HEAD remains the fallback
+# for the original China runs.
+REWARD_HOSTS = [ENGINE_HOSTS[0], HEAD]
+
 # n79 belongs to someone else. n81 is healthy but holds no authorized key, so
 # it is not in the job. Adding it means changing the pipeline layout as well.
 FORBIDDEN_HOSTS = {"n79"}
@@ -598,23 +604,40 @@ def reward(run: str = "", quiet: bool = False) -> RewardReport:
         "    except ValueError: continue\n"
         "    if 'step' not in r: continue\n"
         "    out.append({'step':r['step'],**{k:r.get(v) for k,v in K.items()}})\n"
-        "print(json.dumps(out))\n"
+        "print('REWARD_JSON '+json.dumps(out))\n"
         "PY\n"
     )
-    rc, out = _ssh(HEAD, script, timeout=180)
+    results = _fan(REWARD_HOSTS, lambda host: _ssh(host, script, timeout=180))
     rep = RewardReport(run=run)
-    blob = ""
-    for line in out.splitlines():
-        if line.startswith("["):
-            blob = line
-    if not blob:
+    rows = None
+    found = []
+    for host in REWARD_HOSTS:
+        candidate = None
+        for line in results[host][1].splitlines():
+            if not line.startswith("REWARD_JSON "):
+                continue
+            try:
+                parsed = json.loads(line.removeprefix("REWARD_JSON "))
+            except (TypeError, ValueError):
+                continue
+            if isinstance(parsed, list):
+                candidate = parsed
+        if candidate is not None:
+            found.append(candidate)
+            if any(isinstance(row, dict) and row.get("eff") is not None for row in candidate):
+                rows = candidate
+                break
+    if rows is None and found:
+        rows = found[0]
+    if rows is None:
         rep.verdict = "no data"
-        rep.note = f"no rollout-metrics.jsonl found under {RUNS}/{run}/"
+        hosts = " or ".join(REWARD_HOSTS)
+        rep.note = f"no rollout-metrics.jsonl found under {RUNS}/{run}/ on {hosts}"
         if not quiet:
             print(rep.report())
         return rep
 
-    rows = [r for r in json.loads(blob) if r.get("eff") is not None]
+    rows = [r for r in rows if isinstance(r, dict) and r.get("eff") is not None]
     rows.sort(key=lambda r: r["step"])
     rep.steps = [r["step"] for r in rows]
     rep.effective = [float(r["eff"]) for r in rows]
