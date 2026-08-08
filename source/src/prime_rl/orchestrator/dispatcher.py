@@ -637,12 +637,22 @@ class RolloutDispatcher:
 
     def _is_transient_policy_failure(self, rollout: Rollout) -> bool:
         error = rollout.error
-        if error is None or error.type != "ProviderError" or not any(
-            marker in error.message.lower() for marker in ("connection", "timed out", "timeout")
+        if error is None or error.type not in ("ProviderError", "HarnessError"):
+            return False
+        message = error.message.lower()
+        if not any(
+            marker in message
+            for marker in ("connection", "timed out", "timeout", "readtimeout")
         ):
             return False
+        if error.type == "HarnessError":
+            # The custom null harness wraps httpx.ReadTimeout after useful
+            # turns as HarnessError. It is still a policy-client failure and
+            # must be retried away from the client pinned to this GRPO group.
+            return True
         return any(
-            getattr(call, "model", None) == self.policy.model_name and getattr(call, "error", None) is not None
+            getattr(call, "model", None) == self.policy.model_name
+            and getattr(call, "error", None) is not None
             for call in getattr(rollout, "calls", [])
         )
 
