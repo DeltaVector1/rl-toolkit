@@ -25,7 +25,7 @@ parallel_streams=${PARALLEL_STREAMS:-16}
 
 copy_parallel() {
   local source=$1 destination=$2
-  local size chunk_size parts_dir remote_parts status pid part
+  local size chunk_size parts_dir remote_parts status pid part part_name part_size
   local -a pids
 
   size=$(stat -c %s "$source")
@@ -36,12 +36,19 @@ copy_parallel() {
   mkdir -p "$parts_dir"
   split -b "$chunk_size" -d -a 3 "$source" "$parts_dir/part-"
   remote "mkdir -p '$remote_parts'"
+  remote "find '$remote_parts' -maxdepth 1 -type f -name 'part-*' -printf '%f %s\\n'" \
+    >"$parts_dir/remote-sizes" || : >"$parts_dir/remote-sizes"
 
   status=0
   pids=()
   for part in "$parts_dir"/part-*; do
+    part_name=$(basename "$part")
+    part_size=$(stat -c %s "$part")
+    if grep -qx "$part_name $part_size" "$parts_dir/remote-sizes"; then
+      continue
+    fi
     rsync -az --partial --append-verify --timeout=120 \
-      -e "ssh ${ssh_opts[*]}" "$part" "$dest_host:$remote_parts/$(basename "$part")" &
+      -e "ssh ${ssh_opts[*]}" "$part" "$dest_host:$remote_parts/$part_name" &
     pids+=("$!")
   done
   for pid in "${pids[@]}"; do
