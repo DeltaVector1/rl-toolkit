@@ -602,8 +602,12 @@ class RolloutDispatcher:
             group.rollouts_to_schedule += 1
             if group.kind == "eval":
                 self.switch_mode(DispatcherMode.PREFER_EVAL, reason="an eval rollout is being retried")
+            detail = "; ".join(
+                f"{error.type}: {error.message}" for error in rollouts[0].errors[-2:]
+            )
             get_logger().warning(
-                f"Retrying transient rollout failure in group {meta.group_id} ({meta.env_name}) away from {identity[0]}"
+                f"Retrying transient rollout failure in group {meta.group_id} "
+                f"({meta.env_name}) away from {identity[0]}: {detail}"
             )
             return
 
