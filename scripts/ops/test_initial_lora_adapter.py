@@ -4,12 +4,14 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 from safetensors.torch import save_file
 from torch import nn
 
-from prime_rl.trainer.lora import load_initial_lora_adapter
+from prime_rl.configs.trainer import LoRAConfig
+from prime_rl.trainer.lora import apply_lora_to_model, load_initial_lora_adapter
 from prime_rl.trainer.models.layers.lora import MultiLoRALinear
 from prime_rl.trainer.models.layers.lora.base import set_lora_num_tokens, set_multilora_scaling
 
@@ -42,6 +44,47 @@ class InitialAdapterTest(unittest.TestCase):
                 str(Path(td) / "adapter_model.safetensors"),
             )
             load_initial_lora_adapter(model, td)
+        torch.testing.assert_close(model.proj.lora_A[0], expected_a)
+        torch.testing.assert_close(model.proj.lora_B[0], expected_b)
+
+    def test_creation_hook_loads_after_slot_reset(self):
+        class FakeRuns:
+            max_runs = 1
+
+            def __init__(self):
+                self.hook = None
+
+            def register_module(self, _prefix, _module):
+                pass
+
+            def register_creation_hook(self, hook):
+                self.hook = hook
+
+        model = nn.Module()
+        model.proj = nn.Linear(16, 8, bias=False, dtype=torch.bfloat16)
+        expected_a = torch.full((8, 16), 0.25, dtype=torch.bfloat16)
+        expected_b = torch.full((8, 8), -0.5, dtype=torch.bfloat16)
+        runs = FakeRuns()
+        with tempfile.TemporaryDirectory() as td:
+            save_file(
+                {
+                    "proj.lora_A.weight": expected_a,
+                    "proj.lora_B.weight": expected_b,
+                },
+                str(Path(td) / "adapter_model.safetensors"),
+            )
+            config = LoRAConfig(
+                rank=8,
+                alpha=16,
+                target_modules=["proj"],
+                initial_adapter_path=td,
+            )
+            with patch("prime_rl.trainer.lora.get_multi_run_manager", return_value=runs):
+                apply_lora_to_model(model, config)
+            self.assertIsNotNone(runs.hook)
+            model.proj.reset_parameters(0)
+            runs.hook(0, "run_test")
+
         torch.testing.assert_close(model.proj.lora_A[0], expected_a)
         torch.testing.assert_close(model.proj.lora_B[0], expected_b)
 
