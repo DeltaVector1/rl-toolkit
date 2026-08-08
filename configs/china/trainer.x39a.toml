@@ -17,7 +17,7 @@ ranks_filter = [0]
 project = "prod-run"
 name = "trainer-x39a"
 group = "glm52-decensor-r32"
-tags = ["glm-5.2", "pp8", "decensor", "grpo", "native-fp8-base", "lora-r32", "64x4090", "b1024", "8192", "cp8", "dequant-linears-native-moe", "sparse-ada", "norm-adv", "expert-ac"]
+tags = ["glm-5.2", "pp8", "decensor", "grpo", "native-fp8-base", "lora-r32", "64x4090", "b1024", "8192", "cp8", "dq-linear-fp8-moe", "sparse-ada", "norm-adv", "expert-ac"]
 
 [file_monitor]
 filename = "run_x39a/trainer-metrics.jsonl"
