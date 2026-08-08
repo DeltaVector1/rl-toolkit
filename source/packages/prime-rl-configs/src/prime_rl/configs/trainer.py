@@ -100,6 +100,9 @@ class LoRAConfig(BaseConfig):
     modules_to_save: list[str] = []
     """Module names or regex patterns to keep fully trainable (not freeze). Same matching rules as ``target_modules``."""
 
+    initial_adapter_path: str | None = None
+    """Optional PEFT adapter file or directory used to initialize slot zero before FSDP wrapping. This restores policy weights only; optimizer state is new."""
+
 
 class DebugModelConfig(BaseConfig):
     num_layers: int | None = None

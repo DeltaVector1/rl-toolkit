@@ -55,6 +55,34 @@ Native FP8 training remains rejected. x37 returns to the previously valid
 BF16-dequantized trainer path and reduces the sequence ceiling to 12,288 for
 memory headroom.
 
+# X37 BF16 PRODUCTION AND X38 POLICY RESTORE
+
+x37 returned to BF16-dequantized frozen weights with sequence length 12,288.
+It completed seven optimizer steps. They measured 1,444 to 1,474 tokens/s,
+46.5 to 46.6 GiB peak memory, masked mismatch KL 0.357 to 0.517, unmasked
+mismatch KL 0.039 to 0.055, and 3.2 to 3.9 percent masked tokens.
+All eight pipeline stages had nonzero LoRA gradients. Adapter step 1 reached
+both H200 engines in about eight seconds and matched SHA-256 on n82, h200a,
+and h200b.
+
+The first ten rollout batches had mean effective reward 0.0320 and
+step-to-step standard deviation 0.0099. The fitted increase was 0.0057 against
+a 0.0194 threshold. The measured verdict was `inside the noise`. Environment
+errors were zero, judge parse failures were at most 0.1 percent, truncation was
+0.1 to 2.1 percent in the first four batches, and approximately 41 to 49
+percent of examples had near-zero reward.
+
+Trainer step 8 contained 314 microbatches. n80 rank 32 OOMed in the expert W2
+`torch._grouped_mm` output while requesting 228 MiB with 187.5 MiB free. The
+other NCCL errors were consequences of this exit.
+
+x38 reduces the sequence length to 8,192, which bounds each CP shard at 1,024
+tokens and reduces this routed-expert output by one third. It initializes its
+LoRA slot from x37 adapter step 7. This preserves the policy, but the Muon
+optimizer state starts new because x37 had no full trainer checkpoint.
+`LoRAConfig.initial_adapter_path` is strict: every exported adapter key and
+shape must match before any tensor is copied.
+
 # LARGE WAN BATCHES AND BUSY ENGINE HEALTH
 
 `scripts/h200/sync_rollout_batches.sh` stripes files of 64 MiB or more into 16
