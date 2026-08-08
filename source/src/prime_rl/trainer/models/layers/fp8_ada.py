@@ -145,6 +145,7 @@ class _FP8LogProb(torch.autograd.Function):
         logprobs = torch.empty(n, device=hidden.device, dtype=torch.float32)
         entropy = torch.empty_like(logprobs)
         logz = torch.empty_like(logprobs)
+        mean_scaled = torch.empty_like(logprobs)
         for start in range(0, n, chunk_size):
             end = min(start + chunk_size, n)
             hidden_chunk = hidden[start:end]
@@ -169,33 +170,53 @@ class _FP8LogProb(torch.autograd.Function):
                 target = torch.where(mask, scaled[row, index], target)
             logz[start:end] = m + torch.log(s)
             logprobs[start:end] = target - logz[start:end]
-            entropy[start:end] = logz[start:end] - t / s
-        ctx.save_for_backward(hidden, weight, scale, labels, inv_temperature, logz)
+            mean_scaled[start:end] = t / s
+            entropy[start:end] = logz[start:end] - mean_scaled[start:end]
+        ctx.save_for_backward(
+            hidden, weight, scale, labels, inv_temperature, logz, mean_scaled
+        )
         ctx.chunk_size = chunk_size
         return logprobs, entropy
 
     @staticmethod
     def backward(ctx, grad_logprobs, grad_entropy):
-        hidden, weight, scale, labels, inv_temperature, logz = ctx.saved_tensors
+        hidden, weight, scale, labels, inv_temperature, logz, mean_scaled = (
+            ctx.saved_tensors
+        )
         grad_hidden = torch.zeros_like(hidden)
         for start in range(0, hidden.shape[0], ctx.chunk_size):
             end = min(start + ctx.chunk_size, hidden.shape[0])
             hidden_chunk = hidden[start:end]
             labels_chunk = labels[start:end]
-            grad_chunk = grad_logprobs[start:end].float()
+            grad_logprob_chunk = (
+                torch.zeros(end - start, device=hidden.device, dtype=torch.float32)
+                if grad_logprobs is None
+                else grad_logprobs[start:end].float()
+            )
+            grad_entropy_chunk = (
+                torch.zeros(end - start, device=hidden.device, dtype=torch.float32)
+                if grad_entropy is None
+                else grad_entropy[start:end].float()
+            )
             inv_t = inv_temperature[start:end].unsqueeze(-1)
             for vocab_start in range(0, weight.shape[0], 16384):
                 vocab_end = min(vocab_start + 16384, weight.shape[0])
                 weight_chunk = weight[vocab_start:vocab_end]
                 scale_chunk = scale[vocab_start:vocab_end]
                 scaled = _scaled_mm(hidden_chunk, weight_chunk, scale_chunk).float() * inv_t
-                grad_logits = (-grad_chunk).unsqueeze(-1) * torch.exp(
-                    scaled - logz[start:end].unsqueeze(-1)
+                probability = torch.exp(scaled - logz[start:end].unsqueeze(-1))
+                # d log p_y / dz = one_hot(y) - p and
+                # d H / dz = p * (E[z] - z), where z is the
+                # temperature-scaled logit.
+                grad_logits = probability * (
+                    -grad_logprob_chunk.unsqueeze(-1)
+                    + grad_entropy_chunk.unsqueeze(-1)
+                    * (mean_scaled[start:end].unsqueeze(-1) - scaled)
                 )
                 mask = (labels_chunk >= vocab_start) & (labels_chunk < vocab_end)
                 row = torch.arange(end - start, device=hidden.device)
                 index = (labels_chunk - vocab_start).clamp(0, vocab_end - vocab_start - 1).long()
-                grad_logits[row, index] += grad_chunk * mask
+                grad_logits[row, index] += grad_logprob_chunk * mask
                 grad_hidden[start:end].add_(
                     _scaled_mm(
                         (grad_logits * inv_t * scale_chunk).to(hidden.dtype),

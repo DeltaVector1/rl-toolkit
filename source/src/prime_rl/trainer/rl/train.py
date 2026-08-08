@@ -940,11 +940,24 @@ def train(config: TrainerConfig):
 
         # compute_loss already divided by the global token count. Undo FSDP's per-rank averaging
         # across dp_cp so the final gradient is the true per-token mean over the global batch.
+        found_nonfinite = torch.zeros((), device="cuda", dtype=torch.int32)
         for param in model.parameters():
             if param.grad is not None:
                 param.grad.mul_(parallel_dims.fsdp_gradient_divide_factor)
                 grad = param.grad.to_local() if hasattr(param.grad, "to_local") else param.grad
-                grad.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+                found_nonfinite.maximum_(
+                    (~torch.isfinite(grad).all()).to(dtype=torch.int32)
+                )
+
+        # Do not silently replace NaN/Inf values with zero. That changes the
+        # optimizer direction and made the later finite-norm guard ineffective.
+        # All ranks must make the same decision before any rank enters the
+        # collective gradient clipping path.
+        dist.all_reduce(found_nonfinite, op=dist.ReduceOp.MAX)
+        if found_nonfinite.item():
+            raise RuntimeError(
+                f"Non-finite gradient at step {progress.step}; refusing to update or broadcast."
+            )
 
         # Optionally, clip the gradients
         grad_norm: torch.Tensor | None = None

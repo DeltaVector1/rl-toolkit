@@ -33,16 +33,6 @@ def _run_lora_for_loop(
     return torch.cat(lora_out_splits, dim=0)
 
 
-class _FiniteGradient(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x):
-        return x
-
-    @staticmethod
-    def backward(ctx, grad):
-        return torch.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0).clamp_(-1.0, 1.0)
-
-
 class _SingleLoRA(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, lora_A, lora_B):
@@ -53,14 +43,24 @@ class _SingleLoRA(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad):
         x, lora_A, lora_B, a_out = ctx.saved_tensors
-        grad = grad.float()
-        lora_A_float = lora_A.float()
-        lora_B_float = lora_B.float()
-        grad_a = grad @ lora_B_float
+        # Accumulate low-precision LoRA gradients in FP32. Preserve FP32/FP64
+        # inputs so the custom backward has the same derivative as the two
+        # matmuls and remains gradcheckable outside the production BF16 path.
+        compute_dtype = (
+            torch.float32
+            if grad.dtype in (torch.float16, torch.bfloat16)
+            else grad.dtype
+        )
+        grad_compute = grad.to(compute_dtype)
+        x_compute = x.to(compute_dtype)
+        lora_A_compute = lora_A.to(compute_dtype)
+        lora_B_compute = lora_B.to(compute_dtype)
+        a_out_compute = a_out.to(compute_dtype)
+        grad_a = grad_compute @ lora_B_compute
         return (
-            (grad_a @ lora_A_float).to(x.dtype),
-            (grad_a.T @ x.float()).to(lora_A.dtype),
-            (grad.T @ a_out.float()).to(lora_B.dtype),
+            (grad_a @ lora_A_compute).to(x.dtype),
+            (grad_a.T @ x_compute).to(lora_A.dtype),
+            (grad_compute.T @ a_out_compute).to(lora_B.dtype),
         )
 
 
@@ -147,7 +147,7 @@ class MultiLoRALinear(MultiLoRAModule):
 
         if self.n_adapters == 1:
             lora_out = _SingleLoRA.apply(lora_x, self.lora_A[0], self.lora_B[0])
-            return _FiniteGradient.apply(base_out + self._scaling_factors[0] * lora_out).view(shape)
+            return (base_out + self._scaling_factors[0] * lora_out).view(shape)
 
         offsets = self._lora_num_tokens.cumsum(dim=0, dtype=torch.int32)
         assert offsets[-1] == x.shape[0], f"offsets: {offsets}, x.shape: {x.shape}"
@@ -158,7 +158,7 @@ class MultiLoRALinear(MultiLoRAModule):
         else:
             lora_out = _run_lora_for_loop(lora_x, lora_A, lora_B, offsets)
         scaling = torch.repeat_interleave(self._scaling_factors, self._lora_num_tokens).unsqueeze(-1)
-        return _FiniteGradient.apply(base_out + scaling * lora_out).view(shape)
+        return (base_out + scaling * lora_out).view(shape)
 
     def __repr__(self) -> str:
         return (
