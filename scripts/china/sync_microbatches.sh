@@ -17,7 +17,7 @@ publish() {
   local digest remote_digest
 
   digest=$(sha256sum "$source" | cut -d' ' -f1)
-  remote_digest=$(ssh "${ssh_opts[@]}" "$host" \
+  remote_digest=$(ssh -n "${ssh_opts[@]}" "$host" \
     "sha256sum '$final' 2>/dev/null | cut -d' ' -f1" || true)
   [ "$remote_digest" = "$digest" ] && return
   if [ -n "$remote_digest" ]; then
@@ -25,21 +25,21 @@ publish() {
     return 1
   fi
 
-  ssh "${ssh_opts[@]}" "$host" \
+  ssh -n "${ssh_opts[@]}" "$host" \
     "mkdir -p '$(dirname "$partial")' '$(dirname "$final")'"
-  if ssh "${ssh_opts[@]}" "$host" "command -v rsync >/dev/null"; then
+  if ssh -n "${ssh_opts[@]}" "$host" "command -v rsync >/dev/null"; then
     rsync -a --partial --append-verify --timeout=60 \
       -e "ssh ${ssh_opts[*]}" "$source" "$host:$partial"
   else
     scp "${ssh_opts[@]}" -p "$source" "$host:$partial"
   fi
-  remote_digest=$(ssh "${ssh_opts[@]}" "$host" \
+  remote_digest=$(ssh -n "${ssh_opts[@]}" "$host" \
     "sha256sum '$partial' | cut -d' ' -f1")
   [ "$remote_digest" = "$digest" ] || {
     echo "$host: checksum failed for $relative" >&2
     return 1
   }
-  ssh "${ssh_opts[@]}" "$host" "mv '$partial' '$final'"
+  ssh -n "${ssh_opts[@]}" "$host" "mv '$partial' '$final'"
   echo "published $relative to $host $digest"
 }
 

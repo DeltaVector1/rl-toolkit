@@ -95,20 +95,19 @@ but the all-to-all became slower: 0.452 s against 0.285 s. Stay at MTU 1500.
 # The expert activation-checkpoint cache
 
 `PRIME_EP_AC_CACHE=1` keeps the INT4 payload that each rank received in the
-forward pass and uses it again on the recompute. This is exact, because the
-recompute would dequantize the same bytes. It costs about 3.8 GB for each GPU.
+forward pass and uses it again on the recompute. It costs about 3.8 GB for each
+GPU.
 
-The guard is easy to get wrong. `torch.autograd.Function.forward` always runs
-with gradients disabled, so a `torch.is_grad_enabled()` test inside
-`_INT4Dispatch.forward` never passes and nothing is cached. The run then looks
-correct and stays slow. The decision is made in `_token_dispatch` and
-`_token_combine` instead.
+Do not enable it on the current trainer. x26 failed twice when rank 35 needed a
+308 MiB grouped-expert output with only 287.62 MiB free. The cache also has
+only one dispatch and combine slot for each layer while 1F1B has multiple
+micro-batches in flight. The slot can be overwritten before its matching
+recompute.
 
-`scripts/china/check_ep_ac_cache.py` counts the real `all_to_all_single` calls,
-so this fault cannot pass without a signal.
-
-This setting needs selective activation checkpointing. With full activation
-checkpointing it raises "Recomputed values have different metadata".
+`PRIME_EP_AC_CACHE=0` recomputes the same INT4 payload and repeats the
+node-local all-to-all. This changes performance, not the model values, and
+restores sufficient memory headroom. Selective activation checkpointing stays
+enabled.
 
 # THE LINK TO THE ENGINES
 

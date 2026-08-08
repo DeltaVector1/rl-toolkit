@@ -159,7 +159,7 @@ for h in n82 n76 n77 n78 n80 n83 n84 n85; do
 done
 for h in n82 n76 n77 n78 n80 n83 n84 n85; do
   ( ssh $h "TRAINER_NODES='$TN' RUN=xNN RUN_NAME=run_xNN CONFIG_TAG=.xNN \
-      PRIME_EP_PROFILE=1 PRIME_EP_AC_CACHE=1 \
+      PRIME_EP_PROFILE=1 PRIME_EP_AC_CACHE=0 \
       bash /data/glm52-rl/deployment/scripts/china/cluster.sh trainer" ) &
 done
 wait

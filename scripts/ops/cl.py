@@ -112,7 +112,7 @@ def cmd_restart(a):
     # only matches under SELECTIVE activation checkpointing; with full AC it trips
     # "Recomputed values ... have different metadata". It also buys little under PP,
     # where the all-to-all is node-local and already 80x faster.
-    ep_cache = os.environ.get("PRIME_EP_AC_CACHE", "1")
+    ep_cache = os.environ.get("PRIME_EP_AC_CACHE", "0")
     env = (
         f"TRAINER_NODES='{nodes_env}' RUN={a.run} RUN_NAME={a.name} CONFIG_TAG={a.tag} "
         f"PRIME_EP_PROFILE=1 PRIME_EP_PROFILE_EVERY=150 PRIME_EP_AC_CACHE={ep_cache}"

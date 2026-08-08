@@ -855,7 +855,7 @@ def start(run: str, mode: str = "cold", nodes: list[str] | None = None, supervis
     trainer_nodes = " ".join(n.lstrip("n") for n in nodes)
     # PRIME_BATCH_CACHE is never forwarded. A value leaking in from the shell
     # would replay one frozen batch for every step while the run looked healthy.
-    env = f"TRAINER_NODES='{trainer_nodes}' RUN={run} RUN_NAME={name} CONFIG_TAG={tag} PRIME_EP_PROFILE=1 PRIME_EP_AC_CACHE=1"
+    env = f"TRAINER_NODES='{trainer_nodes}' RUN={run} RUN_NAME={name} CONFIG_TAG={tag} PRIME_EP_PROFILE=1 PRIME_EP_AC_CACHE=0"
 
     def launch_trainer():
         print(f"starting trainer on {len(nodes)} nodes")

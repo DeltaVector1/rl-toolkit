@@ -51,7 +51,7 @@ for h in $NODES; do
   ( ssh -o BatchMode=yes -o ConnectTimeout=25 "$h" "sudo docker rm -f glm52-decensor-trainer >/dev/null 2>&1; \
       TRAINER_NODES='$TRAINER_NODES' \
       PRIME_STATS_DEBUG='$DBG' PRIME_PP_MAX_MICRO='$CAP' \
-      RUN=$RUN RUN_NAME=$NAME CONFIG_TAG=.$RUN PRIME_EP_PROFILE=1 PRIME_EP_AC_CACHE='${PRIME_EP_AC_CACHE:-1}' \
+      RUN=$RUN RUN_NAME=$NAME CONFIG_TAG=.$RUN PRIME_EP_PROFILE=1 PRIME_EP_AC_CACHE='${PRIME_EP_AC_CACHE:-0}' \
       bash /data/glm52-rl/deployment/scripts/china/cluster.sh trainer >/dev/null 2>&1" \
     || echo "$h" >> /tmp/ppretry_failed.$$ ) &
 done
