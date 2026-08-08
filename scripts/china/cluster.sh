@@ -31,14 +31,14 @@ common=(
   -e NCCL_P2P_DISABLE=1
   -e NCCL_SOCKET_NTHREADS=1
   -e NCCL_NSOCKS_PERTHREAD=1
-  # 1MB, not the old 8MB WAN tuning: buffer size multiplies across every
-  # comm x peer x channel; host-side NCCL memory hit 49GB/rank at 16K.
+  # Native checkpoint FP8 restores enough VRAM headroom to use the faster x24
+  # communication settings without putting routed-expert allocations at risk.
   -e NCCL_BUFFSIZE=1048576
   # NCCL >=2.19 allocates host bounce buffers via cuMem/memfd (invisible in
   # /dev/shm, counted as shmem) -- the 300GB/node "shared" spikes. Legacy path.
   -e NCCL_CUMEM_HOST_ENABLE=0
-  # The current launcher uses four NCCL channels. Historical global-EP tests
-  # favored eight, but that topology is no longer current.
+  # Four channels measured substantially faster than two. One hangs and must
+  # never be used.
   -e NCCL_MIN_NCHANNELS=4
   -e NCCL_MAX_NCHANNELS=4
   -e TORCH_NCCL_TRACE_BUFFER_SIZE=1048576
@@ -104,6 +104,9 @@ PY
     # 1500+ per node = 50GB+); the container was just removed, so purge.
     sudo rm -f /dev/shm/nccl-* 2>/dev/null || true
     sudo docker rm -f glm52-decensor-trainer >/dev/null 2>&1 || true
+    # Keep the optional checkpoint cache disabled. It is not selected by the
+    # current dequantized, node-local EP path, but its single slot per layer is
+    # not safe for multiple 1F1B micro-batches.
     sudo docker run -d --name glm52-decensor-trainer \
       --gpus all "${common[@]}" \
       -v /data/glm52-rl/cache/torchinductor:/tmp/torchinductor_appuser \
@@ -134,11 +137,11 @@ PY
       -v "$deployment/source/src/prime_rl/trainer/model.py":/app/src/prime_rl/trainer/model.py:ro \
       -v "$deployment/source/packages/prime-rl-configs/src/prime_rl/configs/trainer.py":/app/packages/prime-rl-configs/src/prime_rl/configs/trainer.py:ro \
       --env-file /data/trinity/training.env \
-      -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8 \
+      -e PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:256}" \
       -e TORCHINDUCTOR_COMPILE_THREADS=8 \
       -e PRIME_EP_PROFILE="${PRIME_EP_PROFILE:-0}" \
       -e PRIME_EP_PROFILE_EVERY="${PRIME_EP_PROFILE_EVERY:-150}" \
-      -e PRIME_EP_AC_CACHE="${PRIME_EP_AC_CACHE:-1}" \
+      -e PRIME_EP_AC_CACHE="${PRIME_EP_AC_CACHE:-0}" \
       -e PRIME_BATCH_CACHE="${PRIME_BATCH_CACHE:-}" \
       -e PRIME_PP_MAX_MICRO="${PRIME_PP_MAX_MICRO:-}" \
       -e PRIME_STATS_DEBUG="${PRIME_STATS_DEBUG:-}" \
