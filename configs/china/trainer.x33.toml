@@ -1,13 +1,13 @@
 output_dir = "/data/glm52-rl/runs/x33"
-max_steps = 200
+max_steps = 1
 # 5400, not 1800: at 16K the phantom-shmem pressure pushes nodes into
 # transient swap thrash; collectives stall 20-40 min and RECOVER (observed
 # blackouts lifting on their own). 1800s converts a recoverable stall into
 # a watchdog kill -- three attempts died exactly this way.
 dist_timeout_seconds = 5400
-# Launch only after x32 passes the full-production native-FP8 parity gate.
-# Router replay stays disabled to keep WAN payloads small.
-enable_router_replay = false
+# x32 no-replay reduced the old-loader mismatch but remained unusable at KL 3.83.
+# Replay the H200 expert routes to isolate route amplification from dense-kernel error.
+enable_router_replay = true
 
 [log]
 level = "debug"
@@ -17,7 +17,7 @@ ranks_filter = [0]
 project = "prod-run"
 name = "trainer-x33"
 group = "glm52-decensor-r32"
-tags = ["glm-5.2", "pp8", "decensor", "grpo", "native-fp8-base", "lora-r32", "64x4090", "b1024", "16384", "cp8", "no-router-replay", "sparse-ada", "norm-adv", "expert-ac"]
+tags = ["glm-5.2", "pp8", "decensor", "grpo", "native-fp8-base", "lora-r32", "64x4090", "b1024", "16384", "cp8", "router-replay", "sparse-ada", "norm-adv", "expert-ac"]
 
 [file_monitor]
 filename = "run_x33/trainer-metrics.jsonl"
@@ -99,7 +99,7 @@ targets = ["attention", "attn_proj", "mla_up_proj", "routed_experts", "norm"]
 
 [optim]
 type = "muon"
-lr = 8e-6
+lr = 0.0
 weight_decay = 0.0
 max_norm = 1.0
 
@@ -113,12 +113,4 @@ save_format = "safetensors"
 [rollout_transport]
 type = "filesystem"
 
-[ckpt]
-interval = 5
-# weights_only=true cannot resume training. At interval=25 no checkpoint
-# existed by step 10, so a trainer restart lost every step.
-weights_only = false
-skip_gather_master_weights = true
-keep_last = 2
-keep_interval = 100
-output_dir = "/data/glm52-rl/runs/x33/run_x33"
+# No trainer checkpoint: x32 proved that a full frozen-base DCP exceeds the remaining disks.

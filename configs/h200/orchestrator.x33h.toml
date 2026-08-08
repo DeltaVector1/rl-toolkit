@@ -1,5 +1,5 @@
 output_dir = "/data/glm52-rl/runs/x33/run_x33"
-max_steps = 200
+max_steps = 1
 seq_len = 16384
 batch_size = 1024
 group_size = 16
@@ -15,7 +15,7 @@ level = "info"
 project = "prod-run"
 name = "orchestrator-x33"
 group = "glm52-decensor-r32"
-tags = ["glm-5.2", "decensor", "grpo", "w8a8-rollouts", "native-fp8-trainer", "lora-r32", "16xh200-rollouts", "64x4090-trainer", "edge-gemma", "b1024", "16384", "cp8", "no-router-replay", "sparse-ada", "norm-adv", "expert-ac"]
+tags = ["glm-5.2", "decensor", "grpo", "w8a8-rollouts", "native-fp8-trainer", "lora-r32", "16xh200-rollouts", "64x4090-trainer", "edge-gemma", "b1024", "16384", "cp8", "router-replay", "sparse-ada", "norm-adv", "expert-ac"]
 
 [file_monitor]
 filename = "rollout-metrics.jsonl"
@@ -51,7 +51,7 @@ wait_for_ready_timeout = 7200
 skip_model_check = true
 
 [optim]
-lr = 8e-6
+lr = 0.0
 
 [renderer]
 name = "default"
