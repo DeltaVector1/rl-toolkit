@@ -155,6 +155,14 @@ class DeterminismTests(unittest.TestCase):
         self.assertLess(source.index("_, precheck = score_decensor"), source.index("asyncio.gather"))
         self.assertIn('"user_sim_failed"', source)
 
+    def test_judges_retry_before_failure_defaults(self):
+        source = (PKG_ROOT / "taskset.py").read_text()
+        verdict = source.split("    async def _verdict", 1)[1].split(
+            "\\n    @vf.reward", 1
+        )[0]
+        self.assertIn("for attempt in range(3)", verdict)
+        self.assertIn("result.parsed is not None", verdict)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -161,11 +161,19 @@ class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
         A raised `evaluate` call means gemma is unreachable (endpoint down) — surfaced so it
         tanks the reward. A received-but-unparseable reply (verdict None) stays fail-open.
         """
-        try:
-            result = await judge.evaluate(trace=trace, **fields)
-        except Exception:
-            return _JudgeOutcome(score=None, endpoint_down=True)
-        return _JudgeOutcome(score=result.parsed, endpoint_down=False)
+        endpoint_error = False
+        for attempt in range(3):
+            try:
+                result = await judge.evaluate(trace=trace, **fields)
+            except Exception:
+                endpoint_error = True
+            else:
+                endpoint_error = False
+                if result.parsed is not None:
+                    return _JudgeOutcome(score=result.parsed, endpoint_down=False)
+            if attempt < 2:
+                await asyncio.sleep(0.5 * (attempt + 1))
+        return _JudgeOutcome(score=None, endpoint_down=endpoint_error)
 
     @vf.reward(weight=1.0)
     async def decensor_reward(self, trace: vf.Trace) -> float:
