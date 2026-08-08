@@ -114,27 +114,28 @@ Report the verdict.
 
 # The current run
 
-There is no active run. Test x26 ran from 18:54 to 19:34 UTC on 2026-08-07 and
-is stopped. Its orchestrator ran on h200a. Its trainer used the same 64 GPUs,
-BF16 weights, PP8, CP8, node-local EP8, batch 1024, group 16, and 128 rollouts
-in flight.
+x37 is active. The trainers started at approximately 09:45 UTC on 2026-08-08.
+The H200 orchestrator started at 09:53 UTC.
 
-x26 rollout step 1 took 20 minutes 5 seconds. Step 2 took 18 minutes 41
-seconds. The 84.2 MB and 92.5 MB batch transfers to n82 each took about 29
-seconds and passed SHA-256 verification. These are rollout collection and
-transfer times. They are not trainer step times.
+x37 uses the BF16-dequantized trainer path, PP8, CP8, node-local EP8, batch
+1024, group 16, sequence length 12,288, learning rate 8e-6, and 128 rollouts
+in flight. The H200 engines use their automatic W8A8 backend. Router replay is
+off. Full trainer checkpoints are off because the frozen base exceeds the
+remaining disks. Each completed step still exports the LoRA adapter.
 
-The trainer did not complete step 1. On two attempts, n80 rank 35 exited about
-44 seconds after the forward pass started. Other ranks then reported an NCCL
-remote-process error. The second attempt used identical verified micro-batch
-files on all eight trainer nodes. The cause of the rank 35 exit is not known.
+The shorter sequence ceiling is a memory repair. x31 reached 46.6 GiB at
+14,336 tokens and later OOMed with only 179 MiB free. Do not increase the x37
+sequence length while it is active.
 
-The H200 engines are healthy and idle. The x26 orchestrator and transport
-publishers are stopped. Do not use the n82 supervisor for x26. It assumes that
-the orchestrator runs on n82.
+Native FP8 training is rejected. x32 had entropy 4.3957, masked mismatch KL
+3.8317, and 48.8 percent masked tokens. x35 route replay still had KL 3.1711.
+x36 forced H200 Triton MoE on a fresh batch-1024 gate and still had entropy
+4.4206, masked mismatch KL 6.5098, unmasked mismatch KL 3.1729, and 48.2
+percent masked tokens. Do not start another native-FP8 trainer run without a
+new measured correction.
 
-x25 is also stopped. Its no-router-replay step measured masked mismatch KL
-0.362. There are too few completed steps for a reward trend.
+x36 also proved the 64-GPU native step can run at 2,178 tokens/s with 46.6 GiB
+peak memory. This is a compute and memory result only. It is not policy parity.
 
 # Where the rest is
 
