@@ -616,6 +616,12 @@ def get_model(
         and checkpoint_quantization.get("weight_block_size") == [128, 128]
     )
     model_config.fp8_checkpoint = model_config.fp8_source_checkpoint and not config.quantization.dequantize_checkpoint
+    model_config.fp8_checkpoint_linears = model_config.fp8_checkpoint and not (
+        config.quantization.dequantize_checkpoint_linears
+    )
+    model_config.fp8_checkpoint_moe = model_config.fp8_checkpoint and not (
+        config.quantization.dequantize_checkpoint_moe
+    )
     model_config.fp8_checkpoint_dequantized = (
         model_config.fp8_source_checkpoint and config.quantization.dequantize_checkpoint
     )
@@ -1255,7 +1261,7 @@ def apply_quantization(model: nn.Module, config: ModelConfig) -> None:
     if isinstance(quant, FP8Config):
         if getattr(model.config, "fp8_checkpoint_dequantized", False):
             return
-        if getattr(model.config, "fp8_checkpoint", False):
+        if getattr(model.config, "fp8_checkpoint_linears", False):
             replace_linear_with_fp8_checkpoint(model, embed=config.fp8_embed_head, lm_head=config.fp8_lm_head)
         else:
             replace_linear_with_fp8_blockwise_linear(model, ignore_modules=quant.ignore_patterns)

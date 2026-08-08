@@ -138,7 +138,11 @@ class FP8Config(BaseConfig):
     type: Literal["fp8"] = "fp8"
     enable_grouped_gemm: bool = True
     dequantize_checkpoint: bool = False
-    """Load serialized block-FP8 weights as BF16 instead of using FP8 activation kernels."""
+    """Load all serialized block-FP8 weights as BF16."""
+    dequantize_checkpoint_linears: bool = False
+    """Diagnostic: dequantize dense/attention FP8 matrices, but keep MoE FP8."""
+    dequantize_checkpoint_moe: bool = False
+    """Diagnostic: dequantize routed/shared MoE matrices, but keep other matrices FP8."""
     ignore_patterns: list[str] = _DEFAULT_FP8_IGNORE_PATTERNS
 
 
