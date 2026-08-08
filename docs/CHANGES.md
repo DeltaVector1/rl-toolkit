@@ -25,6 +25,49 @@ if you want to apply the changes one at a time:
 git am patches/series/*.patch
 ```
 
+# NATIVE FP8 PARITY GATES X32, X35, AND X36
+
+x32 completed one zero-learning-rate, batch-1024 trainer step without router
+replay. The trainer reached 2,105 tokens/s and 46.6 GiB peak memory. The policy
+comparison failed: entropy was 4.3957, masked mismatch KL was 3.8317, and
+48.8 percent of tokens were masked.
+
+x35 replayed the H200 routes on a diagnostic 128-example subset. Replay reduced
+masked mismatch KL only to 3.1711. Entropy was 4.6134 and 41.8 percent of
+tokens were masked. Thus, route selection was not the main mismatch.
+
+Direct deterministic kernel probes tested the backend hypothesis:
+
+- H200 dense CUTLASS versus Ada Triton had relative RMSE 0.000434 and
+  0.000438 for `q_a_proj` and `o_proj`.
+- A raw FlashInfer routed-expert call with gate first had relative RMSE 0.1083.
+  Up first reduced it to 0.01257.
+- This raw-call result is not a live-engine ordering defect. vLLM
+  `prepare_fp8_moe_layer_for_fi()` swaps the loaded W13 layout to W31 before
+  the FlashInfer call.
+- x36 forced the H200 Triton MoE backend on a fresh batch-1024 gate. It still
+  failed, with entropy 4.4206, masked mismatch KL 6.5098, unmasked mismatch KL
+  3.1729, and 48.2 percent masked tokens.
+
+Thus, the H200 MoE backend is not the main native-trainer mismatch.
+`scripts/h200/start_inference.sh` uses the faster automatic backend again.
+Native FP8 training remains rejected. x37 returns to the previously valid
+BF16-dequantized trainer path and reduces the sequence ceiling to 12,288 for
+memory headroom.
+
+# LARGE WAN BATCHES AND BUSY ENGINE HEALTH
+
+`scripts/h200/sync_rollout_batches.sh` stripes files of 64 MiB or more into 16
+resumable streams. It skips complete remote chunks, joins them on n82, and
+still verifies the whole-file SHA-256 before the atomic rename. This reduced
+the observed x36 88.3 MB transfer from an estimated single-stream wait of
+tens of minutes to approximately four minutes.
+
+The H200 engine watchdog no longer restarts an engine only because its tiny
+probe waits behind a full production queue. On probe timeout, it reads the
+running-request and generated-token metrics. A rising generated-token counter
+proves that the engine is live. The smoke suite tests this case.
+
 # X26 EDGE FILESYSTEM TRANSPORT
 
 Files:

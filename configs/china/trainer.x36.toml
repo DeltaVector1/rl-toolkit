@@ -8,7 +8,7 @@ dist_timeout_seconds = 5400
 # x35 router replay still had KL 3.17. A direct expert probe found 10.8%
 # relative RMSE between FlashInfer CUTLASS and the Ada policy, while H200
 # dense CUTLASS and Ada differed by only 0.044%. Use the H200 Triton MoE
-# backend and no replay to test the corrected policy.
+# backend and no replay to isolate this backend hypothesis.
 enable_router_replay = false
 
 [log]
