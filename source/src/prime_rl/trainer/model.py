@@ -1261,10 +1261,17 @@ def apply_quantization(model: nn.Module, config: ModelConfig) -> None:
     if isinstance(quant, FP8Config):
         if getattr(model.config, "fp8_checkpoint_dequantized", False):
             return
-        if getattr(model.config, "fp8_checkpoint_linears", False):
-            replace_linear_with_fp8_checkpoint(model, embed=config.fp8_embed_head, lm_head=config.fp8_lm_head)
-        else:
-            replace_linear_with_fp8_blockwise_linear(model, ignore_modules=quant.ignore_patterns)
+        if getattr(model.config, "fp8_checkpoint", False):
+            if getattr(model.config, "fp8_checkpoint_linears", False):
+                replace_linear_with_fp8_checkpoint(
+                    model,
+                    embed=config.fp8_embed_head,
+                    lm_head=config.fp8_lm_head,
+                )
+            # A checkpoint-linear bisection keeps these modules as ordinary
+            # BF16 Linear layers. The storage reader dequantizes into them.
+            return
+        replace_linear_with_fp8_blockwise_linear(model, ignore_modules=quant.ignore_patterns)
     elif isinstance(quant, MXFP8Config):
         capability = torch.cuda.get_device_capability()
         if capability < (10, 0):
