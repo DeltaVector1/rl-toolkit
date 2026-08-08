@@ -35,6 +35,7 @@ from decensor_v1.scoring import ScoringConfig, Verdicts, score_decensor
 from decensor_v1.state import DecensorState
 from decensor_v1.text import (
     extract_completion_text,
+    extract_all_assistant_texts,
     extract_last_user_across,
     extract_message_reasoning_trace,
     extract_think_trace,
@@ -217,6 +218,13 @@ class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
         )
         for (name, _judge, _fields), outcome in zip(jobs, outcomes):
             verdict_kwargs[name] = outcome.score
+            trace.record_metric(
+                f"decensor_judge_{name}_endpoint_down", float(outcome.endpoint_down)
+            )
+            trace.record_metric(
+                f"decensor_judge_{name}_parse_failure",
+                float(outcome.score is None and not outcome.endpoint_down),
+            )
 
         # FIX #6: an endpoint outage (gemma unreachable) tanks the reward; a received-but-
         # unparseable reply is a parse failure that stays fail-open (verdict None).
@@ -253,6 +261,23 @@ class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
         )
         trace.record_metric("decensor_judge_parse_failures", float(parse_failures))
         trace.record_metric("decensor_gated", 0.0 if breakdown.get("early_termination") is None else 1.0)
+        trace.record_metric("decensor_zero_reward", float(reward == 0.0))
+        trace.record_metric("decensor_near_zero_reward", float(reward < 1e-3))
+        gate_reason = breakdown.get("early_termination")
+        for reason in (
+            "truncated",
+            "unclosed_think",
+            "zero_words",
+            "no_reasoning",
+            "structured_markers",
+            "judge_endpoint_down",
+        ):
+            trace.record_metric(f"decensor_gate_{reason}", float(gate_reason == reason))
+        trace.record_metric("decensor_target_turns", float(self.data.target_turns))
+        trace.record_metric(
+            "decensor_completed_turns", float(len(extract_all_assistant_texts(completion)))
+        )
+        trace.record_metric("decensor_user_sim_failed", float(trace.state.user_sim_failed))
         return reward
 
 

@@ -178,7 +178,9 @@ ANSWER: {response}
 
 
 class DecensorJudgeSampling(JudgeSamplingConfig):
-    temperature: float = 0.8
+    # A sampled judge adds label noise inside each GRPO group.  The policy
+    # rollouts should be stochastic; grading the same answer should not be.
+    temperature: float = 0.0
     max_tokens: int = 512  # FIX #1: a real, applied max-tokens value
 
 

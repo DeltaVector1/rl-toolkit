@@ -13,3 +13,5 @@ class DecensorState(vf.State):
     """How many assistant turns the model should produce before the user simulator stops."""
     user_done: bool = False
     """Set once the simulator has driven the conversation to `target_turns`."""
+    user_sim_failed: bool = False
+    """The simulator returned no parseable follow-up before `target_turns`."""
