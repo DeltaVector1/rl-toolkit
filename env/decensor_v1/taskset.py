@@ -326,6 +326,7 @@ class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
             "no_reasoning",
             "structured_markers",
             "judge_endpoint_down",
+            "user_sim_failed",
         ):
             trace.record_metric(f"decensor_gate_{reason}", float(gate_reason == reason))
         trace.record_metric("decensor_target_turns", float(self.data.target_turns))
