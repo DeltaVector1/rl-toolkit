@@ -253,6 +253,72 @@ class FP8AdaAutogradTest(unittest.TestCase):
         )
         torch.testing.assert_close(got_grad, ref_hidden.grad, rtol=2e-6, atol=2e-6)
 
+    def test_entropy_only_backward_matches_dense_softmax(self):
+        torch.manual_seed(31)
+        hidden = torch.randn(3, 4, dtype=torch.float32, requires_grad=True)
+        weight = torch.randn(6, 4, dtype=torch.float32)
+        scale = torch.rand(6, dtype=torch.float32) + 0.25
+        labels = torch.tensor([1, 4, 0])
+        inv_temperature = torch.tensor([0.6, 1.0, 1.4])
+        upstream = torch.tensor([0.7, -0.2, 0.5])
+
+        original_scaled_mm = fp8_ada._scaled_mm
+
+        def dense_scaled_mm(value, raw_weight, row_scale):
+            if row_scale is not None:
+                raw_weight = raw_weight * row_scale.unsqueeze(-1)
+            return F.linear(value, raw_weight)
+
+        fp8_ada._scaled_mm = dense_scaled_mm
+        try:
+            _, entropy = fp8_ada._FP8LogProb.apply(
+                hidden, weight, scale, labels, inv_temperature, 2
+            )
+            entropy.backward(upstream)
+        finally:
+            fp8_ada._scaled_mm = original_scaled_mm
+        got_grad = hidden.grad.detach().clone()
+
+        ref_hidden = hidden.detach().clone().requires_grad_()
+        scaled = (
+            F.linear(ref_hidden, weight * scale.unsqueeze(-1))
+            * inv_temperature.unsqueeze(-1)
+        )
+        probabilities = F.softmax(scaled, dim=-1)
+        ref_entropy = -(probabilities * F.log_softmax(scaled, dim=-1)).sum(dim=-1)
+        ref_entropy.backward(upstream)
+        torch.testing.assert_close(got_grad, ref_hidden.grad, rtol=2e-6, atol=2e-6)
+
+    def test_grouped_mm_zeros_rows_after_last_expert_offset(self):
+        x = torch.randn(4, 2)
+        weight = torch.randn(2, 3, 2)
+        scale = torch.ones(2, 1, 1)
+        offsets = torch.tensor([1, 2], dtype=torch.int32)
+
+        originals = (
+            fp8_ada.moe_kernel_quantize_input,
+            fp8_ada.dispatch_fused_moe_kernel,
+        )
+
+        def fake_quantize(value, *args, **kwargs):
+            return value, torch.ones(value.shape[0], 1)
+
+        def fake_dispatch(*args, **kwargs):
+            args[2].fill_(7)
+
+        fp8_ada.moe_kernel_quantize_input = fake_quantize
+        fp8_ada.dispatch_fused_moe_kernel = fake_dispatch
+        try:
+            got = fp8_ada._grouped_mm(x, weight, scale, offsets)
+        finally:
+            (
+                fp8_ada.moe_kernel_quantize_input,
+                fp8_ada.dispatch_fused_moe_kernel,
+            ) = originals
+
+        torch.testing.assert_close(got[:2], torch.full_like(got[:2], 7))
+        torch.testing.assert_close(got[2:], torch.zeros_like(got[2:]))
+
 
 class MultiLinearAutogradTest(unittest.TestCase):
     def test_single_lora_passes_double_gradcheck(self):

@@ -395,7 +395,12 @@ def _grouped_mm(x, weight, scale, offsets):
         False,
         block_shape,
     )
-    return out[:, 0]
+    # Expert-parallel dispatch can append rows after the last real token.  The
+    # assignment above must give every row an expert id for the fused kernel,
+    # but padded rows are not tokens and must not contribute in forward or
+    # backward.  The dense expert implementation has the same zero-padding
+    # contract.
+    return out[:, 0].masked_fill((rows >= offsets[-1]).unsqueeze(-1), 0)
 
 
 class _Experts(torch.autograd.Function):

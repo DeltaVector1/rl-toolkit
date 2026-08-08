@@ -67,16 +67,6 @@ class _SparseMLA(torch.autograd.Function):
         return dq, dkv, None, None
 
 
-class _FiniteGrad(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x):
-        return x
-
-    @staticmethod
-    def backward(ctx, grad):
-        return torch.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0).clamp_(-1.0, 1.0)
-
-
 def apply_rope_interleave_single(
     t: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, unsqueeze_dim: int = 1
 ) -> torch.Tensor:
@@ -218,8 +208,8 @@ class GlmMoeDsaAttention(nn.Module):
         return self._cp_world_size > 1
 
     def attn_projections(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        q_latent = _FiniteGrad.apply(self.q_a_layernorm(self.q_a_proj(hidden_states)))
-        compressed_kv = _FiniteGrad.apply(self.kv_a_proj_with_mqa(hidden_states))
+        q_latent = self.q_a_layernorm(self.q_a_proj(hidden_states))
+        compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
         k_compressed, k_rope = compressed_kv.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         return q_latent, self.kv_a_layernorm(k_compressed), k_rope
 
