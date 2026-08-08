@@ -792,14 +792,34 @@ def _repair_supervisors() -> str:
     return msg
 
 
+def _mounts_in(script: Path) -> set[str]:
+    """Repository paths mounted by one container launcher."""
+    return set(re.findall(r'-v "\$deployment/(\S+?)":', script.read_text()))
+
+
 def mounted_files() -> list[str]:
-    """The source paths that cluster.sh mounts into the trainer container.
+    """The source paths that the trainer and H200 launchers mount.
 
     A change to any other file has no effect: the container keeps using the
     copy baked into the image.
     """
-    sh = (REPO / "scripts" / "china" / "cluster.sh").read_text()
-    return sorted(set(re.findall(r'-v "\$deployment/(\S+?)":', sh)))
+    scripts = (
+        REPO / "scripts" / "china" / "cluster.sh",
+        REPO / "scripts" / "h200" / "start_orchestrator.sh",
+        REPO / "scripts" / "h200" / "start_inference.sh",
+    )
+    return sorted(set().union(*(_mounts_in(script) for script in scripts)))
+
+
+def _mounted_on(path: str, host: str) -> bool:
+    if host in ENGINE_HOSTS:
+        scripts = (
+            REPO / "scripts" / "h200" / "start_orchestrator.sh",
+            REPO / "scripts" / "h200" / "start_inference.sh",
+        )
+    else:
+        scripts = (REPO / "scripts" / "china" / "cluster.sh",)
+    return any(path in _mounts_in(script) for script in scripts)
 
 
 def deploy(path: str, nodes: list[str] | None = None) -> bool:
@@ -808,12 +828,15 @@ def deploy(path: str, nodes: list[str] | None = None) -> bool:
     local = REPO / path
     if not local.is_file():
         raise Refused(f"not in the repository: {local}")
-    if path.startswith("source/") and path not in mounted_files():
-        raise Refused(
-            f"{path} is not mounted by cluster.sh, so the container would ignore it. "
-            "Add a -v line to scripts/china/cluster.sh first, or pick a mounted path. "
-            "Call mounted_files() to list them."
-        )
+    if path.startswith("source/"):
+        unmounted = [host for host in nodes if not _mounted_on(path, host)]
+        if unmounted:
+            raise Refused(
+                f"{path} is not mounted by the launcher for {unmounted}, so the "
+                "container would ignore it. Add a -v line to the applicable "
+                "launcher first, or pick a mounted path. Call mounted_files() "
+                "to list the union."
+            )
     want = __import__("hashlib").md5(local.read_bytes()).hexdigest()
     remote = f"{DEPLOY}/{path}"
 
@@ -832,7 +855,7 @@ def deploy(path: str, nodes: list[str] | None = None) -> bool:
         if path.startswith("source/") or path.endswith("cluster.sh"):
             # Mounted into the container at launch, so a running container keeps
             # the old copy until it is recreated.
-            print("The running container still holds the old file. Restart the trainer for this to take effect.")
+            print("The running container still holds the old file. Recreate that container for this to take effect.")
         else:
             # Host-side scripts are read at each launch, so only long-lived
             # loops (the watchdogs, the supervisor) need restarting.
