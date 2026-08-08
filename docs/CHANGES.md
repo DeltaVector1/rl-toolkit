@@ -80,8 +80,9 @@ x38 reduces the sequence length to 8,192, which bounds each CP shard at 1,024
 tokens and reduces this routed-expert output by one third. It initializes its
 LoRA slot from x37 adapter step 7. This preserves the policy, but the Muon
 optimizer state starts new because x37 had no full trainer checkpoint.
-`LoRAConfig.initial_adapter_path` is strict: every exported adapter key and
-shape must match before any tensor is copied.
+`LoRAConfig.initial_adapter_path` is strict for each local pipeline stage:
+every local adapter key and shape must match before any tensor is copied. Keys
+owned by the other seven stages are ignored on that stage.
 
 # LARGE WAN BATCHES AND BUSY ENGINE HEALTH
 

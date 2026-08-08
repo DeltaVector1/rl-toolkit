@@ -269,12 +269,14 @@ def load_initial_lora_adapter(model: nn.Module, adapter_path: str, adapter_idx: 
 
     missing = sorted(set(expected) - set(state_dict))
     unexpected = sorted(set(state_dict) - set(expected))
-    if missing or unexpected:
+    if missing:
         raise ValueError(
-            "Initial LoRA adapter keys do not match the configured model: "
-            f"missing={missing[:5]} ({len(missing)} total), "
-            f"unexpected={unexpected[:5]} ({len(unexpected)} total)"
+            "Initial LoRA adapter keys do not match the local pipeline stage: "
+            f"missing={missing[:5]} ({len(missing)} total)"
         )
+    # Every PP stage loads the same global adapter file but constructs only its
+    # own layers. Keys for the other stages are therefore expected here. A
+    # missing or misspelled key still fails on the stage that owns that layer.
 
     with torch.no_grad():
         for key, param in expected.items():
@@ -287,7 +289,8 @@ def load_initial_lora_adapter(model: nn.Module, adapter_path: str, adapter_idx: 
             param.copy_(value.to(device=param.device, dtype=param.dtype))
 
     get_logger().info(
-        f"Loaded {len(expected)} initial LoRA tensors from {path} into adapter slot {adapter_idx}"
+        f"Loaded {len(expected)} initial LoRA tensors from {path} into adapter slot "
+        f"{adapter_idx}; ignored {len(unexpected)} tensors owned by other pipeline stages"
     )
 
 
