@@ -35,7 +35,15 @@ class TrainSinkLimitTest(unittest.TestCase):
         )[0]
         self.assertIn("if self.batch_size is not None:", group)
         self.assertIn('r.filter_results = {"trainer_seq_len": True}', group)
-        self.assertIn("self.pending_batch.extend(oversized_fillers)", group)
+        self.assertIn("rejected_fillers.extend(oversized_fillers)", group)
+        self.assertIn("self.pending_batch.extend(rejected_fillers)", group)
+
+    def test_failed_rollouts_get_sample_free_placeholders(self):
+        group = SOURCE.split("    async def process_group", 1)[1].split(
+            "\n    def process_batch", 1
+        )[0]
+        self.assertIn('r.filter_results = {"rollout_error": True}', group)
+        self.assertIn('r.filter_results = {"group_scored_partial": True}', group)
 
 
 if __name__ == "__main__":

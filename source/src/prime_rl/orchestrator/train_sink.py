@@ -187,11 +187,25 @@ class TrainSink:
         task_idx = group[0].task.data.idx
         survivors = [r for r in group if not r.has_error]
         num_errored = len(group) - len(survivors)
+        rejected_fillers: list[Rollout] = []
+        if num_errored and self.batch_size is not None:
+            for r in group:
+                if r.has_error:
+                    r.samples = []
+                    r.is_filtered = True
+                    r.filter_results = {"rollout_error": True}
+                    rejected_fillers.append(r)
 
         # Group-scoring envs: any failure makes survivors' rewards unsafe
         # (computed relative to the missing ones)
         env = self.train_envs.get(env_name)
         if num_errored > 0 and env.requires_group_scoring:
+            if self.batch_size is not None:
+                for r in group:
+                    r.samples = []
+                    r.is_filtered = True
+                    r.filter_results = {"group_scored_partial": True}
+                self.pending_batch.extend(group)
             get_logger().debug(
                 f"Finished group | env={env_name} task_idx={task_idx} | "
                 f"rollouts={len(group)} (errored={num_errored}) | dropped: group-scored partial"
@@ -233,12 +247,13 @@ class TrainSink:
                     r.is_filtered = True
                     r.filter_results = {"trainer_seq_len": True}
                 oversized_fillers = oversized
+        rejected_fillers.extend(oversized_fillers)
 
         # Untrainable traces carry no samples and must not skew the group baseline.
         survivors = [r for r in survivors if r.trainable]
         if not survivors:
-            if oversized_fillers:
-                self.pending_batch.extend(oversized_fillers)
+            if rejected_fillers:
+                self.pending_batch.extend(rejected_fillers)
             get_logger().debug(
                 f"Finished group | env={env_name} task_idx={task_idx} | "
                 f"rollouts={len(group)} (errored={num_errored}) | dropped: no trainable survivors"
@@ -277,7 +292,7 @@ class TrainSink:
             self.pending_batch.append(r)
             if self.token_batch_size is not None:
                 self.pending_tokens += payload_tokens(r)
-        self.pending_batch.extend(oversized_fillers)
+        self.pending_batch.extend(rejected_fillers)
 
         # Per-group summary. One line per finalized group; per-filter
         # detection breakdown lives at debug level in ``apply_filters``
