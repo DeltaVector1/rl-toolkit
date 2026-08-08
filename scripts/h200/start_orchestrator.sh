@@ -10,7 +10,7 @@ RUN_NAME=${RUN_NAME:?set RUN_NAME}
 deployment=/data/glm52-rl/deployment
 config=$deployment/configs/h200
 image=prime-rl:glm52-decensor
-config_file=$config/orchestrator${CONFIG_TAG}.toml
+config_file=${ORCH_CONFIG:-$config/orchestrator${CONFIG_TAG}.toml}
 transport=$(awk '
   $0 == "[rollout_transport]" { active=1; next }
   /^\[/ { active=0 }
