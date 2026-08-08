@@ -852,9 +852,9 @@ def deploy(path: str, nodes: list[str] | None = None) -> bool:
     bad = [h for h, v in res.items() if v != "ok"]
     print(f"{path} -> {len(nodes) - len(bad)}/{len(nodes)} nodes" + (f", FAILED {bad}" if bad else ""))
     if not bad:
-        if path.startswith("source/") or path.endswith("cluster.sh"):
-            # Mounted into the container at launch, so a running container keeps
-            # the old copy until it is recreated.
+        if path.startswith(("source/", "env/")) or path.endswith("cluster.sh"):
+            # Imported or mounted at container launch, so a running container
+            # keeps the old module until it is recreated.
             print("The running container still holds the old file. Recreate that container for this to take effect.")
         else:
             # Host-side scripts are read at each launch, so only long-lived

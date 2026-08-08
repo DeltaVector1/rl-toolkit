@@ -49,7 +49,7 @@ sudo docker run -d --name glm52-decensor-orchestrator \
   --network host --restart no \
   --env-file /data/trinity/training.env \
   -e VLLM_API_KEY=unused \
-  -e PYTHONPATH=/data/glm52-rl/decensor-v1:/app/src \
+  -e PYTHONPATH="$deployment/env":/app/src \
   -e HF_HOME=/data/glm52-rl/hf-cache \
   -e HF_HUB_OFFLINE=1 \
   -e HF_DATASETS_OFFLINE=1 \
