@@ -20,10 +20,48 @@ remote() {
   fi
 }
 
-copy_partial() {
+parallel_threshold=${PARALLEL_THRESHOLD:-268435456}
+parallel_streams=${PARALLEL_STREAMS:-16}
+
+copy_parallel() {
   local source=$1 destination=$2
+  local size chunk_size parts_dir remote_parts status pid part
+  local -a pids
+
+  size=$(stat -c %s "$source")
+  chunk_size=$(( (size + parallel_streams - 1) / parallel_streams ))
+  parts_dir="$source.parallel"
+  remote_parts="$destination.parallel"
+  rm -rf "$parts_dir"
+  mkdir -p "$parts_dir"
+  split -b "$chunk_size" -d -a 3 "$source" "$parts_dir/part-"
+  remote "mkdir -p '$remote_parts'"
+
+  status=0
+  pids=()
+  for part in "$parts_dir"/part-*; do
+    rsync -az --partial --append-verify --timeout=120 \
+      -e "ssh ${ssh_opts[*]}" "$part" "$dest_host:$remote_parts/$(basename "$part")" &
+    pids+=("$!")
+  done
+  for pid in "${pids[@]}"; do
+    wait "$pid" || status=1
+  done
+  [ "$status" = 0 ] || return 1
+
+  remote "rm -f '$destination.assembling'; cat '$remote_parts'/part-* >'$destination.assembling'; mv '$destination.assembling' '$destination'; rm -rf '$remote_parts'"
+  rm -rf "$parts_dir"
+}
+
+copy_partial() {
+  local source=$1 destination=$2 size
   if [ "$dest_host" = local ]; then
     cp "$source" "$destination"
+    return
+  fi
+  size=$(stat -c %s "$source")
+  if [ "$size" -ge "$parallel_threshold" ]; then
+    copy_parallel "$source" "$destination"
   else
     rsync -az --partial --append-verify --timeout=120 \
       -e "ssh ${ssh_opts[*]}" "$source" "$dest_host:$destination"
