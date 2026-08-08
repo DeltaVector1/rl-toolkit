@@ -12,10 +12,11 @@ gpu_memory_utilization = 0.92
 enable_prefix_caching = true
 enable_expert_parallel = true
 enable_eplb = false
-# The trainer discards routed_experts when enable_router_replay=false
-# (train.py:571), yet it was still 95.5% of every response on the wire:
-# 711 bytes for each generated token, 2.79 MB for each rollout.
-enable_return_routed_experts = false
+# x34 is a zero-LR native-FP8 parity gate. It needs the H200 routes to
+# measure how much of x32's KL 3.83 is route amplification. Routed experts
+# add about 711 bytes for each generated token; disable this again if the
+# route-replay gate fails.
+enable_return_routed_experts = true
 api_server_count = 1
 
 [server]
