@@ -478,7 +478,10 @@ async def load_lora_adapter(admin_clients: list[AsyncClient], lora_name: str, lo
 
     @retry(
         retry=retry_if_exception(_is_retryable_lora_error),
-        stop=stop_after_delay(LORA_LOAD_TOTAL_TIMEOUT_S) | stop_after_attempt(10),
+        # An engine restart takes 5 to 10 minutes. Keep retrying for the
+        # complete wall-clock budget instead of stopping after ten fast
+        # connection failures.
+        stop=stop_after_delay(LORA_LOAD_TOTAL_TIMEOUT_S),
         wait=wait_exponential(multiplier=1, min=1, max=10),
         reraise=True,
     )
