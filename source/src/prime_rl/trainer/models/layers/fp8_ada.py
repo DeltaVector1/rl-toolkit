@@ -19,6 +19,7 @@ from vllm.model_executor.layers.fused_moe.fused_moe import (
 block_shape = [128, 128]
 _DIAGNOSE_LINEAR_BACKWARD = False
 _REPORTED_LINEAR_BACKWARD: set[tuple[tuple[int, ...], bool, bool]] = set()
+_REPORTED_INPUT_GRAD: set[tuple[int, ...]] = set()
 
 
 def set_diagnose_linear_backward(enabled: bool) -> None:
@@ -58,7 +59,30 @@ def _linear_input_grad(grad, weight, scale, chunk_rows=1024):
         end = min(start + chunk_rows, weight.shape[0])
         dequantized = _dequant_weight(weight, scale, start, end, compute_dtype)
         result.addmm_(grad_2d[:, start:end].to(compute_dtype), dequantized)
-    return result.to(grad.dtype).view(shape)
+    converted = result.to(grad.dtype)
+    if (
+        (_DIAGNOSE_LINEAR_BACKWARD or os.environ.get("PRIME_FP8_DIAG_LINEAR_BACKWARD", "") == "1")
+        and not bool(torch.isfinite(converted).all())
+        and tuple(weight.shape) not in _REPORTED_INPUT_GRAD
+    ):
+        _REPORTED_INPUT_GRAD.add(tuple(weight.shape))
+        finite_result = result[torch.isfinite(result)]
+        weight_float = weight.float()
+        finite_weight = weight_float[torch.isfinite(weight_float)]
+        print(
+            "[fp8-linear-input-grad] "
+            f"weight={tuple(weight.shape)} weight_finite={bool(torch.isfinite(weight_float).all())} "
+            f"weight_absmax={float(finite_weight.abs().max()) if finite_weight.numel() else float('nan'):.6e} "
+            f"scale_finite={bool(torch.isfinite(scale).all())} "
+            f"scale_min={float(scale[torch.isfinite(scale)].min()):.6e} "
+            f"scale_max={float(scale[torch.isfinite(scale)].max()):.6e} "
+            f"result_finite={bool(torch.isfinite(result).all())} "
+            f"result_nan={int(torch.isnan(result).sum())} result_inf={int(torch.isinf(result).sum())} "
+            f"result_absmax={float(finite_result.abs().max()) if finite_result.numel() else float('nan'):.6e} "
+            f"converted_nan={int(torch.isnan(converted).sum())} converted_inf={int(torch.isinf(converted).sum())}",
+            flush=True,
+        )
+    return converted.view(shape)
 
 
 class _Linear(torch.autograd.Function):
