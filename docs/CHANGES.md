@@ -25,6 +25,50 @@ if you want to apply the changes one at a time:
 git am patches/series/*.patch
 ```
 
+# NATIVE FP8 REPAIR AND GATE X55A
+
+The native-FP8 failures had three separate causes.
+
+First, the routed-expert forward path did not apply TorchTitan's expert-
+parallel row permutation after all-to-all. Source-major rows used global
+expert IDs with local expert matrices. The repair uses
+`generate_permute_indices()`, combines local counts, adds aligned sentinel
+padding, calls the fused experts, and unpermutes the output. Gate x46p then
+measured masked mismatch KL 0.3562 instead of x45r's 4.0768.
+
+Second, FSDP released frozen FP8 parameter storage before the inner custom
+linear backward. `_Linear` now keeps owned weight and scale snapshots directly
+on the autograd context, outside checkpoint saved-tensor hooks. Weight and
+scale remain explicit tensor inputs so FSDP can see the dependency. A two-rank
+CUDA FSDP reshard and non-reentrant checkpoint regression passes.
+
+Third, non-reentrant activation checkpoint recompute of native-FP8 attention
+under FSDP produced an all-NaN sparse Q. This was measured directly in x53d
+and x54e. Native-FP8 configs therefore do not checkpoint `attention`,
+`attn_proj`, or `mla_up_proj`. They checkpoint only routed experts and norms.
+The sparse MLA kernel also returns zero output and positive-infinity LSE for a
+fully masked row, so its backward gradient is zero and finite.
+
+Zero-learning-rate, batch-1024 gate x55a validated the combined full
+native-FP8 path at sequence length 2,048:
+
+- 913 microbatches completed in 3,356.38 seconds.
+- Grad norm was finite at 0.015471.
+- Entropy was 0.477953.
+- Masked mismatch KL was 0.357186.
+- Unmasked mismatch KL was 0.037908.
+- The masked fraction was 3.171 percent.
+- Throughput was 556 tokens/s and peak GPU memory was 46.55 GiB.
+- Rollout collection took 19 minutes 13 seconds with zero environment errors.
+- Step 1 exported a 278,990,560-byte LoRA adapter and its `STABLE` marker.
+
+The trainer time and rollout time are separate. The low throughput is a
+measured cost of the safe native linear backward and the reduced activation
+checkpoint set.
+
+x56p is the first nonzero-learning-rate production run on this validated path.
+It started from a new LoRA policy with learning rate 8e-6.
+
 # NATIVE FP8 PARITY GATES X32, X35, AND X36
 
 x32 completed one zero-learning-rate, batch-1024 trainer step without router

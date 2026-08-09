@@ -15,10 +15,9 @@ gives commands. `docs/PERFORMANCE.md` contains dated measurements.
 - Latest test orchestrator: h200a. Adapter server: n82.
 - n81 is not in the job because it has no authorized key. Do not touch n79.
 
-There is no active run. The latest test is x26 in
-`/data/glm52-rl/runs/x26`. It used the edge orchestrator and durable filesystem
-transport. It was stopped after two rollout batches because the trainer failed
-twice during its first forward pass.
+x56p is the active native-FP8 production run. Its trainer data is in
+`/data/glm52-rl/runs/x56p`. The edge orchestrator runs on h200a and uses the
+durable filesystem transport.
 
 ## Current settings
 
@@ -26,47 +25,31 @@ twice during its first forward pass.
 - Environment: `NewEden/decensor-v1`
 - Dataset: `NewEden/RL-seed-Decensor`
 - Batch 1024, GRPO group 16, maximum 128 live rollouts
-- Context and trainer pack length 16,384 tokens
+- Trainer sequence length 2,048 tokens
 - LoRA rank 32, alpha 64, on `q_a_proj`, `q_b_proj`,
   `kv_a_proj_with_mqa`, and `o_proj`
 - Muon at 8e-6
 - Trainer mesh: PP 8, CP 8, EP 8 node-local
-- Checkpoints every 5 steps, with optimizer state
-- Router replay off and engine routed-expert return off for x25
-- H200 FP8 weights with BF16 activations (W8A16), FP8 KV cache
-- Trainer checkpoint dequantized to BF16 weights, BF16 compute and reductions,
-  FP32 MoE router
-
-“FP8 model” identifies the source checkpoint. It does not mean that the current
-trainer runs FP8 GEMMs. The native trainer W8A8 path produced 7 to 9 nats of
-masked mismatch KL and broke the importance ratio, so x25 sets
-`dequantize_checkpoint = true`.
+- Full native-FP8 frozen weights, BF16 activations and reductions, FP32 router
+- Adapter export after every completed step; no full frozen-base checkpoints
+- Router replay off
+- H200 serialized FP8 weights, BF16 layer I/O, and FP8 KV cache
+- Selective activation checkpoints on routed experts and norms only
 
 ## Latest result
 
-x26 rollout step 1 took 20 minutes 5 seconds. Step 2 took 18 minutes 41
-seconds. Keep these rollout collection times separate from trainer compute.
-The two immutable batch files were 84.2 MB and 92.5 MB. Each transfer to n82
-finished in about 29 seconds, and both SHA-256 hashes matched.
+Zero-learning-rate gate x55a completed one full native-FP8 trainer step with
+finite gradients. It processed 913 microbatches in 3,356.38 seconds. Grad norm
+was 0.015471, masked mismatch KL was 0.357186, unmasked mismatch KL was
+0.037908, and 3.171 percent of tokens were masked. Throughput was 556 tokens/s
+and peak GPU memory was 46.55 GiB.
 
-The trainer did not complete a step. On two attempts, n80 rank 35 exited about
-44 seconds after the forward pass started. The other ranks then reported NCCL
-remote-process errors. All trainer nodes read the same verified micro-batch
-file on the second attempt. This result does not identify the reason that rank
-35 exited.
+The x55a rollout batch took 19 minutes 13 seconds. It had zero environment
+errors. Keep this rollout collection time separate from trainer compute.
+Step 1 exported a 278,990,560-byte LoRA adapter and a `STABLE` marker.
 
-x25 step 1 collected 1,072 attempts in 48 minutes 40 seconds, with 1,032
-trainable attempts and a 3.7 percent error rate. The trainer forward and
-backward pass took 17 minutes 11 seconds. Keep these as separate numbers.
-
-The first no-router-replay step measured masked mismatch KL 0.362. The replay
-baseline was 0.19 to 0.21. This is above the baseline but far below the failed
-W8A8 range of 7 to 9 nats. One step is not a reward trend.
-
-The stopped x25 path used 48 reverse SSH tunnels on n82 ports 18001 to
-18048. The x26 test put the orchestrator on h200a and moved completed immutable
-batches to n82 with resumable, verified transfer. `docs/ROLLOUT_TRANSPORT.md`
-gives the design.
+x56p started from a new policy after this gate. It uses learning rate 8e-6.
+No reward trend is available yet.
 
 ## Repository layout
 

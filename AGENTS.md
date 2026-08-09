@@ -114,33 +114,34 @@ Report the verdict.
 
 # The current run
 
-x38 is active. Its trainers started at approximately 14:22 UTC on 2026-08-08.
-The H200 orchestrator started at 14:29 UTC.
+x56p is active. It started at approximately 13:14 UTC on 2026-08-09.
 
-x38 uses the BF16-dequantized trainer path, PP8, CP8, node-local EP8, batch
-1024, group 16, sequence length 8,192, learning rate 8e-6, and 128 rollouts
+x56p uses the full native-FP8 trainer path, PP8, CP8, node-local EP8, batch
+1024, group 16, sequence length 2,048, learning rate 8e-6, and 128 rollouts
 in flight. The H200 engines use their automatic W8A8 backend. Router replay is
-off.
+off. x56p started a new LoRA policy and a new Muon optimizer.
 
-x38 was intended to start from x37 adapter step 7, but it did not. The first
-loader ran before `MultiRunManager` reset the new slot. The reset erased the
-loaded tensors. x38 therefore started a new LoRA policy and a new Muon
-optimizer. The loader is fixed for future runs by loading from a creation hook
-after the slot reset. Do not describe x38 as a continuation of x37.
+Zero-learning-rate gate x55a validated this exact native-FP8 model path before
+x56p started. It completed 913 microbatches with finite gradients. Grad norm
+was 0.01547. Entropy was 0.47795, masked mismatch KL was 0.35719, unmasked
+mismatch KL was 0.03791, and 3.171 percent of tokens were masked. Trainer
+forward and backward took 3,356 seconds at 556 tokens/s. Peak GPU memory was
+46.55 GiB. Rollout collection took 19 minutes 13 seconds. These times are
+separate.
 
-x37 completed seven optimizer steps before it failed on trainer step 8. That
-batch had 314 microbatches. n80 rank 32 OOMed in the expert W2 grouped GEMM
-while requesting 228 MiB with 187.5 MiB free. The other NCCL errors followed
-this exit. x37's first ten rollout rewards were inside the measured noise:
-mean 0.0320, standard deviation 0.0099, and fitted increase 0.0057 against a
-0.0194 threshold.
+Do not add `attention`, `attn_proj`, or `mla_up_proj` to activation checkpoint
+targets for the native-FP8 path. Under FSDP resharding, their non-reentrant
+recompute used nonfinite sparse-Q activations. x55a checkpoints only routed
+experts and norms.
 
-The 8,192-token x38 limit reduces the failed expert output by one third. Do
-not increase it while x38 is active.
+The native routed-expert path must permute source-major EP rows before the
+local fused expert call. Native checkpoint linears must keep their weight and
+scale as explicit autograd inputs and keep owned backward snapshots outside
+checkpoint saved-tensor hooks.
 
-Native FP8 training remains rejected. x32 had masked mismatch KL 3.8317; x35
-route replay had 3.1711; x36 with H200 Triton MoE had masked KL 6.5098 and
-unmasked KL 3.1729.
+x38 was not a continuation of x37. Its intended adapter restore was erased by
+the old run-slot reset order. The creation-hook loader fixes this for later
+policy-only restarts.
 
 # Where the rest is
 
