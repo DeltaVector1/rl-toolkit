@@ -142,7 +142,11 @@ class FP8Config(BaseConfig):
     dequantize_checkpoint_linears: bool = False
     """Diagnostic: dequantize dense/attention FP8 matrices, but keep MoE FP8."""
     dequantize_checkpoint_moe: bool = False
-    """Diagnostic: dequantize routed/shared MoE matrices, but keep other matrices FP8."""
+    """Diagnostic: dequantize all routed/shared MoE matrices."""
+    dequantize_checkpoint_routed_moe: bool = False
+    """Diagnostic: dequantize routed-expert matrices only."""
+    dequantize_checkpoint_shared_moe: bool = False
+    """Diagnostic: dequantize shared-expert matrices only."""
     ignore_patterns: list[str] = _DEFAULT_FP8_IGNORE_PATTERNS
 
 

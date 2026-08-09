@@ -35,6 +35,8 @@ class MoEArgs:
     load_balance_coeff: float | None = 1e-3
     fp8: bool = False  # use FP8 grouped GEMM via DeepGEMM (requires SM90)
     fp8_checkpoint: bool = False
+    fp8_checkpoint_routed: bool | None = None
+    fp8_checkpoint_shared: bool | None = None
     mxfp4: bool = False
 
 
@@ -734,13 +736,23 @@ class MoE(nn.Module):
         super().__init__()
 
         num_experts = moe_args.num_experts
+        fp8_checkpoint_routed = (
+            moe_args.fp8_checkpoint
+            if moe_args.fp8_checkpoint_routed is None
+            else moe_args.fp8_checkpoint_routed
+        )
+        fp8_checkpoint_shared = (
+            moe_args.fp8_checkpoint
+            if moe_args.fp8_checkpoint_shared is None
+            else moe_args.fp8_checkpoint_shared
+        )
         self.experts = GroupedExperts(
             dim=dim,
             hidden_dim=hidden_dim,
             num_experts=num_experts,
             use_grouped_mm=moe_args.use_grouped_mm,
             fp8=moe_args.fp8,
-            fp8_checkpoint=moe_args.fp8_checkpoint,
+            fp8_checkpoint=fp8_checkpoint_routed,
             mxfp4=moe_args.mxfp4,
         )
         self.ep_comm_backend: EPCommBackend = "torch"
@@ -758,7 +770,7 @@ class MoE(nn.Module):
         self.shared_expert = (
             (
                 FP8CheckpointFeedForward
-                if moe_args.fp8_checkpoint
+                if fp8_checkpoint_shared
                 else MXFP4FeedForward if moe_args.mxfp4 else BCFeedForward
             )(
                 dim=dim, hidden_dim=hidden_dim * moe_args.num_shared_experts

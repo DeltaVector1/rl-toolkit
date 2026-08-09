@@ -71,6 +71,16 @@ class GlmMoeDsaDecoderLayer(GradientCheckpointingLayer):
                 "fp8_checkpoint_moe",
                 getattr(config, "fp8_checkpoint", False),
             ),
+            fp8_checkpoint_routed=getattr(
+                config,
+                "fp8_checkpoint_routed_moe",
+                getattr(config, "fp8_checkpoint", False),
+            ),
+            fp8_checkpoint_shared=getattr(
+                config,
+                "fp8_checkpoint_shared_moe",
+                getattr(config, "fp8_checkpoint", False),
+            ),
             mxfp4=getattr(config, "mxfp4", False),
         )
         mlp_config = MLPConfig(

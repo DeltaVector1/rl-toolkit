@@ -622,6 +622,12 @@ def get_model(
     model_config.fp8_checkpoint_moe = model_config.fp8_checkpoint and not (
         config.quantization.dequantize_checkpoint_moe
     )
+    model_config.fp8_checkpoint_routed_moe = model_config.fp8_checkpoint_moe and not (
+        config.quantization.dequantize_checkpoint_routed_moe
+    )
+    model_config.fp8_checkpoint_shared_moe = model_config.fp8_checkpoint_moe and not (
+        config.quantization.dequantize_checkpoint_shared_moe
+    )
     model_config.fp8_checkpoint_dequantized = (
         model_config.fp8_source_checkpoint and config.quantization.dequantize_checkpoint
     )
