@@ -49,6 +49,10 @@ errors. Keep this rollout collection time separate from trainer compute.
 Step 1 exported a 278,990,560-byte LoRA adapter and a `STABLE` marker.
 
 x56p started from a new policy after this gate. It uses learning rate 8e-6.
+Production step 1 completed with finite grad norm 0.01786, masked mismatch KL
+0.34769, unmasked mismatch KL 0.03660, and 3.060 percent masked tokens. Both
+H200 engines loaded the exported adapter with matching SHA-256
+`37f5f0a1f2c2aa4560256def08033ba0dec2bba37d8140dda14add45bbb8b04c`.
 No reward trend is available yet.
 
 ## Repository layout

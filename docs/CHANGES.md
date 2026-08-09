@@ -67,7 +67,12 @@ measured cost of the safe native linear backward and the reduced activation
 checkpoint set.
 
 x56p is the first nonzero-learning-rate production run on this validated path.
-It started from a new LoRA policy with learning rate 8e-6.
+It started from a new LoRA policy with learning rate 8e-6. Production step 1
+completed with grad norm 0.017861, masked mismatch KL 0.347687, unmasked
+mismatch KL 0.036602, 3.060 percent masked tokens, and 46.55 GiB peak memory.
+Forward and backward took 3,447.28 seconds. The exported adapter SHA-256 was
+`37f5f0a1f2c2aa4560256def08033ba0dec2bba37d8140dda14add45bbb8b04c`.
+The adapter cache on both H200 hosts matched this digest.
 
 # NATIVE FP8 PARITY GATES X32, X35, AND X36
 

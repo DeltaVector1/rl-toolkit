@@ -121,6 +121,14 @@ x56p uses the full native-FP8 trainer path, PP8, CP8, node-local EP8, batch
 in flight. The H200 engines use their automatic W8A8 backend. Router replay is
 off. x56p started a new LoRA policy and a new Muon optimizer.
 
+x56p completed production trainer step 1 with finite grad norm 0.01786.
+Masked mismatch KL was 0.34769, unmasked mismatch KL was 0.03660, and the
+masked fraction was 3.060 percent. Forward and backward took 3,447 seconds.
+The step-1 adapter SHA-256 is
+`37f5f0a1f2c2aa4560256def08033ba0dec2bba37d8140dda14add45bbb8b04c`.
+Both H200 engines loaded this exact file. Early rollout rewards are not a
+measured trend.
+
 Zero-learning-rate gate x55a validated this exact native-FP8 model path before
 x56p started. It completed 913 microbatches with finite gradients. Grad norm
 was 0.01547. Entropy was 0.47795, masked mismatch KL was 0.35719, unmasked
