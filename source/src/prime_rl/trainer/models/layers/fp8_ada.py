@@ -100,15 +100,20 @@ class _Linear(torch.autograd.Function):
         # pre-backward rematerialization does not run before this inner custom
         # autograd backward, so both the saved alias and the current module
         # accessor point at the released allocation. Save owned snapshots.
-        # Non-reentrant activation checkpointing intercepts these saved tensors,
-        # releases the original snapshots, and recreates them during recompute.
-        ctx.save_for_backward(weight.detach().clone(), scale.detach().clone())
+        # Keep these snapshots as direct context attributes. Non-reentrant
+        # checkpoint saved-tensor hooks otherwise replace save_for_backward()
+        # tensors with recomputed aliases, which reintroduces the released
+        # FSDP allocation before this inner backward runs.
+        ctx.weight_snapshot = weight.detach().clone()
+        ctx.scale_snapshot = scale.detach().clone()
         return _linear(x, weight, scale)
 
     @staticmethod
     def backward(ctx, grad):
-        weight, scale = ctx.saved_tensors
+        weight = ctx.weight_snapshot
+        scale = ctx.scale_snapshot
         input_grad = _linear_input_grad(grad, weight, scale)
+        del ctx.weight_snapshot, ctx.scale_snapshot
         if _DIAGNOSE_LINEAR_BACKWARD or os.environ.get(
             "PRIME_FP8_DIAG_LINEAR_BACKWARD", ""
         ) == "1":
