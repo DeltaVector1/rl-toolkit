@@ -76,6 +76,28 @@ Forward and backward took 3,447.28 seconds. The exported adapter SHA-256 was
 `37f5f0a1f2c2aa4560256def08033ba0dec2bba37d8140dda14add45bbb8b04c`.
 The adapter cache on both H200 hosts matched this digest.
 
+# X56P FILESYSTEM LORA UPDATE RECOVERY
+
+After rollout batch 6, the off-policy gate correctly paused generation at a
+lead of four versions. The trainer continued through step 3, but the
+orchestrator did not resume. The first adapter load had completed on both H200
+engines, but one vLLM `/load_lora_adapter` HTTP response never finished.
+`WeightWatcher.apply_policy_update()` therefore remained inside the inference
+update and never advanced `policy.version`.
+
+`load_lora_adapter()` now has an absolute timeout. If the load response does
+not finish, it queries `/v1/models` and accepts the update only when the exact
+adapter name is visible. Retries now use the complete 600-second wall-clock
+budget, because an H200 engine restart needs 5 to 10 minutes. The old
+ten-attempt cap could expire in about one minute during connection failures.
+
+The unit regression simulates an applied adapter with a hung HTTP response and
+passes. At the clean batch boundary, the edge orchestrator resumed rollout
+batch 7 from policy version 3. Both H200 engines then reported the same
+step-3 adapter cache path and SHA-256
+`091298e90b00939de2f9b5edecc173d502230ecda941b6ed24f56e0428248119`.
+The trainer was not restarted.
+
 # NATIVE FP8 PARITY GATES X32, X35, AND X36
 
 x32 completed one zero-learning-rate, batch-1024 trainer step without router

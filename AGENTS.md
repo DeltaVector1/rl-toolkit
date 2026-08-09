@@ -121,13 +121,21 @@ x56p uses the full native-FP8 trainer path, PP8, CP8, node-local EP8, batch
 in flight. The H200 engines use their automatic W8A8 backend. Router replay is
 off. x56p started a new LoRA policy and a new Muon optimizer.
 
-x56p completed production trainer step 1 with finite grad norm 0.01786.
-Masked mismatch KL was 0.34769, unmasked mismatch KL was 0.03660, and the
-masked fraction was 3.060 percent. Forward and backward took 3,447 seconds.
-The step-1 adapter SHA-256 is
-`37f5f0a1f2c2aa4560256def08033ba0dec2bba37d8140dda14add45bbb8b04c`.
+x56p completed production trainer steps 1 through 3 with finite grad norms
+0.01786, 0.03069, and 0.02578. Masked mismatch KL remained 0.348 to 0.368,
+unmasked mismatch KL remained 0.0366 to 0.0394, and 3.06 to 3.32 percent of
+tokens were masked. Forward and backward took 3,447 to 4,134 seconds per step.
+The step-3 adapter SHA-256 is
+`091298e90b00939de2f9b5edecc173d502230ecda941b6ed24f56e0428248119`.
 Both H200 engines loaded this exact file. Early rollout rewards are not a
 measured trend.
+
+The off-policy gate pauses generation at a lead of four while the slower
+trainer computes. A completed vLLM LoRA load once left its HTTP response open
+and blocked the weight watcher after rollout batch 6. The client now verifies
+adapter visibility after an absolute timeout and retries for the full
+600-second engine-restart window. The edge orchestrator resumed batch 7 from
+policy version 3 without restarting the trainer.
 
 Zero-learning-rate gate x55a validated this exact native-FP8 model path before
 x56p started. It completed 913 microbatches with finite gradients. Grad norm

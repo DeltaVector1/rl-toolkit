@@ -70,6 +70,26 @@ orchestrator. The trainer waited 27 minutes when this happened.
 Never touch port 29620 while the orchestrator runs. `repair("tunnels")` does
 not touch it.
 
+# The off-policy gate stays closed after the trainer advances
+
+Symptom: the orchestrator prints `Pausing dispatcher` and remains at
+`0/1024` with zero in flight after a newer adapter `STABLE` marker exists.
+The trainer continues to complete steps. The H200 engines can show the new
+adapter even though the watcher policy version does not advance.
+
+Cause: vLLM completed `/load_lora_adapter`, but one HTTP response did not
+finish. The weight watcher remained inside the inference update. An engine
+restart can also outlast the old ten-attempt retry cap.
+
+Repair: use the patched `client.py`, confirm both engines are healthy with
+`engines()`, then restart only the edge orchestrator at the clean zero-inflight
+boundary. With `ckpt.resume_step = -1` and `skip_progress = true`, it resumes
+from the latest immutable rollout batch and latest `STABLE` policy. Do not
+restart the trainer. Confirm the exact adapter SHA-256 on both H200 caches.
+
+This happened in x56p after rollout batch 6. The orchestrator resumed batch 7
+from policy version 3. The trainer continued without a restart.
+
 # The orchestrator waits for a policy version that cannot exist
 
 Symptom: these two lines in the orchestrator log.
