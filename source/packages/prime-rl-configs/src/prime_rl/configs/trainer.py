@@ -147,6 +147,8 @@ class FP8Config(BaseConfig):
     """Diagnostic: dequantize routed-expert matrices only."""
     dequantize_checkpoint_shared_moe: bool = False
     """Diagnostic: dequantize shared-expert matrices only."""
+    diagnose_linear_backward: bool = False
+    """Report the first nonfinite native-FP8 linear backward for each shape."""
     ignore_patterns: list[str] = _DEFAULT_FP8_IGNORE_PATTERNS
 
 

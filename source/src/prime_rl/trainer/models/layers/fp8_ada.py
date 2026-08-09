@@ -17,7 +17,13 @@ from vllm.model_executor.layers.fused_moe.fused_moe import (
 
 
 block_shape = [128, 128]
+_DIAGNOSE_LINEAR_BACKWARD = False
 _REPORTED_LINEAR_BACKWARD: set[tuple[tuple[int, ...], bool, bool]] = set()
+
+
+def set_diagnose_linear_backward(enabled: bool) -> None:
+    global _DIAGNOSE_LINEAR_BACKWARD
+    _DIAGNOSE_LINEAR_BACKWARD = enabled
 
 
 def _linear(x, weight, scale):
@@ -65,7 +71,9 @@ class _Linear(torch.autograd.Function):
     def backward(ctx, grad):
         weight, scale = ctx.saved_tensors
         input_grad = _linear_input_grad(grad, weight, scale)
-        if os.environ.get("PRIME_FP8_DIAG_LINEAR_BACKWARD", "") == "1":
+        if _DIAGNOSE_LINEAR_BACKWARD or os.environ.get(
+            "PRIME_FP8_DIAG_LINEAR_BACKWARD", ""
+        ) == "1":
             incoming_finite = bool(torch.isfinite(grad).all())
             output_finite = bool(torch.isfinite(input_grad).all())
             report_key = (tuple(weight.shape), incoming_finite, output_finite)

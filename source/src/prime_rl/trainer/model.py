@@ -54,6 +54,7 @@ from prime_rl.trainer.models.layers.checkpointing import (
 )
 from prime_rl.trainer.models.layers.fp8_ada import (
     replace_linear as replace_linear_with_fp8_checkpoint,
+    set_diagnose_linear_backward,
 )
 from prime_rl.trainer.models.layers.fp8_linear import replace_linear_with_fp8_blockwise_linear
 from prime_rl.trainer.models.layers.lm_head import inject_prime_lm_head
@@ -1265,6 +1266,7 @@ def apply_quantization(model: nn.Module, config: ModelConfig) -> None:
         return
 
     if isinstance(quant, FP8Config):
+        set_diagnose_linear_backward(quant.diagnose_linear_backward)
         if getattr(model.config, "fp8_checkpoint_dequantized", False):
             return
         if getattr(model.config, "fp8_checkpoint", False):
