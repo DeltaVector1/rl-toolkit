@@ -289,6 +289,54 @@ class FP8AdaAutogradTest(unittest.TestCase):
         ref_entropy.backward(upstream)
         torch.testing.assert_close(got_grad, ref_hidden.grad, rtol=2e-6, atol=2e-6)
 
+    def test_checkpoint_fp8_experts_permute_ep_source_major_rows(self):
+        import torchtitan.experiments.kernels.moe.indices as index_ops
+
+        # Source-major rows after EP all-to-all:
+        # [src0/e0 x2, src0/e1 x1, src1/e0 x3, src1/e1 x0].
+        x = torch.arange(6, dtype=torch.float32).unsqueeze(1)
+        counts = torch.tensor([2, 1, 3, 0])
+        weights = tuple(torch.zeros(2, 1, 1) for _ in range(3))
+        scales = tuple(torch.ones(2, 1, 1) for _ in range(3))
+        captured = {}
+
+        def fake_generate(raw_counts, local_experts, ep_size, *_args):
+            torch.testing.assert_close(raw_counts, counts)
+            self.assertEqual((local_experts, ep_size), (2, 2))
+            return (
+                torch.tensor([0, 1, 3, 4, 5, 2]),
+                torch.tensor([5, 1]),
+                torch.tensor([0, 5, 6]),
+            )
+
+        def fake_apply(permuted_x, _w1, _s1, _w2, _s2, _w3, _s3, offsets):
+            captured["x"] = permuted_x.clone()
+            captured["offsets"] = offsets.clone()
+            return permuted_x
+
+        original_generate = index_ops.generate_permute_indices
+        original_apply = fp8_ada._Experts.apply
+        index_ops.generate_permute_indices = fake_generate
+        fp8_ada._Experts.apply = fake_apply
+        try:
+            got = fp8_ada.fp8_experts(
+                weights[0],
+                weights[1],
+                weights[2],
+                scales[0],
+                scales[1],
+                scales[2],
+                x,
+                counts,
+            )
+        finally:
+            index_ops.generate_permute_indices = original_generate
+            fp8_ada._Experts.apply = original_apply
+
+        torch.testing.assert_close(captured["x"], x[[0, 1, 3, 4, 5, 2]])
+        torch.testing.assert_close(captured["offsets"], torch.tensor([5, 6], dtype=torch.int32))
+        torch.testing.assert_close(got, x)
+
     def test_grouped_mm_zeros_rows_after_last_expert_offset(self):
         x = torch.randn(4, 2)
         weight = torch.randn(2, 3, 2)

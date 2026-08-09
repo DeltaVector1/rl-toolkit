@@ -3,6 +3,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 import triton.language as tl
 from torch import nn
+from torch.distributed.tensor import DTensor
 from prime_rl.trainer.models.layers.lm_head import PrimeLmOutput, _online_logsumexp_and_weighted_update
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.fused_moe.fused_moe import (
@@ -468,13 +469,68 @@ class _Experts(torch.autograd.Function):
 
 
 def fp8_experts(w1, w2, w3, s1, s2, s3, x, num_tokens_per_expert):
-    return _Experts.apply(
-        x,
+    """Run checkpoint-FP8 experts with TorchTitan's EP row permutation.
+
+    After the EP all-to-all, rows are grouped first by sending rank and then
+    by this rank's local experts.  ``num_tokens_per_expert`` consequently has
+    ``ep_size * local_experts`` entries while the local weight shard has only
+    ``local_experts`` matrices.  The ordinary grouped-expert path uses
+    TorchTitan's ``expert_parallel`` decorator to transpose that logical
+    layout, combine counts for each local expert, and add aligned padding.
+    The native FP8 path used to unwrap the DTensors and call the kernel
+    directly.  Most rows were then assigned expert ids beyond the local
+    weight array and were ignored by the fused kernel.
+    """
+    if isinstance(w1, DTensor):
+        w1, w2, w3, s1, s2, s3 = (
+            value.to_local() for value in (w1, w2, w3, s1, s2, s3)
+        )
+
+    local_experts = w1.shape[0]
+    if num_tokens_per_expert.shape[0] == local_experts:
+        return _Experts.apply(
+            x,
+            w1,
+            s1,
+            w2,
+            s2,
+            w3,
+            s3,
+            torch.cumsum(num_tokens_per_expert, 0, dtype=torch.int32),
+        )
+
+    if num_tokens_per_expert.shape[0] % local_experts:
+        raise ValueError(
+            "EP token counts must be a whole number of local expert groups: "
+            f"{num_tokens_per_expert.shape[0]} counts for {local_experts} experts"
+        )
+
+    from torchtitan.distributed.expert_parallel import TOKEN_GROUP_ALIGN_SIZE_M
+    from torchtitan.experiments.kernels.moe.indices import generate_permute_indices
+
+    ep_size = num_tokens_per_expert.shape[0] // local_experts
+    with torch.no_grad():
+        permuted_indices, local_counts, _ = generate_permute_indices(
+            num_tokens_per_expert,
+            local_experts,
+            ep_size,
+            x.shape[0] + local_experts * TOKEN_GROUP_ALIGN_SIZE_M,
+            TOKEN_GROUP_ALIGN_SIZE_M,
+        )
+
+    # The last row is a shared zero sentinel selected for padding positions.
+    padded_x = torch.vstack((x, x.new_zeros((1, x.shape[-1]))))
+    permuted_x = padded_x[permuted_indices, :]
+    out = _Experts.apply(
+        permuted_x,
         w1,
         s1,
         w2,
         s2,
         w3,
         s3,
-        torch.cumsum(num_tokens_per_expert, 0, dtype=torch.int32),
+        torch.cumsum(local_counts, 0, dtype=torch.int32),
     )
+    out_unpermuted = out.new_empty(padded_x.shape)
+    out_unpermuted[permuted_indices, :] = out
+    return out_unpermuted[:-1]
