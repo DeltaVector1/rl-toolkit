@@ -11,8 +11,6 @@ from prime_rl.trainer.models.layers.rotary_emb import rotate_half
 from prime_rl.utils.cp import gather_for_cp
 
 _flex_attention = torch.compile(flex_attention, dynamic=True)
-_REPORTED_NONFINITE_SPARSE_BACKWARD = False
-
 _ADA_FLEX_OPTIONS = {
     "BLOCK_M": 16,
     "BLOCK_N": 16,
@@ -64,47 +62,10 @@ class _SparseMLA(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do):
-        global _REPORTED_NONFINITE_SPARSE_BACKWARD
         q, kv, out, indices, lse = ctx.saved_tensors
         dq, dkv = sparse_mla_bwd(
             q, kv, out, do.contiguous(), indices, lse, sm_scale=ctx.sm_scale
         )
-        if (
-            not _REPORTED_NONFINITE_SPARSE_BACKWARD
-            and (not bool(torch.isfinite(dq).all()) or not bool(torch.isfinite(dkv).all()))
-        ):
-            _REPORTED_NONFINITE_SPARSE_BACKWARD = True
-
-            def state(name, value):
-                finite = value[torch.isfinite(value)]
-                return (
-                    f"{name}_finite={bool(torch.isfinite(value).all())} "
-                    f"{name}_nan={int(torch.isnan(value).sum())} "
-                    f"{name}_inf={int(torch.isinf(value).sum())} "
-                    f"{name}_absmax={float(finite.abs().max()) if finite.numel() else float('nan'):.6e}"
-                )
-
-            valid_indices = indices < kv.shape[1] - 1
-            valid_per_query = valid_indices.sum(dim=-1)
-            print(
-                "[sparse-mla-bwd] "
-                + " ".join(
-                    state(name, value)
-                    for name, value in (
-                        ("q", q),
-                        ("kv", kv),
-                        ("out", out),
-                        ("do", do),
-                        ("lse", lse),
-                        ("dq", dq),
-                        ("dkv", dkv),
-                    )
-                )
-                + f" all_masked={int((valid_per_query == 0).sum())}"
-                + f" valid_min={int(valid_per_query.min())}"
-                + f" valid_max={int(valid_per_query.max())}",
-                flush=True,
-            )
         return dq, dkv, None, None
 
 
