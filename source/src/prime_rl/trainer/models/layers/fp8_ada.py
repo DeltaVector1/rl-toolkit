@@ -23,6 +23,34 @@ def _linear(x, weight, scale):
     return _grouped_mm(x, weight.unsqueeze(0), scale.unsqueeze(0), offsets).view(shape)
 
 
+def _linear_input_grad(grad, weight, scale, chunk_rows=1024):
+    """Compute dX = dY @ dequant(W) without a transposed FP8 kernel.
+
+    The forward fused kernel accepts checkpoint layout [out, in]. Its
+    transposed-weight use in backward is not a supported checkpoint layout and
+    produced non-finite LoRA gradients on the 64-GPU Ada job. Dequantize bounded
+    row chunks and accumulate in FP32 instead.
+    """
+    shape = (*grad.shape[:-1], weight.shape[1])
+    grad_2d = grad.reshape(-1, grad.shape[-1])
+    compute_dtype = (
+        torch.float64
+        if grad.dtype == torch.float64 or weight.dtype == torch.float64
+        else torch.float32
+    )
+    result = torch.zeros(
+        grad_2d.shape[0],
+        weight.shape[1],
+        device=grad.device,
+        dtype=compute_dtype,
+    )
+    for start in range(0, weight.shape[0], chunk_rows):
+        end = min(start + chunk_rows, weight.shape[0])
+        dequantized = _dequant_weight(weight, scale, start, end, compute_dtype)
+        result.addmm_(grad_2d[:, start:end].to(compute_dtype), dequantized)
+    return result.to(grad.dtype).view(shape)
+
+
 class _Linear(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, weight, scale):
@@ -32,7 +60,7 @@ class _Linear(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad):
         weight, scale = ctx.saved_tensors
-        return _linear(grad, weight.T, scale.T), None, None
+        return _linear_input_grad(grad, weight, scale), None, None
 
 
 class FP8CheckpointLinear(nn.Linear):
