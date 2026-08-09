@@ -7,9 +7,10 @@
 - Historical r33 trainer image:
   `sha256:7d75ba7215c070a1c6d1e1a4ab93b62c48518ff8eb762b85fc36d0c2a4da863b`
   Live x25 uses node-local image IDs and is not reproducibly pinned here.
-- Historical H200 rollout image:
-  `sha256:0c8764d53791b651fbf9b028082939eafb80071219a2c2540dbed6480b679fc7`
-  Live h200a and h200b do not currently share one recorded image ID.
+- Live H200 rollout images measured on 2026-08-09:
+  - h200a: `sha256:17423e0a392fdb74634aaf9c5f9b6b49d71f59d6b843c698021f4a835dd8d142`
+  - h200b: `sha256:0c8764d53791b651fbf9b028082939eafb80071219a2c2540dbed6480b679fc7`
+  The tag is `prime-rl:glm52-decensor` on both hosts, but the image IDs differ.
 - H200 rollout hosts: `152.236.142.243:40051` and `152.236.142.239:40050`
 - Python: 3.12
 - PyTorch: `2.11.0+cu128`
@@ -47,10 +48,10 @@ Runtime patch SHA-256 values:
 - It applies cleanly to `f50ec5c4c8c45864ec535dead2c3b630de50d068`.
 - Historical r33 trainer: 64 RTX 4090 GPUs, block-FP8 frozen base,
   rank-32/alpha-64 LoRA, CP 4, global EP 8, and eight data replicas.
-- Current x25 trainer: the FP8 source checkpoint is dequantized to BF16;
-  optimization and reductions are BF16 and the router is FP32.
-- Rollouts: two 8-GPU H200 nodes, one TP8/EP8 vLLM engine per node, W8A16,
-  FP8 KV cache, and CUDA graphs.
+- Current x56p trainer: native block-FP8 frozen weights, BF16 activations
+  and reductions, FP32 router, PP8, CP8, and node-local EP8.
+- Rollouts: two 8-GPU H200 nodes, one TP8/EP8 vLLM engine per node,
+  serialized block-FP8 weights, BF16 layer I/O, FP8 KV cache, and CUDA graphs.
 - The token embedding and output head remain BF16 to match the H200 model.
 - The trainer uses GLM sparse attention and the checkpoint's IndexShare
   schedule on Ada instead of substituting dense causal attention.
@@ -82,6 +83,9 @@ wrappers.
 - `scripts/china/sync_microbatches.sh`:
   `2534a8fcece653899805d864068d63f1dc3904a16b036578d907ed023391ea7f`
 
-The historical RTX 4090 FP8 path uses vLLM Triton block-FP8 kernels. Current
-x25 does not use that trainer path. The H200 engines use native FP8 weights
-with BF16 activations.
+The current RTX 4090 trainer uses the native block-FP8 checkpoint path with
+custom Ada kernels. Both H200 engines report vLLM 0.24.0 and PyTorch
+2.11.0+cu128. They resolve `GlmMoeDsaForCausalLM`, FP8 quantization,
+`CutlassFp8BlockScaledMMKernel`, `FLASHINFER_CUTLASS` FP8 MoE,
+`FLASHMLA_SPARSE`, and the `fp8_ds_mla` KV-cache format. Both use TP8 with EP8,
+which gives MoE TP1/EP8. Router logits and the LM head are FP32.
