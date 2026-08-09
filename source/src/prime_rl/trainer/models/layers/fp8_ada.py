@@ -85,17 +85,9 @@ def _linear_input_grad(grad, weight, scale, chunk_rows=1024):
     return converted.view(shape)
 
 
-def _current_module_tensor(module: nn.Module, name: str) -> torch.Tensor:
-    value = getattr(module, name)
-    return value.to_local() if isinstance(value, DTensor) else value
-
-
 class _Linear(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, module, weight_name, scale_name):
-        # Resolve the current full tensors while the module is unsharded.
-        weight = _current_module_tensor(module, weight_name)
-        scale = _current_module_tensor(module, scale_name)
+    def forward(ctx, x, weight, scale):
         # FSDP2 releases the unsharded frozen parameters after forward. Its
         # pre-backward rematerialization does not run before this inner custom
         # autograd backward, so both the saved alias and the current module
@@ -136,12 +128,12 @@ class _Linear(torch.autograd.Function):
                     f"output_absmax={float(finite_output.abs().max()) if finite_output.numel() else float('nan'):.6e}",
                     flush=True,
                 )
-        return input_grad, None, None, None
+        return input_grad, None, None
 
 
 class FP8CheckpointLinear(nn.Linear):
     def forward(self, x):
-        out = _Linear.apply(x, self, "weight", "weight_scale_inv")
+        out = _Linear.apply(x, self.weight, self.weight_scale_inv)
         return out if self.bias is None else out + self.bias
 
     @classmethod

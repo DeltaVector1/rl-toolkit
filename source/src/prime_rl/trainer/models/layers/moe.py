@@ -122,11 +122,10 @@ class FP8CheckpointFeedForward(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return _Linear.apply(
-            F.silu(_Linear.apply(x, self, "w1", "w1_scale_inv"))
-            * _Linear.apply(x, self, "w3", "w3_scale_inv"),
-            self,
-            "w2",
-            "w2_scale_inv",
+            F.silu(_Linear.apply(x, self.w1, self.w1_scale_inv))
+            * _Linear.apply(x, self.w3, self.w3_scale_inv),
+            self.w2,
+            self.w2_scale_inv,
         )
 
 
