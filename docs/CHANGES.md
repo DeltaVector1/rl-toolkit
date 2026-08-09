@@ -40,7 +40,9 @@ Second, FSDP released frozen FP8 parameter storage before the inner custom
 linear backward. `_Linear` now keeps owned weight and scale snapshots directly
 on the autograd context, outside checkpoint saved-tensor hooks. Weight and
 scale remain explicit tensor inputs so FSDP can see the dependency. A two-rank
-CUDA FSDP reshard and non-reentrant checkpoint regression passes.
+CUDA FSDP reshard and non-reentrant checkpoint regression passes. Backward
+diagnostics carry the full module FQN and deduplicate by FQN, not tensor shape,
+because several GLM projections have the same geometry.
 
 Third, non-reentrant activation checkpoint recompute of native-FP8 attention
 under FSDP produced an all-NaN sparse Q. This was measured directly in x53d
