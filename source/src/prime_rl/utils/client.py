@@ -482,14 +482,45 @@ async def load_lora_adapter(admin_clients: list[AsyncClient], lora_name: str, lo
         wait=wait_exponential(multiplier=1, min=1, max=10),
         reraise=True,
     )
+    async def _adapter_is_visible(admin_client: AsyncClient) -> bool:
+        try:
+            response = await admin_client.get(
+                "/v1/models",
+                timeout=httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0),
+            )
+            response.raise_for_status()
+            return any(model.get("id") == lora_name for model in response.json().get("data", []))
+        except Exception:
+            return False
+
     async def _load_lora_adapter(admin_client: AsyncClient) -> None:
         logger.debug(f"Sending request to load LoRA adapter {lora_name} from {lora_path}")
-        response = await admin_client.post(
-            "/load_lora_adapter",
-            json={"lora_name": lora_name, "lora_path": lora_path_posix},
-            timeout=httpx.Timeout(connect=10.0, read=LORA_LOAD_READ_TIMEOUT_S, write=60.0, pool=10.0),
-        )
-        response.raise_for_status()
+        try:
+            # Some vLLM workers finish the collective LoRA load but never
+            # finish the HTTP response. Enforce one absolute deadline in
+            # addition to httpx's idle read timeout.
+            response = await asyncio.wait_for(
+                admin_client.post(
+                    "/load_lora_adapter",
+                    json={"lora_name": lora_name, "lora_path": lora_path_posix},
+                    timeout=httpx.Timeout(
+                        connect=10.0,
+                        read=LORA_LOAD_READ_TIMEOUT_S,
+                        write=60.0,
+                        pool=10.0,
+                    ),
+                ),
+                timeout=LORA_LOAD_READ_TIMEOUT_S,
+            )
+            response.raise_for_status()
+        except (TimeoutError, httpx.TimeoutException, httpx.TransportError):
+            if await _adapter_is_visible(admin_client):
+                logger.warning(
+                    f"LoRA load response from {admin_client.base_url} did not finish, "
+                    f"but adapter {lora_name} is visible; accepting the completed load"
+                )
+                return
+            raise
 
     await asyncio.gather(*[_load_lora_adapter(admin_client) for admin_client in admin_clients])
 
