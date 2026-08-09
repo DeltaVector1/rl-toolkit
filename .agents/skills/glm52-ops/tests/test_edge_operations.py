@@ -64,5 +64,32 @@ class EdgeOperationsTest(unittest.TestCase):
         )
 
 
+    def test_busy_trainer_is_not_reported_as_log_stalled(self):
+        status = glm52_ops.Status(
+            trainer_up=True,
+            orch_up=True,
+            trainer_log_age=1800,
+            orch_log_age=1,
+            tunnels_ok=48,
+            judge="200",
+            adapter="200",
+            supervisor_run=True,
+            supervisor_tunnel=True,
+            nodes=[
+                glm52_ops.NodeState(
+                    host="n82",
+                    gpu_util=99,
+                    mem_free_gb=400,
+                )
+            ],
+        )
+
+        warnings = glm52_ops._warnings(status)
+
+        self.assertFalse(
+            any("trainer has written nothing" in warning for warning in warnings)
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

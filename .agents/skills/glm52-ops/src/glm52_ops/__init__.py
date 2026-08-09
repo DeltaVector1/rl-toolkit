@@ -493,8 +493,13 @@ def _warnings(s: Status) -> list[str]:
             f"tunnel watchdog process exists but its log is {_hms(s.supervisor_tunnel_log_age)} old; "
             "a process that writes no log line does not work"
         )
+    trainer_busy = s.trainer_up and any(
+        node.reachable and node.gpu_util >= 50 for node in s.nodes
+    )
     for name, age in (("trainer", s.trainer_log_age), ("orchestrator", s.orch_log_age)):
         if age is not None and age > STALL_SECONDS:
+            if name == "trainer" and trainer_busy:
+                continue
             w.append(f"{name} has written nothing for {_hms(age)}; the limit is {STALL_SECONDS // 60} minutes")
     for n in s.nodes:
         if n.reachable and n.mem_free_gb < 60:
@@ -755,11 +760,21 @@ def watch(hours: float = 2.0, every: int = 300, run: str = "") -> list[Status]:
         else:
             still = time.time() - last_change
             if still > STALL_SECONDS:
-                print(
-                    f"!! STALLED: step count and batch progress have not changed for {_hms(still)}. "
-                    f"Read references/FAULTS.md and repair before waiting further.",
-                    flush=True,
+                trainer_busy = s.trainer_up and any(
+                    node.reachable and node.gpu_util >= 50 for node in s.nodes
                 )
+                if trainer_busy:
+                    print(
+                        f"-- trainer GPUs remain busy after {_hms(still)} without a counter change; "
+                        "forward/backward or off-policy backpressure is active.",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"!! STALLED: step count and batch progress have not changed for {_hms(still)}. "
+                        f"Read references/FAULTS.md and repair before waiting further.",
+                        flush=True,
+                    )
         remaining = min(every, max(0, deadline - time.time()))
         if remaining <= 0:
             break
