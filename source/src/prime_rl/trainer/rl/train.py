@@ -938,6 +938,10 @@ def train(config: TrainerConfig):
             }
             token_exporter.mark_stable(ready_run_ids)
 
+        # Synchronize forward/loss diagnostics before validating gradients.
+        # A rejected update must still preserve its measured parity evidence.
+        tensor_stats = tensors.compute_stats()
+
         # compute_loss already divided by the global token count. Undo FSDP's per-rank averaging
         # across dp_cp so the final gradient is the true per-token mean over the global batch.
         found_nonfinite = torch.zeros((), device="cuda", dtype=torch.int32)
@@ -952,7 +956,7 @@ def train(config: TrainerConfig):
                     nonfinite_grad_names.append(name)
         if nonfinite_grad_names:
             logger.error(
-                "Non-finite local gradients at step %s: %s",
+                "Non-finite local gradients at step {}: {}",
                 progress.step,
                 nonfinite_grad_names,
             )
@@ -963,6 +967,21 @@ def train(config: TrainerConfig):
         # collective gradient clipping path.
         dist.all_reduce(found_nonfinite, op=dist.ReduceOp.MAX)
         if found_nonfinite.item():
+            rejected_metrics = {
+                **tensor_stats,
+                "diagnostic/nonfinite_gradient": 1.0,
+                "step": progress.step,
+            }
+            monitor.log(rejected_metrics, step=progress.step)
+            logger.error(
+                "Rejected-step forward diagnostics at step {}: entropy={} masked_fraction={} "
+                "masked_mismatch_kl={} unmasked_mismatch_kl={}",
+                progress.step,
+                tensor_stats.get("entropy/all/mean"),
+                tensor_stats.get("is_masked/mean"),
+                tensor_stats.get("masked_mismatch_kl/mean"),
+                tensor_stats.get("unmasked_mismatch_kl/mean"),
+            )
             raise RuntimeError(
                 f"Non-finite gradient at step {progress.step}; refusing to update or broadcast."
             )
@@ -1092,8 +1111,8 @@ def train(config: TrainerConfig):
         if memory_profiler is not None:
             memory_profiler.step()
 
-        # Synchronize the tensor metrics across all steps and ranks
-        tensor_stats = tensors.compute_stats()
+        # Forward/loss tensor metrics were synchronized before gradient
+        # validation so rejected updates preserve the same parity evidence.
 
         # Compute step metrics
         # Under PP every micro-batch was padded up to pp_target_length after
