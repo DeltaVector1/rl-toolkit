@@ -158,9 +158,24 @@ class FP8AdaAutogradTest(unittest.TestCase):
             )
             return F.linear(value, raw_weight * expanded)
 
+        module = nn.Module()
+        module.weight = nn.Parameter(weight.clone(), requires_grad=False)
+        module.weight_scale_inv = nn.Parameter(scale.clone(), requires_grad=False)
         fp8_ada._linear = dequantized_linear
         try:
-            got = fp8_ada._Linear.apply(x, weight, scale)
+            got = fp8_ada._Linear.apply(
+                x, module, "weight", "weight_scale_inv"
+            )
+            # Simulate FSDP RAF replacing the all-gather allocation before
+            # backward. The released forward aliases must never be read.
+            stale_weight = module.weight
+            stale_scale = module.weight_scale_inv
+            module.weight = nn.Parameter(stale_weight.detach().clone(), requires_grad=False)
+            module.weight_scale_inv = nn.Parameter(
+                stale_scale.detach().clone(), requires_grad=False
+            )
+            stale_weight.data.fill_(float("nan"))
+            stale_scale.data.fill_(float("nan"))
             got.backward(upstream)
         finally:
             fp8_ada._linear = original_linear

@@ -85,15 +85,38 @@ def _linear_input_grad(grad, weight, scale, chunk_rows=1024):
     return converted.view(shape)
 
 
+def _current_module_tensor(module: nn.Module, name: str) -> torch.Tensor:
+    value = getattr(module, name)
+    return value.to_local() if isinstance(value, DTensor) else value
+
+
 class _Linear(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, weight, scale):
-        ctx.save_for_backward(weight, scale)
+    def forward(ctx, x, module, weight_name, scale_name):
+        # Do not save FSDP-managed frozen tensors. With RAF enabled their
+        # all-gather storage is released after forward. Saving the tensor alias
+        # left backward reading the released FP8/scale allocation. Store the
+        # stable module accessor and read its rematerialized parameters after
+        # FSDP's pre-backward unshard instead.
+        ctx.module = module
+        ctx.weight_name = weight_name
+        ctx.scale_name = scale_name
+        weight = _current_module_tensor(module, weight_name)
+        scale = _current_module_tensor(module, scale_name)
+        ctx.weight_shape = tuple(weight.shape)
+        ctx.scale_shape = tuple(scale.shape)
         return _linear(x, weight, scale)
 
     @staticmethod
     def backward(ctx, grad):
-        weight, scale = ctx.saved_tensors
+        weight = _current_module_tensor(ctx.module, ctx.weight_name)
+        scale = _current_module_tensor(ctx.module, ctx.scale_name)
+        if tuple(weight.shape) != ctx.weight_shape or tuple(scale.shape) != ctx.scale_shape:
+            raise RuntimeError(
+                "FSDP did not rematerialize the native-FP8 linear before backward: "
+                f"weight {tuple(weight.shape)} != {ctx.weight_shape}, "
+                f"scale {tuple(scale.shape)} != {ctx.scale_shape}"
+            )
         input_grad = _linear_input_grad(grad, weight, scale)
         if _DIAGNOSE_LINEAR_BACKWARD or os.environ.get(
             "PRIME_FP8_DIAG_LINEAR_BACKWARD", ""
@@ -117,12 +140,12 @@ class _Linear(torch.autograd.Function):
                     f"output_absmax={float(finite_output.abs().max()) if finite_output.numel() else float('nan'):.6e}",
                     flush=True,
                 )
-        return input_grad, None, None
+        return input_grad, None, None, None
 
 
 class FP8CheckpointLinear(nn.Linear):
     def forward(self, x):
-        out = _Linear.apply(x, self.weight, self.weight_scale_inv)
+        out = _Linear.apply(x, self, "weight", "weight_scale_inv")
         return out if self.bias is None else out + self.bias
 
     @classmethod
