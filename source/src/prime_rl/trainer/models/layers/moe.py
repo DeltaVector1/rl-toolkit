@@ -121,11 +121,13 @@ class FP8CheckpointFeedForward(nn.Module):
         self.w3_scale_inv = nn.Parameter(torch.empty(hidden_dim // 128, dim // 128, dtype=torch.float32), requires_grad=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        fqn = getattr(self, "_fp8_fqn", "<unassigned-fp8-shared-expert>")
         return _Linear.apply(
-            F.silu(_Linear.apply(x, self.w1, self.w1_scale_inv))
-            * _Linear.apply(x, self.w3, self.w3_scale_inv),
+            F.silu(_Linear.apply(x, self.w1, self.w1_scale_inv, f"{fqn}.w1"))
+            * _Linear.apply(x, self.w3, self.w3_scale_inv, f"{fqn}.w3"),
             self.w2,
             self.w2_scale_inv,
+            f"{fqn}.w2",
         )
 
 

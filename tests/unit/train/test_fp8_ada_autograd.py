@@ -162,7 +162,9 @@ class FP8AdaAutogradTest(unittest.TestCase):
         live_scale = scale.clone()
         fp8_ada._linear = dequantized_linear
         try:
-            got = fp8_ada._Linear.apply(x, live_weight, live_scale)
+            got = fp8_ada._Linear.apply(
+                x, live_weight, live_scale, "model.layers.0.self_attn.o_proj"
+            )
             # Simulate FSDP RAF releasing the explicit forward inputs. Backward
             # must use the owned direct-context snapshots.
             live_weight.fill_(float("nan"))
@@ -372,6 +374,25 @@ class FP8AdaAutogradTest(unittest.TestCase):
 
         torch.testing.assert_close(got[:2], torch.full_like(got[:2], 7))
         torch.testing.assert_close(got[2:], torch.zeros_like(got[2:]))
+
+
+    def test_replace_linear_assigns_full_module_names(self):
+        model = nn.Module()
+        model.config = types.SimpleNamespace(
+            quantization_config={"modules_to_not_convert": []}
+        )
+        model.layers = nn.ModuleList([nn.Module(), nn.Module()])
+        model.layers[0].o_proj = nn.Linear(128, 128, bias=False)
+        model.layers[1].o_proj = nn.Linear(128, 128, bias=False)
+
+        fp8_ada.replace_linear(model)
+
+        self.assertEqual(
+            model.layers[0].o_proj._fp8_fqn, "layers.0.o_proj"
+        )
+        self.assertEqual(
+            model.layers[1].o_proj._fp8_fqn, "layers.1.o_proj"
+        )
 
 
 class MultiLinearAutogradTest(unittest.TestCase):

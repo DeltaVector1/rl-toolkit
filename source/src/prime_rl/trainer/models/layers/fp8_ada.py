@@ -34,7 +34,9 @@ def _linear(x, weight, scale):
     return _grouped_mm(x, weight.unsqueeze(0), scale.unsqueeze(0), offsets).view(shape)
 
 
-def _linear_input_grad(grad, weight, scale, chunk_rows=1024):
+def _linear_input_grad(
+    grad, weight, scale, chunk_rows=1024, fqn="<unassigned-fp8-linear>"
+):
     """Compute dX = dY @ dequant(W) without a transposed FP8 kernel.
 
     The forward fused kernel accepts checkpoint layout [out, in]. Its
@@ -63,15 +65,15 @@ def _linear_input_grad(grad, weight, scale, chunk_rows=1024):
     if (
         (_DIAGNOSE_LINEAR_BACKWARD or os.environ.get("PRIME_FP8_DIAG_LINEAR_BACKWARD", "") == "1")
         and not bool(torch.isfinite(converted).all())
-        and tuple(weight.shape) not in _REPORTED_INPUT_GRAD
+        and fqn not in _REPORTED_INPUT_GRAD
     ):
-        _REPORTED_INPUT_GRAD.add(tuple(weight.shape))
+        _REPORTED_INPUT_GRAD.add(fqn)
         finite_result = result[torch.isfinite(result)]
         weight_float = weight.float()
         finite_weight = weight_float[torch.isfinite(weight_float)]
         print(
             "[fp8-linear-input-grad] "
-            f"weight={tuple(weight.shape)} weight_finite={bool(torch.isfinite(weight_float).all())} "
+            f"fqn={fqn} weight={tuple(weight.shape)} weight_finite={bool(torch.isfinite(weight_float).all())} "
             f"weight_absmax={float(finite_weight.abs().max()) if finite_weight.numel() else float('nan'):.6e} "
             f"scale_finite={bool(torch.isfinite(scale).all())} "
             f"scale_min={float(scale[torch.isfinite(scale)].min()):.6e} "
@@ -87,7 +89,7 @@ def _linear_input_grad(grad, weight, scale, chunk_rows=1024):
 
 class _Linear(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, weight, scale):
+    def forward(ctx, x, weight, scale, fqn):
         # FSDP2 releases the unsharded frozen parameters after forward. Its
         # pre-backward rematerialization does not run before this inner custom
         # autograd backward, so both the saved alias and the current module
@@ -98,20 +100,21 @@ class _Linear(torch.autograd.Function):
         # FSDP allocation before this inner backward runs.
         ctx.weight_snapshot = weight.detach().clone()
         ctx.scale_snapshot = scale.detach().clone()
+        ctx.fqn = fqn
         return _linear(x, weight, scale)
 
     @staticmethod
     def backward(ctx, grad):
         weight = ctx.weight_snapshot
         scale = ctx.scale_snapshot
-        input_grad = _linear_input_grad(grad, weight, scale)
+        input_grad = _linear_input_grad(grad, weight, scale, fqn=ctx.fqn)
         del ctx.weight_snapshot, ctx.scale_snapshot
         if _DIAGNOSE_LINEAR_BACKWARD or os.environ.get(
             "PRIME_FP8_DIAG_LINEAR_BACKWARD", ""
         ) == "1":
             incoming_finite = bool(torch.isfinite(grad).all())
             output_finite = bool(torch.isfinite(input_grad).all())
-            report_key = (tuple(weight.shape), incoming_finite, output_finite)
+            report_key = (ctx.fqn, incoming_finite, output_finite)
             if (
                 (not incoming_finite or not output_finite)
                 and report_key not in _REPORTED_LINEAR_BACKWARD
@@ -121,19 +124,25 @@ class _Linear(torch.autograd.Function):
                 finite_output = input_grad[torch.isfinite(input_grad)]
                 print(
                     "[fp8-linear-bwd] "
-                    f"weight={tuple(weight.shape)} grad={tuple(grad.shape)} "
+                    f"fqn={ctx.fqn} weight={tuple(weight.shape)} "
+                    f"grad={tuple(grad.shape)} "
                     f"incoming_finite={incoming_finite} "
                     f"incoming_absmax={float(finite_grad.abs().max()) if finite_grad.numel() else float('nan'):.6e} "
                     f"output_finite={output_finite} "
                     f"output_absmax={float(finite_output.abs().max()) if finite_output.numel() else float('nan'):.6e}",
                     flush=True,
                 )
-        return input_grad, None, None
+        return input_grad, None, None, None
 
 
 class FP8CheckpointLinear(nn.Linear):
     def forward(self, x):
-        out = _Linear.apply(x, self.weight, self.weight_scale_inv)
+        out = _Linear.apply(
+            x,
+            self.weight,
+            self.weight_scale_inv,
+            getattr(self, "_fp8_fqn", "<unassigned-fp8-linear>"),
+        )
         return out if self.bias is None else out + self.bias
 
     @classmethod
@@ -423,6 +432,16 @@ def replace_linear(model, embed=False, lm_head=False):
         parent_name, attr = name.rsplit(".", 1) if "." in name else ("", name)
         parent = model.get_submodule(parent_name) if parent_name else model
         setattr(parent, attr, FP8CheckpointLinear.from_linear(module))
+
+    # Shape-only diagnostics are ambiguous in GLM because many projections
+    # share geometry. Persist the model path on every native checkpoint
+    # linear and shared expert so backward reports identify one module.
+    for fqn, module in model.named_modules():
+        if isinstance(module, FP8CheckpointLinear) or all(
+            hasattr(module, attr) for attr in ("w1_scale_inv", "w2_scale_inv", "w3_scale_inv")
+        ):
+            module._fp8_fqn = fqn
+
     if embed:
         model.model.embed_tokens = FP8CheckpointEmbedding.from_embedding(model.model.embed_tokens)
     if not lm_head:
