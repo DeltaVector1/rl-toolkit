@@ -170,10 +170,22 @@ def sparse_mla_fwd(
                 T.copy(acc_s, S_shared)
                 T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
 
+            # A fully masked query has no valid K row. Return the exact zero
+            # output and +inf LSE so backward reconstructs zero probabilities.
+            # Dividing by sumexp=0 and storing -inf LSE produced NaNs that
+            # propagated through every earlier LoRA projection.
             for h_i, d_i in T.Parallel(H_per_block, D):
-                acc_o[h_i, d_i] /= sumexp[h_i]
+                acc_o[h_i, d_i] = T.if_then_else(
+                    sumexp[h_i] > 0,
+                    acc_o[h_i, d_i] / sumexp[h_i],
+                    0,
+                )
             for h_i in T.Parallel(H_per_block):
-                sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
+                sumexp[h_i] = T.if_then_else(
+                    sumexp[h_i] > 0,
+                    T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale,
+                    T.infinity(sumexp.dtype),
+                )
 
             T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
             T.copy(sumexp, Lse[b_i, s_i, H0:H1])
