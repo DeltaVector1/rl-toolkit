@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -15,6 +17,7 @@ from vllm.model_executor.layers.fused_moe.fused_moe import (
 
 
 block_shape = [128, 128]
+_REPORTED_LINEAR_BACKWARD: set[tuple[tuple[int, ...], bool, bool]] = set()
 
 
 def _linear(x, weight, scale):
@@ -61,7 +64,28 @@ class _Linear(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad):
         weight, scale = ctx.saved_tensors
-        return _linear_input_grad(grad, weight, scale), None, None
+        input_grad = _linear_input_grad(grad, weight, scale)
+        if os.environ.get("PRIME_FP8_DIAG_LINEAR_BACKWARD", "") == "1":
+            incoming_finite = bool(torch.isfinite(grad).all())
+            output_finite = bool(torch.isfinite(input_grad).all())
+            report_key = (tuple(weight.shape), incoming_finite, output_finite)
+            if (
+                (not incoming_finite or not output_finite)
+                and report_key not in _REPORTED_LINEAR_BACKWARD
+            ):
+                _REPORTED_LINEAR_BACKWARD.add(report_key)
+                finite_grad = grad[torch.isfinite(grad)]
+                finite_output = input_grad[torch.isfinite(input_grad)]
+                print(
+                    "[fp8-linear-bwd] "
+                    f"weight={tuple(weight.shape)} grad={tuple(grad.shape)} "
+                    f"incoming_finite={incoming_finite} "
+                    f"incoming_absmax={float(finite_grad.abs().max()) if finite_grad.numel() else float('nan'):.6e} "
+                    f"output_finite={output_finite} "
+                    f"output_absmax={float(finite_output.abs().max()) if finite_output.numel() else float('nan'):.6e}",
+                    flush=True,
+                )
+        return input_grad, None, None
 
 
 class FP8CheckpointLinear(nn.Linear):
