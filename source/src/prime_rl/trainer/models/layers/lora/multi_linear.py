@@ -1,4 +1,5 @@
 import math
+import os
 
 import torch
 import triton
@@ -6,6 +7,9 @@ import triton.language as tl
 from torch import nn
 
 from prime_rl.trainer.models.layers.lora.base import MultiLoRAModule, get_lora_num_tokens, get_multilora_scaling
+
+
+_REPORTED_NONFINITE_LORA: set[str] = set()
 
 
 if hasattr(triton, "jit"):
@@ -147,9 +151,10 @@ def _run_lora_for_loop(
 
 class _SingleLoRA(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, lora_A, lora_B):
+    def forward(ctx, x, lora_A, lora_B, fqn):
         a_out = _lora_mm(x, lora_A.T)
         ctx.save_for_backward(x, lora_A, lora_B, a_out)
+        ctx.fqn = fqn
         return _lora_mm(a_out, lora_B.T)
 
     @staticmethod
@@ -160,10 +165,32 @@ class _SingleLoRA(torch.autograd.Function):
             # write the BF16/FP16 gradients expected by the parameters. Avoid
             # explicit full-size FP32 activation and output-gradient copies.
             grad_a = _lora_mm(grad, lora_B)
+            x_grad = _lora_mm(grad_a, lora_A).to(x.dtype)
+            a_grad = _lora_mm(grad_a.T, x).to(lora_A.dtype)
+            b_grad = _lora_mm(grad.T, a_out).to(lora_B.dtype)
+            if (
+                os.environ.get("PRIME_FP8_DIAG_LINEAR_BACKWARD", "") == "1"
+                and not all(
+                    bool(torch.isfinite(value).all())
+                    for value in (grad, grad_a, x_grad, a_grad, b_grad)
+                )
+                and ctx.fqn not in _REPORTED_NONFINITE_LORA
+            ):
+                _REPORTED_NONFINITE_LORA.add(ctx.fqn)
+                print(
+                    "[lora-bwd] "
+                    f"fqn={ctx.fqn} incoming={bool(torch.isfinite(grad).all())} "
+                    f"grad_a={bool(torch.isfinite(grad_a).all())} "
+                    f"x_grad={bool(torch.isfinite(x_grad).all())} "
+                    f"a_grad={bool(torch.isfinite(a_grad).all())} "
+                    f"b_grad={bool(torch.isfinite(b_grad).all())}",
+                    flush=True,
+                )
             return (
-                _lora_mm(grad_a, lora_A).to(x.dtype),
-                _lora_mm(grad_a.T, x).to(lora_A.dtype),
-                _lora_mm(grad.T, a_out).to(lora_B.dtype),
+                x_grad,
+                a_grad,
+                b_grad,
+                None,
             )
 
         # Preserve exact FP32/FP64 behavior for CPU use and gradcheck.
@@ -172,6 +199,7 @@ class _SingleLoRA(torch.autograd.Function):
             (grad_a @ lora_A).to(x.dtype),
             (grad_a.T @ x).to(lora_A.dtype),
             (grad.T @ a_out).to(lora_B.dtype),
+            None,
         )
 
 
@@ -257,7 +285,12 @@ class MultiLoRALinear(MultiLoRAModule):
         lora_x = self.lora_dropout(x)
 
         if self.n_adapters == 1:
-            lora_out = _SingleLoRA.apply(lora_x, self.lora_A[0], self.lora_B[0])
+            lora_out = _SingleLoRA.apply(
+                lora_x,
+                self.lora_A[0],
+                self.lora_B[0],
+                getattr(self.base_layer, "_fp8_fqn", "<unassigned-lora-linear>"),
+            )
             return (base_out + self._scaling_factors[0] * lora_out).view(shape)
 
         offsets = self._lora_num_tokens.cumsum(dim=0, dtype=torch.int32)

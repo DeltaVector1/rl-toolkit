@@ -1,3 +1,4 @@
+import os
 import time
 import warnings
 from typing import Optional, Union
@@ -27,6 +28,40 @@ from prime_rl.trainer.models.layers.norms import RMSNorm, RMSNormConfig
 from prime_rl.trainer.models.layers.rotary_emb import RotaryEmbedding, RotaryEmbeddingConfig
 
 
+_LAYER_PROFILE = os.environ.get("PRIME_EP_PROFILE", "") == "1"
+_LAYER_PROFILE_EVERY = int(os.environ.get("PRIME_LAYER_PROFILE_EVERY", "180"))
+_LAYER_PROFILE_EVENTS: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event, torch.cuda.Event]]] = {}
+_LAYER_PROFILE_CALLS = 0
+
+
+def _report_layer_profile(phase: str, events) -> None:
+    """Record attention and MLP CUDA time without timing pipeline waits."""
+    global _LAYER_PROFILE_CALLS
+    if not _LAYER_PROFILE:
+        return
+    _LAYER_PROFILE_EVENTS.setdefault(phase, []).append(events)
+    _LAYER_PROFILE_CALLS += 1
+    if _LAYER_PROFILE_CALLS % _LAYER_PROFILE_EVERY:
+        return
+    events[-1].synchronize()
+    parts = []
+    for name, samples in sorted(_LAYER_PROFILE_EVENTS.items()):
+        attention_ms = sum(start.elapsed_time(middle) for start, middle, _ in samples)
+        mlp_ms = sum(middle.elapsed_time(end) for _, middle, end in samples)
+        parts.append(
+            f"{name}:calls={len(samples)} attn={attention_ms / 1000:.2f}s "
+            f"mlp={mlp_ms / 1000:.2f}s"
+        )
+    _LAYER_PROFILE_EVENTS.clear()
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if local_rank == 0:
+        print(
+            f"[glm-layer-prof] rank={os.environ.get('RANK', '0')} "
+            + " | ".join(parts),
+            flush=True,
+        )
+
+
 def _sparse_mla_attention_args(config: GlmMoeDsaConfig, layer_idx: int) -> SparseMlaAttentionArgs:
     if config.q_lora_rank is None:
         raise ValueError("Sparse MLA attention requires q_lora_rank to be set")
@@ -52,6 +87,7 @@ def _sparse_mla_attention_args(config: GlmMoeDsaConfig, layer_idx: int) -> Spars
 class GlmMoeDsaDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: GlmMoeDsaConfig, layer_idx: int):
         super().__init__()
+        self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
         self.self_attn = GlmMoeDsaAttention(_sparse_mla_attention_args(config, layer_idx))
 
@@ -130,6 +166,11 @@ class GlmMoeDsaDecoderLayer(GradientCheckpointingLayer):
             return t if t.dtype in _REAL else t.to(torch.bfloat16)
 
         hidden_states = _real(hidden_states)
+        if _LAYER_PROFILE:
+            profile_start = torch.cuda.Event(enable_timing=True)
+            profile_middle = torch.cuda.Event(enable_timing=True)
+            profile_end = torch.cuda.Event(enable_timing=True)
+            profile_start.record()
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states, cached_indices = self.self_attn(
@@ -141,11 +182,24 @@ class GlmMoeDsaDecoderLayer(GradientCheckpointingLayer):
             block_mask=block_mask,
         )
         hidden_states = residual + _real(hidden_states)
+        if _LAYER_PROFILE:
+            profile_middle.record()
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states, routed_experts=routed_experts)
         hidden_states = residual + _real(hidden_states)
+        if _LAYER_PROFILE:
+            profile_end.record()
+            phase = (
+                "recompute"
+                if torch._C._current_graph_task_id() != -1
+                else "forward"
+            )
+            _report_layer_profile(
+                phase,
+                (profile_start, profile_middle, profile_end),
+            )
         return hidden_states, cached_indices
 
 

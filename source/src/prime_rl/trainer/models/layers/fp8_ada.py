@@ -21,11 +21,31 @@ from vllm.model_executor.layers.fused_moe.fused_moe import (
 
 
 block_shape = [128, 128]
-_DIRECT_SM89_FORWARD_MAX_ROWS = 256
 _FP8_W2_CHUNK_ROWS = 4096
 _DIAGNOSE_LINEAR_BACKWARD = False
 _REPORTED_LINEAR_BACKWARD: set[tuple[tuple[int, ...], bool, bool]] = set()
 _REPORTED_INPUT_GRAD: set[tuple[int, ...]] = set()
+_EXPERT_PROFILE = os.environ.get("PRIME_EP_PROFILE", "") == "1"
+_EXPERT_BACKWARD_EVENTS: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+_EXPERT_PROFILE_EVERY = int(os.environ.get("PRIME_EXPERT_PROFILE_EVERY", "90"))
+
+
+def _profile_expert_backward(start, end) -> None:
+    if not _EXPERT_PROFILE:
+        return
+    _EXPERT_BACKWARD_EVENTS.append((start, end))
+    if len(_EXPERT_BACKWARD_EVENTS) < _EXPERT_PROFILE_EVERY:
+        return
+    end.synchronize()
+    elapsed = sum(first.elapsed_time(last) for first, last in _EXPERT_BACKWARD_EVENTS)
+    _EXPERT_BACKWARD_EVENTS.clear()
+    if int(os.environ.get("LOCAL_RANK", "0")) == 0:
+        print(
+            f"[fp8-expert-prof] rank={os.environ.get('RANK', '0')} "
+            f"backward_calls={_EXPERT_PROFILE_EVERY} "
+            f"cuda={elapsed / 1000:.2f}s",
+            flush=True,
+        )
 
 
 if hasattr(triton, "jit"):
@@ -221,14 +241,10 @@ def _native_sm89_eligible(activation, weight, scale):
 def _linear(x, weight, scale):
     shape = (*x.shape[:-1], weight.shape[0])
     x = x.reshape(-1, x.shape[-1]).contiguous()
-    eligible, _ = _native_sm89_eligible(x, weight, scale)
-    if eligible and x.shape[0] <= _DIRECT_SM89_FORWARD_MAX_ROWS:
-        return _native_block_fp8_mm(
-            x,
-            weight,
-            scale,
-            weight_is_output_major=True,
-        ).view(shape)
+    # Use the checkpoint block-FP8 W8A8 kernel for every production forward.
+    # The old short-row branch converted both operands to BF16 inside Triton.
+    # It was accurate, but it was not an FP8 forward and introduced a precision
+    # change at an arbitrary row-count boundary.
     offsets = torch.tensor([x.shape[0]], device=x.device, dtype=torch.int32)
     return _grouped_mm(x, weight.unsqueeze(0), scale.unsqueeze(0), offsets).view(shape)
 
@@ -289,16 +305,27 @@ def _linear_input_grad_oracle(
 def _linear_input_grad(
     grad, weight, scale, chunk_rows=1024, fqn="<unassigned-fp8-linear>"
 ):
-    """Compute dX with the SM89 block-FP8 kernel, or use the FP32 oracle."""
+    """Compute dX with W8A8 block-FP8 GEMM, or use the FP32 oracle.
+
+    The checkpoint stores W as ``[out, in]`` with a ``[out/128, in/128]``
+    inverse-scale grid. Transposing both views gives the exact block metadata
+    required for ``dY @ W``. The fused grouped kernel dynamically quantizes dY
+    and performs the matrix multiply on FP8 tensor cores. This replaces the
+    previous SM89 path, which converted each weight fragment to BF16 before
+    ``tl.dot`` and therefore was not an FP8 backward.
+    """
     eligible, _ = _native_sm89_eligible(grad, weight, scale)
     if eligible:
         shape = (*grad.shape[:-1], weight.shape[1])
-        grad_2d = grad.reshape(-1, grad.shape[-1])
-        return _native_block_fp8_mm(
+        grad_2d = grad.reshape(-1, grad.shape[-1]).contiguous()
+        offsets = torch.tensor(
+            [grad_2d.shape[0]], device=grad.device, dtype=torch.int32
+        )
+        return _grouped_mm(
             grad_2d,
-            weight,
-            scale,
-            weight_is_output_major=False,
+            weight.t().unsqueeze(0),
+            scale.t().unsqueeze(0),
+            offsets,
         ).view(shape)
     return _linear_input_grad_oracle(
         grad, weight, scale, chunk_rows=chunk_rows, fqn=fqn
@@ -813,6 +840,10 @@ class _Experts(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad):
+        if _EXPERT_PROFILE:
+            profile_start = torch.cuda.Event(enable_timing=True)
+            profile_end = torch.cuda.Event(enable_timing=True)
+            profile_start.record()
         q1, qs1, q3, qs3, w1, s1, w2, s2, w3, s3, offsets = ctx.saved_tensors
         z1 = q1.to(grad.dtype).mul_(qs1.to(grad.dtype))
         z3 = q3.to(grad.dtype).mul_(qs3.to(grad.dtype))
@@ -831,6 +862,9 @@ class _Experts(torch.autograd.Function):
                 z3_grad, w3.transpose(-2, -1), s3.transpose(-2, -1), offsets
             )
         )
+        if _EXPERT_PROFILE:
+            profile_end.record()
+            _profile_expert_backward(profile_start, profile_end)
         return x_grad, None, None, None, None, None, None, None
 
 

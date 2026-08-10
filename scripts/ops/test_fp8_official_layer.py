@@ -30,6 +30,11 @@ from prime_rl.trainer.models.layers.checkpointing import (
     set_reentrant_block_checkpointing,
 )
 from prime_rl.trainer.models.layers.fp8_ada import replace_linear
+from prime_rl.trainer.models.layers.lora.base import (
+    set_lora_num_tokens,
+    set_multilora_scaling,
+)
+from prime_rl.trainer.models.layers.lora.multi_linear import MultiLoRALinear
 from prime_rl.trainer.models.layers.rotary_emb import (
     RotaryEmbedding,
     RotaryEmbeddingConfig,
@@ -125,11 +130,36 @@ def main() -> None:
     progress("official layer-0 checkpoint tensors loaded")
 
     layer = container.model.layers[0]
-    # Production blocks contain trainable LoRA parameters. Keep one small
-    # parameter trainable so the FSDP pre/post-backward lifecycle matches that
-    # path; an entirely frozen FSDP block does not restore the same full-
-    # parameter state across repeated input-gradient-only backwards.
-    layer.input_layernorm.weight.requires_grad_(True)
+    # Install the exact production rank-32 attention adapters. The earlier
+    # version kept only one norm trainable. That covered FSDP rematerialization
+    # but did not cover LoRA backward, so x58g could pass this gate and then
+    # reject every LoRA gradient at the end of a full step.
+    set_lora_num_tokens(
+        torch.tensor([args.seq_len], device="cuda", dtype=torch.int32),
+        reset_reference=True,
+    )
+    set_multilora_scaling(
+        torch.tensor([2.0], device="cuda", dtype=torch.bfloat16),
+        reset_reference=True,
+    )
+    for name in (
+        "q_a_proj",
+        "q_b_proj",
+        "kv_a_proj_with_mqa",
+        "o_proj",
+    ):
+        setattr(
+            layer.self_attn,
+            name,
+            MultiLoRALinear(
+                getattr(layer.self_attn, name),
+                rank=32,
+                n_adapters=1,
+                alpha=64.0,
+                dropout=0.0,
+            ),
+        )
+    progress("production attention LoRA modules installed")
     layer.self_attn.use_index_cache = True
     mesh = init_device_mesh("cuda", (dist.get_world_size(),))
     fully_shard(
@@ -183,11 +213,11 @@ def main() -> None:
         dtype=torch.int32,
     )
 
-    def iteration(checkpoint_enabled: bool):
+    def iteration(checkpoint_enabled: bool, input_requires_grad: bool = True):
         container.train(checkpoint_enabled)
         for parameter in container.parameters():
             parameter.grad = None
-        value = template.detach().clone().requires_grad_()
+        value = template.detach().clone().requires_grad_(input_requires_grad)
         torch.cuda.reset_peak_memory_stats(local_rank)
         output, indices = container(
             value,
@@ -199,15 +229,37 @@ def main() -> None:
             raise RuntimeError("official layer forward produced nonfinite values")
         output.float().square().mean().backward()
         torch.cuda.synchronize(local_rank)
-        if value.grad is None or not bool(torch.isfinite(value.grad).all()):
-            raise RuntimeError("official layer backward produced a nonfinite or missing gradient")
-        if not bool(value.grad.abs().max() > 0):
-            raise RuntimeError("official layer backward produced an all-zero gradient")
+        if input_requires_grad:
+            if value.grad is None or not bool(torch.isfinite(value.grad).all()):
+                raise RuntimeError("official layer backward produced a nonfinite or missing input gradient")
+            if not bool(value.grad.abs().max() > 0):
+                raise RuntimeError("official layer backward produced an all-zero input gradient")
+        lora_gradients = {
+            name: parameter.grad
+            for name, parameter in container.named_parameters()
+            if "lora_A" in name or "lora_B" in name
+        }
+        missing = sorted(name for name, grad in lora_gradients.items() if grad is None)
+        nonfinite = sorted(
+            name
+            for name, grad in lora_gradients.items()
+            if grad is not None and not bool(torch.isfinite(grad).all())
+        )
+        if missing or nonfinite:
+            raise RuntimeError(
+                f"official layer LoRA gradients failed: missing={missing} "
+                f"nonfinite={nonfinite}"
+            )
         return (
             output.detach(),
-            value.grad.detach(),
+            value.grad.detach() if value.grad is not None else None,
             indices.detach(),
             torch.cuda.max_memory_allocated(local_rank),
+            {
+                name: gradient.detach().clone()
+                for name, gradient in lora_gradients.items()
+                if gradient is not None
+            },
         )
 
     # Keep the module in training mode for both paths. Eval mode is useful to
@@ -219,6 +271,7 @@ def main() -> None:
         first_eager_gradient,
         first_eager_indices,
         first_eager_peak,
+        first_eager_lora_gradients,
     ) = iteration(True)
     progress("first eager official-layer forward and backward passed")
     (
@@ -226,6 +279,7 @@ def main() -> None:
         eager_gradient,
         eager_indices,
         eager_peak,
+        eager_lora_gradients,
     ) = iteration(True)
     progress("second eager official-layer forward and backward passed")
     torch.testing.assert_close(eager_indices, first_eager_indices, rtol=0, atol=0)
@@ -236,10 +290,18 @@ def main() -> None:
         rtol=1e-4,
         atol=1e-8,
     )
+    for name in sorted(eager_lora_gradients):
+        torch.testing.assert_close(
+            eager_lora_gradients[name],
+            first_eager_lora_gradients[name],
+            rtol=1e-4,
+            atol=1e-8,
+        )
     del (
         first_eager_output,
         first_eager_gradient,
         first_eager_indices,
+        first_eager_lora_gradients,
     )
     eager_peak = max(eager_peak, first_eager_peak)
     progress("repeated grad-enabled eager execution is deterministic")
@@ -249,6 +311,7 @@ def main() -> None:
         checkpoint_gradient,
         checkpoint_indices,
         checkpoint_peak,
+        checkpoint_lora_gradients,
     ) = iteration(True)
     progress("reentrant official-layer forward and backward passed")
 
@@ -265,6 +328,33 @@ def main() -> None:
         rtol=1e-4,
         atol=1e-8,
     )
+    for name in sorted(eager_lora_gradients):
+        torch.testing.assert_close(
+            checkpoint_lora_gradients[name],
+            eager_lora_gradients[name],
+            rtol=1e-4,
+            atol=1e-8,
+        )
+    (
+        anchored_output,
+        anchored_gradient,
+        anchored_indices,
+        anchored_peak,
+        anchored_lora_gradients,
+    ) = iteration(True, input_requires_grad=False)
+    if anchored_gradient is not None:
+        raise RuntimeError("frozen first-stage input unexpectedly received a gradient")
+    torch.testing.assert_close(anchored_indices, eager_indices, rtol=0, atol=0)
+    torch.testing.assert_close(anchored_output, eager_output, rtol=0, atol=0)
+    for name in sorted(eager_lora_gradients):
+        torch.testing.assert_close(
+            anchored_lora_gradients[name],
+            eager_lora_gradients[name],
+            rtol=1e-4,
+            atol=1e-8,
+        )
+    checkpoint_peak = max(checkpoint_peak, anchored_peak)
+    progress("reentrant first-stage scalar-anchor LoRA backward passed")
     local_peak = max(eager_peak, checkpoint_peak)
     peak = torch.tensor(local_peak, device="cuda", dtype=torch.int64)
     dist.all_reduce(peak, op=dist.ReduceOp.MAX)

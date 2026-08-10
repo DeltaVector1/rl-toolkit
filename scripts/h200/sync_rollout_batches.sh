@@ -27,7 +27,8 @@ parallel_streams=${PARALLEL_STREAMS:-16}
 
 copy_parallel() {
   local source=$1 destination=$2
-  local size chunk_size parts_dir remote_parts status pid part part_name part_size
+  local size chunk_size parts_dir remote_parts status pid part part_name part_size attempt
+  local expected_sizes remote_sizes
   local -a pids
 
   size=$(stat -c %s "$source")
@@ -37,28 +38,52 @@ copy_parallel() {
   rm -rf "$parts_dir"
   mkdir -p "$parts_dir"
   split -b "$chunk_size" -d -a 3 "$source" "$parts_dir/part-"
-  remote "mkdir -p '$remote_parts'"
-  remote "find '$remote_parts' -maxdepth 1 -type f -name 'part-*' -printf '%f %s\\n'" \
-    >"$parts_dir/remote-sizes" || : >"$parts_dir/remote-sizes"
+  if ! remote "mkdir -p '$remote_parts'"; then
+    rm -rf "$parts_dir"
+    return 1
+  fi
+  expected_sizes=$(find "$parts_dir" -maxdepth 1 -type f -name 'part-*' -printf '%f %s\n' | sort)
 
-  status=0
-  pids=()
-  for part in "$parts_dir"/part-*; do
-    part_name=$(basename "$part")
-    part_size=$(stat -c %s "$part")
-    if grep -qx "$part_name $part_size" "$parts_dir/remote-sizes"; then
-      continue
+  # A single SSH key-exchange reset occurred in x58g. Retry only absent or
+  # short stripes, then require the complete size manifest before assembly.
+  status=1
+  for attempt in 1 2 3; do
+    if ! remote "find '$remote_parts' -maxdepth 1 -type f -name 'part-*' -printf '%f %s\\n'" \
+      >"$parts_dir/remote-sizes"; then
+      : >"$parts_dir/remote-sizes"
     fi
-    rsync -az --partial --append-verify --timeout=120 \
-      -e "ssh ${ssh_opts[*]}" "$part" "$dest_host:$remote_parts/$part_name" &
-    pids+=("$!")
+    pids=()
+    for part in "$parts_dir"/part-*; do
+      part_name=$(basename "$part")
+      part_size=$(stat -c %s "$part")
+      if grep -qx "$part_name $part_size" "$parts_dir/remote-sizes"; then
+        continue
+      fi
+      rsync -az --partial --append-verify --timeout=120 \
+        -e "ssh ${ssh_opts[*]}" "$part" "$dest_host:$remote_parts/$part_name" &
+      pids+=("$!")
+    done
+    status=0
+    for pid in "${pids[@]}"; do
+      wait "$pid" || status=1
+    done
+    remote_sizes=$(remote "find '$remote_parts' -maxdepth 1 -type f -name 'part-*' -printf '%f %s\\n' | sort" || true)
+    if [ "$status" = 0 ] && [ "$remote_sizes" = "$expected_sizes" ]; then
+      status=0
+      break
+    fi
+    status=1
+    echo "parallel transfer attempt $attempt incomplete for $source" >&2
   done
-  for pid in "${pids[@]}"; do
-    wait "$pid" || status=1
-  done
-  [ "$status" = 0 ] || return 1
+  if [ "$status" != 0 ]; then
+    rm -rf "$parts_dir"
+    return 1
+  fi
 
-  remote "rm -f '$destination.assembling'; cat '$remote_parts'/part-* >'$destination.assembling'; mv '$destination.assembling' '$destination'; rm -rf '$remote_parts'"
+  if ! remote "rm -f '$destination.assembling'; cat '$remote_parts'/part-* >'$destination.assembling' && mv '$destination.assembling' '$destination' && rm -rf '$remote_parts'"; then
+    rm -rf "$parts_dir"
+    return 1
+  fi
   rm -rf "$parts_dir"
 }
 
@@ -93,14 +118,23 @@ publish() {
     return 1
   fi
 
-  remote "mkdir -p '$(dirname "$partial")' '$(dirname "$final")'"
-  copy_partial "$source" "$partial"
-  remote_digest=$(remote "sha256sum '$partial' | cut -d' ' -f1")
+  if ! remote "mkdir -p '$(dirname "$partial")' '$(dirname "$final")'"; then
+    return 1
+  fi
+  if ! copy_partial "$source" "$partial"; then
+    return 1
+  fi
+  if ! remote_digest=$(remote "sha256sum '$partial' 2>/dev/null | cut -d' ' -f1"); then
+    echo "cannot read transferred checksum for $relative" >&2
+    return 1
+  fi
   [ "$remote_digest" = "$digest" ] || {
     echo "checksum failed for $relative" >&2
     return 1
   }
-  remote "mv '$partial' '$final'"
+  if ! remote "mv '$partial' '$final'"; then
+    return 1
+  fi
   printf '%s\n' "$digest" >"$source.delivered"
   echo "published $relative $digest"
 }

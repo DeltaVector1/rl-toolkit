@@ -90,7 +90,9 @@ for name in NAMES:
         g,w.t().unsqueeze(0),s.t().unsqueeze(0),offsets
     )
     fused_diff=fused_b.float()-ref_b.float()
-    native_ms,native_peak=profiled(lambda:_linear_input_grad(g,w,s,fqn=name))
+    native_ms,native_peak=profiled(
+        lambda:_native_block_fp8_mm(g,w,s,weight_is_output_major=False)
+    )
     fused_ms,fused_peak=profiled(
         lambda:_grouped_mm(g,w.t().unsqueeze(0),s.t().unsqueeze(0),offsets)
     )

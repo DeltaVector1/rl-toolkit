@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 
@@ -17,8 +18,16 @@ from prime_rl.trainer.models.layers.fp8_ada import (
 
 
 MODEL = Path("/model")
-NAME = "model.layers.0.self_attn.o_proj.weight"
 ROW_COUNTS = (16, 64, 256, 1024, 4096)
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--name",
+    default="model.layers.0.self_attn.o_proj.weight",
+)
+args = parser.parse_args()
+NAME = args.name
 
 
 def profiled(fn, warmup: int, iterations: int) -> float:
@@ -54,7 +63,12 @@ for rows in ROW_COUNTS:
     ).mul_(0.1)
     offsets = torch.tensor([rows], device="cuda", dtype=torch.int32)
 
-    native = _linear_input_grad(grad, weight, scale, fqn=NAME)
+    native = _native_block_fp8_mm(
+        grad,
+        weight,
+        scale,
+        weight_is_output_major=False,
+    )
     fused = _grouped_mm(
         grad,
         weight.t().unsqueeze(0),
@@ -66,7 +80,12 @@ for rows in ROW_COUNTS:
 
     iterations = 20 if rows <= 256 else 5 if rows <= 1024 else 2
     native_ms = profiled(
-        lambda: _linear_input_grad(grad, weight, scale, fqn=NAME),
+        lambda: _native_block_fp8_mm(
+            grad,
+            weight,
+            scale,
+            weight_is_output_major=False,
+        ),
         warmup=3,
         iterations=iterations,
     )

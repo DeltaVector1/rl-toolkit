@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import time
 
 import torch
 
@@ -20,6 +21,18 @@ def arguments() -> argparse.Namespace:
 
 def mismatch(left: torch.Tensor, right: torch.Tensor) -> int:
     return int((left != right).sum().item())
+
+
+def timed(callable):
+    """Return one synchronized CUDA execution and its elapsed milliseconds."""
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    wall_start = time.perf_counter()
+    start.record()
+    result = callable()
+    end.record()
+    end.synchronize()
+    return result, start.elapsed_time(end), time.perf_counter() - wall_start
 
 
 def main() -> None:
@@ -58,13 +71,23 @@ def main() -> None:
 
     query_reference = query.clone()
     key_value_reference = key_value.clone()
-    first, first_lse = sparse_mla_fwd_interface(
-        query, key_value, indices, sm_scale=scale
+    (first, first_lse), first_forward_ms, first_forward_wall = timed(
+        lambda: sparse_mla_fwd_interface(
+            query, key_value, indices, sm_scale=scale
+        )
     )
-    second, _ = sparse_mla_fwd_interface(query, key_value, indices, sm_scale=scale)
+    (second, _), steady_forward_ms, steady_forward_wall = timed(
+        lambda: sparse_mla_fwd_interface(
+            query, key_value, indices, sm_scale=scale
+        )
+    )
     torch.cuda.synchronize()
     print(
-        f"forward_repeat_mismatch={mismatch(second, first)}/{first.numel()}",
+        f"forward_repeat_mismatch={mismatch(second, first)}/{first.numel()} "
+        f"first_cuda_ms={first_forward_ms:.3f} "
+        f"first_wall_s={first_forward_wall:.3f} "
+        f"steady_cuda_ms={steady_forward_ms:.3f} "
+        f"steady_wall_s={steady_forward_wall:.3f}",
         flush=True,
     )
 
@@ -74,14 +97,16 @@ def main() -> None:
         dtype=torch.bfloat16,
         generator=generator,
     ).mul_(1e-4)
-    query_gradient, key_value_gradient = sparse_mla_bwd(
-        query,
-        key_value,
-        first,
-        output_gradient,
-        indices,
-        first_lse,
-        sm_scale=scale,
+    (query_gradient, key_value_gradient), first_backward_ms, first_backward_wall = timed(
+        lambda: sparse_mla_bwd(
+            query,
+            key_value,
+            first,
+            output_gradient,
+            indices,
+            first_lse,
+            sm_scale=scale,
+        )
     )
     torch.cuda.synchronize()
     if not bool(torch.isfinite(query_gradient).all()):
@@ -95,17 +120,20 @@ def main() -> None:
         f"post_backward_output_mismatch={mismatch(third, first)}/{first.numel()} "
         f"query_mutation={mismatch(query, query_reference)}/{query.numel()} "
         f"key_value_mutation={mismatch(key_value, key_value_reference)}/"
-        f"{key_value.numel()}",
+        f"{key_value.numel()} first_backward_cuda_ms={first_backward_ms:.3f} "
+        f"first_backward_wall_s={first_backward_wall:.3f}",
         flush=True,
     )
-    sparse_mla_bwd(
-        query,
-        key_value,
-        third,
-        output_gradient,
-        indices,
-        first_lse,
-        sm_scale=scale,
+    _, steady_backward_ms, steady_backward_wall = timed(
+        lambda: sparse_mla_bwd(
+            query,
+            key_value,
+            third,
+            output_gradient,
+            indices,
+            first_lse,
+            sm_scale=scale,
+        )
     )
     fourth, _ = sparse_mla_fwd_interface(query, key_value, indices, sm_scale=scale)
     torch.cuda.synchronize()
@@ -113,7 +141,9 @@ def main() -> None:
         f"post_second_backward_output_mismatch={mismatch(fourth, first)}/"
         f"{first.numel()} query_mutation={mismatch(query, query_reference)}/"
         f"{query.numel()} key_value_mutation="
-        f"{mismatch(key_value, key_value_reference)}/{key_value.numel()}",
+        f"{mismatch(key_value, key_value_reference)}/{key_value.numel()} "
+        f"steady_backward_cuda_ms={steady_backward_ms:.3f} "
+        f"steady_backward_wall_s={steady_backward_wall:.3f}",
         flush=True,
     )
 
