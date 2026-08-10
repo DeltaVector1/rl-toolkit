@@ -25,6 +25,14 @@ if you want to apply the changes one at a time:
 git am patches/series/*.patch
 ```
 
+# DECENSOR LAST-TURN JUDGING
+
+Remote Decensor judges grade only the final assistant turn. The earlier
+conversation remains context for the coherency judge, but refusal, reasoning,
+meta-commentary, and Markdown verdicts use the final assistant response and
+its reasoning trace. Full-conversation aggregation was reverted because prior
+Decensor experiments produced flat reward.
+
 # NATIVE FP8 REPAIR AND GATE X55A
 
 The native-FP8 failures had three separate causes.

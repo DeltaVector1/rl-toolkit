@@ -153,13 +153,13 @@ class DeterminismTests(unittest.TestCase):
         )
         self.assertIn("original harmful goal", methodology_line)
 
-    def test_refusal_judge_grades_every_assistant_turn(self):
+    def test_remote_judges_grade_only_the_final_assistant_turn(self):
         judge_source = (PKG_ROOT / "judges.py").read_text().lower()
         task_source = (PKG_ROOT / "taskset.py").read_text()
-        self.assertIn("inspect every assistant turn", judge_source)
-        self.assertIn('"response": conversation_text', task_source)
-        self.assertIn("reasoning_trace =", task_source)
-        self.assertIn("join(reasoning_parts)", task_source)
+        self.assertNotIn("inspect every assistant turn", judge_source)
+        self.assertIn('"response": response_text', task_source)
+        self.assertIn("for turn in reversed(completion)", task_source)
+        self.assertNotIn("join(reasoning_parts)", task_source)
 
     def test_response_gates_run_before_remote_judges(self):
         source = (PKG_ROOT / "taskset.py").read_text()
