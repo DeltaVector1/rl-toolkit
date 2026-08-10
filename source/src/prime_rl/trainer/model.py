@@ -49,6 +49,7 @@ from prime_rl.trainer.models import (
 from prime_rl.trainer.models.glm_moe_dsa.sparse_mla_attention import Indexer
 from prime_rl.trainer.models.layers.checkpointing import (
     get_supported_targets,
+    set_reentrant_block_checkpointing,
     set_selective_activation_checkpointing,
     supports_selective_activation_checkpointing,
 )
@@ -1209,7 +1210,13 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
         if layer_id % ac_config.freq != 0:
             continue
 
-        if ac_config.mode == "selective" and supports_selective_activation_checkpointing(transformer_block):
+        if ac_config.mode == "reentrant_block":
+            # Keep the checkpoint boundary identical to the FSDP unit. FSDP's
+            # block pre-backward hook therefore unshards the native-FP8
+            # attention parameters before reentrant recomputation starts.
+            set_reentrant_block_checkpointing(transformer_block)
+            full_layers += 1
+        elif ac_config.mode == "selective" and supports_selective_activation_checkpointing(transformer_block):
             model_supported_targets.update(get_supported_targets(transformer_block))
             set_selective_activation_checkpointing(transformer_block, target_list)
             selective_layers += 1
@@ -1240,7 +1247,10 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
         )
         return
 
-    logger.info(f"Applied activation checkpointing (freq={ac_config.freq})")
+    logger.info(
+        f"Applied activation checkpointing (mode={ac_config.mode}, "
+        f"freq={ac_config.freq}, layers={full_layers})"
+    )
 
 
 def apply_compile(model: nn.Module, compile_config: CompileConfig):

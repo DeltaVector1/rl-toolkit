@@ -30,8 +30,8 @@ class GCConfig(BaseConfig):
 
 
 class ActivationCheckpointConfig(BaseConfig):
-    mode: Literal["full", "selective"] = "full"
-    """``full`` checkpoints whole transformer blocks; ``selective`` checkpoints only the subcomponents listed in ``targets`` inside supported custom decoder layers."""
+    mode: Literal["full", "selective", "reentrant_block"] = "full"
+    """Activation checkpoint implementation. ``full`` uses the ordinary non-reentrant whole-block wrapper. ``reentrant_block`` recomputes a complete decoder block after its FSDP pre-backward hook has restored sharded parameters; use this mode for native-FP8 attention with ``reshard_after_forward``. ``selective`` checkpoints only the subcomponents listed in ``targets`` inside supported custom decoder layers."""
 
     freq: int = Field(1, ge=1)
     """Apply activation checkpointing to every N layers."""

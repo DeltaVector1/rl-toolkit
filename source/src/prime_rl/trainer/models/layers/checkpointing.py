@@ -5,6 +5,7 @@ from functools import wraps
 
 import torch
 import torch.nn as nn
+from torch.utils._pytree import tree_flatten, tree_unflatten
 from torch.utils.checkpoint import checkpoint
 
 SELECTIVE_AC_TARGETS = frozenset(
@@ -30,7 +31,13 @@ def _should_checkpoint(module: nn.Module) -> bool:
     return torch.is_grad_enabled() and module.training
 
 
-def checkpoint_method(module: nn.Module, method_name: str) -> None:
+def checkpoint_method(
+    module: nn.Module,
+    method_name: str,
+    *,
+    use_reentrant: bool = False,
+    preserve_rng_state: bool = False,
+) -> None:
     patched_methods = frozenset(getattr(module, _PATCHED_METHODS_ATTR, ()))
     if method_name in patched_methods:
         return
@@ -42,10 +49,25 @@ def checkpoint_method(module: nn.Module, method_name: str) -> None:
         if not _should_checkpoint(module):
             return original(*args, **kwargs)
 
-        def fn(*checkpoint_args):
-            return original(*checkpoint_args, **kwargs)
+        # Reentrant checkpointing only tracks tensors passed as positional
+        # checkpoint inputs. Custom GLM blocks pass the hidden state and the
+        # position tensors through keyword and nested arguments, so flatten the
+        # complete call. Keeping those tensors as explicit inputs also keeps
+        # their lifetime visible to autograd.
+        flat_args, call_spec = tree_flatten((args, kwargs))
 
-        return checkpoint(fn, *args, use_reentrant=False, preserve_rng_state=False)
+        def fn(*checkpoint_args):
+            restored_args, restored_kwargs = tree_unflatten(
+                list(checkpoint_args), call_spec
+            )
+            return original(*restored_args, **restored_kwargs)
+
+        return checkpoint(
+            fn,
+            *flat_args,
+            use_reentrant=use_reentrant,
+            preserve_rng_state=preserve_rng_state,
+        )
 
     setattr(module, method_name, checkpointed)
     setattr(module, _PATCHED_METHODS_ATTR, patched_methods.union({method_name}))
@@ -146,6 +168,27 @@ def set_selective_activation_checkpointing(layer: nn.Module, targets: Iterable[s
         checkpoint_method(linear_attn, "forward")
     if "norm" in enabled_targets:
         _configure_norm_checkpointing(layer)
+
+
+def set_reentrant_block_checkpointing(layer: nn.Module) -> None:
+    """Checkpoint a complete decoder block at its FSDP ownership boundary.
+
+    FSDP installs its pre-backward unshard hook on the block output. Reentrant
+    checkpoint recomputation starts only after that hook has restored the
+    block's parameters. This is the safe native-FP8 attention path. Do not
+    replace it with an inner non-reentrant ``attention``, ``attn_proj``, or
+    ``mla_up_proj`` checkpoint: x53d and x54e measured all-NaN sparse Q from
+    that ordering while ``reshard_after_forward`` was enabled.
+    """
+
+    checkpoint_method(
+        layer,
+        "forward",
+        use_reentrant=True,
+        # A whole block can contain stochastic operations. Correct recompute
+        # takes priority over the small RNG-state overhead in this mode.
+        preserve_rng_state=True,
+    )
 
 
 def supports_selective_activation_checkpointing(layer: nn.Module) -> bool:
