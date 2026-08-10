@@ -1414,28 +1414,49 @@ class _ScaleRoutedOutput(torch.autograd.Function):
             raise ValueError(
                 f"route score rows {flat_scores.shape[0]} do not match expert rows {x.shape[0]}"
             )
-        ctx.save_for_backward(x, flat_scores)
+        inplace_offload = _FP8_EXPERT_ACTIVATION_OFFLOAD and x.is_cuda
+        if inplace_offload:
+            saved_x = torch.empty_like(x, device="cpu", pin_memory=True)
+            saved_x.copy_(x, non_blocking=True)
+            offload_done = torch.cuda.Event()
+            offload_done.record(torch.cuda.current_stream(x.device))
+        else:
+            saved_x = x
+            offload_done = None
+        ctx.save_for_backward(saved_x, flat_scores)
         ctx.score_shape = scores.shape
         ctx.chunk_rows = chunk_rows
-        out = torch.empty_like(x)
+        ctx.inplace_offload = inplace_offload
+        ctx.offload_done = offload_done
+        out = x if inplace_offload else torch.empty_like(x)
         for start in range(0, x.shape[0], chunk_rows):
             end = min(start + chunk_rows, x.shape[0])
             out[start:end].copy_(
                 (x[start:end].float() * flat_scores[start:end, None]).to(x.dtype)
             )
+        if inplace_offload:
+            ctx.mark_dirty(x)
         return out
 
     @staticmethod
     def backward(ctx, grad):
         x, scores = ctx.saved_tensors
-        grad_x = torch.empty_like(x)
+        if ctx.inplace_offload:
+            torch.cuda.current_stream(grad.device).wait_event(ctx.offload_done)
+            grad_x = grad.contiguous()
+        else:
+            grad_x = torch.empty_like(x)
         grad_scores = torch.empty_like(scores)
         for start in range(0, x.shape[0], ctx.chunk_rows):
             end = min(start + ctx.chunk_rows, x.shape[0])
             grad_chunk = grad[start:end].float()
-            x_chunk = x[start:end].float()
+            if ctx.inplace_offload:
+                x_chunk = x[start:end].to(grad.device, non_blocking=True).float()
+            else:
+                x_chunk = x[start:end].float()
             grad_x[start:end].copy_((grad_chunk * scores[start:end, None]).to(x.dtype))
             grad_scores[start:end].copy_((grad_chunk * x_chunk).sum(dim=-1))
+        del ctx.offload_done
         return grad_x, grad_scores.view(ctx.score_shape), None
 
 

@@ -283,6 +283,16 @@ paths now classify only indices in `[0, x.shape[0])` as real rows and clamp
 both sentinel forms only for their zero-filled gather. The exact CUDA gate now
 mixes negative and positive padding sentinels.
 
+The corrected x60q path passed the in-place expert permutation and failed in
+the INT4 expert-output combine. n76 local rank 7 tried to allocate its 384 MiB
+BF16 combine result with 303.62 MiB free. Route-score scaling still retained
+the complete unscaled expert output on the GPU for router-score backward and
+allocated a second complete scaled result. In production offload mode it now
+saves the exact BF16 unscaled output in pinned host memory, applies route
+scores in place, restores each bounded chunk for backward, and reuses the
+incoming gradient for its input gradient. This releases one complete routed
+tensor before INT4 combine without changing route-score arithmetic.
+
 x56p is the first nonzero-learning-rate production run on this validated path.
 It started from a new LoRA policy with learning rate 8e-6. Production step 1
 completed with grad norm 0.017861, masked mismatch KL 0.347687, unmasked

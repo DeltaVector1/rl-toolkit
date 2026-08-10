@@ -10,6 +10,7 @@ import json
 
 import torch
 
+from prime_rl.trainer.models.layers import fp8_ada
 from prime_rl.trainer.models.layers.fp8_ada import scale_routed_output
 
 
@@ -24,6 +25,7 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     torch.cuda.set_device(0)
+    fp8_ada._FP8_EXPERT_ACTIVATION_OFFLOAD = True
     generator = torch.Generator(device="cuda").manual_seed(61)
     value = torch.randn(
         ROWS,
@@ -66,7 +68,9 @@ def main() -> None:
     torch.testing.assert_close(out[:ROWS], value.mul(2), rtol=0, atol=0)
     out[:ROWS].sum().backward()
     if value.grad is None or not bool(torch.isfinite(value.grad).all()):
-        raise RuntimeError("inverse permutation produced a missing or nonfinite gradient")
+        raise RuntimeError(
+            "inverse permutation produced a missing or nonfinite gradient"
+        )
     torch.testing.assert_close(
         value.grad,
         torch.full_like(value, 2),
@@ -84,7 +88,7 @@ def main() -> None:
     )
     torch.cuda.empty_cache()
 
-    route_value = torch.randn(
+    route_leaf = torch.randn(
         ROWS,
         HIDDEN,
         device="cuda",
@@ -92,6 +96,7 @@ def main() -> None:
         generator=generator,
         requires_grad=True,
     )
+    route_value = route_leaf * 1
     route_scores = torch.randn(
         ROWS,
         device="cuda",
@@ -102,24 +107,38 @@ def main() -> None:
     torch.cuda.synchronize()
     route_before = torch.cuda.memory_allocated()
     torch.cuda.reset_peak_memory_stats()
+    route_pointer = route_value.data_ptr()
     routed = scale_routed_output(route_value, route_scores)
     torch.cuda.synchronize()
     route_forward_incremental = torch.cuda.max_memory_allocated() - route_before
-    if route_forward_incremental > 800 * MIB:
+    if routed.data_ptr() != route_pointer:
+        raise RuntimeError("route scaling did not reuse expert-output storage")
+    if route_forward_incremental > 256 * MIB:
         raise RuntimeError(
-            "chunked route scaling exceeded its bounded forward budget: "
+            "in-place route scaling exceeded its bounded forward budget: "
             f"incremental peak {route_forward_incremental / MIB:.2f} MiB"
         )
-    routed.sum().backward()
+    upstream = torch.randn_like(routed)
+    expected_output = (route_leaf.detach().float() * route_scores.detach()[:, None]).to(
+        route_leaf.dtype
+    )
+    expected_value_grad = (upstream.float() * route_scores.detach()[:, None]).to(
+        route_leaf.dtype
+    )
+    expected_score_grad = (upstream.float() * route_leaf.detach().float()).sum(dim=-1)
+    routed.backward(upstream)
     torch.cuda.synchronize()
     route_total_peak = torch.cuda.max_memory_allocated()
-    if route_value.grad is None or route_scores.grad is None:
+    torch.testing.assert_close(routed, expected_output, rtol=0, atol=0)
+    if route_leaf.grad is None or route_scores.grad is None:
         raise RuntimeError("chunked route scaling produced missing gradients")
-    if not bool(torch.isfinite(route_value.grad).all()) or not bool(
+    torch.testing.assert_close(route_leaf.grad, expected_value_grad, rtol=0, atol=0)
+    torch.testing.assert_close(route_scores.grad, expected_score_grad, rtol=0, atol=0)
+    if not bool(torch.isfinite(route_leaf.grad).all()) or not bool(
         torch.isfinite(route_scores.grad).all()
     ):
         raise RuntimeError("chunked route scaling produced nonfinite gradients")
-    del routed, route_value, route_scores
+    del routed, route_leaf, route_value, route_scores, upstream
     torch.cuda.empty_cache()
 
     dispatch_rows = 44_714
@@ -156,8 +175,7 @@ def main() -> None:
                 "incremental_unpermute_peak_mib": incremental_peak / MIB,
                 "incremental_padding_mask_peak_mib": mask_incremental_peak / MIB,
                 "padding_mask_buffer_gib": dispatch_rows * HIDDEN * 2 / GIB,
-                "route_scale_forward_incremental_mib": route_forward_incremental
-                / MIB,
+                "route_scale_forward_incremental_mib": route_forward_incremental / MIB,
                 "route_scale_forward_backward_peak_gib": route_total_peak / GIB,
                 "max_allocated_gib": torch.cuda.max_memory_allocated() / GIB,
                 "gradient": "exact",
