@@ -260,6 +260,20 @@ failure had zero errors. Collection was 1,454.43 seconds and maximum active
 generation was 821.51 seconds, which was 101.51 seconds above the alarm band.
 The 99,286,073-byte batch transfer took 163.62 seconds.
 
+Gate x60o failed before it reached W2. n76 local rank 7 tried to allocate a
+440 MiB source-major EP permutation with 397.62 MiB free. The permutation is a
+bijection for real routed rows. Native FP8 EP experts now gather one 4,096-row
+chunk, run the W8A8 W1, W3, and W2 kernels, and write each result back to its
+unique source row in the routed-input allocation. Backward applies the same
+bounded gather and scatter to its incoming gradient. Exact FP8 W1 and W3
+activations remain in pinned host memory. The production-shape SM89 gate used
+36,352 by 6,144 source rows, 512 alignment rows, and 2,048-wide experts. Its
+forward output and input gradient were bit-exact, it reused routed-input
+storage, retained 144 MiB of FP8 host activations, and measured 426.28 MiB
+incremental GPU peak including backward. x60o rollout step 1 had 1,024 of
+1,024 trainable samples and zero errors. Its active generation time was
+approximately 15 minutes, outside the 8-to-12-minute acceptance band.
+
 x56p is the first nonzero-learning-rate production run on this validated path.
 It started from a new LoRA policy with learning rate 8e-6. Production step 1
 completed with grad norm 0.017861, masked mismatch KL 0.347687, unmasked

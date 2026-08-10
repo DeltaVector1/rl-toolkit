@@ -1202,6 +1202,203 @@ class _Experts(torch.autograd.Function):
         return x_grad, None, None, None, None, None, None, None, None
 
 
+class _InplacePermutedExperts(torch.autograd.Function):
+    """Run EP experts without a full source-major permutation allocation.
+
+    The EP permutation is a bijection for real token rows.  Each gathered row
+    can therefore be processed once and written back to its original source
+    row without changing an input that a later chunk needs.  Reusing the
+    routed-input allocation for the source-major result removes one complete
+    hidden-size tensor from both forward and backward.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        x,
+        w1,
+        s1,
+        w2,
+        s2,
+        w3,
+        s3,
+        permuted_indices,
+        offsets,
+        owner,
+        chunk_rows,
+    ):
+        if not x.is_cuda:
+            raise RuntimeError("in-place streamed EP experts require CUDA")
+        if chunk_rows <= 0:
+            raise ValueError("FP8 EP permutation chunk rows must be positive")
+
+        rows = permuted_indices.shape[0]
+        q1_host = torch.empty(
+            rows,
+            w1.shape[1],
+            device="cpu",
+            dtype=torch.float8_e4m3fn,
+            pin_memory=True,
+        )
+        q3_host = torch.empty_like(q1_host, pin_memory=True)
+        qs1_parts = []
+        qs3_parts = []
+
+        for start in range(0, rows, chunk_rows):
+            end = min(start + chunk_rows, rows)
+            indices = permuted_indices[start:end]
+            real = indices < x.shape[0]
+            safe_indices = indices.clamp_max(x.shape[0] - 1).long()
+            chunk_x = x.index_select(0, safe_indices)
+            chunk_x.masked_fill_((~real).unsqueeze(-1), 0)
+            chunk_offsets = _expert_chunk_offsets(offsets, start, end)
+            z1, z3 = _grouped_mm_pair(
+                chunk_x,
+                w1,
+                s1,
+                chunk_x,
+                w3,
+                s3,
+                chunk_offsets,
+                shared_input=True,
+            )
+            q1, qs1 = ops.scaled_fp8_quant(z1, use_per_token_if_dynamic=True)
+            q3, qs3 = ops.scaled_fp8_quant(z3, use_per_token_if_dynamic=True)
+            q1_host[start:end].copy_(q1, non_blocking=True)
+            q3_host[start:end].copy_(q3, non_blocking=True)
+            qs1_parts.append(qs1)
+            qs3_parts.append(qs3)
+            F.silu(z1, inplace=True)
+            z1.mul_(z3)
+            chunk_out = _grouped_mm_chunked(
+                z1,
+                w2,
+                s2,
+                chunk_offsets,
+            )
+            x.index_copy_(0, indices[real].long(), chunk_out[real])
+
+        qs1 = torch.cat(qs1_parts, dim=0)
+        qs3 = torch.cat(qs3_parts, dim=0)
+        offload_done = torch.cuda.Event()
+        offload_done.record(torch.cuda.current_stream(x.device))
+        ctx.owner = owner
+        ctx.offload_done = offload_done
+        ctx.source_rows = x.shape[0]
+        ctx.chunk_rows = chunk_rows
+        if owner is None:
+            ctx.save_for_backward(
+                q1_host,
+                qs1,
+                q3_host,
+                qs3,
+                permuted_indices,
+                offsets,
+                w1,
+                s1,
+                w2,
+                s2,
+                w3,
+                s3,
+            )
+        else:
+            ctx.save_for_backward(
+                q1_host,
+                qs1,
+                q3_host,
+                qs3,
+                permuted_indices,
+                offsets,
+            )
+        ctx.mark_dirty(x)
+        return x
+
+    @staticmethod
+    def backward(ctx, grad):
+        if _EXPERT_PROFILE:
+            profile_start = torch.cuda.Event(enable_timing=True)
+            profile_end = torch.cuda.Event(enable_timing=True)
+            profile_start.record()
+        if ctx.owner is None:
+            (
+                q1,
+                qs1,
+                q3,
+                qs3,
+                permuted_indices,
+                offsets,
+                w1,
+                s1,
+                w2,
+                s2,
+                w3,
+                s3,
+            ) = ctx.saved_tensors
+        else:
+            q1, qs1, q3, qs3, permuted_indices, offsets = ctx.saved_tensors
+            owner = ctx.owner
+            w1, s1, w2, s2, w3, s3 = (
+                getattr(owner, name)
+                for name in (
+                    "w1",
+                    "w1_scale_inv",
+                    "w2",
+                    "w2_scale_inv",
+                    "w3",
+                    "w3_scale_inv",
+                )
+            )
+            w1, s1, w2, s2, w3, s3 = (
+                value.to_local() if isinstance(value, DTensor) else value
+                for value in (w1, s1, w2, s2, w3, s3)
+            )
+
+        torch.cuda.current_stream(grad.device).wait_event(ctx.offload_done)
+        grad = grad.contiguous()
+        rows = permuted_indices.shape[0]
+        for start in range(0, rows, ctx.chunk_rows):
+            end = min(start + ctx.chunk_rows, rows)
+            indices = permuted_indices[start:end]
+            real = indices < ctx.source_rows
+            safe_indices = indices.clamp_max(ctx.source_rows - 1).long()
+            grad_chunk = grad.index_select(0, safe_indices)
+            grad_chunk.masked_fill_((~real).unsqueeze(-1), 0)
+            chunk_offsets = _expert_chunk_offsets(offsets, start, end)
+
+            q1_device = q1[start:end].to(grad.device, non_blocking=True)
+            z1 = q1_device.to(grad.dtype).mul_(qs1[start:end].to(grad.dtype))
+            del q1_device
+            q3_device = q3[start:end].to(grad.device, non_blocking=True)
+            z3 = q3_device.to(grad.dtype).mul_(qs3[start:end].to(grad.dtype))
+            del q3_device
+            hidden_grad = _grouped_mm_chunked(
+                grad_chunk,
+                w2.transpose(-2, -1),
+                s2.transpose(-2, -1),
+                chunk_offsets,
+            )
+            sigmoid = torch.sigmoid(z1)
+            z1_grad = hidden_grad * z3 * sigmoid * (1 + z1 * (1 - sigmoid))
+            z3_grad = hidden_grad * F.silu(z1)
+            x_grad, x_grad_w3 = _grouped_mm_pair(
+                z1_grad,
+                w1.transpose(-2, -1),
+                s1.transpose(-2, -1),
+                z3_grad,
+                w3.transpose(-2, -1),
+                s3.transpose(-2, -1),
+                chunk_offsets,
+            )
+            x_grad.add_(x_grad_w3)
+            grad.index_copy_(0, indices[real].long(), x_grad[real])
+
+        if _EXPERT_PROFILE:
+            profile_end.record()
+            _profile_expert_backward(profile_start, profile_end)
+        del ctx.owner, ctx.offload_done
+        return grad, None, None, None, None, None, None, None, None, None, None
+
+
 class _ScaleRoutedOutput(torch.autograd.Function):
     """Apply FP32 route scores with bounded temporary storage.
 
@@ -1315,6 +1512,22 @@ def fp8_experts(
             TOKEN_GROUP_ALIGN_SIZE_M,
         )
 
+    offsets = torch.cumsum(local_counts, 0, dtype=torch.int32)
+    if _FP8_EXPERT_ACTIVATION_OFFLOAD and x.is_cuda:
+        return _InplacePermutedExperts.apply(
+            x,
+            w1,
+            s1,
+            w2,
+            s2,
+            w3,
+            s3,
+            permuted_indices,
+            offsets,
+            owner,
+            _FP8_W13_CHUNK_ROWS,
+        )
+
     # The index equal to x.shape[0] is a shared zero sentinel for alignment
     # padding. Clamp it for the gather, then zero those gathered rows in place.
     # This avoids a complete padded copy of the 426 MiB production input.
@@ -1330,7 +1543,7 @@ def fp8_experts(
         s2,
         w3,
         s3,
-        torch.cumsum(local_counts, 0, dtype=torch.int32),
+        offsets,
         owner,
     )
     # Expert forward no longer needs permuted input values, and its custom
