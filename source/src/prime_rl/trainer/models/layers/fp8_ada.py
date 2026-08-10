@@ -3,6 +3,7 @@ import os
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+import triton
 import triton.language as tl
 from torch import nn
 from torch.distributed.tensor import DTensor
@@ -22,9 +23,180 @@ _REPORTED_LINEAR_BACKWARD: set[tuple[tuple[int, ...], bool, bool]] = set()
 _REPORTED_INPUT_GRAD: set[tuple[int, ...]] = set()
 
 
+if hasattr(triton, "jit"):
+
+    @triton.jit
+    def _block_fp8_mm_kernel(
+        x,
+        weight,
+        scale,
+        out,
+        rows,
+        output_size: tl.constexpr,
+        reduction_size: tl.constexpr,
+        stride_xm,
+        stride_xk,
+        stride_w0,
+        stride_w1,
+        stride_s0,
+        stride_s1,
+        stride_om,
+        stride_on,
+        weight_is_output_major: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        """BF16 tensor-core GEMM which dequantizes one FP8 block at a time.
+
+        BLOCK_N and BLOCK_K are the checkpoint scale block dimensions. One FP32
+        inverse scale applies to every weight in each dot-product fragment and
+        can be applied to the FP32 accumulator fragment without materializing
+        a dequantized matrix.
+        """
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        for k_start in range(0, reduction_size, BLOCK_K):
+            offs_k = k_start + tl.arange(0, BLOCK_K)
+            activation = tl.load(
+                x + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk,
+                mask=(offs_m[:, None] < rows)
+                & (offs_k[None, :] < reduction_size),
+                other=0.0,
+            ).to(tl.bfloat16)
+            if weight_is_output_major:
+                weight_fragment = tl.load(
+                    weight
+                    + offs_n[None, :] * stride_w0
+                    + offs_k[:, None] * stride_w1,
+                    mask=(offs_n[None, :] < output_size)
+                    & (offs_k[:, None] < reduction_size),
+                    other=0.0,
+                ).to(tl.bfloat16)
+                inverse_scale = tl.load(
+                    scale
+                    + (pid_n * stride_s0)
+                    + ((k_start // 128) * stride_s1)
+                )
+            else:
+                weight_fragment = tl.load(
+                    weight
+                    + offs_k[:, None] * stride_w0
+                    + offs_n[None, :] * stride_w1,
+                    mask=(offs_k[:, None] < reduction_size)
+                    & (offs_n[None, :] < output_size),
+                    other=0.0,
+                ).to(tl.bfloat16)
+                inverse_scale = tl.load(
+                    scale
+                    + ((k_start // 128) * stride_s0)
+                    + (pid_n * stride_s1)
+                )
+            accumulator += tl.dot(activation, weight_fragment) * inverse_scale
+
+        tl.store(
+            out + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on,
+            accumulator,
+            mask=(offs_m[:, None] < rows) & (offs_n[None, :] < output_size),
+        )
+
+else:
+    _block_fp8_mm_kernel = None
+
+
 def set_diagnose_linear_backward(enabled: bool) -> None:
     global _DIAGNOSE_LINEAR_BACKWARD
     _DIAGNOSE_LINEAR_BACKWARD = enabled
+
+
+def _native_block_fp8_mm(x, weight, scale, *, weight_is_output_major):
+    """Multiply by serialized block-E4M3 weights without dequantizing them.
+
+    With ``weight_is_output_major=True`` this computes ``x @ weight.T`` (the
+    checkpoint forward layout).  False computes ``x @ weight`` and is the dX
+    layout.  The output is always contiguous; x may have arbitrary positive
+    two-dimensional strides.
+    """
+    if _block_fp8_mm_kernel is None:
+        raise RuntimeError("Triton is unavailable")
+    if x.ndim != 2 or weight.ndim != 2 or scale.ndim != 2:
+        raise ValueError("native block-FP8 GEMM requires 2-D tensors")
+    reduction_size = x.shape[1]
+    if weight_is_output_major:
+        output_size = weight.shape[0]
+        expected_reduction = weight.shape[1]
+        expected_scale = (
+            (output_size + 127) // 128,
+            (reduction_size + 127) // 128,
+        )
+    else:
+        expected_reduction = weight.shape[0]
+        output_size = weight.shape[1]
+        expected_scale = (
+            (reduction_size + 127) // 128,
+            (output_size + 127) // 128,
+        )
+    if reduction_size != expected_reduction:
+        raise ValueError(
+            f"reduction mismatch: activation {reduction_size}, weight {tuple(weight.shape)}"
+        )
+    if tuple(scale.shape) != expected_scale:
+        raise ValueError(
+            f"scale shape {tuple(scale.shape)} does not cover weight "
+            f"{tuple(weight.shape)}; expected {expected_scale}"
+        )
+    out = torch.empty(
+        x.shape[0], output_size, device=x.device, dtype=x.dtype
+    )
+    grid = ((x.shape[0] + 15) // 16, (output_size + 127) // 128)
+    _block_fp8_mm_kernel[grid](
+        x,
+        weight,
+        scale,
+        out,
+        x.shape[0],
+        output_size,
+        reduction_size,
+        x.stride(0),
+        x.stride(1),
+        weight.stride(0),
+        weight.stride(1),
+        scale.stride(0),
+        scale.stride(1),
+        out.stride(0),
+        out.stride(1),
+        weight_is_output_major,
+        BLOCK_M=16,
+        BLOCK_N=128,
+        BLOCK_K=128,
+        num_warps=4,
+        num_stages=2,
+    )
+    return out
+
+
+def _native_sm89_eligible(activation, weight, scale):
+    if (
+        not activation.is_cuda
+        or not weight.is_cuda
+        or not scale.is_cuda
+        or activation.device != weight.device
+        or activation.device != scale.device
+    ):
+        return False, "not-cuda"
+    if torch.cuda.get_device_capability(activation.device) != (8, 9):
+        return False, "not-sm89"
+    if activation.dtype not in (torch.bfloat16, torch.float16):
+        return False, "activation-dtype"
+    if weight.dtype != torch.float8_e4m3fn or scale.dtype != torch.float32:
+        return False, "checkpoint-dtype"
+    if _block_fp8_mm_kernel is None:
+        return False, "triton-unavailable"
+    return True, ""
 
 
 def _linear(x, weight, scale):
@@ -34,7 +206,7 @@ def _linear(x, weight, scale):
     return _grouped_mm(x, weight.unsqueeze(0), scale.unsqueeze(0), offsets).view(shape)
 
 
-def _linear_input_grad(
+def _linear_input_grad_oracle(
     grad, weight, scale, chunk_rows=1024, fqn="<unassigned-fp8-linear>"
 ):
     """Compute dX = dY @ dequant(W) without a transposed FP8 kernel.
@@ -85,6 +257,25 @@ def _linear_input_grad(
             flush=True,
         )
     return converted.view(shape)
+
+
+def _linear_input_grad(
+    grad, weight, scale, chunk_rows=1024, fqn="<unassigned-fp8-linear>"
+):
+    """Compute dX with the SM89 block-FP8 kernel, or use the FP32 oracle."""
+    eligible, _ = _native_sm89_eligible(grad, weight, scale)
+    if eligible:
+        shape = (*grad.shape[:-1], weight.shape[1])
+        grad_2d = grad.reshape(-1, grad.shape[-1])
+        return _native_block_fp8_mm(
+            grad_2d,
+            weight,
+            scale,
+            weight_is_output_major=False,
+        ).view(shape)
+    return _linear_input_grad_oracle(
+        grad, weight, scale, chunk_rows=chunk_rows, fqn=fqn
+    )
 
 
 class _Linear(torch.autograd.Function):
@@ -209,14 +400,32 @@ class FP8CheckpointEmbedding(nn.Embedding):
 
 
 def _dequant_weight(weight, scale, start, end, dtype):
-    return (
-        weight[start:end]
-        .to(dtype)
-        .view(-1, 128, weight.shape[1] // 128, 128)
-        .mul(scale[start // 128 : end // 128].to(dtype)[:, None, :, None])
-        .flatten(0, 1)
-        .flatten(1, 2)
+    if not (0 <= start <= end <= weight.shape[0]):
+        raise ValueError(
+            f"invalid row range [{start}, {end}) for weight {tuple(weight.shape)}"
+        )
+    expected = (
+        (weight.shape[0] + 127) // 128,
+        (weight.shape[1] + 127) // 128,
     )
+    if tuple(scale.shape) != expected:
+        raise ValueError(
+            f"scale shape {tuple(scale.shape)} does not cover "
+            f"weight {tuple(weight.shape)}; expected {expected}"
+        )
+    if start % 128 == 0 and end % 128 == 0 and weight.shape[1] % 128 == 0:
+        return (
+            weight[start:end]
+            .to(dtype)
+            .view(-1, 128, weight.shape[1] // 128, 128)
+            .mul(scale[start // 128 : end // 128].to(dtype)[:, None, :, None])
+            .flatten(0, 1)
+            .flatten(1, 2)
+        )
+    rows = torch.arange(start, end, device=scale.device) // 128
+    columns = torch.arange(weight.shape[1], device=scale.device) // 128
+    expanded_scale = scale.index_select(0, rows).index_select(1, columns)
+    return weight[start:end].to(dtype).mul(expanded_scale.to(dtype))
 
 
 def _scaled_mm(x, weight, weight_scale):

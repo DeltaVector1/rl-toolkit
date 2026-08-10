@@ -143,6 +143,84 @@ class FP8AdaAutogradTest(unittest.TestCase):
         )
         torch.testing.assert_close(got, expected, rtol=0, atol=0)
 
+    def test_dequant_weight_supports_partial_blocks(self):
+        weight = (
+            torch.arange(130 * 259, dtype=torch.int32)
+            .remainder(31)
+            .sub(15)
+            .reshape(130, 259)
+            .to(torch.float8_e4m3fn)
+        )
+        scale = torch.tensor(
+            [[0.25, 0.5, 1.0], [2.0, 4.0, 8.0]], dtype=torch.float32
+        )
+        got = fp8_ada._dequant_weight(weight, scale, 127, 130, torch.float32)
+        expected = weight[127:130].float() * _expanded_block_scale(
+            scale, (130, 259)
+        )[127:130]
+        torch.testing.assert_close(got, expected, rtol=0, atol=0)
+
+    def test_native_dx_accepts_noncontiguous_gradient(self):
+        grad_storage = torch.arange(3 * 10, dtype=torch.float32).reshape(3, 10)
+        grad = grad_storage[:, ::2]
+        self.assertFalse(grad.is_contiguous())
+        weight = torch.randn(5, 7)
+        scale = torch.ones(1, 1)
+        expected = grad @ weight
+        seen = {}
+
+        original_eligible = fp8_ada._native_sm89_eligible
+        original_native = fp8_ada._native_block_fp8_mm
+        fp8_ada._native_sm89_eligible = lambda *_args: (True, "")
+
+        def fake_native(value, raw_weight, block_scale, **kwargs):
+            seen["stride"] = value.stride()
+            self.assertFalse(kwargs["weight_is_output_major"])
+            torch.testing.assert_close(block_scale, scale)
+            return value @ raw_weight
+
+        fp8_ada._native_block_fp8_mm = fake_native
+        try:
+            got = fp8_ada._linear_input_grad(
+                grad, weight, scale, fqn="model.layers.7.self_attn.q_b_proj"
+            )
+        finally:
+            fp8_ada._native_sm89_eligible = original_eligible
+            fp8_ada._native_block_fp8_mm = original_native
+
+        self.assertEqual(seen["stride"], grad.stride())
+        torch.testing.assert_close(got, expected)
+
+    def test_eligible_native_dx_does_not_call_oracle(self):
+        grad = torch.randn(2, 3)
+        weight = torch.randn(3, 4)
+        scale = torch.ones(1, 1)
+        sentinel = torch.full((2, 4), 17.0)
+
+        original_eligible = fp8_ada._native_sm89_eligible
+        original_native = fp8_ada._native_block_fp8_mm
+        original_oracle = fp8_ada._linear_input_grad_oracle
+        fp8_ada._native_sm89_eligible = lambda *_args: (True, "")
+        fp8_ada._native_block_fp8_mm = lambda *_args, **_kwargs: sentinel
+
+        def fail_oracle(*_args, **_kwargs):
+            raise AssertionError("eligible SM89 input used the oracle")
+
+        fp8_ada._linear_input_grad_oracle = fail_oracle
+        try:
+            got = fp8_ada._linear_input_grad(
+                grad,
+                weight,
+                scale,
+                fqn="model.layers.11.self_attn.o_proj",
+            )
+        finally:
+            fp8_ada._native_sm89_eligible = original_eligible
+            fp8_ada._native_block_fp8_mm = original_native
+            fp8_ada._linear_input_grad_oracle = original_oracle
+
+        torch.testing.assert_close(got, sentinel)
+
     def test_fp8_linear_custom_backward_matches_dequantized_linear(self):
         torch.manual_seed(1)
         x = torch.randn(3, 256, dtype=torch.double, requires_grad=True)
