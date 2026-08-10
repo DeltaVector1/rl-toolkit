@@ -349,6 +349,49 @@ class FP8AdaAutogradTest(unittest.TestCase):
         torch.cat(pieces).backward(upstream)
         torch.testing.assert_close(got_grad, ref_x.grad, rtol=1e-12, atol=1e-12)
 
+    def test_grouped_w2_chunking_preserves_expert_rows_and_padding(self):
+        torch.manual_seed(23)
+        x = torch.randn(13, 4)
+        weight = torch.randn(2, 3, 4)
+        scale = torch.ones(2, 1, 1)
+        offsets = torch.tensor([6, 11], dtype=torch.int32)
+        seen_rows = []
+
+        original_grouped_mm = fp8_ada._grouped_mm
+
+        def dense_grouped_mm(value, raw_weight, _scale, ends):
+            seen_rows.append(value.shape[0])
+            outputs = value.new_zeros(value.shape[0], raw_weight.shape[1])
+            begin = 0
+            for expert, finish in enumerate(ends.tolist()):
+                outputs[begin:finish] = F.linear(
+                    value[begin:finish], raw_weight[expert]
+                )
+                begin = finish
+            return outputs
+
+        fp8_ada._grouped_mm = dense_grouped_mm
+        try:
+            got = fp8_ada._grouped_mm_chunked(
+                x,
+                weight,
+                scale,
+                offsets,
+                chunk_rows=5,
+            )
+        finally:
+            fp8_ada._grouped_mm = original_grouped_mm
+
+        expected = torch.cat(
+            (
+                F.linear(x[:6], weight[0]),
+                F.linear(x[6:11], weight[1]),
+                x.new_zeros(2, weight.shape[1]),
+            )
+        )
+        self.assertEqual(seen_rows, [5, 5, 3])
+        torch.testing.assert_close(got, expected)
+
     def test_logprob_and_entropy_backward_match_dense_softmax(self):
         torch.manual_seed(3)
         hidden = torch.randn(4, 5, dtype=torch.float32, requires_grad=True)

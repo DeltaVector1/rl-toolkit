@@ -19,6 +19,7 @@ from vllm.model_executor.layers.fused_moe.fused_moe import (
 
 block_shape = [128, 128]
 _DIRECT_SM89_FORWARD_MAX_ROWS = 256
+_FP8_W2_CHUNK_ROWS = 4096
 _DIAGNOSE_LINEAR_BACKWARD = False
 _REPORTED_LINEAR_BACKWARD: set[tuple[tuple[int, ...], bool, bool]] = set()
 _REPORTED_INPUT_GRAD: set[tuple[int, ...]] = set()
@@ -750,6 +751,39 @@ def _grouped_mm(x, weight, scale, offsets):
     return out[:, 0].masked_fill((rows >= offsets[-1]).unsqueeze(-1), 0)
 
 
+def _grouped_mm_chunked(x, weight, scale, offsets, chunk_rows=None):
+    """Run a grouped matrix multiply with bounded token-row workspaces.
+
+    The routed-expert W2 projection can start while delayed expert unshards are
+    still resident. Splitting only its token rows keeps the fused-kernel
+    workspace bounded without changing expert ownership or output order.
+    """
+    chunk_rows = chunk_rows or _FP8_W2_CHUNK_ROWS
+    if chunk_rows <= 0:
+        raise ValueError("FP8 W2 chunk rows must be positive")
+    if x.shape[0] <= chunk_rows:
+        return _grouped_mm(x, weight, scale, offsets)
+
+    out = x.new_empty(x.shape[0], weight.shape[1])
+    expert_starts = torch.cat((offsets.new_zeros(1), offsets[:-1]))
+    for start in range(0, x.shape[0], chunk_rows):
+        end = min(start + chunk_rows, x.shape[0])
+        counts = (
+            offsets.clamp(min=start, max=end)
+            - expert_starts.clamp(min=start, max=end)
+        ).clamp_min_(0)
+        chunk_offsets = torch.cumsum(counts, 0, dtype=torch.int32)
+        out[start:end].copy_(
+            _grouped_mm(
+                x[start:end],
+                weight,
+                scale,
+                chunk_offsets,
+            )
+        )
+    return out
+
+
 class _Experts(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, w1, s1, w2, s2, w3, s3, offsets):
@@ -761,14 +795,14 @@ class _Experts(torch.autograd.Function):
         F.silu(z1, inplace=True)
         z1.mul_(z3)
         del z3
-        return _grouped_mm(z1, w2, s2, offsets)
+        return _grouped_mm_chunked(z1, w2, s2, offsets)
 
     @staticmethod
     def backward(ctx, grad):
         q1, qs1, q3, qs3, w1, s1, w2, s2, w3, s3, offsets = ctx.saved_tensors
         z1 = q1.to(grad.dtype).mul_(qs1.to(grad.dtype))
         z3 = q3.to(grad.dtype).mul_(qs3.to(grad.dtype))
-        hidden_grad = _grouped_mm(
+        hidden_grad = _grouped_mm_chunked(
             grad, w2.transpose(-2, -1), s2.transpose(-2, -1), offsets
         )
         sigmoid = torch.sigmoid(z1)
