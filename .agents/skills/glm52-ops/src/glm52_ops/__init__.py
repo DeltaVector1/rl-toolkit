@@ -9,10 +9,12 @@ either read the text or compute over the result.
 
 from __future__ import annotations
 
+import base64
 import datetime as _dt
-import glob as _glob
 import json
+import math
 import re
+import shlex
 import statistics
 import subprocess
 import sys
@@ -68,6 +70,24 @@ TREND_SIGMA = 2.0
 
 # Nothing in this run should sit still this long.
 STALL_SECONDS = 600
+
+# TRAINING_EXPECTATIONS.md acceptance gates. Keep these values here so the
+# read-only report and its unit tests use one definition.
+EXPECTED_BATCH_SIZE = 1024
+EXPECTED_GROUP_SIZE = 16
+EXPECTED_CONTEXT_LENGTH = 32768
+EXPECTED_MAX_OUTPUT_LENGTH = 16384
+EXPECTED_LR = 8e-6
+EXPECTED_MAX_NORM = 1.0
+EXPECTED_WEIGHT_DECAY = 0.0
+TRAINER_COMPUTE_MIN_SECONDS = 10 * 60
+TRAINER_COMPUTE_MAX_SECONDS = 15 * 60
+# "Approximately 10 minutes" needs a mechanical alarm boundary. Two minutes
+# on either side keeps the report explicit without calling normal jitter a
+# regression.
+ROLLOUT_GENERATION_MIN_SECONDS = 8 * 60
+ROLLOUT_GENERATION_MAX_SECONDS = 12 * 60
+FINAL_VALIDATION_STEPS = 50
 
 # .../<repo>/.agents/skills/glm52-ops/src/glm52_ops/__init__.py
 REPO = Path(__file__).resolve().parents[5]
@@ -158,6 +178,10 @@ def _hms(sec: float | None) -> str:
     if sec < 5400:
         return f"{sec // 60}m"
     return f"{sec // 3600}h{(sec % 3600) // 60:02d}m"
+
+
+def _shown(value) -> str:
+    return "?" if value is None else str(value)
 
 
 def _run_dir(run: str) -> str:
@@ -275,6 +299,79 @@ class EngineState:
 
 
 @dataclass
+class AcceptanceReport:
+    """Read-only TRAINING_EXPECTATIONS evidence and alarms."""
+
+    run: str = ""
+    trainer_config_path: str = ""
+    orchestrator_config_path: str = ""
+    batch_size: int | None = None
+    group_size: int | None = None
+    context_length: int | None = None
+    max_output_lengths: list[int] = field(default_factory=list)
+    learning_rates: list[float] = field(default_factory=list)
+    max_norm: float | None = None
+    weight_decay: float | None = None
+    native_fp8: bool | None = None
+    completed_steps: int = 0
+    trainer_compute_step: int | None = None
+    trainer_compute_seconds: float | None = None
+    rollout_generation_step: int | None = None
+    rollout_generation_seconds: float | None = None
+    batch_2048_evidence: bool = False
+    reward_verdict: str = "no data"
+    failures: dict[str, int] = field(default_factory=dict)
+    alarms: list[str] = field(default_factory=list)
+
+    @property
+    def passed(self) -> bool:
+        return not self.alarms
+
+    def report(self) -> str:
+        values = (
+            f"batch={_shown(self.batch_size)} group={_shown(self.group_size)} "
+            f"context={_shown(self.context_length)} "
+            f"max_output={','.join(map(str, self.max_output_lengths)) or '?'} "
+            f"lr={','.join(f'{x:g}' for x in self.learning_rates) or '?'} "
+            f"max_norm={_shown(self.max_norm)} weight_decay={_shown(self.weight_decay)}"
+        )
+        precision = "yes" if self.native_fp8 is True else "no" if self.native_fp8 is False else "?"
+        trainer = (
+            f"step {self.trainer_compute_step}: {_hms(self.trainer_compute_seconds)}"
+            if self.trainer_compute_step is not None
+            else "no post-step-1 measurement"
+        )
+        generation = (
+            f"step {self.rollout_generation_step}: {_hms(self.rollout_generation_seconds)}"
+            if self.rollout_generation_step is not None
+            else "no separate generation measurement"
+        )
+        L = [f"=== TRAINING_EXPECTATIONS acceptance for run {self.run} ==="]
+        L.append(f"config: {values}")
+        L.append(f"native FP8 trainer: {precision}")
+        L.append(f"trainer forward/backward only: {trainer} (gate 10-15m after step 1)")
+        L.append(f"active rollout generation only: {generation} (approximate gate 8-12m)")
+        L.append(
+            "excluded from both times: policy/gate waiting, judging/scoring, batch transfer, "
+            "adapter transfer, and checkpoint save"
+        )
+        L.append(
+            f"stability: {self.completed_steps}/{FINAL_VALIDATION_STEPS} completed steps | "
+            f"batch-2048 evidence={'yes' if self.batch_2048_evidence else 'NO'} | "
+            f"reward verdict={self.reward_verdict}"
+        )
+        if self.failures:
+            L.append("failure evidence: " + ", ".join(f"{k}={v}" for k, v in sorted(self.failures.items())))
+        L.append(f"VERDICT: {'PASS' if self.passed else 'FAIL'}")
+        for alarm in self.alarms:
+            L.append(f"!! ACCEPTANCE: {alarm}")
+        return "\n".join(L)
+
+    def __str__(self) -> str:
+        return self.report()
+
+
+@dataclass
 class Status:
     when: str = ""
     run: str = ""
@@ -297,6 +394,7 @@ class Status:
     nodes: list[NodeState] = field(default_factory=list)
     engines: list[EngineState] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    acceptance_alarms: list[str] = field(default_factory=list)
 
     def report(self) -> str:
         L = [f"=== {self.when} UTC  run={self.run} ==="]
@@ -340,10 +438,432 @@ class Status:
             )
         for w in self.warnings:
             L.append(f"!! {w}")
+        for alarm in self.acceptance_alarms:
+            L.append(f"!! ACCEPTANCE: {alarm}")
         return "\n".join(L)
 
     def __str__(self) -> str:
         return self.report()
+
+
+
+# ------------------------------------------------------ acceptance reporting
+
+
+def _strip_toml_comment(line: str) -> str:
+    """Remove a TOML comment while preserving quoted # characters."""
+    quote = ""
+    escaped = False
+    out = []
+    for ch in line:
+        if escaped:
+            out.append(ch)
+            escaped = False
+            continue
+        if ch == "\\" and quote == '"':
+            out.append(ch)
+            escaped = True
+            continue
+        if ch in ("'", '"'):
+            if not quote:
+                quote = ch
+            elif quote == ch:
+                quote = ""
+            out.append(ch)
+            continue
+        if ch == "#" and not quote:
+            break
+        out.append(ch)
+    return "".join(out).strip()
+
+
+def _parse_toml_value(raw: str):
+    raw = _strip_toml_comment(raw).strip()
+    if not raw:
+        return None
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ("'", '"'):
+        return raw[1:-1]
+    low = raw.lower()
+    if low in ("true", "false"):
+        return low == "true"
+    number = raw.replace("_", "")
+    try:
+        return float(number) if any(c in number.lower() for c in (".", "e")) else int(number)
+    except ValueError:
+        return raw
+
+
+def _parse_toml_scalars(text: str) -> dict[str, list[object]]:
+    """Parse scalar TOML values without a TOML dependency.
+
+    The operations skill supports Python 3.10, where tomllib is not available.
+    Acceptance uses only scalar gate fields, so multiline arrays and tables are
+    deliberately ignored. Repeated array-of-table keys remain visible as a list.
+    """
+    section = ""
+    values: dict[str, list[object]] = {}
+    for raw_line in text.splitlines():
+        line = _strip_toml_comment(raw_line)
+        if not line:
+            continue
+        table = re.fullmatch(r"\[\[?([^\]]+?)\]?\]", line)
+        if table:
+            section = table.group(1).strip()
+            continue
+        match = re.match(r"([A-Za-z0-9_.-]+)\s*=\s*(.+)$", line)
+        if not match:
+            continue
+        key = f"{section}.{match.group(1)}" if section else match.group(1)
+        value = _parse_toml_value(match.group(2))
+        if value is not None and not isinstance(value, str) or (
+            isinstance(value, str) and not value.startswith(("[", "{"))
+        ):
+            values.setdefault(key, []).append(value)
+    return values
+
+
+def _last(values: dict[str, list[object]], key: str):
+    found = values.get(key, [])
+    return found[-1] if found else None
+
+
+def _numbers(values: dict[str, list[object]], keys: tuple[str, ...]) -> list[float]:
+    out = []
+    for key in keys:
+        for value in values.get(key, []):
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                out.append(float(value))
+    return out
+
+
+def _parse_jsonl_metrics(text: str) -> list[dict]:
+    """Merge JSONL monitor records by step. Invalid and partial lines are ignored."""
+    by_step: dict[int, dict] = {}
+    for line in text.splitlines():
+        try:
+            row = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(row, dict) or not isinstance(row.get("step"), (int, float)):
+            continue
+        step = int(row["step"])
+        by_step.setdefault(step, {"step": step}).update(row)
+    return [by_step[step] for step in sorted(by_step)]
+
+
+def _near(actual: float, expected: float) -> bool:
+    return math.isclose(float(actual), float(expected), rel_tol=1e-9, abs_tol=1e-12)
+
+
+def _failure_evidence(trainer_rows: list[dict], rollout_rows: list[dict], logs: str) -> dict[str, int]:
+    """Count measured failure evidence. Counts are lines or affected metric steps."""
+    failures: dict[str, int] = {}
+
+    rollout_error_steps = sum(
+        1 for row in rollout_rows if float(row.get("train/agg/all/has_error/mean") or 0.0) > 0.0
+    )
+    environment_steps = sum(
+        1
+        for row in rollout_rows
+        if any(
+            isinstance(value, (int, float))
+            and value > 0
+            and (
+                "user_sim_failed" in key
+                or "environment_error" in key
+                or "env_error" in key
+            )
+            for key, value in row.items()
+        )
+    )
+    if rollout_error_steps:
+        failures["transport/rollout"] = rollout_error_steps
+    if environment_steps:
+        failures["environment"] = environment_steps
+
+    categories = {
+        "transport": re.compile(
+            r"rollout failed|readtimeout|connect(?:ion)?error|transport(?:error| failure)|"
+            r"(?:batch|file).*(?:transfer|sync).*(?:failed|error|mismatch)|"
+            r"checksum.*(?:failed|mismatch)|tunnel.*(?: down|failed)",
+            re.I,
+        ),
+        "adapter": re.compile(
+            r"(?:adapter|lora).*(?:failed|error|timeout|mismatch|not visible)|"
+            r"(?:failed|error).*(?:adapter|lora)",
+            re.I,
+        ),
+        "environment": re.compile(
+            r"(?:environment|user.sim(?:ulation)?).*(?:failed|error|exception)|"
+            r"(?:failed|error).*(?:environment|user.sim(?:ulation)?)",
+            re.I,
+        ),
+        "stability": re.compile(r"out of memory|\boom\b|\b(?:nan|inf)\b|nonfinite", re.I),
+    }
+    lines = list(dict.fromkeys(line.strip() for line in logs.splitlines() if line.strip()))
+    for category, pattern in categories.items():
+        count = sum(
+            1
+            for line in lines
+            if pattern.search(line)
+            and not re.search(r"(?:error|failed|nonfinite)[^0-9]{0,8}0(?:\.0+)?%?", line, re.I)
+        )
+        if count:
+            failures[category] = failures.get(category, 0) + count
+
+    nonfinite_steps = 0
+    for row in trainer_rows:
+        bad = float(row.get("diagnostic/nonfinite_gradient") or 0.0) > 0
+        for value in row.values():
+            if isinstance(value, float) and not math.isfinite(value):
+                bad = True
+        nonfinite_steps += int(bad)
+    if nonfinite_steps:
+        failures["stability"] = failures.get("stability", 0) + nonfinite_steps
+    return failures
+
+
+def _batch_2048_evidence(
+    orchestrator_values: dict[str, list[object]],
+    trainer_rows: list[dict],
+    logs: str,
+) -> bool:
+    batch = _last(orchestrator_values, "batch_size")
+    if batch == 2048 and any(row["step"] >= 1 for row in trainer_rows):
+        return True
+    explicit = re.search(r"\b(?:batch(?:_size)?\s*[=: ]\s*2048|b2048)\b", logs, re.I)
+    completed = re.search(r"\b(?:SUCCESS Step|validated|acceptance|completed)\b", logs, re.I)
+    return bool(explicit and completed)
+
+
+def _acceptance_from_text(
+    run: str,
+    trainer_config: str,
+    orchestrator_config: str,
+    trainer_metrics: str,
+    rollout_metrics: str,
+    logs: str,
+    reward_verdict: str,
+) -> AcceptanceReport:
+    """Build an acceptance report from text. This function never uses SSH."""
+    trainer_values = _parse_toml_scalars(trainer_config)
+    orch_values = _parse_toml_scalars(orchestrator_config)
+    trainer_rows = _parse_jsonl_metrics(trainer_metrics)
+    rollout_rows = _parse_jsonl_metrics(rollout_metrics)
+    rep = AcceptanceReport(run=run, reward_verdict=reward_verdict)
+
+    rep.batch_size = _last(orch_values, "batch_size")
+    rep.group_size = _last(orch_values, "group_size")
+    # The trainer config sets the accepted training context. The orchestrator
+    # root seq_len is only its rollout packing limit and can differ.
+    rep.context_length = _last(trainer_values, "model.seq_len")
+    output_values = _numbers(
+        orch_values,
+        (
+            "train.sampling.max_completion_tokens",
+            "train.env.sampling.max_completion_tokens",
+            "train.env.env.agent.max_output_tokens",
+        ),
+    )
+    rep.max_output_lengths = sorted(set(int(v) for v in output_values))
+    rep.learning_rates = _numbers(trainer_values, ("optim.lr",)) + _numbers(orch_values, ("optim.lr",))
+    rep.max_norm = _last(trainer_values, "optim.max_norm")
+    rep.weight_decay = _last(trainer_values, "optim.weight_decay")
+
+    quant_type = _last(trainer_values, "model.quantization.type")
+    dequant_flags = [
+        _last(trainer_values, key)
+        for key in (
+            "model.quantization.dequantize_checkpoint",
+            "model.quantization.dequantize_checkpoint_linears",
+            "model.quantization.dequantize_checkpoint_moe",
+        )
+    ]
+    if not trainer_config.strip():
+        rep.native_fp8 = None
+    else:
+        rep.native_fp8 = quant_type == "fp8" and all(flag is False for flag in dequant_flags)
+
+    rep.completed_steps = max((row["step"] for row in trainer_rows), default=0)
+    compute = [
+        (row["step"], float(row["time/forward_backward"]))
+        for row in trainer_rows
+        if row["step"] > 1 and isinstance(row.get("time/forward_backward"), (int, float))
+    ]
+    if compute:
+        rep.trainer_compute_step, rep.trainer_compute_seconds = compute[-1]
+
+    generation_keys = (
+        "train/agg/all/timing/generation/max",
+        "train/decensor/all/timing/generation/max",
+    )
+    generation = []
+    for row in rollout_rows:
+        value = next(
+            (
+                row[key]
+                for key in generation_keys
+                if isinstance(row.get(key), (int, float))
+            ),
+            None,
+        )
+        if value is not None:
+            generation.append((row["step"], float(value)))
+    if generation:
+        rep.rollout_generation_step, rep.rollout_generation_seconds = generation[-1]
+
+    rep.batch_2048_evidence = _batch_2048_evidence(orch_values, trainer_rows, logs)
+    rep.failures = _failure_evidence(trainer_rows, rollout_rows, logs)
+
+    def expected(name: str, actual, want) -> None:
+        if actual is None or actual != want:
+            rep.alarms.append(f"{name} is {_shown(actual)}; expected {want}")
+
+    expected("batch size", rep.batch_size, EXPECTED_BATCH_SIZE)
+    expected("group size", rep.group_size, EXPECTED_GROUP_SIZE)
+    expected("context length", rep.context_length, EXPECTED_CONTEXT_LENGTH)
+    if not rep.max_output_lengths or any(v != EXPECTED_MAX_OUTPUT_LENGTH for v in rep.max_output_lengths):
+        shown = ",".join(map(str, rep.max_output_lengths)) or "?"
+        rep.alarms.append(f"maximum output length is {shown}; expected {EXPECTED_MAX_OUTPUT_LENGTH}")
+    if len(rep.learning_rates) < 2 or any(not _near(v, EXPECTED_LR) for v in rep.learning_rates):
+        shown = ",".join(f"{v:g}" for v in rep.learning_rates) or "?"
+        rep.alarms.append(f"trainer/orchestrator learning rates are {shown}; expected {EXPECTED_LR:g}")
+    if rep.max_norm is None or not _near(rep.max_norm, EXPECTED_MAX_NORM):
+        rep.alarms.append(f"maximum gradient norm is {_shown(rep.max_norm)}; expected {EXPECTED_MAX_NORM:g}")
+    if rep.weight_decay is None or not _near(rep.weight_decay, EXPECTED_WEIGHT_DECAY):
+        rep.alarms.append(f"weight decay is {_shown(rep.weight_decay)}; expected {EXPECTED_WEIGHT_DECAY:g}")
+    if rep.native_fp8 is not True:
+        rep.alarms.append("trainer is not confirmed on native FP8 checkpoint weights")
+
+    bad_compute = [
+        step
+        for step, seconds in compute
+        if seconds < TRAINER_COMPUTE_MIN_SECONDS or seconds > TRAINER_COMPUTE_MAX_SECONDS
+    ]
+    if bad_compute:
+        rep.alarms.append(
+            f"trainer forward/backward is outside 10-15m after step 1 at steps "
+            f"{','.join(map(str, bad_compute[-8:]))}"
+        )
+    elif rep.completed_steps > 1 and not compute:
+        rep.alarms.append("no separate trainer forward/backward measurement after step 1")
+
+    bad_generation = [
+        step
+        for step, seconds in generation
+        if seconds < ROLLOUT_GENERATION_MIN_SECONDS or seconds > ROLLOUT_GENERATION_MAX_SECONDS
+    ]
+    if bad_generation:
+        rep.alarms.append(
+            f"active rollout generation is outside approximately 10m (8-12m alarm band) "
+            f"at steps {','.join(map(str, bad_generation[-8:]))}"
+        )
+    elif rollout_rows and not generation:
+        rep.alarms.append("no separate active rollout generation measurement")
+
+    for category, count in sorted(rep.failures.items()):
+        rep.alarms.append(f"{category} failure evidence is present ({count})")
+    if reward_verdict == "falling":
+        rep.alarms.append("effective reward verdict is falling")
+    if not rep.batch_2048_evidence:
+        rep.alarms.append("no measured batch-2048 validation evidence")
+    if rep.completed_steps < FINAL_VALIDATION_STEPS:
+        rep.alarms.append(
+            f"final stability validation has {rep.completed_steps}/{FINAL_VALIDATION_STEPS} completed trainer steps"
+        )
+    return rep
+
+
+_ACCEPTANCE_LOG_GREP = (
+    r"SUCCESS Step|batch(?:_size)?[=: ]+2048|b2048|out of memory|\bOOM\b|"
+    r"\bNaN\b|\bInf\b|nonfinite|adapter|LoRA|Rollout failed|ReadTimeout|"
+    r"ConnectError|TransportError|environment|user.sim|checksum|tunnel.*DOWN"
+)
+
+
+def _acceptance_probe_script(run: str, role: str) -> str:
+    root = shlex.quote(f"{RUNS}/{run}")
+    if role == "trainer":
+        container = TRAINER_CT
+        fallback = shlex.quote(f"{DEPLOY}/configs/china/trainer.{run}.toml")
+        metric_name = "trainer-metrics.jsonl"
+        containers = TRAINER_CT
+    elif role == "edge":
+        container = ORCH_CT
+        fallback = shlex.quote(f"{DEPLOY}/configs/h200/orchestrator.{run}h.toml")
+        metric_name = "rollout-metrics.jsonl"
+        containers = f"{ORCH_CT} {ENGINE_CT}"
+    else:
+        container = ENGINE_CT
+        fallback = "''"
+        metric_name = "__none__"
+        containers = ENGINE_CT
+    return f"""
+cfg=$(sudo docker inspect {container} --format '{{{{range .Config.Cmd}}}}{{{{println .}}}}{{{{end}}}}' 2>/dev/null |
+      grep -E '\\.toml$' | tail -1)
+[ -n "$cfg" ] || cfg={fallback}
+metric=$(find {root} -maxdepth 3 -type f -name {shlex.quote(metric_name)} -print 2>/dev/null | head -1)
+emit() {{ printf '%s_B64 ' "$1"; if [ -n "$2" ] && [ -r "$2" ]; then "$3" "$2" | base64 -w0; fi; printf '\\n'; }}
+emit PATH "$cfg" cat
+emit CONFIG "$cfg" cat
+emit METRICS "$metric" tail
+logs=""
+for ct in {containers}; do
+  logs="$logs$(sudo docker logs --tail 20000 "$ct" 2>&1 |
+    grep -aiE {shlex.quote(_ACCEPTANCE_LOG_GREP)} | tail -200)"
+done
+printf 'LOGS_B64 '; printf '%s' "$logs" | base64 -w0; printf '\\n'
+"""
+
+
+def _decode_acceptance_probe(out: str) -> dict[str, str]:
+    decoded = {}
+    for line in out.splitlines():
+        match = re.match(r"^(PATH|CONFIG|METRICS|LOGS)_B64(?: +(.*))?$", line)
+        if not match:
+            continue
+        try:
+            decoded[match.group(1).lower()] = base64.b64decode(match.group(2) or "").decode(
+                "utf-8", errors="replace"
+            )
+        except (ValueError, TypeError):
+            decoded[match.group(1).lower()] = ""
+    return decoded
+
+
+def acceptance(run: str = "", quiet: bool = False) -> AcceptanceReport:
+    """Read active configs and measured logs, then apply TRAINING_EXPECTATIONS.
+
+    This is read-only. Trainer compute uses only ``time/forward_backward``.
+    Rollout generation uses only the environment's ``timing/generation/max``.
+    The report never adds policy waiting, judging, transfer, or checkpoint time
+    to either measurement.
+    """
+    run = run or current_run()
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        f_trainer = ex.submit(_ssh, HEAD, _acceptance_probe_script(run, "trainer"), 180)
+        f_edge = ex.submit(_ssh, EDGE_ORCH, _acceptance_probe_script(run, "edge"), 180)
+        f_engine = ex.submit(_ssh, ENGINE_HOSTS[1], _acceptance_probe_script(run, "engine"), 180)
+        f_reward = ex.submit(reward, run, True)
+        trainer = _decode_acceptance_probe(f_trainer.result()[1])
+        edge = _decode_acceptance_probe(f_edge.result()[1])
+        engine = _decode_acceptance_probe(f_engine.result()[1])
+        reward_report = f_reward.result()
+
+    rep = _acceptance_from_text(
+        run,
+        trainer.get("config", ""),
+        edge.get("config", ""),
+        trainer.get("metrics", ""),
+        edge.get("metrics", ""),
+        "\n".join((trainer.get("logs", ""), edge.get("logs", ""), engine.get("logs", ""))),
+        reward_report.verdict,
+    )
+    rep.trainer_config_path = trainer.get("path", "")
+    rep.orchestrator_config_path = edge.get("path", "")
+    if not quiet:
+        print(rep.report())
+    return rep
 
 
 # --------------------------------------------------------------------- reads
@@ -1030,6 +1550,7 @@ def stop() -> None:
 
 _ACTIONS = {
     "status": lambda a: status(*a),
+    "acceptance": lambda a: acceptance(*a),
     "reward": lambda a: reward(*a),
     "tunnels": lambda a: tunnels(),
     "engines": lambda a: engines(),
@@ -1052,6 +1573,7 @@ def run(argstr: str = "status"):
 _USAGE = f"""glm52-ops <action> [args]
 
   status [run]        the whole picture in one call
+  acceptance [run]    TRAINING_EXPECTATIONS evidence and alarms
   reward [run]        the reward series with a trend verdict
   tunnels             the HTTP code for each of the 24 tunnel ports
   engines             a real completion probe for each engine
