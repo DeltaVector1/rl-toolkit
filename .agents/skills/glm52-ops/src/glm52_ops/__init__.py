@@ -1424,12 +1424,16 @@ def deploy(path: str, nodes: list[str] | None = None) -> bool:
             )
     want = __import__("hashlib").md5(local.read_bytes()).hexdigest()
     remote = f"{DEPLOY}/{path}"
+    remote_mode = "0755" if local.stat().st_mode & 0o111 else "0644"
 
     def one(h):
         subprocess.run(_SSH + [h, f"mkdir -p {str(Path(remote).parent)}"], capture_output=True)
         p = subprocess.run(["scp", "-q", "-o", "BatchMode=yes", str(local), f"{h}:{remote}"], capture_output=True, text=True)
         if p.returncode:
             return "scp failed"
+        rc, out = _ssh(h, f"chmod {remote_mode} {shlex.quote(remote)}")
+        if rc:
+            return f"chmod failed: {out.strip()[:80]}"
         rc, got = _ssh(h, f"md5sum {remote} | cut -d' ' -f1")
         return "ok" if got.strip() == want else f"MISMATCH {got.strip()[:8]}"
 
