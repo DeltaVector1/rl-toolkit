@@ -10,6 +10,8 @@ import json
 
 import torch
 
+from prime_rl.trainer.models.layers.fp8_ada import scale_routed_output
+
 
 GIB = 1024**3
 MIB = 1024**2
@@ -31,7 +33,6 @@ def main() -> None:
         generator=generator,
         requires_grad=True,
     )
-    padded = torch.vstack((value, value.new_zeros((1, HIDDEN))))
     permutation = torch.randperm(ROWS, device="cuda", generator=generator)
     indices = torch.cat(
         (
@@ -44,14 +45,15 @@ def main() -> None:
             ),
         )
     )
-    permuted = padded[indices]
+    padding_rows = indices == ROWS
+    permuted = value[indices.clamp_max(ROWS - 1)]
+    permuted.masked_fill_(padding_rows.unsqueeze(-1), 0)
     expert_output = permuted.mul(2)
-    del permuted
 
     torch.cuda.synchronize()
     before = torch.cuda.memory_allocated()
     torch.cuda.reset_peak_memory_stats()
-    out = padded
+    out = permuted
     out[indices] = expert_output
     torch.cuda.synchronize()
     incremental_peak = torch.cuda.max_memory_allocated() - before
@@ -61,8 +63,8 @@ def main() -> None:
             f"incremental peak {incremental_peak / MIB:.2f} MiB"
         )
 
-    torch.testing.assert_close(out[:-1], value.mul(2), rtol=0, atol=0)
-    out[:-1].sum().backward()
+    torch.testing.assert_close(out[:ROWS], value.mul(2), rtol=0, atol=0)
+    out[:ROWS].sum().backward()
     if value.grad is None or not bool(torch.isfinite(value.grad).all()):
         raise RuntimeError("inverse permutation produced a missing or nonfinite gradient")
     torch.testing.assert_close(
@@ -71,6 +73,80 @@ def main() -> None:
         rtol=0,
         atol=0,
     )
+    del (
+        out,
+        expert_output,
+        permuted,
+        permutation,
+        indices,
+        padding_rows,
+        value,
+    )
+    torch.cuda.empty_cache()
+
+    route_value = torch.randn(
+        ROWS,
+        HIDDEN,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+        requires_grad=True,
+    )
+    route_scores = torch.randn(
+        ROWS,
+        device="cuda",
+        dtype=torch.float32,
+        generator=generator,
+        requires_grad=True,
+    )
+    torch.cuda.synchronize()
+    route_before = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    routed = scale_routed_output(route_value, route_scores)
+    torch.cuda.synchronize()
+    route_forward_incremental = torch.cuda.max_memory_allocated() - route_before
+    if route_forward_incremental > 800 * MIB:
+        raise RuntimeError(
+            "chunked route scaling exceeded its bounded forward budget: "
+            f"incremental peak {route_forward_incremental / MIB:.2f} MiB"
+        )
+    routed.sum().backward()
+    torch.cuda.synchronize()
+    route_total_peak = torch.cuda.max_memory_allocated()
+    if route_value.grad is None or route_scores.grad is None:
+        raise RuntimeError("chunked route scaling produced missing gradients")
+    if not bool(torch.isfinite(route_value.grad).all()) or not bool(
+        torch.isfinite(route_scores.grad).all()
+    ):
+        raise RuntimeError("chunked route scaling produced nonfinite gradients")
+    del routed, route_value, route_scores
+    torch.cuda.empty_cache()
+
+    dispatch_rows = 44_714
+    dispatch = torch.full(
+        (dispatch_rows, 1, HIDDEN),
+        7,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    result = dispatch[:, 0]
+    padding_mask = torch.arange(dispatch_rows, device="cuda") >= dispatch_rows - 128
+    torch.cuda.synchronize()
+    mask_before = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    result.masked_fill_(padding_mask.unsqueeze(-1), 0)
+    torch.cuda.synchronize()
+    mask_incremental_peak = torch.cuda.max_memory_allocated() - mask_before
+    if mask_incremental_peak > 8 * MIB:
+        raise RuntimeError(
+            "in-place expert padding mask allocated an output copy: "
+            f"incremental peak {mask_incremental_peak / MIB:.2f} MiB"
+        )
+    if result.data_ptr() != dispatch.data_ptr():
+        raise RuntimeError("expert padding mask did not return dispatch storage")
+    if not bool((result[-128:] == 0).all()) or not bool((result[:-128] == 7).all()):
+        raise RuntimeError("in-place expert padding mask changed the wrong rows")
+
     print(
         json.dumps(
             {
@@ -78,6 +154,11 @@ def main() -> None:
                 "shape": [ROWS, HIDDEN],
                 "single_buffer_gib": ROWS * HIDDEN * 2 / GIB,
                 "incremental_unpermute_peak_mib": incremental_peak / MIB,
+                "incremental_padding_mask_peak_mib": mask_incremental_peak / MIB,
+                "padding_mask_buffer_gib": dispatch_rows * HIDDEN * 2 / GIB,
+                "route_scale_forward_incremental_mib": route_forward_incremental
+                / MIB,
+                "route_scale_forward_backward_peak_gib": route_total_peak / GIB,
                 "max_allocated_gib": torch.cuda.max_memory_allocated() / GIB,
                 "gradient": "exact",
             },

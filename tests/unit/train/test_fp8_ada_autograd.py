@@ -528,6 +528,38 @@ class FP8AdaAutogradTest(unittest.TestCase):
         torch.cat(pieces).backward(upstream)
         torch.testing.assert_close(x.grad, ref_x.grad, rtol=1e-12, atol=1e-12)
 
+    def test_chunked_route_scaling_matches_full_fp32_autograd(self):
+        torch.manual_seed(43)
+        value = torch.randn(7, 9, dtype=torch.bfloat16, requires_grad=True)
+        scores = torch.randn(7, dtype=torch.float32, requires_grad=True)
+        upstream = torch.randn(7, 9, dtype=torch.bfloat16)
+
+        got = fp8_ada.scale_routed_output(value, scores, chunk_rows=3)
+        got.backward(upstream)
+        got_value_grad = value.grad.detach().clone()
+        got_score_grad = scores.grad.detach().clone()
+
+        ref_value = value.detach().clone().requires_grad_()
+        ref_scores = scores.detach().clone().requires_grad_()
+        expected = (
+            ref_value.float() * ref_scores.reshape(-1, 1)
+        ).to(ref_value.dtype)
+        expected.backward(upstream)
+
+        torch.testing.assert_close(got, expected, rtol=0, atol=0)
+        torch.testing.assert_close(
+            got_value_grad,
+            ref_value.grad,
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            got_score_grad,
+            ref_scores.grad,
+            rtol=0,
+            atol=0,
+        )
+
     def test_grouped_mm_pair_reuses_assignment_and_shared_input_quantization(self):
         calls = {"prepare": 0, "quantize": 0, "dispatch": 0}
         value = types.SimpleNamespace(is_cuda=True, shape=(7, 8))
@@ -710,9 +742,9 @@ class FP8AdaAutogradTest(unittest.TestCase):
             torch.testing.assert_close(raw_counts, counts)
             self.assertEqual((local_experts, ep_size), (2, 2))
             return (
-                torch.tensor([0, 1, 3, 4, 5, 2]),
-                torch.tensor([5, 1]),
-                torch.tensor([0, 5, 6]),
+                torch.tensor([0, 1, 3, 4, 5, 2, 6, 6]),
+                torch.tensor([5, 3]),
+                torch.tensor([0, 5, 8]),
             )
 
         def fake_apply(
@@ -741,9 +773,12 @@ class FP8AdaAutogradTest(unittest.TestCase):
             index_ops.generate_permute_indices = original_generate
             fp8_ada._Experts.apply = original_apply
 
-        torch.testing.assert_close(captured["x"], x[[0, 1, 3, 4, 5, 2]])
         torch.testing.assert_close(
-            captured["offsets"], torch.tensor([5, 6], dtype=torch.int32)
+            captured["x"],
+            torch.cat((x[[0, 1, 3, 4, 5, 2]], torch.zeros(2, 1))),
+        )
+        torch.testing.assert_close(
+            captured["offsets"], torch.tensor([5, 8], dtype=torch.int32)
         )
         torch.testing.assert_close(got, x.mul(2))
         got.sum().backward()
@@ -754,6 +789,7 @@ class FP8AdaAutogradTest(unittest.TestCase):
         weight = torch.randn(2, 3, 2)
         scale = torch.ones(2, 1, 1)
         offsets = torch.tensor([1, 2], dtype=torch.int32)
+        dispatched = {}
 
         originals = (
             fp8_ada.moe_kernel_quantize_input,
@@ -764,6 +800,7 @@ class FP8AdaAutogradTest(unittest.TestCase):
             return value, torch.ones(value.shape[0], 1)
 
         def fake_dispatch(*args, **kwargs):
+            dispatched["data_ptr"] = args[2].data_ptr()
             args[2].fill_(7)
 
         fp8_ada.moe_kernel_quantize_input = fake_quantize
@@ -778,6 +815,7 @@ class FP8AdaAutogradTest(unittest.TestCase):
 
         torch.testing.assert_close(got[:2], torch.full_like(got[:2], 7))
         torch.testing.assert_close(got[2:], torch.zeros_like(got[2:]))
+        self.assertEqual(got.data_ptr(), dispatched["data_ptr"])
 
     def test_replace_linear_assigns_full_module_names(self):
         model = nn.Module()

@@ -15,7 +15,11 @@ from torchtitan.distributed.expert_parallel import expert_parallel
 
 from prime_rl.configs.trainer import EPCommBackend
 from prime_rl.trainer.mxfp4 import dequant_mxfp4
-from prime_rl.trainer.models.layers.fp8_ada import _Linear, fp8_experts
+from prime_rl.trainer.models.layers.fp8_ada import (
+    _Linear,
+    fp8_experts,
+    scale_routed_output,
+)
 
 
 @dataclass
@@ -853,7 +857,16 @@ class MoE(nn.Module):
         routed_output = self.experts(routed_input, num_tokens_per_expert)
 
         if not self.score_before_experts:
-            routed_output = (routed_output.to(torch.float32) * top_scores_experts_sorted.reshape(-1, 1)).to(x.dtype)
+            if self.experts.fp8_checkpoint:
+                routed_output = scale_routed_output(
+                    routed_output,
+                    top_scores_experts_sorted,
+                )
+            else:
+                routed_output = (
+                    routed_output.to(torch.float32)
+                    * top_scores_experts_sorted.reshape(-1, 1)
+                ).to(x.dtype)
 
         return routed_output
 

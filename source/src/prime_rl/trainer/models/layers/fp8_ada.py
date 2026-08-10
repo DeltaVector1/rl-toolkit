@@ -25,6 +25,7 @@ from vllm.model_executor.layers.fused_moe.fused_moe import (
 
 block_shape = [128, 128]
 _FP8_W2_CHUNK_ROWS = 4096
+_FP8_ROUTE_SCALE_CHUNK_ROWS = 4096
 _DIAGNOSE_LINEAR_BACKWARD = False
 _REPORTED_LINEAR_BACKWARD: set[tuple[tuple[int, ...], bool, bool]] = set()
 _REPORTED_INPUT_GRAD: set[tuple[int, ...]] = set()
@@ -922,7 +923,12 @@ def _dispatch_grouped_mm(
     # but padded rows are not tokens and must not contribute in forward or
     # backward.  The dense expert implementation has the same zero-padding
     # contract.
-    return out[:, 0].masked_fill((rows >= offsets[-1]).unsqueeze(-1), 0)
+    result = out[:, 0]
+    # ``out`` is new storage owned by this dispatch. An out-of-place mask made
+    # a second 118-to-524 MiB expert result at the production shape and OOMed
+    # x60l after the inverse-permutation allocation was removed.
+    result.masked_fill_((rows >= offsets[-1]).unsqueeze(-1), 0)
+    return result
 
 
 @torch.compiler.disable
@@ -1111,6 +1117,59 @@ class _Experts(torch.autograd.Function):
         return x_grad, None, None, None, None, None, None, None, None
 
 
+class _ScaleRoutedOutput(torch.autograd.Function):
+    """Apply FP32 route scores with bounded temporary storage.
+
+    The ordinary expression materializes the complete routed output in FP32,
+    the complete FP32 product, and the final BF16 tensor together. Production
+    routed output can exceed 500 MiB, so that eager expression does not fit.
+    """
+
+    @staticmethod
+    def forward(ctx, x, scores, chunk_rows):
+        flat_scores = scores.reshape(-1)
+        if x.shape[0] != flat_scores.shape[0]:
+            raise ValueError(
+                f"route score rows {flat_scores.shape[0]} do not match expert rows {x.shape[0]}"
+            )
+        ctx.save_for_backward(x, flat_scores)
+        ctx.score_shape = scores.shape
+        ctx.chunk_rows = chunk_rows
+        out = torch.empty_like(x)
+        for start in range(0, x.shape[0], chunk_rows):
+            end = min(start + chunk_rows, x.shape[0])
+            out[start:end].copy_(
+                (
+                    x[start:end].float()
+                    * flat_scores[start:end, None]
+                ).to(x.dtype)
+            )
+        return out
+
+    @staticmethod
+    def backward(ctx, grad):
+        x, scores = ctx.saved_tensors
+        grad_x = torch.empty_like(x)
+        grad_scores = torch.empty_like(scores)
+        for start in range(0, x.shape[0], ctx.chunk_rows):
+            end = min(start + ctx.chunk_rows, x.shape[0])
+            grad_chunk = grad[start:end].float()
+            x_chunk = x[start:end].float()
+            grad_x[start:end].copy_(
+                (grad_chunk * scores[start:end, None]).to(x.dtype)
+            )
+            grad_scores[start:end].copy_((grad_chunk * x_chunk).sum(dim=-1))
+        return grad_x, grad_scores.view(ctx.score_shape), None
+
+
+def scale_routed_output(x, scores, chunk_rows=None):
+    return _ScaleRoutedOutput.apply(
+        x,
+        scores,
+        chunk_rows or _FP8_ROUTE_SCALE_CHUNK_ROWS,
+    )
+
+
 def fp8_experts(
     w1,
     w2,
@@ -1139,6 +1198,9 @@ def fp8_experts(
         w1, w2, w3, s1, s2, s3 = (
             value.to_local() for value in (w1, w2, w3, s1, s2, s3)
         )
+
+    if x.shape[0] == 0:
+        return x
 
     local_experts = w1.shape[0]
     if num_tokens_per_expert.shape[0] == local_experts:
@@ -1173,9 +1235,13 @@ def fp8_experts(
             TOKEN_GROUP_ALIGN_SIZE_M,
         )
 
-    # The last row is a shared zero sentinel selected for padding positions.
-    padded_x = torch.vstack((x, x.new_zeros((1, x.shape[-1]))))
-    permuted_x = padded_x[permuted_indices, :]
+    # The index equal to x.shape[0] is a shared zero sentinel for alignment
+    # padding. Clamp it for the gather, then zero those gathered rows in place.
+    # This avoids a complete padded copy of the 426 MiB production input.
+    padding_rows = permuted_indices == x.shape[0]
+    safe_indices = permuted_indices.clamp_max(x.shape[0] - 1)
+    permuted_x = x[safe_indices, :]
+    permuted_x.masked_fill_(padding_rows.unsqueeze(-1), 0)
     out = _Experts.apply(
         permuted_x,
         w1,
@@ -1187,11 +1253,9 @@ def fp8_experts(
         torch.cumsum(local_counts, 0, dtype=torch.int32),
         owner,
     )
-    # Expert forward no longer needs the padded input values, and its custom
-    # backward keeps only quantized intermediates. Reuse this equally shaped
-    # buffer for the inverse permutation. Allocating a second output here cost
-    # 426 MiB at the production 32K/CP8 shape and OOMed x60k with the first
-    # eager MoE microbatch.
-    out_unpermuted = padded_x
+    # Expert forward no longer needs permuted input values, and its custom
+    # backward keeps only quantized intermediates. Reuse this buffer for the
+    # inverse permutation.
+    out_unpermuted = permuted_x
     out_unpermuted[permuted_indices, :] = out
-    return out_unpermuted[:-1]
+    return out_unpermuted[: x.shape[0]]

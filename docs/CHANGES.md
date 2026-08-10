@@ -211,6 +211,26 @@ through the reused buffer. A production-shape CUDA gate uses 36,352 rows by
 failure. Inverse permutation added 0 MiB to allocated memory and its gradient
 was exact. Peak for the complete synthetic graph was 2.708 GiB.
 
+x60l passed that inverse permutation and reached the next duplicate. The fused
+expert dispatch allocated its result, then out-of-place `masked_fill()` copied
+the complete result only to zero aligned padding rows. Failed allocations were
+118 to 524 MiB across W1, W3, and W2 shapes, with 54 to 456 MiB free. The
+dispatch result is new private storage. Padding is now masked in place. The
+unit regression checks both zero padding and that the returned tensor has the
+same data pointer as the fused-kernel output.
+
+The remaining routed-expert temporaries are now bounded. EP permutation
+gathers directly into its aligned output and zeros sentinel rows in place, so
+it no longer first builds a complete padded input. Route-score multiplication
+uses FP32 arithmetic in 4,096-row chunks, with an explicit autograd backward,
+instead of holding complete FP32 input and product tensors together. At the
+production 36,352 by 6,144 shape, the CUDA gate measured 0 MiB incremental for
+inverse permutation, 0 MiB for the in-place padding mask, and 618 MiB for the
+chunked route-score forward. Forward and backward peaked at 1.576 GiB and
+produced exact finite gradients. The 32K/CP8 two-rank SM89 FSDP gate then
+passed repeated reentrant attention backward and two in-flight fused-expert
+backwards at a 1.103 GiB measured peak.
+
 x56p is the first nonzero-learning-rate production run on this validated path.
 It started from a new LoRA policy with learning rate 8e-6. Production step 1
 completed with grad norm 0.017861, masked mismatch KL 0.347687, unmasked
