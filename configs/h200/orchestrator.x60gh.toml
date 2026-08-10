@@ -14,7 +14,7 @@ level = "info"
 project = "prod-run"
 name = "orchestrator-x60g"
 group = "glm52-decensor-r32"
-tags = ["glm-5.2", "decensor", "grpo", "w8a8-rollouts", "native-fp8-trainer", "lora-r32", "16xh200-rollouts", "64x4090-trainer", "edge-gemma", "b1024", "32768", "out16384", "cp8", "zero-lr-gate", "fp8-forward-backward", "int4-ep", "balanced-pp", "sparse-cache-transfer"]
+tags = ["glm-5.2", "decensor", "grpo", "w8a8-rollouts", "native-fp8-trainer", "lora-r32", "16xh200-rollouts", "64x4090-trainer", "edge-gemma", "b1024", "32768", "out16384", "cp8", "zero-lr-gate", "fp8-forward-backward", "int4-ep", "balanced-pp", "sparse-cache"]
 
 [file_monitor]
 filename = "rollout-metrics.jsonl"

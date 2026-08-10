@@ -11,7 +11,7 @@ ranks_filter = [0]
 project = "prod-run"
 name = "trainer-x60g"
 group = "glm52-decensor-r32"
-tags = ["glm-5.2", "pp8", "decensor", "grpo", "native-fp8-base", "lora-r32", "64x4090", "b1024", "32768", "cp8", "zero-lr-gate", "fp8-forward-backward", "int4-ep", "balanced-pp", "sparse-cache-transfer"]
+tags = ["glm-5.2", "pp8", "decensor", "grpo", "native-fp8-base", "lora-r32", "64x4090", "b1024", "32768", "cp8", "zero-lr-gate", "fp8-forward-backward", "int4-ep", "balanced-pp", "sparse-cache"]
 
 [file_monitor]
 filename = "run_x60g/trainer-metrics.jsonl"
