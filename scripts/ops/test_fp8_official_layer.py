@@ -14,6 +14,7 @@ import time
 import torch
 import torch.distributed as dist
 from torch import nn
+from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
 from torch.distributed.checkpoint.state_dict_loader import load as dcp_load
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
@@ -67,7 +68,9 @@ def main() -> None:
                 flush=True,
             )
 
+    progress("loading model configuration")
     config = GlmMoeDsaConfig.from_pretrained(args.model)
+    progress("model configuration loaded")
     config.fp8_source_checkpoint = True
     config.fp8_checkpoint = True
     config.fp8_checkpoint_linears = True
@@ -86,6 +89,9 @@ def main() -> None:
                 [GlmMoeDsaDecoderLayer(config, layer_idx=0)]
             )
 
+        def forward(self, *args, **kwargs):
+            return self.model.layers[0](*args, **kwargs)
+
     previous_dtype = torch.get_default_dtype()
     torch.set_default_dtype(torch.bfloat16)
     try:
@@ -93,20 +99,38 @@ def main() -> None:
             container = LayerContainer()
     finally:
         torch.set_default_dtype(previous_dtype)
+    progress("meta layer constructed")
     replace_linear(container)
+    progress("native FP8 linears installed")
     container.to_empty(device=torch.device("cuda", local_rank))
+    progress("layer storage allocated")
 
+    progress("reading official checkpoint metadata and tensors")
     reader = FP8CheckpointStorageReader(
         path=args.model,
         dequantize_all=False,
     )
-    dcp_load(container.state_dict(), storage_reader=reader)
+    # The test supplies one already-flat decoder-layer state dict while the
+    # storage reader exposes full-model metadata. The default flattening
+    # compatibility branch treats every unrequested checkpoint key as an old
+    # nested-state mismatch and performs minutes of unnecessary CUDA work.
+    # Production loads the full model and does not enter that branch.
+    dcp_load(
+        container.state_dict(),
+        storage_reader=reader,
+        planner=DefaultLoadPlanner(flatten_state_dict=False),
+    )
     for parameter in container.parameters():
         parameter.requires_grad_(False)
     progress("official layer-0 checkpoint tensors loaded")
 
     layer = container.model.layers[0]
-    set_reentrant_block_checkpointing(layer)
+    # Production blocks contain trainable LoRA parameters. Keep one small
+    # parameter trainable so the FSDP pre/post-backward lifecycle matches that
+    # path; an entirely frozen FSDP block does not restore the same full-
+    # parameter state across repeated input-gradient-only backwards.
+    layer.input_layernorm.weight.requires_grad_(True)
+    layer.self_attn.use_index_cache = True
     mesh = init_device_mesh("cuda", (dist.get_world_size(),))
     fully_shard(
         layer,
@@ -114,7 +138,13 @@ def main() -> None:
         mp_policy=MixedPrecisionPolicy(),
         reshard_after_forward=True,
     )
-    progress("layer sharded with reshard_after_forward")
+    fully_shard(
+        container,
+        mesh=mesh,
+        mp_policy=MixedPrecisionPolicy(param_dtype=torch.bfloat16),
+        reshard_after_forward=True,
+    )
+    progress("layer and root sharded with reshard_after_forward")
 
     rope_parameters = getattr(config, "rope_parameters", None) or {}
     rope_type = (
@@ -154,10 +184,12 @@ def main() -> None:
     )
 
     def iteration(checkpoint_enabled: bool):
-        layer.train(checkpoint_enabled)
+        container.train(checkpoint_enabled)
+        for parameter in container.parameters():
+            parameter.grad = None
         value = template.detach().clone().requires_grad_()
         torch.cuda.reset_peak_memory_stats(local_rank)
-        output, _ = layer(
+        output, indices = container(
             value,
             position_embeddings=position_embeddings,
             ks=ks,
@@ -174,14 +206,53 @@ def main() -> None:
         return (
             output.detach(),
             value.grad.detach(),
+            indices.detach(),
             torch.cuda.max_memory_allocated(local_rank),
         )
 
-    eager_output, eager_gradient, eager_peak = iteration(False)
-    progress("eager official-layer forward and backward passed")
-    checkpoint_output, checkpoint_gradient, checkpoint_peak = iteration(True)
+    # Keep the module in training mode for both paths. Eval mode is useful to
+    # bypass an already installed checkpoint wrapper, but it is not a valid
+    # numerical baseline for a production training forward.
+    layer.train(True)
+    (
+        first_eager_output,
+        first_eager_gradient,
+        first_eager_indices,
+        first_eager_peak,
+    ) = iteration(True)
+    progress("first eager official-layer forward and backward passed")
+    (
+        eager_output,
+        eager_gradient,
+        eager_indices,
+        eager_peak,
+    ) = iteration(True)
+    progress("second eager official-layer forward and backward passed")
+    torch.testing.assert_close(eager_indices, first_eager_indices, rtol=0, atol=0)
+    torch.testing.assert_close(eager_output, first_eager_output, rtol=0, atol=0)
+    torch.testing.assert_close(
+        eager_gradient,
+        first_eager_gradient,
+        rtol=1e-4,
+        atol=1e-8,
+    )
+    del (
+        first_eager_output,
+        first_eager_gradient,
+        first_eager_indices,
+    )
+    eager_peak = max(eager_peak, first_eager_peak)
+    progress("repeated grad-enabled eager execution is deterministic")
+    set_reentrant_block_checkpointing(layer)
+    (
+        checkpoint_output,
+        checkpoint_gradient,
+        checkpoint_indices,
+        checkpoint_peak,
+    ) = iteration(True)
     progress("reentrant official-layer forward and backward passed")
 
+    torch.testing.assert_close(checkpoint_indices, eager_indices, rtol=0, atol=0)
     torch.testing.assert_close(checkpoint_output, eager_output, rtol=0, atol=0)
     gradient_diff = checkpoint_gradient.float() - eager_gradient.float()
     gradient_rel_rmse = float(

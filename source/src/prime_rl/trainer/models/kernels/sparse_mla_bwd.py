@@ -91,6 +91,12 @@ def postprocess(
     pass_configs={
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        # TileLang's vectorize planner produces a non-scalar BroadcastNode for
+        # the SM89 scalar-atomic dKV store at a 4,096-token CP shard. The
+        # production Ada path already selects vectorized_atomic=False, so TIR
+        # vectorization is not part of its kernel contract. Disable the later
+        # vectorization pass instead of rejecting the required 32K context.
+        tilelang.PassConfigKey.TIR_DISABLE_VECTORIZE: True,
         # Avoid TileLang MLA backward NaNs: https://github.com/tile-ai/tilelang/issues/2199
         tilelang.PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: False,
     },
