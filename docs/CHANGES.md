@@ -111,6 +111,23 @@ The trainer time and rollout time are separate. The low throughput is a
 measured cost of the safe native linear backward and the reduced activation
 checkpoint set.
 
+# SPARSE-CACHE PIPELINE BACKWARD MEMORY
+
+Gate x60h used exact FP16 bit transport for the sparse-MLA index cache across
+balanced pipeline boundaries. PyTorch PipelineStage treated this discrete
+cache as a differentiable output. During schedule setup it allocated one
+16 MiB cache-gradient receive buffer for each microbatch. With 95
+microbatches, this used approximately 1.5 GiB on each sending stage. x60h then
+failed before its first forward while it tried to allocate another 512 MiB.
+
+`SparseCachePipelineStage` now sends the cache only in the forward direction.
+Only the hidden-state output has a backward receive buffer. Cache inputs do
+not require gradients, and stages do not send cache gradients. The cache bits
+and the hidden-state gradient are unchanged. The two-rank 1F1B transport test
+checks the exact boundary values 0, 1, 2047, 2048, 32639, 32640, 32767, and
+32768. It also checks that the cache has no backward buffer. Four
+microbatches completed with finite gradients on both ranks.
+
 x56p is the first nonzero-learning-rate production run on this validated path.
 It started from a new LoRA policy with learning rate 8e-6. Production step 1
 completed with grad norm 0.017861, masked mismatch KL 0.347687, unmasked

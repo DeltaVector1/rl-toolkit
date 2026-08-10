@@ -5,7 +5,8 @@ import os
 import torch
 import torch.distributed as dist
 from torch import nn
-from torch.distributed.pipelining import PipelineStage, Schedule1F1B
+
+from prime_rl.trainer.distributed.pp_runner import build_schedule
 
 
 class FirstStage(nn.Module):
@@ -20,7 +21,7 @@ class FirstStage(nn.Module):
             device=value.device,
             dtype=torch.int32,
         ).view_as(value)
-        transport = indices.to(torch.int16).view(torch.float16).requires_grad_()
+        transport = indices.to(torch.int16).view(torch.float16)
         return hidden, transport
 
 
@@ -38,10 +39,6 @@ class LastStage(nn.Module):
         decoded = cache.view(torch.int16).to(torch.int32).bitwise_and_(0xFFFF)
         if not torch.equal(decoded, expected):
             raise RuntimeError("pipeline sparse-index cache changed in transport")
-        # PipelineStage requires every input to participate in backward. The
-        # sparse indices are discrete, so use a zero-valued dependency only.
-        anchor = torch.nan_to_num(cache.reshape(-1)[0].float()) * 0
-        hidden = hidden + anchor.to(hidden.dtype)
         return hidden.sum() * self.scale
 
 
@@ -54,20 +51,18 @@ def main() -> None:
     example = torch.empty(1, 8, device="cuda")
     cache_example = torch.empty(1, 8, device="cuda", dtype=torch.float16)
     module = FirstStage() if rank == 0 else LastStage()
-    stage = PipelineStage(
+    module.transfer_sparse_indices = True
+    schedule = build_schedule(
         module,
-        stage_index=rank,
-        num_stages=2,
-        device=torch.device("cuda"),
-        group=dist.group.WORLD,
-        input_args=example if rank == 0 else (example, cache_example),
-        output_args=(example, cache_example) if rank == 0 else torch.empty((), device="cuda"),
-    )
-    schedule = Schedule1F1B(
-        stage,
+        pp_rank=rank,
+        pp_size=2,
         n_microbatches=4,
-        loss_fn=lambda output, _target: output,
-        scale_grads=False,
+        pp_group=dist.group.WORLD,
+        schedule_name="1f1b",
+        example_input=example if rank == 0 else (example, cache_example),
+        example_output=(example, cache_example)
+        if rank == 0
+        else torch.empty((), device="cuda"),
     )
 
     if rank == 0:
@@ -77,6 +72,17 @@ def main() -> None:
         print("rank1_schedule_start", flush=True)
         schedule.step(target=torch.zeros(4, device="cuda"), return_outputs=False)
     print(f"rank{rank}_schedule_done", flush=True)
+
+    stage = schedule._stage
+    if rank == 0:
+        if any(len(recv_infos) != 1 for recv_infos in stage.grad_recv_info.values()):
+            raise RuntimeError("the discrete cache allocated a backward receive buffer")
+    else:
+        if any(
+            recv_infos[1].buffer.requires_grad
+            for recv_infos in stage.args_recv_info.values()
+        ):
+            raise RuntimeError("the discrete cache receive buffer requires a gradient")
 
     if module.scale.grad is None or not bool(torch.isfinite(module.scale.grad)):
         raise RuntimeError(f"rank {rank} did not receive a finite parameter gradient")

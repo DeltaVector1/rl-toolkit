@@ -95,13 +95,13 @@ class PipelineStageModule(nn.Module):
         sparse_indices_cache: torch.Tensor | None = None,
     ):
         if sparse_indices_cache is not None:
-            # PipelineStage forces received tensors to require gradients.
             # Send the unsigned 16-bit index bits through an FP16 tensor. NCCL
             # preserves these bits, including patterns which encode FP16 NaN.
-            # Add a sanitized zero-valued dependency for pipeline backward,
-            # then recover the discrete INT32 cache used by sparse MLA.
-            anchor = torch.nan_to_num(sparse_indices_cache.reshape(-1)[0].float()) * 0
-            x = x + anchor.to(x.dtype)
+            # SparseCachePipelineStage keeps this discrete input out of the
+            # backward graph. A production micro-batch carries 16 MiB of index
+            # bits; allocating its unused gradient for every pipeline slot
+            # costs 1.5 GiB at 95 micro-batches and can OOM during schedule
+            # setup before the first forward.
             sparse_indices_cache = (
                 sparse_indices_cache.view(torch.int16)
                 .to(torch.int32)
@@ -150,12 +150,65 @@ class PipelineStageModule(nn.Module):
             raise RuntimeError(
                 "pipeline sparse-index transfer was enabled, but the stage did not produce a cache"
             )
-        cache_transport = (
-            out.past_key_values.to(torch.int16)
-            .view(torch.float16)
-            .requires_grad_()
-        )
+        cache_transport = out.past_key_values.to(torch.int16).view(torch.float16)
         return out.last_hidden_state, cache_transport
+
+
+def _sparse_cache_pipeline_stage_cls():
+    """Return a PipelineStage which sends no gradient for its cache output.
+
+    PyTorch 2.8 assumes every inter-stage tensor participates in backward. The
+    sparse-index cache is integer control data carried in FP16 only because the
+    pipeline transport accepts floating tensors. Override the four small parts
+    of that assumption instead of retaining one full-size zero gradient per
+    micro-batch.
+    """
+    from torch.distributed.pipelining import PipelineStage
+    from torch.distributed.pipelining.stage import _RecvInfo, _make_tensor_from_meta
+
+    class SparseCachePipelineStage(PipelineStage):
+        def _prepare_forward_infra(self, num_microbatches, args, kwargs=None):
+            outputs = super()._prepare_forward_infra(num_microbatches, args, kwargs)
+            if not self.is_first:
+                for recv_infos in self.args_recv_info.values():
+                    if len(recv_infos) != 2:
+                        raise RuntimeError(
+                            "sparse-cache pipeline stages require hidden-state and cache inputs"
+                        )
+                    recv_infos[1].buffer.requires_grad_(False)
+            return outputs
+
+        def _create_grad_recv_info(self, act_send_info):
+            if self.is_last:
+                return ()
+            hidden_dst = act_send_info[0][0]
+            return (
+                _RecvInfo(
+                    f"recv_grad_for_{self.stage_index}_from_{hidden_dst}",
+                    hidden_dst,
+                    _make_tensor_from_meta(self.get_outputs_meta()[0], self.device),
+                ),
+            )
+
+        def _retrieve_recv_grads(self, bwd_chunk_id):
+            hidden_grad = super()._retrieve_recv_grads(bwd_chunk_id)
+            if len(hidden_grad) != 1:
+                raise RuntimeError(
+                    "sparse-cache pipeline expected one differentiable output"
+                )
+            return hidden_grad[0], None
+
+        def _create_grad_send_info(self, args_recv_info):
+            send_info = super()._create_grad_send_info(args_recv_info)
+            if not self.is_first:
+                if len(send_info) != 2:
+                    raise RuntimeError(
+                        "sparse-cache pipeline stages require hidden-state and cache inputs"
+                    )
+                send_info[1] = None
+            return send_info
+
+    return SparseCachePipelineStage
 
 
 def force_fsdp_lazy_init(model: nn.Module) -> int:
@@ -202,7 +255,12 @@ def build_schedule(
     """
     from torch.distributed.pipelining import PipelineStage, Schedule1F1B, ScheduleGPipe
 
-    stage = PipelineStage(
+    stage_cls = (
+        _sparse_cache_pipeline_stage_cls()
+        if stage_module.transfer_sparse_indices
+        else PipelineStage
+    )
+    stage = stage_cls(
         stage_module,
         stage_index=pp_rank,
         num_stages=pp_size,
@@ -220,7 +278,9 @@ def build_schedule(
         "gpipe": ScheduleGPipe,
     }
     if schedule_name not in schedules:
-        raise ValueError(f"pp_schedule must be one of {sorted(schedules)}, got {schedule_name!r}")
+        raise ValueError(
+            f"pp_schedule must be one of {sorted(schedules)}, got {schedule_name!r}"
+        )
     cls = schedules[schedule_name]
     # scale_grads=False is load-bearing. The schedule's default divides every
     # gradient by n_microbatches, which is only correct for a loss that AVERAGES
@@ -236,7 +296,9 @@ def build_schedule(
     )
 
 
-def pad_side_inputs_to_common_length(side_inputs: list[dict], cp_world_size: int = 1) -> list[dict]:
+def pad_side_inputs_to_common_length(
+    side_inputs: list[dict], cp_world_size: int = 1
+) -> list[dict]:
     """Verify every micro-batch already shares one sequence length.
 
     Padding happens in the trainer BEFORE context-parallel sharding (see
