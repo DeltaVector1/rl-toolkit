@@ -57,6 +57,7 @@ class TrainSink:
         mm_token_type_ids_mapping: dict[int, int] | None,
         batch_size: int | None,
         token_batch_size: int | None,
+        training_policy_version: int,
         pre_filters: list[RolloutFilter],
         post_filters: list[RolloutFilter],
     ) -> None:
@@ -69,6 +70,9 @@ class TrainSink:
         self.mm_token_type_ids_mapping = mm_token_type_ids_mapping
         self.batch_size = batch_size
         self.token_batch_size = token_batch_size
+        # Batch ``step`` trains policy v{step-1}. This value advances only
+        # after that batch is shipped.
+        self.training_policy_version = training_policy_version
         self.pre_filters = pre_filters
         self.post_filters = post_filters
 
@@ -93,6 +97,54 @@ class TrainSink:
         self.pre_filter_seen = 0
         self.pre_filter_dropped = 0
         self.pre_filter_dropped_by_name: dict[str, int] = {}
+
+    def _is_stale(self, rollout: Rollout) -> bool:
+        sampler = self.train_envs.get(rollout.env_name).sampler
+        return (
+            sampler.samples_from_live_policy
+            and self.training_policy_version - rollout.policy_version > self.config.max_off_policy_steps
+        )
+
+    @staticmethod
+    def _mark_off_policy(rollouts: list[Rollout]) -> None:
+        for rollout in rollouts:
+            rollout.samples = []
+            rollout.is_filtered = True
+            rollout.filter_results = {"max_off_policy_steps": True}
+
+    def _drop_stale_pending(self) -> int:
+        """Remove complete stale groups already queued for a later batch.
+
+        The group is the GRPO baseline unit, so if any member is stale the
+        whole group is removed. The normal rollout-budget update replaces the
+        removed rollouts before the next trainer batch can become ready.
+        """
+        stale_group_ids = {r.group_id for r in self.pending_batch if self._is_stale(r)}
+        if not stale_group_ids:
+            return 0
+        stale = [r for r in self.pending_batch if r.group_id in stale_group_ids]
+        self.pending_batch = [r for r in self.pending_batch if r.group_id not in stale_group_ids]
+        self._mark_off_policy(stale)
+        if self.token_batch_size is not None:
+            self.pending_tokens = sum(payload_tokens(r) for r in self.pending_batch)
+        get_logger().warning(
+            f"Dropped {len(stale)} completed rollout(s) from {len(stale_group_ids)} group(s) "
+            f"past max_off_policy_steps={self.config.max_off_policy_steps}; replenishing the batch"
+        )
+        return len(stale)
+
+    def advance_training_policy_version(self, version: int) -> int:
+        """Advance the policy that the next trainer batch will update.
+
+        This also rejects completed overflow left in ``pending_batch``. Partial
+        groups are checked when they finish, before they can enter the batch.
+        """
+        if version < self.training_policy_version:
+            raise ValueError(
+                f"training policy version moved backwards: {self.training_policy_version} -> {version}"
+            )
+        self.training_policy_version = version
+        return self._drop_stale_pending()
 
     def group_size_for(self, env_name: str) -> int:
         return self.train_envs.get(env_name).config.group_size
@@ -185,6 +237,14 @@ class TrainSink:
             self.pending_rollouts.append(r)
         env_name = group[0].env_name
         task_idx = group[0].task.data.idx
+        if any(self._is_stale(r) for r in group):
+            self._mark_off_policy(group)
+            get_logger().warning(
+                f"Finished group | env={env_name} task_idx={task_idx} | "
+                f"dropped {len(group)} rollout(s) past max_off_policy_steps="
+                f"{self.config.max_off_policy_steps}; replenishing the batch"
+            )
+            return
         survivors = [r for r in group if not r.has_error]
         num_errored = len(group) - len(survivors)
         rejected_fillers: list[Rollout] = []
@@ -305,12 +365,22 @@ class TrainSink:
             f"reward={avg_reward:.4f} | filters: {filter_str}"
         )
 
-    def process_batch(self) -> TrainBatch:
+    def process_batch(self) -> TrainBatch | None:
         """Pop a cohort off ``pending_batch`` (by rollout count when
         ``batch_size`` is set, by token count when ``token_batch_size`` is
         set), apply post-batch filter annotations, and assemble the
         trainer-bound ``TrainingSample`` list. Overflow stays for the next
         batch."""
+        # Delivery invariant: even completed overflow that crossed a batch
+        # boundary cannot become trainer samples.
+        self._drop_stale_pending()
+        ready = (
+            len(self.pending_batch) >= self.batch_size
+            if self.batch_size is not None
+            else self.pending_tokens >= (self.token_batch_size or 0)
+        )
+        if not ready:
+            return None
         if self.batch_size is not None:
             cohort = self.pending_batch[: self.batch_size]
             self.pending_batch = self.pending_batch[self.batch_size :]

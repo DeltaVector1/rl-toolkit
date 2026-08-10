@@ -25,6 +25,20 @@ if you want to apply the changes one at a time:
 git am patches/series/*.patch
 ```
 
+# HARD OFF-POLICY REJECTION
+
+The dispatch gate limits new work, but completed groups can remain buffered
+across a trainer-batch boundary. x56p rollout batch 9 therefore contained 128
+policy-v3 rollouts at staleness 5 although `max_off_policy_steps = 4`.
+`TrainSink` now rejects and replenishes complete stale groups before they can
+become trainer samples, including buffered overflow. The limit is inclusive:
+staleness equal to the configured value is accepted, and a zero limit accepts
+only the current training policy. Three regressions cover the x56p overflow,
+completed stale groups, and the zero-limit case.
+
+This change is committed for later deployments. It is not active in the
+already-running x56p containers.
+
 # DECENSOR LAST-TURN JUDGING
 
 Remote Decensor judges grade only the final assistant turn. The earlier

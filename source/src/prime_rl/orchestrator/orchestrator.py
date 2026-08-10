@@ -446,6 +446,7 @@ class Orchestrator:
             mm_token_type_ids_mapping=self.mm_token_type_ids_mapping,
             batch_size=config.batch_size,
             token_batch_size=config.token_batch_size,
+            training_policy_version=self.progress.step - 1,
             pre_filters=pre_filters,
             post_filters=post_filters,
         )
@@ -685,6 +686,7 @@ class Orchestrator:
 
         await self.sender.send(TrainingBatch(examples=batch.samples, step=step))
         self.progress.step += 1
+        self.train_sink.advance_training_policy_version(self.progress.step - 1)
         self.update_dispatch_gate()
         # Checkpoint the step we just shipped (resume point: continue at step + 1).
         save_ckpt_time = await self.maybe_save_ckpt(step)
