@@ -6,6 +6,10 @@ table.
 
 Language: ASD-STE100 Simplified Technical English.
 
+Read `TRAINING_EXPECTATIONS.md` before each trainer gate or production run.
+Treat its configuration, performance, precision, and final 50-step stability
+requirements as acceptance gates.
+
 # What the system is
 
 The system trains from the GLM-5.2-FP8 checkpoint, a 745 billion parameter
