@@ -133,6 +133,14 @@ the exact boundary values 0, 1, 2047, 2048, 32639, 32640, 32767, and 32768.
 It also checks that the cache has no backward buffer. Four microbatches
 completed with finite gradients on both ranks.
 
+The custom pipeline stage also uses an event-protected receive ring for this
+forward-only cache. It does not allocate one cache receive buffer for each
+microbatch, and it removes sent and received cache tensors from the saved
+forward state after the P2P operations own them. The ring has at most one slot
+for each pipeline stage. This keeps cache transport memory bounded when the
+batch-2,048 gate has approximately twice as many microbatches. The two-rank
+test checks that four microbatches use no more than two cache buffers.
+
 x56p is the first nonzero-learning-rate production run on this validated path.
 It started from a new LoRA policy with learning rate 8e-6. Production step 1
 completed with grad norm 0.017861, masked mismatch KL 0.347687, unmasked

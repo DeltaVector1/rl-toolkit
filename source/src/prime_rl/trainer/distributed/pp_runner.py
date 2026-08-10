@@ -183,13 +183,63 @@ def _sparse_cache_pipeline_stage_cls():
         def _prepare_forward_infra(self, num_microbatches, args, kwargs=None):
             outputs = super()._prepare_forward_infra(num_microbatches, args, kwargs)
             if not self.is_first:
-                for recv_infos in self.args_recv_info.values():
+                # The cache is consumed during forward and is not needed by
+                # backward. Reuse a small receive ring instead of retaining a
+                # 16 MiB buffer for every micro-batch. Record one CUDA event for
+                # each slot so NCCL cannot overwrite it before the previous
+                # default-stream forward has finished reading it.
+                slot_count = min(num_microbatches, self.num_stages)
+                slots = []
+                for chunk_id in range(slot_count):
+                    recv_infos = self.args_recv_info[chunk_id]
                     if len(recv_infos) != 2:
                         raise RuntimeError(
                             "sparse-cache pipeline stages require hidden-state and cache inputs"
                         )
                     recv_infos[1].buffer.requires_grad_(False)
+                    slots.append(recv_infos[1].buffer)
+                for chunk_id, recv_infos in self.args_recv_info.items():
+                    recv_infos[1].buffer = slots[chunk_id % slot_count]
+                self._sparse_cache_events = [None] * slot_count
             return outputs
+
+        def get_fwd_recv_ops(self, fwd_chunk_id):
+            if not self.is_first:
+                slot = fwd_chunk_id % len(self._sparse_cache_events)
+                event = self._sparse_cache_events[slot]
+                if event is not None:
+                    event.synchronize()
+            return super().get_fwd_recv_ops(fwd_chunk_id)
+
+        def forward_one_chunk(
+            self, fwd_chunk_id, args, kwargs=None, save_forward_output=True
+        ):
+            output = super().forward_one_chunk(
+                fwd_chunk_id,
+                args,
+                kwargs,
+                save_forward_output=save_forward_output,
+            )
+            if not self.is_first:
+                slot = fwd_chunk_id % len(self._sparse_cache_events)
+                event = torch.cuda.Event()
+                event.record(torch.cuda.current_stream())
+                self._sparse_cache_events[slot] = event
+            return output
+
+        def get_fwd_send_ops(self, fwd_chunk_id):
+            ops = super().get_fwd_send_ops(fwd_chunk_id)
+            stage_output, input_values = self.fwd_cache[fwd_chunk_id]
+            if not self.is_last:
+                # P2POp keeps the real cache tensor alive through the send.
+                # Backward ignores this discrete output, so do not retain it
+                # in the forward cache for the rest of the schedule.
+                stage_output = (stage_output[0], None)
+            if not self.is_first:
+                input_values = list(input_values)
+                input_values[1] = None
+            self.fwd_cache[fwd_chunk_id] = (stage_output, input_values)
+            return ops
 
         def _create_grad_recv_info(self, act_send_info):
             if self.is_last:

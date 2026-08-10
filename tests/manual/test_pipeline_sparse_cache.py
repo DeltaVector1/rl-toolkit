@@ -83,6 +83,12 @@ def main() -> None:
             for recv_infos in stage.args_recv_info.values()
         ):
             raise RuntimeError("the discrete cache receive buffer requires a gradient")
+        cache_buffers = {
+            recv_infos[1].buffer.data_ptr()
+            for recv_infos in stage.args_recv_info.values()
+        }
+        if len(cache_buffers) > 2:
+            raise RuntimeError("the discrete cache allocated one buffer per microbatch")
 
     if module.scale.grad is None or not bool(torch.isfinite(module.scale.grad)):
         raise RuntimeError(f"rank {rank} did not receive a finite parameter gradient")
