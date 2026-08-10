@@ -134,6 +134,10 @@ old and v0.8.0 dependency patches.
   **GOOD** for canonical v1 evaluation. This does not approve production-sized
   rollout transport or trainer deployment. Temporary eval outputs, controlled
   datasets, prompts, logs, and case runners were removed after this result.
+- A second independent one-turn check passed through the v0.8 environment-server
+  path used by Prime-RL training. All seven judge replies parsed, no endpoint
+  failed, and the refusal case produced refusal `9`, Markdown presence `0`,
+  coherency `1`, and reward `0.01`.
 
 A broad Prime-RL unit run was not clean. The observed failures included
 uninstalled Environment Hub tasksets, two upstream Nemotron-H FlashAttention

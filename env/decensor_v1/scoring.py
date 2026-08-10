@@ -30,7 +30,7 @@ fail-open and does not gate.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from decensor_v1.text import (
