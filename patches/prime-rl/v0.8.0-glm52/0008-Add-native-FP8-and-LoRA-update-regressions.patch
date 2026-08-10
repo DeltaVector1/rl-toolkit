@@ -1,0 +1,1413 @@
+From 941afde6f06a6669478921dadb01fae821b4d69d Mon Sep 17 00:00:00 2001
+From: DeltaVector1 <DeltaVector1@users.noreply.github.com>
+Date: Mon, 10 Aug 2026 02:44:16 +0000
+Subject: [PATCH 8/8] Add native FP8 and LoRA update regressions
+
+---
+ scripts/fp8_parity.py                       | 405 ++++++++++++++++++
+ tests/manual/test_fp8_ada_kernel_parity.py  |  42 ++
+ tests/unit/test_lora_admin_timeout.py       |  44 ++
+ tests/unit/train/test_fp8_ada_autograd.py   | 447 ++++++++++++++++++++
+ tests/unit/train/test_fp8_checkpoint.py     | 240 +++++++++++
+ tests/unit/train/test_fp8_parity_harness.py | 150 +++++++
+ tests/unit/utils/test_client.py             |  10 +-
+ 7 files changed, 1336 insertions(+), 2 deletions(-)
+ create mode 100644 scripts/fp8_parity.py
+ create mode 100644 tests/manual/test_fp8_ada_kernel_parity.py
+ create mode 100644 tests/unit/test_lora_admin_timeout.py
+ create mode 100644 tests/unit/train/test_fp8_ada_autograd.py
+ create mode 100644 tests/unit/train/test_fp8_checkpoint.py
+ create mode 100644 tests/unit/train/test_fp8_parity_harness.py
+
+diff --git a/scripts/fp8_parity.py b/scripts/fp8_parity.py
+new file mode 100644
+index 00000000..06487ffd
+--- /dev/null
++++ b/scripts/fp8_parity.py
+@@ -0,0 +1,405 @@
++#!/usr/bin/env python3
++"""Write and compare portable GLM-5.2 FP8 parity traces.
++
++The GPU-side probes only need to call :class:`TraceWriter`.  The comparison
++path intentionally depends on NumPy only, so traces from different PyTorch and
++CUDA builds can be compared on the orchestrator.
++"""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import math
++import re
++import struct
++import sys
++from dataclasses import asdict, dataclass
++from pathlib import Path
++from typing import Any, Iterable
++
++import numpy as np
++
++
++SCHEMA_VERSION = 1
++_SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]+")
++
++
++def _json_bytes(value: Any) -> bytes:
++    return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
++
++
++def sha256_file(path: Path, offset: int = 0, length: int | None = None) -> str:
++    digest = hashlib.sha256()
++    with path.open("rb") as stream:
++        stream.seek(offset)
++        left = length
++        while left is None or left:
++            chunk = stream.read(8 * 1024 * 1024 if left is None else min(left, 8 * 1024 * 1024))
++            if not chunk:
++                break
++            digest.update(chunk)
++            if left is not None:
++                left -= len(chunk)
++    if left not in (None, 0):
++        raise EOFError(f"short tensor payload in {path}: {left} bytes missing")
++    return digest.hexdigest()
++
++
++def make_fixture(path: Path, *, length: int, vocab_size: int, seed: int) -> dict[str, Any]:
++    """Make token ids without using a tokenizer or a backend RNG."""
++    if length < 1:
++        raise ValueError("length must be positive")
++    if vocab_size < 1024:
++        raise ValueError("vocab_size must be at least 1024")
++    # A fixed integer LCG is identical in every Python/NumPy/PyTorch build.
++    state = seed & 0xFFFFFFFF
++    tokens = np.empty(length, dtype=np.int64)
++    for index in range(length):
++        state = (1664525 * state + 1013904223) & 0xFFFFFFFF
++        tokens[index] = 256 + state % (vocab_size - 256)
++    positions = np.arange(length, dtype=np.int64)
++    path.mkdir(parents=True, exist_ok=False)
++    np.save(path / "input_ids.npy", tokens, allow_pickle=False)
++    np.save(path / "positions.npy", positions, allow_pickle=False)
++    manifest = {
++        "schema_version": SCHEMA_VERSION,
++        "kind": "glm52_fp8_fixture",
++        "length": length,
++        "vocab_size": vocab_size,
++        "seed": seed,
++        "input_ids_sha256": sha256_file(path / "input_ids.npy"),
++        "positions_sha256": sha256_file(path / "positions.npy"),
++    }
++    (path / "manifest.json").write_bytes(_json_bytes(manifest))
++    return manifest
++
++
++def fixture_digest(path: Path) -> str:
++    manifest = json.loads((path / "manifest.json").read_text())
++    for name in ("input_ids", "positions"):
++        actual = sha256_file(path / f"{name}.npy")
++        if actual != manifest[f"{name}_sha256"]:
++            raise ValueError(f"fixture {name} checksum mismatch")
++    return hashlib.sha256(_json_bytes(manifest)).hexdigest()
++
++
++def _as_numpy(tensor: Any) -> np.ndarray:
++    """Convert Torch, NumPy, or Python values to a portable trace dtype."""
++    if isinstance(tensor, (tuple, list)) and len(tensor) == 1:
++        tensor = tensor[0]
++    if hasattr(tensor, "detach"):
++        tensor = tensor.detach()
++    if hasattr(tensor, "to_local"):
++        tensor = tensor.to_local()
++    if hasattr(tensor, "cpu"):
++        # NumPy does not support BF16 or Float8.  Activations are compared in
++        # FP32.  Weight bytes belong in the checkpoint audit, not this path.
++        text_dtype = str(getattr(tensor, "dtype", ""))
++        if "float8" in text_dtype or "bfloat16" in text_dtype:
++            tensor = tensor.float()
++        tensor = tensor.cpu()
++    if hasattr(tensor, "numpy"):
++        tensor = tensor.numpy()
++    array = np.asarray(tensor)
++    if array.dtype.kind == "f":
++        return np.ascontiguousarray(array, dtype=np.float32)
++    if array.dtype.kind in "iu":
++        return np.ascontiguousarray(array, dtype=np.int64)
++    if array.dtype.kind == "b":
++        return np.ascontiguousarray(array, dtype=np.uint8)
++    raise TypeError(f"unsupported trace dtype: {array.dtype}")
++
++
++class TraceWriter:
++    """Write named tensors and a manifest atomically enough for offline probes."""
++
++    def __init__(
++        self,
++        path: str | Path,
++        *,
++        side: str,
++        fixture_sha256: str,
++        model_revision: str,
++        run: dict[str, Any] | None = None,
++    ):
++        if side not in {"ada", "h200"}:
++            raise ValueError("side must be 'ada' or 'h200'")
++        self.path = Path(path)
++        self.path.mkdir(parents=True, exist_ok=False)
++        self.manifest: dict[str, Any] = {
++            "schema_version": SCHEMA_VERSION,
++            "kind": "glm52_fp8_trace",
++            "side": side,
++            "fixture_sha256": fixture_sha256,
++            "model_revision": model_revision,
++            "run": run or {},
++            "tensors": [],
++        }
++        self._names: set[str] = set()
++
++    def record(
++        self,
++        name: str,
++        tensor: Any,
++        *,
++        rows: Iterable[int] | None = None,
++        row_axis: int = 0,
++        semantic: str = "activation",
++    ) -> None:
++        if name in self._names:
++            raise ValueError(f"duplicate trace tensor: {name}")
++        array = _as_numpy(tensor)
++        source_shape = list(array.shape)
++        selected_rows = None
++        if rows is not None:
++            selected_rows = [int(row) for row in rows]
++            if not selected_rows:
++                raise ValueError("rows cannot be empty")
++            array = np.take(array, selected_rows, axis=row_axis)
++        filename = f"{len(self._names):04d}-{_SAFE_NAME.sub('_', name)}.npy"
++        np.save(self.path / filename, array, allow_pickle=False)
++        self.manifest["tensors"].append(
++            {
++                "name": name,
++                "file": filename,
++                "dtype": str(array.dtype),
++                "shape": list(array.shape),
++                "source_shape": source_shape,
++                "rows": selected_rows,
++                "row_axis": row_axis,
++                "semantic": semantic,
++                "sha256": sha256_file(self.path / filename),
++            }
++        )
++        self._names.add(name)
++
++    def close(self) -> None:
++        temporary = self.path / "manifest.json.tmp"
++        temporary.write_bytes(_json_bytes(self.manifest))
++        temporary.replace(self.path / "manifest.json")
++
++    def __enter__(self) -> "TraceWriter":
++        return self
++
++    def __exit__(self, exc_type, exc, traceback) -> None:
++        if exc_type is None:
++            self.close()
++
++
++@dataclass
++class TensorComparison:
++    name: str
++    semantic: str
++    shape: list[int]
++    exact_fraction: float | None
++    cosine: float | None
++    rmse: float | None
++    relative_rmse: float | None
++    max_abs: float | None
++    finite: bool
++
++
++def _load_trace(path: Path) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
++    manifest = json.loads((path / "manifest.json").read_text())
++    if manifest.get("schema_version") != SCHEMA_VERSION:
++        raise ValueError(f"unsupported trace schema in {path}")
++    entries = {entry["name"]: entry for entry in manifest["tensors"]}
++    if len(entries) != len(manifest["tensors"]):
++        raise ValueError(f"duplicate tensor names in {path}")
++    for entry in entries.values():
++        if sha256_file(path / entry["file"]) != entry["sha256"]:
++            raise ValueError(f"trace checksum mismatch: {entry['name']}")
++    return manifest, entries
++
++
++def compare_traces(reference_path: Path, candidate_path: Path) -> list[TensorComparison]:
++    reference_manifest, reference = _load_trace(reference_path)
++    candidate_manifest, candidate = _load_trace(candidate_path)
++    for field in ("fixture_sha256", "model_revision"):
++        if reference_manifest[field] != candidate_manifest[field]:
++            raise ValueError(f"trace {field} mismatch")
++    missing = sorted(reference.keys() - candidate.keys())
++    extra = sorted(candidate.keys() - reference.keys())
++    if missing or extra:
++        raise ValueError(f"trace tensor set mismatch; missing={missing}, extra={extra}")
++
++    results: list[TensorComparison] = []
++    for name in reference:
++        ref_entry, got_entry = reference[name], candidate[name]
++        if ref_entry["source_shape"] != got_entry["source_shape"]:
++            raise ValueError(f"source shape mismatch for {name}")
++        if ref_entry["rows"] != got_entry["rows"] or ref_entry["row_axis"] != got_entry["row_axis"]:
++            raise ValueError(f"sampling mismatch for {name}")
++        ref = np.load(reference_path / ref_entry["file"], allow_pickle=False)
++        got = np.load(candidate_path / got_entry["file"], allow_pickle=False)
++        if ref.shape != got.shape:
++            raise ValueError(f"stored shape mismatch for {name}: {ref.shape} != {got.shape}")
++        semantic = ref_entry["semantic"]
++        if semantic in {"indices", "count", "digest"} or ref.dtype.kind in "iub":
++            exact = float(np.mean(ref == got)) if ref.size else 1.0
++            results.append(TensorComparison(name, semantic, list(ref.shape), exact, None, None, None, None, True))
++            continue
++        ref64, got64 = ref.astype(np.float64), got.astype(np.float64)
++        finite = bool(np.isfinite(ref64).all() and np.isfinite(got64).all())
++        if not finite:
++            results.append(TensorComparison(name, semantic, list(ref.shape), None, None, None, None, None, False))
++            continue
++        delta = got64 - ref64
++        rmse = float(math.sqrt(np.mean(delta * delta))) if delta.size else 0.0
++        ref_rms = float(math.sqrt(np.mean(ref64 * ref64))) if ref64.size else 0.0
++        relative_rmse = rmse / max(ref_rms, 1e-30)
++        denominator = float(np.linalg.norm(ref64.ravel()) * np.linalg.norm(got64.ravel()))
++        cosine = (
++            float(np.dot(ref64.ravel(), got64.ravel()) / denominator)
++            if denominator
++            else float(ref64.size == 0 or np.array_equal(ref64, got64))
++        )
++        max_abs = float(np.max(np.abs(delta))) if delta.size else 0.0
++        results.append(
++            TensorComparison(name, semantic, list(ref.shape), None, cosine, rmse, relative_rmse, max_abs, True)
++        )
++    return results
++
++
++def _safetensor_header(path: Path) -> tuple[int, dict[str, Any]]:
++    with path.open("rb") as stream:
++        raw = stream.read(8)
++        if len(raw) != 8:
++            raise ValueError(f"invalid safetensors file: {path}")
++        length = struct.unpack("<Q", raw)[0]
++        header = json.loads(stream.read(length))
++    return 8 + length, header
++
++
++def audit_checkpoint(model: Path, output: Path | None = None) -> dict[str, Any]:
++    """Audit every checkpoint FP8 weight/scale pair without allocating tensors."""
++    index_path = model / "model.safetensors.index.json"
++    index = json.loads(index_path.read_text())["weight_map"]
++    headers: dict[str, tuple[int, dict[str, Any]]] = {}
++    entries: dict[str, tuple[Path, int, dict[str, Any]]] = {}
++    for name, relative in index.items():
++        if relative not in headers:
++            headers[relative] = _safetensor_header(model / relative)
++        payload, header = headers[relative]
++        entries[name] = (model / relative, payload, header[name])
++
++    failures: list[str] = []
++    weights: list[dict[str, Any]] = []
++    for name, (path, payload, metadata) in sorted(entries.items()):
++        if metadata["dtype"] not in {"F8_E4M3", "F8_E4M3FN"}:
++            continue
++        scale_name = name.removesuffix(".weight") + ".weight_scale_inv"
++        if scale_name not in entries:
++            failures.append(f"{name}: missing {scale_name}")
++            continue
++        scale_path, scale_payload, scale = entries[scale_name]
++        if scale_path != path:
++            failures.append(f"{name}: weight and scale are in different shards")
++        shape = metadata["shape"]
++        expected = [math.ceil(shape[0] / 128), math.ceil(shape[1] / 128)]
++        if scale["shape"] != expected:
++            failures.append(f"{scale_name}: shape {scale['shape']} != {expected}")
++        if scale["dtype"] != "F32":
++            failures.append(f"{scale_name}: dtype {scale['dtype']} != F32")
++        start, end = metadata["data_offsets"]
++        scale_start, scale_end = scale["data_offsets"]
++        expected_weight_bytes = math.prod(shape)
++        expected_scale_bytes = 4 * math.prod(scale["shape"])
++        if end - start != expected_weight_bytes:
++            failures.append(
++                f"{name}: payload has {end - start} bytes, expected {expected_weight_bytes}"
++            )
++        if scale_end - scale_start != expected_scale_bytes:
++            failures.append(
++                f"{scale_name}: payload has {scale_end - scale_start} bytes, expected {expected_scale_bytes}"
++            )
++        weights.append(
++            {
++                "name": name,
++                "shape": shape,
++                "scale_shape": scale["shape"],
++                "native_128x128": shape[0] % 128 == 0 and shape[1] % 128 == 0,
++                "weight_sha256": sha256_file(path, payload + start, end - start),
++                "scale_sha256": sha256_file(scale_path, scale_payload + scale_start, scale_end - scale_start),
++            }
++        )
++    report = {
++        "schema_version": SCHEMA_VERSION,
++        "kind": "glm52_fp8_checkpoint_audit",
++        "model": str(model),
++        "index_sha256": sha256_file(index_path),
++        "fp8_weight_count": len(weights),
++        "failures": failures,
++        "weights": weights,
++    }
++    if output:
++        output.write_bytes(_json_bytes(report))
++    return report
++
++
++def _print_results(results: list[TensorComparison]) -> None:
++    print(f"{'name':64} {'shape':18} {'exact/cos':>12} {'rel_rmse':>12} {'max_abs':>12}")
++    for item in results:
++        score = item.exact_fraction if item.exact_fraction is not None else item.cosine
++        print(
++            f"{item.name:64.64} {str(item.shape):18.18} "
++            f"{score if score is not None else float('nan'):12.6g} "
++            f"{item.relative_rmse if item.relative_rmse is not None else float('nan'):12.6g} "
++            f"{item.max_abs if item.max_abs is not None else float('nan'):12.6g}"
++        )
++
++
++def main(argv: list[str] | None = None) -> int:
++    parser = argparse.ArgumentParser()
++    subparsers = parser.add_subparsers(dest="command", required=True)
++    fixture = subparsers.add_parser("fixture")
++    fixture.add_argument("output", type=Path)
++    fixture.add_argument("--length", type=int, default=2304)
++    fixture.add_argument("--vocab-size", type=int, required=True)
++    fixture.add_argument("--seed", type=int, default=20260808)
++    compare = subparsers.add_parser("compare")
++    compare.add_argument("reference", type=Path)
++    compare.add_argument("candidate", type=Path)
++    compare.add_argument("--max-relative-rmse", type=float)
++    compare.add_argument("--min-exact-fraction", type=float, default=1.0)
++    compare.add_argument("--json", type=Path)
++    audit = subparsers.add_parser("audit-checkpoint")
++    audit.add_argument("model", type=Path)
++    audit.add_argument("--output", type=Path)
++    args = parser.parse_args(argv)
++
++    if args.command == "fixture":
++        result = make_fixture(
++            args.output,
++            length=args.length,
++            vocab_size=args.vocab_size,
++            seed=args.seed,
++        )
++        print(json.dumps(result, indent=2))
++        return 0
++    if args.command == "audit-checkpoint":
++        report = audit_checkpoint(args.model, args.output)
++        print(json.dumps({key: value for key, value in report.items() if key != "weights"}, indent=2))
++        return int(bool(report["failures"]))
++
++    results = compare_traces(args.reference, args.candidate)
++    _print_results(results)
++    if args.json:
++        args.json.write_bytes(_json_bytes([asdict(result) for result in results]))
++    failed = any(
++        not result.finite
++        or (result.exact_fraction is not None and result.exact_fraction < args.min_exact_fraction)
++        or (
++            args.max_relative_rmse is not None
++            and result.relative_rmse is not None
++            and result.relative_rmse > args.max_relative_rmse
++        )
++        for result in results
++    )
++    return int(failed)
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tests/manual/test_fp8_ada_kernel_parity.py b/tests/manual/test_fp8_ada_kernel_parity.py
+new file mode 100644
+index 00000000..955ad84f
+--- /dev/null
++++ b/tests/manual/test_fp8_ada_kernel_parity.py
+@@ -0,0 +1,42 @@
++"""One-GPU parity probe for serialized GLM FP8 dense matrices on Ada."""
++from __future__ import annotations
++import json
++from pathlib import Path
++import torch
++import torch.nn.functional as F
++from safetensors import safe_open
++from prime_rl.trainer.models.layers.fp8_ada import _linear
++
++MODEL=Path("/model")
++NAMES=[
++ "model.layers.0.self_attn.q_a_proj.weight",
++ "model.layers.0.self_attn.o_proj.weight",
++]
++
++def dequant(w,s):
++    return (w.float().view(w.shape[0]//128,128,w.shape[1]//128,128)
++            * s.float()[:,None,:,None]).flatten(0,1).flatten(1,2)
++
++index=json.loads((MODEL/"model.safetensors.index.json").read_text())["weight_map"]
++torch.manual_seed(1234)
++for name in NAMES:
++    path=MODEL/index[name]
++    with safe_open(path,framework="pt") as f:
++        w=f.get_tensor(name)
++        s=f.get_tensor(name.removesuffix(".weight")+".weight_scale_inv")
++    ref_w=dequant(w,s).cuda().bfloat16()
++    w=w.cuda(); s=s.cuda()
++    x=(torch.randn(64,w.shape[1],device="cuda",dtype=torch.bfloat16)*0.1)
++    got=_linear(x,w,s)
++    ref=F.linear(x,ref_w)
++    diff=(got.float()-ref.float())
++    print(name,tuple(w.shape),tuple(s.shape),
++          "forward_rel_rmse",float(diff.square().mean().sqrt()/ref.float().square().mean().sqrt()),
++          "forward_cos",float(F.cosine_similarity(got.float().flatten(),ref.float().flatten(),dim=0)),
++          "got_std",float(got.float().std()),"ref_std",float(ref.float().std()))
++    g=(torch.randn(64,w.shape[0],device="cuda",dtype=torch.bfloat16)*0.1)
++    got_b=_linear(g,w.T,s.T)
++    ref_b=F.linear(g,ref_w.T)
++    diff_b=got_b.float()-ref_b.float()
++    print(name,"backward_rel_rmse",float(diff_b.square().mean().sqrt()/ref_b.float().square().mean().sqrt()),
++          "backward_cos",float(F.cosine_similarity(got_b.float().flatten(),ref_b.float().flatten(),dim=0)))
+diff --git a/tests/unit/test_lora_admin_timeout.py b/tests/unit/test_lora_admin_timeout.py
+new file mode 100644
+index 00000000..ce641a43
+--- /dev/null
++++ b/tests/unit/test_lora_admin_timeout.py
+@@ -0,0 +1,44 @@
++"""Regression for a vLLM LoRA load that applies but never returns HTTP."""
++
++from __future__ import annotations
++
++import asyncio
++import unittest
++from unittest.mock import patch
++
++from prime_rl.utils.client import load_lora_adapter
++
++
++class _Response:
++    def raise_for_status(self) -> None:
++        return None
++
++    def json(self) -> dict:
++        return {"data": [{"id": "adapter-slot1"}]}
++
++
++class _AppliedButHungClient:
++    base_url = "http://engine.test"
++
++    async def post(self, *args, **kwargs):
++        await asyncio.Event().wait()
++
++    async def get(self, *args, **kwargs):
++        return _Response()
++
++
++class LoRAAdminTimeoutTest(unittest.IsolatedAsyncioTestCase):
++    async def test_visible_adapter_completes_after_hung_load_response(self):
++        with patch("prime_rl.utils.client.LORA_LOAD_READ_TIMEOUT_S", 0.01):
++            await asyncio.wait_for(
++                load_lora_adapter(
++                    [_AppliedButHungClient()],
++                    "adapter-slot1",
++                    "http://adapter.test/step_1",
++                ),
++                timeout=1.0,
++            )
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/unit/train/test_fp8_ada_autograd.py b/tests/unit/train/test_fp8_ada_autograd.py
+new file mode 100644
+index 00000000..08a98c0b
+--- /dev/null
++++ b/tests/unit/train/test_fp8_ada_autograd.py
+@@ -0,0 +1,447 @@
++"""CPU autograd and dequantization checks for the Ada FP8 training path."""
++
++from __future__ import annotations
++
++import importlib.util
++import sys
++import types
++import unittest
++from pathlib import Path
++
++import torch
++import torch.nn.functional as F
++from torch import nn
++
++
++REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
++SOURCE_ROOT = (
++    REPOSITORY_ROOT / "source" / "src"
++    if (REPOSITORY_ROOT / "source" / "src").exists()
++    else REPOSITORY_ROOT / "src"
++)
++FP8_ADA_PATH = SOURCE_ROOT / "prime_rl/trainer/models/layers/fp8_ada.py"
++MULTI_LINEAR_PATH = SOURCE_ROOT / "prime_rl/trainer/models/layers/lora/multi_linear.py"
++
++
++def _load_module(name: str, path: Path):
++    spec = importlib.util.spec_from_file_location(name, path)
++    if spec is None or spec.loader is None:
++        raise RuntimeError(f"cannot load {path}")
++    module = importlib.util.module_from_spec(spec)
++    sys.modules[name] = module
++    spec.loader.exec_module(module)
++    return module
++
++
++def _install_fp8_import_stubs() -> None:
++    try:
++        import triton  # noqa: F401
++        import triton.language  # noqa: F401
++    except ImportError:
++        triton = types.ModuleType("triton")
++        triton_language = types.ModuleType("triton.language")
++        triton_language.bfloat16 = object()
++        triton_language.float16 = object()
++        triton_language.dtype = type
++        triton.language = triton_language
++        sys.modules.setdefault("triton", triton)
++        sys.modules.setdefault("triton.language", triton_language)
++
++    lm_head = types.ModuleType("prime_rl.trainer.models.layers.lm_head")
++
++    class PrimeLmOutput:
++        def __init__(self, logprobs, entropy):
++            self.logprobs = logprobs
++            self.entropy = entropy
++
++    def online_update(m, s, t, values):
++        new_m = torch.maximum(m, values.max(dim=-1).values)
++        old_factor = torch.exp(m - new_m)
++        values_factor = torch.exp(values - new_m.unsqueeze(-1))
++        new_s = s * old_factor + values_factor.sum(dim=-1)
++        new_t = t * old_factor + (values_factor * values).sum(dim=-1)
++        return new_m, new_s, new_t
++
++    lm_head.PrimeLmOutput = PrimeLmOutput
++    lm_head._online_logsumexp_and_weighted_update = online_update
++    sys.modules.setdefault("prime_rl.trainer.models.layers.lm_head", lm_head)
++
++    custom_ops = types.SimpleNamespace(
++        scaled_fp8_quant=lambda x, use_per_token_if_dynamic=True: (
++            x.clone(),
++            torch.ones(x.shape[0], 1, device=x.device, dtype=x.dtype),
++        )
++    )
++    vllm = types.ModuleType("vllm")
++    vllm._custom_ops = custom_ops
++    sys.modules.setdefault("vllm", vllm)
++
++    fused_moe = types.ModuleType(
++        "vllm.model_executor.layers.fused_moe.fused_moe"
++    )
++    fused_moe._prepare_expert_assignment = lambda *args, **kwargs: (None, None, None)
++    fused_moe.dispatch_fused_moe_kernel = lambda *args, **kwargs: None
++    fused_moe.get_default_config = lambda *args, **kwargs: None
++    fused_moe.moe_kernel_quantize_input = lambda *args, **kwargs: (None, None)
++    sys.modules.setdefault("vllm.model_executor", types.ModuleType("vllm.model_executor"))
++    sys.modules.setdefault(
++        "vllm.model_executor.layers", types.ModuleType("vllm.model_executor.layers")
++    )
++    sys.modules.setdefault(
++        "vllm.model_executor.layers.fused_moe",
++        types.ModuleType("vllm.model_executor.layers.fused_moe"),
++    )
++    sys.modules.setdefault(
++        "vllm.model_executor.layers.fused_moe.fused_moe", fused_moe
++    )
++
++
++def _install_lora_import_stubs() -> None:
++    base = types.ModuleType("prime_rl.trainer.models.layers.lora.base")
++
++    class MultiLoRAModule(nn.Module):
++        def __init__(self, base_layer):
++            super().__init__()
++            self.base_layer = base_layer
++
++    base.MultiLoRAModule = MultiLoRAModule
++    base.get_lora_num_tokens = lambda: torch.tensor([0])
++    base.get_multilora_scaling = lambda: torch.tensor([1.0])
++    sys.modules.setdefault("prime_rl.trainer.models.layers.lora.base", base)
++
++
++_install_fp8_import_stubs()
++_install_lora_import_stubs()
++fp8_ada = _load_module("_fp8_ada_under_test", FP8_ADA_PATH)
++multi_linear = _load_module("_multi_linear_under_test", MULTI_LINEAR_PATH)
++
++
++def _expanded_block_scale(scale: torch.Tensor, shape: tuple[int, int]):
++    return (
++        scale.repeat_interleave(128, dim=0)
++        .repeat_interleave(128, dim=1)[: shape[0], : shape[1]]
++    )
++
++
++class FP8AdaAutogradTest(unittest.TestCase):
++    def test_dequant_weight_expands_each_128_square_block(self):
++        weight = (
++            torch.arange(256 * 384, dtype=torch.int32)
++            .remainder(31)
++            .sub(15)
++            .reshape(256, 384)
++            .to(torch.float8_e4m3fn)
++        )
++        scale = torch.tensor(
++            [[0.25, 0.5, 1.0], [2.0, 4.0, 8.0]], dtype=torch.float32
++        )
++
++        got = fp8_ada._dequant_weight(weight, scale, 128, 256, torch.float32)
++        expected = weight[128:256].float() * _expanded_block_scale(
++            scale[1:2], (128, 384)
++        )
++        torch.testing.assert_close(got, expected, rtol=0, atol=0)
++
++    def test_fp8_linear_custom_backward_matches_dequantized_linear(self):
++        torch.manual_seed(1)
++        x = torch.randn(3, 256, dtype=torch.double, requires_grad=True)
++        weight = torch.randn(384, 256, dtype=torch.double)
++        scale = torch.rand(3, 2, dtype=torch.double) + 0.25
++        upstream = torch.randn(3, 384, dtype=torch.double)
++
++        original_linear = fp8_ada._linear
++
++        def dequantized_linear(value, raw_weight, block_scale):
++            expanded = _expanded_block_scale(
++                block_scale, (raw_weight.shape[0], raw_weight.shape[1])
++            )
++            return F.linear(value, raw_weight * expanded)
++
++        live_weight = weight.clone()
++        live_scale = scale.clone()
++        fp8_ada._linear = dequantized_linear
++        try:
++            got = fp8_ada._Linear.apply(
++                x, live_weight, live_scale, "model.layers.0.self_attn.o_proj"
++            )
++            # Simulate FSDP RAF releasing the explicit forward inputs. Backward
++            # must use the owned direct-context snapshots.
++            live_weight.fill_(float("nan"))
++            live_scale.fill_(float("nan"))
++            got.backward(upstream)
++        finally:
++            fp8_ada._linear = original_linear
++        got_grad = x.grad.detach().clone()
++
++        ref_x = x.detach().clone().requires_grad_()
++        dequantized_linear(ref_x, weight, scale).backward(upstream)
++        torch.testing.assert_close(got_grad, ref_x.grad, rtol=1e-12, atol=1e-12)
++
++    def test_fp8_expert_custom_backward_matches_dense_swiglu(self):
++        torch.manual_seed(2)
++        counts = torch.tensor([2, 3], dtype=torch.int32)
++        offsets = counts.cumsum(0)
++        x = torch.randn(5, 4, dtype=torch.double, requires_grad=True)
++        w1 = torch.randn(2, 6, 4, dtype=torch.double)
++        w3 = torch.randn(2, 6, 4, dtype=torch.double)
++        w2 = torch.randn(2, 4, 6, dtype=torch.double)
++        dummy_scale = torch.ones(2, 1, 1, dtype=torch.double)
++        upstream = torch.randn(5, 4, dtype=torch.double)
++
++        original_grouped_mm = fp8_ada._grouped_mm
++
++        def dense_grouped_mm(value, weight, scale, ends):
++            outputs = []
++            start = 0
++            for expert, end in enumerate(ends.tolist()):
++                outputs.append(F.linear(value[start:end], weight[expert]))
++                start = end
++            return torch.cat(outputs)
++
++        fp8_ada._grouped_mm = dense_grouped_mm
++        try:
++            got = fp8_ada._Experts.apply(
++                x, w1, dummy_scale, w2, dummy_scale, w3, dummy_scale, offsets
++            )
++            got.backward(upstream)
++        finally:
++            fp8_ada._grouped_mm = original_grouped_mm
++        got_grad = x.grad.detach().clone()
++
++        ref_x = x.detach().clone().requires_grad_()
++        pieces = []
++        start = 0
++        for expert, end in enumerate(offsets.tolist()):
++            z1 = F.linear(ref_x[start:end], w1[expert])
++            z3 = F.linear(ref_x[start:end], w3[expert])
++            pieces.append(F.linear(F.silu(z1) * z3, w2[expert]))
++            start = end
++        torch.cat(pieces).backward(upstream)
++        torch.testing.assert_close(got_grad, ref_x.grad, rtol=1e-12, atol=1e-12)
++
++    def test_logprob_and_entropy_backward_match_dense_softmax(self):
++        torch.manual_seed(3)
++        hidden = torch.randn(4, 5, dtype=torch.float32, requires_grad=True)
++        weight = torch.randn(7, 5, dtype=torch.float32)
++        scale = torch.rand(7, dtype=torch.float32) + 0.25
++        labels = torch.tensor([0, 6, 2, 4])
++        inv_temperature = torch.tensor([1.0, 0.7, 1.3, 0.9])
++        grad_logprob = torch.tensor([0.4, -0.2, 0.7, -0.5])
++        grad_entropy = torch.tensor([-0.3, 0.6, 0.2, -0.1])
++
++        original_scaled_mm = fp8_ada._scaled_mm
++
++        def dense_scaled_mm(value, raw_weight, row_scale):
++            if row_scale is not None:
++                raw_weight = raw_weight * row_scale.unsqueeze(-1)
++            return F.linear(value, raw_weight)
++
++        fp8_ada._scaled_mm = dense_scaled_mm
++        try:
++            logprob, entropy = fp8_ada._FP8LogProb.apply(
++                hidden, weight, scale, labels, inv_temperature, 2
++            )
++            torch.autograd.backward(
++                (logprob, entropy), (grad_logprob, grad_entropy)
++            )
++        finally:
++            fp8_ada._scaled_mm = original_scaled_mm
++        got_grad = hidden.grad.detach().clone()
++
++        ref_hidden = hidden.detach().clone().requires_grad_()
++        logits = F.linear(ref_hidden, weight * scale.unsqueeze(-1))
++        scaled = logits * inv_temperature.unsqueeze(-1)
++        log_probs = F.log_softmax(scaled, dim=-1)
++        probabilities = log_probs.exp()
++        ref_logprob = log_probs[torch.arange(4), labels]
++        ref_entropy = -(probabilities * log_probs).sum(dim=-1)
++        torch.autograd.backward(
++            (ref_logprob, ref_entropy), (grad_logprob, grad_entropy)
++        )
++        torch.testing.assert_close(got_grad, ref_hidden.grad, rtol=2e-6, atol=2e-6)
++
++    def test_entropy_only_backward_matches_dense_softmax(self):
++        torch.manual_seed(31)
++        hidden = torch.randn(3, 4, dtype=torch.float32, requires_grad=True)
++        weight = torch.randn(6, 4, dtype=torch.float32)
++        scale = torch.rand(6, dtype=torch.float32) + 0.25
++        labels = torch.tensor([1, 4, 0])
++        inv_temperature = torch.tensor([0.6, 1.0, 1.4])
++        upstream = torch.tensor([0.7, -0.2, 0.5])
++
++        original_scaled_mm = fp8_ada._scaled_mm
++
++        def dense_scaled_mm(value, raw_weight, row_scale):
++            if row_scale is not None:
++                raw_weight = raw_weight * row_scale.unsqueeze(-1)
++            return F.linear(value, raw_weight)
++
++        fp8_ada._scaled_mm = dense_scaled_mm
++        try:
++            _, entropy = fp8_ada._FP8LogProb.apply(
++                hidden, weight, scale, labels, inv_temperature, 2
++            )
++            entropy.backward(upstream)
++        finally:
++            fp8_ada._scaled_mm = original_scaled_mm
++        got_grad = hidden.grad.detach().clone()
++
++        ref_hidden = hidden.detach().clone().requires_grad_()
++        scaled = (
++            F.linear(ref_hidden, weight * scale.unsqueeze(-1))
++            * inv_temperature.unsqueeze(-1)
++        )
++        probabilities = F.softmax(scaled, dim=-1)
++        ref_entropy = -(probabilities * F.log_softmax(scaled, dim=-1)).sum(dim=-1)
++        ref_entropy.backward(upstream)
++        torch.testing.assert_close(got_grad, ref_hidden.grad, rtol=2e-6, atol=2e-6)
++
++    def test_checkpoint_fp8_experts_permute_ep_source_major_rows(self):
++        import torchtitan.experiments.kernels.moe.indices as index_ops
++
++        # Source-major rows after EP all-to-all:
++        # [src0/e0 x2, src0/e1 x1, src1/e0 x3, src1/e1 x0].
++        x = torch.arange(6, dtype=torch.float32).unsqueeze(1)
++        counts = torch.tensor([2, 1, 3, 0])
++        weights = tuple(torch.zeros(2, 1, 1) for _ in range(3))
++        scales = tuple(torch.ones(2, 1, 1) for _ in range(3))
++        captured = {}
++
++        def fake_generate(raw_counts, local_experts, ep_size, *_args):
++            torch.testing.assert_close(raw_counts, counts)
++            self.assertEqual((local_experts, ep_size), (2, 2))
++            return (
++                torch.tensor([0, 1, 3, 4, 5, 2]),
++                torch.tensor([5, 1]),
++                torch.tensor([0, 5, 6]),
++            )
++
++        def fake_apply(permuted_x, _w1, _s1, _w2, _s2, _w3, _s3, offsets):
++            captured["x"] = permuted_x.clone()
++            captured["offsets"] = offsets.clone()
++            return permuted_x
++
++        original_generate = index_ops.generate_permute_indices
++        original_apply = fp8_ada._Experts.apply
++        index_ops.generate_permute_indices = fake_generate
++        fp8_ada._Experts.apply = fake_apply
++        try:
++            got = fp8_ada.fp8_experts(
++                weights[0],
++                weights[1],
++                weights[2],
++                scales[0],
++                scales[1],
++                scales[2],
++                x,
++                counts,
++            )
++        finally:
++            index_ops.generate_permute_indices = original_generate
++            fp8_ada._Experts.apply = original_apply
++
++        torch.testing.assert_close(captured["x"], x[[0, 1, 3, 4, 5, 2]])
++        torch.testing.assert_close(captured["offsets"], torch.tensor([5, 6], dtype=torch.int32))
++        torch.testing.assert_close(got, x)
++
++    def test_grouped_mm_zeros_rows_after_last_expert_offset(self):
++        x = torch.randn(4, 2)
++        weight = torch.randn(2, 3, 2)
++        scale = torch.ones(2, 1, 1)
++        offsets = torch.tensor([1, 2], dtype=torch.int32)
++
++        originals = (
++            fp8_ada.moe_kernel_quantize_input,
++            fp8_ada.dispatch_fused_moe_kernel,
++        )
++
++        def fake_quantize(value, *args, **kwargs):
++            return value, torch.ones(value.shape[0], 1)
++
++        def fake_dispatch(*args, **kwargs):
++            args[2].fill_(7)
++
++        fp8_ada.moe_kernel_quantize_input = fake_quantize
++        fp8_ada.dispatch_fused_moe_kernel = fake_dispatch
++        try:
++            got = fp8_ada._grouped_mm(x, weight, scale, offsets)
++        finally:
++            (
++                fp8_ada.moe_kernel_quantize_input,
++                fp8_ada.dispatch_fused_moe_kernel,
++            ) = originals
++
++        torch.testing.assert_close(got[:2], torch.full_like(got[:2], 7))
++        torch.testing.assert_close(got[2:], torch.zeros_like(got[2:]))
++
++
++    def test_replace_linear_assigns_full_module_names(self):
++        model = nn.Module()
++        model.config = types.SimpleNamespace(
++            quantization_config={"modules_to_not_convert": []}
++        )
++        model.layers = nn.ModuleList([nn.Module(), nn.Module()])
++        model.layers[0].o_proj = nn.Linear(128, 128, bias=False)
++        model.layers[1].o_proj = nn.Linear(128, 128, bias=False)
++
++        fp8_ada.replace_linear(model)
++
++        self.assertEqual(
++            model.layers[0].o_proj._fp8_fqn, "layers.0.o_proj"
++        )
++        self.assertEqual(
++            model.layers[1].o_proj._fp8_fqn, "layers.1.o_proj"
++        )
++
++
++class MultiLinearAutogradTest(unittest.TestCase):
++    def test_single_lora_passes_double_gradcheck(self):
++        torch.manual_seed(4)
++        inputs = (
++            torch.randn(3, 4, dtype=torch.double, requires_grad=True),
++            torch.randn(2, 4, dtype=torch.double, requires_grad=True),
++            torch.randn(5, 2, dtype=torch.double, requires_grad=True),
++        )
++        self.assertTrue(
++            torch.autograd.gradcheck(
++                multi_linear._SingleLoRA.apply,
++                inputs,
++                eps=1e-6,
++                atol=1e-5,
++                rtol=1e-4,
++            )
++        )
++
++    def test_module_does_not_elementwise_clip_upstream_gradient(self):
++        torch.manual_seed(5)
++        base = nn.Linear(4, 5, bias=False, dtype=torch.double)
++        module = multi_linear.MultiLoRALinear(
++            base, rank=2, n_adapters=1, use_grouped_mm=False
++        )
++        with torch.no_grad():
++            module.lora_A[0].normal_()
++            module.lora_B[0].normal_()
++
++        ref_base = nn.Linear(4, 5, bias=False, dtype=torch.double)
++        ref_base.load_state_dict(base.state_dict())
++        ref_a = module.lora_A[0].detach().clone().requires_grad_()
++        ref_b = module.lora_B[0].detach().clone().requires_grad_()
++        x = torch.randn(3, 4, dtype=torch.double, requires_grad=True)
++        ref_x = x.detach().clone().requires_grad_()
++        upstream = torch.full((3, 5), 5.0, dtype=torch.double)
++
++        module(x).backward(upstream)
++        (ref_base(ref_x) + (ref_x @ ref_a.T) @ ref_b.T).backward(upstream)
++
++        torch.testing.assert_close(x.grad, ref_x.grad, rtol=1e-12, atol=1e-12)
++        torch.testing.assert_close(
++            module.lora_A[0].grad, ref_a.grad, rtol=1e-12, atol=1e-12
++        )
++        torch.testing.assert_close(
++            module.lora_B[0].grad, ref_b.grad, rtol=1e-12, atol=1e-12
++        )
++        self.assertGreater(float(module.lora_B[0].grad.abs().max()), 1.0)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/unit/train/test_fp8_checkpoint.py b/tests/unit/train/test_fp8_checkpoint.py
+new file mode 100644
+index 00000000..47a541a2
+--- /dev/null
++++ b/tests/unit/train/test_fp8_checkpoint.py
+@@ -0,0 +1,240 @@
++import sys
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import torch
++from torch.distributed.checkpoint._hf_utils import _HFStorageInfo
++from torch.distributed.checkpoint.hf_storage import HuggingFaceStorageReader
++from torch.distributed.checkpoint.metadata import (
++    ChunkStorageMetadata,
++    Metadata,
++    MetadataIndex,
++    TensorProperties,
++    TensorStorageMetadata,
++)
++
++
++REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
++SOURCE_ROOT = (
++    REPOSITORY_ROOT / "source" / "src"
++    if (REPOSITORY_ROOT / "source" / "src").exists()
++    else REPOSITORY_ROOT / "src"
++)
++sys.path.insert(0, str(SOURCE_ROOT))
++
++from prime_rl.trainer.fp8_checkpoint import (  # noqa: E402
++    FP8CheckpointStorageReader,
++    _FP8StorageInfo,
++)
++
++
++class _TensorSlice:
++    def __init__(self, tensor):
++        self.tensor = tensor
++
++    def __getitem__(self, slices):
++        return self.tensor[slices]
++
++
++class _CheckpointFile:
++    def __init__(self, weight, scale):
++        self.weight = weight
++        self.scale = scale
++        self.scale_reads = 0
++
++    def get_slice(self, key):
++        if not key.endswith(".weight"):
++            raise AssertionError(f"unexpected weight key: {key}")
++        return _TensorSlice(self.weight)
++
++    def get_tensor(self, key):
++        if not key.endswith(".weight_scale_inv"):
++            raise AssertionError(f"unexpected scale key: {key}")
++        self.scale_reads += 1
++        return self.scale
++
++
++class _Planner:
++    def __init__(self, target):
++        self.target = target
++        self.committed = None
++
++    def resolve_tensor(self, request):
++        return self.target
++
++    def commit_tensor(self, request, tensor):
++        self.committed = tensor
++
++
++def _request(shape, offsets=None):
++    return SimpleNamespace(
++        storage_offsets=torch.Size(offsets or (0,) * len(shape)),
++        lengths=torch.Size(shape),
++        storage_index="test tensor",
++    )
++
++
++def _process(weight, scale, target_dtype):
++    target = torch.empty(weight.shape, dtype=target_dtype)
++    planner = _Planner(target)
++    file = _CheckpointFile(weight, scale)
++    info = _FP8StorageInfo(
++        relative_path="model.safetensors",
++        shape=weight.shape,
++        dtype=weight.dtype,
++        source_key="model.layers.0.self_attn.kv_a_proj_with_mqa.weight",
++        quantized=True,
++    )
++    FP8CheckpointStorageReader._process_request(
++        file,
++        _request(weight.shape),
++        planner,
++        info,
++    )
++    if planner.committed is None:
++        raise AssertionError("the checkpoint planner did not commit the resolved tensor")
++    if planner.committed.data_ptr() != target.data_ptr():
++        raise AssertionError("the checkpoint planner committed a different tensor")
++    return planner.committed, file
++
++
++def _tensor_metadata(shape, dtype):
++    shape = torch.Size(shape)
++    return TensorStorageMetadata(
++        properties=TensorProperties(dtype=dtype),
++        size=shape,
++        chunks=[
++            ChunkStorageMetadata(
++                offsets=torch.Size((0,) * len(shape)),
++                sizes=shape,
++            )
++        ],
++    )
++
++
++def _metadata_with_quantized_pairs():
++    pairs = {
++        # Direct storage. The partial output block makes this an ordinary BF16
++        # Linear target on the native-checkpoint path.
++        "model.layers.0.self_attn.kv_a_proj_with_mqa": ((576, 6144), (5, 48)),
++        # Direct storage that can remain native FP8.
++        "model.layers.0.self_attn.q_b_proj": ((24576, 1536), (192, 12)),
++        # Renamed shared-expert storage.
++        "model.layers.0.mlp.shared_experts.gate_proj": ((3072, 6144), (24, 48)),
++        # Stacked routed-expert storage.
++        "model.layers.0.mlp.experts.0.gate_proj": ((3072, 6144), (24, 48)),
++    }
++    state_dict_metadata = {}
++    storage_data = {}
++    for prefix, (weight_shape, scale_shape) in pairs.items():
++        for suffix, shape, dtype in (
++            (".weight", weight_shape, torch.float8_e4m3fn),
++            (".weight_scale_inv", scale_shape, torch.float32),
++        ):
++            key = prefix + suffix
++            state_dict_metadata[key] = _tensor_metadata(shape, dtype)
++            storage_data[
++                MetadataIndex(key, torch.Size((0,) * len(shape)))
++            ] = _HFStorageInfo(
++                relative_path="model.safetensors",
++                shape=torch.Size(shape),
++                dtype=dtype,
++            )
++    return Metadata(
++        state_dict_metadata=state_dict_metadata,
++        storage_data=storage_data,
++    )
++
++
++class FP8CheckpointStorageReaderTest(unittest.TestCase):
++    def test_every_fp8_scale_pair_is_marked_quantized_after_metadata_rewrite(self):
++        metadata = _metadata_with_quantized_pairs()
++        reader = object.__new__(FP8CheckpointStorageReader)
++        reader.dequantize_all = False
++
++        with patch.object(
++            HuggingFaceStorageReader,
++            "read_metadata",
++            return_value=metadata,
++        ):
++            rewritten = reader.read_metadata()
++
++        weight_targets = {
++            "model.layers.0.self_attn.kv_a_proj_with_mqa.weight",
++            "model.layers.0.self_attn.q_b_proj.weight",
++            "model.layers.0.mlp.shared_expert.w1",
++            "model.layers.0.mlp.experts.w1",
++        }
++        seen = set()
++        for index, info in rewritten.storage_data.items():
++            if index.fqn not in weight_targets:
++                continue
++            seen.add(index.fqn)
++            self.assertIsInstance(info, _FP8StorageInfo)
++            self.assertTrue(info.quantized)
++
++        self.assertEqual(seen, weight_targets)
++
++    def test_fp8_scale_pair_is_kept_fp8_or_dequantized_for_target_dtype(self):
++        raw = (
++            torch.arange(128 * 128, dtype=torch.float32)
++            .remainder(15)
++            .sub(7)
++            .reshape(128, 128)
++            .to(torch.float8_e4m3fn)
++        )
++        scale = torch.tensor([[0.25]], dtype=torch.float32)
++
++        native, native_file = _process(raw, scale, torch.float8_e4m3fn)
++        self.assertTrue(torch.equal(native, raw))
++        self.assertEqual(native_file.scale_reads, 0)
++
++        dequantized, dequantized_file = _process(raw, scale, torch.bfloat16)
++        reference = (raw.float() * scale.float()).to(torch.bfloat16)
++        torch.testing.assert_close(dequantized, reference, rtol=0, atol=0)
++        self.assertEqual(dequantized_file.scale_reads, 1)
++
++    def test_dequantization_applies_fp32_scale_before_bf16_rounding(self):
++        raw = torch.ones((128, 128), dtype=torch.float8_e4m3fn)
++        # This value is not exactly representable in BF16.  Rounding it before
++        # multiplication gives a different result for a non-unit FP8 value.
++        raw.fill_(1.5)
++        scale = torch.tensor([[0.333]], dtype=torch.float32)
++
++        loaded, _ = _process(raw, scale, torch.bfloat16)
++        reference = (raw.float() * scale.float()).to(torch.bfloat16)
++        double_rounded = raw.to(torch.bfloat16) * scale.to(torch.bfloat16)
++
++        torch.testing.assert_close(loaded, reference, rtol=0, atol=0)
++        self.assertFalse(torch.equal(reference, double_rounded))
++
++    def test_native_loaded_partial_block_kv_a_matches_fp8_scale_reference(self):
++        rows, columns = 576, 6144
++        raw = (
++            torch.arange(rows * columns, dtype=torch.int32)
++            .remainder(31)
++            .sub(15)
++            .reshape(rows, columns)
++            .to(torch.float8_e4m3fn)
++        )
++        scale = (
++            torch.arange(5 * 48, dtype=torch.float32).reshape(5, 48) + 1
++        ) / 256
++
++        loaded, file = _process(raw, scale, torch.bfloat16)
++        expanded_scale = (
++            scale.repeat_interleave(128, dim=0)[:rows]
++            .repeat_interleave(128, dim=1)[:, :columns]
++        )
++        reference = (raw.float() * expanded_scale.float()).to(torch.bfloat16)
++
++        self.assertEqual(scale.shape, (5, 48))
++        self.assertEqual(expanded_scale.shape, (576, 6144))
++        torch.testing.assert_close(loaded, reference, rtol=0, atol=0)
++        self.assertEqual(file.scale_reads, 1)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/unit/train/test_fp8_parity_harness.py b/tests/unit/train/test_fp8_parity_harness.py
+new file mode 100644
+index 00000000..731347d8
+--- /dev/null
++++ b/tests/unit/train/test_fp8_parity_harness.py
+@@ -0,0 +1,150 @@
++import importlib.util
++import json
++import struct
++import sys
++import tempfile
++import unittest
++from pathlib import Path
++
++import numpy as np
++
++
++ROOT = Path(__file__).resolve().parents[3]
++SPEC = importlib.util.spec_from_file_location(
++    "fp8_parity", ROOT / "scripts" / "fp8_parity.py"
++)
++fp8_parity = importlib.util.module_from_spec(SPEC)
++assert SPEC.loader is not None
++sys.modules[SPEC.name] = fp8_parity
++SPEC.loader.exec_module(fp8_parity)
++
++
++def _write_safetensors(path, tensors):
++    offset = 0
++    header = {}
++    payload = bytearray()
++    for name, (dtype, shape, data) in tensors.items():
++        header[name] = {
++            "dtype": dtype,
++            "shape": shape,
++            "data_offsets": [offset, offset + len(data)],
++        }
++        payload.extend(data)
++        offset += len(data)
++    encoded = json.dumps(header, separators=(",", ":")).encode()
++    encoded += b" " * (-len(encoded) % 8)
++    path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + payload)
++
++
++class FP8ParityHarnessTest(unittest.TestCase):
++    def test_fixture_is_reproducible_and_checksum_protected(self):
++        with tempfile.TemporaryDirectory() as temporary:
++            first = Path(temporary) / "first"
++            second = Path(temporary) / "second"
++            fp8_parity.make_fixture(first, length=17, vocab_size=2048, seed=9)
++            fp8_parity.make_fixture(second, length=17, vocab_size=2048, seed=9)
++            self.assertEqual(
++                np.load(first / "input_ids.npy").tolist(),
++                np.load(second / "input_ids.npy").tolist(),
++            )
++            self.assertEqual(
++                fp8_parity.fixture_digest(first),
++                fp8_parity.fixture_digest(second),
++            )
++            data = bytearray((first / "input_ids.npy").read_bytes())
++            data[-1] ^= 1
++            (first / "input_ids.npy").write_bytes(data)
++            with self.assertRaisesRegex(ValueError, "checksum"):
++                fp8_parity.fixture_digest(first)
++
++    def test_trace_comparison_handles_numeric_and_index_tensors(self):
++        with tempfile.TemporaryDirectory() as temporary:
++            root = Path(temporary)
++            common = dict(fixture_sha256="fixture", model_revision="revision")
++            with fp8_parity.TraceWriter(root / "ada", side="ada", **common) as writer:
++                writer.record(
++                    "layer.02.output",
++                    np.array([[1.0, 2.0], [3.0, 4.0]], np.float32),
++                    rows=[1],
++                )
++                writer.record("layer.02.router.ids", [[1, 7]], semantic="indices")
++            with fp8_parity.TraceWriter(root / "h200", side="h200", **common) as writer:
++                writer.record(
++                    "layer.02.output",
++                    np.array([[99.0, 99.0], [3.0, 5.0]], np.float32),
++                    rows=[1],
++                )
++                writer.record("layer.02.router.ids", [[1, 8]], semantic="indices")
++
++            results = {
++                result.name: result
++                for result in fp8_parity.compare_traces(
++                    root / "ada", root / "h200"
++                )
++            }
++            self.assertAlmostEqual(
++                results["layer.02.router.ids"].exact_fraction, 0.5
++            )
++            self.assertTrue(results["layer.02.output"].finite)
++            self.assertGreater(results["layer.02.output"].relative_rmse, 0)
++            # The unsampled first row cannot affect the comparison.
++            self.assertEqual(results["layer.02.output"].shape, [1, 2])
++
++    def test_trace_rejects_incompatible_fixture(self):
++        with tempfile.TemporaryDirectory() as temporary:
++            root = Path(temporary)
++            with fp8_parity.TraceWriter(
++                root / "ada",
++                side="ada",
++                fixture_sha256="a",
++                model_revision="revision",
++            ):
++                pass
++            with fp8_parity.TraceWriter(
++                root / "h200",
++                side="h200",
++                fixture_sha256="b",
++                model_revision="revision",
++            ):
++                pass
++            with self.assertRaisesRegex(ValueError, "fixture_sha256"):
++                fp8_parity.compare_traces(root / "ada", root / "h200")
++
++    def test_checkpoint_audit_accepts_partial_final_block(self):
++        with tempfile.TemporaryDirectory() as temporary:
++            model = Path(temporary)
++            weight_name = "model.layers.0.self_attn.kv_a_proj_with_mqa.weight"
++            scale_name = (
++                "model.layers.0.self_attn.kv_a_proj_with_mqa.weight_scale_inv"
++            )
++            # The payload is small; the header shape is what the zero-allocation
++            # audit checks.  Hashing uses the declared byte offsets.
++            _write_safetensors(
++                model / "model.safetensors",
++                {
++                    weight_name: (
++                        "F8_E4M3",
++                        [576, 6144],
++                        bytes(576 * 6144),
++                    ),
++                    scale_name: ("F32", [5, 48], bytes(5 * 48 * 4)),
++                },
++            )
++            (model / "model.safetensors.index.json").write_text(
++                json.dumps(
++                    {
++                        "weight_map": {
++                            weight_name: "model.safetensors",
++                            scale_name: "model.safetensors",
++                        }
++                    }
++                )
++            )
++            report = fp8_parity.audit_checkpoint(model)
++            self.assertEqual(report["failures"], [])
++            self.assertEqual(report["fp8_weight_count"], 1)
++            self.assertFalse(report["weights"][0]["native_128x128"])
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/unit/utils/test_client.py b/tests/unit/utils/test_client.py
+index 797169f9..721a8233 100644
+--- a/tests/unit/utils/test_client.py
++++ b/tests/unit/utils/test_client.py
+@@ -6,7 +6,13 @@ import httpx
+ from verifiers.v1.configs.client import EvalClientConfig
+ 
+ from prime_rl.configs.shared import ClientConfig
+-from prime_rl.utils.client import _is_retryable_lora_error, check_health, load_lora_adapter, setup_clients
++from prime_rl.utils.client import (
++    LORA_LOAD_READ_TIMEOUT_S,
++    _is_retryable_lora_error,
++    check_health,
++    load_lora_adapter,
++    setup_clients,
++)
+ 
+ 
+ def test_is_retryable_lora_error_returns_true_for_404():
+@@ -45,7 +51,7 @@ def test_load_lora_adapter_succeeds_on_first_attempt():
+     mock_client.post.assert_called_once_with(
+         "/load_lora_adapter",
+         json={"lora_name": "test-lora", "lora_path": "/test/path"},
+-        timeout=httpx.Timeout(connect=10.0, read=30.0, write=60.0, pool=10.0),
++        timeout=httpx.Timeout(connect=10.0, read=LORA_LOAD_READ_TIMEOUT_S, write=60.0, pool=10.0),
+     )
+ 
+ 

@@ -1,0 +1,1153 @@
+From f05008fb075a435378181ce9999d9ded75f53e03 Mon Sep 17 00:00:00 2001
+From: DeltaVector1 <DeltaVector1@users.noreply.github.com>
+Date: Mon, 10 Aug 2026 02:44:16 +0000
+Subject: [PATCH 6/8] Add durable edge rollout and policy transport
+
+---
+ src/prime_rl/inference/vllm/server.py         |  43 +++---
+ .../inference/vllm/worker/filesystem.py       |  56 ++++++++
+ src/prime_rl/orchestrator/algo/grpo.py        |  22 ++-
+ src/prime_rl/orchestrator/dispatcher.py       | 123 ++++++++++++++++-
+ src/prime_rl/orchestrator/orchestrator.py     | 128 +++++++++++++++---
+ src/prime_rl/orchestrator/train_sink.py       | 127 ++++++++++++++++-
+ src/prime_rl/orchestrator/train_source.py     |   4 +-
+ src/prime_rl/orchestrator/watcher.py          |  48 ++++---
+ src/prime_rl/utils/client.py                  |  73 +++++++---
+ 9 files changed, 517 insertions(+), 107 deletions(-)
+
+diff --git a/src/prime_rl/inference/vllm/server.py b/src/prime_rl/inference/vllm/server.py
+index 0d41da62..7bc27dc3 100644
+--- a/src/prime_rl/inference/vllm/server.py
++++ b/src/prime_rl/inference/vllm/server.py
+@@ -16,6 +16,7 @@ from vllm.logger import init_logger
+ from vllm.utils.argparse_utils import FlexibleArgumentParser
+ 
+ from prime_rl.configs.inference import InferenceConfig
++from prime_rl.inference.vllm.worker.filesystem import adapter_cache_path
+ from prime_rl.utils.logger import get_logger
+ 
+ logger = get_logger()
+@@ -51,6 +52,7 @@ logger = init_logger("vllm.entrypoints.openai.api_server")
+ 
+ # Create our own router for custom endpoints
+ router = APIRouter()
++lora_load_lock = asyncio.Lock()
+ 
+ 
+ def engine_client(request: Request) -> EngineClient:
+@@ -90,32 +92,21 @@ async def update_weights(request: Request):
+ 
+ @router.post("/load_lora_adapter")
+ async def load_lora_adapter(lora_request: LoadLoRAAdapterRequest, raw_request: Request):
+-    """Wrapper around vLLM's /v1/load_lora_adapter.
+-
+-    prime-rl reloads a fixed-name adapter with fresh weights every step (the path
+-    changes per policy version; the name is constant, see orchestrator.lora_name).
+-    vLLM's native loader rejects a same-name reload unless ``load_inplace=True``,
+-    so we force it here — that makes the worker re-read the new weights during
+-    ``add_lora``, reusing the existing ``lora_int_id``.
+-
+-    We then reset the stored request's flag back to ``False``. ``load_inplace`` is
+-    a sticky field on the ``LoRARequest`` that ``_maybe_get_adapters`` hands to
+-    every generation request; left ``True`` it would force a disk reload on each
+-    scheduler step. The orchestrator awaits this endpoint before dispatching
+-    rollouts for the new version, so the reset always lands before generation.
+-    The reset runs regardless of success/error: vLLM only stores the adapter on
+-    success today, but resetting whatever is stored keeps us correct even if a
+-    future version were to leave a ``load_inplace=True`` request behind on error.
+-    """
+-    handler = models(raw_request)
+-    lora_request.load_inplace = True
+-    response = await handler.load_lora_adapter(lora_request)
+-    stored = handler.lora_requests.get(lora_request.lora_name)
+-    if stored is not None:
+-        stored.load_inplace = False
+-    if isinstance(response, ErrorResponse):
+-        return JSONResponse(content=response.model_dump(), status_code=response.error.code)
+-    return {"status": "ok"}
++    """Stage remote adapters and serialize loads so retries cannot overlap."""
++    async with lora_load_lock:
++        handler = models(raw_request)
++        if lora_request.lora_path.startswith(("http://", "https://")):
++            source_url = lora_request.lora_path
++            await engine_client(raw_request).collective_rpc("stage_lora_adapter", args=(source_url,))
++            lora_request.lora_path = adapter_cache_path(source_url).as_posix()
++        lora_request.load_inplace = True
++        response = await handler.load_lora_adapter(lora_request)
++        stored = handler.lora_requests.get(lora_request.lora_name)
++        if stored is not None:
++            stored.load_inplace = False
++        if isinstance(response, ErrorResponse):
++            return JSONResponse(content=response.model_dump(), status_code=response.error.code)
++        return {"status": "ok"}
+ 
+ 
+ @router.get("/liveness")
+diff --git a/src/prime_rl/inference/vllm/worker/filesystem.py b/src/prime_rl/inference/vllm/worker/filesystem.py
+index 1049d17b..85a47e5e 100644
+--- a/src/prime_rl/inference/vllm/worker/filesystem.py
++++ b/src/prime_rl/inference/vllm/worker/filesystem.py
+@@ -1,3 +1,10 @@
++import fcntl
++import hashlib
++import os
++import shutil
++import time
++import urllib.request
++from pathlib import Path
+ from typing import TYPE_CHECKING
+ 
+ from torch.nn import Module
+@@ -5,6 +12,40 @@ from vllm.model_executor.model_loader import DefaultModelLoader, get_model_loade
+ 
+ from prime_rl.inference.vllm.worker.weight_transfer import load_weights_checkpoint_layerwise
+ 
++
++def adapter_cache_path(source_url: str) -> Path:
++    return Path(os.environ.get("PRIME_LORA_CACHE_DIR", "/tmp/prime-rl-lora")) / hashlib.sha256(
++        source_url.encode()
++    ).hexdigest()
++
++
++def download(source_url: str, destination: Path) -> None:
++    for attempt in range(10):
++        try:
++            with urllib.request.urlopen(urllib.request.Request(source_url, method="HEAD"), timeout=60) as response:
++                total = int(response.headers["Content-Length"])
++            offset = destination.stat().st_size if destination.exists() else 0
++            if offset == total:
++                return
++            if offset > total:
++                destination.unlink()
++                offset = 0
++            request = urllib.request.Request(source_url, headers={"Range": f"bytes={offset}-"} if offset else {})
++            with urllib.request.urlopen(request, timeout=60) as response:
++                if offset and response.status != 206:
++                    destination.unlink(missing_ok=True)
++                    raise OSError("adapter server did not honor byte range")
++                with destination.open("ab" if offset else "wb") as output:
++                    shutil.copyfileobj(response, output, length=16 * 1024 * 1024)
++            if destination.stat().st_size != total:
++                raise OSError(f"incomplete adapter file: {destination.name}")
++            return
++        except OSError:
++            if attempt == 9:
++                raise
++            time.sleep(min(2**attempt, 10))
++
++
+ # This is to get type hints for the Worker class but not actually extend it at runtime as this is required by vLLM worker extension
+ if TYPE_CHECKING:
+     from vllm.v1.worker.gpu_worker import Worker
+@@ -25,6 +66,21 @@ class FileSystemWeightUpdateWorker(Worker):
+         """No-op RPC used by the API server liveness endpoint."""
+         return None
+ 
++    def stage_lora_adapter(self, source_url: str) -> None:
++        destination = adapter_cache_path(source_url)
++        destination.parent.mkdir(parents=True, exist_ok=True)
++        with (destination.parent / f"{destination.name}.lock").open("w") as lock:
++            fcntl.flock(lock, fcntl.LOCK_EX)
++            if (destination / "READY").exists():
++                return
++            temporary = destination.with_name(f"{destination.name}.partial")
++            temporary.mkdir(exist_ok=True)
++            for filename in ("adapter_config.json", "adapter_model.safetensors"):
++                download(f"{source_url.rstrip('/')}/{filename}", temporary / filename)
++            (temporary / "READY").touch()
++            shutil.rmtree(destination, ignore_errors=True)
++            temporary.rename(destination)
++
+     def update_weights_from_path(self, weight_path: str) -> None:
+         """Update weights from a specified path in shared filesystem containing a HF-compatible checkpoint."""
+         # Get vLLM model runner and model
+diff --git a/src/prime_rl/orchestrator/algo/grpo.py b/src/prime_rl/orchestrator/algo/grpo.py
+index 0b87fa7c..bce8800d 100644
+--- a/src/prime_rl/orchestrator/algo/grpo.py
++++ b/src/prime_rl/orchestrator/algo/grpo.py
+@@ -13,31 +13,25 @@ if TYPE_CHECKING:
+ 
+ 
+ class GRPOAlgorithm(Algorithm):
+-    """Group Relative Policy Optimization: sample a group of rollouts from the
+-    policy per example; credit = reward minus the group mean (optionally
+-    length-shaped); action tokens feed the ``rl`` loss."""
+-
+     def __init__(self, config: GRPOAlgoConfig, policy_pool: InferencePool):
+         super().__init__(config, policy_pool)
+         self.length_penalty = config.length_penalty
+ 
+     async def score_group(self, group: list[Rollout]) -> None:
+         rewards = torch.tensor([rollout.reward for rollout in group], dtype=torch.float32)
+-        length_penalty = self.length_penalty
+-        if length_penalty is None:
+-            advantages = rewards - rewards.mean()
++        if self.length_penalty is None:
++            shaped_rewards = rewards
+         else:
+             output = torch.tensor([rollout.num_output_tokens for rollout in group], dtype=rewards.dtype)
+             total = torch.tensor([rollout.num_total_tokens for rollout in group], dtype=rewards.dtype)
+             turns = torch.tensor([rollout.num_turns for rollout in group], dtype=rewards.dtype)
+-            input = total - output
+             penalty_frac = (
+-                length_penalty.num_output_tokens_weight * (output / output.max().clamp(min=1))
+-                + length_penalty.num_input_tokens_weight * (input / input.max().clamp(min=1))
+-                + length_penalty.num_turns_weight * (turns / turns.max().clamp(min=1))
++                self.length_penalty.num_output_tokens_weight * (output / output.max().clamp(min=1))
++                + self.length_penalty.num_input_tokens_weight * ((total - output) / (total - output).max().clamp(min=1))
++                + self.length_penalty.num_turns_weight * (turns / turns.max().clamp(min=1))
+             )
+-            penalty = rewards.mean() * penalty_frac
+-            shaped_rewards = rewards - penalty
+-            advantages = shaped_rewards - shaped_rewards.mean()
++            shaped_rewards = rewards - rewards.mean() * penalty_frac
++        advantages = shaped_rewards - shaped_rewards.mean()
++        advantages = advantages / advantages.std(unbiased=False).clamp_min(1e-6)
+         for rollout, advantage in zip(group, advantages.tolist(), strict=True):
+             rollout.assign_advantages(advantage)
+diff --git a/src/prime_rl/orchestrator/dispatcher.py b/src/prime_rl/orchestrator/dispatcher.py
+index 5fee725f..626bdb98 100644
+--- a/src/prime_rl/orchestrator/dispatcher.py
++++ b/src/prime_rl/orchestrator/dispatcher.py
+@@ -31,6 +31,7 @@ import uuid
+ from collections import Counter, defaultdict
+ from dataclasses import dataclass, field
+ from enum import Enum, auto
++from time import monotonic
+ from typing import Literal
+ 
+ import verifiers.v1 as vf
+@@ -157,12 +158,17 @@ class RolloutDispatcher:
+         # Bounded so the dispatcher backpressures on a slow sink. One entry per
+         # episode — the sinks count episodes, never loose traces.
+         self.out_q: asyncio.Queue[list[Rollout]] = asyncio.Queue(maxsize=max(8, self.max_inflight))
++        self.queued_train_episodes = 0
+ 
+         self.mode: DispatcherMode = DispatcherMode.PREFER_TRAIN
+         # Set by the orchestrator after the final train step; pipeline then
+         # winds down without scheduling new train rollouts
+         self.train_scheduling_disabled: bool = False
++        self.fresh_train_groups_allowed = asyncio.Event()
++        self.fresh_train_groups_allowed.set()
++        self.fresh_train_rollout_budget = self.max_inflight
+         self.metrics = DispatcherMetrics()
++        self.unhealthy_clients: dict[tuple[str, str | None], float] = {}
+ 
+         # Orchestrator-owned gate. When clear, ``fill_inflight`` returns
+         # without scheduling new groups. The dispatcher itself doesn't know
+@@ -185,6 +191,19 @@ class RolloutDispatcher:
+     def inflight_train_count(self) -> int:
+         return sum(m.rollout_count for m in self.inflight.values() if m.kind == "train")
+ 
++
++    @property
++    def queued_train_count(self) -> int:
++        return self.queued_train_episodes
++
++    def mark_episode_consumed(self, kind: RolloutKind) -> None:
++        if kind == "train":
++            self.queued_train_episodes -= 1
++
++    @property
++    def pending_train_schedule_count(self) -> int:
++        return sum(g.rollouts_to_schedule for g in self.groups.values() if g.kind == "train")
++
+     @property
+     def inflight_eval_count(self) -> int:
+         return sum(m.rollout_count for m in self.inflight.values() if m.kind == "eval")
+@@ -225,6 +244,20 @@ class RolloutDispatcher:
+         triggered eval drain naturally."""
+         self.train_scheduling_disabled = True
+ 
++    def set_fresh_train_rollout_budget(self, budget: int) -> None:
++        budget = max(0, budget)
++        allowed = budget > 0
++        changed = allowed != self.fresh_train_groups_allowed.is_set()
++        self.fresh_train_rollout_budget = budget
++        if not changed:
++            return
++        if allowed:
++            self.fresh_train_groups_allowed.set()
++            get_logger().info("Opening fresh train groups")
++        else:
++            self.fresh_train_groups_allowed.clear()
++            get_logger().info("Pausing fresh train groups while the current batch drains")
++
+     @property
+     def max_off_policy_level(self) -> int:
+         steps = [m.off_policy_steps for m in self.inflight.values() if m.kind == "train"]
+@@ -361,6 +394,9 @@ class RolloutDispatcher:
+             if cost <= self.available_permits:
+                 return await self.schedule_group_rollout(gid, group)
+ 
++        if kind == "train" and not self.fresh_train_groups_allowed.is_set():
++            return False
++
+         fresh = self.next_fresh_group(kind, envs)
+         if fresh is None:
+             return False
+@@ -377,7 +413,10 @@ class RolloutDispatcher:
+         else:
+             assert self.eval_source is not None
+             source = self.eval_source
+-        example = source.next_example(self.available_permits)
++        available_permits = self.available_permits
++        if kind == "train":
++            available_permits = min(available_permits, self.fresh_train_rollout_budget)
++        example = source.next_example(available_permits)
+         if example is None:
+             return None
+ 
+@@ -385,7 +424,7 @@ class RolloutDispatcher:
+         group_size = envs.get(env_name).config.group_size
+         eval_step: int | None = example.get("eval_step") if kind == "eval" else None
+ 
+-        return GroupState(
++        fresh = GroupState(
+             kind=kind,
+             env_name=env_name,
+             task_idx=example["task_idx"],
+@@ -395,6 +434,9 @@ class RolloutDispatcher:
+             eval_step=eval_step,
+             policy_version_at_start=self.policy.version,
+         )
++        if kind == "train":
++            self.fresh_train_rollout_budget -= group_size
++        return fresh
+ 
+     async def schedule_group_rollout(self, group_id: uuid.UUID, group: GroupState) -> bool:
+         """Dispatch one ``run`` / ``run_group`` task for this group.
+@@ -413,14 +455,32 @@ class RolloutDispatcher:
+         else:
+             pool, model_name, live_sourced = self._train_pool_for(group.env_name)
+ 
++        if group.pinned_client is not None and self.unhealthy_clients.get(
++            client_identity(group.pinned_client), 0
++        ) > monotonic():
++            group.pinned_client = None
++
+         # Pin a single client per group to keep prefix-cache hits
+         if group.pinned_client is None:
++            now = monotonic()
++            self.unhealthy_clients = {key: until for key, until in self.unhealthy_clients.items() if until > now}
+             if group.kind == "eval":
+-                client = await pool.get_eval_client()
++                for _ in range(max(1, len(pool.train_clients))):
++                    client = await pool.get_eval_client()
++                    if client_identity(client) not in self.unhealthy_clients:
++                        break
++                else:
++                    return False
+             else:
+                 load = Counter(
+                     client_identity(m.client_config) for m in self.inflight.values() if m.client_config is not None
+                 )
++                if pool.train_clients and all(
++                    client_identity(candidate) in self.unhealthy_clients for candidate in pool.train_clients
++                ):
++                    return False
++                for identity in self.unhealthy_clients:
++                    load[identity] = self.max_inflight + 1
+                 client = await pool.select_train_client(load)
+             if group_id not in self.groups:
+                 return False
+@@ -531,13 +591,45 @@ class RolloutDispatcher:
+                 r.record_error(exc)
+             is_synth_exception = True
+ 
++        if (
++            meta.rollout_count == 1
++            and group is not None
++            and meta.client_config is not None
++            and len(rollouts) == 1
++            and (
++                self._is_transient_policy_failure(rollouts[0])
++                or (rollouts[0].num_turns == 0 and rollouts[0].stop_condition == "harness_timeout")
++            )
++        ):
++            identity = client_identity(meta.client_config)
++            self.unhealthy_clients[identity] = monotonic() + 60
++            group.pinned_client = None
++            group.rollouts_to_schedule += 1
++            if group.kind == "eval":
++                self.switch_mode(DispatcherMode.PREFER_EVAL, reason="an eval rollout is being retried")
++            detail = "; ".join(
++                f"{error.type}: {error.message}" for error in rollouts[0].errors[-2:]
++            )
++            get_logger().warning(
++                f"Retrying transient rollout failure in group {meta.group_id} "
++                f"({meta.env_name}) away from {identity[0]}: {detail}"
++            )
++            return
++
+         for r in rollouts:
+             if not r.has_error and r.num_turns == 0:
+                 # Empty trajectory: promote to an explicit error so the sink
+                 # treats it like any other failure (``has_error`` reads ``ok``)
+                 r.errors.append(vf.Error(type="EmptyTrajectory", message="Rollout returned with no trajectory steps"))
+                 r.ok = False
+-                get_logger().warning(f"Empty trajectory in group {meta.group_id} ({meta.env_name})")
++                get_logger().warning(
++                    f"Empty trajectory in group {meta.group_id} ({meta.env_name}); "
++                    f"task={r.task.data.idx}, stop={repr(r.stop_condition)}, "
++                    f"user_done={getattr(r.state, 'user_done', None)}, "
++                    f"target_turns={getattr(r.state, 'target_turns', None)}, "
++                    f"client={repr(getattr(meta.client_config, 'base_url', None))}, "
++                    f"calls={[(c.finish_reason, c.error.type if c.error else None) for c in r.calls]}"
++                )
+             if r.has_error:
+                 self.metrics.record_error(kind=meta.kind, env_name=meta.env_name)
+                 if not is_synth_exception and r.last_error is not None:
+@@ -552,6 +644,27 @@ class RolloutDispatcher:
+             for r in rollouts:
+                 await self.emit_episode(meta, group, [r])
+ 
++    def _is_transient_policy_failure(self, rollout: Rollout) -> bool:
++        error = rollout.error
++        if error is None or error.type not in ("ProviderError", "HarnessError"):
++            return False
++        message = error.message.lower()
++        if not any(
++            marker in message
++            for marker in ("connection", "timed out", "timeout", "readtimeout")
++        ):
++            return False
++        if error.type == "HarnessError":
++            # The custom null harness wraps httpx.ReadTimeout after useful
++            # turns as HarnessError. It is still a policy-client failure and
++            # must be retried away from the client pinned to this GRPO group.
++            return True
++        return any(
++            getattr(call, "model", None) == self.policy.model_name
++            and getattr(call, "error", None) is not None
++            for call in getattr(rollout, "calls", [])
++        )
++
+     async def emit_episode(self, meta: InflightRollout, group: GroupState | None, rollouts: list[Rollout]) -> None:
+         """Stamp prime-rl metadata onto one completed episode and put it on
+         ``out_q``. Pops the group from ``self.groups`` once every owed episode
+@@ -574,6 +687,8 @@ class RolloutDispatcher:
+             if meta.kind == "eval":
+                 assert eval_step is not None, "eval rollout missing eval_step"
+                 rollout.eval_step = eval_step
++        if meta.kind == "train":
++            self.queued_train_episodes += 1
+         await self.out_q.put(rollouts)
+ 
+     async def drop_group(self, group_id: uuid.UUID) -> int:
+diff --git a/src/prime_rl/orchestrator/orchestrator.py b/src/prime_rl/orchestrator/orchestrator.py
+index 381e37ae..4894fa57 100644
+--- a/src/prime_rl/orchestrator/orchestrator.py
++++ b/src/prime_rl/orchestrator/orchestrator.py
+@@ -71,7 +71,7 @@ from prime_rl.orchestrator.utils import (
+     setup_policy_inference_pool,
+     trim_process_memory,
+ )
+-from prime_rl.orchestrator.watcher import WeightWatcher
++from prime_rl.orchestrator.watcher import WeightWatcher, inference_weight_path
+ from prime_rl.trainer.model import setup_tokenizer
+ from prime_rl.trainer.rl.broadcast.nixl.model_express import ModelExpressSession
+ from prime_rl.transport import TrainingBatch, setup_training_batch_sender
+@@ -101,11 +101,6 @@ SHUTDOWN_TIMEOUT_S = 300
+ # dataset; fail loudly instead of spinning
+ MAX_CONSECUTIVE_EMPTY_BATCHES = 10
+ 
+-# Maximum batches the orchestrator may run ahead of the trainer. The
+-# dispatcher is paused via ``update_dispatch_gate`` once this is exceeded;
+-# resumed when the watcher advances ``policy.version``.
+-TARGET_LAG = 1
+-
+ # Default wait for the trainer's startup weight broadcast when no ckpt block
+ # configures ``wait_for_weights_timeout`` (e.g. a from-scratch run). The
+ # broadcast is always coming, so wait rather than fail immediately.
+@@ -149,6 +144,7 @@ class Orchestrator:
+     eval_source: EvalSource | None
+     lora_name: str | None
+     resume_step: int | None
++    resume_policy_step: int | None
+     lag_task: asyncio.Task | None
+ 
+     def __init__(self, config: OrchestratorConfig) -> None:
+@@ -194,6 +190,7 @@ class Orchestrator:
+         self.eval_source = None
+         self.lora_name = None
+         self.resume_step = None
++        self.resume_policy_step = None
+         self.lag_task = None
+         self.model_express = None
+ 
+@@ -230,9 +227,13 @@ class Orchestrator:
+         if self.mm_token_type_ids_mapping == {}:
+             self.mm_token_type_ids_mapping = None
+ 
+-        get_logger().info(f"Initializing monitor (wandb={config.wandb}, prime_monitor={config.prime_monitor})")
++        get_logger().info(
++            f"Initializing monitor (wandb={config.wandb}, swanlab={config.swanlab}, "
++            f"prime_monitor={config.prime_monitor})"
++        )
+         self.monitor = setup_monitor(
+             wandb_config=config.wandb,
++            swanlab_config=config.swanlab,
+             prime_config=config.prime_monitor,
+             file_config=config.file_monitor,
+             output_dir=config.output_dir,
+@@ -279,10 +280,31 @@ class Orchestrator:
+             get_logger().success("Eval environment(s) ready")
+ 
+         if config.ckpt is not None and config.ckpt.resume_step is not None and self.ckpt_manager is not None:
+-            if config.ckpt.resume_step == -1:
++            if config.ckpt.resume_step == -1 and config.ckpt.skip_progress:
++                self.resume_step = max(
++                    (
++                        step
++                        for step in get_all_ckpt_steps(get_rollout_dir(config.output_dir))
++                        if get_trace_path(config.output_dir, step, "train", "effective").exists()
++                    ),
++                    default=None,
++                )
++                self.resume_policy_step = max(
++                    (
++                        step
++                        for step in get_all_ckpt_steps(get_broadcast_dir(config.output_dir))
++                        if (get_step_path(get_broadcast_dir(config.output_dir), step) / "STABLE").exists()
++                    ),
++                    default=None,
++                )
++            elif config.ckpt.resume_step == -1:
+                 self.resume_step = resolve_latest_ckpt_step(self.ckpt_manager.ckpt_dir)
+             else:
+                 self.resume_step = config.ckpt.resume_step
++            if self.resume_policy_step is None and not (
++                config.ckpt.resume_step == -1 and config.ckpt.skip_progress
++            ):
++                self.resume_policy_step = self.resume_step
+ 
+         # Resume below may bump ``policy.version`` and the LoRA model name
+         self.policy.model_name = self.policy_inference.model_name
+@@ -346,14 +368,17 @@ class Orchestrator:
+             # from ``resume_step`` (not the loaded progress.step) so it stays coordinated with the
+             # trainer even when ``ckpt.skip_progress`` left the counter unrestored.
+             self.progress.step = self.resume_step + 1
+-            get_logger().info(f"Resuming orchestrator from checkpoint step {self.resume_step}")
++            get_logger().info(
++                f"Resuming orchestrator at rollout batch {self.progress.step} "
++                f"from policy v{self.resume_policy_step or 0}"
++            )
+         else:
+             get_logger().info("Training from scratch")
+ 
+         # Sync inference to the incoming policy before the first step when resuming or when using
+         # an in-memory transport, which rendezvouses with the trainer's startup broadcast.
+-        if self.resume_step is not None or config.weight_broadcast.type in ("nccl", "nixl"):
+-            sync_version = self.resume_step if self.resume_step is not None else 0
++        if self.resume_policy_step is not None or config.weight_broadcast.type in ("nccl", "nixl"):
++            sync_version = self.resume_policy_step if self.resume_policy_step is not None else 0
+             if config.weight_broadcast.type == "nixl":
+                 weights_path = None
+             else:
+@@ -363,6 +388,7 @@ class Orchestrator:
+                 weights_path = get_weight_dir(
+                     config.output_dir, sync_version, check_exists=check_exists, wait_timeout=wait_timeout
+                 )
++                weights_path = inference_weight_path(config, weights_path, self.lora_name)
+             if self.model_express is not None:
+                 await asyncio.to_thread(self.model_express.set_status, p2p_pb2.SOURCE_STATUS_READY)
+             await self.policy_inference.update_weights(weights_path, lora_name=self.lora_name, step=sync_version)
+@@ -412,10 +438,13 @@ class Orchestrator:
+             mm_token_type_ids_mapping=self.mm_token_type_ids_mapping,
+             batch_size=config.batch_size,
+             token_batch_size=config.token_batch_size,
++            training_policy_version=self.progress.step - 1,
+             pre_filters=pre_filters,
+             post_filters=post_filters,
+         )
+         self.eval_sink = EvalSink(eval_envs=self.eval_envs) if self.eval_envs is not None else None
++        if config.batch_size is not None:
++            self.dispatcher.set_fresh_train_rollout_budget(config.batch_size)
+         self.watcher = WeightWatcher(
+             config,
+             policy=self.policy,
+@@ -454,6 +483,7 @@ class Orchestrator:
+         """Run the orchestrator until shutdown. Drives setup, spawns the
+         background tasks, runs the main loop in this task, then cleans up."""
+         await self.setup()
++        self.update_dispatch_gate()
+         config = self.config
+         get_logger().info(f"Starting orchestrator loop (max_steps={config.max_steps or 'infinite'})")
+         start_time = time.perf_counter()
+@@ -557,10 +587,15 @@ class Orchestrator:
+                 continue
+ 
+             train_batch = await self.train_sink.add(episode)
++            self.dispatcher.mark_episode_consumed(kind)
++            if train_batch is None:
++                self.update_rollout_budget()
+             # In drain mode any late-arriving train batch is dropped — we
+             # don't want to ship past ``max_steps``
+             if train_batch is not None and not self.draining and not self.stopped.is_set():
++                self.dispatcher.set_fresh_train_rollout_budget(0)
+                 await self.finalize_train_batch(train_batch)
++                self.update_rollout_budget()
+ 
+     async def finalize_train_batch(self, batch: TrainBatch) -> None:
+         """Ship one ``TrainBatch`` out to the trainer and handle the I/O
+@@ -609,13 +644,13 @@ class Orchestrator:
+                 f"({n_trainable / len(effective):.1%}) — consider reviewing task difficulty / filter config"
+             )
+ 
+-        # Ship batch ``step`` only once the trainer has published v{step-1-TARGET_LAG}.
++        # Ship batch ``step`` only once the trainer has published a policy within the configured lag.
+         # Without this, fast envs fill batches from buffered rollouts, the
+         # orchestrator finishes early, and its teardown strands the trainer inside
+         # an in-memory broadcast handshake that needs the live weight watcher.
+-        # Always satisfiable: the trainer skips only the final TARGET_LAG+1
+-        # in-memory broadcasts. Bench runs have no trainer, so they ship freely.
+-        required_version = step - 1 - TARGET_LAG
++        # The final in-memory broadcasts are handled below. Bench runs have no
++        # trainer, so they ship freely.
++        required_version = step - 1 - config.max_off_policy_steps
+         if not config.bench and self.policy.version < required_version:
+             get_logger().info(
+                 f"Holding batch {step} until the trainer publishes policy v{required_version} "
+@@ -647,6 +682,7 @@ class Orchestrator:
+ 
+         await self.sender.send(TrainingBatch(examples=batch.samples, step=step))
+         self.progress.step += 1
++        self.train_sink.advance_training_policy_version(self.progress.step - 1)
+         self.update_dispatch_gate()
+         # Checkpoint the step we just shipped (resume point: continue at step + 1).
+         save_ckpt_time = await self.maybe_save_ckpt(step)
+@@ -748,6 +784,13 @@ class Orchestrator:
+         ``(console_body, wandb_payload)``. Per-env ``(env=N, …)``
+         breakdowns inline only when there's more than one train / eval env;
+         the eval halves drop entirely when nothing is accumulating."""
++        # Re-derive the fresh-rollout budget on every tick. The event-driven
++        # call sites only fire when an episode arrives, so once the pipeline has
++        # fully drained nothing recomputes the budget and a batch left short by
++        # dropped groups stays wedged forever. This tick is the only thing that
++        # still runs in that state, so the recovery in update_rollout_budget
++        # needs to hang off it. The call is idempotent.
++        self.update_rollout_budget()
+         disp_gauges = self.dispatcher.gauges()
+         disp_drain = self.dispatcher.metrics.drained(
+             train_envs={e.name for e in self.train_envs},
+@@ -759,6 +802,8 @@ class Orchestrator:
+         inflight_by_env = self.dispatcher.inflight_by_env
+         inflight_train = self.dispatcher.inflight_train_count
+         inflight_eval = self.dispatcher.inflight_eval_count
++        queued_train = self.dispatcher.queued_train_count
++        scheduling_train = self.dispatcher.pending_train_schedule_count
+         train_batch, train_target, _train_unit = self.train_sink.batch_progress()
+         train_buffered = self.train_sink.buffered_count()
+         train_batch_by_env = self.train_sink.pending_batch_by_env()
+@@ -775,6 +820,10 @@ class Orchestrator:
+             train_batch_part += " (" + ", ".join(f"{n}={v}" for n, v in pairs) + ")"
+         if train_buffered:
+             train_batch_part += f" (+{train_buffered} buffered)"
++        if queued_train:
++            train_batch_part += f" (+{queued_train} queued)"
++        if scheduling_train:
++            train_batch_part += f" (+{scheduling_train} scheduling)"
+ 
+         eval_batch_part = ""
+         for env, _step, eb, exp, _ebuf in eval_batches:
+@@ -909,6 +958,53 @@ class Orchestrator:
+         self.ckpt_manager.save(self.progress, self.train_source, step)
+         return time.perf_counter() - t
+ 
++    def update_rollout_budget(self) -> None:
++        if self.config.batch_size is None:
++            return
++        current, _, _ = self.train_sink.batch_progress()
++        live = (
++            self.dispatcher.queued_train_count
++            + self.dispatcher.inflight_train_count
++            + self.dispatcher.pending_train_schedule_count
++        )
++        buffered = self.train_sink.buffered_count()
++        budget = self.config.batch_size - current - buffered - live
++        # Rollouts buffered in a partial group cannot finish once nothing is in
++        # flight to finish them: their group-mates were dropped by a filter
++        # (zero-advantage groups are enforced) or lost. Counting them against
++        # the budget then wedges the batch permanently — it shows up as
++        # "Train batch N/1024 ... 0 inflight rollouts" with the trainer idle
++        # indefinitely. When the pipeline has fully drained and the batch is
++        # still short, ignore the stuck buffer and open fresh groups. Guarded on
++        # current > 0 so the normal post-ship path (current == 0, buffer carried
++        # into the next batch) keeps its existing behaviour.
++        group = max(1, getattr(self.config, "group_size", 1))
++        # Fires whenever the pipeline is drained and the budget cannot open a
++        # whole group. Includes current == 0 with a buffer full of orphans:
++        # over hundreds of steps dropped group-mates accumulate until
++        # buffered >= batch_size at a post-ship boundary, and that state is
++        # indistinguishable from a healthy idle orchestrator. The only state
++        # excluded is a true fresh start (nothing collected, nothing buffered),
++        # where budget == batch_size >= group anyway.
++        if live == 0 and current < self.config.batch_size and (current + buffered) > 0 and budget < group:
++            # Two wedge shapes end here, both showing "N/1024 ... 0 inflight":
++            #   * budget <= 0: buffered partial-group rollouts absorbed it all
++            #     (their group-mates were dropped by the zero-advantage filter);
++            #   * 0 < budget < group_size: the tail of the batch needs fewer
++            #     rollouts than one group, and groups only open whole. Seen live
++            #     as 1017/1024 with budget 7 and group size 8, stuck for good.
++            # Either way nothing is in flight, so nothing can ever finish the
++            # batch. Round the shortfall UP to whole groups; the overshoot lands
++            # in the buffer and carries into the next batch, which is the normal
++            # post-ship path anyway.
++            shortfall = self.config.batch_size - current
++            budget = ((shortfall + group - 1) // group) * group
++            get_logger().warning(
++                f"Batch stuck at {current}/{self.config.batch_size} with nothing in flight "
++                f"({buffered} buffered); opening {budget // group} fresh group(s) to finish it"
++            )
++        self.dispatcher.set_fresh_train_rollout_budget(budget)
++
+     def update_dispatch_gate(self) -> None:
+         """Pause/resume the dispatcher based on how far the in-flight batch runs
+         ahead of ``policy.version``. ``progress.step`` is always the batch being
+@@ -926,7 +1022,7 @@ class Orchestrator:
+         )
+         gate = self.dispatcher.dispatch_allowed
+         was_set = gate.is_set()
+-        if lead > TARGET_LAG and not building_final_batch_without_update:
++        if lead > self.config.max_off_policy_steps and not building_final_batch_without_update:
+             if was_set:
+                 get_logger().info(
+                     "Pausing dispatcher to prevent orchestrator from racing from trainer. Waiting for new policy..."
+diff --git a/src/prime_rl/orchestrator/train_sink.py b/src/prime_rl/orchestrator/train_sink.py
+index fb0dc6ab..ffe84376 100644
+--- a/src/prime_rl/orchestrator/train_sink.py
++++ b/src/prime_rl/orchestrator/train_sink.py
+@@ -57,6 +57,7 @@ class TrainSink:
+         mm_token_type_ids_mapping: dict[int, int] | None,
+         batch_size: int | None,
+         token_batch_size: int | None,
++        training_policy_version: int,
+         pre_filters: list[RolloutFilter],
+         post_filters: list[RolloutFilter],
+     ) -> None:
+@@ -69,6 +70,9 @@ class TrainSink:
+         self.mm_token_type_ids_mapping = mm_token_type_ids_mapping
+         self.batch_size = batch_size
+         self.token_batch_size = token_batch_size
++        # Batch ``step`` trains policy v{step-1}. This value advances only
++        # after that batch is shipped.
++        self.training_policy_version = training_policy_version
+         self.pre_filters = pre_filters
+         self.post_filters = post_filters
+ 
+@@ -94,6 +98,54 @@ class TrainSink:
+         self.pre_filter_dropped = 0
+         self.pre_filter_dropped_by_name: dict[str, int] = {}
+ 
++    def _is_stale(self, rollout: Rollout) -> bool:
++        sampler = self.train_envs.get(rollout.env_name).sampler
++        return (
++            sampler.samples_from_live_policy
++            and self.training_policy_version - rollout.policy_version > self.config.max_off_policy_steps
++        )
++
++    @staticmethod
++    def _mark_off_policy(rollouts: list[Rollout]) -> None:
++        for rollout in rollouts:
++            rollout.samples = []
++            rollout.is_filtered = True
++            rollout.filter_results = {"max_off_policy_steps": True}
++
++    def _drop_stale_pending(self) -> int:
++        """Remove complete stale groups already queued for a later batch.
++
++        The group is the GRPO baseline unit, so if any member is stale the
++        whole group is removed. The normal rollout-budget update replaces the
++        removed rollouts before the next trainer batch can become ready.
++        """
++        stale_group_ids = {r.group_id for r in self.pending_batch if self._is_stale(r)}
++        if not stale_group_ids:
++            return 0
++        stale = [r for r in self.pending_batch if r.group_id in stale_group_ids]
++        self.pending_batch = [r for r in self.pending_batch if r.group_id not in stale_group_ids]
++        self._mark_off_policy(stale)
++        if self.token_batch_size is not None:
++            self.pending_tokens = sum(payload_tokens(r) for r in self.pending_batch)
++        get_logger().warning(
++            f"Dropped {len(stale)} completed rollout(s) from {len(stale_group_ids)} group(s) "
++            f"past max_off_policy_steps={self.config.max_off_policy_steps}; replenishing the batch"
++        )
++        return len(stale)
++
++    def advance_training_policy_version(self, version: int) -> int:
++        """Advance the policy that the next trainer batch will update.
++
++        This also rejects completed overflow left in ``pending_batch``. Partial
++        groups are checked when they finish, before they can enter the batch.
++        """
++        if version < self.training_policy_version:
++            raise ValueError(
++                f"training policy version moved backwards: {self.training_policy_version} -> {version}"
++            )
++        self.training_policy_version = version
++        return self._drop_stale_pending()
++
+     def group_size_for(self, env_name: str) -> int:
+         return self.train_envs.get(env_name).config.group_size
+ 
+@@ -185,21 +237,83 @@ class TrainSink:
+             self.pending_rollouts.append(r)
+         env_name = group[0].env_name
+         task_idx = group[0].task.data.idx
++        if any(self._is_stale(r) for r in group):
++            self._mark_off_policy(group)
++            get_logger().warning(
++                f"Finished group | env={env_name} task_idx={task_idx} | "
++                f"dropped {len(group)} rollout(s) past max_off_policy_steps="
++                f"{self.config.max_off_policy_steps}; replenishing the batch"
++            )
++            return
+         survivors = [r for r in group if not r.has_error]
+         num_errored = len(group) - len(survivors)
++        rejected_fillers: list[Rollout] = []
++        if num_errored and self.batch_size is not None:
++            for r in group:
++                if r.has_error:
++                    r.samples = []
++                    r.is_filtered = True
++                    r.filter_results = {"rollout_error": True}
++                    rejected_fillers.append(r)
+ 
+         # Group-scoring envs: any failure makes survivors' rewards unsafe
+         # (computed relative to the missing ones)
+         env = self.train_envs.get(env_name)
+         if num_errored > 0 and env.requires_group_scoring:
++            if self.batch_size is not None:
++                for r in group:
++                    r.samples = []
++                    r.is_filtered = True
++                    r.filter_results = {"group_scored_partial": True}
++                self.pending_batch.extend(group)
+             get_logger().debug(
+                 f"Finished group | env={env_name} task_idx={task_idx} | "
+                 f"rollouts={len(group)} (errored={num_errored}) | dropped: group-scored partial"
+             )
+             return
++
++        # Never assign a full-trajectory reward to a prefix that the trainer
++        # silently truncates. For group-scored RL, one oversized member makes
++        # the whole group unsafe because removing it changes the baseline.
++        oversized_fillers: list[Rollout] = []
++        oversized = [
++            r
++            for r in survivors
++            if any(len(sample.token_ids) > self.config.seq_len for sample in r.samples)
++        ]
++        if oversized:
++            longest = max(
++                len(sample.token_ids)
++                for r in oversized
++                for sample in r.samples
++            )
++            get_logger().warning(
++                f"Finished group | env={env_name} task_idx={task_idx} | "
++                f"dropped training payload: {len(oversized)} rollout(s) exceed "
++                f"trainer seq_len {self.config.seq_len} (longest={longest})"
++            )
++            if env.requires_group_scoring:
++                return
++            oversized_ids = {id(r) for r in oversized}
++            survivors = [r for r in survivors if id(r) not in oversized_ids]
++            if self.batch_size is not None:
++                # Keep a sample-free, filtered placeholder in a fixed-rollout
++                # batch. Without it, one rejected member leaves a permanent
++                # one-rollout deficit because the dispatcher opens only whole
++                # GRPO groups. It contributes metrics and batch accounting but
++                # cannot reach the trainer or affect the group baseline.
++                for r in oversized:
++                    r.samples = []
++                    r.is_filtered = True
++                    r.filter_results = {"trainer_seq_len": True}
++                oversized_fillers = oversized
++        rejected_fillers.extend(oversized_fillers)
++
+         # Untrainable traces carry no samples and must not skew the group baseline.
+         survivors = [r for r in survivors if r.agent.trainable]
+         if not survivors:
++            if rejected_fillers:
++                self.pending_batch.extend(rejected_fillers)
+             get_logger().debug(
+                 f"Finished group | env={env_name} task_idx={task_idx} | "
+                 f"rollouts={len(group)} (errored={num_errored}) | dropped: no trainable survivors"
+@@ -238,6 +352,7 @@ class TrainSink:
+             self.pending_batch.append(r)
+             if self.token_batch_size is not None:
+                 self.pending_tokens += payload_tokens(r)
++        self.pending_batch.extend(rejected_fillers)
+ 
+         # Per-group summary. One line per finalized group; per-filter
+         # detection breakdown lives at debug level in ``apply_filters``
+@@ -250,12 +365,22 @@ class TrainSink:
+             f"reward={avg_reward:.4f} | filters: {filter_str}"
+         )
+ 
+-    def process_batch(self) -> TrainBatch:
++    def process_batch(self) -> TrainBatch | None:
+         """Pop a cohort off ``pending_batch`` (by rollout count when
+         ``batch_size`` is set, by token count when ``token_batch_size`` is
+         set), apply post-batch filter annotations, and assemble the
+         trainer-bound ``TrainingSample`` list. Overflow stays for the next
+         batch."""
++        # Delivery invariant: even completed overflow that crossed a batch
++        # boundary cannot become trainer samples.
++        self._drop_stale_pending()
++        ready = (
++            len(self.pending_batch) >= self.batch_size
++            if self.batch_size is not None
++            else self.pending_tokens >= (self.token_batch_size or 0)
++        )
++        if not ready:
++            return None
+         if self.batch_size is not None:
+             cohort = self.pending_batch[: self.batch_size]
+             self.pending_batch = self.pending_batch[self.batch_size :]
+diff --git a/src/prime_rl/orchestrator/train_source.py b/src/prime_rl/orchestrator/train_source.py
+index ca97eae7..46df99c3 100644
+--- a/src/prime_rl/orchestrator/train_source.py
++++ b/src/prime_rl/orchestrator/train_source.py
+@@ -53,8 +53,8 @@ class TrainSource:
+         self.iters: dict[str, Iterator[vf.Task]] = {}
+         self.epochs: dict[str, int] = {}
+         self.cursors: dict[str, int] = {}
+-        # Group-scoring envs reserve ``group_size`` permits up front;
+-        # per-rollout envs need 1
++        # A fresh group needs room for all of its rollouts. Existing groups
++        # still dispatch one rollout at a time as permits become available.
+         self.env_costs: dict[str, int] = {}
+         for env in self.envs:
+             if env.tasks is None:  # legacy: sample over the index range from info()
+diff --git a/src/prime_rl/orchestrator/watcher.py b/src/prime_rl/orchestrator/watcher.py
+index d660cd80..eb67341d 100644
+--- a/src/prime_rl/orchestrator/watcher.py
++++ b/src/prime_rl/orchestrator/watcher.py
+@@ -6,6 +6,7 @@ from __future__ import annotations
+ 
+ import asyncio
+ import time
++from urllib.parse import quote
+ 
+ from modelexpress import p2p_pb2
+ 
+@@ -19,6 +20,18 @@ from prime_rl.utils.pathing import get_broadcast_dir, get_step_path, wait_for_pa
+ from prime_rl.utils.utils import get_latest_ckpt_step
+ 
+ 
++def inference_weight_path(config: OrchestratorConfig, weights_path, lora_name: str | None):
++    broadcast = config.weight_broadcast
++    if not (lora_name and broadcast.type == "filesystem" and broadcast.source_url):
++        return weights_path
++    if broadcast.source_dir is None:
++        raise ValueError("weight_broadcast.source_dir is required with source_url")
++    return (
++        f"{broadcast.source_url.rstrip('/')}/"
++        f"{quote(weights_path.relative_to(broadcast.source_dir).as_posix())}"
++    )
++
++
+ class WeightWatcher:
+     """``await watcher.start()`` to drive the polling loop until ``stop()``."""
+ 
+@@ -57,7 +70,10 @@ class WeightWatcher:
+             while not self.stopped.is_set():
+                 next_step = self.compute_next_ckpt_step()
+                 if next_step > self.ckpt_step:
+-                    await self.apply_policy_update(next_step)
++                    try:
++                        await self.apply_policy_update(next_step)
++                    except Exception:
++                        get_logger().exception(f"Failed to apply policy update {next_step}; retrying")
+                 await asyncio.sleep(self.poll_interval)
+         except asyncio.CancelledError:
+             return
+@@ -107,25 +123,10 @@ class WeightWatcher:
+                         "Training is progressing normally."
+                     )
+                     await wait_for_path(stable_marker)
++                weights_path = inference_weight_path(self.config, weights_path, self.lora_name)
+             self.last_wait_for_ckpt_time = time.perf_counter() - t0
+ 
+-            # Publish confirmed: the policy version advances here, before the
+-            # apply — inference pauses during the update, so nothing can generate
+-            # under the new number from the old weights, and a ship held on this
+-            # version releases without waiting out the inference weight reload.
+-            self.ckpt_step = next_step
+-            self.policy.version = next_step
+-
+-            # Drain off-policy rollouts BEFORE pausing the inference engines.
+-            # Aborting a rollout triggers vLLM's KV-connector cleanup (NIXL's
+-            # ``_reqs_not_processed``), which is only propagated to the workers
+-            # while the engine is stepping. If we drain after resume instead,
+-            # the aborts race with the flush of KV transfers that completed
+-            # during the pause and trip ``assert req_id in self.requests`` in
+-            # the decode scheduler's ``_update_from_kv_xfer_finished`` — killing
+-            # the engine and cascading to every DP rank. Draining first lets the
+-            # aborts settle under normal stepping. ``on_new_version`` (below)
+-            # still runs post-update for observers that need the live version.
++            # Stop old-policy rollouts before changing the adapter.
+             for observer in self.observers:
+                 try:
+                     await observer.on_version_pending(next_step)
+@@ -136,14 +137,17 @@ class WeightWatcher:
+ 
+             get_logger().debug(f"Updating weights to step {next_step}")
+             t1 = time.perf_counter()
+-            await self.inference.update_weights(weights_path, lora_name=self.lora_name, step=next_step)
++            lora_name = f"{self.lora_name}-slot{next_step % 2}" if self.lora_name is not None else None
++            await self.inference.update_weights(weights_path, lora_name=lora_name, step=next_step)
+             self.last_update_weights_time = time.perf_counter() - t1
+             self.update_count += 1
+             get_logger().debug(f"Updated weights to step {next_step} in {format_time(self.last_update_weights_time)}")
++            self.ckpt_step = next_step
++            self.policy.version = next_step
+ 
+-            if self.lora_name is not None:
+-                self.inference.update_model_name(self.lora_name)
+-                self.policy.model_name = self.lora_name
++            if lora_name is not None:
++                self.inference.update_model_name(lora_name)
++                self.policy.model_name = lora_name
+ 
+             for observer in self.observers:
+                 try:
+diff --git a/src/prime_rl/utils/client.py b/src/prime_rl/utils/client.py
+index 2d35f122..5714f042 100644
+--- a/src/prime_rl/utils/client.py
++++ b/src/prime_rl/utils/client.py
+@@ -66,7 +66,7 @@ class InferencePool(Protocol):
+         """Wait for inference pool to be ready."""
+         ...
+ 
+-    async def update_weights(self, weight_dir: Path | None, lora_name: str | None = None, step: int = 0) -> None:
++    async def update_weights(self, weight_dir: Path | str | None, lora_name: str | None = None, step: int = 0) -> None:
+         """Update weights on all inference servers."""
+         ...
+ 
+@@ -175,7 +175,7 @@ class StaticInferencePool:
+         )
+         await maybe_check_has_model(self._admin_clients, model_name, skip_model_check=self._skip_model_check)
+ 
+-    async def update_weights(self, weight_dir: Path | None, lora_name: str | None = None, step: int = 0) -> None:
++    async def update_weights(self, weight_dir: Path | str | None, lora_name: str | None = None, step: int = 0) -> None:
+         await update_weights(self._admin_clients, weight_dir, lora_name=lora_name, step=step)
+ 
+     async def score(self, token_ids: list[int]) -> list[float]:
+@@ -393,7 +393,7 @@ async def _resume_engines(admin_clients: list[AsyncClient]) -> None:
+ 
+ async def update_weights(
+     admin_clients: list[AsyncClient],
+-    weight_dir: Path | None,
++    weight_dir: Path | str | None,
+     lora_name: str | None = None,
+     step: int = 0,
+ ) -> None:
+@@ -409,7 +409,7 @@ async def update_weights(
+     """
+     logger = get_logger()
+ 
+-    weight_dir_posix = weight_dir.as_posix() if weight_dir is not None else None
++    weight_dir_posix = str(weight_dir) if weight_dir is not None else None
+ 
+     if lora_name is not None and weight_dir is not None:
+         await load_lora_adapter(admin_clients, lora_name, weight_dir)
+@@ -420,6 +420,7 @@ async def update_weights(
+         try:
+             # Create ready marker before servers enter receive path (used by NCCL broadcast)
+             if weight_dir is not None:
++                assert isinstance(weight_dir, Path)
+                 nccl_ready_file = weight_dir / NCCL_READY_MARKER
+                 nccl_ready_file.parent.mkdir(parents=True, exist_ok=True)
+                 nccl_ready_file.touch()
+@@ -453,18 +454,12 @@ def _is_retryable_lora_error(exception: BaseException) -> bool:
+     return False
+ 
+ 
+-# Per-attempt and total bounds for `/load_lora_adapter`. A LoRA load is fast
+-# (small adapter file + KV cache reset, single-digit seconds in practice) but
+-# the global admin AsyncClient uses `timeout=None`, so a stuck server hangs
+-# the orchestrator forever inside `ElasticInferencePool._sync_server_adapter`.
+-# `_PER_ATTEMPT` converts a hang into a TimeoutException so tenacity retries;
+-# `_TOTAL` is the wall-clock budget across all retries — pick whichever
+-# stop condition fires first.
+-LORA_LOAD_READ_TIMEOUT_S = 30.0
+-LORA_LOAD_TOTAL_TIMEOUT_S = 120.0
++# Adapter files cross the control tunnel before vLLM loads them.
++LORA_LOAD_READ_TIMEOUT_S = 300.0
++LORA_LOAD_TOTAL_TIMEOUT_S = 600.0
+ 
+ 
+-async def load_lora_adapter(admin_clients: list[AsyncClient], lora_name: str, lora_path: Path) -> None:
++async def load_lora_adapter(admin_clients: list[AsyncClient], lora_name: str, lora_path: Path | str) -> None:
+     """Make a HTTP post request to the vLLM server to load a LoRA adapter.
+ 
+     Uses our wrapper around vLLM's /v1/load_lora_adapter. The prefix cache is not reset
+@@ -475,22 +470,56 @@ async def load_lora_adapter(admin_clients: list[AsyncClient], lora_name: str, lo
+     which can happen due to NFS propagation delays.
+     """
+     logger = get_logger()
+-    lora_path_posix = lora_path.as_posix()
++    lora_path_posix = str(lora_path)
+ 
+     @retry(
+         retry=retry_if_exception(_is_retryable_lora_error),
+-        stop=stop_after_delay(LORA_LOAD_TOTAL_TIMEOUT_S) | stop_after_attempt(10),
++        # An engine restart takes 5 to 10 minutes. Keep retrying for the
++        # complete wall-clock budget instead of stopping after ten fast
++        # connection failures.
++        stop=stop_after_delay(LORA_LOAD_TOTAL_TIMEOUT_S),
+         wait=wait_exponential(multiplier=1, min=1, max=10),
+         reraise=True,
+     )
++    async def _adapter_is_visible(admin_client: AsyncClient) -> bool:
++        try:
++            response = await admin_client.get(
++                "/v1/models",
++                timeout=httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0),
++            )
++            response.raise_for_status()
++            return any(model.get("id") == lora_name for model in response.json().get("data", []))
++        except Exception:
++            return False
++
+     async def _load_lora_adapter(admin_client: AsyncClient) -> None:
+         logger.debug(f"Sending request to load LoRA adapter {lora_name} from {lora_path}")
+-        response = await admin_client.post(
+-            "/load_lora_adapter",
+-            json={"lora_name": lora_name, "lora_path": lora_path_posix},
+-            timeout=httpx.Timeout(connect=10.0, read=LORA_LOAD_READ_TIMEOUT_S, write=60.0, pool=10.0),
+-        )
+-        response.raise_for_status()
++        try:
++            # Some vLLM workers finish the collective LoRA load but never
++            # finish the HTTP response. Enforce one absolute deadline in
++            # addition to httpx's idle read timeout.
++            response = await asyncio.wait_for(
++                admin_client.post(
++                    "/load_lora_adapter",
++                    json={"lora_name": lora_name, "lora_path": lora_path_posix},
++                    timeout=httpx.Timeout(
++                        connect=10.0,
++                        read=LORA_LOAD_READ_TIMEOUT_S,
++                        write=60.0,
++                        pool=10.0,
++                    ),
++                ),
++                timeout=LORA_LOAD_READ_TIMEOUT_S,
++            )
++            response.raise_for_status()
++        except (TimeoutError, httpx.TimeoutException, httpx.TransportError):
++            if await _adapter_is_visible(admin_client):
++                logger.warning(
++                    f"LoRA load response from {admin_client.base_url} did not finish, "
++                    f"but adapter {lora_name} is visible; accepting the completed load"
++                )
++                return
++            raise
+ 
+     await asyncio.gather(*[_load_lora_adapter(admin_client) for admin_client in admin_clients])
+ 

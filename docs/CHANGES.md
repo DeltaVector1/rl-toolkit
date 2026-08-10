@@ -25,6 +25,27 @@ if you want to apply the changes one at a time:
 git am patches/series/*.patch
 ```
 
+# PRIME-RL V0.8.0 SOURCE-MAINTENANCE PORT
+
+`patches/prime-rl/v0.8.0-glm52/` contains an eight-patch port to the exact
+Prime-RL v0.8.0 release at
+`60bc29547a8824ad1de7b9af8d265e2b27b2a72d`. The directory README records the
+inventory, excluded diagnostics and INT4 weight code, dependency revisions,
+validation results, and the remaining semantic gates.
+
+This patch series is not deployed. It does not change the current Prime-RL
+pin or x56p. Prime-RL v0.8.0 changes packing, transport, LoRA, environment,
+configuration, and vLLM interfaces. The current x56p orchestrator
+configuration fails the v0.8.0 schema and must be rewritten before a runtime
+gate.
+
+The matching v0.8.0 dependency ports are:
+
+```
+patches/renderers/v0.8.0-disconnected-and-tokenizer.patch
+patches/verifiers/v0.8.0-disconnected-provider-retry.patch
+```
+
 # HARD OFF-POLICY REJECTION
 
 The dispatch gate limits new work, but completed groups can remain buffered

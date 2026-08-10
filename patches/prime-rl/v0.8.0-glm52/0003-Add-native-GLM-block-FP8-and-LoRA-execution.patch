@@ -1,0 +1,2151 @@
+From f203c00f74d892c8f1181b92deedf9373302a2d6 Mon Sep 17 00:00:00 2001
+From: DeltaVector1 <DeltaVector1@users.noreply.github.com>
+Date: Mon, 10 Aug 2026 02:44:16 +0000
+Subject: [PATCH 3/8] Add native GLM block-FP8 and LoRA execution
+
+---
+ src/prime_rl/trainer/fp8_checkpoint.py        | 210 ++++++
+ src/prime_rl/trainer/lora.py                  |  68 ++
+ src/prime_rl/trainer/model.py                 | 220 +++++--
+ .../trainer/models/layers/checkpointing.py    |  73 ++-
+ src/prime_rl/trainer/models/layers/fp8_ada.py | 618 ++++++++++++++++++
+ .../models/layers/lora/multi_linear.py        | 123 ++--
+ src/prime_rl/trainer/models/layers/moe.py     | 196 ++++--
+ src/prime_rl/trainer/models/layers/norms.py   |  30 +-
+ src/prime_rl/trainer/weights.py               |  76 ++-
+ 9 files changed, 1411 insertions(+), 203 deletions(-)
+ create mode 100644 src/prime_rl/trainer/fp8_checkpoint.py
+ create mode 100644 src/prime_rl/trainer/models/layers/fp8_ada.py
+
+diff --git a/src/prime_rl/trainer/fp8_checkpoint.py b/src/prime_rl/trainer/fp8_checkpoint.py
+new file mode 100644
+index 00000000..a8678dfe
+--- /dev/null
++++ b/src/prime_rl/trainer/fp8_checkpoint.py
+@@ -0,0 +1,210 @@
++import dataclasses
++import re
++
++import torch
++from safetensors import safe_open
++from torch.distributed.checkpoint._hf_utils import _HFStorageInfo
++from torch.distributed.checkpoint.hf_storage import HuggingFaceStorageReader
++from torch.distributed.checkpoint.metadata import ChunkStorageMetadata, MetadataIndex, TensorStorageMetadata
++from torch.distributed.checkpoint.planner import LoadPlan, LoadPlanner, ReadItem
++from torch.futures import Future
++
++
++_EXPERT = re.compile(
++    r"^(model\.layers\.\d+\.mlp)\.experts\.(\d+)\.(gate|down|up)_proj\.(weight|weight_scale_inv)$"
++)
++_PROJECTIONS = {"gate": "w1", "down": "w2", "up": "w3"}
++
++
++@dataclasses.dataclass
++class _FP8StorageInfo(_HFStorageInfo):
++    source_key: str = ""
++    stacked: bool = False
++    quantized: bool = False
++    dequantize: bool = False
++    bitcast: bool = False
++
++
++class FP8CheckpointStorageReader(HuggingFaceStorageReader):
++    def __init__(self, *args, dequantize_all: bool = False, **kwargs):
++        super().__init__(*args, **kwargs)
++        self.dequantize_all = dequantize_all
++
++    def read_metadata(self):
++        metadata = super().read_metadata()
++        storage_by_fqn = {}
++        for index in metadata.storage_data:
++            storage_by_fqn.setdefault(index.fqn, []).append(index)
++        quantized_weights = {
++            key
++            for key in storage_by_fqn
++            if key.endswith(".weight") and key.removesuffix(".weight") + ".weight_scale_inv" in storage_by_fqn
++        }
++
++        groups = {}
++        for key in list(metadata.state_dict_metadata):
++            if match := _EXPERT.match(key):
++                prefix, expert, projection, kind = match.groups()
++                groups.setdefault((prefix, projection, kind), []).append((int(expert), key))
++
++        for (prefix, projection, kind), sources in groups.items():
++            suffix = "_scale_inv" if kind == "weight_scale_inv" else ""
++            target = f"{prefix}.experts.{_PROJECTIONS[projection]}{suffix}"
++            chunks = []
++            properties = None
++            size = None
++            for expert, source in sorted(sources):
++                source_metadata = metadata.state_dict_metadata.pop(source)
++                properties = source_metadata.properties
++                source_shape = source_metadata.size
++                size = torch.Size((len(sources), *source_shape))
++                offset = torch.Size((expert, *([0] * len(source_shape))))
++                chunks.append(
++                    ChunkStorageMetadata(
++                        offsets=offset,
++                        sizes=torch.Size((1, *source_shape)),
++                    )
++                )
++                self._move_storage(
++                    metadata,
++                    storage_by_fqn,
++                    source,
++                    target,
++                    offset,
++                    stacked=True,
++                    quantized=source in quantized_weights,
++                    dequantize=self.dequantize_all and source in quantized_weights,
++                )
++            metadata.state_dict_metadata[target] = TensorStorageMetadata(
++                properties=properties,
++                size=size,
++                chunks=chunks,
++            )
++
++        renames = {
++            ".mlp.gate.weight": ".mlp.router.gate.weight",
++            ".mlp.gate.e_score_correction_bias": ".mlp.expert_bias",
++            ".mlp.shared_experts.gate_proj.weight": ".mlp.shared_expert.w1",
++            ".mlp.shared_experts.gate_proj.weight_scale_inv": ".mlp.shared_expert.w1_scale_inv",
++            ".mlp.shared_experts.down_proj.weight": ".mlp.shared_expert.w2",
++            ".mlp.shared_experts.down_proj.weight_scale_inv": ".mlp.shared_expert.w2_scale_inv",
++            ".mlp.shared_experts.up_proj.weight": ".mlp.shared_expert.w3",
++            ".mlp.shared_experts.up_proj.weight_scale_inv": ".mlp.shared_expert.w3_scale_inv",
++        }
++        for source in list(metadata.state_dict_metadata):
++            for suffix, replacement in renames.items():
++                if source.endswith(suffix):
++                    target = source.removesuffix(suffix) + replacement
++                    metadata.state_dict_metadata[target] = metadata.state_dict_metadata.pop(source)
++                    self._move_storage(
++                        metadata,
++                        storage_by_fqn,
++                        source,
++                        target,
++                        torch.Size([0] * len(metadata.state_dict_metadata[target].size)),
++                        quantized=source in quantized_weights,
++                        dequantize=self.dequantize_all and source in quantized_weights,
++                    )
++                    break
++
++        for source in metadata.state_dict_metadata:
++            quantized = source in quantized_weights
++            dequantize = (
++                self.dequantize_all and quantized
++            ) or source.endswith((".self_attn.kv_b_proj.weight", ".self_attn.indexer.wk.weight"))
++            bitcast = False
++            if quantized or dequantize or bitcast:
++                for index in storage_by_fqn[source]:
++                    info = metadata.storage_data[index]
++                    metadata.storage_data[index] = _FP8StorageInfo(
++                        relative_path=info.relative_path,
++                        shape=info.shape,
++                        dtype=info.dtype,
++                        source_key=source,
++                        quantized=quantized,
++                        dequantize=dequantize,
++                        bitcast=bitcast,
++                    )
++        return metadata
++
++    @staticmethod
++    def _move_storage(
++        metadata,
++        storage_by_fqn,
++        source,
++        target,
++        target_offset,
++        stacked=False,
++        quantized=False,
++        dequantize=False,
++    ):
++        for index in storage_by_fqn.pop(source, ()):
++            info = metadata.storage_data.pop(index)
++            metadata.storage_data[MetadataIndex(target, target_offset)] = _FP8StorageInfo(
++                relative_path=info.relative_path,
++                shape=info.shape,
++                dtype=info.dtype,
++                source_key=source,
++                stacked=stacked,
++                quantized=quantized,
++                dequantize=dequantize,
++            )
++
++    @staticmethod
++    def _process_request(file, request: ReadItem, planner: LoadPlanner, info: _FP8StorageInfo):
++        slices = tuple(
++            slice(offset, offset + length)
++            for offset, length in zip(request.storage_offsets, request.lengths)
++        )
++        tensor = file.get_slice(info.source_key)[slices[1:] if info.stacked else slices]
++        target = planner.resolve_tensor(request).detach()
++        if info.stacked:
++            tensor = tensor.unsqueeze(0)
++        # Some serialized FP8 matrices cannot use the native 128x128 kernel
++        # because one dimension has a partial final block. Those modules stay
++        # as ordinary BF16 Linear layers. DCP otherwise casts their raw E4M3
++        # values to BF16 without applying weight_scale_inv, corrupting the
++        # model by orders of magnitude (GLM kv_a is [576, 6144]).
++        dequantize = info.dequantize or (info.quantized and target.dtype != tensor.dtype)
++        if dequantize:
++            scale = file.get_tensor(
++                info.source_key.removesuffix(".weight") + ".weight_scale_inv"
++            )
++            row_slice = slices[1] if info.stacked else slices[0]
++            col_slice = slices[2] if info.stacked else slices[1]
++            rows = torch.arange(row_slice.start, row_slice.stop) // 128
++            cols = torch.arange(col_slice.start, col_slice.stop) // 128
++            block_scale = scale[rows][:, cols]
++            if info.stacked:
++                block_scale = block_scale.unsqueeze(0)
++            # Apply the checkpoint's FP32 inverse scales before the final
++            # target-dtype rounding.  Casting the scales to BF16 first causes
++            # a second, avoidable rounding and does not match vLLM's
++            # scaled_dequantize path for fused MLA/indexer weights.
++            tensor = (tensor.float() * block_scale.float()).to(target.dtype)
++        elif info.bitcast:
++            tensor = tensor.view(torch.uint8)
++        if target.size() != tensor.size():
++            raise AssertionError(
++                f"{request.storage_index} mismatch sizes {target.size()} vs {tensor.size()}"
++            )
++        target.copy_(tensor)
++        planner.commit_tensor(request, target)
++
++    def read_data(self, plan: LoadPlan, planner: LoadPlanner) -> Future[None]:
++        per_file = {}
++        for item in plan.items:
++            info = self.storage_data[item.storage_index]
++            per_file.setdefault(info.relative_path, []).append((item, info))
++
++        for file_name, requests in per_file.items():
++            with safe_open(file_name, framework="pt") as file:
++                for request, info in requests:
++                    if isinstance(info, _FP8StorageInfo):
++                        self._process_request(file, request, planner, info)
++                    else:
++                        self._process_read_request(file, request, planner)
++
++        future = Future()
++        future.set_result(None)
++        return future
+diff --git a/src/prime_rl/trainer/lora.py b/src/prime_rl/trainer/lora.py
+index e5b00036..317dc0f8 100644
+--- a/src/prime_rl/trainer/lora.py
++++ b/src/prime_rl/trainer/lora.py
+@@ -213,6 +213,17 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> None:
+         lora_module.register_with_runs(get_multi_run_manager(), module_name)
+         _set_module_by_name(model, module_name, lora_module)
+ 
++    if config.initial_adapter_path is not None:
++        # MultiRunManager resets a slot when it discovers a new orchestrator
++        # run. Loading here would be silently erased by that later reset.
++        # The creation hook runs immediately after reset on every rank.
++        initial_adapter_path = config.initial_adapter_path
++
++        def load_after_run_reset(adapter_idx: int, _run_id: str) -> None:
++            load_initial_lora_adapter(model, initial_adapter_path, adapter_idx)
++
++        get_multi_run_manager().register_creation_hook(load_after_run_reset)
++
+     freeze_all_except_lora_and_specified(model, config)
+ 
+     total_params = sum(p.numel() for p in model.parameters())
+@@ -234,6 +245,63 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> None:
+     logger.info(f"LoRA: {adapted_or_trainable:,} adapted or fully trainable out of {total_params:,} parameters")
+ 
+ 
++def load_initial_lora_adapter(model: nn.Module, adapter_path: str, adapter_idx: int = 0) -> None:
++    """Load one exported PEFT adapter into a freshly created MultiLoRA slot.
++
++    This restores the policy after a trainer restart without loading the
++    frozen base checkpoint again from a distributed checkpoint. Optimizer
++    state is not restored.
++    """
++    from pathlib import Path
++
++    from safetensors.torch import load_file
++
++    path = Path(adapter_path)
++    if path.is_dir():
++        path = path / "adapter_model.safetensors"
++    if not path.is_file():
++        raise FileNotFoundError(f"Initial LoRA adapter not found: {path}")
++
++    state_dict = load_file(str(path), device="cpu")
++    expected: dict[str, nn.Parameter] = {}
++    for module_name, module in model.named_modules():
++        if not isinstance(module, MultiLoRAModule):
++            continue
++        if adapter_idx >= module.n_adapters:
++            raise ValueError(
++                f"Initial LoRA adapter index {adapter_idx} is invalid for "
++                f"{module_name} with {module.n_adapters} slots"
++            )
++        for param_name, param in module.named_parameters_for_adapter(adapter_idx):
++            expected[f"{module_name}.{param_name}.weight"] = param
++
++    missing = sorted(set(expected) - set(state_dict))
++    unexpected = sorted(set(state_dict) - set(expected))
++    if missing:
++        raise ValueError(
++            "Initial LoRA adapter keys do not match the local pipeline stage: "
++            f"missing={missing[:5]} ({len(missing)} total)"
++        )
++    # Every PP stage loads the same global adapter file but constructs only its
++    # own layers. Keys for the other stages are therefore expected here. A
++    # missing or misspelled key still fails on the stage that owns that layer.
++
++    with torch.no_grad():
++        for key, param in expected.items():
++            value = state_dict[key]
++            if tuple(value.shape) != tuple(param.shape):
++                raise ValueError(
++                    f"Initial LoRA adapter shape mismatch for {key}: "
++                    f"checkpoint={tuple(value.shape)}, model={tuple(param.shape)}"
++                )
++            param.copy_(value.to(device=param.device, dtype=param.dtype))
++
++    get_logger().info(
++        f"Loaded {len(expected)} initial LoRA tensors from {path} into adapter slot "
++        f"{adapter_idx}; ignored {len(unexpected)} tensors owned by other pipeline stages"
++    )
++
++
+ def has_lora_layers(model: nn.Module) -> bool:
+     """Check if model has LoRA layers."""
+     for module in model.modules():
+diff --git a/src/prime_rl/trainer/model.py b/src/prime_rl/trainer/model.py
+index d2d67038..1bceaf78 100644
+--- a/src/prime_rl/trainer/model.py
++++ b/src/prime_rl/trainer/model.py
+@@ -35,6 +35,7 @@ from prime_rl.configs.trainer import (
+     TokenizerConfig,
+ )
+ from prime_rl.trainer.distributed import DeepEPExpertParallel, MXFP8AllToAllExpertParallel
++from prime_rl.trainer.fp8_checkpoint import FP8CheckpointStorageReader
+ from prime_rl.trainer.lora import apply_lora_to_model, freeze_all_except_lora_and_specified, strip_lora_from_state_dict
+ from prime_rl.trainer.models import (
+     AutoModelForCausalLMPrimeRL,
+@@ -50,6 +51,12 @@ from prime_rl.trainer.models.layers.checkpointing import (
+     set_selective_activation_checkpointing,
+     supports_selective_activation_checkpointing,
+ )
++from prime_rl.trainer.models.layers.fp8_ada import (
++    replace_linear as replace_linear_with_fp8_checkpoint,
++)
++from prime_rl.trainer.models.layers.fp8_ada import (
++    set_diagnose_linear_backward,
++)
+ from prime_rl.trainer.models.layers.fp8_linear import replace_linear_with_fp8_blockwise_linear
+ from prime_rl.trainer.models.layers.lm_head import inject_prime_lm_head
+ from prime_rl.trainer.models.layers.moe import LatentMoE, MoE, TokenChoiceTopKRouter
+@@ -68,6 +75,19 @@ from prime_rl.utils.utils import format_time
+ from prime_rl.utils.vlm import get_language_model, get_vision_encoder, is_vlm_architecture
+ 
+ 
++def iter_layers(layers):
++    """Yield decoder layer modules from a ModuleList or the ModuleDict used under PP.
++
++    Pipeline parallelism replaces ``layers`` with a ModuleDict keyed by global
++    layer index so checkpoint names keep resolving. Iterating a ModuleDict
++    directly yields its string keys, so every call site that walks the decoder
++    must go through this.
++    """
++    import torch.nn as _nn
++
++    return layers.values() if isinstance(layers, _nn.ModuleDict) else layers
++
++
+ def pre_download_model(model_name: str) -> None:
+     """Pre-download model from HuggingFace Hub so all nodes have cached weights before training."""
+     if Path(model_name).exists():
+@@ -388,7 +408,7 @@ def freeze_moe_router(model: nn.Module) -> None:
+     language_model = get_language_model(model)
+     num_frozen = 0
+ 
+-    for layer in language_model.layers:
++    for layer in iter_layers(language_model.layers):
+         mlp = layer.mlp if hasattr(layer, "mlp") else layer.feed_forward if hasattr(layer, "feed_forward") else None
+         if mlp is None:
+             continue
+@@ -419,7 +439,7 @@ def apply_fp32_moe_router(model: nn.Module) -> None:
+     language_model = get_language_model(model)
+     num_routers = 0
+ 
+-    for layer in language_model.layers:
++    for layer in iter_layers(language_model.layers):
+         mlp = layer.mlp if hasattr(layer, "mlp") else layer.feed_forward if hasattr(layer, "feed_forward") else None
+         if isinstance(mlp, (MoE, LatentMoE)):
+             mlp.router.to(torch.float32)
+@@ -457,12 +477,12 @@ def freeze_sparse_indexer(model: nn.Module) -> None:
+ 
+ 
+ def apply_force_balanced_routing(model: nn.Module) -> None:
+-    """Force MoE token-choice routers into round-robin assignment for fake-data smoke tests."""
++    """Force MoE token-choice routers into round-robin assignment for balanced-routing checks."""
+     logger = get_logger()
+     language_model = get_language_model(model)
+     num_routers = 0
+ 
+-    for layer in language_model.layers:
++    for layer in iter_layers(language_model.layers):
+         mlp = layer.mlp if hasattr(layer, "mlp") else layer.feed_forward if hasattr(layer, "feed_forward") else None
+         if isinstance(mlp, (MoE, LatentMoE)):
+             mlp.router.force_balanced = True
+@@ -488,7 +508,7 @@ def configure_moe_ep_backend(model: nn.Module, config: ModelConfig) -> None:
+ 
+         configure_num_sms(config.deepep_num_sms)
+     language_model = get_language_model(model)
+-    for transformer_block in language_model.layers:
++    for transformer_block in iter_layers(language_model.layers):
+         if not isinstance(transformer_block.mlp, (MoE, LatentMoE)):
+             continue
+         transformer_block.mlp.set_ep_comm_backend(backend)
+@@ -501,7 +521,7 @@ def get_load_balance_stats(
+     per_layer_max_vio = []
+     per_layer_routing_confidence = []
+     language_model = get_language_model(model)
+-    for transformer_block in language_model.layers:
++    for transformer_block in iter_layers(language_model.layers):
+         # This is necessary for models that have mixed dense layers
+         block_mlp = getattr(transformer_block, "mlp", None)
+         if block_mlp is None or not hasattr(block_mlp, "tokens_per_expert"):
+@@ -590,11 +610,24 @@ def get_model(
+         if subconfig is not None and hasattr(subconfig, "use_cache"):
+             subconfig.use_cache = False
+     model_config.use_grouped_mm = config.moe_use_grouped_mm
+-    # MoEArgs.fp8 (read via getattr(config, "fp8") in the modeling files) gates the
+-    # DeepGEMM FP8 grouped GEMM. MXFP8 grouped GEMM is applied by wrapping the expert
+-    # weights with torchao (see apply_quantization), so it leaves this flag False and
+-    # the experts keep calling torch._grouped_mm — which the wrapper tensor intercepts.
+-    model_config.fp8 = isinstance(config.quantization, FP8Config) and config.quantization.enable_grouped_gemm
++    checkpoint_quantization = getattr(model_config, "quantization_config", {})
++    model_config.fp8_source_checkpoint = isinstance(config.quantization, FP8Config) and (
++        checkpoint_quantization.get("quant_method") == "fp8"
++        and checkpoint_quantization.get("weight_block_size") == [128, 128]
++    )
++    model_config.fp8_checkpoint = model_config.fp8_source_checkpoint and not config.quantization.dequantize_checkpoint
++    model_config.fp8_checkpoint_linears = model_config.fp8_checkpoint
++    model_config.fp8_checkpoint_moe = model_config.fp8_checkpoint
++    model_config.fp8_checkpoint_routed_moe = model_config.fp8_checkpoint
++    model_config.fp8_checkpoint_shared_moe = model_config.fp8_checkpoint
++    model_config.fp8_checkpoint_dequantized = (
++        model_config.fp8_source_checkpoint and config.quantization.dequantize_checkpoint
++    )
++    model_config.fp8 = (
++        isinstance(config.quantization, FP8Config)
++        and config.quantization.enable_grouped_gemm
++        and not model_config.fp8_source_checkpoint
++    )
+ 
+     if config.index_cache is not None:
+         model_config.use_index_cache = True
+@@ -765,19 +798,24 @@ def setup_processor(config: ModelConfig):
+ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
+     mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=DTYPE_MAP[config.reduce_dtype])
+     offload_policy: OffloadPolicy = CPUOffloadPolicy(pin_memory=True) if config.fsdp_cpu_offload else OffloadPolicy()
++    cold_offload_policy: OffloadPolicy = (
++        CPUOffloadPolicy(pin_memory=True) if config.cold_cpu_offload else offload_policy
++    )
+ 
+     fsdp_config = {
+         "mp_policy": mp_policy,
+         "offload_policy": offload_policy,
+         "reshard_after_forward": config.reshard_after_forward,
+     }
++    packed_fsdp_config = {**fsdp_config, "mp_policy": MixedPrecisionPolicy()}
++    native_fp8 = getattr(model.config, "fp8_checkpoint", False)
+ 
+     hsdp_mesh = parallel_dims.get_mesh("hsdp")
+ 
+     dp_mod_ep_mesh: DeviceMesh | None = None
+     if parallel_dims.ep_enabled:
+         dp_mod_ep_mesh_dim_names = []
+-        if parallel_dims.dp_replicate_enabled:
++        if parallel_dims.dp_replicate_enabled and not parallel_dims.global_ep:
+             dp_mod_ep_mesh_dim_names.append("dp_replicate")
+         dp_mod_ep_mesh_dim_names.append("dp_shard_mod_ep")
+ 
+@@ -793,14 +831,28 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
+         get_logger().info(f"Applied FSDP to vision encoder (frozen={config.vlm.freeze_vision_encoder})")
+ 
+     language_model = get_language_model(model, override=config.vlm.language_model_attr if is_vlm_training else None)
+-    transformer_layers = language_model.layers
++    transformer_layers = iter_layers(language_model.layers)
+ 
+     for transformer_block in transformer_layers:
+         block_mlp = getattr(transformer_block, "mlp", None)
+-        if parallel_dims.ep_enabled and block_mlp is not None and isinstance(block_mlp, (MoE, LatentMoE)):
+-            fully_shard(block_mlp.experts, mesh=dp_mod_ep_mesh, **fsdp_config)
+-
+-            block_mlp.experts.set_gradient_divide_factor(parallel_dims.fsdp_gradient_divide_factor)
++        if isinstance(block_mlp, (MoE, LatentMoE)):
++            if native_fp8:
++                fully_shard(
++                    block_mlp.experts,
++                    mesh=dp_mod_ep_mesh if parallel_dims.ep_enabled else hsdp_mesh,
++                    **packed_fsdp_config,
++                )
++                if block_mlp.shared_expert is not None:
++                    fully_shard(
++                        block_mlp.shared_expert,
++                        mesh=hsdp_mesh,
++                        **{**packed_fsdp_config, "offload_policy": cold_offload_policy},
++                    )
++            elif parallel_dims.ep_enabled:
++                fully_shard(block_mlp.experts, mesh=dp_mod_ep_mesh, **fsdp_config)
++
++            if parallel_dims.ep_enabled:
++                block_mlp.experts.set_gradient_divide_factor(parallel_dims.fsdp_gradient_divide_factor)
+ 
+         if config.moe_router_dtype == "float32" and isinstance(block_mlp, (MoE, LatentMoE)):
+             # Own FSDP unit with an fp32 policy so the gate weight is not cast to
+@@ -809,34 +861,45 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
+                 block_mlp.router,
+                 mesh=hsdp_mesh,
+                 mp_policy=MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32),
+-                offload_policy=offload_policy,
++                offload_policy=cold_offload_policy,
+                 reshard_after_forward=config.reshard_after_forward,
+             )
+ 
+         fully_shard(
+             transformer_block,
+             mesh=hsdp_mesh,
+-            **fsdp_config,
++            **(packed_fsdp_config if native_fp8 else fsdp_config),
+         )
+ 
+     shard_norm_and_lm_head = hasattr(model, "config") and not model.config.tie_word_embeddings
+ 
+     if shard_norm_and_lm_head:
+-        # This optimization breaks weight tying
++        # This optimization breaks weight tying.
++        # Under pipeline parallelism only the first stage owns the embedding and
++        # only the last owns the norm and output head, so shard whichever of
++        # these this stage actually has.
+         embed_module = getattr(language_model, "embed_tokens", None) or getattr(language_model, "embeddings", None)
+-        fully_shard(
+-            embed_module,
+-            mesh=hsdp_mesh,
+-            **fsdp_config,
+-        )
+-        norm_module = getattr(language_model, "norm", None) or language_model.norm_f
+-        fully_shard(
+-            [model.lm_head, norm_module],
+-            mesh=hsdp_mesh,
+-            mp_policy=mp_policy,
+-            offload_policy=offload_policy,
+-            reshard_after_forward=False,
+-        )
++        if embed_module is not None:
++            fully_shard(
++                embed_module,
++                mesh=hsdp_mesh,
++                **{
++                    **(packed_fsdp_config if native_fp8 and config.fp8_embed_head else fsdp_config),
++                    "offload_policy": cold_offload_policy,
++                },
++            )
++        norm_module = getattr(language_model, "norm", None) or getattr(language_model, "norm_f", None)
++        lm_head_module = getattr(model, "lm_head", None)
++        if norm_module is not None and lm_head_module is not None:
++            fully_shard(
++                [lm_head_module, norm_module],
++                mesh=hsdp_mesh,
++                mp_policy=MixedPrecisionPolicy()
++                if native_fp8 and (config.fp8_embed_head or config.fp8_lm_head)
++                else mp_policy,
++                offload_policy=cold_offload_policy,
++                reshard_after_forward=False,
++            )
+     else:
+         get_logger().warning("Model uses tied word embeddings, so skipping the last-layer no-reshard optimization.")
+ 
+@@ -854,7 +917,7 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
+     # if EP is enabled, d2h syncs in the dispatch/combine can interfere with FSDP prefetch, that's why we set it below manually
+     # the rest of the function handles only that
+ 
+-    transformer_blocks = list(language_model.layers)
++    transformer_blocks = list(iter_layers(language_model.layers))
+     next_transformer_blocks = transformer_blocks[1:] + [None]
+ 
+     embed_module = getattr(language_model, "embed_tokens", None) or getattr(language_model, "embeddings", None)
+@@ -869,7 +932,8 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
+                 prefetch_modules = [next_transformer_block]
+                 if isinstance(next_mlp.router, FSDPModule):
+                     prefetch_modules.append(next_mlp.router)
+-                prefetch_modules.append(next_mlp.experts)
++                if not native_fp8:
++                    prefetch_modules.append(next_mlp.experts)
+                 transformer_block.set_modules_to_forward_prefetch(prefetch_modules)
+             else:
+                 transformer_block.set_modules_to_forward_prefetch([next_transformer_block])
+@@ -878,7 +942,7 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
+                 transformer_block.set_modules_to_forward_prefetch([language_model.norm, model.lm_head])
+ 
+     # backward
+-    reversed_transformer_blocks = list(reversed(language_model.layers))
++    reversed_transformer_blocks = list(reversed(list(iter_layers(language_model.layers))))
+     prev_transformer_blocks = reversed_transformer_blocks[1:] + [None]
+ 
+     if language_model.norm is not None and model.lm_head is not None and len(language_model.layers) > 0:
+@@ -891,7 +955,9 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
+         if prev_transformer_block is not None:
+             prev_mlp = getattr(prev_transformer_block, "mlp", None)
+             if prev_mlp is not None and isinstance(prev_mlp, (MoE, LatentMoE)):
+-                prefetch_modules = [prev_transformer_block, prev_mlp.experts]
++                prefetch_modules = [prev_transformer_block]
++                if not native_fp8:
++                    prefetch_modules.append(prev_mlp.experts)
+                 if isinstance(prev_mlp.router, FSDPModule):
+                     prefetch_modules.append(prev_mlp.router)
+                 transformer_block.set_modules_to_backward_prefetch(prefetch_modules)
+@@ -903,8 +969,24 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
+ 
+ 
+ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
+-    device = "cpu" if config.fsdp_cpu_offload else "cuda"
++    device = "cpu" if config.fsdp_cpu_offload or config.cold_cpu_offload else "cuda"
+     model.to_empty(device=device)
++    if config.cold_cpu_offload and not config.fsdp_cpu_offload:
++        for name, module in model.named_modules():
++            cold = config.cold_cpu_offload and (
++                name.startswith("model.embed_tokens.")
++                or name == "model.embed_tokens"
++                or name.startswith("model.norm.")
++                or name == "model.norm"
++                or name.startswith("lm_head.")
++                or name == "lm_head"
++                or ".mlp.router." in name
++                or name.endswith(".mlp.router")
++                or ".mlp.shared_expert." in name
++                or name.endswith(".mlp.shared_expert")
++            )
++            if not cold:
++                module.to_empty(device="cuda", recurse=False)
+     torch.distributed.barrier()
+ 
+     def _init_buffers_post_meta():
+@@ -940,7 +1022,12 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
+         snapshot_is_hf = model.is_hf_state_dict(snapshot_keys)
+         snapshot_is_prime = model.is_prime_state_dict(snapshot_keys)
+ 
+-        if snapshot_is_hf and not snapshot_is_prime and model.is_prime_state_dict(model_keys):
++        if (
++            snapshot_is_hf
++            and not snapshot_is_prime
++            and model.is_prime_state_dict(model_keys)
++            and not getattr(model.config, "fp8_source_checkpoint", False)
++        ):
+             logger.warning(
+                 "Found HF weight format in snapshot state dict and PrimeRL weight format in model state dict. Trying to auto-convert..."
+             )
+@@ -977,10 +1064,14 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
+     state_dict = strip_lora_from_state_dict(state_dict)
+     if model.config.tie_word_embeddings:
+         state_dict.pop("lm_head.weight")
+-    dcp_load(
+-        state_dict,
+-        storage_reader=HuggingFaceStorageReader(path=snapshot_path.as_posix()),
+-    )
++    if getattr(model.config, "fp8_source_checkpoint", False):
++        reader = FP8CheckpointStorageReader(
++            path=snapshot_path.as_posix(),
++            dequantize_all=getattr(model.config, "fp8_checkpoint_dequantized", False),
++        )
++    else:
++        reader = HuggingFaceStorageReader(path=snapshot_path.as_posix())
++    dcp_load(state_dict, storage_reader=reader)
+     # Restore weight tying broken by to_empty() for HF models
+     if not isinstance(model, PreTrainedModelPrimeRL) and model.config.tie_word_embeddings:
+         model.tie_weights()
+@@ -1152,6 +1243,17 @@ def apply_quantization(model: nn.Module, config: ModelConfig) -> None:
+         return
+ 
+     if isinstance(quant, FP8Config):
++        set_diagnose_linear_backward(quant.diagnose_linear_backward)
++        if getattr(model.config, "fp8_checkpoint_dequantized", False):
++            return
++        if getattr(model.config, "fp8_checkpoint", False):
++            if getattr(model.config, "fp8_checkpoint_linears", False):
++                replace_linear_with_fp8_checkpoint(
++                    model,
++                    embed=config.fp8_embed_head,
++                    lm_head=config.fp8_lm_head,
++                )
++            return
+         replace_linear_with_fp8_blockwise_linear(model, ignore_modules=quant.ignore_patterns)
+     elif isinstance(quant, MXFP8Config):
+         capability = torch.cuda.get_device_capability()
+@@ -1166,12 +1268,14 @@ def apply_quantization(model: nn.Module, config: ModelConfig) -> None:
+ 
+ def apply_ep(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
+     language_model = get_language_model(model)
+-    for transformer_block in language_model.layers:
++    for transformer_block in iter_layers(language_model.layers):
+         block_mlp = getattr(transformer_block, "mlp", None)
+         if block_mlp is not None and isinstance(block_mlp, (MoE, LatentMoE)):
+             if config.ep_comm_backend == "torch":
+                 quant = config.quantization
+-                if isinstance(quant, MXFP8Config) and quant.enable_a2a:
++                if (isinstance(quant, MXFP8Config) and quant.enable_a2a) or (
++                    isinstance(quant, FP8Config) and config.global_ep
++                ):
+                     parallelize_plan = MXFP8AllToAllExpertParallel()
+                 else:
+                     parallelize_plan = ExpertParallel()
+@@ -1276,6 +1380,17 @@ def setup_model(
+     model = get_model(config, device=torch.device("meta"), dtype=DTYPE_MAP[config.optimization_dtype])
+     configure_moe_ep_backend(model, config)
+ 
++    # Trim to this rank's pipeline stage before anything else touches the model,
++    # so quantization, LoRA, EP sharding, AC and FSDP only ever see the layers
++    # this rank owns. Doing it here also means the checkpoint loader below only
++    # materialises this stage's weights.
++    pp_rank = None
++    if parallel_dims.pp_enabled:
++        from prime_rl.trainer.distributed.pipeline_parallel import apply_pp_layers
++
++        pp_rank = parallel_dims.get_mesh("pp").get_local_rank()
++        apply_pp_layers(model, pp_rank, parallel_dims.pp)
++
+     possible_to_load_to_meta = can_reinit_empty_buffers(model)
+ 
+     if config.debug.random_init and not possible_to_load_to_meta:
+@@ -1295,6 +1410,13 @@ def setup_model(
+ 
+     inject_prime_lm_head(model, chunk_size=lm_head_chunk_size)
+ 
++    # Drop norm/head on non-final stages only after the head has been injected,
++    # since inject_prime_lm_head requires a real nn.Linear to replace.
++    if pp_rank is not None:
++        from prime_rl.trainer.distributed.pipeline_parallel import apply_pp_boundaries
++
++        apply_pp_boundaries(model, pp_rank, parallel_dims.pp)
++
+     apply_quantization(model, config)
+ 
+     frozen_vision_encoder = configure_trainable_parameters(model, config)
+@@ -1383,12 +1505,18 @@ def forward(
+     # True when seq_lens holds the full pre-CP-shard document boundaries
+     # (kept global because documents can straddle the shard cut).
+     seq_lens_are_pre_shard: bool = False,
++    # Set instead of input_ids by a pipeline stage that is not the first: it
++    # receives hidden states from the previous stage rather than token ids.
++    inputs_embeds: Tensor | None = None,
+ ) -> PrimeLmOutput:
+     kwargs = {
+-        "input_ids": input_ids,
+         "labels": labels,
+         "temperature": temperature,
+     }
++    if inputs_embeds is not None:
++        kwargs["inputs_embeds"] = inputs_embeds
++    else:
++        kwargs["input_ids"] = input_ids
+ 
+     if mm_kwargs:
+         # Forward the per-model multimodal tensors verbatim, plus the
+diff --git a/src/prime_rl/trainer/models/layers/checkpointing.py b/src/prime_rl/trainer/models/layers/checkpointing.py
+index ef4c41cd..bb8df5f6 100644
+--- a/src/prime_rl/trainer/models/layers/checkpointing.py
++++ b/src/prime_rl/trainer/models/layers/checkpointing.py
+@@ -1,30 +1,4 @@
+-"""Selective activation checkpointing hooks for custom decoder layers.
+-
+-New model integration contract:
+-
+-- `norm`: no explicit hook is required. Every child module whose type name
+-  contains `norm` is checkpointed through `forward()`.
+-- `attn_proj`: expose `layer.self_attn.attn_projections(...)` for
+-  projection-side attention work before the core kernel, plus
+-  `layer.self_attn.output_proj(...)` for the post-attention output projection.
+-  This target is meant for attention-local work outside the main attention
+-  kernel, such as q/k/v projections, attention-local norms, RoPE, gating, and
+-  similar model-specific helpers.
+-- `mla_up_proj`: expose `layer.self_attn.mla_up_proj(...)` when MLA-style
+-  up-projection work should be checkpointed separately from
+-  `attn_projections(...)`.
+-- `mlp`: expose a dense `layer.mlp.forward(...)`. A module is treated as dense
+-  when it does not define `_run_routed_experts` or `tokens_per_expert`.
+-- `routed_experts`: expose `layer.mlp._run_routed_experts(...)` for the MoE
+-  expert path, and optionally `layer.mlp._run_local_routed_experts(...)` when
+-  local expert compute is separated from dispatch/combine.
+-- `linear_attn`: expose a token-mixer module on `layer.linear_attn` or
+-  `layer.mamba`, or reuse `layer.self_attn` when
+-  `layer.attention_type == "sliding_attention"`.
+-
+-These hook names are an intentional public interface for custom model support,
+-so new models should follow them directly rather than adding private aliases.
+-"""
++"""Selective activation checkpointing hooks for custom decoder layers."""
+ 
+ from collections.abc import Iterable
+ from functools import wraps
+@@ -33,7 +7,18 @@ import torch
+ import torch.nn as nn
+ from torch.utils.checkpoint import checkpoint
+ 
+-SELECTIVE_AC_TARGETS = frozenset({"norm", "attn_proj", "mlp", "mla_up_proj", "routed_experts", "linear_attn"})
++SELECTIVE_AC_TARGETS = frozenset(
++    {
++        "norm",
++        "attention",
++        "attn_proj",
++        "mlp",
++        "mla_up_proj",
++        "sparse_attention",
++        "routed_experts",
++        "linear_attn",
++    }
++)
+ _PATCHED_METHODS_ATTR = "_prime_rl_selective_ac_patched_methods"
+ 
+ 
+@@ -97,16 +82,19 @@ def _get_linear_attn_module(layer: nn.Module) -> nn.Module | None:
+ 
+ 
+ def get_supported_targets(layer: nn.Module) -> frozenset[str]:
+-    """Infer which selective activation checkpoint targets a decoder layer supports."""
+     supported_targets = {"norm"}
+     self_attn = getattr(layer, "self_attn", None)
+     mlp = getattr(layer, "mlp", None)
+     linear_attn = _get_linear_attn_module(layer)
+ 
++    if self_attn is not None:
++        supported_targets.add("attention")
+     if _supports_attn_proj(self_attn):
+         supported_targets.add("attn_proj")
+     if self_attn is not None and hasattr(self_attn, "mla_up_proj"):
+         supported_targets.add("mla_up_proj")
++    if self_attn is not None and hasattr(self_attn, "sparse_attention"):
++        supported_targets.add("sparse_attention")
+     if mlp is not None and _is_dense_mlp(mlp):
+         supported_targets.add("mlp")
+     if mlp is not None and (hasattr(mlp, "_run_routed_experts") or hasattr(mlp, "_run_local_routed_experts")):
+@@ -128,19 +116,32 @@ def set_selective_activation_checkpointing(layer: nn.Module, targets: Iterable[s
+     mlp = getattr(layer, "mlp", None)
+     linear_attn = _get_linear_attn_module(layer)
+     attn_proj_is_subsumed = "linear_attn" in enabled_targets and linear_attn is self_attn
+-
+-    if self_attn is not None and "attn_proj" in enabled_targets and not attn_proj_is_subsumed:
++    attention_checkpointed = "attention" in enabled_targets
++
++    if self_attn is not None and attention_checkpointed:
++        checkpoint_method(self_attn, "forward")
++    if (
++        self_attn is not None
++        and "attn_proj" in enabled_targets
++        and not attn_proj_is_subsumed
++        and not attention_checkpointed
++    ):
+         checkpoint_method(self_attn, "attn_projections")
+         checkpoint_method(self_attn, "output_proj")
+-    if self_attn is not None and "mla_up_proj" in enabled_targets:
++    if self_attn is not None and "mla_up_proj" in enabled_targets and not attention_checkpointed:
+         checkpoint_method(self_attn, "mla_up_proj")
++    if self_attn is not None and "sparse_attention" in enabled_targets and not attention_checkpointed:
++        checkpoint_method(self_attn, "sparse_attention")
+     if mlp is not None and "mlp" in enabled_targets:
+         checkpoint_method(mlp, "forward")
+     if mlp is not None and "routed_experts" in enabled_targets:
+-        if hasattr(mlp, "_run_routed_experts"):
+-            checkpoint_method(mlp, "_run_routed_experts")
+-        if hasattr(mlp, "_run_local_routed_experts"):
+-            checkpoint_method(mlp, "_run_local_routed_experts")
++        if getattr(mlp, "ep_comm_backend", None) == "deepep" and hasattr(mlp, "_run_deepep_routed_experts"):
++            checkpoint_method(mlp, "_run_deepep_routed_experts")
++        else:
++            if hasattr(mlp, "_run_routed_experts"):
++                checkpoint_method(mlp, "_run_routed_experts")
++            if hasattr(mlp, "_run_local_routed_experts"):
++                checkpoint_method(mlp, "_run_local_routed_experts")
+     if linear_attn is not None and "linear_attn" in enabled_targets:
+         checkpoint_method(linear_attn, "forward")
+     if "norm" in enabled_targets:
+diff --git a/src/prime_rl/trainer/models/layers/fp8_ada.py b/src/prime_rl/trainer/models/layers/fp8_ada.py
+new file mode 100644
+index 00000000..dff03050
+--- /dev/null
++++ b/src/prime_rl/trainer/models/layers/fp8_ada.py
+@@ -0,0 +1,618 @@
++import torch
++import torch.distributed as dist
++import torch.nn.functional as F
++import triton.language as tl
++from torch import nn
++from torch.distributed.tensor import DTensor
++from vllm import _custom_ops as ops
++from vllm.model_executor.layers.fused_moe.fused_moe import (
++    _prepare_expert_assignment,
++    dispatch_fused_moe_kernel,
++    get_default_config,
++    moe_kernel_quantize_input,
++)
++
++from prime_rl.trainer.models.layers.lm_head import PrimeLmOutput, _online_logsumexp_and_weighted_update
++
++block_shape = [128, 128]
++_DIAGNOSE_LINEAR_BACKWARD = False
++_REPORTED_LINEAR_BACKWARD: set[tuple[str, bool, bool]] = set()
++_REPORTED_INPUT_GRAD: set[str] = set()
++
++
++def set_diagnose_linear_backward(enabled: bool) -> None:
++    global _DIAGNOSE_LINEAR_BACKWARD
++    _DIAGNOSE_LINEAR_BACKWARD = enabled
++
++
++def _linear(x, weight, scale):
++    shape = (*x.shape[:-1], weight.shape[0])
++    x = x.reshape(-1, x.shape[-1]).contiguous()
++    offsets = torch.tensor([x.shape[0]], device=x.device, dtype=torch.int32)
++    return _grouped_mm(x, weight.unsqueeze(0), scale.unsqueeze(0), offsets).view(shape)
++
++
++def _linear_input_grad(
++    grad, weight, scale, chunk_rows=1024, fqn="<unassigned-fp8-linear>"
++):
++    """Compute dX = dY @ dequant(W) without a transposed FP8 kernel.
++
++    The forward fused kernel accepts checkpoint layout [out, in]. Its
++    transposed-weight use in backward is not a supported checkpoint layout and
++    produced non-finite LoRA gradients on the 64-GPU Ada job. Dequantize bounded
++    row chunks and accumulate in FP32 instead.
++    """
++    shape = (*grad.shape[:-1], weight.shape[1])
++    grad_2d = grad.reshape(-1, grad.shape[-1])
++    compute_dtype = (
++        torch.float64
++        if grad.dtype == torch.float64 or weight.dtype == torch.float64
++        else torch.float32
++    )
++    result = torch.zeros(
++        grad_2d.shape[0],
++        weight.shape[1],
++        device=grad.device,
++        dtype=compute_dtype,
++    )
++    for start in range(0, weight.shape[0], chunk_rows):
++        end = min(start + chunk_rows, weight.shape[0])
++        dequantized = _dequant_weight(weight, scale, start, end, compute_dtype)
++        result.addmm_(grad_2d[:, start:end].to(compute_dtype), dequantized)
++    converted = result.to(grad.dtype)
++    if (
++        _DIAGNOSE_LINEAR_BACKWARD
++        and not bool(torch.isfinite(converted).all())
++        and fqn not in _REPORTED_INPUT_GRAD
++    ):
++        _REPORTED_INPUT_GRAD.add(fqn)
++        finite_result = result[torch.isfinite(result)]
++        weight_float = weight.float()
++        finite_weight = weight_float[torch.isfinite(weight_float)]
++        print(
++            "[fp8-linear-input-grad] "
++            f"fqn={fqn} weight={tuple(weight.shape)} weight_finite={bool(torch.isfinite(weight_float).all())} "
++            f"weight_absmax={float(finite_weight.abs().max()) if finite_weight.numel() else float('nan'):.6e} "
++            f"scale_finite={bool(torch.isfinite(scale).all())} "
++            f"scale_min={float(scale[torch.isfinite(scale)].min()):.6e} "
++            f"scale_max={float(scale[torch.isfinite(scale)].max()):.6e} "
++            f"result_finite={bool(torch.isfinite(result).all())} "
++            f"result_nan={int(torch.isnan(result).sum())} result_inf={int(torch.isinf(result).sum())} "
++            f"result_absmax={float(finite_result.abs().max()) if finite_result.numel() else float('nan'):.6e} "
++            f"converted_nan={int(torch.isnan(converted).sum())} converted_inf={int(torch.isinf(converted).sum())}",
++            flush=True,
++        )
++    return converted.view(shape)
++
++
++class _Linear(torch.autograd.Function):
++    @staticmethod
++    def forward(ctx, x, weight, scale, fqn):
++        # FSDP2 releases the unsharded frozen parameters after forward. Its
++        # pre-backward rematerialization does not run before this inner custom
++        # autograd backward, so both the saved alias and the current module
++        # accessor point at the released allocation. Save owned snapshots.
++        # Keep these snapshots as direct context attributes. Non-reentrant
++        # checkpoint saved-tensor hooks otherwise replace save_for_backward()
++        # tensors with recomputed aliases, which reintroduces the released
++        # FSDP allocation before this inner backward runs.
++        ctx.weight_snapshot = weight.detach().clone()
++        ctx.scale_snapshot = scale.detach().clone()
++        ctx.fqn = fqn
++        return _linear(x, weight, scale)
++
++    @staticmethod
++    def backward(ctx, grad):
++        weight = ctx.weight_snapshot
++        scale = ctx.scale_snapshot
++        input_grad = _linear_input_grad(grad, weight, scale, fqn=ctx.fqn)
++        del ctx.weight_snapshot, ctx.scale_snapshot
++        if _DIAGNOSE_LINEAR_BACKWARD:
++            incoming_finite = bool(torch.isfinite(grad).all())
++            output_finite = bool(torch.isfinite(input_grad).all())
++            report_key = (ctx.fqn, incoming_finite, output_finite)
++            if (
++                (not incoming_finite or not output_finite)
++                and report_key not in _REPORTED_LINEAR_BACKWARD
++            ):
++                _REPORTED_LINEAR_BACKWARD.add(report_key)
++                finite_grad = grad[torch.isfinite(grad)]
++                finite_output = input_grad[torch.isfinite(input_grad)]
++                print(
++                    "[fp8-linear-bwd] "
++                    f"fqn={ctx.fqn} weight={tuple(weight.shape)} "
++                    f"grad={tuple(grad.shape)} "
++                    f"incoming_finite={incoming_finite} "
++                    f"incoming_absmax={float(finite_grad.abs().max()) if finite_grad.numel() else float('nan'):.6e} "
++                    f"output_finite={output_finite} "
++                    f"output_absmax={float(finite_output.abs().max()) if finite_output.numel() else float('nan'):.6e}",
++                    flush=True,
++                )
++        return input_grad, None, None, None
++
++
++class FP8CheckpointLinear(nn.Linear):
++    def forward(self, x):
++        out = _Linear.apply(
++            x,
++            self.weight,
++            self.weight_scale_inv,
++            getattr(self, "_fp8_fqn", "<unassigned-fp8-linear>"),
++        )
++        return out if self.bias is None else out + self.bias
++
++    @classmethod
++    def from_linear(cls, linear):
++        with torch.device("meta"):
++            module = cls(
++                linear.in_features,
++                linear.out_features,
++                bias=linear.bias is not None,
++            )
++        module.weight = nn.Parameter(
++            torch.empty_like(linear.weight, dtype=torch.float8_e4m3fn),
++            requires_grad=False,
++        )
++        module.weight_scale_inv = nn.Parameter(
++            torch.empty(
++                linear.out_features // 128,
++                linear.in_features // 128,
++                device=linear.weight.device,
++                dtype=torch.float32,
++            ),
++            requires_grad=False,
++        )
++        module.bias = linear.bias
++        return module
++
++
++class FP8CheckpointEmbedding(nn.Embedding):
++    def forward(self, input):
++        quantized = self.weight.view(torch.float8_e4m3fn).view(
++            self.num_embeddings, self.embedding_dim
++        ).index_select(0, input.flatten()).view(
++            *input.shape, self.embedding_dim
++        ).to(torch.bfloat16)
++        scales = self.weight_scale_inv.index_select(0, input.flatten()).view(input.shape)
++        return quantized * scales.to(quantized.dtype).unsqueeze(-1)
++
++    @classmethod
++    def from_embedding(cls, embedding):
++        with torch.device("meta"):
++            module = cls(
++                embedding.num_embeddings,
++                embedding.embedding_dim,
++                embedding.padding_idx,
++                embedding.max_norm,
++                embedding.norm_type,
++                embedding.scale_grad_by_freq,
++                embedding.sparse,
++            )
++        module.weight = nn.Parameter(
++            torch.empty(
++                embedding.num_embeddings,
++                embedding.embedding_dim // 2,
++                device=embedding.weight.device,
++                dtype=torch.bfloat16,
++            ),
++            requires_grad=False,
++        )
++        module.weight_scale_inv = nn.Parameter(
++            torch.empty(embedding.num_embeddings, device=embedding.weight.device, dtype=torch.float32),
++            requires_grad=False,
++        )
++        return module
++
++
++def _dequant_weight(weight, scale, start, end, dtype):
++    return (
++        weight[start:end]
++        .to(dtype)
++        .view(-1, 128, weight.shape[1] // 128, 128)
++        .mul(scale[start // 128 : end // 128].to(dtype)[:, None, :, None])
++        .flatten(0, 1)
++        .flatten(1, 2)
++    )
++
++
++def _scaled_mm(x, weight, weight_scale):
++    scale = x.float().abs().amax(1).clamp_min(1e-12).div(torch.finfo(torch.float8_e4m3fn).max)
++    quantized = (
++        x.float()
++        .div(scale[:, None])
++        .clamp(torch.finfo(torch.float8_e4m3fn).min, torch.finfo(torch.float8_e4m3fn).max)
++        .to(torch.float8_e4m3fn)
++    )
++    matrix = weight.t()
++    if matrix.stride(0) != 1:
++        matrix = matrix.t().contiguous().t()
++    if weight_scale is None:
++        weight_scale = torch.ones(matrix.shape[1], device=x.device, dtype=torch.float32)
++    return torch._scaled_mm(
++        quantized,
++        matrix,
++        scale[:, None],
++        weight_scale[None],
++        out_dtype=x.dtype,
++        use_fast_accum=True,
++    )
++
++
++class _FP8LogProb(torch.autograd.Function):
++    @staticmethod
++    def forward(ctx, hidden, weight, scale, labels, inv_temperature, chunk_size):
++        n = hidden.shape[0]
++        vocab = weight.shape[0]
++        logprobs = torch.empty(n, device=hidden.device, dtype=torch.float32)
++        entropy = torch.empty_like(logprobs)
++        logz = torch.empty_like(logprobs)
++        mean_scaled = torch.empty_like(logprobs)
++        for start in range(0, n, chunk_size):
++            end = min(start + chunk_size, n)
++            hidden_chunk = hidden[start:end]
++            labels_chunk = labels[start:end]
++            inv_t = inv_temperature[start:end].unsqueeze(-1)
++            m = torch.full((end - start,), float("-inf"), device=hidden.device, dtype=torch.float32)
++            s = torch.zeros_like(m)
++            t = torch.zeros_like(m)
++            target = torch.zeros_like(m)
++            for vocab_start in range(0, vocab, 16384):
++                vocab_end = min(vocab_start + 16384, vocab)
++                logits = _scaled_mm(
++                    hidden_chunk,
++                    weight[vocab_start:vocab_end],
++                    scale[vocab_start:vocab_end],
++                )
++                scaled = logits.float() * inv_t
++                m, s, t = _online_logsumexp_and_weighted_update(m, s, t, scaled)
++                mask = (labels_chunk >= vocab_start) & (labels_chunk < vocab_end)
++                row = torch.arange(end - start, device=hidden.device)
++                index = (labels_chunk - vocab_start).clamp(0, vocab_end - vocab_start - 1).long()
++                target = torch.where(mask, scaled[row, index], target)
++            logz[start:end] = m + torch.log(s)
++            logprobs[start:end] = target - logz[start:end]
++            mean_scaled[start:end] = t / s
++            entropy[start:end] = logz[start:end] - mean_scaled[start:end]
++        ctx.save_for_backward(
++            hidden, weight, scale, labels, inv_temperature, logz, mean_scaled
++        )
++        ctx.chunk_size = chunk_size
++        return logprobs, entropy
++
++    @staticmethod
++    def backward(ctx, grad_logprobs, grad_entropy):
++        hidden, weight, scale, labels, inv_temperature, logz, mean_scaled = (
++            ctx.saved_tensors
++        )
++        grad_hidden = torch.zeros_like(hidden)
++        for start in range(0, hidden.shape[0], ctx.chunk_size):
++            end = min(start + ctx.chunk_size, hidden.shape[0])
++            hidden_chunk = hidden[start:end]
++            labels_chunk = labels[start:end]
++            grad_logprob_chunk = (
++                torch.zeros(end - start, device=hidden.device, dtype=torch.float32)
++                if grad_logprobs is None
++                else grad_logprobs[start:end].float()
++            )
++            grad_entropy_chunk = (
++                torch.zeros(end - start, device=hidden.device, dtype=torch.float32)
++                if grad_entropy is None
++                else grad_entropy[start:end].float()
++            )
++            inv_t = inv_temperature[start:end].unsqueeze(-1)
++            for vocab_start in range(0, weight.shape[0], 16384):
++                vocab_end = min(vocab_start + 16384, weight.shape[0])
++                weight_chunk = weight[vocab_start:vocab_end]
++                scale_chunk = scale[vocab_start:vocab_end]
++                scaled = _scaled_mm(hidden_chunk, weight_chunk, scale_chunk).float() * inv_t
++                probability = torch.exp(scaled - logz[start:end].unsqueeze(-1))
++                # d log p_y / dz = one_hot(y) - p and
++                # d H / dz = p * (E[z] - z), where z is the
++                # temperature-scaled logit.
++                grad_logits = probability * (
++                    -grad_logprob_chunk.unsqueeze(-1)
++                    + grad_entropy_chunk.unsqueeze(-1)
++                    * (mean_scaled[start:end].unsqueeze(-1) - scaled)
++                )
++                mask = (labels_chunk >= vocab_start) & (labels_chunk < vocab_end)
++                row = torch.arange(end - start, device=hidden.device)
++                index = (labels_chunk - vocab_start).clamp(0, vocab_end - vocab_start - 1).long()
++                grad_logits[row, index] += grad_logprob_chunk * mask
++                grad_hidden[start:end].add_(
++                    _scaled_mm(
++                        (grad_logits * inv_t * scale_chunk).to(hidden.dtype),
++                        weight_chunk.t(),
++                        None,
++                    )
++                )
++        return grad_hidden, None, None, None, None, None
++
++
++class _AllToAllRows(torch.autograd.Function):
++    @staticmethod
++    def forward(ctx, x, output_splits, input_splits, group):
++        out = x.new_empty((sum(output_splits),) + x.shape[1:])
++        dist.all_to_all_single(out, x.contiguous(), output_splits, input_splits, group=group)
++        ctx.output_splits = output_splits
++        ctx.input_splits = input_splits
++        ctx.group = group
++        return out
++
++    @staticmethod
++    def backward(ctx, grad):
++        out = grad.new_empty((sum(ctx.input_splits),) + grad.shape[1:])
++        dist.all_to_all_single(
++            out,
++            grad.contiguous(),
++            ctx.input_splits,
++            ctx.output_splits,
++            group=ctx.group,
++        )
++        return out, None, None, None
++
++
++def _balanced_splits(counts, rank):
++    world = len(counts)
++    total = sum(counts)
++    targets = [total // world + (i < total % world) for i in range(world)]
++    source_start = sum(counts[:rank])
++    source_end = source_start + counts[rank]
++    target_starts = [sum(targets[:i]) for i in range(world)]
++    sends = [
++        max(0, min(source_end, start + size) - max(source_start, start))
++        for start, size in zip(target_starts, targets)
++    ]
++    target_start = target_starts[rank]
++    target_end = target_start + targets[rank]
++    source_starts = [sum(counts[:i]) for i in range(world)]
++    receives = [
++        max(0, min(target_end, start + size) - max(target_start, start))
++        for start, size in zip(source_starts, counts)
++    ]
++    return sends, receives
++
++
++def _fp8_lm_head_forward(self, hidden_states, labels=None, temperature=None):
++    b, s, h = hidden_states.shape
++    hidden_states = hidden_states.reshape(b * s, h)
++    labels = labels.reshape(b * s)
++    temperature = temperature.reshape(b * s)
++    valid = labels != -100
++    hidden = hidden_states[valid].contiguous()
++    target = labels[valid].contiguous()
++    inv_temperature = (1.0 / temperature[valid]).contiguous()
++    sends = receives = None
++    if getattr(self, "cp_group", None) is not None:
++        count = torch.tensor([hidden.shape[0]], device=hidden.device)
++        counts = [torch.empty_like(count) for _ in range(self.cp_size)]
++        dist.all_gather(counts, count, group=self.cp_group)
++        sends, receives = _balanced_splits([int(x.item()) for x in counts], self.cp_rank)
++        hidden = _AllToAllRows.apply(hidden, receives, sends, self.cp_group)
++        moved_target = target.new_empty(sum(receives))
++        moved_temperature = inv_temperature.new_empty(sum(receives))
++        dist.all_to_all_single(moved_target, target, receives, sends, group=self.cp_group)
++        dist.all_to_all_single(moved_temperature, inv_temperature, receives, sends, group=self.cp_group)
++        target = moved_target
++        inv_temperature = moved_temperature
++    scored, scored_entropy = _FP8LogProb.apply(
++        hidden,
++        self.weight.view(torch.float8_e4m3fn).view(self.out_features, self.in_features),
++        self.weight_scale_inv,
++        target,
++        inv_temperature,
++        self.chunk_size,
++    )
++    if sends is not None:
++        scored = _AllToAllRows.apply(scored, sends, receives, self.cp_group)
++        restored_entropy = scored_entropy.new_empty(sum(sends))
++        dist.all_to_all_single(restored_entropy, scored_entropy, sends, receives, group=self.cp_group)
++        scored_entropy = restored_entropy
++    logprobs = torch.zeros(b * s, device=hidden_states.device, dtype=torch.float32) + scored.sum() * 0
++    entropy = torch.zeros_like(logprobs) + scored_entropy.sum() * 0
++    logprobs[valid], entropy[valid] = scored, scored_entropy
++    return PrimeLmOutput(logprobs=logprobs.view(b, s), entropy=entropy.view(b, s))
++
++
++def replace_linear(model, embed=False, lm_head=False):
++    exclusions = set(model.config.quantization_config["modules_to_not_convert"])
++    for name, module in list(model.named_modules()):
++        if (
++            not isinstance(module, nn.Linear)
++            or name in exclusions
++            or name.replace(".mlp.router.gate", ".mlp.gate") in exclusions
++            or name.endswith((".self_attn.kv_b_proj", ".self_attn.indexer.wk"))
++        ):
++            continue
++        if module.in_features % 128 or module.out_features % 128:
++            continue
++        parent_name, attr = name.rsplit(".", 1) if "." in name else ("", name)
++        parent = model.get_submodule(parent_name) if parent_name else model
++        setattr(parent, attr, FP8CheckpointLinear.from_linear(module))
++
++    # Shape-only diagnostics are ambiguous in GLM because many projections
++    # share geometry. Persist the model path on every native checkpoint
++    # linear and shared expert so backward reports identify one module.
++    for fqn, module in model.named_modules():
++        if isinstance(module, FP8CheckpointLinear) or all(
++            hasattr(module, attr) for attr in ("w1_scale_inv", "w2_scale_inv", "w3_scale_inv")
++        ):
++            module._fp8_fqn = fqn
++
++    if embed:
++        model.model.embed_tokens = FP8CheckpointEmbedding.from_embedding(model.model.embed_tokens)
++    if not lm_head:
++        return
++    model.lm_head.weight = nn.Parameter(
++        torch.empty(
++            model.lm_head.out_features,
++            model.lm_head.in_features // 2,
++            device=model.lm_head.weight.device,
++            dtype=torch.bfloat16,
++        ),
++        requires_grad=False,
++    )
++    model.lm_head.weight_scale_inv = nn.Parameter(
++        torch.empty(model.lm_head.out_features, device=model.lm_head.weight.device, dtype=torch.float32),
++        requires_grad=False,
++    )
++    model.lm_head.forward = _fp8_lm_head_forward.__get__(model.lm_head)
++
++
++@torch.compiler.disable
++def _grouped_mm(x, weight, scale, offsets):
++    experts, output_size, input_size = weight.shape
++    config = get_default_config(
++        x.shape[0], experts, output_size, input_size, 1, "fp8_w8a8", block_shape
++    )
++    rows = torch.arange(x.shape[0], device=x.device)
++    ids = torch.searchsorted(offsets, rows, right=True).clamp_max(experts - 1).int().view(-1, 1)
++    sorted_ids, expert_ids, padded = _prepare_expert_assignment(
++        ids,
++        config,
++        x.shape[0],
++        1,
++        experts,
++        None,
++        block_shape=block_shape,
++        ignore_invalid_experts=True,
++    )
++    quantized, activation_scale = moe_kernel_quantize_input(
++        x,
++        None,
++        torch.float8_e4m3fn,
++        False,
++        block_shape,
++    )
++    out = torch.empty(x.shape[0], 1, output_size, device=x.device, dtype=x.dtype)
++    dispatch_fused_moe_kernel(
++        quantized,
++        weight,
++        out,
++        activation_scale,
++        scale,
++        None,
++        None,
++        sorted_ids,
++        expert_ids,
++        padded,
++        False,
++        1,
++        config,
++        tl.bfloat16 if x.dtype == torch.bfloat16 else tl.float16,
++        True,
++        False,
++        False,
++        False,
++        False,
++        block_shape,
++    )
++    # Expert-parallel dispatch can append rows after the last real token.  The
++    # assignment above must give every row an expert id for the fused kernel,
++    # but padded rows are not tokens and must not contribute in forward or
++    # backward.  The dense expert implementation has the same zero-padding
++    # contract.
++    return out[:, 0].masked_fill((rows >= offsets[-1]).unsqueeze(-1), 0)
++
++
++class _Experts(torch.autograd.Function):
++    @staticmethod
++    def forward(ctx, x, w1, s1, w2, s2, w3, s3, offsets):
++        z1 = _grouped_mm(x, w1, s1, offsets)
++        z3 = _grouped_mm(x, w3, s3, offsets)
++        q1, qs1 = ops.scaled_fp8_quant(z1, use_per_token_if_dynamic=True)
++        q3, qs3 = ops.scaled_fp8_quant(z3, use_per_token_if_dynamic=True)
++        ctx.save_for_backward(q1, qs1, q3, qs3, w1, s1, w2, s2, w3, s3, offsets)
++        F.silu(z1, inplace=True)
++        z1.mul_(z3)
++        del z3
++        return _grouped_mm(z1, w2, s2, offsets)
++
++    @staticmethod
++    def backward(ctx, grad):
++        q1, qs1, q3, qs3, w1, s1, w2, s2, w3, s3, offsets = ctx.saved_tensors
++        z1 = q1.to(grad.dtype).mul_(qs1.to(grad.dtype))
++        z3 = q3.to(grad.dtype).mul_(qs3.to(grad.dtype))
++        hidden_grad = _grouped_mm(
++            grad, w2.transpose(-2, -1), s2.transpose(-2, -1), offsets
++        )
++        sigmoid = torch.sigmoid(z1)
++        z1_grad = hidden_grad * z3 * sigmoid * (1 + z1 * (1 - sigmoid))
++        z3_grad = hidden_grad * F.silu(z1)
++        x_grad = _grouped_mm(
++            z1_grad, w1.transpose(-2, -1), s1.transpose(-2, -1), offsets
++        )
++        del hidden_grad, sigmoid, z1, z3, z1_grad
++        x_grad.add_(
++            _grouped_mm(
++                z3_grad, w3.transpose(-2, -1), s3.transpose(-2, -1), offsets
++            )
++        )
++        return x_grad, None, None, None, None, None, None, None
++
++
++def fp8_experts(w1, w2, w3, s1, s2, s3, x, num_tokens_per_expert):
++    """Run checkpoint-FP8 experts with TorchTitan's EP row permutation.
++
++    After the EP all-to-all, rows are grouped first by sending rank and then
++    by this rank's local experts.  ``num_tokens_per_expert`` consequently has
++    ``ep_size * local_experts`` entries while the local weight shard has only
++    ``local_experts`` matrices.  The ordinary grouped-expert path uses
++    TorchTitan's ``expert_parallel`` decorator to transpose that logical
++    layout, combine counts for each local expert, and add aligned padding.
++    The native FP8 path used to unwrap the DTensors and call the kernel
++    directly.  Most rows were then assigned expert ids beyond the local
++    weight array and were ignored by the fused kernel.
++    """
++    if isinstance(w1, DTensor):
++        w1, w2, w3, s1, s2, s3 = (
++            value.to_local() for value in (w1, w2, w3, s1, s2, s3)
++        )
++
++    local_experts = w1.shape[0]
++    if num_tokens_per_expert.shape[0] == local_experts:
++        return _Experts.apply(
++            x,
++            w1,
++            s1,
++            w2,
++            s2,
++            w3,
++            s3,
++            torch.cumsum(num_tokens_per_expert, 0, dtype=torch.int32),
++        )
++
++    if num_tokens_per_expert.shape[0] % local_experts:
++        raise ValueError(
++            "EP token counts must be a whole number of local expert groups: "
++            f"{num_tokens_per_expert.shape[0]} counts for {local_experts} experts"
++        )
++
++    from torchtitan.distributed.expert_parallel import TOKEN_GROUP_ALIGN_SIZE_M
++    from torchtitan.experiments.kernels.moe.indices import generate_permute_indices
++
++    ep_size = num_tokens_per_expert.shape[0] // local_experts
++    with torch.no_grad():
++        permuted_indices, local_counts, _ = generate_permute_indices(
++            num_tokens_per_expert,
++            local_experts,
++            ep_size,
++            x.shape[0] + local_experts * TOKEN_GROUP_ALIGN_SIZE_M,
++            TOKEN_GROUP_ALIGN_SIZE_M,
++        )
++
++    # The last row is a shared zero sentinel selected for padding positions.
++    padded_x = torch.vstack((x, x.new_zeros((1, x.shape[-1]))))
++    permuted_x = padded_x[permuted_indices, :]
++    out = _Experts.apply(
++        permuted_x,
++        w1,
++        s1,
++        w2,
++        s2,
++        w3,
++        s3,
++        torch.cumsum(local_counts, 0, dtype=torch.int32),
++    )
++    out_unpermuted = out.new_empty(padded_x.shape)
++    out_unpermuted[permuted_indices, :] = out
++    return out_unpermuted[:-1]
+diff --git a/src/prime_rl/trainer/models/layers/lora/multi_linear.py b/src/prime_rl/trainer/models/layers/lora/multi_linear.py
+index fd9b59e7..0128d7a3 100644
+--- a/src/prime_rl/trainer/models/layers/lora/multi_linear.py
++++ b/src/prime_rl/trainer/models/layers/lora/multi_linear.py
+@@ -12,9 +12,11 @@ def _run_lora_grouped_mm(
+     lora_B: torch.Tensor,
+     offsets: torch.LongTensor,
+ ) -> torch.Tensor:
+-    _a_out = torch._grouped_mm(x, lora_A.transpose(-2, -1), offsets)
+-    lora_out = torch._grouped_mm(_a_out, lora_B.transpose(-2, -1), offsets)
+-    return lora_out
++    return torch._grouped_mm(
++        torch._grouped_mm(x, lora_A.transpose(-2, -1), offsets),
++        lora_B.transpose(-2, -1),
++        offsets,
++    )
+ 
+ 
+ def _run_lora_for_loop(
+@@ -25,20 +27,45 @@ def _run_lora_for_loop(
+ ) -> torch.Tensor:
+     lora_out_splits = []
+     for i in range(offsets.shape[0]):
+-        if i == 0:
+-            _a_out = torch.matmul(x[0 : offsets[i]], lora_A[i].transpose(-2, -1))
+-            lora_out = torch.matmul(_a_out, lora_B[i].transpose(-2, -1))
+-        else:
+-            _a_out = torch.matmul(x[offsets[i - 1] : offsets[i]], lora_A[i].transpose(-2, -1))
+-            lora_out = torch.matmul(_a_out, lora_B[i].transpose(-2, -1))
+-        lora_out_splits.append(lora_out)
++        start = 0 if i == 0 else offsets[i - 1]
++        a_out = torch.matmul(x[start : offsets[i]], lora_A[i].transpose(-2, -1))
++        lora_out_splits.append(torch.matmul(a_out, lora_B[i].transpose(-2, -1)))
+     return torch.cat(lora_out_splits, dim=0)
+ 
+ 
++class _SingleLoRA(torch.autograd.Function):
++    @staticmethod
++    def forward(ctx, x, lora_A, lora_B):
++        a_out = x @ lora_A.T
++        ctx.save_for_backward(x, lora_A, lora_B, a_out)
++        return a_out @ lora_B.T
++
++    @staticmethod
++    def backward(ctx, grad):
++        x, lora_A, lora_B, a_out = ctx.saved_tensors
++        # Accumulate low-precision LoRA gradients in FP32. Preserve FP32/FP64
++        # inputs so the custom backward has the same derivative as the two
++        # matmuls and remains gradcheckable outside the production BF16 path.
++        compute_dtype = (
++            torch.float32
++            if grad.dtype in (torch.float16, torch.bfloat16)
++            else grad.dtype
++        )
++        grad_compute = grad.to(compute_dtype)
++        x_compute = x.to(compute_dtype)
++        lora_A_compute = lora_A.to(compute_dtype)
++        lora_B_compute = lora_B.to(compute_dtype)
++        a_out_compute = a_out.to(compute_dtype)
++        grad_a = grad_compute @ lora_B_compute
++        return (
++            (grad_a @ lora_A_compute).to(x.dtype),
++            (grad_a.T @ x_compute).to(lora_A.dtype),
++            (grad_compute.T @ a_out_compute).to(lora_B.dtype),
++        )
++
++
+ class MultiLoRALinear(MultiLoRAModule):
+-    """
+-    Linear + multi-LoRA with grouped GEMM.
+-    """
++    """Linear + multi-LoRA with grouped GEMM."""
+ 
+     def __init__(
+         self,
+@@ -52,7 +79,6 @@ class MultiLoRALinear(MultiLoRAModule):
+         super().__init__(base_layer)
+         if rank <= 0 or n_adapters <= 0:
+             raise ValueError("rank and n_adapters must be > 0")
+-
+         if rank % 8 != 0 or base_layer.in_features % 8 != 0 or base_layer.out_features % 8 != 0:
+             use_grouped_mm = False
+ 
+@@ -63,12 +89,11 @@ class MultiLoRALinear(MultiLoRAModule):
+         self.use_grouped_mm = use_grouped_mm
+         self.in_features = base_layer.in_features
+         self.out_features = base_layer.out_features
+-
+         self._lora_num_tokens = get_lora_num_tokens()
+         self._scaling_factors = get_multilora_scaling()
+-
+-        # LoRA weights: one low-rank pair per adapter
+-        # [n_adapters, in, r]
++        lora_dtype = (
++            torch.bfloat16 if base_layer.weight.dtype == torch.float8_e4m3fn else base_layer.weight.dtype
++        )
+         self.lora_A = nn.ParameterList(
+             [
+                 nn.Parameter(
+@@ -76,13 +101,12 @@ class MultiLoRALinear(MultiLoRAModule):
+                         rank,
+                         self.in_features,
+                         device=self.base_layer.weight.device,
+-                        dtype=self.base_layer.weight.dtype,
++                        dtype=lora_dtype,
+                     )
+                 )
+                 for _ in range(n_adapters)
+             ]
+         )
+-        # [n_adapters, r, out]
+         self.lora_B = nn.ParameterList(
+             [
+                 nn.Parameter(
+@@ -90,13 +114,12 @@ class MultiLoRALinear(MultiLoRAModule):
+                         self.out_features,
+                         rank,
+                         device=self.base_layer.weight.device,
+-                        dtype=self.base_layer.weight.dtype,
++                        dtype=lora_dtype,
+                     )
+                 )
+                 for _ in range(n_adapters)
+             ]
+         )
+-
+         self.reset_parameters()
+ 
+     def reset_parameters(self, index: int | None = None) -> None:
+@@ -108,54 +131,34 @@ class MultiLoRALinear(MultiLoRAModule):
+             nn.init.zeros_(self.lora_B[index])
+ 
+     def named_parameters_for_adapter(self, idx: int) -> list[tuple[str, nn.Parameter]]:
+-        """Get named parameters for a specific adapter index.
+-
+-        Args:
+-            idx: The adapter index to get parameters for
+-
+-        Returns:
+-            List of (name, parameter) tuples for the specified adapter
+-        """
+-        return [
+-            ("lora_A", self.lora_A[idx]),
+-            ("lora_B", self.lora_B[idx]),
+-        ]
++        return [("lora_A", self.lora_A[idx]), ("lora_B", self.lora_B[idx])]
+ 
+     def get_lora_param_counts(self) -> tuple[int, int]:
+-        """Get the number of LoRA adapter parameters and adapted base parameters.
+-
+-        Returns:
+-            A tuple of (adapter_params, adapted_params) where:
+-            - adapter_params: Number of parameters in ONE LoRA adapter (lora_A + lora_B)
+-            - adapted_params: Number of base layer parameters being adapted by LoRA
+-        """
+-        adapter_params = self.lora_A[0].numel() + self.lora_B[0].numel()
+-        adapted_params = self.base_layer.weight.numel()
+-        return adapter_params, adapted_params
++        return (
++            self.lora_A[0].numel() + self.lora_B[0].numel(),
++            self.base_layer.weight.numel(),
++        )
+ 
+     def forward(self, x: torch.Tensor) -> torch.Tensor:
+-        """
+-        x: [..., in_features]
+-        """
+-        ori_shape = x.shape
+-        new_shape = ori_shape[:-1] + (self.out_features,)
++        shape = x.shape[:-1] + (self.out_features,)
+         x = x.view(-1, x.shape[-1])
+-        offsets = self._lora_num_tokens.cumsum(dim=0, dtype=torch.int32)
+-        assert offsets[-1] == x.shape[0], f"offsets: {offsets}, x.shape: {x.shape}"
+-
+         base_out = self.base_layer(x)
+         lora_x = self.lora_dropout(x)
+ 
+-        combined_lora_A = torch.stack([i for i in self.lora_A], dim=0)
+-        combined_lora_B = torch.stack([i for i in self.lora_B], dim=0)
++        if self.n_adapters == 1:
++            lora_out = _SingleLoRA.apply(lora_x, self.lora_A[0], self.lora_B[0])
++            return (base_out + self._scaling_factors[0] * lora_out).view(shape)
++
++        offsets = self._lora_num_tokens.cumsum(dim=0, dtype=torch.int32)
++        assert offsets[-1] == x.shape[0], f"offsets: {offsets}, x.shape: {x.shape}"
++        lora_A = torch.stack(list(self.lora_A))
++        lora_B = torch.stack(list(self.lora_B))
+         if self.use_grouped_mm:
+-            lora_out = _run_lora_grouped_mm(lora_x, combined_lora_A, combined_lora_B, offsets)
++            lora_out = _run_lora_grouped_mm(lora_x, lora_A, lora_B, offsets)
+         else:
+-            lora_out = _run_lora_for_loop(lora_x, combined_lora_A, combined_lora_B, offsets)
+-
+-        # Apply per-token scaling
+-        per_token_scaling = torch.repeat_interleave(self._scaling_factors, self._lora_num_tokens).unsqueeze(-1)
+-        return (base_out + per_token_scaling * lora_out).view(new_shape)
++            lora_out = _run_lora_for_loop(lora_x, lora_A, lora_B, offsets)
++        scaling = torch.repeat_interleave(self._scaling_factors, self._lora_num_tokens).unsqueeze(-1)
++        return (base_out + scaling * lora_out).view(shape)
+ 
+     def __repr__(self) -> str:
+         return (
+diff --git a/src/prime_rl/trainer/models/layers/moe.py b/src/prime_rl/trainer/models/layers/moe.py
+index 4fc40d1f..f13dbe1f 100644
+--- a/src/prime_rl/trainer/models/layers/moe.py
++++ b/src/prime_rl/trainer/models/layers/moe.py
+@@ -10,9 +10,11 @@ from typing import Literal
+ import torch
+ import torch.nn.functional as F
+ from torch import nn
++from torch.distributed.tensor import DTensor
+ from torchtitan.distributed.expert_parallel import expert_parallel
+ 
+ from prime_rl.configs.trainer import EPCommBackend
++from prime_rl.trainer.models.layers.fp8_ada import _Linear, fp8_experts
+ 
+ 
+ @dataclass
+@@ -31,6 +33,9 @@ class MoEArgs:
+     use_grouped_mm: bool = True  # grouped mm or for-loop for the experts computation
+     load_balance_coeff: float | None = 1e-3
+     fp8: bool = False  # use FP8 grouped GEMM via DeepGEMM (requires SM90)
++    fp8_checkpoint: bool = False
++    fp8_checkpoint_routed: bool | None = None
++    fp8_checkpoint_shared: bool | None = None
+ 
+ 
+ # can be used as dense FFN layer or shared experts in MoE layers
+@@ -85,6 +90,27 @@ class BCFeedForward(nn.Module):
+         nn.init.trunc_normal_(self.w3, mean=0.0, std=init_std)
+ 
+ 
++class FP8CheckpointFeedForward(nn.Module):
++    def __init__(self, dim: int, hidden_dim: int):
++        super().__init__()
++        self.w1 = nn.Parameter(torch.empty(hidden_dim, dim, dtype=torch.float8_e4m3fn), requires_grad=False)
++        self.w1_scale_inv = nn.Parameter(torch.empty(hidden_dim // 128, dim // 128, dtype=torch.float32), requires_grad=False)
++        self.w2 = nn.Parameter(torch.empty(dim, hidden_dim, dtype=torch.float8_e4m3fn), requires_grad=False)
++        self.w2_scale_inv = nn.Parameter(torch.empty(dim // 128, hidden_dim // 128, dtype=torch.float32), requires_grad=False)
++        self.w3 = nn.Parameter(torch.empty(hidden_dim, dim, dtype=torch.float8_e4m3fn), requires_grad=False)
++        self.w3_scale_inv = nn.Parameter(torch.empty(hidden_dim // 128, dim // 128, dtype=torch.float32), requires_grad=False)
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        fqn = getattr(self, "_fp8_fqn", "<unassigned-fp8-shared-expert>")
++        return _Linear.apply(
++            F.silu(_Linear.apply(x, self.w1, self.w1_scale_inv, f"{fqn}.w1"))
++            * _Linear.apply(x, self.w3, self.w3_scale_inv, f"{fqn}.w3"),
++            self.w2,
++            self.w2_scale_inv,
++            f"{fqn}.w2",
++        )
++
++
+ # TODO: keeping this for-loop implementation for comparison
+ #       and readability, may remove later
+ def _run_experts_for_loop_impl(
+@@ -189,23 +215,56 @@ class GroupedExperts(nn.Module):
+         num_experts: int,
+         use_grouped_mm: bool,
+         fp8: bool = False,
++        fp8_checkpoint: bool = False,
+     ):
+         super().__init__()
+         self.num_experts = num_experts
+-        self.w1 = nn.Parameter(torch.empty(num_experts, hidden_dim, dim))
+-        self.w2 = nn.Parameter(torch.empty(num_experts, dim, hidden_dim))
+-        self.w3 = nn.Parameter(torch.empty(num_experts, hidden_dim, dim))
++        if fp8_checkpoint:
++            self.w1 = nn.Parameter(
++                torch.empty(num_experts, hidden_dim, dim, dtype=torch.float8_e4m3fn), requires_grad=False
++            )
++            self.w1_scale_inv = nn.Parameter(torch.empty(num_experts, hidden_dim // 128, dim // 128, dtype=torch.float32), requires_grad=False)
++            self.w2 = nn.Parameter(
++                torch.empty(num_experts, dim, hidden_dim, dtype=torch.float8_e4m3fn), requires_grad=False
++            )
++            self.w2_scale_inv = nn.Parameter(torch.empty(num_experts, dim // 128, hidden_dim // 128, dtype=torch.float32), requires_grad=False)
++            self.w3 = nn.Parameter(
++                torch.empty(num_experts, hidden_dim, dim, dtype=torch.float8_e4m3fn), requires_grad=False
++            )
++            self.w3_scale_inv = nn.Parameter(torch.empty(num_experts, hidden_dim // 128, dim // 128, dtype=torch.float32), requires_grad=False)
++        else:
++            self.w1 = nn.Parameter(torch.empty(num_experts, hidden_dim, dim))
++            self.w2 = nn.Parameter(torch.empty(num_experts, dim, hidden_dim))
++            self.w3 = nn.Parameter(torch.empty(num_experts, hidden_dim, dim))
+         self.use_grouped_mm = use_grouped_mm
+         self.fp8 = fp8
++        self.fp8_checkpoint = fp8_checkpoint
+         self.ep_comm_backend: EPCommBackend = "torch"
+ 
+     def set_ep_comm_backend(self, backend: EPCommBackend) -> None:
+         self.ep_comm_backend = backend
+ 
+     def _forward_deepep(self, x: torch.Tensor, num_tokens_per_expert: torch.Tensor) -> torch.Tensor:
+-        w1 = self.w1.to_local()
+-        w2 = self.w2.to_local()
+-        w3 = self.w3.to_local()
++        weights = (self.w1, self.w2, self.w3)
++        w1, w2, w3 = (
++            weight.to_local() if isinstance(weight, DTensor) else weight
++            for weight in weights
++        )
++        if self.fp8_checkpoint:
++            scales = (self.w1_scale_inv, self.w2_scale_inv, self.w3_scale_inv)
++            w1_scale, w2_scale, w3_scale = (
++                scale.to_local() if isinstance(scale, DTensor) else scale for scale in scales
++            )
++            return fp8_experts(
++                w1,
++                w2,
++                w3,
++                w1_scale,
++                w2_scale,
++                w3_scale,
++                x,
++                num_tokens_per_expert,
++            )
+         if self.use_grouped_mm:
+             return _run_experts_grouped_mm_impl(w1, w2, w3, x, num_tokens_per_expert, fp8=self.fp8)
+         return _run_experts_for_loop_impl(w1, w2, w3, x, num_tokens_per_expert)
+@@ -215,6 +274,23 @@ class GroupedExperts(nn.Module):
+         x: torch.Tensor,
+         num_tokens_per_expert: torch.Tensor,
+     ) -> torch.Tensor:
++        if self.fp8_checkpoint:
++            weights = (
++                weight.to_local() if isinstance(weight, DTensor) else weight
++                for weight in (
++                    self.w1,
++                    self.w2,
++                    self.w3,
++                    self.w1_scale_inv,
++                    self.w2_scale_inv,
++                    self.w3_scale_inv,
++                )
++            )
++            return fp8_experts(
++                *weights,
++                x,
++                num_tokens_per_expert,
++            )
+         if self.ep_comm_backend == "deepep":
+             return self._forward_deepep(x, num_tokens_per_expert)
+ 
+@@ -470,8 +546,15 @@ class TokenChoiceTopKRouter(nn.Module):
+         #       top_scores is still derived from the original scores.
+ 
+         if routed_experts is not None:
+-            top_scores = scores.gather(dim=1, index=routed_experts)
+             selected_experts_indices = routed_experts
++            if self.top_k > 1:
++                padding = routed_experts[:, 1:].eq(routed_experts[:, :1]).all(dim=1, keepdim=True)
++                selected_experts_indices = torch.where(
++                    padding,
++                    torch.topk(scores, k=self.top_k, dim=1).indices,
++                    routed_experts,
++                )
++            top_scores = scores.gather(dim=1, index=selected_experts_indices)
+         elif self.force_balanced:
+             num_tokens = scores.shape[0]
+             arange = torch.arange(num_tokens * self.top_k, device=scores.device)
+@@ -569,12 +652,23 @@ class MoE(nn.Module):
+         super().__init__()
+ 
+         num_experts = moe_args.num_experts
++        fp8_checkpoint_routed = (
++            moe_args.fp8_checkpoint
++            if moe_args.fp8_checkpoint_routed is None
++            else moe_args.fp8_checkpoint_routed
++        )
++        fp8_checkpoint_shared = (
++            moe_args.fp8_checkpoint
++            if moe_args.fp8_checkpoint_shared is None
++            else moe_args.fp8_checkpoint_shared
++        )
+         self.experts = GroupedExperts(
+             dim=dim,
+             hidden_dim=hidden_dim,
+             num_experts=num_experts,
+             use_grouped_mm=moe_args.use_grouped_mm,
+             fp8=moe_args.fp8,
++            fp8_checkpoint=fp8_checkpoint_routed,
+         )
+         self.ep_comm_backend: EPCommBackend = "torch"
+         self.experts.set_ep_comm_backend(self.ep_comm_backend)
+@@ -589,7 +683,13 @@ class MoE(nn.Module):
+         self.reorderer = TokenReorderer(num_experts=num_experts, top_k=moe_args.top_k)
+         # TODO: Add the s back and use FF when the weights support it
+         self.shared_expert = (
+-            BCFeedForward(dim=dim, hidden_dim=hidden_dim * moe_args.num_shared_experts)
++            (
++                FP8CheckpointFeedForward
++                if fp8_checkpoint_shared
++                else BCFeedForward
++            )(
++                dim=dim, hidden_dim=hidden_dim * moe_args.num_shared_experts
++            )
+             if moe_args.num_shared_experts > 0
+             else None
+         )
+@@ -673,37 +773,26 @@ class MoE(nn.Module):
+ 
+         group = get_ep_group(self.experts)
+         chunk_size = min(self.deepep_token_chunk_size or x.shape[0], x.shape[0])
+-
+-        def dispatch_chunk(start: int, end: int):
+-            return dispatch_tokens_async(
+-                x[start:end],
+-                selected_experts_indices[start:end],
+-                top_scores[start:end],
+-                num_experts=self.experts.num_experts,
+-                group=group,
+-                score_before_experts=self.score_before_experts,
+-            )
+-
+-        def run_pending_chunk(pending_state):
+-            hidden_states, num_tokens_per_expert, dispatch_state = finalize_dispatch_tokens(pending_state)
+-            routed_output = self._run_local_routed_experts(hidden_states, num_tokens_per_expert)
+-            # Keep combine outside the checkpointed routed-expert region so
+-            # selective AC only recomputes local expert matmuls.
+-            return combine_tokens(routed_output, dispatch_state)
+-
+-        pending_state = dispatch_chunk(0, chunk_size)
+         routed_outputs: list[torch.Tensor] = []
+ 
+-        for chunk_start in range(chunk_size, x.shape[0], chunk_size):
++        for chunk_start in range(0, x.shape[0], chunk_size):
+             chunk_end = min(chunk_start + chunk_size, x.shape[0])
+-            next_pending_state = dispatch_chunk(chunk_start, chunk_end)
+-            routed_outputs.append(run_pending_chunk(pending_state))
+-            pending_state = next_pending_state
+-
+-        routed_outputs.append(run_pending_chunk(pending_state))
++            hidden_states, num_tokens_per_expert, dispatch_state = finalize_dispatch_tokens(
++                dispatch_tokens_async(
++                    x[chunk_start:chunk_end],
++                    selected_experts_indices[chunk_start:chunk_end],
++                    top_scores[chunk_start:chunk_end],
++                    num_experts=self.experts.num_experts,
++                    group=group,
++                    score_before_experts=self.score_before_experts,
++                )
++            )
++            routed_outputs.append(
++                combine_tokens(self._run_local_routed_experts(hidden_states, num_tokens_per_expert), dispatch_state)
++            )
++            sync_combine()
+ 
+         shared_output = self.shared_expert(x) if self.shared_expert is not None else None
+-        sync_combine()
+         routed_output = routed_outputs[0] if len(routed_outputs) == 1 else torch.cat(routed_outputs, dim=0)
+         return routed_output if shared_output is None else shared_output + routed_output
+ 
+@@ -1158,35 +1247,26 @@ class LatentMoE(nn.Module):
+         # Project before dispatch so DeepEP communicates the smaller latent activations.
+         latent_x = self.fc1_latent_proj(x)
+         chunk_size = min(self.deepep_token_chunk_size or latent_x.shape[0], latent_x.shape[0])
+-
+-        def dispatch_chunk(start: int, end: int):
+-            return dispatch_tokens_async(
+-                latent_x[start:end],
+-                selected_experts_indices[start:end],
+-                top_scores[start:end],
+-                num_experts=self.experts.num_experts,
+-                group=group,
+-                score_before_experts=False,
+-            )
+-
+-        def run_pending_chunk(pending_state):
+-            hidden_states, num_tokens_per_expert, dispatch_state = finalize_dispatch_tokens(pending_state)
+-            routed_output = self._run_local_routed_experts(hidden_states, num_tokens_per_expert)
+-            return combine_tokens(routed_output, dispatch_state)
+-
+-        pending_state = dispatch_chunk(0, chunk_size)
+         routed_outputs: list[torch.Tensor] = []
+ 
+-        for chunk_start in range(chunk_size, latent_x.shape[0], chunk_size):
++        for chunk_start in range(0, latent_x.shape[0], chunk_size):
+             chunk_end = min(chunk_start + chunk_size, latent_x.shape[0])
+-            next_pending_state = dispatch_chunk(chunk_start, chunk_end)
+-            routed_outputs.append(run_pending_chunk(pending_state))
+-            pending_state = next_pending_state
+-
+-        routed_outputs.append(run_pending_chunk(pending_state))
++            hidden_states, num_tokens_per_expert, dispatch_state = finalize_dispatch_tokens(
++                dispatch_tokens_async(
++                    latent_x[chunk_start:chunk_end],
++                    selected_experts_indices[chunk_start:chunk_end],
++                    top_scores[chunk_start:chunk_end],
++                    num_experts=self.experts.num_experts,
++                    group=group,
++                    score_before_experts=False,
++                )
++            )
++            routed_outputs.append(
++                combine_tokens(self._run_local_routed_experts(hidden_states, num_tokens_per_expert), dispatch_state)
++            )
++            sync_combine()
+ 
+         shared_output = self.shared_expert(x)
+-        sync_combine()
+         routed_output = routed_outputs[0] if len(routed_outputs) == 1 else torch.cat(routed_outputs, dim=0)
+         routed_output = routed_output * self.routed_scaling_factor
+         routed_output = self.fc2_latent_proj(routed_output)
+diff --git a/src/prime_rl/trainer/models/layers/norms.py b/src/prime_rl/trainer/models/layers/norms.py
+index d5d23ee8..140bf455 100644
+--- a/src/prime_rl/trainer/models/layers/norms.py
++++ b/src/prime_rl/trainer/models/layers/norms.py
+@@ -38,10 +38,28 @@ class RMSNorm(nn.Module):
+         if quack_fn is not None:
+             return quack_fn(hidden_states, self.weight, eps=self.variance_epsilon)
+         input_dtype = hidden_states.dtype
++        # Under `quantization.dequantize_checkpoint = false` the transformer
++        # blocks are wrapped with a bare MixedPrecisionPolicy() (model.py:813),
++        # so FSDP does not cast params to bf16 and float8_e4m3fn tensors reach
++        # this norm. `self.weight * hidden_states` then raises "Promotion for
++        # Float8 Types is not supported". Torch has no fp8 type promotion at
++        # all, so both operands must land in a real float dtype first.
++        #
++        # Widening fp8 -> bf16/fp32 is exact (every e4m3 value is representable),
++        # and the loader never bitcasts -- `bitcast` is hardcoded False in
++        # fp8_checkpoint.py:111 -- so fp8 storage always holds true values, not
++        # reinterpreted bytes. This changes no numerics when nothing is fp8.
++        if input_dtype not in (torch.float32, torch.float16, torch.bfloat16):
++            input_dtype = self.weight.dtype
++            if input_dtype not in (torch.float32, torch.float16, torch.bfloat16):
++                input_dtype = torch.bfloat16
++        weight = self.weight
++        if weight.dtype != input_dtype:
++            weight = weight.to(input_dtype)
+         hidden_states = hidden_states.to(torch.float32)
+         variance = hidden_states.pow(2).mean(-1, keepdim=True)
+         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+-        return self.weight * hidden_states.to(input_dtype)
++        return weight * hidden_states.to(input_dtype)
+ 
+     def extra_repr(self):
+         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+@@ -56,4 +74,12 @@ class LayerNorm(nn.Module):
+         self.bias = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+ 
+     def forward(self, x: torch.Tensor):
+-        return F.layer_norm(x.float(), (self.dim,), self.weight.float(), self.bias.float(), self.eps).type_as(x)
++        # `.type_as(x)` PROPAGATES float8: an fp8 input yields an fp8 output,
++        # which then blows up at the next op that mixes it with bf16. This norm
++        # already computes in fp32, so there is nothing to preserve by casting
++        # back to fp8 -- it only re-narrows the result to 3 mantissa bits.
++        # Normalize to a real float dtype instead and stop the leak here.
++        out = F.layer_norm(x.float(), (self.dim,), self.weight.float(), self.bias.float(), self.eps)
++        if x.dtype in (torch.float32, torch.float16, torch.bfloat16):
++            return out.type_as(x)
++        return out.to(torch.bfloat16)
+diff --git a/src/prime_rl/trainer/weights.py b/src/prime_rl/trainer/weights.py
+index 8d0ff56b..650e179a 100644
+--- a/src/prime_rl/trainer/weights.py
++++ b/src/prime_rl/trainer/weights.py
+@@ -105,6 +105,57 @@ def save_state_dict(
+             torch.save(state_dict, save_dir / weights_name)
+ 
+ 
++# ── pipeline parallelism context ─────────────────────────────────────────────
++# Set once by train.py when pp > 1. Under PP each rank's model holds only its
++# stage's layers, so the master's local state_dict is a fraction of the model;
++# saving it as the adapter would ship a truncated LoRA to the inference engines
++# with no error anywhere. The fix: each stage's first rank gathers its stage,
++# then the stage dicts are merged on the global master over the pp group.
++_PP_GROUP = None
++_IS_STAGE_MASTER = False
++
++
++def set_pp_gather_context(pp_group, is_stage_master: bool) -> None:
++    global _PP_GROUP, _IS_STAGE_MASTER
++    _PP_GROUP = pp_group
++    _IS_STAGE_MASTER = is_stage_master
++
++
++def pp_enabled_for_gather() -> bool:
++    return _PP_GROUP is not None
++
++
++def is_pp_stage_master() -> bool:
++    return _IS_STAGE_MASTER
++
++
++def merge_pp_state_dict(state_dict: dict, is_master: bool) -> dict:
++    """Merge per-stage shards of an adapter into one dict on the global master.
++
++    Under pipeline parallelism each rank's model owns only its stage's layers,
++    and DTensor.full_tensor() reassembles across FSDP/EP but NOT across stages.
++    The master would otherwise save only its own stage -- a truncated adapter
++    that loads without complaint and serves a partly-unadapted model.
++
++    Every stage master contributes its CPU tensors; layer names carry global
++    indices, so the union is exactly the full adapter.
++    """
++    if _PP_GROUP is None:
++        return state_dict
++
++    world = torch.distributed.get_world_size()
++    gathered: list[dict | None] = [None] * world
++    torch.distributed.all_gather_object(gathered, state_dict if _IS_STAGE_MASTER else {})
++    if not is_master:
++        return state_dict
++
++    merged: dict[str, Tensor] = {}
++    for part in gathered:
++        if part:
++            merged.update(part)
++    return merged
++
++
+ def gather_weights_on_master(
+     model: nn.Module, is_master: bool, dtype: torch.dtype = torch.bfloat16
+ ) -> dict[str, Tensor]:
+@@ -113,18 +164,41 @@ def gather_weights_on_master(
+         warnings.filterwarnings("ignore", category=FutureWarning, module="torch.distributed")
+         warnings.filterwarnings("ignore", category=UserWarning, module="torch.distributed.*")
+ 
++        # Under PP every stage master materialises its stage; otherwise only
++        # the global master does.
++        build_local = is_master or (_PP_GROUP is not None and _IS_STAGE_MASTER)
+         cpu_state = {}
+         for key, value in model.state_dict().items():
+             if isinstance(value, DTensor):
+                 # only gather after the downcast to dtype as it will be faster
+                 value = cast(DTensor, value.to(dtype)).full_tensor()
+ 
+-            if is_master:
++            if build_local:
+                 key = get_fqns(model, key)
+                 assert len(key) == 1
+                 key = next(iter(key))
+                 # TODO(Sami) Blocking to avoid race condition, should make non-blocking long-term tho
+                 cpu_state[key] = value.to("cpu", non_blocking=False)
++
++        if _PP_GROUP is not None:
++            # Gather over the WORLD group, not the pp subgroup. all_gather_object
++            # sizes its receive buffers from the participating ranks, and mixing a
++            # mesh-derived subgroup with global rank bookkeeping produced garbage
++            # lengths -- a 3796 GiB allocation attempt inside recv_object_list.
++            # World-group gather needs no rank translation: every rank sends its
++            # stage dict (or {}), and layer names already carry global indices, so
++            # the union is exactly the full model.
++            world = torch.distributed.get_world_size()
++            gathered: list[dict | None] = [None] * world
++            torch.distributed.all_gather_object(gathered, cpu_state if _IS_STAGE_MASTER else {})
++            if is_master:
++                merged: dict[str, Tensor] = {}
++                for part in gathered:
++                    if part:
++                        merged.update(part)
++                cpu_state = merged
++            else:
++                cpu_state = {}
+         torch.distributed.barrier()
+ 
+     # Always clean up the state dict for HF compatibility

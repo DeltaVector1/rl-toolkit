@@ -1,0 +1,737 @@
+From 557075743f86841eb667811063709e4496458717 Mon Sep 17 00:00:00 2001
+From: DeltaVector1 <DeltaVector1@users.noreply.github.com>
+Date: Mon, 10 Aug 2026 02:44:16 +0000
+Subject: [PATCH 5/8] Add GLM52 trainer loop and filesystem broadcast
+
+---
+ .../trainer/rl/broadcast/filesystem.py        |  11 +-
+ src/prime_rl/trainer/rl/data.py               |   4 +-
+ src/prime_rl/trainer/rl/train.py              | 481 +++++++++++++++++-
+ src/prime_rl/trainer/utils.py                 |  12 +-
+ 4 files changed, 480 insertions(+), 28 deletions(-)
+
+diff --git a/src/prime_rl/trainer/rl/broadcast/filesystem.py b/src/prime_rl/trainer/rl/broadcast/filesystem.py
+index d0a453f0..d2a773aa 100644
+--- a/src/prime_rl/trainer/rl/broadcast/filesystem.py
++++ b/src/prime_rl/trainer/rl/broadcast/filesystem.py
+@@ -59,11 +59,20 @@ class FileSystemWeightBroadcast(WeightBroadcast):
+                 # For adapter-only, MultiRunManager creates state dict directly for each run
+                 # All ranks must participate in DTensor gathering, but only master saves
+                 state_dict = self.multi_run_manager.get_state_dict_for_run(idx)
++                # Under pipeline parallelism each rank holds only its stage's
++                # layers and full_tensor() does not reassemble across stages, so
++                # every stage master must materialise its shard on CPU and the
++                # global master merges them. Without this the adapter shipped to
++                # the inference engines contains one stage's layers only.
++                from prime_rl.trainer.weights import is_pp_stage_master, merge_pp_state_dict
++
++                keep_local = self.world.is_master or is_pp_stage_master()
+                 for key, value in state_dict.items():
+                     if isinstance(value, DTensor):
+                         value = value.full_tensor()
+-                    if self.world.is_master:
++                    if keep_local:
+                         state_dict[key] = value.to("cpu", non_blocking=False)
++                state_dict = merge_pp_state_dict(state_dict, is_master=self.world.is_master)
+ 
+             # TODO: Broadcast ready to update in sync, then we dont need to gather on not ready
+             if self.world.is_master:
+diff --git a/src/prime_rl/trainer/rl/data.py b/src/prime_rl/trainer/rl/data.py
+index 1ad250cf..091fafe9 100644
+--- a/src/prime_rl/trainer/rl/data.py
++++ b/src/prime_rl/trainer/rl/data.py
+@@ -243,7 +243,9 @@ class DataLoader:
+                     dtype=_torch_dtype(packed_routed_experts.dtype),
+                 )
+                 .reshape(packed_routed_experts.shape)
+-                .to(torch.int32)
++                # Keep the wire dtype on CPU. The int32 upcast happens on GPU in
++                # the train loop; doing it here quadrupled the CPU-resident batch
++                # (per rank, whole batch) and at 16K contributed to host OOM.
+                 .unsqueeze(0)
+             )
+         return TensorMicroBatch(
+diff --git a/src/prime_rl/trainer/rl/train.py b/src/prime_rl/trainer/rl/train.py
+index 295d3ad1..7dffb241 100644
+--- a/src/prime_rl/trainer/rl/train.py
++++ b/src/prime_rl/trainer/rl/train.py
+@@ -1,6 +1,7 @@
+ import prime_rl._compat  # noqa: F401 — patch ring_flash_attn compat before import
+ 
+ from contextlib import nullcontext
++import os
+ import time
+ from datetime import timedelta
+ 
+@@ -12,6 +13,7 @@ from prime_rl.trainer.rl.broadcast import setup_weight_broadcast
+ from prime_rl.utils.act_offloading import maybe_activation_offloading
+ import torch
+ import torch.distributed as dist
++from torch.distributed.distributed_c10d import _set_pg_timeout
+ from torch.profiler import profile, ProfilerActivity, record_function
+ from prime_rl.trainer.ckpt import setup_ckpt_managers
+ from prime_rl.trainer.multi_ckpt import setup_multi_checkpoint_manager
+@@ -37,6 +39,7 @@ from prime_rl.trainer.rl.loss import (
+ )
+ from prime_rl.trainer.rl.token_export import setup_token_exporter
+ from prime_rl.trainer.model import (
++    DTYPE_MAP,
+     forward,
+     setup_tokenizer,
+     setup_model,
+@@ -70,6 +73,86 @@ from ring_flash_attn import substitute_hf_flash_attn
+ from torchtitan.distributed.utils import clip_grad_norm_
+ 
+ 
++
++def move_micro_batch_to_cuda(micro_batch) -> None:
++    """Move a micro-batch's tensors to the GPU in place, field by field.
++
++    Under pipeline parallelism every micro-batch is padded up to the global
++    16K target. Doing that padding on CPU meant materializing the whole padded
++    batch in host RAM on EVERY rank (8 per node) -- measured at ~50 GB/rank at
++    16K, which the kernel OOM-killer answered. Moving fields to the GPU first
++    drops each CPU copy as it goes, and the subsequent pads then allocate on
++    the GPU where the tensors were headed anyway.
++    """
++    for name in (
++        "input_ids",
++        "position_ids",
++        "advantages",
++        "inference_logprobs",
++        "ref_logprobs",
++        "loss_mask",
++        "temperatures",
++        "rl_weights",
++        "ce_weights",
++        "ref_kl_weights",
++        "mm_token_type_ids",
++        "routed_experts",
++    ):
++        t = micro_batch[name]
++        if t is not None:
++            micro_batch[name] = t.to("cuda", non_blocking=True)
++
++
++def pad_micro_batch_to_distributed_max(micro_batch, group) -> None:
++    length = micro_batch["input_ids"].shape[1]
++    max_length = torch.tensor(length, device="cuda")
++    dist.all_reduce(max_length, op=dist.ReduceOp.MAX, group=group)
++    pad_micro_batch_to_length(micro_batch, int(max_length.item()))
++
++
++def pad_micro_batch_to_length(micro_batch, target_length: int) -> None:
++    """Pad one micro-batch to ``target_length`` tokens.
++
++    This must run BEFORE context-parallel sharding. Padding a CP shard instead
++    puts the pad tokens at the end of each shard, so after gather_for_cp they sit
++    interleaved through the sequence while loss_mask/advantages/inference_logprobs
++    still carry theirs at the end -- every per-token tensor then lines up against
++    the wrong logprobs, silently corrupting both the loss and the metrics.
++    """
++    length = micro_batch["input_ids"].shape[1]
++    padding = target_length - length
++    if padding <= 0:
++        return
++
++    for name, value in (
++        ("input_ids", 1),
++        ("position_ids", 0),
++        ("advantages", 0.0),
++        ("inference_logprobs", 0.0),
++        ("ref_logprobs", 0.0),
++        ("loss_mask", False),
++        ("temperatures", 1.0),
++        ("rl_weights", 0.0),
++        ("ce_weights", 0.0),
++        ("ref_kl_weights", 0.0),
++        ("mm_token_type_ids", 0),
++    ):
++        tensor = micro_batch[name]
++        if tensor is not None:
++            micro_batch[name] = torch.nn.functional.pad(tensor, (0, padding), value=value)
++
++    if micro_batch["routed_experts"] is not None:
++        routed = micro_batch["routed_experts"]
++        micro_batch["routed_experts"] = torch.cat(
++            (routed, routed.new_zeros((routed.shape[0], padding, *routed.shape[2:]))),
++            dim=1,
++        )
++    micro_batch["env_names"].extend([""] * padding)
++    micro_batch["sequence_lengths"][-1] += padding
++    micro_batch["seq_lens"][-1] += padding
++    micro_batch["lora_num_tokens"][-1] += padding
++
++
+ @clean_exit
+ def train(config: TrainerConfig):
+     # Setup world and logger
+@@ -85,9 +168,13 @@ def train(config: TrainerConfig):
+         logger.warning(f"Running in benchmark mode (max_steps={config.max_steps})")
+ 
+     # Setup the monitor
+-    logger.info(f"Initializing monitor ({config.wandb})")
++    logger.info(f"Initializing monitor (wandb={config.wandb}, swanlab={config.swanlab})")
+     monitor = setup_monitor(
+-        config.wandb, file_config=config.file_monitor, output_dir=config.output_dir, run_config=config
++        config.wandb,
++        swanlab_config=config.swanlab,
++        file_config=config.file_monitor,
++        output_dir=config.output_dir,
++        run_config=config,
+     )
+ 
+     # Setup heartbeat (only on rank 0)
+@@ -150,6 +237,38 @@ def train(config: TrainerConfig):
+     logger.info(f"Initializing model ({config.model})")
+     loading_from_ckpt_later = config.ckpt and checkpoint_step is not None
+     model = setup_model(config.model, parallel_dims, loading_from_ckpt_later)
++    group_timeout = timedelta(seconds=config.dist_timeout_seconds)
++    process_groups = {}
++    for mesh in (parallel_dims.world_mesh, *parallel_dims._submeshes.values()):
++        for group in mesh.get_all_groups():
++            process_groups[id(group)] = group
++    for group in process_groups.values():
++        _set_pg_timeout(group_timeout, group)
++    logger.info(f"Set {len(process_groups)} distributed group timeouts to {config.dist_timeout_seconds} seconds")
++    resume_adapter = os.environ.get("PRIME_RL_RESUME_ADAPTER") if checkpoint_step is None else None
++    if resume_adapter:
++        from safetensors.torch import load_file
++        from torch.distributed.tensor import DTensor, distribute_tensor
++
++        adapter = load_file(resume_adapter)
++        loaded = set()
++        with torch.no_grad():
++            for name, parameter in model.named_parameters():
++                key = (
++                    name.replace("._checkpoint_wrapped_module", "")
++                    .replace(".lora_A.0", ".lora_A.weight")
++                    .replace(".lora_B.0", ".lora_B.weight")
++                )
++                if key not in adapter:
++                    continue
++                value = adapter[key].to("cuda", dtype=parameter.dtype)
++                if isinstance(parameter, DTensor):
++                    value = distribute_tensor(value, parameter.device_mesh, parameter.placements)
++                parameter.copy_(value)
++                loaded.add(key)
++        if loaded != adapter.keys():
++            raise ValueError(f"Adapter keys not loaded: {sorted(adapter.keys() - loaded)}")
++        logger.info(f"Loaded {len(loaded)} adapter tensors from {resume_adapter}")
+ 
+     logger.info(f"Initializing tokenizer ({config.tokenizer})")
+     tokenizer = setup_tokenizer(config.tokenizer)
+@@ -221,11 +340,45 @@ def train(config: TrainerConfig):
+         assert_cp_style_supports_model(config.model.cp_style, model)
+         # sparse MLA is softmax (works with both ring and ulysses).
+         setup_sparse_mla_cp(model, cp_group, cp_rank, parallel_dims.cp)
++        # Under pipeline parallelism only the last stage owns the output head.
++        if getattr(model, "lm_head", None) is not None:
++            model.lm_head.cp_group = cp_group
++            model.lm_head.cp_rank = cp_rank
++            model.lm_head.cp_size = parallel_dims.cp
+         # Linear-attn / Mamba layers are only configured under ulysses; with ring
+         # we'd have already raised above.
+         if config.model.cp_style == "ulysses":
+             setup_model_cp(model, cp_group, cp_rank, parallel_dims.cp)
+ 
++    # Pipeline parallelism: wrap this rank's stage once, before the loop.
++    pp_stage_module = None
++    pp_rank = 0
++    if parallel_dims.pp_enabled:
++        from prime_rl.trainer.distributed.pp_runner import PipelineStageModule
++        from prime_rl.trainer.distributed.pp_runner import build_schedule as build_pp_schedule
++        from prime_rl.trainer.distributed.pp_runner import pad_side_inputs_to_common_length as pad_pp_side_inputs
++        from prime_rl.trainer.distributed.pp_runner import force_fsdp_lazy_init
++
++        pp_rank = parallel_dims.get_mesh("pp").get_local_rank()
++        # Weight broadcast: tell the gatherer to merge stage dicts over the pp
++        # group. "Stage master" = the first rank within each stage, which is
++        # exactly the membership of the global master's pp group.
++        from prime_rl.trainer.weights import set_pp_gather_context
++
++        # pp is the slowest-varying mesh dim, so stage s owns the contiguous
++        # ranks [s*k, (s+1)*k) with k = world/pp; the stage master is the first.
++        _ranks_per_stage = dist.get_world_size() // parallel_dims.pp
++        set_pp_gather_context(
++            parallel_dims.get_mesh("pp").get_group(),
++            is_stage_master=(dist.get_rank() % _ranks_per_stage) == 0,
++        )
++        pp_stage_module = PipelineStageModule(
++            model,
++            is_first=pp_rank == 0,
++            is_last=pp_rank == parallel_dims.pp - 1,
++            offload_cfg=config.model.ac_offloading,
++        )
++
+     # Optionally, resume training from a checkpoint
+     progress = Progress()
+     if checkpoint_step is not None:
+@@ -233,6 +386,11 @@ def train(config: TrainerConfig):
+         # The checkpoint finished step ``checkpoint_step``; resume training at the next step.
+         progress.step += 1
+         logger.info(f"Resuming training from checkpoint step {checkpoint_step}")
++    elif resume_adapter:
++        progress.step = int(os.environ["PRIME_RL_RESUME_ADAPTER_STEP"]) + 1
++        multi_run_manager.wait_for_run(0)
++        for idx in multi_run_manager.used_idxs:
++            multi_run_manager.progress[idx].step = progress.step
+ 
+     logger.info(
+         f"Starting from step {progress.step} (total_tokens={progress.total_tokens}, total_samples={progress.total_samples})"
+@@ -240,6 +398,7 @@ def train(config: TrainerConfig):
+ 
+     # Set up the data loader (Optionally, use a fake data loader for debugging)
+     logger.info(f"Initializing data loader ({config.data})")
++    bin_cost = build_bin_cost(model.config)
+     if config.data.fake:
+         dataloader = FakeDataLoader(config.data.fake, config.model.seq_len, parallel_dims.get_mesh("dp").size())
+     else:
+@@ -249,7 +408,7 @@ def train(config: TrainerConfig):
+             parallel_dims.get_mesh("dp").size(),
+             config.model.seq_len,
+             config.model.cp,
+-            build_bin_cost(model.config),
++            bin_cost,
+             config.rollout_transport,
+         )
+ 
+@@ -293,14 +452,39 @@ def train(config: TrainerConfig):
+         dataloader.wait_for_batch()
+         wait_for_batch_time = time.perf_counter() - wait_for_batch_start_time
+         logger.debug(f"Waited for batch to arrive for {wait_for_batch_time:.2f} seconds")
+-
+-        # Load the training batch
+-        logger.debug("Loading batch")
+-        load_data_start_time = time.perf_counter()
++        load_batch_start_time = time.perf_counter()
+         micro_batches = dataloader.get_batch()
+-        load_data_time = time.perf_counter() - load_data_start_time
++        load_data_time = time.perf_counter() - load_batch_start_time
+         logger.debug(f"Loaded batch in {load_data_time:.2f} seconds")
+ 
++        # Reject a corrupt batch instead of dying on it. On 2026-08-06 10:13 a
++        # micro-batch arrived with input_ids of shape [1, 9142729177965406720]
++        # -- a sequence length just under 2^63, i.e. garbage deserialized as
++        # tensor metadata, not a real length. torch raised "Storage size
++        # calculation overflowed", rank 0 died, and the other ranks then hung
++        # until the NCCL collective timeout. The run sat dead for six hours.
++        #
++        # Sequences are packed to at most seq_len (times cp for the pre-shard
++        # case), so anything past a generous multiple of that is corruption.
++        # Skipping costs one batch; crashing costs the whole run.
++        _max_len = config.model.seq_len * max(config.model.cp, 1) * 4
++        _bad = []
++        for _i, _mb in enumerate(micro_batches):
++            _ids = _mb.get("input_ids") if isinstance(_mb, dict) else None
++            if _ids is None:
++                _bad.append((_i, "missing input_ids"))
++                continue
++            if _ids.dim() != 2 or _ids.shape[0] != 1 or not (0 < _ids.shape[1] <= _max_len):
++                _bad.append((_i, f"input_ids shape {tuple(_ids.shape)} (max len {_max_len})"))
++        if _bad:
++            for _i, _why in _bad[:5]:
++                logger.error(f"Corrupt micro-batch {_i}: {_why}")
++            logger.error(
++                f"Discarding batch at step {progress.step}: {len(_bad)}/{len(micro_batches)} micro-batches corrupt. "
++                "Waiting for the next batch rather than crashing the run."
++            )
++            continue
++
+         batch_size = len(micro_batches)
+         memory_profiler = None
+         if config.memory_profiler_path is not None:
+@@ -339,22 +523,45 @@ def train(config: TrainerConfig):
+         cp_rank = parallel_dims.world_mesh["cp"].get_local_rank() if cp_enabled else 0
+         cp_group = parallel_dims.world_mesh["cp"].get_group() if cp_enabled else None
+         cp_size = parallel_dims.cp
++        pp_enabled = parallel_dims.pp_enabled
++        pp_side_inputs: list[dict] = []
++
++        pp_target_length = 0
++        if pp_enabled:
++            # PipelineStage uses fixed-size inter-stage buffers, so every
++            # micro-batch must be the same length. Agree on one length across the
++            # WHOLE world (every stage builds the same buffers) and pad to it here,
++            # before CP sharding, so each shard stays uniform and the pad tokens
++            # land at the true end of the sequence.
++            _local_max = max((mb["input_ids"].shape[1] for mb in micro_batches), default=0)
++            _max_t = torch.tensor(_local_max, device="cuda")
++            dist.all_reduce(_max_t, op=dist.ReduceOp.MAX)
++            pp_target_length = int(_max_t.item())
++            if cp_enabled and pp_target_length % cp_size:
++                pp_target_length += cp_size - (pp_target_length % cp_size)
+ 
+         for micro_step, micro_batch in enumerate(micro_batches):
+-            input_ids = micro_batch["input_ids"].to("cuda")
+-            position_ids = micro_batch["position_ids"].to("cuda")
+-            advantages = micro_batch["advantages"].to("cuda")
+-            loss_mask = micro_batch["loss_mask"].to("cuda")
+-            inference_logprobs = micro_batch["inference_logprobs"].to("cuda")
+-            ref_logprobs = micro_batch["ref_logprobs"].to("cuda") if micro_batch["ref_logprobs"] is not None else None
+-            rl_weights = micro_batch["rl_weights"].to("cuda") if micro_batch["rl_weights"] is not None else None
+-            ce_weights = micro_batch["ce_weights"].to("cuda") if micro_batch["ce_weights"] is not None else None
++            pad_micro_batch_to_distributed_max(micro_batch, dp_cp_group)
++            if pp_enabled:
++                pad_micro_batch_to_length(micro_batch, pp_target_length)
++            _dev = "cpu" if pp_enabled else "cuda"
++            input_ids = micro_batch["input_ids"].to(_dev)
++            position_ids = micro_batch["position_ids"].to(_dev)
++            advantages = micro_batch["advantages"].to(_dev)
++            loss_mask = micro_batch["loss_mask"].to(_dev)
++            inference_logprobs = micro_batch["inference_logprobs"].to(_dev)
++            ref_logprobs = micro_batch["ref_logprobs"].to(_dev) if micro_batch["ref_logprobs"] is not None else None
++            rl_weights = micro_batch["rl_weights"].to(_dev) if micro_batch["rl_weights"] is not None else None
++            ce_weights = micro_batch["ce_weights"].to(_dev) if micro_batch["ce_weights"] is not None else None
+             ref_kl_weights = (
+-                micro_batch["ref_kl_weights"].to("cuda") if micro_batch["ref_kl_weights"] is not None else None
++                micro_batch["ref_kl_weights"].to(_dev) if micro_batch["ref_kl_weights"] is not None else None
+             )
+             routed_experts = (
+-                micro_batch["routed_experts"].to("cuda") if micro_batch["routed_experts"] is not None else None
++                micro_batch["routed_experts"].to(_dev) if micro_batch["routed_experts"] is not None else None
+             )
++            if routed_experts is not None and not pp_enabled:
++                # PP defers this cast to GPU-consumption time in _next_side.
++                routed_experts = routed_experts.to(torch.int32)
+ 
+             if routed_experts is None and config.enable_router_replay:
+                 raise ValueError(
+@@ -385,6 +592,11 @@ def train(config: TrainerConfig):
+             seq_lens = micro_batch["seq_lens"].to("cuda")
+ 
+             labels = shift_tensor_left(input_ids)
++            logprob_mask = shift_tensor_left(loss_mask)
++            if ce_weights is not None:
++                logprob_mask |= shift_tensor_left(ce_weights != 0)
++            if ref_kl_weights is not None:
++                logprob_mask |= shift_tensor_left(ref_kl_weights != 0)
+ 
+             seq_lens_are_pre_shard = False
+ 
+@@ -403,9 +615,12 @@ def train(config: TrainerConfig):
+                     )
+                 seq_lens_are_pre_shard = True
+                 labels = shard_for_cp(labels, cp_rank=cp_rank, cp_world_size=cp_size)
++                logprob_mask = shard_for_cp(logprob_mask, cp_rank=cp_rank, cp_world_size=cp_size)
+                 if routed_experts is not None and not defer_vlm_cp_to_model:
+                     routed_experts = shard_for_cp(routed_experts, cp_rank=cp_rank, cp_world_size=cp_size)
+ 
++            labels = labels.masked_fill(~logprob_mask, -100)
++
+             if config.model.lora:
+                 lora_num_tokens = micro_batch["lora_num_tokens"].to("cuda")
+                 if cp_enabled:
+@@ -418,12 +633,37 @@ def train(config: TrainerConfig):
+                     )
+                 set_lora_num_tokens(lora_num_tokens)
+ 
+-            temperatures = micro_batch["temperatures"].to("cuda")
++            temperatures = micro_batch["temperatures"].to(_dev)
+ 
+             # Shard temperatures for context parallelism if enabled
+             if cp_enabled:
+                 temperatures = shard_for_cp(temperatures, cp_rank=cp_rank, cp_world_size=cp_size)
+ 
++            if pp_enabled:
++                # Under pipeline parallelism the forward/backward is driven by
++                # the schedule after this loop, not here. Stash everything the
++                # stage will need, in micro-batch order.
++                pp_side_inputs.append(
++                    dict(
++                        input_ids=input_ids,
++                        position_ids=position_ids,
++                        labels=labels,
++                        temperatures=temperatures,
++                        seq_lens=seq_lens,
++                        seq_lens_are_pre_shard=seq_lens_are_pre_shard,
++                        routed_experts=routed_experts,
++                        sequence_lengths=micro_batch["sequence_lengths"],
++                        inference_logprobs=inference_logprobs,
++                        ref_logprobs=ref_logprobs,
++                        advantages=advantages,
++                        loss_mask=loss_mask,
++                        rl_weights=rl_weights,
++                        ce_weights=ce_weights,
++                        ref_kl_weights=ref_kl_weights,
++                    )
++                )
++                continue
++
+             # Forward pass with per-token temperatures
+             with maybe_record_function("forward"), maybe_activation_offloading(config.model.ac_offloading):
+                 out = forward(
+@@ -552,6 +792,137 @@ def train(config: TrainerConfig):
+                 micro_step_message += f" | Routing Conf. {tensors['routing_confidence'][-1].mean().item():.4f}"
+             logger.debug(micro_step_message)
+ 
++        if pp_enabled:
++            # Loss for the last stage. Mirrors the non-PP path: temperature-scaled
++            # logprobs, CP gather, right-shift, then the RL loss. Returns a scalar
++            # so the schedule only backprops one value.
++            def _pp_loss(out, side):
++                o = dict(out) if isinstance(out, dict) else {"logits": out}
++                # The PP loss consumes head-computed logprobs directly. Without
++                # the fused head this KeyErrors mid-schedule on the last stage
++                # while 48 other ranks sit in P2P -- fail loudly instead.
++                assert o.get("logprobs") is not None, (
++                    "pipeline parallelism requires the fused output head "
++                    "(logprobs computed in the head); got logits-only output"
++                )
++                if cp_enabled:
++                    o["logprobs"] = gather_for_cp(o["logprobs"], cp_group)
++                    o["entropy"] = gather_for_cp_wo_grad(o["entropy"], cp_size, cp_group)
++                vocab_size = getattr(model.config, "vocab_size", None) or model.config.text_config.vocab_size
++                o["logprobs"] = shift_tensor_right(
++                    o["logprobs"], pad_value=torch.log(torch.tensor(1.0 / vocab_size)).item()
++                )
++                o["entropy"] = shift_tensor_right(
++                    o["entropy"], pad_value=torch.log(torch.tensor(float(vocab_size))).item()
++                )
++                sl = side["sequence_lengths"]
++                loss, loss_tensors = compute_loss(
++                    trainer_logprobs=o["logprobs"].squeeze().split(sl),
++                    inference_logprobs=side["inference_logprobs"].squeeze().split(sl),
++                    ref_logprobs=side["ref_logprobs"].squeeze().split(sl) if side["ref_logprobs"] is not None else None,
++                    advantages=side["advantages"].squeeze().split(sl),
++                    loss_mask=side["loss_mask"].squeeze().split(sl),
++                    rl_weights=side["rl_weights"].squeeze().split(sl) if side["rl_weights"] is not None else None,
++                    ce_weights=side["ce_weights"].squeeze().split(sl) if side["ce_weights"] is not None else None,
++                    ref_kl_weights=side["ref_kl_weights"].squeeze().split(sl)
++                    if side["ref_kl_weights"] is not None
++                    else None,
++                    rl_loss_fn=rl_loss_fn,
++                    rl_scale=rl_scale,
++                    ce_scale=ce_scale,
++                    ref_kl_scale=ref_kl_scale,
++                )
++                tensors["loss"].append(loss.detach().to("cpu").unsqueeze(0))
++                tensors["entropy/all"].append(o["entropy"][side["loss_mask"]].detach().to("cpu"))
++                for k, v in loss_tensors.items():
++                    tensors[k].append(v.detach().to("cpu"))
++                return loss
++
++            # Stage buffers are fixed size, so every micro-batch must share one
++            # sequence length; the pad is appended as a masked-out sequence.
++            _n = torch.tensor([len(pp_side_inputs), -len(pp_side_inputs)], device="cuda")
++            dist.all_reduce(_n, op=dist.ReduceOp.MAX)
++            if _n[0].item() != -_n[1].item() or _n[0].item() == 0:
++                raise RuntimeError(
++                    f"micro-batch count mismatch across ranks (max={_n[0].item()}, "
++                    f"min={-_n[1].item()}); the pipeline schedule would deadlock"
++                )
++            pp_side_inputs = pad_pp_side_inputs(pp_side_inputs, cp_world_size=parallel_dims.cp)
++            pp_stage_module.loss_closure = _pp_loss
++            pp_stage_module.set_side_inputs(pp_side_inputs)
++            # All micro-batches share one padded shape, so hand the stage its
++            # exact tensors and skip the metadata-exchange rendezvous.
++            _L = pp_side_inputs[0]["input_ids"].shape[1]
++            _hs = getattr(model.config, "hidden_size", None) or model.config.text_config.hidden_size
++            # The inter-stage buffers carry ACTIVATIONS, so their dtype is
++            # optimization_dtype -- NOT the dtype of the first parameter. Those
++            # coincided under bf16 weights, but with
++            # `quantization.dequantize_checkpoint = false` the first parameter is
++            # float8_e4m3fn, which declared every hidden-state buffer fp8 and
++            # failed as
++            #   PipeliningShapeError: Stage 1 forward outputs: value 0 has a
++            #   dtype mismatch: expected torch.float8_e4m3fn actual torch.bfloat16
++            # Scanning for the first "real float" parameter is no better: an fp32
++            # weight_scale_inv can precede the bf16 weights and would declare the
++            # buffers fp32. Read the configured value instead.
++            _stage_dtype = DTYPE_MAP[config.model.optimization_dtype]
++            _hidden_ex = torch.empty(1, _L, _hs, dtype=_stage_dtype, device="cuda")
++            _is_last = pp_rank == parallel_dims.pp - 1
++            pp_schedule = build_pp_schedule(
++                pp_stage_module,
++                pp_rank=pp_rank,
++                pp_size=parallel_dims.pp,
++                n_microbatches=len(pp_side_inputs),
++                pp_group=parallel_dims.get_mesh("pp").get_group(),
++                schedule_name=config.model.pp_schedule,
++                example_input=torch.empty(1, _L, dtype=torch.int64, device="cuda") if pp_rank == 0 else _hidden_ex,
++                example_output=torch.empty((), dtype=torch.float32, device="cuda") if _is_last else _hidden_ex,
++            )
++            # FSDP must be initialised before the schedule issues its first
++            # prefetch, which happens before any forward on some stages.
++            force_fsdp_lazy_init(model)
++            # Side inputs are CPU-staged; the schedule input itself must be CUDA.
++            pp_inputs = torch.cat([sd["input_ids"] for sd in pp_side_inputs], dim=0).to("cuda")
++            if dist.get_rank() == 0:
++                torch.cuda.synchronize()
++                pp_start = time.perf_counter()
++            # return_outputs=False: the schedule would otherwise concatenate the
++            # last stage's per-micro-batch outputs, which are scalar losses --
++            # "zero-dimensional tensor cannot be concatenated". The loss closure
++            # already accumulates what the metrics need.
++            if pp_rank == 0:
++                pp_schedule.step(pp_inputs, return_outputs=False)
++            elif pp_rank == parallel_dims.pp - 1:
++                # The schedule indexes target_mbs unconditionally on the last
++                # stage; the loss closure ignores the value, so a zero per
++                # micro-batch is enough to satisfy it.
++                pp_schedule.step(target=torch.zeros(len(pp_side_inputs), device="cuda"), return_outputs=False)
++            else:
++                pp_schedule.step(return_outputs=False)
++            if dist.get_rank() == 0:
++                torch.cuda.synchronize()
++                logger.info(
++                    f"PP step: {len(pp_side_inputs)} micro-batches in {time.perf_counter() - pp_start:.2f}s"
++                )
++            # Free this step's pipeline state NOW. The side inputs (including
++            # routed_experts, tens of MB per micro-batch) and the stage's
++            # per-micro-batch recv/grad buffers otherwise survive through the
++            # optimizer step and overlap with the NEXT batch's allocations --
++            # a multi-GB transient that ran the 47.4 GiB cards to the edge.
++            pp_stage_module.set_side_inputs([])
++            pp_stage_module.loss_closure = None
++            del pp_schedule, pp_inputs, _hidden_ex, pp_side_inputs
++            pp_side_inputs = []
++
++            # F6: MoE router stat buffers accumulate via add_ every forward and
++            # are only drained by this call; without it they grow for the whole
++            # run under PP (the non-PP path drains them per micro-batch).
++            if is_tt_moe_model(model):
++                lb_stats = get_load_balance_stats(model)
++                for k, v in lb_stats.items():
++                    if v is not None:
++                        tensors[k].append(v)
++
+         if config.enable_token_export:
+             dist.barrier()
+             ready_run_ids = {
+@@ -561,20 +932,71 @@ def train(config: TrainerConfig):
+             }
+             token_exporter.mark_stable(ready_run_ids)
+ 
++        # Synchronize forward/loss diagnostics before validating gradients.
++        # A rejected update must still preserve its measured parity evidence.
++        tensor_stats = tensors.compute_stats()
++
+         # compute_loss already divided by the global token count. Undo FSDP's per-rank averaging
+         # across dp_cp so the final gradient is the true per-token mean over the global batch.
+-        for param in model.parameters():
++        found_nonfinite = torch.zeros((), device="cuda", dtype=torch.int32)
++        nonfinite_grad_names: list[str] = []
++        for name, param in model.named_parameters():
+             if param.grad is not None:
+                 param.grad.mul_(parallel_dims.fsdp_gradient_divide_factor)
++                grad = param.grad.to_local() if hasattr(param.grad, "to_local") else param.grad
++                is_nonfinite = (~torch.isfinite(grad).all()).to(dtype=torch.int32)
++                found_nonfinite = torch.maximum(found_nonfinite, is_nonfinite)
++                if is_nonfinite.item():
++                    nonfinite_grad_names.append(name)
++        if nonfinite_grad_names:
++            logger.error(
++                "Non-finite local gradients at step {}: {}",
++                progress.step,
++                nonfinite_grad_names,
++            )
++
++        # Do not silently replace NaN/Inf values with zero. That changes the
++        # optimizer direction and made the later finite-norm guard ineffective.
++        # All ranks must make the same decision before any rank enters the
++        # collective gradient clipping path.
++        dist.all_reduce(found_nonfinite, op=dist.ReduceOp.MAX)
++        if found_nonfinite.item():
++            rejected_metrics = {
++                **tensor_stats,
++                "diagnostic/nonfinite_gradient": 1.0,
++                "step": progress.step,
++            }
++            monitor.log(rejected_metrics, step=progress.step)
++            logger.error(
++                "Rejected-step forward diagnostics at step {}: entropy={} masked_fraction={} "
++                "masked_mismatch_kl={} unmasked_mismatch_kl={}",
++                progress.step,
++                tensor_stats.get("entropy/all/mean"),
++                tensor_stats.get("is_masked/mean"),
++                tensor_stats.get("masked_mismatch_kl/mean"),
++                tensor_stats.get("unmasked_mismatch_kl/mean"),
++            )
++            raise RuntimeError(
++                f"Non-finite gradient at step {progress.step}; refusing to update or broadcast."
++            )
+ 
+         # Optionally, clip the gradients
+         grad_norm: torch.Tensor | None = None
+         if config.optim.max_norm is not None:
+             grad_norm = clip_grad_norm_(
+-                model.parameters(), max_norm=config.optim.max_norm, ep_enabled=parallel_dims.ep_enabled
++                model.parameters(),
++                max_norm=config.optim.max_norm,
++                ep_enabled=parallel_dims.ep_enabled,
++                # Each stage's DTensor meshes do not span pp, so without this the
++                # norm is per-stage and clipping diverges from the non-PP runs.
++                pp_mesh=parallel_dims.get_mesh("pp") if parallel_dims.pp_enabled else None,
+             )
+             if grad_norm.device.type == "cpu":
+                 grad_norm = grad_norm.to(torch.device("cuda"))
++            if not torch.isfinite(grad_norm):
++                raise RuntimeError(f"Non-finite gradient norm at step {progress.step}; refusing to update or broadcast.")
++            if dist.get_rank() == 0:
++                logger.info(f"grad_norm full precision: {grad_norm.item():.6e}")
+ 
+         zero_grad_ratio = get_zero_gradient_ratio(model.parameters(), parallel_dims.dp_replicate)
+ 
+@@ -656,18 +1078,27 @@ def train(config: TrainerConfig):
+         if memory_profiler is not None:
+             memory_profiler.step()
+ 
+-        # Synchronize the tensor metrics across all steps and ranks
+-        tensor_stats = tensors.compute_stats()
++        # Forward/loss tensor metrics were synchronized before gradient
++        # validation so rejected updates preserve the same parity evidence.
+ 
+         # Compute step metrics
+-        num_local_tokens = seq_len * batch_size
++        # Under PP every micro-batch was padded up to pp_target_length after
++        # seq_len was read; measure the padded length or throughput/MFU are
++        # biased low and not comparable across runs.
++        _eff_seq = pp_target_length if (pp_enabled and pp_target_length) else seq_len
++        num_local_tokens = _eff_seq * batch_size
+         num_tokens = parallel_dims.get_mesh("dp").size() * num_local_tokens
+         progress.total_tokens += num_tokens
+         progress.total_samples += batch_size
+         perf_counter = get_perf_counter(model, seq_len)
+         throughput = perf_counter.get_step_tokens_per_second(num_tokens, forward_backward_time)
+         mfu = perf_counter.get_step_mfu(num_tokens, forward_backward_time)
+-        peak_memory = torch.cuda.max_memory_reserved() / 1024**3  # GiB
++        # Report the WORST rank, not rank 0. Under pipeline parallelism rank 0 is
++        # stage 0, which owns the fewest layers; reporting it hid 12-layer stages
++        # sitting at 46 of 47.4 GiB until they OOM'd.
++        _peak = torch.tensor(torch.cuda.max_memory_reserved() / 1024**3, device="cuda")
++        dist.all_reduce(_peak, op=dist.ReduceOp.MAX)
++        peak_memory = _peak.item()  # GiB, max across ranks
+ 
+         # Log step metrics
+         step_time = time.perf_counter() - step_start_time
+diff --git a/src/prime_rl/trainer/utils.py b/src/prime_rl/trainer/utils.py
+index bc0f2e8c..1467b355 100644
+--- a/src/prime_rl/trainer/utils.py
++++ b/src/prime_rl/trainer/utils.py
+@@ -1,6 +1,7 @@
+ import gc
+ import heapq
+ import json
++import os
+ import pickle
+ import shutil
+ import time
+@@ -562,7 +563,16 @@ class Tensors(defaultdict):
+         for key in keys:
+             # All-gather tensors across steps and ranks (get global distribution)
+             values = self.pop(key, [])
+-            tensors = torch.cat(values, dim=0).to("cuda") if values else torch.empty(0, device="cuda")
++            # Cast to float32 before gathering. Under pipeline parallelism a rank
++            # that owns no loss (any stage but the last) contributes an empty
++            # tensor, and an empty tensor defaults to float32 while real values
++            # may be bfloat16. flexible_all_gather sizes its buffers from the
++            # LOCAL dtype, so mismatched dtypes desync the all-gather and every
++            # statistic after the first one comes back as nan. These are logging
++            # statistics, so widening to float32 costs nothing.
++            tensors = (
++                torch.cat(values, dim=0).to("cuda").float() if values else torch.empty(0, device="cuda", dtype=torch.float32)
++            )
+             assert tensors.ndim == 1, "Can only aggregate 1D tensors"
+             tensors = flexible_all_gather(tensors)
+             assert tensors.ndim == 1, "Can only aggregate 1D tensors"

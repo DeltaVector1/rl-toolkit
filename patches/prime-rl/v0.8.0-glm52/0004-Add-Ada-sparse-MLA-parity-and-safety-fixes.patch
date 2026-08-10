@@ -1,0 +1,478 @@
+From 85631261ae858f869a2196eded2694ef06c92010 Mon Sep 17 00:00:00 2001
+From: DeltaVector1 <DeltaVector1@users.noreply.github.com>
+Date: Mon, 10 Aug 2026 02:44:16 +0000
+Subject: [PATCH 4/8] Add Ada sparse MLA parity and safety fixes
+
+---
+ .../glm_moe_dsa/modeling_glm_moe_dsa.py       | 77 ++++++++++++++---
+ .../glm_moe_dsa/sparse_mla_attention.py       | 53 +++++++++++-
+ .../trainer/models/kernels/sparse_mla_bwd.py  | 86 ++++++++++++++-----
+ .../trainer/models/kernels/sparse_mla_fwd.py  | 37 +++++---
+ 4 files changed, 208 insertions(+), 45 deletions(-)
+
+diff --git a/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py b/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py
+index 547e61ba..ed89b13e 100644
+--- a/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py
++++ b/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py
+@@ -65,6 +65,21 @@ class GlmMoeDsaDecoderLayer(GradientCheckpointingLayer):
+             load_balance_coeff=1e-3,
+             use_grouped_mm=config.use_grouped_mm,
+             fp8=getattr(config, "fp8", False),
++            fp8_checkpoint=getattr(
++                config,
++                "fp8_checkpoint_moe",
++                getattr(config, "fp8_checkpoint", False),
++            ),
++            fp8_checkpoint_routed=getattr(
++                config,
++                "fp8_checkpoint_routed_moe",
++                getattr(config, "fp8_checkpoint", False),
++            ),
++            fp8_checkpoint_shared=getattr(
++                config,
++                "fp8_checkpoint_shared_moe",
++                getattr(config, "fp8_checkpoint", False),
++            ),
+         )
+         mlp_config = MLPConfig(
+             hidden_size=config.hidden_size,
+@@ -96,7 +111,23 @@ class GlmMoeDsaDecoderLayer(GradientCheckpointingLayer):
+         ke: Optional[torch.Tensor] = None,
+         cached_indices: Optional[torch.Tensor] = None,
+         routed_experts: Optional[torch.LongTensor] = None,
++        block_mask=None,
+     ) -> tuple[torch.Tensor, torch.Tensor | None]:
++        # Backstop for the float8 residual stream. Under
++        # `quantization.dequantize_checkpoint = false` FSDP applies a bare
++        # MixedPrecisionPolicy() to these blocks (model.py:813) and nothing
++        # normalizes activation dtypes, so an fp8 tensor produced anywhere in
++        # attention or the MoE reaches these adds and torch raises "Promotion
++        # for Float8 Types is not supported". Patching interior sites one by one
++        # is whack-a-mole; the residual stream is where every path converges, so
++        # clamp here. Widening fp8 -> bf16 is exact and this is a no-op when
++        # nothing is fp8.
++        _REAL = (torch.float32, torch.float16, torch.bfloat16)
++
++        def _real(t):
++            return t if t.dtype in _REAL else t.to(torch.bfloat16)
++
++        hidden_states = _real(hidden_states)
+         residual = hidden_states
+         hidden_states = self.input_layernorm(hidden_states)
+         hidden_states, cached_indices = self.self_attn(
+@@ -105,13 +136,14 @@ class GlmMoeDsaDecoderLayer(GradientCheckpointingLayer):
+             ks=ks,
+             ke=ke,
+             cached_indices=cached_indices,
++            block_mask=block_mask,
+         )
+-        hidden_states = residual + hidden_states
++        hidden_states = residual + _real(hidden_states)
+ 
+         residual = hidden_states
+         hidden_states = self.post_attention_layernorm(hidden_states)
+         hidden_states = self.mlp(hidden_states, routed_experts=routed_experts)
+-        hidden_states = residual + hidden_states
++        hidden_states = residual + _real(hidden_states)
+         return hidden_states, cached_indices
+ 
+ 
+@@ -187,7 +219,16 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
+         if len(self.layers) == 0:
+             return None, 0, 1
+ 
+-        layer = self.layers[0]
++        # Under pipeline parallelism apply_pp_boundaries replaces this
++        # ModuleList with nn.ModuleDict keyed by GLOBAL layer index as a STRING
++        # (pipeline_parallel.py:139), so `self.layers[0]` raises KeyError: 0 --
++        # both because the key is a str and because a non-first stage does not
++        # own layer 0 at all. Every layer on a stage carries the same cp
++        # attributes, so take whichever comes first.
++        if isinstance(self.layers, nn.ModuleDict):
++            layer = next(iter(self.layers.values()))
++        else:
++            layer = self.layers[0]
+         return getattr(layer, "_cp_group", None), getattr(layer, "_cp_rank", 0), getattr(layer, "_cp_world_size", 1)
+ 
+     def _gather_position_ids_for_cp(
+@@ -254,7 +295,17 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
+ 
+         cached_indices = None
+         use_index_cache = getattr(self.config, "use_index_cache", False)
+-        for layer_idx, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
++        # Under pipeline parallelism self.layers is an nn.ModuleDict keyed by
++        # GLOBAL layer index as a string (pipeline_parallel.py:139). It cannot be
++        # sliced, and enumerate() would hand back a local 0-based index while
++        # routed_experts is indexed by global layer -- silently replaying the
++        # wrong layer's router on every stage after the first. Keying by global
++        # index is the whole reason that ModuleDict exists, so use it.
++        if isinstance(self.layers, nn.ModuleDict):
++            layer_items = [(int(name), module) for name, module in self.layers.items()]
++        else:
++            layer_items = list(enumerate(self.layers[: self.config.num_hidden_layers]))
++        for layer_idx, decoder_layer in layer_items:
+             routed_experts_layer = routed_experts[:, :, layer_idx, :] if routed_experts is not None else None
+             hidden_states, next_cached_indices = decoder_layer(
+                 hidden_states,
+@@ -266,7 +317,12 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
+             )
+             cached_indices = next_cached_indices if use_index_cache else None
+ 
+-        hidden_states = self.norm(hidden_states)
++        # apply_pp_boundaries sets norm to None on every stage but the last
++        # (pipeline_parallel.py:161) -- the head is ~1.9 GB in bf16 and the
++        # non-final stages never use it. Only the last stage normalizes; the
++        # others hand their hidden states straight to the next stage.
++        if self.norm is not None:
++            hidden_states = self.norm(hidden_states)
+         return BaseModelOutputWithPast(last_hidden_state=hidden_states)
+ 
+ 
+@@ -283,7 +339,7 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
+         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+ 
+         warnings.warn("GlmMoeDsaForCausalLM is experimental, higher trainer<->inference KL mismatch may be observed.")
+-        warnings.warn("`model.attn` is ignored, GlmMoeDsa uses only sparse attention.")
++        warnings.warn("`model.attn` is ignored; GlmMoeDsa selects its model-specific attention path.")
+ 
+         self.post_init()
+ 
+@@ -300,9 +356,8 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
+         logits_to_keep: Union[int, torch.Tensor] = 0,
+         temperature: Optional[torch.Tensor] = None,
+         routed_experts: Optional[torch.LongTensor] = None,
+-        # Document boundaries derive from position_ids (sparse MLA builds its
+-        # varlen indices from them); seq_lens is accepted to satisfy the
+-        # trainer's universal contract.
++        # Document boundaries derive from position_ids; seq_lens is accepted
++        # to satisfy the trainer's universal contract.
+         *,
+         seq_lens: torch.LongTensor,
+         seq_lens_are_pre_shard: bool = False,
+@@ -339,14 +394,14 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
+             inputs_embeds=inputs_embeds,
+             routed_experts=routed_experts,
+         )
+-
+         hidden_states = outputs.last_hidden_state
+         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+-        return self.lm_head(
++        output = self.lm_head(
+             hidden_states[:, slice_indices, :],
+             labels[:, slice_indices] if labels is not None else None,
+             temperature=temperature,
+         )
++        return output
+ 
+     def init_buffers_post_meta(self):
+         buffer_names = [name for name, _ in self.named_buffers()]
+diff --git a/src/prime_rl/trainer/models/glm_moe_dsa/sparse_mla_attention.py b/src/prime_rl/trainer/models/glm_moe_dsa/sparse_mla_attention.py
+index 1cc6c914..d36f72ac 100644
+--- a/src/prime_rl/trainer/models/glm_moe_dsa/sparse_mla_attention.py
++++ b/src/prime_rl/trainer/models/glm_moe_dsa/sparse_mla_attention.py
+@@ -3,12 +3,26 @@ from dataclasses import dataclass
+ import torch
+ import torch.distributed as dist
+ from torch import nn
++from torch.nn.attention.flex_attention import flex_attention
+ 
+ from prime_rl.trainer.models.kernels.fp8_indexer import fp8_indexer
+ from prime_rl.trainer.models.layers.norms import LayerNorm, RMSNorm, RMSNormConfig
+ from prime_rl.trainer.models.layers.rotary_emb import rotate_half
+ from prime_rl.utils.cp import gather_for_cp
+ 
++_flex_attention = torch.compile(flex_attention, dynamic=True)
++_ADA_FLEX_OPTIONS = {
++    "BLOCK_M": 16,
++    "BLOCK_N": 16,
++    "BLOCK_M1": 16,
++    "BLOCK_N1": 16,
++    "BLOCK_M2": 16,
++    "BLOCK_N2": 16,
++    "num_warps": 4,
++    "num_stages": 1,
++    "PRESCALE_QK": True,
++}
++
+ try:
+     from prime_rl.trainer.models.kernels.sparse_mla_bwd import sparse_mla_bwd
+     from prime_rl.trainer.models.kernels.sparse_mla_fwd import sparse_mla_fwd_interface
+@@ -49,7 +63,9 @@ class _SparseMLA(torch.autograd.Function):
+     @staticmethod
+     def backward(ctx, do):
+         q, kv, out, indices, lse = ctx.saved_tensors
+-        dq, dkv = sparse_mla_bwd(q, kv, out, do.contiguous(), indices, lse, sm_scale=ctx.sm_scale)
++        dq, dkv = sparse_mla_bwd(
++            q, kv, out, do.contiguous(), indices, lse, sm_scale=ctx.sm_scale
++        )
+         return dq, dkv, None, None
+ 
+ 
+@@ -60,6 +76,22 @@ def apply_rope_interleave_single(
+     sin = sin.unsqueeze(unsqueeze_dim)
+     b, h, s, d = t.shape
+     t = t.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
++    # Under `quantization.dequantize_checkpoint = false` FSDP wraps the blocks
++    # with a bare MixedPrecisionPolicy() (model.py:813), so nothing normalizes
++    # activation dtypes and float8 tensors reach this multiply. Torch has no fp8
++    # promotion, so ANY fp8 operand raises. Either side can be the fp8 one: t on
++    # the main path, cos/sin via compute_sparse_indices. Widening fp8 -> bf16 is
++    # exact, and rope must not run in fp8 regardless -- e4m3 has 3 mantissa bits,
++    # which would wreck the positional phase.
++    _REAL = (torch.float32, torch.float16, torch.bfloat16)
++    if t.dtype not in _REAL or cos.dtype not in _REAL or sin.dtype not in _REAL:
++        common = next((x.dtype for x in (t, cos, sin) if x.dtype in _REAL), torch.bfloat16)
++        if t.dtype not in _REAL:
++            t = t.to(common)
++        if cos.dtype not in _REAL:
++            cos = cos.to(common)
++        if sin.dtype not in _REAL:
++            sin = sin.to(common)
+     return (t * cos) + (rotate_half(t) * sin)
+ 
+ 
+@@ -240,6 +272,7 @@ class GlmMoeDsaAttention(nn.Module):
+         ks: torch.Tensor | None = None,
+         ke: torch.Tensor | None = None,
+         cached_indices: torch.Tensor | None = None,
++        block_mask=None,
+     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+         q_latent, k_compressed_normed, k_rope = self.attn_projections(hidden_states)
+ 
+@@ -247,6 +280,24 @@ class GlmMoeDsaAttention(nn.Module):
+             k_compressed_normed = gather_for_cp(k_compressed_normed, self._cp_group)
+             k_rope = gather_for_cp(k_rope, self._cp_group)
+ 
++        if block_mask is not None:
++            sparse_q, sparse_kv, w_v = self.mla_up_proj(
++                q_latent_local=q_latent,
++                k_compressed_normed_full=k_compressed_normed,
++                k_rope_full=k_rope,
++                position_embeddings_full=position_embeddings,
++            )
++            out = _flex_attention(
++                sparse_q.transpose(1, 2),
++                sparse_kv[:, :-1].transpose(1, 2),
++                sparse_kv[:, :-1, :, : self.kv_lora_rank].transpose(1, 2),
++                block_mask=block_mask,
++                scale=self.scaling,
++                enable_gqa=True,
++                kernel_options=_ADA_FLEX_OPTIONS,
++            ).transpose(1, 2).to(w_v.dtype)
++            return self.output_proj(out, w_v), None
++
+         indices = cached_indices
+         if not self.skip_topk:
+             indices = self.indexer.compute_sparse_indices(
+diff --git a/src/prime_rl/trainer/models/kernels/sparse_mla_bwd.py b/src/prime_rl/trainer/models/kernels/sparse_mla_bwd.py
+index 4ccbc584..480eb9e0 100644
+--- a/src/prime_rl/trainer/models/kernels/sparse_mla_bwd.py
++++ b/src/prime_rl/trainer/models/kernels/sparse_mla_bwd.py
+@@ -104,8 +104,10 @@ def bwd(
+     sm_scale=None,
+     is_causal=True,
+     block_size=32,
++    block_H=64,
+     num_stages=0,
+     threads=256,
++    vectorized_atomic=True,
+     indices_dtype=T.int32,
+     dtype=T.bfloat16,
+     accum_dtype=T.float32,
+@@ -134,7 +136,7 @@ def bwd(
+ 
+     H = H_kv
+     padded_H = max(tilelang.math.next_power_of_2(H_kv), 16)
+-    block_H = min(64, padded_H)
++    block_H = min(block_H, padded_H)
+     assert padded_H % block_H == 0
+     NH = padded_H // block_H
+     BS = block_size
+@@ -245,27 +247,50 @@ def bwd(
+                         if bi_i < BS // split_store:
+                             acc_dkv_tail_shared[bi_i, d_i] = acc_dkv_tail[bi_i + s * (BS // split_store), d_i]
+ 
+-                    for bi_i, d_i in T.Parallel(BS // split_store, D // 4):
+-                        T.atomic_addx4(
+-                            dKV[
+-                                by,
+-                                Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
+-                                bz // NH,
+-                                d_i * 4,
+-                            ],
+-                            acc_dkv_shared[bi_i, d_i * 4],
+-                        )
+-
+-                    for bi_i, d_i in T.Parallel(BS // split_store, D_tail // 4):
+-                        T.atomic_addx4(
+-                            dKV[
+-                                by,
+-                                Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
+-                                bz // NH,
+-                                D + d_i * 4,
+-                            ],
+-                            acc_dkv_tail_shared[bi_i, d_i * 4],
+-                        )
++                    if vectorized_atomic:
++                        for bi_i, d_i in T.Parallel(BS // split_store, D // 4):
++                            T.atomic_addx4(
++                                dKV[
++                                    by,
++                                    Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
++                                    bz // NH,
++                                    d_i * 4,
++                                ],
++                                acc_dkv_shared[bi_i, d_i * 4],
++                            )
++
++                        for bi_i, d_i in T.Parallel(BS // split_store, D_tail // 4):
++                            T.atomic_addx4(
++                                dKV[
++                                    by,
++                                    Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
++                                    bz // NH,
++                                    D + d_i * 4,
++                                ],
++                                acc_dkv_tail_shared[bi_i, d_i * 4],
++                            )
++                    else:
++                        for bi_i, d_i in T.Parallel(BS // split_store, D):
++                            T.atomic_add(
++                                dKV[
++                                    by,
++                                    Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
++                                    bz // NH,
++                                    d_i,
++                                ],
++                                acc_dkv_shared[bi_i, d_i],
++                            )
++
++                        for bi_i, d_i in T.Parallel(BS // split_store, D_tail):
++                            T.atomic_add(
++                                dKV[
++                                    by,
++                                    Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
++                                    bz // NH,
++                                    D + d_i,
++                                ],
++                                acc_dkv_tail_shared[bi_i, d_i],
++                            )
+ 
+             T.copy(acc_dq, dQ_shared)
+             T.copy(acc_dq_tail, dQ_tail_shared)
+@@ -292,7 +317,22 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None):
+     assert lse.shape == (B, S, H)
+ 
+     preprocess_kernel = preprocess(H, D)
+-    bwd_kernel = bwd(H, D, D_tail, topk, kv_group, sm_scale, True)
++    if torch.cuda.get_device_capability(q.device)[0] < 9:
++        bwd_kernel = bwd(
++            H,
++            D,
++            D_tail,
++            topk,
++            kv_group,
++            sm_scale,
++            True,
++            block_size=16,
++            block_H=16,
++            threads=64,
++            vectorized_atomic=False,
++        )
++    else:
++        bwd_kernel = bwd(H, D, D_tail, topk, kv_group, sm_scale, True)
+     postprocess_kernel = postprocess(D, D_tail, kv_group)
+ 
+     delta = preprocess_kernel(o, do)
+diff --git a/src/prime_rl/trainer/models/kernels/sparse_mla_fwd.py b/src/prime_rl/trainer/models/kernels/sparse_mla_fwd.py
+index ac360a02..a42d54b0 100644
+--- a/src/prime_rl/trainer/models/kernels/sparse_mla_fwd.py
++++ b/src/prime_rl/trainer/models/kernels/sparse_mla_fwd.py
+@@ -14,6 +14,7 @@ except Exception:
+     pass
+ 
+ import tilelang
++import torch
+ from tilelang import language as T
+ 
+ 
+@@ -34,6 +35,7 @@ def sparse_mla_fwd(
+     is_causal=True,
+     CP0=True,
+     block_I=64,
++    block_H=64,
+     num_stages=2,
+     threads=256,
+ ):
+@@ -73,13 +75,9 @@ def sparse_mla_fwd(
+     D = dim
+     D_tail = tail_dim
+ 
+-    if head_kv > 64:
+-        assert head_kv % 64 == 0, "head_kv should be a multiple of 64"
+-        REPLICATE_H = head_kv // 64
+-    else:
+-        REPLICATE_H = 1
+-
+-    H_per_block = padded_H if REPLICATE_H == 1 else 64
++    H_per_block = min(block_H, padded_H)
++    assert padded_H % H_per_block == 0
++    REPLICATE_H = padded_H // H_per_block
+ 
+     @T.prim_func
+     def main(
+@@ -124,7 +122,7 @@ def sparse_mla_fwd(
+             # (where local q_i no longer matches the global K position).
+             max_kv_i = seq_len_kv - 2
+ 
+-            H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * 64)
++            H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * H_per_block)
+             H1 = H0 + H_per_block
+ 
+             T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)
+@@ -172,10 +170,22 @@ def sparse_mla_fwd(
+                 T.copy(acc_s, S_shared)
+                 T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
+ 
++            # A fully masked query has no valid K row. Return the exact zero
++            # output and +inf LSE so backward reconstructs zero probabilities.
++            # Dividing by sumexp=0 and storing -inf LSE produced NaNs that
++            # propagated through every earlier LoRA projection.
+             for h_i, d_i in T.Parallel(H_per_block, D):
+-                acc_o[h_i, d_i] /= sumexp[h_i]
++                acc_o[h_i, d_i] = T.if_then_else(
++                    sumexp[h_i] > 0,
++                    acc_o[h_i, d_i] / sumexp[h_i],
++                    0,
++                )
+             for h_i in T.Parallel(H_per_block):
+-                sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
++                sumexp[h_i] = T.if_then_else(
++                    sumexp[h_i] > 0,
++                    T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale,
++                    T.infinity(sumexp.dtype),
++                )
+ 
+             T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
+             T.copy(sumexp, Lse[b_i, s_i, H0:H1])
+@@ -196,6 +206,12 @@ def sparse_mla_fwd_interface(q, kv, indices, sm_scale=None, d_v=512, block_I=64,
+     _, _, _, topk = indices.shape
+     assert indices.shape == (batch, seq_len, kv_group, topk)
+ 
++    block_H = 64
++    if torch.cuda.get_device_capability(q.device)[0] < 9:
++        block_I = min(block_I, 32)
++        block_H = 16
++        threads = min(threads, 128)
++
+     kernel = sparse_mla_fwd(
+         heads,
+         dim,
+@@ -205,6 +221,7 @@ def sparse_mla_fwd_interface(q, kv, indices, sm_scale=None, d_v=512, block_I=64,
+         sm_scale,
+         True,
+         block_I=block_I,
++        block_H=block_H,
+         num_stages=num_stages,
+         threads=threads,
+     )
