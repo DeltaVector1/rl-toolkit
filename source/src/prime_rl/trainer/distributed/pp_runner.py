@@ -177,30 +177,62 @@ def _sparse_cache_pipeline_stage_cls():
     micro-batch.
     """
     from torch.distributed.pipelining import PipelineStage
-    from torch.distributed.pipelining.stage import _RecvInfo, _make_tensor_from_meta
+    from torch.distributed.pipelining.stage import (
+        _RecvInfo,
+        _RootArgPlaceholder,
+        _make_tensor_from_meta,
+    )
 
     class SparseCachePipelineStage(PipelineStage):
         def _prepare_forward_infra(self, num_microbatches, args, kwargs=None):
-            outputs = super()._prepare_forward_infra(num_microbatches, args, kwargs)
+            outputs = ()
+            if self.inputs_meta is None:
+                outputs = self._shape_inference(args, kwargs)
+            if self.inputs_meta is None:
+                raise RuntimeError(
+                    "pipeline shape inference did not configure input metadata"
+                )
+
             if not self.is_first:
                 # The cache is consumed during forward and is not needed by
                 # backward. Reuse a small receive ring instead of retaining a
                 # 16 MiB buffer for every micro-batch. Record one CUDA event for
                 # each slot so NCCL cannot overwrite it before the previous
                 # default-stream forward has finished reading it.
+                if len(self.inputs_meta) != 2:
+                    raise RuntimeError(
+                        "sparse-cache pipeline stages require hidden-state and cache inputs"
+                    )
                 slot_count = min(num_microbatches, self.num_stages)
-                slots = []
-                for chunk_id in range(slot_count):
-                    recv_infos = self.args_recv_info[chunk_id]
-                    if len(recv_infos) != 2:
-                        raise RuntimeError(
-                            "sparse-cache pipeline stages require hidden-state and cache inputs"
-                        )
-                    recv_infos[1].buffer.requires_grad_(False)
-                    slots.append(recv_infos[1].buffer)
-                for chunk_id, recv_infos in self.args_recv_info.items():
-                    recv_infos[1].buffer = slots[chunk_id % slot_count]
+                slots = [
+                    _make_tensor_from_meta(self.inputs_meta[1], self.device)
+                    for _ in range(slot_count)
+                ]
                 self._sparse_cache_events = [None] * slot_count
+
+            for chunk_id in range(num_microbatches):
+                if self.is_first:
+                    self.args_recv_info[chunk_id] = tuple(
+                        _RootArgPlaceholder(i) for i in self.inputs_meta
+                    )
+                    continue
+                hidden = _RecvInfo(
+                    f"recv_for_{self.stage_index}_from_{self.stage_index - 1}",
+                    self.stage_index - 1,
+                    _make_tensor_from_meta(self.inputs_meta[0], self.device),
+                )
+                hidden.buffer.requires_grad_(True)
+                cache = _RecvInfo(
+                    f"recv_cache_for_{self.stage_index}_from_{self.stage_index - 1}",
+                    self.stage_index - 1,
+                    slots[chunk_id % slot_count],
+                )
+                self.args_recv_info[chunk_id] = (hidden, cache)
+
+            self.act_send_info = {
+                idx: ([] if self.is_last else [self.stage_index + 1])
+                for idx in range(len(self.get_outputs_meta()))
+            }
             return outputs
 
         def get_fwd_recv_ops(self, fwd_chunk_id):

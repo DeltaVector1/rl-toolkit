@@ -140,6 +140,9 @@ forward state after the P2P operations own them. The ring has at most one slot
 for each pipeline stage. This keeps cache transport memory bounded when the
 batch-2,048 gate has approximately twice as many microbatches. The two-rank
 test checks that four microbatches use no more than two cache buffers.
+The production-shape test sends 95 caches of shape `[1, 4096, 1, 2048]`.
+It completed with 0.117 GiB peak allocated memory on the receiving rank. The
+old one-buffer-for-each-microbatch setup measured 1.500 GiB in the same test.
 
 x56p is the first nonzero-learning-rate production run on this validated path.
 It started from a new LoRA policy with learning rate 8e-6. Production step 1

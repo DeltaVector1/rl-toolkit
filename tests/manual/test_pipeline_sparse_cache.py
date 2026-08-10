@@ -9,33 +9,40 @@ from torch import nn
 from prime_rl.trainer.distributed.pp_runner import build_schedule
 
 
+BOUNDARY_INDICES = [0, 1, 2047, 2048, 32639, 32640, 32767, 32768]
+
+
+def make_indices(device, cache_shape):
+    indices = torch.zeros(cache_shape, device=device, dtype=torch.int32)
+    indices.flatten()[: len(BOUNDARY_INDICES)] = torch.tensor(
+        BOUNDARY_INDICES,
+        device=device,
+        dtype=torch.int32,
+    )
+    return indices
+
+
 class FirstStage(nn.Module):
-    def __init__(self):
+    def __init__(self, cache_shape):
         super().__init__()
         self.scale = nn.Parameter(torch.tensor(2.0, device="cuda"))
+        self.cache_shape = cache_shape
 
     def forward(self, value):
         hidden = value * self.scale
-        indices = torch.tensor(
-            [0, 1, 2047, 2048, 32639, 32640, 32767, 32768],
-            device=value.device,
-            dtype=torch.int32,
-        ).view_as(value)
+        indices = make_indices(value.device, self.cache_shape)
         transport = indices.to(torch.int16).view(torch.float16)
         return hidden, transport
 
 
 class LastStage(nn.Module):
-    def __init__(self):
+    def __init__(self, cache_shape):
         super().__init__()
         self.scale = nn.Parameter(torch.tensor(3.0, device="cuda"))
+        self.cache_shape = cache_shape
 
     def forward(self, hidden, cache):
-        expected = torch.tensor(
-            [0, 1, 2047, 2048, 32639, 32640, 32767, 32768],
-            device=cache.device,
-            dtype=torch.int32,
-        ).view_as(cache)
+        expected = make_indices(cache.device, self.cache_shape)
         decoded = cache.view(torch.int16).to(torch.int32).bitwise_and_(0xFFFF)
         if not torch.equal(decoded, expected):
             raise RuntimeError("pipeline sparse-index cache changed in transport")
@@ -48,15 +55,19 @@ def main() -> None:
     torch.cuda.set_device(local_rank)
     dist.init_process_group("nccl")
 
-    example = torch.empty(1, 8, device="cuda")
-    cache_example = torch.empty(1, 8, device="cuda", dtype=torch.float16)
-    module = FirstStage() if rank == 0 else LastStage()
+    production_cache = os.environ.get("PRODUCTION_CACHE", "") == "1"
+    n_microbatches = 95 if production_cache else 4
+    hidden_shape = (1, 1) if production_cache else (1, 8)
+    cache_shape = (1, 4096, 1, 2048) if production_cache else (1, 8)
+    example = torch.empty(hidden_shape, device="cuda")
+    cache_example = torch.empty(cache_shape, device="cuda", dtype=torch.float16)
+    module = FirstStage(cache_shape) if rank == 0 else LastStage(cache_shape)
     module.transfer_sparse_indices = True
     schedule = build_schedule(
         module,
         pp_rank=rank,
         pp_size=2,
-        n_microbatches=4,
+        n_microbatches=n_microbatches,
         pp_group=dist.group.WORLD,
         schedule_name="1f1b",
         example_input=example if rank == 0 else (example, cache_example),
@@ -67,10 +78,16 @@ def main() -> None:
 
     if rank == 0:
         print("rank0_schedule_start", flush=True)
-        schedule.step(torch.ones(4, 8, device="cuda"), return_outputs=False)
+        schedule.step(
+            torch.ones((n_microbatches, *hidden_shape[1:]), device="cuda"),
+            return_outputs=False,
+        )
     else:
         print("rank1_schedule_start", flush=True)
-        schedule.step(target=torch.zeros(4, device="cuda"), return_outputs=False)
+        schedule.step(
+            target=torch.zeros(n_microbatches, device="cuda"),
+            return_outputs=False,
+        )
     print(f"rank{rank}_schedule_done", flush=True)
 
     stage = schedule._stage
@@ -89,6 +106,10 @@ def main() -> None:
         }
         if len(cache_buffers) > 2:
             raise RuntimeError("the discrete cache allocated one buffer per microbatch")
+    peak_gib = torch.cuda.max_memory_allocated() / 1024**3
+    if production_cache and peak_gib >= 2.0:
+        raise RuntimeError(f"production cache transport used {peak_gib:.2f} GiB")
+    print(f"rank{rank}_peak_gib={peak_gib:.3f}", flush=True)
 
     if module.scale.grad is None or not bool(torch.isfinite(module.scale.grad)):
         raise RuntimeError(f"rank {rank} did not receive a finite parameter gradient")
