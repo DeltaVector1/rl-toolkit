@@ -251,6 +251,15 @@ path. It retained 142 MiB of exact FP8 activation bits on the host and reduced
 incremental GPU peak from 2,420.17 to 2,277.17 MiB. The two-rank 32K FSDP gate
 also passed with the offload path enabled.
 
+Gate x60n passed the full input-quantization and W1/W3 sites. n76 local rank 6
+then failed at the remaining 4,096-row W2 output chunk: it requested 48 MiB
+with 37.62 MiB free. W1/W3 keeps its 4,096-row paired chunk. W2 now uses 2,048
+rows, so the same measured output allocation is 24 MiB. This changes only the
+workspace bound and not its W8A8 arithmetic. The rollout that preceded this
+failure had zero errors. Collection was 1,454.43 seconds and maximum active
+generation was 821.51 seconds, which was 101.51 seconds above the alarm band.
+The 99,286,073-byte batch transfer took 163.62 seconds.
+
 x56p is the first nonzero-learning-rate production run on this validated path.
 It started from a new LoRA policy with learning rate 8e-6. Production step 1
 completed with grad norm 0.017861, masked mismatch KL 0.347687, unmasked

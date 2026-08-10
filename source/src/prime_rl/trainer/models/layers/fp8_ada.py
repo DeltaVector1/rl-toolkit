@@ -24,7 +24,8 @@ from vllm.model_executor.layers.fused_moe.fused_moe import (
 
 
 block_shape = [128, 128]
-_FP8_W2_CHUNK_ROWS = 4096
+_FP8_W13_CHUNK_ROWS = 4096
+_FP8_W2_CHUNK_ROWS = 2048
 _FP8_ROUTE_SCALE_CHUNK_ROWS = 4096
 _FP8_EXPERT_ACTIVATION_OFFLOAD = (
     os.environ.get("PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD", "") == "1"
@@ -1079,7 +1080,7 @@ class _Experts(torch.autograd.Function):
                 w3,
                 s3,
                 offsets,
-                _FP8_W2_CHUNK_ROWS,
+                _FP8_W13_CHUNK_ROWS,
             ):
                 q1_chunk, qs1_chunk = ops.scaled_fp8_quant(
                     z1, use_per_token_if_dynamic=True
