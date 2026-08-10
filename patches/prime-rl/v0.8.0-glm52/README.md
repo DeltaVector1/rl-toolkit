@@ -113,9 +113,27 @@ old and v0.8.0 dependency patches.
 - The added verifiers disconnect-retry test passes.
 - Both dependency patches pass a clean `git apply --check` at their exact
   v0.8.0 submodule revisions.
-- The x56p trainer TOML parses after removal of the two obsolete false-only
-  bisection keys. It preserves PP8, CP8, EP8, LR `8e-6`, maximum grad norm
-  `1.0`, weight decay `0.0`, and native FP8.
+- The Decensor plugin is discovered through the v0.8 `Taskset` and `Env`
+  class exports. Its environment owns the multi-turn exchange after verifiers
+  removed task-attached `vf.User`. Before cleanup, the original 11 pure tests
+  and 8 temporary v0.8 plugin, turn-count, provider-failure, and failure-path
+  tests passed. The temporary v0.8 test module and eval fixtures were then
+  removed as requested.
+- The canonical v1 command in this checkout is `uv run eval decensor-v1` (or
+  `.venv/bin/eval decensor-v1`). Prime CLI 0.5.60 `prime eval run` still calls
+  the legacy `verifiers.utils.env_utils` loader and is not a v1 `Env` runner.
+- A CPU-only eval against
+  `RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic` at the external judge endpoint
+  completed on 2026-08-10. The one-turn controlled case returned reward `0.9`
+  with all seven judge replies parsed. The two-turn controlled case generated
+  exactly two assistant messages and scored only the final refusal:
+  refusal `9`, Markdown presence `0`, and reward `0.01`. Seven controlled
+  negative judge inputs also returned the expected refusal, coherency,
+  reasoning-ethics, reasoning-coherency, meta-commentary, Markdown-presence,
+  and Markdown-correctness verdicts. The Decensor v0.8 environment gate is
+  **GOOD** for canonical v1 evaluation. This does not approve production-sized
+  rollout transport or trainer deployment. Temporary eval outputs, controlled
+  datasets, prompts, logs, and case runners were removed after this result.
 
 A broad Prime-RL unit run was not clean. The observed failures included
 uninstalled Environment Hub tasksets, two upstream Nemotron-H FlashAttention
@@ -125,9 +143,13 @@ do not authorize a runtime gate.
 
 ## Required semantic work before deployment
 
-1. Rewrite the production combined RL configuration for the v0.8.0
-   `trainer` and `orchestrator` sections. The current x56p orchestrator TOML
-   fails v0.8.0 validation with 14 schema errors.
+1. Create production trainer and orchestrator configurations only after the
+   32K, packing, precision, and performance gates pass. Direct
+   `OrchestratorConfig` migration required three schema
+   changes: `train.env` to `train.source`, `max_inflight_rollouts` to
+   `max_inflight_episodes`, and removal of `pool_size` in favor of each
+   source's `serve.pool`. The earlier count of 14 was from incorrectly parsing
+   a standalone orchestrator file as a combined `RLConfig`.
 2. Verify v0.8.0 orchestrator-side packing for PP8 and CP8. The packer uses
    the DP mesh size as its worker count. Measure microbatch count, PP stage
    balance, and token ownership before a trainer run.
@@ -136,8 +158,9 @@ do not authorize a runtime gate.
    identity.
 4. Verify the singleton v0.8.0 LoRA state model against policy-only restart,
    run-slot reset, PP adapter export, and exact H200 visibility.
-5. Port the Decensor v0.8 environment package and keep final-assistant-turn
-   judging.
+5. Run the Decensor package through the production-sized environment-server
+   and rollout-transport gates. Keep final-assistant-turn judging and verify
+   the cumulative multi-turn token budget at the production sequence length.
 6. Build a new image with the v0.8.0 lock and vLLM 0.26. Do not reuse the
    x56p containers.
 7. Run the staged gates in `TRAINING_EXPECTATIONS.md`: one matrix, one GLM

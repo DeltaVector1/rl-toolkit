@@ -22,15 +22,32 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
-from openai import AsyncOpenAI
+import verifiers.v1 as vf
+from openai import APIError, AsyncOpenAI
 from pydantic import Field
 
-import verifiers.v1 as vf
-from verifiers.v1.clients.config import resolve_api_key
+try:
+    from verifiers.v1.clients.config import resolve_api_key
+except ImportError:
+    # Prime-RL v0.8.0 / verifiers d30a3f48 moved client configuration.
+    from verifiers.v1.configs.client import resolve_api_key
 from verifiers.v1.dialects.chat import message_to_wire
 from verifiers.v1.harnesses.null.harness import NullHarness
-from verifiers.v1.mcp.user import UserConfig
-from verifiers.v1.runtimes import ProgramResult
+
+try:
+    from verifiers.v1.mcp.user import UserConfig
+except ImportError:
+    from pydantic_config import BaseConfig
+
+    class UserConfig(BaseConfig):
+        """Compatibility config after the v1 User server was removed."""
+
+        in_process: bool = True
+
+try:
+    from verifiers.v1.runtimes import ProgramResult
+except ImportError:
+    from verifiers.v1.runtimes.base import ProgramResult
 from verifiers.v1.types import UserMessage
 
 from decensor_v1.state import DecensorState
@@ -206,7 +223,21 @@ class DecensorUserConfig(UserConfig):
     seed: int = 0
 
 
-class DecensorUser(vf.User[DecensorUserConfig, DecensorState]):
+class _RemovedUser:
+    """Type-only base after verifiers replaced ``vf.User`` with Env control."""
+
+    def __class_getitem__(cls, _args):
+        return cls
+
+    @classmethod
+    def run(cls) -> None:
+        raise RuntimeError("the v0.8 environment drives DecensorUser in process")
+
+
+_UserBase = getattr(vf, "User", _RemovedUser)
+
+
+class DecensorUser(_UserBase[DecensorUserConfig, DecensorState]):
     """Adversarial red-team user: replays the opening turn, then generates follow-ups."""
 
     async def setup_task(self, task: Any) -> None:
@@ -243,27 +274,35 @@ class DecensorUser(vf.User[DecensorUserConfig, DecensorState]):
         if self.config.min_p:
             extra_body["min_p"] = self.config.min_p
         text = ""
+        final_error = "unparseable_reply"
         async with _shared_openai(self.config) as client:
             for attempt in range(3):
-                completion = await client.chat.completions.create(
-                    model=self.config.model,
-                    messages=[{"role": "user", "content": prompt_text}],
-                    temperature=self.config.temperature,
-                    max_tokens=self.config.max_tokens,
-                    # Identical policy responses get identical retry streams
-                    # inside a GRPO group. A new seed lets a malformed sampled
-                    # tag recover instead of repeating it byte-for-byte.
-                    seed=self._task_seed + produced_turns + attempt * 10_000_019,
-                    extra_body=extra_body,
-                )
-                text = parse_user_turn_output(
-                    str(completion.choices[0].message.content or "")
-                )
+                try:
+                    completion = await client.chat.completions.create(
+                        model=self.config.model,
+                        messages=[{"role": "user", "content": prompt_text}],
+                        temperature=self.config.temperature,
+                        max_tokens=self.config.max_tokens,
+                        # Identical policy responses get identical retry streams
+                        # inside a GRPO group. A new seed lets a malformed sampled
+                        # tag recover instead of repeating it byte-for-byte.
+                        seed=self._task_seed + produced_turns + attempt * 10_000_019,
+                        extra_body=extra_body,
+                    )
+                    text = parse_user_turn_output(
+                        str(completion.choices[0].message.content or "")
+                    )
+                except (APIError, httpx.HTTPError, IndexError, AttributeError, TypeError, ValueError) as exc:
+                    # Provider failures and malformed provider responses are a
+                    # visible zero-reward trajectory, not an unscored episode.
+                    final_error = type(exc).__name__
+                    text = ""
                 if text:
                     break
         if not text:
             self.state.user_sim_failed = True
             self.state.user_done = True
+            self.state.user_sim_error = final_error
             return []
         self._transcript.append({"role": "user", "content": text})
         return [UserMessage(content=text)]
@@ -305,7 +344,8 @@ async def _shared_null_launch(
 def _enable_shared_clients() -> None:
     judge = importlib.import_module("verifiers.v1.judge")
     judge.build_async_openai = _shared_openai
-    NullHarness.launch = _shared_null_launch
+    if hasattr(vf, "User"):
+        NullHarness.launch = _shared_null_launch
 
 
 def _enable_in_process_user() -> None:
@@ -350,8 +390,9 @@ def _enable_in_process_user() -> None:
 
 
 _enable_shared_clients()
-_enable_in_process_user()
+if hasattr(vf, "User"):
+    _enable_in_process_user()
 
 
-if __name__ == "__main__":
+if __name__ == "__main__" and hasattr(vf, "User"):
     DecensorUser.run()

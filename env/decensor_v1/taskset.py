@@ -18,7 +18,9 @@ import asyncio
 import random
 from typing import Any, NamedTuple
 
+import httpx
 import verifiers.v1 as vf
+from openai import APIError
 
 from decensor_v1.data import build_rows
 from decensor_v1.judges import (
@@ -34,13 +36,13 @@ from decensor_v1.judges import (
 from decensor_v1.scoring import ScoringConfig, Verdicts, score_decensor
 from decensor_v1.state import DecensorState
 from decensor_v1.text import (
-    extract_completion_text,
+    _format_full_conv_for_coherency,
     extract_all_assistant_texts,
+    extract_completion_text,
     extract_last_user_across,
     extract_message_reasoning_trace,
     extract_think_trace,
     strip_think_tags,
-    _format_full_conv_for_coherency,
 )
 from decensor_v1.user import DecensorUser, DecensorUserConfig
 
@@ -109,12 +111,14 @@ class _JudgeOutcome(NamedTuple):
 
 
 class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
-    user = DecensorUser
+    if hasattr(vf, "User"):
+        # Compatibility with the currently deployed verifiers exchange.
+        user = DecensorUser
 
-    def user_server(self):
-        user = super().user_server()
-        user._task_data = self.data
-        return user
+        def user_server(self):
+            user = super().user_server()
+            user._task_data = self.data
+            return user
 
     async def setup(self, trace: vf.Trace, runtime: vf.Runtime) -> None:
         trace.state.target_turns = self.data.target_turns
@@ -161,19 +165,23 @@ class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
         A raised `evaluate` call means gemma is unreachable (endpoint down) — surfaced so it
         tanks the reward. A received-but-unparseable reply (verdict None) stays fail-open.
         """
-        endpoint_error = False
+        received_reply = False
         for attempt in range(3):
             try:
                 result = await judge.evaluate(trace=trace, **fields)
-            except Exception:
-                endpoint_error = True
+            except (APIError, httpx.HTTPError, TimeoutError):
+                pass
             else:
-                endpoint_error = False
+                received_reply = True
                 if result.parsed is not None:
                     return _JudgeOutcome(score=result.parsed, endpoint_down=False)
             if attempt < 2:
                 await asyncio.sleep(0.5 * (attempt + 1))
-        return _JudgeOutcome(score=None, endpoint_down=endpoint_error)
+        # A parse failure means the endpoint replied but none of its replies
+        # contained a valid verdict.  Classify an outage only when all attempts
+        # failed before a reply arrived; a mixed error/parse sequence must not
+        # change category based on which attempt happened last.
+        return _JudgeOutcome(score=None, endpoint_down=not received_reply)
 
     @vf.reward(weight=1.0)
     async def decensor_reward(self, trace: vf.Trace) -> float:
@@ -198,6 +206,7 @@ class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
         )
         if trace.state.user_sim_failed:
             precheck["early_termination"] = "user_sim_failed"
+            precheck["user_sim_error"] = trace.state.user_sim_error
         if precheck.get("early_termination") is not None:
             precheck["final_reward"] = 0.0
             trace.info["decensor"] = precheck

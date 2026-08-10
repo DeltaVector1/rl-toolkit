@@ -17,7 +17,16 @@ from __future__ import annotations
 from typing import Any
 
 import verifiers.v1 as vf
-from verifiers.v1.judge import JudgeConfig, JudgeResponse, JudgeSamplingConfig
+from verifiers.v1.judge import JudgeResponse
+
+try:
+    # Verifiers d30a3f48 (Prime-RL v0.8.0) moved judge configuration
+    # out of judge.py and uses the shared provider sampling model.
+    from verifiers.v1.configs.judge import JudgeConfig
+    from verifiers.v1.types import SamplingConfig as JudgeSamplingConfig
+except ImportError:
+    # Keep the environment usable with the current deployed Prime-RL pin.
+    from verifiers.v1.judge import JudgeConfig, JudgeSamplingConfig
 
 from decensor_v1.text import parse_tag_int
 

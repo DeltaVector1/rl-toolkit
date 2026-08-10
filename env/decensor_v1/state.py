@@ -15,3 +15,5 @@ class DecensorState(vf.State):
     """Set once the simulator has driven the conversation to `target_turns`."""
     user_sim_failed: bool = False
     """The simulator returned no parseable follow-up before `target_turns`."""
+    user_sim_error: str = ""
+    """The final provider or response-shape error when the simulator failed."""
