@@ -23,6 +23,20 @@ import torch
 import torch.nn as nn
 
 
+def minimum_pipeline_microbatches(schedule_name: str, pp_size: int) -> int:
+    """Return the minimum batch that the selected pipeline schedule accepts."""
+    if schedule_name == "1f1b":
+        # PyTorch Schedule1F1B rejects fewer micro-batches than stages. Check
+        # this before schedule construction so a rollout batch with mostly
+        # failed samples can be discarded without stopping all trainer ranks.
+        return pp_size
+    if schedule_name == "gpipe":
+        return 1
+    raise ValueError(
+        f"pp_schedule must be one of ['1f1b', 'gpipe'], got {schedule_name!r}"
+    )
+
+
 class PipelineStageModule(nn.Module):
     """One pipeline stage: hidden states in, hidden states (or loss) out.
 
@@ -372,10 +386,7 @@ def build_schedule(
         "1f1b": Schedule1F1B,
         "gpipe": ScheduleGPipe,
     }
-    if schedule_name not in schedules:
-        raise ValueError(
-            f"pp_schedule must be one of {sorted(schedules)}, got {schedule_name!r}"
-        )
+    minimum_pipeline_microbatches(schedule_name, pp_size)
     cls = schedules[schedule_name]
     # scale_grads=False is load-bearing. The schedule's default divides every
     # gradient by n_microbatches, which is only correct for a loss that AVERAGES

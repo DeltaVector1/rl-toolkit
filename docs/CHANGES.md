@@ -46,6 +46,26 @@ patches/renderers/v0.8.0-disconnected-and-tokenizer.patch
 patches/verifiers/v0.8.0-disconnected-provider-retry.patch
 ```
 
+# PP8 UNDERSIZED-BATCH GUARD AND PRODUCTION X61P
+
+x60r completed eight native-FP8 trainer steps with finite gradients. Step 8
+used 94 micro-batches, took 797.05 seconds for pipeline forward and backward,
+and peaked at 46.5 GiB. An h200a engine restart removed its loaded LoRA. The
+resulting rollout batch for trainer step 9 packed to only two micro-batches.
+PyTorch `Schedule1F1B` requires at least as many micro-batches as pipeline
+stages and stopped PP8 during schedule construction.
+
+The trainer now computes the minimum rank-local micro-batch count before later
+step collectives. For 1F1B it discards a batch below the pipeline stage count
+and waits for the next fresh batch without advancing the policy step. GPipe
+keeps its minimum of one. The pipeline regression tests cover both schedules
+and an unknown schedule.
+
+x61p is the fresh production configuration. It keeps batch 1,024, group 16,
+32,768-token context, 16,384-token maximum output, PP8, CP8, node-local EP8,
+native FP8, Muon, maximum gradient norm 1.0, and weight decay 0.0. It changes
+the zero-learning-rate gate to the required learning rate of 8e-6.
+
 # HARD OFF-POLICY REJECTION
 
 The dispatch gate limits new work, but completed groups can remain buffered

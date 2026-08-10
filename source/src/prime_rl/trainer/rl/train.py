@@ -401,6 +401,7 @@ def train(config: TrainerConfig):
             pad_side_inputs_to_common_length as pad_pp_side_inputs,
         )
         from prime_rl.trainer.distributed.pp_runner import force_fsdp_lazy_init
+        from prime_rl.trainer.distributed.pp_runner import minimum_pipeline_microbatches
         from prime_rl.trainer.distributed.pp_runner import sparse_cache_transport_shape
 
         pp_rank = parallel_dims.get_mesh("pp").get_local_rank()
@@ -545,6 +546,32 @@ def train(config: TrainerConfig):
                 "Waiting for the next batch rather than crashing the run."
             )
             continue
+
+        if parallel_dims.pp_enabled:
+            # Schedule1F1B requires at least one micro-batch for each pipeline
+            # stage. An engine restart can make almost all rollouts fail and
+            # leave a much smaller packed trainer batch. x60r received two
+            # micro-batches under PP8 and PyTorch stopped the complete trainer.
+            # Agree on the smallest rank-local count before any later
+            # collective, then consume and discard the undersized rollout
+            # batch. DataLoader advances to the next fresh batch while the
+            # trainer policy step remains unchanged.
+            _minimum_count = torch.tensor(
+                len(micro_batches), dtype=torch.int64, device="cuda"
+            )
+            dist.all_reduce(_minimum_count, op=dist.ReduceOp.MIN)
+            _minimum_required = minimum_pipeline_microbatches(
+                config.model.pp_schedule, parallel_dims.pp
+            )
+            if _minimum_count.item() < _minimum_required:
+                logger.error(
+                    f"Discarding undersized rollout batch at step {progress.step}: "
+                    f"minimum rank-local micro-batches={_minimum_count.item()}, "
+                    f"pipeline schedule {config.model.pp_schedule!r} with "
+                    f"{parallel_dims.pp} stages requires {_minimum_required}. "
+                    "Waiting for the next fresh batch rather than stopping the trainer."
+                )
+                continue
 
         batch_size = len(micro_batches)
         memory_profiler = None

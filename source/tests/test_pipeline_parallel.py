@@ -223,6 +223,16 @@ class SideInputFifoTest(unittest.TestCase):
             ],
         )
 
+    def test_1f1b_requires_at_least_one_microbatch_per_stage(self):
+        self.assertEqual(self.runner.minimum_pipeline_microbatches("1f1b", 8), 8)
+
+    def test_gpipe_accepts_one_microbatch(self):
+        self.assertEqual(self.runner.minimum_pipeline_microbatches("gpipe", 8), 1)
+
+    def test_unknown_schedule_fails_closed(self):
+        with self.assertRaisesRegex(ValueError, "pp_schedule"):
+            self.runner.minimum_pipeline_microbatches("unknown", 8)
+
     def test_middle_stage_transfers_sparse_index_cache(self):
         hidden = _Tensor("hidden")
         incoming = _Tensor("incoming-cache")
