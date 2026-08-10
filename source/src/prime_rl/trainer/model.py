@@ -49,6 +49,7 @@ from prime_rl.trainer.models import (
 from prime_rl.trainer.models.glm_moe_dsa.sparse_mla_attention import Indexer
 from prime_rl.trainer.models.layers.checkpointing import (
     get_supported_targets,
+    set_reentrant_attention_checkpointing,
     set_reentrant_block_checkpointing,
     set_selective_activation_checkpointing,
     supports_selective_activation_checkpointing,
@@ -1216,6 +1217,12 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
             # block pre-backward hook therefore unshards the native-FP8
             # attention parameters before reentrant recomputation starts.
             set_reentrant_block_checkpointing(transformer_block)
+            full_layers += 1
+        elif ac_config.mode == "reentrant_attention":
+            # The decoder block remains the FSDP unit. Its pre-backward hook
+            # restores native-FP8 storage before inner reentrant attention
+            # recompute, while the slower MoE forward stays eager.
+            set_reentrant_attention_checkpointing(transformer_block)
             full_layers += 1
         elif ac_config.mode == "selective" and supports_selective_activation_checkpointing(transformer_block):
             model_supported_targets.update(get_supported_targets(transformer_block))

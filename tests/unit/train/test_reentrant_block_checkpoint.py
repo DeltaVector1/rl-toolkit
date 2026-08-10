@@ -168,6 +168,56 @@ class ReentrantBlockCheckpointTest(unittest.TestCase):
 
         self.assertEqual(block.forward_calls, 1)
 
+    def test_reentrant_attention_recomputes_attention_but_not_mlp(self):
+        phases = []
+
+        class Attention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.projection = nn.Linear(8, 8, bias=False)
+                self.calls = 0
+
+            def forward(self, *, hidden_states, metadata):
+                self.calls += 1
+                phases.append(checkpointing.in_reentrant_block_checkpoint())
+                return self.projection(hidden_states) + metadata["bias"]
+
+        class Mlp(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.projection = nn.Linear(8, 8, bias=False)
+                self.calls = 0
+
+            def forward(self, value):
+                self.calls += 1
+                phases.append(checkpointing.in_reentrant_block_checkpoint())
+                return self.projection(value).relu()
+
+        class Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn = Attention()
+                self.mlp = Mlp()
+
+            def forward(self, hidden_states, bias):
+                value = self.self_attn(
+                    hidden_states=hidden_states,
+                    metadata={"bias": bias},
+                )
+                return self.mlp(value)
+
+        block = Block()
+        checkpointing.set_reentrant_attention_checkpointing(block)
+        hidden = torch.randn(4, 8, requires_grad=True)
+        bias = torch.randn(4, 8, requires_grad=True)
+        block(hidden, bias).sum().backward()
+
+        self.assertEqual(block.self_attn.calls, 2)
+        self.assertEqual(block.mlp.calls, 1)
+        self.assertEqual(phases, [True, False, True])
+        self.assertTrue(torch.isfinite(hidden.grad).all())
+        self.assertTrue(torch.isfinite(bias.grad).all())
+
     def test_configuration_and_model_dispatch_expose_reentrant_mode(self):
         config_source = (
             REPOSITORY_ROOT
@@ -188,12 +238,15 @@ class ReentrantBlockCheckpointTest(unittest.TestCase):
             / "model.py"
         ).read_text()
 
-        self.assertIn(
-            'Literal["full", "selective", "reentrant_block"]', config_source
-        )
+        self.assertIn('"reentrant_attention"', config_source)
         self.assertIn('ac_config.mode == "reentrant_block"', model_source)
+        self.assertIn('ac_config.mode == "reentrant_attention"', model_source)
         self.assertIn(
             "set_reentrant_block_checkpointing(transformer_block)", model_source
+        )
+        self.assertIn(
+            "set_reentrant_attention_checkpointing(transformer_block)",
+            model_source,
         )
 
 

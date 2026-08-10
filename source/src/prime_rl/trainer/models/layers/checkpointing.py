@@ -28,13 +28,13 @@ _REENTRANT_BLOCK_PHASE: ContextVar[str | None] = ContextVar(
 
 
 def in_reentrant_block_checkpoint() -> bool:
-    """Return true while a whole FSDP block runs under reentrant AC.
+    """Return true in a safe reentrant region inside an FSDP block.
 
-    During the first call, PyTorch runs the block with gradients disabled. It
-    discards the inner autograd contexts. During recompute, the outer FSDP
-    pre-backward hook has already restored the block parameters and keeps them
-    valid until the block backward completes. Native-FP8 linears can therefore
-    borrow those parameters instead of making large owned copies.
+    During the first call, PyTorch runs the checkpointed region with gradients
+    disabled and discards its inner autograd contexts. During recompute, the
+    outer FSDP block pre-backward hook has already restored the parameters and
+    keeps them valid until block backward completes. Native-FP8 linears can
+    therefore borrow those parameters instead of making owned copies.
     """
 
     return _REENTRANT_BLOCK_PHASE.get() is not None
@@ -232,6 +232,29 @@ def set_reentrant_block_checkpointing(layer: nn.Module) -> None:
         use_reentrant=True,
         # A whole block can contain stochastic operations. Correct recompute
         # takes priority over the small RNG-state overhead in this mode.
+        preserve_rng_state=True,
+    )
+
+
+def set_reentrant_attention_checkpointing(layer: nn.Module) -> None:
+    """Checkpoint only attention after the owning FSDP block is unsharded.
+
+    The checkpoint stays reentrant. The owning decoder block remains the FSDP
+    unit, so its output pre-backward hook restores the FP8 parameters before
+    attention recompute starts. MLP activations remain eager. Do not replace
+    this with the selective non-reentrant ``attention`` target; x53d and x54e
+    measured nonfinite sparse-Q activations in that ordering.
+    """
+
+    self_attn = getattr(layer, "self_attn", None)
+    if self_attn is None:
+        raise ValueError(
+            f"{type(layer).__name__} has no self_attn module for reentrant attention checkpointing"
+        )
+    checkpoint_method(
+        self_attn,
+        "forward",
+        use_reentrant=True,
         preserve_rng_state=True,
     )
 

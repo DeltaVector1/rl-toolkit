@@ -14,13 +14,9 @@ from torch import nn
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
-FP8_ADA_PATH = (
-    REPOSITORY_ROOT
-    / "source/src/prime_rl/trainer/models/layers/fp8_ada.py"
-)
+FP8_ADA_PATH = REPOSITORY_ROOT / "source/src/prime_rl/trainer/models/layers/fp8_ada.py"
 MULTI_LINEAR_PATH = (
-    REPOSITORY_ROOT
-    / "source/src/prime_rl/trainer/models/layers/lora/multi_linear.py"
+    REPOSITORY_ROOT / "source/src/prime_rl/trainer/models/layers/lora/multi_linear.py"
 )
 
 
@@ -78,14 +74,14 @@ def _install_fp8_import_stubs() -> None:
     vllm._custom_ops = custom_ops
     sys.modules.setdefault("vllm", vllm)
 
-    fused_moe = types.ModuleType(
-        "vllm.model_executor.layers.fused_moe.fused_moe"
-    )
+    fused_moe = types.ModuleType("vllm.model_executor.layers.fused_moe.fused_moe")
     fused_moe._prepare_expert_assignment = lambda *args, **kwargs: (None, None, None)
     fused_moe.dispatch_fused_moe_kernel = lambda *args, **kwargs: None
     fused_moe.get_default_config = lambda *args, **kwargs: None
     fused_moe.moe_kernel_quantize_input = lambda *args, **kwargs: (None, None)
-    sys.modules.setdefault("vllm.model_executor", types.ModuleType("vllm.model_executor"))
+    sys.modules.setdefault(
+        "vllm.model_executor", types.ModuleType("vllm.model_executor")
+    )
     sys.modules.setdefault(
         "vllm.model_executor.layers", types.ModuleType("vllm.model_executor.layers")
     )
@@ -93,9 +89,7 @@ def _install_fp8_import_stubs() -> None:
         "vllm.model_executor.layers.fused_moe",
         types.ModuleType("vllm.model_executor.layers.fused_moe"),
     )
-    sys.modules.setdefault(
-        "vllm.model_executor.layers.fused_moe.fused_moe", fused_moe
-    )
+    sys.modules.setdefault("vllm.model_executor.layers.fused_moe.fused_moe", fused_moe)
 
 
 def _install_lora_import_stubs() -> None:
@@ -119,10 +113,9 @@ multi_linear = _load_module("_multi_linear_under_test", MULTI_LINEAR_PATH)
 
 
 def _expanded_block_scale(scale: torch.Tensor, shape: tuple[int, int]):
-    return (
-        scale.repeat_interleave(128, dim=0)
-        .repeat_interleave(128, dim=1)[: shape[0], : shape[1]]
-    )
+    return scale.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)[
+        : shape[0], : shape[1]
+    ]
 
 
 class FP8AdaAutogradTest(unittest.TestCase):
@@ -134,9 +127,7 @@ class FP8AdaAutogradTest(unittest.TestCase):
             .reshape(256, 384)
             .to(torch.float8_e4m3fn)
         )
-        scale = torch.tensor(
-            [[0.25, 0.5, 1.0], [2.0, 4.0, 8.0]], dtype=torch.float32
-        )
+        scale = torch.tensor([[0.25, 0.5, 1.0], [2.0, 4.0, 8.0]], dtype=torch.float32)
 
         got = fp8_ada._dequant_weight(weight, scale, 128, 256, torch.float32)
         expected = weight[128:256].float() * _expanded_block_scale(
@@ -152,13 +143,11 @@ class FP8AdaAutogradTest(unittest.TestCase):
             .reshape(130, 259)
             .to(torch.float8_e4m3fn)
         )
-        scale = torch.tensor(
-            [[0.25, 0.5, 1.0], [2.0, 4.0, 8.0]], dtype=torch.float32
-        )
+        scale = torch.tensor([[0.25, 0.5, 1.0], [2.0, 4.0, 8.0]], dtype=torch.float32)
         got = fp8_ada._dequant_weight(weight, scale, 127, 130, torch.float32)
-        expected = weight[127:130].float() * _expanded_block_scale(
-            scale, (130, 259)
-        )[127:130]
+        expected = (
+            weight[127:130].float() * _expanded_block_scale(scale, (130, 259))[127:130]
+        )
         torch.testing.assert_close(got, expected, rtol=0, atol=0)
 
     def test_fp8_dx_contiguates_gradient_and_transposes_block_metadata(self):
@@ -289,7 +278,15 @@ class FP8AdaAutogradTest(unittest.TestCase):
         fp8_ada._linear = dequantized_linear
         try:
             got = fp8_ada._Linear.apply(
-                x, live_weight, live_scale, "model.layers.0.self_attn.o_proj"
+                x,
+                live_weight,
+                live_scale,
+                "model.layers.0.self_attn.o_proj",
+                None,
+            )
+            self.assertEqual(
+                fp8_ada._LINEAR_SNAPSHOT_CACHE["model.layers.0.self_attn.o_proj"][2],
+                1,
             )
             # Simulate FSDP RAF releasing the explicit forward inputs. Backward
             # must use the owned direct-context snapshots.
@@ -298,11 +295,116 @@ class FP8AdaAutogradTest(unittest.TestCase):
             got.backward(upstream)
         finally:
             fp8_ada._linear = original_linear
+        self.assertEqual(fp8_ada._LINEAR_SNAPSHOT_CACHE, {})
         got_grad = x.grad.detach().clone()
+
+        # Multiple 1F1B forwards share one frozen snapshot until their
+        # matching backwards release the final reference.
+        x0 = x.detach().clone().requires_grad_()
+        x1 = x.detach().clone().requires_grad_()
+        live_weight = weight.clone()
+        live_scale = scale.clone()
+        fp8_ada._linear = dequantized_linear
+        try:
+            got0 = fp8_ada._Linear.apply(
+                x0,
+                live_weight,
+                live_scale,
+                "model.layers.0.self_attn.o_proj",
+                None,
+            )
+            got1 = fp8_ada._Linear.apply(
+                x1,
+                live_weight,
+                live_scale,
+                "model.layers.0.self_attn.o_proj",
+                None,
+            )
+            entry = fp8_ada._LINEAR_SNAPSHOT_CACHE["model.layers.0.self_attn.o_proj"]
+            self.assertEqual(entry[2], 2)
+            self.assertNotEqual(entry[0].data_ptr(), live_weight.data_ptr())
+            live_weight.fill_(float("nan"))
+            live_scale.fill_(float("nan"))
+            got0.backward(upstream)
+            self.assertEqual(entry[2], 1)
+            got1.backward(upstream)
+        finally:
+            fp8_ada._linear = original_linear
+        self.assertEqual(fp8_ada._LINEAR_SNAPSHOT_CACHE, {})
 
         ref_x = x.detach().clone().requires_grad_()
         dequantized_linear(ref_x, weight, scale).backward(upstream)
         torch.testing.assert_close(got_grad, ref_x.grad, rtol=1e-12, atol=1e-12)
+
+    def test_fp8_linear_snapshot_is_not_retained_without_input_gradient(self):
+        x = torch.randn(3, 4)
+        weight = torch.randn(5, 4)
+        scale = torch.ones(1, 1)
+        original_linear = fp8_ada._linear
+        fp8_ada._linear = lambda value, raw_weight, _scale: F.linear(
+            value, raw_weight
+        )
+        try:
+            fp8_ada._Linear.apply(x, weight, scale, "probe.no_grad", None)
+        finally:
+            fp8_ada._linear = original_linear
+        self.assertEqual(fp8_ada._LINEAR_SNAPSHOT_CACHE, {})
+
+    def test_fp8_linear_forward_failure_releases_snapshot(self):
+        x = torch.randn(3, 4, requires_grad=True)
+        weight = torch.randn(5, 4)
+        scale = torch.ones(1, 1)
+        original_linear = fp8_ada._linear
+
+        def fail(*_args):
+            raise RuntimeError("injected forward failure")
+
+        fp8_ada._linear = fail
+        try:
+            with self.assertRaisesRegex(RuntimeError, "injected forward failure"):
+                fp8_ada._Linear.apply(x, weight, scale, "probe.failure", None)
+        finally:
+            fp8_ada._linear = original_linear
+        self.assertEqual(fp8_ada._LINEAR_SNAPSHOT_CACHE, {})
+
+    def test_fp8_linear_reacquires_current_owner_parameter_storage(self):
+        torch.manual_seed(37)
+        x = torch.randn(3, 4, dtype=torch.double, requires_grad=True)
+        weight = torch.randn(5, 4, dtype=torch.double)
+        scale = torch.ones(1, 1, dtype=torch.double)
+        upstream = torch.randn(3, 5, dtype=torch.double)
+        owner = types.SimpleNamespace(
+            weight=weight.clone(),
+            weight_scale_inv=scale.clone(),
+        )
+        stale_weight = owner.weight
+        stale_scale = owner.weight_scale_inv
+        original_linear = fp8_ada._linear
+
+        def dense(value, raw_weight, _scale):
+            return F.linear(value, raw_weight)
+
+        fp8_ada._linear = dense
+        try:
+            got = fp8_ada._Linear.apply(
+                x,
+                stale_weight,
+                stale_scale,
+                "probe.live-owner",
+                (owner, "weight", "weight_scale_inv"),
+            )
+            owner.weight = weight.clone()
+            owner.weight_scale_inv = scale.clone()
+            stale_weight.fill_(float("nan"))
+            stale_scale.fill_(float("nan"))
+            got.backward(upstream)
+        finally:
+            fp8_ada._linear = original_linear
+
+        ref_x = x.detach().clone().requires_grad_()
+        F.linear(ref_x, weight).backward(upstream)
+        torch.testing.assert_close(x.grad, ref_x.grad, rtol=0, atol=0)
+        self.assertEqual(fp8_ada._LINEAR_SNAPSHOT_CACHE, {})
 
     def test_fp8_expert_custom_backward_matches_dense_swiglu(self):
         torch.manual_seed(2)
@@ -328,7 +430,15 @@ class FP8AdaAutogradTest(unittest.TestCase):
         fp8_ada._grouped_mm = dense_grouped_mm
         try:
             got = fp8_ada._Experts.apply(
-                x, w1, dummy_scale, w2, dummy_scale, w3, dummy_scale, offsets
+                x,
+                w1,
+                dummy_scale,
+                w2,
+                dummy_scale,
+                w3,
+                dummy_scale,
+                offsets,
+                None,
             )
             got.backward(upstream)
         finally:
@@ -345,6 +455,78 @@ class FP8AdaAutogradTest(unittest.TestCase):
             start = end
         torch.cat(pieces).backward(upstream)
         torch.testing.assert_close(got_grad, ref_x.grad, rtol=1e-12, atol=1e-12)
+
+    def test_fp8_expert_reacquires_current_owner_parameter_storage(self):
+        torch.manual_seed(41)
+        counts = torch.tensor([2, 3], dtype=torch.int32)
+        offsets = counts.cumsum(0)
+        x = torch.randn(5, 4, dtype=torch.double, requires_grad=True)
+        base_w1 = torch.randn(2, 6, 4, dtype=torch.double)
+        base_w2 = torch.randn(2, 4, 6, dtype=torch.double)
+        base_w3 = torch.randn(2, 6, 4, dtype=torch.double)
+        scale = torch.ones(2, 1, 1, dtype=torch.double)
+        upstream = torch.randn(5, 4, dtype=torch.double)
+        live = [
+            base_w1.clone(),
+            scale.clone(),
+            base_w2.clone(),
+            scale.clone(),
+            base_w3.clone(),
+            scale.clone(),
+        ]
+        owner = types.SimpleNamespace(
+            w1=live[0],
+            w1_scale_inv=live[1],
+            w2=live[2],
+            w2_scale_inv=live[3],
+            w3=live[4],
+            w3_scale_inv=live[5],
+        )
+        original_grouped_mm = fp8_ada._grouped_mm
+
+        def dense_grouped_mm(value, weight, _scale, ends):
+            outputs = []
+            start = 0
+            for expert, end in enumerate(ends.tolist()):
+                outputs.append(F.linear(value[start:end], weight[expert]))
+                start = end
+            return torch.cat(outputs)
+
+        fp8_ada._grouped_mm = dense_grouped_mm
+        try:
+            got = fp8_ada._Experts.apply(
+                x,
+                live[0],
+                live[1],
+                live[2],
+                live[3],
+                live[4],
+                live[5],
+                offsets,
+                owner,
+            )
+            owner.w1 = base_w1.clone()
+            owner.w1_scale_inv = scale.clone()
+            owner.w2 = base_w2.clone()
+            owner.w2_scale_inv = scale.clone()
+            owner.w3 = base_w3.clone()
+            owner.w3_scale_inv = scale.clone()
+            for value in live:
+                value.fill_(float("nan"))
+            got.backward(upstream)
+        finally:
+            fp8_ada._grouped_mm = original_grouped_mm
+
+        ref_x = x.detach().clone().requires_grad_()
+        pieces = []
+        start = 0
+        for expert, end in enumerate(offsets.tolist()):
+            z1 = F.linear(ref_x[start:end], base_w1[expert])
+            z3 = F.linear(ref_x[start:end], base_w3[expert])
+            pieces.append(F.linear(F.silu(z1) * z3, base_w2[expert]))
+            start = end
+        torch.cat(pieces).backward(upstream)
+        torch.testing.assert_close(x.grad, ref_x.grad, rtol=1e-12, atol=1e-12)
 
     def test_grouped_mm_pair_reuses_assignment_and_shared_input_quantization(self):
         calls = {"prepare": 0, "quantize": 0, "dispatch": 0}
@@ -461,9 +643,7 @@ class FP8AdaAutogradTest(unittest.TestCase):
             logprob, entropy = fp8_ada._FP8LogProb.apply(
                 hidden, weight, scale, labels, inv_temperature, 2
             )
-            torch.autograd.backward(
-                (logprob, entropy), (grad_logprob, grad_entropy)
-            )
+            torch.autograd.backward((logprob, entropy), (grad_logprob, grad_entropy))
         finally:
             fp8_ada._scaled_mm = original_scaled_mm
         got_grad = hidden.grad.detach().clone()
@@ -507,10 +687,9 @@ class FP8AdaAutogradTest(unittest.TestCase):
         got_grad = hidden.grad.detach().clone()
 
         ref_hidden = hidden.detach().clone().requires_grad_()
-        scaled = (
-            F.linear(ref_hidden, weight * scale.unsqueeze(-1))
-            * inv_temperature.unsqueeze(-1)
-        )
+        scaled = F.linear(
+            ref_hidden, weight * scale.unsqueeze(-1)
+        ) * inv_temperature.unsqueeze(-1)
         probabilities = F.softmax(scaled, dim=-1)
         ref_entropy = -(probabilities * F.log_softmax(scaled, dim=-1)).sum(dim=-1)
         ref_entropy.backward(upstream)
@@ -536,7 +715,9 @@ class FP8AdaAutogradTest(unittest.TestCase):
                 torch.tensor([0, 5, 6]),
             )
 
-        def fake_apply(permuted_x, _w1, _s1, _w2, _s2, _w3, _s3, offsets):
+        def fake_apply(
+            permuted_x, _w1, _s1, _w2, _s2, _w3, _s3, offsets, _owner
+        ):
             captured["x"] = permuted_x.clone()
             captured["offsets"] = offsets.clone()
             return permuted_x
@@ -561,7 +742,9 @@ class FP8AdaAutogradTest(unittest.TestCase):
             fp8_ada._Experts.apply = original_apply
 
         torch.testing.assert_close(captured["x"], x[[0, 1, 3, 4, 5, 2]])
-        torch.testing.assert_close(captured["offsets"], torch.tensor([5, 6], dtype=torch.int32))
+        torch.testing.assert_close(
+            captured["offsets"], torch.tensor([5, 6], dtype=torch.int32)
+        )
         torch.testing.assert_close(got, x)
 
     def test_grouped_mm_zeros_rows_after_last_expert_offset(self):
@@ -594,7 +777,6 @@ class FP8AdaAutogradTest(unittest.TestCase):
         torch.testing.assert_close(got[:2], torch.full_like(got[:2], 7))
         torch.testing.assert_close(got[2:], torch.zeros_like(got[2:]))
 
-
     def test_replace_linear_assigns_full_module_names(self):
         model = nn.Module()
         model.config = types.SimpleNamespace(
@@ -606,12 +788,8 @@ class FP8AdaAutogradTest(unittest.TestCase):
 
         fp8_ada.replace_linear(model)
 
-        self.assertEqual(
-            model.layers[0].o_proj._fp8_fqn, "layers.0.o_proj"
-        )
-        self.assertEqual(
-            model.layers[1].o_proj._fp8_fqn, "layers.1.o_proj"
-        )
+        self.assertEqual(model.layers[0].o_proj._fp8_fqn, "layers.0.o_proj")
+        self.assertEqual(model.layers[1].o_proj._fp8_fqn, "layers.1.o_proj")
 
 
 class MultiLinearAutogradTest(unittest.TestCase):

@@ -123,11 +123,26 @@ class FP8CheckpointFeedForward(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         fqn = getattr(self, "_fp8_fqn", "<unassigned-fp8-shared-expert>")
         return _Linear.apply(
-            F.silu(_Linear.apply(x, self.w1, self.w1_scale_inv, f"{fqn}.w1"))
-            * _Linear.apply(x, self.w3, self.w3_scale_inv, f"{fqn}.w3"),
+            F.silu(
+                _Linear.apply(
+                    x,
+                    self.w1,
+                    self.w1_scale_inv,
+                    f"{fqn}.w1",
+                    (self, "w1", "w1_scale_inv"),
+                )
+            )
+            * _Linear.apply(
+                x,
+                self.w3,
+                self.w3_scale_inv,
+                f"{fqn}.w3",
+                (self, "w3", "w3_scale_inv"),
+            ),
             self.w2,
             self.w2_scale_inv,
             f"{fqn}.w2",
+            (self, "w2", "w2_scale_inv"),
         )
 
 
@@ -323,6 +338,7 @@ class GroupedExperts(nn.Module):
                 w3_scale,
                 x,
                 num_tokens_per_expert,
+                owner=self,
             )
         if self.mxfp4:
             scales = (self.w1_scale, self.w2_scale, self.w3_scale)
@@ -365,6 +381,7 @@ class GroupedExperts(nn.Module):
                 *weights,
                 x,
                 num_tokens_per_expert,
+                owner=self,
             )
         if self.mxfp4:
             return _run_experts_mxfp4(

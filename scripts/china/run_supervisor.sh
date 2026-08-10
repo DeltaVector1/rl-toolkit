@@ -29,7 +29,7 @@ while true; do
     for h in $NODES; do
       ( ssh -o BatchMode=yes -o ConnectTimeout=30 "$h" \
           "TRAINER_NODES='$TRAINER_NODES' RUN=$RUN RUN_NAME=$RUN_NAME CONFIG_TAG=$TAG \
-           PRIME_EP_PROFILE=1 PRIME_EP_AC_CACHE=0 bash $CLUSTER trainer" ) \
+           PRIME_EP_PROFILE=0 PRIME_EP_AC_CACHE=0 bash $CLUSTER trainer" ) \
           >>"/data/glm52-rl/run-supervisor-$h.log" 2>&1 &
       launches[$h]=$!
     done

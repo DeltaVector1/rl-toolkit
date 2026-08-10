@@ -144,6 +144,60 @@ The production-shape test sends 95 caches of shape `[1, 4096, 1, 2048]`.
 It completed with 0.117 GiB peak allocated memory on the receiving rank. The
 old one-buffer-for-each-microbatch setup measured 1.500 GiB in the same test.
 
+Gate x60j was the first full-topology run with the corrected cache shape. It
+completed 94 production microbatches at context length 32,768. Forward and
+backward took 1,648.69 seconds, or 27 minutes 29 seconds. Grad norm was finite
+at 0.020348. Entropy was 0.483419, masked mismatch KL was 0.478039, unmasked
+mismatch KL was 0.067077, and 5.730 percent of tokens were masked. Throughput
+was 1,868 tokens/s and peak GPU memory was 46.55 GiB. Thus, the cache repair
+passes the full-context correctness gate but fails the 10-to-15-minute trainer
+performance gate. Batch wait was 1,620.37 seconds and data load was 1.89
+seconds. These times are separate from trainer compute.
+
+# LIVE FROZEN FP8 BACKWARD PARAMETERS
+
+Outside whole-block reentrant checkpointing, each native-FP8 linear must own
+its weight and inverse-scale snapshot until backward because FSDP releases the
+unsharded parameter after forward. The old direct-context repair cloned the
+same frozen checkpoint weight once for each in-flight 1F1B microbatch. This
+made reduced recomputation use memory in proportion to the pipeline depth.
+
+The first repair kept one shared owned snapshot for each full module name and
+gave each in-flight autograd context a reference to it. This bounded dense
+linear copies, but a complete eager MoE stage would still retain approximately
+one unsharded routed-expert weight set for each layer.
+
+The production path now keeps the owning module on the autograd context. The
+outer FSDP block pre-backward hook restores its current parameter storage.
+Dense linear and routed-expert backward read that current storage instead of a
+saved forward view or a clone. Thus, held 1F1B forwards do not copy frozen FP8
+weights. The shared snapshot cache remains only as a fallback for unowned
+direct function calls. A forward exception releases a fallback reference, and
+an input that does not need a gradient does not make a snapshot.
+
+The CPU autograd suite has 22 tests. It replaces both dense and expert owner
+storage after forward, poisons the stale views, and verifies exact input
+gradients from the current owner parameters. A two-rank SM89 CUDA test keeps
+`reshard_after_forward=true`, uses the full 32K/CP8 attention projection
+shape, holds two forwards before backward, and checks exact eager gradients.
+It also runs two held fused routed-expert forwards through an FSDP owner. The
+dense, expert, whole-block reentrant, and attention-only reentrant cases all
+pass. The cache is empty and measured probe peak is 1.12 GiB.
+
+The new `reentrant_attention` activation-checkpoint mode recomputes only
+attention. It keeps the checkpoint boundary reentrant and inside the owning
+FSDP decoder block, so attention parameters are restored before recompute.
+The MoE stays eager and uses live owner parameters in backward. This mode does
+not use the unsafe non-reentrant `attention`, `attn_proj`, or `mla_up_proj`
+selective targets.
+
+Production launch and supervisor restart now set `PRIME_EP_PROFILE=0`. x60j
+already supplied the layer and expert timing needed for this repair. The
+profile path records CUDA events on every layer call and synchronizes after
+each reporting window. It is a diagnostic mode and is not part of the measured
+speed configuration. Foreground `glm52_ops.watch()` continues to report GPU
+use, trainer steps, rollout progress, and engine generation without it.
+
 x56p is the first nonzero-learning-rate production run on this validated path.
 It started from a new LoRA policy with learning rate 8e-6. Production step 1
 completed with grad norm 0.017861, masked mismatch KL 0.347687, unmasked

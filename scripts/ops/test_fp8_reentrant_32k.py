@@ -7,9 +7,11 @@ complete 745B model fits. Run it in the trainer image on free RTX 4090 GPUs:
         scripts/ops/test_fp8_reentrant_32k.py
 
 The gate keeps ``reshard_after_forward=True``. It compares eager and reentrant
-input gradients, runs reentrant backward twice, rejects nonfinite values, and
-reports both a conservative preflight estimate and the measured CUDA peak.
-The defaults account for a 32,768-token sequence split across CP8.
+input gradients, holds two eager forwards before either backward to exercise
+live owner parameter reacquisition used by 1F1B, runs reentrant backward
+twice, rejects nonfinite values, and reports both a conservative preflight
+estimate and the measured CUDA peak. The defaults account for a 32,768-token
+sequence split across CP8.
 """
 
 from __future__ import annotations
@@ -134,9 +136,14 @@ def main() -> None:
     from torch.distributed.fsdp import fully_shard
 
     from prime_rl.trainer.models.layers.checkpointing import (
+        set_reentrant_attention_checkpointing,
         set_reentrant_block_checkpointing,
     )
-    from prime_rl.trainer.models.layers.fp8_ada import FP8CheckpointLinear
+    from prime_rl.trainer.models.layers.fp8_ada import (
+        FP8CheckpointLinear,
+        _Experts,
+        _LINEAR_SNAPSHOT_CACHE,
+    )
 
     args = _arguments()
     shape = ProbeShape(
@@ -217,21 +224,23 @@ def main() -> None:
         return module
 
     class NativeFp8AttentionProbe(nn.Module):
-        def __init__(self):
+        def __init__(self, prefix="probe"):
             super().__init__()
+            self.forward_calls = 0
             h, qr, qw, kr = (
                 shape.hidden_size,
                 shape.q_rank,
                 shape.q_width,
                 shape.kv_rank,
             )
-            self.q_down = make_linear(h, qr, "probe.q_down")
-            self.q_up = make_linear(qr, qw, "probe.q_up")
-            self.kv_down = make_linear(h, kr, "probe.kv_down")
-            self.kv_up = make_linear(kr, h, "probe.kv_up")
-            self.out = make_linear(h, h, "probe.out")
+            self.q_down = make_linear(h, qr, f"{prefix}.q_down")
+            self.q_up = make_linear(qr, qw, f"{prefix}.q_up")
+            self.kv_down = make_linear(h, kr, f"{prefix}.kv_down")
+            self.kv_up = make_linear(kr, h, f"{prefix}.kv_up")
+            self.out = make_linear(h, h, f"{prefix}.out")
 
         def forward(self, *, hidden_states, metadata):
+            self.forward_calls += 1
             q = self.q_up(torch.nn.functional.silu(self.q_down(hidden_states)))
             q = q.view(q.shape[0], -1, shape.hidden_size).mean(dim=1)
             kv = self.kv_up(torch.nn.functional.silu(self.kv_down(hidden_states)))
@@ -286,6 +295,38 @@ def main() -> None:
 
     eager_output, eager_gradient, eager_peak = run_iteration(False)
     progress("eager forward and backward passed")
+
+    # A pipeline stage can run several forwards before their matching
+    # backwards. Frozen checkpoint weights are identical across those graphs,
+    # so direct (non-reentrant) native-FP8 contexts must share one owned FSDP
+    # snapshot per linear rather than clone one per microbatch.
+    block.train(False)
+    inflight_values = [
+        template.detach().clone().requires_grad_(),
+        template.detach().clone().requires_grad_(),
+    ]
+    torch.cuda.reset_peak_memory_stats(local_rank)
+    inflight_outputs = [
+        block(hidden_states=value, metadata={"position_ids": position_ids})
+        for value in inflight_values
+    ]
+    if _LINEAR_SNAPSHOT_CACHE:
+        raise RuntimeError(
+            "owned-module linears copied snapshots instead of reacquiring FSDP parameters"
+        )
+    inflight_outputs[0].float().square().mean().backward()
+    inflight_outputs[1].float().square().mean().backward()
+    torch.cuda.synchronize(local_rank)
+    if _LINEAR_SNAPSHOT_CACHE:
+        raise RuntimeError("the final in-flight backward left FP8 snapshots allocated")
+    for output, value in zip(inflight_outputs, inflight_values, strict=True):
+        if value.grad is None or not bool(torch.isfinite(value.grad).all()):
+            raise RuntimeError("in-flight eager backward produced a nonfinite or missing gradient")
+        torch.testing.assert_close(output.detach().cpu(), eager_output, rtol=0, atol=0)
+        torch.testing.assert_close(value.grad.detach().cpu(), eager_gradient, rtol=0, atol=0)
+    inflight_peak = torch.cuda.max_memory_allocated(local_rank)
+    progress("two-in-flight live-owner forward and backward passed")
+
     checkpoint_output, checkpoint_gradient, checkpoint_peak = run_iteration(True)
     progress("reentrant forward and backward passed")
     repeat_output, repeat_gradient, repeat_peak = run_iteration(True)
@@ -296,7 +337,175 @@ def main() -> None:
     torch.testing.assert_close(repeat_output, checkpoint_output, rtol=0, atol=0)
     torch.testing.assert_close(repeat_gradient, checkpoint_gradient, rtol=0, atol=0)
 
-    peak = max(eager_peak, checkpoint_peak, repeat_peak)
+    class NativeFp8AttentionOnlyBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = NativeFp8AttentionProbe("hybrid.attention")
+            self.mlp = make_linear(
+                shape.hidden_size,
+                shape.hidden_size,
+                "hybrid.mlp",
+            )
+
+        def forward(self, *, hidden_states, metadata):
+            attended = self.self_attn(
+                hidden_states=hidden_states,
+                metadata=metadata,
+            )
+            return self.mlp(torch.nn.functional.silu(attended))
+
+    hybrid = NativeFp8AttentionOnlyBlock().cuda(local_rank)
+    set_reentrant_attention_checkpointing(hybrid)
+    fully_shard(hybrid, mesh=mesh, reshard_after_forward=True)
+
+    def run_hybrid(checkpoint_enabled: bool):
+        hybrid.train(checkpoint_enabled)
+        hybrid.self_attn.forward_calls = 0
+        value = template.detach().clone().requires_grad_()
+        torch.cuda.reset_peak_memory_stats(local_rank)
+        output = hybrid(
+            hidden_states=value,
+            metadata={"position_ids": position_ids},
+        )
+        if _LINEAR_SNAPSHOT_CACHE:
+            raise RuntimeError(
+                "attention-only checkpoint made owned FP8 snapshots: "
+                f"{list(_LINEAR_SNAPSHOT_CACHE)}"
+            )
+        output.float().square().mean().backward()
+        torch.cuda.synchronize(local_rank)
+        if _LINEAR_SNAPSHOT_CACHE:
+            raise RuntimeError("attention-only backward left FP8 snapshots allocated")
+        expected_calls = 2 if checkpoint_enabled else 1
+        if hybrid.self_attn.forward_calls != expected_calls:
+            raise RuntimeError(
+                "attention-only checkpoint recomputed the wrong region: "
+                f"attention calls={hybrid.self_attn.forward_calls}"
+            )
+        if value.grad is None or not bool(torch.isfinite(value.grad).all()):
+            raise RuntimeError("attention-only backward produced a nonfinite or missing gradient")
+        return (
+            output.detach().cpu(),
+            value.grad.detach().cpu(),
+            torch.cuda.max_memory_allocated(local_rank),
+        )
+
+    hybrid_eager_output, hybrid_eager_gradient, hybrid_eager_peak = run_hybrid(
+        False
+    )
+    hybrid_output, hybrid_gradient, hybrid_peak = run_hybrid(True)
+    torch.testing.assert_close(hybrid_output, hybrid_eager_output, rtol=0, atol=0)
+    torch.testing.assert_close(
+        hybrid_gradient,
+        hybrid_eager_gradient,
+        rtol=0,
+        atol=0,
+    )
+    progress("attention-only reentrant FSDP forward and backward passed")
+
+    class NativeFp8ExpertOwnerProbe(nn.Module):
+        def __init__(self):
+            super().__init__()
+            experts = 2
+            dim = 128
+            for name, shape_ in (
+                ("w1", (experts, dim, dim)),
+                ("w2", (experts, dim, dim)),
+                ("w3", (experts, dim, dim)),
+            ):
+                parameter = nn.Parameter(
+                    torch.empty(
+                        shape_,
+                        device="cuda",
+                        dtype=torch.float8_e4m3fn,
+                    ),
+                    requires_grad=False,
+                )
+                with torch.no_grad():
+                    parameter.copy_(
+                        torch.randn(
+                            shape_,
+                            device="cuda",
+                            dtype=torch.bfloat16,
+                        ).to(torch.float8_e4m3fn)
+                    )
+                setattr(self, name, parameter)
+                setattr(
+                    self,
+                    f"{name}_scale_inv",
+                    nn.Parameter(
+                        torch.full(
+                            (experts, 1, 1),
+                            0.01,
+                            device="cuda",
+                            dtype=torch.float32,
+                        ),
+                        requires_grad=False,
+                    ),
+                )
+
+        def forward(self, value):
+            rows = value.shape[0]
+            offsets = torch.tensor(
+                [rows // 2, rows],
+                device=value.device,
+                dtype=torch.int32,
+            )
+            return _Experts.apply(
+                value,
+                self.w1,
+                self.w1_scale_inv,
+                self.w2,
+                self.w2_scale_inv,
+                self.w3,
+                self.w3_scale_inv,
+                offsets,
+                self,
+            )
+
+    expert_probe = NativeFp8ExpertOwnerProbe()
+    fully_shard(expert_probe, mesh=mesh, reshard_after_forward=True)
+    expert_template = torch.randn(
+        shape.local_tokens,
+        128,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    expert_values = [
+        expert_template.detach().clone().requires_grad_(),
+        expert_template.detach().clone().requires_grad_(),
+    ]
+    expert_outputs = [expert_probe(value) for value in expert_values]
+    expert_outputs[0].float().square().mean().backward()
+    expert_outputs[1].float().square().mean().backward()
+    torch.cuda.synchronize(local_rank)
+    for value in expert_values:
+        if value.grad is None or not bool(torch.isfinite(value.grad).all()):
+            raise RuntimeError("live-owner FP8 expert backward produced a nonfinite gradient")
+    torch.testing.assert_close(
+        expert_outputs[0].detach().cpu(),
+        expert_outputs[1].detach().cpu(),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        expert_values[0].grad.detach().cpu(),
+        expert_values[1].grad.detach().cpu(),
+        rtol=0,
+        atol=0,
+    )
+    expert_peak = torch.cuda.max_memory_allocated(local_rank)
+    progress("two-in-flight live-owner FP8 expert FSDP backward passed")
+
+    peak = max(
+        eager_peak,
+        inflight_peak,
+        checkpoint_peak,
+        repeat_peak,
+        hybrid_eager_peak,
+        hybrid_peak,
+        expert_peak,
+    )
     peak_tensor = torch.tensor(peak, device="cuda", dtype=torch.int64)
     dist.all_reduce(peak_tensor, op=dist.ReduceOp.MAX)
     maximum_peak = int(peak_tensor.item())
@@ -325,6 +534,13 @@ def main() -> None:
                     "safety_margin_gib": args.safety_margin_gib,
                     "reshard_after_forward": True,
                     "checkpoint": "reentrant whole block",
+                    "inflight_eager_forwards": 2,
+                    "shared_snapshot_cache_cleared": not bool(
+                        _LINEAR_SNAPSHOT_CACHE
+                    ),
+                    "live_owner_parameter_reacquire": "PASS",
+                    "reentrant_attention_fsdp": "PASS",
+                    "live_owner_expert_fsdp": "PASS",
                 },
                 indent=2,
                 sort_keys=True,

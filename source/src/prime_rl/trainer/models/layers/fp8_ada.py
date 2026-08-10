@@ -10,7 +10,10 @@ from torch.distributed.tensor import DTensor
 from prime_rl.trainer.models.layers.checkpointing import (
     in_reentrant_block_checkpoint,
 )
-from prime_rl.trainer.models.layers.lm_head import PrimeLmOutput, _online_logsumexp_and_weighted_update
+from prime_rl.trainer.models.layers.lm_head import (
+    PrimeLmOutput,
+    _online_logsumexp_and_weighted_update,
+)
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.fused_moe.fused_moe import (
     _prepare_expert_assignment,
@@ -28,6 +31,34 @@ _REPORTED_INPUT_GRAD: set[tuple[int, ...]] = set()
 _EXPERT_PROFILE = os.environ.get("PRIME_EP_PROFILE", "") == "1"
 _EXPERT_BACKWARD_EVENTS: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
 _EXPERT_PROFILE_EVERY = int(os.environ.get("PRIME_EXPERT_PROFILE_EVERY", "90"))
+# Fallback for direct function calls that have no owning module. Production
+# modules reacquire current unsharded FSDP parameters from their owner.
+# Values are [weight, scale, refcount].
+_LINEAR_SNAPSHOT_CACHE: dict[str, list] = {}
+
+
+def _acquire_linear_snapshot(
+    fqn: str,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    entry = _LINEAR_SNAPSHOT_CACHE.get(fqn)
+    if entry is None:
+        entry = [weight.detach().clone(), scale.detach().clone(), 0]
+        _LINEAR_SNAPSHOT_CACHE[fqn] = entry
+    elif tuple(entry[0].shape) != tuple(weight.shape) or tuple(entry[1].shape) != tuple(
+        scale.shape
+    ):
+        raise RuntimeError(f"FP8 snapshot cache shape changed for {fqn}")
+    entry[2] += 1
+    return entry[0], entry[1]
+
+
+def _release_linear_snapshot(fqn: str) -> None:
+    entry = _LINEAR_SNAPSHOT_CACHE[fqn]
+    entry[2] -= 1
+    if entry[2] == 0:
+        del _LINEAR_SNAPSHOT_CACHE[fqn]
 
 
 def _profile_expert_backward(start, end) -> None:
@@ -89,37 +120,28 @@ if hasattr(triton, "jit"):
             offs_k = k_start + tl.arange(0, BLOCK_K)
             activation = tl.load(
                 x + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk,
-                mask=(offs_m[:, None] < rows)
-                & (offs_k[None, :] < reduction_size),
+                mask=(offs_m[:, None] < rows) & (offs_k[None, :] < reduction_size),
                 other=0.0,
             ).to(tl.bfloat16)
             if weight_is_output_major:
                 weight_fragment = tl.load(
-                    weight
-                    + offs_n[None, :] * stride_w0
-                    + offs_k[:, None] * stride_w1,
+                    weight + offs_n[None, :] * stride_w0 + offs_k[:, None] * stride_w1,
                     mask=(offs_n[None, :] < output_size)
                     & (offs_k[:, None] < reduction_size),
                     other=0.0,
                 ).to(tl.bfloat16)
                 inverse_scale = tl.load(
-                    scale
-                    + (pid_n * stride_s0)
-                    + ((k_start // 128) * stride_s1)
+                    scale + (pid_n * stride_s0) + ((k_start // 128) * stride_s1)
                 )
             else:
                 weight_fragment = tl.load(
-                    weight
-                    + offs_k[:, None] * stride_w0
-                    + offs_n[None, :] * stride_w1,
+                    weight + offs_k[:, None] * stride_w0 + offs_n[None, :] * stride_w1,
                     mask=(offs_k[:, None] < reduction_size)
                     & (offs_n[None, :] < output_size),
                     other=0.0,
                 ).to(tl.bfloat16)
                 inverse_scale = tl.load(
-                    scale
-                    + ((k_start // 128) * stride_s0)
-                    + (pid_n * stride_s1)
+                    scale + ((k_start // 128) * stride_s0) + (pid_n * stride_s1)
                 )
             accumulator += tl.dot(activation, weight_fragment) * inverse_scale
 
@@ -174,9 +196,7 @@ def _native_block_fp8_mm(x, weight, scale, *, weight_is_output_major):
             f"scale shape {tuple(scale.shape)} does not cover weight "
             f"{tuple(weight.shape)}; expected {expected_scale}"
         )
-    out = torch.empty(
-        x.shape[0], output_size, device=x.device, dtype=x.dtype
-    )
+    out = torch.empty(x.shape[0], output_size, device=x.device, dtype=x.dtype)
     # Small LoRA projections need a short M tile. Long context shards need a
     # taller tile so each program reuses the same checkpoint weight fragment
     # across more token rows instead of reloading it for every 16 rows.
@@ -278,7 +298,10 @@ def _linear_input_grad_oracle(
         result.addmm_(grad_2d[:, start:end].to(compute_dtype), dequantized)
     converted = result.to(grad.dtype)
     if (
-        (_DIAGNOSE_LINEAR_BACKWARD or os.environ.get("PRIME_FP8_DIAG_LINEAR_BACKWARD", "") == "1")
+        (
+            _DIAGNOSE_LINEAR_BACKWARD
+            or os.environ.get("PRIME_FP8_DIAG_LINEAR_BACKWARD", "") == "1"
+        )
         and not bool(torch.isfinite(converted).all())
         and fqn not in _REPORTED_INPUT_GRAD
     ):
@@ -334,16 +357,23 @@ def _linear_input_grad(
 
 class _Linear(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, weight, scale, fqn):
-        # FSDP2 releases the unsharded frozen parameters after forward. Its
-        # pre-backward rematerialization does not run before this inner custom
-        # autograd backward, so both the saved alias and the current module
-        # accessor point at the released allocation. Save owned snapshots.
-        # Keep these snapshots as direct context attributes. Non-reentrant
-        # checkpoint saved-tensor hooks otherwise replace save_for_backward()
-        # tensors with recomputed aliases, which reintroduces the released
-        # FSDP allocation before this inner backward runs.
-        if in_reentrant_block_checkpoint():
+    def forward(ctx, x, weight, scale, fqn, owner):
+        # FSDP2 releases the unsharded frozen parameters after forward. A saved
+        # tensor alias continues to point at that released allocation. An
+        # owned production module can reacquire the current storage after the
+        # outer block pre-backward hook unshards it. Direct function calls have
+        # no owner, so they keep a bounded fallback snapshot instead.
+        ctx.owner = owner
+        if owner is not None:
+            # The decoder block is the FSDP unit. Its output pre-backward hook
+            # restores current parameter storage before an inner backward.
+            # Keep the owner, not this forward's view, because resharding
+            # releases that view.
+            ctx.weight_snapshot = None
+            ctx.scale_snapshot = None
+            ctx.owns_snapshot = False
+            ctx.snapshot_key = None
+        elif in_reentrant_block_checkpoint():
             # A whole-block reentrant checkpoint starts recompute only after
             # the matching FSDP pre-backward hook unshards this block. FSDP
             # keeps the parameters valid until the block backward completes,
@@ -352,29 +382,58 @@ class _Linear(torch.autograd.Function):
             ctx.weight_snapshot = weight
             ctx.scale_snapshot = scale
             ctx.owns_snapshot = False
-        else:
-            ctx.weight_snapshot = weight.detach().clone()
-            ctx.scale_snapshot = scale.detach().clone()
+            ctx.snapshot_key = None
+        elif ctx.needs_input_grad[0]:
+            ctx.weight_snapshot, ctx.scale_snapshot = _acquire_linear_snapshot(
+                fqn, weight, scale
+            )
             ctx.owns_snapshot = True
+            ctx.snapshot_key = fqn
+        else:
+            # Autograd will not call backward when the activation does not
+            # require a gradient. Do not retain an owned weight in that case.
+            ctx.weight_snapshot = weight
+            ctx.scale_snapshot = scale
+            ctx.owns_snapshot = False
+            ctx.snapshot_key = None
         ctx.fqn = fqn
-        return _linear(x, weight, scale)
+        try:
+            return _linear(x, weight, scale)
+        except BaseException:
+            if ctx.snapshot_key is not None:
+                _release_linear_snapshot(ctx.snapshot_key)
+                ctx.snapshot_key = None
+            raise
 
     @staticmethod
     def backward(ctx, grad):
-        weight = ctx.weight_snapshot
-        scale = ctx.scale_snapshot
-        input_grad = _linear_input_grad(grad, weight, scale, fqn=ctx.fqn)
-        del ctx.weight_snapshot, ctx.scale_snapshot
-        if _DIAGNOSE_LINEAR_BACKWARD or os.environ.get(
-            "PRIME_FP8_DIAG_LINEAR_BACKWARD", ""
-        ) == "1":
+        if ctx.owner is not None:
+            owner, weight_name, scale_name = ctx.owner
+            weight = getattr(owner, weight_name)
+            scale = getattr(owner, scale_name)
+            if isinstance(weight, DTensor):
+                weight = weight.to_local()
+            if isinstance(scale, DTensor):
+                scale = scale.to_local()
+        else:
+            weight = ctx.weight_snapshot
+            scale = ctx.scale_snapshot
+        try:
+            input_grad = _linear_input_grad(grad, weight, scale, fqn=ctx.fqn)
+        finally:
+            if ctx.snapshot_key is not None:
+                _release_linear_snapshot(ctx.snapshot_key)
+            del ctx.weight_snapshot, ctx.scale_snapshot, ctx.owner
+        if (
+            _DIAGNOSE_LINEAR_BACKWARD
+            or os.environ.get("PRIME_FP8_DIAG_LINEAR_BACKWARD", "") == "1"
+        ):
             incoming_finite = bool(torch.isfinite(grad).all())
             output_finite = bool(torch.isfinite(input_grad).all())
             report_key = (ctx.fqn, incoming_finite, output_finite)
             if (
-                (not incoming_finite or not output_finite)
-                and report_key not in _REPORTED_LINEAR_BACKWARD
-            ):
+                not incoming_finite or not output_finite
+            ) and report_key not in _REPORTED_LINEAR_BACKWARD:
                 _REPORTED_LINEAR_BACKWARD.add(report_key)
                 finite_grad = grad[torch.isfinite(grad)]
                 finite_output = input_grad[torch.isfinite(input_grad)]
@@ -388,16 +447,18 @@ class _Linear(torch.autograd.Function):
                     f"output_absmax={float(finite_output.abs().max()) if finite_output.numel() else float('nan'):.6e}",
                     flush=True,
                 )
-        return input_grad, None, None, None
+        return input_grad, None, None, None, None
 
 
 class FP8CheckpointLinear(nn.Linear):
     def forward(self, x):
+        fqn = getattr(self, "_fp8_fqn", f"<unassigned-fp8-linear:{id(self)}>")
         out = _Linear.apply(
             x,
             self.weight,
             self.weight_scale_inv,
-            getattr(self, "_fp8_fqn", "<unassigned-fp8-linear>"),
+            fqn,
+            (self, "weight", "weight_scale_inv"),
         )
         return out if self.bias is None else out + self.bias
 
@@ -428,12 +489,16 @@ class FP8CheckpointLinear(nn.Linear):
 
 class FP8CheckpointEmbedding(nn.Embedding):
     def forward(self, input):
-        quantized = self.weight.view(torch.float8_e4m3fn).view(
-            self.num_embeddings, self.embedding_dim
-        ).index_select(0, input.flatten()).view(
-            *input.shape, self.embedding_dim
-        ).to(torch.bfloat16)
-        scales = self.weight_scale_inv.index_select(0, input.flatten()).view(input.shape)
+        quantized = (
+            self.weight.view(torch.float8_e4m3fn)
+            .view(self.num_embeddings, self.embedding_dim)
+            .index_select(0, input.flatten())
+            .view(*input.shape, self.embedding_dim)
+            .to(torch.bfloat16)
+        )
+        scales = self.weight_scale_inv.index_select(0, input.flatten()).view(
+            input.shape
+        )
         return quantized * scales.to(quantized.dtype).unsqueeze(-1)
 
     @classmethod
@@ -458,7 +523,11 @@ class FP8CheckpointEmbedding(nn.Embedding):
             requires_grad=False,
         )
         module.weight_scale_inv = nn.Parameter(
-            torch.empty(embedding.num_embeddings, device=embedding.weight.device, dtype=torch.float32),
+            torch.empty(
+                embedding.num_embeddings,
+                device=embedding.weight.device,
+                dtype=torch.float32,
+            ),
             requires_grad=False,
         )
         return module
@@ -494,11 +563,19 @@ def _dequant_weight(weight, scale, start, end, dtype):
 
 
 def _scaled_mm(x, weight, weight_scale):
-    scale = x.float().abs().amax(1).clamp_min(1e-12).div(torch.finfo(torch.float8_e4m3fn).max)
+    scale = (
+        x.float()
+        .abs()
+        .amax(1)
+        .clamp_min(1e-12)
+        .div(torch.finfo(torch.float8_e4m3fn).max)
+    )
     quantized = (
         x.float()
         .div(scale[:, None])
-        .clamp(torch.finfo(torch.float8_e4m3fn).min, torch.finfo(torch.float8_e4m3fn).max)
+        .clamp(
+            torch.finfo(torch.float8_e4m3fn).min, torch.finfo(torch.float8_e4m3fn).max
+        )
         .to(torch.float8_e4m3fn)
     )
     matrix = weight.t()
@@ -530,7 +607,9 @@ class _FP8LogProb(torch.autograd.Function):
             hidden_chunk = hidden[start:end]
             labels_chunk = labels[start:end]
             inv_t = inv_temperature[start:end].unsqueeze(-1)
-            m = torch.full((end - start,), float("-inf"), device=hidden.device, dtype=torch.float32)
+            m = torch.full(
+                (end - start,), float("-inf"), device=hidden.device, dtype=torch.float32
+            )
             s = torch.zeros_like(m)
             t = torch.zeros_like(m)
             target = torch.zeros_like(m)
@@ -545,7 +624,11 @@ class _FP8LogProb(torch.autograd.Function):
                 m, s, t = _online_logsumexp_and_weighted_update(m, s, t, scaled)
                 mask = (labels_chunk >= vocab_start) & (labels_chunk < vocab_end)
                 row = torch.arange(end - start, device=hidden.device)
-                index = (labels_chunk - vocab_start).clamp(0, vocab_end - vocab_start - 1).long()
+                index = (
+                    (labels_chunk - vocab_start)
+                    .clamp(0, vocab_end - vocab_start - 1)
+                    .long()
+                )
                 target = torch.where(mask, scaled[row, index], target)
             logz[start:end] = m + torch.log(s)
             logprobs[start:end] = target - logz[start:end]
@@ -582,7 +665,9 @@ class _FP8LogProb(torch.autograd.Function):
                 vocab_end = min(vocab_start + 16384, weight.shape[0])
                 weight_chunk = weight[vocab_start:vocab_end]
                 scale_chunk = scale[vocab_start:vocab_end]
-                scaled = _scaled_mm(hidden_chunk, weight_chunk, scale_chunk).float() * inv_t
+                scaled = (
+                    _scaled_mm(hidden_chunk, weight_chunk, scale_chunk).float() * inv_t
+                )
                 probability = torch.exp(scaled - logz[start:end].unsqueeze(-1))
                 # d log p_y / dz = one_hot(y) - p and
                 # d H / dz = p * (E[z] - z), where z is the
@@ -594,7 +679,11 @@ class _FP8LogProb(torch.autograd.Function):
                 )
                 mask = (labels_chunk >= vocab_start) & (labels_chunk < vocab_end)
                 row = torch.arange(end - start, device=hidden.device)
-                index = (labels_chunk - vocab_start).clamp(0, vocab_end - vocab_start - 1).long()
+                index = (
+                    (labels_chunk - vocab_start)
+                    .clamp(0, vocab_end - vocab_start - 1)
+                    .long()
+                )
                 grad_logits[row, index] += grad_logprob_chunk * mask
                 grad_hidden[start:end].add_(
                     _scaled_mm(
@@ -610,7 +699,9 @@ class _AllToAllRows(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, output_splits, input_splits, group):
         out = x.new_empty((sum(output_splits),) + x.shape[1:])
-        dist.all_to_all_single(out, x.contiguous(), output_splits, input_splits, group=group)
+        dist.all_to_all_single(
+            out, x.contiguous(), output_splits, input_splits, group=group
+        )
         ctx.output_splits = output_splits
         ctx.input_splits = input_splits
         ctx.group = group
@@ -664,12 +755,18 @@ def _fp8_lm_head_forward(self, hidden_states, labels=None, temperature=None):
         count = torch.tensor([hidden.shape[0]], device=hidden.device)
         counts = [torch.empty_like(count) for _ in range(self.cp_size)]
         dist.all_gather(counts, count, group=self.cp_group)
-        sends, receives = _balanced_splits([int(x.item()) for x in counts], self.cp_rank)
+        sends, receives = _balanced_splits(
+            [int(x.item()) for x in counts], self.cp_rank
+        )
         hidden = _AllToAllRows.apply(hidden, receives, sends, self.cp_group)
         moved_target = target.new_empty(sum(receives))
         moved_temperature = inv_temperature.new_empty(sum(receives))
-        dist.all_to_all_single(moved_target, target, receives, sends, group=self.cp_group)
-        dist.all_to_all_single(moved_temperature, inv_temperature, receives, sends, group=self.cp_group)
+        dist.all_to_all_single(
+            moved_target, target, receives, sends, group=self.cp_group
+        )
+        dist.all_to_all_single(
+            moved_temperature, inv_temperature, receives, sends, group=self.cp_group
+        )
         target = moved_target
         inv_temperature = moved_temperature
     scored, scored_entropy = _FP8LogProb.apply(
@@ -683,9 +780,14 @@ def _fp8_lm_head_forward(self, hidden_states, labels=None, temperature=None):
     if sends is not None:
         scored = _AllToAllRows.apply(scored, sends, receives, self.cp_group)
         restored_entropy = scored_entropy.new_empty(sum(sends))
-        dist.all_to_all_single(restored_entropy, scored_entropy, sends, receives, group=self.cp_group)
+        dist.all_to_all_single(
+            restored_entropy, scored_entropy, sends, receives, group=self.cp_group
+        )
         scored_entropy = restored_entropy
-    logprobs = torch.zeros(b * s, device=hidden_states.device, dtype=torch.float32) + scored.sum() * 0
+    logprobs = (
+        torch.zeros(b * s, device=hidden_states.device, dtype=torch.float32)
+        + scored.sum() * 0
+    )
     entropy = torch.zeros_like(logprobs) + scored_entropy.sum() * 0
     logprobs[valid], entropy[valid] = scored, scored_entropy
     return PrimeLmOutput(logprobs=logprobs.view(b, s), entropy=entropy.view(b, s))
@@ -712,12 +814,15 @@ def replace_linear(model, embed=False, lm_head=False):
     # linear and shared expert so backward reports identify one module.
     for fqn, module in model.named_modules():
         if isinstance(module, FP8CheckpointLinear) or all(
-            hasattr(module, attr) for attr in ("w1_scale_inv", "w2_scale_inv", "w3_scale_inv")
+            hasattr(module, attr)
+            for attr in ("w1_scale_inv", "w2_scale_inv", "w3_scale_inv")
         ):
             module._fp8_fqn = fqn
 
     if embed:
-        model.model.embed_tokens = FP8CheckpointEmbedding.from_embedding(model.model.embed_tokens)
+        model.model.embed_tokens = FP8CheckpointEmbedding.from_embedding(
+            model.model.embed_tokens
+        )
     if not lm_head:
         return
     model.lm_head.weight = nn.Parameter(
@@ -730,7 +835,11 @@ def replace_linear(model, embed=False, lm_head=False):
         requires_grad=False,
     )
     model.lm_head.weight_scale_inv = nn.Parameter(
-        torch.empty(model.lm_head.out_features, device=model.lm_head.weight.device, dtype=torch.float32),
+        torch.empty(
+            model.lm_head.out_features,
+            device=model.lm_head.weight.device,
+            dtype=torch.float32,
+        ),
         requires_grad=False,
     )
     model.lm_head.forward = _fp8_lm_head_forward.__get__(model.lm_head)
@@ -742,7 +851,12 @@ def _prepare_grouped_mm(x, weight, offsets):
         x.shape[0], experts, output_size, input_size, 1, "fp8_w8a8", block_shape
     )
     rows = torch.arange(x.shape[0], device=x.device)
-    ids = torch.searchsorted(offsets, rows, right=True).clamp_max(experts - 1).int().view(-1, 1)
+    ids = (
+        torch.searchsorted(offsets, rows, right=True)
+        .clamp_max(experts - 1)
+        .int()
+        .view(-1, 1)
+    )
     sorted_ids, expert_ids, padded = _prepare_expert_assignment(
         ids,
         config,
@@ -899,8 +1013,7 @@ def _grouped_mm_chunked(x, weight, scale, offsets, chunk_rows=None):
     for start in range(0, x.shape[0], chunk_rows):
         end = min(start + chunk_rows, x.shape[0])
         counts = (
-            offsets.clamp(min=start, max=end)
-            - expert_starts.clamp(min=start, max=end)
+            offsets.clamp(min=start, max=end) - expert_starts.clamp(min=start, max=end)
         ).clamp_min_(0)
         chunk_offsets = torch.cumsum(counts, 0, dtype=torch.int32)
         out[start:end].copy_(
@@ -916,7 +1029,7 @@ def _grouped_mm_chunked(x, weight, scale, offsets, chunk_rows=None):
 
 class _Experts(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, w1, s1, w2, s2, w3, s3, offsets):
+    def forward(ctx, x, w1, s1, w2, s2, w3, s3, offsets, owner):
         z1, z3 = _grouped_mm_pair(
             x,
             w1,
@@ -929,7 +1042,16 @@ class _Experts(torch.autograd.Function):
         )
         q1, qs1 = ops.scaled_fp8_quant(z1, use_per_token_if_dynamic=True)
         q3, qs3 = ops.scaled_fp8_quant(z3, use_per_token_if_dynamic=True)
-        ctx.save_for_backward(q1, qs1, q3, qs3, w1, s1, w2, s2, w3, s3, offsets)
+        ctx.owner = owner
+        if owner is None:
+            ctx.save_for_backward(
+                q1, qs1, q3, qs3, offsets, w1, s1, w2, s2, w3, s3
+            )
+        else:
+            # Reacquire current unsharded owner parameters in backward. Saved
+            # forward views still point at the released FSDP all-gather
+            # allocation after resharding.
+            ctx.save_for_backward(q1, qs1, q3, qs3, offsets)
         F.silu(z1, inplace=True)
         z1.mul_(z3)
         del z3
@@ -941,7 +1063,28 @@ class _Experts(torch.autograd.Function):
             profile_start = torch.cuda.Event(enable_timing=True)
             profile_end = torch.cuda.Event(enable_timing=True)
             profile_start.record()
-        q1, qs1, q3, qs3, w1, s1, w2, s2, w3, s3, offsets = ctx.saved_tensors
+        if ctx.owner is None:
+            q1, qs1, q3, qs3, offsets, w1, s1, w2, s2, w3, s3 = (
+                ctx.saved_tensors
+            )
+        else:
+            q1, qs1, q3, qs3, offsets = ctx.saved_tensors
+            owner = ctx.owner
+            w1, s1, w2, s2, w3, s3 = (
+                getattr(owner, name)
+                for name in (
+                    "w1",
+                    "w1_scale_inv",
+                    "w2",
+                    "w2_scale_inv",
+                    "w3",
+                    "w3_scale_inv",
+                )
+            )
+            w1, s1, w2, s2, w3, s3 = (
+                value.to_local() if isinstance(value, DTensor) else value
+                for value in (w1, s1, w2, s2, w3, s3)
+            )
         z1 = q1.to(grad.dtype).mul_(qs1.to(grad.dtype))
         z3 = q3.to(grad.dtype).mul_(qs3.to(grad.dtype))
         hidden_grad = _grouped_mm_chunked(
@@ -964,10 +1107,22 @@ class _Experts(torch.autograd.Function):
         if _EXPERT_PROFILE:
             profile_end.record()
             _profile_expert_backward(profile_start, profile_end)
-        return x_grad, None, None, None, None, None, None, None
+        del ctx.owner
+        return x_grad, None, None, None, None, None, None, None, None
 
 
-def fp8_experts(w1, w2, w3, s1, s2, s3, x, num_tokens_per_expert):
+def fp8_experts(
+    w1,
+    w2,
+    w3,
+    s1,
+    s2,
+    s3,
+    x,
+    num_tokens_per_expert,
+    *,
+    owner=None,
+):
     """Run checkpoint-FP8 experts with TorchTitan's EP row permutation.
 
     After the EP all-to-all, rows are grouped first by sending rank and then
@@ -996,6 +1151,7 @@ def fp8_experts(w1, w2, w3, s1, s2, s3, x, num_tokens_per_expert):
             w3,
             s3,
             torch.cumsum(num_tokens_per_expert, 0, dtype=torch.int32),
+            owner,
         )
 
     if num_tokens_per_expert.shape[0] % local_experts:
@@ -1029,6 +1185,7 @@ def fp8_experts(w1, w2, w3, s1, s2, s3, x, num_tokens_per_expert):
         w3,
         s3,
         torch.cumsum(local_counts, 0, dtype=torch.int32),
+        owner,
     )
     out_unpermuted = out.new_empty(padded_x.shape)
     out_unpermuted[permuted_indices, :] = out
