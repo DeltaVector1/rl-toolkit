@@ -1,6 +1,7 @@
 """Selective activation checkpointing hooks for custom decoder layers."""
 
 from collections.abc import Iterable
+from contextvars import ContextVar
 from functools import wraps
 
 import torch
@@ -21,6 +22,22 @@ SELECTIVE_AC_TARGETS = frozenset(
     }
 )
 _PATCHED_METHODS_ATTR = "_prime_rl_selective_ac_patched_methods"
+_REENTRANT_BLOCK_PHASE: ContextVar[str | None] = ContextVar(
+    "prime_rl_reentrant_block_phase", default=None
+)
+
+
+def in_reentrant_block_checkpoint() -> bool:
+    """Return true while a whole FSDP block runs under reentrant AC.
+
+    During the first call, PyTorch runs the block with gradients disabled. It
+    discards the inner autograd contexts. During recompute, the outer FSDP
+    pre-backward hook has already restored the block parameters and keeps them
+    valid until the block backward completes. Native-FP8 linears can therefore
+    borrow those parameters instead of making large owned copies.
+    """
+
+    return _REENTRANT_BLOCK_PHASE.get() is not None
 
 
 def _is_norm_module(module: nn.Module) -> bool:
@@ -56,15 +73,43 @@ def checkpoint_method(
         # their lifetime visible to autograd.
         flat_args, call_spec = tree_flatten((args, kwargs))
 
-        def fn(*checkpoint_args):
-            restored_args, restored_kwargs = tree_unflatten(
-                list(checkpoint_args), call_spec
+        original_input_count = len(flat_args)
+        checkpoint_args = list(flat_args)
+        if use_reentrant and not any(
+            isinstance(value, torch.Tensor) and value.requires_grad
+            for value in checkpoint_args
+        ):
+            # Reentrant checkpointing does not record parameter gradients when
+            # no input requires gradients. The first pipeline block receives a
+            # frozen embedding output, but it still contains trainable LoRA
+            # parameters. A scalar anchor makes PyTorch recompute that block;
+            # the wrapped method does not consume the anchor.
+            first_tensor = next(
+                value
+                for value in checkpoint_args
+                if isinstance(value, torch.Tensor)
             )
-            return original(*restored_args, **restored_kwargs)
+            checkpoint_args.append(
+                torch.empty((), device=first_tensor.device, requires_grad=True)
+            )
+
+        def fn(*received_args):
+            restored_args, restored_kwargs = tree_unflatten(
+                list(received_args[:original_input_count]), call_spec
+            )
+            token = None
+            if use_reentrant:
+                phase = "recompute" if torch.is_grad_enabled() else "forward"
+                token = _REENTRANT_BLOCK_PHASE.set(phase)
+            try:
+                return original(*restored_args, **restored_kwargs)
+            finally:
+                if token is not None:
+                    _REENTRANT_BLOCK_PHASE.reset(token)
 
         return checkpoint(
             fn,
-            *flat_args,
+            *checkpoint_args,
             use_reentrant=use_reentrant,
             preserve_rng_state=preserve_rng_state,
         )

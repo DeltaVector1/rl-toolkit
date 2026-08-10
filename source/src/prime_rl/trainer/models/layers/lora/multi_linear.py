@@ -1,9 +1,121 @@
 import math
 
 import torch
+import triton
+import triton.language as tl
 from torch import nn
 
 from prime_rl.trainer.models.layers.lora.base import MultiLoRAModule, get_lora_num_tokens, get_multilora_scaling
+
+
+if hasattr(triton, "jit"):
+
+    @triton.jit
+    def _lora_mm_kernel(
+        left,
+        right,
+        out,
+        rows,
+        columns,
+        reduction,
+        stride_lm,
+        stride_lk,
+        stride_rk,
+        stride_rn,
+        stride_om,
+        stride_on,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        for k_start in range(0, reduction, BLOCK_K):
+            offs_k = k_start + tl.arange(0, BLOCK_K)
+            left_fragment = tl.load(
+                left + offs_m[:, None] * stride_lm + offs_k[None, :] * stride_lk,
+                mask=(offs_m[:, None] < rows) & (offs_k[None, :] < reduction),
+                other=0.0,
+            )
+            right_fragment = tl.load(
+                right + offs_k[:, None] * stride_rk + offs_n[None, :] * stride_rn,
+                mask=(offs_k[:, None] < reduction) & (offs_n[None, :] < columns),
+                other=0.0,
+            )
+            accumulator += tl.dot(left_fragment, right_fragment)
+
+        tl.store(
+            out + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on,
+            accumulator,
+            mask=(offs_m[:, None] < rows) & (offs_n[None, :] < columns),
+        )
+
+else:
+    _lora_mm_kernel = None
+
+
+def _lora_mm(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+    """BF16/FP16 GEMM with FP32 tensor-core accumulation and no cuBLAS handle.
+
+    Reentrant backward runs on an autograd worker thread. Creating a new cuBLAS
+    handle there can fail when the 32K working set is near the device limit.
+    The direct Triton path has bounded launch state and does not materialize
+    full FP32 copies of the activation or output gradient.
+    """
+
+    if left.ndim != 2 or right.ndim != 2 or left.shape[1] != right.shape[0]:
+        raise ValueError(
+            f"LoRA matrix mismatch: {tuple(left.shape)} @ {tuple(right.shape)}"
+        )
+    eligible = (
+        _lora_mm_kernel is not None
+        and left.is_cuda
+        and right.is_cuda
+        and left.device == right.device
+        and left.dtype in (torch.bfloat16, torch.float16)
+        and right.dtype == left.dtype
+        and torch.cuda.get_device_capability(left.device) == (8, 9)
+    )
+    if not eligible:
+        return left @ right
+
+    rows, reduction = left.shape
+    columns = right.shape[1]
+    if columns <= 32:
+        block_m, block_n, block_k, num_warps = 32, 32, 32, 4
+    elif rows <= 32:
+        block_m, block_n, block_k, num_warps = 32, 128, 32, 4
+    else:
+        block_m, block_n, block_k, num_warps = 64, 128, 32, 8
+    out = torch.empty(rows, columns, device=left.device, dtype=left.dtype)
+    grid = (
+        triton.cdiv(rows, block_m),
+        triton.cdiv(columns, block_n),
+    )
+    _lora_mm_kernel[grid](
+        left,
+        right,
+        out,
+        rows,
+        columns,
+        reduction,
+        left.stride(0),
+        left.stride(1),
+        right.stride(0),
+        right.stride(1),
+        out.stride(0),
+        out.stride(1),
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        num_warps=num_warps,
+        num_stages=2,
+    )
+    return out
 
 
 def _run_lora_grouped_mm(
@@ -36,31 +148,30 @@ def _run_lora_for_loop(
 class _SingleLoRA(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, lora_A, lora_B):
-        a_out = x @ lora_A.T
+        a_out = _lora_mm(x, lora_A.T)
         ctx.save_for_backward(x, lora_A, lora_B, a_out)
-        return a_out @ lora_B.T
+        return _lora_mm(a_out, lora_B.T)
 
     @staticmethod
     def backward(ctx, grad):
         x, lora_A, lora_B, a_out = ctx.saved_tensors
-        # Accumulate low-precision LoRA gradients in FP32. Preserve FP32/FP64
-        # inputs so the custom backward has the same derivative as the two
-        # matmuls and remains gradcheckable outside the production BF16 path.
-        compute_dtype = (
-            torch.float32
-            if grad.dtype in (torch.float16, torch.bfloat16)
-            else grad.dtype
-        )
-        grad_compute = grad.to(compute_dtype)
-        x_compute = x.to(compute_dtype)
-        lora_A_compute = lora_A.to(compute_dtype)
-        lora_B_compute = lora_B.to(compute_dtype)
-        a_out_compute = a_out.to(compute_dtype)
-        grad_a = grad_compute @ lora_B_compute
+        if grad.dtype in (torch.float16, torch.bfloat16):
+            # The Triton dot operations accumulate each product in FP32, then
+            # write the BF16/FP16 gradients expected by the parameters. Avoid
+            # explicit full-size FP32 activation and output-gradient copies.
+            grad_a = _lora_mm(grad, lora_B)
+            return (
+                _lora_mm(grad_a, lora_A).to(x.dtype),
+                _lora_mm(grad_a.T, x).to(lora_A.dtype),
+                _lora_mm(grad.T, a_out).to(lora_B.dtype),
+            )
+
+        # Preserve exact FP32/FP64 behavior for CPU use and gradcheck.
+        grad_a = grad @ lora_B
         return (
-            (grad_a @ lora_A_compute).to(x.dtype),
-            (grad_a.T @ x_compute).to(lora_A.dtype),
-            (grad_compute.T @ a_out_compute).to(lora_B.dtype),
+            (grad_a @ lora_A).to(x.dtype),
+            (grad_a.T @ x).to(lora_A.dtype),
+            (grad.T @ a_out).to(lora_B.dtype),
         )
 
 

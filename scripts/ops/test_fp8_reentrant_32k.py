@@ -89,9 +89,10 @@ def estimate_working_set_bytes(shape: ProbeShape, fsdp_world_size: int) -> dict[
     categories = {
         "resident_fsdp_shards": math.ceil(parameter_payload / fsdp_world_size),
         "unsharded_parameters": parameter_payload,
-        # Native _Linear owns snapshots during grad-enabled recompute so FSDP
-        # cannot invalidate its weight and scale storage before inner backward.
-        "owned_backward_snapshots": parameter_payload,
+        # Whole-block recompute begins after the FSDP pre-backward hook and
+        # finishes before the block is resharded. Native linears borrow that
+        # restored storage, so they need no duplicate backward snapshot.
+        "owned_backward_snapshots": 0,
         "checkpoint_input_and_gradient": 2 * input_bytes,
         "recompute_forward_and_backward": 2 * forward_intermediates,
         "position_ids_and_offsets": tokens * 16,

@@ -64,6 +64,7 @@ def _install_fp8_import_stubs() -> None:
         return new_m, new_s, new_t
 
     lm_head.PrimeLmOutput = PrimeLmOutput
+    lm_head.cast_float_and_contiguous = lambda function: function
     lm_head._online_logsumexp_and_weighted_update = online_update
     sys.modules.setdefault("prime_rl.trainer.models.layers.lm_head", lm_head)
 
@@ -568,6 +569,10 @@ class FP8AdaAutogradTest(unittest.TestCase):
 
 
 class MultiLinearAutogradTest(unittest.TestCase):
+    def test_lora_mm_rejects_mismatched_shapes(self):
+        with self.assertRaisesRegex(ValueError, "LoRA matrix mismatch"):
+            multi_linear._lora_mm(torch.randn(2, 3), torch.randn(4, 5))
+
     def test_single_lora_passes_double_gradcheck(self):
         torch.manual_seed(4)
         inputs = (

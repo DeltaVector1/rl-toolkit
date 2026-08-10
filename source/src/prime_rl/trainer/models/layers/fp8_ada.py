@@ -7,6 +7,9 @@ import triton
 import triton.language as tl
 from torch import nn
 from torch.distributed.tensor import DTensor
+from prime_rl.trainer.models.layers.checkpointing import (
+    in_reentrant_block_checkpoint,
+)
 from prime_rl.trainer.models.layers.lm_head import PrimeLmOutput, _online_logsumexp_and_weighted_update
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.fused_moe.fused_moe import (
@@ -313,8 +316,19 @@ class _Linear(torch.autograd.Function):
         # checkpoint saved-tensor hooks otherwise replace save_for_backward()
         # tensors with recomputed aliases, which reintroduces the released
         # FSDP allocation before this inner backward runs.
-        ctx.weight_snapshot = weight.detach().clone()
-        ctx.scale_snapshot = scale.detach().clone()
+        if in_reentrant_block_checkpoint():
+            # A whole-block reentrant checkpoint starts recompute only after
+            # the matching FSDP pre-backward hook unshards this block. FSDP
+            # keeps the parameters valid until the block backward completes,
+            # so these inner linear contexts can borrow the restored storage.
+            # The first no-grad checkpoint call also discards its contexts.
+            ctx.weight_snapshot = weight
+            ctx.scale_snapshot = scale
+            ctx.owns_snapshot = False
+        else:
+            ctx.weight_snapshot = weight.detach().clone()
+            ctx.scale_snapshot = scale.detach().clone()
+            ctx.owns_snapshot = True
         ctx.fqn = fqn
         return _linear(x, weight, scale)
 

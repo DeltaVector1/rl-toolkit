@@ -119,6 +119,45 @@ class ReentrantBlockCheckpointTest(unittest.TestCase):
         self.assertTrue(block.parameters_restored)
         self.assertEqual(block.forward_calls, 2)
 
+    def test_frozen_input_still_recomputes_trainable_parameters(self):
+        torch.manual_seed(31)
+        eager = _KeywordBlock()
+        recomputed = _KeywordBlock()
+        recomputed.load_state_dict(eager.state_dict())
+        eager.dropout.p = 0.0
+        recomputed.dropout.p = 0.0
+        checkpointing.set_reentrant_block_checkpointing(recomputed)
+
+        hidden = torch.randn(4, 8)
+        residual = torch.randn(4, 8)
+        eager(hidden_states=hidden, metadata={"residual": residual}).sum().backward()
+        recomputed(
+            hidden_states=hidden,
+            metadata={"residual": residual},
+        ).sum().backward()
+
+        torch.testing.assert_close(
+            recomputed.projection.weight.grad,
+            eager.projection.weight.grad,
+        )
+        self.assertEqual(recomputed.forward_calls, 2)
+
+    def test_reentrant_context_covers_forward_and_recompute_only(self):
+        phases = []
+
+        class ContextBlock(nn.Module):
+            def forward(self, hidden_states):
+                phases.append(checkpointing.in_reentrant_block_checkpoint())
+                return hidden_states.square()
+
+        block = ContextBlock()
+        checkpointing.set_reentrant_block_checkpointing(block)
+        value = torch.randn(3, requires_grad=True)
+        block(value).sum().backward()
+
+        self.assertEqual(phases, [True, True])
+        self.assertFalse(checkpointing.in_reentrant_block_checkpoint())
+
     def test_eval_mode_does_not_checkpoint(self):
         block = _KeywordBlock().eval()
         checkpointing.set_reentrant_block_checkpointing(block)

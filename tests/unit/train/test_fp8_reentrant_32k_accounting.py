@@ -22,18 +22,14 @@ gate = _load_gate_module()
 
 
 class FP8Reentrant32KAccountingTest(unittest.TestCase):
-    def test_default_is_32k_cp8_and_accounts_owned_snapshots(self):
+    def test_default_is_32k_cp8_and_elides_owned_snapshots(self):
         shape = gate.ProbeShape()
         estimate = gate.estimate_working_set_bytes(shape, fsdp_world_size=2)
 
         self.assertEqual(shape.seq_len, 32768)
         self.assertEqual(shape.cp, 8)
         self.assertEqual(shape.local_tokens, 4096)
-        self.assertGreater(estimate["owned_backward_snapshots"], 0)
-        self.assertEqual(
-            estimate["owned_backward_snapshots"],
-            estimate["unsharded_parameters"],
-        )
+        self.assertEqual(estimate["owned_backward_snapshots"], 0)
         self.assertEqual(
             estimate["estimated_total"],
             sum(value for key, value in estimate.items() if key != "estimated_total"),
