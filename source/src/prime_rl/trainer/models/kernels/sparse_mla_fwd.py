@@ -13,6 +13,8 @@ except Exception:
     # This is expected on CPU-only machines
     pass
 
+import os
+
 import tilelang
 import torch
 from tilelang import language as T
@@ -208,9 +210,11 @@ def sparse_mla_fwd_interface(q, kv, indices, sm_scale=None, d_v=512, block_I=64,
 
     block_H = 64
     if torch.cuda.get_device_capability(q.device)[0] < 9:
-        block_I = min(block_I, 32)
-        block_H = 16
-        threads = min(threads, 128)
+        block_I = int(os.environ.get("PRIME_SPARSE_FWD_BLOCK_SIZE", "32"))
+        # Two head tiles per block are 1.80x faster than one at the exact
+        # CP8 production shape on RTX 4090 (44.0 ms against 79.1 ms).
+        block_H = int(os.environ.get("PRIME_SPARSE_FWD_BLOCK_HEADS", "32"))
+        threads = int(os.environ.get("PRIME_SPARSE_FWD_THREADS", "128"))
         # The two-stage TileLang pipeline is not repeatable on SM89 when other
         # kernels run between identical sparse-MLA calls: production-shaped
         # q, kv, and indices remained bit-identical while 37.5% of the raw

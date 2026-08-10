@@ -304,12 +304,15 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         routed_experts: Optional[torch.LongTensor] = None,
+        sparse_indices_cache: Optional[torch.LongTensor] = None,
         seq_lens: Optional[torch.LongTensor] = None,
         seq_lens_are_pre_shard: bool = False,
     ) -> BaseModelOutputWithPast:
         """
         routed_experts (`torch.LongTensor` of shape `(batch_size, sequence_length, num_hidden_layers, num_experts_per_tok)`, *optional*):
             Routed experts for each token in the sequence. Only used for router replay.
+        sparse_indices_cache (`torch.LongTensor` of shape `(batch_size, sequence_length, index_n_heads, index_topk)`, *optional*):
+            Sparse attention indices computed by an earlier pipeline stage.
         seq_lens (`torch.LongTensor`, *optional*):
             Packed sequence lengths supplied by the trainer.
         seq_lens_are_pre_shard (`bool`, *optional*):
@@ -348,7 +351,7 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
         else:
             ks, ke = ks_full, ke_full
 
-        cached_indices = None
+        cached_indices = sparse_indices_cache
         use_index_cache = getattr(self.config, "use_index_cache", False)
         # Under pipeline parallelism self.layers is an nn.ModuleDict keyed by
         # GLOBAL layer index as a string (pipeline_parallel.py:139). It cannot be
@@ -378,7 +381,10 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
         # others hand their hidden states straight to the next stage.
         if self.norm is not None:
             hidden_states = self.norm(hidden_states)
-        return BaseModelOutputWithPast(last_hidden_state=hidden_states)
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=cached_indices,
+        )
 
 
 @auto_docstring
@@ -411,6 +417,7 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
         logits_to_keep: Union[int, torch.Tensor] = 0,
         temperature: Optional[torch.Tensor] = None,
         routed_experts: Optional[torch.LongTensor] = None,
+        sparse_indices_cache: Optional[torch.LongTensor] = None,
         # Document boundaries derive from position_ids; seq_lens is accepted
         # to satisfy the trainer's universal contract.
         *,
@@ -433,6 +440,8 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
             Per-token temperatures for logprobs/entropy computation when `labels` are provided.
         routed_experts (`torch.LongTensor` of shape `(batch_size, sequence_length, num_hidden_layers, num_experts_per_tok)`, *optional*):
             Routed experts for each token in the sequence. Only used for router replay.
+        sparse_indices_cache (`torch.LongTensor` of shape `(batch_size, sequence_length, index_n_heads, index_topk)`, *optional*):
+            Sparse attention indices computed by an earlier pipeline stage.
         """
         assert use_cache is None, "use_cache is not supported for custom glm_moe_dsa for now"
         assert past_key_values is None, "past_key_values is not supported for custom glm_moe_dsa for now"
@@ -452,6 +461,7 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             routed_experts=routed_experts,
+            sparse_indices_cache=sparse_indices_cache,
         )
         if profile:
             torch.cuda.synchronize()

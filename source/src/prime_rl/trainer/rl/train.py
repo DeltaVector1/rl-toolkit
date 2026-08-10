@@ -377,6 +377,7 @@ def train(config: TrainerConfig):
             is_first=pp_rank == 0,
             is_last=pp_rank == parallel_dims.pp - 1,
             offload_cfg=config.model.ac_offloading,
+            transfer_sparse_indices=config.model.pp_transfer_sparse_indices,
         )
 
     # Optionally, resume training from a checkpoint
@@ -873,7 +874,29 @@ def train(config: TrainerConfig):
             # buffers fp32. Read the configured value instead.
             _stage_dtype = DTYPE_MAP[config.model.optimization_dtype]
             _hidden_ex = torch.empty(1, _L, _hs, dtype=_stage_dtype, device="cuda")
+            _cache_ex = None
+            if config.model.pp_transfer_sparse_indices:
+                _cache_ex = torch.empty(
+                    1,
+                    _L,
+                    getattr(model.config, "index_n_heads", 1),
+                    model.config.index_topk,
+                    # PipelineStage requires floating-point receive buffers.
+                    # FP16 carries the lossless unsigned 16-bit index bits.
+                    dtype=torch.float16,
+                    device="cuda",
+                )
             _is_last = pp_rank == parallel_dims.pp - 1
+            _example_input = (
+                torch.empty(1, _L, dtype=torch.int64, device="cuda")
+                if pp_rank == 0
+                else ((_hidden_ex, _cache_ex) if _cache_ex is not None else _hidden_ex)
+            )
+            _example_output = (
+                torch.empty((), dtype=torch.float32, device="cuda")
+                if _is_last
+                else ((_hidden_ex, _cache_ex) if _cache_ex is not None else _hidden_ex)
+            )
             pp_schedule = build_pp_schedule(
                 pp_stage_module,
                 pp_rank=pp_rank,
@@ -881,8 +904,8 @@ def train(config: TrainerConfig):
                 n_microbatches=len(pp_side_inputs),
                 pp_group=parallel_dims.get_mesh("pp").get_group(),
                 schedule_name=config.model.pp_schedule,
-                example_input=torch.empty(1, _L, dtype=torch.int64, device="cuda") if pp_rank == 0 else _hidden_ex,
-                example_output=torch.empty((), dtype=torch.float32, device="cuda") if _is_last else _hidden_ex,
+                example_input=_example_input,
+                example_output=_example_output,
             )
             # FSDP must be initialised before the schedule issues its first
             # prefetch, which happens before any forward on some stages.
@@ -917,7 +940,7 @@ def train(config: TrainerConfig):
             # a multi-GB transient that ran the 47.4 GiB cards to the edge.
             pp_stage_module.set_side_inputs([])
             pp_stage_module.loss_closure = None
-            del pp_schedule, pp_inputs, _hidden_ex, pp_side_inputs
+            del pp_schedule, pp_inputs, _hidden_ex, _cache_ex, pp_side_inputs
             pp_side_inputs = []
 
             # F6: MoE router stat buffers accumulate via add_ every forward and

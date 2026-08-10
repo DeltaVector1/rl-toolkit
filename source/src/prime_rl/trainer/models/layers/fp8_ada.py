@@ -736,8 +736,7 @@ def replace_linear(model, embed=False, lm_head=False):
     model.lm_head.forward = _fp8_lm_head_forward.__get__(model.lm_head)
 
 
-@torch.compiler.disable
-def _grouped_mm(x, weight, scale, offsets):
+def _prepare_grouped_mm(x, weight, offsets):
     experts, output_size, input_size = weight.shape
     config = get_default_config(
         x.shape[0], experts, output_size, input_size, 1, "fp8_w8a8", block_shape
@@ -754,13 +753,33 @@ def _grouped_mm(x, weight, scale, offsets):
         block_shape=block_shape,
         ignore_invalid_experts=True,
     )
-    quantized, activation_scale = moe_kernel_quantize_input(
+    return config, rows, sorted_ids, expert_ids, padded
+
+
+def _quantize_grouped_mm_input(x):
+    return moe_kernel_quantize_input(
         x,
         None,
         torch.float8_e4m3fn,
         False,
         block_shape,
     )
+
+
+def _dispatch_grouped_mm(
+    x,
+    weight,
+    scale,
+    config,
+    rows,
+    sorted_ids,
+    expert_ids,
+    padded,
+    quantized,
+    activation_scale,
+    offsets,
+):
+    output_size = weight.shape[1]
     out = torch.empty(x.shape[0], 1, output_size, device=x.device, dtype=x.dtype)
     dispatch_fused_moe_kernel(
         quantized,
@@ -790,6 +809,76 @@ def _grouped_mm(x, weight, scale, offsets):
     # backward.  The dense expert implementation has the same zero-padding
     # contract.
     return out[:, 0].masked_fill((rows >= offsets[-1]).unsqueeze(-1), 0)
+
+
+@torch.compiler.disable
+def _grouped_mm(x, weight, scale, offsets):
+    prepared = _prepare_grouped_mm(x, weight, offsets)
+    quantized, activation_scale = _quantize_grouped_mm_input(x)
+    return _dispatch_grouped_mm(
+        x,
+        weight,
+        scale,
+        *prepared,
+        quantized,
+        activation_scale,
+        offsets,
+    )
+
+
+@torch.compiler.disable
+def _grouped_mm_pair(
+    x1,
+    w1,
+    s1,
+    x2,
+    w2,
+    s2,
+    offsets,
+    *,
+    shared_input=False,
+):
+    """Run two equal-shape expert GEMMs with one assignment preparation.
+
+    W1 and W3 use the same input in forward, so they also reuse one dynamic
+    FP8 quantization. Their input-gradient GEMMs use different activations but
+    still have identical expert assignments and kernel configurations.
+    """
+    if not x1.is_cuda:
+        return (
+            _grouped_mm(x1, w1, s1, offsets),
+            _grouped_mm(x2, w2, s2, offsets),
+        )
+    if w1.shape != w2.shape or x1.shape != x2.shape:
+        raise ValueError(
+            "paired FP8 expert GEMMs require equal input and weight shapes"
+        )
+    prepared = _prepare_grouped_mm(x1, w1, offsets)
+    quantized1, activation_scale1 = _quantize_grouped_mm_input(x1)
+    if shared_input:
+        quantized2, activation_scale2 = quantized1, activation_scale1
+    else:
+        quantized2, activation_scale2 = _quantize_grouped_mm_input(x2)
+    return (
+        _dispatch_grouped_mm(
+            x1,
+            w1,
+            s1,
+            *prepared,
+            quantized1,
+            activation_scale1,
+            offsets,
+        ),
+        _dispatch_grouped_mm(
+            x2,
+            w2,
+            s2,
+            *prepared,
+            quantized2,
+            activation_scale2,
+            offsets,
+        ),
+    )
 
 
 def _grouped_mm_chunked(x, weight, scale, offsets, chunk_rows=None):
@@ -828,8 +917,16 @@ def _grouped_mm_chunked(x, weight, scale, offsets, chunk_rows=None):
 class _Experts(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, w1, s1, w2, s2, w3, s3, offsets):
-        z1 = _grouped_mm(x, w1, s1, offsets)
-        z3 = _grouped_mm(x, w3, s3, offsets)
+        z1, z3 = _grouped_mm_pair(
+            x,
+            w1,
+            s1,
+            x,
+            w3,
+            s3,
+            offsets,
+            shared_input=True,
+        )
         q1, qs1 = ops.scaled_fp8_quant(z1, use_per_token_if_dynamic=True)
         q3, qs3 = ops.scaled_fp8_quant(z3, use_per_token_if_dynamic=True)
         ctx.save_for_backward(q1, qs1, q3, qs3, w1, s1, w2, s2, w3, s3, offsets)
@@ -853,15 +950,17 @@ class _Experts(torch.autograd.Function):
         sigmoid = torch.sigmoid(z1)
         z1_grad = hidden_grad * z3 * sigmoid * (1 + z1 * (1 - sigmoid))
         z3_grad = hidden_grad * F.silu(z1)
-        x_grad = _grouped_mm(
-            z1_grad, w1.transpose(-2, -1), s1.transpose(-2, -1), offsets
+        x_grad, x_grad_w3 = _grouped_mm_pair(
+            z1_grad,
+            w1.transpose(-2, -1),
+            s1.transpose(-2, -1),
+            z3_grad,
+            w3.transpose(-2, -1),
+            s3.transpose(-2, -1),
+            offsets,
         )
         del hidden_grad, sigmoid, z1, z3, z1_grad
-        x_grad.add_(
-            _grouped_mm(
-                z3_grad, w3.transpose(-2, -1), s3.transpose(-2, -1), offsets
-            )
-        )
+        x_grad.add_(x_grad_w3)
         if _EXPERT_PROFILE:
             profile_end.record()
             _profile_expert_backward(profile_start, profile_end)

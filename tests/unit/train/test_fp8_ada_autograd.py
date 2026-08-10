@@ -346,6 +346,56 @@ class FP8AdaAutogradTest(unittest.TestCase):
         torch.cat(pieces).backward(upstream)
         torch.testing.assert_close(got_grad, ref_x.grad, rtol=1e-12, atol=1e-12)
 
+    def test_grouped_mm_pair_reuses_assignment_and_shared_input_quantization(self):
+        calls = {"prepare": 0, "quantize": 0, "dispatch": 0}
+        value = types.SimpleNamespace(is_cuda=True, shape=(7, 8))
+        weight1 = types.SimpleNamespace(shape=(2, 16, 8))
+        weight2 = types.SimpleNamespace(shape=(2, 16, 8))
+        scale1, scale2, offsets = object(), object(), object()
+        originals = (
+            fp8_ada._prepare_grouped_mm,
+            fp8_ada._quantize_grouped_mm_input,
+            fp8_ada._dispatch_grouped_mm,
+        )
+
+        def fake_prepare(*args):
+            calls["prepare"] += 1
+            return ("config", "rows", "sorted", "experts", "padded")
+
+        def fake_quantize(*args):
+            calls["quantize"] += 1
+            return "quantized", "activation-scale"
+
+        def fake_dispatch(*args):
+            calls["dispatch"] += 1
+            return args[1]
+
+        (
+            fp8_ada._prepare_grouped_mm,
+            fp8_ada._quantize_grouped_mm_input,
+            fp8_ada._dispatch_grouped_mm,
+        ) = (fake_prepare, fake_quantize, fake_dispatch)
+        try:
+            got = fp8_ada._grouped_mm_pair(
+                value,
+                weight1,
+                scale1,
+                value,
+                weight2,
+                scale2,
+                offsets,
+                shared_input=True,
+            )
+        finally:
+            (
+                fp8_ada._prepare_grouped_mm,
+                fp8_ada._quantize_grouped_mm_input,
+                fp8_ada._dispatch_grouped_mm,
+            ) = originals
+
+        self.assertEqual(got, (weight1, weight2))
+        self.assertEqual(calls, {"prepare": 1, "quantize": 1, "dispatch": 2})
+
     def test_grouped_w2_chunking_preserves_expert_rows_and_padding(self):
         torch.manual_seed(23)
         x = torch.randn(13, 4)

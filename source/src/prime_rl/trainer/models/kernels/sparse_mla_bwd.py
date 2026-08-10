@@ -6,6 +6,7 @@
 # and the stub calls abort().  Pre-loading the real library with RTLD_GLOBAL
 # ensures dlsym finds it before the stub's own exports.
 import ctypes as _ctypes
+import os
 
 try:
     _ctypes.CDLL("libcudart.so", mode=_ctypes.RTLD_GLOBAL)
@@ -324,6 +325,9 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None):
 
     preprocess_kernel = preprocess(H, D)
     if torch.cuda.get_device_capability(q.device)[0] < 9:
+        block_size = int(os.environ.get("PRIME_SPARSE_BWD_BLOCK_SIZE", "16"))
+        block_heads = int(os.environ.get("PRIME_SPARSE_BWD_BLOCK_HEADS", "16"))
+        threads = int(os.environ.get("PRIME_SPARSE_BWD_THREADS", "64"))
         bwd_kernel = bwd(
             H,
             D,
@@ -332,9 +336,9 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None):
             kv_group,
             sm_scale,
             True,
-            block_size=16,
-            block_H=16,
-            threads=64,
+            block_size=block_size,
+            block_H=block_heads,
+            threads=threads,
             vectorized_atomic=False,
         )
     else:

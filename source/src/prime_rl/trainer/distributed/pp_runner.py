@@ -37,6 +37,7 @@ class PipelineStageModule(nn.Module):
         is_last: bool,
         loss_closure: Callable[[Any, dict], torch.Tensor] | None = None,
         offload_cfg=None,
+        transfer_sparse_indices: bool = False,
     ):
         super().__init__()
         self.model = model
@@ -49,6 +50,7 @@ class PipelineStageModule(nn.Module):
         # second forward before the first backward; per-micro-batch instances
         # each get drained by their own backward, so interleaving is irrelevant.
         self.offload_cfg = offload_cfg
+        self.transfer_sparse_indices = transfer_sparse_indices
         self._side: list[dict] = []
         self._idx = 0
 
@@ -77,13 +79,34 @@ class PipelineStageModule(nn.Module):
             out[k] = v
         return out
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        sparse_indices_cache: torch.Tensor | None = None,
+    ):
         from prime_rl.utils.act_offloading import maybe_activation_offloading
 
         with maybe_activation_offloading(self.offload_cfg):
-            return self._forward_inner(x)
+            return self._forward_inner(x, sparse_indices_cache)
 
-    def _forward_inner(self, x: torch.Tensor) -> torch.Tensor:
+    def _forward_inner(
+        self,
+        x: torch.Tensor,
+        sparse_indices_cache: torch.Tensor | None = None,
+    ):
+        if sparse_indices_cache is not None:
+            # PipelineStage forces received tensors to require gradients.
+            # Send the unsigned 16-bit index bits through an FP16 tensor. NCCL
+            # preserves these bits, including patterns which encode FP16 NaN.
+            # Add a sanitized zero-valued dependency for pipeline backward,
+            # then recover the discrete INT32 cache used by sparse MLA.
+            anchor = torch.nan_to_num(sparse_indices_cache.reshape(-1)[0].float()) * 0
+            x = x + anchor.to(x.dtype)
+            sparse_indices_cache = (
+                sparse_indices_cache.view(torch.int16)
+                .to(torch.int32)
+                .bitwise_and_(0xFFFF)
+            )
         side = self._next_side()
         kwargs = dict(
             position_ids=side["position_ids"],
@@ -108,6 +131,7 @@ class PipelineStageModule(nn.Module):
                 routed_experts=side.get("routed_experts"),
                 seq_lens_are_pre_shard=side.get("seq_lens_are_pre_shard", False),
                 inputs_embeds=None if self.is_first else x,
+                sparse_indices_cache=sparse_indices_cache,
             )
             assert self.loss_closure is not None, "last stage needs a loss closure"
             return self.loss_closure(out, side)
@@ -118,8 +142,20 @@ class PipelineStageModule(nn.Module):
             input_ids=x if self.is_first else None,
             inputs_embeds=None if self.is_first else x,
             **kwargs,
+            sparse_indices_cache=sparse_indices_cache,
         )
-        return out.last_hidden_state
+        if not self.transfer_sparse_indices:
+            return out.last_hidden_state
+        if out.past_key_values is None:
+            raise RuntimeError(
+                "pipeline sparse-index transfer was enabled, but the stage did not produce a cache"
+            )
+        cache_transport = (
+            out.past_key_values.to(torch.int16)
+            .view(torch.float16)
+            .requires_grad_()
+        )
+        return out.last_hidden_state, cache_transport
 
 
 def force_fsdp_lazy_init(model: nn.Module) -> int:

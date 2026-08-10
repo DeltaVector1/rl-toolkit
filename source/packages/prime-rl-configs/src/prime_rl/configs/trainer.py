@@ -149,6 +149,10 @@ class FP8Config(BaseConfig):
     """Diagnostic: dequantize shared-expert matrices only."""
     diagnose_linear_backward: bool = False
     """Report the first nonfinite native-FP8 linear backward for each shape."""
+    expert_activation_transport: Literal["bf16", "int4"] = "bf16"
+    """Expert-parallel activation transport. ``int4`` keeps checkpoint weights
+    in FP8, quantizes only forward all-to-all payloads to INT4, and sends
+    backward payloads in FP8."""
     ignore_patterns: list[str] = _DEFAULT_FP8_IGNORE_PATTERNS
 
 
@@ -231,6 +235,10 @@ class ModelConfig(BaseModelConfig):
     pp_schedule: Literal["1f1b", "gpipe", "interleaved_1f1b"] = "1f1b"
     """Pipeline schedule. ``1f1b`` keeps activation memory to one stage's depth and
     is the default; ``gpipe`` is simpler but holds every micro-batch's activations."""
+
+    pp_transfer_sparse_indices: bool = False
+    """Transfer sparse-attention index caches with pipeline activations. This
+    permits balanced stage boundaries that start on IndexShare layers."""
 
     cp_style: Literal["ring", "ulysses"] = "ring"
     """CP communication style. ``ring`` uses ring-attention all-gather/reduce-scatter (requires custom kernels per attention type). ``ulysses`` uses all-to-all to redistribute Q/K/V from sequence-sharded to head-sharded, runs vanilla attention locally on the full sequence, then all-to-all back — works out-of-the-box with any attention kernel (softmax FA, linear attention, mamba, etc.)."""

@@ -34,6 +34,8 @@ def _index_computing_layers(config) -> list[int] | None:
     boundaries are restricted to layers that compute indices themselves, which
     keeps the numerics identical to a non-pipelined run.
     """
+    if getattr(config, "pp_transfer_sparse_indices", False):
+        return list(range(getattr(config, "num_hidden_layers", 0)))
     types = getattr(config, "indexer_types", None)
     if types is not None:
         return [i for i, t in enumerate(types) if t != "shared"]
@@ -121,6 +123,43 @@ def balanced_boundaries(num_layers: int, pp_size: int, allowed: list[int] | None
     return [0] + list(result[2])
 
 
+def compute_balanced_boundaries(num_layers: int, pp_size: int) -> list[int]:
+    """Minimize the maximum layer count when stages can transfer index caches.
+
+    The ordinary planner prioritizes activation memory and deliberately leaves
+    12 layers on late stages. Once a sparse-index cache can cross boundaries,
+    trainer rate becomes the first objective. Among equal-rate plans, keep
+    fewer layers on early stages because 1F1B holds more activations there.
+    """
+    from functools import lru_cache
+
+    @lru_cache(maxsize=None)
+    def solve(stage: int, start: int):
+        remaining_stages = pp_size - stage
+        def stage_cost(size: int) -> float:
+            return size * (1.50 + 0.137 * remaining_stages)
+
+        if remaining_stages == 1:
+            size = num_layers - start
+            return (size, stage_cost(size), size * size, (num_layers,))
+        best = (float("inf"), float("inf"), float("inf"), ())
+        last = num_layers - (remaining_stages - 1)
+        for boundary in range(start + 1, last + 1):
+            size = boundary - start
+            sub_max, sub_live, sub_sq, tail = solve(stage + 1, boundary)
+            got = (
+                max(size, sub_max),
+                max(stage_cost(size), sub_live),
+                size * size + sub_sq,
+                (boundary,) + tail,
+            )
+            if got[:3] < best[:3]:
+                best = got
+        return best
+
+    return [0] + list(solve(0, 0)[3])
+
+
 def stage_layer_range(num_layers: int, pp_rank: int, pp_size: int, config=None) -> tuple[int, int]:
     """Contiguous [start, end) layer range for a stage.
 
@@ -128,8 +167,11 @@ def stage_layer_range(num_layers: int, pp_rank: int, pp_size: int, config=None) 
     compute their own indices (see ``_index_computing_layers``); otherwise the
     split is even with the remainder going to the earliest stages.
     """
-    allowed = _index_computing_layers(config) if config is not None else None
-    bounds = balanced_boundaries(num_layers, pp_size, allowed)
+    if config is not None and getattr(config, "pp_transfer_sparse_indices", False):
+        bounds = compute_balanced_boundaries(num_layers, pp_size)
+    else:
+        allowed = _index_computing_layers(config) if config is not None else None
+        bounds = balanced_boundaries(num_layers, pp_size, allowed)
     return bounds[pp_rank], bounds[pp_rank + 1]
 
 

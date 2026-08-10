@@ -100,11 +100,12 @@ def _ep_profile_tick() -> None:
     for tag, pairs in _ep_events.items():
         totals[tag] = sum(s.elapsed_time(e) for s, e in pairs) / 1000.0
     _ep_events.clear()
-    if int(os.environ.get("RANK", "0")) == 0:
+    if int(os.environ.get("LOCAL_RANK", "0")) == 0:
         a2a = sum(totals.values())
         parts = " ".join(f"{k}={v:.1f}s" for k, v in sorted(totals.items()))
         print(
-            f"[ep-prof] {_EP_PROFILE_EVERY} dispatches | wall={wall:.1f}s "
+            f"[ep-prof] rank={os.environ.get('RANK', '0')} "
+            f"{_EP_PROFILE_EVERY} dispatches | wall={wall:.1f}s "
             f"a2a={a2a:.1f}s ({100 * a2a / max(wall, 1e-9):.0f}% of wall) | {parts}",
             flush=True,
         )

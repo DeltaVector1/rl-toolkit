@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import time
 
 import torch
@@ -39,6 +40,16 @@ def main() -> None:
     args = arguments()
     if torch.cuda.get_device_capability() != (8, 9):
         raise RuntimeError("this gate requires an SM89 GPU")
+    print(
+        "sparse_config "
+        f"fwd_block={os.environ.get('PRIME_SPARSE_FWD_BLOCK_SIZE', '32')} "
+        f"fwd_heads={os.environ.get('PRIME_SPARSE_FWD_BLOCK_HEADS', '32')} "
+        f"fwd_threads={os.environ.get('PRIME_SPARSE_FWD_THREADS', '128')} "
+        f"bwd_block={os.environ.get('PRIME_SPARSE_BWD_BLOCK_SIZE', '16')} "
+        f"bwd_heads={os.environ.get('PRIME_SPARSE_BWD_BLOCK_HEADS', '16')} "
+        f"bwd_threads={os.environ.get('PRIME_SPARSE_BWD_THREADS', '64')}",
+        flush=True,
+    )
 
     generator = torch.Generator(device="cuda").manual_seed(20260810)
     query = torch.randn(

@@ -41,10 +41,35 @@ class _Module:
 class _Tensor:
     def __init__(self, name: str):
         self.name = name
+        self.dtype = object()
         self.moves: list[tuple[tuple, dict]] = []
 
     def to(self, *args, **kwargs):
         self.moves.append((args, kwargs))
+        return self
+
+    def reshape(self, *args):
+        return self
+
+    def view(self, *args):
+        return self
+
+    def float(self):
+        return self
+
+    def bitwise_and_(self, *args):
+        return self
+
+    def requires_grad_(self, *args):
+        return self
+
+    def __getitem__(self, key):
+        return self
+
+    def __mul__(self, other):
+        return self
+
+    def __add__(self, other):
         return self
 
 
@@ -55,7 +80,10 @@ def _load(path: pathlib.Path, name: str):
     torch.nn = nn
     torch.Tensor = _Tensor
     torch.int32 = object()
+    torch.int16 = object()
+    torch.float16 = object()
     torch.is_tensor = lambda value: isinstance(value, _Tensor)
+    torch.nan_to_num = lambda value: value
 
     logger = types.ModuleType("prime_rl.utils.logger")
     logger.get_logger = lambda: types.SimpleNamespace(info=lambda *args, **kwargs: None)
@@ -102,6 +130,22 @@ class PipelineBalanceTest(unittest.TestCase):
             for cuts in itertools.combinations(interior, 7)
         )
         self.assertEqual(best, 12)
+
+    def test_sparse_cache_transfer_enables_ten_layer_compute_plan(self):
+        config = types.SimpleNamespace(
+            indexer_types=GLM_INDEXER_TYPES,
+            num_hidden_layers=78,
+            pp_transfer_sparse_indices=True,
+        )
+        bounds = [
+            self.pp.stage_layer_range(78, rank, 8, config)[0]
+            for rank in range(8)
+        ] + [78]
+        self.assertEqual(bounds, [0, 9, 18, 28, 38, 48, 58, 68, 78])
+        self.assertEqual(
+            max(end - start for start, end in zip(bounds, bounds[1:])),
+            10,
+        )
 
     def test_current_plan_is_the_unique_minimum_of_measured_memory_model(self):
         allowed = [i for i, kind in enumerate(GLM_INDEXER_TYPES) if kind == "full"]
@@ -179,6 +223,42 @@ class SideInputFifoTest(unittest.TestCase):
                 ((self.torch.int32,), {}),
             ],
         )
+
+    def test_middle_stage_transfers_sparse_index_cache(self):
+        hidden = _Tensor("hidden")
+        incoming = _Tensor("incoming-cache")
+        outgoing = _Tensor("outgoing-cache")
+        position_ids = _Tensor("position-ids")
+        seen = {}
+
+        class Decoder:
+            def __call__(self, **kwargs):
+                seen.update(kwargs)
+                return types.SimpleNamespace(
+                    last_hidden_state=hidden,
+                    past_key_values=outgoing,
+                )
+
+        stage = self.runner.PipelineStageModule(
+            model=types.SimpleNamespace(model=Decoder()),
+            is_first=False,
+            is_last=False,
+            transfer_sparse_indices=True,
+        )
+        stage.set_side_inputs(
+            [
+                {
+                    "position_ids": position_ids,
+                    "seq_lens": None,
+                    "seq_lens_are_pre_shard": True,
+                }
+            ]
+        )
+        got = stage._forward_inner(hidden, incoming)
+
+        self.assertEqual(got, (hidden, outgoing))
+        self.assertIs(seen["inputs_embeds"], hidden)
+        self.assertIs(seen["sparse_indices_cache"], incoming)
 
 
 if __name__ == "__main__":

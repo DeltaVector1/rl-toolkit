@@ -612,6 +612,7 @@ def get_model(
         if subconfig is not None and hasattr(subconfig, "use_cache"):
             subconfig.use_cache = False
     model_config.use_grouped_mm = config.moe_use_grouped_mm
+    model_config.pp_transfer_sparse_indices = config.pp_transfer_sparse_indices
     checkpoint_quantization = getattr(model_config, "quantization_config", {})
     model_config.fp8_source_checkpoint = isinstance(config.quantization, FP8Config) and (
         checkpoint_quantization.get("quant_method") == "fp8"
@@ -1315,7 +1316,11 @@ def apply_ep(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims)
             if config.ep_comm_backend == "torch":
                 quant = config.quantization
                 if (isinstance(quant, MXFP8Config) and quant.enable_a2a) or (
-                    isinstance(quant, FP8Config) and config.global_ep
+                    isinstance(quant, FP8Config)
+                    and (
+                        config.global_ep
+                        or quant.expert_activation_transport == "int4"
+                    )
                 ):
                     parallelize_plan = MXFP8AllToAllExpertParallel()
                 else:
@@ -1536,6 +1541,7 @@ def forward(
     labels: Int[Tensor, "batch seq"] | None = None,
     temperature: Tensor | None = None,
     routed_experts: Int[Tensor, "batch seq layers topk"] | None = None,
+    sparse_indices_cache: Int[Tensor, "batch seq groups topk"] | None = None,
     # Generic multimodal kwargs (e.g. {"pixel_values": ...,
     # "image_grid_thw": ...} for Qwen3-VL; just {"pixel_values": ...}
     # for Gemma3). Passed straight through to ``model(**kwargs)`` so
@@ -1577,6 +1583,8 @@ def forward(
 
     if routed_experts is not None:
         kwargs["routed_experts"] = routed_experts
+    if sparse_indices_cache is not None:
+        kwargs["sparse_indices_cache"] = sparse_indices_cache
 
     out = model(**kwargs)
 
