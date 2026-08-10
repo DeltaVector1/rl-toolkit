@@ -18,6 +18,7 @@ import argparse
 import json
 import math
 import os
+import time
 from dataclasses import dataclass
 
 
@@ -161,6 +162,15 @@ def main() -> None:
     if world_size < 2:
         raise RuntimeError("run with at least two ranks so FSDP really shards and reshards")
 
+    gate_start = time.perf_counter()
+
+    def progress(message: str) -> None:
+        if dist.get_rank() == 0:
+            print(
+                f"[32k-fp8-gate] {time.perf_counter() - gate_start:.1f}s {message}",
+                flush=True,
+            )
+
     estimate = estimate_working_set_bytes(shape, world_size)
     budget = int(args.memory_budget_gib * GIB)
     margin = int(args.safety_margin_gib * GIB)
@@ -180,6 +190,7 @@ def main() -> None:
             f"memory: need {(estimate['estimated_total'] + margin) / GIB:.2f} GiB, "
             f"minimum free is {minimum_free / GIB:.2f} GiB"
         )
+    progress("preflight memory accounting passed")
 
     def make_linear(in_features: int, out_features: int, fqn: str):
         with torch.device("meta"):
@@ -231,9 +242,11 @@ def main() -> None:
 
     torch.manual_seed(7)
     block = NativeFp8AttentionProbe().cuda(local_rank)
+    progress("native FP8 probe weights initialized")
     set_reentrant_block_checkpointing(block)
     mesh = init_device_mesh("cuda", (world_size,))
     fully_shard(block, mesh=mesh, reshard_after_forward=True)
+    progress("two-rank FSDP sharding initialized")
 
     generator = torch.Generator(device="cuda").manual_seed(29)
     template = torch.randn(
@@ -271,8 +284,11 @@ def main() -> None:
         )
 
     eager_output, eager_gradient, eager_peak = run_iteration(False)
+    progress("eager forward and backward passed")
     checkpoint_output, checkpoint_gradient, checkpoint_peak = run_iteration(True)
+    progress("reentrant forward and backward passed")
     repeat_output, repeat_gradient, repeat_peak = run_iteration(True)
+    progress("repeat reentrant forward and backward passed")
 
     torch.testing.assert_close(checkpoint_output, eager_output, rtol=0, atol=0)
     torch.testing.assert_close(checkpoint_gradient, eager_gradient, rtol=0, atol=0)

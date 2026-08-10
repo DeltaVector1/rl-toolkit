@@ -191,6 +191,57 @@ class FP8AdaAutogradTest(unittest.TestCase):
         self.assertEqual(seen["stride"], grad.stride())
         torch.testing.assert_close(got, expected)
 
+    def test_short_sm89_forward_uses_accurate_direct_kernel(self):
+        value = torch.randn(4, 3)
+        weight = torch.randn(5, 3)
+        scale = torch.ones(1, 1)
+        sentinel = torch.full((4, 5), 23.0)
+
+        original_eligible = fp8_ada._native_sm89_eligible
+        original_native = fp8_ada._native_block_fp8_mm
+        original_grouped = fp8_ada._grouped_mm
+        fp8_ada._native_sm89_eligible = lambda *_args: (True, "")
+        fp8_ada._native_block_fp8_mm = lambda *_args, **_kwargs: sentinel
+
+        def fail_grouped(*_args, **_kwargs):
+            raise AssertionError("short eligible SM89 forward used fused W8A8")
+
+        fp8_ada._grouped_mm = fail_grouped
+        try:
+            got = fp8_ada._linear(value, weight, scale)
+        finally:
+            fp8_ada._native_sm89_eligible = original_eligible
+            fp8_ada._native_block_fp8_mm = original_native
+            fp8_ada._grouped_mm = original_grouped
+
+        torch.testing.assert_close(got, sentinel)
+
+    def test_long_sm89_forward_keeps_faster_fused_kernel(self):
+        rows = fp8_ada._DIRECT_SM89_FORWARD_MAX_ROWS + 1
+        value = torch.randn(rows, 3)
+        weight = torch.randn(5, 3)
+        scale = torch.ones(1, 1)
+        sentinel = torch.full((rows, 5), 29.0)
+
+        original_eligible = fp8_ada._native_sm89_eligible
+        original_native = fp8_ada._native_block_fp8_mm
+        original_grouped = fp8_ada._grouped_mm
+        fp8_ada._native_sm89_eligible = lambda *_args: (True, "")
+
+        def fail_native(*_args, **_kwargs):
+            raise AssertionError("long SM89 forward used slower direct kernel")
+
+        fp8_ada._native_block_fp8_mm = fail_native
+        fp8_ada._grouped_mm = lambda *_args, **_kwargs: sentinel
+        try:
+            got = fp8_ada._linear(value, weight, scale)
+        finally:
+            fp8_ada._native_sm89_eligible = original_eligible
+            fp8_ada._native_block_fp8_mm = original_native
+            fp8_ada._grouped_mm = original_grouped
+
+        torch.testing.assert_close(got, sentinel)
+
     def test_eligible_native_dx_does_not_call_oracle(self):
         grad = torch.randn(2, 3)
         weight = torch.randn(3, 4)

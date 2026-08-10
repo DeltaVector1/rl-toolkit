@@ -18,6 +18,7 @@ from vllm.model_executor.layers.fused_moe.fused_moe import (
 
 
 block_shape = [128, 128]
+_DIRECT_SM89_FORWARD_MAX_ROWS = 256
 _DIAGNOSE_LINEAR_BACKWARD = False
 _REPORTED_LINEAR_BACKWARD: set[tuple[tuple[int, ...], bool, bool]] = set()
 _REPORTED_INPUT_GRAD: set[tuple[int, ...]] = set()
@@ -152,7 +153,21 @@ def _native_block_fp8_mm(x, weight, scale, *, weight_is_output_major):
     out = torch.empty(
         x.shape[0], output_size, device=x.device, dtype=x.dtype
     )
-    grid = ((x.shape[0] + 15) // 16, (output_size + 127) // 128)
+    # Small LoRA projections need a short M tile. Long context shards need a
+    # taller tile so each program reuses the same checkpoint weight fragment
+    # across more token rows instead of reloading it for every 16 rows.
+    if x.shape[0] <= 64:
+        block_m, num_warps = 16, 4
+    elif x.shape[0] <= 512:
+        block_m, num_warps = 32, 4
+    elif x.shape[0] <= 2048:
+        block_m, num_warps = 64, 8
+    else:
+        block_m, num_warps = 128, 8
+    grid = (
+        (x.shape[0] + block_m - 1) // block_m,
+        (output_size + 127) // 128,
+    )
     _block_fp8_mm_kernel[grid](
         x,
         weight,
@@ -170,10 +185,10 @@ def _native_block_fp8_mm(x, weight, scale, *, weight_is_output_major):
         out.stride(0),
         out.stride(1),
         weight_is_output_major,
-        BLOCK_M=16,
+        BLOCK_M=block_m,
         BLOCK_N=128,
         BLOCK_K=128,
-        num_warps=4,
+        num_warps=num_warps,
         num_stages=2,
     )
     return out
@@ -202,6 +217,14 @@ def _native_sm89_eligible(activation, weight, scale):
 def _linear(x, weight, scale):
     shape = (*x.shape[:-1], weight.shape[0])
     x = x.reshape(-1, x.shape[-1]).contiguous()
+    eligible, _ = _native_sm89_eligible(x, weight, scale)
+    if eligible and x.shape[0] <= _DIRECT_SM89_FORWARD_MAX_ROWS:
+        return _native_block_fp8_mm(
+            x,
+            weight,
+            scale,
+            weight_is_output_major=True,
+        ).view(shape)
     offsets = torch.tensor([x.shape[0]], device=x.device, dtype=torch.int32)
     return _grouped_mm(x, weight.unsqueeze(0), scale.unsqueeze(0), offsets).view(shape)
 
