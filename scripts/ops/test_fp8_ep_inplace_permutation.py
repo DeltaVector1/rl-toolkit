@@ -44,8 +44,8 @@ def scale_for(weight):
 
 
 def reference(value, weights, scales, indices, offsets, upstream):
-    real = indices < value.shape[0]
-    safe_indices = indices.clamp_max(value.shape[0] - 1).long()
+    real = (indices >= 0) & (indices < value.shape[0])
+    safe_indices = indices.clamp(min=0, max=value.shape[0] - 1).long()
     permuted = value.index_select(0, safe_indices)
     permuted.masked_fill_((~real).unsqueeze(-1), 0)
     expert_output = fp8_ada._Experts.apply(
@@ -125,7 +125,13 @@ def main():
         (
             permutation[:20_000],
             permutation[20_000:],
-            torch.full((PADDING,), ROWS, device="cuda", dtype=torch.int64),
+            torch.full((PADDING // 2,), -1, device="cuda", dtype=torch.int64),
+            torch.full(
+                (PADDING // 2,),
+                ROWS,
+                device="cuda",
+                dtype=torch.int64,
+            ),
         )
     ).to(torch.int32)
     offsets = torch.tensor(

@@ -274,6 +274,15 @@ incremental GPU peak including backward. x60o rollout step 1 had 1,024 of
 1,024 trainable samples and zero errors. Its active generation time was
 approximately 15 minutes, outside the 8-to-12-minute acceptance band.
 
+The first x60p attempt found a padding-metadata compatibility error before it
+could measure memory. This TorchTitan build uses `-1` for some aligned padding
+rows, while the native FP8 permutation path accepted only the positive
+`x.shape[0]` sentinel. The in-place scatter consequently sent `-1` to a CUDA
+index operation and triggered a device-side assert. Both streamed and fallback
+paths now classify only indices in `[0, x.shape[0])` as real rows and clamp
+both sentinel forms only for their zero-filled gather. The exact CUDA gate now
+mixes negative and positive padding sentinels.
+
 x56p is the first nonzero-learning-rate production run on this validated path.
 It started from a new LoRA policy with learning rate 8e-6. Production step 1
 completed with grad norm 0.017861, masked mismatch KL 0.347687, unmasked

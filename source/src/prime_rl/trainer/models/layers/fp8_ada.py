@@ -1247,8 +1247,8 @@ class _InplacePermutedExperts(torch.autograd.Function):
         for start in range(0, rows, chunk_rows):
             end = min(start + chunk_rows, rows)
             indices = permuted_indices[start:end]
-            real = indices < x.shape[0]
-            safe_indices = indices.clamp_max(x.shape[0] - 1).long()
+            real = (indices >= 0) & (indices < x.shape[0])
+            safe_indices = indices.clamp(min=0, max=x.shape[0] - 1).long()
             chunk_x = x.index_select(0, safe_indices)
             chunk_x.masked_fill_((~real).unsqueeze(-1), 0)
             chunk_offsets = _expert_chunk_offsets(offsets, start, end)
@@ -1359,8 +1359,8 @@ class _InplacePermutedExperts(torch.autograd.Function):
         for start in range(0, rows, ctx.chunk_rows):
             end = min(start + ctx.chunk_rows, rows)
             indices = permuted_indices[start:end]
-            real = indices < ctx.source_rows
-            safe_indices = indices.clamp_max(ctx.source_rows - 1).long()
+            real = (indices >= 0) & (indices < ctx.source_rows)
+            safe_indices = indices.clamp(min=0, max=ctx.source_rows - 1).long()
             grad_chunk = grad.index_select(0, safe_indices)
             grad_chunk.masked_fill_((~real).unsqueeze(-1), 0)
             chunk_offsets = _expert_chunk_offsets(offsets, start, end)
@@ -1528,13 +1528,14 @@ def fp8_experts(
             _FP8_W13_CHUNK_ROWS,
         )
 
-    # The index equal to x.shape[0] is a shared zero sentinel for alignment
-    # padding. Clamp it for the gather, then zero those gathered rows in place.
-    # This avoids a complete padded copy of the 426 MiB production input.
-    padding_rows = permuted_indices == x.shape[0]
-    safe_indices = permuted_indices.clamp_max(x.shape[0] - 1)
+    # TorchTitan versions use either -1 or x.shape[0] as the shared zero
+    # sentinel for alignment padding. Clamp both forms for the gather, then
+    # zero those gathered rows in place. This avoids a complete padded copy of
+    # the 426 MiB production input.
+    real_rows = (permuted_indices >= 0) & (permuted_indices < x.shape[0])
+    safe_indices = permuted_indices.clamp(min=0, max=x.shape[0] - 1)
     permuted_x = x[safe_indices, :]
-    permuted_x.masked_fill_(padding_rows.unsqueeze(-1), 0)
+    permuted_x.masked_fill_((~real_rows).unsqueeze(-1), 0)
     out = _Experts.apply(
         permuted_x,
         w1,
@@ -1550,5 +1551,5 @@ def fp8_experts(
     # backward keeps only quantized intermediates. Reuse this buffer for the
     # inverse permutation.
     out_unpermuted = permuted_x
-    out_unpermuted[permuted_indices, :] = out
+    out_unpermuted[permuted_indices[real_rows], :] = out[real_rows]
     return out_unpermuted[: x.shape[0]]
