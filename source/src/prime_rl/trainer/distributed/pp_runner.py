@@ -154,6 +154,19 @@ class PipelineStageModule(nn.Module):
         return out.last_hidden_state, cache_transport
 
 
+def sparse_cache_transport_shape(
+    seq_len: int, index_topk: int
+) -> tuple[int, int, int, int]:
+    """Return the exact cache shape emitted by sparse MLA on one CP rank.
+
+    ``index_n_heads`` configures work inside the indexer. Its final cache is a
+    single shared top-k list for each token, as fixed by
+    ``Indexer.compute_sparse_indices``. Using ``index_n_heads`` here made each
+    pipeline buffer 32 times too large for GLM-5.2.
+    """
+    return 1, seq_len, 1, index_topk
+
+
 def _sparse_cache_pipeline_stage_cls():
     """Return a PipelineStage which sends no gradient for its cache output.
 

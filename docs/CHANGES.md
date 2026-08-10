@@ -115,18 +115,23 @@ checkpoint set.
 
 Gate x60h used exact FP16 bit transport for the sparse-MLA index cache across
 balanced pipeline boundaries. PyTorch PipelineStage treated this discrete
-cache as a differentiable output. During schedule setup it allocated one
-16 MiB cache-gradient receive buffer for each microbatch. With 95
-microbatches, this used approximately 1.5 GiB on each sending stage. x60h then
-failed before its first forward while it tried to allocate another 512 MiB.
+cache as a differentiable output. The static pipeline shape also used the
+configured 32 indexer heads, although `compute_sparse_indices()` emits one
+shared index group. During schedule setup, x60h therefore allocated 512 MiB
+cache-gradient buffers until it failed before the first forward. After the
+unused cache gradients were removed, x60i reached its first forward and
+reported the exact shape mismatch: the declared `[1, 4096, 32, 2048]` output
+was actually `[1, 4096, 1, 2048]`.
 
 `SparseCachePipelineStage` now sends the cache only in the forward direction.
 Only the hidden-state output has a backward receive buffer. Cache inputs do
-not require gradients, and stages do not send cache gradients. The cache bits
-and the hidden-state gradient are unchanged. The two-rank 1F1B transport test
-checks the exact boundary values 0, 1, 2047, 2048, 32639, 32640, 32767, and
-32768. It also checks that the cache has no backward buffer. Four
-microbatches completed with finite gradients on both ranks.
+not require gradients, and stages do not send cache gradients. The declared
+cache shape now has the one shared index group that the model emits. A real
+cache buffer is 16 MiB for each production microbatch. The cache bits and the
+hidden-state gradient are unchanged. The two-rank 1F1B transport test checks
+the exact boundary values 0, 1, 2047, 2048, 32639, 32640, 32767, and 32768.
+It also checks that the cache has no backward buffer. Four microbatches
+completed with finite gradients on both ranks.
 
 x56p is the first nonzero-learning-rate production run on this validated path.
 It started from a new LoRA policy with learning rate 8e-6. Production step 1

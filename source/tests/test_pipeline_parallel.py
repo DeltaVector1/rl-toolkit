@@ -120,7 +120,9 @@ class PipelineBalanceTest(unittest.TestCase):
             [end - start for start, end in zip(bounds, bounds[1:])],
             [6, 8, 8, 8, 12, 12, 12, 12],
         )
-        self.assertTrue(all(GLM_INDEXER_TYPES[start] == "full" for start in bounds[:-1]))
+        self.assertTrue(
+            all(GLM_INDEXER_TYPES[start] == "full" for start in bounds[:-1])
+        )
 
     def test_twelve_layers_is_the_smallest_cache_safe_maximum(self):
         allowed = [i for i, kind in enumerate(GLM_INDEXER_TYPES) if kind == "full"]
@@ -138,8 +140,7 @@ class PipelineBalanceTest(unittest.TestCase):
             pp_transfer_sparse_indices=True,
         )
         bounds = [
-            self.pp.stage_layer_range(78, rank, 8, config)[0]
-            for rank in range(8)
+            self.pp.stage_layer_range(78, rank, 8, config)[0] for rank in range(8)
         ] + [78]
         self.assertEqual(bounds, [0, 9, 18, 28, 38, 48, 58, 68, 78])
         self.assertEqual(
@@ -155,13 +156,11 @@ class PipelineBalanceTest(unittest.TestCase):
             bounds = (0, *cuts, 78)
             sizes = [end - start for start, end in zip(bounds, bounds[1:])]
             return max(
-                size * (1.50 + 0.137 * (8 - stage))
-                for stage, size in enumerate(sizes)
+                size * (1.50 + 0.137 * (8 - stage)) for stage, size in enumerate(sizes)
             )
 
         ranked = sorted(
-            (maximum_cost(cuts), cuts)
-            for cuts in itertools.combinations(interior, 7)
+            (maximum_cost(cuts), cuts) for cuts in itertools.combinations(interior, 7)
         )
         self.assertAlmostEqual(ranked[0][0], 24.576)
         self.assertEqual(ranked[0][1], (6, 14, 22, 30, 42, 54, 66))
@@ -214,8 +213,8 @@ class SideInputFifoTest(unittest.TestCase):
         self.assertEqual((got0["marker"], got1["marker"]), ("micro-0", "micro-1"))
         self.assertIsNone(stage._side[0])
         self.assertIsNone(stage._side[1])
-        self.assertEqual(first.moves, [(('cuda',), {"non_blocking": True})])
-        self.assertEqual(second.moves, [(('cuda',), {"non_blocking": True})])
+        self.assertEqual(first.moves, [(("cuda",), {"non_blocking": True})])
+        self.assertEqual(second.moves, [(("cuda",), {"non_blocking": True})])
         self.assertEqual(
             routed.moves,
             [
@@ -259,6 +258,12 @@ class SideInputFifoTest(unittest.TestCase):
         self.assertEqual(got, (hidden, outgoing))
         self.assertIs(seen["inputs_embeds"], hidden)
         self.assertIs(seen["sparse_indices_cache"], incoming)
+
+    def test_sparse_cache_transport_has_one_shared_index_group(self):
+        self.assertEqual(
+            self.runner.sparse_cache_transport_shape(4096, 2048),
+            (1, 4096, 1, 2048),
+        )
 
 
 if __name__ == "__main__":
