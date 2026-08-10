@@ -700,7 +700,7 @@ class FP8AdaAutogradTest(unittest.TestCase):
 
         # Source-major rows after EP all-to-all:
         # [src0/e0 x2, src0/e1 x1, src1/e0 x3, src1/e1 x0].
-        x = torch.arange(6, dtype=torch.float32).unsqueeze(1)
+        x = torch.arange(6, dtype=torch.float32).unsqueeze(1).requires_grad_()
         counts = torch.tensor([2, 1, 3, 0])
         weights = tuple(torch.zeros(2, 1, 1) for _ in range(3))
         scales = tuple(torch.ones(2, 1, 1) for _ in range(3))
@@ -720,7 +720,7 @@ class FP8AdaAutogradTest(unittest.TestCase):
         ):
             captured["x"] = permuted_x.clone()
             captured["offsets"] = offsets.clone()
-            return permuted_x
+            return permuted_x.mul(2)
 
         original_generate = index_ops.generate_permute_indices
         original_apply = fp8_ada._Experts.apply
@@ -745,7 +745,9 @@ class FP8AdaAutogradTest(unittest.TestCase):
         torch.testing.assert_close(
             captured["offsets"], torch.tensor([5, 6], dtype=torch.int32)
         )
-        torch.testing.assert_close(got, x)
+        torch.testing.assert_close(got, x.mul(2))
+        got.sum().backward()
+        torch.testing.assert_close(x.grad, torch.full_like(x, 2))
 
     def test_grouped_mm_zeros_rows_after_last_expert_offset(self):
         x = torch.randn(4, 2)

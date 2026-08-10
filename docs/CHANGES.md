@@ -198,6 +198,19 @@ each reporting window. It is a diagnostic mode and is not part of the measured
 speed configuration. Foreground `glm52_ops.watch()` continues to report GPU
 use, trainer steps, rollout progress, and engine generation without it.
 
+Gate x60k reached its first eager MoE forward at the full 32K/CP8 shape. n76,
+n77, and n82 OOMed while `fp8_experts()` allocated a 426-to-472 MiB inverse-
+permutation output with only 356-to-454 MiB free. The fused expert output and
+the padded pre-permutation input already had this same shape. Expert custom
+backward keeps quantized intermediates and does not need the padded input
+values after forward. The inverse permutation now writes into that existing
+buffer. This removes one complete routed-output allocation without changing
+row order. The EP permutation unit test now also checks its input gradient
+through the reused buffer. A production-shape CUDA gate uses 36,352 rows by
+6,144 hidden values, the exact 426 MiB BF16 geometry from the first n76
+failure. Inverse permutation added 0 MiB to allocated memory and its gradient
+was exact. Peak for the complete synthetic graph was 2.708 GiB.
+
 x56p is the first nonzero-learning-rate production run on this validated path.
 It started from a new LoRA policy with learning rate 8e-6. Production step 1
 completed with grad norm 0.017861, masked mismatch KL 0.347687, unmasked

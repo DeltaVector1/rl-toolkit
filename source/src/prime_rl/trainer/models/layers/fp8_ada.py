@@ -1187,6 +1187,11 @@ def fp8_experts(
         torch.cumsum(local_counts, 0, dtype=torch.int32),
         owner,
     )
-    out_unpermuted = out.new_empty(padded_x.shape)
+    # Expert forward no longer needs the padded input values, and its custom
+    # backward keeps only quantized intermediates. Reuse this equally shaped
+    # buffer for the inverse permutation. Allocating a second output here cost
+    # 426 MiB at the production 32K/CP8 shape and OOMed x60k with the first
+    # eager MoE microbatch.
+    out_unpermuted = padded_x
     out_unpermuted[permuted_indices, :] = out
     return out_unpermuted[:-1]
