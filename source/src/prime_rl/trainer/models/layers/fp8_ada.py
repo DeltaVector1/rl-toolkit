@@ -26,6 +26,9 @@ from vllm.model_executor.layers.fused_moe.fused_moe import (
 block_shape = [128, 128]
 _FP8_W2_CHUNK_ROWS = 4096
 _FP8_ROUTE_SCALE_CHUNK_ROWS = 4096
+_FP8_EXPERT_ACTIVATION_OFFLOAD = (
+    os.environ.get("PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD", "") == "1"
+)
 _DIAGNOSE_LINEAR_BACKWARD = False
 _REPORTED_LINEAR_BACKWARD: set[tuple[tuple[int, ...], bool, bool]] = set()
 _REPORTED_INPUT_GRAD: set[tuple[int, ...]] = set()
@@ -1001,6 +1004,32 @@ def _grouped_mm_pair(
     )
 
 
+def _expert_chunk_offsets(offsets, start, end):
+    expert_starts = torch.cat((offsets.new_zeros(1), offsets[:-1]))
+    counts = (
+        offsets.clamp(min=start, max=end) - expert_starts.clamp(min=start, max=end)
+    ).clamp_min_(0)
+    return torch.cumsum(counts, 0, dtype=torch.int32)
+
+
+def _grouped_mm_pair_chunks(x, w1, s1, w3, s3, offsets, chunk_rows):
+    """Yield bounded W1/W3 outputs with one quantization for each row chunk."""
+    for start in range(0, x.shape[0], chunk_rows):
+        end = min(start + chunk_rows, x.shape[0])
+        chunk_offsets = _expert_chunk_offsets(offsets, start, end)
+        z1, z3 = _grouped_mm_pair(
+            x[start:end],
+            w1,
+            s1,
+            x[start:end],
+            w3,
+            s3,
+            chunk_offsets,
+            shared_input=True,
+        )
+        yield start, end, z1, z3
+
+
 def _grouped_mm_chunked(x, weight, scale, offsets, chunk_rows=None):
     """Run a grouped matrix multiply with bounded token-row workspaces.
 
@@ -1015,13 +1044,9 @@ def _grouped_mm_chunked(x, weight, scale, offsets, chunk_rows=None):
         return _grouped_mm(x, weight, scale, offsets)
 
     out = x.new_empty(x.shape[0], weight.shape[1])
-    expert_starts = torch.cat((offsets.new_zeros(1), offsets[:-1]))
     for start in range(0, x.shape[0], chunk_rows):
         end = min(start + chunk_rows, x.shape[0])
-        counts = (
-            offsets.clamp(min=start, max=end) - expert_starts.clamp(min=start, max=end)
-        ).clamp_min_(0)
-        chunk_offsets = torch.cumsum(counts, 0, dtype=torch.int32)
+        chunk_offsets = _expert_chunk_offsets(offsets, start, end)
         out[start:end].copy_(
             _grouped_mm(
                 x[start:end],
@@ -1036,31 +1061,83 @@ def _grouped_mm_chunked(x, weight, scale, offsets, chunk_rows=None):
 class _Experts(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, w1, s1, w2, s2, w3, s3, offsets, owner):
-        z1, z3 = _grouped_mm_pair(
-            x,
-            w1,
-            s1,
-            x,
-            w3,
-            s3,
-            offsets,
-            shared_input=True,
-        )
-        q1, qs1 = ops.scaled_fp8_quant(z1, use_per_token_if_dynamic=True)
-        q3, qs3 = ops.scaled_fp8_quant(z3, use_per_token_if_dynamic=True)
-        ctx.owner = owner
-        if owner is None:
-            ctx.save_for_backward(
-                q1, qs1, q3, qs3, offsets, w1, s1, w2, s2, w3, s3
+        offload = _FP8_EXPERT_ACTIVATION_OFFLOAD and x.is_cuda
+        if offload:
+            # An eager 1F1B stage retains one expert context for each live
+            # microbatch. Keeping q1 and q3 on the GPU used several GiB and
+            # left x60m unable to allocate even a 48 MiB W2 chunk. Stream the
+            # W1/W3 pair, retain its exact per-token FP8 values in pinned host
+            # memory, and keep only the small inverse scales on the GPU.
+            gated = x.new_empty(x.shape[0], w1.shape[1])
+            q1_host = q3_host = None
+            qs1_parts = []
+            qs3_parts = []
+            for start, end, z1, z3 in _grouped_mm_pair_chunks(
+                x,
+                w1,
+                s1,
+                w3,
+                s3,
+                offsets,
+                _FP8_W2_CHUNK_ROWS,
+            ):
+                q1_chunk, qs1_chunk = ops.scaled_fp8_quant(
+                    z1, use_per_token_if_dynamic=True
+                )
+                q3_chunk, qs3_chunk = ops.scaled_fp8_quant(
+                    z3, use_per_token_if_dynamic=True
+                )
+                if q1_host is None:
+                    q1_host = torch.empty(
+                        x.shape[0],
+                        z1.shape[1],
+                        device="cpu",
+                        dtype=q1_chunk.dtype,
+                        pin_memory=True,
+                    )
+                    q3_host = torch.empty_like(q1_host, pin_memory=True)
+                q1_host[start:end].copy_(q1_chunk, non_blocking=True)
+                q3_host[start:end].copy_(q3_chunk, non_blocking=True)
+                qs1_parts.append(qs1_chunk)
+                qs3_parts.append(qs3_chunk)
+                F.silu(z1, inplace=True)
+                z1.mul_(z3)
+                gated[start:end].copy_(z1)
+            if q1_host is None or q3_host is None:
+                raise RuntimeError("streamed FP8 experts received no token rows")
+            q1, q3 = q1_host, q3_host
+            qs1 = torch.cat(qs1_parts, dim=0)
+            qs3 = torch.cat(qs3_parts, dim=0)
+            offload_done = torch.cuda.Event()
+            offload_done.record(torch.cuda.current_stream(x.device))
+            z1 = gated
+        else:
+            z1, z3 = _grouped_mm_pair(
+                x,
+                w1,
+                s1,
+                x,
+                w3,
+                s3,
+                offsets,
+                shared_input=True,
             )
+            q1, qs1 = ops.scaled_fp8_quant(z1, use_per_token_if_dynamic=True)
+            q3, qs3 = ops.scaled_fp8_quant(z3, use_per_token_if_dynamic=True)
+            F.silu(z1, inplace=True)
+            z1.mul_(z3)
+            del z3
+            offload_done = None
+        ctx.owner = owner
+        ctx.expert_activation_offload = offload
+        ctx.offload_done = offload_done
+        if owner is None:
+            ctx.save_for_backward(q1, qs1, q3, qs3, offsets, w1, s1, w2, s2, w3, s3)
         else:
             # Reacquire current unsharded owner parameters in backward. Saved
             # forward views still point at the released FSDP all-gather
             # allocation after resharding.
             ctx.save_for_backward(q1, qs1, q3, qs3, offsets)
-        F.silu(z1, inplace=True)
-        z1.mul_(z3)
-        del z3
         return _grouped_mm_chunked(z1, w2, s2, offsets)
 
     @staticmethod
@@ -1070,9 +1147,7 @@ class _Experts(torch.autograd.Function):
             profile_end = torch.cuda.Event(enable_timing=True)
             profile_start.record()
         if ctx.owner is None:
-            q1, qs1, q3, qs3, offsets, w1, s1, w2, s2, w3, s3 = (
-                ctx.saved_tensors
-            )
+            q1, qs1, q3, qs3, offsets, w1, s1, w2, s2, w3, s3 = ctx.saved_tensors
         else:
             q1, qs1, q3, qs3, offsets = ctx.saved_tensors
             owner = ctx.owner
@@ -1091,8 +1166,17 @@ class _Experts(torch.autograd.Function):
                 value.to_local() if isinstance(value, DTensor) else value
                 for value in (w1, s1, w2, s2, w3, s3)
             )
-        z1 = q1.to(grad.dtype).mul_(qs1.to(grad.dtype))
-        z3 = q3.to(grad.dtype).mul_(qs3.to(grad.dtype))
+        if ctx.expert_activation_offload:
+            torch.cuda.current_stream(grad.device).wait_event(ctx.offload_done)
+            q1_device = q1.to(grad.device, non_blocking=True)
+            z1 = q1_device.to(grad.dtype).mul_(qs1.to(grad.dtype))
+            del q1_device
+            q3_device = q3.to(grad.device, non_blocking=True)
+            z3 = q3_device.to(grad.dtype).mul_(qs3.to(grad.dtype))
+            del q3_device
+        else:
+            z1 = q1.to(grad.dtype).mul_(qs1.to(grad.dtype))
+            z3 = q3.to(grad.dtype).mul_(qs3.to(grad.dtype))
         hidden_grad = _grouped_mm_chunked(
             grad, w2.transpose(-2, -1), s2.transpose(-2, -1), offsets
         )
@@ -1113,7 +1197,7 @@ class _Experts(torch.autograd.Function):
         if _EXPERT_PROFILE:
             profile_end.record()
             _profile_expert_backward(profile_start, profile_end)
-        del ctx.owner
+        del ctx.owner, ctx.offload_done
         return x_grad, None, None, None, None, None, None, None, None
 
 
@@ -1139,10 +1223,7 @@ class _ScaleRoutedOutput(torch.autograd.Function):
         for start in range(0, x.shape[0], chunk_rows):
             end = min(start + chunk_rows, x.shape[0])
             out[start:end].copy_(
-                (
-                    x[start:end].float()
-                    * flat_scores[start:end, None]
-                ).to(x.dtype)
+                (x[start:end].float() * flat_scores[start:end, None]).to(x.dtype)
             )
         return out
 
@@ -1155,9 +1236,7 @@ class _ScaleRoutedOutput(torch.autograd.Function):
             end = min(start + ctx.chunk_rows, x.shape[0])
             grad_chunk = grad[start:end].float()
             x_chunk = x[start:end].float()
-            grad_x[start:end].copy_(
-                (grad_chunk * scores[start:end, None]).to(x.dtype)
-            )
+            grad_x[start:end].copy_((grad_chunk * scores[start:end, None]).to(x.dtype))
             grad_scores[start:end].copy_((grad_chunk * x_chunk).sum(dim=-1))
         return grad_x, grad_scores.view(ctx.score_shape), None
 

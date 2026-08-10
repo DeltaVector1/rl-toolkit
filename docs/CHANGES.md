@@ -231,6 +231,26 @@ produced exact finite gradients. The 32K/CP8 two-rank SM89 FSDP gate then
 passed repeated reentrant attention backward and two in-flight fused-expert
 backwards at a 1.103 GiB measured peak.
 
+Gate x60m removed those duplicates but measured three more eager-MoE memory
+limits. n76 could not allocate a 236 MiB full input-quantization buffer with
+139.62 MiB free. n82 could not allocate the second 134 MiB W1/W3 output with
+119.62 MiB free. n77 could not allocate a 48 MiB W2 chunk with 17.62 MiB free.
+The fresh rollout batch completed first: collection was 1,418.19 seconds,
+maximum active generation was 758.55 seconds, and one of 1,024 rollouts had a
+user error. Active generation was 38.55 seconds outside the 8-to-12-minute
+alarm band. Scoring and transfer are not part of that number.
+
+Native FP8 experts now stream W1 and W3 in 4,096-row chunks. Each pair shares
+one input quantization and one expert assignment. The exact per-token FP8 W1
+and W3 activations are retained in pinned host memory; this is not the global
+activation-offload feature, which remains disabled. Backward copies the FP8
+values to the GPU and continues to use W8A8 fused expert GEMMs. At the
+production 36,352 by 6,144 input shape and 2,048 intermediate width, the SM89
+gate measured bit-exact forward output and input gradients against the eager
+path. It retained 142 MiB of exact FP8 activation bits on the host and reduced
+incremental GPU peak from 2,420.17 to 2,277.17 MiB. The two-rank 32K FSDP gate
+also passed with the offload path enabled.
+
 x56p is the first nonzero-learning-rate production run on this validated path.
 It started from a new LoRA policy with learning rate 8e-6. Production step 1
 completed with grad norm 0.017861, masked mismatch KL 0.347687, unmasked

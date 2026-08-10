@@ -92,7 +92,15 @@ FINAL_VALIDATION_STEPS = 50
 # .../<repo>/.agents/skills/glm52-ops/src/glm52_ops/__init__.py
 REPO = Path(__file__).resolve().parents[5]
 
-_SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=25", "-o", "StrictHostKeyChecking=accept-new"]
+_SSH = [
+    "ssh",
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ConnectTimeout=25",
+    "-o",
+    "StrictHostKeyChecking=accept-new",
+]
 
 
 class Refused(RuntimeError):
@@ -112,7 +120,9 @@ def _check_host(host: str) -> str:
 def _ssh(host: str, script: str, timeout: int = 120) -> tuple[int, str]:
     _check_host(host)
     try:
-        p = subprocess.run(_SSH + [host, script], capture_output=True, text=True, timeout=timeout)
+        p = subprocess.run(
+            _SSH + [host, script], capture_output=True, text=True, timeout=timeout
+        )
         return p.returncode, (p.stdout + p.stderr)
     except subprocess.TimeoutExpired:
         return 124, "TIMEOUT"
@@ -152,7 +162,11 @@ def _kv(out: str) -> dict[str, str]:
     d: dict[str, str] = {}
     for line in out.splitlines():
         parts = line.strip().split(" ", 1)
-        if len(parts) == 2 and parts[0].isupper() and parts[0].replace("_", "").isalpha():
+        if (
+            len(parts) == 2
+            and parts[0].isupper()
+            and parts[0].replace("_", "").isalpha()
+        ):
             d[parts[0]] = parts[1].strip()
         elif len(parts) == 1 and parts[0].isupper() and parts[0]:
             d[parts[0]] = ""
@@ -164,7 +178,9 @@ def _age(rfc3339: str) -> float | None:
     try:
         t = rfc3339.strip().replace("Z", "+00:00")
         t = re.sub(r"\.(\d{6})\d+", r".\1", t)  # docker prints 9 fractional digits
-        return (_dt.datetime.now(_dt.timezone.utc) - _dt.datetime.fromisoformat(t)).total_seconds()
+        return (
+            _dt.datetime.now(_dt.timezone.utc) - _dt.datetime.fromisoformat(t)
+        ).total_seconds()
     except Exception:
         return None
 
@@ -187,7 +203,7 @@ def _shown(value) -> str:
 def _run_dir(run: str) -> str:
     """Remote shell fragment that resolves the run directory."""
     return (
-        f'd=$(ls -d {RUNS}/{run}/*/ 2>/dev/null | while read x; do '
+        f"d=$(ls -d {RUNS}/{run}/*/ 2>/dev/null | while read x; do "
         f'[ -f "$x/rollout-metrics.jsonl" ] && echo "$x"; done | head -1)'
     )
 
@@ -218,7 +234,6 @@ echo "SUP_RUN $(pgrep -f 'bash .*[r]un_supervisor.sh' | wc -l)"
 echo "SUP_TUN $(pgrep -f 'bash .*[t]unnel_watchdog.sh' | wc -l)"
 echo "SUP_TUN_LOG $(tail -1 /data/glm52-rl/tunnel_watchdog.log 2>/dev/null | cut -d' ' -f1)"
 """
-
 
 
 _EDGE_ORCH_PROBE = r"""
@@ -335,7 +350,13 @@ class AcceptanceReport:
             f"lr={','.join(f'{x:g}' for x in self.learning_rates) or '?'} "
             f"max_norm={_shown(self.max_norm)} weight_decay={_shown(self.weight_decay)}"
         )
-        precision = "yes" if self.native_fp8 is True else "no" if self.native_fp8 is False else "?"
+        precision = (
+            "yes"
+            if self.native_fp8 is True
+            else "no"
+            if self.native_fp8 is False
+            else "?"
+        )
         trainer = (
             f"step {self.trainer_compute_step}: {_hms(self.trainer_compute_seconds)}"
             if self.trainer_compute_step is not None
@@ -350,7 +371,9 @@ class AcceptanceReport:
         L.append(f"config: {values}")
         L.append(f"native FP8 trainer: {precision}")
         L.append(f"trainer forward/backward only: {trainer} (gate 10-15m after step 1)")
-        L.append(f"active rollout generation only: {generation} (approximate gate 8-12m)")
+        L.append(
+            f"active rollout generation only: {generation} (approximate gate 8-12m)"
+        )
         L.append(
             "excluded from both times: policy/gate waiting, judging/scoring, batch transfer, "
             "adapter transfer, and checkpoint save"
@@ -361,7 +384,10 @@ class AcceptanceReport:
             f"reward verdict={self.reward_verdict}"
         )
         if self.failures:
-            L.append("failure evidence: " + ", ".join(f"{k}={v}" for k, v in sorted(self.failures.items())))
+            L.append(
+                "failure evidence: "
+                + ", ".join(f"{k}={v}" for k, v in sorted(self.failures.items()))
+            )
         L.append(f"VERDICT: {'PASS' if self.passed else 'FAIL'}")
         for alarm in self.alarms:
             L.append(f"!! ACCEPTANCE: {alarm}")
@@ -403,7 +429,9 @@ class Status:
             f"orchestrator {'up' if self.orch_up else 'DOWN'} | "
             f"tunnels {self.tunnels_ok}/{len(TUNNEL_PORTS)} | judge {self.judge} | adapter {self.adapter}"
         )
-        L.append(f"steps {self.trainer_steps} | fails/5m {self.fails_5m} | {self.batch or 'no batch line'}")
+        L.append(
+            f"steps {self.trainer_steps} | fails/5m {self.fails_5m} | {self.batch or 'no batch line'}"
+        )
         if self.trainer_last:
             L.append(f"  trainer: {self.trainer_last[:150]}")
         if self.orch_last:
@@ -444,7 +472,6 @@ class Status:
 
     def __str__(self) -> str:
         return self.report()
-
 
 
 # ------------------------------------------------------ acceptance reporting
@@ -488,7 +515,11 @@ def _parse_toml_value(raw: str):
         return low == "true"
     number = raw.replace("_", "")
     try:
-        return float(number) if any(c in number.lower() for c in (".", "e")) else int(number)
+        return (
+            float(number)
+            if any(c in number.lower() for c in (".", "e"))
+            else int(number)
+        )
     except ValueError:
         return raw
 
@@ -515,8 +546,10 @@ def _parse_toml_scalars(text: str) -> dict[str, list[object]]:
             continue
         key = f"{section}.{match.group(1)}" if section else match.group(1)
         value = _parse_toml_value(match.group(2))
-        if value is not None and not isinstance(value, str) or (
-            isinstance(value, str) and not value.startswith(("[", "{"))
+        if (
+            value is not None
+            and not isinstance(value, str)
+            or (isinstance(value, str) and not value.startswith(("[", "{")))
         ):
             values.setdefault(key, []).append(value)
     return values
@@ -555,12 +588,16 @@ def _near(actual: float, expected: float) -> bool:
     return math.isclose(float(actual), float(expected), rel_tol=1e-9, abs_tol=1e-12)
 
 
-def _failure_evidence(trainer_rows: list[dict], rollout_rows: list[dict], logs: str) -> dict[str, int]:
+def _failure_evidence(
+    trainer_rows: list[dict], rollout_rows: list[dict], logs: str
+) -> dict[str, int]:
     """Count measured failure evidence. Counts are lines or affected metric steps."""
     failures: dict[str, int] = {}
 
     rollout_error_steps = sum(
-        1 for row in rollout_rows if float(row.get("train/agg/all/has_error/mean") or 0.0) > 0.0
+        1
+        for row in rollout_rows
+        if float(row.get("train/agg/all/has_error/mean") or 0.0) > 0.0
     )
     environment_steps = sum(
         1
@@ -598,15 +635,21 @@ def _failure_evidence(trainer_rows: list[dict], rollout_rows: list[dict], logs: 
             r"(?:failed|error).*(?:environment|user.sim(?:ulation)?)",
             re.I,
         ),
-        "stability": re.compile(r"out of memory|\boom\b|\b(?:nan|inf)\b|nonfinite", re.I),
+        "stability": re.compile(
+            r"out of memory|\boom\b|\b(?:nan|inf)\b|nonfinite", re.I
+        ),
     }
-    lines = list(dict.fromkeys(line.strip() for line in logs.splitlines() if line.strip()))
+    lines = list(
+        dict.fromkeys(line.strip() for line in logs.splitlines() if line.strip())
+    )
     for category, pattern in categories.items():
         count = sum(
             1
             for line in lines
             if pattern.search(line)
-            and not re.search(r"(?:error|failed|nonfinite)[^0-9]{0,8}0(?:\.0+)?%?", line, re.I)
+            and not re.search(
+                r"(?:error|failed|nonfinite)[^0-9]{0,8}0(?:\.0+)?%?", line, re.I
+            )
         )
         if count:
             failures[category] = failures.get(category, 0) + count
@@ -632,7 +675,9 @@ def _batch_2048_evidence(
     if batch == 2048 and any(row["step"] >= 1 for row in trainer_rows):
         return True
     explicit = re.search(r"\b(?:batch(?:_size)?\s*[=: ]\s*2048|b2048)\b", logs, re.I)
-    completed = re.search(r"\b(?:SUCCESS Step|validated|acceptance|completed)\b", logs, re.I)
+    completed = re.search(
+        r"\b(?:SUCCESS Step|validated|acceptance|completed)\b", logs, re.I
+    )
     return bool(explicit and completed)
 
 
@@ -666,7 +711,9 @@ def _acceptance_from_text(
         ),
     )
     rep.max_output_lengths = sorted(set(int(v) for v in output_values))
-    rep.learning_rates = _numbers(trainer_values, ("optim.lr",)) + _numbers(orch_values, ("optim.lr",))
+    rep.learning_rates = _numbers(trainer_values, ("optim.lr",)) + _numbers(
+        orch_values, ("optim.lr",)
+    )
     rep.max_norm = _last(trainer_values, "optim.max_norm")
     rep.weight_decay = _last(trainer_values, "optim.weight_decay")
 
@@ -682,13 +729,16 @@ def _acceptance_from_text(
     if not trainer_config.strip():
         rep.native_fp8 = None
     else:
-        rep.native_fp8 = quant_type == "fp8" and all(flag is False for flag in dequant_flags)
+        rep.native_fp8 = quant_type == "fp8" and all(
+            flag is False for flag in dequant_flags
+        )
 
     rep.completed_steps = max((row["step"] for row in trainer_rows), default=0)
     compute = [
         (row["step"], float(row["time/forward_backward"]))
         for row in trainer_rows
-        if row["step"] > 1 and isinstance(row.get("time/forward_backward"), (int, float))
+        if row["step"] > 1
+        and isinstance(row.get("time/forward_backward"), (int, float))
     ]
     if compute:
         rep.trainer_compute_step, rep.trainer_compute_seconds = compute[-1]
@@ -722,23 +772,36 @@ def _acceptance_from_text(
     expected("batch size", rep.batch_size, EXPECTED_BATCH_SIZE)
     expected("group size", rep.group_size, EXPECTED_GROUP_SIZE)
     expected("context length", rep.context_length, EXPECTED_CONTEXT_LENGTH)
-    if not rep.max_output_lengths or any(v != EXPECTED_MAX_OUTPUT_LENGTH for v in rep.max_output_lengths):
+    if not rep.max_output_lengths or any(
+        v != EXPECTED_MAX_OUTPUT_LENGTH for v in rep.max_output_lengths
+    ):
         shown = ",".join(map(str, rep.max_output_lengths)) or "?"
-        rep.alarms.append(f"maximum output length is {shown}; expected {EXPECTED_MAX_OUTPUT_LENGTH}")
-    if len(rep.learning_rates) < 2 or any(not _near(v, EXPECTED_LR) for v in rep.learning_rates):
+        rep.alarms.append(
+            f"maximum output length is {shown}; expected {EXPECTED_MAX_OUTPUT_LENGTH}"
+        )
+    if len(rep.learning_rates) < 2 or any(
+        not _near(v, EXPECTED_LR) for v in rep.learning_rates
+    ):
         shown = ",".join(f"{v:g}" for v in rep.learning_rates) or "?"
-        rep.alarms.append(f"trainer/orchestrator learning rates are {shown}; expected {EXPECTED_LR:g}")
+        rep.alarms.append(
+            f"trainer/orchestrator learning rates are {shown}; expected {EXPECTED_LR:g}"
+        )
     if rep.max_norm is None or not _near(rep.max_norm, EXPECTED_MAX_NORM):
-        rep.alarms.append(f"maximum gradient norm is {_shown(rep.max_norm)}; expected {EXPECTED_MAX_NORM:g}")
+        rep.alarms.append(
+            f"maximum gradient norm is {_shown(rep.max_norm)}; expected {EXPECTED_MAX_NORM:g}"
+        )
     if rep.weight_decay is None or not _near(rep.weight_decay, EXPECTED_WEIGHT_DECAY):
-        rep.alarms.append(f"weight decay is {_shown(rep.weight_decay)}; expected {EXPECTED_WEIGHT_DECAY:g}")
+        rep.alarms.append(
+            f"weight decay is {_shown(rep.weight_decay)}; expected {EXPECTED_WEIGHT_DECAY:g}"
+        )
     if rep.native_fp8 is not True:
         rep.alarms.append("trainer is not confirmed on native FP8 checkpoint weights")
 
     bad_compute = [
         step
         for step, seconds in compute
-        if seconds < TRAINER_COMPUTE_MIN_SECONDS or seconds > TRAINER_COMPUTE_MAX_SECONDS
+        if seconds < TRAINER_COMPUTE_MIN_SECONDS
+        or seconds > TRAINER_COMPUTE_MAX_SECONDS
     ]
     if bad_compute:
         rep.alarms.append(
@@ -746,12 +809,15 @@ def _acceptance_from_text(
             f"{','.join(map(str, bad_compute[-8:]))}"
         )
     elif rep.completed_steps > 1 and not compute:
-        rep.alarms.append("no separate trainer forward/backward measurement after step 1")
+        rep.alarms.append(
+            "no separate trainer forward/backward measurement after step 1"
+        )
 
     bad_generation = [
         step
         for step, seconds in generation
-        if seconds < ROLLOUT_GENERATION_MIN_SECONDS or seconds > ROLLOUT_GENERATION_MAX_SECONDS
+        if seconds < ROLLOUT_GENERATION_MIN_SECONDS
+        or seconds > ROLLOUT_GENERATION_MAX_SECONDS
     ]
     if bad_generation:
         rep.alarms.append(
@@ -823,9 +889,9 @@ def _decode_acceptance_probe(out: str) -> dict[str, str]:
         if not match:
             continue
         try:
-            decoded[match.group(1).lower()] = base64.b64decode(match.group(2) or "").decode(
-                "utf-8", errors="replace"
-            )
+            decoded[match.group(1).lower()] = base64.b64decode(
+                match.group(2) or ""
+            ).decode("utf-8", errors="replace")
         except (ValueError, TypeError):
             decoded[match.group(1).lower()] = ""
     return decoded
@@ -843,7 +909,9 @@ def acceptance(run: str = "", quiet: bool = False) -> AcceptanceReport:
     with ThreadPoolExecutor(max_workers=4) as ex:
         f_trainer = ex.submit(_ssh, HEAD, _acceptance_probe_script(run, "trainer"), 180)
         f_edge = ex.submit(_ssh, EDGE_ORCH, _acceptance_probe_script(run, "edge"), 180)
-        f_engine = ex.submit(_ssh, ENGINE_HOSTS[1], _acceptance_probe_script(run, "engine"), 180)
+        f_engine = ex.submit(
+            _ssh, ENGINE_HOSTS[1], _acceptance_probe_script(run, "engine"), 180
+        )
         f_reward = ex.submit(reward, run, True)
         trainer = _decode_acceptance_probe(f_trainer.result()[1])
         edge = _decode_acceptance_probe(f_edge.result()[1])
@@ -856,7 +924,9 @@ def acceptance(run: str = "", quiet: bool = False) -> AcceptanceReport:
         edge.get("config", ""),
         trainer.get("metrics", ""),
         edge.get("metrics", ""),
-        "\n".join((trainer.get("logs", ""), edge.get("logs", ""), engine.get("logs", ""))),
+        "\n".join(
+            (trainer.get("logs", ""), edge.get("logs", ""), engine.get("logs", ""))
+        ),
         reward_report.verdict,
     )
     rep.trainer_config_path = trainer.get("path", "")
@@ -872,13 +942,21 @@ def acceptance(run: str = "", quiet: bool = False) -> AcceptanceReport:
 def status(run: str = "", quiet: bool = False) -> Status:
     """Probe every part of the run once and return the whole picture."""
     run = run or current_run()
-    s = Status(when=_dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), run=run)
+    s = Status(
+        when=_dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), run=run
+    )
 
     def node(h):
         return _ssh(h, _NODE_PROBE.replace("__TRAINER__", TRAINER_CT), timeout=60)
 
     def engine(h):
-        return _ssh(h, _ENGINE_PROBE.replace("__MODEL__", ENGINE_MODEL).replace("__ENGINE__", ENGINE_CT), timeout=90)
+        return _ssh(
+            h,
+            _ENGINE_PROBE.replace("__MODEL__", ENGINE_MODEL).replace(
+                "__ENGINE__", ENGINE_CT
+            ),
+            timeout=90,
+        )
 
     with ThreadPoolExecutor(max_workers=12) as ex:
         f_head = ex.submit(_ssh, HEAD, _head_script(), 300)
@@ -994,11 +1072,15 @@ def _warnings(s: Status) -> list[str]:
             )
     for e in s.engines:
         if e.reachable and not e.healthy:
-            w.append(f"{e.host} failed a real completion probe (code {e.gen_code}). Run repair('engine:{e.host}').")
+            w.append(
+                f"{e.host} failed a real completion probe (code {e.gen_code}). Run repair('engine:{e.host}')."
+            )
         if e.reachable and not e.watchdog:
             w.append(f"{e.host} has no engine watchdog running")
     if s.judge != "200":
-        w.append(f"judge returned {s.judge}; every reward multiplies by the judge score")
+        w.append(
+            f"judge returned {s.judge}; every reward multiplies by the judge score"
+        )
     if s.adapter != "200":
         w.append(
             f"adapter server returned {s.adapter} on port {ADAPTER_PORT}. "
@@ -1020,7 +1102,9 @@ def _warnings(s: Status) -> list[str]:
         if age is not None and age > STALL_SECONDS:
             if name == "trainer" and trainer_busy:
                 continue
-            w.append(f"{name} has written nothing for {_hms(age)}; the limit is {STALL_SECONDS // 60} minutes")
+            w.append(
+                f"{name} has written nothing for {_hms(age)}; the limit is {STALL_SECONDS // 60} minutes"
+            )
     for n in s.nodes:
         if n.reachable and n.mem_free_gb < 60:
             w.append(
@@ -1032,7 +1116,10 @@ def _warnings(s: Status) -> list[str]:
 
 def current_run() -> str:
     """The run name the trainer container was started with."""
-    rc, out = _ssh(HEAD, f"sudo docker inspect {TRAINER_CT} --format '{{{{range .Config.Env}}}}{{{{println .}}}}{{{{end}}}}' 2>/dev/null | grep -E '^RUN='")
+    rc, out = _ssh(
+        HEAD,
+        f"sudo docker inspect {TRAINER_CT} --format '{{{{range .Config.Env}}}}{{{{println .}}}}{{{{end}}}}' 2>/dev/null | grep -E '^RUN='",
+    )
     m = re.search(r"^RUN=(\S+)", out, re.M)
     if m:
         return m.group(1)
@@ -1054,7 +1141,9 @@ def tunnels() -> dict[int, str]:
         if len(p) == 2 and p[0].isdigit():
             res[int(p[0])] = p[1]
     ok = sum(1 for v in res.values() if v == "200")
-    print(f"tunnels {ok}/{len(res)} answering; bad: {[p for p, v in res.items() if v != '200']}")
+    print(
+        f"tunnels {ok}/{len(res)} answering; bad: {[p for p, v in res.items() if v != '200']}"
+    )
     return res
 
 
@@ -1062,7 +1151,9 @@ def engines() -> dict[str, EngineState]:
     """Probe both engines with a real 3-token completion."""
     s = status(quiet=True)
     for e in s.engines:
-        print(f"{e.host}: gen={e.gen_code} in {e.gen_ms} ms, running={e.running}, {e.throughput} tok/s")
+        print(
+            f"{e.host}: gen={e.gen_code} in {e.gen_ms} ms, running={e.running}, {e.throughput} tok/s"
+        )
     return {e.host: e for e in s.engines}
 
 
@@ -1072,7 +1163,11 @@ def alive(pattern: str, host: str = HEAD, log: str = "") -> bool:
     A process that runs but writes no new log line does not work, so pass
     `log` when the process has one.
     """
-    rc, out = _ssh(host, f"pgrep -f {json.dumps(_no_self_match(pattern))} | wc -l; " + (f"tail -1 {log} 2>/dev/null" if log else ""))
+    rc, out = _ssh(
+        host,
+        f"pgrep -f {json.dumps(_no_self_match(pattern))} | wc -l; "
+        + (f"tail -1 {log} 2>/dev/null" if log else ""),
+    )
     lines = out.strip().splitlines()
     n = int(lines[0]) if lines and lines[0].strip().isdigit() else 0
     running = n > 0
@@ -1109,7 +1204,9 @@ class RewardReport:
 
     def report(self) -> str:
         L = [f"=== reward for run {self.run} ({len(self.steps)} steps) ==="]
-        L.append(f"{'step':>5} {'effective':>10} {'all':>8} {'p10':>8} {'p90':>8} {'error':>7} {'time':>8}")
+        L.append(
+            f"{'step':>5} {'effective':>10} {'all':>8} {'p10':>8} {'p90':>8} {'error':>7} {'time':>8}"
+        )
         for i, st in enumerate(self.steps):
             L.append(
                 f"{st:>5} {self.effective[i]:10.4f} {self.all_scope[i]:8.4f} "
@@ -1117,8 +1214,12 @@ class RewardReport:
                 f"{self.error_rate[i] * 100:6.1f}% {self.step_seconds[i] / 60:7.1f}m"
             )
         L.append("")
-        L.append(f"effective reward: mean {self.mean:.4f}, standard deviation {self.std:.4f} across steps")
-        L.append(f"baseline {BASELINE_RUN}: standard deviation {BASELINE_STD:.4f} at batch 256 over 36 steps")
+        L.append(
+            f"effective reward: mean {self.mean:.4f}, standard deviation {self.std:.4f} across steps"
+        )
+        L.append(
+            f"baseline {BASELINE_RUN}: standard deviation {BASELINE_STD:.4f} at batch 256 over 36 steps"
+        )
         L.append(
             f"fit: {self.total_change:+.4f} over the window, residual spread {self.residual_std:.4f}, "
             f"threshold {TREND_SIGMA:g} x residual = {TREND_SIGMA * self.residual_std:.4f}"
@@ -1176,7 +1277,10 @@ def reward(run: str = "", quiet: bool = False) -> RewardReport:
                 candidate = parsed
         if candidate is not None:
             found.append(candidate)
-            if any(isinstance(row, dict) and row.get("eff") is not None for row in candidate):
+            if any(
+                isinstance(row, dict) and row.get("eff") is not None
+                for row in candidate
+            ):
                 rows = candidate
                 break
     if rows is None and found:
@@ -1208,7 +1312,11 @@ def reward(run: str = "", quiet: bool = False) -> RewardReport:
         xs = list(range(n))
         xbar, ybar = statistics.fmean(xs), rep.mean
         denom = sum((x - xbar) ** 2 for x in xs)
-        rep.slope = sum((x - xbar) * (v - ybar) for x, v in zip(xs, y)) / denom if denom else 0.0
+        rep.slope = (
+            sum((x - xbar) * (v - ybar) for x, v in zip(xs, y)) / denom
+            if denom
+            else 0.0
+        )
         rep.total_change = rep.slope * (n - 1)
         resid = [v - (ybar + rep.slope * (x - xbar)) for x, v in zip(xs, y)]
         rep.residual_std = statistics.stdev(resid) if n > 2 else 0.0
@@ -1317,13 +1425,15 @@ def repair(what: str) -> str:
         return _repair_engine(what.split(":", 1)[1])
     if what == "supervisors":
         return _repair_supervisors()
-    raise Refused(f"unknown repair {what!r}. Use tunnels, engine:<host>, or supervisors.")
+    raise Refused(
+        f"unknown repair {what!r}. Use tunnels, engine:<host>, or supervisors."
+    )
 
 
 def _repair_tunnels() -> str:
     rc, out = _ssh(
         HEAD,
-        f'k=0; for p in $(seq {TUNNEL_PORTS[0]} {TUNNEL_PORTS[-1]}); do '
+        f"k=0; for p in $(seq {TUNNEL_PORTS[0]} {TUNNEL_PORTS[-1]}); do "
         'c=$(curl -s -o /dev/null -m 6 -w "%{http_code}" http://127.0.0.1:$p/v1/models 2>/dev/null); '
         'if [ "$c" != "200" ]; then '
         'pid=$(sudo ss -H -lntp "sport = :$p" | sed -n "s/.*pid=\\([0-9][0-9]*\\).*/\\1/p" | head -1); '
@@ -1340,7 +1450,9 @@ def _repair_engine(host: str) -> str:
     _check_host(host)
     if host not in ENGINE_HOSTS:
         raise Refused(f"{host} is not an engine host. Use one of {ENGINE_HOSTS}.")
-    print(f"{host}: removing and restarting {ENGINE_CT}. The model load needs 5 to 10 minutes.")
+    print(
+        f"{host}: removing and restarting {ENGINE_CT}. The model load needs 5 to 10 minutes."
+    )
     rc, out = _ssh(
         host,
         f"sudo docker rm -f {ENGINE_CT} >/dev/null 2>&1; "
@@ -1369,11 +1481,16 @@ def _repair_supervisors() -> str:
             out.append(f"{pat} already runs")
     for h in ENGINE_HOSTS:
         if not alive("bash .*engine_watchdog.sh", h):
-            _ssh(h, f"nohup setsid bash {DEPLOY}/scripts/h200/engine_watchdog.sh >> /root/engine_watchdog.log 2>&1 </dev/null & disown")
+            _ssh(
+                h,
+                f"nohup setsid bash {DEPLOY}/scripts/h200/engine_watchdog.sh >> /root/engine_watchdog.log 2>&1 </dev/null & disown",
+            )
             out.append(f"restarted engine watchdog on {h}")
     msg = "; ".join(out)
     print(msg)
-    print("The run supervisor needs RUN, RUN_NAME, and CONFIG_TAG. Start it with start(run, mode='restart').")
+    print(
+        "The run supervisor needs RUN, RUN_NAME, and CONFIG_TAG. Start it with start(run, mode='restart')."
+    )
     return msg
 
 
@@ -1427,8 +1544,14 @@ def deploy(path: str, nodes: list[str] | None = None) -> bool:
     remote_mode = "0755" if local.stat().st_mode & 0o111 else "0644"
 
     def one(h):
-        subprocess.run(_SSH + [h, f"mkdir -p {str(Path(remote).parent)}"], capture_output=True)
-        p = subprocess.run(["scp", "-q", "-o", "BatchMode=yes", str(local), f"{h}:{remote}"], capture_output=True, text=True)
+        subprocess.run(
+            _SSH + [h, f"mkdir -p {str(Path(remote).parent)}"], capture_output=True
+        )
+        p = subprocess.run(
+            ["scp", "-q", "-o", "BatchMode=yes", str(local), f"{h}:{remote}"],
+            capture_output=True,
+            text=True,
+        )
         if p.returncode:
             return "scp failed"
         rc, out = _ssh(h, f"chmod {remote_mode} {shlex.quote(remote)}")
@@ -1439,20 +1562,32 @@ def deploy(path: str, nodes: list[str] | None = None) -> bool:
 
     res = _fan(nodes, one)
     bad = [h for h, v in res.items() if v != "ok"]
-    print(f"{path} -> {len(nodes) - len(bad)}/{len(nodes)} nodes" + (f", FAILED {bad}" if bad else ""))
+    print(
+        f"{path} -> {len(nodes) - len(bad)}/{len(nodes)} nodes"
+        + (f", FAILED {bad}" if bad else "")
+    )
     if not bad:
         if path.startswith(("source/", "env/")) or path.endswith("cluster.sh"):
             # Imported or mounted at container launch, so a running container
             # keeps the old module until it is recreated.
-            print("The running container still holds the old file. Recreate that container for this to take effect.")
+            print(
+                "The running container still holds the old file. Recreate that container for this to take effect."
+            )
         else:
             # Host-side scripts are read at each launch, so only long-lived
             # loops (the watchdogs, the supervisor) need restarting.
-            print("This runs on the host. Restart the process only if it is a long-running loop.")
+            print(
+                "This runs on the host. Restart the process only if it is a long-running loop."
+            )
     return not bad
 
 
-def start(run: str, mode: str = "cold", nodes: list[str] | None = None, supervisors: bool = True) -> None:
+def start(
+    run: str,
+    mode: str = "cold",
+    nodes: list[str] | None = None,
+    supervisors: bool = True,
+) -> None:
     """Start a run. `mode` is "cold" for a new run name or "restart" for an existing one.
 
     The two modes start the trainer and the orchestrator in opposite order, and
@@ -1473,11 +1608,20 @@ def start(run: str, mode: str = "cold", nodes: list[str] | None = None, supervis
     trainer_nodes = " ".join(n.lstrip("n") for n in nodes)
     # PRIME_BATCH_CACHE is never forwarded. A value leaking in from the shell
     # would replay one frozen batch for every step while the run looked healthy.
-    env = f"TRAINER_NODES='{trainer_nodes}' RUN={run} RUN_NAME={name} CONFIG_TAG={tag} PRIME_EP_PROFILE=0 PRIME_EP_AC_CACHE=0"
+    env = (
+        f"TRAINER_NODES='{trainer_nodes}' RUN={run} RUN_NAME={name} "
+        f"CONFIG_TAG={tag} PRIME_EP_PROFILE=0 PRIME_EP_AC_CACHE=0 "
+        "PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD=1"
+    )
 
     def launch_trainer():
         print(f"starting trainer on {len(nodes)} nodes")
-        _fan(nodes, lambda h: _ssh(h, f"{env} bash {CLUSTER} trainer >/dev/null 2>&1; echo done", 300))
+        _fan(
+            nodes,
+            lambda h: _ssh(
+                h, f"{env} bash {CLUSTER} trainer >/dev/null 2>&1; echo done", 300
+            ),
+        )
 
     def launch_orch():
         print(f"starting edge orchestrator on {EDGE_ORCH}")
@@ -1497,7 +1641,13 @@ def start(run: str, mode: str = "cold", nodes: list[str] | None = None, supervis
         f"sudo docker rm -f {ORCH_CT} >/dev/null 2>&1; echo done",
     )
     _ssh(HEAD, f"sudo docker rm -f {ORCH_CT} >/dev/null 2>&1; echo done")
-    _fan(nodes, lambda h: _ssh(h, f"sudo pkill -9 -f PRIME-RL 2>/dev/null; sudo docker rm -f {TRAINER_CT} >/dev/null 2>&1; echo done"))
+    _fan(
+        nodes,
+        lambda h: _ssh(
+            h,
+            f"sudo pkill -9 -f PRIME-RL 2>/dev/null; sudo docker rm -f {TRAINER_CT} >/dev/null 2>&1; echo done",
+        ),
+    )
     time.sleep(20)  # let the host mirror of device memory drain before reloading
 
     if mode == "cold":
@@ -1537,7 +1687,10 @@ def start(run: str, mode: str = "cold", nodes: list[str] | None = None, supervis
 
 def stop() -> None:
     """Stop the edge orchestrator, then the trainer. Supervisors stop first."""
-    _ssh(HEAD, "pkill -f 'bash .*[r]un_supervisor.sh'; pkill -f 'bash .*[t]unnel_watchdog.sh'; echo done")
+    _ssh(
+        HEAD,
+        "pkill -f 'bash .*[r]un_supervisor.sh'; pkill -f 'bash .*[t]unnel_watchdog.sh'; echo done",
+    )
     _ssh(
         EDGE_ORCH,
         f"pkill -f '[s]ync_rollout_batches.sh' 2>/dev/null; "
@@ -1545,8 +1698,16 @@ def stop() -> None:
     )
     # Remove a legacy n82 container if one exists, but never start one there.
     _ssh(HEAD, f"sudo docker rm -f {ORCH_CT} >/dev/null 2>&1; echo done")
-    _fan(TRAINER_NODES, lambda h: _ssh(h, f"sudo pkill -9 -f PRIME-RL 2>/dev/null; sudo docker rm -f {TRAINER_CT} >/dev/null 2>&1; echo done"))
-    print("stopped supervisors, edge orchestrator, and trainer. The engines are still running.")
+    _fan(
+        TRAINER_NODES,
+        lambda h: _ssh(
+            h,
+            f"sudo pkill -9 -f PRIME-RL 2>/dev/null; sudo docker rm -f {TRAINER_CT} >/dev/null 2>&1; echo done",
+        ),
+    )
+    print(
+        "stopped supervisors, edge orchestrator, and trainer. The engines are still running."
+    )
 
 
 # ------------------------------------------------------------------ entry

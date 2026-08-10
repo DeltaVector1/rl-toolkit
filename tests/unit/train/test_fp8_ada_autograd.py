@@ -341,9 +341,7 @@ class FP8AdaAutogradTest(unittest.TestCase):
         weight = torch.randn(5, 4)
         scale = torch.ones(1, 1)
         original_linear = fp8_ada._linear
-        fp8_ada._linear = lambda value, raw_weight, _scale: F.linear(
-            value, raw_weight
-        )
+        fp8_ada._linear = lambda value, raw_weight, _scale: F.linear(value, raw_weight)
         try:
             fp8_ada._Linear.apply(x, weight, scale, "probe.no_grad", None)
         finally:
@@ -541,9 +539,7 @@ class FP8AdaAutogradTest(unittest.TestCase):
 
         ref_value = value.detach().clone().requires_grad_()
         ref_scores = scores.detach().clone().requires_grad_()
-        expected = (
-            ref_value.float() * ref_scores.reshape(-1, 1)
-        ).to(ref_value.dtype)
+        expected = (ref_value.float() * ref_scores.reshape(-1, 1)).to(ref_value.dtype)
         expected.backward(upstream)
 
         torch.testing.assert_close(got, expected, rtol=0, atol=0)
@@ -609,6 +605,21 @@ class FP8AdaAutogradTest(unittest.TestCase):
 
         self.assertEqual(got, (weight1, weight2))
         self.assertEqual(calls, {"prepare": 1, "quantize": 1, "dispatch": 2})
+
+    def test_expert_chunk_offsets_preserve_expert_row_counts(self):
+        offsets = torch.tensor([5, 9, 16], dtype=torch.int32)
+        torch.testing.assert_close(
+            fp8_ada._expert_chunk_offsets(offsets, 0, 7),
+            torch.tensor([5, 7, 7], dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            fp8_ada._expert_chunk_offsets(offsets, 7, 13),
+            torch.tensor([0, 2, 6], dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            fp8_ada._expert_chunk_offsets(offsets, 13, 16),
+            torch.tensor([0, 0, 3], dtype=torch.int32),
+        )
 
     def test_grouped_w2_chunking_preserves_expert_rows_and_padding(self):
         torch.manual_seed(23)
@@ -747,9 +758,7 @@ class FP8AdaAutogradTest(unittest.TestCase):
                 torch.tensor([0, 5, 8]),
             )
 
-        def fake_apply(
-            permuted_x, _w1, _s1, _w2, _s2, _w3, _s3, offsets, _owner
-        ):
+        def fake_apply(permuted_x, _w1, _s1, _w2, _s2, _w3, _s3, offsets, _owner):
             captured["x"] = permuted_x.clone()
             captured["offsets"] = offsets.clone()
             return permuted_x.mul(2)

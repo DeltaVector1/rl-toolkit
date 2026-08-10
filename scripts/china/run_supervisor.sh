@@ -28,8 +28,9 @@ while true; do
     declare -A launches
     for h in $NODES; do
       ( ssh -o BatchMode=yes -o ConnectTimeout=30 "$h" \
-          "TRAINER_NODES='$TRAINER_NODES' RUN=$RUN RUN_NAME=$RUN_NAME CONFIG_TAG=$TAG \
-           PRIME_EP_PROFILE=0 PRIME_EP_AC_CACHE=0 bash $CLUSTER trainer" ) \
+        "TRAINER_NODES='$TRAINER_NODES' RUN=$RUN RUN_NAME=$RUN_NAME CONFIG_TAG=$TAG \
+           PRIME_EP_PROFILE=0 PRIME_EP_AC_CACHE=0 \
+           PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD=1 bash $CLUSTER trainer" ) \
           >>"/data/glm52-rl/run-supervisor-$h.log" 2>&1 &
       launches[$h]=$!
     done
