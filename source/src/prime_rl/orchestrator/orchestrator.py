@@ -107,6 +107,31 @@ SHUTDOWN_TIMEOUT_S = 300
 # dataset; fail loudly instead of spinning
 MAX_CONSECUTIVE_EMPTY_BATCHES = 10
 
+# Keep one complete GRPO group beyond the exact batch target. It carries into
+# the next batch and prevents one long-tail member of the last group from
+# holding an otherwise complete batch. No rollout is selected or dropped.
+# Keep several independent groups open at the tail. One spare still made x72p
+# wait for the slowest few requests in two partially complete groups at step 3.
+# Eight spares fill the existing 128-request cap initially. Four spares still
+# left x72p rollout 31 at 1008/1024 behind one long member while 69 other
+# incomplete members were buffered. Eight spares improved rollout 33 to 17m35s,
+# but rollout 34 fell to 20 live requests with 135 members spread across open
+# groups. Sixteen spares let freed request slots open more groups without
+# changing the 128-request cap. A clean follow-up reached 880/1024 with 317
+# buffered members and only 75 live; the 256-row allowance had eight credits
+# left, less than one group, so fresh groups closed again. Thirty-two groups
+# bound the measured partial-group backlog while the independent dispatcher
+# limiter still enforces 128 actual in-flight requests. Completed overflow
+# carries into the next batch; trainer batch and GRPO group sizes do not change.
+ROLLOUT_TAIL_SPARE_GROUPS = 32
+
+# A staged adapter applies at a train-batch boundary when the collecting batch
+# is still inside the configured off-policy limit. An in-flight update restarted
+# 19 complete GRPO groups during x72p rollout 22 and increased collection from
+# 15 minutes to 35 minutes. Let the valid old-policy batch finish instead. The
+# timeout keeps a genuinely wedged batch from holding an update indefinitely.
+POLICY_UPDATE_BATCH_WAIT_TIMEOUT_S = 1200
+
 # Default wait for the trainer's startup weight broadcast when no ckpt block
 # configures ``wait_for_weights_timeout`` (e.g. a from-scratch run). The
 # broadcast is always coming, so wait rather than fail immediately.
@@ -181,6 +206,9 @@ class Orchestrator:
         self.gate_closed_at = None
         # Pulsed by the version hooks so a held ship can re-check ``policy.version``
         self.version_advanced = asyncio.Event()
+        # Pulsed after a train batch advances ``progress.step``. The watcher
+        # uses it for a bounded policy update at the train-batch boundary.
+        self.batch_completed = asyncio.Event()
         self.wait_for_policy_time = 0.0
         self.component_tasks = []
 
@@ -457,7 +485,11 @@ class Orchestrator:
             config,
             policy=self.policy,
             inference=self.policy_inference,
-            observers=[self.dispatcher, self],
+            # The orchestrator gets the boundary hook first. It leaves fresh
+            # scheduling enabled while the current batch finishes. The
+            # dispatcher then drains only the small overflow at the boundary
+            # before the adapter load.
+            observers=[self, self.dispatcher],
             lora_name=self.lora_name,
             ckpt_step=self.policy.version,
             model_express=self.model_express,
@@ -502,6 +534,12 @@ class Orchestrator:
         # monitor each ``log.interval`` seconds for the pipeline-view log
         self.lag_task = asyncio.create_task(self.lag_monitor.run(), name="event_loop_lag")
         await self.periodic_logger.start()
+        # On resume, an immutable trainer checkpoint can be newer than the
+        # policy currently loaded by the engines. Close scheduling before the
+        # dispatcher task exists, so it cannot fill 128 requests in the race
+        # before WeightWatcher.on_version_pending starts the drain.
+        if self.watcher.compute_next_ckpt_step() > self.watcher.ckpt_step:
+            self.dispatcher.weight_update_pending = True
         self.component_tasks = [
             asyncio.create_task(self.dispatcher.start(), name="dispatcher"),
             asyncio.create_task(self.watcher.start(), name="watcher"),
@@ -562,6 +600,9 @@ class Orchestrator:
             # Train rollouts belong to the batch window currently collecting (``progress.step``),
             # eval rollouts to the step whose eval triggered them.
             kind = episode[0].kind
+            if self.dispatcher.is_abandoned_group(episode[0].group_id):
+                self.dispatcher.mark_episode_consumed(kind)
+                continue
             step = episode[0].eval_step if kind == "eval" else self.progress.step
             assert step is not None
             run: vf.RunInfo = (
@@ -686,6 +727,7 @@ class Orchestrator:
 
         await self.sender.send(TrainingBatch(examples=batch.samples, step=step))
         self.progress.step += 1
+        self.batch_completed.set()
         self.train_sink.advance_training_policy_version(self.progress.step - 1)
         self.update_dispatch_gate()
         # Checkpoint the step we just shipped (resume point: continue at step + 1).
@@ -970,7 +1012,12 @@ class Orchestrator:
             + self.dispatcher.pending_train_schedule_count
         )
         buffered = self.train_sink.buffered_count()
-        budget = self.config.batch_size - current - buffered - live
+        group = max(1, getattr(self.config, "group_size", 1))
+        # The spare is normal full-group overflow for the next step. It removes
+        # the exact-batch barrier that held x71p step 8 at 1008 + 15 buffered
+        # while one long-tail request finished.
+        spare = group * ROLLOUT_TAIL_SPARE_GROUPS
+        budget = self.config.batch_size + spare - current - buffered - live
         # Rollouts buffered in a partial group cannot finish once nothing is in
         # flight to finish them: their group-mates were dropped by a filter
         # (zero-advantage groups are enforced) or lost. Counting them against
@@ -980,7 +1027,6 @@ class Orchestrator:
         # still short, ignore the stuck buffer and open fresh groups. Guarded on
         # current > 0 so the normal post-ship path (current == 0, buffer carried
         # into the next batch) keeps its existing behaviour.
-        group = max(1, getattr(self.config, "group_size", 1))
         # Fires whenever the pipeline is drained and the budget cannot open a
         # whole group. Includes current == 0 with a buffer full of orphans:
         # over hundreds of steps dropped group-mates accumulate until
@@ -1044,7 +1090,66 @@ class Orchestrator:
         ``policy.version`` already carries the new version, so wake a held ship."""
         if self.model_express is not None:
             await asyncio.to_thread(self.model_express.set_status, p2p_pb2.SOURCE_STATUS_READY)
+        restarted = self.dispatcher.restarted_group_ids(step)
+        if restarted:
+            discarded = self.train_sink.abandon_groups(restarted)
+            get_logger().info(
+                f"Policy v{step}: removed {discarded} buffered rollout episode(s) from "
+                f"{len(restarted)} restarted GRPO group(s)"
+            )
+            self.update_rollout_budget()
         self.version_advanced.set()
+
+    async def wait_for_policy_update_boundary(self, step: int) -> None:
+        """Let the collecting train batch ship before invalidating groups.
+
+        The adapter is already present on every inference host when this hook
+        runs. Defer only when the current policy is recent enough to ship the
+        batch under the configured off-policy limit. The dispatcher continues
+        to schedule old-policy groups during this wait. Otherwise the batch
+        could wait for the same update and deadlock.
+        """
+        if self.config.batch_size is None or self.config.max_off_policy_steps < 1:
+            return
+        current, target, _ = self.train_sink.batch_progress()
+        # There is no accepted batch work to preserve at zero progress. Apply
+        # the staged policy now. Waiting here can consume the full tail timeout
+        # and then restart the same incomplete groups after the batch grows.
+        if current == 0:
+            return
+        if (
+            self.dispatcher.inflight_train_count
+            + self.dispatcher.pending_train_schedule_count
+            + self.dispatcher.queued_train_count
+            == 0
+        ):
+            return
+
+        collecting_step = self.progress.step
+        required_version = collecting_step - 1 - self.config.max_off_policy_steps
+        if self.policy.version < required_version:
+            return
+
+        get_logger().info(
+            f"Policy v{step}: deferring the group boundary at {current}/{target} "
+            f"until rollout batch {collecting_step} ships (maximum "
+            f"{POLICY_UPDATE_BATCH_WAIT_TIMEOUT_S}s)"
+        )
+        self.batch_completed.clear()
+        # Avoid losing a completion that raced the clear above.
+        if self.progress.step != collecting_step or self.stopped.is_set():
+            return
+        try:
+            await asyncio.wait_for(
+                self.batch_completed.wait(), timeout=POLICY_UPDATE_BATCH_WAIT_TIMEOUT_S
+            )
+        except asyncio.TimeoutError:
+            get_logger().warning(
+                f"Policy v{step}: rollout batch {collecting_step} did not finish during the "
+                "bounded tail deferral; applying the policy update now"
+            )
+        else:
+            self.dispatcher.mark_batch_boundary_complete(step)
 
     async def on_new_version(self, step: int) -> None:
         """``VersionObserver`` hook: the weight update completed;
@@ -1057,6 +1162,8 @@ class Orchestrator:
         """Bounded best-effort teardown of all components. Has a global
         timeout so a wedged peer can't keep the process alive forever —
         training artifacts are already persisted before this is reached."""
+
+        self.batch_completed.set()
 
         async def teardown() -> None:
             if self.sender is not None:

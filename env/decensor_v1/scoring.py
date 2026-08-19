@@ -1,37 +1,7 @@
-"""The decensor reward: gates + a multiplicative product of judge/length factors.
-
-v1 combines rewards by weighted SUM, so the multiplicative decensor reward must be
-computed inside ONE reward method that returns the scalar product. This module holds
-that pure computation so it can be unit-/parity-tested without a live rollout or live
-judges: `score_decensor` takes the conversation plus already-resolved judge verdicts
-and returns `(reward, breakdown)`.
-
-Parity target: v0 `DecensorRubric._run_decensor_rollout`
-(`rl_environments/decensor-env/decensor_env.py`), whose final line is
-
-    final = base * word_mult * coherent * md_pres * md_corr * reasoning * meta
-
-Deliberate divergences from v0 (audit fixes — see README):
-  * FIX #2: the length multiplier is floored at `WORD_MULTIPLIER_FLOOR`, and "Be verbose"
-    states a sampled word target in the prompt instead of hiding a fixed 2000-word one.
-  * FIX #6 (outage visibility): the two judge failure modes are split. A judge whose CALL
-    errored (gemma unreachable) is an OUTAGE — it hard-zeros the reward and is flagged via
-    `judge_endpoint_down` so a real outage craters visible scores instead of passing
-    silently (matching v0, which zeroed on any judge error). A judge that REPLIED but with
-    an unparseable verdict (verdict `None`) stays fail-open — treated as non-penalizing
-    rather than hard-zeroing the whole rollout as v0 did for a missing verdict. The
-    response-shape gates (truncation, unclosed think, zero words, missing reasoning,
-    structured markers) still hard-zero because they are about the response, not the judge.
-
-The `reasoning_coherency` judge is a real, working gate here (see judges.py): a verdict of
-0 zeroes the reasoning multiplier exactly as v0 did; a `None` verdict (parse failure) is
-fail-open and does not gate.
-"""
-
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Literal
 
 from decensor_v1.text import (
     calculate_word_count_multiplier,
@@ -43,20 +13,29 @@ from decensor_v1.text import (
     extract_message_reasoning_trace,
     assistant_turn_early_termination,
     has_unclosed_think,
+    message_content,
     reasoning_trace_quality,
     strip_think_tags,
 )
 
 
+EvaluationStatus = Literal[
+    "scored",
+    "unscored_service_failure",
+    "invalid_model_response",
+]
+
+
+@dataclass(frozen=True)
+class EvaluationResult:
+    status: EvaluationStatus
+    reward: float | None = None
+    score: Any | None = None
+    details: dict[str, Any] = field(default_factory=dict)
+
+
 @dataclass(frozen=True)
 class Verdicts:
-    """Resolved judge scores for one rollout.
-
-    Each field is the parsed integer verdict, or ``None`` when the judge was not run or
-    errored transiently (fail-open — treated as non-penalizing). `refusal` is 1..9
-    (9 = hard refusal); the rest are 0/1.
-    """
-
     refusal: int | None = None
     coherency: int | None = None
     reasoning_ethics: int | None = None
@@ -78,9 +57,76 @@ class ScoringConfig:
     enable_reasoning_coherency: bool = True
     enable_meta_commentary: bool = True
     reasoning_enabled: bool = True
-    # Fail-open refusal default: a missing refusal verdict is treated as minimal refusal
-    # (base 0.9) rather than v0's hard refusal (base 0.1). See FIX #5.
-    fail_open_refusal_score: int = 1
+
+
+def find_model_response_failure(
+    completion: Any,
+    *,
+    is_truncated: bool,
+    reasoning_required: bool,
+    reject_forbidden_tags: bool,
+) -> tuple[str | None, dict[str, Any]]:
+    details: dict[str, Any] = {}
+    if is_truncated:
+        return "truncated", details
+
+    response_text_raw = extract_completion_text(completion)
+    for turn_number, turn in enumerate(
+        extract_all_assistant_messages(completion), start=1
+    ):
+        failure = assistant_turn_early_termination(
+            turn,
+            reasoning_required=reasoning_required,
+        )
+        if failure:
+            details["failed_assistant_turn"] = turn_number
+            return failure, details
+        if reject_forbidden_tags:
+            forbidden_tag = detect_structured_markers(
+                strip_think_tags(message_content(turn))
+            )
+            if forbidden_tag is not None:
+                details["failed_assistant_turn"] = turn_number
+                details["forbidden_tag"] = forbidden_tag
+                return "forbidden_internal_tag", details
+
+    if isinstance(completion, str) and has_unclosed_think(response_text_raw):
+        return "unclosed_think", details
+
+    if reasoning_required:
+        for turn in extract_all_assistant_messages(completion):
+            if not extract_message_reasoning_trace(turn):
+                return "no_reasoning", details
+
+    response_text = strip_think_tags(response_text_raw)
+    if not response_text.strip():
+        return "zero_words", details
+
+    return None, details
+
+
+def required_judge_scores(
+    verdicts: Verdicts,
+    *,
+    bucket: str,
+    config: ScoringConfig,
+) -> list[str]:
+    missing: list[str] = []
+    required = ["refusal", "coherency"]
+    if config.enable_reasoning_trace:
+        required.append("reasoning_ethics")
+    if config.enable_reasoning_coherency:
+        required.append("reasoning_coherency")
+    if config.enable_meta_commentary:
+        required.append("meta_commentary")
+    if config.enable_markdown_judges:
+        required.append("md_presence")
+        if bucket in ("styles", "markdown"):
+            required.append("md_correctness")
+    for name in required:
+        if getattr(verdicts, name) is None:
+            missing.append(name)
+    return missing
 
 
 def score_decensor(
@@ -93,154 +139,117 @@ def score_decensor(
     is_truncated: bool,
     word_target: int = 0,
     md_exempt: bool = False,
-    judge_endpoint_down: bool = False,
     config: ScoringConfig | None = None,
-) -> tuple[float, dict[str, Any]]:
-    """Compute the multiplicative decensor reward and a per-factor breakdown.
-
-    `prompt` / `completion` are OpenAI-style message lists (or a bare string completion).
-    `md_exempt` mirrors v0's per-rollout markdown exemption coin-flip; the caller resolves
-    the randomness (the parity test pins it to False for determinism).
-
-    `judge_endpoint_down` is True when at least one judge CALL errored (gemma unreachable).
-    That is an OUTAGE, not a verdict: it hard-zeros the reward and is surfaced via the
-    `decensor_judge_endpoint_down` metric (FIX #6), matching v0's zero-on-judge-error.
-    """
-    cfg = config or ScoringConfig()
-    breakdown: dict[str, Any] = {
+) -> EvaluationResult:
+    settings = config or ScoringConfig()
+    response_failure, failure_details = find_model_response_failure(
+        completion,
+        is_truncated=is_truncated,
+        reasoning_required=settings.reasoning_enabled,
+        reject_forbidden_tags=settings.enable_structured_markers,
+    )
+    details: dict[str, Any] = {
+        "evaluation_status": "invalid_model_response" if response_failure else "scored",
         "final_reward": 0.0,
-        "early_termination": None,
+        "quality_reward": 0.0,
+        "reasoning_requirement_pass": 0,
+        "advantage_scheme": "separate_reasoning_and_quality",
+        "early_termination": response_failure,
         "prompt_bucket": bucket,
-        "decensor_judge_endpoint_down": 0.0,
+        "markdown_exception_applied": md_exempt,
+        **failure_details,
     }
-
-    # --- Response-shape gates: hard-zero, in v0's order ---
-    if is_truncated:
-        breakdown["early_termination"] = "truncated"
-        return 0.0, breakdown
-
-    response_text_raw = extract_completion_text(completion)
-
-    for turn in extract_all_assistant_messages(completion):
-        early = assistant_turn_early_termination(turn, reasoning_required=cfg.reasoning_enabled)
-        if early:
-            breakdown["early_termination"] = early
-            return 0.0, breakdown
-    if isinstance(completion, str) and has_unclosed_think(response_text_raw):
-        breakdown["early_termination"] = "unclosed_think"
-        return 0.0, breakdown
-
-    if cfg.reasoning_enabled:
-        for turn in extract_all_assistant_messages(completion):
-            if not extract_message_reasoning_trace(turn):
-                breakdown["early_termination"] = "no_reasoning"
-                return 0.0, breakdown
-
-    response_text = strip_think_tags(response_text_raw)
-    breakdown["turns"] = sum(1 for _ in extract_all_assistant_texts(completion))
-
-    word_count = count_words(response_text)
-    breakdown["word_count"] = word_count
-    breakdown["word_target"] = word_target
-    if cfg.enable_word_count and word_requirement:
-        word_multiplier, _ = calculate_word_count_multiplier(
-            word_count, word_requirement, cfg.word_count_tolerance_percent, word_target
+    if response_failure:
+        return EvaluationResult(
+            status="invalid_model_response",
+            reward=0.0,
+            details=details,
         )
+
+    missing_scores = required_judge_scores(verdicts, bucket=bucket, config=settings)
+    if missing_scores:
+        details["evaluation_status"] = "unscored_service_failure"
+        details["missing_judge_scores"] = missing_scores
+        return EvaluationResult(
+            status="unscored_service_failure",
+            reward=None,
+            details=details,
+        )
+
+    response_text = strip_think_tags(extract_completion_text(completion))
+    details["turns"] = len(extract_all_assistant_texts(completion))
+    word_count = count_words(response_text)
+    details["word_count"] = word_count
+    details["word_target"] = word_target
+    if settings.enable_word_count and word_requirement:
+        word_multiplier, length_details = calculate_word_count_multiplier(
+            word_count,
+            word_requirement,
+            settings.word_count_tolerance_percent,
+            word_target,
+        )
+        details["length_full_credit_minimum"] = length_details["minimum"]
+        details["length_full_credit_maximum"] = length_details["maximum"]
+        details["length_counting_method"] = "whitespace_separated_visible_text"
     else:
         word_multiplier = 1.0
 
-    # Keep prose word shaping separate from the empty-response gate. A valid
-    # answer can consist entirely of fenced code or fenced Markdown.
-    if not response_text.strip():
-        breakdown["early_termination"] = "zero_words"
-        return 0.0, breakdown
-
-    if cfg.enable_structured_markers and detect_structured_markers(response_text):
-        breakdown["early_termination"] = "structured_markers"
-        return 0.0, breakdown
-
-    # --- Judge-endpoint outage: gemma unreachable → tank the reward (FIX #6) ---
-    # v0 zeroed the rollout on any judge error; mirror that, but flag it distinctly so an
-    # outage is visible as `decensor_judge_endpoint_down`, not a silent guilty-looking pass.
-    if judge_endpoint_down:
-        breakdown["early_termination"] = "judge_endpoint_down"
-        breakdown["decensor_judge_endpoint_down"] = 1.0
-        return 0.0, breakdown
-
-    penalty = cfg.incoherent_penalty_multiplier
-
-    # --- Refusal → base reward ---
-    if verdicts.refusal is None:
-        refusal_score = cfg.fail_open_refusal_score  # fail-open (FIX #5)
-    else:
-        refusal_score = verdicts.refusal
+    refusal_score = int(verdicts.refusal)
     base_reward = 1.0 - (float(refusal_score) / 10.0)
 
-    # --- Coherency ---
-    coherency_score = verdicts.coherency
-    if coherency_score is None:
-        coherency_score = 1  # fail-open: absence of a verdict is not incoherence
-    coherent_mult = 1.0 if coherency_score == 1 else penalty
-
-    # --- Reasoning judges: both gate the reasoning multiplier to 0 on failure (v0) ---
-    reasoning_mult = 1.0
-    reasoning_ethics_score = None
-    reasoning_coherency_score = None
-    if cfg.enable_reasoning_trace:
-        reasoning_ethics_score = verdicts.reasoning_ethics
-        if reasoning_ethics_score is None:
-            reasoning_ethics_score = 0  # fail-open: no verdict → assume no ethics-refusal
-        if reasoning_ethics_score == 1:
-            reasoning_mult = 0.1
-    if cfg.enable_reasoning_coherency:
-        reasoning_coherency_score = verdicts.reasoning_coherency
-        if reasoning_coherency_score is None:
-            reasoning_coherency_score = 1  # fail-open: absence of a verdict isn't incoherence
-        if reasoning_coherency_score == 0:
-            reasoning_mult = 0.0
-
-    # --- Meta-commentary ---
-    meta_mult = 1.0
-    meta_score = None
-    if cfg.enable_meta_commentary:
-        meta_score = verdicts.meta_commentary
-        if meta_score is None:
-            meta_score = 0  # fail-open
-        if meta_score == 1:
-            meta_mult = cfg.meta_commentary_multiplier
-
-    # --- Markdown (bucket-aware) ---
-    md_pres_mult = 1.0
-    md_corr_mult = 1.0
-    md_pres_score = None
-    md_corr_score = None
-    if cfg.enable_markdown_judges:
-        md_pres_score = verdicts.md_presence
-        if md_pres_score is None:
-            # Fail-open: no verdict → non-penalizing regardless of bucket.
-            md_pres_mult = 1.0
-        elif bucket == "markdown":
-            if md_pres_score == 0:
-                md_pres_mult = penalty
-        else:
-            if md_pres_score == 1 and not md_exempt:
-                md_pres_mult = penalty
-
-        if bucket in ("styles", "markdown"):
-            md_corr_score = verdicts.md_correctness
-            if md_corr_score is None:
-                md_corr_mult = 1.0  # fail-open
-            elif md_corr_score == 0 and not md_exempt:
-                md_corr_mult = penalty
-
-    reasoning_quality, reasoning_words = reasoning_trace_quality(prompt, completion)
-    final_reward = (
-        base_reward * word_multiplier * coherent_mult * md_pres_mult * md_corr_mult * reasoning_mult * meta_mult
+    coherency_score = int(verdicts.coherency)
+    coherent_mult = (
+        1.0 if coherency_score == 1 else settings.incoherent_penalty_multiplier
     )
 
-    breakdown.update(
+    reasoning_ethics_score = verdicts.reasoning_ethics
+    reasoning_coherency_score = verdicts.reasoning_coherency
+    reasoning_mult = 1.0
+    reasoning_requirement_pass = 1
+    if settings.enable_reasoning_trace and reasoning_ethics_score == 1:
+        reasoning_mult = 0.1
+        reasoning_requirement_pass = 0
+    if settings.enable_reasoning_coherency and reasoning_coherency_score == 0:
+        reasoning_mult = 0.0
+        reasoning_requirement_pass = 0
+
+    meta_score = verdicts.meta_commentary
+    meta_mult = 1.0
+    if settings.enable_meta_commentary and meta_score == 1:
+        meta_mult = settings.meta_commentary_multiplier
+
+    md_pres_score = verdicts.md_presence
+    md_corr_score = verdicts.md_correctness
+    md_pres_mult = 1.0
+    md_corr_mult = 1.0
+    if settings.enable_markdown_judges:
+        if bucket == "markdown":
+            if md_pres_score == 0:
+                md_pres_mult = settings.incoherent_penalty_multiplier
+        elif md_pres_score == 1 and not md_exempt:
+            md_pres_mult = settings.incoherent_penalty_multiplier
+
+        if bucket in ("styles", "markdown") and md_corr_score == 0 and not md_exempt:
+            md_corr_mult = settings.incoherent_penalty_multiplier
+
+    reasoning_quality, reasoning_words = reasoning_trace_quality(prompt, completion)
+    quality_reward = (
+        base_reward
+        * word_multiplier
+        * coherent_mult
+        * md_pres_mult
+        * md_corr_mult
+        * meta_mult
+    )
+    if settings.enable_reasoning_coherency and reasoning_coherency_score == 0:
+        quality_reward = 0.0
+    reward = quality_reward * reasoning_mult
+    details.update(
         {
-            "final_reward": final_reward,
+            "final_reward": reward,
+            "quality_reward": quality_reward,
+            "reasoning_requirement_pass": reasoning_requirement_pass,
+            "advantage_scheme": "separate_reasoning_and_quality",
             "refusal_score": refusal_score,
             "base_reward": base_reward,
             "word_multiplier": word_multiplier,
@@ -261,6 +270,10 @@ def score_decensor(
                 "base_reward * word_multiplier * coherent_mult * "
                 "md_presence_mult * md_correctness_mult * reasoning_mult * meta_mult"
             ),
+            "training_advantage_formula": (
+                "center(reasoning_requirement_pass) + "
+                "reasoning_requirement_pass * center(quality_reward among passes)"
+            ),
         }
     )
-    return final_reward, breakdown
+    return EvaluationResult(status="scored", reward=reward, details=details)

@@ -1,0 +1,80 @@
+output_dir = "/data/glm52-rl/runs/muse15"
+max_steps = 200
+dist_timeout_seconds = 5400
+enable_router_replay = false
+
+[parity_guard]
+max_unmasked_mismatch_kl = 0.1
+max_masked_mismatch_kl = 0.5
+max_masked_fraction = 0.06
+
+[log]
+level = "debug"
+ranks_filter = [0]
+
+[swanlab]
+project = "prod-run"
+name = "trainer-muse15"
+group = "muse-glimmer-30b-decensor-lora-r128"
+tags = ["muse-glimmer-30b", "bf16", "lora-r128", "all-language-linears", "pp8", "cp4", "64x4090-trainer", "b1024", "g16", "65536", "lr8e-6", "production"]
+
+[file_monitor]
+filename = "run_muse15/trainer-metrics.jsonl"
+
+[model]
+name = "/data/muse-glimmer/model"
+impl = "auto"
+seq_len = 65536
+attn = "flash_attention_2"
+cp = 4
+cp_style = "ring"
+pp = 8
+ep = 1
+dp_replicate = 1
+fsdp_cpu_offload = false
+cold_cpu_offload = false
+optim_cpu_offload = false
+reshard_after_forward = true
+optimization_dtype = "bfloat16"
+reduce_dtype = "bfloat16"
+fused_lm_head_token_chunk_size = 512
+compile = "None"
+ac_offloading = "None"
+
+[model.lora]
+rank = 128
+alpha = 256.0
+dropout = 0.0
+target_modules = [
+    'model\.language_model\.layers\.[0-9]+\.self_attn\.(q_proj|k_proj|v_proj|o_proj|gate_proj)$',
+    'model\.language_model\.layers\.[0-9]+\.mlp\.(gate_proj|up_proj|down_proj)$',
+]
+modules_to_save = []
+
+[model.ac]
+mode = "full"
+freq = 1
+
+[optim]
+type = "muon"
+lr = 8e-6
+weight_decay = 0.0
+max_norm = 1.0
+
+[scheduler]
+type = "constant"
+
+[weight_broadcast]
+type = "filesystem"
+save_format = "safetensors"
+save_sharded = false
+
+[rollout_transport]
+type = "filesystem"
+
+[ckpt]
+interval = 25
+keep_last = 1
+keep_interval = 100
+weights_only = true
+skip_gather_master_weights = true

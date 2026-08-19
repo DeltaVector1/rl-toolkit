@@ -1,18 +1,9 @@
-"""Decensor dataset assembly, ported from v0.
-
-Loads the NewEden/RL-seed-Decensor seed conversations (local JSONL cache or HF streaming)
-and the three system-prompt buckets (styles / plaintext / markdown), then assembles per-example
-rows: an opening user turn wrapped in a bucket system prompt, an optional `<Response-Length>`
-requirement, and a target number of model turns drawn from a geometric decay. The follow-up
-user turns themselves are produced live by the user simulator, so only the opening turn is
-materialized here (mirroring v0's `build_multiturn_dataset`).
-"""
-
 from __future__ import annotations
 
 import json
 import os
 import random
+from collections import Counter
 from typing import Any
 
 from datasets import load_dataset
@@ -21,7 +12,9 @@ from huggingface_hub import hf_hub_download
 from decensor_v1.text import WORD_REQUIREMENTS, length_instruction, sample_word_target
 
 
-def convert_sharegpt_messages(convo: list[dict], strip_system: bool = False) -> list[dict[str, str]]:
+def convert_sharegpt_messages(
+    convo: list[dict], strip_system: bool = False
+) -> list[dict[str, str]]:
     out: list[dict[str, str]] = []
     for turn in convo:
         if not isinstance(turn, dict):
@@ -44,7 +37,9 @@ def convert_sharegpt_messages(convo: list[dict], strip_system: bool = False) -> 
     return out
 
 
-def truncate_to_k_user_turns(messages: list[dict[str, str]], k: int) -> list[dict[str, str]] | None:
+def truncate_to_k_user_turns(
+    messages: list[dict[str, str]], k: int
+) -> list[dict[str, str]] | None:
     if k < 1:
         return None
     msgs = [m for m in messages if m.get("role") != "system"]
@@ -61,7 +56,9 @@ def truncate_to_k_user_turns(messages: list[dict[str, str]], k: int) -> list[dic
     return msgs[: cut + 1]
 
 
-def sample_turn_counts(total: int, decay: float, max_turns: int, seed: int) -> list[int]:
+def sample_turn_counts(
+    total: int, decay: float, max_turns: int, seed: int
+) -> list[int]:
     if total <= 0:
         return []
     weights = [decay ** (k - 1) for k in range(1, max_turns + 1)]
@@ -88,7 +85,9 @@ def sample_turn_counts(total: int, decay: float, max_turns: int, seed: int) -> l
     return out
 
 
-def stratified_sample_by_key(rows_by_key: dict[str, list[Any]], target: int, seed: int) -> list[Any]:
+def stratified_sample_by_key(
+    rows_by_key: dict[str, list[Any]], target: int, seed: int
+) -> list[Any]:
     rng = random.Random(seed)
     keys = sorted(rows_by_key.keys())
     if not keys or target <= 0:
@@ -111,11 +110,17 @@ def stratified_sample_by_key(rows_by_key: dict[str, list[Any]], target: int, see
     return selected
 
 
-def assign_buckets(n: int, styles_r: float, plaintext_r: float, markdown_r: float, seed: int) -> list[str]:
+def assign_buckets(
+    n: int, styles_r: float, plaintext_r: float, markdown_r: float, seed: int
+) -> list[str]:
     total = styles_r + plaintext_r + markdown_r
     if total <= 0:
         raise ValueError("All bucket ratios are zero")
-    styles_r, plaintext_r, markdown_r = styles_r / total, plaintext_r / total, markdown_r / total
+    styles_r, plaintext_r, markdown_r = (
+        styles_r / total,
+        plaintext_r / total,
+        markdown_r / total,
+    )
 
     n_styles = round(n * styles_r)
     n_plaintext = round(n * plaintext_r)
@@ -127,24 +132,28 @@ def assign_buckets(n: int, styles_r: float, plaintext_r: float, markdown_r: floa
             n_plaintext += n_markdown
         n_markdown = 0
 
-    assignments = ["styles"] * n_styles + ["plaintext"] * n_plaintext + ["markdown"] * n_markdown
+    assignments = (
+        ["styles"] * n_styles + ["plaintext"] * n_plaintext + ["markdown"] * n_markdown
+    )
     random.Random(seed).shuffle(assignments)
     return assignments
 
 
 def load_bucket_prompts() -> dict[str, list[str]]:
-    """Load the three system-prompt pools: styles, plaintext, markdown (from HF)."""
     out: dict[str, list[str]] = {}
 
     styles_path = hf_hub_download(
-        repo_id="Delta-Vector/Tauri-RL-Styles", filename="system_prompts.txt", repo_type="dataset",
+        repo_id="Delta-Vector/Tauri-RL-Styles",
+        filename="system_prompts.txt",
+        repo_type="dataset",
     )
     with open(styles_path, "r", encoding="utf-8") as f:
         out["styles"] = [line.strip() for line in f if line.strip()]
 
     plaintext_path = hf_hub_download(
         repo_id="Delta-Vector/Tauri-RL-Plaintext-System",
-        filename="jailbreak_prompt_variants (1).jsonl", repo_type="dataset",
+        filename="jailbreak_prompt_variants (1).jsonl",
+        repo_type="dataset",
     )
     pt_prompts: list[str] = []
     with open(plaintext_path, "r", encoding="utf-8") as f:
@@ -159,7 +168,8 @@ def load_bucket_prompts() -> dict[str, list[str]]:
 
     md_path = hf_hub_download(
         repo_id="Delta-Vector/Tauri-RL-Markdown-System",
-        filename="jailbreak_prompt_variants_markdown.jsonl", repo_type="dataset",
+        filename="jailbreak_prompt_variants_markdown.jsonl",
+        repo_type="dataset",
     )
     md_prompts: list[str] = []
     with open(md_path, "r", encoding="utf-8") as f:
@@ -184,7 +194,7 @@ def decensor_candidate_paths(ds_name: str) -> list[str]:
         candidate_paths.append(ds_name)
     elif os.path.isdir(ds_name):
         candidate_paths.append(os.path.join(ds_name, "rl.jsonl"))
-    # Local v0 cache, if the port runs alongside the v0 checkout.
+
     candidate_paths.append("/root/prime/data/NewEden-RL-seed-Decensor/rl.jsonl")
     return candidate_paths
 
@@ -201,33 +211,43 @@ def iter_decensor_rows(ds_name: str):
                 try:
                     yield json.loads(line)
                 except json.JSONDecodeError as e:
-                    raise ValueError(f"Invalid decensor JSONL at {path}:{line_no}: {e}") from e
+                    raise ValueError(
+                        f"Invalid decensor JSONL at {path}:{line_no}: {e}"
+                    ) from e
         return
     yield from load_dataset(ds_name, split="train", streaming=True)
 
 
 def build_decensor_pool(
-    ds_name: str, target: int, decay: float, max_turns: int, seed: int,
-) -> list[tuple[list[dict[str, str]], int]]:
-    """Assemble (messages, K) pairs; messages ends at the K-th user turn."""
+    ds_name: str,
+    target: int,
+    decay: float,
+    max_turns: int,
+    seed: int,
+) -> list[tuple[list[dict[str, str]], int, str, int]]:
     if target <= 0:
         return []
     all_rows: list[dict[str, Any]] = []
     rows_by_asst_turns: dict[int, dict[str, list[int]]] = {}
     for row in iter_decensor_rows(ds_name):
         conv = row.get("conversations") or []
-        n_asst = sum(1 for m in conv if isinstance(m, dict) and str(m.get("from", "")).lower() in ("gpt", "assistant"))
+        n_asst = sum(
+            1
+            for m in conv
+            if isinstance(m, dict)
+            and str(m.get("from", "")).lower() in ("gpt", "assistant")
+        )
         harms = row.get("harm_types") or [row.get("harm_label") or "unknown"]
         primary = str(harms[0]) if harms else "unknown"
         idx = len(all_rows)
-        all_rows.append({"conversations": conv})
+        all_rows.append({"conversations": conv, "harm_type": primary})
         rows_by_asst_turns.setdefault(n_asst, {}).setdefault(primary, []).append(idx)
 
     alloc_per_k: dict[int, int] = {}
     for k in sample_turn_counts(target, decay, max_turns, seed):
         alloc_per_k[k] = alloc_per_k.get(k, 0) + 1
 
-    out: list[tuple[list[dict[str, str]], int]] = []
+    out: list[tuple[list[dict[str, str]], int, str, int]] = []
     for k, need in alloc_per_k.items():
         candidate_rows_by_harm: dict[str, list[int]] = {}
         for asst_count, harm_map in rows_by_asst_turns.items():
@@ -244,12 +264,21 @@ def build_decensor_pool(
                 for harm, idxs in harm_map.items():
                     candidate_rows_by_harm.setdefault(harm, []).extend(idxs)
 
-        for row_idx in stratified_sample_by_key(candidate_rows_by_harm, need, seed + k * 7919):
+        for row_idx in stratified_sample_by_key(
+            candidate_rows_by_harm, need, seed + k * 7919
+        ):
             conv = all_rows[int(row_idx)].get("conversations") or []
             msgs = convert_sharegpt_messages(conv, strip_system=False)
             truncated = truncate_to_k_user_turns(msgs, k)
             if truncated is not None:
-                out.append((truncated, k))
+                out.append(
+                    (
+                        truncated,
+                        k,
+                        str(all_rows[int(row_idx)]["harm_type"]),
+                        int(row_idx),
+                    )
+                )
     random.Random(seed).shuffle(out)
     return out[:target]
 
@@ -266,13 +295,24 @@ def build_rows(
     enable_length_prompts: bool,
     output_prompt: str | None,
 ) -> list[dict[str, Any]]:
-    """Return per-example dicts: system_prompt, user prompt, word_requirement, bucket, target_turns."""
     bucket_prompts = load_bucket_prompts()
-    pool = build_decensor_pool(ds_name, num_examples, turn_decay_ratio, max_turns, seed + 2)
-    buckets = assign_buckets(len(pool), bucket_styles_ratio, bucket_plaintext_ratio, bucket_markdown_ratio, seed + 101)
+    pool = build_decensor_pool(
+        ds_name, num_examples, turn_decay_ratio, max_turns, seed + 2
+    )
+    buckets = assign_buckets(
+        len(pool),
+        bucket_styles_ratio,
+        bucket_plaintext_ratio,
+        bucket_markdown_ratio,
+        seed + 101,
+    )
+    source_row_counts = Counter(source_row_index for _, _, _, source_row_index in pool)
 
     rows: list[dict[str, Any]] = []
-    for idx, ((convo_msgs, k), bucket) in enumerate(zip(pool, buckets)):
+    for idx, (
+        (convo_msgs, k, harm_type, source_row_index),
+        bucket,
+    ) in enumerate(zip(pool, buckets)):
         bucket_pool = bucket_prompts[bucket]
         body = bucket_pool[idx % len(bucket_pool)]
         if bucket == "styles":
@@ -301,6 +341,9 @@ def build_rows(
                 "word_target": word_target,
                 "prompt_bucket": bucket,
                 "target_turns": k,
+                "harm_type": harm_type,
+                "source_row_index": source_row_index,
+                "source_row_repeated": source_row_counts[source_row_index] > 1,
             }
         )
 

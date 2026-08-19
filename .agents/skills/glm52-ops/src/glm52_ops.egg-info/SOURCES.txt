@@ -5,3 +5,7 @@ src/glm52_ops.egg-info/SOURCES.txt
 src/glm52_ops.egg-info/dependency_links.txt
 src/glm52_ops.egg-info/entry_points.txt
 src/glm52_ops.egg-info/top_level.txt
+tests/test_acceptance.py
+tests/test_deploy.py
+tests/test_edge_operations.py
+tests/test_reward.py

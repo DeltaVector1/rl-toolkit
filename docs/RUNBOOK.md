@@ -94,10 +94,12 @@ cd /home/mango/Misc/data-gen/glm52-decensor
 python3 -c "
 import pathlib
 p=pathlib.Path
-p('configs/china/trainer.xNN.toml').write_text(p('configs/china/trainer.x24.toml').read_text().replace('x24','xNN'))
-p('configs/china/orchestrator.xNN.toml').write_text(p('configs/china/orchestrator.x24.toml').read_text().replace('x24','xNN'))"
-scripts/ops/cl.py edit configs/china/trainer.xNN.toml
-scripts/ops/cl.py -n n82 edit configs/china/orchestrator.xNN.toml
+p('configs/china/trainer.museNN.toml').write_text(
+    p('configs/china/trainer.muse13.toml').read_text().replace('muse13','museNN'))
+p('configs/h200/orchestrator.museNN.toml').write_text(
+    p('configs/h200/orchestrator.muse13.toml').read_text().replace('muse13','museNN'))"
+scripts/ops/cl.py edit configs/china/trainer.museNN.toml
+scripts/ops/cl.py edit configs/h200/orchestrator.museNN.toml
 ```
 
 # Step 2. Test the engines
@@ -281,7 +283,7 @@ Git bundles: `~/Misc/data-gen/backups/`.
 
 Node snapshot: `/data/glm52-rl/deployment-WORKING-16KSTEP-*.tar.gz` on n84.
 
-Patches: `patches/glm52-fixes-all.patch` and `patches/series/`.
+Portable patches: `patches/prime-rl/v0.8.0-glm52/`.
 
 # THE SWANLAB PROJECT
 

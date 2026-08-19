@@ -49,7 +49,9 @@ from prime_rl.trainer.models import (
 from prime_rl.trainer.models.glm_moe_dsa.sparse_mla_attention import Indexer
 from prime_rl.trainer.models.layers.checkpointing import (
     get_supported_targets,
+    ring_attention_checkpoint_context_fn,
     set_reentrant_attention_checkpointing,
+    set_reentrant_attention_shared_expert_checkpointing,
     set_reentrant_block_checkpointing,
     set_selective_activation_checkpointing,
     supports_selective_activation_checkpointing,
@@ -89,6 +91,23 @@ def iter_layers(layers):
     import torch.nn as _nn
 
     return layers.values() if isinstance(layers, _nn.ModuleDict) else layers
+
+
+def _uses_tied_word_embeddings(model: nn.Module) -> bool:
+    """Read weight tying from either a language model or a VLM config.
+
+    Some multimodal Transformers configs, including Muse Glimmer, do not
+    expose ``tie_word_embeddings`` on the outer config object even when the
+    source config JSON contains it.  Missing means untied, which is also the
+    safe behavior for a model with a separate output head.
+    """
+    config = getattr(model, "config", None)
+    if config is None:
+        return False
+    tied = getattr(config, "tie_word_embeddings", None)
+    if tied is None and hasattr(config, "get_text_config"):
+        tied = getattr(config.get_text_config(), "tie_word_embeddings", None)
+    return bool(tied) if tied is not None else False
 
 
 def pre_download_model(model_name: str) -> None:
@@ -725,11 +744,27 @@ def get_model(
             f"but model.impl resolved to 'hf'. Set model.impl='custom' explicitly."
         )
 
-    if config.cp > 1 and config.impl == "auto" and impl_to_use != "custom":
+    # Muse Glimmer has no PrimeRL-native implementation, but its text stack is
+    # standard causal softmax attention.  The trainer's HF FlashAttention ring
+    # adapter supports both its full-attention and sliding-window layers.  Keep
+    # the general auto/HF refusal in place and allow only this measured path.
+    hf_cp_supported = (
+        getattr(model_config, "model_type", "") == "muse_glimmer"
+        and config.attn == "flash_attention_2"
+        and config.cp_style == "ring"
+    )
+    if (
+        config.cp > 1
+        and config.impl == "auto"
+        and impl_to_use != "custom"
+        and not hf_cp_supported
+    ):
         raise ValueError(
             "Context parallelism with model.impl='auto' requires a supported custom PrimeRL implementation, "
             "but this architecture resolved to model.impl='hf'."
         )
+    if config.cp > 1 and impl_to_use == "hf" and hf_cp_supported:
+        logger.info("Using supported Hugging Face ring context parallelism for Muse Glimmer")
 
     if config.vlm is not None and not (is_vlm_arch and custom_vlm_cls):
         raise ValueError(
@@ -890,7 +925,7 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
             **(packed_fsdp_config if native_fp8 else fsdp_config),
         )
 
-    shard_norm_and_lm_head = hasattr(model, "config") and not model.config.tie_word_embeddings
+    shard_norm_and_lm_head = hasattr(model, "config") and not _uses_tied_word_embeddings(model)
 
     if shard_norm_and_lm_head:
         # This optimization breaks weight tying.
@@ -1086,7 +1121,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
     load_dcp_start_time = time.perf_counter()
     state_dict = model.state_dict()
     state_dict = strip_lora_from_state_dict(state_dict)
-    if model.config.tie_word_embeddings:
+    if _uses_tied_word_embeddings(model):
         state_dict.pop("lm_head.weight")
     if getattr(model.config, "fp8_source_checkpoint", False):
         reader = FP8CheckpointStorageReader(
@@ -1099,7 +1134,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
         reader = HuggingFaceStorageReader(path=snapshot_path.as_posix())
     dcp_load(state_dict, storage_reader=reader)
     # Restore weight tying broken by to_empty() for HF models
-    if not isinstance(model, PreTrainedModelPrimeRL) and model.config.tie_word_embeddings:
+    if not isinstance(model, PreTrainedModelPrimeRL) and _uses_tied_word_embeddings(model):
         model.tie_weights()
     _init_buffers_post_meta()
 
@@ -1156,12 +1191,33 @@ def can_reinit_empty_buffers(model: nn.Module):
     if set(buffer_names) == gemma3_buffers:
         return True
 
+    muse_glimmer_buffers = {
+        "model.vision_tower.rotary_emb.inv_freq",
+        "model.vision_tower.rotary_emb.original_inv_freq",
+        "model.language_model.rotary_emb.inv_freq",
+        "model.language_model.rotary_emb.original_inv_freq",
+    }
+    if set(buffer_names) == muse_glimmer_buffers:
+        return True
+
     get_logger().warning(f"Model cannot be loaded using meta device because of buffers: {buffer_names}")
     return False
 
 
 def fix_model_post_empty(model: nn.Module):
     buffer_names = [name for name, _ in model.named_buffers()]
+
+    def reinitialize_rotary(rotary_emb, prefix: str) -> None:
+        rope_init_fn = getattr(
+            rotary_emb, "rope_init_fn", rotary_emb.compute_default_rope_parameters
+        )
+        inv_freq, rotary_emb.attention_scaling = rope_init_fn(
+            rotary_emb.config, rotary_emb.inv_freq.device
+        )
+        rotary_emb.inv_freq.copy_(inv_freq)
+        if f"{prefix}.original_inv_freq" in buffer_names:
+            rotary_emb.original_inv_freq.copy_(inv_freq)
+
     # HF standard transformer model
     if "model.rotary_emb.inv_freq" in buffer_names:
         rotary_emb = model.model.rotary_emb
@@ -1191,6 +1247,16 @@ def fix_model_post_empty(model: nn.Module):
     if "model.embed_tokens.embed_scale" in buffer_names:
         embed_scale = model.config.hidden_size**0.5
         model.model.embed_tokens.embed_scale.fill_(embed_scale)
+    if "model.language_model.rotary_emb.inv_freq" in buffer_names:
+        reinitialize_rotary(
+            model.model.language_model.rotary_emb,
+            "model.language_model.rotary_emb",
+        )
+    if "model.vision_tower.rotary_emb.inv_freq" in buffer_names:
+        reinitialize_rotary(
+            model.model.vision_tower.rotary_emb,
+            "model.vision_tower.rotary_emb",
+        )
 
 
 def reshard_module(model: nn.Module):
@@ -1224,6 +1290,11 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
             # recompute, while the slower MoE forward stays eager.
             set_reentrant_attention_checkpointing(transformer_block)
             full_layers += 1
+        elif ac_config.mode == "reentrant_attention_shared_expert":
+            # Keep routed experts eager. Recompute only the shared-expert
+            # branch to release its saved activations during the 1F1B warmup.
+            set_reentrant_attention_shared_expert_checkpointing(transformer_block)
+            full_layers += 1
         elif ac_config.mode == "selective" and supports_selective_activation_checkpointing(transformer_block):
             model_supported_targets.update(get_supported_targets(transformer_block))
             set_selective_activation_checkpointing(transformer_block, target_list)
@@ -1231,7 +1302,14 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
         else:
             if ac_config.mode == "selective":
                 fallback_layer_types.add(type(transformer_block).__name__)
-            transformer_block = checkpoint_wrapper(transformer_block, preserve_rng_state=False)
+            transformer_block = checkpoint_wrapper(
+                transformer_block,
+                preserve_rng_state=False,
+                # ring_flash_attn keeps packed boundaries in process-global
+                # state. Pipeline 1F1B interleaves microbatches, so checkpoint
+                # recompute must restore the values from this invocation.
+                context_fn=ring_attention_checkpoint_context_fn,
+            )
             full_layers += 1
 
         language_model.layers.register_module(layer_name, transformer_block)
@@ -1527,7 +1605,7 @@ def setup_model(
             else:
                 fix_model_post_empty(model)
                 # Restore weight tying broken by to_empty() for HF models
-                if model.config.tie_word_embeddings:
+                if _uses_tied_word_embeddings(model):
                     model.tie_weights()
 
             _move_buffers_to_cuda(model, config)

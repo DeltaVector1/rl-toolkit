@@ -16,6 +16,7 @@ They print a report and also return the data.
 glm52_ops.status()          # one full picture of the run
 glm52_ops.reward()          # reward series with a trend verdict
 glm52_ops.watch(hours=2)    # the same picture on a loop, in the foreground
+glm52_ops.qualify("muse-qualification") # trainer-only fake-data run
 ```
 
 `await glm52_ops("status")` and `await glm52_ops("reward")` do the same thing.
@@ -101,8 +102,20 @@ glm52_ops.repair("supervisors")    # restart the tunnel and engine watchdogs tha
 `repair` never targets the batch tunnel on port 29620. Stop the orchestrator first. A killed batch tunnel leaves dead zmq
 connections and the trainer waits.
 
+If an engine watchdog is active, read `/root/engine_watchdog.log` before a
+manual engine repair. The watchdog can already be inside its load-verification
+loop. The repair function stops that watchdog first and starts a fresh one
+with a 600-second Muse startup grace or a 180-second GLM startup grace, so two
+replacement attempts cannot remove the same loading container.
+
 A stalled orchestrator has no repair. Start a new run name. See
 `references/FAULTS.md`.
+
+The trainer supervisor is fail-closed. It checks all eight trainer
+containers. It does not restart a failed trainer because this configuration
+has no resumable optimizer checkpoint. The h200a trainer-failure watchdog
+stops the orchestrator and the durable batch publisher after two confirmed
+worker misses. Fix the cause and start a fresh run name.
 
 # How to push a changed file
 
@@ -142,6 +155,26 @@ dead peer blocks its event loop. So the trainer starts first.
 Never make the orchestrator wait for the trainer to bind port 29620. The
 trainer waits for a file that only the orchestrator writes. That pair of waits
 is a deadlock. It stopped the run once.
+
+# How to qualify the trainer without rollouts
+
+Use a configuration that contains `[data.fake]`, then call:
+
+```python
+glm52_ops.qualify("muse-qualification")
+glm52_ops.watch(hours=2)
+```
+
+`qualify` starts only the trainer containers. It does not start or require the
+orchestrator, inference engines, judge, tunnels, batch publisher, or run
+supervisor. `status` detects this mode and does not report those absent rollout
+components as trainer failures. Use `mode="restart"` only when replacing an
+active qualification is intended.
+
+`acceptance()` is production-only. It refuses trainer-only qualifications so
+it cannot mix qualification data with stale rollout data. It applies separate
+Muse BF16, batch-2048, context-65536, and one-sided speed limits when the run
+or model is Muse. It keeps the native-FP8 GLM limits for GLM runs.
 
 # How to test that a process runs
 

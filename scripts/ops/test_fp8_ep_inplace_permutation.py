@@ -10,6 +10,7 @@ from prime_rl.trainer.models.layers import fp8_ada
 
 
 MIB = 1024**2
+TARGET_FREE_MIB = 1024
 ROWS = 36_352
 PADDING = 512
 INPUT = 6_144
@@ -167,6 +168,17 @@ def main():
     torch.cuda.empty_cache()
 
     inplace_value = template.detach().clone().requires_grad_()
+    # Account for the leaf-gradient destination before constraining free
+    # memory. The production expert input is an intermediate activation, so
+    # autograd forwards its returned gradient instead of allocating a new
+    # 426 MiB leaf buffer after the expert backward has completed.
+    inplace_value.grad = torch.zeros_like(inplace_value)
+    free_bytes, _ = torch.cuda.mem_get_info()
+    target_free = TARGET_FREE_MIB * MIB
+    ballast = torch.empty(
+        max(0, free_bytes - target_free), device="cuda", dtype=torch.uint8
+    )
+    constrained_free_before, _ = torch.cuda.mem_get_info()
     got_output, got_grad, peak, host_fp8 = inplace(
         inplace_value,
         weights,
@@ -175,6 +187,7 @@ def main():
         offsets,
         upstream,
     )
+    constrained_free_after, _ = torch.cuda.mem_get_info()
     torch.testing.assert_close(got_output, expected_output, rtol=0, atol=0)
     torch.testing.assert_close(got_grad, expected_grad, rtol=0, atol=0)
     if len(host_fp8) != 2 or not all(tensor.is_pinned() for tensor in host_fp8):
@@ -196,18 +209,22 @@ def main():
                 "permuted_rows": ROWS + PADDING,
                 "intermediate": INTERMEDIATE,
                 "chunk_rows": fp8_ada._FP8_W13_CHUNK_ROWS,
+                "backward_chunk_rows": fp8_ada._FP8_EXPERT_BACKWARD_CHUNK_ROWS,
                 "forward": "exact",
                 "input_gradient": "exact",
                 "routed_input_storage": "reused",
                 "saved_fp8_location": "pinned CPU",
                 "saved_fp8_mib": host_bytes / MIB,
                 "incremental_peak_mib": peak / MIB,
+                "constrained_free_before_mib": constrained_free_before / MIB,
+                "constrained_free_after_mib": constrained_free_after / MIB,
             },
             indent=2,
             sort_keys=True,
         ),
         flush=True,
     )
+    del ballast
 
 
 if __name__ == "__main__":

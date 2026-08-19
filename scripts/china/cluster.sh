@@ -8,6 +8,7 @@ deployment=/data/glm52-rl/deployment
 RUN=${RUN:-r33}
 run_name=${RUN_NAME:-run_${RUN:-r33}}
 config=$deployment/configs/china
+orchestrator_config=${ORCHESTRATOR_CONFIG_DIR:-$config}
 # CONFIG_TAG picks configs/china/trainer${CONFIG_TAG}.toml (e.g. ".r34")
 CONFIG_TAG=${CONFIG_TAG:-}
 run_dir=/data/glm52-rl/runs/$RUN/$run_name
@@ -21,6 +22,10 @@ common=(
   --ulimit nofile=1048576:1048576
   --ulimit memlock=-1:-1
   --ulimit stack=67108864:67108864
+  # A failed 64-rank trainer can otherwise leave one multi-gigabyte Apport
+  # core per worker on the host root filesystem. These dumps filled n76 and
+  # prevented NCCL from writing its much smaller diagnostic trace.
+  --ulimit core=0:0
   -v /data:/data
   -e CUDA_DEVICE_ORDER=PCI_BUS_ID
   -e PYTHONUNBUFFERED=1
@@ -48,6 +53,35 @@ common=(
   -e TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=600
 )
 
+# A newly released model can require a newer Transformers package than the
+# pinned trainer image. Set TRANSFORMERS_OVERRIDE_DIR to a host directory that
+# contains the complete `transformers` Python package. The default is empty and
+# therefore does not change established GLM runs.
+transformers_mount=()
+if [ -n "${TRANSFORMERS_OVERRIDE_DIR:-}" ]; then
+  test -d "$TRANSFORMERS_OVERRIDE_DIR/transformers" || {
+    echo "TRANSFORMERS_OVERRIDE_DIR must contain transformers/" >&2
+    exit 1
+  }
+  transformers_mount=(-v "$TRANSFORMERS_OVERRIDE_DIR/transformers":/app/.venv/lib/python3.12/site-packages/transformers:ro)
+fi
+
+python_dependency_mounts=()
+if [ -n "${MUSE_PYTHON_OVERRIDE_DIR:-}" ]; then
+  test -d "$MUSE_PYTHON_OVERRIDE_DIR/safetensors" || {
+    echo "MUSE_PYTHON_OVERRIDE_DIR must contain safetensors/" >&2
+    exit 1
+  }
+  test -d "$MUSE_PYTHON_OVERRIDE_DIR/safetensors-0.8.0.dist-info" || {
+    echo "MUSE_PYTHON_OVERRIDE_DIR must contain safetensors-0.8.0.dist-info/" >&2
+    exit 1
+  }
+  python_dependency_mounts=(
+    -v "$MUSE_PYTHON_OVERRIDE_DIR/safetensors":/app/.venv/lib/python3.12/site-packages/safetensors:ro
+    -v "$MUSE_PYTHON_OVERRIDE_DIR/safetensors-0.8.0.dist-info":/app/.venv/lib/python3.12/site-packages/safetensors-0.7.0.dist-info:ro
+  )
+fi
+
 case ${1:-} in
   trainer)
     # TRAINER_NODES lists the participating nodes in rank order; a node's rank
@@ -65,18 +99,23 @@ case ${1:-} in
     if [ "$rank" -lt 0 ]; then
       echo "node $node is not in TRAINER_NODES ($TRAINER_NODES)" >&2; exit 1
     fi
-    if [ "$rank" -eq 0 ]; then
-      read -r rollout_transport trainer_output < <(
-        python3 - "$config/trainer${CONFIG_TAG}.toml" <<'PY'
+    read -r rollout_transport trainer_output fake_data < <(
+      python3 - "$config/trainer${CONFIG_TAG}.toml" <<'PY'
 import sys
 import tomllib
 
 with open(sys.argv[1], "rb") as f:
     config = tomllib.load(f)
-print(config["rollout_transport"]["type"], config["output_dir"])
+print(
+    config["rollout_transport"]["type"],
+    config["output_dir"],
+    int("fake" in config.get("data", {})),
+)
 PY
-      )
-      if [ "$rollout_transport" = filesystem ]; then
+    )
+    sudo install -d -o 1000 -g 1000 -m 0755 "$trainer_output"
+    if [ "$rank" -eq 0 ]; then
+      if [ "$rollout_transport" = filesystem ] && [ "$fake_data" = 0 ]; then
         sync_log="/data/glm52-rl/microbatch-sync-$RUN.log"
         nohup setsid env RUN_DIR="$trainer_output" \
           "$deployment/scripts/china/sync_microbatches.sh" \
@@ -113,12 +152,17 @@ PY
       -v /data/glm52-rl/cache/tilelang:/home/appuser/.tilelang \
       -v /data/glm52-rl/cache/triton:/home/appuser/.triton \
       -v /data/glm52-rl/cache/tmp:/scratch-tmp \
+      "${transformers_mount[@]}" \
+      "${python_dependency_mounts[@]}" \
       -e TMPDIR=/scratch-tmp \
       -v "$deployment/source/src/prime_rl/trainer/fp8_checkpoint.py":/app/src/prime_rl/trainer/fp8_checkpoint.py:ro \
+      -v "$deployment/source/src/prime_rl/trainer/model.py":/app/src/prime_rl/trainer/model.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/models/layers/fp8_ada.py":/app/src/prime_rl/trainer/models/layers/fp8_ada.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/models/layers/moe.py":/app/src/prime_rl/trainer/models/layers/moe.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/models/layers/checkpointing.py":/app/src/prime_rl/trainer/models/layers/checkpointing.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/models/layers/norms.py":/app/src/prime_rl/trainer/models/layers/norms.py:ro \
+      -v "$deployment/source/src/prime_rl/trainer/models/layers/hf_ring_attn.py":/app/src/prime_rl/trainer/models/layers/hf_ring_attn.py:ro \
+      -v "$deployment/source/src/prime_rl/trainer/models/layers/lm_head_gemma.py":/app/src/prime_rl/trainer/models/layers/lm_head_gemma.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/distributed/expert_parallel.py":/app/src/prime_rl/trainer/distributed/expert_parallel.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/distributed/pipeline_parallel.py":/app/src/prime_rl/trainer/distributed/pipeline_parallel.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/distributed/pp_runner.py":/app/src/prime_rl/trainer/distributed/pp_runner.py:ro \
@@ -136,13 +180,15 @@ PY
       -v "$deployment/source/src/prime_rl/trainer/models/kernels/sparse_mla_fwd.py":/app/src/prime_rl/trainer/models/kernels/sparse_mla_fwd.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/models/kernels/sparse_mla_bwd.py":/app/src/prime_rl/trainer/models/kernels/sparse_mla_bwd.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/model.py":/app/src/prime_rl/trainer/model.py:ro \
+      -v "$deployment/source/src/prime_rl/utils/vlm.py":/app/src/prime_rl/utils/vlm.py:ro \
       -v "$deployment/source/packages/prime-rl-configs/src/prime_rl/configs/trainer.py":/app/packages/prime-rl-configs/src/prime_rl/configs/trainer.py:ro \
       --env-file /data/trinity/training.env \
-      -e PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:256}" \
+      -e PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,garbage_collection_threshold:0.8}" \
       -e TORCHINDUCTOR_COMPILE_THREADS=8 \
       -e PRIME_EP_PROFILE="${PRIME_EP_PROFILE:-0}" \
       -e PRIME_EP_PROFILE_EVERY="${PRIME_EP_PROFILE_EVERY:-150}" \
       -e PRIME_EP_AC_CACHE="${PRIME_EP_AC_CACHE:-0}" \
+      -e PRIME_INT4_COMBINE_ROUNDS="${PRIME_INT4_COMBINE_ROUNDS:-1}" \
       -e PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD="${PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD:-0}" \
       -e PRIME_BATCH_CACHE="${PRIME_BATCH_CACHE:-}" \
       -e PRIME_PP_MAX_MICRO="${PRIME_PP_MAX_MICRO:-}" \
@@ -164,6 +210,20 @@ PY
     ;;
   orchestrator)
     test "$node" = 82 || { echo "the orchestrator runs on n82" >&2; exit 1; }
+    orchestrator_output=$(
+      python3 - "$orchestrator_config/orchestrator${CONFIG_TAG}.toml" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as source:
+    print(tomllib.load(source)["output_dir"])
+PY
+    )
+    # The orchestrator writes run control data under `output_dir`, and its
+    # environment workers write logs beside that directory. Both locations
+    # must be writable by the container user.
+    sudo install -d -o 1000 -g 1000 -m 0755 \
+      "$(dirname "$orchestrator_output")" "$orchestrator_output"
     sudo docker rm -f glm52-decensor-orchestrator >/dev/null 2>&1 || true
     sudo docker run -d --name glm52-decensor-orchestrator \
       "${common[@]}" \
@@ -180,11 +240,13 @@ PY
       -v "$deployment/source/src/prime_rl/orchestrator/algo/grpo.py":/app/src/prime_rl/orchestrator/algo/grpo.py:ro \
       -v "$deployment/source/src/prime_rl/orchestrator/dispatcher.py":/app/src/prime_rl/orchestrator/dispatcher.py:ro \
       -v "$deployment/source/src/prime_rl/orchestrator/orchestrator.py":/app/src/prime_rl/orchestrator/orchestrator.py:ro \
+      -v "$deployment/source/src/prime_rl/orchestrator/train_sink.py":/app/src/prime_rl/orchestrator/train_sink.py:ro \
       -v "$deployment/source/src/prime_rl/orchestrator/train_source.py":/app/src/prime_rl/orchestrator/train_source.py:ro \
       -v "$deployment/source/src/prime_rl/orchestrator/watcher.py":/app/src/prime_rl/orchestrator/watcher.py:ro \
       -v "$deployment/source/src/prime_rl/utils/client.py":/app/src/prime_rl/utils/client.py:ro \
+      -v "$deployment/source/src/prime_rl/utils/checkpoint_delta.py":/app/src/prime_rl/utils/checkpoint_delta.py:ro \
       --entrypoint /app/.venv/bin/orchestrator "$image" \
-      @ "$config/orchestrator${CONFIG_TAG}.toml"
+      @ "$orchestrator_config/orchestrator${CONFIG_TAG}.toml"
     ;;
   gemma)
     test "$node" = 85 || { echo "the Gemma server runs on n85" >&2; exit 1; }
@@ -236,13 +298,15 @@ PY
     ;;
   adapter-http)
     test "$node" = 82 || { echo "the adapter server runs on n82" >&2; exit 1; }
+    broadcast_root=${BROADCAST_ROOT:-/data/glm52-rl/runs}
+    test -d "$broadcast_root" || { echo "broadcast root does not exist: $broadcast_root" >&2; exit 1; }
     sudo docker rm -f glm52-adapter-http >/dev/null 2>&1 || true
     sudo docker run -d --name glm52-adapter-http --restart unless-stopped \
       --network host \
-      -v /data/glm52-rl/runs:/data/glm52-rl/runs:ro \
+      -v "$broadcast_root":/broadcast:ro \
       -v "$deployment/scripts/china/adapter_server.py":/app/adapter_server.py:ro \
       --entrypoint /app/.venv/bin/python "$image" \
-      /app/adapter_server.py --port 8100 --directory /data/glm52-rl/runs
+      /app/adapter_server.py --port 8100 --directory /broadcast
     ;;
   *)
     echo "usage: $0 trainer|orchestrator|adapter-http|gemma" >&2

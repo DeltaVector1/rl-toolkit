@@ -20,10 +20,57 @@ remote() {
   fi
 }
 
-# One WAN TCP stream collapses under the measured loss. Even ordinary
-# no-router batches are 80-100 MiB, so stripe them too.
-parallel_threshold=${PARALLEL_THRESHOLD:-67108864}
+# One WAN TCP stream collapses under the measured loss. Shorter x64p batches
+# can be 55-60 MiB and took more than four minutes on one rsync stream, so
+# stripe every material production batch rather than only files above 64 MiB.
+parallel_threshold=${PARALLEL_THRESHOLD:-16777216}
 parallel_streams=${PARALLEL_STREAMS:-16}
+# A stripe that makes no I/O progress for one minute is dead on this path.
+# Retry its partial file promptly instead of holding the trainer for the old
+# two-minute rsync timeout. Active slow transfers are not timed out.
+stripe_io_timeout=${STRIPE_IO_TIMEOUT:-60}
+# rsync's I/O timeout did not terminate a wedged SSH child on x72p step 16.
+# Bound each small stripe attempt by wall time as well. A timeout keeps the
+# remote partial file, and the next attempt resumes it with --append-verify.
+stripe_attempt_timeout=${STRIPE_ATTEMPT_TIMEOUT:-90}
+# Starting all 16 SSH handshakes in one instant produced repeatable
+# kex/reset failures on the jump path. Keep the independent TCP streams, but
+# spread their handshakes across four seconds so a failed first wave does not
+# force a complete retry pass.
+parallel_launch_delay=${PARALLEL_LAUNCH_DELAY:-0.25}
+adapter_source_base=${ADAPTER_SOURCE_BASE:-}
+adapter_admin_urls=${ADAPTER_ADMIN_URLS:-}
+
+prefetch_adapter() {
+  local relative=$1 adapter_relative source_url admin status pid
+  local -a pids
+  [ -n "$adapter_source_base" ] || return 0
+  [ -n "$adapter_admin_urls" ] || return 0
+  case "$relative" in
+    broadcasts/step_*/STABLE) ;;
+    *) return 0 ;;
+  esac
+  adapter_relative=${relative%/STABLE}
+  source_url="${adapter_source_base%/}/$adapter_relative"
+  pids=()
+  for admin in $adapter_admin_urls; do
+    curl --fail --silent --show-error --max-time 600 \
+      --retry 3 --retry-all-errors --retry-delay 2 \
+      -H 'Content-Type: application/json' \
+      -d "{\"lora_path\":\"$source_url\"}" \
+      "${admin%/}/stage_lora_adapter" >/dev/null &
+    pids+=("$!")
+  done
+  status=0
+  for pid in "${pids[@]}"; do
+    wait "$pid" || status=1
+  done
+  if [ "$status" != 0 ]; then
+    echo "$(date -u +%FT%TZ) adapter prefetch incomplete for $relative" >&2
+    return 1
+  fi
+  echo "$(date -u +%FT%TZ) prefetched adapter for $relative"
+}
 
 copy_parallel() {
   local source=$1 destination=$2
@@ -59,9 +106,11 @@ copy_parallel() {
       if grep -qx "$part_name $part_size" "$parts_dir/remote-sizes"; then
         continue
       fi
-      rsync -az --partial --append-verify --timeout=120 \
+      timeout --signal=TERM --kill-after=10 "$stripe_attempt_timeout" \
+        rsync -az --partial --append-verify --timeout="$stripe_io_timeout" \
         -e "ssh ${ssh_opts[*]}" "$part" "$dest_host:$remote_parts/$part_name" &
       pids+=("$!")
+      sleep "$parallel_launch_delay"
     done
     status=0
     for pid in "${pids[@]}"; do
@@ -97,7 +146,8 @@ copy_partial() {
   if [ "$size" -ge "$parallel_threshold" ]; then
     copy_parallel "$source" "$destination"
   else
-    rsync -az --partial --append-verify --timeout=120 \
+    timeout --signal=TERM --kill-after=10 "$stripe_attempt_timeout" \
+      rsync -az --partial --append-verify --timeout="$stripe_io_timeout" \
       -e "ssh ${ssh_opts[*]}" "$source" "$dest_host:$destination"
   fi
 }
@@ -163,14 +213,15 @@ pull_stable_markers() {
     mkdir -p "$(dirname "$partial")" "$(dirname "$final")"
     rsync -a --partial --timeout=60 -e "ssh ${ssh_opts[*]}" \
       "$dest_host:$remote_file" "$partial" || continue
+    prefetch_adapter "$relative" || continue
     mv "$partial" "$final"
     echo "pulled $relative"
   done < <(remote "find '$dest_dir/broadcasts' -type f -name STABLE -print 2>/dev/null" || true)
 }
 
 while true; do
-  scan
-  pull_stable_markers
+  scan || echo "$(date -u +%FT%TZ) batch scan failed; retrying" >&2
+  pull_stable_markers || echo "$(date -u +%FT%TZ) stable-marker pull failed; retrying" >&2
   [ "${ONCE:-0}" = 1 ] && exit
   sleep "$interval"
 done

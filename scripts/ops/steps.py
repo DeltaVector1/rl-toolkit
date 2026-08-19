@@ -16,6 +16,7 @@ bottleneck).
 import argparse
 import json
 import re
+import shlex
 import subprocess
 import time
 
@@ -31,8 +32,16 @@ def sh(cmd, timeout=90):
 
 
 def metrics(run):
-    path = f"/data/glm52-rl/runs/{run}/run_decensor_fp8_{run}/trainer-metrics.jsonl"
-    raw = sh(f"sudo docker exec glm52-decensor-trainer cat {path} 2>/dev/null || cat {path} 2>/dev/null")
+    run_dir = shlex.quote(f"/data/glm52-rl/runs/{run}")
+    # Run slot names changed several times (run_decensor_fp8_x*, run_x*, and
+    # others). Locate the metric file instead of silently treating a healthy
+    # production run as empty when its slot name differs from this script.
+    raw = sh(
+        f"path=$(find {run_dir} -maxdepth 3 -type f -name trainer-metrics.jsonl "
+        "-print 2>/dev/null | head -1); "
+        '[ -n "$path" ] && { sudo docker exec glm52-decensor-trainer '
+        'cat "$path" 2>/dev/null || cat "$path" 2>/dev/null; }'
+    )
     steps, perf = {}, {}
     for line in raw.splitlines():
         try:
@@ -47,10 +56,26 @@ def metrics(run):
 
 
 def micro_counts():
-    out = sh('sudo docker logs glm52-decensor-trainer 2>&1 | grep -aoE "Received [0-9]+ micro batches for step [0-9]+"')
+    out = sh(
+        "sudo docker logs glm52-decensor-trainer 2>&1 | "
+        "grep -aoE 'Received [0-9]+ micro batches for step [0-9]+|"
+        "Starting training step [0-9]+|"
+        "Starting forward and backward pass \\(batch_size=[0-9]+\\)'"
+    )
     counts = {}
-    for m in re.finditer(r"Received (\d+) micro batches for step (\d+)", out):
-        counts[int(m.group(2))] = int(m.group(1))
+    current_step = None
+    for line in out.splitlines():
+        received = re.search(r"Received (\d+) micro batches for step (\d+)", line)
+        if received:
+            counts[int(received.group(2))] = int(received.group(1))
+            continue
+        starting = re.search(r"Starting training step (\d+)", line)
+        if starting:
+            current_step = int(starting.group(1))
+            continue
+        batch = re.search(r"Starting forward and backward pass \(batch_size=(\d+)\)", line)
+        if batch and current_step is not None:
+            counts[current_step] = int(batch.group(1))
     return counts
 
 

@@ -1,13 +1,13 @@
 # Patches
 
-`glm52-fixes-all.patch` is the diff from the initial deployment commit for
-`configs/`, `runtime/`, `scripts/`, and `source/`.
-`glm52-source-only.patch` contains the corresponding `source/` diff.
+The checked-out source tree is the current deployment source. This directory
+contains maintained portable and component patch sets. It does not contain
+generated copies of the complete working-tree diff.
 
 ## Prime-RL
 
 - `prime-rl/glm52-fp8.patch` is the base GLM-5.2 FP8 change set against the
-  pinned Prime-RL commit in `../PINS.md`.
+  pinned Prime-RL commit in `../docs/PINS.md`.
 - `prime-rl/build-deepep-fused-score.patch` is the small DeepEP slice applied
   by the Dockerfile when building from the existing base image. It is already
   included in the base patch.

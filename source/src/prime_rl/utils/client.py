@@ -296,6 +296,24 @@ async def maybe_check_has_model(
     logger.debug(f"Model {model_name} was found in the inference pool")
 
 
+async def model_is_visible(admin_client: AsyncClient, model_name: str) -> bool:
+    """Return whether one endpoint currently exposes ``model_name``.
+
+    Engine health and model visibility are separate. A restarted vLLM server
+    can answer health and base-model requests while its dynamic LoRA is absent.
+    Keep this probe bounded so recovery cannot wedge on an open HTTP response.
+    """
+    try:
+        response = await admin_client.get(
+            "/v1/models",
+            timeout=httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0),
+        )
+        response.raise_for_status()
+        return any(model.get("id") == model_name for model in response.json().get("data", []))
+    except Exception:
+        return False
+
+
 async def check_health(
     admin_clients: list[AsyncClient], interval: int = 1, log_interval: int = 10, timeout: int = 1800
 ) -> None:
@@ -352,6 +370,7 @@ ADMIN_TIMEOUT_S = 300.0
 # `/update_weights` runs a collective NCCL receive across all DP workers, which
 # can take longer than the other admin ops.
 UPDATE_WEIGHTS_TIMEOUT_S = 720.0
+FULL_CHECKPOINT_STAGE_TIMEOUT_S = 7200.0
 
 
 async def _admin_post(client: AsyncClient, path: str, *, timeout_s: float = ADMIN_TIMEOUT_S, **kwargs) -> None:
@@ -375,11 +394,16 @@ async def _admin_post(client: AsyncClient, path: str, *, timeout_s: float = ADMI
 
 
 async def _pause_engines(admin_clients: list[AsyncClient], *, step: int) -> None:
-    """Pause all inference engines, waiting for in-flight requests to drain."""
+    """Abort registered requests and pause every inference scheduler.
+
+    The dispatcher has preserved every prompt that needs regeneration.
+    Engine-native abort is still required because cancelling an HTTP client can
+    leave its decode request registered for several engine steps.
+    """
     logger = get_logger()
     logger.info(f"Updating policy in-flight to v{step}")
     await asyncio.gather(
-        *[_admin_post(client, "/pause", params={"mode": "keep", "clear_cache": "false"}) for client in admin_clients]
+        *[_admin_post(client, "/pause", params={"mode": "abort", "clear_cache": "false"}) for client in admin_clients]
     )
     logger.debug("All inference engines paused")
 
@@ -393,6 +417,48 @@ async def _resume_engines(admin_clients: list[AsyncClient]) -> None:
     logger = get_logger()
     await asyncio.gather(*[_admin_post(client, "/resume") for client in admin_clients])
     logger.debug("All inference engines resumed")
+
+
+async def stage_lora_adapter(admin_clients: list[AsyncClient], lora_path: Path | str) -> None:
+    """Download a remote adapter on every host while generation continues."""
+    lora_path_posix = str(lora_path)
+    if not lora_path_posix.startswith(("http://", "https://")):
+        return
+    await asyncio.gather(
+        *[
+            _admin_post(
+                client,
+                "/stage_lora_adapter",
+                json={"lora_path": lora_path_posix},
+                timeout_s=LORA_LOAD_TOTAL_TIMEOUT_S,
+            )
+            for client in admin_clients
+        ]
+    )
+
+
+async def stage_full_checkpoint(admin_clients: list[AsyncClient], checkpoint_url: Path | str) -> None:
+    """Download one immutable full checkpoint on every inference host."""
+    checkpoint_url_posix = str(checkpoint_url)
+    async def _stage(client: AsyncClient) -> None:
+        try:
+            await _admin_post(
+                client,
+                "/stage_full_checkpoint",
+                json={"checkpoint_url": checkpoint_url_posix},
+                timeout_s=FULL_CHECKPOINT_STAGE_TIMEOUT_S,
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != 404:
+                raise
+            await _admin_post(
+                client,
+                "/collective_rpc",
+                json={"method": "stage_full_checkpoint", "args": [checkpoint_url_posix]},
+                timeout_s=FULL_CHECKPOINT_STAGE_TIMEOUT_S,
+            )
+
+    await asyncio.gather(*[_stage(client) for client in admin_clients])
 
 
 async def update_weights(
@@ -416,31 +482,53 @@ async def update_weights(
     weight_dir_posix = str(weight_dir) if weight_dir is not None else None
 
     if lora_name is not None and weight_dir is not None:
-        await load_lora_adapter(admin_clients, lora_name, weight_dir)
+        # vLLM's fused MoE LoRA load is a worker collective. Running it while
+        # decode requests remain registered repeatedly stalled h200b in x64p:
+        # the token counter stopped and EngineCore logged one unavailable
+        # shared-memory broadcast block per minute until the watchdog restart.
+        # The dispatcher's version-pending hook drains registered requests
+        # before this function runs. Pause here to prevent the engine from
+        # admitting work during the collective. Always resume, including after
+        # a bounded load failure.
+        await _pause_engines(admin_clients, step=step)
+        try:
+            await load_lora_adapter(admin_clients, lora_name, weight_dir)
+        finally:
+            await _resume_engines(admin_clients)
     else:
         # Pause engines so all DP workers drain in-flight work and can join the NCCL broadcast
         await _pause_engines(admin_clients, step=step)
 
         try:
             # Create ready marker before servers enter receive path (used by NCCL broadcast)
-            if weight_dir is not None:
-                assert isinstance(weight_dir, Path)
+            if isinstance(weight_dir, Path):
                 nccl_ready_file = weight_dir / NCCL_READY_MARKER
                 nccl_ready_file.parent.mkdir(parents=True, exist_ok=True)
                 nccl_ready_file.touch()
                 logger.debug(f"Created NCCL_READY marker at {nccl_ready_file}")
 
-            await asyncio.gather(
-                *[
-                    _admin_post(
+            async def _update(admin_client: AsyncClient) -> None:
+                try:
+                    await _admin_post(
                         admin_client,
                         "/update_weights",
                         json={"weight_dir": weight_dir_posix},
                         timeout_s=UPDATE_WEIGHTS_TIMEOUT_S,
                     )
-                    for admin_client in admin_clients
-                ]
-            )
+                except httpx.HTTPStatusError as exc:
+                    # New vLLM reserves /update_weights for its typed transport
+                    # API. Its development RPC route invokes the same mounted
+                    # worker extension without changing established engines.
+                    if exc.response.status_code != 400:
+                        raise
+                    await _admin_post(
+                        admin_client,
+                        "/collective_rpc",
+                        json={"method": "update_weights_from_path", "args": [weight_dir_posix]},
+                        timeout_s=UPDATE_WEIGHTS_TIMEOUT_S,
+                    )
+
+            await asyncio.gather(*[_update(admin_client) for admin_client in admin_clients])
         finally:
             await _resume_engines(admin_clients)
 
@@ -485,17 +573,6 @@ async def load_lora_adapter(admin_clients: list[AsyncClient], lora_name: str, lo
         wait=wait_exponential(multiplier=1, min=1, max=10),
         reraise=True,
     )
-    async def _adapter_is_visible(admin_client: AsyncClient) -> bool:
-        try:
-            response = await admin_client.get(
-                "/v1/models",
-                timeout=httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0),
-            )
-            response.raise_for_status()
-            return any(model.get("id") == lora_name for model in response.json().get("data", []))
-        except Exception:
-            return False
-
     async def _load_lora_adapter(admin_client: AsyncClient) -> None:
         logger.debug(f"Sending request to load LoRA adapter {lora_name} from {lora_path}")
         try:
@@ -517,7 +594,7 @@ async def load_lora_adapter(admin_clients: list[AsyncClient], lora_name: str, lo
             )
             response.raise_for_status()
         except (TimeoutError, httpx.TimeoutException, httpx.TransportError):
-            if await _adapter_is_visible(admin_client):
+            if await model_is_visible(admin_client, lora_name):
                 logger.warning(
                     f"LoRA load response from {admin_client.base_url} did not finish, "
                     f"but adapter {lora_name} is visible; accepting the completed load"

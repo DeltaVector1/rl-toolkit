@@ -1,4 +1,5 @@
 from collections.abc import Callable, Sequence
+import json
 from pathlib import Path
 from typing import TypedDict
 
@@ -60,16 +61,61 @@ class TensorMicroBatch(TypedDict):
 
 
 class FakeDataLoader:
-    def __init__(self, config: FakeDataLoaderConfig, seq_len: int, dp_world_size: int):
+    def __init__(
+        self,
+        config: FakeDataLoaderConfig,
+        seq_len: int,
+        dp_world_size: int,
+        dp_rank: int,
+    ):
         self.world = get_world()
         self.dp_world_size = dp_world_size
-        self.non_dp_world_size = self.world.world_size // self.dp_world_size
-        self.dp_rank = self.world.rank // self.non_dp_world_size
+        if not 0 <= dp_rank < dp_world_size:
+            raise ValueError(f"invalid dp_rank={dp_rank} for dp_world_size={dp_world_size}")
+        self.dp_rank = dp_rank
 
         self.batch_size = config.batch_size
         self.num_micro_batches = self.batch_size // self.dp_world_size
         self.seq_len = seq_len
         self.generate_samples = config.generate_samples
+        self.ce_only = config.ce_only
+        reference_payload = (
+            json.loads(config.reference_path.read_text())
+            if config.reference_path is not None
+            else None
+        )
+        self.references = None
+        if reference_payload is not None:
+            self.references = reference_payload.get("microbatches", [reference_payload])
+            if not self.references:
+                raise ValueError("fake reference contains no microbatches")
+            if len(self.references) not in (1, self.num_micro_batches):
+                raise ValueError(
+                    "fake reference must contain one microbatch or exactly "
+                    f"{self.num_micro_batches}, got {len(self.references)}"
+                )
+        if self.references is not None and self.ce_only:
+            raise ValueError("fake reference_path and ce_only are mutually exclusive")
+        for reference in self.references or ():
+            token_count = len(reference["input_ids"])
+            if token_count != self.seq_len:
+                raise ValueError(
+                    f"fake reference has {token_count} tokens, expected seq_len={self.seq_len}"
+                )
+            if len(reference["inference_logprobs"]) != token_count:
+                raise ValueError("fake reference log probabilities do not align with its tokens")
+            if (
+                reference.get("loss_mask") is not None
+                and len(reference["loss_mask"]) != token_count
+            ):
+                raise ValueError("fake reference loss mask does not align with its tokens")
+            if (
+                reference.get("advantages") is not None
+                and len(reference["advantages"]) != token_count
+            ):
+                raise ValueError("fake reference advantages do not align with its tokens")
+            if sum(reference["sequence_lengths"]) != token_count:
+                raise ValueError("fake reference sequence lengths do not cover its tokens")
         self.batch_counter = 0
         self.multi_run_manager = get_multi_run_manager()
 
@@ -87,10 +133,65 @@ class FakeDataLoader:
         for micro_batch_idx in range(self.num_micro_batches):
             seed = self.dp_rank * 1000000 + self.batch_counter * 1000 + micro_batch_idx
             generator = torch.Generator().manual_seed(seed)
-            micro_batches.append(get_micro_batch_fn(generator))
+            if self.references is not None:
+                reference = self.references[micro_batch_idx % len(self.references)]
+                micro_batches.append(self._get_reference_micro_batch(reference))
+            else:
+                micro_batches.append(get_micro_batch_fn(generator))
 
         self.batch_counter += 1
         return micro_batches
+
+    def _get_reference_micro_batch(self, reference: dict) -> TensorMicroBatch:
+        input_ids = torch.tensor(reference["input_ids"], dtype=torch.long)
+        inference_logprobs = torch.tensor(
+            reference["inference_logprobs"], dtype=torch.float
+        )
+        sequence_lengths = list(reference["sequence_lengths"])
+        position_ids = torch.cat([torch.arange(length) for length in sequence_lengths])
+        reference_mask = reference.get("loss_mask")
+        loss_mask = (
+            torch.tensor(reference_mask, dtype=torch.bool)
+            if reference_mask is not None
+            else torch.ones(input_ids.shape[0], dtype=torch.bool)
+        )
+        offset = 0
+        for length in sequence_lengths:
+            # A sequence has no preceding token in its own attention block.
+            # Keep this false even when a supplied rollout mask is malformed.
+            loss_mask[offset] = False
+            offset += length
+        reference_advantages = reference.get("advantages")
+        advantages = (
+            torch.tensor(reference_advantages, dtype=torch.float)
+            if reference_advantages is not None
+            else torch.zeros_like(inference_logprobs)
+        )
+        lora_num_tokens = torch.zeros(
+            self.multi_run_manager.max_runs, dtype=torch.int32
+        )
+        lora_num_tokens[0] = input_ids.shape[0]
+        return {
+            "input_ids": input_ids.unsqueeze(0),
+            "position_ids": position_ids.unsqueeze(0),
+            "advantages": advantages.unsqueeze(0),
+            "inference_logprobs": inference_logprobs.unsqueeze(0),
+            "ref_logprobs": None,
+            "temperatures": torch.ones_like(inference_logprobs).unsqueeze(0),
+            "env_names": ["direct_parity"] * input_ids.shape[0],
+            "sequence_lengths": sequence_lengths,
+            "loss_mask": loss_mask.unsqueeze(0),
+            "lora_num_tokens": lora_num_tokens,
+            "seq_lens": torch.tensor(sequence_lengths, dtype=torch.long),
+            "routed_experts": None,
+            "mm_kwargs": None,
+            "mm_token_type_ids": None,
+            "rl_weights": None,
+            "ce_weights": None,
+            "ref_kl_weights": None,
+            "run_id": None,
+            "run_step": None,
+        }
 
     def _get_sample_micro_batch(self, generator: torch.Generator) -> TensorMicroBatch:
         total_seq_len = 0
@@ -119,6 +220,9 @@ class FakeDataLoader:
         lora_num_tokens = torch.zeros(self.multi_run_manager.max_runs, dtype=torch.int32)
         lora_num_tokens[0] = input_ids.shape[0]
 
+        rl_weights = torch.zeros(input_ids.shape[0]) if self.ce_only else None
+        ce_weights = torch.ones(input_ids.shape[0]) if self.ce_only else None
+
         return {
             "input_ids": input_ids.unsqueeze(0),
             "position_ids": position_ids.unsqueeze(0),
@@ -134,8 +238,8 @@ class FakeDataLoader:
             "routed_experts": None,
             "mm_kwargs": None,
             "mm_token_type_ids": None,
-            "rl_weights": None,
-            "ce_weights": None,
+            "rl_weights": rl_weights.unsqueeze(0) if rl_weights is not None else None,
+            "ce_weights": ce_weights.unsqueeze(0) if ce_weights is not None else None,
             "ref_kl_weights": None,
             "run_id": None,
             "run_step": None,
@@ -144,6 +248,8 @@ class FakeDataLoader:
     def _get_micro_batch(self, generator: torch.Generator) -> TensorMicroBatch:
         lora_num_tokens = torch.zeros(self.multi_run_manager.max_runs, dtype=torch.int32)
         lora_num_tokens[0] = self.seq_len
+        rl_weights = torch.zeros(self.seq_len) if self.ce_only else None
+        ce_weights = torch.ones(self.seq_len) if self.ce_only else None
         return {
             "input_ids": torch.randint(
                 0,
@@ -167,8 +273,8 @@ class FakeDataLoader:
             "routed_experts": None,
             "mm_kwargs": None,
             "mm_token_type_ids": None,
-            "rl_weights": None,
-            "ce_weights": None,
+            "rl_weights": rl_weights.unsqueeze(0) if rl_weights is not None else None,
+            "ce_weights": ce_weights.unsqueeze(0) if ce_weights is not None else None,
             "ref_kl_weights": None,
             "run_id": None,
             "run_step": None,
@@ -183,6 +289,7 @@ class DataLoader:
         output_dir: Path,
         start_step: int,
         dp_world_size: int,
+        dp_rank: int,
         seq_len: int,
         pad_to_multiple_of: int,
         bin_cost: Callable[[Sequence[int]], int],
@@ -200,8 +307,8 @@ class DataLoader:
                 start_step=start_step,
             )
 
-        non_dp_world_size = self.world.world_size // dp_world_size
-        dp_rank = self.world.rank // non_dp_world_size
+        if not 0 <= dp_rank < dp_world_size:
+            raise ValueError(f"invalid dp_rank={dp_rank} for dp_world_size={dp_world_size}")
         self.multi_run_manager = get_multi_run_manager()
 
         self.receiver: MicroBatchReceiver = setup_micro_batch_receiver(output_dir, dp_rank, start_step, config)

@@ -24,8 +24,9 @@ from vllm.model_executor.layers.fused_moe.fused_moe import (
 
 
 block_shape = [128, 128]
-_FP8_W13_CHUNK_ROWS = 4096
+_FP8_W13_CHUNK_ROWS = 2048
 _FP8_W2_CHUNK_ROWS = 2048
+_FP8_EXPERT_BACKWARD_CHUNK_ROWS = 2048
 _FP8_ROUTE_SCALE_CHUNK_ROWS = 4096
 _FP8_EXPERT_ACTIVATION_OFFLOAD = (
     os.environ.get("PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD", "") == "1"
@@ -85,7 +86,6 @@ def _profile_expert_backward(start, end) -> None:
 
 
 if hasattr(triton, "jit"):
-
     @triton.jit
     def _block_fp8_mm_kernel(
         x,
@@ -876,13 +876,28 @@ def _prepare_grouped_mm(x, weight, offsets):
 
 
 def _quantize_grouped_mm_input(x):
-    return moe_kernel_quantize_input(
-        x,
-        None,
-        torch.float8_e4m3fn,
-        False,
-        block_shape,
-    )
+    try:
+        return moe_kernel_quantize_input(
+            x,
+            None,
+            torch.float8_e4m3fn,
+            False,
+            block_shape,
+        )
+    except torch.OutOfMemoryError:
+        # The quantizer allocates its FP8 output before launching its kernel.
+        # A routed-row peak can leave enough bytes in unused allocator blocks
+        # but no block that fits that output. Release only unused cache and
+        # retry the identical quantization once. A live-set OOM still fails on
+        # the second call.
+        torch.cuda.empty_cache()
+        return moe_kernel_quantize_input(
+            x,
+            None,
+            torch.float8_e4m3fn,
+            False,
+            block_shape,
+        )
 
 
 def _dispatch_grouped_mm(
@@ -899,7 +914,20 @@ def _dispatch_grouped_mm(
     offsets,
 ):
     output_size = weight.shape[1]
-    out = torch.empty(x.shape[0], 1, output_size, device=x.device, dtype=x.dtype)
+    try:
+        out = torch.empty(
+            x.shape[0], 1, output_size, device=x.device, dtype=x.dtype
+        )
+    except torch.OutOfMemoryError:
+        # A routed-row peak can coincide with allocator fragmentation. x72p
+        # rank 18 failed a 24 MiB allocation while PyTorch reported 1.16 GiB
+        # reserved but unallocated. Release only unused cached blocks and make
+        # one bounded retry. A true live-set OOM still fails immediately on
+        # the second allocation.
+        torch.cuda.empty_cache()
+        out = torch.empty(
+            x.shape[0], 1, output_size, device=x.device, dtype=x.dtype
+        )
     dispatch_fused_moe_kernel(
         quantized,
         weight,
@@ -1013,6 +1041,39 @@ def _expert_chunk_offsets(offsets, start, end):
     return torch.cumsum(counts, 0, dtype=torch.int32)
 
 
+def _index_select_rows_with_cache_retry(x, indices):
+    """Gather one bounded expert row chunk, with one fragmentation retry.
+
+    The production allocator can have enough unused reserved memory in total
+    while no cached block is large enough for a contiguous BF16 row gather.
+    x74p rank 17 failed a 48 MiB gather with 179 MiB reserved but unused. A
+    one-time cache release preserves the bounded-row path and turns that
+    allocator-fragmentation case into physically available memory. A true
+    live-set OOM still fails on the second allocation.
+    """
+    try:
+        return x.index_select(0, indices)
+    except torch.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        return x.index_select(0, indices)
+
+
+def _index_copy_real_rows_with_cache_retry(destination, indices, source, real):
+    """Scatter one bounded real-row chunk with one fragmentation retry.
+
+    Keep this on PyTorch's already-loaded indexing path. A custom Triton
+    scatter first encountered a new kernel variant during x79p step 4 and
+    failed while loading its CUDA module at the full model live set. The
+    2,048-row bound limits the boolean source gather to 24 MiB here.
+    """
+    try:
+        destination.index_copy_(0, indices[real].long(), source[real])
+    except torch.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        destination.index_copy_(0, indices[real].long(), source[real])
+    return destination
+
+
 def _grouped_mm_pair_chunks(x, w1, s1, w3, s3, offsets, chunk_rows):
     """Yield bounded W1/W3 outputs with one quantization for each row chunk."""
     for start in range(0, x.shape[0], chunk_rows):
@@ -1057,6 +1118,26 @@ def _grouped_mm_chunked(x, weight, scale, offsets, chunk_rows=None):
             )
         )
     return out
+
+
+def _silu_glu_backward_inplace(hidden_grad, z1, z3):
+    """Return SiLU-GLU input gradients with no extra gate-gradient tensor.
+
+    The inputs and returned tensors are backward-only temporaries. Reuse
+    ``hidden_grad`` for the gate gradient and ``z3_grad`` for the other
+    product. The operation order matches the original expression. This
+    removes the large expression temporaries that caused a random production
+    OOM near the 48 GiB limit.
+    """
+    sigmoid = torch.sigmoid(z1)
+    z3_grad = F.silu(z1)
+    z3_grad.mul_(hidden_grad)
+    hidden_grad.mul_(z3).mul_(sigmoid)
+    # z1 <- 1 + z1 * (1 - sigmoid(z1))
+    sigmoid.neg_().add_(1)
+    z1.mul_(sigmoid).add_(1)
+    hidden_grad.mul_(z1)
+    return hidden_grad, z3_grad
 
 
 class _Experts(torch.autograd.Function):
@@ -1181,9 +1262,8 @@ class _Experts(torch.autograd.Function):
         hidden_grad = _grouped_mm_chunked(
             grad, w2.transpose(-2, -1), s2.transpose(-2, -1), offsets
         )
-        sigmoid = torch.sigmoid(z1)
-        z1_grad = hidden_grad * z3 * sigmoid * (1 + z1 * (1 - sigmoid))
-        z3_grad = hidden_grad * F.silu(z1)
+        z1_grad, z3_grad = _silu_glu_backward_inplace(hidden_grad, z1, z3)
+        del hidden_grad, z1, z3
         x_grad, x_grad_w3 = _grouped_mm_pair(
             z1_grad,
             w1.transpose(-2, -1),
@@ -1193,7 +1273,7 @@ class _Experts(torch.autograd.Function):
             s3.transpose(-2, -1),
             offsets,
         )
-        del hidden_grad, sigmoid, z1, z3, z1_grad
+        del z1_grad, z3_grad
         x_grad.add_(x_grad_w3)
         if _EXPERT_PROFILE:
             profile_end.record()
@@ -1249,7 +1329,7 @@ class _InplacePermutedExperts(torch.autograd.Function):
             indices = permuted_indices[start:end]
             real = (indices >= 0) & (indices < x.shape[0])
             safe_indices = indices.clamp(min=0, max=x.shape[0] - 1).long()
-            chunk_x = x.index_select(0, safe_indices)
+            chunk_x = _index_select_rows_with_cache_retry(x, safe_indices)
             chunk_x.masked_fill_((~real).unsqueeze(-1), 0)
             chunk_offsets = _expert_chunk_offsets(offsets, start, end)
             z1, z3 = _grouped_mm_pair(
@@ -1262,21 +1342,35 @@ class _InplacePermutedExperts(torch.autograd.Function):
                 chunk_offsets,
                 shared_input=True,
             )
+            # The W2 result is hidden-size wide. Release the gathered input
+            # before W2 allocates its output. In x72p step 39, retaining this
+            # 24 MiB tensor left only 1.5 MiB free and the following 24 MiB
+            # grouped-matrix output failed on rank 18.
+            del chunk_x, safe_indices
             q1, qs1 = ops.scaled_fp8_quant(z1, use_per_token_if_dynamic=True)
             q3, qs3 = ops.scaled_fp8_quant(z3, use_per_token_if_dynamic=True)
             q1_host[start:end].copy_(q1, non_blocking=True)
             q3_host[start:end].copy_(q3, non_blocking=True)
             qs1_parts.append(qs1)
             qs3_parts.append(qs3)
+            # The copies are ordered on the current CUDA stream. Dropping the
+            # source references here lets the caching allocator reuse their
+            # storage after the copies finish, before the W2 allocation.
+            del q1, q3
             F.silu(z1, inplace=True)
             z1.mul_(z3)
+            del z3
             chunk_out = _grouped_mm_chunked(
                 z1,
                 w2,
                 s2,
                 chunk_offsets,
             )
-            x.index_copy_(0, indices[real].long(), chunk_out[real])
+            _index_copy_real_rows_with_cache_retry(x, indices, chunk_out, real)
+            # Do not retain one completed W2 output while Python evaluates
+            # the next W1/W3 call. At 4,096 rows the old gated activation and
+            # W2 output otherwise keep another 56 MiB live across chunks.
+            del z1, chunk_out, indices, real, chunk_offsets
 
         qs1 = torch.cat(qs1_parts, dim=0)
         qs3 = torch.cat(qs3_parts, dim=0)
@@ -1286,6 +1380,7 @@ class _InplacePermutedExperts(torch.autograd.Function):
         ctx.offload_done = offload_done
         ctx.source_rows = x.shape[0]
         ctx.chunk_rows = chunk_rows
+        ctx.backward_chunk_rows = min(chunk_rows, _FP8_EXPERT_BACKWARD_CHUNK_ROWS)
         if owner is None:
             ctx.save_for_backward(
                 q1_host,
@@ -1356,12 +1451,12 @@ class _InplacePermutedExperts(torch.autograd.Function):
         torch.cuda.current_stream(grad.device).wait_event(ctx.offload_done)
         grad = grad.contiguous()
         rows = permuted_indices.shape[0]
-        for start in range(0, rows, ctx.chunk_rows):
-            end = min(start + ctx.chunk_rows, rows)
+        for start in range(0, rows, ctx.backward_chunk_rows):
+            end = min(start + ctx.backward_chunk_rows, rows)
             indices = permuted_indices[start:end]
             real = (indices >= 0) & (indices < ctx.source_rows)
             safe_indices = indices.clamp(min=0, max=ctx.source_rows - 1).long()
-            grad_chunk = grad.index_select(0, safe_indices)
+            grad_chunk = _index_select_rows_with_cache_retry(grad, safe_indices)
             grad_chunk.masked_fill_((~real).unsqueeze(-1), 0)
             chunk_offsets = _expert_chunk_offsets(offsets, start, end)
 
@@ -1377,9 +1472,8 @@ class _InplacePermutedExperts(torch.autograd.Function):
                 s2.transpose(-2, -1),
                 chunk_offsets,
             )
-            sigmoid = torch.sigmoid(z1)
-            z1_grad = hidden_grad * z3 * sigmoid * (1 + z1 * (1 - sigmoid))
-            z3_grad = hidden_grad * F.silu(z1)
+            z1_grad, z3_grad = _silu_glu_backward_inplace(hidden_grad, z1, z3)
+            del hidden_grad, z1, z3
             x_grad, x_grad_w3 = _grouped_mm_pair(
                 z1_grad,
                 w1.transpose(-2, -1),
@@ -1390,7 +1484,21 @@ class _InplacePermutedExperts(torch.autograd.Function):
                 chunk_offsets,
             )
             x_grad.add_(x_grad_w3)
-            grad.index_copy_(0, indices[real].long(), x_grad[real])
+            _index_copy_real_rows_with_cache_retry(grad, indices, x_grad, real)
+            # Release this chunk before the next chunk allocates. Assignment
+            # keeps the previous value alive until the new RHS completes, so
+            # relying on name reuse briefly retains two chunks.
+            del (
+                indices,
+                real,
+                safe_indices,
+                grad_chunk,
+                chunk_offsets,
+                z1_grad,
+                z3_grad,
+                x_grad,
+                x_grad_w3,
+            )
 
         if _EXPERT_PROFILE:
             profile_end.record()

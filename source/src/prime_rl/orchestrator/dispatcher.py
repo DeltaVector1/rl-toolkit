@@ -50,6 +50,12 @@ from prime_rl.utils.client import InferencePool, client_identity
 from prime_rl.utils.logger import get_logger
 
 
+# Let already-running members close useful GRPO groups before a strict policy
+# boundary cancels the remainder. This is deliberately shorter than the
+# measured long-generation tail; the boundary still has a hard upper bound.
+POLICY_GROUP_DRAIN_GRACE_S = 60
+
+
 class DispatcherMode(Enum):
     """Which kind of work the dispatcher schedules next."""
 
@@ -173,6 +179,16 @@ class RolloutDispatcher:
         # *why* — the orchestrator toggles this based on step / policy lead.
         self.dispatch_allowed = asyncio.Event()
         self.dispatch_allowed.set()
+        self.weight_update_pending = False
+        self.policy_group_drain_pending = False
+        # Policy versions whose active train batch already shipped while the
+        # watcher waited. Only overflow groups remain, so another drain grace
+        # would delay the update and then discard the same overflow anyway.
+        self.batch_boundary_complete_steps: set[int] = set()
+        # Old group ids whose partial results were invalidated at a policy
+        # boundary. Queued results with these ids must not reach a sink.
+        self.abandoned_group_ids: set[uuid.UUID] = set()
+        self.policy_restart_groups: dict[int, set[uuid.UUID]] = {}
 
         self.stopped = asyncio.Event()
         self.task: asyncio.Task | None = None
@@ -301,40 +317,122 @@ class RolloutDispatcher:
             self.task = None
 
     async def on_version_pending(self, step: int) -> None:
-        """Bump off-policy counters and drop groups past
-        ``max_off_policy_steps`` (drop_group emits ``Cancelled`` markers so
-        the sink still finalizes the partial group). Eval rollouts are not
-        aged because they are tied to their start-time policy version.
+        """Stop admission and restart incomplete live-policy groups at ``step``.
 
-        Runs *before* the inference engines are paused for the weight update so
-        the resulting aborts are processed while the engine is still stepping —
-        otherwise the orphaned KV transfers crash the decode engine on resume
-        (see ``WeightWatcher.apply_policy_update``)."""
-        stale_groups: set[uuid.UUID] = set()
-        cancelled = 0
-        for meta in self.inflight.values():
-            if meta.kind != "train":
+        A fused MoE LoRA load needs an empty vLLM scheduler. Waiting for every
+        long-tail request made policy updates take 5 to 10 minutes in x71p.
+        Cancelling only unfinished members would corrupt the GRPO baseline, so
+        preserve each prompt and regenerate its complete group under the new
+        policy. Eval remains a version-pinned measurement and drains naturally.
+        """
+        # Set this before any cancellation so fill_inflight cannot schedule a
+        # task between the snapshot and the group reset.
+        self.weight_update_pending = True
+        old_group_ids = {
+            gid
+            for gid, group in self.groups.items()
+            if group.kind == "train"
+            and self.train_envs.get(group.env_name).sampler.samples_from_live_policy
+        }
+        self.abandoned_group_ids.update(old_group_ids)
+        self.policy_restart_groups[step] = set(old_group_ids)
+
+        tasks_to_cancel: list[asyncio.Task] = []
+        cancelled_rollouts = 0
+        for task, meta in list(self.inflight.items()):
+            if meta.group_id not in old_group_ids:
                 continue
-            # Frozen-sourced rollouts never go stale — their sampler doesn't
-            # change with policy updates.
-            if not self.train_envs.get(meta.env_name).sampler.samples_from_live_policy:
+            self.inflight.pop(task, None)
+            self.release(meta.rollout_count)
+            self.metrics.record_cancellation(kind="train", env_name=meta.env_name, n=meta.rollout_count)
+            cancelled_rollouts += meta.rollout_count
+            tasks_to_cancel.append(task)
+
+        restarted = 0
+        discarded_episodes = 0
+        for old_gid in old_group_ids:
+            group = self.groups.pop(old_gid, None)
+            if group is None:
                 continue
-            meta.off_policy_steps += 1
-            if meta.off_policy_steps > self.max_off_policy_steps:
-                stale_groups.add(meta.group_id)
+            discarded_episodes += group.emitted
+            group.emitted = 0
+            group.rollouts_to_schedule = group.target_rollouts
+            group.pinned_client = None
+            group.policy_version_at_start = step
+            self.groups[uuid.uuid4()] = group
+            restarted += 1
 
-        for gid in stale_groups:
-            removed = await self.drop_group(gid)
-            cancelled += removed
-
-        if cancelled:
-            get_logger().warning(
-                f"Cancelled {cancelled} train rollouts past max_off_policy_steps={self.max_off_policy_steps}. "
-                "Consider increasing it to avoid this."
+        if tasks_to_cancel:
+            await safe_cancel_all(tasks_to_cancel)
+        if restarted:
+            get_logger().info(
+                f"Policy v{step}: restarting {restarted} incomplete GRPO group(s) from their original prompts "
+                f"({cancelled_rollouts} live and {discarded_episodes} completed rollout(s) discarded)"
             )
 
+        # Eval is a version-pinned measurement. Do not silently move it to a
+        # different policy.
+        while any(meta.kind == "eval" for meta in self.inflight.values()) and not self.stopped.is_set():
+            await asyncio.sleep(0.1)
+
+    async def wait_for_policy_update_boundary(self, step: int) -> None:
+        """Bounded grace for incomplete groups that already have useful rows.
+
+        Stop opening fresh prompts, but continue scheduling the remaining
+        members of groups already in progress. Fully completed groups leave
+        ``self.groups`` and remain valid old-policy input. The normal strict
+        boundary then restarts only the groups that remain incomplete.
+        """
+        if step in self.batch_boundary_complete_steps:
+            self.batch_boundary_complete_steps.discard(step)
+            get_logger().info(
+                f"Policy v{step}: active rollout batch already shipped; "
+                "skipping overflow-group grace"
+            )
+            return
+
+        live_groups = {
+            gid: group
+            for gid, group in self.groups.items()
+            if group.kind == "train"
+            and self.train_envs.get(group.env_name).sampler.samples_from_live_policy
+        }
+        completed = sum(group.emitted for group in live_groups.values())
+        smallest_group = min((group.target_rollouts for group in live_groups.values()), default=1)
+        if completed < smallest_group:
+            return
+
+        self.policy_group_drain_pending = True
+        get_logger().info(
+            f"Policy v{step}: giving {len(live_groups)} incomplete GRPO group(s) up to "
+            f"{POLICY_GROUP_DRAIN_GRACE_S}s to finish ({completed} completed member(s) retained)"
+        )
+        deadline = monotonic() + POLICY_GROUP_DRAIN_GRACE_S
+        while monotonic() < deadline and not self.stopped.is_set():
+            if not any(
+                group.kind == "train"
+                and self.train_envs.get(group.env_name).sampler.samples_from_live_policy
+                for group in self.groups.values()
+            ):
+                break
+            await asyncio.sleep(0.1)
+
+    def mark_batch_boundary_complete(self, step: int) -> None:
+        """Skip grace once when the orchestrator already shipped the batch."""
+        self.batch_boundary_complete_steps.add(step)
+
+    def is_abandoned_group(self, group_id: uuid.UUID) -> bool:
+        """Return whether a queued episode belongs to an invalidated group."""
+        return group_id in self.abandoned_group_ids
+
+    def restarted_group_ids(self, step: int) -> set[uuid.UUID]:
+        """Old group ids invalidated while preparing policy ``step``."""
+        return set(self.policy_restart_groups.get(step, set()))
+
     async def on_new_version(self, step: int) -> None:
-        """No-op: the dispatcher drains in ``on_version_pending`` (pre-pause)."""
+        """Allow scheduling after the pre-pause request drain and update."""
+        self.weight_update_pending = False
+        self.policy_group_drain_pending = False
 
     async def fill_inflight(self) -> None:
         """Schedule new rollouts up to ``max_inflight``, honoring
@@ -343,6 +441,8 @@ class RolloutDispatcher:
         respects it. When ``PREFER_EVAL``'s source exhausts we flip back to
         ``PREFER_TRAIN`` so the eval tail drains alongside fresh train."""
         while True:
+            if self.weight_update_pending:
+                return
             if self.available_permits <= 0:
                 return
 
@@ -392,7 +492,9 @@ class RolloutDispatcher:
             if cost <= self.available_permits:
                 return await self.schedule_group_rollout(gid, group)
 
-        if kind == "train" and not self.fresh_train_groups_allowed.is_set():
+        if kind == "train" and (
+            not self.fresh_train_groups_allowed.is_set() or self.policy_group_drain_pending
+        ):
             return False
 
         fresh = self.next_fresh_group(kind, envs)
@@ -586,19 +688,30 @@ class RolloutDispatcher:
                 r.capture_error(exc)
             is_synth_exception = True
 
+        transient_policy_failure = (
+            len(rollouts) == 1 and self._is_transient_policy_failure(rollouts[0])
+        )
+        transient_user_simulator_failure = (
+            len(rollouts) == 1 and self._is_transient_user_simulator_failure(rollouts[0])
+        )
         if (
             meta.rollout_count == 1
             and group is not None
             and meta.client_config is not None
             and len(rollouts) == 1
             and (
-                self._is_transient_policy_failure(rollouts[0])
-                or (rollouts[0].num_turns == 0 and rollouts[0].stop_condition == "harness_timeout")
+                transient_policy_failure
+                or transient_user_simulator_failure
             )
         ):
             identity = client_identity(meta.client_config)
-            self.unhealthy_clients[identity] = monotonic() + 60
-            group.pinned_client = None
+            if not transient_user_simulator_failure:
+                # Policy transport failures are endpoint-local. Unpin and cool
+                # that endpoint before retrying. The user simulator is shared;
+                # moving the policy request cannot repair it, so retain the
+                # pinned client and retry only the missing group member.
+                self.unhealthy_clients[identity] = monotonic() + 60
+                group.pinned_client = None
             group.rollouts_to_schedule += 1
             if group.kind == "eval":
                 self.switch_mode(DispatcherMode.PREFER_EVAL, reason="an eval rollout is being retried")
@@ -607,11 +720,18 @@ class RolloutDispatcher:
             )
             get_logger().warning(
                 f"Retrying transient rollout failure in group {meta.group_id} "
-                f"({meta.env_name}) away from {identity[0]}: {detail}"
+                f"({meta.env_name})"
+                f"{' away from ' + identity[0] if not transient_user_simulator_failure else ''}: "
+                f"{detail}"
             )
             return
 
         for r in rollouts:
+            # A wall-clock harness timeout is a terminal rollout result. Do not
+            # reschedule it: muse12 retried one zero-turn timeout indefinitely
+            # and held a 1008/1024 batch for more than 90 minutes. The empty
+            # trajectory guard below turns it into an explicit failed member;
+            # TrainSink then rejects the complete GRPO group and replenishes it.
             if not r.has_error and r.num_turns == 0:
                 # Empty trajectory: promote to an explicit error so the sink
                 # treats it like any other failure (``has_error`` reads ``ok``)
@@ -644,6 +764,28 @@ class RolloutDispatcher:
         if error is None or error.type not in ("ProviderError", "HarnessError"):
             return False
         message = error.message.lower()
+        # A restarted vLLM process is healthy before it has the live LoRA.
+        # Requests then fail with a policy-model 404. Do not emit those as
+        # completed rollouts: unpin the endpoint and keep the GRPO group open
+        # while the weight watcher restores the adapter.
+        missing_policy_model = (
+            ("404" in message or "not found" in message or "does not exist" in message)
+            and "model" in message
+        )
+        if missing_policy_model:
+            return True
+        # vLLM can occasionally produce a NaN in response metadata while the
+        # generated token sequence itself remains bounded. Starlette refuses
+        # to serialize that response and vLLM returns this exact HTTP 400.
+        # Retry the missing group member on the other policy endpoint instead
+        # of discarding all 16 members of an otherwise valid GRPO group.
+        response_metadata_nan = (
+            error.type == "ProviderError"
+            and "out of range float values are not json compliant" in message
+            and "nan" in message
+        )
+        if response_metadata_nan:
+            return True
         if not any(
             marker in message
             for marker in ("connection", "timed out", "timeout", "readtimeout")
@@ -658,6 +800,18 @@ class RolloutDispatcher:
             getattr(call, "model", None) == self.policy.model_name
             and getattr(call, "error", None) is not None
             for call in getattr(rollout, "calls", [])
+        )
+
+    @staticmethod
+    def _is_transient_user_simulator_failure(rollout: Rollout) -> bool:
+        """Retry a user-simulator network failure without counting a bad row."""
+        error = rollout.error
+        if error is None or error.type != "UserError":
+            return False
+        message = error.message.lower()
+        return "user simulator failed" in message and any(
+            marker in message
+            for marker in ("connection", "timed out", "timeout", "readtimeout")
         )
 
     async def emit_episode(self, meta: InflightRollout, group: GroupState | None, rollouts: list[Rollout]) -> None:

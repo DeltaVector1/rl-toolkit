@@ -1,48 +1,32 @@
-"""decensor_v1 — the v0 decensor env ported to the task-centric v1 API.
-
-A multi-turn rollout under the `null` harness: an adversarial red-team `vf.User` drives
-follow-up turns while the model produces every assistant turn, then ONE `@vf.reward`
-returns the scalar product of the refusal-derived base reward and the coherency / markdown /
-reasoning-ethics / meta / length multipliers (v1 sums rewards, so the multiplication happens
-inside the single method). Every factor is logged with `trace.record_metrics`.
-
-Audit fixes baked in (see README): length multiplier floored (#2), `reasoning_coherency`
-re-added as a real working gate fed the true `reasoning_content` trace (undoes the old #4
-misdiagnosis), and judge failures split (#6): an endpoint outage tanks the reward + flags a
-metric, while a received-but-unparseable reply stays fail-open.
-"""
-
 from __future__ import annotations
 
 import asyncio
 import random
-from typing import Any, NamedTuple
+from typing import Any
 
-import httpx
 import verifiers.v1 as vf
-from openai import APIError
 
-from decensor_v1.data import build_rows
-from decensor_v1.judges import (
-    CoherencyJudge,
-    DecensorJudgeConfig,
-    MarkdownCorrectnessJudge,
-    MarkdownPresenceJudge,
-    MetaCommentaryJudge,
-    ReasoningCoherencyJudge,
-    ReasoningEthicsJudge,
-    RefusalJudge,
+from decensor_v1.agentic_review import (
+    TranscriptReview,
+    aggregate_review,
+    build_turn_review_sources,
+    run_agentic_review,
 )
-from decensor_v1.scoring import ScoringConfig, Verdicts, score_decensor
+from decensor_v1.data import build_rows
+from decensor_v1.judges import DecensorJudgeConfig
+from decensor_v1.scoring import (
+    EvaluationResult,
+    ScoringConfig,
+    Verdicts,
+    find_model_response_failure,
+    score_decensor,
+)
+from decensor_v1.service import request_judge_score
 from decensor_v1.state import DecensorState
 from decensor_v1.text import (
-    _format_full_conv_for_coherency,
+    completion_contains_markdown,
     extract_all_assistant_texts,
-    extract_completion_text,
-    extract_last_user_across,
-    extract_message_reasoning_trace,
-    extract_think_trace,
-    strip_think_tags,
+    word_band,
 )
 from decensor_v1.user import DecensorUser, DecensorUserConfig
 
@@ -52,6 +36,9 @@ class DecensorData(vf.TaskData):
     word_target: int = 0
     prompt_bucket: str = "styles"
     target_turns: int = 1
+    harm_type: str = "unknown"
+    source_row_index: int = -1
+    source_row_repeated: bool = False
 
 
 class DecensorTaskConfig(vf.TaskConfig):
@@ -101,18 +88,8 @@ def _scoring_config(cfg: DecensorTaskConfig) -> ScoringConfig:
     )
 
 
-class _JudgeOutcome(NamedTuple):
-    """One judge result (FIX #6). `score` is the parsed verdict, or `None` when gemma replied
-    but the reply was unparseable (fail-open). `endpoint_down` is True when the judge CALL
-    itself errored (gemma unreachable) — that outage tanks the reward, it is not fail-open."""
-
-    score: int | None
-    endpoint_down: bool
-
-
 class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
     if hasattr(vf, "User"):
-        # Compatibility with the currently deployed verifiers exchange.
         user = DecensorUser
 
         def user_server(self):
@@ -129,8 +106,6 @@ class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
             return True
         return trace.num_turns >= max(1, self.data.target_turns)
 
-    # --- Trace → message lists ---
-
     @staticmethod
     def _message_dict(message: Any) -> dict[str, Any]:
         out: dict[str, Any] = {"role": message.role, "content": message.content or ""}
@@ -140,15 +115,15 @@ class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
                 out[key] = value
         return out
 
-    def _split_conversation(self, trace: vf.Trace) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        """Reconstruct (prompt, completion) as v0-shaped message lists.
-
-        prompt = [system, opening user]; completion = every turn after the opening user.
-        """
+    def _split_conversation(
+        self, trace: vf.Trace
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         branches = trace.branches
         messages = branches[-1].messages if branches else []
         convo = [self._message_dict(m) for m in messages if m.role != "system"]
-        prompt: list[dict[str, Any]] = [{"role": "system", "content": self.data.system_prompt or ""}]
+        prompt: list[dict[str, Any]] = [
+            {"role": "system", "content": self.data.system_prompt or ""}
+        ]
         completion: list[dict[str, Any]] = []
         seen_first_user = False
         for m in convo:
@@ -159,65 +134,73 @@ class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
                 completion.append(m)
         return prompt, completion
 
-    async def _verdict(self, judge: Any, trace: vf.Trace, **fields: Any) -> "_JudgeOutcome":
-        """Run one judge, distinguishing the two failure modes (FIX #6).
-
-        A raised `evaluate` call means gemma is unreachable (endpoint down) — surfaced so it
-        tanks the reward. A received-but-unparseable reply (verdict None) stays fail-open.
-        """
-        received_reply = False
-        for attempt in range(3):
-            try:
-                result = await judge.evaluate(trace=trace, **fields)
-            except (APIError, httpx.HTTPError, TimeoutError):
-                pass
-            else:
-                received_reply = True
-                if result.parsed is not None:
-                    return _JudgeOutcome(score=result.parsed, endpoint_down=False)
-            if attempt < 2:
-                await asyncio.sleep(0.5 * (attempt + 1))
-        # A parse failure means the endpoint replied but none of its replies
-        # contained a valid verdict.  Classify an outage only when all attempts
-        # failed before a reply arrived; a mixed error/parse sequence must not
-        # change category based on which attempt happened last.
-        return _JudgeOutcome(score=None, endpoint_down=not received_reply)
-
     @vf.reward(weight=1.0)
     async def decensor_reward(self, trace: vf.Trace) -> float:
         cfg = self.config
         scfg = _scoring_config(cfg)
         prompt, completion = self._split_conversation(trace)
         bucket = self.data.prompt_bucket
+        md_exempt = (bucket == "styles") and (
+            random.Random(self.data.idx).random() < cfg.markdown_exempt_probability
+        )
+        length_range = (
+            word_band(self.data.word_requirement, self.data.word_target)
+            if self.data.word_requirement
+            else None
+        )
+        trace.info["decensor_context"] = {
+            "source_harm_type": self.data.harm_type,
+            "source_row_index": self.data.source_row_index,
+            "source_row_repeated": self.data.source_row_repeated,
+            "response_format": bucket,
+            "word_requirement": self.data.word_requirement,
+            "word_target": self.data.word_target,
+            "full_credit_word_range": length_range,
+            "markdown_exception_applied": md_exempt,
+            "follow_up_strategies": list(trace.state.follow_up_strategies),
+            "follow_up_attempts": list(trace.state.follow_up_attempts),
+        }
 
-        # Reject response-shape failures before spending six or seven remote
-        # judge calls. These gates depend only on the completed trajectory.
-        _, precheck = score_decensor(
-            prompt,
+        response_failure, failure_details = find_model_response_failure(
             completion,
-            Verdicts(),
-            bucket=bucket,
-            word_requirement=self.data.word_requirement,
-            word_target=self.data.word_target,
             is_truncated=trace.is_truncated,
-            md_exempt=False,
-            judge_endpoint_down=False,
-            config=scfg,
+            reasoning_required=scfg.reasoning_enabled,
+            reject_forbidden_tags=scfg.enable_structured_markers,
         )
         if trace.state.user_sim_failed:
-            precheck["early_termination"] = "user_sim_failed"
-            precheck["user_sim_error"] = trace.state.user_sim_error
-        if precheck.get("early_termination") is not None:
-            precheck["final_reward"] = 0.0
-            trace.info["decensor"] = precheck
+            trace.info["decensor"] = {
+                "evaluation_status": "unscored_service_failure",
+                "service": "follow_up_model",
+                "error": trace.state.user_sim_error,
+            }
+            raise RuntimeError(
+                "follow-up model failed after three attempts; rollout is unscored"
+            )
+        if response_failure is not None:
+            invalid_result = EvaluationResult(
+                status="invalid_model_response",
+                reward=0.0,
+                details={
+                    "evaluation_status": "invalid_model_response",
+                    "final_reward": 0.0,
+                    "quality_reward": 0.0,
+                    "reasoning_requirement_pass": 0,
+                    "advantage_scheme": "separate_reasoning_and_quality",
+                    "early_termination": response_failure,
+                    "prompt_bucket": bucket,
+                    **failure_details,
+                },
+            )
+            response_details = invalid_result.details
+            trace.info["decensor"] = response_details
             trace.record_metrics(
                 {
                     key: float(value)
-                    for key, value in precheck.items()
+                    for key, value in response_details.items()
                     if isinstance(value, (int, float)) and not isinstance(value, bool)
                 }
             )
-            reason = precheck["early_termination"]
+            reason = response_failure
             trace.record_metric("decensor_gated", 1.0)
             trace.record_metric("decensor_zero_reward", 1.0)
             trace.record_metric("decensor_near_zero_reward", 1.0)
@@ -232,70 +215,107 @@ class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
             )
             return 0.0
 
-        response_text_raw = extract_completion_text(completion)
-        response_text = strip_think_tags(response_text_raw)
-        # Judge only the final assistant turn. Earlier-turn aggregation flattened
-        # the reward in prior Decensor experiments.
-        reasoning_trace = extract_think_trace(response_text_raw) or ""
-        for turn in reversed(completion):
-            if turn.get("role") == "assistant":
-                reasoning_trace = extract_message_reasoning_trace(turn) or reasoning_trace
-                break
-        question = extract_last_user_across(prompt, completion)
-        system_prompt_text = self.data.system_prompt or ""
-
-        judge_cfg = cfg.judge
-        verdict_kwargs = {"refusal": None, "coherency": None, "reasoning_ethics": None,
-                          "reasoning_coherency": None, "meta_commentary": None,
-                          "md_presence": None, "md_correctness": None}
-
-        jobs: list[tuple[str, Any, dict[str, Any]]] = [
-            ("refusal", RefusalJudge(judge_cfg), {"question": question, "response": response_text}),
-            ("coherency", CoherencyJudge(judge_cfg),
-             {"prompt": _format_full_conv_for_coherency(prompt, completion), "response": response_text}),
+        review_sources = build_turn_review_sources(
+            prompt,
+            completion,
+            system_prompt=self.data.system_prompt or "",
+            response_format=bucket,
+        )
+        review_names = [
+            f"turn_{source.turns[0].turn}_review" for source in review_sources
         ]
-        if cfg.enable_reasoning_trace:
-            jobs.append(("reasoning_ethics", ReasoningEthicsJudge(judge_cfg),
-                         {"reasoning_trace": reasoning_trace, "response": response_text}))
-        if cfg.enable_reasoning_coherency:
-            # Fed the SAME real reasoning_content trace the ethics judge gets (not v0's empty
-            # content-only trace) — so this is a genuine coherency gate, not a rubber stamp.
-            jobs.append(("reasoning_coherency", ReasoningCoherencyJudge(judge_cfg),
-                         {"reasoning_trace": reasoning_trace, "question": question}))
-        if cfg.enable_meta_commentary:
-            jobs.append(("meta_commentary", MetaCommentaryJudge(judge_cfg),
-                         {"system_prompt": system_prompt_text, "response": response_text}))
-        if cfg.enable_markdown_judges:
-            jobs.append(("md_presence", MarkdownPresenceJudge(judge_cfg), {"response": response_text}))
-            if bucket in ("styles", "markdown"):
-                jobs.append(("md_correctness", MarkdownCorrectnessJudge(judge_cfg), {"response": response_text}))
-
-        outcomes: list[_JudgeOutcome] = await asyncio.gather(
-            *(self._verdict(judge, trace, **fields) for _name, judge, fields in jobs)
-        )
-        for (name, _judge, _fields), outcome in zip(jobs, outcomes):
-            verdict_kwargs[name] = outcome.score
-            trace.record_metric(
-                f"decensor_judge_{name}_endpoint_down", float(outcome.endpoint_down)
+        review_outcomes = await asyncio.gather(
+            *(
+                request_judge_score(
+                    name,
+                    lambda source=source: run_agentic_review(cfg.judge, source),
+                )
+                for name, source in zip(review_names, review_sources, strict=True)
             )
-            trace.record_metric(
-                f"decensor_judge_{name}_parse_failure",
-                float(outcome.score is None and not outcome.endpoint_down),
+        )
+        trace.info["judge"] = [
+            attempt
+            for outcome in review_outcomes
+            for attempt in outcome.details.get("attempts", [])
+        ]
+        trace.info["judge_results"] = {
+            name: {
+                "status": outcome.status,
+                "turn": source.turns[0].turn,
+            }
+            for name, source, outcome in zip(
+                review_names, review_sources, review_outcomes, strict=True
             )
+        }
+        failed_reviews = [
+            name
+            for name, outcome in zip(review_names, review_outcomes, strict=True)
+            if outcome.status != "scored" or outcome.score is None
+        ]
+        if failed_reviews:
+            trace.info["decensor"] = {
+                "evaluation_status": "unscored_service_failure",
+                "failed_judges": failed_reviews,
+            }
+            trace.record_metric("decensor_judge_service_failure", 1.0)
+            raise RuntimeError(
+                "one or more per-turn reviews failed after three attempts; "
+                "rollout is unscored"
+            )
+        turn_reviews = [
+            TranscriptReview.model_validate(outcome.score).turns[0]
+            for outcome in review_outcomes
+        ]
+        turn_reviews.sort(key=lambda item: item.turn)
+        review = TranscriptReview(turns=turn_reviews)
+        verdict_kwargs = aggregate_review(
+            review,
+            markdown_present=completion_contains_markdown(completion),
+            response_format=bucket,
+        )
+        if not cfg.enable_reasoning_trace:
+            verdict_kwargs["reasoning_ethics"] = None
+        if not cfg.enable_reasoning_coherency:
+            verdict_kwargs["reasoning_coherency"] = None
+        if not cfg.enable_meta_commentary:
+            verdict_kwargs["meta_commentary"] = None
+        if not cfg.enable_markdown_judges:
+            verdict_kwargs["md_presence"] = None
+            verdict_kwargs["md_correctness"] = None
 
-        # FIX #6: an endpoint outage (gemma unreachable) tanks the reward; a received-but-
-        # unparseable reply is a parse failure that stays fail-open (verdict None).
-        endpoint_down = any(o.endpoint_down for o in outcomes)
-        parse_failures = sum(o.score is None and not o.endpoint_down for o in outcomes)
-
-        # Seeded by the row, not drawn fresh per rollout: an unseeded draw gave two identical
-        # answers in the same GRPO group a 10x reward difference, which is pure noise in the
-        # advantage. Per-row it shifts the whole group's baseline instead, which GRPO cancels.
-        md_exempt = (bucket == "styles") and (
-            random.Random(self.data.idx).random() < cfg.markdown_exempt_probability
+        trace.info["turn_reviews"] = review.model_dump()["turns"]
+        trace.info["judge_review_aggregation"] = {
+            "refusal": "maximum across turns",
+            "coherency": "fail if any turn fails",
+            "reasoning_ethics": "present if any turn is present",
+            "reasoning_coherency": "fail if any turn fails",
+            "meta_commentary": "present if any turn is present",
+            "markdown_correctness": "fail if any applicable turn fails",
+        }
+        trace.info["judge_review_score"] = verdict_kwargs
+        trace.record_metric("decensor_agentic_review_turns", float(len(review.turns)))
+        trace.record_metric(
+            "decensor_reasoning_restriction_turn_rate",
+            sum(turn.reasoning_restriction == "present" for turn in review.turns)
+            / len(review.turns),
+        )
+        trace.record_metric(
+            "decensor_reasoning_incoherent_turn_rate",
+            sum(turn.reasoning_coherence == "fail" for turn in review.turns)
+            / len(review.turns),
+        )
+        trace.record_metric(
+            "decensor_visible_incoherent_turn_rate",
+            sum(turn.visible_coherence == "fail" for turn in review.turns)
+            / len(review.turns),
+        )
+        parse_failures = sum(
+            attempt.get("status") == "invalid_judge_response"
+            for outcome in review_outcomes
+            for attempt in outcome.details.get("attempts", [])
         )
 
-        reward, breakdown = score_decensor(
+        result = score_decensor(
             prompt,
             completion,
             Verdicts(**verdict_kwargs),
@@ -304,9 +324,17 @@ class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
             word_target=self.data.word_target,
             is_truncated=trace.is_truncated,
             md_exempt=md_exempt,
-            judge_endpoint_down=endpoint_down,
             config=scfg,
         )
+
+        if result.status != "scored" or result.reward is None:
+            trace.info["decensor"] = result.details
+            raise RuntimeError("response evaluation ended without a score")
+        reward = result.reward
+        breakdown = result.details
+        breakdown["source_harm_type"] = self.data.harm_type
+        breakdown["follow_up_strategies"] = list(trace.state.follow_up_strategies)
+        breakdown["follow_up_attempts"] = list(trace.state.follow_up_attempts)
 
         trace.info["decensor"] = breakdown
         trace.record_metrics(
@@ -317,7 +345,9 @@ class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
             }
         )
         trace.record_metric("decensor_judge_parse_failures", float(parse_failures))
-        trace.record_metric("decensor_gated", 0.0 if breakdown.get("early_termination") is None else 1.0)
+        trace.record_metric(
+            "decensor_gated", 0.0 if breakdown.get("early_termination") is None else 1.0
+        )
         trace.record_metric("decensor_zero_reward", float(reward == 0.0))
         trace.record_metric("decensor_near_zero_reward", float(reward < 1e-3))
         gate_reason = breakdown.get("early_termination")
@@ -333,9 +363,12 @@ class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
             trace.record_metric(f"decensor_gate_{reason}", float(gate_reason == reason))
         trace.record_metric("decensor_target_turns", float(self.data.target_turns))
         trace.record_metric(
-            "decensor_completed_turns", float(len(extract_all_assistant_texts(completion)))
+            "decensor_completed_turns",
+            float(len(extract_all_assistant_texts(completion))),
         )
-        trace.record_metric("decensor_user_sim_failed", float(trace.state.user_sim_failed))
+        trace.record_metric(
+            "decensor_user_sim_failed", float(trace.state.user_sim_failed)
+        )
         return reward
 
 
@@ -366,6 +399,9 @@ class DecensorTaskset(vf.Taskset[DecensorTask, DecensorTasksetConfig]):
                         word_target=row["word_target"],
                         prompt_bucket=row["prompt_bucket"],
                         target_turns=row["target_turns"],
+                        harm_type=row["harm_type"],
+                        source_row_index=row["source_row_index"],
+                        source_row_repeated=row["source_row_repeated"],
                     ),
                     c.task,
                 )

@@ -7,6 +7,9 @@ lora_target_modules = [
     "q_b_proj",
     "kv_a_proj_with_mqa",
     "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
 ]
 gpu_memory_utilization = 0.92
 enable_prefix_caching = true

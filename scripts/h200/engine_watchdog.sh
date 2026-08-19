@@ -25,9 +25,27 @@ MODEL=${MODEL:-/data/glm52-rl/model-fp8}
 INTERVAL=${INTERVAL:-60}
 TIMEOUT=${TIMEOUT:-15}
 FAILS_BEFORE_RESTART=${FAILS_BEFORE_RESTART:-2}
+# A deliberate engine replacement can leave the base-model endpoint absent
+# while the checkpoint loads. The repair command starts a fresh watchdog with
+# this grace so stale misses from the old engine cannot trigger a second
+# replacement during that load.
+STARTUP_GRACE=${STARTUP_GRACE:-0}
+# A LoRA collective can temporarily stop token progress while requests remain
+# registered in the engine. Two such stalls at policy updates on 2026-08-11
+# finished on the peer engine but made this watchdog discard h200b after only
+# two minutes. Give a busy engine a longer bounded grace. A dead or empty
+# EngineCore still uses FAILS_BEFORE_RESTART.
+BUSY_STALL_FAILS_BEFORE_RESTART=${BUSY_STALL_FAILS_BEFORE_RESTART:-5}
+# A blocked LoRA collective can report zero running requests while the complete
+# engine remains resident. This happened at x64p policy v3: h200b held
+# 132155 MiB but the ordinary two-probe limit restarted it. Treat a resident
+# engine like a busy one for the bounded grace. Empty dead engines use the
+# ordinary limit and still restart quickly.
+RESIDENT_ENGINE_MIN_MIB=${RESIDENT_ENGINE_MIN_MIB:-65536}
 # Overridable so scripts/ops/watchdog_smoketest.sh can drive this real script
 # against a fake launcher instead of re-implementing its decisions.
 START=${START:-/data/glm52-rl/deployment/scripts/h200/start_inference.sh}
+ENGINE_CONTAINER=${ENGINE_CONTAINER:-glm52-decensor-h200}
 RELOAD_TRIES=${RELOAD_TRIES:-40}
 RELOAD_WAIT=${RELOAD_WAIT:-30}
 misses=0
@@ -35,6 +53,10 @@ last_generation_tokens=-1
 
 log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
 log "engine watchdog started (port=$PORT interval=${INTERVAL}s timeout=${TIMEOUT}s)"
+if [ "$STARTUP_GRACE" -gt 0 ]; then
+  log "engine startup grace ${STARTUP_GRACE}s"
+  sleep "$STARTUP_GRACE"
+fi
 
 while true; do
   # A tiny real generation. max_tokens=3 keeps it cheap; a hung EngineCore
@@ -62,11 +84,16 @@ while true; do
       misses=0
     else
       misses=$((misses + 1))
-      log "engine probe failed (code=${code:-none} running=$running generated=$generated) miss=$misses/$FAILS_BEFORE_RESTART"
-    if [ "$misses" -ge "$FAILS_BEFORE_RESTART" ]; then
       gpu=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader 2>/dev/null | head -1)
+      gpu_mib=$(printf '%s\n' "$gpu" | awk '{print $1 + 0}')
+      restart_after=$FAILS_BEFORE_RESTART
+      if [ "$running" != 0 ] || [ "$gpu_mib" -ge "$RESIDENT_ENGINE_MIN_MIB" ]; then
+        restart_after=$BUSY_STALL_FAILS_BEFORE_RESTART
+      fi
+      log "engine probe failed (code=${code:-none} running=$running generated=$generated gpu0=${gpu:-unknown}) miss=$misses/$restart_after"
+    if [ "$misses" -ge "$restart_after" ]; then
       log "RESTARTING ENGINE (gpu0=${gpu:-unknown})"
-      sudo docker rm -f glm52-decensor-h200 >/dev/null 2>&1
+      sudo docker rm -f "$ENGINE_CONTAINER" >/dev/null 2>&1
       if bash "$START" >/dev/null 2>&1; then
         log "start_inference.sh returned ok; waiting for engine to load"
       else

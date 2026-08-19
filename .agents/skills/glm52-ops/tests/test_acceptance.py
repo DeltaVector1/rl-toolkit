@@ -1,5 +1,6 @@
 import json
 import unittest
+from unittest.mock import patch
 
 import glm52_ops
 
@@ -37,6 +38,30 @@ env.agent.max_output_tokens = 16384
 [train.env.sampling]
 max_completion_tokens = 16384
 """
+
+MUSE_TRAINER_CONFIG = """
+[model]
+name = "/data/muse-glimmer/model"
+seq_len = 65536
+optimization_dtype = "bfloat16"
+reduce_dtype = "bfloat16"
+cp = 4
+pp = 8
+
+[model.lora]
+rank = 128
+alpha = 256.0
+dropout = 0.0
+
+[optim]
+lr = 8e-6
+max_norm = 1.0
+weight_decay = 0.0
+"""
+
+MUSE_ORCHESTRATOR_CONFIG = ORCHESTRATOR_CONFIG.replace(
+    "batch_size = 1024", "batch_size = 2048"
+)
 
 
 def jsonl(*rows):
@@ -120,6 +145,44 @@ class AcceptanceTest(unittest.TestCase):
         self.assertIn("adapter failure evidence", alarms)
         self.assertIn("reward verdict is falling", alarms)
         self.assertIn("14/50", alarms)
+
+    def test_health_probe_nan_does_not_create_training_failure(self):
+        report = self.build(
+            logs=(
+                "SUCCESS Train environment(s) ready\n"
+                "(APIServer pid=1) ValueError: Out of range float values are "
+                "not JSON compliant: nan"
+            )
+        )
+
+        self.assertEqual(report.failures, {})
+
+    def test_real_nonfinite_gradient_log_remains_a_stability_failure(self):
+        report = self.build(logs="trainer detected nonfinite gradient")
+
+        self.assertEqual(report.failures.get("stability"), 1)
+
+    def test_muse_uses_bf16_batch_context_and_one_sided_time_limits(self):
+        report = glm52_ops._acceptance_from_text(
+            "muse-test",
+            MUSE_TRAINER_CONFIG,
+            MUSE_ORCHESTRATOR_CONFIG,
+            jsonl({"step": 50, "time/forward_backward": 250.0}),
+            jsonl({"step": 50, "train/agg/all/timing/generation/max": 300.0}),
+            "batch_size=2048 validation completed",
+            "inside the noise",
+        )
+
+        self.assertTrue(report.passed)
+        self.assertEqual(report.profile, "muse")
+        self.assertTrue(report.precision_ok)
+        self.assertIn("BF16 trainer: yes", report.report())
+        self.assertNotIn("native FP8 trainer", report.report())
+
+    def test_production_acceptance_refuses_trainer_only_run(self):
+        with patch.object(glm52_ops, "_trainer_mode", return_value="trainer-only"):
+            with self.assertRaises(glm52_ops.Refused):
+                glm52_ops.acceptance("muse-qualification", quiet=True)
 
 
 if __name__ == "__main__":

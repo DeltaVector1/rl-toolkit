@@ -107,10 +107,9 @@ def save_state_dict(
 
 # ── pipeline parallelism context ─────────────────────────────────────────────
 # Set once by train.py when pp > 1. Under PP each rank's model holds only its
-# stage's layers, so the master's local state_dict is a fraction of the model;
-# saving it as the adapter would ship a truncated LoRA to the inference engines
-# with no error anywhere. The fix: each stage's first rank gathers its stage,
-# then the stage dicts are merged on the global master over the pp group.
+# stage's layers, so the master's local state_dict is a fraction of the model.
+# The group is a CPU/Gloo group containing one master from each stage. This
+# keeps multi-gigabyte full-model objects out of GPU memory.
 _PP_GROUP = None
 _IS_STAGE_MASTER = False
 
@@ -143,13 +142,22 @@ def merge_pp_state_dict(state_dict: dict, is_master: bool) -> dict:
     if _PP_GROUP is None:
         return state_dict
 
-    world = torch.distributed.get_world_size()
-    gathered: list[dict | None] = [None] * world
-    torch.distributed.all_gather_object(gathered, state_dict if _IS_STAGE_MASTER else {})
+    if not _IS_STAGE_MASTER:
+        return state_dict
+
+    group_size = torch.distributed.get_world_size(group=_PP_GROUP)
+    gathered: list[dict | None] | None = [None] * group_size if is_master else None
+    torch.distributed.gather_object(
+        state_dict,
+        object_gather_list=gathered,
+        dst=0,
+        group=_PP_GROUP,
+    )
     if not is_master:
         return state_dict
 
     merged: dict[str, Tensor] = {}
+    assert gathered is not None
     for part in gathered:
         if part:
             merged.update(part)
@@ -181,24 +189,28 @@ def gather_weights_on_master(
                 cpu_state[key] = value.to("cpu", non_blocking=False)
 
         if _PP_GROUP is not None:
-            # Gather over the WORLD group, not the pp subgroup. all_gather_object
-            # sizes its receive buffers from the participating ranks, and mixing a
-            # mesh-derived subgroup with global rank bookkeeping produced garbage
-            # lengths -- a 3796 GiB allocation attempt inside recv_object_list.
-            # World-group gather needs no rank translation: every rank sends its
-            # stage dict (or {}), and layer names already carry global indices, so
-            # the union is exactly the full model.
-            world = torch.distributed.get_world_size()
-            gathered: list[dict | None] = [None] * world
-            torch.distributed.all_gather_object(gathered, cpu_state if _IS_STAGE_MASTER else {})
-            if is_master:
-                merged: dict[str, Tensor] = {}
-                for part in gathered:
-                    if part:
-                        merged.update(part)
-                cpu_state = merged
-            else:
-                cpu_state = {}
+            # Gather only across the CPU stage-master group. Only rank 0
+            # receives the objects. all_gather_object replicated the complete
+            # BF16 model into all 64 trainer processes, which requires about
+            # 480 GB of host memory per node for a 30B full-model update.
+            if _IS_STAGE_MASTER:
+                group_size = torch.distributed.get_world_size(group=_PP_GROUP)
+                gathered: list[dict | None] | None = [None] * group_size if is_master else None
+                torch.distributed.gather_object(
+                    cpu_state,
+                    object_gather_list=gathered,
+                    dst=0,
+                    group=_PP_GROUP,
+                )
+                if is_master:
+                    assert gathered is not None
+                    merged: dict[str, Tensor] = {}
+                    for part in gathered:
+                        if part:
+                            merged.update(part)
+                    cpu_state = merged
+                else:
+                    cpu_state = {}
         torch.distributed.barrier()
 
     # Always clean up the state dict for HF compatibility

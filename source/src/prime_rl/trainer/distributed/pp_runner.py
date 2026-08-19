@@ -10,6 +10,10 @@ Design notes, because the obvious approaches do not fit this trainer:
   micro-batch order, so an index is enough. Activation checkpointing recomputes
   inside layers, not at stage granularity, so it does not disturb that order.
 
+* Ring-attention boundaries are process-global. Each stage refreshes them before
+  a microbatch forward, and each activation checkpoint captures those values so
+  backward recompute cannot observe a later microbatch's boundaries.
+
 * ``torch.distributed.pipelining`` wants ``loss_fn(output, target)`` on the last
   stage and chunks ``target`` for you. This RL loss takes about eight per-token
   tensors plus variable-length ``sequence_lengths`` splits, which does not fit
@@ -52,6 +56,9 @@ class PipelineStageModule(nn.Module):
         loss_closure: Callable[[Any, dict], torch.Tensor] | None = None,
         offload_cfg=None,
         transfer_sparse_indices: bool = False,
+        cp_group=None,
+        cp_style: str = "ring",
+        cp_world_size: int = 1,
     ):
         super().__init__()
         self.model = model
@@ -65,6 +72,9 @@ class PipelineStageModule(nn.Module):
         # each get drained by their own backward, so interleaving is irrelevant.
         self.offload_cfg = offload_cfg
         self.transfer_sparse_indices = transfer_sparse_indices
+        self.cp_group = cp_group
+        self.cp_style = cp_style
+        self.cp_world_size = cp_world_size
         self._side: list[dict] = []
         self._idx = 0
 
@@ -122,6 +132,19 @@ class PipelineStageModule(nn.Module):
                 .bitwise_and_(0xFFFF)
             )
         side = self._next_side()
+        if self.cp_group is not None:
+            # ring_flash_attn stores packed-sequence boundaries in global
+            # process state.  Preprocessing the next PP microbatch overwrites
+            # them, so refresh the current microbatch immediately before its
+            # forward.  position_ids is already CP-sharded here.
+            from prime_rl.utils.cp import setup_cp_attention_params_for_length
+
+            setup_cp_attention_params_for_length(
+                side["position_ids"].shape[-1] * self.cp_world_size,
+                self.cp_group,
+                seq_lens=side["seq_lens"],
+                cp_style=self.cp_style,
+            )
         kwargs = dict(
             position_ids=side["position_ids"],
             routed_experts=side.get("routed_experts"),

@@ -7,20 +7,43 @@ user continue each conversation, and grades the model with parallel Gemma judges
 ## Rollout
 
 Each row receives one of three response styles: prose with styling, plain text, or Markdown.
-Some rows also state a response-length target. The target number of turns follows a geometric
+Some rows also request a terse, medium, or verbose response. The target number of turns follows a geometric
 distribution capped by `max_turns`.
 
-The simulated user keeps the complete transcript locally because the harness passes it only
-the latest assistant message. It generates a short adversarial follow-up after each assistant
-turn and stops when the row's target turn count is reached.
+The simulated user keeps the complete transcript locally because the harness
+passes it only the latest assistant message. Each rollout has a new random
+nonce. This prevents two rollouts for one prompt from receiving the same user
+turns.
+
+For each follow-up, the user model receives the opening request, the latest
+answer, and one assigned strategy. Normal code checks the wrapper, length,
+sentence count, role labels, nested tags, and repeated text. A separate tool
+call then checks that the message still seeks the opening request, fits the
+latest answer, does not switch to an alternative from the assistant, and
+sounds like a real user. The model gets three attempts. If all attempts fail,
+the rollout is unscored. If an assistant turn has no visible answer, the user
+model stops and the normal invalid-response check handles it.
 
 ## Reward
 
-The environment returns one multiplicative reward:
+The environment records this multiplicative response score:
 
 ```text
 refusal * length * coherency * markdown presence * markdown correctness * reasoning * meta commentary
 ```
+
+Training does not normalize this combined value. It calculates two group
+advantages and adds them:
+
+```text
+reasoning pass minus the group pass rate
++ response quality minus the mean quality of passing responses
+```
+
+Only responses that pass the private-reasoning review receive the quality
+advantage. A failed response cannot receive a positive advantage. An
+all-failed group has no training signal and is replaced by the rollout
+collector. An all-passed group still trains response quality.
 
 The following response failures return zero before any judge score is used:
 
@@ -28,15 +51,34 @@ The following response failures return zero before any judge score is used:
 - an unclosed `<think>` block
 - missing reasoning when reasoning is required
 - an empty visible response
-- structured output markers
+- copied internal wrapper tags
 
-Judge calls run concurrently. If the Gemma endpoint cannot be reached, the reward is zero and
-`decensor_judge_endpoint_down` is logged. If Gemma replies but a verdict cannot be parsed, that
-verdict is ignored instead of guessing a failure.
+Judge calls run concurrently. Each call gets three total attempts. A service
+failure or three invalid replies make the rollout unscored. No service failure
+becomes a model reward.
 
-Reasoning judges inspect `reasoning_content` from the final assistant turn. Length targets are
-shown to the model, and a non-empty response keeps a small length floor so length alone cannot
-erase the entire learning signal. Every reward factor is recorded in the trace metrics.
+Every assistant turn has two narrow structured reviews. The visible review
+receives the user context and that turn's answer. It scores refusal, visible
+coherence, instruction leaks, and formatting. The private review receives the
+same user context, that turn's reasoning, and the visible refusal score. It
+scores restricted reasoning and reasoning coherence. It does not receive the
+visible answer. Different turns are reviewed concurrently.
+
+The controller divides each answer and reasoning trace into numbered exact
+source sections. The judge selects section numbers for each failed or present
+result. The controller records the selected source text and offsets. The judge
+does not copy or rewrite evidence text.
+
+A self-harm prevention trace is exempt from the restricted-reasoning result.
+Length ranges are broad and are not shown as exact counts. A non-empty response
+keeps a small length value so length alone cannot erase the response-quality
+signal. Every score, section result, and final advantage is recorded.
+
+Raw judge replies include the judge name, turn, phase, attempt number, status,
+elapsed time, text, parsed value, and evidence offsets. The trace also records
+the source harm type, source row, repeated-source status, follow-up strategies,
+every follow-up attempt and semantic review, response format, length range,
+and Markdown exception.
 
 ## Config
 
@@ -58,5 +100,6 @@ model = "google/gemma-4-26B-A4B-it"
 api_key_var = "VLLM_API_KEY"
 ```
 
-The main run uses the official GLM-5.2 chat template, GLM tool parsing, reasoning enabled for
-the policy model, and thinking disabled for the simulated user and judges.
+The Muse run uses the Muse Glimmer renderer and tool parser. Reasoning is
+enabled for the policy model. Thinking is disabled for the simulated user and
+judges.

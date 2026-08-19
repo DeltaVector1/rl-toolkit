@@ -4,6 +4,103 @@ This note gives the reasons. `docs/RUNBOOK.md` gives the commands.
 `docs/PERFORMANCE.md` gives the measurements. `.agents/skills/glm52-ops/`
 holds the tools and the fault table.
 
+# PAUSE NOTICE: 2026-08-14
+
+This section is the current handoff state. It supersedes older run-state
+sections in this document.
+
+The owner paused GLM-5.2 training on 2026-08-14. The current policy adapted
+four attention projections and the always-on shared expert. It did not adapt
+the 256 routed experts. The owner decided that more training with this target
+set was not worth the compute.
+
+The safe stop operation stopped the x84p trainer on all eight trainer nodes.
+It also stopped the edge orchestrator, the rollout batch synchronizer, the run
+supervisor, and the China tunnel supervisor. It preserved all x84p run data.
+Both H200 inference engines remain running and idle. Their engine watchdogs
+remain enabled.
+
+Do not continue x84p as evidence for routed-expert learning. A later
+expert-LoRA experiment must use a new run name, a new LoRA policy, and a new
+optimizer unless the owner makes a different decision.
+
+## LAST MEASURED X84P STATE
+
+The final status sample was at 07:51 UTC on 2026-08-14.
+
+- The trainer completed six steps.
+- Trainer step 6 forward and backward took 717.17 seconds, or 11 minutes 57
+  seconds.
+- Step 6 had finite gradient norm 0.0302 and peak allocation 44.2 GiB.
+- Rollout step 7 completed 1,024 trainable rollouts with zero rollout errors.
+- Rollout step 7 active generation took 1,318.22 seconds, or 21 minutes 58
+  seconds. This failed the 8-to-12-minute rollout performance gate.
+- Rollout step 7 total orchestrator time was 23 minutes 5 seconds.
+- The effective reward values for rollout steps 1 through 7 were 0.0981,
+  0.0503, 0.0857, 0.0942, 0.0538, 0.0953, and 0.0663.
+- The reward verdict was `too few steps (7 of 10 needed)`. Do not report a
+  reward trend for x84p.
+- All 48 rollout tunnels, the judge, the adapter server, and both H200 engines
+  were healthy before the stop.
+
+## REASON FOR THE NEXT IMPLEMENTATION
+
+Research and local measurements indicate that target coverage can be more
+important than a large attention-only rank. The current adapter does not train
+the routed MLP experts, which hold most of the model parameters.
+
+Read `docs/research/lora-rank-and-moe.md` before you design the next adapter.
+It records the papers, evidence limits, parameter counts, and project
+hypotheses discussed with the owner.
+
+Do not enable the existing upstream grouped-expert LoRA class for this model.
+It derives LoRA tensor dtype from the FP8 base weights. It also converts the
+base expert weights to BF16 during forward. This is not the required
+native-FP8 path and can cause incorrect training or an out-of-memory failure.
+
+## REQUIRED WORK BEFORE THE NEXT RUN
+
+1. Implement a fused routed-expert LoRA path with frozen native-FP8 base
+   weights and trainable BF16 LoRA matrices.
+2. Preserve the source-major expert-parallel row permutation used by the
+   validated native routed-expert path.
+3. Keep native checkpoint weights and inverse scales as explicit autograd
+   inputs.
+4. Keep owned backward snapshots outside checkpoint saved-tensor hooks.
+5. Bound LoRA saved activations. Use selective pinned-host offload only when a
+   full-shape memory measurement requires it. Do not enable global activation
+   offload.
+6. Export routed-expert LoRA tensors in the per-expert format that vLLM loads.
+7. Test adapter load, visibility, generation, unload, and reload on both H200
+   hosts.
+8. Measure the adapter export and cross-region transfer time. A uniform
+   rank-16 routed adapter is approximately 15.9 GB, which is approximately 40
+   times the x84p adapter file.
+9. Run the full-shape forward and backward memory gate on the 64 RTX 4090
+   GPUs. Check finite gradients for routed experts on every pipeline stage.
+10. Start a fresh full production run. Use no cached batch. Keep the learning
+    rate at 8e-6 unless the owner explicitly changes it.
+11. Monitor the run in the foreground through 50 completed trainer steps.
+    Apply all gates in `TRAINING_EXPECTATIONS.md`.
+
+## OPEN ADAPTER DECISION
+
+The owner proposed rank 16 on all transformer projections and all routed
+experts. This gives approximately 7.95 billion trainable parameters and a
+15.9 GB BF16 adapter. It needs at least approximately 0.93 GiB of sharded
+weights, gradients, and one FP32 optimizer buffer on each trainer GPU. Saved
+activations and workspaces are additional.
+
+The current lower-risk research hypothesis uses rank 16 on attention, dense
+MLP, and shared-expert projections, and rank 4 on every routed expert. It keeps
+all routed experts trainable. It produces an approximately 4.12 GB adapter and
+needs at least approximately 0.24 GiB of additional sharded trainer state for
+each GPU.
+
+No next-run rank has been selected. Do not treat the lower-risk hypothesis as
+an owner decision. Keep the router frozen for the first routed-expert test.
+Record rank and alpha together because x84p used rank 32 and alpha 64.
+
 Read the mistakes section before you change anything. Each item is a real
 failure with a real cost.
 
@@ -13,9 +110,9 @@ sentence. Active voice.
 # WHAT THE SYSTEM IS
 
 The system trains from the GLM-5.2-FP8 checkpoint, a 745 billion parameter
-MoE, with GRPO and a rank-32 LoRA adapter. The H200 engines use W8A16 and FP8
-KV cache. The trainer dequantizes the checkpoint to BF16 weights. The goal is to reduce
-refusals.
+MoE, with GRPO and a LoRA adapter. The H200 engines use their automatic FP8
+W8A8 backend. The trainer keeps the native FP8 checkpoint weights and uses
+BF16 optimization and reduction dtypes. The goal is to reduce refusals.
 
 The trainer computes gradients on 8 nodes of 8 RTX 4090: n76, n77, n78, n80,
 n82, n83, n84, n85.
@@ -25,7 +122,8 @@ The inference engines make the rollouts on h200a and h200b, 8 H200 each.
 The judge scores the rollouts on one external host of 8 RTX 5090, at
 202.214.223.66 port 26406.
 
-The orchestrator joins them and runs on n82.
+The orchestrator joins them and runs on h200a. The trainer and adapter server
+run on n82.
 
 # THE NETWORK, WHICH EXPLAINS ALMOST EVERYTHING
 
@@ -68,7 +166,10 @@ Do not run load tests against the engines. The owner refused one on
 2026-08-07. Read the vLLM metrics instead: `num_requests_running` and
 `num_requests_waiting` answer the same question without adding load.
 
-# THE STATE AT HANDOFF
+# OLDER X25 AND X26 HANDOFF STATE
+
+This section is historical. Use the pause notice at the top of this document
+for the current state.
 
 There is no active run. x25 and x26 are stopped. Both H200 engines are healthy
 and idle.

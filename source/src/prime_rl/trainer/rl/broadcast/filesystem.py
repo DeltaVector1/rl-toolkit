@@ -20,6 +20,38 @@ from prime_rl.trainer.world import get_world
 from prime_rl.utils.utils import get_broadcast_dir, get_step_path
 
 
+def prepare_full_model_broadcast_dir(broadcast_dir: Path, save_step: int) -> list[Path]:
+    """Remove full-model policies that are older than the active policy.
+
+    A BF16 Muse policy is about 60 GB. The normal post-save cleanup briefly
+    needs three complete policies and also keeps checkpoint-interval policy
+    copies. That exceeds the trainer master's local disk. When policy N is
+    ready to save, the trainer has already consumed the rollout batch from
+    policy N-1. Keep N-1 while N is written, and remove every older policy.
+    Trainer checkpoints provide the durable interval copies.
+    """
+    removed: list[Path] = []
+    keep_from = max(save_step - 1, 0)
+    if not broadcast_dir.exists():
+        return removed
+
+    for candidate in broadcast_dir.iterdir():
+        if not candidate.is_dir() or not candidate.name.startswith("step_"):
+            continue
+        try:
+            candidate_step = int(candidate.name.removeprefix("step_"))
+        except ValueError:
+            continue
+        if candidate_step < keep_from:
+            # Every local trainer rank runs post-step cleanup. On the master
+            # host, another rank can remove this same old policy after the
+            # directory scan and before this call. Cleanup is idempotent; a
+            # missing candidate must not abort the new policy broadcast.
+            shutil.rmtree(candidate, ignore_errors=True)
+            removed.append(candidate)
+    return removed
+
+
 class FileSystemWeightBroadcast(WeightBroadcast):
     """Broadcast weights into the inference engine via shared filesystem."""
 
@@ -79,9 +111,18 @@ class FileSystemWeightBroadcast(WeightBroadcast):
                 try:
                     # pack() already advanced progress to the next step, so the model we just
                     # trained — policy v(step-1) — broadcasts to broadcasts/step_{step-1}.
+                    save_step = self.multi_run_manager.progress[idx].step - 1
+                    broadcast_dir = get_broadcast_dir(self.multi_run_manager.get_run_dir(idx))
+                    if not adapter_only:
+                        removed = prepare_full_model_broadcast_dir(broadcast_dir, save_step)
+                        if removed:
+                            self.logger.info(
+                                f"Removed old full-model broadcasts before saving policy {save_step}: "
+                                + ", ".join(path.name for path in removed)
+                            )
                     save_dir = get_step_path(
-                        get_broadcast_dir(self.multi_run_manager.get_run_dir(idx)),
-                        self.multi_run_manager.progress[idx].step - 1,
+                        broadcast_dir,
+                        save_step,
                     )
                     save_dir.mkdir(parents=True, exist_ok=True)
 

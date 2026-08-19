@@ -281,7 +281,7 @@ note was wrong and is retracted. The kernel trace showed `shmem_fault`,
 `shmem_alloc_folio`, `__alloc_pages`, and `out_of_memory`.
 
 The pipeline stage balance moved the peak GPU memory from 24.6 GB to 21.9 GB
-for each GPU. See `PIPELINE_PARALLEL.md`.
+for each GPU. See `docs/PIPELINE_PARALLEL.md`.
 
 # THE PRECISION MEASUREMENTS
 

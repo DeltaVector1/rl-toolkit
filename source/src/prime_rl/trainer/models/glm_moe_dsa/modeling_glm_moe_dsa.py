@@ -239,6 +239,15 @@ class GlmMoeDsaPreTrainedModel(PreTrainedModelPrimeRL):
         return conversion_chain(config)
 
     @classmethod
+    def convert_adapter_to_hf(cls, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Rename the trainer's singular shared expert to the HF/vLLM name."""
+        for old_key in list(state_dict):
+            new_key = old_key.replace(".mlp.shared_expert.", ".mlp.shared_experts.")
+            if new_key != old_key:
+                state_dict[new_key] = state_dict.pop(old_key)
+        return state_dict
+
+    @classmethod
     def convert_layer_to_vllm_kernel(
         cls, state_dict: dict[str, Tensor], layer_idx: int, quantize_fp8: bool = False
     ) -> dict[str, Tensor]:

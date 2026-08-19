@@ -22,6 +22,15 @@ import torch.nn as nn
 from prime_rl.utils.logger import get_logger
 
 
+class SliceableModuleDict(nn.ModuleDict):
+    """A globally keyed stage layer set that HF forwards can also slice."""
+
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            return list(self.values())[key]
+        return super().__getitem__(key)
+
+
 
 def _index_computing_layers(config) -> list[int] | None:
     """Layers that compute their own sparse-MLA top-k indices.
@@ -202,8 +211,17 @@ def apply_pp_layers(model: nn.Module, pp_rank: int, pp_size: int) -> tuple[int, 
     # the original names and makes the key itself the global index, so router
     # replay needs no separate offset.
     layers = list(lm.layers)
-    lm.layers = nn.ModuleDict({str(i): layers[i] for i in range(start, end)})
+    lm.layers = SliceableModuleDict({str(i): layers[i] for i in range(start, end)})
     lm.pp_layer_offset = start
+    if getattr(getattr(model, "config", None), "model_type", None) == "muse_glimmer":
+        # The stock Muse forward indexes these per-layer arrays with a local
+        # enumerate() index. Make its stage config local while the ModuleDict
+        # keys and decoder layer_idx values remain global for checkpoint I/O.
+        for name in ("layer_types", "layer_rope_theta"):
+            values = getattr(cfg, name, None)
+            if values is not None:
+                setattr(cfg, name, list(values[start:end]))
+        cfg.num_hidden_layers = end - start
     if pp_rank != 0:
         lm.embed_tokens = None
 
@@ -224,7 +242,13 @@ def apply_pp_boundaries(model: nn.Module, pp_rank: int, pp_size: int) -> None:
 
     if pp_rank == pp_size - 1:
         return
-    get_language_model(model).norm = None
+    lm = get_language_model(model)
+    if getattr(getattr(model, "config", None), "model_type", None) == "muse_glimmer":
+        # The stock Muse forward always calls its final norm. Identity keeps
+        # intermediate stages unnormalized without retaining norm weights.
+        lm.norm = nn.Identity()
+    else:
+        lm.norm = None
     for attr in ("lm_head", "output"):
         if getattr(model, attr, None) is not None:
             setattr(model, attr, None)

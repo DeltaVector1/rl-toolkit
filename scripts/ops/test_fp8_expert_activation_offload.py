@@ -143,6 +143,7 @@ def main():
                 "intermediate": INTERMEDIATE,
                 "w13_chunk_rows": fp8_ada._FP8_W13_CHUNK_ROWS,
                 "w2_chunk_rows": fp8_ada._FP8_W2_CHUNK_ROWS,
+                "backward_chunk_rows": fp8_ada._FP8_EXPERT_BACKWARD_CHUNK_ROWS,
                 "forward": "exact",
                 "input_gradient": "exact",
                 "saved_fp8_location": "pinned CPU",

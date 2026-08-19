@@ -79,7 +79,7 @@ EOF
 
 cat > "$BIN/nvidia-smi" <<'EOF'
 #!/usr/bin/env bash
-echo "1 MiB"
+echo "${GPU_MIB:-1} MiB"
 EOF
 
 # sleep: counts loop iterations and stops the script under test after MAXCYCLES,
@@ -183,6 +183,7 @@ absent "batch port 29620 is never killed"         "$FIX/killed" "29620"
 
 run_engine() { # needs $FIX/respond.sh and $MAXCYCLES
   { PORT=8000 INTERVAL=1 TIMEOUT=1 FAILS_BEFORE_RESTART=2 \
+    BUSY_STALL_FAILS_BEFORE_RESTART=5 \
     START="$FIX/fake_start.sh" RELOAD_TRIES=2 RELOAD_WAIT=1 \
       timeout 30 bash "$ENGINE_WD" > "$FIX/log" 2>&1; } 2>/dev/null
 }
@@ -253,6 +254,81 @@ EOF
 MAXCYCLES=3 run_engine
 absent "busy engine with rising tokens -> no restart" "$FIX/log" "RESTARTING ENGINE"
 contains "busy engine -> reports progress" "$FIX/log" "engine busy but progressing"
+
+# A policy adapter load can hold the collective for longer than two probes
+# while requests remain registered but token progress is temporarily flat.
+# Do not discard that engine at the ordinary dead-engine threshold, but keep a
+# finite upper bound so a genuinely wedged busy engine still self-recovers.
+reset
+cat > "$FIX/respond.sh" <<'EOF'
+respond() {
+  if [ "$1" = engine ]; then
+    echo 000
+  elif [ "$1" = metrics ]; then
+    echo 'vllm:num_requests_running{engine="0"} 23'
+    echo 'vllm:generation_tokens_total{engine="0"} 1000'
+  else
+    echo 200
+  fi
+}
+EOF
+MAXCYCLES=5 run_engine
+absent "busy stalled engine -> survives ordinary threshold" "$FIX/log" "RESTARTING ENGINE"
+contains "busy stalled engine -> uses bounded grace" "$FIX/log" "miss=4/5"
+
+reset
+cat > "$FIX/respond.sh" <<'EOF'
+respond() {
+  if [ "$1" = engine ]; then
+    echo 000
+  elif [ "$1" = metrics ]; then
+    echo 'vllm:num_requests_running{engine="0"} 23'
+    echo 'vllm:generation_tokens_total{engine="0"} 1000'
+  else
+    echo 200
+  fi
+}
+EOF
+MAXCYCLES=6 run_engine
+contains "busy stalled engine -> restarts at grace limit" "$FIX/log" "miss=5/5"
+contains "busy stalled engine -> bounded restart" "$FIX/log" "RESTARTING ENGINE"
+
+# The LoRA collective can report zero running requests while the full engine
+# is still resident. It needs the same bounded grace as a busy engine. An
+# empty engine is already covered above and must keep the ordinary threshold.
+reset
+cat > "$FIX/respond.sh" <<'EOF'
+respond() {
+  if [ "$1" = engine ]; then
+    echo 000
+  elif [ "$1" = metrics ]; then
+    echo 'vllm:num_requests_running{engine="0"} 0'
+    echo 'vllm:generation_tokens_total{engine="0"} 1000'
+  else
+    echo 200
+  fi
+}
+EOF
+GPU_MIB=132155 MAXCYCLES=4 run_engine
+absent "resident stalled engine -> survives ordinary threshold" "$FIX/log" "RESTARTING ENGINE"
+contains "resident stalled engine -> uses bounded grace" "$FIX/log" "miss=4/5"
+
+reset
+cat > "$FIX/respond.sh" <<'EOF'
+respond() {
+  if [ "$1" = engine ]; then
+    echo 000
+  elif [ "$1" = metrics ]; then
+    echo 'vllm:num_requests_running{engine="0"} 0'
+    echo 'vllm:generation_tokens_total{engine="0"} 1000'
+  else
+    echo 200
+  fi
+}
+EOF
+GPU_MIB=132155 MAXCYCLES=6 run_engine
+contains "resident stalled engine -> restarts at grace limit" "$FIX/log" "miss=5/5"
+contains "resident stalled engine -> bounded restart" "$FIX/log" "RESTARTING ENGINE"
 
 # ------------------------------------------- liveness probes must not self-match
 

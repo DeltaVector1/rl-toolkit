@@ -77,6 +77,7 @@ def _load(path: pathlib.Path, name: str):
     torch = types.ModuleType("torch")
     nn = types.ModuleType("torch.nn")
     nn.Module = _Module
+    nn.ModuleDict = dict
     torch.nn = nn
     torch.Tensor = _Tensor
     torch.int32 = object()
@@ -268,6 +269,49 @@ class SideInputFifoTest(unittest.TestCase):
         self.assertEqual(got, (hidden, outgoing))
         self.assertIs(seen["inputs_embeds"], hidden)
         self.assertIs(seen["sparse_indices_cache"], incoming)
+
+    def test_cp_boundaries_refresh_immediately_before_each_pp_forward(self):
+        hidden = _Tensor("hidden")
+        position_ids = _Tensor("position-ids")
+        position_ids.shape = (1, 16)
+        seq_lens = _Tensor("seq-lens")
+        seen = {}
+
+        class Decoder:
+            def __call__(self, **kwargs):
+                seen["decoder_called"] = True
+                return types.SimpleNamespace(last_hidden_state=hidden)
+
+        cp = types.ModuleType("prime_rl.utils.cp")
+
+        def refresh(total_tokens, group, *, seq_lens, cp_style):
+            seen["refresh"] = (total_tokens, group, seq_lens, cp_style)
+            self.assertNotIn("decoder_called", seen)
+
+        cp.setup_cp_attention_params_for_length = refresh
+        group = object()
+        stage = self.runner.PipelineStageModule(
+            model=types.SimpleNamespace(model=Decoder()),
+            is_first=False,
+            is_last=False,
+            cp_group=group,
+            cp_style="ring",
+            cp_world_size=4,
+        )
+        stage.set_side_inputs(
+            [
+                {
+                    "position_ids": position_ids,
+                    "seq_lens": seq_lens,
+                    "seq_lens_are_pre_shard": True,
+                }
+            ]
+        )
+        with mock.patch.dict(sys.modules, {"prime_rl.utils.cp": cp}):
+            stage._forward_inner(hidden)
+
+        self.assertEqual(seen["refresh"], (64, group, seq_lens, "ring"))
+        self.assertTrue(seen["decoder_called"])
 
     def test_sparse_cache_transport_has_one_shared_index_group(self):
         self.assertEqual(

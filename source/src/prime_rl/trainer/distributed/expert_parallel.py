@@ -48,6 +48,15 @@ def _dequantize_int4_kernel(packed, scale, output, cols: tl.constexpr, block: tl
 # recompute. This is numerically exact: the recompute would dequantize the same
 # bytes. The payload is 1/4 the size of the dequantized bf16 activation.
 _EP_AC_CACHE = os.environ.get("PRIME_EP_AC_CACHE", "") == "1"
+# The dispatch and combine outputs are full BF16 activations. A one-shot INT4
+# all-to-all holds the full packed send and receive buffers while it allocates
+# that activation. On a 32K-row GLM microbatch this adds about 192 MiB
+# immediately before a 384 to 500 MiB allocation. Split both directions into
+# a fixed number of rounds so every rank executes the same collective sequence
+# and peak packed-buffer memory falls in proportion to this value.
+_INT4_COMBINE_ROUNDS = int(os.environ.get("PRIME_INT4_COMBINE_ROUNDS", "1"))
+if _INT4_COMBINE_ROUNDS < 1:
+    raise ValueError("PRIME_INT4_COMBINE_ROUNDS must be at least 1")
 
 
 def _in_backward() -> bool:
@@ -109,13 +118,360 @@ def _ep_profile_tick() -> None:
             f"a2a={a2a:.1f}s ({100 * a2a / max(wall, 1e-9):.0f}% of wall) | {parts}",
             flush=True,
         )
+
+
+def _empty_with_cache_retry(*size, **kwargs):
+    """Allocate once more after releasing only unused CUDA allocator blocks."""
+    try:
+        return torch.empty(*size, **kwargs)
+    except torch.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        return torch.empty(*size, **kwargs)
     _ep_t0 = time.perf_counter()
+
+
+def _round_splits(splits: list[int], round_idx: int, rounds: int) -> tuple[list[int], list[int]]:
+    """Return this round's peer counts and offsets in the full peer-major buffer."""
+    counts = []
+    offsets = []
+    peer_base = 0
+    for split in splits:
+        width, extra = divmod(split, rounds)
+        counts.append(width + int(round_idx < extra))
+        offsets.append(peer_base + round_idx * width + min(round_idx, extra))
+        peer_base += split
+    return counts, offsets
+
+
+def _streaming_int4_forward(
+    routed_input,
+    output_splits,
+    input_splits,
+    group_name,
+    tag,
+    rounds,
+    reuse_input,
+):
+    """Run an INT4 all-to-all with bounded send and receive rounds."""
+    rows, cols = routed_input.shape
+    packed_cols = (cols + 1) // 2
+    block = triton.next_power_of_2(packed_cols)
+    output_rows = sum(output_splits)
+
+    # The operation is the sole consumer of its input, and its backward does
+    # not need the forward values. If the input allocation is large enough for
+    # the returned rows, reuse it for the BF16 result. Quantize the complete
+    # source before overwriting it in that case. If routing imbalance requires
+    # a larger result, allocate that result before any packed transport buffer
+    # and quantize only one send round at a time. The latter ordering removed a
+    # measured step-8 dispatch peak where a 498 MiB result had only 413.5 MiB
+    # physically free while full packed send and receive buffers were live.
+    if reuse_input:
+        # The input and final output share storage.  Do not overwrite any BF16
+        # source rows until every round has sent them.  Retain the compact INT4
+        # receive payload, quantize only one send round at a time, and expand
+        # into the reserved BF16 storage after all collectives finish.  This
+        # replaces a complete INT4 send copy with one round of send scratch.
+        received_all = _empty_with_cache_retry(
+            (output_rows, packed_cols),
+            device=routed_input.device,
+            dtype=torch.uint8,
+        )
+        received_scale_all = _empty_with_cache_retry(
+            output_rows, device=routed_input.device, dtype=torch.float16
+        )
+        dequantized = routed_input
+        storage_bytes = routed_input.untyped_storage().nbytes()
+        logical_bytes = rows * cols * routed_input.element_size()
+        tail_bytes = max(0, storage_bytes - logical_bytes)
+    else:
+        # Dispatch is followed by the inverse combine.  An EP rank can receive
+        # fewer rows during dispatch than it must return during combine.  Give
+        # the dispatch result enough storage for both shapes while memory is
+        # still available.  The native-FP8 expert path operates in place and
+        # preserves this storage, so combine can reuse it instead of trying to
+        # allocate a complete hidden-size tensor at the later memory peak.
+        capacity_rows = (
+            max(rows, output_rows) if tag.startswith("dispatch") else output_rows
+        )
+        dequantized = _empty_with_cache_retry(
+            (capacity_rows, cols), device=routed_input.device, dtype=routed_input.dtype
+        )
+        if capacity_rows != output_rows:
+            dequantized.as_strided_((output_rows, cols), (cols, 1))
+    group = _resolve_process_group(group_name)
+
+    for round_idx in range(rounds):
+        input_counts, input_offsets = _round_splits(input_splits, round_idx, rounds)
+        output_counts, output_offsets = _round_splits(output_splits, round_idx, rounds)
+        send_rows = sum(input_counts)
+        receive_rows = sum(output_counts)
+
+        round_packed_bytes = send_rows * packed_cols
+        if reuse_input and round_packed_bytes <= tail_bytes:
+            # Dispatch reserved BF16 capacity for a larger inverse-combine
+            # result.  Before expansion, that tail is outside the live input.
+            # Use it as the current round's packed-send scratch.  No source row
+            # is overwritten, and all sends finish before final dequantization
+            # writes into the expanded BF16 result.
+            round_quantized = torch.empty(
+                0, device=routed_input.device, dtype=torch.uint8
+            ).set_(
+                routed_input.untyped_storage(),
+                logical_bytes,
+                (send_rows, packed_cols),
+                (packed_cols, 1),
+            )
+        else:
+            round_quantized = _empty_with_cache_retry(
+                (send_rows, packed_cols),
+                device=routed_input.device,
+                dtype=torch.uint8,
+            )
+        round_scale = _empty_with_cache_retry(
+            send_rows, device=routed_input.device, dtype=torch.float16
+        )
+        send = []
+        send_scale = []
+        send_cursor = 0
+        for count, offset in zip(input_counts, input_offsets):
+            packed_part = round_quantized[send_cursor : send_cursor + count]
+            scale_part = round_scale[send_cursor : send_cursor + count]
+            if count:
+                _quantize_int4_kernel[(count,)](
+                    routed_input[offset : offset + count],
+                    packed_part,
+                    scale_part,
+                    cols,
+                    block,
+                    num_warps=8,
+                )
+            send.append(packed_part)
+            send_scale.append(scale_part)
+            send_cursor += count
+
+        if reuse_input:
+            received = received_all
+            received_scale = received_scale_all
+            received_offsets = output_offsets
+        else:
+            received = _empty_with_cache_retry(
+                (receive_rows, packed_cols),
+                device=routed_input.device,
+                dtype=torch.uint8,
+            )
+            received_scale = _empty_with_cache_retry(
+                receive_rows, device=routed_input.device, dtype=torch.float16
+            )
+            received_offsets = []
+            cursor = 0
+            for count in output_counts:
+                received_offsets.append(cursor)
+                cursor += count
+        receive = [
+            received[offset : offset + count]
+            for count, offset in zip(output_counts, received_offsets)
+        ]
+        receive_scale = [
+            received_scale[offset : offset + count]
+            for count, offset in zip(output_counts, received_offsets)
+        ]
+        with _EPTimer(f"fwd_{tag}"):
+            dist.all_to_all(receive, send, group=group)
+            dist.all_to_all(receive_scale, send_scale, group=group)
+
+        if not reuse_input:
+            cursor = 0
+            for count, offset in zip(output_counts, output_offsets):
+                if count:
+                    _dequantize_int4_kernel[(count,)](
+                        received[cursor : cursor + count],
+                        received_scale[cursor : cursor + count],
+                        dequantized[offset : offset + count],
+                        cols,
+                        block,
+                        num_warps=8,
+                    )
+                    cursor += count
+
+        del send, send_scale, receive, receive_scale, round_quantized, round_scale
+        if not reuse_input:
+            del received, received_scale
+
+    if reuse_input:
+        # as_strided_ changes only tensor metadata.  The dispatch allocation
+        # reserved enough rows for the inverse-combine result.
+        routed_input.as_strided_((output_rows, cols), (cols, 1))
+        _dequantize_int4_kernel[(output_rows,)](
+            received_all,
+            received_scale_all,
+            routed_input,
+            cols,
+            block,
+            num_warps=8,
+        )
+
+    return dequantized
+
+
+def _streaming_fp8_backward(
+    grad_output,
+    output_splits,
+    input_splits,
+    group_name,
+    tag,
+    rounds,
+):
+    """Return the inverse all-to-all gradient with bounded receive memory.
+
+    The forward combine output and its input gradient normally have the same
+    32K routed-row capacity. Reuse the consumed incoming-gradient buffer when
+    it is large enough. This avoids allocating a second 384 MiB BF16 tensor at
+    the backward peak. Imbalanced ranks whose returned gradient is larger use
+    a new result, but still receive only one FP8 round at a time.
+    """
+    rows, cols = grad_output.shape
+    input_rows = sum(input_splits)
+    storage_rows = 0
+    if grad_output.is_contiguous():
+        storage_elements = (
+            grad_output.untyped_storage().nbytes() // grad_output.element_size()
+        )
+        storage_rows = (
+            storage_elements - grad_output.storage_offset()
+        ) // cols
+    reuse_output = input_rows <= storage_rows
+    if reuse_output:
+        quantized, scale = ops.scaled_fp8_quant(
+            grad_output, use_per_token_if_dynamic=True
+        )
+        scale = scale.flatten()
+        grad_output.as_strided_((input_rows, cols), (cols, 1))
+        dequantized = grad_output
+    else:
+        dequantized = _empty_with_cache_retry(
+            (input_rows, cols), device=grad_output.device, dtype=grad_output.dtype
+        )
+    group = _resolve_process_group(group_name)
+
+    # Backward reverses forward: send the forward receive segments and receive
+    # the forward send segments. Every rank executes the same round count.
+    for round_idx in range(rounds):
+        send_counts, send_offsets = _round_splits(output_splits, round_idx, rounds)
+        receive_counts, receive_offsets = _round_splits(input_splits, round_idx, rounds)
+        receive_rows = sum(receive_counts)
+
+        if reuse_output:
+            send = [
+                quantized[offset : offset + count]
+                for count, offset in zip(send_counts, send_offsets)
+            ]
+            send_scale = [
+                scale[offset : offset + count]
+                for count, offset in zip(send_counts, send_offsets)
+            ]
+        else:
+            # Allocate the BF16 result before this loop, then retain only the
+            # current round's FP8 sources. Per-token scaling makes independent
+            # peer-slice quantization identical to quantizing the full tensor.
+            send = []
+            send_scale = []
+            for count, offset in zip(send_counts, send_offsets):
+                if count:
+                    quantized_part, scale_part = ops.scaled_fp8_quant(
+                        grad_output[offset : offset + count],
+                        use_per_token_if_dynamic=True,
+                    )
+                    scale_part = scale_part.flatten()
+                else:
+                    quantized_part = torch.empty(
+                        (0, cols), device=grad_output.device, dtype=torch.float8_e4m3fn
+                    )
+                    scale_part = torch.empty(
+                        0, device=grad_output.device, dtype=torch.float32
+                    )
+                send.append(quantized_part)
+                send_scale.append(scale_part)
+
+        # A production rank failed here with enough reserved-but-unused memory
+        # for this bounded receive. A true live-memory OOM remains fatal on the
+        # retry because the requested shape and lifetime do not change.
+        received = _empty_with_cache_retry(
+            (receive_rows, cols), device=grad_output.device, dtype=send[0].dtype
+        )
+        received_scale = torch.empty(
+            receive_rows, device=grad_output.device, dtype=send_scale[0].dtype
+        )
+        receive_round_offsets = []
+        cursor = 0
+        for count in receive_counts:
+            receive_round_offsets.append(cursor)
+            cursor += count
+        receive = [
+            received[offset : offset + count]
+            for count, offset in zip(receive_counts, receive_round_offsets)
+        ]
+        receive_scale = [
+            received_scale[offset : offset + count]
+            for count, offset in zip(receive_counts, receive_round_offsets)
+        ]
+        with _EPTimer(f"bwd_{tag}"):
+            dist.all_to_all(receive, send, group=group)
+            dist.all_to_all(receive_scale, send_scale, group=group)
+
+        cursor = 0
+        for count, offset in zip(receive_counts, receive_offsets):
+            if count:
+                target = dequantized[offset : offset + count]
+                target.copy_(received[cursor : cursor + count])
+                target.mul_(
+                    received_scale[cursor : cursor + count].to(target.dtype)[:, None]
+                )
+                cursor += count
+
+        del received, received_scale, send, send_scale, receive, receive_scale
+
+    return dequantized
 
 
 class _INT4Dispatch(torch.autograd.Function):
     @staticmethod
     def forward(ctx, routed_input, output_splits, input_splits, group_name, tag="a2a", cache=None):
         ctx.tag = tag
+        ctx.rounds = (
+            _INT4_COMBINE_ROUNDS
+            if tag in {"dispatch", "combine"} and cache is None
+            else 1
+        )
+        if ctx.rounds > 1:
+            ctx.input_splits = input_splits
+            ctx.output_splits = output_splits
+            ctx.group_name = group_name
+            ctx.cols = routed_input.shape[1]
+            output_rows = sum(output_splits)
+            # Dispatch receives an FSDP post-backward view. Returning and
+            # modifying that view from this custom autograd function is
+            # forbidden because it would replace FSDP's custom backward.
+            # Expert-output combine owns its input allocation and can reuse it.
+            storage_rows = 0
+            if routed_input.is_contiguous() and routed_input.storage_offset() == 0:
+                storage_rows = (
+                    routed_input.untyped_storage().nbytes()
+                    // routed_input.element_size()
+                    // routed_input.shape[1]
+                )
+            reuse_input = tag == "combine" and output_rows <= storage_rows
+            if reuse_input:
+                ctx.mark_dirty(routed_input)
+            return _streaming_int4_forward(
+                routed_input,
+                output_splits,
+                input_splits,
+                group_name,
+                tag,
+                ctx.rounds,
+                reuse_input,
+            )
         rows, cols = routed_input.shape
         packed_cols = (cols + 1) // 2
         block = triton.next_power_of_2(packed_cols)
@@ -153,6 +509,22 @@ class _INT4Dispatch(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        if ctx.rounds > 1:
+            return (
+                _streaming_fp8_backward(
+                    grad_output,
+                    ctx.output_splits,
+                    ctx.input_splits,
+                    ctx.group_name,
+                    ctx.tag,
+                    ctx.rounds,
+                ),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
         quantized, scale = ops.scaled_fp8_quant(grad_output, use_per_token_if_dynamic=True)
         scale = scale.flatten()
         grad_input = quantized.new_empty((sum(ctx.input_splits), quantized.shape[1]))

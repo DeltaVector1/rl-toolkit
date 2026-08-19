@@ -1,0 +1,105 @@
+output_dir = "/data/glm52-rl/runs/muse14/run_muse14"
+max_steps = 200
+seq_len = 65536
+batch_size = 1024
+group_size = 16
+max_inflight_rollouts = 128
+max_off_policy_steps = 4
+pool_size = 4
+
+[log]
+level = "info"
+
+[swanlab]
+project = "prod-run"
+name = "orchestrator-muse14"
+group = "muse-glimmer-30b-decensor-lora-r128"
+tags = ["muse-glimmer-30b", "bf16", "lora-r128", "all-language-linears", "8xh200-rollouts", "dp8", "tp1", "direct-replicas", "64x4090-trainer", "b1024", "g16", "65536", "out16384", "lr8e-6", "production"]
+
+[file_monitor]
+filename = "rollout-metrics.jsonl"
+
+[model]
+name = "/data/muse-glimmer/model"
+
+[model.lora]
+name = "muse14-r128"
+rank = 128
+alpha = 256.0
+
+[model.client]
+base_url = [
+    "http://127.0.0.1:8001/v1",
+    "http://127.0.0.1:8002/v1",
+    "http://127.0.0.1:8003/v1",
+    "http://127.0.0.1:8004/v1",
+    "http://127.0.0.1:8005/v1",
+    "http://127.0.0.1:8006/v1",
+    "http://127.0.0.1:8007/v1",
+    "http://127.0.0.1:8008/v1",
+]
+admin_base_url = [
+    "http://127.0.0.1:8001/v1",
+    "http://127.0.0.1:8002/v1",
+    "http://127.0.0.1:8003/v1",
+    "http://127.0.0.1:8004/v1",
+    "http://127.0.0.1:8005/v1",
+    "http://127.0.0.1:8006/v1",
+    "http://127.0.0.1:8007/v1",
+    "http://127.0.0.1:8008/v1",
+]
+wait_for_ready_timeout = 7200
+skip_model_check = true
+
+[optim]
+lr = 8e-6
+
+[renderer]
+name = "default"
+tool_parser = "muse_glimmer"
+reasoning_parser = "muse_glimmer"
+clear_thinking = true
+
+[train.sampling]
+temperature = 1.0
+max_completion_tokens = 16384
+extra_body = { min_tokens = 16 }
+
+[[train.env]]
+name = "decensor"
+ratio = 1.0
+pool = { type = "static", num_workers = 16 }
+env.taskset.id = "decensor-v1"
+env.taskset.dataset_name = "/data/glm52-rl/decensor-data/rl.jsonl"
+env.taskset.num_examples = 2000
+env.agent.harness = { id = "null", runtime = { type = "subprocess" } }
+env.agent.max_output_tokens = 16384
+env.agent.timeout.rollout = 1200
+
+[train.env.sampling]
+max_completion_tokens = 16384
+
+[train.env.env.taskset.task.judge]
+base_url = "http://202.214.223.66:26406/v1"
+model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
+api_key_var = "VLLM_API_KEY"
+
+[train.env.env.taskset.task.user]
+base_url = "http://202.214.223.66:26406/v1"
+model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
+api_key_var = "VLLM_API_KEY"
+
+[weight_broadcast]
+type = "filesystem"
+source_url = "http://127.0.0.1:18100/muse14"
+source_dir = "/data/glm52-rl/runs/muse14"
+
+[rollout_transport]
+type = "filesystem"
+
+[ckpt]
+interval = 25
+resume_step = -1
+skip_progress = true
+keep_last = 1
+keep_interval = 100

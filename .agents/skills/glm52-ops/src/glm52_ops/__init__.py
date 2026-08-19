@@ -19,6 +19,7 @@ import statistics
 import subprocess
 import sys
 import time
+import tomllib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,7 +28,7 @@ from pathlib import Path
 
 HEAD = "n82"
 TRAINER_NODES = ["n76", "n77", "n78", "n80", "n82", "n83", "n84", "n85"]
-ENGINE_HOSTS = ["h200a", "h200b"]
+ENGINE_HOSTS = ["h200a"]
 EDGE_ORCH = ENGINE_HOSTS[0]
 
 # Edge orchestrators write their metrics on h200a. Earlier orchestrators ran
@@ -46,6 +47,7 @@ ADAPTER_PORT = 8100
 BATCH_PORT = 29620
 
 ENGINE_MODEL = "/data/glm52-rl/model-fp8"
+MUSE_ENGINE_MODEL = "/data/muse-glimmer/model"
 DEPLOY = "/data/glm52-rl/deployment"
 RUNS = "/data/glm52-rl/runs"
 CLUSTER = f"{DEPLOY}/scripts/china/cluster.sh"
@@ -54,6 +56,7 @@ EDGE_ORCH_START = f"{DEPLOY}/scripts/h200/start_orchestrator.sh"
 TRAINER_CT = "glm52-decensor-trainer"
 ORCH_CT = "glm52-decensor-orchestrator"
 ENGINE_CT = "glm52-decensor-h200"
+MUSE_ENGINE_CT = "muse-glimmer-h200"
 
 # Run x22 gave 36 steps at batch 256: mean reward 0.1205, standard deviation
 # 0.039 across steps. That is the noise floor a new batch size must beat.
@@ -89,6 +92,11 @@ ROLLOUT_GENERATION_MIN_SECONDS = 8 * 60
 ROLLOUT_GENERATION_MAX_SECONDS = 12 * 60
 FINAL_VALIDATION_STEPS = 50
 
+MUSE_EXPECTED_BATCH_SIZE = 2048
+MUSE_EXPECTED_CONTEXT_LENGTH = 65536
+MUSE_TRAINER_COMPUTE_MAX_SECONDS = 8 * 60
+MUSE_ROLLOUT_GENERATION_MAX_SECONDS = 20 * 60
+
 # .../<repo>/.agents/skills/glm52-ops/src/glm52_ops/__init__.py
 REPO = Path(__file__).resolve().parents[5]
 
@@ -96,6 +104,14 @@ _SSH = [
     "ssh",
     "-o",
     "BatchMode=yes",
+    "-o",
+    "NumberOfPasswordPrompts=0",
+    "-o",
+    "PasswordAuthentication=no",
+    "-o",
+    "KbdInteractiveAuthentication=no",
+    "-o",
+    "RequestTTY=no",
     "-o",
     "ConnectTimeout=25",
     "-o",
@@ -121,9 +137,18 @@ def _ssh(host: str, script: str, timeout: int = 120) -> tuple[int, str]:
     _check_host(host)
     try:
         p = subprocess.run(
-            _SSH + [host, script], capture_output=True, text=True, timeout=timeout
+            _SSH + [host, script],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
         )
-        return p.returncode, (p.stdout + p.stderr)
+        # Successful probes must return only remote stdout. Local SSH warnings
+        # such as a disabled stale control socket are diagnostic stderr, not
+        # remote process data. Merging both made qualify() read that warning as
+        # an active container name on n82.
+        output = p.stdout if p.returncode == 0 else p.stdout + p.stderr
+        return p.returncode, output
     except subprocess.TimeoutExpired:
         return 124, "TIMEOUT"
 
@@ -220,9 +245,18 @@ echo "TUNNELS_OK $ok"
 echo "TUNNELS_BAD $bad"
 strip() { sed "s/\x1b\[[0-9;]*m//g"; }
 echo "TRAINER_UP $(sudo docker ps --filter name=__TRAINER__ --format up 2>/dev/null | head -1)"
+trainer_cfg=$(sudo docker inspect __TRAINER__ --format '{{range .Config.Cmd}}{{println .}}{{end}}' 2>/dev/null | grep -E '\.toml$' | tail -1)
+if [ -n "$trainer_cfg" ] && grep -q '^\[data\.fake\]' "$trainer_cfg" 2>/dev/null; then
+  echo "MODE trainer-only"
+else
+  echo "MODE rl"
+fi
 echo "ORCH_UP $(sudo docker ps --filter name=__ORCH__ --format up 2>/dev/null | head -1)"
 echo "TRAINER_STEPS $(sudo docker logs __TRAINER__ 2>&1 | strip | grep -ac 'SUCCESS Step')"
 echo "TRAINER_LAST $(sudo docker logs __TRAINER__ 2>&1 | strip | grep -a 'SUCCESS Step' | tail -1)"
+echo "TRAINER_CURRENT $(sudo docker logs --tail 1 __TRAINER__ 2>&1 | strip | tail -1)"
+echo "TRAINER_FINISHED $(sudo docker logs __TRAINER__ 2>&1 | strip | grep -aEc 'RL trainer finished|Trainer finished')"
+echo "TRAINER_FAILED $(sudo docker logs __TRAINER__ 2>&1 | strip | grep -aEc 'prime_rl\.trainer\.rl\.train FAILED|CheckpointException')"
 echo "ORCH_LAST $(sudo docker logs __ORCH__ 2>&1 | strip | grep -a 'SUCCESS Step' | tail -1)"
 echo "BATCH $(sudo docker logs --tail 40 __ORCH__ 2>&1 | grep -oE 'batch [0-9]+/[0-9]+[^;]*; [0-9]+ inflight' | tail -1)"
 echo "FAILS5M $(sudo docker logs --since 5m __ORCH__ 2>&1 | grep -ac 'Rollout failed')"
@@ -236,9 +270,24 @@ echo "SUP_TUN_LOG $(tail -1 /data/glm52-rl/tunnel_watchdog.log 2>/dev/null | cut
 """
 
 
+_TRAINER_ONLY_HEAD_PROBE = r"""
+strip() { sed "s/\x1b\[[0-9;]*m//g"; }
+echo "MODE trainer-only"
+echo "TRAINER_UP $(sudo docker ps --filter name=__TRAINER__ --format up 2>/dev/null | head -1)"
+echo "TRAINER_STEPS $(sudo docker logs __TRAINER__ 2>&1 | strip | grep -ac 'SUCCESS Step')"
+echo "TRAINER_LAST $(sudo docker logs __TRAINER__ 2>&1 | strip | grep -a 'SUCCESS Step' | tail -1)"
+echo "TRAINER_CURRENT $(sudo docker logs --tail 1 __TRAINER__ 2>&1 | strip | tail -1)"
+echo "TRAINER_FINISHED $(sudo docker logs __TRAINER__ 2>&1 | strip | grep -aEc 'RL trainer finished|Trainer finished')"
+echo "TRAINER_FAILED $(sudo docker logs __TRAINER__ 2>&1 | strip | grep -aEc 'prime_rl\.trainer\.rl\.train FAILED|CheckpointException')"
+echo "TRAINER_LOGAGE $(sudo docker logs -t --tail 1 __TRAINER__ 2>&1 | tail -1 | cut -d' ' -f1)"
+"""
+
+
 _EDGE_ORCH_PROBE = r"""
 strip() { sed "s/\\x1b\\[[0-9;]*m//g"; }
 echo "ORCH_UP $(sudo docker ps --filter name=__ORCH__ --format up 2>/dev/null | head -1)"
+echo "BATCH_SYNC $(pgrep -f 'bash .*[s]ync_rollout_batches.sh' | wc -l)"
+echo "TRAINER_FAIL_WD $(pgrep -f 'bash .*[t]rainer_failure_watchdog.sh' | wc -l)"
 echo "ORCH_LAST $(sudo docker logs __ORCH__ 2>&1 | strip | grep -a 'SUCCESS Step' | tail -1)"
 echo "BATCH $(sudo docker logs --tail 40 __ORCH__ 2>&1 | grep -oE 'batch [0-9]+/[0-9]+[^;]*; [0-9]+ inflight' | tail -1)"
 echo "FAILS5M $(sudo docker logs --since 5m __ORCH__ 2>&1 | grep -ac 'Rollout failed')"
@@ -249,6 +298,7 @@ _NODE_PROBE = r"""
 nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader,nounits \
   | awk -F, '{m+=$1; u+=$2; n++} END{printf "GPU %d %d %d\n", m/n, u/n, n}'
 free -g | sed -n 2p | awk '{print "MEM " $7 " " $5}'
+df -BG --output=avail,pcent /data | tail -1 | awk '{gsub(/G|%/, ""); print "DISK " $1 " " $2}'
 echo "CT $(sudo docker ps --filter name=__TRAINER__ --format '{{.Status}}' 2>/dev/null | head -1)"
 """
 
@@ -261,8 +311,17 @@ c=$(curl -s -o /dev/null -m 25 -w '%{http_code}' -X POST http://127.0.0.1:8000/v
     -d '{"model":"__MODEL__","prompt":"hi","max_tokens":3}')
 e=$(date +%s%N)
 echo "GEN $c $(( (e-s)/1000000 ))"
-echo "RUNNING $(sudo docker logs --tail 20 __ENGINE__ 2>&1 | grep -aoE 'Running: [0-9]+' | tail -1 | grep -oE '[0-9]+')"
-echo "TPUT $(sudo docker logs --tail 20 __ENGINE__ 2>&1 | grep -aoE 'generation throughput: [0-9.]+' | tail -1 | grep -oE '[0-9.]+')"
+# The health request can open a fresh 10-second metrics window whose first
+# line is zero. Use the maximum loaded observation from the last minute so the
+# synthetic probe does not erase evidence of concurrent production traffic.
+if sudo docker ps -a --filter name=^muse-glimmer-h200-0$ --format '{{.Names}}' | grep -q .; then
+  replicas=$(sudo docker ps -a --filter name=muse-glimmer-h200- --format '{{.Names}}' | grep -E '^muse-glimmer-h200-[0-9]+$' | sort -V)
+  echo "RUNNING $(for c in $replicas; do sudo docker logs --since 60s $c 2>&1 | grep -aoE 'Running: [0-9]+' | grep -oE '[0-9]+' | awk 'BEGIN{m=0} {if ($1>m)m=$1} END{print m}'; done | awk '{s+=$1} END{print s+0}')"
+  echo "TPUT $(for c in $replicas; do sudo docker logs --since 60s $c 2>&1 | grep -aoE 'generation throughput: [0-9.]+' | grep -oE '[0-9.]+' | awk 'BEGIN{m=0} {if ($1>m)m=$1} END{print m}'; done | awk '{s+=$1} END{print s+0}')"
+else
+  echo "RUNNING $(sudo docker logs --since 60s __ENGINE__ 2>&1 | grep -aoE 'Running: [0-9]+' | grep -oE '[0-9]+' | awk 'BEGIN{m=0} {if ($1>m)m=$1} END{print m}')"
+  echo "TPUT $(sudo docker logs --since 60s __ENGINE__ 2>&1 | grep -aoE 'generation throughput: [0-9.]+' | grep -oE '[0-9.]+' | awk 'BEGIN{m=0} {if ($1>m)m=$1} END{print m}')"
+fi
 echo "WD $(pgrep -f 'bash .*[e]ngine_watchdog.sh' | wc -l)"
 """
 
@@ -278,6 +337,19 @@ def _head_script() -> str:
     )
 
 
+def _trainer_mode() -> str:
+    """Return `trainer-only` when the active trainer uses `[data.fake]`."""
+    rc, out = _ssh(
+        HEAD,
+        f"cfg=$(sudo docker inspect {TRAINER_CT} --format "
+        "'{{range .Config.Cmd}}{{println .}}{{end}}' 2>/dev/null | "
+        "grep -E '\\.toml$' | tail -1); "
+        "if [ -n \"$cfg\" ] && grep -q '^\\[data\\.fake\\]' \"$cfg\" 2>/dev/null; "
+        "then echo trainer-only; else echo rl; fi",
+    )
+    return out.strip().splitlines()[-1] if rc == 0 and out.strip() else "rl"
+
+
 # ------------------------------------------------------------------- results
 
 
@@ -289,6 +361,8 @@ class NodeState:
     gpus: int = 0
     mem_free_gb: int = 0
     mem_shared_gb: int = 0
+    data_free_gb: int = 0
+    data_use_percent: int = 0
     container: str = ""
     reachable: bool = True
 
@@ -318,6 +392,7 @@ class AcceptanceReport:
     """Read-only TRAINING_EXPECTATIONS evidence and alarms."""
 
     run: str = ""
+    profile: str = "glm52"
     trainer_config_path: str = ""
     orchestrator_config_path: str = ""
     batch_size: int | None = None
@@ -328,6 +403,7 @@ class AcceptanceReport:
     max_norm: float | None = None
     weight_decay: float | None = None
     native_fp8: bool | None = None
+    precision_ok: bool | None = None
     completed_steps: int = 0
     trainer_compute_step: int | None = None
     trainer_compute_seconds: float | None = None
@@ -352,9 +428,9 @@ class AcceptanceReport:
         )
         precision = (
             "yes"
-            if self.native_fp8 is True
+            if self.precision_ok is True
             else "no"
-            if self.native_fp8 is False
+            if self.precision_ok is False
             else "?"
         )
         trainer = (
@@ -368,12 +444,24 @@ class AcceptanceReport:
             else "no separate generation measurement"
         )
         L = [f"=== TRAINING_EXPECTATIONS acceptance for run {self.run} ==="]
+        L.append(f"profile: {self.profile}")
         L.append(f"config: {values}")
-        L.append(f"native FP8 trainer: {precision}")
-        L.append(f"trainer forward/backward only: {trainer} (gate 10-15m after step 1)")
-        L.append(
-            f"active rollout generation only: {generation} (approximate gate 8-12m)"
-        )
+        if self.profile == "muse":
+            L.append(f"BF16 trainer: {precision}")
+            L.append(
+                f"trainer forward/backward only: {trainer} (alarm above 8m after step 1)"
+            )
+            L.append(
+                f"active rollout generation only: {generation} (alarm above 20m)"
+            )
+        else:
+            L.append(f"native FP8 trainer: {precision}")
+            L.append(
+                f"trainer forward/backward only: {trainer} (gate 10-15m after step 1)"
+            )
+            L.append(
+                f"active rollout generation only: {generation} (approximate gate 8-12m)"
+            )
         L.append(
             "excluded from both times: policy/gate waiting, judging/scoring, batch transfer, "
             "adapter transfer, and checkpoint save"
@@ -401,12 +489,18 @@ class AcceptanceReport:
 class Status:
     when: str = ""
     run: str = ""
+    mode: str = "rl"
     tunnels_ok: int = 0
     tunnels_bad: list[int] = field(default_factory=list)
     trainer_up: bool = False
+    trainer_finished: bool = False
+    trainer_failed: bool = False
     orch_up: bool = False
+    batch_sync: bool = False
+    trainer_failure_watchdog: bool = False
     trainer_steps: int = 0
     trainer_last: str = ""
+    trainer_current: str = ""
     orch_last: str = ""
     batch: str = ""
     fails_5m: int = 0
@@ -424,27 +518,58 @@ class Status:
 
     def report(self) -> str:
         L = [f"=== {self.when} UTC  run={self.run} ==="]
-        L.append(
-            f"trainer {'up' if self.trainer_up else 'DOWN'} | "
-            f"orchestrator {'up' if self.orch_up else 'DOWN'} | "
-            f"tunnels {self.tunnels_ok}/{len(TUNNEL_PORTS)} | judge {self.judge} | adapter {self.adapter}"
-        )
+        if self.mode == "trainer-only":
+            trainer_state = (
+                "FAILED"
+                if self.trainer_failed
+                else "finished"
+                if self.trainer_finished
+                else "up"
+                if self.trainer_up
+                else "DOWN"
+            )
+            L.append(
+                f"trainer {trainer_state} | "
+                "mode trainer-only qualification | rollout components not required"
+            )
+        else:
+            trainer_state = (
+                "FAILED"
+                if self.trainer_failed
+                else "finished"
+                if self.trainer_finished
+                else "up"
+                if self.trainer_up
+                else "DOWN"
+            )
+            L.append(
+                f"trainer {trainer_state} | "
+                f"orchestrator {'up' if self.orch_up else 'DOWN'} | "
+                f"tunnels {self.tunnels_ok}/{len(TUNNEL_PORTS)} | judge {self.judge} | adapter {self.adapter}"
+            )
         L.append(
             f"steps {self.trainer_steps} | fails/5m {self.fails_5m} | {self.batch or 'no batch line'}"
         )
         if self.trainer_last:
             L.append(f"  trainer: {self.trainer_last[:150]}")
+        elif self.trainer_current:
+            L.append(f"  trainer now: {self.trainer_current[:150]}")
         if self.orch_last:
             L.append(f"  orch:    {self.orch_last[:150]}")
-        L.append(
-            f"  last log line: trainer {_hms(self.trainer_log_age)} ago, "
-            f"orchestrator {_hms(self.orch_log_age)} ago"
-        )
-        L.append(
-            f"  supervisors: run={'yes' if self.supervisor_run else 'NO'} "
-            f"tunnel={'yes' if self.supervisor_tunnel else 'NO'} "
-            f"(tunnel log {_hms(self.supervisor_tunnel_log_age)} old)"
-        )
+        if self.mode == "trainer-only":
+            L.append(f"  last log line: trainer {_hms(self.trainer_log_age)} ago")
+        else:
+            L.append(
+                f"  last log line: trainer {_hms(self.trainer_log_age)} ago, "
+                f"orchestrator {_hms(self.orch_log_age)} ago"
+            )
+            L.append(
+                f"  supervisors: run={'yes' if self.supervisor_run else 'NO'} "
+                f"tunnel={'yes' if self.supervisor_tunnel else 'NO'} "
+                f"batch-sync={'yes' if self.batch_sync else 'NO'} "
+                f"trainer-guard={'yes' if self.trainer_failure_watchdog else 'NO'} "
+                f"(tunnel log {_hms(self.supervisor_tunnel_log_age)} old)"
+            )
         L.append("--- trainer nodes " + "-" * 46)
         for n in self.nodes:
             if not n.reachable:
@@ -452,18 +577,20 @@ class Status:
                 continue
             L.append(
                 f"{n.host:<5} {n.gpu_mem_mb / 1024:5.1f} GiB/gpu  {n.gpu_util:3d}% util  "
-                f"{n.mem_free_gb:4d}G free  {n.mem_shared_gb:3d}G shared  {n.container[:28]}"
+                f"{n.mem_free_gb:4d}G RAM  {n.data_free_gb:4d}G disk "
+                f"({n.data_use_percent:2d}% used)  {n.container[:28]}"
             )
-        L.append("--- engines " + "-" * 52)
-        for e in self.engines:
-            if not e.reachable:
-                L.append(f"{e.host:<6} UNREACHABLE")
-                continue
-            L.append(
-                f"{e.host:<6} gen={e.gen_code} in {e.gen_ms:>6d} ms  {e.gpu_util:3d}% util  "
-                f"running={e.running:<4d} {e.throughput:8.1f} tok/s  "
-                f"watchdog={'yes' if e.watchdog else 'NO'}"
-            )
+        if self.mode != "trainer-only":
+            L.append("--- engines " + "-" * 52)
+            for e in self.engines:
+                if not e.reachable:
+                    L.append(f"{e.host:<6} UNREACHABLE")
+                    continue
+                L.append(
+                    f"{e.host:<6} gen={e.gen_code} in {e.gen_ms:>6d} ms  {e.gpu_util:3d}% util  "
+                    f"running={e.running:<4d} {e.throughput:8.1f} tok/s  "
+                    f"watchdog={'yes' if e.watchdog else 'NO'}"
+                )
         for w in self.warnings:
             L.append(f"!! {w}")
         for alarm in self.acceptance_alarms:
@@ -647,6 +774,15 @@ def _failure_evidence(
             1
             for line in lines
             if pattern.search(line)
+            # The synthetic completion probe can make vLLM reject a NaN
+            # timing/usage field while the engine remains healthy and serves
+            # production requests. Actual rollout failures are counted from
+            # rollout metrics above.
+            and not re.search(
+                r"Out of range float values are not JSON compliant:\s*nan",
+                line,
+                re.I,
+            )
             and not re.search(
                 r"(?:error|failed|nonfinite)[^0-9]{0,8}0(?:\.0+)?%?", line, re.I
             )
@@ -695,7 +831,15 @@ def _acceptance_from_text(
     orch_values = _parse_toml_scalars(orchestrator_config)
     trainer_rows = _parse_jsonl_metrics(trainer_metrics)
     rollout_rows = _parse_jsonl_metrics(rollout_metrics)
-    rep = AcceptanceReport(run=run, reward_verdict=reward_verdict)
+    is_muse = run.lower().startswith("muse") or "muse-glimmer" in trainer_config.lower()
+    profile = "muse" if is_muse else "glm52"
+    rep = AcceptanceReport(
+        run=run, profile=profile, reward_verdict=reward_verdict
+    )
+    expected_batch = MUSE_EXPECTED_BATCH_SIZE if is_muse else EXPECTED_BATCH_SIZE
+    expected_context = (
+        MUSE_EXPECTED_CONTEXT_LENGTH if is_muse else EXPECTED_CONTEXT_LENGTH
+    )
 
     rep.batch_size = _last(orch_values, "batch_size")
     rep.group_size = _last(orch_values, "group_size")
@@ -728,10 +872,21 @@ def _acceptance_from_text(
     ]
     if not trainer_config.strip():
         rep.native_fp8 = None
+        rep.precision_ok = None
+    elif is_muse:
+        optimization_dtype = _last(trainer_values, "model.optimization_dtype")
+        reduce_dtype = _last(trainer_values, "model.reduce_dtype")
+        rep.native_fp8 = False
+        rep.precision_ok = (
+            optimization_dtype == "bfloat16"
+            and reduce_dtype == "bfloat16"
+            and quant_type is None
+        )
     else:
         rep.native_fp8 = quant_type == "fp8" and all(
             flag is False for flag in dequant_flags
         )
+        rep.precision_ok = rep.native_fp8
 
     rep.completed_steps = max((row["step"] for row in trainer_rows), default=0)
     compute = [
@@ -769,9 +924,9 @@ def _acceptance_from_text(
         if actual is None or actual != want:
             rep.alarms.append(f"{name} is {_shown(actual)}; expected {want}")
 
-    expected("batch size", rep.batch_size, EXPECTED_BATCH_SIZE)
+    expected("batch size", rep.batch_size, expected_batch)
     expected("group size", rep.group_size, EXPECTED_GROUP_SIZE)
-    expected("context length", rep.context_length, EXPECTED_CONTEXT_LENGTH)
+    expected("context length", rep.context_length, expected_context)
     if not rep.max_output_lengths or any(
         v != EXPECTED_MAX_OUTPUT_LENGTH for v in rep.max_output_lengths
     ):
@@ -794,36 +949,65 @@ def _acceptance_from_text(
         rep.alarms.append(
             f"weight decay is {_shown(rep.weight_decay)}; expected {EXPECTED_WEIGHT_DECAY:g}"
         )
-    if rep.native_fp8 is not True:
-        rep.alarms.append("trainer is not confirmed on native FP8 checkpoint weights")
+    if rep.precision_ok is not True:
+        if is_muse:
+            rep.alarms.append("trainer is not confirmed on unquantized BF16 weights")
+        else:
+            rep.alarms.append("trainer is not confirmed on native FP8 checkpoint weights")
 
-    bad_compute = [
-        step
-        for step, seconds in compute
-        if seconds < TRAINER_COMPUTE_MIN_SECONDS
-        or seconds > TRAINER_COMPUTE_MAX_SECONDS
-    ]
+    if is_muse:
+        bad_compute = [
+            step
+            for step, seconds in compute
+            if seconds > MUSE_TRAINER_COMPUTE_MAX_SECONDS
+        ]
+    else:
+        bad_compute = [
+            step
+            for step, seconds in compute
+            if seconds < TRAINER_COMPUTE_MIN_SECONDS
+            or seconds > TRAINER_COMPUTE_MAX_SECONDS
+        ]
     if bad_compute:
-        rep.alarms.append(
-            f"trainer forward/backward is outside 10-15m after step 1 at steps "
-            f"{','.join(map(str, bad_compute[-8:]))}"
-        )
+        if is_muse:
+            rep.alarms.append(
+                f"trainer forward/backward exceeds 8m after step 1 at steps "
+                f"{','.join(map(str, bad_compute[-8:]))}"
+            )
+        else:
+            rep.alarms.append(
+                f"trainer forward/backward is outside 10-15m after step 1 at steps "
+                f"{','.join(map(str, bad_compute[-8:]))}"
+            )
     elif rep.completed_steps > 1 and not compute:
         rep.alarms.append(
             "no separate trainer forward/backward measurement after step 1"
         )
 
-    bad_generation = [
-        step
-        for step, seconds in generation
-        if seconds < ROLLOUT_GENERATION_MIN_SECONDS
-        or seconds > ROLLOUT_GENERATION_MAX_SECONDS
-    ]
+    if is_muse:
+        bad_generation = [
+            step
+            for step, seconds in generation
+            if seconds > MUSE_ROLLOUT_GENERATION_MAX_SECONDS
+        ]
+    else:
+        bad_generation = [
+            step
+            for step, seconds in generation
+            if seconds < ROLLOUT_GENERATION_MIN_SECONDS
+            or seconds > ROLLOUT_GENERATION_MAX_SECONDS
+        ]
     if bad_generation:
-        rep.alarms.append(
-            f"active rollout generation is outside approximately 10m (8-12m alarm band) "
-            f"at steps {','.join(map(str, bad_generation[-8:]))}"
-        )
+        if is_muse:
+            rep.alarms.append(
+                f"active rollout generation exceeds 20m at steps "
+                f"{','.join(map(str, bad_generation[-8:]))}"
+            )
+        else:
+            rep.alarms.append(
+                f"active rollout generation is outside approximately 10m (8-12m alarm band) "
+                f"at steps {','.join(map(str, bad_generation[-8:]))}"
+            )
     elif rollout_rows and not generation:
         rep.alarms.append("no separate active rollout generation measurement")
 
@@ -875,7 +1059,8 @@ emit CONFIG "$cfg" cat
 emit METRICS "$metric" tail
 logs=""
 for ct in {containers}; do
-  logs="$logs$(sudo docker logs --tail 20000 "$ct" 2>&1 |
+  logs="${{logs}}
+$(sudo docker logs --tail 20000 "$ct" 2>&1 |
     grep -aiE {shlex.quote(_ACCEPTANCE_LOG_GREP)} | tail -200)"
 done
 printf 'LOGS_B64 '; printf '%s' "$logs" | base64 -w0; printf '\\n'
@@ -906,6 +1091,11 @@ def acceptance(run: str = "", quiet: bool = False) -> AcceptanceReport:
     to either measurement.
     """
     run = run or current_run()
+    if _trainer_mode() == "trainer-only":
+        raise Refused(
+            "acceptance() is for production RL runs. Use status() for the "
+            "20-step trainer-only qualification and run direct parity separately."
+        )
     with ThreadPoolExecutor(max_workers=4) as ex:
         f_trainer = ex.submit(_ssh, HEAD, _acceptance_probe_script(run, "trainer"), 180)
         f_edge = ex.submit(_ssh, EDGE_ORCH, _acceptance_probe_script(run, "edge"), 180)
@@ -939,12 +1129,113 @@ def acceptance(run: str = "", quiet: bool = False) -> AcceptanceReport:
 # --------------------------------------------------------------------- reads
 
 
+def logs(role: str = "trainer", lines: int = 200) -> str:
+    """Read the current container tail without a separate SSH command."""
+    roles = {
+        "trainer": (HEAD, TRAINER_CT),
+        "orchestrator": (EDGE_ORCH, ORCH_CT),
+        "h200a": ("h200a", MUSE_ENGINE_CT),
+        "h200b": ("h200b", MUSE_ENGINE_CT),
+    }
+    if role not in roles:
+        raise Refused(f"log role must be one of: {', '.join(roles)}")
+    try:
+        lines = int(lines)
+    except (TypeError, ValueError) as error:
+        raise Refused("log line count must be an integer") from error
+    if not 1 <= lines <= 5000:
+        raise Refused("log line count must be between 1 and 5000")
+    host, container = roles[role]
+    rc, output = _ssh(
+        host,
+        f"sudo docker logs --tail {lines} {container} 2>&1 | "
+        "sed 's/\\x1b\\[[0-9;]*m//g'",
+        timeout=180,
+    )
+    if rc:
+        raise RuntimeError(f"could not read {role} logs on {host}: {output.strip()}")
+    print(output, end="" if output.endswith("\n") else "\n")
+    return output
+
+
+def parity(run: str = "") -> dict:
+    """Summarize the step-1 token parity record on the owning trainer host."""
+    run = run or current_run()
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", run):
+        raise Refused("run name contains invalid characters")
+    path = f"{RUNS}/{run}/parity-step1.json"
+    script = f"""
+python3 - {shlex.quote(path)} <<'PY'
+import hashlib,json,math,sys
+p=sys.argv[1]
+try:
+    raw=open(p,'rb').read()
+except FileNotFoundError:
+    raise SystemExit(3)
+d=json.loads(raw)
+lengths=d['sequence_lengths']
+expected=[]
+for length in lengths:
+    expected.extend(range(length))
+positions=d['position_ids']
+mask=d['loss_mask']
+delta=d['delta']
+trainer=d['trainer_logprobs']
+reference=d['reference_logprobs']
+valid=[x for x,keep in zip(delta,mask) if keep]
+valid_trainer=[x for x,keep in zip(trainer,mask) if keep]
+valid_reference=[x for x,keep in zip(reference,mask) if keep]
+ordered=sorted(abs(x) for x in valid)
+proxy=sum(math.exp(min(x,80.0))-x-1.0 for x in valid)/max(len(valid),1)
+out={{
+  'sha256':hashlib.sha256(raw).hexdigest(),
+  'tokens':len(delta),
+  'sequences':len(lengths),
+  'valid_tokens':len(valid),
+  'masked_fraction':1.0-len(valid)/max(len(delta),1),
+  'position_mismatches':sum(a!=b for a,b in zip(positions,expected)) + abs(len(positions)-len(expected)),
+  'mean_abs_delta':sum(abs(x) for x in valid)/max(len(valid),1),
+  'mean_delta':sum(valid)/max(len(valid),1),
+  'mean_trainer_logprob':sum(valid_trainer)/max(len(valid_trainer),1),
+  'mean_reference_logprob':sum(valid_reference)/max(len(valid_reference),1),
+  'p95_abs_delta':ordered[min(int(0.95*len(ordered)),len(ordered)-1)] if ordered else 0.0,
+  'max_abs_delta':max(ordered,default=0.0),
+  'mismatch_kl_proxy':proxy,
+}}
+print(json.dumps(out,sort_keys=True))
+PY
+"""
+    results = _fan(TRAINER_NODES, lambda host: _ssh(host, script, timeout=180))
+    found = []
+    for host, (rc, output) in results.items():
+        if rc:
+            continue
+        try:
+            summary = json.loads(output.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            continue
+        summary["host"] = host
+        found.append(summary)
+    if not found:
+        raise RuntimeError(f"no parity record found at {path} on trainer nodes")
+    unique = {item["sha256"] for item in found}
+    if len(unique) != 1:
+        raise RuntimeError(f"different parity records found for {run}: {found}")
+    summary = found[0]
+    print(json.dumps(summary, indent=2, sort_keys=True))
+    return summary
+
+
 def status(run: str = "", quiet: bool = False) -> Status:
     """Probe every part of the run once and return the whole picture."""
     run = run or current_run()
+    muse_run = run.startswith("muse")
+    engine_model = MUSE_ENGINE_MODEL if muse_run else ENGINE_MODEL
+    engine_container = MUSE_ENGINE_CT if muse_run else ENGINE_CT
     s = Status(
         when=_dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), run=run
     )
+    trainer_only = _trainer_mode() == "trainer-only"
 
     def node(h):
         return _ssh(h, _NODE_PROBE.replace("__TRAINER__", TRAINER_CT), timeout=60)
@@ -952,41 +1243,68 @@ def status(run: str = "", quiet: bool = False) -> Status:
     def engine(h):
         return _ssh(
             h,
-            _ENGINE_PROBE.replace("__MODEL__", ENGINE_MODEL).replace(
-                "__ENGINE__", ENGINE_CT
+            _ENGINE_PROBE.replace("__MODEL__", engine_model).replace(
+                "__ENGINE__", engine_container
             ),
             timeout=90,
         )
 
     with ThreadPoolExecutor(max_workers=12) as ex:
-        f_head = ex.submit(_ssh, HEAD, _head_script(), 300)
-        f_edge_orch = ex.submit(
-            _ssh,
-            EDGE_ORCH,
-            _EDGE_ORCH_PROBE.replace("__ORCH__", ORCH_CT),
-            120,
-        )
-        f_nodes = ex.submit(_fan, TRAINER_NODES, node)
-        f_engines = ex.submit(_fan, ENGINE_HOSTS, engine)
-        head_rc, head_out = f_head.result()
-        edge_orch_rc, edge_orch_out = f_edge_orch.result()
-        nodes_out = f_nodes.result()
-        engines_out = f_engines.result()
+        if trainer_only:
+            f_head = ex.submit(
+                _ssh,
+                HEAD,
+                _TRAINER_ONLY_HEAD_PROBE.replace("__TRAINER__", TRAINER_CT),
+                120,
+            )
+            f_nodes = ex.submit(_fan, TRAINER_NODES, node)
+            head_rc, head_out = f_head.result()
+            nodes_out = f_nodes.result()
+            edge_orch_rc, edge_orch_out = 0, ""
+            engines_out = {}
+        else:
+            f_head = ex.submit(_ssh, HEAD, _head_script(), 300)
+            f_edge_orch = ex.submit(
+                _ssh,
+                EDGE_ORCH,
+                _EDGE_ORCH_PROBE.replace("__ORCH__", ORCH_CT),
+                120,
+            )
+            f_nodes = ex.submit(_fan, TRAINER_NODES, node)
+            f_engines = ex.submit(_fan, ENGINE_HOSTS, engine)
+            head_rc, head_out = f_head.result()
+            edge_orch_rc, edge_orch_out = f_edge_orch.result()
+            nodes_out = f_nodes.result()
+            engines_out = f_engines.result()
 
     h = _kv(head_out)
     edge_orch = _kv(edge_orch_out) if edge_orch_rc == 0 else {}
     # The active filesystem orchestrator runs on h200a. Prefer its state and
     # metrics. Keep the n82 values only as a legacy fallback for old runs.
     if edge_orch.get("ORCH_UP") == "up":
-        for key in ("ORCH_UP", "ORCH_LAST", "BATCH", "FAILS5M", "ORCH_LOGAGE"):
+        for key in (
+            "ORCH_UP",
+            "BATCH_SYNC",
+            "TRAINER_FAIL_WD",
+            "ORCH_LAST",
+            "BATCH",
+            "FAILS5M",
+            "ORCH_LOGAGE",
+        ):
             if key in edge_orch:
                 h[key] = edge_orch[key]
     s.tunnels_ok = int(h.get("TUNNELS_OK", 0) or 0)
+    s.mode = h.get("MODE", "rl")
     s.tunnels_bad = [int(p) for p in h.get("TUNNELS_BAD", "").split()]
-    s.trainer_up = h.get("TRAINER_UP", "") == "up"
+    head_trainer_up = h.get("TRAINER_UP", "") == "up"
     s.orch_up = h.get("ORCH_UP", "") == "up"
+    s.batch_sync = int(h.get("BATCH_SYNC", 0) or 0) > 0
+    s.trainer_failure_watchdog = int(h.get("TRAINER_FAIL_WD", 0) or 0) > 0
     s.trainer_steps = int(h.get("TRAINER_STEPS", 0) or 0)
     s.trainer_last = h.get("TRAINER_LAST", "")
+    s.trainer_current = h.get("TRAINER_CURRENT", "")
+    s.trainer_finished = int(h.get("TRAINER_FINISHED", 0) or 0) > 0
+    s.trainer_failed = int(h.get("TRAINER_FAILED", 0) or 0) > 0
     s.orch_last = h.get("ORCH_LAST", "")
     s.batch = h.get("BATCH", "")
     s.fails_5m = int(h.get("FAILS5M", 0) or 0)
@@ -1006,9 +1324,19 @@ def status(run: str = "", quiet: bool = False) -> Status:
                 n.gpu_mem_mb, n.gpu_util, n.gpus = int(p[1]), int(p[2]), int(p[3])
             elif p[:1] == ["MEM"] and len(p) >= 3:
                 n.mem_free_gb, n.mem_shared_gb = int(p[1]), int(p[2])
+            elif p[:1] == ["DISK"] and len(p) >= 3:
+                n.data_free_gb, n.data_use_percent = int(p[1]), int(p[2])
             elif p[:1] == ["CT"]:
                 n.container = line[3:].strip()
         s.nodes.append(n)
+
+    # A distributed trainer is up only when all eight workers are reachable
+    # and their containers are running. The old n82-only result hid the x65p
+    # step-8 failure while n76 and n77 had already exited.
+    cluster_trainers_up = len(s.nodes) == len(TRAINER_NODES) and all(
+        n.reachable and n.container.startswith("Up") for n in s.nodes
+    )
+    s.trainer_up = head_trainer_up and cluster_trainers_up
 
     for host, (rc, out) in engines_out.items():
         e = EngineState(host=host, reachable=(rc == 0))
@@ -1034,11 +1362,20 @@ def status(run: str = "", quiet: bool = False) -> Status:
 
 def _warnings(s: Status) -> list[str]:
     w = []
-    if not s.trainer_up:
-        w.append("trainer container is not up")
-    if not s.orch_up:
+    if s.trainer_failed:
+        w.append(f"trainer process failed after {s.trainer_steps} completed steps")
+    elif not s.trainer_up and not s.trainer_finished:
+        failed_nodes = [
+            n.host
+            for n in s.nodes
+            if not n.reachable or not n.container.startswith("Up")
+        ]
+        detail = f" on {', '.join(failed_nodes)}" if failed_nodes else ""
+        w.append(f"trainer cluster is not complete{detail}")
+    trainer_only = s.mode == "trainer-only"
+    if not trainer_only and not s.orch_up:
         w.append("orchestrator container is not up")
-    if s.tunnels_ok <= 20:
+    if not trainer_only and s.tunnels_ok <= 20:
         # Do not read this as dead tunnels on its own. The probe shares each
         # tunnel with rollout traffic, so under load it starves on links that
         # still carry rollouts. Confirm against the engines before acting:
@@ -1049,7 +1386,7 @@ def _warnings(s: Status) -> list[str]:
             f"only {s.tunnels_ok}/{len(TUNNEL_PORTS)} tunnels answer. Check the engines before you believe this. "
             "If they are generating, the probe is starved by load, not by dead tunnels."
         )
-    elif s.tunnels_ok < 36:
+    elif not trainer_only and s.tunnels_ok < 36:
         w.append(
             f"{s.tunnels_ok}/{len(TUNNEL_PORTS)} tunnels answer. "
             "Compare against the engine concurrency below."
@@ -1070,35 +1407,49 @@ def _warnings(s: Status) -> list[str]:
                 "and run nothing. Sample again before acting. If it holds, the requests are queued "
                 "in the tunnels; lower max_inflight_rollouts, which is independent of batch_size."
             )
-    for e in s.engines:
+    for e in (() if trainer_only else s.engines):
         if e.reachable and not e.healthy:
-            w.append(
-                f"{e.host} failed a real completion probe (code {e.gen_code}). Run repair('engine:{e.host}')."
-            )
+            if e.watchdog:
+                w.append(
+                    f"{e.host} failed a real completion probe (code {e.gen_code}), but its watchdog is active. "
+                    "Sample again and inspect /root/engine_watchdog.log before a manual repair."
+                )
+            else:
+                w.append(
+                    f"{e.host} failed a real completion probe (code {e.gen_code}). Run repair('engine:{e.host}')."
+                )
         if e.reachable and not e.watchdog:
             w.append(f"{e.host} has no engine watchdog running")
-    if s.judge != "200":
+    if not trainer_only and s.judge != "200":
         w.append(
             f"judge returned {s.judge}; every reward multiplies by the judge score"
         )
-    if s.adapter != "200":
+    if not trainer_only and s.adapter != "200":
         w.append(
             f"adapter server returned {s.adapter} on port {ADAPTER_PORT}. "
             "If the engines cannot fetch the LoRA, they keep serving the base model and nothing learns."
         )
-    if not s.supervisor_run:
-        w.append("run supervisor is not running; a dead trainer will stay dead")
-    if not s.supervisor_tunnel:
+    if not trainer_only and not s.supervisor_run:
+        w.append("fail-closed run supervisor is not running")
+    if not trainer_only and not s.supervisor_tunnel:
         w.append("tunnel watchdog is not running")
-    elif s.supervisor_tunnel_log_age and s.supervisor_tunnel_log_age > 300:
+    elif not trainer_only and s.supervisor_tunnel_log_age and s.supervisor_tunnel_log_age > 300:
         w.append(
             f"tunnel watchdog process exists but its log is {_hms(s.supervisor_tunnel_log_age)} old; "
             "a process that writes no log line does not work"
         )
+    if s.orch_up and not s.batch_sync:
+        w.append("durable batch publisher is not running; completed rollout batches cannot reach the trainer")
+    if s.orch_up and not s.trainer_failure_watchdog:
+        w.append("edge trainer-failure watchdog is not running; rollout production will not fail closed")
     trainer_busy = s.trainer_up and any(
         node.reachable and node.gpu_util >= 50 for node in s.nodes
     )
-    for name, age in (("trainer", s.trainer_log_age), ("orchestrator", s.orch_log_age)):
+    ages = (("trainer", s.trainer_log_age),) if trainer_only else (
+        ("trainer", s.trainer_log_age),
+        ("orchestrator", s.orch_log_age),
+    )
+    for name, age in ages:
         if age is not None and age > STALL_SECONDS:
             if name == "trainer" and trainer_busy:
                 continue
@@ -1110,6 +1461,11 @@ def _warnings(s: Status) -> list[str]:
             w.append(
                 f"{n.host} has only {n.mem_free_gb}G of host memory free. "
                 'Check that ac_offloading = "None" is set; the default fills pinned host memory.'
+            )
+        if n.reachable and n.data_free_gb < 25:
+            w.append(
+                f"{n.host} has only {n.data_free_gb}G free on /data "
+                f"({n.data_use_percent}% used). Do not start a save until space is available."
             )
     return w
 
@@ -1147,14 +1503,38 @@ def tunnels() -> dict[int, str]:
     return res
 
 
-def engines() -> dict[str, EngineState]:
+def engines(run: str = "") -> dict[str, EngineState]:
     """Probe both engines with a real 3-token completion."""
-    s = status(quiet=True)
-    for e in s.engines:
+    run = run or current_run()
+    muse_run = run.startswith("muse")
+    engine_model = MUSE_ENGINE_MODEL if muse_run else ENGINE_MODEL
+    engine_container = MUSE_ENGINE_CT if muse_run else ENGINE_CT
+    script = _ENGINE_PROBE.replace("__MODEL__", engine_model).replace(
+        "__ENGINE__", engine_container
+    )
+    states = []
+    for host, (rc, out) in _fan(
+        ENGINE_HOSTS, lambda h: _ssh(h, script, timeout=90)
+    ).items():
+        e = EngineState(host=host, reachable=(rc == 0))
+        for line in out.splitlines():
+            p = line.split()
+            if p[:1] == ["GPU"] and len(p) >= 2:
+                e.gpu_util = int(p[1])
+            elif p[:1] == ["GEN"] and len(p) >= 3:
+                e.gen_code, e.gen_ms = p[1], int(p[2])
+            elif p[:1] == ["RUNNING"] and len(p) >= 2:
+                e.running = int(p[1])
+            elif p[:1] == ["TPUT"] and len(p) >= 2:
+                e.throughput = float(p[1])
+            elif p[:1] == ["WD"] and len(p) >= 2:
+                e.watchdog = int(p[1]) > 0
+        states.append(e)
+    for e in states:
         print(
             f"{e.host}: gen={e.gen_code} in {e.gen_ms} ms, running={e.running}, {e.throughput} tok/s"
         )
-    return {e.host: e for e in s.engines}
+    return {e.host: e for e in states}
 
 
 def alive(pattern: str, host: str = HEAD, log: str = "") -> bool:
@@ -1450,16 +1830,54 @@ def _repair_engine(host: str) -> str:
     _check_host(host)
     if host not in ENGINE_HOSTS:
         raise Refused(f"{host} is not an engine host. Use one of {ENGINE_HOSTS}.")
+    muse_engine = _ssh(
+        host,
+        f"sudo docker ps -a --filter name=^{MUSE_ENGINE_CT}$ --format '{{{{.Names}}}}' | head -1",
+    )[1].strip() == MUSE_ENGINE_CT
+    engine_container = MUSE_ENGINE_CT if muse_engine else ENGINE_CT
+    engine_model = MUSE_ENGINE_MODEL if muse_engine else ENGINE_MODEL
+    start_script = (
+        f"{DEPLOY}/scripts/h200/start_muse_inference.sh"
+        if muse_engine
+        else f"{DEPLOY}/scripts/h200/start_inference.sh"
+    )
+    startup_grace = 600 if muse_engine else 180
     print(
-        f"{host}: removing and restarting {ENGINE_CT}. The model load needs 5 to 10 minutes."
+        f"{host}: removing and restarting {engine_container}. The model load needs 5 to 10 minutes."
+    )
+    # A watchdog that already has misses can race a deliberate repair and
+    # remove the newly loading container. Stop it first, then start a fresh
+    # watcher with a bounded load grace and a reset miss count.
+    _ssh(
+        host,
+        f"pkill -f '^bash {DEPLOY}/scripts/h200/engine_watchdog.sh$' 2>/dev/null; echo stopped",
     )
     rc, out = _ssh(
         host,
-        f"sudo docker rm -f {ENGINE_CT} >/dev/null 2>&1; "
-        f"nohup setsid bash {DEPLOY}/scripts/h200/start_inference.sh >/root/start_inference.log 2>&1 </dev/null & "
+        f"sudo docker rm -f {engine_container} >/dev/null 2>&1; "
+        f"nohup setsid bash {start_script} >/root/start_inference.log 2>&1 </dev/null & "
         "sleep 3; echo issued",
         timeout=180,
     )
+    if muse_engine:
+        watchdogs = []
+        for replica, port in enumerate(range(8001, 8009)):
+            watchdogs.append(
+                f"nohup setsid env STARTUP_GRACE={startup_grace} MODEL={engine_model} "
+                f"PORT={port} MUSE_REPLICA_INDEX={replica} START={start_script} "
+                f"ENGINE_CONTAINER={engine_container}-{replica} "
+                f"bash {DEPLOY}/scripts/h200/engine_watchdog.sh "
+                f">> /root/engine_watchdog-{replica}.log 2>&1 </dev/null &"
+            )
+        _ssh(host, " ".join(watchdogs) + " disown")
+    else:
+        _ssh(
+            host,
+            f"nohup setsid env STARTUP_GRACE={startup_grace} MODEL={engine_model} "
+            f"START={start_script} ENGINE_CONTAINER={engine_container} "
+            f"bash {DEPLOY}/scripts/h200/engine_watchdog.sh "
+            ">> /root/engine_watchdog.log 2>&1 </dev/null & disown",
+        )
     print("Do not test with /v1/models. Test with engines() when the load finishes.")
     return out.strip()
 
@@ -1480,12 +1898,49 @@ def _repair_supervisors() -> str:
         else:
             out.append(f"{pat} already runs")
     for h in ENGINE_HOSTS:
-        if not alive("bash .*engine_watchdog.sh", h):
+        muse_engine = _ssh(
+            h,
+            f"sudo docker ps -a --filter name=^{MUSE_ENGINE_CT}$ --format '{{{{.Names}}}}' | head -1",
+        )[1].strip() == MUSE_ENGINE_CT
+        rc, count_text = _ssh(
+            h,
+            f"pgrep -f '^bash {DEPLOY}/scripts/h200/engine_watchdog.sh$' | wc -l",
+        )
+        count = int(count_text.strip() or 0)
+        if muse_engine:
+            replica_text = _ssh(
+                h,
+                f"sudo docker ps -a --filter name={MUSE_ENGINE_CT}- --format '{{{{.Names}}}}' "
+                f"| grep -Ec '^{MUSE_ENGINE_CT}-[0-9]+$'",
+            )[1].strip()
+            expected = int(replica_text or 0) or 8
+        else:
+            expected = 1
+        if count == expected:
+            out.append(f"{expected} engine watchdog(s) already run on {h}")
+            continue
+        _ssh(
+            h,
+            f"pkill -f '^bash {DEPLOY}/scripts/h200/engine_watchdog.sh$' 2>/dev/null; true",
+        )
+        if muse_engine:
+            start_script = f"{DEPLOY}/scripts/h200/start_muse_inference.sh"
+            watchdogs = []
+            for replica, port in enumerate(range(8001, 8001 + expected)):
+                watchdogs.append(
+                    f"nohup setsid env STARTUP_GRACE=600 MODEL={MUSE_ENGINE_MODEL} "
+                    f"PORT={port} MUSE_REPLICA_INDEX={replica} START={start_script} "
+                    f"ENGINE_CONTAINER={MUSE_ENGINE_CT}-{replica} "
+                    f"bash {DEPLOY}/scripts/h200/engine_watchdog.sh "
+                    f">> /root/engine_watchdog-{replica}.log 2>&1 </dev/null &"
+                )
+            _ssh(h, " ".join(watchdogs) + " disown")
+        else:
             _ssh(
                 h,
                 f"nohup setsid bash {DEPLOY}/scripts/h200/engine_watchdog.sh >> /root/engine_watchdog.log 2>&1 </dev/null & disown",
             )
-            out.append(f"restarted engine watchdog on {h}")
+        out.append(f"restarted {expected} engine watchdog(s) on {h}")
     msg = "; ".join(out)
     print(msg)
     print(
@@ -1509,6 +1964,7 @@ def mounted_files() -> list[str]:
         REPO / "scripts" / "china" / "cluster.sh",
         REPO / "scripts" / "h200" / "start_orchestrator.sh",
         REPO / "scripts" / "h200" / "start_inference.sh",
+        REPO / "scripts" / "h200" / "start_muse_inference.sh",
     )
     return sorted(set().union(*(_mounts_in(script) for script in scripts)))
 
@@ -1518,6 +1974,7 @@ def _mounted_on(path: str, host: str) -> bool:
         scripts = (
             REPO / "scripts" / "h200" / "start_orchestrator.sh",
             REPO / "scripts" / "h200" / "start_inference.sh",
+            REPO / "scripts" / "h200" / "start_muse_inference.sh",
         )
     else:
         scripts = (REPO / "scripts" / "china" / "cluster.sh",)
@@ -1525,8 +1982,14 @@ def _mounted_on(path: str, host: str) -> bool:
 
 
 def deploy(path: str, nodes: list[str] | None = None) -> bool:
-    """Push one repository file to every trainer node and verify the checksum."""
-    nodes = [_check_host(h) for h in (nodes or TRAINER_NODES)]
+    """Push one repository file to its hosts and verify the checksum."""
+    if nodes is None:
+        nodes = (
+            ENGINE_HOSTS
+            if path.startswith(("configs/h200/", "scripts/h200/"))
+            else TRAINER_NODES
+        )
+    nodes = [_check_host(h) for h in nodes]
     local = REPO / path
     if not local.is_file():
         raise Refused(f"not in the repository: {local}")
@@ -1599,7 +2062,8 @@ def start(
     if HEAD in nodes:  # rank 0 is the rendezvous master and carries the readable log
         nodes = [HEAD] + [n for n in nodes if n != HEAD]
     name, tag = f"run_{run}", f".{run}"
-    edge_tag = f".{run}h"
+    muse_run = run.startswith("muse")
+    edge_tag = tag if muse_run else f".{run}h"
     edge_config = f"{DEPLOY}/configs/h200/orchestrator{edge_tag}.toml"
     if _ssh(EDGE_ORCH, f"test -f {edge_config}")[0] != 0:
         raise Refused(
@@ -1608,11 +2072,20 @@ def start(
     trainer_nodes = " ".join(n.lstrip("n") for n in nodes)
     # PRIME_BATCH_CACHE is never forwarded. A value leaking in from the shell
     # would replay one frozen batch for every step while the run looked healthy.
-    env = (
-        f"TRAINER_NODES='{trainer_nodes}' RUN={run} RUN_NAME={name} "
-        f"CONFIG_TAG={tag} PRIME_EP_PROFILE=0 PRIME_EP_AC_CACHE=0 "
-        "PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD=1"
-    )
+    if muse_run:
+        env = (
+            f"TRAINER_NODES='{trainer_nodes}' RUN={run} RUN_NAME={name} "
+            f"CONFIG_TAG={tag} PRIME_EP_PROFILE=0 PRIME_EP_AC_CACHE=0 "
+            "PRIME_INT4_COMBINE_ROUNDS=1 PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD=0 "
+            "TRANSFORMERS_OVERRIDE_DIR=/data/muse-glimmer/transformers "
+            "MUSE_PYTHON_OVERRIDE_DIR=/data/muse-glimmer/python-overrides"
+        )
+    else:
+        env = (
+            f"TRAINER_NODES='{trainer_nodes}' RUN={run} RUN_NAME={name} "
+            f"CONFIG_TAG={tag} PRIME_EP_PROFILE=0 PRIME_EP_AC_CACHE=0 "
+            "PRIME_INT4_COMBINE_ROUNDS=8 PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD=1"
+        )
 
     def launch_trainer():
         print(f"starting trainer on {len(nodes)} nodes")
@@ -1685,6 +2158,109 @@ def start(
     print(f"started {run} in {mode} mode. Call status() in a few minutes.")
 
 
+def qualify(
+    name: str,
+    mode: str = "cold",
+    nodes: list[str] | None = None,
+) -> None:
+    """Start a fake-data trainer qualification without rollout components.
+
+    ``name`` selects ``configs/china/trainer.<name>.toml``. The configuration
+    must contain ``[data.fake]``. This operation never starts an orchestrator,
+    rollout engine, judge, tunnel, publisher, or run supervisor.
+    """
+    if mode not in ("cold", "restart"):
+        raise Refused('qualification mode must be "cold" or "restart"')
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+        raise Refused("qualification name can contain only letters, digits, '_' and '-'")
+    nodes = [_check_host(host) for host in (nodes or TRAINER_NODES)]
+    if HEAD in nodes:
+        nodes = [HEAD] + [host for host in nodes if host != HEAD]
+
+    relative_config = f"configs/china/trainer.{name}.toml"
+    local_config = REPO / relative_config
+    if not local_config.is_file():
+        raise Refused(f"missing qualification config {relative_config}")
+    with local_config.open("rb") as stream:
+        config = tomllib.load(stream)
+    if "fake" not in config.get("data", {}):
+        raise Refused(
+            f"{relative_config} has no [data.fake]; use start() for an RL run"
+        )
+    model_name = str(config.get("model", {}).get("name", ""))
+    muse = "muse" in model_name.lower()
+
+    rc, out = _ssh(
+        EDGE_ORCH,
+        f"sudo docker ps --filter name=^{ORCH_CT}$ --format '{{{{.Names}}}}'",
+    )
+    if rc or out.strip():
+        raise Refused(
+            "an orchestrator is active; a trainer-only qualification must not replace an RL run"
+        )
+
+    def trainer_running(host: str) -> tuple[int, str]:
+        return _ssh(
+            host,
+            f"sudo docker ps --filter name=^{TRAINER_CT}$ --format '{{{{.Names}}}}'",
+        )
+
+    active = [
+        host
+        for host, (rc, out) in _fan(nodes, trainer_running).items()
+        if rc == 0 and out.strip()
+    ]
+    if active and mode == "cold":
+        raise Refused(
+            "trainer qualification is already active on "
+            + ", ".join(active)
+            + "; use mode='restart' only when replacing it is intended"
+        )
+
+    if not deploy(relative_config, nodes=nodes):
+        raise RuntimeError(f"failed to deploy {relative_config}")
+
+    trainer_nodes = " ".join(host.removeprefix("n") for host in nodes)
+    env = (
+        f"TRAINER_NODES='{trainer_nodes}' RUN={shlex.quote(name)} "
+        f"RUN_NAME=run_{shlex.quote(name)} CONFIG_TAG=.{shlex.quote(name)} "
+        "PRIME_EP_PROFILE=0 PRIME_EP_AC_CACHE=0 PRIME_INT4_COMBINE_ROUNDS=1 "
+        "PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD=0"
+    )
+    if muse:
+        env += (
+            " TRANSFORMERS_OVERRIDE_DIR=/data/muse-glimmer/transformers"
+            " MUSE_PYTHON_OVERRIDE_DIR=/data/muse-glimmer/python-overrides"
+        )
+
+    if active:
+        _fan(
+            nodes,
+            lambda host: _ssh(
+                host,
+                f"sudo pkill -9 -f PRIME-RL 2>/dev/null; "
+                f"sudo docker rm -f {TRAINER_CT} >/dev/null 2>&1; echo done",
+            ),
+        )
+        time.sleep(20)
+
+    results = _fan(
+        nodes,
+        lambda host: _ssh(
+            host,
+            f"{env} bash {CLUSTER} trainer >/dev/null 2>&1; echo done",
+            300,
+        ),
+    )
+    failed = [host for host, (rc, _out) in results.items() if rc]
+    if failed:
+        raise RuntimeError(f"qualification trainer launch failed on {failed}")
+    print(
+        f"started trainer-only qualification {name} on {len(nodes)} nodes; "
+        "call status() or watch()"
+    )
+
+
 def stop() -> None:
     """Stop the edge orchestrator, then the trainer. Supervisors stop first."""
     _ssh(
@@ -1718,10 +2294,13 @@ _ACTIONS = {
     "acceptance": lambda a: acceptance(*a),
     "reward": lambda a: reward(*a),
     "tunnels": lambda a: tunnels(),
-    "engines": lambda a: engines(),
+    "engines": lambda a: engines(*a),
+    "logs": lambda a: logs(a[0] if a else "trainer", int(a[1]) if len(a) > 1 else 200),
+    "parity": lambda a: parity(*a),
     "watch": lambda a: watch(*[float(x) for x in a]),
     "repair": lambda a: repair(*a),
     "deploy": lambda a: deploy(*a),
+    "qualify": lambda a: qualify(*a),
     "stop": lambda a: stop(),
     "mounts": lambda a: print("\n".join(mounted_files())),
 }
@@ -1740,11 +2319,14 @@ _USAGE = f"""glm52-ops <action> [args]
   status [run]        the whole picture in one call
   acceptance [run]    TRAINING_EXPECTATIONS evidence and alarms
   reward [run]        the reward series with a trend verdict
-  tunnels             the HTTP code for each of the 24 tunnel ports
+  tunnels             the HTTP code for each of the 48 tunnel ports
   engines             a real completion probe for each engine
+  logs [role] [lines] current trainer, orchestrator, h200a, or h200b log tail
+  parity [run]        summarize the production step-1 token parity record
   watch [hours] [s]   the picture on a loop, in the foreground
   repair <what>       tunnels | engine:<host> | supervisors
   deploy <path>       push one repository file to every trainer node
+  qualify <name>      start trainer.<name>.toml with fake data and no rollouts
   mounts              the source paths the container mounts
   stop                stop the supervisors, orchestrator and trainer
 

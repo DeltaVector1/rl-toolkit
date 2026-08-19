@@ -16,7 +16,11 @@ from vllm.logger import init_logger
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from prime_rl.configs.inference import InferenceConfig
-from prime_rl.inference.vllm.worker.filesystem import adapter_cache_path
+from prime_rl.inference.vllm.worker.filesystem import (
+    adapter_cache_path,
+    stage_full_checkpoint_files,
+    stage_lora_adapter_files,
+)
 from prime_rl.utils.logger import get_logger
 
 logger = get_logger()
@@ -76,8 +80,12 @@ WORKER_EXTENSION_CLS = {
 
 @router.post("/pause")
 async def pause(request: Request):
-    logger.debug("Received /pause request (mode=keep, clear_cache=False)")
-    await engine_client(request).pause_generation(mode="keep", clear_cache=False)
+    mode = request.query_params.get("mode", "abort")
+    if mode not in ("abort", "keep"):
+        return JSONResponse({"error": f"unsupported pause mode: {mode}"}, status_code=400)
+    clear_cache = request.query_params.get("clear_cache", "true").lower() == "true"
+    logger.debug(f"Received /pause request (mode={mode}, clear_cache={clear_cache})")
+    await engine_client(request).pause_generation(mode=mode, clear_cache=clear_cache)
     return {"status": "paused"}
 
 
@@ -111,6 +119,28 @@ async def load_lora_adapter(lora_request: LoadLoRAAdapterRequest, raw_request: R
         if isinstance(response, ErrorResponse):
             return JSONResponse(content=response.model_dump(), status_code=response.error.code)
         return {"status": "ok"}
+
+
+@router.post("/stage_lora_adapter")
+async def stage_lora_adapter(raw_request: Request):
+    """Prefetch a remote adapter without pausing or calling engine workers."""
+    data = await raw_request.json()
+    source_url = data.get("lora_path")
+    if not isinstance(source_url, str) or not source_url.startswith(("http://", "https://")):
+        return JSONResponse({"error": "lora_path must be an HTTP URL"}, status_code=400)
+    destination = await asyncio.to_thread(stage_lora_adapter_files, source_url)
+    return {"status": "ok", "path": destination.as_posix()}
+
+
+@router.post("/stage_full_checkpoint")
+async def stage_full_checkpoint(raw_request: Request):
+    """Prefetch a remote full checkpoint while generation continues."""
+    data = await raw_request.json()
+    source_url = data.get("checkpoint_url")
+    if not isinstance(source_url, str) or not source_url.startswith(("http://", "https://")):
+        return JSONResponse({"error": "checkpoint_url must be an HTTP URL"}, status_code=400)
+    destination = await asyncio.to_thread(stage_full_checkpoint_files, source_url)
+    return {"status": "ok", "path": destination.as_posix()}
 
 
 @router.get("/liveness")
@@ -212,9 +242,16 @@ def server(config: InferenceConfig, vllm_extra: dict[str, Any] | None = None):
     from vllm.entrypoints.cli.serve import run_headless, run_multi_api_server
     from vllm.entrypoints.openai.api_server import run_server
 
-    # Signal worker processes to disable LoRA on MoE layers when LoRA targets don't include experts
-    if config.lora_target_modules and not any("expert" in m for m in config.lora_target_modules):
+    # Shared-expert LoRA uses ordinary linear layers. Keep the fused routed-MoE
+    # kernels in their non-LoRA mode unless the target is the routed `experts`
+    # module itself. A substring check incorrectly classified `shared_experts`.
+    routed_moe_lora = any(
+        "experts" in target.split(".") for target in (config.lora_target_modules or [])
+    )
+    if config.lora_target_modules and not routed_moe_lora:
         os.environ["PRIME_NO_MOE_LORA"] = "1"
+    else:
+        os.environ.pop("PRIME_NO_MOE_LORA", None)
 
     namespace = config.to_vllm()
     if vllm_extra:

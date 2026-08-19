@@ -1,0 +1,61 @@
+output_dir = "/data/muse-glimmer/runs/muse-smoke"
+max_steps = 1
+dist_timeout_seconds = 1800
+
+[data.fake]
+batch_size = 8
+generate_samples = false
+
+[log]
+level = "debug"
+ranks_filter = [0]
+
+[file_monitor]
+filename = "trainer-metrics.jsonl"
+
+[model]
+name = "/data/muse-glimmer/bootstrap"
+impl = "auto"
+seq_len = 128
+attn = "flash_attention_2"
+cp = 1
+pp = 8
+ep = 1
+dp_replicate = 1
+fsdp_cpu_offload = false
+cold_cpu_offload = false
+optim_cpu_offload = false
+reshard_after_forward = true
+optimization_dtype = "bfloat16"
+reduce_dtype = "bfloat16"
+fused_lm_head_token_chunk_size = 64
+compile = "None"
+ac_offloading = "None"
+
+[model.debug]
+num_layers = 8
+random_init = true
+
+[model.ac]
+mode = "full"
+freq = 1
+
+[optim]
+# The one-node PP8 gate has no data-parallel shard mesh. Muon requires a
+# sharded 1-D optimizer mesh, which the 64-GPU production topology provides.
+# AdamW lets this reduced topology test the same model forward and backward.
+type = "adamw"
+lr = 8e-6
+weight_decay = 0.0
+max_norm = 1.0
+
+[scheduler]
+type = "constant"
+
+[weight_broadcast]
+type = "filesystem"
+save_format = "safetensors"
+save_sharded = true
+
+[rollout_transport]
+type = "filesystem"

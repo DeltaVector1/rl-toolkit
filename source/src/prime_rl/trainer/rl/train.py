@@ -1,6 +1,8 @@
 import prime_rl._compat  # noqa: F401 — patch ring_flash_attn compat before import
 
 from contextlib import nullcontext
+import hashlib
+import json
 import os
 import time
 from datetime import timedelta
@@ -73,7 +75,7 @@ from prime_rl.utils.monitor import setup_monitor
 from prime_rl.utils.config import cli
 from prime_rl.utils.process import set_proc_title
 from prime_rl.utils.utils import clean_exit, resolve_latest_ckpt_step, to_col_format
-from ring_flash_attn import substitute_hf_flash_attn
+from prime_rl.trainer.models.layers.hf_ring_attn import substitute_hf_flash_attn
 from torchtitan.distributed.utils import clip_grad_norm_
 
 
@@ -156,6 +158,152 @@ def pad_micro_batch_to_length(micro_batch, target_length: int) -> None:
     micro_batch["sequence_lengths"][-1] += padding
     micro_batch["seq_lens"][-1] += padding
     micro_batch["lora_num_tokens"][-1] += padding
+
+
+def verify_pipeline_batch_identity(micro_batches, pp_group) -> None:
+    """Fail before forward when stages in one pipeline loaded different data."""
+    digests = []
+    for micro_batch in micro_batches:
+        digest = hashlib.sha256()
+        for name in (
+            "input_ids",
+            "position_ids",
+            "inference_logprobs",
+            "loss_mask",
+            "lora_num_tokens",
+            "seq_lens",
+        ):
+            tensor = micro_batch[name].detach().cpu().contiguous()
+            digest.update(name.encode())
+            digest.update(str(tensor.dtype).encode())
+            digest.update(bytes(tensor.numpy().data))
+        digest.update(json.dumps(micro_batch["sequence_lengths"]).encode())
+        digests.append(int.from_bytes(digest.digest()[:8], "little") & ((1 << 63) - 1))
+    local = torch.tensor(digests, dtype=torch.int64, device="cuda")
+    minimum = local.clone()
+    maximum = local.clone()
+    dist.all_reduce(minimum, op=dist.ReduceOp.MIN, group=pp_group)
+    dist.all_reduce(maximum, op=dist.ReduceOp.MAX, group=pp_group)
+    mismatched = torch.nonzero(minimum != maximum).flatten().tolist()
+    if mismatched:
+        raise RuntimeError(
+            "pipeline stages loaded different trainer data for microbatches "
+            f"{mismatched[:10]}; check data-parallel rank mapping"
+        )
+
+
+def register_fake_lora_run(multi_run_manager, lora_config) -> None:
+    """Create adapter slot zero without an orchestrator in fake-data mode.
+
+    The normal LoRA optimizer waits until MultiRunManager discovers an
+    orchestrator run because discovery resets the adapter. A trainer-only
+    qualification deliberately has no orchestrator. Register the one local
+    adapter directly after model construction, when every LoRA module has
+    already attached itself to the manager.
+    """
+    if multi_run_manager.used_idxs:
+        raise RuntimeError("fake-data LoRA qualification found an unexpected RL run")
+    run_id = "fake_qualification"
+    idx = 0
+    multi_run_manager.idx_2_id[idx] = run_id
+    multi_run_manager.id_2_idx[run_id] = idx
+    multi_run_manager.unused_idxs.remove(idx)
+    multi_run_manager.progress[idx] = Progress()
+    multi_run_manager.scaling_factors[idx] = lora_config.alpha / lora_config.rank
+    multi_run_manager.reset_run_parameters(idx)
+
+
+def initialize_fresh_lora_policy(
+    multi_run_manager, lora_config, device: torch.device | str
+) -> tuple[int, int]:
+    """Make policy zero exactly equal the base model and verify all ranks."""
+    fresh_parameters = list(multi_run_manager.get_named_parameters_for_run(0))
+    fresh_b = [
+        (name, parameter)
+        for name, parameter in fresh_parameters
+        if ".lora_B" in name
+    ]
+    if not fresh_b:
+        raise RuntimeError("fresh LoRA policy has no B matrices")
+    nonzero_b_shards = torch.tensor(
+        sum(
+            int(
+                torch.count_nonzero(
+                    parameter.to_local()
+                    if hasattr(parameter, "to_local")
+                    else parameter
+                ).item()
+                > 0
+            )
+            for _, parameter in fresh_b
+        ),
+        dtype=torch.int32,
+        device=device,
+    )
+    dist.all_reduce(nonzero_b_shards, op=dist.ReduceOp.SUM)
+    with torch.no_grad():
+        for _, parameter in fresh_b:
+            parameter.zero_()
+
+    local_bad = torch.zeros((), dtype=torch.int32, device=device)
+    for _, parameter in fresh_parameters:
+        local = parameter.to_local() if hasattr(parameter, "to_local") else parameter
+        local_bad = torch.maximum(
+            local_bad,
+            (~torch.isfinite(local).all()).to(dtype=torch.int32),
+        )
+    for _, parameter in fresh_b:
+        local = parameter.to_local() if hasattr(parameter, "to_local") else parameter
+        local_bad = torch.maximum(
+            local_bad,
+            (torch.count_nonzero(local) != 0).to(dtype=torch.int32),
+        )
+    expected_scale = lora_config.alpha / lora_config.rank
+    scale = torch.as_tensor(
+        multi_run_manager.scaling_factors[0], device=device, dtype=torch.float32
+    )
+    local_bad = torch.maximum(
+        local_bad,
+        (~torch.isclose(scale, torch.tensor(expected_scale, device=device))).to(
+            dtype=torch.int32
+        ),
+    )
+    dist.all_reduce(local_bad, op=dist.ReduceOp.MAX)
+    if local_bad.item():
+        raise RuntimeError(
+            "fresh LoRA policy initialization failed: parameters must be finite, "
+            "all B matrices must be zero, and the scaling factor must match alpha/rank"
+        )
+    return len(fresh_b), int(nonzero_b_shards.item())
+
+
+def parity_guard_failures(tensor_stats: dict, guard) -> list[str]:
+    """Return measured parity violations. Missing required evidence fails closed."""
+    failures = []
+    unmasked = tensor_stats.get("unmasked_mismatch_kl/mean")
+    masked = tensor_stats.get("masked_mismatch_kl/mean")
+    masked_fraction = tensor_stats.get("is_masked/mean")
+    if unmasked is None:
+        failures.append("unmasked mismatch KL is missing")
+    elif unmasked > guard.max_unmasked_mismatch_kl:
+        failures.append(
+            f"unmasked mismatch KL {unmasked:.6f} > {guard.max_unmasked_mismatch_kl:.6f}"
+        )
+    if masked_fraction is None:
+        failures.append("masked token fraction is missing")
+    else:
+        if masked_fraction > guard.max_masked_fraction:
+            failures.append(
+                f"masked token fraction {masked_fraction:.6f} > {guard.max_masked_fraction:.6f}"
+            )
+        if masked_fraction > 0:
+            if masked is None:
+                failures.append("masked mismatch KL is missing")
+            elif masked > guard.max_masked_mismatch_kl:
+                failures.append(
+                    f"masked mismatch KL {masked:.6f} > {guard.max_masked_mismatch_kl:.6f}"
+                )
+    return failures
 
 
 @clean_exit
@@ -318,6 +466,10 @@ def train(config: TrainerConfig):
     # Set up the optimizer
     logger.info(f"Initializing optimizer ({config.optim})")
 
+    if config.data.fake and config.model.lora:
+        register_fake_lora_run(multi_run_manager, config.model.lora)
+        logger.info("Registered local LoRA adapter slot for fake-data qualification")
+
     if config.max_concurrent_runs == 1:
         optimizer = setup_optimizer(
             config.optim,
@@ -340,6 +492,28 @@ def train(config: TrainerConfig):
         optimizer.register_post_creation_callback(load_run_checkpoint, index=1)
 
     logger.info(f"Using `{config.scheduler.type}` scheduler ({config.scheduler})")
+
+    # A fresh filesystem-LoRA run generates policy-v0 rollouts with the base
+    # model before the trainer can broadcast an adapter.  The trainer must
+    # therefore start with an exactly zero-output adapter.  Run discovery
+    # resets LoRA slots after FSDP construction; make the required B=0 state
+    # explicit after that reset and verify every local shard before accepting
+    # a rollout batch.  A and B must also be finite.
+    fresh_lora_policy = (
+        config.model.lora is not None
+        and not config.data.fake
+        and checkpoint_step is None
+        and not resume_adapter
+    )
+    if fresh_lora_policy:
+        fresh_b_count, reset_b_shards = initialize_fresh_lora_policy(
+            multi_run_manager, config.model.lora, torch.device("cuda", world.local_rank)
+        )
+        expected_scale = config.model.lora.alpha / config.model.lora.rank
+        logger.info(
+            f"Verified fresh LoRA policy: {fresh_b_count} local B matrices are zero; "
+            f"scale={expected_scale:g}; reset {reset_b_shards} nonzero B shards"
+        )
 
     # Set up weight broadcast (skip when using fake data since there's no inference server)
     if config.data.fake:
@@ -413,9 +587,27 @@ def train(config: TrainerConfig):
         # pp is the slowest-varying mesh dim, so stage s owns the contiguous
         # ranks [s*k, (s+1)*k) with k = world/pp; the stage master is the first.
         _ranks_per_stage = dist.get_world_size() // parallel_dims.pp
+        _stage_master_ranks = [
+            stage * _ranks_per_stage for stage in range(parallel_dims.pp)
+        ]
+        _is_stage_master = dist.get_rank() in _stage_master_ranks
+        # Full-model BF16 broadcast moves about 7.5 GB from each stage master.
+        # Use a CPU/Gloo group containing only those eight ranks. An NCCL object
+        # collective stages serialized objects on GPU and cannot fit the 60 GB
+        # receive buffer on a 4090.
+        _pp_weight_gather_group = (
+            dist.new_group(
+                ranks=_stage_master_ranks,
+                backend="gloo",
+                timeout=group_timeout,
+                use_local_synchronization=True,
+            )
+            if _is_stage_master
+            else None
+        )
         set_pp_gather_context(
-            parallel_dims.get_mesh("pp").get_group(),
-            is_stage_master=(dist.get_rank() % _ranks_per_stage) == 0,
+            _pp_weight_gather_group,
+            is_stage_master=_is_stage_master,
         )
         pp_stage_module = PipelineStageModule(
             model,
@@ -423,6 +615,9 @@ def train(config: TrainerConfig):
             is_last=pp_rank == parallel_dims.pp - 1,
             offload_cfg=config.model.ac_offloading,
             transfer_sparse_indices=config.model.pp_transfer_sparse_indices,
+            cp_group=cp_group if parallel_dims.cp_enabled else None,
+            cp_style=config.model.cp_style,
+            cp_world_size=parallel_dims.cp,
         )
 
     # Optionally, resume training from a checkpoint
@@ -447,13 +642,17 @@ def train(config: TrainerConfig):
     bin_cost = build_bin_cost(model.config)
     if config.data.fake:
         dataloader = FakeDataLoader(
-            config.data.fake, config.model.seq_len, parallel_dims.get_mesh("dp").size()
+            config.data.fake,
+            config.model.seq_len,
+            parallel_dims.get_mesh("dp").size(),
+            parallel_dims.get_mesh("dp").get_local_rank(),
         )
     else:
         dataloader = DataLoader(
             config.output_dir,
             progress.step,
             parallel_dims.get_mesh("dp").size(),
+            parallel_dims.get_mesh("dp").get_local_rank(),
             config.model.seq_len,
             config.model.cp,
             bin_cost,
@@ -508,6 +707,22 @@ def train(config: TrainerConfig):
         logger.debug(
             f"Waited for batch to arrive for {wait_for_batch_time:.2f} seconds"
         )
+        if fresh_lora_policy and progress.step == 1:
+            # Production synchronizes run state only after the rollout file
+            # arrives. That operation is absent from fake-data qualification
+            # and can reset adapter slots after the startup check. Re-establish
+            # policy zero at the actual forward boundary. No optimizer update
+            # has happened yet, so this changes no learned state.
+            fresh_b_count, reset_b_shards = initialize_fresh_lora_policy(
+                multi_run_manager,
+                config.model.lora,
+                torch.device("cuda", world.local_rank),
+            )
+            logger.info(
+                f"Reverified fresh LoRA policy after batch state synchronization: "
+                f"{fresh_b_count} local B matrices are zero; "
+                f"reset {reset_b_shards} nonzero B shards"
+            )
         load_batch_start_time = time.perf_counter()
         micro_batches = dataloader.get_batch()
         load_data_time = time.perf_counter() - load_batch_start_time
@@ -572,6 +787,21 @@ def train(config: TrainerConfig):
                     "Waiting for the next fresh batch rather than stopping the trainer."
                 )
                 continue
+
+            _count_range = torch.tensor(
+                [len(micro_batches), -len(micro_batches)],
+                dtype=torch.int64,
+                device="cuda",
+            )
+            dist.all_reduce(_count_range, op=dist.ReduceOp.MAX)
+            if _count_range[0].item() != -_count_range[1].item():
+                raise RuntimeError(
+                    "trainer ranks received different microbatch counts before "
+                    "pipeline data verification"
+                )
+            verify_pipeline_batch_identity(
+                micro_batches, parallel_dims.get_mesh("pp").get_group()
+            )
 
         batch_size = len(micro_batches)
         memory_profiler = None
@@ -960,7 +1190,10 @@ def train(config: TrainerConfig):
             # Loss for the last stage. Mirrors the non-PP path: temperature-scaled
             # logprobs, CP gather, right-shift, then the RL loss. Returns a scalar
             # so the schedule only backprops one value.
+            direct_parity_dumped = False
+
             def _pp_loss(out, side):
+                nonlocal direct_parity_dumped
                 o = dict(out) if isinstance(out, dict) else {"logits": out}
                 # The PP loss consumes head-computed logprobs directly. Without
                 # the fused head this KeyErrors mid-schedule on the last stage
@@ -986,6 +1219,59 @@ def train(config: TrainerConfig):
                     o["entropy"],
                     pad_value=torch.log(torch.tensor(float(vocab_size))).item(),
                 )
+                qualification_dump = (
+                    config.data.fake
+                    and config.data.fake.reference_path is not None
+                )
+                production_dump = (
+                    not config.data.fake
+                    and config.parity_guard is not None
+                    and progress.step == 1
+                )
+                if (qualification_dump or production_dump) and not direct_parity_dumped:
+                    # Every CP rank must join these gathers. Only DP0/CP0 writes
+                    # the diagnostic. Production writes only the first
+                    # microbatch of step 1, before the parity gate can reject
+                    # it, so a failure always has token-level evidence.
+                    full_input_ids = gather_for_cp_wo_grad(
+                        side["input_ids"], cp_size, cp_group
+                    )
+                    full_position_ids = gather_for_cp_wo_grad(
+                        side["position_ids"], cp_size, cp_group
+                    )
+                    dp_rank = parallel_dims.get_mesh("dp").get_local_rank()
+                    if dp_rank == 0 and cp_rank == 0:
+                        trainer_values = o["logprobs"].squeeze(0).detach().float().cpu()
+                        reference_values = (
+                            side["inference_logprobs"].squeeze(0).detach().float().cpu()
+                        )
+                        delta = trainer_values - reference_values
+                        valid = side["loss_mask"].squeeze(0).detach().cpu()
+                        payload = {
+                            "input_ids": full_input_ids.squeeze(0).cpu().tolist(),
+                            "position_ids": full_position_ids.squeeze(0).cpu().tolist(),
+                            "sequence_lengths": side["sequence_lengths"],
+                            "loss_mask": valid.tolist(),
+                            "trainer_logprobs": trainer_values.tolist(),
+                            "reference_logprobs": reference_values.tolist(),
+                            "delta": delta.tolist(),
+                            "valid_mean_abs_delta": float(delta[valid].abs().mean()),
+                            "valid_max_abs_delta": float(delta[valid].abs().max()),
+                        }
+                        dump_path = config.output_dir / (
+                            "direct-parity.json"
+                            if qualification_dump
+                            else "parity-step1.json"
+                        )
+                        dump_path.write_text(json.dumps(payload))
+                        logger.info(
+                            "Wrote direct trainer/HF parity data to %s "
+                            "(mean abs delta %.6f, max %.6f)",
+                            dump_path,
+                            payload["valid_mean_abs_delta"],
+                            payload["valid_max_abs_delta"],
+                        )
+                    direct_parity_dumped = True
                 sl = side["sequence_lengths"]
                 loss, loss_tensors = compute_loss(
                     trainer_logprobs=o["logprobs"].squeeze().split(sl),
@@ -1154,6 +1440,23 @@ def train(config: TrainerConfig):
         # A rejected update must still preserve its measured parity evidence.
         tensor_stats = tensors.compute_stats()
 
+        if config.parity_guard is not None:
+            violations = parity_guard_failures(tensor_stats, config.parity_guard)
+            if violations:
+                monitor.log(
+                    {
+                        **tensor_stats,
+                        "diagnostic/parity_guard_rejected": 1.0,
+                        "step": progress.step,
+                    },
+                    step=progress.step,
+                )
+                optimizer.zero_grad()
+                raise RuntimeError(
+                    "Parity guard rejected step before optimizer update and weight broadcast: "
+                    + "; ".join(violations)
+                )
+
         # compute_loss already divided by the global token count. Undo FSDP's per-rank averaging
         # across dp_cp so the final gradient is the true per-token mean over the global batch.
         found_nonfinite = torch.zeros((), device="cuda", dtype=torch.int32)
@@ -1264,6 +1567,21 @@ def train(config: TrainerConfig):
 
         # Update learning rate scheduler
         scheduler.step()
+
+        # x64p n76 grew from 380 to 391 GiB shared memory and fell from 76 to
+        # 62 GiB available by step 6 while streamed native-FP8 expert
+        # activation offload was active. All backward H2D copies are complete
+        # after this synchronization. Release unused pinned allocator blocks
+        # before the next variable-sized batch can establish a higher mark.
+        if os.environ.get("PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD", "") == "1":
+            torch.cuda.synchronize()
+            host_empty_cache = getattr(torch._C, "_host_emptyCache", None)
+            if host_empty_cache is None:
+                raise RuntimeError(
+                    "PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD requires torch._C._host_emptyCache "
+                    "to bound pinned host memory across steps"
+                )
+            host_empty_cache()
 
         if config.max_concurrent_runs == 1:
             current_lr = optimizer.param_groups[0]["lr"]

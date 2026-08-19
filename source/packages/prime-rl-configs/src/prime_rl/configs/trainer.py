@@ -31,9 +31,13 @@ class GCConfig(BaseConfig):
 
 class ActivationCheckpointConfig(BaseConfig):
     mode: Literal[
-        "full", "selective", "reentrant_block", "reentrant_attention"
+        "full",
+        "selective",
+        "reentrant_block",
+        "reentrant_attention",
+        "reentrant_attention_shared_expert",
     ] = "full"
-    """Activation checkpoint implementation. ``full`` uses the ordinary non-reentrant whole-block wrapper. ``reentrant_block`` recomputes a complete decoder block after its FSDP pre-backward hook has restored sharded parameters. ``reentrant_attention`` uses the same safe ordering for attention only and keeps MLP activations eager. Use a reentrant mode for native-FP8 attention with ``reshard_after_forward``. ``selective`` checkpoints only the subcomponents listed in ``targets`` inside supported custom decoder layers."""
+    """Activation checkpoint implementation. ``full`` uses the ordinary non-reentrant whole-block wrapper. ``reentrant_block`` recomputes a complete decoder block after its FSDP pre-backward hook has restored sharded parameters. ``reentrant_attention`` uses the same safe ordering for attention only and keeps MLP activations eager. ``reentrant_attention_shared_expert`` also recomputes only the shared-expert branch; routed experts and their all-to-all remain eager. Use a reentrant mode for native-FP8 attention with ``reshard_after_forward``. ``selective`` checkpoints only the subcomponents listed in ``targets`` inside supported custom decoder layers."""
 
     freq: int = Field(1, ge=1)
     """Apply activation checkpointing to every N layers."""
@@ -555,10 +559,27 @@ class FakeDataLoaderConfig(BaseConfig):
     generate_samples: bool = False
     """Generate separate samples and pack them into a single micro-batch instead of using random tensors."""
 
+    ce_only: bool = False
+    """Use a CE-only objective so trainer stress tests do real backward work."""
+
+    reference_path: Path | None = None
+    """Use deterministic token IDs and aligned HF log probabilities from this JSON file."""
+
 
 class DataLoaderConfig(BaseConfig):
     fake: FakeDataLoaderConfig | None = None
     """Use a fake data loader sampling random micro-batches (for debugging)."""
+
+
+class ParityGuardConfig(BaseConfig):
+    max_unmasked_mismatch_kl: float = Field(0.1, ge=0)
+    """Reject the step before optimizer update when retained-token mismatch exceeds this value."""
+
+    max_masked_mismatch_kl: float = Field(0.5, ge=0)
+    """Reject the step before optimizer update when masked-token mismatch exceeds this value."""
+
+    max_masked_fraction: float = Field(0.06, ge=0, le=1)
+    """Reject the step before optimizer update when DPPO masks more than this token fraction."""
 
 
 class BaseWeightBroadcastConfig(BaseConfig):
@@ -622,6 +643,9 @@ class TrainerConfig(BaseConfig):
     tokenizer: TokenizerConfig = TokenizerConfig()
 
     data: DataLoaderConfig = DataLoaderConfig()
+
+    parity_guard: ParityGuardConfig | None = None
+    """Optional fail-closed trainer-to-inference parity limits for RL batches."""
 
     loss: LossConfig = DefaultLossConfig()
     """Loss config for the rl loss component (see ``setup_rl_loss_fn``). The ce / ref_kl components are fixed and do not read this."""

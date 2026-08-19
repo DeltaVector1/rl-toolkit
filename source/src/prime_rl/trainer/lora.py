@@ -1,17 +1,35 @@
+import math
 import re
 from typing import Dict, List
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from prime_rl.configs.trainer import LoRAConfig
-from prime_rl.trainer.models.layers.lora import MultiLoRALinear, MultiLoRAModule
+from prime_rl.trainer.models.layers.fp8_ada import _Linear
+from prime_rl.trainer.models.layers.lora import (
+    MultiLoRALinear,
+    MultiLoRAModule,
+    get_lora_num_tokens,
+    get_multilora_scaling,
+)
+from prime_rl.trainer.models.layers.lora.multi_linear import (
+    _SingleLoRA,
+    _run_lora_for_loop,
+    _run_lora_grouped_mm,
+)
 from prime_rl.trainer.models.layers.lora.multi_moe import (
     MultiLoRAGptOssGroupedExperts,
     MultiLoRAGroupedExperts,
     MultiLoRANonGatedGroupedExperts,
 )
-from prime_rl.trainer.models.layers.moe import GptOssGroupedExperts, GroupedExperts, NonGatedGroupedExperts
+from prime_rl.trainer.models.layers.moe import (
+    FP8CheckpointFeedForward,
+    GptOssGroupedExperts,
+    GroupedExperts,
+    NonGatedGroupedExperts,
+)
 from prime_rl.trainer.runs import get_multi_run_manager
 from prime_rl.utils.logger import get_logger
 
@@ -67,6 +85,169 @@ def _matches_pattern(name: str, pattern: str) -> bool:
         return pattern in name.split(".")
 
 
+class MultiLoRAFP8CheckpointFeedForward(MultiLoRAModule):
+    """LoRA for an always-on shared expert with native FP8 base weights.
+
+    The frozen checkpoint weights stay in FP8 and use their block scales in
+    both forward and activation backward. Only the low-rank matrices are
+    trainable, and those matrices stay in BF16.
+    """
+
+    _PROJECTIONS = (
+        ("w1", "w1_scale_inv", "gate_proj"),
+        ("w2", "w2_scale_inv", "down_proj"),
+        ("w3", "w3_scale_inv", "up_proj"),
+    )
+
+    def __init__(
+        self,
+        base_layer: FP8CheckpointFeedForward,
+        rank: int,
+        n_adapters: int,
+        alpha: float = 32.0,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__(base_layer)
+        if rank <= 0 or n_adapters <= 0:
+            raise ValueError("rank and n_adapters must be > 0")
+
+        self.rank = rank
+        self.n_adapters = n_adapters
+        self.alpha = alpha
+        self.lora_dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
+        self._lora_num_tokens = get_lora_num_tokens()
+        self._scaling_factors = get_multilora_scaling()
+
+        for weight_name, _, _ in self._PROJECTIONS:
+            weight = getattr(base_layer, weight_name)
+            out_features, in_features = weight.shape
+            setattr(
+                self,
+                f"lora_A_{weight_name}",
+                nn.ParameterList(
+                    [
+                        nn.Parameter(
+                            torch.empty(
+                                rank,
+                                in_features,
+                                device=weight.device,
+                                dtype=torch.bfloat16,
+                            )
+                        )
+                        for _ in range(n_adapters)
+                    ]
+                ),
+            )
+            setattr(
+                self,
+                f"lora_B_{weight_name}",
+                nn.ParameterList(
+                    [
+                        nn.Parameter(
+                            torch.empty(
+                                out_features,
+                                rank,
+                                device=weight.device,
+                                dtype=torch.bfloat16,
+                            )
+                        )
+                        for _ in range(n_adapters)
+                    ]
+                ),
+            )
+        self.reset_parameters()
+
+    def reset_parameters(self, index: int | None = None) -> None:
+        indices = range(self.n_adapters) if index is None else (index,)
+        for idx in indices:
+            for weight_name, _, _ in self._PROJECTIONS:
+                nn.init.kaiming_uniform_(
+                    getattr(self, f"lora_A_{weight_name}")[idx],
+                    a=math.sqrt(5),
+                )
+                nn.init.zeros_(getattr(self, f"lora_B_{weight_name}")[idx])
+
+    def named_parameters_for_adapter(self, idx: int) -> list[tuple[str, nn.Parameter]]:
+        parameters = []
+        for weight_name, _, hf_name in self._PROJECTIONS:
+            parameters.extend(
+                [
+                    (f"{hf_name}.lora_A", getattr(self, f"lora_A_{weight_name}")[idx]),
+                    (f"{hf_name}.lora_B", getattr(self, f"lora_B_{weight_name}")[idx]),
+                ]
+            )
+        return parameters
+
+    def adapter_target_modules(self) -> tuple[str, ...]:
+        return tuple(hf_name for _, _, hf_name in self._PROJECTIONS)
+
+    def get_lora_param_counts(self) -> tuple[int, int]:
+        adapter_params = 0
+        adapted_params = 0
+        for weight_name, _, _ in self._PROJECTIONS:
+            adapter_params += getattr(self, f"lora_A_{weight_name}")[0].numel()
+            adapter_params += getattr(self, f"lora_B_{weight_name}")[0].numel()
+            adapted_params += getattr(self.base_layer, weight_name).numel()
+        return adapter_params, adapted_params
+
+    def _lora(self, x: torch.Tensor, weight_name: str, fqn: str) -> torch.Tensor:
+        lora_x = self.lora_dropout(x)
+        lora_A = getattr(self, f"lora_A_{weight_name}")
+        lora_B = getattr(self, f"lora_B_{weight_name}")
+        if self.n_adapters == 1:
+            return self._scaling_factors[0] * _SingleLoRA.apply(
+                lora_x, lora_A[0], lora_B[0], fqn
+            )
+
+        offsets = self._lora_num_tokens.cumsum(dim=0, dtype=torch.int32)
+        assert offsets[-1] == x.shape[0], f"offsets: {offsets}, x.shape: {x.shape}"
+        stacked_A = torch.stack(list(lora_A))
+        stacked_B = torch.stack(list(lora_B))
+        aligned = self.rank % 8 == 0
+        aligned = aligned and x.shape[-1] % 8 == 0 and stacked_B.shape[1] % 8 == 0
+        if aligned:
+            lora_out = _run_lora_grouped_mm(lora_x, stacked_A, stacked_B, offsets)
+        else:
+            lora_out = _run_lora_for_loop(lora_x, stacked_A, stacked_B, offsets)
+        scaling = torch.repeat_interleave(
+            self._scaling_factors, self._lora_num_tokens
+        ).unsqueeze(-1)
+        return scaling * lora_out
+
+    def _base(self, x: torch.Tensor, weight_name: str, scale_name: str) -> torch.Tensor:
+        fqn = getattr(
+            self.base_layer,
+            "_fp8_fqn",
+            "<unassigned-fp8-shared-expert>",
+        )
+        return _Linear.apply(
+            x,
+            getattr(self.base_layer, weight_name),
+            getattr(self.base_layer, scale_name),
+            f"{fqn}.{weight_name}",
+            (self.base_layer, weight_name, scale_name),
+        )
+
+    def _project(self, x: torch.Tensor, weight_name: str, scale_name: str) -> torch.Tensor:
+        fqn = getattr(
+            self.base_layer,
+            "_fp8_fqn",
+            "<unassigned-fp8-shared-expert>",
+        )
+        return self._base(x, weight_name, scale_name) + self._lora(
+            x, weight_name, f"{fqn}.{weight_name}.lora"
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        shape = x.shape
+        x = x.reshape(-1, x.shape[-1])
+        gate = self._project(x, "w1", "w1_scale_inv")
+        up = self._project(x, "w3", "w3_scale_inv")
+        hidden = F.silu(gate) * up
+        out = self._project(hidden, "w2", "w2_scale_inv")
+        return out.view(*shape[:-1], out.shape[-1])
+
+
 def _find_target_modules(model: nn.Module, target_patterns: List[str]) -> List[str]:
     """Find all module names that match any of the target patterns.
 
@@ -79,7 +260,16 @@ def _find_target_modules(model: nn.Module, target_patterns: List[str]) -> List[s
 
     for name, module in model.named_modules():
         # Check if module is Linear or one of the supported expert classes
-        if not isinstance(module, (nn.Linear, GroupedExperts, NonGatedGroupedExperts, GptOssGroupedExperts)):
+        if not isinstance(
+            module,
+            (
+                nn.Linear,
+                FP8CheckpointFeedForward,
+                GroupedExperts,
+                NonGatedGroupedExperts,
+                GptOssGroupedExperts,
+            ),
+        ):
             continue
 
         for pattern in target_patterns:
@@ -176,6 +366,14 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> None:
                 alpha=config.alpha,
                 dropout=config.dropout,
             )
+        elif isinstance(base_module, FP8CheckpointFeedForward):
+            lora_module = MultiLoRAFP8CheckpointFeedForward(
+                base_layer=base_module,
+                rank=config.rank,
+                n_adapters=n_loras,
+                alpha=config.alpha,
+                dropout=config.dropout,
+            )
         # Handle GroupedExperts (MoE)
         elif isinstance(base_module, GroupedExperts):
             lora_module = MultiLoRAGroupedExperts(
@@ -206,7 +404,8 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> None:
         else:
             logger.warning(
                 f"Module {module_name} is type {type(base_module).__name__}, "
-                f"expected nn.Linear, GroupedExperts, NonGatedGroupedExperts, or GptOssGroupedExperts. Skipping."
+                "expected nn.Linear, FP8CheckpointFeedForward, GroupedExperts, "
+                "NonGatedGroupedExperts, or GptOssGroupedExperts. Skipping."
             )
             continue
 
@@ -274,6 +473,9 @@ def load_initial_lora_adapter(model: nn.Module, adapter_path: str, adapter_idx: 
             )
         for param_name, param in module.named_parameters_for_adapter(adapter_idx):
             expected[f"{module_name}.{param_name}.weight"] = param
+
+    if hasattr(type(model), "convert_adapter_to_hf"):
+        expected = type(model).convert_adapter_to_hf(expected)
 
     missing = sorted(set(expected) - set(state_dict))
     unexpected = sorted(set(state_dict) - set(expected))
@@ -349,8 +551,11 @@ def save_lora_config(model: nn.Module, save_path, rank: int, alpha: float, dropo
 
     for name, module in model.named_modules():
         if isinstance(module, MultiLoRAModule):
-            module_suffix = name.split(".")[-1]
-            target_modules.add(module_suffix)
+            if hasattr(module, "adapter_target_modules"):
+                target_modules.update(module.adapter_target_modules())
+            else:
+                module_suffix = name.split(".")[-1]
+                target_modules.add(module_suffix)
 
     for name, param in model.named_parameters():
         if param.requires_grad and "lora_A" not in name and "lora_B" not in name:

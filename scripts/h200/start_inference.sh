@@ -9,6 +9,10 @@ docker rm -f glm52-decensor-h200 glm52-decensor-h200-0 glm52-decensor-h200-1 >/d
 docker update --restart=no glm52-decensor-trainer >/dev/null 2>&1 || true
 docker rm -f glm52-decensor-trainer >/dev/null 2>&1 || true
 
+# Do not enable native MTP here with the pinned vLLM and FlashMLA. The MTP
+# draft layer pads 8 query heads to 64. At 32,768 tokens its BF16 query has a
+# 2,415,919,104-byte stride, which exceeds FlashMLA's int32 limit and
+# terminates every tensor-parallel worker.
 docker run -d --name glm52-decensor-h200 --restart unless-stopped \
   --log-opt max-size=512m --log-opt max-file=3 \
   --gpus all \
@@ -17,8 +21,8 @@ docker run -d --name glm52-decensor-h200 --restart unless-stopped \
   --ulimit stack=67108864:67108864 \
   -v /data:/data \
   -v "$deployment/cache/vllm":/home/appuser/.cache \
-  -v "$deployment/runtime/vllm/filesystem.py":/app/src/prime_rl/inference/vllm/worker/filesystem.py:ro \
-  -v "$deployment/runtime/vllm/server.py":/app/src/prime_rl/inference/vllm/server.py:ro \
+  -v "$deployment/source/src/prime_rl/inference/vllm/worker/filesystem.py":/app/src/prime_rl/inference/vllm/worker/filesystem.py:ro \
+  -v "$deployment/source/src/prime_rl/inference/vllm/server.py":/app/src/prime_rl/inference/vllm/server.py:ro \
   -e CUDA_DEVICE_ORDER=PCI_BUS_ID \
   -e PYTHONUNBUFFERED=1 \
   -e OMP_NUM_THREADS=1 \

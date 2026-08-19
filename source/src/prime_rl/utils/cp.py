@@ -173,9 +173,33 @@ def setup_cp_attention_params(
     seq_lens: torch.Tensor,
     cp_style: CPStyle = "ring",
 ) -> None:
-    total_tokens = position_ids.shape[-1]
+    setup_cp_attention_params_for_length(
+        position_ids.shape[-1],
+        cp_group,
+        seq_lens=seq_lens,
+        cp_style=cp_style,
+    )
+
+
+def setup_cp_attention_params_for_length(
+    total_tokens: int,
+    cp_group: dist.ProcessGroup,
+    *,
+    seq_lens: torch.Tensor,
+    cp_style: CPStyle = "ring",
+) -> None:
+    """Publish packed-sequence boundaries for one imminent CP forward.
+
+    Pipeline parallelism prepares all microbatches before it runs the schedule.
+    The ring library keeps these boundaries in process-global state, so PP must
+    call this function again immediately before each microbatch forward.
+    """
+
     cu_seqlens, max_seqlen = get_cu_seqlens_from_seq_lens(
-        seq_lens.to(device=position_ids.device),
+        # Under pipeline parallelism, position IDs stay on CPU until their
+        # microbatch reaches the stage.  seq_lens is already placed on CUDA so
+        # the ring kernel's cu_seqlens remain on CUDA as required.
+        seq_lens,
         total_tokens=total_tokens,
     )
 

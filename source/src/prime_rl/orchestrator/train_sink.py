@@ -32,6 +32,19 @@ from prime_rl.transport import TrainingSample
 from prime_rl.utils.logger import get_logger
 
 
+# Transient policy-endpoint failures are retried in the dispatcher and do not
+# reach the sink. Repeated failures that do reach this point usually mean an
+# environment or judge fault. Stop before the orchestrator can spend a full
+# batch on unusable groups. The arrival traces are already persisted by the
+# orchestrator, so the failure remains diagnosable after this trips.
+MAX_CONSECUTIVE_ERRORED_GROUPS = 8
+# A complete GRPO group with equal rewards receives all-zero advantages and
+# contributes no gradient. Do not fill a production batch with such groups.
+# Stop after a bounded streak so a broken or impossible environment fails
+# closed instead of collecting forever.
+MAX_CONSECUTIVE_ZERO_ADVANTAGE_GROUPS = 8
+
+
 def payload_tokens(rollout: Rollout) -> int:
     """Token cost of the rollout's trainer-bound payload — the samples built by
     ``process_rollout``. This is what actually ships: forked traces can drop
@@ -87,11 +100,14 @@ class TrainSink:
         # Episodes arrived per group — the finalization count (an episode may
         # add several traces to ``pending_groups`` but counts once here).
         self.pending_group_episodes: dict[uuid.UUID, int] = defaultdict(int)
+        self.abandoned_groups: set[uuid.UUID] = set()
         self.pending_batch: list[Rollout] = []
         # Running payload-token total of ``pending_batch`` (token-batched
         # runs), kept in sync on append/pop so the readiness check never
         # re-sums per arrival.
         self.pending_tokens: int = 0
+        self.consecutive_errored_groups: int = 0
+        self.consecutive_zero_advantage_groups: int = 0
 
         # Reset by the orchestrator after each ship via ``reset_pre_filter_stats``
         self.pre_filter_seen = 0
@@ -182,9 +198,15 @@ class TrainSink:
         pushed (or left) the batch over its threshold. Arrivals into
         still-incomplete groups never ship a batch."""
         group_id = episode[0].group_id
+        if group_id in self.abandoned_groups:
+            return None
         env_name = episode[0].env_name
         for rollout in episode:
             await self.process_rollout(rollout)
+        # A policy boundary can invalidate this group while tokenization runs
+        # in a worker thread. Check again before mutating group state.
+        if group_id in self.abandoned_groups:
+            return None
         self.pending_groups[group_id].extend(episode)
         self.pending_group_episodes[group_id] += 1
         if self.pending_group_episodes[group_id] < self.group_size_for(env_name):
@@ -201,6 +223,19 @@ class TrainSink:
         if ready:
             return self.process_batch()
         return None
+
+    def abandon_groups(self, group_ids: set[uuid.UUID]) -> int:
+        """Discard partial groups that will restart under a new policy.
+
+        These are scheduling cancellations, not rollout failures. They must not
+        enter the errored-group path or contribute to batch failure metrics.
+        """
+        self.abandoned_groups.update(group_ids)
+        discarded = 0
+        for group_id in group_ids:
+            discarded += self.pending_group_episodes.pop(group_id, 0)
+            self.pending_groups.pop(group_id, None)
+        return discarded
 
     async def process_rollout(self, rollout: Rollout) -> None:
         """Build training samples from the rollout's Trace (one per branch), walking the
@@ -222,9 +257,9 @@ class TrainSink:
         await self.train_envs.get(rollout.env_name).algorithm.finalize_rollout(rollout)
 
     async def process_group(self, group_id: uuid.UUID) -> None:
-        """Finalize one GRPO group: drop errored rollouts (the whole group
-        when ``requires_group_scoring`` and any failed), assign advantages,
-        run pre-batch filters, append survivors to ``pending_batch``."""
+        """Finalize one complete GRPO group: reject the complete group when
+        any member failed, is oversized, or is untrainable; assign advantages;
+        run pre-batch filters; append clean survivors to ``pending_batch``."""
         group = self.pending_groups.pop(group_id, [])
         self.pending_group_episodes.pop(group_id, None)
         if not group:
@@ -247,41 +282,42 @@ class TrainSink:
             return
         survivors = [r for r in group if not r.has_error]
         num_errored = len(group) - len(survivors)
-        rejected_fillers: list[Rollout] = []
-        if num_errored and self.batch_size is not None:
-            for r in group:
-                if r.has_error:
-                    r.samples = []
-                    r.is_filtered = True
-                    r.filter_results = {"rollout_error": True}
-                    rejected_fillers.append(r)
-
-        # Group-scoring envs: any failure makes survivors' rewards unsafe
-        # (computed relative to the missing ones)
         env = self.train_envs.get(env_name)
-        if num_errored > 0 and env.requires_group_scoring:
-            if self.batch_size is not None:
-                for r in group:
-                    r.samples = []
-                    r.is_filtered = True
-                    r.filter_results = {"group_scored_partial": True}
-                self.pending_batch.extend(group)
-            get_logger().debug(
+        if num_errored > 0:
+            # A GRPO group is the advantage baseline even when the environment
+            # scores each rollout independently. Training on its survivors
+            # changes that baseline and lets infrastructure failures alter the
+            # optimization signal. Reject and replenish the complete group.
+            for r in group:
+                r.samples = []
+                r.is_filtered = True
+                r.filter_results = {"errored_group": True}
+            self.consecutive_errored_groups += 1
+            self.consecutive_zero_advantage_groups = 0
+            get_logger().warning(
                 f"Finished group | env={env_name} task_idx={task_idx} | "
-                f"rollouts={len(group)} (errored={num_errored}) | dropped: group-scored partial"
+                f"rollouts={len(group)} (errored={num_errored}) | dropped complete group; "
+                f"consecutive errored groups={self.consecutive_errored_groups}/"
+                f"{MAX_CONSECUTIVE_ERRORED_GROUPS}"
             )
+            if self.consecutive_errored_groups >= MAX_CONSECUTIVE_ERRORED_GROUPS:
+                raise RuntimeError(
+                    f"{self.consecutive_errored_groups} consecutive rollout groups contained errors; "
+                    "stopping collection before an unusable train batch can be built"
+                )
             return
+        self.consecutive_errored_groups = 0
 
         # Never assign a full-trajectory reward to a prefix that the trainer
-        # silently truncates. For group-scored RL, one oversized member makes
-        # the whole group unsafe because removing it changes the baseline.
-        oversized_fillers: list[Rollout] = []
+        # silently truncates. One oversized member makes the complete GRPO
+        # baseline unsafe.
         oversized = [
             r
             for r in survivors
             if any(len(sample.token_ids) > self.config.seq_len for sample in r.samples)
         ]
         if oversized:
+            self.consecutive_zero_advantage_groups = 0
             longest = max(
                 len(sample.token_ids)
                 for r in oversized
@@ -292,31 +328,22 @@ class TrainSink:
                 f"dropped training payload: {len(oversized)} rollout(s) exceed "
                 f"trainer seq_len {self.config.seq_len} (longest={longest})"
             )
-            if env.requires_group_scoring:
-                return
-            oversized_ids = {id(r) for r in oversized}
-            survivors = [r for r in survivors if id(r) not in oversized_ids]
-            if self.batch_size is not None:
-                # Keep a sample-free, filtered placeholder in a fixed-rollout
-                # batch. Without it, one rejected member leaves a permanent
-                # one-rollout deficit because the dispatcher opens only whole
-                # GRPO groups. It contributes metrics and batch accounting but
-                # cannot reach the trainer or affect the group baseline.
-                for r in oversized:
-                    r.samples = []
-                    r.is_filtered = True
-                    r.filter_results = {"trainer_seq_len": True}
-                oversized_fillers = oversized
-        rejected_fillers.extend(oversized_fillers)
+            for r in group:
+                r.samples = []
+                r.is_filtered = True
+                r.filter_results = {"trainer_seq_len_group": True}
+            return
 
         # Untrainable traces carry no samples and must not skew the group baseline.
-        survivors = [r for r in survivors if r.trainable]
-        if not survivors:
-            if rejected_fillers:
-                self.pending_batch.extend(rejected_fillers)
+        if any(not r.trainable for r in survivors):
+            self.consecutive_zero_advantage_groups = 0
+            for r in group:
+                r.samples = []
+                r.is_filtered = True
+                r.filter_results = {"untrainable_group": True}
             get_logger().debug(
                 f"Finished group | env={env_name} task_idx={task_idx} | "
-                f"rollouts={len(group)} (errored={num_errored}) | dropped: no trainable survivors"
+                f"rollouts={len(group)} | dropped complete group: untrainable member"
             )
             return
 
@@ -324,6 +351,30 @@ class TrainSink:
         # routing) are the algorithm's job (finalize_group); the sink only
         # owns the grouping mechanics.
         await env.algorithm.finalize_group(survivors)
+
+        # ``Rollout.is_trainable`` becomes meaningful only after advantages
+        # are assigned. A uniform-reward GRPO group has all-zero advantages:
+        # shipping it consumes one of the 64 batch groups but produces no
+        # gradient. Reject and replenish the complete group.
+        if not any(r.is_trainable for r in survivors):
+            for r in group:
+                r.samples = []
+                r.is_filtered = True
+                r.filter_results = {"zero_advantage_group": True}
+            self.consecutive_zero_advantage_groups += 1
+            get_logger().warning(
+                f"Finished group | env={env_name} task_idx={task_idx} | "
+                f"rollouts={len(group)} | dropped complete zero-advantage group; "
+                f"consecutive zero-advantage groups={self.consecutive_zero_advantage_groups}/"
+                f"{MAX_CONSECUTIVE_ZERO_ADVANTAGE_GROUPS}"
+            )
+            if self.consecutive_zero_advantage_groups >= MAX_CONSECUTIVE_ZERO_ADVANTAGE_GROUPS:
+                raise RuntimeError(
+                    f"{self.consecutive_zero_advantage_groups} consecutive rollout groups had "
+                    "all-zero advantages; stopping collection before a no-gradient train batch can be built"
+                )
+            return
+        self.consecutive_zero_advantage_groups = 0
 
         # The env has a single sampling temperature; fan it out per token
         # (context tokens are masked out, so their temperature is don't-care).
@@ -352,8 +403,6 @@ class TrainSink:
             self.pending_batch.append(r)
             if self.token_batch_size is not None:
                 self.pending_tokens += payload_tokens(r)
-        self.pending_batch.extend(rejected_fillers)
-
         # Per-group summary. One line per finalized group; per-filter
         # detection breakdown lives at debug level in ``apply_filters``
         rewards = [r.reward for r in survivors]
