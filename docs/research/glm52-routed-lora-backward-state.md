@@ -565,6 +565,40 @@ Do not detach selected route scores.
 Do not disable H200 expert parallelism before measuring it against the current
 known configuration.
 
+## Implementation status on `glm52-optims`
+
+The first code slice is complete. It does not change the active Muse run.
+
+The INT4 expert exchange can now give one dispatch call its own compressed
+input object. Streamed rounds are copied into their exact source-order slices
+in pinned host memory. The object records a CUDA event after the last copy.
+There is no layer-wide payload slot.
+
+A bounded workspace can gather selected host rows and reconstruct them into a
+BF16 CUDA tensor that the caller supplies. It does not allocate a BF16 output.
+This permits the native expert backward to reuse its consumed 2,048-row
+gradient buffer later.
+
+The feature is inactive until a native routed-expert LoRA module requests the
+input object. The existing Muse and GLM paths therefore keep their current
+behavior.
+
+Local results:
+
+- Python compilation passes for all changed files.
+- Ruff format and checks pass.
+- Ten INT4 transport-memory tests pass.
+- Thirteen related FP8 memory and accounting tests pass.
+- `git diff --check` passes.
+
+The eight-GPU CUDA parity test now checks exact full-payload reconstruction and
+selected-row reconstruction. It has not run for this branch. The local VM
+cannot load CUDA PyTorch because its cuDNN 9 library is absent.
+
+The next code slice must add the native FP8 routed-expert LoRA module. It must
+pass the retained input object into the matching autograd call and use the
+bounded reconstruction workspace for W1 and W3 A gradients.
+
 ## Primary sources
 
 1. PyTorch activation checkpointing:

@@ -8,7 +8,12 @@ import triton
 import triton.language as tl
 from torch.distributed import ProcessGroup
 from torch.distributed.distributed_c10d import _resolve_process_group
-from torch.distributed.tensor import DeviceMesh, Shard, distribute_module, distribute_tensor
+from torch.distributed.tensor import (
+    DeviceMesh,
+    Shard,
+    distribute_module,
+    distribute_tensor,
+)
 from torch.distributed.tensor.parallel import ParallelStyle
 from torchtitan.distributed.expert_parallel import ExpertParallel
 from triton.language.extra import libdevice
@@ -23,22 +28,38 @@ def _quantize_int4_kernel(x, packed, scale, cols: tl.constexpr, block: tl.conste
     col1 = col0 + 1
     x0 = tl.load(x + row * cols + col0, mask=col0 < cols, other=0.0).to(tl.float32)
     x1 = tl.load(x + row * cols + col1, mask=col1 < cols, other=0.0).to(tl.float32)
-    row_scale = tl.maximum(tl.maximum(tl.max(tl.abs(x0)), tl.max(tl.abs(x1))) / 7.0, 1e-8)
+    row_scale = tl.maximum(
+        tl.maximum(tl.max(tl.abs(x0)), tl.max(tl.abs(x1))) / 7.0, 1e-8
+    )
     q0 = tl.maximum(-7.0, tl.minimum(7.0, libdevice.rint(x0 / row_scale))).to(tl.int32)
     q1 = tl.maximum(-7.0, tl.minimum(7.0, libdevice.rint(x1 / row_scale))).to(tl.int32)
-    tl.store(packed + row * ((cols + 1) // 2) + pair, (q0 + 8) | ((q1 + 8) << 4), mask=col0 < cols)
+    tl.store(
+        packed + row * ((cols + 1) // 2) + pair,
+        (q0 + 8) | ((q1 + 8) << 4),
+        mask=col0 < cols,
+    )
     tl.store(scale + row, row_scale)
 
 
 @triton.jit
-def _dequantize_int4_kernel(packed, scale, output, cols: tl.constexpr, block: tl.constexpr):
+def _dequantize_int4_kernel(
+    packed, scale, output, cols: tl.constexpr, block: tl.constexpr
+):
     row = tl.program_id(0)
     pair = tl.arange(0, block)
     col0 = pair * 2
-    value = tl.load(packed + row * ((cols + 1) // 2) + pair, mask=col0 < cols, other=0).to(tl.int32)
+    value = tl.load(
+        packed + row * ((cols + 1) // 2) + pair, mask=col0 < cols, other=0
+    ).to(tl.int32)
     row_scale = tl.load(scale + row)
-    tl.store(output + row * cols + col0, ((value & 15) - 8) * row_scale, mask=col0 < cols)
-    tl.store(output + row * cols + col0 + 1, ((value >> 4) - 8) * row_scale, mask=col0 + 1 < cols)
+    tl.store(
+        output + row * cols + col0, ((value & 15) - 8) * row_scale, mask=col0 < cols
+    )
+    tl.store(
+        output + row * cols + col0 + 1,
+        ((value >> 4) - 8) * row_scale,
+        mask=col0 + 1 < cols,
+    )
 
 
 # When selective activation checkpointing targets "routed_experts", the whole
@@ -130,7 +151,9 @@ def _empty_with_cache_retry(*size, **kwargs):
     _ep_t0 = time.perf_counter()
 
 
-def _round_splits(splits: list[int], round_idx: int, rounds: int) -> tuple[list[int], list[int]]:
+def _round_splits(
+    splits: list[int], round_idx: int, rounds: int
+) -> tuple[list[int], list[int]]:
     """Return this round's peer counts and offsets in the full peer-major buffer."""
     counts = []
     offsets = []
@@ -143,6 +166,183 @@ def _round_splits(splits: list[int], round_idx: int, rounds: int) -> tuple[list[
     return counts, offsets
 
 
+class ReceivedINT4ExpertInput:
+    """Own the exact compressed expert input received by one dispatch call."""
+
+    __slots__ = ("values", "scales", "columns", "copy_done")
+
+    def __init__(self) -> None:
+        self.values = None
+        self.scales = None
+        self.columns = 0
+        self.copy_done = None
+
+    def prepare(self, rows: int, columns: int) -> None:
+        if self.values is not None:
+            raise RuntimeError("received INT4 expert input was prepared more than once")
+        if rows < 0 or columns <= 0:
+            raise ValueError("received INT4 expert input shape is invalid")
+        self.columns = columns
+        self.values = torch.empty(
+            (rows, (columns + 1) // 2),
+            device="cpu",
+            dtype=torch.uint8,
+            pin_memory=True,
+        )
+        self.scales = torch.empty(
+            rows,
+            device="cpu",
+            dtype=torch.float16,
+            pin_memory=True,
+        )
+
+    def copy_slices(
+        self,
+        values: torch.Tensor,
+        scales: torch.Tensor,
+        counts: list[int],
+        source_offsets: list[int],
+        destination_offsets: list[int],
+    ) -> None:
+        if self.values is None or self.scales is None:
+            raise RuntimeError("received INT4 expert input was not prepared")
+        if not (len(counts) == len(source_offsets) == len(destination_offsets)):
+            raise ValueError("received INT4 slice metadata lengths do not match")
+        for count, source, destination in zip(
+            counts,
+            source_offsets,
+            destination_offsets,
+        ):
+            if count < 0 or source < 0 or destination < 0:
+                raise ValueError("received INT4 slice metadata cannot be negative")
+            if source + count > values.shape[0] or source + count > scales.shape[0]:
+                raise ValueError("received INT4 source slice is out of bounds")
+            if (
+                destination + count > self.values.shape[0]
+                or destination + count > self.scales.shape[0]
+            ):
+                raise ValueError("received INT4 destination slice is out of bounds")
+            if not count:
+                continue
+            self.values[destination : destination + count].copy_(
+                values[source : source + count],
+                non_blocking=True,
+            )
+            self.scales[destination : destination + count].copy_(
+                scales[source : source + count],
+                non_blocking=True,
+            )
+
+    def finish_copy(self, device: torch.device) -> None:
+        if self.values is None or self.scales is None:
+            raise RuntimeError("received INT4 expert input was not prepared")
+        if self.copy_done is not None:
+            raise RuntimeError(
+                "received INT4 expert input copy was finished more than once"
+            )
+        self.copy_done = torch.cuda.Event()
+        self.copy_done.record(torch.cuda.current_stream(device))
+
+    def reconstruct_rows(
+        self,
+        row_indices: torch.Tensor,
+        output: torch.Tensor,
+        workspace,
+    ) -> None:
+        if self.values is None or self.scales is None or self.copy_done is None:
+            raise RuntimeError("received INT4 expert input is incomplete")
+        if row_indices.device.type != "cpu" or row_indices.ndim != 1:
+            raise ValueError(
+                "received INT4 row indices must be a one-dimensional CPU tensor"
+            )
+        if output.device.type != "cuda" or output.dtype != torch.bfloat16:
+            raise ValueError(
+                "received INT4 rows must be reconstructed into CUDA BF16 storage"
+            )
+        if output.shape != (row_indices.shape[0], self.columns):
+            raise ValueError("received INT4 reconstruction output has the wrong shape")
+        workspace.check(row_indices.shape[0], self.columns, output.device)
+        if not row_indices.shape[0]:
+            return
+        if not self.values.shape[0]:
+            raise ValueError(
+                "cannot reconstruct rows from an empty received INT4 input"
+            )
+
+        stream = torch.cuda.current_stream(output.device)
+        stream.wait_event(self.copy_done)
+        real_rows = (row_indices >= 0) & (row_indices < self.values.shape[0])
+        safe_indices = row_indices.clamp(0, self.values.shape[0] - 1).long()
+        host_values = workspace.host_values[: row_indices.shape[0]]
+        host_scales = workspace.host_scales[: row_indices.shape[0]]
+        torch.index_select(self.values, 0, safe_indices, out=host_values)
+        torch.index_select(self.scales, 0, safe_indices, out=host_scales)
+
+        device_values = workspace.device_values[: row_indices.shape[0]]
+        device_scales = workspace.device_scales[: row_indices.shape[0]]
+        device_values.copy_(host_values, non_blocking=True)
+        device_scales.copy_(host_scales, non_blocking=True)
+        _dequantize_int4_kernel[(row_indices.shape[0],)](
+            device_values,
+            device_scales,
+            output,
+            self.columns,
+            triton.next_power_of_2((self.columns + 1) // 2),
+            num_warps=8,
+        )
+        output.masked_fill_((~real_rows).to(output.device).unsqueeze(-1), 0)
+
+
+class INT4ExpertInputWorkspace:
+    """Bound host and GPU scratch for compressed expert-input reconstruction."""
+
+    __slots__ = (
+        "row_capacity",
+        "columns",
+        "device",
+        "host_values",
+        "host_scales",
+        "device_values",
+        "device_scales",
+    )
+
+    def __init__(self, row_capacity: int, columns: int, device: torch.device) -> None:
+        if row_capacity <= 0 or columns <= 0:
+            raise ValueError("INT4 expert input workspace shape is invalid")
+        self.row_capacity = row_capacity
+        self.columns = columns
+        self.device = torch.device(device)
+        packed_columns = (columns + 1) // 2
+        self.host_values = torch.empty(
+            (row_capacity, packed_columns),
+            device="cpu",
+            dtype=torch.uint8,
+            pin_memory=True,
+        )
+        self.host_scales = torch.empty(
+            row_capacity,
+            device="cpu",
+            dtype=torch.float16,
+            pin_memory=True,
+        )
+        self.device_values = torch.empty(
+            (row_capacity, packed_columns),
+            device=self.device,
+            dtype=torch.uint8,
+        )
+        self.device_scales = torch.empty(
+            row_capacity,
+            device=self.device,
+            dtype=torch.float16,
+        )
+
+    def check(self, rows: int, columns: int, device: torch.device) -> None:
+        if rows > self.row_capacity:
+            raise ValueError("INT4 expert input workspace row capacity is too small")
+        if columns != self.columns or torch.device(device) != self.device:
+            raise ValueError("INT4 expert input workspace does not match the output")
+
+
 def _streaming_int4_forward(
     routed_input,
     output_splits,
@@ -151,12 +351,15 @@ def _streaming_int4_forward(
     tag,
     rounds,
     reuse_input,
+    received_input=None,
 ):
     """Run an INT4 all-to-all with bounded send and receive rounds."""
     rows, cols = routed_input.shape
     packed_cols = (cols + 1) // 2
     block = triton.next_power_of_2(packed_cols)
     output_rows = sum(output_splits)
+    if received_input is not None:
+        received_input.prepare(output_rows, cols)
 
     # The operation is the sole consumer of its input, and its backward does
     # not need the forward values. If the input allocation is large enough for
@@ -280,6 +483,23 @@ def _streaming_int4_forward(
             dist.all_to_all(receive, send, group=group)
             dist.all_to_all(receive_scale, send_scale, group=group)
 
+        if received_input is not None:
+            if reuse_input:
+                receive_source_offsets = output_offsets
+            else:
+                receive_source_offsets = []
+                receive_cursor = 0
+                for count in output_counts:
+                    receive_source_offsets.append(receive_cursor)
+                    receive_cursor += count
+            received_input.copy_slices(
+                received,
+                received_scale,
+                output_counts,
+                receive_source_offsets,
+                output_offsets,
+            )
+
         if not reuse_input:
             cursor = 0
             for count, offset in zip(output_counts, output_offsets):
@@ -311,6 +531,9 @@ def _streaming_int4_forward(
             num_warps=8,
         )
 
+    if received_input is not None:
+        received_input.finish_copy(routed_input.device)
+
     return dequantized
 
 
@@ -337,9 +560,7 @@ def _streaming_fp8_backward(
         storage_elements = (
             grad_output.untyped_storage().nbytes() // grad_output.element_size()
         )
-        storage_rows = (
-            storage_elements - grad_output.storage_offset()
-        ) // cols
+        storage_rows = (storage_elements - grad_output.storage_offset()) // cols
     reuse_output = input_rows <= storage_rows
     if reuse_output:
         quantized, scale = ops.scaled_fp8_quant(
@@ -436,7 +657,16 @@ def _streaming_fp8_backward(
 
 class _INT4Dispatch(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, routed_input, output_splits, input_splits, group_name, tag="a2a", cache=None):
+    def forward(
+        ctx,
+        routed_input,
+        output_splits,
+        input_splits,
+        group_name,
+        tag="a2a",
+        cache=None,
+        received_input=None,
+    ):
         ctx.tag = tag
         ctx.rounds = (
             _INT4_COMBINE_ROUNDS
@@ -471,6 +701,7 @@ class _INT4Dispatch(torch.autograd.Function):
                 tag,
                 ctx.rounds,
                 reuse_input,
+                received_input,
             )
         rows, cols = routed_input.shape
         packed_cols = (cols + 1) // 2
@@ -482,15 +713,23 @@ class _INT4Dispatch(torch.autograd.Function):
             output, output_scale = cache[0]
             cache[0] = None
         else:
-            quantized = torch.empty((rows, packed_cols), device=routed_input.device, dtype=torch.uint8)
+            quantized = torch.empty(
+                (rows, packed_cols), device=routed_input.device, dtype=torch.uint8
+            )
             scale = torch.empty(rows, device=routed_input.device, dtype=torch.float16)
-            _quantize_int4_kernel[(rows,)](routed_input, quantized, scale, cols, block, num_warps=8)
+            _quantize_int4_kernel[(rows,)](
+                routed_input, quantized, scale, cols, block, num_warps=8
+            )
             output = quantized.new_empty((sum(output_splits), packed_cols))
             output_scale = scale.new_empty(sum(output_splits))
             group = _resolve_process_group(group_name)
             with _EPTimer(f"fwd_{tag}"):
-                dist.all_to_all_single(output, quantized, output_splits, input_splits, group=group)
-                dist.all_to_all_single(output_scale, scale, output_splits, input_splits, group=group)
+                dist.all_to_all_single(
+                    output, quantized, output_splits, input_splits, group=group
+                )
+                dist.all_to_all_single(
+                    output_scale, scale, output_splits, input_splits, group=group
+                )
             # NOTE: do not test torch.is_grad_enabled() here. autograd.Function
             # forward always runs with grad disabled, so that check would never
             # pass and nothing would ever be cached. The caller decides whether
@@ -501,10 +740,22 @@ class _INT4Dispatch(torch.autograd.Function):
         ctx.output_splits = output_splits
         ctx.group_name = group_name
         ctx.cols = cols
-        dequantized = torch.empty((sum(output_splits), cols), device=output.device, dtype=routed_input.dtype)
+        dequantized = torch.empty(
+            (sum(output_splits), cols), device=output.device, dtype=routed_input.dtype
+        )
         _dequantize_int4_kernel[(sum(output_splits),)](
             output, output_scale, dequantized, cols, block, num_warps=8
         )
+        if received_input is not None:
+            received_input.prepare(sum(output_splits), cols)
+            received_input.copy_slices(
+                output,
+                output_scale,
+                [sum(output_splits)],
+                [0],
+                [0],
+            )
+            received_input.finish_copy(output.device)
         return dequantized
 
     @staticmethod
@@ -524,8 +775,11 @@ class _INT4Dispatch(torch.autograd.Function):
                 None,
                 None,
                 None,
+                None,
             )
-        quantized, scale = ops.scaled_fp8_quant(grad_output, use_per_token_if_dynamic=True)
+        quantized, scale = ops.scaled_fp8_quant(
+            grad_output, use_per_token_if_dynamic=True
+        )
         scale = scale.flatten()
         grad_input = quantized.new_empty((sum(ctx.input_splits), quantized.shape[1]))
         grad_scale = scale.new_empty(sum(ctx.input_splits))
@@ -539,7 +793,7 @@ class _INT4Dispatch(torch.autograd.Function):
             )
         grad_input = grad_input.to(grad_output.dtype)
         grad_input.mul_(grad_scale.to(grad_output.dtype)[:, None])
-        return grad_input, None, None, None, None, None
+        return grad_input, None, None, None, None, None, None
 
 
 class MXFP8AllToAllExpertParallel(ExpertParallel):
@@ -561,20 +815,43 @@ class MXFP8AllToAllExpertParallel(ExpertParallel):
     def _token_dispatch(self, mod, inputs, device_mesh):
         routed_input, num_tokens_per_expert = inputs
         if _EP_AC_CACHE and _in_backward() and self._meta_cache is not None:
-            num_tokens_per_expert_group, self.input_splits, self.output_splits = self._meta_cache
+            num_tokens_per_expert_group, self.input_splits, self.output_splits = (
+                self._meta_cache
+            )
             self._meta_cache = None
         else:
             with torch.no_grad():
-                num_tokens_per_expert_group = num_tokens_per_expert.new_empty(num_tokens_per_expert.shape[0])
+                num_tokens_per_expert_group = num_tokens_per_expert.new_empty(
+                    num_tokens_per_expert.shape[0]
+                )
                 with _EPTimer("meta"):
                     dist.all_to_all_single(
-                        num_tokens_per_expert_group, num_tokens_per_expert, group=device_mesh.get_group()
+                        num_tokens_per_expert_group,
+                        num_tokens_per_expert,
+                        group=device_mesh.get_group(),
                     )
-                self.input_splits = num_tokens_per_expert.view(device_mesh.shape[0], -1).sum(dim=1).tolist()
-                self.output_splits = num_tokens_per_expert_group.view(device_mesh.shape[0], -1).sum(dim=1).tolist()
+                self.input_splits = (
+                    num_tokens_per_expert.view(device_mesh.shape[0], -1)
+                    .sum(dim=1)
+                    .tolist()
+                )
+                self.output_splits = (
+                    num_tokens_per_expert_group.view(device_mesh.shape[0], -1)
+                    .sum(dim=1)
+                    .tolist()
+                )
             if _EP_AC_CACHE and not _in_backward() and torch.is_grad_enabled():
-                self._meta_cache = (num_tokens_per_expert_group, self.input_splits, self.output_splits)
+                self._meta_cache = (
+                    num_tokens_per_expert_group,
+                    self.input_splits,
+                    self.output_splits,
+                )
         _ep_profile_tick()
+        received_input = (
+            ReceivedINT4ExpertInput()
+            if getattr(mod, "requires_received_int4_input", False)
+            else None
+        )
         routed_input = _INT4Dispatch.apply(
             routed_input,
             self.output_splits,
@@ -582,8 +859,11 @@ class MXFP8AllToAllExpertParallel(ExpertParallel):
             device_mesh.get_group().group_name,
             "dispatch",
             self._cache_slot(self._dispatch_cache),
+            received_input,
         )
-        return routed_input, num_tokens_per_expert_group
+        if received_input is None:
+            return routed_input, num_tokens_per_expert_group
+        return routed_input, num_tokens_per_expert_group, received_input
 
     def _token_combine(self, mod, routed_output, device_mesh):
         return _INT4Dispatch.apply(
@@ -593,6 +873,7 @@ class MXFP8AllToAllExpertParallel(ExpertParallel):
             device_mesh.get_group().group_name,
             "combine",
             self._cache_slot(self._combine_cache),
+            None,
         )
 
 

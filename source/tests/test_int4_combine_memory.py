@@ -28,7 +28,122 @@ def load_round_splits():
     return namespace["_round_splits"]
 
 
+def load_received_input_type():
+    tree = ast.parse(SOURCE)
+    definition = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "ReceivedINT4ExpertInput"
+    )
+    module = ast.Module(body=[definition], type_ignores=[])
+    fake_torch = types.SimpleNamespace(Tensor=object, device=object)
+    namespace = {"torch": fake_torch}
+    exec(compile(module, str(SOURCE_PATH), "exec"), namespace)
+    return namespace["ReceivedINT4ExpertInput"]
+
+
+class FakeTensor:
+    def __init__(self, rows):
+        self.rows = list(rows)
+        self.shape = (len(self.rows),)
+
+    def __getitem__(self, row_slice):
+        return FakeTensorView(self, row_slice)
+
+
+class FakeTensorView:
+    def __init__(self, tensor, row_slice):
+        self.tensor = tensor
+        self.row_slice = row_slice
+
+    def copy_(self, source, non_blocking=False):
+        del non_blocking
+        if isinstance(source, FakeTensorView):
+            values = source.tensor.rows[source.row_slice]
+        else:
+            values = source.rows
+        self.tensor.rows[self.row_slice] = values
+
+
 class Int4CombineMemoryTests(unittest.TestCase):
+    def test_received_input_copies_rounds_into_source_order(self):
+        received_input = load_received_input_type()()
+        received_input.columns = 4
+        received_input.values = FakeTensor([[0, 0] for _ in range(7)])
+        received_input.scales = FakeTensor([0 for _ in range(7)])
+        round_values = FakeTensor([[0, 1], [2, 3], [4, 5], [6, 7]])
+        round_scales = FakeTensor([10, 11, 12, 13])
+
+        received_input.copy_slices(
+            round_values,
+            round_scales,
+            counts=[2, 0, 2],
+            source_offsets=[0, 2, 2],
+            destination_offsets=[4, 1, 0],
+        )
+
+        self.assertEqual(received_input.values.rows[4:6], round_values.rows[:2])
+        self.assertEqual(received_input.values.rows[:2], round_values.rows[2:])
+        self.assertEqual(received_input.scales.rows[4:6], round_scales.rows[:2])
+        self.assertEqual(received_input.scales.rows[:2], round_scales.rows[2:])
+
+        with self.assertRaisesRegex(ValueError, "metadata lengths"):
+            received_input.copy_slices(
+                round_values,
+                round_scales,
+                counts=[1],
+                source_offsets=[],
+                destination_offsets=[0],
+            )
+        with self.assertRaisesRegex(ValueError, "source slice"):
+            received_input.copy_slices(
+                round_values,
+                round_scales,
+                counts=[2],
+                source_offsets=[3],
+                destination_offsets=[0],
+            )
+
+    def test_received_input_is_owned_by_the_dispatch_call(self):
+        dispatch = SOURCE.split("def _token_dispatch", 1)[1].split(
+            "\n    def _token_combine", 1
+        )[0]
+        self.assertIn("ReceivedINT4ExpertInput()", dispatch)
+        self.assertIn("requires_received_int4_input", dispatch)
+        self.assertIn(
+            "return routed_input, num_tokens_per_expert_group, received_input",
+            dispatch,
+        )
+        self.assertNotIn("self._received_input", dispatch)
+
+    def test_received_input_uses_pinned_memory_and_records_completion(self):
+        definition = SOURCE.split("class ReceivedINT4ExpertInput", 1)[1].split(
+            "\n\nclass INT4ExpertInputWorkspace", 1
+        )[0]
+        self.assertEqual(definition.count("pin_memory=True"), 2)
+        self.assertIn("self.copy_done = torch.cuda.Event()", definition)
+        self.assertIn(
+            "self.copy_done.record(torch.cuda.current_stream(device))", definition
+        )
+
+    def test_reconstruction_uses_caller_output_and_bounded_workspace(self):
+        received_input = SOURCE.split("class ReceivedINT4ExpertInput", 1)[1].split(
+            "\n\nclass INT4ExpertInputWorkspace", 1
+        )[0]
+        reconstruction = received_input.split("def reconstruct_rows", 1)[1]
+        workspace = SOURCE.split("class INT4ExpertInputWorkspace", 1)[1].split(
+            "\n\ndef _streaming_int4_forward", 1
+        )[0]
+        self.assertIn("workspace.check(row_indices.shape[0]", reconstruction)
+        self.assertIn("stream.wait_event(self.copy_done)", reconstruction)
+        self.assertIn("torch.index_select(self.values", reconstruction)
+        self.assertIn("_dequantize_int4_kernel", reconstruction)
+        self.assertNotIn("torch.empty", reconstruction)
+        self.assertEqual(workspace.count("pin_memory=True"), 2)
+        self.assertIn("rows > self.row_capacity", workspace)
+        self.assertIn("self.device_values", workspace)
+        self.assertIn("self.device_scales", workspace)
+
     def test_round_splits_cover_every_peer_segment_once(self):
         round_splits = load_round_splits()
         splits = [5, 0, 8, 2]
@@ -37,7 +152,9 @@ class Int4CombineMemoryTests(unittest.TestCase):
         for round_idx in range(3):
             counts, offsets = round_splits(splits, round_idx, 3)
             for peer, (count, offset) in enumerate(zip(counts, offsets)):
-                covered[peer].extend(range(offset - peer_bases[peer], offset - peer_bases[peer] + count))
+                covered[peer].extend(
+                    range(offset - peer_bases[peer], offset - peer_bases[peer] + count)
+                )
         self.assertEqual(covered, [list(range(split)) for split in splits])
 
     def test_dispatch_and_combine_reuse_input_and_bound_transport_scratch(self):
@@ -127,7 +244,9 @@ class Int4CombineMemoryTests(unittest.TestCase):
         )
         namespace = {"torch": fake_torch}
         exec(
-            compile(ast.Module(body=[helper], type_ignores=[]), str(SOURCE_PATH), "exec"),
+            compile(
+                ast.Module(body=[helper], type_ignores=[]), str(SOURCE_PATH), "exec"
+            ),
             namespace,
         )
         result = namespace["_empty_with_cache_retry"](

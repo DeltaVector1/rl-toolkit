@@ -76,6 +76,7 @@ def main() -> None:
             dist.group.WORLD.group_name,
             "gate",
             None,
+            None,
         )
 
     for _ in range(2):
@@ -105,9 +106,13 @@ def main() -> None:
     if not bool(torch.isfinite(gradient).all()):
         raise RuntimeError("compressed EP backward produced nonfinite gradients")
     if forward_rel_rmse > 0.20:
-        raise RuntimeError(f"INT4 forward relative RMSE is too large: {forward_rel_rmse}")
+        raise RuntimeError(
+            f"INT4 forward relative RMSE is too large: {forward_rel_rmse}"
+        )
     if backward_rel_rmse > 0.08:
-        raise RuntimeError(f"FP8 backward relative RMSE is too large: {backward_rel_rmse}")
+        raise RuntimeError(
+            f"FP8 backward relative RMSE is too large: {backward_rel_rmse}"
+        )
 
     metrics = torch.tensor(
         [

@@ -4,6 +4,27 @@ This document lists each change. The patch files are in `patches/`.
 
 Language: ASD-STE100 Simplified Technical English.
 
+# 2026-08-19: START EXACT INPUT RETENTION FOR GLM EXPERT LORA
+
+This change exists only on the `glm52-optims` branch. It does not change the
+active Muse checkout or run.
+
+Each requested INT4 expert dispatch now owns one pinned-host copy of the exact
+compressed rows and scales that forward received. Streamed rounds write to
+their correct source-order positions. A CUDA event records when the copy is
+complete. The implementation does not use one mutable payload slot on a layer.
+
+A bounded host and GPU workspace reconstructs selected rows into a BF16 output
+that the caller owns. This prepares the native FP8 expert backward to reuse its
+consumed 2,048-row gradient buffer instead of allocating another 24 MiB BF16
+input chunk.
+
+The capture remains off unless a future native routed-expert LoRA module asks
+for it. Ten INT4 transport-memory tests and thirteen related FP8 memory tests
+pass. The changed files pass Ruff, Python compilation, and `git diff --check`.
+The eight-GPU CUDA parity test contains the new exact reconstruction checks but
+has not run for this branch.
+
 # 2026-08-18: REVIEW EACH ASSISTANT TURN INDEPENDENTLY
 
 The first agentic-review candidate gave one judge access to the complete

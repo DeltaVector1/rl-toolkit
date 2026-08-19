@@ -28,7 +28,15 @@ def run_region(x, out_splits, in_splits, group_name, cache):
     from torch.utils.checkpoint import checkpoint
 
     def block(inp):
-        y = ep._INT4Dispatch.apply(inp, out_splits, in_splits, group_name, "dispatch", cache)
+        y = ep._INT4Dispatch.apply(
+            inp,
+            out_splits,
+            in_splits,
+            group_name,
+            "dispatch",
+            cache,
+            None,
+        )
         return torch.nn.functional.silu(y) * 1.5
 
     return checkpoint(block, x, use_reentrant=False, preserve_rng_state=False)
@@ -76,7 +84,9 @@ def main():
     dist.all_reduce(checks, op=dist.ReduceOp.MIN)
     if rank == 0:
         print(f"world={world} rows={rows} cols={cols}")
-        print(f"all_to_all_single calls: uncached={counts['uncached']} cached={counts['cached']}")
+        print(
+            f"all_to_all_single calls: uncached={counts['uncached']} cached={counts['cached']}"
+        )
         print(f"cache populated by forward: {bool(checks[3])}")
         print(f"outputs bitwise identical:  {bool(checks[0])}")
         print(f"grads   bitwise identical:  {bool(checks[1])}")

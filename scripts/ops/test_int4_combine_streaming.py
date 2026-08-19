@@ -4,9 +4,13 @@ import os
 
 import torch
 import torch.distributed as dist
+import triton
 
 from prime_rl.trainer.distributed.expert_parallel import (
+    INT4ExpertInputWorkspace,
+    ReceivedINT4ExpertInput,
     _INT4Dispatch,
+    _dequantize_int4_kernel,
     _streaming_int4_forward,
     _streaming_fp8_backward,
 )
@@ -36,9 +40,11 @@ def main() -> None:
         group_name,
         "reference",
         None,
+        None,
     )
     streamed_leaf = original.detach().clone().requires_grad_(True)
     streamed_input = streamed_leaf * 1
+    received_input = ReceivedINT4ExpertInput()
     streamed = _INT4Dispatch.apply(
         streamed_input,
         output_splits,
@@ -46,8 +52,46 @@ def main() -> None:
         group_name,
         "dispatch",
         None,
+        received_input,
     )
     torch.testing.assert_close(streamed, reference, rtol=0, atol=0)
+    received_input.copy_done.synchronize()
+    captured_values = received_input.values.to("cuda", non_blocking=True)
+    captured_scales = received_input.scales.to("cuda", non_blocking=True)
+    captured = torch.empty_like(streamed)
+    _dequantize_int4_kernel[(captured.shape[0],)](
+        captured_values,
+        captured_scales,
+        captured,
+        captured.shape[1],
+        triton.next_power_of_2((captured.shape[1] + 1) // 2),
+        num_warps=8,
+    )
+    torch.testing.assert_close(captured, streamed, rtol=0, atol=0)
+    selected_rows = torch.tensor(
+        [2, 0, -1, streamed.shape[0] - 1],
+        device="cpu",
+        dtype=torch.int64,
+    )
+    reconstructed = torch.empty(
+        (selected_rows.shape[0], streamed.shape[1]),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    reconstruction_workspace = INT4ExpertInputWorkspace(
+        selected_rows.shape[0],
+        streamed.shape[1],
+        reconstructed.device,
+    )
+    received_input.reconstruct_rows(
+        selected_rows,
+        reconstructed,
+        reconstruction_workspace,
+    )
+    expected_rows = torch.stack(
+        (streamed[2], streamed[0], torch.zeros_like(streamed[0]), streamed[-1])
+    )
+    torch.testing.assert_close(reconstructed, expected_rows, rtol=0, atol=0)
     assert streamed.data_ptr() != streamed_input.data_ptr()
     reference.float().square().mean().backward()
     streamed.float().square().mean().backward()
@@ -71,6 +115,7 @@ def main() -> None:
         group_name,
         "reference",
         None,
+        None,
     )
     imbalanced_leaf = imbalanced.detach().clone().requires_grad_(True)
     imbalanced_streamed_input = imbalanced_leaf * 1
@@ -81,8 +126,11 @@ def main() -> None:
         group_name,
         "dispatch",
         None,
+        None,
     )
-    torch.testing.assert_close(imbalanced_streamed, imbalanced_reference, rtol=0, atol=0)
+    torch.testing.assert_close(
+        imbalanced_streamed, imbalanced_reference, rtol=0, atol=0
+    )
     imbalanced_reference.float().square().mean().backward()
     imbalanced_streamed.float().square().mean().backward()
     assert imbalanced_reference_input.grad is not None
@@ -100,6 +148,14 @@ def main() -> None:
         streamed_leaf,
         streamed_input,
         streamed,
+        received_input,
+        captured_values,
+        captured_scales,
+        captured,
+        selected_rows,
+        reconstructed,
+        reconstruction_workspace,
+        expected_rows,
         imbalanced,
         imbalanced_reference_input,
         imbalanced_reference,
@@ -129,9 +185,14 @@ def main() -> None:
     large_input = torch.zeros((rows, cols), device="cuda", dtype=torch.bfloat16)
     free_bytes, _ = torch.cuda.mem_get_info()
     target_free = 560 * 1024 * 1024
-    ballast = torch.empty(max(0, free_bytes - target_free), device="cuda", dtype=torch.uint8)
+    ballast = torch.empty(
+        max(0, free_bytes - target_free), device="cuda", dtype=torch.uint8
+    )
     before, _ = torch.cuda.mem_get_info()
-    print(f"rank={rank} constrained-dispatch-start free={before / 2**20:.1f}MiB", flush=True)
+    print(
+        f"rank={rank} constrained-dispatch-start free={before / 2**20:.1f}MiB",
+        flush=True,
+    )
     large_output = _streaming_int4_forward(
         large_input,
         large_output_splits,
@@ -152,9 +213,7 @@ def main() -> None:
     # that receive fewer rows than they must return.  The combine must reuse
     # that storage instead of allocating a full BF16 result at peak memory.
     dispatch_capacity_rows = (
-        large_output.untyped_storage().nbytes()
-        // large_output.element_size()
-        // cols
+        large_output.untyped_storage().nbytes() // large_output.element_size() // cols
     )
     assert dispatch_capacity_rows >= max(input_rows, output_rows)
     inverse_reuse = input_rows <= dispatch_capacity_rows
