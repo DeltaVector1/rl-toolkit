@@ -130,32 +130,34 @@ Report the verdict.
 
 # The current run
 
-muse15 is active. It is a fresh run with no restored policy or optimizer state.
-It uses batch 1024, group 16, sequence length 65,536, learning rate 8e-6, and
-128 rollouts in flight. It uses a rank-128 LoRA adapter on all supported
-attention and MLP linear weights.
+muse16 is active. It resumed the Muse15 step-60 LoRA policy. The checkpoint is
+adapter-only, so it did not restore optimizer state. The trainer started a new
+Muon optimizer at trainer step 61. It uses batch 1024, group 16, sequence
+length 65,536, learning rate 8e-6, and 256 rollouts in flight. It uses a
+rank-128 LoRA adapter on all supported attention and MLP linear weights.
 
 h200a serves eight independent TP1 replicas. The orchestrator addresses all
 eight replicas directly and pins each GRPO group to one replica. This is data
-parallel serving across all eight H200 GPUs. A controlled benchmark with
-128 concurrent requests and 256 generated tokens measured 2,789 output tokens
-per second. The equivalent four-replica TP2 setup measured 1,619 output tokens
-per second. Use TP1 data parallel serving for this model and workload. The
-engine context limit is 65,536 tokens.
+parallel serving across all eight H200 GPUs. CUDA graphs use
+`FULL_AND_PIECEWISE` mode. Graph capture used 0.38 GiB on each GPU. A controlled
+rank-128 LoRA benchmark with 2,048 generated tokens per request measured 5,077,
+7,041, and 8,703 output tokens per second at 128, 192, and 256 concurrent
+requests. Use 256 concurrent requests and TP1 data parallel serving for this
+model and workload. The engine context limit is 65,536 tokens.
 
 The environment rollout deadline is 1,200 seconds. A wall-clock harness timeout
 is terminal and does not enter the transient network retry path. This prevents
 the unlimited retry that held muse12 rollout batch 14 at 1008 of 1024 for more
 than 90 minutes.
 
-Muse15 completed trainer steps 1 through 3 with finite loss, entropy, and
-gradient norm. The sampled GPU memory maximum was 29.1 GiB. Rollout batches 1,
-2, and 3 took 14 minutes 21 seconds, 12 minutes 8 seconds, and 17 minutes 30
-seconds. Their mean rewards were 0.0424, 0.0370, and 0.0650. Their rollout
-error rates were 0.4 percent, 0.2 percent, and 0.0 percent. Every batch sent
-1,024 trainable rows to the trainer. Batch 4 started immediately. Do not report
-a trainer step until the trainer has finished forward, backward, and the
-optimizer update.
+Muse16 rollout batch 61 completed in 15 minutes 36 seconds. It sent 1,024
+trainable rows to the trainer, reported 0.3 percent rollout errors, and had no
+mixed policy versions. At 992 of 1,024 rows, the scheduler still held 245
+rollouts in flight and had 107 completed rows buffered. This verifies the tail
+refill change under production load. Trainer forward and backward for step 61
+started at 06:59:55 UTC on 2026-08-19. Rollout batch 62 started at the same
+time. Do not report trainer step 61 as complete until forward, backward, and
+the optimizer update finish.
 
 # Previous GLM run
 
