@@ -67,8 +67,11 @@ def test_muse_production_fails_closed_on_parity() -> None:
 
 def test_muse_adapter_resume_reaches_the_trainer_container() -> None:
     launcher = (ROOT / "scripts/china/cluster.sh").read_text()
+    trainer = (ROOT / "source/src/prime_rl/trainer/rl/train.py").read_text()
     assert '-e PRIME_RL_RESUME_ADAPTER="${PRIME_RL_RESUME_ADAPTER:-}"' in launcher
     assert '-e PRIME_RL_RESUME_ADAPTER_STEP="${PRIME_RL_RESUME_ADAPTER_STEP:-}"' in launcher
+    assert "dist.all_gather_object(loaded_by_rank, loaded)" in trainer
+    assert "globally_loaded != adapter_keys" in trainer
 
 
 def test_muse16_uses_direct_sticky_replicas_and_bounded_rollouts() -> None:

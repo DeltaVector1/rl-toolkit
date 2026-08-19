@@ -445,11 +445,23 @@ def train(config: TrainerConfig):
                     )
                 parameter.copy_(value)
                 loaded.add(key)
-        if loaded != adapter.keys():
+        loaded_by_rank: list[set[str] | None] = [None] * dist.get_world_size()
+        dist.all_gather_object(loaded_by_rank, loaded)
+        globally_loaded: set[str] = set()
+        for rank_loaded in loaded_by_rank:
+            if rank_loaded is None:
+                raise RuntimeError("adapter key validation received no result from one trainer rank")
+            globally_loaded.update(rank_loaded)
+        adapter_keys = set(adapter.keys())
+        if globally_loaded != adapter_keys:
             raise ValueError(
-                f"Adapter keys not loaded: {sorted(adapter.keys() - loaded)}"
+                f"Adapter keys not loaded by any pipeline stage: "
+                f"{sorted(adapter_keys - globally_loaded)}"
             )
-        logger.info(f"Loaded {len(loaded)} adapter tensors from {resume_adapter}")
+        logger.info(
+            f"Loaded {len(loaded)} local adapter tensors and verified all "
+            f"{len(globally_loaded)} global tensors from {resume_adapter}"
+        )
 
     logger.info(f"Initializing tokenizer ({config.tokenizer})")
     tokenizer = setup_tokenizer(config.tokenizer)
