@@ -193,6 +193,8 @@ PY
       -e PRIME_BATCH_CACHE="${PRIME_BATCH_CACHE:-}" \
       -e PRIME_PP_MAX_MICRO="${PRIME_PP_MAX_MICRO:-}" \
       -e PRIME_STATS_DEBUG="${PRIME_STATS_DEBUG:-}" \
+      -e PRIME_RL_RESUME_ADAPTER="${PRIME_RL_RESUME_ADAPTER:-}" \
+      -e PRIME_RL_RESUME_ADAPTER_STEP="${PRIME_RL_RESUME_ADAPTER_STEP:-}" \
       --entrypoint /app/.venv/bin/torchrun "$image" \
       --role=trainer \
       --nnodes="$nnodes" \

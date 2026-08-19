@@ -11,13 +11,13 @@ def _load(relative: str) -> dict:
 
 
 def test_current_configuration_matches_training_expectations() -> None:
-    trainer = _load("configs/china/trainer.muse13.toml")
-    orchestrator = _load("configs/h200/orchestrator.muse13.toml")
+    trainer = _load("configs/china/trainer.muse16.toml")
+    orchestrator = _load("configs/h200/orchestrator.muse16.toml")
 
     assert orchestrator["batch_size"] == 1024
     assert orchestrator["group_size"] == 16
     assert orchestrator["seq_len"] == 65536
-    assert orchestrator["max_inflight_rollouts"] == 128
+    assert orchestrator["max_inflight_rollouts"] == 256
     assert orchestrator["train"]["sampling"]["max_completion_tokens"] == 16384
     assert orchestrator["optim"]["lr"] == 8e-6
     assert trainer["model"]["seq_len"] == 65536
@@ -35,8 +35,8 @@ def test_current_configuration_matches_training_expectations() -> None:
 
 def test_current_swanlab_tags_fit_service_limit() -> None:
     for relative in (
-        "configs/china/trainer.muse13.toml",
-        "configs/h200/orchestrator.muse13.toml",
+        "configs/china/trainer.muse16.toml",
+        "configs/h200/orchestrator.muse16.toml",
     ):
         config = _load(relative)
         assert len(config["swanlab"]["tags"]) <= 30
@@ -47,6 +47,7 @@ def test_muse_saves_only_adapters_not_optimizer_or_merged_weights() -> None:
     """Muse persistence is the filesystem LoRA adapter, not trainer state."""
     for relative in (
         "configs/china/trainer.muse13.toml",
+        "configs/china/trainer.muse16.toml",
         "configs/china/trainer.muse-qualification.toml",
         "configs/china/trainer.muse-direct-parity.toml",
     ):
@@ -56,7 +57,7 @@ def test_muse_saves_only_adapters_not_optimizer_or_merged_weights() -> None:
 
 
 def test_muse_production_fails_closed_on_parity() -> None:
-    trainer = _load("configs/china/trainer.muse13.toml")
+    trainer = _load("configs/china/trainer.muse16.toml")
     assert trainer["parity_guard"] == {
         "max_unmasked_mismatch_kl": 0.1,
         "max_masked_mismatch_kl": 0.5,
@@ -64,14 +65,21 @@ def test_muse_production_fails_closed_on_parity() -> None:
     }
 
 
-def test_muse13_uses_direct_sticky_replicas_and_bounded_rollouts() -> None:
-    orchestrator = _load("configs/h200/orchestrator.muse13.toml")
+def test_muse_adapter_resume_reaches_the_trainer_container() -> None:
+    launcher = (ROOT / "scripts/china/cluster.sh").read_text()
+    assert '-e PRIME_RL_RESUME_ADAPTER="${PRIME_RL_RESUME_ADAPTER:-}"' in launcher
+    assert '-e PRIME_RL_RESUME_ADAPTER_STEP="${PRIME_RL_RESUME_ADAPTER_STEP:-}"' in launcher
+
+
+def test_muse16_uses_direct_sticky_replicas_and_bounded_rollouts() -> None:
+    orchestrator = _load("configs/h200/orchestrator.muse16.toml")
     urls = orchestrator["model"]["client"]["base_url"]
 
     assert urls == [f"http://127.0.0.1:{port}/v1" for port in range(8001, 8009)]
     assert orchestrator["model"]["client"]["admin_base_url"] == urls
     assert orchestrator["train"]["env"][0]["env"]["agent"]["timeout"]["rollout"] == 1200
     assert orchestrator["train"]["sampling"]["max_completion_tokens"] == 16384
+    assert orchestrator["ckpt"]["resume_step"] == 60
 
 
 def test_production_allocator_does_not_strand_large_reserved_blocks() -> None:

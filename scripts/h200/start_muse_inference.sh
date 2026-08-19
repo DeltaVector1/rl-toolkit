@@ -22,6 +22,7 @@ tp_size=${MUSE_TP_SIZE:-1}
 max_model_len=${MUSE_MAX_MODEL_LEN:-65536}
 max_num_seqs=${MUSE_MAX_NUM_SEQS:-32}
 max_num_batched_tokens=${MUSE_MAX_NUM_BATCHED_TOKENS:-16384}
+cudagraph_mode=${MUSE_CUDAGRAPH_MODE:-FULL_AND_PIECEWISE}
 case "$model_impl" in
   auto|vllm|transformers) ;;
   *)
@@ -32,6 +33,13 @@ esac
 case "$tp_size" in
   1|2|4|8) ;;
   *) echo "MUSE_TP_SIZE must be 1, 2, 4, or 8" >&2; exit 2 ;;
+esac
+case "$cudagraph_mode" in
+  NONE|PIECEWISE|FULL|FULL_DECODE_ONLY|FULL_AND_PIECEWISE) ;;
+  *)
+    echo "MUSE_CUDAGRAPH_MODE must be NONE, PIECEWISE, FULL, FULL_DECODE_ONLY, or FULL_AND_PIECEWISE" >&2
+    exit 2
+    ;;
 esac
 if [ $((8 % tp_size)) -ne 0 ]; then
   echo "MUSE_TP_SIZE must divide the eight local GPUs" >&2
@@ -75,7 +83,7 @@ start_replica() {
   --port "$port" \
   --tensor-parallel-size "$tp_size" \
   --model-impl "$model_impl" \
-  --compilation-config '{"mode":3,"cudagraph_mode":0}' \
+  --compilation-config "{\"mode\":3,\"cudagraph_mode\":\"$cudagraph_mode\"}" \
   --dtype bfloat16 \
   --max-model-len "$max_model_len" \
   --gpu-memory-utilization 0.92 \

@@ -10,6 +10,7 @@ START = (ROOT / "scripts/h200/start_muse_inference.sh").read_text()
 TP_PATCH = (ROOT / "scripts/h200/muse_transformers_sitecustomize.py").read_text()
 PROXY = (ROOT / "scripts/h200/muse_replica_proxy.py").read_text()
 ORCHESTRATOR_START = (ROOT / "scripts/h200/start_orchestrator.sh").read_text()
+ORCHESTRATOR_CONFIG = (ROOT / "configs/h200/orchestrator.muse15.toml").read_text()
 
 
 class MuseLoRAEndpointTest(unittest.TestCase):
@@ -31,26 +32,23 @@ class MuseLoRAEndpointTest(unittest.TestCase):
         self.assertIn("model_impl=${MUSE_MODEL_IMPL:-transformers}", START)
         self.assertIn('--model-impl "$model_impl"', START)
         self.assertNotIn("--enforce-eager", START)
-        self.assertIn("--compilation-config '{\"mode\":3,\"cudagraph_mode\":0}'", START)
+        self.assertIn("cudagraph_mode=${MUSE_CUDAGRAPH_MODE:-FULL_AND_PIECEWISE}", START)
+        self.assertIn('\\"cudagraph_mode\\":\\"$cudagraph_mode\\"', START)
 
-    def test_engine_runs_four_independent_tp2_replicas(self):
-        self.assertIn('--tensor-parallel-size 2', START)
-        self.assertIn('--max-num-seqs 32', START)
-        for replica, devices, port in (
-            (0, "0,1", 8001),
-            (1, "2,3", 8002),
-            (2, "4,5", 8003),
-            (3, "6,7", 8004),
-        ):
-            self.assertIn(f"start_replica {replica} {devices} {port}", START)
+    def test_engine_defaults_to_eight_independent_tp1_replicas(self):
+        self.assertIn("tp_size=${MUSE_TP_SIZE:-1}", START)
+        self.assertIn("replica_count=$((8 / tp_size))", START)
+        self.assertIn('--tensor-parallel-size "$tp_size"', START)
+        self.assertIn("max_num_seqs=${MUSE_MAX_NUM_SEQS:-32}", START)
+        self.assertIn('for replica in $(seq 0 $((replica_count - 1)))', START)
+        self.assertIn('start_replica "$replica" "$devices" "$port"', START)
         self.assertIn("muse_replica_proxy.py", START)
         self.assertIn("sorted(rotated, key=lambda backend: _active[backend])", PROXY)
 
     def test_orchestrator_fans_adapter_updates_to_every_replica(self):
-        for port in range(8001, 8005):
-            self.assertIn(f"http://127.0.0.1:{port}", ORCHESTRATOR_START)
-        for port in range(18111, 18115):
-            self.assertIn(f"http://127.0.0.1:{port}", ORCHESTRATOR_START)
+        for port in range(8001, 8009):
+            self.assertIn(f"http://127.0.0.1:{port}/v1", ORCHESTRATOR_CONFIG)
+        self.assertIn('config["model"]["client"]["admin_base_url"]', ORCHESTRATOR_START)
 
     def test_transformers_backend_uses_complete_attention_gate_tensors(self):
         self.assertIn("muse_transformers_sitecustomize.py", START)

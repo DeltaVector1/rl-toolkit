@@ -2050,6 +2050,8 @@ def start(
     mode: str = "cold",
     nodes: list[str] | None = None,
     supervisors: bool = True,
+    resume_adapter: str | None = None,
+    resume_step: int | None = None,
 ) -> None:
     """Start a run. `mode` is "cold" for a new run name or "restart" for an existing one.
 
@@ -2058,6 +2060,15 @@ def start(
     """
     if mode not in ("cold", "restart"):
         raise Refused('mode must be "cold" or "restart"')
+    if (resume_adapter is None) != (resume_step is None):
+        raise Refused("resume_adapter and resume_step must be set together")
+    if resume_adapter is not None:
+        if not run.startswith("muse"):
+            raise Refused("adapter-only resume is supported only for Muse runs")
+        if not resume_adapter.startswith(f"{RUNS}/"):
+            raise Refused(f"resume adapter must be below {RUNS}")
+        if resume_step is None or resume_step < 0:
+            raise Refused("resume_step must be zero or greater")
     nodes = [_check_host(h) for h in (nodes or TRAINER_NODES)]
     if HEAD in nodes:  # rank 0 is the rendezvous master and carries the readable log
         nodes = [HEAD] + [n for n in nodes if n != HEAD]
@@ -2080,6 +2091,20 @@ def start(
             "TRANSFORMERS_OVERRIDE_DIR=/data/muse-glimmer/transformers "
             "MUSE_PYTHON_OVERRIDE_DIR=/data/muse-glimmer/python-overrides"
         )
+        if resume_adapter is not None:
+            missing = [
+                host
+                for host, (rc, _out) in _fan(
+                    nodes, lambda host: _ssh(host, f"test -f {shlex.quote(resume_adapter)}")
+                ).items()
+                if rc
+            ]
+            if missing:
+                raise Refused(f"resume adapter is missing on {missing}")
+            env += (
+                f" PRIME_RL_RESUME_ADAPTER={shlex.quote(resume_adapter)}"
+                f" PRIME_RL_RESUME_ADAPTER_STEP={resume_step}"
+            )
     else:
         env = (
             f"TRAINER_NODES='{trainer_nodes}' RUN={run} RUN_NAME={name} "

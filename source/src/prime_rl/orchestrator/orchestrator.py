@@ -125,6 +125,28 @@ MAX_CONSECUTIVE_EMPTY_BATCHES = 10
 # carries into the next batch; trainer batch and GRPO group sizes do not change.
 ROLLOUT_TAIL_SPARE_GROUPS = 32
 
+
+def rollout_budget(
+    *,
+    batch_size: int,
+    current: int,
+    buffered: int,
+    live: int,
+    group_size: int,
+    max_inflight: int,
+    replica_count: int,
+) -> int:
+    group_size = max(1, group_size)
+    spare = group_size * ROLLOUT_TAIL_SPARE_GROUPS
+    budget = batch_size + spare - current - buffered - live
+    if current < batch_size and current + buffered > 0:
+        target_live = min(max_inflight, group_size * max(1, replica_count))
+        refill = max(0, target_live - live)
+        if refill:
+            refill = ((refill + group_size - 1) // group_size) * group_size
+            budget = max(budget, refill)
+    return budget
+
 # A staged adapter applies at a train-batch boundary when the collecting batch
 # is still inside the configured off-policy limit. An in-flight update restarted
 # 19 complete GRPO groups during x72p rollout 22 and increased collection from
@@ -1016,8 +1038,15 @@ class Orchestrator:
         # The spare is normal full-group overflow for the next step. It removes
         # the exact-batch barrier that held x71p step 8 at 1008 + 15 buffered
         # while one long-tail request finished.
-        spare = group * ROLLOUT_TAIL_SPARE_GROUPS
-        budget = self.config.batch_size + spare - current - buffered - live
+        budget = rollout_budget(
+            batch_size=self.config.batch_size,
+            current=current,
+            buffered=buffered,
+            live=live,
+            group_size=group,
+            max_inflight=self.config.max_inflight_rollouts,
+            replica_count=len(self.policy_inference.train_clients),
+        )
         # Rollouts buffered in a partial group cannot finish once nothing is in
         # flight to finish them: their group-mates were dropped by a filter
         # (zero-advantage groups are enforced) or lost. Counting them against
