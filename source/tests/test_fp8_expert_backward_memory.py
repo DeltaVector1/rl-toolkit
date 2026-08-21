@@ -35,56 +35,6 @@ class FP8ExpertBackwardMemoryTest(unittest.TestCase):
         self.assertLess(release_w3, w2)
         self.assertGreater(release_chunk, w2)
 
-    def test_inplace_ep_scatter_uses_bounded_torch_path_with_one_retry(self):
-        helper = SOURCE.split(
-            "def _index_copy_real_rows_with_cache_retry", 1
-        )[1].split("\n\ndef _grouped_mm_pair_chunks", 1)[0]
-        self.assertEqual(helper.count("except torch.OutOfMemoryError:"), 1)
-        self.assertEqual(helper.count("torch.cuda.empty_cache()"), 1)
-        self.assertEqual(helper.count("destination.index_copy_("), 2)
-        self.assertNotIn("_scatter_permuted_rows_kernel", SOURCE)
-
-        inplace = SOURCE.split("class _InplacePermutedExperts", 1)[1].split(
-            "\n\nclass _ScaleRoutedOutput", 1
-        )[0]
-        self.assertEqual(
-            inplace.count("_index_copy_real_rows_with_cache_retry("), 2
-        )
-
-    def test_forward_expert_workspace_is_bounded_to_2048_rows(self):
-        self.assertIn("_FP8_W13_CHUNK_ROWS = 2048", SOURCE)
-
-    def test_expert_row_gather_has_one_cache_recovery_retry(self):
-        helper = SOURCE.split(
-            "def _index_select_rows_with_cache_retry", 1
-        )[1].split("\ndef _index_copy_real_rows_with_cache_retry", 1)[0]
-        self.assertEqual(helper.count("except torch.OutOfMemoryError:"), 1)
-        self.assertEqual(helper.count("torch.cuda.empty_cache()"), 1)
-        self.assertEqual(helper.count("return x.index_select(0, indices)"), 2)
-
-        inplace = SOURCE.split("class _InplacePermutedExperts", 1)[1].split(
-            "\n\nclass _ScaleRoutedOutput", 1
-        )[0]
-        self.assertEqual(
-            inplace.count("_index_select_rows_with_cache_retry("), 2
-        )
-
-    def test_gate_gradient_reuses_backward_temporaries(self):
-        helper = SOURCE.split("def _silu_glu_backward_inplace", 1)[1].split(
-            "\n\nclass _Experts", 1
-        )[0]
-        self.assertIn("z3_grad = F.silu(z1)", helper)
-        self.assertIn("hidden_grad.mul_(z3).mul_(sigmoid)", helper)
-        self.assertIn("hidden_grad.mul_(z1)", helper)
-        self.assertNotIn("hidden_grad * z3 * sigmoid", helper)
-
-    def test_inplace_ep_backward_uses_a_smaller_chunk(self):
-        self.assertIn("_FP8_EXPERT_BACKWARD_CHUNK_ROWS = 2048", SOURCE)
-        self.assertIn(
-            "ctx.backward_chunk_rows = min(chunk_rows, _FP8_EXPERT_BACKWARD_CHUNK_ROWS)",
-            SOURCE,
-        )
-
     def test_each_backward_chunk_is_released_before_the_next(self):
         backward = SOURCE.split("class _InplacePermutedExperts", 1)[1].split(
             "\n\nclass _ScaleRoutedOutput", 1

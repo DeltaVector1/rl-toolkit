@@ -454,6 +454,7 @@ def load_initial_lora_adapter(model: nn.Module, adapter_path: str, adapter_idx: 
     from pathlib import Path
 
     from safetensors.torch import load_file
+    from torch.distributed.tensor import DTensor, distribute_tensor
 
     path = Path(adapter_path)
     if path.is_dir():
@@ -472,7 +473,12 @@ def load_initial_lora_adapter(model: nn.Module, adapter_path: str, adapter_idx: 
                 f"{module_name} with {module.n_adapters} slots"
             )
         for param_name, param in module.named_parameters_for_adapter(adapter_idx):
-            expected[f"{module_name}.{param_name}.weight"] = param
+            key = f"{module_name}.{param_name}.weight".replace(
+                "._checkpoint_wrapped_module", ""
+            )
+            if key in expected:
+                raise ValueError(f"Duplicate normalized LoRA adapter key: {key}")
+            expected[key] = param
 
     if hasattr(type(model), "convert_adapter_to_hf"):
         expected = type(model).convert_adapter_to_hf(expected)
@@ -496,7 +502,10 @@ def load_initial_lora_adapter(model: nn.Module, adapter_path: str, adapter_idx: 
                     f"Initial LoRA adapter shape mismatch for {key}: "
                     f"checkpoint={tuple(value.shape)}, model={tuple(param.shape)}"
                 )
-            param.copy_(value.to(device=param.device, dtype=param.dtype))
+            value = value.to(device=param.device, dtype=param.dtype)
+            if isinstance(param, DTensor):
+                value = distribute_tensor(value, param.device_mesh, param.placements)
+            param.copy_(value)
 
     get_logger().info(
         f"Loaded {len(expected)} initial LoRA tensors from {path} into adapter slot "

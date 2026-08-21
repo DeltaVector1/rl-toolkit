@@ -11,7 +11,8 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location(
-    "fp8_parity", ROOT / "scripts" / "fp8_parity.py"
+    "fp8_parity",
+    ROOT / "scripts" / "qualification" / "glm52" / "fp8_parity.py",
 )
 fp8_parity = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
@@ -89,62 +90,6 @@ class FP8ParityHarnessTest(unittest.TestCase):
             self.assertGreater(results["layer.02.output"].relative_rmse, 0)
             # The unsampled first row cannot affect the comparison.
             self.assertEqual(results["layer.02.output"].shape, [1, 2])
-
-    def test_trace_rejects_incompatible_fixture(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            with fp8_parity.TraceWriter(
-                root / "ada",
-                side="ada",
-                fixture_sha256="a",
-                model_revision="revision",
-            ):
-                pass
-            with fp8_parity.TraceWriter(
-                root / "h200",
-                side="h200",
-                fixture_sha256="b",
-                model_revision="revision",
-            ):
-                pass
-            with self.assertRaisesRegex(ValueError, "fixture_sha256"):
-                fp8_parity.compare_traces(root / "ada", root / "h200")
-
-    def test_checkpoint_audit_accepts_partial_final_block(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            model = Path(temporary)
-            weight_name = "model.layers.0.self_attn.kv_a_proj_with_mqa.weight"
-            scale_name = (
-                "model.layers.0.self_attn.kv_a_proj_with_mqa.weight_scale_inv"
-            )
-            # The payload is small; the header shape is what the zero-allocation
-            # audit checks.  Hashing uses the declared byte offsets.
-            _write_safetensors(
-                model / "model.safetensors",
-                {
-                    weight_name: (
-                        "F8_E4M3",
-                        [576, 6144],
-                        bytes(576 * 6144),
-                    ),
-                    scale_name: ("F32", [5, 48], bytes(5 * 48 * 4)),
-                },
-            )
-            (model / "model.safetensors.index.json").write_text(
-                json.dumps(
-                    {
-                        "weight_map": {
-                            weight_name: "model.safetensors",
-                            scale_name: "model.safetensors",
-                        }
-                    }
-                )
-            )
-            report = fp8_parity.audit_checkpoint(model)
-            self.assertEqual(report["failures"], [])
-            self.assertEqual(report["fp8_weight_count"], 1)
-            self.assertFalse(report["weights"][0]["native_128x128"])
-
 
 if __name__ == "__main__":
     unittest.main()

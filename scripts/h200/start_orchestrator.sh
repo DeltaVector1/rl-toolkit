@@ -4,13 +4,11 @@
 # China link.
 set -uo pipefail
 
-CONFIG_TAG=${CONFIG_TAG:-.x7h}
 RUN=${RUN:?set RUN}
 RUN_NAME=${RUN_NAME:?set RUN_NAME}
 deployment=/data/glm52-rl/deployment
-config=$deployment/configs/h200
 image=prime-rl:glm52-decensor
-config_file=${ORCH_CONFIG:-$config/orchestrator${CONFIG_TAG}.toml}
+config_file=${ORCH_CONFIG:-$deployment/configs/current/orchestrator.toml}
 transport=$(awk '
   $0 == "[rollout_transport]" { active=1; next }
   /^\[/ { active=0 }
@@ -26,6 +24,10 @@ for url in config["model"]["client"]["admin_base_url"]:
     print(url.removesuffix("/v1"), end=" ")
 PY
 )
+
+if grep -q 'refusals-classifier-eval-v1' "$config_file"; then
+  bash "$deployment/scripts/h200/start_refusals_classifier.sh"
+fi
 
 tunnel() { # local_port  target_host:port  ssh_target  [compress]
   local lp=$1 tgt=$2 via=$3 comp=${4:-no}
@@ -66,7 +68,7 @@ sudo docker run -d --name glm52-decensor-orchestrator \
   --network host --restart no \
   --env-file /data/trinity/training.env \
   -e VLLM_API_KEY=unused \
-  -e PYTHONPATH="$deployment/env":/app/src \
+  -e PYTHONPATH="$deployment/environments/src":/app/src \
   -e HF_HOME=/data/glm52-rl/hf-cache \
   -e HF_HUB_OFFLINE=1 \
   -e HF_DATASETS_OFFLINE=1 \

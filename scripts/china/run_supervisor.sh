@@ -9,7 +9,7 @@ set -uo pipefail
 
 RUN=${RUN:?set RUN}
 RUN_NAME=${RUN_NAME:?set RUN_NAME}
-TRAINER_NODES=${TRAINER_NODES:-"82 76 77 78 80 83 84 85"}
+trainer_nodes=${trainer_nodes:-"82 76 77 78 80 83 84 85"}
 INTERVAL=${INTERVAL:-30}
 STARTUP_GRACE=${STARTUP_GRACE:-900}
 MAX_MISSES=${MAX_MISSES:-2}
@@ -22,7 +22,7 @@ log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
 
 trainer_failures() {
   local id host state failures=""
-  for id in $TRAINER_NODES; do
+  for id in $trainer_nodes; do
     if [ "$id" = 82 ]; then
       state=$(sudo docker ps --filter name="$TRAINER_CT" --format up 2>/dev/null | head -1)
     else
@@ -40,7 +40,7 @@ trainer_failures() {
 
 stop_trainers() {
   local id host
-  for id in $TRAINER_NODES; do
+  for id in $trainer_nodes; do
     host="10.92.20.$id"
     ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=25 "$host" \
       "sudo docker rm -f $TRAINER_CT >/dev/null 2>&1 || true" \

@@ -1,0 +1,88 @@
+[hosts]
+trainer_head = "n82"
+trainers = ["n76", "n77", "n78", "n80", "n82", "n83", "n84", "n85"]
+inference = ["h200a"]
+orchestrator = "h200a"
+metrics = ["h200a", "n82"]
+blocked = ["n79"]
+
+[ports]
+inference_tunnel_first = 18001
+inference_tunnel_last = 18048
+judge = 26406
+adapter = 8100
+batch = 29620
+
+[paths]
+remote_repository = "/data/glm52-rl/deployment"
+runs = "/data/glm52-rl/runs"
+adapter_bucket = "hf://buckets/NewEden/muse-lora-checkpoints"
+
+[containers]
+trainer = "glm52-decensor-trainer"
+orchestrator = "glm52-decensor-orchestrator"
+glm52_inference = "glm52-decensor-h200"
+muse_inference = "muse-glimmer-h200"
+
+[models]
+glm52 = "/data/glm52-rl/model-fp8"
+muse = "/data/muse-glimmer/model"
+
+[inference.h200a.muse]
+gpu_count = 8
+tensor_parallel_size = 1
+ports = [8001, 8002, 8003, 8004, 8005, 8006, 8007, 8008]
+
+[inference.h200a.glm52]
+gpu_count = 8
+tensor_parallel_size = 8
+ports = [8000]
+
+[profiles.current]
+kind = "muse"
+trainer = "configs/current/trainer.toml"
+orchestrator = "configs/current/orchestrator.toml"
+
+[profiles.glm52]
+kind = "glm52"
+trainer = "configs/paused/glm52/trainer.toml"
+orchestrator = "configs/paused/glm52/orchestrator.toml"
+
+[profiles.muse-qualification]
+kind = "muse"
+trainer = "configs/qualification/muse-trainer.toml"
+
+[profiles.muse-parity]
+kind = "muse"
+trainer = "configs/qualification/muse-parity.toml"
+
+[reward]
+minimum_steps = 10
+spread_multiplier = 2.0
+reference_run = "x22"
+reference_spread = 0.039
+
+[limits]
+stall_seconds = 600
+final_steps = 50
+
+[requirements.shared]
+group_size = 16
+max_output_length = 16384
+learning_rate = 8e-6
+max_gradient_norm = 1.0
+weight_decay = 0.0
+
+[requirements.muse]
+batch_size = 1024
+context_length = 65536
+trainer_seconds_max = 480
+rollout_seconds_max = 1200
+
+[requirements.glm52]
+batch_size = 1024
+context_length = 32768
+trainer_seconds_min = 600
+trainer_seconds_max = 900
+rollout_seconds_min = 480
+rollout_seconds_max = 720

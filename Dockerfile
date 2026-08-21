@@ -16,7 +16,7 @@ COPY --chmod=644 source/src/prime_rl/trainer/models/glm_moe_dsa/sparse_mla_atten
 COPY --chmod=644 source/src/prime_rl/trainer/models/layers/checkpointing.py /app/src/prime_rl/trainer/models/layers/checkpointing.py
 COPY --chmod=644 source/src/prime_rl/trainer/models/layers/lora/multi_linear.py /app/src/prime_rl/trainer/models/layers/lora/multi_linear.py
 COPY --chmod=644 source/src/prime_rl/trainer/models/layers/moe.py /app/src/prime_rl/trainer/models/layers/moe.py
-COPY --chmod=644 patches/prime-rl/build-deepep-fused-score.patch /tmp/deepep-fused-score.patch
+COPY --chmod=644 patches/prime-rl/runtime-deepep-score.patch /tmp/deepep-fused-score.patch
 RUN cd /app && if git apply --check --include=src/prime_rl/trainer/distributed/deepep.py /tmp/deepep-fused-score.patch; then \
         git apply --include=src/prime_rl/trainer/distributed/deepep.py /tmp/deepep-fused-score.patch; \
     else \

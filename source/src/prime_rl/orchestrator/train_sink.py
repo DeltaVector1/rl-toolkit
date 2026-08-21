@@ -38,11 +38,6 @@ from prime_rl.utils.logger import get_logger
 # batch on unusable groups. The arrival traces are already persisted by the
 # orchestrator, so the failure remains diagnosable after this trips.
 MAX_CONSECUTIVE_ERRORED_GROUPS = 8
-# A complete GRPO group with equal rewards receives all-zero advantages and
-# contributes no gradient. Do not fill a production batch with such groups.
-# Stop after a bounded streak so a broken or impossible environment fails
-# closed instead of collecting forever.
-MAX_CONSECUTIVE_ZERO_ADVANTAGE_GROUPS = 8
 
 
 def payload_tokens(rollout: Rollout) -> int:
@@ -107,7 +102,6 @@ class TrainSink:
         # re-sums per arrival.
         self.pending_tokens: int = 0
         self.consecutive_errored_groups: int = 0
-        self.consecutive_zero_advantage_groups: int = 0
 
         # Reset by the orchestrator after each ship via ``reset_pre_filter_stats``
         self.pre_filter_seen = 0
@@ -293,7 +287,6 @@ class TrainSink:
                 r.is_filtered = True
                 r.filter_results = {"errored_group": True}
             self.consecutive_errored_groups += 1
-            self.consecutive_zero_advantage_groups = 0
             get_logger().warning(
                 f"Finished group | env={env_name} task_idx={task_idx} | "
                 f"rollouts={len(group)} (errored={num_errored}) | dropped complete group; "
@@ -317,7 +310,6 @@ class TrainSink:
             if any(len(sample.token_ids) > self.config.seq_len for sample in r.samples)
         ]
         if oversized:
-            self.consecutive_zero_advantage_groups = 0
             longest = max(
                 len(sample.token_ids)
                 for r in oversized
@@ -336,7 +328,6 @@ class TrainSink:
 
         # Untrainable traces carry no samples and must not skew the group baseline.
         if any(not r.trainable for r in survivors):
-            self.consecutive_zero_advantage_groups = 0
             for r in group:
                 r.samples = []
                 r.is_filtered = True
@@ -361,20 +352,11 @@ class TrainSink:
                 r.samples = []
                 r.is_filtered = True
                 r.filter_results = {"zero_advantage_group": True}
-            self.consecutive_zero_advantage_groups += 1
             get_logger().warning(
                 f"Finished group | env={env_name} task_idx={task_idx} | "
-                f"rollouts={len(group)} | dropped complete zero-advantage group; "
-                f"consecutive zero-advantage groups={self.consecutive_zero_advantage_groups}/"
-                f"{MAX_CONSECUTIVE_ZERO_ADVANTAGE_GROUPS}"
+                f"rollouts={len(group)} | dropped complete zero-advantage group"
             )
-            if self.consecutive_zero_advantage_groups >= MAX_CONSECUTIVE_ZERO_ADVANTAGE_GROUPS:
-                raise RuntimeError(
-                    f"{self.consecutive_zero_advantage_groups} consecutive rollout groups had "
-                    "all-zero advantages; stopping collection before a no-gradient train batch can be built"
-                )
             return
-        self.consecutive_zero_advantage_groups = 0
 
         # The env has a single sampling temperature; fan it out per token
         # (context tokens are masked out, so their temperature is don't-care).

@@ -406,6 +406,19 @@ def train(config: TrainerConfig):
         )
         logger.info("Initialized multi-run checkpoint manager")
 
+    resume_adapter = (
+        os.environ.get("PRIME_RL_RESUME_ADAPTER") if checkpoint_step is None else None
+    )
+    if resume_adapter:
+        if config.model.lora is None:
+            raise ValueError("PRIME_RL_RESUME_ADAPTER requires model.lora")
+        configured_adapter = config.model.lora.initial_adapter_path
+        if configured_adapter is not None and configured_adapter != resume_adapter:
+            raise ValueError(
+                "PRIME_RL_RESUME_ADAPTER conflicts with model.lora.initial_adapter_path"
+            )
+        config.model.lora.initial_adapter_path = resume_adapter
+
     # Initialize the model and tokenizer
     logger.info(f"Initializing model ({config.model})")
     loading_from_ckpt_later = config.ckpt and checkpoint_step is not None
@@ -420,49 +433,6 @@ def train(config: TrainerConfig):
     logger.info(
         f"Set {len(process_groups)} distributed group timeouts to {config.dist_timeout_seconds} seconds"
     )
-    resume_adapter = (
-        os.environ.get("PRIME_RL_RESUME_ADAPTER") if checkpoint_step is None else None
-    )
-    if resume_adapter:
-        from safetensors.torch import load_file
-        from torch.distributed.tensor import DTensor, distribute_tensor
-
-        adapter = load_file(resume_adapter)
-        loaded = set()
-        with torch.no_grad():
-            for name, parameter in model.named_parameters():
-                key = (
-                    name.replace("._checkpoint_wrapped_module", "")
-                    .replace(".lora_A.0", ".lora_A.weight")
-                    .replace(".lora_B.0", ".lora_B.weight")
-                )
-                if key not in adapter:
-                    continue
-                value = adapter[key].to("cuda", dtype=parameter.dtype)
-                if isinstance(parameter, DTensor):
-                    value = distribute_tensor(
-                        value, parameter.device_mesh, parameter.placements
-                    )
-                parameter.copy_(value)
-                loaded.add(key)
-        loaded_by_rank: list[set[str] | None] = [None] * dist.get_world_size()
-        dist.all_gather_object(loaded_by_rank, loaded)
-        globally_loaded: set[str] = set()
-        for rank_loaded in loaded_by_rank:
-            if rank_loaded is None:
-                raise RuntimeError("adapter key validation received no result from one trainer rank")
-            globally_loaded.update(rank_loaded)
-        adapter_keys = set(adapter.keys())
-        if globally_loaded != adapter_keys:
-            raise ValueError(
-                f"Adapter keys not loaded by any pipeline stage: "
-                f"{sorted(adapter_keys - globally_loaded)}"
-            )
-        logger.info(
-            f"Loaded {len(loaded)} local adapter tensors and verified all "
-            f"{len(globally_loaded)} global tensors from {resume_adapter}"
-        )
-
     logger.info(f"Initializing tokenizer ({config.tokenizer})")
     tokenizer = setup_tokenizer(config.tokenizer)
 
@@ -696,12 +666,20 @@ def train(config: TrainerConfig):
         logger.debug(f"Starting training step {progress.step}")
         step_start_time = time.perf_counter()
 
-        # In-memory transfers broadcast the incoming policy (v{progress.step-1}) before waiting
-        # for its rollouts so the trainer and inference pool join the same update lifecycle.
+        # Broadcast the incoming policy (v{progress.step-1}) before waiting for
+        # its rollouts. Filesystem transport needs this on adapter-only resumes;
+        # otherwise the orchestrator starts from the base model until the first
+        # optimizer update publishes an adapter.
         if (
             progress.step == start_step
             and weight_broadcast is not None
-            and config.weight_broadcast.type in ("nccl", "nixl")
+            and (
+                config.weight_broadcast.type in ("nccl", "nixl")
+                or (
+                    config.weight_broadcast.type == "filesystem"
+                    and resume_adapter is not None
+                )
+            )
         ):
             logger.info(
                 f"Broadcasting startup policy weights (v{progress.step - 1}) to inference engines"
@@ -1243,7 +1221,7 @@ def train(config: TrainerConfig):
                 if (qualification_dump or production_dump) and not direct_parity_dumped:
                     # Every CP rank must join these gathers. Only DP0/CP0 writes
                     # the diagnostic. Production writes only the first
-                    # microbatch of step 1, before the parity gate can reject
+                    # microbatch of step 1, before the parity check can reject
                     # it, so a failure always has token-level evidence.
                     full_input_ids = gather_for_cp_wo_grad(
                         side["input_ids"], cp_size, cp_group

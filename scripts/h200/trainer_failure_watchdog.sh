@@ -26,7 +26,7 @@ trainer_failures() {
      done
      printf '%s\\n' \"\${failures# }\"" 2>/dev/null); then
     printf '%s\n' probe-failed
-    return
+    return 2
   fi
   printf '%s\n' "$output"
 }
@@ -47,24 +47,32 @@ stop_edge() {
 log "trainer failure watchdog started (RUN=$RUN interval=${INTERVAL}s)"
 deadline=$(( $(date +%s) + STARTUP_GRACE ))
 while true; do
-  failed=$(trainer_failures || true)
-  if [ -z "$failed" ]; then
+  probe_status=0
+  failed=$(trainer_failures) || probe_status=$?
+  if [ "$probe_status" -eq 0 ] && [ -z "$failed" ]; then
     break
   fi
-  if [ "$(date +%s)" -ge "$deadline" ]; then
+  if [ "$probe_status" -ne 0 ]; then
+    log "startup: trainer state unknown; health query failed"
+  elif [ "$(date +%s)" -ge "$deadline" ]; then
     log "FATAL: trainer cluster did not become complete; missing:$failed"
     stop_edge
     exit 1
+  else
+    log "startup: waiting for trainer nodes:$failed"
   fi
-  log "startup: waiting for trainer nodes:${failed:- probe-failed}"
   sleep 15
 done
 
 log "all trainer containers are up"
 misses=0
 while true; do
-  failed=$(trainer_failures || true)
-  if [ -n "$failed" ]; then
+  probe_status=0
+  failed=$(trainer_failures) || probe_status=$?
+  if [ "$probe_status" -ne 0 ]; then
+    misses=0
+    log "trainer state unknown; health query failed; no failure recorded"
+  elif [ -n "$failed" ]; then
     misses=$((misses + 1))
     log "trainer probe miss $misses/$MAX_MISSES:$failed"
   else

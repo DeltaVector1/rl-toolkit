@@ -10,7 +10,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
-BACKENDS = tuple(
+backends = tuple(
     backend.strip()
     for backend in os.environ.get(
         "MUSE_REPLICA_BACKENDS",
@@ -18,8 +18,8 @@ BACKENDS = tuple(
     ).split(",")
     if backend.strip()
 )
-LISTEN_PORT = int(os.environ.get("MUSE_PROXY_PORT", "8000"))
-HOP_HEADERS = {
+listen_port = int(os.environ.get("MUSE_PROXY_PORT", "8000"))
+hop_headers = {
     "connection",
     "keep-alive",
     "proxy-authenticate",
@@ -31,7 +31,7 @@ HOP_HEADERS = {
 }
 
 _lock = threading.Lock()
-_active = {backend: 0 for backend in BACKENDS}
+_active = {backend: 0 for backend in backends}
 _cursor = 0
 
 
@@ -39,8 +39,8 @@ def _ordered_backends() -> list[str]:
     global _cursor
     with _lock:
         start = _cursor
-        _cursor = (_cursor + 1) % len(BACKENDS)
-        rotated = BACKENDS[start:] + BACKENDS[:start]
+        _cursor = (_cursor + 1) % len(backends)
+        rotated = backends[start:] + backends[:start]
         return sorted(rotated, key=lambda backend: _active[backend])
 
 
@@ -77,13 +77,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 headers = {
                     name: value
                     for name, value in self.headers.items()
-                    if name.lower() not in HOP_HEADERS and name.lower() != "host"
+                    if name.lower() not in hop_headers and name.lower() != "host"
                 }
                 connection.request(self.command, self.path, body=body, headers=headers)
                 response = connection.getresponse()
                 self.send_response(response.status, response.reason)
                 for name, value in response.getheaders():
-                    if name.lower() not in HOP_HEADERS:
+                    if name.lower() not in hop_headers:
                         self.send_header(name, value)
                 self.end_headers()
                 while chunk := response.read(1024 * 1024):
@@ -118,10 +118,10 @@ class ProxyServer(ThreadingHTTPServer):
 
 
 def main() -> None:
-    if not BACKENDS:
+    if not backends:
         raise SystemExit("MUSE_REPLICA_BACKENDS is empty")
-    print(f"Muse replica proxy listening on :{LISTEN_PORT}; backends={BACKENDS}", flush=True)
-    ProxyServer(("0.0.0.0", LISTEN_PORT), ProxyHandler).serve_forever()
+    print(f"Muse replica proxy listening on :{listen_port}; backends={backends}", flush=True)
+    ProxyServer(("0.0.0.0", listen_port), ProxyHandler).serve_forever()
 
 
 if __name__ == "__main__":

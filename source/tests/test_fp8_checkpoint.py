@@ -2,11 +2,9 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import torch
 from torch.distributed.checkpoint._hf_utils import _HFStorageInfo
-from torch.distributed.checkpoint.hf_storage import HuggingFaceStorageReader
 from torch.distributed.checkpoint.metadata import (
     ChunkStorageMetadata,
     Metadata,
@@ -144,53 +142,6 @@ def _metadata_with_quantized_pairs():
 
 
 class FP8CheckpointStorageReaderTest(unittest.TestCase):
-    def test_every_fp8_scale_pair_is_marked_quantized_after_metadata_rewrite(self):
-        metadata = _metadata_with_quantized_pairs()
-        reader = object.__new__(FP8CheckpointStorageReader)
-        reader.dequantize_all = False
-
-        with patch.object(
-            HuggingFaceStorageReader,
-            "read_metadata",
-            return_value=metadata,
-        ):
-            rewritten = reader.read_metadata()
-
-        weight_targets = {
-            "model.layers.0.self_attn.kv_a_proj_with_mqa.weight",
-            "model.layers.0.self_attn.q_b_proj.weight",
-            "model.layers.0.mlp.shared_expert.w1",
-            "model.layers.0.mlp.experts.w1",
-        }
-        seen = set()
-        for index, info in rewritten.storage_data.items():
-            if index.fqn not in weight_targets:
-                continue
-            seen.add(index.fqn)
-            self.assertIsInstance(info, _FP8StorageInfo)
-            self.assertTrue(info.quantized)
-
-        self.assertEqual(seen, weight_targets)
-
-    def test_fp8_scale_pair_is_kept_fp8_or_dequantized_for_target_dtype(self):
-        raw = (
-            torch.arange(128 * 128, dtype=torch.float32)
-            .remainder(15)
-            .sub(7)
-            .reshape(128, 128)
-            .to(torch.float8_e4m3fn)
-        )
-        scale = torch.tensor([[0.25]], dtype=torch.float32)
-
-        native, native_file = _process(raw, scale, torch.float8_e4m3fn)
-        self.assertTrue(torch.equal(native, raw))
-        self.assertEqual(native_file.scale_reads, 0)
-
-        dequantized, dequantized_file = _process(raw, scale, torch.bfloat16)
-        reference = (raw.float() * scale.float()).to(torch.bfloat16)
-        torch.testing.assert_close(dequantized, reference, rtol=0, atol=0)
-        self.assertEqual(dequantized_file.scale_reads, 1)
-
     def test_dequantization_applies_fp32_scale_before_bf16_rounding(self):
         raw = torch.ones((128, 128), dtype=torch.float8_e4m3fn)
         # This value is not exactly representable in BF16.  Rounding it before

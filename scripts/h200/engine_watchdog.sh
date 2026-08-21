@@ -42,7 +42,7 @@ BUSY_STALL_FAILS_BEFORE_RESTART=${BUSY_STALL_FAILS_BEFORE_RESTART:-5}
 # engine like a busy one for the bounded grace. Empty dead engines use the
 # ordinary limit and still restart quickly.
 RESIDENT_ENGINE_MIN_MIB=${RESIDENT_ENGINE_MIN_MIB:-65536}
-# Overridable so scripts/ops/watchdog_smoketest.sh can drive this real script
+# Tests can replace these commands without changing this file.
 # against a fake launcher instead of re-implementing its decisions.
 START=${START:-/data/glm52-rl/deployment/scripts/h200/start_inference.sh}
 ENGINE_CONTAINER=${ENGINE_CONTAINER:-glm52-decensor-h200}

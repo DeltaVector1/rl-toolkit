@@ -225,7 +225,7 @@ class Orchestrator:
         # Trigger timestamps so eval success logs can report epoch duration
         self.eval_triggered_at = {}
         self.consecutive_empty_batches = 0
-        self.gate_closed_at = None
+        self.dispatch_paused_at = None
         # Pulsed by the version hooks so a held ship can re-check ``policy.version``
         self.version_advanced = asyncio.Event()
         # Pulsed after a train batch advances ``progress.step``. The watcher
@@ -545,7 +545,7 @@ class Orchestrator:
         """Run the orchestrator until shutdown. Drives setup, spawns the
         background tasks, runs the main loop in this task, then cleans up."""
         await self.setup()
-        self.update_dispatch_gate()
+        self.update_dispatch_permission()
         config = self.config
         get_logger().info(f"Starting orchestrator loop (max_steps={config.max_steps or 'infinite'})")
         start_time = time.perf_counter()
@@ -751,7 +751,7 @@ class Orchestrator:
         self.progress.step += 1
         self.batch_completed.set()
         self.train_sink.advance_training_policy_version(self.progress.step - 1)
-        self.update_dispatch_gate()
+        self.update_dispatch_permission()
         # Checkpoint the step we just shipped (resume point: continue at step + 1).
         save_ckpt_time = await self.maybe_save_ckpt(step)
         trim_process_memory()
@@ -1082,7 +1082,7 @@ class Orchestrator:
             )
         self.dispatcher.set_fresh_train_rollout_budget(budget)
 
-    def update_dispatch_gate(self) -> None:
+    def update_dispatch_permission(self) -> None:
         """Pause/resume the dispatcher based on how far the in-flight batch runs
         ahead of ``policy.version``. ``progress.step`` is always the batch being
         collected — advanced right after shipping — so both call sites (ship time
@@ -1097,22 +1097,25 @@ class Orchestrator:
             and self.config.max_steps is not None
             and self.progress.step >= self.config.max_steps - 1
         )
-        gate = self.dispatcher.dispatch_allowed
-        was_set = gate.is_set()
+        dispatch_permission = self.dispatcher.dispatch_allowed
+        was_set = dispatch_permission.is_set()
         if lead > self.config.max_off_policy_steps and not building_final_batch_without_update:
             if was_set:
                 get_logger().info(
-                    "Pausing dispatcher to prevent orchestrator from racing from trainer. Waiting for new policy..."
+                    "Pausing rollout scheduling because the orchestrator is too far "
+                    "ahead of the trainer. Waiting for a new policy."
                 )
-                self.gate_closed_at = time.perf_counter()
-            gate.clear()
+                self.dispatch_paused_at = time.perf_counter()
+            dispatch_permission.clear()
         else:
             if not was_set:
                 get_logger().info("Resuming dispatcher")
-                if self.gate_closed_at is not None:
-                    self.wait_for_policy_time += time.perf_counter() - self.gate_closed_at
-                    self.gate_closed_at = None
-            gate.set()
+                if self.dispatch_paused_at is not None:
+                    self.wait_for_policy_time += (
+                        time.perf_counter() - self.dispatch_paused_at
+                    )
+                    self.dispatch_paused_at = None
+            dispatch_permission.set()
 
     async def on_version_pending(self, step: int) -> None:
         """``VersionObserver`` hook, fired at publish confirmation (pre-apply):
@@ -1182,10 +1185,10 @@ class Orchestrator:
 
     async def on_new_version(self, step: int) -> None:
         """``VersionObserver`` hook: the weight update completed;
-        re-evaluate the dispatch gate (may resume if the trainer caught up)."""
+        re-evaluate the dispatch permission (may resume if the trainer caught up)."""
         if self.model_express is not None:
             await asyncio.to_thread(self.model_express.set_status, p2p_pb2.SOURCE_STATUS_INITIALIZING)
-        self.update_dispatch_gate()
+        self.update_dispatch_permission()
 
     async def stop(self) -> None:
         """Bounded best-effort teardown of all components. Has a global

@@ -7,6 +7,7 @@ install -d -m 0755 "$runtime/prime_rl/inference/vllm/worker"
 install -d -m 0755 "$runtime/prime_rl/utils"
 install -d -m 0755 "$runtime/muse_file_server-0.1.dist-info"
 install -d -m 0755 /data/muse-glimmer/weight-cache
+install -d -m 0755 /data/muse-glimmer/lora-cache
 install -m 0644 "$deployment/scripts/h200/muse_file_endpoint.py" "$runtime/muse_file_endpoint.py"
 install -m 0644 "$deployment/scripts/h200/muse_file_server.entry_points.txt" \
   "$runtime/muse_file_server-0.1.dist-info/entry_points.txt"
@@ -17,12 +18,14 @@ install -m 0644 "$deployment/scripts/h200/muse_transformers_sitecustomize.py" \
 install -m 0644 "$deployment/scripts/h200/muse_replica_proxy.py" \
   "$runtime/muse_replica_proxy.py"
 weight_tunnel_ports=$(seq -s, 19001 19128)
+vllm_image=${MUSE_VLLM_IMAGE:-vllm/vllm-openai:nightly-5a4c8d99242e9e069b604d0e9b969e77f7dd501d}
 model_impl=${MUSE_MODEL_IMPL:-transformers}
 tp_size=${MUSE_TP_SIZE:-1}
+gpu_count=${MUSE_GPU_COUNT:-8}
 max_model_len=${MUSE_MAX_MODEL_LEN:-65536}
 max_num_seqs=${MUSE_MAX_NUM_SEQS:-32}
 max_num_batched_tokens=${MUSE_MAX_NUM_BATCHED_TOKENS:-16384}
-cudagraph_mode=${MUSE_CUDAGRAPH_MODE:-FULL_AND_PIECEWISE}
+cudagraph_mode=${MUSE_CUDAGRAPH_MODE:-FULL_DECODE_ONLY}
 case "$model_impl" in
   auto|vllm|transformers) ;;
   *)
@@ -34,6 +37,13 @@ case "$tp_size" in
   1|2|4|8) ;;
   *) echo "MUSE_TP_SIZE must be 1, 2, 4, or 8" >&2; exit 2 ;;
 esac
+case "$gpu_count" in
+  ''|*[!0-9]*) echo "MUSE_GPU_COUNT must be a positive integer" >&2; exit 2 ;;
+esac
+if [ "$gpu_count" -lt 1 ]; then
+  echo "MUSE_GPU_COUNT must be a positive integer" >&2
+  exit 2
+fi
 case "$cudagraph_mode" in
   NONE|PIECEWISE|FULL|FULL_DECODE_ONLY|FULL_AND_PIECEWISE) ;;
   *)
@@ -41,11 +51,11 @@ case "$cudagraph_mode" in
     exit 2
     ;;
 esac
-if [ $((8 % tp_size)) -ne 0 ]; then
-  echo "MUSE_TP_SIZE must divide the eight local GPUs" >&2
+if [ $((gpu_count % tp_size)) -ne 0 ]; then
+  echo "MUSE_TP_SIZE must divide MUSE_GPU_COUNT" >&2
   exit 2
 fi
-replica_count=$((8 / tp_size))
+replica_count=$((gpu_count / tp_size))
 
 start_replica() {
   local replica=$1 devices=$2 port=$3
@@ -66,6 +76,7 @@ start_replica() {
   -e VLLM_PLUGINS=muse_file_server \
   -e VLLM_SERVER_DEV_MODE=1 \
   -e PRIME_FULL_CHECKPOINT_CACHE_DIR=/data/muse-glimmer/weight-cache \
+  -e PRIME_LORA_CACHE_DIR=/data/muse-glimmer/lora-cache \
   -e PRIME_LORA_DOWNLOAD_STREAMS=8 \
   -e PRIME_FULL_CHECKPOINT_PORTS="$weight_tunnel_ports" \
   -e CUDA_DEVICE_ORDER=PCI_BUS_ID \
@@ -76,7 +87,7 @@ start_replica() {
   -e NCCL_IB_DISABLE=1 \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False \
   --entrypoint vllm \
-  vllm/vllm-openai:muse-glimmer \
+  "$vllm_image" \
   serve /data/muse-glimmer/model \
   --served-model-name /data/muse-glimmer/model \
   --host 0.0.0.0 \
@@ -115,18 +126,15 @@ if [ -n "${MUSE_REPLICA_INDEX:-}" ]; then
   first_device=$((MUSE_REPLICA_INDEX * tp_size))
   last_device=$((first_device + tp_size - 1))
   devices=$(seq -s, "$first_device" "$last_device")
-  start_replica "$MUSE_REPLICA_INDEX" "$devices" "$((8001 + MUSE_REPLICA_INDEX))"
+  start_replica "$MUSE_REPLICA_INDEX" "$devices" "${PORT:-$((8001 + MUSE_REPLICA_INDEX))}"
   exit
 fi
 
-docker update --restart=no glm52-decensor-h200 muse-glimmer-h200 \
-  muse-glimmer-h200-0 muse-glimmer-h200-1 muse-glimmer-h200-2 muse-glimmer-h200-3 \
-  muse-glimmer-h200-4 muse-glimmer-h200-5 muse-glimmer-h200-6 muse-glimmer-h200-7 \
-  >/dev/null 2>&1 || true
-docker rm -f glm52-decensor-h200 muse-glimmer-h200 \
-  muse-glimmer-h200-0 muse-glimmer-h200-1 muse-glimmer-h200-2 muse-glimmer-h200-3 \
-  muse-glimmer-h200-4 muse-glimmer-h200-5 muse-glimmer-h200-6 muse-glimmer-h200-7 \
-  >/dev/null 2>&1 || true
+old_containers=$(docker ps -a --format '{{.Names}}' | grep -E '^(glm52-decensor-h200|muse-glimmer-h200(-[0-9]+)?)$' || true)
+if [ -n "$old_containers" ]; then
+  docker update --restart=no $old_containers >/dev/null 2>&1 || true
+  docker rm -f $old_containers >/dev/null 2>&1 || true
+fi
 
 replica_backends=""
 for replica in $(seq 0 $((replica_count - 1))); do
@@ -145,5 +153,5 @@ docker run -d --name muse-glimmer-h200 --restart unless-stopped \
   -e MUSE_PROXY_PORT=8000 \
   -e MUSE_REPLICA_BACKENDS="$replica_backends" \
   --entrypoint python3 \
-  vllm/vllm-openai:muse-glimmer \
+  "$vllm_image" \
   "$runtime/muse_replica_proxy.py"

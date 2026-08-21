@@ -1,0 +1,131 @@
+output_dir = "/data/glm52-rl/runs/muse19/run_muse19"
+max_steps = 200
+seq_len = 65536
+batch_size = 1024
+group_size = 16
+max_inflight_rollouts = 128
+max_off_policy_steps = 4
+pool_size = 4
+
+[log]
+level = "info"
+
+[swanlab]
+project = "muse-runs"
+name = "orchestrator-muse19"
+group = "muse-runs"
+tags = ["muse19", "orchestrator"]
+
+[file_monitor]
+filename = "rollout-metrics.jsonl"
+
+[model]
+name = "/data/muse-glimmer/model"
+
+[model.lora]
+name = "muse19-r128"
+rank = 128
+alpha = 256.0
+
+[model.client]
+base_url = [
+    "http://127.0.0.1:8001/v1",
+    "http://127.0.0.1:8002/v1",
+    "http://127.0.0.1:8003/v1",
+    "http://127.0.0.1:8004/v1",
+    "http://127.0.0.1:8005/v1",
+    "http://127.0.0.1:8006/v1",
+    "http://127.0.0.1:8007/v1",
+    "http://127.0.0.1:8008/v1",
+]
+admin_base_url = [
+    "http://127.0.0.1:8001/v1",
+    "http://127.0.0.1:8002/v1",
+    "http://127.0.0.1:8003/v1",
+    "http://127.0.0.1:8004/v1",
+    "http://127.0.0.1:8005/v1",
+    "http://127.0.0.1:8006/v1",
+    "http://127.0.0.1:8007/v1",
+    "http://127.0.0.1:8008/v1",
+]
+wait_for_ready_timeout = 7200
+skip_model_check = true
+
+[optim]
+lr = 8e-6
+
+[renderer]
+name = "default"
+tool_parser = "muse_glimmer"
+reasoning_parser = "muse_glimmer"
+clear_thinking = true
+
+[train.sampling]
+temperature = 1.0
+max_completion_tokens = 16384
+extra_body = { min_tokens = 16 }
+
+[[train.env]]
+name = "decensor"
+ratio = 1.0
+pool = { type = "static", num_workers = 16 }
+env.taskset.id = "decensor-v1"
+env.taskset.dataset_name = "/data/glm52-rl/decensor-data/rl.jsonl"
+env.taskset.num_examples = 2000
+env.agent.harness = { id = "null", runtime = { type = "subprocess" } }
+env.agent.max_output_tokens = 16384
+env.agent.timeout.rollout = 1200
+
+[train.env.sampling]
+max_completion_tokens = 16384
+
+[train.env.env.taskset.task.judge]
+base_url = "http://202.214.223.66:26406/v1"
+model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
+api_key_var = "VLLM_API_KEY"
+
+[train.env.env.taskset.task.user]
+base_url = "http://202.214.223.66:26406/v1"
+model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
+api_key_var = "VLLM_API_KEY"
+
+[eval]
+interval = 5
+num_examples = 4000
+group_size = 1
+skip_first_step = false
+
+[eval.sampling]
+temperature = 0.0
+max_completion_tokens = 8192
+
+[[eval.env]]
+name = "refusals-classifier-eval"
+pool = { type = "static", num_workers = 16 }
+env.taskset.id = "refusals-classifier-eval-v1"
+env.taskset.dataset_path = "/data/glm52-rl/refusals-classifier-eval/periodic-4000.jsonl"
+env.taskset.expected_sha256 = "fec3d0af70a25e4fc95e9fccdb9437452bc15e02502a1fb76da6cf5d27b0edda"
+env.taskset.num_examples = -1
+env.agent.harness = { id = "null", runtime = { type = "subprocess" } }
+env.agent.max_output_tokens = 8192
+env.agent.timeout.rollout = 1200
+
+[eval.env.env.taskset.task]
+classifier_base_url = "http://127.0.0.1:18150"
+classifier_revision = "2084304ece320e87820140adfc8845761fb357a0"
+attempts = 3
+request_timeout_seconds = 60.0
+total_timeout_seconds = 150.0
+
+[weight_broadcast]
+type = "filesystem"
+source_url = "http://127.0.0.1:18100/muse19"
+source_dir = "/data/glm52-rl/runs/muse19"
+
+[rollout_transport]
+type = "filesystem"
+
+[ckpt]
+interval = 25
+keep_last = 1
+keep_interval = 100

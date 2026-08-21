@@ -121,7 +121,7 @@ to 13-16/min. x25 uses 48 ports, 18001-18048.
 Uncompressed bulk transfer measured less than 130 KB/s. Compressed transfer
 measured 4.9 MB/s. Therefore a batch can cross the link, but it must use a
 resumable, integrity-checked bulk transport. Individual rollout responses and
-WAN ZMQ do not provide that guarantee. See `docs/ROLLOUT_TRANSPORT.md`.
+WAN ZMQ do not provide that guarantee. See `docs/design/rollout-transport.md`.
 
 # THE TUNNEL CONCURRENCY CEILING
 
@@ -263,7 +263,7 @@ without any kernel module, but it needs a port. Measured from an engine host:
 UDP and arbitrary TCP to the jump host both time out. Only SSH on port 31331
 crosses. Ask the provider to open one UDP port if this route is wanted.
 
-`scripts/network/tune_wan.sh` applies what is possible today: BBR on n82 for
+`scripts/setup/tune_wan.sh` applies what is possible today: BBR on n82 for
 the two engine routes only, and on both ends `tcp_slow_start_after_idle=0`,
 `tcp_mtu_probing=1`, and a 32 MB buffer ceiling. Do not set BBR globally on
 n82. It is a trainer node and NCCL crosses the same interface, where cubic
@@ -281,7 +281,7 @@ note was wrong and is retracted. The kernel trace showed `shmem_fault`,
 `shmem_alloc_folio`, `__alloc_pages`, and `out_of_memory`.
 
 The pipeline stage balance moved the peak GPU memory from 24.6 GB to 21.9 GB
-for each GPU. See `docs/PIPELINE_PARALLEL.md`.
+for each GPU. See `docs/design/pipeline-parallel.md`.
 
 # THE PRECISION MEASUREMENTS
 
@@ -330,7 +330,7 @@ event timers:
 All-to-all was 93 percent of the micro-batch, so kernel tuning could not move
 the step time.
 
-The remaining gap between the wire floor and the measured time was expert load
+The remaining gap between the theoretical wire time and the measured time was expert load
 imbalance. `all_to_all_single` finishes at the pace of its busiest peer.
 
 | Split skew | Time for each layer | Wire efficiency |

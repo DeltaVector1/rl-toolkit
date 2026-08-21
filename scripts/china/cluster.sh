@@ -3,14 +3,10 @@ set -euo pipefail
 
 image=prime-rl:glm52-fp8
 deployment=/data/glm52-rl/deployment
-# RUN selects which config pair under configs/china to use and where logs land.
-# Defaults keep the historical r33 layout.
-RUN=${RUN:-r33}
-run_name=${RUN_NAME:-run_${RUN:-r33}}
-config=$deployment/configs/china
-orchestrator_config=${ORCHESTRATOR_CONFIG_DIR:-$config}
-# CONFIG_TAG picks configs/china/trainer${CONFIG_TAG}.toml (e.g. ".r34")
-CONFIG_TAG=${CONFIG_TAG:-}
+RUN=${RUN:?set RUN}
+run_name=${RUN_NAME:-run_$RUN}
+trainer_config=${TRAINER_CONFIG:-$deployment/configs/current/trainer.toml}
+orchestrator_config=${ORCHESTRATOR_CONFIG:-$deployment/configs/current/orchestrator.toml}
 run_dir=/data/glm52-rl/runs/$RUN/$run_name
 node=${NODE_ID:-$(ip -4 -o addr show vlan130 | awk '{split($4, a, /[.\/]/); print a[4]}')}
 
@@ -84,23 +80,23 @@ fi
 
 case ${1:-} in
   trainer)
-    # TRAINER_NODES lists the participating nodes in rank order; a node's rank
+    # trainer_nodes lists the participating nodes in rank order; a node's rank
     # is its position in that list. Set it to drop a node from the job -- e.g.
-    # with n81 down, TRAINER_NODES="82 76 77 78 80 83 84" gives a 7-node,
+    # with n81 down, trainer_nodes="82 76 77 78 80 83 84" gives a 7-node,
     # 56-rank job. NNODES follows automatically.
-    TRAINER_NODES=${TRAINER_NODES:-"82 76 77 78 80 83 84 85"}   # n85 = stage 7 (ex-judge); n81 still down
+    trainer_nodes=${trainer_nodes:-"82 76 77 78 80 83 84 85"}   # n85 = stage 7 (ex-judge); n81 still down
     rank=-1
     idx=0
-    for n in $TRAINER_NODES; do
+    for n in $trainer_nodes; do
       if [ "$n" = "$node" ]; then rank=$idx; fi
       idx=$((idx + 1))
     done
     nnodes=$idx
     if [ "$rank" -lt 0 ]; then
-      echo "node $node is not in TRAINER_NODES ($TRAINER_NODES)" >&2; exit 1
+      echo "node $node is not in trainer_nodes ($trainer_nodes)" >&2; exit 1
     fi
     read -r rollout_transport trainer_output fake_data < <(
-      python3 - "$config/trainer${CONFIG_TAG}.toml" <<'PY'
+      python3 - "$trainer_config" <<'PY'
 import sys
 import tomllib
 
@@ -208,12 +204,12 @@ PY
       --redirects=3 \
       --local-ranks-filter=0 \
       -m prime_rl.trainer.rl.train \
-      @ "$config/trainer${CONFIG_TAG}.toml"
+      @ "$trainer_config"
     ;;
   orchestrator)
     test "$node" = 82 || { echo "the orchestrator runs on n82" >&2; exit 1; }
     orchestrator_output=$(
-      python3 - "$orchestrator_config/orchestrator${CONFIG_TAG}.toml" <<'PY'
+      python3 - "$orchestrator_config" <<'PY'
 import sys
 import tomllib
 
@@ -248,7 +244,7 @@ PY
       -v "$deployment/source/src/prime_rl/utils/client.py":/app/src/prime_rl/utils/client.py:ro \
       -v "$deployment/source/src/prime_rl/utils/checkpoint_delta.py":/app/src/prime_rl/utils/checkpoint_delta.py:ro \
       --entrypoint /app/.venv/bin/orchestrator "$image" \
-      @ "$orchestrator_config/orchestrator${CONFIG_TAG}.toml"
+      @ "$orchestrator_config"
     ;;
   gemma)
     test "$node" = 85 || { echo "the Gemma server runs on n85" >&2; exit 1; }

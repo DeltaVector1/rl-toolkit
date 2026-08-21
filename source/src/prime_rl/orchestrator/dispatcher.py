@@ -174,7 +174,7 @@ class RolloutDispatcher:
         self.metrics = DispatcherMetrics()
         self.unhealthy_clients: dict[tuple[str, str | None], float] = {}
 
-        # Orchestrator-owned gate. When clear, ``fill_inflight`` returns
+        # Orchestrator-owned permission. When clear, ``fill_inflight`` returns
         # without scheduling new groups. The dispatcher itself doesn't know
         # *why* — the orchestrator toggles this based on step / policy lead.
         self.dispatch_allowed = asyncio.Event()
@@ -437,7 +437,7 @@ class RolloutDispatcher:
     async def fill_inflight(self) -> None:
         """Schedule new rollouts up to ``max_inflight``, honoring
         ``self.mode``. Eval scheduling ignores the orchestrator's dispatch
-        gate (evals are version-pinned measurements); only train scheduling
+        permission (evals are version-pinned measurements); only train scheduling
         respects it. When ``PREFER_EVAL``'s source exhausts we flip back to
         ``PREFER_TRAIN`` so the eval tail drains alongside fresh train."""
         while True:
@@ -459,7 +459,7 @@ class RolloutDispatcher:
                 scheduled = await self.try_schedule("eval")
                 if not scheduled:
                     return
-            else:  # PREFER_TRAIN — respects the orchestrator's dispatch gate
+            else:  # PREFER_TRAIN — respects the orchestrator's dispatch permission
                 if not self.dispatch_allowed.is_set():
                     return
                 scheduled = await self.try_schedule("train")
