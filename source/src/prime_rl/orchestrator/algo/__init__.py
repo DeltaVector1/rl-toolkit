@@ -34,7 +34,6 @@ from prime_rl.orchestrator.algo.grpo import GRPOAlgorithm
 from prime_rl.orchestrator.algo.max_rl import MaxRLAlgorithm
 from prime_rl.orchestrator.algo.opd import OPDAlgorithm
 from prime_rl.orchestrator.algo.opsd import OPSDAlgorithm
-from prime_rl.orchestrator.algo.rae import RAEAlgorithm
 from prime_rl.orchestrator.algo.reasoning_failure_grpo import (
     ReasoningFailureGRPOAlgorithm,
 )
@@ -53,7 +52,6 @@ ALGORITHM_CLASSES: dict[str, type[Algorithm]] = {
     "reasoning_failure_grpo": ReasoningFailureGRPOAlgorithm,
     "echo": EchoAlgorithm,
     "max_rl": MaxRLAlgorithm,
-    "rae": RAEAlgorithm,
     "opd": OPDAlgorithm,
     "opsd": OPSDAlgorithm,
     "sft": SFTDistillAlgorithm,
@@ -80,7 +78,6 @@ __all__ = [
     "MaxRLAlgorithm",
     "OPDAlgorithm",
     "OPSDAlgorithm",
-    "RAEAlgorithm",
     "ReasoningFailureGRPOAlgorithm",
     "Rollout",
     "SFTDistillAlgorithm",
