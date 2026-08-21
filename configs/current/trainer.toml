@@ -1,4 +1,4 @@
-output_dir = "/data/glm52-rl/runs/muse19"
+output_dir = "/data/glm52-rl/runs/muse20"
 max_steps = 200
 dist_timeout_seconds = 5400
 enable_router_replay = false
@@ -14,12 +14,12 @@ ranks_filter = [0]
 
 [swanlab]
 project = "muse-runs"
-name = "trainer-muse19"
+name = "trainer-muse20"
 group = "muse-runs"
-tags = ["muse19", "trainer"]
+tags = ["muse20", "trainer"]
 
 [file_monitor]
-filename = "run_muse19/trainer-metrics.jsonl"
+filename = "run_muse20/trainer-metrics.jsonl"
 
 [model]
 name = "/data/muse-glimmer/model"

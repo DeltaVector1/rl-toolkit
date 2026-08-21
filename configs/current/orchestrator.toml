@@ -1,4 +1,4 @@
-output_dir = "/data/glm52-rl/runs/muse19/run_muse19"
+output_dir = "/data/glm52-rl/runs/muse20/run_muse20"
 max_steps = 200
 seq_len = 65536
 batch_size = 1024
@@ -12,9 +12,9 @@ level = "info"
 
 [swanlab]
 project = "muse-runs"
-name = "orchestrator-muse19"
+name = "orchestrator-muse20"
 group = "muse-runs"
-tags = ["muse19", "orchestrator"]
+tags = ["muse20", "orchestrator"]
 
 [file_monitor]
 filename = "rollout-metrics.jsonl"
@@ -23,7 +23,7 @@ filename = "rollout-metrics.jsonl"
 name = "/data/muse-glimmer/model"
 
 [model.lora]
-name = "muse19-r128"
+name = "muse20-r128"
 rank = 128
 alpha = 256.0
 
@@ -120,8 +120,8 @@ total_timeout_seconds = 150.0
 
 [weight_broadcast]
 type = "filesystem"
-source_url = "http://127.0.0.1:18100/muse19"
-source_dir = "/data/glm52-rl/runs/muse19"
+source_url = "http://127.0.0.1:18100/muse20"
+source_dir = "/data/glm52-rl/runs/muse20"
 
 [rollout_transport]
 type = "filesystem"
