@@ -69,6 +69,7 @@ extra_body = { min_tokens = 16 }
 name = "decensor"
 ratio = 1.0
 pool = { type = "static", num_workers = 16 }
+algo = { type = "reasoning_failure_grpo", failed_group_scale = 0.1, virtual_reward = 0.9 }
 env.taskset.id = "decensor-v1"
 env.taskset.dataset_name = "/data/glm52-rl/decensor-data/rl.jsonl"
 env.taskset.num_examples = 2000
