@@ -11,7 +11,7 @@ ranks_filter = [0]
 project = "prod-run"
 name = "trainer-x84p"
 group = "glm52-decensor-r32"
-tags = ["glm-5.2", "pp8", "decensor", "grpo", "native-fp8-base", "lora-r32", "lora-shared-expert", "64x4090", "b1024", "32768", "cp8", "lr8e-6", "production", "fp8-forward-backward", "int4-ep", "balanced-pp", "sparse-cache", "shared-expert-ac", "fp8-act-offload", "fp8-live-set", "inplace-ep", "bwd-2k", "fail-closed-rollouts", "lora-reconcile", "stream-fp8-bwd", "stream-int4-a2a", "int4-a2a-r8"]
+tags = ["glm-5.2", "pp8", "decensor", "grpo", "native-fp8-base", "lora-r32", "full-expert-lora", "64x4090", "b2048", "32768", "cp8", "lr8e-6", "production", "fp8-forward-backward", "int4-ep"]
 
 [file_monitor]
 filename = "run_x84p/trainer-metrics.jsonl"
@@ -55,7 +55,7 @@ expert_activation_transport = "int4"
 rank = 32
 alpha = 64
 dropout = 0.0
-target_modules = ["q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "o_proj", "shared_expert"]
+target_modules = ["q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "shared_expert", "experts"]
 
 [model.ac]
 mode = "reentrant_attention_shared_expert"

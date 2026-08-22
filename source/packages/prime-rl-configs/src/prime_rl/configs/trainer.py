@@ -566,9 +566,29 @@ class FakeDataLoaderConfig(BaseConfig):
     """Use deterministic token IDs and aligned HF log probabilities from this JSON file."""
 
 
+class RolloutCacheConfig(BaseConfig):
+    mode: Literal["record", "replay"]
+    """Record one real rollout batch, or replay a recorded batch."""
+
+    directory: Path
+    """Directory that holds one cache file for each trainer rank."""
+
+    policy_id: str = Field(min_length=1)
+    """Exact policy name used to make the recorded rollouts."""
+
+
 class DataLoaderConfig(BaseConfig):
     fake: FakeDataLoaderConfig | None = None
     """Use a fake data loader sampling random micro-batches (for debugging)."""
+
+    rollout_cache: RolloutCacheConfig | None = None
+    """Record or replay one real rollout batch for trainer qualification."""
+
+    @model_validator(mode="after")
+    def choose_one_debug_source(self):
+        if self.fake is not None and self.rollout_cache is not None:
+            raise ValueError("fake data and rollout cache cannot be enabled together")
+        return self
 
 
 class ParityGuardConfig(BaseConfig):
@@ -713,6 +733,17 @@ class TrainerConfig(BaseConfig):
 
     env_vars: EnvVars = {}
     """Extra environment variables for the trainer process(es). Merged on top of the launcher defaults."""
+
+    @model_validator(mode="after")
+    def validate_rollout_cache(self):
+        cache = self.data.rollout_cache
+        if cache is not None and cache.mode == "record" and self.max_steps != 1:
+            raise ValueError("rollout cache record mode requires max_steps=1")
+        if cache is not None and self.max_concurrent_runs != 1:
+            raise ValueError("rollout cache supports one run only")
+        if cache is not None and self.optim.lr != 0:
+            raise ValueError("rollout cache qualification requires optim.lr=0")
+        return self
 
     @model_validator(mode="after")
     def deepep_disables_grad_clipping(self):

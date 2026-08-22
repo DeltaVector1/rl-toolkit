@@ -137,7 +137,7 @@ PY
     # Triton compiles kernels into ~/.triton and filled n76 root twice.
     sudo install -d -o 1000 -g 1000 -m 0755 /data/glm52-rl/cache/triton
     sudo install -d -o 1000 -g 1000 -m 1777 /data/glm52-rl/cache/tmp
-    # Batch replay cache (PRIME_BATCH_CACHE), written by the container user.
+    # Recorded rollout batches used by explicit trainer qualification configs.
     sudo install -d -o 1000 -g 1000 -m 0755 /data/glm52-rl/cache/batch_pp
     # nccl shm segments leak on every trainer crash (~33MB each, observed
     # 1500+ per node = 50GB+); the container was just removed, so purge.
@@ -176,6 +176,7 @@ PY
       -v "$deployment/source/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py":/app/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/models/glm_moe_dsa/sparse_mla_attention.py":/app/src/prime_rl/trainer/models/glm_moe_dsa/sparse_mla_attention.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/models/layers/lora/multi_linear.py":/app/src/prime_rl/trainer/models/layers/lora/multi_linear.py:ro \
+      -v "$deployment/source/src/prime_rl/trainer/models/layers/lora/native_fp8_moe.py":/app/src/prime_rl/trainer/models/layers/lora/native_fp8_moe.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/lora.py":/app/src/prime_rl/trainer/lora.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/models/kernels/sparse_mla_fwd.py":/app/src/prime_rl/trainer/models/kernels/sparse_mla_fwd.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/models/kernels/sparse_mla_bwd.py":/app/src/prime_rl/trainer/models/kernels/sparse_mla_bwd.py:ro \
@@ -190,7 +191,6 @@ PY
       -e PRIME_EP_AC_CACHE="${PRIME_EP_AC_CACHE:-0}" \
       -e PRIME_INT4_COMBINE_ROUNDS="${PRIME_INT4_COMBINE_ROUNDS:-1}" \
       -e PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD="${PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD:-0}" \
-      -e PRIME_BATCH_CACHE="${PRIME_BATCH_CACHE:-}" \
       -e PRIME_PP_MAX_MICRO="${PRIME_PP_MAX_MICRO:-}" \
       -e PRIME_STATS_DEBUG="${PRIME_STATS_DEBUG:-}" \
       --entrypoint /app/.venv/bin/torchrun "$image" \

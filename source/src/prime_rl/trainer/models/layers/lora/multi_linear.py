@@ -278,6 +278,17 @@ class MultiLoRALinear(MultiLoRAModule):
             self.base_layer.weight.numel(),
         )
 
+    def active_lora_factors(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return the active factors for code paths that absorb a linear weight."""
+        if not isinstance(self.lora_dropout, nn.Identity):
+            raise ValueError("absorbed LoRA projections require dropout=0")
+        adapter_index = int(self._lora_num_tokens.argmax().item())
+        return (
+            self.lora_A[adapter_index],
+            self.lora_B[adapter_index],
+            self._scaling_factors[adapter_index],
+        )
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shape = x.shape[:-1] + (self.out_features,)
         x = x.view(-1, x.shape[-1])

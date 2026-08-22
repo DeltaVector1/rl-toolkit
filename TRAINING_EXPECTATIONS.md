@@ -54,7 +54,7 @@ parallelism requirements for a run whose name starts with `muse`.
 
 - Native FP8 trainer forward precision must match H200 FP8 inference as closely
   as measured parity permits.
-- Batch size: 1,024, with a validated path to 2,048.
+- Batch size: 2,048 or greater.
 - Group size: 16.
 - Context length: 32,768 tokens.
 - Maximum output length: 16,384 tokens.
@@ -64,7 +64,8 @@ parallelism requirements for a run whose name starts with `muse`.
 
 ## Performance requirements after step 1
 
-- Trainer forward and backward: 10 to 15 minutes per step.
+- Trainer forward and backward target: less than 5 minutes per step.
+- Trainer forward and backward hard limit: 8 minutes per step.
 - Active rollout generation: approximately 10 minutes per batch.
 - Report trainer compute, rollout generation, transfer, and gate waiting as
   separate times.
@@ -83,3 +84,8 @@ regressions. Continue beyond 50 steps when evidence is still incomplete.
 
 Do not accept a short run, a successful step 1, or an early noisy reward rise
 as final validation.
+
+The final GLM run must target every supported attention projection, every
+dense MLP projection, every shared-expert projection, and every routed-expert
+projection. Keep the router and sparse indexer frozen. Complete 20 repeated
+batch-2,048 trainer steps before the final run. No delayed OOM is allowed.

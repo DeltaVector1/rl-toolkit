@@ -22,7 +22,7 @@ from prime_rl.trainer.multi_ckpt import setup_multi_checkpoint_manager
 from prime_rl.trainer.optim import setup_optimizer, setup_multi_optimizer
 from prime_rl.trainer.scheduler import setup_scheduler, setup_multi_scheduler
 from prime_rl.configs.trainer import TrainerConfig
-from prime_rl.trainer.rl.data import DataLoader, FakeDataLoader
+from prime_rl.trainer.rl.data import DataLoader, FakeDataLoader, RolloutCacheDataLoader
 from prime_rl.utils.cp import (
     gather_for_cp,
     gather_for_cp_wo_grad,
@@ -192,8 +192,8 @@ def verify_pipeline_batch_identity(micro_batches, pp_group) -> None:
         )
 
 
-def register_fake_lora_run(multi_run_manager, lora_config) -> None:
-    """Create adapter slot zero without an orchestrator in fake-data mode.
+def register_local_lora_run(multi_run_manager, lora_config) -> None:
+    """Create adapter slot zero for trainer-only qualification.
 
     The normal LoRA optimizer waits until MultiRunManager discovers an
     orchestrator run because discovery resets the adapter. A trainer-only
@@ -202,8 +202,8 @@ def register_fake_lora_run(multi_run_manager, lora_config) -> None:
     already attached itself to the manager.
     """
     if multi_run_manager.used_idxs:
-        raise RuntimeError("fake-data LoRA qualification found an unexpected RL run")
-    run_id = "fake_qualification"
+        raise RuntimeError("trainer-only qualification found an unexpected RL run")
+    run_id = "trainer_qualification"
     idx = 0
     multi_run_manager.idx_2_id[idx] = run_id
     multi_run_manager.id_2_idx[run_id] = idx
@@ -221,7 +221,7 @@ def initialize_fresh_lora_policy(
     fresh_b = [
         (name, parameter)
         for name, parameter in fresh_parameters
-        if ".lora_B" in name
+        if "lora_B" in name
     ]
     if not fresh_b:
         raise RuntimeError("fresh LoRA policy has no B matrices")
@@ -466,9 +466,14 @@ def train(config: TrainerConfig):
     # Set up the optimizer
     logger.info(f"Initializing optimizer ({config.optim})")
 
-    if config.data.fake and config.model.lora:
-        register_fake_lora_run(multi_run_manager, config.model.lora)
-        logger.info("Registered local LoRA adapter slot for fake-data qualification")
+    replay_rollouts = (
+        config.data.rollout_cache is not None
+        and config.data.rollout_cache.mode == "replay"
+    )
+    trainer_only = config.data.fake is not None or replay_rollouts
+    if trainer_only and config.model.lora:
+        register_local_lora_run(multi_run_manager, config.model.lora)
+        logger.info("Registered local LoRA adapter slot for trainer qualification")
 
     if config.max_concurrent_runs == 1:
         optimizer = setup_optimizer(
@@ -501,7 +506,7 @@ def train(config: TrainerConfig):
     # a rollout batch.  A and B must also be finite.
     fresh_lora_policy = (
         config.model.lora is not None
-        and not config.data.fake
+        and not trainer_only
         and checkpoint_step is None
         and not resume_adapter
     )
@@ -516,9 +521,9 @@ def train(config: TrainerConfig):
         )
 
     # Set up weight broadcast (skip when using fake data since there's no inference server)
-    if config.data.fake:
+    if trainer_only:
         weight_broadcast = None
-        logger.info("Skipping weight broadcast setup (fake data mode)")
+        logger.info("Skipping weight broadcast setup for trainer-only qualification")
     else:
         logger.info(f"Initializing weight broadcast ({config.weight_broadcast})")
         weight_broadcast = setup_weight_broadcast(
@@ -648,16 +653,29 @@ def train(config: TrainerConfig):
             parallel_dims.get_mesh("dp").get_local_rank(),
         )
     else:
-        dataloader = DataLoader(
-            config.output_dir,
-            progress.step,
-            parallel_dims.get_mesh("dp").size(),
-            parallel_dims.get_mesh("dp").get_local_rank(),
-            config.model.seq_len,
-            config.model.cp,
-            bin_cost,
-            config.rollout_transport,
-        )
+        real_dataloader = None
+        if not replay_rollouts:
+            real_dataloader = DataLoader(
+                config.output_dir,
+                progress.step,
+                parallel_dims.get_mesh("dp").size(),
+                parallel_dims.get_mesh("dp").get_local_rank(),
+                config.model.seq_len,
+                config.model.cp,
+                bin_cost,
+                config.rollout_transport,
+            )
+        if config.data.rollout_cache is not None:
+            dataloader = RolloutCacheDataLoader(
+                config.data.rollout_cache,
+                real_dataloader,
+                config.model.seq_len,
+                parallel_dims.get_mesh("dp").size(),
+                parallel_dims.get_mesh("dp").get_local_rank(),
+                config.model.cp,
+            )
+        else:
+            dataloader = real_dataloader
 
     token_exporter = setup_token_exporter(config, parallel_dims, world, logger)
 

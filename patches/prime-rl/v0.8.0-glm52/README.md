@@ -74,6 +74,8 @@ The INT4 expert-activation transport remains. It is not an INT4 weight path.
    enforcement, and LoRA administration recovery.
 7. `0007`: transport and topology regression tests.
 8. `0008`: FP8, LoRA, and deterministic parity regression tests.
+9. `0009`: later bounded-memory FP8 work, rank-32 routed-expert LoRA, strict
+   GLM target checks, and explicit rollout record and replay support.
 
 `SHA256SUMS` records the exact patch payloads.
 

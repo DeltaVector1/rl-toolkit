@@ -1,8 +1,9 @@
-cdffdcb646f2de35248ce36214aa365e9460d13eb8886beb7502dfab4e10d2e4  0001-Add-GLM52-topology-and-monitoring-configuration.patch
-78f2125844744966aab83c5d10c85b22fe4481dee634b14d997f9ca8a0eaeac6  0002-Add-PP8-CP8-and-node-local-expert-topology.patch
-306d4feb6f74843352630a8d736ce128e1ac6fb880a46a59975d5166973b3982  0003-Add-native-GLM-block-FP8-and-LoRA-execution.patch
-846db1fdd6e90dd0dce517550144677ce85ef0bc0a5a08c4825d31f611b93b6d  0004-Add-Ada-sparse-MLA-parity-and-safety-fixes.patch
-5d31fdf6c6c3bd19e623a34b03a162bafbb27a8a2bb6a2a7b785c22e5c7eec06  0005-Add-GLM52-trainer-loop-and-filesystem-broadcast.patch
-89bc38068ec98477f36d9bcb78620e4d117c88b7de1abff6f8de44195e2c7abe  0006-Add-durable-edge-rollout-and-policy-transport.patch
-06072ddbf074dbb480c082674a17a0f19379b2be5b3c886602a5c542f30d4a68  0007-Add-GLM52-transport-and-topology-regressions.patch
-382b4b670bb114738d46f6b741b016f8b7d9307c6a207b0507209a4308b591a7  0008-Add-native-FP8-and-LoRA-update-regressions.patch
+cdffdcb646f2de35248ce36214aa365e9460d13eb8886beb7502dfab4e10d2e4  patches/prime-rl/v0.8.0-glm52/0001-Add-GLM52-topology-and-monitoring-configuration.patch
+78f2125844744966aab83c5d10c85b22fe4481dee634b14d997f9ca8a0eaeac6  patches/prime-rl/v0.8.0-glm52/0002-Add-PP8-CP8-and-node-local-expert-topology.patch
+306d4feb6f74843352630a8d736ce128e1ac6fb880a46a59975d5166973b3982  patches/prime-rl/v0.8.0-glm52/0003-Add-native-GLM-block-FP8-and-LoRA-execution.patch
+846db1fdd6e90dd0dce517550144677ce85ef0bc0a5a08c4825d31f611b93b6d  patches/prime-rl/v0.8.0-glm52/0004-Add-Ada-sparse-MLA-parity-and-safety-fixes.patch
+5d31fdf6c6c3bd19e623a34b03a162bafbb27a8a2bb6a2a7b785c22e5c7eec06  patches/prime-rl/v0.8.0-glm52/0005-Add-GLM52-trainer-loop-and-filesystem-broadcast.patch
+89bc38068ec98477f36d9bcb78620e4d117c88b7de1abff6f8de44195e2c7abe  patches/prime-rl/v0.8.0-glm52/0006-Add-durable-edge-rollout-and-policy-transport.patch
+06072ddbf074dbb480c082674a17a0f19379b2be5b3c886602a5c542f30d4a68  patches/prime-rl/v0.8.0-glm52/0007-Add-GLM52-transport-and-topology-regressions.patch
+382b4b670bb114738d46f6b741b016f8b7d9307c6a207b0507209a4308b591a7  patches/prime-rl/v0.8.0-glm52/0008-Add-native-FP8-and-LoRA-update-regressions.patch
+9a95411a2449c46fbe61f89ae1b34cd89f9da2bb9afa4ec92c66b93d3c716e27  patches/prime-rl/v0.8.0-glm52/0009-Add-routed-expert-LoRA-and-bounded-FP8-qualification.patch

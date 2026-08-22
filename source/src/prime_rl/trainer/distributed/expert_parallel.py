@@ -877,6 +877,51 @@ class MXFP8AllToAllExpertParallel(ExpertParallel):
         )
 
 
+class NativeFP8LoRAAllToAllExpertParallel(MXFP8AllToAllExpertParallel):
+    """Shard the native FP8 base and every routed-expert LoRA factor."""
+
+    @staticmethod
+    def _shard_direct_parameters(mod: nn.Module, device_mesh: DeviceMesh) -> None:
+        for parameter_name, parameter in list(mod.named_parameters(recurse=False)):
+            mod.register_parameter(
+                parameter_name,
+                nn.Parameter(
+                    distribute_tensor(parameter, device_mesh, [Shard(0)]),
+                    requires_grad=parameter.requires_grad,
+                ),
+            )
+
+    @classmethod
+    def _partition_fn(
+        cls,
+        name: str,
+        mod: nn.Module,
+        device_mesh: DeviceMesh,
+    ) -> None:
+        base_layer = getattr(mod, "base_layer", None)
+        if base_layer is None or not getattr(base_layer, "fp8_checkpoint", False):
+            raise TypeError("native FP8 LoRA expert parallelism requires an FP8 base layer")
+        cls._shard_direct_parameters(base_layer, device_mesh)
+        for projection in ("w1", "w2", "w3"):
+            for factor in ("A", "B"):
+                parameter_list = getattr(mod, f"{projection}_lora_{factor}", None)
+                if not isinstance(parameter_list, nn.ParameterList):
+                    raise TypeError(
+                        f"native FP8 LoRA expert module has no {projection} factor {factor}"
+                    )
+                cls._shard_direct_parameters(parameter_list, device_mesh)
+        mod._ep_group = device_mesh.get_group()
+
+    def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
+        return distribute_module(
+            module,
+            device_mesh,
+            partition_fn=self._partition_fn,
+            input_fn=self._token_dispatch,
+            output_fn=self._token_combine,
+        )
+
+
 class DeepEPExpertParallel(ParallelStyle):
     @staticmethod
     def _partition_fn(name: str, mod: nn.Module, device_mesh: DeviceMesh) -> None:

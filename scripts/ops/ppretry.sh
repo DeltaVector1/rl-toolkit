@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# PRIME_BATCH_CACHE (if exported) makes the trainer replay a saved batch
-# instead of waiting for the rollout hosts -- retest costs a model load.
 # ppretry.sh <RUN> -- restart only the trainer for the current PP test run.
 #
 # ONLY safe while the trainer has never completed a step. Once it has, the

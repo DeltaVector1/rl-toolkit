@@ -248,6 +248,22 @@ class GlmMoeDsaAttention(nn.Module):
         w_v = kv_b_w[:, self.qk_nope_head_dim :, :]
         q_absorbed = torch.einsum("bshd,hdk->bshk", q_nope, w_k_nope)
 
+        active_lora_factors = getattr(self.kv_b_proj, "active_lora_factors", None)
+        if active_lora_factors is not None:
+            lora_a, lora_b, lora_scaling = active_lora_factors()
+            lora_b = lora_b.view(
+                self.num_heads,
+                self.qk_nope_head_dim + self.v_head_dim,
+                lora_b.shape[-1],
+            )
+            key_lora_b = lora_b[:, : self.qk_nope_head_dim, :]
+            value_lora_b = lora_b[:, self.qk_nope_head_dim :, :]
+            q_low_rank = torch.einsum("bshd,hdr->bshr", q_nope, key_lora_b)
+            q_update = torch.einsum("bshr,rk->bshk", q_low_rank, lora_a)
+            q_update.mul_(lora_scaling)
+            q_absorbed.add_(q_update)
+            w_v = (w_v, lora_a, value_lora_b, lora_scaling)
+
         sparse_q = torch.cat([q_absorbed, q_rope], dim=-1)
         sparse_kv = torch.cat([k_compressed_normed_full, k_rope_full], dim=-1).unsqueeze(2)
 
@@ -256,7 +272,15 @@ class GlmMoeDsaAttention(nn.Module):
         assert sparse_kv.shape[1] == s_full + 1
         return sparse_q, sparse_kv, w_v
 
-    def _mla_unabsorb(self, out: torch.Tensor, w_v: torch.Tensor) -> torch.Tensor:
+    def _mla_unabsorb(self, out: torch.Tensor, w_v) -> torch.Tensor:
+        if isinstance(w_v, tuple):
+            base_w_v, lora_a, value_lora_b, lora_scaling = w_v
+            result = torch.einsum("bshk,hdk->bshd", out, base_w_v)
+            low_rank = torch.einsum("bshk,rk->bshr", out, lora_a)
+            value_update = torch.einsum("bshr,hdr->bshd", low_rank, value_lora_b)
+            value_update.mul_(lora_scaling)
+            result.add_(value_update)
+            return result
         return torch.einsum("bshk,hdk->bshd", out, w_v)
 
     def output_proj(self, attn_output: torch.Tensor, w_v: torch.Tensor) -> torch.Tensor:

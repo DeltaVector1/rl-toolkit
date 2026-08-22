@@ -1,5 +1,7 @@
 from collections.abc import Callable, Sequence
+import hashlib
 import json
+import os
 from pathlib import Path
 from typing import TypedDict
 
@@ -7,7 +9,7 @@ import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
-from prime_rl.configs.trainer import FakeDataLoaderConfig
+from prime_rl.configs.trainer import FakeDataLoaderConfig, RolloutCacheConfig
 from prime_rl.trainer.rl.packer import BasePacker, setup_packer
 from prime_rl.trainer.runs import get_multi_run_manager
 from prime_rl.trainer.world import get_world
@@ -386,6 +388,117 @@ class DataLoader:
             run_id=micro_batch.run_id,
             run_step=micro_batch.run_step,
         )
+
+
+def _copy_cached_value(value):
+    if isinstance(value, torch.Tensor):
+        return value.clone()
+    if isinstance(value, dict):
+        return {key: _copy_cached_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_copy_cached_value(item) for item in value]
+    return value
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+class RolloutCacheDataLoader:
+    """Record one real batch or replay it without rollout services."""
+
+    format_version = 1
+
+    def __init__(
+        self,
+        config: RolloutCacheConfig,
+        source: DataLoader | None,
+        seq_len: int,
+        dp_world_size: int,
+        dp_rank: int,
+        cp_size: int,
+    ) -> None:
+        self.config = config
+        self.source = source
+        self.seq_len = seq_len
+        self.dp_world_size = dp_world_size
+        self.dp_rank = dp_rank
+        self.cp_size = cp_size
+        self.world = get_world()
+        self.path = config.directory / f"rank-{self.world.rank}.pt"
+        self.digest_path = config.directory / f"rank-{self.world.rank}.sha256"
+        self.cached_batch = None
+        self.recorded = False
+
+        if config.mode == "record":
+            if source is None:
+                raise ValueError("rollout cache record mode requires the real data loader")
+            config.directory.mkdir(parents=True, exist_ok=True)
+        else:
+            if source is not None:
+                raise ValueError("rollout cache replay mode cannot use the real data loader")
+            self.cached_batch = self._load()
+
+    def wait_for_batch(self) -> None:
+        if self.source is not None:
+            self.source.wait_for_batch()
+
+    def get_batch(self) -> list[TensorMicroBatch]:
+        if self.config.mode == "record":
+            if self.recorded:
+                raise RuntimeError("rollout cache record mode accepts one batch only")
+            batch = self.source.get_batch()
+            self._save(batch)
+            self.recorded = True
+            return batch
+        return _copy_cached_value(self.cached_batch)
+
+    def _metadata(self) -> dict:
+        return {
+            "format_version": self.format_version,
+            "policy_id": self.config.policy_id,
+            "rank": self.world.rank,
+            "world_size": self.world.world_size,
+            "dp_world_size": self.dp_world_size,
+            "dp_rank": self.dp_rank,
+            "seq_len": self.seq_len,
+            "cp_size": self.cp_size,
+        }
+
+    def _save(self, batch: list[TensorMicroBatch]) -> None:
+        payload = {"metadata": self._metadata(), "micro_batches": batch}
+        temporary = self.path.with_suffix(".tmp")
+        torch.save(payload, temporary)
+        digest = _sha256_file(temporary)
+        os.replace(temporary, self.path)
+        digest_temporary = self.digest_path.with_suffix(".tmp")
+        digest_temporary.write_text(f"{digest}\n")
+        os.replace(digest_temporary, self.digest_path)
+
+    def _load(self) -> list[TensorMicroBatch]:
+        if not self.path.is_file() or not self.digest_path.is_file():
+            raise FileNotFoundError(
+                f"rollout cache is incomplete for trainer rank {self.world.rank}: {self.path}"
+            )
+        expected_digest = self.digest_path.read_text().strip()
+        actual_digest = _sha256_file(self.path)
+        if actual_digest != expected_digest:
+            raise ValueError(f"rollout cache digest does not match for {self.path}")
+        payload = torch.load(self.path, map_location="cpu", weights_only=False)
+        expected_metadata = self._metadata()
+        if payload.get("metadata") != expected_metadata:
+            raise ValueError(
+                "rollout cache metadata does not match this trainer: "
+                f"expected={expected_metadata}, found={payload.get('metadata')}"
+            )
+        batch = payload.get("micro_batches")
+        if not isinstance(batch, list) or not batch:
+            raise ValueError(f"rollout cache contains no micro-batches: {self.path}")
+        return batch
 
 
 def _torch_dtype(name: str) -> torch.dtype:

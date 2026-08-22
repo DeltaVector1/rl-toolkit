@@ -36,6 +36,9 @@ from prime_rl.configs.trainer import (
     TokenizerConfig,
 )
 from prime_rl.trainer.distributed import DeepEPExpertParallel, MXFP8AllToAllExpertParallel
+from prime_rl.trainer.distributed.expert_parallel import (
+    NativeFP8LoRAAllToAllExpertParallel,
+)
 from prime_rl.trainer.fp8_checkpoint import FP8CheckpointStorageReader
 from prime_rl.trainer.lora import apply_lora_to_model, freeze_all_except_lora_and_specified, strip_lora_from_state_dict
 from prime_rl.trainer.models import (
@@ -1398,9 +1401,18 @@ def apply_ep(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims)
     for transformer_block in iter_layers(language_model.layers):
         block_mlp = getattr(transformer_block, "mlp", None)
         if block_mlp is not None and isinstance(block_mlp, (MoE, LatentMoE)):
+            native_fp8_expert_lora = getattr(
+                block_mlp.experts,
+                "requires_received_int4_input",
+                False,
+            )
+            if native_fp8_expert_lora and config.ep_comm_backend != "torch":
+                raise ValueError("native FP8 routed-expert LoRA requires the torch EP backend")
             if config.ep_comm_backend == "torch":
                 quant = config.quantization
-                if (isinstance(quant, MXFP8Config) and quant.enable_a2a) or (
+                if native_fp8_expert_lora:
+                    parallelize_plan = NativeFP8LoRAAllToAllExpertParallel()
+                elif (isinstance(quant, MXFP8Config) and quant.enable_a2a) or (
                     isinstance(quant, FP8Config)
                     and (
                         config.global_ep
