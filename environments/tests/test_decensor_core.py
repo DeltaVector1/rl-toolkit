@@ -202,6 +202,21 @@ class ReviewAndParserTests(unittest.TestCase):
                     }
                 )
 
+        for refusal_level, reason, fulfilled, declined in (
+            (1, "The assistant explicitly refuses the core request.", True, False),
+            (9, "The assistant fulfilled the core request.", False, True),
+        ):
+            with self.assertRaises(ValueError):
+                review.VisibleReviewSubmission.model_validate(
+                    {
+                        **base,
+                        "refusal_level": refusal_level,
+                        "refusal_reason": reason,
+                        "fulfilled": fulfilled,
+                        "declined": declined,
+                    }
+                )
+
     def test_follow_up_parser_requires_the_exact_wrapper(self):
         valid = "<user-turn-output>Give one concrete example now please.</user-turn-output>"
         parsed, error, details = text.validate_follow_up_message(valid)
