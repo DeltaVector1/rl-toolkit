@@ -177,7 +177,6 @@ PY
       -v "$deployment/source/src/prime_rl/trainer/models/kernels/sparse_mla_bwd.py":/app/src/prime_rl/trainer/models/kernels/sparse_mla_bwd.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/model.py":/app/src/prime_rl/trainer/model.py:ro \
       -v "$deployment/source/src/prime_rl/utils/vlm.py":/app/src/prime_rl/utils/vlm.py:ro \
-      -v "$deployment/source/packages/prime-rl-configs/src/prime_rl/configs/algorithm.py":/app/packages/prime-rl-configs/src/prime_rl/configs/algorithm.py:ro \
       -v "$deployment/source/packages/prime-rl-configs/src/prime_rl/configs/trainer.py":/app/packages/prime-rl-configs/src/prime_rl/configs/trainer.py:ro \
       --env-file /data/trinity/training.env \
       -e PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,garbage_collection_threshold:0.8}" \
@@ -236,10 +235,7 @@ PY
       -v "$deployment/source/deps/renderers/renderers/client.py":/app/deps/renderers/renderers/client.py:ro \
       -v "$deployment/source/deps/verifiers/verifiers/v1/clients/eval.py":/app/deps/verifiers/verifiers/v1/clients/eval.py:ro \
       -v "$deployment/source/deps/verifiers/verifiers/v1/clients/config.py":/app/deps/verifiers/verifiers/v1/clients/config.py:ro \
-      -v "$deployment/source/packages/prime-rl-configs/src/prime_rl/configs/algorithm.py":/app/packages/prime-rl-configs/src/prime_rl/configs/algorithm.py:ro \
-      -v "$deployment/source/src/prime_rl/orchestrator/algo/__init__.py":/app/src/prime_rl/orchestrator/algo/__init__.py:ro \
       -v "$deployment/source/src/prime_rl/orchestrator/algo/grpo.py":/app/src/prime_rl/orchestrator/algo/grpo.py:ro \
-      -v "$deployment/source/src/prime_rl/orchestrator/algo/reasoning_failure_grpo.py":/app/src/prime_rl/orchestrator/algo/reasoning_failure_grpo.py:ro \
       -v "$deployment/source/src/prime_rl/orchestrator/dispatcher.py":/app/src/prime_rl/orchestrator/dispatcher.py:ro \
       -v "$deployment/source/src/prime_rl/orchestrator/orchestrator.py":/app/src/prime_rl/orchestrator/orchestrator.py:ro \
       -v "$deployment/source/src/prime_rl/orchestrator/train_sink.py":/app/src/prime_rl/orchestrator/train_sink.py:ro \

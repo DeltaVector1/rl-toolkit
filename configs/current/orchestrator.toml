@@ -1,4 +1,4 @@
-output_dir = "/data/glm52-rl/runs/muse20/run_muse20"
+output_dir = "/data/glm52-rl/runs/muse21/run_muse21"
 max_steps = 200
 seq_len = 65536
 batch_size = 1024
@@ -12,9 +12,9 @@ level = "info"
 
 [swanlab]
 project = "muse-runs"
-name = "orchestrator-muse20"
+name = "orchestrator-muse21"
 group = "muse-runs"
-tags = ["muse20", "orchestrator"]
+tags = ["muse21", "orchestrator"]
 
 [file_monitor]
 filename = "rollout-metrics.jsonl"
@@ -23,7 +23,7 @@ filename = "rollout-metrics.jsonl"
 name = "/data/muse-glimmer/model"
 
 [model.lora]
-name = "muse20-r128"
+name = "muse21-r128"
 rank = 128
 alpha = 256.0
 
@@ -69,7 +69,7 @@ extra_body = { min_tokens = 16 }
 name = "decensor"
 ratio = 1.0
 pool = { type = "static", num_workers = 16 }
-algo = { type = "reasoning_failure_grpo", failed_group_scale = 0.1, virtual_reward = 0.9 }
+algo = { type = "grpo" }
 env.taskset.id = "decensor-v1"
 env.taskset.dataset_name = "/data/glm52-rl/decensor-data/rl.jsonl"
 env.taskset.num_examples = 2000
@@ -120,8 +120,8 @@ total_timeout_seconds = 150.0
 
 [weight_broadcast]
 type = "filesystem"
-source_url = "http://127.0.0.1:18100/muse20"
-source_dir = "/data/glm52-rl/runs/muse20"
+source_url = "http://127.0.0.1:18100/muse21"
+source_dir = "/data/glm52-rl/runs/muse21"
 
 [rollout_transport]
 type = "filesystem"

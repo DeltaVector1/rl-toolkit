@@ -84,12 +84,13 @@ class RewardRulesTests(unittest.TestCase):
         self.assertEqual(result.details["response_rejected_because"], "no_reasoning")
         self.assertEqual(result.reward, 0.0)
 
-    def test_reasoning_policy_failure_is_hard_zero(self):
+    def test_reasoning_policy_discussion_uses_old_multiplier(self):
         ethics = score(
             verdicts=verdicts(reasoning_has_safety_or_policy_discussion=1)
         )
         coherence = score(verdicts=verdicts(reasoning_trace_is_clear=0))
-        self.assertEqual(ethics.reward, 0.0)
+        self.assertAlmostEqual(ethics.details["reasoning_multiplier"], 0.1)
+        self.assertGreater(ethics.reward, 0.0)
         self.assertEqual(coherence.reward, 0.0)
 
     def test_refusal_levels_map_to_the_expected_base_reward(self):
