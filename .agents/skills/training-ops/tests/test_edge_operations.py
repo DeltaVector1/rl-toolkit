@@ -404,6 +404,43 @@ class EdgeOperationsTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "directory refused"):
                     training_ops._prepare_glm_parity_stage_directory()
 
+    def test_parity_capture_directory_creates_only_exact_missing_path(self):
+        commands = []
+
+        def remote(host, command, timeout=120):
+            del host, timeout
+            commands.append(command)
+            return 0, "created\n"
+
+        with patch.object(training_ops, "_ssh", side_effect=remote):
+            self.assertEqual(
+                training_ops._prepare_glm_parity_capture_directory(), "created"
+            )
+        command = commands[0]
+        exact = training_ops.glm_parity_paths["h200_capture"]
+        self.assertIn(
+            'sudo install -d -o 1000 -g 1000 -m 0750 "$capture"', command
+        )
+        self.assertIn(f"capture={exact}", command)
+        self.assertNotIn("chmod -R", command)
+        self.assertNotIn("chown -R", command)
+
+    def test_parity_capture_directory_accepts_correct_existing_path(self):
+        with patch.object(training_ops, "_ssh", return_value=(0, "existing\n")):
+            self.assertEqual(
+                training_ops._prepare_glm_parity_capture_directory(), "existing"
+            )
+
+    def test_parity_capture_directory_refuses_bad_existing_paths(self):
+        for detail in (
+            "capture owner or mode differs: 0:0:755",
+            "capture has content but no manifest",
+            "capture path is a symlink",
+        ):
+            with patch.object(training_ops, "_ssh", return_value=(44, detail)):
+                with self.assertRaisesRegex(RuntimeError, "directory refused"):
+                    training_ops._prepare_glm_parity_capture_directory()
+
     def test_qualification_refuses_a_live_trainer(self):
         with patch.object(
             training_ops,

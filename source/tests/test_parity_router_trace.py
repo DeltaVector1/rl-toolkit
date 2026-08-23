@@ -185,6 +185,66 @@ class ParityRouterTraceTest(unittest.TestCase):
             configure_process_trace("trainer", rank=0)
             self.assertFalse(router_debug_enabled(1))
 
+    def test_h200_router_debug_waits_for_an_active_request(self):
+        torch = fake_torch()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            metadata = TraceSession(**{**session().__dict__, "side": "h200"})
+            values = FakeTensor([[0.1, 0.2, 0.3, 0.4]] * 4)
+            with (
+                patch.dict(os.environ, {trace_dir_env: str(root)}, clear=True),
+                patch.dict(sys.modules, {"torch": torch}),
+            ):
+                write_session(root, metadata)
+                configure_process_trace("h200", rank=0)
+                write_router_debug_chunk(1, values, values, values, values)
+                self.assertFalse(list(root.glob("*-router-debug.npz")))
+                mark_h200_trace_flags(trace_session_identity(metadata), "a" * 32)
+                with h200_trace_request(trace_session_identity(metadata), "a" * 32):
+                    write_router_debug_chunk(1, values, values, values, values)
+            self.assertEqual(len(list(root.glob("*-router-debug.npz"))), 1)
+
+    def test_h200_router_debug_rearms_for_a_new_session(self):
+        torch = fake_torch()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = TraceSession(**{**session().__dict__, "side": "h200"})
+            second = TraceSession(**{**first.__dict__, "fixture_sha256": "5" * 64})
+            values = FakeTensor([[0.1, 0.2, 0.3, 0.4]] * 4)
+            with (
+                patch.dict(os.environ, {trace_dir_env: str(root)}, clear=True),
+                patch.dict(sys.modules, {"torch": torch}),
+            ):
+                write_session(root, first)
+                configure_process_trace("h200", rank=0)
+                mark_h200_trace_flags(trace_session_identity(first), "b" * 32)
+                with h200_trace_request(trace_session_identity(first), "b" * 32):
+                    write_router_debug_chunk(1, values, values, values, values)
+                clear_trace(root)
+                write_session(root, second)
+                mark_h200_trace_flags(trace_session_identity(second), "c" * 32)
+                with h200_trace_request(trace_session_identity(second), "c" * 32):
+                    write_router_debug_chunk(1, values, values, values, values)
+            self.assertEqual(len(list(root.glob("*-router-debug.npz"))), 1)
+
+    def test_h200_router_debug_writes_once_per_session(self):
+        torch = fake_torch()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            metadata = TraceSession(**{**session().__dict__, "side": "h200"})
+            values = FakeTensor([[0.1, 0.2, 0.3, 0.4]] * 4)
+            with (
+                patch.dict(os.environ, {trace_dir_env: str(root)}, clear=True),
+                patch.dict(sys.modules, {"torch": torch}),
+            ):
+                write_session(root, metadata)
+                configure_process_trace("h200", rank=0)
+                mark_h200_trace_flags(trace_session_identity(metadata), "d" * 32)
+                with h200_trace_request(trace_session_identity(metadata), "d" * 32):
+                    write_router_debug_chunk(1, values, values, values, values)
+                    write_router_debug_chunk(1, values, values, values, values)
+            self.assertEqual(len(list(root.glob("*-router-debug.npz"))), 1)
+
     def test_bias_selects_and_unbiased_sigmoid_weights_score(self):
         logits = np.array([[2.0, 1.0, -1.0, -2.0]], dtype=np.float32)
         bias = np.array([-10.0, 0.0, 10.0, 0.0], dtype=np.float32)

@@ -2420,6 +2420,8 @@ def _repair_engine(host: str) -> str:
     inference_config = "" if muse_engine else glm_parity_inference_config
     start_args = "" if muse_engine else shlex.quote(inference_config)
     startup_grace = 600 if muse_engine else 180
+    if not muse_engine:
+        _prepare_glm_parity_capture_directory()
     print(
         f"{host}: removing and restarting {engine_container}. The model load needs 5 to 10 minutes."
     )
@@ -3611,6 +3613,55 @@ echo existing
     return state
 
 
+def _prepare_glm_parity_capture_directory() -> str:
+    """Prepare the exact H200 capture directory for the capture container."""
+    capture = glm_parity_paths["h200_capture"]
+    root = "/data/glm52-rl/qualifications/glm52-policy-parity"
+    capture_path = PurePosixPath(capture)
+    if capture_path.parent != PurePosixPath(root) or capture_path.name != (
+        "h200-capture-final"
+    ):
+        raise Refused("GLM parity capture path is not the exact pinned directory")
+    quoted_capture = shlex.quote(capture)
+    quoted_root = shlex.quote(root)
+    command = f"""
+set -euo pipefail
+capture={quoted_capture}
+root={quoted_root}
+test -d "$root"
+test ! -L "$root"
+test "$(realpath -e "$root")" = "$root"
+if test -L "$capture"; then
+  echo "capture path is a symlink" >&2
+  exit 41
+fi
+if ! test -e "$capture"; then
+  sudo install -d -o 1000 -g 1000 -m 0750 "$capture"
+  echo created
+  exit 0
+fi
+test -d "$capture" || {{ echo "capture path is not a directory" >&2; exit 42; }}
+identity=$(stat -c '%u:%g:%a' "$capture")
+test "$identity" = "1000:1000:750" || {{
+  echo "capture owner or mode differs: $identity" >&2
+  exit 43
+}}
+if test -n "$(find "$capture" -mindepth 1 -maxdepth 1 -print -quit)" && \
+   ! test -f "$capture/manifest.json"; then
+  echo "capture has content but no manifest" >&2
+  exit 44
+fi
+echo existing
+"""
+    code, output = _ssh(orchestrator_host, command)
+    if code:
+        raise RuntimeError(f"GLM parity capture directory refused: {output.strip()}")
+    state = output.strip()
+    if state not in {"created", "existing"}:
+        raise RuntimeError("GLM parity capture directory returned an invalid state")
+    return state
+
+
 def stage_glm52_policy_parity(nodes: list[str] | None = None) -> None:
     """Build the exact H200 parity reference and copy it to trainer nodes."""
     nodes = [_check_host(host) for host in (nodes or trainer_hosts)]
@@ -3620,6 +3671,7 @@ def stage_glm52_policy_parity(nodes: list[str] | None = None) -> None:
     qualification_root = "/data/glm52-rl/qualifications/glm52-policy-parity/"
     if not all(path.startswith(qualification_root) for path in (fixture, capture, stage)):
         raise Refused("GLM parity paths must stay under the qualification directory")
+    _prepare_glm_parity_capture_directory()
     _deploy_glm_parity_staging_sources()
     _prepare_glm_parity_stage_directory()
     quoted_stage = shlex.quote(stage)

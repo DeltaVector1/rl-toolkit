@@ -377,6 +377,7 @@ _written_files = 0
 _written_bytes = 0
 _debug_written = False
 _debug_written_bytes = 0
+_debug_written_session: str | None = None
 _owned_layers: set[int] = set()
 _provenance_written = False
 _expected_owned_layers: set[int] = set()
@@ -423,11 +424,13 @@ def configure_process_trace(
     _active_h200_session = None
     _calls.clear()
     global _written_files, _written_bytes, _debug_written, _debug_written_bytes
+    global _debug_written_session
     global _owned_layers, _provenance_written
     _written_files = 0
     _written_bytes = 0
     _debug_written = False
     _debug_written_bytes = 0
+    _debug_written_session = None
     _owned_layers = set()
     _provenance_written = False
     _runtime_calls.clear()
@@ -757,54 +760,61 @@ def write_router_debug_chunk(
     selection_scores: Any,
 ) -> None:
     """Write one bounded router diagnostic chunk for the first routed layer."""
-    global _debug_written, _debug_written_bytes
+    global _debug_written, _debug_written_bytes, _debug_written_session
     root = trace_root()
     if root is None or _process_side is None:
         return
-    session = read_session(root)
-    if layer != session.dense_layers or _debug_written:
+    if not router_debug_enabled(layer):
         return
-    limit = int(os.environ.get("PRIME_PARITY_ROUTER_DEBUG_TOKENS", "256"))
-    max_bytes = int(os.environ.get("PRIME_PARITY_ROUTER_DEBUG_MAX_BYTES", "50000000"))
-    if limit < 1 or max_bytes < 1:
-        raise ValueError("router debug limits must be positive")
-    torch = __import__("torch")
-    input_array = router_input.detach()[:limit].to(dtype=torch.float32, device="cpu").numpy()
-    logits_array = router_logits.detach()[:limit].to(dtype=torch.float32, device="cpu").numpy()
-    pre_bias_array = pre_bias_scores.detach()[:limit].to(dtype=torch.float32, device="cpu").numpy()
-    selection_array = selection_scores.detach()[:limit].to(dtype=torch.float32, device="cpu").numpy()
-    if (
-        input_array.ndim != 2
-        or logits_array.ndim != 2
-        or pre_bias_array.shape != logits_array.shape
-        or selection_array.shape != logits_array.shape
-    ):
-        raise ValueError("router debug arrays have invalid shapes")
-    if logits_array.shape[1] != session.experts:
-        raise ValueError("router debug logits have the wrong expert count")
-    if (
-        not np.isfinite(input_array).all()
-        or not np.isfinite(logits_array).all()
-        or not np.isfinite(pre_bias_array).all()
-        or not np.isfinite(selection_array).all()
-    ):
-        raise ValueError("router debug arrays contain non-finite values")
-    estimate = int(
-        input_array.nbytes
-        + logits_array.nbytes
-        + pre_bias_array.nbytes
-        + selection_array.nbytes
-        + 4096
-    )
-    if estimate > max_bytes:
-        raise ValueError("router debug byte limit exceeded")
-    filename = (
-        f"{_process_side}-rank-{_process_rank}-pp-{_process_pp_rank}-"
-        f"cp-{_process_cp_rank}-layer-{layer}-router-debug.npz"
-    )
-    path = root / filename
-    temporary = root / f".{filename}.{os.getpid()}"
+    session = read_session(root)
     with _write_lock:
+        session_identity = trace_session_identity(session)
+        if _debug_written_session != session_identity:
+            _debug_written = False
+            _debug_written_bytes = 0
+            _debug_written_session = session_identity
+        if layer != session.dense_layers or _debug_written:
+            return
+        limit = int(os.environ.get("PRIME_PARITY_ROUTER_DEBUG_TOKENS", "256"))
+        max_bytes = int(os.environ.get("PRIME_PARITY_ROUTER_DEBUG_MAX_BYTES", "50000000"))
+        if limit < 1 or max_bytes < 1:
+            raise ValueError("router debug limits must be positive")
+        torch = __import__("torch")
+        input_array = router_input.detach()[:limit].to(dtype=torch.float32, device="cpu").numpy()
+        logits_array = router_logits.detach()[:limit].to(dtype=torch.float32, device="cpu").numpy()
+        pre_bias_array = pre_bias_scores.detach()[:limit].to(dtype=torch.float32, device="cpu").numpy()
+        selection_array = selection_scores.detach()[:limit].to(dtype=torch.float32, device="cpu").numpy()
+        if (
+            input_array.ndim != 2
+            or logits_array.ndim != 2
+            or pre_bias_array.shape != logits_array.shape
+            or selection_array.shape != logits_array.shape
+        ):
+            raise ValueError("router debug arrays have invalid shapes")
+        if logits_array.shape[1] != session.experts:
+            raise ValueError("router debug logits have the wrong expert count")
+        if (
+            not np.isfinite(input_array).all()
+            or not np.isfinite(logits_array).all()
+            or not np.isfinite(pre_bias_array).all()
+            or not np.isfinite(selection_array).all()
+        ):
+            raise ValueError("router debug arrays contain non-finite values")
+        estimate = int(
+            input_array.nbytes
+            + logits_array.nbytes
+            + pre_bias_array.nbytes
+            + selection_array.nbytes
+            + 4096
+        )
+        if estimate > max_bytes:
+            raise ValueError("router debug byte limit exceeded")
+        filename = (
+            f"{_process_side}-rank-{_process_rank}-pp-{_process_pp_rank}-"
+            f"cp-{_process_cp_rank}-layer-{layer}-router-debug.npz"
+        )
+        path = root / filename
+        temporary = root / f".{filename}.{os.getpid()}"
         if path.exists():
             raise FileExistsError(f"router debug chunk already exists: {path}")
         with temporary.open("wb") as stream:
@@ -821,7 +831,11 @@ def write_router_debug_chunk(
 
 
 def router_debug_enabled(layer: int | None) -> bool:
-    return layer is not None and trace_root() is not None and _process_side is not None
+    if layer is None or trace_root() is None or _process_side is None:
+        return False
+    if _process_side == "h200":
+        return _active_h200_session is not None and _process_request is not None
+    return True
 
 
 def assemble_chunks(root: Path, session: TraceSession) -> tuple[np.ndarray, np.ndarray]:
