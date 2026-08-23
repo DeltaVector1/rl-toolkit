@@ -104,7 +104,7 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
         ).read_text()
         token_router_source = moe_source.split("class NemotronHRouter", 1)[0]
         self.assertIn('model_type", None) == "glm_moe_dsa"', model_source)
-        self.assertIn("router_param_dtype = (", model_source)
+        self.assertIn("def _glm_router_fsdp_policy", model_source)
         self.assertIn("torch.bfloat16", model_source)
         self.assertIn("use_fp32_router_output = True", model_source)
         self.assertIn(
@@ -236,6 +236,11 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
         self.assertIn('static_expert_bias = getattr(self, "_use_static_expert_bias", False)', moe_source)
         self.assertIn("if self.load_balance_coeff is not None:", moe_source)
         self.assertIn("expert_bias_is_static=static_expert_bias", moe_source)
+        self.assertIn("def _glm_router_fsdp_policy", model_source)
+        self.assertIn('"cast_forward_inputs" not in inspect.signature(MixedPrecisionPolicy).parameters', model_source)
+        self.assertIn("policy_args[\"cast_forward_inputs\"] = not frozen_glm", model_source)
+        self.assertIn("return None if frozen_glm else MixedPrecisionPolicy(**policy_args)", model_source)
+        self.assertIn("if router_policy is not None:", model_source)
 
     @unittest.skipUnless(torch is not None, "PP fingerprint validation requires PyTorch")
     def test_glm_router_bias_fingerprint_requires_all_75_routed_layers(self):

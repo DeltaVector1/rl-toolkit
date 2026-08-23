@@ -1,6 +1,7 @@
 # ruff: noqa: F722, F821
 
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -1147,6 +1148,19 @@ def setup_processor(config: ModelConfig):
     return processor
 
 
+def _glm_router_fsdp_policy(model: nn.Module, config: ModelConfig) -> MixedPrecisionPolicy | None:
+    model_type = getattr(getattr(model, "config", None), "model_type", None)
+    frozen_glm = bool(getattr(config, "freeze_moe_router", False)) and model_type == "glm_moe_dsa"
+    policy_args = {
+        "param_dtype": torch.bfloat16 if model_type == "glm_moe_dsa" else torch.float32,
+        "reduce_dtype": torch.float32,
+    }
+    if "cast_forward_inputs" not in inspect.signature(MixedPrecisionPolicy).parameters:
+        return None if frozen_glm else MixedPrecisionPolicy(**policy_args)
+    policy_args["cast_forward_inputs"] = not frozen_glm
+    return MixedPrecisionPolicy(**policy_args)
+
+
 def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
     mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=DTYPE_MAP[config.reduce_dtype])
     offload_policy: OffloadPolicy = CPUOffloadPolicy(pin_memory=True) if config.fsdp_cpu_offload else OffloadPolicy()
@@ -1225,18 +1239,15 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
                 block_mlp.experts.set_gradient_divide_factor(parallel_dims.fsdp_gradient_divide_factor)
 
         if config.moe_router_dtype == "float32" and isinstance(block_mlp, (MoE, LatentMoE)):
-            router_param_dtype = (
-                torch.bfloat16
-                if getattr(getattr(model, "config", None), "model_type", None) == "glm_moe_dsa"
-                else torch.float32
-            )
-            fully_shard(
-                block_mlp.router,
-                mesh=hsdp_mesh,
-                mp_policy=MixedPrecisionPolicy(param_dtype=router_param_dtype, reduce_dtype=torch.float32),
-                offload_policy=cold_offload_policy,
-                reshard_after_forward=fsdp_config["reshard_after_forward"],
-            )
+            router_policy = _glm_router_fsdp_policy(model, config)
+            if router_policy is not None:
+                fully_shard(
+                    block_mlp.router,
+                    mesh=hsdp_mesh,
+                    mp_policy=router_policy,
+                    offload_policy=cold_offload_policy,
+                    reshard_after_forward=fsdp_config["reshard_after_forward"],
+                )
 
         fully_shard(
             transformer_block,
