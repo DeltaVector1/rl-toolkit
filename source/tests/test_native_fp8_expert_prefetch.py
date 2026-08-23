@@ -4,6 +4,11 @@ from pathlib import Path
 
 import tomllib
 
+try:
+    import torch
+except ModuleNotFoundError:
+    torch = None
+
 ROOT = Path(__file__).resolve().parents[2]
 MODEL = ROOT / "source/src/prime_rl/trainer/model.py"
 
@@ -103,7 +108,11 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
             moe_source,
         )
         self.assertIn(
-            "torch.mm(gate_input, gate_weight.t(), out_dtype=torch.float32)",
+            "class _BF16RouterGemm",
+            moe_source,
+        )
+        self.assertIn(
+            "torch.mm(hidden_states, gate_weight.t(), out_dtype=torch.float32)",
             moe_source,
         )
         self.assertNotIn("sorted=False", token_router_source)
@@ -118,6 +127,32 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
         self.assertIn("if router_debug_active", forward_source)
         self.assertIn("raw_router_logits = scores.to", forward_source)
         self.assertIn("del raw_router_logits", forward_source)
+
+    @unittest.skipUnless(
+        torch is not None and torch.cuda.is_available(),
+        "BF16 router autograd test requires CUDA PyTorch",
+    )
+    def test_bf16_router_gemm_matches_forward_and_backward_reference(self):
+        from prime_rl.trainer.models.layers.moe import _BF16RouterGemm
+
+        device = torch.device("cuda")
+        hidden_states = torch.randn(17, 32, device=device, dtype=torch.bfloat16, requires_grad=True)
+        gate_weight = torch.randn(11, 32, device=device, dtype=torch.bfloat16)
+        actual = _BF16RouterGemm.apply(hidden_states, gate_weight)
+        reference = torch.mm(hidden_states.float(), gate_weight.float().t())
+        self.assertEqual(actual.dtype, torch.float32)
+        torch.testing.assert_close(actual, reference, rtol=0.01, atol=0.01)
+
+        output_gradient = torch.randn_like(actual)
+        (actual * output_gradient).sum().backward()
+        expected_hidden_gradient = torch.mm(
+            output_gradient, gate_weight.float()
+        ).to(torch.bfloat16)
+        self.assertTrue(torch.isfinite(hidden_states.grad).all())
+        torch.testing.assert_close(
+            hidden_states.grad, expected_hidden_gradient, rtol=0.01, atol=0.01
+        )
+        self.assertIsNone(gate_weight.grad)
 
 
 if __name__ == "__main__":

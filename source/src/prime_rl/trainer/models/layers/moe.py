@@ -579,6 +579,22 @@ def _selected_probability_mass_sum(
         return selected_prob_mass.sum(dim=-1).sum()
 
 
+class _BF16RouterGemm(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, hidden_states: torch.Tensor, gate_weight: torch.Tensor) -> torch.Tensor:
+        ctx.input_dtype = hidden_states.dtype
+        ctx.save_for_backward(gate_weight)
+        return torch.mm(hidden_states, gate_weight.t(), out_dtype=torch.float32)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        (gate_weight,) = ctx.saved_tensors
+        hidden_grad = torch.mm(
+            grad_output.to(torch.float32), gate_weight.to(torch.float32)
+        )
+        return hidden_grad.to(ctx.input_dtype), None
+
+
 class TokenChoiceTopKRouter(nn.Module):
     """This class implements token-choice routing. In token-choice top-K routing, each token is
         routed to top K experts based on the router scores.
@@ -646,9 +662,10 @@ class TokenChoiceTopKRouter(nn.Module):
             gate_weight = self.gate.weight
             if gate_weight.dtype == torch.bfloat16:
                 gate_input = x.to(torch.bfloat16)
+                scores = _BF16RouterGemm.apply(gate_input, gate_weight)
             else:
                 gate_input = x.to(gate_weight.dtype)
-            scores = torch.mm(gate_input, gate_weight.t(), out_dtype=torch.float32)
+                scores = self.gate(gate_input)
         else:
             scores = self.gate(x)
         if router_debug_active:
