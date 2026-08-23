@@ -36,6 +36,7 @@ from prime_rl.parity_router_trace import (
     validate_encoded_diagnostic_input,
     validate_diagnostic_content_length,
     validate_isolated_parity_root,
+    validate_h200_diagnostic_results,
     _capture_h200_decoder_input,
     _capture_h200_layer_boundary,
     _capture_h200_attention_boundary,
@@ -878,6 +879,44 @@ class ParityRouterTraceTest(unittest.TestCase):
                                 )
                 marker = read_h200_runtime_marker(root, metadata)
             self.assertEqual(marker["ranks"], list(range(8)))
+
+    def test_direct_diagnostic_accepts_all_tp8_results_but_writes_once(self):
+        result = {
+            "session_identity": "a" * 64,
+            "request_identity": "b" * 32,
+            "layer": 3,
+            "input_shape": [2, 6144],
+            "logits_sha256": "c" * 64,
+            "route_ids_sha256": "d" * 64,
+            "route_weights_sha256": "e" * 64,
+        }
+        self.assertEqual(validate_h200_diagnostic_results([result.copy() for _ in range(8)]), result)
+        changed = result.copy()
+        changed["route_ids_sha256"] = "f" * 64
+        with self.assertRaisesRegex(ValueError, "worker results differ"):
+            validate_h200_diagnostic_results([result] * 7 + [changed])
+
+    def test_direct_diagnostic_nonzero_worker_does_not_write(self):
+        metadata = TraceSession(**{**session().__dict__, "side": "h200"})
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = {
+                trace_dir_env: str(root),
+                "PRIME_PARITY_DIAGNOSTICS": "1",
+                "PRIME_PARITY_DIAGNOSTIC_TOKENS": "2",
+                "PRIME_PARITY_DIAGNOSTIC_MAX_FILES": "4",
+                "PRIME_PARITY_DIAGNOSTIC_MAX_BYTES": "10000000",
+            }
+            with patch.dict(os.environ, environment, clear=True), patch.dict(
+                sys.modules, {"torch": fake_torch()}
+            ):
+                configure_process_trace("h200", rank=1, world_size=8)
+                write_session(root, metadata)
+                with h200_diagnostic_request(trace_session_identity(metadata), "a" * 32):
+                    write_hidden_diagnostic(
+                        "layer3_h200_input", FakeTensor(np.ones((2, 6144), dtype=np.float32))
+                    )
+            self.assertEqual(list(root.glob("*-diagnostic-*.npz")), [])
 
     def test_h200_request_session_identity_fails_closed(self):
         with tempfile.TemporaryDirectory() as temporary:

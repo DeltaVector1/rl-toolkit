@@ -58,6 +58,19 @@ class H200ParityLauncherTest(unittest.TestCase):
         self.assertIn('max_num_batched_tokens":32769', source)
         self.assertIn('max_cudagraph_capture_size":256', source)
 
+    def test_parity_handlers_use_bounded_stream_reader(self):
+        server = (ROOT / "source/src/prime_rl/inference/vllm/server.py").read_text()
+        reset = server.split('@router.post("/parity/router-trace/reset")', 1)[1].split(
+            "@router.get(\"/parity/router-trace\")", 1
+        )[0]
+        diagnostic = server.split('@router.post("/parity/router-diagnostic")', 1)[1].split(
+            "@router.post(\"/init_broadcaster\")", 1
+        )[0]
+        self.assertNotIn("request.json()", reset)
+        self.assertNotIn("request.json()", diagnostic)
+        self.assertIn("bounded_request_body(request, 64 * 1024)", reset)
+        self.assertIn("bounded_request_body(request, 16 * 1024 * 1024)", diagnostic)
+
 
 if __name__ == "__main__":
     unittest.main()

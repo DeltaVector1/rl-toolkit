@@ -42,6 +42,7 @@ from prime_rl.parity_router_trace import (
     trace_session_identity,
     diagnostic_authorization_valid,
     validate_diagnostic_content_length,
+    validate_h200_diagnostic_results,
     validate_isolated_parity_root,
     write_session,
 )
@@ -214,7 +215,11 @@ async def reset_parity_router_trace(request: Request):
     if not bootstrap_authorized(request):
         raise HTTPException(status_code=401, detail="parity bootstrap authorization is required")
     root = isolated_parity_trace_root()
-    data = await request.json()
+    body = await bounded_request_body(request, 64 * 1024)
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError as error:
+        raise HTTPException(status_code=400, detail="router trace session is not JSON") from error
     if not isinstance(data, dict):
         raise HTTPException(status_code=400, detail="router trace session must be an object")
     try:
@@ -286,6 +291,7 @@ async def run_parity_router_diagnostic(request: Request):
         result = await engine_client(request).collective_rpc(
             "parity_router_diagnostic", args=(data,)
         )
+        result = validate_h200_diagnostic_results(result)
         return {
             "session": session.as_dict(),
             "results": result,

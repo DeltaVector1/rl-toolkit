@@ -9,6 +9,7 @@ import json
 import os
 import re
 import secrets
+import stat
 import sys
 import threading
 from contextlib import contextmanager
@@ -189,26 +190,38 @@ def trace_root() -> Path | None:
     return path
 
 
+def validated_trace_root() -> Path | None:
+    root = trace_root()
+    if root is None:
+        return None
+    configured = os.environ.get("PRIME_PARITY_QUALIFICATION_ROOT")
+    if configured:
+        return validate_isolated_parity_root(root, Path(configured))
+    return root
+
+
 def validate_isolated_parity_root(root: Path, configured: Path) -> Path:
     """Return an existing run root strictly below the qualification root."""
     if not root.is_absolute() or not configured.is_absolute():
         raise ValueError("parity roots must be absolute")
-    current = root
-    while True:
-        if current.is_symlink():
-            raise ValueError("parity trace root cannot contain symlinks")
-        if current == current.parent:
-            break
-        current = current.parent
-    current = configured
-    while True:
-        if current.is_symlink():
-            raise ValueError("parity qualification root cannot contain symlinks")
-        if current == current.parent:
-            break
-        current = current.parent
-    resolved_root = root.resolve(strict=True)
-    resolved_configured = configured.resolve(strict=True)
+    def reject_symlink_components(path: Path) -> None:
+        current = Path(path.anchor)
+        for component in path.parts[1:]:
+            current /= component
+            try:
+                mode = os.lstat(current).st_mode
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(mode):
+                raise ValueError("parity roots cannot contain symlinks")
+
+    reject_symlink_components(root)
+    reject_symlink_components(configured)
+    try:
+        resolved_root = root.resolve(strict=True)
+        resolved_configured = configured.resolve(strict=True)
+    except OSError:
+        raise
     if resolved_root == resolved_configured or resolved_configured not in resolved_root.parents:
         raise ValueError("parity trace root is outside the qualification root")
     return resolved_root
@@ -287,6 +300,22 @@ def consume_single_use_diagnostic_token(
     tokens.pop(session_identity, None)
     expiry.pop(session_identity, None)
     return True
+
+
+def validate_h200_diagnostic_results(results: Any) -> dict[str, Any]:
+    if not isinstance(results, list) or len(results) != 8 or not all(
+        isinstance(item, dict) for item in results
+    ):
+        raise ValueError("H200 diagnostic did not return one result per TP8 worker")
+    fields = ("session_identity", "request_identity", "layer", "input_shape")
+    hashes = ("logits_sha256", "route_ids_sha256", "route_weights_sha256")
+    first = results[0]
+    for item in results[1:]:
+        if any(item.get(field) != first.get(field) for field in fields + hashes):
+            raise ValueError("H200 diagnostic worker results differ")
+    if any(not isinstance(first.get(name), str) or len(first[name]) != 64 for name in hashes):
+        raise ValueError("H200 diagnostic worker hashes are invalid")
+    return first
 
 
 def _diagnostic_limit(name: str) -> int:
@@ -466,7 +495,7 @@ def clear_trace(root: Path) -> None:
 def configure_trainer_trace(
     config: Any, parallel_dims: Any, world: Any, model: Any = None
 ) -> bool:
-    root = trace_root()
+    root = validated_trace_root()
     if root is None:
         return False
     configured = os.environ.get("PRIME_PARITY_QUALIFICATION_ROOT")
@@ -561,6 +590,7 @@ _diagnostic_files = 0
 _diagnostic_bytes = 0
 _diagnostic_session: str | None = None
 _h200_diagnostic_active = False
+_h200_direct_diagnostic = False
 _diagnostic_hooks: list[Any] = []
 _write_lock = threading.Lock()
 
@@ -579,7 +609,7 @@ def configure_process_trace(
     global _process_world_size, _process_pp_size, _process_cp_size
     global _process_session, _process_request, _active_h200_session
     global _bound_root_identity, _bound_root_path
-    root = trace_root()
+    root = validated_trace_root()
     if root is None:
         return False
     if side not in {"trainer", "h200"}:
@@ -597,9 +627,6 @@ def configure_process_trace(
     _process_world_size = world_size
     _process_pp_size = pp_size
     _process_cp_size = cp_size
-    if side == "h200" and rank != 0:
-        _process_side = None
-        return False
     _process_side = side
     _process_session = None
     _process_request = None
@@ -611,7 +638,7 @@ def configure_process_trace(
     global _debug_written_session
     global _owned_layers, _provenance_written
     global _diagnostic_files, _diagnostic_bytes, _diagnostic_session
-    global _h200_diagnostic_active
+    global _h200_diagnostic_active, _h200_direct_diagnostic
     global _diagnostic_hooks
     _written_files = 0
     _written_bytes = 0
@@ -624,6 +651,7 @@ def configure_process_trace(
     _diagnostic_bytes = 0
     _diagnostic_session = None
     _h200_diagnostic_active = False
+    _h200_direct_diagnostic = False
     for handle in _diagnostic_hooks:
         handle.remove()
     _diagnostic_hooks = []
@@ -669,10 +697,12 @@ def write_hidden_diagnostic(
 ) -> None:
     """Write one bounded activation capture when explicitly enabled."""
     global _diagnostic_files, _diagnostic_bytes, _diagnostic_session
-    root = trace_root()
+    root = validated_trace_root()
     if root is None or _process_side is None or not diagnostics_enabled():
         return
     if _process_side == "h200" and _active_h200_session is None:
+        return
+    if _process_side == "h200" and _h200_direct_diagnostic and _process_rank != 0:
         return
     kind = _diagnostic_name(kind)
     entry_name = (
@@ -821,7 +851,7 @@ def run_h200_router_diagnostic(model_runner: Any, payload: dict[str, Any]) -> di
         raise ValueError("H200 parity diagnostics are disabled")
     if _process_side != "h200":
         raise ValueError("H200 router diagnostics require an H200 process")
-    root = trace_root()
+    root = validated_trace_root()
     if root is None:
         raise ValueError("H200 router diagnostics have no trace directory")
     session = read_session(root)
@@ -902,12 +932,19 @@ def run_h200_router_diagnostic(model_runner: Any, payload: dict[str, Any]) -> di
         write_hidden_diagnostic(
             f"layer{layer}_h200_route_weights", route_weights, expected_width=None
         )
+        def tensor_hash(value: Any, dtype: Any) -> str:
+            array = value.detach().to(dtype=dtype, device="cpu").contiguous().numpy()
+            return sha256_bytes(memoryview(np.ascontiguousarray(array)).cast("B"))
+
         return {
             "session_identity": session_identity,
             "source_session_identity": source_session_identity,
             "request_identity": request_identity,
             "layer": layer,
             "input_shape": list(input_array.shape),
+            "logits_sha256": tensor_hash(logits, torch.float32),
+            "route_ids_sha256": tensor_hash(route_ids, torch.int32),
+            "route_weights_sha256": tensor_hash(route_weights, torch.float32),
         }
 
 
@@ -1135,7 +1172,7 @@ def _write_lifecycle(root: Path, marker: dict[str, Any]) -> None:
 
 
 def mark_h200_trace_flags(session_identity: str, request_identity: str) -> None:
-    root = trace_root()
+    root = validated_trace_root()
     if root is None:
         raise ValueError("H200 router trace request has no trace directory")
     session = read_session(root)
@@ -1160,7 +1197,7 @@ def mark_h200_trace_flags(session_identity: str, request_identity: str) -> None:
 def _enter_h200_trace_context(
     session_identity: str, request_identity: str
 ) -> None:
-    root = trace_root()
+    root = validated_trace_root()
     if root is None:
         raise ValueError("H200 router trace request has no trace directory")
     path = _lifecycle_path(root, _process_rank)
@@ -1188,7 +1225,7 @@ def h200_trace_request(session_identity: str, request_identity: str):
         return
     if _process_side != "h200":
         raise ValueError("H200 router trace request used a non-H200 process")
-    root = trace_root()
+    root = validated_trace_root()
     if root is None:
         raise ValueError("H200 router trace request has no trace directory")
     session = read_session(root)
@@ -1215,7 +1252,8 @@ def h200_trace_request(session_identity: str, request_identity: str):
 @contextmanager
 def h200_diagnostic_request(session_identity: str, request_identity: str):
     global _process_session, _process_request, _active_h200_session
-    root = trace_root()
+    global _h200_direct_diagnostic
+    root = validated_trace_root()
     if root is None or _process_side != "h200":
         raise ValueError("H200 diagnostic requires an H200 trace process")
     session = read_session(root)
@@ -1227,11 +1265,13 @@ def h200_diagnostic_request(session_identity: str, request_identity: str):
         _process_session = session
         _process_request = request_identity
         _active_h200_session = session_identity
+        _h200_direct_diagnostic = True
     try:
         yield session
     finally:
         with _write_lock:
             _active_h200_session = None
+            _h200_direct_diagnostic = False
 
 
 def h200_trace_is_active() -> bool:
@@ -1320,7 +1360,7 @@ def write_route_chunk(
     global _process_session
     if id_source != "modular_actual":
         raise ValueError("router trace ID source is invalid")
-    root = trace_root()
+    root = validated_trace_root()
     if root is None or _process_side is None:
         return
     if _process_side == "h200" and _active_h200_session is None:
@@ -1469,7 +1509,7 @@ def write_router_debug_chunk(
 ) -> None:
     """Write one bounded router diagnostic chunk for the first routed layer."""
     global _debug_written, _debug_written_bytes, _debug_written_session
-    root = trace_root()
+    root = validated_trace_root()
     if root is None or _process_side is None:
         return
     if not router_debug_enabled(layer):
@@ -1561,7 +1601,7 @@ def write_router_debug_chunk(
 
 
 def router_debug_enabled(layer: int | None) -> bool:
-    if layer is None or trace_root() is None or _process_side is None:
+    if layer is None or validated_trace_root() is None or _process_side is None:
         return False
     if _process_side == "h200":
         return _active_h200_session is not None and _process_request is not None
@@ -1667,7 +1707,7 @@ def validate_encoded_diagnostic_input(value: dict[str, Any]) -> tuple[int, int]:
 
 
 def install_vllm_parity_trace() -> bool:
-    root = trace_root()
+    root = validated_trace_root()
     if root is None:
         return False
     from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
