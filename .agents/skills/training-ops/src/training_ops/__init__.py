@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import secrets
 import shlex
 import statistics
 import subprocess
@@ -2459,6 +2460,385 @@ def _diagnostic_capture_preflight(config_path: Path, side: str) -> dict[str, int
     return {"files": len(names), "estimated_bytes": estimated_bytes}
 
 
+def _redact_sensitive(value: str, sensitive: tuple[str, ...]) -> str:
+    redacted = value
+    for secret in sensitive:
+        if secret:
+            redacted = redacted.replace(secret, "[redacted]")
+    return redacted
+
+
+def _sensitive_ssh(
+    host: str,
+    command: str,
+    label: str,
+    sensitive: tuple[str, ...],
+    timeout: int,
+) -> str:
+    code, output = _ssh(host, command, timeout=timeout)
+    if code:
+        clean = _redact_sensitive(output.strip(), sensitive)
+        raise RuntimeError(f"{label} failed on {host}: {clean}")
+    return _redact_sensitive(output, sensitive)
+
+
+def _sensitive_ssh_input(
+    host: str,
+    command: str,
+    secret: str,
+    label: str,
+    timeout: int,
+) -> str:
+    _check_host(host)
+    try:
+        process = subprocess.run(
+            ssh_command + [host, command],
+            input=secret + "\n",
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(f"{label} timed out on {host}") from error
+    output = process.stdout if process.returncode == 0 else process.stdout + process.stderr
+    clean = _redact_sensitive(output, (secret,))
+    if process.returncode:
+        raise RuntimeError(f"{label} failed on {host}: {clean.strip()}")
+    return clean
+
+
+def _isolated_container_status(
+    host: str,
+    name: str,
+    sensitive: tuple[str, ...],
+) -> str:
+    allowed = {
+        glm_inference_container,
+        f"{glm_inference_container}-0",
+        f"{glm_inference_container}-1",
+    }
+    if name not in allowed or not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+        raise Refused("isolated container name is not exact")
+    command = f"""
+set -euo pipefail
+name={shlex.quote(name)}
+found=$(sudo docker ps -a --filter "name=^/${{name}}$" --format '{{{{.Names}}}}')
+if test -z "$found"; then echo absent; exit 0; fi
+test "$found" = "$name"
+sudo docker inspect "$name" --format '{{{{.State.Status}}}}'
+"""
+    status = _sensitive_ssh(
+        host, command, "isolated container inspection", sensitive, 60
+    ).strip()
+    if status not in {
+        "absent",
+        "created",
+        "restarting",
+        "running",
+        "removing",
+        "paused",
+        "exited",
+        "dead",
+    }:
+        raise Refused(f"isolated container {name} returned invalid status {status!r}")
+    return status
+
+
+def _require_remote_source_matches(
+    host: str,
+    relative: str,
+    sensitive: tuple[str, ...],
+) -> None:
+    local = repo_root / relative
+    remote = f"{remote_repo}/{relative}"
+    expected = _sha256_file(local, relative)
+    actual = _sensitive_ssh(
+        host,
+        f"test -f {shlex.quote(remote)} && test ! -L {shlex.quote(remote)} && "
+        f"sha256sum -- {shlex.quote(remote)} | cut -d' ' -f1",
+        f"isolated parity source {relative}",
+        sensitive,
+        60,
+    ).strip()
+    if actual != expected:
+        raise Refused(f"remote isolated parity source differs: {relative}")
+
+
+def _copy_parity_diagnostic_input(
+    source_host: str,
+    source_path: str,
+    destination_host: str,
+    destination_path: str,
+) -> None:
+    _check_parity_host(source_host)
+    _check_host(destination_host)
+    source = PurePosixPath(source_path)
+    destination = PurePosixPath(destination_path)
+    parity_root = PurePosixPath("/data/glm52-rl/qualifications/glm52-policy-parity")
+    if source.parent.parent != PurePosixPath(parity_trace_root) or not re.fullmatch(
+        r"trainer-rank-0-pp-0-cp-0-diagnostic-layer3_router_input\.npz",
+        source.name,
+    ):
+        raise Refused("trainer diagnostic input path is outside the exact trace root")
+    if destination.parent != parity_root or not destination.name.startswith(
+        ".diagnostic-input-"
+    ):
+        raise Refused("H200 diagnostic input path is outside the exact parity root")
+    with tempfile.TemporaryDirectory(prefix="glm52-parity-diagnostic-") as temporary:
+        local_input = Path(temporary) / "layer3-router-input.npz"
+        download = subprocess.run(
+            [
+                "scp",
+                "-q",
+                "-o",
+                "BatchMode=yes",
+                f"{source_host}:{source_path}",
+                str(local_input),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if download.returncode or not local_input.is_file() or local_input.is_symlink():
+            raise RuntimeError("trainer CP0 diagnostic input copy failed")
+        upload = subprocess.run(
+            [
+                "scp",
+                "-q",
+                "-o",
+                "BatchMode=yes",
+                str(local_input),
+                f"{destination_host}:{destination_path}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if upload.returncode:
+            raise RuntimeError("H200 diagnostic input copy failed")
+
+
+def diagnose_glm52_policy_parity(name: str, keep_engine: bool = False) -> dict[str, object]:
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+        raise Refused("parity diagnostic name contains unsafe characters")
+    host = orchestrator_host
+    if host != inference_hosts[0] or len(inference_hosts) != 1:
+        raise Refused("parity diagnostics require the one configured H200 host")
+    config_path = repo_root / "configs/qualification/glm52-policy-parity-h200.toml"
+    plan = _diagnostic_capture_preflight(config_path, "h200")
+    if plan["files"] == 0:
+        raise Refused("H200 parity diagnostics are not enabled")
+    root = "/data/glm52-rl/qualifications/glm52-policy-parity"
+    capture = glm_parity_paths["h200_capture"]
+    fixture = glm_parity_paths["fixture"]
+    if PurePosixPath(capture).parent != PurePosixPath(root):
+        raise Refused("H200 capture path is outside the exact parity root")
+    source_host = trainer_hosts[0]
+    source_root = f"{parity_trace_root}/{name}"
+    source_input = (
+        f"{source_root}/trainer-rank-0-pp-0-cp-0-"
+        "diagnostic-layer3_router_input.npz"
+    )
+    session_path = f"{source_root}/session.json"
+    metadata_command = (
+        f"test ! -L {shlex.quote(source_root)} && "
+        f"test \"$(realpath -e {shlex.quote(source_root)})\" = {shlex.quote(source_root)} && "
+        f"test -f {shlex.quote(source_input)} && test ! -L {shlex.quote(source_input)} && "
+        f"test -f {shlex.quote(session_path)} && test ! -L {shlex.quote(session_path)} && "
+        "python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); "
+        "print(json.dumps({\"model_revision\":s[\"model_revision\"],"
+        "\"adapter_sha256\":s[\"adapter_sha256\"]}))' "
+        f"{shlex.quote(session_path)}"
+    )
+    metadata_output = _remote_ok(
+        source_host, metadata_command, "trainer parity session", timeout=60
+    )
+    try:
+        metadata = json.loads(metadata_output.strip().splitlines()[-1])
+    except (json.JSONDecodeError, IndexError) as error:
+        raise RuntimeError("trainer parity session returned invalid JSON") from error
+    if not re.fullmatch(r"[0-9a-f]{40}", str(metadata.get("model_revision", ""))):
+        raise Refused("trainer parity model revision is invalid")
+    if not re.fullmatch(r"[0-9a-f]{64}", str(metadata.get("adapter_sha256", ""))):
+        raise Refused("trainer parity adapter checksum is invalid")
+
+    bootstrap_token = secrets.token_urlsafe(48)
+    nonce = secrets.token_hex(8)
+    sensitive = (bootstrap_token,)
+    remote_input = f"{root}/.diagnostic-input-{nonce}.npz"
+    temporary_capture = f"{root}/.h200-capture-{nonce}"
+    engine_launch_attempted = False
+    succeeded = False
+    operation_error: BaseException | None = None
+    try:
+        root_command = (
+            f"test -d {shlex.quote(root)} && test ! -L {shlex.quote(root)} && "
+            f"test \"$(realpath -e {shlex.quote(root)})\" = {shlex.quote(root)}"
+        )
+        _sensitive_ssh(
+            host, root_command, "isolated parity root and config", sensitive, 60
+        )
+        for relative in (
+            "configs/qualification/glm52-policy-parity-h200.toml",
+            "scripts/h200/start_inference.sh",
+            "scripts/glm52_policy_parity.py",
+            "source/src/prime_rl/inference/vllm/server.py",
+            "source/src/prime_rl/parity_router_trace.py",
+        ):
+            _require_remote_source_matches(host, relative, sensitive)
+
+        for related_name in (
+            f"{glm_inference_container}-0",
+            f"{glm_inference_container}-1",
+        ):
+            related_status = _isolated_container_status(host, related_name, sensitive)
+            if related_status != "absent":
+                raise Refused(
+                    f"related isolated container {related_name} is {related_status!r}; expected absent"
+                )
+        status = _isolated_container_status(host, glm_inference_container, sensitive)
+        if status == "exited":
+            _sensitive_ssh(
+                host,
+                f"sudo docker rm {shlex.quote(glm_inference_container)} >/dev/null",
+                "exited isolated container removal",
+                sensitive,
+                60,
+            )
+        elif status != "absent":
+            raise Refused(f"isolated parity container status is {status!r}, expected absent or exited")
+
+        _copy_parity_diagnostic_input(source_host, source_input, host, remote_input)
+
+        start_command = (
+            "IFS= read -r PRIME_PARITY_BOOTSTRAP_TOKEN; "
+            "export PRIME_PARITY_BOOTSTRAP_TOKEN; "
+            "env "
+            f"prime_deployment={shlex.quote(remote_repo)} "
+            f"prime_image={shlex.quote(inference_image)} "
+            f"prime_model_volume={shlex.quote(glm_model_volume)} "
+            f"prime_inference_container={shlex.quote(glm_inference_container)} "
+            "prime_require_absent=1 "
+            f"bash {shlex.quote(remote_repo + '/scripts/h200/start_inference.sh')} "
+            f"{shlex.quote(glm_parity_inference_config)}"
+        )
+        engine_launch_attempted = True
+        _sensitive_ssh_input(
+            host,
+            start_command,
+            bootstrap_token,
+            "isolated parity engine start",
+            180,
+        )
+        _h200_parity_container_preflight(host)
+        startup_grace = _configured_h200_engine_startup_grace()
+        ready_command = (
+            f"deadline=$((SECONDS+{startup_grace})); "
+            "until curl -fsS --max-time 5 http://127.0.0.1:8000/liveness >/dev/null; do "
+            "test $SECONDS -lt $deadline || exit 124; sleep 5; done"
+        )
+        _sensitive_ssh(host, ready_command, "isolated parity engine readiness", sensitive, startup_grace + 30)
+        capture_command = (
+            "IFS= read -r PRIME_PARITY_BOOTSTRAP_TOKEN; "
+            "sudo docker run --rm --network host -v /data:/data "
+            f"-v {shlex.quote(remote_repo)}:/workspace:ro -w /workspace "
+            '-e PRIME_PARITY_BOOTSTRAP_TOKEN="$PRIME_PARITY_BOOTSTRAP_TOKEN" '
+            f"--entrypoint /app/.venv/bin/python {shlex.quote(inference_image)} "
+            f"scripts/glm52_policy_parity.py --profile {shlex.quote(production_parity_profile)} "
+            f"capture-h200 --fixture {shlex.quote(fixture)} "
+            "--base-url http://127.0.0.1:8000 "
+            f"--model {shlex.quote(glm_model)} "
+            f"--model-revision {shlex.quote(metadata['model_revision'])} "
+            f"--adapter-sha256 {shlex.quote(metadata['adapter_sha256'])} "
+            f"--image {shlex.quote(inference_image)} "
+            f"--diagnostic-input {shlex.quote(remote_input)} "
+            f"{shlex.quote(temporary_capture)}"
+        )
+        _sensitive_ssh_input(
+            host,
+            capture_command,
+            bootstrap_token,
+            "H200 parity capture and replay",
+            3600,
+        )
+        publish_command = f"""
+set -euo pipefail
+root={shlex.quote(root)}
+capture={shlex.quote(capture)}
+candidate={shlex.quote(temporary_capture)}
+test ! -L "$root"
+test "$(realpath -e "$root")" = "$root"
+test -f "$candidate/manifest.json"
+python3 -c 'import hashlib,json,pathlib,sys
+p=pathlib.Path(sys.argv[1]); m=json.loads((p/"manifest.json").read_text())
+assert m.get("kind")=="glm52_policy_parity_h200_capture"
+assert m.get("direct_router_diagnostic") is not None
+for e in m.get("arrays",{{}}).values():
+ f=p/e["file"]; assert f.is_file() and not f.is_symlink()
+ assert hashlib.sha256(f.read_bytes()).hexdigest()==e["sha256"]' "$candidate"
+previous="$root/.h200-capture-previous-{nonce}"
+test ! -e "$previous"
+restore_previous() {{
+  if test -e "$previous" && ! test -e "$capture"; then mv "$previous" "$capture"; fi
+}}
+trap restore_previous EXIT
+if test -e "$capture"; then mv "$capture" "$previous"; fi
+mv "$candidate" "$capture"
+if test -e "$previous"; then rm -rf -- "$previous"; fi
+trap - EXIT
+"""
+        _sensitive_ssh(host, publish_command, "H200 parity capture publish", sensitive, 300)
+        succeeded = True
+        return {"capture": capture, "diagnostic_plan": plan, "engine_kept": keep_engine}
+    except BaseException as error:
+        operation_error = error
+        raise
+    finally:
+        cleanup_failures = []
+        cleanup = (
+            f"rm -f -- {shlex.quote(remote_input)}; "
+            f"if test -d {shlex.quote(temporary_capture)}; then "
+            f"rm -rf -- {shlex.quote(temporary_capture)}; fi; "
+            f"test ! -e {shlex.quote(remote_input)}; "
+            f"test ! -e {shlex.quote(temporary_capture)}"
+        )
+        cleanup_code, cleanup_output = _ssh(host, cleanup, timeout=120)
+        if cleanup_code:
+            cleanup_failures.append(
+                "temporary parity artifact cleanup failed: "
+                + _redact_sensitive(cleanup_output.strip(), sensitive)
+            )
+        if engine_launch_attempted and (not keep_engine or not succeeded):
+            container_cleanup = f"""
+set -euo pipefail
+name={shlex.quote(glm_inference_container)}
+found=$(sudo docker ps -a --filter "name=^/${{name}}$" --format '{{{{.Names}}}}')
+if test -n "$found"; then
+  test "$found" = "$name"
+  sudo docker rm -f "$name" >/dev/null
+fi
+test -z "$(sudo docker ps -a --filter "name=^/${{name}}$" --format '{{{{.Names}}}}')"
+"""
+            container_code, container_output = _ssh(
+                host,
+                container_cleanup,
+                timeout=180,
+            )
+            if container_code:
+                cleanup_failures.append(
+                    "isolated parity container cleanup failed: "
+                    + _redact_sensitive(container_output.strip(), sensitive)
+                )
+        bootstrap_token = ""
+        sensitive = ()
+        if cleanup_failures:
+            detail = "; ".join(cleanup_failures)
+            if operation_error is not None:
+                operation_error.add_note(detail)
+            else:
+                raise RuntimeError(detail)
+
+
 def _repair_engine(host: str) -> str:
     _check_host(host)
     if host not in inference_hosts:
@@ -4292,6 +4672,21 @@ def _archive_action(arguments: list[str]):
     return archive_adapters(arguments[0], steps_to_archive or None, finished=finished)
 
 
+def _diagnose_glm52_parity_action(arguments: list[str]):
+    keep_engine = False
+    names = []
+    for argument in arguments:
+        if argument == "--keep-engine":
+            keep_engine = True
+        elif argument.startswith("--"):
+            raise Refused(f"unknown GLM parity diagnostic option {argument}")
+        else:
+            names.append(argument)
+    if len(names) != 1:
+        raise Refused("diagnose-glm52-parity needs exactly one trace run name")
+    return diagnose_glm52_policy_parity(names[0], keep_engine=keep_engine)
+
+
 actions = {
     "status": lambda a: status(*a),
     "acceptance": lambda a: acceptance(*a),
@@ -4311,6 +4706,7 @@ actions = {
     "qualify": lambda a: qualify(*a),
     "stage-glm52-parity": lambda a: stage_glm52_policy_parity(a or None),
     "collect-glm52-parity": lambda a: collect_glm52_policy_parity(a[0] if a else ""),
+    "diagnose-glm52-parity": _diagnose_glm52_parity_action,
     "stop-legacy-qualification": lambda a: stop_legacy_qualification(*a),
     "stop": lambda a: stop(),
     "mounts": lambda a: print("\n".join(mounted_files())),
@@ -4345,6 +4741,8 @@ usage = f"""training-ops <action> [args]
                                 add --finished after another run is active
   qualify <profile>             start a trainer-only profile
   stage-glm52-parity [node ...] validate and stage the exact parity reference
+  diagnose-glm52-parity <run>  capture H200 parity and replay trainer layer 3
+                                add --keep-engine to retain a successful engine
   stop-legacy-qualification <output-path>
                                 stop a verified legacy qualification
   mounts                        list live-mounted source files

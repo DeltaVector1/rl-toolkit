@@ -58,6 +58,11 @@ class H200ParityLauncherTest(unittest.TestCase):
         self.assertIn('max_num_batched_tokens":32769', source)
         self.assertIn('max_cudagraph_capture_size":256', source)
 
+    def test_isolated_operation_can_require_all_container_names_absent(self):
+        source = START.read_text()
+        self.assertIn("prime_require_absent", source)
+        self.assertIn("refusing to replace an existing isolated container", source)
+
     def test_parity_handlers_use_bounded_stream_reader(self):
         server = (ROOT / "source/src/prime_rl/inference/vllm/server.py").read_text()
         reset = server.split('@router.post("/parity/router-trace/reset")', 1)[1].split(

@@ -660,6 +660,7 @@ def capture_h200(
     image: str,
     api_key_env: str | None,
     bootstrap_token_env: str,
+    diagnostic_input: Path | None,
     timeout: float,
 ) -> dict[str, Any]:
     fixture_manifest = load_manifest(fixture, "glm52_policy_parity_fixture")
@@ -812,6 +813,22 @@ def capture_h200(
             "graph and eager scoring failed the existing parity limits: "
             + json.dumps(graph_eager_guard, sort_keys=True)
         )
+    direct_router_diagnostic = None
+    if diagnostic_input is not None:
+        diagnostic_token = reset.get("diagnostic_token") if isinstance(reset, dict) else None
+        if not isinstance(diagnostic_token, str) or not diagnostic_token:
+            raise ValueError("H200 reset did not issue a diagnostic token")
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as session_file:
+            json.dump(trace_session, session_file)
+            session_file.flush()
+            direct_router_diagnostic = run_h200_router_diagnostic(
+                diagnostic_input,
+                Path(session_file.name),
+                base_url,
+                trace_session["dense_layers"],
+                diagnostic_token,
+                min(timeout, 300.0),
+            )
     output.mkdir(parents=True, exist_ok=False)
     arrays = {
         "full_logprobs": graph_full_logprobs,
@@ -849,6 +866,7 @@ def capture_h200(
         "router_weight_provenance": "selected_weights_before_route_output_scale",
         "graph_eager_guard": graph_eager_guard,
         "router_runtime_marker": runtime_marker,
+        "direct_router_diagnostic": direct_router_diagnostic,
         "phases": {
             "graph": {
                 "fixture_sha256": fixture_digest(fixture),
@@ -1624,6 +1642,7 @@ def parser() -> argparse.ArgumentParser:
     h200.add_argument("--image", required=True)
     h200.add_argument("--api-key-env")
     h200.add_argument("--bootstrap-token-env", default="PRIME_PARITY_BOOTSTRAP_TOKEN")
+    h200.add_argument("--diagnostic-input", type=Path)
     h200.add_argument("--timeout", type=float, default=1800.0)
     h200.add_argument("output", type=Path)
     diagnostic = commands.add_parser("diagnose-h200")
@@ -1701,6 +1720,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.image,
                 args.api_key_env,
                 args.bootstrap_token_env,
+                args.diagnostic_input,
                 args.timeout,
             )
         elif args.command == "diagnose-h200":

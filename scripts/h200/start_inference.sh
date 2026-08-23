@@ -27,6 +27,11 @@ image=${prime_image:-prime-rl:glm52-v080-full}
 model_volume=${prime_model_volume:-glm52-fp8-model}
 adapter_ports=${prime_adapter_ports:-18100}
 engine_container=${prime_inference_container:-glm52-optims-h200}
+require_absent=${prime_require_absent:-0}
+if [[ "$require_absent" != "0" && "$require_absent" != "1" ]]; then
+  echo "refusing invalid existing-container policy" >&2
+  exit 2
+fi
 overlay_root="$deployment/cache/vllm/flashmla512-selected-v4"
 overlay_preflight="$deployment/scripts/h200/flashmla_overlay_preflight.py"
 if [[ ! -f "$overlay_preflight" ]]; then
@@ -50,6 +55,10 @@ install -d -o 1000 -g 1000 -m 0755 /data/glm52-rl/lora-cache
 install -d -o 1000 -g 1000 -m 0755 "$deployment/cache/vllm"
 for stale_container in "$engine_container" "$engine_container-0" "$engine_container-1"; do
   if docker inspect "$stale_container" >/dev/null 2>&1; then
+    if [[ "$require_absent" == "1" ]]; then
+      echo "refusing to replace an existing isolated container: $stale_container" >&2
+      exit 2
+    fi
     docker update --restart=no "$stale_container" >/dev/null 2>&1 || {
       echo "refusing to remove stale container with failed restart-policy update: $stale_container" >&2
       exit 2

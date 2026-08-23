@@ -10,6 +10,8 @@ from unittest.mock import patch
 
 import numpy as np
 from scripts.glm52_policy_parity import (
+    Profile,
+    capture_h200,
     validate_diagnostic_file,
     validate_diagnostic_source,
 )
@@ -282,6 +284,125 @@ class ParityRouterTraceTest(unittest.TestCase):
         self.assertFalse(
             consume_single_use_diagnostic_token(tokens, expiry, "session", "Bearer secret", 11.0)
         )
+
+    def test_h200_capture_uses_reset_token_for_direct_replay_without_saving_it(self):
+        import scripts.glm52_policy_parity as parity_script
+
+        route_ids = np.asarray(
+            [[[0, 0], [1, 2]], [[0, 0], [2, 3]]], dtype=np.uint8
+        )
+        route_weights = np.asarray(
+            [[[0.0, 0.0], [0.5, 0.5]], [[0.0, 0.0], [0.5, 0.5]]],
+            dtype=np.float32,
+        )
+        encoded_ids = {
+            "data": base64.b64encode(route_ids.tobytes()).decode(),
+            "dtype": route_ids.dtype.name,
+            "shape": list(route_ids.shape),
+            "start": 0,
+        }
+        encoded_weights = {
+            "data": base64.b64encode(route_weights.tobytes()).decode(),
+            "dtype": route_weights.dtype.name,
+            "shape": list(route_weights.shape),
+        }
+        active_session = {}
+        generate_count = 0
+
+        def request(url, body, api_key, timeout):
+            nonlocal generate_count
+            del timeout
+            if url.endswith("/v1/models"):
+                return {"data": [{"id": "model", "max_model_len": 3}]}
+            if url.endswith("/parity/router-trace/reset"):
+                self.assertEqual(api_key, "bootstrap-secret")
+                active_session.update(body)
+                return {"session": body, "diagnostic_token": "one-use-secret"}
+            if url.endswith("/inference/v1/generate"):
+                generate_count += 1
+                result = {"request_id": f"request-{generate_count}"}
+                if generate_count == 2:
+                    result["choices"] = [{"routed_experts": encoded_ids}]
+                return result
+            if url.endswith("/parity/router-trace"):
+                return {
+                    "session": active_session,
+                    "runtime_marker": {"request_identity": "trace-request"},
+                    "router_ids": encoded_ids,
+                    "router_weights": encoded_weights,
+                }
+            raise AssertionError(url)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            profile_path = root / "profile.toml"
+            profile_path.write_text("test = true\n")
+            profile = Profile(
+                profile_path,
+                {
+                    "h200_scoring_context_length": 3,
+                    "context_length": 2,
+                    "hidden_layers": 2,
+                    "dense_layers": 1,
+                    "experts_per_token": 2,
+                    "experts": 4,
+                    "router_scale": 2.5,
+                    "max_router_weight_sum_error": 0.01,
+                    "max_output_length": 1,
+                },
+            )
+            arrays = {
+                "token_ids": np.asarray([1, 2], dtype=np.int64),
+                "selected_indices": np.asarray([1], dtype=np.int64),
+                "advantages": np.asarray([1.0], dtype=np.float32),
+            }
+            output = root / "output"
+            with patch.dict(
+                os.environ,
+                {"PRIME_PARITY_BOOTSTRAP_TOKEN": "bootstrap-secret"},
+                clear=True,
+            ), patch.object(
+                parity_script, "load_manifest", return_value={"seed": 1}
+            ), patch.object(
+                parity_script, "check_fresh"
+            ), patch.object(
+                parity_script, "fixture_digest", return_value="fixture-sha"
+            ), patch.object(
+                parity_script, "load_array", side_effect=lambda fixture, manifest, name: arrays[name]
+            ), patch.object(
+                parity_script, "request_json", side_effect=request
+            ), patch.object(
+                parity_script, "prompt_logprobs", return_value=np.asarray([0.0, -0.2])
+            ), patch.object(
+                parity_script, "graph_sampling_params", return_value={}
+            ), patch.object(
+                parity_script,
+                "trace_sampling_params",
+                return_value={"extra_args": {"prime_router_trace_request": "trace-request"}},
+            ), patch.object(
+                parity_script, "inference_path_metrics", return_value={"passed": True}
+            ), patch.object(
+                parity_script,
+                "run_h200_router_diagnostic",
+                return_value={"passed": True},
+            ) as replay:
+                manifest = capture_h200(
+                    profile,
+                    root / "fixture",
+                    output,
+                    "http://h200",
+                    "model",
+                    "a" * 40,
+                    "b" * 64,
+                    "image",
+                    None,
+                    "PRIME_PARITY_BOOTSTRAP_TOKEN",
+                    root / "input.npz",
+                    30.0,
+                )
+        self.assertEqual(replay.call_args.args[4], "one-use-secret")
+        self.assertEqual(manifest["direct_router_diagnostic"], {"passed": True})
+        self.assertNotIn("one-use-secret", json.dumps(manifest, sort_keys=True))
 
     def test_router_owner_gate_tuple_and_bias_are_checked(self):
         class Gate:
