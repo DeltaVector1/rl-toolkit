@@ -2414,6 +2414,51 @@ def _h200_parity_container_preflight(host: str) -> dict[str, object]:
     return result
 
 
+def _diagnostic_capture_preflight(config_path: Path, side: str) -> dict[str, int]:
+    if side not in {"trainer", "h200"}:
+        raise Refused("diagnostic capture side is invalid")
+    with config_path.open("rb") as stream:
+        config = tomllib.load(stream)
+    env = config.get("env_vars", {})
+    if env.get("PRIME_PARITY_DIAGNOSTICS") != "1":
+        return {"files": 0, "estimated_bytes": 0}
+    names = ["embedding"]
+    for layer in range(3):
+        names.extend(
+            (
+                f"layer{layer}_input",
+                f"layer{layer}_attention_raw",
+                f"layer{layer}_mlp_raw",
+                f"layer{layer}_output",
+            )
+        )
+    names.append("layer3_router_input")
+    widths = [6144] * len(names)
+    if side == "h200":
+        extra = {
+            "layer3_h200_input": 6144,
+            "layer3_h200_logits": 256,
+            "layer3_h200_scores": 256,
+            "layer3_h200_selection_scores": 256,
+            "layer3_h200_route_ids": 8,
+            "layer3_h200_route_weights": 8,
+        }
+        names.extend(extra)
+        widths.extend(extra.values())
+    if len(names) != len(set(names)):
+        raise Refused("diagnostic capture plan contains duplicate semantic files")
+    try:
+        tokens = int(env["PRIME_PARITY_DIAGNOSTIC_TOKENS"])
+        max_files = int(env["PRIME_PARITY_DIAGNOSTIC_MAX_FILES"])
+        max_bytes = int(env["PRIME_PARITY_DIAGNOSTIC_MAX_BYTES"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise Refused("diagnostic capture limits are invalid") from error
+    estimated_bytes = sum(tokens * width * 4 + 64 * 1024 for width in widths)
+    if len(names) > max_files or estimated_bytes > max_bytes:
+        raise Refused("diagnostic capture plan exceeds its configured cap")
+    return {"files": len(names), "estimated_bytes": estimated_bytes}
+
+
 def _repair_engine(host: str) -> str:
     _check_host(host)
     if host not in inference_hosts:
@@ -2432,6 +2477,10 @@ def _repair_engine(host: str) -> str:
         600 if muse_engine else _configured_h200_engine_startup_grace()
     )
     if not muse_engine:
+        _diagnostic_capture_preflight(
+            repo_root / "configs/qualification/glm52-policy-parity-h200.toml",
+            "h200",
+        )
         _prepare_glm_parity_capture_directory()
     print(
         f"{host}: removing and restarting {engine_container}. The model load needs 5 to 10 minutes."
@@ -3418,6 +3467,8 @@ def qualify(
         raise Refused(f"missing qualification config {relative_config}")
     with local_config.open("rb") as stream:
         config = tomllib.load(stream)
+    if relative_config == "configs/qualification/glm52-policy-parity-trainer.toml":
+        _diagnostic_capture_preflight(local_config, "trainer")
     if "fake" not in config.get("data", {}):
         raise Refused(
             f"{relative_config} has no [data.fake]; use start() for an RL run"

@@ -578,6 +578,13 @@ def validate_diagnostic_file(path: Path) -> None:
                 raise ValueError("diagnostic values must be 1..256x6144 float32")
 
 
+def validate_diagnostic_source(name: str, layer: int) -> None:
+    if not re.fullmatch(
+        rf"layer{layer}_router_input-rank-[0-9]+-pp-[0-9]+-cp-0", name
+    ):
+        raise ValueError("direct router replay requires the CP0 layer router input")
+
+
 def run_h200_router_diagnostic(
     input_path: Path,
     session_path: Path,
@@ -589,10 +596,11 @@ def run_h200_router_diagnostic(
     """Send one bounded trainer activation to the H200 router worker."""
     validate_diagnostic_file(input_path)
     with np.load(input_path, allow_pickle=False) as values:
-        if "values" not in values or "session_identity" not in values:
-            raise ValueError("diagnostic input must contain values and session identity")
+        if not {"values", "session_identity", "name"}.issubset(values.files):
+            raise ValueError("diagnostic input must contain values, name, and session identity")
         input_array = np.ascontiguousarray(values["values"])
         session_identity = str(values["session_identity"].item())
+        source_name = str(values["name"].item())
         source_dtype = str(values.get("source_dtype", ""))
         provenance = {
             name: str(values[name].item())
@@ -611,6 +619,7 @@ def run_h200_router_diagnostic(
         or input_array.shape[1] != 6144
     ):
         raise ValueError("diagnostic input must be at most 256x6144 float32 values")
+    validate_diagnostic_source(source_name, layer)
     session = json.loads(session_path.read_text())
     if session.get("side") != "h200":
         raise ValueError("diagnostic session must be an H200 session")

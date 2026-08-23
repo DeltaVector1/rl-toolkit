@@ -40,6 +40,7 @@ diagnostic_max_files_env = "PRIME_PARITY_DIAGNOSTIC_MAX_FILES"
 diagnostic_max_bytes_env = "PRIME_PARITY_DIAGNOSTIC_MAX_BYTES"
 diagnostic_hidden_width = 6144
 diagnostic_max_request_bytes = 16 * 1024 * 1024
+diagnostic_npz_overhead_bytes = 64 * 1024
 parity_model_modules = (
     "prime_rl.trainer.model",
     "prime_rl.trainer.lora",
@@ -338,6 +339,51 @@ def diagnostic_limits() -> dict[str, int]:
     }
 
 
+def diagnostic_capture_preflight(session: TraceSession, side: str) -> dict[str, Any]:
+    if side not in {"trainer", "h200"}:
+        raise ValueError("diagnostic capture side is invalid")
+    limits = diagnostic_limits()
+    hidden_names = ["embedding"]
+    for layer in range(session.dense_layers):
+        hidden_names.extend(
+            (
+                f"layer{layer}_input",
+                f"layer{layer}_attention_raw",
+                f"layer{layer}_mlp_raw",
+                f"layer{layer}_output",
+            )
+        )
+    hidden_names.append(f"layer{session.dense_layers}_router_input")
+    plan = [(name, diagnostic_hidden_width) for name in hidden_names]
+    if side == "h200":
+        plan.extend(
+            (
+                (f"layer{session.dense_layers}_h200_input", diagnostic_hidden_width),
+                (f"layer{session.dense_layers}_h200_logits", session.experts),
+                (f"layer{session.dense_layers}_h200_scores", session.experts),
+                (f"layer{session.dense_layers}_h200_selection_scores", session.experts),
+                (f"layer{session.dense_layers}_h200_route_ids", session.topk),
+                (f"layer{session.dense_layers}_h200_route_weights", session.topk),
+            )
+        )
+    names = [name for name, _width in plan]
+    if len(names) != len(set(names)):
+        raise ValueError("diagnostic capture plan contains duplicate semantic files")
+    estimated_bytes = sum(
+        limits["tokens"] * width * np.dtype(np.float32).itemsize
+        + diagnostic_npz_overhead_bytes
+        for _name, width in plan
+    )
+    if len(plan) > limits["max_files"] or estimated_bytes > limits["max_bytes"]:
+        raise ValueError("diagnostic capture plan exceeds the configured file or byte cap")
+    return {
+        "side": side,
+        "files": len(plan),
+        "estimated_bytes": estimated_bytes,
+        "names": sorted(names),
+    }
+
+
 def _diagnostic_name(kind: str) -> str:
     if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", kind):
         raise ValueError("diagnostic name is invalid")
@@ -557,8 +603,9 @@ def configure_trainer_trace(
         global _expected_owned_layers
         _expected_owned_layers = expected_owned_layers
         if diagnostics_enabled():
-            diagnostic_limits()
-            configure_hidden_diagnostics(language_model)
+            diagnostic_capture_preflight(session, "trainer")
+            if cp_rank == 0:
+                configure_hidden_diagnostics(language_model, layer_start, layer_end)
     return configured
 
 
@@ -686,7 +733,7 @@ def _diagnostic_tensor_metadata(
     if token_count < 1:
         raise ValueError("diagnostic tensor has no tokens")
     source_dtype = str(getattr(tensor, "dtype", "unknown"))
-    estimated_bytes = token_count * shape[-1] * 4 + 1024 * 1024
+    estimated_bytes = token_count * shape[-1] * 4 + diagnostic_npz_overhead_bytes
     return token_count, source_dtype, estimated_bytes
 
 
@@ -697,6 +744,8 @@ def write_hidden_diagnostic(
     global _diagnostic_files, _diagnostic_bytes, _diagnostic_session
     root = validated_trace_root()
     if root is None or _process_side is None or not diagnostics_enabled():
+        return
+    if _process_side == "trainer" and _process_cp_rank != 0:
         return
     if _process_side == "h200" and _active_h200_session is None:
         return
@@ -995,7 +1044,9 @@ def _capture_trainer_decoder_input(_module: Any, inputs: Any, layer: int) -> Non
     write_hidden_diagnostic(f"layer{layer}_input", inputs[0])
 
 
-def configure_hidden_diagnostics(language_model: Any) -> None:
+def configure_hidden_diagnostics(
+    language_model: Any, layer_start: int, layer_end: int
+) -> None:
     """Install bounded hooks for the first dense layers of the local PP stage."""
     if not diagnostics_enabled():
         return
@@ -1006,14 +1057,14 @@ def configure_hidden_diagnostics(language_model: Any) -> None:
     if layers is None:
         raise ValueError("parity diagnostics cannot find model layers")
     embed = getattr(root_model, "embed_tokens", None)
-    if embed is not None:
+    if embed is not None and layer_start <= 0 < layer_end:
         _diagnostic_hooks.append(
             embed.register_forward_hook(_capture_embedding)
         )
     items = layers.items() if hasattr(layers, "items") else enumerate(layers)
     for raw_layer, layer in items:
-        layer_number = int(raw_layer)
-        if layer_number > 2:
+        layer_number = int(getattr(layer, "layer_idx", raw_layer))
+        if layer_number < layer_start or layer_number >= layer_end or layer_number > 2:
             continue
         attention = getattr(layer, "self_attn", None)
         if attention is not None:
@@ -1508,6 +1559,8 @@ def write_router_debug_chunk(
     global _debug_written, _debug_written_bytes, _debug_written_session
     root = validated_trace_root()
     if root is None or _process_side is None:
+        return
+    if _process_side == "trainer" and _process_cp_rank != 0:
         return
     if not router_debug_enabled(layer):
         return

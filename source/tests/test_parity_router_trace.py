@@ -9,13 +9,17 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
-from scripts.glm52_policy_parity import validate_diagnostic_file
+from scripts.glm52_policy_parity import (
+    validate_diagnostic_file,
+    validate_diagnostic_source,
+)
 
 from prime_rl.parity_router_trace import (
     TraceSession,
     assemble_chunks,
     clear_trace,
     configure_process_trace,
+    configure_hidden_diagnostics,
     h200_trace_request,
     h200_diagnostic_request,
     install_vllm_parity_trace,
@@ -32,6 +36,7 @@ from prime_rl.parity_router_trace import (
     write_hidden_diagnostic,
     run_h200_router_diagnostic,
     diagnostic_authorization_valid,
+    diagnostic_capture_preflight,
     consume_single_use_diagnostic_token,
     validate_encoded_diagnostic_input,
     validate_diagnostic_content_length,
@@ -134,6 +139,61 @@ def session() -> TraceSession:
 
 
 class ParityRouterTraceTest(unittest.TestCase):
+    def test_glm_diagnostic_plan_fits_existing_caps(self):
+        metadata = TraceSession(
+            **{
+                **session().__dict__,
+                "hidden_layers": 78,
+                "dense_layers": 3,
+                "experts": 256,
+                "topk": 8,
+            }
+        )
+        environment = {
+            "PRIME_PARITY_DIAGNOSTICS": "1",
+            "PRIME_PARITY_DIAGNOSTIC_TOKENS": "256",
+            "PRIME_PARITY_DIAGNOSTIC_MAX_FILES": "64",
+            "PRIME_PARITY_DIAGNOSTIC_MAX_BYTES": "100000000",
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            trainer = diagnostic_capture_preflight(metadata, "trainer")
+            h200 = diagnostic_capture_preflight(metadata, "h200")
+        self.assertEqual(trainer["files"], 14)
+        self.assertEqual(trainer["estimated_bytes"], 88_997_888)
+        self.assertEqual(h200["files"], 20)
+        self.assertEqual(h200["estimated_bytes"], 96_485_376)
+        self.assertEqual(len(h200["names"]), len(set(h200["names"])))
+
+    def test_diagnostic_plan_refuses_existing_cap_overflow(self):
+        metadata = TraceSession(
+            **{
+                **session().__dict__,
+                "hidden_layers": 78,
+                "dense_layers": 3,
+                "experts": 256,
+                "topk": 8,
+            }
+        )
+        environment = {
+            "PRIME_PARITY_DIAGNOSTICS": "1",
+            "PRIME_PARITY_DIAGNOSTIC_TOKENS": "256",
+            "PRIME_PARITY_DIAGNOSTIC_MAX_FILES": "64",
+            "PRIME_PARITY_DIAGNOSTIC_MAX_BYTES": "96485375",
+        }
+        with patch.dict(os.environ, environment, clear=True), self.assertRaisesRegex(
+            ValueError, "exceeds"
+        ):
+            diagnostic_capture_preflight(metadata, "h200")
+
+    def test_direct_router_replay_requires_cp_zero_layer_input(self):
+        validate_diagnostic_source("layer3_router_input-rank-0-pp-0-cp-0", 3)
+        for name in (
+            "layer3_router_input-rank-1-pp-0-cp-1",
+            "layer2_router_input-rank-0-pp-0-cp-0",
+        ):
+            with self.assertRaisesRegex(ValueError, "CP0"):
+                validate_diagnostic_source(name, 3)
+
     def test_hidden_diagnostics_are_off_by_default(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertFalse(diagnostics_enabled())
@@ -305,6 +365,70 @@ class ParityRouterTraceTest(unittest.TestCase):
                 write_route_chunk(1, ids, weights, route_output_scale=2.5)
                 with self.assertRaisesRegex(ValueError, "limit exceeded"):
                     write_route_chunk(1, ids, weights, route_output_scale=2.5)
+
+    def test_cp_nonzero_skips_hidden_debug_but_keeps_route_trace(self):
+        torch = fake_torch()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            metadata = session()
+            environment = {
+                trace_dir_env: str(root),
+                "PRIME_PARITY_TRACE_MAX_CALLS": "4",
+                "PRIME_PARITY_TRACE_MAX_FILES": "4",
+                "PRIME_PARITY_TRACE_MAX_BYTES": "100000",
+                "PRIME_PARITY_DIAGNOSTICS": "1",
+                "PRIME_PARITY_DIAGNOSTIC_TOKENS": "2",
+                "PRIME_PARITY_DIAGNOSTIC_MAX_FILES": "4",
+                "PRIME_PARITY_DIAGNOSTIC_MAX_BYTES": "10000000",
+                "PRIME_PARITY_ROUTER_DEBUG_TOKENS": "2",
+            }
+            ids = FakeTensor([[0, 1]] * 4)
+            weights = FakeTensor([[0.4, 0.6]] * 4)
+            hidden = FakeTensor(np.ones((4, 6144), dtype=np.float32))
+            router = FakeTensor(np.ones((4, 4), dtype=np.float32))
+            with patch.dict(os.environ, environment, clear=True), patch.dict(
+                sys.modules, {"torch": torch}
+            ):
+                configure_process_trace(
+                    "trainer",
+                    rank=1,
+                    pp_rank=0,
+                    cp_rank=1,
+                    world_size=2,
+                    pp_size=1,
+                    cp_size=2,
+                )
+                write_session(root, metadata)
+                write_hidden_diagnostic("layer0_input", hidden)
+                write_router_debug_chunk(1, hidden, router, router, router)
+                write_route_chunk(1, ids, weights, route_output_scale=2.5)
+            self.assertEqual(list(root.glob("*-diagnostic-*.npz")), [])
+            self.assertEqual(list(root.glob("*-router-debug.npz")), [])
+            self.assertEqual(len(list(root.glob("*-layer-1-call-0.npz"))), 1)
+
+    def test_hidden_hooks_install_only_on_owning_pp_stage(self):
+        class Target:
+            def __init__(self, layer_idx=None):
+                self.layer_idx = layer_idx
+                self.self_attn = self
+                self.mlp = self
+                self.hooks = 0
+
+            def register_forward_hook(self, _hook):
+                self.hooks += 1
+                return types.SimpleNamespace(remove=lambda: None)
+
+            def register_forward_pre_hook(self, _hook):
+                self.hooks += 1
+                return types.SimpleNamespace(remove=lambda: None)
+
+        embed = Target()
+        layer = Target(layer_idx=0)
+        model = types.SimpleNamespace(embed_tokens=embed, layers={0: layer})
+        with patch.dict(os.environ, {"PRIME_PARITY_DIAGNOSTICS": "1"}, clear=True):
+            configure_hidden_diagnostics(model, 10, 20)
+        self.assertEqual(embed.hooks, 0)
+        self.assertEqual(layer.hooks, 0)
 
     def test_router_debug_is_bounded_and_cleared(self):
         torch = fake_torch()

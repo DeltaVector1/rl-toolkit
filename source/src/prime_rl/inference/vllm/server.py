@@ -34,6 +34,7 @@ from prime_rl.parity_router_trace import (
     assemble_chunks,
     clear_trace,
     consume_single_use_diagnostic_token,
+    diagnostic_capture_preflight,
     encoded_array,
     read_h200_runtime_marker,
     read_diagnostic_manifest,
@@ -226,6 +227,8 @@ async def reset_parity_router_trace(request: Request):
         session = TraceSession.from_dict(data)
         if session.side != "h200":
             raise ValueError("H200 router trace session side must be h200")
+        if os.environ.get("PRIME_PARITY_DIAGNOSTICS") == "1":
+            diagnostic_capture_preflight(session, "h200")
         clear_trace(root)
         write_session(root, session)
     except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
