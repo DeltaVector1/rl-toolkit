@@ -681,6 +681,7 @@ def cache_glm_moe_bias_values(model: nn.Module) -> None:
         source_sha256 = getattr(mlp, "_fp32_expert_bias_source_sha256", None)
         if source_sha256 is not None and cache_sha256 != source_sha256:
             raise RuntimeError("GLM static routing correction changed after source capture")
+        mlp._fp32_expert_bias_validation = None
         setattr(mlp, "_fp32_expert_bias", cached)
         mlp._fp32_expert_bias_cache_sha256 = cache_sha256
         mlp._use_static_expert_bias = True

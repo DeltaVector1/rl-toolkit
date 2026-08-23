@@ -415,6 +415,7 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
         self.assertNotIn("_fp32_expert_bias", mlp._buffers)
         self.assertNotIn("_fp32_expert_bias", model.state_dict())
         torch.testing.assert_close(mlp._fp32_expert_bias, source, rtol=0, atol=0)
+        self.assertIsNotNone(mlp._fp32_expert_bias_validation)
         mlp._fp32_expert_bias.add_(1.0)
         with self.assertRaisesRegex(RuntimeError, "changed after source capture"):
             cache_glm_moe_bias_values(model)
@@ -430,6 +431,7 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
         mlp._fp32_expert_bias_cache_sha256 = mlp._fp32_expert_bias_source_sha256
         mlp._fp32_expert_bias.copy_(source)
         cache_glm_moe_bias_values(model)
+        self.assertIsNotNone(mlp._fp32_expert_bias_validation)
 
         seen = []
         mlp.router = RecordingRouter(seen)

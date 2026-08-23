@@ -72,6 +72,7 @@ def _move_static_expert_bias(module: nn.Module, device: torch.device) -> torch.T
     if value is None:
         raise RuntimeError("Frozen GLM routing requires an FP32 bias cache")
     value = value.to(device=device, dtype=torch.float32)
+    module._fp32_expert_bias_validation = None
     module._fp32_expert_bias = value
     return _validate_static_expert_bias(module)
 
