@@ -8,6 +8,7 @@ import inspect
 import json
 import os
 import re
+import secrets
 import sys
 import threading
 from contextlib import contextmanager
@@ -35,6 +36,8 @@ diagnostic_env = "PRIME_PARITY_DIAGNOSTICS"
 diagnostic_tokens_env = "PRIME_PARITY_DIAGNOSTIC_TOKENS"
 diagnostic_max_files_env = "PRIME_PARITY_DIAGNOSTIC_MAX_FILES"
 diagnostic_max_bytes_env = "PRIME_PARITY_DIAGNOSTIC_MAX_BYTES"
+diagnostic_hidden_width = 6144
+diagnostic_max_request_bytes = 16 * 1024 * 1024
 parity_model_modules = (
     "prime_rl.trainer.model",
     "prime_rl.trainer.lora",
@@ -189,6 +192,16 @@ def diagnostics_enabled() -> bool:
     return os.environ.get(diagnostic_env) == "1"
 
 
+def diagnostic_authorization_valid(
+    authorization: str | None, expected_token: str | None
+) -> bool:
+    if not isinstance(authorization, str) or not authorization.startswith("Bearer "):
+        return False
+    if not isinstance(expected_token, str) or not expected_token:
+        return False
+    return secrets.compare_digest(authorization[7:], expected_token)
+
+
 def _diagnostic_limit(name: str) -> int:
     value = os.environ.get(name)
     if value is None or not value.isdigit() or int(value) < 1:
@@ -199,8 +212,11 @@ def _diagnostic_limit(name: str) -> int:
 def diagnostic_limits() -> dict[str, int]:
     if not diagnostics_enabled():
         return {}
+    tokens = _diagnostic_limit(diagnostic_tokens_env)
+    if tokens > 256:
+        raise ValueError(f"{diagnostic_tokens_env} cannot exceed 256")
     return {
-        "tokens": _diagnostic_limit(diagnostic_tokens_env),
+        "tokens": tokens,
         "max_files": _diagnostic_limit(diagnostic_max_files_env),
         "max_bytes": _diagnostic_limit(diagnostic_max_bytes_env),
     }
@@ -510,7 +526,27 @@ def _diagnostic_array(value: Any, limit: int) -> tuple[np.ndarray, str]:
     return array, source_dtype
 
 
-def write_hidden_diagnostic(kind: str, value: Any) -> None:
+def _diagnostic_tensor_metadata(
+    value: Any, limit: int, expected_width: int | None
+) -> tuple[int, str, int]:
+    tensor = value.detach()
+    shape = tuple(int(item) for item in getattr(tensor, "shape", ()))
+    if len(shape) < 2 or (expected_width is not None and shape[-1] != expected_width):
+        raise ValueError("diagnostic tensor has an invalid width")
+    token_count = 1
+    for size in shape[:-1]:
+        token_count *= size
+    token_count = min(token_count, limit)
+    if token_count < 1:
+        raise ValueError("diagnostic tensor has no tokens")
+    source_dtype = str(getattr(tensor, "dtype", "unknown"))
+    estimated_bytes = token_count * shape[-1] * 4 + 1024 * 1024
+    return token_count, source_dtype, estimated_bytes
+
+
+def write_hidden_diagnostic(
+    kind: str, value: Any, *, expected_width: int | None = diagnostic_hidden_width
+) -> None:
     """Write one bounded activation capture when explicitly enabled."""
     global _diagnostic_files, _diagnostic_bytes, _diagnostic_session
     root = trace_root()
@@ -528,43 +564,23 @@ def write_hidden_diagnostic(kind: str, value: Any) -> None:
             _diagnostic_files = 0
             _diagnostic_bytes = 0
             _diagnostic_session = session_identity
-        array, source_dtype = _diagnostic_array(value, limits["tokens"])
+        token_count, source_dtype, estimated_bytes = _diagnostic_tensor_metadata(
+            value, limits["tokens"], expected_width
+        )
         filename = (
             f"{_process_side}-rank-{_process_rank}-pp-{_process_pp_rank}-"
             f"cp-{_process_cp_rank}-diagnostic-{kind}.npz"
         )
         path = root / filename
-        temporary = root / f".{filename}.{os.getpid()}"
-        with temporary.open("wb") as stream:
-            np.savez(
-                stream,
-                values=array,
-                session_identity=np.asarray(session_identity, dtype="<U64"),
-                name=np.asarray(entry_name, dtype="<U128"),
-                source_dtype=np.asarray(source_dtype, dtype="<U32"),
-                fixture_sha256=np.asarray(session.fixture_sha256, dtype="<U64"),
-                token_ids_sha256=np.asarray(session.token_ids_sha256, dtype="<U64"),
-                model_revision=np.asarray(session.model_revision, dtype="<U40"),
-                adapter_sha256=np.asarray(session.adapter_sha256, dtype="<U64"),
-            )
-        size = temporary.stat().st_size
-        if (
-            _diagnostic_files + 1 > limits["max_files"]
-            or _diagnostic_bytes + size > limits["max_bytes"]
-        ):
-            temporary.unlink()
-            raise ValueError("parity diagnostic file or byte limit exceeded")
         manifest_path = root / diagnostic_manifest_name
         with (root / diagnostic_manifest_lock_name).open("w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             if manifest_path.exists():
                 manifest = json.loads(manifest_path.read_text())
                 if manifest.get("session_identity") != session_identity:
-                    temporary.unlink()
                     raise ValueError("diagnostic manifest session differs")
                 entries = manifest.get("entries", [])
                 if not isinstance(entries, list):
-                    temporary.unlink()
                     raise ValueError("diagnostic manifest entries are invalid")
             else:
                 entries = []
@@ -576,16 +592,33 @@ def write_hidden_diagnostic(kind: str, value: Any) -> None:
                     "entries": entries,
                 }
             if any(entry.get("name") == entry_name for entry in entries):
-                temporary.unlink()
                 return
             if path.exists():
-                temporary.unlink()
                 raise FileExistsError(f"diagnostic output already exists: {path}")
             existing_bytes = sum(int(entry.get("bytes", 0)) for entry in entries)
             if (
                 len(entries) + 1 > limits["max_files"]
-                or existing_bytes + size > limits["max_bytes"]
+                or existing_bytes + estimated_bytes > limits["max_bytes"]
             ):
+                raise ValueError("parity diagnostic file or byte limit exceeded")
+            array, source_dtype = _diagnostic_array(value, limits["tokens"])
+            if array.shape[0] != token_count:
+                raise ValueError("diagnostic tensor changed during capture")
+            temporary = root / f".{filename}.{os.getpid()}"
+            with temporary.open("wb") as stream:
+                np.savez(
+                    stream,
+                    values=array,
+                    session_identity=np.asarray(session_identity, dtype="<U64"),
+                    name=np.asarray(entry_name, dtype="<U128"),
+                    source_dtype=np.asarray(source_dtype, dtype="<U32"),
+                    fixture_sha256=np.asarray(session.fixture_sha256, dtype="<U64"),
+                    token_ids_sha256=np.asarray(session.token_ids_sha256, dtype="<U64"),
+                    model_revision=np.asarray(session.model_revision, dtype="<U40"),
+                    adapter_sha256=np.asarray(session.adapter_sha256, dtype="<U64"),
+                )
+            size = temporary.stat().st_size
+            if size > limits["max_bytes"] or size > estimated_bytes:
                 temporary.unlink()
                 raise ValueError("parity diagnostic file or byte limit exceeded")
             os.replace(temporary, path)
@@ -610,28 +643,53 @@ def h200_diagnostic_is_active() -> bool:
     return _h200_diagnostic_active
 
 
-def _h200_router_for_layer(model: Any, layer: int) -> Any:
+def _h200_router_for_layer(model: Any, layer: int) -> tuple[Any, Any]:
     modules = model.modules() if hasattr(model, "modules") else ()
     for module in modules:
         router = getattr(module, "router", None)
         if router is not None and getattr(router, "_prime_parity_layer", None) == layer:
-            return router
+            return module, router
     raise ValueError(f"H200 router layer {layer} is not available")
 
 
-def _router_logits(router: Any, hidden: Any) -> Any:
-    for owner in (router, getattr(router, "layer", None)):
-        if owner is None:
+def _router_logits(owner: Any, router: Any, hidden: Any) -> Any:
+    expected_bias = getattr(router, "e_score_correction_bias", None)
+    for candidate in (getattr(owner, "gate", None), getattr(router, "gate", None)):
+        if candidate is None:
             continue
-        for name in ("gate", "router", "linear"):
-            operation = getattr(owner, name, None)
-            if callable(operation):
-                return operation(hidden)
+        operation = candidate
+        if not callable(operation):
             weight = getattr(operation, "weight", None)
-            if weight is not None:
-                import torch.nn.functional as functional
+            if weight is None:
+                continue
+            import torch.nn.functional as functional
 
-                return functional.linear(hidden, weight)
+            def operation(values: Any, weight: Any = weight) -> Any:
+                return functional.linear(values, weight)
+        result = operation(hidden)
+        output_bias = None
+        if isinstance(result, tuple):
+            if len(result) != 2:
+                raise ValueError("H200 gate returned an invalid result tuple")
+            result, output_bias = result
+        if output_bias is not None:
+            if expected_bias is None or not __import__("torch").equal(
+                output_bias.to(dtype=__import__("torch").float32),
+                expected_bias.to(dtype=__import__("torch").float32),
+            ):
+                raise ValueError("H200 gate bias differs from router correction bias")
+        elif expected_bias is not None and getattr(candidate, "bias", None) is not None:
+            raise ValueError("H200 gate omitted its configured correction bias")
+        return result
+    for candidate in (getattr(owner, "layer", None),):
+        if candidate is None:
+            continue
+        operation = getattr(candidate, "gate", None)
+        if callable(operation):
+            result = operation(hidden)
+            if isinstance(result, tuple):
+                result = result[0]
+            return result
     raise ValueError("H200 router does not expose its gate operation")
 
 
@@ -667,7 +725,10 @@ def run_h200_router_diagnostic(model_runner: Any, payload: dict[str, Any]) -> di
     encoded = payload.get("router_input")
     if not isinstance(encoded, dict):
         raise ValueError("H200 diagnostic input is missing")
+    expected_bytes, _ = validate_encoded_diagnostic_input(encoded)
     input_array = decoded_array(encoded)
+    if input_array.nbytes != expected_bytes:
+        raise ValueError("H200 diagnostic input byte count differs")
     expected_input_hash = payload.get("router_input_sha256")
     actual_input_hash = sha256_bytes(
         memoryview(np.ascontiguousarray(input_array)).cast("B")
@@ -685,14 +746,14 @@ def run_h200_router_diagnostic(model_runner: Any, payload: dict[str, Any]) -> di
     torch = __import__("torch")
     model = getattr(model_runner, "model", model_runner)
     model = getattr(model, "runnable", model)
-    router = _h200_router_for_layer(model, layer)
+    owner, router = _h200_router_for_layer(model, layer)
     parameter = next(iter(model.parameters()), None)
     device = getattr(parameter, "device", "cuda")
     hidden = torch.as_tensor(input_array, dtype=torch.bfloat16, device=device)
     global _h200_diagnostic_active
     _h200_diagnostic_active = True
     try:
-        logits = _router_logits(router, hidden)
+        logits = _router_logits(owner, router, hidden)
         route_weights, route_ids = router.select_experts(hidden, logits)
     finally:
         _h200_diagnostic_active = False
@@ -703,11 +764,21 @@ def run_h200_router_diagnostic(model_runner: Any, payload: dict[str, Any]) -> di
     if correction_bias is not None:
         selection_scores = selection_scores + correction_bias.to(torch.float32)
     write_hidden_diagnostic(f"layer{layer}_h200_input", hidden)
-    write_hidden_diagnostic(f"layer{layer}_h200_logits", logits)
-    write_hidden_diagnostic(f"layer{layer}_h200_scores", scores)
-    write_hidden_diagnostic(f"layer{layer}_h200_selection_scores", selection_scores)
-    write_hidden_diagnostic(f"layer{layer}_h200_route_ids", route_ids)
-    write_hidden_diagnostic(f"layer{layer}_h200_route_weights", route_weights)
+    write_hidden_diagnostic(
+        f"layer{layer}_h200_logits", logits, expected_width=None
+    )
+    write_hidden_diagnostic(
+        f"layer{layer}_h200_scores", scores, expected_width=None
+    )
+    write_hidden_diagnostic(
+        f"layer{layer}_h200_selection_scores", selection_scores, expected_width=None
+    )
+    write_hidden_diagnostic(
+        f"layer{layer}_h200_route_ids", route_ids, expected_width=None
+    )
+    write_hidden_diagnostic(
+        f"layer{layer}_h200_route_weights", route_weights, expected_width=None
+    )
     return {
         "session_identity": session_identity,
         "source_session_identity": source_session_identity,
@@ -717,17 +788,40 @@ def run_h200_router_diagnostic(model_runner: Any, payload: dict[str, Any]) -> di
     }
 
 
-def _hook_tensor(value: Any) -> Any | None:
-    if value is None:
-        return None
-    if hasattr(value, "detach"):
-        return value
-    if isinstance(value, (tuple, list)):
-        for item in value:
-            result = _hook_tensor(item)
-            if result is not None:
-                return result
-    return None
+def _hidden_stream(output: Any, name: str) -> Any:
+    if hasattr(output, "detach"):
+        return output
+    if (
+        isinstance(output, tuple)
+        and len(output) == 2
+        and hasattr(output[0], "detach")
+        and (output[1] is None or hasattr(output[1], "detach"))
+    ):
+        return output[0]
+    raise ValueError(f"{name} output is not a known hidden-state stream")
+
+
+def _capture_embedding(_module: Any, _inputs: Any, output: Any) -> None:
+    hidden = _hidden_stream(output, "embedding")
+    write_hidden_diagnostic("embedding", hidden)
+    write_hidden_diagnostic("layer0_input", hidden)
+
+
+def _capture_attention(_module: Any, _inputs: Any, output: Any, layer: int) -> None:
+    write_hidden_diagnostic(f"layer{layer}_attention", _hidden_stream(output, "attention"))
+
+
+def _capture_mlp(_module: Any, _inputs: Any, output: Any, layer: int) -> None:
+    if not hasattr(output, "detach"):
+        raise ValueError("MLP output is not a tensor")
+    write_hidden_diagnostic(f"layer{layer}_mlp", output)
+
+
+def _capture_decoder_layer(_module: Any, _inputs: Any, output: Any, layer: int) -> None:
+    hidden = _hidden_stream(output, "decoder layer")
+    write_hidden_diagnostic(f"layer{layer}_output", hidden)
+    if layer < 2:
+        write_hidden_diagnostic(f"layer{layer + 1}_input", hidden)
 
 
 def configure_hidden_diagnostics(language_model: Any) -> None:
@@ -743,30 +837,19 @@ def configure_hidden_diagnostics(language_model: Any) -> None:
     embed = getattr(root_model, "embed_tokens", None)
     if embed is not None:
         _diagnostic_hooks.append(
-            embed.register_forward_hook(
-                lambda _module, _inputs, output: write_hidden_diagnostic(
-                    "embedding", _hook_tensor(output)
-                )
-            )
+            embed.register_forward_hook(_capture_embedding)
         )
     items = layers.items() if hasattr(layers, "items") else enumerate(layers)
     for raw_layer, layer in items:
         layer_number = int(raw_layer)
         if layer_number > 2:
             continue
-        _diagnostic_hooks.append(
-            layer.register_forward_pre_hook(
-                lambda _module, inputs, number=layer_number: write_hidden_diagnostic(
-                    f"layer{number}_input", _hook_tensor(inputs)
-                )
-            )
-        )
         attention = getattr(layer, "self_attn", None)
         if attention is not None:
             _diagnostic_hooks.append(
                 attention.register_forward_hook(
-                    lambda _module, _inputs, output, number=layer_number: write_hidden_diagnostic(
-                        f"layer{number}_attention", _hook_tensor(output)
+                    lambda module, inputs, output, number=layer_number: _capture_attention(
+                        module, inputs, output, number
                     )
                 )
             )
@@ -774,15 +857,85 @@ def configure_hidden_diagnostics(language_model: Any) -> None:
         if mlp is not None:
             _diagnostic_hooks.append(
                 mlp.register_forward_hook(
-                    lambda _module, _inputs, output, number=layer_number: write_hidden_diagnostic(
-                        f"layer{number}_mlp", _hook_tensor(output)
+                    lambda module, inputs, output, number=layer_number: _capture_mlp(
+                        module, inputs, output, number
                     )
                 )
             )
         _diagnostic_hooks.append(
             layer.register_forward_hook(
-                lambda _module, _inputs, output, number=layer_number: write_hidden_diagnostic(
-                    f"layer{number}_output", _hook_tensor(output)
+                lambda module, inputs, output, number=layer_number: _capture_decoder_layer(
+                    module, inputs, output, number
+                )
+            )
+        )
+
+
+def _capture_h200_attention_boundary(
+    _module: Any, _inputs: Any, output: Any, layer: int
+) -> None:
+    if (
+        not isinstance(output, tuple)
+        or len(output) != 2
+        or not hasattr(output[0], "detach")
+        or not hasattr(output[1], "detach")
+    ):
+        raise ValueError("H200 attention boundary is not a hidden/residual pair")
+    write_hidden_diagnostic(f"layer{layer}_attention_hidden", output[0])
+    write_hidden_diagnostic(f"layer{layer}_attention_residual", output[1])
+
+
+def _capture_h200_layer_boundary(
+    _module: Any, _inputs: Any, output: Any, layer: int
+) -> None:
+    if (
+        not isinstance(output, tuple)
+        or len(output) != 2
+        or not hasattr(output[0], "detach")
+        or not hasattr(output[1], "detach")
+    ):
+        raise ValueError("H200 decoder boundary is not a hidden/residual pair")
+    write_hidden_diagnostic(f"layer{layer}_output", output[0])
+    write_hidden_diagnostic(f"layer{layer}_residual", output[1])
+    if layer < 2:
+        write_hidden_diagnostic(f"layer{layer + 1}_input", output[0])
+
+
+def configure_h200_boundary_diagnostics(model: Any) -> None:
+    if not diagnostics_enabled():
+        return
+    root_model = getattr(model, "model", model)
+    embed = getattr(root_model, "embed_tokens", None)
+    layers = getattr(root_model, "layers", None)
+    if embed is None or layers is None or not hasattr(embed, "register_forward_hook"):
+        raise ValueError("H200 diagnostics cannot find the model embedding and layers")
+    _diagnostic_hooks.append(embed.register_forward_hook(_capture_embedding))
+    layer_items = layers.items() if hasattr(layers, "items") else enumerate(layers)
+    selected: dict[int, Any] = {}
+    for raw_layer, layer in layer_items:
+        layer_number = int(getattr(layer, "layer_idx", raw_layer))
+        if layer_number in {0, 1, 2}:
+            selected[layer_number] = layer
+    if set(selected) != {0, 1, 2}:
+        raise ValueError("H200 diagnostics require local logical layers 0, 1, and 2")
+    for layer_number in range(3):
+        layer = selected[layer_number]
+        attention_boundary = getattr(layer, "post_attention_layernorm", None)
+        if attention_boundary is None or not hasattr(
+            attention_boundary, "register_forward_hook"
+        ):
+            raise ValueError("H200 diagnostics cannot find the attention boundary")
+        _diagnostic_hooks.append(
+            attention_boundary.register_forward_hook(
+                lambda module, inputs, output, number=layer_number: _capture_h200_attention_boundary(
+                    module, inputs, output, number
+                )
+            )
+        )
+        _diagnostic_hooks.append(
+            layer.register_forward_hook(
+                lambda module, inputs, output, number=layer_number: _capture_h200_layer_boundary(
+                    module, inputs, output, number
                 )
             )
         )
@@ -1119,7 +1272,7 @@ def write_router_debug_chunk(
         return
     if not router_debug_enabled(layer):
         return
-    if diagnostics_enabled():
+    if diagnostics_enabled() and layer == read_session(root).dense_layers:
         write_hidden_diagnostic(f"layer{layer}_router_input", router_input)
     session = read_session(root)
     with _write_lock:
@@ -1288,6 +1441,29 @@ def decoded_array(value: dict[str, Any]) -> np.ndarray:
         raise ValueError("encoded router array is invalid") from error
 
 
+def validate_encoded_diagnostic_input(value: dict[str, Any]) -> tuple[int, int]:
+    """Validate shape and base64 size before decoding or device allocation."""
+    if not isinstance(value, dict):
+        raise ValueError("encoded diagnostic input is not an object")
+    data = value.get("data")
+    dtype = value.get("dtype")
+    shape = value.get("shape")
+    if not isinstance(data, str) or len(data) > diagnostic_max_request_bytes:
+        raise ValueError("encoded diagnostic input is too large")
+    if dtype != "float32" or not isinstance(shape, list) or len(shape) != 2:
+        raise ValueError("encoded diagnostic input must be float32 rank two")
+    if any(isinstance(item, bool) or not isinstance(item, int) for item in shape):
+        raise ValueError("encoded diagnostic input shape is invalid")
+    tokens, width = shape
+    if tokens < 1 or tokens > 256 or width != diagnostic_hidden_width:
+        raise ValueError("encoded diagnostic input shape is outside the diagnostic limit")
+    expected_bytes = tokens * width * np.dtype(np.float32).itemsize
+    expected_encoded_length = 4 * ((expected_bytes + 2) // 3)
+    if len(data) != expected_encoded_length:
+        raise ValueError("encoded diagnostic input length is invalid")
+    return expected_bytes, expected_encoded_length
+
+
 def install_vllm_parity_trace() -> bool:
     root = trace_root()
     if root is None:
@@ -1367,11 +1543,13 @@ def install_vllm_parity_trace() -> bool:
             get_tensor_model_parallel_world_size,
         )
 
-        configure_process_trace(
+        configured = configure_process_trace(
             "h200",
             rank=get_tensor_model_parallel_rank(),
             world_size=get_tensor_model_parallel_world_size(),
         )
+        if configured and diagnostics_enabled():
+            configure_h200_boundary_diagnostics(self.model)
         return result
 
     GPUModelRunner._bind_routed_experts_capturer = traced_bind

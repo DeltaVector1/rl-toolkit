@@ -1,5 +1,6 @@
 import os
 import json
+import base64
 import sys
 import tempfile
 import types
@@ -27,6 +28,10 @@ from prime_rl.parity_router_trace import (
     write_router_debug_chunk,
     write_hidden_diagnostic,
     run_h200_router_diagnostic,
+    diagnostic_authorization_valid,
+    validate_encoded_diagnostic_input,
+    _hidden_stream,
+    _router_logits,
     diagnostics_enabled,
     write_session,
     _is_mounted,
@@ -128,9 +133,9 @@ class ParityRouterTraceTest(unittest.TestCase):
                 "PRIME_PARITY_DIAGNOSTICS": "1",
                 "PRIME_PARITY_DIAGNOSTIC_TOKENS": "2",
                 "PRIME_PARITY_DIAGNOSTIC_MAX_FILES": "2",
-                "PRIME_PARITY_DIAGNOSTIC_MAX_BYTES": "100000",
+                "PRIME_PARITY_DIAGNOSTIC_MAX_BYTES": "2000000",
             }
-            values = FakeTensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+            values = FakeTensor(np.ones((3, 6144), dtype=np.float32))
             with patch.dict(os.environ, environment, clear=True), patch.dict(
                 sys.modules, {"torch": torch}
             ):
@@ -142,7 +147,7 @@ class ParityRouterTraceTest(unittest.TestCase):
             manifest = json.loads((root / "parity-diagnostics.json").read_text())
             self.assertEqual(len(manifest["entries"]), 1)
             with np.load(path, allow_pickle=False) as saved:
-                self.assertEqual(saved["values"].shape, (2, 2))
+                self.assertEqual(saved["values"].shape, (2, 6144))
                 self.assertEqual(saved["session_identity"].item(), trace_session_identity(session()))
 
     def test_hidden_diagnostic_rejects_file_limit(self):
@@ -155,9 +160,9 @@ class ParityRouterTraceTest(unittest.TestCase):
                 "PRIME_PARITY_DIAGNOSTICS": "1",
                 "PRIME_PARITY_DIAGNOSTIC_TOKENS": "2",
                 "PRIME_PARITY_DIAGNOSTIC_MAX_FILES": "1",
-                "PRIME_PARITY_DIAGNOSTIC_MAX_BYTES": "100000",
+                "PRIME_PARITY_DIAGNOSTIC_MAX_BYTES": "2000000",
             }
-            values = FakeTensor([[1.0, 2.0], [3.0, 4.0]])
+            values = FakeTensor(np.ones((2, 6144), dtype=np.float32))
             with patch.dict(os.environ, environment, clear=True), patch.dict(
                 sys.modules, {"torch": torch}
             ):
@@ -175,6 +180,70 @@ class ParityRouterTraceTest(unittest.TestCase):
                 configure_process_trace("h200", rank=0)
                 with self.assertRaisesRegex(ValueError, "diagnostics are disabled"):
                     run_h200_router_diagnostic(object(), {})
+
+    def test_diagnostic_input_rejects_wrong_size_before_decode(self):
+        data = base64.b64encode(b"too short").decode()
+        with self.assertRaisesRegex(ValueError, "length is invalid"):
+            validate_encoded_diagnostic_input(
+                {"data": data, "dtype": "float32", "shape": [1, 6144]}
+            )
+
+    def test_diagnostic_authentication_rejects_missing_or_wrong_token(self):
+        self.assertFalse(diagnostic_authorization_valid(None, "secret"))
+        self.assertFalse(diagnostic_authorization_valid("Bearer wrong", "secret"))
+        self.assertTrue(diagnostic_authorization_valid("Bearer secret", "secret"))
+
+    def test_router_owner_gate_tuple_and_bias_are_checked(self):
+        class Gate:
+            def __call__(self, value):
+                return value, FakeTensor([1.0, 2.0])
+
+        class Router:
+            e_score_correction_bias = FakeTensor([1.0, 2.0])
+
+        class Owner:
+            gate = Gate()
+
+        torch = fake_torch()
+        torch.equal = lambda left, right: np.array_equal(left.value, right.value)
+        with patch.dict(sys.modules, {"torch": torch}):
+            result = _router_logits(Owner(), Router(), FakeTensor([[1.0, 2.0]]))
+        self.assertIsInstance(result, FakeTensor)
+        Router.e_score_correction_bias = FakeTensor([1.0, 3.0])
+        with patch.dict(sys.modules, {"torch": torch}), self.assertRaisesRegex(
+            ValueError, "correction bias"
+        ):
+            _router_logits(Owner(), Router(), FakeTensor([[1.0, 2.0]]))
+
+    def test_two_stream_boundary_requires_two_tensors(self):
+        first = FakeTensor([[1.0, 2.0]])
+        second = FakeTensor([[3.0, 4.0]])
+        self.assertIs(_hidden_stream((first, second), "layer"), first)
+        with self.assertRaisesRegex(ValueError, "known hidden-state"):
+            _hidden_stream((first,), "layer")
+
+    def test_router_diagnostics_capture_only_first_routed_layer(self):
+        torch = fake_torch()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_session(root, session())
+            environment = {
+                trace_dir_env: str(root),
+                "PRIME_PARITY_DIAGNOSTICS": "1",
+                "PRIME_PARITY_DIAGNOSTIC_TOKENS": "2",
+                "PRIME_PARITY_DIAGNOSTIC_MAX_FILES": "4",
+                "PRIME_PARITY_DIAGNOSTIC_MAX_BYTES": "100000000",
+            }
+            router_input = FakeTensor(np.ones((2, 6144), dtype=np.float32))
+            router_values = FakeTensor(np.ones((2, 4), dtype=np.float32))
+            with patch.dict(os.environ, environment, clear=True), patch.dict(
+                sys.modules, {"torch": torch}
+            ):
+                configure_process_trace("trainer", rank=0)
+                write_router_debug_chunk(2, router_input, router_values, router_values, router_values)
+                self.assertFalse(list(root.glob("*diagnostic-layer2_router_input.npz")))
+                write_router_debug_chunk(1, router_input, router_values, router_values, router_values)
+            self.assertTrue(list(root.glob("*diagnostic-layer1_router_input.npz")))
 
     def test_mount_classification_requires_exact_mountpoint(self):
         self.assertTrue(_is_mounted(Path("/app/src/prime_rl/model.py"), {Path("/app/src/prime_rl/model.py")}))

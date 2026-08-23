@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import secrets
 from argparse import Namespace
 from pathlib import Path
 from typing import Any
@@ -35,6 +36,8 @@ from prime_rl.parity_router_trace import (
     read_h200_runtime_marker,
     read_session,
     trace_root,
+    trace_session_identity,
+    diagnostic_authorization_valid,
     write_session,
 )
 from prime_rl.utils.logger import get_logger
@@ -66,6 +69,7 @@ logger = init_logger("vllm.entrypoints.openai.api_server")
 # Create our own router for custom endpoints
 router = APIRouter()
 lora_load_lock = asyncio.Lock()
+parity_diagnostic_tokens: dict[str, str] = {}
 
 
 def engine_client(request: Request) -> EngineClient:
@@ -160,7 +164,12 @@ async def reset_parity_router_trace(request: Request):
         write_session(root, session)
     except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
-    return session.as_dict()
+    response = session.as_dict()
+    if os.environ.get("PRIME_PARITY_DIAGNOSTICS") == "1":
+        token = secrets.token_urlsafe(32)
+        parity_diagnostic_tokens[trace_session_identity(session)] = token
+        response = {"session": response, "diagnostic_token": token}
+    return response
 
 
 @router.get("/parity/router-trace")
@@ -184,15 +193,27 @@ async def get_parity_router_trace():
 
 @router.post("/parity/router-diagnostic")
 async def run_parity_router_diagnostic(request: Request):
+    if os.environ.get("PRIME_PARITY_ENGINE") != "1":
+        raise HTTPException(status_code=404, detail="parity diagnostics are not enabled on this engine")
+    if os.environ.get("PRIME_PARITY_DIAGNOSTICS") != "1":
+        raise HTTPException(status_code=404, detail="parity diagnostics are disabled")
     root = parity_trace_root()
     try:
-        data = await request.json()
+        body = await request.body()
+        if len(body) > 16 * 1024 * 1024:
+            raise ValueError("H200 diagnostic request body is too large")
+        data = json.loads(body)
         if not isinstance(data, dict):
             raise ValueError("H200 diagnostic request must be an object")
+        session = read_session(root)
+        session_identity = trace_session_identity(session)
+        authorization = request.headers.get("authorization", "")
+        expected_token = parity_diagnostic_tokens.get(session_identity)
+        if not diagnostic_authorization_valid(authorization, expected_token):
+            raise HTTPException(status_code=401, detail="diagnostic authorization is required")
         result = await engine_client(request).collective_rpc(
             "parity_router_diagnostic", args=(data,)
         )
-        session = read_session(root)
         return {
             "session": session.as_dict(),
             "results": result,

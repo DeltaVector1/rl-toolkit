@@ -512,7 +512,7 @@ def run_h200_router_diagnostic(
     session_path: Path,
     base_url: str,
     layer: int,
-    api_key_env: str | None,
+    diagnostic_token: str,
     timeout: float,
 ) -> dict[str, Any]:
     """Send one bounded trainer activation to the H200 router worker."""
@@ -531,6 +531,14 @@ def run_h200_router_diagnostic(
                 "adapter_sha256",
             )
         }
+    if (
+        input_array.dtype != np.float32
+        or input_array.ndim != 2
+        or input_array.shape[0] < 1
+        or input_array.shape[0] > 256
+        or input_array.shape[1] != 6144
+    ):
+        raise ValueError("diagnostic input must be at most 256x6144 float32 values")
     session = json.loads(session_path.read_text())
     if session.get("side") != "h200":
         raise ValueError("diagnostic session must be an H200 session")
@@ -555,7 +563,7 @@ def run_h200_router_diagnostic(
     return request_json(
         f"{base_url.rstrip('/').removesuffix('/v1')}/parity/router-diagnostic",
         body=payload,
-        api_key=os.environ.get(api_key_env) if api_key_env else None,
+        api_key=diagnostic_token,
         timeout=timeout,
     )
 
@@ -630,7 +638,11 @@ def capture_h200(
         api_key=api_key,
         timeout=min(timeout, 120),
     )
-    if reset != trace_session:
+    if reset != trace_session and not (
+        isinstance(reset, dict)
+        and reset.get("session") == trace_session
+        and isinstance(reset.get("diagnostic_token"), str)
+    ):
         raise ValueError("H200 router trace reset returned different session metadata")
     eager_sampling_params = trace_sampling_params(seed, trace_session)
     eager_body = {
@@ -1533,7 +1545,7 @@ def parser() -> argparse.ArgumentParser:
     diagnostic.add_argument("--session", type=Path, required=True)
     diagnostic.add_argument("--base-url", required=True)
     diagnostic.add_argument("--layer", type=int, required=True)
-    diagnostic.add_argument("--api-key-env")
+    diagnostic.add_argument("--diagnostic-token", required=True)
     diagnostic.add_argument("--timeout", type=float, default=300.0)
     trainer = commands.add_parser("capture-trainer")
     trainer.add_argument("--fixture", type=Path, required=True)
@@ -1610,7 +1622,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.session,
                 args.base_url,
                 args.layer,
-                args.api_key_env,
+                args.diagnostic_token,
                 args.timeout,
             )
         elif args.command == "capture-trainer":
