@@ -182,6 +182,26 @@ async def get_parity_router_trace():
     }
 
 
+@router.post("/parity/router-diagnostic")
+async def run_parity_router_diagnostic(request: Request):
+    root = parity_trace_root()
+    try:
+        data = await request.json()
+        if not isinstance(data, dict):
+            raise ValueError("H200 diagnostic request must be an object")
+        result = await engine_client(request).collective_rpc(
+            "parity_router_diagnostic", args=(data,)
+        )
+        session = read_session(root)
+        return {
+            "session": session.as_dict(),
+            "results": result,
+            "diagnostics": json.loads((root / "parity-diagnostics.json").read_text()),
+        }
+    except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
 @router.post("/init_broadcaster")
 async def init_broadcaster(request: Request):
     data = await request.json()

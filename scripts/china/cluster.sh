@@ -129,7 +129,7 @@ case ${1:-} in
     if [ "$rank" -lt 0 ]; then
       echo "node $node is not in trainer_nodes ($trainer_nodes)" >&2; exit 1
     fi
-    read -r rollout_transport trainer_output trainer_only parity_trace_dir parity_trace_source parity_pp parity_cp parity_batch parity_max_calls parity_max_files parity_max_bytes configured_int4_combine_rounds configured_fp8_expert_activation_offload < <(
+    read -r rollout_transport trainer_output trainer_only parity_trace_dir parity_trace_source parity_pp parity_cp parity_batch parity_max_calls parity_max_files parity_max_bytes parity_diagnostics parity_diagnostic_tokens parity_diagnostic_max_files parity_diagnostic_max_bytes configured_int4_combine_rounds configured_fp8_expert_activation_offload < <(
       python3 - "$trainer_config" <<'PY'
 import sys
 import tomllib
@@ -158,6 +158,10 @@ print(
     env_vars.get("PRIME_PARITY_TRACE_MAX_CALLS", ""),
     env_vars.get("PRIME_PARITY_TRACE_MAX_FILES", ""),
     env_vars.get("PRIME_PARITY_TRACE_MAX_BYTES", ""),
+    env_vars.get("PRIME_PARITY_DIAGNOSTICS", ""),
+    env_vars.get("PRIME_PARITY_DIAGNOSTIC_TOKENS", ""),
+    env_vars.get("PRIME_PARITY_DIAGNOSTIC_MAX_FILES", ""),
+    env_vars.get("PRIME_PARITY_DIAGNOSTIC_MAX_BYTES", ""),
     *memory_env,
 )
 PY
@@ -197,6 +201,21 @@ PY
         [1-9]*:[1-9]*:[1-9]* ) ;;
         *) echo "parity trainer TOML must define all trace limits" >&2; exit 1 ;;
       esac
+      if [ -n "$parity_diagnostics" ]; then
+        case "$parity_diagnostics" in
+          0|1) ;;
+          *)
+            echo "PRIME_PARITY_DIAGNOSTICS must be 0 or 1" >&2
+            exit 1
+            ;;
+        esac
+      fi
+      if [ "$parity_diagnostics" = "1" ]; then
+        case "$parity_diagnostic_tokens:$parity_diagnostic_max_files:$parity_diagnostic_max_bytes" in
+          [1-9]*:[1-9]*:[1-9]* ) ;;
+          *) echo "parity diagnostics must define all diagnostic limits" >&2; exit 1 ;;
+        esac
+      fi
       case "$parity_trace_dir" in
         /*) ;;
         *) echo "PRIME_PARITY_ROUTER_TRACE_DIR must be absolute" >&2; exit 1 ;;
@@ -236,6 +255,14 @@ PY
         -e "PRIME_PARITY_TRACE_MAX_FILES=$parity_max_files"
         -e "PRIME_PARITY_TRACE_MAX_BYTES=$parity_max_bytes"
       )
+      if [ -n "$parity_diagnostics" ]; then
+        parity_env+=(
+          -e "PRIME_PARITY_DIAGNOSTICS=$parity_diagnostics"
+          -e "PRIME_PARITY_DIAGNOSTIC_TOKENS=$parity_diagnostic_tokens"
+          -e "PRIME_PARITY_DIAGNOSTIC_MAX_FILES=$parity_diagnostic_max_files"
+          -e "PRIME_PARITY_DIAGNOSTIC_MAX_BYTES=$parity_diagnostic_max_bytes"
+        )
+      fi
     fi
     sudo install -d -o 1000 -g 1000 -m 0755 "$trainer_output"
     if [ "$rank" -eq 0 ]; then

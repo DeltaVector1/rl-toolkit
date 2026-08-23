@@ -507,6 +507,59 @@ def request_json(
     return result
 
 
+def run_h200_router_diagnostic(
+    input_path: Path,
+    session_path: Path,
+    base_url: str,
+    layer: int,
+    api_key_env: str | None,
+    timeout: float,
+) -> dict[str, Any]:
+    """Send one bounded trainer activation to the H200 router worker."""
+    with np.load(input_path, allow_pickle=False) as values:
+        if "values" not in values or "session_identity" not in values:
+            raise ValueError("diagnostic input must contain values and session identity")
+        input_array = np.ascontiguousarray(values["values"])
+        session_identity = str(values["session_identity"].item())
+        source_dtype = str(values.get("source_dtype", ""))
+        provenance = {
+            name: str(values[name].item())
+            for name in (
+                "fixture_sha256",
+                "token_ids_sha256",
+                "model_revision",
+                "adapter_sha256",
+            )
+        }
+    session = json.loads(session_path.read_text())
+    if session.get("side") != "h200":
+        raise ValueError("diagnostic session must be an H200 session")
+    encoded = {
+        "data": base64.b64encode(memoryview(input_array).cast("B")).decode("ascii"),
+        "dtype": input_array.dtype.name,
+        "shape": list(input_array.shape),
+    }
+    target_session_identity = hashlib.sha256(
+        json.dumps(session, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    payload = {
+        "session_identity": target_session_identity,
+        "source_session_identity": session_identity,
+        **{f"source_{name}": value for name, value in provenance.items()},
+        "request_identity": secrets.token_hex(16),
+        "layer": layer,
+        "source_dtype": source_dtype,
+        "router_input_sha256": hashlib.sha256(memoryview(input_array).cast("B")).hexdigest(),
+        "router_input": encoded,
+    }
+    return request_json(
+        f"{base_url.rstrip('/').removesuffix('/v1')}/parity/router-diagnostic",
+        body=payload,
+        api_key=os.environ.get(api_key_env) if api_key_env else None,
+        timeout=timeout,
+    )
+
+
 def capture_h200(
     profile: Profile,
     fixture: Path,
@@ -1475,6 +1528,13 @@ def parser() -> argparse.ArgumentParser:
     h200.add_argument("--api-key-env")
     h200.add_argument("--timeout", type=float, default=1800.0)
     h200.add_argument("output", type=Path)
+    diagnostic = commands.add_parser("diagnose-h200")
+    diagnostic.add_argument("--input", type=Path, required=True)
+    diagnostic.add_argument("--session", type=Path, required=True)
+    diagnostic.add_argument("--base-url", required=True)
+    diagnostic.add_argument("--layer", type=int, required=True)
+    diagnostic.add_argument("--api-key-env")
+    diagnostic.add_argument("--timeout", type=float, default=300.0)
     trainer = commands.add_parser("capture-trainer")
     trainer.add_argument("--fixture", type=Path, required=True)
     trainer.add_argument("--token-exports", type=Path, required=True)
@@ -1541,6 +1601,15 @@ def main(argv: list[str] | None = None) -> int:
                 args.model_revision,
                 args.adapter_sha256,
                 args.image,
+                args.api_key_env,
+                args.timeout,
+            )
+        elif args.command == "diagnose-h200":
+            result = run_h200_router_diagnostic(
+                args.input,
+                args.session,
+                args.base_url,
+                args.layer,
                 args.api_key_env,
                 args.timeout,
             )

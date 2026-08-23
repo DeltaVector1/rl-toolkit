@@ -1,4 +1,5 @@
 import os
+import json
 import sys
 import tempfile
 import types
@@ -24,6 +25,9 @@ from prime_rl.parity_router_trace import (
     router_debug_enabled,
     write_route_chunk,
     write_router_debug_chunk,
+    write_hidden_diagnostic,
+    run_h200_router_diagnostic,
+    diagnostics_enabled,
     write_session,
     _is_mounted,
     _trainer_host_name,
@@ -33,6 +37,15 @@ from prime_rl.parity_router_trace import (
 class FakeTensor:
     def __init__(self, value):
         self.value = np.asarray(value)
+        self.dtype = np.float32
+
+    @property
+    def ndim(self):
+        return self.value.ndim
+
+    @property
+    def shape(self):
+        return self.value.shape
 
     def detach(self):
         return self
@@ -45,6 +58,9 @@ class FakeTensor:
 
     def numpy(self):
         return self.value
+
+    def reshape(self, *shape):
+        return FakeTensor(self.value.reshape(*shape))
 
     def __getitem__(self, key):
         return FakeTensor(self.value[key])
@@ -98,6 +114,68 @@ def session() -> TraceSession:
 
 
 class ParityRouterTraceTest(unittest.TestCase):
+    def test_hidden_diagnostics_are_off_by_default(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(diagnostics_enabled())
+
+    def test_hidden_diagnostic_is_bounded_and_hashed(self):
+        torch = fake_torch()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_session(root, session())
+            environment = {
+                trace_dir_env: str(root),
+                "PRIME_PARITY_DIAGNOSTICS": "1",
+                "PRIME_PARITY_DIAGNOSTIC_TOKENS": "2",
+                "PRIME_PARITY_DIAGNOSTIC_MAX_FILES": "2",
+                "PRIME_PARITY_DIAGNOSTIC_MAX_BYTES": "100000",
+            }
+            values = FakeTensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+            with patch.dict(os.environ, environment, clear=True), patch.dict(
+                sys.modules, {"torch": torch}
+            ):
+                configure_process_trace("trainer", rank=0)
+                write_hidden_diagnostic("layer0_input", values)
+                write_hidden_diagnostic("layer0_input", values)
+            path = root / "trainer-rank-0-pp-0-cp-0-diagnostic-layer0_input.npz"
+            self.assertTrue(path.is_file())
+            manifest = json.loads((root / "parity-diagnostics.json").read_text())
+            self.assertEqual(len(manifest["entries"]), 1)
+            with np.load(path, allow_pickle=False) as saved:
+                self.assertEqual(saved["values"].shape, (2, 2))
+                self.assertEqual(saved["session_identity"].item(), trace_session_identity(session()))
+
+    def test_hidden_diagnostic_rejects_file_limit(self):
+        torch = fake_torch()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_session(root, session())
+            environment = {
+                trace_dir_env: str(root),
+                "PRIME_PARITY_DIAGNOSTICS": "1",
+                "PRIME_PARITY_DIAGNOSTIC_TOKENS": "2",
+                "PRIME_PARITY_DIAGNOSTIC_MAX_FILES": "1",
+                "PRIME_PARITY_DIAGNOSTIC_MAX_BYTES": "100000",
+            }
+            values = FakeTensor([[1.0, 2.0], [3.0, 4.0]])
+            with patch.dict(os.environ, environment, clear=True), patch.dict(
+                sys.modules, {"torch": torch}
+            ):
+                configure_process_trace("trainer", rank=0)
+                write_hidden_diagnostic("layer0_input", values)
+                with self.assertRaisesRegex(ValueError, "file or byte limit"):
+                    write_hidden_diagnostic("layer0_output", values)
+
+    def test_h200_diagnostic_requires_explicit_enable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            metadata = TraceSession(**{**session().__dict__, "side": "h200"})
+            write_session(root, metadata)
+            with patch.dict(os.environ, {trace_dir_env: str(root)}, clear=True):
+                configure_process_trace("h200", rank=0)
+                with self.assertRaisesRegex(ValueError, "diagnostics are disabled"):
+                    run_h200_router_diagnostic(object(), {})
+
     def test_mount_classification_requires_exact_mountpoint(self):
         self.assertTrue(_is_mounted(Path("/app/src/prime_rl/model.py"), {Path("/app/src/prime_rl/model.py")}))
         self.assertFalse(_is_mounted(Path("/app/src/prime_rl/model.py"), {Path("/app/src")}))

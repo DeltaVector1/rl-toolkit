@@ -144,6 +144,11 @@ class FileSystemWeightUpdateWorker(Worker):
         """No-op RPC used by the API server liveness endpoint."""
         return None
 
+    def parity_router_diagnostic(self, payload: dict) -> dict:
+        from prime_rl.parity_router_trace import run_h200_router_diagnostic
+
+        return run_h200_router_diagnostic(self.model_runner, payload)
+
     def stage_lora_adapter(self, source_url: str) -> None:
         destination = adapter_cache_path(source_url)
         destination.parent.mkdir(parents=True, exist_ok=True)

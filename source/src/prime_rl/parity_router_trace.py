@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import fcntl
 import hashlib
 import importlib
 import inspect
@@ -25,6 +26,15 @@ trainer_provenance_name = "trainer-runtime.json"
 router_debug_pattern = re.compile(
     r"^(trainer|h200)-rank-(\d+)-pp-(\d+)-cp-(\d+)-layer-(\d+)-router-debug\.npz$"
 )
+diagnostic_pattern = re.compile(
+    r"^(trainer|h200)-rank-(\d+)-pp-(\d+)-cp-(\d+)-diagnostic-([a-z0-9_-]+)\.npz$"
+)
+diagnostic_manifest_name = "parity-diagnostics.json"
+diagnostic_manifest_lock_name = "parity-diagnostics.lock"
+diagnostic_env = "PRIME_PARITY_DIAGNOSTICS"
+diagnostic_tokens_env = "PRIME_PARITY_DIAGNOSTIC_TOKENS"
+diagnostic_max_files_env = "PRIME_PARITY_DIAGNOSTIC_MAX_FILES"
+diagnostic_max_bytes_env = "PRIME_PARITY_DIAGNOSTIC_MAX_BYTES"
 parity_model_modules = (
     "prime_rl.trainer.model",
     "prime_rl.trainer.lora",
@@ -175,6 +185,33 @@ def trace_root() -> Path | None:
     return path
 
 
+def diagnostics_enabled() -> bool:
+    return os.environ.get(diagnostic_env) == "1"
+
+
+def _diagnostic_limit(name: str) -> int:
+    value = os.environ.get(name)
+    if value is None or not value.isdigit() or int(value) < 1:
+        raise ValueError(f"{name} must be a positive integer when diagnostics are enabled")
+    return int(value)
+
+
+def diagnostic_limits() -> dict[str, int]:
+    if not diagnostics_enabled():
+        return {}
+    return {
+        "tokens": _diagnostic_limit(diagnostic_tokens_env),
+        "max_files": _diagnostic_limit(diagnostic_max_files_env),
+        "max_bytes": _diagnostic_limit(diagnostic_max_bytes_env),
+    }
+
+
+def _diagnostic_name(kind: str) -> str:
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", kind):
+        raise ValueError("diagnostic name is invalid")
+    return kind
+
+
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -288,6 +325,9 @@ def clear_trace(root: Path) -> None:
             or path.name.startswith("trainer-runtime-pp-")
             or chunk_pattern.match(path.name)
             or router_debug_pattern.match(path.name)
+            or diagnostic_pattern.match(path.name)
+            or path.name == diagnostic_manifest_name
+            or path.name == diagnostic_manifest_lock_name
             or lifecycle_pattern.match(path.name)
         ):
             if not path.is_file():
@@ -356,6 +396,9 @@ def configure_trainer_trace(
             raise ValueError("configured parity CP size differs from trainer mesh")
         global _expected_owned_layers
         _expected_owned_layers = expected_owned_layers
+        if diagnostics_enabled():
+            diagnostic_limits()
+            configure_hidden_diagnostics(language_model)
     return configured
 
 
@@ -381,6 +424,11 @@ _debug_written_session: str | None = None
 _owned_layers: set[int] = set()
 _provenance_written = False
 _expected_owned_layers: set[int] = set()
+_diagnostic_files = 0
+_diagnostic_bytes = 0
+_diagnostic_session: str | None = None
+_h200_diagnostic_active = False
+_diagnostic_hooks: list[Any] = []
 _write_lock = threading.Lock()
 
 
@@ -426,6 +474,9 @@ def configure_process_trace(
     global _written_files, _written_bytes, _debug_written, _debug_written_bytes
     global _debug_written_session
     global _owned_layers, _provenance_written
+    global _diagnostic_files, _diagnostic_bytes, _diagnostic_session
+    global _h200_diagnostic_active
+    global _diagnostic_hooks
     _written_files = 0
     _written_bytes = 0
     _debug_written = False
@@ -433,10 +484,308 @@ def configure_process_trace(
     _debug_written_session = None
     _owned_layers = set()
     _provenance_written = False
+    _diagnostic_files = 0
+    _diagnostic_bytes = 0
+    _diagnostic_session = None
+    _h200_diagnostic_active = False
+    for handle in _diagnostic_hooks:
+        handle.remove()
+    _diagnostic_hooks = []
     _runtime_calls.clear()
     _runtime_id_sources.clear()
     _runtime_scales.clear()
     return True
+
+
+def _diagnostic_array(value: Any, limit: int) -> tuple[np.ndarray, str]:
+    tensor = value.detach()
+    source_dtype = str(getattr(tensor, "dtype", "unknown"))
+    if getattr(tensor, "ndim", 0) < 2:
+        raise ValueError("diagnostic tensor must have at least two dimensions")
+    tensor = tensor.reshape(-1, tensor.shape[-1])[:limit]
+    tensor = tensor.to(dtype=__import__("torch").float32, device="cpu")
+    array = np.ascontiguousarray(tensor.numpy())
+    if array.ndim != 2 or not np.isfinite(array).all():
+        raise ValueError("diagnostic tensor is invalid")
+    return array, source_dtype
+
+
+def write_hidden_diagnostic(kind: str, value: Any) -> None:
+    """Write one bounded activation capture when explicitly enabled."""
+    global _diagnostic_files, _diagnostic_bytes, _diagnostic_session
+    root = trace_root()
+    if root is None or _process_side is None or not diagnostics_enabled():
+        return
+    kind = _diagnostic_name(kind)
+    entry_name = (
+        f"{kind}-rank-{_process_rank}-pp-{_process_pp_rank}-cp-{_process_cp_rank}"
+    )
+    session = read_session(root)
+    limits = diagnostic_limits()
+    with _write_lock:
+        session_identity = trace_session_identity(session)
+        if _diagnostic_session != session_identity:
+            _diagnostic_files = 0
+            _diagnostic_bytes = 0
+            _diagnostic_session = session_identity
+        array, source_dtype = _diagnostic_array(value, limits["tokens"])
+        filename = (
+            f"{_process_side}-rank-{_process_rank}-pp-{_process_pp_rank}-"
+            f"cp-{_process_cp_rank}-diagnostic-{kind}.npz"
+        )
+        path = root / filename
+        temporary = root / f".{filename}.{os.getpid()}"
+        with temporary.open("wb") as stream:
+            np.savez(
+                stream,
+                values=array,
+                session_identity=np.asarray(session_identity, dtype="<U64"),
+                name=np.asarray(entry_name, dtype="<U128"),
+                source_dtype=np.asarray(source_dtype, dtype="<U32"),
+                fixture_sha256=np.asarray(session.fixture_sha256, dtype="<U64"),
+                token_ids_sha256=np.asarray(session.token_ids_sha256, dtype="<U64"),
+                model_revision=np.asarray(session.model_revision, dtype="<U40"),
+                adapter_sha256=np.asarray(session.adapter_sha256, dtype="<U64"),
+            )
+        size = temporary.stat().st_size
+        if (
+            _diagnostic_files + 1 > limits["max_files"]
+            or _diagnostic_bytes + size > limits["max_bytes"]
+        ):
+            temporary.unlink()
+            raise ValueError("parity diagnostic file or byte limit exceeded")
+        manifest_path = root / diagnostic_manifest_name
+        with (root / diagnostic_manifest_lock_name).open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if manifest_path.exists():
+                manifest = json.loads(manifest_path.read_text())
+                if manifest.get("session_identity") != session_identity:
+                    temporary.unlink()
+                    raise ValueError("diagnostic manifest session differs")
+                entries = manifest.get("entries", [])
+                if not isinstance(entries, list):
+                    temporary.unlink()
+                    raise ValueError("diagnostic manifest entries are invalid")
+            else:
+                entries = []
+                manifest = {
+                    "schema_version": 1,
+                    "kind": "glm52_policy_parity_diagnostics",
+                    "session_identity": session_identity,
+                    "side": _process_side,
+                    "entries": entries,
+                }
+            if any(entry.get("name") == entry_name for entry in entries):
+                temporary.unlink()
+                return
+            if path.exists():
+                temporary.unlink()
+                raise FileExistsError(f"diagnostic output already exists: {path}")
+            existing_bytes = sum(int(entry.get("bytes", 0)) for entry in entries)
+            if (
+                len(entries) + 1 > limits["max_files"]
+                or existing_bytes + size > limits["max_bytes"]
+            ):
+                temporary.unlink()
+                raise ValueError("parity diagnostic file or byte limit exceeded")
+            os.replace(temporary, path)
+            entry = {
+                "name": entry_name,
+                "file": filename,
+                "shape": list(array.shape),
+                "source_dtype": source_dtype,
+                "sha256": sha256_bytes(memoryview(array).cast("B")),
+                "bytes": size,
+            }
+            entries.append(entry)
+            manifest["entries"] = entries
+            manifest_temporary = root / f".{diagnostic_manifest_name}.{os.getpid()}"
+            manifest_temporary.write_text(json.dumps(manifest, sort_keys=True) + "\n")
+            os.replace(manifest_temporary, manifest_path)
+        _diagnostic_files += 1
+        _diagnostic_bytes += size
+
+
+def h200_diagnostic_is_active() -> bool:
+    return _h200_diagnostic_active
+
+
+def _h200_router_for_layer(model: Any, layer: int) -> Any:
+    modules = model.modules() if hasattr(model, "modules") else ()
+    for module in modules:
+        router = getattr(module, "router", None)
+        if router is not None and getattr(router, "_prime_parity_layer", None) == layer:
+            return router
+    raise ValueError(f"H200 router layer {layer} is not available")
+
+
+def _router_logits(router: Any, hidden: Any) -> Any:
+    for owner in (router, getattr(router, "layer", None)):
+        if owner is None:
+            continue
+        for name in ("gate", "router", "linear"):
+            operation = getattr(owner, name, None)
+            if callable(operation):
+                return operation(hidden)
+            weight = getattr(operation, "weight", None)
+            if weight is not None:
+                import torch.nn.functional as functional
+
+                return functional.linear(hidden, weight)
+    raise ValueError("H200 router does not expose its gate operation")
+
+
+def run_h200_router_diagnostic(model_runner: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    """Run one bounded captured-input router check inside the H200 worker."""
+    if not diagnostics_enabled():
+        raise ValueError("H200 parity diagnostics are disabled")
+    if _process_side != "h200":
+        raise ValueError("H200 router diagnostics require an H200 process")
+    root = trace_root()
+    if root is None:
+        raise ValueError("H200 router diagnostics have no trace directory")
+    session = read_session(root)
+    session_identity = payload.get("session_identity")
+    source_session_identity = payload.get("source_session_identity")
+    request_identity = payload.get("request_identity")
+    if session.side != "h200" or trace_session_identity(session) != session_identity:
+        raise ValueError("H200 diagnostic session differs")
+    if not isinstance(source_session_identity, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", source_session_identity
+    ):
+        raise ValueError("trainer diagnostic session identity is invalid")
+    for name in ("fixture_sha256", "token_ids_sha256", "adapter_sha256"):
+        if payload.get(f"source_{name}") != getattr(session, name):
+            raise ValueError(f"H200 diagnostic {name} differs")
+    if payload.get("source_model_revision") != session.model_revision:
+        raise ValueError("H200 diagnostic model revision differs")
+    if not isinstance(request_identity, str) or not re.fullmatch(r"[0-9a-f]{32}", request_identity):
+        raise ValueError("H200 diagnostic request identity is invalid")
+    layer = payload.get("layer")
+    if not isinstance(layer, int) or layer != session.dense_layers:
+        raise ValueError("H200 diagnostic must target the first routed layer")
+    encoded = payload.get("router_input")
+    if not isinstance(encoded, dict):
+        raise ValueError("H200 diagnostic input is missing")
+    input_array = decoded_array(encoded)
+    expected_input_hash = payload.get("router_input_sha256")
+    actual_input_hash = sha256_bytes(
+        memoryview(np.ascontiguousarray(input_array)).cast("B")
+    )
+    if expected_input_hash != actual_input_hash:
+        raise ValueError("H200 diagnostic input checksum differs")
+    source_dtype = payload.get("source_dtype")
+    if source_dtype not in {"torch.bfloat16", "bfloat16"}:
+        raise ValueError("H200 diagnostic input is not a BF16 trainer capture")
+    limits = diagnostic_limits()
+    if input_array.ndim != 2 or input_array.shape[0] > limits["tokens"]:
+        raise ValueError("H200 diagnostic input exceeds the configured token limit")
+    if input_array.shape[1] < 1 or not np.isfinite(input_array).all():
+        raise ValueError("H200 diagnostic input is invalid")
+    torch = __import__("torch")
+    model = getattr(model_runner, "model", model_runner)
+    model = getattr(model, "runnable", model)
+    router = _h200_router_for_layer(model, layer)
+    parameter = next(iter(model.parameters()), None)
+    device = getattr(parameter, "device", "cuda")
+    hidden = torch.as_tensor(input_array, dtype=torch.bfloat16, device=device)
+    global _h200_diagnostic_active
+    _h200_diagnostic_active = True
+    try:
+        logits = _router_logits(router, hidden)
+        route_weights, route_ids = router.select_experts(hidden, logits)
+    finally:
+        _h200_diagnostic_active = False
+    logits = logits.to(torch.float32)
+    scores = 0.5 * torch.tanh(0.5 * logits) + 0.5
+    correction_bias = getattr(router, "e_score_correction_bias", None)
+    selection_scores = scores
+    if correction_bias is not None:
+        selection_scores = selection_scores + correction_bias.to(torch.float32)
+    write_hidden_diagnostic(f"layer{layer}_h200_input", hidden)
+    write_hidden_diagnostic(f"layer{layer}_h200_logits", logits)
+    write_hidden_diagnostic(f"layer{layer}_h200_scores", scores)
+    write_hidden_diagnostic(f"layer{layer}_h200_selection_scores", selection_scores)
+    write_hidden_diagnostic(f"layer{layer}_h200_route_ids", route_ids)
+    write_hidden_diagnostic(f"layer{layer}_h200_route_weights", route_weights)
+    return {
+        "session_identity": session_identity,
+        "source_session_identity": source_session_identity,
+        "request_identity": request_identity,
+        "layer": layer,
+        "input_shape": list(input_array.shape),
+    }
+
+
+def _hook_tensor(value: Any) -> Any | None:
+    if value is None:
+        return None
+    if hasattr(value, "detach"):
+        return value
+    if isinstance(value, (tuple, list)):
+        for item in value:
+            result = _hook_tensor(item)
+            if result is not None:
+                return result
+    return None
+
+
+def configure_hidden_diagnostics(language_model: Any) -> None:
+    """Install bounded hooks for the first dense layers of the local PP stage."""
+    if not diagnostics_enabled():
+        return
+    root_model = language_model
+    if not hasattr(root_model, "embed_tokens") and hasattr(root_model, "model"):
+        root_model = root_model.model
+    layers = getattr(root_model, "layers", None)
+    if layers is None:
+        raise ValueError("parity diagnostics cannot find model layers")
+    embed = getattr(root_model, "embed_tokens", None)
+    if embed is not None:
+        _diagnostic_hooks.append(
+            embed.register_forward_hook(
+                lambda _module, _inputs, output: write_hidden_diagnostic(
+                    "embedding", _hook_tensor(output)
+                )
+            )
+        )
+    items = layers.items() if hasattr(layers, "items") else enumerate(layers)
+    for raw_layer, layer in items:
+        layer_number = int(raw_layer)
+        if layer_number > 2:
+            continue
+        _diagnostic_hooks.append(
+            layer.register_forward_pre_hook(
+                lambda _module, inputs, number=layer_number: write_hidden_diagnostic(
+                    f"layer{number}_input", _hook_tensor(inputs)
+                )
+            )
+        )
+        attention = getattr(layer, "self_attn", None)
+        if attention is not None:
+            _diagnostic_hooks.append(
+                attention.register_forward_hook(
+                    lambda _module, _inputs, output, number=layer_number: write_hidden_diagnostic(
+                        f"layer{number}_attention", _hook_tensor(output)
+                    )
+                )
+            )
+        mlp = getattr(layer, "mlp", None)
+        if mlp is not None:
+            _diagnostic_hooks.append(
+                mlp.register_forward_hook(
+                    lambda _module, _inputs, output, number=layer_number: write_hidden_diagnostic(
+                        f"layer{number}_mlp", _hook_tensor(output)
+                    )
+                )
+            )
+        _diagnostic_hooks.append(
+            layer.register_forward_hook(
+                lambda _module, _inputs, output, number=layer_number: write_hidden_diagnostic(
+                    f"layer{number}_output", _hook_tensor(output)
+                )
+            )
+        )
 
 
 def _lifecycle_path(root: Path, rank: int) -> Path:
@@ -770,6 +1119,8 @@ def write_router_debug_chunk(
         return
     if not router_debug_enabled(layer):
         return
+    if diagnostics_enabled():
+        write_hidden_diagnostic(f"layer{layer}_router_input", router_input)
     session = read_session(root)
     with _write_lock:
         session_identity = trace_session_identity(session)
@@ -965,7 +1316,7 @@ def install_vllm_parity_trace() -> bool:
                 input_ids=input_ids,
             )
             layer = getattr(self, "_prime_parity_layer", None)
-            if layer is not None:
+            if layer is not None and not h200_diagnostic_is_active():
                 route_output_scale = getattr(
                     self, "_prime_parity_route_output_scale", None
                 )
