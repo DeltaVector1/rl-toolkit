@@ -42,6 +42,12 @@ def _require_static_expert_bias(module: nn.Module) -> torch.Tensor:
     return value
 
 
+def _move_static_expert_bias(module: nn.Module, device: torch.device) -> torch.Tensor:
+    value = _require_static_expert_bias(module).to(device=device, dtype=torch.float32)
+    module._fp32_expert_bias = value
+    return _require_static_expert_bias(module)
+
+
 @dataclass
 class MoEArgs:
     num_experts: int = 8
@@ -1077,9 +1083,10 @@ class MoE(nn.Module):
         else:
             expert_bias = self.expert_bias
         if expert_bias is not None and expert_bias.device != x.device:
-            expert_bias = expert_bias.to(x.device)
             if static_expert_bias:
-                self._fp32_expert_bias = expert_bias
+                expert_bias = _move_static_expert_bias(self, x.device)
+            else:
+                expert_bias = expert_bias.to(device=x.device, dtype=torch.float32)
         (
             top_scores,
             selected_experts_indices,
@@ -1566,9 +1573,10 @@ class LatentMoE(nn.Module):
         else:
             expert_bias = self.expert_bias
         if expert_bias is not None and expert_bias.device != x_flat.device:
-            expert_bias = expert_bias.to(x_flat.device)
             if static_expert_bias:
-                self._fp32_expert_bias = expert_bias
+                expert_bias = _move_static_expert_bias(self, x_flat.device)
+            else:
+                expert_bias = expert_bias.to(device=x_flat.device, dtype=torch.float32)
         top_scores, selected_experts_indices, num_tokens_per_expert, routing_confidence_sum = self.router(
             x_flat, expert_bias, routed_experts=routed_experts
         )

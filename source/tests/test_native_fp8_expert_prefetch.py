@@ -228,6 +228,9 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
         self.assertEqual(moe_source.count("_require_static_expert_bias(self)"), 2)
         self.assertIn("selection_bias = expert_bias", moe_source)
         self.assertIn("selection_scores = selection_scores + selection_bias.to(torch.float32)", moe_source)
+        self.assertIn("_move_static_expert_bias(self, x.device)", moe_source)
+        self.assertIn("_move_static_expert_bias(self, x_flat.device)", moe_source)
+        self.assertIn("to(device=device, dtype=torch.float32)", moe_source)
         self.assertIn('static_expert_bias = getattr(self, "_use_static_expert_bias", False)', moe_source)
         self.assertIn("if self.load_balance_coeff is not None:", moe_source)
         self.assertIn("expert_bias_is_static=static_expert_bias", moe_source)
@@ -436,6 +439,23 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
         for value in seen:
             torch.testing.assert_close(value, source, rtol=0, atol=0)
         self.assertEqual(float(mlp.tokens_per_expert.sum()), 0.0)
+
+    @unittest.skipUnless(torch is not None, "Static bias transfer requires PyTorch")
+    def test_static_bias_transfer_ignores_bf16_registered_buffer(self):
+        from prime_rl.trainer.model import _glm_moe_bias_sha256
+        from prime_rl.trainer.models.layers.moe import MoE, MoEArgs
+        from prime_rl.trainer.models.layers.moe import _move_static_expert_bias
+
+        mlp = MoE(MoEArgs(num_experts=4, top_k=1), dim=2, hidden_dim=4)
+        exact = torch.tensor([34.18921, 34.60598, 34.601982, 34.60798], dtype=torch.float32)
+        mlp.expert_bias = mlp.expert_bias.to(torch.bfloat16)
+        mlp._fp32_expert_bias = exact.clone()
+        digest = _glm_moe_bias_sha256(exact)
+        mlp._fp32_expert_bias_source_sha256 = digest
+        mlp._fp32_expert_bias_cache_sha256 = digest
+        applied = _move_static_expert_bias(mlp, torch.device("cpu"))
+        torch.testing.assert_close(applied, exact, rtol=0, atol=0)
+        self.assertEqual(applied.dtype, torch.float32)
 
     @unittest.skipUnless(torch is not None, "Dynamic router behavior requires PyTorch")
     def test_non_frozen_router_uses_registered_bias_without_static_cache(self):
