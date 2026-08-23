@@ -759,6 +759,9 @@ def write_router_debug_chunk(
     pre_bias_scores: Any,
     selection_scores: Any,
     expert_bias: Any | None = None,
+    expert_bias_source_sha256: str | None = None,
+    expert_bias_cache_sha256: str | None = None,
+    expert_bias_is_static: bool = False,
 ) -> None:
     """Write one bounded router diagnostic chunk for the first routed layer."""
     global _debug_written, _debug_written_bytes, _debug_written_session
@@ -810,6 +813,8 @@ def write_router_debug_chunk(
             + pre_bias_array.nbytes
             + selection_array.nbytes
             + (0 if bias_array is None else bias_array.nbytes)
+            + (0 if expert_bias_source_sha256 is None else 64)
+            + (0 if expert_bias_cache_sha256 is None else 64)
             + 4096
         )
         if estimate > max_bytes:
@@ -834,6 +839,15 @@ def write_router_debug_chunk(
                 arrays["expert_bias_object_id"] = np.asarray(id(expert_bias), dtype=np.uint64)
                 data_ptr = expert_bias.data_ptr() if hasattr(expert_bias, "data_ptr") else 0
                 arrays["expert_bias_data_ptr"] = np.asarray(data_ptr, dtype=np.uint64)
+                arrays["expert_bias_is_static"] = np.asarray(expert_bias_is_static, dtype=np.bool_)
+                if expert_bias_source_sha256 is not None:
+                    arrays["expert_bias_source_sha256"] = np.asarray(
+                        expert_bias_source_sha256, dtype="<U64"
+                    )
+                if expert_bias_cache_sha256 is not None:
+                    arrays["expert_bias_cache_sha256"] = np.asarray(
+                        expert_bias_cache_sha256, dtype="<U64"
+                    )
             np.savez(stream, **arrays)
         os.replace(temporary, path)
         _debug_written = True

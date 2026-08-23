@@ -631,7 +631,13 @@ class TokenChoiceTopKRouter(nn.Module):
         self.use_fp32_router_output = False
 
     def forward(
-        self, x: torch.Tensor, expert_bias: torch.Tensor | None = None, routed_experts: torch.Tensor | None = None
+        self,
+        x: torch.Tensor,
+        expert_bias: torch.Tensor | None = None,
+        routed_experts: torch.Tensor | None = None,
+        expert_bias_is_static: bool = False,
+        expert_bias_source_sha256: str | None = None,
+        expert_bias_cache_sha256: str | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -703,6 +709,9 @@ class TokenChoiceTopKRouter(nn.Module):
                 scores,
                 selection_scores,
                 expert_bias,
+                expert_bias_source_sha256,
+                expert_bias_cache_sha256,
+                expert_bias_is_static,
             )
             del raw_router_logits
 
@@ -1039,20 +1048,30 @@ class MoE(nn.Module):
 
         # top_scores and selected_experts_indices shape (bs*slen*top_k,)
         # num_tokens_per_expert shape (num_experts,)
-        if getattr(self, "_use_static_expert_bias", False):
+        static_expert_bias = getattr(self, "_use_static_expert_bias", False)
+        if static_expert_bias and getattr(self, "_fp32_expert_bias_source_sha256", None) is None:
+            raise RuntimeError("Frozen GLM routing requires an exact source bias hash")
+        if static_expert_bias:
             expert_bias = getattr(self, "_fp32_expert_bias", self.expert_bias)
         else:
             expert_bias = self.expert_bias
         if expert_bias is not None and expert_bias.device != x.device:
             expert_bias = expert_bias.to(x.device)
-            if getattr(self, "_use_static_expert_bias", False):
+            if static_expert_bias:
                 self._fp32_expert_bias = expert_bias
         (
             top_scores,
             selected_experts_indices,
             num_tokens_per_expert,
             routing_confidence_sum,
-        ) = self.router(x, expert_bias, routed_experts=routed_experts)
+        ) = self.router(
+            x,
+            expert_bias,
+            routed_experts=routed_experts,
+            expert_bias_is_static=static_expert_bias,
+            expert_bias_source_sha256=getattr(self, "_fp32_expert_bias_source_sha256", None),
+            expert_bias_cache_sha256=getattr(self, "_fp32_expert_bias_cache_sha256", None),
+        )
 
         # tokens_per_expert will be used to update the expert bias for load balancing.
         # and also to count the expert usage
@@ -1518,13 +1537,16 @@ class LatentMoE(nn.Module):
             _, _, top_k = routed_experts.shape
             routed_experts = routed_experts.reshape(-1, top_k)
 
-        if getattr(self, "_use_static_expert_bias", False):
+        static_expert_bias = getattr(self, "_use_static_expert_bias", False)
+        if static_expert_bias and getattr(self, "_fp32_expert_bias_source_sha256", None) is None:
+            raise RuntimeError("Frozen GLM routing requires an exact source bias hash")
+        if static_expert_bias:
             expert_bias = getattr(self, "_fp32_expert_bias", self.expert_bias)
         else:
             expert_bias = self.expert_bias
         if expert_bias is not None and expert_bias.device != x_flat.device:
             expert_bias = expert_bias.to(x_flat.device)
-            if getattr(self, "_use_static_expert_bias", False):
+            if static_expert_bias:
                 self._fp32_expert_bias = expert_bias
         top_scores, selected_experts_indices, num_tokens_per_expert, routing_confidence_sum = self.router(
             x_flat, expert_bias, routed_experts=routed_experts

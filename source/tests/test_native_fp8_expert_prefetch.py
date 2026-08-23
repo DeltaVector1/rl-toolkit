@@ -212,6 +212,8 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
         self.assertIn("_glm_freeze_moe_router", model_source)
         self.assertIn("_use_static_expert_bias", model_source)
         self.assertIn("_expert_bias_updates_disabled", model_source)
+        self.assertIn("_fp32_expert_bias_source_sha256", model_source)
+        self.assertIn("static routing correction changed after source capture", model_source)
         setup_source = ast.unparse(
             next(
                 node
@@ -223,9 +225,9 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
         self.assertIn("validate_glm_moe_bias_values(model, parallel_dims)", setup_source)
         moe_source = (ROOT / "source/src/prime_rl/trainer/models/layers/moe.py").read_text()
         self.assertIn('getattr(self, "_fp32_expert_bias", self.expert_bias)', moe_source)
-        self.assertIn('if getattr(self, "_use_static_expert_bias", False)', moe_source)
+        self.assertIn('static_expert_bias = getattr(self, "_use_static_expert_bias", False)', moe_source)
         self.assertIn("if self.load_balance_coeff is not None:", moe_source)
-        self.assertIn("self.router(x, expert_bias, routed_experts=routed_experts)", moe_source)
+        self.assertIn("expert_bias_is_static=static_expert_bias", moe_source)
 
     @unittest.skipUnless(torch is not None, "PP fingerprint validation requires PyTorch")
     def test_glm_router_bias_fingerprint_requires_all_75_routed_layers(self):
@@ -337,6 +339,10 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
             restore_glm_moe_bias_values(model, root)
             self.assertEqual(model.model.layers[0].mlp.expert_bias.dtype, torch.bfloat16)
             torch.testing.assert_close(model.model.layers[0].mlp._fp32_expert_bias, source, rtol=0, atol=0)
+            self.assertEqual(
+                model.model.layers[0].mlp._fp32_expert_bias_source_sha256,
+                model.model.layers[0].mlp._fp32_expert_bias_cache_sha256,
+            )
             changed = source + torch.tensor([0.123, 0.0, -0.25, 0.5])
             model.model.layers[0].mlp.expert_bias.copy_(changed)
             validate_glm_moe_bias_values(model)
@@ -393,6 +399,11 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
         self.assertNotIn("_fp32_expert_bias", mlp._buffers)
         self.assertNotIn("_fp32_expert_bias", model.state_dict())
         torch.testing.assert_close(mlp._fp32_expert_bias, source, rtol=0, atol=0)
+        mlp._fp32_expert_bias.add_(1.0)
+        with self.assertRaisesRegex(RuntimeError, "changed after source capture"):
+            cache_glm_moe_bias_values(model)
+        mlp._fp32_expert_bias.copy_(source)
+        cache_glm_moe_bias_values(model)
 
         seen = []
         mlp.router = RecordingRouter(seen)

@@ -144,7 +144,17 @@ class ParityRouterTraceTest(unittest.TestCase):
             with patch.dict(os.environ, environment, clear=True), patch.dict(sys.modules, {"torch": torch}):
                 configure_process_trace("trainer", rank=0)
                 bias = FakeTensor([1.1, 2.2, 3.3, 4.4])
-                write_router_debug_chunk(1, values, values, values, values, bias)
+                write_router_debug_chunk(
+                    1,
+                    values,
+                    values,
+                    values,
+                    values,
+                    bias,
+                    "a" * 64,
+                    "a" * 64,
+                    True,
+                )
             path = root / "trainer-rank-0-pp-0-cp-0-layer-1-router-debug.npz"
             self.assertTrue(path.is_file())
             with np.load(path, allow_pickle=False) as saved:
@@ -154,6 +164,9 @@ class ParityRouterTraceTest(unittest.TestCase):
                 self.assertEqual(saved["selection_scores"].shape, (2, 4))
                 np.testing.assert_allclose(saved["expert_bias"], bias.value)
                 self.assertEqual(saved["expert_bias_data_ptr"].item(), 0)
+                self.assertEqual(saved["expert_bias_source_sha256"].item(), "a" * 64)
+                self.assertEqual(saved["expert_bias_cache_sha256"].item(), "a" * 64)
+                self.assertTrue(saved["expert_bias_is_static"].item())
             clear_trace(root)
             self.assertFalse(path.exists())
 

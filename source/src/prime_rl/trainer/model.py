@@ -669,9 +669,15 @@ def cache_glm_moe_bias_values(model: nn.Module) -> None:
             if value is None or value.dtype != torch.float32:
                 raise RuntimeError("Cannot cache a non-FP32 GLM routing correction")
             cached = value.detach().clone()
+            mlp._fp32_expert_bias_source_sha256 = _glm_moe_bias_sha256(cached)
         elif cached.dtype != torch.float32:
             raise RuntimeError("GLM static routing correction must remain float32")
+        cache_sha256 = _glm_moe_bias_sha256(cached)
+        source_sha256 = getattr(mlp, "_fp32_expert_bias_source_sha256", None)
+        if source_sha256 is not None and cache_sha256 != source_sha256:
+            raise RuntimeError("GLM static routing correction changed after source capture")
         setattr(mlp, "_fp32_expert_bias", cached)
+        mlp._fp32_expert_bias_cache_sha256 = cache_sha256
         mlp._use_static_expert_bias = True
         mlp._expert_bias_updates_disabled = True
         if "_fp32_expert_bias" in mlp._buffers:
@@ -760,6 +766,7 @@ def restore_glm_moe_bias_values(
                     mlp._fp32_expert_bias = source.to(
                         device=target.device, dtype=torch.float32
                     ).detach().clone()
+                    mlp._fp32_expert_bias_source_sha256 = _glm_moe_bias_sha256(source)
                 if int(layer_index) == 3 and os.environ.get("RANK", "0") == "0":
                     data_ptr = target.data_ptr() if hasattr(target, "data_ptr") else 0
                     get_logger().info(
@@ -778,6 +785,13 @@ def restore_glm_moe_bias_values(
     if frozen:
         model._glm_moe_source_layers = live_layers
     _publish_glm_moe_bias_fingerprint(model, parallel_dims, live_layers, "Restored")
+
+
+def _glm_moe_bias_sha256(value: torch.Tensor) -> str:
+    if hasattr(value, "to_local"):
+        value = value.to_local()
+    value = value.detach().to(device="cpu").contiguous()
+    return hashlib.sha256(value.view(torch.uint8).numpy().tobytes()).hexdigest()
 
 
 def freeze_sparse_indexer(model: nn.Module) -> None:
