@@ -878,7 +878,10 @@ class ParityRouterTraceTest(unittest.TestCase):
                                     route_output_scale=metadata.route_output_scale,
                                 )
                 marker = read_h200_runtime_marker(root, metadata)
+                ids, weights = assemble_chunks(root, metadata)
             self.assertEqual(marker["ranks"], list(range(8)))
+            self.assertEqual(ids.shape, (4, 3, 2))
+            np.testing.assert_allclose(weights[:, 1:, :].sum(axis=-1), 1.0)
 
     def test_direct_diagnostic_accepts_all_tp8_results_but_writes_once(self):
         result = {

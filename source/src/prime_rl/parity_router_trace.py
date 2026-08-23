@@ -590,7 +590,6 @@ _diagnostic_files = 0
 _diagnostic_bytes = 0
 _diagnostic_session: str | None = None
 _h200_diagnostic_active = False
-_h200_direct_diagnostic = False
 _diagnostic_hooks: list[Any] = []
 _write_lock = threading.Lock()
 
@@ -638,7 +637,7 @@ def configure_process_trace(
     global _debug_written_session
     global _owned_layers, _provenance_written
     global _diagnostic_files, _diagnostic_bytes, _diagnostic_session
-    global _h200_diagnostic_active, _h200_direct_diagnostic
+    global _h200_diagnostic_active
     global _diagnostic_hooks
     _written_files = 0
     _written_bytes = 0
@@ -651,7 +650,6 @@ def configure_process_trace(
     _diagnostic_bytes = 0
     _diagnostic_session = None
     _h200_diagnostic_active = False
-    _h200_direct_diagnostic = False
     for handle in _diagnostic_hooks:
         handle.remove()
     _diagnostic_hooks = []
@@ -702,7 +700,7 @@ def write_hidden_diagnostic(
         return
     if _process_side == "h200" and _active_h200_session is None:
         return
-    if _process_side == "h200" and _h200_direct_diagnostic and _process_rank != 0:
+    if _process_side == "h200" and _process_rank != 0:
         return
     kind = _diagnostic_name(kind)
     entry_name = (
@@ -1252,7 +1250,6 @@ def h200_trace_request(session_identity: str, request_identity: str):
 @contextmanager
 def h200_diagnostic_request(session_identity: str, request_identity: str):
     global _process_session, _process_request, _active_h200_session
-    global _h200_direct_diagnostic
     root = validated_trace_root()
     if root is None or _process_side != "h200":
         raise ValueError("H200 diagnostic requires an H200 trace process")
@@ -1265,13 +1262,11 @@ def h200_diagnostic_request(session_identity: str, request_identity: str):
         _process_session = session
         _process_request = request_identity
         _active_h200_session = session_identity
-        _h200_direct_diagnostic = True
     try:
         yield session
     finally:
         with _write_lock:
             _active_h200_session = None
-            _h200_direct_diagnostic = False
 
 
 def h200_trace_is_active() -> bool:
@@ -1364,6 +1359,8 @@ def write_route_chunk(
     if root is None or _process_side is None:
         return
     if _process_side == "h200" and _active_h200_session is None:
+        return
+    if _process_side == "h200" and _process_rank != 0:
         return
     torch = __import__("torch")
     compiler = getattr(torch, "compiler", None)
@@ -1604,6 +1601,8 @@ def router_debug_enabled(layer: int | None) -> bool:
     if layer is None or validated_trace_root() is None or _process_side is None:
         return False
     if _process_side == "h200":
+        if _process_rank != 0:
+            return False
         return _active_h200_session is not None and _process_request is not None
     return True
 
