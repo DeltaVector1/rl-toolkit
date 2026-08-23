@@ -1,5 +1,6 @@
 import hashlib
 import json
+import subprocess
 import threading
 import tempfile
 import unittest
@@ -50,6 +51,55 @@ class EdgeOperationsTest(unittest.TestCase):
         self.assertEqual(
             config["env_vars"]["PRIME_PARITY_ROUTER_TRACE_SOURCE"],
             f"{stage}/trainer-router-trace",
+        )
+
+    def test_parity_python_missing_numpy_fails_before_host_copy(self):
+        failed = subprocess.CompletedProcess(
+            [], 1, stdout="", stderr="No module named numpy"
+        )
+        with (
+            patch.object(training_ops.subprocess, "run", return_value=failed),
+            patch.object(training_ops.os, "access", return_value=True),
+            self.assertRaisesRegex(RuntimeError, "no usable parity Python"),
+        ):
+            training_ops._parity_python()
+
+        with (
+            patch.object(
+                training_ops,
+                "_parity_python",
+                side_effect=RuntimeError("no usable parity Python"),
+            ),
+            patch.object(training_ops, "_copy_parity_host_evidence") as copy_hosts,
+            self.assertRaisesRegex(RuntimeError, "no usable parity Python"),
+        ):
+            training_ops.collect_glm52_policy_parity("test-run", nodes=["n82"])
+        copy_hosts.assert_not_called()
+
+    def test_parity_commands_use_the_selected_interpreter(self):
+        calls = []
+
+        def run(command, **kwargs):
+            calls.append((command, kwargs))
+            return subprocess.CompletedProcess(command, 0)
+
+        selected = "/usr/bin/python3.12"
+        with patch.object(training_ops.subprocess, "run", side_effect=run):
+            for action in ("collect-trainer", "capture-trainer", "compare"):
+                training_ops._run_parity_command(
+                    selected,
+                    Path("scripts/glm52_policy_parity.py"),
+                    Path("configs/qualification/glm52-policy-parity.toml"),
+                    action,
+                    ["output"],
+                    check=action != "compare",
+                )
+
+        self.assertEqual(len(calls), 3)
+        self.assertEqual([call[0][0] for call in calls], [selected] * 3)
+        self.assertEqual(
+            [call[0][4] for call in calls],
+            ["collect-trainer", "capture-trainer", "compare"],
         )
 
     def test_parity_host_copies_overlap_and_keep_configured_order(self):

@@ -3718,6 +3718,69 @@ def _validate_parity_remote_source(remote: str) -> None:
     raise Refused("parity evidence source is not an approved exact directory")
 
 
+def _parity_python() -> str:
+    configured = operations.get("paths", {}).get("parity_python")
+    candidates = [configured, "/usr/bin/python3", sys.executable]
+    checked: set[str] = set()
+    failures: list[str] = []
+    dependency_check = (
+        "import numpy, tomllib, urllib.request; "
+        "assert numpy.__version__"
+    )
+    for candidate in candidates:
+        if not isinstance(candidate, str) or not candidate:
+            continue
+        path = Path(candidate)
+        if not path.is_absolute():
+            failures.append(f"{candidate}: interpreter path is not absolute")
+            continue
+        try:
+            resolved = str(path.resolve(strict=True))
+        except OSError:
+            failures.append(f"{candidate}: interpreter does not exist")
+            continue
+        if resolved in checked:
+            continue
+        checked.add(resolved)
+        if not os.access(resolved, os.X_OK):
+            failures.append(f"{resolved}: interpreter is not executable")
+            continue
+        try:
+            result = subprocess.run(
+                [resolved, "-c", dependency_check],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            failures.append(f"{resolved}: dependency check failed: {error}")
+            continue
+        if result.returncode == 0:
+            return resolved
+        detail = (result.stderr or result.stdout).strip().replace("\n", " ")[:160]
+        failures.append(f"{resolved}: missing parity dependency: {detail}")
+    raise RuntimeError(
+        "no usable parity Python interpreter was found before evidence transfer: "
+        + "; ".join(failures)
+    )
+
+
+def _run_parity_command(
+    python: str,
+    script: Path,
+    profile: Path,
+    action: str,
+    arguments: list[str],
+    *,
+    check: bool,
+) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [python, str(script), "--profile", str(profile), action, *arguments],
+        check=check,
+    )
+
+
 def _validate_parity_extraction(destination: Path) -> None:
     root = destination.resolve()
     for current, directories, files in os.walk(root, followlinks=False):
@@ -3835,6 +3898,7 @@ def collect_glm52_policy_parity(name: str, nodes: list[str] | None = None) -> di
     """Collect every trainer host trace and write the canonical parity report."""
     if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
         raise Refused("parity trace run name contains unsafe characters")
+    parity_python = _parity_python()
     nodes = [_check_parity_host(host) for host in (nodes or trainer_hosts)]
     profile = repo_root / production_parity_profile
     trainer_config = repo_root / "configs/qualification/glm52-policy-parity-trainer.toml"
@@ -3875,27 +3939,51 @@ def collect_glm52_policy_parity(name: str, nodes: list[str] | None = None) -> di
         copy_tree(orchestrator_host, f"{remote_root}/fixture", fixture)
         copy_tree(orchestrator_host, f"{remote_root}/h200-capture-final", capture)
         merged = root / "trainer-router-trace"
-        subprocess.run(
-            [sys.executable, str(script), "--profile", str(profile), "collect-trainer",
-             "--trainer-config", str(trainer_config),
-             *sum((["--source", str(source)] for source in sources), []), str(merged)],
+        _run_parity_command(
+            parity_python,
+            script,
+            profile,
+            "collect-trainer",
+            [
+                "--trainer-config",
+                str(trainer_config),
+                *sum((["--source", str(source)] for source in sources), []),
+                str(merged),
+            ],
             check=True,
         )
         trainer = root / "trainer"
         model_revision = json.loads((capture / "manifest.json").read_text())["model_revision"]
         adapter_sha256 = json.loads((capture / "manifest.json").read_text())["adapter_sha256"]
-        subprocess.run(
-            [sys.executable, str(script), "--profile", str(profile), "capture-trainer",
-             "--fixture", str(fixture), "--token-exports", str(root / "tokens"),
-             "--router-trace", str(merged), "--model-revision", model_revision,
-             "--adapter-sha256", adapter_sha256, "--image", trainer_image, str(trainer)],
+        _run_parity_command(
+            parity_python,
+            script,
+            profile,
+            "capture-trainer",
+            [
+                "--fixture", str(fixture),
+                "--token-exports", str(root / "tokens"),
+                "--router-trace", str(merged),
+                "--model-revision", model_revision,
+                "--adapter-sha256", adapter_sha256,
+                "--image", trainer_image,
+                str(trainer),
+            ],
             check=True,
         )
         report = root / "report.json"
-        subprocess.run(
-            [sys.executable, str(script), "--profile", str(profile), "compare",
-             "--fixture", str(fixture), "--trainer", str(trainer), "--h200", str(capture),
-             "--operations", str(repo_root / "configs/operations.toml"), "--output", str(report)],
+        _run_parity_command(
+            parity_python,
+            script,
+            profile,
+            "compare",
+            [
+                "--fixture", str(fixture),
+                "--trainer", str(trainer),
+                "--h200", str(capture),
+                "--operations", str(repo_root / "configs/operations.toml"),
+                "--output", str(report),
+            ],
             check=False,
         )
         if not report.is_file():
