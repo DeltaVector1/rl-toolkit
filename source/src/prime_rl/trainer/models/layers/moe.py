@@ -582,6 +582,8 @@ def _selected_probability_mass_sum(
 class _BF16RouterGemm(torch.autograd.Function):
     @staticmethod
     def forward(ctx, hidden_states: torch.Tensor, gate_weight: torch.Tensor) -> torch.Tensor:
+        if gate_weight.requires_grad:
+            raise RuntimeError("BF16 router GEMM requires frozen router weights")
         ctx.input_dtype = hidden_states.dtype
         ctx.save_for_backward(gate_weight)
         return torch.mm(hidden_states, gate_weight.t(), out_dtype=torch.float32)

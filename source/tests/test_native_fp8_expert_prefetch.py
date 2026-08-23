@@ -112,6 +112,14 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
             moe_source,
         )
         self.assertIn(
+            'if gate_weight.requires_grad:',
+            moe_source,
+        )
+        self.assertIn(
+            "requires frozen router weights",
+            moe_source,
+        )
+        self.assertIn(
             "torch.mm(hidden_states, gate_weight.t(), out_dtype=torch.float32)",
             moe_source,
         )
@@ -153,6 +161,10 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
             hidden_states.grad, expected_hidden_gradient, rtol=0.01, atol=0.01
         )
         self.assertIsNone(gate_weight.grad)
+
+        trainable_weight = gate_weight.detach().requires_grad_()
+        with self.assertRaisesRegex(RuntimeError, "frozen router weights"):
+            _BF16RouterGemm.apply(hidden_states.detach(), trainable_weight)
 
 
 if __name__ == "__main__":
