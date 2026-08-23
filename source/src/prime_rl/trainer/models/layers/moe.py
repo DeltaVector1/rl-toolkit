@@ -23,8 +23,15 @@ from prime_rl.trainer.models.layers.fp8_ada import (
 from prime_rl.trainer.mxfp4 import dequant_mxfp4
 
 
-def _require_static_expert_bias(module: nn.Module) -> torch.Tensor:
-    """Return the frozen routing bias only when its recorded bytes are intact."""
+def _static_expert_bias_identity(value: torch.Tensor) -> tuple[int, int, str, str, int]:
+    data_ptr = value.data_ptr() if hasattr(value, "data_ptr") else 0
+    version = int(getattr(value, "_version", -1))
+    return id(value), int(data_ptr), str(value.device), str(value.dtype), version
+
+
+def _validate_static_expert_bias(
+    module: nn.Module, *, actual_hash: str | None = None
+) -> torch.Tensor:
     value = getattr(module, "_fp32_expert_bias", None)
     source_hash = getattr(module, "_fp32_expert_bias_source_sha256", None)
     cache_hash = getattr(module, "_fp32_expert_bias_cache_sha256", None)
@@ -35,17 +42,38 @@ def _require_static_expert_bias(module: nn.Module) -> torch.Tensor:
     if not source_hash or not cache_hash or source_hash != cache_hash:
         raise RuntimeError("Frozen GLM routing bias hashes are incomplete")
     local_value = value.to_local() if hasattr(value, "to_local") else value
-    raw = local_value.detach().to(device="cpu").contiguous().view(torch.uint8).numpy().tobytes()
-    actual_hash = hashlib.sha256(raw).hexdigest()
+    if actual_hash is None:
+        raw = local_value.detach().to(device="cpu").contiguous().view(torch.uint8).numpy().tobytes()
+        actual_hash = hashlib.sha256(raw).hexdigest()
     if actual_hash != source_hash or actual_hash != cache_hash:
         raise RuntimeError("Frozen GLM routing bias cache changed after source capture")
+    module._fp32_expert_bias_validation = _static_expert_bias_identity(value)
+    return value
+
+
+def _require_static_expert_bias(module: nn.Module) -> torch.Tensor:
+    value = getattr(module, "_fp32_expert_bias", None)
+    source_hash = getattr(module, "_fp32_expert_bias_source_sha256", None)
+    cache_hash = getattr(module, "_fp32_expert_bias_cache_sha256", None)
+    if value is None:
+        raise RuntimeError("Frozen GLM routing requires an FP32 bias cache")
+    if value.dtype != torch.float32:
+        raise RuntimeError("Frozen GLM routing bias cache must remain float32")
+    if not source_hash or not cache_hash or source_hash != cache_hash:
+        raise RuntimeError("Frozen GLM routing bias hashes are incomplete")
+    expected = getattr(module, "_fp32_expert_bias_validation", None)
+    if expected != _static_expert_bias_identity(value):
+        raise RuntimeError("Frozen GLM routing bias cache changed after validation")
     return value
 
 
 def _move_static_expert_bias(module: nn.Module, device: torch.device) -> torch.Tensor:
-    value = _require_static_expert_bias(module).to(device=device, dtype=torch.float32)
+    value = getattr(module, "_fp32_expert_bias", None)
+    if value is None:
+        raise RuntimeError("Frozen GLM routing requires an FP32 bias cache")
+    value = value.to(device=device, dtype=torch.float32)
     module._fp32_expert_bias = value
-    return _require_static_expert_bias(module)
+    return _validate_static_expert_bias(module)
 
 
 @dataclass

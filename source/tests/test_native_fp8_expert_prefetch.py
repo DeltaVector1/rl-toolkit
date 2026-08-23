@@ -1,8 +1,10 @@
 import ast
+import hashlib
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import tomllib
 
@@ -416,7 +418,7 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
         mlp._fp32_expert_bias.add_(1.0)
         with self.assertRaisesRegex(RuntimeError, "changed after source capture"):
             cache_glm_moe_bias_values(model)
-        with self.assertRaisesRegex(RuntimeError, "cache changed after source capture"):
+        with self.assertRaisesRegex(RuntimeError, "cache changed after validation"):
             mlp(torch.ones(1, 2, 2))
         delattr(mlp, "_fp32_expert_bias")
         with self.assertRaisesRegex(RuntimeError, "requires an FP32 bias cache"):
@@ -456,6 +458,32 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
         applied = _move_static_expert_bias(mlp, torch.device("cpu"))
         torch.testing.assert_close(applied, exact, rtol=0, atol=0)
         self.assertEqual(applied.dtype, torch.float32)
+
+    @unittest.skipUnless(torch is not None, "Static bias validation requires PyTorch")
+    def test_static_bias_hashes_once_per_transfer_not_per_forward(self):
+        from prime_rl.trainer.model import _glm_moe_bias_sha256
+        from prime_rl.trainer.models.layers.moe import (
+            MoE,
+            MoEArgs,
+            _move_static_expert_bias,
+            _require_static_expert_bias,
+        )
+
+        mlp = MoE(MoEArgs(num_experts=4, top_k=1), dim=2, hidden_dim=4)
+        exact = torch.tensor([34.18921, 34.60598, 34.601982, 34.60798], dtype=torch.float32)
+        mlp._fp32_expert_bias = exact.clone()
+        digest = _glm_moe_bias_sha256(exact)
+        mlp._fp32_expert_bias_source_sha256 = digest
+        mlp._fp32_expert_bias_cache_sha256 = digest
+        real_sha256 = hashlib.sha256
+        with patch("prime_rl.trainer.models.layers.moe.hashlib.sha256") as sha256:
+            sha256.side_effect = real_sha256
+            _move_static_expert_bias(mlp, torch.device("cpu"))
+            after_transfer = sha256.call_count
+            _require_static_expert_bias(mlp)
+            _require_static_expert_bias(mlp)
+            self.assertEqual(sha256.call_count, after_transfer)
+            self.assertEqual(after_transfer, 1)
 
     @unittest.skipUnless(torch is not None, "Dynamic router behavior requires PyTorch")
     def test_non_frozen_router_uses_registered_bias_without_static_cache(self):
