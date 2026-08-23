@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import hashlib
 from dataclasses import dataclass
 from typing import Literal
 
@@ -20,6 +21,25 @@ from prime_rl.trainer.models.layers.fp8_ada import (
     scale_routed_output,
 )
 from prime_rl.trainer.mxfp4 import dequant_mxfp4
+
+
+def _require_static_expert_bias(module: nn.Module) -> torch.Tensor:
+    """Return the frozen routing bias only when its recorded bytes are intact."""
+    value = getattr(module, "_fp32_expert_bias", None)
+    source_hash = getattr(module, "_fp32_expert_bias_source_sha256", None)
+    cache_hash = getattr(module, "_fp32_expert_bias_cache_sha256", None)
+    if value is None:
+        raise RuntimeError("Frozen GLM routing requires an FP32 bias cache")
+    if value.dtype != torch.float32:
+        raise RuntimeError("Frozen GLM routing bias cache must remain float32")
+    if not source_hash or not cache_hash or source_hash != cache_hash:
+        raise RuntimeError("Frozen GLM routing bias hashes are incomplete")
+    local_value = value.to_local() if hasattr(value, "to_local") else value
+    raw = local_value.detach().to(device="cpu").contiguous().view(torch.uint8).numpy().tobytes()
+    actual_hash = hashlib.sha256(raw).hexdigest()
+    if actual_hash != source_hash or actual_hash != cache_hash:
+        raise RuntimeError("Frozen GLM routing bias cache changed after source capture")
+    return value
 
 
 @dataclass
@@ -1052,7 +1072,7 @@ class MoE(nn.Module):
         if static_expert_bias and getattr(self, "_fp32_expert_bias_source_sha256", None) is None:
             raise RuntimeError("Frozen GLM routing requires an exact source bias hash")
         if static_expert_bias:
-            expert_bias = getattr(self, "_fp32_expert_bias", self.expert_bias)
+            expert_bias = _require_static_expert_bias(self)
         else:
             expert_bias = self.expert_bias
         if expert_bias is not None and expert_bias.device != x.device:
@@ -1541,7 +1561,7 @@ class LatentMoE(nn.Module):
         if static_expert_bias and getattr(self, "_fp32_expert_bias_source_sha256", None) is None:
             raise RuntimeError("Frozen GLM routing requires an exact source bias hash")
         if static_expert_bias:
-            expert_bias = getattr(self, "_fp32_expert_bias", self.expert_bias)
+            expert_bias = _require_static_expert_bias(self)
         else:
             expert_bias = self.expert_bias
         if expert_bias is not None and expert_bias.device != x_flat.device:

@@ -224,7 +224,8 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
         self.assertIn("_reset_runtime_moe_buffers(model)", setup_source)
         self.assertIn("validate_glm_moe_bias_values(model, parallel_dims)", setup_source)
         moe_source = (ROOT / "source/src/prime_rl/trainer/models/layers/moe.py").read_text()
-        self.assertIn('getattr(self, "_fp32_expert_bias", self.expert_bias)', moe_source)
+        self.assertIn("_require_static_expert_bias(self)", moe_source)
+        self.assertEqual(moe_source.count("_require_static_expert_bias(self)"), 2)
         self.assertIn('static_expert_bias = getattr(self, "_use_static_expert_bias", False)', moe_source)
         self.assertIn("if self.load_balance_coeff is not None:", moe_source)
         self.assertIn("expert_bias_is_static=static_expert_bias", moe_source)
@@ -387,7 +388,7 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
                 super().__init__()
                 self.seen = seen
 
-            def forward(self, x, expert_bias, routed_experts=None):
+            def forward(self, x, expert_bias, routed_experts=None, **kwargs):
                 self.seen.append(expert_bias.detach().clone())
                 count = x.shape[0]
                 scores = torch.ones(count, 1, dtype=torch.float32)
@@ -410,6 +411,16 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
         mlp._fp32_expert_bias.add_(1.0)
         with self.assertRaisesRegex(RuntimeError, "changed after source capture"):
             cache_glm_moe_bias_values(model)
+        with self.assertRaisesRegex(RuntimeError, "cache changed after source capture"):
+            mlp(torch.ones(1, 2, 2))
+        delattr(mlp, "_fp32_expert_bias")
+        with self.assertRaisesRegex(RuntimeError, "requires an FP32 bias cache"):
+            mlp(torch.ones(1, 2, 2))
+        mlp._fp32_expert_bias = source.clone()
+        mlp._fp32_expert_bias_cache_sha256 = None
+        with self.assertRaisesRegex(RuntimeError, "hashes are incomplete"):
+            mlp(torch.ones(1, 2, 2))
+        mlp._fp32_expert_bias_cache_sha256 = mlp._fp32_expert_bias_source_sha256
         mlp._fp32_expert_bias.copy_(source)
         cache_glm_moe_bias_values(model)
 
@@ -459,7 +470,7 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
         class RecordingRouter(torch.nn.Module):
             route_scale = 1.0
 
-            def forward(self, x, expert_bias, routed_experts=None):
+            def forward(self, x, expert_bias, routed_experts=None, **kwargs):
                 seen.append(expert_bias.detach().clone())
                 count = x.shape[0]
                 scores = torch.ones(count, 1, dtype=torch.float32)
