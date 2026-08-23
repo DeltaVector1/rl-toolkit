@@ -19,6 +19,40 @@ class EdgeOperationsTest(unittest.TestCase):
         with self.assertRaises(training_ops.Refused):
             training_ops._ssh("n79", "true")
 
+    def test_h200_startup_grace_comes_from_operations_config(self):
+        self.assertEqual(
+            training_ops._configured_h200_engine_startup_grace(), 7200
+        )
+        calls = []
+
+        def fake_ssh(host, command, timeout=120):
+            del host, timeout
+            calls.append(command)
+            if "pkill -f" in command:
+                return 0, "stopped\n"
+            if "docker rm -f" in command:
+                return 0, "issued\n"
+            return 0, "\n"
+
+        with (
+            patch.object(training_ops, "_profile", return_value={"kind": "glm52"}),
+            patch.object(training_ops, "_prepare_glm_parity_capture_directory"),
+            patch.object(training_ops, "_h200_parity_container_preflight"),
+            patch.object(training_ops, "_ssh", side_effect=fake_ssh),
+        ):
+            training_ops._repair_engine("h200a")
+        watchdog = next(command for command in calls if "STARTUP_GRACE=" in command)
+        self.assertIn("STARTUP_GRACE=7200", watchdog)
+        self.assertNotIn("STARTUP_GRACE=180", watchdog)
+
+    def test_h200_startup_grace_rejects_missing_or_invalid_config(self):
+        for value in (None, True, 0, -1, "7200"):
+            with patch.dict(training_ops.limits, {"h200_engine_startup_grace_seconds": value}, clear=True):
+                with self.assertRaisesRegex(
+                    training_ops.Refused, "positive integer"
+                ):
+                    training_ops._configured_h200_engine_startup_grace()
+
     def test_glm_qualification_is_fake_data_in_the_isolated_deployment(self):
         profile = training_ops._profile("glm52-native-small")
         with (training_ops.repo_root / profile["trainer"]).open("rb") as stream:

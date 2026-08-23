@@ -115,6 +115,15 @@ glm_compute_max_seconds = glm_requirements["trainer_seconds_max"]
 glm_rollout_min_seconds = glm_requirements["rollout_seconds_min"]
 glm_rollout_max_seconds = glm_requirements["rollout_seconds_max"]
 
+
+def _configured_h200_engine_startup_grace() -> int:
+    value = limits.get("h200_engine_startup_grace_seconds")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise Refused(
+            "limits.h200_engine_startup_grace_seconds must be a positive integer"
+        )
+    return value
+
 adapter_archive_bucket = paths["adapter_bucket"]
 adapter_archive_files = ("adapter_config.json", "adapter_model.safetensors")
 
@@ -2419,7 +2428,9 @@ def _repair_engine(host: str) -> str:
     )
     inference_config = "" if muse_engine else glm_parity_inference_config
     start_args = "" if muse_engine else shlex.quote(inference_config)
-    startup_grace = 600 if muse_engine else 180
+    startup_grace = (
+        600 if muse_engine else _configured_h200_engine_startup_grace()
+    )
     if not muse_engine:
         _prepare_glm_parity_capture_directory()
     print(
