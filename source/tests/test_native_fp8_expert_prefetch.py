@@ -1,4 +1,6 @@
 import ast
+import json
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -169,6 +171,59 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
         bias_bytes = 78 * 256 * 4
         self.assertEqual(bias_bytes, 79872)
         self.assertLess(bias_bytes, 128 * 1024)
+
+        load_source = ast.unparse(
+            next(
+                node
+                for node in ast.parse(model_source).body
+                if isinstance(node, ast.FunctionDef) and node.name == "load_dcp_from_hf"
+            )
+        )
+        self.assertIn("restore_glm_moe_bias_values(model, snapshot_path)", load_source)
+        self.assertIn("source.dtype != torch.float32", ast.unparse(ast.parse(model_source)))
+
+    @unittest.skipUnless(torch is not None, "FP32 checkpoint restoration requires PyTorch")
+    def test_glm_router_bias_restores_exact_checkpoint_values(self):
+        from safetensors.torch import save_file
+
+        from prime_rl.trainer.model import restore_glm_moe_bias_values
+        from prime_rl.trainer.models.layers.moe import MoE, MoEArgs
+
+        class Layer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layer_idx = 3
+                self.mlp = MoE(MoEArgs(num_experts=4, top_k=1), dim=2, hidden_dim=4)
+
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = type("Config", (), {"model_type": "glm_moe_dsa"})()
+                self.model = torch.nn.Module()
+                self.model.layers = torch.nn.ModuleList([Layer()])
+
+        source = torch.tensor([34.18921, 34.60598, 34.601982, 34.60798], dtype=torch.float32)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            save_file(
+                {"model.layers.3.mlp.gate.e_score_correction_bias": source},
+                root / "model.safetensors",
+            )
+            (root / "model.safetensors.index.json").write_text(
+                json.dumps(
+                    {
+                        "metadata": {},
+                        "weight_map": {
+                            "model.layers.3.mlp.gate.e_score_correction_bias": "model.safetensors"
+                        },
+                    }
+                )
+            )
+            model = Model()
+            model.model.layers[0].mlp.expert_bias.copy_(source.to(torch.bfloat16).float())
+            restore_glm_moe_bias_values(model, root)
+            self.assertEqual(model.model.layers[0].mlp.expert_bias.dtype, torch.float32)
+            torch.testing.assert_close(model.model.layers[0].mlp.expert_bias, source, rtol=0, atol=0)
 
     @unittest.skipUnless(
         torch is not None and torch.cuda.is_available(),

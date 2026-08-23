@@ -1,5 +1,7 @@
 # ruff: noqa: F722, F821
 
+import hashlib
+import json
 import logging
 import os
 import time
@@ -16,6 +18,7 @@ import torch._dynamo
 import torch.nn as nn
 from huggingface_hub import snapshot_download
 from jaxtyping import Int
+from safetensors import safe_open
 from torch import Tensor
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
 from torch.distributed.checkpoint.hf_storage import HuggingFaceStorageReader
@@ -486,6 +489,77 @@ def preserve_glm_moe_bias_precision(model: nn.Module) -> None:
                 raise RuntimeError(f"GLM {name} must remain float32")
     if restored:
         get_logger().info(f"Restored {restored} GLM routing correction buffers to fp32")
+
+
+def restore_glm_moe_bias_values(model: nn.Module, snapshot_path: Path) -> None:
+    """Restore GLM routing correction values from their FP32 checkpoint tensors."""
+    if getattr(getattr(model, "config", None), "model_type", None) != "glm_moe_dsa":
+        return
+
+    index_path = snapshot_path / "model.safetensors.index.json"
+    weight_map: dict[str, str] = {}
+    if index_path.is_file():
+        index = json.loads(index_path.read_text())
+        weight_map = index.get("weight_map", {})
+    else:
+        for shard_path in sorted(snapshot_path.glob("*.safetensors")):
+            with safe_open(shard_path, framework="pt", device="cpu") as shard:
+                for key in shard.keys():
+                    weight_map[key] = shard_path.name
+
+    language_model = get_language_model(model)
+    requested: dict[str, tuple[nn.Module, str]] = {}
+    for layer in iter_layers(language_model.layers):
+        layer_index = getattr(layer, "layer_idx", None)
+        mlp = getattr(layer, "mlp", None)
+        if not isinstance(layer_index, int) or not isinstance(mlp, (MoE, LatentMoE)):
+            continue
+        target = getattr(mlp, "expert_bias", None)
+        if target is None:
+            continue
+        candidates = (
+            f"model.layers.{layer_index}.mlp.gate.e_score_correction_bias",
+            f"model.layers.{layer_index}.mlp.expert_bias",
+            f"model.layers.{layer_index}.mlp.router.e_score_correction_bias",
+        )
+        source_key = next((key for key in candidates if key in weight_map), None)
+        if source_key is None:
+            raise RuntimeError(
+                f"Missing FP32 GLM routing correction for layer {layer_index} in {snapshot_path}"
+            )
+        requested[source_key] = (mlp, str(layer_index))
+
+    by_file: dict[Path, list[tuple[str, nn.Module, str]]] = {}
+    for source_key, (mlp, layer_index) in requested.items():
+        by_file.setdefault(snapshot_path / weight_map[source_key], []).append((source_key, mlp, layer_index))
+
+    source_hash = hashlib.sha256()
+    restored = 0
+    for shard_path, entries in by_file.items():
+        with safe_open(shard_path, framework="pt", device="cpu") as shard:
+            for source_key, mlp, layer_index in entries:
+                source = shard.get_tensor(source_key)
+                if source.dtype != torch.float32:
+                    raise RuntimeError(
+                        f"GLM routing correction {source_key} is {source.dtype}, expected float32"
+                    )
+                target = mlp.expert_bias
+                if tuple(source.shape) != tuple(target.shape):
+                    raise RuntimeError(
+                        f"GLM routing correction {source_key} shape {tuple(source.shape)} "
+                        f"does not match layer {layer_index} target {tuple(target.shape)}"
+                    )
+                source_hash.update(source.contiguous().view(torch.uint8).numpy().tobytes())
+                target.copy_(source.to(device=target.device, dtype=torch.float32))
+                restored += 1
+
+    expected = len(requested)
+    if restored != expected:
+        raise RuntimeError(f"Restored {restored}/{expected} GLM routing corrections")
+    get_logger().info(
+        f"Restored {restored} exact FP32 GLM routing corrections from checkpoint "
+        f"sha256={source_hash.hexdigest()}"
+    )
 
 
 def freeze_sparse_indexer(model: nn.Module) -> None:
@@ -1157,6 +1231,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
             generator = torch.Generator(device="cuda").manual_seed(seed_tensor.item())
         for module in lora_modules:
             module._init_lora_parameters(generator)
+    restore_glm_moe_bias_values(model, snapshot_path)
     logger.debug(f"Loaded weights using HF DCP in {time.perf_counter() - load_dcp_start_time:.2f} seconds")
 
 
