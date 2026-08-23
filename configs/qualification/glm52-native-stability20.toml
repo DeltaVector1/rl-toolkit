@@ -78,8 +78,5 @@ save_format = "safetensors"
 type = "filesystem"
 
 [env_vars]
-# Keep the trainer-only stability gate on the bounded INT4 transport path.
-# These values are consumed by scripts/china/cluster.sh; Muse configs do not
-# define them and retain the launcher defaults.
 PRIME_INT4_COMBINE_ROUNDS = "8"
 PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD = "0"

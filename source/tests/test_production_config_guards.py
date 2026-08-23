@@ -158,13 +158,12 @@ def test_glm52_stability_and_production_pin_bounded_transport_env() -> None:
     }
     for relative in (
         "configs/qualification/glm52-native-stability20.toml",
+        "configs/qualification/glm52-native-b2048.toml",
         "configs/paused/trainer.glm52-production.toml",
     ):
         config = _load(relative)
         assert config["env_vars"] == expected, relative
 
-    # The GLM pins are read from each trainer TOML and override shell values.
-    # Configs without these pins, including Muse, retain the old defaults.
     launcher = (ROOT / "scripts/china/cluster.sh").read_text()
     assert 'env_vars.get("PRIME_INT4_COMBINE_ROUNDS", "")' in launcher
     assert 'env_vars.get("PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD", "")' in launcher

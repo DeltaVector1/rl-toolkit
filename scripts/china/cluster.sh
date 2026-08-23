@@ -171,12 +171,9 @@ PY
         echo "GLM trainer configs must pin PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD=0" >&2
         exit 1
       }
-      # A GLM config pin is authoritative. This prevents a shell override from
-      # making the production trainer differ from the stability qualification.
       int4_combine_rounds="$configured_int4_combine_rounds"
       fp8_expert_activation_offload="$configured_fp8_expert_activation_offload"
     else
-      # Muse and other legacy configs retain their historical launcher defaults.
       int4_combine_rounds="${PRIME_INT4_COMBINE_ROUNDS:-1}"
       fp8_expert_activation_offload="${PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD:-0}"
     fi
