@@ -41,6 +41,11 @@ if [[ "$vllm_extra" != "$expected_vllm_extra" ]]; then
   echo "refusing non-parity vllm-extra: $vllm_extra" >&2
   exit 2
 fi
+bootstrap_token=${PRIME_PARITY_BOOTSTRAP_TOKEN:-}
+if [[ -z "$bootstrap_token" || ! "$bootstrap_token" =~ ^[A-Za-z0-9._~-]{32,256}$ ]]; then
+  echo "refusing parity engine without a valid bootstrap token" >&2
+  exit 2
+fi
 install -d -o 1000 -g 1000 -m 0755 /data/glm52-rl/lora-cache
 install -d -o 1000 -g 1000 -m 0755 "$deployment/cache/vllm"
 for stale_container in "$engine_container" "$engine_container-0" "$engine_container-1"; do
@@ -92,6 +97,7 @@ docker run -d --name "$engine_container" --restart unless-stopped \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False \
   -e VLLM_ENGINE_READY_TIMEOUT_S=7200 \
   -e PRIME_ADAPTER_PORTS="$adapter_ports" \
+  -e PRIME_PARITY_BOOTSTRAP_TOKEN="$bootstrap_token" \
   --entrypoint /app/.venv/bin/inference \
   "$image" \
   @ "$inference_config" \

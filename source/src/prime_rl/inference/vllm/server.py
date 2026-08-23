@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import secrets
+import time
 from argparse import Namespace
 from pathlib import Path
 from typing import Any
@@ -32,12 +33,15 @@ from prime_rl.parity_router_trace import (
     TraceSession,
     assemble_chunks,
     clear_trace,
+    consume_single_use_diagnostic_token,
     encoded_array,
     read_h200_runtime_marker,
     read_session,
     trace_root,
     trace_session_identity,
     diagnostic_authorization_valid,
+    validate_diagnostic_content_length,
+    validate_isolated_parity_root,
     write_session,
 )
 from prime_rl.utils.logger import get_logger
@@ -70,6 +74,10 @@ logger = init_logger("vllm.entrypoints.openai.api_server")
 router = APIRouter()
 lora_load_lock = asyncio.Lock()
 parity_diagnostic_tokens: dict[str, str] = {}
+parity_diagnostic_expiry: dict[str, float] = {}
+parity_diagnostic_bootstrap_env = "PRIME_PARITY_BOOTSTRAP_TOKEN"
+parity_qualification_root_env = "PRIME_PARITY_QUALIFICATION_ROOT"
+parity_diagnostic_token_seconds = 300.0
 
 
 def engine_client(request: Request) -> EngineClient:
@@ -85,6 +93,27 @@ def parity_trace_root() -> Path:
     if root is None:
         raise HTTPException(status_code=404, detail="parity router trace is disabled")
     return root
+
+
+def isolated_parity_trace_root() -> Path:
+    try:
+        root = parity_trace_root()
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail="parity trace root is invalid") from error
+    configured = os.environ.get(parity_qualification_root_env)
+    if not configured or not Path(configured).is_absolute():
+        raise HTTPException(status_code=404, detail="parity qualification root is not configured")
+    configured_path = Path(configured)
+    try:
+        return validate_isolated_parity_root(root, configured_path)
+    except (OSError, ValueError) as error:
+        raise HTTPException(status_code=404, detail="parity trace root is unavailable") from error
+
+
+def bootstrap_authorized(request: Request) -> bool:
+    expected = os.environ.get(parity_diagnostic_bootstrap_env)
+    authorization = request.headers.get("authorization", "")
+    return diagnostic_authorization_valid(authorization, expected)
 
 
 WORKER_EXTENSION_CLS = {
@@ -152,7 +181,11 @@ async def liveness(raw_request: Request):
 
 @router.post("/parity/router-trace/reset")
 async def reset_parity_router_trace(request: Request):
-    root = parity_trace_root()
+    if os.environ.get("PRIME_PARITY_ENGINE") != "1":
+        raise HTTPException(status_code=404, detail="parity engine is not enabled")
+    if not bootstrap_authorized(request):
+        raise HTTPException(status_code=401, detail="parity bootstrap authorization is required")
+    root = isolated_parity_trace_root()
     data = await request.json()
     if not isinstance(data, dict):
         raise HTTPException(status_code=400, detail="router trace session must be an object")
@@ -165,10 +198,18 @@ async def reset_parity_router_trace(request: Request):
     except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     response = session.as_dict()
+    identity = trace_session_identity(session)
+    parity_diagnostic_tokens.pop(identity, None)
+    parity_diagnostic_expiry.pop(identity, None)
     if os.environ.get("PRIME_PARITY_DIAGNOSTICS") == "1":
         token = secrets.token_urlsafe(32)
-        parity_diagnostic_tokens[trace_session_identity(session)] = token
-        response = {"session": response, "diagnostic_token": token}
+        parity_diagnostic_tokens[identity] = token
+        parity_diagnostic_expiry[identity] = time.monotonic() + parity_diagnostic_token_seconds
+        response = {
+            "session": response,
+            "diagnostic_token": token,
+            "expires_in": parity_diagnostic_token_seconds,
+        }
     return response
 
 
@@ -197,19 +238,36 @@ async def run_parity_router_diagnostic(request: Request):
         raise HTTPException(status_code=404, detail="parity diagnostics are not enabled on this engine")
     if os.environ.get("PRIME_PARITY_DIAGNOSTICS") != "1":
         raise HTTPException(status_code=404, detail="parity diagnostics are disabled")
-    root = parity_trace_root()
+    root = isolated_parity_trace_root()
     try:
-        body = await request.body()
-        if len(body) > 16 * 1024 * 1024:
-            raise ValueError("H200 diagnostic request body is too large")
+        expected_length = validate_diagnostic_content_length(
+            request.headers.get("content-length"),
+            request.headers.get("transfer-encoding"),
+            16 * 1024 * 1024,
+        )
+        chunks: list[bytes] = []
+        received = 0
+        async for chunk in request.stream():
+            received += len(chunk)
+            if received > expected_length or received > 16 * 1024 * 1024:
+                raise ValueError("H200 diagnostic request body is too large")
+            chunks.append(chunk)
+        if received != expected_length:
+            raise ValueError("H200 diagnostic request body length is incorrect")
+        body = b"".join(chunks)
         data = json.loads(body)
         if not isinstance(data, dict):
             raise ValueError("H200 diagnostic request must be an object")
         session = read_session(root)
         session_identity = trace_session_identity(session)
         authorization = request.headers.get("authorization", "")
-        expected_token = parity_diagnostic_tokens.get(session_identity)
-        if not diagnostic_authorization_valid(authorization, expected_token):
+        if not consume_single_use_diagnostic_token(
+            parity_diagnostic_tokens,
+            parity_diagnostic_expiry,
+            session_identity,
+            authorization,
+            time.monotonic(),
+        ):
             raise HTTPException(status_code=401, detail="diagnostic authorization is required")
         result = await engine_client(request).collective_rpc(
             "parity_router_diagnostic", args=(data,)

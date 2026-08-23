@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+from scripts.glm52_policy_parity import validate_diagnostic_file
 
 from prime_rl.parity_router_trace import (
     TraceSession,
@@ -29,7 +30,14 @@ from prime_rl.parity_router_trace import (
     write_hidden_diagnostic,
     run_h200_router_diagnostic,
     diagnostic_authorization_valid,
+    consume_single_use_diagnostic_token,
     validate_encoded_diagnostic_input,
+    validate_diagnostic_content_length,
+    validate_isolated_parity_root,
+    _capture_h200_decoder_input,
+    _capture_h200_layer_boundary,
+    _capture_h200_attention_boundary,
+    _capture_h200_mlp_boundary,
     _hidden_stream,
     _router_logits,
     diagnostics_enabled,
@@ -64,6 +72,9 @@ class FakeTensor:
     def numpy(self):
         return self.value
 
+    def __array__(self, dtype=None):
+        return np.asarray(self.value, dtype=dtype)
+
     def reshape(self, *shape):
         return FakeTensor(self.value.reshape(*shape))
 
@@ -77,10 +88,10 @@ class FakeTensor:
         return FakeTensor(other * self.value)
 
     def __add__(self, other):
-        return FakeTensor(self.value + other)
+        return FakeTensor(self.value + (other.value if isinstance(other, FakeTensor) else other))
 
     def __radd__(self, other):
-        return FakeTensor(other + self.value)
+        return FakeTensor((other.value if isinstance(other, FakeTensor) else other) + self.value)
 
 
 def fake_torch(state=None):
@@ -192,6 +203,21 @@ class ParityRouterTraceTest(unittest.TestCase):
         self.assertFalse(diagnostic_authorization_valid(None, "secret"))
         self.assertFalse(diagnostic_authorization_valid("Bearer wrong", "secret"))
         self.assertTrue(diagnostic_authorization_valid("Bearer secret", "secret"))
+
+    def test_diagnostic_token_expires_and_cannot_be_replayed(self):
+        tokens = {"session": "secret"}
+        expiry = {"session": 10.0}
+        self.assertFalse(
+            consume_single_use_diagnostic_token(tokens, expiry, "session", "Bearer secret", 10.0)
+        )
+        tokens["session"] = "secret"
+        expiry["session"] = 20.0
+        self.assertTrue(
+            consume_single_use_diagnostic_token(tokens, expiry, "session", "Bearer secret", 11.0)
+        )
+        self.assertFalse(
+            consume_single_use_diagnostic_token(tokens, expiry, "session", "Bearer secret", 11.0)
+        )
 
     def test_router_owner_gate_tuple_and_bias_are_checked(self):
         class Gate:
@@ -923,6 +949,67 @@ class ParityRouterTraceTest(unittest.TestCase):
                 TraceSession(
                     **{**session().__dict__, "route_output_scale": scale}
                 ).validate()
+
+    def test_chunked_diagnostic_request_is_rejected_before_read(self):
+        with self.assertRaisesRegex(ValueError, "chunked"):
+            validate_diagnostic_content_length("100", "chunked", 1024)
+        with self.assertRaisesRegex(ValueError, "Content-Length"):
+            validate_diagnostic_content_length(None, None, 1024)
+        with self.assertRaisesRegex(ValueError, "too large"):
+            validate_diagnostic_content_length("1025", None, 1024)
+
+    def test_h200_boundaries_use_logical_sums(self):
+        captured = []
+        hidden = FakeTensor([[1.0, 2.0]])
+        residual = FakeTensor([[3.0, 4.0]])
+        with patch(
+            "prime_rl.parity_router_trace.write_hidden_diagnostic",
+            lambda name, value, **kwargs: captured.append((name, value.value.copy())),
+        ):
+            _capture_h200_decoder_input(None, (None, hidden, residual), 1)
+            _capture_h200_layer_boundary(None, (), (hidden, residual), 1)
+        self.assertEqual([name for name, _ in captured], ["layer1_input", "layer1_output"])
+        np.testing.assert_allclose(captured[0][1], [[4.0, 6.0]])
+        np.testing.assert_allclose(captured[1][1], [[4.0, 6.0]])
+
+    def test_h200_attention_and_mlp_names_are_raw_outputs(self):
+        captured = []
+        value = FakeTensor([[1.0, 2.0]])
+        with patch(
+            "prime_rl.parity_router_trace.write_hidden_diagnostic",
+            lambda name, tensor, **kwargs: captured.append((name, tensor)),
+        ):
+            _capture_h200_attention_boundary(None, (), value, 0)
+            _capture_h200_mlp_boundary(None, (), value, 0)
+        self.assertEqual([name for name, _ in captured], ["layer0_attention_raw", "layer0_mlp_raw"])
+
+    def test_isolated_root_rejects_equal_or_symlink_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary) / "qualification"
+            run = base / "run"
+            run.mkdir(parents=True)
+            self.assertEqual(validate_isolated_parity_root(run, base), run.resolve())
+            with self.assertRaisesRegex(ValueError, "outside"):
+                validate_isolated_parity_root(base, base)
+            link = Path(temporary) / "link"
+            link.symlink_to(run, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "symlinks"):
+                validate_isolated_parity_root(link, base)
+
+    def test_diagnostic_npz_rejects_compression_bomb_metadata(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "bomb.npz"
+            np.savez_compressed(path, values=np.zeros((256, 6144), dtype=np.float32))
+            with self.assertRaisesRegex(ValueError, "compression ratio"):
+                validate_diagnostic_file(path)
+
+    def test_diagnostic_npy_requires_exact_data_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "values.npy"
+            np.save(path, np.zeros((1, 6144), dtype=np.float32))
+            path.write_bytes(path.read_bytes()[:-1])
+            with self.assertRaisesRegex(ValueError, "byte count"):
+                validate_diagnostic_file(path)
 
 
 if __name__ == "__main__":

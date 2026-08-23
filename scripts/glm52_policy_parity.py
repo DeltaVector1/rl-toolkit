@@ -18,6 +18,7 @@ import tempfile
 import tomllib
 import urllib.error
 import urllib.request
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -507,6 +508,76 @@ def request_json(
     return result
 
 
+diagnostic_file_limit = 16 * 1024 * 1024
+
+
+def _read_npy_member_header(stream: Any, member_size: int) -> tuple[np.dtype, tuple[int, ...]]:
+    version = np.lib.format.read_magic(stream)
+    if version == (1, 0):
+        shape, fortran_order, dtype = np.lib.format.read_array_header_1_0(stream)
+    elif version == (2, 0):
+        shape, fortran_order, dtype = np.lib.format.read_array_header_2_0(stream)
+    else:
+        raise ValueError(f"unsupported diagnostic NPY version {version}")
+    dtype = np.dtype(dtype)
+    if dtype.hasobject or not isinstance(shape, tuple) or any(
+        isinstance(dim, bool) or not isinstance(dim, int) or dim < 0 for dim in shape
+    ):
+        raise ValueError("diagnostic NPY header is invalid")
+    expected = int(dtype.itemsize) * math.prod(shape)
+    if stream.tell() + expected != member_size:
+        raise ValueError("diagnostic NPY member byte count is incorrect")
+    return dtype, shape
+
+
+def validate_diagnostic_file(path: Path) -> None:
+    if not path.is_file() or path.stat().st_size > diagnostic_file_limit:
+        raise ValueError("diagnostic input file is too large or missing")
+    if path.suffix == ".npy":
+        with path.open("rb") as stream:
+            dtype, shape = _read_npy_member_header(stream, path.stat().st_size)
+        if (
+            dtype != np.dtype("float32")
+            or len(shape) != 2
+            or shape[1] != 6144
+            or not 1 <= shape[0] <= 256
+        ):
+            raise ValueError("diagnostic NPY must be 1..256x6144 float32")
+        return
+    if path.suffix != ".npz":
+        raise ValueError("diagnostic input must be NPY or NPZ")
+    total_uncompressed = 0
+    with zipfile.ZipFile(path) as archive:
+        if not archive.infolist():
+            raise ValueError("diagnostic NPZ is empty")
+        names: set[str] = set()
+        for info in archive.infolist():
+            if info.filename in names:
+                raise ValueError("diagnostic NPZ contains duplicate members")
+            names.add(info.filename)
+            member = Path(info.filename)
+            if member.is_absolute() or ".." in member.parts:
+                raise ValueError("diagnostic NPZ contains an unsafe member")
+            if info.file_size > diagnostic_file_limit:
+                raise ValueError("diagnostic NPZ member is too large")
+            if info.compress_size == 0 and info.file_size:
+                raise ValueError("diagnostic NPZ member has invalid compression metadata")
+            if info.compress_size and info.file_size > info.compress_size * 1000:
+                raise ValueError("diagnostic NPZ member compression ratio is too high")
+            total_uncompressed += info.file_size
+            if total_uncompressed > diagnostic_file_limit:
+                raise ValueError("diagnostic NPZ is too large when uncompressed")
+            with archive.open(info) as stream:
+                dtype, shape = _read_npy_member_header(stream, info.file_size)
+            if member.name == "values.npy" and (
+                dtype != np.dtype("float32")
+                or len(shape) != 2
+                or not 1 <= shape[0] <= 256
+                or shape[1] != 6144
+            ):
+                raise ValueError("diagnostic values must be 1..256x6144 float32")
+
+
 def run_h200_router_diagnostic(
     input_path: Path,
     session_path: Path,
@@ -516,6 +587,7 @@ def run_h200_router_diagnostic(
     timeout: float,
 ) -> dict[str, Any]:
     """Send one bounded trainer activation to the H200 router worker."""
+    validate_diagnostic_file(input_path)
     with np.load(input_path, allow_pickle=False) as values:
         if "values" not in values or "session_identity" not in values:
             raise ValueError("diagnostic input must contain values and session identity")
@@ -578,6 +650,7 @@ def capture_h200(
     adapter_sha256: str,
     image: str,
     api_key_env: str | None,
+    bootstrap_token_env: str,
     timeout: float,
 ) -> dict[str, Any]:
     fixture_manifest = load_manifest(fixture, "glm52_policy_parity_fixture")
@@ -586,6 +659,9 @@ def capture_h200(
     api_key = os.environ.get(api_key_env) if api_key_env else None
     if api_key_env and api_key is None:
         raise ValueError(f"environment variable {api_key_env} is not set")
+    bootstrap_token = os.environ.get(bootstrap_token_env)
+    if not bootstrap_token:
+        raise ValueError(f"environment variable {bootstrap_token_env} is not set")
     cards = request_json(
         f"{base}/v1/models", body=None, api_key=api_key, timeout=min(timeout, 120)
     ).get("data", [])
@@ -635,7 +711,7 @@ def capture_h200(
     reset = request_json(
         f"{base}/parity/router-trace/reset",
         body=trace_session,
-        api_key=api_key,
+        api_key=bootstrap_token,
         timeout=min(timeout, 120),
     )
     if reset != trace_session and not (
@@ -1538,6 +1614,7 @@ def parser() -> argparse.ArgumentParser:
     h200.add_argument("--adapter-sha256", required=True)
     h200.add_argument("--image", required=True)
     h200.add_argument("--api-key-env")
+    h200.add_argument("--bootstrap-token-env", default="PRIME_PARITY_BOOTSTRAP_TOKEN")
     h200.add_argument("--timeout", type=float, default=1800.0)
     h200.add_argument("output", type=Path)
     diagnostic = commands.add_parser("diagnose-h200")
@@ -1614,6 +1691,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.adapter_sha256,
                 args.image,
                 args.api_key_env,
+                args.bootstrap_token_env,
                 args.timeout,
             )
         elif args.command == "diagnose-h200":

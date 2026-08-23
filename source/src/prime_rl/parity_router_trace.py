@@ -188,6 +188,44 @@ def trace_root() -> Path | None:
     return path
 
 
+def validate_isolated_parity_root(root: Path, configured: Path) -> Path:
+    """Return an existing run root strictly below the qualification root."""
+    if not root.is_absolute() or not configured.is_absolute():
+        raise ValueError("parity roots must be absolute")
+    current = root
+    while True:
+        if current.is_symlink():
+            raise ValueError("parity trace root cannot contain symlinks")
+        if current == current.parent:
+            break
+        current = current.parent
+    current = configured
+    while True:
+        if current.is_symlink():
+            raise ValueError("parity qualification root cannot contain symlinks")
+        if current == current.parent:
+            break
+        current = current.parent
+    resolved_root = root.resolve(strict=True)
+    resolved_configured = configured.resolve(strict=True)
+    if resolved_root == resolved_configured or resolved_configured not in resolved_root.parents:
+        raise ValueError("parity trace root is outside the qualification root")
+    return resolved_root
+
+
+def validate_diagnostic_content_length(
+    content_length: str | None, transfer_encoding: str | None, limit: int
+) -> int:
+    if transfer_encoding and "chunked" in transfer_encoding.lower():
+        raise ValueError("chunked diagnostic requests are not accepted")
+    if content_length is None or not content_length.isdigit():
+        raise ValueError("diagnostic request needs a valid Content-Length")
+    size = int(content_length)
+    if size < 1 or size > limit:
+        raise ValueError("diagnostic request body is too large")
+    return size
+
+
 def diagnostics_enabled() -> bool:
     return os.environ.get(diagnostic_env) == "1"
 
@@ -200,6 +238,25 @@ def diagnostic_authorization_valid(
     if not isinstance(expected_token, str) or not expected_token:
         return False
     return secrets.compare_digest(authorization[7:], expected_token)
+
+
+def consume_single_use_diagnostic_token(
+    tokens: dict[str, str],
+    expiry: dict[str, float],
+    session_identity: str,
+    authorization: str | None,
+    now: float,
+) -> bool:
+    expected = tokens.get(session_identity)
+    expires_at = expiry.get(session_identity, 0.0)
+    if expires_at <= now or not diagnostic_authorization_valid(authorization, expected):
+        if expires_at <= now:
+            tokens.pop(session_identity, None)
+            expiry.pop(session_identity, None)
+        return False
+    tokens.pop(session_identity, None)
+    expiry.pop(session_identity, None)
+    return True
 
 
 def _diagnostic_limit(name: str) -> int:
@@ -552,6 +609,8 @@ def write_hidden_diagnostic(
     root = trace_root()
     if root is None or _process_side is None or not diagnostics_enabled():
         return
+    if _process_side == "h200" and _active_h200_session is None:
+        return
     kind = _diagnostic_name(kind)
     entry_name = (
         f"{kind}-rank-{_process_rank}-pp-{_process_pp_rank}-cp-{_process_cp_rank}"
@@ -808,20 +867,26 @@ def _capture_embedding(_module: Any, _inputs: Any, output: Any) -> None:
 
 
 def _capture_attention(_module: Any, _inputs: Any, output: Any, layer: int) -> None:
-    write_hidden_diagnostic(f"layer{layer}_attention", _hidden_stream(output, "attention"))
+    write_hidden_diagnostic(
+        f"layer{layer}_attention_raw", _hidden_stream(output, "attention")
+    )
 
 
 def _capture_mlp(_module: Any, _inputs: Any, output: Any, layer: int) -> None:
     if not hasattr(output, "detach"):
         raise ValueError("MLP output is not a tensor")
-    write_hidden_diagnostic(f"layer{layer}_mlp", output)
+    write_hidden_diagnostic(f"layer{layer}_mlp_raw", output)
 
 
 def _capture_decoder_layer(_module: Any, _inputs: Any, output: Any, layer: int) -> None:
     hidden = _hidden_stream(output, "decoder layer")
     write_hidden_diagnostic(f"layer{layer}_output", hidden)
-    if layer < 2:
-        write_hidden_diagnostic(f"layer{layer + 1}_input", hidden)
+
+
+def _capture_trainer_decoder_input(_module: Any, inputs: Any, layer: int) -> None:
+    if not isinstance(inputs, tuple) or not inputs or not hasattr(inputs[0], "detach"):
+        raise ValueError("trainer decoder input is not a hidden-state tensor")
+    write_hidden_diagnostic(f"layer{layer}_input", inputs[0])
 
 
 def configure_hidden_diagnostics(language_model: Any) -> None:
@@ -863,6 +928,13 @@ def configure_hidden_diagnostics(language_model: Any) -> None:
                 )
             )
         _diagnostic_hooks.append(
+            layer.register_forward_pre_hook(
+                lambda module, inputs, number=layer_number: _capture_trainer_decoder_input(
+                    module, inputs, number
+                )
+            )
+        )
+        _diagnostic_hooks.append(
             layer.register_forward_hook(
                 lambda module, inputs, output, number=layer_number: _capture_decoder_layer(
                     module, inputs, output, number
@@ -874,15 +946,32 @@ def configure_hidden_diagnostics(language_model: Any) -> None:
 def _capture_h200_attention_boundary(
     _module: Any, _inputs: Any, output: Any, layer: int
 ) -> None:
-    if (
-        not isinstance(output, tuple)
-        or len(output) != 2
-        or not hasattr(output[0], "detach")
-        or not hasattr(output[1], "detach")
-    ):
-        raise ValueError("H200 attention boundary is not a hidden/residual pair")
-    write_hidden_diagnostic(f"layer{layer}_attention_hidden", output[0])
-    write_hidden_diagnostic(f"layer{layer}_attention_residual", output[1])
+    if not hasattr(output, "detach"):
+        raise ValueError("H200 attention output is not a tensor")
+    write_hidden_diagnostic(f"layer{layer}_attention_raw", output)
+
+
+def _capture_h200_decoder_input(
+    _module: Any, inputs: Any, layer: int
+) -> None:
+    if not isinstance(inputs, tuple) or len(inputs) < 3:
+        raise ValueError("H200 decoder input does not contain hidden and residual")
+    hidden, residual = inputs[1], inputs[2]
+    if not hasattr(hidden, "detach"):
+        raise ValueError("H200 decoder input hidden state is not a tensor")
+    if residual is not None:
+        if not hasattr(residual, "detach"):
+            raise ValueError("H200 decoder input residual is not a tensor")
+        hidden = hidden + residual
+    write_hidden_diagnostic(f"layer{layer}_input", hidden)
+
+
+def _capture_h200_mlp_boundary(
+    _module: Any, _inputs: Any, output: Any, layer: int
+) -> None:
+    if not hasattr(output, "detach"):
+        raise ValueError("H200 dense MLP output is not a tensor")
+    write_hidden_diagnostic(f"layer{layer}_mlp_raw", output)
 
 
 def _capture_h200_layer_boundary(
@@ -895,10 +984,7 @@ def _capture_h200_layer_boundary(
         or not hasattr(output[1], "detach")
     ):
         raise ValueError("H200 decoder boundary is not a hidden/residual pair")
-    write_hidden_diagnostic(f"layer{layer}_output", output[0])
-    write_hidden_diagnostic(f"layer{layer}_residual", output[1])
-    if layer < 2:
-        write_hidden_diagnostic(f"layer{layer + 1}_input", output[0])
+    write_hidden_diagnostic(f"layer{layer}_output", output[0] + output[1])
 
 
 def configure_h200_boundary_diagnostics(model: Any) -> None:
@@ -920,14 +1006,33 @@ def configure_h200_boundary_diagnostics(model: Any) -> None:
         raise ValueError("H200 diagnostics require local logical layers 0, 1, and 2")
     for layer_number in range(3):
         layer = selected[layer_number]
-        attention_boundary = getattr(layer, "post_attention_layernorm", None)
-        if attention_boundary is None or not hasattr(
-            attention_boundary, "register_forward_hook"
-        ):
-            raise ValueError("H200 diagnostics cannot find the attention boundary")
+        if not hasattr(layer, "register_forward_pre_hook"):
+            raise ValueError("H200 diagnostics cannot find decoder input boundary")
         _diagnostic_hooks.append(
-            attention_boundary.register_forward_hook(
+            layer.register_forward_pre_hook(
+                lambda module, inputs, number=layer_number: _capture_h200_decoder_input(
+                    module, inputs, number
+                )
+            )
+        )
+        attention = getattr(layer, "self_attn", None)
+        mlp = getattr(layer, "mlp", None)
+        if attention is None or not hasattr(attention, "register_forward_hook"):
+            raise ValueError("H200 diagnostics cannot find self-attention boundary")
+        if mlp is None or not hasattr(mlp, "register_forward_hook"):
+            raise ValueError("H200 diagnostics cannot find dense MLP boundary")
+        if getattr(mlp, "router", None) is not None:
+            raise ValueError("H200 diagnostics requires a dense MLP for layers 0-2")
+        _diagnostic_hooks.append(
+            attention.register_forward_hook(
                 lambda module, inputs, output, number=layer_number: _capture_h200_attention_boundary(
+                    module, inputs, output, number
+                )
+            )
+        )
+        _diagnostic_hooks.append(
+            mlp.register_forward_hook(
+                lambda module, inputs, output, number=layer_number: _capture_h200_mlp_boundary(
                     module, inputs, output, number
                 )
             )
