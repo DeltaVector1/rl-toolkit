@@ -1367,7 +1367,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
             generator = torch.Generator(device="cuda").manual_seed(seed_tensor.item())
         for module in lora_modules:
             module._init_lora_parameters(generator)
-            restore_glm_moe_bias_values(model, snapshot_path, parallel_dims)
+    restore_glm_moe_bias_values(model, snapshot_path, parallel_dims)
     logger.debug(f"Loaded weights using HF DCP in {time.perf_counter() - load_dcp_start_time:.2f} seconds")
 
 

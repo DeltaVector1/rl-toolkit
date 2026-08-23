@@ -183,6 +183,28 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
             "restore_glm_moe_bias_values(model, snapshot_path, parallel_dims)",
             load_source,
         )
+        load_node = next(
+            node
+            for node in ast.parse(model_source).body
+            if isinstance(node, ast.FunctionDef) and node.name == "load_dcp_from_hf"
+        )
+        restore_expressions = [
+            node
+            for node in load_node.body
+            if isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "restore_glm_moe_bias_values"
+        ]
+        self.assertEqual(len(restore_expressions), 1)
+        lora_loop = next(
+            node
+            for node in ast.walk(load_node)
+            if isinstance(node, ast.For)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "module"
+        )
+        self.assertGreater(restore_expressions[0].lineno, lora_loop.end_lineno)
         self.assertIn("source.dtype != torch.float32", ast.unparse(ast.parse(model_source)))
 
     @unittest.skipUnless(torch is not None, "PP fingerprint validation requires PyTorch")
