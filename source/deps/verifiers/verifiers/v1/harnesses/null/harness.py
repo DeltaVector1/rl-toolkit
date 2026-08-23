@@ -1,12 +1,12 @@
 import json
 from pathlib import Path
 
-from openai import APIStatusError, AsyncOpenAI
-
 from verifiers.v1.clients import ModelContext
+from verifiers.v1.configs.harness import HarnessConfig
 from verifiers.v1.dialects.chat import message_to_wire
-from verifiers.v1.harness import Harness, HarnessConfig
+from verifiers.v1.harness import Harness
 from verifiers.v1.runtimes import ProgramResult, Runtime
+from verifiers.v1.task import TaskData
 from verifiers.v1.trace import Trace
 
 PROGRAM_SOURCE = (Path(__file__).resolve().parent / "program.py").read_text()
@@ -19,12 +19,12 @@ class NullHarnessConfig(HarnessConfig):
 class NullHarness(Harness[NullHarnessConfig]):
     APPENDS_SYSTEM_PROMPT = True
     SUPPORTS_MCP = True
-    SUPPORTS_USER_SIM = True
-    SUPPORTS_MESSAGE_PROMPT = True
+    SUPPORTS_RESUME = True
     EXECUTES_CODE = False
+    NEEDS_CONTAINER = False
 
     async def setup(self, runtime: Runtime) -> None:
-        pass
+        await runtime.prepare_uv_script(PROGRAM_SOURCE, self.config.resolved_env)
 
     async def launch(
         self,
@@ -34,28 +34,9 @@ class NullHarness(Harness[NullHarnessConfig]):
         endpoint: str,
         secret: str,
         mcp_urls: dict[str, str],
+        data: TaskData,
     ) -> ProgramResult:
-        system_prompt, prompt = self.resolve_prompt(trace.task.data)
-        if not mcp_urls:
-            messages = (
-                [{"role": "system", "content": system_prompt}]
-                if system_prompt
-                else []
-            )
-            if isinstance(prompt, str):
-                messages.append({"role": "user", "content": prompt})
-            elif prompt is not None:
-                messages.extend(message_to_wire(message) for message in prompt)
-            client = AsyncOpenAI(base_url=endpoint, api_key=secret)
-            try:
-                await client.chat.completions.create(model=ctx.model, messages=messages)
-            except APIStatusError:
-                if trace.stop_condition is None:
-                    raise
-            finally:
-                await client.close()
-            return ProgramResult(exit_code=0, stdout="", stderr="")
-
+        system_prompt, prompt = self.resolve_prompt(data)
         env = {**self.config.resolved_env}
         args = [
             f"--base-url={endpoint}",
@@ -64,23 +45,27 @@ class NullHarness(Harness[NullHarnessConfig]):
         ]
         if system_prompt:
             args.append(f"--system-prompt={system_prompt}")
-        args.append(
-            "--mcp-config="
-            + json.dumps(
-                {
-                    "mcpServers": {
-                        name: {"url": url} for name, url in mcp_urls.items()
+        if mcp_urls:
+            # The program connects to the tool servers over HTTP; hand it a standard
+            # `mcpServers` URL config (the `mcp` client itself comes from the uv deps).
+            args.append(
+                "--mcp-config="
+                + json.dumps(
+                    {
+                        "mcpServers": {
+                            name: {"url": url} for name, url in mcp_urls.items()
+                        }
                     }
-                }
+                )
             )
-        )
         if isinstance(prompt, str):
             args.append(f"--prompt={prompt}")
         elif prompt is not None:
+            # Base64 images can exceed exec limits, so hand Messages off through a file.
             path = f".vf-initial-messages-{trace.id}.json"
             await runtime.write(
                 path,
-                json.dumps([message_to_wire(message) for message in prompt]).encode(),
+                json.dumps([message_to_wire(m) for m in prompt]).encode(),
             )
             args.append(f"--initial-messages-file={path}")
         program = await runtime.prepare_uv_script(

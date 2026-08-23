@@ -32,6 +32,8 @@ class NativeFP8MultiLoRAGroupedExperts(MultiLoRAModule):
             raise ValueError("native FP8 expert LoRA requires block-FP8 checkpoint weights")
         if rank <= 0 or n_adapters <= 0:
             raise ValueError("rank and n_adapters must be positive")
+        if rank % 8:
+            raise ValueError("native FP8 routed-expert LoRA rank must be a multiple of 8")
         if n_adapters != 1:
             raise ValueError("native FP8 routed-expert LoRA supports one run at a time")
         if dropout != 0.0:

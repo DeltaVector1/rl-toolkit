@@ -1,4 +1,13 @@
-"""Vision-language model architecture metadata and component access."""
+"""Vision-Language Model (VLM) support utilities.
+
+Central registry for VLM model families. All model-specific knowledge
+lives here. Add new VLM families by extending VLM_REGISTRY.
+
+For custom models not in the registry, set overrides in config:
+    [model.vlm]
+    vision_encoder_attr = "model.my_vision"
+    language_model_attr = "model.my_lm"
+"""
 
 from dataclasses import dataclass
 
@@ -8,69 +17,103 @@ from transformers.configuration_utils import PretrainedConfig
 
 @dataclass(frozen=True)
 class VLMModelInfo:
-    """Attribute paths for one VLM family."""
+    """Per-model-family VLM architecture metadata."""
 
     vision_encoder_attr: str
     language_model_attr: str
 
 
+# Central registry: model_type -> architecture info.
 VLM_REGISTRY: dict[str, VLMModelInfo] = {
     "qwen3_vl": VLMModelInfo(vision_encoder_attr="model.visual", language_model_attr="model.language_model"),
     "qwen3_5": VLMModelInfo(vision_encoder_attr="model.visual", language_model_attr="model.language_model"),
     "qwen3_5_moe": VLMModelInfo(vision_encoder_attr="model.visual", language_model_attr="model.language_model"),
     "qwen3_vl_moe": VLMModelInfo(vision_encoder_attr="model.visual", language_model_attr="model.language_model"),
     "gemma4": VLMModelInfo(vision_encoder_attr="model.vision_tower", language_model_attr="model.language_model"),
-    "muse_glimmer": VLMModelInfo(
-        vision_encoder_attr="model.vision_tower",
-        language_model_attr="model.language_model",
-    ),
 }
 
+# Text-only default
 DEFAULT_LAYER_PREFIX = "model.layers."
 
 
+# ---------------------------------------------------------------------------
+# Model component access
+# ---------------------------------------------------------------------------
+
+
 def get_vision_encoder(model: nn.Module, override: str | None = None) -> nn.Module | None:
-    """Return the vision encoder, or None when the model is text-only."""
+    """Get the vision encoder module.
+
+    Checks: config override -> registry. Returns None if not found.
+    Raises ValueError on a bad config override.
+    """
     if override is not None:
         result = _resolve_attr(model, override)
         if result is None:
             raise ValueError(f"vlm.vision_encoder_attr='{override}' does not resolve on this model")
         return result
+
     info = _get_model_info(model)
-    return _resolve_attr(model, info.vision_encoder_attr) if info is not None else None
+    if info is not None:
+        return _resolve_attr(model, info.vision_encoder_attr)
+
+    return None
 
 
 def get_language_model(model: nn.Module, override: str | None = None) -> nn.Module:
-    """Return the module that owns the transformer layers."""
+    """Get the language model module (the part with transformer layers).
+
+    Checks: config override -> registry -> model.model (text-only default).
+    Raises ValueError on a bad config override.
+    """
     if override is not None:
         result = _resolve_attr(model, override)
         if result is None:
             raise ValueError(f"vlm.language_model_attr='{override}' does not resolve on this model")
         return result
+
     info = _get_model_info(model)
     if info is not None:
         result = _resolve_attr(model, info.language_model_attr)
         if result is not None:
             return result
+
+    # Text-only models: language model is directly at model.model
     return model.model
 
 
 def is_vlm_architecture(model_config: PretrainedConfig) -> bool:
-    """Return whether the config is a registered VLM architecture."""
+    """Check if the model config belongs to a known VLM architecture."""
     return _get_model_info_from_config(model_config) is not None
 
 
 def get_final_logit_softcapping(model_config: PretrainedConfig) -> float | None:
-    """Return text-model final-logit softcapping when it is configured."""
+    """Read ``final_logit_softcapping`` from the text config.
+
+    For composite VLM configs (e.g. Gemma) the value lives under ``text_config``;
+    ``get_text_config()`` returns that for VLMs and the config itself for text-only
+    models, so a plain top-level ``getattr`` would miss it and silently drop softcapping.
+    """
     return getattr(model_config.get_text_config(), "final_logit_softcapping", None)
 
 
 def get_layer_prefix(model_config: PretrainedConfig, override: str | None = None) -> str:
-    """Return the checkpoint prefix for language-model layers."""
+    """Return the weight key prefix for language model layers.
+
+    Derived from language_model_attr + '.layers.' for registered VLMs,
+    or 'model.layers.' for text-only / unknown models.
+    """
     if override is not None:
         return override
     info = _get_model_info_from_config(model_config)
-    return info.language_model_attr + ".layers." if info is not None else DEFAULT_LAYER_PREFIX
+    if info is not None:
+        return info.language_model_attr + ".layers."
+    return DEFAULT_LAYER_PREFIX
+
+
+# ---------------------------------------------------------------------------
+# Internal
+# ---------------------------------------------------------------------------
 
 
 def _get_model_info(model: nn.Module) -> VLMModelInfo | None:
@@ -84,6 +127,7 @@ def _get_model_info_from_config(model_config: PretrainedConfig) -> VLMModelInfo 
 
 
 def _resolve_attr(obj, dotted_path: str):
+    """Resolve a dotted attribute path like 'model.visual' on an object."""
     for part in dotted_path.split("."):
         obj = getattr(obj, part, None)
         if obj is None:

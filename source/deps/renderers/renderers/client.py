@@ -1,4 +1,4 @@
-"""Renderer-based generate client for vLLM 0.20's /inference/v1/generate.
+"""Renderer-based generate client for vLLM's /inference/v1/generate.
 
     messages → Renderer.render_ids() → token IDs → POST /inference/v1/generate
     → completion tokens → Renderer.parse_response() → structured message
@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 from collections.abc import Mapping
 from typing import Any, cast
 
@@ -33,6 +34,9 @@ from renderers.base import (
 _request_logger = logging.getLogger("renderers.client")
 ROUTED_EXPERTS_DATA_PREFIX = b'"routed_experts":{"data":"'
 KEPT_TOKENS_IDS_PREFIX = b'"kept_tokens":{"ids":"'
+# vLLM uses this value both when sampled-token evidence is missing and as a
+# lower-bound clamp, so receiving it cannot prove the real logprob was returned.
+VLLM_LOGPROB_SENTINEL = -9999.0
 
 
 class OverlongPromptError(Exception):
@@ -54,9 +58,12 @@ class OverlongPromptError(Exception):
         self.prompt_len = prompt_len
         self.max_prompt_len = max_prompt_len
         super().__init__(
-            f"Prompt length ({prompt_len}) exceeds maximum "
-            f"context length ({max_prompt_len})."
+            f"Prompt length ({prompt_len}) exceeds maximum context length ({max_prompt_len})."
         )
+
+
+class MalformedGenerateResponseError(ValueError):
+    """The generate endpoint returned unusable sampled-token evidence."""
 
 
 # Per-process cache of resolved engine context-length caps, keyed by
@@ -148,6 +155,60 @@ def parse_generate_response(raw: bytes) -> dict[str, Any]:
     if kept_ids_data is not None:
         payload["choices"][0]["kept_tokens"]["ids"] = kept_ids_data
     return payload
+
+
+def _parse_completion_logprobs(
+    choice: Mapping[str, Any], completion_ids: list[int]
+) -> list[float]:
+    raw_logprobs = choice.get("logprobs")
+    if not isinstance(raw_logprobs, Mapping):
+        raise MalformedGenerateResponseError(
+            "Engine response choice.logprobs must be an object."
+        )
+
+    content = raw_logprobs.get("content")
+    if not isinstance(content, list):
+        raise MalformedGenerateResponseError(
+            "Engine response choice.logprobs.content must be a list."
+        )
+    if len(content) != len(completion_ids):
+        raise MalformedGenerateResponseError(
+            "Engine response completion token count "
+            f"({len(completion_ids)}) does not match logprob count ({len(content)})."
+        )
+
+    completion_logprobs: list[float] = []
+    for index, entry in enumerate(content):
+        if not isinstance(entry, Mapping):
+            raise MalformedGenerateResponseError(
+                f"Engine response choice.logprobs.content[{index}] must be an object."
+            )
+        expected_token = f"token_id:{completion_ids[index]}"
+        if entry.get("token") != expected_token:
+            raise MalformedGenerateResponseError(
+                f"Engine response choice.logprobs.content[{index}].token must be {expected_token!r}."
+            )
+        raw_logprob = entry.get("logprob")
+        if isinstance(raw_logprob, bool) or not isinstance(raw_logprob, (int, float)):
+            raise MalformedGenerateResponseError(
+                f"Engine response choice.logprobs.content[{index}].logprob must be a number."
+            )
+        try:
+            logprob = float(raw_logprob)
+        except OverflowError as exc:
+            raise MalformedGenerateResponseError(
+                f"Engine response choice.logprobs.content[{index}].logprob must be finite."
+            ) from exc
+        if not math.isfinite(logprob):
+            raise MalformedGenerateResponseError(
+                f"Engine response choice.logprobs.content[{index}].logprob must be finite."
+            )
+        if logprob == VLLM_LOGPROB_SENTINEL:
+            raise MalformedGenerateResponseError(
+                f"Engine response choice.logprobs.content[{index}].logprob does not contain sampling evidence."
+            )
+        completion_logprobs.append(logprob)
+    return completion_logprobs
 
 
 async def generate(
@@ -304,14 +365,11 @@ async def generate(
     choice = (data.get("choices") or [{}])[0]
     completion_ids = choice.get("token_ids") or []
 
+    completion_logprobs = _parse_completion_logprobs(choice, completion_ids)
+
     parsed = await _maybe_offload(
         renderer, lambda: renderer.parse_response(completion_ids, tools=tools)
     )
-
-    # ChatCompletionLogProbs flatten: {"content": [{"logprob": ...}, ...]}
-    raw_logprobs = choice.get("logprobs") or {}
-    content_lp = raw_logprobs.get("content") if isinstance(raw_logprobs, dict) else None
-    completion_logprobs = [float(c.get("logprob") or 0.0) for c in content_lp or []]
 
     routed_experts = choice.get("routed_experts")
     kept_tokens = choice.get("kept_tokens")
@@ -371,9 +429,9 @@ def _build_mm_features(
     model-family specific. For now we dispatch on the renderer class;
     extend the dispatch table as more multimodal renderers land.
 
-    NOTE — future engine pluggability: this encoder is vLLM 0.20-specific
+    NOTE — future engine pluggability: this encoder is vLLM-specific
     (uses ``vllm.multimodal.inputs.MultiModalKwargsItems``,
-    ``vllm.entrypoints.serve.disagg.mm_serde.encode_mm_kwargs_item``, and
+    ``vllm.entrypoints.scale_out.token_in_token_out.mm_serde.encode_mm_kwargs_item``, and
     ``_create_qwen2vl_field_factory``). When a second inference engine
     arrives (SGLang, MAX, ...) the renderer client should be parameterized
     on engine: either (a) move the encoder onto the renderer as
@@ -420,7 +478,9 @@ def _build_qwen_vl_features(
     try:
         import torch
         from transformers.feature_extraction_utils import BatchFeature
-        from vllm.entrypoints.serve.disagg.mm_serde import encode_mm_kwargs_item
+        from vllm.entrypoints.scale_out.token_in_token_out.mm_serde import (
+            encode_mm_kwargs_item,
+        )
         from vllm.model_executor.models.qwen2_vl import _create_qwen2vl_field_factory
         from vllm.multimodal.inputs import MultiModalKwargsItems
     except ImportError as exc:

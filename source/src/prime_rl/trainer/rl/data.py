@@ -1,7 +1,9 @@
-from collections.abc import Callable, Sequence
+# ruff: noqa: F722, F821
+
 import hashlib
 import json
 import os
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TypedDict
 
@@ -159,8 +161,6 @@ class FakeDataLoader:
         )
         offset = 0
         for length in sequence_lengths:
-            # A sequence has no preceding token in its own attention block.
-            # Keep this false even when a supplied rollout mask is malformed.
             loss_mask[offset] = False
             offset += length
         reference_advantages = reference.get("advantages")
@@ -400,6 +400,72 @@ def _copy_cached_value(value):
     return value
 
 
+_TOKEN_FIELDS = (
+    "input_ids",
+    "position_ids",
+    "advantages",
+    "inference_logprobs",
+    "ref_logprobs",
+    "loss_mask",
+    "temperatures",
+    "mm_token_type_ids",
+    "routed_experts",
+    "rl_weights",
+    "ce_weights",
+    "ref_kl_weights",
+)
+
+
+def _combine_cached_batches(
+    first: TensorMicroBatch,
+    second: TensorMicroBatch,
+) -> TensorMicroBatch:
+    if first["input_ids"].shape[0] != 1 or second["input_ids"].shape[0] != 1:
+        raise ValueError("cached rollout replay only combines single-row packed batches")
+    if first["mm_kwargs"] is not None or second["mm_kwargs"] is not None:
+        raise ValueError("cached rollout replay cannot combine multimodal batches")
+    if first["run_id"] != second["run_id"] or first["run_step"] != second["run_step"]:
+        raise ValueError("cached rollout replay cannot combine different runs or policy steps")
+
+    combined = _copy_cached_value(first)
+    for name in _TOKEN_FIELDS:
+        left = first[name]
+        right = second[name]
+        if (left is None) != (right is None):
+            raise ValueError(f"cached rollout field {name} is present in only one batch")
+        combined[name] = None if left is None else torch.cat((left, right), dim=1)
+    combined["env_names"] = first["env_names"] + second["env_names"]
+    combined["sequence_lengths"] = first["sequence_lengths"] + second["sequence_lengths"]
+    combined["lora_num_tokens"] = first["lora_num_tokens"] + second["lora_num_tokens"]
+    combined["seq_lens"] = torch.cat((first["seq_lens"], second["seq_lens"]))
+    return combined
+
+
+def _combine_partial_cached_batches(
+    batches: list[TensorMicroBatch],
+    maximum_tokens: int,
+) -> list[TensorMicroBatch]:
+    combined = []
+    current = None
+    for batch in batches:
+        tokens = batch["input_ids"].shape[1]
+        if tokens > maximum_tokens:
+            raise ValueError(
+                f"cached rollout batch has {tokens} tokens; maximum is {maximum_tokens}"
+            )
+        if current is None:
+            current = batch
+            continue
+        if current["input_ids"].shape[1] + tokens <= maximum_tokens:
+            current = _combine_cached_batches(current, batch)
+        else:
+            combined.append(current)
+            current = batch
+    if current is not None:
+        combined.append(current)
+    return combined
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -429,8 +495,20 @@ class RolloutCacheDataLoader:
         self.dp_rank = dp_rank
         self.cp_size = cp_size
         self.world = get_world()
-        self.path = config.directory / f"rank-{self.world.rank}.pt"
-        self.digest_path = config.directory / f"rank-{self.world.rank}.sha256"
+        source_rank = self.world.rank
+        if config.recorded_cp_size is not None:
+            if config.recorded_cp_size != dp_world_size * cp_size:
+                raise ValueError(
+                    "recorded_cp_size must equal the replay data-parallel size "
+                    "times the replay context-parallel size"
+                )
+            source_rank = (
+                self.world.rank // config.recorded_cp_size * config.recorded_cp_size
+                + self.world.rank % cp_size
+            )
+        self.source_rank = source_rank
+        self.path = config.directory / f"rank-{source_rank}.pt"
+        self.digest_path = config.directory / f"rank-{source_rank}.sha256"
         self.cached_batch = None
         self.recorded = False
 
@@ -455,7 +533,14 @@ class RolloutCacheDataLoader:
             self._save(batch)
             self.recorded = True
             return batch
-        return _copy_cached_value(self.cached_batch)
+        batches = [
+            micro_batch
+            for _ in range(self.config.repeats)
+            for micro_batch in _copy_cached_value(self.cached_batch)
+        ]
+        if self.config.combine_partial_batches:
+            return _combine_partial_cached_batches(batches, self.seq_len)
+        return batches
 
     def _metadata(self) -> dict:
         return {
@@ -490,6 +575,13 @@ class RolloutCacheDataLoader:
             raise ValueError(f"rollout cache digest does not match for {self.path}")
         payload = torch.load(self.path, map_location="cpu", weights_only=False)
         expected_metadata = self._metadata()
+        if self.config.recorded_cp_size is not None:
+            expected_metadata.update(
+                rank=self.source_rank,
+                dp_world_size=1,
+                dp_rank=0,
+                cp_size=self.config.recorded_cp_size,
+            )
         if payload.get("metadata") != expected_metadata:
             raise ValueError(
                 "rollout cache metadata does not match this trainer: "

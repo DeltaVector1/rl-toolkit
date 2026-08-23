@@ -7,3 +7,5 @@ cdffdcb646f2de35248ce36214aa365e9460d13eb8886beb7502dfab4e10d2e4  patches/prime-
 06072ddbf074dbb480c082674a17a0f19379b2be5b3c886602a5c542f30d4a68  patches/prime-rl/v0.8.0-glm52/0007-Add-GLM52-transport-and-topology-regressions.patch
 382b4b670bb114738d46f6b741b016f8b7d9307c6a207b0507209a4308b591a7  patches/prime-rl/v0.8.0-glm52/0008-Add-native-FP8-and-LoRA-update-regressions.patch
 9a95411a2449c46fbe61f89ae1b34cd89f9da2bb9afa4ec92c66b93d3c716e27  patches/prime-rl/v0.8.0-glm52/0009-Add-routed-expert-LoRA-and-bounded-FP8-qualification.patch
+ae75ceeeaf67c0aefd612b6ab15e425ed2ec4e0d05a1bcf7777f820100b39c67  patches/prime-rl/v0.8.0-glm52/0010-Fix-v0.8-CUDA-image-package-versions.patch
+17ac931812cccf0fda2592aab8c5d6b179bdf0265d57f3a83326dfa326f691b0  patches/prime-rl/v0.8.0-glm52/0011-Fix-routed-expert-LoRA-EP-child-sharding.patch

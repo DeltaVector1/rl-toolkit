@@ -76,6 +76,10 @@ The INT4 expert-activation transport remains. It is not an INT4 weight path.
 8. `0008`: FP8, LoRA, and deterministic parity regression tests.
 9. `0009`: later bounded-memory FP8 work, rank-32 routed-expert LoRA, strict
    GLM target checks, and explicit rollout record and replay support.
+10. `0010`: correct the v0.8 image build, include its missing MXFP4 helper,
+    and add the final rank-32 runtime checks.
+11. `0011`: shard only the routed-expert LoRA wrapper during recursive EP
+    partitioning.
 
 `SHA256SUMS` records the exact patch payloads.
 
@@ -83,7 +87,7 @@ The INT4 expert-activation transport remains. It is not an INT4 weight path.
 
 ```bash
 git checkout 60bc29547a8824ad1de7b9af8d265e2b27b2a72d
-git am /path/to/v0.8.0-glm52/000*.patch
+git am /path/to/v0.8.0-glm52/0*.patch
 git submodule update --init --recursive
 ```
 
@@ -106,13 +110,19 @@ old and v0.8.0 dependency patches.
 
 ## Validation completed
 
-- All eight patches apply with `git am` to the exact v0.8.0 base.
+- All eleven patches apply with `git am` to the exact v0.8.0 base.
 - Each cumulative patch revision passes `compileall` and `git diff --check`.
 - The focused Prime-RL suite passes: 43 tests.
 - The full renderers suite passes: 2,589 tests, with 153 skips and 1 expected
   failure.
 - The targeted verifiers relay suite passes: 25 tests.
 - The added verifiers disconnect-retry test passes.
+- Rank-32 routed-expert LoRA passed 20 forward, backward, and optimizer
+  iterations with real GLM widths on one 8x RTX 4090 EP8 node. The test used
+  the real INT4 dispatch and combine path with eight transport rounds. All
+  parameter and input gradients were finite, all ranks updated parameters,
+  peak allocated memory was 0.765 GiB, and post-iteration allocated memory
+  returned to 0.109 GiB for the isolated expert layer.
 - Both dependency patches pass a clean `git apply --check` at their exact
   v0.8.0 submodule revisions.
 - The Decensor plugin is discovered through the v0.8 `Taskset` and `Env`

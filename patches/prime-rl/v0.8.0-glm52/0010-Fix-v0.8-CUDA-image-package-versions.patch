@@ -1,0 +1,252 @@
+From 39767350bf040f8520b1747dfc9b29c9ee144a7f Mon Sep 17 00:00:00 2001
+From: DeltaVector1 <DeltaVector1@users.noreply.github.com>
+Date: Sat, 22 Aug 2026 08:37:55 +0000
+Subject: [PATCH] Fix v0.8 CUDA image package versions
+
+---
+ Dockerfile.cuda                               |   8 +-
+ .../glm_moe_dsa/modeling_glm_moe_dsa.py       |   2 +
+ .../models/layers/lora/native_fp8_moe.py      |   2 +
+ src/prime_rl/trainer/mxfp4.py                 | 166 ++++++++++++++++++
+ uv.lock                                       |   2 +-
+ 5 files changed, 175 insertions(+), 5 deletions(-)
+ create mode 100644 src/prime_rl/trainer/mxfp4.py
+
+diff --git a/Dockerfile.cuda b/Dockerfile.cuda
+index 2f536a66..4cfa6e29 100644
+--- a/Dockerfile.cuda
++++ b/Dockerfile.cuda
+@@ -100,15 +100,15 @@ RUN --mount=type=cache,target=/app/.cache/uv \
+     && \
+     eval "$(bash /app/scripts/docker-editable-pretend-versions.sh --shell /app)" \
+     && \
+-    if [ -L /app/.git/modules ]; then rm /app/.git/modules && rmdir /app/.git 2>/dev/null || true; fi \
+-    && \
+     sed -i "s/fallback-version = \"0.0.0\"/fallback-version = \"${VERIFIERS_PRETEND_VERSION}\"/" /app/deps/verifiers/pyproject.toml \
+     && \
+     sed -i "s/fallback-version = \"0.0.0\"/fallback-version = \"${RENDERERS_PRETEND_VERSION}\"/" /app/deps/renderers/pyproject.toml \
+     && \
+-    uv sync --all-packages --extra flash-attn --extra flash-attn-3 --extra flash-attn-cute --extra disagg --extra gpt-oss --extra quack --group mamba-ssm --locked --no-dev \
++    uv sync --all-packages --extra flash-attn --extra flash-attn-3 --extra flash-attn-cute --extra disagg --extra gpt-oss --extra quack --locked --no-dev \
++    && \
++    if [ -L /app/.git/modules ]; then rm /app/.git/modules && rmdir /app/.git 2>/dev/null || true; fi \
+     && \
+-    /app/.venv/bin/python -c 'from importlib.metadata import version; [version(name) for name in ("deep-ep", "deep-gemm", "mamba-ssm", "nixl", "quack-kernels", "vllm", "vllm-router")]'
++    /app/.venv/bin/python -c 'from importlib.metadata import version; [version(name) for name in ("deep-ep", "deep-gemm", "nixl", "quack-kernels", "vllm", "vllm-router")]'
+ 
+ # Optional: build NIXL from source against the UCX 1.19 baked above. The PyPI
+ # nixl wheel ships its own UCX which segfaults on prefill→decode KV transfer
+diff --git a/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py b/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py
+index 76cd30c8..98dd4a52 100644
+--- a/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py
++++ b/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py
+@@ -310,6 +310,8 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
+         """
+         routed_experts (`torch.LongTensor` of shape `(batch_size, sequence_length, num_hidden_layers, num_experts_per_tok)`, *optional*):
+             Routed experts for each token in the sequence. Only used for router replay.
++        sparse_indices_cache (`torch.LongTensor`, *optional*):
++            Sparse attention indices from the preceding pipeline stage.
+         seq_lens (`torch.LongTensor` of shape `(num_documents,)`, *optional*):
+             Per-document lengths of the packed row (PrimeRL packed-batch contract). Unused.
+         seq_lens_are_pre_shard (`bool`, *optional*, defaults to `False`):
+diff --git a/src/prime_rl/trainer/models/layers/lora/native_fp8_moe.py b/src/prime_rl/trainer/models/layers/lora/native_fp8_moe.py
+index 1f39c1cb..fa8ecbcc 100644
+--- a/src/prime_rl/trainer/models/layers/lora/native_fp8_moe.py
++++ b/src/prime_rl/trainer/models/layers/lora/native_fp8_moe.py
+@@ -32,6 +32,8 @@ class NativeFP8MultiLoRAGroupedExperts(MultiLoRAModule):
+             raise ValueError("native FP8 expert LoRA requires block-FP8 checkpoint weights")
+         if rank <= 0 or n_adapters <= 0:
+             raise ValueError("rank and n_adapters must be positive")
++        if rank % 8:
++            raise ValueError("native FP8 routed-expert LoRA rank must be a multiple of 8")
+         if n_adapters != 1:
+             raise ValueError("native FP8 routed-expert LoRA supports one run at a time")
+         if dropout != 0.0:
+diff --git a/src/prime_rl/trainer/mxfp4.py b/src/prime_rl/trainer/mxfp4.py
+new file mode 100644
+index 00000000..e188b2fb
+--- /dev/null
++++ b/src/prime_rl/trainer/mxfp4.py
+@@ -0,0 +1,166 @@
++import dataclasses
++import re
++
++import torch
++import triton
++import triton.language as tl
++from safetensors import safe_open
++from torch.distributed.checkpoint._hf_utils import _HFStorageInfo
++from torch.distributed.checkpoint.hf_storage import HuggingFaceStorageReader
++from torch.distributed.checkpoint.metadata import ChunkStorageMetadata, MetadataIndex, TensorStorageMetadata
++from torch.distributed.checkpoint.planner import LoadPlan, LoadPlanner, ReadItem
++from torch.futures import Future
++
++_EXPERT = re.compile(
++    r"^(model\.layers\.\d+\.mlp)\.experts\.(\d+)\.(gate|down|up)_proj\.(weight|weight_scale)$"
++)
++_PROJECTIONS = {"gate": "w1", "down": "w2", "up": "w3"}
++
++
++@triton.jit
++def _dequant_mxfp4_kernel(weight, scale, out, packed_k: tl.constexpr, BLOCK: tl.constexpr):
++    row = tl.program_id(0)
++    logical_k = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++    mask = logical_k < packed_k * 2
++    packed = tl.load(weight + row * packed_k + logical_k // 2, mask=mask)
++    value = (packed >> ((logical_k & 1) * 4)) & 0xF
++    code = (value & 0x7).to(tl.int32)
++    magnitude = tl.where(
++        code == 0,
++        0.0,
++        tl.where(
++            code == 1,
++            0.5,
++            tl.exp2((code // 2 - 1).to(tl.float32)) * (1.0 + (code & 1).to(tl.float32) * 0.5),
++        ),
++    )
++    magnitude = tl.where((value & 0x8) != 0, -magnitude, magnitude)
++    exponent = tl.load(scale + row * (packed_k // 16) + logical_k // 32, mask=mask)
++    block_scale = (exponent.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
++    tl.store(out + row * packed_k * 2 + logical_k, magnitude * block_scale, mask=mask)
++
++
++@torch.library.custom_op("prime_rl::dequant_mxfp4", mutates_args=())
++def dequant_mxfp4(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
++    packed_k = weight.shape[-1]
++    out = torch.empty((*weight.shape[:-1], packed_k * 2), dtype=torch.bfloat16, device=weight.device)
++    _dequant_mxfp4_kernel[(weight.numel() // packed_k, triton.cdiv(packed_k * 2, 256))](
++        weight,
++        scale,
++        out,
++        packed_k,
++        256,
++    )
++    return out
++
++
++@dequant_mxfp4.register_fake
++def _(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
++    return torch.empty((*weight.shape[:-1], weight.shape[-1] * 2), dtype=torch.bfloat16, device=weight.device)
++
++
++@dataclasses.dataclass
++class _MXFP4StorageInfo(_HFStorageInfo):
++    source_key: str = ""
++    stacked: bool = False
++
++
++class MXFP4HuggingFaceStorageReader(HuggingFaceStorageReader):
++    def read_metadata(self):
++        metadata = super().read_metadata()
++        storage_by_fqn = {}
++        for index in metadata.storage_data:
++            storage_by_fqn.setdefault(index.fqn, []).append(index)
++        groups = {}
++        for key in list(metadata.state_dict_metadata):
++            match = _EXPERT.match(key)
++            if match:
++                prefix, expert, projection, kind = match.groups()
++                groups.setdefault((prefix, projection, kind), []).append((int(expert), key))
++
++        for (prefix, projection, kind), sources in groups.items():
++            target = f"{prefix}.experts.{_PROJECTIONS[projection]}{'_scale' if kind == 'weight_scale' else ''}"
++            chunks = []
++            properties = None
++            size = None
++            for expert, source in sorted(sources):
++                source_metadata = metadata.state_dict_metadata.pop(source)
++                properties = source_metadata.properties
++                source_shape = source_metadata.size
++                size = torch.Size((len(sources), *source_shape))
++                offset = torch.Size((expert, *([0] * len(source_shape))))
++                chunks.append(ChunkStorageMetadata(offsets=offset, sizes=torch.Size((1, *source_shape))))
++                self._move_storage(metadata, storage_by_fqn, source, target, offset, stacked=True)
++            metadata.state_dict_metadata[target] = TensorStorageMetadata(
++                properties=properties,
++                size=size,
++                chunks=chunks,
++            )
++
++        renames = {
++            ".mlp.gate.weight": ".mlp.router.gate.weight",
++            ".mlp.gate.e_score_correction_bias": ".mlp.expert_bias",
++            ".mlp.shared_experts.gate_proj.weight": ".mlp.shared_expert.w1",
++            ".mlp.shared_experts.gate_proj.weight_scale": ".mlp.shared_expert.w1_scale",
++            ".mlp.shared_experts.down_proj.weight": ".mlp.shared_expert.w2",
++            ".mlp.shared_experts.down_proj.weight_scale": ".mlp.shared_expert.w2_scale",
++            ".mlp.shared_experts.up_proj.weight": ".mlp.shared_expert.w3",
++            ".mlp.shared_experts.up_proj.weight_scale": ".mlp.shared_expert.w3_scale",
++        }
++        for source in list(metadata.state_dict_metadata):
++            for suffix, replacement in renames.items():
++                if source.endswith(suffix):
++                    target = source.removesuffix(suffix) + replacement
++                    metadata.state_dict_metadata[target] = metadata.state_dict_metadata.pop(source)
++                    self._move_storage(
++                        metadata,
++                        storage_by_fqn,
++                        source,
++                        target,
++                        torch.Size([0] * len(metadata.state_dict_metadata[target].size)),
++                    )
++                    break
++        return metadata
++
++    @staticmethod
++    def _move_storage(metadata, storage_by_fqn, source, target, target_offset, stacked=False):
++        for index in storage_by_fqn.pop(source, ()):
++            info = metadata.storage_data.pop(index)
++            metadata.storage_data[MetadataIndex(target, target_offset)] = _MXFP4StorageInfo(
++                relative_path=info.relative_path,
++                shape=info.shape,
++                dtype=info.dtype,
++                source_key=source,
++                stacked=stacked,
++            )
++
++    @staticmethod
++    def _process_mxfp4_request(f, req: ReadItem, planner: LoadPlanner, info: _MXFP4StorageInfo):
++        slices = tuple(slice(offset, offset + length) for offset, length in zip(req.storage_offsets, req.lengths))
++        if info.stacked:
++            tensor = f.get_slice(info.source_key)[slices[1:]].unsqueeze(0)
++        else:
++            tensor = f.get_slice(info.source_key)[slices]
++        target = planner.resolve_tensor(req).detach()
++        if target.size() != tensor.size():
++            raise AssertionError(f"req {req.storage_index} mismatch sizes {target.size()} vs {tensor.size()}")
++        target.copy_(tensor)
++        planner.commit_tensor(req, target)
++
++    def read_data(self, plan: LoadPlan, planner: LoadPlanner) -> Future[None]:
++        per_file = {}
++        for item in plan.items:
++            info = self.storage_data[item.storage_index]
++            per_file.setdefault(info.relative_path, []).append((item, info))
++
++        for file_name, requests in per_file.items():
++            with safe_open(file_name, framework="pt") as f:
++                for request, info in requests:
++                    if isinstance(info, _MXFP4StorageInfo):
++                        self._process_mxfp4_request(f, request, planner, info)
++                    else:
++                        self._process_read_request(f, request, planner)
++
++        future = Future()
++        future.set_result(None)
++        return future
+diff --git a/uv.lock b/uv.lock
+index e59c12c4..4a9053bc 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -5153,7 +5153,7 @@ dev = [
+ 
+ [[package]]
+ name = "prime-rl"
+-version = "0.7.0"
++version = "0.8.0"
+ source = { editable = "." }
+ dependencies = [
+     { name = "aiolimiter" },
+-- 
+2.43.0
+

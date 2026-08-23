@@ -44,9 +44,11 @@ class ParallelDims:
 
     _world_mesh: DeviceMesh = None
     _submeshes: dict = None
+    _partial_reshard_meshes: dict[int, DeviceMesh] = None
 
     def __post_init__(self):
         self._submeshes = {}
+        self._partial_reshard_meshes = {}
         self._validate()
 
     def _validate(self):
@@ -220,6 +222,52 @@ class ParallelDims:
         if name in self._submeshes:
             return self._submeshes[name]
         return mesh[name]
+
+    def get_partial_reshard_mesh(self, shard_size: int) -> DeviceMesh:
+        if shard_size in self._partial_reshard_meshes:
+            return self._partial_reshard_meshes[shard_size]
+
+        if shard_size != 4:
+            raise ValueError("partial reshard currently supports only four shard ranks")
+        topology = (
+            self.pp,
+            self.cp,
+            self.ep,
+            self.dp_replicate,
+            self.dp_shard,
+            self.world_size,
+            self.global_ep,
+        )
+        if topology != (8, 8, 8, 1, 1, 64, False):
+            raise ValueError(
+                "four-rank partial reshard requires PP8, CP8, EP8, "
+                "dp_replicate=1, dp_shard=1, world_size=64, and global_ep=false"
+            )
+
+        hsdp_mesh = self.get_mesh("hsdp")
+        if hsdp_mesh.ndim != 1:
+            raise ValueError("partial reshard requires a one-dimensional FSDP mesh")
+        fsdp_size = hsdp_mesh.size()
+        if shard_size < 2 or shard_size >= fsdp_size or fsdp_size % shard_size != 0:
+            raise ValueError(
+                f"partial reshard size must be a factor of {fsdp_size} between 2 and {fsdp_size - 1}"
+            )
+
+        world_ranks = self.world_mesh.mesh
+        if world_ranks.numel() != self.pp * fsdp_size:
+            raise ValueError(
+                "partial reshard requires each pipeline stage to contain only its FSDP ranks"
+            )
+        ranks = world_ranks.reshape(self.pp, fsdp_size // shard_size, shard_size)
+        names = (
+            f"partial_reshard_pp_{shard_size}",
+            f"partial_reshard_replicate_{shard_size}",
+            f"partial_reshard_shard_{shard_size}",
+        )
+        all_stages = DeviceMesh(device_type, ranks, mesh_dim_names=names)
+        stage_mesh = all_stages[(names[1], names[2])]
+        self._partial_reshard_meshes[shard_size] = stage_mesh
+        return stage_mesh
 
     @property
     def dp_enabled(self):

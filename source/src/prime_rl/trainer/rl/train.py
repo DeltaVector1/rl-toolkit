@@ -3,7 +3,10 @@ import prime_rl._compat  # noqa: F401 — patch ring_flash_attn compat before im
 from contextlib import nullcontext
 import hashlib
 import json
+import math
 import os
+from pathlib import Path
+import subprocess
 import time
 from datetime import timedelta
 
@@ -75,8 +78,56 @@ from prime_rl.utils.monitor import setup_monitor
 from prime_rl.utils.config import cli
 from prime_rl.utils.process import set_proc_title
 from prime_rl.utils.utils import clean_exit, resolve_latest_ckpt_step, to_col_format
-from prime_rl.trainer.models.layers.hf_ring_attn import substitute_hf_flash_attn
+from ring_flash_attn import substitute_hf_flash_attn
 from torchtitan.distributed.utils import clip_grad_norm_
+
+
+def _parse_cpu_list(value: str) -> set[int]:
+    cpus = set()
+    for part in value.strip().split(","):
+        start, separator, end = part.partition("-")
+        if not start:
+            raise ValueError(f"invalid CPU list {value!r}")
+        first = int(start)
+        last = int(end) if separator else first
+        if last < first:
+            raise ValueError(f"invalid CPU range {part!r}")
+        cpus.update(range(first, last + 1))
+    if not cpus:
+        raise ValueError("CPU list is empty")
+    return cpus
+
+
+def bind_worker_to_gpu_numa_node() -> tuple[int, int] | None:
+    """Bind one trainer worker and its communication threads near its GPU."""
+    if os.environ.get("PRIME_BIND_GPU_NUMA", "0") != "1":
+        return None
+    local_rank = int(os.environ["LOCAL_RANK"])
+    result = subprocess.run(
+        ["nvidia-smi", "--query-gpu=pci.bus_id", "--format=csv,noheader"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    bus_ids = [line.strip().lower() for line in result.stdout.splitlines() if line.strip()]
+    if local_rank >= len(bus_ids):
+        raise RuntimeError(
+            f"local rank {local_rank} has no GPU PCI address in {bus_ids}"
+        )
+    pci_address = bus_ids[local_rank][-12:]
+    node_path = Path("/sys/bus/pci/devices") / pci_address / "numa_node"
+    try:
+        numa_node = int(node_path.read_text().strip())
+    except (FileNotFoundError, ValueError) as error:
+        raise RuntimeError(
+            f"cannot read NUMA node for local GPU {local_rank} at {node_path}"
+        ) from error
+    if numa_node < 0:
+        raise RuntimeError(f"local GPU {local_rank} has no NUMA node")
+    cpu_path = Path(f"/sys/devices/system/node/node{numa_node}/cpulist")
+    cpus = _parse_cpu_list(cpu_path.read_text())
+    os.sched_setaffinity(0, cpus)
+    return numa_node, len(cpus)
 
 
 def move_micro_batch_to_cuda(micro_batch) -> None:
@@ -178,7 +229,9 @@ def verify_pipeline_batch_identity(micro_batches, pp_group) -> None:
             digest.update(str(tensor.dtype).encode())
             digest.update(bytes(tensor.numpy().data))
         digest.update(json.dumps(micro_batch["sequence_lengths"]).encode())
-        digests.append(int.from_bytes(digest.digest()[:8], "little") & ((1 << 63) - 1))
+        digests.append(
+            int.from_bytes(digest.digest()[:8], "little") & ((1 << 63) - 1)
+        )
     local = torch.tensor(digests, dtype=torch.int64, device="cuda")
     minimum = local.clone()
     maximum = local.clone()
@@ -190,27 +243,6 @@ def verify_pipeline_batch_identity(micro_batches, pp_group) -> None:
             "pipeline stages loaded different trainer data for microbatches "
             f"{mismatched[:10]}; check data-parallel rank mapping"
         )
-
-
-def register_local_lora_run(multi_run_manager, lora_config) -> None:
-    """Create adapter slot zero for trainer-only qualification.
-
-    The normal LoRA optimizer waits until MultiRunManager discovers an
-    orchestrator run because discovery resets the adapter. A trainer-only
-    qualification deliberately has no orchestrator. Register the one local
-    adapter directly after model construction, when every LoRA module has
-    already attached itself to the manager.
-    """
-    if multi_run_manager.used_idxs:
-        raise RuntimeError("trainer-only qualification found an unexpected RL run")
-    run_id = "trainer_qualification"
-    idx = 0
-    multi_run_manager.idx_2_id[idx] = run_id
-    multi_run_manager.id_2_idx[run_id] = idx
-    multi_run_manager.unused_idxs.remove(idx)
-    multi_run_manager.progress[idx] = Progress()
-    multi_run_manager.scaling_factors[idx] = lora_config.alpha / lora_config.rank
-    multi_run_manager.reset_run_parameters(idx)
 
 
 def initialize_fresh_lora_policy(
@@ -278,27 +310,29 @@ def initialize_fresh_lora_policy(
 
 
 def parity_guard_failures(tensor_stats: dict, guard) -> list[str]:
-    """Return measured parity violations. Missing required evidence fails closed."""
+    """Return parity violations. Missing or nonfinite evidence fails closed."""
     failures = []
     unmasked = tensor_stats.get("unmasked_mismatch_kl/mean")
     masked = tensor_stats.get("masked_mismatch_kl/mean")
     masked_fraction = tensor_stats.get("is_masked/mean")
-    if unmasked is None:
-        failures.append("unmasked mismatch KL is missing")
+
+    if unmasked is None or not math.isfinite(unmasked):
+        failures.append("unmasked mismatch KL is missing or nonfinite")
     elif unmasked > guard.max_unmasked_mismatch_kl:
         failures.append(
             f"unmasked mismatch KL {unmasked:.6f} > {guard.max_unmasked_mismatch_kl:.6f}"
         )
-    if masked_fraction is None:
-        failures.append("masked token fraction is missing")
+
+    if masked_fraction is None or not math.isfinite(masked_fraction):
+        failures.append("masked token fraction is missing or nonfinite")
     else:
         if masked_fraction > guard.max_masked_fraction:
             failures.append(
                 f"masked token fraction {masked_fraction:.6f} > {guard.max_masked_fraction:.6f}"
             )
         if masked_fraction > 0:
-            if masked is None:
-                failures.append("masked mismatch KL is missing")
+            if masked is None or not math.isfinite(masked):
+                failures.append("masked mismatch KL is missing or nonfinite")
             elif masked > guard.max_masked_mismatch_kl:
                 failures.append(
                     f"masked mismatch KL {masked:.6f} > {guard.max_masked_mismatch_kl:.6f}"
@@ -310,11 +344,17 @@ def parity_guard_failures(tensor_stats: dict, guard) -> list[str]:
 def train(config: TrainerConfig):
     # Setup world and logger
     world = get_world()
+    numa_binding = bind_worker_to_gpu_numa_node()
     logger = setup_logger(
         config.log.level,
         json_logging=config.log.json_logging,
     )
     logger.info(f"Starting RL trainer in {world} in {config.output_dir}")
+    if numa_binding is not None:
+        logger.info(
+            f"Bound local GPU {world.local_rank} worker to NUMA node "
+            f"{numa_binding[0]} ({numa_binding[1]} CPUs)"
+        )
 
     # Print warning if running in benchmark mode
     if config.bench is not None:
@@ -374,6 +414,11 @@ def train(config: TrainerConfig):
         torch.device("cuda", world.local_rank),
         config.model.lora,
     )
+    replay_rollouts = (
+        config.data.rollout_cache is not None
+        and config.data.rollout_cache.mode == "replay"
+    )
+    trainer_only = config.data.fake is not None or replay_rollouts
 
     # Resolve ep="auto" to a concrete integer before creating parallel dims
     resolve_ep(config.model)
@@ -410,6 +455,8 @@ def train(config: TrainerConfig):
     logger.info(f"Initializing model ({config.model})")
     loading_from_ckpt_later = config.ckpt and checkpoint_step is not None
     model = setup_model(config.model, parallel_dims, loading_from_ckpt_later)
+    if trainer_only and config.model.lora is not None:
+        multi_run_manager.create_trainer_only_run(config.model.lora)
     group_timeout = timedelta(seconds=config.dist_timeout_seconds)
     process_groups = {}
     for mesh in (parallel_dims.world_mesh, *parallel_dims._submeshes.values()):
@@ -466,15 +513,6 @@ def train(config: TrainerConfig):
     # Set up the optimizer
     logger.info(f"Initializing optimizer ({config.optim})")
 
-    replay_rollouts = (
-        config.data.rollout_cache is not None
-        and config.data.rollout_cache.mode == "replay"
-    )
-    trainer_only = config.data.fake is not None or replay_rollouts
-    if trainer_only and config.model.lora:
-        register_local_lora_run(multi_run_manager, config.model.lora)
-        logger.info("Registered local LoRA adapter slot for trainer qualification")
-
     if config.max_concurrent_runs == 1:
         optimizer = setup_optimizer(
             config.optim,
@@ -498,12 +536,6 @@ def train(config: TrainerConfig):
 
     logger.info(f"Using `{config.scheduler.type}` scheduler ({config.scheduler})")
 
-    # A fresh filesystem-LoRA run generates policy-v0 rollouts with the base
-    # model before the trainer can broadcast an adapter.  The trainer must
-    # therefore start with an exactly zero-output adapter.  Run discovery
-    # resets LoRA slots after FSDP construction; make the required B=0 state
-    # explicit after that reset and verify every local shard before accepting
-    # a rollout batch.  A and B must also be finite.
     fresh_lora_policy = (
         config.model.lora is not None
         and not trainer_only
@@ -511,6 +543,7 @@ def train(config: TrainerConfig):
         and not resume_adapter
     )
     if fresh_lora_policy:
+        multi_run_manager.wait_for_run(0)
         fresh_b_count, reset_b_shards = initialize_fresh_lora_policy(
             multi_run_manager, config.model.lora, torch.device("cuda", world.local_rank)
         )
@@ -520,8 +553,10 @@ def train(config: TrainerConfig):
             f"scale={expected_scale:g}; reset {reset_b_shards} nonzero B shards"
         )
 
-    # Set up weight broadcast (skip when using fake data since there's no inference server)
-    if trainer_only:
+    export_final_adapter = bool(
+        config.data.fake is not None and config.data.fake.export_final_adapter
+    )
+    if trainer_only and not export_final_adapter:
         weight_broadcast = None
         logger.info("Skipping weight broadcast setup for trainer-only qualification")
     else:
@@ -582,6 +617,7 @@ def train(config: TrainerConfig):
         from prime_rl.trainer.distributed.pp_runner import force_fsdp_lazy_init
         from prime_rl.trainer.distributed.pp_runner import minimum_pipeline_microbatches
         from prime_rl.trainer.distributed.pp_runner import sparse_cache_transport_shape
+        from prime_rl.trainer.distributed.pipeline_parallel import sparse_cache_stage_flags
 
         pp_rank = parallel_dims.get_mesh("pp").get_local_rank()
         # Weight broadcast: tell the gatherer to merge stage dicts over the pp
@@ -595,34 +631,29 @@ def train(config: TrainerConfig):
         _stage_master_ranks = [
             stage * _ranks_per_stage for stage in range(parallel_dims.pp)
         ]
-        _is_stage_master = dist.get_rank() in _stage_master_ranks
-        # Full-model BF16 broadcast moves about 7.5 GB from each stage master.
-        # Use a CPU/Gloo group containing only those eight ranks. An NCCL object
-        # collective stages serialized objects on GPU and cannot fit the 60 GB
-        # receive buffer on a 4090.
-        _pp_weight_gather_group = (
-            dist.new_group(
-                ranks=_stage_master_ranks,
-                backend="gloo",
-                timeout=group_timeout,
-                use_local_synchronization=True,
-            )
-            if _is_stage_master
-            else None
-        )
         set_pp_gather_context(
-            _pp_weight_gather_group,
-            is_stage_master=_is_stage_master,
+            parallel_dims.get_mesh("pp").get_group(),
+            is_stage_master=(dist.get_rank() % _ranks_per_stage) == 0,
+            stage_master_ranks=_stage_master_ranks,
         )
+        receive_sparse_indices = False
+        send_sparse_indices = False
+        if config.model.pp_transfer_sparse_indices:
+            receive_sparse_indices, send_sparse_indices = sparse_cache_stage_flags(
+                model, pp_rank, parallel_dims.pp
+            )
+            logger.info(
+                f"PP stage {pp_rank}: receive sparse cache={receive_sparse_indices}, "
+                f"send sparse cache={send_sparse_indices}"
+            )
         pp_stage_module = PipelineStageModule(
             model,
             is_first=pp_rank == 0,
             is_last=pp_rank == parallel_dims.pp - 1,
             offload_cfg=config.model.ac_offloading,
             transfer_sparse_indices=config.model.pp_transfer_sparse_indices,
-            cp_group=cp_group if parallel_dims.cp_enabled else None,
-            cp_style=config.model.cp_style,
-            cp_world_size=parallel_dims.cp,
+            receive_sparse_indices=receive_sparse_indices,
+            send_sparse_indices=send_sparse_indices,
         )
 
     # Optionally, resume training from a checkpoint
@@ -726,11 +757,6 @@ def train(config: TrainerConfig):
             f"Waited for batch to arrive for {wait_for_batch_time:.2f} seconds"
         )
         if fresh_lora_policy and progress.step == 1:
-            # Production synchronizes run state only after the rollout file
-            # arrives. That operation is absent from fake-data qualification
-            # and can reset adapter slots after the startup check. Re-establish
-            # policy zero at the actual forward boundary. No optimizer update
-            # has happened yet, so this changes no learned state.
             fresh_b_count, reset_b_shards = initialize_fresh_lora_policy(
                 multi_run_manager,
                 config.model.lora,
@@ -822,6 +848,7 @@ def train(config: TrainerConfig):
             )
 
         batch_size = len(micro_batches)
+        rollout_rows = sum(len(micro_batch["sequence_lengths"]) for micro_batch in micro_batches)
         memory_profiler = None
         if config.memory_profiler_path is not None:
             memory_profiler = MemoryProfiler(progress.step, config.memory_profiler_path)
@@ -1037,6 +1064,8 @@ def train(config: TrainerConfig):
                         rl_weights=rl_weights,
                         ce_weights=ce_weights,
                         ref_kl_weights=ref_kl_weights,
+                        export_micro_batch=micro_batch,
+                        micro_step=micro_step,
                     )
                 )
                 continue
@@ -1247,10 +1276,6 @@ def train(config: TrainerConfig):
                     and progress.step == 1
                 )
                 if (qualification_dump or production_dump) and not direct_parity_dumped:
-                    # Every CP rank must join these gathers. Only DP0/CP0 writes
-                    # the diagnostic. Production writes only the first
-                    # microbatch of step 1, before the parity gate can reject
-                    # it, so a failure always has token-level evidence.
                     full_input_ids = gather_for_cp_wo_grad(
                         side["input_ids"], cp_size, cp_group
                     )
@@ -1265,6 +1290,14 @@ def train(config: TrainerConfig):
                         )
                         delta = trainer_values - reference_values
                         valid = side["loss_mask"].squeeze(0).detach().cpu()
+                        if not valid.any():
+                            raise RuntimeError("direct parity data has no retained tokens")
+                        if not (
+                            torch.isfinite(trainer_values).all()
+                            and torch.isfinite(reference_values).all()
+                            and torch.isfinite(delta[valid]).all()
+                        ):
+                            raise RuntimeError("direct parity data contains non-finite values")
                         payload = {
                             "input_ids": full_input_ids.squeeze(0).cpu().tolist(),
                             "position_ids": full_position_ids.squeeze(0).cpu().tolist(),
@@ -1283,7 +1316,7 @@ def train(config: TrainerConfig):
                         )
                         dump_path.write_text(json.dumps(payload))
                         logger.info(
-                            "Wrote direct trainer/HF parity data to %s "
+                            "Wrote direct trainer/reference parity data to %s "
                             "(mean abs delta %.6f, max %.6f)",
                             dump_path,
                             payload["valid_mean_abs_delta"],
@@ -1319,39 +1352,32 @@ def train(config: TrainerConfig):
                 )
                 for k, v in loss_tensors.items():
                     tensors[k].append(v.detach().to("cpu"))
+                token_exporter.export(
+                    progress.step,
+                    side["micro_step"],
+                    side["export_micro_batch"],
+                    o,
+                    sl,
+                    config.loss,
+                )
                 return loss
 
             # Stage buffers are fixed size, so every micro-batch must share one
             # sequence length; the pad is appended as a masked-out sequence.
-            # PRIME_PP_MAX_MICRO truncates the micro-batch list so a debug step
-            # takes about a minute instead of thirteen. Never set in production.
-            _cap = int(os.environ.get("PRIME_PP_MAX_MICRO", "0") or 0)
-            if _cap and len(pp_side_inputs) > _cap:
-                pp_side_inputs = pp_side_inputs[:_cap]
-                logger.warning(
-                    f"PRIME_PP_MAX_MICRO: using only {_cap} micro-batches (debug only)"
-                )
-            _n = torch.tensor(
-                [len(pp_side_inputs), -len(pp_side_inputs)], device="cuda"
-            )
+            _n = torch.tensor([len(pp_side_inputs), -len(pp_side_inputs)], device="cuda")
             dist.all_reduce(_n, op=dist.ReduceOp.MAX)
             if _n[0].item() != -_n[1].item() or _n[0].item() == 0:
                 raise RuntimeError(
                     f"micro-batch count mismatch across ranks (max={_n[0].item()}, "
                     f"min={-_n[1].item()}); the pipeline schedule would deadlock"
                 )
-            pp_side_inputs = pad_pp_side_inputs(
-                pp_side_inputs, cp_world_size=parallel_dims.cp
-            )
+            pp_side_inputs = pad_pp_side_inputs(pp_side_inputs, cp_world_size=parallel_dims.cp)
             pp_stage_module.loss_closure = _pp_loss
             pp_stage_module.set_side_inputs(pp_side_inputs)
             # All micro-batches share one padded shape, so hand the stage its
             # exact tensors and skip the metadata-exchange rendezvous.
             _L = pp_side_inputs[0]["input_ids"].shape[1]
-            _hs = (
-                getattr(model.config, "hidden_size", None)
-                or model.config.text_config.hidden_size
-            )
+            _hs = getattr(model.config, "hidden_size", None) or model.config.text_config.hidden_size
             # The inter-stage buffers carry ACTIVATIONS, so their dtype is
             # optimization_dtype -- NOT the dtype of the first parameter. Those
             # coincided under bf16 weights, but with
@@ -1368,7 +1394,9 @@ def train(config: TrainerConfig):
             _cache_ex = None
             if config.model.pp_transfer_sparse_indices:
                 _cache_ex = torch.empty(
-                    sparse_cache_transport_shape(_L, model.config.index_topk),
+                    sparse_cache_transport_shape(_L, model.config.index_topk)
+                    if pp_stage_module.receive_sparse_indices
+                    else (1,),
                     # PipelineStage requires floating-point receive buffers.
                     # FP16 carries the lossless unsigned 16-bit index bits.
                     dtype=torch.float16,
@@ -1380,10 +1408,23 @@ def train(config: TrainerConfig):
                 if pp_rank == 0
                 else ((_hidden_ex, _cache_ex) if _cache_ex is not None else _hidden_ex)
             )
+            _output_cache_ex = None
+            if config.model.pp_transfer_sparse_indices and not _is_last:
+                _output_cache_ex = torch.empty(
+                    sparse_cache_transport_shape(_L, model.config.index_topk)
+                    if pp_stage_module.send_sparse_indices
+                    else (1,),
+                    dtype=torch.float16,
+                    device="cuda",
+                )
             _example_output = (
                 torch.empty((), dtype=torch.float32, device="cuda")
                 if _is_last
-                else ((_hidden_ex, _cache_ex) if _cache_ex is not None else _hidden_ex)
+                else (
+                    (_hidden_ex, _output_cache_ex)
+                    if _output_cache_ex is not None
+                    else _hidden_ex
+                )
             )
             pp_schedule = build_pp_schedule(
                 pp_stage_module,
@@ -1402,30 +1443,73 @@ def train(config: TrainerConfig):
             pp_inputs = torch.cat([sd["input_ids"] for sd in pp_side_inputs], dim=0).to(
                 "cuda"
             )
-            if dist.get_rank() == 0:
+            profile_pp_stage = os.environ.get("PRIME_PROFILE_PP_STAGE") == "1"
+            if dist.get_rank() == 0 or profile_pp_stage:
                 torch.cuda.synchronize()
                 pp_start = time.perf_counter()
             # return_outputs=False: the schedule would otherwise concatenate the
             # last stage's per-micro-batch outputs, which are scalar losses --
             # "zero-dimensional tensor cannot be concatenated". The loss closure
             # already accumulates what the metrics need.
-            if pp_rank == 0:
-                pp_schedule.step(pp_inputs, return_outputs=False)
-            elif pp_rank == parallel_dims.pp - 1:
-                # The schedule indexes target_mbs unconditionally on the last
-                # stage; the loss closure ignores the value, so a zero per
-                # micro-batch is enough to satisfy it.
-                pp_schedule.step(
-                    target=torch.zeros(len(pp_side_inputs), device="cuda"),
-                    return_outputs=False,
-                )
-            else:
-                pp_schedule.step(return_outputs=False)
-            if dist.get_rank() == 0:
-                torch.cuda.synchronize()
+            profile_rank = int(os.environ.get("PRIME_PROFILE_PP_RANK", "-1"))
+            schedule_profiler = (
+                profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
+                if dist.get_rank() == profile_rank
+                else nullcontext()
+            )
+            with schedule_profiler:
+                if pp_rank == 0:
+                    pp_schedule.step(pp_inputs, return_outputs=False)
+                elif pp_rank == parallel_dims.pp - 1:
+                    # The schedule indexes target_mbs unconditionally on the last
+                    # stage; the loss closure ignores the value, so a zero per
+                    # micro-batch is enough to satisfy it.
+                    pp_schedule.step(
+                        target=torch.zeros(len(pp_side_inputs), device="cuda"),
+                        return_outputs=False,
+                    )
+                else:
+                    pp_schedule.step(return_outputs=False)
+            if dist.get_rank() == profile_rank:
                 logger.info(
-                    f"PP step: {len(pp_side_inputs)} micro-batches in {time.perf_counter() - pp_start:.2f}s"
+                    "PP CUDA profile:\n"
+                    + schedule_profiler.key_averages().table(
+                        sort_by="self_cpu_time_total", row_limit=40
+                    )
                 )
+            local_schedule_ms = 0.0
+            if dist.get_rank() == 0 or profile_pp_stage:
+                torch.cuda.synchronize()
+                local_schedule_ms = (time.perf_counter() - pp_start) * 1000.0
+            if dist.get_rank() == 0:
+                logger.info(
+                    f"PP step: {len(pp_side_inputs)} micro-batches in {local_schedule_ms / 1000.0:.2f}s"
+                )
+            if profile_pp_stage:
+                forward_ms, backward_ms = pp_stage_module.profile_times_ms(clear=True)
+                local_profile = torch.tensor(
+                    [float(pp_rank), local_schedule_ms, forward_ms, backward_ms],
+                    dtype=torch.float64,
+                    device="cuda",
+                )
+                gathered_profiles = [torch.empty_like(local_profile) for _ in range(dist.get_world_size())]
+                dist.all_gather(gathered_profiles, local_profile)
+                if dist.get_rank() == 0:
+                    stage_profiles = []
+                    for stage in range(parallel_dims.pp):
+                        rows = [row.tolist() for row in gathered_profiles if int(row[0].item()) == stage]
+                        stage_profiles.append(
+                            (
+                                stage,
+                                max(row[1] for row in rows),
+                                max(row[2] for row in rows),
+                                max(row[3] for row in rows),
+                            )
+                        )
+                    logger.info(
+                        "PP stage profile ms (stage, schedule, forward, backward): "
+                        f"{stage_profiles}"
+                    )
             # Free this step's pipeline state NOW. The side inputs (including
             # routed_experts, tens of MB per micro-batch) and the stage's
             # per-micro-batch recv/grad buffers otherwise survive through the
@@ -1433,7 +1517,7 @@ def train(config: TrainerConfig):
             # a multi-GB transient that ran the 47.4 GiB cards to the edge.
             pp_stage_module.set_side_inputs([])
             pp_stage_module.loss_closure = None
-            del pp_schedule, pp_inputs, _hidden_ex, _cache_ex, pp_side_inputs
+            del pp_schedule, pp_inputs, _hidden_ex, _cache_ex, _output_cache_ex, pp_side_inputs
             pp_side_inputs = []
 
             # F6: MoE router stat buffers accumulate via add_ every forward and
@@ -1532,16 +1616,12 @@ def train(config: TrainerConfig):
                 ep_enabled=parallel_dims.ep_enabled,
                 # Each stage's DTensor meshes do not span pp, so without this the
                 # norm is per-stage and clipping diverges from the non-PP runs.
-                pp_mesh=parallel_dims.get_mesh("pp")
-                if parallel_dims.pp_enabled
-                else None,
+                pp_mesh=parallel_dims.get_mesh("pp") if parallel_dims.pp_enabled else None,
             )
             if grad_norm.device.type == "cpu":
                 grad_norm = grad_norm.to(torch.device("cuda"))
             if not torch.isfinite(grad_norm):
-                raise RuntimeError(
-                    f"Non-finite gradient norm at step {progress.step}; refusing to update or broadcast."
-                )
+                raise RuntimeError(f"Non-finite gradient norm at step {progress.step}; refusing to update or broadcast.")
             if dist.get_rank() == 0:
                 logger.info(f"grad_norm full precision: {grad_norm.item():.6e}")
 
@@ -1549,35 +1629,31 @@ def train(config: TrainerConfig):
             pp_enabled
             and dist.get_rank() % (dist.get_world_size() // parallel_dims.pp) == 0
         ):
-            # One line per stage master per step, full precision. A stage whose
-            # backward silently detached shows l1=0 here; the SUCCESS line's
-            # 4-decimal grad norm cannot distinguish that from a small gradient.
             import sys
 
-            # Operate on LOCAL shards only. Reducing a DTensor here would issue
-            # a collective on the stage mesh that the other 7 ranks of the stage
-            # never join (only the stage master runs this block), deadlocking
-            # the step -- a diagnostic must never alter collective ordering.
             from torch.distributed.tensor import DTensor as _DT
 
-            _l1 = 0.0
-            _n_with = 0
-            for _p in model.parameters():
-                if _p.grad is None:
+            stage_gradient_l1 = 0.0
+            parameters_with_gradient = 0
+            for parameter in model.parameters():
+                if parameter.grad is None:
                     continue
-                _n_with += 1
-                _g = _p.grad.to_local() if isinstance(_p.grad, _DT) else _p.grad
-                _l1 += float(_g.abs().sum())
+                parameters_with_gradient += 1
+                gradient = (
+                    parameter.grad.to_local()
+                    if isinstance(parameter.grad, _DT)
+                    else parameter.grad
+                )
+                stage_gradient_l1 += float(gradient.abs().sum())
             print(
                 f"[grad-check] step={progress.step} stage={pp_rank} "
-                f"lora_grad_l1={_l1:.6e} params_with_grad={_n_with}",
+                f"lora_grad_l1={stage_gradient_l1:.6e} "
+                f"params_with_grad={parameters_with_gradient}",
                 file=sys.stderr,
                 flush=True,
             )
 
-        zero_grad_ratio = get_zero_gradient_ratio(
-            model.parameters(), parallel_dims.dp_replicate
-        )
+        zero_grad_ratio = get_zero_gradient_ratio(model.parameters(), parallel_dims.dp_replicate)
 
         # Update the model parameters
         optimizer.step()
@@ -1586,11 +1662,6 @@ def train(config: TrainerConfig):
         # Update learning rate scheduler
         scheduler.step()
 
-        # x64p n76 grew from 380 to 391 GiB shared memory and fell from 76 to
-        # 62 GiB available by step 6 while streamed native-FP8 expert
-        # activation offload was active. All backward H2D copies are complete
-        # after this synchronization. Release unused pinned allocator blocks
-        # before the next variable-sized batch can establish a higher mark.
         if os.environ.get("PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD", "") == "1":
             torch.cuda.synchronize()
             host_empty_cache = getattr(torch._C, "_host_emptyCache", None)
@@ -1610,7 +1681,11 @@ def train(config: TrainerConfig):
         # Broadcast the model just produced (policy v{progress.step}) so the orchestrator can
         # sample its next step from it. In-memory transports retain their two-step shutdown
         # window; filesystem broadcast still writes every version for resume.
-        if weight_broadcast is None:
+        if trainer_only and export_final_adapter and is_last_step:
+            for idx in multi_run_manager.used_idxs:
+                multi_run_manager.ready_to_update[idx] = True
+                multi_run_manager.progress[idx].step = progress.step + 1
+        if weight_broadcast is None or (trainer_only and not is_last_step):
             broadcast_weights_time = 0
         else:
             broadcast_unused = (
@@ -1722,6 +1797,7 @@ def train(config: TrainerConfig):
             "perf/throughput_per_gpu": throughput / world.world_size,
             "perf/mfu": mfu,
             "perf/peak_memory": peak_memory,
+            "data/rollout_rows": rollout_rows,
             "step": progress.step,
         }
         monitor.log(perf_metrics, step=progress.step)

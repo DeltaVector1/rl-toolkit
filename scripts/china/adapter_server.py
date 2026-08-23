@@ -40,6 +40,8 @@ class RangeHandler(SimpleHTTPRequestHandler):
         return source
 
     def copyfile(self, source, output):
+        if not hasattr(self, "remaining"):
+            return super().copyfile(source, output)
         while self.remaining:
             chunk = source.read(min(self.remaining, 16 * 1024 * 1024))
             if not chunk:

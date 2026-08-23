@@ -75,6 +75,10 @@ EOF
 cat > "$BIN/docker" <<'EOF'
 #!/usr/bin/env bash
 echo "$*" >> "$FIX/docker"
+case "$*" in
+  *"inspect --format {{.State.Status}}"*) echo "${DOCKER_STATUS:-running}" ;;
+  *"inspect --format {{.State.StartedAt}}"*) : ;;
+esac
 EOF
 
 cat > "$BIN/nvidia-smi" <<'EOF'
@@ -182,7 +186,7 @@ absent "batch port 29620 is never killed"         "$FIX/killed" "29620"
 # ------------------------------------------------------- engine watchdog
 
 run_engine() { # needs $FIX/respond.sh and $MAXCYCLES
-  { PORT=8000 INTERVAL=1 TIMEOUT=1 FAILS_BEFORE_RESTART=2 \
+  { PORT=8000 INTERVAL=1 TIMEOUT=1 FAILS_BEFORE_RESTART=2 STARTUP_GRACE=${STARTUP_GRACE:--1} \
     BUSY_STALL_FAILS_BEFORE_RESTART=5 \
     START="$FIX/fake_start.sh" RELOAD_TRIES=2 RELOAD_WAIT=1 \
       timeout 30 bash "$ENGINE_WD" > "$FIX/log" 2>&1; } 2>/dev/null
@@ -196,6 +200,26 @@ reset; echo 'respond() { echo 200; }' > "$FIX/respond.sh"
 MAXCYCLES=3 run_engine
 absent "generation ok -> no restart"              "$FIX/log" "RESTARTING ENGINE"
 contains "generation ok -> probes a completion"   "$FIX/probed" "engine 8000"
+
+reset
+cat > "$FIX/respond.sh" <<'EOF'
+respond() {
+  c=$(cat "$FIX/cycles" 2>/dev/null || echo 0)
+  [ "$c" -lt 2 ] && echo 000 || echo 200
+}
+EOF
+STARTUP_GRACE=7200 MAXCYCLES=4 run_engine
+absent  "slow startup inside grace -> no restart" "$FIX/log" "RESTARTING ENGINE"
+contains "slow startup inside grace -> logs age" "$FIX/log" "engine startup (age="
+
+reset; echo 'respond() { echo 000; }' > "$FIX/respond.sh"
+STARTUP_GRACE=-1 MAXCYCLES=2 run_engine
+contains "hung startup beyond grace -> restarts" "$FIX/log" "startup exceeded -1s"
+
+reset; echo 'respond() { echo 000; }' > "$FIX/respond.sh"
+DOCKER_STATUS=exited STARTUP_GRACE=7200 MAXCYCLES=2 run_engine
+contains "exited container -> immediate restart" "$FIX/log" "container=exited"
+unset DOCKER_STATUS
 
 # The 2026-08-06 06:05 failure on h200a: /v1/models answered 200 while the
 # EngineCore was hung at "Running: 64, throughput: 0.0". Container state and
@@ -217,9 +241,9 @@ respond() {
   if [ "$1" = engine ] && [ "$c" = 0 ]; then echo 000; else echo 200; fi
 }
 EOF
-MAXCYCLES=3 run_engine
+STARTUP_GRACE=7200 MAXCYCLES=3 run_engine
 absent  "1 miss then recovery -> no restart"      "$FIX/log" "RESTARTING ENGINE"
-contains "1 miss then recovery -> logs recovery"  "$FIX/log" "engine recovered"
+contains "1 miss then recovery -> logs ready"     "$FIX/log" "engine ready"
 
 # After a restart it must confirm with a generation, not with /v1/models.
 reset
@@ -232,7 +256,17 @@ respond() {
 EOF
 rm -f "$FIX/n"
 MAXCYCLES=4 run_engine
-contains "post-restart health is a generation"    "$FIX/log" "engine back up (generation verified)"
+contains "post-restart health is a generation"    "$FIX/log" "engine ready"
+
+reset
+cat > "$FIX/respond.sh" <<'EOF'
+respond() {
+  c=$(cat "$FIX/cycles" 2>/dev/null || echo 0)
+  [ "$c" = 0 ] && echo 200 || echo 000
+}
+EOF
+STARTUP_GRACE=7200 MAXCYCLES=4 run_engine
+contains "post-ready misses use strict repair" "$FIX/log" "post-ready probe failures=2"
 
 # A real generation probe can queue for more than TIMEOUT when every sequence
 # slot is busy. Rising production token metrics prove this is load, not a dead
@@ -241,7 +275,8 @@ reset
 cat > "$FIX/respond.sh" <<'EOF'
 respond() {
   if [ "$1" = engine ]; then
-    echo 000
+    c=$(cat "$FIX/cycles" 2>/dev/null || echo 0)
+    [ "$c" = 0 ] && echo 200 || echo 000
   elif [ "$1" = metrics ]; then
     c=$(cat "$FIX/cycles" 2>/dev/null || echo 0)
     echo "vllm:num_requests_running{engine=\"0\"} 64"
@@ -263,24 +298,8 @@ reset
 cat > "$FIX/respond.sh" <<'EOF'
 respond() {
   if [ "$1" = engine ]; then
-    echo 000
-  elif [ "$1" = metrics ]; then
-    echo 'vllm:num_requests_running{engine="0"} 23'
-    echo 'vllm:generation_tokens_total{engine="0"} 1000'
-  else
-    echo 200
-  fi
-}
-EOF
-MAXCYCLES=5 run_engine
-absent "busy stalled engine -> survives ordinary threshold" "$FIX/log" "RESTARTING ENGINE"
-contains "busy stalled engine -> uses bounded grace" "$FIX/log" "miss=4/5"
-
-reset
-cat > "$FIX/respond.sh" <<'EOF'
-respond() {
-  if [ "$1" = engine ]; then
-    echo 000
+    c=$(cat "$FIX/cycles" 2>/dev/null || echo 0)
+    [ "$c" = 0 ] && echo 200 || echo 000
   elif [ "$1" = metrics ]; then
     echo 'vllm:num_requests_running{engine="0"} 23'
     echo 'vllm:generation_tokens_total{engine="0"} 1000'
@@ -290,6 +309,24 @@ respond() {
 }
 EOF
 MAXCYCLES=6 run_engine
+absent "busy stalled engine -> survives ordinary threshold" "$FIX/log" "RESTARTING ENGINE"
+contains "busy stalled engine -> uses bounded grace" "$FIX/log" "miss=4/5"
+
+reset
+cat > "$FIX/respond.sh" <<'EOF'
+respond() {
+  if [ "$1" = engine ]; then
+    c=$(cat "$FIX/cycles" 2>/dev/null || echo 0)
+    [ "$c" = 0 ] && echo 200 || echo 000
+  elif [ "$1" = metrics ]; then
+    echo 'vllm:num_requests_running{engine="0"} 23'
+    echo 'vllm:generation_tokens_total{engine="0"} 1000'
+  else
+    echo 200
+  fi
+}
+EOF
+MAXCYCLES=7 run_engine
 contains "busy stalled engine -> restarts at grace limit" "$FIX/log" "miss=5/5"
 contains "busy stalled engine -> bounded restart" "$FIX/log" "RESTARTING ENGINE"
 
@@ -300,7 +337,8 @@ reset
 cat > "$FIX/respond.sh" <<'EOF'
 respond() {
   if [ "$1" = engine ]; then
-    echo 000
+    c=$(cat "$FIX/cycles" 2>/dev/null || echo 0)
+    [ "$c" = 0 ] && echo 200 || echo 000
   elif [ "$1" = metrics ]; then
     echo 'vllm:num_requests_running{engine="0"} 0'
     echo 'vllm:generation_tokens_total{engine="0"} 1000'
@@ -309,7 +347,7 @@ respond() {
   fi
 }
 EOF
-GPU_MIB=132155 MAXCYCLES=4 run_engine
+GPU_MIB=132155 MAXCYCLES=5 run_engine
 absent "resident stalled engine -> survives ordinary threshold" "$FIX/log" "RESTARTING ENGINE"
 contains "resident stalled engine -> uses bounded grace" "$FIX/log" "miss=4/5"
 
@@ -317,7 +355,8 @@ reset
 cat > "$FIX/respond.sh" <<'EOF'
 respond() {
   if [ "$1" = engine ]; then
-    echo 000
+    c=$(cat "$FIX/cycles" 2>/dev/null || echo 0)
+    [ "$c" = 0 ] && echo 200 || echo 000
   elif [ "$1" = metrics ]; then
     echo 'vllm:num_requests_running{engine="0"} 0'
     echo 'vllm:generation_tokens_total{engine="0"} 1000'

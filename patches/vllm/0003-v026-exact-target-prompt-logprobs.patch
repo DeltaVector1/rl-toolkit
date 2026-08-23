@@ -1,0 +1,201 @@
+diff --git a/vllm/model_executor/layers/logits_processor.py b/vllm/model_executor/layers/logits_processor.py
+index 496a1dd15..3df7dcc5f 100644
+--- a/vllm/model_executor/layers/logits_processor.py
++++ b/vllm/model_executor/layers/logits_processor.py
+@@ -9,6 +9,7 @@ from vllm.config import get_current_vllm_config
+ from vllm.distributed import (
+     get_tensor_model_parallel_world_size,
+     tensor_model_parallel_all_gather,
++    tensor_model_parallel_all_reduce,
+     tensor_model_parallel_gather,
+ )
+ from vllm.model_executor.custom_op import PluggableLayer
+@@ -204,6 +205,100 @@ class LogitsProcessor(PluggableLayer):
+         top_tokens = gathered[:, :, 1].gather(dim=-1, index=max_rank_idx)
+         return top_tokens.squeeze(-1).to(torch.int64)
+ 
++    def get_selected_token_logprobs(
++        self,
++        lm_head: VocabParallelEmbedding,
++        hidden_states: torch.Tensor,
++        target_token_ids: torch.Tensor,
++        embedding_bias: torch.Tensor | None = None,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        if hidden_states.shape[:-1] != target_token_ids.shape:
++            raise ValueError("target token IDs do not match hidden states")
++        if torch.any(target_token_ids < 0) or torch.any(
++            target_token_ids >= self.org_vocab_size
++        ):
++            raise ValueError("target token ID is outside the model vocabulary")
++
++        flat_hidden = hidden_states.reshape(-1, hidden_states.shape[-1])
++        flat_targets = target_token_ids.reshape(-1)
++        logprobs = torch.empty_like(flat_targets, dtype=torch.float32)
++        ranks = torch.empty_like(flat_targets, dtype=torch.int64)
++        for start in range(0, flat_targets.numel(), 1024):
++            stop = min(start + 1024, flat_targets.numel())
++            logprobs[start:stop], ranks[start:stop] = (
++                self._get_selected_token_logprobs_chunk(
++                    lm_head,
++                    flat_hidden[start:stop],
++                    flat_targets[start:stop],
++                    embedding_bias,
++                )
++            )
++        return logprobs.reshape(target_token_ids.shape), ranks.reshape(
++            target_token_ids.shape
++        )
++
++    def _get_selected_token_logprobs_chunk(
++        self,
++        lm_head: VocabParallelEmbedding,
++        hidden_states: torch.Tensor,
++        target_token_ids: torch.Tensor,
++        embedding_bias: torch.Tensor | None,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        local_logits = self._apply_head(lm_head, hidden_states, embedding_bias)
++        if self.soft_cap is not None:
++            local_logits = torch.tanh(local_logits / self.soft_cap) * self.soft_cap
++        if self.scale != 1.0:
++            local_logits = local_logits * self.scale
++        local_logits = local_logits.float()
++
++        shard = lm_head.shard_indices
++        valid_logits = local_logits[..., : shard.num_org_elements]
++        tp_size = get_tensor_model_parallel_world_size()
++        finite = torch.isfinite(valid_logits).all(dim=-1).to(torch.float32)
++        finite = tensor_model_parallel_all_reduce(finite)
++        if torch.any(finite != tp_size):
++            raise ValueError("selected-token scoring received a nonfinite logit")
++
++        if shard.num_org_elements:
++            local_max = valid_logits.max(dim=-1).values
++        else:
++            local_max = local_logits.new_full(target_token_ids.shape, -float("inf"))
++        gathered_max = tensor_model_parallel_all_gather(
++            local_max.unsqueeze(-1), dim=-1
++        )
++        global_max = gathered_max.max(dim=-1).values
++        local_sum = torch.exp(valid_logits - global_max.unsqueeze(-1)).sum(dim=-1)
++
++        owned = (target_token_ids >= shard.org_vocab_start_index) & (
++            target_token_ids < shard.org_vocab_end_index
++        )
++        local_target = local_logits.new_zeros(target_token_ids.shape)
++        if shard.num_org_elements:
++            local_index = (target_token_ids - shard.org_vocab_start_index).clamp(
++                0, shard.num_org_elements - 1
++            )
++            local_target = torch.where(
++                owned,
++                valid_logits.gather(-1, local_index.unsqueeze(-1)).squeeze(-1),
++                local_target,
++            )
++        totals = tensor_model_parallel_all_reduce(
++            torch.stack((local_sum, local_target, owned.to(torch.float32)), dim=-1)
++        )
++        if torch.any(totals[..., 2] != 1):
++            raise ValueError("target token does not have exactly one vocabulary owner")
++        log_normalizer = global_max + torch.log(totals[..., 0])
++        target_logits = totals[..., 1]
++
++        local_rank = (valid_logits >= target_logits.unsqueeze(-1)).sum(dim=-1)
++        rank = tensor_model_parallel_all_reduce(local_rank.to(torch.float32)).to(
++            torch.int64
++        )
++        logprobs = target_logits - log_normalizer
++        if not torch.isfinite(logprobs).all():
++            raise ValueError("selected-token scoring produced a nonfinite logprob")
++        return logprobs, rank
++
+     def extra_repr(self) -> str:
+         s = f"vocab_size={self.vocab_size}"
+         s += f", org_vocab_size={self.org_vocab_size}"
+diff --git a/vllm/model_executor/models/deepseek_v2.py b/vllm/model_executor/models/deepseek_v2.py
+index daf4ea3de..45d2bd924 100644
+--- a/vllm/model_executor/models/deepseek_v2.py
++++ b/vllm/model_executor/models/deepseek_v2.py
+@@ -1918,4 +1918,11 @@ class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
+ 
+ 
+ class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
+-    pass
++    def compute_selected_token_logprobs(
++        self,
++        hidden_states: torch.Tensor,
++        target_token_ids: torch.Tensor,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        return self.logits_processor.get_selected_token_logprobs(
++            self.lm_head, hidden_states, target_token_ids
++        )
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index f3f0afb13..fe2a05b10 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -5628,7 +5628,6 @@ class GPUModelRunner(
+             req_idx = self.input_batch.req_id_to_index[req_id]
+             offset = self.query_start_loc.np[req_idx].item()
+             prompt_hidden_states = hidden_states[offset : offset + num_logits]
+-            logits = self.model.compute_logits(prompt_hidden_states)
+ 
+             # Get the "target" tokens for each index. For prompt at index i,
+             # the token at prompt index i+1 is the "sampled" token we want
+@@ -5638,13 +5637,51 @@ class GPUModelRunner(
+             # Compute prompt scores respecting logprobs_mode.
+             # NOTE: prompt tokens skip sampling processors, so
+             # processed_* and raw_* yield the same scores here.
+-            if self.model_config.logprobs_mode in ("raw_logits", "processed_logits"):
+-                scores = logits.to(torch.float32)
+-            else:
+-                scores = self.sampler.compute_logprobs(logits)
+-            token_ids, logprobs, ranks, _ = self.sampler.gather_logprobs(
+-                scores, num_prompt_logprobs, tgt_token_ids
++            extra_args = (
++                request.sampling_params.extra_args
++                if request.sampling_params is not None
++                else None
+             )
++            exact_targets = bool(
++                extra_args
++                and extra_args.get("prime_exact_target_prompt_logprobs") is True
++            )
++            if exact_targets:
++                if num_prompt_logprobs != 0:
++                    raise ValueError(
++                        "exact target prompt logprobs require prompt_logprobs=0"
++                    )
++                if self.model_config.logprobs_mode in (
++                    "raw_logits",
++                    "processed_logits",
++                ):
++                    raise ValueError(
++                        "exact target prompt logprobs do not return raw logits"
++                    )
++                scorer = getattr(
++                    self.get_model(), "compute_selected_token_logprobs", None
++                )
++                if scorer is None:
++                    raise ValueError(
++                        "this model does not support exact target prompt logprobs"
++                    )
++                selected_logprobs, ranks = scorer(
++                    prompt_hidden_states, tgt_token_ids
++                )
++                token_ids = tgt_token_ids.unsqueeze(-1)
++                logprobs = selected_logprobs.unsqueeze(-1)
++            else:
++                logits = self.model.compute_logits(prompt_hidden_states)
++                if self.model_config.logprobs_mode in (
++                    "raw_logits",
++                    "processed_logits",
++                ):
++                    scores = logits.to(torch.float32)
++                else:
++                    scores = self.sampler.compute_logprobs(logits)
++                token_ids, logprobs, ranks, _ = self.sampler.gather_logprobs(
++                    scores, num_prompt_logprobs, tgt_token_ids
++                )
+ 
+             # Transfer GPU->CPU async.
+             chunk_slice = slice(start_idx, start_idx + num_logits)
+

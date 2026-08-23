@@ -1,0 +1,110 @@
+--- a/flashinfer/fused_moe/core.py
++++ b/flashinfer/fused_moe/core.py
+@@ -1994,7 +1994,7 @@
+ 
+     @register_custom_op(
+         "flashinfer::trtllm_fp8_block_scale_moe",
+-        mutates_args=("routing_replay_out",),
++        mutates_args=("routing_replay_out", "routing_weights_replay_out"),
+     )
+     def trtllm_fp8_block_scale_moe_op(
+         routing_logits: Optional[torch.Tensor],
+@@ -2030,6 +2030,7 @@
+         activation_type: int = ActivationType.Swiglu.value,
+         norm_topk_prob: bool = True,
+         routing_replay_out: Optional[torch.Tensor] = None,
++        routing_weights_replay_out: Optional[torch.Tensor] = None,
+     ) -> List[torch.Tensor]:
+         # Determine routing mode: compute from logits or use pre-computed
+         if routing_logits is None:
+@@ -2040,6 +2041,9 @@
+             routing_dtype = torch.bfloat16
+         else:
+             routing_dtype = routing_logits.dtype
++            _validate_routing_weights_replay_out(
++                routing_weights_replay_out, routing_logits, top_k
++            )
+ 
+         if enable_pdl is None:
+             enable_pdl = device_support_pdl(hidden_states.device)
+@@ -2069,8 +2073,10 @@
+         if routing_logits is not None:
+             # When routing_logits is provided, allocate empty buffers (kernel will fill them)
+             topk_ids = torch.empty(0, dtype=torch.int32, device=hidden_states.device)
+-            expert_weights = torch.empty(
+-                0, dtype=routing_dtype, device=hidden_states.device
++            expert_weights = (
++                routing_weights_replay_out
++                if routing_weights_replay_out is not None
++                else torch.empty(0, dtype=routing_dtype, device=hidden_states.device)
+             )
+         else:
+             # When routing_logits is None, we have pre-computed routing:
+@@ -2235,8 +2241,9 @@
+         activation_type: int = ActivationType.Swiglu.value,
+         norm_topk_prob: bool = True,
+         routing_replay_out: Optional[torch.Tensor] = None,
++        routing_weights_replay_out: Optional[torch.Tensor] = None,
+     ) -> List[torch.Tensor]:
+-        _ = routing_replay_out
++        _ = routing_replay_out, routing_weights_replay_out
+         seq_len = hidden_states.shape[0]
+         hidden_size = hidden_states.shape[1]
+         # TODO: This is not correct for gemm1_lora_delta or do_finalize=False
+@@ -2760,6 +2767,29 @@
+         raise ValueError("routing_replay_out must be contiguous (packed row-major)")
+ 
+ 
++def _validate_routing_weights_replay_out(
++    routing_weights_replay_out: Optional[torch.Tensor],
++    routing_logits: torch.Tensor,
++    top_k: int,
++) -> None:
++    if routing_weights_replay_out is None:
++        return
++    expected = (routing_logits.shape[0], top_k)
++    if routing_weights_replay_out.shape != expected:
++        raise ValueError(
++            f"routing_weights_replay_out must have shape {expected}, "
++            f"got {tuple(routing_weights_replay_out.shape)}"
++        )
++    if routing_weights_replay_out.dtype != torch.float32:
++        raise ValueError("routing_weights_replay_out must be float32")
++    if routing_logits.dtype != torch.float32:
++        raise ValueError("routing weights replay requires float32 routing logits")
++    if routing_weights_replay_out.device != routing_logits.device:
++        raise ValueError("routing weights replay must use the routing logits device")
++    if not routing_weights_replay_out.is_contiguous():
++        raise ValueError("routing_weights_replay_out must be contiguous")
++
++
+ def _validate_fp8_block_scale_gemm1_activation_params(
+     fp8_quantization_type: Fp8QuantizationType,
+     activation_type: int,
+@@ -3368,6 +3398,7 @@
+     activation_type: int = ActivationType.Swiglu.value,
+     norm_topk_prob: bool = True,
+     routing_replay_out: Optional[torch.Tensor] = None,
++    routing_weights_replay_out: Optional[torch.Tensor] = None,
+     gemm1_alpha: Optional[torch.Tensor] = None,
+     gemm1_beta: Optional[torch.Tensor] = None,
+     gemm1_clamp_limit: Optional[torch.Tensor] = None,
+@@ -3490,6 +3521,9 @@
+         ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``.
+     """
+     _validate_routing_replay_out(routing_replay_out, top_k)
++    _validate_routing_weights_replay_out(
++        routing_weights_replay_out, routing_logits, top_k
++    )
+     _validate_fp8_block_scale_gemm1_activation_params(
+         fp8_quantization_type,
+         activation_type,
+@@ -3500,7 +3534,7 @@
+     result = get_trtllm_moe_sm100_module().trtllm_fp8_block_scale_moe(
+         routing_logits,
+         None,  # topk_ids - will be computed from routing_logits
+-        None,  # expert_weights - will be computed from routing_logits
++        routing_weights_replay_out,
+         routing_bias,
+         hidden_states,
+         hidden_states_scale,

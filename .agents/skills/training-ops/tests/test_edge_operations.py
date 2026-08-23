@@ -1,0 +1,327 @@
+import hashlib
+import json
+import tempfile
+import unittest
+import tomllib
+from pathlib import Path
+from unittest.mock import patch
+
+import training_ops
+
+
+class EdgeOperationsTest(unittest.TestCase):
+    def test_status_parser_keeps_metric_names_with_digits(self):
+        self.assertEqual(training_ops._kv("FAILS5M 3\n"), {"FAILS5M": "3"})
+
+    def test_blocked_host_is_refused_before_ssh(self):
+        with self.assertRaises(training_ops.Refused):
+            training_ops._ssh("n79", "true")
+
+    def test_glm_qualification_is_fake_data_in_the_isolated_deployment(self):
+        profile = training_ops._profile("glm52-native-small")
+        with (training_ops.repo_root / profile["trainer"]).open("rb") as stream:
+            config = tomllib.load(stream)
+        self.assertIn("fake", config["data"])
+        self.assertNotIn("rollout_cache", config["data"])
+        self.assertEqual(
+            training_ops.remote_repo,
+            "/data/glm52-rl/deployment-glm52-optims",
+        )
+        self.assertEqual(training_ops.trainer_container, "glm52-optims-trainer")
+
+    def test_policy_parity_profile_and_stage_are_registered(self):
+        profile = training_ops._profile("glm52-policy-parity")
+        self.assertEqual(
+            profile["trainer"],
+            "configs/qualification/glm52-policy-parity-trainer.toml",
+        )
+        with (training_ops.repo_root / profile["trainer"]).open("rb") as stream:
+            config = tomllib.load(stream)
+        stage = training_ops.glm_parity_paths["trainer_stage"]
+        self.assertEqual(
+            config["data"]["fake"]["reference_path"],
+            f"{stage}/trainer-reference.json",
+        )
+        self.assertEqual(
+            config["env_vars"]["PRIME_PARITY_ROUTER_TRACE_DIR"],
+            f"{stage}/trainer-router-trace",
+        )
+
+    def test_policy_parity_stage_validation_is_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            stage = Path(temporary)
+            reference = stage / "trainer-reference.json"
+            session = stage / "trainer-router-trace/session.json"
+            session.parent.mkdir()
+            reference.write_text("{}\n")
+            session.write_text("{}\n")
+            profile = (
+                training_ops.repo_root
+                / "configs/qualification/glm52-policy-parity.toml"
+            )
+            manifest = {
+                "schema_version": 1,
+                "kind": "glm52_policy_parity_trainer_stage",
+                "profile_sha256": hashlib.sha256(profile.read_bytes()).hexdigest(),
+                "fixture_sha256": "1" * 64,
+                "h200_capture_manifest_sha256": "2" * 64,
+                "route_output_scale": 2.5,
+                "router_weight_provenance": (
+                    "selected_weights_before_route_output_scale"
+                ),
+                "files": {
+                    "trainer-reference.json": hashlib.sha256(
+                        reference.read_bytes()
+                    ).hexdigest(),
+                    "trainer-router-trace/session.json": hashlib.sha256(
+                        session.read_bytes()
+                    ).hexdigest(),
+                },
+            }
+            (stage / "manifest.json").write_text(json.dumps(manifest) + "\n")
+            training_ops._validate_glm_parity_stage(stage)
+            extra = stage / "unexpected.bin"
+            extra.write_bytes(b"x")
+            with self.assertRaisesRegex(RuntimeError, "unexpected files"):
+                training_ops._validate_glm_parity_stage(stage)
+            extra.unlink()
+            session.write_text("changed\n")
+            with self.assertRaisesRegex(RuntimeError, "checksum differs"):
+                training_ops._validate_glm_parity_stage(stage)
+
+    def test_policy_parity_stage_refuses_symlink_and_extra_content(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "target"
+            target.mkdir()
+            link = root / "stage"
+            link.symlink_to(target, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, "regular directory"):
+                training_ops._validate_glm_parity_stage(link)
+
+    def test_parity_staging_deploys_inventory_before_script(self):
+        events = []
+
+        def deploy(relative, nodes=None):
+            events.append(("deploy", relative, nodes))
+            return True
+
+        def remote(host, command, timeout=120):
+            del timeout
+            events.append(("verify", host, command))
+            relative = (
+                "configs/operations.toml"
+                if "configs/operations.toml" in command
+                else "scripts/glm52_policy_parity.py"
+            )
+            digest = hashlib.sha256(
+                (training_ops.repo_root / relative).read_bytes()
+            ).hexdigest()
+            return 0, digest + "\n"
+
+        with (
+            patch.object(training_ops, "deploy", side_effect=deploy),
+            patch.object(training_ops, "_ssh", side_effect=remote),
+        ):
+            training_ops._deploy_glm_parity_staging_sources()
+
+        self.assertEqual(
+            [event[1] for event in events if event[0] == "deploy"],
+            ["configs/operations.toml", "scripts/glm52_policy_parity.py"],
+        )
+        self.assertEqual(events[0][0:2], ("deploy", "configs/operations.toml"))
+        self.assertEqual(events[1][0], "verify")
+        self.assertEqual(events[2][0:2], ("deploy", "scripts/glm52_policy_parity.py"))
+
+    def test_parity_staging_refuses_missing_or_mismatched_inventory(self):
+        with (
+            patch.object(training_ops, "deploy", return_value=True),
+            patch.object(training_ops, "_ssh", return_value=(1, "missing")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "remote source is missing"):
+                training_ops._deploy_glm_parity_staging_sources()
+        with (
+            patch.object(training_ops, "deploy", return_value=True),
+            patch.object(training_ops, "_ssh", return_value=(0, "0" * 64)),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "checksum differs"):
+                training_ops._deploy_glm_parity_staging_sources()
+
+    def test_parity_staging_verifies_sources_before_docker(self):
+        source = Path(training_ops.__file__).read_text()
+        method = source[source.index("def stage_glm52_policy_parity"):]
+        deploy = method.index("_deploy_glm_parity_staging_sources()")
+        docker = method.index("sudo docker run")
+        self.assertLess(deploy, docker)
+
+    def test_parity_stage_directory_creates_only_exact_missing_path(self):
+        commands = []
+
+        def remote(host, command, timeout=120):
+            del host, timeout
+            commands.append(command)
+            return 0, "created\n"
+
+        with patch.object(training_ops, "_ssh", side_effect=remote):
+            self.assertEqual(
+                training_ops._prepare_glm_parity_stage_directory(), "created"
+            )
+        command = commands[0]
+        exact = training_ops.glm_parity_paths["trainer_stage"]
+        self.assertIn(
+            'sudo install -d -o 1000 -g 1000 -m 0750 "$stage"', command
+        )
+        self.assertIn(f"stage={exact}", command)
+        self.assertNotIn("chmod -R", command)
+        self.assertNotIn("chown -R", command)
+
+    def test_parity_stage_directory_accepts_correct_existing_path(self):
+        with patch.object(training_ops, "_ssh", return_value=(0, "existing\n")):
+            self.assertEqual(
+                training_ops._prepare_glm_parity_stage_directory(), "existing"
+            )
+
+    def test_parity_stage_directory_refuses_bad_existing_paths(self):
+        for detail in (
+            "stage owner or mode differs: 0:0:755",
+            "stage has content but no manifest",
+            "stage path is a symlink",
+        ):
+            with patch.object(training_ops, "_ssh", return_value=(44, detail)):
+                with self.assertRaisesRegex(RuntimeError, "directory refused"):
+                    training_ops._prepare_glm_parity_stage_directory()
+
+    def test_qualification_refuses_a_live_trainer(self):
+        with patch.object(
+            training_ops,
+            "_fan",
+            return_value={"n82": (0, training_ops.protected_trainer + "\n")},
+        ):
+            with self.assertRaises(training_ops.Refused):
+                training_ops._assert_live_services_are_down(
+                    ["n82"], include_inference=False
+                )
+
+    def test_qualification_launch_uses_isolated_inventory(self):
+        calls = []
+
+        def fake_ssh(host, command, timeout=120):
+            calls.append((host, command))
+            return 0, ""
+
+        def fake_fan(hosts, function, workers=None):
+            return {host: function(host) for host in hosts}
+
+        with (
+            patch.object(training_ops, "_ssh", side_effect=fake_ssh),
+            patch.object(training_ops, "_fan", side_effect=fake_fan),
+            patch.object(training_ops, "deploy", return_value=True) as deploy_file,
+            patch.object(training_ops, "_assert_live_services_are_down"),
+            patch.object(training_ops, "trainer_mount_preflight"),
+        ):
+            training_ops.qualify("glm52-native-small", nodes=["n82"])
+
+        deploy_file.assert_any_call(
+            "source/src/prime_rl/trainer/rl/token_export.py", nodes=["n82"]
+        )
+        launch = next(command for host, command in calls if "cluster.sh trainer" in command)
+        self.assertIn("prime_deployment=/data/glm52-rl/deployment-glm52-optims", launch)
+        self.assertIn("prime_image=prime-rl:glm52-v080-qual", launch)
+        self.assertIn("prime_trainer_container=glm52-optims-trainer", launch)
+        self.assertIn(
+            "TRAINER_CONFIG=/data/glm52-rl/deployment-glm52-optims/"
+            "configs/qualification/glm52-native-small.toml",
+            launch,
+        )
+
+    def test_current_run_uses_trainer_log_path_when_run_env_is_absent(self):
+        command = (
+            "--role=trainer\n"
+            "--log-dir=/data/glm52-rl/runs/muse19/run_muse19/logs/trainer/torchrun\n"
+        )
+        with patch.object(training_ops, "_ssh", side_effect=[(1, ""), (0, command)]):
+            self.assertEqual(training_ops.current_run(), "muse19")
+
+    def test_start_uses_edge_launcher_and_never_starts_china_orchestrator(self):
+        calls = []
+
+        def fake_ssh(host, command, timeout=120):
+            calls.append((host, command))
+            if command.startswith("test -f "):
+                return 0, ""
+            return 0, "done\n"
+
+        with (
+            patch.object(training_ops, "_ssh", side_effect=fake_ssh),
+            patch.object(training_ops, "_fan", return_value={}),
+            patch.object(training_ops, "deploy", return_value=True) as deploy_file,
+            patch.object(training_ops, "_assert_live_services_are_down"),
+            patch.object(training_ops, "trainer_mount_preflight"),
+            patch.object(training_ops, "production_start_preflight"),
+            patch.object(training_ops.time, "sleep"),
+        ):
+            training_ops.start("glm52-1", mode="cold", supervisors=False)
+
+        ranked_trainers = [training_ops.trainer_head] + [
+            host
+            for host in training_ops.trainer_hosts
+            if host != training_ops.trainer_head
+        ]
+        deploy_file.assert_any_call(
+            "source/src/prime_rl/trainer/rl/token_export.py",
+            nodes=ranked_trainers,
+        )
+        deploy_file.assert_any_call(
+            "source/deps/renderers/renderers/base.py",
+            nodes=[training_ops.orchestrator_host],
+        )
+        self.assertTrue(
+            any(
+                host == training_ops.orchestrator_host
+                and "scripts/h200/start_orchestrator.sh" in command
+                and (
+                    "ORCH_CONFIG="
+                    + training_ops.remote_repo
+                    + "/configs/paused/orchestrator.glm52-production.toml"
+                )
+                in command
+                for host, command in calls
+            )
+        )
+        self.assertFalse(
+            any(
+                host == training_ops.trainer_head
+                and "cluster.sh orchestrator" in command
+                for host, command in calls
+            )
+        )
+
+    def test_start_refuses_a_run_name_that_does_not_match_profile_paths(self):
+        with self.assertRaises(training_ops.Refused):
+            training_ops.start("wrong-run-name", supervisors=False)
+
+    def test_stop_removes_edge_orchestrator(self):
+        calls = []
+
+        def fake_ssh(host, command, timeout=120):
+            calls.append((host, command))
+            return 0, ""
+
+        with (
+            patch.object(training_ops, "_ssh", side_effect=fake_ssh),
+            patch.object(training_ops, "_fan", return_value={}),
+        ):
+            training_ops.stop()
+
+        self.assertTrue(
+            any(
+                host == training_ops.orchestrator_host
+                and training_ops.orchestrator_container in command
+                and training_ops.environment_container in command
+                for host, command in calls
+            )
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

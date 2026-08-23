@@ -8,13 +8,6 @@ import triton
 import triton.language as tl
 from torch import nn
 from torch.distributed.tensor import DTensor
-from prime_rl.trainer.models.layers.checkpointing import (
-    in_reentrant_block_checkpoint,
-)
-from prime_rl.trainer.models.layers.lm_head import (
-    PrimeLmOutput,
-    _online_logsumexp_and_weighted_update,
-)
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.fused_moe.fused_moe import (
     _prepare_expert_assignment,
@@ -23,6 +16,13 @@ from vllm.model_executor.layers.fused_moe.fused_moe import (
     moe_kernel_quantize_input,
 )
 
+from prime_rl.trainer.models.layers.checkpointing import (
+    in_reentrant_block_checkpoint,
+)
+from prime_rl.trainer.models.layers.lm_head import (
+    PrimeLmOutput,
+    _online_logsumexp_and_weighted_update,
+)
 
 block_shape = [128, 128]
 _FP8_W13_CHUNK_ROWS = 2048
@@ -1707,6 +1707,10 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad):
+        if _EXPERT_PROFILE:
+            profile_start = torch.cuda.Event(enable_timing=True)
+            profile_end = torch.cuda.Event(enable_timing=True)
+            profile_start.record()
         (
             q1,
             qs1,
@@ -1859,6 +1863,9 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                 grad_b,
             )
 
+        if _EXPERT_PROFILE:
+            profile_end.record()
+            _profile_expert_backward(profile_start, profile_end)
         del ctx.owner, ctx.received_input, ctx.offload_done
         return (
             grad,

@@ -1,0 +1,41 @@
+schema_version = 1
+name = "glm52-native-fp8-r32-policy-parity"
+prime_rl_revision = "60bc29547a8824ad1de7b9af8d265e2b27b2a72d"
+trainer_image = "prime-rl:glm52-v080-qual"
+inference_image = "prime-rl:glm52-v080-full"
+model_name = "/data/glm52-rl/model-fp8"
+model_architecture = "GlmMoeDsaForCausalLM"
+quantization = "native_fp8"
+context_length = 32768
+h200_scoring_context_length = 32769
+prompt_length = 16384
+max_output_length = 16384
+vocab_size = 154880
+hidden_layers = 78
+dense_layers = 3
+experts = 256
+experts_per_token = 8
+router_scale = 2.5
+lora_rank = 32
+lora_alpha = 64
+lora_targets = [
+  "q_a_proj",
+  "q_b_proj",
+  "kv_a_proj_with_mqa",
+  "kv_b_proj",
+  "o_proj",
+  "gate_proj",
+  "up_proj",
+  "down_proj",
+  "shared_expert",
+  "experts",
+]
+dppo_mask_low = 0.2
+dppo_mask_high = 0.2
+max_unmasked_mismatch_kl = 0.1
+max_masked_mismatch_kl = 0.5
+max_masked_fraction = 0.06
+max_router_weight_abs_delta = 0.01
+max_router_weight_sum_error = 0.005
+router_weight_delta_status = "provisional_until_first_base_and_adapter_capture"
+max_fixture_age_hours = 24

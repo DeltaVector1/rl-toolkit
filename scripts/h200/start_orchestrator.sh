@@ -7,10 +7,23 @@ set -uo pipefail
 CONFIG_TAG=${CONFIG_TAG:-.x7h}
 RUN=${RUN:?set RUN}
 RUN_NAME=${RUN_NAME:?set RUN_NAME}
-deployment=/data/glm52-rl/deployment
+deployment=${prime_deployment:-/data/glm52-rl/deployment-glm52-optims}
 config=$deployment/configs/h200
-image=prime-rl:glm52-decensor
+image=${prime_image:-prime-rl:glm52-v080-full}
+model_volume=${prime_model_volume:-glm52-fp8-model}
+orchestrator_container=${prime_orchestrator_container:-glm52-optims-orchestrator}
+env_container=${prime_env_container:-glm52-optims-env-train}
+trainer_container=${prime_trainer_container:-glm52-optims-trainer}
 config_file=${ORCH_CONFIG:-$config/orchestrator${CONFIG_TAG}.toml}
+env_config_file=${ENV_CONFIG:-$config/env${CONFIG_TAG}.toml}
+orchestrator_output=$(python3 - "$config_file" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as source:
+    print(tomllib.load(source)["output_dir"])
+PY
+)
 transport=$(awk '
   $0 == "[rollout_transport]" { active=1; next }
   /^\[/ { active=0 }
@@ -57,13 +70,20 @@ fi
 sleep 6
 sudo install -d -o 1000 -g 1000 "/data/glm52-rl/runs/$RUN"
 sudo install -d -o 1000 -g 1000 "/data/glm52-rl/runs/$RUN/$RUN_NAME"
+sudo install -d -o 1000 -g 1000 "$(dirname "$orchestrator_output")"
+sudo install -d -o 1000 -g 1000 "$orchestrator_output"
 for p in "${ports[@]}"; do
   ss -tln 2>/dev/null | grep -q "127.0.0.1:$p" && echo "tunnel :$p up" || echo "tunnel :$p DOWN"
 done
 
-sudo docker rm -f glm52-decensor-orchestrator >/dev/null 2>&1 || true
-sudo docker run -d --name glm52-decensor-orchestrator \
-  --network host --restart no \
+if [ ! -r "$env_config_file" ]; then
+  echo "ERROR: environment server config not found: $env_config_file" >&2
+  exit 1
+fi
+
+sudo docker rm -f "$orchestrator_container" "$env_container" >/dev/null 2>&1 || true
+sudo docker run -d --name "$env_container" \
+  --network host --restart no --user root \
   --env-file /data/trinity/training.env \
   -e VLLM_API_KEY=unused \
   -e PYTHONPATH="$deployment/env":/app/src \
@@ -71,10 +91,30 @@ sudo docker run -d --name glm52-decensor-orchestrator \
   -e HF_HUB_OFFLINE=1 \
   -e HF_DATASETS_OFFLINE=1 \
   -v /data/glm52-rl:/data/glm52-rl \
+  -v "$model_volume":/models/glm52-fp8:ro \
+  -v "$deployment/source/deps/renderers/renderers/base.py":/app/deps/renderers/renderers/base.py:ro \
+  -v "$deployment/source/deps/renderers/renderers/client.py":/app/deps/renderers/renderers/client.py:ro \
+  -v "$deployment/source/deps/verifiers/verifiers/v1/clients/eval.py":/app/deps/verifiers/verifiers/v1/clients/eval.py:ro \
+  -v "$deployment/source/deps/verifiers/verifiers/v1/harnesses/null/harness.py":/app/deps/verifiers/verifiers/v1/harnesses/null/harness.py:ro \
+  -v "$deployment/patches/verifiers/v1-serialize-env-replies.patch":/tmp/v1-serialize-env-replies.patch:ro \
+  --entrypoint /bin/sh "$image" \
+  -c 'cd /app/deps/verifiers && patch -s -p1 < /tmp/v1-serialize-env-replies.patch && exec runuser -u appuser -- /app/.venv/bin/env-server "$@"' \
+  sh @ "$env_config_file" >/dev/null
+sudo docker run -d --name "$orchestrator_container" \
+  --network host --restart no --user root \
+  --env-file /data/trinity/training.env \
+  -e VLLM_API_KEY=unused \
+  -e PYTHONPATH="$deployment/env":/app/src \
+  -e HF_HOME=/data/glm52-rl/hf-cache \
+  -e HF_HUB_OFFLINE=1 \
+  -e HF_DATASETS_OFFLINE=1 \
+  -v /data/glm52-rl:/data/glm52-rl \
+  -v "$model_volume":/models/glm52-fp8:ro \
   -v /data/muse-glimmer/model:/data/muse-glimmer/model:ro \
   -v "$deployment/source/deps/renderers/renderers/base.py":/app/deps/renderers/renderers/base.py:ro \
   -v "$deployment/source/deps/renderers/renderers/client.py":/app/deps/renderers/renderers/client.py:ro \
   -v "$deployment/source/deps/verifiers/verifiers/v1/clients/eval.py":/app/deps/verifiers/verifiers/v1/clients/eval.py:ro \
+  -v "$deployment/patches/verifiers/v1-serialize-env-replies.patch":/tmp/v1-serialize-env-replies.patch:ro \
   -v "$deployment/source/src/prime_rl/orchestrator/algo/grpo.py":/app/src/prime_rl/orchestrator/algo/grpo.py:ro \
   -v "$deployment/source/src/prime_rl/orchestrator/dispatcher.py":/app/src/prime_rl/orchestrator/dispatcher.py:ro \
   -v "$deployment/source/src/prime_rl/orchestrator/orchestrator.py":/app/src/prime_rl/orchestrator/orchestrator.py:ro \
@@ -83,29 +123,33 @@ sudo docker run -d --name glm52-decensor-orchestrator \
   -v "$deployment/source/src/prime_rl/orchestrator/watcher.py":/app/src/prime_rl/orchestrator/watcher.py:ro \
   -v "$deployment/source/src/prime_rl/utils/client.py":/app/src/prime_rl/utils/client.py:ro \
   -v "$deployment/source/src/prime_rl/utils/checkpoint_delta.py":/app/src/prime_rl/utils/checkpoint_delta.py:ro \
-  --entrypoint /app/.venv/bin/orchestrator "$image" \
-  @ "$config_file"
-echo "orchestrator started on $(hostname) with $(basename "$config_file")"
+  --entrypoint /bin/sh "$image" \
+  -c 'cd /app/deps/verifiers && patch -s -p1 < /tmp/v1-serialize-env-replies.patch && exec runuser -u appuser -- /app/.venv/bin/orchestrator "$@"' \
+  sh @ "$config_file"
+echo "environment and orchestrator started on $(hostname) with $(basename "$config_file")"
 
 # The China-side supervisor refuses to restart a failed trainer because the
 # optimizer has no resumable checkpoint. Stop rollout production here as soon
 # as any trainer worker is gone, so the run cannot accumulate unusable batches.
 pkill -f '[t]rainer_failure_watchdog.sh' 2>/dev/null || true
 nohup setsid env RUN="$RUN" RUN_NAME="$RUN_NAME" \
+  prime_trainer_container="$trainer_container" \
+  prime_orchestrator_container="$orchestrator_container" \
+  prime_env_container="$env_container" \
   bash "$deployment/scripts/h200/trainer_failure_watchdog.sh" \
   >>"/data/glm52-rl/trainer-failure-watchdog-$RUN.log" 2>&1 </dev/null &
 trainer_watchdog_pid=$!
 sleep 1
 if ! kill -0 "$trainer_watchdog_pid" 2>/dev/null; then
   echo "ERROR: trainer failure watchdog exited during startup" >&2
-  sudo docker rm -f glm52-decensor-orchestrator >/dev/null 2>&1 || true
+  sudo docker rm -f "$orchestrator_container" "$env_container" >/dev/null 2>&1 || true
   exit 1
 fi
 echo "trainer failure watchdog started (pid $trainer_watchdog_pid)"
 
-ctl=/data/glm52-rl/runs/$RUN/$RUN_NAME/control/orch.toml
+ctl=$orchestrator_output/control/orch.toml
 if [ "$transport" = filesystem ]; then
-  publisher_dir="/data/glm52-rl/runs/$RUN/$RUN_NAME"
+  publisher_dir="$orchestrator_output"
   publisher_pid_file="$publisher_dir/.batch-sync.pid"
   publisher_lock="$publisher_dir/.batch-sync.lock"
   if [ -r "$publisher_pid_file" ]; then
@@ -146,7 +190,7 @@ if [ "$transport" = filesystem ]; then
     echo "ERROR: old durable batch publisher still owns $publisher_lock" >&2
     exit 1
   fi
-  nohup setsid env SOURCE_RUN_DIR="/data/glm52-rl/runs/$RUN/$RUN_NAME" \
+  nohup setsid env SOURCE_RUN_DIR="$orchestrator_output" DEST_RUN_DIR="$orchestrator_output" \
     DEST_HOST=china-trainer \
     ADAPTER_SOURCE_BASE="http://127.0.0.1:18100/$RUN/$RUN_NAME" \
     ADAPTER_ADMIN_URLS="$adapter_admin_urls" \

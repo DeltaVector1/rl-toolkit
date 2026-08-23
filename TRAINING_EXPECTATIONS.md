@@ -1,91 +1,52 @@
-# Training expectations
+# Training requirements
 
-Review this file before each trainer qualification or production run. These
-are acceptance requirements. Do not implement them as a sequence of full
-rollout gates. A run does not pass if it changes these values or exceeds these
-limits without an explicit owner decision.
+Read this file before each trainer qualification or production run. These are
+acceptance requirements. Do not change them without an owner decision.
 
-Do not use a full rollout batch to debug trainer execution. First use a
-trainer-only fake-data qualification on the exact distributed topology. Use a
-direct deterministic Hugging Face reference to debug log-probability parity.
-Start rollout production only after these direct tests pass.
+Use trainer-only fake data to debug trainer execution. Use deterministic Hugging
+Face output to check log probabilities. Start rollout production only after
+these direct checks pass.
 
-## Muse-Glimmer-30B owner decision
+## Muse-Glimmer-30B
 
-These requirements replace the GLM-5.2 precision, batch, context, and
-parallelism requirements for a run whose name starts with `muse`.
+- Use BF16 base and LoRA weights. Do not use FP8, QLoRA, or INT4 weights.
+- Use LoRA rank 128, alpha 256, and dropout 0.
+- Train all 416 supported language-model linear modules. These are Q, K, V,
+  attention output, attention control, MLP control, MLP up, and MLP down.
+- Do not train the vision tower.
+- Require 838,336,512 trainable parameters.
+- Use batch 1,024, group 16, context 65,536, maximum output 16,384, learning
+  rate `8e-6`, maximum gradient norm 1.0, and weight decay 0.
+- Use PP8, CP4 ring, and FSDP2 on 64 RTX 4090 GPUs.
+- H200 inference must load the same rank-128 adapter targets.
+- Use the Transformers model implementation until the native vLLM model gives
+  equal trainer and inference log probabilities.
+- Complete 20 trainer-only steps on the production trainer topology. Use real
+  backward work and changing packed-document boundaries.
+- Compare distributed trainer log probabilities with an independent Hugging
+  Face result on fixed tokens.
+- Reject a step before the optimizer update if unmasked mismatch KL is above
+  0.1, masked mismatch KL is above 0.5, or more than 6 percent of tokens are
+  masked.
+- After step 1, warn if forward and backward exceeds 8 minutes or active
+  rollout collection exceeds 20 minutes.
+- Complete at least 50 stable trainer steps for final acceptance.
 
-- BF16 base weights and BF16 LoRA weights. Do not use FP8, QLoRA, or INT4
-  weights.
-- Rank-128 LoRA with alpha 256 and dropout 0.
-- Target all 416 linear modules in the 52 language-model layers: Q, K, V,
-  attention output, attention gate, MLP gate, MLP up, and MLP down.
-- Do not target the vision tower. Muse-Glimmer is dense and has no routed
-  experts or router.
-- The expected adapter has 838,336,512 trainable parameters.
-- Batch size 2,048, group size 16, context length 65,536, maximum output length
-  16,384, learning rate `8e-6`, maximum gradient norm 1.0, and weight decay 0.
-- Use PP8, CP4 ring, and FSDP2 on all 64 RTX 4090 GPUs.
-- H200 inference must enable BF16 rank-128 LoRA and the same seven projection
-  suffixes.
-- H200 inference must use the Transformers model implementation unless a
-  separate gate proves that the native vLLM implementation has equal
-  trainer-to-inference parity.
-- Before a production run, complete 20 trainer-only steps on the exact PP8,
-  CP4, FSDP2, BF16, rank-128 topology with changing packed-document
-  boundaries and real backward work. This test does not use rollouts.
-- Compare the exact distributed trainer log probabilities with an independent
-  Hugging Face reference on deterministic tokens. Do not start rollout
-  production while this direct comparison fails.
-- Production uses fresh rollouts and learning rate `8e-6` from step 1. It does
-  not use a separate full-batch zero-learning-rate rollout gate.
-- The production trainer must reject a step before the optimizer update and
-  adapter broadcast if unmasked mismatch KL exceeds 0.1, masked mismatch KL
-  exceeds 0.5, or more than 6 percent of tokens are masked. Do not increase
-  the DPPO mask thresholds to make the check pass.
-- After step 1, alarm if trainer forward and backward exceeds 8 minutes or
-  active rollout collection exceeds 20 minutes. A faster result is not a
-  failure.
-- Report trainer compute, rollout collection, adapter transfer, and gate wait
-  as separate times.
-- Complete at least 50 stable trainer steps before final acceptance.
+## GLM-5.2
 
-## Required configuration
+- Use the native FP8 trainer path and measure it against H200 FP8 inference.
+- Use batch 1,024, group 16, context 32,768, maximum output 16,384, learning
+  rate `8e-6`, maximum gradient norm 1.0, and weight decay 0.
+- After step 1, forward and backward must take 10 to 15 minutes.
+- Active rollout generation should take about 10 minutes per batch.
+- Validate the path to batch 2,048 before using that batch in production.
 
-- Native FP8 trainer forward precision must match H200 FP8 inference as closely
-  as measured parity permits.
-- Batch size: 2,048 or greater.
-- Group size: 16.
-- Context length: 32,768 tokens.
-- Maximum output length: 16,384 tokens.
-- Learning rate: `8e-6`.
-- Maximum gradient norm: `1.0`.
-- Weight decay: `0.0`.
+## Final acceptance
 
-## Performance requirements after step 1
+Run the full topology for at least 50 completed trainer steps. Keep
+`training_ops.watch()` in the foreground with an interval of ten minutes or
+less. Stop acceptance if there is an OOM, a nonfinite value, a failed adapter
+load, a transport failure, an environment failure, or a measured reward
+regression.
 
-- Trainer forward and backward target: less than 5 minutes per step.
-- Trainer forward and backward hard limit: 8 minutes per step.
-- Active rollout generation: approximately 10 minutes per batch.
-- Report trainer compute, rollout generation, transfer, and gate waiting as
-  separate times.
-- Trigger a regression alarm when a run exceeds these limits or reduces the
-  required context, batch size, precision parity, or stability.
-
-## Final stability validation
-
-Do this only after the speed, memory, context, and precision gates pass.
-
-Run the final full-topology configuration for at least 50 completed trainer
-steps. Keep `glm52_ops.watch()` in the foreground with no interval longer than
-10 minutes. Watch for random OOMs, NaN or Inf values, nonfinite gradients,
-adapter-load failures, transport failures, environment errors, and reward
-regressions. Continue beyond 50 steps when evidence is still incomplete.
-
-Do not accept a short run, a successful step 1, or an early noisy reward rise
-as final validation.
-
-The final GLM run must target every supported attention projection, every
-dense MLP projection, every shared-expert projection, and every routed-expert
-projection. Keep the router and sparse indexer frozen. Complete 20 repeated
-batch-2,048 trainer steps before the final run. No delayed OOM is allowed.
+A short run, step 1, or a reward change inside the noise does not pass.

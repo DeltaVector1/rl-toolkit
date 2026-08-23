@@ -1,0 +1,4 @@
+interface:
+  display_name: "Training Operations"
+  short_description: "Operate and inspect distributed RL training"
+  default_prompt: "Use $training-ops to inspect the current training run and report only measured results."

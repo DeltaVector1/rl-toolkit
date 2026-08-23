@@ -1,0 +1,87 @@
+output_dir = "/data/glm52-rl/runs/glm52-1/run_glm52-1"
+max_steps = 200
+seq_len = 32768
+batch_size = 1024
+group_size = 16
+max_inflight_episodes = 128
+max_off_policy_steps = 4
+
+[log]
+level = "info"
+
+[swanlab]
+project = "prod-run"
+name = "orchestrator-glm52-1"
+group = "glm52-decensor-r32"
+tags = ["glm-5.2", "native-fp8", "w8a8-rollouts", "lora-r32", "full-expert-lora", "tp8", "8xh200", "64x4090", "b1024", "g16", "32768", "out16384", "cp8", "lr8e-6", "production"]
+
+[file_monitor]
+filename = "rollout-metrics.jsonl"
+
+[model]
+name = "/models/glm52-fp8"
+
+[model.lora]
+name = "glm52-decensor-r32-node-local"
+rank = 32
+alpha = 64
+
+[model.client]
+base_url = ["http://127.0.0.1:8000/v1"]
+admin_base_url = ["http://127.0.0.1:8000/v1"]
+wait_for_ready_timeout = 7200
+skip_model_check = true
+
+[optim]
+lr = 8e-6
+
+[renderer]
+name = "default"
+tool_parser = "glm"
+reasoning_parser = "think"
+enable_thinking = true
+clear_thinking = true
+
+[train.sampling]
+temperature = 1.0
+max_completion_tokens = 16384
+extra_body = { min_tokens = 16 }
+
+[[train.source]]
+name = "decensor"
+ratio = 1.0
+serve.pool = { type = "static", num_workers = 16 }
+env.taskset.id = "decensor-v1"
+env.taskset.dataset_name = "/data/glm52-rl/decensor-data/rl.jsonl"
+env.taskset.num_examples = 2000
+env.assistant.harness = { id = "null" }
+env.assistant.max_output_tokens = 16384
+env.assistant.timeout.rollout = 3600
+
+[train.source.sampling]
+max_completion_tokens = 16384
+
+[train.source.env.taskset.task.judge]
+base_url = "http://202.214.223.66:26406/v1"
+model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
+api_key_var = "VLLM_API_KEY"
+
+[train.source.env.taskset.task.user]
+base_url = "http://202.214.223.66:26406/v1"
+model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
+api_key_var = "VLLM_API_KEY"
+
+[weight_broadcast]
+type = "filesystem"
+source_url = "http://127.0.0.1:18100/glm52-1"
+source_dir = "/data/glm52-rl/runs/glm52-1"
+
+[rollout_transport]
+type = "filesystem"
+
+[ckpt]
+interval = 5
+resume_step = -1
+skip_progress = true
+keep_last = 2
+keep_interval = 100

@@ -1,0 +1,6 @@
+ARG BASE_IMAGE=prime-rl:glm52-v080-glm52-h200
+FROM ${BASE_IMAGE}
+USER root
+ADD --checksum=sha256:db0c9410a4c130da8ffeea22f569faca7c85c58c5e183be1ebf758076361a6ec https://github.com/PrimeIntellect-ai/router/releases/download/v0.1.26/vllm_router-0.1.26-cp38-abi3-manylinux_2_28_x86_64.whl /tmp/vllm_router-0.1.26-cp38-abi3-manylinux_2_28_x86_64.whl
+RUN VIRTUAL_ENV=/app/.venv uv pip install --no-deps /tmp/vllm_router-0.1.26-cp38-abi3-manylinux_2_28_x86_64.whl
+USER appuser

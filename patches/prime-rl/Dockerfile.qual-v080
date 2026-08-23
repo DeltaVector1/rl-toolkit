@@ -1,0 +1,18 @@
+FROM prime-rl:glm52-fp8
+
+USER root
+WORKDIR /app
+
+RUN rm -rf /app/src /app/packages /app/deps
+COPY pyproject.toml README.md /app/
+COPY src /app/src
+COPY packages /app/packages
+COPY deps /app/deps
+
+RUN sed -i 's/fallback-version = "0.0.0"/fallback-version = "0.2.2.dev0"/' /app/deps/verifiers/pyproject.toml \
+    && sed -i 's/fallback-version = "0.0.0"/fallback-version = "0.1.9"/' /app/deps/renderers/pyproject.toml \
+    && VIRTUAL_ENV=/app/.venv uv pip install --no-deps prime-sandboxes==0.2.33 \
+    && VIRTUAL_ENV=/app/.venv uv pip install --no-deps -e /app -e /app/packages/prime-rl-configs \
+    && /app/.venv/bin/python -c 'from importlib.metadata import version; assert version("prime-rl") == "0.8.0"'
+
+USER appuser

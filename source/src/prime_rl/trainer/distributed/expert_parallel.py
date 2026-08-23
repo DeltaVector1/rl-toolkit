@@ -898,6 +898,8 @@ class NativeFP8LoRAAllToAllExpertParallel(MXFP8AllToAllExpertParallel):
         mod: nn.Module,
         device_mesh: DeviceMesh,
     ) -> None:
+        if not getattr(mod, "requires_received_int4_input", False):
+            return
         base_layer = getattr(mod, "base_layer", None)
         if base_layer is None or not getattr(base_layer, "fp8_checkpoint", False):
             raise TypeError("native FP8 LoRA expert parallelism requires an FP8 base layer")

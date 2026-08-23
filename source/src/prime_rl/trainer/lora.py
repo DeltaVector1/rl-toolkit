@@ -15,17 +15,17 @@ from prime_rl.trainer.models.layers.lora import (
     get_multilora_scaling,
 )
 from prime_rl.trainer.models.layers.lora.multi_linear import (
-    _SingleLoRA,
     _run_lora_for_loop,
     _run_lora_grouped_mm,
-)
-from prime_rl.trainer.models.layers.lora.native_fp8_moe import (
-    NativeFP8MultiLoRAGroupedExperts,
+    _SingleLoRA,
 )
 from prime_rl.trainer.models.layers.lora.multi_moe import (
     MultiLoRAGptOssGroupedExperts,
     MultiLoRAGroupedExperts,
     MultiLoRANonGatedGroupedExperts,
+)
+from prime_rl.trainer.models.layers.lora.native_fp8_moe import (
+    NativeFP8MultiLoRAGroupedExperts,
 )
 from prime_rl.trainer.models.layers.moe import (
     FP8CheckpointFeedForward,

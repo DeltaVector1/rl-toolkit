@@ -1,0 +1,97 @@
+diff --git a/verifiers/v1/serve/server.py b/verifiers/v1/serve/server.py
+--- a/verifiers/v1/serve/server.py
++++ b/verifiers/v1/serve/server.py
+@@ -53,5 +53,6 @@ class EnvServer:
+         # This worker's episode bound (`--max-concurrent`), spanning requests.
+         self._gate = asyncio.Semaphore(max_concurrent) if max_concurrent else None
++        self._reply_lock = asyncio.Lock()
+         self.ctx = zmq.asyncio.Context()
+         self.frontend = self.ctx.socket(zmq.ROUTER)
+         self.frontend.setsockopt(zmq.ROUTER_MANDATORY, 1)
+@@ -154,8 +155,11 @@ class EnvServer:
+         )
+         try:
+-            # Let ZMQ retain the packed response instead of copying large traces.
+-            await self.frontend.send_multipart(
+-                [client_id, request_id, data], copy=False
+-            )
++            # Own the reply bytes until ZMQ has accepted the complete message.
++            logger.debug("environment reply ready: request=%s bytes=%d", request_id.hex(), len(data))
++            async with self._reply_lock:
++                await self.frontend.send_multipart(
++                    [client_id, request_id, data], copy=True
++                )
++            logger.debug("environment reply sent: request=%s", request_id.hex())
+         except zmq.ZMQError as e:
+             logger.warning("failed to send response: %s", e)
+diff --git a/verifiers/v1/serve/client.py b/verifiers/v1/serve/client.py
+--- a/verifiers/v1/serve/client.py
++++ b/verifiers/v1/serve/client.py
+@@ -52,18 +52,30 @@ class EnvClient:
+         self.socket.connect(address)
+         self._pending: dict[str, asyncio.Future[bytes]] = {}
+         self._receiver: asyncio.Task | None = None
+-        self._decode_slots = asyncio.BoundedSemaphore(1)
++        self._send_lock = asyncio.Lock()
+ 
+     def _ensure_receiver(self) -> None:
+-        if self._receiver is None:
++        if self._receiver is None or self._receiver.done():
+             self._receiver = asyncio.create_task(self._receive_loop())
+ 
+     async def _receive_loop(self) -> None:
+         while True:
+             try:
+-                request_id_bytes, data = await self.socket.recv_multipart()
++                frames = await self.socket.recv_multipart()
+             except asyncio.CancelledError:
+                 break
+-            future = self._pending.pop(request_id_bytes.decode(), None)
++            if len(frames) != 2:
++                logger.error(
++                    "invalid environment response: expected 2 frames, got %d",
++                    len(frames),
++                )
++                continue
++            request_id_bytes, data = frames
++            request_id = request_id_bytes.decode()
++            future = self._pending.pop(request_id, None)
++            if future is None:
++                logger.warning("unexpected environment response: request=%s", request_id)
++                continue
++            logger.debug("environment response received: request=%s bytes=%d", request_id, len(data))
+             if future is not None and not future.done():
+                 future.set_result(data)
+@@ -81,8 +93,9 @@ class EnvClient:
+         future: asyncio.Future[bytes] = asyncio.get_running_loop().create_future()
+         self._pending[request_id] = future
+         payload = msgpack.packb(request.model_dump(mode="json"), use_bin_type=True)
+-        await self.socket.send_multipart(
+-            [request_id.encode(), request.method.encode(), payload]
+-        )
++        async with self._send_lock:
++            await self.socket.send_multipart(
++                [request_id.encode(), request.method.encode(), payload]
++            )
+         try:
+             data = await asyncio.wait_for(future, timeout)
+@@ -95,18 +108,1 @@ class EnvClient:
+-            # Keep large trace replies compact on the loop and expand only one at a time.
+-            await self._decode_slots.acquire()
+-            decoding = asyncio.create_task(
+-                asyncio.to_thread(
+-                    lambda: response_type.model_validate(
+-                        msgpack.unpackb(data, raw=False)
+-                    )
+-                )
+-            )
+-            # Hold the slot until the worker finishes so cancellation cannot overlap decodes.
+-            decoding.add_done_callback(lambda _: self._decode_slots.release())
+-            try:
+-                response = await asyncio.shield(decoding)
+-            except asyncio.CancelledError:
+-                decoding.add_done_callback(
+-                    lambda task: None if task.cancelled() else task.exception()
+-                )
+-                raise
++            response = response_type.model_validate(msgpack.unpackb(data, raw=False))

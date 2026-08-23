@@ -14,12 +14,12 @@ from torch.distributed.tensor import DTensor
 from torchtitan.distributed.expert_parallel import expert_parallel
 
 from prime_rl.configs.trainer import EPCommBackend
-from prime_rl.trainer.mxfp4 import dequant_mxfp4
 from prime_rl.trainer.models.layers.fp8_ada import (
     _Linear,
     fp8_experts,
     scale_routed_output,
 )
+from prime_rl.trainer.mxfp4 import dequant_mxfp4
 
 
 @dataclass
@@ -609,6 +609,7 @@ class TokenChoiceTopKRouter(nn.Module):
         self.route_norm = route_norm
         self.route_scale = route_scale
         self.force_balanced = False
+        self.parity_trace_layer: int | None = None
         # Set via model.moe_router_dtype='float32': the gate weight is kept in fp32
         # (exempt from FSDP bf16 casting) and the gate GEMM runs in fp32.
         self.fp32_gate = False
@@ -678,7 +679,16 @@ class TokenChoiceTopKRouter(nn.Module):
         if self.route_norm:
             denominator = top_scores.sum(dim=-1, keepdim=True) + 1e-20
             top_scores = top_scores / denominator
-        top_scores = top_scores * self.route_scale
+
+        if self.parity_trace_layer is not None:
+            from prime_rl.parity_router_trace import write_route_chunk
+
+            write_route_chunk(
+                self.parity_trace_layer,
+                selected_experts_indices,
+                top_scores,
+                route_output_scale=self.route_scale,
+            )
 
         # group tokens together by expert indices from 0 to num_experts and pass that to experts forward
         num_tokens_per_expert = torch.histc(
@@ -715,7 +725,7 @@ class TokenReorderer(nn.Module):
         self,
         top_scores: torch.Tensor,
         selected_experts_indices: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Reorders token indices to match the order of experts for MoE routing.
 
@@ -742,16 +752,53 @@ class TokenReorderer(nn.Module):
 
         # Reorder the token indices to match the order of the experts
         # token_indices_experts_sorted shape (bs*slen*top_k,)
-        token_indices_experts_sorted = torch.argsort(selected_experts_indices, stable=True)
+        expert_order = torch.argsort(selected_experts_indices, stable=True)
 
-        top_scores_experts_sorted = top_scores.view(-1)[token_indices_experts_sorted]
-        token_indices_experts_sorted = token_indices_experts_sorted // self.top_k
+        top_scores_experts_sorted = top_scores.view(-1)[expert_order]
+        token_indices_experts_sorted = expert_order // self.top_k
 
         return (
             top_scores_experts_sorted,
             token_indices_experts_sorted,
             num_tokens_per_expert,
+            expert_order,
         )
+
+
+def combine_expert_outputs(
+    shared_output: torch.Tensor,
+    routed_output: torch.Tensor,
+    expert_order: torch.Tensor,
+    top_k: int,
+) -> torch.Tensor:
+    """Add expert outputs in the model's fixed top-k order."""
+    token_count, width = shared_output.shape
+    expected_rows = token_count * top_k
+    if routed_output.shape != (expected_rows, width):
+        raise ValueError(
+            f"routed output shape {tuple(routed_output.shape)} does not match "
+            f"({expected_rows}, {width})"
+        )
+    if expert_order.shape != (expected_rows,):
+        raise ValueError(
+            f"expert order shape {tuple(expert_order.shape)} does not match "
+            f"({expected_rows},)"
+        )
+
+    sorted_row_for_token_slot = torch.empty_like(expert_order)
+    sorted_row_for_token_slot[expert_order] = torch.arange(
+        expected_rows,
+        device=expert_order.device,
+        dtype=expert_order.dtype,
+    )
+    sorted_row_for_token_slot = sorted_row_for_token_slot.view(token_count, top_k)
+
+    output = shared_output
+    for slot in range(top_k):
+        rows = sorted_row_for_token_slot[:, slot]
+        contribution = routed_output.index_select(0, rows)
+        output = output + contribution
+    return output
 
 
 class MoE(nn.Module):
@@ -885,8 +932,7 @@ class MoE(nn.Module):
         from prime_rl.trainer.distributed.expert_parallel import get_ep_group
 
         if x.shape[0] == 0:
-            shared_output = self.shared_expert(x) if self.shared_expert is not None else None
-            return x.new_zeros(x.shape) if shared_output is None else shared_output
+            return x.new_zeros(x.shape)
 
         group = get_ep_group(self.experts)
         chunk_size = min(self.deepep_token_chunk_size or x.shape[0], x.shape[0])
@@ -909,9 +955,8 @@ class MoE(nn.Module):
             )
             sync_combine()
 
-        shared_output = self.shared_expert(x) if self.shared_expert is not None else None
         routed_output = routed_outputs[0] if len(routed_outputs) == 1 else torch.cat(routed_outputs, dim=0)
-        return routed_output if shared_output is None else shared_output + routed_output
+        return routed_output
 
     def forward(
         self,
@@ -955,6 +1000,9 @@ class MoE(nn.Module):
 
         if self.ep_comm_backend == "deepep":
             routed_output = self._run_deepep_routed_experts(x, selected_experts_indices, top_scores)
+            routed_output = routed_output * self.router.route_scale
+            if self.shared_expert is not None:
+                routed_output = self.shared_expert(x) + routed_output
             return routed_output.reshape(bs, slen, dim)
 
         # top_scores and token_indices_experts_sorted shape (bs*slen*top_k,)
@@ -969,6 +1017,7 @@ class MoE(nn.Module):
             top_scores_experts_sorted,
             token_indices_experts_sorted,
             num_tokens_per_expert,
+            expert_order,
         ) = self.reorderer(top_scores, selected_experts_indices)
 
         routed_output = self._run_routed_experts(
@@ -977,13 +1026,18 @@ class MoE(nn.Module):
             num_tokens_per_expert,
             top_scores_experts_sorted,
         )
+        routed_output = routed_output * self.router.route_scale
         if self.shared_expert is not None:
             out = self.shared_expert(x)
         else:
             out = torch.zeros_like(x)
 
-        routed_indices = token_indices_experts_sorted.reshape(-1, 1).expand(-1, dim)
-        out = out.scatter_add(dim=0, index=routed_indices, src=routed_output)
+        out = combine_expert_outputs(
+            out,
+            routed_output,
+            expert_order,
+            self.router.top_k,
+        )
         out = out.reshape(bs, slen, dim)
         return out
 
@@ -1414,6 +1468,7 @@ class LatentMoE(nn.Module):
             top_scores_experts_sorted,
             token_indices_experts_sorted,
             num_tokens_per_expert,
+            expert_order,
         ) = self.reorderer(top_scores, selected_experts_indices)
 
         routed_output = self._run_routed_experts(
@@ -1425,8 +1480,12 @@ class LatentMoE(nn.Module):
 
         out = self.shared_expert(x_flat)
 
-        token_indices_full = token_indices_experts_sorted.reshape(-1, 1).expand(-1, dim)
-        out = out.scatter_add(dim=0, index=token_indices_full, src=routed_output)
+        out = combine_expert_outputs(
+            out,
+            routed_output,
+            expert_order,
+            self.router.top_k,
+        )
         out = out.reshape(bs, slen, dim)
         return out
 

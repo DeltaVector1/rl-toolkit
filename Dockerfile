@@ -1,10 +1,21 @@
-FROM prime-rl:glm52-decensor
+ARG BASE_IMAGE=prime-rl:glm52-v080-full
+FROM ${BASE_IMAGE}
 USER root
+ADD --checksum=sha256:db0c9410a4c130da8ffeea22f569faca7c85c58c5e183be1ebf758076361a6ec https://github.com/PrimeIntellect-ai/router/releases/download/v0.1.26/vllm_router-0.1.26-cp38-abi3-manylinux_2_28_x86_64.whl /tmp/vllm_router-0.1.26-cp38-abi3-manylinux_2_28_x86_64.whl
+RUN VIRTUAL_ENV=/app/.venv uv pip install --no-deps /tmp/vllm_router-0.1.26-cp38-abi3-manylinux_2_28_x86_64.whl
 COPY --chmod=644 source/packages/prime-rl-configs/src/prime_rl/configs/shared.py /app/packages/prime-rl-configs/src/prime_rl/configs/shared.py
 COPY --chmod=644 source/packages/prime-rl-configs/src/prime_rl/configs/trainer.py /app/packages/prime-rl-configs/src/prime_rl/configs/trainer.py
 COPY --chmod=644 source/packages/prime-rl-configs/src/prime_rl/configs/orchestrator.py /app/packages/prime-rl-configs/src/prime_rl/configs/orchestrator.py
 COPY --chmod=644 source/packages/prime-rl-configs/src/prime_rl/configs/rl.py /app/packages/prime-rl-configs/src/prime_rl/configs/rl.py
 COPY --chmod=644 source/src/prime_rl/trainer/rl/train.py /app/src/prime_rl/trainer/rl/train.py
+COPY --chmod=644 source/src/prime_rl/trainer/rl/token_export.py /app/src/prime_rl/trainer/rl/token_export.py
+COPY --chmod=644 source/src/prime_rl/parity_router_trace.py /app/src/prime_rl/parity_router_trace.py
+COPY --chmod=644 patches/prime-rl/v0.8.0-glm52/0012-Register-trainer-only-LoRA-runs.patch /tmp/trainer-only-lora.patch
+RUN cd /app && if git apply --check --include=src/prime_rl/trainer/runs.py /tmp/trainer-only-lora.patch; then \
+        git apply --include=src/prime_rl/trainer/runs.py /tmp/trainer-only-lora.patch; \
+    else \
+        git apply --reverse --check --include=src/prime_rl/trainer/runs.py /tmp/trainer-only-lora.patch; \
+    fi
 COPY --chmod=644 source/src/prime_rl/trainer/model.py /app/src/prime_rl/trainer/model.py
 COPY --chmod=644 source/src/prime_rl/trainer/parallel_dims.py /app/src/prime_rl/trainer/parallel_dims.py
 COPY --chmod=644 source/src/prime_rl/trainer/fp8_checkpoint.py /app/src/prime_rl/trainer/fp8_checkpoint.py

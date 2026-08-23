@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import enum
-import json
 import logging
 import queue
-import re
 import threading
 from collections.abc import Mapping
 from contextlib import contextmanager
@@ -560,8 +558,15 @@ class ToolCallParseStatus(str, enum.Enum):
     """Per-attempt outcome of parsing a single ``<tool_call>`` block.
 
     The renderer parser's job is JSON-syntax → ``dict`` (the parser-level
-    contract). Schema validation — required fields, argument types, tool
-    name lookup — is the *tool*'s job and is intentionally not done here.
+    contract). Schema validation — required fields, argument types — is
+    the *tool*'s job and is intentionally not done here. Tool-*name*
+    lookup is the one exception, and only where the reference inference
+    parser does it: vLLM ≥ 0.24 aliases ``glm45``/``glm47`` to a parser
+    with ``validate_tool_names=True`` that silently drops any call whose
+    name isn't in the request's tool list. ``parse_glm`` mirrors that as
+    ``UNKNOWN_TOOL`` (when ``tools`` is passed) so train-side parsing
+    agrees with what an eval client sees from the engine — but keeps the
+    attempt visible instead of swallowing it.
     See ``ParsedToolCall.status`` for what each value means.
 
     Diverges from vLLM/SGLang on purpose. Both engines collapse parse
@@ -578,6 +583,7 @@ class ToolCallParseStatus(str, enum.Enum):
     UNCLOSED_BLOCK = "unclosed_block"  # opening delim hit EOS / stop
     MISSING_NAME = "missing_name"  # parsed structurally, but no function name
     MALFORMED_STRUCTURE = "malformed_structure"  # format-specific shape error
+    UNKNOWN_TOOL = "unknown_tool"  # name not in the provided tools list
 
 
 @dataclass
@@ -624,109 +630,6 @@ class ParsedResponse:
     content: str
     reasoning_content: str | None = None
     tool_calls: list[ParsedToolCall] = field(default_factory=list)
-
-
-_MUSE_MESSAGE_HEADER_RE = re.compile(
-    r"(?:<\|start\|>\s*assistant)?[^\S\n]*(?:to=(?P<recipient>[A-Za-z0-9_.\-]+))?<\|message\|>"
-)
-_MUSE_MESSAGE_END_RE = re.compile(r"<\|eom\|>|<\|eot\|>")
-_MUSE_INVOKE_RE = re.compile(r"<atem:invoke\b.*?</atem:invoke>", re.DOTALL)
-_MUSE_NAME_RE = re.compile(r'<atem:invoke\b[^>]*?\bname="([^"]+)"')
-_MUSE_PARAM_RE = re.compile(
-    r'<atem:parameter\b[^>]*?\bname="(?P<key>[^"]+)"[^>]*?>(?P<value>.*?)</atem:parameter>',
-    re.DOTALL,
-)
-
-
-def _iter_muse_messages(text: str):
-    """Yield Muse assistant messages as recipient, body, and closed state."""
-    pos = 0
-    while pos < len(text):
-        header = _MUSE_MESSAGE_HEADER_RE.search(text, pos)
-        if header is None:
-            return
-        body_start = header.end()
-        end = _MUSE_MESSAGE_END_RE.search(text, body_start)
-        next_header = _MUSE_MESSAGE_HEADER_RE.search(text, body_start)
-        body_end = end.start() if end is not None else len(text)
-        closed = end is not None
-        if next_header is not None and next_header.start() < body_end:
-            body_end = next_header.start()
-            closed = False
-            pos = next_header.start()
-        else:
-            pos = end.end() if end is not None else len(text)
-        yield header.group("recipient"), text[body_start:body_end], closed
-
-
-class MuseGlimmerToolParser:
-    """Parse channel-scoped Muse ATEM tool calls."""
-
-    def __init__(self, tokenizer):
-        self._tokenizer = tokenizer
-
-    def extract(self, ids: list[int]) -> tuple[list[int], list[ParsedToolCall]]:
-        text = self._tokenizer.decode(ids, skip_special_tokens=False)
-        tool_calls: list[ParsedToolCall] = []
-        for recipient, body, _closed in _iter_muse_messages(text):
-            if recipient in (None, "self", "user"):
-                continue
-            invokes = _MUSE_INVOKE_RE.findall(body)
-            if not invokes and "<atem:invoke" in body:
-                tool_calls.append(
-                    ParsedToolCall(
-                        raw=body,
-                        status=ToolCallParseStatus.UNCLOSED_BLOCK,
-                    )
-                )
-                continue
-            for invoke in invokes:
-                name_match = _MUSE_NAME_RE.search(invoke)
-                arguments: dict[str, Any] = {}
-                for parameter in _MUSE_PARAM_RE.finditer(invoke):
-                    value = parameter.group("value")
-                    try:
-                        arguments[parameter.group("key")] = json.loads(value)
-                    except (json.JSONDecodeError, ValueError):
-                        arguments[parameter.group("key")] = value
-                name = name_match.group(1) if name_match else None
-                tool_calls.append(
-                    ParsedToolCall(
-                        raw=invoke,
-                        name=name,
-                        arguments=arguments,
-                        status=(
-                            ToolCallParseStatus.OK
-                            if name
-                            else ToolCallParseStatus.MISSING_NAME
-                        ),
-                    )
-                )
-        # The reasoning parser removes Muse channel framing and tool-channel
-        # bodies after tool extraction. Keep the original token ids here so it
-        # can still see every channel boundary.
-        return ids, tool_calls
-
-
-class MuseGlimmerReasoningParser:
-    """Split Muse ``to=self`` reasoning from ``to=user`` final content."""
-
-    def __init__(self, tokenizer):
-        self._tokenizer = tokenizer
-
-    def extract(self, text: str) -> tuple[str | None, str]:
-        messages = list(_iter_muse_messages(text))
-        if not messages:
-            return None, text
-        reasoning_parts: list[str] = []
-        content_parts: list[str] = []
-        for recipient, body, _closed in messages:
-            if recipient == "self":
-                reasoning_parts.append(body)
-            elif recipient in (None, "user"):
-                content_parts.append(body)
-        reasoning = "\n".join(part for part in reasoning_parts if part)
-        return (reasoning or None), "".join(content_parts)
 
 
 @dataclass
@@ -1411,7 +1314,6 @@ def load_tokenizer(model_name_or_path: str):
 def _populate_registry():
     if RENDERER_REGISTRY:
         return
-    from renderers import parsers
     from renderers.deepseek_r1 import DeepSeekR1Renderer
     from renderers.deepseek_v3 import DeepSeekV3Renderer
     from renderers.default import DefaultRenderer
@@ -1430,13 +1332,6 @@ def _populate_registry():
     from renderers.qwen3_vl import Qwen3VLRenderer
     from renderers.qwen35 import Qwen35Renderer
     from renderers.qwen36 import Qwen36Renderer
-
-    # Muse Glimmer uses the default renderer with its native ATEM channel
-    # syntax. Register these local parsers before DefaultRenderer is created.
-    parsers.TOOL_PARSERS.setdefault("muse_glimmer", MuseGlimmerToolParser)
-    parsers.REASONING_PARSERS.setdefault(
-        "muse_glimmer", MuseGlimmerReasoningParser
-    )
 
     RENDERER_REGISTRY.update(
         {

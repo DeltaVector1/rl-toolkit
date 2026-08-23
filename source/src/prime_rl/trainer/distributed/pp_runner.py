@@ -10,10 +10,6 @@ Design notes, because the obvious approaches do not fit this trainer:
   micro-batch order, so an index is enough. Activation checkpointing recomputes
   inside layers, not at stage granularity, so it does not disturb that order.
 
-* Ring-attention boundaries are process-global. Each stage refreshes them before
-  a microbatch forward, and each activation checkpoint captures those values so
-  backward recompute cannot observe a later microbatch's boundaries.
-
 * ``torch.distributed.pipelining`` wants ``loss_fn(output, target)`` on the last
   stage and chunks ``target`` for you. This RL loss takes about eight per-token
   tensors plus variable-length ``sequence_lengths`` splits, which does not fit
@@ -21,6 +17,7 @@ Design notes, because the obvious approaches do not fit this trainer:
   forward from its side inputs and returns it, and ``loss_fn`` is the identity.
 """
 
+import os
 from typing import Any, Callable
 
 import torch
@@ -56,9 +53,8 @@ class PipelineStageModule(nn.Module):
         loss_closure: Callable[[Any, dict], torch.Tensor] | None = None,
         offload_cfg=None,
         transfer_sparse_indices: bool = False,
-        cp_group=None,
-        cp_style: str = "ring",
-        cp_world_size: int = 1,
+        receive_sparse_indices: bool | None = None,
+        send_sparse_indices: bool | None = None,
     ):
         super().__init__()
         self.model = model
@@ -72,11 +68,47 @@ class PipelineStageModule(nn.Module):
         # each get drained by their own backward, so interleaving is irrelevant.
         self.offload_cfg = offload_cfg
         self.transfer_sparse_indices = transfer_sparse_indices
-        self.cp_group = cp_group
-        self.cp_style = cp_style
-        self.cp_world_size = cp_world_size
+        self.receive_sparse_indices = (
+            transfer_sparse_indices
+            if receive_sparse_indices is None
+            else receive_sparse_indices
+        )
+        self.send_sparse_indices = (
+            transfer_sparse_indices if send_sparse_indices is None else send_sparse_indices
+        )
+        self.profile_stage = os.environ.get("PRIME_PROFILE_PP_STAGE") == "1"
+        self._forward_events = []
+        self._backward_events = []
+        if self.profile_stage:
+            self.register_full_backward_pre_hook(self._record_backward_start)
+            self.register_full_backward_hook(self._record_backward_end)
         self._side: list[dict] = []
         self._idx = 0
+
+    def _record_backward_start(self, _module, _grad_output) -> None:
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        self._backward_events.append([event, None])
+
+    def _record_backward_end(self, _module, _grad_input, _grad_output) -> None:
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        self._backward_events[-1][1] = event
+
+    def profile_times_ms(self, *, clear: bool = False) -> tuple[float, float]:
+        if not self.profile_stage:
+            return 0.0, 0.0
+        torch.cuda.synchronize()
+        forward = sum(start.elapsed_time(end) for start, end in self._forward_events)
+        backward = sum(
+            start.elapsed_time(end)
+            for start, end in self._backward_events
+            if end is not None
+        )
+        if clear:
+            self._forward_events.clear()
+            self._backward_events.clear()
+        return forward, backward
 
     def set_side_inputs(self, side: list[dict]) -> None:
         self._side = side
@@ -110,15 +142,24 @@ class PipelineStageModule(nn.Module):
     ):
         from prime_rl.utils.act_offloading import maybe_activation_offloading
 
+        start = None
+        if self.profile_stage:
+            start = torch.cuda.Event(enable_timing=True)
+            start.record()
         with maybe_activation_offloading(self.offload_cfg):
-            return self._forward_inner(x, sparse_indices_cache)
+            output = self._forward_inner(x, sparse_indices_cache)
+        if start is not None:
+            end = torch.cuda.Event(enable_timing=True)
+            end.record()
+            self._forward_events.append((start, end))
+        return output
 
     def _forward_inner(
         self,
         x: torch.Tensor,
         sparse_indices_cache: torch.Tensor | None = None,
     ):
-        if sparse_indices_cache is not None:
+        if sparse_indices_cache is not None and self.receive_sparse_indices:
             # Send the unsigned 16-bit index bits through an FP16 tensor. NCCL
             # preserves these bits, including patterns which encode FP16 NaN.
             # SparseCachePipelineStage keeps this discrete input out of the
@@ -131,20 +172,9 @@ class PipelineStageModule(nn.Module):
                 .to(torch.int32)
                 .bitwise_and_(0xFFFF)
             )
+        elif not self.receive_sparse_indices:
+            sparse_indices_cache = None
         side = self._next_side()
-        if self.cp_group is not None:
-            # ring_flash_attn stores packed-sequence boundaries in global
-            # process state.  Preprocessing the next PP microbatch overwrites
-            # them, so refresh the current microbatch immediately before its
-            # forward.  position_ids is already CP-sharded here.
-            from prime_rl.utils.cp import setup_cp_attention_params_for_length
-
-            setup_cp_attention_params_for_length(
-                side["position_ids"].shape[-1] * self.cp_world_size,
-                self.cp_group,
-                seq_lens=side["seq_lens"],
-                cp_style=self.cp_style,
-            )
         kwargs = dict(
             position_ids=side["position_ids"],
             routed_experts=side.get("routed_experts"),
@@ -183,6 +213,9 @@ class PipelineStageModule(nn.Module):
         )
         if not self.transfer_sparse_indices:
             return out.last_hidden_state
+        if not self.send_sparse_indices:
+            placeholder = torch.zeros(1, dtype=torch.float16, device=out.last_hidden_state.device)
+            return out.last_hidden_state, placeholder
         if out.past_key_values is None:
             raise RuntimeError(
                 "pipeline sparse-index transfer was enabled, but the stage did not produce a cache"

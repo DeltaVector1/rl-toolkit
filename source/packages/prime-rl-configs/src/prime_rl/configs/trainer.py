@@ -2,19 +2,19 @@ import warnings
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypeAlias
 
-from pydantic import Field, model_validator
+from pydantic import Field, StrictBool, model_validator
 
 from prime_rl.configs.shared import (
     BaseModelConfig,
     EnvVars,
     FileMonitorConfig,
-    FileSystemTransportConfig,
     HeartbeatConfig,
     MetricsServerConfig,
     SwanlabConfig,
     TrainerLogConfig,
     TransportConfig,
     WandbConfig,
+    ZMQTransportConfig,
 )
 from prime_rl.utils.config import BaseConfig
 
@@ -36,8 +36,9 @@ class ActivationCheckpointConfig(BaseConfig):
         "reentrant_block",
         "reentrant_attention",
         "reentrant_attention_shared_expert",
+        "reentrant_attention_all_experts",
     ] = "full"
-    """Activation checkpoint implementation. ``full`` uses the ordinary non-reentrant whole-block wrapper. ``reentrant_block`` recomputes a complete decoder block after its FSDP pre-backward hook has restored sharded parameters. ``reentrant_attention`` uses the same safe ordering for attention only and keeps MLP activations eager. ``reentrant_attention_shared_expert`` also recomputes only the shared-expert branch; routed experts and their all-to-all remain eager. Use a reentrant mode for native-FP8 attention with ``reshard_after_forward``. ``selective`` checkpoints only the subcomponents listed in ``targets`` inside supported custom decoder layers."""
+    """Activation checkpoint implementation. ``full`` uses the ordinary non-reentrant whole-block wrapper. ``reentrant_block`` recomputes a complete decoder block after its FSDP pre-backward hook has restored sharded parameters. ``reentrant_attention`` uses the same safe ordering for attention only and keeps MLP activations eager. Use a reentrant mode for native-FP8 attention with ``reshard_after_forward``. ``selective`` checkpoints only the subcomponents listed in ``targets`` inside supported custom decoder layers."""
 
     freq: int = Field(1, ge=1)
     """Apply activation checkpointing to every N layers."""
@@ -145,20 +146,10 @@ class FP8Config(BaseConfig):
     enable_grouped_gemm: bool = True
     dequantize_checkpoint: bool = False
     """Load all serialized block-FP8 weights as BF16."""
-    dequantize_checkpoint_linears: bool = False
-    """Diagnostic: dequantize dense/attention FP8 matrices, but keep MoE FP8."""
-    dequantize_checkpoint_moe: bool = False
-    """Diagnostic: dequantize all routed/shared MoE matrices."""
-    dequantize_checkpoint_routed_moe: bool = False
-    """Diagnostic: dequantize routed-expert matrices only."""
-    dequantize_checkpoint_shared_moe: bool = False
-    """Diagnostic: dequantize shared-expert matrices only."""
     diagnose_linear_backward: bool = False
-    """Report the first nonfinite native-FP8 linear backward for each shape."""
+    """Report non-finite native-FP8 linear backward values with module-FQN attribution."""
     expert_activation_transport: Literal["bf16", "int4"] = "bf16"
-    """Expert-parallel activation transport. ``int4`` keeps checkpoint weights
-    in FP8, quantizes only forward all-to-all payloads to INT4, and sends
-    backward payloads in FP8."""
+    """Precision used for expert-parallel activation transport."""
     ignore_patterns: list[str] = _DEFAULT_FP8_IGNORE_PATTERNS
 
 
@@ -170,11 +161,7 @@ class MXFP8Config(BaseConfig):
     ignore_patterns: list[str] = _DEFAULT_FP8_IGNORE_PATTERNS
 
 
-class MXFP4Config(BaseConfig):
-    type: Literal["mxfp4"] = "mxfp4"
-
-
-QuantizationConfig: TypeAlias = Annotated[FP8Config | MXFP8Config | MXFP4Config, Field(discriminator="type")]
+QuantizationConfig: TypeAlias = Annotated[FP8Config | MXFP8Config, Field(discriminator="type")]
 
 
 class ModelConfig(BaseModelConfig):
@@ -205,8 +192,11 @@ class ModelConfig(BaseModelConfig):
     optim_cpu_offload: bool = True
     """Offload only optimizer states (momentum, variance) to CPU, keeping weights on GPU. Avoids the H2D all-gather overhead of FSDP CPU offload while still saving GPU memory."""
 
-    reshard_after_forward: bool = True
-    """Reshard the model after each forward pass."""
+    reshard_after_forward: StrictBool | Literal[4] = True
+    """Reshard after forward. Four keeps each block sharded across four ranks until backward."""
+
+    native_fp8_expert_prefetch: bool = False
+    """Prefetch native-FP8 expert parameters before expert compute."""
 
     dp_replicate: int = 1
     """Data parallel dim where model weights are replicated."""
@@ -563,18 +553,31 @@ class FakeDataLoaderConfig(BaseConfig):
     """Use a CE-only objective so trainer stress tests do real backward work."""
 
     reference_path: Path | None = None
-    """Use deterministic token IDs and aligned HF log probabilities from this JSON file."""
+    """Use deterministic token IDs and aligned reference log probabilities from this JSON file."""
+
+    export_final_adapter: bool = False
+    """Write the final LoRA adapter for an inference qualification."""
 
 
 class RolloutCacheConfig(BaseConfig):
     mode: Literal["record", "replay"]
-    """Record one real rollout batch, or replay a recorded batch."""
-
     directory: Path
-    """Directory that holds one cache file for each trainer rank."""
-
     policy_id: str = Field(min_length=1)
-    """Exact policy name used to make the recorded rollouts."""
+    repeats: int = Field(1, ge=1, le=256)
+    combine_partial_batches: bool = False
+    recorded_cp_size: int | None = Field(None, ge=1)
+
+    @model_validator(mode="after")
+    def repeats_apply_to_replay_only(self):
+        if self.mode == "record" and self.repeats != 1:
+            raise ValueError("rollout cache record mode requires repeats=1")
+        if self.mode == "record" and self.combine_partial_batches:
+            raise ValueError(
+                "rollout cache record mode cannot combine partial batches"
+            )
+        if self.mode == "record" and self.recorded_cp_size is not None:
+            raise ValueError("rollout cache record mode cannot change the recorded topology")
+        return self
 
 
 class DataLoaderConfig(BaseConfig):
@@ -582,7 +585,6 @@ class DataLoaderConfig(BaseConfig):
     """Use a fake data loader sampling random micro-batches (for debugging)."""
 
     rollout_cache: RolloutCacheConfig | None = None
-    """Record or replay one real rollout batch for trainer qualification."""
 
     @model_validator(mode="after")
     def choose_one_debug_source(self):
@@ -593,13 +595,13 @@ class DataLoaderConfig(BaseConfig):
 
 class ParityGuardConfig(BaseConfig):
     max_unmasked_mismatch_kl: float = Field(0.1, ge=0)
-    """Reject the step before optimizer update when retained-token mismatch exceeds this value."""
+    """Reject the step when retained-token mismatch exceeds this value."""
 
     max_masked_mismatch_kl: float = Field(0.5, ge=0)
-    """Reject the step before optimizer update when masked-token mismatch exceeds this value."""
+    """Reject the step when masked-token mismatch exceeds this value."""
 
     max_masked_fraction: float = Field(0.06, ge=0, le=1)
-    """Reject the step before optimizer update when DPPO masks more than this token fraction."""
+    """Reject the step when DPPO masks more than this token fraction."""
 
 
 class BaseWeightBroadcastConfig(BaseConfig):
@@ -665,7 +667,7 @@ class TrainerConfig(BaseConfig):
     data: DataLoaderConfig = DataLoaderConfig()
 
     parity_guard: ParityGuardConfig | None = None
-    """Optional fail-closed trainer-to-inference parity limits for RL batches."""
+    """Optional fail-closed trainer-to-inference parity limits."""
 
     loss: LossConfig = DefaultLossConfig()
     """Loss config for the rl loss component (see ``setup_rl_loss_fn``). The ce / ref_kl components are fixed and do not read this."""
@@ -680,7 +682,7 @@ class TrainerConfig(BaseConfig):
     weight_broadcast: WeightBroadcastConfig = FileSystemWeightBroadcastConfig()
     """Transport used to broadcast updated weights from trainer to inference."""
 
-    rollout_transport: TransportConfig = FileSystemTransportConfig()
+    rollout_transport: TransportConfig = ZMQTransportConfig()
     """Transport used to ship rollouts from orchestrator to trainer."""
 
     log: TrainerLogConfig = TrainerLogConfig()
@@ -853,5 +855,11 @@ class TrainerConfig(BaseConfig):
     def router_replay_only_with_custom_impl(self):
         if self.enable_router_replay and self.model.impl not in ("custom", "auto"):
             raise ValueError("Router replay is only supported with the custom implementation or auto mode")
+
+        if self.enable_router_replay and self.data.fake is not None:
+            raise ValueError(
+                "Router replay requires route IDs and weights from inference; "
+                "the fake data loader does not provide them"
+            )
 
         return self

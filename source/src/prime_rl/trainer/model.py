@@ -1,3 +1,5 @@
+# ruff: noqa: F722, F821
+
 import logging
 import os
 import time
@@ -31,7 +33,6 @@ from prime_rl.configs.trainer import (
     CompileConfig,
     FP8Config,
     ModelConfig,
-    MXFP4Config,
     MXFP8Config,
     TokenizerConfig,
 )
@@ -39,6 +40,7 @@ from prime_rl.trainer.distributed import DeepEPExpertParallel, MXFP8AllToAllExpe
 from prime_rl.trainer.distributed.expert_parallel import (
     NativeFP8LoRAAllToAllExpertParallel,
 )
+from prime_rl.trainer.distributed.partial_reshard import set_partial_reshard_mesh
 from prime_rl.trainer.fp8_checkpoint import FP8CheckpointStorageReader
 from prime_rl.trainer.lora import apply_lora_to_model, freeze_all_except_lora_and_specified, strip_lora_from_state_dict
 from prime_rl.trainer.models import (
@@ -52,7 +54,7 @@ from prime_rl.trainer.models import (
 from prime_rl.trainer.models.glm_moe_dsa.sparse_mla_attention import Indexer
 from prime_rl.trainer.models.layers.checkpointing import (
     get_supported_targets,
-    ring_attention_checkpoint_context_fn,
+    set_reentrant_attention_all_experts_checkpointing,
     set_reentrant_attention_checkpointing,
     set_reentrant_attention_shared_expert_checkpointing,
     set_reentrant_block_checkpointing,
@@ -61,6 +63,8 @@ from prime_rl.trainer.models.layers.checkpointing import (
 )
 from prime_rl.trainer.models.layers.fp8_ada import (
     replace_linear as replace_linear_with_fp8_checkpoint,
+)
+from prime_rl.trainer.models.layers.fp8_ada import (
     set_diagnose_linear_backward,
 )
 from prime_rl.trainer.models.layers.fp8_linear import replace_linear_with_fp8_blockwise_linear
@@ -68,7 +72,6 @@ from prime_rl.trainer.models.layers.lm_head import inject_prime_lm_head
 from prime_rl.trainer.models.layers.moe import LatentMoE, MoE, TokenChoiceTopKRouter
 from prime_rl.trainer.models.layers.mxfp8_grouped_gemm import apply_mxfp8_moe_grouped_gemm
 from prime_rl.trainer.models.layers.mxfp8_linear import replace_linear_with_mxfp8_linear
-from prime_rl.trainer.mxfp4 import MXFP4HuggingFaceStorageReader
 from prime_rl.trainer.parallel_dims import ParallelDims
 from prime_rl.trainer.weights import (
     load_state_dict,
@@ -82,7 +85,6 @@ from prime_rl.utils.utils import format_time
 from prime_rl.utils.vlm import get_language_model, get_vision_encoder, is_vlm_architecture
 
 
-
 def iter_layers(layers):
     """Yield decoder layer modules from a ModuleList or the ModuleDict used under PP.
 
@@ -94,23 +96,6 @@ def iter_layers(layers):
     import torch.nn as _nn
 
     return layers.values() if isinstance(layers, _nn.ModuleDict) else layers
-
-
-def _uses_tied_word_embeddings(model: nn.Module) -> bool:
-    """Read weight tying from either a language model or a VLM config.
-
-    Some multimodal Transformers configs, including Muse Glimmer, do not
-    expose ``tie_word_embeddings`` on the outer config object even when the
-    source config JSON contains it.  Missing means untied, which is also the
-    safe behavior for a model with a separate output head.
-    """
-    config = getattr(model, "config", None)
-    if config is None:
-        return False
-    tied = getattr(config, "tie_word_embeddings", None)
-    if tied is None and hasattr(config, "get_text_config"):
-        tied = getattr(config.get_text_config(), "tie_word_embeddings", None)
-    return bool(tied) if tied is not None else False
 
 
 def pre_download_model(model_name: str) -> None:
@@ -642,18 +627,10 @@ def get_model(
         and checkpoint_quantization.get("weight_block_size") == [128, 128]
     )
     model_config.fp8_checkpoint = model_config.fp8_source_checkpoint and not config.quantization.dequantize_checkpoint
-    model_config.fp8_checkpoint_linears = model_config.fp8_checkpoint and not (
-        config.quantization.dequantize_checkpoint_linears
-    )
-    model_config.fp8_checkpoint_moe = model_config.fp8_checkpoint and not (
-        config.quantization.dequantize_checkpoint_moe
-    )
-    model_config.fp8_checkpoint_routed_moe = model_config.fp8_checkpoint_moe and not (
-        config.quantization.dequantize_checkpoint_routed_moe
-    )
-    model_config.fp8_checkpoint_shared_moe = model_config.fp8_checkpoint_moe and not (
-        config.quantization.dequantize_checkpoint_shared_moe
-    )
+    model_config.fp8_checkpoint_linears = model_config.fp8_checkpoint
+    model_config.fp8_checkpoint_moe = model_config.fp8_checkpoint
+    model_config.fp8_checkpoint_routed_moe = model_config.fp8_checkpoint
+    model_config.fp8_checkpoint_shared_moe = model_config.fp8_checkpoint
     model_config.fp8_checkpoint_dequantized = (
         model_config.fp8_source_checkpoint and config.quantization.dequantize_checkpoint
     )
@@ -662,7 +639,6 @@ def get_model(
         and config.quantization.enable_grouped_gemm
         and not model_config.fp8_source_checkpoint
     )
-    model_config.mxfp4 = isinstance(config.quantization, MXFP4Config)
 
     if config.index_cache is not None:
         model_config.use_index_cache = True
@@ -747,27 +723,11 @@ def get_model(
             f"but model.impl resolved to 'hf'. Set model.impl='custom' explicitly."
         )
 
-    # Muse Glimmer has no PrimeRL-native implementation, but its text stack is
-    # standard causal softmax attention.  The trainer's HF FlashAttention ring
-    # adapter supports both its full-attention and sliding-window layers.  Keep
-    # the general auto/HF refusal in place and allow only this measured path.
-    hf_cp_supported = (
-        getattr(model_config, "model_type", "") == "muse_glimmer"
-        and config.attn == "flash_attention_2"
-        and config.cp_style == "ring"
-    )
-    if (
-        config.cp > 1
-        and config.impl == "auto"
-        and impl_to_use != "custom"
-        and not hf_cp_supported
-    ):
+    if config.cp > 1 and config.impl == "auto" and impl_to_use != "custom":
         raise ValueError(
             "Context parallelism with model.impl='auto' requires a supported custom PrimeRL implementation, "
             "but this architecture resolved to model.impl='hf'."
         )
-    if config.cp > 1 and impl_to_use == "hf" and hf_cp_supported:
-        logger.info("Using supported Hugging Face ring context parallelism for Muse Glimmer")
 
     if config.vlm is not None and not (is_vlm_arch and custom_vlm_cls):
         raise ValueError(
@@ -852,22 +812,31 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
     cold_offload_policy: OffloadPolicy = (
         CPUOffloadPolicy(pin_memory=True) if config.cold_cpu_offload else offload_policy
     )
-    expert_offload_policy: OffloadPolicy = (
-        CPUOffloadPolicy(pin_memory=True)
-        if isinstance(config.quantization, MXFP4Config)
-        and os.environ.get("PRIME_RL_MXFP4_EXPERT_CPU_OFFLOAD") == "1"
-        else offload_policy
-    )
 
+    requested_reshard = config.reshard_after_forward
     fsdp_config = {
         "mp_policy": mp_policy,
         "offload_policy": offload_policy,
-        "reshard_after_forward": config.reshard_after_forward,
+        "reshard_after_forward": requested_reshard,
     }
-    packed_fsdp_config = {**fsdp_config, "mp_policy": MixedPrecisionPolicy()}
+    packed_fsdp_config = {
+        **fsdp_config,
+        "mp_policy": MixedPrecisionPolicy(),
+        "reshard_after_forward": True,
+    }
     native_fp8 = getattr(model.config, "fp8_checkpoint", False)
 
     hsdp_mesh = parallel_dims.get_mesh("hsdp")
+    partial_reshard_mesh: DeviceMesh | None = None
+    if type(requested_reshard) is int:
+        if native_fp8 is False:
+            raise ValueError("four-rank partial reshard requires native FP8 training")
+        partial_reshard_mesh = parallel_dims.get_partial_reshard_mesh(requested_reshard)
+        fsdp_config["reshard_after_forward"] = True
+        get_logger().info(
+            f"Keeping transformer-block parameters sharded across {requested_reshard} ranks until backward"
+        )
+    native_block_fsdp_config = {**packed_fsdp_config, "reshard_after_forward": True}
 
     dp_mod_ep_mesh: DeviceMesh | None = None
     if parallel_dims.ep_enabled:
@@ -893,11 +862,12 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
     for transformer_block in transformer_layers:
         block_mlp = getattr(transformer_block, "mlp", None)
         if isinstance(block_mlp, (MoE, LatentMoE)):
-            if isinstance(config.quantization, MXFP4Config) or native_fp8:
+            if native_fp8:
+                expert_mesh = dp_mod_ep_mesh if parallel_dims.ep_enabled else hsdp_mesh
                 fully_shard(
                     block_mlp.experts,
-                    mesh=dp_mod_ep_mesh if parallel_dims.ep_enabled else hsdp_mesh,
-                    **{**packed_fsdp_config, "offload_policy": expert_offload_policy},
+                    mesh=expert_mesh,
+                    **packed_fsdp_config,
                 )
                 if block_mlp.shared_expert is not None:
                     fully_shard(
@@ -905,6 +875,8 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
                         mesh=hsdp_mesh,
                         **{**packed_fsdp_config, "offload_policy": cold_offload_policy},
                     )
+                    if partial_reshard_mesh is not None:
+                        set_partial_reshard_mesh(block_mlp.shared_expert, partial_reshard_mesh)
             elif parallel_dims.ep_enabled:
                 fully_shard(block_mlp.experts, mesh=dp_mod_ep_mesh, **fsdp_config)
 
@@ -919,16 +891,18 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
                 mesh=hsdp_mesh,
                 mp_policy=MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32),
                 offload_policy=cold_offload_policy,
-                reshard_after_forward=config.reshard_after_forward,
+                reshard_after_forward=fsdp_config["reshard_after_forward"],
             )
 
         fully_shard(
             transformer_block,
             mesh=hsdp_mesh,
-            **(packed_fsdp_config if native_fp8 else fsdp_config),
+            **(native_block_fsdp_config if native_fp8 else fsdp_config),
         )
+        if partial_reshard_mesh is not None:
+            set_partial_reshard_mesh(transformer_block, partial_reshard_mesh)
 
-    shard_norm_and_lm_head = hasattr(model, "config") and not _uses_tied_word_embeddings(model)
+    shard_norm_and_lm_head = hasattr(model, "config") and not model.config.tie_word_embeddings
 
     if shard_norm_and_lm_head:
         # This optimization breaks weight tying.
@@ -965,7 +939,7 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
         mesh=hsdp_mesh,
         mp_policy=mp_policy,
         offload_policy=offload_policy,
-        reshard_after_forward=config.reshard_after_forward,
+        reshard_after_forward=fsdp_config["reshard_after_forward"],
     )
 
     if not parallel_dims.ep_enabled:
@@ -989,7 +963,10 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
                 prefetch_modules = [next_transformer_block]
                 if isinstance(next_mlp.router, FSDPModule):
                     prefetch_modules.append(next_mlp.router)
-                if not native_fp8:
+                if (
+                    isinstance(next_mlp.experts, FSDPModule)
+                    and (not native_fp8 or config.native_fp8_expert_prefetch)
+                ):
                     prefetch_modules.append(next_mlp.experts)
                 transformer_block.set_modules_to_forward_prefetch(prefetch_modules)
             else:
@@ -1013,7 +990,10 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
             prev_mlp = getattr(prev_transformer_block, "mlp", None)
             if prev_mlp is not None and isinstance(prev_mlp, (MoE, LatentMoE)):
                 prefetch_modules = [prev_transformer_block]
-                if not native_fp8:
+                if (
+                    isinstance(prev_mlp.experts, FSDPModule)
+                    and (not native_fp8 or config.native_fp8_expert_prefetch)
+                ):
                     prefetch_modules.append(prev_mlp.experts)
                 if isinstance(prev_mlp.router, FSDPModule):
                     prefetch_modules.append(prev_mlp.router)
@@ -1026,13 +1006,9 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
 
 
 def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
-    expert_cpu_offload = (
-        isinstance(config.quantization, MXFP4Config)
-        and os.environ.get("PRIME_RL_MXFP4_EXPERT_CPU_OFFLOAD") == "1"
-    )
-    device = "cpu" if config.fsdp_cpu_offload or config.cold_cpu_offload or expert_cpu_offload else "cuda"
+    device = "cpu" if config.fsdp_cpu_offload or config.cold_cpu_offload else "cuda"
     model.to_empty(device=device)
-    if (expert_cpu_offload or config.cold_cpu_offload) and not config.fsdp_cpu_offload:
+    if config.cold_cpu_offload and not config.fsdp_cpu_offload:
         for name, module in model.named_modules():
             cold = config.cold_cpu_offload and (
                 name.startswith("model.embed_tokens.")
@@ -1046,7 +1022,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
                 or ".mlp.shared_expert." in name
                 or name.endswith(".mlp.shared_expert")
             )
-            if not cold and not (expert_cpu_offload and ".experts" in name):
+            if not cold:
                 module.to_empty(device="cuda", recurse=False)
     torch.distributed.barrier()
 
@@ -1087,7 +1063,6 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
             snapshot_is_hf
             and not snapshot_is_prime
             and model.is_prime_state_dict(model_keys)
-            and not isinstance(config.quantization, MXFP4Config)
             and not getattr(model.config, "fp8_source_checkpoint", False)
         ):
             logger.warning(
@@ -1124,24 +1099,22 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
     load_dcp_start_time = time.perf_counter()
     state_dict = model.state_dict()
     state_dict = strip_lora_from_state_dict(state_dict)
-    if _uses_tied_word_embeddings(model):
+    if model.config.tie_word_embeddings:
         state_dict.pop("lm_head.weight")
     if getattr(model.config, "fp8_source_checkpoint", False):
         reader = FP8CheckpointStorageReader(
             path=snapshot_path.as_posix(),
             dequantize_all=getattr(model.config, "fp8_checkpoint_dequantized", False),
         )
-    elif isinstance(config.quantization, MXFP4Config):
-        reader = MXFP4HuggingFaceStorageReader(path=snapshot_path.as_posix())
     else:
         reader = HuggingFaceStorageReader(path=snapshot_path.as_posix())
     dcp_load(state_dict, storage_reader=reader)
     # Restore weight tying broken by to_empty() for HF models
-    if not isinstance(model, PreTrainedModelPrimeRL) and _uses_tied_word_embeddings(model):
+    if not isinstance(model, PreTrainedModelPrimeRL) and model.config.tie_word_embeddings:
         model.tie_weights()
     _init_buffers_post_meta()
 
-    _move_buffers_to_cuda(model, config, expert_cpu_offload)
+    _move_buffers_to_cuda(model, config)
 
     lora_modules = [m for m in model.modules() if hasattr(m, "_init_lora_parameters")]
     if lora_modules:
@@ -1194,33 +1167,12 @@ def can_reinit_empty_buffers(model: nn.Module):
     if set(buffer_names) == gemma3_buffers:
         return True
 
-    muse_glimmer_buffers = {
-        "model.vision_tower.rotary_emb.inv_freq",
-        "model.vision_tower.rotary_emb.original_inv_freq",
-        "model.language_model.rotary_emb.inv_freq",
-        "model.language_model.rotary_emb.original_inv_freq",
-    }
-    if set(buffer_names) == muse_glimmer_buffers:
-        return True
-
     get_logger().warning(f"Model cannot be loaded using meta device because of buffers: {buffer_names}")
     return False
 
 
 def fix_model_post_empty(model: nn.Module):
     buffer_names = [name for name, _ in model.named_buffers()]
-
-    def reinitialize_rotary(rotary_emb, prefix: str) -> None:
-        rope_init_fn = getattr(
-            rotary_emb, "rope_init_fn", rotary_emb.compute_default_rope_parameters
-        )
-        inv_freq, rotary_emb.attention_scaling = rope_init_fn(
-            rotary_emb.config, rotary_emb.inv_freq.device
-        )
-        rotary_emb.inv_freq.copy_(inv_freq)
-        if f"{prefix}.original_inv_freq" in buffer_names:
-            rotary_emb.original_inv_freq.copy_(inv_freq)
-
     # HF standard transformer model
     if "model.rotary_emb.inv_freq" in buffer_names:
         rotary_emb = model.model.rotary_emb
@@ -1250,16 +1202,6 @@ def fix_model_post_empty(model: nn.Module):
     if "model.embed_tokens.embed_scale" in buffer_names:
         embed_scale = model.config.hidden_size**0.5
         model.model.embed_tokens.embed_scale.fill_(embed_scale)
-    if "model.language_model.rotary_emb.inv_freq" in buffer_names:
-        reinitialize_rotary(
-            model.model.language_model.rotary_emb,
-            "model.language_model.rotary_emb",
-        )
-    if "model.vision_tower.rotary_emb.inv_freq" in buffer_names:
-        reinitialize_rotary(
-            model.model.vision_tower.rotary_emb,
-            "model.vision_tower.rotary_emb",
-        )
 
 
 def reshard_module(model: nn.Module):
@@ -1294,9 +1236,10 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
             set_reentrant_attention_checkpointing(transformer_block)
             full_layers += 1
         elif ac_config.mode == "reentrant_attention_shared_expert":
-            # Keep routed experts eager. Recompute only the shared-expert
-            # branch to release its saved activations during the 1F1B warmup.
             set_reentrant_attention_shared_expert_checkpointing(transformer_block)
+            full_layers += 1
+        elif ac_config.mode == "reentrant_attention_all_experts":
+            set_reentrant_attention_all_experts_checkpointing(transformer_block)
             full_layers += 1
         elif ac_config.mode == "selective" and supports_selective_activation_checkpointing(transformer_block):
             model_supported_targets.update(get_supported_targets(transformer_block))
@@ -1305,14 +1248,7 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
         else:
             if ac_config.mode == "selective":
                 fallback_layer_types.add(type(transformer_block).__name__)
-            transformer_block = checkpoint_wrapper(
-                transformer_block,
-                preserve_rng_state=False,
-                # ring_flash_attn keeps packed boundaries in process-global
-                # state. Pipeline 1F1B interleaves microbatches, so checkpoint
-                # recompute must restore the values from this invocation.
-                context_fn=ring_attention_checkpoint_context_fn,
-            )
+            transformer_block = checkpoint_wrapper(transformer_block, preserve_rng_state=False)
             full_layers += 1
 
         language_model.layers.register_module(layer_name, transformer_block)
@@ -1345,10 +1281,11 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
 def apply_compile(model: nn.Module, compile_config: CompileConfig):
     torch._dynamo.config.capture_scalar_outputs = True
     language_model = get_language_model(model)
-    for layer_id in range(len(language_model.layers)):
+    layers = list(iter_layers(language_model.layers))
+    for layer in layers:
         # Doing it in-place avoids mangled fqn which can break checkpoint loading
-        language_model.layers[layer_id].compile(fullgraph=compile_config.fullgraph)
-    get_logger().info(f"Compiled {len(language_model.layers)} layers (fullgraph={compile_config.fullgraph})")
+        layer.compile(fullgraph=compile_config.fullgraph)
+    get_logger().info(f"Compiled {len(layers)} layers (fullgraph={compile_config.fullgraph})")
 
 
 def apply_quantization(model: nn.Module, config: ModelConfig) -> None:
@@ -1375,8 +1312,6 @@ def apply_quantization(model: nn.Module, config: ModelConfig) -> None:
                     embed=config.fp8_embed_head,
                     lm_head=config.fp8_lm_head,
                 )
-            # A checkpoint-linear bisection keeps these modules as ordinary
-            # BF16 Linear layers. The storage reader dequantizes into them.
             return
         replace_linear_with_fp8_blockwise_linear(model, ignore_modules=quant.ignore_patterns)
     elif isinstance(quant, MXFP8Config):
@@ -1388,12 +1323,6 @@ def apply_quantization(model: nn.Module, config: ModelConfig) -> None:
         replace_linear_with_mxfp8_linear(model, recipe=quant.recipe, ignore_modules=quant.ignore_patterns)
         if quant.enable_grouped_gemm:
             apply_mxfp8_moe_grouped_gemm(model, recipe=quant.recipe)
-    elif isinstance(quant, MXFP4Config):
-        capability = torch.cuda.get_device_capability()
-        if capability < (8, 0):
-            raise ValueError(f"MXFP4 training requires SM80 or newer, but device is SM{capability[0]}{capability[1]}.")
-        if not any(getattr(module, "mxfp4", False) for module in model.modules()):
-            raise ValueError("MXFP4 training currently requires a custom model with packed MoE experts.")
 
 
 def apply_ep(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
@@ -1446,9 +1375,9 @@ def configure_trainable_parameters(model: nn.Module, config: ModelConfig) -> nn.
     return frozen_vision_encoder
 
 
-def _move_buffers_to_cuda(model: nn.Module, config: ModelConfig, force: bool = False) -> None:
+def _move_buffers_to_cuda(model: nn.Module, config: ModelConfig) -> None:
     """FSDP CPU offloading only manages parameters, not buffers. Move buffers to CUDA."""
-    if not config.fsdp_cpu_offload and not force:
+    if not config.fsdp_cpu_offload:
         return
     for _, buffer in model.named_buffers():
         if buffer.device.type == "cpu":
@@ -1617,7 +1546,7 @@ def setup_model(
             else:
                 fix_model_post_empty(model)
                 # Restore weight tying broken by to_empty() for HF models
-                if _uses_tied_word_embeddings(model):
+                if model.config.tie_word_embeddings:
                     model.tie_weights()
 
             _move_buffers_to_cuda(model, config)

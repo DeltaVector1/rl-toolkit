@@ -1,5 +1,4 @@
 import os
-import time
 import warnings
 from typing import Optional, Union
 
@@ -117,7 +116,6 @@ class GlmMoeDsaDecoderLayer(GradientCheckpointingLayer):
                 "fp8_checkpoint_shared_moe",
                 getattr(config, "fp8_checkpoint", False),
             ),
-            mxfp4=getattr(config, "mxfp4", False),
         )
         mlp_config = MLPConfig(
             hidden_size=config.hidden_size,
@@ -128,6 +126,7 @@ class GlmMoeDsaDecoderLayer(GradientCheckpointingLayer):
 
         if layer_idx >= config.first_k_dense_replace:
             self.mlp = MoE(moe_args, dim=config.hidden_size, hidden_dim=config.moe_intermediate_size)
+            self.mlp.router.parity_trace_layer = layer_idx
         else:
             self.mlp = MLP(mlp_config)
 
@@ -240,7 +239,6 @@ class GlmMoeDsaPreTrainedModel(PreTrainedModelPrimeRL):
 
     @classmethod
     def convert_adapter_to_hf(cls, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
-        """Rename the trainer's singular shared expert to the HF/vLLM name."""
         for old_key in list(state_dict):
             new_key = old_key.replace(".mlp.shared_expert.", ".mlp.shared_experts.")
             if new_key != old_key:
@@ -314,18 +312,19 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         routed_experts: Optional[torch.LongTensor] = None,
         sparse_indices_cache: Optional[torch.LongTensor] = None,
+        *,
         seq_lens: Optional[torch.LongTensor] = None,
         seq_lens_are_pre_shard: bool = False,
     ) -> BaseModelOutputWithPast:
         """
         routed_experts (`torch.LongTensor` of shape `(batch_size, sequence_length, num_hidden_layers, num_experts_per_tok)`, *optional*):
             Routed experts for each token in the sequence. Only used for router replay.
-        sparse_indices_cache (`torch.LongTensor` of shape `(batch_size, sequence_length, index_n_heads, index_topk)`, *optional*):
-            Sparse attention indices computed by an earlier pipeline stage.
-        seq_lens (`torch.LongTensor`, *optional*):
-            Packed sequence lengths supplied by the trainer.
-        seq_lens_are_pre_shard (`bool`, *optional*):
-            Whether `seq_lens` describes the sequence before context-parallel sharding.
+        sparse_indices_cache (`torch.LongTensor`, *optional*):
+            Sparse attention indices from the preceding pipeline stage.
+        seq_lens (`torch.LongTensor` of shape `(num_documents,)`, *optional*):
+            Per-document lengths of the packed row (PrimeRL packed-batch contract). Unused.
+        seq_lens_are_pre_shard (`bool`, *optional*, defaults to `False`):
+            Whether `seq_lens` holds pre-CP-shard (global) document boundaries. Unused.
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -461,10 +460,6 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
             else:
                 position_ids = torch.arange(input_ids.shape[1], device=input_ids.device).unsqueeze(0)
 
-        profile = dist.is_initialized() and dist.get_rank() == 0
-        if profile:
-            torch.cuda.synchronize()
-            phase_start = time.perf_counter()
         outputs: BaseModelOutputWithPast = self.model(
             input_ids=input_ids,
             position_ids=position_ids,
@@ -472,11 +467,6 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
             routed_experts=routed_experts,
             sparse_indices_cache=sparse_indices_cache,
         )
-        if profile:
-            torch.cuda.synchronize()
-            print(f"GLM body forward: {time.perf_counter() - phase_start:.2f}s", flush=True)
-            phase_start = time.perf_counter()
-
         hidden_states = outputs.last_hidden_state
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         output = self.lm_head(
@@ -484,9 +474,6 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
             labels[:, slice_indices] if labels is not None else None,
             temperature=temperature,
         )
-        if profile:
-            torch.cuda.synchronize()
-            print(f"GLM head forward: {time.perf_counter() - phase_start:.2f}s", flush=True)
         return output
 
     def init_buffers_post_meta(self):

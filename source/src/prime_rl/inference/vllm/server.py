@@ -1,9 +1,12 @@
 import asyncio
+import json
+import os
 from argparse import Namespace
+from pathlib import Path
 from typing import Any
 
 import uvloop
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 from starlette.datastructures import State
 from vllm.engine.protocol import EngineClient
@@ -16,22 +19,27 @@ from vllm.logger import init_logger
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from prime_rl.configs.inference import InferenceConfig
-from prime_rl.inference.vllm.worker.filesystem import (
-    adapter_cache_path,
-    stage_full_checkpoint_files,
-    stage_lora_adapter_files,
-)
-from prime_rl.utils.logger import get_logger
-
-logger = get_logger()
 from prime_rl.inference.patches import (
     monkey_patch_dp_coordinator_startup_timeout,
     monkey_patch_harmony_stop_token_propagation,
     monkey_patch_nano_v3_reasoning_parser,
     monkey_patch_strip_routed_experts_from_chat,
     monkey_patch_tokenize_params_validation,
-    monkey_patch_vllm_padded_input_scrub,
 )
+from prime_rl.inference.vllm.worker.filesystem import adapter_cache_path
+from prime_rl.parity_router_trace import (
+    TraceSession,
+    assemble_chunks,
+    clear_trace,
+    encoded_array,
+    read_h200_runtime_marker,
+    read_session,
+    trace_root,
+    write_session,
+)
+from prime_rl.utils.logger import get_logger
+
+logger = get_logger()
 
 # NOTE: Fix harmony stop token propagation for GPT-OSS models
 # Upstream issue still open: https://github.com/vllm-project/vllm/issues/22519
@@ -42,9 +50,6 @@ monkey_patch_tokenize_params_validation()
 # NOTE: Register Nano V3 reasoning parser so configs can use
 # `reasoning_parser = "nano_v3"` without a vLLM plugin file.
 monkey_patch_nano_v3_reasoning_parser()
-# NOTE: Optional mitigation for vLLM padded decode inputs until the native fix
-# is available in our pinned runtime.
-monkey_patch_vllm_padded_input_scrub()
 # NOTE: routed_experts are consumed only via the serialized /generate path (router
 # replay). The chat-completions path encodes them as a base64 np.save string the PD
 # router cannot merge, which fails eval rollouts (they use chat completions). Strip
@@ -71,6 +76,13 @@ def models(request: Request) -> OpenAIServingModels:
     return request.app.state.openai_serving_models
 
 
+def parity_trace_root() -> Path:
+    root = trace_root()
+    if root is None:
+        raise HTTPException(status_code=404, detail="parity router trace is disabled")
+    return root
+
+
 WORKER_EXTENSION_CLS = {
     "nccl": "prime_rl.inference.vllm.worker.nccl.NCCLWeightUpdateWorker",
     "filesystem": "prime_rl.inference.vllm.worker.filesystem.FileSystemWeightUpdateWorker",
@@ -80,12 +92,8 @@ WORKER_EXTENSION_CLS = {
 
 @router.post("/pause")
 async def pause(request: Request):
-    mode = request.query_params.get("mode", "abort")
-    if mode not in ("abort", "keep"):
-        return JSONResponse({"error": f"unsupported pause mode: {mode}"}, status_code=400)
-    clear_cache = request.query_params.get("clear_cache", "true").lower() == "true"
-    logger.debug(f"Received /pause request (mode={mode}, clear_cache={clear_cache})")
-    await engine_client(request).pause_generation(mode=mode, clear_cache=clear_cache)
+    logger.debug("Received /pause request (mode=keep, clear_cache=False)")
+    await engine_client(request).pause_generation(mode="keep", clear_cache=False)
     return {"status": "paused"}
 
 
@@ -106,6 +114,10 @@ async def update_weights(request: Request):
 async def load_lora_adapter(lora_request: LoadLoRAAdapterRequest, raw_request: Request):
     """Stage remote adapters and serialize loads so retries cannot overlap."""
     async with lora_load_lock:
+        if os.environ.get("PRIME_MOE_LORA_FORMAT") == "2d":
+            if not hasattr(lora_request, "is_3d_lora_weight"):
+                raise RuntimeError("this vLLM version cannot load per-expert LoRA weights")
+            lora_request.is_3d_lora_weight = False
         handler = models(raw_request)
         if lora_request.lora_path.startswith(("http://", "https://")):
             source_url = lora_request.lora_path
@@ -121,28 +133,6 @@ async def load_lora_adapter(lora_request: LoadLoRAAdapterRequest, raw_request: R
         return {"status": "ok"}
 
 
-@router.post("/stage_lora_adapter")
-async def stage_lora_adapter(raw_request: Request):
-    """Prefetch a remote adapter without pausing or calling engine workers."""
-    data = await raw_request.json()
-    source_url = data.get("lora_path")
-    if not isinstance(source_url, str) or not source_url.startswith(("http://", "https://")):
-        return JSONResponse({"error": "lora_path must be an HTTP URL"}, status_code=400)
-    destination = await asyncio.to_thread(stage_lora_adapter_files, source_url)
-    return {"status": "ok", "path": destination.as_posix()}
-
-
-@router.post("/stage_full_checkpoint")
-async def stage_full_checkpoint(raw_request: Request):
-    """Prefetch a remote full checkpoint while generation continues."""
-    data = await raw_request.json()
-    source_url = data.get("checkpoint_url")
-    if not isinstance(source_url, str) or not source_url.startswith(("http://", "https://")):
-        return JSONResponse({"error": "checkpoint_url must be an HTTP URL"}, status_code=400)
-    destination = await asyncio.to_thread(stage_full_checkpoint_files, source_url)
-    return {"status": "ok", "path": destination.as_posix()}
-
-
 @router.get("/liveness")
 async def liveness(raw_request: Request):
     """Check that the engine event loop can service a no-op worker RPC."""
@@ -154,6 +144,42 @@ async def liveness(raw_request: Request):
     except asyncio.TimeoutError:
         return JSONResponse({"status": "engine_unresponsive"}, status_code=503)
     return {"status": "ok"}
+
+
+@router.post("/parity/router-trace/reset")
+async def reset_parity_router_trace(request: Request):
+    root = parity_trace_root()
+    data = await request.json()
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="router trace session must be an object")
+    try:
+        session = TraceSession.from_dict(data)
+        if session.side != "h200":
+            raise ValueError("H200 router trace session side must be h200")
+        clear_trace(root)
+        write_session(root, session)
+    except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return session.as_dict()
+
+
+@router.get("/parity/router-trace")
+async def get_parity_router_trace():
+    root = parity_trace_root()
+    try:
+        session = read_session(root)
+        if session.side != "h200":
+            raise ValueError("H200 router trace session side must be h200")
+        runtime_marker = read_h200_runtime_marker(root, session)
+        ids, weights = assemble_chunks(root, session)
+    except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return {
+        "session": session.as_dict(),
+        "router_ids": encoded_array(ids),
+        "router_weights": encoded_array(weights),
+        "runtime_marker": runtime_marker,
+    }
 
 
 @router.post("/init_broadcaster")
@@ -203,10 +229,10 @@ async def custom_init_app_state(
         state.serving_tokens = prime_serving
 
 
-import vllm.entrypoints.openai.api_server
-import vllm.v1.utils
-from vllm.entrypoints.openai.api_server import build_app as _original_build_app
-from vllm.v1.utils import run_api_server_worker_proc as _original_run_api_server_worker_proc
+import vllm.entrypoints.openai.api_server  # noqa: E402
+import vllm.v1.utils  # noqa: E402
+from vllm.entrypoints.openai.api_server import build_app as _original_build_app  # noqa: E402
+from vllm.v1.utils import run_api_server_worker_proc as _original_run_api_server_worker_proc  # noqa: E402
 
 
 def custom_build_app(args: Namespace, supported_tasks: tuple, model_config=None):
@@ -237,23 +263,25 @@ vllm.v1.utils.run_api_server_worker_proc = custom_run_api_server_worker_proc
 # Only difference we do some config translation (i.e. pass populated namespace
 # to `parse_args`) and additional arg validation
 def server(config: InferenceConfig, vllm_extra: dict[str, Any] | None = None):
-    import os
-
     from vllm.entrypoints.cli.serve import run_headless, run_multi_api_server
     from vllm.entrypoints.openai.api_server import run_server
 
-    # Shared-expert LoRA uses ordinary linear layers. Keep the fused routed-MoE
-    # kernels in their non-LoRA mode unless the target is the routed `experts`
-    # module itself. A substring check incorrectly classified `shared_experts`.
     routed_moe_lora = any(
-        "experts" in target.split(".") for target in (config.lora_target_modules or [])
+        "experts" in target.split(".")
+        for target in (config.lora_target_modules or [])
     )
     if config.lora_target_modules and not routed_moe_lora:
         os.environ["PRIME_NO_MOE_LORA"] = "1"
     else:
         os.environ.pop("PRIME_NO_MOE_LORA", None)
+    if routed_moe_lora:
+        os.environ["PRIME_MOE_LORA_FORMAT"] = "2d"
+    else:
+        os.environ.pop("PRIME_MOE_LORA_FORMAT", None)
 
     namespace = config.to_vllm()
+    if routed_moe_lora:
+        namespace.enable_mixed_moe_lora_format = True
     if vllm_extra:
         for key, value in vllm_extra.items():
             setattr(namespace, key, value)

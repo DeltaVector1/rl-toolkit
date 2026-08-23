@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-image=prime-rl:glm52-fp8
-deployment=/data/glm52-rl/deployment
+image=${prime_image:-prime-rl:glm52-v080-qual}
+deployment=${prime_deployment:-/data/glm52-rl/deployment-glm52-optims}
+trainer_container=${prime_trainer_container:-glm52-optims-trainer}
+orchestrator_container=${prime_orchestrator_container:-glm52-optims-orchestrator}
+nccl_channels=${PRIME_NCCL_CHANNELS:-4}
+profile_pp_stage=${PRIME_PROFILE_PP_STAGE:-0}
+profile_pp_rank=${PRIME_PROFILE_PP_RANK:--1}
 # RUN selects which config pair under configs/china to use and where logs land.
 # Defaults keep the historical r33 layout.
 RUN=${RUN:-r33}
@@ -11,6 +16,7 @@ config=$deployment/configs/china
 orchestrator_config=${ORCHESTRATOR_CONFIG_DIR:-$config}
 # CONFIG_TAG picks configs/china/trainer${CONFIG_TAG}.toml (e.g. ".r34")
 CONFIG_TAG=${CONFIG_TAG:-}
+trainer_config=${TRAINER_CONFIG:-$config/trainer${CONFIG_TAG}.toml}
 run_dir=/data/glm52-rl/runs/$RUN/$run_name
 node=${NODE_ID:-$(ip -4 -o addr show vlan130 | awk '{split($4, a, /[.\/]/); print a[4]}')}
 
@@ -44,8 +50,8 @@ common=(
   -e NCCL_CUMEM_HOST_ENABLE=0
   # Four channels measured substantially faster than two. One hangs and must
   # never be used.
-  -e NCCL_MIN_NCHANNELS=4
-  -e NCCL_MAX_NCHANNELS=4
+  -e NCCL_MIN_NCHANNELS="$nccl_channels"
+  -e NCCL_MAX_NCHANNELS="$nccl_channels"
   -e TORCH_NCCL_TRACE_BUFFER_SIZE=1048576
   -e TORCH_NCCL_DUMP_ON_TIMEOUT=1
   -e TORCH_NCCL_ASYNC_ERROR_HANDLING=1
@@ -82,40 +88,67 @@ if [ -n "${MUSE_PYTHON_OVERRIDE_DIR:-}" ]; then
   )
 fi
 
+verifiers_mount=()
+if [ -n "${VERIFIERS_OVERRIDE_DIR:-}" ]; then
+  test -d "$VERIFIERS_OVERRIDE_DIR/verifiers/v1/configs" || {
+    echo "VERIFIERS_OVERRIDE_DIR must contain verifiers/v1/configs/" >&2
+    exit 1
+  }
+  verifiers_mount=(
+    -v "$VERIFIERS_OVERRIDE_DIR/verifiers":/app/deps/verifiers/verifiers:ro
+  )
+fi
+
+prime_configs_mount=(
+  -v "$deployment/source/packages/prime-rl-configs/src/prime_rl/configs/trainer.py":/app/packages/prime-rl-configs/src/prime_rl/configs/trainer.py:ro
+)
+if [ -n "${PRIME_CONFIGS_OVERRIDE_DIR:-}" ]; then
+  test -f "$PRIME_CONFIGS_OVERRIDE_DIR/configs/trainer.py" || {
+    echo "PRIME_CONFIGS_OVERRIDE_DIR must contain configs/trainer.py" >&2
+    exit 1
+  }
+  prime_configs_mount=(
+    -v "$PRIME_CONFIGS_OVERRIDE_DIR/configs":/app/packages/prime-rl-configs/src/prime_rl/configs:ro
+  )
+fi
+
 case ${1:-} in
   trainer)
     # TRAINER_NODES lists the participating nodes in rank order; a node's rank
     # is its position in that list. Set it to drop a node from the job -- e.g.
     # with n81 down, TRAINER_NODES="82 76 77 78 80 83 84" gives a 7-node,
     # 56-rank job. NNODES follows automatically.
-    TRAINER_NODES=${TRAINER_NODES:-"82 76 77 78 80 83 84 85"}   # n85 = stage 7 (ex-judge); n81 still down
+    trainer_nodes=${trainer_nodes:-${TRAINER_NODES:-"82 76 77 78 80 83 84 85"}}   # n85 = stage 7 (ex-judge); n81 still down
     rank=-1
     idx=0
-    for n in $TRAINER_NODES; do
+    for n in $trainer_nodes; do
       if [ "$n" = "$node" ]; then rank=$idx; fi
       idx=$((idx + 1))
     done
     nnodes=$idx
     if [ "$rank" -lt 0 ]; then
-      echo "node $node is not in TRAINER_NODES ($TRAINER_NODES)" >&2; exit 1
+      echo "node $node is not in trainer_nodes ($trainer_nodes)" >&2; exit 1
     fi
-    read -r rollout_transport trainer_output fake_data < <(
-      python3 - "$config/trainer${CONFIG_TAG}.toml" <<'PY'
+    read -r rollout_transport trainer_output trainer_only < <(
+      python3 - "$trainer_config" <<'PY'
 import sys
 import tomllib
 
 with open(sys.argv[1], "rb") as f:
     config = tomllib.load(f)
+data = config.get("data", {})
+cache = data.get("rollout_cache", {})
+trainer_only = "fake" in data or cache.get("mode") == "replay"
 print(
     config["rollout_transport"]["type"],
     config["output_dir"],
-    int("fake" in config.get("data", {})),
+    int(trainer_only),
 )
 PY
     )
     sudo install -d -o 1000 -g 1000 -m 0755 "$trainer_output"
     if [ "$rank" -eq 0 ]; then
-      if [ "$rollout_transport" = filesystem ] && [ "$fake_data" = 0 ]; then
+      if [ "$rollout_transport" = filesystem ] && [ "$trainer_only" = 0 ]; then
         sync_log="/data/glm52-rl/microbatch-sync-$RUN.log"
         nohup setsid env RUN_DIR="$trainer_output" \
           "$deployment/scripts/china/sync_microbatches.sh" \
@@ -142,11 +175,11 @@ PY
     # nccl shm segments leak on every trainer crash (~33MB each, observed
     # 1500+ per node = 50GB+); the container was just removed, so purge.
     sudo rm -f /dev/shm/nccl-* 2>/dev/null || true
-    sudo docker rm -f glm52-decensor-trainer >/dev/null 2>&1 || true
+    sudo docker rm -f "$trainer_container" >/dev/null 2>&1 || true
     # Keep the optional checkpoint cache disabled. It is not selected by the
     # current dequantized, node-local EP path, but its single slot per layer is
     # not safe for multiple 1F1B micro-batches.
-    sudo docker run -d --name glm52-decensor-trainer \
+    sudo docker run -d --name "$trainer_container" \
       --gpus all "${common[@]}" \
       -v /data/glm52-rl/cache/torchinductor:/tmp/torchinductor_appuser \
       -v /data/glm52-rl/cache/tilelang:/home/appuser/.tilelang \
@@ -154,7 +187,10 @@ PY
       -v /data/glm52-rl/cache/tmp:/scratch-tmp \
       "${transformers_mount[@]}" \
       "${python_dependency_mounts[@]}" \
+      "${verifiers_mount[@]}" \
+      "${prime_configs_mount[@]}" \
       -e TMPDIR=/scratch-tmp \
+      -e PYTHONPATH="$deployment/env":/app/packages/prime-rl-configs/src:/app/src \
       -v "$deployment/source/src/prime_rl/trainer/fp8_checkpoint.py":/app/src/prime_rl/trainer/fp8_checkpoint.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/model.py":/app/src/prime_rl/trainer/model.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/models/layers/fp8_ada.py":/app/src/prime_rl/trainer/models/layers/fp8_ada.py:ro \
@@ -164,11 +200,16 @@ PY
       -v "$deployment/source/src/prime_rl/trainer/models/layers/hf_ring_attn.py":/app/src/prime_rl/trainer/models/layers/hf_ring_attn.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/models/layers/lm_head_gemma.py":/app/src/prime_rl/trainer/models/layers/lm_head_gemma.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/distributed/expert_parallel.py":/app/src/prime_rl/trainer/distributed/expert_parallel.py:ro \
+      -v "$deployment/source/src/prime_rl/trainer/distributed/partial_reshard.py":/app/src/prime_rl/trainer/distributed/partial_reshard.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/distributed/pipeline_parallel.py":/app/src/prime_rl/trainer/distributed/pipeline_parallel.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/distributed/pp_runner.py":/app/src/prime_rl/trainer/distributed/pp_runner.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/parallel_dims.py":/app/src/prime_rl/trainer/parallel_dims.py:ro \
       -v "$deployment/source/src/prime_rl/utils/cp.py":/app/src/prime_rl/utils/cp.py:ro \
+      -v "$deployment/source/src/prime_rl/utils/checkpoint_delta.py":/app/src/prime_rl/utils/checkpoint_delta.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/rl/train.py":/app/src/prime_rl/trainer/rl/train.py:ro \
+      -v "$deployment/source/src/prime_rl/trainer/rl/token_export.py":/app/src/prime_rl/trainer/rl/token_export.py:ro \
+      -v "$deployment/source/src/prime_rl/parity_router_trace.py":/app/src/prime_rl/parity_router_trace.py:ro \
+      -v "$deployment/source/src/prime_rl/trainer/runs.py":/app/src/prime_rl/trainer/runs.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/rl/data.py":/app/src/prime_rl/trainer/rl/data.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/weights.py":/app/src/prime_rl/trainer/weights.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/utils.py":/app/src/prime_rl/trainer/utils.py:ro \
@@ -182,12 +223,16 @@ PY
       -v "$deployment/source/src/prime_rl/trainer/models/kernels/sparse_mla_bwd.py":/app/src/prime_rl/trainer/models/kernels/sparse_mla_bwd.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/model.py":/app/src/prime_rl/trainer/model.py:ro \
       -v "$deployment/source/src/prime_rl/utils/vlm.py":/app/src/prime_rl/utils/vlm.py:ro \
-      -v "$deployment/source/packages/prime-rl-configs/src/prime_rl/configs/trainer.py":/app/packages/prime-rl-configs/src/prime_rl/configs/trainer.py:ro \
       --env-file /data/trinity/training.env \
       -e PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,garbage_collection_threshold:0.8}" \
       -e TORCHINDUCTOR_COMPILE_THREADS=8 \
       -e PRIME_EP_PROFILE="${PRIME_EP_PROFILE:-0}" \
       -e PRIME_EP_PROFILE_EVERY="${PRIME_EP_PROFILE_EVERY:-150}" \
+      -e PRIME_EXPERT_PROFILE_EVERY="${PRIME_EXPERT_PROFILE_EVERY:-90}" \
+      -e PRIME_BIND_GPU_NUMA="${PRIME_BIND_GPU_NUMA:-0}" \
+      -e PRIME_NCCL_CHANNELS="$nccl_channels" \
+      -e PRIME_PROFILE_PP_STAGE="$profile_pp_stage" \
+      -e PRIME_PROFILE_PP_RANK="$profile_pp_rank" \
       -e PRIME_EP_AC_CACHE="${PRIME_EP_AC_CACHE:-0}" \
       -e PRIME_INT4_COMBINE_ROUNDS="${PRIME_INT4_COMBINE_ROUNDS:-1}" \
       -e PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD="${PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD:-0}" \
@@ -206,9 +251,11 @@ PY
       --redirects=3 \
       --local-ranks-filter=0 \
       -m prime_rl.trainer.rl.train \
-      @ "$config/trainer${CONFIG_TAG}.toml"
+      @ "$trainer_config"
     ;;
   orchestrator)
+    echo "the isolated GLM branch runs its orchestrator on h200a; use scripts/h200/start_orchestrator.sh" >&2
+    exit 2
     test "$node" = 82 || { echo "the orchestrator runs on n82" >&2; exit 1; }
     orchestrator_output=$(
       python3 - "$orchestrator_config/orchestrator${CONFIG_TAG}.toml" <<'PY'
@@ -224,8 +271,8 @@ PY
     # must be writable by the container user.
     sudo install -d -o 1000 -g 1000 -m 0755 \
       "$(dirname "$orchestrator_output")" "$orchestrator_output"
-    sudo docker rm -f glm52-decensor-orchestrator >/dev/null 2>&1 || true
-    sudo docker run -d --name glm52-decensor-orchestrator \
+    sudo docker rm -f "$orchestrator_container" >/dev/null 2>&1 || true
+    sudo docker run -d --name "$orchestrator_container" \
       "${common[@]}" \
       --env-file /data/trinity/training.env \
       -e VLLM_API_KEY=unused \

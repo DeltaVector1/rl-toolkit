@@ -1,24 +1,24 @@
 enable_lora = true
 max_loras = 1
 max_cpu_loras = 2
-max_lora_rank = 128
+max_lora_rank = 32
 lora_target_modules = [
     "q_a_proj",
     "q_b_proj",
     "kv_a_proj_with_mqa",
+    "kv_b_proj",
     "o_proj",
     "gate_proj",
     "up_proj",
     "down_proj",
+    "shared_expert",
+    "experts",
 ]
 gpu_memory_utilization = 0.92
 enable_prefix_caching = true
-enable_expert_parallel = true
+enable_expert_parallel = false
 enable_eplb = false
-# x35 showed that route replay only reduced mismatch KL from 3.83 to 3.17.
-# Do not send the 624 route bytes per generated token in the x36 Triton-MoE
-# parity gate.
-enable_return_routed_experts = false
+enable_return_routed_experts = true
 api_server_count = 1
 
 [server]
@@ -30,7 +30,7 @@ liveness_timeout_seconds = 120.0
 level = "info"
 
 [model]
-name = "/data/glm52-rl/model-fp8"
+name = "/models/glm52-fp8"
 dtype = "bfloat16"
 max_model_len = 32768
 reasoning_parser = "glm45"

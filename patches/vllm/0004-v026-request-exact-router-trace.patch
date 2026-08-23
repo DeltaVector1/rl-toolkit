@@ -1,0 +1,160 @@
+diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
+index 5667482e9..3ba9d75e2 100644
+--- a/vllm/v1/core/sched/output.py
++++ b/vllm/v1/core/sched/output.py
+@@ -187,6 +187,19 @@ class ScheduledEncoderInputStats:
+     output_tokens: int = 0
+ 
+ 
++@dataclass(frozen=True)
++class RouterTracePacket:
++    enabled: bool
++    session_hash: bytes
++    request_id: bytes
++
++    def __post_init__(self) -> None:
++        if self.enabled is not True:
++            raise ValueError("router trace packet must be enabled")
++        if len(self.session_hash) != 32 or len(self.request_id) != 16:
++            raise ValueError("router trace packet identity has the wrong size")
++
++
+ @dataclass
+ class SchedulerOutput:
+     # list of the requests that are scheduled for the first time.
+@@ -259,6 +272,8 @@ class SchedulerOutput:
+     # Number of spec tokens to schedule for the next step.
+     num_spec_tokens_to_schedule: int = 0
+ 
++    prime_router_trace_packet: RouterTracePacket | None = None
++
+     @classmethod
+     def make_empty(cls) -> "SchedulerOutput":
+         return cls(
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index b77d01410..bf293b8ec 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -44,6 +44,7 @@ from vllm.v1.core.sched.output import (
+     CachedRequestData,
+     GrammarOutput,
+     NewRequestData,
++    RouterTracePacket,
+     ScheduledEncoderInputStats,
+     SchedulerOutput,
+ )
+@@ -1145,6 +1146,33 @@ class Scheduler(SchedulerInterface):
+                 scheduled_encoder_inputs
+             )
+ 
++        prime_router_trace_packet = None
++        traced_requests = []
++        for request_id in num_scheduled_tokens:
++            sampling_params = self.requests[request_id].sampling_params
++            extra_args = (
++                sampling_params.extra_args if sampling_params is not None else None
++            )
++            if extra_args and extra_args.get("prime_router_trace") is True:
++                traced_requests.append(extra_args)
++        if traced_requests:
++            if len(num_scheduled_tokens) != 1 or len(traced_requests) != 1:
++                raise ValueError("an exact router trace request must run alone")
++            session = traced_requests[0].get("prime_router_trace_session")
++            request = traced_requests[0].get("prime_router_trace_request")
++            try:
++                session_bytes = bytes.fromhex(session)
++                request_bytes = bytes.fromhex(request)
++            except (TypeError, ValueError) as error:
++                raise ValueError("exact router trace identity is invalid") from error
++            if len(session_bytes) != 32 or len(request_bytes) != 16:
++                raise ValueError("exact router trace identity is invalid")
++            prime_router_trace_packet = RouterTracePacket(
++                enabled=True,
++                session_hash=session_bytes,
++                request_id=request_bytes,
++            )
++
+         scheduler_output = SchedulerOutput(
+             scheduled_new_reqs=new_reqs_data,
+             scheduled_cached_reqs=cached_reqs_data,
+@@ -1164,6 +1192,7 @@ class Scheduler(SchedulerInterface):
+             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
+             kv_cache_block_copies=pending_kv_cache_block_copies,
+             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
++            prime_router_trace_packet=prime_router_trace_packet,
+         )
+ 
+         # NOTE(Kuntai): this function is designed for multiple purposes:
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index fe2a05b10..8c79334f6 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -3874,6 +3874,20 @@ class GPUModelRunner(
+             else force_uniform_decode
+         )
+ 
++    def _exact_router_trace_request(self, packet) -> tuple[str, str] | None:
++        if packet is None:
++            return None
++        if packet.enabled is not True:
++            raise ValueError("exact router trace packet is not enabled")
++        if len(packet.session_hash) != 32 or len(packet.request_id) != 16:
++            raise ValueError("exact router trace packet identity is invalid")
++        session = packet.session_hash.hex()
++        request = packet.request_id.hex()
++        from prime_rl.parity_router_trace import mark_h200_trace_flags
++
++        mark_h200_trace_flags(session, request)
++        return session, request
++
+     def _determine_batch_execution_and_padding(
+         self,
+         num_tokens: int,
+@@ -4187,6 +4201,10 @@ class GPUModelRunner(
+ 
+             num_reqs = self.input_batch.num_reqs
+             req_ids = self.input_batch.req_ids
++            router_trace_request = self._exact_router_trace_request(
++                scheduler_output.prime_router_trace_packet
++            )
++            eager_router_trace = router_trace_request is not None
+             tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
+             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
+             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
+@@ -4220,6 +4238,7 @@ class GPUModelRunner(
+                 max_num_scheduled_tokens=max_num_scheduled_tokens,
+                 use_cascade_attn=cascade_attn_prefix_lens is not None,
+                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
++                force_eager=eager_router_trace,
+             )
+ 
+             logger.debug(
+@@ -4360,6 +4379,11 @@ class GPUModelRunner(
+         has_encoder_input = (
+             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
+         )
++        router_trace_context = nullcontext()
++        if router_trace_request is not None:
++            from prime_rl.parity_router_trace import h200_trace_request
++
++            router_trace_context = h200_trace_request(*router_trace_request)
+ 
+         # Run the model.
+         # Use persistent buffers for CUDA graphs.
+@@ -4374,6 +4398,7 @@ class GPUModelRunner(
+                 ubatch_slices_padded,
+             )
+         with (
++            router_trace_context,
+             set_forward_context(
+                 attn_metadata,
+                 self.vllm_config,
+@@ -4383,7 +4408,7 @@ class GPUModelRunner(
+                 batch_descriptor=batch_desc,
+                 ubatch_slices=ubatch_slices_padded,
+                 slot_mapping=slot_mappings,
+-                skip_compiled=has_encoder_input,
++                skip_compiled=has_encoder_input or eager_router_trace,
+             ),
+             record_function_or_nullcontext("gpu_model_runner: forward"),
+             self.maybe_get_kv_connector_output(

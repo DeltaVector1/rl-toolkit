@@ -1,7 +1,6 @@
 """Selective activation checkpointing hooks for custom decoder layers."""
 
 from collections.abc import Iterable
-from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
 
@@ -26,49 +25,6 @@ _PATCHED_METHODS_ATTR = "_prime_rl_selective_ac_patched_methods"
 _REENTRANT_BLOCK_PHASE: ContextVar[str | None] = ContextVar(
     "prime_rl_reentrant_block_phase", default=None
 )
-
-
-def _capture_ring_attention_params() -> tuple[dict, dict] | None:
-    """Capture the packed-sequence state used by one checkpoint invocation.
-
-    ``ring_flash_attn`` stores this state in one process-global dictionary.
-    Pipeline 1F1B can start later microbatches before checkpoint backward
-    recomputes an earlier one.  Each checkpoint invocation must therefore own
-    the dictionary values that were active during its original forward.
-    """
-
-    try:
-        from ring_flash_attn.adapters.hf_adapter import DATA_PARAMS
-    except ImportError:
-        return None
-    return DATA_PARAMS, dict(DATA_PARAMS)
-
-
-@contextmanager
-def _restore_ring_attention_params(snapshot: tuple[dict, dict] | None):
-    if snapshot is None:
-        yield
-        return
-
-    params, values = snapshot
-    previous = dict(params)
-    params.clear()
-    params.update(values)
-    try:
-        yield
-    finally:
-        params.clear()
-        params.update(previous)
-
-
-def ring_attention_checkpoint_context_fn():
-    """Give non-reentrant checkpoint forward and recompute the same CP state."""
-
-    snapshot = _capture_ring_attention_params()
-    return (
-        _restore_ring_attention_params(snapshot),
-        _restore_ring_attention_params(snapshot),
-    )
 
 
 def in_reentrant_block_checkpoint() -> bool:
@@ -304,21 +260,10 @@ def set_reentrant_attention_checkpointing(layer: nn.Module) -> None:
 
 
 def set_reentrant_attention_shared_expert_checkpointing(layer: nn.Module) -> None:
-    """Checkpoint attention and only the non-routed shared expert.
-
-    The complete routed-expert path stays eager, so backward does not repeat
-    expert dispatch, all-to-all, or the fused routed-expert calls. The shared
-    expert is inside the owning FSDP decoder block. Its reentrant recompute
-    therefore starts after the block pre-backward hook restores the native-FP8
-    parameters, which is the same safe ordering as reentrant attention.
-    """
-
+    """Checkpoint attention and the shared expert, but not routed experts."""
     set_reentrant_attention_checkpointing(layer)
     mlp = getattr(layer, "mlp", None)
     shared_expert = getattr(mlp, "shared_expert", None)
-    # GLM-5.2 keeps its first decoder layers dense. Those layers still use the
-    # attention checkpoint above, but they have no shared-expert branch to
-    # wrap. Later MoE layers expose ``mlp.shared_expert``.
     if shared_expert is None:
         return
     checkpoint_method(
@@ -327,6 +272,26 @@ def set_reentrant_attention_shared_expert_checkpointing(layer: nn.Module) -> Non
         use_reentrant=True,
         preserve_rng_state=True,
     )
+
+
+def set_reentrant_attention_all_experts_checkpointing(layer: nn.Module) -> None:
+    """Checkpoint attention, the shared expert, and routed experts."""
+    set_reentrant_attention_shared_expert_checkpointing(layer)
+    mlp = getattr(layer, "mlp", None)
+    if mlp is None:
+        return
+    method = (
+        "_run_deepep_routed_experts"
+        if getattr(mlp, "ep_comm_backend", None) == "deepep"
+        else "_run_routed_experts"
+    )
+    if hasattr(mlp, method):
+        checkpoint_method(
+            mlp,
+            method,
+            use_reentrant=True,
+            preserve_rng_state=False,
+        )
 
 
 def supports_selective_activation_checkpointing(layer: nn.Module) -> bool:
