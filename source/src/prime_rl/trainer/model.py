@@ -562,6 +562,63 @@ def _validate_glm_moe_bias_union(
     return len(combined), fingerprint.hexdigest()
 
 
+def _publish_glm_moe_bias_fingerprint(
+    model: nn.Module,
+    parallel_dims: ParallelDims | None,
+    local_layers: dict[str, dict],
+    action: str,
+) -> None:
+    expected_layers = _expected_glm_moe_layer_indices(model)
+    pp_rank = 0
+    pp_size = 1
+    if parallel_dims is not None and parallel_dims.pp_enabled:
+        pp_rank = parallel_dims.get_mesh("pp").get_local_rank()
+        pp_size = parallel_dims.pp
+    local_record = {"pp_rank": pp_rank, "layers": local_layers}
+    dist_ready = torch.distributed.is_available() and torch.distributed.is_initialized()
+    if dist_ready:
+        gathered: list[dict | None] = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(gathered, local_record)
+        records = [record for record in gathered if record is not None]
+    else:
+        records = [local_record]
+    count, fingerprint = _validate_glm_moe_bias_union(records, expected_layers, pp_size)
+    if not dist_ready or torch.distributed.get_rank() == 0:
+        get_logger().info(
+            f"{action} {count} exact FP32 GLM routing corrections "
+            f"sha256={fingerprint}"
+        )
+
+
+def validate_glm_moe_bias_values(
+    model: nn.Module, parallel_dims: ParallelDims | None = None
+) -> None:
+    """Validate loaded GLM routing buffers without changing their values."""
+    if getattr(getattr(model, "config", None), "model_type", None) != "glm_moe_dsa":
+        return
+    local_layers: dict[str, dict] = {}
+    language_model = get_language_model(model)
+    for layer in iter_layers(language_model.layers):
+        layer_index = getattr(layer, "layer_idx", None)
+        mlp = getattr(layer, "mlp", None)
+        if not isinstance(layer_index, int) or not isinstance(mlp, (MoE, LatentMoE)):
+            continue
+        value = getattr(mlp, "expert_bias", None)
+        if value is None or value.dtype != torch.float32:
+            raise RuntimeError(f"GLM routing correction layer {layer_index} is not float32")
+        if hasattr(value, "to_local"):
+            value = value.to_local()
+        value = value.detach().to(device="cpu").contiguous()
+        raw = value.view(torch.uint8).numpy().tobytes()
+        local_layers[f"model.layers.{layer_index}.mlp.expert_bias"] = {
+            "layer": layer_index,
+            "dtype": str(value.dtype),
+            "shape": list(value.shape),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        }
+    _publish_glm_moe_bias_fingerprint(model, parallel_dims, local_layers, "Validated")
+
+
 def restore_glm_moe_bias_values(
     model: nn.Module, snapshot_path: Path, parallel_dims: ParallelDims | None = None
 ) -> None:
@@ -582,7 +639,6 @@ def restore_glm_moe_bias_values(
                 for key in shard.keys():
                     weight_map[key] = shard_path.name
 
-    expected_layers = _expected_glm_moe_layer_indices(model)
     language_model = get_language_model(model)
     requested: dict[str, tuple[nn.Module, str]] = {}
     for layer in iter_layers(language_model.layers):
@@ -626,7 +682,7 @@ def restore_glm_moe_bias_values(
                         f"does not match layer {layer_index} target {tuple(target.shape)}"
                     )
                 source_bytes = source.contiguous().view(torch.uint8).numpy().tobytes()
-                local_layers[source_key] = {
+                local_layers[f"model.layers.{layer_index}.mlp.expert_bias"] = {
                     "layer": int(layer_index),
                     "dtype": str(source.dtype),
                     "shape": list(source.shape),
@@ -639,25 +695,7 @@ def restore_glm_moe_bias_values(
     if restored != len(local_layers):
         raise RuntimeError(f"GLM routing-bias restoration produced duplicate records: {restored}")
 
-    pp_rank = 0
-    pp_size = 1
-    if parallel_dims is not None and parallel_dims.pp_enabled:
-        pp_rank = parallel_dims.get_mesh("pp").get_local_rank()
-        pp_size = parallel_dims.pp
-    local_record = {"pp_rank": pp_rank, "layers": local_layers}
-    dist_ready = torch.distributed.is_available() and torch.distributed.is_initialized()
-    if dist_ready:
-        gathered: list[dict | None] = [None] * torch.distributed.get_world_size()
-        torch.distributed.all_gather_object(gathered, local_record)
-        records = [record for record in gathered if record is not None]
-    else:
-        records = [local_record]
-    count, fingerprint = _validate_glm_moe_bias_union(records, expected_layers, pp_size)
-    if not dist_ready or torch.distributed.get_rank() == 0:
-        get_logger().info(
-            f"Restored {count} exact FP32 GLM routing corrections from checkpoint "
-            f"sha256={fingerprint}"
-        )
+    _publish_glm_moe_bias_fingerprint(model, parallel_dims, local_layers, "Restored")
 
 
 def freeze_sparse_indexer(model: nn.Module) -> None:
@@ -1329,7 +1367,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
             generator = torch.Generator(device="cuda").manual_seed(seed_tensor.item())
         for module in lora_modules:
             module._init_lora_parameters(generator)
-    restore_glm_moe_bias_values(model, snapshot_path)
+            restore_glm_moe_bias_values(model, snapshot_path, parallel_dims)
     logger.debug(f"Loaded weights using HF DCP in {time.perf_counter() - load_dcp_start_time:.2f} seconds")
 
 

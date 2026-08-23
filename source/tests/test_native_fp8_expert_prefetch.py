@@ -179,7 +179,10 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
                 if isinstance(node, ast.FunctionDef) and node.name == "load_dcp_from_hf"
             )
         )
-        self.assertIn("restore_glm_moe_bias_values(model, snapshot_path)", load_source)
+        self.assertIn(
+            "restore_glm_moe_bias_values(model, snapshot_path, parallel_dims)",
+            load_source,
+        )
         self.assertIn("source.dtype != torch.float32", ast.unparse(ast.parse(model_source)))
 
     @unittest.skipUnless(torch is not None, "PP fingerprint validation requires PyTorch")
@@ -234,14 +237,17 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
     def test_glm_router_bias_restores_after_resume_load(self):
         train_source = (ROOT / "source/src/prime_rl/trainer/rl/train.py").read_text()
         load_position = train_source.index("ckpt_manager.load(checkpoint_step")
-        restore_position = train_source.index("restore_glm_moe_bias_values(model, Path(config.model.name)")
-        self.assertLess(load_position, restore_position)
+        preserve_position = train_source.index("preserve_glm_moe_bias_precision(model)", load_position - 500)
+        validate_position = train_source.index("validate_glm_moe_bias_values(model, parallel_dims)", load_position)
+        self.assertLess(preserve_position, load_position)
+        self.assertLess(load_position, validate_position)
+        self.assertNotIn("restore_glm_moe_bias_values(model, Path(config.model.name)", train_source)
 
     @unittest.skipUnless(torch is not None, "FP32 checkpoint restoration requires PyTorch")
     def test_glm_router_bias_restores_exact_checkpoint_values(self):
         from safetensors.torch import save_file
 
-        from prime_rl.trainer.model import restore_glm_moe_bias_values
+        from prime_rl.trainer.model import restore_glm_moe_bias_values, validate_glm_moe_bias_values
         from prime_rl.trainer.models.layers.moe import MoE, MoEArgs
 
         class Layer(torch.nn.Module):
@@ -287,6 +293,12 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
             restore_glm_moe_bias_values(model, root)
             self.assertEqual(model.model.layers[0].mlp.expert_bias.dtype, torch.float32)
             torch.testing.assert_close(model.model.layers[0].mlp.expert_bias, source, rtol=0, atol=0)
+            changed = source + torch.tensor([0.123, 0.0, -0.25, 0.5])
+            model.model.layers[0].mlp.expert_bias.copy_(changed)
+            validate_glm_moe_bias_values(model)
+            torch.testing.assert_close(
+                model.model.layers[0].mlp.expert_bias, changed, rtol=0, atol=0
+            )
 
     @unittest.skipUnless(
         torch is not None and torch.cuda.is_available(),
