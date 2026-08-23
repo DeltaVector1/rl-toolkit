@@ -209,6 +209,9 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
         self.assertIn("_collect_live_glm_moe_bias_layers", model_source)
         self.assertIn("cache_glm_moe_bias_values", model_source)
         self.assertIn("destination differs from exact source after setup", model_source)
+        self.assertIn("_glm_freeze_moe_router", model_source)
+        self.assertIn("_use_static_expert_bias", model_source)
+        self.assertIn("_expert_bias_updates_disabled", model_source)
         setup_source = ast.unparse(
             next(
                 node
@@ -220,6 +223,8 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
         self.assertIn("validate_glm_moe_bias_values(model, parallel_dims)", setup_source)
         moe_source = (ROOT / "source/src/prime_rl/trainer/models/layers/moe.py").read_text()
         self.assertIn('getattr(self, "_fp32_expert_bias", self.expert_bias)', moe_source)
+        self.assertIn('if getattr(self, "_use_static_expert_bias", False)', moe_source)
+        self.assertIn("if self.load_balance_coeff is not None:", moe_source)
         self.assertIn("self.router(x, expert_bias, routed_experts=routed_experts)", moe_source)
 
     @unittest.skipUnless(torch is not None, "PP fingerprint validation requires PyTorch")
@@ -305,6 +310,7 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
                         "first_k_dense_replace": 3,
                     },
                 )()
+                self._glm_freeze_moe_router = True
                 self.model = torch.nn.Module()
                 self.model.layers = torch.nn.ModuleList([Layer()])
 
@@ -326,16 +332,129 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
                 )
             )
             model = Model()
-            model.model.layers[0].mlp.expert_bias.copy_(source.to(torch.bfloat16).float())
+            model.model.layers[0].mlp.expert_bias = model.model.layers[0].mlp.expert_bias.to(torch.bfloat16)
+            model.model.layers[0].mlp.expert_bias.copy_(source)
             restore_glm_moe_bias_values(model, root)
-            self.assertEqual(model.model.layers[0].mlp.expert_bias.dtype, torch.float32)
-            torch.testing.assert_close(model.model.layers[0].mlp.expert_bias, source, rtol=0, atol=0)
+            self.assertEqual(model.model.layers[0].mlp.expert_bias.dtype, torch.bfloat16)
+            torch.testing.assert_close(model.model.layers[0].mlp._fp32_expert_bias, source, rtol=0, atol=0)
             changed = source + torch.tensor([0.123, 0.0, -0.25, 0.5])
             model.model.layers[0].mlp.expert_bias.copy_(changed)
             validate_glm_moe_bias_values(model)
             torch.testing.assert_close(
-                model.model.layers[0].mlp.expert_bias, changed, rtol=0, atol=0
+                model.model.layers[0].mlp._fp32_expert_bias, source, rtol=0, atol=0
             )
+
+    @unittest.skipUnless(torch is not None, "Frozen router behavior requires PyTorch")
+    def test_frozen_router_uses_static_bias_and_stops_load_balance_updates(self):
+        from prime_rl.trainer.model import cache_glm_moe_bias_values, freeze_moe_router
+        from prime_rl.trainer.models.layers.moe import MoE, MoEArgs
+
+        class Layer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layer_idx = 3
+                self.mlp = MoE(
+                    MoEArgs(num_experts=4, top_k=1, num_shared_experts=0),
+                    dim=2,
+                    hidden_dim=4,
+                )
+
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = type("Config", (), {"model_type": "glm_moe_dsa"})()
+                self.model = torch.nn.Module()
+                self.model.layers = torch.nn.ModuleList([Layer()])
+
+        class RecordingRouter(torch.nn.Module):
+            route_scale = 1.0
+
+            def __init__(self, seen):
+                super().__init__()
+                self.seen = seen
+
+            def forward(self, x, expert_bias, routed_experts=None):
+                self.seen.append(expert_bias.detach().clone())
+                count = x.shape[0]
+                scores = torch.ones(count, 1, dtype=torch.float32)
+                indices = torch.zeros(count, 1, dtype=torch.long)
+                counts = torch.zeros(4, dtype=torch.float32)
+                counts[0] = count
+                return scores, indices, counts, torch.tensor(float(count))
+
+        model = Model()
+        mlp = model.model.layers[0].mlp
+        source = torch.tensor([34.18921, 34.60598, 34.601982, 34.60798], dtype=torch.float32)
+        mlp.expert_bias.copy_(source)
+        freeze_moe_router(model)
+        cache_glm_moe_bias_values(model)
+        self.assertIsNone(mlp.load_balance_coeff)
+        self.assertTrue(mlp._expert_bias_updates_disabled)
+        self.assertNotIn("_fp32_expert_bias", mlp._buffers)
+        self.assertNotIn("_fp32_expert_bias", model.state_dict())
+        torch.testing.assert_close(mlp._fp32_expert_bias, source, rtol=0, atol=0)
+
+        seen = []
+        mlp.router = RecordingRouter(seen)
+        mlp._run_routed_experts = lambda x, indices, counts, scores: torch.zeros_like(x)
+        for step in range(3):
+            mlp.expert_bias.add_(float(step + 1))
+            mlp(torch.ones(1, 2, 2))
+        self.assertEqual(len(seen), 3)
+        for value in seen:
+            torch.testing.assert_close(value, source, rtol=0, atol=0)
+        self.assertEqual(float(mlp.tokens_per_expert.sum()), 0.0)
+
+    @unittest.skipUnless(torch is not None, "Dynamic router behavior requires PyTorch")
+    def test_non_frozen_router_uses_registered_bias_without_static_cache(self):
+        from prime_rl.trainer.model import cache_glm_moe_bias_values
+        from prime_rl.trainer.models.layers.moe import MoE, MoEArgs
+
+        class Layer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layer_idx = 3
+                self.mlp = MoE(
+                    MoEArgs(num_experts=4, top_k=1, num_shared_experts=0),
+                    dim=2,
+                    hidden_dim=4,
+                )
+
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = type("Config", (), {"model_type": "glm_moe_dsa"})()
+                self.model = torch.nn.Module()
+                self.model.layers = torch.nn.ModuleList([Layer()])
+
+        model = Model()
+        mlp = model.model.layers[0].mlp
+        model._glm_freeze_moe_router = False
+        cache_glm_moe_bias_values(model)
+        self.assertFalse(hasattr(mlp, "_fp32_expert_bias"))
+        self.assertFalse(mlp._use_static_expert_bias)
+        self.assertFalse(mlp._expert_bias_updates_disabled)
+
+        seen = []
+
+        class RecordingRouter(torch.nn.Module):
+            route_scale = 1.0
+
+            def forward(self, x, expert_bias, routed_experts=None):
+                seen.append(expert_bias.detach().clone())
+                count = x.shape[0]
+                scores = torch.ones(count, 1, dtype=torch.float32)
+                indices = torch.zeros(count, 1, dtype=torch.long)
+                counts = torch.zeros(4, dtype=torch.float32)
+                counts[0] = count
+                return scores, indices, counts, torch.tensor(float(count))
+
+        mlp.router = RecordingRouter()
+        mlp._run_routed_experts = lambda x, indices, counts, scores: torch.zeros_like(x)
+        dynamic = torch.tensor([1.25, 2.5, 3.75, 5.0], dtype=torch.float32)
+        mlp.expert_bias.copy_(dynamic)
+        mlp(torch.ones(1, 2, 2))
+        torch.testing.assert_close(seen[0], dynamic, rtol=0, atol=0)
 
     @unittest.skipUnless(
         torch is not None and torch.cuda.is_available(),

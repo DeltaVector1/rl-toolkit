@@ -664,8 +664,8 @@ def train(config: TrainerConfig):
     if checkpoint_step is not None:
         preserve_glm_moe_bias_precision(model)
         ckpt_manager.load(checkpoint_step, model, [optimizer], scheduler, progress)
-        validate_glm_moe_bias_values(model, parallel_dims)
         cache_glm_moe_bias_values(model)
+        validate_glm_moe_bias_values(model, parallel_dims)
         # The checkpoint finished step ``checkpoint_step``; resume training at the next step.
         progress.step += 1
         logger.info(f"Resuming training from checkpoint step {checkpoint_step}")

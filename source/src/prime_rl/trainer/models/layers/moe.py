@@ -1039,10 +1039,14 @@ class MoE(nn.Module):
 
         # top_scores and selected_experts_indices shape (bs*slen*top_k,)
         # num_tokens_per_expert shape (num_experts,)
-        expert_bias = getattr(self, "_fp32_expert_bias", self.expert_bias)
+        if getattr(self, "_use_static_expert_bias", False):
+            expert_bias = getattr(self, "_fp32_expert_bias", self.expert_bias)
+        else:
+            expert_bias = self.expert_bias
         if expert_bias is not None and expert_bias.device != x.device:
             expert_bias = expert_bias.to(x.device)
-            self._fp32_expert_bias = expert_bias
+            if getattr(self, "_use_static_expert_bias", False):
+                self._fp32_expert_bias = expert_bias
         (
             top_scores,
             selected_experts_indices,
@@ -1056,7 +1060,8 @@ class MoE(nn.Module):
         # in backward. The selective MoE path avoids that by checkpointing only the
         # routed expert compute below.
         with torch.no_grad():
-            self.tokens_per_expert.add_(num_tokens_per_expert)
+            if self.load_balance_coeff is not None:
+                self.tokens_per_expert.add_(num_tokens_per_expert)
             self.routing_confidence_sum.add_(routing_confidence_sum)
 
         if self.ep_comm_backend == "deepep":
@@ -1513,12 +1518,21 @@ class LatentMoE(nn.Module):
             _, _, top_k = routed_experts.shape
             routed_experts = routed_experts.reshape(-1, top_k)
 
+        if getattr(self, "_use_static_expert_bias", False):
+            expert_bias = getattr(self, "_fp32_expert_bias", self.expert_bias)
+        else:
+            expert_bias = self.expert_bias
+        if expert_bias is not None and expert_bias.device != x_flat.device:
+            expert_bias = expert_bias.to(x_flat.device)
+            if getattr(self, "_use_static_expert_bias", False):
+                self._fp32_expert_bias = expert_bias
         top_scores, selected_experts_indices, num_tokens_per_expert, routing_confidence_sum = self.router(
-            x_flat, self.expert_bias, routed_experts=routed_experts
+            x_flat, expert_bias, routed_experts=routed_experts
         )
 
         with torch.no_grad():
-            self.tokens_per_expert.add_(num_tokens_per_expert)
+            if self.load_balance_coeff is not None:
+                self.tokens_per_expert.add_(num_tokens_per_expert)
             self.routing_confidence_sum.add_(routing_confidence_sum)
 
         if self.ep_comm_backend == "deepep":

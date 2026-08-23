@@ -419,6 +419,8 @@ def freeze_moe_router(model: nn.Module) -> None:
     """Freeze MoE router parameters to maintain stable routing during training."""
     logger = get_logger()
     language_model = get_language_model(model)
+    is_glm_moe_dsa = getattr(getattr(model, "config", None), "model_type", None) == "glm_moe_dsa"
+    model._glm_freeze_moe_router = True
     num_frozen = 0
 
     for layer in iter_layers(language_model.layers):
@@ -428,6 +430,12 @@ def freeze_moe_router(model: nn.Module) -> None:
 
         # Custom implementation: MoE/LatentMoE class with router attribute
         if isinstance(mlp, (MoE, LatentMoE)):
+            if is_glm_moe_dsa:
+                if mlp.expert_bias is None:
+                    raise ValueError("Frozen GLM routing requires the checkpoint expert_bias buffer")
+                mlp.load_balance_coeff = None
+                mlp._use_static_expert_bias = True
+                mlp._expert_bias_updates_disabled = True
             for param in mlp.router.parameters():
                 param.requires_grad = False
                 num_frozen += 1
@@ -596,14 +604,17 @@ def validate_glm_moe_bias_values(
     """Validate loaded GLM routing buffers without changing their values."""
     if getattr(getattr(model, "config", None), "model_type", None) != "glm_moe_dsa":
         return
-    local_layers = _collect_live_glm_moe_bias_layers(model)
+    frozen = bool(getattr(model, "_glm_freeze_moe_router", False))
+    local_layers = _collect_live_glm_moe_bias_layers(model, require_fp32=frozen)
     expected_layers = getattr(model, "_glm_moe_source_layers", None)
-    if expected_layers is not None and local_layers != expected_layers:
+    if frozen and expected_layers is not None and local_layers != expected_layers:
         raise RuntimeError("GLM routing-bias destination differs from exact source after setup")
     _publish_glm_moe_bias_fingerprint(model, parallel_dims, local_layers, "Validated")
 
 
-def _collect_live_glm_moe_bias_layers(model: nn.Module) -> dict[str, dict]:
+def _collect_live_glm_moe_bias_layers(
+    model: nn.Module, *, require_fp32: bool = True
+) -> dict[str, dict]:
     local_layers: dict[str, dict] = {}
     language_model = get_language_model(model)
     for layer in iter_layers(language_model.layers):
@@ -611,8 +622,11 @@ def _collect_live_glm_moe_bias_layers(model: nn.Module) -> dict[str, dict]:
         mlp = getattr(layer, "mlp", None)
         if not isinstance(layer_index, int) or not isinstance(mlp, (MoE, LatentMoE)):
             continue
-        value = getattr(mlp, "expert_bias", None)
-        if value is None or value.dtype != torch.float32:
+        if getattr(mlp, "_use_static_expert_bias", False):
+            value = getattr(mlp, "_fp32_expert_bias", None)
+        else:
+            value = getattr(mlp, "expert_bias", None)
+        if value is None or (require_fp32 and value.dtype != torch.float32):
             raise RuntimeError(f"GLM routing correction layer {layer_index} is not float32")
         if hasattr(value, "to_local"):
             value = value.to_local()
@@ -637,16 +651,29 @@ def cache_glm_moe_bias_values(model: nn.Module) -> None:
     """Keep an FP32 copy outside FSDP's mixed-precision buffer casts."""
     if getattr(getattr(model, "config", None), "model_type", None) != "glm_moe_dsa":
         return
+    frozen = bool(getattr(model, "_glm_freeze_moe_router", False))
     language_model = get_language_model(model)
     for layer in iter_layers(language_model.layers):
         mlp = getattr(layer, "mlp", None)
         if not isinstance(mlp, (MoE, LatentMoE)):
             continue
-        value = getattr(mlp, "expert_bias", None)
-        if value is None or value.dtype != torch.float32:
-            raise RuntimeError("Cannot cache a non-FP32 GLM routing correction")
-        cached = value.detach().clone()
+        if not frozen:
+            if hasattr(mlp, "_fp32_expert_bias"):
+                delattr(mlp, "_fp32_expert_bias")
+            mlp._use_static_expert_bias = False
+            mlp._expert_bias_updates_disabled = False
+            continue
+        cached = getattr(mlp, "_fp32_expert_bias", None)
+        if cached is None:
+            value = getattr(mlp, "expert_bias", None)
+            if value is None or value.dtype != torch.float32:
+                raise RuntimeError("Cannot cache a non-FP32 GLM routing correction")
+            cached = value.detach().clone()
+        elif cached.dtype != torch.float32:
+            raise RuntimeError("GLM static routing correction must remain float32")
         setattr(mlp, "_fp32_expert_bias", cached)
+        mlp._use_static_expert_bias = True
+        mlp._expert_bias_updates_disabled = True
         if "_fp32_expert_bias" in mlp._buffers:
             raise RuntimeError("GLM FP32 routing cache must not be an FSDP buffer")
 
@@ -672,6 +699,7 @@ def restore_glm_moe_bias_values(
                     weight_map[key] = shard_path.name
 
     language_model = get_language_model(model)
+    frozen = bool(getattr(model, "_glm_freeze_moe_router", False))
     requested: dict[str, tuple[nn.Module, str]] = {}
     for layer in iter_layers(language_model.layers):
         layer_index = getattr(layer, "layer_idx", None)
@@ -728,6 +756,10 @@ def restore_glm_moe_bias_values(
                 }
                 with torch.no_grad():
                     target.copy_(source.to(device=target.device, dtype=torch.float32))
+                if frozen:
+                    mlp._fp32_expert_bias = source.to(
+                        device=target.device, dtype=torch.float32
+                    ).detach().clone()
                 if int(layer_index) == 3 and os.environ.get("RANK", "0") == "0":
                     data_ptr = target.data_ptr() if hasattr(target, "data_ptr") else 0
                     get_logger().info(
@@ -739,11 +771,12 @@ def restore_glm_moe_bias_values(
     if restored != len(local_layers):
         raise RuntimeError(f"GLM routing-bias restoration produced duplicate records: {restored}")
 
-    live_layers = _collect_live_glm_moe_bias_layers(model)
-    if live_layers != local_layers:
-        raise RuntimeError("GLM routing-bias destination differs from exact source after restore")
-    model._glm_moe_source_layers = live_layers
     cache_glm_moe_bias_values(model)
+    live_layers = _collect_live_glm_moe_bias_layers(model, require_fp32=frozen)
+    if frozen and live_layers != local_layers:
+        raise RuntimeError("GLM routing-bias destination differs from exact source after restore")
+    if frozen:
+        model._glm_moe_source_layers = live_layers
     _publish_glm_moe_bias_fingerprint(model, parallel_dims, live_layers, "Restored")
 
 
@@ -819,6 +852,8 @@ def get_load_balance_stats(
         # This is necessary for models that have mixed dense layers
         block_mlp = getattr(transformer_block, "mlp", None)
         if block_mlp is None or not hasattr(block_mlp, "tokens_per_expert"):
+            continue
+        if getattr(block_mlp, "load_balance_coeff", None) is None:
             continue
         tokens_per_expert: torch.Tensor = block_mlp.tokens_per_expert
         num_routed_tokens = tokens_per_expert.sum() / block_mlp.router.top_k
@@ -1738,6 +1773,7 @@ def setup_model(
 
     # 1. We load to meta device by default
     model = get_model(config, device=torch.device("meta"), dtype=DTYPE_MAP[config.optimization_dtype])
+    model._glm_freeze_moe_router = bool(config.freeze_moe_router)
     configure_moe_ep_backend(model, config)
 
     # Trim to this rank's pipeline stage before anything else touches the model,
@@ -1763,6 +1799,7 @@ def setup_model(
     if not possible_to_load_to_meta:
         logger.warning("Cannot load model to meta device only, loading to CPU instead.")
         model = get_model(config, device=torch.device("cpu"), dtype=DTYPE_MAP[config.optimization_dtype])
+        model._glm_freeze_moe_router = bool(config.freeze_moe_router)
         configure_moe_ep_backend(model, config)
 
     lm_head_chunk_size: int | None = None
