@@ -32,6 +32,7 @@ diagnostic_pattern = re.compile(
 )
 diagnostic_manifest_name = "parity-diagnostics.json"
 diagnostic_manifest_lock_name = "parity-diagnostics.lock"
+root_identity_name = "parity-root-identity.json"
 diagnostic_env = "PRIME_PARITY_DIAGNOSTICS"
 diagnostic_tokens_env = "PRIME_PARITY_DIAGNOSTIC_TOKENS"
 diagnostic_max_files_env = "PRIME_PARITY_DIAGNOSTIC_MAX_FILES"
@@ -213,6 +214,35 @@ def validate_isolated_parity_root(root: Path, configured: Path) -> Path:
     return resolved_root
 
 
+def _root_identity(root: Path) -> tuple[int, int]:
+    stat = root.stat()
+    if not root.is_dir():
+        raise ValueError("parity trace root is not a directory")
+    return stat.st_dev, stat.st_ino
+
+
+def _validate_root_identity(root: Path) -> None:
+    if (
+        _bound_root_path == root
+        and _bound_root_identity is not None
+        and _bound_root_identity != _root_identity(root)
+    ):
+        raise ValueError("parity trace root was replaced")
+    identity_path = root / root_identity_name
+    if not identity_path.is_file():
+        return
+    data = json.loads(identity_path.read_text())
+    if (data.get("device"), data.get("inode")) != _root_identity(root):
+        raise ValueError("parity trace root was replaced")
+
+
+def _write_root_identity(root: Path) -> None:
+    device, inode = _root_identity(root)
+    temporary = root / f".{root_identity_name}.{os.getpid()}"
+    temporary.write_text(json.dumps({"device": device, "inode": inode}) + "\n")
+    os.replace(temporary, root / root_identity_name)
+
+
 def validate_diagnostic_content_length(
     content_length: str | None, transfer_encoding: str | None, limit: int
 ) -> int:
@@ -375,26 +405,51 @@ def _trainer_provenance(root: Path, owned_layers: set[int]) -> None:
 def write_session(root: Path, session: TraceSession) -> None:
     session.validate()
     root.mkdir(parents=True, exist_ok=True)
+    _validate_root_identity(root)
     path = root / session_name
     if path.exists():
         current = TraceSession.from_dict(json.loads(path.read_text()))
         if current != session:
             raise ValueError("router trace session does not match the existing session")
+        _write_root_identity(root)
         return
     temporary = root / f".{session_name}.{os.getpid()}"
     temporary.write_text(json.dumps(session.as_dict(), sort_keys=True) + "\n")
     os.replace(temporary, path)
+    _write_root_identity(root)
 
 
 def read_session(root: Path) -> TraceSession:
+    _validate_root_identity(root)
     return TraceSession.from_dict(json.loads((root / session_name).read_text()))
+
+
+def read_diagnostic_manifest(root: Path, session: TraceSession) -> dict[str, Any]:
+    _validate_root_identity(root)
+    path = root / diagnostic_manifest_name
+    if not path.is_file():
+        raise ValueError("parity diagnostic session manifest is missing")
+    manifest = json.loads(path.read_text())
+    if (
+        manifest.get("session_identity") != trace_session_identity(session)
+        or manifest.get("side") != session.side
+        or not isinstance(manifest.get("entries"), list)
+    ):
+        raise ValueError("parity diagnostic session manifest differs")
+    return manifest
 
 
 def clear_trace(root: Path) -> None:
     root.mkdir(parents=True, exist_ok=True)
+    _validate_root_identity(root)
     for path in root.iterdir():
         if (
-            path.name in {session_name, runtime_marker_name, trainer_provenance_name}
+            path.name in {
+                session_name,
+                runtime_marker_name,
+                trainer_provenance_name,
+                root_identity_name,
+            }
             or path.name.startswith("trainer-runtime-pp-")
             or chunk_pattern.match(path.name)
             or router_debug_pattern.match(path.name)
@@ -414,6 +469,9 @@ def configure_trainer_trace(
     root = trace_root()
     if root is None:
         return False
+    configured = os.environ.get("PRIME_PARITY_QUALIFICATION_ROOT")
+    if configured:
+        validate_isolated_parity_root(root, Path(configured))
     expected_root = os.environ.get("PRIME_PARITY_TRACE_ROOT")
     if expected_root is None or root != Path(expected_root) or not re.fullmatch(
         r"/data/glm52-rl/qualifications/glm52-policy-parity/trainer-traces/[A-Za-z0-9_-]+",
@@ -484,6 +542,8 @@ _process_pp_size = 1
 _process_cp_size = 1
 _process_session: TraceSession | None = None
 _process_request: str | None = None
+_bound_root_identity: tuple[int, int] | None = None
+_bound_root_path: Path | None = None
 _active_h200_session: str | None = None
 _runtime_calls: dict[int, int] = {}
 _runtime_id_sources: dict[int, str] = {}
@@ -518,6 +578,7 @@ def configure_process_trace(
     global _process_side, _process_rank, _process_pp_rank, _process_cp_rank
     global _process_world_size, _process_pp_size, _process_cp_size
     global _process_session, _process_request, _active_h200_session
+    global _bound_root_identity, _bound_root_path
     root = trace_root()
     if root is None:
         return False
@@ -543,6 +604,8 @@ def configure_process_trace(
     _process_session = None
     _process_request = None
     _active_h200_session = None
+    _bound_root_identity = _root_identity(root) if root.is_dir() else None
+    _bound_root_path = root
     _calls.clear()
     global _written_files, _written_bytes, _debug_written, _debug_written_bytes
     global _debug_written_session
@@ -802,49 +865,50 @@ def run_h200_router_diagnostic(model_runner: Any, payload: dict[str, Any]) -> di
         raise ValueError("H200 diagnostic input exceeds the configured token limit")
     if input_array.shape[1] < 1 or not np.isfinite(input_array).all():
         raise ValueError("H200 diagnostic input is invalid")
-    torch = __import__("torch")
-    model = getattr(model_runner, "model", model_runner)
-    model = getattr(model, "runnable", model)
-    owner, router = _h200_router_for_layer(model, layer)
-    parameter = next(iter(model.parameters()), None)
-    device = getattr(parameter, "device", "cuda")
-    hidden = torch.as_tensor(input_array, dtype=torch.bfloat16, device=device)
     global _h200_diagnostic_active
-    _h200_diagnostic_active = True
-    try:
-        logits = _router_logits(owner, router, hidden)
-        route_weights, route_ids = router.select_experts(hidden, logits)
-    finally:
-        _h200_diagnostic_active = False
-    logits = logits.to(torch.float32)
-    scores = 0.5 * torch.tanh(0.5 * logits) + 0.5
-    correction_bias = getattr(router, "e_score_correction_bias", None)
-    selection_scores = scores
-    if correction_bias is not None:
-        selection_scores = selection_scores + correction_bias.to(torch.float32)
-    write_hidden_diagnostic(f"layer{layer}_h200_input", hidden)
-    write_hidden_diagnostic(
-        f"layer{layer}_h200_logits", logits, expected_width=None
-    )
-    write_hidden_diagnostic(
-        f"layer{layer}_h200_scores", scores, expected_width=None
-    )
-    write_hidden_diagnostic(
-        f"layer{layer}_h200_selection_scores", selection_scores, expected_width=None
-    )
-    write_hidden_diagnostic(
-        f"layer{layer}_h200_route_ids", route_ids, expected_width=None
-    )
-    write_hidden_diagnostic(
-        f"layer{layer}_h200_route_weights", route_weights, expected_width=None
-    )
-    return {
-        "session_identity": session_identity,
-        "source_session_identity": source_session_identity,
-        "request_identity": request_identity,
-        "layer": layer,
-        "input_shape": list(input_array.shape),
-    }
+    with h200_diagnostic_request(session_identity, request_identity):
+        torch = __import__("torch")
+        model = getattr(model_runner, "model", model_runner)
+        model = getattr(model, "runnable", model)
+        owner, router = _h200_router_for_layer(model, layer)
+        parameter = next(iter(model.parameters()), None)
+        device = getattr(parameter, "device", "cuda")
+        hidden = torch.as_tensor(input_array, dtype=torch.bfloat16, device=device)
+        _h200_diagnostic_active = True
+        try:
+            logits = _router_logits(owner, router, hidden)
+            route_weights, route_ids = router.select_experts(hidden, logits)
+        finally:
+            _h200_diagnostic_active = False
+        logits = logits.to(torch.float32)
+        scores = 0.5 * torch.tanh(0.5 * logits) + 0.5
+        correction_bias = getattr(router, "e_score_correction_bias", None)
+        selection_scores = scores
+        if correction_bias is not None:
+            selection_scores = selection_scores + correction_bias.to(torch.float32)
+        write_hidden_diagnostic(f"layer{layer}_h200_input", hidden)
+        write_hidden_diagnostic(
+            f"layer{layer}_h200_logits", logits, expected_width=None
+        )
+        write_hidden_diagnostic(
+            f"layer{layer}_h200_scores", scores, expected_width=None
+        )
+        write_hidden_diagnostic(
+            f"layer{layer}_h200_selection_scores", selection_scores, expected_width=None
+        )
+        write_hidden_diagnostic(
+            f"layer{layer}_h200_route_ids", route_ids, expected_width=None
+        )
+        write_hidden_diagnostic(
+            f"layer{layer}_h200_route_weights", route_weights, expected_width=None
+        )
+        return {
+            "session_identity": session_identity,
+            "source_session_identity": source_session_identity,
+            "request_identity": request_identity,
+            "layer": layer,
+            "input_shape": list(input_array.shape),
+        }
 
 
 def _hidden_stream(output: Any, name: str) -> Any:
@@ -858,6 +922,13 @@ def _hidden_stream(output: Any, name: str) -> Any:
     ):
         return output[0]
     raise ValueError(f"{name} output is not a known hidden-state stream")
+
+
+def _slice_diagnostic_tokens(value: Any, limit: int = 256) -> Any:
+    shape = tuple(int(size) for size in getattr(value, "shape", ()))
+    if len(shape) < 2:
+        raise ValueError("diagnostic boundary value is not a token tensor")
+    return value[:limit]
 
 
 def _capture_embedding(_module: Any, _inputs: Any, output: Any) -> None:
@@ -959,9 +1030,11 @@ def _capture_h200_decoder_input(
     hidden, residual = inputs[1], inputs[2]
     if not hasattr(hidden, "detach"):
         raise ValueError("H200 decoder input hidden state is not a tensor")
+    hidden = _slice_diagnostic_tokens(hidden)
     if residual is not None:
         if not hasattr(residual, "detach"):
             raise ValueError("H200 decoder input residual is not a tensor")
+        residual = _slice_diagnostic_tokens(residual)
         hidden = hidden + residual
     write_hidden_diagnostic(f"layer{layer}_input", hidden)
 
@@ -984,7 +1057,9 @@ def _capture_h200_layer_boundary(
         or not hasattr(output[1], "detach")
     ):
         raise ValueError("H200 decoder boundary is not a hidden/residual pair")
-    write_hidden_diagnostic(f"layer{layer}_output", output[0] + output[1])
+    hidden = _slice_diagnostic_tokens(output[0])
+    residual = _slice_diagnostic_tokens(output[1])
+    write_hidden_diagnostic(f"layer{layer}_output", hidden + residual)
 
 
 def configure_h200_boundary_diagnostics(model: Any) -> None:
@@ -1132,6 +1207,28 @@ def h200_trace_request(session_identity: str, request_identity: str):
         _active_h200_session = session_identity
     try:
         yield
+    finally:
+        with _write_lock:
+            _active_h200_session = None
+
+
+@contextmanager
+def h200_diagnostic_request(session_identity: str, request_identity: str):
+    global _process_session, _process_request, _active_h200_session
+    root = trace_root()
+    if root is None or _process_side != "h200":
+        raise ValueError("H200 diagnostic requires an H200 trace process")
+    session = read_session(root)
+    if session.side != "h200" or trace_session_identity(session) != session_identity:
+        raise ValueError("H200 diagnostic session does not match the session manifest")
+    with _write_lock:
+        if _active_h200_session is not None:
+            raise ValueError("H200 diagnostic session is already active")
+        _process_session = session
+        _process_request = request_identity
+        _active_h200_session = session_identity
+    try:
+        yield session
     finally:
         with _write_lock:
             _active_h200_session = None

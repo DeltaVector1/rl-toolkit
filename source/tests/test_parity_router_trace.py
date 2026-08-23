@@ -17,9 +17,11 @@ from prime_rl.parity_router_trace import (
     clear_trace,
     configure_process_trace,
     h200_trace_request,
+    h200_diagnostic_request,
     install_vllm_parity_trace,
     mark_h200_trace_flags,
     read_h200_runtime_marker,
+    read_diagnostic_manifest,
     sigmoid_router_reference,
     trace_dir_env,
     trace_session_identity,
@@ -38,6 +40,7 @@ from prime_rl.parity_router_trace import (
     _capture_h200_layer_boundary,
     _capture_h200_attention_boundary,
     _capture_h200_mlp_boundary,
+    _slice_diagnostic_tokens,
     _hidden_stream,
     _router_logits,
     diagnostics_enabled,
@@ -982,6 +985,73 @@ class ParityRouterTraceTest(unittest.TestCase):
             _capture_h200_attention_boundary(None, (), value, 0)
             _capture_h200_mlp_boundary(None, (), value, 0)
         self.assertEqual([name for name, _ in captured], ["layer0_attention_raw", "layer0_mlp_raw"])
+
+    def test_direct_h200_diagnostic_creates_and_clears_session_context(self):
+        import prime_rl.parity_router_trace as trace_module
+
+        metadata = TraceSession(**{**session().__dict__, "side": "h200"})
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = {
+                trace_dir_env: str(root),
+                "PRIME_PARITY_DIAGNOSTICS": "1",
+                "PRIME_PARITY_DIAGNOSTIC_TOKENS": "2",
+                "PRIME_PARITY_DIAGNOSTIC_MAX_FILES": "4",
+                "PRIME_PARITY_DIAGNOSTIC_MAX_BYTES": "10000000",
+            }
+            with patch.dict(os.environ, environment, clear=True):
+                configure_process_trace("h200", rank=0)
+                write_session(root, metadata)
+                with h200_diagnostic_request(trace_session_identity(metadata), "a" * 32):
+                    self.assertEqual(
+                        trace_module._active_h200_session,
+                        trace_session_identity(metadata),
+                    )
+                self.assertIsNone(trace_module._active_h200_session)
+                with self.assertRaisesRegex(ValueError, "manifest is missing"):
+                    read_diagnostic_manifest(root, metadata)
+
+    def test_boundary_slices_each_operand_before_addition(self):
+        events = []
+
+        class TrackingTensor(FakeTensor):
+            def __getitem__(self, key):
+                events.append("slice")
+                return TrackingTensor(self.value[key])
+
+            def __add__(self, other):
+                events.append("add")
+                return super().__add__(other)
+
+        first = TrackingTensor(np.ones((1024, 6144), dtype=np.float32))
+        second = TrackingTensor(np.ones((1024, 6144), dtype=np.float32))
+        sliced_first = _slice_diagnostic_tokens(first)
+        sliced_second = _slice_diagnostic_tokens(second)
+        _ = sliced_first + sliced_second
+        self.assertEqual(events, ["slice", "slice", "add"])
+        self.assertEqual(sliced_first.shape[0], 256)
+
+    def test_reset_body_limit_is_small_and_exact(self):
+        with self.assertRaisesRegex(ValueError, "too large"):
+            validate_diagnostic_content_length("65537", None, 65536)
+        self.assertEqual(validate_diagnostic_content_length("12", None, 65536), 12)
+
+    def test_bound_worker_root_detects_directory_replacement(self):
+        import prime_rl.parity_router_trace as trace_module
+
+        metadata = session()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "trace"
+            root.mkdir()
+            environment = {trace_dir_env: str(root)}
+            with patch.dict(os.environ, environment, clear=True):
+                configure_process_trace("trainer", rank=0, pp_size=1, cp_size=1)
+                write_session(root, metadata)
+                old = Path(temporary) / "old"
+                root.rename(old)
+                root.mkdir()
+                with self.assertRaisesRegex(ValueError, "replaced"):
+                    trace_module.read_session(root)
 
     def test_isolated_root_rejects_equal_or_symlink_root(self):
         with tempfile.TemporaryDirectory() as temporary:

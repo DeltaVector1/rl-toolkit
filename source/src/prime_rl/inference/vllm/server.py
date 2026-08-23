@@ -36,6 +36,7 @@ from prime_rl.parity_router_trace import (
     consume_single_use_diagnostic_token,
     encoded_array,
     read_h200_runtime_marker,
+    read_diagnostic_manifest,
     read_session,
     trace_root,
     trace_session_identity,
@@ -116,6 +117,29 @@ def bootstrap_authorized(request: Request) -> bool:
     return diagnostic_authorization_valid(authorization, expected)
 
 
+async def bounded_request_body(request: Request, limit: int) -> bytes:
+    try:
+        expected = validate_diagnostic_content_length(
+            request.headers.get("content-length"),
+            request.headers.get("transfer-encoding"),
+            limit,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=413, detail=str(error)) from error
+    chunks: list[bytes] = []
+    received = 0
+    async for chunk in request.stream():
+        if not isinstance(chunk, bytes):
+            raise HTTPException(status_code=400, detail="request body chunk is not bytes")
+        received += len(chunk)
+        if received > expected:
+            raise HTTPException(status_code=413, detail="request body is too large")
+        chunks.append(chunk)
+    if received != expected:
+        raise HTTPException(status_code=400, detail="request body length is incorrect")
+    return b"".join(chunks)
+
+
 WORKER_EXTENSION_CLS = {
     "nccl": "prime_rl.inference.vllm.worker.nccl.NCCLWeightUpdateWorker",
     "filesystem": "prime_rl.inference.vllm.worker.filesystem.FileSystemWeightUpdateWorker",
@@ -138,7 +162,11 @@ async def resume(request: Request):
 
 @router.post("/update_weights")
 async def update_weights(request: Request):
-    data = await request.json()
+    body = await bounded_request_body(request, 64 * 1024)
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError as error:
+        raise HTTPException(status_code=400, detail="router trace session is not JSON") from error
     await engine_client(request).collective_rpc("update_weights_from_path", args=(data.get("weight_dir"),))
     return {"status": "ok"}
 
@@ -215,7 +243,7 @@ async def reset_parity_router_trace(request: Request):
 
 @router.get("/parity/router-trace")
 async def get_parity_router_trace():
-    root = parity_trace_root()
+    root = isolated_parity_trace_root()
     try:
         session = read_session(root)
         if session.side != "h200":
@@ -240,21 +268,7 @@ async def run_parity_router_diagnostic(request: Request):
         raise HTTPException(status_code=404, detail="parity diagnostics are disabled")
     root = isolated_parity_trace_root()
     try:
-        expected_length = validate_diagnostic_content_length(
-            request.headers.get("content-length"),
-            request.headers.get("transfer-encoding"),
-            16 * 1024 * 1024,
-        )
-        chunks: list[bytes] = []
-        received = 0
-        async for chunk in request.stream():
-            received += len(chunk)
-            if received > expected_length or received > 16 * 1024 * 1024:
-                raise ValueError("H200 diagnostic request body is too large")
-            chunks.append(chunk)
-        if received != expected_length:
-            raise ValueError("H200 diagnostic request body length is incorrect")
-        body = b"".join(chunks)
+        body = await bounded_request_body(request, 16 * 1024 * 1024)
         data = json.loads(body)
         if not isinstance(data, dict):
             raise ValueError("H200 diagnostic request must be an object")
@@ -275,7 +289,7 @@ async def run_parity_router_diagnostic(request: Request):
         return {
             "session": session.as_dict(),
             "results": result,
-            "diagnostics": json.loads((root / "parity-diagnostics.json").read_text()),
+            "diagnostics": read_diagnostic_manifest(root, session),
         }
     except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
