@@ -3698,6 +3698,33 @@ def stage_glm52_policy_parity(nodes: list[str] | None = None) -> None:
     print(f"GLM parity trainer stage verified on {len(nodes)} nodes")
 
 
+def _copy_parity_host_evidence(
+    nodes: list[str],
+    name: str,
+    root: Path,
+    trace_root: str,
+    token_root: str,
+    token_host: str,
+    copy_tree,
+) -> list[tuple[str, Path, Path | None]]:
+    """Copy each trainer host's trace and token evidence in parallel."""
+
+    def copy_host(host: str) -> tuple[str, Path, Path | None]:
+        trace = root / "sources" / host
+        trace.parent.mkdir(parents=True, exist_ok=True)
+        copy_tree(host, f"{trace_root}/{name}", trace)
+        tokens = None
+        if host == token_host:
+            tokens = root / "tokens" / host
+            tokens.parent.mkdir(parents=True, exist_ok=True)
+            copy_tree(host, token_root, tokens)
+        return host, trace, tokens
+
+    workers = min(8, len(nodes))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        return list(executor.map(copy_host, nodes))
+
+
 def collect_glm52_policy_parity(name: str, nodes: list[str] | None = None) -> dict:
     """Collect every trainer host trace and write the canonical parity report."""
     if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
@@ -3705,6 +3732,15 @@ def collect_glm52_policy_parity(name: str, nodes: list[str] | None = None) -> di
     nodes = [_check_host(host) for host in (nodes or trainer_hosts)]
     profile = repo_root / production_parity_profile
     trainer_config = repo_root / "configs/qualification/glm52-policy-parity-trainer.toml"
+    with trainer_config.open("rb") as stream:
+        trainer_values = tomllib.load(stream)
+    pp_size = trainer_values.get("model", {}).get("pp")
+    if isinstance(pp_size, bool) or not isinstance(pp_size, int) or pp_size < 1:
+        raise Refused("parity trainer TOML must define a positive model.pp")
+    if len(nodes) != pp_size:
+        raise Refused(
+            f"parity collection requires {pp_size} configured PP hosts, found {len(nodes)}"
+        )
     trace_root = "/data/glm52-rl/qualifications/glm52-policy-parity/trainer-traces"
     token_root = "/data/glm52-rl/qualifications/glm52-policy-parity/trainer/token_exports"
     remote_root = "/data/glm52-rl/qualifications/glm52-policy-parity"
@@ -3723,15 +3759,10 @@ def collect_glm52_policy_parity(name: str, nodes: list[str] | None = None) -> di
 
     with tempfile.TemporaryDirectory(prefix="glm52-policy-parity-collect-") as temporary:
         root = Path(temporary)
-        sources: list[Path] = []
-        for host in nodes:
-            trace = root / "sources" / host
-            trace.parent.mkdir(parents=True, exist_ok=True)
-            copy_tree(host, f"{trace_root}/{name}", trace)
-            sources.append(trace)
-            tokens = root / "tokens" / host
-            tokens.parent.mkdir(parents=True, exist_ok=True)
-            copy_tree(host, token_root, tokens)
+        copied_hosts = _copy_parity_host_evidence(
+            nodes, name, root, trace_root, token_root, nodes[pp_size - 1], copy_tree
+        )
+        sources = [trace for _, trace, _ in copied_hosts]
         fixture = root / "fixture"
         capture = root / "h200-capture-final"
         copy_tree(orchestrator_host, f"{remote_root}/fixture", fixture)

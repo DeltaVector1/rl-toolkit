@@ -1,5 +1,6 @@
 import hashlib
 import json
+import threading
 import tempfile
 import unittest
 import tomllib
@@ -50,6 +51,62 @@ class EdgeOperationsTest(unittest.TestCase):
             config["env_vars"]["PRIME_PARITY_ROUTER_TRACE_SOURCE"],
             f"{stage}/trainer-router-trace",
         )
+
+    def test_parity_host_copies_overlap_and_keep_configured_order(self):
+        nodes = ["n82", "n76", "n77"]
+        trace_root = "/remote/traces"
+        token_root = "/remote/tokens"
+        first_trace_copy = threading.Barrier(len(nodes))
+        calls = []
+        lock = threading.Lock()
+
+        def copy_tree(host, remote, local):
+            with lock:
+                calls.append((host, remote))
+            if remote.startswith(trace_root):
+                first_trace_copy.wait(timeout=2)
+            local.mkdir(parents=True, exist_ok=True)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            copied = training_ops._copy_parity_host_evidence(
+                nodes,
+                "run-1",
+                Path(temporary),
+                trace_root,
+                token_root,
+                nodes[-1],
+                copy_tree,
+            )
+
+        self.assertEqual([host for host, _, _ in copied], nodes)
+        self.assertEqual(
+            {host for host, remote in calls if remote.startswith(trace_root)},
+            set(nodes),
+        )
+        self.assertEqual(
+            {host for host, remote in calls if remote == token_root},
+            {nodes[-1]},
+        )
+
+    def test_parity_host_copies_fail_when_final_tokens_are_missing(self):
+        nodes = ["n82", "n76", "n77"]
+
+        def copy_tree(host, remote, local):
+            if host == nodes[-1] and remote == "/remote/tokens":
+                raise RuntimeError("final token exports are missing")
+            local.mkdir(parents=True, exist_ok=True)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(RuntimeError, "final token exports"):
+                training_ops._copy_parity_host_evidence(
+                    nodes,
+                    "run-1",
+                    Path(temporary),
+                    "/remote/traces",
+                    "/remote/tokens",
+                    nodes[-1],
+                    copy_tree,
+                )
 
     def test_policy_parity_stage_validation_is_fail_closed(self):
         with tempfile.TemporaryDirectory() as temporary:
