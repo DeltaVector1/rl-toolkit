@@ -88,6 +88,26 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
         self.assertIs(production["model"]["reshard_after_forward"], True)
         self.assertFalse(production["model"]["native_fp8_expert_prefetch"])
 
+    def test_glm_router_keeps_bf16_gate_and_uses_h200_order(self):
+        model_source = MODEL.read_text()
+        moe_source = (
+            ROOT / "source/src/prime_rl/trainer/models/layers/moe.py"
+        ).read_text()
+        token_router_source = moe_source.split("class NemotronHRouter", 1)[0]
+        self.assertIn('model_type", None) == "glm_moe_dsa"', model_source)
+        self.assertIn("router_param_dtype = (", model_source)
+        self.assertIn("torch.bfloat16", model_source)
+        self.assertIn("use_fp32_router_output = True", model_source)
+        self.assertIn(
+            "0.5 * torch.tanh(0.5 * scores) + 0.5",
+            moe_source,
+        )
+        self.assertIn(
+            "torch.mm(gate_input, gate_weight.t(), out_dtype=torch.float32)",
+            moe_source,
+        )
+        self.assertNotIn("sorted=False", token_router_source)
+
 
 if __name__ == "__main__":
     unittest.main()

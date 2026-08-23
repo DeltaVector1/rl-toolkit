@@ -22,6 +22,9 @@ trace_dir_env = "PRIME_PARITY_ROUTER_TRACE_DIR"
 session_name = "session.json"
 runtime_marker_name = "h200-runtime.json"
 trainer_provenance_name = "trainer-runtime.json"
+router_debug_pattern = re.compile(
+    r"^(trainer|h200)-rank-(\d+)-pp-(\d+)-cp-(\d+)-layer-(\d+)-router-debug\.npz$"
+)
 parity_model_modules = (
     "prime_rl.trainer.model",
     "prime_rl.trainer.lora",
@@ -66,10 +69,7 @@ def sigmoid_router_reference(
         raise ValueError("router logits or correction bias has the wrong shape")
     if topk < 1 or topk > logits.shape[1]:
         raise ValueError("topk is outside the expert count")
-    scores = np.reciprocal(
-        np.float32(1.0) + np.exp(-logits, dtype=np.float32),
-        dtype=np.float32,
-    )
+    scores = np.float32(0.5) * np.tanh(np.float32(0.5) * logits) + np.float32(0.5)
     choice = scores + correction_bias[None, :]
     ids = np.argsort(-choice, axis=1, kind="stable")[:, :topk]
     weights = np.take_along_axis(scores, ids, axis=1).astype(np.float32)
@@ -287,6 +287,7 @@ def clear_trace(root: Path) -> None:
             path.name in {session_name, runtime_marker_name, trainer_provenance_name}
             or path.name.startswith("trainer-runtime-pp-")
             or chunk_pattern.match(path.name)
+            or router_debug_pattern.match(path.name)
             or lifecycle_pattern.match(path.name)
         ):
             if not path.is_file():
@@ -374,6 +375,8 @@ _runtime_scales: dict[int, float] = {}
 _calls: dict[int, int] = {}
 _written_files = 0
 _written_bytes = 0
+_debug_written = False
+_debug_written_bytes = 0
 _owned_layers: set[int] = set()
 _provenance_written = False
 _expected_owned_layers: set[int] = set()
@@ -419,9 +422,12 @@ def configure_process_trace(
     _process_request = None
     _active_h200_session = None
     _calls.clear()
-    global _written_files, _written_bytes, _owned_layers, _provenance_written
+    global _written_files, _written_bytes, _debug_written, _debug_written_bytes
+    global _owned_layers, _provenance_written
     _written_files = 0
     _written_bytes = 0
+    _debug_written = False
+    _debug_written_bytes = 0
     _owned_layers = set()
     _provenance_written = False
     _runtime_calls.clear()
@@ -743,6 +749,77 @@ def write_route_chunk(
             os.replace(marker_temporary, marker_path)
 
 
+def write_router_debug_chunk(
+    layer: int,
+    router_input: Any,
+    router_logits: Any,
+    pre_bias_scores: Any,
+    selection_scores: Any,
+) -> None:
+    """Write one bounded router diagnostic chunk for the first routed layer."""
+    global _debug_written, _debug_written_bytes
+    root = trace_root()
+    if root is None or _process_side is None:
+        return
+    session = read_session(root)
+    if layer != session.dense_layers or _debug_written:
+        return
+    limit = int(os.environ.get("PRIME_PARITY_ROUTER_DEBUG_TOKENS", "256"))
+    max_bytes = int(os.environ.get("PRIME_PARITY_ROUTER_DEBUG_MAX_BYTES", "50000000"))
+    if limit < 1 or max_bytes < 1:
+        raise ValueError("router debug limits must be positive")
+    torch = __import__("torch")
+    input_array = router_input.detach().to(dtype=torch.float32, device="cpu").numpy()[:limit]
+    logits_array = router_logits.detach().to(dtype=torch.float32, device="cpu").numpy()[:limit]
+    pre_bias_array = pre_bias_scores.detach().to(dtype=torch.float32, device="cpu").numpy()[:limit]
+    selection_array = selection_scores.detach().to(dtype=torch.float32, device="cpu").numpy()[:limit]
+    if (
+        input_array.ndim != 2
+        or logits_array.ndim != 2
+        or pre_bias_array.shape != logits_array.shape
+        or selection_array.shape != logits_array.shape
+    ):
+        raise ValueError("router debug arrays have invalid shapes")
+    if logits_array.shape[1] != session.experts:
+        raise ValueError("router debug logits have the wrong expert count")
+    if (
+        not np.isfinite(input_array).all()
+        or not np.isfinite(logits_array).all()
+        or not np.isfinite(pre_bias_array).all()
+        or not np.isfinite(selection_array).all()
+    ):
+        raise ValueError("router debug arrays contain non-finite values")
+    estimate = int(
+        input_array.nbytes
+        + logits_array.nbytes
+        + pre_bias_array.nbytes
+        + selection_array.nbytes
+        + 4096
+    )
+    if estimate > max_bytes:
+        raise ValueError("router debug byte limit exceeded")
+    filename = (
+        f"{_process_side}-rank-{_process_rank}-pp-{_process_pp_rank}-"
+        f"cp-{_process_cp_rank}-layer-{layer}-router-debug.npz"
+    )
+    path = root / filename
+    temporary = root / f".{filename}.{os.getpid()}"
+    with _write_lock:
+        if path.exists():
+            raise FileExistsError(f"router debug chunk already exists: {path}")
+        with temporary.open("wb") as stream:
+            np.savez(
+                stream,
+                router_input=input_array,
+                router_logits=logits_array,
+                pre_bias_scores=pre_bias_array,
+                selection_scores=selection_array,
+            )
+        os.replace(temporary, path)
+        _debug_written = True
+        _debug_written_bytes += estimate
+
+
 def assemble_chunks(root: Path, session: TraceSession) -> tuple[np.ndarray, np.ndarray]:
     if read_session(root) != session:
         raise ValueError("router trace session metadata differs")
@@ -830,8 +907,21 @@ def install_vllm_parity_trace() -> bool:
     if not getattr(FusedMoERouter, "_prime_parity_trace_installed", False):
         original_select = FusedMoERouter.select_experts
 
-        def traced_select(self, *args, **kwargs):
-            route_weights, route_ids = original_select(self, *args, **kwargs)
+        def traced_select(
+            self,
+            hidden_states,
+            router_logits,
+            topk_indices_dtype=None,
+            *,
+            input_ids=None,
+        ):
+            route_weights, route_ids = original_select(
+                self,
+                hidden_states,
+                router_logits,
+                topk_indices_dtype=topk_indices_dtype,
+                input_ids=input_ids,
+            )
             layer = getattr(self, "_prime_parity_layer", None)
             if layer is not None:
                 route_output_scale = getattr(
@@ -842,6 +932,22 @@ def install_vllm_parity_trace() -> bool:
                     route_ids,
                     route_weights,
                     route_output_scale=route_output_scale,
+                )
+                import torch
+
+                pre_bias_scores = (
+                    0.5 * torch.tanh(0.5 * router_logits.to(torch.float32)) + 0.5
+                )
+                selection_scores = pre_bias_scores
+                correction_bias = getattr(self, "e_score_correction_bias", None)
+                if correction_bias is not None:
+                    selection_scores = selection_scores + correction_bias.to(torch.float32)
+                write_router_debug_chunk(
+                    layer,
+                    hidden_states,
+                    router_logits,
+                    pre_bias_scores,
+                    selection_scores,
                 )
             return route_weights, route_ids
 

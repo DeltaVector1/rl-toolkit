@@ -610,9 +610,7 @@ class TokenChoiceTopKRouter(nn.Module):
         self.route_scale = route_scale
         self.force_balanced = False
         self.parity_trace_layer: int | None = None
-        # Set via model.moe_router_dtype='float32': the gate weight is kept in fp32
-        # (exempt from FSDP bf16 casting) and the gate GEMM runs in fp32.
-        self.fp32_gate = False
+        self.use_fp32_router_output = False
 
     def forward(
         self, x: torch.Tensor, expert_bias: torch.Tensor | None = None, routed_experts: torch.Tensor | None = None
@@ -639,11 +637,25 @@ class TokenChoiceTopKRouter(nn.Module):
         assert routed_experts is None or routed_experts.shape[-1] == self.top_k, (
             f"routed_experts shape: {routed_experts.shape}, top_k: {self.top_k}"
         )
-        scores = self.gate(x.to(torch.float32)) if self.fp32_gate else self.gate(x)
+        if self.use_fp32_router_output:
+            gate_weight = self.gate.weight
+            if gate_weight.dtype == torch.bfloat16:
+                gate_input = x.to(torch.bfloat16)
+            else:
+                gate_input = x.to(gate_weight.dtype)
+            scores = torch.mm(gate_input, gate_weight.t(), out_dtype=torch.float32)
+        else:
+            scores = self.gate(x)
+        router_logits = scores.to(torch.float32)
 
         # By default, sigmoid or softmax is performed in float32 to avoid loss explosion
         if self.score_func == "sigmoid":
-            scores = torch.sigmoid(scores.to(torch.float32))
+            scores = scores.to(torch.float32)
+            if self.use_fp32_router_output:
+                # vLLM's GLM grouped-topk kernel uses this tanhf form.
+                scores = 0.5 * torch.tanh(0.5 * scores) + 0.5
+            else:
+                scores = torch.sigmoid(scores)
         elif self.score_func == "softmax":
             scores = F.softmax(scores.to(torch.float32), dim=1)
         else:
@@ -652,6 +664,9 @@ class TokenChoiceTopKRouter(nn.Module):
         # top scores shape (bs*slen, top_k)
         # NOTE: The expert_bias is only used for routing. The gating value
         #       top_scores is still derived from the original scores.
+        selection_scores = scores
+        if expert_bias is not None:
+            selection_scores = selection_scores + expert_bias
 
         if routed_experts is not None:
             selected_experts_indices = routed_experts
@@ -669,10 +684,14 @@ class TokenChoiceTopKRouter(nn.Module):
             selected_experts_indices = (arange % self.num_experts).view(num_tokens, self.top_k)
             top_scores = scores.gather(dim=1, index=selected_experts_indices)
         elif expert_bias is not None:
-            _, selected_experts_indices = torch.topk(scores + expert_bias, k=self.top_k, dim=1)
+            _, selected_experts_indices = torch.topk(
+                selection_scores, k=self.top_k, dim=1
+            )
             top_scores = scores.gather(dim=1, index=selected_experts_indices)
         else:
-            top_scores, selected_experts_indices = torch.topk(scores, k=self.top_k, dim=1)
+            top_scores, selected_experts_indices = torch.topk(
+                scores, k=self.top_k, dim=1
+            )
 
         routing_confidence_sum = _selected_probability_mass_sum(scores, top_scores, self.score_func)
 
@@ -681,13 +700,20 @@ class TokenChoiceTopKRouter(nn.Module):
             top_scores = top_scores / denominator
 
         if self.parity_trace_layer is not None:
-            from prime_rl.parity_router_trace import write_route_chunk
+            from prime_rl.parity_router_trace import write_route_chunk, write_router_debug_chunk
 
             write_route_chunk(
                 self.parity_trace_layer,
                 selected_experts_indices,
                 top_scores,
                 route_output_scale=self.route_scale,
+            )
+            write_router_debug_chunk(
+                self.parity_trace_layer,
+                x,
+                router_logits,
+                scores,
+                selection_scores,
             )
 
         # group tokens together by expert indices from 0 to num_experts and pass that to experts forward

@@ -441,26 +441,25 @@ def freeze_moe_router(model: nn.Module) -> None:
 
 
 def apply_fp32_moe_router(model: nn.Module) -> None:
-    """Cast MoE router gates to fp32 so routing runs in fp32 in forward and backward.
-
-    The FSDP bf16 cast exemption is applied separately in `setup_fsdp`.
-    """
+    """Configure router output precision without changing GLM gate storage."""
     logger = get_logger()
     language_model = get_language_model(model)
+    is_glm_moe_dsa = getattr(getattr(model, "config", None), "model_type", None) == "glm_moe_dsa"
     num_routers = 0
 
     for layer in iter_layers(language_model.layers):
         mlp = layer.mlp if hasattr(layer, "mlp") else layer.feed_forward if hasattr(layer, "feed_forward") else None
         if isinstance(mlp, (MoE, LatentMoE)):
-            mlp.router.to(torch.float32)
             if isinstance(mlp.router, TokenChoiceTopKRouter):
-                mlp.router.fp32_gate = True
+                mlp.router.use_fp32_router_output = True
+            if not is_glm_moe_dsa:
+                mlp.router.to(torch.float32)
             num_routers += 1
 
     # No-op for non-MoE and HF-impl models: moe_router_dtype='float32' is the default,
     # so absence of custom-impl MoE routers is the common case, not an error.
     if num_routers > 0:
-        logger.info(f"Running {num_routers} MoE router gates in fp32")
+        logger.info(f"Running {num_routers} MoE router outputs in fp32")
 
 
 def freeze_sparse_indexer(model: nn.Module) -> None:
@@ -884,12 +883,15 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
                 block_mlp.experts.set_gradient_divide_factor(parallel_dims.fsdp_gradient_divide_factor)
 
         if config.moe_router_dtype == "float32" and isinstance(block_mlp, (MoE, LatentMoE)):
-            # Own FSDP unit with an fp32 policy so the gate weight is not cast to
-            # bf16 for forward and its gradients reduce in fp32.
+            router_param_dtype = (
+                torch.bfloat16
+                if getattr(getattr(model, "config", None), "model_type", None) == "glm_moe_dsa"
+                else torch.float32
+            )
             fully_shard(
                 block_mlp.router,
                 mesh=hsdp_mesh,
-                mp_policy=MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32),
+                mp_policy=MixedPrecisionPolicy(param_dtype=router_param_dtype, reduce_dtype=torch.float32),
                 offload_policy=cold_offload_policy,
                 reshard_after_forward=fsdp_config["reshard_after_forward"],
             )

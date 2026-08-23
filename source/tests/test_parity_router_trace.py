@@ -22,6 +22,7 @@ from prime_rl.parity_router_trace import (
     trace_session_identity,
     validate_sparse_routes,
     write_route_chunk,
+    write_router_debug_chunk,
     write_session,
     _is_mounted,
     _trainer_host_name,
@@ -35,12 +36,26 @@ class FakeTensor:
     def detach(self):
         return self
 
-    def to(self, *, dtype, device):
+    def to(self, *args, dtype=None, device=None):
         del device
+        if args:
+            dtype = args[0]
         return FakeTensor(self.value.astype(dtype))
 
     def numpy(self):
         return self.value
+
+    def __mul__(self, other):
+        return FakeTensor(self.value * other)
+
+    def __rmul__(self, other):
+        return FakeTensor(other * self.value)
+
+    def __add__(self, other):
+        return FakeTensor(self.value + other)
+
+    def __radd__(self, other):
+        return FakeTensor(other + self.value)
 
 
 def fake_torch(state=None):
@@ -48,6 +63,8 @@ def fake_torch(state=None):
     module = types.ModuleType("torch")
     module.int32 = np.int32
     module.float32 = np.float32
+    module.sigmoid = lambda value: value
+    module.tanh = lambda value: value
     module.compiler = types.SimpleNamespace(
         is_compiling=lambda: state["compiling"]
     )
@@ -107,6 +124,31 @@ class ParityRouterTraceTest(unittest.TestCase):
                 write_route_chunk(1, ids, weights, route_output_scale=2.5)
                 with self.assertRaisesRegex(ValueError, "limit exceeded"):
                     write_route_chunk(1, ids, weights, route_output_scale=2.5)
+
+    def test_router_debug_is_bounded_and_cleared(self):
+        torch = fake_torch()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            metadata = session()
+            write_session(root, metadata)
+            values = FakeTensor([[0.1, 0.2, 0.3, 0.4]] * 4)
+            environment = {
+                trace_dir_env: str(root),
+                "PRIME_PARITY_ROUTER_DEBUG_TOKENS": "2",
+                "PRIME_PARITY_ROUTER_DEBUG_MAX_BYTES": "100000",
+            }
+            with patch.dict(os.environ, environment, clear=True), patch.dict(sys.modules, {"torch": torch}):
+                configure_process_trace("trainer", rank=0)
+                write_router_debug_chunk(1, values, values, values, values)
+            path = root / "trainer-rank-0-pp-0-cp-0-layer-1-router-debug.npz"
+            self.assertTrue(path.is_file())
+            with np.load(path, allow_pickle=False) as saved:
+                self.assertEqual(saved["router_input"].shape, (2, 4))
+                self.assertEqual(saved["router_logits"].shape, (2, 4))
+                self.assertEqual(saved["pre_bias_scores"].shape, (2, 4))
+                self.assertEqual(saved["selection_scores"].shape, (2, 4))
+            clear_trace(root)
+            self.assertFalse(path.exists())
 
     def test_bias_selects_and_unbiased_sigmoid_weights_score(self):
         logits = np.array([[2.0, 1.0, -1.0, -2.0]], dtype=np.float32)
@@ -323,15 +365,21 @@ class ParityRouterTraceTest(unittest.TestCase):
         torch = fake_torch()
 
         class FusedMoERouter:
-            def select_experts(self):
-                return self._select_experts()
+            def select_experts(self, hidden_states=None, router_logits=None, **kwargs):
+                del kwargs
+                if hidden_states is None:
+                    hidden_states = FakeTensor([[0.1, 0.2, 0.3, 0.4]] * 4)
+                if router_logits is None:
+                    router_logits = hidden_states
+                return self._select_experts(hidden_states, router_logits)
 
         class BaseRouter(FusedMoERouter):
             def __init__(self, ids):
                 self.ids = ids
                 self.routed_scaling_factor = 1.0
 
-            def _select_experts(self):
+            def _select_experts(self, hidden_states, router_logits):
+                del hidden_states, router_logits
                 return FakeTensor([[0.4, 0.6]] * 4), FakeTensor([self.ids] * 4)
 
         class MoERunner:
@@ -411,7 +459,8 @@ class ParityRouterTraceTest(unittest.TestCase):
                 mark_h200_trace_flags(trace_session_identity(metadata), "8" * 32)
                 with h200_trace_request(trace_session_identity(metadata), "8" * 32):
                     for module in runner.model.modules():
-                        module.router.select_experts()
+                        values = FakeTensor([[0.1, 0.2, 0.3, 0.4]] * 4)
+                        module.router.select_experts(values, values)
                 ids, _weights = assemble_chunks(root, metadata)
                 marker = read_h200_runtime_marker(root, metadata)
         np.testing.assert_array_equal(ids[:, 1, :], [[0, 2]] * 4)
