@@ -255,6 +255,37 @@ class ParityRouterTraceTest(unittest.TestCase):
         np.testing.assert_allclose(weights[0], expected, rtol=1e-6, atol=1e-6)
         self.assertEqual(weights.dtype, np.float32)
 
+    def test_measured_fp32_bias_changes_layer_three_route_selection(self):
+        logits = np.array(
+            [[
+                2.7464626, -0.7243003, -0.7251897, -0.7362717,
+                -0.7686051, -0.6138942, -0.73032445, -0.7487934,
+                -0.011393953, -0.024174858, -0.030296402, -0.045026578,
+                -0.05115481, -0.057988662, -0.070849776,
+            ]],
+            dtype=np.float32,
+        )
+        bias = np.array(
+            [
+                34.18921, 34.60598, 34.601982, 34.601982,
+                34.60798, 34.572998, 34.598984, 34.601982,
+                34.383102, 34.412086, 34.379105, 34.381104,
+                34.397095, 34.397095, 34.420082,
+            ],
+            dtype=np.float32,
+        )
+        full_ids, _ = sigmoid_router_reference(logits, bias, topk=8)
+        raw = bias.view(np.uint32)
+        low = raw & np.uint32(0xFFFF)
+        increment = (
+            (low > np.uint32(0x8000))
+            | ((low == np.uint32(0x8000)) & (((raw >> np.uint32(16)) & 1) != 0))
+        ).astype(np.uint32)
+        bf16_bias = ((raw + (increment << np.uint32(16))) & np.uint32(0xFFFF0000)).view(np.float32)
+        rounded_ids, _ = sigmoid_router_reference(logits, bf16_bias, topk=8)
+        np.testing.assert_array_equal(full_ids[0], np.arange(8, dtype=np.int32))
+        np.testing.assert_array_equal(rounded_ids[0], [0, 8, 9, 10, 11, 12, 13, 14])
+
     def test_ties_are_stable_and_weights_sum_to_one(self):
         logits = np.zeros((2, 4), dtype=np.float32)
         bias = np.zeros(4, dtype=np.float32)

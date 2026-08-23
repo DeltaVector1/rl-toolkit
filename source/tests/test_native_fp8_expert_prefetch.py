@@ -136,6 +136,40 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
         self.assertIn("raw_router_logits = scores.to", forward_source)
         self.assertIn("del raw_router_logits", forward_source)
 
+    def test_glm_router_bias_stays_fp32_across_setup_and_load(self):
+        model_source = MODEL.read_text()
+        helper = ast.unparse(
+            next(
+                node
+                for node in ast.parse(model_source).body
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "preserve_glm_moe_bias_precision"
+            )
+        )
+        self.assertIn("glm_moe_dsa", helper)
+        self.assertIn("expert_bias", helper)
+        self.assertIn("e_score_correction_bias", helper)
+        self.assertIn("value.to(dtype=torch.float32)", helper)
+        self.assertIn("GLM {name} must remain float32", helper)
+
+        setup_source = ast.unparse(
+            next(
+                node
+                for node in ast.parse(model_source).body
+                if isinstance(node, ast.FunctionDef) and node.name == "setup_model"
+            )
+        )
+        self.assertGreaterEqual(
+            setup_source.count("preserve_glm_moe_bias_precision(model)"), 4
+        )
+        self.assertIn("apply_pp_layers(model, pp_rank, parallel_dims.pp)", setup_source)
+        self.assertIn("setup_fsdp(model, config, parallel_dims)", setup_source)
+        self.assertIn("load_dcp_from_hf(model, config, parallel_dims)", setup_source)
+
+        bias_bytes = 78 * 256 * 4
+        self.assertEqual(bias_bytes, 79872)
+        self.assertLess(bias_bytes, 128 * 1024)
+
     @unittest.skipUnless(
         torch is not None and torch.cuda.is_available(),
         "BF16 router autograd test requires CUDA PyTorch",

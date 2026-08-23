@@ -462,6 +462,32 @@ def apply_fp32_moe_router(model: nn.Module) -> None:
         logger.info(f"Running {num_routers} MoE router outputs in fp32")
 
 
+def preserve_glm_moe_bias_precision(model: nn.Module) -> None:
+    """Keep GLM routing correction buffers in FP32 while gates stay BF16."""
+    if getattr(getattr(model, "config", None), "model_type", None) != "glm_moe_dsa":
+        return
+    language_model = get_language_model(model)
+    restored = 0
+    for layer in iter_layers(language_model.layers):
+        mlp = getattr(layer, "mlp", None)
+        if not isinstance(mlp, (MoE, LatentMoE)):
+            continue
+        for owner, name in (
+            (mlp, "expert_bias"),
+            (mlp.router, "e_score_correction_bias"),
+        ):
+            value = getattr(owner, name, None)
+            if value is None:
+                continue
+            if value.dtype != torch.float32:
+                setattr(owner, name, value.to(dtype=torch.float32))
+                restored += 1
+            if getattr(owner, name).dtype != torch.float32:
+                raise RuntimeError(f"GLM {name} must remain float32")
+    if restored:
+        get_logger().info(f"Restored {restored} GLM routing correction buffers to fp32")
+
+
 def freeze_sparse_indexer(model: nn.Module) -> None:
     """Freeze DSA sparse-attention indexer parameters.
 
@@ -1464,6 +1490,7 @@ def setup_model(
 
         pp_rank = parallel_dims.get_mesh("pp").get_local_rank()
         apply_pp_layers(model, pp_rank, parallel_dims.pp)
+        preserve_glm_moe_bias_precision(model)
 
     possible_to_load_to_meta = can_reinit_empty_buffers(model)
 
@@ -1509,6 +1536,8 @@ def setup_model(
     if config.debug.force_balanced_routing:
         apply_force_balanced_routing(model)
 
+    preserve_glm_moe_bias_precision(model)
+
     if parallel_dims.ep_enabled:
         apply_ep(model, config, parallel_dims)
         # EP replaces params with DTensors that default to requires_grad=True,
@@ -1529,6 +1558,7 @@ def setup_model(
         apply_compile(model, config.compile)
 
     setup_fsdp(model, config, parallel_dims)
+    preserve_glm_moe_bias_precision(model)
 
     if not possible_to_load_to_meta:
         _move_buffers_to_cuda(model, config)
@@ -1552,9 +1582,11 @@ def setup_model(
                     model.tie_weights()
 
             _move_buffers_to_cuda(model, config)
+            preserve_glm_moe_bias_precision(model)
         # - or load from HF with dcp
         else:
             load_dcp_from_hf(model, config, parallel_dims)
+            preserve_glm_moe_bias_precision(model)
 
     _reset_runtime_moe_buffers(model)
     return model

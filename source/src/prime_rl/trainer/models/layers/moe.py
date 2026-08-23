@@ -691,7 +691,7 @@ class TokenChoiceTopKRouter(nn.Module):
         #       top_scores is still derived from the original scores.
         selection_scores = scores
         if expert_bias is not None:
-            selection_scores = selection_scores + expert_bias
+            selection_scores = selection_scores + expert_bias.to(torch.float32)
 
         if router_debug_active:
             from prime_rl.parity_router_trace import write_router_debug_chunk
@@ -1288,10 +1288,10 @@ class NemotronHRouter(nn.Module):
             # are intentionally skipped here.
             selected_experts_indices = routed_experts
         else:
-            scores_for_choice = scores + self.e_score_correction_bias
+            scores_for_choice = scores + self.e_score_correction_bias.to(torch.float32)
 
             if expert_bias is not None:
-                scores_for_choice = scores_for_choice + expert_bias
+                scores_for_choice = scores_for_choice + expert_bias.to(torch.float32)
 
             # Group-based routing
             if self.n_group > 1:
