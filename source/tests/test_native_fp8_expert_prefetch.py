@@ -282,10 +282,18 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
         train_source = (ROOT / "source/src/prime_rl/trainer/rl/train.py").read_text()
         load_position = train_source.index("ckpt_manager.load(checkpoint_step")
         preserve_position = train_source.index("preserve_glm_moe_bias_precision(model)", load_position - 500)
+        restore_position = train_source.index(
+            "restore_glm_moe_bias_values(model, base_snapshot, parallel_dims)",
+            load_position,
+        )
         validate_position = train_source.index("validate_glm_moe_bias_values(model, parallel_dims)", load_position)
         self.assertLess(preserve_position, load_position)
-        self.assertLess(load_position, validate_position)
-        self.assertNotIn("restore_glm_moe_bias_values(model, Path(config.model.name)", train_source)
+        self.assertLess(load_position, restore_position)
+        self.assertLess(restore_position, validate_position)
+        self.assertIn("if config.model.freeze_moe_router:", train_source[load_position:validate_position])
+        self.assertIn("else:\n            cache_glm_moe_bias_values(model)", train_source[load_position:validate_position])
+        self.assertIn("if not base_snapshot.is_dir():", train_source[load_position:restore_position])
+        self.assertIn("Frozen GLM resume requires the local base model snapshot", train_source)
 
     @unittest.skipUnless(torch is not None, "FP32 checkpoint restoration requires PyTorch")
     def test_glm_router_bias_restores_exact_checkpoint_values(self):

@@ -52,6 +52,7 @@ from prime_rl.trainer.model import (
     get_load_balance_stats,
     preserve_glm_moe_bias_precision,
     cache_glm_moe_bias_values,
+    restore_glm_moe_bias_values,
     validate_glm_moe_bias_values,
 )
 from prime_rl.trainer.parallel_dims import get_parallel_dims, resolve_ep
@@ -664,7 +665,15 @@ def train(config: TrainerConfig):
     if checkpoint_step is not None:
         preserve_glm_moe_bias_precision(model)
         ckpt_manager.load(checkpoint_step, model, [optimizer], scheduler, progress)
-        cache_glm_moe_bias_values(model)
+        if config.model.freeze_moe_router:
+            base_snapshot = Path(config.model.name)
+            if not base_snapshot.is_dir():
+                raise RuntimeError(
+                    "Frozen GLM resume requires the local base model snapshot"
+                )
+            restore_glm_moe_bias_values(model, base_snapshot, parallel_dims)
+        else:
+            cache_glm_moe_bias_values(model)
         validate_glm_moe_bias_values(model, parallel_dims)
         # The checkpoint finished step ``checkpoint_step``; resume training at the next step.
         progress.step += 1
