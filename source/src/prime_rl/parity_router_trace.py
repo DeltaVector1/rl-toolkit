@@ -769,10 +769,10 @@ def write_router_debug_chunk(
     if limit < 1 or max_bytes < 1:
         raise ValueError("router debug limits must be positive")
     torch = __import__("torch")
-    input_array = router_input.detach().to(dtype=torch.float32, device="cpu").numpy()[:limit]
-    logits_array = router_logits.detach().to(dtype=torch.float32, device="cpu").numpy()[:limit]
-    pre_bias_array = pre_bias_scores.detach().to(dtype=torch.float32, device="cpu").numpy()[:limit]
-    selection_array = selection_scores.detach().to(dtype=torch.float32, device="cpu").numpy()[:limit]
+    input_array = router_input.detach()[:limit].to(dtype=torch.float32, device="cpu").numpy()
+    logits_array = router_logits.detach()[:limit].to(dtype=torch.float32, device="cpu").numpy()
+    pre_bias_array = pre_bias_scores.detach()[:limit].to(dtype=torch.float32, device="cpu").numpy()
+    selection_array = selection_scores.detach()[:limit].to(dtype=torch.float32, device="cpu").numpy()
     if (
         input_array.ndim != 2
         or logits_array.ndim != 2
@@ -818,6 +818,10 @@ def write_router_debug_chunk(
         os.replace(temporary, path)
         _debug_written = True
         _debug_written_bytes += estimate
+
+
+def router_debug_enabled(layer: int | None) -> bool:
+    return layer is not None and trace_root() is not None and _process_side is not None
 
 
 def assemble_chunks(root: Path, session: TraceSession) -> tuple[np.ndarray, np.ndarray]:

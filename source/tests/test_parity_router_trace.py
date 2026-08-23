@@ -21,6 +21,7 @@ from prime_rl.parity_router_trace import (
     trace_dir_env,
     trace_session_identity,
     validate_sparse_routes,
+    router_debug_enabled,
     write_route_chunk,
     write_router_debug_chunk,
     write_session,
@@ -44,6 +45,9 @@ class FakeTensor:
 
     def numpy(self):
         return self.value
+
+    def __getitem__(self, key):
+        return FakeTensor(self.value[key])
 
     def __mul__(self, other):
         return FakeTensor(self.value * other)
@@ -149,6 +153,37 @@ class ParityRouterTraceTest(unittest.TestCase):
                 self.assertEqual(saved["selection_scores"].shape, (2, 4))
             clear_trace(root)
             self.assertFalse(path.exists())
+
+    def test_router_debug_slices_before_transfer(self):
+        events = []
+
+        class TrackingTensor(FakeTensor):
+            def __init__(self, value):
+                super().__init__(value)
+
+            def __getitem__(self, key):
+                events.append("slice")
+                return TrackingTensor(self.value[key])
+
+            def to(self, *args, dtype=None, device=None):
+                events.append("transfer")
+                return super().to(*args, dtype=dtype, device=device)
+
+        torch = fake_torch()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_session(root, session())
+            value = TrackingTensor([[0.1, 0.2, 0.3, 0.4]] * 4)
+            environment = {trace_dir_env: str(root), "PRIME_PARITY_ROUTER_DEBUG_TOKENS": "2"}
+            with patch.dict(os.environ, environment, clear=True), patch.dict(sys.modules, {"torch": torch}):
+                configure_process_trace("trainer", rank=0)
+                write_router_debug_chunk(1, value, value, value, value)
+        self.assertEqual(events, ["slice", "transfer"] * 4)
+
+    def test_router_debug_is_disabled_without_trace_root(self):
+        with patch.dict(os.environ, {}, clear=True):
+            configure_process_trace("trainer", rank=0)
+            self.assertFalse(router_debug_enabled(1))
 
     def test_bias_selects_and_unbiased_sigmoid_weights_score(self):
         logits = np.array([[2.0, 1.0, -1.0, -2.0]], dtype=np.float32)

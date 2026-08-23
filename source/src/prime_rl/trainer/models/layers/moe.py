@@ -637,6 +637,11 @@ class TokenChoiceTopKRouter(nn.Module):
         assert routed_experts is None or routed_experts.shape[-1] == self.top_k, (
             f"routed_experts shape: {routed_experts.shape}, top_k: {self.top_k}"
         )
+        router_debug_active = False
+        if self.parity_trace_layer is not None:
+            from prime_rl.parity_router_trace import router_debug_enabled
+
+            router_debug_active = router_debug_enabled(self.parity_trace_layer)
         if self.use_fp32_router_output:
             gate_weight = self.gate.weight
             if gate_weight.dtype == torch.bfloat16:
@@ -646,7 +651,8 @@ class TokenChoiceTopKRouter(nn.Module):
             scores = torch.mm(gate_input, gate_weight.t(), out_dtype=torch.float32)
         else:
             scores = self.gate(x)
-        router_logits = scores.to(torch.float32)
+        if router_debug_active:
+            raw_router_logits = scores.to(torch.float32)
 
         # By default, sigmoid or softmax is performed in float32 to avoid loss explosion
         if self.score_func == "sigmoid":
@@ -667,6 +673,18 @@ class TokenChoiceTopKRouter(nn.Module):
         selection_scores = scores
         if expert_bias is not None:
             selection_scores = selection_scores + expert_bias
+
+        if router_debug_active:
+            from prime_rl.parity_router_trace import write_router_debug_chunk
+
+            write_router_debug_chunk(
+                self.parity_trace_layer,
+                x,
+                raw_router_logits,
+                scores,
+                selection_scores,
+            )
+            del raw_router_logits
 
         if routed_experts is not None:
             selected_experts_indices = routed_experts
@@ -700,20 +718,13 @@ class TokenChoiceTopKRouter(nn.Module):
             top_scores = top_scores / denominator
 
         if self.parity_trace_layer is not None:
-            from prime_rl.parity_router_trace import write_route_chunk, write_router_debug_chunk
+            from prime_rl.parity_router_trace import write_route_chunk
 
             write_route_chunk(
                 self.parity_trace_layer,
                 selected_experts_indices,
                 top_scores,
                 route_output_scale=self.route_scale,
-            )
-            write_router_debug_chunk(
-                self.parity_trace_layer,
-                x,
-                router_logits,
-                scores,
-                selection_scores,
             )
 
         # group tokens together by expert indices from 0 to num_experts and pass that to experts forward

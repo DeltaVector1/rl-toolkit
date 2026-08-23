@@ -108,6 +108,17 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
         )
         self.assertNotIn("sorted=False", token_router_source)
 
+        forward_source = ast.unparse(
+            next(
+                node
+                for node in ast.parse(moe_source).body
+                if isinstance(node, ast.ClassDef) and node.name == "TokenChoiceTopKRouter"
+            )
+        )
+        self.assertIn("if router_debug_active", forward_source)
+        self.assertIn("raw_router_logits = scores.to", forward_source)
+        self.assertIn("del raw_router_logits", forward_source)
+
 
 if __name__ == "__main__":
     unittest.main()
