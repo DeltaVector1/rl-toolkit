@@ -702,6 +702,7 @@ class TokenChoiceTopKRouter(nn.Module):
                 raw_router_logits,
                 scores,
                 selection_scores,
+                expert_bias,
             )
             del raw_router_logits
 
@@ -1038,12 +1039,16 @@ class MoE(nn.Module):
 
         # top_scores and selected_experts_indices shape (bs*slen*top_k,)
         # num_tokens_per_expert shape (num_experts,)
+        expert_bias = getattr(self, "_fp32_expert_bias", self.expert_bias)
+        if expert_bias is not None and expert_bias.device != x.device:
+            expert_bias = expert_bias.to(x.device)
+            self._fp32_expert_bias = expert_bias
         (
             top_scores,
             selected_experts_indices,
             num_tokens_per_expert,
             routing_confidence_sum,
-        ) = self.router(x, self.expert_bias, routed_experts=routed_experts)
+        ) = self.router(x, expert_bias, routed_experts=routed_experts)
 
         # tokens_per_expert will be used to update the expert bias for load balancing.
         # and also to count the expert usage

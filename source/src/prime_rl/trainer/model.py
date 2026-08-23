@@ -596,6 +596,14 @@ def validate_glm_moe_bias_values(
     """Validate loaded GLM routing buffers without changing their values."""
     if getattr(getattr(model, "config", None), "model_type", None) != "glm_moe_dsa":
         return
+    local_layers = _collect_live_glm_moe_bias_layers(model)
+    expected_layers = getattr(model, "_glm_moe_source_layers", None)
+    if expected_layers is not None and local_layers != expected_layers:
+        raise RuntimeError("GLM routing-bias destination differs from exact source after setup")
+    _publish_glm_moe_bias_fingerprint(model, parallel_dims, local_layers, "Validated")
+
+
+def _collect_live_glm_moe_bias_layers(model: nn.Module) -> dict[str, dict]:
     local_layers: dict[str, dict] = {}
     language_model = get_language_model(model)
     for layer in iter_layers(language_model.layers):
@@ -616,7 +624,31 @@ def validate_glm_moe_bias_values(
             "shape": list(value.shape),
             "sha256": hashlib.sha256(raw).hexdigest(),
         }
-    _publish_glm_moe_bias_fingerprint(model, parallel_dims, local_layers, "Validated")
+        if layer_index == 3 and os.environ.get("RANK", "0") == "0":
+            data_ptr = value.data_ptr() if hasattr(value, "data_ptr") else 0
+            get_logger().info(
+                f"GLM routing layer=3 live dtype={value.dtype} id={id(value)} "
+                f"data_ptr={data_ptr} sha256={local_layers[f'model.layers.{layer_index}.mlp.expert_bias']['sha256']}"
+            )
+    return local_layers
+
+
+def cache_glm_moe_bias_values(model: nn.Module) -> None:
+    """Keep an FP32 copy outside FSDP's mixed-precision buffer casts."""
+    if getattr(getattr(model, "config", None), "model_type", None) != "glm_moe_dsa":
+        return
+    language_model = get_language_model(model)
+    for layer in iter_layers(language_model.layers):
+        mlp = getattr(layer, "mlp", None)
+        if not isinstance(mlp, (MoE, LatentMoE)):
+            continue
+        value = getattr(mlp, "expert_bias", None)
+        if value is None or value.dtype != torch.float32:
+            raise RuntimeError("Cannot cache a non-FP32 GLM routing correction")
+        cached = value.detach().clone()
+        setattr(mlp, "_fp32_expert_bias", cached)
+        if "_fp32_expert_bias" in mlp._buffers:
+            raise RuntimeError("GLM FP32 routing cache must not be an FSDP buffer")
 
 
 def restore_glm_moe_bias_values(
@@ -682,6 +714,12 @@ def restore_glm_moe_bias_values(
                         f"does not match layer {layer_index} target {tuple(target.shape)}"
                     )
                 source_bytes = source.contiguous().view(torch.uint8).numpy().tobytes()
+                if int(layer_index) == 3 and os.environ.get("RANK", "0") == "0":
+                    data_ptr = target.data_ptr() if hasattr(target, "data_ptr") else 0
+                    get_logger().info(
+                        f"GLM routing layer=3 before_copy dtype={target.dtype} id={id(target)} "
+                        f"data_ptr={data_ptr}"
+                    )
                 local_layers[f"model.layers.{layer_index}.mlp.expert_bias"] = {
                     "layer": int(layer_index),
                     "dtype": str(source.dtype),
@@ -690,12 +728,23 @@ def restore_glm_moe_bias_values(
                 }
                 with torch.no_grad():
                     target.copy_(source.to(device=target.device, dtype=torch.float32))
+                if int(layer_index) == 3 and os.environ.get("RANK", "0") == "0":
+                    data_ptr = target.data_ptr() if hasattr(target, "data_ptr") else 0
+                    get_logger().info(
+                        f"GLM routing layer=3 after_copy dtype={target.dtype} id={id(target)} "
+                        f"data_ptr={data_ptr}"
+                    )
                 restored += 1
 
     if restored != len(local_layers):
         raise RuntimeError(f"GLM routing-bias restoration produced duplicate records: {restored}")
 
-    _publish_glm_moe_bias_fingerprint(model, parallel_dims, local_layers, "Restored")
+    live_layers = _collect_live_glm_moe_bias_layers(model)
+    if live_layers != local_layers:
+        raise RuntimeError("GLM routing-bias destination differs from exact source after restore")
+    model._glm_moe_source_layers = live_layers
+    cache_glm_moe_bias_values(model)
+    _publish_glm_moe_bias_fingerprint(model, parallel_dims, live_layers, "Restored")
 
 
 def freeze_sparse_indexer(model: nn.Module) -> None:
@@ -1800,6 +1849,8 @@ def setup_model(
             preserve_glm_moe_bias_precision(model)
 
     _reset_runtime_moe_buffers(model)
+    if possible_to_load_to_meta and not loading_from_checkpoint_later:
+        validate_glm_moe_bias_values(model, parallel_dims)
     return model
 
 

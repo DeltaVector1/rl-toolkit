@@ -206,6 +206,21 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
         )
         self.assertGreater(restore_expressions[0].lineno, lora_loop.end_lineno)
         self.assertIn("source.dtype != torch.float32", ast.unparse(ast.parse(model_source)))
+        self.assertIn("_collect_live_glm_moe_bias_layers", model_source)
+        self.assertIn("cache_glm_moe_bias_values", model_source)
+        self.assertIn("destination differs from exact source after setup", model_source)
+        setup_source = ast.unparse(
+            next(
+                node
+                for node in ast.parse(model_source).body
+                if isinstance(node, ast.FunctionDef) and node.name == "setup_model"
+            )
+        )
+        self.assertIn("_reset_runtime_moe_buffers(model)", setup_source)
+        self.assertIn("validate_glm_moe_bias_values(model, parallel_dims)", setup_source)
+        moe_source = (ROOT / "source/src/prime_rl/trainer/models/layers/moe.py").read_text()
+        self.assertIn('getattr(self, "_fp32_expert_bias", self.expert_bias)', moe_source)
+        self.assertIn("self.router(x, expert_bias, routed_experts=routed_experts)", moe_source)
 
     @unittest.skipUnless(torch is not None, "PP fingerprint validation requires PyTorch")
     def test_glm_router_bias_fingerprint_requires_all_75_routed_layers(self):

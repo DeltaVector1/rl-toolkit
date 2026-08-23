@@ -51,6 +51,7 @@ from prime_rl.trainer.model import (
     is_tt_moe_model,
     get_load_balance_stats,
     preserve_glm_moe_bias_precision,
+    cache_glm_moe_bias_values,
     validate_glm_moe_bias_values,
 )
 from prime_rl.trainer.parallel_dims import get_parallel_dims, resolve_ep
@@ -664,6 +665,7 @@ def train(config: TrainerConfig):
         preserve_glm_moe_bias_precision(model)
         ckpt_manager.load(checkpoint_step, model, [optimizer], scheduler, progress)
         validate_glm_moe_bias_values(model, parallel_dims)
+        cache_glm_moe_bias_values(model)
         # The checkpoint finished step ``checkpoint_step``; resume training at the next step.
         progress.step += 1
         logger.info(f"Resuming training from checkpoint step {checkpoint_step}")

@@ -758,6 +758,7 @@ def write_router_debug_chunk(
     router_logits: Any,
     pre_bias_scores: Any,
     selection_scores: Any,
+    expert_bias: Any | None = None,
 ) -> None:
     """Write one bounded router diagnostic chunk for the first routed layer."""
     global _debug_written, _debug_written_bytes, _debug_written_session
@@ -784,6 +785,9 @@ def write_router_debug_chunk(
         logits_array = router_logits.detach()[:limit].to(dtype=torch.float32, device="cpu").numpy()
         pre_bias_array = pre_bias_scores.detach()[:limit].to(dtype=torch.float32, device="cpu").numpy()
         selection_array = selection_scores.detach()[:limit].to(dtype=torch.float32, device="cpu").numpy()
+        bias_array = None
+        if expert_bias is not None:
+            bias_array = expert_bias.detach().to(dtype=torch.float32, device="cpu").numpy()
         if (
             input_array.ndim != 2
             or logits_array.ndim != 2
@@ -805,6 +809,7 @@ def write_router_debug_chunk(
             + logits_array.nbytes
             + pre_bias_array.nbytes
             + selection_array.nbytes
+            + (0 if bias_array is None else bias_array.nbytes)
             + 4096
         )
         if estimate > max_bytes:
@@ -818,13 +823,18 @@ def write_router_debug_chunk(
         if path.exists():
             raise FileExistsError(f"router debug chunk already exists: {path}")
         with temporary.open("wb") as stream:
-            np.savez(
-                stream,
+            arrays = dict(
                 router_input=input_array,
                 router_logits=logits_array,
                 pre_bias_scores=pre_bias_array,
                 selection_scores=selection_array,
             )
+            if bias_array is not None:
+                arrays["expert_bias"] = bias_array
+                arrays["expert_bias_object_id"] = np.asarray(id(expert_bias), dtype=np.uint64)
+                data_ptr = expert_bias.data_ptr() if hasattr(expert_bias, "data_ptr") else 0
+                arrays["expert_bias_data_ptr"] = np.asarray(data_ptr, dtype=np.uint64)
+            np.savez(stream, **arrays)
         os.replace(temporary, path)
         _debug_written = True
         _debug_written_bytes += estimate
