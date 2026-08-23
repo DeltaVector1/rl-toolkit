@@ -226,6 +226,8 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
         moe_source = (ROOT / "source/src/prime_rl/trainer/models/layers/moe.py").read_text()
         self.assertIn("_require_static_expert_bias(self)", moe_source)
         self.assertEqual(moe_source.count("_require_static_expert_bias(self)"), 2)
+        self.assertIn("selection_bias = expert_bias", moe_source)
+        self.assertIn("selection_scores = selection_scores + selection_bias.to(torch.float32)", moe_source)
         self.assertIn('static_expert_bias = getattr(self, "_use_static_expert_bias", False)', moe_source)
         self.assertIn("if self.load_balance_coeff is not None:", moe_source)
         self.assertIn("expert_bias_is_static=static_expert_bias", moe_source)

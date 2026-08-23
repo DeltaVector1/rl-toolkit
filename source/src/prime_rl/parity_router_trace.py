@@ -758,10 +758,10 @@ def write_router_debug_chunk(
     router_logits: Any,
     pre_bias_scores: Any,
     selection_scores: Any,
-    expert_bias: Any | None = None,
-    expert_bias_source_sha256: str | None = None,
-    expert_bias_cache_sha256: str | None = None,
-    expert_bias_is_static: bool = False,
+    selection_bias: Any | None = None,
+    selection_bias_source_sha256: str | None = None,
+    selection_bias_cache_sha256: str | None = None,
+    selection_bias_is_static: bool = False,
 ) -> None:
     """Write one bounded router diagnostic chunk for the first routed layer."""
     global _debug_written, _debug_written_bytes, _debug_written_session
@@ -789,8 +789,8 @@ def write_router_debug_chunk(
         pre_bias_array = pre_bias_scores.detach()[:limit].to(dtype=torch.float32, device="cpu").numpy()
         selection_array = selection_scores.detach()[:limit].to(dtype=torch.float32, device="cpu").numpy()
         bias_array = None
-        if expert_bias is not None:
-            bias_array = expert_bias.detach().to(dtype=torch.float32, device="cpu").numpy()
+        if selection_bias is not None:
+            bias_array = selection_bias.detach().to(dtype=torch.float32, device="cpu").numpy()
         if (
             input_array.ndim != 2
             or logits_array.ndim != 2
@@ -813,8 +813,8 @@ def write_router_debug_chunk(
             + pre_bias_array.nbytes
             + selection_array.nbytes
             + (0 if bias_array is None else bias_array.nbytes)
-            + (0 if expert_bias_source_sha256 is None else 64)
-            + (0 if expert_bias_cache_sha256 is None else 64)
+            + (0 if selection_bias_source_sha256 is None else 64)
+            + (0 if selection_bias_cache_sha256 is None else 64)
             + 4096
         )
         if estimate > max_bytes:
@@ -835,18 +835,18 @@ def write_router_debug_chunk(
                 selection_scores=selection_array,
             )
             if bias_array is not None:
-                arrays["expert_bias"] = bias_array
-                arrays["expert_bias_object_id"] = np.asarray(id(expert_bias), dtype=np.uint64)
-                data_ptr = expert_bias.data_ptr() if hasattr(expert_bias, "data_ptr") else 0
-                arrays["expert_bias_data_ptr"] = np.asarray(data_ptr, dtype=np.uint64)
-                arrays["expert_bias_is_static"] = np.asarray(expert_bias_is_static, dtype=np.bool_)
-                if expert_bias_source_sha256 is not None:
-                    arrays["expert_bias_source_sha256"] = np.asarray(
-                        expert_bias_source_sha256, dtype="<U64"
+                arrays["selection_bias"] = bias_array
+                arrays["selection_bias_object_id"] = np.asarray(id(selection_bias), dtype=np.uint64)
+                data_ptr = selection_bias.data_ptr() if hasattr(selection_bias, "data_ptr") else 0
+                arrays["selection_bias_data_ptr"] = np.asarray(data_ptr, dtype=np.uint64)
+                arrays["selection_bias_is_static"] = np.asarray(selection_bias_is_static, dtype=np.bool_)
+                if selection_bias_source_sha256 is not None:
+                    arrays["selection_bias_source_sha256"] = np.asarray(
+                        selection_bias_source_sha256, dtype="<U64"
                     )
-                if expert_bias_cache_sha256 is not None:
-                    arrays["expert_bias_cache_sha256"] = np.asarray(
-                        expert_bias_cache_sha256, dtype="<U64"
+                if selection_bias_cache_sha256 is not None:
+                    arrays["selection_bias_cache_sha256"] = np.asarray(
+                        selection_bias_cache_sha256, dtype="<U64"
                     )
             np.savez(stream, **arrays)
         os.replace(temporary, path)

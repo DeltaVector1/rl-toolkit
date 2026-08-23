@@ -715,9 +715,10 @@ class TokenChoiceTopKRouter(nn.Module):
         # top scores shape (bs*slen, top_k)
         # NOTE: The expert_bias is only used for routing. The gating value
         #       top_scores is still derived from the original scores.
+        selection_bias = expert_bias
         selection_scores = scores
-        if expert_bias is not None:
-            selection_scores = selection_scores + expert_bias.to(torch.float32)
+        if selection_bias is not None:
+            selection_scores = selection_scores + selection_bias.to(torch.float32)
 
         if router_debug_active:
             from prime_rl.parity_router_trace import write_router_debug_chunk
@@ -728,7 +729,7 @@ class TokenChoiceTopKRouter(nn.Module):
                 raw_router_logits,
                 scores,
                 selection_scores,
-                expert_bias,
+                selection_bias,
                 expert_bias_source_sha256,
                 expert_bias_cache_sha256,
                 expert_bias_is_static,

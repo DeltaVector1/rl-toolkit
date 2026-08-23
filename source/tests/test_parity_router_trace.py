@@ -162,11 +162,11 @@ class ParityRouterTraceTest(unittest.TestCase):
                 self.assertEqual(saved["router_logits"].shape, (2, 4))
                 self.assertEqual(saved["pre_bias_scores"].shape, (2, 4))
                 self.assertEqual(saved["selection_scores"].shape, (2, 4))
-                np.testing.assert_allclose(saved["expert_bias"], bias.value)
-                self.assertEqual(saved["expert_bias_data_ptr"].item(), 0)
-                self.assertEqual(saved["expert_bias_source_sha256"].item(), "a" * 64)
-                self.assertEqual(saved["expert_bias_cache_sha256"].item(), "a" * 64)
-                self.assertTrue(saved["expert_bias_is_static"].item())
+                np.testing.assert_allclose(saved["selection_bias"], bias.value)
+                self.assertEqual(saved["selection_bias_data_ptr"].item(), 0)
+                self.assertEqual(saved["selection_bias_source_sha256"].item(), "a" * 64)
+                self.assertEqual(saved["selection_bias_cache_sha256"].item(), "a" * 64)
+                self.assertTrue(saved["selection_bias_is_static"].item())
             clear_trace(root)
             self.assertFalse(path.exists())
 
@@ -195,6 +195,58 @@ class ParityRouterTraceTest(unittest.TestCase):
                 configure_process_trace("trainer", rank=0)
                 write_router_debug_chunk(1, value, value, value, value)
         self.assertEqual(events, ["slice", "transfer"] * 4)
+
+    def test_router_debug_records_the_selection_bias_operand(self):
+        torch = fake_torch()
+        logits = np.zeros((4, 4), dtype=np.float32)
+        exact_bias = np.asarray([0.0, 0.0001, 0.0, 0.0], dtype=np.float32)
+        rounded_bias = np.zeros(4, dtype=np.float32)
+        exact_ids, exact_weights = sigmoid_router_reference(logits, exact_bias, 2)
+        rounded_ids, _ = sigmoid_router_reference(logits, rounded_bias, 2)
+        self.assertFalse(np.array_equal(exact_ids, rounded_ids))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_session(root, session())
+            environment = {
+                trace_dir_env: str(root),
+                "PRIME_PARITY_TRACE_MAX_CALLS": "2",
+                "PRIME_PARITY_TRACE_MAX_FILES": "2",
+                "PRIME_PARITY_TRACE_MAX_BYTES": "100000",
+                "PRIME_PARITY_ROUTER_DEBUG_TOKENS": "4",
+            }
+            pre_bias = FakeTensor(logits)
+            selection = FakeTensor(logits + exact_bias[None, :])
+            with patch.dict(os.environ, environment, clear=True), patch.dict(sys.modules, {"torch": torch}):
+                configure_process_trace("trainer", rank=0)
+                write_route_chunk(
+                    1,
+                    FakeTensor(exact_ids),
+                    FakeTensor(exact_weights),
+                    route_output_scale=2.5,
+                )
+                write_router_debug_chunk(
+                    1,
+                    pre_bias,
+                    pre_bias,
+                    pre_bias,
+                    selection,
+                    FakeTensor(exact_bias),
+                    "a" * 64,
+                    "a" * 64,
+                    True,
+                )
+            debug_path = root / "trainer-rank-0-pp-0-cp-0-layer-1-router-debug.npz"
+            route_path = root / "trainer-rank-0-pp-0-cp-0-layer-1-call-0.npz"
+            with np.load(debug_path, allow_pickle=False) as saved:
+                np.testing.assert_allclose(saved["selection_bias"], exact_bias)
+                np.testing.assert_allclose(
+                    saved["selection_scores"] - saved["pre_bias_scores"],
+                    np.broadcast_to(exact_bias, (4, 4)),
+                )
+                self.assertFalse(np.allclose(saved["selection_bias"], rounded_bias))
+            with np.load(route_path, allow_pickle=False) as saved:
+                np.testing.assert_array_equal(saved["ids"], exact_ids)
+                np.testing.assert_allclose(saved["weights"], exact_weights)
 
     def test_router_debug_is_disabled_without_trace_root(self):
         with patch.dict(os.environ, {}, clear=True):
