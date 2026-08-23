@@ -7,6 +7,7 @@ import datetime as _dt
 import hashlib
 import json
 import math
+import os
 import re
 import shlex
 import statistics
@@ -46,6 +47,8 @@ shared_requirements = operations["requirements"]["shared"]
 muse_requirements = operations["requirements"]["muse"]
 glm_requirements = operations["requirements"]["glm52"]
 glm_parity_paths = operations["parity"]["glm52"]
+parity_trace_root = "/data/glm52-rl/qualifications/glm52-policy-parity/trainer-traces"
+parity_token_root = "/data/glm52-rl/qualifications/glm52-policy-parity/trainer/token_exports"
 
 trainer_head = hosts["trainer_head"]
 trainer_hosts = list(hosts["trainers"])
@@ -188,6 +191,13 @@ def _check_host(host: str) -> str:
     for bad in blocked_hosts:
         if re.search(rf"\b{bad}\b", host):
             raise Refused(f"{bad} is off limits. The owner said so with no exception.")
+    return host
+
+
+def _check_parity_host(host: str) -> str:
+    _check_host(host)
+    if host not in trainer_hosts:
+        raise Refused(f"parity host is not in the configured trainer list: {host}")
     return host
 
 
@@ -3698,6 +3708,86 @@ def stage_glm52_policy_parity(nodes: list[str] | None = None) -> None:
     print(f"GLM parity trainer stage verified on {len(nodes)} nodes")
 
 
+def _validate_parity_remote_source(remote: str) -> None:
+    if remote == parity_token_root:
+        return
+    if re.fullmatch(
+        rf"{re.escape(parity_trace_root)}/[A-Za-z0-9_-]+", remote
+    ):
+        return
+    raise Refused("parity evidence source is not an approved exact directory")
+
+
+def _validate_parity_extraction(destination: Path) -> None:
+    root = destination.resolve()
+    for current, directories, files in os.walk(root, followlinks=False):
+        for name in (*directories, *files):
+            path = Path(current) / name
+            if path.is_symlink():
+                raise RuntimeError(f"parity evidence contains a symlink: {path}")
+            if not path.resolve().is_relative_to(root):
+                raise RuntimeError(f"parity evidence escapes its destination: {path}")
+
+
+def _copy_parity_tree_stream(host: str, remote: str, local: Path) -> None:
+    """Extract one remote tar stream into a controlled local directory."""
+    _check_parity_host(host)
+    _validate_parity_remote_source(remote)
+    if local.exists() and (local.is_symlink() or not local.is_dir()):
+        raise RuntimeError(f"parity evidence destination is not a directory: {local}")
+    local.mkdir(parents=True, exist_ok=True)
+    remote_process = subprocess.Popen(
+        [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            host,
+            "tar",
+            "-C",
+            remote,
+            "-cf",
+            "-",
+            ".",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert remote_process.stdout is not None
+    local_process = subprocess.Popen(
+        [
+            "tar",
+            "--extract",
+            "--file=-",
+            "--directory",
+            str(local),
+            "--no-same-owner",
+            "--no-same-permissions",
+            "--no-overwrite-dir",
+        ],
+        stdin=remote_process.stdout,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    remote_process.stdout.close()
+    timeout = 1800
+    try:
+        _, local_error = local_process.communicate(timeout=timeout)
+        _, remote_error = remote_process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        for process in (local_process, remote_process):
+            process.kill()
+        for process in (local_process, remote_process):
+            process.communicate()
+        raise RuntimeError(f"parity evidence tar transfer timed out after {timeout}s") from error
+    if remote_process.returncode:
+        detail = (remote_error or b"").decode(errors="replace").strip()[:200]
+        raise RuntimeError(f"parity evidence remote tar failed: {detail}")
+    if local_process.returncode:
+        detail = (local_error or b"").decode(errors="replace").strip()[:200]
+        raise RuntimeError(f"parity evidence local tar failed: {detail}")
+    _validate_parity_extraction(local)
+
+
 def _copy_parity_host_evidence(
     nodes: list[str],
     name: str,
@@ -3705,19 +3795,35 @@ def _copy_parity_host_evidence(
     trace_root: str,
     token_root: str,
     token_host: str,
-    copy_tree,
+    copy_tree=None,
 ) -> list[tuple[str, Path, Path | None]]:
     """Copy each trainer host's trace and token evidence in parallel."""
+
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+        raise Refused("parity trace run name contains unsafe characters")
+    if trace_root != parity_trace_root or token_root != parity_token_root:
+        raise Refused("parity evidence roots are not the configured exact directories")
+    if len(set(nodes)) != len(nodes):
+        raise Refused("parity trainer host list contains duplicates")
+    for host in nodes:
+        _check_parity_host(host)
+    copy_tree = copy_tree or _copy_parity_tree_stream
 
     def copy_host(host: str) -> tuple[str, Path, Path | None]:
         trace = root / "sources" / host
         trace.parent.mkdir(parents=True, exist_ok=True)
         copy_tree(host, f"{trace_root}/{name}", trace)
+        if not (trace / "session.json").is_file():
+            raise RuntimeError(f"parity trace session is missing from {host}")
+        if not list(trace.glob("trainer-runtime-pp-*-host-*.json")):
+            raise RuntimeError(f"parity trace provenance is missing from {host}")
         tokens = None
         if host == token_host:
             tokens = root / "tokens" / host
             tokens.parent.mkdir(parents=True, exist_ok=True)
             copy_tree(host, token_root, tokens)
+            if not any(tokens.rglob("rank_*.jsonl")):
+                raise RuntimeError(f"parity token exports are missing from {host}")
         return host, trace, tokens
 
     workers = min(8, len(nodes))
@@ -3729,7 +3835,7 @@ def collect_glm52_policy_parity(name: str, nodes: list[str] | None = None) -> di
     """Collect every trainer host trace and write the canonical parity report."""
     if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
         raise Refused("parity trace run name contains unsafe characters")
-    nodes = [_check_host(host) for host in (nodes or trainer_hosts)]
+    nodes = [_check_parity_host(host) for host in (nodes or trainer_hosts)]
     profile = repo_root / production_parity_profile
     trainer_config = repo_root / "configs/qualification/glm52-policy-parity-trainer.toml"
     with trainer_config.open("rb") as stream:
@@ -3741,8 +3847,8 @@ def collect_glm52_policy_parity(name: str, nodes: list[str] | None = None) -> di
         raise Refused(
             f"parity collection requires {pp_size} configured PP hosts, found {len(nodes)}"
         )
-    trace_root = "/data/glm52-rl/qualifications/glm52-policy-parity/trainer-traces"
-    token_root = "/data/glm52-rl/qualifications/glm52-policy-parity/trainer/token_exports"
+    trace_root = parity_trace_root
+    token_root = parity_token_root
     remote_root = "/data/glm52-rl/qualifications/glm52-policy-parity"
     script = repo_root / "scripts/glm52_policy_parity.py"
 
@@ -3760,7 +3866,8 @@ def collect_glm52_policy_parity(name: str, nodes: list[str] | None = None) -> di
     with tempfile.TemporaryDirectory(prefix="glm52-policy-parity-collect-") as temporary:
         root = Path(temporary)
         copied_hosts = _copy_parity_host_evidence(
-            nodes, name, root, trace_root, token_root, nodes[pp_size - 1], copy_tree
+            nodes, name, root, trace_root, token_root, nodes[pp_size - 1],
+            _copy_parity_tree_stream,
         )
         sources = [trace for _, trace, _ in copied_hosts]
         fixture = root / "fixture"

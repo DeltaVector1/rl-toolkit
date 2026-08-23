@@ -54,8 +54,8 @@ class EdgeOperationsTest(unittest.TestCase):
 
     def test_parity_host_copies_overlap_and_keep_configured_order(self):
         nodes = ["n82", "n76", "n77"]
-        trace_root = "/remote/traces"
-        token_root = "/remote/tokens"
+        trace_root = training_ops.parity_trace_root
+        token_root = training_ops.parity_token_root
         first_trace_copy = threading.Barrier(len(nodes))
         calls = []
         lock = threading.Lock()
@@ -66,6 +66,11 @@ class EdgeOperationsTest(unittest.TestCase):
             if remote.startswith(trace_root):
                 first_trace_copy.wait(timeout=2)
             local.mkdir(parents=True, exist_ok=True)
+            if remote.startswith(trace_root):
+                (local / "session.json").write_text("{}\n")
+                (local / f"trainer-runtime-pp-0-host-{host}.json").write_text("{}\n")
+            else:
+                (local / "rank_0.jsonl").write_text("{}\n")
 
         with tempfile.TemporaryDirectory() as temporary:
             copied = training_ops._copy_parity_host_evidence(
@@ -90,11 +95,16 @@ class EdgeOperationsTest(unittest.TestCase):
 
     def test_parity_host_copies_fail_when_final_tokens_are_missing(self):
         nodes = ["n82", "n76", "n77"]
+        trace_root = training_ops.parity_trace_root
+        token_root = training_ops.parity_token_root
 
         def copy_tree(host, remote, local):
-            if host == nodes[-1] and remote == "/remote/tokens":
+            if host == nodes[-1] and remote == token_root:
                 raise RuntimeError("final token exports are missing")
             local.mkdir(parents=True, exist_ok=True)
+            if remote == f"{trace_root}/run-1":
+                (local / "session.json").write_text("{}\n")
+                (local / f"trainer-runtime-pp-0-host-{host}.json").write_text("{}\n")
 
         with tempfile.TemporaryDirectory() as temporary:
             with self.assertRaisesRegex(RuntimeError, "final token exports"):
@@ -102,11 +112,103 @@ class EdgeOperationsTest(unittest.TestCase):
                     nodes,
                     "run-1",
                     Path(temporary),
-                    "/remote/traces",
-                    "/remote/tokens",
+                    trace_root,
+                    token_root,
                     nodes[-1],
                     copy_tree,
                 )
+
+    def test_parity_tar_stream_uses_safe_argv_and_accepts_success(self):
+        class Stream:
+            def close(self):
+                return None
+
+        class Process:
+            def __init__(self, stdout=None):
+                self.stdout = stdout
+                self.returncode = 0
+
+            def communicate(self, timeout=None):
+                del timeout
+                return b"", b""
+
+            def kill(self):
+                return None
+
+        calls = []
+        processes = [Process(Stream()), Process()]
+
+        def popen(argv, **kwargs):
+            calls.append((argv, kwargs))
+            return processes.pop(0)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "trace"
+            with patch.object(training_ops.subprocess, "Popen", side_effect=popen):
+                training_ops._copy_parity_tree_stream(
+                    "n82",
+                    "/data/glm52-rl/qualifications/glm52-policy-parity/trainer-traces/run-1",
+                    destination,
+                )
+
+        self.assertEqual(
+            calls[0][0],
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "n82",
+                "tar",
+                "-C",
+                "/data/glm52-rl/qualifications/glm52-policy-parity/trainer-traces/run-1",
+                "-cf",
+                "-",
+                ".",
+            ],
+        )
+        self.assertEqual(calls[1][0][0:3], ["tar", "--extract", "--file=-"])
+        self.assertNotIn("shell", calls[0][1])
+        self.assertNotIn("shell", calls[1][1])
+
+    def test_parity_tar_stream_fails_on_remote_or_local_error(self):
+        class Stream:
+            def close(self):
+                return None
+
+        class Process:
+            def __init__(self, returncode, stderr=b"", has_stdout=False):
+                self.stdout = Stream() if has_stdout else None
+                self.returncode = returncode
+                self.stderr = stderr
+
+            def communicate(self, timeout=None):
+                del timeout
+                return b"", self.stderr
+
+            def kill(self):
+                return None
+
+        for remote_code, local_code, message in (
+            (1, 0, "remote tar"),
+            (0, 1, "local tar"),
+        ):
+            processes = [
+                Process(remote_code, b"remote failed", has_stdout=True),
+                Process(local_code, b"local failed"),
+            ]
+
+            def popen(argv, **kwargs):
+                del argv, kwargs
+                return processes.pop(0)
+
+            with tempfile.TemporaryDirectory() as temporary:
+                with patch.object(training_ops.subprocess, "Popen", side_effect=popen):
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        training_ops._copy_parity_tree_stream(
+                            "n82",
+                            f"{training_ops.parity_trace_root}/run-1",
+                            Path(temporary) / "trace",
+                        )
 
     def test_policy_parity_stage_validation_is_fail_closed(self):
         with tempfile.TemporaryDirectory() as temporary:
