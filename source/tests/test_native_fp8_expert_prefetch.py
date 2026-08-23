@@ -369,7 +369,7 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
     @unittest.skipUnless(torch is not None, "Frozen router behavior requires PyTorch")
     def test_frozen_router_uses_static_bias_and_stops_load_balance_updates(self):
         from prime_rl.trainer.model import cache_glm_moe_bias_values, freeze_moe_router
-        from prime_rl.trainer.models.layers.moe import MoE, MoEArgs
+        from prime_rl.trainer.models.layers.moe import MoE, MoEArgs, _require_static_expert_bias
 
         class Layer(torch.nn.Module):
             def __init__(self):
@@ -416,6 +416,7 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
         self.assertNotIn("_fp32_expert_bias", model.state_dict())
         torch.testing.assert_close(mlp._fp32_expert_bias, source, rtol=0, atol=0)
         self.assertIsNotNone(mlp._fp32_expert_bias_validation)
+        torch.testing.assert_close(_require_static_expert_bias(mlp), source, rtol=0, atol=0)
         mlp._fp32_expert_bias.add_(1.0)
         with self.assertRaisesRegex(RuntimeError, "changed after source capture"):
             cache_glm_moe_bias_values(model)
@@ -432,6 +433,7 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
         mlp._fp32_expert_bias.copy_(source)
         cache_glm_moe_bias_values(model)
         self.assertIsNotNone(mlp._fp32_expert_bias_validation)
+        torch.testing.assert_close(_require_static_expert_bias(mlp), source, rtol=0, atol=0)
 
         seen = []
         mlp.router = RecordingRouter(seen)

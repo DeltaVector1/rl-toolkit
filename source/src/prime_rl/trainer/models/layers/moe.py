@@ -23,7 +23,7 @@ from prime_rl.trainer.models.layers.fp8_ada import (
 from prime_rl.trainer.mxfp4 import dequant_mxfp4
 
 
-def _static_expert_bias_identity(value: torch.Tensor) -> tuple[int, int, str, str, int]:
+def static_expert_bias_identity(value: torch.Tensor) -> tuple[int, int, str, str, int]:
     data_ptr = value.data_ptr() if hasattr(value, "data_ptr") else 0
     version = int(getattr(value, "_version", -1))
     return id(value), int(data_ptr), str(value.device), str(value.dtype), version
@@ -47,7 +47,7 @@ def _validate_static_expert_bias(
         actual_hash = hashlib.sha256(raw).hexdigest()
     if actual_hash != source_hash or actual_hash != cache_hash:
         raise RuntimeError("Frozen GLM routing bias cache changed after source capture")
-    module._fp32_expert_bias_validation = _static_expert_bias_identity(value)
+    module._fp32_expert_bias_validation = static_expert_bias_identity(value)
     return value
 
 
@@ -62,7 +62,7 @@ def _require_static_expert_bias(module: nn.Module) -> torch.Tensor:
     if not source_hash or not cache_hash or source_hash != cache_hash:
         raise RuntimeError("Frozen GLM routing bias hashes are incomplete")
     expected = getattr(module, "_fp32_expert_bias_validation", None)
-    if expected != _static_expert_bias_identity(value):
+    if expected != static_expert_bias_identity(value):
         raise RuntimeError("Frozen GLM routing bias cache changed after validation")
     return value
 

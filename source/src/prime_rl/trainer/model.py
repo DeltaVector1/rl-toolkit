@@ -76,6 +76,7 @@ from prime_rl.trainer.models.layers.moe import (
     LatentMoE,
     MoE,
     TokenChoiceTopKRouter,
+    static_expert_bias_identity,
     _validate_static_expert_bias,
 )
 from prime_rl.trainer.models.layers.mxfp8_grouped_gemm import apply_mxfp8_moe_grouped_gemm
@@ -681,7 +682,6 @@ def cache_glm_moe_bias_values(model: nn.Module) -> None:
         source_sha256 = getattr(mlp, "_fp32_expert_bias_source_sha256", None)
         if source_sha256 is not None and cache_sha256 != source_sha256:
             raise RuntimeError("GLM static routing correction changed after source capture")
-        mlp._fp32_expert_bias_validation = None
         setattr(mlp, "_fp32_expert_bias", cached)
         mlp._fp32_expert_bias_cache_sha256 = cache_sha256
         mlp._use_static_expert_bias = True
@@ -689,6 +689,7 @@ def cache_glm_moe_bias_values(model: nn.Module) -> None:
         if "_fp32_expert_bias" in mlp._buffers:
             raise RuntimeError("GLM FP32 routing cache must not be an FSDP buffer")
         _validate_static_expert_bias(mlp, actual_hash=cache_sha256)
+        mlp._fp32_expert_bias_validation = static_expert_bias_identity(cached)
 
 
 def restore_glm_moe_bias_values(
