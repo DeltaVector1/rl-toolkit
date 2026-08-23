@@ -129,7 +129,7 @@ case ${1:-} in
     if [ "$rank" -lt 0 ]; then
       echo "node $node is not in trainer_nodes ($trainer_nodes)" >&2; exit 1
     fi
-    read -r rollout_transport trainer_output trainer_only parity_trace_dir parity_trace_source parity_pp parity_cp parity_batch parity_max_calls parity_max_files parity_max_bytes < <(
+    read -r rollout_transport trainer_output trainer_only parity_trace_dir parity_trace_source parity_pp parity_cp parity_batch parity_max_calls parity_max_files parity_max_bytes configured_int4_combine_rounds configured_fp8_expert_activation_offload < <(
       python3 - "$trainer_config" <<'PY'
 import sys
 import tomllib
@@ -142,6 +142,10 @@ trainer_only = "fake" in data or cache.get("mode") == "replay"
 env_vars = config.get("env_vars", {})
 model = config.get("model", {})
 fake = data.get("fake", {})
+memory_env = (
+    env_vars.get("PRIME_INT4_COMBINE_ROUNDS", ""),
+    env_vars.get("PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD", ""),
+)
 print(
     config["rollout_transport"]["type"],
     config["output_dir"],
@@ -154,9 +158,28 @@ print(
     env_vars.get("PRIME_PARITY_TRACE_MAX_CALLS", ""),
     env_vars.get("PRIME_PARITY_TRACE_MAX_FILES", ""),
     env_vars.get("PRIME_PARITY_TRACE_MAX_BYTES", ""),
+    *memory_env,
 )
 PY
     )
+    if [ -n "$configured_int4_combine_rounds" ] || [ -n "$configured_fp8_expert_activation_offload" ]; then
+      [ "$configured_int4_combine_rounds" = "8" ] || {
+        echo "GLM trainer configs must pin PRIME_INT4_COMBINE_ROUNDS=8" >&2
+        exit 1
+      }
+      [ "$configured_fp8_expert_activation_offload" = "0" ] || {
+        echo "GLM trainer configs must pin PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD=0" >&2
+        exit 1
+      }
+      # A GLM config pin is authoritative. This prevents a shell override from
+      # making the production trainer differ from the stability qualification.
+      int4_combine_rounds="$configured_int4_combine_rounds"
+      fp8_expert_activation_offload="$configured_fp8_expert_activation_offload"
+    else
+      # Muse and other legacy configs retain their historical launcher defaults.
+      int4_combine_rounds="${PRIME_INT4_COMBINE_ROUNDS:-1}"
+      fp8_expert_activation_offload="${PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD:-0}"
+    fi
     parity_trace_runtime=""
     parity_image_digest=""
     parity_env=()
@@ -306,8 +329,8 @@ PY
       -e PRIME_PROFILE_PP_STAGE="$profile_pp_stage" \
       -e PRIME_PROFILE_PP_RANK="$profile_pp_rank" \
       -e PRIME_EP_AC_CACHE="${PRIME_EP_AC_CACHE:-0}" \
-      -e PRIME_INT4_COMBINE_ROUNDS="${PRIME_INT4_COMBINE_ROUNDS:-1}" \
-      -e PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD="${PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD:-0}" \
+      -e PRIME_INT4_COMBINE_ROUNDS="$int4_combine_rounds" \
+      -e PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD="$fp8_expert_activation_offload" \
       -e PRIME_PP_MAX_MICRO="${PRIME_PP_MAX_MICRO:-}" \
       -e PRIME_STATS_DEBUG="${PRIME_STATS_DEBUG:-}" \
       --entrypoint /app/.venv/bin/torchrun "$image" \

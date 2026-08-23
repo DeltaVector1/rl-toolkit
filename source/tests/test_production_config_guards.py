@@ -151,6 +151,32 @@ def test_production_allocator_does_not_strand_large_reserved_blocks() -> None:
     assert "max_split_size_mb" not in allocator
 
 
+def test_glm52_stability_and_production_pin_bounded_transport_env() -> None:
+    expected = {
+        "PRIME_INT4_COMBINE_ROUNDS": "8",
+        "PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD": "0",
+    }
+    for relative in (
+        "configs/qualification/glm52-native-stability20.toml",
+        "configs/paused/trainer.glm52-production.toml",
+    ):
+        config = _load(relative)
+        assert config["env_vars"] == expected, relative
+
+    # The GLM pins are read from each trainer TOML and override shell values.
+    # Configs without these pins, including Muse, retain the old defaults.
+    launcher = (ROOT / "scripts/china/cluster.sh").read_text()
+    assert 'env_vars.get("PRIME_INT4_COMBINE_ROUNDS", "")' in launcher
+    assert 'env_vars.get("PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD", "")' in launcher
+    assert 'int4_combine_rounds="$configured_int4_combine_rounds"' in launcher
+    assert 'fp8_expert_activation_offload="$configured_fp8_expert_activation_offload"' in launcher
+    assert 'int4_combine_rounds="${PRIME_INT4_COMBINE_ROUNDS:-1}"' in launcher
+    assert 'fp8_expert_activation_offload="${PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD:-0}"' in launcher
+    muse = _load("configs/china/trainer.muse13.toml")
+    assert "PRIME_INT4_COMBINE_ROUNDS" not in muse.get("env_vars", {})
+    assert "PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD" not in muse.get("env_vars", {})
+
+
 def test_pipeline_loader_uses_mesh_data_parallel_rank() -> None:
     train = (ROOT / "source/src/prime_rl/trainer/rl/train.py").read_text()
     data = (ROOT / "source/src/prime_rl/trainer/rl/data.py").read_text()

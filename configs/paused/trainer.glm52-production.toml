@@ -81,3 +81,9 @@ save_format = "safetensors"
 
 [rollout_transport]
 type = "filesystem"
+
+[env_vars]
+# Match the trainer-only stability gate. The launcher treats these GLM pins as
+# authoritative; Muse configs do not define them and retain their defaults.
+PRIME_INT4_COMBINE_ROUNDS = "8"
+PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD = "0"
