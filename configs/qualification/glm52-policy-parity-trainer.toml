@@ -5,7 +5,7 @@ enable_router_replay = false
 enable_token_export = true
 
 [data.fake]
-batch_size = 1
+batch_size = 8
 generate_samples = false
 reference_path = "/data/glm52-rl/qualifications/glm52-policy-parity/trainer-stage-final/trainer-reference.json"
 

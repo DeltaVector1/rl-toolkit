@@ -50,6 +50,10 @@ def test_current_glm52_profile_is_batch_1024_without_rollout_cache() -> None:
     large_batch = operations["profiles"]["glm52-native-b2048"]
     assert "orchestrator" not in large_batch
     assert _load(large_batch["trainer"])["data"]["fake"]["batch_size"] == 64
+    parity = operations["profiles"]["glm52-policy-parity"]
+    parity_trainer = _load(parity["trainer"])
+    assert parity_trainer["data"]["fake"]["batch_size"] == 8
+    assert parity_trainer["model"]["pp"] == 8
     assert operations["requirements"]["glm52"] == {
         "batch_size": 1024,
         "context_length": 32768,

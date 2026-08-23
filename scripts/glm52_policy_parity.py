@@ -11,6 +11,7 @@ import json
 import math
 import os
 import secrets
+import shutil
 import sys
 import tempfile
 import tomllib
@@ -783,6 +784,32 @@ def require_exact_router_ids(
         raise ValueError("executed and observed router IDs differ")
 
 
+def select_first_trainer_router_call(router_trace: Path, output: Path) -> None:
+    """Select one identical fixture pass from a multi-microbatch trainer trace."""
+    output.mkdir(parents=True, exist_ok=False)
+    shutil.copy2(router_trace / "session.json", output / "session.json")
+    chunks = sorted(router_trace.glob("trainer-rank-*-pp-*-cp-*-layer-*-call-*.npz"))
+    first_calls = [path for path in chunks if path.name.endswith("-call-0.npz")]
+    if not first_calls:
+        raise ValueError("trainer router trace has no first microbatch")
+    for path in chunks:
+        first_path = output / (path.name.rsplit("-call-", 1)[0] + "-call-0.npz")
+        if path.name.endswith("-call-0.npz"):
+            shutil.copy2(path, first_path)
+            continue
+        reference_path = router_trace / first_path.name
+        if not reference_path.is_file():
+            raise ValueError(f"trainer router trace is missing {reference_path.name}")
+        with np.load(reference_path, allow_pickle=False) as reference, np.load(
+            path, allow_pickle=False
+        ) as candidate:
+            for name in ("ids", "weights"):
+                if not np.array_equal(reference[name], candidate[name]):
+                    raise ValueError(
+                        f"trainer router trace microbatch differs for {path.name}"
+                    )
+
+
 def capture_trainer(
     profile: Profile,
     fixture: Path,
@@ -822,7 +849,10 @@ def capture_trainer(
     for name, value in expected.items():
         if getattr(session, name) != value:
             raise ValueError(f"trainer router trace {name} differs from the parity request")
-    router_ids, router_weights = assemble_chunks(router_trace, session)
+    with tempfile.TemporaryDirectory(prefix="glm52-policy-parity-router-") as temporary:
+        first_router_trace = Path(temporary) / "first"
+        select_first_trainer_router_call(router_trace, first_router_trace)
+        router_ids, router_weights = assemble_chunks(first_router_trace, session)
     matching_records: list[dict[str, Any]] = []
     for path in sorted(token_exports.rglob("rank_*.jsonl")):
         for line in path.read_text().splitlines():
@@ -831,10 +861,26 @@ def capture_trainer(
                 raise ValueError(f"token export schema differs in {path}")
             if record.get("token_ids") == token_ids.tolist():
                 matching_records.append(record)
-    if len(matching_records) != 1:
+    if not matching_records:
         raise ValueError(
-            f"expected one exact fixture token export, found {len(matching_records)}"
+            "expected at least one exact fixture token export, found none"
         )
+    first_record = matching_records[0]
+    for duplicate in matching_records[1:]:
+        for name in (
+            "token_ids",
+            "position_ids",
+            "loss_mask",
+            "advantages",
+            "inference_logprobs",
+            "trainer_logprobs",
+            "sequence_lengths",
+        ):
+            if duplicate.get(name) != first_record.get(name):
+                raise ValueError(
+                    "duplicate fixture token exports differ in "
+                    f"{name}; parity cannot select one microbatch"
+                )
     full_logprobs = np.asarray(matching_records[0].get("trainer_logprobs"), dtype=np.float32)
     if full_logprobs.shape != token_ids.shape:
         raise ValueError(
