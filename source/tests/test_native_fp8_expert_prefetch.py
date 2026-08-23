@@ -182,6 +182,61 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
         self.assertIn("restore_glm_moe_bias_values(model, snapshot_path)", load_source)
         self.assertIn("source.dtype != torch.float32", ast.unparse(ast.parse(model_source)))
 
+    @unittest.skipUnless(torch is not None, "PP fingerprint validation requires PyTorch")
+    def test_glm_router_bias_fingerprint_requires_all_75_routed_layers(self):
+        from prime_rl.trainer.model import (
+            _expected_glm_moe_layer_indices,
+            _validate_glm_moe_bias_union,
+        )
+
+        model = type(
+            "Model",
+            (),
+            {
+                "config": type(
+                    "Config",
+                    (),
+                    {"num_hidden_layers": 78, "first_k_dense_replace": 3},
+                )(),
+            },
+        )()
+        expected = _expected_glm_moe_layer_indices(model)
+        self.assertEqual(expected, tuple(range(3, 78)))
+
+        def record(pp_rank, layers):
+            return {
+                "pp_rank": pp_rank,
+                "layers": {
+                    f"model.layers.{layer}.mlp.gate.e_score_correction_bias": {
+                        "layer": layer,
+                        "dtype": "torch.float32",
+                        "shape": [256],
+                        "sha256": f"{layer:064x}",
+                    }
+                    for layer in layers
+                },
+            }
+
+        ranges = [range(3 + 10 * rank, 3 + 10 * (rank + 1)) for rank in range(7)]
+        ranges.append(range(73, 78))
+        records = [record(rank, layers) for rank, layers in enumerate(ranges)]
+        count, fingerprint = _validate_glm_moe_bias_union(records, expected, 8)
+        self.assertEqual(count, 75)
+        self.assertEqual(len(fingerprint), 64)
+
+        with self.assertRaisesRegex(RuntimeError, "incomplete"):
+            _validate_glm_moe_bias_union(records[:-1], expected, 8)
+        duplicate = records.copy()
+        duplicate[1] = record(1, range(12, 22))
+        with self.assertRaisesRegex(RuntimeError, "Duplicate"):
+            _validate_glm_moe_bias_union(duplicate, expected, 8)
+
+    def test_glm_router_bias_restores_after_resume_load(self):
+        train_source = (ROOT / "source/src/prime_rl/trainer/rl/train.py").read_text()
+        load_position = train_source.index("ckpt_manager.load(checkpoint_step")
+        restore_position = train_source.index("restore_glm_moe_bias_values(model, Path(config.model.name)")
+        self.assertLess(load_position, restore_position)
+
     @unittest.skipUnless(torch is not None, "FP32 checkpoint restoration requires PyTorch")
     def test_glm_router_bias_restores_exact_checkpoint_values(self):
         from safetensors.torch import save_file
@@ -198,7 +253,15 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
         class Model(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                self.config = type("Config", (), {"model_type": "glm_moe_dsa"})()
+                self.config = type(
+                    "Config",
+                    (),
+                    {
+                        "model_type": "glm_moe_dsa",
+                        "num_hidden_layers": 4,
+                        "first_k_dense_replace": 3,
+                    },
+                )()
                 self.model = torch.nn.Module()
                 self.model.layers = torch.nn.ModuleList([Layer()])
 

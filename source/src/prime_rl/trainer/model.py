@@ -491,10 +491,85 @@ def preserve_glm_moe_bias_precision(model: nn.Module) -> None:
         get_logger().info(f"Restored {restored} GLM routing correction buffers to fp32")
 
 
-def restore_glm_moe_bias_values(model: nn.Module, snapshot_path: Path) -> None:
+def _expected_glm_moe_layer_indices(model: nn.Module) -> tuple[int, ...]:
+    config = getattr(model, "config", None)
+    total_layers = getattr(config, "num_hidden_layers", None)
+    first_dense = getattr(config, "first_k_dense_replace", None)
+    if not isinstance(total_layers, int) or not isinstance(first_dense, int):
+        raise RuntimeError("GLM routing-bias fingerprint requires layer-count configuration")
+    if total_layers <= 0 or first_dense < 0 or first_dense >= total_layers:
+        raise RuntimeError(
+            f"Invalid GLM layer configuration: num_hidden_layers={total_layers}, "
+            f"first_k_dense_replace={first_dense}"
+        )
+    return tuple(range(first_dense, total_layers))
+
+
+def _validate_glm_moe_bias_union(
+    records: list[dict], expected_layers: tuple[int, ...], pp_size: int
+) -> tuple[int, str]:
+    owners: dict[int, dict[str, dict]] = {}
+    for record in records:
+        pp_rank = record.get("pp_rank")
+        if not isinstance(pp_rank, int) or pp_rank < 0 or pp_rank >= pp_size:
+            raise RuntimeError(f"Invalid GLM routing-bias PP rank: {pp_rank}")
+        layers = record.get("layers")
+        if not isinstance(layers, dict):
+            raise RuntimeError(f"Missing GLM routing-bias layers for PP rank {pp_rank}")
+        previous = owners.get(pp_rank)
+        if previous is not None and previous != layers:
+            raise RuntimeError(f"Conflicting duplicate GLM routing-bias PP rank {pp_rank}")
+        owners[pp_rank] = layers
+
+    expected_pp = set(range(pp_size))
+    if set(owners) != expected_pp:
+        missing = sorted(expected_pp - set(owners))
+        duplicate = sorted(set(owners) - expected_pp)
+        raise RuntimeError(
+            f"GLM routing-bias PP union is incomplete: missing={missing}, invalid={duplicate}"
+        )
+
+    combined: dict[str, dict] = {}
+    for pp_rank in sorted(owners):
+        for key, metadata in owners[pp_rank].items():
+            if key in combined:
+                raise RuntimeError(f"Duplicate GLM routing-bias layer key: {key}")
+            combined[key] = metadata
+
+    observed_layers = sorted(metadata.get("layer") for metadata in combined.values())
+    if observed_layers != list(expected_layers):
+        raise RuntimeError(
+            f"GLM routing-bias layer union mismatch: expected={list(expected_layers)}, "
+            f"observed={observed_layers}"
+        )
+
+    fingerprint = hashlib.sha256()
+    for key in sorted(combined):
+        metadata = combined[key]
+        fingerprint.update(
+            json.dumps(
+                {
+                    "key": key,
+                    "layer": metadata["layer"],
+                    "dtype": metadata["dtype"],
+                    "shape": metadata["shape"],
+                    "sha256": metadata["sha256"],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        )
+    return len(combined), fingerprint.hexdigest()
+
+
+def restore_glm_moe_bias_values(
+    model: nn.Module, snapshot_path: Path, parallel_dims: ParallelDims | None = None
+) -> None:
     """Restore GLM routing correction values from their FP32 checkpoint tensors."""
     if getattr(getattr(model, "config", None), "model_type", None) != "glm_moe_dsa":
         return
+    if not snapshot_path.is_dir():
+        snapshot_path = Path(snapshot_download(repo_id=str(snapshot_path), repo_type="model"))
 
     index_path = snapshot_path / "model.safetensors.index.json"
     weight_map: dict[str, str] = {}
@@ -507,6 +582,7 @@ def restore_glm_moe_bias_values(model: nn.Module, snapshot_path: Path) -> None:
                 for key in shard.keys():
                     weight_map[key] = shard_path.name
 
+    expected_layers = _expected_glm_moe_layer_indices(model)
     language_model = get_language_model(model)
     requested: dict[str, tuple[nn.Module, str]] = {}
     for layer in iter_layers(language_model.layers):
@@ -533,7 +609,7 @@ def restore_glm_moe_bias_values(model: nn.Module, snapshot_path: Path) -> None:
     for source_key, (mlp, layer_index) in requested.items():
         by_file.setdefault(snapshot_path / weight_map[source_key], []).append((source_key, mlp, layer_index))
 
-    source_hash = hashlib.sha256()
+    local_layers: dict[str, dict] = {}
     restored = 0
     for shard_path, entries in by_file.items():
         with safe_open(shard_path, framework="pt", device="cpu") as shard:
@@ -549,17 +625,39 @@ def restore_glm_moe_bias_values(model: nn.Module, snapshot_path: Path) -> None:
                         f"GLM routing correction {source_key} shape {tuple(source.shape)} "
                         f"does not match layer {layer_index} target {tuple(target.shape)}"
                     )
-                source_hash.update(source.contiguous().view(torch.uint8).numpy().tobytes())
-                target.copy_(source.to(device=target.device, dtype=torch.float32))
+                source_bytes = source.contiguous().view(torch.uint8).numpy().tobytes()
+                local_layers[source_key] = {
+                    "layer": int(layer_index),
+                    "dtype": str(source.dtype),
+                    "shape": list(source.shape),
+                    "sha256": hashlib.sha256(source_bytes).hexdigest(),
+                }
+                with torch.no_grad():
+                    target.copy_(source.to(device=target.device, dtype=torch.float32))
                 restored += 1
 
-    expected = len(requested)
-    if restored != expected:
-        raise RuntimeError(f"Restored {restored}/{expected} GLM routing corrections")
-    get_logger().info(
-        f"Restored {restored} exact FP32 GLM routing corrections from checkpoint "
-        f"sha256={source_hash.hexdigest()}"
-    )
+    if restored != len(local_layers):
+        raise RuntimeError(f"GLM routing-bias restoration produced duplicate records: {restored}")
+
+    pp_rank = 0
+    pp_size = 1
+    if parallel_dims is not None and parallel_dims.pp_enabled:
+        pp_rank = parallel_dims.get_mesh("pp").get_local_rank()
+        pp_size = parallel_dims.pp
+    local_record = {"pp_rank": pp_rank, "layers": local_layers}
+    dist_ready = torch.distributed.is_available() and torch.distributed.is_initialized()
+    if dist_ready:
+        gathered: list[dict | None] = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(gathered, local_record)
+        records = [record for record in gathered if record is not None]
+    else:
+        records = [local_record]
+    count, fingerprint = _validate_glm_moe_bias_union(records, expected_layers, pp_size)
+    if not dist_ready or torch.distributed.get_rank() == 0:
+        get_logger().info(
+            f"Restored {count} exact FP32 GLM routing corrections from checkpoint "
+            f"sha256={fingerprint}"
+        )
 
 
 def freeze_sparse_indexer(model: nn.Module) -> None:
