@@ -2681,6 +2681,8 @@ def _validate_live_parity_report(
     report: dict,
     fixture_manifest: dict,
     profile: dict,
+    *,
+    require_passed: bool = True,
 ) -> list[str]:
     """Return all parity evidence failures; never accept missing fields."""
     failures: list[str] = []
@@ -2688,7 +2690,9 @@ def _validate_live_parity_report(
         failures.append("parity report schema_version is not 1")
     if report.get("kind") != "glm52_policy_parity_report":
         failures.append("parity report kind is invalid")
-    if report.get("passed") is not True:
+    if not isinstance(report.get("passed"), bool):
+        failures.append("parity report passed field is invalid")
+    if require_passed and report.get("passed") is not True:
         failures.append("parity report passed is not true")
     if fixture_manifest.get("schema_version") != 1:
         failures.append("parity fixture schema_version is not 1")
@@ -2708,6 +2712,96 @@ def _validate_live_parity_report(
         value = report.get(name)
         if not isinstance(value, str) or not re.fullmatch(rf"[0-9a-f]{{{length}}}", value):
             failures.append(f"parity report {name} is not a lowercase SHA-256/revision")
+    trainer_image_digest = report.get("trainer_image_digest")
+    if not isinstance(trainer_image_digest, str) or not re.fullmatch(
+        r"sha256:[0-9a-f]{64}", trainer_image_digest
+    ):
+        failures.append("parity report trainer image digest is missing or invalid")
+    expected_image_digest = operations.get("containers", {}).get("trainer_image_digest")
+    if expected_image_digest is None:
+        expected_image_digest = operations.get("profiles", {}).get(
+            "glm52-policy-parity", {}
+        ).get("trainer_image_digest")
+    trainer_image_digests = report.get("trainer_image_digests")
+    if not isinstance(trainer_image_digests, dict) or not trainer_image_digests:
+        failures.append("parity report trainer host image digests are missing")
+    elif any(
+        not isinstance(host, str)
+        or not isinstance(digest, str)
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
+        for host, digest in trainer_image_digests.items()
+    ):
+        failures.append("parity report trainer host image digest is invalid")
+    elif trainer_image_digest not in trainer_image_digests.values():
+        failures.append("parity report trainer image digest is not one of the host digests")
+    trainer_modules = report.get("trainer_model_modules")
+    if not isinstance(trainer_modules, dict) or not trainer_modules:
+        failures.append("parity report trainer model module hashes are missing")
+    else:
+        locations = set()
+        for name, record in trainer_modules.items():
+            if not isinstance(name, str) or not isinstance(record, dict):
+                failures.append("parity report trainer model module hash record is invalid")
+                continue
+            location = record.get("location")
+            digest = record.get("sha256")
+            if location not in {"mounted", "unmounted"} or not isinstance(digest, str) or not re.fullmatch(
+                r"[0-9a-f]{64}", digest
+            ):
+                failures.append(f"parity report trainer model module hash is invalid: {name}")
+            else:
+                locations.add(location)
+        if locations != {"mounted", "unmounted"}:
+            failures.append("parity report trainer mounted/unmounted module hashes are incomplete")
+    host_records = report.get("trainer_host_provenance")
+    if not isinstance(host_records, list) or len(host_records) != 8:
+        failures.append("parity report must contain eight trainer host provenance records")
+    else:
+        pp_ranks = {record.get("pp_rank") for record in host_records if isinstance(record, dict)}
+        host_names = {
+            record.get("host")
+            for record in host_records
+            if isinstance(record, dict) and isinstance(record.get("host"), str)
+        }
+        if pp_ranks != set(range(8)):
+            failures.append("parity report trainer PP host mapping is incomplete")
+        if len(host_names) != len(host_records) or not all(
+            re.fullmatch(r"n[0-9]+", host) for host in host_names
+        ):
+            failures.append("parity report trainer host names are invalid or duplicated")
+        if not isinstance(trainer_image_digests, dict) or set(trainer_image_digests) != host_names:
+            failures.append("parity report trainer host image digest keys do not match hosts")
+        module_records = []
+        for record in host_records:
+            if not isinstance(record, dict) or record.get("cp_rank") != 0:
+                failures.append("parity report trainer host mapping has a nonzero CP rank")
+                continue
+            if record.get("global_rank") != record.get("pp_rank", -1) * 8:
+                failures.append("parity report trainer host global rank mapping is invalid")
+            image_digest = record.get("image_digest")
+            if not isinstance(image_digest, str) or not re.fullmatch(
+                r"sha256:[0-9a-f]{64}", image_digest
+            ):
+                failures.append("parity report trainer host image digest is invalid")
+            elif not isinstance(trainer_image_digests, dict) or trainer_image_digests.get(
+                record.get("host")
+            ) != image_digest:
+                failures.append("parity report trainer host image digest record does not match")
+            modules = record.get("modules")
+            if not isinstance(modules, dict):
+                failures.append("parity report trainer host module hashes are missing")
+            else:
+                module_records.append(modules)
+        if module_records and any(value != module_records[0] for value in module_records[1:]):
+            failures.append("parity report trainer host module hashes differ")
+        if module_records and trainer_modules != module_records[0]:
+            failures.append("parity report trainer module hashes differ from host records")
+        if expected_image_digest is not None and any(
+            record.get("image_digest") != expected_image_digest
+            for record in host_records
+            if isinstance(record, dict)
+        ):
+            failures.append("parity report trainer host image digest differs from operations config")
     selected_tokens = report.get("selected_tokens")
     if isinstance(selected_tokens, bool) or not isinstance(selected_tokens, int) or selected_tokens <= 0:
         failures.append("parity report selected_tokens is invalid")
@@ -2731,7 +2825,7 @@ def _validate_live_parity_report(
         limit = thresholds[name]
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
             failures.append(f"parity report {name} is missing or non-finite")
-        elif not isinstance(limit, (int, float)) or value > limit:
+        elif not isinstance(limit, (int, float)) or (require_passed and value > limit):
             failures.append(f"parity report {name} exceeds its pinned limit")
     report_thresholds = report.get("thresholds")
     if not isinstance(report_thresholds, dict):
@@ -2746,10 +2840,14 @@ def _validate_live_parity_report(
             if report_thresholds.get(name) != expected:
                 failures.append(f"parity report threshold {name} differs from the pinned profile")
     checks = report.get("checks")
-    if not isinstance(checks, dict) or not checks or not all(value is True for value in checks.values()):
+    if not isinstance(checks, dict) or not checks or (
+        require_passed and not all(value is True for value in checks.values())
+    ):
         failures.append("parity report checks are not all true")
     provisional = report.get("provisional_checks")
-    if not isinstance(provisional, dict) or provisional.get("router_weight_delta") is not True:
+    if not isinstance(provisional, dict) or (
+        require_passed and provisional.get("router_weight_delta") is not True
+    ):
         failures.append("parity report provisional router check is not true")
     if report.get("router_weight_delta_status") != profile.get("router_weight_delta_status"):
         failures.append("parity report router delta status differs from the pinned profile")
@@ -3600,6 +3698,102 @@ def stage_glm52_policy_parity(nodes: list[str] | None = None) -> None:
     print(f"GLM parity trainer stage verified on {len(nodes)} nodes")
 
 
+def collect_glm52_policy_parity(name: str, nodes: list[str] | None = None) -> dict:
+    """Collect every trainer host trace and write the canonical parity report."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+        raise Refused("parity trace run name contains unsafe characters")
+    nodes = [_check_host(host) for host in (nodes or trainer_hosts)]
+    profile = repo_root / production_parity_profile
+    trainer_config = repo_root / "configs/qualification/glm52-policy-parity-trainer.toml"
+    trace_root = "/data/glm52-rl/qualifications/glm52-policy-parity/trainer-traces"
+    token_root = "/data/glm52-rl/qualifications/glm52-policy-parity/trainer/token_exports"
+    remote_root = "/data/glm52-rl/qualifications/glm52-policy-parity"
+    script = repo_root / "scripts/glm52_policy_parity.py"
+
+    def copy_tree(host: str, remote: str, local: Path) -> None:
+        _check_host(host)
+        result = subprocess.run(
+            ["scp", "-q", "-o", "BatchMode=yes", "-r", f"{host}:{remote}", str(local)],
+            capture_output=True,
+            text=True,
+            timeout=1800,
+        )
+        if result.returncode:
+            raise RuntimeError(f"parity evidence copy failed from {host}:{remote}: {result.stderr.strip()[:200]}")
+
+    with tempfile.TemporaryDirectory(prefix="glm52-policy-parity-collect-") as temporary:
+        root = Path(temporary)
+        sources: list[Path] = []
+        for host in nodes:
+            trace = root / "sources" / host
+            trace.parent.mkdir(parents=True, exist_ok=True)
+            copy_tree(host, f"{trace_root}/{name}", trace)
+            sources.append(trace)
+            tokens = root / "tokens" / host
+            tokens.parent.mkdir(parents=True, exist_ok=True)
+            copy_tree(host, token_root, tokens)
+        fixture = root / "fixture"
+        capture = root / "h200-capture-final"
+        copy_tree(orchestrator_host, f"{remote_root}/fixture", fixture)
+        copy_tree(orchestrator_host, f"{remote_root}/h200-capture-final", capture)
+        merged = root / "trainer-router-trace"
+        subprocess.run(
+            [sys.executable, str(script), "--profile", str(profile), "collect-trainer",
+             "--trainer-config", str(trainer_config),
+             *sum((["--source", str(source)] for source in sources), []), str(merged)],
+            check=True,
+        )
+        trainer = root / "trainer"
+        model_revision = json.loads((capture / "manifest.json").read_text())["model_revision"]
+        adapter_sha256 = json.loads((capture / "manifest.json").read_text())["adapter_sha256"]
+        subprocess.run(
+            [sys.executable, str(script), "--profile", str(profile), "capture-trainer",
+             "--fixture", str(fixture), "--token-exports", str(root / "tokens"),
+             "--router-trace", str(merged), "--model-revision", model_revision,
+             "--adapter-sha256", adapter_sha256, "--image", trainer_image, str(trainer)],
+            check=True,
+        )
+        report = root / "report.json"
+        subprocess.run(
+            [sys.executable, str(script), "--profile", str(profile), "compare",
+             "--fixture", str(fixture), "--trainer", str(trainer), "--h200", str(capture),
+             "--operations", str(repo_root / "configs/operations.toml"), "--output", str(report)],
+            check=False,
+        )
+        if not report.is_file():
+            raise RuntimeError("parity comparison did not produce a report")
+        report_value = json.loads(report.read_text())
+        fixture_manifest = json.loads((fixture / "manifest.json").read_text())
+        with profile.open("rb") as stream:
+            profile_value = tomllib.load(stream)
+        validation_failures = _validate_live_parity_report(
+            report_value, fixture_manifest, profile_value, require_passed=False
+        )
+        if validation_failures:
+            raise RuntimeError("parity report validation failed: " + "; ".join(validation_failures))
+        local_digest = hashlib.sha256(report.read_bytes()).hexdigest()
+        temporary_report = f"{remote_root}/.report-{name}-{local_digest}.json"
+        copy_result = subprocess.run(
+            ["scp", "-q", "-o", "BatchMode=yes", str(report),
+             f"{orchestrator_host}:{temporary_report}"],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if copy_result.returncode:
+            raise RuntimeError(f"canonical parity report upload failed: {copy_result.stderr.strip()[:200]}")
+        remote_check = _ssh(
+            orchestrator_host,
+            f"test \"$(sha256sum {shlex.quote(temporary_report)} | cut -d' ' -f1)\" = {local_digest} "
+            f"&& mv -f {shlex.quote(temporary_report)} {remote_root}/report.json "
+            f"&& test \"$(sha256sum {remote_root}/report.json | cut -d' ' -f1)\" = {local_digest}",
+            timeout=300,
+        )
+        if remote_check[0]:
+            raise RuntimeError(f"canonical parity report checksum or publish failed: {remote_check[1].strip()[:200]}")
+        return report_value
+
+
 def stop_legacy_qualification(expected_output_path: str) -> None:
     """Stop the old trainer name only when every worker is one qualification."""
     expected = PurePosixPath(expected_output_path)
@@ -3776,6 +3970,7 @@ actions = {
     "archive": _archive_action,
     "qualify": lambda a: qualify(*a),
     "stage-glm52-parity": lambda a: stage_glm52_policy_parity(a or None),
+    "collect-glm52-parity": lambda a: collect_glm52_policy_parity(a[0] if a else ""),
     "stop-legacy-qualification": lambda a: stop_legacy_qualification(*a),
     "stop": lambda a: stop(),
     "mounts": lambda a: print("\n".join(mounted_files())),

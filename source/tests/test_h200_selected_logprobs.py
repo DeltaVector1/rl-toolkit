@@ -418,6 +418,81 @@ def test_trainer_stage_requires_exact_operations_paths(tmp_path):
         )
 
 
+def test_trainer_trace_collection_accepts_layer_owners_and_rejects_wrong_owner(tmp_path):
+    profile = parity.Profile(
+        tmp_path / "profile.toml",
+        {"dense_layers": 1, "hidden_layers": 3},
+    )
+    trainer_config = tmp_path / "trainer.toml"
+    trainer_config.write_text(
+        "[model]\npp = 2\ncp = 2\n[data.fake]\nbatch_size = 2\n"
+    )
+    sources = []
+    for pp in range(2):
+        source = tmp_path / f"host{pp}"
+        source.mkdir()
+        (source / "session.json").write_text('{"side":"trainer"}\n')
+        provenance = {
+            "kind": "glm52_policy_parity_trainer_runtime",
+            "host": f"host{pp}",
+            "pp_rank": pp,
+            "cp_rank": 0,
+            "global_rank": pp * 2,
+            "pp_size": 2,
+            "cp_size": 2,
+            "batch_size": 2,
+            "image_digest": "sha256:" + ("a" if pp == 0 else "b") * 64,
+            "owned_layers": [pp + 1],
+            "trace_limits": {"max_calls": 4, "max_files": 4, "max_bytes": 1000000},
+            "modules": {
+                "mounted": {"location": "mounted", "sha256": "b" * 64},
+                "unmounted": {"location": "unmounted", "sha256": "c" * 64},
+            },
+        }
+        (source / f"trainer-runtime-pp-{pp}-host-host{pp}.json").write_text(
+            json.dumps(provenance)
+        )
+        for cp in range(2):
+            rank = pp * 2 + cp
+            np.savez(
+                source / f"trainer-rank-{rank}-pp-{pp}-cp-{cp}-layer-{pp + 1}-call-0.npz",
+                ids=np.array([[0, 1]], dtype=np.int32),
+                weights=np.array([[0.5, 0.5]], dtype=np.float32),
+            )
+        sources.append(source)
+    result = parity.collect_trainer_router_trace(
+        profile, trainer_config, sources, tmp_path / "merged"
+    )
+    assert result["chunks"] == 4
+    host_bound = json.loads(
+        (sources[1] / "trainer-runtime-pp-1-host-host1.json").read_text()
+    )
+    host_bound["host"] = "other-host"
+    (sources[1] / "trainer-runtime-pp-1-host-host1.json").write_text(json.dumps(host_bound))
+    with pytest.raises(ValueError, match="bound source"):
+        parity.collect_trainer_router_trace(profile, trainer_config, sources, tmp_path / "host-bad")
+    host_bound["host"] = "host1"
+    (sources[1] / "trainer-runtime-pp-1-host-host1.json").write_text(json.dumps(host_bound))
+    bad = json.loads(
+        (sources[1] / "trainer-runtime-pp-1-host-host1.json").read_text()
+    )
+    bad["owned_layers"] = [1]
+    (sources[1] / "trainer-runtime-pp-1-host-host1.json").write_text(json.dumps(bad))
+    with pytest.raises(ValueError, match="multiple PP stages"):
+        parity.collect_trainer_router_trace(profile, trainer_config, sources, tmp_path / "bad")
+
+
+def test_trainer_trace_collection_requires_each_host_provenance(tmp_path):
+    profile = parity.Profile(tmp_path / "profile.toml", {"dense_layers": 1, "hidden_layers": 3})
+    trainer_config = tmp_path / "trainer.toml"
+    trainer_config.write_text("[model]\npp = 2\ncp = 2\n[data.fake]\nbatch_size = 2\n")
+    source = tmp_path / "host"
+    source.mkdir()
+    (source / "session.json").write_text('{"side":"trainer"}\n')
+    with pytest.raises(ValueError, match="one host provenance"):
+        parity.collect_trainer_router_trace(profile, trainer_config, [source], tmp_path / "merged")
+
+
 def test_router_id_equality_is_exact_and_fails_on_one_disagreement():
     executed = np.asarray([[[0, 2], [1, 3]]], dtype=np.int32)
     observed = executed.copy()

@@ -129,7 +129,7 @@ case ${1:-} in
     if [ "$rank" -lt 0 ]; then
       echo "node $node is not in trainer_nodes ($trainer_nodes)" >&2; exit 1
     fi
-    read -r rollout_transport trainer_output trainer_only < <(
+    read -r rollout_transport trainer_output trainer_only parity_trace_dir parity_trace_source parity_pp parity_cp parity_batch parity_max_calls parity_max_files parity_max_bytes < <(
       python3 - "$trainer_config" <<'PY'
 import sys
 import tomllib
@@ -139,13 +139,84 @@ with open(sys.argv[1], "rb") as f:
 data = config.get("data", {})
 cache = data.get("rollout_cache", {})
 trainer_only = "fake" in data or cache.get("mode") == "replay"
+env_vars = config.get("env_vars", {})
+model = config.get("model", {})
+fake = data.get("fake", {})
 print(
     config["rollout_transport"]["type"],
     config["output_dir"],
     int(trainer_only),
+    env_vars.get("PRIME_PARITY_ROUTER_TRACE_DIR", ""),
+    env_vars.get("PRIME_PARITY_ROUTER_TRACE_SOURCE", ""),
+    model.get("pp", ""),
+    model.get("cp", ""),
+    fake.get("batch_size", ""),
+    env_vars.get("PRIME_PARITY_TRACE_MAX_CALLS", ""),
+    env_vars.get("PRIME_PARITY_TRACE_MAX_FILES", ""),
+    env_vars.get("PRIME_PARITY_TRACE_MAX_BYTES", ""),
 )
 PY
     )
+    parity_trace_runtime=""
+    parity_image_digest=""
+    parity_env=()
+    if [ -n "$parity_trace_dir" ]; then
+      [ "$parity_trace_dir" = "/data/glm52-rl/qualifications/glm52-policy-parity/trainer-traces" ] || {
+        echo "parity trace directory is not the pinned base directory" >&2
+        exit 1
+      }
+      [[ "$RUN" =~ ^[A-Za-z0-9_-]+$ ]] || {
+        echo "RUN is unsafe for a parity trace directory" >&2
+        exit 1
+      }
+      case "$parity_pp:$parity_cp:$parity_batch" in
+        [1-9]*:[1-9]*:[1-9]* ) ;;
+        *) echo "parity trainer TOML must define model.pp, model.cp, and data.fake.batch_size" >&2; exit 1 ;;
+      esac
+      case "$parity_max_calls:$parity_max_files:$parity_max_bytes" in
+        [1-9]*:[1-9]*:[1-9]* ) ;;
+        *) echo "parity trainer TOML must define all trace limits" >&2; exit 1 ;;
+      esac
+      case "$parity_trace_dir" in
+        /*) ;;
+        *) echo "PRIME_PARITY_ROUTER_TRACE_DIR must be absolute" >&2; exit 1 ;;
+      esac
+      test -n "$parity_trace_source" || {
+        echo "parity trace source is required when parity tracing is enabled" >&2
+        exit 1
+      }
+      test -f "$parity_trace_source/session.json" || {
+        echo "parity trace session is missing: $parity_trace_source/session.json" >&2
+        exit 1
+      }
+      parity_trace_runtime="$parity_trace_dir/$RUN"
+      sudo install -d -o 1000 -g 1000 -m 0755 "$parity_trace_runtime"
+      sudo find "$parity_trace_runtime" -mindepth 1 -maxdepth 1 -delete
+      sudo install -o 1000 -g 1000 -m 0644 "$parity_trace_source/session.json" \
+        "$parity_trace_runtime/session.json"
+      sudo -u '#1000' test -w "$parity_trace_runtime" || {
+        echo "parity trace directory is not writable: $parity_trace_runtime" >&2
+        exit 1
+      }
+      parity_image_digest=$(sudo docker image inspect "$image" --format '{{.Id}}')
+      if ! [[ "$parity_image_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+        echo "trainer image has no exact digest: $parity_image_digest" >&2
+        exit 1
+      fi
+      parity_env+=(
+        -e "PRIME_PARITY_ROUTER_TRACE_DIR=$parity_trace_runtime"
+        -e "PRIME_PARITY_TRACE_ROOT=$parity_trace_runtime"
+        -e "PRIME_PARITY_ROUTER_TRACE_SOURCE=$parity_trace_source"
+        -e "PRIME_TRAINER_IMAGE_DIGEST=$parity_image_digest"
+        -e "PRIME_TRAINER_HOST=n$node"
+        -e "PRIME_PARITY_PP_SIZE=$parity_pp"
+        -e "PRIME_PARITY_CP_SIZE=$parity_cp"
+        -e "PRIME_PARITY_BATCH_SIZE=$parity_batch"
+        -e "PRIME_PARITY_TRACE_MAX_CALLS=$parity_max_calls"
+        -e "PRIME_PARITY_TRACE_MAX_FILES=$parity_max_files"
+        -e "PRIME_PARITY_TRACE_MAX_BYTES=$parity_max_bytes"
+      )
+    fi
     sudo install -d -o 1000 -g 1000 -m 0755 "$trainer_output"
     if [ "$rank" -eq 0 ]; then
       if [ "$rollout_transport" = filesystem ] && [ "$trainer_only" = 0 ]; then
@@ -191,6 +262,7 @@ PY
       "${prime_configs_mount[@]}" \
       -e TMPDIR=/scratch-tmp \
       -e PYTHONPATH="$deployment/env":/app/packages/prime-rl-configs/src:/app/src \
+      "${parity_env[@]}" \
       -v "$deployment/source/src/prime_rl/trainer/fp8_checkpoint.py":/app/src/prime_rl/trainer/fp8_checkpoint.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/model.py":/app/src/prime_rl/trainer/model.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/models/layers/fp8_ada.py":/app/src/prime_rl/trainer/models/layers/fp8_ada.py:ro \

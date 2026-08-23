@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import importlib
+import inspect
 import json
 import os
 import re
+import sys
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -18,6 +21,18 @@ trace_schema_version = 1
 trace_dir_env = "PRIME_PARITY_ROUTER_TRACE_DIR"
 session_name = "session.json"
 runtime_marker_name = "h200-runtime.json"
+trainer_provenance_name = "trainer-runtime.json"
+parity_model_modules = (
+    "prime_rl.trainer.model",
+    "prime_rl.trainer.lora",
+    "prime_rl.trainer.distributed.pipeline_parallel",
+    "prime_rl.trainer.models.glm_moe_dsa.modeling_glm_moe_dsa",
+    "prime_rl.trainer.models.glm_moe_dsa.sparse_mla_attention",
+    "prime_rl.trainer.models.layers.moe",
+    "prime_rl.trainer.models.layers.mxfp8_grouped_gemm",
+    "prime_rl.trainer.models.layers.lora.multi_linear",
+    "prime_rl.trainer.models.layers.lora.native_fp8_moe",
+)
 lifecycle_pattern = re.compile(r"^h200-lifecycle-rank-(\d+)\.json$")
 chunk_pattern = re.compile(
     r"^(trainer|h200)-rank-(\d+)-pp-(\d+)-cp-(\d+)-layer-(\d+)-call-(\d+)\.npz$"
@@ -160,6 +175,93 @@ def trace_root() -> Path | None:
     return path
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _mount_points() -> set[Path]:
+    points: set[Path] = set()
+    for line in Path("/proc/self/mountinfo").read_text().splitlines():
+        fields = line.split(" - ", 1)[0].split()
+        if len(fields) >= 5:
+            points.add(Path(re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), fields[4])))
+    return points
+
+
+def _is_mounted(path: Path, mount_points: set[Path]) -> bool:
+    return path in mount_points
+
+
+def _trainer_host_name() -> str:
+    host = os.environ.get("PRIME_TRAINER_HOST", "")
+    if not re.fullmatch(r"n[0-9]+", host):
+        raise ValueError("PRIME_TRAINER_HOST must identify the configured trainer host")
+    return host
+
+
+def _trainer_provenance(root: Path, owned_layers: set[int]) -> None:
+    image_digest = os.environ.get("PRIME_TRAINER_IMAGE_DIGEST", "")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_digest):
+        raise ValueError("PRIME_TRAINER_IMAGE_DIGEST must be an exact image digest")
+    values = {
+        name: os.environ.get(name, "")
+        for name in (
+            "PRIME_PARITY_PP_SIZE",
+            "PRIME_PARITY_CP_SIZE",
+            "PRIME_PARITY_BATCH_SIZE",
+            "PRIME_PARITY_TRACE_MAX_CALLS",
+            "PRIME_PARITY_TRACE_MAX_FILES",
+            "PRIME_PARITY_TRACE_MAX_BYTES",
+        )
+    }
+    if any(not value.isdigit() or int(value) < 1 for value in values.values()):
+        raise ValueError("parity sizes, batch, and trace limits must be positive integers")
+    if owned_layers != _expected_owned_layers:
+        raise ValueError("observed router layers differ from trainer PP partition ownership")
+    for name in parity_model_modules:
+        importlib.import_module(name)
+    mount_points = _mount_points()
+    modules: dict[str, dict[str, str]] = {}
+    for name in parity_model_modules:
+        module = sys.modules.get(name)
+        source = inspect.getsourcefile(module)
+        if source is None:
+            raise ValueError(f"required parity model module has no source: {name}")
+        path = Path(source).resolve()
+        if not path.is_file():
+            raise ValueError(f"required parity model module is not a file: {path}")
+        location = "mounted" if path in mount_points else "unmounted"
+        modules[name] = {"location": location, "sha256": _file_sha256(path)}
+    payload = {
+        "schema_version": trace_schema_version,
+        "kind": "glm52_policy_parity_trainer_runtime",
+        "image_digest": image_digest,
+        "host": os.environ.get("PRIME_TRAINER_HOST", ""),
+        "pp_rank": _process_pp_rank,
+        "cp_rank": _process_cp_rank,
+        "global_rank": _process_rank,
+        "pp_size": int(values["PRIME_PARITY_PP_SIZE"]),
+        "cp_size": int(values["PRIME_PARITY_CP_SIZE"]),
+        "batch_size": int(values["PRIME_PARITY_BATCH_SIZE"]),
+        "owned_layers": sorted(owned_layers),
+        "trace_limits": {
+            "max_calls": int(values["PRIME_PARITY_TRACE_MAX_CALLS"]),
+            "max_files": int(values["PRIME_PARITY_TRACE_MAX_FILES"]),
+            "max_bytes": int(values["PRIME_PARITY_TRACE_MAX_BYTES"]),
+        },
+        "modules": modules,
+    }
+    host = _trainer_host_name()
+    filename = f"trainer-runtime-pp-{_process_pp_rank}-host-{host}.json"
+    temporary = root / f".{filename}.{os.getpid()}"
+    temporary.write_text(json.dumps(payload, sort_keys=True) + "\n")
+    os.replace(temporary, root / filename)
+
+
 def write_session(root: Path, session: TraceSession) -> None:
     session.validate()
     root.mkdir(parents=True, exist_ok=True)
@@ -182,7 +284,8 @@ def clear_trace(root: Path) -> None:
     root.mkdir(parents=True, exist_ok=True)
     for path in root.iterdir():
         if (
-            path.name in {session_name, runtime_marker_name}
+            path.name in {session_name, runtime_marker_name, trainer_provenance_name}
+            or path.name.startswith("trainer-runtime-pp-")
             or chunk_pattern.match(path.name)
             or lifecycle_pattern.match(path.name)
         ):
@@ -191,32 +294,68 @@ def clear_trace(root: Path) -> None:
             path.unlink()
 
 
-def configure_trainer_trace(config: Any, parallel_dims: Any, world: Any) -> bool:
+def configure_trainer_trace(
+    config: Any, parallel_dims: Any, world: Any, model: Any = None
+) -> bool:
     root = trace_root()
     if root is None:
         return False
+    expected_root = os.environ.get("PRIME_PARITY_TRACE_ROOT")
+    if expected_root is None or root != Path(expected_root) or not re.fullmatch(
+        r"/data/glm52-rl/qualifications/glm52-policy-parity/trainer-traces/[A-Za-z0-9_-]+",
+        str(root),
+    ):
+        raise ValueError("parity trace root is not the configured per-run directory")
+    if not root.is_dir() or not os.access(root, os.W_OK):
+        raise ValueError(f"trainer parity trace directory is missing or not writable: {root}")
+    if not (root / session_name).is_file():
+        raise ValueError(f"trainer parity trace session is missing: {root / session_name}")
     if not config.enable_token_export:
         raise ValueError("trainer router trace requires enable_token_export=true")
     session = read_session(root)
     if session.side != "trainer":
         raise ValueError("trainer router trace session side must be trainer")
+    if model is None:
+        raise ValueError("trainer parity trace requires the initialized model")
+    from prime_rl.trainer.model import get_language_model
+    from prime_rl.trainer.distributed.pipeline_parallel import stage_layer_range
+
+    language_model = get_language_model(model)
+    model_config = getattr(language_model, "config", None) or getattr(model, "config", None)
     pp_rank = (
         parallel_dims.world_mesh["pp"].get_local_rank()
         if parallel_dims.pp_enabled
         else 0
     )
+    layer_start, layer_end = stage_layer_range(
+        model_config.num_hidden_layers,
+        pp_rank,
+        parallel_dims.pp,
+        config=model_config,
+    )
+    expected_owned_layers = set(range(max(layer_start, session.dense_layers), layer_end))
     cp_rank = (
         parallel_dims.world_mesh["cp"].get_local_rank()
         if parallel_dims.cp_enabled
         else 0
     )
-    return configure_process_trace(
+    configured = configure_process_trace(
         "trainer",
         rank=world.rank,
         pp_rank=pp_rank,
         cp_rank=cp_rank,
         world_size=world.world_size,
+        pp_size=int(parallel_dims.pp),
+        cp_size=int(parallel_dims.cp),
     )
+    if configured:
+        if os.environ.get("PRIME_PARITY_PP_SIZE") != str(parallel_dims.pp):
+            raise ValueError("configured parity PP size differs from trainer mesh")
+        if os.environ.get("PRIME_PARITY_CP_SIZE") != str(parallel_dims.cp):
+            raise ValueError("configured parity CP size differs from trainer mesh")
+        global _expected_owned_layers
+        _expected_owned_layers = expected_owned_layers
+    return configured
 
 
 _process_side: str | None = None
@@ -224,6 +363,8 @@ _process_rank = 0
 _process_pp_rank = 0
 _process_cp_rank = 0
 _process_world_size = 1
+_process_pp_size = 1
+_process_cp_size = 1
 _process_session: TraceSession | None = None
 _process_request: str | None = None
 _active_h200_session: str | None = None
@@ -231,6 +372,11 @@ _runtime_calls: dict[int, int] = {}
 _runtime_id_sources: dict[int, str] = {}
 _runtime_scales: dict[int, float] = {}
 _calls: dict[int, int] = {}
+_written_files = 0
+_written_bytes = 0
+_owned_layers: set[int] = set()
+_provenance_written = False
+_expected_owned_layers: set[int] = set()
 _write_lock = threading.Lock()
 
 
@@ -241,9 +387,11 @@ def configure_process_trace(
     pp_rank: int = 0,
     cp_rank: int = 0,
     world_size: int = 1,
+    pp_size: int = 1,
+    cp_size: int = 1,
 ) -> bool:
     global _process_side, _process_rank, _process_pp_rank, _process_cp_rank
-    global _process_world_size
+    global _process_world_size, _process_pp_size, _process_cp_size
     global _process_session, _process_request, _active_h200_session
     root = trace_root()
     if root is None:
@@ -252,10 +400,17 @@ def configure_process_trace(
         raise ValueError("trace side must be trainer or h200")
     if world_size < 1 or rank < 0 or rank >= world_size:
         raise ValueError("trace process rank or world size is invalid")
+    if side == "trainer":
+        if pp_size < 1 or cp_size < 1 or world_size != pp_size * cp_size:
+            raise ValueError("parity PP/CP sizes do not match the trainer world")
+        if rank != pp_rank * cp_size + cp_rank:
+            raise ValueError("trainer global rank does not match PP/CP rank")
     _process_rank = rank
     _process_pp_rank = pp_rank
     _process_cp_rank = cp_rank
     _process_world_size = world_size
+    _process_pp_size = pp_size
+    _process_cp_size = cp_size
     if side == "h200" and rank != 0:
         _process_side = None
         return False
@@ -264,6 +419,11 @@ def configure_process_trace(
     _process_request = None
     _active_h200_session = None
     _calls.clear()
+    global _written_files, _written_bytes, _owned_layers, _provenance_written
+    _written_files = 0
+    _written_bytes = 0
+    _owned_layers = set()
+    _provenance_written = False
     _runtime_calls.clear()
     _runtime_id_sources.clear()
     _runtime_scales.clear()
@@ -488,6 +648,27 @@ def write_route_chunk(
         raise ValueError("route output scale must be finite and positive")
     if float(route_output_scale) != session.route_output_scale:
         raise ValueError("route output scale differs from the trace session")
+    global _written_files, _written_bytes, _owned_layers, _provenance_written
+    estimate = int(ids_array.nbytes + weight_array.nbytes + 4096)
+    if _process_side == "trainer":
+        limits = {
+            name: int(os.environ.get(name, "0"))
+            for name in (
+                "PRIME_PARITY_TRACE_MAX_CALLS",
+                "PRIME_PARITY_TRACE_MAX_FILES",
+                "PRIME_PARITY_TRACE_MAX_BYTES",
+            )
+        }
+        if min(limits.values()) < 1:
+            raise ValueError("parity trace limits are missing")
+        if sum(_calls.values()) >= limits["PRIME_PARITY_TRACE_MAX_CALLS"]:
+            raise ValueError("parity router trace call limit exceeded")
+        if (
+            _written_files >= limits["PRIME_PARITY_TRACE_MAX_FILES"]
+            or _written_bytes + estimate > limits["PRIME_PARITY_TRACE_MAX_BYTES"]
+        ):
+            raise ValueError("parity router trace file or byte limit exceeded")
+    _owned_layers.add(layer)
     with _write_lock:
         if _process_side != "h200" and _process_session != session:
             _calls.clear()
@@ -509,6 +690,16 @@ def write_route_chunk(
                 weights=weight_array,
             )
         os.replace(temporary, path)
+        _written_files += 1
+        _written_bytes += estimate
+        if (
+            _process_side == "trainer"
+            and _process_cp_rank == 0
+            and not _provenance_written
+            and _owned_layers == _expected_owned_layers
+        ):
+            _trainer_provenance(root, _owned_layers)
+            _provenance_written = True
         _runtime_calls[layer] = _runtime_calls.get(layer, 0) + 1
         source = id_source
         previous_source = _runtime_id_sources.get(layer)

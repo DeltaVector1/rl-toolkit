@@ -23,6 +23,8 @@ from prime_rl.parity_router_trace import (
     validate_sparse_routes,
     write_route_chunk,
     write_session,
+    _is_mounted,
+    _trainer_host_name,
 )
 
 
@@ -75,6 +77,37 @@ def session() -> TraceSession:
 
 
 class ParityRouterTraceTest(unittest.TestCase):
+    def test_mount_classification_requires_exact_mountpoint(self):
+        self.assertTrue(_is_mounted(Path("/app/src/prime_rl/model.py"), {Path("/app/src/prime_rl/model.py")}))
+        self.assertFalse(_is_mounted(Path("/app/src/prime_rl/model.py"), {Path("/app/src")}))
+
+    def test_trainer_host_identity_comes_from_launcher(self):
+        with patch.dict(os.environ, {"PRIME_TRAINER_HOST": "n82"}, clear=True):
+            self.assertEqual(_trainer_host_name(), "n82")
+        with patch.dict(os.environ, {"PRIME_TRAINER_HOST": "container-id"}, clear=True):
+            with self.assertRaisesRegex(ValueError, "configured trainer host"):
+                _trainer_host_name()
+
+    def test_trainer_trace_bound_rejects_second_chunk(self):
+        torch = fake_torch()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            metadata = session()
+            write_session(root, metadata)
+            ids = FakeTensor([[0, 1]] * 4)
+            weights = FakeTensor([[0.4, 0.6]] * 4)
+            env = {
+                trace_dir_env: str(root),
+                "PRIME_PARITY_TRACE_MAX_CALLS": "1",
+                "PRIME_PARITY_TRACE_MAX_FILES": "1",
+                "PRIME_PARITY_TRACE_MAX_BYTES": "100000",
+            }
+            with patch.dict(os.environ, env, clear=True), patch.dict(sys.modules, {"torch": torch}):
+                configure_process_trace("trainer", rank=1, pp_rank=0, cp_rank=1, world_size=2, pp_size=1, cp_size=2)
+                write_route_chunk(1, ids, weights, route_output_scale=2.5)
+                with self.assertRaisesRegex(ValueError, "limit exceeded"):
+                    write_route_chunk(1, ids, weights, route_output_scale=2.5)
+
     def test_bias_selects_and_unbiased_sigmoid_weights_score(self):
         logits = np.array([[2.0, 1.0, -1.0, -2.0]], dtype=np.float32)
         bias = np.array([-10.0, 0.0, 10.0, 0.0], dtype=np.float32)

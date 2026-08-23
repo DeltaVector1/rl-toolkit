@@ -44,6 +44,10 @@ class EdgeOperationsTest(unittest.TestCase):
         )
         self.assertEqual(
             config["env_vars"]["PRIME_PARITY_ROUTER_TRACE_DIR"],
+            "/data/glm52-rl/qualifications/glm52-policy-parity/trainer-traces",
+        )
+        self.assertEqual(
+            config["env_vars"]["PRIME_PARITY_ROUTER_TRACE_SOURCE"],
             f"{stage}/trainer-router-trace",
         )
 

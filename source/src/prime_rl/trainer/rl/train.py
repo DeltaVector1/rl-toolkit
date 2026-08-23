@@ -708,7 +708,7 @@ def train(config: TrainerConfig):
         else:
             dataloader = real_dataloader
 
-    token_exporter = setup_token_exporter(config, parallel_dims, world, logger)
+    token_exporter = setup_token_exporter(config, parallel_dims, world, logger, model)
 
     gc_handler = GarbageCollection(config.gc.interval) if config.gc else None
 

@@ -10,6 +10,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import secrets
 import shutil
 import sys
@@ -810,6 +811,179 @@ def select_first_trainer_router_call(router_trace: Path, output: Path) -> None:
                     )
 
 
+def collect_trainer_router_trace(
+    profile: Profile, trainer_config: Path, sources: list[Path], output: Path
+) -> dict[str, Any]:
+    """Merge per-host PP/CP traces into one immutable capture directory."""
+    if not sources:
+        raise ValueError("at least one trainer router trace source is required")
+    if output.exists():
+        raise ValueError(f"trainer router trace output already exists: {output}")
+    with trainer_config.open("rb") as stream:
+        trainer_values = tomllib.load(stream)
+    model_values = trainer_values.get("model", {})
+    fake_values = trainer_values.get("data", {}).get("fake", {})
+    pp_size = model_values.get("pp")
+    cp_size = model_values.get("cp")
+    batch_size = fake_values.get("batch_size")
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in (pp_size, cp_size, batch_size)):
+        raise ValueError("trainer TOML must define positive model.pp, model.cp, and data.fake.batch_size")
+    source_sessions = []
+    for source in sources:
+        if not source.is_dir():
+            raise ValueError(f"trainer router trace source is missing: {source}")
+        session_path = source / "session.json"
+        if not session_path.is_file():
+            raise ValueError(f"trainer router trace session is missing: {session_path}")
+        source_sessions.append(json.loads(session_path.read_text()))
+    if any(session != source_sessions[0] for session in source_sessions[1:]):
+        raise ValueError("trainer router trace sessions differ between hosts")
+    source_session = source_sessions[0]
+    if source_session.get("side") != "trainer":
+        raise ValueError("trainer router trace session side is not trainer")
+
+    output.mkdir(parents=True)
+    (output / "session.json").write_text(json.dumps(source_session, sort_keys=True) + "\n")
+    provenances: list[dict[str, Any]] = []
+    copied: set[str] = set()
+    for source in sources:
+        runtime_paths = sorted(source.glob("trainer-runtime-pp-*-host-*.json"))
+        if len(runtime_paths) != 1:
+            raise ValueError(f"trainer source must contain one host provenance record: {source}")
+        record = json.loads(runtime_paths[0].read_text())
+        if record.get("host") != source.name:
+            raise ValueError(
+                f"trainer provenance host does not match its bound source: {record.get('host')} != {source.name}"
+            )
+        provenances.append(record)
+        for chunk in sorted(source.glob("trainer-rank-*-pp-*-cp-*-layer-*-call-*.npz")):
+            name = chunk.name
+            if name in copied:
+                raise ValueError(f"duplicate trainer router chunk: {name}")
+            copied.add(name)
+            shutil.copy2(chunk, output / name)
+    if not copied:
+        raise ValueError("trainer router trace contains no route chunks")
+    if len(provenances) != pp_size:
+        raise ValueError(f"expected {pp_size} PP host provenance records, found {len(provenances)}")
+    expected_layers = set(range(profile.get("dense_layers"), profile.get("hidden_layers")))
+    pp_ranks = {record.get("pp_rank") for record in provenances}
+    if pp_ranks != set(range(pp_size)):
+        raise ValueError("trainer provenance does not cover each PP rank exactly once")
+    for record in provenances:
+        image_digest = record.get("image_digest")
+        if not isinstance(image_digest, str) or not re.fullmatch(
+            r"sha256:[0-9a-f]{64}", image_digest
+        ):
+            raise ValueError("trainer provenance has an invalid image digest")
+    module_records = {json.dumps(record.get("modules"), sort_keys=True) for record in provenances}
+    if len(module_records) != 1:
+        raise ValueError("trainer model module hashes differ between PP hosts")
+    ownership: dict[int, int] = {}
+    for record in provenances:
+        pp_rank = record.get("pp_rank")
+        if record.get("cp_rank") != 0 or record.get("global_rank") != pp_rank * cp_size:
+            raise ValueError("trainer provenance PP/CP/global rank mapping is invalid")
+        if record.get("pp_size") != pp_size or record.get("cp_size") != cp_size:
+            raise ValueError("trainer provenance PP/CP sizes differ from trainer TOML")
+        if record.get("batch_size") != batch_size:
+            raise ValueError("trainer provenance batch size differs from trainer TOML")
+        owned = set(record.get("owned_layers", ()))
+        if not owned or not owned <= expected_layers:
+            raise ValueError("trainer provenance has invalid owned layers")
+        for layer in owned:
+            if layer in ownership:
+                raise ValueError(f"layer {layer} is owned by multiple PP stages")
+            ownership[layer] = pp_rank
+    if set(ownership) != expected_layers:
+        raise ValueError("trainer PP layer ownership is incomplete")
+    expected_pp = pp_size
+    expected_cp = cp_size
+    coverage: set[tuple[int, int, int]] = set()
+    rank_by_mesh: dict[tuple[int, int], int] = {}
+    for name in copied:
+        match = re.fullmatch(
+            r"trainer-rank-(\d+)-pp-(\d+)-cp-(\d+)-layer-(\d+)-call-(\d+)\.npz",
+            name,
+        )
+        if match is None:
+            raise ValueError(f"unexpected trainer router chunk name: {name}")
+        rank, pp, cp, layer, call = (int(value) for value in match.groups())
+        if pp >= expected_pp or cp >= expected_cp or layer not in expected_layers:
+            raise ValueError(f"trainer router chunk is outside expected coverage: {name}")
+        if ownership[layer] != pp:
+            raise ValueError(f"trainer router chunk has the wrong PP owner: {name}")
+        mesh = (pp, cp)
+        previous_rank = rank_by_mesh.setdefault(mesh, rank)
+        if previous_rank != rank:
+            raise ValueError(f"trainer router rank changed for PP/CP mesh {mesh}")
+        if call == 0:
+            coverage.add((pp, cp, layer))
+    expected = {
+        (ownership[layer], cp, layer)
+        for layer in expected_layers
+        for cp in range(expected_cp)
+    }
+    if coverage != expected:
+        missing = sorted(expected - coverage)
+        extra = sorted(coverage - expected)
+        raise ValueError(f"trainer router coverage differs; missing={missing[:3]} extra={extra[:3]}")
+    expected_ranks = {pp * expected_cp + cp for pp in range(expected_pp) for cp in range(expected_cp)}
+    if set(rank_by_mesh.values()) != expected_ranks:
+        raise ValueError("trainer router ranks do not cover the expected PP/CP world")
+    expected_trace_calls = (profile.get("hidden_layers") - profile.get("dense_layers")) * batch_size
+    for record in provenances:
+        limits = record.get("trace_limits")
+        if not isinstance(limits, dict) or limits.get("max_calls") != expected_trace_calls or limits.get("max_files") != expected_trace_calls:
+            raise ValueError("trainer trace limits do not match model layers and batch size")
+    for record in provenances:
+        filename = (
+            f"trainer-runtime-pp-{record['pp_rank']}-host-{record['host']}.json"
+        )
+        (output / filename).write_text(json.dumps(record, sort_keys=True) + "\n")
+    return {
+        "kind": "glm52_policy_parity_trainer_trace_collection",
+        "sources": [str(source) for source in sources],
+        "chunks": len(copied),
+        "pipeline_stages": expected_pp,
+        "context_parallel": expected_cp,
+        "runtime_provenance": provenances,
+    }
+
+
+def load_trainer_provenance(router_trace: Path) -> dict[str, Any]:
+    paths = sorted(router_trace.glob("trainer-runtime-pp-*-host-*.json"))
+    if not paths:
+        raise ValueError("trainer host provenance records are missing")
+    records = [json.loads(path.read_text()) for path in paths]
+    for record in records:
+        image_digest = record.get("image_digest")
+        if not isinstance(image_digest, str) or not re.fullmatch(
+            r"sha256:[0-9a-f]{64}", image_digest
+        ):
+            raise ValueError("trainer image digest is missing or invalid")
+    modules = [record.get("modules") for record in records]
+    if not modules or any(value != modules[0] for value in modules[1:]):
+        raise ValueError("trainer model module hashes differ between host records")
+    for record in records:
+        if record.get("kind") != "glm52_policy_parity_trainer_runtime":
+            raise ValueError("trainer runtime provenance kind is invalid")
+    image_digest = records[0]["image_digest"]
+    if not isinstance(modules[0], dict) or not modules[0]:
+        raise ValueError("trainer model module hashes are missing")
+    for name, value in modules[0].items():
+        if not isinstance(name, str) or not isinstance(value, dict):
+            raise ValueError("trainer model module hash record is invalid")
+        if value.get("location") not in {"mounted", "unmounted"} or not re.fullmatch(
+            r"[0-9a-f]{64}", str(value.get("sha256", ""))
+        ):
+            raise ValueError(f"trainer model module hash is invalid: {name}")
+    locations = {value["location"] for value in modules[0].values()}
+    if locations != {"mounted", "unmounted"}:
+        raise ValueError("mounted and unmounted trainer model module hashes are incomplete")
+    return {**records[0], "host_records": records}
+
+
 def capture_trainer(
     profile: Profile,
     fixture: Path,
@@ -849,6 +1023,7 @@ def capture_trainer(
     for name, value in expected.items():
         if getattr(session, name) != value:
             raise ValueError(f"trainer router trace {name} differs from the parity request")
+    provenance = load_trainer_provenance(router_trace)
     with tempfile.TemporaryDirectory(prefix="glm52-policy-parity-router-") as temporary:
         first_router_trace = Path(temporary) / "first"
         select_first_trainer_router_call(router_trace, first_router_trace)
@@ -893,7 +1068,7 @@ def capture_trainer(
         np.save(temp / "selected_logprobs.npy", selected_logprobs, allow_pickle=False)
         np.save(temp / "router_ids.npy", router_ids, allow_pickle=False)
         np.save(temp / "router_weights.npy", router_weights, allow_pickle=False)
-        return record_trace(
+        manifest = record_trace(
             profile,
             fixture,
             output,
@@ -905,6 +1080,15 @@ def capture_trainer(
             adapter_sha256,
             image,
         )
+    manifest["trainer_image_digest"] = provenance["image_digest"]
+    manifest["trainer_image_digests"] = {
+        record["host"]: record["image_digest"]
+        for record in provenance["host_records"]
+    }
+    manifest["trainer_model_modules"] = provenance["modules"]
+    manifest["trainer_host_provenance"] = provenance["host_records"]
+    (output / "manifest.json").write_bytes(json_bytes(manifest))
+    return manifest
 
 
 def make_trainer_reference(
@@ -1079,7 +1263,33 @@ def validate_stage_paths(
         )
 
 
-def compare(profile: Profile, fixture: Path, trainer: Path, h200: Path, output: Path | None) -> dict[str, Any]:
+def expected_trainer_image_digest(operations_path: Path) -> str | None:
+    if not operations_path.is_file():
+        raise ValueError(f"operations config is missing: {operations_path}")
+    with operations_path.open("rb") as stream:
+        operations = tomllib.load(stream)
+    containers = operations.get("containers", {})
+    profile = operations.get("profiles", {}).get("glm52-policy-parity", {})
+    expected = containers.get("trainer_image_digest") or profile.get(
+        "trainer_image_digest"
+    )
+    if expected is None:
+        return None
+    if not isinstance(expected, str) or not re.fullmatch(
+        r"sha256:[0-9a-f]{64}", expected
+    ):
+        raise ValueError("configured trainer image digest is invalid")
+    return expected
+
+
+def compare(
+    profile: Profile,
+    fixture: Path,
+    trainer: Path,
+    h200: Path,
+    output: Path | None,
+    operations_path: Path,
+) -> dict[str, Any]:
     fixture_manifest = load_manifest(fixture, "glm52_policy_parity_fixture")
     check_fresh(profile, fixture, fixture_manifest)
     trainer_manifest = load_manifest(trainer, "glm52_policy_parity_trace")
@@ -1099,6 +1309,42 @@ def compare(profile: Profile, fixture: Path, trainer: Path, h200: Path, output: 
         if trainer_manifest.get(field) != h200_manifest.get(field):
             raise ValueError(f"trace {field} values differ")
     validate_route_output_scales(profile, trainer_manifest, h200_manifest)
+    trainer_image_digest = trainer_manifest.get("trainer_image_digest")
+    if not isinstance(trainer_image_digest, str) or not re.fullmatch(
+        r"sha256:[0-9a-f]{64}", trainer_image_digest
+    ):
+        raise ValueError("trainer manifest image digest is missing or invalid")
+    expected_image_digest = expected_trainer_image_digest(operations_path)
+    trainer_model_modules = trainer_manifest.get("trainer_model_modules")
+    if not isinstance(trainer_model_modules, dict) or not trainer_model_modules:
+        raise ValueError("trainer manifest model module hashes are missing")
+    if not any(
+        isinstance(value, dict) and value.get("location") == "mounted"
+        for value in trainer_model_modules.values()
+    ) or not any(
+        isinstance(value, dict) and value.get("location") == "unmounted"
+        for value in trainer_model_modules.values()
+    ):
+        raise ValueError("trainer manifest mounted and unmounted module hashes are incomplete")
+    trainer_host_provenance = trainer_manifest.get("trainer_host_provenance")
+    if not isinstance(trainer_host_provenance, list) or len(trainer_host_provenance) != 8:
+        raise ValueError("trainer manifest must contain eight host provenance records")
+    trainer_image_digests = trainer_manifest.get("trainer_image_digests")
+    if not isinstance(trainer_image_digests, dict) or len(trainer_image_digests) != len(
+        trainer_host_provenance
+    ):
+        raise ValueError("trainer manifest must contain one image digest per host")
+    for record in trainer_host_provenance:
+        host = record.get("host") if isinstance(record, dict) else None
+        digest = trainer_image_digests.get(host) if isinstance(host, str) else None
+        if not isinstance(digest, str) or not re.fullmatch(
+            r"sha256:[0-9a-f]{64}", digest
+        ) or digest != record.get("image_digest"):
+            raise ValueError("trainer manifest host image digest records do not match")
+    if expected_image_digest is not None and any(
+        digest != expected_image_digest for digest in trainer_image_digests.values()
+    ):
+        raise ValueError("a trainer host image digest differs from operations config")
 
     trainer_logprobs = validate_logprobs(
         profile, load_array(trainer, trainer_manifest, "selected_logprobs")
@@ -1171,6 +1417,10 @@ def compare(profile: Profile, fixture: Path, trainer: Path, h200: Path, output: 
         "profile_sha256": file_sha256(profile.path),
         "model_revision": trainer_manifest["model_revision"],
         "adapter_sha256": trainer_manifest["adapter_sha256"],
+        "trainer_image_digest": trainer_image_digest,
+        "trainer_image_digests": trainer_image_digests,
+        "trainer_model_modules": trainer_model_modules,
+        "trainer_host_provenance": trainer_host_provenance,
         "inference_logprob_source": "normal_cuda_graph_request",
         "inference_router_source": "isolated_eager_trace_request",
         "graph_eager_guard": h200_manifest["graph_eager_guard"],
@@ -1233,6 +1483,10 @@ def parser() -> argparse.ArgumentParser:
     trainer.add_argument("--adapter-sha256", required=True)
     trainer.add_argument("--image", required=True)
     trainer.add_argument("output", type=Path)
+    collect = commands.add_parser("collect-trainer")
+    collect.add_argument("--trainer-config", type=Path, required=True)
+    collect.add_argument("--source", type=Path, action="append", required=True)
+    collect.add_argument("output", type=Path)
     reference = commands.add_parser("make-trainer-reference")
     reference.add_argument("--fixture", type=Path, required=True)
     reference.add_argument("--h200-capture", type=Path, required=True)
@@ -1264,6 +1518,9 @@ def parser() -> argparse.ArgumentParser:
     check.add_argument("--fixture", type=Path, required=True)
     check.add_argument("--trainer", type=Path, required=True)
     check.add_argument("--h200", type=Path, required=True)
+    check.add_argument(
+        "--operations", type=Path, default=Path("configs/operations.toml")
+    )
     check.add_argument("--output", type=Path)
     return result
 
@@ -1297,6 +1554,10 @@ def main(argv: list[str] | None = None) -> int:
                 args.model_revision,
                 args.adapter_sha256,
                 args.image,
+            )
+        elif args.command == "collect-trainer":
+            result = collect_trainer_router_trace(
+                profile, args.trainer_config, args.source, args.output
             )
         elif args.command == "make-trainer-reference":
             result = make_trainer_reference(
@@ -1339,7 +1600,14 @@ def main(argv: list[str] | None = None) -> int:
                 args.image,
             )
         else:
-            result = compare(profile, args.fixture, args.trainer, args.h200, args.output)
+            result = compare(
+                profile,
+                args.fixture,
+                args.trainer,
+                args.h200,
+                args.output,
+                args.operations,
+            )
         print(json.dumps(result, indent=2, sort_keys=True))
         return int(args.command == "compare" and not result["passed"])
     except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:

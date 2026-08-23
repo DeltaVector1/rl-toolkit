@@ -79,4 +79,8 @@ save_format = "safetensors"
 type = "filesystem"
 
 [env_vars]
-PRIME_PARITY_ROUTER_TRACE_DIR = "/data/glm52-rl/qualifications/glm52-policy-parity/trainer-stage-final/trainer-router-trace"
+PRIME_PARITY_ROUTER_TRACE_DIR = "/data/glm52-rl/qualifications/glm52-policy-parity/trainer-traces"
+PRIME_PARITY_ROUTER_TRACE_SOURCE = "/data/glm52-rl/qualifications/glm52-policy-parity/trainer-stage-final/trainer-router-trace"
+PRIME_PARITY_TRACE_MAX_CALLS = "600"
+PRIME_PARITY_TRACE_MAX_FILES = "600"
+PRIME_PARITY_TRACE_MAX_BYTES = "400000000"
