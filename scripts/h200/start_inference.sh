@@ -98,6 +98,82 @@ for path in "$engine_cidfile" "$engine_identity_file" "$engine_identity_file.tmp
     exit 2
   fi
 done
+read_engine_cid() {
+  python3 - "$work_parent" "$(basename "$engine_cidfile")" <<'PY'
+import os,re,stat,sys
+parent_path,name=sys.argv[1:]
+parent=os.open(parent_path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+try:
+ st=os.fstat(parent)
+ assert stat.S_ISDIR(st.st_mode) and st.st_uid==1000 and st.st_gid==1000
+ assert stat.S_IMODE(st.st_mode)==0o750
+ fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=parent)
+ try:
+  st=os.fstat(fd)
+  assert stat.S_ISREG(st.st_mode) and st.st_uid==1000 and st.st_gid==1000
+  assert stat.S_IMODE(st.st_mode)==0o600
+  data=os.read(fd,66)
+  assert os.read(fd,1)==b""
+ finally:
+  os.close(fd)
+ assert re.fullmatch(rb"[0-9a-f]{64}\n",data)
+ print(data[:-1].decode())
+finally:
+ os.close(parent)
+PY
+}
+write_engine_identity() {
+  python3 - "$work_parent" "$(basename "$engine_cidfile")" \
+    "$(basename "$engine_identity_file")" "$container_id" "$host_boot_id" <<'PY'
+import json,os,re,stat,sys
+parent_path,cid_name,identity_name,expected_cid,boot=sys.argv[1:]
+assert re.fullmatch(r"[0-9a-f]{64}",expected_cid)
+assert re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",boot)
+parent=os.open(parent_path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+tmp=identity_name+".tmp"
+try:
+ st=os.fstat(parent)
+ assert stat.S_ISDIR(st.st_mode) and st.st_uid==1000 and st.st_gid==1000
+ assert stat.S_IMODE(st.st_mode)==0o750
+ cid_fd=os.open(cid_name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=parent)
+ try:
+  st=os.fstat(cid_fd)
+  assert stat.S_ISREG(st.st_mode) and st.st_uid==1000 and st.st_gid==1000
+  assert stat.S_IMODE(st.st_mode)==0o600
+  cid=os.read(cid_fd,66)
+  assert os.read(cid_fd,1)==b""
+ finally:
+  os.close(cid_fd)
+ assert cid==expected_cid.encode()+b"\n"
+ payload=(json.dumps({"container_id":expected_cid,"host_boot_id":boot},sort_keys=True,separators=(",",":"))+"\n").encode()
+ fd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=parent)
+ try:
+  view=memoryview(payload)
+  while view:
+   written=os.write(fd,view)
+   assert written>0
+   view=view[written:]
+  os.fsync(fd)
+  st=os.fstat(fd)
+  assert stat.S_ISREG(st.st_mode) and st.st_uid==1000 and st.st_gid==1000
+  assert stat.S_IMODE(st.st_mode)==0o600
+ finally:
+  os.close(fd)
+ os.replace(tmp,identity_name,src_dir_fd=parent,dst_dir_fd=parent)
+ os.fsync(parent)
+ final_fd=os.open(identity_name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=parent)
+ try:
+  st=os.fstat(final_fd)
+  assert stat.S_ISREG(st.st_mode) and st.st_uid==1000 and st.st_gid==1000
+  assert stat.S_IMODE(st.st_mode)==0o600
+  actual=os.read(final_fd,len(payload)+1)
+  assert os.read(final_fd,1)==b"" and actual==payload
+ finally:
+  os.close(final_fd)
+finally:
+ os.close(parent)
+PY
+}
 host_boot_id=$(cat /proc/sys/kernel/random/boot_id)
 if [[ ! "$host_boot_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
   echo "refusing invalid host boot ID" >&2
@@ -130,6 +206,16 @@ done
 # draft layer pads 8 query heads to 64. At 32,768 tokens its BF16 query has a
 # 2,415,919,104-byte stride, which exceeds FlashMLA's int32 limit and
 # terminates every tensor-parallel worker.
+cleanup_unreported_container() {
+  status=$?
+  trap - EXIT
+  if ! docker rm -f "$container_id" >/dev/null 2>&1; then
+    echo "failed to remove unreported isolated container: $container_id" >&2
+    exit 1
+  fi
+  exit "$status"
+}
+umask 077
 container_id=$(docker run -d --cidfile "$engine_cidfile" \
   --name "$engine_container" --restart "$restart_policy" \
   --log-opt max-size=512m --log-opt max-file=3 \
@@ -166,47 +252,23 @@ container_id=$(docker run -d --cidfile "$engine_cidfile" \
   "$image" \
   @ "$inference_config" \
   --vllm-extra "$vllm_extra")
-if [[ ! "$container_id" =~ ^[0-9a-f]{64}$ && \
-      -f "$engine_cidfile" && ! -L "$engine_cidfile" ]]; then
-  container_id=$(<"$engine_cidfile")
+if [[ "$container_id" =~ ^[0-9a-f]{64}$ ]]; then
+  trap cleanup_unreported_container EXIT
+fi
+cid_from_file=$(read_engine_cid)
+if [[ ! "$container_id" =~ ^[0-9a-f]{64}$ ]]; then
+  container_id=$cid_from_file
+  trap cleanup_unreported_container EXIT
 fi
 if [[ ! "$container_id" =~ ^[0-9a-f]{64}$ ]]; then
   echo "refusing invalid isolated container ID and CID file" >&2
   exit 1
 fi
-cleanup_unreported_container() {
-  status=$?
-  trap - EXIT
-  if ! docker rm -f "$container_id" >/dev/null 2>&1; then
-    echo "failed to remove unreported isolated container: $container_id" >&2
-    exit 1
-  fi
-  exit "$status"
-}
-trap cleanup_unreported_container EXIT
-if [[ ! -f "$engine_cidfile" || -L "$engine_cidfile" || \
-      "$(realpath -e "$engine_cidfile")" != "$engine_cidfile" ]]; then
-  echo "refusing invalid isolated container CID file" >&2
-  exit 1
-fi
-chmod 0600 "$engine_cidfile"
-if [[ "$(stat -c '%u:%g:%a' "$engine_cidfile")" != "1000:1000:600" || \
-      "$(<"$engine_cidfile")" != "$container_id" || \
-      "$(wc -l <"$engine_cidfile")" -ne 1 ]]; then
+if [[ "$cid_from_file" != "$container_id" ]]; then
   echo "refusing isolated container CID file mismatch" >&2
   exit 1
 fi
-python3 -c 'import json,os,pathlib,sys
-p=pathlib.Path(sys.argv[1]); t=pathlib.Path(str(p)+".tmp")
-t.write_text(json.dumps({"container_id":sys.argv[2],"host_boot_id":sys.argv[3]},sort_keys=True,separators=(",",":"))+"\n")
-os.chmod(t,0o600); os.replace(t,p)' \
-  "$engine_identity_file" "$container_id" "$host_boot_id"
-if [[ ! -f "$engine_identity_file" || -L "$engine_identity_file" || \
-      "$(realpath -e "$engine_identity_file")" != "$engine_identity_file" || \
-      "$(stat -c '%u:%g:%a' "$engine_identity_file")" != "1000:1000:600" ]]; then
-  echo "refusing invalid isolated container identity file" >&2
-  exit 1
-fi
+write_engine_identity
 printf 'parity-engine-identity:%s:%s\n' "$container_id" "$host_boot_id"
 expected_command=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:],separators=(",",":")))' \
   @ "$inference_config" --vllm-extra "$vllm_extra")

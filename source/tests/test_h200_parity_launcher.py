@@ -14,6 +14,11 @@ START = ROOT / "scripts/h200/start_inference.sh"
 
 
 class H200ParityLauncherTest(unittest.TestCase):
+    @staticmethod
+    def _identity_helper(name: str) -> str:
+        source = START.read_text().split(f"{name}() {{", 1)[1]
+        return source.split("<<'PY'\n", 1)[1].split("\nPY\n}", 1)[0]
+
     def _run(self, *args: str, deployment: pathlib.Path) -> subprocess.CompletedProcess:
         env = os.environ.copy()
         env["prime_deployment"] = str(deployment)
@@ -149,6 +154,97 @@ class H200ParityLauncherTest(unittest.TestCase):
         self.assertIn("1000:1000:600", source)
         self.assertLess(identity, source.index("mapfile -t identity", launch))
         self.assertLess(identity, source.index("trap - EXIT", identity))
+
+    def test_cid_reader_rejects_symlink_without_touching_target(self):
+        code = self._identity_helper("read_engine_cid")
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            work = root / "work"
+            work.mkdir(mode=0o750)
+            outside = root / "outside"
+            outside.write_text("outside\n")
+            outside.chmod(0o640)
+            (work / "engine.cid").symlink_to(outside)
+            result = subprocess.run(
+                ["python3", "-c", code, str(work), "engine.cid"],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(outside.read_text(), "outside\n")
+            self.assertEqual(outside.stat().st_mode & 0o777, 0o640)
+
+    def test_identity_writer_rejects_tmp_symlink_without_touching_target(self):
+        code = self._identity_helper("write_engine_identity")
+        container_id = "d" * 64
+        boot_id = "11111111-2222-3333-4444-555555555555"
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            work = root / "work"
+            work.mkdir(mode=0o750)
+            cid = work / "engine.cid"
+            cid.write_text(container_id + "\n")
+            cid.chmod(0o600)
+            outside = root / "outside"
+            outside.write_text("outside\n")
+            outside.chmod(0o640)
+            (work / "engine-identity.json.tmp").symlink_to(outside)
+            result = subprocess.run(
+                [
+                    "python3",
+                    "-c",
+                    code,
+                    str(work),
+                    cid.name,
+                    "engine-identity.json",
+                    container_id,
+                    boot_id,
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(outside.read_text(), "outside\n")
+            self.assertEqual(outside.stat().st_mode & 0o777, 0o640)
+
+    def test_identity_writer_replaces_final_symlink_without_touching_target(self):
+        code = self._identity_helper("write_engine_identity")
+        container_id = "d" * 64
+        boot_id = "11111111-2222-3333-4444-555555555555"
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            work = root / "work"
+            work.mkdir(mode=0o750)
+            cid = work / "engine.cid"
+            cid.write_text(container_id + "\n")
+            cid.chmod(0o600)
+            outside = root / "outside"
+            outside.write_text("outside\n")
+            outside.chmod(0o640)
+            identity = work / "engine-identity.json"
+            identity.symlink_to(outside)
+            result = subprocess.run(
+                [
+                    "python3",
+                    "-c",
+                    code,
+                    str(work),
+                    cid.name,
+                    identity.name,
+                    container_id,
+                    boot_id,
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(identity.is_symlink())
+            self.assertEqual(identity.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(outside.read_text(), "outside\n")
+            self.assertEqual(outside.stat().st_mode & 0o777, 0o640)
 
     def test_parity_handlers_use_bounded_stream_reader(self):
         server = (ROOT / "source/src/prime_rl/inference/vllm/server.py").read_text()

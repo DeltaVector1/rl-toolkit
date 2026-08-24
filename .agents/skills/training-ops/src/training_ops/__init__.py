@@ -3089,21 +3089,42 @@ test -d "$work"
 test ! -L "$work"
 test "$(realpath -e "$work")" = "$work"
 test "$(stat -c '%u:%g:%a' "$work")" = "1000:1000:750"
-for path in "$cidfile" "$identity"; do
-  test -f "$path"
-  test ! -L "$path"
-  test "$(realpath -e "$path")" = "$path"
-  test "$(stat -c '%u:%g:%a' "$path")" = "1000:1000:600"
-done
-cid=$(cat "$cidfile")
-[[ "$cid" =~ ^[0-9a-f]{{64}}$ ]]
-test "$(wc -l <"$cidfile")" = 1
-boot=$(python3 -c 'import json,pathlib,re,sys
-p=pathlib.Path(sys.argv[1]); value=json.loads(p.read_text())
-assert set(value)=={{"container_id","host_boot_id"}}
-assert value["container_id"]==sys.argv[2]
-assert re.fullmatch(r"[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}",value["host_boot_id"])
-print(value["host_boot_id"])' "$identity" "$cid")
+mapfile -t recovered < <(python3 - "$work" "$(basename "$cidfile")" "$(basename "$identity")" <<'PY'
+import json,os,re,stat,sys
+parent_path,cid_name,identity_name=sys.argv[1:]
+parent=os.open(parent_path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+try:
+ st=os.fstat(parent)
+ assert stat.S_ISDIR(st.st_mode) and st.st_uid==1000 and st.st_gid==1000
+ assert stat.S_IMODE(st.st_mode)==0o750
+ values=[]
+ for name in (cid_name,identity_name):
+  fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=parent)
+  try:
+   st=os.fstat(fd)
+   assert stat.S_ISREG(st.st_mode) and st.st_uid==1000 and st.st_gid==1000
+   assert stat.S_IMODE(st.st_mode)==0o600
+   data=os.read(fd,4097)
+   assert os.read(fd,1)==b""
+  finally:
+   os.close(fd)
+  values.append(data)
+ cid_data,identity_data=values
+ assert re.fullmatch(rb"[0-9a-f]{{64}}\\n",cid_data)
+ cid=cid_data[:-1].decode()
+ value=json.loads(identity_data)
+ assert set(value)=={{"container_id","host_boot_id"}}
+ assert value["container_id"]==cid
+ assert re.fullmatch(r"[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}",value["host_boot_id"])
+ print(cid)
+ print(value["host_boot_id"])
+finally:
+ os.close(parent)
+PY
+)
+test "${{#recovered[@]}}" = 2
+cid=${{recovered[0]}}
+boot=${{recovered[1]}}
 test "$(cat /proc/sys/kernel/random/boot_id)" = "$boot"
 record=""
 if record=$(sudo docker inspect "$cid" --format '{{{{.Id}}}}\n{{{{.Name}}}}\n{{{{.Config.Image}}}}\n{{{{json .Config.Cmd}}}}\n{{{{.RestartCount}}}}\n{{{{.HostConfig.RestartPolicy.Name}}}}' 2>/dev/null); then

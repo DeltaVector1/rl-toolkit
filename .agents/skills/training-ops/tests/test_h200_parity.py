@@ -1699,10 +1699,13 @@ sleep() {{
         command = remote.call_args.args[1]
         self.assertIn(paths["engine_cid"], command)
         self.assertIn(paths["engine_identity"], command)
-        self.assertIn("1000:1000:600", command)
+        self.assertIn("os.O_NOFOLLOW", command)
+        self.assertIn("stat.S_IMODE(st.st_mode)==0o600", command)
         self.assertIn("sudo docker inspect \"$cid\"", command)
         self.assertIn("{{json .Config.Cmd}}", command)
         self.assertIn('name=^/${name}$', command)
+        python_code = command.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+        compile(python_code, "parity-identity-recovery", "exec")
         different = (
             "parity-engine-identity:"
             + "e" * 64
