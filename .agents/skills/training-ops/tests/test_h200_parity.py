@@ -223,6 +223,8 @@ class H200ParityTest(unittest.TestCase):
                 "listener_pid": 1234,
                 "container_init_pid": 1234,
                 "listener_relation": "init",
+                "listener_socket_inode": 900,
+                "listener_starttime": 1000,
                 "container_id": "d" * 64,
                 "host_boot_id": "11111111-2222-3333-4444-555555555555",
             },
@@ -864,6 +866,8 @@ class H200ParityTest(unittest.TestCase):
             "listener_pid": 1235,
             "container_init_pid": 1234,
             "listener_relation": "child",
+            "listener_socket_inode": 900,
+            "listener_starttime": 1000,
             "container_id": "a" * 64,
             "host_boot_id": "11111111-2222-3333-4444-555555555555",
         }
@@ -886,6 +890,34 @@ class H200ParityTest(unittest.TestCase):
         self.assertIn("container-restart-policy-invalid", command)
         self.assertEqual(remote.call_args.args[4], 7230)
 
+    def _listener_shell_support(self, container_id, expected_command):
+        image = shlex.quote(json.dumps(training_ops.inference_image))
+        command = shlex.quote(expected_command)
+        policy = shlex.quote(json.dumps("no"))
+        return (
+            "sudo() { \"$@\"; }; "
+            "_docker_record() { printf '%s\\n' true 101 "
+            f"{container_id} {image} {command} 0 {policy}; }}; "
+            "_docker_top() { printf '%s\\n' PID 101 202; }; "
+            "docker() { if test \"$1\" = inspect; then _docker_record; "
+            "elif test \"$1\" = top; then _docker_top; else return 70; fi; }; "
+            "_ss_record() { printf '%s\\n' "
+            "'LISTEN 0 128 *:8000 ino:900 users:((\"python\",pid=202,fd=9))'; }; "
+            "ss() { _ss_record; }; "
+            "_process_stat() { printf '%s\\n' "
+            "\"$1 (worker name) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 1000\"; }; "
+            "_cat_record() { path=${!#}; case \"$path\" in "
+            f"*/cgroup) printf '%s\\n' '0::/docker/{container_id}';; "
+            "*/stat) pid=${path#/proc/}; pid=${pid%/stat}; _process_stat \"$pid\";; "
+            "*/boot_id) printf '%s\\n' 11111111-2222-3333-4444-555555555555;; "
+            "*) return 71;; esac; }; "
+            "cat() { _cat_record \"$@\"; }; "
+            "_stat_record() { path=${!#}; case \"$path\" in "
+            "*/ns/pid) printf '%s\\n' 700;; */ns/mnt) printf '%s\\n' 800;; "
+            "*) return 72;; esac; }; "
+            "stat() { _stat_record \"$@\"; }; "
+        )
+
     def test_listener_identity_shell_accepts_child_only_inside_container_cgroup(self):
         command = training_ops._h200_parity_listener_identity_command(0)
         container_id = "a" * 64
@@ -898,20 +930,8 @@ class H200ParityTest(unittest.TestCase):
             ],
             separators=(",", ":"),
         )
-        common = (
-            "sudo() { \"$@\"; }; "
-            "docker() { printf '%s\\n' true 101 "
-            f"{container_id} {shlex.quote(json.dumps(training_ops.inference_image))} "
-            f"{shlex.quote(expected_command)} 0 {shlex.quote(json.dumps('no'))}; }}; "
-            "ss() { printf '%s\\n' 'LISTEN 0 128 *:8000 users:((\"python\",pid=202,fd=9))'; }; "
-        )
-        inside = (
-            common
-            + "cat() { case \"$*\" in *cgroup) printf '%s\\n' '0::/docker/"
-            + container_id
-            + "';; *) printf '%s\\n' 11111111-2222-3333-4444-555555555555;; esac; }; "
-            + command
-        )
+        common = self._listener_shell_support(container_id, expected_command)
+        inside = common + command
         accepted = subprocess.run(
             ["bash", "-c", inside], text=True, capture_output=True, check=False
         )
@@ -920,19 +940,22 @@ class H200ParityTest(unittest.TestCase):
         self.assertEqual(identity["listener_pid"], 202)
         self.assertEqual(identity["container_init_pid"], 101)
         self.assertEqual(identity["listener_relation"], "child")
+        self.assertEqual(identity["listener_socket_inode"], 900)
+        self.assertEqual(identity["listener_starttime"], 1000)
 
         outside = (
             common
-            + "cat() { case \"$*\" in *cgroup) printf '%s\\n' '0::/docker/"
+            + "cat() { path=${!#}; if test \"$path\" = /proc/202/cgroup; then "
+            + "printf '%s\\n' '0::/docker/"
             + ("b" * 64)
-            + "';; *) printf '%s\\n' 11111111-2222-3333-4444-555555555555;; esac; }; "
+            + "'; else _cat_record \"$@\"; fi; }; "
             + command
         )
         rejected = subprocess.run(
             ["bash", "-c", outside], text=True, capture_output=True, check=False
         )
         self.assertNotEqual(rejected.returncode, 0)
-        self.assertIn("parity-listener-error:listener-outside-container", rejected.stderr)
+        self.assertIn("parity-listener-error:listener-cgroup-mismatch", rejected.stderr)
 
     def test_listener_identity_shell_failures_are_detailed(self):
         command = training_ops._h200_parity_listener_identity_command(0)
@@ -946,46 +969,162 @@ class H200ParityTest(unittest.TestCase):
             ],
             separators=(",", ":"),
         )
-        inspect = (
-            "docker() { printf '%s\\n' true 101 "
-            f"{container_id} {shlex.quote(json.dumps(training_ops.inference_image))} "
-            f"{shlex.quote(expected_command)} 0 {shlex.quote(json.dumps('no'))}; }}; "
-        )
+        healthy = self._listener_shell_support(container_id, expected_command)
+        image = shlex.quote(json.dumps(training_ops.inference_image))
+        policy = shlex.quote(json.dumps("no"))
         cases = {
-            "container-inspect-failed": "docker() { return 71; }; ss() { :; };",
-            "container-not-running": inspect.replace("true 101", "false 101")
-            + "ss() { :; };",
-            "container-image-mismatch": inspect.replace(
-                shlex.quote(json.dumps(training_ops.inference_image)),
-                shlex.quote(json.dumps("wrong-image")),
-            )
-            + "ss() { :; };",
-            "container-command-mismatch": inspect.replace(
-                shlex.quote(expected_command), shlex.quote(json.dumps(["wrong"]))
-            )
-            + "ss() { :; };",
-            "container-restarted": inspect.replace(" 0 ", " 1 ")
-            + "ss() { :; };",
-            "container-restart-policy-invalid": inspect.replace(
-                shlex.quote(json.dumps("no")), shlex.quote(json.dumps("always"))
-            )
-            + "ss() { :; };",
-            "listener-timeout": inspect + "ss() { :; }; sleep() { :; };",
-            "multiple-listeners": inspect
+            "container-inspect-failed": healthy
+            + "docker() { if test \"$1\" = inspect; then return 71; else _docker_top; fi; };",
+            "container-not-running": healthy
+            + "_docker_record() { printf '%s\\n' false 101 "
+            + f"{container_id} {image} {shlex.quote(expected_command)} 0 {policy}; }};",
+            "container-image-mismatch": healthy
+            + "_docker_record() { printf '%s\\n' true 101 "
+            + f"{container_id} {shlex.quote(json.dumps('wrong-image'))} "
+            + f"{shlex.quote(expected_command)} 0 {policy}; }};",
+            "container-command-mismatch": healthy
+            + "_docker_record() { printf '%s\\n' true 101 "
+            + f"{container_id} {image} {shlex.quote(json.dumps(['wrong']))} 0 {policy}; }};",
+            "container-restarted": healthy
+            + "_docker_record() { printf '%s\\n' true 101 "
+            + f"{container_id} {image} {shlex.quote(expected_command)} 1 {policy}; }};",
+            "container-restart-policy-invalid": healthy
+            + "_docker_record() { printf '%s\\n' true 101 "
+            + f"{container_id} {image} {shlex.quote(expected_command)} 0 "
+            + f"{shlex.quote(json.dumps('always'))}; }};",
+            "listener-timeout": healthy + "ss() { :; }; sleep() { :; };",
+            "multiple-listeners": healthy
             + "ss() { printf '%s\\n' 'LISTEN pid=202,' 'LISTEN pid=203,'; };",
-            "multiple-listener-processes": inspect
+            "multiple-listener-processes": healthy
             + "ss() { printf '%s\\n' 'LISTEN pid=202,pid=203,'; };",
-            "listener-pid-missing": inspect
+            "listener-pid-missing": healthy
             + "ss() { printf '%s\\n' 'LISTEN 0 128 *:8000'; };",
-            "listener-probe-failed": inspect + "ss() { return 72; };",
-            "listener-cgroup-unreadable": inspect
-            + "ss() { printf '%s\\n' 'LISTEN pid=202,'; }; cat() { return 73; };",
+            "listener-probe-failed": healthy + "ss() { return 72; };",
+            "listener-cgroup-unreadable": healthy
+            + "cat() { path=${!#}; if test \"$path\" = /proc/202/cgroup; then "
+            + "return 73; else _cat_record \"$@\"; fi; };",
         }
         for detail, functions in cases.items():
             with self.subTest(detail=detail):
-                script = f"sudo() {{ \"$@\"; }}; {functions} {command}"
+                script = functions + command
                 result = subprocess.run(
                     ["bash", "-c", script],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"parity-listener-error:{detail}", result.stderr)
+
+    def test_listener_identity_rejects_replacement_and_pid_reuse(self):
+        command = training_ops._h200_parity_listener_identity_command(0)
+        container_id = "a" * 64
+        expected_command = json.dumps(
+            [
+                "@",
+                training_ops.glm_parity_inference_config,
+                "--vllm-extra",
+                training_ops.glm_parity_vllm_extra,
+            ],
+            separators=(",", ":"),
+        )
+        healthy = self._listener_shell_support(container_id, expected_command)
+        image = shlex.quote(json.dumps(training_ops.inference_image))
+        expected = shlex.quote(expected_command)
+        policy = shlex.quote(json.dumps("no"))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cases = {
+                "second-container-replaced": (
+                    "docker() { if test \"$1\" = inspect; then "
+                    f"if test -e {shlex.quote(str(root / 'inspect'))}; then "
+                    "printf '%s\\n' true 101 "
+                    f"{'b' * 64} {image} {expected} 0 {policy}; else "
+                    f": > {shlex.quote(str(root / 'inspect'))}; _docker_record; fi; "
+                    "else _docker_top; fi; };"
+                ),
+                "second-container-restarted": (
+                    "docker() { if test \"$1\" = inspect; then "
+                    f"if test -e {shlex.quote(str(root / 'restart'))}; then "
+                    f"printf '%s\\n' true 101 {container_id} {image} {expected} 1 {policy}; else "
+                    f": > {shlex.quote(str(root / 'restart'))}; _docker_record; fi; "
+                    "else _docker_top; fi; };"
+                ),
+                "listener-pid-rebound": (
+                    "ss() { if test -e "
+                    f"{shlex.quote(str(root / 'pid'))}; then printf '%s\\n' "
+                    "'LISTEN ino:900 pid=203,'; else "
+                    f": > {shlex.quote(str(root / 'pid'))}; _ss_record; fi; }};"
+                ),
+                "listener-socket-rebound": (
+                    "ss() { if test -e "
+                    f"{shlex.quote(str(root / 'socket'))}; then printf '%s\\n' "
+                    "'LISTEN ino:901 pid=202,'; else "
+                    f": > {shlex.quote(str(root / 'socket'))}; _ss_record; fi; }};"
+                ),
+                "listener-pid-reused": (
+                    "cat() { path=${!#}; if test \"$path\" = /proc/202/stat; then "
+                    f"if test -e {shlex.quote(str(root / 'stat'))}; then "
+                    "printf '%s\\n' '202 (worker name) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 2000'; else "
+                    f": > {shlex.quote(str(root / 'stat'))}; _cat_record \"$@\"; fi; "
+                    "else _cat_record \"$@\"; fi; };"
+                ),
+            }
+            for detail, override in cases.items():
+                with self.subTest(detail=detail):
+                    for marker in root.iterdir():
+                        marker.unlink()
+                    result = subprocess.run(
+                        ["bash", "-c", healthy + override + command],
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(f"parity-listener-error:{detail}", result.stderr)
+
+    def test_listener_identity_rejects_membership_namespace_and_cgroup_mismatch(self):
+        command = training_ops._h200_parity_listener_identity_command(0)
+        container_id = "a" * 64
+        expected_command = json.dumps(
+            [
+                "@",
+                training_ops.glm_parity_inference_config,
+                "--vllm-extra",
+                training_ops.glm_parity_vllm_extra,
+            ],
+            separators=(",", ":"),
+        )
+        healthy = self._listener_shell_support(container_id, expected_command)
+        cases = {
+            "listener-docker-membership-invalid-absent": (
+                "listener-docker-membership-invalid",
+                "_docker_top() { printf '%s\\n' PID 101; };",
+            ),
+            "listener-docker-membership-invalid-duplicate": (
+                "listener-docker-membership-invalid",
+                "_docker_top() { printf '%s\\n' PID 101 202 202; };",
+            ),
+            "listener-pid-namespace-mismatch": (
+                "listener-pid-namespace-mismatch",
+                "stat() { path=${!#}; if test \"$path\" = /proc/202/ns/pid; then "
+                "printf '%s\\n' 701; else _stat_record \"$@\"; fi; };",
+            ),
+            "listener-mount-namespace-mismatch": (
+                "listener-mount-namespace-mismatch",
+                "stat() { path=${!#}; if test \"$path\" = /proc/202/ns/mnt; then "
+                "printf '%s\\n' 801; else _stat_record \"$@\"; fi; };",
+            ),
+            "listener-cgroup-mismatch": (
+                "listener-cgroup-mismatch",
+                "cat() { path=${!#}; if test \"$path\" = /proc/202/cgroup; then "
+                f"printf '%s\\n' '0::/docker/{'b' * 64}'; else _cat_record \"$@\"; fi; }};",
+            ),
+        }
+        for name, (detail, override) in cases.items():
+            with self.subTest(name=name):
+                result = subprocess.run(
+                    ["bash", "-c", healthy + override + command],
                     text=True,
                     capture_output=True,
                     check=False,

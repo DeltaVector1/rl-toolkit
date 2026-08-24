@@ -2674,16 +2674,17 @@ fail() {{
   printf 'parity-listener-error:%s\n' "$detail" >&2
   exit "$code"
 }}
-while :; do
+read_container() {{
+  phase=$1
   inspect=$(sudo docker inspect "$name" --format '{{{{.State.Running}}}}
 {{{{.State.Pid}}}}
 {{{{.Id}}}}
 {{{{json .Config.Image}}}}
 {{{{json .Config.Cmd}}}}
 {{{{.RestartCount}}}}
-{{{{json .HostConfig.RestartPolicy.Name}}}}') || fail 81 container-inspect-failed
-  mapfile -t record <<<"$inspect" || fail 82 container-inspect-record-unreadable
-  test "${{#record[@]}}" = 7 || fail 82 container-inspect-record-invalid
+{{{{json .HostConfig.RestartPolicy.Name}}}}') || fail 81 "${{phase}}container-inspect-failed"
+  mapfile -t record <<<"$inspect" || fail 82 "${{phase}}container-inspect-record-unreadable"
+  test "${{#record[@]}}" = 7 || fail 82 "${{phase}}container-inspect-record-invalid"
   running=${{record[0]}}
   container_pid=${{record[1]}}
   container_id=${{record[2]}}
@@ -2691,45 +2692,191 @@ while :; do
   command=${{record[4]}}
   restart_count=${{record[5]}}
   restart_policy=${{record[6]}}
-  test "$running" = true || fail 83 container-not-running
-  [[ "$container_pid" =~ ^[0-9]+$ ]] || fail 84 container-pid-invalid
-  test "$container_pid" -gt 1 || fail 84 container-pid-invalid
-  [[ "$container_id" =~ ^[0-9a-f]{{64}}$ ]] || fail 85 container-id-invalid
-  test "$image" = {shlex.quote(json.dumps(inference_image))} || fail 86 container-image-mismatch
-  test "$command" = {shlex.quote(expected_command)} || fail 87 container-command-mismatch
-  test "$restart_count" = 0 || fail 88 container-restarted
-  test "$restart_policy" = {shlex.quote(json.dumps('no'))} || fail 89 container-restart-policy-invalid
-  listener_output=$(sudo ss -H -lntp 'sport = :8000') || fail 90 listener-probe-failed
-  if test -z "$listener_output"; then
-    test $SECONDS -lt $deadline || fail 124 listener-timeout
-    sleep 2 || fail 99 listener-wait-failed
-    continue
-  fi
-  mapfile -t listeners <<<"$listener_output" || fail 91 listener-record-unreadable
-  test "${{#listeners[@]}}" = 1 || fail 91 multiple-listeners
+  test "$running" = true || fail 83 "${{phase}}container-not-running"
+  [[ "$container_pid" =~ ^[0-9]+$ ]] || fail 84 "${{phase}}container-pid-invalid"
+  test "$container_pid" -gt 1 || fail 84 "${{phase}}container-pid-invalid"
+  [[ "$container_id" =~ ^[0-9a-f]{{64}}$ ]] || fail 85 "${{phase}}container-id-invalid"
+  test "$image" = {shlex.quote(json.dumps(inference_image))} || fail 86 "${{phase}}container-image-mismatch"
+  test "$command" = {shlex.quote(expected_command)} || fail 87 "${{phase}}container-command-mismatch"
+  test "$restart_count" = 0 || fail 88 "${{phase}}container-restarted"
+  test "$restart_policy" = {shlex.quote(json.dumps('no'))} || fail 89 "${{phase}}container-restart-policy-invalid"
+}}
+read_listener() {{
+  phase=$1
+  listener_output=$(sudo ss -H -lntpe 'sport = :8000') || fail 90 "${{phase}}listener-probe-failed"
+  test -n "$listener_output" || return 10
+  mapfile -t listeners <<<"$listener_output" || fail 91 "${{phase}}listener-record-unreadable"
+  test "${{#listeners[@]}}" = 1 || fail 91 "${{phase}}multiple-listeners"
   remaining=${{listeners[0]}}
   listener_pids=()
   while [[ "$remaining" =~ pid=([0-9]+) ]]; do
     listener_pids+=("${{BASH_REMATCH[1]}}")
     remaining=${{remaining#*"${{BASH_REMATCH[0]}}"}}
   done
-  test "${{#listener_pids[@]}}" -gt 0 || fail 92 listener-pid-missing
+  test "${{#listener_pids[@]}}" -gt 0 || fail 92 "${{phase}}listener-pid-missing"
   declare -A unique_listener_pids=()
   for pid in "${{listener_pids[@]}}"; do unique_listener_pids["$pid"]=1; done
-  test "${{#unique_listener_pids[@]}}" = 1 || fail 93 multiple-listener-processes
+  test "${{#unique_listener_pids[@]}}" = 1 || fail 93 "${{phase}}multiple-listener-processes"
   for listener_pid in "${{!unique_listener_pids[@]}}"; do :; done
-  [[ "$listener_pid" =~ ^[0-9]+$ ]] || fail 94 listener-pid-invalid
-  test "$listener_pid" -gt 1 || fail 94 listener-pid-invalid
-  listener_cgroup=$(sudo cat -- "/proc/$listener_pid/cgroup") || fail 95 listener-cgroup-unreadable
-  [[ "$listener_cgroup" == *"$container_id"* ]] || fail 96 listener-outside-container
-  host_boot_id=$(sudo cat -- /proc/sys/kernel/random/boot_id) || fail 97 host-boot-id-unreadable
-  [[ "$host_boot_id" =~ ^[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}$ ]] || fail 98 host-boot-id-invalid
-  relation=child
-  if test "$listener_pid" = "$container_pid"; then relation=init; fi
-  printf '{{"listener_pid":%s,"container_init_pid":%s,"listener_relation":"%s","container_id":"%s","host_boot_id":"%s"}}\n' \
-    "$listener_pid" "$container_pid" "$relation" "$container_id" "$host_boot_id" || fail 99 identity-write-failed
-  break
+  [[ "$listener_pid" =~ ^[0-9]+$ ]] || fail 94 "${{phase}}listener-pid-invalid"
+  test "$listener_pid" -gt 1 || fail 94 "${{phase}}listener-pid-invalid"
+  remaining=${{listeners[0]}}
+  listener_inodes=()
+  while [[ "$remaining" =~ ino:([0-9]+) ]]; do
+    listener_inodes+=("${{BASH_REMATCH[1]}}")
+    remaining=${{remaining#*"${{BASH_REMATCH[0]}}"}}
+  done
+  test "${{#listener_inodes[@]}}" = 1 || fail 94 "${{phase}}listener-socket-inode-invalid"
+  listener_inode=${{listener_inodes[0]}}
+}}
+process_starttime() {{
+  pid=$1
+  stat_record=$(sudo cat -- "/proc/$pid/stat") || return 1
+  stat_tail=${{stat_record##*) }}
+  test "$stat_tail" != "$stat_record" || return 1
+  read -r -a stat_fields <<<"$stat_tail" || return 1
+  test "${{#stat_fields[@]}}" -ge 20 || return 1
+  starttime=${{stat_fields[19]}}
+  [[ "$starttime" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$starttime"
+}}
+read_namespaces() {{
+  pid=$1
+  pid_namespace=$(sudo stat -Lc %i -- "/proc/$pid/ns/pid") || return 1
+  mount_namespace=$(sudo stat -Lc %i -- "/proc/$pid/ns/mnt") || return 1
+  [[ "$pid_namespace" =~ ^[0-9]+$ ]] || return 1
+  [[ "$mount_namespace" =~ ^[0-9]+$ ]] || return 1
+}}
+cgroup_is_equal_or_below() {{
+  parent=$1
+  child=$2
+  declare -A parent_paths=()
+  declare -A child_paths=()
+  while IFS=: read -r hierarchy controllers path extra; do
+    test -z "$extra" || return 1
+    test -n "$hierarchy" || return 1
+    [[ "$path" == /* ]] || return 1
+    key="$hierarchy:$controllers"
+    [[ ! -v 'parent_paths[$key]' ]] || return 1
+    parent_paths["$key"]=$path
+  done <<<"$parent"
+  while IFS=: read -r hierarchy controllers path extra; do
+    test -z "$extra" || return 1
+    test -n "$hierarchy" || return 1
+    [[ "$path" == /* ]] || return 1
+    key="$hierarchy:$controllers"
+    [[ ! -v 'child_paths[$key]' ]] || return 1
+    child_paths["$key"]=$path
+  done <<<"$child"
+  test "${{#parent_paths[@]}}" -gt 0 || return 1
+  test "${{#child_paths[@]}}" = "${{#parent_paths[@]}}" || return 1
+  for key in "${{!parent_paths[@]}}"; do
+    [[ -v 'child_paths[$key]' ]] || return 1
+    parent_path=${{parent_paths[$key]}}
+    child_path=${{child_paths[$key]}}
+    if test "$parent_path" = /; then
+      [[ "$child_path" == /* ]] || return 1
+    else
+      [[ "$child_path" == "$parent_path" || "$child_path" == "$parent_path/"* ]] || return 1
+    fi
+  done
+}}
+read_membership() {{
+  phase=$1
+  member_pid=$2
+  top_output=$(sudo docker top "$name" -eo pid) || fail 99 "${{phase}}docker-top-failed"
+  member_count=0
+  while read -r top_pid extra; do
+    test -z "${{extra:-}}" || fail 99 "${{phase}}docker-top-record-invalid"
+    if test "$top_pid" = "$member_pid"; then member_count=$((member_count+1)); fi
+  done <<<"$top_output"
+  test "$member_count" = 1 || fail 99 "${{phase}}listener-docker-membership-invalid"
+}}
+while :; do
+  read_container ""
+  if read_listener ""; then
+    break
+  else
+    listener_status=$?
+  fi
+  test "$listener_status" = 10 || fail 99 listener-read-failed
+  if test $SECONDS -ge $deadline; then
+    fail 124 listener-timeout
+  else
+    sleep 2 || fail 99 listener-wait-failed
+  fi
 done
+first_inspect=$inspect
+first_container_pid=$container_pid
+first_container_id=$container_id
+first_listener_output=$listener_output
+first_listener_pid=$listener_pid
+first_listener_inode=$listener_inode
+read_membership "" "$first_listener_pid"
+first_init_starttime=$(process_starttime "$first_container_pid") || fail 95 container-init-stat-unreadable
+first_listener_starttime=$(process_starttime "$first_listener_pid") || fail 95 listener-stat-unreadable
+read_namespaces "$first_container_pid" || fail 95 container-init-namespace-unreadable
+first_init_pid_namespace=$pid_namespace
+first_init_mount_namespace=$mount_namespace
+read_namespaces "$first_listener_pid" || fail 95 listener-namespace-unreadable
+first_listener_pid_namespace=$pid_namespace
+first_listener_mount_namespace=$mount_namespace
+test "$first_listener_pid_namespace" = "$first_init_pid_namespace" || fail 96 listener-pid-namespace-mismatch
+test "$first_listener_mount_namespace" = "$first_init_mount_namespace" || fail 96 listener-mount-namespace-mismatch
+first_init_cgroup=$(sudo cat -- "/proc/$first_container_pid/cgroup") || fail 95 container-init-cgroup-unreadable
+first_listener_cgroup=$(sudo cat -- "/proc/$first_listener_pid/cgroup") || fail 95 listener-cgroup-unreadable
+cgroup_is_equal_or_below "$first_init_cgroup" "$first_listener_cgroup" || fail 96 listener-cgroup-mismatch
+first_boot_id=$(sudo cat -- /proc/sys/kernel/random/boot_id) || fail 97 host-boot-id-unreadable
+[[ "$first_boot_id" =~ ^[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}$ ]] || fail 98 host-boot-id-invalid
+
+read_container second-
+second_inspect=$inspect
+second_container_pid=$container_pid
+second_container_id=$container_id
+test "$second_container_id" = "$first_container_id" || fail 100 second-container-replaced
+test "$second_container_pid" = "$first_container_pid" || fail 100 second-container-init-pid-changed
+test "$second_inspect" = "$first_inspect" || fail 100 second-container-inspect-changed
+if read_listener second-; then
+  :
+else
+  listener_status=$?
+  test "$listener_status" = 10 || fail 100 second-listener-read-failed
+  fail 100 second-listener-missing
+fi
+second_listener_output=$listener_output
+second_listener_pid=$listener_pid
+second_listener_inode=$listener_inode
+test "$second_listener_pid" = "$first_listener_pid" || fail 100 listener-pid-rebound
+test "$second_listener_inode" = "$first_listener_inode" || fail 100 listener-socket-rebound
+test "$second_listener_output" = "$first_listener_output" || fail 100 listener-record-changed
+read_membership second- "$second_listener_pid"
+second_init_starttime=$(process_starttime "$second_container_pid") || fail 100 second-container-init-stat-unreadable
+second_listener_starttime=$(process_starttime "$second_listener_pid") || fail 100 second-listener-stat-unreadable
+test "$second_init_starttime" = "$first_init_starttime" || fail 100 container-init-pid-reused
+test "$second_listener_starttime" = "$first_listener_starttime" || fail 100 listener-pid-reused
+read_namespaces "$second_container_pid" || fail 100 second-container-init-namespace-unreadable
+second_init_pid_namespace=$pid_namespace
+second_init_mount_namespace=$mount_namespace
+read_namespaces "$second_listener_pid" || fail 100 second-listener-namespace-unreadable
+second_listener_pid_namespace=$pid_namespace
+second_listener_mount_namespace=$mount_namespace
+test "$second_init_pid_namespace" = "$first_init_pid_namespace" || fail 100 container-init-pid-namespace-changed
+test "$second_init_mount_namespace" = "$first_init_mount_namespace" || fail 100 container-init-mount-namespace-changed
+test "$second_listener_pid_namespace" = "$first_listener_pid_namespace" || fail 100 listener-pid-namespace-changed
+test "$second_listener_mount_namespace" = "$first_listener_mount_namespace" || fail 100 listener-mount-namespace-changed
+test "$second_listener_pid_namespace" = "$second_init_pid_namespace" || fail 100 second-listener-pid-namespace-mismatch
+test "$second_listener_mount_namespace" = "$second_init_mount_namespace" || fail 100 second-listener-mount-namespace-mismatch
+second_init_cgroup=$(sudo cat -- "/proc/$second_container_pid/cgroup") || fail 100 second-container-init-cgroup-unreadable
+second_listener_cgroup=$(sudo cat -- "/proc/$second_listener_pid/cgroup") || fail 100 second-listener-cgroup-unreadable
+test "$second_init_cgroup" = "$first_init_cgroup" || fail 100 container-init-cgroup-changed
+test "$second_listener_cgroup" = "$first_listener_cgroup" || fail 100 listener-cgroup-changed
+cgroup_is_equal_or_below "$second_init_cgroup" "$second_listener_cgroup" || fail 100 second-listener-cgroup-mismatch
+second_boot_id=$(sudo cat -- /proc/sys/kernel/random/boot_id) || fail 100 second-host-boot-id-unreadable
+test "$second_boot_id" = "$first_boot_id" || fail 100 host-boot-id-changed
+relation=child
+if test "$first_listener_pid" = "$first_container_pid"; then relation=init; fi
+printf '{{"listener_pid":%s,"container_init_pid":%s,"listener_relation":"%s","listener_socket_inode":%s,"listener_starttime":%s,"container_id":"%s","host_boot_id":"%s"}}\n' \
+  "$first_listener_pid" "$first_container_pid" "$relation" "$first_listener_inode" "$first_listener_starttime" "$first_container_id" "$first_boot_id" || fail 100 identity-write-failed
 """
 
 
@@ -2757,6 +2904,10 @@ def _h200_parity_listener_identity(
         or identity["listener_pid"] <= 1
         or not isinstance(identity.get("container_init_pid"), int)
         or identity["container_init_pid"] <= 1
+        or not isinstance(identity.get("listener_socket_inode"), int)
+        or identity["listener_socket_inode"] <= 0
+        or not isinstance(identity.get("listener_starttime"), int)
+        or identity["listener_starttime"] <= 0
         or identity.get("listener_relation") not in {"init", "child"}
         or (
             identity["listener_relation"] == "init"
