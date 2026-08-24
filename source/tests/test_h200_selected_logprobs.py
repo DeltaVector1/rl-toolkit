@@ -845,6 +845,23 @@ def _refresh_fixture_inputs(tmp_path):
     return profile, fixture, session_path, token_export, diagnostic
 
 
+def _bind_refresh_inputs_to_fixture(fixture, session_path, diagnostic_path):
+    session = json.loads(session_path.read_text())
+    session["fixture_sha256"] = parity.fixture_digest(fixture)
+    session_path.write_text(json.dumps(session))
+    session_identity = hashlib.sha256(
+        json.dumps(session, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    with np.load(diagnostic_path, allow_pickle=False) as values:
+        diagnostic = {name: values[name] for name in values.files}
+    diagnostic["session_identity"] = np.asarray(session_identity, dtype="<U64")
+    diagnostic["fixture_sha256"] = np.asarray(
+        session["fixture_sha256"], dtype="<U64"
+    )
+    with diagnostic_path.open("wb") as stream:
+        np.savez(stream, **diagnostic)
+
+
 def test_refresh_fixture_rebuilds_stale_fixture_from_current_export(tmp_path):
     profile, fixture, session, export, diagnostic = _refresh_fixture_inputs(tmp_path)
     output = tmp_path / "current-fixture"
@@ -902,6 +919,104 @@ def test_trainer_session_uses_refreshed_fixture_identity(tmp_path):
     manifest["source"]["fixture_semantic_sha256"]["token_ids"] = "0" * 64
     with pytest.raises(ValueError, match="source provenance is invalid"):
         parity.trainer_session_fixture_sha256(fixture, manifest, token_hash)
+
+
+def test_refresh_fixture_preserves_current_wrapper_and_rebinds_diagnostic(tmp_path):
+    profile, source, session, export, diagnostic = _refresh_fixture_inputs(tmp_path)
+    current = tmp_path / "current"
+    first_diagnostic = tmp_path / "first-diagnostic.npz"
+    first = parity.refresh_fixture_from_trainer_export(
+        profile,
+        source,
+        session,
+        export,
+        diagnostic,
+        current,
+        first_diagnostic,
+        7,
+    )
+    with pytest.raises(
+        ValueError, match="trainer session does not identify the source fixture"
+    ):
+        parity.refresh_fixture_from_trainer_export(
+            profile,
+            current,
+            session,
+            export,
+            diagnostic,
+            tmp_path / "old-session-output",
+            tmp_path / "old-session-output.npz",
+            7,
+        )
+    _bind_refresh_inputs_to_fixture(current, session, diagnostic)
+    output = tmp_path / "preserved"
+    output_diagnostic = tmp_path / "preserved-diagnostic.npz"
+    second = parity.refresh_fixture_from_trainer_export(
+        profile,
+        current,
+        session,
+        export,
+        diagnostic,
+        output,
+        output_diagnostic,
+        7,
+    )
+    assert second["fixture_sha256"] == first["fixture_sha256"]
+    assert second["source_fixture_sha256"] == first["source_fixture_sha256"]
+    assert {path.name: path.read_bytes() for path in current.iterdir()} == {
+        path.name: path.read_bytes() for path in output.iterdir()
+    }
+    with np.load(output_diagnostic, allow_pickle=False) as values:
+        assert str(values["fixture_sha256"].item()) == first["fixture_sha256"]
+        assert str(values["source_fixture_sha256"].item()) == first[
+            "source_fixture_sha256"
+        ]
+
+
+@pytest.mark.parametrize(
+    "change,error",
+    [
+        ("partial", "source provenance is invalid"),
+        ("unknown", "source provenance is invalid"),
+        ("fixture_semantics", "source provenance is invalid"),
+        ("export_semantics", "trainer export differs from recorded fixture source"),
+    ],
+)
+def test_refresh_fixture_rejects_bad_recorded_provenance(tmp_path, change, error):
+    profile, source, session, export, diagnostic = _refresh_fixture_inputs(tmp_path)
+    current = tmp_path / "current"
+    parity.refresh_fixture_from_trainer_export(
+        profile,
+        source,
+        session,
+        export,
+        diagnostic,
+        current,
+        tmp_path / "first-diagnostic.npz",
+        7,
+    )
+    manifest = json.loads((current / "manifest.json").read_text())
+    if change == "partial":
+        manifest["source"].pop("token_export_sha256")
+    elif change == "unknown":
+        manifest["source"]["unknown"] = "0" * 64
+    elif change == "fixture_semantics":
+        manifest["source"]["fixture_semantic_sha256"]["token_ids"] = "0" * 64
+    else:
+        manifest["source"]["export_semantic_sha256"]["token_ids"] = "0" * 64
+    (current / "manifest.json").write_bytes(parity.json_bytes(manifest))
+    _bind_refresh_inputs_to_fixture(current, session, diagnostic)
+    with pytest.raises(ValueError, match=error):
+        parity.refresh_fixture_from_trainer_export(
+            profile,
+            current,
+            session,
+            export,
+            diagnostic,
+            tmp_path / "bad-output",
+            tmp_path / "bad-output.npz",
+            7,
+        )
 
 
 def test_refresh_fixture_rejects_session_or_semantic_hash_mismatch(tmp_path):

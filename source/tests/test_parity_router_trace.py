@@ -436,14 +436,33 @@ class ParityRouterTraceTest(unittest.TestCase):
                 first_diagnostic,
                 7,
             )
+            current_session = dict(session)
+            current_session["fixture_sha256"] = first_result["fixture_sha256"]
+            current_session_path = root / "current-session.json"
+            current_session_path.write_text(json.dumps(current_session))
+            current_session_identity = parity_script.hashlib.sha256(
+                json.dumps(
+                    current_session, sort_keys=True, separators=(",", ":")
+                ).encode()
+            ).hexdigest()
+            with np.load(first_diagnostic, allow_pickle=False) as values:
+                current_diagnostic_values = {
+                    name: values[name] for name in values.files
+                }
+            current_diagnostic_values["session_identity"] = np.asarray(
+                current_session_identity
+            )
+            current_diagnostic = root / "current-diagnostic.npz"
+            with current_diagnostic.open("xb") as stream:
+                np.savez(stream, **current_diagnostic_values)
             second = root / "second"
             second_diagnostic = root / "second-diagnostic.npz"
             second_result = parity_script.refresh_fixture_from_trainer_export(
                 profile,
                 first,
-                session_path,
+                current_session_path,
                 export,
-                diagnostic,
+                current_diagnostic,
                 second,
                 second_diagnostic,
                 7,
@@ -477,7 +496,7 @@ class ParityRouterTraceTest(unittest.TestCase):
                 parity_script.refresh_fixture_from_trainer_export(
                     profile,
                     tampered,
-                    session_path,
+                    current_session_path,
                     export,
                     first_diagnostic,
                     root / "tampered-output",
@@ -493,20 +512,20 @@ class ParityRouterTraceTest(unittest.TestCase):
                 parity_script.json_bytes(drifted_manifest)
             )
             with self.assertRaisesRegex(
-                ValueError, "wrapper reconstruction differs"
+                ValueError, "refreshed fixture wrapper is invalid"
             ):
                 parity_script.refresh_fixture_from_trainer_export(
                     profile,
                     drifted,
-                    session_path,
+                    current_session_path,
                     export,
-                    diagnostic,
+                    current_diagnostic,
                     root / "drifted-output",
                     root / "drifted-output.npz",
                     7,
                 )
 
-            with np.load(first_diagnostic, allow_pickle=False) as values:
+            with np.load(current_diagnostic, allow_pickle=False) as values:
                 wrong_values = {name: values[name] for name in values.files}
             wrong_values["fixture_sha256"] = np.asarray("0" * 64)
             wrong_diagnostic = root / "wrong-wrapper.npz"
@@ -517,7 +536,7 @@ class ParityRouterTraceTest(unittest.TestCase):
                 parity_script.refresh_fixture_from_trainer_export(
                     profile,
                     first,
-                    session_path,
+                    current_session_path,
                     export,
                     wrong_diagnostic,
                     root / "wrong-wrapper-output",

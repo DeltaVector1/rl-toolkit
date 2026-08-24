@@ -302,6 +302,7 @@ def refresh_fixture_from_trainer_export(
     }
     recorded_source = source_manifest.get("source")
     source_fixture_sha256 = source_wrapper_sha256
+    session_fixture_sha256 = source_wrapper_sha256
     if recorded_source is not None:
         source_fields = {
             "fixture_sha256",
@@ -315,6 +316,11 @@ def refresh_fixture_from_trainer_export(
             name: _array_bytes_sha256(array)
             for name, array in source_arrays.items()
         }
+        export_semantic_hashes = (
+            recorded_source.get("export_semantic_sha256")
+            if isinstance(recorded_source, dict)
+            else None
+        )
         if (
             not isinstance(recorded_source, dict)
             or set(recorded_source) != source_fields
@@ -333,9 +339,66 @@ def refresh_fixture_from_trainer_export(
             or recorded_source.get("rank") != expected_rank
             or recorded_source.get("fixture_semantic_sha256")
             != fixture_semantic_hashes
-            or not isinstance(recorded_source.get("export_semantic_sha256"), dict)
+            or not isinstance(export_semantic_hashes, dict)
+            or set(export_semantic_hashes)
+            != {"token_ids", "positions", "loss_mask", "advantages"}
+            or any(
+                re.fullmatch(r"[0-9a-f]{64}", str(value)) is None
+                for value in export_semantic_hashes.values()
+            )
         ):
             raise ValueError("refreshed fixture source provenance is invalid")
+        expected_manifest_fields = {
+            "schema_version",
+            "kind",
+            "created_utc",
+            "seed",
+            "profile_sha256",
+            "context_length",
+            "prompt_length",
+            "max_output_length",
+            "source",
+            "arrays",
+        }
+        expected_files = {
+            "manifest.json",
+            "token_ids.npy",
+            "positions.npy",
+            "selected_indices.npy",
+            "advantages.npy",
+        }
+        expected_arrays = {
+            "token_ids": ("int64", [profile.get("context_length")]),
+            "positions": ("int64", [profile.get("context_length")]),
+            "selected_indices": ("int64", [profile.get("max_output_length")]),
+            "advantages": ("float32", [profile.get("max_output_length")]),
+        }
+        if (
+            set(source_manifest) != expected_manifest_fields
+            or not isinstance(source_manifest.get("arrays"), dict)
+            or set(source_manifest["arrays"])
+            != {"token_ids", "positions", "selected_indices", "advantages"}
+            or any(
+                not isinstance(source_manifest["arrays"].get(name), dict)
+                or set(source_manifest["arrays"][name])
+                != {"file", "dtype", "shape", "sha256"}
+                or source_manifest["arrays"][name].get("file") != f"{name}.npy"
+                or source_manifest["arrays"][name].get("dtype") != dtype
+                or source_manifest["arrays"][name].get("shape") != shape
+                or re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str(source_manifest["arrays"][name].get("sha256", "")),
+                )
+                is None
+                for name, (dtype, shape) in expected_arrays.items()
+            )
+            or {path.name for path in source_fixture.iterdir()} != expected_files
+            or any(
+                path.is_symlink() or not path.is_file()
+                for path in source_fixture.iterdir()
+            )
+        ):
+            raise ValueError("refreshed fixture wrapper is invalid")
         source_fixture_sha256 = recorded_source["fixture_sha256"]
     source_session = json.loads(source_session_path.read_text())
     source_session_identity = hashlib.sha256(
@@ -344,7 +407,7 @@ def refresh_fixture_from_trainer_export(
     if (
         source_session.get("schema_version") != schema_version
         or source_session.get("side") != "trainer"
-        or source_session.get("fixture_sha256") != source_fixture_sha256
+        or source_session.get("fixture_sha256") != session_fixture_sha256
         or source_session.get("token_ids_sha256")
         != _array_bytes_sha256(source_arrays["token_ids"])
         or re.fullmatch(
@@ -355,10 +418,6 @@ def refresh_fixture_from_trainer_export(
             r"[0-9a-f]{64}", str(source_session.get("adapter_sha256", ""))
         )
         is None
-        or (
-            recorded_source is not None
-            and recorded_source.get("session_identity") != source_session_identity
-        )
     ):
         raise ValueError("trainer session does not identify the source fixture")
     fields = ("token_ids", "position_ids", "loss_mask", "advantages")
@@ -522,7 +581,7 @@ def refresh_fixture_from_trainer_export(
         diagnostic = {name: values[name] for name in values.files}
     expected_diagnostic = {
         "session_identity": source_session_identity,
-        "fixture_sha256": source_fixture_sha256,
+        "fixture_sha256": session_fixture_sha256,
         "token_ids_sha256": token_ids_sha256,
         "model_revision": source_session.get("model_revision"),
         "adapter_sha256": source_session.get("adapter_sha256"),
@@ -541,43 +600,43 @@ def refresh_fixture_from_trainer_export(
         raise FileExistsError("refreshed parity fixture output already exists")
     try:
         output.mkdir(parents=False)
-        entries: dict[str, Any] = {}
-        fixture_semantic_hashes: dict[str, str] = {}
-        for name, array in refreshed_arrays.items():
-            filename = f"{name}.npy"
-            np.save(output / filename, array, allow_pickle=False)
-            entries[name] = {
-                "file": filename,
-                "dtype": str(array.dtype),
-                "shape": list(array.shape),
-                "sha256": file_sha256(output / filename),
+        if recorded_source is not None:
+            for filename in sorted(expected_files):
+                shutil.copyfile(source_fixture / filename, output / filename)
+            manifest = load_manifest(output, "glm52_policy_parity_fixture")
+        else:
+            entries: dict[str, Any] = {}
+            fixture_semantic_hashes: dict[str, str] = {}
+            for name, array in refreshed_arrays.items():
+                filename = f"{name}.npy"
+                np.save(output / filename, array, allow_pickle=False)
+                entries[name] = {
+                    "file": filename,
+                    "dtype": str(array.dtype),
+                    "shape": list(array.shape),
+                    "sha256": file_sha256(output / filename),
+                }
+                fixture_semantic_hashes[name] = _array_bytes_sha256(array)
+            manifest = {
+                "schema_version": schema_version,
+                "kind": "glm52_policy_parity_fixture",
+                "created_utc": parse_time(created_utc).isoformat(),
+                "seed": source_manifest["seed"],
+                "profile_sha256": file_sha256(profile.path),
+                "context_length": length,
+                "prompt_length": profile.get("prompt_length"),
+                "max_output_length": profile.get("max_output_length"),
+                "source": {
+                    "fixture_sha256": source_fixture_sha256,
+                    "session_identity": source_session_identity,
+                    "token_export_sha256": trainer_source_sha256,
+                    "rank": expected_rank,
+                    "fixture_semantic_sha256": fixture_semantic_hashes,
+                    "export_semantic_sha256": export_semantic_hashes,
+                },
+                "arrays": entries,
             }
-            fixture_semantic_hashes[name] = _array_bytes_sha256(array)
-        manifest_created_utc = (
-            source_manifest["created_utc"]
-            if recorded_source is not None
-            else parse_time(created_utc).isoformat()
-        )
-        manifest = {
-            "schema_version": schema_version,
-            "kind": "glm52_policy_parity_fixture",
-            "created_utc": manifest_created_utc,
-            "seed": source_manifest["seed"],
-            "profile_sha256": file_sha256(profile.path),
-            "context_length": length,
-            "prompt_length": profile.get("prompt_length"),
-            "max_output_length": profile.get("max_output_length"),
-            "source": {
-                "fixture_sha256": source_fixture_sha256,
-                "session_identity": source_session_identity,
-                "token_export_sha256": trainer_source_sha256,
-                "rank": expected_rank,
-                "fixture_semantic_sha256": fixture_semantic_hashes,
-                "export_semantic_sha256": export_semantic_hashes,
-            },
-            "arrays": entries,
-        }
-        (output / "manifest.json").write_bytes(json_bytes(manifest))
+            (output / "manifest.json").write_bytes(json_bytes(manifest))
         check_fresh(profile, output, manifest)
         refreshed_fixture_sha256 = fixture_digest(output)
         if (
