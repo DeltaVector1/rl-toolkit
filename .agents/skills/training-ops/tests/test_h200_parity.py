@@ -16,7 +16,9 @@ import training_ops
 
 
 class H200ParityTest(unittest.TestCase):
-    def _run_bootstrap_controller(self, state, *, token=None, timeout=2):
+    def _run_bootstrap_controller(
+        self, state, *, token=None, timeout=2, delayed_extra=False
+    ):
         container_id = "d" * 64
         boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
         canonical_fifo = (
@@ -88,6 +90,11 @@ class H200ParityTest(unittest.TestCase):
                     time.sleep(0.1)
                     with fifo.open("w") as stream:
                         stream.write(token + "\n")
+                        stream.flush()
+                        if delayed_extra:
+                            time.sleep(0.2)
+                            stream.write("x")
+                            stream.flush()
 
                 writer = threading.Thread(target=write_token)
                 writer.start()
@@ -866,6 +873,23 @@ sleep() {{
         self.assertEqual(stdout, token + "\n")
         self.assertFalse(fifo_exists)
 
+    def test_bootstrap_controller_rejects_delayed_extra_before_writer_close(self):
+        token = base64.urlsafe_b64encode(b"x" * 48).decode("ascii")
+        code, stdout, stderr, fifo_exists = self._run_bootstrap_controller(
+            {
+                "Status": "running",
+                "Running": True,
+                "ExitCode": 0,
+                "OOMKilled": False,
+            },
+            token=token,
+            delayed_extra=True,
+        )
+        self.assertNotEqual(code, 0)
+        self.assertEqual(stdout, "")
+        self.assertIn("bootstrap-framing-invalid", stderr)
+        self.assertFalse(fifo_exists)
+
     def test_bootstrap_controller_stops_on_exit_before_fifo_writer(self):
         code, stdout, stderr, fifo_exists = self._run_bootstrap_controller(
             {
@@ -912,7 +936,7 @@ sleep() {{
         code, stdout, stderr, fifo_exists = self._run_bootstrap_controller([running, exited], token=token)
         self.assertNotEqual(code, 0)
         self.assertEqual(stdout, "")
-        self.assertIn("container-exited-after-token", stderr)
+        self.assertIn("container-exited", stderr)
         self.assertFalse(fifo_exists)
 
     def test_bootstrap_controller_times_out_without_blind_fifo_read(self):
@@ -982,6 +1006,67 @@ sleep() {{
             recorded["records"]["logs"]["sha256"],
             training_ops.hashlib.sha256(b"last log line\n").hexdigest(),
         )
+
+    def test_failure_evidence_uses_bounded_stdin_not_an_argv_value(self):
+        transaction = (
+            "/data/glm52-rl/qualifications/glm52-policy-parity/"
+            ".diagnostic-run-1111111111111111/transaction.json"
+        )
+        evidence = {
+            "container_id": "d" * 64,
+            "host_boot_id": "11111111-2222-3333-4444-555555555555",
+            "records": {"logs": {"text": "x" * 200000}},
+        }
+        captured = {}
+
+        def send(_host, command, payload, _label, _timeout):
+            captured["command"] = command
+            captured["payload"] = payload
+            return training_ops.hashlib.sha256((payload + "\n").encode()).hexdigest()
+
+        snapshot = {"state": {}}
+        with patch.object(
+            training_ops, "_sensitive_ssh_input", side_effect=send
+        ), patch.object(
+            training_ops, "_parity_transaction_snapshot", return_value=snapshot
+        ), patch.object(training_ops, "_write_parity_transaction_state"):
+            path = training_ops._write_h200_parity_failure_evidence(
+                "h200a", transaction, evidence, ()
+            )
+        self.assertNotIn(captured["payload"], captured["command"])
+        self.assertLess(len(captured["command"]), 4096)
+        self.assertTrue(path.endswith("/failure-evidence.json"))
+        argv = shlex.split(captured["command"])
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "failure-evidence.json"
+            local = [argv[1], argv[2], argv[3], str(target), argv[5]]
+            completed = subprocess.run(
+                local,
+                input=captured["payload"] + "\n",
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(target.read_text(), captured["payload"] + "\n")
+
+    def test_failure_evidence_rejects_payload_over_bound_before_ssh(self):
+        transaction = (
+            "/data/glm52-rl/qualifications/glm52-policy-parity/"
+            ".diagnostic-run-1111111111111111/transaction.json"
+        )
+        evidence = {
+            "container_id": "d" * 64,
+            "host_boot_id": "11111111-2222-3333-4444-555555555555",
+            "text": "x" * 458753,
+        }
+        with patch.object(training_ops, "_sensitive_ssh_input") as send, self.assertRaisesRegex(
+            RuntimeError, "exceeds its configured bound"
+        ):
+            training_ops._write_h200_parity_failure_evidence(
+                "h200a", transaction, evidence, ()
+            )
+        send.assert_not_called()
 
     def test_temporary_cleanup_keeps_early_failure_nonzero(self):
         with tempfile.TemporaryDirectory() as temporary:

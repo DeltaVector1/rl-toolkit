@@ -4433,29 +4433,35 @@ try:
         ready, _, _ = select.select([fifo_fd], [], [], min(float(poll_seconds), remaining))
         if not ready:
             continue
-        chunk = os.read(fifo_fd, 66 - len(data))
+        chunk = os.read(fifo_fd, max(1, 66 - len(data)))
         if not chunk:
+            if data:
+                if len(data) != 65 or not data.endswith(b"\n") or data.count(b"\n") != 1:
+                    raise RuntimeError("bootstrap-framing-invalid")
+                candidate = data[:-1]
+                try:
+                    decoded = base64.urlsafe_b64decode(candidate)
+                except Exception as error:
+                    raise RuntimeError("bootstrap-encoding-invalid") from error
+                if len(candidate) != 64 or len(decoded) != 48:
+                    raise RuntimeError("bootstrap-capacity-invalid")
+                state = inspect_container()
+                if not state.get("Running"):
+                    raise RuntimeError(
+                        "container-exited-after-token:status=%s,exit=%s,oom=%s"
+                        % (state.get("Status"), state.get("ExitCode"), str(state.get("OOMKilled")).lower())
+                    )
+                token = candidate.decode("ascii")
+                break
             time.sleep(min(float(poll_seconds), max(0.0, deadline - time.monotonic())))
             continue
         data += chunk
-        if len(data) > 65 or b"\n" in data:
-            if len(data) != 65 or not data.endswith(b"\n") or data.count(b"\n") != 1:
-                raise RuntimeError("bootstrap-framing-invalid")
-            candidate = data[:-1]
-            try:
-                decoded = base64.urlsafe_b64decode(candidate)
-            except Exception as error:
-                raise RuntimeError("bootstrap-encoding-invalid") from error
-            if len(candidate) != 64 or len(decoded) != 48:
-                raise RuntimeError("bootstrap-capacity-invalid")
-            state = inspect_container()
-            if not state.get("Running"):
-                raise RuntimeError(
-                    "container-exited-after-token:status=%s,exit=%s,oom=%s"
-                    % (state.get("Status"), state.get("ExitCode"), str(state.get("OOMKilled")).lower())
-                )
-            token = candidate.decode("ascii")
-            break
+        if (
+            len(data) > 65
+            or data.count(b"\n") > 1
+            or (b"\n" in data and not data.endswith(b"\n"))
+        ):
+            raise RuntimeError("bootstrap-framing-invalid")
 except BaseException as error:
     failure = str(error) or type(error).__name__
 finally:
@@ -4517,35 +4523,40 @@ def _write_h200_parity_failure_evidence(
 ) -> str:
     nonce = _validate_parity_transaction_path(transaction_path)
     evidence_path = f"{glm_parity_root}/.diagnostic-run-{nonce}/failure-evidence.json"
-    payload = json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n"
+    payload = json.dumps(evidence, sort_keys=True, separators=(",", ":"))
     for secret in sensitive:
         if secret and secret in payload:
             raise RuntimeError("parity failure evidence contains a secret")
-    encoded = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+    _poll, inspect_max, logs_max, events_max = _configured_h200_parity_failure_evidence()
+    payload_limit = inspect_max + logs_max + events_max + 65536
+    wire_payload = payload + "\n"
+    if len(wire_payload.encode("utf-8")) > payload_limit:
+        raise RuntimeError("H200 parity failure evidence exceeds its configured bound")
     command = (
-        "sudo python3 -c 'import base64,hashlib,os,pathlib,stat,sys; "
+        "sudo python3 -c 'import hashlib,os,pathlib,stat,sys; "
         "p=pathlib.Path(sys.argv[1]); root=p.parent; "
         "st=os.lstat(root); "
         "assert stat.S_ISDIR(st.st_mode) and not stat.S_ISLNK(st.st_mode); "
         'assert p.name=="failure-evidence.json" and not p.exists() and not p.is_symlink(); '
         't=root/".failure-evidence.json.tmp"; '
+        "limit=int(sys.argv[2]); data=sys.stdin.buffer.read(limit+1); "
+        "assert 0<len(data)<=limit and data.endswith(b\"\\n\"); "
         "fd=os.open(t,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600); "
-        "data=base64.b64decode(sys.argv[2],validate=True); "
         "os.write(fd,data); os.fsync(fd); os.close(fd); os.replace(t,p); "
         "d=os.open(root,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW); os.fsync(d); os.close(d); "
         "q=os.lstat(p); assert stat.S_ISREG(q.st_mode) and not stat.S_ISLNK(q.st_mode) "
         "and stat.S_IMODE(q.st_mode)==0o600; "
         "print(hashlib.sha256(p.read_bytes()).hexdigest())' "
-        f"{shlex.quote(evidence_path)} {shlex.quote(encoded)}"
+        f"{shlex.quote(evidence_path)} {payload_limit}"
     )
-    remote_hash = _sensitive_ssh(
+    remote_hash = _sensitive_ssh_input(
         host,
         command,
+        payload,
         "H200 parity failure evidence write",
-        sensitive,
         60,
     ).strip()
-    expected_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    expected_hash = hashlib.sha256(wire_payload.encode("utf-8")).hexdigest()
     if remote_hash != expected_hash:
         raise RuntimeError("H200 parity failure evidence hash differs after write")
     snapshot = _parity_transaction_snapshot(host, transaction_path, sensitive)
@@ -4585,7 +4596,11 @@ def _capture_h200_parity_failure_evidence(
     inspect_command = (
         "set -euo pipefail; "
         f'test "$(cat /proc/sys/kernel/random/boot_id)" = {shlex.quote(boot_id)}; '
-        f"sudo docker inspect {container_id}"
+        f"sudo docker inspect {container_id} | "
+        "python3 -c 'import sys; limit=int(sys.argv[1]); "
+        "data=sys.stdin.buffer.read(limit+1); "
+        "assert len(data)<=limit; sys.stdout.buffer.write(data)' "
+        f"{inspect_max}"
     )
     inspect_text = _sensitive_ssh(
         host,
