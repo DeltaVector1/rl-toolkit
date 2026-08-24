@@ -82,6 +82,10 @@ stall_seconds = 600
 final_steps = 50
 h200_engine_startup_grace_seconds = 7200
 
+[limits.h200_parity_cleanup]
+settle_timeout_seconds = 120
+poll_seconds = 2
+
 [limits.live_service_check]
 attempts = 2
 connect_timeout_seconds = 45

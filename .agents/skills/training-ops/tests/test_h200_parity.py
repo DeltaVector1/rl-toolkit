@@ -22,6 +22,7 @@ class H200ParityTest(unittest.TestCase):
         fail_refresh=False,
         fail_capture=False,
         fail_cleanup=False,
+        fail_container_cleanup=False,
         fail_fixture_backup=False,
         fail_capture_backup=False,
         fail_rollback=False,
@@ -87,6 +88,10 @@ class H200ParityTest(unittest.TestCase):
                     return 73, "rollback stopped"
                 transaction["state"]["phase"] = "rolled_back"
                 return 0, ""
+            if "parity-cleanup-error:" in command:
+                if fail_container_cleanup:
+                    return 1, "parity-cleanup-error:container-settle-timeout\n"
+                return 0, "removed\n"
             if command.startswith("test -f ") and command.endswith("transaction.json"):
                 return (0, "") if transaction["state"] is not None else (1, "")
             if "docker ps -a" in command and "glm52-optims-h200-" in command:
@@ -258,6 +263,98 @@ class H200ParityTest(unittest.TestCase):
         self.last_diagnostic_copy = copy_input.call_args
         self.last_listener_ports = listener_ports
         return result
+
+    def _run_container_cleanup(self, scenario):
+        container_id = "d" * 64
+        replacement_id = "e" * 64
+        boot_id = "11111111-2222-3333-4444-555555555555"
+        command = training_ops._h200_parity_container_cleanup_command(
+            container_id,
+            boot_id,
+            10,
+            1,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "state"
+            calls = Path(temporary) / "calls"
+            state.write_text("absent" if scenario == "absent" else "running")
+            prefix = f"""
+state_file={shlex.quote(str(state))}
+calls_file={shlex.quote(str(calls))}
+scenario={shlex.quote(scenario)}
+container_id={container_id}
+replacement_id={replacement_id}
+container_name={training_ops.glm_inference_container}
+sudo() {{ "$@"; }}
+cat() {{
+  if test "$1" = /proc/sys/kernel/random/boot_id; then echo {boot_id}; return; fi
+  if test "$1" = /proc/321/stat; then
+    test "$(<"$state_file")" != ready || return 1
+    echo '321 (worker) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19'
+    return
+  fi
+  command cat "$@"
+}}
+docker() {{
+  action=$1
+  shift
+  current=$(<"$state_file")
+  echo "docker-$action-$current" >>"$calls_file"
+  case "$action" in
+    inspect)
+      test "$current" != absent || return 1
+      id=$container_id
+      restart=0
+      if test "$current" = replacement; then id=$replacement_id; fi
+      if test "$current" = restarted; then restart=1; fi
+      status=running
+      running=true
+      pid=321
+      if test "$current" != running; then status=exited; running=false; pid=0; fi
+      printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+        "$id" "$status" "$running" "$pid" \
+        {shlex.quote(json.dumps(training_ops.inference_image))} \
+        {shlex.quote(json.dumps(["@", training_ops.glm_parity_inference_config, "--vllm-extra", training_ops.glm_parity_vllm_extra], separators=(",", ":")))} \
+        "$restart" '"no"'
+      ;;
+    ps)
+      test "$current" != absent || return 0
+      id=$container_id
+      test "$current" != replacement || id=$replacement_id
+      printf '%s %s\n' "$id" "$container_name"
+      ;;
+    top)
+      echo 321
+      ;;
+    kill)
+      echo settling >"$state_file"
+      ;;
+    rm)
+      test "$1" = "$container_id" || return 91
+      test "$current" = ready || return 92
+      echo absent >"$state_file"
+      ;;
+    *) return 93 ;;
+  esac
+}}
+ss() {{ echo ss >>"$calls_file"; }}
+nvidia-smi() {{ echo nvidia-smi >>"$calls_file"; }}
+sleep() {{
+  case "$scenario" in
+    transient) echo ready >"$state_file" ;;
+    persistent) SECONDS=$((SECONDS+20)) ;;
+    replacement) echo replacement >"$state_file" ;;
+    restart) echo restarted >"$state_file" ;;
+  esac
+}}
+"""
+            completed = subprocess.run(
+                ["bash", "-c", prefix + command],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            return completed, calls.read_text() if calls.exists() else ""
 
     @staticmethod
     def _source_evidence(pp_by_host, session):
@@ -1236,7 +1333,7 @@ class H200ParityTest(unittest.TestCase):
         self.assertTrue(
             any(
                 'name=glm52-optims-h200' in command
-                and 'sudo docker rm -f "$name"' in command
+                and 'sudo docker rm "$expected_id"' in command
                 for command in commands
             )
         )
@@ -1328,10 +1425,21 @@ class H200ParityTest(unittest.TestCase):
             "sudo docker rm glm52-optims-h200 >/dev/null",
             removals,
         )
-        final_cleanup = next(command for command in removals if 'rm -f "$name"' in command)
+        final_cleanup = next(
+            command for command in removals if 'rm "$expected_id"' in command
+        )
         self.assertIn('name=glm52-optims-h200', final_cleanup)
         self.assertIn('name=^/${name}$', final_cleanup)
-        self.assertFalse(any("*" in command for command in removals))
+        self.assertIn("expected_id=" + "d" * 64, final_cleanup)
+        self.assertIn("expected_boot=11111111-2222-3333-4444-555555555555", final_cleanup)
+        self.assertNotIn('docker rm -f', final_cleanup)
+        self.assertNotIn('docker rm "$name"', final_cleanup)
+        commit = next(
+            command for command in commands if " committed none committed" in command
+        )
+        self.assertLess(commands.index(commit), commands.index(final_cleanup))
+        self.assertEqual(result["engine_cleanup"], "removed")
+        self.assertFalse(result["engine_kept"])
         self.assertTrue(
             any(
                 ".fixture-previous-1111111111111111" in command
@@ -1369,6 +1477,85 @@ class H200ParityTest(unittest.TestCase):
         self.assertIn(f"{work}/diagnostic.npz", refresh)
         self.assertIn(f"{work}/capture", capture)
         self.assertIn(f"{work}/h200-router-trace", start)
+
+    def test_committed_capture_is_retained_when_container_cleanup_times_out(self):
+        commands = []
+        secret, ssh_call, secret_call, _ = self._operation_ssh(
+            commands, fail_container_cleanup=True
+        )
+        result = self._run_operation(ssh_call, secret_call, secret)
+        self.assertEqual(ssh_call.transaction["state"]["phase"], "committed")
+        self.assertEqual(result["engine_cleanup"], "retained")
+        self.assertTrue(result["engine_kept"])
+        self.assertEqual(
+            result["container_work"],
+            "/data/glm52-rl/qualifications/glm52-policy-parity/"
+            ".diagnostic-work-1111111111111111",
+        )
+        self.assertTrue(
+            any(
+                "container-settle-timeout" in warning
+                for warning in result["cleanup_warnings"]
+            )
+        )
+        self.assertFalse(
+            any(
+                ".fixture-failed-1111111111111111" in command
+                and ".h200-capture-failed-1111111111111111" in command
+                for command in commands
+            )
+        )
+
+    def test_container_cleanup_waits_for_zombie_then_removes_exact_id(self):
+        completed, calls = self._run_container_cleanup("transient")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "removed")
+        self.assertEqual(calls.count("docker-kill-running"), 1)
+        self.assertEqual(calls.count("docker-rm-ready"), 1)
+        self.assertIn("ss", calls)
+        self.assertIn("nvidia-smi", calls)
+
+    def test_container_cleanup_verifies_absent_container_ports_and_gpu(self):
+        completed, calls = self._run_container_cleanup("absent")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "absent")
+        self.assertNotIn("docker-kill", calls)
+        self.assertNotIn("docker-rm", calls)
+        self.assertIn("ss", calls)
+        self.assertIn("nvidia-smi", calls)
+
+    def test_container_cleanup_fails_closed_for_persistent_zombie(self):
+        completed, calls = self._run_container_cleanup("persistent")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("container-settle-timeout", completed.stderr)
+        self.assertNotIn("docker-rm", calls)
+
+    def test_container_cleanup_refuses_replacement_and_restart(self):
+        for scenario, detail in (
+            ("replacement", "settle-container-replaced"),
+            ("restart", "settle-container-restarted"),
+        ):
+            with self.subTest(scenario=scenario):
+                completed, calls = self._run_container_cleanup(scenario)
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(detail, completed.stderr)
+                self.assertNotIn("docker-rm", calls)
+
+    def test_container_cleanup_limits_are_explicit_and_bounded(self):
+        self.assertEqual(training_ops._configured_h200_parity_cleanup(), (120, 2))
+        with patch.object(training_ops, "limits", {}), self.assertRaisesRegex(
+            training_ops.Refused, "must be configured"
+        ):
+            training_ops._configured_h200_parity_cleanup()
+        for values in (
+            {"settle_timeout_seconds": 181, "poll_seconds": 2},
+            {"settle_timeout_seconds": 120, "poll_seconds": 0},
+            {"settle_timeout_seconds": 10, "poll_seconds": 11},
+        ):
+            with self.subTest(values=values), patch.object(
+                training_ops, "limits", {"h200_parity_cleanup": values}
+            ), self.assertRaisesRegex(training_ops.Refused, "limits are invalid"):
+                training_ops._configured_h200_parity_cleanup()
 
     def test_container_write_inventory_refuses_unprepared_path(self):
         paths = training_ops._parity_container_write_paths("1" * 16)
@@ -1776,7 +1963,7 @@ class H200ParityTest(unittest.TestCase):
         self.assertTrue(
             any(
                 'name=glm52-optims-h200' in command
-                and 'sudo docker rm -f "$name"' in command
+                and 'sudo docker rm "$expected_id"' in command
                 for command in commands
             )
         )
@@ -1786,16 +1973,18 @@ class H200ParityTest(unittest.TestCase):
         secret, ssh_call, secret_call, _ = self._operation_ssh(
             commands, fail_cleanup=True
         )
-        with self.assertRaisesRegex(RuntimeError, "artifact cleanup failed"):
-            self._run_operation(ssh_call, secret_call, secret)
-        rollback = next(
-            command
-            for command in commands
-            if ".fixture-failed-1111111111111111" in command
-            and ".h200-capture-failed-1111111111111111" in command
+        result = self._run_operation(ssh_call, secret_call, secret)
+        self.assertTrue(
+            any("artifact cleanup failed" in warning for warning in result["cleanup_warnings"])
         )
-        self.assertIn(".fixture-previous-1111111111111111", rollback)
-        self.assertIn(".h200-capture-previous-1111111111111111", rollback)
+        self.assertEqual(ssh_call.transaction["state"]["phase"], "committed")
+        self.assertFalse(
+            any(
+                ".fixture-failed-1111111111111111" in command
+                and ".h200-capture-failed-1111111111111111" in command
+                for command in commands
+            )
+        )
 
     def test_committed_fixture_backup_cleanup_failure_is_only_a_warning(self):
         commands = []
@@ -1850,7 +2039,7 @@ class H200ParityTest(unittest.TestCase):
         with self.assertRaises(KeyboardInterrupt):
             self._run_operation(ssh_call, secret_call, secret, keep_engine=True)
         self.assertTrue(
-            any('sudo docker rm -f "$name"' in command for command in commands)
+            any('sudo docker rm "$expected_id"' in command for command in commands)
         )
         self.assertTrue(
             any(
