@@ -1221,6 +1221,13 @@ sleep() {{
         self.assertEqual(
             json.loads(training_ops.glm_parity_vllm_extra)["host"], "127.0.0.1"
         )
+        self.assertEqual(
+            json.loads(training_ops.glm_parity_vllm_extra)["kv_cache_dtype"], "auto"
+        )
+        self.assertEqual(
+            json.loads(training_ops.glm_parity_vllm_extra)["max_num_batched_tokens"],
+            32769,
+        )
         command = training_ops._h200_parity_listener_identity_command(
             0,
             "a" * 64,

@@ -69,7 +69,7 @@ glm_parity_inference_config = (
     f"{remote_repo}/configs/qualification/glm52-policy-parity-h200.toml"
 )
 glm_parity_vllm_extra = (
-    '{"host":"127.0.0.1","kv_cache_dtype":"fp8","max_num_seqs":128,'
+    '{"host":"127.0.0.1","kv_cache_dtype":"auto","max_num_seqs":128,'
     '"max_num_batched_tokens":32769,'
     '"compilation_config":{"max_cudagraph_capture_size":256}}'
 )

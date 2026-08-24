@@ -16,9 +16,11 @@ import prime_rl.parity_router_trace as parity_trace
 from scripts.glm52_policy_parity import (
     Profile,
     capture_h200,
+    retain_h200_diagnostics,
     read_secret_stdin,
     validate_diagnostic_file,
     validate_diagnostic_source,
+    validate_retained_h200_diagnostics,
 )
 
 from prime_rl.parity_router_trace import (
@@ -911,6 +913,93 @@ class ParityRouterTraceTest(unittest.TestCase):
                 self.assertEqual(saved["values"].shape, (2, 6144))
                 self.assertEqual(saved["session_identity"].item(), trace_session_identity(session()))
 
+    def test_h200_diagnostics_are_retained_with_content_validation(self):
+        import hashlib
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            trace = root / "trace"
+            output = root / "capture"
+            trace.mkdir()
+            output.mkdir()
+            values = np.arange(3 * 6144, dtype=np.float32).reshape(3, 6144)
+            filename = "h200-rank-0-pp-0-cp-0-diagnostic-layer0_attention_raw.npz"
+            name = "layer0_attention_raw-rank-0-pp-0-cp-0"
+            np.savez(
+                trace / filename,
+                values=values,
+                name=np.asarray(name),
+                source_dtype=np.asarray("torch.bfloat16"),
+            )
+            entry = {
+                "name": name,
+                "file": filename,
+                "bytes": (trace / filename).stat().st_size,
+                "shape": [3, 6144],
+                "source_dtype": "torch.bfloat16",
+                "sha256": hashlib.sha256(values.tobytes()).hexdigest(),
+            }
+            route_values = np.arange(3 * 8, dtype=np.int32).reshape(3, 8)
+            route_filename = (
+                "h200-rank-0-pp-0-cp-0-diagnostic-layer3_h200_route_ids.npz"
+            )
+            route_name = "layer3_h200_route_ids-rank-0-pp-0-cp-0"
+            np.savez(
+                trace / route_filename,
+                values=route_values,
+                name=np.asarray(route_name),
+                source_dtype=np.asarray("torch.int32"),
+            )
+            route_entry = {
+                "name": route_name,
+                "file": route_filename,
+                "bytes": (trace / route_filename).stat().st_size,
+                "shape": [3, 8],
+                "source_dtype": "torch.int32",
+                "sha256": hashlib.sha256(route_values.tobytes()).hexdigest(),
+            }
+            diagnostics = {
+                "schema_version": 1,
+                "kind": "glm52_policy_parity_diagnostics",
+                "session_identity": "a" * 64,
+                "side": "h200",
+                "entries": [entry, route_entry],
+            }
+            (trace / "parity-diagnostics.json").write_text(
+                json.dumps(diagnostics, sort_keys=True) + "\n"
+            )
+            retained = retain_h200_diagnostics(
+                {"diagnostics": diagnostics}, output, trace, 64, 100_000_000
+            )
+            copied = output / retained["entries"][0]["file"]
+            self.assertTrue(copied.is_file())
+            self.assertEqual(retained["files"], 2)
+            self.assertEqual(
+                retained["bytes"], entry["bytes"] + route_entry["bytes"]
+            )
+            with np.load(copied, allow_pickle=False) as stored:
+                np.testing.assert_array_equal(stored["values"], values)
+            manifest = {
+                "direct_router_diagnostic": {"diagnostics": diagnostics},
+                "retained_diagnostics": retained,
+            }
+            validate_retained_h200_diagnostics(output, manifest)
+
+            with (output / retained["entries"][1]["file"]).open("ab") as stream:
+                stream.write(b"changed")
+            with self.assertRaisesRegex(ValueError, "checksum differs"):
+                validate_retained_h200_diagnostics(output, manifest)
+
+            diagnostics["entries"][0]["sha256"] = "0" * 64
+            (trace / "parity-diagnostics.json").write_text(
+                json.dumps(diagnostics, sort_keys=True) + "\n"
+            )
+            (root / "bad").mkdir()
+            with self.assertRaisesRegex(ValueError, "content differs"):
+                retain_h200_diagnostics(
+                    {"diagnostics": diagnostics}, root / "bad", trace, 64, 100_000_000
+                )
+
     def test_hidden_diagnostic_rejects_file_limit(self):
         torch = fake_torch()
         with tempfile.TemporaryDirectory() as temporary:
@@ -1163,7 +1252,15 @@ class ParityRouterTraceTest(unittest.TestCase):
                 parity_script,
                 "run_h200_router_diagnostic",
                 side_effect=replay_diagnostic,
-            ) as replay:
+            ) as replay, patch.object(
+                parity_script,
+                "h200_diagnostic_retention_settings",
+                return_value=(root / "trace", 64, 100_000_000),
+            ), patch.object(
+                parity_script,
+                "retain_h200_diagnostics",
+                return_value={"files": 1, "bytes": 1, "entries": []},
+            ):
                 manifest = capture_h200(
                     profile,
                     root / "fixture",
@@ -1196,6 +1293,7 @@ class ParityRouterTraceTest(unittest.TestCase):
         )
         self.assertEqual(replay.call_args.args[4], "one-use-secret")
         self.assertEqual(manifest["direct_router_diagnostic"], {"passed": True})
+        self.assertEqual(manifest["retained_diagnostics"]["files"], 1)
         self.assertEqual(manifest["bootstrap_identity"]["boot_nonce"], "c" * 32)
         self.assertNotIn("one-use-secret", json.dumps(manifest, sort_keys=True))
 

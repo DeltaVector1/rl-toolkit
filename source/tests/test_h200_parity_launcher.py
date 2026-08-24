@@ -63,6 +63,8 @@ class H200ParityLauncherTest(unittest.TestCase):
         source = START.read_text()
         self.assertNotIn("prime_inference_config", source)
         self.assertIn('"host":"127.0.0.1"', source)
+        self.assertIn('"kv_cache_dtype":"auto"', source)
+        self.assertNotIn('"kv_cache_dtype":"fp8"', source)
         self.assertIn('max_num_batched_tokens":32769', source)
         self.assertIn('max_cudagraph_capture_size":256', source)
 

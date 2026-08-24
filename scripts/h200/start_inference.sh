@@ -48,7 +48,7 @@ if [[ ! -f "$overlay_preflight" ]]; then
 fi
 python3 "$overlay_preflight" prepare --deployment "$deployment" --overlay "$overlay_root" --image "$image"
 python3 "$overlay_preflight" verify --deployment "$deployment" --overlay "$overlay_root" --image "$image"
-expected_vllm_extra='{"host":"127.0.0.1","kv_cache_dtype":"fp8","max_num_seqs":128,"max_num_batched_tokens":32769,"compilation_config":{"max_cudagraph_capture_size":256}}'
+expected_vllm_extra='{"host":"127.0.0.1","kv_cache_dtype":"auto","max_num_seqs":128,"max_num_batched_tokens":32769,"compilation_config":{"max_cudagraph_capture_size":256}}'
 vllm_extra=${prime_vllm_extra:-$expected_vllm_extra}
 if [[ "$vllm_extra" != "$expected_vllm_extra" ]]; then
   echo "refusing non-parity vllm-extra: $vllm_extra" >&2
