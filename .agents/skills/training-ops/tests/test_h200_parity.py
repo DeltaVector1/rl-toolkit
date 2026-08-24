@@ -21,6 +21,7 @@ class H200ParityTest(unittest.TestCase):
         fail_cleanup=False,
         fail_fixture_backup=False,
         fail_capture_backup=False,
+        fail_rollback=False,
         lose_fixture_ack=False,
         invalid_fixture_ack=False,
         lose_capture_ack=False,
@@ -71,6 +72,8 @@ class H200ParityTest(unittest.TestCase):
                 transaction["state"]["phase"] = "committed"
                 return 0, ""
             if " rolled_back none rolled_back" in command:
+                if fail_rollback:
+                    return 73, "rollback stopped"
                 transaction["state"]["phase"] = "rolled_back"
                 return 0, ""
             if command.startswith("test -f ") and command.endswith("transaction.json"):
@@ -489,6 +492,13 @@ class H200ParityTest(unittest.TestCase):
         )
         self.assertIn(".fixture-previous-1111111111111111", rollback)
         self.assertIn(".fixture-failed-1111111111111111", rollback)
+        self.assertTrue(
+            any(
+                'sudo rm -f -- "$state"' in command
+                and 'sudo rmdir -- "$run"' in command
+                for command in commands
+            )
+        )
 
     def test_diagnostic_operation_uses_memory_token_and_exact_cleanup(self):
         commands = []
@@ -557,6 +567,13 @@ class H200ParityTest(unittest.TestCase):
             any(
                 ".h200-capture-previous-1111111111111111" in command
                 and "rm -rf --" in command
+                for command in commands
+            )
+        )
+        self.assertTrue(
+            any(
+                'sudo rm -f -- "$state"' in command
+                and 'sudo rmdir -- "$run"' in command
                 for command in commands
             )
         )
@@ -720,6 +737,80 @@ class H200ParityTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "capture paths"):
             training_ops._validate_parity_transaction_state(path, state)
 
+    def test_completed_transaction_cleanup_removes_only_regular_state_and_empty_dir(self):
+        exact_directory = (
+            "/data/glm52-rl/qualifications/glm52-policy-parity/"
+            ".diagnostic-run-1111111111111111"
+        )
+        exact_state = f"{exact_directory}/transaction.json"
+        with tempfile.TemporaryDirectory() as temporary:
+            local_directory = Path(temporary) / ".diagnostic-run-1111111111111111"
+            local_directory.mkdir()
+            local_state = local_directory / "transaction.json"
+            local_state.write_text("state")
+
+            def run_cleanup(_host, command, _label, _sensitive, _timeout):
+                local_command = command.replace(exact_state, str(local_state)).replace(
+                    exact_directory, str(local_directory)
+                )
+                local_command = local_command.replace("sudo rm", "rm").replace(
+                    "sudo rmdir", "rmdir"
+                )
+                completed = subprocess.run(
+                    ["bash", "-c", local_command],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                if completed.returncode:
+                    raise RuntimeError(completed.stderr)
+                return completed.stdout
+
+            with patch.object(training_ops, "_sensitive_ssh", side_effect=run_cleanup):
+                training_ops._remove_completed_parity_transaction(
+                    "h200a", exact_state, exact_directory, ()
+                )
+            self.assertFalse(local_state.exists())
+            self.assertFalse(local_directory.exists())
+
+    def test_completed_transaction_cleanup_retains_state_when_dir_is_not_empty(self):
+        exact_directory = (
+            "/data/glm52-rl/qualifications/glm52-policy-parity/"
+            ".diagnostic-run-1111111111111111"
+        )
+        exact_state = f"{exact_directory}/transaction.json"
+        with tempfile.TemporaryDirectory() as temporary:
+            local_directory = Path(temporary) / ".diagnostic-run-1111111111111111"
+            local_directory.mkdir()
+            local_state = local_directory / "transaction.json"
+            local_state.write_text("state")
+            (local_directory / "recovery").write_text("retain")
+
+            def run_cleanup(_host, command, _label, _sensitive, _timeout):
+                local_command = command.replace(exact_state, str(local_state)).replace(
+                    exact_directory, str(local_directory)
+                )
+                local_command = local_command.replace("sudo rm", "rm").replace(
+                    "sudo rmdir", "rmdir"
+                )
+                completed = subprocess.run(
+                    ["bash", "-c", local_command],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                if completed.returncode:
+                    raise RuntimeError("not empty")
+                return completed.stdout
+
+            with patch.object(training_ops, "_sensitive_ssh", side_effect=run_cleanup):
+                with self.assertRaisesRegex(RuntimeError, "not empty"):
+                    training_ops._remove_completed_parity_transaction(
+                        "h200a", exact_state, exact_directory, ()
+                    )
+            self.assertTrue(local_state.is_file())
+            self.assertTrue(local_directory.is_dir())
+
 
     def test_diagnostic_operation_cleans_exact_container_after_start_failure(self):
         commands = []
@@ -757,8 +848,10 @@ class H200ParityTest(unittest.TestCase):
             commands, fail_fixture_backup=True
         )
         result = self._run_operation(ssh_call, secret_call, secret)
-        self.assertEqual(len(result["cleanup_warnings"]), 1)
+        self.assertEqual(len(result["cleanup_warnings"]), 2)
         self.assertIn("fixture backup cleanup failed", result["cleanup_warnings"][0])
+        self.assertIn("parity transaction state retained at", result["cleanup_warnings"][1])
+        self.assertFalse(any('sudo rm -f -- "$state"' in command for command in commands))
         self.assertTrue(
             any(
                 ".h200-capture-previous-1111111111111111" in command
@@ -773,8 +866,26 @@ class H200ParityTest(unittest.TestCase):
             commands, fail_capture_backup=True
         )
         result = self._run_operation(ssh_call, secret_call, secret)
-        self.assertEqual(len(result["cleanup_warnings"]), 1)
+        self.assertEqual(len(result["cleanup_warnings"]), 2)
         self.assertIn("capture backup cleanup failed", result["cleanup_warnings"][0])
+        self.assertIn("parity transaction state retained at", result["cleanup_warnings"][1])
+        self.assertFalse(any('sudo rm -f -- "$state"' in command for command in commands))
+
+    def test_incomplete_rollback_retains_exact_transaction_state(self):
+        commands = []
+        secret, ssh_call, secret_call, _ = self._operation_ssh(
+            commands, fail_capture=True, fail_rollback=True
+        )
+        with self.assertRaises(RuntimeError) as caught:
+            self._run_operation(ssh_call, secret_call, secret)
+        notes = "\n".join(getattr(caught.exception, "__notes__", ()))
+        self.assertIn("rollback did not complete", notes)
+        self.assertIn(
+            "/data/glm52-rl/qualifications/glm52-policy-parity/"
+            ".diagnostic-run-1111111111111111",
+            notes,
+        )
+        self.assertFalse(any('sudo rm -f -- "$state"' in command for command in commands))
 
     def test_diagnostic_operation_cleans_fifo_and_container_on_interrupt(self):
         commands = []

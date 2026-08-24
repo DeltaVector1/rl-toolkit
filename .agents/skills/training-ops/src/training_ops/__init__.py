@@ -2690,6 +2690,44 @@ def _parity_transaction_update_command(path: str, phase: str, kind: str, action_
     )
 
 
+def _remove_completed_parity_transaction(
+    host: str,
+    path: str,
+    run_directory: str,
+    sensitive: tuple[str, ...],
+) -> None:
+    nonce = _validate_parity_transaction_path(path)
+    expected_directory = (
+        "/data/glm52-rl/qualifications/glm52-policy-parity/"
+        f".diagnostic-run-{nonce}"
+    )
+    if run_directory != expected_directory or str(PurePosixPath(path).parent) != run_directory:
+        raise Refused("completed parity transaction directory is not exact")
+    command = f"""
+set -euo pipefail
+run={shlex.quote(run_directory)}
+state={shlex.quote(path)}
+test -d "$run"
+test ! -L "$run"
+test "$(realpath -e "$run")" = "$run"
+test -f "$state"
+test ! -L "$state"
+test "$(realpath -e "$state")" = "$state"
+test "$(find "$run" -mindepth 1 -maxdepth 1 -printf '%f\n')" = "transaction.json"
+sudo rm -f -- "$state"
+sudo rmdir -- "$run"
+test ! -e "$state"
+test ! -e "$run"
+"""
+    _sensitive_ssh(
+        host,
+        command,
+        "completed parity transaction cleanup",
+        sensitive,
+        60,
+    )
+
+
 def _remote_manifest_sha256(host: str, path: str, label: str, sensitive: tuple[str, ...]) -> str | None:
     value = _sensitive_ssh(
         host,
@@ -3207,6 +3245,8 @@ def diagnose_glm52_policy_parity(name: str, keep_engine: bool = False) -> dict[s
     capture_replaced = False
     succeeded = False
     committed = False
+    rollback_completed = False
+    transaction_present = False
     cleanup_warnings: list[str] = []
     operation_error: BaseException | None = None
     try:
@@ -3323,6 +3363,7 @@ echo fifo-ready
             },
         }
         _write_parity_transaction_state(host, transaction_path, transaction_state, sensitive)
+        transaction_present = True
         fixture_publish = f"""
 set -euo pipefail
 root={shlex.quote(root)}
@@ -3605,7 +3646,9 @@ test -z "$(sudo docker ps -a --filter "name=^/${{name}}$" --format '{{{{.Names}}
         if operation_error is not None or cleanup_failures:
             state_code, _state_output = _ssh(host, f"test -f {shlex.quote(transaction_path)}", timeout=60)
             rollback_artifacts: list[dict[str, object]] = []
+            reconciliation_ok = False
             if state_code == 0:
+                transaction_present = True
                 try:
                     rollback_snapshot = _parity_transaction_snapshot(host, transaction_path, sensitive)
                     rollback_state = rollback_snapshot.get("state")
@@ -3627,6 +3670,7 @@ test -z "$(sudo docker ps -a --filter "name=^/${{name}}$" --format '{{{{.Names}}
                                 "replaced": replaced,
                             }
                         )
+                    reconciliation_ok = True
                 except BaseException as error:
                     cleanup_failures.append(
                         "parity transaction reconciliation failed; recovery paths retained: " + str(error)
@@ -3647,6 +3691,9 @@ test -z "$(sudo docker ps -a --filter "name=^/${{name}}$" --format '{{{{.Names}}
                 else:
                     fixture_published = False
                     capture_published = False
+                    rollback_completed = True
+            elif reconciliation_ok:
+                rollback_completed = True
         elif committed:
             for replaced, previous, label in (
                 (fixture_replaced, fixture_previous, "fixture"),
@@ -3667,6 +3714,41 @@ test -z "$(sudo docker ps -a --filter "name=^/${{name}}$" --format '{{{{.Names}}
                     )
                     cleanup_warnings.append(warning)
                     print("WARNING: " + warning)
+        remove_transaction = (
+            (committed and not cleanup_failures and not cleanup_warnings)
+            or (rollback_completed and not cleanup_failures)
+        )
+        if transaction_present and remove_transaction:
+            try:
+                _remove_completed_parity_transaction(
+                    host,
+                    transaction_path,
+                    run_directory,
+                    sensitive,
+                )
+                transaction_present = False
+            except BaseException as error:
+                message = (
+                    "completed parity transaction cleanup failed; "
+                    f"state retained at {run_directory}: {error}"
+                )
+                if operation_error is None:
+                    cleanup_warnings.append(message)
+                    print("WARNING: " + message)
+                else:
+                    cleanup_failures.append(message)
+        if transaction_present:
+            retained = f"parity transaction state retained at {run_directory}"
+            reported = any(
+                run_directory in message
+                for message in (*cleanup_failures, *cleanup_warnings)
+            )
+            if not reported:
+                if operation_error is not None or cleanup_failures:
+                    cleanup_failures.append(retained)
+                else:
+                    cleanup_warnings.append(retained)
+                    print("WARNING: " + retained)
         bootstrap_token = ""
         sensitive = ()
         if cleanup_failures:
