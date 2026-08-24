@@ -1701,6 +1701,8 @@ sleep() {{
         self.assertIn(paths["engine_identity"], command)
         self.assertIn("os.O_NOFOLLOW", command)
         self.assertIn("stat.S_IMODE(st.st_mode)==0o600", command)
+        self.assertIn("((cid_name,0),(identity_name,1000))", command)
+        self.assertIn('re.fullmatch(rb"[0-9a-f]{64}",cid_data)', command)
         self.assertIn("sudo docker inspect \"$cid\"", command)
         self.assertIn("{{json .Config.Cmd}}", command)
         self.assertIn('name=^/${name}$', command)

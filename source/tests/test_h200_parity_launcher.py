@@ -96,6 +96,8 @@ class H200ParityLauncherTest(unittest.TestCase):
         self.assertIn("prime_parity_bootstrap_fifo", source)
         self.assertIn("! -p \"$bootstrap_fifo\"", source)
         self.assertIn("1000:1000:600", source)
+        self.assertIn("st.st_uid==0 and st.st_gid==0", source)
+        self.assertIn('re.fullmatch(rb"[0-9a-f]{64}",data)', source)
         self.assertIn(
             "source=$bootstrap_fifo,target=/run/prime-parity-bootstrap",
             source,
@@ -175,8 +177,47 @@ class H200ParityLauncherTest(unittest.TestCase):
             self.assertEqual(outside.read_text(), "outside\n")
             self.assertEqual(outside.stat().st_mode & 0o777, 0o640)
 
+    def test_cid_reader_rejects_uid_1000_regular_file(self):
+        code = self._identity_helper("read_engine_cid")
+        with tempfile.TemporaryDirectory() as directory:
+            work = pathlib.Path(directory) / "work"
+            work.mkdir(mode=0o750)
+            cid = work / "engine.cid"
+            cid.write_bytes(b"d" * 64)
+            cid.chmod(0o600)
+            result = subprocess.run(
+                ["python3", "-c", code, str(work), cid.name],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_cid_reader_accepts_exact_raw_format_for_expected_owner(self):
+        code = self._identity_helper("read_engine_cid").replace(
+            "st.st_uid==0 and st.st_gid==0",
+            "st.st_uid==1000 and st.st_gid==1000",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            work = pathlib.Path(directory) / "work"
+            work.mkdir(mode=0o750)
+            cid = work / "engine.cid"
+            cid.write_bytes(b"d" * 64)
+            cid.chmod(0o600)
+            result = subprocess.run(
+                ["python3", "-c", code, str(work), cid.name],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "d" * 64 + "\n")
+
     def test_identity_writer_rejects_tmp_symlink_without_touching_target(self):
-        code = self._identity_helper("write_engine_identity")
+        code = self._identity_helper("write_engine_identity").replace(
+            "st.st_uid==0 and st.st_gid==0",
+            "st.st_uid==1000 and st.st_gid==1000",
+        )
         container_id = "d" * 64
         boot_id = "11111111-2222-3333-4444-555555555555"
         with tempfile.TemporaryDirectory() as directory:
@@ -184,7 +225,7 @@ class H200ParityLauncherTest(unittest.TestCase):
             work = root / "work"
             work.mkdir(mode=0o750)
             cid = work / "engine.cid"
-            cid.write_text(container_id + "\n")
+            cid.write_text(container_id)
             cid.chmod(0o600)
             outside = root / "outside"
             outside.write_text("outside\n")
@@ -210,7 +251,10 @@ class H200ParityLauncherTest(unittest.TestCase):
             self.assertEqual(outside.stat().st_mode & 0o777, 0o640)
 
     def test_identity_writer_replaces_final_symlink_without_touching_target(self):
-        code = self._identity_helper("write_engine_identity")
+        code = self._identity_helper("write_engine_identity").replace(
+            "st.st_uid==0 and st.st_gid==0",
+            "st.st_uid==1000 and st.st_gid==1000",
+        )
         container_id = "d" * 64
         boot_id = "11111111-2222-3333-4444-555555555555"
         with tempfile.TemporaryDirectory() as directory:
@@ -218,7 +262,7 @@ class H200ParityLauncherTest(unittest.TestCase):
             work = root / "work"
             work.mkdir(mode=0o750)
             cid = work / "engine.cid"
-            cid.write_text(container_id + "\n")
+            cid.write_text(container_id)
             cid.chmod(0o600)
             outside = root / "outside"
             outside.write_text("outside\n")

@@ -110,14 +110,14 @@ try:
  fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=parent)
  try:
   st=os.fstat(fd)
-  assert stat.S_ISREG(st.st_mode) and st.st_uid==1000 and st.st_gid==1000
+  assert stat.S_ISREG(st.st_mode) and st.st_uid==0 and st.st_gid==0
   assert stat.S_IMODE(st.st_mode)==0o600
-  data=os.read(fd,66)
+  data=os.read(fd,65)
   assert os.read(fd,1)==b""
  finally:
   os.close(fd)
- assert re.fullmatch(rb"[0-9a-f]{64}\n",data)
- print(data[:-1].decode())
+ assert re.fullmatch(rb"[0-9a-f]{64}",data)
+ print(data.decode())
 finally:
  os.close(parent)
 PY
@@ -138,13 +138,13 @@ try:
  cid_fd=os.open(cid_name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=parent)
  try:
   st=os.fstat(cid_fd)
-  assert stat.S_ISREG(st.st_mode) and st.st_uid==1000 and st.st_gid==1000
+  assert stat.S_ISREG(st.st_mode) and st.st_uid==0 and st.st_gid==0
   assert stat.S_IMODE(st.st_mode)==0o600
-  cid=os.read(cid_fd,66)
+  cid=os.read(cid_fd,65)
   assert os.read(cid_fd,1)==b""
  finally:
   os.close(cid_fd)
- assert cid==expected_cid.encode()+b"\n"
+ assert cid==expected_cid.encode()
  payload=(json.dumps({"container_id":expected_cid,"host_boot_id":boot},sort_keys=True,separators=(",",":"))+"\n").encode()
  fd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=parent)
  try:

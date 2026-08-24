@@ -3098,11 +3098,11 @@ try:
  assert stat.S_ISDIR(st.st_mode) and st.st_uid==1000 and st.st_gid==1000
  assert stat.S_IMODE(st.st_mode)==0o750
  values=[]
- for name in (cid_name,identity_name):
+ for name,owner in ((cid_name,0),(identity_name,1000)):
   fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=parent)
   try:
    st=os.fstat(fd)
-   assert stat.S_ISREG(st.st_mode) and st.st_uid==1000 and st.st_gid==1000
+   assert stat.S_ISREG(st.st_mode) and st.st_uid==owner and st.st_gid==owner
    assert stat.S_IMODE(st.st_mode)==0o600
    data=os.read(fd,4097)
    assert os.read(fd,1)==b""
@@ -3110,8 +3110,8 @@ try:
    os.close(fd)
   values.append(data)
  cid_data,identity_data=values
- assert re.fullmatch(rb"[0-9a-f]{{64}}\\n",cid_data)
- cid=cid_data[:-1].decode()
+ assert re.fullmatch(rb"[0-9a-f]{{64}}",cid_data)
+ cid=cid_data.decode()
  value=json.loads(identity_data)
  assert set(value)=={{"container_id","host_boot_id"}}
  assert value["container_id"]==cid
@@ -3564,14 +3564,15 @@ def _verify_parity_container_outputs(
     if stage == "refresh":
         directories = (paths["fixture"], paths["router_trace"])
         files = (paths["diagnostic"],)
+        root_files: tuple[str, ...] = ()
         names = "diagnostic.npz\nfixture\nh200-router-trace"
     elif stage == "capture":
         directories = (paths["capture"], paths["router_trace"])
         files = (
             paths["diagnostic"],
-            paths["engine_cid"],
             paths["engine_identity"],
         )
+        root_files = (paths["engine_cid"],)
         names = (
             "capture\ndiagnostic.npz\nengine-identity.json\nengine.cid\n"
             "h200-router-trace"
@@ -3580,6 +3581,7 @@ def _verify_parity_container_outputs(
         raise Refused("parity container output stage is invalid")
     directory_values = " ".join(shlex.quote(path) for path in directories)
     file_values = " ".join(shlex.quote(path) for path in files)
+    root_file_values = " ".join(shlex.quote(path) for path in root_files)
     command = f"""
 set -euo pipefail
 work={shlex.quote(paths["work"])}
@@ -3605,6 +3607,13 @@ for path in {file_values}; do
   test "$(stat -c '%u:%g' "$path")" = "1000:1000"
   test $((8#$(stat -c '%a' "$path") & 8#022)) -eq 0
   sudo -u '#1000' test -r "$path"
+done
+for path in {root_file_values}; do
+  test -f "$path"
+  test ! -L "$path"
+  test "$(realpath -e "$path")" = "$path"
+  test "$(stat -c '%u:%g:%a' "$path")" = "0:0:600"
+  sudo test -r "$path"
 done
 for directory in {directory_values}; do
   test -z "$(sudo -u '#1000' find "$directory" -xdev \
