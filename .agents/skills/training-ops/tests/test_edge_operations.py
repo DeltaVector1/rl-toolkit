@@ -2586,6 +2586,39 @@ raise SystemExit(99)
             ):
                 training_ops.current_run()
 
+    def test_current_run_reports_observed_daemon_absent_container(self):
+        with patch.object(
+            training_ops,
+            "_ssh",
+            return_value=(
+                1,
+                "[]\nError response from daemon: No such container: "
+                "glm52-optims-trainer",
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "no active trainer container glm52-optims-trainer"
+            ):
+                training_ops.current_run()
+
+    def test_trainer_absence_detection_rejects_ambiguous_errors(self):
+        observed = (
+            "[]\nError response from daemon: No such container: "
+            "glm52-optims-trainer"
+        )
+        failures = (
+            (2, observed),
+            (1, observed + "\nwarning"),
+            (1, "Error response from daemon: No such container: other"),
+        )
+        for rc, output in failures:
+            with (
+                self.subTest(rc=rc, output=output),
+                patch.object(training_ops, "_ssh", return_value=(rc, output)),
+                self.assertRaisesRegex(RuntimeError, "cannot inspect trainer"),
+            ):
+                training_ops.current_run()
+
     def test_trainer_inspect_shell_preserves_exact_absent_error(self):
         captured = []
 
@@ -2599,7 +2632,9 @@ raise SystemExit(99)
             sudo = Path(temporary) / "sudo"
             sudo.write_text(
                 "#!/bin/sh\n"
-                "printf '%s\\n' 'Error: No such object: glm52-optims-trainer' >&2\n"
+                "printf '%s\\n' '[]'\n"
+                "printf '%s\\n' 'Error response from daemon: No such container: "
+                "glm52-optims-trainer' >&2\n"
                 "exit 1\n",
                 encoding="utf-8",
             )
@@ -2616,7 +2651,9 @@ raise SystemExit(99)
             )
         self.assertEqual(result.returncode, 1)
         self.assertEqual(
-            result.stdout.strip(), "Error: No such object: glm52-optims-trainer"
+            result.stdout.strip(),
+            "[]\nError response from daemon: No such container: "
+            "glm52-optims-trainer",
         )
         self.assertEqual(result.stderr, "")
 

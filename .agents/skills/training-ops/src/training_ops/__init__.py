@@ -764,7 +764,12 @@ def _trainer_container_config() -> tuple[list[str], list[str]]:
     )
     if rc:
         detail = output.strip() or f"docker inspect returned status {rc}"
-        if rc == 1 and detail == f"Error: No such object: {trainer_container}":
+        absent_details = {
+            f"Error: No such object: {trainer_container}",
+            "[]\n"
+            f"Error response from daemon: No such container: {trainer_container}",
+        }
+        if rc == 1 and detail in absent_details:
             raise _TrainerContainerAbsent(
                 f"no active trainer container {trainer_container} on {trainer_head}"
             )
