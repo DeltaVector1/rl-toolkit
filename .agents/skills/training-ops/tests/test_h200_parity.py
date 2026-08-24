@@ -221,6 +221,8 @@ class H200ParityTest(unittest.TestCase):
             "_h200_parity_listener_identity",
             return_value={
                 "listener_pid": 1234,
+                "container_init_pid": 1234,
+                "listener_relation": "init",
                 "container_id": "d" * 64,
                 "host_boot_id": "11111111-2222-3333-4444-555555555555",
             },
@@ -859,7 +861,9 @@ class H200ParityTest(unittest.TestCase):
 
     def test_listener_identity_binds_port_to_running_isolated_container(self):
         identity = {
-            "listener_pid": 1234,
+            "listener_pid": 1235,
+            "container_init_pid": 1234,
+            "listener_relation": "child",
             "container_id": "a" * 64,
             "host_boot_id": "11111111-2222-3333-4444-555555555555",
         }
@@ -874,10 +878,120 @@ class H200ParityTest(unittest.TestCase):
         self.assertIn(".State.Running", command)
         self.assertIn("sport = :8000", command)
         self.assertIn(".State.Pid", command)
-        self.assertIn('test "$listener_pid" = "$container_pid"', command)
+        self.assertNotIn('test "$listener_pid" = "$container_pid" ||', command)
         self.assertIn("/cgroup", command)
         self.assertIn("$container_id", command)
+        self.assertIn("container-image-mismatch", command)
+        self.assertIn("container-command-mismatch", command)
+        self.assertIn("container-restart-policy-invalid", command)
         self.assertEqual(remote.call_args.args[4], 7230)
+
+    def test_listener_identity_shell_accepts_child_only_inside_container_cgroup(self):
+        command = training_ops._h200_parity_listener_identity_command(0)
+        container_id = "a" * 64
+        expected_command = json.dumps(
+            [
+                "@",
+                training_ops.glm_parity_inference_config,
+                "--vllm-extra",
+                training_ops.glm_parity_vllm_extra,
+            ],
+            separators=(",", ":"),
+        )
+        common = (
+            "sudo() { \"$@\"; }; "
+            "docker() { printf '%s\\n' true 101 "
+            f"{container_id} {shlex.quote(json.dumps(training_ops.inference_image))} "
+            f"{shlex.quote(expected_command)} 0 {shlex.quote(json.dumps('no'))}; }}; "
+            "ss() { printf '%s\\n' 'LISTEN 0 128 *:8000 users:((\"python\",pid=202,fd=9))'; }; "
+        )
+        inside = (
+            common
+            + "cat() { case \"$*\" in *cgroup) printf '%s\\n' '0::/docker/"
+            + container_id
+            + "';; *) printf '%s\\n' 11111111-2222-3333-4444-555555555555;; esac; }; "
+            + command
+        )
+        accepted = subprocess.run(
+            ["bash", "-c", inside], text=True, capture_output=True, check=False
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        identity = json.loads(accepted.stdout)
+        self.assertEqual(identity["listener_pid"], 202)
+        self.assertEqual(identity["container_init_pid"], 101)
+        self.assertEqual(identity["listener_relation"], "child")
+
+        outside = (
+            common
+            + "cat() { case \"$*\" in *cgroup) printf '%s\\n' '0::/docker/"
+            + ("b" * 64)
+            + "';; *) printf '%s\\n' 11111111-2222-3333-4444-555555555555;; esac; }; "
+            + command
+        )
+        rejected = subprocess.run(
+            ["bash", "-c", outside], text=True, capture_output=True, check=False
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("parity-listener-error:listener-outside-container", rejected.stderr)
+
+    def test_listener_identity_shell_failures_are_detailed(self):
+        command = training_ops._h200_parity_listener_identity_command(0)
+        container_id = "a" * 64
+        expected_command = json.dumps(
+            [
+                "@",
+                training_ops.glm_parity_inference_config,
+                "--vllm-extra",
+                training_ops.glm_parity_vllm_extra,
+            ],
+            separators=(",", ":"),
+        )
+        inspect = (
+            "docker() { printf '%s\\n' true 101 "
+            f"{container_id} {shlex.quote(json.dumps(training_ops.inference_image))} "
+            f"{shlex.quote(expected_command)} 0 {shlex.quote(json.dumps('no'))}; }}; "
+        )
+        cases = {
+            "container-inspect-failed": "docker() { return 71; }; ss() { :; };",
+            "container-not-running": inspect.replace("true 101", "false 101")
+            + "ss() { :; };",
+            "container-image-mismatch": inspect.replace(
+                shlex.quote(json.dumps(training_ops.inference_image)),
+                shlex.quote(json.dumps("wrong-image")),
+            )
+            + "ss() { :; };",
+            "container-command-mismatch": inspect.replace(
+                shlex.quote(expected_command), shlex.quote(json.dumps(["wrong"]))
+            )
+            + "ss() { :; };",
+            "container-restarted": inspect.replace(" 0 ", " 1 ")
+            + "ss() { :; };",
+            "container-restart-policy-invalid": inspect.replace(
+                shlex.quote(json.dumps("no")), shlex.quote(json.dumps("always"))
+            )
+            + "ss() { :; };",
+            "listener-timeout": inspect + "ss() { :; }; sleep() { :; };",
+            "multiple-listeners": inspect
+            + "ss() { printf '%s\\n' 'LISTEN pid=202,' 'LISTEN pid=203,'; };",
+            "multiple-listener-processes": inspect
+            + "ss() { printf '%s\\n' 'LISTEN pid=202,pid=203,'; };",
+            "listener-pid-missing": inspect
+            + "ss() { printf '%s\\n' 'LISTEN 0 128 *:8000'; };",
+            "listener-probe-failed": inspect + "ss() { return 72; };",
+            "listener-cgroup-unreadable": inspect
+            + "ss() { printf '%s\\n' 'LISTEN pid=202,'; }; cat() { return 73; };",
+        }
+        for detail, functions in cases.items():
+            with self.subTest(detail=detail):
+                script = f"sudo() {{ \"$@\"; }}; {functions} {command}"
+                result = subprocess.run(
+                    ["bash", "-c", script],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"parity-listener-error:{detail}", result.stderr)
 
     def test_capture_records_boot_nonce_and_bootstrap_hash(self):
         secret = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_"

@@ -2657,38 +2657,89 @@ def _assert_h200_parity_port_free(host: str) -> None:
         )
 
 
+def _h200_parity_listener_identity_command(timeout: int) -> str:
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout < 0:
+        raise Refused("H200 parity listener timeout is invalid")
+    expected_command = json.dumps(
+        ["@", glm_parity_inference_config, "--vllm-extra", glm_parity_vllm_extra],
+        separators=(",", ":"),
+    )
+    return rf"""
+set -euo pipefail
+name={shlex.quote(glm_inference_container)}
+deadline=$((SECONDS+{timeout}))
+fail() {{
+  code=$1
+  detail=$2
+  printf 'parity-listener-error:%s\n' "$detail" >&2
+  exit "$code"
+}}
+while :; do
+  inspect=$(sudo docker inspect "$name" --format '{{{{.State.Running}}}}
+{{{{.State.Pid}}}}
+{{{{.Id}}}}
+{{{{json .Config.Image}}}}
+{{{{json .Config.Cmd}}}}
+{{{{.RestartCount}}}}
+{{{{json .HostConfig.RestartPolicy.Name}}}}') || fail 81 container-inspect-failed
+  mapfile -t record <<<"$inspect" || fail 82 container-inspect-record-unreadable
+  test "${{#record[@]}}" = 7 || fail 82 container-inspect-record-invalid
+  running=${{record[0]}}
+  container_pid=${{record[1]}}
+  container_id=${{record[2]}}
+  image=${{record[3]}}
+  command=${{record[4]}}
+  restart_count=${{record[5]}}
+  restart_policy=${{record[6]}}
+  test "$running" = true || fail 83 container-not-running
+  [[ "$container_pid" =~ ^[0-9]+$ ]] || fail 84 container-pid-invalid
+  test "$container_pid" -gt 1 || fail 84 container-pid-invalid
+  [[ "$container_id" =~ ^[0-9a-f]{{64}}$ ]] || fail 85 container-id-invalid
+  test "$image" = {shlex.quote(json.dumps(inference_image))} || fail 86 container-image-mismatch
+  test "$command" = {shlex.quote(expected_command)} || fail 87 container-command-mismatch
+  test "$restart_count" = 0 || fail 88 container-restarted
+  test "$restart_policy" = {shlex.quote(json.dumps('no'))} || fail 89 container-restart-policy-invalid
+  listener_output=$(sudo ss -H -lntp 'sport = :8000') || fail 90 listener-probe-failed
+  if test -z "$listener_output"; then
+    test $SECONDS -lt $deadline || fail 124 listener-timeout
+    sleep 2 || fail 99 listener-wait-failed
+    continue
+  fi
+  mapfile -t listeners <<<"$listener_output" || fail 91 listener-record-unreadable
+  test "${{#listeners[@]}}" = 1 || fail 91 multiple-listeners
+  remaining=${{listeners[0]}}
+  listener_pids=()
+  while [[ "$remaining" =~ pid=([0-9]+) ]]; do
+    listener_pids+=("${{BASH_REMATCH[1]}}")
+    remaining=${{remaining#*"${{BASH_REMATCH[0]}}"}}
+  done
+  test "${{#listener_pids[@]}}" -gt 0 || fail 92 listener-pid-missing
+  declare -A unique_listener_pids=()
+  for pid in "${{listener_pids[@]}}"; do unique_listener_pids["$pid"]=1; done
+  test "${{#unique_listener_pids[@]}}" = 1 || fail 93 multiple-listener-processes
+  for listener_pid in "${{!unique_listener_pids[@]}}"; do :; done
+  [[ "$listener_pid" =~ ^[0-9]+$ ]] || fail 94 listener-pid-invalid
+  test "$listener_pid" -gt 1 || fail 94 listener-pid-invalid
+  listener_cgroup=$(sudo cat -- "/proc/$listener_pid/cgroup") || fail 95 listener-cgroup-unreadable
+  [[ "$listener_cgroup" == *"$container_id"* ]] || fail 96 listener-outside-container
+  host_boot_id=$(sudo cat -- /proc/sys/kernel/random/boot_id) || fail 97 host-boot-id-unreadable
+  [[ "$host_boot_id" =~ ^[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}$ ]] || fail 98 host-boot-id-invalid
+  relation=child
+  if test "$listener_pid" = "$container_pid"; then relation=init; fi
+  printf '{{"listener_pid":%s,"container_init_pid":%s,"listener_relation":"%s","container_id":"%s","host_boot_id":"%s"}}\n' \
+    "$listener_pid" "$container_pid" "$relation" "$container_id" "$host_boot_id" || fail 99 identity-write-failed
+  break
+done
+"""
+
+
 def _h200_parity_listener_identity(
     host: str,
     sensitive: tuple[str, ...],
     timeout: int,
 ) -> dict[str, object]:
     _check_host(host)
-    command = rf"""
-set -euo pipefail
-name={shlex.quote(glm_inference_container)}
-deadline=$((SECONDS+{timeout}))
-while :; do
-  running=$(sudo docker inspect "$name" --format '{{{{.State.Running}}}}' 2>/dev/null) || exit 81
-  test "$running" = true || exit 82
-  container_pid=$(sudo docker inspect "$name" --format '{{{{.State.Pid}}}}')
-  container_id=$(sudo docker inspect "$name" --format '{{{{.Id}}}}')
-  listener_pids=$(sudo ss -H -lntp 'sport = :8000' 2>/dev/null | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | sort -u)
-  if test -z "$listener_pids"; then
-    test $SECONDS -lt $deadline || exit 124
-    sleep 2
-    continue
-  fi
-  test "$(printf '%s\n' "$listener_pids" | sed '/^$/d' | wc -l)" = 1 || exit 83
-  listener_pid=$listener_pids
-  test "$listener_pid" = "$container_pid" || exit 84
-  test -r "/proc/$listener_pid/cgroup" || exit 85
-  grep -Fq "$container_id" "/proc/$listener_pid/cgroup" || exit 86
-  host_boot_id=$(cat /proc/sys/kernel/random/boot_id)
-  printf '{{"listener_pid":%s,"container_id":"%s","host_boot_id":"%s"}}\n' \
-    "$listener_pid" "$container_id" "$host_boot_id"
-  break
-done
-"""
+    command = _h200_parity_listener_identity_command(timeout)
     output = _sensitive_ssh(
         host,
         command,
@@ -2704,6 +2755,17 @@ done
         not isinstance(identity, dict)
         or not isinstance(identity.get("listener_pid"), int)
         or identity["listener_pid"] <= 1
+        or not isinstance(identity.get("container_init_pid"), int)
+        or identity["container_init_pid"] <= 1
+        or identity.get("listener_relation") not in {"init", "child"}
+        or (
+            identity["listener_relation"] == "init"
+            and identity["listener_pid"] != identity["container_init_pid"]
+        )
+        or (
+            identity["listener_relation"] == "child"
+            and identity["listener_pid"] == identity["container_init_pid"]
+        )
         or re.fullmatch(r"[0-9a-f]{64}", str(identity.get("container_id", ""))) is None
         or re.fullmatch(
             r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
