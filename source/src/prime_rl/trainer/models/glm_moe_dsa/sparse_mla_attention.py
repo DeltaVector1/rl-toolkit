@@ -6,6 +6,10 @@ from torch import nn
 from torch.nn.attention.flex_attention import flex_attention
 
 from prime_rl.trainer.models.kernels.fp8_indexer import fp8_indexer
+from prime_rl.trainer.models.layers.lora.multi_linear import (
+    MultiLoRALinear,
+    fused_frozen_linear_pair,
+)
 from prime_rl.trainer.models.layers.norms import LayerNorm, RMSNorm, RMSNormConfig
 from prime_rl.trainer.models.layers.rotary_emb import rotate_half
 from prime_rl.utils.cp import gather_for_cp
@@ -209,10 +213,32 @@ class GlmMoeDsaAttention(nn.Module):
     def cp_enabled(self) -> bool:
         return self._cp_world_size > 1
 
-    def attn_projections(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        q_latent = self.q_a_layernorm(self.q_a_proj(hidden_states))
-        compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
-        k_compressed, k_rope = compressed_kv.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+    def attn_projections(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        q_projection = self.q_a_proj
+        kv_projection = self.kv_a_proj_with_mqa
+        if isinstance(q_projection, MultiLoRALinear) and isinstance(
+            kv_projection, MultiLoRALinear
+        ):
+            q_latent, compressed_kv = fused_frozen_linear_pair(
+                hidden_states,
+                q_projection.base_layer,
+                kv_projection.base_layer,
+            )
+            q_latent = q_latent + q_projection.adapter_output(hidden_states)
+            compressed_kv = compressed_kv + kv_projection.adapter_output(hidden_states)
+        elif isinstance(q_projection, MultiLoRALinear) or isinstance(
+            kv_projection, MultiLoRALinear
+        ):
+            raise ValueError("Q-A and KV-A must use LoRA together")
+        else:
+            q_latent = q_projection(hidden_states)
+            compressed_kv = kv_projection(hidden_states)
+        q_latent = self.q_a_layernorm(q_latent)
+        k_compressed, k_rope = compressed_kv.split(
+            [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+        )
         return q_latent, self.kv_a_layernorm(k_compressed), k_rope
 
     def mla_up_proj(

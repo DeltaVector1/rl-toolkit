@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import importlib.util
+import gc
 import sys
 import types
 import unittest
+import weakref
 from pathlib import Path
+from unittest import mock
 
 import torch
 import torch.nn.functional as F
@@ -17,6 +20,10 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 FP8_ADA_PATH = REPOSITORY_ROOT / "source/src/prime_rl/trainer/models/layers/fp8_ada.py"
 MULTI_LINEAR_PATH = (
     REPOSITORY_ROOT / "source/src/prime_rl/trainer/models/layers/lora/multi_linear.py"
+)
+SPARSE_ATTENTION_PATH = (
+    REPOSITORY_ROOT
+    / "source/src/prime_rl/trainer/models/glm_moe_dsa/sparse_mla_attention.py"
 )
 
 
@@ -64,6 +71,12 @@ def _install_fp8_import_stubs() -> None:
     lm_head._online_logsumexp_and_weighted_update = online_update
     sys.modules.setdefault("prime_rl.trainer.models.layers.lm_head", lm_head)
 
+    checkpointing = types.ModuleType("prime_rl.trainer.models.layers.checkpointing")
+    checkpointing.in_reentrant_block_checkpoint = lambda: False
+    sys.modules.setdefault(
+        "prime_rl.trainer.models.layers.checkpointing", checkpointing
+    )
+
     custom_ops = types.SimpleNamespace(
         scaled_fp8_quant=lambda x, use_per_token_if_dynamic=True: (
             x.clone(),
@@ -110,6 +123,37 @@ _install_fp8_import_stubs()
 _install_lora_import_stubs()
 fp8_ada = _load_module("_fp8_ada_under_test", FP8_ADA_PATH)
 multi_linear = _load_module("_multi_linear_under_test", MULTI_LINEAR_PATH)
+
+
+def _load_sparse_attention_module():
+    stubs = {
+        "prime_rl.trainer.models.kernels.fp8_indexer": {
+            "fp8_indexer": lambda *args, **kwargs: None
+        },
+        "prime_rl.trainer.models.layers.lora.multi_linear": vars(multi_linear),
+        "prime_rl.trainer.models.layers.norms": {
+            "LayerNorm": object,
+            "RMSNorm": object,
+            "RMSNormConfig": object,
+        },
+        "prime_rl.trainer.models.layers.rotary_emb": {
+            "rotate_half": lambda value: value
+        },
+        "prime_rl.utils.cp": {"gather_for_cp": lambda value, group: value},
+    }
+    previous = {name: sys.modules.get(name) for name in stubs}
+    for name, values in stubs.items():
+        module = types.ModuleType(name)
+        module.__dict__.update(values)
+        sys.modules[name] = module
+    with mock.patch.object(torch, "compile", lambda function, **kwargs: function):
+        loaded = _load_module("_sparse_attention_under_test", SPARSE_ATTENTION_PATH)
+    for name, module in previous.items():
+        if module is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = module
+    return loaded
 
 
 def _expanded_block_scale(scale: torch.Tensor, shape: tuple[int, int]):
@@ -894,6 +938,238 @@ class MultiLinearAutogradTest(unittest.TestCase):
             module.lora_B[0].grad, ref_b.grad, rtol=1e-12, atol=1e-12
         )
         self.assertGreater(float(module.lora_B[0].grad.abs().max()), 1.0)
+
+    def test_fused_frozen_pair_matches_one_bf16_linear_and_backward(self):
+        torch.manual_seed(6)
+        first = nn.Linear(8, 6, bias=False, dtype=torch.bfloat16)
+        second = nn.Linear(8, 4, bias=False, dtype=torch.bfloat16)
+        first.requires_grad_(False)
+        second.requires_grad_(False)
+        x = torch.randn(2, 3, 8, dtype=torch.bfloat16, requires_grad=True)
+        ref_x = x.detach().clone().requires_grad_()
+        fused_weight = torch.cat((first.weight, second.weight), dim=0)
+        expected = F.linear(ref_x.view(-1, 8), fused_weight).view(2, 3, 10)
+
+        calls = []
+        real_linear = multi_linear.F.linear
+
+        def record_linear(input_tensor, weight, bias=None):
+            calls.append((tuple(input_tensor.shape), tuple(weight.shape)))
+            return real_linear(input_tensor, weight, bias)
+
+        with mock.patch.object(multi_linear.F, "linear", record_linear):
+            first_out, second_out = multi_linear.fused_frozen_linear_pair(
+                x, first, second
+            )
+        actual = torch.cat((first_out, second_out), dim=-1)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        self.assertEqual(calls, [((6, 8), (10, 8))])
+
+        grad = torch.randn_like(actual)
+        actual.backward(grad)
+        expected.backward(grad)
+        torch.testing.assert_close(x.grad, ref_x.grad, rtol=0, atol=0)
+        self.assertIsNone(first.weight.grad)
+        self.assertIsNone(second.weight.grad)
+
+    def test_fused_frozen_pair_does_not_retain_combined_weight(self):
+        first = nn.Linear(8, 6, bias=False, dtype=torch.bfloat16)
+        second = nn.Linear(8, 4, bias=False, dtype=torch.bfloat16)
+        first.requires_grad_(False)
+        second.requires_grad_(False)
+        x = torch.randn(2, 8, dtype=torch.bfloat16, requires_grad=True)
+        combined_weights = []
+        real_cat = multi_linear.torch.cat
+
+        def record_cat(values, *args, **kwargs):
+            value = real_cat(values, *args, **kwargs)
+            if tuple(value.shape) == (10, 8):
+                combined_weights.append(weakref.ref(value))
+            return value
+
+        with mock.patch.object(multi_linear.torch, "cat", record_cat):
+            outputs = multi_linear.fused_frozen_linear_pair(x, first, second)
+            torch.cat(outputs, dim=-1).sum().backward()
+        gc.collect()
+
+        self.assertEqual(len(combined_weights), 2)
+        self.assertTrue(all(reference() is None for reference in combined_weights))
+        self.assertFalse(
+            any("fused" in name for name in first.state_dict() | second.state_dict())
+        )
+
+    def test_fused_frozen_pair_reacquires_weights_for_backward(self):
+        first = nn.Linear(8, 6, bias=False, dtype=torch.bfloat16)
+        second = nn.Linear(8, 4, bias=False, dtype=torch.bfloat16)
+        first.requires_grad_(False)
+        second.requires_grad_(False)
+        x = torch.randn(2, 8, dtype=torch.bfloat16, requires_grad=True)
+        outputs = multi_linear.fused_frozen_linear_pair(x, first, second)
+        combined = torch.cat(outputs, dim=-1)
+        with torch.no_grad():
+            first.weight = nn.Parameter(
+                torch.full_like(first.weight, 0.25), requires_grad=False
+            )
+            second.weight = nn.Parameter(
+                torch.full_like(second.weight, -0.5), requires_grad=False
+            )
+        grad = torch.randn_like(combined)
+        expected = F.linear(
+            grad,
+            torch.cat((first.weight, second.weight), dim=0).t(),
+        )
+
+        combined.backward(grad)
+
+        torch.testing.assert_close(x.grad, expected, rtol=0, atol=0)
+
+    def test_fused_frozen_pair_supports_reentrant_checkpointing(self):
+        first = nn.Linear(8, 6, bias=False, dtype=torch.bfloat16)
+        second = nn.Linear(8, 4, bias=False, dtype=torch.bfloat16)
+        first.requires_grad_(False)
+        second.requires_grad_(False)
+        x = torch.randn(2, 8, dtype=torch.bfloat16, requires_grad=True)
+
+        def project(value):
+            return torch.cat(
+                multi_linear.fused_frozen_linear_pair(value, first, second),
+                dim=-1,
+            )
+
+        output = torch.utils.checkpoint.checkpoint(project, x, use_reentrant=True)
+        output.sum().backward()
+
+        self.assertEqual(tuple(output.shape), (2, 10))
+        self.assertTrue(bool(torch.isfinite(x.grad).all()))
+
+    def test_fused_pair_uses_glm_output_sizes(self):
+        q_projection = nn.Linear(8, 2048, bias=False, dtype=torch.bfloat16)
+        kv_projection = nn.Linear(8, 576, bias=False, dtype=torch.bfloat16)
+        q_projection.requires_grad_(False)
+        kv_projection.requires_grad_(False)
+
+        q, kv = multi_linear.fused_frozen_linear_pair(
+            torch.randn(2, 8, dtype=torch.bfloat16),
+            q_projection,
+            kv_projection,
+        )
+
+        self.assertEqual(tuple(q.shape), (2, 2048))
+        self.assertEqual(tuple(kv.shape), (2, 576))
+
+    def test_adapter_output_keeps_forward_and_lora_gradients(self):
+        torch.manual_seed(7)
+        base = nn.Linear(8, 6, bias=False, dtype=torch.double)
+        base.requires_grad_(False)
+        module = multi_linear.MultiLoRALinear(
+            base, rank=2, n_adapters=1, alpha=2, use_grouped_mm=False
+        )
+        with torch.no_grad():
+            module.lora_A[0].normal_()
+            module.lora_B[0].normal_()
+        x = torch.randn(2, 3, 8, dtype=torch.double, requires_grad=True)
+        expected = base(x) + module.adapter_output(x)
+        actual = module(x)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+        actual.square().sum().backward()
+        self.assertIsNone(base.weight.grad)
+        self.assertGreater(float(module.lora_A[0].grad.abs().max()), 0)
+        self.assertGreater(float(module.lora_B[0].grad.abs().max()), 0)
+        self.assertEqual(
+            set(module.state_dict()),
+            {"base_layer.weight", "lora_A.0", "lora_B.0"},
+        )
+
+    def test_adapter_output_keeps_multi_adapter_assignment(self):
+        base = nn.Linear(8, 6, bias=False, dtype=torch.double)
+        base.requires_grad_(False)
+        module = multi_linear.MultiLoRALinear(
+            base, rank=2, n_adapters=2, alpha=2, use_grouped_mm=False
+        )
+        module._lora_num_tokens = torch.tensor([2, 3])
+        module._scaling_factors = torch.tensor([0.5, 1.5])
+        with torch.no_grad():
+            for parameter in (*module.lora_A, *module.lora_B):
+                parameter.normal_()
+        x = torch.randn(5, 8, dtype=torch.double, requires_grad=True)
+        expected = torch.cat(
+            tuple(
+                scale * (part @ lora_a.T) @ lora_b.T
+                for part, lora_a, lora_b, scale in zip(
+                    x.split((2, 3)),
+                    module.lora_A,
+                    module.lora_B,
+                    module._scaling_factors,
+                    strict=True,
+                )
+            )
+        )
+
+        actual = module.adapter_output(x)
+        torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
+        actual.square().sum().backward()
+        self.assertTrue(
+            all(
+                parameter.grad is not None and float(parameter.grad.abs().max()) > 0
+                for parameter in (*module.lora_A, *module.lora_B)
+            )
+        )
+        self.assertIsNone(base.weight.grad)
+
+    def test_glm_attention_adds_q_and_kv_adapters_after_fused_base(self):
+        sparse_attention = _load_sparse_attention_module()
+        attention = sparse_attention.GlmMoeDsaAttention.__new__(
+            sparse_attention.GlmMoeDsaAttention
+        )
+        nn.Module.__init__(attention)
+        q_base = nn.Linear(8, 6, bias=False, dtype=torch.bfloat16)
+        kv_base = nn.Linear(8, 4, bias=False, dtype=torch.bfloat16)
+        q_base.requires_grad_(False)
+        kv_base.requires_grad_(False)
+        attention.q_a_proj = multi_linear.MultiLoRALinear(
+            q_base, rank=2, n_adapters=1, use_grouped_mm=False
+        )
+        attention.kv_a_proj_with_mqa = multi_linear.MultiLoRALinear(
+            kv_base, rank=2, n_adapters=1, use_grouped_mm=False
+        )
+        attention.q_a_layernorm = nn.Identity()
+        attention.kv_a_layernorm = nn.Identity()
+        attention.kv_lora_rank = 2
+        attention.qk_rope_head_dim = 2
+        with torch.no_grad():
+            attention.q_a_proj.lora_B[0].normal_()
+            attention.kv_a_proj_with_mqa.lora_B[0].normal_()
+        hidden = torch.randn(2, 8, dtype=torch.bfloat16, requires_grad=True)
+
+        q, kv, rope = attention.attn_projections(hidden)
+        (q.sum() + kv.sum() + rope.sum()).backward()
+
+        self.assertEqual(
+            (tuple(q.shape), tuple(kv.shape), tuple(rope.shape)),
+            ((2, 6), (2, 2), (2, 2)),
+        )
+        self.assertGreater(float(attention.q_a_proj.lora_A[0].grad.abs().max()), 0)
+        self.assertGreater(
+            float(attention.kv_a_proj_with_mqa.lora_A[0].grad.abs().max()),
+            0,
+        )
+        self.assertIsNone(q_base.weight.grad)
+        self.assertIsNone(kv_base.weight.grad)
+
+    def test_fused_pair_rejects_trainable_or_non_bf16_base(self):
+        trainable = nn.Linear(8, 6, bias=False, dtype=torch.bfloat16)
+        frozen = nn.Linear(8, 4, bias=False, dtype=torch.bfloat16)
+        frozen.requires_grad_(False)
+        x = torch.randn(2, 8, dtype=torch.bfloat16)
+        with self.assertRaisesRegex(ValueError, "must be frozen"):
+            multi_linear.fused_frozen_linear_pair(x, trainable, frozen)
+
+        trainable.requires_grad_(False)
+        wrong_dtype = nn.Linear(8, 4, bias=False, dtype=torch.float32)
+        wrong_dtype.requires_grad_(False)
+        with self.assertRaisesRegex(TypeError, "must be BF16"):
+            multi_linear.fused_frozen_linear_pair(x, trainable, wrong_dtype)
 
 
 if __name__ == "__main__":

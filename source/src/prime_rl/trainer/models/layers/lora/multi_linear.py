@@ -2,9 +2,11 @@ import math
 import os
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 from torch import nn
+from torch.distributed.tensor import DTensor
 
 from prime_rl.trainer.models.layers.lora.base import MultiLoRAModule, get_lora_num_tokens, get_multilora_scaling
 
@@ -203,6 +205,76 @@ class _SingleLoRA(torch.autograd.Function):
         )
 
 
+def _local_frozen_weight(module: nn.Linear) -> torch.Tensor:
+    weight = module.weight
+    if weight.requires_grad:
+        raise ValueError("fused Q/KV-A base weights must be frozen")
+    if isinstance(weight, DTensor):
+        weight = weight.to_local()
+    if weight.dtype != torch.bfloat16:
+        raise TypeError(
+            "fused Q/KV-A base weights must be BF16, " f"got {weight.dtype}"
+        )
+    return weight
+
+
+class _FusedFrozenLinearPair(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, first_owner, second_owner):
+        if x.dtype != torch.bfloat16:
+            raise TypeError(f"fused Q/KV-A input must be BF16, got {x.dtype}")
+        first_weight = _local_frozen_weight(first_owner)
+        second_weight = _local_frozen_weight(second_owner)
+        if first_weight.shape[1] != second_weight.shape[1]:
+            raise ValueError(
+                "fused Q/KV-A input sizes differ: "
+                f"{first_weight.shape[1]} and {second_weight.shape[1]}"
+            )
+        if first_weight.shape[1] != x.shape[-1]:
+            raise ValueError(
+                "fused Q/KV-A input size mismatch: "
+                f"input={x.shape[-1]}, weight={first_weight.shape[1]}"
+            )
+        ctx.first_owner = first_owner
+        ctx.second_owner = second_owner
+        ctx.input_shape = x.shape
+        x = x.view(-1, x.shape[-1])
+        fused_weight = torch.cat((first_weight, second_weight), dim=0)
+        try:
+            output = F.linear(x, fused_weight)
+            return output.view(*ctx.input_shape[:-1], output.shape[-1])
+        finally:
+            del fused_weight
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        first_weight = _local_frozen_weight(ctx.first_owner)
+        second_weight = _local_frozen_weight(ctx.second_owner)
+        grad_output = grad_output.reshape(-1, grad_output.shape[-1])
+        fused_weight = torch.cat((first_weight, second_weight), dim=0)
+        try:
+            input_grad = F.linear(grad_output, fused_weight.t()).view(ctx.input_shape)
+        finally:
+            del (
+                fused_weight,
+                ctx.first_owner,
+                ctx.second_owner,
+                ctx.input_shape,
+            )
+        return input_grad, None, None
+
+
+def fused_frozen_linear_pair(
+    x: torch.Tensor,
+    first: nn.Linear,
+    second: nn.Linear,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if first.bias is not None or second.bias is not None:
+        raise ValueError("fused Q/KV-A base projections do not support bias")
+    combined = _FusedFrozenLinearPair.apply(x, first, second)
+    return combined.split((first.out_features, second.out_features), dim=-1)
+
+
 class MultiLoRALinear(MultiLoRAModule):
     """Linear + multi-LoRA with grouped GEMM."""
 
@@ -289,10 +361,7 @@ class MultiLoRALinear(MultiLoRAModule):
             self._scaling_factors[adapter_index],
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        shape = x.shape[:-1] + (self.out_features,)
-        x = x.view(-1, x.shape[-1])
-        base_out = self.base_layer(x)
+    def _adapter_output_2d(self, x: torch.Tensor) -> torch.Tensor:
         lora_x = self.lora_dropout(x)
 
         if self.n_adapters == 1:
@@ -302,7 +371,7 @@ class MultiLoRALinear(MultiLoRAModule):
                 self.lora_B[0],
                 getattr(self.base_layer, "_fp8_fqn", "<unassigned-lora-linear>"),
             )
-            return (base_out + self._scaling_factors[0] * lora_out).view(shape)
+            return self._scaling_factors[0] * lora_out
 
         offsets = self._lora_num_tokens.cumsum(dim=0, dtype=torch.int32)
         assert offsets[-1] == x.shape[0], f"offsets: {offsets}, x.shape: {x.shape}"
@@ -312,8 +381,20 @@ class MultiLoRALinear(MultiLoRAModule):
             lora_out = _run_lora_grouped_mm(lora_x, lora_A, lora_B, offsets)
         else:
             lora_out = _run_lora_for_loop(lora_x, lora_A, lora_B, offsets)
-        scaling = torch.repeat_interleave(self._scaling_factors, self._lora_num_tokens).unsqueeze(-1)
-        return (base_out + scaling * lora_out).view(shape)
+        scaling = torch.repeat_interleave(
+            self._scaling_factors, self._lora_num_tokens
+        ).unsqueeze(-1)
+        return scaling * lora_out
+
+    def adapter_output(self, x: torch.Tensor) -> torch.Tensor:
+        shape = x.shape[:-1] + (self.out_features,)
+        x = x.view(-1, x.shape[-1])
+        return self._adapter_output_2d(x).view(shape)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        shape = x.shape[:-1] + (self.out_features,)
+        x = x.view(-1, x.shape[-1])
+        return (self.base_layer(x) + self._adapter_output_2d(x)).view(shape)
 
     def __repr__(self) -> str:
         return (
