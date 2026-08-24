@@ -13,6 +13,7 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import sys
 import tempfile
 import tomllib
@@ -173,6 +174,27 @@ def _array_bytes_sha256(value: np.ndarray) -> str:
     return hashlib.sha256(memoryview(np.ascontiguousarray(value)).cast("B")).hexdigest()
 
 
+def _prepare_refresh_output(output: Path, prepared_output: bool) -> None:
+    if prepared_output:
+        try:
+            status = output.lstat()
+        except FileNotFoundError as error:
+            raise ValueError("prepared fixture output is missing") from error
+        if (
+            not stat.S_ISDIR(status.st_mode)
+            or output.is_symlink()
+            or status.st_uid != os.geteuid()
+            or status.st_gid != os.getegid()
+            or stat.S_IMODE(status.st_mode) != 0o750
+            or any(output.iterdir())
+        ):
+            raise ValueError("prepared fixture output has wrong type, owner, mode, or content")
+        return
+    if output.exists() or output.is_symlink():
+        raise FileExistsError("refreshed parity fixture output already exists")
+    output.mkdir(parents=False)
+
+
 def refresh_fixture_from_trainer_export(
     profile: Profile,
     source_fixture: Path,
@@ -183,6 +205,7 @@ def refresh_fixture_from_trainer_export(
     diagnostic_output: Path,
     expected_rank: int,
     created_utc: str | None = None,
+    prepared_output: bool = False,
 ) -> dict[str, Any]:
     source_manifest = load_manifest(source_fixture, "glm52_policy_parity_fixture")
     source_fixture_sha256 = fixture_digest(source_fixture)
@@ -265,10 +288,10 @@ def refresh_fixture_from_trainer_export(
         value = diagnostic.get(name)
         if value is None or str(value.item()) != expected:
             raise ValueError(f"trainer diagnostic {name} differs from its session")
-    if output.exists() or diagnostic_output.exists():
-        raise FileExistsError("refreshed parity fixture output already exists")
+    if diagnostic_output.exists() or diagnostic_output.is_symlink():
+        raise FileExistsError("refreshed parity fixture diagnostic output already exists")
+    _prepare_refresh_output(output, prepared_output)
     try:
-        output.mkdir(parents=False)
         entries: dict[str, Any] = {}
         fixture_semantic_hashes: dict[str, str] = {}
         for name, array in refreshed_arrays.items():
@@ -1839,6 +1862,7 @@ def parser() -> argparse.ArgumentParser:
     refresh.add_argument("--diagnostic-output", type=Path, required=True)
     refresh.add_argument("--expected-rank", type=int, required=True)
     refresh.add_argument("--created-utc")
+    refresh.add_argument("--prepared-output", action="store_true")
     refresh.add_argument("output", type=Path)
     h200 = commands.add_parser("capture-h200")
     h200.add_argument("--fixture", type=Path, required=True)
@@ -1924,6 +1948,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.diagnostic_output,
                 args.expected_rank,
                 args.created_utc,
+                args.prepared_output,
             )
         elif args.command == "capture-h200":
             result = capture_h200(

@@ -2568,6 +2568,41 @@ def _validate_parity_transaction_state(path: str, state: dict[str, object]) -> N
             raise RuntimeError(f"parity transaction {kind} published hash is missing")
 
 
+def _prepare_parity_fixture_candidate(
+    host: str,
+    path: str,
+    sensitive: tuple[str, ...],
+) -> None:
+    if re.fullmatch(
+        r"/data/glm52-rl/qualifications/glm52-policy-parity/"
+        r"\.fixture-candidate-[0-9a-f]{16}",
+        path,
+    ) is None:
+        raise Refused("parity fixture candidate path is not exact")
+    command = f"""
+set -euo pipefail
+candidate={shlex.quote(path)}
+test ! -e "$candidate"
+test ! -L "$candidate"
+sudo install -d -o 1000 -g 1000 -m 0750 "$candidate"
+test -d "$candidate"
+test ! -L "$candidate"
+test "$(realpath -e "$candidate")" = "$candidate"
+test "$(stat -c '%u:%g:%a' "$candidate")" = "1000:1000:750"
+test -z "$(find "$candidate" -mindepth 1 -maxdepth 1 -print -quit)"
+printf 'candidate-ready\n'
+"""
+    output = _sensitive_ssh(
+        host,
+        command,
+        "parity fixture candidate preparation",
+        sensitive,
+        60,
+    ).strip()
+    if output != "candidate-ready":
+        raise RuntimeError("parity fixture candidate preparation returned an invalid state")
+
+
 def _write_parity_transaction_state(
     host: str,
     path: str,
@@ -3303,6 +3338,7 @@ echo fifo-ready
         if fifo_state != "fifo-ready":
             raise RuntimeError("parity bootstrap FIFO setup returned an invalid state")
 
+        _prepare_parity_fixture_candidate(host, fixture_candidate, sensitive)
         _copy_parity_diagnostic_input(source_host, source_input, host, source_diagnostic_input)
         _copy_parity_refresh_file(source_host, session_path, host, source_session, "session")
         _copy_parity_refresh_file(final_host, token_export, host, source_token_export, "token")
@@ -3316,7 +3352,8 @@ echo fifo-ready
             f"--token-export {shlex.quote(source_token_export)} "
             f"--diagnostic-input {shlex.quote(source_diagnostic_input)} "
             f"--diagnostic-output {shlex.quote(remote_input)} "
-            f"--expected-rank {final_rank} {shlex.quote(fixture_candidate)}"
+            f"--expected-rank {final_rank} --prepared-output "
+            f"{shlex.quote(fixture_candidate)}"
         )
         refresh_output = _sensitive_ssh(host, refresh_command, "current parity fixture rebuild", sensitive, 600)
         try:
@@ -3604,8 +3641,13 @@ test -z "$(sudo docker ps -a --filter "name=^/${{name}}$" --format '{{{{.Names}}
             f"rm -f -- {shlex.quote(source_diagnostic_input)}; "
             f"rm -f -- {shlex.quote(source_session)}; "
             f"rm -f -- {shlex.quote(source_token_export)}; "
-            f"if test -d {shlex.quote(fixture_candidate)}; then "
-            f"rm -rf -- {shlex.quote(fixture_candidate)}; fi; "
+            f"if test -e {shlex.quote(fixture_candidate)} || "
+            f"test -L {shlex.quote(fixture_candidate)}; then "
+            f"test -d {shlex.quote(fixture_candidate)} && "
+            f"test ! -L {shlex.quote(fixture_candidate)} && "
+            f"test \"$(realpath -e {shlex.quote(fixture_candidate)})\" = "
+            f"{shlex.quote(fixture_candidate)} && "
+            f"sudo rm -rf -- {shlex.quote(fixture_candidate)}; fi; "
             f"if test -d {shlex.quote(temporary_capture)}; then "
             f"rm -rf -- {shlex.quote(temporary_capture)}; fi; "
             f"test ! -e {shlex.quote(bootstrap_fifo)}; "
@@ -3617,6 +3659,7 @@ test -z "$(sudo docker ps -a --filter "name=^/${{name}}$" --format '{{{{.Names}}
             f"test ! -e {shlex.quote(source_session)}; "
             f"test ! -e {shlex.quote(source_token_export)}; "
             f"test ! -e {shlex.quote(fixture_candidate)}; "
+            f"test ! -L {shlex.quote(fixture_candidate)}; "
             f"test ! -e {shlex.quote(temporary_capture)}"
         )
         cleanup_code, cleanup_output = _ssh(host, cleanup, timeout=120)

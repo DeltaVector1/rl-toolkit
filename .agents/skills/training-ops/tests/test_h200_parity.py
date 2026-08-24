@@ -17,6 +17,7 @@ class H200ParityTest(unittest.TestCase):
         commands,
         *,
         fail_start=False,
+        fail_refresh=False,
         fail_capture=False,
         fail_cleanup=False,
         fail_fixture_backup=False,
@@ -40,7 +41,11 @@ class H200ParityTest(unittest.TestCase):
                 return 0, "config-sha\n"
             if "mkfifo -m 0600" in command:
                 return 0, "fifo-ready\n"
+            if "parity fixture candidate" in command or "candidate-ready" in command:
+                return 0, "candidate-ready\n"
             if "refresh-fixture" in command:
+                if fail_refresh:
+                    return 1, "refresh failed"
                 return 0, json.dumps(
                     {
                         "fixture_sha256": "1" * 64,
@@ -577,6 +582,70 @@ class H200ParityTest(unittest.TestCase):
                 for command in commands
             )
         )
+
+        candidate_setup = next(
+            command for command in commands if "candidate-ready" in command
+        )
+        refresh = next(command for command in commands if "refresh-fixture" in command)
+        self.assertLess(commands.index(candidate_setup), commands.index(refresh))
+        self.assertIn("install -d -o 1000 -g 1000 -m 0750", candidate_setup)
+        self.assertIn("1000:1000:750", candidate_setup)
+        self.assertIn("--prepared-output", refresh)
+
+    def test_fixture_candidate_preparation_refuses_wrong_path(self):
+        with self.assertRaisesRegex(training_ops.Refused, "candidate path"):
+            training_ops._prepare_parity_fixture_candidate(
+                "h200a", "/tmp/.fixture-candidate-1111111111111111", ()
+            )
+
+    def test_fixture_candidate_preparation_creates_exact_owned_empty_dir(self):
+        exact = (
+            "/data/glm52-rl/qualifications/glm52-policy-parity/"
+            ".fixture-candidate-1111111111111111"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            local = Path(temporary) / ".fixture-candidate-1111111111111111"
+
+            def run_prepare(_host, command, _label, _sensitive, _timeout):
+                local_command = command.replace(exact, str(local)).replace(
+                    "sudo install", "install"
+                )
+                completed = subprocess.run(
+                    ["bash", "-c", local_command],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                if completed.returncode:
+                    raise RuntimeError(completed.stderr)
+                return completed.stdout
+
+            with patch.object(training_ops, "_sensitive_ssh", side_effect=run_prepare):
+                training_ops._prepare_parity_fixture_candidate(
+                    "h200a", exact, ()
+                )
+            status = local.stat()
+            self.assertEqual(status.st_uid, 1000)
+            self.assertEqual(status.st_gid, 1000)
+            self.assertEqual(status.st_mode & 0o777, 0o750)
+            self.assertEqual(list(local.iterdir()), [])
+
+    def test_fixture_candidate_cleanup_uses_sudo_after_refresh_failure(self):
+        commands = []
+        secret, ssh_call, secret_call, _ = self._operation_ssh(
+            commands, fail_refresh=True
+        )
+        with self.assertRaisesRegex(RuntimeError, "refresh failed"):
+            self._run_operation(ssh_call, secret_call, secret)
+        cleanup = next(
+            command
+            for command in commands
+            if "sudo rm -rf --" in command
+            and ".fixture-candidate-1111111111111111" in command
+            and "realpath -e" in command
+        )
+        self.assertIn("test ! -L", cleanup)
+        self.assertIn("sudo rm -rf --", cleanup)
 
     def test_diagnostic_operation_reconciles_lost_or_invalid_publish_ack(self):
         cases = (
