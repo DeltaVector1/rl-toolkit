@@ -97,7 +97,12 @@ class H200ParityTest(unittest.TestCase):
                 return 1, "start rejected"
             if "capture-h200" in command and fail_capture:
                 return 1, f"capture rejected {secret}"
-            if command.startswith("sudo rm -f --") and fail_cleanup:
+            if (
+                fail_cleanup
+                and "bootstrap.fifo" in command
+                and ".diagnostic-source-" in command
+                and "sudo rm -f --" in command
+            ):
                 return 1, "cleanup failed"
             if (
                 fail_fixture_backup
@@ -570,6 +575,113 @@ class H200ParityTest(unittest.TestCase):
             )
             self.assertNotEqual(cleanup.returncode, 0)
             self.assertTrue(retained.exists())
+
+            retained_regular = root / "retained-regular.fifo"
+            retained_regular.write_text("x" * 64 + "\n")
+            regular_command = training_ops._parity_bootstrap_receive_command(
+                str(retained_regular), 1
+            )
+            regular_cleanup = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    "sudo() { if test \"$1\" = rm; then return 0; fi; \"$@\"; }; "
+                    + regular_command,
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(regular_cleanup.returncode, 0)
+            self.assertTrue(retained_regular.is_file())
+
+            retained_symlink = root / "retained-symlink.fifo"
+            retained_symlink.symlink_to(root / "missing-target")
+            symlink_command = training_ops._parity_bootstrap_receive_command(
+                str(retained_symlink), 1
+            )
+            symlink_cleanup = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    "sudo() { "
+                    "if test \"$1\" = timeout; then printf '%064d\\n' 0; return 0; fi; "
+                    "if test \"$1\" = rm; then return 0; fi; "
+                    "\"$@\"; }; "
+                    + symlink_command,
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(symlink_cleanup.returncode, 0)
+            self.assertTrue(retained_symlink.is_symlink())
+
+    def test_temporary_cleanup_keeps_early_failure_nonzero(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run = root / "run"
+            run.mkdir()
+            transaction = run / "transaction.json"
+            transaction.write_text("state")
+            diagnostic_input = root / "diagnostic-input"
+            diagnostic_input.mkdir()
+            command = training_ops._parity_temporary_cleanup_command(
+                bootstrap_fifo=str(root / "missing-fifo"),
+                transaction_path=str(transaction),
+                run_directory=str(run),
+                source_diagnostic_input=str(diagnostic_input),
+                source_session=str(root / "missing-session"),
+                source_compact=str(root / "missing-compact"),
+                source_compact_manifest=str(root / "missing-manifest"),
+                container_work_directory=str(root / "missing-work"),
+                retain_container_work=False,
+            )
+            completed = subprocess.run(
+                ["bash", "-c", "sudo() { \"$@\"; }; " + command],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertTrue(diagnostic_input.is_dir())
+
+    def test_temporary_cleanup_rejects_retained_file_and_symlink(self):
+        for kind in ("file", "symlink"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                run = root / "run"
+                run.mkdir()
+                transaction = run / "transaction.json"
+                transaction.write_text("state")
+                diagnostic_input = root / "diagnostic-input"
+                if kind == "file":
+                    diagnostic_input.write_text("retained")
+                else:
+                    diagnostic_input.symlink_to(root / "missing-target")
+                command = training_ops._parity_temporary_cleanup_command(
+                    bootstrap_fifo=str(root / "missing-fifo"),
+                    transaction_path=str(transaction),
+                    run_directory=str(run),
+                    source_diagnostic_input=str(diagnostic_input),
+                    source_session=str(root / "missing-session"),
+                    source_compact=str(root / "missing-compact"),
+                    source_compact_manifest=str(root / "missing-manifest"),
+                    container_work_directory=str(root / "missing-work"),
+                    retain_container_work=False,
+                )
+                completed = subprocess.run(
+                    [
+                        "bash",
+                        "-c",
+                        "rm() { return 0; }; sudo() { \"$@\"; }; " + command,
+                    ],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertTrue(diagnostic_input.exists() or diagnostic_input.is_symlink())
 
     def test_diagnostic_capture_preflight_refuses_existing_cap_overflow(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -3329,9 +3329,85 @@ def _parity_bootstrap_receive_command(path: str, timeout: int) -> str:
         "set -euo pipefail; status=0; "
         f"sudo timeout --foreground {timeout} cat -- {shlex.quote(path)} || status=$?; "
         f"sudo rm -f -- {shlex.quote(path)}; "
-        f"test ! -e {shlex.quote(path)} && test ! -L {shlex.quote(path)}; "
+        f"test ! -e {shlex.quote(path)}; "
+        f"test ! -L {shlex.quote(path)}; "
         'exit "$status"'
     )
+
+
+def _parity_temporary_cleanup_command(
+    *,
+    bootstrap_fifo: str,
+    transaction_path: str,
+    run_directory: str,
+    source_diagnostic_input: str,
+    source_session: str,
+    source_compact: str,
+    source_compact_manifest: str,
+    container_work_directory: str,
+    retain_container_work: bool,
+) -> str:
+    fifo = shlex.quote(bootstrap_fifo)
+    transaction = shlex.quote(transaction_path)
+    run = shlex.quote(run_directory)
+    diagnostic_input = shlex.quote(source_diagnostic_input)
+    session = shlex.quote(source_session)
+    compact = shlex.quote(source_compact)
+    compact_manifest = shlex.quote(source_compact_manifest)
+    work = shlex.quote(container_work_directory)
+    if retain_container_work:
+        work_cleanup = f"""
+test -d {work}
+test ! -L {work}
+test "$(realpath -e {work})" = {work}
+"""
+    else:
+        work_cleanup = f"""
+if test -e {work}; then
+  test -d {work}
+  test ! -L {work}
+  test "$(realpath -e {work})" = {work}
+  sudo rm -rf -- {work}
+elif test -L {work}; then
+  exit 1
+fi
+test ! -e {work}
+test ! -L {work}
+"""
+    return f"""
+set -euo pipefail
+sudo rm -f -- {fifo}
+if test -e {transaction}; then
+  test -f {transaction}
+  test ! -L {transaction}
+else
+  sudo rmdir -- {run}
+fi
+rm -f -- {diagnostic_input}
+rm -f -- {session}
+rm -f -- {compact}
+rm -f -- {compact_manifest}
+{work_cleanup}
+test ! -e {fifo}
+test ! -L {fifo}
+if test -e {transaction}; then
+  test -f {transaction}
+  test ! -L {transaction}
+  test -d {run}
+  test ! -L {run}
+else
+  test ! -e {run}
+  test ! -L {run}
+fi
+test ! -e {diagnostic_input}
+test ! -L {diagnostic_input}
+test ! -e {session}
+test ! -L {session}
+test ! -e {compact}
+test ! -L {compact}
+test ! -e {compact_manifest}
+test ! -L {compact_manifest}
+"""
 
 
 def _isolated_container_status(
@@ -4196,43 +4272,16 @@ test -z "$(sudo docker ps -a --filter "name=^/${{name}}$" --format '{{{{.Names}}
                     + _redact_sensitive(container_output.strip(), sensitive)
                 )
         retain_container_work = keep_engine and succeeded
-        work_cleanup = (
-            f"test -d {shlex.quote(container_work_directory)} && "
-            f"test ! -L {shlex.quote(container_work_directory)} && "
-            f"test \"$(realpath -e {shlex.quote(container_work_directory)})\" = "
-            f"{shlex.quote(container_work_directory)}"
-            if retain_container_work
-            else (
-                f"if test -e {shlex.quote(container_work_directory)} || "
-                f"test -L {shlex.quote(container_work_directory)}; then "
-                f"test -d {shlex.quote(container_work_directory)} && "
-                f"test ! -L {shlex.quote(container_work_directory)} && "
-                f"test \"$(realpath -e {shlex.quote(container_work_directory)})\" = "
-                f"{shlex.quote(container_work_directory)} && "
-                f"sudo rm -rf -- {shlex.quote(container_work_directory)}; fi; "
-                f"test ! -e {shlex.quote(container_work_directory)}; "
-                f"test ! -L {shlex.quote(container_work_directory)}"
-            )
-        )
-        cleanup = (
-            f"sudo rm -f -- {shlex.quote(bootstrap_fifo)}; "
-            f"if test -e {shlex.quote(transaction_path)}; then "
-            f"test -f {shlex.quote(transaction_path)} && "
-            f"test ! -L {shlex.quote(transaction_path)}; "
-            f"else sudo rmdir -- {shlex.quote(run_directory)}; fi; "
-            f"rm -f -- {shlex.quote(source_diagnostic_input)}; "
-            f"rm -f -- {shlex.quote(source_session)}; "
-            f"rm -f -- {shlex.quote(source_compact)}; "
-            f"rm -f -- {shlex.quote(source_compact_manifest)}; "
-            f"{work_cleanup}; "
-            f"test ! -e {shlex.quote(bootstrap_fifo)}; "
-            f"if test -e {shlex.quote(transaction_path)}; then "
-            f"test -d {shlex.quote(run_directory)}; else "
-            f"test ! -e {shlex.quote(run_directory)}; fi; "
-            f"test ! -e {shlex.quote(source_diagnostic_input)}; "
-            f"test ! -e {shlex.quote(source_session)}; "
-            f"test ! -e {shlex.quote(source_compact)}; "
-            f"test ! -e {shlex.quote(source_compact_manifest)}"
+        cleanup = _parity_temporary_cleanup_command(
+            bootstrap_fifo=bootstrap_fifo,
+            transaction_path=transaction_path,
+            run_directory=run_directory,
+            source_diagnostic_input=source_diagnostic_input,
+            source_session=source_session,
+            source_compact=source_compact,
+            source_compact_manifest=source_compact_manifest,
+            container_work_directory=container_work_directory,
+            retain_container_work=retain_container_work,
         )
         cleanup_code, cleanup_output = _ssh(host, cleanup, timeout=120)
         if cleanup_code:
