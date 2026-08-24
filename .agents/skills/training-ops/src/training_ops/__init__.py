@@ -3034,17 +3034,30 @@ def _h200_capture_bootstrap_identity(
     return identity
 
 
+def _h200_parity_launch_identity(output: str) -> dict[str, str]:
+    matches = re.findall(
+        r"^parity-engine-identity:([0-9a-f]{64}):"
+        r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$",
+        output,
+        re.MULTILINE,
+    )
+    if len(matches) != 1:
+        raise Refused("isolated parity launch identity is missing or duplicated")
+    container_id, host_boot_id = matches[0]
+    return {"container_id": container_id, "host_boot_id": host_boot_id}
+
+
 def _h200_parity_container_cleanup_command(
-    expected_container_id: str | None,
-    expected_host_boot_id: str | None,
+    expected_container_id: str,
+    expected_host_boot_id: str,
     settle_timeout: int,
     poll_seconds: int,
 ) -> str:
-    if expected_container_id is not None and re.fullmatch(
+    if not isinstance(expected_container_id, str) or re.fullmatch(
         r"[0-9a-f]{64}", expected_container_id
     ) is None:
         raise Refused("H200 parity cleanup container ID is invalid")
-    if expected_host_boot_id is not None and re.fullmatch(
+    if not isinstance(expected_host_boot_id, str) or re.fullmatch(
         r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
         expected_host_boot_id,
     ) is None:
@@ -3066,23 +3079,48 @@ def _h200_parity_container_cleanup_command(
     return f"""
 set -euo pipefail
 name={shlex.quote(glm_inference_container)}
-expected_id={shlex.quote(expected_container_id or "")}
-expected_boot={shlex.quote(expected_host_boot_id or "")}
+expected_id={shlex.quote(expected_container_id)}
+expected_boot={shlex.quote(expected_host_boot_id)}
 expected_command={shlex.quote(expected_command)}
 settle_timeout={settle_timeout}
 poll_seconds={poll_seconds}
-fail() {{ printf 'parity-cleanup-error:%s\n' "$1" >&2; exit 1; }}
-boot=$(sudo cat /proc/sys/kernel/random/boot_id) || fail host-boot-read
-test -n "$expected_boot" || expected_boot="$boot"
+deadline=$((SECONDS + settle_timeout))
+container_state=unknown
+fail() {{
+  reported_state=${{2:-$container_state}}
+  printf 'parity-cleanup-state:%s\nparity-cleanup-error:%s\n' "$reported_state" "$1" >&2
+  exit 1
+}}
+remaining() {{
+  remaining_seconds=$((deadline - SECONDS))
+  test "$remaining_seconds" -gt 0
+}}
+bounded() {{
+  remaining || return 124
+  timeout --foreground "$remaining_seconds" "$@"
+  code=$?
+  test "$code" = 0 || return "$code"
+  test "$SECONDS" -le "$deadline" || return 124
+}}
+bounded_sleep() {{
+  remaining || return 124
+  delay=$poll_seconds
+  test "$delay" -le "$remaining_seconds" || delay=$remaining_seconds
+  timeout --foreground "$remaining_seconds" sleep "$delay"
+  code=$?
+  test "$code" = 0 || return "$code"
+  test "$SECONDS" -le "$deadline" || return 124
+}}
+boot=$(bounded sudo cat /proc/sys/kernel/random/boot_id) || fail host-boot-read
 test "$boot" = "$expected_boot" || fail host-boot-changed
 inspect_name() {{
-  sudo docker inspect "$name" --format '{{{{.Id}}}}\n{{{{.State.Status}}}}\n{{{{.State.Running}}}}\n{{{{.State.Pid}}}}\n{{{{json .Config.Image}}}}\n{{{{json .Config.Cmd}}}}\n{{{{.RestartCount}}}}\n{{{{json .HostConfig.RestartPolicy.Name}}}}'
+  bounded sudo docker inspect "$name" --format '{{{{.Id}}}}\n{{{{.State.Status}}}}\n{{{{.State.Running}}}}\n{{{{.State.Pid}}}}\n{{{{json .Config.Image}}}}\n{{{{json .Config.Cmd}}}}\n{{{{.RestartCount}}}}\n{{{{json .HostConfig.RestartPolicy.Name}}}}'
 }}
 inventory_name() {{
-  sudo docker ps -a --no-trunc --filter "name=^/${{name}}$" --format '{{{{.ID}}}} {{{{.Names}}}}'
+  bounded sudo docker ps -a --no-trunc --filter "name=^/${{name}}$" --format '{{{{.ID}}}} {{{{.Names}}}}'
 }}
 inventory_id() {{
-  sudo docker ps -a --no-trunc --filter "id=$expected_id" --format '{{{{.ID}}}} {{{{.Names}}}}'
+  bounded sudo docker ps -a --no-trunc --filter "id=$expected_id" --format '{{{{.ID}}}} {{{{.Names}}}}'
 }}
 verify_record() {{
   local record="$1" phase="$2" id status running pid image command restart policy
@@ -3097,7 +3135,7 @@ verify_record() {{
   command=${{fields[5]}}
   restart=${{fields[6]}}
   policy=${{fields[7]}}
-  test "$id" = "$expected_id" || fail "$phase-container-replaced"
+  test "$id" = "$expected_id" || fail "$phase-container-replaced" unknown
   test "$image" = {shlex.quote(json.dumps(inference_image))} || fail "$phase-image-changed"
   test "$command" = {shlex.quote(expected_command)} || fail "$phase-command-changed"
   test "$restart" = 0 || fail "$phase-container-restarted"
@@ -3107,70 +3145,70 @@ verify_record() {{
 first=""
 if first=$(inspect_name 2>/dev/null); then
   first_id=${{first%%$'\n'*}}
-  if test -n "$expected_id" && test "$first_id" != "$expected_id"; then
-    fail initial-container-replaced
-  fi
-  expected_id="$first_id"
+  test "$first_id" = "$expected_id" || fail initial-container-replaced unknown
+  container_state=retained
 else
   listing=$(inventory_name) || fail initial-container-inventory
   test -z "$listing" || fail initial-container-inspect
-  test -z "$expected_id" || {{ id_listing=$(inventory_id) || fail initial-id-inventory; test -z "$id_listing" || fail initial-name-rebound; }}
+  id_listing=$(inventory_id) || fail initial-id-inventory
+  test -z "$id_listing" || fail initial-name-rebound unknown
+  container_state=absent
 fi
 tracked=""
-initial_state=absent
 if test -n "$first"; then
-  initial_state=present
   state=$(verify_record "$first" initial)
   status=$(sed -n '1p' <<<"$state")
   running=$(sed -n '2p' <<<"$state")
   pid=$(sed -n '3p' <<<"$state")
   case "$status:$running" in
-    running:true|created:false|exited:false|dead:false) ;;
+    running:true|created:false|exited:false|dead:false|removing:false) ;;
     *) fail initial-state-invalid ;;
   esac
-  top=$(sudo docker top "$expected_id" -eo pid= 2>/dev/null) || {{
+  top=$(bounded sudo docker top "$expected_id" -eo pid= 2>/dev/null) || {{
     test "$status" != running || fail initial-top-failed
     top=""
   }}
   for process in $top; do
     [[ "$process" =~ ^[0-9]+$ ]] || fail initial-pid-invalid
     test "$(printf '%s\n' "$top" | grep -cx "$process")" = 1 || fail initial-pid-duplicate
-    stat=$(sudo cat "/proc/$process/stat" 2>/dev/null) || continue
+    stat=$(bounded sudo cat "/proc/$process/stat" 2>/dev/null) || continue
     start=${{stat##*) }}
     start=$(awk '{{print $20}}' <<<"$start")
     [[ "$start" =~ ^[0-9]+$ ]] || fail initial-starttime-invalid
     tracked+="$process:$start "
   done
   if test "$status" = running; then
-    sudo docker kill "$expected_id" >/dev/null || {{
+    bounded sudo docker kill "$expected_id" >/dev/null || {{
       check=$(inspect_name 2>/dev/null) || fail kill-failed
       check_state=$(verify_record "$check" kill)
       test "$(sed -n '2p' <<<"$check_state")" = false || fail kill-failed
     }}
   fi
-  deadline=$((SECONDS + settle_timeout))
+  current="$first"
+  remove_ready=0
   while :; do
-    boot_now=$(sudo cat /proc/sys/kernel/random/boot_id) || fail settle-host-boot-read
+    boot_now=$(bounded sudo cat /proc/sys/kernel/random/boot_id) || fail settle-host-boot-read
     test "$boot_now" = "$expected_boot" || fail settle-host-boot-changed
     listing=$(inventory_name) || fail settle-name-inventory
     id_listing=$(inventory_id) || fail settle-id-inventory
     if test -n "$listing"; then
-      test "$listing" = "$expected_id $name" || fail settle-container-replaced
+      test "$listing" = "$expected_id $name" || fail settle-container-replaced unknown
     fi
     if test -n "$id_listing"; then
-      test "$id_listing" = "$expected_id $name" || fail settle-id-rebound
+      test "$id_listing" = "$expected_id $name" || fail settle-id-rebound unknown
     fi
     current=$(inspect_name 2>/dev/null) || current=""
     if test -z "$current"; then
       test -z "$listing" || fail settle-container-inspect
       test -z "$id_listing" || fail settle-id-inspect
+      container_state=absent
       break
     fi
     current_state=$(verify_record "$current" settle)
     status=$(sed -n '1p' <<<"$current_state")
     running=$(sed -n '2p' <<<"$current_state")
     case "$status:$running" in
-      exited:false|dead:false) ;;
+      exited:false|dead:false|removing:false) ;;
       running:true|created:false) ;;
       *) fail settle-state-invalid ;;
     esac
@@ -3178,35 +3216,38 @@ if test -n "$first"; then
     for item in $tracked; do
       process=${{item%%:*}}
       start=${{item#*:}}
-      stat=$(sudo cat "/proc/$process/stat" 2>/dev/null) || continue
+      stat=$(bounded sudo cat "/proc/$process/stat" 2>/dev/null) || continue
       current_start=${{stat##*) }}
       current_start=$(awk '{{print $20}}' <<<"$current_start")
       if test "$current_start" = "$start"; then live=1; fi
     done
-    if test "$running" = false && test "$live" = 0; then break; fi
-    test "$SECONDS" -lt "$deadline" || fail container-settle-timeout
-    sleep "$poll_seconds"
+    if test "$status" != removing && test "$running" = false && test "$live" = 0; then
+      remove_ready=1
+      break
+    fi
+    bounded_sleep || fail container-settle-timeout
   done
-  if test -n "$current"; then
-    sudo docker rm "$expected_id" >/dev/null || fail container-remove-failed
+  if test "$remove_ready" = 1; then
+    container_state=unknown
+    bounded sudo docker rm "$expected_id" >/dev/null || fail container-remove-failed
+    container_state=removed_cleanup_incomplete
   fi
 fi
-boot_now=$(sudo cat /proc/sys/kernel/random/boot_id) || fail final-host-boot-read
+boot_now=$(bounded sudo cat /proc/sys/kernel/random/boot_id) || fail final-host-boot-read
 test "$boot_now" = "$expected_boot" || fail final-host-boot-changed
 listing=$(inventory_name) || fail final-name-inventory
-test -z "$listing" || fail final-name-present
-if test -n "$expected_id"; then
-  id_listing=$(inventory_id) || fail final-id-inventory
-  test -z "$id_listing" || fail final-id-present
-fi
-listeners=$(sudo ss -H -ltnp) || fail final-listener-probe
+test -z "$listing" || fail final-name-present unknown
+id_listing=$(inventory_id) || fail final-id-inventory
+test -z "$id_listing" || fail final-id-present unknown
+listeners=$(bounded sudo ss -H -ltnp) || fail final-listener-probe
 test -z "$(awk '$4 ~ /(^|:)(8000|8100)$/ {{print}}' <<<"$listeners")" || fail final-listener-present
-gpu_processes=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits) || fail final-gpu-probe
+gpu_processes=$(bounded nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits) || fail final-gpu-probe
 for item in $tracked; do
   process=${{item%%:*}}
   test "$(printf '%s\n' "$gpu_processes" | grep -cx "$process")" = 0 || fail final-gpu-process-present
 done
-printf '%s\n' "$(test "$initial_state" = absent && echo absent || echo removed)"
+test "$container_state" = removed_cleanup_incomplete && container_state=removed
+printf '%s\n' "$container_state"
 """
 
 
@@ -4368,6 +4409,7 @@ def diagnose_glm52_policy_parity(name: str, keep_engine: bool = False) -> dict[s
     listener_identity: dict[str, object] | None = None
     api_listener_identity: dict[str, object] | None = None
     bootstrap_identity: dict[str, object] | None = None
+    launch_identity: dict[str, str] | None = None
     cleanup_warnings: list[str] = []
     operation_error: BaseException | None = None
     result: dict[str, object] | None = None
@@ -4567,8 +4609,20 @@ printf '%s\n' "$state"
             f"bash {shlex.quote(remote_repo + '/scripts/h200/start_inference.sh')} "
             f"{shlex.quote(glm_parity_inference_config)}"
         )
-        engine_launch_attempted = True
-        _sensitive_ssh(host, start_command, "isolated parity engine start", sensitive, 180)
+        start_code, start_output = _ssh(host, start_command, timeout=180)
+        try:
+            launch_identity = _h200_parity_launch_identity(start_output)
+            engine_launch_attempted = True
+        except Refused:
+            if start_code == 0:
+                raise
+        if start_code:
+            raise RuntimeError(
+                "isolated parity engine start failed: "
+                + _redact_sensitive(start_output.strip(), sensitive)
+            )
+        if launch_identity is None:
+            raise RuntimeError("isolated parity engine start returned no identity")
         startup_grace = _configured_h200_engine_startup_grace()
         _h200_parity_container_preflight(host, h200_trace_directory)
         fifo_read = _parity_bootstrap_receive_command(
@@ -4595,8 +4649,10 @@ printf '%s\n' "$state"
         if (
             api_listener_identity["container_id"] != listener_identity["container_id"]
             or api_listener_identity["host_boot_id"] != listener_identity["host_boot_id"]
+            or listener_identity["container_id"] != launch_identity["container_id"]
+            or listener_identity["host_boot_id"] != launch_identity["host_boot_id"]
         ):
-            raise Refused("H200 parity router and API listeners differ")
+            raise Refused("H200 parity launch, router, and API identities differ")
         expected_api_process_id = api_listener_identity["listener_namespace_pid"]
         capture_command = (
             "sudo docker run --rm -i --network host -v /data:/data "
@@ -4748,6 +4804,7 @@ printf '%s\n' "$state"
             "listener_identity": listener_identity,
             "api_listener_identity": api_listener_identity,
             "bootstrap_identity": bootstrap_identity,
+            "launch_identity": launch_identity,
             "diagnostic_plan": plan,
             "engine_kept": keep_engine,
             "engine_cleanup": "retained" if keep_engine else "pending",
@@ -4764,17 +4821,10 @@ printf '%s\n' "$state"
         if engine_launch_attempted and (not keep_engine or not succeeded):
             try:
                 settle_timeout, poll_seconds = _configured_h200_parity_cleanup()
-                expected_id = None
-                expected_boot = None
-                if listener_identity is not None:
-                    container_id_value = listener_identity.get("container_id")
-                    host_boot_value = listener_identity.get("host_boot_id")
-                    if not isinstance(container_id_value, str) or not isinstance(
-                        host_boot_value, str
-                    ):
-                        raise Refused("H200 parity listener cleanup identity is invalid")
-                    expected_id = container_id_value
-                    expected_boot = host_boot_value
+                if launch_identity is None:
+                    raise Refused("H200 parity launch cleanup identity is missing")
+                expected_id = launch_identity["container_id"]
+                expected_boot = launch_identity["host_boot_id"]
                 container_cleanup = _h200_parity_container_cleanup_command(
                     expected_id,
                     expected_boot,
@@ -4784,14 +4834,24 @@ printf '%s\n' "$state"
                 container_code, container_output = _ssh(
                     host,
                     container_cleanup,
-                    timeout=settle_timeout + 60,
+                    timeout=settle_timeout + 15,
                 )
                 cleaned = container_output.strip()
-                if container_code or cleaned not in {"removed", "absent"}:
+                if container_code:
+                    state_match = re.search(
+                        r"^parity-cleanup-state:"
+                        r"(retained|removed|absent|removed_cleanup_incomplete|unknown)$",
+                        cleaned,
+                        re.MULTILINE,
+                    )
+                    engine_cleanup = state_match.group(1) if state_match else "unknown"
                     raise RuntimeError(
                         _redact_sensitive(cleaned, sensitive)
                         or f"cleanup command returned {container_code}"
                     )
+                if cleaned not in {"removed", "absent"}:
+                    engine_cleanup = "unknown"
+                    raise RuntimeError("cleanup command returned an invalid state")
                 engine_cleanup = cleaned
             except BaseException as error:
                 cleanup_failures.append(
@@ -4804,7 +4864,7 @@ printf '%s\n' "$state"
             result["container_work"] = (
                 container_work_directory if engine_cleanup == "retained" else None
             )
-        retain_container_work = engine_cleanup == "retained"
+        retain_container_work = engine_cleanup in {"retained", "unknown"}
         cleanup = _parity_temporary_cleanup_command(
             bootstrap_fifo=bootstrap_fifo,
             transaction_path=transaction_path,
@@ -4820,6 +4880,12 @@ printf '%s\n' "$state"
         if cleanup_code:
             cleanup_failures.append(
                 "temporary parity artifact cleanup failed: " + _redact_sensitive(cleanup_output.strip(), sensitive)
+            )
+        if result is not None:
+            result["container_work"] = (
+                None
+                if cleanup_code == 0 and not retain_container_work
+                else container_work_directory
             )
         if not committed and (operation_error is not None or cleanup_failures):
             state_code, _state_output = _ssh(host, f"test -f {shlex.quote(transaction_path)}", timeout=60)

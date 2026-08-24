@@ -127,6 +127,24 @@ class H200ParityLauncherTest(unittest.TestCase):
             launch,
         )
 
+    def test_launcher_records_and_validates_exact_container_identity(self):
+        source = START.read_text()
+        launch = source.index("container_id=$(docker run -d")
+        identity = source.index("parity-engine-identity:")
+        self.assertLess(launch, identity)
+        self.assertIn('[[ ! "$container_id" =~ ^[0-9a-f]{64}$ ]]', source)
+        self.assertIn("/proc/sys/kernel/random/boot_id", source)
+        self.assertIn("{{.Id}}", source)
+        self.assertIn("{{.Name}}", source)
+        self.assertIn("{{.Config.Image}}", source)
+        self.assertIn("{{json .Config.Cmd}}", source)
+        self.assertIn("{{.RestartCount}}", source)
+        self.assertIn("{{.HostConfig.RestartPolicy.Name}}", source)
+        self.assertIn("trap cleanup_unreported_container EXIT", source)
+        self.assertIn('docker rm -f "$container_id"', source)
+        self.assertLess(identity, source.index("mapfile -t identity", launch))
+        self.assertLess(identity, source.index("trap - EXIT", identity))
+
     def test_parity_handlers_use_bounded_stream_reader(self):
         server = (ROOT / "source/src/prime_rl/inference/vllm/server.py").read_text()
         bootstrap_ready = server.split(

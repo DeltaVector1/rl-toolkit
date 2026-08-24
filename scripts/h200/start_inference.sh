@@ -110,7 +110,7 @@ done
 # draft layer pads 8 query heads to 64. At 32,768 tokens its BF16 query has a
 # 2,415,919,104-byte stride, which exceeds FlashMLA's int32 limit and
 # terminates every tensor-parallel worker.
-docker run -d --name "$engine_container" --restart "$restart_policy" \
+container_id=$(docker run -d --name "$engine_container" --restart "$restart_policy" \
   --log-opt max-size=512m --log-opt max-file=3 \
   --gpus all \
   --network host \
@@ -144,4 +144,44 @@ docker run -d --name "$engine_container" --restart "$restart_policy" \
   --entrypoint /app/.venv/bin/inference \
   "$image" \
   @ "$inference_config" \
-  --vllm-extra "$vllm_extra"
+  --vllm-extra "$vllm_extra")
+if [[ ! "$container_id" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "refusing invalid isolated container ID" >&2
+  exit 1
+fi
+cleanup_unreported_container() {
+  status=$?
+  trap - EXIT
+  if ! docker rm -f "$container_id" >/dev/null 2>&1; then
+    echo "failed to remove unreported isolated container: $container_id" >&2
+    exit 1
+  fi
+  exit "$status"
+}
+trap cleanup_unreported_container EXIT
+host_boot_id=$(cat /proc/sys/kernel/random/boot_id)
+if [[ ! "$host_boot_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+  echo "refusing invalid host boot ID" >&2
+  exit 1
+fi
+printf 'parity-engine-identity:%s:%s\n' "$container_id" "$host_boot_id"
+expected_command=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:],separators=(",",":")))' \
+  @ "$inference_config" --vllm-extra "$vllm_extra")
+mapfile -t identity < <(docker inspect "$container_id" --format \
+  '{{.Id}}
+{{.Name}}
+{{.Config.Image}}
+{{json .Config.Cmd}}
+{{.RestartCount}}
+{{.HostConfig.RestartPolicy.Name}}')
+if [[ "${#identity[@]}" -ne 6 || \
+      "${identity[0]}" != "$container_id" || \
+      "${identity[1]}" != "/$engine_container" || \
+      "${identity[2]}" != "$image" || \
+      "${identity[3]}" != "$expected_command" || \
+      "${identity[4]}" != "0" || \
+      "${identity[5]}" != "$restart_policy" ]]; then
+  echo "refusing isolated container identity mismatch" >&2
+  exit 1
+fi
+trap - EXIT

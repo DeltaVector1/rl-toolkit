@@ -90,7 +90,10 @@ class H200ParityTest(unittest.TestCase):
                 return 0, ""
             if "parity-cleanup-error:" in command:
                 if fail_container_cleanup:
-                    return 1, "parity-cleanup-error:container-settle-timeout\n"
+                    return 1, (
+                        "parity-cleanup-state:retained\n"
+                        "parity-cleanup-error:container-settle-timeout\n"
+                    )
                 return 0, "removed\n"
             if command.startswith("test -f ") and command.endswith("transaction.json"):
                 return (0, "") if transaction["state"] is not None else (1, "")
@@ -98,8 +101,15 @@ class H200ParityTest(unittest.TestCase):
                 return 0, "absent\n"
             if "docker ps -a" in command and "glm52-optims-h200" in command:
                 return 0, f"{main_status}\n"
-            if "start_inference.sh" in command and fail_start:
-                return 1, "start rejected"
+            if "start_inference.sh" in command and "prime_deployment=" in command:
+                identity = (
+                    "parity-engine-identity:"
+                    + "d" * 64
+                    + ":11111111-2222-3333-4444-555555555555\n"
+                )
+                if fail_start:
+                    return 1, "start rejected\n" + identity
+                return 0, identity
             if "capture-h200" in command and fail_capture:
                 return 1, f"capture rejected {secret}"
             if (
@@ -286,6 +296,12 @@ container_id={container_id}
 replacement_id={replacement_id}
 container_name={training_ops.glm_inference_container}
 sudo() {{ "$@"; }}
+timeout() {{
+  test "$1" = --foreground || return 95
+  shift
+  shift
+  "$@"
+}}
 cat() {{
   if test "$1" = /proc/sys/kernel/random/boot_id; then echo {boot_id}; return; fi
   if test "$1" = /proc/321/stat; then
@@ -311,6 +327,7 @@ docker() {{
       running=true
       pid=321
       if test "$current" != running; then status=exited; running=false; pid=0; fi
+      if test "$current" = removing; then status=removing; fi
       printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
         "$id" "$status" "$running" "$pid" \
         {shlex.quote(json.dumps(training_ops.inference_image))} \
@@ -327,7 +344,12 @@ docker() {{
       echo 321
       ;;
     kill)
-      echo settling >"$state_file"
+      if test "$scenario" = slow-kill; then SECONDS=$((SECONDS+20)); fi
+      if test "$scenario" = removing; then
+        echo removing >"$state_file"
+      else
+        echo settling >"$state_file"
+      fi
       ;;
     rm)
       test "$1" = "$container_id" || return 91
@@ -337,14 +359,15 @@ docker() {{
     *) return 93 ;;
   esac
 }}
-ss() {{ echo ss >>"$calls_file"; }}
+ss() {{ echo ss >>"$calls_file"; test "$scenario" != final-ss-fail; }}
 nvidia-smi() {{ echo nvidia-smi >>"$calls_file"; }}
 sleep() {{
   case "$scenario" in
-    transient) echo ready >"$state_file" ;;
     persistent) SECONDS=$((SECONDS+20)) ;;
     replacement) echo replacement >"$state_file" ;;
     restart) echo restarted >"$state_file" ;;
+    removing) echo absent >"$state_file" ;;
+    *) echo ready >"$state_file" ;;
   esac
 }}
 """
@@ -1485,13 +1508,13 @@ sleep() {{
         )
         result = self._run_operation(ssh_call, secret_call, secret)
         self.assertEqual(ssh_call.transaction["state"]["phase"], "committed")
-        self.assertEqual(result["engine_cleanup"], "retained")
-        self.assertTrue(result["engine_kept"])
         self.assertEqual(
             result["container_work"],
             "/data/glm52-rl/qualifications/glm52-policy-parity/"
             ".diagnostic-work-1111111111111111",
         )
+        self.assertEqual(result["engine_cleanup"], "retained")
+        self.assertTrue(result["engine_kept"])
         self.assertTrue(
             any(
                 "container-settle-timeout" in warning
@@ -1530,6 +1553,28 @@ sleep() {{
         self.assertIn("container-settle-timeout", completed.stderr)
         self.assertNotIn("docker-rm", calls)
 
+    def test_container_cleanup_waits_for_removing_state_without_second_rm(self):
+        completed, calls = self._run_container_cleanup("removing")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "absent")
+        self.assertNotIn("docker-rm", calls)
+
+    def test_container_cleanup_slow_kill_cannot_pass_absolute_deadline(self):
+        completed, calls = self._run_container_cleanup("slow-kill")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("parity-cleanup-state:retained", completed.stderr)
+        self.assertIn("kill-failed", completed.stderr)
+        self.assertNotIn("docker-rm", calls)
+
+    def test_container_cleanup_reports_removed_but_incomplete_final_checks(self):
+        completed, calls = self._run_container_cleanup("final-ss-fail")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn(
+            "parity-cleanup-state:removed_cleanup_incomplete", completed.stderr
+        )
+        self.assertIn("final-listener-probe", completed.stderr)
+        self.assertEqual(calls.count("docker-rm-ready"), 1)
+
     def test_container_cleanup_refuses_replacement_and_restart(self):
         for scenario, detail in (
             ("replacement", "settle-container-replaced"),
@@ -1556,6 +1601,32 @@ sleep() {{
                 training_ops, "limits", {"h200_parity_cleanup": values}
             ), self.assertRaisesRegex(training_ops.Refused, "limits are invalid"):
                 training_ops._configured_h200_parity_cleanup()
+
+    def test_launch_identity_requires_one_full_id_and_boot_id(self):
+        marker = (
+            "preflight output\nparity-engine-identity:"
+            + "d" * 64
+            + ":11111111-2222-3333-4444-555555555555\n"
+        )
+        self.assertEqual(
+            training_ops._h200_parity_launch_identity(marker),
+            {
+                "container_id": "d" * 64,
+                "host_boot_id": "11111111-2222-3333-4444-555555555555",
+            },
+        )
+        for invalid in ("", marker + marker, "parity-engine-identity:short:bad\n"):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                training_ops.Refused, "missing or duplicated"
+            ):
+                training_ops._h200_parity_launch_identity(invalid)
+        with self.assertRaisesRegex(training_ops.Refused, "container ID is invalid"):
+            training_ops._h200_parity_container_cleanup_command(
+                None,
+                "11111111-2222-3333-4444-555555555555",
+                120,
+                2,
+            )
 
     def test_container_write_inventory_refuses_unprepared_path(self):
         paths = training_ops._parity_container_write_paths("1" * 16)
@@ -1978,6 +2049,11 @@ sleep() {{
             any("artifact cleanup failed" in warning for warning in result["cleanup_warnings"])
         )
         self.assertEqual(ssh_call.transaction["state"]["phase"], "committed")
+        self.assertEqual(
+            result["container_work"],
+            "/data/glm52-rl/qualifications/glm52-policy-parity/"
+            ".diagnostic-work-1111111111111111",
+        )
         self.assertFalse(
             any(
                 ".fixture-failed-1111111111111111" in command
