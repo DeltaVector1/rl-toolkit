@@ -257,8 +257,8 @@ class H200ParityTest(unittest.TestCase):
         def remote(host, command, label, timeout=120, connect_timeout=None):
             nonlocal active, maximum_active
             del command, label
-            self.assertEqual(timeout, 90)
-            self.assertEqual(connect_timeout, 60)
+            self.assertEqual(timeout, 60)
+            self.assertEqual(connect_timeout, 45)
             with lock:
                 queried.append(host)
                 active += 1
@@ -299,8 +299,8 @@ class H200ParityTest(unittest.TestCase):
 
         def remote(host, command, label, timeout=120, connect_timeout=None):
             del command, label
-            self.assertEqual(timeout, 90)
-            self.assertEqual(connect_timeout, 60)
+            self.assertEqual(timeout, 60)
+            self.assertEqual(connect_timeout, 45)
             queried.append(host)
             if host == "n76":
                 raise RuntimeError("banner exchange timed out")
@@ -338,8 +338,8 @@ class H200ParityTest(unittest.TestCase):
                     host, command, label, timeout=120, connect_timeout=None
                 ):
                     del command, label
-                    self.assertEqual(timeout, 90)
-                    self.assertEqual(connect_timeout, 60)
+                    self.assertEqual(timeout, 60)
+                    self.assertEqual(connect_timeout, 45)
                     return self._source_evidence(host, pp_by_host[host], session)
 
                 with patch.object(training_ops, "trainer_hosts", hosts), patch.object(
@@ -361,8 +361,8 @@ class H200ParityTest(unittest.TestCase):
 
         def remote(host, command, label, timeout=120, connect_timeout=None):
             del command, label
-            self.assertEqual(timeout, 90)
-            self.assertEqual(connect_timeout, 60)
+            self.assertEqual(timeout, 60)
+            self.assertEqual(connect_timeout, 45)
             return self._source_evidence(host, pp_by_host[host], session)
 
         with patch.object(training_ops, "trainer_hosts", hosts), patch.object(
@@ -379,19 +379,19 @@ class H200ParityTest(unittest.TestCase):
             training_ops.subprocess, "run", return_value=completed
         ) as run:
             result = training_ops._ssh(
-                "n76", "true", timeout=90, connect_timeout=60
+                "n76", "true", timeout=60, connect_timeout=45
             )
 
         expected = list(training_ops.ssh_command)
         option = expected.index("ConnectTimeout=25")
-        expected[option] = "ConnectTimeout=60"
+        expected[option] = "ConnectTimeout=45"
         self.assertEqual(result, (0, "ready\n"))
         self.assertEqual(run.call_args.args[0], expected + ["n76", "true"])
-        self.assertEqual(run.call_args.kwargs["timeout"], 90)
+        self.assertEqual(run.call_args.kwargs["timeout"], 60)
         self.assertIs(run.call_args.kwargs["stdin"], subprocess.DEVNULL)
         self.assertEqual(
             [value for value in run.call_args.args[0] if value.startswith("ConnectTimeout=")],
-            ["ConnectTimeout=60"],
+            ["ConnectTimeout=45"],
         )
 
     def test_provenance_ssh_adds_no_multiplexing_cleanup_state(self):
@@ -401,7 +401,7 @@ class H200ParityTest(unittest.TestCase):
         with patch.object(
             training_ops.subprocess, "run", return_value=completed
         ) as run:
-            training_ops._ssh("n76", "true", connect_timeout=60)
+            training_ops._ssh("n76", "true", connect_timeout=45)
 
         arguments = run.call_args.args[0]
         self.assertNotIn("-M", arguments)
@@ -418,15 +418,15 @@ class H200ParityTest(unittest.TestCase):
         with patch.object(
             training_ops.subprocess,
             "run",
-            side_effect=subprocess.TimeoutExpired(cmd="ssh", timeout=90),
+            side_effect=subprocess.TimeoutExpired(cmd="ssh", timeout=60),
         ) as run:
             result = training_ops._ssh(
-                "n76", "true", timeout=90, connect_timeout=60
+                "n76", "true", timeout=60, connect_timeout=45
             )
 
         self.assertEqual(result, (124, "TIMEOUT"))
-        self.assertEqual(run.call_args.kwargs["timeout"], 90)
-        self.assertIn("ConnectTimeout=60", run.call_args.args[0])
+        self.assertEqual(run.call_args.kwargs["timeout"], 60)
+        self.assertIn("ConnectTimeout=45", run.call_args.args[0])
         run.assert_called_once()
 
     def test_provenance_ssh_refuses_invalid_connect_timeout(self):

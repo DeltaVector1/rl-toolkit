@@ -3284,8 +3284,8 @@ def _resolve_glm52_parity_diagnostic_source(
             host,
             command,
             "trainer parity provenance",
-            timeout=90,
-            connect_timeout=60,
+            timeout=60,
+            connect_timeout=45,
         )
         try:
             value = json.loads(output.strip().splitlines()[-1])
