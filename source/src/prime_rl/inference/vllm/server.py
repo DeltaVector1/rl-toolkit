@@ -33,10 +33,12 @@ from prime_rl.parity_router_trace import (
     TraceSession,
     assemble_chunks,
     clear_trace,
+    consume_single_use_bootstrap_token,
     consume_single_use_diagnostic_token,
     diagnostic_capture_preflight,
     encoded_array,
     read_h200_runtime_marker,
+    read_one_use_bootstrap_fifo,
     read_diagnostic_manifest,
     read_session,
     trace_root,
@@ -78,9 +80,11 @@ router = APIRouter()
 lora_load_lock = asyncio.Lock()
 parity_diagnostic_tokens: dict[str, str] = {}
 parity_diagnostic_expiry: dict[str, float] = {}
-parity_diagnostic_bootstrap_env = "PRIME_PARITY_BOOTSTRAP_TOKEN"
+parity_diagnostic_bootstrap_fifo_env = "PRIME_PARITY_BOOTSTRAP_FIFO"
 parity_qualification_root_env = "PRIME_PARITY_QUALIFICATION_ROOT"
 parity_diagnostic_token_seconds = 300.0
+parity_diagnostic_bootstrap_token: str | None = None
+parity_diagnostic_bootstrap_lock = asyncio.Lock()
 
 
 def engine_client(request: Request) -> EngineClient:
@@ -114,9 +118,22 @@ def isolated_parity_trace_root() -> Path:
 
 
 def bootstrap_authorized(request: Request) -> bool:
-    expected = os.environ.get(parity_diagnostic_bootstrap_env)
     authorization = request.headers.get("authorization", "")
-    return diagnostic_authorization_valid(authorization, expected)
+    return diagnostic_authorization_valid(
+        authorization, parity_diagnostic_bootstrap_token
+    )
+
+
+def read_parity_bootstrap_fifo() -> str:
+    path_value = os.environ.get(parity_diagnostic_bootstrap_fifo_env)
+    try:
+        return read_one_use_bootstrap_fifo(
+            Path(path_value or ""),
+            Path("/run/prime-parity-bootstrap"),
+            os.geteuid(),
+        )
+    except (OSError, ValueError) as error:
+        raise RuntimeError(str(error)) from error
 
 
 async def bounded_request_body(request: Request, limit: int) -> bytes:
@@ -211,42 +228,53 @@ async def liveness(raw_request: Request):
 
 @router.post("/parity/router-trace/reset")
 async def reset_parity_router_trace(request: Request):
+    global parity_diagnostic_bootstrap_token
     if os.environ.get("PRIME_PARITY_ENGINE") != "1":
         raise HTTPException(status_code=404, detail="parity engine is not enabled")
-    if not bootstrap_authorized(request):
-        raise HTTPException(status_code=401, detail="parity bootstrap authorization is required")
-    root = isolated_parity_trace_root()
-    body = await bounded_request_body(request, 64 * 1024)
-    try:
-        data = json.loads(body)
-    except json.JSONDecodeError as error:
-        raise HTTPException(status_code=400, detail="router trace session is not JSON") from error
-    if not isinstance(data, dict):
-        raise HTTPException(status_code=400, detail="router trace session must be an object")
-    try:
-        session = TraceSession.from_dict(data)
-        if session.side != "h200":
-            raise ValueError("H200 router trace session side must be h200")
+    async with parity_diagnostic_bootstrap_lock:
+        if not bootstrap_authorized(request):
+            raise HTTPException(
+                status_code=401,
+                detail="parity bootstrap authorization is required",
+            )
+        root = isolated_parity_trace_root()
+        body = await bounded_request_body(request, 64 * 1024)
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError as error:
+            raise HTTPException(status_code=400, detail="router trace session is not JSON") from error
+        if not isinstance(data, dict):
+            raise HTTPException(status_code=400, detail="router trace session must be an object")
+        try:
+            session = TraceSession.from_dict(data)
+            if session.side != "h200":
+                raise ValueError("H200 router trace session side must be h200")
+            if os.environ.get("PRIME_PARITY_DIAGNOSTICS") == "1":
+                diagnostic_capture_preflight(session, "h200")
+            clear_trace(root)
+            write_session(root, session)
+        except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        response = session.as_dict()
+        identity = trace_session_identity(session)
+        parity_diagnostic_tokens.pop(identity, None)
+        parity_diagnostic_expiry.pop(identity, None)
         if os.environ.get("PRIME_PARITY_DIAGNOSTICS") == "1":
-            diagnostic_capture_preflight(session, "h200")
-        clear_trace(root)
-        write_session(root, session)
-    except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
-    response = session.as_dict()
-    identity = trace_session_identity(session)
-    parity_diagnostic_tokens.pop(identity, None)
-    parity_diagnostic_expiry.pop(identity, None)
-    if os.environ.get("PRIME_PARITY_DIAGNOSTICS") == "1":
-        token = secrets.token_urlsafe(32)
-        parity_diagnostic_tokens[identity] = token
-        parity_diagnostic_expiry[identity] = time.monotonic() + parity_diagnostic_token_seconds
-        response = {
-            "session": response,
-            "diagnostic_token": token,
-            "expires_in": parity_diagnostic_token_seconds,
-        }
-    return response
+            token = secrets.token_urlsafe(32)
+            parity_diagnostic_tokens[identity] = token
+            parity_diagnostic_expiry[identity] = (
+                time.monotonic() + parity_diagnostic_token_seconds
+            )
+            response = {
+                "session": response,
+                "diagnostic_token": token,
+                "expires_in": parity_diagnostic_token_seconds,
+            }
+        parity_diagnostic_bootstrap_token = consume_single_use_bootstrap_token(
+            parity_diagnostic_bootstrap_token,
+            request.headers.get("authorization", ""),
+        )
+        return response
 
 
 @router.get("/parity/router-trace")
@@ -385,6 +413,9 @@ vllm.v1.utils.run_api_server_worker_proc = custom_run_api_server_worker_proc
 # Only difference we do some config translation (i.e. pass populated namespace
 # to `parse_args`) and additional arg validation
 def server(config: InferenceConfig, vllm_extra: dict[str, Any] | None = None):
+    global parity_diagnostic_bootstrap_token
+    if os.environ.get(parity_diagnostic_bootstrap_fifo_env) is not None:
+        parity_diagnostic_bootstrap_token = read_parity_bootstrap_fifo()
     from vllm.entrypoints.cli.serve import run_headless, run_multi_api_server
     from vllm.entrypoints.openai.api_server import run_server
 

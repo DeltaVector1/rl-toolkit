@@ -16,9 +16,10 @@ class H200ParityTest(unittest.TestCase):
         fail_start=False,
         fail_capture=False,
         fail_cleanup=False,
+        interrupt_fifo=False,
         main_status="absent",
     ):
-        secret = "strong-bootstrap-token-for-test-only-0123456789"
+        secret = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_"
         secret_inputs = []
 
         def call(host, command, timeout=120):
@@ -26,6 +27,8 @@ class H200ParityTest(unittest.TestCase):
             commands.append(command)
             if "sha256sum --" in command:
                 return 0, "config-sha\n"
+            if "mkfifo -m 0600" in command:
+                return 0, "fifo-ready\n"
             if "docker ps -a" in command and "glm52-optims-h200-" in command:
                 return 0, "absent\n"
             if "docker ps -a" in command and "glm52-optims-h200" in command:
@@ -34,12 +37,14 @@ class H200ParityTest(unittest.TestCase):
                 return 1, f"start rejected {secret}"
             if "capture-h200" in command and fail_capture:
                 return 1, f"capture rejected {secret}"
-            if command.startswith("rm -f --") and fail_cleanup:
+            if command.startswith("sudo rm -f --") and fail_cleanup:
                 return 1, "cleanup failed"
             return 0, ""
 
         def secret_call(host, command, provided, label, timeout):
             secret_inputs.append(provided)
+            if interrupt_fifo and "FIFO delivery" in label:
+                raise KeyboardInterrupt
             code, output = call(host, command, timeout)
             clean = training_ops._redact_sensitive(output, (provided,))
             if code:
@@ -87,7 +92,7 @@ class H200ParityTest(unittest.TestCase):
         self.assertEqual(result, {"files": 20, "estimated_bytes": 96_485_376})
 
     def test_sensitive_ssh_input_keeps_token_out_of_command_and_redacts_error(self):
-        secret = "strong-bootstrap-token-for-test-only-0123456789"
+        secret = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_"
         completed = subprocess.CompletedProcess(
             args=[], returncode=1, stdout="", stderr=f"remote repeated {secret}"
         )
@@ -122,7 +127,28 @@ class H200ParityTest(unittest.TestCase):
             training_ops.glm_parity_vllm_extra,
         ]
         inspect = "\n".join(
-            [json.dumps(True), json.dumps(training_ops.inference_image), json.dumps(command)]
+            [
+                json.dumps(True),
+                json.dumps(training_ops.inference_image),
+                json.dumps(command),
+                json.dumps(
+                    ["PRIME_PARITY_BOOTSTRAP_FIFO=/run/prime-parity-bootstrap"]
+                ),
+                json.dumps(
+                    [
+                        {
+                            "Type": "bind",
+                            "Source": (
+                                "/data/glm52-rl/qualifications/glm52-policy-parity/"
+                                ".diagnostic-run-1111111111111111/bootstrap.fifo"
+                            ),
+                            "Destination": "/run/prime-parity-bootstrap",
+                            "RW": False,
+                        }
+                    ]
+                ),
+                json.dumps("no"),
+            ]
         )
         config = json.dumps(
             {
@@ -145,11 +171,60 @@ class H200ParityTest(unittest.TestCase):
             training_ops.glm_parity_vllm_extra,
         ]
         inspect = "\n".join(
-            [json.dumps(True), json.dumps(training_ops.inference_image), json.dumps(command)]
+            [
+                json.dumps(True),
+                json.dumps(training_ops.inference_image),
+                json.dumps(command),
+                json.dumps(
+                    ["PRIME_PARITY_BOOTSTRAP_FIFO=/run/prime-parity-bootstrap"]
+                ),
+                json.dumps(
+                    [
+                        {
+                            "Type": "bind",
+                            "Source": (
+                                "/data/glm52-rl/qualifications/glm52-policy-parity/"
+                                ".diagnostic-run-1111111111111111/bootstrap.fifo"
+                            ),
+                            "Destination": "/run/prime-parity-bootstrap",
+                            "RW": False,
+                        }
+                    ]
+                ),
+                json.dumps("no"),
+            ]
         )
         with patch.object(training_ops, "_ssh", return_value=(0, inspect)):
             with self.assertRaises(training_ops.Refused):
                 training_ops._h200_parity_container_preflight("h200a")
+
+    def test_post_launch_inspection_refuses_token_in_container_environment(self):
+        secret = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_"
+        command = [
+            "@",
+            training_ops.glm_parity_inference_config,
+            "--vllm-extra",
+            training_ops.glm_parity_vllm_extra,
+        ]
+        inspect = "\n".join(
+            [
+                json.dumps(True),
+                json.dumps(training_ops.inference_image),
+                json.dumps(command),
+                json.dumps(
+                    [
+                        "PRIME_PARITY_BOOTSTRAP_FIFO=/run/prime-parity-bootstrap",
+                        f"PRIME_PARITY_BOOTSTRAP_TOKEN={secret}",
+                    ]
+                ),
+                json.dumps([]),
+                json.dumps("no"),
+            ]
+        )
+        with patch.object(training_ops, "_ssh", return_value=(0, inspect)):
+            with self.assertRaisesRegex(training_ops.Refused, "metadata contains") as caught:
+                training_ops._h200_parity_container_preflight("h200a")
+        self.assertNotIn(secret, str(caught.exception))
 
     def test_diagnostic_operation_redacts_token_and_cleans_up_after_failure(self):
         commands = []
@@ -183,7 +258,28 @@ class H200ParityTest(unittest.TestCase):
             if "start_inference.sh" in command and "prime_deployment=" in command
         )
         self.assertIn("prime_require_absent=1", start)
+        self.assertIn("prime_parity_bootstrap_fifo=", start)
         self.assertTrue(any("capture-h200" in command for command in commands))
+        self.assertFalse(
+            any("PRIME_PARITY_BOOTSTRAP_TOKEN" in command for command in commands)
+        )
+        capture = next(command for command in commands if "capture-h200" in command)
+        self.assertIn("docker run --rm -i", capture)
+        self.assertNotIn(" -e ", capture)
+        fifo_setup = next(command for command in commands if "mkfifo -m 0600" in command)
+        self.assertIn("chown 1000:1000", fifo_setup)
+        self.assertIn("1000:1000:600", fifo_setup)
+        fifo_delivery = next(
+            command for command in commands if "timeout --foreground" in command
+        )
+        self.assertIn("timeout --foreground 7200", fifo_delivery)
+        self.assertNotIn("timeout --foreground 180", fifo_delivery)
+        fifo_cleanup = next(
+            command
+            for command in commands
+            if "sudo rmdir --" in command and "bootstrap.fifo" in command
+        )
+        self.assertIn("sudo rmdir --", fifo_cleanup)
         self.assertFalse(any("training.env" in command for command in commands))
         self.assertFalse(
             any(
@@ -222,6 +318,25 @@ class H200ParityTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "artifact cleanup failed"):
             self._run_operation(ssh_call, secret_call, secret)
+
+    def test_diagnostic_operation_cleans_fifo_and_container_on_interrupt(self):
+        commands = []
+        secret, ssh_call, secret_call, _ = self._operation_ssh(
+            commands, interrupt_fifo=True
+        )
+        with self.assertRaises(KeyboardInterrupt):
+            self._run_operation(ssh_call, secret_call, secret, keep_engine=True)
+        self.assertTrue(
+            any('sudo docker rm -f "$name"' in command for command in commands)
+        )
+        self.assertTrue(
+            any(
+                "sudo rm -f --" in command
+                and "bootstrap.fifo" in command
+                and "sudo rmdir --" in command
+                for command in commands
+            )
+        )
 
 
 if __name__ == "__main__":

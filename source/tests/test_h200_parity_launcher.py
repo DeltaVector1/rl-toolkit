@@ -63,6 +63,22 @@ class H200ParityLauncherTest(unittest.TestCase):
         self.assertIn("prime_require_absent", source)
         self.assertIn("refusing to replace an existing isolated container", source)
 
+    def test_launcher_mounts_only_the_non_secret_bootstrap_fifo_path(self):
+        source = START.read_text()
+        self.assertNotIn("PRIME_PARITY_BOOTSTRAP_TOKEN", source)
+        self.assertIn("prime_parity_bootstrap_fifo", source)
+        self.assertIn("! -p \"$bootstrap_fifo\"", source)
+        self.assertIn("1000:1000:600", source)
+        self.assertIn(
+            "source=$bootstrap_fifo,target=/run/prime-parity-bootstrap,readonly",
+            source,
+        )
+        self.assertIn(
+            "PRIME_PARITY_BOOTSTRAP_FIFO=/run/prime-parity-bootstrap",
+            source,
+        )
+        self.assertIn('restart_policy=no', source)
+
     def test_parity_handlers_use_bounded_stream_reader(self):
         server = (ROOT / "source/src/prime_rl/inference/vllm/server.py").read_text()
         reset = server.split('@router.post("/parity/router-trace/reset")', 1)[1].split(
@@ -75,6 +91,14 @@ class H200ParityLauncherTest(unittest.TestCase):
         self.assertNotIn("request.json()", diagnostic)
         self.assertIn("bounded_request_body(request, 64 * 1024)", reset)
         self.assertIn("bounded_request_body(request, 16 * 1024 * 1024)", diagnostic)
+        self.assertGreater(
+            reset.index("consume_single_use_bootstrap_token"),
+            reset.index("write_session(root, session)"),
+        )
+        self.assertIn(
+            "parity_diagnostic_bootstrap_token = consume_single_use_bootstrap_token(",
+            reset,
+        )
 
 
 if __name__ == "__main__":

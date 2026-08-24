@@ -508,6 +508,23 @@ def request_json(
     return result
 
 
+def read_secret_stdin(label: str, minimum: int, maximum: int) -> str:
+    if minimum < 1 or maximum < minimum:
+        raise ValueError("secret input limits are invalid")
+    value = sys.stdin.buffer.readline(maximum + 2)
+    if len(value) > maximum + 1 or not value.endswith(b"\n"):
+        raise ValueError(f"{label} input is too long or incomplete")
+    if sys.stdin.buffer.read(1):
+        raise ValueError(f"{label} input contains extra data")
+    token = value[:-1].decode("ascii")
+    if not minimum <= len(token) <= maximum or any(
+        character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+        for character in token
+    ):
+        raise ValueError(f"{label} input is invalid")
+    return token
+
+
 diagnostic_file_limit = 16 * 1024 * 1024
 
 
@@ -659,7 +676,7 @@ def capture_h200(
     adapter_sha256: str,
     image: str,
     api_key_env: str | None,
-    bootstrap_token_env: str,
+    bootstrap_token: str,
     diagnostic_input: Path | None,
     timeout: float,
 ) -> dict[str, Any]:
@@ -669,9 +686,8 @@ def capture_h200(
     api_key = os.environ.get(api_key_env) if api_key_env else None
     if api_key_env and api_key is None:
         raise ValueError(f"environment variable {api_key_env} is not set")
-    bootstrap_token = os.environ.get(bootstrap_token_env)
-    if not bootstrap_token:
-        raise ValueError(f"environment variable {bootstrap_token_env} is not set")
+    if len(bootstrap_token) != 64:
+        raise ValueError("bootstrap token must have 384-bit encoded capacity")
     cards = request_json(
         f"{base}/v1/models", body=None, api_key=api_key, timeout=min(timeout, 120)
     ).get("data", [])
@@ -1641,7 +1657,6 @@ def parser() -> argparse.ArgumentParser:
     h200.add_argument("--adapter-sha256", required=True)
     h200.add_argument("--image", required=True)
     h200.add_argument("--api-key-env")
-    h200.add_argument("--bootstrap-token-env", default="PRIME_PARITY_BOOTSTRAP_TOKEN")
     h200.add_argument("--diagnostic-input", type=Path)
     h200.add_argument("--timeout", type=float, default=1800.0)
     h200.add_argument("output", type=Path)
@@ -1650,7 +1665,6 @@ def parser() -> argparse.ArgumentParser:
     diagnostic.add_argument("--session", type=Path, required=True)
     diagnostic.add_argument("--base-url", required=True)
     diagnostic.add_argument("--layer", type=int, required=True)
-    diagnostic.add_argument("--diagnostic-token", required=True)
     diagnostic.add_argument("--timeout", type=float, default=300.0)
     trainer = commands.add_parser("capture-trainer")
     trainer.add_argument("--fixture", type=Path, required=True)
@@ -1719,7 +1733,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.adapter_sha256,
                 args.image,
                 args.api_key_env,
-                args.bootstrap_token_env,
+                read_secret_stdin("bootstrap token", 64, 64),
                 args.diagnostic_input,
                 args.timeout,
             )
@@ -1729,7 +1743,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.session,
                 args.base_url,
                 args.layer,
-                args.diagnostic_token,
+                read_secret_stdin("diagnostic token", 32, 256),
                 args.timeout,
             )
         elif args.command == "capture-trainer":

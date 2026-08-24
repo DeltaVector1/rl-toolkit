@@ -32,6 +32,10 @@ if [[ "$require_absent" != "0" && "$require_absent" != "1" ]]; then
   echo "refusing invalid existing-container policy" >&2
   exit 2
 fi
+restart_policy=unless-stopped
+if [[ "$require_absent" == "1" ]]; then
+  restart_policy=no
+fi
 overlay_root="$deployment/cache/vllm/flashmla512-selected-v4"
 overlay_preflight="$deployment/scripts/h200/flashmla_overlay_preflight.py"
 if [[ ! -f "$overlay_preflight" ]]; then
@@ -46,9 +50,21 @@ if [[ "$vllm_extra" != "$expected_vllm_extra" ]]; then
   echo "refusing non-parity vllm-extra: $vllm_extra" >&2
   exit 2
 fi
-bootstrap_token=${PRIME_PARITY_BOOTSTRAP_TOKEN:-}
-if [[ -z "$bootstrap_token" || ! "$bootstrap_token" =~ ^[A-Za-z0-9._~-]{32,256}$ ]]; then
-  echo "refusing parity engine without a valid bootstrap token" >&2
+bootstrap_fifo=${prime_parity_bootstrap_fifo:-}
+qualification_root=/data/glm52-rl/qualifications/glm52-policy-parity
+if [[ ! "$bootstrap_fifo" =~ ^$qualification_root/\.diagnostic-run-[0-9a-f]{16}/bootstrap\.fifo$ ]]; then
+  echo "refusing parity engine without an exact bootstrap FIFO" >&2
+  exit 2
+fi
+fifo_parent=$(dirname "$bootstrap_fifo")
+if [[ -L "$fifo_parent" || "$(realpath -e "$fifo_parent")" != "$fifo_parent" || \
+      -L "$bootstrap_fifo" || ! -p "$bootstrap_fifo" ]]; then
+  echo "refusing invalid parity bootstrap FIFO" >&2
+  exit 2
+fi
+fifo_identity=$(stat -c '%u:%g:%a' "$bootstrap_fifo")
+if [[ "$fifo_identity" != "1000:1000:600" ]]; then
+  echo "refusing parity bootstrap FIFO owner or mode: $fifo_identity" >&2
   exit 2
 fi
 install -d -o 1000 -g 1000 -m 0755 /data/glm52-rl/lora-cache
@@ -78,7 +94,7 @@ done
 # draft layer pads 8 query heads to 64. At 32,768 tokens its BF16 query has a
 # 2,415,919,104-byte stride, which exceeds FlashMLA's int32 limit and
 # terminates every tensor-parallel worker.
-docker run -d --name "$engine_container" --restart unless-stopped \
+docker run -d --name "$engine_container" --restart "$restart_policy" \
   --log-opt max-size=512m --log-opt max-file=3 \
   --gpus all \
   --network host \
@@ -94,6 +110,7 @@ docker run -d --name "$engine_container" --restart unless-stopped \
   --mount "type=bind,source=$overlay_root/vllm/v1/worker/gpu_model_runner.py,target=/app/.venv/lib/python3.12/site-packages/vllm/v1/worker/gpu_model_runner.py,readonly" \
   --mount "type=bind,source=$overlay_root/vllm/v1/core/sched/output.py,target=/app/.venv/lib/python3.12/site-packages/vllm/v1/core/sched/output.py,readonly" \
   --mount "type=bind,source=$overlay_root/vllm/v1/core/sched/scheduler.py,target=/app/.venv/lib/python3.12/site-packages/vllm/v1/core/sched/scheduler.py,readonly" \
+  --mount "type=bind,source=$bootstrap_fifo,target=/run/prime-parity-bootstrap,readonly" \
   -v "$deployment/source/src/prime_rl/inference/vllm/worker/filesystem.py":/app/src/prime_rl/inference/vllm/worker/filesystem.py:ro \
   -v "$deployment/source/src/prime_rl/inference/vllm/server.py":/app/src/prime_rl/inference/vllm/server.py:ro \
   -v "$deployment/source/src/prime_rl/parity_router_trace.py":/app/src/prime_rl/parity_router_trace.py:ro \
@@ -106,7 +123,7 @@ docker run -d --name "$engine_container" --restart unless-stopped \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False \
   -e VLLM_ENGINE_READY_TIMEOUT_S=7200 \
   -e PRIME_ADAPTER_PORTS="$adapter_ports" \
-  -e PRIME_PARITY_BOOTSTRAP_TOKEN="$bootstrap_token" \
+  -e PRIME_PARITY_BOOTSTRAP_FIFO=/run/prime-parity-bootstrap \
   --entrypoint /app/.venv/bin/inference \
   "$image" \
   @ "$inference_config" \

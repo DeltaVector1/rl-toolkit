@@ -2362,19 +2362,24 @@ def _h200_parity_container_preflight(host: str) -> dict[str, object]:
     _check_host(host)
     inspect_command = (
         f"sudo docker inspect {shlex.quote(glm_inference_container)} "
-        "--format '{{json .State.Running}}\\n{{json .Config.Image}}\\n{{json .Config.Cmd}}'"
+        "--format '{{json .State.Running}}\\n{{json .Config.Image}}\\n"
+        "{{json .Config.Cmd}}\\n{{json .Config.Env}}\\n{{json .Mounts}}\\n"
+        "{{json .HostConfig.RestartPolicy.Name}}'"
     )
     rc, output = _ssh(host, inspect_command, timeout=45)
     if rc:
         raise Refused(f"cannot inspect {glm_inference_container} on {host}: {output.strip()}")
     # Docker's Go template emits literal backslash-n separators on this host.
     lines = output.replace("\\n", "\n").splitlines()
-    if len(lines) != 3:
+    if len(lines) != 6:
         raise Refused("H200 parity container inspection returned an invalid record")
     try:
         running = json.loads(lines[0])
         image = json.loads(lines[1])
         command = json.loads(lines[2])
+        environment = json.loads(lines[3])
+        mounts = json.loads(lines[4])
+        restart_policy = json.loads(lines[5])
     except json.JSONDecodeError as error:
         raise Refused(f"H200 parity container inspection is not valid JSON: {error}") from error
     expected_command = ["@", glm_parity_inference_config, "--vllm-extra", glm_parity_vllm_extra]
@@ -2384,6 +2389,37 @@ def _h200_parity_container_preflight(host: str) -> dict[str, object]:
         raise Refused(f"H200 parity image is {image!r}, expected {inference_image!r}")
     if command != expected_command:
         raise Refused(f"H200 parity command is {command!r}, expected {expected_command!r}")
+    if restart_policy != "no":
+        raise Refused("H200 parity container restart policy is not isolated")
+    if not isinstance(environment, list) or any(
+        not isinstance(value, str) for value in environment
+    ):
+        raise Refused("H200 parity container environment is invalid")
+    if any(value.startswith("PRIME_PARITY_BOOTSTRAP_TOKEN=") for value in environment):
+        raise Refused("H200 parity container metadata contains a bootstrap token")
+    if environment.count(
+        "PRIME_PARITY_BOOTSTRAP_FIFO=/run/prime-parity-bootstrap"
+    ) != 1:
+        raise Refused("H200 parity container has no exact bootstrap FIFO path")
+    bootstrap_mounts = [
+        mount
+        for mount in mounts
+        if isinstance(mount, dict)
+        and mount.get("Destination") == "/run/prime-parity-bootstrap"
+    ] if isinstance(mounts, list) else []
+    if len(bootstrap_mounts) != 1:
+        raise Refused("H200 parity container has no exact bootstrap FIFO mount")
+    bootstrap_mount = bootstrap_mounts[0]
+    if (
+        bootstrap_mount.get("Type") != "bind"
+        or bootstrap_mount.get("RW") is not False
+        or not re.fullmatch(
+            r"/data/glm52-rl/qualifications/glm52-policy-parity/"
+            r"\.diagnostic-run-[0-9a-f]{16}/bootstrap\.fifo",
+            str(bootstrap_mount.get("Source", "")),
+        )
+    ):
+        raise Refused("H200 parity bootstrap FIFO mount is invalid")
 
     config_command = (
         "python3 -c 'import json,sys,tomllib; "
@@ -2410,7 +2446,13 @@ def _h200_parity_container_preflight(host: str) -> dict[str, object]:
     }
     if config != expected_config:
         raise Refused(f"H200 parity config is {config!r}, expected {expected_config!r}")
-    result = {"host": host, "image": image, "command": command, "config": config}
+    result = {
+        "host": host,
+        "image": image,
+        "command": command,
+        "config": config,
+        "bootstrap_fifo": "/run/prime-parity-bootstrap",
+    }
     print("H200 parity container preflight passed: " + json.dumps(result, sort_keys=True))
     return result
 
@@ -2665,6 +2707,8 @@ def diagnose_glm52_policy_parity(name: str, keep_engine: bool = False) -> dict[s
     bootstrap_token = secrets.token_urlsafe(48)
     nonce = secrets.token_hex(8)
     sensitive = (bootstrap_token,)
+    run_directory = f"{root}/.diagnostic-run-{nonce}"
+    bootstrap_fifo = f"{run_directory}/bootstrap.fifo"
     remote_input = f"{root}/.diagnostic-input-{nonce}.npz"
     temporary_capture = f"{root}/.h200-capture-{nonce}"
     engine_launch_attempted = False
@@ -2708,30 +2752,56 @@ def diagnose_glm52_policy_parity(name: str, keep_engine: bool = False) -> dict[s
         elif status != "absent":
             raise Refused(f"isolated parity container status is {status!r}, expected absent or exited")
 
+        fifo_setup = f"""
+set -euo pipefail
+root={shlex.quote(root)}
+run_directory={shlex.quote(run_directory)}
+fifo={shlex.quote(bootstrap_fifo)}
+test ! -e "$run_directory"
+test ! -L "$root"
+test "$(realpath -e "$root")" = "$root"
+sudo install -d -o 0 -g 0 -m 0700 "$run_directory"
+sudo mkfifo -m 0600 "$fifo"
+sudo chown 1000:1000 "$fifo"
+test ! -L "$fifo"
+test -p "$fifo"
+test "$(stat -c '%u:%g:%a' "$fifo")" = "1000:1000:600"
+echo fifo-ready
+"""
+        fifo_state = _sensitive_ssh(
+            host, fifo_setup, "parity bootstrap FIFO setup", sensitive, 60
+        ).strip()
+        if fifo_state != "fifo-ready":
+            raise RuntimeError("parity bootstrap FIFO setup returned an invalid state")
+
         _copy_parity_diagnostic_input(source_host, source_input, host, remote_input)
 
         start_command = (
-            "IFS= read -r PRIME_PARITY_BOOTSTRAP_TOKEN; "
-            "export PRIME_PARITY_BOOTSTRAP_TOKEN; "
             "env "
             f"prime_deployment={shlex.quote(remote_repo)} "
             f"prime_image={shlex.quote(inference_image)} "
             f"prime_model_volume={shlex.quote(glm_model_volume)} "
             f"prime_inference_container={shlex.quote(glm_inference_container)} "
+            f"prime_parity_bootstrap_fifo={shlex.quote(bootstrap_fifo)} "
             "prime_require_absent=1 "
             f"bash {shlex.quote(remote_repo + '/scripts/h200/start_inference.sh')} "
             f"{shlex.quote(glm_parity_inference_config)}"
         )
         engine_launch_attempted = True
+        _sensitive_ssh(
+            host, start_command, "isolated parity engine start", sensitive, 180
+        )
+        startup_grace = _configured_h200_engine_startup_grace()
+        fifo_write = (
+            f"sudo timeout --foreground {startup_grace} "
+            f"sh -c 'cat > \"$1\"' sh {shlex.quote(bootstrap_fifo)} && "
+            f"sudo rm -f -- {shlex.quote(bootstrap_fifo)} && "
+            f"test ! -e {shlex.quote(bootstrap_fifo)}"
+        )
         _sensitive_ssh_input(
-            host,
-            start_command,
-            bootstrap_token,
-            "isolated parity engine start",
-            180,
+            host, fifo_write, bootstrap_token, "parity bootstrap FIFO delivery", startup_grace + 30
         )
         _h200_parity_container_preflight(host)
-        startup_grace = _configured_h200_engine_startup_grace()
         ready_command = (
             f"deadline=$((SECONDS+{startup_grace})); "
             "until curl -fsS --max-time 5 http://127.0.0.1:8000/liveness >/dev/null; do "
@@ -2739,10 +2809,8 @@ def diagnose_glm52_policy_parity(name: str, keep_engine: bool = False) -> dict[s
         )
         _sensitive_ssh(host, ready_command, "isolated parity engine readiness", sensitive, startup_grace + 30)
         capture_command = (
-            "IFS= read -r PRIME_PARITY_BOOTSTRAP_TOKEN; "
-            "sudo docker run --rm --network host -v /data:/data "
+            "sudo docker run --rm -i --network host -v /data:/data "
             f"-v {shlex.quote(remote_repo)}:/workspace:ro -w /workspace "
-            '-e PRIME_PARITY_BOOTSTRAP_TOKEN="$PRIME_PARITY_BOOTSTRAP_TOKEN" '
             f"--entrypoint /app/.venv/bin/python {shlex.quote(inference_image)} "
             f"scripts/glm52_policy_parity.py --profile {shlex.quote(production_parity_profile)} "
             f"capture-h200 --fixture {shlex.quote(fixture)} "
@@ -2795,19 +2863,6 @@ trap - EXIT
         raise
     finally:
         cleanup_failures = []
-        cleanup = (
-            f"rm -f -- {shlex.quote(remote_input)}; "
-            f"if test -d {shlex.quote(temporary_capture)}; then "
-            f"rm -rf -- {shlex.quote(temporary_capture)}; fi; "
-            f"test ! -e {shlex.quote(remote_input)}; "
-            f"test ! -e {shlex.quote(temporary_capture)}"
-        )
-        cleanup_code, cleanup_output = _ssh(host, cleanup, timeout=120)
-        if cleanup_code:
-            cleanup_failures.append(
-                "temporary parity artifact cleanup failed: "
-                + _redact_sensitive(cleanup_output.strip(), sensitive)
-            )
         if engine_launch_attempted and (not keep_engine or not succeeded):
             container_cleanup = f"""
 set -euo pipefail
@@ -2829,6 +2884,24 @@ test -z "$(sudo docker ps -a --filter "name=^/${{name}}$" --format '{{{{.Names}}
                     "isolated parity container cleanup failed: "
                     + _redact_sensitive(container_output.strip(), sensitive)
                 )
+        cleanup = (
+            f"sudo rm -f -- {shlex.quote(bootstrap_fifo)}; "
+            f"if test -d {shlex.quote(run_directory)}; then "
+            f"sudo rmdir -- {shlex.quote(run_directory)}; fi; "
+            f"rm -f -- {shlex.quote(remote_input)}; "
+            f"if test -d {shlex.quote(temporary_capture)}; then "
+            f"rm -rf -- {shlex.quote(temporary_capture)}; fi; "
+            f"test ! -e {shlex.quote(bootstrap_fifo)}; "
+            f"test ! -e {shlex.quote(run_directory)}; "
+            f"test ! -e {shlex.quote(remote_input)}; "
+            f"test ! -e {shlex.quote(temporary_capture)}"
+        )
+        cleanup_code, cleanup_output = _ssh(host, cleanup, timeout=120)
+        if cleanup_code:
+            cleanup_failures.append(
+                "temporary parity artifact cleanup failed: "
+                + _redact_sensitive(cleanup_output.strip(), sensitive)
+            )
         bootstrap_token = ""
         sensitive = ()
         if cleanup_failures:
@@ -2844,24 +2917,14 @@ def _repair_engine(host: str) -> str:
     if host not in inference_hosts:
         raise Refused(f"{host} is not an engine host. Use one of {inference_hosts}.")
     muse_engine = _profile()["kind"] == "muse"
-    engine_container = muse_inference_container if muse_engine else glm_inference_container
-    engine_model = muse_model if muse_engine else glm_model
-    start_script = (
-        f"{remote_repo}/scripts/h200/start_muse_inference.sh"
-        if muse_engine
-        else f"{remote_repo}/scripts/h200/start_inference.sh"
-    )
-    inference_config = "" if muse_engine else glm_parity_inference_config
-    start_args = "" if muse_engine else shlex.quote(inference_config)
-    startup_grace = (
-        600 if muse_engine else _configured_h200_engine_startup_grace()
-    )
     if not muse_engine:
-        _diagnostic_capture_preflight(
-            repo_root / "configs/qualification/glm52-policy-parity-h200.toml",
-            "h200",
+        raise Refused(
+            "start the isolated GLM parity engine with diagnose-glm52-parity and a trace run name"
         )
-        _prepare_glm_parity_capture_directory()
+    engine_container = muse_inference_container
+    engine_model = muse_model
+    start_script = f"{remote_repo}/scripts/h200/start_muse_inference.sh"
+    startup_grace = 600
     print(
         f"{host}: removing and restarting {engine_container}. The model load needs 5 to 10 minutes."
     )
@@ -2878,39 +2941,25 @@ def _repair_engine(host: str) -> str:
         f"prime_image={shlex.quote(inference_image)} "
         f"prime_model_volume={shlex.quote(glm_model_volume)} "
         f"prime_inference_container={shlex.quote(engine_container)} "
-        f"bash {start_script} {start_args} >/root/start_inference.log 2>&1 </dev/null & "
+        f"bash {start_script} >/root/start_inference.log 2>&1 </dev/null & "
         "sleep 3; echo issued",
         timeout=180,
     )
     if rc:
         raise RuntimeError(f"inference restart failed on {host}: {out.strip()}")
-    if not muse_engine:
-        _h200_parity_container_preflight(host)
-    if muse_engine:
-        settings = _inference_config(host, "muse")
-        watchdogs = []
-        for replica, port in enumerate(settings["ports"]):
-            watchdogs.append(
-                f"nohup setsid env STARTUP_GRACE={startup_grace} MODEL={engine_model} "
-                f"MUSE_GPU_COUNT={settings['gpu_count']} "
-                f"MUSE_TP_SIZE={settings['tensor_parallel_size']} "
-                f"PORT={port} MUSE_REPLICA_INDEX={replica} START={start_script} "
-                f"ENGINE_CONTAINER={engine_container}-{replica} "
-                f"bash {remote_repo}/scripts/h200/engine_watchdog.sh "
-                f">> /root/engine_watchdog-{replica}.log 2>&1 </dev/null &"
-            )
-        watchdog_code, watchdog_output = _ssh(
-            host, " ".join(watchdogs) + " disown"
-        )
-    else:
-        watchdog_code, watchdog_output = _ssh(
-            host,
+    settings = _inference_config(host, "muse")
+    watchdogs = []
+    for replica, port in enumerate(settings["ports"]):
+        watchdogs.append(
             f"nohup setsid env STARTUP_GRACE={startup_grace} MODEL={engine_model} "
-            f"START={start_script} INFERENCE_CONFIG={shlex.quote(inference_config)} "
-            f"ENGINE_CONTAINER={engine_container} "
+            f"MUSE_GPU_COUNT={settings['gpu_count']} "
+            f"MUSE_TP_SIZE={settings['tensor_parallel_size']} "
+            f"PORT={port} MUSE_REPLICA_INDEX={replica} START={start_script} "
+            f"ENGINE_CONTAINER={engine_container}-{replica} "
             f"bash {remote_repo}/scripts/h200/engine_watchdog.sh "
-            ">> /root/engine_watchdog.log 2>&1 </dev/null & disown",
+            f">> /root/engine_watchdog-{replica}.log 2>&1 </dev/null &"
         )
+    watchdog_code, watchdog_output = _ssh(host, " ".join(watchdogs) + " disown")
     if watchdog_code:
         raise RuntimeError(
             f"watchdog restart failed on {host}: {watchdog_output.strip()}"
@@ -2920,6 +2969,10 @@ def _repair_engine(host: str) -> str:
 
 
 def _repair_supervisors() -> str:
+    if _profile()["kind"] != "muse":
+        raise Refused(
+            "isolated GLM parity engines do not use a reusable engine supervisor"
+        )
     out = []
     for pat, cmd, log in (
         (

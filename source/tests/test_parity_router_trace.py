@@ -1,8 +1,10 @@
 import os
 import json
 import base64
+import io
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -12,6 +14,7 @@ import numpy as np
 from scripts.glm52_policy_parity import (
     Profile,
     capture_h200,
+    read_secret_stdin,
     validate_diagnostic_file,
     validate_diagnostic_source,
 )
@@ -40,6 +43,8 @@ from prime_rl.parity_router_trace import (
     diagnostic_authorization_valid,
     diagnostic_capture_preflight,
     consume_single_use_diagnostic_token,
+    consume_single_use_bootstrap_token,
+    read_one_use_bootstrap_fifo,
     validate_encoded_diagnostic_input,
     validate_diagnostic_content_length,
     validate_isolated_parity_root,
@@ -285,8 +290,75 @@ class ParityRouterTraceTest(unittest.TestCase):
             consume_single_use_diagnostic_token(tokens, expiry, "session", "Bearer secret", 11.0)
         )
 
+    def test_bootstrap_fifo_is_exact_mode_and_removed_after_one_read(self):
+        token = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_"
+        with tempfile.TemporaryDirectory() as temporary:
+            fifo = Path(temporary) / "bootstrap.fifo"
+            os.mkfifo(fifo, 0o600)
+            os.chmod(fifo, 0o600)
+
+            def write():
+                fifo.write_text(token + "\n")
+
+            writer = threading.Thread(target=write)
+            writer.start()
+            observed = read_one_use_bootstrap_fifo(fifo, fifo, os.geteuid())
+            writer.join(timeout=5)
+            self.assertFalse(writer.is_alive())
+            self.assertEqual(observed, token)
+            fifo.unlink()
+            self.assertFalse(fifo.exists())
+
+    def test_bootstrap_fifo_rejects_regular_file_and_wrong_mode(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "bootstrap.fifo"
+            path.write_text("not a fifo\n")
+            with self.assertRaisesRegex(ValueError, "type, mode, or owner"):
+                read_one_use_bootstrap_fifo(path, path, os.geteuid())
+            path.unlink()
+            os.mkfifo(path, 0o644)
+            os.chmod(path, 0o644)
+            with self.assertRaisesRegex(ValueError, "type, mode, or owner"):
+                read_one_use_bootstrap_fifo(path, path, os.geteuid())
+
+    def test_bootstrap_fifo_rejects_insufficient_token_capacity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fifo = Path(temporary) / "bootstrap.fifo"
+            os.mkfifo(fifo, 0o600)
+            os.chmod(fifo, 0o600)
+            writer = threading.Thread(target=lambda: fifo.write_text("a" * 32 + "\n"))
+            writer.start()
+            with self.assertRaisesRegex(ValueError, "below 384 bits"):
+                read_one_use_bootstrap_fifo(fifo, fifo, os.geteuid())
+            writer.join(timeout=5)
+            self.assertFalse(writer.is_alive())
+
+    def test_bootstrap_authorization_cannot_be_replayed(self):
+        token = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_"
+        authorization = f"Bearer {token}"
+        self.assertIsNone(consume_single_use_bootstrap_token(token, authorization))
+        token = None
+        with self.assertRaisesRegex(ValueError, "authorization"):
+            consume_single_use_bootstrap_token(token, authorization)
+
+    def test_secret_stdin_is_bounded_and_has_no_cli_value(self):
+        token = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_"
+        stdin = io.TextIOWrapper(io.BytesIO((token + "\n").encode("ascii")))
+        with patch.object(sys, "stdin", stdin):
+            self.assertEqual(read_secret_stdin("bootstrap token", 64, 64), token)
+        oversized = io.TextIOWrapper(io.BytesIO(("a" * 257 + "\n").encode("ascii")))
+        with patch.object(sys, "stdin", oversized), self.assertRaisesRegex(
+            ValueError, "too long"
+        ):
+            read_secret_stdin("diagnostic token", 32, 256)
+        source = (Path(__file__).resolve().parents[2] / "scripts/glm52_policy_parity.py").read_text()
+        self.assertNotIn("--diagnostic-token", source)
+        self.assertNotIn("--bootstrap-token-env", source)
+
     def test_h200_capture_uses_reset_token_for_direct_replay_without_saving_it(self):
         import scripts.glm52_policy_parity as parity_script
+
+        bootstrap_token = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_"
 
         route_ids = np.asarray(
             [[[0, 0], [1, 2]], [[0, 0], [2, 3]]], dtype=np.uint8
@@ -315,7 +387,7 @@ class ParityRouterTraceTest(unittest.TestCase):
             if url.endswith("/v1/models"):
                 return {"data": [{"id": "model", "max_model_len": 3}]}
             if url.endswith("/parity/router-trace/reset"):
-                self.assertEqual(api_key, "bootstrap-secret")
+                self.assertEqual(api_key, bootstrap_token)
                 active_session.update(body)
                 return {"session": body, "diagnostic_token": "one-use-secret"}
             if url.endswith("/inference/v1/generate"):
@@ -357,11 +429,7 @@ class ParityRouterTraceTest(unittest.TestCase):
                 "advantages": np.asarray([1.0], dtype=np.float32),
             }
             output = root / "output"
-            with patch.dict(
-                os.environ,
-                {"PRIME_PARITY_BOOTSTRAP_TOKEN": "bootstrap-secret"},
-                clear=True,
-            ), patch.object(
+            with patch.object(
                 parity_script, "load_manifest", return_value={"seed": 1}
             ), patch.object(
                 parity_script, "check_fresh"
@@ -396,7 +464,7 @@ class ParityRouterTraceTest(unittest.TestCase):
                     "b" * 64,
                     "image",
                     None,
-                    "PRIME_PARITY_BOOTSTRAP_TOKEN",
+                    bootstrap_token,
                     root / "input.npz",
                     30.0,
                 )

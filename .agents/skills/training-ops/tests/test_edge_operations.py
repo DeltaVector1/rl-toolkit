@@ -23,27 +23,13 @@ class EdgeOperationsTest(unittest.TestCase):
         self.assertEqual(
             training_ops._configured_h200_engine_startup_grace(), 7200
         )
-        calls = []
-
-        def fake_ssh(host, command, timeout=120):
-            del host, timeout
-            calls.append(command)
-            if "pkill -f" in command:
-                return 0, "stopped\n"
-            if "docker rm -f" in command:
-                return 0, "issued\n"
-            return 0, "\n"
-
-        with (
-            patch.object(training_ops, "_profile", return_value={"kind": "glm52"}),
-            patch.object(training_ops, "_prepare_glm_parity_capture_directory"),
-            patch.object(training_ops, "_h200_parity_container_preflight"),
-            patch.object(training_ops, "_ssh", side_effect=fake_ssh),
+        with patch.object(
+            training_ops, "_profile", return_value={"kind": "glm52"}
+        ), patch.object(training_ops, "_ssh") as ssh, self.assertRaisesRegex(
+            training_ops.Refused, "diagnose-glm52-parity"
         ):
             training_ops._repair_engine("h200a")
-        watchdog = next(command for command in calls if "STARTUP_GRACE=" in command)
-        self.assertIn("STARTUP_GRACE=7200", watchdog)
-        self.assertNotIn("STARTUP_GRACE=180", watchdog)
+        ssh.assert_not_called()
 
     def test_h200_startup_grace_rejects_missing_or_invalid_config(self):
         for value in (None, True, 0, -1, "7200"):

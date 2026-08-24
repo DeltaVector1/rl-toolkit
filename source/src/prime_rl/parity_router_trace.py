@@ -284,6 +284,54 @@ def diagnostic_authorization_valid(
     return secrets.compare_digest(authorization[7:], expected_token)
 
 
+def consume_single_use_bootstrap_token(
+    expected_token: str | None,
+    authorization: str | None,
+) -> None:
+    if not diagnostic_authorization_valid(authorization, expected_token):
+        raise ValueError("parity bootstrap authorization is invalid")
+
+
+def read_one_use_bootstrap_fifo(
+    path: Path,
+    expected_path: Path,
+    expected_uid: int,
+) -> str:
+    if path != expected_path:
+        raise ValueError("parity bootstrap FIFO path is invalid")
+    metadata = os.lstat(path)
+    if (
+        not stat.S_ISFIFO(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_uid != expected_uid
+    ):
+        raise ValueError("parity bootstrap FIFO type, mode, or owner is invalid")
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        value = bytearray()
+        while True:
+            chunk = os.read(descriptor, 257 - len(value))
+            if not chunk:
+                break
+            value.extend(chunk)
+            if len(value) > 256:
+                raise ValueError("parity bootstrap token is too long")
+    finally:
+        os.close(descriptor)
+    if not value.endswith(b"\n") or b"\n" in value[:-1]:
+        raise ValueError("parity bootstrap token framing is invalid")
+    token = bytes(value[:-1]).decode("ascii")
+    if len(token) != 64 or any(
+        character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+        for character in token
+    ):
+        raise ValueError("parity bootstrap token capacity is below 384 bits")
+    decoded = base64.urlsafe_b64decode(token.encode("ascii"))
+    if len(decoded) != 48:
+        raise ValueError("parity bootstrap token capacity is below 384 bits")
+    return token
+
+
 def consume_single_use_diagnostic_token(
     tokens: dict[str, str],
     expiry: dict[str, float],
