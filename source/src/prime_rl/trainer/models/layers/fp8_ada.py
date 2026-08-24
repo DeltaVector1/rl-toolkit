@@ -333,6 +333,10 @@ def _native_w8a16_input_grad(grad, weight, scale):
         triton.cdiv(grad.shape[0], block_m),
         triton.cdiv(input_size, 128),
     )
+    stream = torch.cuda.current_stream(grad.device)
+    grad.record_stream(stream)
+    weight.record_stream(stream)
+    scale.record_stream(stream)
     _w8a16_input_grad_kernel[grid](
         grad,
         weight,
