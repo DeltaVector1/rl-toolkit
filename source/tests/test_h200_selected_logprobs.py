@@ -875,6 +875,35 @@ def test_refresh_fixture_rebuilds_stale_fixture_from_current_export(tmp_path):
         ]
 
 
+def test_trainer_session_uses_refreshed_fixture_identity(tmp_path):
+    profile, source_fixture, session_path, export, diagnostic = (
+        _refresh_fixture_inputs(tmp_path)
+    )
+    fixture = tmp_path / "current-fixture"
+    parity.refresh_fixture_from_trainer_export(
+        profile,
+        source_fixture,
+        session_path,
+        export,
+        diagnostic,
+        fixture,
+        tmp_path / "current-diagnostic.npz",
+        7,
+    )
+    manifest = parity.load_manifest(fixture, "glm52_policy_parity_fixture")
+    current_fixture_sha256 = parity.fixture_digest(fixture)
+    assert manifest["source"]["fixture_sha256"] != current_fixture_sha256
+    token_ids = parity.load_array(fixture, manifest, "token_ids").astype(np.int64)
+    token_hash = parity._array_bytes_sha256(token_ids)
+    assert parity.trainer_session_fixture_sha256(
+        fixture, manifest, token_hash
+    ) == current_fixture_sha256
+
+    manifest["source"]["fixture_semantic_sha256"]["token_ids"] = "0" * 64
+    with pytest.raises(ValueError, match="source provenance is invalid"):
+        parity.trainer_session_fixture_sha256(fixture, manifest, token_hash)
+
+
 def test_refresh_fixture_rejects_session_or_semantic_hash_mismatch(tmp_path):
     profile, fixture, session, export, diagnostic = _refresh_fixture_inputs(tmp_path)
     bad_session = json.loads(session.read_text())

@@ -2314,6 +2314,27 @@ def load_trainer_provenance(router_trace: Path) -> dict[str, Any]:
     return {**records[0], "host_records": records}
 
 
+def trainer_session_fixture_sha256(
+    fixture: Path, fixture_manifest: dict[str, Any], expected_token_hash: str
+) -> str:
+    source = fixture_manifest.get("source")
+    if source is not None:
+        semantic_hashes = (
+            source.get("fixture_semantic_sha256")
+            if isinstance(source, dict)
+            else None
+        )
+        if (
+            not isinstance(source, dict)
+            or not isinstance(source.get("fixture_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", source["fixture_sha256"]) is None
+            or not isinstance(semantic_hashes, dict)
+            or semantic_hashes.get("token_ids") != expected_token_hash
+        ):
+            raise ValueError("refreshed fixture trainer source provenance is invalid")
+    return fixture_digest(fixture)
+
+
 def capture_trainer(
     profile: Profile,
     fixture: Path,
@@ -2335,23 +2356,9 @@ def capture_trainer(
     from prime_rl.parity_router_trace import assemble_chunks, read_session
 
     session = read_session(router_trace)
-    source = fixture_manifest.get("source")
-    session_fixture_sha256 = fixture_digest(fixture)
-    if source is not None:
-        semantic_hashes = (
-            source.get("fixture_semantic_sha256")
-            if isinstance(source, dict)
-            else None
-        )
-        if (
-            not isinstance(source, dict)
-            or not isinstance(source.get("fixture_sha256"), str)
-            or re.fullmatch(r"[0-9a-f]{64}", source["fixture_sha256"]) is None
-            or not isinstance(semantic_hashes, dict)
-            or semantic_hashes.get("token_ids") != expected_token_hash
-        ):
-            raise ValueError("refreshed fixture trainer source provenance is invalid")
-        session_fixture_sha256 = source["fixture_sha256"]
+    session_fixture_sha256 = trainer_session_fixture_sha256(
+        fixture, fixture_manifest, expected_token_hash
+    )
     expected = {
         "side": "trainer",
         "fixture_sha256": session_fixture_sha256,
