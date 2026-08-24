@@ -62,7 +62,10 @@ class H200ParityTest(unittest.TestCase):
                                 training_ops.glm_parity_vllm_extra,
                             ],
                         },
-                        "HostConfig": {"RestartPolicy": {"Name": "no"}},
+                        "HostConfig": {
+                            "RestartPolicy": {"Name": "no"},
+                            "Init": True,
+                        },
                         "RestartCount": 0,
                         "State": current_state,
                     }
@@ -462,11 +465,11 @@ docker() {{
       pid=321
       if test "$current" != running; then status=exited; running=false; pid=0; fi
       if test "$current" = removing; then status=removing; fi
-      printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+      printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
         "$id" "$status" "$running" "$pid" \
         {shlex.quote(json.dumps(training_ops.inference_image))} \
         {shlex.quote(json.dumps(["@", training_ops.glm_parity_inference_config, "--vllm-extra", training_ops.glm_parity_vllm_extra], separators=(",", ":")))} \
-        "$restart" '"no"'
+        "$restart" '"no"' true
       ;;
     ps)
       test "$current" != absent || return 0
@@ -1183,6 +1186,7 @@ sleep() {{
                     ]
                 ),
                 json.dumps("no"),
+                json.dumps(True),
             ]
         )
         config = json.dumps(
@@ -1235,6 +1239,7 @@ sleep() {{
                     ]
                 ),
                 json.dumps("no"),
+                json.dumps(True),
             ]
         )
         with patch.object(training_ops, "_ssh", return_value=(0, inspect)):
@@ -1267,6 +1272,7 @@ sleep() {{
                 ),
                 json.dumps([]),
                 json.dumps("no"),
+                json.dumps(True),
             ]
         )
         with patch.object(training_ops, "_ssh", return_value=(0, inspect)):
@@ -1358,7 +1364,7 @@ sleep() {{
         return (
             "sudo() { \"$@\"; }; "
             "_docker_record() { printf '%s\\n' true 101 "
-            f"{container_id} {image} {command} 0 {policy}; }}; "
+            f"{container_id} {image} {command} 0 {policy} true; }}; "
             "_docker_top() { printf '%s\\n' PID 101 202; }; "
             "docker() { if test \"$1\" = inspect; then _docker_record; "
             "elif test \"$1\" = top; then _docker_top; else return 70; fi; }; "
@@ -1474,6 +1480,52 @@ sleep() {{
             )
             self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_listener_identity_polls_at_last_valid_deadline(self):
+        command = training_ops._h200_parity_listener_identity_command(
+            1, "a" * 64, "11111111-2222-3333-4444-555555555555"
+        )
+        container_id = "a" * 64
+        expected_command = json.dumps(
+            [
+                "@",
+                training_ops.glm_parity_inference_config,
+                "--vllm-extra",
+                training_ops.glm_parity_vllm_extra,
+            ],
+            separators=(",", ":"),
+        )
+        common = self._listener_shell_support(container_id, expected_command)
+        with tempfile.TemporaryDirectory() as temporary:
+            marker = shlex.quote(str(Path(temporary) / "listener"))
+            boundary = (
+                "ss() { if test -e "
+                + marker
+                + "; then _ss_record; else :; fi; }; "
+                "sleep() { : > "
+                + marker
+                + "; return 0; }; "
+                "timeout() { return 124; }; "
+            )
+            result = subprocess.run(
+                ["bash", "-c", common + boundary + command],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            marker_path = Path(temporary) / "listener"
+            marker_path.unlink()
+            late = boundary.replace("; return 0; }; timeout()", "; SECONDS=2; return 0; }; timeout()")
+            result = subprocess.run(
+                ["bash", "-c", common + late + command],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 124)
+            self.assertIn("parity-listener-error:listener-timeout", result.stderr)
+
     def test_api_listener_identity_requires_loopback_binding(self):
         port = training_ops.h200_parity_backend_port
         self.assertEqual(
@@ -1547,21 +1599,24 @@ sleep() {{
             + "docker() { if test \"$1\" = inspect; then return 71; else _docker_top; fi; };",
             "container-not-running": healthy
             + "_docker_record() { printf '%s\\n' false 101 "
-            + f"{container_id} {image} {shlex.quote(expected_command)} 0 {policy}; }};",
+            + f"{container_id} {image} {shlex.quote(expected_command)} 0 {policy} true; }};",
             "container-image-mismatch": healthy
             + "_docker_record() { printf '%s\\n' true 101 "
             + f"{container_id} {shlex.quote(json.dumps('wrong-image'))} "
-            + f"{shlex.quote(expected_command)} 0 {policy}; }};",
+            + f"{shlex.quote(expected_command)} 0 {policy} true; }};",
             "container-command-mismatch": healthy
             + "_docker_record() { printf '%s\\n' true 101 "
-            + f"{container_id} {image} {shlex.quote(json.dumps(['wrong']))} 0 {policy}; }};",
+            + f"{container_id} {image} {shlex.quote(json.dumps(['wrong']))} 0 {policy} true; }};",
             "container-restarted": healthy
             + "_docker_record() { printf '%s\\n' true 101 "
-            + f"{container_id} {image} {shlex.quote(expected_command)} 1 {policy}; }};",
+            + f"{container_id} {image} {shlex.quote(expected_command)} 1 {policy} true; }};",
             "container-restart-policy-invalid": healthy
             + "_docker_record() { printf '%s\\n' true 101 "
             + f"{container_id} {image} {shlex.quote(expected_command)} 0 "
-            + f"{shlex.quote(json.dumps('always'))}; }};",
+            + f"{shlex.quote(json.dumps('always'))} true; }};",
+            "container-init-disabled": healthy
+            + "_docker_record() { printf '%s\\n' true 101 "
+            + f"{container_id} {image} {shlex.quote(expected_command)} 0 {policy} false; }};",
             "listener-timeout": healthy + "ss() { :; }; sleep() { :; };",
             "multiple-listeners": healthy
             + "ss() { printf '%s\\n' 'LISTEN pid=202,' 'LISTEN pid=203,'; };",
@@ -1611,14 +1666,14 @@ sleep() {{
                     "docker() { if test \"$1\" = inspect; then "
                     f"if test -e {shlex.quote(str(root / 'inspect'))}; then "
                     "printf '%s\\n' true 101 "
-                    f"{'b' * 64} {image} {expected} 0 {policy}; else "
+                    f"{'b' * 64} {image} {expected} 0 {policy} true; else "
                     f": > {shlex.quote(str(root / 'inspect'))}; _docker_record; fi; "
                     "else _docker_top; fi; };"
                 ),
                 "second-container-restarted": (
                     "docker() { if test \"$1\" = inspect; then "
                     f"if test -e {shlex.quote(str(root / 'restart'))}; then "
-                    f"printf '%s\\n' true 101 {container_id} {image} {expected} 1 {policy}; else "
+                    f"printf '%s\\n' true 101 {container_id} {image} {expected} 1 {policy} true; else "
                     f": > {shlex.quote(str(root / 'restart'))}; _docker_record; fi; "
                     "else _docker_top; fi; };"
                 ),
@@ -2868,6 +2923,7 @@ sleep() {{
                     ]
                 ),
                 json.dumps("no"),
+                json.dumps(True),
             )
         )
         with patch.object(

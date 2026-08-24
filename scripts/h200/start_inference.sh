@@ -222,6 +222,7 @@ cleanup_unreported_container() {
 umask 077
 container_id=$(docker run -d --cidfile "$engine_cidfile" \
   --name "$engine_container" --restart "$restart_policy" \
+  --init \
   --log-opt max-size=512m --log-opt max-file=3 \
   --gpus all \
   --network host \
@@ -282,14 +283,16 @@ mapfile -t identity < <(docker inspect "$container_id" --format \
 {{.Config.Image}}
 {{json .Config.Cmd}}
 {{.RestartCount}}
-{{.HostConfig.RestartPolicy.Name}}')
-if [[ "${#identity[@]}" -ne 6 || \
+{{.HostConfig.RestartPolicy.Name}}
+{{json .HostConfig.Init}}')
+if [[ "${#identity[@]}" -ne 7 || \
       "${identity[0]}" != "$container_id" || \
       "${identity[1]}" != "/$engine_container" || \
       "${identity[2]}" != "$image" || \
       "${identity[3]}" != "$expected_command" || \
       "${identity[4]}" != "0" || \
-      "${identity[5]}" != "$restart_policy" ]]; then
+      "${identity[5]}" != "$restart_policy" || \
+      "${identity[6]}" != "true" ]]; then
   echo "refusing isolated container identity mismatch" >&2
   exit 1
 fi

@@ -2713,14 +2713,14 @@ def _h200_parity_container_preflight(host: str, expected_trace_dir: str) -> dict
         f"sudo docker inspect {shlex.quote(glm_inference_container)} "
         "--format '{{json .State.Running}}\\n{{json .Config.Image}}\\n"
         "{{json .Config.Cmd}}\\n{{json .Config.Env}}\\n{{json .Mounts}}\\n"
-        "{{json .HostConfig.RestartPolicy.Name}}'"
+        "{{json .HostConfig.RestartPolicy.Name}}\\n{{json .HostConfig.Init}}'"
     )
     rc, output = _ssh(host, inspect_command, timeout=45)
     if rc:
         raise Refused(f"cannot inspect {glm_inference_container} on {host}: {output.strip()}")
     # Docker's Go template emits literal backslash-n separators on this host.
     lines = output.replace("\\n", "\n").splitlines()
-    if len(lines) != 6:
+    if len(lines) != 7:
         raise Refused("H200 parity container inspection returned an invalid record")
     try:
         running = json.loads(lines[0])
@@ -2729,6 +2729,7 @@ def _h200_parity_container_preflight(host: str, expected_trace_dir: str) -> dict
         environment = json.loads(lines[3])
         mounts = json.loads(lines[4])
         restart_policy = json.loads(lines[5])
+        init = json.loads(lines[6])
     except json.JSONDecodeError as error:
         raise Refused(f"H200 parity container inspection is not valid JSON: {error}") from error
     expected_command = ["@", glm_parity_inference_config, "--vllm-extra", glm_parity_vllm_extra]
@@ -2740,6 +2741,8 @@ def _h200_parity_container_preflight(host: str, expected_trace_dir: str) -> dict
         raise Refused(f"H200 parity command is {command!r}, expected {expected_command!r}")
     if restart_policy != "no":
         raise Refused("H200 parity container restart policy is not isolated")
+    if init is not True:
+        raise Refused("H200 parity container has no init process")
     if not isinstance(environment, list) or any(
         not isinstance(value, str) for value in environment
     ):
@@ -2901,9 +2904,10 @@ read_container() {{
 {{{{json .Config.Image}}}}
 {{{{json .Config.Cmd}}}}
 {{{{.RestartCount}}}}
-{{{{json .HostConfig.RestartPolicy.Name}}}}') || fail 81 "${{phase}}container-inspect-failed"
+{{{{json .HostConfig.RestartPolicy.Name}}}}
+{{{{json .HostConfig.Init}}}}') || fail 81 "${{phase}}container-inspect-failed"
   mapfile -t record <<<"$inspect" || fail 82 "${{phase}}container-inspect-record-unreadable"
-  test "${{#record[@]}}" = 7 || fail 82 "${{phase}}container-inspect-record-invalid"
+  test "${{#record[@]}}" = 8 || fail 82 "${{phase}}container-inspect-record-invalid"
   running=${{record[0]}}
   container_pid=${{record[1]}}
   container_id=${{record[2]}}
@@ -2911,6 +2915,7 @@ read_container() {{
   command=${{record[4]}}
   restart_count=${{record[5]}}
   restart_policy=${{record[6]}}
+  init=${{record[7]}}
   test "$running" = true || fail 83 "${{phase}}container-not-running"
   [[ "$container_pid" =~ ^[0-9]+$ ]] || fail 84 "${{phase}}container-pid-invalid"
   test "$container_pid" -gt 1 || fail 84 "${{phase}}container-pid-invalid"
@@ -2920,6 +2925,7 @@ read_container() {{
   test "$command" = {shlex.quote(expected_command)} || fail 87 "${{phase}}container-command-mismatch"
   test "$restart_count" = 0 || fail 88 "${{phase}}container-restarted"
   test "$restart_policy" = {shlex.quote(json.dumps('no'))} || fail 89 "${{phase}}container-restart-policy-invalid"
+  test "$init" = true || fail 89 "${{phase}}container-init-disabled"
 }}
 read_listener() {{
   phase=$1
@@ -3056,6 +3062,7 @@ while :; do
   fi
   if read_listener ""; then
     if read_membership "" "$listener_pid" 1; then
+      test "$SECONDS" -le "$deadline" || fail 124 listener-timeout
       break
     else
       listener_status=$?
@@ -3075,8 +3082,16 @@ while :; do
   else
     listener_remaining=$((deadline - SECONDS))
     listener_delay=2
-    test "$listener_delay" -le "$listener_remaining" || listener_delay=$listener_remaining
-    timeout --foreground "$listener_remaining" sleep "$listener_delay" || fail 99 listener-wait-failed
+    if test "$listener_delay" -ge "$listener_remaining"; then
+      if test "$listener_remaining" -gt 1; then
+        listener_delay=$((listener_remaining - 1))
+      else
+        listener_delay=0.1
+      fi
+      sleep "$listener_delay" || fail 99 listener-wait-failed
+    else
+      timeout --foreground "$listener_remaining" sleep "$listener_delay" || fail 99 listener-wait-failed
+    fi
     test "$SECONDS" -le "$deadline" || fail 124 "$wait_detail-timeout"
   fi
 done
@@ -3345,15 +3360,16 @@ cid=${{recovered[0]}}
 boot=${{recovered[1]}}
 test "$(cat /proc/sys/kernel/random/boot_id)" = "$boot"
 record=""
-if record=$(sudo docker inspect "$cid" --format '{{{{.Id}}}}\n{{{{.Name}}}}\n{{{{.Config.Image}}}}\n{{{{json .Config.Cmd}}}}\n{{{{.RestartCount}}}}\n{{{{.HostConfig.RestartPolicy.Name}}}}' 2>/dev/null); then
+if record=$(sudo docker inspect "$cid" --format '{{{{.Id}}}}\n{{{{.Name}}}}\n{{{{.Config.Image}}}}\n{{{{json .Config.Cmd}}}}\n{{{{.RestartCount}}}}\n{{{{.HostConfig.RestartPolicy.Name}}}}\n{{{{json .HostConfig.Init}}}}' 2>/dev/null); then
   mapfile -t fields <<<"$record"
-  test "${{#fields[@]}}" = 6
+  test "${{#fields[@]}}" = 7
   test "${{fields[0]}}" = "$cid"
   test "${{fields[1]}}" = "/$name"
   test "${{fields[2]}}" = {shlex.quote(inference_image)}
   test "${{fields[3]}}" = {shlex.quote(expected_command)}
   test "${{fields[4]}}" = 0
   test "${{fields[5]}}" = no
+  test "${{fields[6]}}" = true
 else
   by_name=$(sudo docker ps -a --no-trunc --filter "name=^/${{name}}$" --format '{{{{.ID}}}} {{{{.Names}}}}')
   by_id=$(sudo docker ps -a --no-trunc --filter "id=$cid" --format '{{{{.ID}}}} {{{{.Names}}}}')
@@ -3443,7 +3459,7 @@ boot=$(bounded sudo cat /proc/sys/kernel/random/boot_id) || fail host-boot-read
 test "$boot" = "$expected_boot" || fail host-boot-changed
 inspect_name_with() {{
   runner=$1
-  "$runner" sudo docker inspect "$name" --format '{{{{.Id}}}}\n{{{{.State.Status}}}}\n{{{{.State.Running}}}}\n{{{{.State.Pid}}}}\n{{{{json .Config.Image}}}}\n{{{{json .Config.Cmd}}}}\n{{{{.RestartCount}}}}\n{{{{json .HostConfig.RestartPolicy.Name}}}}'
+  "$runner" sudo docker inspect "$name" --format '{{{{.Id}}}}\n{{{{.State.Status}}}}\n{{{{.State.Running}}}}\n{{{{.State.Pid}}}}\n{{{{json .Config.Image}}}}\n{{{{json .Config.Cmd}}}}\n{{{{.RestartCount}}}}\n{{{{json .HostConfig.RestartPolicy.Name}}}}\n{{{{json .HostConfig.Init}}}}'
 }}
 inspect_name() {{
   inspect_name_with bounded
@@ -3455,10 +3471,10 @@ inventory_id() {{
   bounded sudo docker ps -a --no-trunc --filter "id=$expected_id" --format '{{{{.ID}}}} {{{{.Names}}}}'
 }}
 verify_record() {{
-  local record="$1" phase="$2" id status running pid image command restart policy
+  local record="$1" phase="$2" id status running pid image command restart policy init
   local -a fields=()
   mapfile -t fields <<<"$record"
-  test "${{#fields[@]}}" = 8 || fail "$phase-record-count"
+  test "${{#fields[@]}}" = 9 || fail "$phase-record-count"
   id=${{fields[0]}}
   status=${{fields[1]}}
   running=${{fields[2]}}
@@ -3467,11 +3483,13 @@ verify_record() {{
   command=${{fields[5]}}
   restart=${{fields[6]}}
   policy=${{fields[7]}}
+  init=${{fields[8]}}
   test "$id" = "$expected_id" || fail "$phase-container-replaced" unknown
   test "$image" = {shlex.quote(json.dumps(inference_image))} || fail "$phase-image-changed"
   test "$command" = {shlex.quote(expected_command)} || fail "$phase-command-changed"
   test "$restart" = 0 || fail "$phase-container-restarted"
   test "$policy" = '"no"' || fail "$phase-restart-policy-changed"
+  test "$init" = true || fail "$phase-init-disabled"
   printf '%s\n%s\n%s\n' "$status" "$running" "$pid"
 }}
 first=""
@@ -4530,6 +4548,7 @@ def inspect_container():
         or config.get("Cmd") != expected_command
         or not isinstance(restart, dict)
         or restart.get("Name") != "no"
+        or host_config.get("Init") is not True
         or value.get("RestartCount") != 0
         or not isinstance(state, dict)
     ):
@@ -6152,15 +6171,17 @@ def cleanup_glm52_policy_parity_engine() -> str:
         host,
         f"sudo docker inspect {shlex.quote(glm_inference_container)} "
         "--format '{{json .Config.Image}}\\n{{json .Config.Cmd}}\\n"
-        "{{json .HostConfig.RestartPolicy.Name}}'",
+        "{{json .HostConfig.RestartPolicy.Name}}\\n{{json .HostConfig.Init}}'",
         "exited parity container inspection",
         (),
         60,
     ).replace("\\n", "\n").splitlines()
-    if len(inspection) != 3:
+    if len(inspection) != 4:
         raise Refused("exited parity container inspection returned an invalid record")
     try:
-        image, command, restart_policy = (json.loads(value) for value in inspection)
+        image, command, restart_policy, init = (
+            json.loads(value) for value in inspection
+        )
     except json.JSONDecodeError as error:
         raise Refused("exited parity container inspection is not valid JSON") from error
     expected_command = [
@@ -6169,7 +6190,12 @@ def cleanup_glm52_policy_parity_engine() -> str:
         "--vllm-extra",
         glm_parity_vllm_extra,
     ]
-    if image != inference_image or command != expected_command or restart_policy != "no":
+    if (
+        image != inference_image
+        or command != expected_command
+        or restart_policy != "no"
+        or init is not True
+    ):
         raise Refused("exited container does not match the isolated parity engine")
     command_output = _remote_ok(
         host,
