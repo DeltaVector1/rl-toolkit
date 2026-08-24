@@ -225,7 +225,12 @@ def test_all_glm52_trainers_keep_q_and_kv_a_in_bf16() -> None:
     assert 'exact_module_patterns(quant.w8a16_modules, label="FP8 W8A16")' in model_source
     assert "W8A16 modules require a native FP8 checkpoint" in model_source
     assert "ignore_patterns=ignore_patterns" in model_source
+    assert "validate_w8a16_patterns=pp_group is None" in model_source
+    assert 'get_mesh("pp").get_group()' in model_source
+    assert "validate_w8a16_matches" in model_source
+    assert "apply_quantization(model, config, parallel_dims)" in model_source
     assert 'rf"(?:^|\\.){re.escape(name)}$"' in fp8_source
+    assert "Pipeline-aware W8A16 validation requires an initialized process group" in fp8_source
 
 
 def test_pipeline_loader_uses_mesh_data_parallel_rank() -> None:

@@ -68,6 +68,7 @@ from prime_rl.trainer.models.layers.checkpointing import (
 from prime_rl.trainer.models.layers.fp8_ada import (
     exact_module_patterns,
     replace_linear as replace_linear_with_fp8_checkpoint,
+    validate_w8a16_matches,
 )
 from prime_rl.trainer.models.layers.fp8_ada import (
     set_diagnose_linear_backward,
@@ -1662,7 +1663,11 @@ def _fp8_w8a16_patterns(quant: FP8Config) -> list[str]:
     return exact_module_patterns(quant.w8a16_modules, label="FP8 W8A16")
 
 
-def apply_quantization(model: nn.Module, config: ModelConfig) -> None:
+def apply_quantization(
+    model: nn.Module,
+    config: ModelConfig,
+    parallel_dims: ParallelDims | None = None,
+) -> None:
     """Swap dense linears and MoE expert GEMMs to the configured low-precision path.
 
     Runs after the LM head is injected but before LoRA / EP / FSDP so the swapped
@@ -1693,12 +1698,21 @@ def apply_quantization(model: nn.Module, config: ModelConfig) -> None:
                         "W8A16 modules require FP8 checkpoint linears to be enabled"
                     )
                 return
-            replace_linear_with_fp8_checkpoint(
+            pp_group = None
+            if parallel_dims is not None and parallel_dims.pp_enabled:
+                pp_group = parallel_dims.get_mesh("pp").get_group()
+            matched_w8a16 = replace_linear_with_fp8_checkpoint(
                 model,
                 embed=config.fp8_embed_head,
                 lm_head=config.fp8_lm_head,
                 ignore_patterns=ignore_patterns,
                 w8a16_patterns=w8a16_patterns,
+                validate_w8a16_patterns=pp_group is None,
+            )
+            validate_w8a16_matches(
+                matched_w8a16,
+                w8a16_patterns,
+                process_group=pp_group,
             )
             return
         if w8a16_patterns:
@@ -1884,7 +1898,7 @@ def setup_model(
 
         apply_pp_boundaries(model, pp_rank, parallel_dims.pp)
 
-    apply_quantization(model, config)
+    apply_quantization(model, config, parallel_dims)
 
     frozen_vision_encoder = configure_trainable_parameters(model, config)
 

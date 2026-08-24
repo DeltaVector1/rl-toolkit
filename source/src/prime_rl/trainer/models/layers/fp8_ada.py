@@ -912,8 +912,64 @@ def _fp8_lm_head_forward(self, hidden_states, labels=None, temperature=None):
     return PrimeLmOutput(logprobs=logprobs.view(b, s), entropy=entropy.view(b, s))
 
 
+def validate_w8a16_matches(
+    matched_pattern_ids: set[int],
+    patterns: tuple[str, ...] | list[str],
+    *,
+    process_group=None,
+) -> None:
+    """Require every configured W8A16 pattern locally or across PP stages."""
+    if not patterns:
+        return
+
+    invalid = set(matched_pattern_ids).difference(range(len(patterns)))
+    if invalid:
+        raise ValueError(f"invalid W8A16 pattern IDs: {sorted(invalid)}")
+
+    if process_group is None:
+        present = set(matched_pattern_ids)
+    else:
+        if not dist.is_available() or not dist.is_initialized():
+            raise RuntimeError(
+                "Pipeline-aware W8A16 validation requires an initialized process group"
+            )
+        backend = str(dist.get_backend(process_group)).lower()
+        device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if backend == "nccl"
+            else torch.device("cpu")
+        )
+        present_mask = torch.zeros(len(patterns), dtype=torch.int32, device=device)
+        if matched_pattern_ids:
+            present_mask[list(matched_pattern_ids)] = 1
+        dist.all_reduce(present_mask, op=dist.ReduceOp.MAX, group=process_group)
+        present = {
+            index
+            for index, value in enumerate(present_mask.detach().cpu().tolist())
+            if value
+        }
+
+    missing = [
+        pattern
+        for index, pattern in enumerate(patterns)
+        if index not in present
+    ]
+    if missing:
+        scope = (
+            "configured W8A16 modules were not installed across pipeline stages"
+            if process_group is not None
+            else "configured W8A16 modules were not installed"
+        )
+        raise ValueError(f"{scope}: {missing}")
+
+
 def replace_linear(
-    model, embed=False, lm_head=False, ignore_patterns=(), w8a16_patterns=()
+    model,
+    embed=False,
+    lm_head=False,
+    ignore_patterns=(),
+    w8a16_patterns=(),
+    validate_w8a16_patterns=True,
 ):
     exclusions = set(model.config.quantization_config["modules_to_not_convert"])
     matched_w8a16 = set()
@@ -942,13 +998,8 @@ def replace_linear(
             FP8CheckpointLinear.from_linear(module, w8a16=bool(matched)),
         )
 
-    if len(matched_w8a16) != len(w8a16_patterns):
-        missing = [
-            pattern
-            for index, pattern in enumerate(w8a16_patterns)
-            if index not in matched_w8a16
-        ]
-        raise ValueError(f"configured W8A16 modules were not installed: {missing}")
+    if validate_w8a16_patterns:
+        validate_w8a16_matches(matched_w8a16, w8a16_patterns)
 
     # Shape-only diagnostics are ambiguous in GLM because many projections
     # share geometry. Persist the model path on every native checkpoint
@@ -965,7 +1016,7 @@ def replace_linear(
             model.model.embed_tokens
         )
     if not lm_head:
-        return
+        return matched_w8a16
     model.lm_head.weight = nn.Parameter(
         torch.empty(
             model.lm_head.out_features,
@@ -984,6 +1035,7 @@ def replace_linear(
         requires_grad=False,
     )
     model.lm_head.forward = _fp8_lm_head_forward.__get__(model.lm_head)
+    return matched_w8a16
 
 
 def _prepare_grouped_mm(x, weight, offsets):

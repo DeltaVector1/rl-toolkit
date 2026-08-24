@@ -6,6 +6,7 @@ import importlib.util
 import gc
 import re
 import sys
+import tempfile
 import types
 import unittest
 import weakref
@@ -13,6 +14,7 @@ from pathlib import Path
 from unittest import mock
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
@@ -989,6 +991,50 @@ class FP8AdaAutogradTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "not installed"):
             fp8_ada.replace_linear(model, w8a16_patterns=patterns)
+
+    def test_replace_linear_can_defer_w8a16_validation_for_pipeline_stages(self):
+        model = nn.Module()
+        model.config = types.SimpleNamespace(
+            quantization_config={"modules_to_not_convert": []}
+        )
+        model.self_attn = nn.Module()
+        model.self_attn.o_proj = nn.Linear(128, 128, bias=False)
+        patterns = fp8_ada.exact_module_patterns(("q_b_proj",))
+
+        matched = fp8_ada.replace_linear(
+            model,
+            w8a16_patterns=patterns,
+            validate_w8a16_patterns=False,
+        )
+
+        self.assertEqual(matched, set())
+        self.assertFalse(model.self_attn.o_proj.w8a16)
+
+    def test_validate_w8a16_matches_uses_the_pipeline_process_group(self):
+        if not dist.is_available() or not dist.is_gloo_available():
+            self.skipTest("torch.distributed is unavailable")
+        if dist.is_initialized():
+            self.skipTest("a process group is already active")
+
+        with tempfile.TemporaryDirectory() as directory:
+            init_file = Path(directory) / "process-group"
+            dist.init_process_group(
+                backend="gloo",
+                init_method=f"file://{init_file}",
+                rank=0,
+                world_size=1,
+            )
+            try:
+                patterns = fp8_ada.exact_module_patterns(("q_b_proj", "o_proj"))
+                with self.assertRaisesRegex(ValueError, "across pipeline stages"):
+                    fp8_ada.validate_w8a16_matches(
+                        {0}, patterns, process_group=dist.group.WORLD
+                    )
+                fp8_ada.validate_w8a16_matches(
+                    {0, 1}, patterns, process_group=dist.group.WORLD
+                )
+            finally:
+                dist.destroy_process_group()
 
     def test_glm_q_and_kv_a_remain_exact_bf16(self):
         model = nn.Module()
