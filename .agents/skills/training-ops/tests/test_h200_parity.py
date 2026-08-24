@@ -265,6 +265,7 @@ class H200ParityTest(unittest.TestCase):
         metadata = json.dumps({"model_revision": "a" * 40, "adapter_sha256": "b" * 64})
         source_root = f"{training_ops.parity_trace_root}/qualification-1"
         listener_ports = []
+        listener_timeouts = []
 
         def write_transaction(_host, _path, state, _sensitive):
             ssh_call.transaction["state"] = copy.deepcopy(state)
@@ -313,6 +314,7 @@ class H200ParityTest(unittest.TestCase):
             _host, _sensitive, _timeout, _container_id, _boot_id, port=8000
         ):
             listener_ports.append(port)
+            listener_timeouts.append(_timeout)
             is_api = port == training_ops.h200_parity_backend_port
             return {
                 "listener_port": port,
@@ -406,6 +408,7 @@ class H200ParityTest(unittest.TestCase):
             result = training_ops.diagnose_glm52_policy_parity("qualification-1", keep_engine=keep_engine)
         self.last_diagnostic_copy = copy_input.call_args
         self.last_listener_ports = listener_ports
+        self.last_listener_timeouts = listener_timeouts
         return result
 
     def _run_container_cleanup(self, scenario):
@@ -1844,12 +1847,13 @@ sleep() {{
         self.assertEqual(
             self.last_listener_ports,
             [
-                8000,
                 training_ops.h200_parity_backend_port,
+                8000,
                 training_ops.h200_parity_backend_port,
                 8000,
             ],
         )
+        self.assertEqual(self.last_listener_timeouts, [30, 30, 30, 30])
         self.assertEqual(result["bootstrap_identity"]["boot_nonce"], "e" * 32)
         self.assertEqual(secret_inputs, [secret])
         self.assertEqual(self.last_diagnostic_copy.args[0], training_ops.trainer_head)

@@ -5726,13 +5726,6 @@ printf '%s\n' "$state"
             raise
         sensitive = (bootstrap_token,)
         listener_stabilization = _configured_h200_parity_listener_stabilization()
-        listener_identity = _h200_parity_listener_identity(
-            host,
-            sensitive,
-            listener_stabilization,
-            launch_identity["container_id"],
-            launch_identity["host_boot_id"],
-        )
         api_listener_identity = _h200_parity_listener_identity(
             host,
             sensitive,
@@ -5740,6 +5733,13 @@ printf '%s\n' "$state"
             launch_identity["container_id"],
             launch_identity["host_boot_id"],
             h200_parity_backend_port,
+        )
+        listener_identity = _h200_parity_listener_identity(
+            host,
+            sensitive,
+            listener_stabilization,
+            launch_identity["container_id"],
+            launch_identity["host_boot_id"],
         )
         if (
             api_listener_identity["container_id"] != listener_identity["container_id"]
