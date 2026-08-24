@@ -8,6 +8,7 @@ import tempfile
 import threading
 import types
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import patch
 
@@ -132,6 +133,122 @@ def fake_torch(state=None):
     return module
 
 
+class CollectiveTensor:
+    def __init__(self, value):
+        self.value = np.asarray(value)
+
+    def to(self, *args, **kwargs):
+        del args, kwargs
+        return self
+
+    def reshape(self, *shape):
+        return CollectiveTensor(self.value.reshape(*shape))
+
+    def cpu(self):
+        return self
+
+    def numpy(self):
+        return self.value
+
+    def numel(self):
+        return self.value.size
+
+    def copy_(self, other):
+        self.value[...] = other.value
+        return self
+
+    def item(self):
+        return self.value.item()
+
+    def __getitem__(self, key):
+        return CollectiveTensor(self.value[key])
+
+
+class FakeBundleCollectives(types.ModuleType):
+    def __init__(
+        self,
+        rank,
+        *,
+        gathered_metadata=None,
+        source_values=None,
+        remote_failure=False,
+    ):
+        super().__init__("torch.distributed")
+        self.rank = rank
+        self.gathered_metadata = gathered_metadata
+        self.source_values = source_values
+        self.remote_failure = remote_failure
+        self.calls = []
+        self.gather_count = 0
+        self.source_broadcast_count = 0
+
+    def is_available(self):
+        return True
+
+    def is_initialized(self):
+        return True
+
+    def get_rank(self):
+        return self.rank
+
+    def get_world_size(self):
+        return 64
+
+    def all_gather_into_tensor(self, output, local):
+        self.gather_count += 1
+        label = "gather-metadata" if self.gather_count == 1 else "gather-errors"
+        self.calls.append(label)
+        if self.gather_count == 1 and self.gathered_metadata is not None:
+            output.value[...] = self.gathered_metadata.reshape(-1)
+        else:
+            output.value[...] = np.tile(local.value, 64)
+
+    def broadcast(self, value, src):
+        if src == 56:
+            self.calls.append("broadcast-source")
+            if self.source_values is not None:
+                value.value[...] = self.source_values[self.source_broadcast_count]
+            self.source_broadcast_count += 1
+            return
+        self.calls.append("broadcast-status")
+        if self.rank != 0 and self.remote_failure:
+            value.value[...] = 1
+
+
+def fake_collective_torch(distributed, *, fail_source_copy=False):
+    module = types.ModuleType("torch")
+    module.distributed = distributed
+    module.Tensor = CollectiveTensor
+    module.dtype = object
+    module.int64 = np.int64
+    module.uint8 = np.uint8
+    module.float32 = np.float32
+    module.int32 = np.int32
+    module.device = lambda *_args, **_kwargs: "cuda:0"
+    module.cuda = types.SimpleNamespace(current_device=lambda: 0)
+
+    def from_numpy(value):
+        array = np.asarray(value)
+        if fail_source_copy and array.dtype != np.uint8:
+            raise RuntimeError("source copy stopped")
+        return CollectiveTensor(array.copy())
+
+    module.from_numpy = from_numpy
+    module.empty = lambda shape, dtype, device: CollectiveTensor(
+        np.empty(shape, dtype=dtype)
+    )
+    module.zeros = lambda shape, dtype, device: CollectiveTensor(
+        np.zeros(shape, dtype=dtype)
+    )
+    module.full = lambda shape, fill, dtype, device: CollectiveTensor(
+        np.full(shape, fill, dtype=dtype)
+    )
+    module.tensor = lambda value, dtype, device: CollectiveTensor(
+        np.asarray(value, dtype=dtype)
+    )
+    return module
+
+
 def session() -> TraceSession:
     return TraceSession(
         side="trainer",
@@ -151,14 +268,13 @@ def session() -> TraceSession:
 
 
 class ParityRouterTraceTest(unittest.TestCase):
-    def _trainer_bundle_values(self):
+    def _trainer_bundle_values(self, expected_tokens=8):
+        token_ids = np.arange(expected_tokens, dtype=np.int64)
         metadata = TraceSession(
             **{
                 **session().__dict__,
-                "token_ids_sha256": parity_trace.sha256_tokens(
-                    np.arange(8, dtype=np.int64)
-                ),
-                "expected_tokens": 8,
+                "token_ids_sha256": parity_trace.sha256_tokens(token_ids),
+                "expected_tokens": expected_tokens,
                 "hidden_layers": 78,
                 "dense_layers": 3,
             }
@@ -197,14 +313,41 @@ class ParityRouterTraceTest(unittest.TestCase):
                     "error": None,
                 }
             )
-        selected = np.arange(4, 8, dtype=np.int64)
+        selected = np.arange(expected_tokens // 2, expected_tokens, dtype=np.int64)
         arrays = {
-            "token_ids": np.arange(8, dtype=np.int64),
-            "positions": np.arange(8, dtype=np.int64),
+            "token_ids": token_ids,
+            "positions": np.arange(expected_tokens, dtype=np.int64),
             "selected_indices": selected,
-            "advantages": np.ones(4, dtype=np.float32),
+            "advantages": np.ones(selected.size, dtype=np.float32),
         }
         return metadata, gathered, arrays
+
+    def _encoded_bundle_metadata(self, gathered):
+        rows = []
+        for record in gathered:
+            payload = parity_trace._canonical_json_bytes(record)
+            encoded = len(payload).to_bytes(4, "little") + payload
+            rows.append(
+                np.frombuffer(
+                    encoded + b"\0" * (16 * 1024 - len(encoded)), dtype=np.uint8
+                )
+            )
+        return np.stack(rows)
+
+    def _bundle_collective_context(self, rank, distributed, torch_module):
+        return (
+            patch.dict(
+                sys.modules,
+                {"torch": torch_module, "torch.distributed": distributed},
+            ),
+            patch.object(parity_trace, "_process_side", "trainer"),
+            patch.object(parity_trace, "_process_rank", rank),
+            patch.object(parity_trace, "_process_pp_rank", rank // 8),
+            patch.object(parity_trace, "_process_cp_rank", rank % 8),
+            patch.object(parity_trace, "_process_world_size", 64),
+            patch.object(parity_trace, "_process_pp_size", 8),
+            patch.object(parity_trace, "_process_cp_size", 8),
+        )
 
     def test_trainer_bundle_validates_pp8_cp8_and_compact_source(self):
         metadata, gathered, arrays = self._trainer_bundle_values()
@@ -311,6 +454,8 @@ class ParityRouterTraceTest(unittest.TestCase):
         self.assertIn("all_gather_into_tensor", source)
         self.assertNotIn("gather_object", source)
         self.assertIn("metadata_limit = 16 * 1024", source)
+        self.assertIn("torch.zeros((32768,)", source)
+        self.assertIn("error_limit = 1024", source)
         self.assertIn("status = torch.tensor", source)
         self.assertLess(
             source.index("dist.broadcast(status"), source.index("if int(status.item())")
@@ -326,7 +471,178 @@ class ParityRouterTraceTest(unittest.TestCase):
 
     def test_trainer_bundle_is_off_without_parity_trace(self):
         with patch.object(parity_trace, "validated_trace_root", return_value=None):
-            parity_trace.publish_trainer_bundle(None)
+            parity_trace.publish_trainer_bundle(None, False)
+
+    def test_trainer_bundle_rank_local_failures_keep_collective_order(self):
+        metadata, _, _ = self._trainer_bundle_values(32768)
+        expected = [
+            "gather-metadata",
+            "gather-errors",
+            "broadcast-source",
+            "broadcast-source",
+            "broadcast-source",
+            "broadcast-source",
+            "broadcast-status",
+        ]
+        canonical_json = parity_trace._canonical_json_bytes
+
+        def fail_first_json():
+            calls = 0
+
+            def encode(value):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise TypeError("json stopped")
+                return canonical_json(value)
+
+            return encode
+
+        cases = (
+            (
+                "root",
+                patch.object(
+                    parity_trace,
+                    "validated_trace_root",
+                    side_effect=ValueError("root stopped"),
+                ),
+                patch.object(parity_trace, "read_session", return_value=metadata),
+                patch.object(
+                    parity_trace, "_canonical_json_bytes", side_effect=canonical_json
+                ),
+            ),
+            (
+                "session",
+                patch.object(parity_trace, "validated_trace_root", return_value=Path("/trace")),
+                patch.object(
+                    parity_trace, "read_session", side_effect=ValueError("session stopped")
+                ),
+                patch.object(
+                    parity_trace, "_canonical_json_bytes", side_effect=canonical_json
+                ),
+            ),
+            (
+                "json",
+                patch.object(parity_trace, "validated_trace_root", return_value=Path("/trace")),
+                patch.object(parity_trace, "read_session", return_value=metadata),
+                patch.object(
+                    parity_trace, "_canonical_json_bytes", side_effect=fail_first_json()
+                ),
+            ),
+        )
+        for name, root_patch, session_patch, json_patch in cases:
+            with self.subTest(name=name):
+                distributed = FakeBundleCollectives(0)
+                torch_module = fake_collective_torch(distributed)
+                with ExitStack() as stack:
+                    for context in self._bundle_collective_context(
+                        0, distributed, torch_module
+                    ):
+                        stack.enter_context(context)
+                    stack.enter_context(root_patch)
+                    stack.enter_context(session_patch)
+                    stack.enter_context(json_patch)
+                    with self.assertRaisesRegex(RuntimeError, "bundle failed"):
+                        parity_trace.publish_trainer_bundle(None, True)
+                self.assertEqual(distributed.calls, expected)
+
+    def test_trainer_bundle_source_failures_keep_collective_order(self):
+        metadata, _, arrays = self._trainer_bundle_values(32768)
+        expected = [
+            "gather-metadata",
+            "gather-errors",
+            "broadcast-source",
+            "broadcast-source",
+            "broadcast-source",
+            "broadcast-source",
+            "broadcast-status",
+        ]
+        oversized = dict(arrays)
+        oversized["selected_indices"] = np.arange(32769, dtype=np.int64)
+        oversized["advantages"] = np.ones(32769, dtype=np.float32)
+        for name, compact_source, fail_copy in (
+            ("copy", arrays, True),
+            ("oversize", oversized, False),
+        ):
+            with self.subTest(name=name):
+                distributed = FakeBundleCollectives(56, remote_failure=True)
+                torch_module = fake_collective_torch(
+                    distributed, fail_source_copy=fail_copy
+                )
+                with ExitStack() as stack:
+                    for context in self._bundle_collective_context(
+                        56, distributed, torch_module
+                    ):
+                        stack.enter_context(context)
+                    stack.enter_context(
+                        patch.object(
+                            parity_trace,
+                            "validated_trace_root",
+                            return_value=Path("/trace"),
+                        )
+                    )
+                    stack.enter_context(
+                        patch.object(parity_trace, "read_session", return_value=metadata)
+                    )
+                    with self.assertRaisesRegex(RuntimeError, "trainer head"):
+                        parity_trace.publish_trainer_bundle(compact_source, True)
+                self.assertEqual(distributed.calls, expected)
+
+    def test_trainer_bundle_rank_zero_write_failure_reaches_status_broadcast(self):
+        metadata, gathered, arrays = self._trainer_bundle_values(32768)
+        selected_count = arrays["selected_indices"].size
+        selected = np.full(32768, -1, dtype=np.int64)
+        selected[:selected_count] = arrays["selected_indices"]
+        advantages = np.zeros(32768, dtype=np.float32)
+        advantages[:selected_count] = arrays["advantages"]
+        distributed = FakeBundleCollectives(
+            0,
+            gathered_metadata=self._encoded_bundle_metadata(gathered),
+            source_values=(
+                arrays["token_ids"],
+                arrays["positions"],
+                selected,
+                advantages,
+            ),
+        )
+        torch_module = fake_collective_torch(distributed)
+        with ExitStack() as stack:
+            for context in self._bundle_collective_context(
+                0, distributed, torch_module
+            ):
+                stack.enter_context(context)
+            stack.enter_context(
+                patch.object(
+                    parity_trace, "validated_trace_root", return_value=Path("/trace")
+                )
+            )
+            stack.enter_context(
+                patch.object(parity_trace, "read_session", return_value=metadata)
+            )
+            stack.enter_context(
+                patch.object(
+                    parity_trace,
+                    "_write_trainer_bundle",
+                    side_effect=OSError("write stopped"),
+                )
+            )
+            stack.enter_context(
+                patch.dict(os.environ, {"PRIME_TRAINER_HEAD": "n82"}, clear=True)
+            )
+            with self.assertRaisesRegex(RuntimeError, "bundle failed"):
+                parity_trace.publish_trainer_bundle(None, True)
+        self.assertEqual(
+            distributed.calls,
+            [
+                "gather-metadata",
+                "gather-errors",
+                "broadcast-source",
+                "broadcast-source",
+                "broadcast-source",
+                "broadcast-source",
+                "broadcast-status",
+            ],
+        )
 
     def test_glm_diagnostic_plan_fits_existing_caps(self):
         metadata = TraceSession(

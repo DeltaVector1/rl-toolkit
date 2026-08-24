@@ -1064,21 +1064,35 @@ def _write_trainer_bundle(
             path.unlink(missing_ok=True)
 
 
-def publish_trainer_bundle(compact_source: dict[str, np.ndarray] | None) -> None:
-    root = validated_trace_root()
-    if root is None:
+def publish_trainer_bundle(
+    compact_source: dict[str, np.ndarray] | None,
+    enabled: bool,
+) -> None:
+    if not enabled:
         return
-    if _process_side != "trainer":
-        raise ValueError("trainer provenance bundle requires trainer tracing")
     import torch.distributed as dist
     import torch
 
     if not dist.is_available() or not dist.is_initialized():
         raise ValueError("trainer provenance bundle requires distributed training")
-    session = read_session(root)
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    local_error: str | None = None
+    errors: list[str] = []
+    root: Path | None = None
+    session: TraceSession | None = None
+    session_identity = ""
+    try:
+        root = validated_trace_root()
+        if root is None:
+            raise ValueError("trainer parity trace root is missing")
+        if _process_side != "trainer":
+            raise ValueError("trainer provenance bundle requires trainer tracing")
+        session = read_session(root)
+        if session.expected_tokens != 32768:
+            raise ValueError("trainer parity session must contain 32768 tokens")
+        session_identity = trace_session_identity(session)
+    except BaseException as error:
+        errors.append(f"root/session preparation failed: {error}"[:512])
     if (
         world_size != 64
         or _process_world_size != 64
@@ -1086,61 +1100,38 @@ def publish_trainer_bundle(compact_source: dict[str, np.ndarray] | None) -> None
         or _process_cp_size != 8
         or rank != _process_rank
     ):
-        local_error = "parity trainer bundle requires exact world64/PP8/CP8 mapping"
+        errors.append("parity trainer bundle requires exact world64/PP8/CP8 mapping")
     source_rank = 56
     if compact_source is not None and rank != source_rank:
-        local_error = "compact fixture source was supplied by a non-final rank"
-    source_arrays: dict[str, np.ndarray] | None = None
-    if rank == source_rank:
-        if compact_source is None:
-            local_error = "final PP/CP0 compact fixture source is missing"
-        else:
-            try:
-                source_arrays = {
-                    name: np.ascontiguousarray(compact_source[name])
-                    for name in (
-                        "token_ids",
-                        "positions",
-                        "selected_indices",
-                        "advantages",
-                    )
-                }
-                if set(compact_source) != set(source_arrays):
-                    raise ValueError("compact fixture source fields differ")
-                selected_count = int(source_arrays["selected_indices"].size)
-                if (
-                    source_arrays["token_ids"].shape != (session.expected_tokens,)
-                    or source_arrays["positions"].shape != (session.expected_tokens,)
-                    or source_arrays["selected_indices"].shape != (selected_count,)
-                    or source_arrays["advantages"].shape != (selected_count,)
-                    or source_arrays["token_ids"].dtype != np.int64
-                    or source_arrays["positions"].dtype != np.int64
-                    or source_arrays["selected_indices"].dtype != np.int64
-                    or source_arrays["advantages"].dtype != np.float32
-                ):
-                    raise ValueError("compact fixture source shape or dtype differs")
-            except (KeyError, TypeError, ValueError) as error:
-                local_error = str(error)[:512]
-                source_arrays = None
+        errors.append("compact fixture source was supplied by a non-final rank")
     local = {
         "rank": rank,
-        "session_identity": trace_session_identity(session),
+        "session_identity": session_identity,
         "provenance": _trainer_provenance_record,
         "has_compact_source": compact_source is not None,
-        "error": local_error,
+        "error": "; ".join(errors) or None,
     }
-    metadata_bytes = _canonical_json_bytes(local)
     metadata_limit = 16 * 1024
-    if len(metadata_bytes) + 4 > metadata_limit:
-        metadata_bytes = _canonical_json_bytes(
+    try:
+        metadata_bytes = _canonical_json_bytes(local)
+        if len(metadata_bytes) + 4 > metadata_limit:
+            raise ValueError("trainer provenance metadata exceeds 16 KiB")
+    except BaseException as error:
+        errors.append(f"metadata preparation failed: {error}"[:512])
+        safe_error = "; ".join(errors).encode(
+            "utf-8", errors="replace"
+        )[:2048].decode("utf-8", errors="replace")
+        metadata_bytes = json.dumps(
             {
                 "rank": rank,
-                "session_identity": trace_session_identity(session),
+                "session_identity": session_identity,
                 "provenance": None,
                 "has_compact_source": compact_source is not None,
-                "error": "trainer provenance metadata exceeds 16 KiB",
-            }
-        )
+                "error": safe_error,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
     encoded = len(metadata_bytes).to_bytes(4, "little") + metadata_bytes
     encoded += b"\0" * (metadata_limit - len(encoded))
     device = torch.device("cuda", torch.cuda.current_device())
@@ -1151,26 +1142,84 @@ def publish_trainer_bundle(compact_source: dict[str, np.ndarray] | None) -> None
         world_size * metadata_limit, dtype=torch.uint8, device=device
     )
     dist.all_gather_into_tensor(gathered_metadata, local_metadata)
+    token_ids = torch.zeros((32768,), dtype=torch.int64, device=device)
+    positions = torch.zeros((32768,), dtype=torch.int64, device=device)
+    selected_indices = torch.full((32768,), -1, dtype=torch.int64, device=device)
+    advantages = torch.zeros((32768,), dtype=torch.float32, device=device)
+    if rank == source_rank:
+        try:
+            if compact_source is None:
+                raise ValueError("final PP/CP0 compact fixture source is missing")
+            if set(compact_source) != {
+                "token_ids",
+                "positions",
+                "selected_indices",
+                "advantages",
+            }:
+                raise ValueError("compact fixture source fields differ")
+            if not all(
+                isinstance(compact_source[name], np.ndarray)
+                for name in compact_source
+            ):
+                raise TypeError("compact fixture source values must be arrays")
+            selected_count = int(compact_source["selected_indices"].size)
+            if (
+                compact_source["token_ids"].shape != (32768,)
+                or compact_source["positions"].shape != (32768,)
+                or compact_source["selected_indices"].shape != (selected_count,)
+                or compact_source["advantages"].shape != (selected_count,)
+                or selected_count < 1
+                or selected_count > 32768
+                or compact_source["token_ids"].dtype != np.int64
+                or compact_source["positions"].dtype != np.int64
+                or compact_source["selected_indices"].dtype != np.int64
+                or compact_source["advantages"].dtype != np.float32
+            ):
+                raise ValueError("compact fixture source shape or dtype differs")
+            source_arrays = {
+                name: np.ascontiguousarray(compact_source[name])
+                for name in compact_source
+            }
+            for target, name in (
+                (token_ids, "token_ids"),
+                (positions, "positions"),
+                (selected_indices, "selected_indices"),
+                (advantages, "advantages"),
+            ):
+                source_value = torch.from_numpy(source_arrays[name]).to(device=device)
+                target[: source_value.numel()].copy_(source_value)
+        except BaseException as error:
+            errors.append(f"source preparation failed: {error}"[:512])
 
-    def source_tensor(name: str, dtype: torch.dtype, fill: int | float) -> torch.Tensor:
-        value = torch.full(
-            (session.expected_tokens,), fill, dtype=dtype, device=device
-        )
-        if rank == source_rank and source_arrays is not None:
-            source_value = torch.from_numpy(source_arrays[name]).to(device=device)
-            value[: source_value.numel()].copy_(source_value)
-        return value
-
-    token_ids = source_tensor("token_ids", torch.int64, 0)
-    positions = source_tensor("positions", torch.int64, 0)
-    selected_indices = source_tensor("selected_indices", torch.int64, -1)
-    advantages = source_tensor("advantages", torch.float32, 0.0)
+    error_limit = 1024
+    error_bytes = "; ".join(errors).encode("utf-8", errors="replace")[: error_limit - 4]
+    error_encoded = len(error_bytes).to_bytes(4, "little") + error_bytes
+    error_encoded += b"\0" * (error_limit - len(error_encoded))
+    local_errors = torch.from_numpy(
+        np.frombuffer(error_encoded, dtype=np.uint8).copy()
+    ).to(device=device)
+    gathered_errors = torch.empty(
+        world_size * error_limit, dtype=torch.uint8, device=device
+    )
+    dist.all_gather_into_tensor(gathered_errors, local_errors)
     for value in (token_ids, positions, selected_indices, advantages):
         dist.broadcast(value, src=source_rank)
 
     failure: BaseException | None = None
     if rank == 0:
         try:
+            error_rows = gathered_errors.reshape(world_size, error_limit).cpu().numpy()
+            rank_errors = []
+            for error_rank, row in enumerate(error_rows):
+                length = int.from_bytes(row[:4].tobytes(), "little")
+                if length > error_limit - 4:
+                    raise ValueError("trainer preparation error length is invalid")
+                if length:
+                    rank_errors.append(
+                        f"rank {error_rank}: {row[4 : 4 + length].tobytes().decode('utf-8')}"
+                    )
+            if rank_errors:
+                raise ValueError("; ".join(rank_errors))
             rows = gathered_metadata.reshape(world_size, metadata_limit).cpu().numpy()
             gathered: list[dict[str, Any]] = []
             for row in rows:
@@ -1196,6 +1245,8 @@ def publish_trainer_bundle(compact_source: dict[str, np.ndarray] | None) -> None
             trainer_head = os.environ.get("PRIME_TRAINER_HEAD", "")
             if re.fullmatch(r"n[0-9]+", trainer_head) is None:
                 raise ValueError("PRIME_TRAINER_HEAD must identify the trainer head")
+            if session is None or root is None:
+                raise ValueError("trainer head session or root is unavailable")
             records, checked_arrays, binding = _validate_trainer_bundle_inputs(
                 gathered, session, trainer_head, arrays
             )

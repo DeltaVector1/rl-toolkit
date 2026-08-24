@@ -43,7 +43,7 @@ from prime_rl.trainer.rl.loss import (
     shift_tensor_right,
 )
 from prime_rl.trainer.rl.token_export import setup_token_exporter
-from prime_rl.parity_router_trace import publish_trainer_bundle
+from prime_rl.parity_router_trace import publish_trainer_bundle, trace_dir_env
 from prime_rl.trainer.model import (
     DTYPE_MAP,
     forward,
@@ -1547,7 +1547,9 @@ def train(config: TrainerConfig):
 
         if config.enable_token_export:
             dist.barrier()
-            publish_trainer_bundle(token_exporter.parity_source())
+            publish_trainer_bundle(
+                token_exporter.parity_source(), trace_dir_env in config.env_vars
+            )
             ready_run_ids = {
                 multi_run_manager.idx_2_id[idx]
                 for idx in multi_run_manager.ready_to_update_idxs
