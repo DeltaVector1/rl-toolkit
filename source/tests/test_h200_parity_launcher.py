@@ -138,6 +138,9 @@ class H200ParityLauncherTest(unittest.TestCase):
         source = START.read_text()
         launch = source.index("container_id=$(docker run -d")
         identity = source.index("parity-engine-identity:")
+        root_check = source.index('"$(id -u):$(id -g)" != "0:0"')
+        self.assertLess(root_check, launch)
+        self.assertIn("refusing parity engine launch by a non-root user", source)
         self.assertLess(launch, identity)
         self.assertIn('[[ ! "$container_id" =~ ^[0-9a-f]{64}$ ]]', source)
         self.assertIn("/proc/sys/kernel/random/boot_id", source)
@@ -156,6 +159,10 @@ class H200ParityLauncherTest(unittest.TestCase):
         self.assertIn("1000:1000:600", source)
         self.assertLess(identity, source.index("mapfile -t identity", launch))
         self.assertLess(identity, source.index("trap - EXIT", identity))
+
+    def test_identity_writer_requires_root_for_cid_temp_and_final_files(self):
+        writer = self._identity_helper("write_engine_identity")
+        self.assertEqual(writer.count("st.st_uid==0 and st.st_gid==0"), 3)
 
     def test_cid_reader_rejects_symlink_without_touching_target(self):
         code = self._identity_helper("read_engine_cid")

@@ -32,6 +32,10 @@ if [[ "$require_absent" != "0" && "$require_absent" != "1" ]]; then
   echo "refusing invalid existing-container policy" >&2
   exit 2
 fi
+if [[ "$(id -u):$(id -g)" != "0:0" ]]; then
+  echo "refusing parity engine launch by a non-root user" >&2
+  exit 2
+fi
 restart_policy=unless-stopped
 if [[ "$require_absent" == "1" ]]; then
   restart_policy=no
@@ -155,7 +159,7 @@ try:
    view=view[written:]
   os.fsync(fd)
   st=os.fstat(fd)
-  assert stat.S_ISREG(st.st_mode) and st.st_uid==1000 and st.st_gid==1000
+  assert stat.S_ISREG(st.st_mode) and st.st_uid==0 and st.st_gid==0
   assert stat.S_IMODE(st.st_mode)==0o600
  finally:
   os.close(fd)
@@ -164,7 +168,7 @@ try:
  final_fd=os.open(identity_name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=parent)
  try:
   st=os.fstat(final_fd)
-  assert stat.S_ISREG(st.st_mode) and st.st_uid==1000 and st.st_gid==1000
+  assert stat.S_ISREG(st.st_mode) and st.st_uid==0 and st.st_gid==0
   assert stat.S_IMODE(st.st_mode)==0o600
   actual=os.read(final_fd,len(payload)+1)
   assert os.read(final_fd,1)==b"" and actual==payload

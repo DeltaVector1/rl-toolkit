@@ -1701,7 +1701,7 @@ sleep() {{
         self.assertIn(paths["engine_identity"], command)
         self.assertIn("os.O_NOFOLLOW", command)
         self.assertIn("stat.S_IMODE(st.st_mode)==0o600", command)
-        self.assertIn("((cid_name,0),(identity_name,1000))", command)
+        self.assertIn("((cid_name,0),(identity_name,0))", command)
         self.assertIn('re.fullmatch(rb"[0-9a-f]{64}",cid_data)', command)
         self.assertIn("sudo docker inspect \"$cid\"", command)
         self.assertIn("{{json .Config.Cmd}}", command)
@@ -1822,6 +1822,20 @@ sleep() {{
                     training_ops._verify_parity_container_outputs(
                         "h200a", paths, "refresh", ()
                     )
+
+    def test_container_capture_verifies_both_identity_files_as_root_owned(self):
+        paths = training_ops._parity_container_write_paths("1" * 16)
+        with patch.object(
+            training_ops, "_sensitive_ssh", return_value="outputs-ready\n"
+        ) as remote:
+            training_ops._verify_parity_container_outputs(
+                "h200a", paths, "capture", ()
+            )
+        command = remote.call_args.args[1]
+        root_loop = command.split("for path in", 3)[3].split("; do", 1)[0]
+        self.assertIn(paths["engine_cid"], root_loop)
+        self.assertIn(paths["engine_identity"], root_loop)
+        self.assertIn('= "0:0:600"', command)
 
     def test_container_permission_failure_stops_before_container_run(self):
         commands = []

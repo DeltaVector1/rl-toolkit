@@ -3098,7 +3098,7 @@ try:
  assert stat.S_ISDIR(st.st_mode) and st.st_uid==1000 and st.st_gid==1000
  assert stat.S_IMODE(st.st_mode)==0o750
  values=[]
- for name,owner in ((cid_name,0),(identity_name,1000)):
+ for name,owner in ((cid_name,0),(identity_name,0)):
   fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=parent)
   try:
    st=os.fstat(fd)
@@ -3570,9 +3570,8 @@ def _verify_parity_container_outputs(
         directories = (paths["capture"], paths["router_trace"])
         files = (
             paths["diagnostic"],
-            paths["engine_identity"],
         )
-        root_files = (paths["engine_cid"],)
+        root_files = (paths["engine_cid"], paths["engine_identity"])
         names = (
             "capture\ndiagnostic.npz\nengine-identity.json\nengine.cid\n"
             "h200-router-trace"
