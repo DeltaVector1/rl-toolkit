@@ -2510,6 +2510,271 @@ def _redact_sensitive(value: str, sensitive: tuple[str, ...]) -> str:
     return redacted
 
 
+def _validate_parity_transaction_path(path: str) -> str:
+    match = re.fullmatch(
+        r"/data/glm52-rl/qualifications/glm52-policy-parity/" r"\.diagnostic-run-([0-9a-f]{16})/transaction\.json",
+        path,
+    )
+    if match is None:
+        raise Refused("parity transaction path is not exact")
+    return match.group(1)
+
+
+def _validate_parity_transaction_state(path: str, state: dict[str, object]) -> None:
+    nonce = _validate_parity_transaction_path(path)
+    root = "/data/glm52-rl/qualifications/glm52-policy-parity"
+    if (
+        state.get("schema_version") != 1
+        or state.get("nonce") != nonce
+        or state.get("phase")
+        not in {
+            "fixture_ready",
+            "fixture_published",
+            "capture_ready",
+            "capture_published",
+            "committed",
+            "rolled_back",
+        }
+    ):
+        raise RuntimeError("parity transaction identity is invalid")
+    expected_paths = {
+        "fixture": {
+            "live": glm_parity_paths["fixture"],
+            "previous": f"{root}/.fixture-previous-{nonce}",
+            "candidate": f"{root}/.fixture-candidate-{nonce}",
+            "failed": f"{root}/.fixture-failed-{nonce}",
+        },
+        "capture": {
+            "live": glm_parity_paths["h200_capture"],
+            "previous": f"{root}/.h200-capture-previous-{nonce}",
+            "candidate": f"{root}/.h200-capture-{nonce}",
+            "failed": f"{root}/.h200-capture-failed-{nonce}",
+        },
+    }
+    for kind, paths in expected_paths.items():
+        artifact = state.get(kind)
+        if not isinstance(artifact, dict) or artifact.get("paths") != paths:
+            raise RuntimeError(f"parity transaction {kind} paths are invalid")
+        action = artifact.get("action")
+        if action not in {None, "created", "replaced"}:
+            raise RuntimeError(f"parity transaction {kind} action is invalid")
+        new_hash = artifact.get("new_manifest_sha256")
+        old_hash = artifact.get("old_manifest_sha256")
+        if new_hash is not None and re.fullmatch(r"[0-9a-f]{64}", str(new_hash)) is None:
+            raise RuntimeError(f"parity transaction {kind} new hash is invalid")
+        if old_hash is not None and re.fullmatch(r"[0-9a-f]{64}", str(old_hash)) is None:
+            raise RuntimeError(f"parity transaction {kind} old hash is invalid")
+        if action is not None and new_hash is None:
+            raise RuntimeError(f"parity transaction {kind} published hash is missing")
+
+
+def _write_parity_transaction_state(
+    host: str,
+    path: str,
+    state: dict[str, object],
+    sensitive: tuple[str, ...],
+) -> None:
+    _validate_parity_transaction_state(path, state)
+    encoded = base64.b64encode((json.dumps(state, sort_keys=True, separators=(",", ":")) + "\n").encode()).decode()
+    command = (
+        "sudo python3 -c 'import base64,os,pathlib,sys; "
+        'p=pathlib.Path(sys.argv[1]); t=p.with_name(".transaction.json.tmp"); '
+        "t.write_bytes(base64.b64decode(sys.argv[2],validate=True)); "
+        "os.chmod(t,0o600); os.replace(t,p)' "
+        f"{shlex.quote(path)} {shlex.quote(encoded)}"
+    )
+    _sensitive_ssh(host, command, "parity transaction state write", sensitive, 60)
+
+
+def _parity_transaction_snapshot(
+    host: str,
+    path: str,
+    sensitive: tuple[str, ...],
+) -> dict[str, object]:
+    _validate_parity_transaction_path(path)
+    command = (
+        "sudo python3 -c 'import hashlib,json,os,pathlib,stat,sys; "
+        "p=pathlib.Path(sys.argv[1]); s=json.loads(p.read_text()); observed={}; "
+        '[(lambda q,k: observed.__setitem__(k,{"exists":q.exists(),'
+        '"symlink":q.is_symlink(),"manifest_sha256":'
+        'hashlib.sha256((q/"manifest.json").read_bytes()).hexdigest() '
+        'if q.is_dir() and not q.is_symlink() and (q/"manifest.json").is_file() else None}))'
+        '(pathlib.Path(v),f"{kind}.{key}") for kind in ("fixture","capture") '
+        'for key,v in s[kind]["paths"].items()]; '
+        'print(json.dumps({"state":s,"observed":observed},sort_keys=True))\' '
+        f"{shlex.quote(path)}"
+    )
+    output = _sensitive_ssh(host, command, "parity transaction reconciliation", sensitive, 60)
+    try:
+        snapshot = json.loads(output)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("parity transaction reconciliation returned invalid JSON") from error
+    if not isinstance(snapshot, dict):
+        raise RuntimeError("parity transaction reconciliation returned no object")
+    state = snapshot.get("state")
+    if not isinstance(state, dict):
+        raise RuntimeError("parity transaction reconciliation omitted state")
+    _validate_parity_transaction_state(path, state)
+    return snapshot
+
+
+def _validate_published_transaction_artifact(snapshot: dict[str, object], kind: str) -> bool:
+    state = snapshot.get("state")
+    observed = snapshot.get("observed")
+    if not isinstance(state, dict) or not isinstance(observed, dict):
+        raise RuntimeError("parity transaction snapshot is incomplete")
+    artifact = state.get(kind)
+    if not isinstance(artifact, dict):
+        raise RuntimeError(f"parity transaction {kind} state is missing")
+    action = artifact.get("action")
+    if action not in {"created", "replaced"}:
+        raise RuntimeError(f"parity transaction {kind} publish is not recorded")
+    live = observed.get(f"{kind}.live")
+    previous = observed.get(f"{kind}.previous")
+    candidate = observed.get(f"{kind}.candidate")
+    failed = observed.get(f"{kind}.failed")
+    if (
+        not isinstance(candidate, dict)
+        or candidate.get("exists") is not False
+        or candidate.get("symlink") is not False
+    ):
+        raise RuntimeError(f"parity transaction {kind} candidate remains")
+    if (
+        not isinstance(failed, dict)
+        or failed.get("exists") is not False
+        or failed.get("symlink") is not False
+    ):
+        raise RuntimeError(f"parity transaction {kind} failed path is occupied")
+    if (
+        not isinstance(live, dict)
+        or live.get("symlink") is not False
+        or (live.get("manifest_sha256") != artifact.get("new_manifest_sha256"))
+    ):
+        raise RuntimeError(f"parity transaction {kind} live artifact differs")
+    if action == "replaced":
+        if (
+            not isinstance(previous, dict)
+            or previous.get("symlink") is not False
+            or (previous.get("manifest_sha256") != artifact.get("old_manifest_sha256"))
+        ):
+            raise RuntimeError(f"parity transaction {kind} backup differs")
+    elif (
+        not isinstance(previous, dict)
+        or previous.get("exists") is not False
+        or previous.get("symlink") is not False
+    ):
+        raise RuntimeError(f"parity transaction {kind} has an unexpected backup")
+    return action == "replaced"
+
+
+def _parity_transaction_update_command(path: str, phase: str, kind: str, action_shell_value: str) -> str:
+    _validate_parity_transaction_path(path)
+    if phase not in {
+        "fixture_published",
+        "capture_published",
+        "committed",
+        "rolled_back",
+    }:
+        raise Refused("parity transaction phase is invalid")
+    if kind not in {"fixture", "capture", "none"}:
+        raise Refused("parity transaction artifact kind is invalid")
+    return (
+        "sudo python3 -c 'import json,os,pathlib,sys; p=pathlib.Path(sys.argv[1]); "
+        's=json.loads(p.read_text()); s["phase"]=sys.argv[2]; '
+        'None if sys.argv[3]=="none" else s[sys.argv[3]].__setitem__("action",sys.argv[4]); '
+        't=p.with_name(".transaction.json.tmp"); '
+        't.write_text(json.dumps(s,sort_keys=True,separators=(",",":"))+"\\n"); '
+        "os.chmod(t,0o600); os.replace(t,p)' "
+        f"{shlex.quote(path)} {shlex.quote(phase)} {shlex.quote(kind)} "
+        f"{action_shell_value}"
+    )
+
+
+def _remote_manifest_sha256(host: str, path: str, label: str, sensitive: tuple[str, ...]) -> str | None:
+    value = _sensitive_ssh(
+        host,
+        f"if test -f {shlex.quote(path + '/manifest.json')}; then "
+        f"sha256sum {shlex.quote(path + '/manifest.json')} | cut -d' ' -f1; "
+        "else echo absent; fi",
+        label,
+        sensitive,
+        60,
+    ).strip()
+    if value == "absent":
+        return None
+    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise RuntimeError(f"{label} returned an invalid hash")
+    return value
+
+
+def _parity_pair_rollback_command(artifacts: list[dict[str, object]], state_update_command: str) -> str:
+    if not artifacts or len(artifacts) > 2 or not state_update_command:
+        raise Refused("parity rollback plan is invalid")
+    values = []
+    for artifact in artifacts:
+        live = str(artifact.get("live", ""))
+        previous = str(artifact.get("previous", ""))
+        failed = str(artifact.get("failed", ""))
+        replaced = artifact.get("replaced")
+        if not all(path.startswith("/") for path in (live, previous, failed)) or not isinstance(replaced, bool):
+            raise Refused("parity rollback artifact is invalid")
+        values.append((live, previous, failed, replaced))
+    lines = ["set -euo pipefail"]
+    for index, (live, previous, failed, replaced) in enumerate(values):
+        lines.extend(
+            (
+                f"live_{index}={shlex.quote(live)}",
+                f"previous_{index}={shlex.quote(previous)}",
+                f"failed_{index}={shlex.quote(failed)}",
+                f"replaced_{index}={int(replaced)}",
+                f"moved_{index}=0",
+                f'test -d "$live_{index}"',
+                f'test ! -L "$live_{index}"',
+                f'test ! -e "$failed_{index}"',
+            )
+        )
+        if replaced:
+            lines.extend(
+                (
+                    f'test -d "$previous_{index}"',
+                    f'test ! -L "$previous_{index}"',
+                )
+            )
+    lines.extend(("recover_pair() {", "  set +e"))
+    if len(values) == 2:
+        lines.extend(
+            (
+                '  if test "$moved_0" != "$moved_1"; then',
+                '    if test "$moved_0" = 1 && ! test -e "$live_0"; then mv "$failed_0" "$live_0"; fi',
+                '    if test "$moved_1" = 1 && ! test -e "$live_1"; then mv "$failed_1" "$live_1"; fi',
+                "    return",
+                "  fi",
+            )
+        )
+    for index, (_live, _previous, _failed, replaced) in enumerate(values):
+        if replaced:
+            lines.append(
+                f'  if ! test -e "$live_{index}" && test -e "$previous_{index}"; then mv "$previous_{index}" "$live_{index}"; fi'
+            )
+    lines.append("}")
+    lines.append("trap recover_pair EXIT")
+    for index in range(len(values)):
+        lines.extend(
+            (
+                f'mv "$live_{index}" "$failed_{index}"',
+                f"moved_{index}=1",
+            )
+        )
+    for index, (_live, _previous, _failed, replaced) in enumerate(values):
+        if replaced:
+            lines.append(f'mv "$previous_{index}" "$live_{index}"')
+    lines.append(state_update_command)
+    lines.append("trap - EXIT")
+    for index in range(len(values)):
+        lines.append(f'rm -rf -- "$failed_{index}"')
+    return "\n".join(lines)
+
+
 def _sensitive_ssh(
     host: str,
     command: str,
@@ -2906,25 +3171,18 @@ def diagnose_glm52_policy_parity(name: str, keep_engine: bool = False) -> dict[s
     fixture = glm_parity_paths["fixture"]
     if PurePosixPath(capture).parent != PurePosixPath(root):
         raise Refused("H200 capture path is outside the exact parity root")
-    source_host, final_host, final_rank, source_root, metadata = (
-        _resolve_glm52_parity_diagnostic_source(name)
-    )
+    source_host, final_host, final_rank, source_root, metadata = _resolve_glm52_parity_diagnostic_source(name)
     token_export = _resolve_glm52_parity_token_export(final_host, final_rank)
-    source_input = (
-        f"{source_root}/trainer-rank-0-pp-0-cp-0-"
-        "diagnostic-layer3_router_input.npz"
-    )
+    source_input = f"{source_root}/trainer-rank-0-pp-0-cp-0-" "diagnostic-layer3_router_input.npz"
     session_path = f"{source_root}/session.json"
     metadata_command = (
         f"test ! -L {shlex.quote(source_root)} && "
-        f"test \"$(realpath -e {shlex.quote(source_root)})\" = {shlex.quote(source_root)} && "
+        f'test "$(realpath -e {shlex.quote(source_root)})" = {shlex.quote(source_root)} && '
         f"test -f {shlex.quote(source_input)} && test ! -L {shlex.quote(source_input)} && "
         f"test -f {shlex.quote(session_path)} && test ! -L {shlex.quote(session_path)} && "
         "echo source-ready"
     )
-    metadata_output = _remote_ok(
-        source_host, metadata_command, "trainer parity session", timeout=60
-    )
+    metadata_output = _remote_ok(source_host, metadata_command, "trainer parity session", timeout=60)
     if metadata_output.strip() != "source-ready":
         raise RuntimeError("trainer parity diagnostic input returned an invalid state")
 
@@ -2936,6 +3194,7 @@ def diagnose_glm52_policy_parity(name: str, keep_engine: bool = False) -> dict[s
     source_diagnostic_input = f"{root}/.diagnostic-source-{nonce}.npz"
     source_session = f"{root}/.diagnostic-session-{nonce}.json"
     source_token_export = f"{root}/.diagnostic-token-{nonce}.jsonl"
+    transaction_path = f"{run_directory}/transaction.json"
     remote_input = f"{root}/.diagnostic-input-{nonce}.npz"
     fixture_candidate = f"{root}/.fixture-candidate-{nonce}"
     fixture_previous = f"{root}/.fixture-previous-{nonce}"
@@ -2953,11 +3212,9 @@ def diagnose_glm52_policy_parity(name: str, keep_engine: bool = False) -> dict[s
     try:
         root_command = (
             f"test -d {shlex.quote(root)} && test ! -L {shlex.quote(root)} && "
-            f"test \"$(realpath -e {shlex.quote(root)})\" = {shlex.quote(root)}"
+            f'test "$(realpath -e {shlex.quote(root)})" = {shlex.quote(root)}'
         )
-        _sensitive_ssh(
-            host, root_command, "isolated parity root and config", sensitive, 60
-        )
+        _sensitive_ssh(host, root_command, "isolated parity root and config", sensitive, 60)
         for relative in (
             "configs/qualification/glm52-policy-parity-h200.toml",
             "scripts/h200/start_inference.sh",
@@ -2973,9 +3230,7 @@ def diagnose_glm52_policy_parity(name: str, keep_engine: bool = False) -> dict[s
         ):
             related_status = _isolated_container_status(host, related_name, sensitive)
             if related_status != "absent":
-                raise Refused(
-                    f"related isolated container {related_name} is {related_status!r}; expected absent"
-                )
+                raise Refused(f"related isolated container {related_name} is {related_status!r}; expected absent")
         status = _isolated_container_status(host, glm_inference_container, sensitive)
         if status == "exited":
             _sensitive_ssh(
@@ -3004,21 +3259,13 @@ test -p "$fifo"
 test "$(stat -c '%u:%g:%a' "$fifo")" = "1000:1000:600"
 echo fifo-ready
 """
-        fifo_state = _sensitive_ssh(
-            host, fifo_setup, "parity bootstrap FIFO setup", sensitive, 60
-        ).strip()
+        fifo_state = _sensitive_ssh(host, fifo_setup, "parity bootstrap FIFO setup", sensitive, 60).strip()
         if fifo_state != "fifo-ready":
             raise RuntimeError("parity bootstrap FIFO setup returned an invalid state")
 
-        _copy_parity_diagnostic_input(
-            source_host, source_input, host, source_diagnostic_input
-        )
-        _copy_parity_refresh_file(
-            source_host, session_path, host, source_session, "session"
-        )
-        _copy_parity_refresh_file(
-            final_host, token_export, host, source_token_export, "token"
-        )
+        _copy_parity_diagnostic_input(source_host, source_input, host, source_diagnostic_input)
+        _copy_parity_refresh_file(source_host, session_path, host, source_session, "session")
+        _copy_parity_refresh_file(final_host, token_export, host, source_token_export, "token")
         refresh_command = (
             "sudo docker run --rm -v /data:/data "
             f"-v {shlex.quote(remote_repo)}:/workspace:ro -w /workspace "
@@ -3031,9 +3278,7 @@ echo fifo-ready
             f"--diagnostic-output {shlex.quote(remote_input)} "
             f"--expected-rank {final_rank} {shlex.quote(fixture_candidate)}"
         )
-        refresh_output = _sensitive_ssh(
-            host, refresh_command, "current parity fixture rebuild", sensitive, 600
-        )
+        refresh_output = _sensitive_ssh(host, refresh_command, "current parity fixture rebuild", sensitive, 600)
         try:
             refresh_result = json.loads(refresh_output)
         except json.JSONDecodeError as error:
@@ -3050,6 +3295,34 @@ echo fifo-ready
                 raise RuntimeError(f"current parity fixture rebuild omitted {field}")
         if refresh_result.get("rank") != final_rank:
             raise RuntimeError("current parity fixture rebuild used another trainer rank")
+        transaction_state: dict[str, object] = {
+            "schema_version": 1,
+            "nonce": nonce,
+            "phase": "fixture_ready",
+            "fixture": {
+                "action": None,
+                "new_manifest_sha256": refresh_result["fixture_sha256"],
+                "old_manifest_sha256": refresh_result["source_fixture_sha256"],
+                "paths": {
+                    "live": fixture,
+                    "previous": fixture_previous,
+                    "candidate": fixture_candidate,
+                    "failed": f"{root}/.fixture-failed-{nonce}",
+                },
+            },
+            "capture": {
+                "action": None,
+                "new_manifest_sha256": None,
+                "old_manifest_sha256": None,
+                "paths": {
+                    "live": capture,
+                    "previous": capture_previous,
+                    "candidate": temporary_capture,
+                    "failed": f"{root}/.h200-capture-failed-{nonce}",
+                },
+            },
+        }
+        _write_parity_transaction_state(host, transaction_path, transaction_state, sensitive)
         fixture_publish = f"""
 set -euo pipefail
 root={shlex.quote(root)}
@@ -3086,16 +3359,27 @@ fi
 mv "$candidate" "$fixture"
 changed=1
 test -f "$fixture/manifest.json"
+{_parity_transaction_update_command(transaction_path, "fixture_published", "fixture", '"$state"')}
 trap - EXIT
 printf '%s\n' "$state"
 """
-        fixture_state = _sensitive_ssh(
-            host, fixture_publish, "current parity fixture publish", sensitive, 120
-        ).strip()
-        if fixture_state not in {"created", "replaced"}:
-            raise RuntimeError("current parity fixture publish returned an invalid state")
+        fixture_publish_error: BaseException | None = None
+        try:
+            fixture_ack = _sensitive_ssh(
+                host, fixture_publish, "current parity fixture publish", sensitive, 120
+            ).strip()
+            if fixture_ack not in {"created", "replaced"}:
+                raise RuntimeError("current parity fixture publish returned an invalid state")
+        except BaseException as error:
+            fixture_publish_error = error
+        fixture_snapshot = _parity_transaction_snapshot(host, transaction_path, sensitive)
+        try:
+            fixture_replaced = _validate_published_transaction_artifact(fixture_snapshot, "fixture")
+        except RuntimeError:
+            if fixture_publish_error is not None:
+                raise fixture_publish_error
+            raise
         fixture_published = True
-        fixture_replaced = fixture_state == "replaced"
 
         start_command = (
             "env "
@@ -3109,9 +3393,7 @@ printf '%s\n' "$state"
             f"{shlex.quote(glm_parity_inference_config)}"
         )
         engine_launch_attempted = True
-        _sensitive_ssh(
-            host, start_command, "isolated parity engine start", sensitive, 180
-        )
+        _sensitive_ssh(host, start_command, "isolated parity engine start", sensitive, 180)
         startup_grace = _configured_h200_engine_startup_grace()
         fifo_write = (
             f"sudo timeout --foreground {startup_grace} "
@@ -3120,7 +3402,11 @@ printf '%s\n' "$state"
             f"test ! -e {shlex.quote(bootstrap_fifo)}"
         )
         _sensitive_ssh_input(
-            host, fifo_write, bootstrap_token, "parity bootstrap FIFO delivery", startup_grace + 30
+            host,
+            fifo_write,
+            bootstrap_token,
+            "parity bootstrap FIFO delivery",
+            startup_grace + 30,
         )
         _h200_parity_container_preflight(host)
         ready_command = (
@@ -3128,7 +3414,13 @@ printf '%s\n' "$state"
             "until curl -fsS --max-time 5 http://127.0.0.1:8000/liveness >/dev/null; do "
             "test $SECONDS -lt $deadline || exit 124; sleep 5; done"
         )
-        _sensitive_ssh(host, ready_command, "isolated parity engine readiness", sensitive, startup_grace + 30)
+        _sensitive_ssh(
+            host,
+            ready_command,
+            "isolated parity engine readiness",
+            sensitive,
+            startup_grace + 30,
+        )
         capture_command = (
             "sudo docker run --rm -i --network host -v /data:/data "
             f"-v {shlex.quote(remote_repo)}:/workspace:ro -w /workspace "
@@ -3150,6 +3442,23 @@ printf '%s\n' "$state"
             "H200 parity capture and replay",
             3600,
         )
+        capture_new_sha256 = _remote_manifest_sha256(
+            host, temporary_capture, "new H200 parity capture manifest", sensitive
+        )
+        if capture_new_sha256 is None:
+            raise RuntimeError("new H200 parity capture manifest is missing")
+        capture_old_sha256 = _remote_manifest_sha256(host, capture, "existing H200 parity capture manifest", sensitive)
+        current_state = fixture_snapshot.get("state")
+        if not isinstance(current_state, dict):
+            raise RuntimeError("fixture transaction state is missing before capture publish")
+        transaction_state = current_state
+        transaction_state["phase"] = "capture_ready"
+        capture_state_value = transaction_state.get("capture")
+        if not isinstance(capture_state_value, dict):
+            raise RuntimeError("capture transaction state is missing")
+        capture_state_value["new_manifest_sha256"] = capture_new_sha256
+        capture_state_value["old_manifest_sha256"] = capture_old_sha256
+        _write_parity_transaction_state(host, transaction_path, transaction_state, sensitive)
         publish_command = f"""
 set -euo pipefail
 root={shlex.quote(root)}
@@ -3191,16 +3500,26 @@ fi
 mv "$candidate" "$capture"
 changed=1
 test -f "$capture/manifest.json"
+{_parity_transaction_update_command(transaction_path, "capture_published", "capture", '"$state"')}
 trap - EXIT
 printf '%s\n' "$state"
 """
-        capture_state = _sensitive_ssh(
-            host, publish_command, "H200 parity capture publish", sensitive, 300
-        ).strip()
-        if capture_state not in {"created", "replaced"}:
-            raise RuntimeError("H200 parity capture publish returned an invalid state")
+        capture_publish_error: BaseException | None = None
+        try:
+            capture_ack = _sensitive_ssh(host, publish_command, "H200 parity capture publish", sensitive, 300).strip()
+            if capture_ack not in {"created", "replaced"}:
+                raise RuntimeError("H200 parity capture publish returned an invalid state")
+        except BaseException as error:
+            capture_publish_error = error
+        capture_snapshot = _parity_transaction_snapshot(host, transaction_path, sensitive)
+        try:
+            fixture_replaced = _validate_published_transaction_artifact(capture_snapshot, "fixture")
+            capture_replaced = _validate_published_transaction_artifact(capture_snapshot, "capture")
+        except RuntimeError:
+            if capture_publish_error is not None:
+                raise capture_publish_error
+            raise
         capture_published = True
-        capture_replaced = capture_state == "replaced"
         succeeded = True
         return {
             "capture": capture,
@@ -3236,8 +3555,10 @@ test -z "$(sudo docker ps -a --filter "name=^/${{name}}$" --format '{{{{.Names}}
                 )
         cleanup = (
             f"sudo rm -f -- {shlex.quote(bootstrap_fifo)}; "
-            f"if test -d {shlex.quote(run_directory)}; then "
-            f"sudo rmdir -- {shlex.quote(run_directory)}; fi; "
+            f"if test -e {shlex.quote(transaction_path)}; then "
+            f"test -f {shlex.quote(transaction_path)} && "
+            f"test ! -L {shlex.quote(transaction_path)}; "
+            f"else sudo rmdir -- {shlex.quote(run_directory)}; fi; "
             f"rm -f -- {shlex.quote(remote_input)}; "
             f"rm -f -- {shlex.quote(source_diagnostic_input)}; "
             f"rm -f -- {shlex.quote(source_session)}; "
@@ -3247,7 +3568,9 @@ test -z "$(sudo docker ps -a --filter "name=^/${{name}}$" --format '{{{{.Names}}
             f"if test -d {shlex.quote(temporary_capture)}; then "
             f"rm -rf -- {shlex.quote(temporary_capture)}; fi; "
             f"test ! -e {shlex.quote(bootstrap_fifo)}; "
-            f"test ! -e {shlex.quote(run_directory)}; "
+            f"if test -e {shlex.quote(transaction_path)}; then "
+            f"test -d {shlex.quote(run_directory)}; else "
+            f"test ! -e {shlex.quote(run_directory)}; fi; "
             f"test ! -e {shlex.quote(remote_input)}; "
             f"test ! -e {shlex.quote(source_diagnostic_input)}; "
             f"test ! -e {shlex.quote(source_session)}; "
@@ -3258,86 +3581,73 @@ test -z "$(sudo docker ps -a --filter "name=^/${{name}}$" --format '{{{{.Names}}
         cleanup_code, cleanup_output = _ssh(host, cleanup, timeout=120)
         if cleanup_code:
             cleanup_failures.append(
-                "temporary parity artifact cleanup failed: "
-                + _redact_sensitive(cleanup_output.strip(), sensitive)
+                "temporary parity artifact cleanup failed: " + _redact_sensitive(cleanup_output.strip(), sensitive)
             )
+        if operation_error is None and not cleanup_failures and succeeded:
+            try:
+                commit_command = _parity_transaction_update_command(transaction_path, "committed", "none", "committed")
+                _sensitive_ssh(
+                    host,
+                    commit_command,
+                    "parity transaction commit record",
+                    sensitive,
+                    60,
+                )
+                commit_snapshot = _parity_transaction_snapshot(host, transaction_path, sensitive)
+                commit_state = commit_snapshot.get("state")
+                if not isinstance(commit_state, dict) or commit_state.get("phase") != ("committed"):
+                    raise RuntimeError("parity transaction commit state differs")
+                fixture_replaced = _validate_published_transaction_artifact(commit_snapshot, "fixture")
+                capture_replaced = _validate_published_transaction_artifact(commit_snapshot, "capture")
+                committed = True
+            except BaseException as error:
+                cleanup_failures.append(f"parity transaction commit failed: {error}")
         if operation_error is not None or cleanup_failures:
-            fixture_failed = f"{root}/.fixture-failed-{nonce}"
-            capture_failed = f"{root}/.h200-capture-failed-{nonce}"
-            validation = []
-            move_new = []
-            restore_old = []
-            verify_old = []
-            remove_new = []
-            for published, replaced, live, previous, failed in (
-                (
-                    fixture_published,
-                    fixture_replaced,
-                    fixture,
-                    fixture_previous,
-                    fixture_failed,
-                ),
-                (
-                    capture_published,
-                    capture_replaced,
-                    capture,
-                    capture_previous,
-                    capture_failed,
-                ),
-            ):
-                if not published:
-                    continue
-                validation.extend(
-                    (
-                        f"test -d {shlex.quote(live)}",
-                        f"test ! -L {shlex.quote(live)}",
-                        f"test ! -e {shlex.quote(failed)}",
-                    )
-                )
-                if replaced:
-                    validation.extend(
-                        (
-                            f"test -d {shlex.quote(previous)}",
-                            f"test ! -L {shlex.quote(previous)}",
+            state_code, _state_output = _ssh(host, f"test -f {shlex.quote(transaction_path)}", timeout=60)
+            rollback_artifacts: list[dict[str, object]] = []
+            if state_code == 0:
+                try:
+                    rollback_snapshot = _parity_transaction_snapshot(host, transaction_path, sensitive)
+                    rollback_state = rollback_snapshot.get("state")
+                    if not isinstance(rollback_state, dict):
+                        raise RuntimeError("remote transaction state is missing")
+                    for kind in ("fixture", "capture"):
+                        artifact = rollback_state.get(kind)
+                        if not isinstance(artifact, dict) or artifact.get("action") is None:
+                            continue
+                        replaced = _validate_published_transaction_artifact(rollback_snapshot, kind)
+                        paths = artifact.get("paths")
+                        if not isinstance(paths, dict):
+                            raise RuntimeError(f"remote {kind} recovery paths are missing")
+                        rollback_artifacts.append(
+                            {
+                                "live": paths.get("live"),
+                                "previous": paths.get("previous"),
+                                "failed": paths.get("failed"),
+                                "replaced": replaced,
+                            }
                         )
+                except BaseException as error:
+                    cleanup_failures.append(
+                        "parity transaction reconciliation failed; recovery paths retained: " + str(error)
                     )
-                    restore_old.append(
-                        f"if test -e {shlex.quote(previous)} && "
-                        f"! test -e {shlex.quote(live)}; then "
-                        f"mv {shlex.quote(previous)} {shlex.quote(live)}; fi"
-                    )
-                    verify_old.append(f"test -f {shlex.quote(live + '/manifest.json')}")
-                move_new.append(
-                    f"mv {shlex.quote(live)} {shlex.quote(failed)}"
-                )
-                remove_new.append(f"rm -rf -- {shlex.quote(failed)}")
-            if move_new:
-                rollback = "\n".join(
-                    (
-                        "set -euo pipefail",
-                        *validation,
-                        "restore_pair() {",
-                        *(f"  {command}" for command in restore_old),
-                        "}",
-                        "trap restore_pair EXIT",
-                        *move_new,
-                        *restore_old,
-                        *verify_old,
-                        "trap - EXIT",
-                        *remove_new,
-                    )
+            elif fixture_published or capture_published:
+                cleanup_failures.append("parity transaction state is missing; recovery paths retained")
+            if rollback_artifacts:
+                rollback = _parity_pair_rollback_command(
+                    rollback_artifacts,
+                    _parity_transaction_update_command(transaction_path, "rolled_back", "none", "rolled_back"),
                 )
                 rollback_code, rollback_output = _ssh(host, rollback, timeout=300)
                 if rollback_code:
                     cleanup_failures.append(
-                        "parity fixture and capture rollback failed: "
+                        "parity pair rollback did not complete; recovery paths retained: "
                         + _redact_sensitive(rollback_output.strip(), sensitive)
                     )
                 else:
                     fixture_published = False
                     capture_published = False
-        elif succeeded:
-            committed = True
+        elif committed:
             for replaced, previous, label in (
                 (fixture_replaced, fixture_previous, "fixture"),
                 (capture_replaced, capture_previous, "capture"),
@@ -3353,8 +3663,7 @@ test -z "$(sudo docker ps -a --filter "name=^/${{name}}$" --format '{{{{.Names}}
                 if backup_code:
                     warning = (
                         f"committed parity {label} backup cleanup failed; "
-                        f"backup remains at {previous}: "
-                        + _redact_sensitive(backup_output.strip(), sensitive)
+                        f"backup remains at {previous}: " + _redact_sensitive(backup_output.strip(), sensitive)
                     )
                     cleanup_warnings.append(warning)
                     print("WARNING: " + warning)

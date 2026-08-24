@@ -1,4 +1,7 @@
+import copy
 import json
+import os
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -18,11 +21,16 @@ class H200ParityTest(unittest.TestCase):
         fail_cleanup=False,
         fail_fixture_backup=False,
         fail_capture_backup=False,
+        lose_fixture_ack=False,
+        invalid_fixture_ack=False,
+        lose_capture_ack=False,
+        invalid_capture_ack=False,
         interrupt_fifo=False,
         main_status="absent",
     ):
         secret = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_"
         secret_inputs = []
+        transaction = {"state": None}
 
         def call(host, command, timeout=120):
             del host, timeout
@@ -44,9 +52,29 @@ class H200ParityTest(unittest.TestCase):
                     }
                 ) + "\n"
             if "state=created" in command and ".fixture-candidate-" in command:
+                transaction["state"]["phase"] = "fixture_published"
+                transaction["state"]["fixture"]["action"] = "replaced"
+                if lose_fixture_ack:
+                    return 124, "fixture acknowledgement lost"
+                if invalid_fixture_ack:
+                    return 0, "invalid\n"
                 return 0, "replaced\n"
             if "state=created" in command and ".h200-capture-previous-" in command:
+                transaction["state"]["phase"] = "capture_published"
+                transaction["state"]["capture"]["action"] = "replaced"
+                if lose_capture_ack:
+                    return 124, "capture acknowledgement lost"
+                if invalid_capture_ack:
+                    return 0, "invalid\n"
                 return 0, "replaced\n"
+            if " committed none committed" in command:
+                transaction["state"]["phase"] = "committed"
+                return 0, ""
+            if " rolled_back none rolled_back" in command:
+                transaction["state"]["phase"] = "rolled_back"
+                return 0, ""
+            if command.startswith("test -f ") and command.endswith("transaction.json"):
+                return (0, "") if transaction["state"] is not None else (1, "")
             if "docker ps -a" in command and "glm52-optims-h200-" in command:
                 return 0, "absent\n"
             if "docker ps -a" in command and "glm52-optims-h200" in command:
@@ -83,17 +111,53 @@ class H200ParityTest(unittest.TestCase):
                 raise RuntimeError(f"{label} failed on {host}: {clean}")
             return clean
 
+        call.transaction = transaction
         return secret, call, secret_call, secret_inputs
 
     def _run_operation(self, ssh_call, secret_call, secret, *, keep_engine=False):
-        metadata = json.dumps(
-            {"model_revision": "a" * 40, "adapter_sha256": "b" * 64}
-        )
+        metadata = json.dumps({"model_revision": "a" * 40, "adapter_sha256": "b" * 64})
         source_root = f"{training_ops.parity_trace_root}/qualification-1"
+
+        def write_transaction(_host, _path, state, _sensitive):
+            ssh_call.transaction["state"] = copy.deepcopy(state)
+
+        def transaction_snapshot(_host, _path, _sensitive):
+            state = copy.deepcopy(ssh_call.transaction["state"])
+            if state is None:
+                raise RuntimeError("remote transaction state is missing")
+            observed = {}
+            for kind in ("fixture", "capture"):
+                artifact = state[kind]
+                action = artifact["action"]
+                for key in ("live", "previous", "candidate", "failed"):
+                    exists = (key == "live" and action in {"created", "replaced"}) or (
+                        key == "previous" and action == "replaced"
+                    )
+                    digest = None
+                    if key == "live" and exists:
+                        digest = artifact["new_manifest_sha256"]
+                    elif key == "previous" and exists:
+                        digest = artifact["old_manifest_sha256"]
+                    observed[f"{kind}.{key}"] = {
+                        "exists": exists,
+                        "symlink": False,
+                        "manifest_sha256": digest,
+                    }
+            return {"state": state, "observed": observed}
+
+        def manifest_sha(_host, path, _label, _sensitive):
+            if ".h200-capture-1111111111111111" in path:
+                return "7" * 64
+            if path == training_ops.glm_parity_paths["h200_capture"]:
+                return "8" * 64
+            raise AssertionError(f"unexpected manifest path: {path}")
+
         with patch.object(training_ops.secrets, "token_urlsafe", return_value=secret), patch.object(
             training_ops.secrets, "token_hex", return_value="1" * 16
         ), patch.object(
-            training_ops, "_diagnostic_capture_preflight", return_value={"files": 20, "estimated_bytes": 1}
+            training_ops,
+            "_diagnostic_capture_preflight",
+            return_value={"files": 20, "estimated_bytes": 1},
         ), patch.object(
             training_ops,
             "_resolve_glm52_parity_diagnostic_source",
@@ -108,22 +172,28 @@ class H200ParityTest(unittest.TestCase):
             training_ops,
             "_resolve_glm52_parity_token_export",
             return_value=f"{training_ops.parity_token_root}/step_0/rank_56.jsonl",
-        ), patch.object(
-            training_ops, "_remote_ok", return_value="source-ready"
-        ), patch.object(
+        ), patch.object(training_ops, "_remote_ok", return_value="source-ready"), patch.object(
             training_ops, "_sha256_file", return_value="config-sha"
         ), patch.object(training_ops, "_copy_parity_diagnostic_input") as copy_input, patch.object(
             training_ops, "_copy_parity_refresh_file"
         ), patch.object(
-            training_ops, "_h200_parity_container_preflight"
+            training_ops,
+            "_write_parity_transaction_state",
+            side_effect=write_transaction,
         ), patch.object(
+            training_ops,
+            "_parity_transaction_snapshot",
+            side_effect=transaction_snapshot,
+        ), patch.object(
+            training_ops,
+            "_remote_manifest_sha256",
+            side_effect=manifest_sha,
+        ), patch.object(training_ops, "_h200_parity_container_preflight"), patch.object(
             training_ops, "_configured_h200_engine_startup_grace", return_value=7200
         ), patch.object(training_ops, "_ssh", side_effect=ssh_call), patch.object(
             training_ops, "_sensitive_ssh_input", side_effect=secret_call
         ):
-            result = training_ops.diagnose_glm52_policy_parity(
-                "qualification-1", keep_engine=keep_engine
-            )
+            result = training_ops.diagnose_glm52_policy_parity("qualification-1", keep_engine=keep_engine)
         self.last_diagnostic_copy = copy_input.call_args
         return result
 
@@ -490,6 +560,166 @@ class H200ParityTest(unittest.TestCase):
                 for command in commands
             )
         )
+
+    def test_diagnostic_operation_reconciles_lost_or_invalid_publish_ack(self):
+        cases = (
+            {"lose_fixture_ack": True},
+            {"invalid_fixture_ack": True},
+            {"lose_capture_ack": True},
+            {"invalid_capture_ack": True},
+        )
+        for options in cases:
+            with self.subTest(options=options):
+                commands = []
+                secret, ssh_call, secret_call, _ = self._operation_ssh(commands, **options)
+                result = self._run_operation(ssh_call, secret_call, secret)
+                self.assertEqual(result["capture"], training_ops.glm_parity_paths["h200_capture"])
+                self.assertEqual(ssh_call.transaction["state"]["phase"], "committed")
+
+    def test_pair_rollback_second_move_failure_never_leaves_mixed_pair(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture_live = root / "fixture"
+            fixture_previous = root / "fixture-previous"
+            fixture_failed = root / "fixture-failed"
+            capture_live = root / "capture"
+            capture_previous = root / "capture-previous"
+            capture_failed = root / "capture-failed"
+            for path, value in (
+                (fixture_live, "new-fixture"),
+                (fixture_previous, "old-fixture"),
+                (capture_live, "new-capture"),
+                (capture_previous, "old-capture"),
+            ):
+                path.mkdir()
+                (path / "manifest.json").write_text(value)
+            tools = root / "tools"
+            tools.mkdir()
+            move_count = root / "move-count"
+            fake_move = tools / "mv"
+            fake_move.write_text(
+                "#!/bin/sh\n"
+                "count=0\n"
+                'if test -f "$MV_COUNT_FILE"; then count=$(cat "$MV_COUNT_FILE"); fi\n'
+                "count=$((count+1))\n"
+                'printf \'%s\\n\' "$count" > "$MV_COUNT_FILE"\n'
+                'if test "$count" = 2; then exit 72; fi\n'
+                'exec /bin/mv "$@"\n'
+            )
+            fake_move.chmod(0o755)
+            command = training_ops._parity_pair_rollback_command(
+                [
+                    {
+                        "live": str(fixture_live),
+                        "previous": str(fixture_previous),
+                        "failed": str(fixture_failed),
+                        "replaced": True,
+                    },
+                    {
+                        "live": str(capture_live),
+                        "previous": str(capture_previous),
+                        "failed": str(capture_failed),
+                        "replaced": True,
+                    },
+                ],
+                "true",
+            )
+            environment = os.environ.copy()
+            environment["PATH"] = f"{tools}:/usr/bin:/bin"
+            environment["MV_COUNT_FILE"] = str(move_count)
+            completed = subprocess.run(
+                ["bash", "-c", command],
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 72)
+            self.assertEqual((fixture_live / "manifest.json").read_text(), "new-fixture")
+            self.assertEqual((capture_live / "manifest.json").read_text(), "new-capture")
+            self.assertEqual((fixture_previous / "manifest.json").read_text(), "old-fixture")
+            self.assertEqual((capture_previous / "manifest.json").read_text(), "old-capture")
+            self.assertFalse(fixture_failed.exists())
+            self.assertFalse(capture_failed.exists())
+
+    def test_transaction_snapshot_command_reports_all_remote_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = {}
+            for kind in ("fixture", "capture"):
+                paths[kind] = {}
+                for key in ("live", "previous", "candidate", "failed"):
+                    path = root / f"{kind}-{key}"
+                    paths[kind][key] = str(path)
+                    if key in {"live", "previous"}:
+                        path.mkdir()
+                        (path / "manifest.json").write_text(f"{kind}-{key}")
+            state = {
+                "schema_version": 1,
+                "fixture": {"paths": paths["fixture"]},
+                "capture": {"paths": paths["capture"]},
+            }
+            transaction = root / "transaction.json"
+            transaction.write_text(json.dumps(state))
+
+            def run_snapshot(_host, command, _label, _sensitive, _timeout):
+                arguments = shlex.split(command)
+                self.assertEqual(arguments[:2], ["sudo", "python3"])
+                arguments[-1] = str(transaction)
+                completed = subprocess.run(arguments[1:], text=True, capture_output=True, check=False)
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                return completed.stdout
+
+            exact_path = (
+                "/data/glm52-rl/qualifications/glm52-policy-parity/" ".diagnostic-run-1111111111111111/transaction.json"
+            )
+            with patch.object(training_ops, "_sensitive_ssh", side_effect=run_snapshot), patch.object(
+                training_ops, "_validate_parity_transaction_state"
+            ):
+                snapshot = training_ops._parity_transaction_snapshot("h200a", exact_path, ())
+            self.assertEqual(snapshot["state"], state)
+            self.assertTrue(snapshot["observed"]["fixture.live"]["exists"])
+            self.assertTrue(snapshot["observed"]["capture.previous"]["exists"])
+            self.assertFalse(snapshot["observed"]["fixture.failed"]["exists"])
+
+    def test_transaction_state_rejects_paths_outside_exact_nonce(self):
+        path = (
+            "/data/glm52-rl/qualifications/glm52-policy-parity/"
+            ".diagnostic-run-1111111111111111/transaction.json"
+        )
+        root = "/data/glm52-rl/qualifications/glm52-policy-parity"
+        state = {
+            "schema_version": 1,
+            "nonce": "1111111111111111",
+            "phase": "fixture_ready",
+            "fixture": {
+                "action": None,
+                "new_manifest_sha256": "1" * 64,
+                "old_manifest_sha256": "2" * 64,
+                "paths": {
+                    "live": training_ops.glm_parity_paths["fixture"],
+                    "previous": f"{root}/.fixture-previous-1111111111111111",
+                    "candidate": f"{root}/.fixture-candidate-1111111111111111",
+                    "failed": f"{root}/.fixture-failed-1111111111111111",
+                },
+            },
+            "capture": {
+                "action": None,
+                "new_manifest_sha256": None,
+                "old_manifest_sha256": None,
+                "paths": {
+                    "live": training_ops.glm_parity_paths["h200_capture"],
+                    "previous": f"{root}/.h200-capture-previous-1111111111111111",
+                    "candidate": f"{root}/.h200-capture-1111111111111111",
+                    "failed": f"{root}/.h200-capture-failed-1111111111111111",
+                },
+            },
+        }
+        training_ops._validate_parity_transaction_state(path, state)
+        state["capture"]["paths"]["failed"] = "/tmp/outside"
+        with self.assertRaisesRegex(RuntimeError, "capture paths"):
+            training_ops._validate_parity_transaction_state(path, state)
+
 
     def test_diagnostic_operation_cleans_exact_container_after_start_failure(self):
         commands = []
