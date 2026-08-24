@@ -2434,6 +2434,7 @@ def _h200_parity_container_preflight(host: str, expected_trace_dir: str) -> dict
         "c=tomllib.load(open(sys.argv[1],\"rb\")); "
         "print(json.dumps({\"max_model_len\":c[\"model\"][\"max_model_len\"],"
         "\"tp\":c[\"parallel\"][\"tp\"],\"dp\":c[\"parallel\"][\"dp\"],"
+        "\"api_servers\":c[\"api_server_count\"],"
         "\"lora_rank\":c[\"max_lora_rank\"],"
         "\"router_trace\":c[\"enable_return_routed_experts\"]}))' "
         f"{shlex.quote(glm_parity_inference_config)}"
@@ -2449,6 +2450,7 @@ def _h200_parity_container_preflight(host: str, expected_trace_dir: str) -> dict
         "max_model_len": 32769,
         "tp": 8,
         "dp": 1,
+        "api_servers": 1,
         "lora_rank": 32,
         "router_trace": True,
     }

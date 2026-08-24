@@ -40,6 +40,7 @@ from prime_rl.parity_router_trace import (
     write_router_debug_chunk,
     write_hidden_diagnostic,
     run_h200_router_diagnostic,
+    bootstrap_readiness,
     diagnostic_authorization_valid,
     diagnostic_capture_preflight,
     consume_single_use_diagnostic_token,
@@ -341,6 +342,17 @@ class ParityRouterTraceTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "authorization"):
             consume_single_use_bootstrap_token(token, authorization)
 
+    def test_bootstrap_readiness_auth_does_not_consume_token(self):
+        token = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_"
+        authorization = f"Bearer {token}"
+        self.assertEqual(bootstrap_readiness(None, authorization), "not_ready")
+        self.assertEqual(bootstrap_readiness(token, "Bearer wrong"), "unauthorized")
+        self.assertEqual(bootstrap_readiness(token, authorization), "ready")
+        self.assertEqual(bootstrap_readiness(token, authorization), "ready")
+        token = consume_single_use_bootstrap_token(token, authorization)
+        self.assertIsNone(token)
+        self.assertEqual(bootstrap_readiness(token, authorization), "not_ready")
+
     def test_secret_stdin_is_bounded_and_has_no_cli_value(self):
         token = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_"
         stdin = io.TextIOWrapper(io.BytesIO((token + "\n").encode("ascii")))
@@ -380,23 +392,34 @@ class ParityRouterTraceTest(unittest.TestCase):
         }
         active_session = {}
         generate_count = 0
+        reset_count = 0
+        events = []
 
         def request(url, body, api_key, timeout):
-            nonlocal generate_count
+            nonlocal generate_count, reset_count
             del timeout
+            if url.endswith("/parity/bootstrap-ready"):
+                self.assertEqual(api_key, bootstrap_token)
+                events.append("bootstrap_ready")
+                return {"status": "ready"}
             if url.endswith("/v1/models"):
+                events.append("models")
                 return {"data": [{"id": "model", "max_model_len": 3}]}
             if url.endswith("/parity/router-trace/reset"):
                 self.assertEqual(api_key, bootstrap_token)
+                reset_count += 1
+                events.extend(("reset", "token_issue"))
                 active_session.update(body)
                 return {"session": body, "diagnostic_token": "one-use-secret"}
             if url.endswith("/inference/v1/generate"):
                 generate_count += 1
+                events.append("graph_capture" if generate_count == 1 else "eager_capture")
                 result = {"request_id": f"request-{generate_count}"}
                 if generate_count == 2:
                     result["choices"] = [{"routed_experts": encoded_ids}]
                 return result
             if url.endswith("/parity/router-trace"):
+                events.append("trace")
                 return {
                     "session": active_session,
                     "runtime_marker": {"request_identity": "trace-request"},
@@ -404,6 +427,11 @@ class ParityRouterTraceTest(unittest.TestCase):
                     "router_weights": encoded_weights,
                 }
             raise AssertionError(url)
+
+        def replay_diagnostic(*args):
+            self.assertEqual(args[4], "one-use-secret")
+            events.append("replay")
+            return {"passed": True}
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -452,7 +480,7 @@ class ParityRouterTraceTest(unittest.TestCase):
             ), patch.object(
                 parity_script,
                 "run_h200_router_diagnostic",
-                return_value={"passed": True},
+                side_effect=replay_diagnostic,
             ) as replay:
                 manifest = capture_h200(
                     profile,
@@ -468,6 +496,20 @@ class ParityRouterTraceTest(unittest.TestCase):
                     root / "input.npz",
                     30.0,
                 )
+        self.assertEqual(reset_count, 1)
+        self.assertEqual(
+            events,
+            [
+                "bootstrap_ready",
+                "models",
+                "graph_capture",
+                "reset",
+                "token_issue",
+                "eager_capture",
+                "trace",
+                "replay",
+            ],
+        )
         self.assertEqual(replay.call_args.args[4], "one-use-secret")
         self.assertEqual(manifest["direct_router_diagnostic"], {"passed": True})
         self.assertNotIn("one-use-secret", json.dumps(manifest, sort_keys=True))

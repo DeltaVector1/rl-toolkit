@@ -1,5 +1,6 @@
 """Fail closed before a parity H200 container can use the wrong TOML."""
 
+import ast
 import os
 import pathlib
 import subprocess
@@ -103,6 +104,9 @@ class H200ParityLauncherTest(unittest.TestCase):
 
     def test_parity_handlers_use_bounded_stream_reader(self):
         server = (ROOT / "source/src/prime_rl/inference/vllm/server.py").read_text()
+        bootstrap_ready = server.split(
+            '@router.get("/parity/bootstrap-ready")', 1
+        )[1].split("async def bounded_request_body", 1)[0]
         reset = server.split('@router.post("/parity/router-trace/reset")', 1)[1].split(
             "@router.get(\"/parity/router-trace\")", 1
         )[0]
@@ -121,6 +125,50 @@ class H200ParityLauncherTest(unittest.TestCase):
             "parity_diagnostic_bootstrap_token = consume_single_use_bootstrap_token(",
             reset,
         )
+        self.assertIn("bootstrap_readiness(", bootstrap_ready)
+        self.assertNotIn("consume_single_use_bootstrap_token", bootstrap_ready)
+        self.assertIn('readiness == "not_ready"', bootstrap_ready)
+        self.assertIn("status_code=503", bootstrap_ready)
+        self.assertIn('readiness != "ready"', bootstrap_ready)
+        self.assertIn("status_code=401", bootstrap_ready)
+
+    def test_api_process_reads_bootstrap_fifo_once_before_serving(self):
+        server = (ROOT / "source/src/prime_rl/inference/vllm/server.py").read_text()
+        app_init = server.split("async def custom_init_app_state", 1)[1].split(
+            "import vllm.entrypoints.openai.api_server", 1
+        )[0]
+        entry = server.split("def server(", 1)[1]
+        self.assertEqual(app_init.count("read_parity_bootstrap_fifo"), 1)
+        self.assertIn("parity_diagnostic_bootstrap_token is not None", app_init)
+        self.assertNotIn("read_parity_bootstrap_fifo", entry)
+        parents = []
+
+        class Calls(ast.NodeVisitor):
+            def __init__(self):
+                self.function = None
+
+            def visit_FunctionDef(self, node):
+                previous = self.function
+                self.function = node.name
+                self.generic_visit(node)
+                self.function = previous
+
+            visit_AsyncFunctionDef = visit_FunctionDef
+
+            def visit_Name(self, node):
+                if (
+                    isinstance(node.ctx, ast.Load)
+                    and node.id == "read_parity_bootstrap_fifo"
+                ):
+                    parents.append(self.function)
+                self.generic_visit(node)
+
+        Calls().visit(ast.parse(server))
+        self.assertEqual(parents, ["custom_init_app_state"])
+        tp_worker = (
+            ROOT / "source/src/prime_rl/inference/vllm/worker/filesystem.py"
+        ).read_text()
+        self.assertNotIn("read_parity_bootstrap_fifo", tp_worker)
 
 
 if __name__ == "__main__":

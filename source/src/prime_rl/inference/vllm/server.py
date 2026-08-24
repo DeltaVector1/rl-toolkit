@@ -32,6 +32,7 @@ from prime_rl.inference.vllm.worker.filesystem import adapter_cache_path
 from prime_rl.parity_router_trace import (
     TraceSession,
     assemble_chunks,
+    bootstrap_readiness,
     clear_trace,
     consume_single_use_bootstrap_token,
     consume_single_use_diagnostic_token,
@@ -134,6 +135,25 @@ def read_parity_bootstrap_fifo() -> str:
         )
     except (OSError, ValueError) as error:
         raise RuntimeError(str(error)) from error
+
+
+@router.get("/parity/bootstrap-ready")
+async def parity_bootstrap_ready(request: Request):
+    if os.environ.get("PRIME_PARITY_ENGINE") != "1":
+        raise HTTPException(status_code=404, detail="parity engine is not enabled")
+    isolated_parity_trace_root()
+    readiness = bootstrap_readiness(
+        parity_diagnostic_bootstrap_token,
+        request.headers.get("authorization", ""),
+    )
+    if readiness == "not_ready":
+        raise HTTPException(status_code=503, detail="parity bootstrap is not ready")
+    if readiness != "ready":
+        raise HTTPException(
+            status_code=401,
+            detail="parity bootstrap authorization is required",
+        )
+    return {"status": "ready"}
 
 
 async def bounded_request_body(request: Request, limit: int) -> bytes:
@@ -363,6 +383,16 @@ async def custom_init_app_state(
        routing and ``routed_experts`` export survive the migration off the
        legacy ``/v1/generate`` endpoint.
     """
+    global parity_diagnostic_bootstrap_token
+    if os.environ.get(parity_diagnostic_bootstrap_fifo_env) is not None:
+        if os.environ.get("PRIME_PARITY_ENGINE") != "1":
+            raise RuntimeError("parity bootstrap FIFO requires an isolated parity engine")
+        if parity_diagnostic_bootstrap_token is not None:
+            raise RuntimeError("parity bootstrap FIFO was already read")
+        parity_diagnostic_bootstrap_token = await asyncio.to_thread(
+            read_parity_bootstrap_fifo
+        )
+
     await init_app_state(engine_client, state, args, supported_tasks)
 
     state.liveness_timeout_seconds = args.liveness_timeout_seconds
@@ -413,9 +443,6 @@ vllm.v1.utils.run_api_server_worker_proc = custom_run_api_server_worker_proc
 # Only difference we do some config translation (i.e. pass populated namespace
 # to `parse_args`) and additional arg validation
 def server(config: InferenceConfig, vllm_extra: dict[str, Any] | None = None):
-    global parity_diagnostic_bootstrap_token
-    if os.environ.get(parity_diagnostic_bootstrap_fifo_env) is not None:
-        parity_diagnostic_bootstrap_token = read_parity_bootstrap_fifo()
     from vllm.entrypoints.cli.serve import run_headless, run_multi_api_server
     from vllm.entrypoints.openai.api_server import run_server
 

@@ -284,6 +284,17 @@ def diagnostic_authorization_valid(
     return secrets.compare_digest(authorization[7:], expected_token)
 
 
+def bootstrap_readiness(
+    expected_token: str | None,
+    authorization: str | None,
+) -> str:
+    if expected_token is None:
+        return "not_ready"
+    if not diagnostic_authorization_valid(authorization, expected_token):
+        return "unauthorized"
+    return "ready"
+
+
 def consume_single_use_bootstrap_token(
     expected_token: str | None,
     authorization: str | None,

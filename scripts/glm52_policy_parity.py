@@ -853,6 +853,14 @@ def capture_h200(
         raise ValueError(f"environment variable {api_key_env} is not set")
     if len(bootstrap_token) != 64:
         raise ValueError("bootstrap token must have 384-bit encoded capacity")
+    bootstrap_ready = request_json(
+        f"{base}/parity/bootstrap-ready",
+        body=None,
+        api_key=bootstrap_token,
+        timeout=min(timeout, 120),
+    )
+    if bootstrap_ready != {"status": "ready"}:
+        raise ValueError("H200 parity bootstrap is not ready")
     cards = request_json(
         f"{base}/v1/models", body=None, api_key=api_key, timeout=min(timeout, 120)
     ).get("data", [])

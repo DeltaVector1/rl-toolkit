@@ -415,6 +415,7 @@ class H200ParityTest(unittest.TestCase):
                 "max_model_len": 32769,
                 "tp": 8,
                 "dp": 1,
+                "api_servers": 1,
                 "lora_rank": 32,
                 "router_trace": True,
             }
@@ -945,7 +946,7 @@ class H200ParityTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "capture paths"):
             training_ops._validate_parity_transaction_state(path, state)
 
-    def test_completed_transaction_cleanup_removes_only_regular_state_and_empty_dir(self):
+    def test_rolled_back_transaction_cleanup_removes_only_regular_state_and_empty_dir(self):
         exact_directory = (
             "/data/glm52-rl/qualifications/glm52-policy-parity/"
             ".diagnostic-run-1111111111111111"
@@ -955,7 +956,7 @@ class H200ParityTest(unittest.TestCase):
             local_directory = Path(temporary) / ".diagnostic-run-1111111111111111"
             local_directory.mkdir()
             local_state = local_directory / "transaction.json"
-            local_state.write_text("state")
+            local_state.write_text(json.dumps({"phase": "rolled_back"}))
 
             def run_cleanup(_host, command, _label, _sensitive, _timeout):
                 local_command = command.replace(exact_state, str(local_state)).replace(
