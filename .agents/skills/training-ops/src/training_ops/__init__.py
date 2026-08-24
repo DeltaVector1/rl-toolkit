@@ -2582,7 +2582,7 @@ def _h200_parity_container_preflight(host: str, expected_trace_dir: str) -> dict
     bootstrap_mount = bootstrap_mounts[0]
     if (
         bootstrap_mount.get("Type") != "bind"
-        or bootstrap_mount.get("RW") is not False
+        or bootstrap_mount.get("RW") is not True
         or not re.fullmatch(
             r"/data/glm52-rl/qualifications/glm52-policy-parity/"
             r"\.diagnostic-run-[0-9a-f]{16}/bootstrap\.fifo",
@@ -2627,6 +2627,127 @@ def _h200_parity_container_preflight(host: str, expected_trace_dir: str) -> dict
     }
     print("H200 parity container preflight passed: " + json.dumps(result, sort_keys=True))
     return result
+
+
+def _assert_h200_parity_port_free(host: str) -> None:
+    _check_host(host)
+    protected = [protected_orchestrator, *protected_inference]
+    expression = "|".join(re.escape(name) for name in protected)
+    command = (
+        "set -euo pipefail; "
+        "active=$(sudo docker ps --format '{{.Names}}' | "
+        f"grep -E '^({expression})(-[0-9]+)?$' || true); "
+        "test -z \"$active\" || { echo protected-inference-active; exit 73; }; "
+        "listener=$(sudo ss -H -lntp 'sport = :8000' 2>/dev/null || true); "
+        "test -z \"$listener\" || { echo port-8000-in-use; exit 74; }; "
+        "echo port-8000-free"
+    )
+    code, output = _ssh(host, command, timeout=60)
+    if code or output.strip() != "port-8000-free":
+        raise Refused(
+            f"isolated parity port preflight failed on {host}: {output.strip()}"
+        )
+
+
+def _h200_parity_listener_identity(
+    host: str,
+    sensitive: tuple[str, ...],
+    timeout: int,
+) -> dict[str, object]:
+    _check_host(host)
+    command = rf"""
+set -euo pipefail
+name={shlex.quote(glm_inference_container)}
+deadline=$((SECONDS+{timeout}))
+while :; do
+  running=$(sudo docker inspect "$name" --format '{{{{.State.Running}}}}' 2>/dev/null) || exit 81
+  test "$running" = true || exit 82
+  container_pid=$(sudo docker inspect "$name" --format '{{{{.State.Pid}}}}')
+  container_id=$(sudo docker inspect "$name" --format '{{{{.Id}}}}')
+  listener_pids=$(sudo ss -H -lntp 'sport = :8000' 2>/dev/null | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | sort -u)
+  if test -z "$listener_pids"; then
+    test $SECONDS -lt $deadline || exit 124
+    sleep 2
+    continue
+  fi
+  test "$(printf '%s\n' "$listener_pids" | sed '/^$/d' | wc -l)" = 1 || exit 83
+  listener_pid=$listener_pids
+  test "$listener_pid" = "$container_pid" || exit 84
+  test -r "/proc/$listener_pid/cgroup" || exit 85
+  grep -Fq "$container_id" "/proc/$listener_pid/cgroup" || exit 86
+  host_boot_id=$(cat /proc/sys/kernel/random/boot_id)
+  printf '{{"listener_pid":%s,"container_id":"%s","host_boot_id":"%s"}}\n' \
+    "$listener_pid" "$container_id" "$host_boot_id"
+  break
+done
+"""
+    output = _sensitive_ssh(
+        host,
+        command,
+        "isolated parity listener identity",
+        sensitive,
+        timeout + 30,
+    ).strip()
+    try:
+        identity = json.loads(output)
+    except json.JSONDecodeError as error:
+        raise Refused("isolated parity listener identity is not valid JSON") from error
+    if (
+        not isinstance(identity, dict)
+        or not isinstance(identity.get("listener_pid"), int)
+        or identity["listener_pid"] <= 1
+        or re.fullmatch(r"[0-9a-f]{64}", str(identity.get("container_id", ""))) is None
+        or re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            str(identity.get("host_boot_id", "")),
+        )
+        is None
+    ):
+        raise Refused("isolated parity listener identity is invalid")
+    return identity
+
+
+def _h200_capture_bootstrap_identity(
+    host: str,
+    capture_directory: str,
+    bootstrap_token: str,
+) -> dict[str, object]:
+    if re.fullmatch(
+        r"/data/glm52-rl/qualifications/glm52-policy-parity/"
+        r"\.diagnostic-work-[0-9a-f]{16}/capture",
+        capture_directory,
+    ) is None:
+        raise Refused("H200 parity capture identity path is invalid")
+    command = (
+        "python3 -c 'import json,pathlib,sys; "
+        "p=pathlib.Path(sys.argv[1]); "
+        "assert p.is_dir() and not p.is_symlink(); "
+        "m=p/\"manifest.json\"; assert m.is_file() and not m.is_symlink(); "
+        "print(json.dumps(json.loads(m.read_text())[\"bootstrap_identity\"],"
+        "sort_keys=True,separators=(\",\",\":\")))' "
+        f"{shlex.quote(capture_directory)}"
+    )
+    output = _sensitive_ssh(
+        host,
+        command,
+        "H200 capture bootstrap identity",
+        (bootstrap_token,),
+        60,
+    ).strip()
+    try:
+        identity = json.loads(output)
+    except json.JSONDecodeError as error:
+        raise Refused("H200 capture bootstrap identity is not valid JSON") from error
+    expected_sha256 = hashlib.sha256(bootstrap_token.encode("ascii")).hexdigest()
+    if (
+        not isinstance(identity, dict)
+        or identity.get("status") != "ready"
+        or identity.get("process_id") != 1
+        or re.fullmatch(r"[0-9a-f]{32}", str(identity.get("boot_nonce", ""))) is None
+        or identity.get("token_sha256") != expected_sha256
+    ):
+        raise Refused("H200 capture bootstrap identity is invalid")
+    return identity
 
 
 def _diagnostic_capture_preflight(config_path: Path, side: str) -> dict[str, int]:
@@ -3166,6 +3287,35 @@ def _sensitive_ssh_input(
     return clean
 
 
+def _receive_parity_bootstrap(host: str, command: str, timeout: int) -> str:
+    _check_host(host)
+    try:
+        process = subprocess.run(
+            ssh_command + [host, command],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(f"parity bootstrap receive timed out on {host}") from error
+    if process.returncode:
+        raise RuntimeError(f"parity bootstrap receive failed on {host}")
+    value = process.stdout
+    if len(value) != 65 or not value.endswith("\n"):
+        raise RuntimeError("parity bootstrap receive returned invalid framing")
+    token = value[:-1]
+    if re.fullmatch(r"[A-Za-z0-9_-]{64}", token) is None:
+        raise RuntimeError("parity bootstrap receive returned invalid capacity")
+    try:
+        decoded = base64.urlsafe_b64decode(token.encode("ascii"))
+    except (ValueError, UnicodeEncodeError) as error:
+        raise RuntimeError("parity bootstrap receive returned invalid encoding") from error
+    if len(decoded) != 48:
+        raise RuntimeError("parity bootstrap receive returned invalid capacity")
+    return token
+
+
 def _isolated_container_status(
     host: str,
     name: str,
@@ -3642,9 +3792,9 @@ def diagnose_glm52_policy_parity(name: str, keep_engine: bool = False) -> dict[s
     session_path = f"{source_root}/session.json"
     compact_source = f"{source_root}/trainer-fixture-source.npz"
     compact_manifest = f"{source_root}/trainer-fixture-source.json"
-    bootstrap_token = secrets.token_urlsafe(48)
     nonce = secrets.token_hex(8)
-    sensitive = (bootstrap_token,)
+    bootstrap_token = ""
+    sensitive: tuple[str, ...] = ()
     container_writes = _parity_container_write_paths(nonce)
     run_directory = f"{root}/.diagnostic-run-{nonce}"
     bootstrap_fifo = container_writes["bootstrap_fifo"]
@@ -3669,6 +3819,8 @@ def diagnose_glm52_policy_parity(name: str, keep_engine: bool = False) -> dict[s
     committed = False
     rollback_completed = False
     transaction_present = False
+    listener_identity: dict[str, object] | None = None
+    bootstrap_identity: dict[str, object] | None = None
     cleanup_warnings: list[str] = []
     operation_error: BaseException | None = None
     try:
@@ -3685,6 +3837,7 @@ def diagnose_glm52_policy_parity(name: str, keep_engine: bool = False) -> dict[s
             "source/src/prime_rl/parity_router_trace.py",
         ):
             _require_remote_source_matches(host, relative, sensitive)
+        _assert_h200_parity_port_free(host)
 
         for related_name in (
             f"{glm_inference_container}-0",
@@ -3869,31 +4022,25 @@ printf '%s\n' "$state"
         engine_launch_attempted = True
         _sensitive_ssh(host, start_command, "isolated parity engine start", sensitive, 180)
         startup_grace = _configured_h200_engine_startup_grace()
-        fifo_write = (
-            f"sudo timeout --foreground {startup_grace} "
-            f"sh -c 'cat > \"$1\"' sh {shlex.quote(bootstrap_fifo)} && "
-            f"sudo rm -f -- {shlex.quote(bootstrap_fifo)} && "
-            f"test ! -e {shlex.quote(bootstrap_fifo)}"
-        )
-        _sensitive_ssh_input(
-            host,
-            fifo_write,
-            bootstrap_token,
-            "parity bootstrap FIFO delivery",
-            startup_grace + 30,
-        )
         _h200_parity_container_preflight(host, h200_trace_directory)
-        ready_command = (
-            f"deadline=$((SECONDS+{startup_grace})); "
-            "until curl -fsS --max-time 5 http://127.0.0.1:8000/liveness >/dev/null; do "
-            "test $SECONDS -lt $deadline || exit 124; sleep 5; done"
+        fifo_read = (
+            f"sudo timeout --foreground {startup_grace} "
+            f"cat -- {shlex.quote(bootstrap_fifo)}; "
+            "status=$?; "
+            f"sudo rm -f -- {shlex.quote(bootstrap_fifo)} && "
+            f"test ! -e {shlex.quote(bootstrap_fifo)}; "
+            "exit $status"
         )
-        _sensitive_ssh(
+        bootstrap_token = _receive_parity_bootstrap(
             host,
-            ready_command,
-            "isolated parity engine readiness",
-            sensitive,
+            fifo_read,
             startup_grace + 30,
+        )
+        sensitive = (bootstrap_token,)
+        listener_identity = _h200_parity_listener_identity(
+            host,
+            sensitive,
+            startup_grace,
         )
         capture_command = (
             "sudo docker run --rm -i --network host -v /data:/data "
@@ -3917,6 +4064,9 @@ printf '%s\n' "$state"
             3600,
         )
         _verify_parity_container_outputs(host, container_writes, "capture", sensitive)
+        bootstrap_identity = _h200_capture_bootstrap_identity(
+            host, temporary_capture, bootstrap_token
+        )
         capture_new_sha256 = _remote_manifest_sha256(
             host, temporary_capture, "new H200 parity capture manifest", sensitive
         )
@@ -3998,6 +4148,8 @@ printf '%s\n' "$state"
         succeeded = True
         return {
             "capture": capture,
+            "listener_identity": listener_identity,
+            "bootstrap_identity": bootstrap_identity,
             "diagnostic_plan": plan,
             "engine_kept": keep_engine,
             "container_work": container_work_directory if keep_engine else None,
@@ -4208,6 +4360,63 @@ test -z "$(sudo docker ps -a --filter "name=^/${{name}}$" --format '{{{{.Names}}
                 raise RuntimeError(detail)
         if succeeded and not committed:
             raise RuntimeError("parity fixture and capture transaction did not commit")
+
+
+def cleanup_glm52_policy_parity_engine() -> str:
+    host = orchestrator_host
+    if host != inference_hosts[0] or len(inference_hosts) != 1:
+        raise Refused("parity cleanup requires the one configured H200 host")
+    if glm_inference_container in set(isolation["protected_inference"]):
+        raise Refused("parity cleanup container overlaps protected inference")
+    for related in (
+        f"{glm_inference_container}-0",
+        f"{glm_inference_container}-1",
+    ):
+        status = _isolated_container_status(host, related, ())
+        if status != "absent":
+            raise Refused(f"related isolated container {related} is {status!r}")
+    status = _isolated_container_status(host, glm_inference_container, ())
+    if status == "absent":
+        return "absent"
+    if status != "exited":
+        raise Refused(
+            f"isolated parity container is {status!r}; only an exited container can be removed"
+        )
+    inspection = _sensitive_ssh(
+        host,
+        f"sudo docker inspect {shlex.quote(glm_inference_container)} "
+        "--format '{{json .Config.Image}}\\n{{json .Config.Cmd}}\\n"
+        "{{json .HostConfig.RestartPolicy.Name}}'",
+        "exited parity container inspection",
+        (),
+        60,
+    ).replace("\\n", "\n").splitlines()
+    if len(inspection) != 3:
+        raise Refused("exited parity container inspection returned an invalid record")
+    try:
+        image, command, restart_policy = (json.loads(value) for value in inspection)
+    except json.JSONDecodeError as error:
+        raise Refused("exited parity container inspection is not valid JSON") from error
+    expected_command = [
+        "@",
+        glm_parity_inference_config,
+        "--vllm-extra",
+        glm_parity_vllm_extra,
+    ]
+    if image != inference_image or command != expected_command or restart_policy != "no":
+        raise Refused("exited container does not match the isolated parity engine")
+    command_output = _remote_ok(
+        host,
+        f"set -euo pipefail; name={shlex.quote(glm_inference_container)}; "
+        "test \"$(sudo docker inspect \"$name\" --format '{{.State.Status}}')\" = exited; "
+        "sudo docker rm \"$name\" >/dev/null; "
+        "test -z \"$(sudo docker ps -a --filter \"name=^/${name}$\" "
+        "--format '{{.Names}}')\"; echo removed",
+        "exited isolated parity container cleanup",
+    ).strip()
+    if command_output != "removed":
+        raise RuntimeError("exited isolated parity container cleanup returned invalid output")
+    return "removed"
 
 
 def _repair_engine(host: str) -> str:
@@ -6038,6 +6247,12 @@ def _diagnose_glm52_parity_action(arguments: list[str]):
     return diagnose_glm52_policy_parity(names[0], keep_engine=keep_engine)
 
 
+def _cleanup_glm52_parity_engine_action(arguments: list[str]):
+    if arguments:
+        raise Refused("cleanup-glm52-parity-engine takes no arguments")
+    return cleanup_glm52_policy_parity_engine()
+
+
 actions = {
     "status": lambda a: status(*a),
     "acceptance": lambda a: acceptance(*a),
@@ -6058,6 +6273,7 @@ actions = {
     "stage-glm52-parity": lambda a: stage_glm52_policy_parity(a or None),
     "collect-glm52-parity": lambda a: collect_glm52_policy_parity(a[0] if a else ""),
     "diagnose-glm52-parity": _diagnose_glm52_parity_action,
+    "cleanup-glm52-parity-engine": _cleanup_glm52_parity_engine_action,
     "stop-legacy-qualification": lambda a: stop_legacy_qualification(*a),
     "stop": lambda a: stop(),
     "mounts": lambda a: print("\n".join(mounted_files())),
@@ -6094,6 +6310,7 @@ usage = f"""training-ops <action> [args]
   stage-glm52-parity [node ...] validate and stage the exact parity reference
   diagnose-glm52-parity <run>  capture H200 parity and replay trainer layer 3
                                 add --keep-engine to retain a successful engine
+  cleanup-glm52-parity-engine  remove only the exited isolated parity engine
   stop-legacy-qualification <output-path>
                                 stop a verified legacy qualification
   mounts                        list live-mounted source files

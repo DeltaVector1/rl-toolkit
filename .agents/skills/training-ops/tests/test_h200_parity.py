@@ -1,6 +1,7 @@
 import copy
 import json
 import os
+import re
 import shlex
 import subprocess
 import tempfile
@@ -93,7 +94,7 @@ class H200ParityTest(unittest.TestCase):
             if "docker ps -a" in command and "glm52-optims-h200" in command:
                 return 0, f"{main_status}\n"
             if "start_inference.sh" in command and fail_start:
-                return 1, f"start rejected {secret}"
+                return 1, "start rejected"
             if "capture-h200" in command and fail_capture:
                 return 1, f"capture rejected {secret}"
             if command.startswith("sudo rm -f --") and fail_cleanup:
@@ -116,15 +117,22 @@ class H200ParityTest(unittest.TestCase):
 
         def secret_call(host, command, provided, label, timeout):
             secret_inputs.append(provided)
-            if interrupt_fifo and "FIFO delivery" in label:
-                raise KeyboardInterrupt
             code, output = call(host, command, timeout)
             clean = training_ops._redact_sensitive(output, (provided,))
             if code:
                 raise RuntimeError(f"{label} failed on {host}: {clean}")
             return clean
 
+        def receive(host, command, timeout):
+            commands.append(command)
+            if interrupt_fifo:
+                raise KeyboardInterrupt
+            self.assertEqual(host, "h200a")
+            self.assertEqual(timeout, 7230)
+            return secret
+
         call.transaction = transaction
+        call.receive = receive
         return secret, call, secret_call, secret_inputs
 
     def _run_operation(self, ssh_call, secret_call, secret, *, keep_engine=False):
@@ -165,7 +173,7 @@ class H200ParityTest(unittest.TestCase):
                 return "8" * 64
             raise AssertionError(f"unexpected manifest path: {path}")
 
-        with patch.object(training_ops.secrets, "token_urlsafe", return_value=secret), patch.object(
+        with patch.object(
             training_ops.secrets, "token_hex", return_value="1" * 16
         ), patch.object(
             training_ops,
@@ -202,9 +210,32 @@ class H200ParityTest(unittest.TestCase):
             "_remote_manifest_sha256",
             side_effect=manifest_sha,
         ), patch.object(training_ops, "_h200_parity_container_preflight"), patch.object(
+            training_ops, "_assert_h200_parity_port_free"
+        ), patch.object(
+            training_ops,
+            "_h200_parity_listener_identity",
+            return_value={
+                "listener_pid": 1234,
+                "container_id": "d" * 64,
+                "host_boot_id": "11111111-2222-3333-4444-555555555555",
+            },
+        ), patch.object(
+            training_ops,
+            "_h200_capture_bootstrap_identity",
+            return_value={
+                "status": "ready",
+                "process_id": 1,
+                "boot_nonce": "e" * 32,
+                "token_sha256": training_ops.hashlib.sha256(
+                    secret.encode("ascii")
+                ).hexdigest(),
+            },
+        ), patch.object(
             training_ops, "_configured_h200_engine_startup_grace", return_value=7200
         ), patch.object(training_ops, "_ssh", side_effect=ssh_call), patch.object(
             training_ops, "_sensitive_ssh_input", side_effect=secret_call
+        ), patch.object(
+            training_ops, "_receive_parity_bootstrap", side_effect=ssh_call.receive
         ):
             result = training_ops.diagnose_glm52_policy_parity("qualification-1", keep_engine=keep_engine)
         self.last_diagnostic_copy = copy_input.call_args
@@ -484,6 +515,27 @@ class H200ParityTest(unittest.TestCase):
         self.assertNotIn(secret, str(caught.exception))
         self.assertIn("[redacted]", str(caught.exception))
 
+    def test_bootstrap_receive_uses_stdout_only_and_never_exposes_token(self):
+        secret = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_"
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=secret + "\n", stderr=""
+        )
+        with patch.object(training_ops.subprocess, "run", return_value=completed) as run:
+            token = training_ops._receive_parity_bootstrap("h200a", "read fifo", 30)
+        self.assertEqual(token, secret)
+        self.assertNotIn(secret, " ".join(run.call_args.args[0]))
+        self.assertIs(run.call_args.kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(run.call_args.kwargs["timeout"], 30)
+
+        failed = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout=secret + "\n", stderr=secret
+        )
+        with patch.object(
+            training_ops.subprocess, "run", return_value=failed
+        ), self.assertRaises(RuntimeError) as caught:
+            training_ops._receive_parity_bootstrap("h200a", "read fifo", 30)
+        self.assertNotIn(secret, str(caught.exception))
+
     def test_diagnostic_capture_preflight_refuses_existing_cap_overflow(self):
         with tempfile.TemporaryDirectory() as temporary:
             config = Path(temporary) / "h200.toml"
@@ -528,7 +580,7 @@ class H200ParityTest(unittest.TestCase):
                                 ".diagnostic-run-1111111111111111/bootstrap.fifo"
                             ),
                             "Destination": "/run/prime-parity-bootstrap",
-                            "RW": False,
+                            "RW": True,
                         }
                     ]
                 ),
@@ -580,7 +632,7 @@ class H200ParityTest(unittest.TestCase):
                                 ".diagnostic-run-1111111111111111/bootstrap.fifo"
                             ),
                             "Destination": "/run/prime-parity-bootstrap",
-                            "RW": False,
+                            "RW": True,
                         }
                     ]
                 ),
@@ -624,6 +676,73 @@ class H200ParityTest(unittest.TestCase):
                 training_ops._h200_parity_container_preflight("h200a", trace)
         self.assertNotIn(secret, str(caught.exception))
 
+    def test_parity_port_preflight_refuses_listener_or_protected_inference(self):
+        with patch.object(
+            training_ops, "_ssh", return_value=(0, "port-8000-free\n")
+        ) as ssh:
+            training_ops._assert_h200_parity_port_free("h200a")
+        command = ssh.call_args.args[1]
+        self.assertIn("sport = :8000", command)
+        for name in training_ops.protected_inference:
+            self.assertIn(re.escape(name), command)
+
+        for output in ("port-8000-in-use", "protected-inference-active"):
+            with self.subTest(output=output), patch.object(
+                training_ops, "_ssh", return_value=(74, output)
+            ), self.assertRaises(training_ops.Refused):
+                training_ops._assert_h200_parity_port_free("h200a")
+
+    def test_listener_identity_binds_port_to_running_isolated_container(self):
+        identity = {
+            "listener_pid": 1234,
+            "container_id": "a" * 64,
+            "host_boot_id": "11111111-2222-3333-4444-555555555555",
+        }
+        with patch.object(
+            training_ops, "_sensitive_ssh", return_value=json.dumps(identity)
+        ) as remote:
+            result = training_ops._h200_parity_listener_identity(
+                "h200a", ("secret",), 7200
+            )
+        self.assertEqual(result, identity)
+        command = remote.call_args.args[1]
+        self.assertIn(".State.Running", command)
+        self.assertIn("sport = :8000", command)
+        self.assertIn(".State.Pid", command)
+        self.assertIn('test "$listener_pid" = "$container_pid"', command)
+        self.assertIn("/cgroup", command)
+        self.assertIn("$container_id", command)
+        self.assertEqual(remote.call_args.args[4], 7230)
+
+    def test_capture_records_boot_nonce_and_bootstrap_hash(self):
+        secret = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_"
+        identity = {
+            "status": "ready",
+            "process_id": 1,
+            "boot_nonce": "f" * 32,
+            "token_sha256": training_ops.hashlib.sha256(
+                secret.encode("ascii")
+            ).hexdigest(),
+        }
+        capture = (
+            "/data/glm52-rl/qualifications/glm52-policy-parity/"
+            ".diagnostic-work-1111111111111111/capture"
+        )
+        with patch.object(
+            training_ops, "_sensitive_ssh", return_value=json.dumps(identity)
+        ):
+            self.assertEqual(
+                training_ops._h200_capture_bootstrap_identity(
+                    "h200a", capture, secret
+                ),
+                identity,
+            )
+        wrong = {**identity, "token_sha256": "0" * 64}
+        with patch.object(
+            training_ops, "_sensitive_ssh", return_value=json.dumps(wrong)
+        ), self.assertRaisesRegex(training_ops.Refused, "identity is invalid"):
+            training_ops._h200_capture_bootstrap_identity("h200a", capture, secret)
+
     def test_diagnostic_operation_redacts_token_and_cleans_up_after_failure(self):
         commands = []
         secret, ssh_call, secret_call, _ = self._operation_ssh(
@@ -663,7 +782,9 @@ class H200ParityTest(unittest.TestCase):
         result = self._run_operation(ssh_call, secret_call, secret)
         self.assertNotIn(secret, json.dumps(result, sort_keys=True))
         self.assertEqual(result["cleanup_warnings"], [])
-        self.assertEqual(secret_inputs, [secret, secret])
+        self.assertEqual(result["listener_identity"]["listener_pid"], 1234)
+        self.assertEqual(result["bootstrap_identity"]["boot_nonce"], "e" * 32)
+        self.assertEqual(secret_inputs, [secret])
         self.assertEqual(self.last_diagnostic_copy.args[0], training_ops.trainer_head)
         self.assertNotEqual(self.last_diagnostic_copy.args[0], training_ops.trainer_hosts[0])
         self.assertFalse(any(secret in command for command in commands))
@@ -684,11 +805,14 @@ class H200ParityTest(unittest.TestCase):
         fifo_setup = next(command for command in commands if "mkfifo -m 0600" in command)
         self.assertIn("chown 1000:1000", fifo_setup)
         self.assertIn("1000:1000:600", fifo_setup)
-        fifo_delivery = next(
-            command for command in commands if "timeout --foreground" in command
+        fifo_receive = next(
+            command
+            for command in commands
+            if "timeout --foreground" in command and "bootstrap.fifo" in command
         )
-        self.assertIn("timeout --foreground 7200", fifo_delivery)
-        self.assertNotIn("timeout --foreground 180", fifo_delivery)
+        self.assertIn("timeout --foreground 7200", fifo_receive)
+        self.assertIn("cat --", fifo_receive)
+        self.assertNotIn("timeout --foreground 180", fifo_receive)
         fifo_cleanup = next(
             command
             for command in commands
@@ -1239,6 +1363,60 @@ class H200ParityTest(unittest.TestCase):
                 for command in commands
             )
         )
+
+    def test_cleanup_removes_only_the_exact_exited_parity_container(self):
+        inspection = "\n".join(
+            (
+                json.dumps(training_ops.inference_image),
+                json.dumps(
+                    [
+                        "@",
+                        training_ops.glm_parity_inference_config,
+                        "--vllm-extra",
+                        training_ops.glm_parity_vllm_extra,
+                    ]
+                ),
+                json.dumps("no"),
+            )
+        )
+        with patch.object(
+            training_ops,
+            "_isolated_container_status",
+            side_effect=["absent", "absent", "exited"],
+        ) as status, patch.object(
+            training_ops, "_sensitive_ssh", return_value=inspection
+        ), patch.object(
+            training_ops, "_remote_ok", return_value="removed\n"
+        ) as remove:
+            result = training_ops.cleanup_glm52_policy_parity_engine()
+        self.assertEqual(result, "removed")
+        self.assertEqual(
+            [call.args[1] for call in status.call_args_list],
+            [
+                training_ops.glm_inference_container + "-0",
+                training_ops.glm_inference_container + "-1",
+                training_ops.glm_inference_container,
+            ],
+        )
+        command = remove.call_args.args[1]
+        self.assertIn("name=glm52-optims-h200", command)
+        self.assertNotIn(training_ops.protected_inference[0], command)
+        self.assertNotIn("rm -f", command)
+        syntax = subprocess.run(
+            ["bash", "-n"], input=command, text=True, capture_output=True, check=False
+        )
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
+
+    def test_cleanup_refuses_a_running_parity_container(self):
+        with patch.object(
+            training_ops,
+            "_isolated_container_status",
+            side_effect=["absent", "absent", "running"],
+        ), patch.object(training_ops, "_remote_ok") as remove, self.assertRaisesRegex(
+            training_ops.Refused, "only an exited container"
+        ):
+            training_ops.cleanup_glm52_policy_parity_engine()
+        remove.assert_not_called()
 
 
 if __name__ == "__main__":

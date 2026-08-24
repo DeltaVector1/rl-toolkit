@@ -15,6 +15,7 @@ import secrets
 import shutil
 import sys
 import tempfile
+import time
 import tomllib
 import urllib.error
 import urllib.request
@@ -775,6 +776,39 @@ def request_json(
     return result
 
 
+def wait_for_bootstrap_identity(
+    base_url: str,
+    bootstrap_token: str,
+    timeout: float,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            ready = request_json(
+                f"{base_url.rstrip('/')}/parity/bootstrap-ready",
+                body=None,
+                api_key=bootstrap_token,
+                timeout=min(timeout, 10),
+            )
+            break
+        except ValueError as error:
+            detail = str(error)
+            if "HTTP 401" in detail:
+                raise ValueError("H200 parity bootstrap identity check failed") from error
+            if "HTTP 503" not in detail or time.monotonic() >= deadline:
+                raise
+            time.sleep(1)
+    expected_sha256 = hashlib.sha256(bootstrap_token.encode("ascii")).hexdigest()
+    if (
+        ready.get("status") != "ready"
+        or ready.get("process_id") != 1
+        or re.fullmatch(r"[0-9a-f]{32}", str(ready.get("boot_nonce", ""))) is None
+        or ready.get("token_sha256") != expected_sha256
+    ):
+        raise ValueError("H200 parity bootstrap identity differs from the isolated API")
+    return ready
+
+
 def read_secret_stdin(label: str, minimum: int, maximum: int) -> str:
     if minimum < 1 or maximum < minimum:
         raise ValueError("secret input limits are invalid")
@@ -955,14 +989,9 @@ def capture_h200(
         raise ValueError(f"environment variable {api_key_env} is not set")
     if len(bootstrap_token) != 64:
         raise ValueError("bootstrap token must have 384-bit encoded capacity")
-    bootstrap_ready = request_json(
-        f"{base}/parity/bootstrap-ready",
-        body=None,
-        api_key=bootstrap_token,
-        timeout=min(timeout, 120),
+    bootstrap_ready = wait_for_bootstrap_identity(
+        base, bootstrap_token, min(timeout, 120)
     )
-    if bootstrap_ready != {"status": "ready"}:
-        raise ValueError("H200 parity bootstrap is not ready")
     cards = request_json(
         f"{base}/v1/models", body=None, api_key=api_key, timeout=min(timeout, 120)
     ).get("data", [])
@@ -1152,6 +1181,7 @@ def capture_h200(
         "model_revision": model_revision,
         "adapter_sha256": adapter_sha256,
         "image": image,
+        "bootstrap_identity": bootstrap_ready,
         "lora_targets": list(required_targets),
         "route_output_scale": profile.get("router_scale"),
         "router_weight_provenance": "selected_weights_before_route_output_scale",

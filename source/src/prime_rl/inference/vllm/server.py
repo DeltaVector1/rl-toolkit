@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 import secrets
@@ -39,7 +40,7 @@ from prime_rl.parity_router_trace import (
     diagnostic_capture_preflight,
     encoded_array,
     read_h200_runtime_marker,
-    read_one_use_bootstrap_fifo,
+    issue_one_use_bootstrap_token,
     read_diagnostic_manifest,
     read_session,
     trace_root,
@@ -84,7 +85,6 @@ parity_diagnostic_expiry: dict[str, float] = {}
 parity_diagnostic_bootstrap_fifo_env = "PRIME_PARITY_BOOTSTRAP_FIFO"
 parity_qualification_root_env = "PRIME_PARITY_QUALIFICATION_ROOT"
 parity_diagnostic_token_seconds = 300.0
-parity_diagnostic_bootstrap_token: str | None = None
 parity_diagnostic_bootstrap_lock = asyncio.Lock()
 
 
@@ -121,14 +121,14 @@ def isolated_parity_trace_root() -> Path:
 def bootstrap_authorized(request: Request) -> bool:
     authorization = request.headers.get("authorization", "")
     return diagnostic_authorization_valid(
-        authorization, parity_diagnostic_bootstrap_token
+        authorization, getattr(request.app.state, "parity_bootstrap_token", None)
     )
 
 
-def read_parity_bootstrap_fifo() -> str:
+def issue_parity_bootstrap_token() -> str:
     path_value = os.environ.get(parity_diagnostic_bootstrap_fifo_env)
     try:
-        return read_one_use_bootstrap_fifo(
+        return issue_one_use_bootstrap_token(
             Path(path_value or ""),
             Path("/run/prime-parity-bootstrap"),
             os.geteuid(),
@@ -143,7 +143,7 @@ async def parity_bootstrap_ready(request: Request):
         raise HTTPException(status_code=404, detail="parity engine is not enabled")
     isolated_parity_trace_root()
     readiness = bootstrap_readiness(
-        parity_diagnostic_bootstrap_token,
+        getattr(request.app.state, "parity_bootstrap_token", None),
         request.headers.get("authorization", ""),
     )
     if readiness == "not_ready":
@@ -153,7 +153,13 @@ async def parity_bootstrap_ready(request: Request):
             status_code=401,
             detail="parity bootstrap authorization is required",
         )
-    return {"status": "ready"}
+    token = getattr(request.app.state, "parity_bootstrap_token", None)
+    return {
+        "status": "ready",
+        "process_id": os.getpid(),
+        "boot_nonce": getattr(request.app.state, "parity_boot_nonce", None),
+        "token_sha256": hashlib.sha256(token.encode("ascii")).hexdigest(),
+    }
 
 
 async def bounded_request_body(request: Request, limit: int) -> bytes:
@@ -248,7 +254,6 @@ async def liveness(raw_request: Request):
 
 @router.post("/parity/router-trace/reset")
 async def reset_parity_router_trace(request: Request):
-    global parity_diagnostic_bootstrap_token
     if os.environ.get("PRIME_PARITY_ENGINE") != "1":
         raise HTTPException(status_code=404, detail="parity engine is not enabled")
     async with parity_diagnostic_bootstrap_lock:
@@ -290,8 +295,8 @@ async def reset_parity_router_trace(request: Request):
                 "diagnostic_token": token,
                 "expires_in": parity_diagnostic_token_seconds,
             }
-        parity_diagnostic_bootstrap_token = consume_single_use_bootstrap_token(
-            parity_diagnostic_bootstrap_token,
+        request.app.state.parity_bootstrap_token = consume_single_use_bootstrap_token(
+            getattr(request.app.state, "parity_bootstrap_token", None),
             request.headers.get("authorization", ""),
         )
         return response
@@ -383,18 +388,18 @@ async def custom_init_app_state(
        routing and ``routed_experts`` export survive the migration off the
        legacy ``/v1/generate`` endpoint.
     """
-    global parity_diagnostic_bootstrap_token
+    bootstrap_token = None
     if os.environ.get(parity_diagnostic_bootstrap_fifo_env) is not None:
         if os.environ.get("PRIME_PARITY_ENGINE") != "1":
             raise RuntimeError("parity bootstrap FIFO requires an isolated parity engine")
-        if parity_diagnostic_bootstrap_token is not None:
-            raise RuntimeError("parity bootstrap FIFO was already read")
-        parity_diagnostic_bootstrap_token = await asyncio.to_thread(
-            read_parity_bootstrap_fifo
+        bootstrap_token = await asyncio.to_thread(
+            issue_parity_bootstrap_token
         )
 
     await init_app_state(engine_client, state, args, supported_tasks)
 
+    state.parity_bootstrap_token = bootstrap_token
+    state.parity_boot_nonce = secrets.token_hex(16) if bootstrap_token is not None else None
     state.liveness_timeout_seconds = args.liveness_timeout_seconds
 
     # Swap in our ServingTokens subclass for /inference/v1/generate so the

@@ -332,7 +332,7 @@ def consume_single_use_bootstrap_token(
         raise ValueError("parity bootstrap authorization is invalid")
 
 
-def read_one_use_bootstrap_fifo(
+def issue_one_use_bootstrap_token(
     path: Path,
     expected_path: Path,
     expected_uid: int,
@@ -346,29 +346,18 @@ def read_one_use_bootstrap_fifo(
         or metadata.st_uid != expected_uid
     ):
         raise ValueError("parity bootstrap FIFO type, mode, or owner is invalid")
-    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    token = secrets.token_urlsafe(48)
+    payload = (token + "\n").encode("ascii")
+    descriptor = os.open(path, os.O_WRONLY | os.O_NOFOLLOW)
     try:
-        value = bytearray()
-        while True:
-            chunk = os.read(descriptor, 257 - len(value))
-            if not chunk:
-                break
-            value.extend(chunk)
-            if len(value) > 256:
-                raise ValueError("parity bootstrap token is too long")
+        written = 0
+        while written < len(payload):
+            count = os.write(descriptor, payload[written:])
+            if count <= 0:
+                raise OSError("parity bootstrap FIFO write stopped early")
+            written += count
     finally:
         os.close(descriptor)
-    if not value.endswith(b"\n") or b"\n" in value[:-1]:
-        raise ValueError("parity bootstrap token framing is invalid")
-    token = bytes(value[:-1]).decode("ascii")
-    if len(token) != 64 or any(
-        character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
-        for character in token
-    ):
-        raise ValueError("parity bootstrap token capacity is below 384 bits")
-    decoded = base64.urlsafe_b64decode(token.encode("ascii"))
-    if len(decoded) != 48:
-        raise ValueError("parity bootstrap token capacity is below 384 bits")
     return token
 
 

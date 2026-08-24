@@ -5,7 +5,6 @@ import io
 import inspect
 import sys
 import tempfile
-import threading
 import types
 import unittest
 from contextlib import ExitStack
@@ -48,7 +47,7 @@ from prime_rl.parity_router_trace import (
     diagnostic_capture_preflight,
     consume_single_use_diagnostic_token,
     consume_single_use_bootstrap_token,
-    read_one_use_bootstrap_fifo,
+    issue_one_use_bootstrap_token,
     validate_encoded_diagnostic_input,
     validate_diagnostic_content_length,
     validate_isolated_parity_root,
@@ -969,48 +968,39 @@ class ParityRouterTraceTest(unittest.TestCase):
             consume_single_use_diagnostic_token(tokens, expiry, "session", "Bearer secret", 11.0)
         )
 
-    def test_bootstrap_fifo_is_exact_mode_and_removed_after_one_read(self):
-        token = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_"
+    def test_api_process_issues_the_exact_token_received_by_parent(self):
         with tempfile.TemporaryDirectory() as temporary:
             fifo = Path(temporary) / "bootstrap.fifo"
             os.mkfifo(fifo, 0o600)
             os.chmod(fifo, 0o600)
+            child = os.fork()
+            if child == 0:
+                try:
+                    issue_one_use_bootstrap_token(fifo, fifo, os.geteuid())
+                except BaseException:
+                    os._exit(1)
+                else:
+                    os._exit(0)
+            with fifo.open("rb", buffering=0) as stream:
+                received = stream.read()
+            finished, status = os.waitpid(child, 0)
+            self.assertEqual(finished, child)
+            self.assertEqual(status, 0)
+            self.assertEqual(len(received), 65)
+            self.assertTrue(received.endswith(b"\n"))
+            self.assertEqual(len(base64.urlsafe_b64decode(received[:-1])), 48)
 
-            def write():
-                fifo.write_text(token + "\n")
-
-            writer = threading.Thread(target=write)
-            writer.start()
-            observed = read_one_use_bootstrap_fifo(fifo, fifo, os.geteuid())
-            writer.join(timeout=5)
-            self.assertFalse(writer.is_alive())
-            self.assertEqual(observed, token)
-            fifo.unlink()
-            self.assertFalse(fifo.exists())
-
-    def test_bootstrap_fifo_rejects_regular_file_and_wrong_mode(self):
+    def test_bootstrap_issue_rejects_regular_file_and_wrong_mode(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "bootstrap.fifo"
             path.write_text("not a fifo\n")
             with self.assertRaisesRegex(ValueError, "type, mode, or owner"):
-                read_one_use_bootstrap_fifo(path, path, os.geteuid())
+                issue_one_use_bootstrap_token(path, path, os.geteuid())
             path.unlink()
             os.mkfifo(path, 0o644)
             os.chmod(path, 0o644)
             with self.assertRaisesRegex(ValueError, "type, mode, or owner"):
-                read_one_use_bootstrap_fifo(path, path, os.geteuid())
-
-    def test_bootstrap_fifo_rejects_insufficient_token_capacity(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            fifo = Path(temporary) / "bootstrap.fifo"
-            os.mkfifo(fifo, 0o600)
-            os.chmod(fifo, 0o600)
-            writer = threading.Thread(target=lambda: fifo.write_text("a" * 32 + "\n"))
-            writer.start()
-            with self.assertRaisesRegex(ValueError, "below 384 bits"):
-                read_one_use_bootstrap_fifo(fifo, fifo, os.geteuid())
-            writer.join(timeout=5)
-            self.assertFalse(writer.is_alive())
+                issue_one_use_bootstrap_token(path, path, os.geteuid())
 
     def test_bootstrap_authorization_cannot_be_replayed(self):
         token = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_"
@@ -1079,7 +1069,14 @@ class ParityRouterTraceTest(unittest.TestCase):
             if url.endswith("/parity/bootstrap-ready"):
                 self.assertEqual(api_key, bootstrap_token)
                 events.append("bootstrap_ready")
-                return {"status": "ready"}
+                return {
+                    "status": "ready",
+                    "process_id": 1,
+                    "boot_nonce": "c" * 32,
+                    "token_sha256": parity_script.hashlib.sha256(
+                        bootstrap_token.encode("ascii")
+                    ).hexdigest(),
+                }
             if url.endswith("/v1/models"):
                 events.append("models")
                 return {"data": [{"id": "model", "max_model_len": 3}]}
@@ -1190,7 +1187,39 @@ class ParityRouterTraceTest(unittest.TestCase):
         )
         self.assertEqual(replay.call_args.args[4], "one-use-secret")
         self.assertEqual(manifest["direct_router_diagnostic"], {"passed": True})
+        self.assertEqual(manifest["bootstrap_identity"]["boot_nonce"], "c" * 32)
         self.assertNotIn("one-use-secret", json.dumps(manifest, sort_keys=True))
+
+    def test_bootstrap_identity_waits_only_for_not_ready(self):
+        import scripts.glm52_policy_parity as parity_script
+
+        token = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_"
+        ready = {
+            "status": "ready",
+            "process_id": 1,
+            "boot_nonce": "d" * 32,
+            "token_sha256": parity_script.hashlib.sha256(token.encode("ascii")).hexdigest(),
+        }
+        with patch.object(
+            parity_script,
+            "request_json",
+            side_effect=[ValueError("H200 request failed with HTTP 503"), ready],
+        ) as request, patch.object(parity_script.time, "sleep") as sleep:
+            result = parity_script.wait_for_bootstrap_identity("http://h200", token, 10)
+        self.assertEqual(result, ready)
+        self.assertEqual(request.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+        with patch.object(
+            parity_script,
+            "request_json",
+            side_effect=ValueError("H200 request failed with HTTP 401"),
+        ) as request, patch.object(parity_script.time, "sleep") as sleep, self.assertRaisesRegex(
+            ValueError, "identity check failed"
+        ):
+            parity_script.wait_for_bootstrap_identity("http://h200", token, 10)
+        request.assert_called_once()
+        sleep.assert_not_called()
 
     def test_router_owner_gate_tuple_and_bias_are_checked(self):
         class Gate:

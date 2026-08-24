@@ -76,6 +76,10 @@ class H200ParityLauncherTest(unittest.TestCase):
         self.assertIn("! -p \"$bootstrap_fifo\"", source)
         self.assertIn("1000:1000:600", source)
         self.assertIn(
+            "source=$bootstrap_fifo,target=/run/prime-parity-bootstrap",
+            source,
+        )
+        self.assertNotIn(
             "source=$bootstrap_fifo,target=/run/prime-parity-bootstrap,readonly",
             source,
         )
@@ -127,7 +131,7 @@ class H200ParityLauncherTest(unittest.TestCase):
             reset.index("write_session(root, session)"),
         )
         self.assertIn(
-            "parity_diagnostic_bootstrap_token = consume_single_use_bootstrap_token(",
+            "request.app.state.parity_bootstrap_token = consume_single_use_bootstrap_token(",
             reset,
         )
         self.assertIn("bootstrap_readiness(", bootstrap_ready)
@@ -136,16 +140,24 @@ class H200ParityLauncherTest(unittest.TestCase):
         self.assertIn("status_code=503", bootstrap_ready)
         self.assertIn('readiness != "ready"', bootstrap_ready)
         self.assertIn("status_code=401", bootstrap_ready)
+        self.assertIn('"process_id": os.getpid()', bootstrap_ready)
+        self.assertIn('"boot_nonce": getattr(', bootstrap_ready)
+        self.assertIn('"token_sha256": hashlib.sha256(', bootstrap_ready)
 
-    def test_api_process_reads_bootstrap_fifo_once_before_serving(self):
+    def test_api_process_issues_bootstrap_once_before_serving(self):
         server = (ROOT / "source/src/prime_rl/inference/vllm/server.py").read_text()
         app_init = server.split("async def custom_init_app_state", 1)[1].split(
             "import vllm.entrypoints.openai.api_server", 1
         )[0]
         entry = server.split("def server(", 1)[1]
-        self.assertEqual(app_init.count("read_parity_bootstrap_fifo"), 1)
-        self.assertIn("parity_diagnostic_bootstrap_token is not None", app_init)
-        self.assertNotIn("read_parity_bootstrap_fifo", entry)
+        self.assertEqual(app_init.count("issue_parity_bootstrap_token"), 1)
+        self.assertIn("state.parity_bootstrap_token = bootstrap_token", app_init)
+        self.assertNotIn("issue_parity_bootstrap_token", entry)
+        self.assertNotIn("parity_diagnostic_bootstrap_token:", server)
+        self.assertIn(
+            'getattr(request.app.state, "parity_bootstrap_token", None)',
+            server,
+        )
         parents = []
 
         class Calls(ast.NodeVisitor):
@@ -163,7 +175,7 @@ class H200ParityLauncherTest(unittest.TestCase):
             def visit_Name(self, node):
                 if (
                     isinstance(node.ctx, ast.Load)
-                    and node.id == "read_parity_bootstrap_fifo"
+                    and node.id == "issue_parity_bootstrap_token"
                 ):
                     parents.append(self.function)
                 self.generic_visit(node)
@@ -173,7 +185,7 @@ class H200ParityLauncherTest(unittest.TestCase):
         tp_worker = (
             ROOT / "source/src/prime_rl/inference/vllm/worker/filesystem.py"
         ).read_text()
-        self.assertNotIn("read_parity_bootstrap_fifo", tp_worker)
+        self.assertNotIn("issue_parity_bootstrap_token", tp_worker)
 
 
 if __name__ == "__main__":
