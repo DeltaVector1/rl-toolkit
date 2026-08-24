@@ -67,6 +67,7 @@ from prime_rl.trainer.models.layers.checkpointing import (
 )
 from prime_rl.trainer.models.layers.fp8_ada import (
     exact_module_patterns,
+    install_w8a16_reshard_wait,
     replace_linear as replace_linear_with_fp8_checkpoint,
     validate_w8a16_matches,
 )
@@ -1256,6 +1257,8 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
             mesh=hsdp_mesh,
             **(native_block_fsdp_config if native_fp8 else fsdp_config),
         )
+        if native_fp8:
+            install_w8a16_reshard_wait(transformer_block)
         if partial_reshard_mesh is not None:
             set_partial_reshard_mesh(transformer_block, partial_reshard_mesh)
 

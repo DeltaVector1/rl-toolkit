@@ -364,6 +364,69 @@ class FP8AdaAutogradTest(unittest.TestCase):
         self.assertEqual(got.shape, (64, 384))
         self.assertTrue(torch.isfinite(got).all())
 
+    def test_w8a16_reshard_wait_runs_once_before_fsdp_post_backward(self):
+        calls = []
+
+        class Fence:
+            def record(self, device):
+                calls.append(("record", device))
+
+            def wait_before_reshard(self, group):
+                calls.append(("wait", group))
+
+        group = types.SimpleNamespace(
+            post_backward=lambda *args, **kwargs: calls.append(
+                ("post_backward", args, kwargs)
+            )
+        )
+
+        class Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = fp8_ada.FP8CheckpointLinear(128, 128, bias=False)
+                self.linear.w8a16 = True
+
+            def _get_fsdp_state(self):
+                return types.SimpleNamespace(_fsdp_param_group=group)
+
+        block = Block()
+        with mock.patch.object(fp8_ada, "W8A16BackwardFence", Fence):
+            self.assertTrue(fp8_ada.install_w8a16_reshard_wait(block))
+        self.assertIs(block.linear._w8a16_backward_fence, group._prime_w8a16_fence)
+
+        group.post_backward("value", named=True)
+        self.assertEqual(
+            calls,
+            [
+                ("wait", group),
+                ("post_backward", ("value",), {"named": True}),
+            ],
+        )
+        with self.assertRaisesRegex(RuntimeError, "already installed"):
+            fp8_ada.install_w8a16_reshard_wait(block)
+
+    def test_w8a16_reshard_wait_skips_blocks_without_w8a16(self):
+        block = nn.Sequential(nn.Linear(8, 8, bias=False))
+        self.assertFalse(fp8_ada.install_w8a16_reshard_wait(block))
+
+    def test_w8a16_reshard_wait_rejects_more_than_one_producer_stream(self):
+        first_stream = object()
+        second_stream = object()
+        event = mock.Mock()
+        fence = fp8_ada.W8A16BackwardFence()
+        with (
+            mock.patch.object(
+                torch.cuda,
+                "current_stream",
+                side_effect=[first_stream, second_stream],
+            ),
+            mock.patch.object(torch.cuda, "Event", return_value=event),
+        ):
+            fence.record(torch.device("cuda"))
+            with self.assertRaisesRegex(RuntimeError, "more than one CUDA stream"):
+                fence.record(torch.device("cuda"))
+        event.record.assert_called_once_with(first_stream)
+
     def test_eligible_fp8_dx_uses_grouped_kernel_and_not_oracle(self):
         grad = torch.randn(2, 3)
         weight = torch.randn(3, 4)

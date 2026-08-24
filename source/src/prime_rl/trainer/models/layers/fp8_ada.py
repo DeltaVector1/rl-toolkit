@@ -46,6 +46,38 @@ _EXPERT_PROFILE_EVERY = int(os.environ.get("PRIME_EXPERT_PROFILE_EVERY", "90"))
 _LINEAR_SNAPSHOT_CACHE: dict[str, list] = {}
 
 
+class W8A16BackwardFence:
+    def __init__(self) -> None:
+        self.event: torch.cuda.Event | None = None
+        self.pending = False
+        self.producer_stream: torch.cuda.Stream | None = None
+
+    def record(self, device: torch.device) -> None:
+        stream = torch.cuda.current_stream(device)
+        if self.pending and self.producer_stream != stream:
+            raise RuntimeError("one W8A16 FSDP unit used more than one CUDA stream")
+        if self.event is None:
+            self.event = torch.cuda.Event()
+        self.event.record(stream)
+        self.producer_stream = stream
+        self.pending = True
+
+    def wait_before_reshard(self, group) -> None:
+        if not self.pending:
+            return
+        if self.event is None:
+            raise RuntimeError("W8A16 backward event is missing")
+        streams = {
+            group.device_handle.current_stream(),
+            group.comm_ctx.all_gather_copy_in_stream,
+            group.comm_ctx.all_gather_stream,
+        }
+        for stream in streams:
+            stream.wait_event(self.event)
+        self.pending = False
+        self.producer_stream = None
+
+
 def exact_module_patterns(module_names, *, label="FP8") -> list[str]:
     if len(module_names) != len(set(module_names)):
         raise ValueError(f"{label} module names must be unique")
@@ -681,6 +713,10 @@ class _W8A16Linear(torch.autograd.Function):
             scale = ctx.scale_snapshot
         try:
             input_grad = _w8a16_input_grad(grad, weight, scale, fqn=ctx.fqn)
+            if ctx.owner is not None:
+                fence = getattr(ctx.owner[0], "_w8a16_backward_fence", None)
+                if fence is not None:
+                    fence.record(input_grad.device)
         finally:
             if ctx.snapshot_key is not None:
                 _release_linear_snapshot(ctx.snapshot_key)
@@ -733,6 +769,36 @@ class FP8CheckpointLinear(nn.Linear):
         module.bias = linear.bias
         module.w8a16 = bool(w8a16)
         return module
+
+
+def install_w8a16_reshard_wait(module: nn.Module) -> bool:
+    linears = [
+        child
+        for child in module.modules()
+        if isinstance(child, FP8CheckpointLinear) and getattr(child, "w8a16", False)
+    ]
+    if not linears:
+        return False
+    state = module._get_fsdp_state()
+    group = state._fsdp_param_group
+    if group is None:
+        raise RuntimeError("W8A16 reshard wait requires an FSDP parameter group")
+    if getattr(group, "_prime_w8a16_reshard_wait", False):
+        raise RuntimeError("W8A16 reshard wait is already installed")
+
+    fence = W8A16BackwardFence()
+    for linear in linears:
+        linear._w8a16_backward_fence = fence
+    original_post_backward = group.post_backward
+
+    def post_backward(*args, **kwargs):
+        fence.wait_before_reshard(group)
+        return original_post_backward(*args, **kwargs)
+
+    group.post_backward = post_backward
+    group._prime_w8a16_fence = fence
+    group._prime_w8a16_reshard_wait = True
+    return True
 
 
 class FP8CheckpointEmbedding(nn.Embedding):
