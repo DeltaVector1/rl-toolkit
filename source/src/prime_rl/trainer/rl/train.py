@@ -43,7 +43,11 @@ from prime_rl.trainer.rl.loss import (
     shift_tensor_right,
 )
 from prime_rl.trainer.rl.token_export import setup_token_exporter
-from prime_rl.parity_router_trace import publish_trainer_bundle, trace_dir_env
+from prime_rl.parity_router_trace import (
+    prepare_trainer_bundle_communication,
+    publish_trainer_bundle,
+    trace_dir_env,
+)
 from prime_rl.trainer.model import (
     DTYPE_MAP,
     forward,
@@ -725,6 +729,13 @@ def train(config: TrainerConfig):
             dataloader = real_dataloader
 
     token_exporter = setup_token_exporter(config, parallel_dims, world, logger, model)
+    parity_bundle_enabled = trace_dir_env in config.env_vars
+    if parity_bundle_enabled and not parallel_dims.pp_enabled:
+        raise ValueError("trainer parity bundle requires pipeline parallel training")
+    parity_bundle_communication = prepare_trainer_bundle_communication(
+        parity_bundle_enabled, torch.device("cuda", world.local_rank)
+    )
+    parity_bundle_readiness = None
 
     gc_handler = GarbageCollection(config.gc.interval) if config.gc else None
 
@@ -1387,6 +1398,7 @@ def train(config: TrainerConfig):
                     f"micro-batch count mismatch across ranks (max={_n[0].item()}, "
                     f"min={-_n[1].item()}); the pipeline schedule would deadlock"
                 )
+            parity_bundle_readiness = _n
             pp_side_inputs = pad_pp_side_inputs(pp_side_inputs, cp_world_size=parallel_dims.cp)
             pp_stage_module.loss_closure = _pp_loss
             pp_stage_module.set_side_inputs(pp_side_inputs)
@@ -1548,7 +1560,10 @@ def train(config: TrainerConfig):
         if config.enable_token_export:
             dist.barrier()
             publish_trainer_bundle(
-                token_exporter.parity_source(), trace_dir_env in config.env_vars
+                token_exporter.parity_source(),
+                parity_bundle_enabled,
+                parity_bundle_communication,
+                parity_bundle_readiness,
             )
             ready_run_ids = {
                 multi_run_manager.idx_2_id[idx]

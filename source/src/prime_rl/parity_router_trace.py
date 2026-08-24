@@ -29,6 +29,7 @@ trainer_provenance_union_name = "trainer-provenance-union.json"
 trainer_fixture_source_name = "trainer-fixture-source.npz"
 trainer_fixture_manifest_name = "trainer-fixture-source.json"
 trainer_bundle_stable_name = "STABLE"
+trainer_bundle_slab_bytes = 2_049_028
 router_debug_pattern = re.compile(
     r"^(trainer|h200)-rank-(\d+)-pp-(\d+)-cp-(\d+)-layer-(\d+)-router-debug\.npz$"
 )
@@ -183,6 +184,30 @@ class TraceSession:
         result = cls(**{name: value[name] for name in cls.__dataclass_fields__})
         result.validate()
         return result
+
+
+@dataclass(frozen=True)
+class TrainerBundleCommunication:
+    slab: Any | None
+    error: str | None
+
+
+def prepare_trainer_bundle_communication(
+    enabled: bool, device: Any
+) -> TrainerBundleCommunication | None:
+    if not enabled:
+        return None
+    try:
+        import torch
+
+        slab = torch.empty(
+            (trainer_bundle_slab_bytes,), dtype=torch.uint8, device=device
+        )
+        return TrainerBundleCommunication(slab=slab, error=None)
+    except BaseException as error:
+        return TrainerBundleCommunication(
+            slab=None, error=f"trainer bundle slab allocation failed: {error}"[:512]
+        )
 
 
 def trace_root() -> Path | None:
@@ -1064,9 +1089,44 @@ def _write_trainer_bundle(
             path.unlink(missing_ok=True)
 
 
+def _trainer_bundle_slab_views(slab: Any) -> dict[str, Any]:
+    import torch
+
+    if (
+        slab.dtype != torch.uint8
+        or slab.numel() != trainer_bundle_slab_bytes
+        or slab.device.type != "cuda"
+    ):
+        raise ValueError("trainer bundle communication slab is invalid")
+    offset = 0
+
+    def take(byte_count: int, dtype: Any) -> Any:
+        nonlocal offset
+        value = slab[offset : offset + byte_count].view(dtype)
+        offset += byte_count
+        return value
+
+    views = {
+        "local_metadata": take(16 * 1024, torch.uint8),
+        "gathered_metadata": take(64 * 16 * 1024, torch.uint8),
+        "token_ids": take(32768 * 8, torch.int64),
+        "positions": take(32768 * 8, torch.int64),
+        "selected_indices": take(32768 * 8, torch.int64),
+        "advantages": take(32768 * 4, torch.float32),
+        "local_errors": take(1024, torch.uint8),
+        "gathered_errors": take(64 * 1024, torch.uint8),
+        "status": take(4, torch.int32),
+    }
+    if offset != trainer_bundle_slab_bytes:
+        raise ValueError("trainer bundle communication slab layout differs")
+    return views
+
+
 def publish_trainer_bundle(
     compact_source: dict[str, np.ndarray] | None,
     enabled: bool,
+    communication: TrainerBundleCommunication | None = None,
+    readiness: Any = None,
 ) -> None:
     if not enabled:
         return
@@ -1077,6 +1137,69 @@ def publish_trainer_bundle(
         raise ValueError("trainer provenance bundle requires distributed training")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
+    if (
+        readiness is None
+        or readiness.numel() != 2
+        or readiness.device.type != "cuda"
+    ):
+        raise ValueError("trainer bundle readiness storage is invalid")
+    communication_error = None
+    slab = None
+    try:
+        if communication is None:
+            raise ValueError("trainer bundle communication was not prepared")
+        if communication.error is not None:
+            raise ValueError(communication.error)
+        slab = communication.slab
+        if slab is None:
+            raise ValueError("trainer bundle communication slab is missing")
+        if (
+            slab.dtype != torch.uint8
+            or slab.numel() != trainer_bundle_slab_bytes
+            or slab.device.type != "cuda"
+        ):
+            raise ValueError("trainer bundle communication slab is invalid")
+    except BaseException as error:
+        communication_error = str(error)[:512]
+    readiness[0] = int(communication_error is not None)
+    readiness[1] = 0
+    dist.all_reduce(readiness, op=dist.ReduceOp.MAX)
+    if int(readiness[0].item()) != 0:
+        if communication_error is not None:
+            raise RuntimeError("trainer bundle communication is unavailable") from ValueError(
+                communication_error
+            )
+        raise RuntimeError("trainer bundle communication is unavailable on another rank")
+    views = None
+    view_error = None
+    try:
+        views = _trainer_bundle_slab_views(slab)
+        views["token_ids"].zero_()
+        views["positions"].zero_()
+        views["selected_indices"].fill_(-1)
+        views["advantages"].zero_()
+        views["local_errors"].zero_()
+        views["status"].zero_()
+    except BaseException as error:
+        view_error = str(error)[:512]
+    readiness[0] = int(view_error is not None)
+    readiness[1] = 0
+    dist.all_reduce(readiness, op=dist.ReduceOp.MAX)
+    if int(readiness[0].item()) != 0:
+        if view_error is not None:
+            raise RuntimeError("trainer bundle slab setup failed") from ValueError(
+                view_error
+            )
+        raise RuntimeError("trainer bundle slab setup failed on another rank")
+    local_metadata = views["local_metadata"]
+    gathered_metadata = views["gathered_metadata"]
+    token_ids = views["token_ids"]
+    positions = views["positions"]
+    selected_indices = views["selected_indices"]
+    advantages = views["advantages"]
+    local_errors = views["local_errors"]
+    gathered_errors = views["gathered_errors"]
+    status = views["status"]
     errors: list[str] = []
     root: Path | None = None
     session: TraceSession | None = None
@@ -1134,29 +1257,13 @@ def publish_trainer_bundle(
         ).encode("utf-8")
     encoded = len(metadata_bytes).to_bytes(4, "little") + metadata_bytes
     encoded += b"\0" * (metadata_limit - len(encoded))
-    device = torch.device("cuda", torch.cuda.current_device())
-    local_metadata = torch.from_numpy(
-        np.frombuffer(encoded, dtype=np.uint8).copy()
-    ).to(device=device)
-    gathered_metadata = torch.empty(
-        world_size * metadata_limit, dtype=torch.uint8, device=device
-    )
-    control = torch.zeros((2,), dtype=torch.int32, device=device)
-    status = torch.zeros((1,), dtype=torch.int32, device=device)
-    dist.all_gather_into_tensor(gathered_metadata, local_metadata)
-    token_ids = None
-    positions = None
-    selected_indices = None
-    advantages = None
     try:
-        token_ids = torch.zeros((32768,), dtype=torch.int64, device=device)
-        positions = torch.zeros((32768,), dtype=torch.int64, device=device)
-        selected_indices = torch.full(
-            (32768,), -1, dtype=torch.int64, device=device
+        local_metadata.copy_(
+            torch.from_numpy(np.frombuffer(encoded, dtype=np.uint8))
         )
-        advantages = torch.zeros((32768,), dtype=torch.float32, device=device)
     except BaseException as error:
-        errors.append(f"source buffer allocation failed: {error}"[:512])
+        errors.append(f"metadata transfer failed: {error}"[:512])
+    dist.all_gather_into_tensor(gathered_metadata, local_metadata)
     if rank == source_rank and not errors:
         try:
             if compact_source is None:
@@ -1197,7 +1304,7 @@ def publish_trainer_bundle(
                 (selected_indices, "selected_indices"),
                 (advantages, "advantages"),
             ):
-                source_value = torch.from_numpy(source_arrays[name]).to(device=device)
+                source_value = torch.from_numpy(source_arrays[name])
                 target[: source_value.numel()].copy_(source_value)
         except BaseException as error:
             errors.append(f"source preparation failed: {error}"[:512])
@@ -1206,26 +1313,17 @@ def publish_trainer_bundle(
     error_bytes = "; ".join(errors).encode("utf-8", errors="replace")[: error_limit - 4]
     error_encoded = len(error_bytes).to_bytes(4, "little") + error_bytes
     error_encoded += b"\0" * (error_limit - len(error_encoded))
-    local_errors = None
-    gathered_errors = None
-    error_buffers_missing = False
     try:
-        local_errors = torch.from_numpy(
-            np.frombuffer(error_encoded, dtype=np.uint8).copy()
-        ).to(device=device)
-        gathered_errors = torch.empty(
-            world_size * error_limit, dtype=torch.uint8, device=device
+        local_errors.copy_(
+            torch.from_numpy(np.frombuffer(error_encoded, dtype=np.uint8))
         )
     except BaseException as error:
-        errors.append(f"error buffer allocation failed: {error}"[:512])
-        error_buffers_missing = True
-    control[0] = int(bool(errors))
-    control[1] = int(error_buffers_missing)
-    dist.all_reduce(control, op=dist.ReduceOp.MAX)
-    any_error = bool(int(control[0].item()))
-    any_error_buffers_missing = bool(int(control[1].item()))
-    if not any_error_buffers_missing:
-        dist.all_gather_into_tensor(gathered_errors, local_errors)
+        errors.append(f"error transfer failed: {error}"[:512])
+    readiness[0] = int(bool(errors))
+    readiness[1] = 0
+    dist.all_reduce(readiness, op=dist.ReduceOp.MAX)
+    any_error = bool(int(readiness[0].item()))
+    dist.all_gather_into_tensor(gathered_errors, local_errors)
     if not any_error:
         for value in (token_ids, positions, selected_indices, advantages):
             dist.broadcast(value, src=source_rank)
@@ -1233,8 +1331,6 @@ def publish_trainer_bundle(
     failure: BaseException | None = None
     if rank == 0:
         try:
-            if any_error_buffers_missing:
-                raise ValueError("one or more ranks could not allocate parity buffers")
             error_rows = gathered_errors.reshape(
                 world_size, error_limit
             ).cpu().numpy()

@@ -134,12 +134,23 @@ def fake_torch(state=None):
 
 
 class CollectiveTensor:
-    def __init__(self, value):
+    def __init__(self, value, *, fail_to=False):
         self.value = np.asarray(value)
+        self.device = types.SimpleNamespace(type="cuda")
+        self.fail_to = fail_to
+
+    @property
+    def dtype(self):
+        return self.value.dtype
 
     def to(self, *args, **kwargs):
         del args, kwargs
+        if self.fail_to:
+            raise RuntimeError("legacy metadata transfer stopped")
         return self
+
+    def view(self, dtype):
+        return CollectiveTensor(self.value.view(dtype))
 
     def reshape(self, *shape):
         return CollectiveTensor(self.value.reshape(*shape))
@@ -155,6 +166,14 @@ class CollectiveTensor:
 
     def copy_(self, other):
         self.value[...] = other.value
+        return self
+
+    def zero_(self):
+        self.value.fill(0)
+        return self
+
+    def fill_(self, value):
+        self.value.fill(value)
         return self
 
     def item(self):
@@ -175,16 +194,17 @@ class FakeBundleCollectives(types.ModuleType):
         gathered_metadata=None,
         source_values=None,
         remote_failure=False,
-        remote_control=None,
+        remote_controls=None,
     ):
         super().__init__("torch.distributed")
         self.rank = rank
         self.gathered_metadata = gathered_metadata
         self.source_values = source_values
         self.remote_failure = remote_failure
-        self.remote_control = remote_control
+        self.remote_controls = list(remote_controls or ())
         self.calls = []
         self.gather_count = 0
+        self.all_reduce_count = 0
         self.source_broadcast_count = 0
 
     def is_available(self):
@@ -210,9 +230,21 @@ class FakeBundleCollectives(types.ModuleType):
 
     def all_reduce(self, value, op):
         del op
-        self.calls.append("all-reduce-control")
-        if self.remote_control is not None:
-            value.value[...] = np.maximum(value.value, self.remote_control)
+        label = (
+            "all-reduce-readiness"
+            if self.all_reduce_count == 0
+            else (
+                "all-reduce-slab"
+                if self.all_reduce_count == 1
+                else "all-reduce-errors"
+            )
+        )
+        self.calls.append(label)
+        if self.all_reduce_count < len(self.remote_controls):
+            value.value[...] = np.maximum(
+                value.value, self.remote_controls[self.all_reduce_count]
+            )
+        self.all_reduce_count += 1
 
     def broadcast(self, value, src):
         if src == 56:
@@ -230,8 +262,8 @@ def fake_collective_torch(
     distributed,
     *,
     fail_source_copy=False,
-    fail_source_allocation=None,
-    fail_error_allocation=False,
+    fail_slab_allocation=False,
+    fail_legacy_allocation=None,
 ):
     module = types.ModuleType("torch")
     module.distributed = distributed
@@ -247,26 +279,37 @@ def fake_collective_torch(
 
     def from_numpy(value):
         array = np.asarray(value)
-        if fail_error_allocation and array.dtype == np.uint8 and array.size == 1024:
-            raise RuntimeError("error buffer stopped")
         if fail_source_copy and array.dtype != np.uint8:
             raise RuntimeError("source copy stopped")
-        return CollectiveTensor(array.copy())
+        return CollectiveTensor(
+            array.copy(),
+            fail_to=(
+                fail_legacy_allocation == "metadata_to"
+                and array.dtype == np.uint8
+                and array.size == 16 * 1024
+            ),
+        )
 
     module.from_numpy = from_numpy
-    module.empty = lambda shape, dtype, device: CollectiveTensor(
-        np.empty(shape, dtype=dtype)
-    )
+    def empty(shape, dtype, device):
+        del device
+        if fail_slab_allocation and shape == (parity_trace.trainer_bundle_slab_bytes,):
+            raise RuntimeError("communication slab stopped")
+        if fail_legacy_allocation == "metadata_empty" and shape == (64 * 16 * 1024,):
+            raise RuntimeError("legacy metadata gather allocation stopped")
+        return CollectiveTensor(np.empty(shape, dtype=dtype))
+
+    module.empty = empty
     def zeros(shape, dtype, device):
         del device
-        if fail_source_allocation == "zeros" and shape == (32768,):
-            raise RuntimeError("zero allocation stopped")
+        if fail_legacy_allocation == "shape2" and shape == (2,):
+            raise RuntimeError("legacy shape-2 allocation stopped")
+        if fail_legacy_allocation == "shape1" and shape == (1,):
+            raise RuntimeError("legacy shape-1 allocation stopped")
         return CollectiveTensor(np.zeros(shape, dtype=dtype))
 
     def full(shape, fill, dtype, device):
         del device
-        if fail_source_allocation == "full" and shape == (32768,):
-            raise RuntimeError("full allocation stopped")
         return CollectiveTensor(np.full(shape, fill, dtype=dtype))
 
     module.zeros = zeros
@@ -377,6 +420,17 @@ class ParityRouterTraceTest(unittest.TestCase):
             patch.object(parity_trace, "_process_cp_size", 8),
         )
 
+    def _bundle_resources(self, torch_module):
+        slab = torch_module.empty(
+            (parity_trace.trainer_bundle_slab_bytes,),
+            dtype=torch_module.uint8,
+            device="cuda:0",
+        )
+        return (
+            parity_trace.TrainerBundleCommunication(slab=slab, error=None),
+            CollectiveTensor(np.zeros(2, dtype=np.int64)),
+        )
+
     def test_trainer_bundle_validates_pp8_cp8_and_compact_source(self):
         metadata, gathered, arrays = self._trainer_bundle_values()
         with patch.object(parity_trace, "_process_pp_size", 8), patch.object(
@@ -482,11 +536,19 @@ class ParityRouterTraceTest(unittest.TestCase):
         self.assertIn("all_gather_into_tensor", source)
         self.assertNotIn("gather_object", source)
         self.assertIn("metadata_limit = 16 * 1024", source)
-        self.assertIn("torch.zeros((32768,)", source)
         self.assertIn("error_limit = 1024", source)
-        self.assertIn("status = torch.zeros", source)
+        self.assertNotIn("torch.zeros(", source)
+        self.assertNotIn("torch.empty(", source)
+        self.assertNotIn(".to(device=device)", source)
+        self.assertEqual(
+            source.count("dist.all_reduce(readiness, op=dist.ReduceOp.MAX)"), 3
+        )
         self.assertLess(
-            source.index("dist.all_reduce(control"),
+            source.index("dist.all_reduce(readiness"),
+            source.index("dist.all_gather_into_tensor"),
+        )
+        self.assertLess(
+            source.rindex("dist.all_reduce(readiness"),
             source.index("if not any_error:"),
         )
         self.assertLess(
@@ -495,9 +557,17 @@ class ParityRouterTraceTest(unittest.TestCase):
         train_source = Path(
             "source/src/prime_rl/trainer/rl/train.py"
         ).read_text()
+        prepare = train_source.index(
+            "parity_bundle_communication = prepare_trainer_bundle_communication"
+        )
+        world_count = train_source.index("dist.all_reduce(_n, op=dist.ReduceOp.MAX)")
+        readiness_source = train_source.index("parity_bundle_readiness = _n", world_count)
         barrier = train_source.index("dist.barrier()", train_source.index("if config.enable_token_export"))
         publish = train_source.index("publish_trainer_bundle", barrier)
         stable = train_source.index("token_exporter.mark_stable", publish)
+        self.assertLess(prepare, barrier)
+        self.assertLess(world_count, readiness_source)
+        self.assertLess(readiness_source, barrier)
         self.assertLess(barrier, publish)
         self.assertLess(publish, stable)
 
@@ -508,8 +578,10 @@ class ParityRouterTraceTest(unittest.TestCase):
     def test_trainer_bundle_rank_local_failures_keep_collective_order(self):
         metadata, _, _ = self._trainer_bundle_values(32768)
         expected = [
+            "all-reduce-readiness",
+            "all-reduce-slab",
             "gather-metadata",
-            "all-reduce-control",
+            "all-reduce-errors",
             "gather-errors",
             "broadcast-status",
         ]
@@ -563,6 +635,7 @@ class ParityRouterTraceTest(unittest.TestCase):
             with self.subTest(name=name):
                 distributed = FakeBundleCollectives(0)
                 torch_module = fake_collective_torch(distributed)
+                communication, readiness = self._bundle_resources(torch_module)
                 with ExitStack() as stack:
                     for context in self._bundle_collective_context(
                         0, distributed, torch_module
@@ -572,14 +645,18 @@ class ParityRouterTraceTest(unittest.TestCase):
                     stack.enter_context(session_patch)
                     stack.enter_context(json_patch)
                     with self.assertRaisesRegex(RuntimeError, "bundle failed"):
-                        parity_trace.publish_trainer_bundle(None, True)
+                        parity_trace.publish_trainer_bundle(
+                            None, True, communication, readiness
+                        )
                 self.assertEqual(distributed.calls, expected)
 
     def test_trainer_bundle_source_failures_keep_collective_order(self):
         metadata, _, arrays = self._trainer_bundle_values(32768)
         expected = [
+            "all-reduce-readiness",
+            "all-reduce-slab",
             "gather-metadata",
-            "all-reduce-control",
+            "all-reduce-errors",
             "gather-errors",
             "broadcast-status",
         ]
@@ -595,6 +672,7 @@ class ParityRouterTraceTest(unittest.TestCase):
                 torch_module = fake_collective_torch(
                     distributed, fail_source_copy=fail_copy
                 )
+                communication, readiness = self._bundle_resources(torch_module)
                 with ExitStack() as stack:
                     for context in self._bundle_collective_context(
                         56, distributed, torch_module
@@ -611,20 +689,62 @@ class ParityRouterTraceTest(unittest.TestCase):
                         patch.object(parity_trace, "read_session", return_value=metadata)
                     )
                     with self.assertRaisesRegex(RuntimeError, "trainer head"):
-                        parity_trace.publish_trainer_bundle(compact_source, True)
+                        parity_trace.publish_trainer_bundle(
+                            compact_source, True, communication, readiness
+                        )
                 self.assertEqual(distributed.calls, expected)
 
-    def test_trainer_bundle_allocation_failures_use_control_rendezvous(self):
-        metadata, _, _ = self._trainer_bundle_values(32768)
-        cases = (
-            ("zeros", {"fail_source_allocation": "zeros"}, True),
-            ("full", {"fail_source_allocation": "full"}, True),
-            ("error", {"fail_error_allocation": True}, False),
-        )
-        for name, failure, error_gather in cases:
+    def test_trainer_bundle_slab_failure_is_uniformly_reported(self):
+        for rank, remote_controls in (
+            (0, ()),
+            (56, ()),
+            (0, ((1, 0),)),
+        ):
+            name = f"rank-{rank}-remote-{bool(remote_controls)}"
             with self.subTest(name=name):
+                distributed = FakeBundleCollectives(
+                    rank, remote_controls=remote_controls
+                )
+                torch_module = fake_collective_torch(
+                    distributed, fail_slab_allocation=not remote_controls
+                )
+                with ExitStack() as stack:
+                    for context in self._bundle_collective_context(
+                        rank, distributed, torch_module
+                    ):
+                        stack.enter_context(context)
+                    communication = parity_trace.prepare_trainer_bundle_communication(
+                        True, "cuda:0"
+                    )
+                    if remote_controls:
+                        communication, _ = self._bundle_resources(torch_module)
+                    readiness = CollectiveTensor(np.zeros(2, dtype=np.int64))
+                    with self.assertRaisesRegex(
+                        RuntimeError, "communication is unavailable"
+                    ):
+                        parity_trace.publish_trainer_bundle(
+                            None, True, communication, readiness
+                        )
+                self.assertEqual(distributed.calls, ["all-reduce-readiness"])
+
+    def test_trainer_bundle_avoids_legacy_cuda_allocations(self):
+        metadata, _, _ = self._trainer_bundle_values(32768)
+        expected = [
+            "all-reduce-readiness",
+            "all-reduce-slab",
+            "gather-metadata",
+            "all-reduce-errors",
+            "gather-errors",
+            "broadcast-status",
+        ]
+        for fault in ("shape2", "shape1", "metadata_to", "metadata_empty"):
+            with self.subTest(fault=fault):
                 distributed = FakeBundleCollectives(0)
-                torch_module = fake_collective_torch(distributed, **failure)
+                clean_torch = fake_collective_torch(distributed)
+                communication, readiness = self._bundle_resources(clean_torch)
+                torch_module = fake_collective_torch(
+                    distributed, fail_legacy_allocation=fault
+                )
                 with ExitStack() as stack:
                     for context in self._bundle_collective_context(
                         0, distributed, torch_module
@@ -634,48 +754,14 @@ class ParityRouterTraceTest(unittest.TestCase):
                         patch.object(
                             parity_trace,
                             "validated_trace_root",
-                            return_value=Path("/trace"),
+                            side_effect=ValueError("root stopped"),
                         )
                     )
-                    stack.enter_context(
-                        patch.object(parity_trace, "read_session", return_value=metadata)
-                    )
                     with self.assertRaisesRegex(RuntimeError, "bundle failed"):
-                        parity_trace.publish_trainer_bundle(None, True)
-                expected = ["gather-metadata", "all-reduce-control"]
-                if error_gather:
-                    expected.append("gather-errors")
-                expected.append("broadcast-status")
+                        parity_trace.publish_trainer_bundle(
+                            None, True, communication, readiness
+                        )
                 self.assertEqual(distributed.calls, expected)
-
-    def test_trainer_bundle_remote_allocation_failure_skips_source_broadcasts(self):
-        metadata, _, _ = self._trainer_bundle_values(32768)
-        distributed = FakeBundleCollectives(0, remote_control=(1, 0))
-        torch_module = fake_collective_torch(distributed)
-        with ExitStack() as stack:
-            for context in self._bundle_collective_context(
-                0, distributed, torch_module
-            ):
-                stack.enter_context(context)
-            stack.enter_context(
-                patch.object(
-                    parity_trace, "validated_trace_root", return_value=Path("/trace")
-                )
-            )
-            stack.enter_context(
-                patch.object(parity_trace, "read_session", return_value=metadata)
-            )
-            with self.assertRaisesRegex(RuntimeError, "bundle failed"):
-                parity_trace.publish_trainer_bundle(None, True)
-        self.assertEqual(
-            distributed.calls,
-            [
-                "gather-metadata",
-                "all-reduce-control",
-                "gather-errors",
-                "broadcast-status",
-            ],
-        )
 
     def test_trainer_bundle_rank_zero_write_failure_reaches_status_broadcast(self):
         metadata, gathered, arrays = self._trainer_bundle_values(32768)
@@ -695,6 +781,7 @@ class ParityRouterTraceTest(unittest.TestCase):
             ),
         )
         torch_module = fake_collective_torch(distributed)
+        communication, readiness = self._bundle_resources(torch_module)
         with ExitStack() as stack:
             for context in self._bundle_collective_context(
                 0, distributed, torch_module
@@ -719,12 +806,16 @@ class ParityRouterTraceTest(unittest.TestCase):
                 patch.dict(os.environ, {"PRIME_TRAINER_HEAD": "n82"}, clear=True)
             )
             with self.assertRaisesRegex(RuntimeError, "bundle failed"):
-                parity_trace.publish_trainer_bundle(None, True)
+                parity_trace.publish_trainer_bundle(
+                    None, True, communication, readiness
+                )
         self.assertEqual(
             distributed.calls,
             [
+                "all-reduce-readiness",
+                "all-reduce-slab",
                 "gather-metadata",
-                "all-reduce-control",
+                "all-reduce-errors",
                 "gather-errors",
                 "broadcast-source",
                 "broadcast-source",
