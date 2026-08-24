@@ -5,8 +5,11 @@ enable_router_replay = false
 enable_token_export = false
 
 [data.fake]
-batch_size = 32
+batch_size = 64
 generate_samples = true
+samples_per_micro_batch = 32
+group_size = 16
+export_final_adapter = true
 
 [log]
 level = "debug"
@@ -63,7 +66,7 @@ freq = 1
 
 [optim]
 type = "muon"
-lr = 0.0
+lr = 8e-6
 weight_decay = 0.0
 max_norm = 1.0
 

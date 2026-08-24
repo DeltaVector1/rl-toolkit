@@ -1,4 +1,5 @@
 import base64
+import datetime
 import hashlib
 import json
 import os
@@ -19,6 +20,172 @@ def _trainer_inspect_record(run_records, command):
 
 
 class EdgeOperationsTest(unittest.TestCase):
+    def qualification_evidence(self, profile_name="glm52-native-b2048"):
+        with (
+            training_ops.repo_root
+            / f"configs/qualification/{profile_name}.toml"
+        ).open("rb") as stream:
+            profile = tomllib.load(stream)
+        now = datetime.datetime(2026, 8, 24, 12, 0, tzinfo=datetime.timezone.utc)
+        hosts = [training_ops.trainer_head] + [
+            host
+            for host in training_ops.trainer_hosts
+            if host != training_ops.trainer_head
+        ]
+        source_files = {"source/a.py": "a" * 64}
+        session = {
+            "schema_version": 1,
+            "kind": "glm52_trainer_qualification_session",
+            "session_id": "1" * 32,
+            "profile": profile_name,
+            "created_utc": (now - datetime.timedelta(minutes=2)).isoformat(),
+            "config_sha256": hashlib.sha256(
+                (
+                    training_ops.repo_root
+                    / f"configs/qualification/{profile_name}.toml"
+                ).read_bytes()
+            ).hexdigest(),
+            "source_sha256": hashlib.sha256(
+                (json.dumps(source_files, sort_keys=True, separators=(",", ":")) + "\n").encode()
+            ).hexdigest(),
+            "source_files": source_files,
+            "trainer_hosts": hosts,
+            "trainer_head": training_ops.trainer_head,
+            "image_digests": {host: "sha256:" + "b" * 64 for host in hosts},
+            "topology": {
+                "world_size": 64,
+                "pp": 8,
+                "cp": 8,
+                "ep": 8,
+                "dp_replicate": 1,
+                "dp_shard": 1,
+            },
+        }
+        count = 2 if profile_name == "glm52-native-b2048" else 20
+        result = {
+            "schema_version": 1,
+            "kind": "glm52_trainer_qualification",
+            "session_id": session["session_id"],
+            "profile": profile_name,
+            "session_sha256": training_ops._canonical_json_sha256(session),
+            "config_sha256": session["config_sha256"],
+            "source_sha256": session["source_sha256"],
+            "trainer_head": training_ops.trainer_head,
+            "trainer_head_image_digest": session["image_digests"][training_ops.trainer_head],
+            "completed_utc": (now - datetime.timedelta(minutes=1)).isoformat(),
+            "topology": session["topology"],
+            "fake_data": {
+                "batch_size": 64,
+                "samples_per_micro_batch": 32,
+                "group_size": 16,
+                "sequence_length": 32768,
+                "rollout_cache": False,
+            },
+            "lora": {
+                "rank": 32,
+                "alpha": 64,
+                "targets": sorted(profile["model"]["lora"]["target_modules"]),
+            },
+            "max_steps": count,
+            "steps": [
+                {
+                    "step": step,
+                    "data/rollout_rows": 2048.0,
+                    "loss/mean": 0.5,
+                    "optim/grad_norm": 0.8,
+                    "optim/lr": 8e-6,
+                    "perf/peak_memory": 44.0,
+                    "time/forward_backward": 300.0,
+                }
+                for step in range(1, count + 1)
+            ],
+            "metrics_path": profile["output_dir"] + "/trainer-metrics.jsonl",
+            "metrics_sha256": "c" * 64,
+            "adapter": None,
+        }
+        if count == 20:
+            result["adapter"] = {
+                "path": profile["output_dir"] + "/run_trainer_only/broadcasts/step_20/adapter_model.safetensors",
+                "sha256": "d" * 64,
+                "size": 300_000_000,
+                "step": 20,
+                "config_path": profile["output_dir"] + "/run_trainer_only/broadcasts/step_20/adapter_config.json",
+                "config_sha256": "e" * 64,
+                "stable_path": profile["output_dir"] + "/run_trainer_only/broadcasts/step_20/STABLE",
+                "stable_sha256": "f" * 64,
+                "checksum_path": profile["output_dir"] + "/run_trainer_only/broadcasts/step_20/adapter_model.safetensors.sha256",
+                "checksum_sha256": "0" * 64,
+            }
+        return session, result, profile, now
+
+    def test_trainer_qualification_evidence_is_exact_and_fresh(self):
+        for name in ("glm52-native-b2048", "glm52-native-stability20"):
+            session, result, profile, now = self.qualification_evidence(name)
+            self.assertEqual(
+                training_ops._validate_trainer_qualification(
+                    session, result, profile, name, now=now
+                ),
+                [],
+            )
+
+    def test_trainer_qualification_rejects_bad_batch_time_memory_and_adapter(self):
+        session, result, profile, now = self.qualification_evidence(
+            "glm52-native-stability20"
+        )
+        result["steps"][0]["data/rollout_rows"] = 2047
+        result["steps"][1]["time/forward_backward"] = 481
+        result["steps"][2]["perf/peak_memory"] = 46.1
+        result["adapter"] = None
+        failures = training_ops._validate_trainer_qualification(
+            session, result, profile, "glm52-native-stability20", now=now
+        )
+        self.assertTrue(any("2048 samples" in failure for failure in failures))
+        self.assertTrue(any("trainer time" in failure for failure in failures))
+        self.assertTrue(any("memory" in failure for failure in failures))
+        self.assertTrue(any("adapter" in failure for failure in failures))
+
+    def test_trainer_qualification_session_publish_is_no_follow_and_atomic(self):
+        profile_name = "glm52-native-b2048"
+        path = (
+            training_ops.repo_root
+            / f"configs/qualification/{profile_name}.toml"
+        )
+        with path.open("rb") as stream:
+            profile = tomllib.load(stream)
+        hosts = [training_ops.trainer_head] + [
+            host
+            for host in training_ops.trainer_hosts
+            if host != training_ops.trainer_head
+        ]
+        images = {host: "sha256:" + "a" * 64 for host in hosts}
+        calls = []
+
+        def ssh(host, command, timeout=60):
+            calls.append((host, command, timeout))
+            return 0, ""
+
+        with (
+            patch.object(training_ops, "_trainer_image_digest_map", return_value=images),
+            patch.object(training_ops, "_ssh", side_effect=ssh),
+            patch.object(training_ops.secrets, "token_hex", return_value="1" * 32),
+        ):
+            environment = training_ops._prepare_trainer_qualification_session(
+                profile_name,
+                profile,
+                path,
+                hosts,
+                {"source/a.py": "b" * 64},
+            )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], training_ops.trainer_head)
+        self.assertEqual(calls[0][2], 60)
+        self.assertIn("os.O_EXCL | os.O_NOFOLLOW", calls[0][1])
+        self.assertIn("os.replace(temporary, destination", calls[0][1])
+        self.assertIn("os.fsync(directory)", calls[0][1])
+        self.assertNotIn(" tee ", calls[0][1])
+        self.assertIn("PRIME_QUALIFICATION_SESSION_ID=" + "1" * 32, environment)
+
     def test_status_parser_keeps_metric_names_with_digits(self):
         self.assertEqual(training_ops._kv("FAILS5M 3\n"), {"FAILS5M": "3"})
 

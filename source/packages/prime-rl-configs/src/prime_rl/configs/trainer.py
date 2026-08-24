@@ -549,6 +549,12 @@ class FakeDataLoaderConfig(BaseConfig):
     generate_samples: bool = False
     """Generate separate samples and pack them into a single micro-batch instead of using random tensors."""
 
+    samples_per_micro_batch: int | None = Field(None, ge=1)
+    """Generate exactly this many samples in each packed micro-batch."""
+
+    group_size: int | None = Field(None, ge=2)
+    """Normalize generated sample advantages in groups of this size."""
+
     ce_only: bool = False
     """Use a CE-only objective so trainer stress tests do real backward work."""
 
@@ -557,6 +563,24 @@ class FakeDataLoaderConfig(BaseConfig):
 
     export_final_adapter: bool = False
     """Write the final LoRA adapter for an inference qualification."""
+
+    @model_validator(mode="after")
+    def validate_grouped_samples(self):
+        if (self.samples_per_micro_batch is None) != (self.group_size is None):
+            raise ValueError(
+                "samples_per_micro_batch and group_size must be set together"
+            )
+        if self.samples_per_micro_batch is None:
+            return self
+        if not self.generate_samples:
+            raise ValueError("grouped fake samples require generate_samples=true")
+        if self.reference_path is not None:
+            raise ValueError("grouped fake samples cannot use a reference file")
+        if self.samples_per_micro_batch % self.group_size:
+            raise ValueError(
+                "samples_per_micro_batch must be divisible by group_size"
+            )
+        return self
 
 
 class RolloutCacheConfig(BaseConfig):

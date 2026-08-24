@@ -185,6 +185,7 @@ PY
     parity_trace_runtime=""
     parity_image_digest=""
     parity_env=()
+    qualification_env=()
     if [ -n "$parity_trace_dir" ]; then
       [ "$parity_trace_dir" = "/data/glm52-rl/qualifications/glm52-policy-parity/trainer-traces" ] || {
         echo "parity trace directory is not the pinned base directory" >&2
@@ -266,6 +267,41 @@ PY
         )
       fi
     fi
+    if [ -n "${PRIME_QUALIFICATION_SESSION_ID:-}" ]; then
+      [[ "$PRIME_QUALIFICATION_SESSION_ID" =~ ^[0-9a-f]{32}$ ]] || {
+        echo "qualification session ID is invalid" >&2; exit 1
+      }
+      case "${PRIME_QUALIFICATION_PROFILE:-}" in
+        glm52-native-b2048|glm52-native-stability20) ;;
+        *) echo "qualification profile is invalid" >&2; exit 1 ;;
+      esac
+      for value in \
+        "${PRIME_QUALIFICATION_CONFIG_SHA256:-}" \
+        "${PRIME_QUALIFICATION_SOURCE_SHA256:-}" \
+        "${PRIME_QUALIFICATION_SESSION_SHA256:-}"; do
+        [[ "$value" =~ ^[0-9a-f]{64}$ ]] || {
+          echo "qualification checksum is invalid" >&2; exit 1
+        }
+      done
+      actual_config_sha256=$(sha256sum "$trainer_config" | cut -d' ' -f1)
+      [ "$actual_config_sha256" = "$PRIME_QUALIFICATION_CONFIG_SHA256" ] || {
+        echo "qualification trainer config checksum differs" >&2; exit 1
+      }
+      qualification_image_digest=$(sudo docker image inspect "$image" --format '{{.Id}}')
+      [[ "$qualification_image_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+        echo "qualification trainer image digest is invalid" >&2; exit 1
+      }
+      qualification_env=(
+        -e "PRIME_QUALIFICATION_SESSION_ID=$PRIME_QUALIFICATION_SESSION_ID"
+        -e "PRIME_QUALIFICATION_PROFILE=$PRIME_QUALIFICATION_PROFILE"
+        -e "PRIME_QUALIFICATION_CONFIG_SHA256=$PRIME_QUALIFICATION_CONFIG_SHA256"
+        -e "PRIME_QUALIFICATION_SOURCE_SHA256=$PRIME_QUALIFICATION_SOURCE_SHA256"
+        -e "PRIME_QUALIFICATION_SESSION_SHA256=$PRIME_QUALIFICATION_SESSION_SHA256"
+        -e "PRIME_TRAINER_IMAGE_DIGEST=$qualification_image_digest"
+        -e "PRIME_TRAINER_HOST=n$node"
+        -e "PRIME_TRAINER_HEAD=n$trainer_head_node"
+      )
+    fi
     sudo install -d -o 1000 -g 1000 -m 0755 "$trainer_output"
     if [ "$rank" -eq 0 ]; then
       if [ "$rollout_transport" = filesystem ] && [ "$trainer_only" = 0 ]; then
@@ -312,6 +348,7 @@ PY
       -e TMPDIR=/scratch-tmp \
       -e PYTHONPATH="$deployment/env":/app/packages/prime-rl-configs/src:/app/src \
       "${parity_env[@]}" \
+      "${qualification_env[@]}" \
       -v "$deployment/source/src/prime_rl/trainer/fp8_checkpoint.py":/app/src/prime_rl/trainer/fp8_checkpoint.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/model.py":/app/src/prime_rl/trainer/model.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/models/layers/fp8_ada.py":/app/src/prime_rl/trainer/models/layers/fp8_ada.py:ro \

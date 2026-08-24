@@ -108,3 +108,60 @@ def test_normal_fake_data_still_has_no_routed_experts() -> None:
             config, seq_len=8, dp_world_size=1, dp_rank=0
         ).get_batch()[0]
     assert microbatch["routed_experts"] is None
+
+
+def test_grouped_fake_data_has_exact_samples_and_grpo_advantages() -> None:
+    config = SimpleNamespace(
+        batch_size=2,
+        generate_samples=True,
+        ce_only=False,
+        reference_path=None,
+        samples_per_micro_batch=4,
+        group_size=2,
+    )
+    world = SimpleNamespace(world_size=1, rank=0)
+    runs = SimpleNamespace(max_runs=1)
+    with (
+        patch("prime_rl.trainer.rl.data.get_world", return_value=world),
+        patch("prime_rl.trainer.rl.data.get_multi_run_manager", return_value=runs),
+    ):
+        batch = FakeDataLoader(
+            config, seq_len=128, dp_world_size=1, dp_rank=0
+        ).get_batch()
+
+    assert len(batch) == 2
+    assert sum(len(item["sequence_lengths"]) for item in batch) == 8
+    for microbatch in batch:
+        lengths = microbatch["sequence_lengths"]
+        assert len(lengths) == 4
+        assert sum(lengths) == 128
+        values = []
+        start = 0
+        for length in lengths:
+            segment = microbatch["advantages"][0, start : start + length]
+            assert torch.all(segment == segment[0])
+            values.append(segment[0])
+            start += length
+        values = torch.stack(values)
+        for group in values.split(2):
+            assert torch.isclose(group.mean(), torch.tensor(0.0), atol=1e-6)
+            assert torch.isclose(
+                group.std(unbiased=False), torch.tensor(1.0), atol=1e-6
+            )
+
+
+def test_fake_data_rejects_batch_not_divisible_by_data_parallel_size() -> None:
+    config = SimpleNamespace(
+        batch_size=3,
+        generate_samples=False,
+        ce_only=False,
+        reference_path=None,
+    )
+    world = SimpleNamespace(world_size=1, rank=0)
+    runs = SimpleNamespace(max_runs=1)
+    with (
+        patch("prime_rl.trainer.rl.data.get_world", return_value=world),
+        patch("prime_rl.trainer.rl.data.get_multi_run_manager", return_value=runs),
+        pytest.raises(ValueError, match="not divisible"),
+    ):
+        FakeDataLoader(config, seq_len=8, dp_world_size=2, dp_rank=0)

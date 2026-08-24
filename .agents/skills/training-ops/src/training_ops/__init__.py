@@ -6629,43 +6629,202 @@ def _validate_live_parity_report(
     return failures
 
 
-def _qualification_metric_path(config_name: str) -> str:
-    with (repo_root / config_name).open("rb") as stream:
-        values = tomllib.load(stream)
-    output_dir = values.get("output_dir")
-    filename = values.get("file_monitor", {}).get("filename")
-    if not isinstance(output_dir, str) or not isinstance(filename, str) or not filename:
-        raise Refused(f"qualification profile has no metric file: {config_name}")
-    return f"{output_dir.rstrip('/')}/{filename.lstrip('/')}"
+def _glm_qualification_limits() -> tuple[int, float, float]:
+    values = limits.get("glm52_qualification")
+    if not isinstance(values, dict):
+        raise Refused("GLM qualification limits are missing")
+    age = values.get("evidence_max_age_seconds")
+    duration = values.get("forward_backward_seconds_max")
+    memory = values.get("peak_memory_gib_max")
+    if isinstance(age, bool) or not isinstance(age, int) or not 1 <= age <= 604800:
+        raise Refused("GLM qualification evidence age limit is invalid")
+    if (
+        isinstance(duration, bool)
+        or not isinstance(duration, (int, float))
+        or not 1 <= duration <= 480
+    ):
+        raise Refused("GLM qualification trainer time limit is invalid")
+    if (
+        isinstance(memory, bool)
+        or not isinstance(memory, (int, float))
+        or not 1 <= memory < 47.5
+    ):
+        raise Refused("GLM qualification memory limit is invalid")
+    return age, float(duration), float(memory)
 
 
-def _successful_metric_steps(host: str, path: str) -> list[int]:
-    code, output = _ssh(host, f"base64 -w0 {shlex.quote(path)}", timeout=60)
-    if code:
-        raise Refused(f"qualification result is unreadable on {host}: {path}")
-    try:
-        raw = base64.b64decode(output.strip()).decode()
-    except (ValueError, UnicodeError) as error:
-        raise Refused(f"qualification result is not valid UTF-8: {path}") from error
-    steps: set[int] = set()
-    for line in raw.splitlines():
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        step = record.get("step") if isinstance(record, dict) else None
-        duration = record.get("time/step") if isinstance(record, dict) else None
+def _validate_trainer_qualification(
+    session: dict,
+    result: dict,
+    profile: dict,
+    profile_name: str,
+    *,
+    now: _dt.datetime | None = None,
+) -> list[str]:
+    failures = []
+    age_limit, duration_limit, memory_limit = _glm_qualification_limits()
+    expected_step_counts = {
+        "glm52-native-b2048": 2,
+        "glm52-native-stability20": 20,
+    }
+    if profile_name not in expected_step_counts:
+        raise Refused("GLM qualification profile is invalid")
+    expected_steps = expected_step_counts[profile_name]
+    expected_adapter = profile_name == "glm52-native-stability20"
+    profile_sha = hashlib.sha256(
+        (repo_root / f"configs/qualification/{profile_name}.toml").read_bytes()
+    ).hexdigest()
+    expected_topology = {
+        "world_size": 64,
+        "pp": 8,
+        "cp": 8,
+        "ep": 8,
+        "dp_replicate": 1,
+        "dp_shard": 1,
+    }
+    expected_targets = {
+        "q_a_proj",
+        "q_b_proj",
+        "kv_a_proj_with_mqa",
+        "kv_b_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+        "shared_expert",
+        "experts",
+    }
+    if session.get("schema_version") != 1 or session.get("kind") != (
+        "glm52_trainer_qualification_session"
+    ):
+        failures.append("qualification session schema is invalid")
+    if result.get("schema_version") != 1 or result.get("kind") != (
+        "glm52_trainer_qualification"
+    ):
+        failures.append("qualification result schema is invalid")
+    session_sha = _canonical_json_sha256(session)
+    for name in ("session_id", "profile", "config_sha256", "source_sha256"):
+        if result.get(name) != session.get(name):
+            failures.append(f"qualification {name} differs")
+    if result.get("session_sha256") != session_sha:
+        failures.append("qualification session checksum differs")
+    if session.get("profile") != profile_name or session.get("config_sha256") != profile_sha:
+        failures.append("qualification profile checksum differs")
+    if session.get("topology") != expected_topology or result.get("topology") != expected_topology:
+        failures.append("qualification topology differs")
+    ranked_hosts = [trainer_head] + [host for host in trainer_hosts if host != trainer_head]
+    if session.get("trainer_hosts") != ranked_hosts or session.get("trainer_head") != trainer_head:
+        failures.append("qualification trainer host mapping differs")
+    if result.get("trainer_head") != session.get("trainer_head"):
+        failures.append("qualification result trainer head differs")
+    image_digests = session.get("image_digests")
+    if (
+        not isinstance(image_digests, dict)
+        or set(image_digests) != set(ranked_hosts)
+        or any(
+            re.fullmatch(r"sha256:[0-9a-f]{64}", str(value)) is None
+            for value in image_digests.values()
+        )
+        or result.get("trainer_head_image_digest") != image_digests.get(trainer_head)
+    ):
+        failures.append("qualification trainer image evidence differs")
+    source_files = session.get("source_files")
+    if not isinstance(source_files, dict) or not source_files:
+        failures.append("qualification source file evidence is missing")
+    elif hashlib.sha256(
+        (json.dumps(source_files, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    ).hexdigest() != session.get("source_sha256"):
+        failures.append("qualification source file checksum differs")
+    fake = profile.get("data", {}).get("fake", {})
+    expected_fake = {
+        "batch_size": 64,
+        "samples_per_micro_batch": 32,
+        "group_size": 16,
+        "sequence_length": 32768,
+        "rollout_cache": False,
+    }
+    if result.get("fake_data") != expected_fake or (
+        fake.get("batch_size"),
+        fake.get("samples_per_micro_batch"),
+        fake.get("group_size"),
+    ) != (64, 32, 16):
+        failures.append("qualification fake batch shape differs")
+    if "rollout_cache" in profile.get("data", {}):
+        failures.append("qualification uses a rollout cache")
+    lora = result.get("lora", {})
+    if (
+        lora.get("rank") != 32
+        or lora.get("alpha") != 64
+        or set(lora.get("targets", [])) != expected_targets
+    ):
+        failures.append("qualification LoRA coverage differs")
+    if profile.get("optim", {}).get("lr") != 8e-6 or result.get("max_steps") != expected_steps:
+        failures.append("qualification learning rate or step count differs")
+    records = result.get("steps")
+    if not isinstance(records, list) or [row.get("step") for row in records if isinstance(row, dict)] != list(
+        range(1, expected_steps + 1)
+    ):
+        failures.append("qualification completed steps differ")
+    else:
+        for row in records:
+            numeric = (
+                "data/rollout_rows",
+                "loss/mean",
+                "optim/grad_norm",
+                "optim/lr",
+                "perf/peak_memory",
+                "time/forward_backward",
+            )
+            if any(
+                isinstance(row.get(key), bool)
+                or not isinstance(row.get(key), (int, float))
+                or not math.isfinite(row[key])
+                for key in numeric
+            ):
+                failures.append(f"qualification step {row.get('step')} has invalid metrics")
+                continue
+            if row["data/rollout_rows"] != 2048:
+                failures.append(f"qualification step {row['step']} does not contain 2048 samples")
+            if not math.isclose(row["optim/lr"], 8e-6, rel_tol=0, abs_tol=1e-12):
+                failures.append(f"qualification step {row['step']} learning rate differs")
+            if row["time/forward_backward"] <= 0 or row["time/forward_backward"] > duration_limit:
+                failures.append(f"qualification step {row['step']} trainer time exceeds the limit")
+            if row["perf/peak_memory"] <= 0 or row["perf/peak_memory"] > memory_limit:
+                failures.append(f"qualification step {row['step']} memory exceeds the limit")
+    adapter = result.get("adapter")
+    if expected_adapter:
         if (
-            isinstance(step, int)
-            and not isinstance(step, bool)
-            and step > 0
-            and isinstance(duration, (int, float))
-            and not isinstance(duration, bool)
-            and math.isfinite(duration)
-            and duration > 0
+            not isinstance(adapter, dict)
+            or adapter.get("step") != 20
+            or re.fullmatch(r"[0-9a-f]{64}", str(adapter.get("sha256"))) is None
+            or not isinstance(adapter.get("size"), int)
+            or not 0 < adapter["size"] <= 1_000_000_000
         ):
-            steps.add(step)
-    return sorted(steps)
+            failures.append("qualification final adapter evidence is invalid")
+        elif any(
+            not isinstance(adapter.get(path_name), str)
+            or not isinstance(adapter.get(digest_name), str)
+            or re.fullmatch(r"[0-9a-f]{64}", adapter[digest_name]) is None
+            for path_name, digest_name in (
+                ("config_path", "config_sha256"),
+                ("stable_path", "stable_sha256"),
+                ("checksum_path", "checksum_sha256"),
+            )
+        ):
+            failures.append("qualification adapter manifest is incomplete")
+    elif adapter is not None:
+        failures.append("batch qualification contains an unexpected adapter")
+    current = now or _dt.datetime.now(_dt.timezone.utc)
+    try:
+        created = _dt.datetime.fromisoformat(session["created_utc"])
+        completed = _dt.datetime.fromisoformat(result["completed_utc"])
+        if created.tzinfo is None or completed.tzinfo is None:
+            raise ValueError("timezone is missing")
+        if not created <= completed <= current or (current - completed).total_seconds() > age_limit:
+            failures.append("qualification evidence is stale")
+    except (KeyError, TypeError, ValueError):
+        failures.append("qualification evidence time is invalid")
+    return failures
 
 
 def _check_image_prime08(image: str, group: str) -> list[str]:
@@ -6687,6 +6846,17 @@ def production_start_preflight() -> dict[str, object]:
     """Refuse a GLM production start until all pinned evidence is complete."""
     failures: list[str] = []
     inference_host = inference_hosts[0]
+    current_sources = None
+    current_images = None
+    try:
+        current_sources = trainer_mount_preflight()
+        if len(current_sources) != 45:
+            failures.append("trainer mount manifest is not exactly 45 files")
+        current_images = _trainer_image_digest_map(
+            [trainer_head] + [host for host in trainer_hosts if host != trainer_head]
+        )
+    except (OSError, Refused, RuntimeError) as error:
+        failures.append(str(error))
     try:
         report = _remote_json(inference_host, production_parity_report)
         fixture_manifest = _remote_json(
@@ -6699,30 +6869,60 @@ def production_start_preflight() -> dict[str, object]:
     except (OSError, Refused, tomllib.TOMLDecodeError) as error:
         failures.append(str(error))
 
-    try:
-        batch_steps = _successful_metric_steps(
-            trainer_head, _qualification_metric_path(production_batch2048_profile)
-        )
-        if not set(range(1, 3)).issubset(batch_steps):
-            failures.append(f"batch2048 qualification has steps {batch_steps}, needs 1-2")
-    except (OSError, Refused, tomllib.TOMLDecodeError) as error:
-        failures.append(str(error))
-    try:
-        stability_steps = _successful_metric_steps(
-            trainer_head, _qualification_metric_path(production_stability20_profile)
-        )
-        if not set(range(1, 21)).issubset(stability_steps):
-            failures.append(
-                f"Stability20 qualification has steps {stability_steps}, needs 1-20"
+    for profile_name, relative in (
+        ("glm52-native-b2048", production_batch2048_profile),
+        ("glm52-native-stability20", production_stability20_profile),
+    ):
+        try:
+            with (repo_root / relative).open("rb") as stream:
+                profile = tomllib.load(stream)
+            output_dir = profile["output_dir"].rstrip("/")
+            session = _remote_json(
+                trainer_head, f"{output_dir}/qualification-session.json"
             )
-    except (OSError, Refused, tomllib.TOMLDecodeError) as error:
-        failures.append(str(error))
-
-    try:
-        if len(trainer_mount_preflight()) != 45:
-            failures.append("trainer mount manifest is not exactly 45 files")
-    except (OSError, Refused) as error:
-        failures.append(str(error))
+            result = _remote_json(
+                trainer_head, f"{output_dir}/qualification-result.json"
+            )
+            failures.extend(
+                f"{profile_name}: {failure}"
+                for failure in _validate_trainer_qualification(
+                    session, result, profile, profile_name
+                )
+            )
+            if current_sources is not None and session.get("source_files") != current_sources:
+                failures.append(f"{profile_name}: qualification source differs from current mounts")
+            if current_images is not None and session.get("image_digests") != current_images:
+                failures.append(f"{profile_name}: qualification images differ from current images")
+            files = [(result.get("metrics_path"), result.get("metrics_sha256"))]
+            adapter = result.get("adapter")
+            if isinstance(adapter, dict):
+                files.append((adapter.get("path"), adapter.get("sha256")))
+                files.extend(
+                    (adapter.get(path_name), adapter.get(digest_name))
+                    for path_name, digest_name in (
+                        ("config_path", "config_sha256"),
+                        ("stable_path", "stable_sha256"),
+                        ("checksum_path", "checksum_sha256"),
+                    )
+                )
+            for path, expected in files:
+                if (
+                    not isinstance(path, str)
+                    or not path.startswith(f"{output_dir}/")
+                    or not isinstance(expected, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", expected) is None
+                ):
+                    failures.append(f"{profile_name}: evidence file identity is invalid")
+                    continue
+                code, observed = _ssh(
+                    trainer_head,
+                    f"test -f {shlex.quote(path)} && sha256sum {shlex.quote(path)} | cut -d' ' -f1",
+                    timeout=60,
+                )
+                if code or observed.strip() != expected:
+                    failures.append(f"{profile_name}: evidence file checksum differs: {path}")
+        except (KeyError, OSError, Refused, RuntimeError, tomllib.TOMLDecodeError) as error:
+            failures.append(f"{profile_name}: {error}")
     failures.extend(_check_image_prime08(inference_image, "inference"))
     failures.extend(_check_image_prime08(trainer_image, "trainer"))
     if failures:
@@ -7146,6 +7346,143 @@ def start(
     print(f"started {run} in {mode} mode. Call status() in a few minutes.")
 
 
+def _trainer_image_digest_map(nodes: list[str]) -> dict[str, str]:
+    def read(host: str) -> tuple[int, str]:
+        return _ssh(
+            host,
+            f"sudo docker image inspect {shlex.quote(trainer_image)} --format '{{{{.Id}}}}'",
+            timeout=60,
+        )
+
+    results = _fan(nodes, read, workers=min(8, len(nodes)))
+    digests = {}
+    for host in nodes:
+        code, text = results.get(host, (1, "missing result"))
+        digest = text.strip()
+        if code or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+            raise Refused(f"qualification trainer image digest is invalid on {host}")
+        digests[host] = digest
+    return digests
+
+
+def _prepare_trainer_qualification_session(
+    profile: str,
+    config: dict,
+    config_path: Path,
+    nodes: list[str],
+    source_files: dict[str, str],
+) -> str:
+    output_dir = config.get("output_dir")
+    qualification_root = PurePosixPath("/data/glm52-rl/qualifications")
+    output = PurePosixPath(output_dir) if isinstance(output_dir, str) else None
+    if output is None or output.parent != qualification_root:
+        raise Refused("qualification output directory is not an exact child of its root")
+    if not source_files or any(
+        not isinstance(path, str)
+        or not isinstance(digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        for path, digest in source_files.items()
+    ):
+        raise Refused("qualification source manifest is invalid")
+
+    image_digests = _trainer_image_digest_map(nodes)
+
+    source_sha256 = hashlib.sha256(
+        (json.dumps(source_files, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    ).hexdigest()
+    session_id = secrets.token_hex(16)
+    manifest = {
+        "schema_version": 1,
+        "kind": "glm52_trainer_qualification_session",
+        "session_id": session_id,
+        "profile": profile,
+        "created_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        "config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
+        "source_sha256": source_sha256,
+        "source_files": source_files,
+        "trainer_hosts": nodes,
+        "trainer_head": trainer_head,
+        "image_digests": image_digests,
+        "topology": {
+            "world_size": 64,
+            "pp": 8,
+            "cp": 8,
+            "ep": 8,
+            "dp_replicate": 1,
+            "dp_shard": 1,
+        },
+    }
+    payload = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    session_sha256 = hashlib.sha256(payload).hexdigest()
+    encoded = base64.b64encode(payload).decode()
+    session_path = f"{output_dir}/qualification-session.json"
+    temporary = f"{output_dir}/.qualification-session-{session_id}.tmp"
+    command = f"""set -euo pipefail
+sudo install -d -o 1000 -g 1000 -m 0755 {shlex.quote(output_dir)}
+sudo python3 - {shlex.quote(output_dir)} {shlex.quote(PurePosixPath(temporary).name)} {shlex.quote(PurePosixPath(session_path).name)} {session_sha256} {shlex.quote(encoded)} <<'PY'
+import base64
+import hashlib
+import os
+import stat
+import sys
+
+root, temporary, destination, expected, encoded = sys.argv[1:]
+root_stat = os.lstat(root)
+if not stat.S_ISDIR(root_stat.st_mode) or stat.S_ISLNK(root_stat.st_mode):
+    raise SystemExit("qualification output root is not a directory")
+if os.path.realpath(root) != root:
+    raise SystemExit("qualification output root is not canonical")
+payload = base64.b64decode(encoded, validate=True)
+if hashlib.sha256(payload).hexdigest() != expected:
+    raise SystemExit("qualification session payload checksum differs")
+directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o644,
+        dir_fd=directory,
+    )
+    try:
+        written = 0
+        while written < len(payload):
+            written += os.write(descriptor, payload[written:])
+        os.fsync(descriptor)
+        result = os.fstat(descriptor)
+        if not stat.S_ISREG(result.st_mode) or stat.S_IMODE(result.st_mode) != 0o644:
+            raise SystemExit("qualification session temporary file is invalid")
+    finally:
+        os.close(descriptor)
+    os.replace(temporary, destination, src_dir_fd=directory, dst_dir_fd=directory)
+    os.fsync(directory)
+    descriptor = os.open(destination, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+    try:
+        result = os.fstat(descriptor)
+        if not stat.S_ISREG(result.st_mode) or result.st_nlink != 1:
+            raise SystemExit("qualification session file is invalid")
+        observed = hashlib.sha256()
+        while chunk := os.read(descriptor, 65536):
+            observed.update(chunk)
+        if observed.hexdigest() != expected:
+            raise SystemExit("qualification session file checksum differs")
+    finally:
+        os.close(descriptor)
+finally:
+    os.close(directory)
+PY
+"""
+    code, detail = _ssh(trainer_head, command, timeout=60)
+    if code:
+        raise RuntimeError(f"qualification session write failed: {detail.strip()[:160]}")
+    return (
+        f"PRIME_QUALIFICATION_SESSION_ID={session_id} "
+        f"PRIME_QUALIFICATION_PROFILE={profile} "
+        f"PRIME_QUALIFICATION_CONFIG_SHA256={manifest['config_sha256']} "
+        f"PRIME_QUALIFICATION_SOURCE_SHA256={source_sha256} "
+        f"PRIME_QUALIFICATION_SESSION_SHA256={session_sha256} "
+    )
+
+
 def qualify(
     name: str,
     mode: str = "cold",
@@ -7170,6 +7507,14 @@ def qualify(
         raise Refused(f"missing qualification config {relative_config}")
     with local_config.open("rb") as stream:
         config = tomllib.load(stream)
+    strict_qualification = name in {
+        "glm52-native-b2048",
+        "glm52-native-stability20",
+    }
+    if strict_qualification and nodes != [trainer_head] + [
+        host for host in trainer_hosts if host != trainer_head
+    ]:
+        raise Refused("GLM batch and stability qualifications require all trainer hosts")
     if relative_config == "configs/qualification/glm52-policy-parity-trainer.toml":
         _diagnostic_capture_preflight(local_config, "trainer")
     if "fake" not in config.get("data", {}):
@@ -7211,7 +7556,13 @@ def qualify(
     for path in ("scripts/china/cluster.sh", *trainer_mounts, relative_config):
         if not deploy(path, nodes=nodes):
             raise RuntimeError(f"failed to deploy {path}")
-    trainer_mount_preflight(nodes)
+    source_files = trainer_mount_preflight(nodes)
+
+    qualification_env = ""
+    if strict_qualification:
+        qualification_env = _prepare_trainer_qualification_session(
+            name, config, local_config, nodes, source_files
+        )
 
     trainer_nodes = " ".join(host.removeprefix("n") for host in nodes)
     env = (
@@ -7221,6 +7572,7 @@ def qualify(
         f"trainer_nodes='{trainer_nodes}' RUN={shlex.quote(name)} "
         f"RUN_NAME=run_{shlex.quote(name)} "
         f"TRAINER_CONFIG={remote_repo}/{relative_config} "
+        f"{qualification_env}"
         "PRIME_EP_PROFILE=0 PRIME_EP_AC_CACHE=0 PRIME_INT4_COMBINE_ROUNDS=1 "
         "PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD=0"
     )

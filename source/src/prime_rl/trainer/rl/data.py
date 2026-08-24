@@ -157,10 +157,19 @@ class FakeDataLoader:
         self.dp_rank = dp_rank
 
         self.batch_size = config.batch_size
+        if self.batch_size % self.dp_world_size:
+            raise ValueError(
+                f"fake batch_size={self.batch_size} is not divisible by "
+                f"dp_world_size={self.dp_world_size}"
+            )
         self.num_micro_batches = self.batch_size // self.dp_world_size
         self.seq_len = seq_len
         self.generate_samples = config.generate_samples
         self.ce_only = config.ce_only
+        self.samples_per_micro_batch = getattr(
+            config, "samples_per_micro_batch", None
+        )
+        self.group_size = getattr(config, "group_size", None)
         reference_payload = (
             json.loads(config.reference_path.read_text())
             if config.reference_path is not None
@@ -289,13 +298,31 @@ class FakeDataLoader:
         position_ids = []
         sequence_lengths = []
 
-        while total_seq_len < self.seq_len:
-            # Generate reasonably long documents
-            seq_len_to_generate = torch.randint(1, self.seq_len // 8, (1,), generator=generator).item()
-            if seq_len_to_generate + total_seq_len > self.seq_len:
-                seq_len_to_generate = self.seq_len - total_seq_len
-            total_seq_len += seq_len_to_generate
-            sequence_lengths.append(seq_len_to_generate)
+        if self.samples_per_micro_batch is None:
+            while total_seq_len < self.seq_len:
+                seq_len_to_generate = torch.randint(
+                    1, self.seq_len // 8, (1,), generator=generator
+                ).item()
+                if seq_len_to_generate + total_seq_len > self.seq_len:
+                    seq_len_to_generate = self.seq_len - total_seq_len
+                total_seq_len += seq_len_to_generate
+                sequence_lengths.append(seq_len_to_generate)
+        else:
+            if self.samples_per_micro_batch > self.seq_len:
+                raise ValueError(
+                    "samples_per_micro_batch cannot exceed the token count"
+                )
+            weights = torch.rand(
+                self.samples_per_micro_batch, generator=generator
+            ).add_(0.5)
+            available = self.seq_len - self.samples_per_micro_batch
+            lengths = torch.floor(weights / weights.sum() * available).to(torch.long)
+            lengths.add_(1)
+            remainder = self.seq_len - int(lengths.sum())
+            lengths[:remainder].add_(1)
+            sequence_lengths = lengths.tolist()
+
+        for seq_len_to_generate in sequence_lengths:
             tmp_input_ids = torch.randint(0, 120000, (seq_len_to_generate,), generator=generator).long()
             tmp_position_ids = torch.arange(seq_len_to_generate).long()
 
@@ -305,7 +332,21 @@ class FakeDataLoader:
         input_ids = torch.cat(input_ids, dim=0)
         position_ids = torch.cat(position_ids, dim=0)
         loss_mask = torch.ones(input_ids.shape[0], dtype=torch.bool)
-        advantages = torch.randn(input_ids.shape[0], generator=generator)
+        if self.group_size is None:
+            advantages = torch.randn(input_ids.shape[0], generator=generator)
+        else:
+            rewards = torch.randn(len(sequence_lengths), generator=generator)
+            sample_advantages = []
+            for offset in range(0, len(sequence_lengths), self.group_size):
+                group = rewards[offset : offset + self.group_size]
+                group = group - group.mean()
+                sample_advantages.append(
+                    group / group.std(unbiased=False).clamp_min(1e-6)
+                )
+            advantages = torch.repeat_interleave(
+                torch.cat(sample_advantages),
+                torch.tensor(sequence_lengths, dtype=torch.long),
+            )
         inference_logprobs = torch.randn(input_ids.shape[0], generator=generator)
         lora_num_tokens = torch.zeros(self.multi_run_manager.max_runs, dtype=torch.int32)
         lora_num_tokens[0] = input_ids.shape[0]

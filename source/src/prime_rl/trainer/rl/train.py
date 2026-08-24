@@ -6,9 +6,10 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import subprocess
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 # Import environment before any other imports
 # ruff: noqa: I001
@@ -32,6 +33,7 @@ from prime_rl.utils.cp import (
     setup_cp_params,
     shard_for_cp,
 )
+from prime_rl.utils.checkpoint_delta import sha256_file
 from prime_rl.utils.logger import format_time, setup_logger
 from prime_rl.trainer.rl.loss import (
     compute_entropy,
@@ -86,7 +88,13 @@ from prime_rl.utils.metrics_server import HealthServer, MetricsServer, RunStats
 from prime_rl.utils.monitor import setup_monitor
 from prime_rl.utils.config import cli
 from prime_rl.utils.process import set_proc_title
-from prime_rl.utils.utils import clean_exit, resolve_latest_ckpt_step, to_col_format
+from prime_rl.utils.utils import (
+    clean_exit,
+    get_broadcast_dir,
+    get_step_path,
+    resolve_latest_ckpt_step,
+    to_col_format,
+)
 from ring_flash_attn import substitute_hf_flash_attn
 from torchtitan.distributed.utils import clip_grad_norm_
 
@@ -349,6 +357,212 @@ def parity_guard_failures(tensor_stats: dict, guard) -> list[str]:
     return failures
 
 
+_qualification_environment_names = (
+    "PRIME_QUALIFICATION_SESSION_ID",
+    "PRIME_QUALIFICATION_PROFILE",
+    "PRIME_QUALIFICATION_CONFIG_SHA256",
+    "PRIME_QUALIFICATION_SOURCE_SHA256",
+    "PRIME_QUALIFICATION_SESSION_SHA256",
+    "PRIME_TRAINER_IMAGE_DIGEST",
+    "PRIME_TRAINER_HOST",
+    "PRIME_TRAINER_HEAD",
+)
+
+
+def _qualification_environment() -> dict[str, str] | None:
+    values = {name: os.environ.get(name, "") for name in _qualification_environment_names}
+    present = [bool(value) for value in values.values()]
+    if not any(present):
+        return None
+    if not all(present):
+        raise RuntimeError("qualification identity is incomplete")
+    if not re.fullmatch(r"[0-9a-f]{32}", values["PRIME_QUALIFICATION_SESSION_ID"]):
+        raise RuntimeError("qualification session ID is invalid")
+    if not re.fullmatch(
+        r"glm52-native-(?:b2048|stability20)",
+        values["PRIME_QUALIFICATION_PROFILE"],
+    ):
+        raise RuntimeError("qualification profile is invalid")
+    for name in (
+        "PRIME_QUALIFICATION_CONFIG_SHA256",
+        "PRIME_QUALIFICATION_SOURCE_SHA256",
+        "PRIME_QUALIFICATION_SESSION_SHA256",
+    ):
+        if not re.fullmatch(r"[0-9a-f]{64}", values[name]):
+            raise RuntimeError(f"{name} is invalid")
+    if not re.fullmatch(
+        r"sha256:[0-9a-f]{64}", values["PRIME_TRAINER_IMAGE_DIGEST"]
+    ):
+        raise RuntimeError("trainer image digest is invalid")
+    for name in ("PRIME_TRAINER_HOST", "PRIME_TRAINER_HEAD"):
+        if not re.fullmatch(r"n[0-9]+", values[name]):
+            raise RuntimeError(f"{name} is invalid")
+    return values
+
+
+def _qualification_step_records(history: list[dict], max_steps: int) -> list[dict]:
+    keys = (
+        "data/rollout_rows",
+        "loss/mean",
+        "optim/grad_norm",
+        "optim/lr",
+        "perf/peak_memory",
+        "time/forward_backward",
+    )
+    merged = {step: {"step": step} for step in range(1, max_steps + 1)}
+    for record in history:
+        step = record.get("step") if isinstance(record, dict) else None
+        if step not in merged:
+            continue
+        for key in keys:
+            if key not in record:
+                continue
+            value = record[key]
+            if isinstance(value, torch.Tensor):
+                if value.numel() != 1:
+                    raise RuntimeError(f"qualification metric {key} is not scalar")
+                value = value.item()
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise RuntimeError(f"qualification metric {key} is not numeric")
+            value = float(value)
+            previous = merged[step].get(key)
+            if previous is not None and previous != value:
+                raise RuntimeError(f"qualification metric {key} conflicts at step {step}")
+            merged[step][key] = value
+    for step, record in merged.items():
+        missing = set(keys) - set(record)
+        if missing:
+            raise RuntimeError(
+                f"qualification step {step} is missing metrics: {sorted(missing)}"
+            )
+        if not all(math.isfinite(record[key]) for key in keys):
+            raise RuntimeError(f"qualification step {step} has a nonfinite metric")
+    return list(merged.values())
+
+
+def _write_atomic_json(path: Path, value: dict, session_id: str) -> None:
+    payload = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    temporary = path.parent / f".{path.name}-{session_id}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(temporary, flags, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb", closefd=False) as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+    finally:
+        os.close(descriptor)
+    os.replace(temporary, path)
+    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def _write_qualification_result(
+    config: TrainerConfig,
+    parallel_dims,
+    monitor,
+    progress: Progress,
+    identity: dict[str, str],
+    adapter_path: Path | None,
+) -> None:
+    session_path = config.output_dir / "qualification-session.json"
+    session_bytes = session_path.read_bytes()
+    if hashlib.sha256(session_bytes).hexdigest() != identity[
+        "PRIME_QUALIFICATION_SESSION_SHA256"
+    ]:
+        raise RuntimeError("qualification session file checksum differs")
+    session = json.loads(session_bytes)
+    if (
+        session.get("session_id") != identity["PRIME_QUALIFICATION_SESSION_ID"]
+        or session.get("profile") != identity["PRIME_QUALIFICATION_PROFILE"]
+        or session.get("config_sha256")
+        != identity["PRIME_QUALIFICATION_CONFIG_SHA256"]
+        or session.get("source_sha256")
+        != identity["PRIME_QUALIFICATION_SOURCE_SHA256"]
+    ):
+        raise RuntimeError("qualification session file identity differs")
+    if config.max_steps is None or progress.step != config.max_steps:
+        raise RuntimeError("qualification did not finish its exact step count")
+    records = _qualification_step_records(monitor.history, config.max_steps)
+    metrics_path = config.output_dir / config.file_monitor.filename
+    adapter = None
+    if config.data.fake.export_final_adapter:
+        if adapter_path is None or not adapter_path.is_file():
+            raise RuntimeError("qualification final adapter is missing")
+        stable = adapter_path.parent / "STABLE"
+        adapter_config = adapter_path.parent / "adapter_config.json"
+        digest_path = adapter_path.parent / "adapter_model.safetensors.sha256"
+        if (
+            not stable.is_file()
+            or not adapter_config.is_file()
+            or not digest_path.is_file()
+        ):
+            raise RuntimeError("qualification final adapter is incomplete")
+        adapter_sha256 = sha256_file(adapter_path)
+        if digest_path.read_text().strip() != adapter_sha256:
+            raise RuntimeError("qualification final adapter checksum file differs")
+        adapter = {
+            "path": str(adapter_path),
+            "sha256": adapter_sha256,
+            "size": adapter_path.stat().st_size,
+            "step": progress.step,
+            "config_path": str(adapter_config),
+            "config_sha256": sha256_file(adapter_config),
+            "stable_path": str(stable),
+            "stable_sha256": sha256_file(stable),
+            "checksum_path": str(digest_path),
+            "checksum_sha256": sha256_file(digest_path),
+        }
+    fake = config.data.fake
+    result = {
+        "schema_version": 1,
+        "kind": "glm52_trainer_qualification",
+        "session_id": identity["PRIME_QUALIFICATION_SESSION_ID"],
+        "profile": identity["PRIME_QUALIFICATION_PROFILE"],
+        "session_sha256": identity["PRIME_QUALIFICATION_SESSION_SHA256"],
+        "config_sha256": identity["PRIME_QUALIFICATION_CONFIG_SHA256"],
+        "source_sha256": identity["PRIME_QUALIFICATION_SOURCE_SHA256"],
+        "trainer_head": identity["PRIME_TRAINER_HEAD"],
+        "trainer_head_image_digest": identity["PRIME_TRAINER_IMAGE_DIGEST"],
+        "completed_utc": datetime.now(timezone.utc).isoformat(),
+        "topology": {
+            "world_size": dist.get_world_size(),
+            "pp": parallel_dims.pp,
+            "cp": parallel_dims.cp,
+            "ep": parallel_dims.ep,
+            "dp_replicate": parallel_dims.dp_replicate,
+            "dp_shard": parallel_dims.dp_shard,
+        },
+        "fake_data": {
+            "batch_size": fake.batch_size,
+            "samples_per_micro_batch": fake.samples_per_micro_batch,
+            "group_size": fake.group_size,
+            "sequence_length": config.model.seq_len,
+            "rollout_cache": False,
+        },
+        "lora": {
+            "rank": config.model.lora.rank,
+            "alpha": config.model.lora.alpha,
+            "targets": sorted(config.model.lora.target_modules),
+        },
+        "max_steps": config.max_steps,
+        "steps": records,
+        "metrics_path": str(metrics_path),
+        "metrics_sha256": sha256_file(metrics_path),
+        "adapter": adapter,
+    }
+    _write_atomic_json(
+        config.output_dir / "qualification-result.json",
+        result,
+        identity["PRIME_QUALIFICATION_SESSION_ID"],
+    )
+
+
 @clean_exit
 def train(config: TrainerConfig):
     # Setup world and logger
@@ -359,6 +573,41 @@ def train(config: TrainerConfig):
         json_logging=config.log.json_logging,
     )
     logger.info(f"Starting RL trainer in {world} in {config.output_dir}")
+    qualification_identity = _qualification_environment()
+    if qualification_identity is not None:
+        fake = config.data.fake
+        expected_steps = {
+            "glm52-native-b2048": (2, False),
+            "glm52-native-stability20": (20, True),
+        }[qualification_identity["PRIME_QUALIFICATION_PROFILE"]]
+        expected_targets = {
+            "q_a_proj",
+            "q_b_proj",
+            "kv_a_proj_with_mqa",
+            "kv_b_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+            "shared_expert",
+            "experts",
+        }
+        if (
+            fake is None
+            or config.data.rollout_cache is not None
+            or fake.batch_size != 64
+            or fake.samples_per_micro_batch != 32
+            or fake.group_size != 16
+            or fake.export_final_adapter is not expected_steps[1]
+            or config.max_steps != expected_steps[0]
+            or config.model.seq_len != 32768
+            or config.optim.lr != 8e-6
+            or config.model.lora is None
+            or config.model.lora.rank != 32
+            or config.model.lora.alpha != 64
+            or set(config.model.lora.target_modules) != expected_targets
+        ):
+            raise RuntimeError("qualification trainer configuration differs")
     if numa_binding is not None:
         logger.info(
             f"Bound local GPU {world.local_rank} worker to NUMA node "
@@ -434,6 +683,15 @@ def train(config: TrainerConfig):
 
     # Initialize parallel dimensions
     parallel_dims = get_parallel_dims(config.model)
+    if qualification_identity is not None and (
+        world.world_size,
+        parallel_dims.pp,
+        parallel_dims.cp,
+        parallel_dims.ep,
+        parallel_dims.dp_replicate,
+        parallel_dims.dp_shard,
+    ) != (64, 8, 8, 8, 1, 1):
+        raise RuntimeError("qualification trainer topology differs")
 
     # For single-run, check for checkpoint to resume from
     checkpoint_step = None
@@ -1711,6 +1969,12 @@ def train(config: TrainerConfig):
         else:
             current_lr = optimizer.get_current_lr()
         forward_backward_time = time.perf_counter() - forward_backward_start_time
+        if qualification_identity is not None:
+            maximum_forward_backward = torch.tensor(
+                forward_backward_time, dtype=torch.float64, device="cuda"
+            )
+            dist.all_reduce(maximum_forward_backward, op=dist.ReduceOp.MAX)
+            forward_backward_time = float(maximum_forward_backward.item())
 
         # Broadcast the model just produced (policy v{progress.step}) so the orchestrator can
         # sample its next step from it. In-memory transports retain their two-step shutdown
@@ -1951,6 +2215,35 @@ def train(config: TrainerConfig):
     logger.info(
         f"Peak memory: {max(to_col_format(monitor.history)['perf/peak_memory']):.1f} GiB"
     )
+    if qualification_identity is not None:
+        dist.barrier()
+        qualification_failed = torch.zeros((), dtype=torch.int32, device="cuda")
+        if world.is_master:
+            try:
+                adapter_path = None
+                if export_final_adapter:
+                    adapter_path = (
+                        get_step_path(
+                            get_broadcast_dir(multi_run_manager.get_run_dir(0)),
+                            progress.step,
+                        )
+                        / "adapter_model.safetensors"
+                    )
+                _write_qualification_result(
+                    config,
+                    parallel_dims,
+                    monitor,
+                    progress,
+                    qualification_identity,
+                    adapter_path,
+                )
+            except Exception:
+                logger.exception("qualification result write failed")
+                qualification_failed.fill_(1)
+        dist.broadcast(qualification_failed, src=0)
+        if qualification_failed.item():
+            raise RuntimeError("qualification result write failed")
+
     logger.success("RL trainer finished!")
 
     # Stop metrics/health server if configured

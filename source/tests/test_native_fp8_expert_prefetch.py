@@ -54,8 +54,22 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
 
         self.assertEqual(config["max_steps"], 2)
         self.assertEqual(
-            config["data"], {"fake": {"batch_size": 64, "generate_samples": True}}
+            config["data"],
+            {
+                "fake": {
+                    "batch_size": 64,
+                    "generate_samples": True,
+                    "samples_per_micro_batch": 32,
+                    "group_size": 16,
+                }
+            },
         )
+        self.assertEqual(
+            config["data"]["fake"]["batch_size"]
+            * config["data"]["fake"]["samples_per_micro_batch"],
+            2048,
+        )
+        self.assertEqual(config["optim"]["lr"], 8e-6)
         self.assertEqual(config["model"]["seq_len"], 32768)
         self.assertEqual(config["model"]["pp"], 8)
         self.assertEqual(config["model"]["cp"], 8)
@@ -74,7 +88,21 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
         self.assertEqual(config["max_steps"], 20)
         self.assertFalse(config["enable_router_replay"])
         self.assertEqual(
-            config["data"], {"fake": {"batch_size": 32, "generate_samples": True}}
+            config["data"],
+            {
+                "fake": {
+                    "batch_size": 64,
+                    "generate_samples": True,
+                    "samples_per_micro_batch": 32,
+                    "group_size": 16,
+                    "export_final_adapter": True,
+                }
+            },
+        )
+        self.assertEqual(
+            config["data"]["fake"]["batch_size"]
+            * config["data"]["fake"]["samples_per_micro_batch"],
+            2048,
         )
         self.assertEqual(config["model"]["seq_len"], 32768)
         self.assertEqual(config["model"]["pp"], 8)
@@ -83,7 +111,7 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
         self.assertIs(config["model"]["reshard_after_forward"], True)
         self.assertFalse(config["model"]["native_fp8_expert_prefetch"])
         self.assertTrue(config["model"]["freeze_moe_router"])
-        self.assertEqual(config["optim"]["lr"], 0.0)
+        self.assertEqual(config["optim"]["lr"], 8e-6)
         self.assertEqual(config["model"]["lora"]["rank"], 32)
         self.assertIn("experts", config["model"]["lora"]["target_modules"])
         self.assertIn("shared_expert", config["model"]["lora"]["target_modules"])
