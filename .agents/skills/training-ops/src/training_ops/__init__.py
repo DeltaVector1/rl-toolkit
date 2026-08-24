@@ -2357,7 +2357,7 @@ def _repair_tunnels() -> str:
     return msg
 
 
-def _h200_parity_container_preflight(host: str) -> dict[str, object]:
+def _h200_parity_container_preflight(host: str, expected_trace_dir: str) -> dict[str, object]:
     """Verify the isolated GLM command and TOML before model-load waiting."""
     _check_host(host)
     inspect_command = (
@@ -2401,6 +2401,14 @@ def _h200_parity_container_preflight(host: str) -> dict[str, object]:
         "PRIME_PARITY_BOOTSTRAP_FIFO=/run/prime-parity-bootstrap"
     ) != 1:
         raise Refused("H200 parity container has no exact bootstrap FIFO path")
+    if re.fullmatch(
+        r"/data/glm52-rl/qualifications/glm52-policy-parity/"
+        r"\.diagnostic-work-[0-9a-f]{16}/h200-router-trace",
+        expected_trace_dir,
+    ) is None or environment.count(
+        f"PRIME_PARITY_ROUTER_TRACE_DIR={expected_trace_dir}"
+    ) != 1:
+        raise Refused("H200 parity container has no exact router trace path")
     bootstrap_mounts = [
         mount
         for mount in mounts
@@ -2520,9 +2528,28 @@ def _validate_parity_transaction_path(path: str) -> str:
     return match.group(1)
 
 
+def _parity_container_write_paths(nonce: str) -> dict[str, str]:
+    if re.fullmatch(r"[0-9a-f]{16}", nonce) is None:
+        raise Refused("parity container write nonce is invalid")
+    root = "/data/glm52-rl/qualifications/glm52-policy-parity"
+    work = f"{root}/.diagnostic-work-{nonce}"
+    run = f"{root}/.diagnostic-run-{nonce}"
+    return {
+        "work": work,
+        "fixture": f"{work}/fixture",
+        "diagnostic": f"{work}/diagnostic.npz",
+        "capture": f"{work}/capture",
+        "router_trace": f"{work}/h200-router-trace",
+        "bootstrap_fifo": f"{run}/bootstrap.fifo",
+        "lora_cache": "/data/glm52-rl/lora-cache",
+        "vllm_cache": f"{remote_repo}/cache/vllm",
+    }
+
+
 def _validate_parity_transaction_state(path: str, state: dict[str, object]) -> None:
     nonce = _validate_parity_transaction_path(path)
     root = "/data/glm52-rl/qualifications/glm52-policy-parity"
+    writes = _parity_container_write_paths(nonce)
     if (
         state.get("schema_version") != 1
         or state.get("nonce") != nonce
@@ -2541,13 +2568,13 @@ def _validate_parity_transaction_state(path: str, state: dict[str, object]) -> N
         "fixture": {
             "live": glm_parity_paths["fixture"],
             "previous": f"{root}/.fixture-previous-{nonce}",
-            "candidate": f"{root}/.fixture-candidate-{nonce}",
+            "candidate": writes["fixture"],
             "failed": f"{root}/.fixture-failed-{nonce}",
         },
         "capture": {
             "live": glm_parity_paths["h200_capture"],
             "previous": f"{root}/.h200-capture-previous-{nonce}",
-            "candidate": f"{root}/.h200-capture-{nonce}",
+            "candidate": writes["capture"],
             "failed": f"{root}/.h200-capture-failed-{nonce}",
         },
     }
@@ -2568,39 +2595,127 @@ def _validate_parity_transaction_state(path: str, state: dict[str, object]) -> N
             raise RuntimeError(f"parity transaction {kind} published hash is missing")
 
 
-def _prepare_parity_fixture_candidate(
+def _prepare_parity_container_work(
     host: str,
-    path: str,
+    paths: dict[str, str],
     sensitive: tuple[str, ...],
 ) -> None:
-    if re.fullmatch(
+    work = paths.get("work", "")
+    match = re.fullmatch(
         r"/data/glm52-rl/qualifications/glm52-policy-parity/"
-        r"\.fixture-candidate-[0-9a-f]{16}",
-        path,
-    ) is None:
-        raise Refused("parity fixture candidate path is not exact")
+        r"\.diagnostic-work-([0-9a-f]{16})",
+        work,
+    )
+    if match is None or paths != _parity_container_write_paths(match.group(1)):
+        raise Refused("parity container write inventory is not exact")
     command = f"""
 set -euo pipefail
-candidate={shlex.quote(path)}
-test ! -e "$candidate"
-test ! -L "$candidate"
-sudo install -d -o 1000 -g 1000 -m 0750 "$candidate"
-test -d "$candidate"
-test ! -L "$candidate"
-test "$(realpath -e "$candidate")" = "$candidate"
-test "$(stat -c '%u:%g:%a' "$candidate")" = "1000:1000:750"
-test -z "$(find "$candidate" -mindepth 1 -maxdepth 1 -print -quit)"
-printf 'candidate-ready\n'
+work={shlex.quote(paths["work"])}
+trace={shlex.quote(paths["router_trace"])}
+fixture={shlex.quote(paths["fixture"])}
+diagnostic={shlex.quote(paths["diagnostic"])}
+capture={shlex.quote(paths["capture"])}
+test ! -e "$work"
+test ! -L "$work"
+sudo install -d -o 1000 -g 1000 -m 0750 "$work"
+sudo install -d -o 1000 -g 1000 -m 0750 "$trace"
+for path in "$work" "$trace"; do
+  test -d "$path"
+  test ! -L "$path"
+  test "$(realpath -e "$path")" = "$path"
+  test "$(stat -c '%u:%g:%a' "$path")" = "1000:1000:750"
+  sudo -u '#1000' test -r "$path"
+  sudo -u '#1000' test -w "$path"
+  sudo -u '#1000' test -x "$path"
+done
+test "$(find "$work" -mindepth 1 -maxdepth 1 -printf '%f\n')" = "h200-router-trace"
+test -z "$(find "$trace" -mindepth 1 -maxdepth 1 -print -quit)"
+for path in "$fixture" "$diagnostic" "$capture"; do
+  test ! -e "$path"
+  test ! -L "$path"
+done
+printf 'work-ready\n'
 """
     output = _sensitive_ssh(
         host,
         command,
-        "parity fixture candidate preparation",
+        "parity container work preparation",
         sensitive,
         60,
     ).strip()
-    if output != "candidate-ready":
-        raise RuntimeError("parity fixture candidate preparation returned an invalid state")
+    if output != "work-ready":
+        raise RuntimeError("parity container work preparation returned an invalid state")
+
+
+def _verify_parity_container_outputs(
+    host: str,
+    paths: dict[str, str],
+    stage: str,
+    sensitive: tuple[str, ...],
+) -> None:
+    work = paths.get("work", "")
+    match = re.fullmatch(
+        r"/data/glm52-rl/qualifications/glm52-policy-parity/"
+        r"\.diagnostic-work-([0-9a-f]{16})",
+        work,
+    )
+    if match is None or paths != _parity_container_write_paths(match.group(1)):
+        raise Refused("parity container write inventory is not exact")
+    if stage == "refresh":
+        directories = (paths["fixture"], paths["router_trace"])
+        files = (paths["diagnostic"],)
+        names = "diagnostic.npz\nfixture\nh200-router-trace"
+    elif stage == "capture":
+        directories = (paths["capture"], paths["router_trace"])
+        files = (paths["diagnostic"],)
+        names = "capture\ndiagnostic.npz\nh200-router-trace"
+    else:
+        raise Refused("parity container output stage is invalid")
+    directory_values = " ".join(shlex.quote(path) for path in directories)
+    file_values = " ".join(shlex.quote(path) for path in files)
+    command = f"""
+set -euo pipefail
+work={shlex.quote(paths["work"])}
+test -d "$work"
+test ! -L "$work"
+test "$(realpath -e "$work")" = "$work"
+test "$(stat -c '%u:%g:%a' "$work")" = "1000:1000:750"
+test "$(find "$work" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)" = {shlex.quote(names)}
+for path in {directory_values}; do
+  test -d "$path"
+  test ! -L "$path"
+  test "$(realpath -e "$path")" = "$path"
+  test "$(stat -c '%u:%g' "$path")" = "1000:1000"
+  sudo -u '#1000' test -r "$path"
+  sudo -u '#1000' test -w "$path"
+  sudo -u '#1000' test -x "$path"
+  test -z "$(find "$path" -xdev \\( -type l -o ! -uid 1000 -o ! -gid 1000 -o -perm /022 \\) -print -quit)"
+done
+for path in {file_values}; do
+  test -f "$path"
+  test ! -L "$path"
+  test "$(realpath -e "$path")" = "$path"
+  test "$(stat -c '%u:%g' "$path")" = "1000:1000"
+  test $((8#$(stat -c '%a' "$path") & 8#022)) -eq 0
+  sudo -u '#1000' test -r "$path"
+done
+for directory in {directory_values}; do
+  test -z "$(sudo -u '#1000' find "$directory" -xdev \
+    \\( ! -readable -o \\( -type d ! -executable \\) \\) -print -quit)"
+done
+printf 'outputs-ready\n'
+"""
+    output = _sensitive_ssh(
+        host,
+        command,
+        f"parity container {stage} output verification",
+        sensitive,
+        60,
+    ).strip()
+    if output != "outputs-ready":
+        raise RuntimeError(
+            f"parity container {stage} output verification returned an invalid state"
+        )
 
 
 def _write_parity_transaction_state(
@@ -3262,16 +3377,19 @@ def diagnose_glm52_policy_parity(name: str, keep_engine: bool = False) -> dict[s
     bootstrap_token = secrets.token_urlsafe(48)
     nonce = secrets.token_hex(8)
     sensitive = (bootstrap_token,)
+    container_writes = _parity_container_write_paths(nonce)
     run_directory = f"{root}/.diagnostic-run-{nonce}"
-    bootstrap_fifo = f"{run_directory}/bootstrap.fifo"
+    bootstrap_fifo = container_writes["bootstrap_fifo"]
     source_diagnostic_input = f"{root}/.diagnostic-source-{nonce}.npz"
     source_session = f"{root}/.diagnostic-session-{nonce}.json"
     source_token_export = f"{root}/.diagnostic-token-{nonce}.jsonl"
     transaction_path = f"{run_directory}/transaction.json"
-    remote_input = f"{root}/.diagnostic-input-{nonce}.npz"
-    fixture_candidate = f"{root}/.fixture-candidate-{nonce}"
+    container_work_directory = container_writes["work"]
+    remote_input = container_writes["diagnostic"]
+    fixture_candidate = container_writes["fixture"]
     fixture_previous = f"{root}/.fixture-previous-{nonce}"
-    temporary_capture = f"{root}/.h200-capture-{nonce}"
+    temporary_capture = container_writes["capture"]
+    h200_trace_directory = container_writes["router_trace"]
     capture_previous = f"{root}/.h200-capture-previous-{nonce}"
     engine_launch_attempted = False
     fixture_published = False
@@ -3338,7 +3456,7 @@ echo fifo-ready
         if fifo_state != "fifo-ready":
             raise RuntimeError("parity bootstrap FIFO setup returned an invalid state")
 
-        _prepare_parity_fixture_candidate(host, fixture_candidate, sensitive)
+        _prepare_parity_container_work(host, container_writes, sensitive)
         _copy_parity_diagnostic_input(source_host, source_input, host, source_diagnostic_input)
         _copy_parity_refresh_file(source_host, session_path, host, source_session, "session")
         _copy_parity_refresh_file(final_host, token_export, host, source_token_export, "token")
@@ -3352,10 +3470,10 @@ echo fifo-ready
             f"--token-export {shlex.quote(source_token_export)} "
             f"--diagnostic-input {shlex.quote(source_diagnostic_input)} "
             f"--diagnostic-output {shlex.quote(remote_input)} "
-            f"--expected-rank {final_rank} --prepared-output "
-            f"{shlex.quote(fixture_candidate)}"
+            f"--expected-rank {final_rank} {shlex.quote(fixture_candidate)}"
         )
         refresh_output = _sensitive_ssh(host, refresh_command, "current parity fixture rebuild", sensitive, 600)
+        _verify_parity_container_outputs(host, container_writes, "refresh", sensitive)
         try:
             refresh_result = json.loads(refresh_output)
         except json.JSONDecodeError as error:
@@ -3466,6 +3584,7 @@ printf '%s\n' "$state"
             f"prime_model_volume={shlex.quote(glm_model_volume)} "
             f"prime_inference_container={shlex.quote(glm_inference_container)} "
             f"prime_parity_bootstrap_fifo={shlex.quote(bootstrap_fifo)} "
+            f"prime_parity_trace_dir={shlex.quote(h200_trace_directory)} "
             "prime_require_absent=1 "
             f"bash {shlex.quote(remote_repo + '/scripts/h200/start_inference.sh')} "
             f"{shlex.quote(glm_parity_inference_config)}"
@@ -3486,7 +3605,7 @@ printf '%s\n' "$state"
             "parity bootstrap FIFO delivery",
             startup_grace + 30,
         )
-        _h200_parity_container_preflight(host)
+        _h200_parity_container_preflight(host, h200_trace_directory)
         ready_command = (
             f"deadline=$((SECONDS+{startup_grace})); "
             "until curl -fsS --max-time 5 http://127.0.0.1:8000/liveness >/dev/null; do "
@@ -3520,6 +3639,7 @@ printf '%s\n' "$state"
             "H200 parity capture and replay",
             3600,
         )
+        _verify_parity_container_outputs(host, container_writes, "capture", sensitive)
         capture_new_sha256 = _remote_manifest_sha256(
             host, temporary_capture, "new H200 parity capture manifest", sensitive
         )
@@ -3603,6 +3723,7 @@ printf '%s\n' "$state"
             "capture": capture,
             "diagnostic_plan": plan,
             "engine_kept": keep_engine,
+            "container_work": container_work_directory if keep_engine else None,
             "cleanup_warnings": cleanup_warnings,
         }
     except BaseException as error:
@@ -3631,36 +3752,42 @@ test -z "$(sudo docker ps -a --filter "name=^/${{name}}$" --format '{{{{.Names}}
                     "isolated parity container cleanup failed: "
                     + _redact_sensitive(container_output.strip(), sensitive)
                 )
+        retain_container_work = keep_engine and succeeded
+        work_cleanup = (
+            f"test -d {shlex.quote(container_work_directory)} && "
+            f"test ! -L {shlex.quote(container_work_directory)} && "
+            f"test \"$(realpath -e {shlex.quote(container_work_directory)})\" = "
+            f"{shlex.quote(container_work_directory)}"
+            if retain_container_work
+            else (
+                f"if test -e {shlex.quote(container_work_directory)} || "
+                f"test -L {shlex.quote(container_work_directory)}; then "
+                f"test -d {shlex.quote(container_work_directory)} && "
+                f"test ! -L {shlex.quote(container_work_directory)} && "
+                f"test \"$(realpath -e {shlex.quote(container_work_directory)})\" = "
+                f"{shlex.quote(container_work_directory)} && "
+                f"sudo rm -rf -- {shlex.quote(container_work_directory)}; fi; "
+                f"test ! -e {shlex.quote(container_work_directory)}; "
+                f"test ! -L {shlex.quote(container_work_directory)}"
+            )
+        )
         cleanup = (
             f"sudo rm -f -- {shlex.quote(bootstrap_fifo)}; "
             f"if test -e {shlex.quote(transaction_path)}; then "
             f"test -f {shlex.quote(transaction_path)} && "
             f"test ! -L {shlex.quote(transaction_path)}; "
             f"else sudo rmdir -- {shlex.quote(run_directory)}; fi; "
-            f"rm -f -- {shlex.quote(remote_input)}; "
             f"rm -f -- {shlex.quote(source_diagnostic_input)}; "
             f"rm -f -- {shlex.quote(source_session)}; "
             f"rm -f -- {shlex.quote(source_token_export)}; "
-            f"if test -e {shlex.quote(fixture_candidate)} || "
-            f"test -L {shlex.quote(fixture_candidate)}; then "
-            f"test -d {shlex.quote(fixture_candidate)} && "
-            f"test ! -L {shlex.quote(fixture_candidate)} && "
-            f"test \"$(realpath -e {shlex.quote(fixture_candidate)})\" = "
-            f"{shlex.quote(fixture_candidate)} && "
-            f"sudo rm -rf -- {shlex.quote(fixture_candidate)}; fi; "
-            f"if test -d {shlex.quote(temporary_capture)}; then "
-            f"rm -rf -- {shlex.quote(temporary_capture)}; fi; "
+            f"{work_cleanup}; "
             f"test ! -e {shlex.quote(bootstrap_fifo)}; "
             f"if test -e {shlex.quote(transaction_path)}; then "
             f"test -d {shlex.quote(run_directory)}; else "
             f"test ! -e {shlex.quote(run_directory)}; fi; "
-            f"test ! -e {shlex.quote(remote_input)}; "
             f"test ! -e {shlex.quote(source_diagnostic_input)}; "
             f"test ! -e {shlex.quote(source_session)}; "
-            f"test ! -e {shlex.quote(source_token_export)}; "
-            f"test ! -e {shlex.quote(fixture_candidate)}; "
-            f"test ! -L {shlex.quote(fixture_candidate)}; "
-            f"test ! -e {shlex.quote(temporary_capture)}"
+            f"test ! -e {shlex.quote(source_token_export)}"
         )
         cleanup_code, cleanup_output = _ssh(host, cleanup, timeout=120)
         if cleanup_code:

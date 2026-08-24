@@ -17,6 +17,7 @@ class H200ParityTest(unittest.TestCase):
         commands,
         *,
         fail_start=False,
+        fail_work_prep=False,
         fail_refresh=False,
         fail_capture=False,
         fail_cleanup=False,
@@ -41,8 +42,12 @@ class H200ParityTest(unittest.TestCase):
                 return 0, "config-sha\n"
             if "mkfifo -m 0600" in command:
                 return 0, "fifo-ready\n"
-            if "parity fixture candidate" in command or "candidate-ready" in command:
-                return 0, "candidate-ready\n"
+            if "work-ready" in command:
+                if fail_work_prep:
+                    return 1, "permission denied"
+                return 0, "work-ready\n"
+            if "outputs-ready" in command:
+                return 0, "outputs-ready\n"
             if "refresh-fixture" in command:
                 if fail_refresh:
                     return 1, "refresh failed"
@@ -57,7 +62,7 @@ class H200ParityTest(unittest.TestCase):
                         "rank": 56,
                     }
                 ) + "\n"
-            if "state=created" in command and ".fixture-candidate-" in command:
+            if "state=created" in command and ".fixture-publish-failed-" in command:
                 transaction["state"]["phase"] = "fixture_published"
                 transaction["state"]["fixture"]["action"] = "replaced"
                 if lose_fixture_ack:
@@ -154,7 +159,7 @@ class H200ParityTest(unittest.TestCase):
             return {"state": state, "observed": observed}
 
         def manifest_sha(_host, path, _label, _sensitive):
-            if ".h200-capture-1111111111111111" in path:
+            if ".diagnostic-work-1111111111111111/capture" in path:
                 return "7" * 64
             if path == training_ops.glm_parity_paths["h200_capture"]:
                 return "8" * 64
@@ -368,6 +373,10 @@ class H200ParityTest(unittest.TestCase):
                 training_ops._diagnostic_capture_preflight(config, "h200")
 
     def test_post_launch_inspection_accepts_exact_command_and_config(self):
+        trace = (
+            "/data/glm52-rl/qualifications/glm52-policy-parity/"
+            ".diagnostic-work-1111111111111111/h200-router-trace"
+        )
         command = [
             "@",
             training_ops.glm_parity_inference_config,
@@ -380,7 +389,10 @@ class H200ParityTest(unittest.TestCase):
                 json.dumps(training_ops.inference_image),
                 json.dumps(command),
                 json.dumps(
-                    ["PRIME_PARITY_BOOTSTRAP_FIFO=/run/prime-parity-bootstrap"]
+                    [
+                        "PRIME_PARITY_BOOTSTRAP_FIFO=/run/prime-parity-bootstrap",
+                        f"PRIME_PARITY_ROUTER_TRACE_DIR={trace}",
+                    ]
                 ),
                 json.dumps(
                     [
@@ -408,10 +420,14 @@ class H200ParityTest(unittest.TestCase):
             }
         )
         with patch.object(training_ops, "_ssh", side_effect=[(0, inspect), (0, config)]):
-            result = training_ops._h200_parity_container_preflight("h200a")
+            result = training_ops._h200_parity_container_preflight("h200a", trace)
         self.assertEqual(result["config"]["max_model_len"], 32769)
 
     def test_post_launch_inspection_refuses_wrong_config_command(self):
+        trace = (
+            "/data/glm52-rl/qualifications/glm52-policy-parity/"
+            ".diagnostic-work-1111111111111111/h200-router-trace"
+        )
         command = [
             "@",
             f"{training_ops.remote_repo}/configs/h200/inference.toml",
@@ -424,7 +440,10 @@ class H200ParityTest(unittest.TestCase):
                 json.dumps(training_ops.inference_image),
                 json.dumps(command),
                 json.dumps(
-                    ["PRIME_PARITY_BOOTSTRAP_FIFO=/run/prime-parity-bootstrap"]
+                    [
+                        "PRIME_PARITY_BOOTSTRAP_FIFO=/run/prime-parity-bootstrap",
+                        f"PRIME_PARITY_ROUTER_TRACE_DIR={trace}",
+                    ]
                 ),
                 json.dumps(
                     [
@@ -444,9 +463,13 @@ class H200ParityTest(unittest.TestCase):
         )
         with patch.object(training_ops, "_ssh", return_value=(0, inspect)):
             with self.assertRaises(training_ops.Refused):
-                training_ops._h200_parity_container_preflight("h200a")
+                training_ops._h200_parity_container_preflight("h200a", trace)
 
     def test_post_launch_inspection_refuses_token_in_container_environment(self):
+        trace = (
+            "/data/glm52-rl/qualifications/glm52-policy-parity/"
+            ".diagnostic-work-1111111111111111/h200-router-trace"
+        )
         secret = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_"
         command = [
             "@",
@@ -462,6 +485,7 @@ class H200ParityTest(unittest.TestCase):
                 json.dumps(
                     [
                         "PRIME_PARITY_BOOTSTRAP_FIFO=/run/prime-parity-bootstrap",
+                        f"PRIME_PARITY_ROUTER_TRACE_DIR={trace}",
                         f"PRIME_PARITY_BOOTSTRAP_TOKEN={secret}",
                     ]
                 ),
@@ -471,7 +495,7 @@ class H200ParityTest(unittest.TestCase):
         )
         with patch.object(training_ops, "_ssh", return_value=(0, inspect)):
             with self.assertRaisesRegex(training_ops.Refused, "metadata contains") as caught:
-                training_ops._h200_parity_container_preflight("h200a")
+                training_ops._h200_parity_container_preflight("h200a", trace)
         self.assertNotIn(secret, str(caught.exception))
 
     def test_diagnostic_operation_redacts_token_and_cleans_up_after_failure(self):
@@ -583,33 +607,55 @@ class H200ParityTest(unittest.TestCase):
             )
         )
 
-        candidate_setup = next(
-            command for command in commands if "candidate-ready" in command
-        )
+        work_setup = next(command for command in commands if "work-ready" in command)
         refresh = next(command for command in commands if "refresh-fixture" in command)
-        self.assertLess(commands.index(candidate_setup), commands.index(refresh))
-        self.assertIn("install -d -o 1000 -g 1000 -m 0750", candidate_setup)
-        self.assertIn("1000:1000:750", candidate_setup)
-        self.assertIn("--prepared-output", refresh)
-
-    def test_fixture_candidate_preparation_refuses_wrong_path(self):
-        with self.assertRaisesRegex(training_ops.Refused, "candidate path"):
-            training_ops._prepare_parity_fixture_candidate(
-                "h200a", "/tmp/.fixture-candidate-1111111111111111", ()
-            )
-
-    def test_fixture_candidate_preparation_creates_exact_owned_empty_dir(self):
-        exact = (
+        capture = next(command for command in commands if "capture-h200" in command)
+        start = next(command for command in commands if "prime_parity_trace_dir=" in command)
+        self.assertLess(commands.index(work_setup), commands.index(refresh))
+        self.assertIn("install -d -o 1000 -g 1000 -m 0750", work_setup)
+        self.assertIn("1000:1000:750", work_setup)
+        work = (
             "/data/glm52-rl/qualifications/glm52-policy-parity/"
-            ".fixture-candidate-1111111111111111"
+            ".diagnostic-work-1111111111111111"
         )
+        self.assertIn(f"{work}/fixture", refresh)
+        self.assertIn(f"{work}/diagnostic.npz", refresh)
+        self.assertIn(f"{work}/capture", capture)
+        self.assertIn(f"{work}/h200-router-trace", start)
+
+    def test_container_write_inventory_refuses_unprepared_path(self):
+        paths = training_ops._parity_container_write_paths("1" * 16)
+        self.assertEqual(
+            set(paths),
+            {
+                "work",
+                "fixture",
+                "diagnostic",
+                "capture",
+                "router_trace",
+                "bootstrap_fifo",
+                "lora_cache",
+                "vllm_cache",
+            },
+        )
+        paths["capture"] = "/tmp/unprepared"
+        with self.assertRaisesRegex(training_ops.Refused, "inventory"):
+            training_ops._prepare_parity_container_work("h200a", paths, ())
+
+    def test_container_work_preparation_creates_exact_owned_empty_dirs(self):
+        exact_work = (
+            "/data/glm52-rl/qualifications/glm52-policy-parity/"
+            ".diagnostic-work-1111111111111111"
+        )
+        paths = training_ops._parity_container_write_paths("1" * 16)
         with tempfile.TemporaryDirectory() as temporary:
-            local = Path(temporary) / ".fixture-candidate-1111111111111111"
+            local = Path(temporary) / ".diagnostic-work-1111111111111111"
 
             def run_prepare(_host, command, _label, _sensitive, _timeout):
-                local_command = command.replace(exact, str(local)).replace(
+                local_command = command.replace(exact_work, str(local)).replace(
                     "sudo install", "install"
                 )
+                local_command = local_command.replace("sudo -u '#1000' ", "")
                 completed = subprocess.run(
                     ["bash", "-c", local_command],
                     text=True,
@@ -621,16 +667,88 @@ class H200ParityTest(unittest.TestCase):
                 return completed.stdout
 
             with patch.object(training_ops, "_sensitive_ssh", side_effect=run_prepare):
-                training_ops._prepare_parity_fixture_candidate(
-                    "h200a", exact, ()
-                )
+                training_ops._prepare_parity_container_work("h200a", paths, ())
             status = local.stat()
             self.assertEqual(status.st_uid, 1000)
             self.assertEqual(status.st_gid, 1000)
             self.assertEqual(status.st_mode & 0o777, 0o750)
-            self.assertEqual(list(local.iterdir()), [])
+            self.assertEqual([path.name for path in local.iterdir()], ["h200-router-trace"])
+            self.assertEqual(list((local / "h200-router-trace").iterdir()), [])
 
-    def test_fixture_candidate_cleanup_uses_sudo_after_refresh_failure(self):
+    def test_container_refresh_outputs_are_verified_before_publish(self):
+        exact_work = (
+            "/data/glm52-rl/qualifications/glm52-policy-parity/"
+            ".diagnostic-work-1111111111111111"
+        )
+        paths = training_ops._parity_container_write_paths("1" * 16)
+        with tempfile.TemporaryDirectory() as temporary:
+            local = Path(temporary) / ".diagnostic-work-1111111111111111"
+            local.mkdir(mode=0o750)
+            os.chmod(local, 0o750)
+            trace = local / "h200-router-trace"
+            trace.mkdir(mode=0o750)
+            os.chmod(trace, 0o750)
+            fixture = local / "fixture"
+            fixture.mkdir()
+            os.chmod(fixture, 0o755)
+            manifest = fixture / "manifest.json"
+            manifest.write_text("{}")
+            os.chmod(manifest, 0o644)
+            diagnostic = local / "diagnostic.npz"
+            diagnostic.write_bytes(b"diagnostic")
+            os.chmod(diagnostic, 0o644)
+
+            def run_verify(_host, command, _label, _sensitive, _timeout):
+                local_command = command.replace(exact_work, str(local)).replace(
+                    "sudo -u '#1000' ", ""
+                )
+                completed = subprocess.run(
+                    ["bash", "-c", local_command],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                if completed.returncode:
+                    raise RuntimeError(completed.stderr)
+                return completed.stdout
+
+            with patch.object(training_ops, "_sensitive_ssh", side_effect=run_verify):
+                training_ops._verify_parity_container_outputs(
+                    "h200a", paths, "refresh", ()
+                )
+
+            os.chmod(local / "diagnostic.npz", 0o666)
+            with patch.object(training_ops, "_sensitive_ssh", side_effect=run_verify):
+                with self.assertRaises(RuntimeError):
+                    training_ops._verify_parity_container_outputs(
+                        "h200a", paths, "refresh", ()
+                    )
+
+    def test_container_permission_failure_stops_before_container_run(self):
+        commands = []
+        secret, ssh_call, secret_call, _ = self._operation_ssh(
+            commands, fail_work_prep=True
+        )
+        with self.assertRaisesRegex(RuntimeError, "permission denied"):
+            self._run_operation(ssh_call, secret_call, secret)
+        self.assertTrue(any("work-ready" in command for command in commands))
+        self.assertFalse(any("refresh-fixture" in command for command in commands))
+        self.assertFalse(any("capture-h200" in command for command in commands))
+        self.assertFalse(
+            any(
+                "start_inference.sh" in command and "prime_deployment=" in command
+                for command in commands
+            )
+        )
+        self.assertTrue(
+            any(
+                ".diagnostic-work-1111111111111111" in command
+                and "sudo rm -rf --" in command
+                for command in commands
+            )
+        )
+
+    def test_container_work_cleanup_uses_sudo_after_refresh_failure(self):
         commands = []
         secret, ssh_call, secret_call, _ = self._operation_ssh(
             commands, fail_refresh=True
@@ -641,11 +759,31 @@ class H200ParityTest(unittest.TestCase):
             command
             for command in commands
             if "sudo rm -rf --" in command
-            and ".fixture-candidate-1111111111111111" in command
+            and ".diagnostic-work-1111111111111111" in command
             and "realpath -e" in command
         )
         self.assertIn("test ! -L", cleanup)
         self.assertIn("sudo rm -rf --", cleanup)
+
+    def test_kept_engine_retains_its_exact_router_trace_work(self):
+        commands = []
+        secret, ssh_call, secret_call, _ = self._operation_ssh(commands)
+        result = self._run_operation(
+            ssh_call, secret_call, secret, keep_engine=True
+        )
+        work = (
+            "/data/glm52-rl/qualifications/glm52-policy-parity/"
+            ".diagnostic-work-1111111111111111"
+        )
+        self.assertTrue(result["engine_kept"])
+        self.assertEqual(result["container_work"], work)
+        cleanup = next(
+            command
+            for command in commands
+            if "bootstrap.fifo" in command and ".diagnostic-source-" in command
+        )
+        self.assertIn(f'realpath -e {work}', cleanup)
+        self.assertNotIn(f"sudo rm -rf -- {work}", cleanup)
 
     def test_diagnostic_operation_reconciles_lost_or_invalid_publish_ack(self):
         cases = (
@@ -774,6 +912,7 @@ class H200ParityTest(unittest.TestCase):
             ".diagnostic-run-1111111111111111/transaction.json"
         )
         root = "/data/glm52-rl/qualifications/glm52-policy-parity"
+        writes = training_ops._parity_container_write_paths("1" * 16)
         state = {
             "schema_version": 1,
             "nonce": "1111111111111111",
@@ -785,7 +924,7 @@ class H200ParityTest(unittest.TestCase):
                 "paths": {
                     "live": training_ops.glm_parity_paths["fixture"],
                     "previous": f"{root}/.fixture-previous-1111111111111111",
-                    "candidate": f"{root}/.fixture-candidate-1111111111111111",
+                    "candidate": writes["fixture"],
                     "failed": f"{root}/.fixture-failed-1111111111111111",
                 },
             },
@@ -796,7 +935,7 @@ class H200ParityTest(unittest.TestCase):
                 "paths": {
                     "live": training_ops.glm_parity_paths["h200_capture"],
                     "previous": f"{root}/.h200-capture-previous-1111111111111111",
-                    "candidate": f"{root}/.h200-capture-1111111111111111",
+                    "candidate": writes["capture"],
                     "failed": f"{root}/.h200-capture-failed-1111111111111111",
                 },
             },

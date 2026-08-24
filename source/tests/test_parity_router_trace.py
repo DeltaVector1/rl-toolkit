@@ -13,7 +13,6 @@ from unittest.mock import patch
 import numpy as np
 from scripts.glm52_policy_parity import (
     Profile,
-    _prepare_refresh_output,
     capture_h200,
     read_secret_stdin,
     validate_diagnostic_file,
@@ -147,52 +146,6 @@ def session() -> TraceSession:
 
 
 class ParityRouterTraceTest(unittest.TestCase):
-    def test_prepared_refresh_output_accepts_exact_empty_directory(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            output = Path(temporary) / "candidate"
-            output.mkdir(mode=0o750)
-            os.chmod(output, 0o750)
-            _prepare_refresh_output(output, True)
-            self.assertEqual(list(output.iterdir()), [])
-
-    def test_prepared_refresh_output_refuses_wrong_mode(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            output = Path(temporary) / "candidate"
-            output.mkdir(mode=0o755)
-            os.chmod(output, 0o755)
-            with self.assertRaisesRegex(ValueError, "owner, mode, or content"):
-                _prepare_refresh_output(output, True)
-
-    def test_prepared_refresh_output_refuses_wrong_owner(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            output = Path(temporary) / "candidate"
-            output.mkdir(mode=0o750)
-            os.chmod(output, 0o750)
-            with patch(
-                "scripts.glm52_policy_parity.os.geteuid",
-                return_value=os.geteuid() + 1,
-            ), self.assertRaisesRegex(ValueError, "owner, mode, or content"):
-                _prepare_refresh_output(output, True)
-
-    def test_prepared_refresh_output_refuses_symlink(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            target = root / "target"
-            target.mkdir(mode=0o750)
-            output = root / "candidate"
-            output.symlink_to(target, target_is_directory=True)
-            with self.assertRaisesRegex(ValueError, "owner, mode, or content"):
-                _prepare_refresh_output(output, True)
-
-    def test_prepared_refresh_output_refuses_content(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            output = Path(temporary) / "candidate"
-            output.mkdir(mode=0o750)
-            os.chmod(output, 0o750)
-            (output / "untracked").write_text("data")
-            with self.assertRaisesRegex(ValueError, "owner, mode, or content"):
-                _prepare_refresh_output(output, True)
-
     def test_glm_diagnostic_plan_fits_existing_caps(self):
         metadata = TraceSession(
             **{

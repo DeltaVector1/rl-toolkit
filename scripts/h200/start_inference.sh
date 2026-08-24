@@ -67,6 +67,22 @@ if [[ "$fifo_identity" != "1000:1000:600" ]]; then
   echo "refusing parity bootstrap FIFO owner or mode: $fifo_identity" >&2
   exit 2
 fi
+parity_trace_dir=${prime_parity_trace_dir:-}
+if [[ ! "$parity_trace_dir" =~ ^$qualification_root/\.diagnostic-work-[0-9a-f]{16}/h200-router-trace$ ]]; then
+  echo "refusing parity engine without an exact router trace directory" >&2
+  exit 2
+fi
+if [[ -L "$parity_trace_dir" || ! -d "$parity_trace_dir" || \
+      "$(realpath -e "$parity_trace_dir")" != "$parity_trace_dir" ]]; then
+  echo "refusing invalid parity router trace directory" >&2
+  exit 2
+fi
+trace_identity=$(stat -c '%u:%g:%a' "$parity_trace_dir")
+if [[ "$trace_identity" != "1000:1000:750" || \
+      -n "$(find "$parity_trace_dir" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+  echo "refusing parity router trace owner, mode, or content: $trace_identity" >&2
+  exit 2
+fi
 install -d -o 1000 -g 1000 -m 0755 /data/glm52-rl/lora-cache
 install -d -o 1000 -g 1000 -m 0755 "$deployment/cache/vllm"
 for stale_container in "$engine_container" "$engine_container-0" "$engine_container-1"; do
@@ -124,6 +140,7 @@ docker run -d --name "$engine_container" --restart "$restart_policy" \
   -e VLLM_ENGINE_READY_TIMEOUT_S=7200 \
   -e PRIME_ADAPTER_PORTS="$adapter_ports" \
   -e PRIME_PARITY_BOOTSTRAP_FIFO=/run/prime-parity-bootstrap \
+  -e PRIME_PARITY_ROUTER_TRACE_DIR="$parity_trace_dir" \
   --entrypoint /app/.venv/bin/inference \
   "$image" \
   @ "$inference_config" \

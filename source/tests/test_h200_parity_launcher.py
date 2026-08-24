@@ -79,6 +79,28 @@ class H200ParityLauncherTest(unittest.TestCase):
         )
         self.assertIn('restart_policy=no', source)
 
+    def test_launcher_requires_the_exact_prepared_router_trace_path(self):
+        source = START.read_text()
+        config = (
+            ROOT / "configs/qualification/glm52-policy-parity-h200.toml"
+        ).read_text()
+        self.assertIn("prime_parity_trace_dir", source)
+        self.assertIn(".diagnostic-work-[0-9a-f]{16}/h200-router-trace", source)
+        self.assertIn("1000:1000:750", source)
+        self.assertIn(
+            'PRIME_PARITY_ROUTER_TRACE_DIR="$parity_trace_dir"', source
+        )
+        self.assertNotIn("PRIME_PARITY_ROUTER_TRACE_DIR", config)
+        launch = source.index("docker run -d")
+        self.assertLess(
+            source.index("install -d -o 1000 -g 1000 -m 0755 /data/glm52-rl/lora-cache"),
+            launch,
+        )
+        self.assertLess(
+            source.index('install -d -o 1000 -g 1000 -m 0755 "$deployment/cache/vllm"'),
+            launch,
+        )
+
     def test_parity_handlers_use_bounded_stream_reader(self):
         server = (ROOT / "source/src/prime_rl/inference/vllm/server.py").read_text()
         reset = server.split('@router.post("/parity/router-trace/reset")', 1)[1].split(
