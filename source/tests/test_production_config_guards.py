@@ -185,15 +185,7 @@ def test_glm52_stability_and_production_pin_bounded_transport_env() -> None:
     assert "PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD" not in muse.get("env_vars", {})
 
 
-def test_all_glm52_trainers_use_fused_q_and_kv_a_fp8() -> None:
-    expected_w8a16 = [
-        "q_b_proj",
-        "o_proj",
-        "gate_proj",
-        "up_proj",
-        "down_proj",
-        "wq_b",
-    ]
+def test_all_glm52_trainers_use_h200_w8a8_semantics() -> None:
     expected_profiles = {
         "configs/qualification/glm52-policy-parity-trainer.toml",
         "configs/qualification/glm52-native-small.toml",
@@ -214,7 +206,8 @@ def test_all_glm52_trainers_use_fused_q_and_kv_a_fp8() -> None:
         assert quantization["type"] == "fp8", relative
         assert quantization["dequantize_checkpoint"] is False, relative
         assert quantization.get("bf16_modules", []) == [], relative
-        assert quantization["w8a16_modules"] == expected_w8a16, relative
+        assert "w8a16_modules" in quantization, relative
+        assert quantization["w8a16_modules"] == [], relative
         assert quantization["fused_qkv_a_fp8"] is True, relative
 
     model_source = (ROOT / "source/src/prime_rl/trainer/model.py").read_text()
