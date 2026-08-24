@@ -371,10 +371,14 @@ _qualification_environment_names = (
 
 def _qualification_environment() -> dict[str, str] | None:
     values = {name: os.environ.get(name, "") for name in _qualification_environment_names}
-    present = [bool(value) for value in values.values()]
-    if not any(present):
+    qualification_names = [
+        name
+        for name in _qualification_environment_names
+        if name.startswith("PRIME_QUALIFICATION_")
+    ]
+    if not any(values[name] for name in qualification_names):
         return None
-    if not all(present):
+    if not all(values.values()):
         raise RuntimeError("qualification identity is incomplete")
     if not re.fullmatch(r"[0-9a-f]{32}", values["PRIME_QUALIFICATION_SESSION_ID"]):
         raise RuntimeError("qualification session ID is invalid")
