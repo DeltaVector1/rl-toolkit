@@ -334,7 +334,11 @@ ssh_command = [
 trainer_ssh_command = [
     "StrictHostKeyChecking=yes" if value == "StrictHostKeyChecking=accept-new" else value
     for value in ssh_command
-] + ["-o", "UpdateHostKeys=no"]
+] + [
+    "-o", "UpdateHostKeys=no",
+    "-o", "ControlMaster=no",
+    "-o", "ControlPath=none",
+]
 
 
 class Refused(RuntimeError):

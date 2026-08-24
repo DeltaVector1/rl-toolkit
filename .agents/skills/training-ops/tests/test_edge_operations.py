@@ -1404,9 +1404,16 @@ raise SystemExit(99)
         self.assertIn("shift 2 && exec rsync", remote)
         self.assertGreater(remote.count("stat -c"), 1)
         self.assertNotIn("flock -n", remote)
-        self.assertIn("StrictHostKeyChecking=yes", command[command.index("-e") + 1])
-        self.assertIn("UpdateHostKeys=no", command[command.index("-e") + 1])
-        self.assertNotIn("accept-new", command[command.index("-e") + 1])
+        transport = command[command.index("-e") + 1]
+        for option in (
+            "StrictHostKeyChecking=yes",
+            "UpdateHostKeys=no",
+            "ControlMaster=no",
+            "ControlPath=none",
+        ):
+            self.assertEqual(transport.count(option), 1)
+        self.assertNotIn("accept-new", transport)
+        self.assertNotIn("ControlPersist", transport)
         self.assertNotIn("--foreground", remote)
         self.assertEqual(command[-2:], ["/source/.", f"10.92.20.76:{candidate}/"])
 
@@ -1509,6 +1516,8 @@ raise SystemExit(99)
             )
         self.assertIn("StrictHostKeyChecking=yes", ssh.call_args.args[1])
         self.assertIn("UpdateHostKeys=no", ssh.call_args.args[1])
+        self.assertIn("ControlMaster=no", ssh.call_args.args[1])
+        self.assertIn("ControlPath=none", ssh.call_args.args[1])
         self.assertNotIn("accept-new", ssh.call_args.args[1])
         source = Path(training_ops.__file__).read_text()
         transfer = source[source.index("def _glm_parity_transfer_preflight"):]
