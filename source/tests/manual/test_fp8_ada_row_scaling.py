@@ -11,14 +11,13 @@ import torch.nn.functional as F
 from safetensors import safe_open
 
 from prime_rl.trainer.models.layers.fp8_ada import (
-    _grouped_mm,
-    _linear_input_grad,
+    _linear_input_grad_oracle,
     _native_block_fp8_mm,
 )
 
 
 MODEL = Path("/model")
-ROW_COUNTS = (16, 64, 256, 1024, 4096)
+ROW_COUNTS = (1, 16, 63, 64, 65, 127, 128, 129, 512, 1024, 2048, 4096)
 
 
 parser = argparse.ArgumentParser()
@@ -61,21 +60,14 @@ for rows in ROW_COUNTS:
         device="cuda",
         dtype=torch.bfloat16,
     ).mul_(0.1)
-    offsets = torch.tensor([rows], device="cuda", dtype=torch.int32)
-
     native = _native_block_fp8_mm(
         grad,
         weight,
         scale,
         weight_is_output_major=False,
     )
-    fused = _grouped_mm(
-        grad,
-        weight.t().unsqueeze(0),
-        scale.t().unsqueeze(0),
-        offsets,
-    )
-    if not bool(torch.isfinite(native).all() and torch.isfinite(fused).all()):
+    oracle = _linear_input_grad_oracle(grad, weight, scale)
+    if not bool(torch.isfinite(native).all() and torch.isfinite(oracle).all()):
         raise RuntimeError(f"nonfinite result at {rows=}")
 
     iterations = 20 if rows <= 256 else 5 if rows <= 1024 else 2
@@ -89,13 +81,8 @@ for rows in ROW_COUNTS:
         warmup=3,
         iterations=iterations,
     )
-    fused_ms = profiled(
-        lambda: _grouped_mm(
-            grad,
-            weight.t().unsqueeze(0),
-            scale.t().unsqueeze(0),
-            offsets,
-        ),
+    oracle_ms = profiled(
+        lambda: _linear_input_grad_oracle(grad, weight, scale),
         warmup=3,
         iterations=iterations,
     )
@@ -111,15 +98,6 @@ for rows in ROW_COUNTS:
         scale,
         weight_is_output_major=True,
     )
-    forward_offsets = torch.tensor(
-        [rows], device="cuda", dtype=torch.int32
-    )
-    fused_forward = _grouped_mm(
-        activation,
-        weight.unsqueeze(0),
-        scale.unsqueeze(0),
-        forward_offsets,
-    )
     direct_forward_ms = profiled(
         lambda: _native_block_fp8_mm(
             activation,
@@ -130,39 +108,38 @@ for rows in ROW_COUNTS:
         warmup=3,
         iterations=iterations,
     )
-    fused_forward_ms = profiled(
-        lambda: _grouped_mm(
-            activation,
-            weight.unsqueeze(0),
-            scale.unsqueeze(0),
-            forward_offsets,
-        ),
-        warmup=3,
-        iterations=iterations,
-    )
+    for amplitude in (0.1, 1.0, 10.0, 100.0, 1000.0):
+        stress_grad = grad * amplitude / 0.1
+        stress_native = _native_block_fp8_mm(
+            stress_grad,
+            weight,
+            scale,
+            weight_is_output_major=False,
+        )
+        stress_oracle = _linear_input_grad_oracle(stress_grad, weight, scale)
+        if not bool(
+            torch.isfinite(stress_native).all()
+            and torch.isfinite(stress_oracle).all()
+        ):
+            raise RuntimeError(f"nonfinite stress result at {rows=} {amplitude=}")
+
+    diff = native.float() - oracle.float()
+    oracle_absmax = oracle.float().abs().max()
     print(
         json.dumps(
             {
                 "rows": rows,
                 "native_ms": native_ms,
-                "fused_transposed_ms": fused_ms,
-                "native_over_fused": native_ms / fused_ms,
+                "oracle_ms": oracle_ms,
+                "native_over_oracle": native_ms / oracle_ms,
                 "direct_forward_ms": direct_forward_ms,
-                "fused_forward_ms": fused_forward_ms,
-                "direct_forward_over_fused": (
-                    direct_forward_ms / fused_forward_ms
+                "native_vs_oracle_rel_rmse": float(
+                    diff.square().mean().sqrt() / oracle_absmax
                 ),
-                "forward_cross_cosine": float(
-                    F.cosine_similarity(
-                        direct_forward.float().flatten(),
-                        fused_forward.float().flatten(),
-                        dim=0,
-                    )
-                ),
-                "cross_cosine": float(
+                "native_vs_oracle_cosine": float(
                     F.cosine_similarity(
                         native.float().flatten(),
-                        fused.float().flatten(),
+                        oracle.float().flatten(),
                         dim=0,
                     )
                 ),

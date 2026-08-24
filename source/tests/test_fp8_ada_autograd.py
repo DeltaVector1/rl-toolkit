@@ -319,23 +319,23 @@ class FP8AdaAutogradTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "input width"):
             fp8_ada._w8a16_linear(value[..., :128], weight, scale)
 
-    def test_w8a16_backward_uses_bounded_fp32_oracle(self):
+    def test_w8a16_backward_uses_native_transposed_layout(self):
         grad = torch.randn(2, 384, dtype=torch.bfloat16)
         weight = torch.empty(384, 256, dtype=torch.float8_e4m3fn)
         scale = torch.ones(3, 2, dtype=torch.float32)
         sentinel = torch.full((2, 256), 31.0, dtype=torch.bfloat16)
-        seen = {"fqn": None}
+        seen = {}
 
-        original_oracle = fp8_ada._linear_input_grad_oracle
+        original_native = fp8_ada._native_block_fp8_mm
 
-        def fake_oracle(value, raw_weight, block_scale, *, fqn):
-            seen["fqn"] = fqn
-            self.assertIs(value, grad)
-            self.assertIs(raw_weight, weight)
-            self.assertIs(block_scale, scale)
+        def fake_native(value, raw_weight, block_scale, *, weight_is_output_major):
+            seen["x_shape"] = value.shape
+            seen["weight_shape"] = raw_weight.shape
+            seen["scale_shape"] = block_scale.shape
+            seen["weight_is_output_major"] = weight_is_output_major
             return sentinel
 
-        fp8_ada._linear_input_grad_oracle = fake_oracle
+        fp8_ada._native_block_fp8_mm = fake_native
         try:
             got = fp8_ada._w8a16_input_grad(
                 grad,
@@ -344,13 +344,18 @@ class FP8AdaAutogradTest(unittest.TestCase):
                 fqn="model.layers.11.self_attn.o_proj",
             )
         finally:
-            fp8_ada._linear_input_grad_oracle = original_oracle
+            fp8_ada._native_block_fp8_mm = original_native
 
         self.assertEqual(got.shape, (2, 256))
-        self.assertEqual(seen["fqn"], "model.layers.11.self_attn.o_proj")
+        self.assertEqual(seen, {
+            "x_shape": (2, 384),
+            "weight_shape": (384, 256),
+            "scale_shape": (3, 2),
+            "weight_is_output_major": False,
+        })
         torch.testing.assert_close(got, sentinel)
 
-    def test_w8a16_oracle_input_gradient_is_finite(self):
+    def test_w8a16_oracle_input_gradient_is_finite_reference(self):
         torch.manual_seed(17)
         grad = torch.randn(64, 256, dtype=torch.bfloat16).mul_(0.1)
         weight = torch.randn(256, 384, dtype=torch.float32).mul_(0.5).to(
@@ -358,7 +363,7 @@ class FP8AdaAutogradTest(unittest.TestCase):
         )
         scale = torch.rand(2, 3, dtype=torch.float32).mul_(0.5).add_(0.5)
 
-        got = fp8_ada._w8a16_input_grad(grad, weight, scale)
+        got = fp8_ada._linear_input_grad_oracle(grad, weight, scale)
 
         self.assertEqual(got.shape, (64, 384))
         self.assertTrue(torch.isfinite(got).all())

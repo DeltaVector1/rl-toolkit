@@ -36,6 +36,7 @@ _FP8_EXPERT_ACTIVATION_OFFLOAD = (
 _DIAGNOSE_LINEAR_BACKWARD = False
 _REPORTED_LINEAR_BACKWARD: set[tuple[tuple[int, ...], bool, bool]] = set()
 _REPORTED_INPUT_GRAD: set[str] = set()
+_REPORTED_W8A16_INPUT_GRAD: set[tuple[str, bool, bool]] = set()
 _EXPERT_PROFILE = os.environ.get("PRIME_EP_PROFILE", "") == "1"
 _EXPERT_BACKWARD_EVENTS: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
 _EXPERT_PROFILE_EVERY = int(os.environ.get("PRIME_EXPERT_PROFILE_EVERY", "90"))
@@ -159,7 +160,12 @@ if hasattr(triton, "jit"):
                 inverse_scale = tl.load(
                     scale + ((k_start // 128) * stride_s0) + (pid_n * stride_s1)
                 )
-            accumulator += tl.dot(activation, weight_fragment) * inverse_scale
+            block_product = tl.dot(
+                activation,
+                weight_fragment,
+                out_dtype=tl.float32,
+            )
+            accumulator = accumulator + block_product * inverse_scale
 
         tl.store(
             out + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on,
@@ -317,10 +323,35 @@ def _w8a16_input_grad(
             f"W8A16 gradient width {grad.shape[-1]} does not match "
             f"weight output width {weight.shape[0]}"
         )
-    # The inference W8A16 kernel is forward-only. Its transposed use is not a
-    # supported checkpoint layout for backward, so dequantize bounded rows and
-    # accumulate the input gradient in FP32.
-    return _linear_input_grad_oracle(grad, weight, scale, fqn=fqn)
+    shape = (*grad.shape[:-1], weight.shape[1])
+    grad_2d = grad.reshape(-1, grad.shape[-1]).contiguous()
+    input_grad = _native_block_fp8_mm(
+        grad_2d, weight, scale, weight_is_output_major=False
+    ).view(shape)
+    if (
+        _DIAGNOSE_LINEAR_BACKWARD
+        or os.environ.get("PRIME_FP8_DIAG_LINEAR_BACKWARD", "") == "1"
+    ):
+        incoming_finite = bool(torch.isfinite(grad).all())
+        output_finite = bool(torch.isfinite(input_grad).all())
+        report_key = (fqn, incoming_finite, output_finite)
+        if (
+            (not incoming_finite or not output_finite)
+            and report_key not in _REPORTED_W8A16_INPUT_GRAD
+        ):
+            _REPORTED_W8A16_INPUT_GRAD.add(report_key)
+            finite_grad = grad[torch.isfinite(grad)]
+            finite_output = input_grad[torch.isfinite(input_grad)]
+            print(
+                "[fp8-w8a16-input-grad] "
+                f"fqn={fqn} weight={tuple(weight.shape)} grad={tuple(grad.shape)} "
+                f"incoming_finite={incoming_finite} "
+                f"incoming_absmax={float(finite_grad.abs().max()) if finite_grad.numel() else float('nan'):.6e} "
+                f"output_finite={output_finite} "
+                f"output_absmax={float(finite_output.abs().max()) if finite_output.numel() else float('nan'):.6e}",
+                flush=True,
+            )
+    return input_grad
 
 
 def _linear_input_grad_oracle(
