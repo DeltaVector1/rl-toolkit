@@ -59,6 +59,11 @@ class H200ParityLauncherTest(unittest.TestCase):
         self.assertIn('max_num_batched_tokens":32769', source)
         self.assertIn('max_cudagraph_capture_size":256', source)
 
+    def test_trainer_launcher_passes_rank_zero_host_for_bundle_validation(self):
+        source = (ROOT / "scripts/china/cluster.sh").read_text()
+        self.assertIn('trainer_head_node=${trainer_nodes%% *}', source)
+        self.assertIn('-e "PRIME_TRAINER_HEAD=n$trainer_head_node"', source)
+
     def test_isolated_operation_can_require_all_container_names_absent(self):
         source = START.read_text()
         self.assertIn("prime_require_absent", source)

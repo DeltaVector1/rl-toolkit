@@ -25,6 +25,10 @@ trace_dir_env = "PRIME_PARITY_ROUTER_TRACE_DIR"
 session_name = "session.json"
 runtime_marker_name = "h200-runtime.json"
 trainer_provenance_name = "trainer-runtime.json"
+trainer_provenance_union_name = "trainer-provenance-union.json"
+trainer_fixture_source_name = "trainer-fixture-source.npz"
+trainer_fixture_manifest_name = "trainer-fixture-source.json"
+trainer_bundle_stable_name = "STABLE"
 router_debug_pattern = re.compile(
     r"^(trainer|h200)-rank-(\d+)-pp-(\d+)-cp-(\d+)-layer-(\d+)-router-debug\.npz$"
 )
@@ -477,7 +481,7 @@ def _trainer_host_name() -> str:
     return host
 
 
-def _trainer_provenance(root: Path, owned_layers: set[int]) -> None:
+def _trainer_provenance_payload(owned_layers: set[int]) -> dict[str, Any]:
     image_digest = os.environ.get("PRIME_TRAINER_IMAGE_DIGEST", "")
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_digest):
         raise ValueError("PRIME_TRAINER_IMAGE_DIGEST must be an exact image digest")
@@ -510,11 +514,11 @@ def _trainer_provenance(root: Path, owned_layers: set[int]) -> None:
             raise ValueError(f"required parity model module is not a file: {path}")
         location = "mounted" if path in mount_points else "unmounted"
         modules[name] = {"location": location, "sha256": _file_sha256(path)}
-    payload = {
+    return {
         "schema_version": trace_schema_version,
         "kind": "glm52_policy_parity_trainer_runtime",
         "image_digest": image_digest,
-        "host": os.environ.get("PRIME_TRAINER_HOST", ""),
+        "host": _trainer_host_name(),
         "pp_rank": _process_pp_rank,
         "cp_rank": _process_cp_rank,
         "global_rank": _process_rank,
@@ -529,11 +533,17 @@ def _trainer_provenance(root: Path, owned_layers: set[int]) -> None:
         },
         "modules": modules,
     }
-    host = _trainer_host_name()
+
+
+def _trainer_provenance(root: Path, owned_layers: set[int]) -> None:
+    global _trainer_provenance_record
+    payload = _trainer_provenance_payload(owned_layers)
+    host = payload["host"]
     filename = f"trainer-runtime-pp-{_process_pp_rank}-host-{host}.json"
     temporary = root / f".{filename}.{os.getpid()}"
     temporary.write_text(json.dumps(payload, sort_keys=True) + "\n")
     os.replace(temporary, root / filename)
+    _trainer_provenance_record = payload
 
 
 def write_session(root: Path, session: TraceSession) -> None:
@@ -582,6 +592,10 @@ def clear_trace(root: Path) -> None:
                 session_name,
                 runtime_marker_name,
                 trainer_provenance_name,
+                trainer_provenance_union_name,
+                trainer_fixture_source_name,
+                trainer_fixture_manifest_name,
+                trainer_bundle_stable_name,
                 root_identity_name,
             }
             or path.name.startswith("trainer-runtime-pp-")
@@ -691,6 +705,7 @@ _debug_written_bytes = 0
 _debug_written_session: str | None = None
 _owned_layers: set[int] = set()
 _provenance_written = False
+_trainer_provenance_record: dict[str, Any] | None = None
 _expected_owned_layers: set[int] = set()
 _diagnostic_files = 0
 _diagnostic_bytes = 0
@@ -741,7 +756,7 @@ def configure_process_trace(
     _calls.clear()
     global _written_files, _written_bytes, _debug_written, _debug_written_bytes
     global _debug_written_session
-    global _owned_layers, _provenance_written
+    global _owned_layers, _provenance_written, _trainer_provenance_record
     global _diagnostic_files, _diagnostic_bytes, _diagnostic_session
     global _h200_diagnostic_active
     global _diagnostic_hooks
@@ -752,6 +767,7 @@ def configure_process_trace(
     _debug_written_session = None
     _owned_layers = set()
     _provenance_written = False
+    _trainer_provenance_record = None
     _diagnostic_files = 0
     _diagnostic_bytes = 0
     _diagnostic_session = None
@@ -763,6 +779,437 @@ def configure_process_trace(
     _runtime_id_sources.clear()
     _runtime_scales.clear()
     return True
+
+
+def compact_trainer_fixture_source(columns: dict[str, Any]) -> dict[str, np.ndarray] | None:
+    root = validated_trace_root()
+    if root is None or _process_side != "trainer":
+        return None
+    session = read_session(root)
+    token_ids = np.asarray(columns.get("token_ids"), dtype=np.int64)
+    if token_ids.shape != (session.expected_tokens,):
+        return None
+    if sha256_tokens(token_ids) != session.token_ids_sha256:
+        return None
+    positions = np.asarray(columns.get("position_ids"), dtype=np.int64)
+    selected_mask = np.asarray(columns.get("loss_mask"), dtype=np.bool_)
+    full_advantages = np.asarray(columns.get("advantages"), dtype=np.float32)
+    if any(
+        value.shape != (session.expected_tokens,)
+        for value in (positions, selected_mask, full_advantages)
+    ):
+        raise ValueError("trainer fixture source arrays do not match the trace context")
+    if not np.isfinite(full_advantages).all():
+        raise ValueError("trainer fixture source advantages are not finite")
+    selected_indices = np.flatnonzero(selected_mask).astype(np.int64)
+    result = {
+        "token_ids": np.ascontiguousarray(token_ids),
+        "positions": np.ascontiguousarray(positions),
+        "selected_indices": np.ascontiguousarray(selected_indices),
+        "advantages": np.ascontiguousarray(full_advantages[selected_indices]),
+    }
+    if sum(value.nbytes for value in result.values()) > 2 * 1024 * 1024:
+        raise ValueError("trainer fixture source exceeds its byte limit")
+    return result
+
+
+def _canonical_json_bytes(value: Any) -> bytes:
+    return (
+        json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode()
+
+
+def _array_sha256(value: np.ndarray) -> str:
+    return sha256_bytes(memoryview(np.ascontiguousarray(value)).cast("B"))
+
+
+def _content_record(value: dict[str, Any]) -> dict[str, Any]:
+    result = dict(value)
+    result["content_sha256"] = sha256_bytes(_canonical_json_bytes(result))
+    return result
+
+
+def _validate_trainer_bundle_inputs(
+    gathered: list[dict[str, Any]],
+    session: TraceSession,
+    trainer_head: str,
+    source: dict[str, np.ndarray],
+) -> tuple[list[dict[str, Any]], dict[str, np.ndarray], str]:
+    expected_world = _process_pp_size * _process_cp_size
+    if len(gathered) != expected_world:
+        raise ValueError("trainer provenance gather does not cover the world")
+    session_identity = trace_session_identity(session)
+    records: list[dict[str, Any]] = []
+    compact_source_ranks: list[int] = []
+    for rank, item in enumerate(gathered):
+        if (
+            not isinstance(item, dict)
+            or item.get("rank") != rank
+            or item.get("session_identity") != session_identity
+        ):
+            raise ValueError("trainer provenance gather rank or session is invalid")
+        record = item.get("provenance")
+        expected_cp = rank % _process_cp_size
+        if expected_cp == 0:
+            if not isinstance(record, dict):
+                raise ValueError("trainer CP0 provenance is missing")
+            records.append(record)
+        elif record is not None:
+            raise ValueError("trainer provenance was supplied by a non-CP0 rank")
+        if item.get("has_compact_source") is True:
+            compact_source_ranks.append(rank)
+        elif item.get("has_compact_source") is not False:
+            raise ValueError("trainer compact fixture source flag is invalid")
+        if item.get("error") is not None:
+            raise ValueError(f"trainer bundle rank {rank} failed: {item['error']}")
+    records.sort(key=lambda value: int(value.get("pp_rank", -1)))
+    if len(records) != _process_pp_size:
+        raise ValueError("trainer provenance does not contain every PP stage")
+    expected_layers = set(range(session.dense_layers, session.hidden_layers))
+    observed_layers: set[int] = set()
+    hosts: set[str] = set()
+    modules: dict[str, Any] | None = None
+    for pp_rank, record in enumerate(records):
+        cp_rank = record.get("cp_rank")
+        global_rank = record.get("global_rank")
+        host = record.get("host")
+        if (
+            record.get("schema_version") != trace_schema_version
+            or
+            record.get("kind") != "glm52_policy_parity_trainer_runtime"
+            or record.get("pp_rank") != pp_rank
+            or cp_rank != 0
+            or global_rank != pp_rank * _process_cp_size
+            or record.get("pp_size") != _process_pp_size
+            or record.get("cp_size") != _process_cp_size
+            or record.get("batch_size") != 8
+            or not isinstance(host, str)
+            or re.fullmatch(r"n[0-9]+", host) is None
+            or host in hosts
+        ):
+            raise ValueError("trainer provenance PP/CP/rank/host mapping is invalid")
+        if pp_rank == 0 and host != trainer_head:
+            raise ValueError("trainer PP0 host differs from the trainer head")
+        hosts.add(host)
+        image = record.get("image_digest")
+        if not isinstance(image, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", image) is None:
+            raise ValueError("trainer provenance image digest is invalid")
+        current_modules = record.get("modules")
+        if not isinstance(current_modules, dict) or not current_modules:
+            raise ValueError("trainer provenance module hashes are missing")
+        for name, module in current_modules.items():
+            if (
+                not isinstance(name, str)
+                or not isinstance(module, dict)
+                or module.get("location") not in {"mounted", "unmounted"}
+                or re.fullmatch(r"[0-9a-f]{64}", str(module.get("sha256", ""))) is None
+            ):
+                raise ValueError("trainer provenance module hash record is invalid")
+        if modules is None:
+            modules = current_modules
+        elif current_modules != modules:
+            raise ValueError("trainer provenance module hashes differ")
+        owned = record.get("owned_layers")
+        if not isinstance(owned, list) or not owned:
+            raise ValueError("trainer provenance layer ownership is missing")
+        owned_set = set(owned)
+        if len(owned_set) != len(owned) or not owned_set <= expected_layers:
+            raise ValueError("trainer provenance layer ownership is invalid")
+        if observed_layers & owned_set:
+            raise ValueError("trainer provenance contains duplicate layer ownership")
+        observed_layers.update(owned_set)
+    if observed_layers != expected_layers:
+        raise ValueError("trainer provenance layer ownership is incomplete")
+    if len(compact_source_ranks) != 1:
+        raise ValueError("trainer compact fixture source is missing or duplicated")
+    source_rank = compact_source_ranks[0]
+    expected_source_rank = (_process_pp_size - 1) * _process_cp_size
+    if source_rank != expected_source_rank:
+        raise ValueError("trainer compact fixture source is not from final PP/CP0")
+    expected_arrays = {
+        "token_ids": (np.dtype(np.int64), (session.expected_tokens,)),
+        "positions": (np.dtype(np.int64), (session.expected_tokens,)),
+        "selected_indices": (np.dtype(np.int64), None),
+        "advantages": (np.dtype(np.float32), None),
+    }
+    arrays: dict[str, np.ndarray] = {}
+    if set(source) != set(expected_arrays):
+        raise ValueError("trainer compact fixture source fields are invalid")
+    for name, (dtype, shape) in expected_arrays.items():
+        value = np.asarray(source[name])
+        if value.dtype != dtype or (shape is not None and value.shape != shape):
+            raise ValueError(f"trainer compact fixture source {name} is invalid")
+        arrays[name] = np.ascontiguousarray(value)
+    selected = arrays["selected_indices"]
+    if (
+        selected.ndim != 1
+        or arrays["advantages"].shape != selected.shape
+        or selected.size < 1
+        or np.any(selected[1:] <= selected[:-1])
+        or selected[0] < 0
+        or selected[-1] >= session.expected_tokens
+    ):
+        raise ValueError("trainer compact fixture selection is invalid")
+    if sha256_tokens(arrays["token_ids"]) != session.token_ids_sha256:
+        raise ValueError("trainer compact fixture token hash differs from its session")
+    if not np.isfinite(arrays["advantages"]).all():
+        raise ValueError("trainer compact fixture advantages are not finite")
+    if sum(value.nbytes for value in arrays.values()) > 2 * 1024 * 1024:
+        raise ValueError("trainer compact fixture source exceeds its byte limit")
+    assert modules is not None
+    records_hash = sha256_bytes(_canonical_json_bytes(records))
+    binding = {
+        "session_identity": session_identity,
+        "model_revision": session.model_revision,
+        "adapter_sha256": session.adapter_sha256,
+        "fixture_sha256": session.fixture_sha256,
+        "token_ids_sha256": session.token_ids_sha256,
+        "records_sha256": records_hash,
+        "modules_sha256": sha256_bytes(_canonical_json_bytes(modules)),
+    }
+    return records, arrays, sha256_bytes(_canonical_json_bytes(binding))
+
+
+def _write_trainer_bundle(
+    root: Path,
+    session: TraceSession,
+    records: list[dict[str, Any]],
+    arrays: dict[str, np.ndarray],
+    binding_sha256: str,
+) -> None:
+    _validate_root_identity(root)
+    finals = {
+        "union": root / trainer_provenance_union_name,
+        "source": root / trainer_fixture_source_name,
+        "manifest": root / trainer_fixture_manifest_name,
+        "stable": root / trainer_bundle_stable_name,
+    }
+    if any(path.exists() or path.is_symlink() for path in finals.values()):
+        raise FileExistsError("trainer provenance bundle already exists")
+    temporary = {
+        name: root / f".{path.name}.{os.getpid()}"
+        for name, path in finals.items()
+    }
+    try:
+        with temporary["source"].open("xb") as stream:
+            np.savez(stream, **arrays)
+        if temporary["source"].stat().st_size > 2 * 1024 * 1024:
+            raise ValueError("trainer compact fixture NPZ exceeds its byte limit")
+        source_sha256 = _file_sha256(temporary["source"])
+        binding = {
+            "session_identity": trace_session_identity(session),
+            "model_revision": session.model_revision,
+            "adapter_sha256": session.adapter_sha256,
+            "fixture_sha256": session.fixture_sha256,
+            "token_ids_sha256": session.token_ids_sha256,
+            "records_sha256": sha256_bytes(_canonical_json_bytes(records)),
+            "modules_sha256": sha256_bytes(
+                _canonical_json_bytes(records[0]["modules"])
+            ),
+        }
+        if sha256_bytes(_canonical_json_bytes(binding)) != binding_sha256:
+            raise ValueError("trainer provenance binding changed before publish")
+        array_records = {
+            name: {
+                "dtype": str(value.dtype),
+                "shape": list(value.shape),
+                "sha256": _array_sha256(value),
+            }
+            for name, value in sorted(arrays.items())
+        }
+        compact_manifest = _content_record(
+            {
+                "schema_version": trace_schema_version,
+                "kind": "glm52_policy_parity_trainer_fixture_source",
+                "binding_sha256": binding_sha256,
+                "rank": (_process_pp_size - 1) * _process_cp_size,
+                "file": trainer_fixture_source_name,
+                "file_sha256": source_sha256,
+                "arrays": array_records,
+            }
+        )
+        temporary["manifest"].write_bytes(_canonical_json_bytes(compact_manifest))
+        manifest_sha256 = _file_sha256(temporary["manifest"])
+        union = _content_record(
+            {
+                "schema_version": trace_schema_version,
+                "kind": "glm52_policy_parity_trainer_provenance_union",
+                "binding_sha256": binding_sha256,
+                "binding": binding,
+                "session": session.as_dict(),
+                "session_identity": trace_session_identity(session),
+                "records": records,
+                "fixture_source_manifest_sha256": manifest_sha256,
+                "fixture_source_sha256": source_sha256,
+            }
+        )
+        temporary["union"].write_bytes(_canonical_json_bytes(union))
+        stable = _content_record(
+            {
+                "schema_version": trace_schema_version,
+                "kind": "glm52_policy_parity_trainer_bundle_stable",
+                "binding_sha256": binding_sha256,
+                "provenance_union_sha256": _file_sha256(temporary["union"]),
+                "fixture_source_manifest_sha256": manifest_sha256,
+                "fixture_source_sha256": source_sha256,
+            }
+        )
+        temporary["stable"].write_bytes(_canonical_json_bytes(stable))
+        if sum(path.stat().st_size for path in temporary.values()) > 18 * 1024 * 1024:
+            raise ValueError("trainer provenance bundle exceeds its byte limit")
+        for name in ("source", "manifest", "union", "stable"):
+            os.replace(temporary[name], finals[name])
+    finally:
+        for path in temporary.values():
+            path.unlink(missing_ok=True)
+
+
+def publish_trainer_bundle(compact_source: dict[str, np.ndarray] | None) -> None:
+    root = validated_trace_root()
+    if root is None:
+        return
+    if _process_side != "trainer":
+        raise ValueError("trainer provenance bundle requires trainer tracing")
+    import torch.distributed as dist
+    import torch
+
+    if not dist.is_available() or not dist.is_initialized():
+        raise ValueError("trainer provenance bundle requires distributed training")
+    session = read_session(root)
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    local_error: str | None = None
+    if (
+        world_size != 64
+        or _process_world_size != 64
+        or _process_pp_size != 8
+        or _process_cp_size != 8
+        or rank != _process_rank
+    ):
+        local_error = "parity trainer bundle requires exact world64/PP8/CP8 mapping"
+    source_rank = 56
+    if compact_source is not None and rank != source_rank:
+        local_error = "compact fixture source was supplied by a non-final rank"
+    source_arrays: dict[str, np.ndarray] | None = None
+    if rank == source_rank:
+        if compact_source is None:
+            local_error = "final PP/CP0 compact fixture source is missing"
+        else:
+            try:
+                source_arrays = {
+                    name: np.ascontiguousarray(compact_source[name])
+                    for name in (
+                        "token_ids",
+                        "positions",
+                        "selected_indices",
+                        "advantages",
+                    )
+                }
+                if set(compact_source) != set(source_arrays):
+                    raise ValueError("compact fixture source fields differ")
+                selected_count = int(source_arrays["selected_indices"].size)
+                if (
+                    source_arrays["token_ids"].shape != (session.expected_tokens,)
+                    or source_arrays["positions"].shape != (session.expected_tokens,)
+                    or source_arrays["selected_indices"].shape != (selected_count,)
+                    or source_arrays["advantages"].shape != (selected_count,)
+                    or source_arrays["token_ids"].dtype != np.int64
+                    or source_arrays["positions"].dtype != np.int64
+                    or source_arrays["selected_indices"].dtype != np.int64
+                    or source_arrays["advantages"].dtype != np.float32
+                ):
+                    raise ValueError("compact fixture source shape or dtype differs")
+            except (KeyError, TypeError, ValueError) as error:
+                local_error = str(error)[:512]
+                source_arrays = None
+    local = {
+        "rank": rank,
+        "session_identity": trace_session_identity(session),
+        "provenance": _trainer_provenance_record,
+        "has_compact_source": compact_source is not None,
+        "error": local_error,
+    }
+    metadata_bytes = _canonical_json_bytes(local)
+    metadata_limit = 16 * 1024
+    if len(metadata_bytes) + 4 > metadata_limit:
+        metadata_bytes = _canonical_json_bytes(
+            {
+                "rank": rank,
+                "session_identity": trace_session_identity(session),
+                "provenance": None,
+                "has_compact_source": compact_source is not None,
+                "error": "trainer provenance metadata exceeds 16 KiB",
+            }
+        )
+    encoded = len(metadata_bytes).to_bytes(4, "little") + metadata_bytes
+    encoded += b"\0" * (metadata_limit - len(encoded))
+    device = torch.device("cuda", torch.cuda.current_device())
+    local_metadata = torch.from_numpy(
+        np.frombuffer(encoded, dtype=np.uint8).copy()
+    ).to(device=device)
+    gathered_metadata = torch.empty(
+        world_size * metadata_limit, dtype=torch.uint8, device=device
+    )
+    dist.all_gather_into_tensor(gathered_metadata, local_metadata)
+
+    def source_tensor(name: str, dtype: torch.dtype, fill: int | float) -> torch.Tensor:
+        value = torch.full(
+            (session.expected_tokens,), fill, dtype=dtype, device=device
+        )
+        if rank == source_rank and source_arrays is not None:
+            source_value = torch.from_numpy(source_arrays[name]).to(device=device)
+            value[: source_value.numel()].copy_(source_value)
+        return value
+
+    token_ids = source_tensor("token_ids", torch.int64, 0)
+    positions = source_tensor("positions", torch.int64, 0)
+    selected_indices = source_tensor("selected_indices", torch.int64, -1)
+    advantages = source_tensor("advantages", torch.float32, 0.0)
+    for value in (token_ids, positions, selected_indices, advantages):
+        dist.broadcast(value, src=source_rank)
+
+    failure: BaseException | None = None
+    if rank == 0:
+        try:
+            rows = gathered_metadata.reshape(world_size, metadata_limit).cpu().numpy()
+            gathered: list[dict[str, Any]] = []
+            for row in rows:
+                length = int.from_bytes(row[:4].tobytes(), "little")
+                if length < 2 or length > metadata_limit - 4:
+                    raise ValueError("trainer provenance metadata length is invalid")
+                value = json.loads(row[4 : 4 + length].tobytes())
+                if not isinstance(value, dict):
+                    raise ValueError("trainer provenance metadata is invalid")
+                gathered.append(value)
+            selected_cpu = selected_indices.cpu().numpy()
+            selected_count = int(np.count_nonzero(selected_cpu >= 0))
+            if np.any(selected_cpu[:selected_count] < 0) or np.any(
+                selected_cpu[selected_count:] != -1
+            ):
+                raise ValueError("trainer compact selection padding is invalid")
+            arrays = {
+                "token_ids": token_ids.cpu().numpy(),
+                "positions": positions.cpu().numpy(),
+                "selected_indices": selected_cpu[:selected_count],
+                "advantages": advantages.cpu().numpy()[:selected_count],
+            }
+            trainer_head = os.environ.get("PRIME_TRAINER_HEAD", "")
+            if re.fullmatch(r"n[0-9]+", trainer_head) is None:
+                raise ValueError("PRIME_TRAINER_HEAD must identify the trainer head")
+            records, checked_arrays, binding = _validate_trainer_bundle_inputs(
+                gathered, session, trainer_head, arrays
+            )
+            _write_trainer_bundle(
+                root, session, records, checked_arrays, binding
+            )
+        except BaseException as error:
+            failure = error
+    status = torch.tensor([1 if failure is not None else 0], dtype=torch.int32, device=device)
+    dist.broadcast(status, src=0)
+    if int(status.item()) != 0:
+        if failure is not None:
+            raise RuntimeError("trainer provenance bundle failed") from failure
+        raise RuntimeError("trainer provenance bundle failed on trainer head")
 
 
 def _diagnostic_array(value: Any, limit: int) -> tuple[np.ndarray, str]:

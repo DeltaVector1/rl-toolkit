@@ -177,12 +177,14 @@ def refresh_fixture_from_trainer_export(
     profile: Profile,
     source_fixture: Path,
     source_session_path: Path,
-    token_export: Path,
+    token_export: Path | None,
     diagnostic_input: Path,
     output: Path,
     diagnostic_output: Path,
     expected_rank: int,
     created_utc: str | None = None,
+    compact_source: Path | None = None,
+    compact_manifest_path: Path | None = None,
 ) -> dict[str, Any]:
     source_manifest = load_manifest(source_fixture, "glm52_policy_parity_fixture")
     source_fixture_sha256 = fixture_digest(source_fixture)
@@ -193,18 +195,118 @@ def refresh_fixture_from_trainer_export(
         or source_session.get("fixture_sha256") != source_fixture_sha256
     ):
         raise ValueError("trainer session does not identify the source fixture")
-    if token_export.stat().st_size > 100_000_000 or token_export.is_symlink():
-        raise ValueError("trainer token export is too large or is a symlink")
-    records = [json.loads(line) for line in token_export.read_text().splitlines() if line]
-    if not records:
-        raise ValueError("trainer token export contains no records")
     fields = ("token_ids", "position_ids", "loss_mask", "advantages")
-    first = records[0]
-    for record in records:
-        if record.get("schema_version") != schema_version or record.get("rank") != expected_rank:
-            raise ValueError("trainer token export provenance is invalid")
-        if any(record.get(name) != first.get(name) for name in fields):
-            raise ValueError("trainer token export contains different fixture records")
+    if compact_source is not None or compact_manifest_path is not None:
+        if token_export is not None or compact_source is None or compact_manifest_path is None:
+            raise ValueError("trainer fixture refresh source selection is invalid")
+        if (
+            compact_source.is_symlink()
+            or compact_manifest_path.is_symlink()
+            or compact_source.stat().st_size > 18 * 1024 * 1024
+            or compact_manifest_path.stat().st_size > 1024 * 1024
+        ):
+            raise ValueError("trainer compact fixture source is too large or is a symlink")
+        compact_manifest = json.loads(compact_manifest_path.read_text())
+        claimed_content = compact_manifest.pop("content_sha256", None)
+        if (
+            compact_manifest.get("schema_version") != schema_version
+            or compact_manifest.get("kind")
+            != "glm52_policy_parity_trainer_fixture_source"
+            or compact_manifest.get("rank") != expected_rank
+            or compact_manifest.get("file") != "trainer-fixture-source.npz"
+            or re.fullmatch(
+                r"[0-9a-f]{64}", str(compact_manifest.get("binding_sha256", ""))
+            )
+            is None
+            or compact_manifest.get("file_sha256") != file_sha256(compact_source)
+            or claimed_content != hashlib.sha256(json_bytes(compact_manifest)).hexdigest()
+        ):
+            raise ValueError("trainer compact fixture manifest is invalid")
+        with zipfile.ZipFile(compact_source) as archive:
+            expected_members = {
+                "token_ids.npy",
+                "positions.npy",
+                "selected_indices.npy",
+                "advantages.npy",
+            }
+            infos = archive.infolist()
+            if {info.filename for info in infos} != expected_members or len(infos) != 4:
+                raise ValueError("trainer compact fixture NPZ members are invalid")
+            if sum(info.file_size for info in infos) > 18 * 1024 * 1024:
+                raise ValueError("trainer compact fixture NPZ is too large")
+        with np.load(compact_source, allow_pickle=False) as source_values:
+            token_ids = np.asarray(source_values["token_ids"])
+            positions = np.asarray(source_values["positions"])
+            selected = np.asarray(source_values["selected_indices"])
+            advantages = np.asarray(source_values["advantages"])
+        length = profile.get("context_length")
+        if (
+            token_ids.dtype != np.int64
+            or positions.dtype != np.int64
+            or selected.dtype != np.int64
+            or advantages.dtype != np.float32
+            or token_ids.shape != (length,)
+            or positions.shape != (length,)
+            or selected.shape != advantages.shape
+            or selected.ndim != 1
+            or selected.size < 1
+            or selected[0] < 0
+            or selected[-1] >= length
+            or np.any(selected[1:] <= selected[:-1])
+            or not np.isfinite(advantages).all()
+        ):
+            raise ValueError("trainer compact fixture arrays are invalid")
+        entries = compact_manifest.get("arrays")
+        if not isinstance(entries, dict) or set(entries) != {
+            "token_ids",
+            "positions",
+            "selected_indices",
+            "advantages",
+        }:
+            raise ValueError("trainer compact fixture array manifest is invalid")
+        for name, value in {
+            "token_ids": token_ids,
+            "positions": positions,
+            "selected_indices": selected,
+            "advantages": advantages,
+        }.items():
+            entry = entries.get(name)
+            if (
+                not isinstance(entry, dict)
+                or entry.get("dtype") != str(value.dtype)
+                or entry.get("shape") != list(value.shape)
+                or entry.get("sha256") != _array_bytes_sha256(value)
+            ):
+                raise ValueError(f"trainer compact fixture {name} hash is invalid")
+        loss_mask = np.zeros(length, dtype=np.bool_)
+        loss_mask[selected] = True
+        full_advantages = np.zeros(length, dtype=np.float32)
+        full_advantages[selected] = advantages
+        first = {
+            "schema_version": schema_version,
+            "rank": expected_rank,
+            "token_ids": token_ids.tolist(),
+            "position_ids": positions.tolist(),
+            "loss_mask": loss_mask.tolist(),
+            "advantages": full_advantages.tolist(),
+        }
+        records = [first]
+        trainer_source_sha256 = file_sha256(compact_source)
+    else:
+        if token_export is None:
+            raise ValueError("trainer token export is missing")
+        if token_export.stat().st_size > 100_000_000 or token_export.is_symlink():
+            raise ValueError("trainer token export is too large or is a symlink")
+        records = [json.loads(line) for line in token_export.read_text().splitlines() if line]
+        if not records:
+            raise ValueError("trainer token export contains no records")
+        first = records[0]
+        for record in records:
+            if record.get("schema_version") != schema_version or record.get("rank") != expected_rank:
+                raise ValueError("trainer token export provenance is invalid")
+            if any(record.get(name) != first.get(name) for name in fields):
+                raise ValueError("trainer token export contains different fixture records")
+        trainer_source_sha256 = file_sha256(token_export)
     token_ids = np.asarray(first.get("token_ids"), dtype=np.int64)
     positions = np.asarray(first.get("position_ids"), dtype=np.int64)
     loss_mask = np.asarray(first.get("loss_mask"), dtype=np.bool_)
@@ -299,7 +401,7 @@ def refresh_fixture_from_trainer_export(
             "source": {
                 "fixture_sha256": source_fixture_sha256,
                 "session_identity": source_session_identity,
-                "token_export_sha256": file_sha256(token_export),
+                "token_export_sha256": trainer_source_sha256,
                 "rank": expected_rank,
                 "fixture_semantic_sha256": fixture_semantic_hashes,
                 "export_semantic_sha256": export_semantic_hashes,
@@ -328,7 +430,7 @@ def refresh_fixture_from_trainer_export(
         "token_ids_sha256": token_ids_sha256,
         "positions_sha256": export_semantic_hashes["positions"],
         "advantages_sha256": export_semantic_hashes["advantages"],
-        "token_export_sha256": file_sha256(token_export),
+        "token_export_sha256": trainer_source_sha256,
         "records": len(records),
         "rank": expected_rank,
     }
@@ -1842,7 +1944,9 @@ def parser() -> argparse.ArgumentParser:
     refresh = commands.add_parser("refresh-fixture")
     refresh.add_argument("--source-fixture", type=Path, required=True)
     refresh.add_argument("--source-session", type=Path, required=True)
-    refresh.add_argument("--token-export", type=Path, required=True)
+    refresh.add_argument("--token-export", type=Path)
+    refresh.add_argument("--compact-source", type=Path)
+    refresh.add_argument("--compact-manifest", type=Path)
     refresh.add_argument("--diagnostic-input", type=Path, required=True)
     refresh.add_argument("--diagnostic-output", type=Path, required=True)
     refresh.add_argument("--expected-rank", type=int, required=True)
@@ -1932,6 +2036,8 @@ def main(argv: list[str] | None = None) -> int:
                 args.diagnostic_output,
                 args.expected_rank,
                 args.created_utc,
+                args.compact_source,
+                args.compact_manifest,
             )
         elif args.command == "capture-h200":
             result = capture_h200(

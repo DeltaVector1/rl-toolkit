@@ -126,6 +126,7 @@ case ${1:-} in
       idx=$((idx + 1))
     done
     nnodes=$idx
+    trainer_head_node=${trainer_nodes%% *}
     if [ "$rank" -lt 0 ]; then
       echo "node $node is not in trainer_nodes ($trainer_nodes)" >&2; exit 1
     fi
@@ -248,6 +249,7 @@ PY
         -e "PRIME_PARITY_ROUTER_TRACE_SOURCE=$parity_trace_source"
         -e "PRIME_TRAINER_IMAGE_DIGEST=$parity_image_digest"
         -e "PRIME_TRAINER_HOST=n$node"
+        -e "PRIME_TRAINER_HEAD=n$trainer_head_node"
         -e "PRIME_PARITY_PP_SIZE=$parity_pp"
         -e "PRIME_PARITY_CP_SIZE=$parity_cp"
         -e "PRIME_PARITY_BATCH_SIZE=$parity_batch"

@@ -9,7 +9,10 @@ import torch
 from torch import Tensor
 
 from prime_rl.configs.trainer import DefaultLossConfig, TrainerConfig
-from prime_rl.parity_router_trace import configure_trainer_trace
+from prime_rl.parity_router_trace import (
+    compact_trainer_fixture_source,
+    configure_trainer_trace,
+)
 from prime_rl.trainer.rl.loss import compute_importance_ratio_and_mismatch_kl
 from prime_rl.utils.logger import get_logger
 
@@ -27,6 +30,9 @@ class DisabledTokenExporter:
     def close(self) -> None:
         return
 
+    def parity_source(self) -> None:
+        return None
+
 
 class TokenExporter:
     def __init__(self, output_dir: Path, rank: int) -> None:
@@ -36,6 +42,7 @@ class TokenExporter:
         self._initialized_files: set[tuple[str | None, int, int]] = set()
         self._sequences_by_file: dict[tuple[str | None, int, int], int] = {}
         self._pending_stable_dirs: dict[str | None, set[Path]] = {}
+        self._parity_source: dict[str, Any] | None = None
         atexit.register(self.close)
 
     def export(
@@ -49,6 +56,17 @@ class TokenExporter:
     ) -> None:
         columns = _export_columns(micro_batch, model_output, loss_config)
         _check_lengths(columns)
+        parity_source = compact_trainer_fixture_source(columns)
+        if parity_source is not None:
+            if self._parity_source is not None and any(
+                not torch.equal(
+                    torch.from_numpy(self._parity_source[name]),
+                    torch.from_numpy(value),
+                )
+                for name, value in parity_source.items()
+            ):
+                raise ValueError("duplicate trainer fixture sources differ")
+            self._parity_source = parity_source
         run_id = micro_batch.get("run_id")
         export_step = (
             micro_batch.get("run_step")
@@ -82,6 +100,9 @@ class TokenExporter:
 
     def close(self) -> None:
         self._closed = True
+
+    def parity_source(self) -> dict[str, Any] | None:
+        return self._parity_source
 
     def mark_stable(self, ready_run_ids: set[str] | None = None) -> None:
         ready_run_ids = ready_run_ids or set()

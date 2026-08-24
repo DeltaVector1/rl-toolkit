@@ -3189,6 +3189,8 @@ def _copy_parity_refresh_file(
     destination_patterns = {
         "session": r"\.diagnostic-session-[0-9a-f]{16}\.json",
         "token": r"\.diagnostic-token-[0-9a-f]{16}\.jsonl",
+        "compact": r"\.diagnostic-compact-[0-9a-f]{16}\.npz",
+        "compact_manifest": r"\.diagnostic-compact-[0-9a-f]{16}\.json",
     }
     if destination.parent != root or re.fullmatch(
         destination_patterns.get(kind, r"(?!)"), destination.name
@@ -3203,6 +3205,16 @@ def _copy_parity_refresh_file(
             source.parent.parent == PurePosixPath(parity_token_root)
             and re.fullmatch(r"step_[0-9]+", source.parent.name) is not None
             and re.fullmatch(r"rank_[0-9]+\.jsonl", source.name) is not None
+        )
+    elif kind == "compact":
+        valid_source = (
+            source.parent.parent == PurePosixPath(parity_trace_root)
+            and source.name == "trainer-fixture-source.npz"
+        )
+    elif kind == "compact_manifest":
+        valid_source = (
+            source.parent.parent == PurePosixPath(parity_trace_root)
+            and source.name == "trainer-fixture-source.json"
         )
     else:
         raise Refused("parity refresh source kind is invalid")
@@ -3262,42 +3274,100 @@ def _resolve_glm52_parity_diagnostic_source(
     if len(trainer_hosts) != pp_size or trainer_head not in trainer_hosts:
         raise Refused("configured trainer hosts do not match the parity PP topology")
     source_root = f"{parity_trace_root}/{name}"
-
-    def read_host(host: str) -> dict[str, object]:
-        _check_parity_host(host)
-        command = (
-            f"test -d {shlex.quote(source_root)} && "
-            f"test ! -L {shlex.quote(source_root)} && "
-            f"test \"$(realpath -e {shlex.quote(source_root)})\" = "
-            f"{shlex.quote(source_root)} && "
-            "python3 -c 'import json,pathlib,sys; root=pathlib.Path(sys.argv[1]); "
-            "session=root/\"session.json\"; "
-            "records=sorted(root.glob(\"trainer-runtime-pp-*-host-*.json\")); "
-            "assert session.is_file() and not session.is_symlink(); "
-            "assert len(records)==1 and not records[0].is_symlink(); "
-            "print(json.dumps({\"session\":json.loads(session.read_text()),"
-            "\"provenance\":json.loads(records[0].read_text()),"
-            "\"provenance_file\":records[0].name},sort_keys=True))' "
-            f"{shlex.quote(source_root)}"
-        )
-        output = _remote_ok(
-            host,
-            command,
-            "trainer parity provenance",
-            timeout=60,
-            connect_timeout=45,
-        )
-        try:
-            value = json.loads(output.strip().splitlines()[-1])
-        except (json.JSONDecodeError, IndexError) as error:
-            raise RuntimeError(
-                f"trainer parity provenance returned invalid JSON on {host}"
-            ) from error
-        if not isinstance(value, dict):
-            raise Refused(f"trainer parity provenance is invalid on {host}")
-        return value
-
-    evidence = {host: read_host(host) for host in trainer_hosts}
+    command = f"""
+set -euo pipefail
+root={shlex.quote(source_root)}
+test -d "$root"
+test ! -L "$root"
+test "$(realpath -e "$root")" = "$root"
+for file in session.json trainer-fixture-source.npz trainer-fixture-source.json trainer-rank-0-pp-0-cp-0-diagnostic-layer3_router_input.npz; do
+  test -f "$root/$file"
+  test ! -L "$root/$file"
+done
+python3 - "$root" <<'PY'
+import hashlib,json,pathlib,sys
+root=pathlib.Path(sys.argv[1])
+names={{
+ "stable":"STABLE",
+ "union":"trainer-provenance-union.json",
+ "manifest":"trainer-fixture-source.json",
+ "source":"trainer-fixture-source.npz",
+}}
+paths={{name:root/value for name,value in names.items()}}
+for path in paths.values():
+ assert path.is_file() and not path.is_symlink()
+def digest(path):
+ h=hashlib.sha256()
+ with path.open("rb") as stream:
+  for block in iter(lambda:stream.read(1024*1024),b""): h.update(block)
+ return h.hexdigest()
+def canonical(value):
+ return (json.dumps(value,sort_keys=True,separators=(",",":"))+"\\n").encode()
+stable=json.loads(paths["stable"].read_text())
+union=json.loads(paths["union"].read_text())
+manifest=json.loads(paths["manifest"].read_text())
+for value,kind in ((stable,"glm52_policy_parity_trainer_bundle_stable"),(union,"glm52_policy_parity_trainer_provenance_union"),(manifest,"glm52_policy_parity_trainer_fixture_source")):
+ assert value["kind"]==kind
+ claimed=value.pop("content_sha256")
+ assert claimed==hashlib.sha256(canonical(value)).hexdigest()
+ value["content_sha256"]=claimed
+assert stable["provenance_union_sha256"]==digest(paths["union"])
+assert stable["fixture_source_manifest_sha256"]==digest(paths["manifest"])
+assert stable["fixture_source_sha256"]==digest(paths["source"])
+assert union["fixture_source_manifest_sha256"]==stable["fixture_source_manifest_sha256"]
+assert union["fixture_source_sha256"]==stable["fixture_source_sha256"]
+assert union["binding_sha256"]==manifest["binding_sha256"]==stable["binding_sha256"]
+assert union["session"]==json.loads((root/"session.json").read_text())
+binding=union["binding"]
+assert union["binding_sha256"]==hashlib.sha256(canonical(binding)).hexdigest()
+assert binding["session_identity"]==union["session_identity"]
+assert binding["model_revision"]==union["session"]["model_revision"]
+assert binding["adapter_sha256"]==union["session"]["adapter_sha256"]
+assert binding["fixture_sha256"]==union["session"]["fixture_sha256"]
+assert binding["token_ids_sha256"]==union["session"]["token_ids_sha256"]
+assert binding["records_sha256"]==hashlib.sha256(canonical(union["records"])).hexdigest()
+assert binding["modules_sha256"]==hashlib.sha256(canonical(union["records"][0]["modules"])).hexdigest()
+assert paths["source"].stat().st_size<=18*1024*1024
+print(json.dumps({{"union":union,"manifest":manifest}},sort_keys=True))
+PY
+"""
+    output = _remote_ok(
+        trainer_head,
+        command,
+        "trainer parity provenance bundle",
+        timeout=60,
+        connect_timeout=45,
+    )
+    try:
+        bundle = json.loads(output.strip().splitlines()[-1])
+        union = bundle["union"]
+        compact_manifest = bundle["manifest"]
+        session_value = union["session"]
+        record_values = union["records"]
+    except (json.JSONDecodeError, IndexError, KeyError, TypeError) as error:
+        raise RuntimeError("trainer parity provenance bundle returned invalid JSON") from error
+    if (
+        not isinstance(union, dict)
+        or union.get("kind") != "glm52_policy_parity_trainer_provenance_union"
+        or not isinstance(compact_manifest, dict)
+        or compact_manifest.get("kind")
+        != "glm52_policy_parity_trainer_fixture_source"
+        or not isinstance(record_values, list)
+        or len(record_values) != pp_size
+    ):
+        raise Refused("trainer parity provenance bundle is invalid")
+    evidence = {
+        str(record.get("host")): {
+            "session": session_value,
+            "provenance": record,
+            "provenance_file": (
+                f"trainer-runtime-pp-{record.get('pp_rank')}-host-"
+                f"{record.get('host')}.json"
+            ),
+        }
+        for record in record_values
+        if isinstance(record, dict)
+    }
     records: list[dict[str, object]] = []
     sessions: list[dict[str, object]] = []
     module_sets: list[object] = []
@@ -3318,6 +3388,9 @@ def _resolve_glm52_parity_diagnostic_source(
         pp_rank = record.get("pp_rank")
         cp_rank = record.get("cp_rank")
         if (
+            record.get("schema_version") != 1
+            or record.get("batch_size") != 8
+            or
             record.get("kind") != "glm52_policy_parity_trainer_runtime"
             or record.get("host") != host
             or match.group(2) != host
@@ -3358,6 +3431,33 @@ def _resolve_glm52_parity_diagnostic_source(
         raise Refused("trainer parity provenance must contain one PP0/CP0 host")
     if {record["pp_rank"] for record in records} != set(range(pp_size)):
         raise Refused("trainer parity provenance does not uniquely cover every PP rank")
+    dense_layers = session_value.get("dense_layers")
+    hidden_layers = session_value.get("hidden_layers")
+    if (
+        isinstance(dense_layers, bool)
+        or not isinstance(dense_layers, int)
+        or isinstance(hidden_layers, bool)
+        or not isinstance(hidden_layers, int)
+        or not 0 <= dense_layers < hidden_layers
+    ):
+        raise Refused("trainer parity session layer counts are invalid")
+    layer_owners: dict[int, int] = {}
+    for record in records:
+        owned = record.get("owned_layers")
+        if not isinstance(owned, list) or not owned:
+            raise Refused("trainer parity layer ownership is missing")
+        for layer in owned:
+            if (
+                isinstance(layer, bool)
+                or not isinstance(layer, int)
+                or layer < dense_layers
+                or layer >= hidden_layers
+                or layer in layer_owners
+            ):
+                raise Refused("trainer parity layer ownership is invalid")
+            layer_owners[layer] = int(record["pp_rank"])
+    if set(layer_owners) != set(range(dense_layers, hidden_layers)):
+        raise Refused("trainer parity layer ownership is incomplete")
     source_host = str(pp0[0]["host"])
     if source_host != trainer_head:
         raise Refused(
@@ -3381,6 +3481,14 @@ def _resolve_glm52_parity_diagnostic_source(
         raise Refused("trainer parity provenance must contain one final PP host")
     final_host = str(final[0]["host"])
     final_rank = int(final[0]["global_rank"])
+    if (
+        compact_manifest.get("rank") != final_rank
+        or compact_manifest.get("file") != "trainer-fixture-source.npz"
+        or compact_manifest.get("binding_sha256") != union.get("binding_sha256")
+        or compact_manifest.get("file_sha256")
+        != union.get("fixture_source_sha256")
+    ):
+        raise Refused("trainer compact fixture source differs from provenance")
     return source_host, final_host, final_rank, source_root, session
 
 
@@ -3399,21 +3507,11 @@ def diagnose_glm52_policy_parity(name: str, keep_engine: bool = False) -> dict[s
     fixture = glm_parity_paths["fixture"]
     if PurePosixPath(capture).parent != PurePosixPath(root):
         raise Refused("H200 capture path is outside the exact parity root")
-    source_host, final_host, final_rank, source_root, metadata = _resolve_glm52_parity_diagnostic_source(name)
-    token_export = _resolve_glm52_parity_token_export(final_host, final_rank)
+    source_host, _final_host, final_rank, source_root, metadata = _resolve_glm52_parity_diagnostic_source(name)
     source_input = f"{source_root}/trainer-rank-0-pp-0-cp-0-" "diagnostic-layer3_router_input.npz"
     session_path = f"{source_root}/session.json"
-    metadata_command = (
-        f"test ! -L {shlex.quote(source_root)} && "
-        f'test "$(realpath -e {shlex.quote(source_root)})" = {shlex.quote(source_root)} && '
-        f"test -f {shlex.quote(source_input)} && test ! -L {shlex.quote(source_input)} && "
-        f"test -f {shlex.quote(session_path)} && test ! -L {shlex.quote(session_path)} && "
-        "echo source-ready"
-    )
-    metadata_output = _remote_ok(source_host, metadata_command, "trainer parity session", timeout=60)
-    if metadata_output.strip() != "source-ready":
-        raise RuntimeError("trainer parity diagnostic input returned an invalid state")
-
+    compact_source = f"{source_root}/trainer-fixture-source.npz"
+    compact_manifest = f"{source_root}/trainer-fixture-source.json"
     bootstrap_token = secrets.token_urlsafe(48)
     nonce = secrets.token_hex(8)
     sensitive = (bootstrap_token,)
@@ -3422,7 +3520,8 @@ def diagnose_glm52_policy_parity(name: str, keep_engine: bool = False) -> dict[s
     bootstrap_fifo = container_writes["bootstrap_fifo"]
     source_diagnostic_input = f"{root}/.diagnostic-source-{nonce}.npz"
     source_session = f"{root}/.diagnostic-session-{nonce}.json"
-    source_token_export = f"{root}/.diagnostic-token-{nonce}.jsonl"
+    source_compact = f"{root}/.diagnostic-compact-{nonce}.npz"
+    source_compact_manifest = f"{root}/.diagnostic-compact-{nonce}.json"
     transaction_path = f"{run_directory}/transaction.json"
     container_work_directory = container_writes["work"]
     remote_input = container_writes["diagnostic"]
@@ -3499,7 +3598,14 @@ echo fifo-ready
         _prepare_parity_container_work(host, container_writes, sensitive)
         _copy_parity_diagnostic_input(source_host, source_input, host, source_diagnostic_input)
         _copy_parity_refresh_file(source_host, session_path, host, source_session, "session")
-        _copy_parity_refresh_file(final_host, token_export, host, source_token_export, "token")
+        _copy_parity_refresh_file(source_host, compact_source, host, source_compact, "compact")
+        _copy_parity_refresh_file(
+            source_host,
+            compact_manifest,
+            host,
+            source_compact_manifest,
+            "compact_manifest",
+        )
         refresh_command = (
             "sudo docker run --rm -v /data:/data "
             f"-v {shlex.quote(remote_repo)}:/workspace:ro -w /workspace "
@@ -3507,7 +3613,8 @@ echo fifo-ready
             f"scripts/glm52_policy_parity.py --profile {shlex.quote(production_parity_profile)} "
             f"refresh-fixture --source-fixture {shlex.quote(fixture)} "
             f"--source-session {shlex.quote(source_session)} "
-            f"--token-export {shlex.quote(source_token_export)} "
+            f"--compact-source {shlex.quote(source_compact)} "
+            f"--compact-manifest {shlex.quote(source_compact_manifest)} "
             f"--diagnostic-input {shlex.quote(source_diagnostic_input)} "
             f"--diagnostic-output {shlex.quote(remote_input)} "
             f"--expected-rank {final_rank} {shlex.quote(fixture_candidate)}"
@@ -3819,7 +3926,8 @@ test -z "$(sudo docker ps -a --filter "name=^/${{name}}$" --format '{{{{.Names}}
             f"else sudo rmdir -- {shlex.quote(run_directory)}; fi; "
             f"rm -f -- {shlex.quote(source_diagnostic_input)}; "
             f"rm -f -- {shlex.quote(source_session)}; "
-            f"rm -f -- {shlex.quote(source_token_export)}; "
+            f"rm -f -- {shlex.quote(source_compact)}; "
+            f"rm -f -- {shlex.quote(source_compact_manifest)}; "
             f"{work_cleanup}; "
             f"test ! -e {shlex.quote(bootstrap_fifo)}; "
             f"if test -e {shlex.quote(transaction_path)}; then "
@@ -3827,7 +3935,8 @@ test -z "$(sudo docker ps -a --filter "name=^/${{name}}$" --format '{{{{.Names}}
             f"test ! -e {shlex.quote(run_directory)}; fi; "
             f"test ! -e {shlex.quote(source_diagnostic_input)}; "
             f"test ! -e {shlex.quote(source_session)}; "
-            f"test ! -e {shlex.quote(source_token_export)}"
+            f"test ! -e {shlex.quote(source_compact)}; "
+            f"test ! -e {shlex.quote(source_compact_manifest)}"
         )
         cleanup_code, cleanup_output = _ssh(host, cleanup, timeout=120)
         if cleanup_code:

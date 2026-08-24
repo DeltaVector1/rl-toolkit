@@ -4,8 +4,6 @@ import os
 import shlex
 import subprocess
 import tempfile
-import threading
-import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -213,17 +211,18 @@ class H200ParityTest(unittest.TestCase):
         return result
 
     @staticmethod
-    def _source_evidence(host, pp_rank, session):
+    def _source_evidence(pp_by_host, session):
+        session.setdefault("dense_layers", 3)
+        session.setdefault("hidden_layers", 78)
         modules = {
             "prime_rl.models.glm": {
                 "location": "mounted",
                 "sha256": "c" * 64,
             }
         }
-        return json.dumps(
-            {
-                "session": session,
-                "provenance": {
+        records = [
+                {
+                    "schema_version": 1,
                     "kind": "glm52_policy_parity_trainer_runtime",
                     "host": host,
                     "pp_rank": pp_rank,
@@ -231,10 +230,29 @@ class H200ParityTest(unittest.TestCase):
                     "global_rank": pp_rank * 8,
                     "pp_size": 8,
                     "cp_size": 8,
+                    "batch_size": 8,
                     "image_digest": "sha256:" + "d" * 64,
+                    "owned_layers": list(range(3 + pp_rank, 78, 8)),
                     "modules": modules,
+                }
+            for host, pp_rank in pp_by_host.items()
+        ]
+        return json.dumps(
+            {
+                "union": {
+                    "kind": "glm52_policy_parity_trainer_provenance_union",
+                    "session": session,
+                    "records": records,
+                    "binding_sha256": "e" * 64,
+                    "fixture_source_sha256": "f" * 64,
                 },
-                "provenance_file": f"trainer-runtime-pp-{pp_rank}-host-{host}.json",
+                "manifest": {
+                    "kind": "glm52_policy_parity_trainer_fixture_source",
+                    "rank": 56,
+                    "file": "trainer-fixture-source.npz",
+                    "file_sha256": "f" * 64,
+                    "binding_sha256": "e" * 64,
+                },
             }
         )
 
@@ -250,25 +268,13 @@ class H200ParityTest(unittest.TestCase):
             "adapter_sha256": "b" * 64,
         }
         queried = []
-        active = 0
-        maximum_active = 0
-        lock = threading.Lock()
 
         def remote(host, command, label, timeout=120, connect_timeout=None):
-            nonlocal active, maximum_active
             del command, label
             self.assertEqual(timeout, 60)
             self.assertEqual(connect_timeout, 45)
-            with lock:
-                queried.append(host)
-                active += 1
-                maximum_active = max(maximum_active, active)
-            time.sleep(0.005)
-            try:
-                return self._source_evidence(host, pp_by_host[host], session)
-            finally:
-                with lock:
-                    active -= 1
+            queried.append(host)
+            return self._source_evidence(pp_by_host, session)
 
         with patch.object(training_ops, "trainer_hosts", hosts), patch.object(
             training_ops, "trainer_head", "n82"
@@ -285,16 +291,10 @@ class H200ParityTest(unittest.TestCase):
             f"{training_ops.parity_trace_root}/qualification-1",
         )
         self.assertEqual(source_session, session)
-        self.assertEqual(queried, hosts)
-        self.assertEqual(maximum_active, 1)
+        self.assertEqual(queried, ["n82"])
 
     def test_provenance_timeout_stops_serial_read_before_h200(self):
         hosts = ["n76", "n77", "n78", "n80", "n82", "n83", "n84", "n85"]
-        session = {
-            "side": "trainer",
-            "model_revision": "a" * 40,
-            "adapter_sha256": "b" * 64,
-        }
         queried = []
 
         def remote(host, command, label, timeout=120, connect_timeout=None):
@@ -302,9 +302,7 @@ class H200ParityTest(unittest.TestCase):
             self.assertEqual(timeout, 60)
             self.assertEqual(connect_timeout, 45)
             queried.append(host)
-            if host == "n76":
-                raise RuntimeError("banner exchange timed out")
-            return self._source_evidence(host, queried.index(host), session)
+            raise RuntimeError("banner exchange timed out")
 
         with patch.object(training_ops, "trainer_hosts", hosts), patch.object(
             training_ops, "trainer_head", "n82"
@@ -319,7 +317,7 @@ class H200ParityTest(unittest.TestCase):
         ):
             training_ops.diagnose_glm52_policy_parity("qualification-1")
 
-        self.assertEqual(queried, hosts[:1])
+        self.assertEqual(queried, ["n82"])
         h200.assert_not_called()
 
     def test_diagnostic_source_refuses_missing_or_duplicate_pp0(self):
@@ -340,7 +338,8 @@ class H200ParityTest(unittest.TestCase):
                     del command, label
                     self.assertEqual(timeout, 60)
                     self.assertEqual(connect_timeout, 45)
-                    return self._source_evidence(host, pp_by_host[host], session)
+                    self.assertEqual(host, "n82")
+                    return self._source_evidence(pp_by_host, session)
 
                 with patch.object(training_ops, "trainer_hosts", hosts), patch.object(
                     training_ops, "trainer_head", "n82"
@@ -363,7 +362,8 @@ class H200ParityTest(unittest.TestCase):
             del command, label
             self.assertEqual(timeout, 60)
             self.assertEqual(connect_timeout, 45)
-            return self._source_evidence(host, pp_by_host[host], session)
+            self.assertEqual(host, "n82")
+            return self._source_evidence(pp_by_host, session)
 
         with patch.object(training_ops, "trainer_hosts", hosts), patch.object(
             training_ops, "trainer_head", "n82"

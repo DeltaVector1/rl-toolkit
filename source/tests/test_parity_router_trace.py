@@ -2,6 +2,7 @@ import os
 import json
 import base64
 import io
+import inspect
 import sys
 import tempfile
 import threading
@@ -11,6 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+import prime_rl.parity_router_trace as parity_trace
 from scripts.glm52_policy_parity import (
     Profile,
     capture_h200,
@@ -61,6 +63,8 @@ from prime_rl.parity_router_trace import (
     write_session,
     _is_mounted,
     _trainer_host_name,
+    _validate_trainer_bundle_inputs,
+    _write_trainer_bundle,
 )
 
 
@@ -147,6 +151,183 @@ def session() -> TraceSession:
 
 
 class ParityRouterTraceTest(unittest.TestCase):
+    def _trainer_bundle_values(self):
+        metadata = TraceSession(
+            **{
+                **session().__dict__,
+                "token_ids_sha256": parity_trace.sha256_tokens(
+                    np.arange(8, dtype=np.int64)
+                ),
+                "expected_tokens": 8,
+                "hidden_layers": 78,
+                "dense_layers": 3,
+            }
+        )
+        hosts = ["n82", "n76", "n77", "n78", "n80", "n83", "n84", "n85"]
+        layer_parts = np.array_split(np.arange(3, 78), 8)
+        modules = {
+            "mounted": {"location": "mounted", "sha256": "a" * 64},
+            "image": {"location": "unmounted", "sha256": "b" * 64},
+        }
+        gathered = []
+        for rank in range(64):
+            pp_rank, cp_rank = divmod(rank, 8)
+            record = None
+            if cp_rank == 0:
+                record = {
+                    "schema_version": 1,
+                    "kind": "glm52_policy_parity_trainer_runtime",
+                    "host": hosts[pp_rank],
+                    "pp_rank": pp_rank,
+                    "cp_rank": 0,
+                    "global_rank": rank,
+                    "pp_size": 8,
+                    "cp_size": 8,
+                    "batch_size": 8,
+                    "image_digest": "sha256:" + str(pp_rank) * 64,
+                    "owned_layers": layer_parts[pp_rank].tolist(),
+                    "modules": modules,
+                }
+            gathered.append(
+                {
+                    "rank": rank,
+                    "session_identity": trace_session_identity(metadata),
+                    "provenance": record,
+                    "has_compact_source": rank == 56,
+                    "error": None,
+                }
+            )
+        selected = np.arange(4, 8, dtype=np.int64)
+        arrays = {
+            "token_ids": np.arange(8, dtype=np.int64),
+            "positions": np.arange(8, dtype=np.int64),
+            "selected_indices": selected,
+            "advantages": np.ones(4, dtype=np.float32),
+        }
+        return metadata, gathered, arrays
+
+    def test_trainer_bundle_validates_pp8_cp8_and_compact_source(self):
+        metadata, gathered, arrays = self._trainer_bundle_values()
+        with patch.object(parity_trace, "_process_pp_size", 8), patch.object(
+            parity_trace, "_process_cp_size", 8
+        ):
+            records, checked, binding = _validate_trainer_bundle_inputs(
+                gathered, metadata, "n82", arrays
+            )
+        self.assertEqual([record["pp_rank"] for record in records], list(range(8)))
+        self.assertEqual(checked["selected_indices"].tolist(), [4, 5, 6, 7])
+        self.assertRegex(binding, r"^[0-9a-f]{64}$")
+        self.assertLess(sum(value.nbytes for value in checked.values()), 18 * 1024 * 1024)
+
+    def test_trainer_bundle_refuses_missing_rank_and_mismatched_modules(self):
+        metadata, gathered, arrays = self._trainer_bundle_values()
+        cases = []
+        missing = list(gathered)
+        missing[24] = {**missing[24], "provenance": None}
+        cases.append((missing, "CP0 provenance"))
+        mismatched = [dict(value) for value in gathered]
+        mismatched[8] = {
+            **mismatched[8],
+            "provenance": {
+                **mismatched[8]["provenance"],
+                "modules": {
+                    "different": {"location": "mounted", "sha256": "f" * 64}
+                },
+            },
+        }
+        cases.append((mismatched, "module hashes differ"))
+        with patch.object(parity_trace, "_process_pp_size", 8), patch.object(
+            parity_trace, "_process_cp_size", 8
+        ):
+            for values, message in cases:
+                with self.subTest(message=message), self.assertRaisesRegex(
+                    ValueError, message
+                ):
+                    _validate_trainer_bundle_inputs(values, metadata, "n82", arrays)
+
+    def test_trainer_bundle_writes_stable_marker_last_with_bound_hashes(self):
+        metadata, gathered, arrays = self._trainer_bundle_values()
+        with patch.object(parity_trace, "_process_pp_size", 8), patch.object(
+            parity_trace, "_process_cp_size", 8
+        ):
+            records, checked, binding = _validate_trainer_bundle_inputs(
+                gathered, metadata, "n82", arrays
+            )
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                write_session(root, metadata)
+                replacements = []
+                real_replace = os.replace
+
+                def replace(source, destination):
+                    replacements.append(Path(destination).name)
+                    real_replace(source, destination)
+
+                with patch.object(parity_trace.os, "replace", side_effect=replace):
+                    _write_trainer_bundle(root, metadata, records, checked, binding)
+                self.assertEqual(replacements[-1], "STABLE")
+                stable = json.loads((root / "STABLE").read_text())
+                union = root / "trainer-provenance-union.json"
+                source = root / "trainer-fixture-source.npz"
+                manifest = root / "trainer-fixture-source.json"
+                self.assertEqual(
+                    stable["provenance_union_sha256"], parity_trace._file_sha256(union)
+                )
+                self.assertEqual(
+                    stable["fixture_source_sha256"], parity_trace._file_sha256(source)
+                )
+                self.assertEqual(
+                    stable["fixture_source_manifest_sha256"],
+                    parity_trace._file_sha256(manifest),
+                )
+                self.assertLess(source.stat().st_size, 18 * 1024 * 1024)
+
+    def test_trainer_bundle_does_not_mark_partial_publish_stable(self):
+        metadata, gathered, arrays = self._trainer_bundle_values()
+        with patch.object(parity_trace, "_process_pp_size", 8), patch.object(
+            parity_trace, "_process_cp_size", 8
+        ):
+            records, checked, binding = _validate_trainer_bundle_inputs(
+                gathered, metadata, "n82", arrays
+            )
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                write_session(root, metadata)
+                real_replace = os.replace
+
+                def replace(source, destination):
+                    if Path(destination).name == "trainer-fixture-source.json":
+                        raise OSError("publish stopped")
+                    real_replace(source, destination)
+
+                with patch.object(
+                    parity_trace.os, "replace", side_effect=replace
+                ), self.assertRaisesRegex(OSError, "publish stopped"):
+                    _write_trainer_bundle(root, metadata, records, checked, binding)
+                self.assertFalse((root / "STABLE").exists())
+
+    def test_trainer_bundle_uses_fixed_cuda_collectives_and_status_broadcast(self):
+        source = inspect.getsource(parity_trace.publish_trainer_bundle)
+        self.assertIn("all_gather_into_tensor", source)
+        self.assertNotIn("gather_object", source)
+        self.assertIn("metadata_limit = 16 * 1024", source)
+        self.assertIn("status = torch.tensor", source)
+        self.assertLess(
+            source.index("dist.broadcast(status"), source.index("if int(status.item())")
+        )
+        train_source = Path(
+            "source/src/prime_rl/trainer/rl/train.py"
+        ).read_text()
+        barrier = train_source.index("dist.barrier()", train_source.index("if config.enable_token_export"))
+        publish = train_source.index("publish_trainer_bundle", barrier)
+        stable = train_source.index("token_exporter.mark_stable", publish)
+        self.assertLess(barrier, publish)
+        self.assertLess(publish, stable)
+
+    def test_trainer_bundle_is_off_without_parity_trace(self):
+        with patch.object(parity_trace, "validated_trace_root", return_value=None):
+            parity_trace.publish_trainer_bundle(None)
+
     def test_glm_diagnostic_plan_fits_existing_caps(self):
         metadata = TraceSession(
             **{
