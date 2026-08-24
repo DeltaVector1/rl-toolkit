@@ -2629,19 +2629,27 @@ def _h200_parity_container_preflight(host: str, expected_trace_dir: str) -> dict
     return result
 
 
-def _assert_h200_parity_port_free(host: str) -> None:
-    _check_host(host)
+def _h200_parity_port_preflight_command() -> str:
     protected = [protected_orchestrator, *protected_inference]
     expression = "|".join(re.escape(name) for name in protected)
-    command = (
+    return (
         "set -euo pipefail; "
-        "active=$(sudo docker ps --format '{{.Names}}' | "
-        f"grep -E '^({expression})(-[0-9]+)?$' || true); "
+        "inventory=$(sudo docker ps --format '{{.Names}}'); "
+        "set +e; "
+        "active=$(printf '%s\\n' \"$inventory\" | "
+        f"grep -E '^({expression})(-[0-9]+)?$'); "
+        "match_status=$?; set -e; "
+        "test \"$match_status\" -le 1 || exit \"$match_status\"; "
         "test -z \"$active\" || { echo protected-inference-active; exit 73; }; "
-        "listener=$(sudo ss -H -lntp 'sport = :8000' 2>/dev/null || true); "
+        "listener=$(sudo ss -H -lntp 'sport = :8000'); "
         "test -z \"$listener\" || { echo port-8000-in-use; exit 74; }; "
         "echo port-8000-free"
     )
+
+
+def _assert_h200_parity_port_free(host: str) -> None:
+    _check_host(host)
+    command = _h200_parity_port_preflight_command()
     code, output = _ssh(host, command, timeout=60)
     if code or output.strip() != "port-8000-free":
         raise Refused(
@@ -3314,6 +3322,16 @@ def _receive_parity_bootstrap(host: str, command: str, timeout: int) -> str:
     if len(decoded) != 48:
         raise RuntimeError("parity bootstrap receive returned invalid capacity")
     return token
+
+
+def _parity_bootstrap_receive_command(path: str, timeout: int) -> str:
+    return (
+        "set -euo pipefail; status=0; "
+        f"sudo timeout --foreground {timeout} cat -- {shlex.quote(path)} || status=$?; "
+        f"sudo rm -f -- {shlex.quote(path)}; "
+        f"test ! -e {shlex.quote(path)} && test ! -L {shlex.quote(path)}; "
+        'exit "$status"'
+    )
 
 
 def _isolated_container_status(
@@ -4023,13 +4041,9 @@ printf '%s\n' "$state"
         _sensitive_ssh(host, start_command, "isolated parity engine start", sensitive, 180)
         startup_grace = _configured_h200_engine_startup_grace()
         _h200_parity_container_preflight(host, h200_trace_directory)
-        fifo_read = (
-            f"sudo timeout --foreground {startup_grace} "
-            f"cat -- {shlex.quote(bootstrap_fifo)}; "
-            "status=$?; "
-            f"sudo rm -f -- {shlex.quote(bootstrap_fifo)} && "
-            f"test ! -e {shlex.quote(bootstrap_fifo)}; "
-            "exit $status"
+        fifo_read = _parity_bootstrap_receive_command(
+            bootstrap_fifo,
+            startup_grace,
         )
         bootstrap_token = _receive_parity_bootstrap(
             host,

@@ -536,6 +536,41 @@ class H200ParityTest(unittest.TestCase):
             training_ops._receive_parity_bootstrap("h200a", "read fifo", 30)
         self.assertNotIn(secret, str(caught.exception))
 
+    def test_bootstrap_receive_command_propagates_read_and_cleanup_failures(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            missing = root / "missing.fifo"
+            read_command = training_ops._parity_bootstrap_receive_command(
+                str(missing), 1
+            ).replace("sudo ", "")
+            read = subprocess.run(
+                ["bash", "-c", read_command],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(read.returncode, 0)
+            self.assertFalse(missing.exists())
+
+            retained = root / "bootstrap.fifo"
+            retained.write_text("x" * 64 + "\n")
+            cleanup_command = training_ops._parity_bootstrap_receive_command(
+                str(retained), 1
+            )
+            cleanup = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    "sudo() { if test \"$1\" = rm; then return 93; fi; \"$@\"; }; "
+                    + cleanup_command,
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(cleanup.returncode, 0)
+            self.assertTrue(retained.exists())
+
     def test_diagnostic_capture_preflight_refuses_existing_cap_overflow(self):
         with tempfile.TemporaryDirectory() as temporary:
             config = Path(temporary) / "h200.toml"
@@ -691,6 +726,24 @@ class H200ParityTest(unittest.TestCase):
                 training_ops, "_ssh", return_value=(74, output)
             ), self.assertRaises(training_ops.Refused):
                 training_ops._assert_h200_parity_port_free("h200a")
+
+    def test_parity_port_preflight_propagates_docker_and_ss_failures(self):
+        command = training_ops._h200_parity_port_preflight_command()
+        cases = {
+            "docker": "docker() { return 91; }; ss() { return 0; };",
+            "ss": "docker() { return 0; }; ss() { return 92; };",
+        }
+        for name, functions in cases.items():
+            with self.subTest(name=name):
+                script = f"sudo() {{ \"$@\"; }}; {functions} {command}"
+                result = subprocess.run(
+                    ["bash", "-c", script],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("port-8000-free", result.stdout)
 
     def test_listener_identity_binds_port_to_running_isolated_container(self):
         identity = {
