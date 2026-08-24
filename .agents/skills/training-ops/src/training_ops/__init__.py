@@ -211,11 +211,32 @@ def _check_parity_host(host: str) -> str:
     return host
 
 
-def _ssh(host: str, script: str, timeout: int = 120) -> tuple[int, str]:
+def _ssh(
+    host: str,
+    script: str,
+    timeout: int = 120,
+    connect_timeout: int | None = None,
+) -> tuple[int, str]:
     _check_host(host)
+    command = list(ssh_command)
+    if connect_timeout is not None:
+        if (
+            isinstance(connect_timeout, bool)
+            or not isinstance(connect_timeout, int)
+            or not 1 <= connect_timeout <= 120
+        ):
+            raise Refused("SSH connect timeout must be an integer from 1 to 120 seconds")
+        timeout_options = [
+            index
+            for index, value in enumerate(command)
+            if value.startswith("ConnectTimeout=")
+        ]
+        if len(timeout_options) != 1:
+            raise Refused("SSH connect timeout inventory is invalid")
+        command[timeout_options[0]] = f"ConnectTimeout={connect_timeout}"
     try:
         p = subprocess.run(
-            ssh_command + [host, script],
+            command + [host, script],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
@@ -227,8 +248,19 @@ def _ssh(host: str, script: str, timeout: int = 120) -> tuple[int, str]:
         return 124, "TIMEOUT"
 
 
-def _remote_ok(host: str, script: str, label: str, timeout: int = 120) -> str:
-    code, output = _ssh(host, script, timeout)
+def _remote_ok(
+    host: str,
+    script: str,
+    label: str,
+    timeout: int = 120,
+    connect_timeout: int | None = None,
+) -> str:
+    if connect_timeout is None:
+        code, output = _ssh(host, script, timeout)
+    else:
+        code, output = _ssh(
+            host, script, timeout, connect_timeout=connect_timeout
+        )
     if code:
         raise RuntimeError(f"{label} failed on {host}: {output.strip()}")
     return output
@@ -3248,7 +3280,13 @@ def _resolve_glm52_parity_diagnostic_source(
             "\"provenance_file\":records[0].name},sort_keys=True))' "
             f"{shlex.quote(source_root)}"
         )
-        output = _remote_ok(host, command, "trainer parity provenance", timeout=60)
+        output = _remote_ok(
+            host,
+            command,
+            "trainer parity provenance",
+            timeout=90,
+            connect_timeout=60,
+        )
         try:
             value = json.loads(output.strip().splitlines()[-1])
         except (json.JSONDecodeError, IndexError) as error:
