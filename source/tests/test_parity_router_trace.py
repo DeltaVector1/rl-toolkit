@@ -7,7 +7,7 @@ import sys
 import tempfile
 import types
 import unittest
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -59,6 +59,7 @@ from prime_rl.parity_router_trace import (
     _slice_diagnostic_tokens,
     _hidden_stream,
     _router_logits,
+    _h200_router_forward_context,
     diagnostics_enabled,
     write_session,
     _is_mounted,
@@ -1263,6 +1264,67 @@ class ParityRouterTraceTest(unittest.TestCase):
             ValueError, "correction bias"
         ):
             _router_logits(Owner(), Router(), FakeTensor([[1.0, 2.0]]))
+
+    def test_direct_router_replay_uses_vllm_026_forward_context(self):
+        calls = []
+        config = object()
+
+        @contextmanager
+        def set_forward_context(
+            attn_metadata,
+            vllm_config,
+            num_tokens=None,
+            num_tokens_across_dp=None,
+            cudagraph_runtime_mode=None,
+            batch_descriptor=None,
+            ubatch_slices=None,
+            slot_mapping=None,
+            skip_compiled=False,
+            is_padding=None,
+        ):
+            calls.append(
+                (
+                    "enter",
+                    attn_metadata,
+                    vllm_config,
+                    num_tokens,
+                    skip_compiled,
+                )
+            )
+            yield
+            calls.append(("exit",))
+
+        vllm = types.ModuleType("vllm")
+        forward_context = types.ModuleType("vllm.forward_context")
+        forward_context.set_forward_context = set_forward_context
+        runner = types.SimpleNamespace(vllm_config=config)
+        with patch.dict(
+            sys.modules,
+            {"vllm": vllm, "vllm.forward_context": forward_context},
+        ):
+            with _h200_router_forward_context(runner, 256):
+                calls.append(("router",))
+        self.assertEqual(
+            calls,
+            [("enter", None, config, 256, True), ("router",), ("exit",)],
+        )
+
+    def test_direct_router_replay_refuses_incompatible_context_api(self):
+        def set_forward_context(attn_metadata, vllm_config, num_tokens=None):
+            del attn_metadata, vllm_config, num_tokens
+
+        vllm = types.ModuleType("vllm")
+        forward_context = types.ModuleType("vllm.forward_context")
+        forward_context.set_forward_context = set_forward_context
+        with patch.dict(
+            sys.modules,
+            {"vllm": vllm, "vllm.forward_context": forward_context},
+        ), self.assertRaisesRegex(ValueError, "API is incompatible"):
+            _h200_router_forward_context(
+                types.SimpleNamespace(vllm_config=object()), 256
+            )
+        with self.assertRaisesRegex(ValueError, "no vLLM configuration"):
+            _h200_router_forward_context(object(), 256)
 
     def test_two_stream_boundary_requires_two_tensors(self):
         first = FakeTensor([[1.0, 2.0]])

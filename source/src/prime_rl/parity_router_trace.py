@@ -1564,6 +1564,29 @@ def _router_logits(owner: Any, router: Any, hidden: Any) -> Any:
     raise ValueError("H200 router does not expose its gate operation")
 
 
+def _h200_router_forward_context(model_runner: Any, num_tokens: int) -> Any:
+    if isinstance(num_tokens, bool) or not isinstance(num_tokens, int) or num_tokens < 1:
+        raise ValueError("H200 diagnostic token count is invalid")
+    vllm_config = getattr(model_runner, "vllm_config", None)
+    if vllm_config is None:
+        raise ValueError("H200 model runner has no vLLM configuration")
+    try:
+        from vllm.forward_context import set_forward_context
+
+        parameters = inspect.signature(set_forward_context).parameters
+    except (ImportError, TypeError, ValueError) as error:
+        raise ValueError("vLLM forward context API is unavailable") from error
+    required = {"attn_metadata", "vllm_config", "num_tokens", "skip_compiled"}
+    if not required.issubset(parameters):
+        raise ValueError("vLLM forward context API is incompatible")
+    return set_forward_context(
+        None,
+        vllm_config,
+        num_tokens=num_tokens,
+        skip_compiled=True,
+    )
+
+
 def run_h200_router_diagnostic(model_runner: Any, payload: dict[str, Any]) -> dict[str, Any]:
     """Run one bounded captured-input router check inside the H200 worker."""
     if not diagnostics_enabled():
@@ -1623,12 +1646,13 @@ def run_h200_router_diagnostic(model_runner: Any, payload: dict[str, Any]) -> di
         parameter = next(iter(model.parameters()), None)
         device = getattr(parameter, "device", "cuda")
         hidden = torch.as_tensor(input_array, dtype=torch.bfloat16, device=device)
-        _h200_diagnostic_active = True
-        try:
-            logits = _router_logits(owner, router, hidden)
-            route_weights, route_ids = router.select_experts(hidden, logits)
-        finally:
-            _h200_diagnostic_active = False
+        with _h200_router_forward_context(model_runner, int(input_array.shape[0])):
+            _h200_diagnostic_active = True
+            try:
+                logits = _router_logits(owner, router, hidden)
+                route_weights, route_ids = router.select_experts(hidden, logits)
+            finally:
+                _h200_diagnostic_active = False
         logits = logits.to(torch.float32)
         scores = 0.5 * torch.tanh(0.5 * logits) + 0.5
         correction_bias = getattr(router, "e_score_correction_bias", None)
