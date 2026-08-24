@@ -126,7 +126,7 @@ def _configured_h200_engine_startup_grace() -> int:
     return value
 
 
-def _configured_live_service_check() -> tuple[int, int, int, int]:
+def _configured_live_service_check() -> tuple[int, int, int, int, int, int, int]:
     settings = limits.get("live_service_check")
     if not isinstance(settings, dict):
         raise Refused("limits.live_service_check must be configured")
@@ -134,23 +134,60 @@ def _configured_live_service_check() -> tuple[int, int, int, int]:
         "attempts",
         "connect_timeout_seconds",
         "command_timeout_seconds",
+        "retry_delay_seconds",
         "workers",
+        "trainer_budget_seconds",
+        "inference_budget_seconds",
     )
     values = tuple(settings.get(name) for name in names)
     if any(isinstance(value, bool) or not isinstance(value, int) for value in values):
         raise Refused("live service check limits must be integers")
-    attempts, connect_timeout, command_timeout, workers = values
+    (
+        attempts,
+        connect_timeout,
+        command_timeout,
+        retry_delay,
+        workers,
+        trainer_budget,
+        inference_budget,
+    ) = values
     if not 1 <= attempts <= 3:
         raise Refused("live service check attempts must be from 1 to 3")
     if not 1 <= connect_timeout <= 120:
         raise Refused("live service check connect timeout must be from 1 to 120 seconds")
-    if not connect_timeout < command_timeout <= 300:
+    if not connect_timeout < command_timeout <= 120:
         raise Refused(
-            "live service check command timeout must exceed its connect timeout and be at most 300 seconds"
+            "live service check command timeout must exceed its connect timeout and be at most 120 seconds"
         )
+    if not 0 <= retry_delay <= 10:
+        raise Refused("live service check retry delay must be from 0 to 10 seconds")
     if not 1 <= workers <= len(trainer_hosts):
         raise Refused("live service check workers must fit the trainer inventory")
-    return attempts, connect_timeout, command_timeout, workers
+    if not 1 <= trainer_budget <= 300:
+        raise Refused("live trainer service check budget must be from 1 to 300 seconds")
+    if not 1 <= inference_budget <= 180:
+        raise Refused("live inference service check budget must be from 1 to 180 seconds")
+    per_host = attempts * command_timeout + (attempts - 1) * retry_delay
+    trainer_worst_case = math.ceil(len(trainer_hosts) / workers) * per_host
+    if trainer_worst_case > trainer_budget:
+        raise Refused(
+            f"live trainer service check worst case is {trainer_worst_case} seconds; "
+            f"budget is {trainer_budget} seconds"
+        )
+    if per_host > inference_budget:
+        raise Refused(
+            f"live inference service check worst case is {per_host} seconds; "
+            f"budget is {inference_budget} seconds"
+        )
+    return (
+        attempts,
+        connect_timeout,
+        command_timeout,
+        retry_delay,
+        workers,
+        trainer_budget,
+        inference_budget,
+    )
 
 adapter_archive_bucket = paths["adapter_bucket"]
 adapter_archive_files = ("adapter_config.json", "adapter_model.safetensors")
@@ -362,17 +399,26 @@ def _assert_live_services_are_down(nodes: list[str], include_inference: bool) ->
     """Refuse an isolated launch while the live deployment uses the same GPUs."""
 
     active: list[str] = []
-    attempts, connect_timeout, command_timeout, workers = (
-        _configured_live_service_check()
-    )
+    (
+        attempts,
+        connect_timeout,
+        command_timeout,
+        retry_delay,
+        workers,
+        trainer_budget,
+        inference_budget,
+    ) = _configured_live_service_check()
 
-    def check(host: str, script: str) -> tuple[int, str]:
+    def check(host: str, script: str, deadline: float) -> tuple[int, str]:
         result = (1, "live service check did not run")
-        for _attempt in range(attempts):
+        for attempt in range(attempts):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return 124, "live service check aggregate deadline exceeded"
             result = _ssh(
                 host,
                 script,
-                timeout=command_timeout,
+                timeout=min(command_timeout, max(1, math.ceil(remaining))),
                 connect_timeout=connect_timeout,
             )
             code, output = result
@@ -380,35 +426,55 @@ def _assert_live_services_are_down(nodes: list[str], include_inference: bool) ->
                 code == 255 and "banner exchange" in output.lower()
             ):
                 break
+            if attempt + 1 < attempts:
+                remaining = deadline - time.monotonic()
+                if retry_delay >= remaining:
+                    return 124, "live service check aggregate deadline exceeded"
+                time.sleep(retry_delay)
         return result
+
+    trainer_deadline = time.monotonic() + trainer_budget
 
     def trainer_active(host: str) -> tuple[int, str]:
         return check(
             host,
             f"sudo docker ps --filter name=^{protected_trainer}$ --format '{{{{.Names}}}}'",
+            trainer_deadline,
         )
 
-    for host, (code, output) in _fan(
+    trainer_results = _fan(
         nodes, trainer_active, workers=workers
-    ).items():
+    )
+    for host, (code, output) in trainer_results.items():
         if code:
             raise RuntimeError(f"cannot check the live trainer on {host}: {output.strip()}")
         if output.strip():
             active.append(f"{host}:{output.strip()}")
+    if active:
+        raise Refused(
+            "the live deployment is active on the requested GPUs: "
+            + ", ".join(active)
+        )
+    if time.monotonic() > trainer_deadline:
+        raise RuntimeError("live trainer service check exceeded its aggregate deadline")
 
     if include_inference:
+        inference_deadline = time.monotonic() + inference_budget
         names = [protected_orchestrator, *protected_inference]
         expression = "|".join(re.escape(name) for name in names)
         code, output = check(
             orchestrator_host,
             "sudo docker ps --format '{{.Names}}' | "
             f"grep -E '^({expression})(-[0-9]+)?$' || true",
+            inference_deadline,
         )
         if code:
             raise RuntimeError(
                 f"cannot check live inference services on {orchestrator_host}: {output.strip()}"
             )
         active.extend(f"{orchestrator_host}:{name}" for name in output.split())
+        if time.monotonic() > inference_deadline:
+            raise RuntimeError("live inference service check exceeded its deadline")
 
     if active:
         raise Refused(

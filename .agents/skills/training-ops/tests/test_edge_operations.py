@@ -474,9 +474,10 @@ class EdgeOperationsTest(unittest.TestCase):
 
     def test_live_service_check_retries_one_transient_banner_timeout(self):
         self.assertEqual(
-            training_ops._configured_live_service_check(), (2, 45, 60, 2)
+            training_ops._configured_live_service_check(),
+            (2, 45, 60, 1, 4, 300, 121),
         )
-        with patch.object(
+        with patch.object(training_ops.time, "sleep") as sleep, patch.object(
             training_ops,
             "_ssh",
             side_effect=[
@@ -489,6 +490,7 @@ class EdgeOperationsTest(unittest.TestCase):
             )
 
         self.assertEqual(ssh.call_count, 2)
+        sleep.assert_called_once_with(1)
         for call in ssh.call_args_list:
             self.assertEqual(call.kwargs["connect_timeout"], 45)
             self.assertEqual(call.kwargs["timeout"], 60)
@@ -506,7 +508,7 @@ class EdgeOperationsTest(unittest.TestCase):
         ssh.assert_called_once()
 
     def test_live_service_check_banner_retry_is_bounded(self):
-        with patch.object(
+        with patch.object(training_ops.time, "sleep") as sleep, patch.object(
             training_ops,
             "_ssh",
             return_value=(255, "Connection timed out during banner exchange"),
@@ -518,9 +520,10 @@ class EdgeOperationsTest(unittest.TestCase):
             )
 
         self.assertEqual(ssh.call_count, 2)
+        sleep.assert_called_once_with(1)
 
     def test_live_service_check_still_refuses_active_service_after_retry(self):
-        with patch.object(
+        with patch.object(training_ops.time, "sleep") as sleep, patch.object(
             training_ops,
             "_ssh",
             side_effect=[
@@ -533,6 +536,7 @@ class EdgeOperationsTest(unittest.TestCase):
             )
 
         self.assertEqual(ssh.call_count, 2)
+        sleep.assert_called_once_with(1)
 
     def test_live_service_check_uses_configured_worker_bound(self):
         observed = []
@@ -548,7 +552,38 @@ class EdgeOperationsTest(unittest.TestCase):
                 ["n82", "n76"], include_inference=False
             )
 
-        self.assertEqual(observed, [2])
+        self.assertEqual(observed, [4])
+
+    def test_live_service_check_refuses_aggregate_config_over_budget(self):
+        original = dict(training_ops.limits["live_service_check"])
+        for change, message in (
+            ({"workers": 1}, "trainer service check worst case"),
+            ({"inference_budget_seconds": 120}, "inference service check worst case"),
+            ({"trainer_budget_seconds": 3000}, "trainer service check budget"),
+        ):
+            settings = {**original, **change}
+            with self.subTest(change=change), patch.dict(
+                training_ops.limits, {"live_service_check": settings}
+            ), self.assertRaisesRegex(training_ops.Refused, message):
+                training_ops._configured_live_service_check()
+
+    def test_live_service_check_enforces_runtime_aggregate_deadline(self):
+        def fan(hosts, function, workers=None):
+            del workers
+            return {host: function(host) for host in hosts}
+
+        with patch.object(
+            training_ops.time, "monotonic", side_effect=[0.0, 301.0]
+        ), patch.object(training_ops, "_fan", side_effect=fan), patch.object(
+            training_ops, "_ssh"
+        ) as ssh, self.assertRaisesRegex(
+            RuntimeError, "aggregate deadline"
+        ):
+            training_ops._assert_live_services_are_down(
+                ["n82"], include_inference=False
+            )
+
+        ssh.assert_not_called()
 
     def test_qualification_launch_uses_isolated_inventory(self):
         calls = []
