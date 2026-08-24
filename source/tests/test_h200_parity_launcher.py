@@ -5,6 +5,7 @@ import os
 import pathlib
 import subprocess
 import tempfile
+import tomllib
 import unittest
 
 
@@ -56,8 +57,23 @@ class H200ParityLauncherTest(unittest.TestCase):
     def test_launcher_requires_the_exact_candidate_override(self):
         source = START.read_text()
         self.assertNotIn("prime_inference_config", source)
+        self.assertIn('"host":"127.0.0.1"', source)
         self.assertIn('max_num_batched_tokens":32769', source)
         self.assertIn('max_cudagraph_capture_size":256', source)
+
+    def test_parity_router_is_external_and_backend_is_loopback(self):
+        source = START.read_text()
+        config_path = ROOT / "configs/qualification/glm52-policy-parity-h200.toml"
+        with config_path.open("rb") as config_file:
+            config = tomllib.load(config_file)
+        self.assertEqual(config["server"]["host"], "0.0.0.0")
+        self.assertEqual(config["server"]["port"], 8000)
+        self.assertEqual(config["backend_port"], 8100)
+        self.assertIn(
+            "expected_vllm_extra='{\"host\":\"127.0.0.1\"",
+            source,
+        )
+        self.assertIn('--vllm-extra "$vllm_extra"', source)
 
     def test_trainer_launcher_passes_rank_zero_host_for_bundle_validation(self):
         source = (ROOT / "scripts/china/cluster.sh").read_text()

@@ -981,6 +981,9 @@ class H200ParityTest(unittest.TestCase):
 
     def test_api_listener_identity_requires_loopback_binding(self):
         port = training_ops.h200_parity_backend_port
+        self.assertEqual(
+            json.loads(training_ops.glm_parity_vllm_extra)["host"], "127.0.0.1"
+        )
         command = training_ops._h200_parity_listener_identity_command(0, port)
         container_id = "a" * 64
         expected_command = json.dumps(
