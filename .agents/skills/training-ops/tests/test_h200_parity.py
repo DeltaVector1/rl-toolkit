@@ -814,8 +814,8 @@ sleep() {{
         self.assertEqual(
             result,
             {
-                "files": 23,
-                "estimated_bytes": 96_716_800,
+                "files": 24,
+                "estimated_bytes": 96_784_384,
                 "max_files": 64,
                 "max_bytes": 100_000_000,
                 "qualification_root": (

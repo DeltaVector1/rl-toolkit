@@ -1049,10 +1049,10 @@ class ParityRouterTraceTest(unittest.TestCase):
         with patch.dict(os.environ, environment, clear=True):
             trainer = diagnostic_capture_preflight(metadata, "trainer")
             h200 = diagnostic_capture_preflight(metadata, "h200")
-        self.assertEqual(trainer["files"], 17)
-        self.assertEqual(trainer["estimated_bytes"], 89_229_312)
-        self.assertEqual(h200["files"], 23)
-        self.assertEqual(h200["estimated_bytes"], 96_716_800)
+        self.assertEqual(trainer["files"], 18)
+        self.assertEqual(trainer["estimated_bytes"], 89_296_896)
+        self.assertEqual(h200["files"], 24)
+        self.assertEqual(h200["estimated_bytes"], 96_784_384)
         self.assertEqual(len(h200["names"]), len(set(h200["names"])))
 
     def test_diagnostic_plan_refuses_existing_cap_overflow(self):
@@ -1254,7 +1254,7 @@ class ParityRouterTraceTest(unittest.TestCase):
                 )
             copied = output / retained["entries"][0]["file"]
             self.assertTrue(copied.is_file())
-            self.assertEqual(retained["files"], 23)
+            self.assertEqual(retained["files"], 24)
             self.assertEqual(retained["binding"], binding)
             with np.load(copied, allow_pickle=False) as stored:
                 self.assertEqual(stored["values"].dtype, np.float32)
@@ -1278,7 +1278,7 @@ class ParityRouterTraceTest(unittest.TestCase):
                 legacy_names = (
                     current_names - parity_script.legacy_h200_missing_diagnostics
                 )
-                self.assertEqual(len(current_names), 23)
+                self.assertEqual(len(current_names), 24)
                 self.assertEqual(len(legacy_names), 20)
                 self.assertEqual(
                     set(parity_script.accepted_h200_diagnostic_entries(legacy_names)),
@@ -1736,10 +1736,11 @@ class ParityRouterTraceTest(unittest.TestCase):
         active_session = {}
         generate_count = 0
         reset_count = 0
+        model_count = 0
         events = []
 
         def request(url, body, api_key, timeout):
-            nonlocal generate_count, reset_count
+            nonlocal generate_count, model_count, reset_count
             del timeout
             if url.endswith("/parity/bootstrap-ready"):
                 self.assertTrue(url.startswith("http://control"))
@@ -1755,8 +1756,25 @@ class ParityRouterTraceTest(unittest.TestCase):
                 }
             if url.endswith("/v1/models"):
                 self.assertTrue(url.startswith("http://h200"))
-                events.append("models")
+                model_count += 1
+                events.append(f"models_{model_count}")
+                if model_count == 1:
+                    return {"data": [{"id": "base", "max_model_len": 3}]}
                 return {"data": [{"id": "model", "max_model_len": 3}]}
+            if url.endswith("/load_lora_adapter"):
+                self.assertTrue(url.startswith("http://control"))
+                self.assertEqual(
+                    body,
+                    {
+                        "lora_name": "model",
+                        "lora_path": (
+                            "/data/glm52-rl/qualifications/glm52-step20-h200/"
+                            "adapter-step20"
+                        ),
+                    },
+                )
+                events.append("load_adapter")
+                return {"status": "ok"}
             if url.endswith("/parity/router-trace/reset"):
                 self.assertTrue(url.startswith("http://control"))
                 self.assertEqual(api_key, bootstrap_token)
@@ -1793,6 +1811,12 @@ class ParityRouterTraceTest(unittest.TestCase):
             root = Path(temporary)
             profile_path = root / "profile.toml"
             profile_path.write_text("test = true\n")
+            operations_path = root / "operations.toml"
+            operations_path.write_text(
+                "[gate.glm52_step20_h200]\n"
+                'adapter = "/data/glm52-rl/qualifications/'
+                'glm52-step20-h200/adapter-step20"\n'
+            )
             profile = Profile(
                 profile_path,
                 {
@@ -1866,13 +1890,20 @@ class ParityRouterTraceTest(unittest.TestCase):
                     22,
                     root / "input.npz",
                     30.0,
+                    Path(
+                        "/data/glm52-rl/qualifications/glm52-step20-h200/"
+                        "adapter-step20"
+                    ),
+                    operations_path,
                 )
         self.assertEqual(reset_count, 1)
         self.assertEqual(
             events,
             [
                 "bootstrap_ready",
-                "models",
+                "models_1",
+                "load_adapter",
+                "models_2",
                 "graph_capture",
                 "reset",
                 "token_issue",
@@ -1885,6 +1916,11 @@ class ParityRouterTraceTest(unittest.TestCase):
         self.assertEqual(manifest["direct_router_diagnostic"], {"passed": True})
         self.assertEqual(manifest["retained_diagnostics"]["files"], 1)
         self.assertEqual(manifest["bootstrap_identity"]["boot_nonce"], "c" * 32)
+        self.assertTrue(manifest["adapter_loaded"])
+        self.assertEqual(
+            manifest["adapter_path"],
+            "/data/glm52-rl/qualifications/glm52-step20-h200/adapter-step20",
+        )
         self.assertNotIn("one-use-secret", json.dumps(manifest, sort_keys=True))
 
     def test_bootstrap_identity_waits_only_for_not_ready(self):

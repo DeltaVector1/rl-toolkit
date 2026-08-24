@@ -48,6 +48,7 @@ diagnostic_max_request_bytes = 16 * 1024 * 1024
 diagnostic_npz_overhead_bytes = 64 * 1024
 diagnostic_token0_widths = {
     "layer0_normalized_input": 6144,
+    "layer0_kv_before_norm": 512,
     "layer0_normalized_kv": 512,
     "layer0_o_proj_input_tp0": 2048,
 }

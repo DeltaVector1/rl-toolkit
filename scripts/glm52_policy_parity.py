@@ -1338,6 +1338,7 @@ def expected_h200_diagnostic_entries() -> dict[str, dict[str, Any]]:
     semantics.extend(
         (
             ("layer0_normalized_input", 1, 6144, "torch.bfloat16"),
+            ("layer0_kv_before_norm", 1, 512, "torch.bfloat16"),
             ("layer0_normalized_kv", 1, 512, "torch.bfloat16"),
             ("layer0_o_proj_input_tp0", 1, 2048, "torch.bfloat16"),
             ("layer3_router_input", retained_diagnostic_tokens, 6144, "torch.bfloat16"),
@@ -1362,6 +1363,7 @@ legacy_h200_missing_diagnostics = frozenset(
     f"{name}-rank-0-pp-0-cp-0"
     for name in (
         "layer0_normalized_input",
+        "layer0_kv_before_norm",
         "layer0_normalized_kv",
         "layer0_o_proj_input_tp0",
     )
@@ -1372,7 +1374,7 @@ def accepted_h200_diagnostic_entries(
     names: set[str],
 ) -> dict[str, dict[str, Any]]:
     current = expected_h200_diagnostic_entries()
-    if len(current) != 23 or not legacy_h200_missing_diagnostics < set(current):
+    if len(current) != 24 or not legacy_h200_missing_diagnostics < set(current):
         raise RuntimeError("H200 diagnostic plan changed without a schema update")
     if names == set(current):
         return current
@@ -1864,6 +1866,8 @@ def capture_h200(
     expected_api_process_id: int,
     diagnostic_input: Path | None,
     timeout: float,
+    adapter_path: Path | None = None,
+    operations_path: Path | None = None,
 ) -> dict[str, Any]:
     fixture_manifest = load_manifest(fixture, "glm52_policy_parity_fixture")
     check_fresh(profile, fixture, fixture_manifest)
@@ -1877,6 +1881,37 @@ def capture_h200(
     bootstrap_ready = wait_for_bootstrap_identity(
         control, bootstrap_token, expected_api_process_id, min(timeout, 120)
     )
+    if adapter_path is not None:
+        if operations_path is None:
+            raise ValueError("H200 step-20 adapter needs the operations inventory")
+        with operations_path.open("rb") as stream:
+            operations = tomllib.load(stream)
+        expected_adapter = (
+            operations.get("gate", {})
+            .get("glm52_step20_h200", {})
+            .get("adapter")
+        )
+        if str(adapter_path) != expected_adapter:
+            raise ValueError("H200 parity adapter path differs from operations")
+        existing_cards = request_json(
+            f"{base}/v1/models",
+            body=None,
+            api_key=api_key,
+            timeout=min(timeout, 120),
+        ).get("data", [])
+        if any(
+            isinstance(item, dict) and item.get("id") == model
+            for item in existing_cards
+        ):
+            raise ValueError("H200 parity adapter alias exists before fresh load")
+        load_result = request_json(
+            f"{control}/load_lora_adapter",
+            body={"lora_name": model, "lora_path": str(adapter_path)},
+            api_key=api_key,
+            timeout=min(timeout, 600),
+        )
+        if load_result.get("status") != "ok":
+            raise ValueError("H200 step-20 adapter load did not return success")
     cards = request_json(
         f"{base}/v1/models", body=None, api_key=api_key, timeout=min(timeout, 120)
     ).get("data", [])
@@ -2080,6 +2115,8 @@ def capture_h200(
         "eager_request_id": eager_response.get("request_id"),
         "model_revision": model_revision,
         "adapter_sha256": adapter_sha256,
+        "adapter_loaded": adapter_path is not None,
+        "adapter_path": str(adapter_path) if adapter_path is not None else None,
         "image": image,
         "bootstrap_identity": bootstrap_ready,
         "lora_targets": list(required_targets),
@@ -2957,11 +2994,13 @@ def compare(
     report = {
         "schema_version": schema_version,
         "kind": "glm52_policy_parity_report",
+        "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "passed": all(checks.values()),
         "fixture_sha256": expected_fixture,
         "profile_sha256": file_sha256(profile.path),
         "model_revision": trainer_manifest["model_revision"],
         "adapter_sha256": trainer_manifest["adapter_sha256"],
+        "h200_capture_manifest_sha256": file_sha256(h200 / "manifest.json"),
         "trainer_image_digest": trainer_image_digest,
         "trainer_image_digests": trainer_image_digests,
         "trainer_model_modules": trainer_model_modules,
@@ -3028,6 +3067,12 @@ def parser() -> argparse.ArgumentParser:
     h200.add_argument("--model", required=True)
     h200.add_argument("--model-revision", required=True)
     h200.add_argument("--adapter-sha256", required=True)
+    h200.add_argument("--adapter-path", type=Path)
+    h200.add_argument(
+        "--operations",
+        type=Path,
+        default=Path("configs/operations.toml"),
+    )
     h200.add_argument("--image", required=True)
     h200.add_argument("--api-key-env")
     h200.add_argument("--expected-api-process-id", type=int, required=True)
@@ -3129,6 +3174,8 @@ def main(argv: list[str] | None = None) -> int:
                 args.expected_api_process_id,
                 args.diagnostic_input,
                 args.timeout,
+                args.adapter_path,
+                args.operations,
             )
         elif args.command == "validate-h200-capture":
             manifest, manifest_sha256 = load_h200_capture_manifest(args.capture)

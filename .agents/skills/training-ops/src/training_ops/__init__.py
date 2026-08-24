@@ -3707,6 +3707,7 @@ def _diagnostic_capture_preflight(
     capture_shapes = [(tokens, 6144)] * len(names)
     for name, width in (
         ("layer0_normalized_input", 6144),
+        ("layer0_kv_before_norm", 512),
         ("layer0_normalized_kv", 512),
         ("layer0_o_proj_input_tp0", 2048),
     ):
