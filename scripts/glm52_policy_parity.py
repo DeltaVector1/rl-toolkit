@@ -1233,29 +1233,39 @@ def h200_diagnostic_binding(result: dict[str, Any]) -> dict[str, str]:
 
 
 def expected_h200_diagnostic_entries() -> dict[str, dict[str, Any]]:
-    semantics: list[tuple[str, int, str]] = [("embedding", 6144, "torch.bfloat16")]
+    semantics: list[tuple[str, int, int, str]] = [
+        ("embedding", retained_diagnostic_tokens, 6144, "torch.bfloat16")
+    ]
     for layer in range(3):
         semantics.extend(
-            (f"layer{layer}_{suffix}", 6144, "torch.bfloat16")
+            (
+                f"layer{layer}_{suffix}",
+                retained_diagnostic_tokens,
+                6144,
+                "torch.bfloat16",
+            )
             for suffix in ("input", "attention_raw", "mlp_raw", "output")
         )
     semantics.extend(
         (
-            ("layer3_router_input", 6144, "torch.bfloat16"),
-            ("layer3_h200_input", 6144, "torch.bfloat16"),
-            ("layer3_h200_logits", 256, "torch.float32"),
-            ("layer3_h200_scores", 256, "torch.float32"),
-            ("layer3_h200_selection_scores", 256, "torch.float32"),
-            ("layer3_h200_route_ids", 8, "torch.int32"),
-            ("layer3_h200_route_weights", 8, "torch.float32"),
+            ("layer0_normalized_input", 1, 6144, "torch.bfloat16"),
+            ("layer0_normalized_kv", 1, 512, "torch.bfloat16"),
+            ("layer0_o_proj_input_tp0", 1, 2048, "torch.bfloat16"),
+            ("layer3_router_input", retained_diagnostic_tokens, 6144, "torch.bfloat16"),
+            ("layer3_h200_input", retained_diagnostic_tokens, 6144, "torch.bfloat16"),
+            ("layer3_h200_logits", retained_diagnostic_tokens, 256, "torch.float32"),
+            ("layer3_h200_scores", retained_diagnostic_tokens, 256, "torch.float32"),
+            ("layer3_h200_selection_scores", retained_diagnostic_tokens, 256, "torch.float32"),
+            ("layer3_h200_route_ids", retained_diagnostic_tokens, 8, "torch.int32"),
+            ("layer3_h200_route_weights", retained_diagnostic_tokens, 8, "torch.float32"),
         )
     )
     return {
         f"{name}-rank-0-pp-0-cp-0": {
-            "shape": [retained_diagnostic_tokens, width],
+            "shape": [tokens, width],
             "source_dtype": source_dtype,
         }
-        for name, width, source_dtype in semantics
+        for name, tokens, width, source_dtype in semantics
     }
 
 

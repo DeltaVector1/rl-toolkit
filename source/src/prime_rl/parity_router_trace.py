@@ -46,6 +46,11 @@ diagnostic_max_bytes_env = "PRIME_PARITY_DIAGNOSTIC_MAX_BYTES"
 diagnostic_hidden_width = 6144
 diagnostic_max_request_bytes = 16 * 1024 * 1024
 diagnostic_npz_overhead_bytes = 64 * 1024
+diagnostic_token0_widths = {
+    "layer0_normalized_input": 6144,
+    "layer0_normalized_kv": 512,
+    "layer0_o_proj_input_tp0": 2048,
+}
 parity_model_modules = (
     "prime_rl.trainer.model",
     "prime_rl.trainer.lora",
@@ -431,25 +436,26 @@ def diagnostic_capture_preflight(session: TraceSession, side: str) -> dict[str, 
             )
         )
     hidden_names.append(f"layer{session.dense_layers}_router_input")
-    plan = [(name, diagnostic_hidden_width) for name in hidden_names]
+    plan = [(name, diagnostic_hidden_width, limits["tokens"]) for name in hidden_names]
+    plan.extend((name, width, 1) for name, width in diagnostic_token0_widths.items())
     if side == "h200":
         plan.extend(
             (
-                (f"layer{session.dense_layers}_h200_input", diagnostic_hidden_width),
-                (f"layer{session.dense_layers}_h200_logits", session.experts),
-                (f"layer{session.dense_layers}_h200_scores", session.experts),
-                (f"layer{session.dense_layers}_h200_selection_scores", session.experts),
-                (f"layer{session.dense_layers}_h200_route_ids", session.topk),
-                (f"layer{session.dense_layers}_h200_route_weights", session.topk),
+                (f"layer{session.dense_layers}_h200_input", diagnostic_hidden_width, limits["tokens"]),
+                (f"layer{session.dense_layers}_h200_logits", session.experts, limits["tokens"]),
+                (f"layer{session.dense_layers}_h200_scores", session.experts, limits["tokens"]),
+                (f"layer{session.dense_layers}_h200_selection_scores", session.experts, limits["tokens"]),
+                (f"layer{session.dense_layers}_h200_route_ids", session.topk, limits["tokens"]),
+                (f"layer{session.dense_layers}_h200_route_weights", session.topk, limits["tokens"]),
             )
         )
-    names = [name for name, _width in plan]
+    names = [name for name, _width, _tokens in plan]
     if len(names) != len(set(names)):
         raise ValueError("diagnostic capture plan contains duplicate semantic files")
     estimated_bytes = sum(
-        limits["tokens"] * width * np.dtype(np.float32).itemsize
+        tokens * width * np.dtype(np.float32).itemsize
         + diagnostic_npz_overhead_bytes
-        for _name, width in plan
+        for _name, width, tokens in plan
     )
     if len(plan) > limits["max_files"] or estimated_bytes > limits["max_bytes"]:
         raise ValueError("diagnostic capture plan exceeds the configured file or byte cap")
@@ -1410,7 +1416,11 @@ def _diagnostic_tensor_metadata(
 
 
 def write_hidden_diagnostic(
-    kind: str, value: Any, *, expected_width: int | None = diagnostic_hidden_width
+    kind: str,
+    value: Any,
+    *,
+    expected_width: int | None = diagnostic_hidden_width,
+    token_limit: int | None = None,
 ) -> None:
     """Write one bounded activation capture when explicitly enabled."""
     global _diagnostic_files, _diagnostic_bytes, _diagnostic_session
@@ -1429,6 +1439,12 @@ def write_hidden_diagnostic(
     )
     session = read_session(root)
     limits = diagnostic_limits()
+    if token_limit is None:
+        token_limit = limits["tokens"]
+    if isinstance(token_limit, bool) or not isinstance(token_limit, int):
+        raise ValueError("diagnostic token limit must be an integer")
+    if token_limit < 1 or token_limit > limits["tokens"]:
+        raise ValueError("diagnostic token limit exceeds the configured limit")
     with _write_lock:
         session_identity = trace_session_identity(session)
         if _diagnostic_session != session_identity:
@@ -1436,7 +1452,7 @@ def write_hidden_diagnostic(
             _diagnostic_bytes = 0
             _diagnostic_session = session_identity
         token_count, source_dtype, estimated_bytes = _diagnostic_tensor_metadata(
-            value, limits["tokens"], expected_width
+            value, token_limit, expected_width
         )
         filename = (
             f"{_process_side}-rank-{_process_rank}-pp-{_process_pp_rank}-"
@@ -1472,7 +1488,7 @@ def write_hidden_diagnostic(
                 or existing_bytes + estimated_bytes > limits["max_bytes"]
             ):
                 raise ValueError("parity diagnostic file or byte limit exceeded")
-            array, source_dtype = _diagnostic_array(value, limits["tokens"])
+            array, source_dtype = _diagnostic_array(value, token_limit)
             if array.shape[0] != token_count:
                 raise ValueError("diagnostic tensor changed during capture")
             temporary = root / f".{filename}.{os.getpid()}"
@@ -1740,6 +1756,62 @@ def _capture_trainer_decoder_input(_module: Any, inputs: Any, layer: int) -> Non
     write_hidden_diagnostic(f"layer{layer}_input", inputs[0])
 
 
+def _capture_layer0_normalized_input(
+    _module: Any, _inputs: Any, output: Any
+) -> None:
+    if not hasattr(output, "detach"):
+        raise ValueError("layer 0 normalized input is not a tensor")
+    write_hidden_diagnostic(
+        "layer0_normalized_input", output, expected_width=6144, token_limit=1
+    )
+
+
+def _capture_layer0_normalized_kv(
+    _module: Any, _inputs: Any, output: Any
+) -> None:
+    if not hasattr(output, "detach"):
+        raise ValueError("layer 0 normalized KV value is not a tensor")
+    write_hidden_diagnostic(
+        "layer0_normalized_kv", output, expected_width=512, token_limit=1
+    )
+
+
+def _capture_layer0_o_proj_input(_module: Any, inputs: Any) -> None:
+    if not isinstance(inputs, tuple) or not inputs or not hasattr(inputs[0], "detach"):
+        raise ValueError("layer 0 output projection input is not a tensor")
+    value = inputs[0]
+    width = int(value.shape[-1])
+    if width == 16384:
+        value = value[..., :2048]
+    elif width != 2048:
+        raise ValueError("layer 0 output projection input has an invalid width")
+    write_hidden_diagnostic(
+        "layer0_o_proj_input_tp0", value, expected_width=2048, token_limit=1
+    )
+
+
+def _install_layer0_token_diagnostics(layer: Any) -> None:
+    input_norm = getattr(layer, "input_layernorm", None)
+    attention = getattr(layer, "self_attn", None)
+    attention_modules = getattr(attention, "mla_attn", attention)
+    kv_norm = getattr(attention_modules, "kv_a_layernorm", None)
+    output_projection = getattr(attention_modules, "o_proj", None)
+    if any(
+        module is None or not hasattr(module, "register_forward_hook")
+        for module in (input_norm, kv_norm, output_projection)
+    ) or not hasattr(output_projection, "register_forward_pre_hook"):
+        raise ValueError("layer 0 token diagnostics cannot find attention boundaries")
+    _diagnostic_hooks.append(
+        input_norm.register_forward_hook(_capture_layer0_normalized_input)
+    )
+    _diagnostic_hooks.append(
+        kv_norm.register_forward_hook(_capture_layer0_normalized_kv)
+    )
+    _diagnostic_hooks.append(
+        output_projection.register_forward_pre_hook(_capture_layer0_o_proj_input)
+    )
+
+
 def configure_hidden_diagnostics(
     language_model: Any, layer_start: int, layer_end: int
 ) -> None:
@@ -1794,6 +1866,8 @@ def configure_hidden_diagnostics(
                 )
             )
         )
+        if layer_number == 0:
+            _install_layer0_token_diagnostics(layer)
 
 
 def _capture_h200_attention_boundary(
@@ -1901,6 +1975,8 @@ def configure_h200_boundary_diagnostics(model: Any) -> None:
                 )
             )
         )
+        if layer_number == 0:
+            _install_layer0_token_diagnostics(layer)
 
 
 def _lifecycle_path(root: Path, rank: int) -> Path:

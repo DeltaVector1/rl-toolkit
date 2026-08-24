@@ -58,6 +58,9 @@ from prime_rl.parity_router_trace import (
     _capture_h200_layer_boundary,
     _capture_h200_attention_boundary,
     _capture_h200_mlp_boundary,
+    _capture_layer0_normalized_input,
+    _capture_layer0_normalized_kv,
+    _capture_layer0_o_proj_input,
     _slice_diagnostic_tokens,
     _hidden_stream,
     _router_logits,
@@ -1027,10 +1030,10 @@ class ParityRouterTraceTest(unittest.TestCase):
         with patch.dict(os.environ, environment, clear=True):
             trainer = diagnostic_capture_preflight(metadata, "trainer")
             h200 = diagnostic_capture_preflight(metadata, "h200")
-        self.assertEqual(trainer["files"], 14)
-        self.assertEqual(trainer["estimated_bytes"], 88_997_888)
-        self.assertEqual(h200["files"], 20)
-        self.assertEqual(h200["estimated_bytes"], 96_485_376)
+        self.assertEqual(trainer["files"], 17)
+        self.assertEqual(trainer["estimated_bytes"], 89_229_312)
+        self.assertEqual(h200["files"], 23)
+        self.assertEqual(h200["estimated_bytes"], 96_716_800)
         self.assertEqual(len(h200["names"]), len(set(h200["names"])))
 
     def test_diagnostic_plan_refuses_existing_cap_overflow(self):
@@ -1093,6 +1096,36 @@ class ParityRouterTraceTest(unittest.TestCase):
             with np.load(path, allow_pickle=False) as saved:
                 self.assertEqual(saved["values"].shape, (2, 6144))
                 self.assertEqual(saved["session_identity"].item(), trace_session_identity(session()))
+
+    def test_token0_diagnostic_uses_one_token(self):
+        torch = fake_torch()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_session(root, session())
+            environment = {
+                trace_dir_env: str(root),
+                "PRIME_PARITY_DIAGNOSTICS": "1",
+                "PRIME_PARITY_DIAGNOSTIC_TOKENS": "256",
+                "PRIME_PARITY_DIAGNOSTIC_MAX_FILES": "1",
+                "PRIME_PARITY_DIAGNOSTIC_MAX_BYTES": "100000",
+            }
+            values = FakeTensor(np.ones((256, 6144), dtype=np.float32))
+            with patch.dict(os.environ, environment, clear=True), patch.dict(
+                sys.modules, {"torch": torch}
+            ):
+                configure_process_trace("trainer", rank=0)
+                write_hidden_diagnostic(
+                    "layer0_normalized_input",
+                    values,
+                    expected_width=6144,
+                    token_limit=1,
+                )
+            path = (
+                root
+                / "trainer-rank-0-pp-0-cp-0-diagnostic-layer0_normalized_input.npz"
+            )
+            with np.load(path, allow_pickle=False) as saved:
+                self.assertEqual(saved["values"].shape, (1, 6144))
 
     def test_h200_diagnostics_are_retained_with_content_validation(self):
         import hashlib
@@ -1202,7 +1235,7 @@ class ParityRouterTraceTest(unittest.TestCase):
                 )
             copied = output / retained["entries"][0]["file"]
             self.assertTrue(copied.is_file())
-            self.assertEqual(retained["files"], 20)
+            self.assertEqual(retained["files"], 23)
             self.assertEqual(retained["binding"], binding)
             with np.load(copied, allow_pickle=False) as stored:
                 self.assertEqual(stored["values"].dtype, np.float32)
@@ -2753,6 +2786,36 @@ class ParityRouterTraceTest(unittest.TestCase):
             _capture_h200_attention_boundary(None, (), value, 0)
             _capture_h200_mlp_boundary(None, (), value, 0)
         self.assertEqual([name for name, _ in captured], ["layer0_attention_raw", "layer0_mlp_raw"])
+
+    def test_layer0_token_boundaries_are_named_and_sliced(self):
+        captured = []
+        normalized = FakeTensor(np.ones((4, 6144), dtype=np.float32))
+        normalized_kv = FakeTensor(np.ones((4, 512), dtype=np.float32))
+        projection_input = FakeTensor(np.arange(4 * 16384).reshape(4, 16384))
+        with patch(
+            "prime_rl.parity_router_trace.write_hidden_diagnostic",
+            lambda name, tensor, **kwargs: captured.append(
+                (name, tensor.value.copy(), kwargs)
+            ),
+        ):
+            _capture_layer0_normalized_input(None, (), normalized)
+            _capture_layer0_normalized_kv(None, (), normalized_kv)
+            _capture_layer0_o_proj_input(None, (projection_input,))
+        self.assertEqual(
+            [name for name, _value, _kwargs in captured],
+            [
+                "layer0_normalized_input",
+                "layer0_normalized_kv",
+                "layer0_o_proj_input_tp0",
+            ],
+        )
+        self.assertEqual([value.shape for _name, value, _kwargs in captured], [
+            (4, 6144),
+            (4, 512),
+            (4, 2048),
+        ])
+        self.assertTrue(all(item[2]["token_limit"] == 1 for item in captured))
+        np.testing.assert_array_equal(captured[2][1], projection_input.value[:, :2048])
 
     def test_direct_h200_diagnostic_creates_and_clears_session_context(self):
         import prime_rl.parity_router_trace as trace_module

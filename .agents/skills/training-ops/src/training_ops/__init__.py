@@ -3552,31 +3552,6 @@ def _diagnostic_capture_preflight(
     env = config.get("env_vars", {})
     if env.get("PRIME_PARITY_DIAGNOSTICS") != "1":
         return {"files": 0, "estimated_bytes": 0}
-    names = ["embedding"]
-    for layer in range(3):
-        names.extend(
-            (
-                f"layer{layer}_input",
-                f"layer{layer}_attention_raw",
-                f"layer{layer}_mlp_raw",
-                f"layer{layer}_output",
-            )
-        )
-    names.append("layer3_router_input")
-    widths = [6144] * len(names)
-    if side == "h200":
-        extra = {
-            "layer3_h200_input": 6144,
-            "layer3_h200_logits": 256,
-            "layer3_h200_scores": 256,
-            "layer3_h200_selection_scores": 256,
-            "layer3_h200_route_ids": 8,
-            "layer3_h200_route_weights": 8,
-        }
-        names.extend(extra)
-        widths.extend(extra.values())
-    if len(names) != len(set(names)):
-        raise Refused("diagnostic capture plan contains duplicate semantic files")
     limit_names = (
         "PRIME_PARITY_DIAGNOSTIC_TOKENS",
         "PRIME_PARITY_DIAGNOSTIC_MAX_FILES",
@@ -3590,6 +3565,38 @@ def _diagnostic_capture_preflight(
     ):
         raise Refused("diagnostic capture limits are invalid")
     tokens, max_files, max_bytes = (int(value) for value in limit_values)
+    names = ["embedding"]
+    for layer in range(3):
+        names.extend(
+            (
+                f"layer{layer}_input",
+                f"layer{layer}_attention_raw",
+                f"layer{layer}_mlp_raw",
+                f"layer{layer}_output",
+            )
+        )
+    names.append("layer3_router_input")
+    capture_shapes = [(tokens, 6144)] * len(names)
+    for name, width in (
+        ("layer0_normalized_input", 6144),
+        ("layer0_normalized_kv", 512),
+        ("layer0_o_proj_input_tp0", 2048),
+    ):
+        names.append(name)
+        capture_shapes.append((1, width))
+    if side == "h200":
+        extra = {
+            "layer3_h200_input": 6144,
+            "layer3_h200_logits": 256,
+            "layer3_h200_scores": 256,
+            "layer3_h200_selection_scores": 256,
+            "layer3_h200_route_ids": 8,
+            "layer3_h200_route_weights": 8,
+        }
+        names.extend(extra)
+        capture_shapes.extend((tokens, width) for width in extra.values())
+    if len(names) != len(set(names)):
+        raise Refused("diagnostic capture plan contains duplicate semantic files")
     qualification_root = env.get("PRIME_PARITY_QUALIFICATION_ROOT")
     if (
         not isinstance(qualification_root, str)
@@ -3597,7 +3604,10 @@ def _diagnostic_capture_preflight(
         or PurePosixPath(qualification_root).as_posix() != qualification_root
     ):
         raise Refused("diagnostic qualification root is invalid")
-    estimated_bytes = sum(tokens * width * 4 + 64 * 1024 for width in widths)
+    estimated_bytes = sum(
+        entry_tokens * width * 4 + 64 * 1024
+        for entry_tokens, width in capture_shapes
+    )
     if len(names) > max_files or estimated_bytes > max_bytes:
         raise Refused("diagnostic capture plan exceeds its configured cap")
     return {
