@@ -143,7 +143,82 @@ def _metadata_with_quantized_pairs():
     )
 
 
+def _metadata_with_glm_qkv_a():
+    pairs = {
+        "model.layers.0.self_attn.q_a_proj": ((2048, 6144), (16, 48)),
+        "model.layers.0.self_attn.kv_a_proj_with_mqa": ((576, 6144), (5, 48)),
+    }
+    state_dict_metadata = {}
+    storage_data = {}
+    for prefix, (weight_shape, scale_shape) in pairs.items():
+        for suffix, shape, dtype in (
+            (".weight", weight_shape, torch.float8_e4m3fn),
+            (".weight_scale_inv", scale_shape, torch.float32),
+        ):
+            key = prefix + suffix
+            state_dict_metadata[key] = _tensor_metadata(shape, dtype)
+            storage_data[MetadataIndex(key, torch.Size((0, 0)))] = _HFStorageInfo(
+                relative_path="model.safetensors",
+                shape=torch.Size(shape),
+                dtype=dtype,
+            )
+    return Metadata(
+        state_dict_metadata=state_dict_metadata,
+        storage_data=storage_data,
+    )
+
+
 class FP8CheckpointStorageReaderTest(unittest.TestCase):
+    def test_glm_qkv_a_metadata_is_packed_q_then_kv_once(self):
+        metadata = _metadata_with_glm_qkv_a()
+        reader = object.__new__(FP8CheckpointStorageReader)
+        reader.dequantize_all = False
+        reader.fuse_glm_qkv_a = True
+
+        with patch.object(
+            HuggingFaceStorageReader,
+            "read_metadata",
+            return_value=metadata,
+        ):
+            rewritten = reader.read_metadata()
+
+        weight_key = "model.layers.0.self_attn.q_a_proj.weight"
+        scale_key = "model.layers.0.self_attn.q_a_proj.weight_scale_inv"
+        self.assertEqual(
+            tuple(rewritten.state_dict_metadata[weight_key].size), (2624, 6144)
+        )
+        self.assertEqual(
+            tuple(rewritten.state_dict_metadata[scale_key].size), (21, 48)
+        )
+        self.assertNotIn(
+            "model.layers.0.self_attn.kv_a_proj_with_mqa.weight",
+            rewritten.state_dict_metadata,
+        )
+        weight_sources = {
+            tuple(index.offset): info.source_key
+            for index, info in rewritten.storage_data.items()
+            if index.fqn == weight_key
+        }
+        scale_sources = {
+            tuple(index.offset): info.source_key
+            for index, info in rewritten.storage_data.items()
+            if index.fqn == scale_key
+        }
+        self.assertEqual(
+            weight_sources,
+            {
+                (0, 0): "model.layers.0.self_attn.q_a_proj.weight",
+                (2048, 0): "model.layers.0.self_attn.kv_a_proj_with_mqa.weight",
+            },
+        )
+        self.assertEqual(
+            scale_sources,
+            {
+                (0, 0): "model.layers.0.self_attn.q_a_proj.weight_scale_inv",
+                (16, 0): "model.layers.0.self_attn.kv_a_proj_with_mqa.weight_scale_inv",
+            },
+        )
+
     def test_every_fp8_scale_pair_is_marked_quantized_after_metadata_rewrite(self):
         metadata = _metadata_with_quantized_pairs()
         reader = object.__new__(FP8CheckpointStorageReader)

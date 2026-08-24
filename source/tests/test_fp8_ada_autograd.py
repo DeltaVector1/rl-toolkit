@@ -1182,6 +1182,65 @@ class FP8AdaAutogradTest(unittest.TestCase):
         self.assertIsInstance(model.self_attn.o_proj, fp8_ada.FP8CheckpointLinear)
         self.assertIsInstance(model.mlp.up_proj, fp8_ada.FP8CheckpointLinear)
 
+    def test_glm_q_and_kv_a_use_one_exact_packed_fp8_owner(self):
+        decoder_type = type("GlmMoeDsaDecoderLayer", (nn.Module,), {})
+        model = nn.Module()
+        model.config = types.SimpleNamespace(
+            model_type="glm_moe_dsa",
+            quantization_config={"modules_to_not_convert": []},
+        )
+        model.layers = nn.ModuleList([decoder_type()])
+        attention = nn.Module()
+        with torch.device("meta"):
+            attention.q_a_proj = nn.Linear(6144, 2048, bias=False)
+            attention.kv_a_proj_with_mqa = nn.Linear(6144, 576, bias=False)
+        model.layers[0].self_attn = attention
+
+        fp8_ada.replace_linear(model, fused_qkv_a_fp8=True)
+
+        q_projection = model.layers[0].self_attn.q_a_proj
+        kv_projection = model.layers[0].self_attn.kv_a_proj_with_mqa
+        self.assertIsInstance(q_projection, fp8_ada.FP8CheckpointFusedQKVA)
+        self.assertIsInstance(kv_projection, fp8_ada.FP8CheckpointFusedQKVASlice)
+        self.assertIs(kv_projection.owner, q_projection)
+        self.assertEqual(tuple(q_projection.weight.shape), (2624, 6144))
+        self.assertEqual(tuple(q_projection.weight_scale_inv.shape), (21, 48))
+        self.assertEqual(q_projection.weight.dtype, torch.float8_e4m3fn)
+        self.assertEqual(q_projection.weight_scale_inv.dtype, torch.float32)
+        self.assertEqual(tuple(kv_projection.weight.shape), (576, 6144))
+
+    def test_glm_fused_qkv_a_runs_one_combined_autograd_call(self):
+        with torch.device("meta"):
+            owner = fp8_ada.FP8CheckpointFusedQKVA()
+            value = torch.empty(3, 6144, dtype=torch.bfloat16)
+            combined = torch.empty(3, 2624, dtype=torch.bfloat16)
+
+        with mock.patch.object(
+            fp8_ada._FusedQKVALinear,
+            "apply",
+            return_value=combined,
+        ) as apply:
+            q_value, kv_value = owner.split(value)
+
+        apply.assert_called_once_with(
+            value,
+            owner.weight,
+            owner.weight_scale_inv,
+            "<unassigned-fused-qkv-a>",
+            (owner, "weight", "weight_scale_inv"),
+        )
+        self.assertEqual(tuple(q_value.shape), (3, 2048))
+        self.assertEqual(tuple(kv_value.shape), (3, 576))
+
+    def test_glm_fused_qkv_a_rejects_wrong_shape(self):
+        with torch.device("meta"):
+            q_projection = nn.Linear(6144, 2048, bias=False)
+            kv_projection = nn.Linear(6144, 512, bias=False)
+        with self.assertRaisesRegex(ValueError, "shapes must be"):
+            fp8_ada.FP8CheckpointFusedQKVA.from_linears(
+                q_projection, kv_projection
+            )
+
     def test_bf16_module_names_fail_closed(self):
         with self.assertRaisesRegex(ValueError, "must be unique"):
             fp8_ada.exact_module_patterns(("q_a_proj", "q_a_proj"))

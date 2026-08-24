@@ -153,6 +153,8 @@ class FP8Config(BaseConfig):
     ignore_patterns: list[str] = _DEFAULT_FP8_IGNORE_PATTERNS
     bf16_modules: list[str] = []
     w8a16_modules: list[str] = []
+    fused_qkv_a_fp8: bool = False
+    """Use one packed checkpoint-FP8 projection for GLM Q-A and KV-A."""
 
 
 class MXFP8Config(BaseConfig):

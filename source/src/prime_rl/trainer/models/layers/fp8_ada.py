@@ -1,6 +1,7 @@
 import math
 import os
 import re
+import weakref
 
 import torch
 import torch.distributed as dist
@@ -724,6 +725,62 @@ class _W8A16Linear(torch.autograd.Function):
         return input_grad, None, None, None, None
 
 
+class _FusedQKVALinear(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight, scale, fqn, owner):
+        ctx.owner = owner
+        ctx.fqn = fqn
+        if owner is not None:
+            ctx.weight_snapshot = None
+            ctx.scale_snapshot = None
+            ctx.snapshot_key = None
+        elif in_reentrant_block_checkpoint():
+            ctx.weight_snapshot = weight
+            ctx.scale_snapshot = scale
+            ctx.snapshot_key = None
+        elif ctx.needs_input_grad[0]:
+            ctx.weight_snapshot, ctx.scale_snapshot = _acquire_linear_snapshot(
+                fqn, weight, scale
+            )
+            ctx.snapshot_key = fqn
+        else:
+            ctx.weight_snapshot = weight
+            ctx.scale_snapshot = scale
+            ctx.snapshot_key = None
+        try:
+            return _linear(x, weight, scale)
+        except BaseException:
+            if ctx.snapshot_key is not None:
+                _release_linear_snapshot(ctx.snapshot_key)
+                ctx.snapshot_key = None
+            raise
+
+    @staticmethod
+    def backward(ctx, grad):
+        if ctx.owner is not None:
+            owner, weight_name, scale_name = ctx.owner
+            weight = getattr(owner, weight_name)
+            scale = getattr(owner, scale_name)
+            if isinstance(weight, DTensor):
+                weight = weight.to_local()
+            if isinstance(scale, DTensor):
+                scale = scale.to_local()
+        else:
+            weight = ctx.weight_snapshot
+            scale = ctx.scale_snapshot
+        try:
+            input_grad = _w8a16_input_grad(grad, weight, scale, fqn=ctx.fqn)
+            if ctx.owner is not None:
+                fence = getattr(ctx.owner[0], "_w8a16_backward_fence", None)
+                if fence is not None:
+                    fence.record(input_grad.device)
+        finally:
+            if ctx.snapshot_key is not None:
+                _release_linear_snapshot(ctx.snapshot_key)
+            del ctx.weight_snapshot, ctx.scale_snapshot, ctx.owner
+        return input_grad, None, None, None, None
+
+
 class FP8CheckpointLinear(nn.Linear):
     def forward(self, x):
         fqn = getattr(self, "_fp8_fqn", f"<unassigned-fp8-linear:{id(self)}>")
@@ -771,11 +828,190 @@ class FP8CheckpointLinear(nn.Linear):
         return module
 
 
+class FP8CheckpointFusedQKVA(nn.Module):
+    input_size = 6144
+    q_output_size = 2048
+    kv_output_size = 576
+
+    def __init__(self, *, device: torch.device | str | None = None) -> None:
+        super().__init__()
+        self.in_features = self.input_size
+        self.out_features = self.q_output_size
+        self.bias = None
+        output_size = self.q_output_size + self.kv_output_size
+        self.weight = nn.Parameter(
+            torch.empty(
+                output_size,
+                self.input_size,
+                device=device,
+                dtype=torch.float8_e4m3fn,
+            ),
+            requires_grad=False,
+        )
+        self.weight_scale_inv = nn.Parameter(
+            torch.empty(
+                math.ceil(output_size / 128),
+                self.input_size // 128,
+                device=device,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+
+    @classmethod
+    def from_linears(cls, q_projection: nn.Linear, kv_projection: nn.Linear):
+        if q_projection.bias is not None or kv_projection.bias is not None:
+            raise ValueError("fused GLM Q-A and KV-A projections do not support bias")
+        expected = (
+            cls.input_size,
+            cls.q_output_size,
+            cls.kv_output_size,
+        )
+        actual = (
+            q_projection.in_features,
+            q_projection.out_features,
+            kv_projection.out_features,
+        )
+        if (
+            kv_projection.in_features != q_projection.in_features
+            or actual != expected
+        ):
+            raise ValueError(
+                "fused GLM Q-A and KV-A shapes must be "
+                f"input={expected[0]}, q={expected[1]}, kv={expected[2]}; got "
+                f"q={tuple(q_projection.weight.shape)}, "
+                f"kv={tuple(kv_projection.weight.shape)}"
+            )
+        return cls(device=q_projection.weight.device)
+
+    def combined(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dtype != torch.bfloat16:
+            raise TypeError(
+                f"fused GLM Q-A and KV-A input must be BF16, got {x.dtype}"
+            )
+        if self.weight.dtype != torch.float8_e4m3fn:
+            raise TypeError(
+                "fused GLM Q-A and KV-A weight must be FP8 E4M3FN, "
+                f"got {self.weight.dtype}"
+            )
+        if self.weight_scale_inv.dtype != torch.float32:
+            raise TypeError(
+                "fused GLM Q-A and KV-A scales must be FP32, "
+                f"got {self.weight_scale_inv.dtype}"
+            )
+        if self.weight.device != x.device or self.weight_scale_inv.device != x.device:
+            raise ValueError(
+                "fused GLM Q-A and KV-A input, weight, and scales must use one device"
+            )
+        expected_weight = (
+            self.q_output_size + self.kv_output_size,
+            self.input_size,
+        )
+        expected_scale = (
+            math.ceil(expected_weight[0] / 128),
+            self.input_size // 128,
+        )
+        if tuple(self.weight.shape) != expected_weight:
+            raise ValueError(
+                f"fused GLM Q-A and KV-A weight has shape {tuple(self.weight.shape)}; "
+                f"expected {expected_weight}"
+            )
+        if tuple(self.weight_scale_inv.shape) != expected_scale:
+            raise ValueError(
+                "fused GLM Q-A and KV-A scale has shape "
+                f"{tuple(self.weight_scale_inv.shape)}; expected {expected_scale}"
+            )
+        if x.shape[-1] != self.input_size:
+            raise ValueError(
+                f"fused GLM Q-A and KV-A input width is {x.shape[-1]}; "
+                f"expected {self.input_size}"
+            )
+        fqn = getattr(self, "_fp8_fqn", "<unassigned-fused-qkv-a>")
+        return _FusedQKVALinear.apply(
+            x,
+            self.weight,
+            self.weight_scale_inv,
+            fqn,
+            (self, "weight", "weight_scale_inv"),
+        )
+
+    def split(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.combined(x).split(
+            (self.q_output_size, self.kv_output_size), dim=-1
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.split(x)[0]
+
+
+class FP8CheckpointFusedQKVASlice(nn.Module):
+    def __init__(self, owner: FP8CheckpointFusedQKVA) -> None:
+        super().__init__()
+        object.__setattr__(self, "_owner_ref", weakref.ref(owner))
+        self.in_features = owner.input_size
+        self.out_features = owner.kv_output_size
+        self.bias = None
+
+    @property
+    def owner(self) -> FP8CheckpointFusedQKVA:
+        owner = self._owner_ref()
+        if owner is None:
+            raise RuntimeError("fused GLM Q-A and KV-A owner no longer exists")
+        return owner
+
+    @property
+    def weight(self) -> torch.Tensor:
+        return self.owner.weight.narrow(
+            0, self.owner.q_output_size, self.owner.kv_output_size
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.owner.split(x)[1]
+
+
+def replace_glm_qkv_a(model: nn.Module) -> int:
+    if getattr(getattr(model, "config", None), "model_type", None) != "glm_moe_dsa":
+        raise ValueError("fused Q-A and KV-A FP8 is only valid for GLM-MoE-DSA")
+    replaced = 0
+    for name, module in list(model.named_modules()):
+        if name.rsplit(".", 1)[-1] != "q_a_proj":
+            continue
+        if not isinstance(module, nn.Linear):
+            raise TypeError(f"{name} must be nn.Linear before fused FP8 replacement")
+        parent_name = name.rsplit(".", 1)[0]
+        parent = model.get_submodule(parent_name)
+        kv_projection = getattr(parent, "kv_a_proj_with_mqa", None)
+        if not isinstance(kv_projection, nn.Linear):
+            raise TypeError(
+                f"{parent_name}.kv_a_proj_with_mqa must be nn.Linear before "
+                "fused FP8 replacement"
+            )
+        fused = FP8CheckpointFusedQKVA.from_linears(module, kv_projection)
+        fused._fp8_fqn = name
+        parent.q_a_proj = fused
+        parent.kv_a_proj_with_mqa = FP8CheckpointFusedQKVASlice(fused)
+        replaced += 1
+    expected = sum(
+        1
+        for module in model.modules()
+        if type(module).__name__ == "GlmMoeDsaDecoderLayer"
+    )
+    if expected == 0 or replaced != expected:
+        raise ValueError(
+            f"fused Q-A and KV-A FP8 replaced {replaced} pairs; expected {expected}"
+        )
+    return replaced
+
+
 def install_w8a16_reshard_wait(module: nn.Module) -> bool:
     linears = [
         child
         for child in module.modules()
-        if isinstance(child, FP8CheckpointLinear) and getattr(child, "w8a16", False)
+        if (
+            isinstance(child, FP8CheckpointLinear)
+            and getattr(child, "w8a16", False)
+        )
+        or isinstance(child, FP8CheckpointFusedQKVA)
     ]
     if not linears:
         return False
@@ -1165,7 +1401,10 @@ def replace_linear(
     ignore_patterns=(),
     w8a16_patterns=(),
     validate_w8a16_patterns=True,
+    fused_qkv_a_fp8=False,
 ):
+    if fused_qkv_a_fp8:
+        replace_glm_qkv_a(model)
     exclusions = set(model.config.quantization_config["modules_to_not_convert"])
     matched_w8a16 = set()
     for name, module in list(model.named_modules()):

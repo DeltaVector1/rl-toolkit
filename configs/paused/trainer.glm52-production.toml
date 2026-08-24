@@ -54,8 +54,8 @@ ac_offloading = "None"
 type = "fp8"
 dequantize_checkpoint = false
 diagnose_linear_backward = false
+fused_qkv_a_fp8 = true
 expert_activation_transport = "int4"
-bf16_modules = ["q_a_proj", "kv_a_proj_with_mqa"]
 w8a16_modules = ["q_b_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "wq_b"]
 
 [model.lora]

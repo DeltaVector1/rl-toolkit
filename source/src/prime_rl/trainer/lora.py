@@ -7,7 +7,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from prime_rl.configs.trainer import LoRAConfig
-from prime_rl.trainer.models.layers.fp8_ada import _Linear
+from prime_rl.trainer.models.layers.fp8_ada import (
+    FP8CheckpointFusedQKVA,
+    FP8CheckpointFusedQKVASlice,
+    _Linear,
+)
 from prime_rl.trainer.models.layers.lora import (
     MultiLoRALinear,
     MultiLoRAModule,
@@ -267,6 +271,8 @@ def _find_target_modules(model: nn.Module, target_patterns: List[str]) -> List[s
             module,
             (
                 nn.Linear,
+                FP8CheckpointFusedQKVA,
+                FP8CheckpointFusedQKVASlice,
                 FP8CheckpointFeedForward,
                 GroupedExperts,
                 NonGatedGroupedExperts,
@@ -321,7 +327,10 @@ def _validate_glm_lora_targets(
     expected = set()
     for name, module in model.named_modules():
         final_name = name.rsplit(".", 1)[-1]
-        if isinstance(module, nn.Linear) and final_name in attention_names:
+        if isinstance(
+            module,
+            (nn.Linear, FP8CheckpointFusedQKVA, FP8CheckpointFusedQKVASlice),
+        ) and final_name in attention_names:
             expected.add(name)
         elif (
             isinstance(module, nn.Linear)
@@ -436,7 +445,10 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> None:
         base_module = _get_module_by_name(model, module_name)
 
         # Handle Linear layers
-        if isinstance(base_module, nn.Linear):
+        if isinstance(
+            base_module,
+            (nn.Linear, FP8CheckpointFusedQKVA, FP8CheckpointFusedQKVASlice),
+        ):
             lora_module = MultiLoRALinear(
                 base_layer=base_module,
                 rank=config.rank,

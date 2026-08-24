@@ -14,6 +14,10 @@ _EXPERT = re.compile(
     r"^(model\.layers\.\d+\.mlp)\.experts\.(\d+)\.(gate|down|up)_proj\.(weight|weight_scale_inv)$"
 )
 _PROJECTIONS = {"gate": "w1", "down": "w2", "up": "w3"}
+_GLM_QKV_A = re.compile(
+    r"^(model\.layers\.\d+\.self_attn)\.(q_a_proj|kv_a_proj_with_mqa)\."
+    r"(weight|weight_scale_inv)$"
+)
 
 
 @dataclasses.dataclass
@@ -26,9 +30,107 @@ class _FP8StorageInfo(_HFStorageInfo):
 
 
 class FP8CheckpointStorageReader(HuggingFaceStorageReader):
-    def __init__(self, *args, dequantize_all: bool = False, **kwargs):
+    def __init__(
+        self,
+        *args,
+        dequantize_all: bool = False,
+        fuse_glm_qkv_a: bool = False,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.dequantize_all = dequantize_all
+        self.fuse_glm_qkv_a = fuse_glm_qkv_a
+
+    def _fuse_glm_qkv_a_metadata(self, metadata, storage_by_fqn) -> None:
+        groups: dict[tuple[str, str], dict[str, str]] = {}
+        for key in list(metadata.state_dict_metadata):
+            match = _GLM_QKV_A.match(key)
+            if match is None:
+                continue
+            prefix, projection, kind = match.groups()
+            groups.setdefault((prefix, kind), {})[projection] = key
+
+        expected_groups = sum(
+            1
+            for key in metadata.state_dict_metadata
+            if key.endswith(".self_attn.q_a_proj.weight")
+        ) * 2
+        if len(groups) != expected_groups:
+            raise ValueError(
+                f"GLM fused Q-A and KV-A found {len(groups)} weight groups; "
+                f"expected {expected_groups}"
+            )
+
+        for (prefix, kind), sources in groups.items():
+            if set(sources) != {"q_a_proj", "kv_a_proj_with_mqa"}:
+                raise ValueError(
+                    f"GLM fused Q-A and KV-A checkpoint is incomplete at {prefix}"
+                )
+            q_source = sources["q_a_proj"]
+            kv_source = sources["kv_a_proj_with_mqa"]
+            q_metadata = metadata.state_dict_metadata.pop(q_source)
+            kv_metadata = metadata.state_dict_metadata.pop(kv_source)
+            if len(q_metadata.size) != 2 or len(kv_metadata.size) != 2:
+                raise ValueError(
+                    f"GLM fused Q-A and KV-A tensors must be matrices at {prefix}"
+                )
+            if q_metadata.size[1] != kv_metadata.size[1]:
+                raise ValueError(f"GLM fused Q-A and KV-A input sizes differ at {prefix}")
+            if kind == "weight":
+                expected_q, expected_kv, expected_input = 2048, 576, 6144
+                expected_dtype = torch.float8_e4m3fn
+            else:
+                expected_q, expected_kv, expected_input = 16, 5, 48
+                expected_dtype = torch.float32
+            if (
+                q_metadata.properties.dtype != expected_dtype
+                or kv_metadata.properties.dtype != expected_dtype
+            ):
+                raise TypeError(
+                    f"GLM fused Q-A and KV-A {kind} must use {expected_dtype} at "
+                    f"{prefix}; got q={q_metadata.properties.dtype}, "
+                    f"kv={kv_metadata.properties.dtype}"
+                )
+            if tuple(q_metadata.size) != (expected_q, expected_input) or tuple(
+                kv_metadata.size
+            ) != (expected_kv, expected_input):
+                raise ValueError(
+                    f"GLM fused Q-A and KV-A {kind} shapes differ at {prefix}: "
+                    f"q={tuple(q_metadata.size)}, kv={tuple(kv_metadata.size)}"
+                )
+
+            target = f"{prefix}.q_a_proj.{kind}"
+            chunks = [
+                ChunkStorageMetadata(
+                    offsets=torch.Size((0, 0)),
+                    sizes=q_metadata.size,
+                ),
+                ChunkStorageMetadata(
+                    offsets=torch.Size((expected_q, 0)),
+                    sizes=kv_metadata.size,
+                ),
+            ]
+            metadata.state_dict_metadata[target] = TensorStorageMetadata(
+                properties=q_metadata.properties,
+                size=torch.Size((expected_q + expected_kv, expected_input)),
+                chunks=chunks,
+            )
+            self._move_storage(
+                metadata,
+                storage_by_fqn,
+                q_source,
+                target,
+                torch.Size((0, 0)),
+                quantized=kind == "weight",
+            )
+            self._move_storage(
+                metadata,
+                storage_by_fqn,
+                kv_source,
+                target,
+                torch.Size((expected_q, 0)),
+                quantized=kind == "weight",
+            )
 
     def read_metadata(self):
         metadata = super().read_metadata()
@@ -125,6 +227,8 @@ class FP8CheckpointStorageReader(HuggingFaceStorageReader):
                         dequantize=dequantize,
                         bitcast=bitcast,
                     )
+        if getattr(self, "fuse_glm_qkv_a", False):
+            self._fuse_glm_qkv_a_metadata(metadata, storage_by_fqn)
         return metadata
 
     @staticmethod

@@ -8,6 +8,10 @@ import triton.language as tl
 from torch import nn
 from torch.distributed.tensor import DTensor
 
+from prime_rl.trainer.models.layers.fp8_ada import (
+    FP8CheckpointFusedQKVA,
+    FP8CheckpointFusedQKVASlice,
+)
 from prime_rl.trainer.models.layers.lora.base import MultiLoRAModule, get_lora_num_tokens, get_multilora_scaling
 
 
@@ -266,11 +270,19 @@ class _FusedFrozenLinearPair(torch.autograd.Function):
 
 def fused_frozen_linear_pair(
     x: torch.Tensor,
-    first: nn.Linear,
-    second: nn.Linear,
+    first: nn.Linear | FP8CheckpointFusedQKVA,
+    second: nn.Linear | FP8CheckpointFusedQKVASlice,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if first.bias is not None or second.bias is not None:
         raise ValueError("fused Q/KV-A base projections do not support bias")
+    if isinstance(first, FP8CheckpointFusedQKVA):
+        if not isinstance(second, FP8CheckpointFusedQKVASlice):
+            raise TypeError("fused FP8 Q-A requires its fused KV-A slice")
+        if second.owner is not first:
+            raise ValueError("fused FP8 Q-A and KV-A do not share one owner")
+        return first.split(x)
+    if isinstance(second, FP8CheckpointFusedQKVASlice):
+        raise TypeError("fused FP8 KV-A requires its fused Q-A owner")
     combined = _FusedFrozenLinearPair.apply(x, first, second)
     return combined.split((first.out_features, second.out_features), dim=-1)
 

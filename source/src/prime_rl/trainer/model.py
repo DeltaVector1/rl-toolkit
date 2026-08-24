@@ -1465,6 +1465,9 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
         reader = FP8CheckpointStorageReader(
             path=snapshot_path.as_posix(),
             dequantize_all=getattr(model.config, "fp8_checkpoint_dequantized", False),
+            fuse_glm_qkv_a=getattr(
+                config.quantization, "fused_qkv_a_fp8", False
+            ),
         )
     else:
         reader = HuggingFaceStorageReader(path=snapshot_path.as_posix())
@@ -1688,6 +1691,10 @@ def apply_quantization(
         ignore_patterns = _fp8_ignore_patterns(quant)
         w8a16_patterns = _fp8_w8a16_patterns(quant)
         if getattr(model.config, "fp8_checkpoint_dequantized", False):
+            if quant.fused_qkv_a_fp8:
+                raise ValueError(
+                    "fused Q-A and KV-A FP8 requires a native FP8 checkpoint"
+                )
             if w8a16_patterns:
                 raise ValueError(
                     "W8A16 modules require a native FP8 checkpoint; "
@@ -1711,6 +1718,7 @@ def apply_quantization(
                 ignore_patterns=ignore_patterns,
                 w8a16_patterns=w8a16_patterns,
                 validate_w8a16_patterns=pp_group is None,
+                fused_qkv_a_fp8=quant.fused_qkv_a_fp8,
             )
             validate_w8a16_matches(
                 matched_w8a16,
@@ -1720,6 +1728,10 @@ def apply_quantization(
             return
         if w8a16_patterns:
             raise ValueError("W8A16 modules require a native FP8 checkpoint")
+        if quant.fused_qkv_a_fp8:
+            raise ValueError(
+                "fused Q-A and KV-A FP8 requires a native FP8 checkpoint"
+            )
         replace_linear_with_fp8_blockwise_linear(
             model, ignore_modules=ignore_patterns
         )
