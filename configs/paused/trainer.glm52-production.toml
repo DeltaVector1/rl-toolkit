@@ -16,7 +16,7 @@ ranks_filter = [0]
 project = "prod-run"
 name = "trainer-glm52-1"
 group = "glm52-decensor-r32"
-tags = ["glm-5.2", "native-fp8", "lora-r32", "full-expert-lora", "pp8", "cp8", "ep8", "64x4090", "b2048", "g16", "32768", "lr8e-6", "production"]
+tags = ["glm-5.2", "native-fp8", "lora-r32", "full-expert-lora", "pp8", "cp8", "ep8", "64x4090", "b1024", "g16", "32768", "lr8e-6", "production"]
 
 [file_monitor]
 filename = "run_glm52-1/trainer-metrics.jsonl"

@@ -27,7 +27,7 @@ def test_only_policy_parity_fake_data_enables_router_replay() -> None:
                 assert enabled is False, path
 
 
-def test_current_glm52_profile_is_batch_2048_without_rollout_cache() -> None:
+def test_current_glm52_profile_is_batch_1024_without_rollout_cache() -> None:
     operations = _load("configs/operations.toml")
     assert set(operations["profiles"]) == {
         "current",
@@ -45,14 +45,14 @@ def test_current_glm52_profile_is_batch_2048_without_rollout_cache() -> None:
     }
     trainer = _load(current["trainer"])
     orchestrator = _load(current["orchestrator"])
-    assert orchestrator["batch_size"] == 2048
+    assert orchestrator["batch_size"] == 1024
     assert "rollout_cache" not in trainer.get("data", {})
 
     for name, profile in operations["profiles"].items():
         profile_trainer = _load(profile["trainer"])
         assert "rollout_cache" not in profile_trainer.get("data", {}), name
         if "orchestrator" in profile:
-            assert _load(profile["orchestrator"])["batch_size"] == 2048, name
+            assert _load(profile["orchestrator"])["batch_size"] == 1024, name
 
     large_batch = operations["profiles"]["glm52-native-b2048"]
     assert "orchestrator" not in large_batch
@@ -64,7 +64,7 @@ def test_current_glm52_profile_is_batch_2048_without_rollout_cache() -> None:
     assert parity_trainer["data"]["fake"]["batch_size"] == 8
     assert parity_trainer["model"]["pp"] == 8
     assert operations["requirements"]["glm52"] == {
-        "batch_size": 2048,
+        "batch_size": 1024,
         "context_length": 32768,
         "trainer_seconds_min": 600,
         "trainer_seconds_max": 900,
@@ -210,7 +210,7 @@ def test_glm52_production_profile_matches_requirements() -> None:
         "orchestrator": "configs/paused/orchestrator.glm52-production.toml",
         "environment": "configs/paused/env.glm52-production.toml",
     }
-    assert orchestrator["batch_size"] == 2048
+    assert orchestrator["batch_size"] == 1024
     assert orchestrator["group_size"] == 16
     assert orchestrator["seq_len"] == 32768
     assert orchestrator["train"]["sampling"]["max_completion_tokens"] == 16384

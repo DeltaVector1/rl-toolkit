@@ -1,7 +1,7 @@
 output_dir = "/data/glm52-rl/runs/glm52-1/run_glm52-1"
 max_steps = 200
 seq_len = 32768
-batch_size = 2048
+batch_size = 1024
 group_size = 16
 max_inflight_episodes = 128
 max_off_policy_steps = 4
@@ -13,7 +13,7 @@ level = "info"
 project = "prod-run"
 name = "orchestrator-glm52-1"
 group = "glm52-decensor-r32"
-tags = ["glm-5.2", "native-fp8", "w8a8-rollouts", "lora-r32", "full-expert-lora", "tp8", "8xh200", "64x4090", "b2048", "g16", "32768", "out16384", "cp8", "lr8e-6", "production"]
+tags = ["glm-5.2", "native-fp8", "w8a8-rollouts", "lora-r32", "full-expert-lora", "tp8", "8xh200", "64x4090", "b1024", "g16", "32768", "out16384", "cp8", "lr8e-6", "production"]
 
 [file_monitor]
 filename = "rollout-metrics.jsonl"

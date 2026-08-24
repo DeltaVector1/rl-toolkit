@@ -127,7 +127,7 @@ trainer_seconds_max = 480
 rollout_seconds_max = 1200
 
 [requirements.glm52]
-batch_size = 2048
+batch_size = 1024
 context_length = 32768
 trainer_seconds_min = 600
 trainer_seconds_max = 900
