@@ -12,6 +12,7 @@ inference_tunnel_last = 18048
 judge = 26406
 adapter = 8100
 batch = 29620
+h200_parity_backend = 8100
 
 [paths]
 remote_repository = "/data/glm52-rl/deployment-glm52-optims"

@@ -779,8 +779,15 @@ def request_json(
 def wait_for_bootstrap_identity(
     base_url: str,
     bootstrap_token: str,
+    expected_process_id: int,
     timeout: float,
 ) -> dict[str, Any]:
+    if (
+        isinstance(expected_process_id, bool)
+        or not isinstance(expected_process_id, int)
+        or expected_process_id <= 0
+    ):
+        raise ValueError("expected H200 API process ID is invalid")
     deadline = time.monotonic() + timeout
     while True:
         try:
@@ -801,7 +808,7 @@ def wait_for_bootstrap_identity(
     expected_sha256 = hashlib.sha256(bootstrap_token.encode("ascii")).hexdigest()
     if (
         ready.get("status") != "ready"
-        or ready.get("process_id") != 1
+        or ready.get("process_id") != expected_process_id
         or re.fullmatch(r"[0-9a-f]{32}", str(ready.get("boot_nonce", ""))) is None
         or ready.get("token_sha256") != expected_sha256
     ):
@@ -972,25 +979,28 @@ def capture_h200(
     fixture: Path,
     output: Path,
     base_url: str,
+    control_url: str,
     model: str,
     model_revision: str,
     adapter_sha256: str,
     image: str,
     api_key_env: str | None,
     bootstrap_token: str,
+    expected_api_process_id: int,
     diagnostic_input: Path | None,
     timeout: float,
 ) -> dict[str, Any]:
     fixture_manifest = load_manifest(fixture, "glm52_policy_parity_fixture")
     check_fresh(profile, fixture, fixture_manifest)
     base = base_url.rstrip("/").removesuffix("/v1")
+    control = control_url.rstrip("/").removesuffix("/v1")
     api_key = os.environ.get(api_key_env) if api_key_env else None
     if api_key_env and api_key is None:
         raise ValueError(f"environment variable {api_key_env} is not set")
     if len(bootstrap_token) != 64:
         raise ValueError("bootstrap token must have 384-bit encoded capacity")
     bootstrap_ready = wait_for_bootstrap_identity(
-        base, bootstrap_token, min(timeout, 120)
+        control, bootstrap_token, expected_api_process_id, min(timeout, 120)
     )
     cards = request_json(
         f"{base}/v1/models", body=None, api_key=api_key, timeout=min(timeout, 120)
@@ -1039,7 +1049,7 @@ def capture_h200(
     )
     graph_full_logprobs = prompt_logprobs(graph_response, token_ids)
     reset = request_json(
-        f"{base}/parity/router-trace/reset",
+        f"{control}/parity/router-trace/reset",
         body=trace_session,
         api_key=bootstrap_token,
         timeout=min(timeout, 120),
@@ -1083,7 +1093,7 @@ def capture_h200(
         raise ValueError(f"H200 routed expert payload is too short: {router_ids.shape}")
     router_ids = validate_router_ids(profile, router_ids[:context])
     route_trace = request_json(
-        f"{base}/parity/router-trace",
+        f"{control}/parity/router-trace",
         body=None,
         api_key=api_key,
         timeout=timeout,
@@ -1144,7 +1154,7 @@ def capture_h200(
             direct_router_diagnostic = run_h200_router_diagnostic(
                 diagnostic_input,
                 Path(session_file.name),
-                base_url,
+                control_url,
                 trace_session["dense_layers"],
                 diagnostic_token,
                 min(timeout, 300.0),
@@ -1175,6 +1185,7 @@ def capture_h200(
         "fixture_sha256": fixture_digest(fixture),
         "profile_sha256": file_sha256(profile.path),
         "base_url": base_url,
+        "control_url": control_url,
         "model": model,
         "graph_request_id": graph_response.get("request_id"),
         "eager_request_id": eager_response.get("request_id"),
@@ -1985,11 +1996,13 @@ def parser() -> argparse.ArgumentParser:
     h200 = commands.add_parser("capture-h200")
     h200.add_argument("--fixture", type=Path, required=True)
     h200.add_argument("--base-url", required=True)
+    h200.add_argument("--control-url", required=True)
     h200.add_argument("--model", required=True)
     h200.add_argument("--model-revision", required=True)
     h200.add_argument("--adapter-sha256", required=True)
     h200.add_argument("--image", required=True)
     h200.add_argument("--api-key-env")
+    h200.add_argument("--expected-api-process-id", type=int, required=True)
     h200.add_argument("--diagnostic-input", type=Path)
     h200.add_argument("--timeout", type=float, default=1800.0)
     h200.add_argument("output", type=Path)
@@ -2075,12 +2088,14 @@ def main(argv: list[str] | None = None) -> int:
                 args.fixture,
                 args.output,
                 args.base_url,
+                args.control_url,
                 args.model,
                 args.model_revision,
                 args.adapter_sha256,
                 args.image,
                 args.api_key_env,
                 read_secret_stdin("bootstrap token", 64, 64),
+                args.expected_api_process_id,
                 args.diagnostic_input,
                 args.timeout,
             )

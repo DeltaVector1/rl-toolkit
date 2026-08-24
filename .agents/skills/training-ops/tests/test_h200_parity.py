@@ -143,6 +143,7 @@ class H200ParityTest(unittest.TestCase):
     def _run_operation(self, ssh_call, secret_call, secret, *, keep_engine=False):
         metadata = json.dumps({"model_revision": "a" * 40, "adapter_sha256": "b" * 64})
         source_root = f"{training_ops.parity_trace_root}/qualification-1"
+        listener_ports = []
 
         def write_transaction(_host, _path, state, _sensitive):
             ssh_call.transaction["state"] = copy.deepcopy(state)
@@ -177,6 +178,21 @@ class H200ParityTest(unittest.TestCase):
             if path == training_ops.glm_parity_paths["h200_capture"]:
                 return "8" * 64
             raise AssertionError(f"unexpected manifest path: {path}")
+
+        def listener_identity(_host, _sensitive, _timeout, port=8000):
+            listener_ports.append(port)
+            is_api = port == training_ops.h200_parity_backend_port
+            return {
+                "listener_port": port,
+                "listener_pid": 1235 if is_api else 1234,
+                "listener_namespace_pid": 22 if is_api else 1,
+                "container_init_pid": 1234,
+                "listener_relation": "child" if is_api else "init",
+                "listener_socket_inode": 901 if is_api else 900,
+                "listener_starttime": 1001 if is_api else 1000,
+                "container_id": "d" * 64,
+                "host_boot_id": "11111111-2222-3333-4444-555555555555",
+            }
 
         with patch.object(
             training_ops.secrets, "token_hex", return_value="1" * 16
@@ -219,21 +235,13 @@ class H200ParityTest(unittest.TestCase):
         ), patch.object(
             training_ops,
             "_h200_parity_listener_identity",
-            return_value={
-                "listener_pid": 1234,
-                "container_init_pid": 1234,
-                "listener_relation": "init",
-                "listener_socket_inode": 900,
-                "listener_starttime": 1000,
-                "container_id": "d" * 64,
-                "host_boot_id": "11111111-2222-3333-4444-555555555555",
-            },
+            side_effect=listener_identity,
         ), patch.object(
             training_ops,
             "_h200_capture_bootstrap_identity",
             return_value={
                 "status": "ready",
-                "process_id": 1,
+                "process_id": 22,
                 "boot_nonce": "e" * 32,
                 "token_sha256": training_ops.hashlib.sha256(
                     secret.encode("ascii")
@@ -248,6 +256,7 @@ class H200ParityTest(unittest.TestCase):
         ):
             result = training_ops.diagnose_glm52_policy_parity("qualification-1", keep_engine=keep_engine)
         self.last_diagnostic_copy = copy_input.call_args
+        self.last_listener_ports = listener_ports
         return result
 
     @staticmethod
@@ -829,15 +838,22 @@ class H200ParityTest(unittest.TestCase):
 
     def test_parity_port_preflight_refuses_listener_or_protected_inference(self):
         with patch.object(
-            training_ops, "_ssh", return_value=(0, "port-8000-free\n")
+            training_ops, "_ssh", return_value=(0, "parity-ports-free\n")
         ) as ssh:
             training_ops._assert_h200_parity_port_free("h200a")
         command = ssh.call_args.args[1]
         self.assertIn("sport = :8000", command)
+        self.assertIn(
+            f"sport = :{training_ops.h200_parity_backend_port}", command
+        )
         for name in training_ops.protected_inference:
             self.assertIn(re.escape(name), command)
 
-        for output in ("port-8000-in-use", "protected-inference-active"):
+        for output in (
+            "port-8000-in-use",
+            f"port-{training_ops.h200_parity_backend_port}-in-use",
+            "protected-inference-active",
+        ):
             with self.subTest(output=output), patch.object(
                 training_ops, "_ssh", return_value=(74, output)
             ), self.assertRaises(training_ops.Refused):
@@ -859,11 +875,13 @@ class H200ParityTest(unittest.TestCase):
                     check=False,
                 )
                 self.assertNotEqual(result.returncode, 0)
-                self.assertNotIn("port-8000-free", result.stdout)
+                self.assertNotIn("parity-ports-free", result.stdout)
 
     def test_listener_identity_binds_port_to_running_isolated_container(self):
         identity = {
+            "listener_port": 8000,
             "listener_pid": 1235,
+            "listener_namespace_pid": 22,
             "container_init_pid": 1234,
             "listener_relation": "child",
             "listener_socket_inode": 900,
@@ -908,6 +926,8 @@ class H200ParityTest(unittest.TestCase):
             "\"$1 (worker name) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 1000\"; }; "
             "_cat_record() { path=${!#}; case \"$path\" in "
             f"*/cgroup) printf '%s\\n' '0::/docker/{container_id}';; "
+            "*/status) pid=${path#/proc/}; pid=${pid%/status}; "
+            "printf 'Name:\\tworker\\nNSpid:\\t%s\\t22\\n' \"$pid\";; "
             "*/stat) pid=${path#/proc/}; pid=${pid%/stat}; _process_stat \"$pid\";; "
             "*/boot_id) printf '%s\\n' 11111111-2222-3333-4444-555555555555;; "
             "*) return 71;; esac; }; "
@@ -942,6 +962,8 @@ class H200ParityTest(unittest.TestCase):
         self.assertEqual(identity["listener_relation"], "child")
         self.assertEqual(identity["listener_socket_inode"], 900)
         self.assertEqual(identity["listener_starttime"], 1000)
+        self.assertEqual(identity["listener_namespace_pid"], 22)
+        self.assertEqual(identity["listener_port"], 8000)
 
         outside = (
             common
@@ -956,6 +978,42 @@ class H200ParityTest(unittest.TestCase):
         )
         self.assertNotEqual(rejected.returncode, 0)
         self.assertIn("parity-listener-error:listener-cgroup-mismatch", rejected.stderr)
+
+    def test_api_listener_identity_requires_loopback_binding(self):
+        port = training_ops.h200_parity_backend_port
+        command = training_ops._h200_parity_listener_identity_command(0, port)
+        container_id = "a" * 64
+        expected_command = json.dumps(
+            [
+                "@",
+                training_ops.glm_parity_inference_config,
+                "--vllm-extra",
+                training_ops.glm_parity_vllm_extra,
+            ],
+            separators=(",", ":"),
+        )
+        common = self._listener_shell_support(container_id, expected_command)
+        loopback = common.replace("*:8000", f"127.0.0.1:{port}")
+        accepted = subprocess.run(
+            ["bash", "-c", loopback + command],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        identity = json.loads(accepted.stdout)
+        self.assertEqual(identity["listener_port"], port)
+        self.assertEqual(identity["listener_namespace_pid"], 22)
+
+        wildcard = common.replace("*:8000", f"*:{port}")
+        rejected = subprocess.run(
+            ["bash", "-c", wildcard + command],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("parity-listener-error:api-listener-not-loopback", rejected.stderr)
 
     def test_listener_identity_shell_failures_are_detailed(self):
         command = training_ops._h200_parity_listener_identity_command(0)
@@ -1136,7 +1194,7 @@ class H200ParityTest(unittest.TestCase):
         secret = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_"
         identity = {
             "status": "ready",
-            "process_id": 1,
+            "process_id": 22,
             "boot_nonce": "f" * 32,
             "token_sha256": training_ops.hashlib.sha256(
                 secret.encode("ascii")
@@ -1151,7 +1209,7 @@ class H200ParityTest(unittest.TestCase):
         ):
             self.assertEqual(
                 training_ops._h200_capture_bootstrap_identity(
-                    "h200a", capture, secret
+                    "h200a", capture, secret, 22
                 ),
                 identity,
             )
@@ -1159,7 +1217,9 @@ class H200ParityTest(unittest.TestCase):
         with patch.object(
             training_ops, "_sensitive_ssh", return_value=json.dumps(wrong)
         ), self.assertRaisesRegex(training_ops.Refused, "identity is invalid"):
-            training_ops._h200_capture_bootstrap_identity("h200a", capture, secret)
+            training_ops._h200_capture_bootstrap_identity(
+                "h200a", capture, secret, 22
+            )
 
     def test_diagnostic_operation_redacts_token_and_cleans_up_after_failure(self):
         commands = []
@@ -1201,6 +1261,16 @@ class H200ParityTest(unittest.TestCase):
         self.assertNotIn(secret, json.dumps(result, sort_keys=True))
         self.assertEqual(result["cleanup_warnings"], [])
         self.assertEqual(result["listener_identity"]["listener_pid"], 1234)
+        self.assertEqual(result["api_listener_identity"]["listener_namespace_pid"], 22)
+        self.assertEqual(
+            self.last_listener_ports,
+            [
+                8000,
+                training_ops.h200_parity_backend_port,
+                training_ops.h200_parity_backend_port,
+                8000,
+            ],
+        )
         self.assertEqual(result["bootstrap_identity"]["boot_nonce"], "e" * 32)
         self.assertEqual(secret_inputs, [secret])
         self.assertEqual(self.last_diagnostic_copy.args[0], training_ops.trainer_head)
@@ -1220,6 +1290,12 @@ class H200ParityTest(unittest.TestCase):
         capture = next(command for command in commands if "capture-h200" in command)
         self.assertIn("docker run --rm -i", capture)
         self.assertNotIn(" -e ", capture)
+        self.assertIn("--base-url http://127.0.0.1:8000", capture)
+        self.assertIn(
+            f"--control-url http://127.0.0.1:{training_ops.h200_parity_backend_port}",
+            capture,
+        )
+        self.assertIn("--expected-api-process-id 22", capture)
         fifo_setup = next(command for command in commands if "mkfifo -m 0600" in command)
         self.assertIn("chown 1000:1000", fifo_setup)
         self.assertIn("1000:1000:600", fifo_setup)

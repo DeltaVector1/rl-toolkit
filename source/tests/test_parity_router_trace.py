@@ -1067,26 +1067,30 @@ class ParityRouterTraceTest(unittest.TestCase):
             nonlocal generate_count, reset_count
             del timeout
             if url.endswith("/parity/bootstrap-ready"):
+                self.assertTrue(url.startswith("http://control"))
                 self.assertEqual(api_key, bootstrap_token)
                 events.append("bootstrap_ready")
                 return {
                     "status": "ready",
-                    "process_id": 1,
+                    "process_id": 22,
                     "boot_nonce": "c" * 32,
                     "token_sha256": parity_script.hashlib.sha256(
                         bootstrap_token.encode("ascii")
                     ).hexdigest(),
                 }
             if url.endswith("/v1/models"):
+                self.assertTrue(url.startswith("http://h200"))
                 events.append("models")
                 return {"data": [{"id": "model", "max_model_len": 3}]}
             if url.endswith("/parity/router-trace/reset"):
+                self.assertTrue(url.startswith("http://control"))
                 self.assertEqual(api_key, bootstrap_token)
                 reset_count += 1
                 events.extend(("reset", "token_issue"))
                 active_session.update(body)
                 return {"session": body, "diagnostic_token": "one-use-secret"}
             if url.endswith("/inference/v1/generate"):
+                self.assertTrue(url.startswith("http://h200"))
                 generate_count += 1
                 events.append("graph_capture" if generate_count == 1 else "eager_capture")
                 result = {"request_id": f"request-{generate_count}"}
@@ -1094,6 +1098,7 @@ class ParityRouterTraceTest(unittest.TestCase):
                     result["choices"] = [{"routed_experts": encoded_ids}]
                 return result
             if url.endswith("/parity/router-trace"):
+                self.assertTrue(url.startswith("http://control"))
                 events.append("trace")
                 return {
                     "session": active_session,
@@ -1104,6 +1109,7 @@ class ParityRouterTraceTest(unittest.TestCase):
             raise AssertionError(url)
 
         def replay_diagnostic(*args):
+            self.assertEqual(args[2], "http://control")
             self.assertEqual(args[4], "one-use-secret")
             events.append("replay")
             return {"passed": True}
@@ -1162,12 +1168,14 @@ class ParityRouterTraceTest(unittest.TestCase):
                     root / "fixture",
                     output,
                     "http://h200",
+                    "http://control",
                     "model",
                     "a" * 40,
                     "b" * 64,
                     "image",
                     None,
                     bootstrap_token,
+                    22,
                     root / "input.npz",
                     30.0,
                 )
@@ -1196,7 +1204,7 @@ class ParityRouterTraceTest(unittest.TestCase):
         token = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_"
         ready = {
             "status": "ready",
-            "process_id": 1,
+            "process_id": 22,
             "boot_nonce": "d" * 32,
             "token_sha256": parity_script.hashlib.sha256(token.encode("ascii")).hexdigest(),
         }
@@ -1205,7 +1213,9 @@ class ParityRouterTraceTest(unittest.TestCase):
             "request_json",
             side_effect=[ValueError("H200 request failed with HTTP 503"), ready],
         ) as request, patch.object(parity_script.time, "sleep") as sleep:
-            result = parity_script.wait_for_bootstrap_identity("http://h200", token, 10)
+            result = parity_script.wait_for_bootstrap_identity(
+                "http://h200", token, 22, 10
+            )
         self.assertEqual(result, ready)
         self.assertEqual(request.call_count, 2)
         sleep.assert_called_once_with(1)
@@ -1217,9 +1227,20 @@ class ParityRouterTraceTest(unittest.TestCase):
         ) as request, patch.object(parity_script.time, "sleep") as sleep, self.assertRaisesRegex(
             ValueError, "identity check failed"
         ):
-            parity_script.wait_for_bootstrap_identity("http://h200", token, 10)
+            parity_script.wait_for_bootstrap_identity(
+                "http://h200", token, 22, 10
+            )
         request.assert_called_once()
         sleep.assert_not_called()
+
+        with patch.object(
+            parity_script,
+            "request_json",
+            return_value={**ready, "process_id": 23},
+        ), self.assertRaisesRegex(ValueError, "differs from the isolated API"):
+            parity_script.wait_for_bootstrap_identity(
+                "http://h200", token, 22, 10
+            )
 
     def test_router_owner_gate_tuple_and_bias_are_checked(self):
         class Gate:

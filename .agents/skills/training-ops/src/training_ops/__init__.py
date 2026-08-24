@@ -63,6 +63,7 @@ inference_tunnel_ports = list(
 judge_port = ports["judge"]
 adapter_port = ports["adapter"]
 batch_port = ports["batch"]
+h200_parity_backend_port = ports["h200_parity_backend"]
 remote_repo = paths["remote_repository"]
 glm_parity_inference_config = (
     f"{remote_repo}/configs/qualification/glm52-policy-parity-h200.toml"
@@ -2641,9 +2642,11 @@ def _h200_parity_port_preflight_command() -> str:
         "match_status=$?; set -e; "
         "test \"$match_status\" -le 1 || exit \"$match_status\"; "
         "test -z \"$active\" || { echo protected-inference-active; exit 73; }; "
-        "listener=$(sudo ss -H -lntp 'sport = :8000'); "
-        "test -z \"$listener\" || { echo port-8000-in-use; exit 74; }; "
-        "echo port-8000-free"
+        "router_listener=$(sudo ss -H -lntp 'sport = :8000'); "
+        "test -z \"$router_listener\" || { echo port-8000-in-use; exit 74; }; "
+        f"backend_listener=$(sudo ss -H -lntp 'sport = :{h200_parity_backend_port}'); "
+        f"test -z \"$backend_listener\" || {{ echo port-{h200_parity_backend_port}-in-use; exit 75; }}; "
+        "echo parity-ports-free"
     )
 
 
@@ -2651,15 +2654,27 @@ def _assert_h200_parity_port_free(host: str) -> None:
     _check_host(host)
     command = _h200_parity_port_preflight_command()
     code, output = _ssh(host, command, timeout=60)
-    if code or output.strip() != "port-8000-free":
+    if code or output.strip() != "parity-ports-free":
         raise Refused(
             f"isolated parity port preflight failed on {host}: {output.strip()}"
         )
 
 
-def _h200_parity_listener_identity_command(timeout: int) -> str:
+def _h200_parity_listener_identity_command(timeout: int, port: int = 8000) -> str:
     if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout < 0:
         raise Refused("H200 parity listener timeout is invalid")
+    if port not in {8000, h200_parity_backend_port}:
+        raise Refused("H200 parity listener port is invalid")
+    error_prefix = "" if port == 8000 else "api-"
+    loopback_check = ""
+    if port == h200_parity_backend_port:
+        loopback_check = rf'''
+  listener_local=$(awk 'NR==1 {{print $4}}' <<<"${{listeners[0]}}") || fail 91 "${{phase}}listener-address-unreadable"
+  case "$listener_local" in
+    127.0.0.1:{port}|\[::1\]:{port}) ;;
+    *) fail 91 "${{phase}}listener-not-loopback" ;;
+  esac
+'''
     expected_command = json.dumps(
         ["@", glm_parity_inference_config, "--vllm-extra", glm_parity_vllm_extra],
         separators=(",", ":"),
@@ -2668,10 +2683,11 @@ def _h200_parity_listener_identity_command(timeout: int) -> str:
 set -euo pipefail
 name={shlex.quote(glm_inference_container)}
 deadline=$((SECONDS+{timeout}))
+error_prefix={shlex.quote(error_prefix)}
 fail() {{
   code=$1
   detail=$2
-  printf 'parity-listener-error:%s\n' "$detail" >&2
+  printf 'parity-listener-error:%s%s\n' "$error_prefix" "$detail" >&2
   exit "$code"
 }}
 read_container() {{
@@ -2703,10 +2719,11 @@ read_container() {{
 }}
 read_listener() {{
   phase=$1
-  listener_output=$(sudo ss -H -lntpe 'sport = :8000') || fail 90 "${{phase}}listener-probe-failed"
+  listener_output=$(sudo ss -H -lntpe 'sport = :{port}') || fail 90 "${{phase}}listener-probe-failed"
   test -n "$listener_output" || return 10
   mapfile -t listeners <<<"$listener_output" || fail 91 "${{phase}}listener-record-unreadable"
   test "${{#listeners[@]}}" = 1 || fail 91 "${{phase}}multiple-listeners"
+{loopback_check}
   remaining=${{listeners[0]}}
   listener_pids=()
   while [[ "$remaining" =~ pid=([0-9]+) ]]; do
@@ -2739,6 +2756,22 @@ process_starttime() {{
   starttime=${{stat_fields[19]}}
   [[ "$starttime" =~ ^[0-9]+$ ]] || return 1
   printf '%s\n' "$starttime"
+}}
+process_namespace_pid() {{
+  pid=$1
+  status_record=$(sudo cat -- "/proc/$pid/status") || return 1
+  namespace_lines=()
+  while IFS= read -r line; do
+    if [[ "$line" == NSpid:* ]]; then namespace_lines+=("$line"); fi
+  done <<<"$status_record"
+  test "${{#namespace_lines[@]}}" = 1 || return 1
+  read -r -a namespace_pids <<<"${{namespace_lines[0]#NSpid:}}" || return 1
+  test "${{#namespace_pids[@]}}" -gt 0 || return 1
+  for namespace_pid in "${{namespace_pids[@]}}"; do
+    [[ "$namespace_pid" =~ ^[0-9]+$ ]] || return 1
+    test "$namespace_pid" -gt 0 || return 1
+  done
+  printf '%s\n' "${{namespace_pids[-1]}}"
 }}
 read_namespaces() {{
   pid=$1
@@ -2815,6 +2848,7 @@ first_listener_inode=$listener_inode
 read_membership "" "$first_listener_pid"
 first_init_starttime=$(process_starttime "$first_container_pid") || fail 95 container-init-stat-unreadable
 first_listener_starttime=$(process_starttime "$first_listener_pid") || fail 95 listener-stat-unreadable
+first_listener_namespace_pid=$(process_namespace_pid "$first_listener_pid") || fail 95 listener-namespace-pid-unreadable
 read_namespaces "$first_container_pid" || fail 95 container-init-namespace-unreadable
 first_init_pid_namespace=$pid_namespace
 first_init_mount_namespace=$mount_namespace
@@ -2852,8 +2886,10 @@ test "$second_listener_output" = "$first_listener_output" || fail 100 listener-r
 read_membership second- "$second_listener_pid"
 second_init_starttime=$(process_starttime "$second_container_pid") || fail 100 second-container-init-stat-unreadable
 second_listener_starttime=$(process_starttime "$second_listener_pid") || fail 100 second-listener-stat-unreadable
+second_listener_namespace_pid=$(process_namespace_pid "$second_listener_pid") || fail 100 second-listener-namespace-pid-unreadable
 test "$second_init_starttime" = "$first_init_starttime" || fail 100 container-init-pid-reused
 test "$second_listener_starttime" = "$first_listener_starttime" || fail 100 listener-pid-reused
+test "$second_listener_namespace_pid" = "$first_listener_namespace_pid" || fail 100 listener-namespace-pid-changed
 read_namespaces "$second_container_pid" || fail 100 second-container-init-namespace-unreadable
 second_init_pid_namespace=$pid_namespace
 second_init_mount_namespace=$mount_namespace
@@ -2875,8 +2911,8 @@ second_boot_id=$(sudo cat -- /proc/sys/kernel/random/boot_id) || fail 100 second
 test "$second_boot_id" = "$first_boot_id" || fail 100 host-boot-id-changed
 relation=child
 if test "$first_listener_pid" = "$first_container_pid"; then relation=init; fi
-printf '{{"listener_pid":%s,"container_init_pid":%s,"listener_relation":"%s","listener_socket_inode":%s,"listener_starttime":%s,"container_id":"%s","host_boot_id":"%s"}}\n' \
-  "$first_listener_pid" "$first_container_pid" "$relation" "$first_listener_inode" "$first_listener_starttime" "$first_container_id" "$first_boot_id" || fail 100 identity-write-failed
+printf '{{"listener_port":%s,"listener_pid":%s,"listener_namespace_pid":%s,"container_init_pid":%s,"listener_relation":"%s","listener_socket_inode":%s,"listener_starttime":%s,"container_id":"%s","host_boot_id":"%s"}}\n' \
+  {port} "$first_listener_pid" "$first_listener_namespace_pid" "$first_container_pid" "$relation" "$first_listener_inode" "$first_listener_starttime" "$first_container_id" "$first_boot_id" || fail 100 identity-write-failed
 """
 
 
@@ -2884,9 +2920,10 @@ def _h200_parity_listener_identity(
     host: str,
     sensitive: tuple[str, ...],
     timeout: int,
+    port: int = 8000,
 ) -> dict[str, object]:
     _check_host(host)
-    command = _h200_parity_listener_identity_command(timeout)
+    command = _h200_parity_listener_identity_command(timeout, port)
     output = _sensitive_ssh(
         host,
         command,
@@ -2900,8 +2937,11 @@ def _h200_parity_listener_identity(
         raise Refused("isolated parity listener identity is not valid JSON") from error
     if (
         not isinstance(identity, dict)
+        or identity.get("listener_port") != port
         or not isinstance(identity.get("listener_pid"), int)
         or identity["listener_pid"] <= 1
+        or not isinstance(identity.get("listener_namespace_pid"), int)
+        or identity["listener_namespace_pid"] <= 0
         or not isinstance(identity.get("container_init_pid"), int)
         or identity["container_init_pid"] <= 1
         or not isinstance(identity.get("listener_socket_inode"), int)
@@ -2932,6 +2972,7 @@ def _h200_capture_bootstrap_identity(
     host: str,
     capture_directory: str,
     bootstrap_token: str,
+    expected_process_id: int,
 ) -> dict[str, object]:
     if re.fullmatch(
         r"/data/glm52-rl/qualifications/glm52-policy-parity/"
@@ -2961,9 +3002,12 @@ def _h200_capture_bootstrap_identity(
         raise Refused("H200 capture bootstrap identity is not valid JSON") from error
     expected_sha256 = hashlib.sha256(bootstrap_token.encode("ascii")).hexdigest()
     if (
-        not isinstance(identity, dict)
+        isinstance(expected_process_id, bool)
+        or not isinstance(expected_process_id, int)
+        or expected_process_id <= 0
+        or not isinstance(identity, dict)
         or identity.get("status") != "ready"
-        or identity.get("process_id") != 1
+        or identity.get("process_id") != expected_process_id
         or re.fullmatch(r"[0-9a-f]{32}", str(identity.get("boot_nonce", ""))) is None
         or identity.get("token_sha256") != expected_sha256
     ):
@@ -4127,6 +4171,7 @@ def diagnose_glm52_policy_parity(name: str, keep_engine: bool = False) -> dict[s
     rollback_completed = False
     transaction_present = False
     listener_identity: dict[str, object] | None = None
+    api_listener_identity: dict[str, object] | None = None
     bootstrap_identity: dict[str, object] | None = None
     cleanup_warnings: list[str] = []
     operation_error: BaseException | None = None
@@ -4345,6 +4390,18 @@ printf '%s\n' "$state"
             sensitive,
             startup_grace,
         )
+        api_listener_identity = _h200_parity_listener_identity(
+            host,
+            sensitive,
+            startup_grace,
+            h200_parity_backend_port,
+        )
+        if (
+            api_listener_identity["container_id"] != listener_identity["container_id"]
+            or api_listener_identity["host_boot_id"] != listener_identity["host_boot_id"]
+        ):
+            raise Refused("H200 parity router and API listeners differ")
+        expected_api_process_id = api_listener_identity["listener_namespace_pid"]
         capture_command = (
             "sudo docker run --rm -i --network host -v /data:/data "
             f"-v {shlex.quote(remote_repo)}:/workspace:ro -w /workspace "
@@ -4352,6 +4409,8 @@ printf '%s\n' "$state"
             f"scripts/glm52_policy_parity.py --profile {shlex.quote(production_parity_profile)} "
             f"capture-h200 --fixture {shlex.quote(fixture)} "
             "--base-url http://127.0.0.1:8000 "
+            f"--control-url http://127.0.0.1:{h200_parity_backend_port} "
+            f"--expected-api-process-id {expected_api_process_id} "
             f"--model {shlex.quote(glm_model)} "
             f"--model-revision {shlex.quote(metadata['model_revision'])} "
             f"--adapter-sha256 {shlex.quote(metadata['adapter_sha256'])} "
@@ -4367,8 +4426,26 @@ printf '%s\n' "$state"
             3600,
         )
         _verify_parity_container_outputs(host, container_writes, "capture", sensitive)
+        final_api_listener_identity = _h200_parity_listener_identity(
+            host,
+            sensitive,
+            60,
+            h200_parity_backend_port,
+        )
+        if final_api_listener_identity != api_listener_identity:
+            raise Refused("H200 parity API listener changed during capture")
+        final_listener_identity = _h200_parity_listener_identity(
+            host,
+            sensitive,
+            60,
+        )
+        if final_listener_identity != listener_identity:
+            raise Refused("H200 parity router listener changed during capture")
         bootstrap_identity = _h200_capture_bootstrap_identity(
-            host, temporary_capture, bootstrap_token
+            host,
+            temporary_capture,
+            bootstrap_token,
+            expected_api_process_id,
         )
         capture_new_sha256 = _remote_manifest_sha256(
             host, temporary_capture, "new H200 parity capture manifest", sensitive
@@ -4452,6 +4529,7 @@ printf '%s\n' "$state"
         return {
             "capture": capture,
             "listener_identity": listener_identity,
+            "api_listener_identity": api_listener_identity,
             "bootstrap_identity": bootstrap_identity,
             "diagnostic_plan": plan,
             "engine_kept": keep_engine,
