@@ -3,14 +3,16 @@ import datetime
 import hashlib
 import json
 import os
+import shlex
 import struct
 import subprocess
-import threading
 import tempfile
+import threading
 import unittest
-import tomllib
 from pathlib import Path
 from unittest.mock import patch
+
+import tomllib
 
 import training_ops
 
@@ -221,6 +223,374 @@ class EdgeOperationsTest(unittest.TestCase):
             session, result, profile, "glm52-native-b2048", now=now
         )
         self.assertTrue(any("stale" in failure for failure in failures))
+
+    def step20_h200_evidence(self):
+        _session, stability, _trainer_profile, now = self.qualification_evidence(
+            "glm52-native-stability20"
+        )
+        with (
+            training_ops.repo_root / training_ops.production_step20_h200_profile
+        ).open("rb") as stream:
+            profile = tomllib.load(stream)
+        capture_sha256 = "6" * 64
+        adapter_sha256 = stability["adapter"]["sha256"]
+        guard = {"passed": True, "checks": {"unmasked_mismatch_kl": True}}
+        capture = {
+            "schema_version": 1,
+            "kind": "glm52_policy_parity_h200_capture",
+            "created_utc": (now - datetime.timedelta(minutes=1)).isoformat(),
+            "adapter_sha256": adapter_sha256,
+            "adapter_loaded": True,
+            "adapter_path": training_ops.glm_step20_h200_gate["adapter"],
+            "graph_eager_guard": guard,
+            "arrays": {
+                "full_logprobs": {"sha256": "7" * 64},
+                "router_ids": {"sha256": "8" * 64},
+                "router_weights": {"sha256": "9" * 64},
+            },
+        }
+        parity_report = {
+            "created_utc": (now - datetime.timedelta(seconds=30)).isoformat(),
+            "adapter_sha256": adapter_sha256,
+            "h200_capture_manifest_sha256": capture_sha256,
+            "graph_eager_guard": guard,
+        }
+        settings = {
+            name: profile[name]
+            for name in (
+                "requests",
+                "group_size",
+                "max_inflight",
+                "context_length",
+                "max_output_tokens",
+                "min_output_tokens",
+                "temperature",
+                "top_p",
+                "seed",
+                "request_timeout_seconds",
+                "max_retries",
+                "retry_count_max",
+                "qualification_deadline_seconds",
+                "tensor_parallel_size",
+                "cuda_graph",
+                "cuda_graph_capture_size",
+                "prefix_cache",
+                "kv_cache_dtype",
+                "max_num_seqs",
+                "max_num_batched_tokens",
+                "batch_seconds_min",
+                "batch_seconds_max",
+                "peak_vram_mib_max",
+                "evidence_max_age_seconds",
+            )
+        }
+        result = {
+            "schema_version": 1,
+            "kind": "glm52_step20_h200_gate",
+            "created_utc": now.isoformat(),
+            "profile_sha256": hashlib.sha256(
+                (
+                    training_ops.repo_root
+                    / training_ops.production_step20_h200_profile
+                ).read_bytes()
+            ).hexdigest(),
+            "settings": settings,
+            "adapter": {
+                "name": profile["model"],
+                "h200_path": training_ops.glm_step20_h200_gate["adapter"],
+                "qualification_result_sha256": "a" * 64,
+                "qualification_session_sha256": stability["session_sha256"],
+                "trainer_path": stability["adapter"]["path"],
+                **{
+                    name: stability["adapter"][name]
+                    for name in (
+                        "sha256",
+                        "size",
+                        "config_sha256",
+                        "stable_sha256",
+                        "checksum_sha256",
+                    )
+                },
+            },
+            "engine": {
+                "config": profile["engine_config"],
+                "config_sha256": hashlib.sha256(
+                    (training_ops.repo_root / profile["engine_config"]).read_bytes()
+                ).hexdigest(),
+                "image_digest": "sha256:" + "b" * 64,
+                **{
+                    name: profile[name]
+                    for name in (
+                        "tensor_parallel_size",
+                        "cuda_graph",
+                        "cuda_graph_capture_size",
+                        "prefix_cache",
+                        "kv_cache_dtype",
+                        "max_num_seqs",
+                        "max_num_batched_tokens",
+                    )
+                },
+            },
+            "parity": {
+                "adapter_sha256": adapter_sha256,
+                "capture_manifest_sha256": capture_sha256,
+                "graph_eager_guard": guard,
+                "router_runtime_marker_sha256": "0" * 64,
+                "array_sha256": {
+                    name: value["sha256"] for name, value in capture["arrays"].items()
+                },
+            },
+            "measurements": {
+                "batch_seconds": 600.0,
+                "completed_requests": 1024,
+                "failed_requests": 0,
+                "retries": 2,
+                "retry_errors": ["H200RequestError: reset"] * 2,
+                "output_tokens": 1024 * 16384,
+                "output_tokens_per_second": (1024 * 16384) / 600,
+                "max_prompt_tokens": 1024,
+                "peak_vram_mib": [120_000] * 8,
+                "latency_seconds": {
+                    "mean": 100.0,
+                    "p50": 90.0,
+                    "p95": 200.0,
+                    "p99": 300.0,
+                    "max": 400.0,
+                },
+                "first_errors": [],
+            },
+        }
+        return result, profile, stability, parity_report, capture, now
+
+    def test_step20_h200_gate_binds_fresh_adapter_parity_and_engine(self):
+        result, profile, stability, report, capture, now = self.step20_h200_evidence()
+        self.assertEqual(
+            training_ops._validate_step20_h200_gate(
+                result,
+                profile,
+                stability,
+                report,
+                capture,
+                qualification_result_sha256="a" * 64,
+                capture_manifest_sha256="6" * 64,
+                expected_engine_digest="sha256:" + "b" * 64,
+                now=now,
+            ),
+            [],
+        )
+
+    def test_step20_h200_gate_rejects_mixed_or_stale_evidence(self):
+        result, profile, stability, report, capture, now = self.step20_h200_evidence()
+        result["adapter"]["sha256"] = "f" * 64
+        result["measurements"]["batch_seconds"] = 721.0
+        capture["created_utc"] = (now - datetime.timedelta(hours=25)).isoformat()
+        profile["max_inflight"] = 127
+        failures = training_ops._validate_step20_h200_gate(
+            result,
+            profile,
+            stability,
+            report,
+            capture,
+            qualification_result_sha256="a" * 64,
+            capture_manifest_sha256="6" * 64,
+            expected_engine_digest="sha256:" + "b" * 64,
+            now=now,
+        )
+        self.assertTrue(any("adapter identity" in failure for failure in failures))
+        self.assertTrue(any("production shape" in failure for failure in failures))
+        self.assertTrue(any("480-720" in failure for failure in failures))
+        self.assertTrue(any("stale" in failure for failure in failures))
+
+    def test_step20_h200_adapter_stage_uses_exact_candidate_and_hashes(self):
+        payloads = {
+            "adapter_model.safetensors": b"weights",
+            "adapter_config.json": b"{}\n",
+            "STABLE": b"stable\n",
+        }
+        payloads["adapter_model.safetensors.sha256"] = (
+            hashlib.sha256(payloads["adapter_model.safetensors"]).hexdigest()
+            + "\n"
+        ).encode()
+        adapter = {
+            "path": "/source/adapter_model.safetensors",
+            "sha256": hashlib.sha256(payloads["adapter_model.safetensors"]).hexdigest(),
+            "config_path": "/source/adapter_config.json",
+            "config_sha256": hashlib.sha256(payloads["adapter_config.json"]).hexdigest(),
+            "stable_path": "/source/STABLE",
+            "stable_sha256": hashlib.sha256(payloads["STABLE"]).hexdigest(),
+            "checksum_path": "/source/adapter_model.safetensors.sha256",
+            "checksum_sha256": hashlib.sha256(
+                payloads["adapter_model.safetensors.sha256"]
+            ).hexdigest(),
+        }
+        result_sha256 = hashlib.sha256(b"qualification\n").hexdigest()
+        payloads["qualification-result.json"] = b"qualification\n"
+        uploads = []
+        remote = []
+
+        def download(source, destination):
+            destination.write_bytes(payloads[Path(source).name])
+
+        def command(arguments, _label, timeout):
+            uploads.append((arguments, timeout))
+
+        def remote_ok(_host, command_text, _label, timeout=60):
+            remote.append((command_text, timeout))
+            return "installed\n" if "sudo python3" in command_text else ""
+
+        with (
+            patch.object(training_ops, "_download_adapter_file", side_effect=download),
+            patch.object(training_ops, "_local_command", side_effect=command),
+            patch.object(training_ops, "_remote_ok", side_effect=remote_ok),
+            patch.object(training_ops.secrets, "token_hex", return_value="1" * 16),
+        ):
+            self.assertEqual(
+                training_ops._stage_step20_adapter_on_h200(
+                    adapter, result_sha256
+                ),
+                training_ops.glm_step20_h200_gate["adapter"],
+            )
+        self.assertEqual(len(uploads), 5)
+        self.assertTrue(all(call[0][0] == "scp" and call[1] == 1800 for call in uploads))
+        self.assertTrue(
+            all(".adapter-candidate-" + "1" * 16 in call[0][-1] for call in uploads)
+        )
+        installer = remote[-1][0]
+        self.assertIn("os.O_NOFOLLOW", installer)
+        self.assertIn("os.rename(candidate_name,final_name", installer)
+        self.assertNotIn("rm -rf", installer)
+        embedded = installer.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+        compile(embedded, "<step20-adapter-installer>", "exec")
+        command = shlex.split(installer.split(" <<'PY'", 1)[0])
+        uid = os.getuid()
+        gid = os.getgid()
+        executable = (
+            embedded.replace("(1000,1000,0o755)", f"({uid},{gid},0o755)")
+            .replace("(0,0,0o755)", f"({uid},{gid},0o755)")
+            .replace("(0,0,0o644)", f"({uid},{gid},0o644)")
+            .replace("os.fchown(fd,0,0)", f"os.fchown(fd,{uid},{gid})")
+            .replace("os.fchown(child,0,0)", f"os.fchown(child,{uid},{gid})")
+        )
+        expected_files = {
+            "adapter_model.safetensors": payloads["adapter_model.safetensors"],
+            "adapter_config.json": payloads["adapter_config.json"],
+            "STABLE": payloads["STABLE"],
+            "adapter_model.safetensors.sha256": payloads[
+                "adapter_model.safetensors.sha256"
+            ],
+            ".qualification-result.json": payloads["qualification-result.json"],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o755)
+            candidate_name, final_name, previous_name, encoded = command[4:8]
+            candidate = root / candidate_name
+            final = root / final_name
+            candidate.mkdir(mode=0o750)
+            final.mkdir(mode=0o755)
+            for name, payload in expected_files.items():
+                (candidate / name).write_bytes(payload)
+                (final / name).write_bytes(b"old-" + payload)
+                (final / name).chmod(0o644)
+            result = subprocess.run(
+                [
+                    "python3",
+                    "-",
+                    str(root),
+                    candidate_name,
+                    final_name,
+                    previous_name,
+                    encoded,
+                ],
+                input=executable,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "replaced")
+            self.assertFalse(candidate.exists())
+            self.assertFalse((root / previous_name).exists())
+            self.assertEqual(
+                {path.name: path.read_bytes() for path in final.iterdir()},
+                expected_files,
+            )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o755)
+            candidate = root / candidate_name
+            final = root / final_name
+            candidate.mkdir(mode=0o750)
+            final.mkdir(mode=0o755)
+            old_files = {}
+            for name, payload in expected_files.items():
+                (candidate / name).write_bytes(payload)
+                old_files[name] = b"old-" + payload
+                (final / name).write_bytes(old_files[name])
+                (final / name).chmod(0o644)
+            before, separator, after = executable.rpartition(
+                "   validate(final_name,True)"
+            )
+            self.assertTrue(separator)
+            faulted = before + '   raise RuntimeError("injected")' + after
+            result = subprocess.run(
+                [
+                    "python3",
+                    "-",
+                    str(root),
+                    candidate_name,
+                    final_name,
+                    previous_name,
+                    encoded,
+                ],
+                input=faulted,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((root / previous_name).exists())
+            self.assertEqual(
+                {path.name: path.read_bytes() for path in final.iterdir()},
+                old_files,
+            )
+            self.assertEqual(
+                {path.name: path.read_bytes() for path in candidate.iterdir()},
+                expected_files,
+            )
+
+    def test_step20_trainer_parity_action_pins_exact_adapter_and_step(self):
+        with patch.object(training_ops, "qualify") as qualify:
+            training_ops._qualify_glm52_step20_parity_action([])
+        qualify.assert_called_once_with(
+            "glm52-policy-parity",
+            resume_adapter=(
+                "/data/glm52-rl/qualifications/glm52-native-stability20/"
+                "run_trainer_only/broadcasts/step_20/adapter_model.safetensors"
+            ),
+            resume_step=0,
+        )
+        with self.assertRaisesRegex(training_ops.Refused, "takes no arguments"):
+            training_ops._qualify_glm52_step20_parity_action(["unexpected"])
+
+    def test_step20_h200_stage_action_binds_qualification_result(self):
+        stability = {"adapter": {"sha256": "a" * 64}}
+        with (
+            patch.object(
+                training_ops,
+                "_step20_stability_evidence",
+                return_value=(stability, "b" * 64),
+            ),
+            patch.object(
+                training_ops,
+                "_stage_step20_adapter_on_h200",
+                return_value=training_ops.glm_step20_h200_gate["adapter"],
+            ) as stage,
+        ):
+            result = training_ops._stage_glm52_step20_adapter_action([])
+        stage.assert_called_once_with(stability["adapter"], "b" * 64)
+        self.assertEqual(result["adapter_sha256"], "a" * 64)
+        self.assertEqual(result["qualification_result_sha256"], "b" * 64)
 
     def test_trainer_qualification_session_publish_is_no_follow_and_atomic(self):
         profile_name = "glm52-native-b2048"

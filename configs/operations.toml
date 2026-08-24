@@ -114,6 +114,13 @@ fixture = "/data/glm52-rl/qualifications/glm52-policy-parity/fixture"
 h200_capture = "/data/glm52-rl/qualifications/glm52-policy-parity/h200-capture-final"
 trainer_stage = "/data/glm52-rl/qualifications/glm52-policy-parity/trainer-stage-final"
 
+[gate.glm52_step20_h200]
+profile = "configs/qualification/glm52-step20-h200.toml"
+result = "/data/glm52-rl/qualifications/glm52-step20-h200/result.json"
+adapter = "/data/glm52-rl/qualifications/glm52-step20-h200/adapter-step20"
+qualification_result = "/data/glm52-rl/qualifications/glm52-step20-h200/adapter-step20/.qualification-result.json"
+trainer_adapter = "/data/glm52-rl/qualifications/glm52-native-stability20/run_trainer_only/broadcasts/step_20/adapter_model.safetensors"
+
 [requirements.shared]
 group_size = 16
 max_output_length = 16384

@@ -551,6 +551,34 @@ def _write_atomic_json(path: Path, value: dict, session_id: str) -> None:
         os.close(directory)
 
 
+def _validate_resume_adapter_inventory(
+    adapter_shapes: dict[str, tuple[int, ...]],
+    expected_by_rank: list[dict[str, tuple[int, ...]]],
+) -> None:
+    expected: dict[str, tuple[int, ...]] = {}
+    conflicts: list[str] = []
+    for rank_expected in expected_by_rank:
+        for key, shape in rank_expected.items():
+            previous = expected.setdefault(key, shape)
+            if previous != shape:
+                conflicts.append(key)
+    missing = sorted(set(expected) - set(adapter_shapes))
+    unexpected = sorted(set(adapter_shapes) - set(expected))
+    mismatched = sorted(
+        key
+        for key in set(expected) & set(adapter_shapes)
+        if expected[key] != adapter_shapes[key]
+    )
+    if conflicts or missing or unexpected or mismatched:
+        raise ValueError(
+            "Resume adapter inventory differs from the complete distributed LoRA model: "
+            f"conflicts={conflicts[:5]} ({len(conflicts)} total), "
+            f"missing={missing[:5]} ({len(missing)} total), "
+            f"unexpected={unexpected[:5]} ({len(unexpected)} total), "
+            f"shape_mismatch={mismatched[:5]} ({len(mismatched)} total)"
+        )
+
+
 def _load_qualification_session(
     config: TrainerConfig, identity: dict[str, str]
 ) -> dict:
@@ -896,28 +924,39 @@ def train(config: TrainerConfig):
         from torch.distributed.tensor import DTensor, distribute_tensor
 
         adapter = load_file(resume_adapter)
-        loaded = set()
+        expected: dict[str, tuple[int, ...]] = {}
+        parameters = {}
+        for name, parameter in model.named_parameters():
+            if ".lora_A.0" not in name and ".lora_B.0" not in name:
+                continue
+            key = (
+                name.replace("._checkpoint_wrapped_module", "")
+                .replace(".lora_A.0", ".lora_A.weight")
+                .replace(".lora_B.0", ".lora_B.weight")
+            )
+            expected[key] = tuple(parameter.shape)
+            parameters[key] = parameter
+        expected_by_rank: list[dict[str, tuple[int, ...]] | None] = [
+            None
+        ] * dist.get_world_size()
+        dist.all_gather_object(expected_by_rank, expected)
+        if any(value is None for value in expected_by_rank):
+            raise RuntimeError("Resume adapter inventory gather is incomplete")
+        _validate_resume_adapter_inventory(
+            {key: tuple(value.shape) for key, value in adapter.items()},
+            [value for value in expected_by_rank if value is not None],
+        )
         with torch.no_grad():
-            for name, parameter in model.named_parameters():
-                key = (
-                    name.replace("._checkpoint_wrapped_module", "")
-                    .replace(".lora_A.0", ".lora_A.weight")
-                    .replace(".lora_B.0", ".lora_B.weight")
-                )
-                if key not in adapter:
-                    continue
+            for key, parameter in parameters.items():
                 value = adapter[key].to("cuda", dtype=parameter.dtype)
                 if isinstance(parameter, DTensor):
                     value = distribute_tensor(
                         value, parameter.device_mesh, parameter.placements
                     )
                 parameter.copy_(value)
-                loaded.add(key)
-        if loaded != adapter.keys():
-            raise ValueError(
-                f"Adapter keys not loaded: {sorted(adapter.keys() - loaded)}"
-            )
-        logger.info(f"Loaded {len(loaded)} adapter tensors from {resume_adapter}")
+        logger.info(
+            f"Loaded {len(parameters)} local tensors from complete adapter {resume_adapter}"
+        )
 
     logger.info(f"Initializing tokenizer ({config.tokenizer})")
     tokenizer = setup_tokenizer(config.tokenizer)

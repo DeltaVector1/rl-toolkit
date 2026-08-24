@@ -19,10 +19,11 @@ import subprocess
 import sys
 import tempfile
 import time
-import tomllib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
+
+import tomllib
 
 repo_root = Path(__file__).resolve().parents[5]
 operations_path = repo_root / "configs" / "operations.toml"
@@ -51,6 +52,7 @@ shared_requirements = operations["requirements"]["shared"]
 muse_requirements = operations["requirements"]["muse"]
 glm_requirements = operations["requirements"]["glm52"]
 glm_parity_paths = operations["parity"]["glm52"]
+glm_step20_h200_gate = operations["gate"]["glm52_step20_h200"]
 glm_parity_root = "/data/glm52-rl/qualifications/glm52-policy-parity"
 glm_parity_stage_candidate_root = f"{glm_parity_root}/.stage-candidates"
 glm_parity_stage_docker_timeout = 1800
@@ -6413,6 +6415,8 @@ production_parity_fixture = "/data/glm52-rl/qualifications/glm52-policy-parity/f
 production_parity_profile = "configs/qualification/glm52-policy-parity.toml"
 production_batch2048_profile = "configs/qualification/glm52-native-b2048.toml"
 production_stability20_profile = "configs/qualification/glm52-native-stability20.toml"
+production_step20_h200_profile = glm_step20_h200_gate["profile"]
+production_step20_h200_result = glm_step20_h200_gate["result"]
 
 
 def _remote_json(host: str, path: str) -> dict:
@@ -6507,7 +6511,6 @@ def _validate_live_parity_report(
         failures.append("parity fixture hash does not match its manifest")
     if report.get("profile_sha256") != expected_profile:
         failures.append("parity profile hash does not match the pinned profile")
-
     hex_fields = {"model_revision": 40, "adapter_sha256": 64}
     for name, length in hex_fields.items():
         value = report.get(name)
@@ -6952,6 +6955,494 @@ def _validate_trainer_qualification(
     return failures
 
 
+def _validate_step20_h200_gate(
+    result: dict,
+    profile: dict,
+    stability: dict,
+    parity_report: dict,
+    capture: dict,
+    *,
+    qualification_result_sha256: str,
+    capture_manifest_sha256: str,
+    expected_engine_digest: str,
+    now: _dt.datetime | None = None,
+) -> list[str]:
+    failures: list[str] = []
+    pinned_profile = {
+        "schema_version": 1,
+        "name": "glm52-step20-h200",
+        "output_path": production_step20_h200_result,
+        "model": "glm52-step20-r32",
+        "engine_config": "configs/qualification/glm52-policy-parity-h200.toml",
+        "adapter_path": glm_step20_h200_gate["adapter"],
+        "requests": 1024,
+        "group_size": 16,
+        "max_inflight": 128,
+        "context_length": 32768,
+        "max_output_tokens": 16384,
+        "min_output_tokens": 16384,
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "seed": 20260824,
+        "request_timeout_seconds": 700,
+        "max_retries": 2,
+        "retry_count_max": 32,
+        "qualification_deadline_seconds": 720,
+        "tensor_parallel_size": 8,
+        "cuda_graph": True,
+        "cuda_graph_capture_size": 256,
+        "prefix_cache": True,
+        "kv_cache_dtype": "auto",
+        "max_num_seqs": 128,
+        "max_num_batched_tokens": 32769,
+        "batch_seconds_min": 480,
+        "batch_seconds_max": 720,
+        "peak_vram_mib_max": 143000,
+        "evidence_max_age_seconds": 86400,
+    }
+    if profile != pinned_profile:
+        failures.append("step-20 H200 gate profile differs from production shape")
+    expected_profile_sha256 = hashlib.sha256(
+        (repo_root / production_step20_h200_profile).read_bytes()
+    ).hexdigest()
+    if (
+        result.get("schema_version") != 1
+        or result.get("kind") != "glm52_step20_h200_gate"
+        or result.get("profile_sha256") != expected_profile_sha256
+    ):
+        failures.append("step-20 H200 gate schema or profile differs")
+    expected_settings = {
+        name: profile[name]
+        for name in (
+            "requests",
+            "group_size",
+            "max_inflight",
+            "context_length",
+            "max_output_tokens",
+            "min_output_tokens",
+            "temperature",
+            "top_p",
+            "seed",
+            "request_timeout_seconds",
+            "max_retries",
+            "retry_count_max",
+            "qualification_deadline_seconds",
+            "tensor_parallel_size",
+            "cuda_graph",
+            "cuda_graph_capture_size",
+            "prefix_cache",
+            "kv_cache_dtype",
+            "max_num_seqs",
+            "max_num_batched_tokens",
+            "batch_seconds_min",
+            "batch_seconds_max",
+            "peak_vram_mib_max",
+            "evidence_max_age_seconds",
+        )
+    }
+    if result.get("settings") != expected_settings:
+        failures.append("step-20 H200 gate settings differ")
+
+    stability_adapter = stability.get("adapter")
+    adapter = result.get("adapter")
+    adapter_fields = {
+        "trainer_path": "path",
+        "sha256": "sha256",
+        "size": "size",
+        "config_sha256": "config_sha256",
+        "stable_sha256": "stable_sha256",
+        "checksum_sha256": "checksum_sha256",
+    }
+    if not isinstance(adapter, dict) or not isinstance(stability_adapter, dict):
+        failures.append("step-20 H200 gate adapter evidence is missing")
+        adapter = {}
+        stability_adapter = {}
+    elif (
+        adapter.get("name") != profile.get("model")
+        or adapter.get("h200_path") != glm_step20_h200_gate["adapter"]
+        or adapter.get("qualification_result_sha256")
+        != qualification_result_sha256
+        or adapter.get("qualification_session_sha256")
+        != stability.get("session_sha256")
+        or any(
+            adapter.get(gate_name) != stability_adapter.get(stability_name)
+            for gate_name, stability_name in adapter_fields.items()
+        )
+    ):
+        failures.append("step-20 H200 gate adapter identity differs")
+
+    engine = result.get("engine")
+    if (
+        not isinstance(engine, dict)
+        or engine.get("config") != profile.get("engine_config")
+        or engine.get("config_sha256")
+        != hashlib.sha256(
+            (repo_root / str(profile.get("engine_config"))).read_bytes()
+        ).hexdigest()
+        or engine.get("image_digest") != expected_engine_digest
+        or any(
+            engine.get(name) != profile.get(name)
+            for name in (
+                "tensor_parallel_size",
+                "cuda_graph",
+                "cuda_graph_capture_size",
+                "prefix_cache",
+                "kv_cache_dtype",
+                "max_num_seqs",
+                "max_num_batched_tokens",
+            )
+        )
+    ):
+        failures.append("step-20 H200 gate engine identity differs")
+
+    measurements = result.get("measurements")
+    if not isinstance(measurements, dict):
+        failures.append("step-20 H200 gate measurements are missing")
+    else:
+        batch_seconds = measurements.get("batch_seconds")
+        output_rate = measurements.get("output_tokens_per_second")
+        latency = measurements.get("latency_seconds")
+        peak = measurements.get("peak_vram_mib")
+        retries = measurements.get("retries")
+        output_tokens = measurements.get("output_tokens")
+        max_prompt_tokens = measurements.get("max_prompt_tokens")
+        if (
+            isinstance(batch_seconds, bool)
+            or not isinstance(batch_seconds, (int, float))
+            or not math.isfinite(batch_seconds)
+            or not profile["batch_seconds_min"]
+            <= batch_seconds
+            <= profile["batch_seconds_max"]
+        ):
+            failures.append("step-20 H200 gate batch time is outside 480-720 seconds")
+        if (
+            measurements.get("completed_requests") != profile["requests"]
+            or measurements.get("failed_requests") != 0
+            or measurements.get("first_errors") != []
+        ):
+            failures.append("step-20 H200 gate request failures differ")
+        if (
+            isinstance(retries, bool)
+            or not isinstance(retries, int)
+            or not 0 <= retries <= profile["retry_count_max"]
+        ):
+            failures.append("step-20 H200 gate retry count is invalid")
+        retry_errors = measurements.get("retry_errors")
+        if (
+            not isinstance(retry_errors, list)
+            or len(retry_errors) != retries
+            or any(not isinstance(value, str) or len(value) > 1000 for value in retry_errors)
+            or any(
+                marker in value.lower()
+                for value in retry_errors
+                for marker in ("out of memory", "oom", "cuda error")
+            )
+        ):
+            failures.append("step-20 H200 gate retry or OOM evidence is invalid")
+        if (
+            isinstance(output_tokens, bool)
+            or not isinstance(output_tokens, int)
+            or output_tokens != profile["requests"] * profile["max_output_tokens"]
+            or isinstance(output_rate, bool)
+            or not isinstance(output_rate, (int, float))
+            or not math.isfinite(output_rate)
+            or output_rate <= 0
+        ):
+            failures.append("step-20 H200 gate output measurements are invalid")
+        elif (
+            not isinstance(batch_seconds, bool)
+            and isinstance(batch_seconds, (int, float))
+            and math.isfinite(batch_seconds)
+            and batch_seconds > 0
+            and not math.isclose(
+                output_rate,
+                output_tokens / batch_seconds,
+                rel_tol=1e-9,
+            )
+        ):
+            failures.append("step-20 H200 gate throughput arithmetic differs")
+        if (
+            isinstance(max_prompt_tokens, bool)
+            or not isinstance(max_prompt_tokens, int)
+            or max_prompt_tokens < 1
+            or max_prompt_tokens + profile["max_output_tokens"]
+            > profile["context_length"]
+        ):
+            failures.append("step-20 H200 gate request context is invalid")
+        if (
+            not isinstance(latency, dict)
+            or any(
+                isinstance(latency.get(name), bool)
+                or not isinstance(latency.get(name), (int, float))
+                or not math.isfinite(latency[name])
+                or latency[name] <= 0
+                for name in ("mean", "p50", "p95", "p99", "max")
+            )
+            or not isinstance(peak, list)
+            or len(peak) != 8
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+                or value > profile["peak_vram_mib_max"]
+                for value in peak
+            )
+        ):
+            failures.append("step-20 H200 gate latency or VRAM measurements are invalid")
+        elif not (
+            latency["p50"] <= latency["p95"] <= latency["p99"] <= latency["max"]
+            and latency["mean"] <= latency["max"]
+        ):
+            failures.append("step-20 H200 gate latency order is invalid")
+
+    parity = result.get("parity")
+    arrays = capture.get("arrays") if isinstance(capture, dict) else None
+    expected_array_hashes = (
+        {
+            name: arrays.get(name, {}).get("sha256")
+            for name in ("full_logprobs", "router_ids", "router_weights")
+        }
+        if isinstance(arrays, dict)
+        else None
+    )
+    if (
+        not isinstance(parity, dict)
+        or parity.get("adapter_sha256") != adapter.get("sha256")
+        or parity.get("capture_manifest_sha256") != capture_manifest_sha256
+        or parity.get("array_sha256") != expected_array_hashes
+        or parity.get("graph_eager_guard") != capture.get("graph_eager_guard")
+        or capture.get("adapter_sha256") != adapter.get("sha256")
+        or capture.get("adapter_loaded") is not True
+        or capture.get("adapter_path") != glm_step20_h200_gate["adapter"]
+        or parity_report.get("adapter_sha256") != adapter.get("sha256")
+        or parity_report.get("h200_capture_manifest_sha256")
+        != capture_manifest_sha256
+        or parity_report.get("graph_eager_guard")
+        != capture.get("graph_eager_guard")
+    ):
+        failures.append("step-20 H200 gate parity binding differs")
+
+    current = now or _dt.datetime.now(_dt.timezone.utc)
+    try:
+        timestamps = [
+            _dt.datetime.fromisoformat(value["created_utc"])
+            for value in (result, parity_report, capture)
+        ]
+        if any(
+            created.tzinfo is None
+            or not created <= current
+            or (current - created).total_seconds() > profile["evidence_max_age_seconds"]
+            for created in timestamps
+        ):
+            failures.append("step-20 H200 gate or parity evidence is stale")
+    except (KeyError, TypeError, ValueError):
+        failures.append("step-20 H200 gate or parity evidence time is invalid")
+    return failures
+
+
+def _step20_stability_evidence() -> tuple[dict, str]:
+    with (repo_root / production_stability20_profile).open("rb") as stream:
+        profile = tomllib.load(stream)
+    output_dir = profile["output_dir"].rstrip("/")
+    session = _remote_json(
+        trainer_head, f"{output_dir}/qualification-session.json"
+    )
+    result_path = f"{output_dir}/qualification-result.json"
+    result = _remote_json(trainer_head, result_path)
+    failures = _validate_trainer_qualification(
+        session, result, profile, "glm52-native-stability20"
+    )
+    ranked_hosts = [trainer_head] + [
+        host for host in trainer_hosts if host != trainer_head
+    ]
+    if session.get("source_files") != _trainer_qualification_source_files(
+        ranked_hosts
+    ):
+        failures.append("stability20 source differs from current trainer mounts")
+    if session.get("image_digests") != _trainer_image_digest_map(ranked_hosts):
+        failures.append("stability20 images differ from current trainer images")
+    code, result_sha256 = _ssh(
+        trainer_head,
+        f"sha256sum {shlex.quote(result_path)} | cut -d' ' -f1",
+        timeout=60,
+    )
+    if code or re.fullmatch(r"[0-9a-f]{64}", result_sha256.strip()) is None:
+        failures.append("stability20 result checksum is invalid")
+    if failures:
+        raise Refused("step-20 adapter evidence failed: " + "; ".join(failures))
+    return result, result_sha256.strip()
+
+
+def _stage_step20_adapter_on_h200(adapter: dict, result_sha256: str) -> str:
+    qualification_result = glm_step20_h200_gate["qualification_result"]
+    if qualification_result != (
+        glm_step20_h200_gate["adapter"] + "/.qualification-result.json"
+    ) or re.fullmatch(r"[0-9a-f]{64}", result_sha256) is None:
+        raise Refused("step-20 qualification result destination is not exact")
+    source_paths = {
+        "adapter_model.safetensors": (adapter.get("path"), adapter.get("sha256")),
+        "adapter_config.json": (adapter.get("config_path"), adapter.get("config_sha256")),
+        "STABLE": (adapter.get("stable_path"), adapter.get("stable_sha256")),
+        "adapter_model.safetensors.sha256": (
+            adapter.get("checksum_path"),
+            adapter.get("checksum_sha256"),
+        ),
+        ".qualification-result.json": (
+            str(
+                PurePosixPath(
+                    tomllib.loads(
+                        (repo_root / production_stability20_profile).read_text()
+                    )["output_dir"]
+                )
+                / "qualification-result.json"
+            ),
+            result_sha256,
+        ),
+    }
+    if any(
+        not isinstance(path, str)
+        or not isinstance(digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        for path, digest in source_paths.values()
+    ):
+        raise Refused("step-20 adapter source identity is invalid")
+    final = PurePosixPath(glm_step20_h200_gate["adapter"])
+    root = final.parent
+    if not final.is_absolute() or ".." in final.parts or final.name != "adapter-step20":
+        raise Refused("step-20 H200 adapter destination is not exact")
+    nonce = secrets.token_hex(8)
+    candidate = root / f".adapter-candidate-{nonce}"
+    host = inference_hosts[0]
+    setup = f"""
+set -euo pipefail
+root={shlex.quote(str(root))}
+candidate={shlex.quote(str(candidate))}
+if test -e "$root" || test -L "$root"; then
+  test -d "$root"
+  test ! -L "$root"
+  test "$(realpath -e "$root")" = "$root"
+  test "$(stat -c '%u:%g:%a' "$root")" = "1000:1000:755"
+else
+  sudo install -d -o 1000 -g 1000 -m 0755 "$root"
+fi
+test ! -e "$candidate"
+test ! -L "$candidate"
+install -d -m 0750 "$candidate"
+"""
+    _remote_ok(host, setup, "step-20 H200 adapter candidate", timeout=60)
+    with tempfile.TemporaryDirectory(prefix="glm52-step20-adapter-") as temporary:
+        local_root = Path(temporary)
+        for name, (source, digest) in source_paths.items():
+            local = local_root / name
+            _download_adapter_file(str(source), local)
+            if _sha256_file(local, name) != digest:
+                raise RuntimeError(f"step-20 adapter download checksum differs: {name}")
+            _local_command(
+                [
+                    "scp",
+                    "-q",
+                    "-o",
+                    "BatchMode=yes",
+                    str(local),
+                    f"{host}:{candidate}/{name}",
+                ],
+                f"stage step-20 adapter {name}",
+                timeout=1800,
+            )
+    encoded = base64.b64encode(
+        json.dumps(
+            {name: digest for name, (_path, digest) in source_paths.items()},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).decode()
+    previous = f".adapter-previous-{nonce}"
+    install = f"""sudo python3 - {shlex.quote(str(root))} {shlex.quote(candidate.name)} {shlex.quote(final.name)} {shlex.quote(previous)} {shlex.quote(encoded)} <<'PY'
+import base64,hashlib,json,os,stat,sys
+root,candidate_name,final_name,previous_name,encoded=sys.argv[1:]
+expected=json.loads(base64.b64decode(encoded,validate=True))
+directory=os.open(root,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+root_info=os.fstat(directory)
+if (root_info.st_uid,root_info.st_gid,stat.S_IMODE(root_info.st_mode))!=(1000,1000,0o755): raise RuntimeError("adapter root identity differs")
+def exists(name):
+ try: os.stat(name,dir_fd=directory,follow_symlinks=False); return True
+ except FileNotFoundError: return False
+def validate(name,installed=False,check_hashes=True):
+ child=os.open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=directory)
+ try:
+  info=os.fstat(child)
+  if installed and (info.st_uid,info.st_gid,stat.S_IMODE(info.st_mode))!=(0,0,0o755): raise RuntimeError("adapter directory identity differs")
+  if set(os.listdir(child))!=set(expected): raise RuntimeError("adapter file set differs")
+  for filename,wanted in expected.items():
+   fd=os.open(filename,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=child)
+   try:
+    info=os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink!=1: raise RuntimeError("adapter file identity differs")
+    if installed and (info.st_uid,info.st_gid,stat.S_IMODE(info.st_mode))!=(0,0,0o644): raise RuntimeError("adapter file owner or mode differs")
+    digest=hashlib.sha256()
+    while block:=os.read(fd,1048576): digest.update(block)
+    if check_hashes and digest.hexdigest()!=wanted: raise RuntimeError("adapter file checksum differs: "+filename)
+   finally: os.close(fd)
+ finally: os.close(child)
+def prepare_candidate():
+ child=os.open(candidate_name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=directory)
+ try:
+  for filename in expected:
+   fd=os.open(filename,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=child)
+   try: os.fchown(fd,0,0); os.fchmod(fd,0o644)
+   finally: os.close(fd)
+  os.fchown(child,0,0); os.fchmod(child,0o755)
+ finally: os.close(child)
+def remove_exact(name):
+ child=os.open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=directory)
+ try:
+  if set(os.listdir(child))!=set(expected): raise RuntimeError("adapter cleanup file set differs")
+  for filename in expected: os.unlink(filename,dir_fd=child)
+ finally: os.close(child)
+ os.rmdir(name,dir_fd=directory)
+try:
+ validate(candidate_name)
+ if exists(previous_name): raise RuntimeError("adapter rollback path already exists")
+ try: validate(final_name,True)
+ except FileNotFoundError:
+  prepare_candidate()
+  os.rename(candidate_name,final_name,src_dir_fd=directory,dst_dir_fd=directory)
+  os.fsync(directory)
+  try:
+   validate(final_name,True)
+  except BaseException:
+   os.rename(final_name,candidate_name,src_dir_fd=directory,dst_dir_fd=directory)
+   os.fsync(directory)
+   raise
+  print("installed")
+ except RuntimeError:
+  validate(final_name,True,False)
+  prepare_candidate()
+  os.rename(final_name,previous_name,src_dir_fd=directory,dst_dir_fd=directory)
+  try:
+   os.rename(candidate_name,final_name,src_dir_fd=directory,dst_dir_fd=directory)
+   os.fsync(directory)
+   validate(final_name,True)
+  except BaseException:
+   if exists(final_name): os.rename(final_name,candidate_name,src_dir_fd=directory,dst_dir_fd=directory)
+   os.rename(previous_name,final_name,src_dir_fd=directory,dst_dir_fd=directory)
+   os.fsync(directory)
+   raise
+  remove_exact(previous_name)
+  os.fsync(directory)
+  print("replaced")
+ else:
+  remove_exact(candidate_name)
+  os.fsync(directory)
+  print("reused")
+finally: os.close(directory)
+PY"""
+    state = _remote_ok(host, install, "step-20 H200 adapter install", timeout=600).strip()
+    if state not in {"installed", "replaced", "reused"}:
+        raise RuntimeError("step-20 H200 adapter install returned invalid state")
+    return str(final)
+
+
 def _check_image_prime08(image: str, group: str) -> list[str]:
     command = (
         f"sudo docker run --rm --network none --entrypoint /app/.venv/bin/python "
@@ -6973,6 +7464,10 @@ def production_start_preflight() -> dict[str, object]:
     inference_host = inference_hosts[0]
     current_sources = None
     current_images = None
+    parity_report = None
+    parity_capture = None
+    stability_result = None
+    stability_result_sha256 = None
     try:
         ranked_hosts = [trainer_head] + [
             host for host in trainer_hosts if host != trainer_head
@@ -6987,6 +7482,10 @@ def production_start_preflight() -> dict[str, object]:
         failures.append(str(error))
     try:
         report = _remote_json(inference_host, production_parity_report)
+        parity_report = report
+        parity_capture = _remote_json(
+            inference_host, f"{glm_parity_paths['h200_capture']}/manifest.json"
+        )
         fixture_manifest = _remote_json(
             inference_host, f"{production_parity_fixture}/manifest.json"
         )
@@ -7065,6 +7564,20 @@ def production_start_preflight() -> dict[str, object]:
                 if code or observed.strip() != expected:
                     failures.append(f"{profile_name}: evidence file checksum differs: {path}")
             if profile_name == "glm52-native-stability20":
+                stability_result = result
+                code, observed_result_sha256 = _ssh(
+                    trainer_head,
+                    f"sha256sum {shlex.quote(f'{output_dir}/qualification-result.json')} | cut -d' ' -f1",
+                    timeout=60,
+                )
+                if code or re.fullmatch(
+                    r"[0-9a-f]{64}", observed_result_sha256.strip()
+                ) is None:
+                    failures.append(
+                        f"{profile_name}: qualification result checksum is invalid"
+                    )
+                else:
+                    stability_result_sha256 = observed_result_sha256.strip()
                 adapter_dir = (
                     PurePosixPath(output_dir)
                     / "run_trainer_only"
@@ -7125,6 +7638,46 @@ def production_start_preflight() -> dict[str, object]:
                     )
         except (KeyError, OSError, Refused, RuntimeError, tomllib.TOMLDecodeError) as error:
             failures.append(f"{profile_name}: {error}")
+    try:
+        if (
+            not isinstance(parity_report, dict)
+            or not isinstance(parity_capture, dict)
+            or not isinstance(stability_result, dict)
+            or not isinstance(stability_result_sha256, str)
+        ):
+            raise Refused("step-20 H200 gate prerequisites are incomplete")
+        with (repo_root / production_step20_h200_profile).open("rb") as stream:
+            gate_profile = tomllib.load(stream)
+        gate_result = _remote_json(inference_host, production_step20_h200_result)
+        capture_manifest_path = f"{glm_parity_paths['h200_capture']}/manifest.json"
+        code, capture_sha256 = _ssh(
+            inference_host,
+            f"sha256sum {shlex.quote(capture_manifest_path)} | cut -d' ' -f1",
+            timeout=60,
+        )
+        if code or re.fullmatch(r"[0-9a-f]{64}", capture_sha256.strip()) is None:
+            raise Refused("H200 parity capture manifest checksum is invalid")
+        code, engine_digest = _ssh(
+            inference_host,
+            f"sudo docker image inspect {shlex.quote(inference_image)} --format '{{{{.Id}}}}'",
+            timeout=60,
+        )
+        if code or re.fullmatch(r"sha256:[0-9a-f]{64}", engine_digest.strip()) is None:
+            raise Refused("H200 gate engine image digest is invalid")
+        failures.extend(
+            _validate_step20_h200_gate(
+                gate_result,
+                gate_profile,
+                stability_result,
+                parity_report,
+                parity_capture,
+                qualification_result_sha256=stability_result_sha256,
+                capture_manifest_sha256=capture_sha256.strip(),
+                expected_engine_digest=engine_digest.strip(),
+            )
+        )
+    except (KeyError, OSError, Refused, RuntimeError, tomllib.TOMLDecodeError) as error:
+        failures.append(str(error))
     failures.extend(_check_image_prime08(inference_image, "inference"))
     failures.extend(_check_image_prime08(trainer_image, "trainer"))
     if failures:
@@ -7133,6 +7686,7 @@ def production_start_preflight() -> dict[str, object]:
         "parity_report": production_parity_report,
         "batch2048_steps": [1, 2],
         "stability20_steps": list(range(1, 21)),
+        "step20_h200_gate": production_step20_h200_result,
         "trainer_mounts": 45,
         "inference_image": inference_image,
         "trainer_image": trainer_image,
@@ -7246,12 +7800,13 @@ def deploy(path: str, nodes: list[str] | None = None) -> bool:
 
 def _copy_resume_adapter(path: str, nodes: list[str]) -> None:
     """Copy one adapter from the trainer head to missing trainer nodes."""
-    if not path.startswith(f"{run_root}/"):
-        raise Refused(f"resume adapter must be below {run_root}")
+    exact_step20 = glm_step20_h200_gate["trainer_adapter"]
+    if not path.startswith(f"{run_root}/") and path != exact_step20:
+        raise Refused("resume adapter is outside an allowed exact root")
     targets = [host for host in nodes if host != trainer_head]
     if not targets:
         return
-    target_addresses = " ".join(f"10.92.20.{host.removeprefix('n')}" for host in targets)
+    target_addresses = " ".join(trainer_internal_addresses[host] for host in targets)
     quoted_path = shlex.quote(path)
     script = f"""
 set -euo pipefail
@@ -7704,12 +8259,17 @@ def qualify(
     name: str,
     mode: str = "cold",
     nodes: list[str] | None = None,
+    *,
+    resume_adapter: str | None = None,
+    resume_step: int | None = None,
 ) -> None:
     """Start one configured trainer-only qualification."""
     if mode not in ("cold", "restart"):
         raise Refused('qualification mode must be "cold" or "restart"')
     if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
         raise Refused("qualification name can contain only letters, digits, '_' and '-'")
+    if (resume_adapter is None) != (resume_step is None):
+        raise Refused("qualification resume adapter and step must be set together")
     nodes = [_check_host(host) for host in (nodes or trainer_hosts)]
     if trainer_head in nodes:
         nodes = [trainer_head] + [host for host in nodes if host != trainer_head]
@@ -7719,6 +8279,13 @@ def qualify(
     if "orchestrator" in selected:
         raise Refused(f"profile {name!r} is a full run; use start()")
     relative_config = selected["trainer"]
+    expected_step20_adapter = glm_step20_h200_gate["trainer_adapter"]
+    if resume_adapter is not None and (
+        relative_config != "configs/qualification/glm52-policy-parity-trainer.toml"
+        or resume_adapter != expected_step20_adapter
+        or resume_step != 0
+    ):
+        raise Refused("only the exact step-20 adapter can seed trainer parity")
     local_config = repo_root / relative_config
     if not local_config.is_file():
         raise Refused(f"missing qualification config {relative_config}")
@@ -7785,6 +8352,49 @@ def qualify(
             name, config, local_config, nodes, source_files
         )
 
+    if resume_adapter is not None:
+        stability, _result_sha256 = _step20_stability_evidence()
+        expected_digest = _remote_sha256(resume_adapter)
+        if expected_digest != stability.get("adapter", {}).get("sha256"):
+            raise Refused("trainer parity adapter differs from stability20 evidence")
+        observed = _fan(
+            nodes,
+            lambda host: _ssh(
+                host,
+                f"sha256sum {shlex.quote(resume_adapter)} 2>/dev/null | cut -d' ' -f1",
+                timeout=60,
+            ),
+        )
+        missing = [
+            host
+            for host, (code, value) in observed.items()
+            if code or not value.strip()
+        ]
+        differing = [
+            host
+            for host, (code, value) in observed.items()
+            if not code and value.strip() and value.strip() != expected_digest
+        ]
+        if differing:
+            raise Refused(f"trainer parity adapter differs on {differing}")
+        if missing:
+            _copy_resume_adapter(resume_adapter, nodes)
+            observed = _fan(
+                nodes,
+                lambda host: _ssh(
+                    host,
+                    f"sha256sum {shlex.quote(resume_adapter)} 2>/dev/null | cut -d' ' -f1",
+                    timeout=60,
+                ),
+            )
+            incomplete = [
+                host
+                for host, (code, value) in observed.items()
+                if code or value.strip() != expected_digest
+            ]
+            if incomplete:
+                raise Refused(f"trainer parity adapter copy differs on {incomplete}")
+
     trainer_nodes = " ".join(host.removeprefix("n") for host in nodes)
     env = (
         f"prime_deployment={shlex.quote(remote_repo)} "
@@ -7797,6 +8407,11 @@ def qualify(
         "PRIME_EP_PROFILE=0 PRIME_EP_AC_CACHE=0 PRIME_INT4_COMBINE_ROUNDS=1 "
         "PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD=0"
     )
+    if resume_adapter is not None:
+        env += (
+            f" PRIME_RL_RESUME_ADAPTER={shlex.quote(resume_adapter)}"
+            f" PRIME_RL_RESUME_ADAPTER_STEP={resume_step}"
+        )
     if muse:
         env += (
             " TRANSFORMERS_OVERRIDE_DIR=/data/muse-glimmer/transformers"
@@ -10092,6 +10707,32 @@ def _diagnose_glm52_parity_action(arguments: list[str]):
     return diagnose_glm52_policy_parity(names[0], keep_engine=keep_engine)
 
 
+def _qualify_glm52_step20_parity_action(arguments: list[str]):
+    if arguments:
+        raise Refused("qualify-glm52-step20-parity takes no arguments")
+    adapter = glm_step20_h200_gate["trainer_adapter"]
+    return qualify(
+        "glm52-policy-parity",
+        resume_adapter=adapter,
+        resume_step=0,
+    )
+
+
+def _stage_glm52_step20_adapter_action(arguments: list[str]):
+    if arguments:
+        raise Refused("stage-glm52-step20-adapter takes no arguments")
+    stability, result_sha256 = _step20_stability_evidence()
+    path = _stage_step20_adapter_on_h200(
+        stability["adapter"], result_sha256
+    )
+    return {
+        "adapter": path,
+        "adapter_sha256": stability["adapter"]["sha256"],
+        "qualification_result": glm_step20_h200_gate["qualification_result"],
+        "qualification_result_sha256": result_sha256,
+    }
+
+
 def _cleanup_glm52_parity_engine_action(arguments: list[str]):
     if arguments:
         raise Refused("cleanup-glm52-parity-engine takes no arguments")
@@ -10117,6 +10758,8 @@ actions = {
     "qualify": lambda a: qualify(*a),
     "stage-glm52-parity": lambda a: stage_glm52_policy_parity(a or None),
     "collect-glm52-parity": lambda a: collect_glm52_policy_parity(a[0] if a else ""),
+    "qualify-glm52-step20-parity": _qualify_glm52_step20_parity_action,
+    "stage-glm52-step20-adapter": _stage_glm52_step20_adapter_action,
     "diagnose-glm52-parity": _diagnose_glm52_parity_action,
     "cleanup-glm52-parity-engine": _cleanup_glm52_parity_engine_action,
     "stop-legacy-qualification": lambda a: stop_legacy_qualification(*a),
@@ -10152,6 +10795,8 @@ usage = f"""training-ops <action> [args]
   archive <run> [step ...]      upload stable old LoRA adapters
                                 add --finished after another run is active
   qualify <profile>             start a trainer-only profile
+  qualify-glm52-step20-parity  score fixed parity tokens with the step-20 adapter
+  stage-glm52-step20-adapter   copy the exact step-20 adapter to H200
   stage-glm52-parity [node ...] validate and stage the exact parity reference
   diagnose-glm52-parity <run>  capture H200 parity and replay trainer layer 3
                                 add --keep-engine to retain a successful engine
