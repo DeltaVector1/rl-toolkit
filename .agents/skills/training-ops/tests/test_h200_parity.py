@@ -31,6 +31,7 @@ class H200ParityTest(unittest.TestCase):
         lose_capture_ack=False,
         invalid_capture_ack=False,
         interrupt_fifo=False,
+        timeout_start=False,
         main_status="absent",
     ):
         secret = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_"
@@ -107,6 +108,8 @@ class H200ParityTest(unittest.TestCase):
                     + "d" * 64
                     + ":11111111-2222-3333-4444-555555555555\n"
                 )
+                if timeout_start:
+                    return 124, "TIMEOUT\n"
                 if fail_start:
                     return 1, "start rejected\n" + identity
                 return 0, identity
@@ -155,7 +158,15 @@ class H200ParityTest(unittest.TestCase):
         call.receive = receive
         return secret, call, secret_call, secret_inputs
 
-    def _run_operation(self, ssh_call, secret_call, secret, *, keep_engine=False):
+    def _run_operation(
+        self,
+        ssh_call,
+        secret_call,
+        secret,
+        *,
+        keep_engine=False,
+        recovery_error=False,
+    ):
         metadata = json.dumps({"model_revision": "a" * 40, "adapter_sha256": "b" * 64})
         source_root = f"{training_ops.parity_trace_root}/qualification-1"
         listener_ports = []
@@ -209,6 +220,14 @@ class H200ParityTest(unittest.TestCase):
                 "host_boot_id": "11111111-2222-3333-4444-555555555555",
             }
 
+        recovery = (
+            RuntimeError("CID identity recovery failed")
+            if recovery_error
+            else {
+                "container_id": "d" * 64,
+                "host_boot_id": "11111111-2222-3333-4444-555555555555",
+            }
+        )
         with patch.object(
             training_ops.secrets, "token_hex", return_value="1" * 16
         ), patch.object(
@@ -264,6 +283,11 @@ class H200ParityTest(unittest.TestCase):
             },
         ), patch.object(
             training_ops, "_configured_h200_engine_startup_grace", return_value=7200
+        ), patch.object(
+            training_ops,
+            "_recover_h200_parity_launch_identity",
+            side_effect=recovery if recovery_error else None,
+            return_value=None if recovery_error else recovery,
         ), patch.object(training_ops, "_ssh", side_effect=ssh_call), patch.object(
             training_ops, "_sensitive_ssh_input", side_effect=secret_call
         ), patch.object(
@@ -597,6 +621,24 @@ sleep() {{
         self.assertEqual(run.call_args.kwargs["timeout"], 60)
         self.assertIn("ConnectTimeout=45", run.call_args.args[0])
         run.assert_called_once()
+
+    def test_ssh_timeout_retains_only_bounded_partial_output(self):
+        partial = "x" * 70000 + "parity-engine-identity:" + "d" * 64
+        with patch.object(
+            training_ops.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(
+                cmd="ssh",
+                timeout=60,
+                output=partial.encode(),
+                stderr=b"tail-error",
+            ),
+        ):
+            code, output = training_ops._ssh("n76", "true", timeout=60)
+        self.assertEqual(code, 124)
+        self.assertTrue(output.startswith("TIMEOUT\n"))
+        self.assertLessEqual(len(output) - len("TIMEOUT\n"), 65536)
+        self.assertTrue(output.endswith("tail-error"))
 
     def test_provenance_ssh_refuses_invalid_connect_timeout(self):
         for value in (True, 0, 121, "60"):
@@ -1353,13 +1395,14 @@ sleep() {{
             self._run_operation(ssh_call, secret_call, secret, keep_engine=True)
         self.assertNotIn(secret, str(caught.exception))
         self.assertIn("[redacted]", str(caught.exception))
-        self.assertTrue(
-            any(
-                'name=glm52-optims-h200' in command
-                and 'sudo docker rm "$expected_id"' in command
-                for command in commands
-            )
-        )
+        exact_cleanups = [
+            command
+            for command in commands
+            if 'name=glm52-optims-h200' in command
+            and 'sudo docker rm "$expected_id"' in command
+        ]
+        self.assertEqual(len(exact_cleanups), 1)
+        self.assertIn("expected_id=" + "d" * 64, exact_cleanups[0])
         rollback = next(
             command
             for command in commands
@@ -1406,6 +1449,17 @@ sleep() {{
         )
         self.assertIn("prime_require_absent=1", start)
         self.assertIn("prime_parity_bootstrap_fifo=", start)
+        self.assertIn(
+            "prime_parity_engine_cidfile=/data/glm52-rl/qualifications/"
+            "glm52-policy-parity/.diagnostic-work-1111111111111111/engine.cid",
+            start,
+        )
+        self.assertIn(
+            "prime_parity_engine_identity_file=/data/glm52-rl/qualifications/"
+            "glm52-policy-parity/.diagnostic-work-1111111111111111/"
+            "engine-identity.json",
+            start,
+        )
         self.assertTrue(any("capture-h200" in command for command in commands))
         self.assertFalse(
             any("PRIME_PARITY_BOOTSTRAP_TOKEN" in command for command in commands)
@@ -1628,6 +1682,39 @@ sleep() {{
                 2,
             )
 
+    def test_launch_identity_recovery_uses_nonce_cidfile_when_stdout_is_lost(self):
+        paths = training_ops._parity_container_write_paths("1" * 16)
+        marker = (
+            "parity-engine-identity:"
+            + "d" * 64
+            + ":11111111-2222-3333-4444-555555555555\n"
+        )
+        with patch.object(
+            training_ops, "_sensitive_ssh", return_value=marker
+        ) as remote:
+            recovered = training_ops._recover_h200_parity_launch_identity(
+                "h200a", paths, "TIMEOUT", ()
+            )
+        self.assertEqual(recovered["container_id"], "d" * 64)
+        command = remote.call_args.args[1]
+        self.assertIn(paths["engine_cid"], command)
+        self.assertIn(paths["engine_identity"], command)
+        self.assertIn("1000:1000:600", command)
+        self.assertIn("sudo docker inspect \"$cid\"", command)
+        self.assertIn("{{json .Config.Cmd}}", command)
+        self.assertIn('name=^/${name}$', command)
+        different = (
+            "parity-engine-identity:"
+            + "e" * 64
+            + ":11111111-2222-3333-4444-555555555555\n"
+        )
+        with patch.object(
+            training_ops, "_sensitive_ssh", return_value=marker
+        ), self.assertRaisesRegex(training_ops.Refused, "differs"):
+            training_ops._recover_h200_parity_launch_identity(
+                "h200a", paths, different, ()
+            )
+
     def test_container_write_inventory_refuses_unprepared_path(self):
         paths = training_ops._parity_container_write_paths("1" * 16)
         self.assertEqual(
@@ -1638,6 +1725,8 @@ sleep() {{
                 "diagnostic",
                 "capture",
                 "router_trace",
+                "engine_cid",
+                "engine_identity",
                 "bootstrap_fifo",
                 "lora_cache",
                 "vllm_cache",
@@ -2031,13 +2120,58 @@ sleep() {{
         with self.assertRaises(RuntimeError) as caught:
             self._run_operation(ssh_call, secret_call, secret, keep_engine=True)
         self.assertNotIn(secret, str(caught.exception))
-        self.assertTrue(
-            any(
-                'name=glm52-optims-h200' in command
-                and 'sudo docker rm "$expected_id"' in command
-                for command in commands
-            )
+        exact_cleanups = [
+            command
+            for command in commands
+            if 'name=glm52-optims-h200' in command
+            and 'sudo docker rm "$expected_id"' in command
+        ]
+        self.assertEqual(len(exact_cleanups), 1)
+
+    def test_start_timeout_without_stdout_recovers_cid_and_cleans_once(self):
+        commands = []
+        secret, ssh_call, secret_call, _ = self._operation_ssh(
+            commands, timeout_start=True
         )
+        with self.assertRaisesRegex(RuntimeError, "engine start failed"):
+            self._run_operation(ssh_call, secret_call, secret)
+        exact_cleanups = [
+            command
+            for command in commands
+            if 'sudo docker rm "$expected_id"' in command
+        ]
+        self.assertEqual(len(exact_cleanups), 1)
+        self.assertIn("expected_id=" + "d" * 64, exact_cleanups[0])
+        self.assertNotIn('docker rm "$name"', exact_cleanups[0])
+
+    def test_launch_identity_recovery_failure_retains_work_without_name_removal(self):
+        commands = []
+        secret, ssh_call, secret_call, _ = self._operation_ssh(
+            commands, timeout_start=True
+        )
+        with self.assertRaisesRegex(RuntimeError, "could not be recovered") as caught:
+            self._run_operation(
+                ssh_call,
+                secret_call,
+                secret,
+                recovery_error=True,
+            )
+        self.assertFalse(
+            any('docker rm "$name"' in command for command in commands)
+        )
+        work = (
+            "/data/glm52-rl/qualifications/glm52-policy-parity/"
+            ".diagnostic-work-1111111111111111"
+        )
+        temp_cleanup = next(
+            command
+            for command in commands
+            if "bootstrap.fifo" in command and ".diagnostic-source-" in command
+        )
+        self.assertNotIn(f"sudo rm -rf -- {work}", temp_cleanup)
+        notes = "\n".join(getattr(caught.exception, "__notes__", ()))
+        self.assertIn("launch cleanup identity is missing", notes)
+        self.assertIn(work, notes)
 
     def test_diagnostic_operation_reports_cleanup_failure(self):
         commands = []

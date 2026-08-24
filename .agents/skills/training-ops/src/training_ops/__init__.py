@@ -332,8 +332,17 @@ def _ssh(
         )
         output = p.stdout if p.returncode == 0 else p.stdout + p.stderr
         return p.returncode, output
-    except subprocess.TimeoutExpired:
-        return 124, "TIMEOUT"
+    except subprocess.TimeoutExpired as error:
+        parts = []
+        for value in (error.stdout, error.stderr):
+            if isinstance(value, bytes):
+                parts.append(value.decode("utf-8", errors="replace"))
+            elif isinstance(value, str):
+                parts.append(value)
+        partial = "".join(parts)
+        if len(partial) > 65536:
+            partial = partial[-65536:]
+        return 124, "TIMEOUT" + ("\n" + partial if partial else "")
 
 
 def _remote_ok(
@@ -3047,6 +3056,86 @@ def _h200_parity_launch_identity(output: str) -> dict[str, str]:
     return {"container_id": container_id, "host_boot_id": host_boot_id}
 
 
+def _recover_h200_parity_launch_identity(
+    host: str,
+    paths: dict[str, str],
+    launch_output: str,
+    sensitive: tuple[str, ...],
+) -> dict[str, str]:
+    work = paths.get("work", "")
+    match = re.fullmatch(
+        r"/data/glm52-rl/qualifications/glm52-policy-parity/"
+        r"\.diagnostic-work-([0-9a-f]{16})",
+        work,
+    )
+    if match is None or paths != _parity_container_write_paths(match.group(1)):
+        raise Refused("parity launch identity inventory is not exact")
+    stdout_identity = None
+    try:
+        stdout_identity = _h200_parity_launch_identity(launch_output)
+    except Refused:
+        pass
+    expected_command = json.dumps(
+        ["@", glm_parity_inference_config, "--vllm-extra", glm_parity_vllm_extra],
+        separators=(",", ":"),
+    )
+    command = f"""
+set -euo pipefail
+work={shlex.quote(work)}
+cidfile={shlex.quote(paths["engine_cid"])}
+identity={shlex.quote(paths["engine_identity"])}
+name={shlex.quote(glm_inference_container)}
+test -d "$work"
+test ! -L "$work"
+test "$(realpath -e "$work")" = "$work"
+test "$(stat -c '%u:%g:%a' "$work")" = "1000:1000:750"
+for path in "$cidfile" "$identity"; do
+  test -f "$path"
+  test ! -L "$path"
+  test "$(realpath -e "$path")" = "$path"
+  test "$(stat -c '%u:%g:%a' "$path")" = "1000:1000:600"
+done
+cid=$(cat "$cidfile")
+[[ "$cid" =~ ^[0-9a-f]{{64}}$ ]]
+test "$(wc -l <"$cidfile")" = 1
+boot=$(python3 -c 'import json,pathlib,re,sys
+p=pathlib.Path(sys.argv[1]); value=json.loads(p.read_text())
+assert set(value)=={{"container_id","host_boot_id"}}
+assert value["container_id"]==sys.argv[2]
+assert re.fullmatch(r"[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}",value["host_boot_id"])
+print(value["host_boot_id"])' "$identity" "$cid")
+test "$(cat /proc/sys/kernel/random/boot_id)" = "$boot"
+record=""
+if record=$(sudo docker inspect "$cid" --format '{{{{.Id}}}}\n{{{{.Name}}}}\n{{{{.Config.Image}}}}\n{{{{json .Config.Cmd}}}}\n{{{{.RestartCount}}}}\n{{{{.HostConfig.RestartPolicy.Name}}}}' 2>/dev/null); then
+  mapfile -t fields <<<"$record"
+  test "${{#fields[@]}}" = 6
+  test "${{fields[0]}}" = "$cid"
+  test "${{fields[1]}}" = "/$name"
+  test "${{fields[2]}}" = {shlex.quote(inference_image)}
+  test "${{fields[3]}}" = {shlex.quote(expected_command)}
+  test "${{fields[4]}}" = 0
+  test "${{fields[5]}}" = no
+else
+  by_name=$(sudo docker ps -a --no-trunc --filter "name=^/${{name}}$" --format '{{{{.ID}}}} {{{{.Names}}}}')
+  by_id=$(sudo docker ps -a --no-trunc --filter "id=$cid" --format '{{{{.ID}}}} {{{{.Names}}}}')
+  test -z "$by_name"
+  test -z "$by_id"
+fi
+printf 'parity-engine-identity:%s:%s\n' "$cid" "$boot"
+"""
+    recovered_output = _sensitive_ssh(
+        host,
+        command,
+        "isolated parity launch identity recovery",
+        sensitive,
+        60,
+    )
+    recovered = _h200_parity_launch_identity(recovered_output)
+    if stdout_identity is not None and stdout_identity != recovered:
+        raise Refused("isolated parity launch output differs from its identity file")
+    return recovered
+
+
 def _h200_parity_container_cleanup_command(
     expected_container_id: str,
     expected_host_boot_id: str,
@@ -3326,6 +3415,8 @@ def _parity_container_write_paths(nonce: str) -> dict[str, str]:
         "diagnostic": f"{work}/diagnostic.npz",
         "capture": f"{work}/capture",
         "router_trace": f"{work}/h200-router-trace",
+        "engine_cid": f"{work}/engine.cid",
+        "engine_identity": f"{work}/engine-identity.json",
         "bootstrap_fifo": f"{run}/bootstrap.fifo",
         "lora_cache": "/data/glm52-rl/lora-cache",
         "vllm_cache": f"{remote_repo}/cache/vllm",
@@ -3401,6 +3492,8 @@ trace={shlex.quote(paths["router_trace"])}
 fixture={shlex.quote(paths["fixture"])}
 diagnostic={shlex.quote(paths["diagnostic"])}
 capture={shlex.quote(paths["capture"])}
+cid={shlex.quote(paths["engine_cid"])}
+identity={shlex.quote(paths["engine_identity"])}
 test ! -e "$work"
 test ! -L "$work"
 sudo install -d -o 1000 -g 1000 -m 0750 "$work"
@@ -3416,7 +3509,7 @@ for path in "$work" "$trace"; do
 done
 test "$(find "$work" -mindepth 1 -maxdepth 1 -printf '%f\n')" = "h200-router-trace"
 test -z "$(find "$trace" -mindepth 1 -maxdepth 1 -print -quit)"
-for path in "$fixture" "$diagnostic" "$capture"; do
+for path in "$fixture" "$diagnostic" "$capture" "$cid" "$identity"; do
   test ! -e "$path"
   test ! -L "$path"
 done
@@ -3453,8 +3546,15 @@ def _verify_parity_container_outputs(
         names = "diagnostic.npz\nfixture\nh200-router-trace"
     elif stage == "capture":
         directories = (paths["capture"], paths["router_trace"])
-        files = (paths["diagnostic"],)
-        names = "capture\ndiagnostic.npz\nh200-router-trace"
+        files = (
+            paths["diagnostic"],
+            paths["engine_cid"],
+            paths["engine_identity"],
+        )
+        names = (
+            "capture\ndiagnostic.npz\nengine-identity.json\nengine.cid\n"
+            "h200-router-trace"
+        )
     else:
         raise Refused("parity container output stage is invalid")
     directory_values = " ".join(shlex.quote(path) for path in directories)
@@ -4605,17 +4705,29 @@ printf '%s\n' "$state"
             f"prime_inference_container={shlex.quote(glm_inference_container)} "
             f"prime_parity_bootstrap_fifo={shlex.quote(bootstrap_fifo)} "
             f"prime_parity_trace_dir={shlex.quote(h200_trace_directory)} "
+            f"prime_parity_engine_cidfile={shlex.quote(container_writes['engine_cid'])} "
+            f"prime_parity_engine_identity_file={shlex.quote(container_writes['engine_identity'])} "
             "prime_require_absent=1 "
             f"bash {shlex.quote(remote_repo + '/scripts/h200/start_inference.sh')} "
             f"{shlex.quote(glm_parity_inference_config)}"
         )
+        engine_launch_attempted = True
         start_code, start_output = _ssh(host, start_command, timeout=180)
         try:
-            launch_identity = _h200_parity_launch_identity(start_output)
-            engine_launch_attempted = True
-        except Refused:
-            if start_code == 0:
-                raise
+            launch_identity = _recover_h200_parity_launch_identity(
+                host,
+                container_writes,
+                start_output,
+                sensitive,
+            )
+        except BaseException as recovery_error:
+            if start_code:
+                raise RuntimeError(
+                    "isolated parity engine start failed and its exact identity "
+                    f"could not be recovered: {_redact_sensitive(start_output.strip(), sensitive)}; "
+                    f"{recovery_error}"
+                ) from recovery_error
+            raise
         if start_code:
             raise RuntimeError(
                 "isolated parity engine start failed: "
@@ -4822,7 +4934,10 @@ printf '%s\n' "$state"
             try:
                 settle_timeout, poll_seconds = _configured_h200_parity_cleanup()
                 if launch_identity is None:
-                    raise Refused("H200 parity launch cleanup identity is missing")
+                    raise Refused(
+                        "H200 parity launch cleanup identity is missing; "
+                        f"work retained at {container_work_directory}"
+                    )
                 expected_id = launch_identity["container_id"]
                 expected_boot = launch_identity["host_boot_id"]
                 container_cleanup = _h200_parity_container_cleanup_command(

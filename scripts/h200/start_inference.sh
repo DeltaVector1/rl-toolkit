@@ -83,6 +83,26 @@ if [[ "$trace_identity" != "1000:1000:750" || \
   echo "refusing parity router trace owner, mode, or content: $trace_identity" >&2
   exit 2
 fi
+engine_cidfile=${prime_parity_engine_cidfile:-}
+engine_identity_file=${prime_parity_engine_identity_file:-}
+work_parent=$(dirname "$parity_trace_dir")
+if [[ "$engine_cidfile" != "$work_parent/engine.cid" || \
+      "$engine_identity_file" != "$work_parent/engine-identity.json" || \
+      ! "$work_parent" =~ ^$qualification_root/\.diagnostic-work-[0-9a-f]{16}$ ]]; then
+  echo "refusing parity engine without exact identity paths" >&2
+  exit 2
+fi
+for path in "$engine_cidfile" "$engine_identity_file" "$engine_identity_file.tmp"; do
+  if [[ -e "$path" || -L "$path" ]]; then
+    echo "refusing existing parity engine identity path: $path" >&2
+    exit 2
+  fi
+done
+host_boot_id=$(cat /proc/sys/kernel/random/boot_id)
+if [[ ! "$host_boot_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+  echo "refusing invalid host boot ID" >&2
+  exit 1
+fi
 install -d -o 1000 -g 1000 -m 0755 /data/glm52-rl/lora-cache
 install -d -o 1000 -g 1000 -m 0755 "$deployment/cache/vllm"
 for stale_container in "$engine_container" "$engine_container-0" "$engine_container-1"; do
@@ -110,7 +130,8 @@ done
 # draft layer pads 8 query heads to 64. At 32,768 tokens its BF16 query has a
 # 2,415,919,104-byte stride, which exceeds FlashMLA's int32 limit and
 # terminates every tensor-parallel worker.
-container_id=$(docker run -d --name "$engine_container" --restart "$restart_policy" \
+container_id=$(docker run -d --cidfile "$engine_cidfile" \
+  --name "$engine_container" --restart "$restart_policy" \
   --log-opt max-size=512m --log-opt max-file=3 \
   --gpus all \
   --network host \
@@ -145,8 +166,12 @@ container_id=$(docker run -d --name "$engine_container" --restart "$restart_poli
   "$image" \
   @ "$inference_config" \
   --vllm-extra "$vllm_extra")
+if [[ ! "$container_id" =~ ^[0-9a-f]{64}$ && \
+      -f "$engine_cidfile" && ! -L "$engine_cidfile" ]]; then
+  container_id=$(<"$engine_cidfile")
+fi
 if [[ ! "$container_id" =~ ^[0-9a-f]{64}$ ]]; then
-  echo "refusing invalid isolated container ID" >&2
+  echo "refusing invalid isolated container ID and CID file" >&2
   exit 1
 fi
 cleanup_unreported_container() {
@@ -159,9 +184,27 @@ cleanup_unreported_container() {
   exit "$status"
 }
 trap cleanup_unreported_container EXIT
-host_boot_id=$(cat /proc/sys/kernel/random/boot_id)
-if [[ ! "$host_boot_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
-  echo "refusing invalid host boot ID" >&2
+if [[ ! -f "$engine_cidfile" || -L "$engine_cidfile" || \
+      "$(realpath -e "$engine_cidfile")" != "$engine_cidfile" ]]; then
+  echo "refusing invalid isolated container CID file" >&2
+  exit 1
+fi
+chmod 0600 "$engine_cidfile"
+if [[ "$(stat -c '%u:%g:%a' "$engine_cidfile")" != "1000:1000:600" || \
+      "$(<"$engine_cidfile")" != "$container_id" || \
+      "$(wc -l <"$engine_cidfile")" -ne 1 ]]; then
+  echo "refusing isolated container CID file mismatch" >&2
+  exit 1
+fi
+python3 -c 'import json,os,pathlib,sys
+p=pathlib.Path(sys.argv[1]); t=pathlib.Path(str(p)+".tmp")
+t.write_text(json.dumps({"container_id":sys.argv[2],"host_boot_id":sys.argv[3]},sort_keys=True,separators=(",",":"))+"\n")
+os.chmod(t,0o600); os.replace(t,p)' \
+  "$engine_identity_file" "$container_id" "$host_boot_id"
+if [[ ! -f "$engine_identity_file" || -L "$engine_identity_file" || \
+      "$(realpath -e "$engine_identity_file")" != "$engine_identity_file" || \
+      "$(stat -c '%u:%g:%a' "$engine_identity_file")" != "1000:1000:600" ]]; then
+  echo "refusing invalid isolated container identity file" >&2
   exit 1
 fi
 printf 'parity-engine-identity:%s:%s\n' "$container_id" "$host_boot_id"

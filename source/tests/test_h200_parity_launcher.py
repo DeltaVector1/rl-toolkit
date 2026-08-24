@@ -142,6 +142,11 @@ class H200ParityLauncherTest(unittest.TestCase):
         self.assertIn("{{.HostConfig.RestartPolicy.Name}}", source)
         self.assertIn("trap cleanup_unreported_container EXIT", source)
         self.assertIn('docker rm -f "$container_id"', source)
+        self.assertIn('--cidfile "$engine_cidfile"', source)
+        self.assertIn("prime_parity_engine_cidfile", source)
+        self.assertIn("prime_parity_engine_identity_file", source)
+        self.assertIn("engine-identity.json", source)
+        self.assertIn("1000:1000:600", source)
         self.assertLess(identity, source.index("mapfile -t identity", launch))
         self.assertLess(identity, source.index("trap - EXIT", identity))
 
