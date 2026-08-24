@@ -1294,6 +1294,32 @@ def expected_h200_diagnostic_entries() -> dict[str, dict[str, Any]]:
     }
 
 
+legacy_h200_missing_diagnostics = frozenset(
+    f"{name}-rank-0-pp-0-cp-0"
+    for name in (
+        "layer0_normalized_input",
+        "layer0_normalized_kv",
+        "layer0_o_proj_input_tp0",
+    )
+)
+
+
+def accepted_h200_diagnostic_entries(
+    names: set[str],
+) -> dict[str, dict[str, Any]]:
+    current = expected_h200_diagnostic_entries()
+    if len(current) != 23 or not legacy_h200_missing_diagnostics < set(current):
+        raise RuntimeError("H200 diagnostic plan changed without a schema update")
+    if names == set(current):
+        return current
+    legacy_names = set(current) - legacy_h200_missing_diagnostics
+    if len(legacy_names) != 20:
+        raise RuntimeError("legacy H200 diagnostic plan is invalid")
+    if names == legacy_names:
+        return {name: current[name] for name in current if name in legacy_names}
+    raise ValueError("retained H200 diagnostic entry set is invalid")
+
+
 def validate_retained_diagnostic_content_fd(
     file_descriptor: int,
     entry: dict[str, Any],
@@ -1385,7 +1411,6 @@ def validate_retained_h200_diagnostics_fd(
         raise ValueError("retained H200 diagnostics are missing")
     source = direct.get("diagnostics")
     binding = h200_diagnostic_binding(direct)
-    plan = expected_h200_diagnostic_entries()
     entries = retained.get("entries")
     source_entries = source.get("entries") if isinstance(source, dict) else None
     if (
@@ -1400,7 +1425,6 @@ def validate_retained_h200_diagnostics_fd(
         or retained.get("binding") != binding
         or retained.get("files") != len(entries)
         or len(entries) != len(source_entries)
-        or len(entries) != len(plan)
         or len(entries) > retained_diagnostic_file_limit
     ):
         raise ValueError("retained H200 diagnostic manifest is invalid")
@@ -1409,6 +1433,9 @@ def validate_retained_h200_diagnostics_fd(
     }
     if len(source_by_name) != len(source_entries):
         raise ValueError("H200 diagnostic source names are invalid")
+    plan = accepted_h200_diagnostic_entries(set(source_by_name))
+    if len(entries) != len(plan):
+        raise ValueError("retained H200 diagnostic manifest is invalid")
     total_bytes = 0
     files: set[str] = set()
     source_fields = {"name", "file", "shape", "source_dtype", "sha256", "bytes"}

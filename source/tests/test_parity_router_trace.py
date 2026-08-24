@@ -1246,6 +1246,61 @@ class ParityRouterTraceTest(unittest.TestCase):
             with patch.object(parity_script, "retained_diagnostic_tokens", 3):
                 validate_retained_h200_diagnostics(output, manifest)
 
+            current_names = set(plan)
+            with patch.object(parity_script, "retained_diagnostic_tokens", 3):
+                self.assertEqual(
+                    set(
+                        parity_script.accepted_h200_diagnostic_entries(
+                            current_names
+                        )
+                    ),
+                    current_names,
+                )
+                legacy_names = (
+                    current_names - parity_script.legacy_h200_missing_diagnostics
+                )
+                self.assertEqual(len(current_names), 23)
+                self.assertEqual(len(legacy_names), 20)
+                self.assertEqual(
+                    set(parity_script.accepted_h200_diagnostic_entries(legacy_names)),
+                    legacy_names,
+                )
+                for missing in current_names:
+                    with self.subTest(missing=missing), self.assertRaisesRegex(
+                        ValueError, "entry set is invalid"
+                    ):
+                        parity_script.accepted_h200_diagnostic_entries(
+                            current_names - {missing}
+                        )
+                with self.assertRaisesRegex(ValueError, "entry set is invalid"):
+                    parity_script.accepted_h200_diagnostic_entries(
+                        (current_names - {next(iter(current_names))})
+                        | {"unknown-rank-0-pp-0-cp-0"}
+                    )
+
+            legacy_manifest = json.loads(json.dumps(manifest))
+            legacy_manifest["direct_router_diagnostic"]["diagnostics"][
+                "entries"
+            ] = [
+                entry
+                for entry in legacy_manifest["direct_router_diagnostic"][
+                    "diagnostics"
+                ]["entries"]
+                if entry["name"] not in parity_script.legacy_h200_missing_diagnostics
+            ]
+            legacy_retained = legacy_manifest["retained_diagnostics"]
+            legacy_retained["entries"] = [
+                entry
+                for entry in legacy_retained["entries"]
+                if entry["name"] not in parity_script.legacy_h200_missing_diagnostics
+            ]
+            legacy_retained["files"] = len(legacy_retained["entries"])
+            legacy_retained["bytes"] = sum(
+                entry["bytes"] for entry in legacy_retained["entries"]
+            )
+            with patch.object(parity_script, "retained_diagnostic_tokens", 3):
+                validate_retained_h200_diagnostics(output, legacy_manifest)
+
             moved_child = root / "moved-retained-child.npz"
             outside_file = root / "outside-file"
             outside_file.write_text("unchanged")
