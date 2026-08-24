@@ -472,6 +472,84 @@ class EdgeOperationsTest(unittest.TestCase):
                     ["n82"], include_inference=False
                 )
 
+    def test_live_service_check_retries_one_transient_banner_timeout(self):
+        self.assertEqual(
+            training_ops._configured_live_service_check(), (2, 45, 60, 2)
+        )
+        with patch.object(
+            training_ops,
+            "_ssh",
+            side_effect=[
+                (255, "Connection timed out during banner exchange"),
+                (0, ""),
+            ],
+        ) as ssh:
+            training_ops._assert_live_services_are_down(
+                ["n82"], include_inference=False
+            )
+
+        self.assertEqual(ssh.call_count, 2)
+        for call in ssh.call_args_list:
+            self.assertEqual(call.kwargs["connect_timeout"], 45)
+            self.assertEqual(call.kwargs["timeout"], 60)
+
+    def test_live_service_check_does_not_retry_a_hard_failure(self):
+        with patch.object(
+            training_ops, "_ssh", return_value=(255, "Permission denied")
+        ) as ssh, self.assertRaisesRegex(
+            RuntimeError, "cannot check the live trainer"
+        ):
+            training_ops._assert_live_services_are_down(
+                ["n82"], include_inference=False
+            )
+
+        ssh.assert_called_once()
+
+    def test_live_service_check_banner_retry_is_bounded(self):
+        with patch.object(
+            training_ops,
+            "_ssh",
+            return_value=(255, "Connection timed out during banner exchange"),
+        ) as ssh, self.assertRaisesRegex(
+            RuntimeError, "cannot check the live trainer"
+        ):
+            training_ops._assert_live_services_are_down(
+                ["n82"], include_inference=False
+            )
+
+        self.assertEqual(ssh.call_count, 2)
+
+    def test_live_service_check_still_refuses_active_service_after_retry(self):
+        with patch.object(
+            training_ops,
+            "_ssh",
+            side_effect=[
+                (255, "Connection timed out during banner exchange"),
+                (0, training_ops.protected_trainer + "\n"),
+            ],
+        ) as ssh, self.assertRaises(training_ops.Refused):
+            training_ops._assert_live_services_are_down(
+                ["n82"], include_inference=False
+            )
+
+        self.assertEqual(ssh.call_count, 2)
+
+    def test_live_service_check_uses_configured_worker_bound(self):
+        observed = []
+
+        def fan(hosts, function, workers=None):
+            observed.append(workers)
+            return {host: function(host) for host in hosts}
+
+        with patch.object(training_ops, "_fan", side_effect=fan), patch.object(
+            training_ops, "_ssh", return_value=(0, "")
+        ):
+            training_ops._assert_live_services_are_down(
+                ["n82", "n76"], include_inference=False
+            )
+
+        self.assertEqual(observed, [2])
+
     def test_qualification_launch_uses_isolated_inventory(self):
         calls = []
 
