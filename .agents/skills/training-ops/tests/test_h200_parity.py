@@ -57,26 +57,133 @@ class H200ParityTest(unittest.TestCase):
         metadata = json.dumps(
             {"model_revision": "a" * 40, "adapter_sha256": "b" * 64}
         )
+        source_root = f"{training_ops.parity_trace_root}/qualification-1"
         with patch.object(training_ops.secrets, "token_urlsafe", return_value=secret), patch.object(
             training_ops.secrets, "token_hex", return_value="1" * 16
         ), patch.object(
             training_ops, "_diagnostic_capture_preflight", return_value={"files": 20, "estimated_bytes": 1}
         ), patch.object(
-            training_ops, "_remote_ok", return_value=metadata
+            training_ops,
+            "_resolve_glm52_parity_diagnostic_source",
+            return_value=(training_ops.trainer_head, source_root, json.loads(metadata)),
+        ), patch.object(
+            training_ops, "_remote_ok", return_value="source-ready"
         ), patch.object(
             training_ops, "_sha256_file", return_value="config-sha"
-        ), patch.object(
-            training_ops, "_copy_parity_diagnostic_input"
-        ), patch.object(
+        ), patch.object(training_ops, "_copy_parity_diagnostic_input") as copy_input, patch.object(
             training_ops, "_h200_parity_container_preflight"
         ), patch.object(
             training_ops, "_configured_h200_engine_startup_grace", return_value=7200
         ), patch.object(training_ops, "_ssh", side_effect=ssh_call), patch.object(
             training_ops, "_sensitive_ssh_input", side_effect=secret_call
         ):
-            return training_ops.diagnose_glm52_policy_parity(
+            result = training_ops.diagnose_glm52_policy_parity(
                 "qualification-1", keep_engine=keep_engine
             )
+        self.last_diagnostic_copy = copy_input.call_args
+        return result
+
+    @staticmethod
+    def _source_evidence(host, pp_rank, session):
+        modules = {
+            "prime_rl.models.glm": {
+                "location": "mounted",
+                "sha256": "c" * 64,
+            }
+        }
+        return json.dumps(
+            {
+                "session": session,
+                "provenance": {
+                    "kind": "glm52_policy_parity_trainer_runtime",
+                    "host": host,
+                    "pp_rank": pp_rank,
+                    "cp_rank": 0,
+                    "global_rank": pp_rank * 8,
+                    "pp_size": 8,
+                    "cp_size": 8,
+                    "image_digest": "sha256:" + "d" * 64,
+                    "modules": modules,
+                },
+                "provenance_file": f"trainer-runtime-pp-{pp_rank}-host-{host}.json",
+            }
+        )
+
+    def test_diagnostic_source_uses_provenance_not_trainer_list_order(self):
+        hosts = ["n76", "n77", "n78", "n80", "n82", "n83", "n84", "n85"]
+        pp_by_host = {"n82": 0}
+        pp_by_host.update(
+            {host: rank for rank, host in enumerate((h for h in hosts if h != "n82"), 1)}
+        )
+        session = {
+            "side": "trainer",
+            "model_revision": "a" * 40,
+            "adapter_sha256": "b" * 64,
+        }
+        queried = []
+
+        def remote(host, command, label, timeout=120):
+            del command, label, timeout
+            queried.append(host)
+            return self._source_evidence(host, pp_by_host[host], session)
+
+        with patch.object(training_ops, "trainer_hosts", hosts), patch.object(
+            training_ops, "trainer_head", "n82"
+        ), patch.object(training_ops, "_remote_ok", side_effect=remote):
+            source_host, source_root, source_session = (
+                training_ops._resolve_glm52_parity_diagnostic_source("qualification-1")
+            )
+
+        self.assertEqual(source_host, "n82")
+        self.assertEqual(
+            source_root,
+            f"{training_ops.parity_trace_root}/qualification-1",
+        )
+        self.assertEqual(source_session, session)
+        self.assertEqual(set(queried), set(hosts))
+
+    def test_diagnostic_source_refuses_missing_or_duplicate_pp0(self):
+        hosts = ["n76", "n77", "n78", "n80", "n82", "n83", "n84", "n85"]
+        session = {
+            "side": "trainer",
+            "model_revision": "a" * 40,
+            "adapter_sha256": "b" * 64,
+        }
+        for pp_by_host in (
+            {host: rank + 1 for rank, host in enumerate(hosts)},
+            {host: (0 if rank < 2 else rank - 1) for rank, host in enumerate(hosts)},
+        ):
+            with self.subTest(pp_by_host=pp_by_host):
+                def remote(host, command, label, timeout=120):
+                    del command, label, timeout
+                    return self._source_evidence(host, pp_by_host[host], session)
+
+                with patch.object(training_ops, "trainer_hosts", hosts), patch.object(
+                    training_ops, "trainer_head", "n82"
+                ), patch.object(training_ops, "_remote_ok", side_effect=remote):
+                    with self.assertRaisesRegex(training_ops.Refused, "one PP0/CP0"):
+                        training_ops._resolve_glm52_parity_diagnostic_source(
+                            "qualification-1"
+                        )
+
+    def test_diagnostic_source_refuses_pp0_that_is_not_trainer_head(self):
+        hosts = ["n76", "n77", "n78", "n80", "n82", "n83", "n84", "n85"]
+        session = {
+            "side": "trainer",
+            "model_revision": "a" * 40,
+            "adapter_sha256": "b" * 64,
+        }
+        pp_by_host = {host: rank for rank, host in enumerate(hosts)}
+
+        def remote(host, command, label, timeout=120):
+            del command, label, timeout
+            return self._source_evidence(host, pp_by_host[host], session)
+
+        with patch.object(training_ops, "trainer_hosts", hosts), patch.object(
+            training_ops, "trainer_head", "n82"
+        ), patch.object(training_ops, "_remote_ok", side_effect=remote):
+            with self.assertRaisesRegex(training_ops.Refused, "trainer head"):
+                training_ops._resolve_glm52_parity_diagnostic_source("qualification-1")
 
     def test_diagnostic_capture_preflight_fits_existing_h200_cap(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -251,6 +358,8 @@ class H200ParityTest(unittest.TestCase):
         result = self._run_operation(ssh_call, secret_call, secret)
         self.assertNotIn(secret, json.dumps(result, sort_keys=True))
         self.assertEqual(secret_inputs, [secret, secret])
+        self.assertEqual(self.last_diagnostic_copy.args[0], training_ops.trainer_head)
+        self.assertNotEqual(self.last_diagnostic_copy.args[0], training_ops.trainer_hosts[0])
         self.assertFalse(any(secret in command for command in commands))
         start = next(
             command

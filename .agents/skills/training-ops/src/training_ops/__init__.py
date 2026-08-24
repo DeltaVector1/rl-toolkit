@@ -2660,6 +2660,136 @@ def _copy_parity_diagnostic_input(
             raise RuntimeError("H200 diagnostic input copy failed")
 
 
+def _resolve_glm52_parity_diagnostic_source(
+    name: str,
+) -> tuple[str, str, dict[str, object]]:
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+        raise Refused("parity diagnostic name contains unsafe characters")
+    trainer_config = repo_root / "configs/qualification/glm52-policy-parity-trainer.toml"
+    with trainer_config.open("rb") as stream:
+        trainer_values = tomllib.load(stream)
+    model_values = trainer_values.get("model", {})
+    pp_size = model_values.get("pp")
+    cp_size = model_values.get("cp")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 1
+        for value in (pp_size, cp_size)
+    ):
+        raise Refused("parity trainer TOML must define positive model.pp and model.cp")
+    if len(trainer_hosts) != pp_size or trainer_head not in trainer_hosts:
+        raise Refused("configured trainer hosts do not match the parity PP topology")
+    source_root = f"{parity_trace_root}/{name}"
+
+    def read_host(host: str) -> dict[str, object]:
+        _check_parity_host(host)
+        command = (
+            f"test -d {shlex.quote(source_root)} && "
+            f"test ! -L {shlex.quote(source_root)} && "
+            f"test \"$(realpath -e {shlex.quote(source_root)})\" = "
+            f"{shlex.quote(source_root)} && "
+            "python3 -c 'import json,pathlib,sys; root=pathlib.Path(sys.argv[1]); "
+            "session=root/\"session.json\"; "
+            "records=sorted(root.glob(\"trainer-runtime-pp-*-host-*.json\")); "
+            "assert session.is_file() and not session.is_symlink(); "
+            "assert len(records)==1 and not records[0].is_symlink(); "
+            "print(json.dumps({\"session\":json.loads(session.read_text()),"
+            "\"provenance\":json.loads(records[0].read_text()),"
+            "\"provenance_file\":records[0].name},sort_keys=True))' "
+            f"{shlex.quote(source_root)}"
+        )
+        output = _remote_ok(host, command, "trainer parity provenance", timeout=60)
+        try:
+            value = json.loads(output.strip().splitlines()[-1])
+        except (json.JSONDecodeError, IndexError) as error:
+            raise RuntimeError(
+                f"trainer parity provenance returned invalid JSON on {host}"
+            ) from error
+        if not isinstance(value, dict):
+            raise Refused(f"trainer parity provenance is invalid on {host}")
+        return value
+
+    evidence = _fan(trainer_hosts, read_host, workers=min(8, len(trainer_hosts)))
+    records: list[dict[str, object]] = []
+    sessions: list[dict[str, object]] = []
+    module_sets: list[object] = []
+    for host in trainer_hosts:
+        value = evidence.get(host)
+        if not isinstance(value, dict):
+            raise Refused(f"trainer parity evidence is missing from {host}")
+        session = value.get("session")
+        record = value.get("provenance")
+        filename = value.get("provenance_file")
+        if not isinstance(session, dict) or not isinstance(record, dict):
+            raise Refused(f"trainer parity evidence is invalid on {host}")
+        match = re.fullmatch(
+            r"trainer-runtime-pp-(\d+)-host-(n\d+)\.json", str(filename)
+        )
+        if match is None:
+            raise Refused(f"trainer parity provenance filename is invalid on {host}")
+        pp_rank = record.get("pp_rank")
+        cp_rank = record.get("cp_rank")
+        if (
+            record.get("kind") != "glm52_policy_parity_trainer_runtime"
+            or record.get("host") != host
+            or match.group(2) != host
+            or not isinstance(pp_rank, int)
+            or isinstance(pp_rank, bool)
+            or int(match.group(1)) != pp_rank
+            or cp_rank != 0
+            or record.get("global_rank") != pp_rank * cp_size
+            or record.get("pp_size") != pp_size
+            or record.get("cp_size") != cp_size
+        ):
+            raise Refused(f"trainer parity rank provenance is invalid on {host}")
+        image_digest = record.get("image_digest")
+        if not isinstance(image_digest, str) or not re.fullmatch(
+            r"sha256:[0-9a-f]{64}", image_digest
+        ):
+            raise Refused(f"trainer parity image digest is invalid on {host}")
+        modules = record.get("modules")
+        if not isinstance(modules, dict) or not modules:
+            raise Refused(f"trainer parity module provenance is invalid on {host}")
+        for module in modules.values():
+            if (
+                not isinstance(module, dict)
+                or module.get("location") not in {"mounted", "unmounted"}
+                or not isinstance(module.get("sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", module["sha256"]) is None
+            ):
+                raise Refused(f"trainer parity module provenance is invalid on {host}")
+        records.append(record)
+        sessions.append(session)
+        module_sets.append(modules)
+    pp0 = [
+        record
+        for record in records
+        if record.get("pp_rank") == 0 and record.get("cp_rank") == 0
+    ]
+    if len(pp0) != 1:
+        raise Refused("trainer parity provenance must contain one PP0/CP0 host")
+    if {record["pp_rank"] for record in records} != set(range(pp_size)):
+        raise Refused("trainer parity provenance does not uniquely cover every PP rank")
+    source_host = str(pp0[0]["host"])
+    if source_host != trainer_head:
+        raise Refused(
+            "trainer parity PP0/CP0 host differs from the configured trainer head"
+        )
+    if any(session != sessions[0] for session in sessions[1:]):
+        raise Refused("trainer parity sessions differ between hosts")
+    session = sessions[0]
+    if (
+        session.get("side") != "trainer"
+        or not isinstance(session.get("model_revision"), str)
+        or re.fullmatch(r"[0-9a-f]{40}", session["model_revision"]) is None
+        or not isinstance(session.get("adapter_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", session["adapter_sha256"]) is None
+    ):
+        raise Refused("trainer parity session identity is invalid")
+    if any(modules != module_sets[0] for modules in module_sets[1:]):
+        raise Refused("trainer parity module hashes differ between hosts")
+    return source_host, source_root, session
+
+
 def diagnose_glm52_policy_parity(name: str, keep_engine: bool = False) -> dict[str, object]:
     if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
         raise Refused("parity diagnostic name contains unsafe characters")
@@ -2675,8 +2805,7 @@ def diagnose_glm52_policy_parity(name: str, keep_engine: bool = False) -> dict[s
     fixture = glm_parity_paths["fixture"]
     if PurePosixPath(capture).parent != PurePosixPath(root):
         raise Refused("H200 capture path is outside the exact parity root")
-    source_host = trainer_hosts[0]
-    source_root = f"{parity_trace_root}/{name}"
+    source_host, source_root, metadata = _resolve_glm52_parity_diagnostic_source(name)
     source_input = (
         f"{source_root}/trainer-rank-0-pp-0-cp-0-"
         "diagnostic-layer3_router_input.npz"
@@ -2687,22 +2816,13 @@ def diagnose_glm52_policy_parity(name: str, keep_engine: bool = False) -> dict[s
         f"test \"$(realpath -e {shlex.quote(source_root)})\" = {shlex.quote(source_root)} && "
         f"test -f {shlex.quote(source_input)} && test ! -L {shlex.quote(source_input)} && "
         f"test -f {shlex.quote(session_path)} && test ! -L {shlex.quote(session_path)} && "
-        "python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); "
-        "print(json.dumps({\"model_revision\":s[\"model_revision\"],"
-        "\"adapter_sha256\":s[\"adapter_sha256\"]}))' "
-        f"{shlex.quote(session_path)}"
+        "echo source-ready"
     )
     metadata_output = _remote_ok(
         source_host, metadata_command, "trainer parity session", timeout=60
     )
-    try:
-        metadata = json.loads(metadata_output.strip().splitlines()[-1])
-    except (json.JSONDecodeError, IndexError) as error:
-        raise RuntimeError("trainer parity session returned invalid JSON") from error
-    if not re.fullmatch(r"[0-9a-f]{40}", str(metadata.get("model_revision", ""))):
-        raise Refused("trainer parity model revision is invalid")
-    if not re.fullmatch(r"[0-9a-f]{64}", str(metadata.get("adapter_sha256", ""))):
-        raise Refused("trainer parity adapter checksum is invalid")
+    if metadata_output.strip() != "source-ready":
+        raise RuntimeError("trainer parity diagnostic input returned an invalid state")
 
     bootstrap_token = secrets.token_urlsafe(48)
     nonce = secrets.token_hex(8)
