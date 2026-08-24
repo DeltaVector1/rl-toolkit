@@ -1,6 +1,7 @@
 [hosts]
 trainer_head = "n82"
 trainers = ["n76", "n77", "n78", "n80", "n82", "n83", "n84", "n85"]
+trainer_internal_addresses = { n76 = "10.92.20.76", n77 = "10.92.20.77", n78 = "10.92.20.78", n80 = "10.92.20.80", n82 = "10.92.20.82", n83 = "10.92.20.83", n84 = "10.92.20.84", n85 = "10.92.20.85" }
 inference = ["h200a"]
 orchestrator = "h200a"
 metrics = ["h200a", "n82"]

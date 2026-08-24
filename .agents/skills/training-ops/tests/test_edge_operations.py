@@ -79,6 +79,13 @@ class EdgeOperationsTest(unittest.TestCase):
             config["env_vars"]["PRIME_PARITY_ROUTER_TRACE_SOURCE"],
             f"{stage}/trainer-router-trace",
         )
+        self.assertEqual(
+            set(training_ops.trainer_internal_addresses),
+            set(training_ops.trainer_hosts),
+        )
+        self.assertEqual(
+            training_ops.trainer_internal_addresses["n82"], "10.92.20.82"
+        )
 
     def test_parity_python_missing_numpy_fails_before_host_copy(self):
         failed = subprocess.CompletedProcess(
@@ -1089,6 +1096,7 @@ raise SystemExit(99)
         self.assertNotIn("/tmp/", command)
         self.assertIn("os.O_NOFOLLOW", command)
         self.assertIn("fcntl.flock", command)
+        self.assertIn("fcntl.LOCK_EX|fcntl.LOCK_NB", command)
         self.assertIn("src_dir_fd=candidates,dst_dir_fd=root", command)
         self.assertIn('print("replaced-retained:"', command)
         self.assertIn("libc.renameat2", command)
@@ -1113,6 +1121,7 @@ raise SystemExit(99)
         )
         self.assertIn("os.O_NOFOLLOW", command)
         self.assertIn("fcntl.flock", command)
+        self.assertIn("fcntl.LOCK_EX|fcntl.LOCK_NB", command)
         self.assertIn("entries<=allowed", command)
         self.assertNotIn("rm -rf", command)
         with self.assertRaisesRegex(training_ops.Refused, "cleanup target"):
@@ -1363,7 +1372,7 @@ raise SystemExit(99)
                         "n82", training_ops.glm_parity_paths["trainer_stage"], Path(temporary)
                     )
 
-    def test_parity_stage_copy_uses_ssh_compression_and_safe_options(self):
+    def test_parity_stage_copy_and_fanout_are_compressed_and_bounded(self):
         copied = subprocess.CompletedProcess([], 0, "", "")
         with tempfile.TemporaryDirectory() as temporary, patch.object(
             training_ops.subprocess, "run", return_value=copied
@@ -1376,16 +1385,30 @@ raise SystemExit(99)
         command = run.call_args.args[0]
         self.assertEqual(command[:6], ["scp", "-C", "-q", "-o", "BatchMode=yes", "-r"])
         self.assertEqual(run.call_args.kwargs["timeout"], 600)
-        source = Path(training_ops.__file__).read_text()
-        install = source[source.index("def install(host: str)"):]
-        copy = install[install.index("copied_to_host = subprocess.run"):]
-        self.assertIn(
-            '"scp",\n                            "-C",\n                            "-q",',
-            copy,
+        candidate = (
+            f"{training_ops.glm_parity_stage_candidate_root}/"
+            "trainer-stage-candidate-0123456789abcdef"
         )
-        self.assertIn('"BatchMode=yes",\n                            "-r",', copy)
-        self.assertLess(copy.index('"-C"'), copy.index('f"{local_stage}/."'))
-        self.assertIn("timeout=600", copy)
+        command = training_ops._glm_parity_transfer_command(
+            "/source", "10.92.20.76", candidate, "10:20"
+        )
+        self.assertEqual(command[:5], [
+            "timeout", "--signal=TERM", "--kill-after=5s", "540s", "rsync",
+        ])
+        for option in ("--compress", "--partial", "--append-verify"):
+            self.assertIn(option, command)
+        remote = next(value for value in command if value.startswith("--rsync-path="))
+        self.assertIn("stat -c '%d:%i'", remote)
+        self.assertIn("exec timeout --signal=TERM --kill-after=5s 500s", remote)
+        self.assertIn(f"flock -- {candidate} sh -c", remote)
+        self.assertIn("shift 2 && exec rsync", remote)
+        self.assertGreater(remote.count("stat -c"), 1)
+        self.assertNotIn("flock -n", remote)
+        self.assertIn("StrictHostKeyChecking=yes", command[command.index("-e") + 1])
+        self.assertIn("UpdateHostKeys=no", command[command.index("-e") + 1])
+        self.assertNotIn("accept-new", command[command.index("-e") + 1])
+        self.assertNotIn("--foreground", remote)
+        self.assertEqual(command[-2:], ["/source/.", f"10.92.20.76:{candidate}/"])
 
     def test_parity_stage_create_ack_loss_still_runs_cleanup(self):
         source = Path(training_ops.__file__).read_text()
@@ -1396,7 +1419,8 @@ raise SystemExit(99)
         self.assertLess(candidate_exists, candidate_create)
         self.assertLess(candidate_create, cleanup)
         self.assertIn("except BaseException as error", method)
-        self.assertIn("timeout=600", method)
+        self.assertIn("transfer_started", method)
+        self.assertIn("transfer started; exact candidate was retained", method)
 
     def test_parity_stage_flow_does_not_use_manifest_only_or_broad_delete(self):
         source = Path(training_ops.__file__).read_text()
@@ -1407,11 +1431,118 @@ raise SystemExit(99)
         self.assertIn("_glm_parity_stage_build_command", method)
         self.assertNotIn("rm -rf", method)
         self.assertNotIn("/tmp/glm52-parity-stage", method)
-        install = method[method.index("def install(host: str)"):]
+        install = method[method.index("def install("):]
         self.assertLess(
             install.index("_glm_parity_stage_current_command"),
-            install.index("copied_to_host = subprocess.run"),
+            install.index("_transfer_glm_parity_stage"),
         )
+        self.assertLess(install.index("seed = install"), install.index("_fan([host"))
+        self.assertEqual(install.count("_ssh(trainer_head, current_command)"), 2)
+
+    def test_parity_stage_transfer_retries_same_partial_candidate(self):
+        candidate = (
+            f"{training_ops.glm_parity_stage_candidate_root}/"
+            "trainer-stage-candidate-0123456789abcdef"
+        )
+        failed = subprocess.CompletedProcess([], 23, "", "partial")
+        copied = subprocess.CompletedProcess([], 0, "", "")
+        with patch.object(
+            training_ops.subprocess,
+            "run",
+            side_effect=[failed, failed, copied],
+        ) as run:
+            result = training_ops._transfer_glm_parity_stage(
+                "/source", "n82", candidate, "10:20"
+            )
+        self.assertEqual(result, (True, "ok"))
+        self.assertEqual(run.call_count, 3)
+        self.assertTrue(
+            all(call.args[0] == run.call_args_list[0].args[0] for call in run.call_args_list)
+        )
+        self.assertTrue(all(call.kwargs["timeout"] == 580 for call in run.call_args_list))
+
+    def test_parity_stage_transfer_timeout_is_uncertain_and_not_retried(self):
+        candidate = (
+            f"{training_ops.glm_parity_stage_candidate_root}/"
+            "trainer-stage-candidate-0123456789abcdef"
+        )
+        with patch.object(
+            training_ops.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired("rsync", 600),
+        ) as run:
+            copied, detail = training_ops._transfer_glm_parity_stage(
+                "/source", "n82", candidate, "10:20"
+            )
+        self.assertFalse(copied)
+        self.assertIn("process state uncertain", detail)
+        run.assert_called_once()
+        with patch.object(
+            training_ops, "_ssh", return_value=(124, "TIMEOUT")
+        ) as ssh:
+            copied, detail = training_ops._transfer_glm_parity_stage(
+                "/source",
+                "10.92.20.76",
+                candidate,
+                "10:20",
+                "n82",
+            )
+        self.assertFalse(copied)
+        self.assertIn("controller timeout", detail)
+        ssh.assert_called_once()
+
+    def test_parity_stage_transfer_preflight_has_no_fallback(self):
+        missing = subprocess.CompletedProcess([], 127, "", "")
+        with patch.object(training_ops.subprocess, "run", return_value=missing):
+            self.assertIn(
+                "unavailable",
+                training_ops._glm_parity_transfer_preflight("n82"),
+            )
+        with patch.object(
+            training_ops, "_ssh", return_value=(127, "missing rsync")
+        ) as ssh:
+            self.assertEqual(
+                training_ops._glm_parity_transfer_preflight(
+                    "10.92.20.76", "n82"
+                ),
+                "missing rsync",
+            )
+        self.assertIn("StrictHostKeyChecking=yes", ssh.call_args.args[1])
+        self.assertIn("UpdateHostKeys=no", ssh.call_args.args[1])
+        self.assertNotIn("accept-new", ssh.call_args.args[1])
+        source = Path(training_ops.__file__).read_text()
+        transfer = source[source.index("def _glm_parity_transfer_preflight"):]
+        self.assertNotIn("transfer=scp", transfer)
+
+    def test_parity_stage_requires_n82_seed(self):
+        with self.assertRaisesRegex(training_ops.Refused, "the head"):
+            training_ops.stage_glm52_policy_parity(["n76"])
+
+    def test_parity_stage_rsync_append_verify_repairs_partial_corruption(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            target = root / "target"
+            source.mkdir()
+            target.mkdir()
+            payload = bytes(range(256)) * 64
+            (source / "trainer-reference.json").write_bytes(payload)
+            (target / "trainer-reference.json").write_bytes(
+                b"wrong!!" + payload[7:8192]
+            )
+            copied = subprocess.run(
+                [
+                    "rsync", "--archive", "--partial", "--append-verify",
+                    f"{source}/.", f"{target}/",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(copied.returncode, 0, copied.stderr)
+            self.assertEqual(
+                (target / "trainer-reference.json").read_bytes(), payload
+            )
 
     def test_parity_stage_directory_creates_only_exact_missing_path(self):
         commands = []

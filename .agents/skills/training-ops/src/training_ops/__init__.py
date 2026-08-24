@@ -67,10 +67,22 @@ parity_token_root = "/data/glm52-rl/qualifications/glm52-policy-parity/trainer/t
 
 trainer_head = hosts["trainer_head"]
 trainer_hosts = list(hosts["trainers"])
+trainer_internal_addresses = dict(hosts["trainer_internal_addresses"])
 inference_hosts = list(hosts["inference"])
 orchestrator_host = hosts["orchestrator"]
 metric_hosts = list(hosts["metrics"])
 blocked_hosts = set(hosts["blocked"])
+if (
+    set(trainer_internal_addresses) != set(trainer_hosts)
+    or len(set(trainer_internal_addresses.values())) != len(trainer_hosts)
+    or any(
+        not isinstance(address, str)
+        or re.fullmatch(r"10\.92\.20\.(?:[1-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])", address)
+        is None
+        for address in trainer_internal_addresses.values()
+    )
+):
+    raise RuntimeError("trainer internal address inventory is invalid")
 inference_tunnel_ports = list(
     range(ports["inference_tunnel_first"], ports["inference_tunnel_last"] + 1)
 )
@@ -319,6 +331,10 @@ ssh_command = [
     "-o",
     "StrictHostKeyChecking=accept-new",
 ]
+trainer_ssh_command = [
+    "StrictHostKeyChecking=yes" if value == "StrictHostKeyChecking=accept-new" else value
+    for value in ssh_command
+] + ["-o", "UpdateHostKeys=no"]
 
 
 class Refused(RuntimeError):
@@ -8074,8 +8090,11 @@ try:
  if root_opened.st_dev!=candidate_root_opened.st_dev:
   raise RuntimeError("candidate root is on another filesystem")
  lock=os.open(".trainer-stage.lock",os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600,dir_fd=root)
+ candidate_lock=None
  try:
   fcntl.flock(lock,fcntl.LOCK_EX)
+  candidate_lock=open_dir_at(candidates,candidate)
+  fcntl.flock(candidate_lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
   required=(wanted,wanted_reference,wanted_session)
   candidate_identity,_=validate(candidates,candidate,required)
   try:
@@ -8114,6 +8133,8 @@ try:
    else:
     replace(stage_identity,candidate_identity,required)
  finally:
+  if candidate_lock is not None:
+   os.close(candidate_lock)
   os.close(lock)
   os.close(candidates)
 finally:
@@ -8168,6 +8189,7 @@ try:
     raise RuntimeError("candidate identity changed")
    if directory_identity!=wanted_identity:
     raise RuntimeError("candidate identity differs from the created directory")
+   fcntl.flock(directory,fcntl.LOCK_EX|fcntl.LOCK_NB)
    if directory_stat.st_uid!=1000 or directory_stat.st_gid!=1000 or stat.S_IMODE(directory_stat.st_mode)!=0o750:
     raise RuntimeError("candidate owner or mode differs")
    entries=set(os.listdir(directory))
@@ -8415,6 +8437,84 @@ def _copy_glm_parity_stage(host: str, stage: str, local_parent: Path) -> Path:
     return local_parent / PurePosixPath(stage).name
 
 
+def _glm_parity_transfer_command(
+    source: str, target: str, candidate: str, identity: str
+) -> list[str]:
+    path = PurePosixPath(candidate)
+    if (
+        target not in {trainer_head, *trainer_internal_addresses.values()}
+        or path.parent != PurePosixPath(glm_parity_stage_candidate_root)
+        or re.fullmatch(r"trainer-stage-candidate-[0-9a-f]{16}", path.name) is None
+        or re.fullmatch(r"[0-9]+:[0-9]+", identity) is None
+    ):
+        raise Refused("GLM parity transfer target is invalid")
+    locked_rsync = (
+        'test ! -L "$1" && test -d "$1" && '
+        'test "$(stat -c \'%d:%i\' "$1")" = "$2" && '
+        'shift 2 && exec rsync "$@"'
+    )
+    remote = (
+        f"test ! -L {shlex.quote(candidate)} && test -d {shlex.quote(candidate)} && "
+        f"test \"$(stat -c '%d:%i' {shlex.quote(candidate)})\" = {shlex.quote(identity)} "
+        f"&& exec timeout --signal=TERM --kill-after=5s 500s "
+        f"flock -- {shlex.quote(candidate)} sh -c {shlex.quote(locked_rsync)} "
+        f"sh {shlex.quote(candidate)} {shlex.quote(identity)}"
+    )
+    return [
+        "timeout", "--signal=TERM", "--kill-after=5s", "540s", "rsync",
+        "--archive", "--compress", "--partial", "--append-verify",
+        "--timeout=120", "--quiet", "-e", shlex.join(trainer_ssh_command),
+        f"--rsync-path={remote}", f"{source}/.", f"{target}:{candidate}/",
+    ]
+
+
+def _glm_parity_transfer_preflight(
+    target: str, source_host: str | None = None
+) -> str | None:
+    check = "command -v rsync && command -v timeout && command -v flock"
+    if source_host is None:
+        local = subprocess.run(
+            ["sh", "-c", check], capture_output=True, text=True, timeout=10
+        )
+        if local.returncode:
+            return "local rsync, timeout, or flock is unavailable"
+        code, detail = _ssh(target, check)
+    else:
+        if source_host != trainer_head or target not in trainer_internal_addresses.values():
+            raise Refused("GLM parity internal transfer route is invalid")
+        code, detail = _ssh(
+            source_host,
+            f"{check} && {shlex.join([*trainer_ssh_command, target, check])}",
+        )
+    return None if code == 0 else (detail.strip()[:120] or f"exit {code}")
+
+
+def _transfer_glm_parity_stage(
+    source: str, target: str, candidate: str, identity: str,
+    source_host: str | None = None,
+) -> tuple[bool, str]:
+    command = _glm_parity_transfer_command(source, target, candidate, identity)
+    failures = []
+    for attempt in range(1, 4):
+        try:
+            if source_host is None:
+                result = subprocess.run(
+                    command, capture_output=True, text=True, timeout=580
+                )
+                code, detail = result.returncode, result.stderr or result.stdout
+            else:
+                code, detail = _ssh(source_host, shlex.join(command), timeout=580)
+                if code == 124 and detail.startswith("TIMEOUT"):
+                    return False, f"attempt {attempt}: controller timeout"
+        except (OSError, subprocess.TimeoutExpired) as error:
+            return False, f"attempt {attempt}: process state uncertain: {error}"
+        if code == 0:
+            return True, "ok"
+        detail = " ".join((detail or "failed").strip().splitlines())[:120]
+        failures.append(f"attempt {attempt}: exit {code}: {detail}")
+    return False, "; ".join(failures)
+
+
 def _validate_glm_parity_stage_live_identity(
     local_stage: Path, fixture: str, capture: str
 ) -> str:
@@ -8547,6 +8647,12 @@ echo existing
 def stage_glm52_policy_parity(nodes: list[str] | None = None) -> None:
     """Build the exact H200 parity reference and copy it to trainer nodes."""
     nodes = [_check_host(host) for host in (nodes or trainer_hosts)]
+    if (
+        trainer_head not in nodes
+        or len(nodes) != len(set(nodes))
+        or any(host not in trainer_hosts for host in nodes)
+    ):
+        raise Refused("GLM parity staging requires configured trainers and the head")
     fixture = glm_parity_paths["fixture"]
     capture = glm_parity_paths["h200_capture"]
     stage = glm_parity_paths["trainer_stage"]
@@ -8683,6 +8789,7 @@ def stage_glm52_policy_parity(nodes: list[str] | None = None) -> None:
         session_sha256 = stage_manifest["files"][
             "trainer-router-trace/session.json"
         ]
+        fanout = False
 
         def install(host: str) -> str:
             current_code, current_state = _ssh(
@@ -8700,6 +8807,12 @@ def stage_glm52_policy_parity(nodes: list[str] | None = None) -> None:
                 return "ok"
             if current_state.strip() != "stale":
                 return "current stage check returned an invalid state"
+            source_host = trainer_head if fanout else None
+            source = stage if fanout else str(local_stage)
+            target = trainer_internal_addresses[host] if fanout else host
+            preflight = _glm_parity_transfer_preflight(target, source_host)
+            if preflight is not None:
+                return f"rsync preflight failed: {preflight}"
             remote_candidate = (
                 f"{glm_parity_stage_candidate_root}/trainer-stage-candidate-"
                 f"{secrets.token_hex(8)}"
@@ -8722,6 +8835,7 @@ def stage_glm52_policy_parity(nodes: list[str] | None = None) -> None:
                 return f"candidate path refused: {absent_detail.strip()[:120]}"
             candidate_exists = True
             remote_candidate_identity: str | None = None
+            transfer_started = False
             result = "ok"
             try:
                 create_code, create_detail = _ssh(
@@ -8740,60 +8854,41 @@ def stage_glm52_policy_parity(nodes: list[str] | None = None) -> None:
                     r"[0-9]+:[0-9]+", remote_candidate_identity
                 ) is None:
                     raise RuntimeError("candidate create identity is invalid")
-                try:
-                    copied_to_host = subprocess.run(
-                        [
-                            "scp",
-                            "-C",
-                            "-q",
-                            "-o",
-                            "BatchMode=yes",
-                            "-r",
-                            f"{local_stage}/.",
-                            f"{host}:{remote_candidate}/",
-                        ],
-                        capture_output=True,
-                        text=True,
-                        timeout=600,
-                    )
-                except subprocess.TimeoutExpired:
-                    result = "scp timed out"
+                transfer_started = True
+                copied, copy_detail = _transfer_glm_parity_stage(
+                    source,
+                    target,
+                    remote_candidate,
+                    remote_candidate_identity,
+                    source_host,
+                )
+                if not copied:
+                    result = f"rsync failed: {copy_detail}"
                 else:
-                    if copied_to_host.returncode:
-                        result = (
-                            "scp failed: "
-                            f"{copied_to_host.stderr.strip()[:120]}"
-                        )
+                    command = _glm_parity_stage_install_command(
+                        stage,
+                        remote_candidate,
+                        manifest_sha256,
+                        reference_sha256,
+                        session_sha256,
+                    )
+                    rc, detail = _ssh(host, command)
+                    state = detail.strip()
+                    if rc:
+                        result = f"install failed: {state[:120]}"
+                    elif state.startswith("replaced-retained:"):
+                        candidate_exists = False
+                        result = f"ok-retained:{state.removeprefix('replaced-retained:')}"
+                    elif state in {"current", "installed", "replaced"}:
+                        candidate_exists = False
                     else:
-                        command = _glm_parity_stage_install_command(
-                            stage,
-                            remote_candidate,
-                            manifest_sha256,
-                            reference_sha256,
-                            session_sha256,
-                        )
-                        rc, detail = _ssh(host, command)
-                        state = detail.strip()
-                        if rc:
-                            result = f"install failed: {state[:120]}"
-                        else:
-                            retained_prefix = "replaced-retained:"
-                            if state.startswith(retained_prefix):
-                                candidate_exists = False
-                                result = (
-                                    "ok-retained:"
-                                    f"{state[len(retained_prefix):]}"
-                                )
-                            elif state not in {
-                                "current",
-                                "installed",
-                                "replaced",
-                            }:
-                                result = "install returned an invalid state"
-                            else:
-                                candidate_exists = False
+                        result = "install returned an invalid state"
             except BaseException as error:
-                if candidate_exists:
+                if candidate_exists and transfer_started:
+                    error.add_note(
+                        "GLM parity transfer started; exact candidate was retained"
+                    )
+                elif candidate_exists:
                     remote_candidate_identity = remote_candidate_identity or (
                         _recover_glm_parity_stage_candidate_identity(
                             host, remote_candidate
@@ -8819,7 +8914,9 @@ def stage_glm52_policy_parity(nodes: list[str] | None = None) -> None:
                 raise
             else:
                 if candidate_exists:
-                    if remote_candidate_identity is None:
+                    if transfer_started:
+                        result = f"{result}; exact candidate retained"
+                    elif remote_candidate_identity is None:
                         result = (
                             f"{result}; exact candidate identity unavailable; "
                             "candidate retained"
@@ -8838,14 +8935,27 @@ def stage_glm52_policy_parity(nodes: list[str] | None = None) -> None:
                             )
             return result
 
-        results = _fan(nodes, install)
+        seed = install(trainer_head)
+        if seed != "ok" and not seed.startswith("ok-retained:"):
+            raise RuntimeError(f"GLM parity seed transfer failed: {seed[:240]}")
+        current_command = _glm_parity_stage_current_command(
+            stage, manifest_sha256, reference_sha256, session_sha256
+        )
+        if _ssh(trainer_head, current_command) != (0, "current\n"):
+            raise RuntimeError("GLM parity trainer-head source validation failed")
+        fanout = True
+        results = {trainer_head: seed}
+        results.update(_fan([host for host in nodes if host != trainer_head], install))
+        if _ssh(trainer_head, current_command) != (0, "current\n"):
+            raise RuntimeError("GLM parity trainer-head source changed during fanout")
     failed = [
         host
         for host, result in results.items()
         if result != "ok" and not result.startswith("ok-retained:")
     ]
     if failed:
-        raise RuntimeError(f"GLM parity stage failed on {failed}")
+        reasons = "; ".join(f"{host}: {results[host][:240]}" for host in failed)
+        raise RuntimeError(f"GLM parity stage failed: {reasons}")
     for host, result in results.items():
         if result.startswith("ok-retained:"):
             print(
