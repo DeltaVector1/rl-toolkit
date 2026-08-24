@@ -48,6 +48,7 @@ shared_requirements = operations["requirements"]["shared"]
 muse_requirements = operations["requirements"]["muse"]
 glm_requirements = operations["requirements"]["glm52"]
 glm_parity_paths = operations["parity"]["glm52"]
+glm_parity_root = "/data/glm52-rl/qualifications/glm52-policy-parity"
 parity_trace_root = "/data/glm52-rl/qualifications/glm52-policy-parity/trainer-traces"
 parity_token_root = "/data/glm52-rl/qualifications/glm52-policy-parity/trainer/token_exports"
 
@@ -3833,6 +3834,70 @@ def _write_parity_transaction_state(
     _sensitive_ssh(host, command, "parity transaction state write", sensitive, 60)
 
 
+def _h200_capture_publish_command(
+    root: str,
+    capture: str,
+    candidate: str,
+    previous: str,
+    nonce: str,
+    transaction_path: str,
+) -> str:
+    if root != glm_parity_root:
+        raise Refused("H200 capture publish root is invalid")
+    if re.fullmatch(r"[0-9a-f]{16}", nonce) is None:
+        raise Refused("H200 capture publish nonce is invalid")
+    failed = f"{root}/.h200-capture-publish-failed-{nonce}"
+    validator = (
+        "python3 scripts/glm52_policy_parity.py "
+        f"--profile {shlex.quote(production_parity_profile)} "
+        "validate-h200-capture"
+    )
+    return f"""
+set -euo pipefail
+root={shlex.quote(root)}
+capture={shlex.quote(capture)}
+candidate={shlex.quote(candidate)}
+test ! -L "$root"
+test "$(realpath -e "$root")" = "$root"
+test -f "$candidate/manifest.json"
+cd {shlex.quote(remote_repo)}
+{validator} "$candidate" >/dev/null
+previous={shlex.quote(previous)}
+failed={shlex.quote(failed)}
+test ! -e "$previous"
+test ! -L "$previous"
+test ! -e "$failed"
+test ! -L "$failed"
+changed=0
+had_previous=0
+restore_previous() {{
+  if test "$changed" = 1; then
+    if test -e "$capture" || test -L "$capture"; then mv "$capture" "$failed"; fi
+    if test "$had_previous" = 1 && test -e "$previous"; then mv "$previous" "$capture"; fi
+    if test -e "$failed" || test -L "$failed"; then rm -rf -- "$failed"; fi
+  fi
+}}
+trap restore_previous EXIT
+state=created
+test ! -L "$capture"
+if test -e "$capture"; then
+  test -d "$capture"
+  test ! -L "$capture"
+  mv "$capture" "$previous"
+  changed=1
+  had_previous=1
+  state=replaced
+fi
+mv "$candidate" "$capture"
+changed=1
+test -f "$capture/manifest.json"
+{validator} "$capture" >/dev/null
+{_parity_transaction_update_command(transaction_path, "capture_published", "capture", '"$state"')}
+trap - EXIT
+printf '%s\n' "$state"
+"""
+
+
 def _parity_transaction_snapshot(
     host: str,
     path: str,
@@ -4870,7 +4935,9 @@ test -d "$candidate"
 test ! -L "$candidate"
 test -f "$candidate/manifest.json"
 test ! -e "$previous"
+test ! -L "$previous"
 test ! -e "$failed"
+test ! -L "$failed"
 changed=0
 had_previous=0
 restore_fixture() {{
@@ -5062,48 +5129,14 @@ printf '%s\n' "$state"
         capture_state_value["new_manifest_sha256"] = capture_new_sha256
         capture_state_value["old_manifest_sha256"] = capture_old_sha256
         _write_parity_transaction_state(host, transaction_path, transaction_state, sensitive)
-        publish_command = f"""
-set -euo pipefail
-root={shlex.quote(root)}
-capture={shlex.quote(capture)}
-candidate={shlex.quote(temporary_capture)}
-test ! -L "$root"
-test "$(realpath -e "$root")" = "$root"
-test -f "$candidate/manifest.json"
-cd {shlex.quote(remote_repo)}
-python3 scripts/glm52_policy_parity.py \
-  --profile {shlex.quote(production_parity_profile)} \
-  validate-h200-capture "$candidate" >/dev/null
-previous={shlex.quote(capture_previous)}
-failed="$root/.h200-capture-publish-failed-{nonce}"
-test ! -e "$previous"
-test ! -e "$failed"
-changed=0
-had_previous=0
-restore_previous() {{
-  if test "$changed" = 1; then
-    if test -e "$capture"; then mv "$capture" "$failed"; fi
-    if test "$had_previous" = 1 && test -e "$previous"; then mv "$previous" "$capture"; fi
-    if test -e "$failed"; then rm -rf -- "$failed"; fi
-  fi
-}}
-trap restore_previous EXIT
-state=created
-if test -e "$capture"; then
-  test -d "$capture"
-  test ! -L "$capture"
-  mv "$capture" "$previous"
-  changed=1
-  had_previous=1
-  state=replaced
-fi
-mv "$candidate" "$capture"
-changed=1
-test -f "$capture/manifest.json"
-{_parity_transaction_update_command(transaction_path, "capture_published", "capture", '"$state"')}
-trap - EXIT
-printf '%s\n' "$state"
-"""
+        publish_command = _h200_capture_publish_command(
+            root,
+            capture,
+            temporary_capture,
+            capture_previous,
+            nonce,
+            transaction_path,
+        )
         capture_publish_error: BaseException | None = None
         try:
             capture_ack = _sensitive_ssh(host, publish_command, "H200 parity capture publish", sensitive, 300).strip()

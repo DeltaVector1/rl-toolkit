@@ -952,6 +952,7 @@ class ParityRouterTraceTest(unittest.TestCase):
                 "adapter_sha256": h200_session["adapter_sha256"],
             }
             entries = []
+            replay_hashes = {}
             with patch.object(parity_script, "retained_diagnostic_tokens", 3):
                 plan = parity_script.expected_h200_diagnostic_entries()
                 for index, (name, semantic) in enumerate(plan.items()):
@@ -982,6 +983,18 @@ class ParityRouterTraceTest(unittest.TestCase):
                             "sha256": hashlib.sha256(values.tobytes()).hexdigest(),
                         }
                     )
+                    if kind == "layer3_h200_logits":
+                        replay_hashes["logits_sha256"] = hashlib.sha256(
+                            values.tobytes()
+                        ).hexdigest()
+                    elif kind == "layer3_h200_route_weights":
+                        replay_hashes["route_weights_sha256"] = hashlib.sha256(
+                            values.tobytes()
+                        ).hexdigest()
+                    elif kind == "layer3_h200_route_ids":
+                        replay_hashes["route_ids_sha256"] = hashlib.sha256(
+                            np.ascontiguousarray(values.astype(np.int32)).tobytes()
+                        ).hexdigest()
             diagnostics = {
                 "schema_version": 1,
                 "kind": "glm52_policy_parity_diagnostics",
@@ -999,6 +1012,7 @@ class ParityRouterTraceTest(unittest.TestCase):
                     "session_identity": identity,
                     "layer": 3,
                     "input_shape": [3, 6144],
+                    **replay_hashes,
                 },
             }
             with patch.object(parity_script, "retained_diagnostic_tokens", 3):
@@ -1017,6 +1031,43 @@ class ParityRouterTraceTest(unittest.TestCase):
             }
             with patch.object(parity_script, "retained_diagnostic_tokens", 3):
                 validate_retained_h200_diagnostics(output, manifest)
+
+            wrong_result_hash = json.loads(json.dumps(manifest))
+            wrong_result_hash["direct_router_diagnostic"]["results"][
+                "logits_sha256"
+            ] = "0" * 64
+            with patch.object(
+                parity_script, "retained_diagnostic_tokens", 3
+            ), self.assertRaisesRegex(ValueError, "differs from direct replay"):
+                validate_retained_h200_diagnostics(output, wrong_result_hash)
+
+            swap_output = root / "swap-output"
+            swap_output.mkdir()
+            moved_output = root / "moved-output"
+            outside = root / "outside"
+            outside.mkdir()
+            original_copy = parity_script.shutil.copyfileobj
+            swapped = False
+
+            def swap_parent(source_stream, target_stream, length):
+                nonlocal swapped
+                if not swapped:
+                    swapped = True
+                    swap_output.rename(moved_output)
+                    swap_output.symlink_to(outside, target_is_directory=True)
+                return original_copy(source_stream, target_stream, length)
+
+            with patch.object(
+                parity_script, "retained_diagnostic_tokens", 3
+            ), patch.object(
+                parity_script.shutil,
+                "copyfileobj",
+                side_effect=swap_parent,
+            ), self.assertRaisesRegex(ValueError, "directory identity changed"):
+                retain_h200_diagnostics(
+                    direct, swap_output, trace, 64, 100_000_000
+                )
+            self.assertEqual(list(outside.iterdir()), [])
 
             wrong_binding = json.loads(json.dumps(manifest))
             wrong_binding["retained_diagnostics"]["binding"][
@@ -1069,8 +1120,35 @@ class ParityRouterTraceTest(unittest.TestCase):
                     100_000_000,
                 )
 
-            outside = root / "outside"
-            outside.mkdir()
+            route_values = np.full(route_entry["shape"], 1.5, dtype=np.float32)
+            np.savez(
+                route_path,
+                values=route_values,
+                name=np.asarray(route_entry["name"]),
+                source_dtype=np.asarray(route_entry["source_dtype"]),
+                **{
+                    field: np.asarray(value) for field, value in binding.items()
+                },
+            )
+            route_entry["bytes"] = route_path.stat().st_size
+            route_entry["sha256"] = hashlib.sha256(
+                route_values.tobytes()
+            ).hexdigest()
+            (trace / "parity-diagnostics.json").write_text(
+                json.dumps(diagnostics, sort_keys=True) + "\n"
+            )
+            (root / "noninteger-route-ids").mkdir()
+            with patch.object(
+                parity_script, "retained_diagnostic_tokens", 3
+            ), self.assertRaisesRegex(ValueError, "route IDs are invalid"):
+                retain_h200_diagnostics(
+                    direct,
+                    root / "noninteger-route-ids",
+                    trace,
+                    64,
+                    100_000_000,
+                )
+
             symlink_output = root / "symlink-output"
             symlink_output.mkdir()
             (symlink_output / "diagnostics").symlink_to(outside)

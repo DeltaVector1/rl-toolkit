@@ -1614,6 +1614,16 @@ sleep() {{
         self.assertIn(
             ".diagnostic-work-1111111111111111/capture", prepublish
         )
+        self.assertEqual(prepublish.count("validate-h200-capture"), 2)
+        candidate_validation = prepublish.index(
+            'validate-h200-capture "$candidate"'
+        )
+        move = prepublish.index('mv "$candidate" "$capture"')
+        live_validation = prepublish.index('validate-h200-capture "$capture"')
+        transaction_update = prepublish.index("capture_published")
+        self.assertLess(candidate_validation, move)
+        self.assertLess(move, live_validation)
+        self.assertLess(live_validation, transaction_update)
         fifo_setup = next(command for command in commands if "mkfifo -m 0600" in command)
         self.assertIn("chown 1000:1000", fifo_setup)
         self.assertIn("1000:1000:600", fifo_setup)
@@ -2092,6 +2102,72 @@ sleep() {{
                 result = self._run_operation(ssh_call, secret_call, secret)
                 self.assertEqual(result["capture"], training_ops.glm_parity_paths["h200_capture"])
                 self.assertEqual(ssh_call.transaction["state"]["phase"], "committed")
+
+    def test_capture_publish_rolls_back_postmove_parent_swap(self):
+        nonce = "1" * 16
+        transaction = (
+            "/data/glm52-rl/qualifications/glm52-policy-parity/"
+            f".diagnostic-run-{nonce}/transaction.json"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            capture = root / "h200-capture-final"
+            previous = root / f".h200-capture-previous-{nonce}"
+            candidate = root / f".h200-capture-candidate-{nonce}"
+            moved = root / "moved-new-capture"
+            outside = root / "outside"
+            tools = root / "tools"
+            capture.mkdir()
+            (capture / "manifest.json").write_text("old")
+            candidate.mkdir()
+            (candidate / "manifest.json").write_text("new")
+            outside.mkdir()
+            tools.mkdir()
+            fake_python = tools / "python3"
+            fake_python.write_text(
+                "#!/bin/bash\n"
+                "last=${!#}\n"
+                'if test "$last" = "$LIVE"; then\n'
+                '  /bin/mv -- "$LIVE" "$MOVED"\n'
+                '  /bin/ln -s -- "$OUTSIDE" "$LIVE"\n'
+                "  exit 71\n"
+                "fi\n"
+                "exit 0\n"
+            )
+            fake_python.chmod(0o755)
+            with patch.object(
+                training_ops, "remote_repo", str(Path.cwd())
+            ), patch.object(training_ops, "glm_parity_root", str(root)):
+                command = training_ops._h200_capture_publish_command(
+                    str(root),
+                    str(capture),
+                    str(candidate),
+                    str(previous),
+                    nonce,
+                    transaction,
+                )
+            environment = {
+                **os.environ,
+                "PATH": f"{tools}:{os.environ['PATH']}",
+                "LIVE": str(capture),
+                "MOVED": str(moved),
+                "OUTSIDE": str(outside),
+            }
+            completed = subprocess.run(
+                ["bash", "-c", command],
+                text=True,
+                capture_output=True,
+                check=False,
+                env=environment,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertTrue(capture.is_dir())
+            self.assertFalse(capture.is_symlink())
+            self.assertEqual((capture / "manifest.json").read_text(), "old")
+            self.assertEqual(list(outside.iterdir()), [])
+            self.assertEqual((moved / "manifest.json").read_text(), "new")
+            self.assertFalse(previous.exists())
+            self.assertFalse((root / f".h200-capture-publish-failed-{nonce}").exists())
 
     def test_pair_rollback_second_move_failure_never_leaves_mixed_pair(self):
         with tempfile.TemporaryDirectory() as temporary:
