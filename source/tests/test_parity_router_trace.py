@@ -3,6 +3,8 @@ import json
 import base64
 import io
 import inspect
+import socket
+import stat
 import sys
 import tempfile
 import types
@@ -1665,6 +1667,123 @@ class ParityRouterTraceTest(unittest.TestCase):
             self.assertTrue(received.endswith(b"\n"))
             self.assertEqual(len(base64.urlsafe_b64decode(received[:-1])), 48)
 
+    def test_h200_capture_permissions_match_stage_contract_after_umask(self):
+        import scripts.glm52_policy_parity as parity_script
+
+        with tempfile.TemporaryDirectory() as temporary:
+            capture = Path(temporary) / "capture"
+            previous_umask = os.umask(0o022)
+            try:
+                capture.mkdir()
+            finally:
+                os.umask(previous_umask)
+            self.assertEqual(stat.S_IMODE(capture.stat().st_mode), 0o755)
+            manifest_path = capture / "manifest.json"
+            array_path = capture / "router_ids.npy"
+            manifest_path.write_text("{}\n")
+            array_path.write_bytes(b"array")
+            diagnostics = capture / "diagnostics"
+            diagnostics.mkdir(mode=0o755)
+            diagnostic = (
+                diagnostics / "h200-rank-0-pp-0-cp-0-diagnostic-router.npz"
+            )
+            diagnostic.write_bytes(b"diagnostic")
+            diagnostic.chmod(0o600)
+            manifest = {
+                "arrays": {"router_ids": {"file": array_path.name}},
+                "retained_diagnostics": {
+                    "entries": [{"file": f"diagnostics/{diagnostic.name}"}]
+                },
+            }
+
+            parity_script.normalize_h200_capture_permissions(capture, manifest)
+            self.assertEqual(stat.S_IMODE(capture.stat().st_mode), 0o750)
+            self.assertEqual(stat.S_IMODE(diagnostics.stat().st_mode), 0o750)
+            self.assertEqual(stat.S_IMODE(manifest_path.stat().st_mode), 0o644)
+            self.assertEqual(stat.S_IMODE(array_path.stat().st_mode), 0o644)
+            self.assertEqual(stat.S_IMODE(diagnostic.stat().st_mode), 0o644)
+            parity_script.validate_h200_capture_permissions(capture, manifest)
+
+            capture.chmod(0o755)
+            with self.assertRaisesRegex(ValueError, "root owner or mode"):
+                parity_script.validate_h200_capture_permissions(capture, manifest)
+
+    def test_h200_capture_permissions_reject_symlink_and_non_file_entries(self):
+        import scripts.glm52_policy_parity as parity_script
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("symlink", "directory"):
+                capture = root / f"capture-{name}"
+                capture.mkdir(mode=0o750)
+                unexpected = capture / "unexpected"
+                if name == "symlink":
+                    unexpected.symlink_to(root / "outside")
+                else:
+                    unexpected.mkdir()
+                with self.subTest(name=name), self.assertRaisesRegex(
+                    ValueError, "symlink|unexpected directory"
+                ):
+                    parity_script.normalize_h200_capture_permissions(
+                        capture,
+                        {"arrays": {}, "retained_diagnostics": {"entries": []}},
+                    )
+
+    def test_h200_capture_permissions_reject_links_and_inventory_drift(self):
+        import scripts.glm52_policy_parity as parity_script
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            capture = root / "capture"
+            capture.mkdir(mode=0o750)
+            manifest_path = capture / "manifest.json"
+            array_path = capture / "router_ids.npy"
+            manifest_path.write_text("{}\n")
+            array_path.write_bytes(b"array")
+            manifest = {
+                "arrays": {"router_ids": {"file": array_path.name}},
+                "retained_diagnostics": {"entries": []},
+            }
+            parity_script.normalize_h200_capture_permissions(capture, manifest)
+
+            extra = capture / "extra"
+            extra.write_bytes(b"extra")
+            with self.assertRaisesRegex(ValueError, "unexpected entry"):
+                parity_script.validate_h200_capture_permissions(capture, manifest)
+            extra.unlink()
+
+            hardlink = capture / "hardlink.npy"
+            os.link(array_path, hardlink)
+            manifest["arrays"]["hardlink"] = {"file": hardlink.name}
+            with self.assertRaisesRegex(ValueError, "owner or mode"):
+                parity_script.validate_h200_capture_permissions(capture, manifest)
+            hardlink.unlink()
+            manifest["arrays"].pop("hardlink")
+
+            fifo = capture / "fifo"
+            os.mkfifo(fifo)
+            manifest["arrays"]["fifo"] = {"file": fifo.name}
+            with self.assertRaisesRegex(ValueError, "not regular"):
+                parity_script.validate_h200_capture_permissions(capture, manifest)
+            fifo.unlink()
+            manifest["arrays"].pop("fifo")
+
+            socket_path = capture / "socket"
+            listener = socket.socket(socket.AF_UNIX)
+            try:
+                listener.bind(str(socket_path))
+                manifest["arrays"]["socket"] = {"file": socket_path.name}
+                with self.assertRaisesRegex(ValueError, "not regular"):
+                    parity_script.validate_h200_capture_permissions(capture, manifest)
+            finally:
+                listener.close()
+                socket_path.unlink(missing_ok=True)
+                manifest["arrays"].pop("socket")
+
+            array_path.unlink()
+            with self.assertRaisesRegex(ValueError, "unexpected entry"):
+                parity_script.validate_h200_capture_permissions(capture, manifest)
+
     def test_bootstrap_issue_rejects_regular_file_and_wrong_mode(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "bootstrap.fifo"
@@ -1895,6 +2014,13 @@ class ParityRouterTraceTest(unittest.TestCase):
                         "adapter-step20"
                     ),
                     operations_path,
+                )
+                self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o750)
+                self.assertTrue(
+                    all(
+                        stat.S_IMODE(path.stat().st_mode) == 0o644
+                        for path in output.iterdir()
+                    )
                 )
         self.assertEqual(reset_count, 1)
         self.assertEqual(

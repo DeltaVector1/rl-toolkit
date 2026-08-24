@@ -126,13 +126,114 @@ def require_child_regular_identity(
 def open_regular_at(directory_descriptor: int, name: str) -> int:
     if Path(name).name != name or not name:
         raise ValueError("relative evidence filename is invalid")
-    descriptor = os.open(
-        name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_descriptor
-    )
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=directory_descriptor,
+        )
+    except OSError as error:
+        raise ValueError(f"evidence file is not regular: {name}") from error
     if not stat.S_ISREG(os.fstat(descriptor).st_mode):
         os.close(descriptor)
         raise ValueError(f"evidence file is not regular: {name}")
     return descriptor
+
+
+def _h200_capture_permission_inventory(
+    manifest: dict[str, Any],
+) -> tuple[set[str], set[str]]:
+    arrays = manifest.get("arrays")
+    retained = manifest.get("retained_diagnostics")
+    entries = retained.get("entries") if isinstance(retained, dict) else None
+    if not isinstance(arrays, dict) or not isinstance(entries, list):
+        raise ValueError("H200 capture permission inventory is invalid")
+    root_files = {"manifest.json"}
+    diagnostic_files = set()
+    for entry in arrays.values():
+        filename = entry.get("file") if isinstance(entry, dict) else None
+        if not isinstance(filename, str) or Path(filename).name != filename:
+            raise ValueError("H200 capture permission inventory is invalid")
+        root_files.add(filename)
+    for entry in entries:
+        relative = entry.get("file") if isinstance(entry, dict) else None
+        if not isinstance(relative, str) or Path(relative).parent != Path("diagnostics"):
+            raise ValueError("H200 capture permission inventory is invalid")
+        diagnostic_files.add(Path(relative).name)
+    if len(diagnostic_files) != len(entries):
+        raise ValueError("H200 capture permission inventory is invalid")
+    return root_files, diagnostic_files
+
+
+def _h200_capture_permissions(
+    path: Path, manifest: dict[str, Any], normalize: bool
+) -> None:
+    root_files, diagnostic_files = _h200_capture_permission_inventory(manifest)
+    root_descriptor = open_directory(path)
+    try:
+        expected = root_files | ({"diagnostics"} if diagnostic_files else set())
+        if set(os.listdir(root_descriptor)) != expected:
+            raise ValueError("H200 capture contains a symlink, non-file, or unexpected entry")
+        if normalize:
+            os.fchmod(root_descriptor, 0o750)
+        root = os.fstat(root_descriptor)
+        if (root.st_uid, root.st_gid, stat.S_IMODE(root.st_mode)) != (1000, 1000, 0o750):
+            raise ValueError("H200 capture root owner or mode differs")
+        for name in root_files:
+            descriptor = open_regular_at(root_descriptor, name)
+            try:
+                if normalize:
+                    os.fchmod(descriptor, 0o644)
+                metadata = os.fstat(descriptor)
+                if (
+                    metadata.st_nlink != 1
+                    or (metadata.st_uid, metadata.st_gid, stat.S_IMODE(metadata.st_mode))
+                    != (1000, 1000, 0o644)
+                ):
+                    raise ValueError("H200 capture file owner or mode differs")
+                require_child_regular_identity(root_descriptor, name, descriptor)
+            finally:
+                os.close(descriptor)
+        if diagnostic_files:
+            diagnostics = os.open(
+                "diagnostics", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=root_descriptor,
+            )
+            try:
+                if set(os.listdir(diagnostics)) != diagnostic_files:
+                    raise ValueError("H200 diagnostic file inventory differs")
+                if normalize:
+                    os.fchmod(diagnostics, 0o750)
+                metadata = os.fstat(diagnostics)
+                if (metadata.st_uid, metadata.st_gid, stat.S_IMODE(metadata.st_mode)) != (1000, 1000, 0o750):
+                    raise ValueError("H200 diagnostics directory owner or mode differs")
+                for name in diagnostic_files:
+                    descriptor = open_regular_at(diagnostics, name)
+                    try:
+                        if normalize:
+                            os.fchmod(descriptor, 0o644)
+                        metadata = os.fstat(descriptor)
+                        if metadata.st_nlink != 1 or (
+                            metadata.st_uid, metadata.st_gid, stat.S_IMODE(metadata.st_mode)
+                        ) != (1000, 1000, 0o644):
+                            raise ValueError("H200 diagnostic file owner or mode differs")
+                        require_child_regular_identity(diagnostics, name, descriptor)
+                    finally:
+                        os.close(descriptor)
+                require_child_directory_identity(root_descriptor, "diagnostics", diagnostics)
+            finally:
+                os.close(diagnostics)
+        require_directory_identity(path, root_descriptor)
+    finally:
+        os.close(root_descriptor)
+
+
+def normalize_h200_capture_permissions(path: Path, manifest: dict[str, Any]) -> None:
+    _h200_capture_permissions(path, manifest, True)
+
+
+def validate_h200_capture_permissions(path: Path, manifest: dict[str, Any]) -> None:
+    _h200_capture_permissions(path, manifest, False)
 
 
 def read_json_at(
@@ -2151,6 +2252,8 @@ def capture_h200(
         "arrays": entries,
     }
     (output / "manifest.json").write_bytes(json_bytes(manifest))
+    normalize_h200_capture_permissions(output, manifest)
+    validate_h200_capture_permissions(output, manifest)
     return load_manifest(output, "glm52_policy_parity_h200_capture")
 
 
@@ -3179,6 +3282,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif args.command == "validate-h200-capture":
             manifest, manifest_sha256 = load_h200_capture_manifest(args.capture)
+            validate_h200_capture_permissions(args.capture, manifest)
             validate_h200_capture_sources(manifest)
             result = {
                 "manifest_sha256": manifest_sha256,
