@@ -1092,6 +1092,12 @@ raise SystemExit(99)
         command = training_ops._glm_parity_stage_install_command(
             stage, candidate, "a" * 64, "b" * 64, "c" * 64
         )
+        self.assertTrue(command.startswith("sudo python3 - "))
+        self.assertIn(
+            f"sudo python3 - {training_ops.glm_parity_root} "
+            f"{training_ops.glm_parity_stage_candidate_root} ",
+            command,
+        )
         self.assertNotIn("rm -rf", command)
         self.assertNotIn("/tmp/", command)
         self.assertIn("os.O_NOFOLLOW", command)
@@ -1183,6 +1189,7 @@ raise SystemExit(99)
                             reference_sha,
                             session_sha,
                         )
+                command = command.replace("sudo python3 -", "python3 -", 1)
                 command = command.replace(
                     "candidate_root_opened.st_uid!=0",
                     "candidate_root_opened.st_uid!=os.geteuid()",
@@ -1325,6 +1332,7 @@ raise SystemExit(99)
                         reference_sha,
                         session_sha,
                     )
+            fault_command = fault_command.replace("sudo python3 -", "python3 -", 1)
             fault_command = fault_command.replace(
                 "candidate_root_opened.st_uid!=0",
                 "candidate_root_opened.st_uid!=os.geteuid()",
@@ -1445,6 +1453,8 @@ raise SystemExit(99)
         )
         self.assertLess(install.index("seed = install"), install.index("_fan([host"))
         self.assertEqual(install.count("_ssh(trainer_head, current_command)"), 2)
+        self.assertIn("state.splitlines()[-1]", install)
+        self.assertNotIn("install failed: {state[:120]}", install)
 
     def test_parity_stage_transfer_retries_same_partial_candidate(self):
         candidate = (

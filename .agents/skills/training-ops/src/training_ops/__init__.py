@@ -7948,7 +7948,7 @@ def _glm_parity_stage_install_command(
     ):
         if re.fullmatch(r"[0-9a-f]{64}", value) is None:
             raise Refused(f"GLM parity stage {name} checksum is invalid")
-    return f"""python3 - {shlex.quote(str(root))} {shlex.quote(glm_parity_stage_candidate_root)} {shlex.quote(stage_path.name)} {shlex.quote(candidate_path.name)} {shlex.quote(manifest_sha256)} {shlex.quote(reference_sha256)} {shlex.quote(session_sha256)} <<'PY'
+    return f"""sudo python3 - {shlex.quote(str(root))} {shlex.quote(glm_parity_stage_candidate_root)} {shlex.quote(stage_path.name)} {shlex.quote(candidate_path.name)} {shlex.quote(manifest_sha256)} {shlex.quote(reference_sha256)} {shlex.quote(session_sha256)} <<'PY'
 import ctypes,fcntl,hashlib,json,os,stat,sys
 root_path,candidate_root_path,stage,candidate,wanted,wanted_reference,wanted_session=sys.argv[1:]
 expected_top={{"manifest.json","trainer-reference.json","trainer-router-trace"}}
@@ -8879,7 +8879,8 @@ def stage_glm52_policy_parity(nodes: list[str] | None = None) -> None:
                     rc, detail = _ssh(host, command)
                     state = detail.strip()
                     if rc:
-                        result = f"install failed: {state[:120]}"
+                        error_line = state.splitlines()[-1] if state else f"exit {rc}"
+                        result = f"install failed: {error_line[:120]}"
                     elif state.startswith("replaced-retained:"):
                         candidate_exists = False
                         result = f"ok-retained:{state.removeprefix('replaced-retained:')}"
