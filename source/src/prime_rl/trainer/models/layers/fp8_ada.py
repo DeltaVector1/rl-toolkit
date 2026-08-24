@@ -35,7 +35,7 @@ _FP8_EXPERT_ACTIVATION_OFFLOAD = (
 )
 _DIAGNOSE_LINEAR_BACKWARD = False
 _REPORTED_LINEAR_BACKWARD: set[tuple[tuple[int, ...], bool, bool]] = set()
-_REPORTED_INPUT_GRAD: set[tuple[int, ...]] = set()
+_REPORTED_INPUT_GRAD: set[str] = set()
 _EXPERT_PROFILE = os.environ.get("PRIME_EP_PROFILE", "") == "1"
 _EXPERT_BACKWARD_EVENTS: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
 _EXPERT_PROFILE_EVERY = int(os.environ.get("PRIME_EXPERT_PROFILE_EVERY", "90"))
@@ -303,7 +303,9 @@ def _w8a16_linear(x, weight, scale):
     ).view(shape)
 
 
-def _w8a16_input_grad(grad, weight, scale):
+def _w8a16_input_grad(
+    grad, weight, scale, *, fqn="<unassigned-fp8-linear>"
+):
     if grad.dtype != torch.bfloat16:
         raise TypeError(f"W8A16 gradient must be BF16, got {grad.dtype}")
     if weight.dtype != torch.float8_e4m3fn:
@@ -315,11 +317,10 @@ def _w8a16_input_grad(grad, weight, scale):
             f"W8A16 gradient width {grad.shape[-1]} does not match "
             f"weight output width {weight.shape[0]}"
         )
-    shape = (*grad.shape[:-1], weight.shape[1])
-    grad_2d = grad.reshape(-1, grad.shape[-1]).contiguous()
-    return _native_block_fp8_mm(
-        grad_2d, weight, scale, weight_is_output_major=False
-    ).view(shape)
+    # The inference W8A16 kernel is forward-only. Its transposed use is not a
+    # supported checkpoint layout for backward, so dequantize bounded rows and
+    # accumulate the input gradient in FP32.
+    return _linear_input_grad_oracle(grad, weight, scale, fqn=fqn)
 
 
 def _linear_input_grad_oracle(
@@ -551,7 +552,7 @@ class _W8A16Linear(torch.autograd.Function):
             weight = ctx.weight_snapshot
             scale = ctx.scale_snapshot
         try:
-            input_grad = _w8a16_input_grad(grad, weight, scale)
+            input_grad = _w8a16_input_grad(grad, weight, scale, fqn=ctx.fqn)
         finally:
             if ctx.snapshot_key is not None:
                 _release_linear_snapshot(ctx.snapshot_key)
