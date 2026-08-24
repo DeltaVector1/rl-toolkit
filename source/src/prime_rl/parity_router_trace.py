@@ -1141,12 +1141,23 @@ def publish_trainer_bundle(
     gathered_metadata = torch.empty(
         world_size * metadata_limit, dtype=torch.uint8, device=device
     )
+    control = torch.zeros((2,), dtype=torch.int32, device=device)
+    status = torch.zeros((1,), dtype=torch.int32, device=device)
     dist.all_gather_into_tensor(gathered_metadata, local_metadata)
-    token_ids = torch.zeros((32768,), dtype=torch.int64, device=device)
-    positions = torch.zeros((32768,), dtype=torch.int64, device=device)
-    selected_indices = torch.full((32768,), -1, dtype=torch.int64, device=device)
-    advantages = torch.zeros((32768,), dtype=torch.float32, device=device)
-    if rank == source_rank:
+    token_ids = None
+    positions = None
+    selected_indices = None
+    advantages = None
+    try:
+        token_ids = torch.zeros((32768,), dtype=torch.int64, device=device)
+        positions = torch.zeros((32768,), dtype=torch.int64, device=device)
+        selected_indices = torch.full(
+            (32768,), -1, dtype=torch.int64, device=device
+        )
+        advantages = torch.zeros((32768,), dtype=torch.float32, device=device)
+    except BaseException as error:
+        errors.append(f"source buffer allocation failed: {error}"[:512])
+    if rank == source_rank and not errors:
         try:
             if compact_source is None:
                 raise ValueError("final PP/CP0 compact fixture source is missing")
@@ -1195,20 +1206,38 @@ def publish_trainer_bundle(
     error_bytes = "; ".join(errors).encode("utf-8", errors="replace")[: error_limit - 4]
     error_encoded = len(error_bytes).to_bytes(4, "little") + error_bytes
     error_encoded += b"\0" * (error_limit - len(error_encoded))
-    local_errors = torch.from_numpy(
-        np.frombuffer(error_encoded, dtype=np.uint8).copy()
-    ).to(device=device)
-    gathered_errors = torch.empty(
-        world_size * error_limit, dtype=torch.uint8, device=device
-    )
-    dist.all_gather_into_tensor(gathered_errors, local_errors)
-    for value in (token_ids, positions, selected_indices, advantages):
-        dist.broadcast(value, src=source_rank)
+    local_errors = None
+    gathered_errors = None
+    error_buffers_missing = False
+    try:
+        local_errors = torch.from_numpy(
+            np.frombuffer(error_encoded, dtype=np.uint8).copy()
+        ).to(device=device)
+        gathered_errors = torch.empty(
+            world_size * error_limit, dtype=torch.uint8, device=device
+        )
+    except BaseException as error:
+        errors.append(f"error buffer allocation failed: {error}"[:512])
+        error_buffers_missing = True
+    control[0] = int(bool(errors))
+    control[1] = int(error_buffers_missing)
+    dist.all_reduce(control, op=dist.ReduceOp.MAX)
+    any_error = bool(int(control[0].item()))
+    any_error_buffers_missing = bool(int(control[1].item()))
+    if not any_error_buffers_missing:
+        dist.all_gather_into_tensor(gathered_errors, local_errors)
+    if not any_error:
+        for value in (token_ids, positions, selected_indices, advantages):
+            dist.broadcast(value, src=source_rank)
 
     failure: BaseException | None = None
     if rank == 0:
         try:
-            error_rows = gathered_errors.reshape(world_size, error_limit).cpu().numpy()
+            if any_error_buffers_missing:
+                raise ValueError("one or more ranks could not allocate parity buffers")
+            error_rows = gathered_errors.reshape(
+                world_size, error_limit
+            ).cpu().numpy()
             rank_errors = []
             for error_rank, row in enumerate(error_rows):
                 length = int.from_bytes(row[:4].tobytes(), "little")
@@ -1218,8 +1247,8 @@ def publish_trainer_bundle(
                     rank_errors.append(
                         f"rank {error_rank}: {row[4 : 4 + length].tobytes().decode('utf-8')}"
                     )
-            if rank_errors:
-                raise ValueError("; ".join(rank_errors))
+            if any_error or rank_errors:
+                raise ValueError("; ".join(rank_errors) or "trainer preparation failed")
             rows = gathered_metadata.reshape(world_size, metadata_limit).cpu().numpy()
             gathered: list[dict[str, Any]] = []
             for row in rows:
@@ -1255,7 +1284,8 @@ def publish_trainer_bundle(
             )
         except BaseException as error:
             failure = error
-    status = torch.tensor([1 if failure is not None else 0], dtype=torch.int32, device=device)
+    if rank == 0:
+        status[0] = int(failure is not None)
     dist.broadcast(status, src=0)
     if int(status.item()) != 0:
         if failure is not None:
