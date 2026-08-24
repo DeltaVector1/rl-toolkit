@@ -8176,13 +8176,25 @@ def _trainer_image_digest_map(nodes: list[str]) -> dict[str, str]:
     return digests
 
 
+@dataclass(frozen=True)
+class TrainerQualificationIdentity:
+    environment: str
+    session_id: str
+    profile: str
+    config_sha256: str
+    source_sha256: str
+    session_sha256: str
+    launcher_sha256: str
+    image_digests: tuple[tuple[str, str], ...]
+
+
 def _prepare_trainer_qualification_session(
     profile: str,
     config: dict,
     config_path: Path,
     nodes: list[str],
     source_files: dict[str, str],
-) -> str:
+) -> TrainerQualificationIdentity:
     output_dir = config.get("output_dir")
     qualification_root = PurePosixPath("/data/glm52-rl/qualifications")
     output = PurePosixPath(output_dir) if isinstance(output_dir, str) else None
@@ -8300,12 +8312,22 @@ PY
         raise RuntimeError(
             "qualification session write failed: " + "; ".join(failures)
         )
-    return (
+    environment = (
         f"PRIME_QUALIFICATION_SESSION_ID={session_id} "
         f"PRIME_QUALIFICATION_PROFILE={profile} "
         f"PRIME_QUALIFICATION_CONFIG_SHA256={manifest['config_sha256']} "
         f"PRIME_QUALIFICATION_SOURCE_SHA256={source_sha256} "
         f"PRIME_QUALIFICATION_SESSION_SHA256={session_sha256} "
+    )
+    return TrainerQualificationIdentity(
+        environment=environment,
+        session_id=session_id,
+        profile=profile,
+        config_sha256=manifest["config_sha256"],
+        source_sha256=source_sha256,
+        session_sha256=session_sha256,
+        launcher_sha256=source_files["scripts/china/cluster.sh"],
+        image_digests=tuple((host, image_digests[host]) for host in nodes),
     )
 
 
@@ -8418,11 +8440,13 @@ def qualify(
         else trainer_mount_preflight(nodes)
     )
 
+    qualification_identity = None
     qualification_env = ""
     if strict_qualification:
-        qualification_env = _prepare_trainer_qualification_session(
+        qualification_identity = _prepare_trainer_qualification_session(
             name, config, local_config, nodes, source_files
         )
+        qualification_env = qualification_identity.environment
 
     if resume_adapter is not None:
         stability, _result_sha256 = _step20_stability_evidence()
@@ -8514,44 +8538,120 @@ def qualify(
         )
         raise RuntimeError(f"qualification trainer launch failed on {failed}: {details}")
     if strict_qualification:
-        expected_environment = {
-            key: value
-            for assignment in shlex.split(qualification_env)
-            for key, value in [assignment.split("=", 1)]
-        }
+        if qualification_identity is None:
+            raise RuntimeError("strict qualification launch identity is missing")
+        image_digests = dict(qualification_identity.image_digests)
+        environment_keys = (
+            "PRIME_QUALIFICATION_SESSION_ID",
+            "PRIME_QUALIFICATION_PROFILE",
+            "PRIME_QUALIFICATION_CONFIG_SHA256",
+            "PRIME_QUALIFICATION_SOURCE_SHA256",
+            "PRIME_QUALIFICATION_SESSION_SHA256",
+            "PRIME_QUALIFICATION_RUNTIME_SOURCE_SHA256",
+            "PRIME_QUALIFICATION_LAUNCHER_SHA256",
+            "PRIME_TRAINER_IMAGE_DIGEST",
+            "PRIME_TRAINER_HOST",
+            "PRIME_TRAINER_HEAD",
+        )
+        probe_source = """import json
+import subprocess
+import sys
+
+container, encoded_keys = sys.argv[1:]
+keys = json.loads(encoded_keys)
+record = json.loads(subprocess.check_output(["sudo", "docker", "inspect", container]))[0]
+environment = {}
+for assignment in record["Config"]["Env"]:
+    key, separator, value = assignment.partition("=")
+    if separator and key in keys:
+        environment[key] = value
+print(json.dumps({
+    "name": record["Name"],
+    "status": record["State"]["Status"],
+    "image": record["Config"]["Image"],
+    "image_digest": record["Image"],
+    "path": record["Path"],
+    "command": record["Config"]["Cmd"],
+    "environment": environment,
+}, sort_keys=True, separators=(",", ":")))
+"""
+        encoded_keys = json.dumps(environment_keys, separators=(",", ":"))
 
         def trainer_qualification_state(host: str) -> tuple[int, str]:
             return _ssh(
                 host,
-                f"sudo docker inspect {trainer_container} --format "
-                "'{{.State.Status}}\\n{{range .Config.Env}}{{println .}}{{end}}'",
+                f"python3 -c {shlex.quote(probe_source)} "
+                f"{shlex.quote(trainer_container)} {shlex.quote(encoded_keys)}",
                 60,
             )
 
         observed_states = _fan(nodes, trainer_qualification_state)
         verification_failures = []
-        for host in nodes:
+        for rank, host in enumerate(nodes):
             rc, output = observed_states.get(host, (1, "missing result"))
-            lines = output.splitlines()
-            if rc or not lines or lines[0].strip() != "running":
+            try:
+                observed = json.loads(output) if rc == 0 else None
+            except json.JSONDecodeError:
+                observed = None
+            if not isinstance(observed, dict):
                 verification_failures.append(
-                    f"{host}: trainer is not running ({output.strip()[:160]})"
+                    f"{host}: trainer identity is unreadable"
                 )
                 continue
-            observed_environment = {
-                key: value
-                for line in lines[1:]
-                if "=" in line
-                for key, value in [line.split("=", 1)]
-            }
-            mismatches = [
-                key
-                for key, expected in expected_environment.items()
-                if observed_environment.get(key) != expected
+            expected_command = [
+                "--role=trainer",
+                f"--nnodes={len(nodes)}",
+                "--nproc-per-node=8",
+                f"--node-rank={rank}",
+                f"--local-addr={trainer_internal_addresses[host]}",
+                f"--master-addr={trainer_internal_addresses[trainer_head]}",
+                "--master-port=29500",
+                f"--log-dir={run_root}/{name}/run_{name}/logs/trainer/torchrun",
+                "--tee=3",
+                "--redirects=3",
+                "--local-ranks-filter=0",
+                "-m",
+                "prime_rl.trainer.rl.train",
+                "@",
+                f"{remote_repo}/{relative_config}",
             ]
+            expected_environment = {
+                "PRIME_QUALIFICATION_SESSION_ID": qualification_identity.session_id,
+                "PRIME_QUALIFICATION_PROFILE": qualification_identity.profile,
+                "PRIME_QUALIFICATION_CONFIG_SHA256": qualification_identity.config_sha256,
+                "PRIME_QUALIFICATION_SOURCE_SHA256": qualification_identity.source_sha256,
+                "PRIME_QUALIFICATION_SESSION_SHA256": qualification_identity.session_sha256,
+                "PRIME_QUALIFICATION_RUNTIME_SOURCE_SHA256": qualification_identity.source_sha256,
+                "PRIME_QUALIFICATION_LAUNCHER_SHA256": qualification_identity.launcher_sha256,
+                "PRIME_TRAINER_IMAGE_DIGEST": image_digests.get(host),
+                "PRIME_TRAINER_HOST": host,
+                "PRIME_TRAINER_HEAD": trainer_head,
+            }
+            mismatches = []
+            if observed.get("name") != f"/{trainer_container}":
+                mismatches.append("container name")
+            if observed.get("status") != "running":
+                mismatches.append("running state")
+            if observed.get("image") != trainer_image:
+                mismatches.append("container image")
+            if observed.get("image_digest") != image_digests.get(host):
+                mismatches.append("container image digest")
+            if observed.get("path") != "/app/.venv/bin/torchrun":
+                mismatches.append("container entrypoint")
+            if observed.get("command") != expected_command:
+                mismatches.append("trainer command")
+            observed_environment = observed.get("environment")
+            if not isinstance(observed_environment, dict):
+                mismatches.append("qualification environment")
+            else:
+                mismatches.extend(
+                    key
+                    for key, expected in expected_environment.items()
+                    if observed_environment.get(key) != expected
+                )
             if mismatches:
                 verification_failures.append(
-                    f"{host}: qualification environment mismatch for {', '.join(mismatches)}"
+                    f"{host}: qualification identity mismatch for {', '.join(mismatches)}"
                 )
         if verification_failures:
             raise RuntimeError(

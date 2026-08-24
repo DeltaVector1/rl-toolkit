@@ -624,7 +624,7 @@ class EdgeOperationsTest(unittest.TestCase):
                 )
             }
             source_files["scripts/china/cluster.sh"] = "c" * 64
-            environment = training_ops._prepare_trainer_qualification_session(
+            identity = training_ops._prepare_trainer_qualification_session(
                 profile_name,
                 profile,
                 path,
@@ -638,7 +638,13 @@ class EdgeOperationsTest(unittest.TestCase):
         self.assertTrue(all("os.replace(temporary, destination" in call[1] for call in calls))
         self.assertTrue(all("os.fsync(directory)" in call[1] for call in calls))
         self.assertTrue(all(" tee " not in call[1] for call in calls))
-        self.assertIn("PRIME_QUALIFICATION_SESSION_ID=" + "1" * 32, environment)
+        self.assertIn(
+            "PRIME_QUALIFICATION_SESSION_ID=" + "1" * 32,
+            identity.environment,
+        )
+        self.assertEqual(identity.profile, profile_name)
+        self.assertEqual(identity.launcher_sha256, "c" * 64)
+        self.assertEqual(dict(identity.image_digests), images)
 
     def test_trainer_qualification_source_manifest_includes_launcher(self):
         digest = hashlib.sha256(
@@ -2642,60 +2648,129 @@ raise SystemExit(99)
         )
 
     def test_strict_qualification_verifies_running_container_identity(self):
-        qualification_env = (
-            "PRIME_QUALIFICATION_SESSION_ID=" + "a" * 32 + " "
-            "PRIME_QUALIFICATION_PROFILE=glm52-native-b2048 "
-            "PRIME_QUALIFICATION_CONFIG_SHA256=" + "b" * 64 + " "
-            "PRIME_QUALIFICATION_SOURCE_SHA256=" + "c" * 64 + " "
-            "PRIME_QUALIFICATION_SESSION_SHA256=" + "d" * 64
-        )
-        calls = []
-
-        def fake_ssh(host, command, timeout=120):
-            del timeout
-            calls.append((host, command))
-            if "docker inspect glm52-optims-trainer --format" in command:
-                return 0, (
-                    "running\n"
-                    "PRIME_QUALIFICATION_SESSION_ID=" + "a" * 32 + "\n"
-                    "PRIME_QUALIFICATION_PROFILE=glm52-native-b2048\n"
-                    "PRIME_QUALIFICATION_CONFIG_SHA256=" + "b" * 64 + "\n"
-                    "PRIME_QUALIFICATION_SOURCE_SHA256=" + "c" * 64 + "\n"
-                    "PRIME_QUALIFICATION_SESSION_SHA256=" + "d" * 64 + "\n"
-                )
-            return 0, ""
-
-        def fake_fan(hosts, function, workers=None):
-            del workers
-            return {host: function(host) for host in hosts}
-
         nodes = [training_ops.trainer_head] + [
             host for host in training_ops.trainer_hosts
             if host != training_ops.trainer_head
         ]
-        with (
-            patch.object(training_ops, "_ssh", side_effect=fake_ssh),
-            patch.object(training_ops, "_fan", side_effect=fake_fan),
-            patch.object(training_ops, "deploy", return_value=True),
-            patch.object(training_ops, "_assert_live_services_are_down"),
-            patch.object(training_ops, "_trainer_qualification_source_files", return_value={}),
-            patch.object(
-                training_ops,
-                "_prepare_trainer_qualification_session",
-                return_value=qualification_env + " ",
+        images = {host: "sha256:" + str(rank) * 64 for rank, host in enumerate(nodes)}
+        identity = training_ops.TrainerQualificationIdentity(
+            environment=(
+                "PRIME_QUALIFICATION_SESSION_ID=" + "a" * 32 + " "
+                "PRIME_QUALIFICATION_PROFILE=glm52-native-b2048 "
+                "PRIME_QUALIFICATION_CONFIG_SHA256=" + "b" * 64 + " "
+                "PRIME_QUALIFICATION_SOURCE_SHA256=" + "c" * 64 + " "
+                "PRIME_QUALIFICATION_SESSION_SHA256=" + "d" * 64 + " "
             ),
-        ):
-            training_ops.qualify("glm52-native-b2048", nodes=nodes)
-
-        self.assertEqual(
-            len(
-                [
-                    command for _host, command in calls
-                    if "docker inspect glm52-optims-trainer --format" in command
-                ]
-            ),
-            len(nodes),
+            session_id="a" * 32,
+            profile="glm52-native-b2048",
+            config_sha256="b" * 64,
+            source_sha256="c" * 64,
+            session_sha256="d" * 64,
+            launcher_sha256="e" * 64,
+            image_digests=tuple(images.items()),
         )
+
+        def record(host):
+            rank = nodes.index(host)
+            return {
+                "name": "/glm52-optims-trainer",
+                "status": "running",
+                "image": training_ops.trainer_image,
+                "image_digest": images[host],
+                "path": "/app/.venv/bin/torchrun",
+                "command": [
+                    "--role=trainer",
+                    "--nnodes=8",
+                    "--nproc-per-node=8",
+                    f"--node-rank={rank}",
+                    f"--local-addr={training_ops.trainer_internal_addresses[host]}",
+                    "--master-addr="
+                    + training_ops.trainer_internal_addresses[training_ops.trainer_head],
+                    "--master-port=29500",
+                    "--log-dir=/data/glm52-rl/runs/glm52-native-b2048/"
+                    "run_glm52-native-b2048/logs/trainer/torchrun",
+                    "--tee=3",
+                    "--redirects=3",
+                    "--local-ranks-filter=0",
+                    "-m",
+                    "prime_rl.trainer.rl.train",
+                    "@",
+                    "/data/glm52-rl/deployment-glm52-optims/configs/qualification/"
+                    "glm52-native-b2048.toml",
+                ],
+                "environment": {
+                    "PRIME_QUALIFICATION_SESSION_ID": identity.session_id,
+                    "PRIME_QUALIFICATION_PROFILE": identity.profile,
+                    "PRIME_QUALIFICATION_CONFIG_SHA256": identity.config_sha256,
+                    "PRIME_QUALIFICATION_SOURCE_SHA256": identity.source_sha256,
+                    "PRIME_QUALIFICATION_SESSION_SHA256": identity.session_sha256,
+                    "PRIME_QUALIFICATION_RUNTIME_SOURCE_SHA256": identity.source_sha256,
+                    "PRIME_QUALIFICATION_LAUNCHER_SHA256": identity.launcher_sha256,
+                    "PRIME_TRAINER_IMAGE_DIGEST": images[host],
+                    "PRIME_TRAINER_HOST": host,
+                    "PRIME_TRAINER_HEAD": training_ops.trainer_head,
+                },
+            }
+
+        def run(mutation=None):
+            calls = []
+
+            def fake_ssh(host, command, timeout=120):
+                del timeout
+                calls.append((host, command))
+                if "python3 -c" in command:
+                    observed = record(host)
+                    if host == training_ops.trainer_head and mutation is not None:
+                        section, key = mutation
+                        if section == "record":
+                            observed[key] = "wrong"
+                        else:
+                            observed["environment"][key] = "wrong"
+                    return 0, json.dumps(observed)
+                return 0, ""
+
+            def fake_fan(hosts, function, workers=None):
+                del workers
+                return {host: function(host) for host in hosts}
+
+            with (
+                patch.object(training_ops, "_ssh", side_effect=fake_ssh),
+                patch.object(training_ops, "_fan", side_effect=fake_fan),
+                patch.object(training_ops, "deploy", return_value=True),
+                patch.object(training_ops, "_assert_live_services_are_down"),
+                patch.object(
+                    training_ops,
+                    "_trainer_qualification_source_files",
+                    return_value={},
+                ),
+                patch.object(
+                    training_ops,
+                    "_prepare_trainer_qualification_session",
+                    return_value=identity,
+                ),
+            ):
+                training_ops.qualify("glm52-native-b2048", nodes=nodes)
+            return calls
+
+        calls = run()
+        self.assertEqual(
+            sum("python3 -c" in command for _host, command in calls), len(nodes)
+        )
+        failures = (
+            ("record", "image"),
+            ("record", "image_digest"),
+            ("record", "command"),
+            ("environment", "PRIME_QUALIFICATION_RUNTIME_SOURCE_SHA256"),
+            ("environment", "PRIME_QUALIFICATION_LAUNCHER_SHA256"),
+            ("environment", "PRIME_TRAINER_IMAGE_DIGEST"),
+            ("environment", "PRIME_TRAINER_HOST"),
+            ("environment", "PRIME_TRAINER_HEAD"),
+        )
+        for mutation in failures:
+            with self.subTest(mutation=mutation), self.assertRaisesRegex(
+                RuntimeError, "qualification identity mismatch"
+            ):
+                run(mutation)
 
     def test_current_run_reports_absent_container(self):
         with patch.object(
