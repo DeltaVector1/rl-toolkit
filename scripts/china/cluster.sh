@@ -130,7 +130,7 @@ case ${1:-} in
     if [ "$rank" -lt 0 ]; then
       echo "node $node is not in trainer_nodes ($trainer_nodes)" >&2; exit 1
     fi
-    read -r rollout_transport trainer_output trainer_only parity_trace_dir parity_trace_source parity_pp parity_cp parity_batch parity_max_calls parity_max_files parity_max_bytes parity_diagnostics parity_diagnostic_tokens parity_diagnostic_max_files parity_diagnostic_max_bytes configured_int4_combine_rounds configured_fp8_expert_activation_offload < <(
+    IFS='|' read -r rollout_transport trainer_output trainer_only parity_trace_dir parity_trace_source parity_pp parity_cp parity_batch parity_max_calls parity_max_files parity_max_bytes parity_diagnostics parity_diagnostic_tokens parity_diagnostic_max_files parity_diagnostic_max_bytes configured_int4_combine_rounds configured_fp8_expert_activation_offload < <(
       python3 - "$trainer_config" <<'PY'
 import sys
 import tomllib
@@ -147,7 +147,7 @@ memory_env = (
     env_vars.get("PRIME_INT4_COMBINE_ROUNDS", ""),
     env_vars.get("PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD", ""),
 )
-print(
+values = (
     config["rollout_transport"]["type"],
     config["output_dir"],
     int(trainer_only),
@@ -165,6 +165,9 @@ print(
     env_vars.get("PRIME_PARITY_DIAGNOSTIC_MAX_BYTES", ""),
     *memory_env,
 )
+if any("|" in str(value) for value in values):
+    raise SystemExit("trainer config value contains the parser separator")
+print("|".join(str(value) for value in values))
 PY
     )
     if [ -n "$configured_int4_combine_rounds" ] || [ -n "$configured_fp8_expert_activation_offload" ]; then

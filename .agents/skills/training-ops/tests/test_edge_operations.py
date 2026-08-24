@@ -2575,6 +2575,128 @@ raise SystemExit(99)
             launch,
         )
 
+    def test_qualification_launch_reports_launcher_error(self):
+        def fake_ssh(host, command, timeout=120):
+            del host, timeout
+            if "cluster.sh trainer" in command:
+                return 17, "parity trace directory is not the pinned base directory"
+            return 0, ""
+
+        def fake_fan(hosts, function, workers=None):
+            del workers
+            return {host: function(host) for host in hosts}
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "qualification trainer launch failed on.*parity trace directory",
+        ):
+            with (
+                patch.object(training_ops, "_ssh", side_effect=fake_ssh),
+                patch.object(training_ops, "_fan", side_effect=fake_fan),
+                patch.object(training_ops, "deploy", return_value=True),
+                patch.object(training_ops, "_assert_live_services_are_down"),
+                patch.object(training_ops, "trainer_mount_preflight"),
+            ):
+                training_ops.qualify("glm52-native-small", nodes=["n82"])
+
+    def test_cluster_config_parser_preserves_empty_optional_fields(self):
+        launcher = (
+            training_ops.repo_root / "scripts/china/cluster.sh"
+        ).read_text()
+        self.assertIn("IFS='|' read -r", launcher)
+        self.assertIn('print("|".join(str(value) for value in values))', launcher)
+        self.assertIn(
+            'raise SystemExit("trainer config value contains the parser separator")',
+            launcher,
+        )
+
+    def test_qualification_removes_stopped_exact_trainer_before_launch(self):
+        calls = []
+
+        def fake_ssh(host, command, timeout=120):
+            del timeout
+            calls.append((host, command))
+            if "docker ps -a --filter" in command:
+                return 0, "glm52-optims-trainer exited\n"
+            return 0, ""
+
+        def fake_fan(hosts, function, workers=None):
+            del workers
+            return {host: function(host) for host in hosts}
+
+        with (
+            patch.object(training_ops, "_ssh", side_effect=fake_ssh),
+            patch.object(training_ops, "_fan", side_effect=fake_fan),
+            patch.object(training_ops, "deploy", return_value=True),
+            patch.object(training_ops, "_assert_live_services_are_down"),
+            patch.object(training_ops, "trainer_mount_preflight"),
+            patch.object(training_ops.time, "sleep"),
+        ):
+            training_ops.qualify("glm52-native-small", nodes=["n82"])
+
+        self.assertTrue(
+            any(
+                "sudo docker rm -f glm52-optims-trainer" in command
+                for _host, command in calls
+            )
+        )
+
+    def test_strict_qualification_verifies_running_container_identity(self):
+        qualification_env = (
+            "PRIME_QUALIFICATION_SESSION_ID=" + "a" * 32 + " "
+            "PRIME_QUALIFICATION_PROFILE=glm52-native-b2048 "
+            "PRIME_QUALIFICATION_CONFIG_SHA256=" + "b" * 64 + " "
+            "PRIME_QUALIFICATION_SOURCE_SHA256=" + "c" * 64 + " "
+            "PRIME_QUALIFICATION_SESSION_SHA256=" + "d" * 64
+        )
+        calls = []
+
+        def fake_ssh(host, command, timeout=120):
+            del timeout
+            calls.append((host, command))
+            if "docker inspect glm52-optims-trainer --format" in command:
+                return 0, (
+                    "running\n"
+                    "PRIME_QUALIFICATION_SESSION_ID=" + "a" * 32 + "\n"
+                    "PRIME_QUALIFICATION_PROFILE=glm52-native-b2048\n"
+                    "PRIME_QUALIFICATION_CONFIG_SHA256=" + "b" * 64 + "\n"
+                    "PRIME_QUALIFICATION_SOURCE_SHA256=" + "c" * 64 + "\n"
+                    "PRIME_QUALIFICATION_SESSION_SHA256=" + "d" * 64 + "\n"
+                )
+            return 0, ""
+
+        def fake_fan(hosts, function, workers=None):
+            del workers
+            return {host: function(host) for host in hosts}
+
+        nodes = [training_ops.trainer_head] + [
+            host for host in training_ops.trainer_hosts
+            if host != training_ops.trainer_head
+        ]
+        with (
+            patch.object(training_ops, "_ssh", side_effect=fake_ssh),
+            patch.object(training_ops, "_fan", side_effect=fake_fan),
+            patch.object(training_ops, "deploy", return_value=True),
+            patch.object(training_ops, "_assert_live_services_are_down"),
+            patch.object(training_ops, "_trainer_qualification_source_files", return_value={}),
+            patch.object(
+                training_ops,
+                "_prepare_trainer_qualification_session",
+                return_value=qualification_env + " ",
+            ),
+        ):
+            training_ops.qualify("glm52-native-b2048", nodes=nodes)
+
+        self.assertEqual(
+            len(
+                [
+                    command for _host, command in calls
+                    if "docker inspect glm52-optims-trainer --format" in command
+                ]
+            ),
+            len(nodes),
+        )
+
     def test_current_run_reports_absent_container(self):
         with patch.object(
             training_ops,

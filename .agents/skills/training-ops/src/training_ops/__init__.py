@@ -8370,17 +8370,35 @@ def qualify(
             "an orchestrator is active; a trainer-only qualification must not replace an RL run"
         )
 
-    def trainer_running(host: str) -> tuple[int, str]:
+    def trainer_container_state(host: str) -> tuple[int, str]:
         return _ssh(
             host,
-            f"sudo docker ps --filter name=^{trainer_container}$ --format '{{{{.Names}}}}'",
+            f"sudo docker ps -a --filter name=^{trainer_container}$ "
+            "--format '{{.Names}} {{.State}}'",
         )
 
-    active = [
-        host
-        for host, (rc, out) in _fan(nodes, trainer_running).items()
-        if rc == 0 and out.strip()
-    ]
+    container_states = _fan(nodes, trainer_container_state)
+    active = []
+    stopped = []
+    state_errors = []
+    for host, (rc, output) in container_states.items():
+        if rc:
+            state_errors.append(f"{host}: {output.strip()[:240]}")
+            continue
+        observed = output.strip()
+        if not observed:
+            continue
+        fields = observed.split()
+        if len(fields) != 2 or fields[0] != trainer_container:
+            state_errors.append(f"{host}: unexpected trainer container record {observed!r}")
+        elif fields[1] == "running":
+            active.append(host)
+        else:
+            stopped.append(host)
+    if state_errors:
+        raise RuntimeError(
+            "cannot determine trainer container state: " + "; ".join(state_errors)
+        )
     if active and mode == "cold":
         raise Refused(
             "trainer qualification is already active on "
@@ -8472,13 +8490,11 @@ def qualify(
             " MUSE_PYTHON_OVERRIDE_DIR=/data/muse-glimmer/python-overrides"
         )
 
-    if active:
+    containers_to_remove = sorted(set(active + stopped))
+    if containers_to_remove:
         _fan(
-            nodes,
-            lambda host: _ssh(
-                host,
-                f"sudo docker rm -f {trainer_container} >/dev/null 2>&1; echo done",
-            ),
+            containers_to_remove,
+            lambda host: _ssh(host, f"sudo docker rm -f {trainer_container}", 60),
         )
         time.sleep(20)
 
@@ -8486,13 +8502,62 @@ def qualify(
         nodes,
         lambda host: _ssh(
             host,
-            f"{env} bash {trainer_launcher} trainer >/dev/null 2>&1; echo done",
+            f"{env} bash {trainer_launcher} trainer",
             300,
         ),
     )
     failed = [host for host, (rc, _out) in results.items() if rc]
     if failed:
-        raise RuntimeError(f"qualification trainer launch failed on {failed}")
+        details = "; ".join(
+            f"{host}: {results[host][1].strip()[:240]}"
+            for host in failed
+        )
+        raise RuntimeError(f"qualification trainer launch failed on {failed}: {details}")
+    if strict_qualification:
+        expected_environment = {
+            key: value
+            for assignment in shlex.split(qualification_env)
+            for key, value in [assignment.split("=", 1)]
+        }
+
+        def trainer_qualification_state(host: str) -> tuple[int, str]:
+            return _ssh(
+                host,
+                f"sudo docker inspect {trainer_container} --format "
+                "'{{.State.Status}}\\n{{range .Config.Env}}{{println .}}{{end}}'",
+                60,
+            )
+
+        observed_states = _fan(nodes, trainer_qualification_state)
+        verification_failures = []
+        for host in nodes:
+            rc, output = observed_states.get(host, (1, "missing result"))
+            lines = output.splitlines()
+            if rc or not lines or lines[0].strip() != "running":
+                verification_failures.append(
+                    f"{host}: trainer is not running ({output.strip()[:160]})"
+                )
+                continue
+            observed_environment = {
+                key: value
+                for line in lines[1:]
+                if "=" in line
+                for key, value in [line.split("=", 1)]
+            }
+            mismatches = [
+                key
+                for key, expected in expected_environment.items()
+                if observed_environment.get(key) != expected
+            ]
+            if mismatches:
+                verification_failures.append(
+                    f"{host}: qualification environment mismatch for {', '.join(mismatches)}"
+                )
+        if verification_failures:
+            raise RuntimeError(
+                "trainer qualification launch verification failed: "
+                + "; ".join(verification_failures)
+            )
     print(
         f"started trainer-only qualification {name} on {len(nodes)} nodes; "
         "call status() or watch()"
