@@ -1648,8 +1648,18 @@ def apply_compile(model: nn.Module, compile_config: CompileConfig):
 def _fp8_ignore_patterns(quant: FP8Config) -> list[str]:
     return [
         *quant.ignore_patterns,
-        *exact_module_patterns(quant.bf16_modules),
+        *exact_module_patterns(quant.bf16_modules, label="FP8 BF16"),
     ]
+
+
+def _fp8_w8a16_patterns(quant: FP8Config) -> list[str]:
+    overlap = set(quant.bf16_modules).intersection(quant.w8a16_modules)
+    if overlap:
+        raise ValueError(
+            "FP8 BF16 and W8A16 module lists overlap: "
+            + ", ".join(sorted(overlap))
+        )
+    return exact_module_patterns(quant.w8a16_modules, label="FP8 W8A16")
 
 
 def apply_quantization(model: nn.Module, config: ModelConfig) -> None:
@@ -1668,17 +1678,31 @@ def apply_quantization(model: nn.Module, config: ModelConfig) -> None:
     if isinstance(quant, FP8Config):
         set_diagnose_linear_backward(quant.diagnose_linear_backward)
         ignore_patterns = _fp8_ignore_patterns(quant)
+        w8a16_patterns = _fp8_w8a16_patterns(quant)
         if getattr(model.config, "fp8_checkpoint_dequantized", False):
-            return
-        if getattr(model.config, "fp8_checkpoint", False):
-            if getattr(model.config, "fp8_checkpoint_linears", False):
-                replace_linear_with_fp8_checkpoint(
-                    model,
-                    embed=config.fp8_embed_head,
-                    lm_head=config.fp8_lm_head,
-                    ignore_patterns=ignore_patterns,
+            if w8a16_patterns:
+                raise ValueError(
+                    "W8A16 modules require a native FP8 checkpoint; "
+                    "dequantized checkpoints have no FP8 weights"
                 )
             return
+        if getattr(model.config, "fp8_checkpoint", False):
+            if not getattr(model.config, "fp8_checkpoint_linears", False):
+                if w8a16_patterns:
+                    raise ValueError(
+                        "W8A16 modules require FP8 checkpoint linears to be enabled"
+                    )
+                return
+            replace_linear_with_fp8_checkpoint(
+                model,
+                embed=config.fp8_embed_head,
+                lm_head=config.fp8_lm_head,
+                ignore_patterns=ignore_patterns,
+                w8a16_patterns=w8a16_patterns,
+            )
+            return
+        if w8a16_patterns:
+            raise ValueError("W8A16 modules require a native FP8 checkpoint")
         replace_linear_with_fp8_blockwise_linear(
             model, ignore_modules=ignore_patterns
         )

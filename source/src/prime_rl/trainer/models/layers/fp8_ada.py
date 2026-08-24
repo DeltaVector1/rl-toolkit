@@ -45,12 +45,12 @@ _EXPERT_PROFILE_EVERY = int(os.environ.get("PRIME_EXPERT_PROFILE_EVERY", "90"))
 _LINEAR_SNAPSHOT_CACHE: dict[str, list] = {}
 
 
-def exact_module_patterns(module_names) -> list[str]:
+def exact_module_patterns(module_names, *, label="FP8") -> list[str]:
     if len(module_names) != len(set(module_names)):
-        raise ValueError("FP8 BF16 module names must be unique")
+        raise ValueError(f"{label} module names must be unique")
     for name in module_names:
         if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None:
-            raise ValueError(f"Invalid FP8 BF16 module name: {name!r}")
+            raise ValueError(f"Invalid {label} module name: {name!r}")
     return [rf"(?:^|\.){re.escape(name)}$" for name in module_names]
 
 
@@ -285,6 +285,43 @@ def _linear(x, weight, scale):
     return _grouped_mm(x, weight.unsqueeze(0), scale.unsqueeze(0), offsets).view(shape)
 
 
+def _w8a16_linear(x, weight, scale):
+    if x.dtype != torch.bfloat16:
+        raise TypeError(f"W8A16 input must be BF16, got {x.dtype}")
+    if weight.dtype != torch.float8_e4m3fn:
+        raise TypeError(f"W8A16 weight must be FP8, got {weight.dtype}")
+    if scale.dtype != torch.float32:
+        raise TypeError(f"W8A16 scale must be FP32, got {scale.dtype}")
+    if x.shape[-1] != weight.shape[1]:
+        raise ValueError(
+            f"W8A16 input width {x.shape[-1]} does not match weight width {weight.shape[1]}"
+        )
+    shape = (*x.shape[:-1], weight.shape[0])
+    x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+    return _native_block_fp8_mm(
+        x_2d, weight, scale, weight_is_output_major=True
+    ).view(shape)
+
+
+def _w8a16_input_grad(grad, weight, scale):
+    if grad.dtype != torch.bfloat16:
+        raise TypeError(f"W8A16 gradient must be BF16, got {grad.dtype}")
+    if weight.dtype != torch.float8_e4m3fn:
+        raise TypeError(f"W8A16 weight must be FP8, got {weight.dtype}")
+    if scale.dtype != torch.float32:
+        raise TypeError(f"W8A16 scale must be FP32, got {scale.dtype}")
+    if grad.shape[-1] != weight.shape[0]:
+        raise ValueError(
+            f"W8A16 gradient width {grad.shape[-1]} does not match "
+            f"weight output width {weight.shape[0]}"
+        )
+    shape = (*grad.shape[:-1], weight.shape[1])
+    grad_2d = grad.reshape(-1, grad.shape[-1]).contiguous()
+    return _native_block_fp8_mm(
+        grad_2d, weight, scale, weight_is_output_major=False
+    ).view(shape)
+
+
 def _linear_input_grad_oracle(
     grad, weight, scale, chunk_rows=1024, fqn="<unassigned-fp8-linear>"
 ):
@@ -466,9 +503,74 @@ class _Linear(torch.autograd.Function):
         return input_grad, None, None, None, None
 
 
+class _W8A16Linear(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight, scale, fqn, owner):
+        ctx.owner = owner
+        ctx.fqn = fqn
+        if owner is not None:
+            ctx.weight_snapshot = None
+            ctx.scale_snapshot = None
+            ctx.owns_snapshot = False
+            ctx.snapshot_key = None
+        elif in_reentrant_block_checkpoint():
+            ctx.weight_snapshot = weight
+            ctx.scale_snapshot = scale
+            ctx.owns_snapshot = False
+            ctx.snapshot_key = None
+        elif ctx.needs_input_grad[0]:
+            ctx.weight_snapshot, ctx.scale_snapshot = _acquire_linear_snapshot(
+                fqn, weight, scale
+            )
+            ctx.owns_snapshot = True
+            ctx.snapshot_key = fqn
+        else:
+            ctx.weight_snapshot = weight
+            ctx.scale_snapshot = scale
+            ctx.owns_snapshot = False
+            ctx.snapshot_key = None
+        try:
+            return _w8a16_linear(x, weight, scale)
+        except BaseException:
+            if ctx.snapshot_key is not None:
+                _release_linear_snapshot(ctx.snapshot_key)
+                ctx.snapshot_key = None
+            raise
+
+    @staticmethod
+    def backward(ctx, grad):
+        if ctx.owner is not None:
+            owner, weight_name, scale_name = ctx.owner
+            weight = getattr(owner, weight_name)
+            scale = getattr(owner, scale_name)
+            if isinstance(weight, DTensor):
+                weight = weight.to_local()
+            if isinstance(scale, DTensor):
+                scale = scale.to_local()
+        else:
+            weight = ctx.weight_snapshot
+            scale = ctx.scale_snapshot
+        try:
+            input_grad = _w8a16_input_grad(grad, weight, scale)
+        finally:
+            if ctx.snapshot_key is not None:
+                _release_linear_snapshot(ctx.snapshot_key)
+            del ctx.weight_snapshot, ctx.scale_snapshot, ctx.owner
+        return input_grad, None, None, None, None
+
+
 class FP8CheckpointLinear(nn.Linear):
     def forward(self, x):
         fqn = getattr(self, "_fp8_fqn", f"<unassigned-fp8-linear:{id(self)}>")
+        if getattr(self, "w8a16", False):
+            out = _W8A16Linear.apply(
+                x,
+                self.weight,
+                self.weight_scale_inv,
+                fqn,
+                (self, "weight", "weight_scale_inv"),
+            )
+            return out if self.bias is None else out + self.bias
         out = _Linear.apply(
             x,
             self.weight,
@@ -479,7 +581,7 @@ class FP8CheckpointLinear(nn.Linear):
         return out if self.bias is None else out + self.bias
 
     @classmethod
-    def from_linear(cls, linear):
+    def from_linear(cls, linear, *, w8a16=False):
         with torch.device("meta"):
             module = cls(
                 linear.in_features,
@@ -500,6 +602,7 @@ class FP8CheckpointLinear(nn.Linear):
             requires_grad=False,
         )
         module.bias = linear.bias
+        module.w8a16 = bool(w8a16)
         return module
 
 
@@ -809,8 +912,11 @@ def _fp8_lm_head_forward(self, hidden_states, labels=None, temperature=None):
     return PrimeLmOutput(logprobs=logprobs.view(b, s), entropy=entropy.view(b, s))
 
 
-def replace_linear(model, embed=False, lm_head=False, ignore_patterns=()):
+def replace_linear(
+    model, embed=False, lm_head=False, ignore_patterns=(), w8a16_patterns=()
+):
     exclusions = set(model.config.quantization_config["modules_to_not_convert"])
+    matched_w8a16 = set()
     for name, module in list(model.named_modules()):
         if (
             not isinstance(module, nn.Linear)
@@ -824,7 +930,25 @@ def replace_linear(model, embed=False, lm_head=False, ignore_patterns=()):
             continue
         parent_name, attr = name.rsplit(".", 1) if "." in name else ("", name)
         parent = model.get_submodule(parent_name) if parent_name else model
-        setattr(parent, attr, FP8CheckpointLinear.from_linear(module))
+        matched = tuple(
+            index
+            for index, pattern in enumerate(w8a16_patterns)
+            if re.search(pattern, name)
+        )
+        matched_w8a16.update(matched)
+        setattr(
+            parent,
+            attr,
+            FP8CheckpointLinear.from_linear(module, w8a16=bool(matched)),
+        )
+
+    if len(matched_w8a16) != len(w8a16_patterns):
+        missing = [
+            pattern
+            for index, pattern in enumerate(w8a16_patterns)
+            if index not in matched_w8a16
+        ]
+        raise ValueError(f"configured W8A16 modules were not installed: {missing}")
 
     # Shape-only diagnostics are ambiguous in GLM because many projections
     # share geometry. Persist the model path on every native checkpoint

@@ -187,6 +187,14 @@ def test_glm52_stability_and_production_pin_bounded_transport_env() -> None:
 
 def test_all_glm52_trainers_keep_q_and_kv_a_in_bf16() -> None:
     expected = ["q_a_proj", "kv_a_proj_with_mqa"]
+    expected_w8a16 = [
+        "q_b_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+        "wq_b",
+    ]
     expected_profiles = {
         "configs/qualification/glm52-policy-parity-trainer.toml",
         "configs/qualification/glm52-native-small.toml",
@@ -207,12 +215,15 @@ def test_all_glm52_trainers_keep_q_and_kv_a_in_bf16() -> None:
         assert quantization["type"] == "fp8", relative
         assert quantization["dequantize_checkpoint"] is False, relative
         assert quantization["bf16_modules"] == expected, relative
+        assert quantization["w8a16_modules"] == expected_w8a16, relative
 
     model_source = (ROOT / "source/src/prime_rl/trainer/model.py").read_text()
     fp8_source = (
         ROOT / "source/src/prime_rl/trainer/models/layers/fp8_ada.py"
     ).read_text()
-    assert "exact_module_patterns(quant.bf16_modules)" in model_source
+    assert 'exact_module_patterns(quant.bf16_modules, label="FP8 BF16")' in model_source
+    assert 'exact_module_patterns(quant.w8a16_modules, label="FP8 W8A16")' in model_source
+    assert "W8A16 modules require a native FP8 checkpoint" in model_source
     assert "ignore_patterns=ignore_patterns" in model_source
     assert 'rf"(?:^|\\.){re.escape(name)}$"' in fp8_source
 

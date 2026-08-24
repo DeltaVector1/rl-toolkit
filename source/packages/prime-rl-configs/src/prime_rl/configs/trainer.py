@@ -152,6 +152,7 @@ class FP8Config(BaseConfig):
     """Precision used for expert-parallel activation transport."""
     ignore_patterns: list[str] = _DEFAULT_FP8_IGNORE_PATTERNS
     bf16_modules: list[str] = []
+    w8a16_modules: list[str] = []
 
 
 class MXFP8Config(BaseConfig):

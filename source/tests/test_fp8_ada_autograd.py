@@ -273,6 +273,81 @@ class FP8AdaAutogradTest(unittest.TestCase):
 
         torch.testing.assert_close(got, sentinel)
 
+    def test_w8a16_forward_keeps_bf16_activation_and_fp8_weight(self):
+        value = torch.randn(2, 256, dtype=torch.bfloat16)
+        weight = torch.empty(384, 256, dtype=torch.float8_e4m3fn)
+        scale = torch.ones(3, 2, dtype=torch.float32)
+        sentinel = torch.full((2, 384), 29.0, dtype=torch.bfloat16)
+        seen = {}
+
+        original_native = fp8_ada._native_block_fp8_mm
+
+        def fake_native(x, raw_weight, block_scale, *, weight_is_output_major):
+            seen["x_dtype"] = x.dtype
+            seen["weight_dtype"] = raw_weight.dtype
+            seen["scale_dtype"] = block_scale.dtype
+            seen["weight_is_output_major"] = weight_is_output_major
+            return sentinel
+
+        fp8_ada._native_block_fp8_mm = fake_native
+        try:
+            got = fp8_ada._w8a16_linear(value, weight, scale)
+        finally:
+            fp8_ada._native_block_fp8_mm = original_native
+
+        self.assertEqual(got.shape, (2, 384))
+        self.assertEqual(seen, {
+            "x_dtype": torch.bfloat16,
+            "weight_dtype": torch.float8_e4m3fn,
+            "scale_dtype": torch.float32,
+            "weight_is_output_major": True,
+        })
+        torch.testing.assert_close(got, sentinel)
+
+    def test_w8a16_forward_rejects_wrong_dtype_or_shape(self):
+        value = torch.randn(2, 256, dtype=torch.bfloat16)
+        weight = torch.empty(384, 256, dtype=torch.float8_e4m3fn)
+        scale = torch.ones(3, 2, dtype=torch.float32)
+        with self.assertRaisesRegex(TypeError, "input must be BF16"):
+            fp8_ada._w8a16_linear(value.float(), weight, scale)
+        with self.assertRaisesRegex(TypeError, "weight must be FP8"):
+            fp8_ada._w8a16_linear(value, weight.float(), scale)
+        with self.assertRaisesRegex(TypeError, "scale must be FP32"):
+            fp8_ada._w8a16_linear(value, weight, scale.bfloat16())
+        with self.assertRaisesRegex(ValueError, "input width"):
+            fp8_ada._w8a16_linear(value[..., :128], weight, scale)
+
+    def test_w8a16_backward_uses_native_weight_layout(self):
+        grad = torch.randn(2, 384, dtype=torch.bfloat16)
+        weight = torch.empty(384, 256, dtype=torch.float8_e4m3fn)
+        scale = torch.ones(3, 2, dtype=torch.float32)
+        sentinel = torch.full((2, 256), 31.0, dtype=torch.bfloat16)
+        seen = {}
+
+        original_native = fp8_ada._native_block_fp8_mm
+
+        def fake_native(x, raw_weight, block_scale, *, weight_is_output_major):
+            seen["x_shape"] = x.shape
+            seen["weight_shape"] = raw_weight.shape
+            seen["scale_shape"] = block_scale.shape
+            seen["weight_is_output_major"] = weight_is_output_major
+            return sentinel
+
+        fp8_ada._native_block_fp8_mm = fake_native
+        try:
+            got = fp8_ada._w8a16_input_grad(grad, weight, scale)
+        finally:
+            fp8_ada._native_block_fp8_mm = original_native
+
+        self.assertEqual(got.shape, (2, 256))
+        self.assertEqual(seen, {
+            "x_shape": (2, 384),
+            "weight_shape": (384, 256),
+            "scale_shape": (3, 2),
+            "weight_is_output_major": False,
+        })
+        torch.testing.assert_close(got, sentinel)
+
     def test_eligible_fp8_dx_uses_grouped_kernel_and_not_oracle(self):
         grad = torch.randn(2, 3)
         weight = torch.randn(3, 4)
@@ -884,6 +959,36 @@ class FP8AdaAutogradTest(unittest.TestCase):
 
         self.assertEqual(model.layers[0].o_proj._fp8_fqn, "layers.0.o_proj")
         self.assertEqual(model.layers[1].o_proj._fp8_fqn, "layers.1.o_proj")
+
+    def test_replace_linear_marks_only_configured_w8a16_modules(self):
+        model = nn.Module()
+        model.config = types.SimpleNamespace(
+            quantization_config={"modules_to_not_convert": []}
+        )
+        model.self_attn = nn.Module()
+        model.self_attn.q_b_proj = nn.Linear(128, 128, bias=False)
+        model.self_attn.o_proj = nn.Linear(128, 128, bias=False)
+        model.mlp = nn.Module()
+        model.mlp.up_proj = nn.Linear(128, 128, bias=False)
+        patterns = fp8_ada.exact_module_patterns(("q_b_proj", "o_proj"))
+
+        fp8_ada.replace_linear(model, w8a16_patterns=patterns)
+
+        self.assertTrue(model.self_attn.q_b_proj.w8a16)
+        self.assertTrue(model.self_attn.o_proj.w8a16)
+        self.assertFalse(model.mlp.up_proj.w8a16)
+
+    def test_replace_linear_rejects_unmatched_w8a16_module(self):
+        model = nn.Module()
+        model.config = types.SimpleNamespace(
+            quantization_config={"modules_to_not_convert": []}
+        )
+        model.self_attn = nn.Module()
+        model.self_attn.o_proj = nn.Linear(128, 128, bias=False)
+        patterns = fp8_ada.exact_module_patterns(("q_b_proj",))
+
+        with self.assertRaisesRegex(ValueError, "not installed"):
+            fp8_ada.replace_linear(model, w8a16_patterns=patterns)
 
     def test_glm_q_and_kv_a_remain_exact_bf16(self):
         model = nn.Module()
