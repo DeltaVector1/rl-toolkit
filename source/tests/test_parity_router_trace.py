@@ -341,6 +341,187 @@ def session() -> TraceSession:
 
 
 class ParityRouterTraceTest(unittest.TestCase):
+    def test_fixture_refresh_is_idempotent_for_a_recorded_source(self):
+        import scripts.glm52_policy_parity as parity_script
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            profile_path = root / "profile.toml"
+            profile_path.write_text("profile = true\n")
+            profile = parity_script.Profile(
+                profile_path,
+                {
+                    "context_length": 8,
+                    "prompt_length": 4,
+                    "max_output_length": 4,
+                    "vocab_size": 512,
+                    "max_fixture_age_hours": 24,
+                },
+            )
+            base = root / "base"
+            parity_script.make_fixture(
+                profile, base, 19, "2020-01-01T00:00:00+00:00"
+            )
+            base_manifest = parity_script.load_manifest(
+                base, "glm52_policy_parity_fixture"
+            )
+            token_ids = parity_script.load_array(
+                base, base_manifest, "token_ids"
+            ).astype(np.int64)
+            positions = parity_script.load_array(
+                base, base_manifest, "positions"
+            ).astype(np.int64)
+            selected = parity_script.load_array(
+                base, base_manifest, "selected_indices"
+            ).astype(np.int64)
+            selected_advantages = parity_script.load_array(
+                base, base_manifest, "advantages"
+            ).astype(np.float32)
+            loss_mask = np.zeros(8, dtype=np.bool_)
+            loss_mask[selected] = True
+            advantages = np.zeros(8, dtype=np.float32)
+            advantages[selected] = selected_advantages
+            session = {
+                "schema_version": 1,
+                "side": "trainer",
+                "fixture_sha256": parity_script.fixture_digest(base),
+                "token_ids_sha256": parity_script._array_bytes_sha256(token_ids),
+                "model_revision": "a" * 40,
+                "adapter_sha256": "b" * 64,
+            }
+            session_path = root / "session.json"
+            session_path.write_text(json.dumps(session))
+            export = root / "rank_7.jsonl"
+            export.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "rank": 7,
+                        "token_ids": token_ids.tolist(),
+                        "position_ids": positions.tolist(),
+                        "loss_mask": loss_mask.tolist(),
+                        "advantages": advantages.tolist(),
+                    }
+                )
+                + "\n"
+            )
+            session_identity = parity_script.hashlib.sha256(
+                json.dumps(
+                    session, sort_keys=True, separators=(",", ":")
+                ).encode()
+            ).hexdigest()
+            diagnostic = root / "diagnostic.npz"
+            np.savez(
+                diagnostic,
+                values=np.zeros((1, 6144), dtype=np.float32),
+                name=np.asarray("layer3_router_input-rank-0-pp-0-cp-0"),
+                session_identity=np.asarray(session_identity),
+                fixture_sha256=np.asarray(session["fixture_sha256"]),
+                token_ids_sha256=np.asarray(session["token_ids_sha256"]),
+                model_revision=np.asarray(session["model_revision"]),
+                adapter_sha256=np.asarray(session["adapter_sha256"]),
+            )
+            first = root / "first"
+            first_diagnostic = root / "first-diagnostic.npz"
+            first_result = parity_script.refresh_fixture_from_trainer_export(
+                profile,
+                base,
+                session_path,
+                export,
+                diagnostic,
+                first,
+                first_diagnostic,
+                7,
+            )
+            second = root / "second"
+            second_diagnostic = root / "second-diagnostic.npz"
+            second_result = parity_script.refresh_fixture_from_trainer_export(
+                profile,
+                first,
+                session_path,
+                export,
+                diagnostic,
+                second,
+                second_diagnostic,
+                7,
+            )
+            self.assertEqual(
+                first_result["fixture_sha256"], second_result["fixture_sha256"]
+            )
+            self.assertEqual(
+                second_result["source_fixture_sha256"],
+                session["fixture_sha256"],
+            )
+            self.assertEqual(
+                second_result["input_fixture_sha256"],
+                first_result["fixture_sha256"],
+            )
+            self.assertEqual(
+                (first / "manifest.json").read_bytes(),
+                (second / "manifest.json").read_bytes(),
+            )
+
+            tampered = root / "tampered"
+            parity_script.shutil.copytree(first, tampered)
+            tampered_manifest = json.loads((tampered / "manifest.json").read_text())
+            tampered_manifest["source"]["fixture_sha256"] = "0" * 64
+            (tampered / "manifest.json").write_bytes(
+                parity_script.json_bytes(tampered_manifest)
+            )
+            with self.assertRaisesRegex(
+                ValueError, "session does not identify the source fixture"
+            ):
+                parity_script.refresh_fixture_from_trainer_export(
+                    profile,
+                    tampered,
+                    session_path,
+                    export,
+                    first_diagnostic,
+                    root / "tampered-output",
+                    root / "tampered-output.npz",
+                    7,
+                )
+
+            drifted = root / "drifted-wrapper"
+            parity_script.shutil.copytree(first, drifted)
+            drifted_manifest = json.loads((drifted / "manifest.json").read_text())
+            drifted_manifest["unexpected"] = True
+            (drifted / "manifest.json").write_bytes(
+                parity_script.json_bytes(drifted_manifest)
+            )
+            with self.assertRaisesRegex(
+                ValueError, "wrapper reconstruction differs"
+            ):
+                parity_script.refresh_fixture_from_trainer_export(
+                    profile,
+                    drifted,
+                    session_path,
+                    export,
+                    diagnostic,
+                    root / "drifted-output",
+                    root / "drifted-output.npz",
+                    7,
+                )
+
+            with np.load(first_diagnostic, allow_pickle=False) as values:
+                wrong_values = {name: values[name] for name in values.files}
+            wrong_values["fixture_sha256"] = np.asarray("0" * 64)
+            wrong_diagnostic = root / "wrong-wrapper.npz"
+            np.savez(wrong_diagnostic, **wrong_values)
+            with self.assertRaisesRegex(
+                ValueError, "diagnostic fixture_sha256 differs from its session"
+            ):
+                parity_script.refresh_fixture_from_trainer_export(
+                    profile,
+                    first,
+                    session_path,
+                    export,
+                    wrong_diagnostic,
+                    root / "wrong-wrapper-output",
+                    root / "wrong-wrapper-output.npz",
+                    7,
+                )
+
     def _trainer_bundle_values(self, expected_tokens=8):
         token_ids = np.arange(expected_tokens, dtype=np.int64)
         metadata = TraceSession(

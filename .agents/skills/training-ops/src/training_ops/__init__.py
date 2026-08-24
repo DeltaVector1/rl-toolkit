@@ -4945,6 +4945,7 @@ echo fifo-ready
             raise RuntimeError("current parity fixture rebuild returned invalid JSON") from error
         for field in (
             "fixture_sha256",
+            "input_fixture_sha256",
             "source_fixture_sha256",
             "token_ids_sha256",
             "positions_sha256",
@@ -4962,7 +4963,7 @@ echo fifo-ready
             "fixture": {
                 "action": None,
                 "new_manifest_sha256": refresh_result["fixture_sha256"],
-                "old_manifest_sha256": refresh_result["source_fixture_sha256"],
+                "old_manifest_sha256": refresh_result["input_fixture_sha256"],
                 "paths": {
                     "live": fixture,
                     "previous": fixture_previous,

@@ -57,6 +57,7 @@ class H200ParityTest(unittest.TestCase):
                 return 0, json.dumps(
                     {
                         "fixture_sha256": "1" * 64,
+                        "input_fixture_sha256": "9" * 64,
                         "source_fixture_sha256": "2" * 64,
                         "token_ids_sha256": "3" * 64,
                         "positions_sha256": "4" * 64,
@@ -1677,6 +1678,10 @@ sleep() {{
         self.assertLess(commands.index(commit), commands.index(final_cleanup))
         self.assertEqual(result["engine_cleanup"], "removed")
         self.assertFalse(result["engine_kept"])
+        self.assertEqual(
+            ssh_call.transaction["state"]["fixture"]["old_manifest_sha256"],
+            "9" * 64,
+        )
         self.assertTrue(
             any(
                 ".fixture-previous-1111111111111111" in command

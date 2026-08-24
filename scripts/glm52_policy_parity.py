@@ -284,12 +284,80 @@ def refresh_fixture_from_trainer_export(
     compact_manifest_path: Path | None = None,
 ) -> dict[str, Any]:
     source_manifest = load_manifest(source_fixture, "glm52_policy_parity_fixture")
-    source_fixture_sha256 = fixture_digest(source_fixture)
+    source_wrapper_sha256 = fixture_digest(source_fixture)
+    source_arrays = {
+        "token_ids": load_array(source_fixture, source_manifest, "token_ids").astype(
+            np.int64
+        ),
+        "positions": load_array(source_fixture, source_manifest, "positions").astype(
+            np.int64
+        ),
+        "selected_indices": load_array(
+            source_fixture, source_manifest, "selected_indices"
+        ).astype(np.int64),
+        "advantages": load_array(
+            source_fixture, source_manifest, "advantages"
+        ).astype(np.float32),
+    }
+    recorded_source = source_manifest.get("source")
+    source_fixture_sha256 = source_wrapper_sha256
+    if recorded_source is not None:
+        source_fields = {
+            "fixture_sha256",
+            "session_identity",
+            "token_export_sha256",
+            "rank",
+            "fixture_semantic_sha256",
+            "export_semantic_sha256",
+        }
+        fixture_semantic_hashes = {
+            name: _array_bytes_sha256(array)
+            for name, array in source_arrays.items()
+        }
+        if (
+            not isinstance(recorded_source, dict)
+            or set(recorded_source) != source_fields
+            or re.fullmatch(
+                r"[0-9a-f]{64}", str(recorded_source.get("fixture_sha256", ""))
+            )
+            is None
+            or re.fullmatch(
+                r"[0-9a-f]{64}", str(recorded_source.get("session_identity", ""))
+            )
+            is None
+            or re.fullmatch(
+                r"[0-9a-f]{64}", str(recorded_source.get("token_export_sha256", ""))
+            )
+            is None
+            or recorded_source.get("rank") != expected_rank
+            or recorded_source.get("fixture_semantic_sha256")
+            != fixture_semantic_hashes
+            or not isinstance(recorded_source.get("export_semantic_sha256"), dict)
+        ):
+            raise ValueError("refreshed fixture source provenance is invalid")
+        source_fixture_sha256 = recorded_source["fixture_sha256"]
     source_session = json.loads(source_session_path.read_text())
+    source_session_identity = hashlib.sha256(
+        json.dumps(source_session, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     if (
         source_session.get("schema_version") != schema_version
         or source_session.get("side") != "trainer"
         or source_session.get("fixture_sha256") != source_fixture_sha256
+        or source_session.get("token_ids_sha256")
+        != _array_bytes_sha256(source_arrays["token_ids"])
+        or re.fullmatch(
+            r"[0-9a-f]{40}", str(source_session.get("model_revision", ""))
+        )
+        is None
+        or re.fullmatch(
+            r"[0-9a-f]{64}", str(source_session.get("adapter_sha256", ""))
+        )
+        is None
+        or (
+            recorded_source is not None
+            and recorded_source.get("session_identity") != source_session_identity
+        )
     ):
         raise ValueError("trainer session does not identify the source fixture")
     fields = ("token_ids", "position_ids", "loss_mask", "advantages")
@@ -415,16 +483,6 @@ def refresh_fixture_from_trainer_export(
     advantages = full_advantages[selected].astype(np.float32)
     if selected.shape != (profile.get("max_output_length"),):
         raise ValueError("trainer token export loss mask does not select the expected output")
-    source_arrays = {
-        "token_ids": load_array(source_fixture, source_manifest, "token_ids").astype(np.int64),
-        "positions": load_array(source_fixture, source_manifest, "positions").astype(np.int64),
-        "selected_indices": load_array(
-            source_fixture, source_manifest, "selected_indices"
-        ).astype(np.int64),
-        "advantages": load_array(source_fixture, source_manifest, "advantages").astype(
-            np.float32
-        ),
-    }
     refreshed_arrays = {
         "token_ids": token_ids,
         "positions": positions,
@@ -447,10 +505,18 @@ def refresh_fixture_from_trainer_export(
     token_ids_sha256 = _array_bytes_sha256(token_ids)
     if source_session.get("token_ids_sha256") != token_ids_sha256:
         raise ValueError("trainer token export hash differs from its session")
+    export_semantic_hashes = {
+        "token_ids": token_ids_sha256,
+        "positions": _array_bytes_sha256(positions),
+        "loss_mask": _array_bytes_sha256(loss_mask),
+        "advantages": _array_bytes_sha256(full_advantages),
+    }
+    if recorded_source is not None and (
+        recorded_source.get("token_export_sha256") != trainer_source_sha256
+        or recorded_source.get("export_semantic_sha256") != export_semantic_hashes
+    ):
+        raise ValueError("trainer export differs from recorded fixture source")
     validate_diagnostic_file(diagnostic_input)
-    source_session_identity = hashlib.sha256(
-        json.dumps(source_session, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
     with np.load(diagnostic_input, allow_pickle=False) as values:
         diagnostic = {name: values[name] for name in values.files}
     expected_diagnostic = {
@@ -464,6 +530,12 @@ def refresh_fixture_from_trainer_export(
         value = diagnostic.get(name)
         if value is None or str(value.item()) != expected:
             raise ValueError(f"trainer diagnostic {name} differs from its session")
+    diagnostic_source = diagnostic.get("source_fixture_sha256")
+    if (
+        diagnostic_source is not None
+        and str(diagnostic_source.item()) != source_fixture_sha256
+    ):
+        raise ValueError("trainer diagnostic source fixture differs from its session")
     if output.exists() or diagnostic_output.exists():
         raise FileExistsError("refreshed parity fixture output already exists")
     try:
@@ -480,16 +552,15 @@ def refresh_fixture_from_trainer_export(
                 "sha256": file_sha256(output / filename),
             }
             fixture_semantic_hashes[name] = _array_bytes_sha256(array)
-        export_semantic_hashes = {
-            "token_ids": token_ids_sha256,
-            "positions": _array_bytes_sha256(positions),
-            "loss_mask": _array_bytes_sha256(loss_mask),
-            "advantages": _array_bytes_sha256(full_advantages),
-        }
+        manifest_created_utc = (
+            source_manifest["created_utc"]
+            if recorded_source is not None
+            else parse_time(created_utc).isoformat()
+        )
         manifest = {
             "schema_version": schema_version,
             "kind": "glm52_policy_parity_fixture",
-            "created_utc": parse_time(created_utc).isoformat(),
+            "created_utc": manifest_created_utc,
             "seed": source_manifest["seed"],
             "profile_sha256": file_sha256(profile.path),
             "context_length": length,
@@ -508,6 +579,11 @@ def refresh_fixture_from_trainer_export(
         (output / "manifest.json").write_bytes(json_bytes(manifest))
         check_fresh(profile, output, manifest)
         refreshed_fixture_sha256 = fixture_digest(output)
+        if (
+            recorded_source is not None
+            and refreshed_fixture_sha256 != source_wrapper_sha256
+        ):
+            raise ValueError("refreshed fixture wrapper reconstruction differs")
         diagnostic["source_fixture_sha256"] = np.asarray(
             source_fixture_sha256, dtype="<U64"
         )
@@ -523,6 +599,7 @@ def refresh_fixture_from_trainer_export(
         raise
     return {
         "fixture_sha256": refreshed_fixture_sha256,
+        "input_fixture_sha256": source_wrapper_sha256,
         "source_fixture_sha256": source_fixture_sha256,
         "token_ids_sha256": token_ids_sha256,
         "positions_sha256": export_semantic_hashes["positions"],
