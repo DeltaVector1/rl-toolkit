@@ -87,6 +87,12 @@ h200_parity_listener_stabilization_seconds = 30
 settle_timeout_seconds = 120
 poll_seconds = 2
 
+[limits.h200_parity_failure_evidence]
+state_poll_seconds = 2
+inspect_max_bytes = 65536
+logs_max_bytes = 262144
+events_max_bytes = 65536
+
 [limits.live_service_check]
 attempts = 2
 connect_timeout_seconds = 45

@@ -156,6 +156,26 @@ def _configured_h200_parity_cleanup() -> tuple[int, int]:
     return timeout, poll
 
 
+def _configured_h200_parity_failure_evidence() -> tuple[int, int, int, int]:
+    settings = limits.get("h200_parity_failure_evidence")
+    if not isinstance(settings, dict):
+        raise Refused("limits.h200_parity_failure_evidence must be configured")
+    poll = settings.get("state_poll_seconds")
+    inspect_bytes = settings.get("inspect_max_bytes")
+    logs_bytes = settings.get("logs_max_bytes")
+    events_bytes = settings.get("events_max_bytes")
+    values = (poll, inspect_bytes, logs_bytes, events_bytes)
+    if (
+        any(isinstance(value, bool) or not isinstance(value, int) for value in values)
+        or not 1 <= poll <= 10
+        or not 4096 <= inspect_bytes <= 262144
+        or not 4096 <= logs_bytes <= 262144
+        or not 4096 <= events_bytes <= 262144
+    ):
+        raise Refused("H200 parity failure evidence limits are invalid")
+    return poll, inspect_bytes, logs_bytes, events_bytes
+
+
 def _configured_live_service_check() -> tuple[int, int, int, int, int, int, int]:
     settings = limits.get("live_service_check")
     if not isinstance(settings, dict):
@@ -3674,6 +3694,20 @@ def _validate_parity_transaction_state(path: str, state: dict[str, object]) -> N
             raise RuntimeError(f"parity transaction {kind} old hash is invalid")
         if action is not None and new_hash is None:
             raise RuntimeError(f"parity transaction {kind} published hash is missing")
+    failure_evidence = state.get("failure_evidence")
+    if failure_evidence is not None:
+        if (
+            not isinstance(failure_evidence, dict)
+            or failure_evidence.get("path") != f"{root}/.diagnostic-run-{nonce}/failure-evidence.json"
+            or re.fullmatch(r"[0-9a-f]{64}", str(failure_evidence.get("sha256", ""))) is None
+            or re.fullmatch(r"[0-9a-f]{64}", str(failure_evidence.get("container_id", ""))) is None
+            or re.fullmatch(
+                r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                str(failure_evidence.get("host_boot_id", "")),
+            )
+            is None
+        ):
+            raise RuntimeError("parity transaction failure evidence is invalid")
 
 
 def _prepare_parity_container_work(
@@ -4239,7 +4273,19 @@ def _receive_parity_bootstrap(host: str, command: str, timeout: int) -> str:
     except subprocess.TimeoutExpired as error:
         raise RuntimeError(f"parity bootstrap receive timed out on {host}") from error
     if process.returncode:
-        raise RuntimeError(f"parity bootstrap receive failed on {host}")
+        candidates = re.findall(
+            r"parity-bootstrap-error:"
+            r"(?:container-(?:exited|exited-after-token):status=[a-z]+,exit=[0-9]+,oom=(?:true|false)"
+            r"|(?:host-boot-changed|container-missing|container-inspect-invalid|"
+            r"container-inspect-count|container-identity-changed|fifo-identity-changed|"
+            r"fifo-metadata-invalid|startup-grace-expired|bootstrap-framing-invalid|"
+            r"bootstrap-encoding-invalid|bootstrap-capacity-invalid|token-missing|"
+            r"fifo-cleanup-failed:[A-Za-z0-9_-]+))",
+            process.stderr,
+        )
+        detail = candidates[-1] if candidates else ""
+        suffix = f": {detail}" if detail else ""
+        raise RuntimeError(f"parity bootstrap receive failed on {host}{suffix}")
     value = process.stdout
     if len(value) != 65 or not value.endswith("\n"):
         raise RuntimeError("parity bootstrap receive returned invalid framing")
@@ -4255,15 +4301,389 @@ def _receive_parity_bootstrap(host: str, command: str, timeout: int) -> str:
     return token
 
 
-def _parity_bootstrap_receive_command(path: str, timeout: int) -> str:
-    return (
-        "set -euo pipefail; status=0; "
-        f"sudo timeout --foreground {timeout} cat -- {shlex.quote(path)} || status=$?; "
-        f"sudo rm -f -- {shlex.quote(path)}; "
-        f"test ! -e {shlex.quote(path)}; "
-        f"test ! -L {shlex.quote(path)}; "
-        'exit "$status"'
+def _parity_bootstrap_receive_command(
+    path: str,
+    timeout: int,
+    poll_seconds: int,
+    container_id: str,
+    host_boot_id: str,
+) -> str:
+    if (
+        re.fullmatch(
+            r"/data/glm52-rl/qualifications/glm52-policy-parity/" r"\.diagnostic-run-[0-9a-f]{16}/bootstrap\.fifo",
+            path,
+        )
+        is None
+    ):
+        raise Refused("parity bootstrap FIFO path is not exact")
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, int)
+        or timeout < 1
+        or isinstance(poll_seconds, bool)
+        or not isinstance(poll_seconds, int)
+        or not 1 <= poll_seconds <= 2
+        or re.fullmatch(r"[0-9a-f]{64}", container_id) is None
+        or re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            host_boot_id,
+        )
+        is None
+    ):
+        raise Refused("parity bootstrap wait identity or limit is invalid")
+    expected_command = [
+        "@",
+        glm_parity_inference_config,
+        "--vllm-extra",
+        glm_parity_vllm_extra,
+    ]
+    program = r"""
+import base64
+import json
+import os
+import select
+import stat
+import subprocess
+import sys
+import time
+
+fifo, timeout_text, poll_text, expected_id, expected_boot, expected_name, expected_image, expected_command_text = sys.argv[1:]
+timeout_seconds = int(timeout_text)
+poll_seconds = int(poll_text)
+expected_command = json.loads(expected_command_text)
+deadline = time.monotonic() + timeout_seconds
+fifo_fd = None
+fifo_stat = None
+token = None
+failure = None
+
+def inspect_container():
+    if open("/proc/sys/kernel/random/boot_id", encoding="ascii").read().strip() != expected_boot:
+        raise RuntimeError("host-boot-changed")
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("startup-grace-expired")
+    result = subprocess.run(
+        ["docker", "inspect", expected_id],
+        capture_output=True,
+        text=True,
+        timeout=min(10.0, remaining),
+        check=False,
     )
+    if result.returncode:
+        raise RuntimeError("container-missing")
+    try:
+        values = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("container-inspect-invalid") from error
+    if not isinstance(values, list) or len(values) != 1 or not isinstance(values[0], dict):
+        raise RuntimeError("container-inspect-count")
+    value = values[0]
+    config = value.get("Config")
+    host_config = value.get("HostConfig")
+    state = value.get("State")
+    restart = host_config.get("RestartPolicy") if isinstance(host_config, dict) else None
+    if (
+        value.get("Id") != expected_id
+        or value.get("Name") != "/" + expected_name
+        or not isinstance(config, dict)
+        or config.get("Image") != expected_image
+        or config.get("Cmd") != expected_command
+        or not isinstance(restart, dict)
+        or restart.get("Name") != "no"
+        or value.get("RestartCount") != 0
+        or not isinstance(state, dict)
+    ):
+        raise RuntimeError("container-identity-changed")
+    return state
+
+def check_fifo(expected_stat):
+    current = os.lstat(fifo)
+    if (
+        not stat.S_ISFIFO(current.st_mode)
+        or current.st_uid != 1000
+        or current.st_gid != 1000
+        or stat.S_IMODE(current.st_mode) != 0o600
+        or (current.st_dev, current.st_ino) != (expected_stat.st_dev, expected_stat.st_ino)
+    ):
+        raise RuntimeError("fifo-identity-changed")
+
+try:
+    fifo_fd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    fifo_stat = os.fstat(fifo_fd)
+    if (
+        not stat.S_ISFIFO(fifo_stat.st_mode)
+        or fifo_stat.st_uid != 1000
+        or fifo_stat.st_gid != 1000
+        or stat.S_IMODE(fifo_stat.st_mode) != 0o600
+    ):
+        raise RuntimeError("fifo-metadata-invalid")
+    data = b""
+    while True:
+        check_fifo(fifo_stat)
+        state = inspect_container()
+        if not state.get("Running"):
+            raise RuntimeError(
+                "container-exited:status=%s,exit=%s,oom=%s"
+                % (state.get("Status"), state.get("ExitCode"), str(state.get("OOMKilled")).lower())
+            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("startup-grace-expired")
+        ready, _, _ = select.select([fifo_fd], [], [], min(float(poll_seconds), remaining))
+        if not ready:
+            continue
+        chunk = os.read(fifo_fd, 66 - len(data))
+        if not chunk:
+            time.sleep(min(float(poll_seconds), max(0.0, deadline - time.monotonic())))
+            continue
+        data += chunk
+        if len(data) > 65 or b"\n" in data:
+            if len(data) != 65 or not data.endswith(b"\n") or data.count(b"\n") != 1:
+                raise RuntimeError("bootstrap-framing-invalid")
+            candidate = data[:-1]
+            try:
+                decoded = base64.urlsafe_b64decode(candidate)
+            except Exception as error:
+                raise RuntimeError("bootstrap-encoding-invalid") from error
+            if len(candidate) != 64 or len(decoded) != 48:
+                raise RuntimeError("bootstrap-capacity-invalid")
+            state = inspect_container()
+            if not state.get("Running"):
+                raise RuntimeError(
+                    "container-exited-after-token:status=%s,exit=%s,oom=%s"
+                    % (state.get("Status"), state.get("ExitCode"), str(state.get("OOMKilled")).lower())
+                )
+            token = candidate.decode("ascii")
+            break
+except BaseException as error:
+    failure = str(error) or type(error).__name__
+finally:
+    if fifo_fd is not None:
+        os.close(fifo_fd)
+    try:
+        current = os.lstat(fifo)
+        if (
+            fifo_stat is None
+            or stat.S_ISLNK(current.st_mode)
+            or not stat.S_ISFIFO(current.st_mode)
+            or current.st_uid != 1000
+            or current.st_gid != 1000
+            or stat.S_IMODE(current.st_mode) != 0o600
+            or (current.st_dev, current.st_ino) != (fifo_stat.st_dev, fifo_stat.st_ino)
+        ):
+            raise RuntimeError("fifo-cleanup-identity-changed")
+        os.unlink(fifo)
+        try:
+            os.lstat(fifo)
+        except FileNotFoundError:
+            pass
+        else:
+            raise RuntimeError("fifo-cleanup-retained")
+    except FileNotFoundError:
+        pass
+    except BaseException as error:
+        failure = "fifo-cleanup-failed:" + (str(error) or type(error).__name__)
+
+if failure is not None:
+    print("parity-bootstrap-error:" + failure, file=sys.stderr)
+    raise SystemExit(70)
+if token is None:
+    print("parity-bootstrap-error:token-missing", file=sys.stderr)
+    raise SystemExit(71)
+print(token)
+""".strip()
+    return " ".join(
+        (
+            "sudo python3 -c",
+            shlex.quote(program),
+            shlex.quote(path),
+            str(timeout),
+            str(poll_seconds),
+            container_id,
+            host_boot_id,
+            shlex.quote(glm_inference_container),
+            shlex.quote(inference_image),
+            shlex.quote(json.dumps(expected_command, separators=(",", ":"))),
+        )
+    )
+
+
+def _write_h200_parity_failure_evidence(
+    host: str,
+    transaction_path: str,
+    evidence: dict[str, object],
+    sensitive: tuple[str, ...],
+) -> str:
+    nonce = _validate_parity_transaction_path(transaction_path)
+    evidence_path = f"{glm_parity_root}/.diagnostic-run-{nonce}/failure-evidence.json"
+    payload = json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n"
+    for secret in sensitive:
+        if secret and secret in payload:
+            raise RuntimeError("parity failure evidence contains a secret")
+    encoded = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+    command = (
+        "sudo python3 -c 'import base64,hashlib,os,pathlib,stat,sys; "
+        "p=pathlib.Path(sys.argv[1]); root=p.parent; "
+        "st=os.lstat(root); "
+        "assert stat.S_ISDIR(st.st_mode) and not stat.S_ISLNK(st.st_mode); "
+        'assert p.name=="failure-evidence.json" and not p.exists() and not p.is_symlink(); '
+        't=root/".failure-evidence.json.tmp"; '
+        "fd=os.open(t,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600); "
+        "data=base64.b64decode(sys.argv[2],validate=True); "
+        "os.write(fd,data); os.fsync(fd); os.close(fd); os.replace(t,p); "
+        "d=os.open(root,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW); os.fsync(d); os.close(d); "
+        "q=os.lstat(p); assert stat.S_ISREG(q.st_mode) and not stat.S_ISLNK(q.st_mode) "
+        "and stat.S_IMODE(q.st_mode)==0o600; "
+        "print(hashlib.sha256(p.read_bytes()).hexdigest())' "
+        f"{shlex.quote(evidence_path)} {shlex.quote(encoded)}"
+    )
+    remote_hash = _sensitive_ssh(
+        host,
+        command,
+        "H200 parity failure evidence write",
+        sensitive,
+        60,
+    ).strip()
+    expected_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    if remote_hash != expected_hash:
+        raise RuntimeError("H200 parity failure evidence hash differs after write")
+    snapshot = _parity_transaction_snapshot(host, transaction_path, sensitive)
+    state = snapshot.get("state")
+    if not isinstance(state, dict):
+        raise RuntimeError("parity transaction state is missing for failure evidence")
+    state["failure_evidence"] = {
+        "path": evidence_path,
+        "sha256": expected_hash,
+        "container_id": evidence.get("container_id"),
+        "host_boot_id": evidence.get("host_boot_id"),
+    }
+    _write_parity_transaction_state(host, transaction_path, state, sensitive)
+    return evidence_path
+
+
+def _capture_h200_parity_failure_evidence(
+    host: str,
+    transaction_path: str,
+    launch_identity: dict[str, str],
+    reason: BaseException,
+    sensitive: tuple[str, ...],
+) -> dict[str, object]:
+    poll_seconds, inspect_max, logs_max, events_max = _configured_h200_parity_failure_evidence()
+    del poll_seconds
+    container_id = launch_identity.get("container_id", "")
+    boot_id = launch_identity.get("host_boot_id", "")
+    if (
+        re.fullmatch(r"[0-9a-f]{64}", container_id) is None
+        or re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            boot_id,
+        )
+        is None
+    ):
+        raise Refused("H200 parity failure evidence identity is invalid")
+    inspect_command = (
+        "set -euo pipefail; "
+        f'test "$(cat /proc/sys/kernel/random/boot_id)" = {shlex.quote(boot_id)}; '
+        f"sudo docker inspect {container_id}"
+    )
+    inspect_text = _sensitive_ssh(
+        host,
+        inspect_command,
+        "H200 parity failure inspect",
+        sensitive,
+        30,
+    )
+    if len(inspect_text.encode("utf-8")) > inspect_max:
+        raise RuntimeError("H200 parity failure inspect exceeds its configured bound")
+    try:
+        inspected = json.loads(inspect_text)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("H200 parity failure inspect is invalid JSON") from error
+    if (
+        not isinstance(inspected, list)
+        or len(inspected) != 1
+        or not isinstance(inspected[0], dict)
+        or inspected[0].get("Id") != container_id
+    ):
+        raise RuntimeError("H200 parity failure inspect identity differs")
+    state = inspected[0].get("State")
+    if not isinstance(state, dict):
+        raise RuntimeError("H200 parity failure inspect has no state")
+    logs_command = "set -euo pipefail; " f"sudo docker logs --tail 200 {container_id} 2>&1 | " f"tail -c {logs_max}"
+    logs_text = _sensitive_ssh(
+        host,
+        logs_command,
+        "H200 parity failure logs",
+        sensitive,
+        30,
+    )
+    if len(logs_text.encode("utf-8")) > logs_max:
+        raise RuntimeError("H200 parity failure logs exceed their configured bound")
+    events_command = (
+        "set -euo pipefail; until=$(date -u +%Y-%m-%dT%H:%M:%SZ); "
+        f'sudo docker events --since 30m --until "$until" --filter container={container_id} '
+        f"--format '{{{{json .}}}}' | tail -c {events_max}"
+    )
+    events_text = _sensitive_ssh(
+        host,
+        events_command,
+        "H200 parity failure events",
+        sensitive,
+        30,
+    )
+    if len(events_text.encode("utf-8")) > events_max:
+        raise RuntimeError("H200 parity failure events exceed their configured bound")
+    clean_reason = _redact_sensitive(str(reason), sensitive)
+    records = {}
+    for key, text_value in (
+        ("inspect", inspect_text),
+        ("logs", logs_text),
+        ("events", events_text),
+    ):
+        for secret in sensitive:
+            if secret and secret in text_value:
+                raise RuntimeError(f"H200 parity failure {key} contains a secret")
+        data = text_value.encode("utf-8")
+        records[key] = {
+            "bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "text": text_value,
+        }
+    evidence: dict[str, object] = {
+        "schema_version": 1,
+        "captured_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        "container_id": container_id,
+        "host_boot_id": boot_id,
+        "reason": clean_reason,
+        "state": {
+            "status": state.get("Status"),
+            "running": state.get("Running"),
+            "exit_code": state.get("ExitCode"),
+            "oom_killed": state.get("OOMKilled"),
+        },
+        "bounds": {
+            "inspect_bytes": inspect_max,
+            "logs_lines": 200,
+            "logs_bytes": logs_max,
+            "events_bytes": events_max,
+        },
+        "records": records,
+    }
+    evidence_path = _write_h200_parity_failure_evidence(
+        host,
+        transaction_path,
+        evidence,
+        sensitive,
+    )
+    log_tail = logs_text[-4096:].strip()
+    return {
+        "path": evidence_path,
+        "status": state.get("Status"),
+        "exit_code": state.get("ExitCode"),
+        "oom_killed": state.get("OOMKilled"),
+        "log_tail": log_tail,
+    }
 
 
 def _parity_temporary_cleanup_command(
@@ -4855,6 +5275,9 @@ def diagnose_glm52_policy_parity(name: str, keep_engine: bool = False) -> dict[s
     api_listener_identity: dict[str, object] | None = None
     bootstrap_identity: dict[str, object] | None = None
     launch_identity: dict[str, str] | None = None
+    failure_evidence: dict[str, object] | None = None
+    failure_evidence_attempted = False
+    failure_evidence_failed = False
     cleanup_warnings: list[str] = []
     operation_error: BaseException | None = None
     result: dict[str, object] | None = None
@@ -5084,16 +5507,49 @@ printf '%s\n' "$state"
         if launch_identity is None:
             raise RuntimeError("isolated parity engine start returned no identity")
         startup_grace = _configured_h200_engine_startup_grace()
+        state_poll_seconds, _inspect_max, _logs_max, _events_max = (
+            _configured_h200_parity_failure_evidence()
+        )
         _h200_parity_container_preflight(host, h200_trace_directory)
         fifo_read = _parity_bootstrap_receive_command(
             bootstrap_fifo,
             startup_grace,
+            state_poll_seconds,
+            launch_identity["container_id"],
+            launch_identity["host_boot_id"],
         )
-        bootstrap_token = _receive_parity_bootstrap(
-            host,
-            fifo_read,
-            startup_grace + 30,
-        )
+        try:
+            bootstrap_token = _receive_parity_bootstrap(
+                host,
+                fifo_read,
+                startup_grace + 30,
+            )
+        except BaseException as error:
+            failure_evidence_attempted = True
+            try:
+                failure_evidence = _capture_h200_parity_failure_evidence(
+                    host,
+                    transaction_path,
+                    launch_identity,
+                    error,
+                    sensitive,
+                )
+                error.add_note(
+                    "H200 parity engine failure: "
+                    f"status={failure_evidence['status']}, "
+                    f"exit={failure_evidence['exit_code']}, "
+                    f"oom={failure_evidence['oom_killed']}; "
+                    f"evidence={failure_evidence['path']}; "
+                    f"log tail={failure_evidence['log_tail']}"
+                )
+            except BaseException as evidence_error:
+                failure_evidence_failed = True
+                error.add_note(
+                    "H200 parity failure evidence could not be saved; "
+                    f"work retained at {container_work_directory}: "
+                    + _redact_sensitive(str(evidence_error), sensitive)
+                )
+            raise
         sensitive = (bootstrap_token,)
         listener_stabilization = _configured_h200_parity_listener_stabilization()
         listener_identity = _h200_parity_listener_identity(
@@ -5256,6 +5712,28 @@ printf '%s\n' "$state"
         raise
     finally:
         cleanup_failures: list[str] = []
+        if (
+            operation_error is not None
+            and engine_launch_attempted
+            and launch_identity is not None
+            and not failure_evidence_attempted
+        ):
+            failure_evidence_attempted = True
+            try:
+                failure_evidence = _capture_h200_parity_failure_evidence(
+                    host,
+                    transaction_path,
+                    launch_identity,
+                    operation_error,
+                    sensitive,
+                )
+                operation_error.add_note("H200 parity failure evidence saved at " + str(failure_evidence["path"]))
+            except BaseException as evidence_error:
+                failure_evidence_failed = True
+                cleanup_failures.append(
+                    "H200 parity failure evidence could not be saved; "
+                    f"work retained at {container_work_directory}: " + _redact_sensitive(str(evidence_error), sensitive)
+                )
         engine_cleanup = "retained" if engine_launch_attempted else "absent"
         if engine_launch_attempted and (not keep_engine or not succeeded):
             try:
@@ -5306,7 +5784,9 @@ printf '%s\n' "$state"
             result["container_work"] = (
                 container_work_directory if engine_cleanup == "retained" else None
             )
-        retain_container_work = engine_cleanup in {"retained", "unknown"}
+        retain_container_work = (
+            engine_cleanup in {"retained", "unknown"} or failure_evidence_failed
+        )
         cleanup = _parity_temporary_cleanup_command(
             bootstrap_fifo=bootstrap_fifo,
             transaction_path=transaction_path,
@@ -5447,7 +5927,7 @@ printf '%s\n' "$state"
         remove_transaction = (
             (committed and not cleanup_failures and not cleanup_warnings)
             or (rollback_completed and not cleanup_failures)
-        )
+        ) and failure_evidence is None
         if transaction_present and remove_transaction:
             try:
                 _remove_completed_parity_transaction(

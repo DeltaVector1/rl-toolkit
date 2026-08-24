@@ -1,3 +1,4 @@
+import base64
 import copy
 import json
 import os
@@ -5,6 +6,8 @@ import re
 import shlex
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -13,6 +16,86 @@ import training_ops
 
 
 class H200ParityTest(unittest.TestCase):
+    def _run_bootstrap_controller(self, state, *, token=None, timeout=2):
+        container_id = "d" * 64
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        canonical_fifo = (
+            "/data/glm52-rl/qualifications/glm52-policy-parity/" ".diagnostic-run-1111111111111111/bootstrap.fifo"
+        )
+        command = training_ops._parity_bootstrap_receive_command(
+            canonical_fifo,
+            timeout,
+            1,
+            container_id,
+            boot_id,
+        )
+        argv = shlex.split(command)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fifo = root / "bootstrap.fifo"
+            os.mkfifo(fifo, 0o600)
+            docker = root / "docker"
+            docker.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json,os,sys\n"
+                "if sys.argv[1] != 'inspect': raise SystemExit(91)\n"
+                "p=os.environ['FAKE_INSPECT_COUNT']; seq=json.loads(os.environ['FAKE_INSPECT'])\n"
+                "try: n=int(open(p).read())\n"
+                "except FileNotFoundError: n=0\n"
+                "open(p,'w').write(str(n+1)); print(json.dumps(seq[min(n,len(seq)-1)]))\n"
+            )
+            docker.chmod(0o755)
+            states = state if isinstance(state, list) else [state]
+            inspect = [
+                [
+                    {
+                        "Id": container_id,
+                        "Name": "/" + training_ops.glm_inference_container,
+                        "Config": {
+                            "Image": training_ops.inference_image,
+                            "Cmd": [
+                                "@",
+                                training_ops.glm_parity_inference_config,
+                                "--vllm-extra",
+                                training_ops.glm_parity_vllm_extra,
+                            ],
+                        },
+                        "HostConfig": {"RestartPolicy": {"Name": "no"}},
+                        "RestartCount": 0,
+                        "State": current_state,
+                    }
+                ]
+                for current_state in states
+            ]
+            environment = {
+                **os.environ,
+                "PATH": str(root) + os.pathsep + os.environ["PATH"],
+                "FAKE_INSPECT": json.dumps(inspect),
+                "FAKE_INSPECT_COUNT": str(root / "inspect-count"),
+            }
+            controller = [argv[1], *argv[2:]]
+            controller[3] = str(fifo)
+            process = subprocess.Popen(
+                controller,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=environment,
+            )
+            if token is not None:
+
+                def write_token():
+                    time.sleep(0.1)
+                    with fifo.open("w") as stream:
+                        stream.write(token + "\n")
+
+                writer = threading.Thread(target=write_token)
+                writer.start()
+            stdout, stderr = process.communicate(timeout=timeout + 5)
+            if token is not None:
+                writer.join(timeout=2)
+            return process.returncode, stdout, stderr, fifo.exists()
+
     def _operation_ssh(
         self,
         commands,
@@ -167,6 +250,7 @@ class H200ParityTest(unittest.TestCase):
         *,
         keep_engine=False,
         recovery_error=False,
+        evidence_error=False,
     ):
         metadata = json.dumps({"model_revision": "a" * 40, "adapter_sha256": "b" * 64})
         source_root = f"{training_ops.parity_trace_root}/qualification-1"
@@ -240,9 +324,18 @@ class H200ParityTest(unittest.TestCase):
                 "host_boot_id": "11111111-2222-3333-4444-555555555555",
             }
         )
-        with patch.object(
-            training_ops.secrets, "token_hex", return_value="1" * 16
-        ), patch.object(
+        failure_evidence = {
+            "path": (
+                "/data/glm52-rl/qualifications/glm52-policy-parity/"
+                ".diagnostic-run-1111111111111111/failure-evidence.json"
+            ),
+            "status": "exited",
+            "exit_code": 1,
+            "oom_killed": False,
+            "log_tail": "engine failed",
+        }
+        evidence_result = RuntimeError("docker logs could not be collected") if evidence_error else failure_evidence
+        with patch.object(training_ops.secrets, "token_hex", return_value="1" * 16), patch.object(
             training_ops,
             "_resolve_glm52_parity_diagnostic_source",
             return_value=(
@@ -285,21 +378,20 @@ class H200ParityTest(unittest.TestCase):
                 "status": "ready",
                 "process_id": 22,
                 "boot_nonce": "e" * 32,
-                "token_sha256": training_ops.hashlib.sha256(
-                    secret.encode("ascii")
-                ).hexdigest(),
+                "token_sha256": training_ops.hashlib.sha256(secret.encode("ascii")).hexdigest(),
             },
-        ), patch.object(
-            training_ops, "_configured_h200_engine_startup_grace", return_value=7200
-        ), patch.object(
+        ), patch.object(training_ops, "_configured_h200_engine_startup_grace", return_value=7200), patch.object(
             training_ops,
             "_recover_h200_parity_launch_identity",
             side_effect=recovery if recovery_error else None,
             return_value=None if recovery_error else recovery,
         ), patch.object(training_ops, "_ssh", side_effect=ssh_call), patch.object(
             training_ops, "_sensitive_ssh_input", side_effect=secret_call
-        ), patch.object(
-            training_ops, "_receive_parity_bootstrap", side_effect=ssh_call.receive
+        ), patch.object(training_ops, "_receive_parity_bootstrap", side_effect=ssh_call.receive), patch.object(
+            training_ops,
+            "_capture_h200_parity_failure_evidence",
+            side_effect=evidence_result if evidence_error else None,
+            return_value=None if evidence_error else evidence_result,
         ):
             result = training_ops.diagnose_glm52_policy_parity("qualification-1", keep_engine=keep_engine)
         self.last_diagnostic_copy = copy_input.call_args
@@ -752,90 +844,144 @@ sleep() {{
         self.assertIs(run.call_args.kwargs["stdin"], subprocess.DEVNULL)
         self.assertEqual(run.call_args.kwargs["timeout"], 30)
 
-        failed = subprocess.CompletedProcess(
-            args=[], returncode=1, stdout=secret + "\n", stderr=secret
-        )
-        with patch.object(
-            training_ops.subprocess, "run", return_value=failed
-        ), self.assertRaises(RuntimeError) as caught:
+        failed = subprocess.CompletedProcess(args=[], returncode=1, stdout=secret + "\n", stderr=secret)
+        with patch.object(training_ops.subprocess, "run", return_value=failed), self.assertRaises(
+            RuntimeError
+        ) as caught:
             training_ops._receive_parity_bootstrap("h200a", "read fifo", 30)
         self.assertNotIn(secret, str(caught.exception))
 
-    def test_bootstrap_receive_command_propagates_read_and_cleanup_failures(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            missing = root / "missing.fifo"
-            read_command = training_ops._parity_bootstrap_receive_command(
-                str(missing), 1
-            ).replace("sudo ", "")
-            read = subprocess.run(
-                ["bash", "-c", read_command],
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            self.assertNotEqual(read.returncode, 0)
-            self.assertFalse(missing.exists())
+    def test_bootstrap_controller_receives_token_and_removes_fifo(self):
+        token = base64.urlsafe_b64encode(b"x" * 48).decode("ascii")
+        code, stdout, stderr, fifo_exists = self._run_bootstrap_controller(
+            {
+                "Status": "running",
+                "Running": True,
+                "ExitCode": 0,
+                "OOMKilled": False,
+            },
+            token=token,
+        )
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(stdout, token + "\n")
+        self.assertFalse(fifo_exists)
 
-            retained = root / "bootstrap.fifo"
-            retained.write_text("x" * 64 + "\n")
-            cleanup_command = training_ops._parity_bootstrap_receive_command(
-                str(retained), 1
-            )
-            cleanup = subprocess.run(
-                [
-                    "bash",
-                    "-c",
-                    "sudo() { if test \"$1\" = rm; then return 93; fi; \"$@\"; }; "
-                    + cleanup_command,
-                ],
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            self.assertNotEqual(cleanup.returncode, 0)
-            self.assertTrue(retained.exists())
+    def test_bootstrap_controller_stops_on_exit_before_fifo_writer(self):
+        code, stdout, stderr, fifo_exists = self._run_bootstrap_controller(
+            {
+                "Status": "exited",
+                "Running": False,
+                "ExitCode": 137,
+                "OOMKilled": True,
+            }
+        )
+        self.assertNotEqual(code, 0)
+        self.assertEqual(stdout, "")
+        self.assertIn("container-exited:status=exited,exit=137,oom=true", stderr)
+        self.assertFalse(fifo_exists)
 
-            retained_regular = root / "retained-regular.fifo"
-            retained_regular.write_text("x" * 64 + "\n")
-            regular_command = training_ops._parity_bootstrap_receive_command(
-                str(retained_regular), 1
-            )
-            regular_cleanup = subprocess.run(
-                [
-                    "bash",
-                    "-c",
-                    "sudo() { if test \"$1\" = rm; then return 0; fi; \"$@\"; }; "
-                    + regular_command,
-                ],
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            self.assertNotEqual(regular_cleanup.returncode, 0)
-            self.assertTrue(retained_regular.is_file())
+    def test_bootstrap_controller_rejects_malformed_token(self):
+        code, stdout, stderr, fifo_exists = self._run_bootstrap_controller(
+            {
+                "Status": "running",
+                "Running": True,
+                "ExitCode": 0,
+                "OOMKilled": False,
+            },
+            token="!" * 64,
+        )
+        self.assertNotEqual(code, 0)
+        self.assertEqual(stdout, "")
+        self.assertIn("bootstrap-capacity-invalid", stderr)
+        self.assertFalse(fifo_exists)
 
-            retained_symlink = root / "retained-symlink.fifo"
-            retained_symlink.symlink_to(root / "missing-target")
-            symlink_command = training_ops._parity_bootstrap_receive_command(
-                str(retained_symlink), 1
+    def test_bootstrap_controller_rechecks_exit_after_token(self):
+        token = base64.urlsafe_b64encode(b"x" * 48).decode("ascii")
+        running = {
+            "Status": "running",
+            "Running": True,
+            "ExitCode": 0,
+            "OOMKilled": False,
+        }
+        exited = {
+            "Status": "exited",
+            "Running": False,
+            "ExitCode": 1,
+            "OOMKilled": False,
+        }
+        code, stdout, stderr, fifo_exists = self._run_bootstrap_controller([running, exited], token=token)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(stdout, "")
+        self.assertIn("container-exited-after-token", stderr)
+        self.assertFalse(fifo_exists)
+
+    def test_bootstrap_controller_times_out_without_blind_fifo_read(self):
+        code, stdout, stderr, fifo_exists = self._run_bootstrap_controller(
+            {
+                "Status": "running",
+                "Running": True,
+                "ExitCode": 0,
+                "OOMKilled": False,
+            },
+            timeout=1,
+        )
+        self.assertNotEqual(code, 0)
+        self.assertEqual(stdout, "")
+        self.assertIn("startup-grace-expired", stderr)
+        self.assertFalse(fifo_exists)
+
+    def test_failure_evidence_is_bounded_and_records_exit_state(self):
+        container_id = "d" * 64
+        boot_id = "11111111-2222-3333-4444-555555555555"
+        inspected = json.dumps(
+            [
+                {
+                    "Id": container_id,
+                    "State": {
+                        "Status": "exited",
+                        "Running": False,
+                        "ExitCode": 137,
+                        "OOMKilled": True,
+                    },
+                }
+            ]
+        )
+        outputs = iter((inspected, "last log line\n", '{"status":"die"}\n'))
+        recorded = {}
+
+        def write(_host, _path, evidence, _sensitive):
+            recorded.update(evidence)
+            return (
+                "/data/glm52-rl/qualifications/glm52-policy-parity/"
+                ".diagnostic-run-1111111111111111/failure-evidence.json"
             )
-            symlink_cleanup = subprocess.run(
-                [
-                    "bash",
-                    "-c",
-                    "sudo() { "
-                    "if test \"$1\" = timeout; then printf '%064d\\n' 0; return 0; fi; "
-                    "if test \"$1\" = rm; then return 0; fi; "
-                    "\"$@\"; }; "
-                    + symlink_command,
-                ],
-                text=True,
-                capture_output=True,
-                check=False,
+
+        with patch.object(
+            training_ops, "_sensitive_ssh", side_effect=lambda *args: next(outputs)
+        ) as remote, patch.object(
+            training_ops,
+            "_write_h200_parity_failure_evidence",
+            side_effect=write,
+        ):
+            result = training_ops._capture_h200_parity_failure_evidence(
+                "h200a",
+                "/data/glm52-rl/qualifications/glm52-policy-parity/"
+                ".diagnostic-run-1111111111111111/transaction.json",
+                {"container_id": container_id, "host_boot_id": boot_id},
+                RuntimeError("engine exited"),
+                (),
             )
-            self.assertNotEqual(symlink_cleanup.returncode, 0)
-            self.assertTrue(retained_symlink.is_symlink())
+        self.assertEqual(result["exit_code"], 137)
+        self.assertTrue(result["oom_killed"])
+        self.assertEqual(recorded["bounds"]["logs_lines"], 200)
+        self.assertEqual(recorded["bounds"]["logs_bytes"], 262144)
+        logs_command = remote.call_args_list[1].args[1]
+        self.assertIn("docker logs --tail 200", logs_command)
+        self.assertIn("tail -c 262144", logs_command)
+        self.assertEqual(
+            recorded["records"]["logs"]["sha256"],
+            training_ops.hashlib.sha256(b"last log line\n").hexdigest(),
+        )
 
     def test_temporary_cleanup_keeps_early_failure_nonzero(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1537,7 +1683,7 @@ sleep() {{
         )
         self.assertIn(".fixture-previous-1111111111111111", rollback)
         self.assertIn(".fixture-failed-1111111111111111", rollback)
-        self.assertTrue(
+        self.assertFalse(
             any(
                 'sudo rm -f -- "$state"' in command
                 and 'sudo rmdir -- "$run"' in command
@@ -1640,11 +1786,12 @@ sleep() {{
         fifo_receive = next(
             command
             for command in commands
-            if "timeout --foreground" in command and "bootstrap.fifo" in command
+            if "O_NONBLOCK" in command and "bootstrap.fifo" in command
         )
-        self.assertIn("timeout --foreground 7200", fifo_receive)
-        self.assertIn("cat --", fifo_receive)
-        self.assertNotIn("timeout --foreground 180", fifo_receive)
+        self.assertIn("7200", fifo_receive)
+        self.assertIn("O_NOFOLLOW", fifo_receive)
+        self.assertIn("docker", fifo_receive)
+        self.assertNotIn(" cat --", fifo_receive)
         fifo_cleanup = next(
             command
             for command in commands
@@ -2580,38 +2727,48 @@ sleep() {{
 
     def test_incomplete_rollback_retains_exact_transaction_state(self):
         commands = []
-        secret, ssh_call, secret_call, _ = self._operation_ssh(
-            commands, fail_capture=True, fail_rollback=True
-        )
+        secret, ssh_call, secret_call, _ = self._operation_ssh(commands, fail_capture=True, fail_rollback=True)
         with self.assertRaises(RuntimeError) as caught:
             self._run_operation(ssh_call, secret_call, secret)
         notes = "\n".join(getattr(caught.exception, "__notes__", ()))
         self.assertIn("rollback did not complete", notes)
         self.assertIn(
-            "/data/glm52-rl/qualifications/glm52-policy-parity/"
-            ".diagnostic-run-1111111111111111",
+            "/data/glm52-rl/qualifications/glm52-policy-parity/" ".diagnostic-run-1111111111111111",
             notes,
         )
         self.assertFalse(any('sudo rm -f -- "$state"' in command for command in commands))
 
     def test_diagnostic_operation_cleans_fifo_and_container_on_interrupt(self):
         commands = []
-        secret, ssh_call, secret_call, _ = self._operation_ssh(
-            commands, interrupt_fifo=True
-        )
+        secret, ssh_call, secret_call, _ = self._operation_ssh(commands, interrupt_fifo=True)
         with self.assertRaises(KeyboardInterrupt):
             self._run_operation(ssh_call, secret_call, secret, keep_engine=True)
-        self.assertTrue(
-            any('sudo docker rm "$expected_id"' in command for command in commands)
-        )
+        self.assertTrue(any('sudo docker rm "$expected_id"' in command for command in commands))
         self.assertTrue(
             any(
-                "sudo rm -f --" in command
-                and "bootstrap.fifo" in command
-                and "sudo rmdir --" in command
+                "sudo rm -f --" in command and "bootstrap.fifo" in command and "sudo rmdir --" in command
                 for command in commands
             )
         )
+
+    def test_failure_evidence_error_retains_exact_container_work(self):
+        commands = []
+        secret, ssh_call, secret_call, _ = self._operation_ssh(commands, fail_capture=True)
+        with self.assertRaises(RuntimeError) as caught:
+            self._run_operation(
+                ssh_call,
+                secret_call,
+                secret,
+                evidence_error=True,
+            )
+        work = "/data/glm52-rl/qualifications/glm52-policy-parity/" ".diagnostic-work-1111111111111111"
+        cleanup = next(
+            command for command in commands if "bootstrap.fifo" in command and ".diagnostic-source-" in command
+        )
+        self.assertNotIn(f"sudo rm -rf -- {work}", cleanup)
+        notes = "\n".join(getattr(caught.exception, "__notes__", ()))
+        self.assertIn("failure evidence could not be saved", notes)
+        self.assertIn(work, notes)
 
     def test_cleanup_removes_only_the_exact_exited_parity_container(self):
         inspection = "\n".join(
