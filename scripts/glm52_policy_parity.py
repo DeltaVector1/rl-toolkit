@@ -711,7 +711,11 @@ def validate_router_ids(profile: Profile, values: np.ndarray) -> np.ndarray:
         raise ValueError(f"router IDs shape must be {expected_router_shape(profile)}, got {values.shape}")
     if values.dtype.kind not in "iu":
         raise ValueError("router IDs must use an integer dtype")
-    sparse = values[:, profile.get("dense_layers") :, :]
+    dense_layers = profile.get("dense_layers")
+    dense = values[:, :dense_layers, :]
+    if dense.size and np.any(dense):
+        raise ValueError("dense-layer router IDs must be zero")
+    sparse = values[:, dense_layers:, :]
     if sparse.size and (sparse.min() < 0 or sparse.max() >= profile.get("experts")):
         raise ValueError("router ID is outside the model expert range")
     if sparse.size and not np.any(sparse):
@@ -2394,6 +2398,10 @@ def make_trainer_reference(
     ).astype(np.float32)
     if inference_logprobs.shape != input_ids.shape:
         raise ValueError("H200 full logprobs do not align with fixture tokens")
+    router_ids = validate_router_ids(
+        profile, load_array(h200_capture, capture_manifest, "router_ids")
+    )
+    router_bytes = memoryview(router_ids).cast("B")
     selected = load_array(fixture, fixture_manifest, "selected_indices").astype(np.int64)
     selected_advantages = load_array(fixture, fixture_manifest, "advantages").astype(
         np.float32
@@ -2415,6 +2423,16 @@ def make_trainer_reference(
         "sequence_lengths": [profile.get("context_length")],
         "loss_mask": loss_mask.tolist(),
         "advantages": advantages.tolist(),
+        "routed_experts": {
+            "schema_version": schema_version,
+            "encoding": "base64",
+            "dtype": "uint8",
+            "shape": list(router_ids.shape),
+            "dense_layers": profile.get("dense_layers"),
+            "experts": profile.get("experts"),
+            "sha256": hashlib.sha256(router_bytes).hexdigest(),
+            "data": base64.b64encode(router_bytes).decode("ascii"),
+        },
     }
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("xb") as stream:
@@ -2424,6 +2442,7 @@ def make_trainer_reference(
         "fixture_sha256": payload["fixture_sha256"],
         "tokens": int(input_ids.size),
         "selected_tokens": int(loss_mask.sum()),
+        "routed_experts_shape": list(router_ids.shape),
         "model_revision": payload["model_revision"],
         "adapter_sha256": payload["adapter_sha256"],
     }

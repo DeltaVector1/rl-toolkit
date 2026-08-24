@@ -1,5 +1,7 @@
 # ruff: noqa: F722, F821
 
+import base64
+import binascii
 import hashlib
 import json
 import os
@@ -21,6 +23,82 @@ from prime_rl.transport import (
     TransportConfig,
     setup_micro_batch_receiver,
 )
+
+
+_REFERENCE_ROUTE_FIELDS = {
+    "schema_version",
+    "encoding",
+    "dtype",
+    "shape",
+    "dense_layers",
+    "experts",
+    "sha256",
+    "data",
+}
+_MAX_REFERENCE_ROUTE_BYTES = 512 * 1024 * 1024
+
+
+def _decode_reference_routed_experts(value: object, token_count: int) -> Tensor:
+    if not isinstance(value, dict) or set(value) != _REFERENCE_ROUTE_FIELDS:
+        raise ValueError("fake reference routed experts have an invalid schema")
+    shape = value["shape"]
+    valid_shape = (
+        isinstance(shape, list)
+        and len(shape) == 3
+        and all(
+            not isinstance(item, bool) and isinstance(item, int) and item > 0
+            for item in shape
+        )
+        and shape[0] == token_count
+    )
+    if (
+        value["schema_version"] != 1
+        or value["encoding"] != "base64"
+        or value["dtype"] != "uint8"
+        or not valid_shape
+    ):
+        raise ValueError("fake reference routed experts have invalid metadata")
+    dense_layers = value["dense_layers"]
+    experts = value["experts"]
+    if (
+        isinstance(dense_layers, bool)
+        or not isinstance(dense_layers, int)
+        or not 0 <= dense_layers < shape[1]
+        or isinstance(experts, bool)
+        or not isinstance(experts, int)
+        or not 1 <= experts <= 256
+    ):
+        raise ValueError("fake reference routed experts have invalid model limits")
+    expected_bytes = shape[0] * shape[1] * shape[2]
+    encoded = value["data"]
+    digest = value["sha256"]
+    expected_encoded_length = 4 * ((expected_bytes + 2) // 3)
+    if (
+        expected_bytes > _MAX_REFERENCE_ROUTE_BYTES
+        or not isinstance(encoded, str)
+        or len(encoded) != expected_encoded_length
+        or not isinstance(digest, str)
+        or len(digest) != 64
+    ):
+        raise ValueError("fake reference routed experts have invalid size or checksum")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise ValueError("fake reference routed experts are not valid base64") from error
+    if len(raw) != expected_bytes or hashlib.sha256(raw).hexdigest() != digest:
+        raise ValueError("fake reference routed experts do not match their checksum")
+    routed = torch.frombuffer(bytearray(raw), dtype=torch.uint8).reshape(shape)
+    dense = routed[:, :dense_layers, :]
+    if dense.numel() and torch.count_nonzero(dense):
+        raise ValueError("fake reference dense-layer router IDs must be zero")
+    sparse = routed[:, dense_layers:, :]
+    if sparse.numel() and (
+        int(sparse.max()) >= experts
+        or not torch.count_nonzero(sparse)
+        or torch.any(torch.diff(torch.sort(sparse, dim=-1).values, dim=-1) == 0)
+    ):
+        raise ValueError("fake reference sparse router IDs are invalid")
+    return routed
 
 
 class TensorMicroBatch(TypedDict):
@@ -120,6 +198,12 @@ class FakeDataLoader:
                 raise ValueError("fake reference advantages do not align with its tokens")
             if sum(reference["sequence_lengths"]) != token_count:
                 raise ValueError("fake reference sequence lengths do not cover its tokens")
+            routed_reference = reference.get("routed_experts")
+            reference["_routed_experts_tensor"] = (
+                _decode_reference_routed_experts(routed_reference, token_count)
+                if routed_reference is not None
+                else None
+            )
         self.batch_counter = 0
         self.multi_run_manager = get_multi_run_manager()
 
@@ -185,7 +269,11 @@ class FakeDataLoader:
             "loss_mask": loss_mask.unsqueeze(0),
             "lora_num_tokens": lora_num_tokens,
             "seq_lens": torch.tensor(sequence_lengths, dtype=torch.long),
-            "routed_experts": None,
+            "routed_experts": (
+                reference["_routed_experts_tensor"].unsqueeze(0)
+                if reference["_routed_experts_tensor"] is not None
+                else None
+            ),
             "mm_kwargs": None,
             "mm_token_type_ids": None,
             "rl_weights": None,

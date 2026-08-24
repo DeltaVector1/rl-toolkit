@@ -1,7 +1,7 @@
 output_dir = "/data/glm52-rl/qualifications/glm52-policy-parity/trainer"
 max_steps = 1
 dist_timeout_seconds = 5400
-enable_router_replay = false
+enable_router_replay = true
 enable_token_export = true
 
 [data.fake]

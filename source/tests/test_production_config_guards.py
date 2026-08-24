@@ -13,11 +13,18 @@ def _load(relative: str) -> dict:
         return tomllib.load(stream)
 
 
-def test_fake_data_qualifications_do_not_enable_router_replay() -> None:
+def test_only_policy_parity_fake_data_enables_router_replay() -> None:
     for path in (ROOT / "configs/qualification").glob("*.toml"):
         config = _load(str(path.relative_to(ROOT)))
         if "fake" in config.get("data", {}):
-            assert config.get("enable_router_replay", False) is False, path
+            enabled = config.get("enable_router_replay", False)
+            if path.name == "glm52-policy-parity-trainer.toml":
+                assert enabled is True
+                assert config["data"]["fake"]["reference_path"].endswith(
+                    "/trainer-stage-final/trainer-reference.json"
+                )
+            else:
+                assert enabled is False, path
 
 
 def test_current_glm52_profile_is_batch_1024_without_rollout_cache() -> None:

@@ -856,10 +856,13 @@ class TrainerConfig(BaseConfig):
         if self.enable_router_replay and self.model.impl not in ("custom", "auto"):
             raise ValueError("Router replay is only supported with the custom implementation or auto mode")
 
-        if self.enable_router_replay and self.data.fake is not None:
+        if (
+            self.enable_router_replay
+            and self.data.fake is not None
+            and self.data.fake.reference_path is None
+        ):
             raise ValueError(
-                "Router replay requires route IDs and weights from inference; "
-                "the fake data loader does not provide them"
+                "Router replay with fake data requires a reference file with route IDs"
             )
 
         return self

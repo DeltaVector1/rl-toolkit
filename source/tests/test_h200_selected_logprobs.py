@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import importlib.util
 import json
@@ -395,6 +396,69 @@ def test_trainer_stage_uses_validated_h200_capture(monkeypatch, tmp_path):
     }
 
 
+def test_trainer_reference_contains_validated_h200_routes(monkeypatch, tmp_path):
+    profile_path = tmp_path / "profile.toml"
+    profile_path.write_text("profile = true\n")
+    profile = parity.Profile(
+        profile_path,
+        {
+            "context_length": 2,
+            "hidden_layers": 2,
+            "dense_layers": 1,
+            "experts_per_token": 2,
+            "experts": 4,
+        },
+    )
+    fixture = tmp_path / "fixture"
+    capture = tmp_path / "capture"
+    fixture.mkdir()
+    capture.mkdir()
+    output = tmp_path / "reference.json"
+    routes = np.asarray(
+        [[[0, 0], [0, 1]], [[0, 0], [2, 3]]], dtype=np.uint8
+    )
+    arrays = {
+        "token_ids": np.asarray([1, 2], dtype=np.int64),
+        "selected_indices": np.asarray([1], dtype=np.int64),
+        "advantages": np.asarray([1.0], dtype=np.float32),
+        "full_logprobs": np.asarray([-0.5, -0.25], dtype=np.float32),
+        "router_ids": routes,
+    }
+    capture_manifest = {
+        "fixture_sha256": "f" * 64,
+        "profile_sha256": parity.file_sha256(profile_path),
+        "model_revision": "a" * 40,
+        "adapter_sha256": "b" * 64,
+        "image": "image",
+    }
+
+    def load_manifest(path, kind):
+        if path == fixture:
+            assert kind == "glm52_policy_parity_fixture"
+            return {}
+        assert path == capture
+        assert kind == "glm52_policy_parity_h200_capture"
+        return capture_manifest
+
+    monkeypatch.setattr(parity, "load_manifest", load_manifest)
+    monkeypatch.setattr(parity, "check_fresh", lambda *_args: None)
+    monkeypatch.setattr(parity, "validate_h200_capture_sources", lambda *_args: None)
+    monkeypatch.setattr(parity, "fixture_digest", lambda _path: "f" * 64)
+    monkeypatch.setattr(
+        parity, "load_array", lambda _root, _manifest, name: arrays[name]
+    )
+
+    result = parity.make_trainer_reference(profile, fixture, capture, output)
+    encoded = json.loads(output.read_text())["routed_experts"]
+    decoded = base64.b64decode(encoded["data"], validate=True)
+    assert result["routed_experts_shape"] == [2, 2, 2]
+    assert encoded["shape"] == [2, 2, 2]
+    assert encoded["dense_layers"] == 1
+    assert encoded["experts"] == 4
+    assert hashlib.sha256(decoded).hexdigest() == encoded["sha256"]
+    assert np.frombuffer(decoded, dtype=np.uint8).reshape(2, 2, 2).tolist() == routes.tolist()
+
+
 def test_trainer_stage_requires_exact_operations_paths(tmp_path):
     operations = tmp_path / "operations.toml"
     operations.write_text(
@@ -655,6 +719,11 @@ def test_zero_filled_builtin_router_payload_is_rejected():
     )
     with pytest.raises(ValueError, match="same expert more than once"):
         parity.validate_router_ids(profile, duplicates)
+    nonzero_dense = np.asarray(
+        [[[1, 0], [0, 1]], [[0, 0], [2, 3]]], dtype=np.uint8
+    )
+    with pytest.raises(ValueError, match="dense-layer router IDs must be zero"):
+        parity.validate_router_ids(profile, nonzero_dense)
 
 
 def test_configured_glm_architecture_owns_the_scorer():
