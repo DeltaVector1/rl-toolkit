@@ -98,6 +98,30 @@ def require_child_directory_identity(
         raise ValueError(f"directory identity changed: {name}")
 
 
+def require_child_regular_identity(
+    parent_descriptor: int, name: str, descriptor: int
+) -> None:
+    opened = os.fstat(descriptor)
+    current = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    fields = (
+        "st_dev",
+        "st_ino",
+        "st_mode",
+        "st_uid",
+        "st_gid",
+        "st_nlink",
+        "st_size",
+        "st_mtime_ns",
+        "st_ctime_ns",
+    )
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or not stat.S_ISREG(current.st_mode)
+        or any(getattr(opened, field) != getattr(current, field) for field in fields)
+    ):
+        raise ValueError(f"file identity changed: {name}")
+
+
 def open_regular_at(directory_descriptor: int, name: str) -> int:
     if Path(name).name != name or not name:
         raise ValueError("relative evidence filename is invalid")
@@ -118,6 +142,7 @@ def read_json_at(
         with os.fdopen(os.dup(descriptor), "rb") as stream:
             value = json.load(stream)
         digest = file_sha256_fd(descriptor)
+        require_child_regular_identity(directory_descriptor, name, descriptor)
     finally:
         os.close(descriptor)
     if not isinstance(value, dict):
@@ -1325,6 +1350,9 @@ def validate_retained_h200_diagnostics_fd(
                 validate_retained_diagnostic_content_fd(
                     file_descriptor, entry, binding, direct["results"]
                 )
+                require_child_regular_identity(
+                    diagnostic_descriptor, filename, file_descriptor
+                )
             finally:
                 os.close(file_descriptor)
             total_bytes += size
@@ -1378,24 +1406,26 @@ def retain_h200_diagnostics(
         raise ValueError("H200 diagnostic retention limits are invalid")
     if len(entries) > max_files:
         raise ValueError("H200 diagnostic file count exceeds its configured limit")
-    if trace_root.is_symlink() or not trace_root.is_dir():
-        raise ValueError("H200 diagnostic trace directory is invalid")
-    disk_manifest = trace_root / "parity-diagnostics.json"
-    if disk_manifest.is_symlink() or not disk_manifest.is_file():
-        raise ValueError("H200 diagnostic disk manifest is missing")
-    if json.loads(disk_manifest.read_text()) != diagnostics:
-        raise ValueError("H200 diagnostic disk and response manifests differ")
-
-    output_fd = open_directory(output)
+    trace_descriptor = open_directory(trace_root)
     try:
-        os.mkdir("diagnostics", mode=0o750, dir_fd=output_fd)
-        destination_fd = os.open(
-            "diagnostics",
-            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-            dir_fd=output_fd,
+        disk_manifest, _disk_manifest_sha256 = read_json_at(
+            trace_descriptor, "parity-diagnostics.json"
         )
+        if disk_manifest != diagnostics:
+            raise ValueError("H200 diagnostic disk and response manifests differ")
+        output_fd = open_directory(output)
+        try:
+            os.mkdir("diagnostics", mode=0o750, dir_fd=output_fd)
+            destination_fd = os.open(
+                "diagnostics",
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=output_fd,
+            )
+        except BaseException:
+            os.close(output_fd)
+            raise
     except BaseException:
-        os.close(output_fd)
+        os.close(trace_descriptor)
         raise
     retained: list[dict[str, Any]] = []
     names: set[str] = set()
@@ -1442,8 +1472,7 @@ def retain_h200_diagnostics(
             if total_bytes > max_bytes:
                 raise ValueError("H200 diagnostic bytes exceed their configured limit")
 
-            source = trace_root / filename
-            source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+            source_fd = open_regular_at(trace_descriptor, filename)
             target_fd = -1
             try:
                 source_stat = os.fstat(source_fd)
@@ -1470,11 +1499,18 @@ def retain_h200_diagnostics(
                 validate_retained_diagnostic_content_fd(
                     target_fd, entry, binding, result["results"]
                 )
+                target_sha256 = file_sha256_fd(target_fd)
+                require_child_regular_identity(
+                    destination_fd, filename, target_fd
+                )
+                require_child_regular_identity(
+                    trace_descriptor, filename, source_fd
+                )
                 retained.append(
                     {
                         **entry,
                         "file": f"diagnostics/{filename}",
-                        "file_sha256": file_sha256_fd(target_fd),
+                        "file_sha256": target_sha256,
                     }
                 )
             finally:
@@ -1487,9 +1523,11 @@ def retain_h200_diagnostics(
         os.fsync(output_fd)
         require_child_directory_identity(output_fd, "diagnostics", destination_fd)
         require_directory_identity(output, output_fd)
+        require_directory_identity(trace_root, trace_descriptor)
     finally:
         os.close(destination_fd)
         os.close(output_fd)
+        os.close(trace_descriptor)
     return {
         "schema_version": 1,
         "kind": "glm52_policy_parity_retained_h200_diagnostics",

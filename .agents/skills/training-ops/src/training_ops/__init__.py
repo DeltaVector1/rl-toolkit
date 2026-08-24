@@ -3868,30 +3868,92 @@ test ! -e "$previous"
 test ! -L "$previous"
 test ! -e "$failed"
 test ! -L "$failed"
+directory_identity() {{
+  local path=$1
+  test -d "$path"
+  test ! -L "$path"
+  test "$(realpath -e "$path")" = "$path"
+  stat -c '%d:%i:%u:%g:%a' -- "$path"
+}}
+require_directory_identity() {{
+  local path=$1
+  local expected=$2
+  local actual
+  actual=$(directory_identity "$path") || return 1
+  test "$actual" = "$expected"
+}}
+require_absent() {{
+  test ! -e "$1"
+  test ! -L "$1"
+}}
 changed=0
 had_previous=0
+new_live=0
+previous_identity=
+capture_identity=
 restore_previous() {{
+  status=$?
+  trap - EXIT
+  set +e
+  rollback_failed=0
   if test "$changed" = 1; then
-    if test -e "$capture" || test -L "$capture"; then mv "$capture" "$failed"; fi
-    if test "$had_previous" = 1 && test -e "$previous"; then mv "$previous" "$capture"; fi
-    if test -e "$failed" || test -L "$failed"; then rm -rf -- "$failed"; fi
+    failed_identity=
+    if test "$new_live" = 1; then
+      if require_directory_identity "$capture" "$capture_identity" &&
+        require_absent "$failed" && mv "$capture" "$failed"; then
+        failed_identity=$capture_identity
+        require_directory_identity "$failed" "$failed_identity" || rollback_failed=1
+      else
+        rollback_failed=1
+      fi
+    else
+      require_absent "$capture" || rollback_failed=1
+    fi
+    if test "$had_previous" = 1; then
+      if test "$rollback_failed" = 0 &&
+        require_directory_identity "$previous" "$previous_identity" &&
+        require_absent "$capture" && mv "$previous" "$capture"; then
+        require_directory_identity "$capture" "$previous_identity" || rollback_failed=1
+      else
+        rollback_failed=1
+      fi
+    fi
+    if test "$rollback_failed" = 0 && test -n "$failed_identity"; then
+      if require_directory_identity "$failed" "$failed_identity" &&
+        rm -rf -- "$failed" && require_absent "$failed"; then :; else
+        rollback_failed=1
+      fi
+    fi
+    if test "$rollback_failed" != 0; then
+      printf '%s\n' 'capture-publish-rollback-failed; recovery artifacts retained' >&2
+      exit 78
+    fi
   fi
+  exit "$status"
 }}
 trap restore_previous EXIT
 state=created
 test ! -L "$capture"
 if test -e "$capture"; then
-  test -d "$capture"
-  test ! -L "$capture"
+  capture_identity=$(directory_identity "$capture")
+  require_absent "$previous"
   mv "$capture" "$previous"
+  previous_identity=$capture_identity
+  require_directory_identity "$previous" "$previous_identity"
   changed=1
   had_previous=1
   state=replaced
 fi
+candidate_identity=$(directory_identity "$candidate")
+require_absent "$capture"
 mv "$candidate" "$capture"
+capture_identity=$candidate_identity
+require_directory_identity "$capture" "$capture_identity"
 changed=1
+new_live=1
 test -f "$capture/manifest.json"
 {validator} "$capture" >/dev/null
+require_directory_identity "$capture" "$capture_identity"
 {_parity_transaction_update_command(transaction_path, "capture_published", "capture", '"$state"')}
 trap - EXIT
 printf '%s\n' "$state"
@@ -5275,11 +5337,50 @@ printf '%s\n' "$state"
                 try:
                     rollback_snapshot = _parity_transaction_snapshot(host, transaction_path, sensitive)
                     rollback_state = rollback_snapshot.get("state")
-                    if not isinstance(rollback_state, dict):
+                    rollback_observed = rollback_snapshot.get("observed")
+                    if not isinstance(rollback_state, dict) or not isinstance(
+                        rollback_observed, dict
+                    ):
                         raise RuntimeError("remote transaction state is missing")
+                    unrecorded_recovery = False
                     for kind in ("fixture", "capture"):
                         artifact = rollback_state.get(kind)
                         if not isinstance(artifact, dict) or artifact.get("action") is None:
+                            if not isinstance(artifact, dict):
+                                raise RuntimeError(
+                                    f"remote {kind} recovery state is missing"
+                                )
+                            live = rollback_observed.get(f"{kind}.live")
+                            previous = rollback_observed.get(f"{kind}.previous")
+                            failed = rollback_observed.get(f"{kind}.failed")
+                            old_hash = artifact.get("old_manifest_sha256")
+                            clean_live = (
+                                isinstance(live, dict)
+                                and live.get("symlink") is False
+                                and (
+                                    live.get("manifest_sha256") == old_hash
+                                    if old_hash is not None
+                                    else live.get("exists") is False
+                                )
+                            )
+                            clean_previous = (
+                                isinstance(previous, dict)
+                                and previous.get("exists") is False
+                                and previous.get("symlink") is False
+                            )
+                            clean_failed = (
+                                isinstance(failed, dict)
+                                and failed.get("exists") is False
+                                and failed.get("symlink") is False
+                            )
+                            if not (
+                                clean_live and clean_previous and clean_failed
+                            ):
+                                unrecorded_recovery = True
+                                cleanup_failures.append(
+                                    f"parity {kind} publish is incomplete; "
+                                    "recovery paths retained"
+                                )
                             continue
                         replaced = _validate_published_transaction_artifact(rollback_snapshot, kind)
                         paths = artifact.get("paths")
@@ -5293,7 +5394,7 @@ printf '%s\n' "$state"
                                 "replaced": replaced,
                             }
                         )
-                    reconciliation_ok = True
+                    reconciliation_ok = not unrecorded_recovery
                 except BaseException as error:
                     cleanup_failures.append(
                         "parity transaction reconciliation failed; recovery paths retained: " + str(error)

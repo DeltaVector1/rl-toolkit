@@ -182,13 +182,22 @@ class H200ParityTest(unittest.TestCase):
             for kind in ("fixture", "capture"):
                 artifact = state[kind]
                 action = artifact["action"]
+                old_hash = artifact["old_manifest_sha256"]
                 for key in ("live", "previous", "candidate", "failed"):
-                    exists = (key == "live" and action in {"created", "replaced"}) or (
-                        key == "previous" and action == "replaced"
-                    )
+                    exists = (
+                        key == "live"
+                        and (
+                            action in {"created", "replaced"}
+                            or (action is None and old_hash is not None)
+                        )
+                    ) or (key == "previous" and action == "replaced")
                     digest = None
                     if key == "live" and exists:
-                        digest = artifact["new_manifest_sha256"]
+                        digest = (
+                            artifact["new_manifest_sha256"]
+                            if action in {"created", "replaced"}
+                            else old_hash
+                        )
                     elif key == "previous" and exists:
                         digest = artifact["old_manifest_sha256"]
                     observed[f"{kind}.{key}"] = {
@@ -2161,13 +2170,77 @@ sleep() {{
                 env=environment,
             )
             self.assertNotEqual(completed.returncode, 0)
-            self.assertTrue(capture.is_dir())
-            self.assertFalse(capture.is_symlink())
-            self.assertEqual((capture / "manifest.json").read_text(), "old")
+            self.assertTrue(capture.is_symlink())
+            self.assertEqual((previous / "manifest.json").read_text(), "old")
             self.assertEqual(list(outside.iterdir()), [])
             self.assertEqual((moved / "manifest.json").read_text(), "new")
-            self.assertFalse(previous.exists())
             self.assertFalse((root / f".h200-capture-publish-failed-{nonce}").exists())
+
+    def test_capture_publish_does_not_restore_a_replaced_previous_directory(self):
+        nonce = "1" * 16
+        transaction = (
+            "/data/glm52-rl/qualifications/glm52-policy-parity/"
+            f".diagnostic-run-{nonce}/transaction.json"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            capture = root / "h200-capture-final"
+            previous = root / f".h200-capture-previous-{nonce}"
+            candidate = root / f".h200-capture-candidate-{nonce}"
+            failed = root / f".h200-capture-publish-failed-{nonce}"
+            moved_old = root / "moved-old-capture"
+            outside = root / "outside"
+            tools = root / "tools"
+            capture.mkdir()
+            (capture / "manifest.json").write_text("old")
+            candidate.mkdir()
+            (candidate / "manifest.json").write_text("new")
+            outside.mkdir()
+            tools.mkdir()
+            fake_python = tools / "python3"
+            fake_python.write_text(
+                "#!/bin/bash\n"
+                "last=${!#}\n"
+                'if test "$last" = "$LIVE"; then\n'
+                '  /bin/mv -- "$PREVIOUS" "$MOVED_OLD"\n'
+                '  /bin/ln -s -- "$OUTSIDE" "$PREVIOUS"\n'
+                "  exit 71\n"
+                "fi\n"
+                "exit 0\n"
+            )
+            fake_python.chmod(0o755)
+            with patch.object(
+                training_ops, "remote_repo", str(Path.cwd())
+            ), patch.object(training_ops, "glm_parity_root", str(root)):
+                command = training_ops._h200_capture_publish_command(
+                    str(root),
+                    str(capture),
+                    str(candidate),
+                    str(previous),
+                    nonce,
+                    transaction,
+                )
+            completed = subprocess.run(
+                ["bash", "-c", command],
+                text=True,
+                capture_output=True,
+                check=False,
+                env={
+                    **os.environ,
+                    "PATH": f"{tools}:{os.environ['PATH']}",
+                    "LIVE": str(capture),
+                    "PREVIOUS": str(previous),
+                    "MOVED_OLD": str(moved_old),
+                    "OUTSIDE": str(outside),
+                },
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("recovery artifacts retained", completed.stderr)
+            self.assertFalse(capture.exists())
+            self.assertTrue(previous.is_symlink())
+            self.assertEqual((moved_old / "manifest.json").read_text(), "old")
+            self.assertEqual((failed / "manifest.json").read_text(), "new")
+            self.assertEqual(list(outside.iterdir()), [])
 
     def test_pair_rollback_second_move_failure_never_leaves_mixed_pair(self):
         with tempfile.TemporaryDirectory() as temporary:

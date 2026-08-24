@@ -1032,6 +1032,124 @@ class ParityRouterTraceTest(unittest.TestCase):
             with patch.object(parity_script, "retained_diagnostic_tokens", 3):
                 validate_retained_h200_diagnostics(output, manifest)
 
+            moved_child = root / "moved-retained-child.npz"
+            outside_file = root / "outside-file"
+            outside_file.write_text("unchanged")
+            original_validate = parity_script.validate_retained_diagnostic_content_fd
+            validator_swapped = False
+
+            def swap_validated_child(file_descriptor, entry, fields, hashes):
+                nonlocal validator_swapped
+                original_validate(file_descriptor, entry, fields, hashes)
+                if not validator_swapped:
+                    validator_swapped = True
+                    copied.rename(moved_child)
+                    copied.symlink_to(outside_file)
+
+            with patch.object(
+                parity_script, "retained_diagnostic_tokens", 3
+            ), patch.object(
+                parity_script,
+                "validate_retained_diagnostic_content_fd",
+                side_effect=swap_validated_child,
+            ), self.assertRaisesRegex(ValueError, "file identity changed"):
+                validate_retained_h200_diagnostics(output, manifest)
+            copied.unlink()
+            moved_child.rename(copied)
+            self.assertEqual(outside_file.read_text(), "unchanged")
+
+            child_swap_output = root / "child-swap-output"
+            child_swap_output.mkdir()
+            moved_written_child = root / "moved-written-child.npz"
+            original_hash = parity_script.file_sha256_fd
+            writer_swapped = False
+
+            def swap_written_child(file_descriptor):
+                nonlocal writer_swapped
+                digest = original_hash(file_descriptor)
+                target = child_swap_output / "diagnostics" / entries[0]["file"]
+                if not writer_swapped and target.exists():
+                    writer_swapped = True
+                    target.rename(moved_written_child)
+                    target.symlink_to(outside_file)
+                return digest
+
+            with patch.object(
+                parity_script, "retained_diagnostic_tokens", 3
+            ), patch.object(
+                parity_script,
+                "file_sha256_fd",
+                side_effect=swap_written_child,
+            ), self.assertRaisesRegex(ValueError, "file identity changed"):
+                retain_h200_diagnostics(
+                    direct, child_swap_output, trace, 64, 100_000_000
+                )
+            self.assertEqual(outside_file.read_text(), "unchanged")
+
+            source_parent_output = root / "source-parent-output"
+            source_parent_output.mkdir()
+            moved_trace = root / "moved-trace"
+            outside_trace = root / "outside-trace"
+            outside_trace.mkdir()
+            source_copy = parity_script.shutil.copyfileobj
+            source_parent_swapped = False
+
+            def swap_source_parent(source_stream, target_stream, length):
+                nonlocal source_parent_swapped
+                if not source_parent_swapped:
+                    source_parent_swapped = True
+                    trace.rename(moved_trace)
+                    trace.symlink_to(outside_trace, target_is_directory=True)
+                return source_copy(source_stream, target_stream, length)
+
+            with patch.object(
+                parity_script, "retained_diagnostic_tokens", 3
+            ), patch.object(
+                parity_script.shutil,
+                "copyfileobj",
+                side_effect=swap_source_parent,
+            ), self.assertRaisesRegex(ValueError, "directory identity changed"):
+                retain_h200_diagnostics(
+                    direct, source_parent_output, trace, 64, 100_000_000
+                )
+            trace.unlink()
+            moved_trace.rename(trace)
+            self.assertEqual(list(outside_trace.iterdir()), [])
+
+            source_child_output = root / "source-child-output"
+            source_child_output.mkdir()
+            source_child = trace / entries[0]["file"]
+            moved_source_child = root / "moved-source-child.npz"
+            original_require = parity_script.require_child_regular_identity
+            source_child_swapped = False
+
+            def swap_source_child(parent_descriptor, name, file_descriptor):
+                nonlocal source_child_swapped
+                original_require(parent_descriptor, name, file_descriptor)
+                parent = Path(os.readlink(f"/proc/self/fd/{parent_descriptor}"))
+                if (
+                    not source_child_swapped
+                    and parent.name == "diagnostics"
+                    and parent.parent == source_child_output
+                ):
+                    source_child_swapped = True
+                    source_child.rename(moved_source_child)
+                    source_child.symlink_to(outside_file)
+
+            with patch.object(
+                parity_script, "retained_diagnostic_tokens", 3
+            ), patch.object(
+                parity_script,
+                "require_child_regular_identity",
+                side_effect=swap_source_child,
+            ), self.assertRaisesRegex(ValueError, "file identity changed"):
+                retain_h200_diagnostics(
+                    direct, source_child_output, trace, 64, 100_000_000
+                )
+            source_child.unlink()
+            moved_source_child.rename(source_child)
+            self.assertEqual(outside_file.read_text(), "unchanged")
+
             wrong_result_hash = json.loads(json.dumps(manifest))
             wrong_result_hash["direct_router_diagnostic"]["results"][
                 "logits_sha256"
