@@ -8472,11 +8472,60 @@ def _glm_parity_transfer_command(
     ]
 
 
+def _glm_parity_internal_transfer_command(
+    source: str, target: str, candidate: str, identity: str
+) -> str:
+    path = PurePosixPath(candidate)
+    if (
+        source != glm_parity_paths["trainer_stage"]
+        or target not in trainer_internal_addresses.values()
+        or path.parent != PurePosixPath(glm_parity_stage_candidate_root)
+        or re.fullmatch(r"trainer-stage-candidate-[0-9a-f]{16}", path.name) is None
+        or re.fullmatch(r"[0-9]+:[0-9]+", identity) is None
+    ):
+        raise Refused("GLM parity internal transfer route is invalid")
+    receiver = """import fcntl,os,stat,sys
+path,wanted=sys.argv[1:]
+descriptor=os.open(path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+opened=os.fstat(descriptor)
+if (opened.st_uid,opened.st_gid,stat.S_IMODE(opened.st_mode))!=(1000,1000,0o750):
+ raise RuntimeError("candidate owner or mode differs")
+if f"{opened.st_dev}:{opened.st_ino}"!=wanted:
+ raise RuntimeError("candidate identity differs")
+fcntl.flock(descriptor,fcntl.LOCK_EX)
+current=os.stat(path,follow_symlinks=False)
+if (current.st_dev,current.st_ino)!=(opened.st_dev,opened.st_ino):
+ raise RuntimeError("candidate identity changed after lock")
+os.set_inheritable(descriptor,True)
+os.umask(0o022)
+os.execvp("tar",["tar","--extract","--gzip","--file","-","--directory",f"/proc/self/fd/{descriptor}","--no-same-owner","--no-same-permissions"])
+"""
+    receive = shlex.join(
+        [
+            "timeout", "--signal=TERM", "--kill-after=5s", "500s",
+            "python3", "-c", receiver, candidate, identity,
+        ]
+    )
+    archive = shlex.join(
+        [
+            "tar", "--create", "--gzip", "--file", "-", "--directory", source,
+            "manifest.json", "trainer-reference.json", "trainer-router-trace",
+        ]
+    )
+    pipeline = f"{archive} | {shlex.join([*trainer_ssh_command, target, receive])}"
+    return shlex.join(
+        [
+            "timeout", "--signal=TERM", "--kill-after=5s", "540s",
+            "bash", "-o", "pipefail", "-c", pipeline,
+        ]
+    )
+
+
 def _glm_parity_transfer_preflight(
     target: str, source_host: str | None = None
 ) -> str | None:
-    check = "command -v rsync && command -v timeout && command -v flock"
     if source_host is None:
+        check = "command -v rsync && command -v timeout && command -v flock"
         local = subprocess.run(
             ["sh", "-c", check], capture_output=True, text=True, timeout=10
         )
@@ -8486,9 +8535,18 @@ def _glm_parity_transfer_preflight(
     else:
         if source_host != trainer_head or target not in trainer_internal_addresses.values():
             raise Refused("GLM parity internal transfer route is invalid")
+        source_check = (
+            "command -v tar && command -v gzip && command -v timeout && "
+            "command -v bash && command -v ssh"
+        )
+        target_check = (
+            "command -v tar && command -v gzip && command -v timeout && "
+            "command -v python3"
+        )
         code, detail = _ssh(
             source_host,
-            f"{check} && {shlex.join([*trainer_ssh_command, target, check])}",
+            f"{source_check} && "
+            f"{shlex.join([*trainer_ssh_command, target, target_check])}",
         )
     return None if code == 0 else (detail.strip()[:120] or f"exit {code}")
 
@@ -8497,7 +8555,13 @@ def _transfer_glm_parity_stage(
     source: str, target: str, candidate: str, identity: str,
     source_host: str | None = None,
 ) -> tuple[bool, str]:
-    command = _glm_parity_transfer_command(source, target, candidate, identity)
+    command = (
+        _glm_parity_transfer_command(source, target, candidate, identity)
+        if source_host is None
+        else _glm_parity_internal_transfer_command(
+            source, target, candidate, identity
+        )
+    )
     failures = []
     for attempt in range(1, 4):
         try:
@@ -8507,7 +8571,7 @@ def _transfer_glm_parity_stage(
                 )
                 code, detail = result.returncode, result.stderr or result.stdout
             else:
-                code, detail = _ssh(source_host, shlex.join(command), timeout=580)
+                code, detail = _ssh(source_host, command, timeout=580)
                 if code == 124 and detail.startswith("TIMEOUT"):
                     return False, f"attempt {attempt}: controller timeout"
         except (OSError, subprocess.TimeoutExpired) as error:
@@ -8867,7 +8931,7 @@ def stage_glm52_policy_parity(nodes: list[str] | None = None) -> None:
                     source_host,
                 )
                 if not copied:
-                    result = f"rsync failed: {copy_detail}"
+                    result = f"transfer failed: {copy_detail}"
                 else:
                     command = _glm_parity_stage_install_command(
                         stage,

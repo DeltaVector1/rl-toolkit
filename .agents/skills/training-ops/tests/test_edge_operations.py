@@ -1424,6 +1424,28 @@ raise SystemExit(99)
         self.assertNotIn("ControlPersist", transport)
         self.assertNotIn("--foreground", remote)
         self.assertEqual(command[-2:], ["/source/.", f"10.92.20.76:{candidate}/"])
+        internal = training_ops._glm_parity_internal_transfer_command(
+            training_ops.glm_parity_paths["trainer_stage"],
+            "10.92.20.76",
+            candidate,
+            "10:20",
+        )
+        self.assertIn("tar --create --gzip", internal)
+        self.assertIn("manifest.json trainer-reference.json trainer-router-trace", internal)
+        self.assertIn("os.O_DIRECTORY|os.O_NOFOLLOW", internal)
+        self.assertIn("fcntl.flock(descriptor,fcntl.LOCK_EX)", internal)
+        self.assertIn("candidate identity changed after lock", internal)
+        self.assertIn("/proc/self/fd/", internal)
+        self.assertIn("timeout --signal=TERM --kill-after=5s 500s", internal)
+        self.assertIn("timeout --signal=TERM --kill-after=5s 540s", internal)
+        self.assertNotIn("rsync", internal)
+        for option in (
+            "StrictHostKeyChecking=yes",
+            "UpdateHostKeys=no",
+            "ControlMaster=no",
+            "ControlPath=none",
+        ):
+            self.assertEqual(internal.count(option), 1)
 
     def test_parity_stage_create_ack_loss_still_runs_cleanup(self):
         source = Path(training_ops.__file__).read_text()
@@ -1478,6 +1500,71 @@ raise SystemExit(99)
         )
         self.assertTrue(all(call.kwargs["timeout"] == 580 for call in run.call_args_list))
 
+    def test_parity_stage_internal_tar_extracts_through_locked_candidate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            candidates = root / ".stage-candidates"
+            candidate = candidates / "trainer-stage-candidate-0123456789abcdef"
+            source_trace = source / "trainer-router-trace"
+            source_trace.mkdir(parents=True)
+            candidates.mkdir()
+            candidate.mkdir(mode=0o750)
+            (source / "manifest.json").write_text("manifest\n")
+            (source / "trainer-reference.json").write_text("reference\n")
+            (source_trace / "session.json").write_text("session\n")
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_ssh = fake_bin / "ssh"
+            fake_ssh.write_text(
+                "#!/bin/bash\nfor command; do :; done\nexec bash -c \"$command\"\n"
+            )
+            fake_ssh.chmod(0o755)
+            identity = f"{candidate.stat().st_dev}:{candidate.stat().st_ino}"
+            with (
+                patch.dict(
+                    training_ops.glm_parity_paths,
+                    {"trainer_stage": str(source)},
+                ),
+                patch.object(
+                    training_ops,
+                    "glm_parity_stage_candidate_root",
+                    str(candidates),
+                ),
+            ):
+                command = training_ops._glm_parity_internal_transfer_command(
+                    str(source), "10.92.20.76", str(candidate), identity
+                )
+            result = subprocess.run(
+                command,
+                shell=True,
+                executable="/bin/bash",
+                capture_output=True,
+                text=True,
+                env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                (candidate / "trainer-reference.json").read_text(),
+                "reference\n",
+            )
+            self.assertEqual(
+                (candidate / "trainer-router-trace/session.json").read_text(),
+                "session\n",
+            )
+            self.assertEqual(candidate.stat().st_mode & 0o777, 0o750)
+            self.assertEqual(
+                (candidate / "trainer-router-trace").stat().st_mode & 0o777,
+                0o755,
+            )
+            for relative in (
+                "manifest.json",
+                "trainer-reference.json",
+                "trainer-router-trace/session.json",
+            ):
+                self.assertEqual((candidate / relative).stat().st_mode & 0o777, 0o644)
+
     def test_parity_stage_transfer_timeout_is_uncertain_and_not_retried(self):
         candidate = (
             f"{training_ops.glm_parity_stage_candidate_root}/"
@@ -1497,8 +1584,14 @@ raise SystemExit(99)
         with patch.object(
             training_ops, "_ssh", return_value=(124, "TIMEOUT")
         ) as ssh:
+            expected = training_ops._glm_parity_internal_transfer_command(
+                training_ops.glm_parity_paths["trainer_stage"],
+                "10.92.20.76",
+                candidate,
+                "10:20",
+            )
             copied, detail = training_ops._transfer_glm_parity_stage(
-                "/source",
+                training_ops.glm_parity_paths["trainer_stage"],
                 "10.92.20.76",
                 candidate,
                 "10:20",
@@ -1507,6 +1600,8 @@ raise SystemExit(99)
         self.assertFalse(copied)
         self.assertIn("controller timeout", detail)
         ssh.assert_called_once()
+        self.assertEqual(ssh.call_args.args, ("n82", expected))
+        self.assertEqual(ssh.call_args.kwargs, {"timeout": 580})
 
     def test_parity_stage_transfer_preflight_has_no_fallback(self):
         missing = subprocess.CompletedProcess([], 127, "", "")
@@ -1516,14 +1611,16 @@ raise SystemExit(99)
                 training_ops._glm_parity_transfer_preflight("n82"),
             )
         with patch.object(
-            training_ops, "_ssh", return_value=(127, "missing rsync")
+            training_ops, "_ssh", return_value=(127, "missing tar")
         ) as ssh:
             self.assertEqual(
                 training_ops._glm_parity_transfer_preflight(
                     "10.92.20.76", "n82"
                 ),
-                "missing rsync",
+                "missing tar",
             )
+        self.assertNotIn("rsync", ssh.call_args.args[1])
+        self.assertIn("command -v tar", ssh.call_args.args[1])
         self.assertIn("StrictHostKeyChecking=yes", ssh.call_args.args[1])
         self.assertIn("UpdateHostKeys=no", ssh.call_args.args[1])
         self.assertIn("ControlMaster=no", ssh.call_args.args[1])
