@@ -234,10 +234,6 @@ class H200ParityTest(unittest.TestCase):
             training_ops.secrets, "token_hex", return_value="1" * 16
         ), patch.object(
             training_ops,
-            "_diagnostic_capture_preflight",
-            return_value={"files": 20, "estimated_bytes": 1},
-        ), patch.object(
-            training_ops,
             "_resolve_glm52_parity_diagnostic_source",
             return_value=(
                 training_ops.trainer_head,
@@ -522,7 +518,15 @@ sleep() {{
         ), patch.object(
             training_ops,
             "_diagnostic_capture_preflight",
-            return_value={"files": 20, "estimated_bytes": 1},
+            return_value={
+                "files": 20,
+                "estimated_bytes": 1,
+                "max_files": 64,
+                "max_bytes": 100_000_000,
+                "qualification_root": (
+                    "/data/glm52-rl/qualifications/glm52-policy-parity"
+                ),
+            },
         ), patch.object(training_ops, "_ssh") as h200, self.assertRaisesRegex(
             RuntimeError, "banner exchange timed out"
         ):
@@ -694,9 +698,22 @@ sleep() {{
                 'PRIME_PARITY_DIAGNOSTIC_TOKENS = "256"\n'
                 'PRIME_PARITY_DIAGNOSTIC_MAX_FILES = "64"\n'
                 'PRIME_PARITY_DIAGNOSTIC_MAX_BYTES = "100000000"\n'
+                'PRIME_PARITY_QUALIFICATION_ROOT = '
+                '"/data/glm52-rl/qualifications/glm52-policy-parity"\n'
             )
             result = training_ops._diagnostic_capture_preflight(config, "h200")
-        self.assertEqual(result, {"files": 20, "estimated_bytes": 96_485_376})
+        self.assertEqual(
+            result,
+            {
+                "files": 20,
+                "estimated_bytes": 96_485_376,
+                "max_files": 64,
+                "max_bytes": 100_000_000,
+                "qualification_root": (
+                    "/data/glm52-rl/qualifications/glm52-policy-parity"
+                ),
+            },
+        )
 
     def test_sensitive_ssh_input_keeps_token_out_of_command_and_redacts_error(self):
         secret = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_"
@@ -1567,12 +1584,36 @@ sleep() {{
         capture = next(command for command in commands if "capture-h200" in command)
         self.assertIn("docker run --rm -i", capture)
         self.assertNotIn(" -e ", capture)
+        self.assertIn(
+            "--env PRIME_PARITY_ROUTER_TRACE_DIR=/data/glm52-rl/qualifications/"
+            "glm52-policy-parity/.diagnostic-work-1111111111111111/"
+            "h200-router-trace",
+            capture,
+        )
+        self.assertIn(
+            "--env PRIME_PARITY_QUALIFICATION_ROOT=/data/glm52-rl/"
+            "qualifications/glm52-policy-parity",
+            capture,
+        )
+        self.assertIn("--env PRIME_PARITY_DIAGNOSTIC_MAX_FILES=64", capture)
+        self.assertIn("--env PRIME_PARITY_DIAGNOSTIC_MAX_BYTES=100000000", capture)
         self.assertIn("--base-url http://127.0.0.1:8000", capture)
         self.assertIn(
             f"--control-url http://127.0.0.1:{training_ops.h200_parity_backend_port}",
             capture,
         )
         self.assertIn("--expected-api-process-id 22", capture)
+        prepublish = next(
+            command
+            for command in commands
+            if "validate-h200-capture" in command
+        )
+        self.assertIn(
+            "scripts/glm52_policy_parity.py", prepublish
+        )
+        self.assertIn(
+            ".diagnostic-work-1111111111111111/capture", prepublish
+        )
         fifo_setup = next(command for command in commands if "mkfifo -m 0600" in command)
         self.assertIn("chown 1000:1000", fifo_setup)
         self.assertIn("1000:1000:600", fifo_setup)

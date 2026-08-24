@@ -3521,7 +3521,9 @@ printf '%s\n' "$container_state"
 """
 
 
-def _diagnostic_capture_preflight(config_path: Path, side: str) -> dict[str, int]:
+def _diagnostic_capture_preflight(
+    config_path: Path, side: str
+) -> dict[str, int | str]:
     if side not in {"trainer", "h200"}:
         raise Refused("diagnostic capture side is invalid")
     with config_path.open("rb") as stream:
@@ -3554,16 +3556,36 @@ def _diagnostic_capture_preflight(config_path: Path, side: str) -> dict[str, int
         widths.extend(extra.values())
     if len(names) != len(set(names)):
         raise Refused("diagnostic capture plan contains duplicate semantic files")
-    try:
-        tokens = int(env["PRIME_PARITY_DIAGNOSTIC_TOKENS"])
-        max_files = int(env["PRIME_PARITY_DIAGNOSTIC_MAX_FILES"])
-        max_bytes = int(env["PRIME_PARITY_DIAGNOSTIC_MAX_BYTES"])
-    except (KeyError, TypeError, ValueError) as error:
-        raise Refused("diagnostic capture limits are invalid") from error
+    limit_names = (
+        "PRIME_PARITY_DIAGNOSTIC_TOKENS",
+        "PRIME_PARITY_DIAGNOSTIC_MAX_FILES",
+        "PRIME_PARITY_DIAGNOSTIC_MAX_BYTES",
+    )
+    limit_values = [env.get(name) for name in limit_names]
+    if any(
+        not isinstance(value, str)
+        or re.fullmatch(r"[1-9][0-9]*", value) is None
+        for value in limit_values
+    ):
+        raise Refused("diagnostic capture limits are invalid")
+    tokens, max_files, max_bytes = (int(value) for value in limit_values)
+    qualification_root = env.get("PRIME_PARITY_QUALIFICATION_ROOT")
+    if (
+        not isinstance(qualification_root, str)
+        or not qualification_root.startswith("/")
+        or PurePosixPath(qualification_root).as_posix() != qualification_root
+    ):
+        raise Refused("diagnostic qualification root is invalid")
     estimated_bytes = sum(tokens * width * 4 + 64 * 1024 for width in widths)
     if len(names) > max_files or estimated_bytes > max_bytes:
         raise Refused("diagnostic capture plan exceeds its configured cap")
-    return {"files": len(names), "estimated_bytes": estimated_bytes}
+    return {
+        "files": len(names),
+        "estimated_bytes": estimated_bytes,
+        "max_files": max_files,
+        "max_bytes": max_bytes,
+        "qualification_root": qualification_root,
+    }
 
 
 def _redact_sensitive(value: str, sensitive: tuple[str, ...]) -> str:
@@ -4658,11 +4680,18 @@ def diagnose_glm52_policy_parity(name: str, keep_engine: bool = False) -> dict[s
     plan = _diagnostic_capture_preflight(config_path, "h200")
     if plan["files"] == 0:
         raise Refused("H200 parity diagnostics are not enabled")
-    root = "/data/glm52-rl/qualifications/glm52-policy-parity"
     capture = glm_parity_paths["h200_capture"]
     fixture = glm_parity_paths["fixture"]
-    if PurePosixPath(capture).parent != PurePosixPath(root):
-        raise Refused("H200 capture path is outside the exact parity root")
+    stage = glm_parity_paths["trainer_stage"]
+    roots = {PurePosixPath(path).parent for path in (capture, fixture, stage)}
+    expected_root = PurePosixPath(
+        "/data/glm52-rl/qualifications/glm52-policy-parity"
+    )
+    if roots != {expected_root}:
+        raise Refused("GLM parity paths do not share the exact parity root")
+    root = expected_root.as_posix()
+    if plan.get("qualification_root") != root:
+        raise Refused("H200 diagnostic qualification root differs from operations")
     source_host, _final_host, final_rank, source_root, metadata = _resolve_glm52_parity_diagnostic_source(name)
     source_input = f"{source_root}/trainer-rank-0-pp-0-cp-0-" "diagnostic-layer3_router_input.npz"
     session_path = f"{source_root}/session.json"
@@ -4960,9 +4989,16 @@ printf '%s\n' "$state"
         ):
             raise Refused("H200 parity launch, router, and API identities differ")
         expected_api_process_id = api_listener_identity["listener_namespace_pid"]
+        capture_environment = (
+            f"--env PRIME_PARITY_ROUTER_TRACE_DIR={shlex.quote(h200_trace_directory)} "
+            f"--env PRIME_PARITY_QUALIFICATION_ROOT={shlex.quote(root)} "
+            f"--env PRIME_PARITY_DIAGNOSTIC_MAX_FILES={plan['max_files']} "
+            f"--env PRIME_PARITY_DIAGNOSTIC_MAX_BYTES={plan['max_bytes']} "
+        )
         capture_command = (
             "sudo docker run --rm -i --network host -v /data:/data "
             f"-v {shlex.quote(remote_repo)}:/workspace:ro -w /workspace "
+            f"{capture_environment}"
             f"--entrypoint /app/.venv/bin/python {shlex.quote(inference_image)} "
             f"scripts/glm52_policy_parity.py --profile {shlex.quote(production_parity_profile)} "
             f"capture-h200 --fixture {shlex.quote(fixture)} "
@@ -5034,13 +5070,10 @@ candidate={shlex.quote(temporary_capture)}
 test ! -L "$root"
 test "$(realpath -e "$root")" = "$root"
 test -f "$candidate/manifest.json"
-python3 -c 'import hashlib,json,pathlib,sys
-p=pathlib.Path(sys.argv[1]); m=json.loads((p/"manifest.json").read_text())
-assert m.get("kind")=="glm52_policy_parity_h200_capture"
-assert m.get("direct_router_diagnostic") is not None
-for e in m.get("arrays",{{}}).values():
- f=p/e["file"]; assert f.is_file() and not f.is_symlink()
- assert hashlib.sha256(f.read_bytes()).hexdigest()==e["sha256"]' "$candidate"
+cd {shlex.quote(remote_repo)}
+python3 scripts/glm52_policy_parity.py \
+  --profile {shlex.quote(production_parity_profile)} \
+  validate-h200-capture "$candidate" >/dev/null
 previous={shlex.quote(capture_previous)}
 failed="$root/.h200-capture-publish-failed-{nonce}"
 test ! -e "$previous"

@@ -839,6 +839,19 @@ def read_secret_stdin(label: str, minimum: int, maximum: int) -> str:
 
 
 diagnostic_file_limit = 16 * 1024 * 1024
+retained_diagnostic_file_limit = 64
+retained_diagnostic_byte_limit = 100_000_000
+retained_diagnostic_tokens = 256
+retained_diagnostic_members = {
+    "values.npy",
+    "session_identity.npy",
+    "name.npy",
+    "source_dtype.npy",
+    "fixture_sha256.npy",
+    "token_ids_sha256.npy",
+    "model_revision.npy",
+    "adapter_sha256.npy",
+}
 
 
 def _read_npy_member_header(stream: Any, member_size: int) -> tuple[np.dtype, tuple[int, ...]]:
@@ -934,24 +947,120 @@ def validate_retained_diagnostic_file(path: Path) -> None:
                 raise ValueError("retained H200 diagnostic is too large when uncompressed")
             with archive.open(info) as stream:
                 _read_npy_member_header(stream, info.file_size)
-    if "values.npy" not in names:
-        raise ValueError("retained H200 diagnostic has no values")
+    if names != retained_diagnostic_members:
+        raise ValueError("retained H200 diagnostic members are incomplete")
+
+
+def h200_diagnostic_binding(result: dict[str, Any]) -> dict[str, str]:
+    session = result.get("session")
+    diagnostics = result.get("diagnostics")
+    results = result.get("results")
+    if (
+        not isinstance(session, dict)
+        or session.get("schema_version") != schema_version
+        or session.get("side") != "h200"
+        or session.get("dense_layers") != 3
+        or session.get("experts") != 256
+        or session.get("topk") != 8
+        or not isinstance(diagnostics, dict)
+        or diagnostics.get("schema_version") != schema_version
+        or diagnostics.get("kind") != "glm52_policy_parity_diagnostics"
+        or diagnostics.get("side") != "h200"
+        or not isinstance(results, dict)
+        or results.get("layer") != 3
+        or results.get("input_shape") != [retained_diagnostic_tokens, 6144]
+    ):
+        raise ValueError("H200 diagnostic session is invalid")
+    identity = hashlib.sha256(
+        json.dumps(session, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    binding = {
+        "session_identity": identity,
+        "fixture_sha256": session.get("fixture_sha256"),
+        "token_ids_sha256": session.get("token_ids_sha256"),
+        "model_revision": session.get("model_revision"),
+        "adapter_sha256": session.get("adapter_sha256"),
+    }
+    lengths = {
+        "session_identity": 64,
+        "fixture_sha256": 64,
+        "token_ids_sha256": 64,
+        "model_revision": 40,
+        "adapter_sha256": 64,
+    }
+    if any(
+        not isinstance(value, str)
+        or re.fullmatch(rf"[0-9a-f]{{{lengths[name]}}}", value) is None
+        for name, value in binding.items()
+    ):
+        raise ValueError("H200 diagnostic session binding is invalid")
+    if (
+        diagnostics.get("session_identity") != identity
+        or results.get("session_identity") != identity
+    ):
+        raise ValueError("H200 diagnostic manifest used another session")
+    return binding
+
+
+def expected_h200_diagnostic_entries() -> dict[str, dict[str, Any]]:
+    semantics: list[tuple[str, int, str]] = [("embedding", 6144, "torch.bfloat16")]
+    for layer in range(3):
+        semantics.extend(
+            (f"layer{layer}_{suffix}", 6144, "torch.bfloat16")
+            for suffix in ("input", "attention_raw", "mlp_raw", "output")
+        )
+    semantics.extend(
+        (
+            ("layer3_router_input", 6144, "torch.bfloat16"),
+            ("layer3_h200_input", 6144, "torch.bfloat16"),
+            ("layer3_h200_logits", 256, "torch.float32"),
+            ("layer3_h200_scores", 256, "torch.float32"),
+            ("layer3_h200_selection_scores", 256, "torch.float32"),
+            ("layer3_h200_route_ids", 8, "torch.int32"),
+            ("layer3_h200_route_weights", 8, "torch.float32"),
+        )
+    )
+    return {
+        f"{name}-rank-0-pp-0-cp-0": {
+            "shape": [retained_diagnostic_tokens, width],
+            "source_dtype": source_dtype,
+        }
+        for name, width, source_dtype in semantics
+    }
 
 
 def validate_retained_diagnostic_content(
-    path: Path, entry: dict[str, Any]
+    path: Path, entry: dict[str, Any], binding: dict[str, str]
 ) -> None:
     validate_retained_diagnostic_file(path)
     with np.load(path, allow_pickle=False) as values:
         if "values" not in values.files:
             raise ValueError("retained H200 diagnostic has no values")
         array = np.ascontiguousarray(values["values"])
+        for name in (
+            "session_identity",
+            "name",
+            "source_dtype",
+            "fixture_sha256",
+            "token_ids_sha256",
+            "model_revision",
+            "adapter_sha256",
+        ):
+            metadata = values[name]
+            if metadata.shape != () or metadata.dtype.kind != "U":
+                raise ValueError("retained H200 diagnostic metadata is invalid")
         stored_name = str(values.get("name", "").item())
         stored_dtype = str(values.get("source_dtype", "").item())
+        stored_binding = {
+            name: str(values.get(name, "").item()) for name in binding
+        }
     if (
-        list(array.shape) != entry["shape"]
+        array.dtype != np.dtype("float32")
+        or not np.isfinite(array).all()
+        or list(array.shape) != entry["shape"]
         or stored_name != entry["name"]
         or stored_dtype != entry["source_dtype"]
+        or stored_binding != binding
         or hashlib.sha256(memoryview(array).cast("B")).hexdigest()
         != entry["sha256"]
     ):
@@ -966,6 +1075,8 @@ def validate_retained_h200_diagnostics(
     if not isinstance(retained, dict) or not isinstance(direct, dict):
         raise ValueError("retained H200 diagnostics are missing")
     source = direct.get("diagnostics")
+    binding = h200_diagnostic_binding(direct)
+    plan = expected_h200_diagnostic_entries()
     entries = retained.get("entries")
     source_entries = source.get("entries") if isinstance(source, dict) else None
     if (
@@ -977,8 +1088,11 @@ def validate_retained_h200_diagnostics(
         or not isinstance(source_entries, list)
         or retained.get("session_identity") != source.get("session_identity")
         or retained.get("side") != source.get("side")
+        or retained.get("binding") != binding
         or retained.get("files") != len(entries)
         or len(entries) != len(source_entries)
+        or len(entries) != len(plan)
+        or len(entries) > retained_diagnostic_file_limit
     ):
         raise ValueError("retained H200 diagnostic manifest is invalid")
     source_by_name = {
@@ -988,8 +1102,11 @@ def validate_retained_h200_diagnostics(
         raise ValueError("H200 diagnostic source names are invalid")
     total_bytes = 0
     files: set[str] = set()
+    source_fields = {"name", "file", "shape", "source_dtype", "sha256", "bytes"}
     for entry in entries:
-        if not isinstance(entry, dict):
+        if not isinstance(entry, dict) or set(entry) != source_fields | {
+            "file_sha256"
+        }:
             raise ValueError("retained H200 diagnostic entry is invalid")
         relative = entry.get("file")
         name = entry.get("name")
@@ -1007,10 +1124,18 @@ def validate_retained_h200_diagnostics(
             raise ValueError("retained H200 diagnostic file identity is invalid")
         files.add(relative)
         original = source_by_name.get(name)
+        expected_semantic = plan.get(name)
         expected = {**entry}
         expected.pop("file_sha256", None)
         expected["file"] = Path(relative).name
-        if original != expected:
+        if (
+            not isinstance(original, dict)
+            or set(original) != source_fields
+            or original != expected
+            or expected_semantic is None
+            or entry.get("shape") != expected_semantic["shape"]
+            or entry.get("source_dtype") != expected_semantic["source_dtype"]
+        ):
             raise ValueError("retained H200 diagnostic source identity differs")
         path = capture_root / relative
         if path.is_symlink() or not path.is_file():
@@ -1020,10 +1145,12 @@ def validate_retained_h200_diagnostics(
             raise ValueError("retained H200 diagnostic byte count is invalid")
         if path.stat().st_size != size or file_sha256(path) != file_sha:
             raise ValueError("retained H200 diagnostic file checksum differs")
-        validate_retained_diagnostic_content(path, entry)
+        validate_retained_diagnostic_content(path, entry, binding)
         total_bytes += size
-    if retained.get("bytes") != total_bytes:
+    if set(source_by_name) != set(plan) or retained.get("bytes") != total_bytes:
         raise ValueError("retained H200 diagnostic total bytes differ")
+    if total_bytes > retained_diagnostic_byte_limit:
+        raise ValueError("retained H200 diagnostic bytes exceed the fixed limit")
 
 
 def retain_h200_diagnostics(
@@ -1034,18 +1161,20 @@ def retain_h200_diagnostics(
     max_bytes: int,
 ) -> dict[str, Any]:
     diagnostics = result.get("diagnostics")
+    binding = h200_diagnostic_binding(result)
+    plan = expected_h200_diagnostic_entries()
     if not isinstance(diagnostics, dict):
         raise ValueError("H200 diagnostic response has no diagnostic manifest")
     entries = diagnostics.get("entries")
-    if not isinstance(entries, list) or not entries:
+    if not isinstance(entries, list) or len(entries) != len(plan):
         raise ValueError("H200 diagnostic response has no diagnostic files")
     if (
         isinstance(max_files, bool)
         or not isinstance(max_files, int)
-        or max_files < 1
+        or max_files != retained_diagnostic_file_limit
         or isinstance(max_bytes, bool)
         or not isinstance(max_bytes, int)
-        or max_bytes < 1
+        or max_bytes != retained_diagnostic_byte_limit
     ):
         raise ValueError("H200 diagnostic retention limits are invalid")
     if len(entries) > max_files:
@@ -1059,71 +1188,109 @@ def retain_h200_diagnostics(
         raise ValueError("H200 diagnostic disk and response manifests differ")
 
     destination = output / "diagnostics"
-    destination.mkdir()
+    os.mkdir(destination, mode=0o750)
+    output_fd = os.open(output, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(output_fd)
+    finally:
+        os.close(output_fd)
+    destination_fd = os.open(
+        destination, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    )
     retained: list[dict[str, Any]] = []
     names: set[str] = set()
     files: set[str] = set()
     total_bytes = 0
-    for entry in entries:
-        if not isinstance(entry, dict):
-            raise ValueError("H200 diagnostic manifest entry is invalid")
-        name = entry.get("name")
-        filename = entry.get("file")
-        size = entry.get("bytes")
-        shape = entry.get("shape")
-        source_dtype = entry.get("source_dtype")
-        raw_sha256 = entry.get("sha256")
-        if (
-            not isinstance(name, str)
-            or not re.fullmatch(r"[A-Za-z0-9_-]+", name)
-            or name in names
-            or not isinstance(filename, str)
-            or not re.fullmatch(r"h200-rank-0-pp-0-cp-0-diagnostic-[A-Za-z0-9_-]+\.npz", filename)
-            or filename in files
-            or isinstance(size, bool)
-            or not isinstance(size, int)
-            or size < 1
-            or not isinstance(shape, list)
-            or not shape
-            or not all(isinstance(value, int) and not isinstance(value, bool) and value > 0 for value in shape)
-            or not isinstance(source_dtype, str)
-            or re.fullmatch(r"[0-9a-f]{64}", str(raw_sha256)) is None
-        ):
-            raise ValueError("H200 diagnostic manifest entry fields are invalid")
-        names.add(name)
-        files.add(filename)
-        total_bytes += size
-        if total_bytes > max_bytes:
-            raise ValueError("H200 diagnostic bytes exceed their configured limit")
+    try:
+        for entry in entries:
+            if not isinstance(entry, dict) or set(entry) != {
+                "name",
+                "file",
+                "shape",
+                "source_dtype",
+                "sha256",
+                "bytes",
+            }:
+                raise ValueError("H200 diagnostic manifest entry is invalid")
+            name = entry.get("name")
+            filename = entry.get("file")
+            size = entry.get("bytes")
+            shape = entry.get("shape")
+            source_dtype = entry.get("source_dtype")
+            raw_sha256 = entry.get("sha256")
+            semantic = plan.get(name) if isinstance(name, str) else None
+            if (
+                semantic is None
+                or name in names
+                or not isinstance(filename, str)
+                or not re.fullmatch(
+                    r"h200-rank-0-pp-0-cp-0-diagnostic-[A-Za-z0-9_-]+\.npz",
+                    filename,
+                )
+                or filename in files
+                or isinstance(size, bool)
+                or not isinstance(size, int)
+                or size < 1
+                or shape != semantic["shape"]
+                or source_dtype != semantic["source_dtype"]
+                or re.fullmatch(r"[0-9a-f]{64}", str(raw_sha256)) is None
+            ):
+                raise ValueError("H200 diagnostic manifest entry fields are invalid")
+            names.add(name)
+            files.add(filename)
+            total_bytes += size
+            if total_bytes > max_bytes:
+                raise ValueError("H200 diagnostic bytes exceed their configured limit")
 
-        source = trace_root / filename
-        source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
-        try:
-            source_stat = os.fstat(source_fd)
-            if not stat.S_ISREG(source_stat.st_mode) or source_stat.st_size != size:
-                raise ValueError("H200 diagnostic source type or size differs")
+            source = trace_root / filename
+            source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+            target_fd = -1
+            try:
+                source_stat = os.fstat(source_fd)
+                if not stat.S_ISREG(source_stat.st_mode) or source_stat.st_size != size:
+                    raise ValueError("H200 diagnostic source type or size differs")
+                target_fd = os.open(
+                    filename,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=destination_fd,
+                )
+                with os.fdopen(os.dup(source_fd), "rb") as source_stream, os.fdopen(
+                    os.dup(target_fd), "wb"
+                ) as target_stream:
+                    shutil.copyfileobj(source_stream, target_stream, 1024 * 1024)
+                    target_stream.flush()
+                os.fsync(target_fd)
+                target_stat = os.fstat(target_fd)
+                if (
+                    not stat.S_ISREG(target_stat.st_mode)
+                    or target_stat.st_size != size
+                ):
+                    raise ValueError("retained H200 diagnostic byte count differs")
+            finally:
+                os.close(source_fd)
+                if target_fd >= 0:
+                    os.close(target_fd)
             target = destination / filename
-            with os.fdopen(os.dup(source_fd), "rb") as source_stream, target.open("xb") as target_stream:
-                shutil.copyfileobj(source_stream, target_stream, 1024 * 1024)
-                target_stream.flush()
-                os.fsync(target_stream.fileno())
-        finally:
-            os.close(source_fd)
-        if target.stat().st_size != size:
-            raise ValueError("retained H200 diagnostic byte count differs")
-        validate_retained_diagnostic_content(target, entry)
-        retained.append(
-            {
-                **entry,
-                "file": f"diagnostics/{filename}",
-                "file_sha256": file_sha256(target),
-            }
-        )
+            validate_retained_diagnostic_content(target, entry, binding)
+            retained.append(
+                {
+                    **entry,
+                    "file": f"diagnostics/{filename}",
+                    "file_sha256": file_sha256(target),
+                }
+            )
+        if names != set(plan):
+            raise ValueError("H200 diagnostic files do not match the exact plan")
+        os.fsync(destination_fd)
+    finally:
+        os.close(destination_fd)
     return {
         "schema_version": 1,
         "kind": "glm52_policy_parity_retained_h200_diagnostics",
         "session_identity": diagnostics.get("session_identity"),
         "side": diagnostics.get("side"),
+        "binding": binding,
         "entries": retained,
         "files": len(retained),
         "bytes": total_bytes,
@@ -1156,6 +1323,8 @@ def h200_diagnostic_retention_settings() -> tuple[Path, int, int]:
         if re.fullmatch(r"[1-9][0-9]*", value) is None:
             raise ValueError(f"{name} is missing or invalid")
         limits.append(int(value))
+    if limits != [retained_diagnostic_file_limit, retained_diagnostic_byte_limit]:
+        raise ValueError("H200 diagnostic retention limits differ from qualification")
     return root, limits[0], limits[1]
 
 
@@ -1495,7 +1664,7 @@ def capture_h200(
         "arrays": entries,
     }
     (output / "manifest.json").write_bytes(json_bytes(manifest))
-    return manifest
+    return load_manifest(output, "glm52_policy_parity_h200_capture")
 
 
 def validate_h200_capture_sources(manifest: dict[str, Any]) -> None:
@@ -2281,6 +2450,8 @@ def parser() -> argparse.ArgumentParser:
     h200.add_argument("--diagnostic-input", type=Path)
     h200.add_argument("--timeout", type=float, default=1800.0)
     h200.add_argument("output", type=Path)
+    validate_h200 = commands.add_parser("validate-h200-capture")
+    validate_h200.add_argument("capture", type=Path)
     diagnostic = commands.add_parser("diagnose-h200")
     diagnostic.add_argument("--input", type=Path, required=True)
     diagnostic.add_argument("--session", type=Path, required=True)
@@ -2374,6 +2545,16 @@ def main(argv: list[str] | None = None) -> int:
                 args.diagnostic_input,
                 args.timeout,
             )
+        elif args.command == "validate-h200-capture":
+            manifest = load_manifest(
+                args.capture, "glm52_policy_parity_h200_capture"
+            )
+            validate_h200_capture_sources(manifest)
+            result = {
+                "manifest_sha256": file_sha256(args.capture / "manifest.json"),
+                "retained_files": manifest["retained_diagnostics"]["files"],
+                "retained_bytes": manifest["retained_diagnostics"]["bytes"],
+            }
         elif args.command == "diagnose-h200":
             result = run_h200_router_diagnostic(
                 args.input,
