@@ -637,6 +637,11 @@ def refresh_fixture_from_trainer_export(
                 "arrays": entries,
             }
             (output / "manifest.json").write_bytes(json_bytes(manifest))
+        output.chmod(0o750)
+        for path in output.iterdir():
+            if path.is_symlink() or not path.is_file():
+                raise ValueError("refreshed parity fixture contains an invalid file")
+            path.chmod(0o644)
         check_fresh(profile, output, manifest)
         refreshed_fixture_sha256 = fixture_digest(output)
         if (

@@ -966,6 +966,10 @@ def test_refresh_fixture_preserves_current_wrapper_and_rebinds_diagnostic(tmp_pa
     assert {path.name: path.read_bytes() for path in current.iterdir()} == {
         path.name: path.read_bytes() for path in output.iterdir()
     }
+    assert current.stat().st_mode & 0o777 == 0o750
+    assert output.stat().st_mode & 0o777 == 0o750
+    assert all(path.stat().st_mode & 0o777 == 0o644 for path in current.iterdir())
+    assert all(path.stat().st_mode & 0o777 == 0o644 for path in output.iterdir())
     with np.load(output_diagnostic, allow_pickle=False) as values:
         assert str(values["fixture_sha256"].item()) == first["fixture_sha256"]
         assert str(values["source_fixture_sha256"].item()) == first[
