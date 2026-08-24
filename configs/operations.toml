@@ -86,6 +86,7 @@ h200_parity_listener_stabilization_seconds = 30
 
 [limits.glm52_qualification]
 evidence_max_age_seconds = 86400
+session_duration_seconds_max = 14400
 forward_backward_seconds_max = 480
 peak_memory_gib_max = 46.0
 

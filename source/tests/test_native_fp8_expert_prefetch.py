@@ -58,6 +58,92 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "incomplete"):
                 read()
 
+    @unittest.skipIf(torch is None, "PyTorch is unavailable")
+    def test_qualification_input_digest_binds_tokens_lengths_and_order(self):
+        train_path = ROOT / "source/src/prime_rl/trainer/rl/train.py"
+        function = next(
+            node
+            for node in ast.parse(train_path.read_text()).body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_qualification_batch_sha256"
+        )
+        module = ast.Module(body=[function], type_ignores=[])
+        ast.fix_missing_locations(module)
+        namespace = {"hashlib": hashlib, "json": json, "torch": torch}
+        exec(compile(module, str(train_path), "exec"), namespace)
+        digest = namespace["_qualification_batch_sha256"]
+        batch = [
+            {
+                "input_ids": torch.tensor([[1, 2, 3, 4]], dtype=torch.long),
+                "sequence_lengths": [2, 2],
+            },
+            {
+                "input_ids": torch.tensor([[5, 6]], dtype=torch.long),
+                "sequence_lengths": [2],
+            },
+        ]
+        original = digest(batch)
+        self.assertEqual(original, digest(batch))
+        changed_token = [dict(item) for item in batch]
+        changed_token[0] = dict(batch[0])
+        changed_token[0]["input_ids"] = batch[0]["input_ids"].clone()
+        changed_token[0]["input_ids"][0, 0] = 9
+        self.assertNotEqual(original, digest(changed_token))
+        changed_lengths = [dict(item) for item in batch]
+        changed_lengths[0] = dict(batch[0], sequence_lengths=[1, 3])
+        self.assertNotEqual(original, digest(changed_lengths))
+        self.assertNotEqual(original, digest(list(reversed(batch))))
+
+    @unittest.skipIf(torch is None, "PyTorch is unavailable")
+    def test_qualification_step_records_reject_adjacent_input_reuse(self):
+        train_path = ROOT / "source/src/prime_rl/trainer/rl/train.py"
+        function = next(
+            node
+            for node in ast.parse(train_path.read_text()).body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_qualification_step_records"
+        )
+        module = ast.Module(body=[function], type_ignores=[])
+        ast.fix_missing_locations(module)
+        namespace = {
+            "math": __import__("math"),
+            "re": __import__("re"),
+            "torch": torch,
+        }
+        exec(compile(module, str(train_path), "exec"), namespace)
+        make_records = namespace["_qualification_step_records"]
+        history = []
+        for step in (1, 2):
+            history.extend(
+                (
+                    {"step": step, "data/rollout_rows": 2048},
+                    {"step": step, "loss/mean": 0.5},
+                    {"step": step, "optim/grad_norm": 0.8, "optim/lr": 8e-6},
+                    {
+                        "step": step,
+                        "perf/peak_memory": 44.0,
+                        "time/forward_backward": 300.0,
+                    },
+                )
+            )
+        values = {1: "1" * 64, 2: "2" * 64}
+        self.assertEqual(
+            [record["input_sha256"] for record in make_records(history, 2, values)],
+            ["1" * 64, "2" * 64],
+        )
+        with self.assertRaisesRegex(RuntimeError, "reused"):
+            make_records(history, 2, {1: "1" * 64, 2: "1" * 64})
+
+    def test_qualification_launcher_binds_runtime_source_image_and_launcher(self):
+        launcher = (ROOT / "scripts/china/cluster.sh").read_text()
+        self.assertIn('len(source_files) != 46', launcher)
+        self.assertIn('candidate.read_bytes()', launcher)
+        self.assertIn('qualification source checksum differs', launcher)
+        self.assertIn('qualification launcher checksum differs', launcher)
+        self.assertIn('qualification trainer image changed after session creation', launcher)
+        self.assertIn('PRIME_QUALIFICATION_RUNTIME_SOURCE_SHA256=', launcher)
+        self.assertIn('PRIME_QUALIFICATION_LAUNCHER_SHA256=', launcher)
+
     def test_native_fp8_expert_prefetch_is_explicit(self):
         tree = ast.parse(MODEL.read_text())
         setup = next(

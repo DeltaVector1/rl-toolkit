@@ -363,6 +363,8 @@ _qualification_environment_names = (
     "PRIME_QUALIFICATION_CONFIG_SHA256",
     "PRIME_QUALIFICATION_SOURCE_SHA256",
     "PRIME_QUALIFICATION_SESSION_SHA256",
+    "PRIME_QUALIFICATION_RUNTIME_SOURCE_SHA256",
+    "PRIME_QUALIFICATION_LAUNCHER_SHA256",
     "PRIME_TRAINER_IMAGE_DIGEST",
     "PRIME_TRAINER_HOST",
     "PRIME_TRAINER_HEAD",
@@ -391,6 +393,8 @@ def _qualification_environment() -> dict[str, str] | None:
         "PRIME_QUALIFICATION_CONFIG_SHA256",
         "PRIME_QUALIFICATION_SOURCE_SHA256",
         "PRIME_QUALIFICATION_SESSION_SHA256",
+        "PRIME_QUALIFICATION_RUNTIME_SOURCE_SHA256",
+        "PRIME_QUALIFICATION_LAUNCHER_SHA256",
     ):
         if not re.fullmatch(r"[0-9a-f]{64}", values[name]):
             raise RuntimeError(f"{name} is invalid")
@@ -404,7 +408,82 @@ def _qualification_environment() -> dict[str, str] | None:
     return values
 
 
-def _qualification_step_records(history: list[dict], max_steps: int) -> list[dict]:
+def _qualification_runtime_records(
+    identity: dict[str, str], world, session: dict
+) -> list[dict]:
+    local = {
+        "global_rank": world.rank,
+        "local_rank": world.local_rank,
+        "host": identity["PRIME_TRAINER_HOST"],
+        "image_digest": identity["PRIME_TRAINER_IMAGE_DIGEST"],
+        "source_sha256": identity["PRIME_QUALIFICATION_RUNTIME_SOURCE_SHA256"],
+        "launcher_sha256": identity["PRIME_QUALIFICATION_LAUNCHER_SHA256"],
+    }
+    payload = json.dumps(local, sort_keys=True, separators=(",", ":")).encode()
+    if len(payload) > 1024:
+        raise RuntimeError("qualification runtime identity is too large")
+    encoded = torch.zeros(1024, dtype=torch.uint8, device="cuda")
+    encoded[: len(payload)] = torch.tensor(list(payload), dtype=torch.uint8, device="cuda")
+    gathered = [torch.empty_like(encoded) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered, encoded)
+    failed = torch.zeros((), dtype=torch.int32, device="cuda")
+    records = []
+    if world.is_master:
+        try:
+            for value in gathered:
+                raw = bytes(value.cpu().tolist()).split(b"\0", 1)[0]
+                records.append(json.loads(raw))
+            hosts = session["trainer_hosts"]
+            images = session["image_digests"]
+            source_sha256 = session["source_sha256"]
+            launcher_sha256 = session["source_files"]["scripts/china/cluster.sh"]
+            if len(records) != 64 or len(hosts) != 8:
+                raise RuntimeError("qualification runtime identity count differs")
+            for rank, record in enumerate(records):
+                expected_host = hosts[rank // 8]
+                if (
+                    record.get("global_rank") != rank
+                    or record.get("local_rank") != rank % 8
+                    or record.get("host") != expected_host
+                    or record.get("image_digest") != images.get(expected_host)
+                    or record.get("source_sha256") != source_sha256
+                    or record.get("launcher_sha256") != launcher_sha256
+                ):
+                    raise RuntimeError(
+                        f"qualification runtime identity differs at rank {rank}"
+                    )
+        except Exception:
+            failed.fill_(1)
+    dist.broadcast(failed, src=0)
+    if failed.item():
+        raise RuntimeError("qualification runtime identity validation failed")
+    return records
+
+
+def _qualification_batch_sha256(micro_batches: list[dict]) -> str:
+    digest = hashlib.sha256()
+    for index, micro_batch in enumerate(micro_batches):
+        input_ids = micro_batch["input_ids"].detach().cpu().contiguous()
+        lengths = micro_batch["sequence_lengths"]
+        digest.update(index.to_bytes(4, "little"))
+        digest.update(str(input_ids.dtype).encode())
+        digest.update(json.dumps(list(input_ids.shape), separators=(",", ":")).encode())
+        digest.update(input_ids.numpy().tobytes())
+        digest.update(json.dumps(lengths, separators=(",", ":")).encode())
+    return digest.hexdigest()
+
+
+def _verify_qualification_batch_sha256(value: str) -> None:
+    encoded = torch.tensor(list(bytes.fromhex(value)), dtype=torch.uint8, device="cuda")
+    gathered = [torch.empty_like(encoded) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered, encoded)
+    if any(not torch.equal(item, encoded) for item in gathered):
+        raise RuntimeError("qualification input differs between ranks")
+
+
+def _qualification_step_records(
+    history: list[dict], max_steps: int, input_sha256: dict[int, str]
+) -> list[dict]:
     keys = (
         "data/rollout_rows",
         "loss/mean",
@@ -441,6 +520,12 @@ def _qualification_step_records(history: list[dict], max_steps: int) -> list[dic
             )
         if not all(math.isfinite(record[key]) for key in keys):
             raise RuntimeError(f"qualification step {step} has a nonfinite metric")
+        digest = input_sha256.get(step)
+        if digest is None or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise RuntimeError(f"qualification step {step} input checksum is missing")
+        record["input_sha256"] = digest
+        if step > 1 and digest == input_sha256.get(step - 1):
+            raise RuntimeError(f"qualification step {step} reused the previous input")
     return list(merged.values())
 
 
@@ -466,14 +551,9 @@ def _write_atomic_json(path: Path, value: dict, session_id: str) -> None:
         os.close(directory)
 
 
-def _write_qualification_result(
-    config: TrainerConfig,
-    parallel_dims,
-    monitor,
-    progress: Progress,
-    identity: dict[str, str],
-    adapter_path: Path | None,
-) -> None:
+def _load_qualification_session(
+    config: TrainerConfig, identity: dict[str, str]
+) -> dict:
     session_path = config.output_dir / "qualification-session.json"
     session_bytes = session_path.read_bytes()
     if hashlib.sha256(session_bytes).hexdigest() != identity[
@@ -490,12 +570,37 @@ def _write_qualification_result(
         != identity["PRIME_QUALIFICATION_SOURCE_SHA256"]
     ):
         raise RuntimeError("qualification session file identity differs")
+    return session
+
+
+def _write_qualification_result(
+    config: TrainerConfig,
+    parallel_dims,
+    monitor,
+    progress: Progress,
+    identity: dict[str, str],
+    runtime_records: list[dict],
+    input_sha256: dict[int, str],
+    adapter_path: Path | None,
+) -> None:
+    _load_qualification_session(config, identity)
     if config.max_steps is None or progress.step != config.max_steps:
         raise RuntimeError("qualification did not finish its exact step count")
-    records = _qualification_step_records(monitor.history, config.max_steps)
+    records = _qualification_step_records(
+        monitor.history, config.max_steps, input_sha256
+    )
     metrics_path = config.output_dir / config.file_monitor.filename
     adapter = None
     if config.data.fake.export_final_adapter:
+        expected_adapter_path = (
+            config.output_dir
+            / "run_trainer_only"
+            / "broadcasts"
+            / f"step_{progress.step}"
+            / "adapter_model.safetensors"
+        )
+        if adapter_path != expected_adapter_path:
+            raise RuntimeError("qualification final adapter path differs")
         if adapter_path is None or not adapter_path.is_file():
             raise RuntimeError("qualification final adapter is missing")
         stable = adapter_path.parent / "STABLE"
@@ -508,8 +613,36 @@ def _write_qualification_result(
         ):
             raise RuntimeError("qualification final adapter is incomplete")
         adapter_sha256 = sha256_file(adapter_path)
-        if digest_path.read_text().strip() != adapter_sha256:
+        checksum_value = digest_path.read_text()
+        if checksum_value != f"{adapter_sha256}\n":
             raise RuntimeError("qualification final adapter checksum file differs")
+        adapter_config_value = json.loads(adapter_config.read_bytes())
+        expected_targets = {
+            "q_a_proj",
+            "q_b_proj",
+            "kv_a_proj_with_mqa",
+            "kv_b_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+            "shared_expert",
+            "experts",
+        }
+        adapter_targets = adapter_config_value.get("target_modules")
+        if (
+            isinstance(adapter_config_value.get("r"), bool)
+            or adapter_config_value.get("r") != 32
+            or isinstance(adapter_config_value.get("lora_alpha"), bool)
+            or adapter_config_value.get("lora_alpha") != 64
+            or isinstance(adapter_config_value.get("lora_dropout"), bool)
+            or adapter_config_value.get("lora_dropout") != 0.0
+            or not isinstance(adapter_targets, list)
+            or any(not isinstance(target, str) for target in adapter_targets)
+            or len(adapter_targets) != len(expected_targets)
+            or set(adapter_targets) != expected_targets
+        ):
+            raise RuntimeError("qualification final adapter configuration differs")
         adapter = {
             "path": str(adapter_path),
             "sha256": adapter_sha256,
@@ -521,6 +654,8 @@ def _write_qualification_result(
             "stable_sha256": sha256_file(stable),
             "checksum_path": str(digest_path),
             "checksum_sha256": sha256_file(digest_path),
+            "checksum_value": checksum_value.rstrip("\n"),
+            "config": adapter_config_value,
         }
     fake = config.data.fake
     result = {
@@ -556,6 +691,13 @@ def _write_qualification_result(
         },
         "max_steps": config.max_steps,
         "steps": records,
+        "runtime_ranks": runtime_records,
+        "runtime_sha256": hashlib.sha256(
+            (
+                json.dumps(runtime_records, sort_keys=True, separators=(",", ":"))
+                + "\n"
+            ).encode()
+        ).hexdigest(),
         "metrics_path": str(metrics_path),
         "metrics_sha256": sha256_file(metrics_path),
         "adapter": adapter,
@@ -696,6 +838,14 @@ def train(config: TrainerConfig):
         parallel_dims.dp_shard,
     ) != (64, 8, 8, 8, 1, 1):
         raise RuntimeError("qualification trainer topology differs")
+    qualification_runtime_records = []
+    if qualification_identity is not None:
+        qualification_session = _load_qualification_session(
+            config, qualification_identity
+        )
+        qualification_runtime_records = _qualification_runtime_records(
+            qualification_identity, world, qualification_session
+        )
 
     # For single-run, check for checkpoint to resume from
     checkpoint_step = None
@@ -998,6 +1148,7 @@ def train(config: TrainerConfig):
         parity_bundle_enabled, torch.device("cuda", world.local_rank)
     )
     parity_bundle_readiness = None
+    qualification_input_sha256: dict[int, str] = {}
 
     gc_handler = GarbageCollection(config.gc.interval) if config.gc else None
 
@@ -1137,6 +1288,15 @@ def train(config: TrainerConfig):
             )
 
         batch_size = len(micro_batches)
+        if qualification_identity is not None:
+            input_sha256 = _qualification_batch_sha256(micro_batches)
+            _verify_qualification_batch_sha256(input_sha256)
+            previous_sha256 = qualification_input_sha256.get(progress.step - 1)
+            if previous_sha256 == input_sha256:
+                raise RuntimeError(
+                    f"qualification step {progress.step} reused the previous input"
+                )
+            qualification_input_sha256[progress.step] = input_sha256
         rollout_rows = sum(len(micro_batch["sequence_lengths"]) for micro_batch in micro_batches)
         memory_profiler = None
         if config.memory_profiler_path is not None:
@@ -2239,6 +2399,8 @@ def train(config: TrainerConfig):
                     monitor,
                     progress,
                     qualification_identity,
+                    qualification_runtime_records,
+                    qualification_input_sha256,
                     adapter_path,
                 )
             except Exception:

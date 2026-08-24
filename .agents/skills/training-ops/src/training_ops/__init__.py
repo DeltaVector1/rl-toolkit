@@ -6382,6 +6382,32 @@ def trainer_mount_preflight(nodes: list[str] | None = None) -> dict[str, str]:
     return expected
 
 
+def _trainer_qualification_source_files(nodes: list[str]) -> dict[str, str]:
+    source_files = trainer_mount_preflight(nodes)
+    launcher = "scripts/china/cluster.sh"
+    digest = hashlib.sha256((repo_root / launcher).read_bytes()).hexdigest()
+    remote = f"{remote_repo}/{launcher}"
+    results = _fan(
+        nodes,
+        lambda host: _ssh(
+            host,
+            f"test -f {shlex.quote(remote)} && sha256sum {shlex.quote(remote)} | cut -d' ' -f1",
+            timeout=60,
+        ),
+        workers=min(2, len(nodes)),
+    )
+    failures = []
+    for host in nodes:
+        code, output = results.get(host, (1, "missing result"))
+        if code or output.strip() != digest:
+            failures.append(host)
+    if failures:
+        raise Refused(
+            "qualification launcher checksum differs on " + ", ".join(failures)
+        )
+    return {**source_files, launcher: digest}
+
+
 production_parity_report = "/data/glm52-rl/qualifications/glm52-policy-parity/report.json"
 production_parity_fixture = "/data/glm52-rl/qualifications/glm52-policy-parity/fixture"
 production_parity_profile = "configs/qualification/glm52-policy-parity.toml"
@@ -6629,15 +6655,22 @@ def _validate_live_parity_report(
     return failures
 
 
-def _glm_qualification_limits() -> tuple[int, float, float]:
+def _glm_qualification_limits() -> tuple[int, int, float, float]:
     values = limits.get("glm52_qualification")
     if not isinstance(values, dict):
         raise Refused("GLM qualification limits are missing")
     age = values.get("evidence_max_age_seconds")
+    session_duration = values.get("session_duration_seconds_max")
     duration = values.get("forward_backward_seconds_max")
     memory = values.get("peak_memory_gib_max")
     if isinstance(age, bool) or not isinstance(age, int) or not 1 <= age <= 604800:
         raise Refused("GLM qualification evidence age limit is invalid")
+    if (
+        isinstance(session_duration, bool)
+        or not isinstance(session_duration, int)
+        or not 1 <= session_duration <= 21600
+    ):
+        raise Refused("GLM qualification session duration limit is invalid")
     if (
         isinstance(duration, bool)
         or not isinstance(duration, (int, float))
@@ -6650,7 +6683,7 @@ def _glm_qualification_limits() -> tuple[int, float, float]:
         or not 1 <= memory < 47.5
     ):
         raise Refused("GLM qualification memory limit is invalid")
-    return age, float(duration), float(memory)
+    return age, session_duration, float(duration), float(memory)
 
 
 def _validate_trainer_qualification(
@@ -6662,7 +6695,9 @@ def _validate_trainer_qualification(
     now: _dt.datetime | None = None,
 ) -> list[str]:
     failures = []
-    age_limit, duration_limit, memory_limit = _glm_qualification_limits()
+    age_limit, session_duration_limit, duration_limit, memory_limit = (
+        _glm_qualification_limits()
+    )
     expected_step_counts = {
         "glm52-native-b2048": 2,
         "glm52-native-stability20": 20,
@@ -6729,7 +6764,11 @@ def _validate_trainer_qualification(
     ):
         failures.append("qualification trainer image evidence differs")
     source_files = session.get("source_files")
-    if not isinstance(source_files, dict) or not source_files:
+    if (
+        not isinstance(source_files, dict)
+        or len(source_files) != 46
+        or "scripts/china/cluster.sh" not in source_files
+    ):
         failures.append("qualification source file evidence is missing")
     elif hashlib.sha256(
         (json.dumps(source_files, sort_keys=True, separators=(",", ":")) + "\n").encode()
@@ -6760,12 +6799,23 @@ def _validate_trainer_qualification(
         failures.append("qualification LoRA coverage differs")
     if profile.get("optim", {}).get("lr") != 8e-6 or result.get("max_steps") != expected_steps:
         failures.append("qualification learning rate or step count differs")
+    expected_metrics_path = str(
+        PurePosixPath(profile["output_dir"])
+        / profile["file_monitor"]["filename"]
+    )
+    if (
+        result.get("metrics_path") != expected_metrics_path
+        or re.fullmatch(r"[0-9a-f]{64}", str(result.get("metrics_sha256")))
+        is None
+    ):
+        failures.append("qualification metric file evidence differs")
     records = result.get("steps")
     if not isinstance(records, list) or [row.get("step") for row in records if isinstance(row, dict)] != list(
         range(1, expected_steps + 1)
     ):
         failures.append("qualification completed steps differ")
     else:
+        previous_input = None
         for row in records:
             numeric = (
                 "data/rollout_rows",
@@ -6791,8 +6841,52 @@ def _validate_trainer_qualification(
                 failures.append(f"qualification step {row['step']} trainer time exceeds the limit")
             if row["perf/peak_memory"] <= 0 or row["perf/peak_memory"] > memory_limit:
                 failures.append(f"qualification step {row['step']} memory exceeds the limit")
+            input_sha256 = row.get("input_sha256")
+            if re.fullmatch(r"[0-9a-f]{64}", str(input_sha256)) is None:
+                failures.append(f"qualification step {row['step']} input checksum is invalid")
+            elif input_sha256 == previous_input:
+                failures.append(f"qualification step {row['step']} reused the previous input")
+            previous_input = input_sha256
+    runtime_ranks = result.get("runtime_ranks")
+    expected_runtime = []
+    if isinstance(image_digests, dict) and isinstance(source_files, dict):
+        launcher_sha256 = source_files.get("scripts/china/cluster.sh")
+        for rank in range(64):
+            host = ranked_hosts[rank // 8]
+            expected_runtime.append(
+                {
+                    "global_rank": rank,
+                    "local_rank": rank % 8,
+                    "host": host,
+                    "image_digest": image_digests.get(host),
+                    "source_sha256": session.get("source_sha256"),
+                    "launcher_sha256": launcher_sha256,
+                }
+            )
+    expected_runtime_sha256 = hashlib.sha256(
+        (
+            json.dumps(expected_runtime, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        ).encode()
+    ).hexdigest()
+    if runtime_ranks != expected_runtime or result.get(
+        "runtime_sha256"
+    ) != expected_runtime_sha256:
+        failures.append("qualification runtime rank evidence differs")
     adapter = result.get("adapter")
     if expected_adapter:
+        adapter_root = (
+            PurePosixPath(profile["output_dir"])
+            / "run_trainer_only"
+            / "broadcasts"
+            / "step_20"
+        )
+        expected_paths = {
+            "path": str(adapter_root / "adapter_model.safetensors"),
+            "config_path": str(adapter_root / "adapter_config.json"),
+            "stable_path": str(adapter_root / "STABLE"),
+            "checksum_path": str(adapter_root / "adapter_model.safetensors.sha256"),
+        }
         if (
             not isinstance(adapter, dict)
             or adapter.get("step") != 20
@@ -6801,6 +6895,8 @@ def _validate_trainer_qualification(
             or not 0 < adapter["size"] <= 1_000_000_000
         ):
             failures.append("qualification final adapter evidence is invalid")
+        elif any(adapter.get(name) != path for name, path in expected_paths.items()):
+            failures.append("qualification final adapter path differs")
         elif any(
             not isinstance(adapter.get(path_name), str)
             or not isinstance(adapter.get(digest_name), str)
@@ -6812,6 +6908,30 @@ def _validate_trainer_qualification(
             )
         ):
             failures.append("qualification adapter manifest is incomplete")
+        adapter_config = adapter.get("config") if isinstance(adapter, dict) else None
+        adapter_targets = (
+            adapter_config.get("target_modules")
+            if isinstance(adapter_config, dict)
+            else None
+        )
+        if (
+            not isinstance(adapter_config, dict)
+            or isinstance(adapter_config.get("r"), bool)
+            or adapter_config.get("r") != 32
+            or isinstance(adapter_config.get("lora_alpha"), bool)
+            or adapter_config.get("lora_alpha") != 64
+            or isinstance(adapter_config.get("lora_dropout"), bool)
+            or adapter_config.get("lora_dropout") != 0.0
+            or not isinstance(adapter_targets, list)
+            or any(not isinstance(target, str) for target in adapter_targets)
+            or len(adapter_targets) != len(expected_targets)
+            or set(adapter_targets) != expected_targets
+        ):
+            failures.append("qualification adapter configuration differs")
+        if isinstance(adapter, dict) and adapter.get("checksum_value") != adapter.get(
+            "sha256"
+        ):
+            failures.append("qualification adapter checksum content differs")
     elif adapter is not None:
         failures.append("batch qualification contains an unexpected adapter")
     current = now or _dt.datetime.now(_dt.timezone.utc)
@@ -6820,7 +6940,12 @@ def _validate_trainer_qualification(
         completed = _dt.datetime.fromisoformat(result["completed_utc"])
         if created.tzinfo is None or completed.tzinfo is None:
             raise ValueError("timezone is missing")
-        if not created <= completed <= current or (current - completed).total_seconds() > age_limit:
+        if (
+            not created <= completed <= current
+            or (current - created).total_seconds() > age_limit
+            or (current - completed).total_seconds() > age_limit
+            or (completed - created).total_seconds() > session_duration_limit
+        ):
             failures.append("qualification evidence is stale")
     except (KeyError, TypeError, ValueError):
         failures.append("qualification evidence time is invalid")
@@ -6849,11 +6974,14 @@ def production_start_preflight() -> dict[str, object]:
     current_sources = None
     current_images = None
     try:
-        current_sources = trainer_mount_preflight()
-        if len(current_sources) != 45:
-            failures.append("trainer mount manifest is not exactly 45 files")
+        ranked_hosts = [trainer_head] + [
+            host for host in trainer_hosts if host != trainer_head
+        ]
+        current_sources = _trainer_qualification_source_files(ranked_hosts)
+        if len(current_sources) != 46:
+            failures.append("qualification source manifest is not exactly 46 files")
         current_images = _trainer_image_digest_map(
-            [trainer_head] + [host for host in trainer_hosts if host != trainer_head]
+            ranked_hosts
         )
     except (OSError, Refused, RuntimeError) as error:
         failures.append(str(error))
@@ -6893,23 +7021,38 @@ def production_start_preflight() -> dict[str, object]:
                 failures.append(f"{profile_name}: qualification source differs from current mounts")
             if current_images is not None and session.get("image_digests") != current_images:
                 failures.append(f"{profile_name}: qualification images differ from current images")
-            files = [(result.get("metrics_path"), result.get("metrics_sha256"))]
+            metrics_path = str(
+                PurePosixPath(output_dir) / profile["file_monitor"]["filename"]
+            )
+            files = [(metrics_path, result.get("metrics_sha256"))]
             adapter = result.get("adapter")
             if isinstance(adapter, dict):
-                files.append((adapter.get("path"), adapter.get("sha256")))
+                adapter_dir = (
+                    PurePosixPath(output_dir)
+                    / "run_trainer_only"
+                    / "broadcasts"
+                    / "step_20"
+                )
+                files.append(
+                    (
+                        str(adapter_dir / "adapter_model.safetensors"),
+                        adapter.get("sha256"),
+                    )
+                )
                 files.extend(
-                    (adapter.get(path_name), adapter.get(digest_name))
-                    for path_name, digest_name in (
-                        ("config_path", "config_sha256"),
-                        ("stable_path", "stable_sha256"),
-                        ("checksum_path", "checksum_sha256"),
+                    (str(adapter_dir / filename), adapter.get(digest_name))
+                    for filename, digest_name in (
+                        ("adapter_config.json", "config_sha256"),
+                        ("STABLE", "stable_sha256"),
+                        (
+                            "adapter_model.safetensors.sha256",
+                            "checksum_sha256",
+                        ),
                     )
                 )
             for path, expected in files:
                 if (
-                    not isinstance(path, str)
-                    or not path.startswith(f"{output_dir}/")
-                    or not isinstance(expected, str)
+                    not isinstance(expected, str)
                     or re.fullmatch(r"[0-9a-f]{64}", expected) is None
                 ):
                     failures.append(f"{profile_name}: evidence file identity is invalid")
@@ -6921,6 +7064,65 @@ def production_start_preflight() -> dict[str, object]:
                 )
                 if code or observed.strip() != expected:
                     failures.append(f"{profile_name}: evidence file checksum differs: {path}")
+            if profile_name == "glm52-native-stability20":
+                adapter_dir = (
+                    PurePosixPath(output_dir)
+                    / "run_trainer_only"
+                    / "broadcasts"
+                    / "step_20"
+                )
+                adapter_config = _remote_json(
+                    trainer_head, str(adapter_dir / "adapter_config.json")
+                )
+                targets = adapter_config.get("target_modules")
+                expected_targets = {
+                    "q_a_proj",
+                    "q_b_proj",
+                    "kv_a_proj_with_mqa",
+                    "kv_b_proj",
+                    "o_proj",
+                    "gate_proj",
+                    "up_proj",
+                    "down_proj",
+                    "shared_expert",
+                    "experts",
+                }
+                if (
+                    isinstance(adapter_config.get("r"), bool)
+                    or isinstance(adapter_config.get("lora_alpha"), bool)
+                    or isinstance(adapter_config.get("lora_dropout"), bool)
+                    or adapter_config.get("r") != 32
+                    or adapter_config.get("lora_alpha") != 64
+                    or adapter_config.get("lora_dropout") != 0.0
+                    or not isinstance(targets, list)
+                    or any(not isinstance(target, str) for target in targets)
+                    or len(targets) != len(expected_targets)
+                    or set(targets) != expected_targets
+                ):
+                    failures.append(
+                        f"{profile_name}: adapter configuration differs"
+                    )
+                checksum_path = str(
+                    adapter_dir / "adapter_model.safetensors.sha256"
+                )
+                code, encoded = _ssh(
+                    trainer_head,
+                    f"base64 -w0 {shlex.quote(checksum_path)}",
+                    timeout=60,
+                )
+                try:
+                    checksum_content = base64.b64decode(
+                        encoded.strip(), validate=True
+                    ).decode()
+                except (ValueError, UnicodeError):
+                    checksum_content = ""
+                adapter_sha256 = (
+                    adapter.get("sha256") if isinstance(adapter, dict) else None
+                )
+                if code or checksum_content != f"{adapter_sha256}\n":
+                    failures.append(
+                        f"{profile_name}: adapter checksum content differs"
+                    )
         except (KeyError, OSError, Refused, RuntimeError, tomllib.TOMLDecodeError) as error:
             failures.append(f"{profile_name}: {error}")
     failures.extend(_check_image_prime08(inference_image, "inference"))
@@ -7377,11 +7579,15 @@ def _prepare_trainer_qualification_session(
     output = PurePosixPath(output_dir) if isinstance(output_dir, str) else None
     if output is None or output.parent != qualification_root:
         raise Refused("qualification output directory is not an exact child of its root")
-    if not source_files or any(
+    if (
+        len(source_files) != 46
+        or "scripts/china/cluster.sh" not in source_files
+        or any(
         not isinstance(path, str)
         or not isinstance(digest, str)
         or re.fullmatch(r"[0-9a-f]{64}", digest) is None
         for path, digest in source_files.items()
+        )
     ):
         raise Refused("qualification source manifest is invalid")
 
@@ -7471,9 +7677,20 @@ finally:
     os.close(directory)
 PY
 """
-    code, detail = _ssh(trainer_head, command, timeout=60)
-    if code:
-        raise RuntimeError(f"qualification session write failed: {detail.strip()[:160]}")
+    results = _fan(
+        nodes,
+        lambda host: _ssh(host, command, timeout=60),
+        workers=min(2, len(nodes)),
+    )
+    failures = []
+    for host in nodes:
+        code, detail = results.get(host, (1, "missing result"))
+        if code:
+            failures.append(f"{host}: {detail.strip()[:120]}")
+    if failures:
+        raise RuntimeError(
+            "qualification session write failed: " + "; ".join(failures)
+        )
     return (
         f"PRIME_QUALIFICATION_SESSION_ID={session_id} "
         f"PRIME_QUALIFICATION_PROFILE={profile} "
@@ -7556,7 +7773,11 @@ def qualify(
     for path in ("scripts/china/cluster.sh", *trainer_mounts, relative_config):
         if not deploy(path, nodes=nodes):
             raise RuntimeError(f"failed to deploy {path}")
-    source_files = trainer_mount_preflight(nodes)
+    source_files = (
+        _trainer_qualification_source_files(nodes)
+        if strict_qualification
+        else trainer_mount_preflight(nodes)
+    )
 
     qualification_env = ""
     if strict_qualification:

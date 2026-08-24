@@ -32,7 +32,13 @@ class EdgeOperationsTest(unittest.TestCase):
             for host in training_ops.trainer_hosts
             if host != training_ops.trainer_head
         ]
-        source_files = {"source/a.py": "a" * 64}
+        source_files = {
+            path: hashlib.sha256(path.encode()).hexdigest()
+            for path in training_ops._mounts_in(
+                training_ops.repo_root / "scripts/china/cluster.sh"
+            )
+        }
+        source_files["scripts/china/cluster.sh"] = "2" * 64
         session = {
             "schema_version": 1,
             "kind": "glm52_trainer_qualification_session",
@@ -62,6 +68,17 @@ class EdgeOperationsTest(unittest.TestCase):
             },
         }
         count = 2 if profile_name == "glm52-native-b2048" else 20
+        runtime_ranks = [
+            {
+                "global_rank": rank,
+                "local_rank": rank % 8,
+                "host": hosts[rank // 8],
+                "image_digest": session["image_digests"][hosts[rank // 8]],
+                "source_sha256": session["source_sha256"],
+                "launcher_sha256": source_files["scripts/china/cluster.sh"],
+            }
+            for rank in range(64)
+        ]
         result = {
             "schema_version": 1,
             "kind": "glm52_trainer_qualification",
@@ -96,11 +113,21 @@ class EdgeOperationsTest(unittest.TestCase):
                     "optim/lr": 8e-6,
                     "perf/peak_memory": 44.0,
                     "time/forward_backward": 300.0,
+                    "input_sha256": hashlib.sha256(str(step).encode()).hexdigest(),
                 }
                 for step in range(1, count + 1)
             ],
             "metrics_path": profile["output_dir"] + "/trainer-metrics.jsonl",
             "metrics_sha256": "c" * 64,
+            "runtime_ranks": runtime_ranks,
+            "runtime_sha256": hashlib.sha256(
+                (
+                    json.dumps(
+                        runtime_ranks, sort_keys=True, separators=(",", ":")
+                    )
+                    + "\n"
+                ).encode()
+            ).hexdigest(),
             "adapter": None,
         }
         if count == 20:
@@ -115,6 +142,15 @@ class EdgeOperationsTest(unittest.TestCase):
                 "stable_sha256": "f" * 64,
                 "checksum_path": profile["output_dir"] + "/run_trainer_only/broadcasts/step_20/adapter_model.safetensors.sha256",
                 "checksum_sha256": "0" * 64,
+                "checksum_value": "d" * 64,
+                "config": {
+                    "r": 32,
+                    "lora_alpha": 64,
+                    "lora_dropout": 0.0,
+                    "target_modules": sorted(
+                        profile["model"]["lora"]["target_modules"]
+                    ),
+                },
             }
         return session, result, profile, now
 
@@ -144,6 +180,48 @@ class EdgeOperationsTest(unittest.TestCase):
         self.assertTrue(any("memory" in failure for failure in failures))
         self.assertTrue(any("adapter" in failure for failure in failures))
 
+    def test_trainer_qualification_rejects_reused_input_stale_session_and_rank(self):
+        session, result, profile, now = self.qualification_evidence(
+            "glm52-native-stability20"
+        )
+        result["steps"][1]["input_sha256"] = result["steps"][0][
+            "input_sha256"
+        ]
+        session["created_utc"] = (now - datetime.timedelta(hours=25)).isoformat()
+        result["session_sha256"] = training_ops._canonical_json_sha256(session)
+        result["runtime_ranks"][9]["host"] = "n82"
+        failures = training_ops._validate_trainer_qualification(
+            session, result, profile, "glm52-native-stability20", now=now
+        )
+        self.assertTrue(any("reused" in failure for failure in failures))
+        self.assertTrue(any("stale" in failure for failure in failures))
+        self.assertTrue(any("runtime rank" in failure for failure in failures))
+
+    def test_trainer_qualification_rejects_adapter_path_config_and_checksum(self):
+        session, result, profile, now = self.qualification_evidence(
+            "glm52-native-stability20"
+        )
+        result["adapter"]["path"] = profile["output_dir"] + "/adapter.safetensors"
+        result["adapter"]["config"]["r"] = 16
+        result["adapter"]["checksum_value"] = "0" * 64
+        failures = training_ops._validate_trainer_qualification(
+            session, result, profile, "glm52-native-stability20", now=now
+        )
+        self.assertTrue(any("adapter path" in failure for failure in failures))
+        self.assertTrue(any("adapter configuration" in failure for failure in failures))
+        self.assertTrue(any("checksum content" in failure for failure in failures))
+
+    def test_trainer_qualification_rejects_overlong_fresh_session(self):
+        session, result, profile, now = self.qualification_evidence(
+            "glm52-native-b2048"
+        )
+        session["created_utc"] = (now - datetime.timedelta(hours=5)).isoformat()
+        result["session_sha256"] = training_ops._canonical_json_sha256(session)
+        failures = training_ops._validate_trainer_qualification(
+            session, result, profile, "glm52-native-b2048", now=now
+        )
+        self.assertTrue(any("stale" in failure for failure in failures))
+
     def test_trainer_qualification_session_publish_is_no_follow_and_atomic(self):
         profile_name = "glm52-native-b2048"
         path = (
@@ -169,22 +247,68 @@ class EdgeOperationsTest(unittest.TestCase):
             patch.object(training_ops, "_ssh", side_effect=ssh),
             patch.object(training_ops.secrets, "token_hex", return_value="1" * 32),
         ):
+            source_files = {
+                source: hashlib.sha256(source.encode()).hexdigest()
+                for source in training_ops._mounts_in(
+                    training_ops.repo_root / "scripts/china/cluster.sh"
+                )
+            }
+            source_files["scripts/china/cluster.sh"] = "c" * 64
             environment = training_ops._prepare_trainer_qualification_session(
                 profile_name,
                 profile,
                 path,
                 hosts,
-                {"source/a.py": "b" * 64},
+                source_files,
             )
 
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0][0], training_ops.trainer_head)
-        self.assertEqual(calls[0][2], 60)
-        self.assertIn("os.O_EXCL | os.O_NOFOLLOW", calls[0][1])
-        self.assertIn("os.replace(temporary, destination", calls[0][1])
-        self.assertIn("os.fsync(directory)", calls[0][1])
-        self.assertNotIn(" tee ", calls[0][1])
+        self.assertCountEqual([call[0] for call in calls], hosts)
+        self.assertTrue(all(call[2] == 60 for call in calls))
+        self.assertTrue(all("os.O_EXCL | os.O_NOFOLLOW" in call[1] for call in calls))
+        self.assertTrue(all("os.replace(temporary, destination" in call[1] for call in calls))
+        self.assertTrue(all("os.fsync(directory)" in call[1] for call in calls))
+        self.assertTrue(all(" tee " not in call[1] for call in calls))
         self.assertIn("PRIME_QUALIFICATION_SESSION_ID=" + "1" * 32, environment)
+
+    def test_trainer_qualification_source_manifest_includes_launcher(self):
+        digest = hashlib.sha256(
+            (training_ops.repo_root / "scripts/china/cluster.sh").read_bytes()
+        ).hexdigest()
+        hosts = ["n82", "n76"]
+        with (
+            patch.object(
+                training_ops,
+                "trainer_mount_preflight",
+                return_value={"source/a.py": "a" * 64},
+            ),
+            patch.object(
+                training_ops,
+                "_fan",
+                return_value={host: (0, digest + "\n") for host in hosts},
+            ),
+        ):
+            self.assertEqual(
+                training_ops._trainer_qualification_source_files(hosts),
+                {
+                    "source/a.py": "a" * 64,
+                    "scripts/china/cluster.sh": digest,
+                },
+            )
+
+        with (
+            patch.object(
+                training_ops,
+                "trainer_mount_preflight",
+                return_value={"source/a.py": "a" * 64},
+            ),
+            patch.object(
+                training_ops,
+                "_fan",
+                return_value={"n82": (0, digest), "n76": (0, "0" * 64)},
+            ),
+            self.assertRaisesRegex(training_ops.Refused, "n76"),
+        ):
+            training_ops._trainer_qualification_source_files(hosts)
 
     def test_status_parser_keeps_metric_names_with_digits(self):
         self.assertEqual(training_ops._kv("FAILS5M 3\n"), {"FAILS5M": "3"})

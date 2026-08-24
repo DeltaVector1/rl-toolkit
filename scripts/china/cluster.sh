@@ -287,9 +287,74 @@ PY
       [ "$actual_config_sha256" = "$PRIME_QUALIFICATION_CONFIG_SHA256" ] || {
         echo "qualification trainer config checksum differs" >&2; exit 1
       }
+      qualification_session="$trainer_output/qualification-session.json"
+      read -r qualification_runtime_source_sha256 qualification_expected_launcher_sha256 qualification_expected_image_digest < <(
+        python3 - "$deployment" "$qualification_session" "$PRIME_QUALIFICATION_SESSION_SHA256" "n$node" <<'PY'
+import hashlib
+import json
+from pathlib import Path, PurePosixPath
+import re
+import sys
+
+deployment, session_path, expected_session_sha256, host = sys.argv[1:]
+session_bytes = Path(session_path).read_bytes()
+if hashlib.sha256(session_bytes).hexdigest() != expected_session_sha256:
+    raise SystemExit("qualification session checksum differs")
+session = json.loads(session_bytes)
+source_files = session.get("source_files")
+if not isinstance(source_files, dict) or len(source_files) != 46:
+    raise SystemExit("qualification source manifest is invalid")
+root = Path(deployment).resolve(strict=True)
+observed = {}
+for relative, expected in source_files.items():
+    path = PurePosixPath(relative) if isinstance(relative, str) else None
+    if (
+        path is None
+        or path.is_absolute()
+        or ".." in path.parts
+        or not isinstance(expected, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected) is None
+    ):
+        raise SystemExit("qualification source record is invalid")
+    candidate = (root / Path(*path.parts)).resolve(strict=True)
+    try:
+        candidate.relative_to(root)
+    except ValueError as error:
+        raise SystemExit("qualification source path leaves deployment") from error
+    if not candidate.is_file():
+        raise SystemExit(f"qualification source is not a file: {relative}")
+    digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
+    if digest != expected:
+        raise SystemExit(f"qualification source checksum differs: {relative}")
+    observed[relative] = digest
+payload = (json.dumps(observed, sort_keys=True, separators=(",", ":")) + "\n").encode()
+source_sha256 = hashlib.sha256(payload).hexdigest()
+if source_sha256 != session.get("source_sha256"):
+    raise SystemExit("qualification source manifest checksum differs")
+launcher_sha256 = observed.get("scripts/china/cluster.sh")
+image_digest = session.get("image_digests", {}).get(host)
+if (
+    launcher_sha256 is None
+    or not isinstance(image_digest, str)
+    or re.fullmatch(r"sha256:[0-9a-f]{64}", image_digest) is None
+):
+    raise SystemExit("qualification host evidence is missing")
+print(source_sha256, launcher_sha256, image_digest)
+PY
+      )
+      [ "$qualification_runtime_source_sha256" = "$PRIME_QUALIFICATION_SOURCE_SHA256" ] || {
+        echo "qualification runtime source checksum differs" >&2; exit 1
+      }
+      qualification_launcher_sha256=$(sha256sum "$0" | cut -d' ' -f1)
+      [ "$qualification_launcher_sha256" = "$qualification_expected_launcher_sha256" ] || {
+        echo "qualification launcher checksum differs" >&2; exit 1
+      }
       qualification_image_digest=$(sudo docker image inspect "$image" --format '{{.Id}}')
       [[ "$qualification_image_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
         echo "qualification trainer image digest is invalid" >&2; exit 1
+      }
+      [ "$qualification_image_digest" = "$qualification_expected_image_digest" ] || {
+        echo "qualification trainer image changed after session creation" >&2; exit 1
       }
       qualification_env=(
         -e "PRIME_QUALIFICATION_SESSION_ID=$PRIME_QUALIFICATION_SESSION_ID"
@@ -297,6 +362,8 @@ PY
         -e "PRIME_QUALIFICATION_CONFIG_SHA256=$PRIME_QUALIFICATION_CONFIG_SHA256"
         -e "PRIME_QUALIFICATION_SOURCE_SHA256=$PRIME_QUALIFICATION_SOURCE_SHA256"
         -e "PRIME_QUALIFICATION_SESSION_SHA256=$PRIME_QUALIFICATION_SESSION_SHA256"
+        -e "PRIME_QUALIFICATION_RUNTIME_SOURCE_SHA256=$qualification_runtime_source_sha256"
+        -e "PRIME_QUALIFICATION_LAUNCHER_SHA256=$qualification_launcher_sha256"
         -e "PRIME_TRAINER_IMAGE_DIGEST=$qualification_image_digest"
         -e "PRIME_TRAINER_HOST=n$node"
         -e "PRIME_TRAINER_HEAD=n$trainer_head_node"
