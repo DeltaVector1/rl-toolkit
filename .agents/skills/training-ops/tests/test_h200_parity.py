@@ -205,7 +205,9 @@ class H200ParityTest(unittest.TestCase):
                 return "8" * 64
             raise AssertionError(f"unexpected manifest path: {path}")
 
-        def listener_identity(_host, _sensitive, _timeout, port=8000):
+        def listener_identity(
+            _host, _sensitive, _timeout, _container_id, _boot_id, port=8000
+        ):
             listener_ports.append(port)
             is_api = port == training_ops.h200_parity_backend_port
             return {
@@ -311,10 +313,12 @@ class H200ParityTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             state = Path(temporary) / "state"
             calls = Path(temporary) / "calls"
+            top_state = Path(temporary) / "top-state"
             state.write_text("absent" if scenario == "absent" else "running")
             prefix = f"""
 state_file={shlex.quote(str(state))}
 calls_file={shlex.quote(str(calls))}
+top_state_file={shlex.quote(str(top_state))}
 scenario={shlex.quote(scenario)}
 container_id={container_id}
 replacement_id={replacement_id}
@@ -365,7 +369,16 @@ docker() {{
       printf '%s %s\n' "$id" "$container_name"
       ;;
     top)
-      echo 321
+      if test "$scenario" = top-transient && test ! -e "$top_state_file"; then
+        : >"$top_state_file"
+        return 94
+      fi
+      if test "$scenario" = top-header-only && test ! -e "$top_state_file"; then
+        : >"$top_state_file"
+        printf '%s\n' PID
+        return 0
+      fi
+      printf '%s\n' PID 321
       ;;
     kill)
       if test "$scenario" = slow-kill; then SECONDS=$((SECONDS+20)); fi
@@ -391,6 +404,9 @@ sleep() {{
     replacement) echo replacement >"$state_file" ;;
     restart) echo restarted >"$state_file" ;;
     removing) echo absent >"$state_file" ;;
+    top-transient|top-header-only)
+      test "$(<"$state_file")" = running || echo ready >"$state_file"
+      ;;
     *) echo ready >"$state_file" ;;
   esac
 }}
@@ -1055,20 +1071,25 @@ sleep() {{
             training_ops, "_sensitive_ssh", return_value=json.dumps(identity)
         ) as remote:
             result = training_ops._h200_parity_listener_identity(
-                "h200a", ("secret",), 7200
+                "h200a",
+                ("secret",),
+                30,
+                "a" * 64,
+                "11111111-2222-3333-4444-555555555555",
             )
         self.assertEqual(result, identity)
         command = remote.call_args.args[1]
         self.assertIn(".State.Running", command)
         self.assertIn("sport = :8000", command)
         self.assertIn(".State.Pid", command)
+        self.assertIn('docker top "$expected_id" -eo pid', command)
         self.assertNotIn('test "$listener_pid" = "$container_pid" ||', command)
         self.assertIn("/cgroup", command)
         self.assertIn("$container_id", command)
         self.assertIn("container-image-mismatch", command)
         self.assertIn("container-command-mismatch", command)
         self.assertIn("container-restart-policy-invalid", command)
-        self.assertEqual(remote.call_args.args[4], 7230)
+        self.assertEqual(remote.call_args.args[4], 60)
 
     def _listener_shell_support(self, container_id, expected_command):
         image = shlex.quote(json.dumps(training_ops.inference_image))
@@ -1101,7 +1122,9 @@ sleep() {{
         )
 
     def test_listener_identity_shell_accepts_child_only_inside_container_cgroup(self):
-        command = training_ops._h200_parity_listener_identity_command(0)
+        command = training_ops._h200_parity_listener_identity_command(
+            0, "a" * 64, "11111111-2222-3333-4444-555555555555"
+        )
         container_id = "a" * 64
         expected_command = json.dumps(
             [
@@ -1141,12 +1164,67 @@ sleep() {{
         self.assertNotEqual(rejected.returncode, 0)
         self.assertIn("parity-listener-error:listener-cgroup-mismatch", rejected.stderr)
 
+    def test_listener_identity_waits_for_pid_and_top_metadata(self):
+        command = training_ops._h200_parity_listener_identity_command(
+            4, "a" * 64, "11111111-2222-3333-4444-555555555555"
+        )
+        container_id = "a" * 64
+        expected_command = json.dumps(
+            [
+                "@",
+                training_ops.glm_parity_inference_config,
+                "--vllm-extra",
+                training_ops.glm_parity_vllm_extra,
+            ],
+            separators=(",", ":"),
+        )
+        common = self._listener_shell_support(container_id, expected_command)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pid_marker = shlex.quote(str(root / "pid"))
+            pid_lag = (
+                "ss() { if test -e "
+                + pid_marker
+                + "; then _ss_record; else : > "
+                + pid_marker
+                + "; printf '%s\\n' 'LISTEN 0 128 *:8000 ino:900'; fi; }; "
+            )
+            result = subprocess.run(
+                ["bash", "-c", common + pid_lag + command],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            top_marker = shlex.quote(str(root / "top"))
+            top_lag = (
+                "docker() { if test \"$1\" = inspect; then _docker_record; "
+                "elif test \"$1\" = top; then if test -e "
+                + top_marker
+                + "; then _docker_top; else : > "
+                + top_marker
+                + "; return 70; fi; else return 71; fi; }; "
+            )
+            result = subprocess.run(
+                ["bash", "-c", common + top_lag + command],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_api_listener_identity_requires_loopback_binding(self):
         port = training_ops.h200_parity_backend_port
         self.assertEqual(
             json.loads(training_ops.glm_parity_vllm_extra)["host"], "127.0.0.1"
         )
-        command = training_ops._h200_parity_listener_identity_command(0, port)
+        command = training_ops._h200_parity_listener_identity_command(
+            0,
+            "a" * 64,
+            "11111111-2222-3333-4444-555555555555",
+            port,
+        )
         container_id = "a" * 64
         expected_command = json.dumps(
             [
@@ -1181,7 +1259,9 @@ sleep() {{
         self.assertIn("parity-listener-error:api-listener-not-loopback", rejected.stderr)
 
     def test_listener_identity_shell_failures_are_detailed(self):
-        command = training_ops._h200_parity_listener_identity_command(0)
+        command = training_ops._h200_parity_listener_identity_command(
+            0, "a" * 64, "11111111-2222-3333-4444-555555555555"
+        )
         container_id = "a" * 64
         expected_command = json.dumps(
             [
@@ -1220,7 +1300,7 @@ sleep() {{
             + "ss() { printf '%s\\n' 'LISTEN pid=202,' 'LISTEN pid=203,'; };",
             "multiple-listener-processes": healthy
             + "ss() { printf '%s\\n' 'LISTEN pid=202,pid=203,'; };",
-            "listener-pid-missing": healthy
+            "listener-pid-missing-timeout": healthy
             + "ss() { printf '%s\\n' 'LISTEN 0 128 *:8000'; };",
             "listener-probe-failed": healthy + "ss() { return 72; };",
             "listener-cgroup-unreadable": healthy
@@ -1240,7 +1320,9 @@ sleep() {{
                 self.assertIn(f"parity-listener-error:{detail}", result.stderr)
 
     def test_listener_identity_rejects_replacement_and_pid_reuse(self):
-        command = training_ops._h200_parity_listener_identity_command(0)
+        command = training_ops._h200_parity_listener_identity_command(
+            0, "a" * 64, "11111111-2222-3333-4444-555555555555"
+        )
         container_id = "a" * 64
         expected_command = json.dumps(
             [
@@ -1304,10 +1386,19 @@ sleep() {{
                         check=False,
                     )
                     self.assertNotEqual(result.returncode, 0)
-                    self.assertIn(f"parity-listener-error:{detail}", result.stderr)
+                    expected_detail = (
+                        "second-container-id-mismatch"
+                        if detail == "second-container-replaced"
+                        else detail
+                    )
+                    self.assertIn(
+                        f"parity-listener-error:{expected_detail}", result.stderr
+                    )
 
     def test_listener_identity_rejects_membership_namespace_and_cgroup_mismatch(self):
-        command = training_ops._h200_parity_listener_identity_command(0)
+        command = training_ops._h200_parity_listener_identity_command(
+            0, "a" * 64, "11111111-2222-3333-4444-555555555555"
+        )
         container_id = "a" * 64
         expected_command = json.dumps(
             [
@@ -1321,7 +1412,7 @@ sleep() {{
         healthy = self._listener_shell_support(container_id, expected_command)
         cases = {
             "listener-docker-membership-invalid-absent": (
-                "listener-docker-membership-invalid",
+                "listener-docker-membership-missing-timeout",
                 "_docker_top() { printf '%s\\n' PID 101; };",
             ),
             "listener-docker-membership-invalid-duplicate": (
@@ -1592,6 +1683,30 @@ sleep() {{
         self.assertIn("ss", calls)
         self.assertIn("nvidia-smi", calls)
 
+    def test_container_cleanup_uses_current_docker_top_format(self):
+        command = training_ops._h200_parity_container_cleanup_command(
+            "d" * 64,
+            "11111111-2222-3333-4444-555555555555",
+            120,
+            2,
+        )
+        self.assertIn('docker top "$expected_id" -eo pid', command)
+        self.assertNotIn("-eo pid=", command)
+        self.assertIn('test "${top_lines[0]}" = PID', command)
+        self.assertIn("top_deadline=$((SECONDS + 10))", command)
+
+    def test_container_cleanup_retries_transient_docker_top_failure(self):
+        completed, calls = self._run_container_cleanup("top-transient")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "removed")
+        self.assertGreaterEqual(calls.count("docker-top-running"), 2)
+
+    def test_container_cleanup_retries_header_only_docker_top_output(self):
+        completed, calls = self._run_container_cleanup("top-header-only")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "removed")
+        self.assertGreaterEqual(calls.count("docker-top-running"), 2)
+
     def test_container_cleanup_verifies_absent_container_ports_and_gpu(self):
         completed, calls = self._run_container_cleanup("absent")
         self.assertEqual(completed.returncode, 0, completed.stderr)
@@ -1642,6 +1757,9 @@ sleep() {{
 
     def test_container_cleanup_limits_are_explicit_and_bounded(self):
         self.assertEqual(training_ops._configured_h200_parity_cleanup(), (120, 2))
+        self.assertEqual(
+            training_ops._configured_h200_parity_listener_stabilization(), 30
+        )
         with patch.object(training_ops, "limits", {}), self.assertRaisesRegex(
             training_ops.Refused, "must be configured"
         ):

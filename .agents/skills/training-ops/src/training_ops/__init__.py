@@ -127,6 +127,15 @@ def _configured_h200_engine_startup_grace() -> int:
     return value
 
 
+def _configured_h200_parity_listener_stabilization() -> int:
+    value = limits.get("h200_parity_listener_stabilization_seconds")
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 60:
+        raise Refused(
+            "limits.h200_parity_listener_stabilization_seconds must be between 1 and 60"
+        )
+    return value
+
+
 def _configured_h200_parity_cleanup() -> tuple[int, int]:
     settings = limits.get("h200_parity_cleanup")
     if not isinstance(settings, dict):
@@ -2688,11 +2697,26 @@ def _assert_h200_parity_port_free(host: str) -> None:
         )
 
 
-def _h200_parity_listener_identity_command(timeout: int, port: int = 8000) -> str:
+def _h200_parity_listener_identity_command(
+    timeout: int,
+    expected_container_id: str,
+    expected_host_boot_id: str,
+    port: int = 8000,
+) -> str:
     if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout < 0:
         raise Refused("H200 parity listener timeout is invalid")
     if port not in {8000, h200_parity_backend_port}:
         raise Refused("H200 parity listener port is invalid")
+    if re.fullmatch(r"[0-9a-f]{64}", expected_container_id) is None:
+        raise Refused("H200 parity listener container ID is invalid")
+    if (
+        re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            expected_host_boot_id,
+        )
+        is None
+    ):
+        raise Refused("H200 parity listener host boot ID is invalid")
     error_prefix = "" if port == 8000 else "api-"
     loopback_check = ""
     if port == h200_parity_backend_port:
@@ -2711,6 +2735,8 @@ def _h200_parity_listener_identity_command(timeout: int, port: int = 8000) -> st
 set -euo pipefail
 name={shlex.quote(glm_inference_container)}
 deadline=$((SECONDS+{timeout}))
+expected_id={shlex.quote(expected_container_id)}
+expected_boot={shlex.quote(expected_host_boot_id)}
 error_prefix={shlex.quote(error_prefix)}
 fail() {{
   code=$1
@@ -2740,6 +2766,7 @@ read_container() {{
   [[ "$container_pid" =~ ^[0-9]+$ ]] || fail 84 "${{phase}}container-pid-invalid"
   test "$container_pid" -gt 1 || fail 84 "${{phase}}container-pid-invalid"
   [[ "$container_id" =~ ^[0-9a-f]{{64}}$ ]] || fail 85 "${{phase}}container-id-invalid"
+  test "$container_id" = "$expected_id" || fail 85 "${{phase}}container-id-mismatch"
   test "$image" = {shlex.quote(json.dumps(inference_image))} || fail 86 "${{phase}}container-image-mismatch"
   test "$command" = {shlex.quote(expected_command)} || fail 87 "${{phase}}container-command-mismatch"
   test "$restart_count" = 0 || fail 88 "${{phase}}container-restarted"
@@ -2758,7 +2785,7 @@ read_listener() {{
     listener_pids+=("${{BASH_REMATCH[1]}}")
     remaining=${{remaining#*"${{BASH_REMATCH[0]}}"}}
   done
-  test "${{#listener_pids[@]}}" -gt 0 || fail 92 "${{phase}}listener-pid-missing"
+  test "${{#listener_pids[@]}}" -gt 0 || return 11
   declare -A unique_listener_pids=()
   for pid in "${{listener_pids[@]}}"; do unique_listener_pids["$pid"]=1; done
   test "${{#unique_listener_pids[@]}}" = 1 || fail 93 "${{phase}}multiple-listener-processes"
@@ -2771,6 +2798,7 @@ read_listener() {{
     listener_inodes+=("${{BASH_REMATCH[1]}}")
     remaining=${{remaining#*"${{BASH_REMATCH[0]}}"}}
   done
+  test "${{#listener_inodes[@]}}" -gt 0 || return 12
   test "${{#listener_inodes[@]}}" = 1 || fail 94 "${{phase}}listener-socket-inode-invalid"
   listener_inode=${{listener_inodes[0]}}
 }}
@@ -2845,26 +2873,62 @@ cgroup_is_equal_or_below() {{
 read_membership() {{
   phase=$1
   member_pid=$2
-  top_output=$(sudo docker top "$name" -eo pid) || fail 99 "${{phase}}docker-top-failed"
+  allow_wait=$3
+  top_output=$(sudo docker top "$expected_id" -eo pid) || {{
+    test "$allow_wait" = 1 && return 10
+    fail 99 "${{phase}}docker-top-failed"
+  }}
+  mapfile -t top_lines <<<"$top_output" || fail 99 "${{phase}}docker-top-record-unreadable"
+  test "${{#top_lines[@]}}" -gt 0 || fail 99 "${{phase}}docker-top-record-invalid"
+  test "${{top_lines[0]}}" = PID || fail 99 "${{phase}}docker-top-header-invalid"
   member_count=0
-  while read -r top_pid extra; do
+  for top_line in "${{top_lines[@]:1}}"; do
+    read -r top_pid extra <<<"$top_line" || fail 99 "${{phase}}docker-top-record-invalid"
     test -z "${{extra:-}}" || fail 99 "${{phase}}docker-top-record-invalid"
+    [[ "$top_pid" =~ ^[0-9]+$ ]] || fail 99 "${{phase}}docker-top-record-invalid"
     if test "$top_pid" = "$member_pid"; then member_count=$((member_count+1)); fi
-  done <<<"$top_output"
+  done
+  if test "$member_count" = 0 && test "$allow_wait" = 1; then return 13; fi
   test "$member_count" = 1 || fail 99 "${{phase}}listener-docker-membership-invalid"
 }}
+startup_inspect=""
 while :; do
+  current_boot=$(sudo cat -- /proc/sys/kernel/random/boot_id) || fail 97 host-boot-id-unreadable
+  test "$current_boot" = "$expected_boot" || fail 98 host-boot-id-changed
   read_container ""
+  if test -z "$startup_inspect"; then
+    startup_inspect=$inspect
+    startup_container_id=$container_id
+    startup_container_pid=$container_pid
+  else
+    test "$container_id" = "$startup_container_id" || fail 100 container-changed-during-listener-wait
+    test "$container_pid" = "$startup_container_pid" || fail 100 container-changed-during-listener-wait
+    test "$inspect" = "$startup_inspect" || fail 100 container-changed-during-listener-wait
+  fi
   if read_listener ""; then
-    break
+    if read_membership "" "$listener_pid" 1; then
+      break
+    else
+      listener_status=$?
+    fi
   else
     listener_status=$?
   fi
-  test "$listener_status" = 10 || fail 99 listener-read-failed
+  case "$listener_status" in
+    10) wait_detail=listener ;;
+    11) wait_detail=listener-pid-missing ;;
+    12) wait_detail=listener-socket-inode-missing ;;
+    13) wait_detail=listener-docker-membership-missing ;;
+    *) fail 99 listener-read-failed ;;
+  esac
   if test $SECONDS -ge $deadline; then
-    fail 124 listener-timeout
+    fail 124 "$wait_detail-timeout"
   else
-    sleep 2 || fail 99 listener-wait-failed
+    listener_remaining=$((deadline - SECONDS))
+    listener_delay=2
+    test "$listener_delay" -le "$listener_remaining" || listener_delay=$listener_remaining
+    timeout --foreground "$listener_remaining" sleep "$listener_delay" || fail 99 listener-wait-failed
+    test "$SECONDS" -le "$deadline" || fail 124 "$wait_detail-timeout"
   fi
 done
 first_inspect=$inspect
@@ -2873,7 +2937,7 @@ first_container_id=$container_id
 first_listener_output=$listener_output
 first_listener_pid=$listener_pid
 first_listener_inode=$listener_inode
-read_membership "" "$first_listener_pid"
+read_membership "" "$first_listener_pid" 0
 first_init_starttime=$(process_starttime "$first_container_pid") || fail 95 container-init-stat-unreadable
 first_listener_starttime=$(process_starttime "$first_listener_pid") || fail 95 listener-stat-unreadable
 first_listener_namespace_pid=$(process_namespace_pid "$first_listener_pid") || fail 95 listener-namespace-pid-unreadable
@@ -2890,6 +2954,7 @@ first_listener_cgroup=$(sudo cat -- "/proc/$first_listener_pid/cgroup") || fail 
 cgroup_is_equal_or_below "$first_init_cgroup" "$first_listener_cgroup" || fail 96 listener-cgroup-mismatch
 first_boot_id=$(sudo cat -- /proc/sys/kernel/random/boot_id) || fail 97 host-boot-id-unreadable
 [[ "$first_boot_id" =~ ^[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}$ ]] || fail 98 host-boot-id-invalid
+test "$first_boot_id" = "$expected_boot" || fail 98 host-boot-id-changed
 
 read_container second-
 second_inspect=$inspect
@@ -2911,7 +2976,7 @@ second_listener_inode=$listener_inode
 test "$second_listener_pid" = "$first_listener_pid" || fail 100 listener-pid-rebound
 test "$second_listener_inode" = "$first_listener_inode" || fail 100 listener-socket-rebound
 test "$second_listener_output" = "$first_listener_output" || fail 100 listener-record-changed
-read_membership second- "$second_listener_pid"
+read_membership second- "$second_listener_pid" 0
 second_init_starttime=$(process_starttime "$second_container_pid") || fail 100 second-container-init-stat-unreadable
 second_listener_starttime=$(process_starttime "$second_listener_pid") || fail 100 second-listener-stat-unreadable
 second_listener_namespace_pid=$(process_namespace_pid "$second_listener_pid") || fail 100 second-listener-namespace-pid-unreadable
@@ -2948,10 +3013,14 @@ def _h200_parity_listener_identity(
     host: str,
     sensitive: tuple[str, ...],
     timeout: int,
+    expected_container_id: str,
+    expected_host_boot_id: str,
     port: int = 8000,
 ) -> dict[str, object]:
     _check_host(host)
-    command = _h200_parity_listener_identity_command(timeout, port)
+    command = _h200_parity_listener_identity_command(
+        timeout, expected_container_id, expected_host_boot_id, port
+    )
     output = _sensitive_ssh(
         host,
         command,
@@ -3223,8 +3292,12 @@ bounded_sleep() {{
 }}
 boot=$(bounded sudo cat /proc/sys/kernel/random/boot_id) || fail host-boot-read
 test "$boot" = "$expected_boot" || fail host-boot-changed
+inspect_name_with() {{
+  runner=$1
+  "$runner" sudo docker inspect "$name" --format '{{{{.Id}}}}\n{{{{.State.Status}}}}\n{{{{.State.Running}}}}\n{{{{.State.Pid}}}}\n{{{{json .Config.Image}}}}\n{{{{json .Config.Cmd}}}}\n{{{{.RestartCount}}}}\n{{{{json .HostConfig.RestartPolicy.Name}}}}'
+}}
 inspect_name() {{
-  bounded sudo docker inspect "$name" --format '{{{{.Id}}}}\n{{{{.State.Status}}}}\n{{{{.State.Running}}}}\n{{{{.State.Pid}}}}\n{{{{json .Config.Image}}}}\n{{{{json .Config.Cmd}}}}\n{{{{.RestartCount}}}}\n{{{{json .HostConfig.RestartPolicy.Name}}}}'
+  inspect_name_with bounded
 }}
 inventory_name() {{
   bounded sudo docker ps -a --no-trunc --filter "name=^/${{name}}$" --format '{{{{.ID}}}} {{{{.Names}}}}'
@@ -3274,13 +3347,49 @@ if test -n "$first"; then
     running:true|created:false|exited:false|dead:false|removing:false) ;;
     *) fail initial-state-invalid ;;
   esac
-  top=$(bounded sudo docker top "$expected_id" -eo pid= 2>/dev/null) || {{
-    test "$status" != running || fail initial-top-failed
-    top=""
+  top_deadline=$((SECONDS + 10))
+  test "$top_deadline" -le "$deadline" || top_deadline=$deadline
+  bounded_top() {{
+    top_remaining=$((top_deadline - SECONDS))
+    test "$top_remaining" -gt 0 || return 124
+    timeout --foreground "$top_remaining" "$@"
+    code=$?
+    test "$code" = 0 || return "$code"
+    test "$SECONDS" -le "$top_deadline" || return 124
   }}
-  for process in $top; do
+  inspect_name_top() {{
+    inspect_name_with bounded_top
+  }}
+  while :; do
+    top=""
+    top_lines=()
+    if top=$(bounded_top sudo docker top "$expected_id" -eo pid 2>/dev/null); then
+      mapfile -t top_lines <<<"$top" || fail initial-top-record-unreadable
+      test "${{#top_lines[@]}}" -gt 0 || fail initial-top-record-invalid
+      test "${{top_lines[0]}}" = PID || fail initial-top-header-invalid
+      if test "${{#top_lines[@]}}" -gt 1 || test "$status" != running; then break; fi
+    elif test "$status" != running; then
+      break
+    fi
+    remaining || fail initial-top-timeout
+    test "$SECONDS" -lt "$top_deadline" || fail initial-top-timeout
+    check=$(inspect_name_top 2>/dev/null) || fail initial-top-identity-probe
+    check_state=$(verify_record "$check" initial-top)
+    status=$(sed -n '1p' <<<"$check_state")
+    running=$(sed -n '2p' <<<"$check_state")
+    test "$status:$running" = running:true || break
+    top_remaining=$((top_deadline - SECONDS))
+    test "$top_remaining" -gt 0 || fail initial-top-timeout
+    top_delay=$poll_seconds
+    test "$top_delay" -le "$top_remaining" || top_delay=$top_remaining
+    timeout --foreground "$top_remaining" sleep "$top_delay" || fail initial-top-timeout
+    test "$SECONDS" -le "$top_deadline" || fail initial-top-timeout
+  done
+  for top_line in "${{top_lines[@]:1}}"; do
+    read -r process extra <<<"$top_line" || fail initial-top-record-invalid
+    test -z "${{extra:-}}" || fail initial-top-record-invalid
     [[ "$process" =~ ^[0-9]+$ ]] || fail initial-pid-invalid
-    test "$(printf '%s\n' "$top" | grep -cx "$process")" = 1 || fail initial-pid-duplicate
+    test "$(printf '%s\n' "${{top_lines[@]:1}}" | grep -cx "$process")" = 1 || fail initial-pid-duplicate
     stat=$(bounded sudo cat "/proc/$process/stat" 2>/dev/null) || continue
     start=${{stat##*) }}
     start=$(awk '{{print $20}}' <<<"$start")
@@ -4776,15 +4885,20 @@ printf '%s\n' "$state"
             startup_grace + 30,
         )
         sensitive = (bootstrap_token,)
+        listener_stabilization = _configured_h200_parity_listener_stabilization()
         listener_identity = _h200_parity_listener_identity(
             host,
             sensitive,
-            startup_grace,
+            listener_stabilization,
+            launch_identity["container_id"],
+            launch_identity["host_boot_id"],
         )
         api_listener_identity = _h200_parity_listener_identity(
             host,
             sensitive,
-            startup_grace,
+            listener_stabilization,
+            launch_identity["container_id"],
+            launch_identity["host_boot_id"],
             h200_parity_backend_port,
         )
         if (
@@ -4822,7 +4936,9 @@ printf '%s\n' "$state"
         final_api_listener_identity = _h200_parity_listener_identity(
             host,
             sensitive,
-            60,
+            listener_stabilization,
+            launch_identity["container_id"],
+            launch_identity["host_boot_id"],
             h200_parity_backend_port,
         )
         if final_api_listener_identity != api_listener_identity:
@@ -4830,7 +4946,9 @@ printf '%s\n' "$state"
         final_listener_identity = _h200_parity_listener_identity(
             host,
             sensitive,
-            60,
+            listener_stabilization,
+            launch_identity["container_id"],
+            launch_identity["host_boot_id"],
         )
         if final_listener_identity != listener_identity:
             raise Refused("H200 parity router listener changed during capture")
