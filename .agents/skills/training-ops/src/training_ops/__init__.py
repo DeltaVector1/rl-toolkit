@@ -3360,41 +3360,92 @@ if test -n "$first"; then
   inspect_name_top() {{
     inspect_name_with bounded_top
   }}
-  while :; do
-    top=""
-    top_lines=()
-    if top=$(bounded_top sudo docker top "$expected_id" -eo pid 2>/dev/null); then
-      mapfile -t top_lines <<<"$top" || fail initial-top-record-unreadable
-      test "${{#top_lines[@]}}" -gt 0 || fail initial-top-record-invalid
-      test "${{top_lines[0]}}" = PID || fail initial-top-header-invalid
-      if test "${{#top_lines[@]}}" -gt 1 || test "$status" != running; then break; fi
-    elif test "$status" != running; then
-      break
-    fi
+  snapshot_identity() {{
+    snapshot_boot=$(bounded_top sudo cat /proc/sys/kernel/random/boot_id) || return 10
+    test "$snapshot_boot" = "$expected_boot" || fail initial-top-host-boot-changed
+    snapshot_listing=$(bounded_top sudo docker ps -a --no-trunc --filter "name=^/${{name}}$" --format '{{{{.ID}}}} {{{{.Names}}}}') || return 10
+    test "$snapshot_listing" = "$expected_id $name" || fail initial-top-container-name-mismatch unknown
+    snapshot_inspect=$(inspect_name_top 2>/dev/null) || return 10
+    snapshot_state=$(verify_record "$snapshot_inspect" initial-top)
+    status=$(sed -n '1p' <<<"$snapshot_state")
+    running=$(sed -n '2p' <<<"$snapshot_state")
+    pid=$(sed -n '3p' <<<"$snapshot_state")
+    case "$status:$running" in
+      running:true|created:false|exited:false|dead:false|removing:false) ;;
+      *) fail initial-top-state-invalid ;;
+    esac
+  }}
+  retry_top_snapshot() {{
     remaining || fail initial-top-timeout
     test "$SECONDS" -lt "$top_deadline" || fail initial-top-timeout
-    check=$(inspect_name_top 2>/dev/null) || fail initial-top-identity-probe
-    check_state=$(verify_record "$check" initial-top)
-    status=$(sed -n '1p' <<<"$check_state")
-    running=$(sed -n '2p' <<<"$check_state")
-    test "$status:$running" = running:true || break
+    if snapshot_identity; then :; else
+      test "$?" = 10 || fail initial-top-identity-probe
+    fi
+    test "$status:$running" = running:true || return 20
     top_remaining=$((top_deadline - SECONDS))
     test "$top_remaining" -gt 0 || fail initial-top-timeout
     top_delay=$poll_seconds
     test "$top_delay" -le "$top_remaining" || top_delay=$top_remaining
     timeout --foreground "$top_remaining" sleep "$top_delay" || fail initial-top-timeout
     test "$SECONDS" -le "$top_deadline" || fail initial-top-timeout
-  done
-  for top_line in "${{top_lines[@]:1}}"; do
-    read -r process extra <<<"$top_line" || fail initial-top-record-invalid
-    test -z "${{extra:-}}" || fail initial-top-record-invalid
-    [[ "$process" =~ ^[0-9]+$ ]] || fail initial-pid-invalid
-    test "$(printf '%s\n' "${{top_lines[@]:1}}" | grep -cx "$process")" = 1 || fail initial-pid-duplicate
-    stat=$(bounded sudo cat "/proc/$process/stat" 2>/dev/null) || continue
-    start=${{stat##*) }}
-    start=$(awk '{{print $20}}' <<<"$start")
-    [[ "$start" =~ ^[0-9]+$ ]] || fail initial-starttime-invalid
-    tracked+="$process:$start "
+  }}
+  declare -A snapshot_pids=()
+  while :; do
+    top=""
+    top_lines=()
+    snapshot_retry=0
+    if top=$(bounded_top sudo docker top "$expected_id" -eo pid 2>/dev/null); then
+      mapfile -t top_lines <<<"$top" || fail initial-top-record-unreadable
+      test "${{#top_lines[@]}}" -gt 0 || fail initial-top-record-invalid
+      test "${{top_lines[0]}}" = PID || fail initial-top-header-invalid
+      if test "$status" = running && test "${{#top_lines[@]}}" = 1; then
+        snapshot_retry=1
+      fi
+    elif test "$status" != running; then
+      break
+    else
+      snapshot_retry=1
+    fi
+    candidate_tracked=""
+    snapshot_pids=()
+    if test "$snapshot_retry" = 0; then
+      for top_line in "${{top_lines[@]:1}}"; do
+        read -r process extra <<<"$top_line" || fail initial-top-record-invalid
+        test -z "${{extra:-}}" || fail initial-top-record-invalid
+        [[ "$process" =~ ^[0-9]+$ ]] || fail initial-pid-invalid
+        [[ ! -v 'snapshot_pids[$process]' ]] || fail initial-pid-duplicate
+        snapshot_pids["$process"]=1
+        if ! stat=$(bounded_top sudo cat "/proc/$process/stat" 2>/dev/null); then
+          snapshot_retry=1
+          break
+        fi
+        start=${{stat##*) }}
+        start=$(awk '{{print $20}}' <<<"$start")
+        if [[ ! "$start" =~ ^[0-9]+$ ]]; then
+          snapshot_retry=1
+          break
+        fi
+        candidate_tracked+="$process:$start "
+      done
+      test "$status" != running || test "${{#snapshot_pids[@]}}" -gt 0 || snapshot_retry=1
+    fi
+    if test "$snapshot_retry" = 0; then
+      if snapshot_identity; then
+        if test "$status" = running; then
+          tracked=$candidate_tracked
+          test -n "$tracked" || fail initial-top-empty-running-snapshot
+        fi
+        break
+      else
+        identity_status=$?
+        test "$identity_status" = 10 || fail initial-top-identity-probe
+      fi
+    fi
+    if retry_top_snapshot; then :; else
+      retry_status=$?
+      test "$retry_status" = 20 && break
+      fail initial-top-identity-probe
+    fi
   done
   if test "$status" = running; then
     bounded sudo docker kill "$expected_id" >/dev/null || {{

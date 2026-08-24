@@ -333,6 +333,7 @@ timeout() {{
 cat() {{
   if test "$1" = /proc/sys/kernel/random/boot_id; then echo {boot_id}; return; fi
   if test "$1" = /proc/321/stat; then
+    test "$scenario" != stat-loss || return 96
     test "$(<"$state_file")" != ready || return 1
     echo '321 (worker) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19'
     return
@@ -379,6 +380,7 @@ docker() {{
         return 0
       fi
       printf '%s\n' PID 321
+      test "$scenario" != restart-after-top || echo restarted >"$state_file"
       ;;
     kill)
       if test "$scenario" = slow-kill; then SECONDS=$((SECONDS+20)); fi
@@ -400,7 +402,7 @@ ss() {{ echo ss >>"$calls_file"; test "$scenario" != final-ss-fail; }}
 nvidia-smi() {{ echo nvidia-smi >>"$calls_file"; }}
 sleep() {{
   case "$scenario" in
-    persistent) SECONDS=$((SECONDS+20)) ;;
+    persistent|stat-loss) SECONDS=$((SECONDS+20)) ;;
     replacement) echo replacement >"$state_file" ;;
     restart) echo restarted >"$state_file" ;;
     removing) echo absent >"$state_file" ;;
@@ -1706,6 +1708,18 @@ sleep() {{
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(completed.stdout.strip(), "removed")
         self.assertGreaterEqual(calls.count("docker-top-running"), 2)
+
+    def test_container_cleanup_never_kills_after_pid_stat_loss(self):
+        completed, calls = self._run_container_cleanup("stat-loss")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("initial-top-timeout", completed.stderr)
+        self.assertNotIn("docker-kill", calls)
+
+    def test_container_cleanup_never_kills_after_restart_following_top(self):
+        completed, calls = self._run_container_cleanup("restart-after-top")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("initial-top-container-restarted", completed.stderr)
+        self.assertNotIn("docker-kill", calls)
 
     def test_container_cleanup_verifies_absent_container_ports_and_gpu(self):
         completed, calls = self._run_container_cleanup("absent")
