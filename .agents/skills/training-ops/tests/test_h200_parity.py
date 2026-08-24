@@ -29,6 +29,20 @@ class H200ParityTest(unittest.TestCase):
                 return 0, "config-sha\n"
             if "mkfifo -m 0600" in command:
                 return 0, "fifo-ready\n"
+            if "refresh-fixture" in command:
+                return 0, json.dumps(
+                    {
+                        "fixture_sha256": "1" * 64,
+                        "source_fixture_sha256": "2" * 64,
+                        "token_ids_sha256": "3" * 64,
+                        "positions_sha256": "4" * 64,
+                        "advantages_sha256": "5" * 64,
+                        "token_export_sha256": "6" * 64,
+                        "rank": 56,
+                    }
+                ) + "\n"
+            if "state=created" in command and ".fixture-candidate-" in command:
+                return 0, "replaced\n"
             if "docker ps -a" in command and "glm52-optims-h200-" in command:
                 return 0, "absent\n"
             if "docker ps -a" in command and "glm52-optims-h200" in command:
@@ -65,12 +79,24 @@ class H200ParityTest(unittest.TestCase):
         ), patch.object(
             training_ops,
             "_resolve_glm52_parity_diagnostic_source",
-            return_value=(training_ops.trainer_head, source_root, json.loads(metadata)),
+            return_value=(
+                training_ops.trainer_head,
+                "n85",
+                56,
+                source_root,
+                json.loads(metadata),
+            ),
+        ), patch.object(
+            training_ops,
+            "_resolve_glm52_parity_token_export",
+            return_value=f"{training_ops.parity_token_root}/step_0/rank_56.jsonl",
         ), patch.object(
             training_ops, "_remote_ok", return_value="source-ready"
         ), patch.object(
             training_ops, "_sha256_file", return_value="config-sha"
         ), patch.object(training_ops, "_copy_parity_diagnostic_input") as copy_input, patch.object(
+            training_ops, "_copy_parity_refresh_file"
+        ), patch.object(
             training_ops, "_h200_parity_container_preflight"
         ), patch.object(
             training_ops, "_configured_h200_engine_startup_grace", return_value=7200
@@ -130,11 +156,13 @@ class H200ParityTest(unittest.TestCase):
         with patch.object(training_ops, "trainer_hosts", hosts), patch.object(
             training_ops, "trainer_head", "n82"
         ), patch.object(training_ops, "_remote_ok", side_effect=remote):
-            source_host, source_root, source_session = (
+            source_host, final_host, final_rank, source_root, source_session = (
                 training_ops._resolve_glm52_parity_diagnostic_source("qualification-1")
             )
 
         self.assertEqual(source_host, "n82")
+        self.assertEqual(final_host, "n85")
+        self.assertEqual(final_rank, 56)
         self.assertEqual(
             source_root,
             f"{training_ops.parity_trace_root}/qualification-1",
@@ -184,6 +212,23 @@ class H200ParityTest(unittest.TestCase):
         ), patch.object(training_ops, "_remote_ok", side_effect=remote):
             with self.assertRaisesRegex(training_ops.Refused, "trainer head"):
                 training_ops._resolve_glm52_parity_diagnostic_source("qualification-1")
+
+    def test_final_pp_token_export_requires_one_stable_exact_source(self):
+        expected = f"{training_ops.parity_token_root}/step_0/rank_56.jsonl"
+        with patch.object(training_ops, "_remote_ok", return_value=expected) as remote:
+            actual = training_ops._resolve_glm52_parity_token_export("n85", 56)
+        self.assertEqual(actual, expected)
+        command = remote.call_args.args[1]
+        self.assertIn("-maxdepth 2", command)
+        self.assertIn("rank_56.jsonl", command)
+        self.assertIn("/STABLE", command)
+        with patch.object(
+            training_ops,
+            "_remote_ok",
+            return_value=f"{expected}\n{training_ops.parity_token_root}/step_1/rank_56.jsonl",
+        ):
+            with self.assertRaisesRegex(training_ops.Refused, "unique and exact"):
+                training_ops._resolve_glm52_parity_token_export("n85", 56)
 
     def test_diagnostic_capture_preflight_fits_existing_h200_cap(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -349,6 +394,13 @@ class H200ParityTest(unittest.TestCase):
                 for command in commands
             )
         )
+        rollback = next(
+            command
+            for command in commands
+            if ".fixture-failed-1111111111111111" in command
+        )
+        self.assertIn('mv "$previous" "$fixture"', rollback)
+        self.assertIn('rm -rf -- "$failed"', rollback)
 
     def test_diagnostic_operation_uses_memory_token_and_exact_cleanup(self):
         commands = []

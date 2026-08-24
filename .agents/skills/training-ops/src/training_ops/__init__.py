@@ -2622,9 +2622,9 @@ def _copy_parity_diagnostic_input(
         source.name,
     ):
         raise Refused("trainer diagnostic input path is outside the exact trace root")
-    if destination.parent != parity_root or not destination.name.startswith(
-        ".diagnostic-input-"
-    ):
+    if destination.parent != parity_root or re.fullmatch(
+        r"\.diagnostic-(?:input|source)-[0-9a-f]{16}\.npz", destination.name
+    ) is None:
         raise Refused("H200 diagnostic input path is outside the exact parity root")
     with tempfile.TemporaryDirectory(prefix="glm52-parity-diagnostic-") as temporary:
         local_input = Path(temporary) / "layer3-router-input.npz"
@@ -2660,9 +2660,105 @@ def _copy_parity_diagnostic_input(
             raise RuntimeError("H200 diagnostic input copy failed")
 
 
+def _resolve_glm52_parity_token_export(host: str, rank: int) -> str:
+    _check_parity_host(host)
+    if isinstance(rank, bool) or not isinstance(rank, int) or rank < 0:
+        raise Refused("final trainer token export rank is invalid")
+    command = f"""
+set -euo pipefail
+root={shlex.quote(parity_token_root)}
+test -d "$root"
+test ! -L "$root"
+test "$(realpath -e "$root")" = "$root"
+mapfile -t files < <(find "$root" -mindepth 2 -maxdepth 2 -type f -name {shlex.quote(f'rank_{rank}.jsonl')} -print)
+test "${{#files[@]}}" -eq 1
+file=${{files[0]}}
+test ! -L "$file"
+test -f "$(dirname "$file")/STABLE"
+test ! -L "$(dirname "$file")/STABLE"
+printf '%s\n' "$file"
+"""
+    output = _remote_ok(host, command, "final PP token export", timeout=60).strip()
+    expected = re.fullmatch(
+        re.escape(parity_token_root) + rf"/step_[0-9]+/rank_{rank}\.jsonl", output
+    )
+    if expected is None:
+        raise Refused("final PP token export path is not unique and exact")
+    return output
+
+
+def _copy_parity_refresh_file(
+    source_host: str,
+    source_path: str,
+    destination_host: str,
+    destination_path: str,
+    kind: str,
+) -> None:
+    _check_parity_host(source_host)
+    _check_host(destination_host)
+    source = PurePosixPath(source_path)
+    destination = PurePosixPath(destination_path)
+    root = PurePosixPath("/data/glm52-rl/qualifications/glm52-policy-parity")
+    destination_patterns = {
+        "session": r"\.diagnostic-session-[0-9a-f]{16}\.json",
+        "token": r"\.diagnostic-token-[0-9a-f]{16}\.jsonl",
+    }
+    if destination.parent != root or re.fullmatch(
+        destination_patterns.get(kind, r"(?!)"), destination.name
+    ) is None:
+        raise Refused("parity refresh destination is outside the exact parity root")
+    if kind == "session":
+        valid_source = source.parent.parent == PurePosixPath(parity_trace_root) and (
+            source.name == "session.json"
+        )
+    elif kind == "token":
+        valid_source = (
+            source.parent.parent == PurePosixPath(parity_token_root)
+            and re.fullmatch(r"step_[0-9]+", source.parent.name) is not None
+            and re.fullmatch(r"rank_[0-9]+\.jsonl", source.name) is not None
+        )
+    else:
+        raise Refused("parity refresh source kind is invalid")
+    if not valid_source:
+        raise Refused("parity refresh source is outside its exact root")
+    with tempfile.TemporaryDirectory(prefix="glm52-parity-refresh-") as temporary:
+        local = Path(temporary) / source.name
+        for arguments, label in (
+            (
+                [
+                    "scp",
+                    "-q",
+                    "-o",
+                    "BatchMode=yes",
+                    f"{source_host}:{source_path}",
+                    str(local),
+                ],
+                "trainer parity refresh download",
+            ),
+            (
+                [
+                    "scp",
+                    "-q",
+                    "-o",
+                    "BatchMode=yes",
+                    str(local),
+                    f"{destination_host}:{destination_path}",
+                ],
+                "H200 parity refresh upload",
+            ),
+        ):
+            result = subprocess.run(
+                arguments, capture_output=True, text=True, timeout=600
+            )
+            if result.returncode:
+                raise RuntimeError(f"{label} failed")
+        if not local.is_file() or local.is_symlink():
+            raise RuntimeError("parity refresh transfer did not produce a regular file")
+
+
 def _resolve_glm52_parity_diagnostic_source(
     name: str,
-) -> tuple[str, str, dict[str, object]]:
+) -> tuple[str, str, int, str, dict[str, object]]:
     if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
         raise Refused("parity diagnostic name contains unsafe characters")
     trainer_config = repo_root / "configs/qualification/glm52-policy-parity-trainer.toml"
@@ -2787,7 +2883,12 @@ def _resolve_glm52_parity_diagnostic_source(
         raise Refused("trainer parity session identity is invalid")
     if any(modules != module_sets[0] for modules in module_sets[1:]):
         raise Refused("trainer parity module hashes differ between hosts")
-    return source_host, source_root, session
+    final = [record for record in records if record.get("pp_rank") == pp_size - 1]
+    if len(final) != 1:
+        raise Refused("trainer parity provenance must contain one final PP host")
+    final_host = str(final[0]["host"])
+    final_rank = int(final[0]["global_rank"])
+    return source_host, final_host, final_rank, source_root, session
 
 
 def diagnose_glm52_policy_parity(name: str, keep_engine: bool = False) -> dict[str, object]:
@@ -2805,7 +2906,10 @@ def diagnose_glm52_policy_parity(name: str, keep_engine: bool = False) -> dict[s
     fixture = glm_parity_paths["fixture"]
     if PurePosixPath(capture).parent != PurePosixPath(root):
         raise Refused("H200 capture path is outside the exact parity root")
-    source_host, source_root, metadata = _resolve_glm52_parity_diagnostic_source(name)
+    source_host, final_host, final_rank, source_root, metadata = (
+        _resolve_glm52_parity_diagnostic_source(name)
+    )
+    token_export = _resolve_glm52_parity_token_export(final_host, final_rank)
     source_input = (
         f"{source_root}/trainer-rank-0-pp-0-cp-0-"
         "diagnostic-layer3_router_input.npz"
@@ -2829,9 +2933,16 @@ def diagnose_glm52_policy_parity(name: str, keep_engine: bool = False) -> dict[s
     sensitive = (bootstrap_token,)
     run_directory = f"{root}/.diagnostic-run-{nonce}"
     bootstrap_fifo = f"{run_directory}/bootstrap.fifo"
+    source_diagnostic_input = f"{root}/.diagnostic-source-{nonce}.npz"
+    source_session = f"{root}/.diagnostic-session-{nonce}.json"
+    source_token_export = f"{root}/.diagnostic-token-{nonce}.jsonl"
     remote_input = f"{root}/.diagnostic-input-{nonce}.npz"
+    fixture_candidate = f"{root}/.fixture-candidate-{nonce}"
+    fixture_previous = f"{root}/.fixture-previous-{nonce}"
     temporary_capture = f"{root}/.h200-capture-{nonce}"
     engine_launch_attempted = False
+    fixture_published = False
+    fixture_replaced = False
     succeeded = False
     operation_error: BaseException | None = None
     try:
@@ -2894,7 +3005,81 @@ echo fifo-ready
         if fifo_state != "fifo-ready":
             raise RuntimeError("parity bootstrap FIFO setup returned an invalid state")
 
-        _copy_parity_diagnostic_input(source_host, source_input, host, remote_input)
+        _copy_parity_diagnostic_input(
+            source_host, source_input, host, source_diagnostic_input
+        )
+        _copy_parity_refresh_file(
+            source_host, session_path, host, source_session, "session"
+        )
+        _copy_parity_refresh_file(
+            final_host, token_export, host, source_token_export, "token"
+        )
+        refresh_command = (
+            "sudo docker run --rm -v /data:/data "
+            f"-v {shlex.quote(remote_repo)}:/workspace:ro -w /workspace "
+            f"--entrypoint /app/.venv/bin/python {shlex.quote(inference_image)} "
+            f"scripts/glm52_policy_parity.py --profile {shlex.quote(production_parity_profile)} "
+            f"refresh-fixture --source-fixture {shlex.quote(fixture)} "
+            f"--source-session {shlex.quote(source_session)} "
+            f"--token-export {shlex.quote(source_token_export)} "
+            f"--diagnostic-input {shlex.quote(source_diagnostic_input)} "
+            f"--diagnostic-output {shlex.quote(remote_input)} "
+            f"--expected-rank {final_rank} {shlex.quote(fixture_candidate)}"
+        )
+        refresh_output = _sensitive_ssh(
+            host, refresh_command, "current parity fixture rebuild", sensitive, 600
+        )
+        try:
+            refresh_result = json.loads(refresh_output)
+        except json.JSONDecodeError as error:
+            raise RuntimeError("current parity fixture rebuild returned invalid JSON") from error
+        for field in (
+            "fixture_sha256",
+            "source_fixture_sha256",
+            "token_ids_sha256",
+            "positions_sha256",
+            "advantages_sha256",
+            "token_export_sha256",
+        ):
+            if re.fullmatch(r"[0-9a-f]{64}", str(refresh_result.get(field, ""))) is None:
+                raise RuntimeError(f"current parity fixture rebuild omitted {field}")
+        if refresh_result.get("rank") != final_rank:
+            raise RuntimeError("current parity fixture rebuild used another trainer rank")
+        fixture_publish = f"""
+set -euo pipefail
+root={shlex.quote(root)}
+fixture={shlex.quote(fixture)}
+candidate={shlex.quote(fixture_candidate)}
+previous={shlex.quote(fixture_previous)}
+test ! -L "$root"
+test "$(realpath -e "$root")" = "$root"
+test -d "$candidate"
+test ! -L "$candidate"
+test -f "$candidate/manifest.json"
+test ! -e "$previous"
+restore_fixture() {{
+  if test -e "$previous" && ! test -e "$fixture"; then mv "$previous" "$fixture"; fi
+}}
+trap restore_fixture EXIT
+state=created
+if test -e "$fixture"; then
+  test -d "$fixture"
+  test ! -L "$fixture"
+  mv "$fixture" "$previous"
+  state=replaced
+fi
+mv "$candidate" "$fixture"
+test -f "$fixture/manifest.json"
+trap - EXIT
+printf '%s\n' "$state"
+"""
+        fixture_state = _sensitive_ssh(
+            host, fixture_publish, "current parity fixture publish", sensitive, 120
+        ).strip()
+        if fixture_state not in {"created", "replaced"}:
+            raise RuntimeError("current parity fixture publish returned an invalid state")
+        fixture_published = True
+        fixture_replaced = fixture_state == "replaced"
 
         start_command = (
             "env "
@@ -2976,6 +3161,17 @@ if test -e "$previous"; then rm -rf -- "$previous"; fi
 trap - EXIT
 """
         _sensitive_ssh(host, publish_command, "H200 parity capture publish", sensitive, 300)
+        if fixture_replaced:
+            _sensitive_ssh(
+                host,
+                f"test -d {shlex.quote(fixture_previous)} && "
+                f"test ! -L {shlex.quote(fixture_previous)} && "
+                f"rm -rf -- {shlex.quote(fixture_previous)}",
+                "previous parity fixture removal",
+                sensitive,
+                120,
+            )
+        fixture_published = False
         succeeded = True
         return {"capture": capture, "diagnostic_plan": plan, "engine_kept": keep_engine}
     except BaseException as error:
@@ -3004,16 +3200,54 @@ test -z "$(sudo docker ps -a --filter "name=^/${{name}}$" --format '{{{{.Names}}
                     "isolated parity container cleanup failed: "
                     + _redact_sensitive(container_output.strip(), sensitive)
                 )
+        if fixture_published:
+            if fixture_replaced:
+                fixture_rollback = f"""
+set -euo pipefail
+fixture={shlex.quote(fixture)}
+previous={shlex.quote(fixture_previous)}
+test -d "$previous"
+test ! -L "$previous"
+failed={shlex.quote(root)}/.fixture-failed-{nonce}
+test ! -e "$failed"
+mv "$fixture" "$failed"
+mv "$previous" "$fixture"
+rm -rf -- "$failed"
+test -f "$fixture/manifest.json"
+"""
+            else:
+                fixture_rollback = (
+                    f"test -d {shlex.quote(fixture)} && "
+                    f"test ! -L {shlex.quote(fixture)} && "
+                    f"rm -rf -- {shlex.quote(fixture)}"
+                )
+            rollback_code, rollback_output = _ssh(
+                host, fixture_rollback, timeout=180
+            )
+            if rollback_code:
+                cleanup_failures.append(
+                    "parity fixture rollback failed: "
+                    + _redact_sensitive(rollback_output.strip(), sensitive)
+                )
         cleanup = (
             f"sudo rm -f -- {shlex.quote(bootstrap_fifo)}; "
             f"if test -d {shlex.quote(run_directory)}; then "
             f"sudo rmdir -- {shlex.quote(run_directory)}; fi; "
             f"rm -f -- {shlex.quote(remote_input)}; "
+            f"rm -f -- {shlex.quote(source_diagnostic_input)}; "
+            f"rm -f -- {shlex.quote(source_session)}; "
+            f"rm -f -- {shlex.quote(source_token_export)}; "
+            f"if test -d {shlex.quote(fixture_candidate)}; then "
+            f"rm -rf -- {shlex.quote(fixture_candidate)}; fi; "
             f"if test -d {shlex.quote(temporary_capture)}; then "
             f"rm -rf -- {shlex.quote(temporary_capture)}; fi; "
             f"test ! -e {shlex.quote(bootstrap_fifo)}; "
             f"test ! -e {shlex.quote(run_directory)}; "
             f"test ! -e {shlex.quote(remote_input)}; "
+            f"test ! -e {shlex.quote(source_diagnostic_input)}; "
+            f"test ! -e {shlex.quote(source_session)}; "
+            f"test ! -e {shlex.quote(source_token_export)}; "
+            f"test ! -e {shlex.quote(fixture_candidate)}; "
             f"test ! -e {shlex.quote(temporary_capture)}"
         )
         cleanup_code, cleanup_output = _ssh(host, cleanup, timeout=120)

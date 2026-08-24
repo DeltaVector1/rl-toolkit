@@ -418,6 +418,139 @@ def test_trainer_stage_requires_exact_operations_paths(tmp_path):
         )
 
 
+def _refresh_fixture_inputs(tmp_path):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    profile_path = tmp_path / "profile.toml"
+    profile_path.write_text("profile = true\n")
+    profile = parity.Profile(
+        profile_path,
+        {
+            "context_length": 8,
+            "prompt_length": 4,
+            "max_output_length": 4,
+            "vocab_size": 512,
+            "max_fixture_age_hours": 24,
+        },
+    )
+    fixture = tmp_path / "fixture"
+    parity.make_fixture(
+        profile, fixture, 19, "2020-01-01T00:00:00+00:00"
+    )
+    manifest = parity.load_manifest(fixture, "glm52_policy_parity_fixture")
+    token_ids = parity.load_array(fixture, manifest, "token_ids").astype(np.int64)
+    positions = parity.load_array(fixture, manifest, "positions").astype(np.int64)
+    selected = parity.load_array(fixture, manifest, "selected_indices").astype(np.int64)
+    selected_advantages = parity.load_array(fixture, manifest, "advantages").astype(
+        np.float32
+    )
+    loss_mask = np.zeros(8, dtype=np.bool_)
+    loss_mask[selected] = True
+    advantages = np.zeros(8, dtype=np.float32)
+    advantages[selected] = selected_advantages
+    session = {
+        "schema_version": 1,
+        "side": "trainer",
+        "fixture_sha256": parity.fixture_digest(fixture),
+        "token_ids_sha256": parity._array_bytes_sha256(token_ids),
+        "model_revision": "a" * 40,
+        "adapter_sha256": "b" * 64,
+    }
+    session_path = tmp_path / "session.json"
+    session_path.write_text(json.dumps(session))
+    token_export = tmp_path / "rank_7.jsonl"
+    record = {
+        "schema_version": 1,
+        "rank": 7,
+        "token_ids": token_ids.tolist(),
+        "position_ids": positions.tolist(),
+        "loss_mask": loss_mask.tolist(),
+        "advantages": advantages.tolist(),
+    }
+    token_export.write_text(json.dumps(record) + "\n" + json.dumps(record) + "\n")
+    identity = hashlib.sha256(
+        json.dumps(session, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    diagnostic = tmp_path / "diagnostic.npz"
+    np.savez(
+        diagnostic,
+        values=np.zeros((1, 6144), dtype=np.float32),
+        name=np.asarray("layer3_router_input-rank-0-pp-0-cp-0", dtype="<U128"),
+        session_identity=np.asarray(identity, dtype="<U64"),
+        fixture_sha256=np.asarray(session["fixture_sha256"], dtype="<U64"),
+        token_ids_sha256=np.asarray(session["token_ids_sha256"], dtype="<U64"),
+        model_revision=np.asarray(session["model_revision"], dtype="<U40"),
+        adapter_sha256=np.asarray(session["adapter_sha256"], dtype="<U64"),
+    )
+    return profile, fixture, session_path, token_export, diagnostic
+
+
+def test_refresh_fixture_rebuilds_stale_fixture_from_current_export(tmp_path):
+    profile, fixture, session, export, diagnostic = _refresh_fixture_inputs(tmp_path)
+    output = tmp_path / "current-fixture"
+    diagnostic_output = tmp_path / "current-diagnostic.npz"
+    result = parity.refresh_fixture_from_trainer_export(
+        profile,
+        fixture,
+        session,
+        export,
+        diagnostic,
+        output,
+        diagnostic_output,
+        7,
+    )
+    current_manifest = parity.load_manifest(output, "glm52_policy_parity_fixture")
+    parity.check_fresh(profile, output, current_manifest)
+    assert result["source_fixture_sha256"] == parity.fixture_digest(fixture)
+    assert result["fixture_sha256"] == parity.fixture_digest(output)
+    assert result["fixture_sha256"] != result["source_fixture_sha256"]
+    assert result["records"] == 2
+    assert current_manifest["source"]["token_export_sha256"] == parity.file_sha256(
+        export
+    )
+    with np.load(diagnostic_output, allow_pickle=False) as values:
+        assert str(values["fixture_sha256"].item()) == result["fixture_sha256"]
+        assert str(values["source_fixture_sha256"].item()) == result[
+            "source_fixture_sha256"
+        ]
+
+
+def test_refresh_fixture_rejects_session_or_semantic_hash_mismatch(tmp_path):
+    profile, fixture, session, export, diagnostic = _refresh_fixture_inputs(tmp_path)
+    bad_session = json.loads(session.read_text())
+    bad_session["token_ids_sha256"] = "0" * 64
+    session.write_text(json.dumps(bad_session))
+    with pytest.raises(ValueError, match="token export hash"):
+        parity.refresh_fixture_from_trainer_export(
+            profile,
+            fixture,
+            session,
+            export,
+            diagnostic,
+            tmp_path / "bad-session",
+            tmp_path / "bad-session.npz",
+            7,
+        )
+    assert not (tmp_path / "bad-session").exists()
+    profile, fixture, session, export, diagnostic = _refresh_fixture_inputs(
+        tmp_path / "semantic"
+    )
+    records = [json.loads(line) for line in export.read_text().splitlines()]
+    for record in records:
+        record["position_ids"][3] += 1
+    export.write_text("\n".join(json.dumps(record) for record in records) + "\n")
+    with pytest.raises(ValueError, match="positions differs"):
+        parity.refresh_fixture_from_trainer_export(
+            profile,
+            fixture,
+            session,
+            export,
+            diagnostic,
+            tmp_path / "bad-position",
+            tmp_path / "bad-position.npz",
+            7,
+        )
+
+
 def test_trainer_trace_collection_accepts_layer_owners_and_rejects_wrong_owner(tmp_path):
     profile = parity.Profile(
         tmp_path / "profile.toml",

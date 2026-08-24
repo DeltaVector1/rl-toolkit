@@ -169,6 +169,171 @@ def make_fixture(
     return manifest
 
 
+def _array_bytes_sha256(value: np.ndarray) -> str:
+    return hashlib.sha256(memoryview(np.ascontiguousarray(value)).cast("B")).hexdigest()
+
+
+def refresh_fixture_from_trainer_export(
+    profile: Profile,
+    source_fixture: Path,
+    source_session_path: Path,
+    token_export: Path,
+    diagnostic_input: Path,
+    output: Path,
+    diagnostic_output: Path,
+    expected_rank: int,
+    created_utc: str | None = None,
+) -> dict[str, Any]:
+    source_manifest = load_manifest(source_fixture, "glm52_policy_parity_fixture")
+    source_fixture_sha256 = fixture_digest(source_fixture)
+    source_session = json.loads(source_session_path.read_text())
+    if (
+        source_session.get("schema_version") != schema_version
+        or source_session.get("side") != "trainer"
+        or source_session.get("fixture_sha256") != source_fixture_sha256
+    ):
+        raise ValueError("trainer session does not identify the source fixture")
+    if token_export.stat().st_size > 100_000_000 or token_export.is_symlink():
+        raise ValueError("trainer token export is too large or is a symlink")
+    records = [json.loads(line) for line in token_export.read_text().splitlines() if line]
+    if not records:
+        raise ValueError("trainer token export contains no records")
+    fields = ("token_ids", "position_ids", "loss_mask", "advantages")
+    first = records[0]
+    for record in records:
+        if record.get("schema_version") != schema_version or record.get("rank") != expected_rank:
+            raise ValueError("trainer token export provenance is invalid")
+        if any(record.get(name) != first.get(name) for name in fields):
+            raise ValueError("trainer token export contains different fixture records")
+    token_ids = np.asarray(first.get("token_ids"), dtype=np.int64)
+    positions = np.asarray(first.get("position_ids"), dtype=np.int64)
+    loss_mask = np.asarray(first.get("loss_mask"), dtype=np.bool_)
+    full_advantages = np.asarray(first.get("advantages"), dtype=np.float32)
+    length = profile.get("context_length")
+    if any(array.shape != (length,) for array in (token_ids, positions, loss_mask, full_advantages)):
+        raise ValueError("trainer token export arrays do not match the parity context")
+    selected = np.flatnonzero(loss_mask).astype(np.int64)
+    advantages = full_advantages[selected].astype(np.float32)
+    if selected.shape != (profile.get("max_output_length"),):
+        raise ValueError("trainer token export loss mask does not select the expected output")
+    source_arrays = {
+        "token_ids": load_array(source_fixture, source_manifest, "token_ids").astype(np.int64),
+        "positions": load_array(source_fixture, source_manifest, "positions").astype(np.int64),
+        "selected_indices": load_array(
+            source_fixture, source_manifest, "selected_indices"
+        ).astype(np.int64),
+        "advantages": load_array(source_fixture, source_manifest, "advantages").astype(
+            np.float32
+        ),
+    }
+    refreshed_arrays = {
+        "token_ids": token_ids,
+        "positions": positions,
+        "selected_indices": selected,
+        "advantages": advantages,
+    }
+    for name in refreshed_arrays:
+        if not np.array_equal(refreshed_arrays[name], source_arrays[name]):
+            raise ValueError(f"trainer token export {name} differs from its source fixture")
+    expected_loss_mask = np.zeros(length, dtype=np.bool_)
+    expected_loss_mask[source_arrays["selected_indices"]] = True
+    expected_full_advantages = np.zeros(length, dtype=np.float32)
+    expected_full_advantages[source_arrays["selected_indices"]] = source_arrays[
+        "advantages"
+    ]
+    if not np.array_equal(loss_mask, expected_loss_mask):
+        raise ValueError("trainer token export loss mask differs from its source fixture")
+    if not np.array_equal(full_advantages, expected_full_advantages):
+        raise ValueError("trainer token export full advantages differ from its source fixture")
+    token_ids_sha256 = _array_bytes_sha256(token_ids)
+    if source_session.get("token_ids_sha256") != token_ids_sha256:
+        raise ValueError("trainer token export hash differs from its session")
+    validate_diagnostic_file(diagnostic_input)
+    source_session_identity = hashlib.sha256(
+        json.dumps(source_session, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    with np.load(diagnostic_input, allow_pickle=False) as values:
+        diagnostic = {name: values[name] for name in values.files}
+    expected_diagnostic = {
+        "session_identity": source_session_identity,
+        "fixture_sha256": source_fixture_sha256,
+        "token_ids_sha256": token_ids_sha256,
+        "model_revision": source_session.get("model_revision"),
+        "adapter_sha256": source_session.get("adapter_sha256"),
+    }
+    for name, expected in expected_diagnostic.items():
+        value = diagnostic.get(name)
+        if value is None or str(value.item()) != expected:
+            raise ValueError(f"trainer diagnostic {name} differs from its session")
+    if output.exists() or diagnostic_output.exists():
+        raise FileExistsError("refreshed parity fixture output already exists")
+    try:
+        output.mkdir(parents=False)
+        entries: dict[str, Any] = {}
+        fixture_semantic_hashes: dict[str, str] = {}
+        for name, array in refreshed_arrays.items():
+            filename = f"{name}.npy"
+            np.save(output / filename, array, allow_pickle=False)
+            entries[name] = {
+                "file": filename,
+                "dtype": str(array.dtype),
+                "shape": list(array.shape),
+                "sha256": file_sha256(output / filename),
+            }
+            fixture_semantic_hashes[name] = _array_bytes_sha256(array)
+        export_semantic_hashes = {
+            "token_ids": token_ids_sha256,
+            "positions": _array_bytes_sha256(positions),
+            "loss_mask": _array_bytes_sha256(loss_mask),
+            "advantages": _array_bytes_sha256(full_advantages),
+        }
+        manifest = {
+            "schema_version": schema_version,
+            "kind": "glm52_policy_parity_fixture",
+            "created_utc": parse_time(created_utc).isoformat(),
+            "seed": source_manifest["seed"],
+            "profile_sha256": file_sha256(profile.path),
+            "context_length": length,
+            "prompt_length": profile.get("prompt_length"),
+            "max_output_length": profile.get("max_output_length"),
+            "source": {
+                "fixture_sha256": source_fixture_sha256,
+                "session_identity": source_session_identity,
+                "token_export_sha256": file_sha256(token_export),
+                "rank": expected_rank,
+                "fixture_semantic_sha256": fixture_semantic_hashes,
+                "export_semantic_sha256": export_semantic_hashes,
+            },
+            "arrays": entries,
+        }
+        (output / "manifest.json").write_bytes(json_bytes(manifest))
+        check_fresh(profile, output, manifest)
+        refreshed_fixture_sha256 = fixture_digest(output)
+        diagnostic["source_fixture_sha256"] = np.asarray(
+            source_fixture_sha256, dtype="<U64"
+        )
+        diagnostic["fixture_sha256"] = np.asarray(
+            refreshed_fixture_sha256, dtype="<U64"
+        )
+        with diagnostic_output.open("xb") as stream:
+            np.savez(stream, **diagnostic)
+        validate_diagnostic_file(diagnostic_output)
+    except BaseException:
+        shutil.rmtree(output, ignore_errors=True)
+        diagnostic_output.unlink(missing_ok=True)
+        raise
+    return {
+        "fixture_sha256": refreshed_fixture_sha256,
+        "source_fixture_sha256": source_fixture_sha256,
+        "token_ids_sha256": token_ids_sha256,
+        "positions_sha256": export_semantic_hashes["positions"],
+        "advantages_sha256": export_semantic_hashes["advantages"],
+        "token_export_sha256": file_sha256(token_export),
+        "records": len(records),
+        "rank": expected_rank,
+    }
+
+
 def load_manifest(path: Path, kind: str) -> dict[str, Any]:
     manifest = json.loads((path / "manifest.json").read_text())
     if manifest.get("schema_version") != schema_version or manifest.get("kind") != kind:
@@ -1189,9 +1354,26 @@ def capture_trainer(
     from prime_rl.parity_router_trace import assemble_chunks, read_session
 
     session = read_session(router_trace)
+    source = fixture_manifest.get("source")
+    session_fixture_sha256 = fixture_digest(fixture)
+    if source is not None:
+        semantic_hashes = (
+            source.get("fixture_semantic_sha256")
+            if isinstance(source, dict)
+            else None
+        )
+        if (
+            not isinstance(source, dict)
+            or not isinstance(source.get("fixture_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", source["fixture_sha256"]) is None
+            or not isinstance(semantic_hashes, dict)
+            or semantic_hashes.get("token_ids") != expected_token_hash
+        ):
+            raise ValueError("refreshed fixture trainer source provenance is invalid")
+        session_fixture_sha256 = source["fixture_sha256"]
     expected = {
         "side": "trainer",
-        "fixture_sha256": fixture_digest(fixture),
+        "fixture_sha256": session_fixture_sha256,
         "token_ids_sha256": expected_token_hash,
         "model_revision": model_revision,
         "adapter_sha256": adapter_sha256,
@@ -1649,6 +1831,15 @@ def parser() -> argparse.ArgumentParser:
     fixture.add_argument("output", type=Path)
     fixture.add_argument("--seed", type=int)
     fixture.add_argument("--created-utc")
+    refresh = commands.add_parser("refresh-fixture")
+    refresh.add_argument("--source-fixture", type=Path, required=True)
+    refresh.add_argument("--source-session", type=Path, required=True)
+    refresh.add_argument("--token-export", type=Path, required=True)
+    refresh.add_argument("--diagnostic-input", type=Path, required=True)
+    refresh.add_argument("--diagnostic-output", type=Path, required=True)
+    refresh.add_argument("--expected-rank", type=int, required=True)
+    refresh.add_argument("--created-utc")
+    refresh.add_argument("output", type=Path)
     h200 = commands.add_parser("capture-h200")
     h200.add_argument("--fixture", type=Path, required=True)
     h200.add_argument("--base-url", required=True)
@@ -1722,6 +1913,18 @@ def main(argv: list[str] | None = None) -> int:
         profile = load_profile(args.profile)
         if args.command == "fixture":
             result = make_fixture(profile, args.output, args.seed, args.created_utc)
+        elif args.command == "refresh-fixture":
+            result = refresh_fixture_from_trainer_export(
+                profile,
+                args.source_fixture,
+                args.source_session,
+                args.token_export,
+                args.diagnostic_input,
+                args.output,
+                args.diagnostic_output,
+                args.expected_rank,
+                args.created_utc,
+            )
         elif args.command == "capture-h200":
             result = capture_h200(
                 profile,
