@@ -2582,9 +2582,65 @@ raise SystemExit(99)
             return_value=(1, "Error: No such object: glm52-optims-trainer"),
         ):
             with self.assertRaisesRegex(
-                RuntimeError, "No such object: glm52-optims-trainer"
+                RuntimeError, "no active trainer container glm52-optims-trainer"
             ):
                 training_ops.current_run()
+
+    def test_trainer_inspect_shell_preserves_exact_absent_error(self):
+        captured = []
+
+        def fake_ssh(host, command, timeout=120):
+            captured.append(command)
+            return 0, _trainer_inspect_record(["RUN=glm52-7"], [])
+
+        with patch.object(training_ops, "_ssh", side_effect=fake_ssh):
+            training_ops._trainer_container_config()
+        with tempfile.TemporaryDirectory() as temporary:
+            sudo = Path(temporary) / "sudo"
+            sudo.write_text(
+                "#!/bin/sh\n"
+                "printf '%s\\n' 'Error: No such object: glm52-optims-trainer' >&2\n"
+                "exit 1\n",
+                encoding="utf-8",
+            )
+            sudo.chmod(0o755)
+            environment = os.environ.copy()
+            environment["PATH"] = f"{temporary}:{environment['PATH']}"
+            result = subprocess.run(
+                ["bash", "-c", captured[0]],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env=environment,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(
+            result.stdout.strip(), "Error: No such object: glm52-optims-trainer"
+        )
+        self.assertEqual(result.stderr, "")
+
+    def test_status_reports_no_active_run_after_stop(self):
+        absent = training_ops._TrainerContainerAbsent("trainer is absent")
+        with (
+            patch.object(
+                training_ops, "_trainer_container_config", side_effect=absent
+            ) as inspect_trainer,
+            patch.object(training_ops, "_ssh", return_value=(0, "")),
+            patch.object(training_ops, "_fan", return_value={}),
+        ):
+            result = training_ops.status(quiet=True)
+        self.assertEqual(result.run, "none")
+        self.assertFalse(result.trainer_up)
+        self.assertEqual(inspect_trainer.call_count, 1)
+
+    def test_engines_do_not_require_an_active_trainer_after_stop(self):
+        with (
+            patch.object(training_ops, "_trainer_container_config") as inspect_trainer,
+            patch.object(training_ops, "_fan", return_value={}),
+        ):
+            self.assertEqual(training_ops.engines(), {})
+        inspect_trainer.assert_not_called()
 
     def test_current_run_reports_ssh_error(self):
         with patch.object(
@@ -2713,7 +2769,7 @@ raise SystemExit(99)
             return_value=(1, "Error: No such object: glm52-optims-trainer"),
         ):
             with self.assertRaisesRegex(
-                RuntimeError, "No such object: glm52-optims-trainer"
+                RuntimeError, "no active trainer container glm52-optims-trainer"
             ):
                 training_ops._trainer_mode()
 

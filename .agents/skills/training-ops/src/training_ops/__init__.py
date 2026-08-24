@@ -347,6 +347,10 @@ class Refused(RuntimeError):
     """Raised when a call would break one of the rules in SKILL.md."""
 
 
+class _TrainerContainerAbsent(RuntimeError):
+    """Raised when the configured trainer container does not exist."""
+
+
 # ------------------------------------------------------------------ plumbing
 
 
@@ -747,13 +751,23 @@ def _trainer_container_config() -> tuple[list[str], list[str]]:
         "print(json.dumps({'run_records':[value for value in environment "
         "if value.startswith('RUN=')],'command':command},separators=(',',':')))"
     )
+    inspect_command = (
+        "inspection=$(sudo docker inspect --type container "
+        f"{shlex.quote(trainer_container)} 2>&1); status=$?; "
+        "if [ \"$status\" -ne 0 ]; then printf '%s\\n' \"$inspection\"; "
+        "exit \"$status\"; fi; printf '%s\\n' \"$inspection\""
+    )
     rc, output = _ssh(
         trainer_head,
-        "set -o pipefail; sudo docker inspect --type container "
-        f"{shlex.quote(trainer_container)} | python3 -c {shlex.quote(inspect_filter)}",
+        f"set -o pipefail; {inspect_command} | "
+        f"python3 -c {shlex.quote(inspect_filter)}",
     )
     if rc:
         detail = output.strip() or f"docker inspect returned status {rc}"
+        if rc == 1 and detail == f"Error: No such object: {trainer_container}":
+            raise _TrainerContainerAbsent(
+                f"no active trainer container {trainer_container} on {trainer_head}"
+            )
         raise RuntimeError(
             f"cannot inspect trainer container {trainer_container} on "
             f"{trainer_head}: {detail}"
@@ -1700,14 +1714,23 @@ PY
 
 def status(run: str = "", quiet: bool = False) -> Status:
     """Probe every part of the run once and return the whole picture."""
-    run = run or current_run()
+    trainer_absent = False
+    if not run:
+        try:
+            run = current_run()
+        except _TrainerContainerAbsent:
+            run = "none"
+            trainer_absent = True
     muse_run = _profile()["kind"] == "muse"
     engine_model = muse_model if muse_run else glm_model
     engine_container = muse_inference_container if muse_run else glm_inference_container
     s = Status(
         when=_dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), run=run
     )
-    trainer_only = _trainer_mode() == "trainer-only"
+    try:
+        trainer_only = not trainer_absent and _trainer_mode() == "trainer-only"
+    except _TrainerContainerAbsent:
+        trainer_only = False
 
     def node(h):
         return _ssh(h, node_probe.replace("__TRAINER__", trainer_container), timeout=60)
@@ -1995,7 +2018,6 @@ def tunnels() -> dict[int, str]:
 
 def engines(run: str = "") -> dict[str, EngineState]:
     """Probe every configured inference host with a real completion."""
-    run = run or current_run()
     muse_run = _profile()["kind"] == "muse"
     engine_model = muse_model if muse_run else glm_model
     engine_container = muse_inference_container if muse_run else glm_inference_container
