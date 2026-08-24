@@ -1363,6 +1363,30 @@ raise SystemExit(99)
                         "n82", training_ops.glm_parity_paths["trainer_stage"], Path(temporary)
                     )
 
+    def test_parity_stage_copy_uses_ssh_compression_and_safe_options(self):
+        copied = subprocess.CompletedProcess([], 0, "", "")
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            training_ops.subprocess, "run", return_value=copied
+        ) as run:
+            training_ops._copy_glm_parity_stage(
+                "n82",
+                training_ops.glm_parity_paths["trainer_stage"],
+                Path(temporary),
+            )
+        command = run.call_args.args[0]
+        self.assertEqual(command[:6], ["scp", "-C", "-q", "-o", "BatchMode=yes", "-r"])
+        self.assertEqual(run.call_args.kwargs["timeout"], 600)
+        source = Path(training_ops.__file__).read_text()
+        install = source[source.index("def install(host: str)"):]
+        copy = install[install.index("copied_to_host = subprocess.run"):]
+        self.assertIn(
+            '"scp",\n                            "-C",\n                            "-q",',
+            copy,
+        )
+        self.assertIn('"BatchMode=yes",\n                            "-r",', copy)
+        self.assertLess(copy.index('"-C"'), copy.index('f"{local_stage}/."'))
+        self.assertIn("timeout=600", copy)
+
     def test_parity_stage_create_ack_loss_still_runs_cleanup(self):
         source = Path(training_ops.__file__).read_text()
         method = source[source.index("def stage_glm52_policy_parity"):]

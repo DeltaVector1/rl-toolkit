@@ -8394,6 +8394,7 @@ def _copy_glm_parity_stage(host: str, stage: str, local_parent: Path) -> Path:
         copied = subprocess.run(
             [
                 "scp",
+                "-C",
                 "-q",
                 "-o",
                 "BatchMode=yes",
@@ -8743,6 +8744,7 @@ def stage_glm52_policy_parity(nodes: list[str] | None = None) -> None:
                     copied_to_host = subprocess.run(
                         [
                             "scp",
+                            "-C",
                             "-q",
                             "-o",
                             "BatchMode=yes",
