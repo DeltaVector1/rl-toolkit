@@ -3259,7 +3259,7 @@ def _resolve_glm52_parity_diagnostic_source(
             raise Refused(f"trainer parity provenance is invalid on {host}")
         return value
 
-    evidence = _fan(trainer_hosts, read_host, workers=min(8, len(trainer_hosts)))
+    evidence = {host: read_host(host) for host in trainer_hosts}
     records: list[dict[str, object]] = []
     sessions: list[dict[str, object]] = []
     module_sets: list[object] = []

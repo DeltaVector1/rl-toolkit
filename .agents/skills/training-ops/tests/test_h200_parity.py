@@ -4,6 +4,8 @@ import os
 import shlex
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -248,11 +250,23 @@ class H200ParityTest(unittest.TestCase):
             "adapter_sha256": "b" * 64,
         }
         queried = []
+        active = 0
+        maximum_active = 0
+        lock = threading.Lock()
 
         def remote(host, command, label, timeout=120):
+            nonlocal active, maximum_active
             del command, label, timeout
-            queried.append(host)
-            return self._source_evidence(host, pp_by_host[host], session)
+            with lock:
+                queried.append(host)
+                active += 1
+                maximum_active = max(maximum_active, active)
+            time.sleep(0.005)
+            try:
+                return self._source_evidence(host, pp_by_host[host], session)
+            finally:
+                with lock:
+                    active -= 1
 
         with patch.object(training_ops, "trainer_hosts", hosts), patch.object(
             training_ops, "trainer_head", "n82"
@@ -269,7 +283,40 @@ class H200ParityTest(unittest.TestCase):
             f"{training_ops.parity_trace_root}/qualification-1",
         )
         self.assertEqual(source_session, session)
-        self.assertEqual(set(queried), set(hosts))
+        self.assertEqual(queried, hosts)
+        self.assertEqual(maximum_active, 1)
+
+    def test_provenance_timeout_stops_serial_read_before_h200(self):
+        hosts = ["n76", "n77", "n78", "n80", "n82", "n83", "n84", "n85"]
+        session = {
+            "side": "trainer",
+            "model_revision": "a" * 40,
+            "adapter_sha256": "b" * 64,
+        }
+        queried = []
+
+        def remote(host, command, label, timeout=120):
+            del command, label, timeout
+            queried.append(host)
+            if host == "n76":
+                raise RuntimeError("banner exchange timed out")
+            return self._source_evidence(host, queried.index(host), session)
+
+        with patch.object(training_ops, "trainer_hosts", hosts), patch.object(
+            training_ops, "trainer_head", "n82"
+        ), patch.object(
+            training_ops, "_remote_ok", side_effect=remote
+        ), patch.object(
+            training_ops,
+            "_diagnostic_capture_preflight",
+            return_value={"files": 20, "estimated_bytes": 1},
+        ), patch.object(training_ops, "_ssh") as h200, self.assertRaisesRegex(
+            RuntimeError, "banner exchange timed out"
+        ):
+            training_ops.diagnose_glm52_policy_parity("qualification-1")
+
+        self.assertEqual(queried, hosts[:1])
+        h200.assert_not_called()
 
     def test_diagnostic_source_refuses_missing_or_duplicate_pp0(self):
         hosts = ["n76", "n77", "n78", "n80", "n82", "n83", "n84", "n85"]
