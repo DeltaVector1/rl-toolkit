@@ -711,19 +711,87 @@ def _head_script() -> str:
     )
 
 
+def _trainer_container_config() -> tuple[list[str], list[str]]:
+    inspect_filter = (
+        "import json,sys; records=json.load(sys.stdin); "
+        "valid=isinstance(records,list) and len(records)==1 and "
+        "isinstance(records[0],dict) and isinstance(records[0].get('Config'),dict); "
+        "config=records[0]['Config'] if valid else {}; "
+        "environment=config.get('Env'); command=config.get('Cmd'); "
+        "valid=valid and isinstance(environment,list) and "
+        "all(isinstance(value,str) for value in environment) and "
+        "isinstance(command,list) and all(isinstance(value,str) for value in command); "
+        "valid or sys.exit('trainer inspection is invalid'); "
+        "print(json.dumps({'run_records':[value for value in environment "
+        "if value.startswith('RUN=')],'command':command},separators=(',',':')))"
+    )
+    rc, output = _ssh(
+        trainer_head,
+        "set -o pipefail; sudo docker inspect --type container "
+        f"{shlex.quote(trainer_container)} | python3 -c {shlex.quote(inspect_filter)}",
+    )
+    if rc:
+        detail = output.strip() or f"docker inspect returned status {rc}"
+        raise RuntimeError(
+            f"cannot inspect trainer container {trainer_container} on "
+            f"{trainer_head}: {detail}"
+        )
+    try:
+        record = json.loads(output)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            f"trainer container {trainer_container} returned invalid configuration"
+        ) from error
+    if (
+        not isinstance(record, dict)
+        or set(record) != {"run_records", "command"}
+        or not isinstance(record["run_records"], list)
+        or not all(isinstance(value, str) for value in record["run_records"])
+        or not isinstance(record["command"], list)
+        or not all(isinstance(value, str) for value in record["command"])
+    ):
+        raise RuntimeError(
+            f"trainer container {trainer_container} returned invalid configuration"
+        )
+    return record["run_records"], record["command"]
+
+
 def _trainer_mode() -> str:
     """Return `trainer-only` when the active trainer uses `[data.fake]`."""
+    _, command = _trainer_container_config()
+    markers = [index for index, value in enumerate(command) if value == "@"]
+    config_paths = [value for value in command if value.endswith(".toml")]
+    if (
+        len(markers) != 1
+        or markers[0] + 1 >= len(command)
+        or len(config_paths) != 1
+        or command[markers[0] + 1] != config_paths[0]
+    ):
+        raise RuntimeError(
+            f"trainer container {trainer_container} must have one TOML config"
+        )
+    config = PurePosixPath(config_paths[0])
+    config_root = PurePosixPath(remote_repo) / "configs"
+    if (
+        not config.is_absolute()
+        or ".." in config.parts
+        or config_root not in config.parents
+        or config.suffix != ".toml"
+        or str(config) != config_paths[0]
+    ):
+        raise RuntimeError(
+            f"trainer container {trainer_container} has an unapproved TOML config"
+        )
     rc, out = _ssh(
         trainer_head,
-        f"cfg=$(sudo docker inspect {trainer_container} --format "
-        "'{{range .Config.Cmd}}{{println .}}{{end}}' 2>/dev/null | "
-        "grep -E '\\.toml$' | tail -1); "
-        "if [ -n \"$cfg\" ] && grep -q '^\\[data\\.fake\\]' \"$cfg\" 2>/dev/null; "
-        "then echo trainer-only; else echo rl; fi",
+        f"if grep -q '^\\[data\\.fake\\]' -- {shlex.quote(str(config))}; then "
+        "printf '%s\\n' trainer-only; "
+        "else status=$?; if [ \"$status\" -eq 1 ]; then printf '%s\\n' rl; "
+        "else exit \"$status\"; fi; fi",
     )
     if rc != 0 or not out.strip():
         raise RuntimeError(f"cannot read trainer mode on {trainer_head}: {out.strip()}")
-    mode = out.strip().splitlines()[-1]
+    mode = out.strip()
     if mode not in {"trainer-only", "rl"}:
         raise RuntimeError(f"trainer returned an invalid mode: {mode!r}")
     return mode
@@ -1838,22 +1906,47 @@ def _warnings(s: Status) -> list[str]:
 
 def current_run() -> str:
     """The run name the trainer container was started with."""
-    rc, out = _ssh(
-        trainer_head,
-        f"sudo docker inspect {trainer_container} --format '{{{{range .Config.Env}}}}{{{{println .}}}}{{{{end}}}}' 2>/dev/null | grep -E '^RUN='",
-    )
-    m = re.search(r"^RUN=(\S+)", out, re.M)
-    if m:
-        return m.group(1)
-    rc, command = _ssh(
-        trainer_head,
-        f"sudo docker inspect {trainer_container} --format '{{{{range .Config.Cmd}}}}{{{{println .}}}}{{{{end}}}}' 2>/dev/null",
-    )
-    m = re.search(rf"^--log-dir={re.escape(run_root)}/([^/]+)/", command, re.M)
-    if m:
-        return m.group(1)
-    detail = command.strip() or out.strip() or f"container {trainer_container} has no run path"
-    raise RuntimeError(f"cannot identify the active run on {trainer_head}: {detail}")
+    run_records, command = _trainer_container_config()
+    run_names = [value.removeprefix("RUN=") for value in run_records]
+    if len(run_names) > 1:
+        raise RuntimeError(f"trainer container {trainer_container} has conflicting RUN records")
+    for value in run_names:
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", value):
+            raise RuntimeError(f"trainer container {trainer_container} has an invalid RUN record")
+
+    log_prefix = f"--log-dir={run_root}/"
+    log_arguments = [value for value in command if value.startswith("--log-dir=")]
+    if len(log_arguments) > 1:
+        raise RuntimeError(
+            f"trainer container {trainer_container} has conflicting log directories"
+        )
+    command_runs: list[str] = []
+    for value in log_arguments:
+        if not value.startswith(log_prefix):
+            raise RuntimeError(
+                f"trainer container {trainer_container} has an invalid log directory"
+            )
+        relative_text = value.removeprefix(log_prefix)
+        relative = PurePosixPath(relative_text)
+        if (
+            str(relative) != relative_text
+            or ".." in relative.parts
+            or len(relative.parts) < 2
+            or not re.fullmatch(r"[A-Za-z0-9_-]+", relative.parts[0])
+        ):
+            raise RuntimeError(
+                f"trainer container {trainer_container} has an invalid log directory"
+            )
+        command_runs.append(relative.parts[0])
+
+    recorded = run_names + command_runs
+    if not recorded:
+        raise RuntimeError(
+            f"trainer container {trainer_container} has no valid run metadata"
+        )
+    if len(set(recorded)) != 1:
+        raise RuntimeError(f"trainer container {trainer_container} has conflicting run records")
+    return recorded[0]
 
 
 def tunnels() -> dict[int, str]:

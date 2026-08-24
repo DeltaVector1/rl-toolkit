@@ -14,6 +14,10 @@ from unittest.mock import patch
 import training_ops
 
 
+def _trainer_inspect_record(run_records, command):
+    return json.dumps({"run_records": run_records, "command": command})
+
+
 class EdgeOperationsTest(unittest.TestCase):
     def test_status_parser_keeps_metric_names_with_digits(self):
         self.assertEqual(training_ops._kv("FAILS5M 3\n"), {"FAILS5M": "3"})
@@ -1263,13 +1267,219 @@ raise SystemExit(3)
             launch,
         )
 
-    def test_current_run_uses_trainer_log_path_when_run_env_is_absent(self):
-        command = (
-            "--role=trainer\n"
-            "--log-dir=/data/glm52-rl/runs/muse19/run_muse19/logs/trainer/torchrun\n"
+    def test_current_run_reports_absent_container(self):
+        with patch.object(
+            training_ops,
+            "_ssh",
+            return_value=(1, "Error: No such object: glm52-optims-trainer"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "No such object: glm52-optims-trainer"
+            ):
+                training_ops.current_run()
+
+    def test_current_run_reports_ssh_error(self):
+        with patch.object(
+            training_ops,
+            "_ssh",
+            return_value=(255, "ssh: connect to host n82: Connection timed out"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Connection timed out"):
+                training_ops.current_run()
+
+    def test_current_run_uses_valid_run_record(self):
+        record = _trainer_inspect_record(
+            ["RUN=glm52-7"],
+            [
+                "--role=trainer",
+                "--log-dir=/data/glm52-rl/runs/glm52-7/run_glm52-7/logs/trainer/torchrun",
+            ],
         )
-        with patch.object(training_ops, "_ssh", side_effect=[(1, ""), (0, command)]):
+        with patch.object(training_ops, "_ssh", return_value=(0, record)) as ssh:
+            self.assertEqual(training_ops.current_run(), "glm52-7")
+        self.assertEqual(ssh.call_count, 1)
+        self.assertIn("docker inspect --type container", ssh.call_args.args[1])
+        self.assertNotIn("2>/dev/null", ssh.call_args.args[1])
+
+    def test_trainer_inspect_filters_other_environment_values_remotely(self):
+        captured = []
+
+        def fake_ssh(host, command, timeout=120):
+            captured.append(command)
+            return 0, _trainer_inspect_record(["RUN=glm52-7"], [])
+
+        with patch.object(training_ops, "_ssh", side_effect=fake_ssh):
+            training_ops._trainer_container_config()
+        secret = "SECRET=must-not-cross-ssh"
+        payload = json.dumps(
+            [
+                {
+                    "Config": {
+                        "Env": ["RUN=glm52-7", secret],
+                        "Cmd": ["--role=trainer"],
+                    }
+                }
+            ]
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            sudo = Path(temporary) / "sudo"
+            sudo.write_text(
+                "#!/usr/bin/env python3\n"
+                f"print({payload!r})\n",
+                encoding="utf-8",
+            )
+            sudo.chmod(0o755)
+            environment = os.environ.copy()
+            environment["PATH"] = f"{temporary}:{environment['PATH']}"
+            result = subprocess.run(
+                ["bash", "-c", captured[0]],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env=environment,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn(secret, captured[0])
+        self.assertNotIn(secret, result.stdout)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {"run_records": ["RUN=glm52-7"], "command": ["--role=trainer"]},
+        )
+
+    def test_current_run_uses_trainer_log_path_when_run_env_is_absent(self):
+        record = _trainer_inspect_record(
+            [],
+            [
+                "--role=trainer",
+                "--log-dir=/data/glm52-rl/runs/muse19/run_muse19/logs/trainer/torchrun",
+            ],
+        )
+        with patch.object(training_ops, "_ssh", return_value=(0, record)):
             self.assertEqual(training_ops.current_run(), "muse19")
+
+    def test_current_run_rejects_conflicting_records(self):
+        records = (
+            _trainer_inspect_record(["RUN=glm52-7", "RUN=glm52-8"], []),
+            _trainer_inspect_record(
+                ["RUN=glm52-7"],
+                ["--log-dir=/data/glm52-rl/runs/glm52-8/run_glm52-8/logs"]
+            ),
+            _trainer_inspect_record(
+                [],
+                [
+                    "--log-dir=/data/glm52-rl/runs/glm52-7/logs",
+                    "--log-dir=/data/glm52-rl/runs/glm52-8/logs",
+                ],
+            ),
+        )
+        for record in records:
+            with self.subTest(record=record), patch.object(
+                training_ops, "_ssh", return_value=(0, record)
+            ):
+                with self.assertRaisesRegex(RuntimeError, "conflicting"):
+                    training_ops.current_run()
+
+    def test_current_run_rejects_invalid_records(self):
+        records = (
+            "not-json",
+            json.dumps({"RUN": "glm52-7"}),
+            _trainer_inspect_record(["RUN=../glm52-7"], []),
+            _trainer_inspect_record([], ["--log-dir=/tmp/glm52-7/logs"]),
+            _trainer_inspect_record(
+                [],
+                ["--log-dir=/data/glm52-rl/runs/glm52-7/../glm52-8/logs"]
+            ),
+            _trainer_inspect_record([], []),
+        )
+        for record in records:
+            with self.subTest(record=record), patch.object(
+                training_ops, "_ssh", return_value=(0, record)
+            ):
+                with self.assertRaises(RuntimeError):
+                    training_ops.current_run()
+
+    def test_trainer_mode_reports_absent_container(self):
+        with patch.object(
+            training_ops,
+            "_ssh",
+            return_value=(1, "Error: No such object: glm52-optims-trainer"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "No such object: glm52-optims-trainer"
+            ):
+                training_ops._trainer_mode()
+
+    def test_trainer_mode_reports_inspect_ssh_error(self):
+        with patch.object(
+            training_ops,
+            "_ssh",
+            return_value=(255, "ssh: connect to host n82: Connection timed out"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Connection timed out"):
+                training_ops._trainer_mode()
+
+    def test_trainer_mode_reads_the_inspected_config(self):
+        config = (
+            "/data/glm52-rl/deployment-glm52-optims/"
+            "configs/qualification/trainer.toml"
+        )
+        record = _trainer_inspect_record(
+            [],
+            ["-m", "prime_rl.trainer.rl.train", "@", config]
+        )
+        with patch.object(
+            training_ops,
+            "_ssh",
+            side_effect=[(0, record), (0, "trainer-only\n")],
+        ) as ssh:
+            self.assertEqual(training_ops._trainer_mode(), "trainer-only")
+        self.assertEqual(ssh.call_count, 2)
+        self.assertIn(
+            f"grep -q '^\\[data\\.fake\\]' -- {config}",
+            ssh.call_args_list[1].args[1],
+        )
+
+    def test_trainer_mode_rejects_invalid_or_conflicting_configs(self):
+        commands = (
+            [],
+            [
+                "/data/glm52-rl/deployment-glm52-optims/configs/first.toml",
+                "/data/glm52-rl/deployment-glm52-optims/configs/second.toml",
+            ],
+        )
+        for command in commands:
+            record = _trainer_inspect_record([], command)
+            with self.subTest(command=command), patch.object(
+                training_ops, "_ssh", return_value=(0, record)
+            ) as ssh:
+                with self.assertRaisesRegex(RuntimeError, "one TOML config"):
+                    training_ops._trainer_mode()
+                self.assertEqual(ssh.call_count, 1)
+
+    def test_trainer_mode_rejects_malformed_environment_or_command(self):
+        records = (
+            json.dumps({"run_records": {"RUN": "glm52-7"}, "command": []}),
+            _trainer_inspect_record(
+                [],
+                [
+                    "/data/glm52-rl/deployment-glm52-optims/"
+                    "configs/qualification/trainer.toml"
+                ],
+            ),
+            _trainer_inspect_record([], ["relative/trainer.toml"]),
+            _trainer_inspect_record(
+                [],
+                ["/data/glm52-rl/deployment-glm52-optims/configs/../bad.toml"],
+            ),
+            _trainer_inspect_record([], ["/tmp/trainer.toml"]),
+        )
+        for record in records:
+            with self.subTest(record=record), patch.object(
+                training_ops, "_ssh", return_value=(0, record)
+            ) as ssh:
+                with self.assertRaises(RuntimeError):
+                    training_ops._trainer_mode()
+                self.assertEqual(ssh.call_count, 1)
 
     def test_start_uses_edge_launcher_and_never_starts_china_orchestrator(self):
         calls = []
