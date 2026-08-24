@@ -1,4 +1,5 @@
 import base64
+import contextlib
 import hashlib
 import importlib.util
 import json
@@ -343,7 +344,15 @@ def test_route_output_scale_is_applied_after_selected_weights_on_both_paths():
 def test_trainer_stage_uses_validated_h200_capture(monkeypatch, tmp_path):
     profile_path = tmp_path / "profile.toml"
     profile_path.write_text("router_scale = 2.5\n")
-    profile = parity.Profile(profile_path, {"router_scale": 2.5})
+    profile = parity.Profile(
+        profile_path,
+        {
+            "router_scale": 2.5,
+            "dense_layers": 1,
+            "experts": 4,
+            "trainer_image": "trainer-image",
+        },
+    )
     fixture = tmp_path / "fixture"
     capture = tmp_path / "h200-capture-final"
     fixture.mkdir()
@@ -358,6 +367,13 @@ def test_trainer_stage_uses_validated_h200_capture(monkeypatch, tmp_path):
         "router_weight_provenance": (
             "selected_weights_before_route_output_scale"
         ),
+        "model_revision": "1" * 40,
+        "adapter_sha256": "2" * 64,
+        "image": "h200-image",
+        "arrays": {
+            "router_ids": {"sha256": "4" * 64},
+            "full_logprobs": {"sha256": "5" * 64},
+        },
     }
 
     def load_manifest(path, kind):
@@ -369,15 +385,46 @@ def test_trainer_stage_uses_validated_h200_capture(monkeypatch, tmp_path):
         return capture_manifest
 
     def make_reference(_profile, _fixture, _capture, path):
-        path.write_text("{}\n")
-        return {}
+        path.write_text(
+            json.dumps(
+                {
+                    "fixture_sha256": "f" * 64,
+                    "profile_sha256": parity.file_sha256(profile_path),
+                    "model_revision": "1" * 40,
+                    "adapter_sha256": "2" * 64,
+                    "image": "h200-image",
+                    "h200_capture_manifest_sha256": "6" * 64,
+                    "capture_router_ids_sha256": "4" * 64,
+                    "capture_full_logprobs_sha256": "5" * 64,
+                }
+            )
+            + "\n"
+        )
+        return {
+            "routed_experts_shape": [2, 2, 2],
+            "routed_experts_sha256": "a" * 64,
+            "capture_router_ids_sha256": "4" * 64,
+            "capture_full_logprobs_sha256": "5" * 64,
+        }
 
     def make_trace(_profile, _fixture, _capture, path):
         path.mkdir()
-        (path / "session.json").write_text("{}\n")
-        return {}
+        result = {
+            "fixture_sha256": "f" * 64,
+            "token_ids_sha256": "3" * 64,
+            "model_revision": "1" * 40,
+            "adapter_sha256": "2" * 64,
+            "image": "trainer-image",
+        }
+        (path / "session.json").write_text(json.dumps(result) + "\n")
+        return result
 
     monkeypatch.setattr(parity, "load_manifest", load_manifest)
+    monkeypatch.setattr(
+        parity,
+        "load_h200_capture_manifest",
+        lambda _path: (capture_manifest, "6" * 64),
+    )
     monkeypatch.setattr(parity, "check_fresh", lambda *_args: None)
     monkeypatch.setattr(parity, "validate_h200_capture_sources", lambda *_args: None)
     monkeypatch.setattr(parity, "fixture_digest", lambda _path: "f" * 64)
@@ -390,6 +437,29 @@ def test_trainer_stage_uses_validated_h200_capture(monkeypatch, tmp_path):
     assert manifest["router_weight_provenance"] == (
         "selected_weights_before_route_output_scale"
     )
+    assert manifest["source_sha256"] == parity.file_sha256(
+        Path(parity.__file__).resolve()
+    )
+    assert manifest["reference_schema"] == {
+        "schema_version": 1,
+        "encoding": "base64",
+        "dtype": "uint8",
+        "shape": [2, 2, 2],
+        "dense_layers": 1,
+        "experts": 4,
+        "sha256": "4" * 64,
+        "routed_experts_sha256": "a" * 64,
+        "full_logprobs_sha256": "5" * 64,
+    }
+    assert manifest["identity"] == {
+        "fixture_sha256": "f" * 64,
+        "profile_sha256": parity.file_sha256(profile_path),
+        "model_revision": "1" * 40,
+        "adapter_sha256": "2" * 64,
+        "h200_image": "h200-image",
+        "trainer_image": "trainer-image",
+        "token_ids_sha256": "3" * 64,
+    }
     assert set(manifest["files"]) == {
         "trainer-reference.json",
         "trainer-router-trace/session.json",
@@ -430,6 +500,10 @@ def test_trainer_reference_contains_validated_h200_routes(monkeypatch, tmp_path)
         "model_revision": "a" * 40,
         "adapter_sha256": "b" * 64,
         "image": "image",
+        "arrays": {
+            "router_ids": {"sha256": "c" * 64},
+            "full_logprobs": {"sha256": "d" * 64},
+        },
     }
 
     def load_manifest(path, kind):
@@ -441,6 +515,19 @@ def test_trainer_reference_contains_validated_h200_routes(monkeypatch, tmp_path)
         return capture_manifest
 
     monkeypatch.setattr(parity, "load_manifest", load_manifest)
+    @contextlib.contextmanager
+    def capture_snapshot(_path, selected_arrays=None):
+        assert selected_arrays == {"full_logprobs", "router_ids"}
+        yield (
+            capture_manifest,
+            "e" * 64,
+            {
+                "full_logprobs": arrays["full_logprobs"],
+                "router_ids": arrays["router_ids"],
+            },
+        )
+
+    monkeypatch.setattr(parity, "open_h200_capture_snapshot", capture_snapshot)
     monkeypatch.setattr(parity, "check_fresh", lambda *_args: None)
     monkeypatch.setattr(parity, "validate_h200_capture_sources", lambda *_args: None)
     monkeypatch.setattr(parity, "fixture_digest", lambda _path: "f" * 64)
@@ -459,6 +546,136 @@ def test_trainer_reference_contains_validated_h200_routes(monkeypatch, tmp_path)
     assert np.frombuffer(decoded, dtype=np.uint8).reshape(2, 2, 2).tolist() == routes.tolist()
 
 
+def test_h200_capture_snapshot_reads_arrays_from_pinned_directory_fd(
+    monkeypatch, tmp_path
+):
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    names = {
+        "full_logprobs",
+        "selected_logprobs",
+        "eager_full_logprobs",
+        "eager_selected_logprobs",
+        "router_ids",
+        "router_weights",
+    }
+    arrays = {}
+    for index, name in enumerate(sorted(names)):
+        values = np.asarray([index, index + 1], dtype=np.int64)
+        path = capture / f"{name}.npy"
+        np.save(path, values, allow_pickle=False)
+        arrays[name] = {
+            "file": path.name,
+            "sha256": parity.file_sha256(path),
+        }
+    manifest = {
+        "schema_version": 1,
+        "kind": "glm52_policy_parity_h200_capture",
+        "arrays": arrays,
+    }
+    (capture / "manifest.json").write_bytes(parity.json_bytes(manifest))
+    alternate = capture / "alternate-router-ids.npy"
+    np.save(alternate, np.asarray([99, 100], dtype=np.int64), allow_pickle=False)
+    original_open = parity.open_regular_at
+    swapped = False
+
+    def swap_and_restore(directory_descriptor, name):
+        nonlocal swapped
+        descriptor = original_open(directory_descriptor, name)
+        if name == "router_ids.npy" and not swapped:
+            original = capture / name
+            retained = capture / "retained-router-ids.npy"
+            original.rename(retained)
+            alternate.rename(original)
+            original.rename(alternate)
+            retained.rename(original)
+            swapped = True
+        return descriptor
+
+    monkeypatch.setattr(parity, "open_regular_at", swap_and_restore)
+    monkeypatch.setattr(
+        parity, "validate_retained_h200_diagnostics_fd", lambda *_args: None
+    )
+    with parity.open_h200_capture_snapshot(capture, {"router_ids"}) as (
+        _manifest,
+        _manifest_sha256,
+        loaded,
+    ):
+        expected = np.load(capture / "router_ids.npy", allow_pickle=False)
+        assert np.array_equal(loaded["router_ids"], expected)
+    assert swapped
+
+
+def test_trainer_stage_rejects_same_identity_capture_with_other_routes(
+    monkeypatch, tmp_path
+):
+    profile_path = tmp_path / "profile.toml"
+    profile_path.write_text("profile = true\n")
+    profile = parity.Profile(
+        profile_path,
+        {"trainer_image": "trainer", "dense_layers": 1, "experts": 4},
+    )
+    fixture = tmp_path / "fixture"
+    capture = tmp_path / "capture"
+    output = tmp_path / "stage"
+    fixture.mkdir()
+    capture.mkdir()
+    output.mkdir()
+    common = {
+        "fixture_sha256": "f" * 64,
+        "profile_sha256": parity.file_sha256(profile_path),
+        "model_revision": "1" * 40,
+        "adapter_sha256": "2" * 64,
+        "image": "h200",
+        "route_output_scale": 2.5,
+        "router_weight_provenance": "selected_weights_before_route_output_scale",
+    }
+    first = {
+        **common,
+        "arrays": {
+            "router_ids": {"sha256": "3" * 64},
+            "full_logprobs": {"sha256": "4" * 64},
+        },
+    }
+    second = {
+        **common,
+        "arrays": {
+            "router_ids": {"sha256": "5" * 64},
+            "full_logprobs": {"sha256": "4" * 64},
+        },
+    }
+    captures = iter(((first, "6" * 64), (second, "7" * 64)))
+    monkeypatch.setattr(
+        parity, "load_h200_capture_manifest", lambda _path: next(captures)
+    )
+    monkeypatch.setattr(
+        parity,
+        "load_manifest",
+        lambda _path, kind: (
+            {"created_utc": "2026-08-23T00:00:00+00:00"}
+            if kind == "glm52_policy_parity_fixture"
+            else first
+        ),
+    )
+    monkeypatch.setattr(parity, "check_fresh", lambda *_args: None)
+    monkeypatch.setattr(parity, "validate_h200_capture_sources", lambda *_args: None)
+    monkeypatch.setattr(parity, "fixture_digest", lambda _path: "f" * 64)
+
+    def reference(_profile, _fixture, _capture, path):
+        path.write_text("{}\n")
+        return {}
+
+    def trace(_profile, _fixture, _capture, path):
+        path.mkdir()
+        (path / "session.json").write_text("{}\n")
+        return {}
+
+    monkeypatch.setattr(parity, "make_trainer_reference", reference)
+    monkeypatch.setattr(parity, "prepare_trainer_router_trace", trace)
+    with pytest.raises(ValueError, match="capture changed"):
+        parity.stage_trainer_artifacts(profile, fixture, capture, output)
+
+
 def test_trainer_stage_requires_exact_operations_paths(tmp_path):
     operations = tmp_path / "operations.toml"
     operations.write_text(
@@ -473,6 +690,19 @@ def test_trainer_stage_requires_exact_operations_paths(tmp_path):
         Path("/data/parity/h200-capture-final"),
         Path("/data/parity/trainer-stage-final"),
     )
+    parity.validate_stage_paths(
+        operations,
+        Path("/data/parity/fixture"),
+        Path("/data/parity/h200-capture-final"),
+        Path("/data/parity/.stage-candidates/trainer-stage-candidate-0123456789abcdef"),
+    )
+    parity.validate_stage_paths(
+        operations,
+        Path("/data/parity/fixture"),
+        Path("/data/parity/h200-capture-final"),
+        Path("/stage"),
+        Path("/data/parity/.stage-candidates/trainer-stage-candidate-0123456789abcdef"),
+    )
     with pytest.raises(ValueError, match="differ from operations"):
         parity.validate_stage_paths(
             operations,
@@ -480,6 +710,73 @@ def test_trainer_stage_requires_exact_operations_paths(tmp_path):
             Path("/data/parity/h200-capture-final"),
             Path("/data/parity/trainer-stage-final"),
         )
+    with pytest.raises(ValueError, match="differ from operations"):
+        parity.validate_stage_paths(
+            operations,
+            Path("/data/parity/fixture"),
+            Path("/data/parity/h200-capture-final"),
+            Path("/data/parity/trainer-stage-candidate-0123456789abcdef"),
+        )
+    with pytest.raises(ValueError, match="differ from operations"):
+        parity.validate_stage_paths(
+            operations,
+            Path("/data/parity/fixture"),
+            Path("/data/parity/h200-capture-final"),
+            Path("/tmp/trainer-stage-candidate-0123456789abcdef"),
+        )
+
+
+def test_stage_trainer_cli_passes_exact_host_output(monkeypatch, tmp_path):
+    operations = tmp_path / "operations.toml"
+    profile_path = tmp_path / "profile.toml"
+    profile_path.write_text("profile = true\n")
+    candidate = Path(
+        "/data/glm52-rl/qualifications/glm52-policy-parity/"
+        ".stage-candidates/trainer-stage-candidate-0123456789abcdef"
+    )
+    calls = []
+    monkeypatch.setattr(
+        parity,
+        "load_profile",
+        lambda _path: parity.Profile(profile_path, {}),
+    )
+
+    def validate(*args):
+        calls.append(args)
+
+    monkeypatch.setattr(parity, "validate_stage_paths", validate)
+    monkeypatch.setattr(
+        parity, "stage_trainer_artifacts", lambda *_args: {"status": "ok"}
+    )
+    result = parity.main(
+        [
+            "--profile",
+            str(profile_path),
+            "stage-trainer",
+            "--operations",
+            str(operations),
+            "--fixture",
+            "/data/glm52-rl/qualifications/glm52-policy-parity/fixture",
+            "--h200-capture",
+            "/data/glm52-rl/qualifications/glm52-policy-parity/h200-capture-final",
+            "--host-output",
+            str(candidate),
+            "/stage",
+        ]
+    )
+    assert result == 0
+    assert calls == [
+        (
+            operations,
+            Path("/data/glm52-rl/qualifications/glm52-policy-parity/fixture"),
+            Path(
+                "/data/glm52-rl/qualifications/glm52-policy-parity/"
+                "h200-capture-final"
+            ),
+            Path("/stage"),
+            candidate,
+        )
+    ]
 
 
 def _refresh_fixture_inputs(tmp_path):
@@ -583,7 +880,9 @@ def test_refresh_fixture_rejects_session_or_semantic_hash_mismatch(tmp_path):
     bad_session = json.loads(session.read_text())
     bad_session["token_ids_sha256"] = "0" * 64
     session.write_text(json.dumps(bad_session))
-    with pytest.raises(ValueError, match="token export hash"):
+    with pytest.raises(
+        ValueError, match="trainer session does not identify the source fixture"
+    ):
         parity.refresh_fixture_from_trainer_export(
             profile,
             fixture,

@@ -1,5 +1,8 @@
+import base64
 import hashlib
 import json
+import os
+import struct
 import subprocess
 import threading
 import tempfile
@@ -281,20 +284,81 @@ class EdgeOperationsTest(unittest.TestCase):
                         )
 
     def test_policy_parity_stage_validation_is_fail_closed(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            tempfile.TemporaryDirectory() as repository,
+        ):
+            root = Path(repository)
+            profile = root / "configs/qualification/glm52-policy-parity.toml"
+            profile.parent.mkdir(parents=True)
+            profile.write_text(
+                "context_length = 2\n"
+                "hidden_layers = 2\n"
+                "dense_layers = 1\n"
+                "experts_per_token = 2\n"
+                "experts = 4\n"
+                "router_scale = 2.5\n"
+                "max_router_weight_sum_error = 0.005\n"
+                'trainer_image = "trainer-image"\n'
+            )
+            source = root / "scripts/glm52_policy_parity.py"
+            source.parent.mkdir()
+            source.write_text("source\n")
             stage = Path(temporary)
+            stage.chmod(0o750)
             reference = stage / "trainer-reference.json"
             session = stage / "trainer-router-trace/session.json"
             session.parent.mkdir()
-            reference.write_text("{}\n")
-            session.write_text("{}\n")
-            profile = (
-                training_ops.repo_root
-                / "configs/qualification/glm52-policy-parity.toml"
-            )
+            session.parent.chmod(0o755)
+            route_bytes = bytes((0, 0, 0, 1, 0, 0, 2, 3))
+            routed = {
+                "schema_version": 1,
+                "encoding": "base64",
+                "dtype": "uint8",
+                "shape": [2, 2, 2],
+                "dense_layers": 1,
+                "experts": 4,
+                "sha256": hashlib.sha256(route_bytes).hexdigest(),
+                "data": base64.b64encode(route_bytes).decode(),
+            }
+            token_bytes = struct.pack("<2q", 1, 2)
+            token_sha256 = hashlib.sha256(token_bytes).hexdigest()
+            reference_payload = {
+                "fixture_sha256": "1" * 64,
+                "profile_sha256": hashlib.sha256(profile.read_bytes()).hexdigest(),
+                "model_revision": "3" * 40,
+                "adapter_sha256": "4" * 64,
+                "image": "h200-image",
+                "h200_capture_manifest_sha256": "2" * 64,
+                "capture_router_ids_sha256": "7" * 64,
+                "capture_full_logprobs_sha256": "8" * 64,
+                "input_ids": [1, 2],
+                "routed_experts": routed,
+            }
+            session_payload = {
+                "schema_version": 1,
+                "side": "trainer",
+                "fixture_sha256": "1" * 64,
+                "token_ids_sha256": token_sha256,
+                "model_revision": "3" * 40,
+                "adapter_sha256": "4" * 64,
+                "image": "trainer-image",
+                "expected_tokens": 2,
+                "hidden_layers": 2,
+                "dense_layers": 1,
+                "topk": 2,
+                "experts": 4,
+                "route_output_scale": 2.5,
+                "weight_sum_tolerance": 0.005,
+            }
+            reference.write_text(json.dumps(reference_payload) + "\n")
+            session.write_text(json.dumps(session_payload) + "\n")
+            reference.chmod(0o644)
+            session.chmod(0o644)
             manifest = {
                 "schema_version": 1,
                 "kind": "glm52_policy_parity_trainer_stage",
+                "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
                 "profile_sha256": hashlib.sha256(profile.read_bytes()).hexdigest(),
                 "fixture_sha256": "1" * 64,
                 "h200_capture_manifest_sha256": "2" * 64,
@@ -302,6 +366,27 @@ class EdgeOperationsTest(unittest.TestCase):
                 "router_weight_provenance": (
                     "selected_weights_before_route_output_scale"
                 ),
+                "reference_schema": {
+                    **{
+                        name: value
+                        for name, value in routed.items()
+                        if name != "data"
+                    },
+                    "routed_experts_sha256": routed["sha256"],
+                    "sha256": "7" * 64,
+                    "full_logprobs_sha256": "8" * 64,
+                },
+                "identity": {
+                    "fixture_sha256": "1" * 64,
+                    "profile_sha256": hashlib.sha256(
+                        profile.read_bytes()
+                    ).hexdigest(),
+                    "model_revision": "3" * 40,
+                    "adapter_sha256": "4" * 64,
+                    "h200_image": "h200-image",
+                    "trainer_image": "trainer-image",
+                    "token_ids_sha256": token_sha256,
+                },
                 "files": {
                     "trainer-reference.json": hashlib.sha256(
                         reference.read_bytes()
@@ -311,16 +396,76 @@ class EdgeOperationsTest(unittest.TestCase):
                     ).hexdigest(),
                 },
             }
-            (stage / "manifest.json").write_text(json.dumps(manifest) + "\n")
-            training_ops._validate_glm_parity_stage(stage)
+            manifest_path = stage / "manifest.json"
+
+            def write_manifest(value):
+                manifest_path.write_text(json.dumps(value) + "\n")
+                manifest_path.chmod(0o644)
+
+            write_manifest(manifest)
+            with patch.object(training_ops, "repo_root", root):
+                training_ops._validate_glm_parity_stage(stage)
+            missing_schema = dict(manifest)
+            missing_schema.pop("reference_schema")
+            write_manifest(missing_schema)
+            with patch.object(training_ops, "repo_root", root):
+                with self.assertRaisesRegex(RuntimeError, "reference schema"):
+                    training_ops._validate_glm_parity_stage(stage)
+            wrong_source = dict(manifest)
+            wrong_source["source_sha256"] = "0" * 64
+            write_manifest(wrong_source)
+            with patch.object(training_ops, "repo_root", root):
+                with self.assertRaisesRegex(RuntimeError, "source checksum"):
+                    training_ops._validate_glm_parity_stage(stage)
+            reference.write_text("{}\n")
+            missing_routes = dict(manifest)
+            missing_routes["files"] = dict(manifest["files"])
+            missing_routes["files"]["trainer-reference.json"] = hashlib.sha256(
+                reference.read_bytes()
+            ).hexdigest()
+            write_manifest(missing_routes)
+            with patch.object(training_ops, "repo_root", root):
+                with self.assertRaisesRegex(RuntimeError, "route schema"):
+                    training_ops._validate_glm_parity_stage(stage)
+            reference.write_text(json.dumps(reference_payload) + "\n")
+            write_manifest(manifest)
+            mixed_reference = dict(reference_payload)
+            mixed_reference["adapter_sha256"] = "5" * 64
+            reference.write_text(json.dumps(mixed_reference) + "\n")
+            mixed_manifest = dict(manifest)
+            mixed_manifest["files"] = dict(manifest["files"])
+            mixed_manifest["files"]["trainer-reference.json"] = hashlib.sha256(
+                reference.read_bytes()
+            ).hexdigest()
+            write_manifest(mixed_manifest)
+            with patch.object(training_ops, "repo_root", root):
+                with self.assertRaisesRegex(RuntimeError, "reference identity"):
+                    training_ops._validate_glm_parity_stage(stage)
+            reference.write_text(json.dumps(reference_payload) + "\n")
+            mixed_session = dict(session_payload)
+            mixed_session["model_revision"] = "6" * 40
+            session.write_text(json.dumps(mixed_session) + "\n")
+            mixed_manifest = dict(manifest)
+            mixed_manifest["files"] = dict(manifest["files"])
+            mixed_manifest["files"][
+                "trainer-router-trace/session.json"
+            ] = hashlib.sha256(session.read_bytes()).hexdigest()
+            write_manifest(mixed_manifest)
+            with patch.object(training_ops, "repo_root", root):
+                with self.assertRaisesRegex(RuntimeError, "session identity"):
+                    training_ops._validate_glm_parity_stage(stage)
+            session.write_text(json.dumps(session_payload) + "\n")
+            write_manifest(manifest)
             extra = stage / "unexpected.bin"
             extra.write_bytes(b"x")
-            with self.assertRaisesRegex(RuntimeError, "unexpected files"):
-                training_ops._validate_glm_parity_stage(stage)
+            with patch.object(training_ops, "repo_root", root):
+                with self.assertRaisesRegex(RuntimeError, "unexpected entries"):
+                    training_ops._validate_glm_parity_stage(stage)
             extra.unlink()
             session.write_text("changed\n")
-            with self.assertRaisesRegex(RuntimeError, "checksum differs"):
-                training_ops._validate_glm_parity_stage(stage)
+            with patch.object(training_ops, "repo_root", root):
+                with self.assertRaisesRegex(RuntimeError, "checksum differs"):
+                    training_ops._validate_glm_parity_stage(stage)
 
     def test_policy_parity_stage_refuses_symlink_and_extra_content(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -384,8 +529,485 @@ class EdgeOperationsTest(unittest.TestCase):
         source = Path(training_ops.__file__).read_text()
         method = source[source.index("def stage_glm52_policy_parity"):]
         deploy = method.index("_deploy_glm_parity_staging_sources()")
-        docker = method.index("sudo docker run")
+        docker = method.index("_glm_parity_stage_build_command(")
         self.assertLess(deploy, docker)
+
+    def test_parity_stage_build_binds_the_opened_candidate_inode(self):
+        candidate = (
+            f"{training_ops.glm_parity_stage_candidate_root}/"
+            "trainer-stage-candidate-0123456789abcdef"
+        )
+        command = training_ops._glm_parity_stage_build_command(
+            candidate,
+            "10:20",
+            training_ops.glm_parity_paths["fixture"],
+            training_ops.glm_parity_paths["h200_capture"],
+        )
+        self.assertIn("os.O_PATH|os.O_DIRECTORY|os.O_NOFOLLOW", command)
+        self.assertIn('bind_source=f"/proc/{os.getpid()}/fd/{candidate}"', command)
+        self.assertIn("subprocess.run(command,timeout=1800,check=True)", command)
+        self.assertIn("cleanup_container()", command)
+        self.assertIn("cleanup_candidate(root,candidate)", command)
+        self.assertIn("except BaseException as error", command)
+        self.assertNotIn(f"-v {candidate}:/stage", command)
+        self.assertGreaterEqual(
+            training_ops.glm_parity_stage_outer_timeout,
+            training_ops.glm_parity_stage_docker_timeout
+            + 2 * training_ops.glm_parity_stage_inspect_timeout
+            + training_ops.glm_parity_stage_remove_timeout
+            + 60,
+        )
+
+    def test_parity_stage_build_retains_replaced_candidate_and_cleans_name_only_container(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            candidates = root / ".stage-candidates"
+            candidates.mkdir(mode=0o755)
+            candidate = candidates / "trainer-stage-candidate-0123456789abcdef"
+            candidate.mkdir(mode=0o750)
+            identity = candidate.stat()
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            state = root / "container-state"
+            removed = root / "container-removed"
+            fake_docker = fake_bin / "docker"
+            fake_docker.write_text(
+                """#!/usr/bin/env python3
+import os
+import pathlib
+import sys
+
+args = sys.argv[1:]
+state = pathlib.Path(os.environ["FAKE_DOCKER_STATE"])
+removed = pathlib.Path(os.environ["FAKE_DOCKER_REMOVED"])
+container = os.environ["FAKE_DOCKER_CONTAINER"]
+container_id = "a" * 64
+if args[:2] == ["container", "inspect"]:
+    if not state.exists():
+        print(f"Error: No such container: {args[-1]}", file=sys.stderr)
+        raise SystemExit(1)
+    if "--format" in args:
+        print(f"{container_id} /{container}")
+    raise SystemExit(0)
+if args[0] == "run":
+    state.write_text("running\\n")
+    source = next(value[:-7] for value in args if value.endswith(":/stage"))
+    opened = pathlib.Path(os.readlink(source))
+    retained = opened.with_name(opened.name + "-retained")
+    opened.rename(retained)
+    opened.mkdir(mode=0o750)
+    raise SystemExit(0)
+if args[0] == "rm":
+    if args[-1] != container_id:
+        raise SystemExit(2)
+    state.unlink()
+    removed.write_text(container_id + "\\n")
+    raise SystemExit(0)
+raise SystemExit(3)
+"""
+            )
+            fake_docker.chmod(0o755)
+            with patch.object(
+                training_ops,
+                "glm_parity_stage_candidate_root",
+                str(candidates),
+            ):
+                command = training_ops._glm_parity_stage_build_command(
+                    str(candidate),
+                    f"{identity.st_dev}:{identity.st_ino}",
+                    "/fixture",
+                    "/capture",
+                )
+            command = command.replace("sudo python3", "python3", 1).replace(
+                "root_opened.st_uid!=0", "root_opened.st_uid!=os.geteuid()"
+            ).replace(
+                "root_opened.st_gid!=0", "root_opened.st_gid!=os.getegid()"
+            )
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+            environment["FAKE_DOCKER_STATE"] = str(state)
+            environment["FAKE_DOCKER_REMOVED"] = str(removed)
+            environment["FAKE_DOCKER_CONTAINER"] = (
+                "glm52-policy-parity-stage-0123456789abcdef"
+            )
+            result = subprocess.run(
+                command,
+                shell=True,
+                executable="/bin/bash",
+                capture_output=True,
+                text=True,
+                check=False,
+                env=environment,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("path identity changed", result.stderr)
+            self.assertTrue(candidate.is_dir())
+            self.assertTrue(
+                candidate.with_name(candidate.name + "-retained").is_dir()
+            )
+            self.assertEqual(removed.read_text().strip(), "a" * 64)
+
+    def test_parity_stage_build_retains_evidence_on_transient_container_inspect_error(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            candidates = root / ".stage-candidates"
+            candidates.mkdir(mode=0o755)
+            candidate = candidates / "trainer-stage-candidate-0123456789abcdef"
+            candidate.mkdir(mode=0o750)
+            identity = candidate.stat()
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_docker = fake_bin / "docker"
+            fake_docker.write_text(
+                "#!/bin/sh\necho 'permission denied' >&2\nexit 1\n"
+            )
+            fake_docker.chmod(0o755)
+            with patch.object(
+                training_ops,
+                "glm_parity_stage_candidate_root",
+                str(candidates),
+            ):
+                command = training_ops._glm_parity_stage_build_command(
+                    str(candidate),
+                    f"{identity.st_dev}:{identity.st_ino}",
+                    "/fixture",
+                    "/capture",
+                )
+            command = command.replace("sudo python3", "python3", 1).replace(
+                "root_opened.st_uid!=0", "root_opened.st_uid!=os.geteuid()"
+            ).replace(
+                "root_opened.st_gid!=0", "root_opened.st_gid!=os.getegid()"
+            )
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+            result = subprocess.run(
+                command,
+                shell=True,
+                executable="/bin/bash",
+                capture_output=True,
+                text=True,
+                check=False,
+                env=environment,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("stage container inspect failed: permission denied", result.stderr)
+            self.assertIn(
+                "stage candidate and container ID evidence retained", result.stderr
+            )
+            self.assertTrue(candidate.is_dir())
+
+    def test_parity_stage_install_is_exact_and_transactional(self):
+        stage = training_ops.glm_parity_paths["trainer_stage"]
+        candidate = (
+            f"{training_ops.glm_parity_stage_candidate_root}/"
+            "trainer-stage-candidate-0123456789abcdef"
+        )
+        command = training_ops._glm_parity_stage_install_command(
+            stage, candidate, "a" * 64, "b" * 64, "c" * 64
+        )
+        self.assertNotIn("rm -rf", command)
+        self.assertNotIn("/tmp/", command)
+        self.assertIn("os.O_NOFOLLOW", command)
+        self.assertIn("fcntl.flock", command)
+        self.assertIn("src_dir_fd=candidates,dst_dir_fd=root", command)
+        self.assertIn('print("replaced-retained:"', command)
+        self.assertIn("libc.renameat2", command)
+        self.assertIn("libc.renameat2(root,stage.encode(),candidates", command)
+        with self.assertRaisesRegex(training_ops.Refused, "candidate"):
+            training_ops._glm_parity_stage_install_command(
+                stage,
+                "/tmp/trainer-stage-candidate-0123456789abcdef",
+                "a" * 64,
+                "b" * 64,
+                "c" * 64,
+            )
+
+    def test_parity_stage_candidate_cleanup_is_exact_and_bounded(self):
+        root = training_ops.glm_parity_root
+        candidate = (
+            f"{training_ops.glm_parity_stage_candidate_root}/"
+            "trainer-stage-candidate-0123456789abcdef"
+        )
+        command = training_ops._glm_parity_stage_candidate_cleanup_command(
+            candidate, "10:20"
+        )
+        self.assertIn("os.O_NOFOLLOW", command)
+        self.assertIn("fcntl.flock", command)
+        self.assertIn("entries<=allowed", command)
+        self.assertNotIn("rm -rf", command)
+        with self.assertRaisesRegex(training_ops.Refused, "cleanup target"):
+            training_ops._glm_parity_stage_candidate_cleanup_command(
+                f"{root}/trainer-stage-final", "10:20"
+            )
+
+    def test_parity_stage_transaction_installs_reuses_and_replaces(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o750)
+            stage = root / "trainer-stage-final"
+            candidates = root / ".stage-candidates"
+            candidates.mkdir(mode=0o755)
+
+            def make_candidate(nonce, marker):
+                candidate = candidates / f"trainer-stage-candidate-{nonce}"
+                trace = candidate / "trainer-router-trace"
+                trace.mkdir(parents=True, mode=0o755)
+                candidate.chmod(0o750)
+                reference = f"reference-{marker}\n".encode()
+                session = f"session-{marker}\n".encode()
+                (candidate / "trainer-reference.json").write_bytes(reference)
+                (trace / "session.json").write_bytes(session)
+                (candidate / "trainer-reference.json").chmod(0o644)
+                (trace / "session.json").chmod(0o644)
+                reference_sha = hashlib.sha256(reference).hexdigest()
+                session_sha = hashlib.sha256(session).hexdigest()
+                manifest = {
+                    "schema_version": 1,
+                    "kind": "glm52_policy_parity_trainer_stage",
+                    "files": {
+                        "trainer-reference.json": reference_sha,
+                        "trainer-router-trace/session.json": session_sha,
+                    },
+                }
+                manifest_bytes = (json.dumps(manifest) + "\n").encode()
+                (candidate / "manifest.json").write_bytes(manifest_bytes)
+                (candidate / "manifest.json").chmod(0o644)
+                return (
+                    candidate,
+                    hashlib.sha256(manifest_bytes).hexdigest(),
+                    reference_sha,
+                    session_sha,
+                )
+
+            def install_command(values):
+                candidate, manifest_sha, reference_sha, session_sha = values
+                with patch.object(training_ops, "glm_parity_root", str(root)):
+                    with patch.object(
+                        training_ops,
+                        "glm_parity_stage_candidate_root",
+                        str(candidates),
+                    ):
+                        command = training_ops._glm_parity_stage_install_command(
+                            str(stage),
+                            str(candidate),
+                            manifest_sha,
+                            reference_sha,
+                            session_sha,
+                        )
+                command = command.replace(
+                    "candidate_root_opened.st_uid!=0",
+                    "candidate_root_opened.st_uid!=os.geteuid()",
+                ).replace(
+                    "candidate_root_opened.st_gid!=0",
+                    "candidate_root_opened.st_gid!=os.getegid()",
+                )
+                return command
+
+            def install(values):
+                command = install_command(values)
+                return subprocess.run(
+                    command,
+                    shell=True,
+                    executable="/bin/bash",
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+
+            absent_values = make_candidate("0" * 16, "zero")
+            absent_candidate = absent_values[0]
+            absent_fault_command = install_command(absent_values).replace(
+                "    installed_identity,installed_hashes=validate(root,stage,required)",
+                '    raise RuntimeError("injected absent-stage validation fault")',
+                1,
+            )
+            absent_fault = subprocess.run(
+                absent_fault_command,
+                shell=True,
+                executable="/bin/bash",
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(absent_fault.returncode, 0)
+            self.assertIn("injected absent-stage validation fault", absent_fault.stderr)
+            self.assertFalse(stage.exists())
+            self.assertTrue(absent_candidate.is_dir())
+            first = install(make_candidate("1" * 16, "one"))
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertEqual(first.stdout.strip(), "installed")
+            first_manifest = hashlib.sha256(
+                (stage / "manifest.json").read_bytes()
+            ).hexdigest()
+            first_reference = hashlib.sha256(
+                (stage / "trainer-reference.json").read_bytes()
+            ).hexdigest()
+            first_session = hashlib.sha256(
+                (stage / "trainer-router-trace/session.json").read_bytes()
+            ).hexdigest()
+            with patch.object(training_ops, "glm_parity_root", str(root)):
+                current_command = training_ops._glm_parity_stage_current_command(
+                    str(stage),
+                    first_manifest,
+                    first_reference,
+                    first_session,
+                )
+            current_check = subprocess.run(
+                current_command,
+                shell=True,
+                executable="/bin/bash",
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(current_check.returncode, 0, current_check.stderr)
+            self.assertEqual(current_check.stdout.strip(), "current")
+            stage.chmod(0o777)
+            unsafe_stage = subprocess.run(
+                current_command,
+                shell=True,
+                executable="/bin/bash",
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(unsafe_stage.returncode, 0, unsafe_stage.stderr)
+            self.assertEqual(unsafe_stage.stdout.strip(), "stale")
+            stage.chmod(0o750)
+            (stage / "trainer-reference.json").chmod(0o755)
+            unsafe_file = subprocess.run(
+                current_command,
+                shell=True,
+                executable="/bin/bash",
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(unsafe_file.returncode, 0, unsafe_file.stderr)
+            self.assertEqual(unsafe_file.stdout.strip(), "stale")
+            (stage / "trainer-reference.json").chmod(0o644)
+            (stage / "trainer-router-trace").chmod(0o777)
+            unsafe_trace = subprocess.run(
+                current_command,
+                shell=True,
+                executable="/bin/bash",
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(unsafe_trace.returncode, 0, unsafe_trace.stderr)
+            self.assertEqual(unsafe_trace.stdout.strip(), "stale")
+            (stage / "trainer-router-trace").chmod(0o755)
+            current = install(make_candidate("2" * 16, "one"))
+            self.assertEqual(current.returncode, 0, current.stderr)
+            self.assertEqual(current.stdout.strip(), "current")
+            (stage / "trainer-router-trace").chmod(0o500)
+            replacement_values = make_candidate("3" * 16, "two")
+            retained = replacement_values[0]
+            replaced = install(replacement_values)
+            self.assertEqual(replaced.returncode, 0, replaced.stderr)
+            self.assertEqual(
+                replaced.stdout.strip(), f"replaced-retained:{retained.name}"
+            )
+            self.assertEqual(
+                (stage / "trainer-reference.json").read_text(),
+                "reference-two\n",
+            )
+            self.assertEqual(
+                (retained / "trainer-reference.json").read_text(),
+                "reference-one\n",
+            )
+            self.assertEqual(
+                (retained / "trainer-router-trace").stat().st_mode & 0o777,
+                0o500,
+            )
+            fault_values = make_candidate("4" * 16, "three")
+            candidate, manifest_sha, reference_sha, session_sha = fault_values
+            with patch.object(training_ops, "glm_parity_root", str(root)):
+                with patch.object(
+                    training_ops,
+                    "glm_parity_stage_candidate_root",
+                    str(candidates),
+                ):
+                    fault_command = training_ops._glm_parity_stage_install_command(
+                        str(stage),
+                        str(candidate),
+                        manifest_sha,
+                        reference_sha,
+                        session_sha,
+                    )
+            fault_command = fault_command.replace(
+                "candidate_root_opened.st_uid!=0",
+                "candidate_root_opened.st_uid!=os.geteuid()",
+            ).replace(
+                "candidate_root_opened.st_gid!=0",
+                "candidate_root_opened.st_gid!=os.getegid()",
+            )
+            fault_command = fault_command.replace(
+                "  installed_identity,_=validate(root,stage,required)",
+                '  raise RuntimeError("injected postcommit validation fault")',
+                1,
+            )
+            fault = subprocess.run(
+                fault_command,
+                shell=True,
+                executable="/bin/bash",
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(fault.returncode, 0)
+            self.assertIn("injected postcommit validation fault", fault.stderr)
+            self.assertEqual(
+                (stage / "trainer-reference.json").read_text(),
+                "reference-two\n",
+            )
+            self.assertEqual(
+                (candidate / "trainer-reference.json").read_text(),
+                "reference-three\n",
+            )
+            self.assertFalse(
+                any("previous" in path.name for path in root.iterdir())
+            )
+            (retained / "trainer-router-trace").chmod(0o755)
+
+    def test_parity_stage_copy_timeout_is_bounded(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(
+                training_ops.subprocess,
+                "run",
+                side_effect=subprocess.TimeoutExpired("scp", 600),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "copy timed out"):
+                    training_ops._copy_glm_parity_stage(
+                        "n82", training_ops.glm_parity_paths["trainer_stage"], Path(temporary)
+                    )
+
+    def test_parity_stage_create_ack_loss_still_runs_cleanup(self):
+        source = Path(training_ops.__file__).read_text()
+        method = source[source.index("def stage_glm52_policy_parity"):]
+        candidate_exists = method.index("candidate_exists = True")
+        candidate_create = method.index('"GLM parity candidate directory"')
+        cleanup = method.index("_cleanup_glm_parity_stage_candidate")
+        self.assertLess(candidate_exists, candidate_create)
+        self.assertLess(candidate_create, cleanup)
+        self.assertIn("except BaseException as error", method)
+        self.assertIn("timeout=600", method)
+
+    def test_parity_stage_flow_does_not_use_manifest_only_or_broad_delete(self):
+        source = Path(training_ops.__file__).read_text()
+        method = source[source.index("def stage_glm52_policy_parity"):]
+        self.assertIn("_validate_glm_parity_stage_live_identity", method)
+        self.assertIn("_glm_parity_stage_install_command", method)
+        self.assertIn("_glm_parity_stage_current_command", method)
+        self.assertIn("_glm_parity_stage_build_command", method)
+        self.assertNotIn("rm -rf", method)
+        self.assertNotIn("/tmp/glm52-parity-stage", method)
+        install = method[method.index("def install(host: str)"):]
+        self.assertLess(
+            install.index("_glm_parity_stage_current_command"),
+            install.index("copied_to_host = subprocess.run"),
+        )
 
     def test_parity_stage_directory_creates_only_exact_missing_path(self):
         commands = []
@@ -393,18 +1015,26 @@ class EdgeOperationsTest(unittest.TestCase):
         def remote(host, command, timeout=120):
             del host, timeout
             commands.append(command)
-            return 0, "created\n"
+            return 0, "missing\n"
 
         with patch.object(training_ops, "_ssh", side_effect=remote):
             self.assertEqual(
-                training_ops._prepare_glm_parity_stage_directory(), "created"
+                training_ops._prepare_glm_parity_stage_directory(), "missing"
             )
         command = commands[0]
         exact = training_ops.glm_parity_paths["trainer_stage"]
-        self.assertIn(
-            'sudo install -d -o 1000 -g 1000 -m 0750 "$stage"', command
-        )
+        self.assertNotIn('sudo install -d -o 1000 -g 1000 -m 0750 "$stage"', command)
         self.assertIn(f"stage={exact}", command)
+        self.assertNotIn("chmod -R", command)
+        self.assertNotIn("chown -R", command)
+
+    def test_parity_stage_candidate_root_is_exact_and_not_user_writable(self):
+        command = training_ops._glm_parity_stage_candidate_root_prepare_command()
+        self.assertIn(training_ops.glm_parity_stage_candidate_root, command)
+        self.assertIn('candidate_stat.st_uid!=0', command)
+        self.assertIn('candidate_stat.st_gid!=0', command)
+        self.assertIn('stat.S_IMODE(candidate_stat.st_mode)!=0o755', command)
+        self.assertIn('os.O_NOFOLLOW', command)
         self.assertNotIn("chmod -R", command)
         self.assertNotIn("chown -R", command)
 
@@ -413,12 +1043,16 @@ class EdgeOperationsTest(unittest.TestCase):
             self.assertEqual(
                 training_ops._prepare_glm_parity_stage_directory(), "existing"
             )
+        with patch.object(training_ops, "_ssh", return_value=(0, "stale\n")):
+            self.assertEqual(
+                training_ops._prepare_glm_parity_stage_directory(), "stale"
+            )
 
     def test_parity_stage_directory_refuses_bad_existing_paths(self):
         for detail in (
-            "stage owner or mode differs: 0:0:755",
-            "stage has content but no manifest",
+            "stage path is not a directory",
             "stage path is a symlink",
+            "candidate root owner or mode differs: 1000:1000:755",
         ):
             with patch.object(training_ops, "_ssh", return_value=(44, detail)):
                 with self.assertRaisesRegex(RuntimeError, "directory refused"):

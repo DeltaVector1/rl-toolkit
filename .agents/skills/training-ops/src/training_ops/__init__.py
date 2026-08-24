@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import datetime as _dt
 import hashlib
 import json
@@ -11,7 +12,9 @@ import os
 import re
 import secrets
 import shlex
+import stat
 import statistics
+import struct
 import subprocess
 import sys
 import tempfile
@@ -49,6 +52,16 @@ muse_requirements = operations["requirements"]["muse"]
 glm_requirements = operations["requirements"]["glm52"]
 glm_parity_paths = operations["parity"]["glm52"]
 glm_parity_root = "/data/glm52-rl/qualifications/glm52-policy-parity"
+glm_parity_stage_candidate_root = f"{glm_parity_root}/.stage-candidates"
+glm_parity_stage_docker_timeout = 1800
+glm_parity_stage_inspect_timeout = 30
+glm_parity_stage_remove_timeout = 120
+glm_parity_stage_outer_timeout = (
+    glm_parity_stage_docker_timeout
+    + 2 * glm_parity_stage_inspect_timeout
+    + glm_parity_stage_remove_timeout
+    + 120
+)
 parity_trace_root = "/data/glm52-rl/qualifications/glm52-policy-parity/trainer-traces"
 parity_token_root = "/data/glm52-rl/qualifications/glm52-policy-parity/trainer/token_exports"
 
@@ -5444,6 +5457,7 @@ test ! -L "$root"
 test "$(realpath -e "$root")" = "$root"
 test -d "$candidate"
 test ! -L "$candidate"
+test "$(stat -c '%u:%g:%a' "$candidate")" = "1000:1000:750"
 test -f "$candidate/manifest.json"
 test ! -e "$previous"
 test ! -L "$previous"
@@ -7133,6 +7147,8 @@ def qualify(
 def _validate_glm_parity_stage(path: Path) -> str:
     if path.is_symlink() or not path.is_dir():
         raise RuntimeError("GLM parity stage is not a regular directory")
+    if stat.S_IMODE(path.stat(follow_symlinks=False).st_mode) != 0o750:
+        raise RuntimeError("GLM parity stage directory mode differs")
     manifest_path = path / "manifest.json"
     if manifest_path.is_symlink() or not manifest_path.is_file():
         raise RuntimeError("GLM parity stage manifest is not a regular file")
@@ -7145,6 +7161,13 @@ def _validate_glm_parity_stage(path: Path) -> str:
     ):
         raise RuntimeError("GLM parity stage manifest kind is invalid")
     profile_path = repo_root / "configs/qualification/glm52-policy-parity.toml"
+    with profile_path.open("rb") as stream:
+        profile = tomllib.load(stream)
+    source_path = repo_root / "scripts/glm52_policy_parity.py"
+    if manifest.get("source_sha256") != hashlib.sha256(
+        source_path.read_bytes()
+    ).hexdigest():
+        raise RuntimeError("GLM parity stage source checksum differs")
     if manifest.get("profile_sha256") != hashlib.sha256(
         profile_path.read_bytes()
     ).hexdigest():
@@ -7173,13 +7196,198 @@ def _validate_glm_parity_stage(path: Path) -> str:
         actual = hashlib.sha256(artifact.read_bytes()).hexdigest()
         if actual != wanted:
             raise RuntimeError(f"GLM parity stage checksum differs: {relative}")
-    actual_files = {
-        str(item.relative_to(path))
-        for item in path.rglob("*")
-        if item.is_file()
+    try:
+        reference = json.loads((path / "trainer-reference.json").read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"cannot read GLM parity trainer reference: {error}") from error
+    routed = reference.get("routed_experts")
+    routed_fields = {
+        "schema_version",
+        "encoding",
+        "dtype",
+        "shape",
+        "dense_layers",
+        "experts",
+        "sha256",
+        "data",
     }
-    if actual_files != {*expected, "manifest.json"}:
-        raise RuntimeError("GLM parity stage contains unexpected files")
+    expected_shape = [
+        profile["context_length"],
+        profile["hidden_layers"],
+        profile["experts_per_token"],
+    ]
+    if (
+        not isinstance(routed, dict)
+        or set(routed) != routed_fields
+        or routed.get("schema_version") != 1
+        or routed.get("encoding") != "base64"
+        or routed.get("dtype") != "uint8"
+        or routed.get("shape") != expected_shape
+        or routed.get("dense_layers") != profile["dense_layers"]
+        or routed.get("experts") != profile["experts"]
+        or not isinstance(routed.get("sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", routed["sha256"]) is None
+        or not isinstance(routed.get("data"), str)
+    ):
+        raise RuntimeError("GLM parity trainer reference route schema differs")
+    reference_schema = {
+        name: routed[name]
+        for name in routed_fields - {"data", "sha256"}
+    }
+    reference_schema["routed_experts_sha256"] = routed["sha256"]
+    for reference_name, schema_name in (
+        ("capture_router_ids_sha256", "sha256"),
+        ("capture_full_logprobs_sha256", "full_logprobs_sha256"),
+    ):
+        value = reference.get(reference_name)
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise RuntimeError("GLM parity trainer reference capture schema differs")
+        reference_schema[schema_name] = value
+    if (
+        reference.get("h200_capture_manifest_sha256")
+        != manifest["h200_capture_manifest_sha256"]
+        or manifest.get("reference_schema") != reference_schema
+    ):
+        raise RuntimeError("GLM parity stage reference schema differs")
+    try:
+        session = json.loads(
+            (path / "trainer-router-trace/session.json").read_text()
+        )
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"cannot read GLM parity trainer session: {error}") from error
+    identity_fields = {
+        "fixture_sha256",
+        "profile_sha256",
+        "model_revision",
+        "adapter_sha256",
+        "h200_image",
+        "trainer_image",
+        "token_ids_sha256",
+    }
+    identity = manifest.get("identity")
+    if not isinstance(identity, dict) or set(identity) != identity_fields:
+        raise RuntimeError("GLM parity stage identity schema differs")
+    expected_common = {
+        "fixture_sha256": manifest["fixture_sha256"],
+        "profile_sha256": manifest["profile_sha256"],
+        "model_revision": identity["model_revision"],
+        "adapter_sha256": identity["adapter_sha256"],
+    }
+    if (
+        identity["fixture_sha256"] != manifest["fixture_sha256"]
+        or identity["profile_sha256"] != manifest["profile_sha256"]
+        or reference.get("fixture_sha256") != expected_common["fixture_sha256"]
+        or reference.get("profile_sha256") != expected_common["profile_sha256"]
+        or reference.get("model_revision") != expected_common["model_revision"]
+        or reference.get("adapter_sha256") != expected_common["adapter_sha256"]
+        or reference.get("image") != identity["h200_image"]
+    ):
+        raise RuntimeError("GLM parity trainer reference identity differs")
+    expected_session_fields = {
+        "schema_version",
+        "side",
+        "fixture_sha256",
+        "token_ids_sha256",
+        "model_revision",
+        "adapter_sha256",
+        "image",
+        "expected_tokens",
+        "hidden_layers",
+        "dense_layers",
+        "topk",
+        "experts",
+        "route_output_scale",
+        "weight_sum_tolerance",
+    }
+    if not isinstance(session, dict) or set(session) != expected_session_fields:
+        raise RuntimeError("GLM parity trainer session schema differs")
+    if (
+        session["schema_version"] != 1
+        or session["side"] != "trainer"
+        or session["fixture_sha256"] != expected_common["fixture_sha256"]
+        or session["model_revision"] != expected_common["model_revision"]
+        or session["adapter_sha256"] != expected_common["adapter_sha256"]
+        or session["image"] != identity["trainer_image"]
+        or session["token_ids_sha256"] != identity["token_ids_sha256"]
+        or session["expected_tokens"] != profile["context_length"]
+        or session["hidden_layers"] != profile["hidden_layers"]
+        or session["dense_layers"] != profile["dense_layers"]
+        or session["topk"] != profile["experts_per_token"]
+        or session["experts"] != profile["experts"]
+        or session["route_output_scale"] != profile["router_scale"]
+        or session["weight_sum_tolerance"]
+        != profile["max_router_weight_sum_error"]
+    ):
+        raise RuntimeError("GLM parity trainer session identity differs")
+    input_ids = reference.get("input_ids")
+    if (
+        not isinstance(input_ids, list)
+        or len(input_ids) != profile["context_length"]
+        or any(isinstance(value, bool) or not isinstance(value, int) for value in input_ids)
+    ):
+        raise RuntimeError("GLM parity trainer reference token schema differs")
+    try:
+        token_bytes = struct.pack(f"<{len(input_ids)}q", *input_ids)
+    except struct.error as error:
+        raise RuntimeError("GLM parity trainer reference token value differs") from error
+    if hashlib.sha256(token_bytes).hexdigest() != identity["token_ids_sha256"]:
+        raise RuntimeError("GLM parity trainer token identity differs")
+    expected_route_bytes = math.prod(expected_shape)
+    if len(routed["data"]) != 4 * ((expected_route_bytes + 2) // 3):
+        raise RuntimeError("GLM parity trainer reference route size differs")
+    try:
+        route_bytes = base64.b64decode(routed["data"], validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise RuntimeError("GLM parity trainer reference routes are invalid") from error
+    if (
+        len(route_bytes) != expected_route_bytes
+        or hashlib.sha256(route_bytes).hexdigest() != routed["sha256"]
+    ):
+        raise RuntimeError("GLM parity trainer reference route checksum differs")
+    context_length, hidden_layers, experts_per_token = expected_shape
+    dense_layers = profile["dense_layers"]
+    experts = profile["experts"]
+    for token in range(context_length):
+        token_offset = token * hidden_layers * experts_per_token
+        for layer in range(hidden_layers):
+            offset = token_offset + layer * experts_per_token
+            selected = route_bytes[offset : offset + experts_per_token]
+            if layer < dense_layers:
+                if any(selected):
+                    raise RuntimeError(
+                        "GLM parity trainer reference dense routes are not zero"
+                    )
+            elif any(expert >= experts for expert in selected):
+                raise RuntimeError(
+                    "GLM parity trainer reference expert ID is out of range"
+                )
+            elif len(set(selected)) != experts_per_token:
+                raise RuntimeError(
+                    "GLM parity trainer reference has duplicate expert IDs"
+                )
+    entries = list(path.rglob("*"))
+    if any(item.is_symlink() for item in entries):
+        raise RuntimeError("GLM parity stage contains a symlink")
+    actual_entries = {str(item.relative_to(path)) for item in entries}
+    expected_entries = {
+        "manifest.json",
+        "trainer-reference.json",
+        "trainer-router-trace",
+        "trainer-router-trace/session.json",
+    }
+    if actual_entries != expected_entries:
+        raise RuntimeError("GLM parity stage contains unexpected entries")
+    trace = path / "trainer-router-trace"
+    if stat.S_IMODE(trace.stat(follow_symlinks=False).st_mode) != 0o755:
+        raise RuntimeError("GLM parity stage trace mode differs")
+    for artifact in (
+        manifest_path,
+        path / "trainer-reference.json",
+        trace / "session.json",
+    ):
+        details = artifact.stat(follow_symlinks=False)
+        if stat.S_IMODE(details.st_mode) != 0o644 or details.st_nlink != 1:
+            raise RuntimeError("GLM parity stage file mode differs")
     return hashlib.sha256(manifest_path.read_bytes()).hexdigest()
 
 
@@ -7213,42 +7421,876 @@ def _prepare_glm_parity_stage_directory() -> str:
         raise Refused("GLM parity stage path is not the exact pinned directory")
     quoted_stage = shlex.quote(stage)
     quoted_root = shlex.quote(root)
+    quoted_candidates = shlex.quote(glm_parity_stage_candidate_root)
     command = f"""
 set -euo pipefail
 stage={quoted_stage}
 root={quoted_root}
+candidates={quoted_candidates}
 test -d "$root"
 test ! -L "$root"
 test "$(realpath -e "$root")" = "$root"
+if test -L "$candidates"; then
+  echo "candidate root is a symlink" >&2
+  exit 40
+fi
+if ! test -e "$candidates"; then
+  sudo install -d -o 0 -g 0 -m 0755 "$candidates"
+fi
+test -d "$candidates" || {{ echo "candidate root is not a directory" >&2; exit 45; }}
+candidate_identity=$(stat -c '%u:%g:%a' "$candidates")
+test "$candidate_identity" = "0:0:755" || {{
+  echo "candidate root owner or mode differs: $candidate_identity" >&2
+  exit 46
+}}
 if test -L "$stage"; then
   echo "stage path is a symlink" >&2
   exit 41
 fi
 if ! test -e "$stage"; then
-  sudo install -d -o 1000 -g 1000 -m 0750 "$stage"
-  echo created
+  echo missing
   exit 0
 fi
 test -d "$stage" || {{ echo "stage path is not a directory" >&2; exit 42; }}
-identity=$(stat -c '%u:%g:%a' "$stage")
-test "$identity" = "1000:1000:750" || {{
-  echo "stage owner or mode differs: $identity" >&2
-  exit 43
-}}
-if test -n "$(find "$stage" -mindepth 1 -maxdepth 1 -print -quit)" && \
-   ! test -f "$stage/manifest.json"; then
-  echo "stage has content but no manifest" >&2
-  exit 44
+if test "$(stat -c '%u:%g:%a' "$stage")" != "1000:1000:750" || \
+   test -L "$stage/manifest.json" || ! test -f "$stage/manifest.json" || \
+   test -L "$stage/trainer-reference.json" || ! test -f "$stage/trainer-reference.json" || \
+   test "$(stat -c '%u:%g:%a' "$stage/manifest.json")" != "1000:1000:644" || \
+   test "$(stat -c '%h' "$stage/manifest.json")" != "1" || \
+   test "$(stat -c '%u:%g:%a' "$stage/trainer-reference.json")" != "1000:1000:644" || \
+   test "$(stat -c '%h' "$stage/trainer-reference.json")" != "1" || \
+   test -L "$stage/trainer-router-trace" || ! test -d "$stage/trainer-router-trace" || \
+   test "$(stat -c '%u:%g:%a' "$stage/trainer-router-trace")" != "1000:1000:755" || \
+   test -L "$stage/trainer-router-trace/session.json" || \
+   ! test -f "$stage/trainer-router-trace/session.json" || \
+   test "$(stat -c '%u:%g:%a' "$stage/trainer-router-trace/session.json")" != "1000:1000:644" || \
+   test "$(stat -c '%h' "$stage/trainer-router-trace/session.json")" != "1" || \
+   test "$(find "$stage/trainer-router-trace" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort | tr '\n' ' ')" != \
+     "session.json " || \
+   test "$(find "$stage" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort | tr '\n' ' ')" != \
+     "manifest.json trainer-reference.json trainer-router-trace "; then
+  echo stale
+else
+  echo existing
 fi
-echo existing
 """
     code, output = _ssh(orchestrator_host, command)
     if code:
         raise RuntimeError(f"GLM parity stage directory refused: {output.strip()}")
     state = output.strip()
-    if state not in {"created", "existing"}:
+    if state not in {"missing", "stale", "existing"}:
         raise RuntimeError("GLM parity stage directory returned an invalid state")
     return state
+
+
+def _glm_parity_stage_candidate_root_prepare_command() -> str:
+    root = PurePosixPath(glm_parity_root)
+    candidate_root = PurePosixPath(glm_parity_stage_candidate_root)
+    if candidate_root != root / ".stage-candidates":
+        raise Refused("GLM parity candidate root is not the exact pinned directory")
+    return f"""python3 - {shlex.quote(str(root))} {shlex.quote(str(candidate_root))} <<'PY'
+import os,stat,subprocess,sys
+root_path,candidate_root_path=sys.argv[1:]
+root=os.open(root_path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+try:
+ opened=os.fstat(root)
+ current=os.stat(root_path,follow_symlinks=False)
+ if (opened.st_dev,opened.st_ino)!=(current.st_dev,current.st_ino):
+  raise RuntimeError("qualification root identity changed")
+ try:
+  candidate=os.open(candidate_root_path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+ except FileNotFoundError:
+  subprocess.run(["sudo","install","-d","-o","0","-g","0","-m","0755",candidate_root_path],check=True)
+  candidate=os.open(candidate_root_path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+ try:
+  candidate_stat=os.fstat(candidate)
+  candidate_current=os.stat(candidate_root_path,follow_symlinks=False)
+  if (candidate_stat.st_dev,candidate_stat.st_ino)!=(candidate_current.st_dev,candidate_current.st_ino):
+   raise RuntimeError("candidate root identity changed")
+  if candidate_stat.st_uid!=0 or candidate_stat.st_gid!=0 or stat.S_IMODE(candidate_stat.st_mode)!=0o755:
+   raise RuntimeError("candidate root owner or mode differs")
+  if candidate_stat.st_dev!=opened.st_dev:
+   raise RuntimeError("candidate root is on another filesystem")
+ finally:
+  os.close(candidate)
+finally:
+ os.close(root)
+print("ready")
+PY"""
+
+
+def _glm_parity_stage_build_command(
+    candidate: str,
+    candidate_identity: str,
+    fixture: str,
+    capture: str,
+) -> str:
+    candidate_path = PurePosixPath(candidate)
+    candidate_root = PurePosixPath(glm_parity_stage_candidate_root)
+    match = re.fullmatch(
+        r"trainer-stage-candidate-([0-9a-f]{16,64})", candidate_path.name
+    )
+    if candidate_path.parent != candidate_root or match is None:
+        raise Refused("GLM parity build target is not an exact stage candidate")
+    if re.fullmatch(r"[0-9]+:[0-9]+", candidate_identity) is None:
+        raise Refused("GLM parity build candidate identity is invalid")
+    container = f"glm52-policy-parity-stage-{match.group(1)}"
+    return f"""sudo python3 - {shlex.quote(str(candidate_root))} {shlex.quote(candidate_path.name)} {shlex.quote(candidate_identity)} {shlex.quote(container)} {shlex.quote(remote_repo)} {shlex.quote(inference_image)} {shlex.quote(fixture)} {shlex.quote(capture)} {shlex.quote(candidate)} <<'PY'
+import os,re,stat,subprocess,sys
+candidate_root_path,candidate_name,wanted,container,repo,image,fixture,capture,host_output=sys.argv[1:]
+wanted_dev,wanted_ino=(int(value) for value in wanted.split(":"))
+allowed={{"manifest.json","trainer-reference.json","trainer-router-trace"}}
+cidfile=f"/run/{{container}}.cid"
+
+def identity(descriptor):
+ details=os.fstat(descriptor)
+ return details.st_dev,details.st_ino
+
+def cleanup_container():
+ try:
+  with open(cidfile,"r",encoding="ascii") as stream:
+   value=stream.read().strip()
+ except FileNotFoundError:
+  value=container
+ else:
+  if re.fullmatch(r"[0-9a-f]{{64}}",value) is None:
+   raise RuntimeError("stage container ID file is invalid")
+ identity=inspect_container(value)
+ if identity is not None:
+  subprocess.run(["docker","rm","-f",identity],timeout={glm_parity_stage_remove_timeout},check=True)
+
+def inspect_container(reference):
+ inspected=subprocess.run(
+  ["docker","container","inspect","--format","{{{{.Id}}}} {{{{.Name}}}}",reference],
+  capture_output=True,text=True,timeout={glm_parity_stage_inspect_timeout},check=False,
+ )
+ if inspected.returncode==0:
+  fields=inspected.stdout.strip().split()
+  if len(fields)!=2 or re.fullmatch(r"[0-9a-f]{{64}}",fields[0]) is None or fields[1]!=f"/{{container}}":
+   raise RuntimeError("stage container identity differs")
+  return fields[0]
+ if inspected.returncode==1 and inspected.stderr.strip() in {{
+ f"Error: No such container: {{reference}}",
+ f"Error: No such object: {{reference}}",
+  f"Error response from daemon: No such container: {{reference}}",
+  f"Error response from daemon: No such object: {{reference}}",
+ }}:
+  return None
+ raise RuntimeError("stage container inspect failed: "+inspected.stderr.strip()[:160])
+
+def remove_cidfile():
+ try:
+  details=os.lstat(cidfile)
+ except FileNotFoundError:
+  return
+ if not stat.S_ISREG(details.st_mode) or details.st_uid!=0 or details.st_nlink!=1:
+  raise RuntimeError("stage container ID file identity differs")
+ os.unlink(cidfile)
+
+def cleanup_candidate(root_descriptor,candidate_descriptor):
+ current=os.stat(candidate_name,dir_fd=root_descriptor,follow_symlinks=False)
+ if (current.st_dev,current.st_ino)!=(wanted_dev,wanted_ino):
+  raise RuntimeError("stage cleanup path no longer identifies the candidate")
+ directory=os.open(".",os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=candidate_descriptor)
+ try:
+  if identity(directory)!=(wanted_dev,wanted_ino):
+   raise RuntimeError("stage cleanup candidate identity differs")
+  entries=set(os.listdir(directory))
+  if not entries<=allowed:
+   raise RuntimeError("stage cleanup candidate has an unexpected entry")
+  for name in ("manifest.json","trainer-reference.json"):
+   if name in entries:
+    child=os.open(name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=directory)
+    try:
+     if not stat.S_ISREG(os.fstat(child).st_mode):
+      raise RuntimeError("stage cleanup child is not regular")
+    finally:
+     os.close(child)
+    os.unlink(name,dir_fd=directory)
+  if "trainer-router-trace" in entries:
+   trace=os.open("trainer-router-trace",os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=directory)
+   try:
+    trace_entries=set(os.listdir(trace))
+    if not trace_entries<={{"session.json"}}:
+     raise RuntimeError("stage cleanup trace has an unexpected entry")
+    if "session.json" in trace_entries:
+     child=os.open("session.json",os.O_RDONLY|os.O_NOFOLLOW,dir_fd=trace)
+     try:
+      if not stat.S_ISREG(os.fstat(child).st_mode):
+       raise RuntimeError("stage cleanup session is not regular")
+     finally:
+      os.close(child)
+     os.unlink("session.json",dir_fd=trace)
+   finally:
+    os.close(trace)
+   os.rmdir("trainer-router-trace",dir_fd=directory)
+ finally:
+  os.close(directory)
+ current=os.stat(candidate_name,dir_fd=root_descriptor,follow_symlinks=False)
+ if (current.st_dev,current.st_ino)!=(wanted_dev,wanted_ino):
+  raise RuntimeError("stage cleanup path changed before directory removal")
+ os.rmdir(candidate_name,dir_fd=root_descriptor)
+
+root=os.open(candidate_root_path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+candidate=os.open(candidate_name,os.O_PATH|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=root)
+try:
+ root_opened=os.fstat(root)
+ root_current=os.stat(candidate_root_path,follow_symlinks=False)
+ if (root_opened.st_dev,root_opened.st_ino)!=(root_current.st_dev,root_current.st_ino):
+  raise RuntimeError("stage candidate root identity changed")
+ if root_opened.st_uid!=0 or root_opened.st_gid!=0 or stat.S_IMODE(root_opened.st_mode)!=0o755:
+  raise RuntimeError("stage candidate root owner or mode differs")
+ candidate_opened=os.fstat(candidate)
+ current=os.stat(candidate_name,dir_fd=root,follow_symlinks=False)
+ if (candidate_opened.st_dev,candidate_opened.st_ino)!=(wanted_dev,wanted_ino) or (current.st_dev,current.st_ino)!=(wanted_dev,wanted_ino):
+  raise RuntimeError("stage candidate identity differs before build")
+ if candidate_opened.st_uid!=1000 or candidate_opened.st_gid!=1000 or stat.S_IMODE(candidate_opened.st_mode)!=0o750:
+  raise RuntimeError("stage candidate owner or mode differs before build")
+ check=os.open(".",os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=candidate)
+ try:
+  if os.listdir(check):
+   raise RuntimeError("stage candidate is not empty before build")
+ finally:
+  os.close(check)
+ try:
+  existing=inspect_container(container)
+  if existing is not None:
+   raise RuntimeError("stage container name is already in use")
+  try:
+   os.unlink(cidfile)
+  except FileNotFoundError:
+   pass
+  bind_source=f"/proc/{{os.getpid()}}/fd/{{candidate}}"
+  command=[
+   "docker","run","--rm","--name",container,"--cidfile",cidfile,
+   "-v","/data:/data:ro","-v",f"{{bind_source}}:/stage",
+   "-v",f"{{repo}}:/workspace:ro","-w","/workspace",
+   "--entrypoint","/app/.venv/bin/python",image,
+   "scripts/glm52_policy_parity.py","stage-trainer",
+   "--fixture",fixture,"--h200-capture",capture,
+   "--host-output",host_output,"/stage",
+  ]
+  subprocess.run(command,timeout={glm_parity_stage_docker_timeout},check=True)
+  root_current=os.stat(candidate_root_path,follow_symlinks=False)
+  current=os.stat(candidate_name,dir_fd=root,follow_symlinks=False)
+  if (root_opened.st_dev,root_opened.st_ino)!=(root_current.st_dev,root_current.st_ino) or (current.st_dev,current.st_ino)!=(wanted_dev,wanted_ino):
+   raise RuntimeError("stage candidate path identity changed during build")
+  remove_cidfile()
+ except BaseException as error:
+  container_cleanup_ok=True
+  try:
+   cleanup_container()
+  except BaseException as cleanup_error:
+   container_cleanup_ok=False
+   error.add_note("stage container cleanup failed: "+str(cleanup_error))
+  if container_cleanup_ok:
+   try:
+    cleanup_candidate(root,candidate)
+   except BaseException as cleanup_error:
+    error.add_note("stage candidate cleanup failed: "+str(cleanup_error))
+   try:
+    remove_cidfile()
+   except BaseException as cleanup_error:
+    error.add_note("stage container ID file cleanup failed: "+str(cleanup_error))
+  else:
+   error.add_note("stage candidate and container ID evidence retained")
+  raise
+finally:
+ os.close(candidate)
+ os.close(root)
+print("built")
+PY"""
+
+
+def _glm_parity_stage_install_command(
+    stage: str,
+    candidate: str,
+    manifest_sha256: str,
+    reference_sha256: str,
+    session_sha256: str,
+) -> str:
+    root = PurePosixPath(glm_parity_root)
+    stage_path = PurePosixPath(stage)
+    candidate_path = PurePosixPath(candidate)
+    if stage_path != root / "trainer-stage-final":
+        raise Refused("GLM parity install target is not the exact stage path")
+    if (
+        candidate_path.parent != PurePosixPath(glm_parity_stage_candidate_root)
+        or re.fullmatch(r"trainer-stage-candidate-[0-9a-f]{16,64}", candidate_path.name)
+        is None
+    ):
+        raise Refused("GLM parity candidate is not an exact stage candidate path")
+    for name, value in (
+        ("manifest", manifest_sha256),
+        ("reference", reference_sha256),
+        ("session", session_sha256),
+    ):
+        if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise Refused(f"GLM parity stage {name} checksum is invalid")
+    return f"""python3 - {shlex.quote(str(root))} {shlex.quote(glm_parity_stage_candidate_root)} {shlex.quote(stage_path.name)} {shlex.quote(candidate_path.name)} {shlex.quote(manifest_sha256)} {shlex.quote(reference_sha256)} {shlex.quote(session_sha256)} <<'PY'
+import ctypes,fcntl,hashlib,json,os,stat,sys
+root_path,candidate_root_path,stage,candidate,wanted,wanted_reference,wanted_session=sys.argv[1:]
+expected_top={{"manifest.json","trainer-reference.json","trainer-router-trace"}}
+expected_files={{"trainer-reference.json","trainer-router-trace/session.json"}}
+
+def identity(fd):
+ st=os.fstat(fd)
+ return st.st_dev,st.st_ino
+
+def open_dir_at(parent,name):
+ fd=os.open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent)
+ current=os.stat(name,dir_fd=parent,follow_symlinks=False)
+ if not stat.S_ISDIR(current.st_mode) or identity(fd)!=(current.st_dev,current.st_ino):
+  os.close(fd)
+  raise RuntimeError("directory identity changed: "+name)
+ return fd
+
+def read_file_at(parent,name):
+ fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=parent)
+ try:
+  opened=os.fstat(fd)
+  current=os.stat(name,dir_fd=parent,follow_symlinks=False)
+  if not stat.S_ISREG(opened.st_mode) or identity(fd)!=(current.st_dev,current.st_ino):
+   raise RuntimeError("file identity changed: "+name)
+  if opened.st_uid!=1000 or opened.st_gid!=1000 or stat.S_IMODE(opened.st_mode)!=0o644 or opened.st_nlink!=1:
+   raise RuntimeError("file owner or mode differs: "+name)
+  digest=hashlib.sha256()
+  data=bytearray()
+  while True:
+   block=os.read(fd,8*1024*1024)
+   if not block:
+    break
+   digest.update(block)
+   data.extend(block)
+  current=os.stat(name,dir_fd=parent,follow_symlinks=False)
+  if identity(fd)!=(current.st_dev,current.st_ino):
+   raise RuntimeError("file identity changed while reading: "+name)
+  return bytes(data),digest.hexdigest()
+ finally:
+  os.close(fd)
+
+def validate(parent,name,required=None):
+ directory=open_dir_at(parent,name)
+ try:
+  opened=os.fstat(directory)
+  if opened.st_uid!=1000 or opened.st_gid!=1000 or stat.S_IMODE(opened.st_mode)!=0o750:
+   raise RuntimeError("stage owner or mode differs: "+name)
+  if set(os.listdir(directory))!=expected_top:
+   raise RuntimeError("stage entries differ: "+name)
+  manifest_data,manifest_sha=read_file_at(directory,"manifest.json")
+  reference_data,reference_sha=read_file_at(directory,"trainer-reference.json")
+  del reference_data
+  trace=open_dir_at(directory,"trainer-router-trace")
+  try:
+   trace_opened=os.fstat(trace)
+   if trace_opened.st_uid!=1000 or trace_opened.st_gid!=1000 or stat.S_IMODE(trace_opened.st_mode)!=0o755:
+    raise RuntimeError("stage trace owner or mode differs: "+name)
+   if set(os.listdir(trace))!={{"session.json"}}:
+    raise RuntimeError("stage trace entries differ: "+name)
+   session_data,session_sha=read_file_at(trace,"session.json")
+   del session_data
+   trace_current=os.stat("trainer-router-trace",dir_fd=directory,follow_symlinks=False)
+   if identity(trace)!=(trace_current.st_dev,trace_current.st_ino) or set(os.listdir(trace))!={{"session.json"}}:
+    raise RuntimeError("stage trace identity changed: "+name)
+  finally:
+   os.close(trace)
+  manifest=json.loads(manifest_data)
+  if manifest.get("schema_version")!=1 or manifest.get("kind")!="glm52_policy_parity_trainer_stage":
+   raise RuntimeError("stage manifest kind differs: "+name)
+  if set(manifest.get("files",{{}}))!=expected_files:
+   raise RuntimeError("stage manifest files differ: "+name)
+  if manifest["files"]["trainer-reference.json"]!=reference_sha or manifest["files"]["trainer-router-trace/session.json"]!=session_sha:
+   raise RuntimeError("stage artifact checksum differs: "+name)
+  hashes=(manifest_sha,reference_sha,session_sha)
+  if required is not None and hashes!=required:
+   raise RuntimeError("stage required checksum differs: "+name)
+  current=os.stat(name,dir_fd=parent,follow_symlinks=False)
+  if identity(directory)!=(current.st_dev,current.st_ino) or set(os.listdir(directory))!=expected_top:
+   raise RuntimeError("stage identity changed: "+name)
+  return identity(directory),hashes
+ finally:
+  os.close(directory)
+
+def remove_exact(parent,name,wanted_identity):
+ directory=open_dir_at(parent,name)
+ try:
+  if identity(directory)!=wanted_identity:
+   raise RuntimeError("cleanup identity differs: "+name)
+  validate(parent,name)
+  os.unlink("trainer-reference.json",dir_fd=directory)
+  trace=open_dir_at(directory,"trainer-router-trace")
+  try:
+   os.unlink("session.json",dir_fd=trace)
+  finally:
+   os.close(trace)
+  os.rmdir("trainer-router-trace",dir_fd=directory)
+  os.unlink("manifest.json",dir_fd=directory)
+  current=os.stat(name,dir_fd=parent,follow_symlinks=False)
+  if identity(directory)!=(current.st_dev,current.st_ino):
+   raise RuntimeError("cleanup target identity changed: "+name)
+ finally:
+  os.close(directory)
+ os.rmdir(name,dir_fd=parent)
+
+def exchange():
+ libc=ctypes.CDLL(None,use_errno=True)
+ result=libc.renameat2(root,stage.encode(),candidates,candidate.encode(),2)
+ if result!=0:
+  error=ctypes.get_errno()
+  raise OSError(error,os.strerror(error))
+
+def replace(stage_identity,candidate_identity,required):
+ exchange()
+ try:
+  installed_identity,_=validate(root,stage,required)
+  if installed_identity!=candidate_identity:
+   raise RuntimeError("installed stage identity differs")
+ except BaseException:
+  current_stage=os.stat(stage,dir_fd=root,follow_symlinks=False)
+  current_candidate=os.stat(candidate,dir_fd=candidates,follow_symlinks=False)
+  if candidate_identity!=(current_stage.st_dev,current_stage.st_ino) or stage_identity!=(current_candidate.st_dev,current_candidate.st_ino):
+   raise RuntimeError("cannot roll back exchanged stage identities")
+  exchange()
+  raise
+ retained=os.stat(candidate,dir_fd=candidates,follow_symlinks=False)
+ if stage_identity!=(retained.st_dev,retained.st_ino):
+  raise RuntimeError("retained stage identity differs")
+ print("replaced-retained:"+candidate)
+
+root=os.open(root_path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+try:
+ root_opened=os.fstat(root)
+ root_current=os.stat(root_path,follow_symlinks=False)
+ if not stat.S_ISDIR(root_current.st_mode) or identity(root)!=(root_current.st_dev,root_current.st_ino):
+  raise RuntimeError("qualification root identity changed")
+ candidates=os.open(candidate_root_path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+ candidate_root_current=os.stat(candidate_root_path,follow_symlinks=False)
+ candidate_root_opened=os.fstat(candidates)
+ if identity(candidates)!=(candidate_root_current.st_dev,candidate_root_current.st_ino):
+  raise RuntimeError("candidate root identity changed")
+ if candidate_root_opened.st_uid!=0 or candidate_root_opened.st_gid!=0 or stat.S_IMODE(candidate_root_opened.st_mode)!=0o755:
+  raise RuntimeError("candidate root owner or mode differs")
+ if root_opened.st_dev!=candidate_root_opened.st_dev:
+  raise RuntimeError("candidate root is on another filesystem")
+ lock=os.open(".trainer-stage.lock",os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600,dir_fd=root)
+ try:
+  fcntl.flock(lock,fcntl.LOCK_EX)
+  required=(wanted,wanted_reference,wanted_session)
+  candidate_identity,_=validate(candidates,candidate,required)
+  try:
+   stage_identity,stage_hashes=validate(root,stage)
+  except FileNotFoundError:
+   os.rename(candidate,stage,src_dir_fd=candidates,dst_dir_fd=root)
+   try:
+    installed_identity,installed_hashes=validate(root,stage,required)
+    if installed_identity!=candidate_identity or installed_hashes!=required:
+     raise RuntimeError("installed stage identity differs")
+   except BaseException:
+    current_stage=os.stat(stage,dir_fd=root,follow_symlinks=False)
+    if candidate_identity!=(current_stage.st_dev,current_stage.st_ino):
+     raise RuntimeError("cannot roll back installed stage identity")
+    try:
+     os.stat(candidate,dir_fd=candidates,follow_symlinks=False)
+    except FileNotFoundError:
+     pass
+    else:
+     raise RuntimeError("cannot roll back because candidate path reappeared")
+    os.rename(stage,candidate,src_dir_fd=root,dst_dir_fd=candidates)
+    raise
+   print("installed")
+  except Exception as error:
+   stage_fd=open_dir_at(root,stage)
+   try:
+    stage_identity=identity(stage_fd)
+   finally:
+    os.close(stage_fd)
+   del error
+   replace(stage_identity,candidate_identity,required)
+  else:
+   if stage_hashes==required:
+    remove_exact(candidates,candidate,candidate_identity)
+    print("current")
+   else:
+    replace(stage_identity,candidate_identity,required)
+ finally:
+  os.close(lock)
+  os.close(candidates)
+finally:
+ os.close(root)
+PY"""
+
+
+def _glm_parity_stage_candidate_cleanup_command(
+    candidate: str, candidate_identity: str
+) -> str:
+    root = PurePosixPath(glm_parity_root)
+    candidate_path = PurePosixPath(candidate)
+    if (
+        candidate_path.parent != PurePosixPath(glm_parity_stage_candidate_root)
+        or re.fullmatch(r"trainer-stage-candidate-[0-9a-f]{16,64}", candidate_path.name)
+        is None
+    ):
+        raise Refused("GLM parity cleanup target is not an exact stage candidate")
+    if re.fullmatch(r"[0-9]+:[0-9]+", candidate_identity) is None:
+        raise Refused("GLM parity cleanup candidate identity is invalid")
+    return f"""python3 - {shlex.quote(str(root))} {shlex.quote(glm_parity_stage_candidate_root)} {shlex.quote(candidate_path.name)} {shlex.quote(candidate_identity)} <<'PY'
+import fcntl,os,stat,sys
+root_path,candidate_root_path,candidate,wanted=sys.argv[1:]
+wanted_identity=tuple(int(value) for value in wanted.split(":"))
+allowed={{"manifest.json","trainer-reference.json","trainer-router-trace"}}
+root=os.open(root_path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+try:
+ opened=os.fstat(root)
+ current=os.stat(root_path,follow_symlinks=False)
+ if not stat.S_ISDIR(current.st_mode) or (opened.st_dev,opened.st_ino)!=(current.st_dev,current.st_ino):
+  raise RuntimeError("qualification root identity changed")
+ candidates=os.open(candidate_root_path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+ candidate_root_stat=os.fstat(candidates)
+ candidate_root_current=os.stat(candidate_root_path,follow_symlinks=False)
+ if (candidate_root_stat.st_dev,candidate_root_stat.st_ino)!=(candidate_root_current.st_dev,candidate_root_current.st_ino):
+  raise RuntimeError("candidate root identity changed")
+ if candidate_root_stat.st_uid!=0 or candidate_root_stat.st_gid!=0 or stat.S_IMODE(candidate_root_stat.st_mode)!=0o755:
+  raise RuntimeError("candidate root owner or mode differs")
+ lock=os.open(".trainer-stage.lock",os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600,dir_fd=root)
+ try:
+  fcntl.flock(lock,fcntl.LOCK_EX)
+  try:
+   directory=os.open(candidate,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=candidates)
+  except FileNotFoundError:
+   print("absent")
+   raise SystemExit(0)
+  try:
+   directory_stat=os.fstat(directory)
+   current=os.stat(candidate,dir_fd=candidates,follow_symlinks=False)
+   directory_identity=(directory_stat.st_dev,directory_stat.st_ino)
+   if directory_identity!=(current.st_dev,current.st_ino):
+    raise RuntimeError("candidate identity changed")
+   if directory_identity!=wanted_identity:
+    raise RuntimeError("candidate identity differs from the created directory")
+   if directory_stat.st_uid!=1000 or directory_stat.st_gid!=1000 or stat.S_IMODE(directory_stat.st_mode)!=0o750:
+    raise RuntimeError("candidate owner or mode differs")
+   entries=set(os.listdir(directory))
+   if not entries<=allowed:
+    raise RuntimeError("candidate contains an unexpected entry")
+   for name in ("manifest.json","trainer-reference.json"):
+    if name not in entries:
+     continue
+    descriptor=os.open(name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=directory)
+    try:
+     child=os.fstat(descriptor)
+     current=os.stat(name,dir_fd=directory,follow_symlinks=False)
+     if not stat.S_ISREG(child.st_mode) or (child.st_dev,child.st_ino)!=(current.st_dev,current.st_ino):
+      raise RuntimeError("candidate file identity differs: "+name)
+    finally:
+     os.close(descriptor)
+    os.unlink(name,dir_fd=directory)
+   if "trainer-router-trace" in entries:
+    trace=os.open("trainer-router-trace",os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=directory)
+    try:
+     trace_stat=os.fstat(trace)
+     current=os.stat("trainer-router-trace",dir_fd=directory,follow_symlinks=False)
+     if (trace_stat.st_dev,trace_stat.st_ino)!=(current.st_dev,current.st_ino):
+      raise RuntimeError("candidate trace identity differs")
+     trace_entries=set(os.listdir(trace))
+     if not trace_entries<={{"session.json"}}:
+      raise RuntimeError("candidate trace contains an unexpected entry")
+     if "session.json" in trace_entries:
+      descriptor=os.open("session.json",os.O_RDONLY|os.O_NOFOLLOW,dir_fd=trace)
+      try:
+       child=os.fstat(descriptor)
+       current=os.stat("session.json",dir_fd=trace,follow_symlinks=False)
+       if not stat.S_ISREG(child.st_mode) or (child.st_dev,child.st_ino)!=(current.st_dev,current.st_ino):
+        raise RuntimeError("candidate session identity differs")
+      finally:
+       os.close(descriptor)
+      os.unlink("session.json",dir_fd=trace)
+    finally:
+     os.close(trace)
+    os.rmdir("trainer-router-trace",dir_fd=directory)
+   current=os.stat(candidate,dir_fd=candidates,follow_symlinks=False)
+   if directory_identity!=(current.st_dev,current.st_ino):
+    raise RuntimeError("candidate identity changed before removal")
+  finally:
+   os.close(directory)
+  os.rmdir(candidate,dir_fd=candidates)
+  print("removed")
+ finally:
+  os.close(lock)
+  os.close(candidates)
+finally:
+ os.close(root)
+PY"""
+
+
+def _glm_parity_stage_candidate_identity_command(candidate: str) -> str:
+    candidate_path = PurePosixPath(candidate)
+    if (
+        candidate_path.parent != PurePosixPath(glm_parity_stage_candidate_root)
+        or re.fullmatch(
+            r"trainer-stage-candidate-[0-9a-f]{16,64}", candidate_path.name
+        )
+        is None
+    ):
+        raise Refused("GLM parity identity target is not an exact stage candidate")
+    return f"""python3 - {shlex.quote(glm_parity_stage_candidate_root)} {shlex.quote(candidate_path.name)} <<'PY'
+import os,stat,sys
+root_path,name=sys.argv[1:]
+root=os.open(root_path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+try:
+ opened=os.fstat(root)
+ current=os.stat(root_path,follow_symlinks=False)
+ if (opened.st_dev,opened.st_ino)!=(current.st_dev,current.st_ino) or opened.st_uid!=0 or opened.st_gid!=0 or stat.S_IMODE(opened.st_mode)!=0o755:
+  raise RuntimeError("candidate root identity differs")
+ candidate=os.open(name,os.O_PATH|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=root)
+ try:
+  details=os.fstat(candidate)
+  current=os.stat(name,dir_fd=root,follow_symlinks=False)
+  if (details.st_dev,details.st_ino)!=(current.st_dev,current.st_ino) or details.st_uid!=1000 or details.st_gid!=1000 or stat.S_IMODE(details.st_mode)!=0o750:
+   raise RuntimeError("candidate identity differs")
+  print(f"{{details.st_dev}}:{{details.st_ino}}")
+ finally:
+  os.close(candidate)
+finally:
+ os.close(root)
+PY"""
+
+
+def _recover_glm_parity_stage_candidate_identity(
+    host: str, candidate: str
+) -> str | None:
+    code, detail = _ssh(
+        host, _glm_parity_stage_candidate_identity_command(candidate)
+    )
+    value = detail.strip()
+    if code or re.fullmatch(r"[0-9]+:[0-9]+", value) is None:
+        return None
+    return value
+
+
+def _glm_parity_stage_current_command(
+    stage: str,
+    manifest_sha256: str,
+    reference_sha256: str,
+    session_sha256: str,
+) -> str:
+    root = PurePosixPath(glm_parity_root)
+    stage_path = PurePosixPath(stage)
+    if stage_path != root / "trainer-stage-final":
+        raise Refused("GLM parity current check target is not the exact stage")
+    for value in (manifest_sha256, reference_sha256, session_sha256):
+        if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise Refused("GLM parity current check checksum is invalid")
+    return f"""python3 - {shlex.quote(str(root))} {shlex.quote(stage_path.name)} {shlex.quote(manifest_sha256)} {shlex.quote(reference_sha256)} {shlex.quote(session_sha256)} <<'PY'
+import fcntl,hashlib,os,stat,sys
+root_path,stage,wanted_manifest,wanted_reference,wanted_session=sys.argv[1:]
+root=os.open(root_path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+try:
+ opened=os.fstat(root)
+ current=os.stat(root_path,follow_symlinks=False)
+ if not stat.S_ISDIR(current.st_mode) or (opened.st_dev,opened.st_ino)!=(current.st_dev,current.st_ino):
+  raise RuntimeError("qualification root identity changed")
+ lock=os.open(".trainer-stage.lock",os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600,dir_fd=root)
+ try:
+  fcntl.flock(lock,fcntl.LOCK_SH)
+  try:
+   directory=os.open(stage,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=root)
+  except FileNotFoundError:
+   print("stale")
+   raise SystemExit(0)
+  try:
+   directory_stat=os.fstat(directory)
+   current=os.stat(stage,dir_fd=root,follow_symlinks=False)
+   if (directory_stat.st_dev,directory_stat.st_ino)!=(current.st_dev,current.st_ino):
+    raise RuntimeError("stage identity changed")
+   if directory_stat.st_uid!=1000 or directory_stat.st_gid!=1000 or stat.S_IMODE(directory_stat.st_mode)!=0o750:
+    print("stale")
+    raise SystemExit(0)
+   if set(os.listdir(directory))!={{"manifest.json","trainer-reference.json","trainer-router-trace"}}:
+    print("stale")
+    raise SystemExit(0)
+   def digest(parent,name):
+    try:
+     descriptor=os.open(name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=parent)
+    except OSError:
+     print("stale")
+     raise SystemExit(0)
+    try:
+     opened=os.fstat(descriptor)
+     current=os.stat(name,dir_fd=parent,follow_symlinks=False)
+     if not stat.S_ISREG(opened.st_mode) or (opened.st_dev,opened.st_ino)!=(current.st_dev,current.st_ino):
+      raise RuntimeError("stage file identity changed")
+     if opened.st_uid!=1000 or opened.st_gid!=1000 or stat.S_IMODE(opened.st_mode)!=0o644 or opened.st_nlink!=1:
+      print("stale")
+      raise SystemExit(0)
+     value=hashlib.sha256()
+     while True:
+      block=os.read(descriptor,8*1024*1024)
+      if not block:
+       break
+      value.update(block)
+     current=os.stat(name,dir_fd=parent,follow_symlinks=False)
+     if (opened.st_dev,opened.st_ino)!=(current.st_dev,current.st_ino):
+      raise RuntimeError("stage file identity changed while reading")
+     return value.hexdigest()
+    finally:
+     os.close(descriptor)
+   manifest=digest(directory,"manifest.json")
+   reference=digest(directory,"trainer-reference.json")
+   try:
+    trace=os.open("trainer-router-trace",os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=directory)
+   except OSError:
+    print("stale")
+    raise SystemExit(0)
+   try:
+    trace_stat=os.fstat(trace)
+    trace_current=os.stat("trainer-router-trace",dir_fd=directory,follow_symlinks=False)
+    if (trace_stat.st_dev,trace_stat.st_ino)!=(trace_current.st_dev,trace_current.st_ino):
+     raise RuntimeError("stage trace identity changed")
+    if trace_stat.st_uid!=1000 or trace_stat.st_gid!=1000 or stat.S_IMODE(trace_stat.st_mode)!=0o755:
+     print("stale")
+     raise SystemExit(0)
+    if set(os.listdir(trace))!={{"session.json"}}:
+     print("stale")
+     raise SystemExit(0)
+    session=digest(trace,"session.json")
+    trace_current=os.stat("trainer-router-trace",dir_fd=directory,follow_symlinks=False)
+    if (trace_stat.st_dev,trace_stat.st_ino)!=(trace_current.st_dev,trace_current.st_ino):
+     raise RuntimeError("stage trace identity changed while reading")
+   finally:
+    os.close(trace)
+   current=os.stat(stage,dir_fd=root,follow_symlinks=False)
+   if (directory_stat.st_dev,directory_stat.st_ino)!=(current.st_dev,current.st_ino):
+    raise RuntimeError("stage identity changed while reading")
+   print("current" if (manifest,reference,session)==(wanted_manifest,wanted_reference,wanted_session) else "stale")
+  finally:
+   os.close(directory)
+ finally:
+  os.close(lock)
+finally:
+ os.close(root)
+PY"""
+
+
+def _cleanup_glm_parity_stage_candidate(
+    host: str, candidate: str, candidate_identity: str
+) -> None:
+    code, detail = _ssh(
+        host,
+        _glm_parity_stage_candidate_cleanup_command(
+            candidate, candidate_identity
+        ),
+    )
+    state = detail.strip()
+    if code or state not in {"absent", "removed"}:
+        raise RuntimeError(
+            "GLM parity candidate cleanup incomplete: "
+            f"{state[:160] or f'exit {code}'}"
+        )
+
+
+def _copy_glm_parity_stage(host: str, stage: str, local_parent: Path) -> Path:
+    try:
+        copied = subprocess.run(
+            [
+                "scp",
+                "-q",
+                "-o",
+                "BatchMode=yes",
+                "-r",
+                f"{host}:{stage}",
+                str(local_parent),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError("GLM parity stage copy timed out") from error
+    if copied.returncode:
+        raise RuntimeError(
+            f"cannot copy GLM parity stage: {copied.stderr.strip()[:160]}"
+        )
+    return local_parent / PurePosixPath(stage).name
+
+
+def _validate_glm_parity_stage_live_identity(
+    local_stage: Path, fixture: str, capture: str
+) -> str:
+    manifest_sha256 = _validate_glm_parity_stage(local_stage)
+    stage_manifest = json.loads((local_stage / "manifest.json").read_text())
+    command = f"""python3 - {shlex.quote(fixture + '/manifest.json')} {shlex.quote(capture + '/manifest.json')} <<'PY'
+import hashlib,json,os,stat,sys
+fixture_path,capture_path=sys.argv[1:]
+def read(path):
+ descriptor=os.open(path,os.O_RDONLY|os.O_NOFOLLOW)
+ try:
+  opened=os.fstat(descriptor)
+  current=os.stat(path,follow_symlinks=False)
+  if not stat.S_ISREG(opened.st_mode) or (opened.st_dev,opened.st_ino)!=(current.st_dev,current.st_ino):
+   raise RuntimeError("manifest identity changed: "+path)
+  data=bytearray()
+  while True:
+   block=os.read(descriptor,1024*1024)
+   if not block:
+    break
+   data.extend(block)
+  current=os.stat(path,follow_symlinks=False)
+  if (opened.st_dev,opened.st_ino)!=(current.st_dev,current.st_ino):
+   raise RuntimeError("manifest identity changed while reading: "+path)
+  return bytes(data)
+ finally:
+  os.close(descriptor)
+fixture_data=read(fixture_path)
+capture_data=read(capture_path)
+fixture=json.loads(fixture_data)
+capture=json.loads(capture_data)
+if fixture.get("schema_version")!=1 or fixture.get("kind")!="glm52_policy_parity_fixture":
+ raise RuntimeError("live fixture manifest kind differs")
+if capture.get("schema_version")!=1 or capture.get("kind")!="glm52_policy_parity_h200_capture":
+ raise RuntimeError("live H200 capture manifest kind differs")
+canonical_fixture=(json.dumps(fixture,sort_keys=True,separators=(",",":"))+"\\n").encode()
+result={{
+ "fixture_sha256":hashlib.sha256(canonical_fixture).hexdigest(),
+ "capture_manifest_sha256":hashlib.sha256(capture_data).hexdigest(),
+ "capture_fixture_sha256":capture.get("fixture_sha256"),
+ "profile_sha256":capture.get("profile_sha256"),
+ "model_revision":capture.get("model_revision"),
+ "adapter_sha256":capture.get("adapter_sha256"),
+ "h200_image":capture.get("image"),
+ "capture_router_ids_sha256":capture.get("arrays",{{}}).get("router_ids",{{}}).get("sha256"),
+ "capture_full_logprobs_sha256":capture.get("arrays",{{}}).get("full_logprobs",{{}}).get("sha256"),
+}}
+print(json.dumps(result,sort_keys=True,separators=(",",":")))
+PY"""
+    live_output = _remote_ok(
+        orchestrator_host,
+        command,
+        "GLM parity live stage identity",
+    )
+    try:
+        live = json.loads(live_output)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("GLM parity live identity output is invalid") from error
+    identity = stage_manifest["identity"]
+    if stage_manifest.get("fixture_sha256") != live.get("fixture_sha256"):
+        raise RuntimeError("GLM parity stage does not match the live fixture")
+    if stage_manifest.get("h200_capture_manifest_sha256") != live.get(
+        "capture_manifest_sha256"
+    ):
+        raise RuntimeError("GLM parity stage does not match the live H200 capture")
+    if (
+        live.get("capture_fixture_sha256") != live.get("fixture_sha256")
+        or live.get("profile_sha256") != stage_manifest["profile_sha256"]
+        or live.get("model_revision") != identity["model_revision"]
+        or live.get("adapter_sha256") != identity["adapter_sha256"]
+        or live.get("h200_image") != identity["h200_image"]
+        or live.get("capture_router_ids_sha256")
+        != stage_manifest["reference_schema"]["sha256"]
+        or live.get("capture_full_logprobs_sha256")
+        != stage_manifest["reference_schema"]["full_logprobs_sha256"]
+    ):
+        raise RuntimeError("GLM parity stage capture identity differs")
+    return manifest_sha256
 
 
 def _prepare_glm_parity_capture_directory() -> str:
@@ -7306,95 +8348,305 @@ def stage_glm52_policy_parity(nodes: list[str] | None = None) -> None:
     fixture = glm_parity_paths["fixture"]
     capture = glm_parity_paths["h200_capture"]
     stage = glm_parity_paths["trainer_stage"]
-    qualification_root = "/data/glm52-rl/qualifications/glm52-policy-parity/"
+    qualification_root = f"{glm_parity_root}/"
     if not all(path.startswith(qualification_root) for path in (fixture, capture, stage)):
         raise Refused("GLM parity paths must stay under the qualification directory")
     _prepare_glm_parity_capture_directory()
     _deploy_glm_parity_staging_sources()
-    _prepare_glm_parity_stage_directory()
-    quoted_stage = shlex.quote(stage)
-    code, output = _ssh(orchestrator_host, f"test -f {quoted_stage}/manifest.json")
-    if code:
-        command = (
-            f"sudo docker run --rm -v /data:/data "
-            f"-v {shlex.quote(remote_repo)}:/workspace:ro -w /workspace "
-            f"--entrypoint /app/.venv/bin/python {shlex.quote(inference_image)} "
-            "scripts/glm52_policy_parity.py stage-trainer "
-            f"--fixture {shlex.quote(fixture)} "
-            f"--h200-capture {shlex.quote(capture)} {quoted_stage}"
-        )
-        _remote_ok(
-            orchestrator_host,
-            command,
-            "GLM parity trainer staging",
-            timeout=1800,
-        )
+    stage_state = _prepare_glm_parity_stage_directory()
     with tempfile.TemporaryDirectory(prefix="glm52-policy-parity-stage-") as temporary:
-        local_parent = Path(temporary)
-        copied = subprocess.run(
-            [
-                "scp",
-                "-q",
-                "-o",
-                "BatchMode=yes",
-                "-r",
-                f"{orchestrator_host}:{stage}",
-                str(local_parent),
-            ],
-            capture_output=True,
-            text=True,
-        )
-        if copied.returncode:
-            raise RuntimeError(
-                f"cannot copy GLM parity stage: {copied.stderr.strip()[:160]}"
+        temporary_root = Path(temporary)
+        current_parent = temporary_root / "current"
+        current_parent.mkdir()
+        local_stage: Path | None = None
+        manifest_sha256: str | None = None
+        if stage_state == "existing":
+            current_stage = _copy_glm_parity_stage(
+                orchestrator_host, stage, current_parent
             )
-        local_stage = local_parent / Path(stage).name
-        manifest_sha256 = _validate_glm_parity_stage(local_stage)
-        live_capture_sha256 = _remote_ok(
-            orchestrator_host,
-            f"sha256sum {shlex.quote(capture + '/manifest.json')} | cut -d' ' -f1",
-            "GLM parity H200 capture checksum",
-        ).strip()
+            try:
+                manifest_sha256 = _validate_glm_parity_stage_live_identity(
+                    current_stage, fixture, capture
+                )
+            except RuntimeError as error:
+                print(f"GLM parity stage is stale: {error}")
+            else:
+                local_stage = current_stage
+        if local_stage is None:
+            candidate = (
+                f"{glm_parity_stage_candidate_root}/trainer-stage-candidate-"
+                f"{secrets.token_hex(8)}"
+            )
+            candidate_exists = True
+            candidate_identity: str | None = None
+            try:
+                candidate_identity = _remote_ok(
+                    orchestrator_host,
+                    f"test ! -e {shlex.quote(candidate)} && "
+                    f"sudo install -d -o 1000 -g 1000 -m 0750 "
+                    f"{shlex.quote(candidate)} && "
+                    f"stat -c '%d:%i' {shlex.quote(candidate)}",
+                    "GLM parity candidate directory",
+                ).strip()
+                if re.fullmatch(r"[0-9]+:[0-9]+", candidate_identity) is None:
+                    raise RuntimeError("GLM parity candidate identity is invalid")
+                command = _glm_parity_stage_build_command(
+                    candidate,
+                    candidate_identity,
+                    fixture,
+                    capture,
+                )
+                _remote_ok(
+                    orchestrator_host,
+                    command,
+                    "GLM parity trainer staging",
+                    timeout=glm_parity_stage_outer_timeout,
+                )
+                _remote_ok(
+                    orchestrator_host,
+                    f"test \"$(stat -c '%d:%i' {shlex.quote(candidate)})\" = "
+                    f"{shlex.quote(candidate_identity)}",
+                    "GLM parity candidate identity after build",
+                )
+                candidate_parent = temporary_root / "candidate"
+                candidate_parent.mkdir()
+                candidate_stage = _copy_glm_parity_stage(
+                    orchestrator_host, candidate, candidate_parent
+                )
+                manifest_sha256 = _validate_glm_parity_stage_live_identity(
+                    candidate_stage, fixture, capture
+                )
+                stage_manifest = json.loads(
+                    (candidate_stage / "manifest.json").read_text()
+                )
+                install_command = _glm_parity_stage_install_command(
+                    stage,
+                    candidate,
+                    manifest_sha256,
+                    stage_manifest["files"]["trainer-reference.json"],
+                    stage_manifest["files"]["trainer-router-trace/session.json"],
+                )
+                install_state = _remote_ok(
+                    orchestrator_host,
+                    install_command,
+                    "GLM parity stage replacement",
+                ).strip()
+                retained_prefix = "replaced-retained:"
+                if install_state not in {
+                    "current",
+                    "installed",
+                    "replaced",
+                } and not install_state.startswith(retained_prefix):
+                    raise RuntimeError(
+                        "GLM parity stage replacement state is invalid"
+                    )
+                if install_state.startswith(retained_prefix):
+                    print(
+                        "WARNING: GLM parity stage replacement committed; "
+                        f"old exact stage retained: {install_state[len(retained_prefix):]}"
+                    )
+                candidate_exists = False
+                local_stage = candidate_stage
+            except BaseException as error:
+                if candidate_exists:
+                    candidate_identity = candidate_identity or (
+                        _recover_glm_parity_stage_candidate_identity(
+                            orchestrator_host, candidate
+                        )
+                    )
+                    if candidate_identity is None:
+                        error.add_note(
+                            "GLM parity exact candidate identity could not be "
+                            "recovered; candidate was retained"
+                        )
+                    else:
+                        try:
+                            _cleanup_glm_parity_stage_candidate(
+                                orchestrator_host,
+                                candidate,
+                                candidate_identity,
+                            )
+                        except BaseException as cleanup_error:
+                            error.add_note(
+                                "GLM parity exact candidate cleanup is incomplete: "
+                                f"{cleanup_error}"
+                            )
+                raise
+        if manifest_sha256 is None:
+            raise RuntimeError("GLM parity stage manifest checksum is unavailable")
         stage_manifest = json.loads((local_stage / "manifest.json").read_text())
-        if stage_manifest.get("h200_capture_manifest_sha256") != (
-            live_capture_sha256
-        ):
-            raise RuntimeError("GLM parity stage does not match the live H200 capture")
+        reference_sha256 = stage_manifest["files"]["trainer-reference.json"]
+        session_sha256 = stage_manifest["files"][
+            "trainer-router-trace/session.json"
+        ]
 
         def install(host: str) -> str:
-            temporary_remote = f"/tmp/glm52-parity-stage-{manifest_sha256}"
-            copied_to_host = subprocess.run(
-                [
-                    "scp",
-                    "-q",
-                    "-o",
-                    "BatchMode=yes",
-                    "-r",
-                    str(local_stage),
-                    f"{host}:{temporary_remote}",
-                ],
-                capture_output=True,
-                text=True,
+            current_code, current_state = _ssh(
+                host,
+                _glm_parity_stage_current_command(
+                    stage,
+                    manifest_sha256,
+                    reference_sha256,
+                    session_sha256,
+                ),
             )
-            if copied_to_host.returncode:
-                return f"scp failed: {copied_to_host.stderr.strip()[:120]}"
-            command = (
-                f"if test -e {quoted_stage}; then "
-                f"test -f {quoted_stage}/manifest.json && "
-                f"test \"$(sha256sum {quoted_stage}/manifest.json | cut -d' ' -f1)\" "
-                f"= {shlex.quote(manifest_sha256)} || exit 44; "
-                f"rm -rf {shlex.quote(temporary_remote)}; "
-                "else "
-                f"sudo install -d -m 0755 {shlex.quote(str(PurePosixPath(stage).parent))} && "
-                f"sudo mv {shlex.quote(temporary_remote)} {quoted_stage}; fi"
+            if current_code:
+                return f"current stage check failed: {current_state.strip()[:120]}"
+            if current_state.strip() == "current":
+                return "ok"
+            if current_state.strip() != "stale":
+                return "current stage check returned an invalid state"
+            remote_candidate = (
+                f"{glm_parity_stage_candidate_root}/trainer-stage-candidate-"
+                f"{secrets.token_hex(8)}"
             )
-            rc, detail = _ssh(host, command)
-            return "ok" if rc == 0 else f"install failed: {detail.strip()[:120]}"
+            candidate_root_code, candidate_root_detail = _ssh(
+                host, _glm_parity_stage_candidate_root_prepare_command()
+            )
+            if (
+                candidate_root_code
+                or candidate_root_detail.strip() != "ready"
+            ):
+                return (
+                    "candidate root refused: "
+                    f"{candidate_root_detail.strip()[:120]}"
+                )
+            absent_code, absent_detail = _ssh(
+                host, f"test ! -e {shlex.quote(remote_candidate)}"
+            )
+            if absent_code:
+                return f"candidate path refused: {absent_detail.strip()[:120]}"
+            candidate_exists = True
+            remote_candidate_identity: str | None = None
+            result = "ok"
+            try:
+                create_code, create_detail = _ssh(
+                    host,
+                    f"sudo install -d -o 1000 -g 1000 -m 0750 "
+                    f"{shlex.quote(remote_candidate)} && "
+                    f"stat -c '%d:%i' {shlex.quote(remote_candidate)}",
+                )
+                if create_code:
+                    raise RuntimeError(
+                        "candidate create failed: "
+                        f"{create_detail.strip()[:120]}"
+                    )
+                remote_candidate_identity = create_detail.strip()
+                if re.fullmatch(
+                    r"[0-9]+:[0-9]+", remote_candidate_identity
+                ) is None:
+                    raise RuntimeError("candidate create identity is invalid")
+                try:
+                    copied_to_host = subprocess.run(
+                        [
+                            "scp",
+                            "-q",
+                            "-o",
+                            "BatchMode=yes",
+                            "-r",
+                            f"{local_stage}/.",
+                            f"{host}:{remote_candidate}/",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=600,
+                    )
+                except subprocess.TimeoutExpired:
+                    result = "scp timed out"
+                else:
+                    if copied_to_host.returncode:
+                        result = (
+                            "scp failed: "
+                            f"{copied_to_host.stderr.strip()[:120]}"
+                        )
+                    else:
+                        command = _glm_parity_stage_install_command(
+                            stage,
+                            remote_candidate,
+                            manifest_sha256,
+                            reference_sha256,
+                            session_sha256,
+                        )
+                        rc, detail = _ssh(host, command)
+                        state = detail.strip()
+                        if rc:
+                            result = f"install failed: {state[:120]}"
+                        else:
+                            retained_prefix = "replaced-retained:"
+                            if state.startswith(retained_prefix):
+                                candidate_exists = False
+                                result = (
+                                    "ok-retained:"
+                                    f"{state[len(retained_prefix):]}"
+                                )
+                            elif state not in {
+                                "current",
+                                "installed",
+                                "replaced",
+                            }:
+                                result = "install returned an invalid state"
+                            else:
+                                candidate_exists = False
+            except BaseException as error:
+                if candidate_exists:
+                    remote_candidate_identity = remote_candidate_identity or (
+                        _recover_glm_parity_stage_candidate_identity(
+                            host, remote_candidate
+                        )
+                    )
+                    if remote_candidate_identity is None:
+                        error.add_note(
+                            "GLM parity exact candidate identity could not be "
+                            "recovered; candidate was retained"
+                        )
+                    else:
+                        try:
+                            _cleanup_glm_parity_stage_candidate(
+                                host,
+                                remote_candidate,
+                                remote_candidate_identity,
+                            )
+                        except BaseException as cleanup_error:
+                            error.add_note(
+                                "GLM parity exact candidate cleanup is incomplete: "
+                                f"{cleanup_error}"
+                            )
+                raise
+            else:
+                if candidate_exists:
+                    if remote_candidate_identity is None:
+                        result = (
+                            f"{result}; exact candidate identity unavailable; "
+                            "candidate retained"
+                        )
+                    else:
+                        try:
+                            _cleanup_glm_parity_stage_candidate(
+                                host,
+                                remote_candidate,
+                                remote_candidate_identity,
+                            )
+                        except Exception as cleanup_error:
+                            result = (
+                                f"{result}; exact candidate cleanup incomplete: "
+                                f"{str(cleanup_error)[:100]}"
+                            )
+            return result
 
         results = _fan(nodes, install)
-    failed = [host for host, result in results.items() if result != "ok"]
+    failed = [
+        host
+        for host, result in results.items()
+        if result != "ok" and not result.startswith("ok-retained:")
+    ]
     if failed:
         raise RuntimeError(f"GLM parity stage failed on {failed}")
+    for host, result in results.items():
+        if result.startswith("ok-retained:"):
+            print(
+                "WARNING: GLM parity stage replacement committed on "
+                f"{host}; old exact stage retained: {result.removeprefix('ok-retained:')}"
+            )
     print(f"GLM parity trainer stage verified on {len(nodes)} nodes")
 
 

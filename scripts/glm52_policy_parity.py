@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import datetime as dt
 import hashlib
 import json
@@ -22,7 +23,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import numpy as np
@@ -610,8 +611,12 @@ def refresh_fixture_from_trainer_export(
     }
 
 
-def load_h200_capture_manifest(path: Path) -> tuple[dict[str, Any], str]:
+@contextlib.contextmanager
+def open_h200_capture_snapshot(
+    path: Path, selected_arrays: set[str] | None = None
+):
     kind = "glm52_policy_parity_h200_capture"
+    selected_arrays = selected_arrays or set()
     root_descriptor = open_directory(path)
     try:
         manifest, manifest_sha256 = read_json_at(root_descriptor, "manifest.json")
@@ -630,22 +635,42 @@ def load_h200_capture_manifest(path: Path) -> tuple[dict[str, Any], str]:
             "router_weights",
         }:
             raise ValueError("H200 capture array inventory is incomplete")
-        for entry in arrays.values():
+        if not selected_arrays <= set(arrays):
+            raise ValueError("requested H200 capture array is missing")
+        loaded: dict[str, np.ndarray] = {}
+        files: set[str] = set()
+        for name, entry in arrays.items():
             if not isinstance(entry, dict) or not isinstance(entry.get("file"), str):
                 raise ValueError("H200 capture array entry is invalid")
+            if entry["file"] in files:
+                raise ValueError("H200 capture array files are not unique")
+            files.add(entry["file"])
             descriptor = open_regular_at(root_descriptor, entry["file"])
             try:
                 if file_sha256_fd(descriptor) != entry.get("sha256"):
                     raise ValueError(
                         f"checksum mismatch for H200 array {entry['file']}"
                     )
+                if name in selected_arrays:
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    with os.fdopen(os.dup(descriptor), "rb") as stream:
+                        loaded[name] = np.load(stream, allow_pickle=False)
+                require_child_regular_identity(
+                    root_descriptor, entry["file"], descriptor
+                )
             finally:
                 os.close(descriptor)
         validate_retained_h200_diagnostics_fd(root_descriptor, manifest)
         require_directory_identity(path, root_descriptor)
-        return manifest, manifest_sha256
+        yield manifest, manifest_sha256, loaded
+        require_directory_identity(path, root_descriptor)
     finally:
         os.close(root_descriptor)
+
+
+def load_h200_capture_manifest(path: Path) -> tuple[dict[str, Any], str]:
+    with open_h200_capture_snapshot(path) as (manifest, manifest_sha256, _arrays):
+        return manifest, manifest_sha256
 
 
 def load_manifest(path: Path, kind: str) -> dict[str, Any]:
@@ -2394,22 +2419,40 @@ def make_trainer_reference(
 ) -> dict[str, Any]:
     fixture_manifest = load_manifest(fixture, "glm52_policy_parity_fixture")
     check_fresh(profile, fixture, fixture_manifest)
-    capture_manifest = load_manifest(
-        h200_capture, "glm52_policy_parity_h200_capture"
-    )
+    with open_h200_capture_snapshot(
+        h200_capture, {"full_logprobs", "router_ids"}
+    ) as (capture_manifest, capture_manifest_sha256, capture_arrays):
+        return _make_trainer_reference_from_snapshot(
+            profile,
+            fixture,
+            output,
+            fixture_manifest,
+            capture_manifest,
+            capture_manifest_sha256,
+            capture_arrays,
+        )
+
+
+def _make_trainer_reference_from_snapshot(
+    profile: Profile,
+    fixture: Path,
+    output: Path,
+    fixture_manifest: dict[str, Any],
+    capture_manifest: dict[str, Any],
+    capture_manifest_sha256: str,
+    capture_arrays: dict[str, np.ndarray],
+) -> dict[str, Any]:
     validate_h200_capture_sources(capture_manifest)
     if capture_manifest.get("fixture_sha256") != fixture_digest(fixture):
         raise ValueError("H200 capture used another fixture")
     if capture_manifest.get("profile_sha256") != file_sha256(profile.path):
         raise ValueError("H200 capture used another profile")
     input_ids = load_array(fixture, fixture_manifest, "token_ids").astype(np.int64)
-    inference_logprobs = load_array(
-        h200_capture, capture_manifest, "full_logprobs"
-    ).astype(np.float32)
+    inference_logprobs = capture_arrays["full_logprobs"].astype(np.float32)
     if inference_logprobs.shape != input_ids.shape:
         raise ValueError("H200 full logprobs do not align with fixture tokens")
     router_ids = validate_router_ids(
-        profile, load_array(h200_capture, capture_manifest, "router_ids")
+        profile, capture_arrays["router_ids"]
     )
     router_bytes = memoryview(router_ids).cast("B")
     selected = load_array(fixture, fixture_manifest, "selected_indices").astype(np.int64)
@@ -2428,6 +2471,13 @@ def make_trainer_reference(
         "model_revision": capture_manifest.get("model_revision"),
         "adapter_sha256": capture_manifest.get("adapter_sha256"),
         "image": capture_manifest.get("image"),
+        "h200_capture_manifest_sha256": capture_manifest_sha256,
+        "capture_router_ids_sha256": capture_manifest["arrays"]["router_ids"][
+            "sha256"
+        ],
+        "capture_full_logprobs_sha256": capture_manifest["arrays"][
+            "full_logprobs"
+        ]["sha256"],
         "input_ids": input_ids.tolist(),
         "inference_logprobs": inference_logprobs.tolist(),
         "sequence_lengths": [profile.get("context_length")],
@@ -2453,6 +2503,11 @@ def make_trainer_reference(
         "tokens": int(input_ids.size),
         "selected_tokens": int(loss_mask.sum()),
         "routed_experts_shape": list(router_ids.shape),
+        "routed_experts_sha256": payload["routed_experts"]["sha256"],
+        "capture_router_ids_sha256": payload["capture_router_ids_sha256"],
+        "capture_full_logprobs_sha256": payload[
+            "capture_full_logprobs_sha256"
+        ],
         "model_revision": payload["model_revision"],
         "adapter_sha256": payload["adapter_sha256"],
     }
@@ -2480,7 +2535,7 @@ def prepare_trainer_router_trace(
     ).hexdigest()
     source_root = Path(__file__).resolve().parents[1] / "source" / "src"
     sys.path.insert(0, str(source_root))
-    from prime_rl.parity_router_trace import TraceSession, write_session
+    from prime_rl.parity_router_trace import TraceSession
 
     trace_session = TraceSession(
         side="trainer",
@@ -2498,7 +2553,7 @@ def prepare_trainer_router_trace(
         weight_sum_tolerance=profile.get("max_router_weight_sum_error"),
     )
     output.mkdir(parents=True, exist_ok=False)
-    write_session(output, trace_session)
+    (output / "session.json").write_bytes(json_bytes(trace_session.as_dict()))
     return trace_session.as_dict()
 
 
@@ -2510,8 +2565,8 @@ def stage_trainer_artifacts(
 ) -> dict[str, Any]:
     fixture_manifest = load_manifest(fixture, "glm52_policy_parity_fixture")
     check_fresh(profile, fixture, fixture_manifest)
-    capture_manifest = load_manifest(
-        h200_capture, "glm52_policy_parity_h200_capture"
+    capture_manifest, capture_manifest_sha256 = load_h200_capture_manifest(
+        h200_capture
     )
     validate_h200_capture_sources(capture_manifest)
     if capture_manifest.get("fixture_sha256") != fixture_digest(fixture):
@@ -2523,23 +2578,86 @@ def stage_trainer_artifacts(
     output.mkdir(parents=False, exist_ok=True)
     if not output.is_dir() or any(output.iterdir()):
         raise ValueError("trainer stage output must be an empty directory")
+    output.chmod(0o750)
     reference = output / "trainer-reference.json"
     router_trace = output / "trainer-router-trace"
-    make_trainer_reference(profile, fixture, h200_capture, reference)
-    prepare_trainer_router_trace(profile, fixture, h200_capture, router_trace)
+    reference_result = make_trainer_reference(
+        profile, fixture, h200_capture, reference
+    )
+    trace_result = prepare_trainer_router_trace(
+        profile, fixture, h200_capture, router_trace
+    )
+    reference.chmod(0o644)
+    router_trace.chmod(0o755)
+    (router_trace / "session.json").chmod(0o644)
+    final_capture_manifest, final_capture_manifest_sha256 = (
+        load_h200_capture_manifest(h200_capture)
+    )
+    if (
+        final_capture_manifest_sha256 != capture_manifest_sha256
+        or final_capture_manifest != capture_manifest
+    ):
+        raise ValueError("H200 capture changed while building trainer stage")
+    reference_payload = json.loads(reference.read_text())
+    fixture_sha256 = fixture_digest(fixture)
+    profile_sha256 = file_sha256(profile.path)
+    common_identity = {
+        "fixture_sha256": fixture_sha256,
+        "model_revision": capture_manifest["model_revision"],
+        "adapter_sha256": capture_manifest["adapter_sha256"],
+    }
+    for name, expected in common_identity.items():
+        if reference_payload.get(name) != expected or trace_result.get(name) != expected:
+            raise ValueError(f"trainer stage {name} identity differs")
+    if reference_payload.get("profile_sha256") != profile_sha256:
+        raise ValueError("trainer stage reference profile identity differs")
+    if reference_payload.get("image") != capture_manifest["image"]:
+        raise ValueError("trainer stage H200 image identity differs")
+    if (
+        reference_payload.get("h200_capture_manifest_sha256")
+        != capture_manifest_sha256
+        or reference_payload.get("capture_router_ids_sha256")
+        != capture_manifest["arrays"]["router_ids"]["sha256"]
+        or reference_payload.get("capture_full_logprobs_sha256")
+        != capture_manifest["arrays"]["full_logprobs"]["sha256"]
+    ):
+        raise ValueError("trainer stage H200 array identity differs")
+    if trace_result.get("image") != profile.get("trainer_image"):
+        raise ValueError("trainer stage trainer image identity differs")
     manifest = {
         "schema_version": schema_version,
         "kind": "glm52_policy_parity_trainer_stage",
         "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "profile_sha256": file_sha256(profile.path),
-        "fixture_sha256": fixture_digest(fixture),
-        "h200_capture_manifest_sha256": file_sha256(
-            h200_capture / "manifest.json"
-        ),
+        "source_sha256": file_sha256(Path(__file__).resolve()),
+        "profile_sha256": profile_sha256,
+        "fixture_sha256": fixture_sha256,
+        "h200_capture_manifest_sha256": capture_manifest_sha256,
         "route_output_scale": capture_manifest["route_output_scale"],
         "router_weight_provenance": capture_manifest[
             "router_weight_provenance"
         ],
+        "reference_schema": {
+            "schema_version": schema_version,
+            "encoding": "base64",
+            "dtype": "uint8",
+            "shape": reference_result["routed_experts_shape"],
+            "dense_layers": profile.get("dense_layers"),
+            "experts": profile.get("experts"),
+            "sha256": capture_manifest["arrays"]["router_ids"]["sha256"],
+            "routed_experts_sha256": reference_result[
+                "routed_experts_sha256"
+            ],
+            "full_logprobs_sha256": capture_manifest["arrays"][
+                "full_logprobs"
+            ]["sha256"],
+        },
+        "identity": {
+            **common_identity,
+            "profile_sha256": profile_sha256,
+            "h200_image": capture_manifest["image"],
+            "trainer_image": profile.get("trainer_image"),
+            "token_ids_sha256": trace_result["token_ids_sha256"],
+        },
         "files": {
             "trainer-reference.json": file_sha256(reference),
             "trainer-router-trace/session.json": file_sha256(
@@ -2548,6 +2666,7 @@ def stage_trainer_artifacts(
         },
     }
     (output / "manifest.json").write_bytes(json_bytes(manifest))
+    (output / "manifest.json").chmod(0o644)
     return manifest
 
 
@@ -2556,20 +2675,38 @@ def validate_stage_paths(
     fixture: Path,
     h200_capture: Path,
     output: Path,
+    host_output: Path | None = None,
 ) -> None:
     with operations_path.open("rb") as stream:
         operations = tomllib.load(stream)
     expected = operations.get("parity", {}).get("glm52")
     if not isinstance(expected, dict):
         raise ValueError("operations config has no GLM parity paths")
-    actual = {
+    actual_sources = {
         "fixture": str(fixture),
         "h200_capture": str(h200_capture),
-        "trainer_stage": str(output),
     }
-    if actual != expected:
+    expected_sources = {
+        "fixture": expected.get("fixture"),
+        "h200_capture": expected.get("h200_capture"),
+    }
+    stage = PurePosixPath(str(expected.get("trainer_stage")))
+    candidate = PurePosixPath(str(host_output or output))
+    candidate_is_exact = (
+        candidate.parent == stage.parent / ".stage-candidates"
+        and re.fullmatch(
+            r"trainer-stage-candidate-[0-9a-f]{16,64}", candidate.name
+        )
+        is not None
+    )
+    if (
+        actual_sources != expected_sources
+        or (candidate != stage and not candidate_is_exact)
+        or (host_output is not None and PurePosixPath(str(output)) != PurePosixPath("/stage"))
+    ):
         raise ValueError(
-            f"GLM parity staging paths differ from operations config: {actual}"
+            "GLM parity staging paths differ from operations config: "
+            f"{actual_sources | {'trainer_stage': str(candidate)}}"
         )
 
 
@@ -2835,6 +2972,7 @@ def parser() -> argparse.ArgumentParser:
     )
     stage.add_argument("--fixture", type=Path, required=True)
     stage.add_argument("--h200-capture", type=Path, required=True)
+    stage.add_argument("--host-output", type=Path)
     stage.add_argument("output", type=Path)
     record = commands.add_parser("record")
     record.add_argument("--fixture", type=Path, required=True)
@@ -2946,6 +3084,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.fixture,
                 args.h200_capture,
                 args.output,
+                args.host_output,
             )
             result = stage_trainer_artifacts(
                 profile,
