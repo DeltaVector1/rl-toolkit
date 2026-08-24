@@ -1776,6 +1776,14 @@ def _capture_layer0_normalized_kv(
     )
 
 
+def _capture_layer0_kv_before_norm(_module: Any, inputs: Any) -> None:
+    if not isinstance(inputs, tuple) or not inputs or not hasattr(inputs[0], "detach"):
+        raise ValueError("layer 0 KV input is not a tensor")
+    write_hidden_diagnostic(
+        "layer0_kv_before_norm", inputs[0], expected_width=512, token_limit=1
+    )
+
+
 def _capture_layer0_o_proj_input(_module: Any, inputs: Any) -> None:
     if not isinstance(inputs, tuple) or not inputs or not hasattr(inputs[0], "detach"):
         raise ValueError("layer 0 output projection input is not a tensor")
@@ -1799,10 +1807,16 @@ def _install_layer0_token_diagnostics(layer: Any) -> None:
     if any(
         module is None or not hasattr(module, "register_forward_hook")
         for module in (input_norm, kv_norm, output_projection)
-    ) or not hasattr(output_projection, "register_forward_pre_hook"):
+    ) or any(
+        not hasattr(module, "register_forward_pre_hook")
+        for module in (kv_norm, output_projection)
+    ):
         raise ValueError("layer 0 token diagnostics cannot find attention boundaries")
     _diagnostic_hooks.append(
         input_norm.register_forward_hook(_capture_layer0_normalized_input)
+    )
+    _diagnostic_hooks.append(
+        kv_norm.register_forward_pre_hook(_capture_layer0_kv_before_norm)
     )
     _diagnostic_hooks.append(
         kv_norm.register_forward_hook(_capture_layer0_normalized_kv)
