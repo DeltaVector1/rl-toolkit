@@ -464,18 +464,19 @@ class EdgeOperationsTest(unittest.TestCase):
     def test_qualification_refuses_a_live_trainer(self):
         with patch.object(
             training_ops,
-            "_fan",
-            return_value={"n82": (0, training_ops.protected_trainer + "\n")},
-        ):
+            "_ssh",
+            return_value=(0, training_ops.protected_trainer + "\n"),
+        ), patch.object(training_ops, "_fan") as fan:
             with self.assertRaises(training_ops.Refused):
                 training_ops._assert_live_services_are_down(
                     ["n82"], include_inference=False
                 )
+        fan.assert_not_called()
 
     def test_live_service_check_retries_one_transient_banner_timeout(self):
         self.assertEqual(
             training_ops._configured_live_service_check(),
-            (2, 45, 60, 1, 4, 300, 121),
+            (2, 45, 49, 1, 7, 210, 105),
         )
         with patch.object(training_ops.time, "sleep") as sleep, patch.object(
             training_ops,
@@ -493,12 +494,12 @@ class EdgeOperationsTest(unittest.TestCase):
         sleep.assert_called_once_with(1)
         for call in ssh.call_args_list:
             self.assertEqual(call.kwargs["connect_timeout"], 45)
-            self.assertEqual(call.kwargs["timeout"], 60)
+            self.assertEqual(call.kwargs["timeout"], 49)
 
     def test_live_service_check_does_not_retry_a_hard_failure(self):
         with patch.object(
             training_ops, "_ssh", return_value=(255, "Permission denied")
-        ) as ssh, self.assertRaisesRegex(
+        ) as ssh, patch.object(training_ops, "_fan") as fan, self.assertRaisesRegex(
             RuntimeError, "cannot check the live trainer"
         ):
             training_ops._assert_live_services_are_down(
@@ -506,6 +507,7 @@ class EdgeOperationsTest(unittest.TestCase):
             )
 
         ssh.assert_called_once()
+        fan.assert_not_called()
 
     def test_live_service_check_banner_retry_is_bounded(self):
         with patch.object(training_ops.time, "sleep") as sleep, patch.object(
@@ -530,35 +532,45 @@ class EdgeOperationsTest(unittest.TestCase):
                 (255, "Connection timed out during banner exchange"),
                 (0, training_ops.protected_trainer + "\n"),
             ],
-        ) as ssh, self.assertRaises(training_ops.Refused):
+        ) as ssh, patch.object(training_ops, "_fan") as fan, self.assertRaises(
+            training_ops.Refused
+        ):
             training_ops._assert_live_services_are_down(
                 ["n82"], include_inference=False
             )
 
         self.assertEqual(ssh.call_count, 2)
         sleep.assert_called_once_with(1)
+        fan.assert_not_called()
 
     def test_live_service_check_uses_configured_worker_bound(self):
         observed = []
+        order = []
 
         def fan(hosts, function, workers=None):
-            observed.append(workers)
+            observed.append((list(hosts), workers, list(order)))
             return {host: function(host) for host in hosts}
 
+        def ssh(host, script, timeout=120, connect_timeout=None):
+            del script, timeout, connect_timeout
+            order.append(host)
+            return 0, ""
+
         with patch.object(training_ops, "_fan", side_effect=fan), patch.object(
-            training_ops, "_ssh", return_value=(0, "")
+            training_ops, "_ssh", side_effect=ssh
         ):
             training_ops._assert_live_services_are_down(
-                ["n82", "n76"], include_inference=False
+                ["n76", "n82", "n77"], include_inference=False
             )
 
-        self.assertEqual(observed, [4])
+        self.assertEqual(observed, [(["n76", "n77"], 7, ["n82"])])
+        self.assertEqual(order, ["n82", "n76", "n77"])
 
     def test_live_service_check_refuses_aggregate_config_over_budget(self):
         original = dict(training_ops.limits["live_service_check"])
         for change, message in (
             ({"workers": 1}, "trainer service check worst case"),
-            ({"inference_budget_seconds": 120}, "inference service check worst case"),
+            ({"inference_budget_seconds": 98}, "inference service check worst case"),
             ({"trainer_budget_seconds": 3000}, "trainer service check budget"),
         ):
             settings = {**original, **change}

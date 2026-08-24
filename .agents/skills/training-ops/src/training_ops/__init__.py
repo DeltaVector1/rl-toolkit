@@ -167,8 +167,12 @@ def _configured_live_service_check() -> tuple[int, int, int, int, int, int, int]
         raise Refused("live trainer service check budget must be from 1 to 300 seconds")
     if not 1 <= inference_budget <= 180:
         raise Refused("live inference service check budget must be from 1 to 180 seconds")
+    if trainer_head not in trainer_hosts:
+        raise Refused("live service check trainer head is outside the trainer inventory")
     per_host = attempts * command_timeout + (attempts - 1) * retry_delay
-    trainer_worst_case = math.ceil(len(trainer_hosts) / workers) * per_host
+    remaining_trainers = len(trainer_hosts) - 1
+    trainer_stages = 1 + math.ceil(remaining_trainers / workers)
+    trainer_worst_case = trainer_stages * per_host
     if trainer_worst_case > trainer_budget:
         raise Refused(
             f"live trainer service check worst case is {trainer_worst_case} seconds; "
@@ -442,9 +446,21 @@ def _assert_live_services_are_down(nodes: list[str], include_inference: bool) ->
             trainer_deadline,
         )
 
-    trainer_results = _fan(
-        nodes, trainer_active, workers=workers
-    )
+    remaining_nodes = list(nodes)
+    if trainer_head in remaining_nodes:
+        code, output = trainer_active(trainer_head)
+        if code:
+            raise RuntimeError(
+                f"cannot check the live trainer on {trainer_head}: {output.strip()}"
+            )
+        if output.strip():
+            raise Refused(
+                "the live deployment is active on the requested GPUs: "
+                f"{trainer_head}:{output.strip()}"
+            )
+        remaining_nodes = [host for host in remaining_nodes if host != trainer_head]
+
+    trainer_results = _fan(remaining_nodes, trainer_active, workers=workers)
     for host, (code, output) in trainer_results.items():
         if code:
             raise RuntimeError(f"cannot check the live trainer on {host}: {output.strip()}")

@@ -84,11 +84,11 @@ h200_engine_startup_grace_seconds = 7200
 [limits.live_service_check]
 attempts = 2
 connect_timeout_seconds = 45
-command_timeout_seconds = 60
+command_timeout_seconds = 49
 retry_delay_seconds = 1
-workers = 4
-trainer_budget_seconds = 300
-inference_budget_seconds = 121
+workers = 7
+trainer_budget_seconds = 210
+inference_budget_seconds = 105
 
 [parity.glm52]
 fixture = "/data/glm52-rl/qualifications/glm52-policy-parity/fixture"
