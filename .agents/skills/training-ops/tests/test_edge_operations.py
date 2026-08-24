@@ -536,7 +536,7 @@ class EdgeOperationsTest(unittest.TestCase):
         docker = method.index("_glm_parity_stage_build_command(")
         self.assertLess(deploy, docker)
 
-    def test_parity_stage_build_binds_the_opened_candidate_inode(self):
+    def test_parity_stage_build_uses_an_ordinary_inode_bound_mount_for_docker(self):
         candidate = (
             f"{training_ops.glm_parity_stage_candidate_root}/"
             "trainer-stage-candidate-0123456789abcdef"
@@ -548,16 +548,24 @@ class EdgeOperationsTest(unittest.TestCase):
             training_ops.glm_parity_paths["h200_capture"],
         )
         self.assertIn("os.O_PATH|os.O_DIRECTORY|os.O_NOFOLLOW", command)
-        self.assertIn('bind_source=f"/proc/{os.getpid()}/fd/{candidate}"', command)
+        self.assertIn('source=f"/proc/{os.getpid()}/fd/{candidate_descriptor}"', command)
+        self.assertIn("libc.mount(source.encode(),mount_path.encode(),None,MS_BIND,None)", command)
+        self.assertIn('mount_path=f"/run/{mount_name}"', command)
+        self.assertIn('f"{mount_path}:/stage"', command)
+        self.assertNotIn('f"{source}:/stage"', command)
+        self.assertIn("libc.umount2(mount_path.encode(),0)", command)
+        self.assertLess(command.index("os.umask(0o077)"), command.index('"docker","run"'))
         self.assertIn("subprocess.run(command,timeout=1800,check=True)", command)
         self.assertIn("cleanup_container()", command)
         self.assertIn("cleanup_candidate(root,candidate)", command)
         self.assertIn("except BaseException as error", command)
         self.assertNotIn(f"-v {candidate}:/stage", command)
+        helper = command.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+        compile(helper, "glm-parity-stage-helper", "exec")
         self.assertGreaterEqual(
             training_ops.glm_parity_stage_outer_timeout,
             training_ops.glm_parity_stage_docker_timeout
-            + 2 * training_ops.glm_parity_stage_inspect_timeout
+            + 3 * training_ops.glm_parity_stage_inspect_timeout
             + training_ops.glm_parity_stage_remove_timeout
             + 60,
         )
@@ -596,11 +604,11 @@ if args[:2] == ["container", "inspect"]:
 if args[0] == "run":
     state.write_text("running\\n")
     source = next(value[:-7] for value in args if value.endswith(":/stage"))
-    opened = pathlib.Path(os.readlink(source))
+    opened = pathlib.Path(source)
     retained = opened.with_name(opened.name + "-retained")
     opened.rename(retained)
     opened.mkdir(mode=0o750)
-    raise SystemExit(0)
+    raise SystemExit(9)
 if args[0] == "rm":
     if args[-1] != container_id:
         raise SystemExit(2)
@@ -627,6 +635,31 @@ raise SystemExit(3)
             ).replace(
                 "root_opened.st_gid!=0", "root_opened.st_gid!=os.getegid()"
             )
+            command = command.replace(
+                "  try:\n"
+                "   bridge=prepare_mount_bridge(runtime,candidate)\n"
+                "  except FileExistsError as error:\n"
+                "   bridge_cleanup_ok=False\n"
+                '   raise RuntimeError("stage mount bridge path already exists") from error\n'
+                "  bridge_mounted=True\n",
+                "  bridge=os.dup(candidate)\n"
+                f"  mount_path={str(candidate)!r}\n"
+                "  bridge_mounted=False\n",
+            ).replace(
+                "  current=os.stat(mount_name,dir_fd=runtime,follow_symlinks=False)\n"
+                "  if (current.st_dev,current.st_ino)!=(wanted_dev,wanted_ino):\n"
+                '   raise RuntimeError("stage mount bridge does not identify the candidate")\n',
+                "  pass\n",
+                1,
+            ).replace(
+                "  cleanup_mount_bridge(runtime,bridge,bridge_mounted)\n"
+                "  bridge_mounted=False\n"
+                "  os.close(bridge)\n"
+                "  bridge=-1\n",
+                "  os.close(bridge)\n"
+                "  bridge=-1\n",
+                1,
+            )
             environment = os.environ.copy()
             environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
             environment["FAKE_DOCKER_STATE"] = str(state)
@@ -644,7 +677,7 @@ raise SystemExit(3)
                 env=environment,
             )
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("path identity changed", result.stderr)
+            self.assertIn("returned non-zero exit status 9", result.stderr)
             self.assertTrue(candidate.is_dir())
             self.assertTrue(
                 candidate.with_name(candidate.name + "-retained").is_dir()
@@ -699,6 +732,349 @@ raise SystemExit(3)
                 "stage candidate and container ID evidence retained", result.stderr
             )
             self.assertTrue(candidate.is_dir())
+
+    def test_parity_stage_build_retains_candidate_used_by_preexisting_container(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            candidates = root / ".stage-candidates"
+            candidates.mkdir(mode=0o755)
+            candidate = candidates / "trainer-stage-candidate-0123456789abcdef"
+            candidate.mkdir(mode=0o750)
+            identity = candidate.stat()
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_docker = fake_bin / "docker"
+            fake_docker.write_text(
+                "#!/bin/sh\n"
+                "if [ \"$1 $2\" = \"container inspect\" ]; then\n"
+                " printf '%s\\n' \"$(printf 'a%.0s' $(seq 1 64)) /$5\"\n"
+                " exit 0\n"
+                "fi\n"
+                "exit 99\n"
+            )
+            fake_docker.chmod(0o755)
+            with patch.object(
+                training_ops,
+                "glm_parity_stage_candidate_root",
+                str(candidates),
+            ):
+                command = training_ops._glm_parity_stage_build_command(
+                    str(candidate),
+                    f"{identity.st_dev}:{identity.st_ino}",
+                    "/fixture",
+                    "/capture",
+                )
+            command = command.replace("sudo python3", "python3", 1).replace(
+                "root_opened.st_uid!=0", "root_opened.st_uid!=os.geteuid()"
+            ).replace(
+                "root_opened.st_gid!=0", "root_opened.st_gid!=os.getegid()"
+            )
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+            result = subprocess.run(
+                command,
+                shell=True,
+                executable="/bin/bash",
+                capture_output=True,
+                text=True,
+                check=False,
+                env=environment,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("container name is already in use", result.stderr)
+            self.assertIn(
+                "stage candidate and container ID evidence retained", result.stderr
+            )
+            self.assertTrue(candidate.is_dir())
+
+    def test_parity_stage_build_reconciles_valid_stale_cid_before_docker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / "run"
+            runtime.mkdir(mode=0o755)
+            candidates = root / ".stage-candidates"
+            candidates.mkdir(mode=0o755)
+            candidate = candidates / "trainer-stage-candidate-0123456789abcdef"
+            candidate.mkdir(mode=0o750)
+            identity = candidate.stat()
+            container = "glm52-policy-parity-stage-0123456789abcdef"
+            cidfile = runtime / f"{container}.cid"
+            cidfile.write_bytes(b"a" * 64)
+            cidfile.chmod(0o600)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            marker = root / "stale-cid-was-absent"
+            fake_docker = fake_bin / "docker"
+            fake_docker.write_text(
+                """#!/usr/bin/env python3
+import os
+import pathlib
+import sys
+
+args = sys.argv[1:]
+if args[:2] == ["container", "inspect"]:
+    print(f"Error: No such container: {args[-1]}", file=sys.stderr)
+    raise SystemExit(1)
+if args[0] == "run":
+    cidfile = pathlib.Path(args[args.index("--cidfile") + 1])
+    if cidfile.exists():
+        raise SystemExit(98)
+    pathlib.Path(os.environ["FAKE_DOCKER_MARKER"]).write_text("absent\\n")
+    cidfile.write_bytes(b"b" * 64)
+    raise SystemExit(9)
+raise SystemExit(99)
+"""
+            )
+            fake_docker.chmod(0o755)
+            with patch.object(
+                training_ops,
+                "glm_parity_stage_candidate_root",
+                str(candidates),
+            ):
+                command = training_ops._glm_parity_stage_build_command(
+                    str(candidate),
+                    f"{identity.st_dev}:{identity.st_ino}",
+                    "/fixture",
+                    "/capture",
+                )
+            command = command.replace("sudo python3", "python3", 1).replace(
+                "root_opened.st_uid!=0", "root_opened.st_uid!=os.geteuid()"
+            ).replace(
+                "root_opened.st_gid!=0", "root_opened.st_gid!=os.getegid()"
+            ).replace(
+                "runtime_opened.st_uid!=0", "runtime_opened.st_uid!=os.geteuid()"
+            ).replace(
+                "runtime_opened.st_gid!=0", "runtime_opened.st_gid!=os.getegid()"
+            ).replace(
+                "opened.st_uid!=0", "opened.st_uid!=os.geteuid()"
+            ).replace(
+                "opened.st_gid!=0", "opened.st_gid!=os.getegid()"
+            ).replace(
+                "details.st_uid!=0", "details.st_uid!=os.geteuid()"
+            ).replace(
+                'cidfile=f"/run/{container}.cid"',
+                f'cidfile=f"{runtime}/{{container}}.cid"',
+            ).replace(
+                'mount_path=f"/run/{mount_name}"',
+                f'mount_path=f"{runtime}/{{mount_name}}"',
+            ).replace(
+                'runtime=os.open("/run",os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)',
+                f"runtime=os.open({str(runtime)!r},os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)",
+            ).replace(
+                'runtime_current=os.stat("/run",follow_symlinks=False)',
+                f"runtime_current=os.stat({str(runtime)!r},follow_symlinks=False)",
+            ).replace(
+                "  try:\n"
+                "   bridge=prepare_mount_bridge(runtime,candidate)\n"
+                "  except FileExistsError as error:\n"
+                "   bridge_cleanup_ok=False\n"
+                '   raise RuntimeError("stage mount bridge path already exists") from error\n'
+                "  bridge_mounted=True\n",
+                "  bridge=os.dup(candidate)\n"
+                f"  mount_path={str(candidate)!r}\n"
+                "  bridge_mounted=False\n",
+            ).replace(
+                "  current=os.stat(mount_name,dir_fd=runtime,follow_symlinks=False)\n"
+                "  if (current.st_dev,current.st_ino)!=(wanted_dev,wanted_ino):\n"
+                '   raise RuntimeError("stage mount bridge does not identify the candidate")\n',
+                "  pass\n",
+                1,
+            ).replace(
+                "    cleanup_mount_bridge(runtime,bridge,bridge_mounted)\n"
+                "    bridge_mounted=False\n"
+                "    os.close(bridge)\n"
+                "    bridge=-1\n",
+                "    os.close(bridge)\n"
+                "    bridge=-1\n",
+                1,
+            )
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+            environment["FAKE_DOCKER_MARKER"] = str(marker)
+            result = subprocess.run(
+                command,
+                shell=True,
+                executable="/bin/bash",
+                capture_output=True,
+                text=True,
+                check=False,
+                env=environment,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("returned non-zero exit status 9", result.stderr)
+            self.assertEqual(marker.read_text(), "absent\n")
+            self.assertFalse(cidfile.exists())
+            self.assertFalse(candidate.exists())
+
+    def test_parity_stage_build_retains_candidate_when_mount_rollback_fails(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / "run"
+            runtime.mkdir(mode=0o755)
+            candidates = root / ".stage-candidates"
+            candidates.mkdir(mode=0o755)
+            candidate = candidates / "trainer-stage-candidate-0123456789abcdef"
+            candidate.mkdir(mode=0o750)
+            identity = candidate.stat()
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_docker = fake_bin / "docker"
+            fake_docker.write_text(
+                "#!/bin/sh\n"
+                "echo \"Error: No such container: $5\" >&2\n"
+                "exit 1\n"
+            )
+            fake_docker.chmod(0o755)
+            with patch.object(
+                training_ops,
+                "glm_parity_stage_candidate_root",
+                str(candidates),
+            ):
+                command = training_ops._glm_parity_stage_build_command(
+                    str(candidate),
+                    f"{identity.st_dev}:{identity.st_ino}",
+                    "/fixture",
+                    "/capture",
+                )
+            command = command.replace("sudo python3", "python3", 1).replace(
+                "root_opened.st_uid!=0", "root_opened.st_uid!=os.geteuid()"
+            ).replace(
+                "root_opened.st_gid!=0", "root_opened.st_gid!=os.getegid()"
+            ).replace(
+                "runtime_opened.st_uid!=0", "runtime_opened.st_uid!=os.geteuid()"
+            ).replace(
+                "runtime_opened.st_gid!=0", "runtime_opened.st_gid!=os.getegid()"
+            ).replace(
+                "opened.st_uid!=0", "opened.st_uid!=os.geteuid()"
+            ).replace(
+                "opened.st_gid!=0", "opened.st_gid!=os.getegid()"
+            ).replace(
+                'cidfile=f"/run/{container}.cid"',
+                f'cidfile=f"{runtime}/{{container}}.cid"',
+            ).replace(
+                'mount_path=f"/run/{mount_name}"',
+                f'mount_path=f"{runtime}/{{mount_name}}"',
+            ).replace(
+                'runtime=os.open("/run",os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)',
+                f"runtime=os.open({str(runtime)!r},os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)",
+            ).replace(
+                'runtime_current=os.stat("/run",follow_symlinks=False)',
+                f"runtime_current=os.stat({str(runtime)!r},follow_symlinks=False)",
+            ).replace(
+                "libc=ctypes.CDLL(None,use_errno=True)",
+                "class FakeLibc:\n"
+                " def mount(self,*_args): return 0\n"
+                " def umount2(self,*_args): return -1\n"
+                "libc=FakeLibc()",
+            )
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+            result = subprocess.run(
+                command,
+                shell=True,
+                executable="/bin/bash",
+                capture_output=True,
+                text=True,
+                check=False,
+                env=environment,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("mount bridge does not identify", result.stderr)
+            self.assertIn("mount bridge cleanup failed", result.stderr)
+            self.assertIn(
+                "stage candidate and container ID evidence retained", result.stderr
+            )
+            self.assertTrue(candidate.is_dir())
+            self.assertTrue(
+                (runtime / "glm52-policy-parity-stage-0123456789abcdef.mount").is_dir()
+            )
+
+    def test_parity_stage_build_refuses_preexisting_bridge_or_invalid_cid(self):
+        for artifact in ("bridge", "cid"):
+            with self.subTest(artifact=artifact), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                runtime = root / "run"
+                runtime.mkdir(mode=0o755)
+                candidates = root / ".stage-candidates"
+                candidates.mkdir(mode=0o755)
+                candidate = candidates / "trainer-stage-candidate-0123456789abcdef"
+                candidate.mkdir(mode=0o750)
+                identity = candidate.stat()
+                container = "glm52-policy-parity-stage-0123456789abcdef"
+                bridge = runtime / f"{container}.mount"
+                cidfile = runtime / f"{container}.cid"
+                if artifact == "bridge":
+                    bridge.mkdir(mode=0o700)
+                else:
+                    cidfile.write_text("invalid\n")
+                    cidfile.chmod(0o600)
+                fake_bin = root / "bin"
+                fake_bin.mkdir()
+                calls = root / "docker-calls"
+                fake_docker = fake_bin / "docker"
+                fake_docker.write_text(
+                    "#!/bin/sh\n"
+                    f"printf '%s\\n' \"$*\" >> {str(calls)!r}\n"
+                    "echo \"Error: No such container: $5\" >&2\n"
+                    "exit 1\n"
+                )
+                fake_docker.chmod(0o755)
+                with patch.object(
+                    training_ops,
+                    "glm_parity_stage_candidate_root",
+                    str(candidates),
+                ):
+                    command = training_ops._glm_parity_stage_build_command(
+                        str(candidate),
+                        f"{identity.st_dev}:{identity.st_ino}",
+                        "/fixture",
+                        "/capture",
+                    )
+                command = command.replace("sudo python3", "python3", 1).replace(
+                    "root_opened.st_uid!=0", "root_opened.st_uid!=os.geteuid()"
+                ).replace(
+                    "root_opened.st_gid!=0", "root_opened.st_gid!=os.getegid()"
+                ).replace(
+                    "runtime_opened.st_uid!=0", "runtime_opened.st_uid!=os.geteuid()"
+                ).replace(
+                    "runtime_opened.st_gid!=0", "runtime_opened.st_gid!=os.getegid()"
+                ).replace(
+                    "opened.st_uid!=0", "opened.st_uid!=os.geteuid()"
+                ).replace(
+                    "opened.st_gid!=0", "opened.st_gid!=os.getegid()"
+                ).replace(
+                    'cidfile=f"/run/{container}.cid"',
+                    f'cidfile=f"{runtime}/{{container}}.cid"',
+                ).replace(
+                    'mount_path=f"/run/{mount_name}"',
+                    f'mount_path=f"{runtime}/{{mount_name}}"',
+                ).replace(
+                    'runtime=os.open("/run",os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)',
+                    f"runtime=os.open({str(runtime)!r},os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)",
+                ).replace(
+                    'runtime_current=os.stat("/run",follow_symlinks=False)',
+                    f"runtime_current=os.stat({str(runtime)!r},follow_symlinks=False)",
+                )
+                environment = os.environ.copy()
+                environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+                result = subprocess.run(
+                    command,
+                    shell=True,
+                    executable="/bin/bash",
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    env=environment,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertTrue(candidate.is_dir())
+                self.assertEqual(len(calls.read_text().splitlines()), 1)
+                if artifact == "bridge":
+                    self.assertIn("mount bridge path already exists", result.stderr)
+                    self.assertTrue(bridge.is_dir())
+                else:
+                    self.assertIn("ID file identity differs", result.stderr)
+                    self.assertTrue(cidfile.is_file())
 
     def test_parity_stage_install_is_exact_and_transactional(self):
         stage = training_ops.glm_parity_paths["trainer_stage"]

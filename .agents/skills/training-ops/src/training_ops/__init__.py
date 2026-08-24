@@ -58,7 +58,7 @@ glm_parity_stage_inspect_timeout = 30
 glm_parity_stage_remove_timeout = 120
 glm_parity_stage_outer_timeout = (
     glm_parity_stage_docker_timeout
-    + 2 * glm_parity_stage_inspect_timeout
+    + 3 * glm_parity_stage_inspect_timeout
     + glm_parity_stage_remove_timeout
     + 120
 )
@@ -7629,11 +7629,16 @@ def _glm_parity_stage_build_command(
         raise Refused("GLM parity build candidate identity is invalid")
     container = f"glm52-policy-parity-stage-{match.group(1)}"
     return f"""sudo python3 - {shlex.quote(str(candidate_root))} {shlex.quote(candidate_path.name)} {shlex.quote(candidate_identity)} {shlex.quote(container)} {shlex.quote(remote_repo)} {shlex.quote(inference_image)} {shlex.quote(fixture)} {shlex.quote(capture)} {shlex.quote(candidate)} <<'PY'
-import os,re,stat,subprocess,sys
+import ctypes,errno,os,re,stat,subprocess,sys
 candidate_root_path,candidate_name,wanted,container,repo,image,fixture,capture,host_output=sys.argv[1:]
 wanted_dev,wanted_ino=(int(value) for value in wanted.split(":"))
 allowed={{"manifest.json","trainer-reference.json","trainer-router-trace"}}
 cidfile=f"/run/{{container}}.cid"
+mount_name=container+".mount"
+mount_path=f"/run/{{mount_name}}"
+libc=ctypes.CDLL(None,use_errno=True)
+MS_BIND=4096
+os.umask(0o077)
 
 def identity(descriptor):
  details=os.fstat(descriptor)
@@ -7680,6 +7685,64 @@ def remove_cidfile():
   raise RuntimeError("stage container ID file identity differs")
  os.unlink(cidfile)
 
+def prepare_cidfile():
+ try:
+  descriptor=os.open(cidfile,os.O_RDONLY|os.O_NOFOLLOW)
+ except FileNotFoundError:
+  return
+ try:
+  opened=os.fstat(descriptor)
+  current=os.stat(cidfile,follow_symlinks=False)
+  if not stat.S_ISREG(opened.st_mode) or (opened.st_dev,opened.st_ino)!=(current.st_dev,current.st_ino) or opened.st_uid!=0 or opened.st_gid!=0 or stat.S_IMODE(opened.st_mode)!=0o600 or opened.st_nlink!=1 or opened.st_size!=64:
+   raise RuntimeError("pre-existing stage container ID file identity differs")
+  data=os.read(descriptor,65)
+  if re.fullmatch(rb"[0-9a-f]{{64}}",data) is None:
+   raise RuntimeError("pre-existing stage container ID file is invalid")
+  value=data.decode("ascii")
+  if inspect_container(value) is not None or inspect_container(container) is not None:
+   raise RuntimeError("pre-existing stage container still exists")
+  current=os.stat(cidfile,follow_symlinks=False)
+  if (opened.st_dev,opened.st_ino)!=(current.st_dev,current.st_ino):
+   raise RuntimeError("pre-existing stage container ID file changed")
+ finally:
+  os.close(descriptor)
+ os.unlink(cidfile)
+
+def prepare_mount_bridge(runtime_descriptor,candidate_descriptor):
+ os.mkdir(mount_name,0o700,dir_fd=runtime_descriptor)
+ bridge=os.open(mount_name,os.O_PATH|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=runtime_descriptor)
+ try:
+  opened=os.fstat(bridge)
+  current=os.stat(mount_name,dir_fd=runtime_descriptor,follow_symlinks=False)
+  if (opened.st_dev,opened.st_ino)!=(current.st_dev,current.st_ino) or opened.st_uid!=0 or opened.st_gid!=0 or stat.S_IMODE(opened.st_mode)!=0o700:
+   raise RuntimeError("stage mount bridge identity differs")
+  source=f"/proc/{{os.getpid()}}/fd/{{candidate_descriptor}}"
+  if libc.mount(source.encode(),mount_path.encode(),None,MS_BIND,None)!=0:
+   error=ctypes.get_errno()
+   raise OSError(error,os.strerror(error))
+  return bridge
+ except BaseException as error:
+  os.close(bridge)
+  try:
+   os.rmdir(mount_name,dir_fd=runtime_descriptor)
+  except BaseException as cleanup_error:
+   error.add_note("stage mount bridge directory cleanup failed: "+str(cleanup_error))
+  raise
+
+def cleanup_mount_bridge(runtime_descriptor,bridge_descriptor,mounted):
+ if mounted:
+  if libc.umount2(mount_path.encode(),0)!=0:
+   error=ctypes.get_errno()
+   current=os.stat(mount_name,dir_fd=runtime_descriptor,follow_symlinks=False)
+   opened=os.fstat(bridge_descriptor)
+   if error!=errno.EINVAL or (current.st_dev,current.st_ino)!=(opened.st_dev,opened.st_ino):
+    raise OSError(error,os.strerror(error))
+ current=os.stat(mount_name,dir_fd=runtime_descriptor,follow_symlinks=False)
+ opened=os.fstat(bridge_descriptor)
+ if (current.st_dev,current.st_ino)!=(opened.st_dev,opened.st_ino) or opened.st_uid!=0 or opened.st_gid!=0 or stat.S_IMODE(opened.st_mode)!=0o700:
+  raise RuntimeError("stage mount bridge changed before removal")
+ os.rmdir(mount_name,dir_fd=runtime_descriptor)
+
 def cleanup_candidate(root_descriptor,candidate_descriptor):
  current=os.stat(candidate_name,dir_fd=root_descriptor,follow_symlinks=False)
  if (current.st_dev,current.st_ino)!=(wanted_dev,wanted_ino):
@@ -7724,9 +7787,19 @@ def cleanup_candidate(root_descriptor,candidate_descriptor):
   raise RuntimeError("stage cleanup path changed before directory removal")
  os.rmdir(candidate_name,dir_fd=root_descriptor)
 
+runtime=os.open("/run",os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
 root=os.open(candidate_root_path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
 candidate=os.open(candidate_name,os.O_PATH|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=root)
+bridge=-1
+bridge_mounted=False
+bridge_cleanup_ok=True
+evidence_cleanup_ok=True
+container_cleanup_required=False
 try:
+ runtime_opened=os.fstat(runtime)
+ runtime_current=os.stat("/run",follow_symlinks=False)
+ if (runtime_opened.st_dev,runtime_opened.st_ino)!=(runtime_current.st_dev,runtime_current.st_ino) or runtime_opened.st_uid!=0 or runtime_opened.st_gid!=0 or stat.S_IMODE(runtime_opened.st_mode)&0o022:
+  raise RuntimeError("stage runtime root identity or mode differs")
  root_opened=os.fstat(root)
  root_current=os.stat(candidate_root_path,follow_symlinks=False)
  if (root_opened.st_dev,root_opened.st_ino)!=(root_current.st_dev,root_current.st_ino):
@@ -7746,24 +7819,46 @@ try:
  finally:
   os.close(check)
  try:
-  existing=inspect_container(container)
+  try:
+   existing=inspect_container(container)
+  except BaseException:
+   evidence_cleanup_ok=False
+   raise
   if existing is not None:
+   evidence_cleanup_ok=False
    raise RuntimeError("stage container name is already in use")
   try:
-   os.unlink(cidfile)
-  except FileNotFoundError:
-   pass
-  bind_source=f"/proc/{{os.getpid()}}/fd/{{candidate}}"
+   prepare_cidfile()
+  except BaseException:
+   evidence_cleanup_ok=False
+   raise
+  try:
+   bridge=prepare_mount_bridge(runtime,candidate)
+  except FileExistsError as error:
+   bridge_cleanup_ok=False
+   raise RuntimeError("stage mount bridge path already exists") from error
+  bridge_mounted=True
+  current=os.stat(mount_name,dir_fd=runtime,follow_symlinks=False)
+  if (current.st_dev,current.st_ino)!=(wanted_dev,wanted_ino):
+   raise RuntimeError("stage mount bridge does not identify the candidate")
   command=[
    "docker","run","--rm","--name",container,"--cidfile",cidfile,
-   "-v","/data:/data:ro","-v",f"{{bind_source}}:/stage",
+   "-v","/data:/data:ro","-v",f"{{mount_path}}:/stage",
    "-v",f"{{repo}}:/workspace:ro","-w","/workspace",
    "--entrypoint","/app/.venv/bin/python",image,
    "scripts/glm52_policy_parity.py","stage-trainer",
    "--fixture",fixture,"--h200-capture",capture,
    "--host-output",host_output,"/stage",
   ]
+  container_cleanup_required=True
   subprocess.run(command,timeout={glm_parity_stage_docker_timeout},check=True)
+  if inspect_container(container) is not None:
+   raise RuntimeError("stage container remained after successful build")
+  container_cleanup_required=False
+  cleanup_mount_bridge(runtime,bridge,bridge_mounted)
+  bridge_mounted=False
+  os.close(bridge)
+  bridge=-1
   root_current=os.stat(candidate_root_path,follow_symlinks=False)
   current=os.stat(candidate_name,dir_fd=root,follow_symlinks=False)
   if (root_opened.st_dev,root_opened.st_ino)!=(root_current.st_dev,root_current.st_ino) or (current.st_dev,current.st_ino)!=(wanted_dev,wanted_ino):
@@ -7771,12 +7866,22 @@ try:
   remove_cidfile()
  except BaseException as error:
   container_cleanup_ok=True
-  try:
-   cleanup_container()
-  except BaseException as cleanup_error:
-   container_cleanup_ok=False
-   error.add_note("stage container cleanup failed: "+str(cleanup_error))
-  if container_cleanup_ok:
+  if container_cleanup_required:
+   try:
+    cleanup_container()
+   except BaseException as cleanup_error:
+    container_cleanup_ok=False
+    error.add_note("stage container cleanup failed: "+str(cleanup_error))
+  if bridge>=0:
+   try:
+    cleanup_mount_bridge(runtime,bridge,bridge_mounted)
+    bridge_mounted=False
+    os.close(bridge)
+    bridge=-1
+   except BaseException as cleanup_error:
+    bridge_cleanup_ok=False
+    error.add_note("stage mount bridge cleanup failed: "+str(cleanup_error))
+  if container_cleanup_ok and bridge_cleanup_ok and evidence_cleanup_ok:
    try:
     cleanup_candidate(root,candidate)
    except BaseException as cleanup_error:
@@ -7789,8 +7894,11 @@ try:
    error.add_note("stage candidate and container ID evidence retained")
   raise
 finally:
+ if bridge>=0:
+  os.close(bridge)
  os.close(candidate)
  os.close(root)
+ os.close(runtime)
 print("built")
 PY"""
 
@@ -8489,12 +8597,14 @@ def stage_glm52_policy_parity(nodes: list[str] | None = None) -> None:
                     fixture,
                     capture,
                 )
+                candidate_exists = False
                 _remote_ok(
                     orchestrator_host,
                     command,
                     "GLM parity trainer staging",
                     timeout=glm_parity_stage_outer_timeout,
                 )
+                candidate_exists = True
                 _remote_ok(
                     orchestrator_host,
                     f"test \"$(stat -c '%d:%i' {shlex.quote(candidate)})\" = "
