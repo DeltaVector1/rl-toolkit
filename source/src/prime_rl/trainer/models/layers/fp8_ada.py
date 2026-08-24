@@ -1,5 +1,6 @@
 import math
 import os
+import re
 
 import torch
 import torch.distributed as dist
@@ -42,6 +43,15 @@ _EXPERT_PROFILE_EVERY = int(os.environ.get("PRIME_EXPERT_PROFILE_EVERY", "90"))
 # modules reacquire current unsharded FSDP parameters from their owner.
 # Values are [weight, scale, refcount].
 _LINEAR_SNAPSHOT_CACHE: dict[str, list] = {}
+
+
+def exact_module_patterns(module_names) -> list[str]:
+    if len(module_names) != len(set(module_names)):
+        raise ValueError("FP8 BF16 module names must be unique")
+    for name in module_names:
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None:
+            raise ValueError(f"Invalid FP8 BF16 module name: {name!r}")
+    return [rf"(?:^|\.){re.escape(name)}$" for name in module_names]
 
 
 def _acquire_linear_snapshot(
@@ -799,13 +809,14 @@ def _fp8_lm_head_forward(self, hidden_states, labels=None, temperature=None):
     return PrimeLmOutput(logprobs=logprobs.view(b, s), entropy=entropy.view(b, s))
 
 
-def replace_linear(model, embed=False, lm_head=False):
+def replace_linear(model, embed=False, lm_head=False, ignore_patterns=()):
     exclusions = set(model.config.quantization_config["modules_to_not_convert"])
     for name, module in list(model.named_modules()):
         if (
             not isinstance(module, nn.Linear)
             or name in exclusions
             or name.replace(".mlp.router.gate", ".mlp.gate") in exclusions
+            or any(re.search(pattern, name) for pattern in ignore_patterns)
             or name.endswith((".self_attn.kv_b_proj", ".self_attn.indexer.wk"))
         ):
             continue

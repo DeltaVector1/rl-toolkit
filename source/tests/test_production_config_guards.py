@@ -185,6 +185,38 @@ def test_glm52_stability_and_production_pin_bounded_transport_env() -> None:
     assert "PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD" not in muse.get("env_vars", {})
 
 
+def test_all_glm52_trainers_keep_q_and_kv_a_in_bf16() -> None:
+    expected = ["q_a_proj", "kv_a_proj_with_mqa"]
+    expected_profiles = {
+        "configs/qualification/glm52-policy-parity-trainer.toml",
+        "configs/qualification/glm52-native-small.toml",
+        "configs/qualification/glm52-native-b2048.toml",
+        "configs/qualification/glm52-native-stability20.toml",
+        "configs/paused/trainer.glm52-production.toml",
+    }
+    operations = _load("configs/operations.toml")
+    profiles = {
+        profile["trainer"]
+        for profile in operations["profiles"].values()
+        if profile["kind"] == "glm52"
+    }
+    assert profiles == expected_profiles
+    for relative in sorted(profiles):
+        config = _load(relative)
+        quantization = config["model"]["quantization"]
+        assert quantization["type"] == "fp8", relative
+        assert quantization["dequantize_checkpoint"] is False, relative
+        assert quantization["bf16_modules"] == expected, relative
+
+    model_source = (ROOT / "source/src/prime_rl/trainer/model.py").read_text()
+    fp8_source = (
+        ROOT / "source/src/prime_rl/trainer/models/layers/fp8_ada.py"
+    ).read_text()
+    assert "exact_module_patterns(quant.bf16_modules)" in model_source
+    assert "ignore_patterns=ignore_patterns" in model_source
+    assert 'rf"(?:^|\\.){re.escape(name)}$"' in fp8_source
+
+
 def test_pipeline_loader_uses_mesh_data_parallel_rank() -> None:
     train = (ROOT / "source/src/prime_rl/trainer/rl/train.py").read_text()
     data = (ROOT / "source/src/prime_rl/trainer/rl/data.py").read_text()

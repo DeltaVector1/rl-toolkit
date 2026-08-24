@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import gc
+import re
 import sys
 import types
 import unittest
@@ -883,6 +884,81 @@ class FP8AdaAutogradTest(unittest.TestCase):
 
         self.assertEqual(model.layers[0].o_proj._fp8_fqn, "layers.0.o_proj")
         self.assertEqual(model.layers[1].o_proj._fp8_fqn, "layers.1.o_proj")
+
+    def test_glm_q_and_kv_a_remain_exact_bf16(self):
+        model = nn.Module()
+        model.config = types.SimpleNamespace(
+            quantization_config={"modules_to_not_convert": []}
+        )
+        model.self_attn = nn.Module()
+        model.self_attn.q_a_proj = nn.Linear(
+            128, 2048, bias=False, dtype=torch.bfloat16
+        )
+        model.self_attn.kv_a_proj_with_mqa = nn.Linear(
+            128, 576, bias=False, dtype=torch.bfloat16
+        )
+        model.self_attn.q_b_proj = nn.Linear(
+            128, 128, bias=False, dtype=torch.bfloat16
+        )
+        model.self_attn.kv_b_proj = nn.Linear(
+            128, 128, bias=False, dtype=torch.bfloat16
+        )
+        model.self_attn.o_proj = nn.Linear(
+            128, 128, bias=False, dtype=torch.bfloat16
+        )
+        model.mlp = nn.Module()
+        model.mlp.up_proj = nn.Linear(
+            128, 128, bias=False, dtype=torch.bfloat16
+        )
+        q_source = model.self_attn.q_a_proj.weight.detach().clone()
+        kv_source = (
+            model.self_attn.kv_a_proj_with_mqa.weight.detach().clone()
+        )
+
+        patterns = fp8_ada.exact_module_patterns(
+            ("q_a_proj", "kv_a_proj_with_mqa")
+        )
+        for name in (
+            "q_b_proj",
+            "kv_b_proj",
+            "o_proj",
+            "mlp.up_proj",
+            "model.layers.0.mlp.experts.0.gate_proj",
+            "q_a_projection",
+            "q_a_proj.lora_A.0",
+        ):
+            self.assertFalse(any(re.search(pattern, name) for pattern in patterns))
+
+        fp8_ada.replace_linear(model, ignore_patterns=patterns)
+
+        self.assertIs(type(model.self_attn.q_a_proj), nn.Linear)
+        self.assertIs(type(model.self_attn.kv_a_proj_with_mqa), nn.Linear)
+        self.assertEqual(model.self_attn.q_a_proj.weight.dtype, torch.bfloat16)
+        self.assertEqual(
+            model.self_attn.kv_a_proj_with_mqa.weight.dtype,
+            torch.bfloat16,
+        )
+        torch.testing.assert_close(
+            model.self_attn.q_a_proj.weight, q_source, rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            model.self_attn.kv_a_proj_with_mqa.weight,
+            kv_source,
+            rtol=0,
+            atol=0,
+        )
+        self.assertIsInstance(model.self_attn.q_b_proj, fp8_ada.FP8CheckpointLinear)
+        self.assertIsInstance(
+            model.self_attn.kv_b_proj, fp8_ada.FP8CheckpointLinear
+        )
+        self.assertIsInstance(model.self_attn.o_proj, fp8_ada.FP8CheckpointLinear)
+        self.assertIsInstance(model.mlp.up_proj, fp8_ada.FP8CheckpointLinear)
+
+    def test_bf16_module_names_fail_closed(self):
+        with self.assertRaisesRegex(ValueError, "must be unique"):
+            fp8_ada.exact_module_patterns(("q_a_proj", "q_a_proj"))
+        with self.assertRaisesRegex(ValueError, "Invalid"):
+            fp8_ada.exact_module_patterns(("self_attn.q_a_proj",))
 
 
 class MultiLinearAutogradTest(unittest.TestCase):

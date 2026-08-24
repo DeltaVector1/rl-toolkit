@@ -66,6 +66,7 @@ from prime_rl.trainer.models.layers.checkpointing import (
     supports_selective_activation_checkpointing,
 )
 from prime_rl.trainer.models.layers.fp8_ada import (
+    exact_module_patterns,
     replace_linear as replace_linear_with_fp8_checkpoint,
 )
 from prime_rl.trainer.models.layers.fp8_ada import (
@@ -1644,6 +1645,13 @@ def apply_compile(model: nn.Module, compile_config: CompileConfig):
     get_logger().info(f"Compiled {len(layers)} layers (fullgraph={compile_config.fullgraph})")
 
 
+def _fp8_ignore_patterns(quant: FP8Config) -> list[str]:
+    return [
+        *quant.ignore_patterns,
+        *exact_module_patterns(quant.bf16_modules),
+    ]
+
+
 def apply_quantization(model: nn.Module, config: ModelConfig) -> None:
     """Swap dense linears and MoE expert GEMMs to the configured low-precision path.
 
@@ -1659,6 +1667,7 @@ def apply_quantization(model: nn.Module, config: ModelConfig) -> None:
 
     if isinstance(quant, FP8Config):
         set_diagnose_linear_backward(quant.diagnose_linear_backward)
+        ignore_patterns = _fp8_ignore_patterns(quant)
         if getattr(model.config, "fp8_checkpoint_dequantized", False):
             return
         if getattr(model.config, "fp8_checkpoint", False):
@@ -1667,9 +1676,12 @@ def apply_quantization(model: nn.Module, config: ModelConfig) -> None:
                     model,
                     embed=config.fp8_embed_head,
                     lm_head=config.fp8_lm_head,
+                    ignore_patterns=ignore_patterns,
                 )
             return
-        replace_linear_with_fp8_blockwise_linear(model, ignore_modules=quant.ignore_patterns)
+        replace_linear_with_fp8_blockwise_linear(
+            model, ignore_modules=ignore_patterns
+        )
     elif isinstance(quant, MXFP8Config):
         capability = torch.cuda.get_device_capability()
         if capability < (10, 0):
