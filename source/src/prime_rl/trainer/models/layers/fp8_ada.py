@@ -115,7 +115,6 @@ if hasattr(triton, "jit"):
         stride_s1,
         stride_om,
         stride_on,
-        weight_is_output_major: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
@@ -140,26 +139,15 @@ if hasattr(triton, "jit"):
                 mask=(offs_m[:, None] < rows) & (offs_k[None, :] < reduction_size),
                 other=0.0,
             ).to(tl.bfloat16)
-            if weight_is_output_major:
-                weight_fragment = tl.load(
-                    weight + offs_n[None, :] * stride_w0 + offs_k[:, None] * stride_w1,
-                    mask=(offs_n[None, :] < output_size)
-                    & (offs_k[:, None] < reduction_size),
-                    other=0.0,
-                ).to(tl.bfloat16)
-                inverse_scale = tl.load(
-                    scale + (pid_n * stride_s0) + ((k_start // 128) * stride_s1)
-                )
-            else:
-                weight_fragment = tl.load(
-                    weight + offs_k[:, None] * stride_w0 + offs_n[None, :] * stride_w1,
-                    mask=(offs_k[:, None] < reduction_size)
-                    & (offs_n[None, :] < output_size),
-                    other=0.0,
-                ).to(tl.bfloat16)
-                inverse_scale = tl.load(
-                    scale + ((k_start // 128) * stride_s0) + (pid_n * stride_s1)
-                )
+            weight_fragment = tl.load(
+                weight + offs_n[None, :] * stride_w0 + offs_k[:, None] * stride_w1,
+                mask=(offs_n[None, :] < output_size)
+                & (offs_k[:, None] < reduction_size),
+                other=0.0,
+            ).to(tl.bfloat16)
+            inverse_scale = tl.load(
+                scale + (pid_n * stride_s0) + ((k_start // 128) * stride_s1)
+            )
             block_product = tl.dot(
                 activation,
                 weight_fragment,
@@ -173,8 +161,62 @@ if hasattr(triton, "jit"):
             mask=(offs_m[:, None] < rows) & (offs_n[None, :] < output_size),
         )
 
+    @triton.jit
+    def _w8a16_input_grad_kernel(
+        grad,
+        weight,
+        scale,
+        out,
+        rows,
+        input_size: tl.constexpr,
+        output_size: tl.constexpr,
+        stride_gm,
+        stride_gk,
+        stride_wk,
+        stride_wn,
+        stride_sk,
+        stride_sn,
+        stride_om,
+        stride_on,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        """Compute dX from BF16 dY and checkpoint-layout block-FP8 W."""
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        for k_start in tl.range(0, output_size, BLOCK_K, num_stages=2):
+            offs_k = k_start + tl.arange(0, BLOCK_K)
+            grad_fragment = tl.load(
+                grad + offs_m[:, None] * stride_gm + offs_k[None, :] * stride_gk,
+                mask=(offs_m[:, None] < rows) & (offs_k[None, :] < output_size),
+                other=0.0,
+            ).to(tl.bfloat16)
+            weight_fragment = tl.load(
+                weight + offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn,
+                mask=(offs_k[:, None] < output_size)
+                & (offs_n[None, :] < input_size),
+                other=0.0,
+            ).to(tl.bfloat16)
+            inverse_scale = tl.load(
+                scale + (k_start // 128) * stride_sk + pid_n * stride_sn
+            ).to(tl.bfloat16)
+            dequantized_weight = (weight_fragment * inverse_scale).to(tl.bfloat16)
+            accumulator += tl.dot(grad_fragment, dequantized_weight)
+
+        tl.store(
+            out + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on,
+            accumulator,
+            mask=(offs_m[:, None] < rows) & (offs_n[None, :] < input_size),
+        )
+
 else:
     _block_fp8_mm_kernel = None
+    _w8a16_input_grad_kernel = None
 
 
 def set_diagnose_linear_backward(enabled: bool) -> None:
@@ -182,33 +224,19 @@ def set_diagnose_linear_backward(enabled: bool) -> None:
     _DIAGNOSE_LINEAR_BACKWARD = enabled
 
 
-def _native_block_fp8_mm(x, weight, scale, *, weight_is_output_major):
-    """Multiply by serialized block-E4M3 weights without dequantizing them.
-
-    With ``weight_is_output_major=True`` this computes ``x @ weight.T`` (the
-    checkpoint forward layout).  False computes ``x @ weight`` and is the dX
-    layout.  The output is always contiguous; x may have arbitrary positive
-    two-dimensional strides.
-    """
+def _native_block_fp8_mm(x, weight, scale):
+    """Compute x @ weight.T from output-major block-E4M3 weights."""
     if _block_fp8_mm_kernel is None:
         raise RuntimeError("Triton is unavailable")
     if x.ndim != 2 or weight.ndim != 2 or scale.ndim != 2:
         raise ValueError("native block-FP8 GEMM requires 2-D tensors")
     reduction_size = x.shape[1]
-    if weight_is_output_major:
-        output_size = weight.shape[0]
-        expected_reduction = weight.shape[1]
-        expected_scale = (
-            (output_size + 127) // 128,
-            (reduction_size + 127) // 128,
-        )
-    else:
-        expected_reduction = weight.shape[0]
-        output_size = weight.shape[1]
-        expected_scale = (
-            (reduction_size + 127) // 128,
-            (output_size + 127) // 128,
-        )
+    output_size = weight.shape[0]
+    expected_reduction = weight.shape[1]
+    expected_scale = (
+        (output_size + 127) // 128,
+        (reduction_size + 127) // 128,
+    )
     if reduction_size != expected_reduction:
         raise ValueError(
             f"reduction mismatch: activation {reduction_size}, weight {tuple(weight.shape)}"
@@ -250,12 +278,81 @@ def _native_block_fp8_mm(x, weight, scale, *, weight_is_output_major):
         scale.stride(1),
         out.stride(0),
         out.stride(1),
-        weight_is_output_major,
         BLOCK_M=block_m,
         BLOCK_N=128,
         BLOCK_K=128,
         num_warps=num_warps,
         num_stages=2,
+    )
+    return out
+
+
+def _native_w8a16_input_grad(grad, weight, scale):
+    """Compute dX with BF16 activations and block-FP8 checkpoint weights."""
+    if _w8a16_input_grad_kernel is None:
+        raise RuntimeError("Triton is unavailable")
+    if grad.ndim != 2 or weight.ndim != 2 or scale.ndim != 2:
+        raise ValueError("native W8A16 input gradient requires 2-D tensors")
+    if grad.dtype != torch.bfloat16:
+        raise TypeError(f"W8A16 gradient must be BF16, got {grad.dtype}")
+    if weight.dtype != torch.float8_e4m3fn:
+        raise TypeError(f"W8A16 weight must be FP8, got {weight.dtype}")
+    if scale.dtype != torch.float32:
+        raise TypeError(f"W8A16 scale must be FP32, got {scale.dtype}")
+    if not (grad.is_cuda and weight.is_cuda and scale.is_cuda):
+        raise ValueError("native W8A16 input gradient requires CUDA tensors")
+    if grad.device != weight.device or grad.device != scale.device:
+        raise ValueError("W8A16 gradient, weight, and scale must share one device")
+    output_size, input_size = weight.shape
+    if grad.shape[1] != output_size:
+        raise ValueError(
+            f"reduction mismatch: gradient {grad.shape[1]}, weight {tuple(weight.shape)}"
+        )
+    expected_scale = (
+        (output_size + 127) // 128,
+        (input_size + 127) // 128,
+    )
+    if tuple(scale.shape) != expected_scale:
+        raise ValueError(
+            f"scale shape {tuple(scale.shape)} does not cover weight "
+            f"{tuple(weight.shape)}; expected {expected_scale}"
+        )
+
+    out = torch.empty(
+        grad.shape[0], input_size, device=grad.device, dtype=torch.bfloat16
+    )
+    if grad.shape[0] <= 64:
+        block_m, num_warps = 16, 4
+    elif grad.shape[0] <= 512:
+        block_m, num_warps = 32, 4
+    elif grad.shape[0] <= 2048:
+        block_m, num_warps = 64, 8
+    else:
+        block_m, num_warps = 128, 8
+    grid = (
+        triton.cdiv(grad.shape[0], block_m),
+        triton.cdiv(input_size, 128),
+    )
+    _w8a16_input_grad_kernel[grid](
+        grad,
+        weight,
+        scale,
+        out,
+        grad.shape[0],
+        input_size,
+        output_size,
+        grad.stride(0),
+        grad.stride(1),
+        weight.stride(0),
+        weight.stride(1),
+        scale.stride(0),
+        scale.stride(1),
+        out.stride(0),
+        out.stride(1),
+        BLOCK_M=block_m,
+        BLOCK_N=128,
+        BLOCK_K=128,
+        num_warps=num_warps,
     )
     return out
 
@@ -304,9 +401,7 @@ def _w8a16_linear(x, weight, scale):
         )
     shape = (*x.shape[:-1], weight.shape[0])
     x_2d = x.reshape(-1, x.shape[-1]).contiguous()
-    return _native_block_fp8_mm(
-        x_2d, weight, scale, weight_is_output_major=True
-    ).view(shape)
+    return _native_block_fp8_mm(x_2d, weight, scale).view(shape)
 
 
 def _w8a16_input_grad(
@@ -325,9 +420,7 @@ def _w8a16_input_grad(
         )
     shape = (*grad.shape[:-1], weight.shape[1])
     grad_2d = grad.reshape(-1, grad.shape[-1]).contiguous()
-    input_grad = _native_block_fp8_mm(
-        grad_2d, weight, scale, weight_is_output_major=False
-    ).view(shape)
+    input_grad = _native_w8a16_input_grad(grad_2d, weight, scale).view(shape)
     if (
         _DIAGNOSE_LINEAR_BACKWARD
         or os.environ.get("PRIME_FP8_DIAG_LINEAR_BACKWARD", "") == "1"

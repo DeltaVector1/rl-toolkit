@@ -284,11 +284,10 @@ class FP8AdaAutogradTest(unittest.TestCase):
 
         original_native = fp8_ada._native_block_fp8_mm
 
-        def fake_native(x, raw_weight, block_scale, *, weight_is_output_major):
+        def fake_native(x, raw_weight, block_scale):
             seen["x_dtype"] = x.dtype
             seen["weight_dtype"] = raw_weight.dtype
             seen["scale_dtype"] = block_scale.dtype
-            seen["weight_is_output_major"] = weight_is_output_major
             return sentinel
 
         fp8_ada._native_block_fp8_mm = fake_native
@@ -302,7 +301,6 @@ class FP8AdaAutogradTest(unittest.TestCase):
             "x_dtype": torch.bfloat16,
             "weight_dtype": torch.float8_e4m3fn,
             "scale_dtype": torch.float32,
-            "weight_is_output_major": True,
         })
         torch.testing.assert_close(got, sentinel)
 
@@ -319,23 +317,22 @@ class FP8AdaAutogradTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "input width"):
             fp8_ada._w8a16_linear(value[..., :128], weight, scale)
 
-    def test_w8a16_backward_uses_native_transposed_layout(self):
+    def test_w8a16_backward_uses_dedicated_native_kernel(self):
         grad = torch.randn(2, 384, dtype=torch.bfloat16)
         weight = torch.empty(384, 256, dtype=torch.float8_e4m3fn)
         scale = torch.ones(3, 2, dtype=torch.float32)
         sentinel = torch.full((2, 256), 31.0, dtype=torch.bfloat16)
         seen = {}
 
-        original_native = fp8_ada._native_block_fp8_mm
+        original_native = fp8_ada._native_w8a16_input_grad
 
-        def fake_native(value, raw_weight, block_scale, *, weight_is_output_major):
+        def fake_native(value, raw_weight, block_scale):
             seen["x_shape"] = value.shape
             seen["weight_shape"] = raw_weight.shape
             seen["scale_shape"] = block_scale.shape
-            seen["weight_is_output_major"] = weight_is_output_major
             return sentinel
 
-        fp8_ada._native_block_fp8_mm = fake_native
+        fp8_ada._native_w8a16_input_grad = fake_native
         try:
             got = fp8_ada._w8a16_input_grad(
                 grad,
@@ -344,14 +341,13 @@ class FP8AdaAutogradTest(unittest.TestCase):
                 fqn="model.layers.11.self_attn.o_proj",
             )
         finally:
-            fp8_ada._native_block_fp8_mm = original_native
+            fp8_ada._native_w8a16_input_grad = original_native
 
         self.assertEqual(got.shape, (2, 256))
         self.assertEqual(seen, {
             "x_shape": (2, 384),
             "weight_shape": (384, 256),
             "scale_shape": (3, 2),
-            "weight_is_output_major": False,
         })
         torch.testing.assert_close(got, sentinel)
 
