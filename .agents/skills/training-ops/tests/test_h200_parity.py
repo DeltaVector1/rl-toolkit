@@ -16,6 +16,8 @@ class H200ParityTest(unittest.TestCase):
         fail_start=False,
         fail_capture=False,
         fail_cleanup=False,
+        fail_fixture_backup=False,
+        fail_capture_backup=False,
         interrupt_fifo=False,
         main_status="absent",
     ):
@@ -43,6 +45,8 @@ class H200ParityTest(unittest.TestCase):
                 ) + "\n"
             if "state=created" in command and ".fixture-candidate-" in command:
                 return 0, "replaced\n"
+            if "state=created" in command and ".h200-capture-previous-" in command:
+                return 0, "replaced\n"
             if "docker ps -a" in command and "glm52-optims-h200-" in command:
                 return 0, "absent\n"
             if "docker ps -a" in command and "glm52-optims-h200" in command:
@@ -53,6 +57,20 @@ class H200ParityTest(unittest.TestCase):
                 return 1, f"capture rejected {secret}"
             if command.startswith("sudo rm -f --") and fail_cleanup:
                 return 1, "cleanup failed"
+            if (
+                fail_fixture_backup
+                and ".fixture-previous-" in command
+                and "rm -rf --" in command
+                and ".fixture-failed-" not in command
+            ):
+                return 1, "fixture backup retained"
+            if (
+                fail_capture_backup
+                and ".h200-capture-previous-" in command
+                and "rm -rf --" in command
+                and ".h200-capture-failed-" not in command
+            ):
+                return 1, "capture backup retained"
             return 0, ""
 
         def secret_call(host, command, provided, label, timeout):
@@ -399,8 +417,8 @@ class H200ParityTest(unittest.TestCase):
             for command in commands
             if ".fixture-failed-1111111111111111" in command
         )
-        self.assertIn('mv "$previous" "$fixture"', rollback)
-        self.assertIn('rm -rf -- "$failed"', rollback)
+        self.assertIn(".fixture-previous-1111111111111111", rollback)
+        self.assertIn(".fixture-failed-1111111111111111", rollback)
 
     def test_diagnostic_operation_uses_memory_token_and_exact_cleanup(self):
         commands = []
@@ -409,6 +427,7 @@ class H200ParityTest(unittest.TestCase):
         )
         result = self._run_operation(ssh_call, secret_call, secret)
         self.assertNotIn(secret, json.dumps(result, sort_keys=True))
+        self.assertEqual(result["cleanup_warnings"], [])
         self.assertEqual(secret_inputs, [secret, secret])
         self.assertEqual(self.last_diagnostic_copy.args[0], training_ops.trainer_head)
         self.assertNotEqual(self.last_diagnostic_copy.args[0], training_ops.trainer_hosts[0])
@@ -457,6 +476,20 @@ class H200ParityTest(unittest.TestCase):
         self.assertIn('name=glm52-optims-h200', final_cleanup)
         self.assertIn('name=^/${name}$', final_cleanup)
         self.assertFalse(any("*" in command for command in removals))
+        self.assertTrue(
+            any(
+                ".fixture-previous-1111111111111111" in command
+                and "rm -rf --" in command
+                for command in commands
+            )
+        )
+        self.assertTrue(
+            any(
+                ".h200-capture-previous-1111111111111111" in command
+                and "rm -rf --" in command
+                for command in commands
+            )
+        )
 
     def test_diagnostic_operation_cleans_exact_container_after_start_failure(self):
         commands = []
@@ -479,6 +512,39 @@ class H200ParityTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "artifact cleanup failed"):
             self._run_operation(ssh_call, secret_call, secret)
+        rollback = next(
+            command
+            for command in commands
+            if ".fixture-failed-1111111111111111" in command
+            and ".h200-capture-failed-1111111111111111" in command
+        )
+        self.assertIn(".fixture-previous-1111111111111111", rollback)
+        self.assertIn(".h200-capture-previous-1111111111111111", rollback)
+
+    def test_committed_fixture_backup_cleanup_failure_is_only_a_warning(self):
+        commands = []
+        secret, ssh_call, secret_call, _ = self._operation_ssh(
+            commands, fail_fixture_backup=True
+        )
+        result = self._run_operation(ssh_call, secret_call, secret)
+        self.assertEqual(len(result["cleanup_warnings"]), 1)
+        self.assertIn("fixture backup cleanup failed", result["cleanup_warnings"][0])
+        self.assertTrue(
+            any(
+                ".h200-capture-previous-1111111111111111" in command
+                and "rm -rf --" in command
+                for command in commands
+            )
+        )
+
+    def test_committed_capture_backup_cleanup_failure_is_only_a_warning(self):
+        commands = []
+        secret, ssh_call, secret_call, _ = self._operation_ssh(
+            commands, fail_capture_backup=True
+        )
+        result = self._run_operation(ssh_call, secret_call, secret)
+        self.assertEqual(len(result["cleanup_warnings"]), 1)
+        self.assertIn("capture backup cleanup failed", result["cleanup_warnings"][0])
 
     def test_diagnostic_operation_cleans_fifo_and_container_on_interrupt(self):
         commands = []

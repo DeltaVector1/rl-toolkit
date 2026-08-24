@@ -2940,10 +2940,15 @@ def diagnose_glm52_policy_parity(name: str, keep_engine: bool = False) -> dict[s
     fixture_candidate = f"{root}/.fixture-candidate-{nonce}"
     fixture_previous = f"{root}/.fixture-previous-{nonce}"
     temporary_capture = f"{root}/.h200-capture-{nonce}"
+    capture_previous = f"{root}/.h200-capture-previous-{nonce}"
     engine_launch_attempted = False
     fixture_published = False
     fixture_replaced = False
+    capture_published = False
+    capture_replaced = False
     succeeded = False
+    committed = False
+    cleanup_warnings: list[str] = []
     operation_error: BaseException | None = None
     try:
         root_command = (
@@ -3051,14 +3056,22 @@ root={shlex.quote(root)}
 fixture={shlex.quote(fixture)}
 candidate={shlex.quote(fixture_candidate)}
 previous={shlex.quote(fixture_previous)}
+failed={shlex.quote(root + '/.fixture-publish-failed-' + nonce)}
 test ! -L "$root"
 test "$(realpath -e "$root")" = "$root"
 test -d "$candidate"
 test ! -L "$candidate"
 test -f "$candidate/manifest.json"
 test ! -e "$previous"
+test ! -e "$failed"
+changed=0
+had_previous=0
 restore_fixture() {{
-  if test -e "$previous" && ! test -e "$fixture"; then mv "$previous" "$fixture"; fi
+  if test "$changed" = 1; then
+    if test -e "$fixture"; then mv "$fixture" "$failed"; fi
+    if test "$had_previous" = 1 && test -e "$previous"; then mv "$previous" "$fixture"; fi
+    if test -e "$failed"; then rm -rf -- "$failed"; fi
+  fi
 }}
 trap restore_fixture EXIT
 state=created
@@ -3066,9 +3079,12 @@ if test -e "$fixture"; then
   test -d "$fixture"
   test ! -L "$fixture"
   mv "$fixture" "$previous"
+  changed=1
+  had_previous=1
   state=replaced
 fi
 mv "$candidate" "$fixture"
+changed=1
 test -f "$fixture/manifest.json"
 trap - EXIT
 printf '%s\n' "$state"
@@ -3149,31 +3165,49 @@ assert m.get("direct_router_diagnostic") is not None
 for e in m.get("arrays",{{}}).values():
  f=p/e["file"]; assert f.is_file() and not f.is_symlink()
  assert hashlib.sha256(f.read_bytes()).hexdigest()==e["sha256"]' "$candidate"
-previous="$root/.h200-capture-previous-{nonce}"
+previous={shlex.quote(capture_previous)}
+failed="$root/.h200-capture-publish-failed-{nonce}"
 test ! -e "$previous"
+test ! -e "$failed"
+changed=0
+had_previous=0
 restore_previous() {{
-  if test -e "$previous" && ! test -e "$capture"; then mv "$previous" "$capture"; fi
+  if test "$changed" = 1; then
+    if test -e "$capture"; then mv "$capture" "$failed"; fi
+    if test "$had_previous" = 1 && test -e "$previous"; then mv "$previous" "$capture"; fi
+    if test -e "$failed"; then rm -rf -- "$failed"; fi
+  fi
 }}
 trap restore_previous EXIT
-if test -e "$capture"; then mv "$capture" "$previous"; fi
+state=created
+if test -e "$capture"; then
+  test -d "$capture"
+  test ! -L "$capture"
+  mv "$capture" "$previous"
+  changed=1
+  had_previous=1
+  state=replaced
+fi
 mv "$candidate" "$capture"
-if test -e "$previous"; then rm -rf -- "$previous"; fi
+changed=1
+test -f "$capture/manifest.json"
 trap - EXIT
+printf '%s\n' "$state"
 """
-        _sensitive_ssh(host, publish_command, "H200 parity capture publish", sensitive, 300)
-        if fixture_replaced:
-            _sensitive_ssh(
-                host,
-                f"test -d {shlex.quote(fixture_previous)} && "
-                f"test ! -L {shlex.quote(fixture_previous)} && "
-                f"rm -rf -- {shlex.quote(fixture_previous)}",
-                "previous parity fixture removal",
-                sensitive,
-                120,
-            )
-        fixture_published = False
+        capture_state = _sensitive_ssh(
+            host, publish_command, "H200 parity capture publish", sensitive, 300
+        ).strip()
+        if capture_state not in {"created", "replaced"}:
+            raise RuntimeError("H200 parity capture publish returned an invalid state")
+        capture_published = True
+        capture_replaced = capture_state == "replaced"
         succeeded = True
-        return {"capture": capture, "diagnostic_plan": plan, "engine_kept": keep_engine}
+        return {
+            "capture": capture,
+            "diagnostic_plan": plan,
+            "engine_kept": keep_engine,
+            "cleanup_warnings": cleanup_warnings,
+        }
     except BaseException as error:
         operation_error = error
         raise
@@ -3199,35 +3233,6 @@ test -z "$(sudo docker ps -a --filter "name=^/${{name}}$" --format '{{{{.Names}}
                 cleanup_failures.append(
                     "isolated parity container cleanup failed: "
                     + _redact_sensitive(container_output.strip(), sensitive)
-                )
-        if fixture_published:
-            if fixture_replaced:
-                fixture_rollback = f"""
-set -euo pipefail
-fixture={shlex.quote(fixture)}
-previous={shlex.quote(fixture_previous)}
-test -d "$previous"
-test ! -L "$previous"
-failed={shlex.quote(root)}/.fixture-failed-{nonce}
-test ! -e "$failed"
-mv "$fixture" "$failed"
-mv "$previous" "$fixture"
-rm -rf -- "$failed"
-test -f "$fixture/manifest.json"
-"""
-            else:
-                fixture_rollback = (
-                    f"test -d {shlex.quote(fixture)} && "
-                    f"test ! -L {shlex.quote(fixture)} && "
-                    f"rm -rf -- {shlex.quote(fixture)}"
-                )
-            rollback_code, rollback_output = _ssh(
-                host, fixture_rollback, timeout=180
-            )
-            if rollback_code:
-                cleanup_failures.append(
-                    "parity fixture rollback failed: "
-                    + _redact_sensitive(rollback_output.strip(), sensitive)
                 )
         cleanup = (
             f"sudo rm -f -- {shlex.quote(bootstrap_fifo)}; "
@@ -3256,6 +3261,103 @@ test -f "$fixture/manifest.json"
                 "temporary parity artifact cleanup failed: "
                 + _redact_sensitive(cleanup_output.strip(), sensitive)
             )
+        if operation_error is not None or cleanup_failures:
+            fixture_failed = f"{root}/.fixture-failed-{nonce}"
+            capture_failed = f"{root}/.h200-capture-failed-{nonce}"
+            validation = []
+            move_new = []
+            restore_old = []
+            verify_old = []
+            remove_new = []
+            for published, replaced, live, previous, failed in (
+                (
+                    fixture_published,
+                    fixture_replaced,
+                    fixture,
+                    fixture_previous,
+                    fixture_failed,
+                ),
+                (
+                    capture_published,
+                    capture_replaced,
+                    capture,
+                    capture_previous,
+                    capture_failed,
+                ),
+            ):
+                if not published:
+                    continue
+                validation.extend(
+                    (
+                        f"test -d {shlex.quote(live)}",
+                        f"test ! -L {shlex.quote(live)}",
+                        f"test ! -e {shlex.quote(failed)}",
+                    )
+                )
+                if replaced:
+                    validation.extend(
+                        (
+                            f"test -d {shlex.quote(previous)}",
+                            f"test ! -L {shlex.quote(previous)}",
+                        )
+                    )
+                    restore_old.append(
+                        f"if test -e {shlex.quote(previous)} && "
+                        f"! test -e {shlex.quote(live)}; then "
+                        f"mv {shlex.quote(previous)} {shlex.quote(live)}; fi"
+                    )
+                    verify_old.append(f"test -f {shlex.quote(live + '/manifest.json')}")
+                move_new.append(
+                    f"mv {shlex.quote(live)} {shlex.quote(failed)}"
+                )
+                remove_new.append(f"rm -rf -- {shlex.quote(failed)}")
+            if move_new:
+                rollback = "\n".join(
+                    (
+                        "set -euo pipefail",
+                        *validation,
+                        "restore_pair() {",
+                        *(f"  {command}" for command in restore_old),
+                        "}",
+                        "trap restore_pair EXIT",
+                        *move_new,
+                        *restore_old,
+                        *verify_old,
+                        "trap - EXIT",
+                        *remove_new,
+                    )
+                )
+                rollback_code, rollback_output = _ssh(host, rollback, timeout=300)
+                if rollback_code:
+                    cleanup_failures.append(
+                        "parity fixture and capture rollback failed: "
+                        + _redact_sensitive(rollback_output.strip(), sensitive)
+                    )
+                else:
+                    fixture_published = False
+                    capture_published = False
+        elif succeeded:
+            committed = True
+            for replaced, previous, label in (
+                (fixture_replaced, fixture_previous, "fixture"),
+                (capture_replaced, capture_previous, "capture"),
+            ):
+                if not replaced:
+                    continue
+                backup_cleanup = (
+                    f"test -d {shlex.quote(previous)} && "
+                    f"test ! -L {shlex.quote(previous)} && "
+                    f"rm -rf -- {shlex.quote(previous)}"
+                )
+                backup_code, backup_output = _ssh(host, backup_cleanup, timeout=180)
+                if backup_code:
+                    warning = (
+                        f"committed parity {label} backup cleanup failed; "
+                        f"backup remains at {previous}: "
+                        + _redact_sensitive(backup_output.strip(), sensitive)
+                    )
+                    cleanup_warnings.append(warning)
+                    print("WARNING: " + warning)
         bootstrap_token = ""
         sensitive = ()
         if cleanup_failures:
@@ -3264,6 +3366,8 @@ test -f "$fixture/manifest.json"
                 operation_error.add_note(detail)
             else:
                 raise RuntimeError(detail)
+        if succeeded and not committed:
+            raise RuntimeError("parity fixture and capture transaction did not commit")
 
 
 def _repair_engine(host: str) -> str:
