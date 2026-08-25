@@ -161,16 +161,13 @@ def test_production_allocator_does_not_strand_large_reserved_blocks() -> None:
 
 
 def test_glm52_stability_and_production_use_exact_bf16_expert_transport() -> None:
-    expected = {
-        "PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD": "0",
-    }
     for relative in (
         "configs/qualification/glm52-native-stability20.toml",
         "configs/qualification/glm52-native-b2048.toml",
         "configs/paused/trainer.glm52-production.toml",
     ):
         config = _load(relative)
-        assert config["env_vars"] == expected, relative
+        assert config.get("env_vars", {}) == {}, relative
         assert config["model"]["quantization"]["expert_activation_transport"] == "bf16"
 
     launcher = (ROOT / "scripts/china/cluster.sh").read_text()
@@ -211,6 +208,9 @@ def test_all_glm52_trainers_use_h200_w8a8_semantics() -> None:
         assert quantization["fused_qkv_a_fp8"] is True, relative
         assert quantization["expert_activation_transport"] == "bf16", relative
         assert "PRIME_INT4_COMBINE_ROUNDS" not in config.get("env_vars", {}), relative
+        assert "PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD" not in config.get(
+            "env_vars", {}
+        ), relative
 
     model_source = (ROOT / "source/src/prime_rl/trainer/model.py").read_text()
     fp8_source = (

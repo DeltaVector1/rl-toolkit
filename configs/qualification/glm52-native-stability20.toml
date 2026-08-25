@@ -81,6 +81,3 @@ save_format = "safetensors"
 
 [rollout_transport]
 type = "filesystem"
-
-[env_vars]
-PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD = "0"
