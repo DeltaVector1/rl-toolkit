@@ -1063,8 +1063,9 @@ def train(config: TrainerConfig):
         if config.model.cp_style == "ulysses":
             setup_model_cp(model, cp_group, cp_rank, parallel_dims.cp)
 
-    # Pipeline parallelism: wrap this rank's stage once, before the loop.
+    # Pipeline parallelism: build one or two local virtual stages before the loop.
     pp_stage_module = None
+    pp_stage_modules = None
     pp_rank = 0
     if parallel_dims.pp_enabled:
         from prime_rl.trainer.distributed.pp_runner import PipelineStageModule
@@ -1077,7 +1078,10 @@ def train(config: TrainerConfig):
         from prime_rl.trainer.distributed.pp_runner import force_fsdp_lazy_init
         from prime_rl.trainer.distributed.pp_runner import minimum_pipeline_microbatches
         from prime_rl.trainer.distributed.pp_runner import sparse_cache_transport_shape
-        from prime_rl.trainer.distributed.pipeline_parallel import sparse_cache_stage_flags
+        from prime_rl.trainer.distributed.pipeline_parallel import (
+            pp_layer_ranges,
+            sparse_cache_stage_flags,
+        )
 
         pp_rank = parallel_dims.get_mesh("pp").get_local_rank()
         # Weight broadcast: tell the gatherer to merge stage dicts over the pp
@@ -1096,25 +1100,48 @@ def train(config: TrainerConfig):
             is_stage_master=(dist.get_rank() % _ranks_per_stage) == 0,
             stage_master_ranks=_stage_master_ranks,
         )
-        receive_sparse_indices = False
-        send_sparse_indices = False
-        if config.model.pp_transfer_sparse_indices:
-            receive_sparse_indices, send_sparse_indices = sparse_cache_stage_flags(
-                model, pp_rank, parallel_dims.pp
+        local_virtual_stages = 2 if config.model.pp_schedule == "interleaved_1f1b" else 1
+        ranges = pp_layer_ranges(
+            model.model,
+            pp_rank,
+            parallel_dims.pp,
+        )
+        if len(ranges) != local_virtual_stages:
+            raise RuntimeError(
+                f"model has {len(ranges)} virtual ranges but schedule needs {local_virtual_stages}"
             )
+        pp_stage_modules = []
+        for local_index, layer_range in enumerate(ranges):
+            stage_identity = pp_rank + local_index * parallel_dims.pp
+            receive_sparse_indices = False
+            send_sparse_indices = False
+            if config.model.pp_transfer_sparse_indices:
+                receive_sparse_indices, send_sparse_indices = sparse_cache_stage_flags(
+                    model,
+                    pp_rank,
+                    parallel_dims.pp,
+                    virtual_stage=local_index,
+                    virtual_stages=local_virtual_stages,
+                )
             logger.info(
-                f"PP stage {pp_rank}: receive sparse cache={receive_sparse_indices}, "
+                f"PP stage {stage_identity}/{parallel_dims.pp * local_virtual_stages}: "
+                f"layers={layer_range}, receive sparse cache={receive_sparse_indices}, "
                 f"send sparse cache={send_sparse_indices}"
             )
-        pp_stage_module = PipelineStageModule(
-            model,
-            is_first=pp_rank == 0,
-            is_last=pp_rank == parallel_dims.pp - 1,
-            offload_cfg=config.model.ac_offloading,
-            transfer_sparse_indices=config.model.pp_transfer_sparse_indices,
-            receive_sparse_indices=receive_sparse_indices,
-            send_sparse_indices=send_sparse_indices,
-        )
+            pp_stage_modules.append(
+                PipelineStageModule(
+                    model,
+                    is_first=stage_identity == 0,
+                    is_last=stage_identity == parallel_dims.pp * local_virtual_stages - 1,
+                    offload_cfg=config.model.ac_offloading,
+                    transfer_sparse_indices=config.model.pp_transfer_sparse_indices,
+                    receive_sparse_indices=receive_sparse_indices,
+                    send_sparse_indices=send_sparse_indices,
+                    stage_identity=stage_identity,
+                    layer_indices=tuple(range(layer_range[0], layer_range[1])),
+                )
+            )
+        pp_stage_module = pp_stage_modules[0] if local_virtual_stages == 1 else pp_stage_modules
 
     # Optionally, resume training from a checkpoint
     progress = Progress()
@@ -1861,8 +1888,11 @@ def train(config: TrainerConfig):
                 )
             parity_bundle_readiness = _n
             pp_side_inputs = pad_pp_side_inputs(pp_side_inputs, cp_world_size=parallel_dims.cp)
-            pp_stage_module.loss_closure = _pp_loss
-            pp_stage_module.set_side_inputs(pp_side_inputs)
+            if pp_stage_modules is None:
+                raise RuntimeError("pipeline stage modules were not initialized")
+            for stage_module in pp_stage_modules:
+                stage_module.loss_closure = _pp_loss
+                stage_module.set_side_inputs(pp_side_inputs)
             # All micro-batches share one padded shape, so hand the stage its
             # exact tensors and skip the metadata-exchange rendezvous.
             _L = pp_side_inputs[0]["input_ids"].shape[1]
@@ -1881,40 +1911,57 @@ def train(config: TrainerConfig):
             _stage_dtype = DTYPE_MAP[config.model.optimization_dtype]
             _hidden_ex = torch.empty(1, _L, _hs, dtype=_stage_dtype, device="cuda")
             _cache_ex = None
+            _cache_placeholder_ex = None
             if config.model.pp_transfer_sparse_indices:
+                _cache_placeholder_ex = torch.empty(
+                    (1,), dtype=torch.float16, device="cuda"
+                )
                 _cache_ex = torch.empty(
                     sparse_cache_transport_shape(_L, model.config.index_topk)
-                    if pp_stage_module.receive_sparse_indices
+                    if any(stage.receive_sparse_indices for stage in pp_stage_modules)
                     else (1,),
                     # PipelineStage requires floating-point receive buffers.
                     # FP16 carries the lossless unsigned 16-bit index bits.
                     dtype=torch.float16,
                     device="cuda",
                 )
-            _is_last = pp_rank == parallel_dims.pp - 1
-            _example_input = (
-                torch.empty(1, _L, dtype=torch.int64, device="cuda")
-                if pp_rank == 0
-                else ((_hidden_ex, _cache_ex) if _cache_ex is not None else _hidden_ex)
-            )
-            _output_cache_ex = None
-            if config.model.pp_transfer_sparse_indices and not _is_last:
-                _output_cache_ex = torch.empty(
-                    sparse_cache_transport_shape(_L, model.config.index_topk)
-                    if pp_stage_module.send_sparse_indices
-                    else (1,),
-                    dtype=torch.float16,
-                    device="cuda",
+            _example_inputs = []
+            _example_outputs = []
+            for stage_module in pp_stage_modules:
+                if stage_module.is_first:
+                    _example_input = torch.empty(
+                        1, _L, dtype=torch.int64, device="cuda"
+                    )
+                else:
+                    if config.model.pp_transfer_sparse_indices:
+                        _example_input = (
+                            _hidden_ex,
+                            _cache_ex
+                            if stage_module.receive_sparse_indices
+                            else _cache_placeholder_ex,
+                        )
+                    else:
+                        _example_input = _hidden_ex
+                _output_cache_ex = None
+                if config.model.pp_transfer_sparse_indices and not stage_module.is_last:
+                    _output_cache_ex = torch.empty(
+                        sparse_cache_transport_shape(_L, model.config.index_topk)
+                        if stage_module.send_sparse_indices
+                        else (1,),
+                        dtype=torch.float16,
+                        device="cuda",
+                    )
+                _example_output = (
+                    torch.empty((), dtype=torch.float32, device="cuda")
+                    if stage_module.is_last
+                    else (
+                        (_hidden_ex, _output_cache_ex)
+                        if _output_cache_ex is not None
+                        else _hidden_ex
+                    )
                 )
-            _example_output = (
-                torch.empty((), dtype=torch.float32, device="cuda")
-                if _is_last
-                else (
-                    (_hidden_ex, _output_cache_ex)
-                    if _output_cache_ex is not None
-                    else _hidden_ex
-                )
-            )
+                _example_inputs.append(_example_input)
+                _example_outputs.append(_example_output)
             pp_schedule = build_pp_schedule(
                 pp_stage_module,
                 pp_rank=pp_rank,
@@ -1922,8 +1969,16 @@ def train(config: TrainerConfig):
                 n_microbatches=len(pp_side_inputs),
                 pp_group=parallel_dims.get_mesh("pp").get_group(),
                 schedule_name=config.model.pp_schedule,
-                example_input=_example_input,
-                example_output=_example_output,
+                example_input=(
+                    _example_inputs
+                    if config.model.pp_schedule == "interleaved_1f1b"
+                    else _example_inputs[0]
+                ),
+                example_output=(
+                    _example_outputs
+                    if config.model.pp_schedule == "interleaved_1f1b"
+                    else _example_outputs[0]
+                ),
             )
             # FSDP must be initialised before the schedule issues its first
             # prefetch, which happens before any forward on some stages.
@@ -1975,7 +2030,14 @@ def train(config: TrainerConfig):
                     f"PP step: {len(pp_side_inputs)} micro-batches in {local_schedule_ms / 1000.0:.2f}s"
                 )
             if profile_pp_stage:
-                forward_ms, backward_ms = pp_stage_module.profile_times_ms(clear=True)
+                forward_ms = 0.0
+                backward_ms = 0.0
+                for stage_module in pp_stage_modules:
+                    stage_forward, stage_backward = stage_module.profile_times_ms(
+                        clear=True
+                    )
+                    forward_ms += stage_forward
+                    backward_ms += stage_backward
                 local_profile = torch.tensor(
                     [float(pp_rank), local_schedule_ms, forward_ms, backward_ms],
                     dtype=torch.float64,
@@ -1999,14 +2061,25 @@ def train(config: TrainerConfig):
                         "PP stage profile ms (stage, schedule, forward, backward): "
                         f"{stage_profiles}"
                     )
+            for stage_module in pp_stage_modules:
+                stage_module.assert_side_inputs_consumed()
             # Free this step's pipeline state NOW. The side inputs (including
             # routed_experts, tens of MB per micro-batch) and the stage's
             # per-micro-batch recv/grad buffers otherwise survive through the
             # optimizer step and overlap with the NEXT batch's allocations --
             # a multi-GB transient that ran the 47.4 GiB cards to the edge.
-            pp_stage_module.set_side_inputs([])
-            pp_stage_module.loss_closure = None
-            del pp_schedule, pp_inputs, _hidden_ex, _cache_ex, _output_cache_ex, pp_side_inputs
+            for stage_module in pp_stage_modules:
+                stage_module.set_side_inputs([])
+                stage_module.loss_closure = None
+            del (
+                pp_schedule,
+                pp_inputs,
+                _hidden_ex,
+                _cache_ex,
+                _cache_placeholder_ex,
+                _output_cache_ex,
+                pp_side_inputs,
+            )
             pp_side_inputs = []
 
             # F6: MoE router stat buffers accumulate via add_ every forward and

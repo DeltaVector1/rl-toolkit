@@ -1889,7 +1889,8 @@ def setup_model(
         from prime_rl.trainer.distributed.pipeline_parallel import apply_pp_layers
 
         pp_rank = parallel_dims.get_mesh("pp").get_local_rank()
-        apply_pp_layers(model, pp_rank, parallel_dims.pp)
+        virtual_stages = 2 if config.pp_schedule == "interleaved_1f1b" else 1
+        apply_pp_layers(model, pp_rank, parallel_dims.pp, virtual_stages=virtual_stages)
         preserve_glm_moe_bias_precision(model)
 
     possible_to_load_to_meta = can_reinit_empty_buffers(model)
@@ -2018,6 +2019,8 @@ def forward(
     # Set instead of input_ids by a pipeline stage that is not the first: it
     # receives hidden states from the previous stage rather than token ids.
     inputs_embeds: Tensor | None = None,
+    pipeline_layer_indices: tuple[int, ...] | None = None,
+    pipeline_apply_norm: bool = True,
 ) -> PrimeLmOutput:
     kwargs = {
         "labels": labels,
@@ -2048,6 +2051,9 @@ def forward(
         kwargs["routed_experts"] = routed_experts
     if sparse_indices_cache is not None:
         kwargs["sparse_indices_cache"] = sparse_indices_cache
+    if pipeline_layer_indices is not None:
+        kwargs["pipeline_layer_indices"] = pipeline_layer_indices
+        kwargs["pipeline_apply_norm"] = pipeline_apply_norm
 
     out = model(**kwargs)
 

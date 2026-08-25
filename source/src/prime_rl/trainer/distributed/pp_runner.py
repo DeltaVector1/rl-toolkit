@@ -5,10 +5,9 @@ Design notes, because the obvious approaches do not fit this trainer:
 * A pipeline stage only receives the previous stage's activations, but this
   model also needs ``position_ids``, ``seq_lens`` and ``routed_experts`` on every
   stage. Passing them down the pipe would ship ``routed_experts`` (tens of MB)
-  across every boundary. Instead each rank keeps the per-micro-batch side inputs
-  in a list and consumes them in order: a schedule runs each stage's forwards in
-  micro-batch order, so an index is enough. Activation checkpointing recomputes
-  inside layers, not at stage granularity, so it does not disturb that order.
+  across every boundary. Each rank keeps side inputs keyed by stage and
+  micro-batch. Activation checkpointing recomputes inside layers, not at stage
+  granularity, so it does not change those keys.
 
 * ``torch.distributed.pipelining`` wants ``loss_fn(output, target)`` on the last
   stage and chunks ``target`` for you. This RL loss takes about eight per-token
@@ -18,6 +17,7 @@ Design notes, because the obvious approaches do not fit this trainer:
 """
 
 import os
+from collections.abc import Mapping, Sequence
 from typing import Any, Callable
 
 import torch
@@ -31,18 +31,36 @@ def minimum_pipeline_microbatches(schedule_name: str, pp_size: int) -> int:
         # this before schedule construction so a rollout batch with mostly
         # failed samples can be discarded without stopping all trainer ranks.
         return pp_size
+    if schedule_name == "interleaved_1f1b":
+        return pp_size
     if schedule_name == "gpipe":
         return 1
     raise ValueError(
-        f"pp_schedule must be one of ['1f1b', 'gpipe'], got {schedule_name!r}"
+        "pp_schedule must be one of ['1f1b', 'interleaved_1f1b', 'gpipe'], "
+        f"got {schedule_name!r}"
     )
+
+
+def validate_interleaved_microbatches(num_microbatches: int, pp_size: int) -> int:
+    if num_microbatches < pp_size:
+        raise ValueError(
+            f"interleaved_1f1b needs at least {pp_size} micro-batches, "
+            f"got {num_microbatches}"
+        )
+    rounds = max(1, num_microbatches // pp_size)
+    if num_microbatches % rounds:
+        raise ValueError(
+            "interleaved_1f1b requires the number of micro-batches to be a "
+            f"multiple of the number of rounds ({rounds}), got {num_microbatches}"
+        )
+    return rounds
 
 
 class PipelineStageModule(nn.Module):
     """One pipeline stage: hidden states in, hidden states (or loss) out.
 
-    ``side_inputs`` is the ordered list of per-micro-batch tensors this rank will
-    need; ``reset()`` must be called before each optimizer step.
+    ``side_inputs`` are the per-micro-batch tensors this stage will need;
+    each lookup uses the schedule micro-batch id.
     """
 
     def __init__(
@@ -55,11 +73,19 @@ class PipelineStageModule(nn.Module):
         transfer_sparse_indices: bool = False,
         receive_sparse_indices: bool | None = None,
         send_sparse_indices: bool | None = None,
+        stage_identity: int = 0,
+        layer_indices: Sequence[int] | None = None,
     ):
         super().__init__()
         self.model = model
         self.is_first = is_first
         self.is_last = is_last
+        self.stage_identity = int(stage_identity)
+        self.layer_indices = (
+            tuple(int(index) for index in layer_indices)
+            if layer_indices is not None
+            else None
+        )
         self.loss_closure = loss_closure
         # One OffloadActivations instance PER FORWARD, created in forward().
         # A single instance wrapped around the whole schedule asserts
@@ -82,8 +108,9 @@ class PipelineStageModule(nn.Module):
         if self.profile_stage:
             self.register_full_backward_pre_hook(self._record_backward_start)
             self.register_full_backward_hook(self._record_backward_end)
-        self._side: list[dict] = []
-        self._idx = 0
+        self._side: dict[tuple[int, int], dict] = {}
+        self._consumed_side: set[tuple[int, int]] = set()
+        self._active_microbatch: int | None = None
 
     def _record_backward_start(self, _module, _grad_output) -> None:
         event = torch.cuda.Event(enable_timing=True)
@@ -110,22 +137,71 @@ class PipelineStageModule(nn.Module):
             self._backward_events.clear()
         return forward, backward
 
-    def set_side_inputs(self, side: list[dict]) -> None:
-        self._side = side
-        self._idx = 0
+    def set_side_inputs(self, side: Mapping | Sequence[dict]) -> None:
+        if isinstance(side, Mapping):
+            entries = {}
+            for key, value in side.items():
+                if not isinstance(key, tuple) or len(key) != 2:
+                    raise RuntimeError(
+                        "pipeline side-input keys must be (stage_identity, microbatch_id)"
+                    )
+                normalized = (int(key[0]), int(key[1]))
+                if normalized in entries:
+                    raise RuntimeError(f"duplicate pipeline side-input key {normalized}")
+                entries[normalized] = value
+            self._side = entries
+        else:
+            self._side = {
+                (self.stage_identity, microbatch_id): value
+                for microbatch_id, value in enumerate(side)
+            }
+        self._consumed_side.clear()
+        self._active_microbatch = None
 
     def reset(self) -> None:
-        self._idx = 0
+        self._side.clear()
+        self._consumed_side.clear()
+        self._active_microbatch = None
 
-    def _next_side(self) -> dict:
+    def set_active_microbatch(self, microbatch_id: int) -> None:
+        if self._active_microbatch is not None:
+            raise RuntimeError(
+                f"pipeline stage {self.stage_identity} already has active microbatch "
+                f"{self._active_microbatch}"
+            )
+        self._active_microbatch = int(microbatch_id)
+
+    def clear_active_microbatch(self) -> None:
+        self._active_microbatch = None
+
+    def assert_side_inputs_consumed(self) -> None:
+        if self._side:
+            keys = sorted(self._side)
+            raise RuntimeError(
+                f"pipeline stage {self.stage_identity} did not consume side inputs {keys[:4]}"
+            )
+
+    def _next_side(self, microbatch_id: int | None = None) -> dict:
         # Side inputs are staged on CPU and moved to the GPU only when the
-        # micro-batch's forward consumes them; the list slot is dropped so the
+        # micro-batch's forward consumes them; the keyed entry is dropped so the
         # CPU copy frees as the schedule advances. Keeping the WHOLE batch's
         # side inputs GPU-resident cost ~7.6 GB/rank at 190 micro-batches
         # (routed_experts alone is ~40 MB each) and OOM'd the 12-layer stages.
-        cpu = self._side[self._idx]
-        self._side[self._idx] = None
-        self._idx += 1
+        if microbatch_id is None:
+            microbatch_id = self._active_microbatch
+        if microbatch_id is None:
+            raise RuntimeError(
+                f"pipeline stage {self.stage_identity} requested side inputs without a microbatch id"
+            )
+        key = (self.stage_identity, int(microbatch_id))
+        if key in self._consumed_side:
+            raise RuntimeError(f"duplicate pipeline side-input consumption for {key}")
+        if key not in self._side:
+            raise RuntimeError(f"missing pipeline side inputs for {key}")
+        cpu = self._side.pop(key)
+        self._consumed_side.add(key)
+        if not isinstance(cpu, Mapping):
+            raise RuntimeError(f"pipeline side inputs for {key} are not a mapping")
         out = {}
         for k, v in cpu.items():
             if torch.is_tensor(v):
@@ -182,6 +258,13 @@ class PipelineStageModule(nn.Module):
             seq_lens_are_pre_shard=side.get("seq_lens_are_pre_shard", False),
         )
 
+        pipeline_kwargs = {}
+        if self.layer_indices is not None:
+            pipeline_kwargs = {
+                "pipeline_layer_indices": self.layer_indices,
+                "pipeline_apply_norm": self.is_last,
+            }
+
         if self.is_last:
             # Go through the same helper the non-PP path uses so the fused output
             # head still receives labels and temperature and computes logprobs
@@ -199,6 +282,7 @@ class PipelineStageModule(nn.Module):
                 seq_lens_are_pre_shard=side.get("seq_lens_are_pre_shard", False),
                 inputs_embeds=None if self.is_first else x,
                 sparse_indices_cache=sparse_indices_cache,
+                **pipeline_kwargs,
             )
             assert self.loss_closure is not None, "last stage needs a loss closure"
             return self.loss_closure(out, side)
@@ -210,6 +294,7 @@ class PipelineStageModule(nn.Module):
             inputs_embeds=None if self.is_first else x,
             **kwargs,
             sparse_indices_cache=sparse_indices_cache,
+            **pipeline_kwargs,
         )
         if not self.transfer_sparse_indices:
             return out.last_hidden_state
@@ -237,6 +322,235 @@ def sparse_cache_transport_shape(
     return 1, seq_len, 1, index_topk
 
 
+def _keyed_pipeline_stage_cls():
+    from torch.distributed.pipelining import PipelineStage
+
+    class KeyedPipelineStage(PipelineStage):
+        def forward_one_chunk(
+            self, fwd_chunk_id, args, kwargs=None, save_forward_output=True
+        ):
+            self.submod.set_active_microbatch(fwd_chunk_id)
+            try:
+                return super().forward_one_chunk(
+                    fwd_chunk_id,
+                    args,
+                    kwargs,
+                    save_forward_output=save_forward_output,
+                )
+            finally:
+                self.submod.clear_active_microbatch()
+
+    return KeyedPipelineStage
+
+
+def _bounded_pipeline_stage_cls():
+    from torch.distributed.pipelining.stage import (
+        _RecvInfo,
+        _RootArgPlaceholder,
+        _make_tensor_from_meta,
+    )
+
+    class BoundedPipelineStage(_keyed_pipeline_stage_cls()):
+        def _prepare_transport_rings(self, num_microbatches):
+            if num_microbatches < 1:
+                raise RuntimeError("pipeline needs at least one micro-batch")
+            slot_count = min(num_microbatches, max(1, self.num_stages))
+            self._transport_slot_count = slot_count
+            if self.is_first:
+                self._forward_slots = []
+                self._forward_slot_by_key = {}
+                self._forward_slot_owner = []
+                self._forward_events = []
+                self._forward_receive_keys = set()
+            else:
+                self._forward_slots = [
+                    _make_tensor_from_meta(self.inputs_meta[0], self.device)
+                    for _ in range(slot_count)
+                ]
+                self._forward_slot_by_key = {
+                    (self.stage_index, chunk_id): chunk_id % slot_count
+                    for chunk_id in range(num_microbatches)
+                }
+                self._forward_slot_owner = [None] * slot_count
+                self._forward_events = [None] * slot_count
+                self._forward_receive_keys = set()
+            if self.is_last:
+                self._backward_slots = []
+                self._backward_slot_by_key = {}
+                self._backward_slot_owner = []
+                self._backward_events = []
+                self._backward_receive_keys = set()
+            else:
+                output_meta = self.get_outputs_meta()[0]
+                self._backward_slots = [
+                    _make_tensor_from_meta(output_meta, self.device)
+                    for _ in range(slot_count)
+                ]
+                self._backward_slot_by_key = {
+                    (self.stage_index, chunk_id): chunk_id % slot_count
+                    for chunk_id in range(num_microbatches)
+                }
+                self._backward_slot_owner = [None] * slot_count
+                self._backward_events = [None] * slot_count
+                self._backward_receive_keys = set()
+
+        def _begin_forward_receive(self, fwd_chunk_id):
+            key = (self.stage_index, int(fwd_chunk_id))
+            slot_by_key = self._forward_slot_by_key
+            if key not in slot_by_key:
+                raise RuntimeError(f"missing hidden-state receive key {key}")
+            if key in self._forward_receive_keys:
+                raise RuntimeError(f"duplicate hidden-state receive key {key}")
+            slot = slot_by_key[key]
+            owner = self._forward_slot_owner[slot]
+            if owner == key:
+                raise RuntimeError(f"duplicate hidden-state slot owner {key}")
+            if owner is not None:
+                event = self._forward_events[slot]
+                if event is None:
+                    raise RuntimeError(f"hidden-state buffer overwrite before {owner} completed")
+                event.synchronize()
+            self._forward_receive_keys.add(key)
+            self._forward_slot_owner[slot] = key
+
+        def _finish_forward_receive(self, fwd_chunk_id):
+            key = (self.stage_index, int(fwd_chunk_id))
+            if key not in self._forward_receive_keys:
+                return
+            slot = self._forward_slot_by_key[key]
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream())
+            self._forward_events[slot] = event
+
+        def _begin_backward_receive(self, bwd_chunk_id):
+            key = (self.stage_index, int(bwd_chunk_id))
+            slot_by_key = self._backward_slot_by_key
+            if key not in slot_by_key:
+                raise RuntimeError(f"missing gradient receive key {key}")
+            if key in self._backward_receive_keys:
+                raise RuntimeError(f"duplicate gradient receive key {key}")
+            slot = slot_by_key[key]
+            owner = self._backward_slot_owner[slot]
+            if owner == key:
+                raise RuntimeError(f"duplicate gradient slot owner {key}")
+            if owner is not None:
+                event = self._backward_events[slot]
+                if event is None:
+                    raise RuntimeError(f"gradient buffer overwrite before {owner} completed")
+                event.synchronize()
+            self._backward_receive_keys.add(key)
+            self._backward_slot_owner[slot] = key
+
+        def _finish_backward_receive(self, bwd_chunk_id):
+            key = (self.stage_index, int(bwd_chunk_id))
+            if key not in self._backward_receive_keys:
+                return
+            slot = self._backward_slot_by_key[key]
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream())
+            self._backward_events[slot] = event
+
+        def _prepare_forward_infra(self, num_microbatches, args, kwargs=None):
+            outputs = ()
+            if self.inputs_meta is None:
+                outputs = self._shape_inference(args, kwargs)
+            if self.inputs_meta is None:
+                raise RuntimeError(
+                    "pipeline shape inference did not configure input metadata"
+                )
+            if len(self.inputs_meta) != 1:
+                raise RuntimeError(
+                    "bounded pipeline stages require one hidden-state input"
+                )
+            self._prepare_transport_rings(num_microbatches)
+            for chunk_id in range(num_microbatches):
+                if self.is_first:
+                    self.args_recv_info[chunk_id] = tuple(
+                        _RootArgPlaceholder(i) for i in self.inputs_meta
+                    )
+                    continue
+                hidden = _RecvInfo(
+                    f"recv_for_{self.stage_index}_from_{self.stage_index - 1}",
+                    self.stage_index - 1,
+                    self._forward_slots[
+                        self._forward_slot_by_key[(self.stage_index, chunk_id)]
+                    ],
+                )
+                hidden.buffer.requires_grad_(True)
+                self.args_recv_info[chunk_id] = (hidden,)
+            self.act_send_info = {
+                idx: ([] if self.is_last else [self.stage_index + 1])
+                for idx in range(len(self.get_outputs_meta()))
+            }
+            return outputs
+
+        def _create_grad_recv_info(self, act_send_info):
+            if self.is_last:
+                return ()
+            hidden_dst = act_send_info[0][0]
+            return (
+                _RecvInfo(
+                    f"recv_grad_for_{self.stage_index}_from_{hidden_dst}",
+                    hidden_dst,
+                    self._backward_slots[0],
+                ),
+            )
+
+        def _prepare_backward_infra(self, num_microbatches):
+            self.chunks = num_microbatches
+            for mb_index in range(num_microbatches):
+                if self.is_last:
+                    self.grad_recv_info[mb_index] = ()
+                    continue
+                hidden_dst = self.act_send_info[0][0]
+                slot = self._backward_slot_by_key[(self.stage_index, mb_index)]
+                self.grad_recv_info[mb_index] = (
+                    _RecvInfo(
+                        f"recv_grad_for_{self.stage_index}_from_{hidden_dst}",
+                        hidden_dst,
+                        self._backward_slots[slot],
+                    ),
+                )
+
+        def get_fwd_recv_ops(self, fwd_chunk_id):
+            if not self.is_first:
+                self._begin_forward_receive(fwd_chunk_id)
+            return super().get_fwd_recv_ops(fwd_chunk_id)
+
+        def forward_one_chunk(
+            self, fwd_chunk_id, args, kwargs=None, save_forward_output=True
+        ):
+            output = super().forward_one_chunk(
+                fwd_chunk_id,
+                args,
+                kwargs,
+                save_forward_output=save_forward_output,
+            )
+            return output
+
+        def get_bwd_recv_ops(self, bwd_chunk_id):
+            if not self.is_last:
+                self._begin_backward_receive(bwd_chunk_id)
+            return super().get_bwd_recv_ops(bwd_chunk_id)
+
+        def backward_one_chunk(
+            self, bwd_chunk_id, loss=None, full_backward=True, last_backward=False
+        ):
+            output = super().backward_one_chunk(
+                bwd_chunk_id,
+                loss=loss,
+                full_backward=full_backward,
+                last_backward=last_backward,
+            )
+            if not self.is_first:
+                self._finish_forward_receive(bwd_chunk_id)
+            if not self.is_last:
+                self._finish_backward_receive(bwd_chunk_id)
+            return output
+
+    return BoundedPipelineStage
+
+
 def _sparse_cache_pipeline_stage_cls():
     """Return a PipelineStage which sends no gradient for its cache output.
 
@@ -246,14 +560,13 @@ def _sparse_cache_pipeline_stage_cls():
     of that assumption instead of retaining one full-size zero gradient per
     micro-batch.
     """
-    from torch.distributed.pipelining import PipelineStage
     from torch.distributed.pipelining.stage import (
         _RecvInfo,
         _RootArgPlaceholder,
         _make_tensor_from_meta,
     )
 
-    class SparseCachePipelineStage(PipelineStage):
+    class SparseCachePipelineStage(_bounded_pipeline_stage_cls()):
         def _prepare_forward_infra(self, num_microbatches, args, kwargs=None):
             outputs = ()
             if self.inputs_meta is None:
@@ -262,6 +575,7 @@ def _sparse_cache_pipeline_stage_cls():
                 raise RuntimeError(
                     "pipeline shape inference did not configure input metadata"
                 )
+            self._prepare_transport_rings(num_microbatches)
 
             if not self.is_first:
                 # The cache is consumed during forward and is not needed by
@@ -273,12 +587,19 @@ def _sparse_cache_pipeline_stage_cls():
                     raise RuntimeError(
                         "sparse-cache pipeline stages require hidden-state and cache inputs"
                     )
-                slot_count = min(num_microbatches, self.num_stages)
+                slot_count = self._transport_slot_count
                 slots = [
                     _make_tensor_from_meta(self.inputs_meta[1], self.device)
                     for _ in range(slot_count)
                 ]
+                self._sparse_cache_slots = slots
                 self._sparse_cache_events = [None] * slot_count
+                self._sparse_cache_slot_by_key = {
+                    (self.stage_index, chunk_id): chunk_id % slot_count
+                    for chunk_id in range(num_microbatches)
+                }
+                self._sparse_cache_slot_owner = [None] * slot_count
+                self._sparse_cache_receive_keys = set()
 
             for chunk_id in range(num_microbatches):
                 if self.is_first:
@@ -289,13 +610,15 @@ def _sparse_cache_pipeline_stage_cls():
                 hidden = _RecvInfo(
                     f"recv_for_{self.stage_index}_from_{self.stage_index - 1}",
                     self.stage_index - 1,
-                    _make_tensor_from_meta(self.inputs_meta[0], self.device),
+                    self._forward_slots[
+                        self._forward_slot_by_key[(self.stage_index, chunk_id)]
+                    ],
                 )
                 hidden.buffer.requires_grad_(True)
                 cache = _RecvInfo(
                     f"recv_cache_for_{self.stage_index}_from_{self.stage_index - 1}",
                     self.stage_index - 1,
-                    slots[chunk_id % slot_count],
+                    slots[self._sparse_cache_slot_by_key[(self.stage_index, chunk_id)]],
                 )
                 self.args_recv_info[chunk_id] = (hidden, cache)
 
@@ -307,10 +630,23 @@ def _sparse_cache_pipeline_stage_cls():
 
         def get_fwd_recv_ops(self, fwd_chunk_id):
             if not self.is_first:
-                slot = fwd_chunk_id % len(self._sparse_cache_events)
+                key = (self.stage_index, int(fwd_chunk_id))
+                if key not in self._sparse_cache_slot_by_key:
+                    raise RuntimeError(f"missing sparse-cache receive key {key}")
+                if key in self._sparse_cache_receive_keys:
+                    raise RuntimeError(f"duplicate sparse-cache receive key {key}")
+                self._sparse_cache_receive_keys.add(key)
+                slot = self._sparse_cache_slot_by_key[key]
+                owner = self._sparse_cache_slot_owner[slot]
+                if owner == key:
+                    raise RuntimeError(f"duplicate sparse-cache slot owner {key}")
                 event = self._sparse_cache_events[slot]
-                if event is not None:
-                    torch.cuda.current_stream().wait_event(event)
+                if owner is not None:
+                    if event is None:
+                        raise RuntimeError(
+                            f"sparse-cache buffer overwrite before {owner} completed"
+                        )
+                    event.synchronize()
             return super().get_fwd_recv_ops(fwd_chunk_id)
 
         def forward_one_chunk(
@@ -323,10 +659,12 @@ def _sparse_cache_pipeline_stage_cls():
                 save_forward_output=save_forward_output,
             )
             if not self.is_first:
-                slot = fwd_chunk_id % len(self._sparse_cache_events)
+                key = (self.stage_index, int(fwd_chunk_id))
+                slot = self._sparse_cache_slot_by_key[key]
                 event = torch.cuda.Event()
                 event.record(torch.cuda.current_stream())
                 self._sparse_cache_events[slot] = event
+                self._sparse_cache_slot_owner[slot] = key
             return output
 
         def get_fwd_send_ops(self, fwd_chunk_id):
@@ -342,18 +680,6 @@ def _sparse_cache_pipeline_stage_cls():
                 input_values[1] = None
             self.fwd_cache[fwd_chunk_id] = (stage_output, input_values)
             return ops
-
-        def _create_grad_recv_info(self, act_send_info):
-            if self.is_last:
-                return ()
-            hidden_dst = act_send_info[0][0]
-            return (
-                _RecvInfo(
-                    f"recv_grad_for_{self.stage_index}_from_{hidden_dst}",
-                    hidden_dst,
-                    _make_tensor_from_meta(self.get_outputs_meta()[0], self.device),
-                ),
-            )
 
         def _retrieve_recv_grads(self, bwd_chunk_id):
             hidden_grad = super()._retrieve_recv_grads(bwd_chunk_id)
@@ -418,31 +744,60 @@ def build_schedule(
     which is another distributed rendezvous that can wedge; every micro-batch
     here is padded to one shape, so the shapes are simply known.
     """
-    from torch.distributed.pipelining import PipelineStage, Schedule1F1B, ScheduleGPipe
+    from torch.distributed.pipelining import (
+        Schedule1F1B,
+        ScheduleGPipe,
+        ScheduleInterleaved1F1B,
+    )
 
-    stage_cls = (
-        _sparse_cache_pipeline_stage_cls()
-        if stage_module.transfer_sparse_indices
-        else PipelineStage
+    stage_modules = list(stage_module) if isinstance(stage_module, (list, tuple)) else [stage_module]
+    if schedule_name == "interleaved_1f1b" and len(stage_modules) != 2:
+        raise ValueError("interleaved_1f1b requires exactly two local pipeline stages")
+    if schedule_name != "interleaved_1f1b" and len(stage_modules) != 1:
+        raise ValueError(f"{schedule_name} requires exactly one local pipeline stage")
+
+    stage_classes = {}
+    stages = []
+    example_inputs = (
+        list(example_input) if schedule_name == "interleaved_1f1b" else [example_input]
     )
-    stage = stage_cls(
-        stage_module,
-        stage_index=pp_rank,
-        num_stages=pp_size,
-        device=torch.device("cuda"),
-        group=pp_group,
-        input_args=example_input,
-        output_args=example_output,
+    example_outputs = (
+        list(example_output) if schedule_name == "interleaved_1f1b" else [example_output]
     )
-    # interleaved_1f1b is deliberately absent: it needs a LIST of stage chunks
-    # and runs forwards out of micro-batch order, which breaks the side-input
-    # FIFO. Unknown names raise instead of silently training on a different
-    # schedule than the config asked for.
+    local_stage_count = len(stage_modules)
+    for local_index, module in enumerate(stage_modules):
+        if module.transfer_sparse_indices:
+            if True not in stage_classes:
+                stage_classes[True] = _sparse_cache_pipeline_stage_cls()
+            stage_cls = stage_classes[True]
+        else:
+            if False not in stage_classes:
+                stage_classes[False] = _bounded_pipeline_stage_cls()
+            stage_cls = stage_classes[False]
+        stage_index = pp_rank + local_index * pp_size
+        if module.stage_identity != stage_index:
+            raise ValueError(
+                f"stage identity {module.stage_identity} does not match pipeline index {stage_index}"
+            )
+        stages.append(
+            stage_cls(
+                module,
+                stage_index=stage_index,
+                num_stages=pp_size * local_stage_count,
+                device=torch.device("cuda"),
+                group=pp_group,
+                input_args=example_inputs[local_index],
+                output_args=example_outputs[local_index],
+            )
+        )
     schedules = {
         "1f1b": Schedule1F1B,
+        "interleaved_1f1b": ScheduleInterleaved1F1B,
         "gpipe": ScheduleGPipe,
     }
     minimum_pipeline_microbatches(schedule_name, pp_size)
+    if schedule_name == "interleaved_1f1b":
+        validate_interleaved_microbatches(n_microbatches, pp_size)
     cls = schedules[schedule_name]
     # scale_grads=False is load-bearing. The schedule's default divides every
     # gradient by n_microbatches, which is only correct for a loss that AVERAGES
@@ -451,7 +806,7 @@ def build_schedule(
     # the default silently shrank gradients ~n_microbatches-fold (effective LR
     # of lr/N with N varying per batch -- the unexplained tiny grad norms).
     return cls(
-        stage,
+        stages if schedule_name == "interleaved_1f1b" else stages[0],
         n_microbatches=n_microbatches,
         loss_fn=lambda output, target: output,
         scale_grads=False,

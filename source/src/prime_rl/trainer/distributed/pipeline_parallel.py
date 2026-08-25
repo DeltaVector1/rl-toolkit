@@ -48,7 +48,13 @@ def _index_computing_layers(config) -> list[int] | None:
     return None
 
 
-def sparse_cache_stage_flags(model: nn.Module, pp_rank: int, pp_size: int) -> tuple[bool, bool]:
+def sparse_cache_stage_flags(
+    model: nn.Module,
+    pp_rank: int,
+    pp_size: int,
+    virtual_stage: int = 0,
+    virtual_stages: int = 1,
+) -> tuple[bool, bool]:
     from prime_rl.trainer.model import get_language_model
 
     lm = get_language_model(model)
@@ -67,15 +73,16 @@ def sparse_cache_stage_flags(model: nn.Module, pp_rank: int, pp_size: int) -> tu
                 if frequency and frequency > 1
                 else None
             )
+    stage_index = pp_rank + virtual_stage * pp_size
+    total_stages = pp_size * virtual_stages
     if computes is None:
-        return pp_rank > 0, pp_rank < pp_size - 1
-
-    start = stage_layer_range(config.num_hidden_layers, pp_rank, pp_size, config)
-    receive = pp_rank > 0 and start[0] not in computes
-    if pp_rank == pp_size - 1:
+        return stage_index > 0, stage_index < total_stages - 1
+    start = stage_layer_range(config.num_hidden_layers, stage_index, total_stages, config)
+    receive = stage_index > 0 and start[0] not in computes
+    if stage_index == total_stages - 1:
         return receive, False
     next_start = stage_layer_range(
-        config.num_hidden_layers, pp_rank + 1, pp_size, config
+        config.num_hidden_layers, stage_index + 1, total_stages, config
     )[0]
     return receive, next_start not in computes
 
@@ -217,7 +224,21 @@ def stage_layer_range(num_layers: int, pp_rank: int, pp_size: int, config=None) 
     return bounds[pp_rank], bounds[pp_rank + 1]
 
 
-def apply_pp_layers(model: nn.Module, pp_rank: int, pp_size: int) -> tuple[int, int]:
+def pp_layer_ranges(model: nn.Module, pp_rank: int, pp_size: int) -> list[tuple[int, int]]:
+    lm = model
+    ranges = getattr(lm, "pp_layer_ranges", None)
+    if ranges is None:
+        raise RuntimeError("pipeline layer ranges were not recorded on the decoder")
+    if getattr(lm, "pp_physical_rank", pp_rank) != pp_rank:
+        raise RuntimeError("pipeline layer ranges belong to a different PP rank")
+    if getattr(lm, "pp_physical_size", pp_size) != pp_size:
+        raise RuntimeError("pipeline layer range size does not match the PP mesh")
+    return [tuple(pair) for pair in ranges]
+
+
+def apply_pp_layers(
+    model: nn.Module, pp_rank: int, pp_size: int, virtual_stages: int = 1
+) -> tuple[int, int]:
     """Trim ``model`` in place to the decoder layers owned by ``pp_rank``.
 
     Returns the (start, end) global layer range kept, and records the offset on
@@ -236,7 +257,21 @@ def apply_pp_layers(model: nn.Module, pp_rank: int, pp_size: int) -> tuple[int, 
     # The decoder config carries indexer_types, which constrains where a stage
     # may start; see stage_layer_range.
     cfg = getattr(lm, "config", None) or getattr(model, "config", None)
-    start, end = stage_layer_range(num_layers, pp_rank, pp_size, config=cfg)
+    if virtual_stages < 1:
+        raise ValueError(f"virtual_stages must be positive, got {virtual_stages}")
+    virtual_size = pp_size * virtual_stages
+    ranges = [
+        stage_layer_range(
+            num_layers,
+            pp_rank + local_index * pp_size,
+            virtual_size,
+            config=cfg,
+        )
+        for local_index in range(virtual_stages)
+    ]
+    if any(start >= end for start, end in ranges):
+        raise RuntimeError(f"empty pipeline virtual stage range: {ranges}")
+    start, end = ranges[0]
 
     # Key by GLOBAL layer index. A dense ModuleList would renumber layers 0..k
     # and the checkpoint keys (model.layers.69.*) would no longer resolve, so
@@ -244,13 +279,18 @@ def apply_pp_layers(model: nn.Module, pp_rank: int, pp_size: int) -> tuple[int, 
     # the original names and makes the key itself the global index, so router
     # replay needs no separate offset.
     layers = list(lm.layers)
-    lm.layers = nn.ModuleDict({str(i): layers[i] for i in range(start, end)})
+    owned_layers = [index for pair in ranges for index in range(pair[0], pair[1])]
+    lm.layers = nn.ModuleDict({str(i): layers[i] for i in owned_layers})
     lm.pp_layer_offset = start
+    lm.pp_layer_ranges = tuple(ranges)
+    lm.pp_physical_rank = pp_rank
+    lm.pp_physical_size = pp_size
+    lm.pp_virtual_stages = virtual_stages
     if pp_rank != 0:
         lm.embed_tokens = None
 
     get_logger().info(
-        f"PP stage {pp_rank}/{pp_size}: layers [{start}, {end}) of {num_layers}, layer_offset={start}"
+        f"PP stage {pp_rank}/{pp_size}: virtual ranges {ranges}, layer_offset={start}"
     )
     return start, end
 

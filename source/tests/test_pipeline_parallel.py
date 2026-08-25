@@ -150,8 +150,25 @@ class PipelineBalanceTest(unittest.TestCase):
             [0, 8, 18, 28, 38, 48, 58, 68, 78],
         )
 
+    def test_interleaved_plan_has_two_nonempty_ranges_per_rank(self):
+        config = types.SimpleNamespace(
+            hidden_size=6144,
+            vocab_size=154880,
+            tie_word_embeddings=False,
+        )
+        bounds = self.pp.compute_balanced_boundaries(78, 16, config)
+        self.assertEqual(len(bounds), 17)
+        ranges = [
+            (bounds[rank], bounds[rank + 1])
+            for rank in range(16)
+        ]
+        self.assertTrue(all(start < end for start, end in ranges))
+        self.assertEqual(sum(end - start for start, end in ranges), 78)
+        for physical_rank in range(8):
+            self.assertTrue(ranges[physical_rank + 8][0] >= ranges[physical_rank][1])
 
-class SideInputFifoTest(unittest.TestCase):
+
+class SideInputKeyTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.runner, cls.torch = _load(
@@ -159,7 +176,7 @@ class SideInputFifoTest(unittest.TestCase):
             "pp_runner_under_test",
         )
 
-    def test_side_inputs_are_consumed_once_in_forward_order(self):
+    def test_side_inputs_are_consumed_by_microbatch_key(self):
         first = _Tensor("first")
         second = _Tensor("second")
         routed = _Tensor("routed")
@@ -175,12 +192,11 @@ class SideInputFifoTest(unittest.TestCase):
             ]
         )
 
-        got0 = stage._next_side()
-        got1 = stage._next_side()
+        got1 = stage._next_side(1)
+        got0 = stage._next_side(0)
 
         self.assertEqual((got0["marker"], got1["marker"]), ("micro-0", "micro-1"))
-        self.assertIsNone(stage._side[0])
-        self.assertIsNone(stage._side[1])
+        self.assertEqual(stage._side, {})
         self.assertEqual(first.moves, [(('cuda',), {"non_blocking": True})])
         self.assertEqual(second.moves, [(('cuda',), {"non_blocking": True})])
         self.assertEqual(
@@ -191,15 +207,34 @@ class SideInputFifoTest(unittest.TestCase):
             ],
         )
 
+    def test_missing_and_duplicate_side_inputs_fail_closed(self):
+        stage = self.runner.PipelineStageModule(
+            model=object(), is_first=False, is_last=False, stage_identity=3
+        )
+        stage.set_side_inputs({(3, 7): {"marker": "micro-7"}})
+        self.assertEqual(stage._next_side(7)["marker"], "micro-7")
+        with self.assertRaisesRegex(RuntimeError, "duplicate"):
+            stage._next_side(7)
+        with self.assertRaisesRegex(RuntimeError, "missing"):
+            stage._next_side(8)
+
+    def test_interleaved_microbatch_count_is_validated(self):
+        self.assertEqual(self.runner.validate_interleaved_microbatches(64, 8), 8)
+        with self.assertRaisesRegex(ValueError, "at least 8"):
+            self.runner.validate_interleaved_microbatches(7, 8)
+        with self.assertRaisesRegex(ValueError, "multiple of the number of rounds"):
+            self.runner.validate_interleaved_microbatches(13, 6)
+
     def test_sparse_cache_slot_reuse_does_not_block_the_cpu(self):
         source = (
             SOURCE / "src/prime_rl/trainer/distributed/pp_runner.py"
         ).read_text()
-        method = source.split("        def get_fwd_recv_ops", 1)[1].split(
+        sparse_source = source.split("def _sparse_cache_pipeline_stage_cls", 1)[1]
+        method = sparse_source.split("        def get_fwd_recv_ops", 1)[1].split(
             "        def forward_one_chunk", 1
         )[0]
-        self.assertIn("torch.cuda.current_stream().wait_event(event)", method)
-        self.assertNotIn("event.synchronize()", method)
+        self.assertIn("event.synchronize()", method)
+        self.assertNotIn("torch.cuda.current_stream().wait_event(event)", method)
 
 
 if __name__ == "__main__":

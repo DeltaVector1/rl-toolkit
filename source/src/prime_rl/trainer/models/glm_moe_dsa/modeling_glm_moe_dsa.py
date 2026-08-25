@@ -315,6 +315,8 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
         *,
         seq_lens: Optional[torch.LongTensor] = None,
         seq_lens_are_pre_shard: bool = False,
+        pipeline_layer_indices: Optional[tuple[int, ...]] = None,
+        pipeline_apply_norm: bool = True,
     ) -> BaseModelOutputWithPast:
         """
         routed_experts (`torch.LongTensor` of shape `(batch_size, sequence_length, num_hidden_layers, num_experts_per_tok)`, *optional*):
@@ -367,7 +369,11 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
         # routed_experts is indexed by global layer -- silently replaying the
         # wrong layer's router on every stage after the first. Keying by global
         # index is the whole reason that ModuleDict exists, so use it.
-        if isinstance(self.layers, nn.ModuleDict):
+        if pipeline_layer_indices is not None:
+            layer_items = [
+                (index, self.layers[str(index)]) for index in pipeline_layer_indices
+            ]
+        elif isinstance(self.layers, nn.ModuleDict):
             layer_items = [(int(name), module) for name, module in self.layers.items()]
         else:
             layer_items = list(enumerate(self.layers[: self.config.num_hidden_layers]))
@@ -387,7 +393,7 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
         # (pipeline_parallel.py:161) -- the head is ~1.9 GB in bf16 and the
         # non-final stages never use it. Only the last stage normalizes; the
         # others hand their hidden states straight to the next stage.
-        if self.norm is not None:
+        if pipeline_apply_norm and self.norm is not None:
             hidden_states = self.norm(hidden_states)
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
@@ -426,6 +432,8 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
         temperature: Optional[torch.Tensor] = None,
         routed_experts: Optional[torch.LongTensor] = None,
         sparse_indices_cache: Optional[torch.LongTensor] = None,
+        pipeline_layer_indices: Optional[tuple[int, ...]] = None,
+        pipeline_apply_norm: bool = True,
         # Document boundaries derive from position_ids; seq_lens is accepted
         # to satisfy the trainer's universal contract.
         *,
@@ -466,6 +474,8 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
             inputs_embeds=inputs_embeds,
             routed_experts=routed_experts,
             sparse_indices_cache=sparse_indices_cache,
+            pipeline_layer_indices=pipeline_layer_indices,
+            pipeline_apply_norm=pipeline_apply_norm,
         )
         hidden_states = outputs.last_hidden_state
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
