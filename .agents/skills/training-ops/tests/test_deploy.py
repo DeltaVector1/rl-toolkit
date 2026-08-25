@@ -8,6 +8,133 @@ import training_ops
 
 
 class DeployTest(unittest.TestCase):
+    def test_control_master_starts_once_per_configured_host(self):
+        hosts = [*training_ops.trainer_hosts, training_ops.trainer_hosts[0]]
+        completed = Mock(returncode=0, stdout="", stderr="")
+        with patch.dict(
+            training_ops._ssh_control_paths, {}, clear=True
+        ), patch.object(
+            training_ops.subprocess, "run", return_value=completed
+        ) as run:
+            with training_ops._ssh_control_masters(hosts):
+                with training_ops._ssh_control_masters(reversed(hosts)):
+                    for host in training_ops.trainer_hosts:
+                        self.assertIn(
+                            "ControlPath=",
+                            " ".join(training_ops._active_ssh_control_options(host)),
+                        )
+
+        commands = [call.args[0] for call in run.call_args_list]
+        starts = [command for command in commands if "-MNf" in command]
+        closes = [
+            command
+            for command in commands
+            if "-O" in command and "exit" in command
+        ]
+        self.assertEqual(len(starts), len(training_ops.trainer_hosts))
+        self.assertEqual(len(closes), len(training_ops.trainer_hosts))
+        self.assertEqual(starts[0][-1], training_ops.trainer_head)
+        self.assertTrue(
+            all("ControlMaster=auto" in command for command in starts)
+        )
+        self.assertEqual(
+            {command[-1] for command in starts}, set(training_ops.trainer_hosts)
+        )
+        self.assertEqual(
+            len({command[command.index("-S") + 1] for command in starts}),
+            len(training_ops.trainer_hosts),
+        )
+
+    def test_control_master_failure_has_bounded_retry_and_cleanup(self):
+        first = training_ops.trainer_head
+        second = next(host for host in training_ops.trainer_hosts if host != first)
+        completed = Mock(returncode=0, stdout="", stderr="")
+        refused = Mock(returncode=255, stdout="", stderr="Exceeded MaxStartups")
+
+        def run(command, **kwargs):
+            del kwargs
+            if "-MNf" in command and command[-1] == second:
+                return refused
+            return completed
+
+        with patch.dict(
+            training_ops._ssh_control_paths, {}, clear=True
+        ), patch.object(
+            training_ops.subprocess, "run", side_effect=run
+        ) as subprocess_run, patch.object(
+            training_ops.time, "sleep"
+        ) as sleep, self.assertRaisesRegex(
+            RuntimeError, "after 3 attempts.*Exceeded MaxStartups"
+        ):
+            with training_ops._ssh_control_masters([first, second]):
+                pass
+
+        commands = [call.args[0] for call in subprocess_run.call_args_list]
+        attempts = [
+            command
+            for command in commands
+            if "-MNf" in command and command[-1] == second
+        ]
+        closes = [command for command in commands if "-O" in command]
+        self.assertEqual(len(attempts), training_ops.ssh_master_attempts)
+        self.assertEqual(sleep.call_count, training_ops.ssh_master_attempts - 1)
+        self.assertLessEqual(
+            len(closes), training_ops.ssh_master_attempts + 1
+        )
+        self.assertEqual(training_ops._ssh_control_paths, {})
+
+    def test_control_master_cleanup_failure_is_bounded_and_keeps_socket(self):
+        host = training_ops.trainer_head
+        started = Mock(returncode=0, stdout="", stderr="")
+        refused = Mock(returncode=255, stdout="", stderr="permission denied")
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "pool"
+            directory.mkdir()
+
+            def run(command, **kwargs):
+                del kwargs
+                path = Path(command[command.index("-S") + 1])
+                if "-MNf" in command:
+                    path.touch()
+                    return started
+                return refused
+
+            with patch.dict(
+                training_ops._ssh_control_paths, {}, clear=True
+            ), patch.object(
+                training_ops.tempfile, "mkdtemp", return_value=str(directory)
+            ), patch.object(
+                training_ops.subprocess, "run", side_effect=run
+            ) as subprocess_run, patch.object(
+                training_ops.time, "sleep"
+            ), self.assertRaisesRegex(
+                RuntimeError, "control sockets retained"
+            ):
+                with training_ops._ssh_control_masters([host]):
+                    pass
+
+            closes = [
+                call.args[0]
+                for call in subprocess_run.call_args_list
+                if "-O" in call.args[0]
+            ]
+            self.assertEqual(
+                len(closes), training_ops.ssh_master_cleanup_attempts
+            )
+            socket = directory / hashlib.sha256(host.encode()).hexdigest()[:16]
+            self.assertTrue(socket.exists())
+            socket.unlink()
+            directory.rmdir()
+
+    def test_control_master_refuses_blocked_host_before_subprocess(self):
+        blocked = next(iter(training_ops.blocked_hosts))
+        with patch.object(training_ops.subprocess, "run") as run, self.assertRaises(
+            training_ops.Refused
+        ):
+            with training_ops._ssh_control_masters([blocked]):
+                pass
+        run.assert_not_called()
+
     def test_mount_preflight_refuses_missing_local_source(self):
         with tempfile.TemporaryDirectory() as directory:
             with (

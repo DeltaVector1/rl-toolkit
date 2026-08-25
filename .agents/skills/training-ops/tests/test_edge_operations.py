@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import patch
 
@@ -2563,6 +2564,9 @@ raise SystemExit(99)
             patch.object(training_ops, "_ssh", side_effect=fake_ssh),
             patch.object(training_ops, "_fan", side_effect=fake_fan),
             patch.object(training_ops, "deploy", return_value=True) as deploy_file,
+            patch.object(
+                training_ops, "_ssh_control_masters", side_effect=lambda _hosts: nullcontext()
+            ),
             patch.object(training_ops, "_assert_live_services_are_down"),
             patch.object(training_ops, "trainer_mount_preflight"),
         ):
@@ -2601,6 +2605,9 @@ raise SystemExit(99)
                 patch.object(training_ops, "_ssh", side_effect=fake_ssh),
                 patch.object(training_ops, "_fan", side_effect=fake_fan),
                 patch.object(training_ops, "deploy", return_value=True),
+                patch.object(
+                    training_ops, "_ssh_control_masters", side_effect=lambda _hosts: nullcontext()
+                ),
                 patch.object(training_ops, "_assert_live_services_are_down"),
                 patch.object(training_ops, "trainer_mount_preflight"),
             ):
@@ -2635,6 +2642,9 @@ raise SystemExit(99)
             patch.object(training_ops, "_ssh", side_effect=fake_ssh),
             patch.object(training_ops, "_fan", side_effect=fake_fan),
             patch.object(training_ops, "deploy", return_value=True),
+            patch.object(
+                training_ops, "_ssh_control_masters", side_effect=lambda _hosts: nullcontext()
+            ),
             patch.object(training_ops, "_assert_live_services_are_down"),
             patch.object(training_ops, "trainer_mount_preflight"),
             patch.object(training_ops.time, "sleep"),
@@ -2738,6 +2748,9 @@ raise SystemExit(99)
                 patch.object(training_ops, "_ssh", side_effect=fake_ssh),
                 patch.object(training_ops, "_fan", side_effect=fake_fan),
                 patch.object(training_ops, "deploy", return_value=True),
+                patch.object(
+                    training_ops, "_ssh_control_masters", side_effect=lambda _hosts: nullcontext()
+                ),
                 patch.object(training_ops, "_assert_live_services_are_down"),
                 patch.object(
                     training_ops,

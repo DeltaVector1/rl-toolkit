@@ -20,8 +20,10 @@ import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
+from threading import Lock
 
 import tomllib
 
@@ -341,6 +343,14 @@ trainer_ssh_command = [
     "-o", "ControlMaster=no",
     "-o", "ControlPath=none",
 ]
+ssh_master_attempts = 3
+ssh_master_start_timeout_seconds = 35
+ssh_master_cleanup_attempts = 3
+ssh_master_cleanup_timeout_seconds = 10
+ssh_master_retry_delay_seconds = 1
+ssh_master_persist_seconds = 300
+_ssh_control_paths: dict[str, str] = {}
+_ssh_control_lock = Lock()
 
 
 class Refused(RuntimeError):
@@ -368,6 +378,121 @@ def _check_parity_host(host: str) -> str:
     return host
 
 
+def _active_ssh_control_options(host: str) -> list[str]:
+    with _ssh_control_lock:
+        path = _ssh_control_paths.get(host)
+    if path is None:
+        return []
+    return ["-o", "ControlMaster=no", "-o", f"ControlPath={path}"]
+
+
+def _close_ssh_control_master(host: str, path: str) -> bool:
+    for attempt in range(ssh_master_cleanup_attempts):
+        try:
+            result = subprocess.run(
+                ["ssh", "-S", path, "-O", "exit", host],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=ssh_master_cleanup_timeout_seconds,
+            )
+            if result.returncode == 0:
+                deadline = time.monotonic() + ssh_master_cleanup_timeout_seconds
+                while Path(path).exists() and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                return not Path(path).exists()
+            if not Path(path).exists():
+                return True
+        except subprocess.TimeoutExpired:
+            pass
+        if attempt + 1 < ssh_master_cleanup_attempts:
+            time.sleep(ssh_master_retry_delay_seconds)
+    return False
+
+
+def _start_ssh_control_master(host: str, path: str) -> None:
+    detail = "connection failed"
+    for attempt in range(ssh_master_attempts):
+        try:
+            result = subprocess.run(
+                [
+                    *ssh_command,
+                    "-S",
+                    path,
+                    "-o",
+                    "ControlMaster=auto",
+                    "-o",
+                    f"ControlPersist={ssh_master_persist_seconds}",
+                    "-MNf",
+                    host,
+                ],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=ssh_master_start_timeout_seconds,
+            )
+            if result.returncode == 0:
+                return
+            detail = (result.stderr or result.stdout or detail).strip()
+        except subprocess.TimeoutExpired:
+            detail = "connection timed out"
+        if not _close_ssh_control_master(host, path):
+            raise RuntimeError(
+                f"SSH connection setup cleanup failed on {host}; "
+                f"control socket retained: {path}"
+            )
+        if attempt + 1 < ssh_master_attempts:
+            time.sleep(ssh_master_retry_delay_seconds)
+    raise RuntimeError(
+        f"SSH connection setup failed on {host} after {ssh_master_attempts} attempts: "
+        f"{detail[:160]}"
+    )
+
+
+@contextmanager
+def _ssh_control_masters(hosts_to_open):
+    checked = list(dict.fromkeys(_check_host(host) for host in hosts_to_open))
+    if trainer_head in checked:
+        checked = [trainer_head, *[host for host in checked if host != trainer_head]]
+    with _ssh_control_lock:
+        missing = [host for host in checked if host not in _ssh_control_paths]
+    if not missing:
+        yield
+        return
+    directory = Path(tempfile.mkdtemp(prefix="training-ops-ssh-"))
+    opened: list[tuple[str, str]] = []
+    try:
+        for host in missing:
+            name = hashlib.sha256(host.encode()).hexdigest()[:16]
+            path = str(directory / name)
+            _start_ssh_control_master(host, path)
+            with _ssh_control_lock:
+                _ssh_control_paths[host] = path
+            opened.append((host, path))
+        yield
+    finally:
+        with _ssh_control_lock:
+            for host, path in opened:
+                if _ssh_control_paths.get(host) == path:
+                    del _ssh_control_paths[host]
+        failed = [
+            f"{host}:{path}"
+            for host, path in reversed(opened)
+            if not _close_ssh_control_master(host, path)
+        ]
+        if failed:
+            raise RuntimeError(
+                "SSH connection cleanup failed; control sockets retained: "
+                + ", ".join(failed)
+            )
+        try:
+            directory.rmdir()
+        except OSError as error:
+            raise RuntimeError(
+                f"SSH connection cleanup retained files in {directory}"
+            ) from error
+
+
 def _ssh(
     host: str,
     script: str,
@@ -375,7 +500,7 @@ def _ssh(
     connect_timeout: int | None = None,
 ) -> tuple[int, str]:
     _check_host(host)
-    command = list(ssh_command)
+    command = [*ssh_command, *_active_ssh_control_options(host)]
     if connect_timeout is not None:
         if (
             isinstance(connect_timeout, bool)
@@ -7820,11 +7945,22 @@ def deploy(path: str, nodes: list[str] | None = None) -> bool:
 
     def one(h):
         staging = f"/tmp/training-ops-{want}-{Path(path).name}"
-        p = subprocess.run(
-            ["scp", "-q", "-o", "BatchMode=yes", str(local), f"{h}:{staging}"],
-            capture_output=True,
-            text=True,
-        )
+        try:
+            p = subprocess.run(
+                [
+                    "scp",
+                    "-q",
+                    *ssh_command[1:],
+                    *_active_ssh_control_options(h),
+                    str(local),
+                    f"{h}:{staging}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except subprocess.TimeoutExpired:
+            return "scp failed: timed out after 120 seconds"
         if p.returncode:
             detail = p.stderr.strip().replace("\n", " ")
             return f"scp failed: {detail[:160]}"
@@ -7848,7 +7984,8 @@ def deploy(path: str, nodes: list[str] | None = None) -> bool:
             return f"verify failed: {got.strip()[:80]}"
         return "ok" if got.strip() == want else f"MISMATCH {got.strip()[:12]}"
 
-    res = _fan(nodes, one)
+    with _ssh_control_masters(nodes):
+        res = _fan(nodes, one)
     bad = [h for h, v in res.items() if v != "ok"]
     print(
         f"{path} -> {len(nodes) - len(bad)}/{len(nodes)} nodes"
@@ -8366,6 +8503,24 @@ def qualify(
     nodes = [_check_host(host) for host in (nodes or trainer_hosts)]
     if trainer_head in nodes:
         nodes = [trainer_head] + [host for host in nodes if host != trainer_head]
+    with _ssh_control_masters(nodes):
+        _qualify_connected(
+            name,
+            mode,
+            nodes,
+            resume_adapter=resume_adapter,
+            resume_step=resume_step,
+        )
+
+
+def _qualify_connected(
+    name: str,
+    mode: str,
+    nodes: list[str],
+    *,
+    resume_adapter: str | None,
+    resume_step: int | None,
+) -> None:
     _assert_live_services_are_down(nodes, include_inference=False)
 
     selected = _profile(name)
@@ -8448,6 +8603,8 @@ def qualify(
     trainer_mounts = sorted(
         _mounts_in(repo_root / "scripts" / "china" / "cluster.sh")
     )
+    qualification_identity = None
+    qualification_env = ""
     for path in ("scripts/china/cluster.sh", *trainer_mounts, relative_config):
         if not deploy(path, nodes=nodes):
             raise RuntimeError(f"failed to deploy {path}")
@@ -8456,9 +8613,6 @@ def qualify(
         if strict_qualification
         else trainer_mount_preflight(nodes)
     )
-
-    qualification_identity = None
-    qualification_env = ""
     if strict_qualification:
         qualification_identity = _prepare_trainer_qualification_session(
             name, config, local_config, nodes, source_files
