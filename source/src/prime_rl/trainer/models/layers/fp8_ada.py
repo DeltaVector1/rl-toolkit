@@ -27,9 +27,9 @@ from prime_rl.trainer.models.layers.lm_head import (
 )
 
 block_shape = [128, 128]
-_FP8_W13_CHUNK_ROWS = 2048
+_FP8_W13_CHUNK_ROWS = 4096
 _FP8_W2_CHUNK_ROWS = 2048
-_FP8_EXPERT_BACKWARD_CHUNK_ROWS = 2048
+_FP8_EXPERT_BACKWARD_CHUNK_ROWS = 4096
 _FP8_ROUTE_SCALE_CHUNK_ROWS = 4096
 _FP8_EXPERT_ACTIVATION_OFFLOAD = (
     os.environ.get("PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD", "") == "1"
@@ -1749,7 +1749,7 @@ def _index_copy_real_rows_with_cache_retry(destination, indices, source, real):
     Keep this on PyTorch's already-loaded indexing path. A custom Triton
     scatter first encountered a new kernel variant during x79p step 4 and
     failed while loading its CUDA module at the full model live set. The
-    2,048-row bound limits the boolean source gather to 24 MiB here.
+    4,096-row bound limits the boolean source gather to 48 MiB here.
     """
     try:
         destination.index_copy_(0, indices[real].long(), source[real])

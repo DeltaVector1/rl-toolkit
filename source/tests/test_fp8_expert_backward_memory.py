@@ -92,8 +92,9 @@ class FP8ExpertBackwardMemoryTest(unittest.TestCase):
             inplace.count("_index_copy_real_rows_with_cache_retry("), 2
         )
 
-    def test_forward_expert_workspace_is_bounded_to_2048_rows(self):
-        self.assertIn("_FP8_W13_CHUNK_ROWS = 2048", SOURCE)
+    def test_forward_expert_workspace_is_bounded_to_4096_rows(self):
+        self.assertIn("_FP8_W13_CHUNK_ROWS = 4096", SOURCE)
+        self.assertIn("_FP8_W2_CHUNK_ROWS = 2048", SOURCE)
 
     def test_expert_row_gather_has_one_cache_recovery_retry(self):
         helper = SOURCE.split(
@@ -119,8 +120,8 @@ class FP8ExpertBackwardMemoryTest(unittest.TestCase):
         self.assertIn("hidden_grad.mul_(z1)", helper)
         self.assertNotIn("hidden_grad * z3 * sigmoid", helper)
 
-    def test_inplace_ep_backward_uses_a_smaller_chunk(self):
-        self.assertIn("_FP8_EXPERT_BACKWARD_CHUNK_ROWS = 2048", SOURCE)
+    def test_inplace_ep_backward_is_bounded_to_4096_rows(self):
+        self.assertIn("_FP8_EXPERT_BACKWARD_CHUNK_ROWS = 4096", SOURCE)
         self.assertIn(
             "ctx.backward_chunk_rows = min(chunk_rows, _FP8_EXPERT_BACKWARD_CHUNK_ROWS)",
             SOURCE,
