@@ -4,6 +4,13 @@ dist_timeout_seconds = 5400
 enable_router_replay = false
 enable_token_export = false
 
+[env_vars]
+PRIME_PROFILE_PP_STAGE = "1"
+PRIME_EP_PROFILE = "1"
+PRIME_EP_PROFILE_EVERY = "160"
+PRIME_EXPERT_PROFILE_EVERY = "80"
+PRIME_LAYER_PROFILE_EVERY = "64"
+
 [data.fake]
 batch_size = 16
 generate_samples = true
@@ -48,7 +55,7 @@ ac_offloading = "None"
 [model.quantization]
 type = "fp8"
 dequantize_checkpoint = false
-diagnose_linear_backward = true
+diagnose_linear_backward = false
 fused_qkv_a_fp8 = true
 expert_activation_transport = "bf16"
 w8a16_modules = []

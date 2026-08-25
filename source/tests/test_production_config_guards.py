@@ -182,6 +182,27 @@ def test_glm52_stability_and_production_use_exact_bf16_expert_transport() -> Non
     assert "PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD" not in muse.get("env_vars", {})
 
 
+def test_only_glm52_small_qualification_enables_cuda_profiling() -> None:
+    expected = {
+        "PRIME_PROFILE_PP_STAGE": "1",
+        "PRIME_EP_PROFILE": "1",
+        "PRIME_EP_PROFILE_EVERY": "160",
+        "PRIME_EXPERT_PROFILE_EVERY": "80",
+        "PRIME_LAYER_PROFILE_EVERY": "64",
+    }
+    small = _load("configs/qualification/glm52-native-small.toml")
+    assert small["env_vars"] == expected
+    assert small["model"]["quantization"]["diagnose_linear_backward"] is False
+    for relative in (
+        "configs/qualification/glm52-policy-parity-trainer.toml",
+        "configs/qualification/glm52-native-b2048.toml",
+        "configs/qualification/glm52-native-stability20.toml",
+        "configs/paused/trainer.glm52-production.toml",
+    ):
+        env_vars = _load(relative).get("env_vars", {})
+        assert not set(expected) & set(env_vars), relative
+
+
 def test_all_glm52_trainers_use_h200_w8a8_semantics() -> None:
     expected_profiles = {
         "configs/qualification/glm52-policy-parity-trainer.toml",
