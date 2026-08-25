@@ -821,7 +821,7 @@ sleep() {{
             result,
             {
                 "files": 29,
-                "estimated_bytes": 98_390_016,
+                "estimated_bytes": 98_586_624,
                 "max_files": 64,
                 "max_bytes": 100_000_000,
                 "qualification_root": (
@@ -1148,7 +1148,7 @@ sleep() {{
                 'PRIME_PARITY_DIAGNOSTICS = "1"\n'
                 'PRIME_PARITY_DIAGNOSTIC_TOKENS = "256"\n'
                 'PRIME_PARITY_DIAGNOSTIC_MAX_FILES = "64"\n'
-                'PRIME_PARITY_DIAGNOSTIC_MAX_BYTES = "98390015"\n'
+                'PRIME_PARITY_DIAGNOSTIC_MAX_BYTES = "98586623"\n'
             )
             with self.assertRaises(training_ops.Refused):
                 training_ops._diagnostic_capture_preflight(config, "h200")

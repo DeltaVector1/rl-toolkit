@@ -3761,8 +3761,8 @@ def _diagnostic_capture_preflight(
     internal_tokens = 32
     internal = [
         ("layer0_dense_input", 6144),
-        ("layer0_dense_gate_up_raw_tp0", 1024),
-        ("layer0_dense_post_silu_tp0", 512),
+        ("layer0_dense_gate_up_raw_tp0", 3072),
+        ("layer0_dense_post_silu_tp0", 1536),
         (
             "layer3_shared_output_full"
             if side == "trainer"

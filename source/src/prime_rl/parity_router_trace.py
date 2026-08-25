@@ -454,8 +454,8 @@ def diagnostic_capture_preflight(session: TraceSession, side: str) -> dict[str, 
     plan.extend(
         (
             ("layer0_dense_input", 6144, internal_diagnostic_tokens),
-            ("layer0_dense_gate_up_raw_tp0", 1024, internal_diagnostic_tokens),
-            ("layer0_dense_post_silu_tp0", 512, internal_diagnostic_tokens),
+            ("layer0_dense_gate_up_raw_tp0", 3072, internal_diagnostic_tokens),
+            ("layer0_dense_post_silu_tp0", 1536, internal_diagnostic_tokens),
             (shared_output_name, 6144, internal_diagnostic_tokens),
             ("layer3_moe_combined", 6144, internal_diagnostic_tokens),
         )
@@ -1918,20 +1918,20 @@ def _install_trainer_dense_diagnostics(module: Any) -> None:
         if gate_output is None:
             raise ValueError("layer 0 dense gate output was not captured")
         up_output = _diagnostic_output_tensor(output, "layer 0 dense up")
-        if gate_output.shape[-1] != 4096 or up_output.shape[-1] != 4096:
-            raise ValueError("layer 0 trainer dense projection width is not 4096")
+        if gate_output.shape[-1] != 12288 or up_output.shape[-1] != 12288:
+            raise ValueError("layer 0 trainer dense projection width is not 12288")
         packed = __import__("torch").cat(
-            (gate_output[..., :512], up_output[..., :512]), dim=-1
+            (gate_output[..., :1536], up_output[..., :1536]), dim=-1
         )
-        _capture_named_output("layer0_dense_gate_up_raw_tp0", 1024, packed)
+        _capture_named_output("layer0_dense_gate_up_raw_tp0", 3072, packed)
 
     _diagnostic_hooks.append(up.register_forward_hook(capture_up))
 
     def capture_post_silu(_module: Any, inputs: Any) -> None:
         value = _diagnostic_output_tensor(inputs, "layer 0 dense post-SiLU")
-        if value.shape[-1] != 4096:
-            raise ValueError("layer 0 trainer post-SiLU width is not 4096")
-        _capture_named_output("layer0_dense_post_silu_tp0", 512, value[..., :512])
+        if value.shape[-1] != 12288:
+            raise ValueError("layer 0 trainer post-SiLU width is not 12288")
+        _capture_named_output("layer0_dense_post_silu_tp0", 1536, value[..., :1536])
 
     _diagnostic_hooks.append(down.register_forward_pre_hook(capture_post_silu))
 
@@ -1952,15 +1952,15 @@ def _install_h200_dense_diagnostics(module: Any) -> None:
 
     def capture_gate_up(_module: Any, _inputs: Any, output: Any) -> None:
         packed = _diagnostic_output_tensor(output, "layer 0 packed gate/up")
-        if packed.shape[-1] != 1024:
-            raise ValueError("layer 0 packed gate/up width is not 1024")
-        _capture_named_output("layer0_dense_gate_up_raw_tp0", 1024, packed)
+        if packed.shape[-1] != 3072:
+            raise ValueError("layer 0 packed gate/up width is not 3072")
+        _capture_named_output("layer0_dense_gate_up_raw_tp0", 3072, packed)
 
     _diagnostic_hooks.append(gate_up.register_forward_hook(capture_gate_up))
     _diagnostic_hooks.append(
         activation.register_forward_hook(
             lambda _module, _inputs, output: _capture_named_output(
-                "layer0_dense_post_silu_tp0", 512, output
+                "layer0_dense_post_silu_tp0", 1536, output
             )
         )
     )

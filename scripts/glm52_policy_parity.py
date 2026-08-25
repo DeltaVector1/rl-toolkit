@@ -1455,8 +1455,8 @@ def expected_h200_diagnostic_entries() -> dict[str, dict[str, Any]]:
     semantics.extend(
         (
             ("layer0_dense_input", internal_diagnostic_tokens, 6144, "torch.bfloat16"),
-            ("layer0_dense_gate_up_raw_tp0", internal_diagnostic_tokens, 1024, "torch.bfloat16"),
-            ("layer0_dense_post_silu_tp0", internal_diagnostic_tokens, 512, "torch.bfloat16"),
+            ("layer0_dense_gate_up_raw_tp0", internal_diagnostic_tokens, 3072, "torch.bfloat16"),
+            ("layer0_dense_post_silu_tp0", internal_diagnostic_tokens, 1536, "torch.bfloat16"),
             ("layer3_shared_output_local_tp0", internal_diagnostic_tokens, 6144, "torch.bfloat16"),
             ("layer3_moe_combined", internal_diagnostic_tokens, 6144, "torch.bfloat16"),
         )

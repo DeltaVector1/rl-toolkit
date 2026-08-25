@@ -1052,9 +1052,9 @@ class ParityRouterTraceTest(unittest.TestCase):
             trainer = diagnostic_capture_preflight(metadata, "trainer")
             h200 = diagnostic_capture_preflight(metadata, "h200")
         self.assertEqual(trainer["files"], 23)
-        self.assertEqual(trainer["estimated_bytes"], 90_902_528)
+        self.assertEqual(trainer["estimated_bytes"], 91_099_136)
         self.assertEqual(h200["files"], 29)
-        self.assertEqual(h200["estimated_bytes"], 98_390_016)
+        self.assertEqual(h200["estimated_bytes"], 98_586_624)
         self.assertEqual(len(h200["names"]), len(set(h200["names"])))
         self.assertIn("layer3_shared_output_full", trainer["names"])
         self.assertNotIn("layer3_shared_output_local_tp0", trainer["names"])
@@ -1152,7 +1152,7 @@ class ParityRouterTraceTest(unittest.TestCase):
             "PRIME_PARITY_DIAGNOSTICS": "1",
             "PRIME_PARITY_DIAGNOSTIC_TOKENS": "256",
             "PRIME_PARITY_DIAGNOSTIC_MAX_FILES": "64",
-            "PRIME_PARITY_DIAGNOSTIC_MAX_BYTES": "98390015",
+            "PRIME_PARITY_DIAGNOSTIC_MAX_BYTES": "98586623",
         }
         with patch.dict(os.environ, environment, clear=True), self.assertRaisesRegex(
             ValueError, "exceeds"
