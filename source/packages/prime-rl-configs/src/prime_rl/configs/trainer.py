@@ -149,7 +149,11 @@ class FP8Config(BaseConfig):
     diagnose_linear_backward: bool = False
     """Report non-finite native-FP8 linear backward values with module-FQN attribution."""
     expert_activation_transport: Literal[
-        "bf16", "int4", "fp8", "bf16_forward_fp8_backward"
+        "bf16",
+        "int4",
+        "fp8",
+        "bf16_forward_fp8_backward",
+        "bf16_forward_fp8_recompute_backward",
     ] = "bf16"
     """Precision used for expert-parallel activation transport."""
     ignore_patterns: list[str] = _DEFAULT_FP8_IGNORE_PATTERNS

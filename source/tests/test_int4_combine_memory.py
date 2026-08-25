@@ -13,6 +13,15 @@ SOURCE_PATH = (
     / "expert_parallel.py"
 )
 SOURCE = SOURCE_PATH.read_text()
+CONFIG_SOURCE = (
+    Path(__file__).parents[1]
+    / "packages"
+    / "prime-rl-configs"
+    / "src"
+    / "prime_rl"
+    / "configs"
+    / "trainer.py"
+).read_text()
 
 
 def load_round_splits():
@@ -66,6 +75,9 @@ class FakeTensorView:
 
 
 class Int4CombineMemoryTests(unittest.TestCase):
+    def test_config_exposes_explicit_recompute_transport(self):
+        self.assertIn('"bf16_forward_fp8_recompute_backward"', CONFIG_SOURCE)
+
     def test_received_input_copies_rounds_into_source_order(self):
         received_input = load_received_input_type()()
         received_input.columns = 4
@@ -261,18 +273,19 @@ class Int4CombineMemoryTests(unittest.TestCase):
         native = SOURCE.split(
             "class NativeFP8LoRAAllToAllExpertParallel", 1
         )[1].split("\n\nclass DeepEPExpertParallel", 1)[0]
-        bf16_branch = native.split(
-            'if self.expert_activation_transport == "bf16"', 1
-        )[1].split('elif self.expert_activation_transport == "int4"', 1)[0]
-        self.assertIn("ReceivedBF16ExpertInput(", bf16_branch)
-        self.assertIn("_BF16Dispatch.apply", bf16_branch)
-        self.assertNotIn("_INT4Dispatch", bf16_branch)
+        self.assertIn('"bf16_forward_fp8_recompute_backward"', native)
+        self.assertIn("recompute_fp8", native)
+        self.assertIn("_in_backward()", native)
+        self.assertIn("ReceivedBF16ExpertInput(", native)
+        self.assertIn("ReceivedFP8ExpertInput()", native)
+        self.assertIn("_BF16Dispatch.apply", native)
+        self.assertIn("_FP8Dispatch.apply", native)
         self.assertIn("expert_activation_transport not in", native)
         self.assertIn("transport is invalid", native)
 
     def test_bf16_transport_has_no_quantization(self):
         bf16 = SOURCE.split("class _BF16Dispatch", 1)[1].split(
-            "\n\nclass _INT4Dispatch", 1
+            "\n\ndef _validate_fp8_dispatch", 1
         )[0]
         self.assertIn("dist.all_to_all_single", bf16)
         self.assertIn("dtype=torch.bfloat16", bf16)

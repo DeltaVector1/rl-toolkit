@@ -1439,6 +1439,7 @@ class NativeFP8LoRAAllToAllExpertParallel(MXFP8AllToAllExpertParallel):
             "int4",
             "fp8",
             "bf16_forward_fp8_backward",
+            "bf16_forward_fp8_recompute_backward",
         }:
             raise ValueError(
                 "native FP8 routed-expert LoRA transport is invalid"
@@ -1454,16 +1455,37 @@ class NativeFP8LoRAAllToAllExpertParallel(MXFP8AllToAllExpertParallel):
             device_mesh,
         )
         _ep_profile_tick()
+        recompute_fp8 = (
+            self.expert_activation_transport
+            == "bf16_forward_fp8_recompute_backward"
+            and _in_backward()
+        )
+        if recompute_fp8:
+            received_input = ReceivedFP8ExpertInput()
+            routed_input = _FP8Dispatch.apply(
+                routed_input,
+                self.output_splits,
+                self.input_splits,
+                device_mesh.get_group().group_name,
+                "dispatch",
+                received_input,
+            )
+            return routed_input, num_tokens_per_expert_group, received_input
         if self.expert_activation_transport in {
             "bf16",
             "bf16_forward_fp8_backward",
+            "bf16_forward_fp8_recompute_backward",
         }:
             received_input = ReceivedBF16ExpertInput(
                 save_for_backward=torch.is_grad_enabled()
             )
             backward_transport = (
                 "fp8"
-                if self.expert_activation_transport == "bf16_forward_fp8_backward"
+                if self.expert_activation_transport
+                in {
+                    "bf16_forward_fp8_backward",
+                    "bf16_forward_fp8_recompute_backward",
+                }
                 else "bf16"
             )
             routed_input = _BF16Dispatch.apply(
@@ -1501,13 +1523,32 @@ class NativeFP8LoRAAllToAllExpertParallel(MXFP8AllToAllExpertParallel):
         return routed_input, num_tokens_per_expert_group, received_input
 
     def _token_combine(self, mod, routed_output, device_mesh):
+        recompute_fp8 = (
+            self.expert_activation_transport
+            == "bf16_forward_fp8_recompute_backward"
+            and _in_backward()
+        )
+        if recompute_fp8:
+            return _FP8Dispatch.apply(
+                routed_output,
+                self.input_splits,
+                self.output_splits,
+                device_mesh.get_group().group_name,
+                "combine",
+                None,
+            )
         if self.expert_activation_transport in {
             "bf16",
             "bf16_forward_fp8_backward",
+            "bf16_forward_fp8_recompute_backward",
         }:
             backward_transport = (
                 "fp8"
-                if self.expert_activation_transport == "bf16_forward_fp8_backward"
+                if self.expert_activation_transport
+                in {
+                    "bf16_forward_fp8_backward",
+                    "bf16_forward_fp8_recompute_backward",
+                }
                 else "bf16"
             )
             return _BF16Dispatch.apply(
