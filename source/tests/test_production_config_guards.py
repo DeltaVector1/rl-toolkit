@@ -195,6 +195,7 @@ def test_only_glm52_small_qualification_enables_cuda_profiling() -> None:
     }
     small = _load("configs/qualification/glm52-native-small.toml")
     assert small["env_vars"] == expected
+    assert small["model"]["pp_schedule"] == "interleaved_1f1b"
     assert small["model"]["quantization"]["diagnose_linear_backward"] is False
     launcher = (ROOT / "scripts/china/cluster.sh").read_text()
     assert 'trainer_output" = "/data/glm52-rl/qualifications/glm52-r32-native-small"' in launcher
