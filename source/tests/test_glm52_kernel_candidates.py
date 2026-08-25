@@ -19,6 +19,7 @@ class GLM52KernelCandidateTest(unittest.TestCase):
     def test_candidates_are_disabled_by_default(self):
         self.assertIn('"PRIME_FP8_EXPERT_TRITON_SCATTER", "0"', FP8_SOURCE)
         self.assertIn('"PRIME_FP8_LORA_W2_LOW_RANK_REUSE", "0"', FP8_SOURCE)
+        self.assertIn('"PRIME_FP8_SCATTERMOE_LORA", "0"', FP8_SOURCE)
         self.assertIn(
             'os.environ.get("PRIME_SPARSE_BWD_VARIANT", "baseline")',
             SPARSE_BWD_SOURCE,
@@ -33,6 +34,15 @@ class GLM52KernelCandidateTest(unittest.TestCase):
         self.assertIn("indices.shape != (source.shape[0],)", helper)
         self.assertIn("destination.device.type != \"cuda\"", helper)
         self.assertIn("return destination", helper)
+
+    def test_scattermoe_lora_candidate_keeps_native_base_path(self):
+        self.assertIn("def _scattermoe_lora_forward_kernel", FP8_SOURCE)
+        self.assertIn("INPUT_SIZE: tl.constexpr", FP8_SOURCE)
+        self.assertIn("Accumulation is FP32", FP8_SOURCE)
+        self.assertIn("_scattermoe_lora_projection", FP8_SOURCE)
+        self.assertIn("_SCATTERMOE_LORA", FP8_SOURCE)
+        self.assertIn("_grouped_mm_pair(", FP8_SOURCE)
+        self.assertIn("ScatterMoE LoRA candidate requires rank 32", FP8_SOURCE)
 
     def test_low_rank_reuse_is_host_saved_and_backward_optional(self):
         forward = FP8_SOURCE.split(
@@ -53,6 +63,17 @@ class GLM52KernelCandidateTest(unittest.TestCase):
         self.assertIn('variant not in {"baseline", "bh32"}', SPARSE_BWD_SOURCE)
         self.assertIn('variant == "bh32"', SPARSE_BWD_SOURCE)
         self.assertEqual(SPARSE_BWD_SOURCE.count("PRIME_SPARSE_BWD_VARIANT"), 2)
+
+    def test_sparse_bf16_dkv_candidate_keeps_bf16_dq_path(self):
+        self.assertIn('"PRIME_SPARSE_BWD_DKV", "fp32"', SPARSE_BWD_SOURCE)
+        self.assertIn("dkv_dtype = T.bfloat16", SPARSE_BWD_SOURCE)
+        self.assertIn("dkv_variant == \"fp32\"", SPARSE_BWD_SOURCE)
+        self.assertIn("dKV: T.Tensor(k_shape, dkv_dtype)", SPARSE_BWD_SOURCE)
+        self.assertIn(
+            'vectorized_atomic=dkv_variant == "fp32"',
+            SPARSE_BWD_SOURCE,
+        )
+        self.assertNotIn("float8", SPARSE_BWD_SOURCE)
 
     def test_w2_chunk_candidate_has_bounded_values(self):
         self.assertIn(

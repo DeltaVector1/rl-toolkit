@@ -118,6 +118,7 @@ def bwd(
     indices_dtype=T.int32,
     dtype=T.bfloat16,
     accum_dtype=T.float32,
+    dkv_dtype=T.float32,
 ):
     assert is_causal is True, "non-casual is not supported now"
     assert topk % block_size == 0, "otherwise will load some index=0 thus causing wrong kv to be loaded"
@@ -160,7 +161,7 @@ def bwd(
         Lse: T.Tensor(lse_shape, accum_dtype),
         Delta: T.Tensor(delta_shape, accum_dtype),
         dQ: T.Tensor(q_shape, dtype),
-        dKV: T.Tensor(k_shape, accum_dtype),
+        dKV: T.Tensor(k_shape, dkv_dtype),
     ):
         with T.Kernel(S, B, kv_group * NH, threads=threads) as (s_i, by, bz):
             Q_shared = T.alloc_shared([block_H, D], dtype)
@@ -181,8 +182,13 @@ def bwd(
             acc_dq_tail = T.alloc_fragment([block_H, D_tail], accum_dtype)
             acc_dkv = T.alloc_fragment([BS, D], accum_dtype)
             acc_dkv_tail = T.alloc_fragment([BS, D_tail], accum_dtype)
-            acc_dkv_shared = T.alloc_shared([BS // split_store, D], accum_dtype)
-            acc_dkv_tail_shared = T.alloc_shared([BS // split_store, D_tail], accum_dtype)
+            # The normal path stores an FP32 atomic accumulator and casts once
+            # in postprocess.  The opt-in BF16-dKV candidate stores the same
+            # FP32 tile into BF16 shared memory before the atomic update.  dQ
+            # remains the validated BF16-output path; this candidate never
+            # uses an FP8 dQ operation.
+            acc_dkv_shared = T.alloc_shared([BS // split_store, D], dkv_dtype)
+            acc_dkv_tail_shared = T.alloc_shared([BS // split_store, D_tail], dkv_dtype)
 
             # See sparse_mla_fwd: sentinel is at index S_kv - 1 (zero KV), valid indices
             # live in [0, S_kv - 1). Using this single bound makes the kernel work for
@@ -323,6 +329,10 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None):
     assert indices.shape == (B, S, kv_group, topk)
     assert lse.shape == (B, S, H)
 
+    dkv_variant = os.environ.get("PRIME_SPARSE_BWD_DKV", "fp32")
+    if dkv_variant not in {"fp32", "bf16"}:
+        raise ValueError("PRIME_SPARSE_BWD_DKV must be 'fp32' or 'bf16'")
+    dkv_dtype = T.bfloat16 if dkv_variant == "bf16" else T.float32
     preprocess_kernel = preprocess(H, D)
     if torch.cuda.get_device_capability(q.device)[0] < 9:
         # The baseline uses 16 heads per tile and 64 threads.  ``bh32`` is an
@@ -358,14 +368,28 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None):
             block_H=block_heads,
             threads=threads,
             vectorized_atomic=False,
+            dkv_dtype=dkv_dtype,
         )
     else:
-        bwd_kernel = bwd(H, D, D_tail, topk, kv_group, sm_scale, True)
-    postprocess_kernel = postprocess(D, D_tail, kv_group)
+        bwd_kernel = bwd(
+            H,
+            D,
+            D_tail,
+            topk,
+            kv_group,
+            sm_scale,
+            True,
+            vectorized_atomic=dkv_variant == "fp32",
+            dkv_dtype=dkv_dtype,
+        )
 
     delta = preprocess_kernel(o, do)
-    dkv = torch.zeros_like(kv, dtype=torch.float32)
+    dkv = torch.zeros_like(
+        kv,
+        dtype=torch.float32 if dkv_variant == "fp32" else torch.bfloat16,
+    )
     dq = bwd_kernel(q, kv, do, indices, lse, delta, dkv)
-    dkv = postprocess_kernel(dkv)
+    if dkv_variant == "fp32":
+        dkv = postprocess(D, D_tail, kv_group)(dkv)
 
     return dq, dkv

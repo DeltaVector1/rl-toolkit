@@ -49,6 +49,10 @@ _LORA_W2_LOW_RANK_REUSE_VALUE = os.environ.get(
 if _LORA_W2_LOW_RANK_REUSE_VALUE not in {"0", "1"}:
     raise ValueError("PRIME_FP8_LORA_W2_LOW_RANK_REUSE must be 0 or 1")
 _LORA_W2_LOW_RANK_REUSE = _LORA_W2_LOW_RANK_REUSE_VALUE == "1"
+_SCATTERMOE_LORA_VALUE = os.environ.get("PRIME_FP8_SCATTERMOE_LORA", "0")
+if _SCATTERMOE_LORA_VALUE not in {"0", "1"}:
+    raise ValueError("PRIME_FP8_SCATTERMOE_LORA must be 0 or 1")
+_SCATTERMOE_LORA = _SCATTERMOE_LORA_VALUE == "1"
 _DIAGNOSE_LINEAR_BACKWARD = False
 _REPORTED_LINEAR_BACKWARD: set[tuple[tuple[int, ...], bool, bool]] = set()
 _REPORTED_INPUT_GRAD: set[str] = set()
@@ -146,6 +150,109 @@ def _profile_expert_backward(start, end) -> None:
 
 
 if hasattr(triton, "jit"):
+    @triton.jit
+    def _scattermoe_lora_forward_kernel(
+        x,
+        row_indices,
+        offsets,
+        lora_a,
+        lora_b,
+        output,
+        source_rows,
+        input_size,
+        output_size,
+        stride_xm,
+        stride_xk,
+        stride_indices,
+        stride_offsets,
+        stride_ae,
+        stride_ak,
+        stride_ad,
+        stride_be,
+        stride_bn,
+        stride_bk,
+        stride_om,
+        stride_on,
+        MAX_EXPERTS: tl.constexpr,
+        INPUT_SIZE: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        """ScatterMoE-style row-mapped rank-32 BF16 LoRA forward.
+
+        Each program reads its source row through ``row_indices`` and finds
+        its expert from ``offsets``.  It computes ``x @ A.T @ B.T`` directly,
+        so the LoRA path does not allocate a gathered BF16 input or an
+        intermediate rank tensor.  The frozen native-FP8 base output remains
+        produced by the validated grouped kernel and is added by the caller.
+        Accumulation is FP32 and the result is stored as BF16.
+        """
+        row = tl.program_id(0)
+        n_block = tl.program_id(1)
+        n = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
+        valid_columns = n < output_size
+        source_index = tl.load(row_indices + row * stride_indices)
+        route_rows = tl.load(offsets + (MAX_EXPERTS - 1) * stride_offsets)
+        source_valid = (
+            (row < route_rows)
+            & (source_index >= 0)
+            & (source_index < source_rows)
+        )
+        safe_source = tl.where(source_valid, source_index, 0)
+
+        # Select the expert from the sorted row offsets.  The explicit range
+        # keeps empty experts valid: a row is selected only when it is inside
+        # both the expert start and end offsets.
+        expert = tl.zeros((), dtype=tl.int32)
+        for expert_index in range(MAX_EXPERTS):
+            expert_start = tl.load(
+                offsets + (expert_index - 1) * stride_offsets,
+                mask=expert_index > 0,
+                other=0,
+            )
+            expert_end = tl.load(offsets + expert_index * stride_offsets)
+            selected = (row >= expert_start) & (row < expert_end)
+            expert = tl.where(selected, expert_index, expert)
+
+        low_rank = tl.zeros((BLOCK_K,), dtype=tl.float32)
+        for d_start in range(0, INPUT_SIZE, BLOCK_D):
+            d = d_start + tl.arange(0, BLOCK_D)
+            x_values = tl.load(
+                x + safe_source * stride_xm + d * stride_xk,
+                mask=(source_valid & (d < input_size)),
+                other=0,
+            ).to(tl.bfloat16)
+            a_values = tl.load(
+                lora_a
+                + expert * stride_ae
+                + tl.arange(0, BLOCK_K)[:, None] * stride_ak
+                + d[None, :] * stride_ad,
+                mask=(tl.arange(0, BLOCK_K)[:, None] < BLOCK_K)
+                & (d[None, :] < input_size),
+                other=0,
+            ).to(tl.bfloat16)
+            low_rank += tl.sum(
+                a_values.to(tl.float32) * x_values[None, :].to(tl.float32),
+                axis=1,
+            )
+
+        b_values = tl.load(
+            lora_b
+            + expert * stride_be
+            + n[None, :] * stride_bn
+            + tl.arange(0, BLOCK_K)[:, None] * stride_bk,
+            mask=(tl.arange(0, BLOCK_K)[:, None] < BLOCK_K)
+            & valid_columns[None, :],
+            other=0,
+        ).to(tl.float32)
+        result = tl.sum(low_rank[:, None] * b_values, axis=0)
+        tl.store(
+            output + row * stride_om + n * stride_on,
+            result,
+            mask=source_valid & valid_columns,
+        )
+
     @triton.jit
     def _expert_scatter_kernel(
         destination,
@@ -367,6 +474,7 @@ if hasattr(triton, "jit"):
         tl.store(output + output_offsets, previous + accumulator, mask=output_mask)
 
 else:
+    _scattermoe_lora_forward_kernel = None
     _expert_scatter_kernel = None
     _block_fp8_mm_kernel = None
     _w8a16_input_grad_kernel = None
@@ -1862,6 +1970,87 @@ def _index_copy_real_rows_with_cache_retry(destination, indices, source, real):
     return destination
 
 
+def _scattermoe_lora_projection(x, row_indices, lora_a, lora_b, offsets):
+    """Run the opt-in row-mapped rank-32 LoRA forward candidate.
+
+    ``row_indices`` maps sorted expert rows to source-major rows.  The helper
+    keeps the base expert result separate so the validated native-FP8 base
+    kernel remains unchanged.  It is a candidate for isolated SM89 timing and
+    parity tests; the default routed-expert path never calls it.
+    """
+    if _scattermoe_lora_forward_kernel is None:
+        raise RuntimeError("Triton is unavailable for ScatterMoE LoRA")
+    if not x.is_cuda or x.dtype != torch.bfloat16:
+        raise TypeError("ScatterMoE LoRA requires CUDA BF16 source rows")
+    if (
+        not row_indices.is_cuda
+        or row_indices.ndim != 1
+        or not row_indices.is_contiguous()
+    ):
+        raise ValueError(
+            "ScatterMoE LoRA row indices must be contiguous CUDA vectors"
+        )
+    if row_indices.shape[0] <= 0:
+        return x.new_empty((0, lora_b.shape[1]))
+    if not offsets.is_cuda or offsets.dtype != torch.int32 or offsets.ndim != 1:
+        raise ValueError("ScatterMoE LoRA offsets must be a CUDA INT32 vector")
+    if not lora_a.is_cuda or not lora_b.is_cuda:
+        raise ValueError("ScatterMoE LoRA factors must be CUDA tensors")
+    if lora_a.dtype != x.dtype or lora_b.dtype != x.dtype:
+        raise TypeError("ScatterMoE LoRA factors must use BF16")
+    if not lora_a.is_contiguous() or not lora_b.is_contiguous():
+        raise ValueError("ScatterMoE LoRA factors must be contiguous")
+    if lora_a.ndim != 3 or lora_b.ndim != 3 or lora_a.shape[0] != offsets.shape[0]:
+        raise ValueError("ScatterMoE LoRA expert dimensions are invalid")
+    if lora_a.shape[1] != 32 or lora_b.shape[2] != 32:
+        raise RuntimeError("ScatterMoE LoRA candidate requires rank 32")
+    if lora_a.shape[2] != x.shape[1]:
+        raise ValueError("ScatterMoE LoRA input width does not match source rows")
+    if lora_b.shape[1] <= 0:
+        raise ValueError("ScatterMoE LoRA output width must be positive")
+
+    output = torch.zeros(
+        row_indices.shape[0],
+        lora_b.shape[1],
+        device=x.device,
+        dtype=x.dtype,
+    )
+    block_n = 128
+    _scattermoe_lora_forward_kernel[
+        (row_indices.shape[0], triton.cdiv(lora_b.shape[1], block_n))
+    ](
+        x,
+        row_indices,
+        offsets,
+        lora_a,
+        lora_b,
+        output,
+        x.shape[0],
+        x.shape[1],
+        lora_b.shape[1],
+        x.stride(0),
+        x.stride(1),
+        row_indices.stride(0),
+        offsets.stride(0),
+        lora_a.stride(0),
+        lora_a.stride(1),
+        lora_a.stride(2),
+        lora_b.stride(0),
+        lora_b.stride(1),
+        lora_b.stride(2),
+        output.stride(0),
+        output.stride(1),
+        MAX_EXPERTS=lora_a.shape[0],
+        INPUT_SIZE=x.shape[1],
+        BLOCK_N=block_n,
+        BLOCK_K=32,
+        BLOCK_D=128,
+        num_warps=4,
+        num_stages=2,
+    )
+    return output
+
+
 def _grouped_mm_pair_chunks(x, w1, s1, w3, s3, offsets, chunk_rows):
     """Yield bounded W1/W3 outputs with one quantization for each row chunk."""
     for start in range(0, x.shape[0], chunk_rows):
@@ -2485,6 +2674,10 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
             getattr(received_input, "save_for_backward", True)
         )
         reuse_w2_low_rank = _LORA_W2_LOW_RANK_REUSE and save_backward_state
+        if _SCATTERMOE_LORA and reuse_w2_low_rank:
+            raise ValueError(
+                "ScatterMoE LoRA and W2 low-rank reuse are separate candidates"
+            )
         if save_backward_state:
             q1_host = torch.empty(
                 rows,
@@ -2524,24 +2717,46 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                 chunk_offsets,
                 shared_input=True,
             )
-            z1.add_(
-                _grouped_lora_projection(
-                    chunk_x,
-                    w1_lora_a,
-                    w1_lora_b,
-                    chunk_offsets,
-                ),
-                alpha=scaling,
-            )
-            z3.add_(
-                _grouped_lora_projection(
-                    chunk_x,
-                    w3_lora_a,
-                    w3_lora_b,
-                    chunk_offsets,
-                ),
-                alpha=scaling,
-            )
+            if _SCATTERMOE_LORA:
+                z1.add_(
+                    _scattermoe_lora_projection(
+                        x,
+                        indices,
+                        w1_lora_a,
+                        w1_lora_b,
+                        chunk_offsets,
+                    ),
+                    alpha=scaling,
+                )
+                z3.add_(
+                    _scattermoe_lora_projection(
+                        x,
+                        indices,
+                        w3_lora_a,
+                        w3_lora_b,
+                        chunk_offsets,
+                    ),
+                    alpha=scaling,
+                )
+            else:
+                z1.add_(
+                    _grouped_lora_projection(
+                        chunk_x,
+                        w1_lora_a,
+                        w1_lora_b,
+                        chunk_offsets,
+                    ),
+                    alpha=scaling,
+                )
+                z3.add_(
+                    _grouped_lora_projection(
+                        chunk_x,
+                        w3_lora_a,
+                        w3_lora_b,
+                        chunk_offsets,
+                    ),
+                    alpha=scaling,
+                )
 
             if save_backward_state:
                 q1, qs1 = ops.scaled_fp8_quant(z1, use_per_token_if_dynamic=True)
@@ -2561,14 +2776,34 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                 s2,
                 chunk_offsets,
             )
-            lora_w2, w2_low_rank = _grouped_lora_projection_with_low_rank(
-                z1,
-                w2_lora_a,
-                w2_lora_b,
-                chunk_offsets,
-            )
+            if _SCATTERMOE_LORA:
+                w2_row_indices = torch.arange(
+                    end - start,
+                    device=z1.device,
+                    dtype=permuted_indices.dtype,
+                )
+                lora_w2 = _scattermoe_lora_projection(
+                    z1,
+                    w2_row_indices,
+                    w2_lora_a,
+                    w2_lora_b,
+                    chunk_offsets,
+                )
+                w2_low_rank = None
+            else:
+                w2_row_indices = None
+                lora_w2, w2_low_rank = _grouped_lora_projection_with_low_rank(
+                    z1,
+                    w2_lora_a,
+                    w2_lora_b,
+                    chunk_offsets,
+                )
             chunk_out.add_(lora_w2, alpha=scaling)
             if reuse_w2_low_rank:
+                if w2_low_rank is None:
+                    raise RuntimeError(
+                        "ScatterMoE LoRA cannot reuse an uncomputed W2 low-rank value"
+                    )
                 w2_low_rank_host[start:end].copy_(w2_low_rank, non_blocking=True)
             _index_copy_real_rows_with_cache_retry(x, indices, chunk_out, real)
             del (
@@ -2578,6 +2813,7 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                 chunk_out,
                 lora_w2,
                 w2_low_rank,
+                w2_row_indices,
                 indices,
                 real,
                 chunk_offsets,
