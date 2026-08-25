@@ -130,6 +130,7 @@ def bwd(
     assert block_size % split_store == 0
     if low_memory_dkv:
         assert split_store == 4, "low-memory dKV uses the split_store=4 tile"
+        assert block_size >= 32, "low-memory dKV requires block_size >= 32"
 
     if sm_scale is None:
         sm_scale = (D + D_tail) ** (-0.5)
@@ -190,17 +191,21 @@ def bwd(
             # the dKV dtype.
             dkv_split_rows = BS // split_store
             if low_memory_dkv:
+                # CUDA BF16 MMA requires an M tile of at least 16 rows.  A
+                # split-4 block has 8 real rows at BS=32, so pad the compute
+                # tile while atomically storing only the real rows.
+                dkv_gemm_rows = max(16, dkv_split_rows)
                 P_dkv_shared = T.alloc_shared(
-                    [block_H, dkv_split_rows], dtype
+                    [block_H, dkv_gemm_rows], dtype
                 )
                 dP_dkv_shared = T.alloc_shared(
-                    [block_H, dkv_split_rows], dtype
+                    [block_H, dkv_gemm_rows], dtype
                 )
                 acc_dkv = T.alloc_fragment(
-                    [dkv_split_rows, D], accum_dtype
+                    [dkv_gemm_rows, D], accum_dtype
                 )
                 acc_dkv_tail = T.alloc_fragment(
-                    [dkv_split_rows, D_tail], accum_dtype
+                    [dkv_gemm_rows, D_tail], accum_dtype
                 )
             else:
                 acc_dkv = T.alloc_fragment([BS, D], accum_dtype)
@@ -288,13 +293,22 @@ def bwd(
 
                 for s in range(split_store):
                     if low_memory_dkv:
-                        for h_i, bi_i in T.Parallel(block_H, dkv_split_rows):
-                            P_dkv_shared[h_i, bi_i] = P_shared_cast[
-                                h_i, bi_i + s * dkv_split_rows
-                            ]
-                            dP_dkv_shared[h_i, bi_i] = dP_shared_cast[
-                                h_i, bi_i + s * dkv_split_rows
-                            ]
+                        for h_i, bi_i in T.Parallel(block_H, dkv_gemm_rows):
+                            valid_row = bi_i < dkv_split_rows
+                            source_column = bi_i + s * dkv_split_rows
+                            safe_source_column = T.if_then_else(
+                                valid_row, source_column, 0
+                            )
+                            P_dkv_shared[h_i, bi_i] = T.if_then_else(
+                                valid_row,
+                                P_shared_cast[h_i, safe_source_column],
+                                0,
+                            )
+                            dP_dkv_shared[h_i, bi_i] = T.if_then_else(
+                                valid_row,
+                                dP_shared_cast[h_i, safe_source_column],
+                                0,
+                            )
                         T.gemm(
                             dP_dkv_shared,
                             Q_shared,

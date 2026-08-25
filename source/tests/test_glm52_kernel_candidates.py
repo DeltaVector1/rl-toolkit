@@ -50,6 +50,14 @@ class GLM52KernelCandidateTest(unittest.TestCase):
         )
         self.assertIn("_scattermoe_lora_projection", FP8_SOURCE)
         self.assertIn("_SCATTERMOE_LORA", FP8_SOURCE)
+        self.assertIn(
+            "ScatterMoE LoRA row indices must be INT32 or INT64",
+            FP8_SOURCE,
+        )
+        self.assertIn(
+            "ScatterMoE LoRA tensors must share one CUDA device",
+            FP8_SOURCE,
+        )
         self.assertIn("_grouped_mm_pair(", FP8_SOURCE)
         self.assertIn("ScatterMoE LoRA candidate requires rank 32", FP8_SOURCE)
         self.assertIn(
@@ -73,6 +81,10 @@ class GLM52KernelCandidateTest(unittest.TestCase):
         self.assertIn("value.to(parameter.dtype)", FP8_SOURCE)
         self.assertIn("BLOCK_ROWS=32", FP8_SOURCE)
         self.assertIn("output.dtype != torch.float32", FP8_SOURCE)
+        self.assertIn(
+            "ScatterMoE LoRA backward tensors must share one device",
+            FP8_SOURCE,
+        )
         backward = FP8_SOURCE.split(
             "class _InplacePermutedLoRAExperts", 1
         )[1].split("\n\nclass _ScaleRoutedOutput", 1)[0]
@@ -135,9 +147,15 @@ class GLM52KernelCandidateTest(unittest.TestCase):
             SPARSE_BWD_SOURCE,
         )
         self.assertIn("if low_memory_dkv:", SPARSE_BWD_SOURCE)
+        self.assertIn(
+            '"low-memory dKV requires block_size >= 32"',
+            SPARSE_BWD_SOURCE,
+        )
+        self.assertIn("dkv_gemm_rows = max(16, dkv_split_rows)", SPARSE_BWD_SOURCE)
+        self.assertIn("safe_source_column", SPARSE_BWD_SOURCE)
         self.assertIn("P_dkv_shared", SPARSE_BWD_SOURCE)
         self.assertIn("dP_dkv_shared", SPARSE_BWD_SOURCE)
-        self.assertIn("[dkv_split_rows, D]", SPARSE_BWD_SOURCE)
+        self.assertIn("[dkv_gemm_rows, D]", SPARSE_BWD_SOURCE)
 
     def test_w2_chunk_candidate_has_bounded_values(self):
         self.assertIn(

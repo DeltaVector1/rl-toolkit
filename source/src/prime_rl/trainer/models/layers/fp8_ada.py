@@ -2090,6 +2090,13 @@ def _scattermoe_lora_projection(x, row_indices, lora_a, lora_b, offsets):
         raise ValueError(
             "ScatterMoE LoRA row indices must be contiguous CUDA vectors"
         )
+    if row_indices.dtype not in (torch.int32, torch.int64):
+        raise TypeError("ScatterMoE LoRA row indices must be INT32 or INT64")
+    if any(
+        value.device != x.device
+        for value in (row_indices, offsets, lora_a, lora_b)
+    ):
+        raise ValueError("ScatterMoE LoRA tensors must share one CUDA device")
     if row_indices.shape[0] <= 0:
         return x.new_empty((0, lora_b.shape[1]))
     if not offsets.is_cuda or offsets.dtype != torch.int32 or offsets.ndim != 1:
@@ -2687,6 +2694,11 @@ def _scattermoe_outer_accumulate(left, right, row_indices, offsets, output):
         value.is_cuda for value in (left, right, row_indices, offsets, output)
     ):
         raise RuntimeError("ScatterMoE LoRA backward requires CUDA tensors")
+    if any(
+        value.device != left.device
+        for value in (right, row_indices, offsets, output)
+    ):
+        raise ValueError("ScatterMoE LoRA backward tensors must share one device")
     if left.dtype != torch.bfloat16 or right.dtype != torch.bfloat16:
         raise TypeError("ScatterMoE LoRA backward inputs must be BF16")
     if output.dtype != torch.float32:
