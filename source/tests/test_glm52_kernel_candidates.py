@@ -76,16 +76,27 @@ class GLM52KernelCandidateTest(unittest.TestCase):
         self.assertIn('variant == "bh32"', SPARSE_BWD_SOURCE)
         self.assertEqual(SPARSE_BWD_SOURCE.count("PRIME_SPARSE_BWD_VARIANT"), 2)
 
-    def test_sparse_bf16_dkv_candidate_keeps_bf16_dq_path(self):
-        self.assertIn('"PRIME_SPARSE_BWD_DKV", "fp32"', SPARSE_BWD_SOURCE)
-        self.assertIn("dkv_dtype = T.bfloat16", SPARSE_BWD_SOURCE)
-        self.assertIn("dkv_variant == \"fp32\"", SPARSE_BWD_SOURCE)
-        self.assertIn("dKV: T.Tensor(k_shape, dkv_dtype)", SPARSE_BWD_SOURCE)
+    def test_sparse_dkv_is_always_fp32_and_bf16_candidate_is_absent(self):
+        self.assertNotIn("PRIME_SPARSE_BWD_DKV", SPARSE_BWD_SOURCE)
+        self.assertIn("dKV: T.Tensor(k_shape, accum_dtype)", SPARSE_BWD_SOURCE)
+        self.assertIn("dkv = torch.zeros_like(kv, dtype=torch.float32)", SPARSE_BWD_SOURCE)
+        self.assertIn("dkv = postprocess(D, D_tail, kv_group)(dkv)", SPARSE_BWD_SOURCE)
+        self.assertNotIn("dkv_dtype", SPARSE_BWD_SOURCE)
+        self.assertNotIn("T.bfloat16 if", SPARSE_BWD_SOURCE)
         self.assertIn(
-            'vectorized_atomic=dkv_variant == "fp32"',
+            "the dKV dtype",
             SPARSE_BWD_SOURCE,
         )
         self.assertNotIn("float8", SPARSE_BWD_SOURCE)
+
+    def test_sparse_fp32_split_stage_is_opt_in(self):
+        self.assertIn(
+            'os.environ.get("PRIME_SPARSE_BWD_FP32_SPLIT_STORE", "2")',
+            SPARSE_BWD_SOURCE,
+        )
+        self.assertIn("split_store_value not in {\"2\", \"4\"}", SPARSE_BWD_SOURCE)
+        self.assertIn("split_store=split_store", SPARSE_BWD_SOURCE)
+        self.assertIn("split_store=4 variant halves this tile again", SPARSE_BWD_SOURCE)
 
     def test_w2_chunk_candidate_has_bounded_values(self):
         self.assertIn(

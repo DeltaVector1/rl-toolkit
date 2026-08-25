@@ -118,13 +118,15 @@ def bwd(
     indices_dtype=T.int32,
     dtype=T.bfloat16,
     accum_dtype=T.float32,
-    dkv_dtype=T.float32,
+    split_store=2,
 ):
     assert is_causal is True, "non-casual is not supported now"
     assert topk % block_size == 0, "otherwise will load some index=0 thus causing wrong kv to be loaded"
     assert dtype == T.bfloat16
     assert accum_dtype == T.float32
     assert indices_dtype == T.int32
+    assert split_store in (2, 4)
+    assert block_size % split_store == 0
 
     if sm_scale is None:
         sm_scale = (D + D_tail) ** (-0.5)
@@ -150,8 +152,6 @@ def bwd(
     BS = block_size
     NS = tilelang.cdiv(topk, block_size)
 
-    split_store = 2
-
     @T.prim_func
     def sparse_mla_bwd_kernel(
         Q: T.Tensor(q_shape, dtype),
@@ -161,7 +161,7 @@ def bwd(
         Lse: T.Tensor(lse_shape, accum_dtype),
         Delta: T.Tensor(delta_shape, accum_dtype),
         dQ: T.Tensor(q_shape, dtype),
-        dKV: T.Tensor(k_shape, dkv_dtype),
+        dKV: T.Tensor(k_shape, accum_dtype),
     ):
         with T.Kernel(S, B, kv_group * NH, threads=threads) as (s_i, by, bz):
             Q_shared = T.alloc_shared([block_H, D], dtype)
@@ -182,13 +182,14 @@ def bwd(
             acc_dq_tail = T.alloc_fragment([block_H, D_tail], accum_dtype)
             acc_dkv = T.alloc_fragment([BS, D], accum_dtype)
             acc_dkv_tail = T.alloc_fragment([BS, D_tail], accum_dtype)
-            # The normal path stores an FP32 atomic accumulator and casts once
-            # in postprocess.  The opt-in BF16-dKV candidate stores the same
-            # FP32 tile into BF16 shared memory before the atomic update.  dQ
-            # remains the validated BF16-output path; this candidate never
-            # uses an FP8 dQ operation.
-            acc_dkv_shared = T.alloc_shared([BS // split_store, D], dkv_dtype)
-            acc_dkv_tail_shared = T.alloc_shared([BS // split_store, D_tail], dkv_dtype)
+            # Keep the staging tile FP32 so the dKV atomic accumulation stays
+            # exact relative to the existing reference.  The opt-in
+            # split_store=4 variant halves this tile again without changing
+            # the dKV dtype; it only performs more store/atomic slices.
+            acc_dkv_shared = T.alloc_shared([BS // split_store, D], accum_dtype)
+            acc_dkv_tail_shared = T.alloc_shared(
+                [BS // split_store, D_tail], accum_dtype
+            )
 
             # See sparse_mla_fwd: sentinel is at index S_kv - 1 (zero KV), valid indices
             # live in [0, S_kv - 1). Using this single bound makes the kernel work for
@@ -329,12 +330,15 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None):
     assert indices.shape == (B, S, kv_group, topk)
     assert lse.shape == (B, S, H)
 
-    dkv_variant = os.environ.get("PRIME_SPARSE_BWD_DKV", "fp32")
-    if dkv_variant not in {"fp32", "bf16"}:
-        raise ValueError("PRIME_SPARSE_BWD_DKV must be 'fp32' or 'bf16'")
-    dkv_dtype = T.bfloat16 if dkv_variant == "bf16" else T.float32
+    split_store_value = os.environ.get("PRIME_SPARSE_BWD_FP32_SPLIT_STORE", "2")
+    if split_store_value not in {"2", "4"}:
+        raise ValueError(
+            "PRIME_SPARSE_BWD_FP32_SPLIT_STORE must be 2 or 4"
+        )
+    split_store = int(split_store_value)
+    capability = torch.cuda.get_device_capability(q.device)
     preprocess_kernel = preprocess(H, D)
-    if torch.cuda.get_device_capability(q.device)[0] < 9:
+    if capability[0] < 9:
         # The baseline uses 16 heads per tile and 64 threads.  ``bh32`` is an
         # opt-in SM89 candidate measured separately at the production shape.
         # It changes only the reduction tile; it does not change the forward
@@ -368,7 +372,7 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None):
             block_H=block_heads,
             threads=threads,
             vectorized_atomic=False,
-            dkv_dtype=dkv_dtype,
+            split_store=split_store,
         )
     else:
         bwd_kernel = bwd(
@@ -379,17 +383,13 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None):
             kv_group,
             sm_scale,
             True,
-            vectorized_atomic=dkv_variant == "fp32",
-            dkv_dtype=dkv_dtype,
+            vectorized_atomic=True,
+            split_store=split_store,
         )
 
     delta = preprocess_kernel(o, do)
-    dkv = torch.zeros_like(
-        kv,
-        dtype=torch.float32 if dkv_variant == "fp32" else torch.bfloat16,
-    )
+    dkv = torch.zeros_like(kv, dtype=torch.float32)
     dq = bwd_kernel(q, kv, do, indices, lse, delta, dkv)
-    if dkv_variant == "fp32":
-        dkv = postprocess(D, D_tail, kv_group)(dkv)
+    dkv = postprocess(D, D_tail, kv_group)(dkv)
 
     return dq, dkv
