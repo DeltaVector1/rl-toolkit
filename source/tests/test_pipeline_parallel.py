@@ -191,6 +191,16 @@ class SideInputFifoTest(unittest.TestCase):
             ],
         )
 
+    def test_sparse_cache_slot_reuse_does_not_block_the_cpu(self):
+        source = (
+            SOURCE / "src/prime_rl/trainer/distributed/pp_runner.py"
+        ).read_text()
+        method = source.split("        def get_fwd_recv_ops", 1)[1].split(
+            "        def forward_one_chunk", 1
+        )[0]
+        self.assertIn("torch.cuda.current_stream().wait_event(event)", method)
+        self.assertNotIn("event.synchronize()", method)
+
 
 if __name__ == "__main__":
     unittest.main()

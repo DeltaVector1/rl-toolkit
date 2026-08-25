@@ -310,7 +310,7 @@ def _sparse_cache_pipeline_stage_cls():
                 slot = fwd_chunk_id % len(self._sparse_cache_events)
                 event = self._sparse_cache_events[slot]
                 if event is not None:
-                    event.synchronize()
+                    torch.cuda.current_stream().wait_event(event)
             return super().get_fwd_recv_ops(fwd_chunk_id)
 
         def forward_one_chunk(
