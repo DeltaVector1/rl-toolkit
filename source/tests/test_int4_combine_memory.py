@@ -279,15 +279,39 @@ class Int4CombineMemoryTests(unittest.TestCase):
         self.assertNotIn("quant", bf16.lower())
         self.assertNotIn("scale", bf16.lower())
 
+    def test_bf16_combine_reuses_reserved_dispatch_storage_by_columns(self):
+        function = SOURCE.split("def _streaming_bf16_combine", 1)[1].split(
+            "\n\nclass _BF16Dispatch", 1
+        )[0]
+        dispatch = SOURCE.split("class _BF16Dispatch", 1)[1].split(
+            "\n\nclass _INT4Dispatch", 1
+        )[0]
+        self.assertIn("result = routed_output", function)
+        self.assertIn("result.as_strided_", function)
+        self.assertIn("source[:, column_offset", function)
+        self.assertIn("result[:, column_offset", function)
+        self.assertIn("output_rows > storage_rows", function)
+        self.assertEqual(function.count("_empty_with_cache_retry("), 2)
+        self.assertIn("capacity_rows = max(routed_input.shape[0], output_rows)", dispatch)
+        self.assertIn("ctx.mark_dirty(routed_input)", dispatch)
+        self.assertIn("_BF16_COMBINE_ROUNDS", dispatch)
+
+    def test_bf16_combine_rounds_fail_closed(self):
+        prefix = SOURCE.split("def _in_backward", 1)[0]
+        self.assertIn('os.environ.get("PRIME_BF16_COMBINE_ROUNDS", "8")', prefix)
+        self.assertIn("not 1 <= _BF16_COMBINE_ROUNDS <= 64", prefix)
+        self.assertIn("PRIME_BF16_COMBINE_ROUNDS must be between 1 and 64", prefix)
+
     def test_bf16_transport_memory_is_counted_in_bytes(self):
         function = SOURCE.split("def bf16_expert_transport_memory_bytes", 1)[1].split(
             "\n\ndef _streaming_int4_forward", 1
         )[0]
-        self.assertIn('"dispatch_output_cuda"', function)
-        self.assertIn('"combine_output_cuda"', function)
-        self.assertIn('"saved_dispatch_input_host"', function)
-        self.assertIn('"reconstruction_workspace_host"', function)
-        self.assertEqual(function.count("* element_bytes"), 4)
+        self.assertIn('"dispatch_capacity_cuda"', function)
+        self.assertIn('"saved_dispatch_input_cuda"', function)
+        self.assertIn('"combine_scratch_cuda"', function)
+        self.assertIn('"reconstruction_workspace_cuda"', function)
+        self.assertEqual(function.count("* element_bytes"), 3)
+        self.assertEqual(function.count("* index_bytes"), 1)
 
     def test_bf16_saved_input_is_only_kept_for_backward(self):
         saved_input = SOURCE.split("class ReceivedBF16ExpertInput", 1)[1].split(
@@ -297,6 +321,10 @@ class Int4CombineMemoryTests(unittest.TestCase):
             "class NativeFP8LoRAAllToAllExpertParallel", 1
         )[1].split("\n\nclass DeepEPExpertParallel", 1)[0]
         self.assertIn("if not self.save_for_backward", saved_input)
+        self.assertIn("self.values = values.detach().clone()", saved_input)
+        self.assertNotIn("pin_memory=True", saved_input)
+        self.assertNotIn("synchronize()", saved_input)
+        self.assertIn("torch.index_select(self.values", saved_input)
         self.assertIn("save_for_backward=torch.is_grad_enabled()", native)
 
 

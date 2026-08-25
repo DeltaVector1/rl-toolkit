@@ -78,6 +78,9 @@ _EP_AC_CACHE = os.environ.get("PRIME_EP_AC_CACHE", "") == "1"
 _INT4_COMBINE_ROUNDS = int(os.environ.get("PRIME_INT4_COMBINE_ROUNDS", "1"))
 if _INT4_COMBINE_ROUNDS < 1:
     raise ValueError("PRIME_INT4_COMBINE_ROUNDS must be at least 1")
+_BF16_COMBINE_ROUNDS = int(os.environ.get("PRIME_BF16_COMBINE_ROUNDS", "8"))
+if not 1 <= _BF16_COMBINE_ROUNDS <= 64:
+    raise ValueError("PRIME_BF16_COMBINE_ROUNDS must be between 1 and 64")
 
 
 def _in_backward() -> bool:
@@ -356,16 +359,12 @@ class ReceivedBF16ExpertInput:
     __slots__ = (
         "values",
         "columns",
-        "copy_done",
-        "copy_ready",
         "save_for_backward",
     )
 
     def __init__(self, save_for_backward: bool = True) -> None:
         self.values = None
         self.columns = 0
-        self.copy_done = None
-        self.copy_ready = False
         self.save_for_backward = save_for_backward
 
     def prepare(self, values: torch.Tensor) -> None:
@@ -378,15 +377,7 @@ class ReceivedBF16ExpertInput:
         self.columns = values.shape[1]
         if not self.save_for_backward:
             return
-        self.values = torch.empty(
-            values.shape,
-            device="cpu",
-            dtype=torch.bfloat16,
-            pin_memory=True,
-        )
-        self.values.copy_(values, non_blocking=True)
-        self.copy_done = torch.cuda.Event()
-        self.copy_done.record(torch.cuda.current_stream(values.device))
+        self.values = values.detach().clone()
 
     def reconstruct_rows(
         self,
@@ -394,7 +385,7 @@ class ReceivedBF16ExpertInput:
         output: torch.Tensor,
         workspace,
     ) -> None:
-        if self.values is None or self.copy_done is None:
+        if self.values is None:
             raise RuntimeError("received BF16 expert input is incomplete")
         if row_indices.device.type != "cpu" or row_indices.ndim != 1:
             raise ValueError(
@@ -412,15 +403,12 @@ class ReceivedBF16ExpertInput:
         if not self.values.shape[0]:
             raise ValueError("cannot reconstruct rows from an empty received BF16 input")
 
-        if not self.copy_ready:
-            self.copy_done.synchronize()
-            self.copy_ready = True
-        real_rows = (row_indices >= 0) & (row_indices < self.values.shape[0])
-        safe_indices = row_indices.clamp(0, self.values.shape[0] - 1).long()
-        host_values = workspace.host_values[: row_indices.shape[0]]
-        torch.index_select(self.values, 0, safe_indices, out=host_values)
-        output.copy_(host_values, non_blocking=True)
-        output.masked_fill_((~real_rows).to(output.device).unsqueeze(-1), 0)
+        indices = workspace.device_indices[: row_indices.shape[0]]
+        indices.copy_(row_indices, non_blocking=True)
+        real_rows = (indices >= 0) & (indices < self.values.shape[0])
+        indices.clamp_(0, self.values.shape[0] - 1)
+        torch.index_select(self.values, 0, indices, out=output)
+        output.masked_fill_((~real_rows).unsqueeze(-1), 0)
 
     def make_workspace(
         self, row_capacity: int, device: torch.device
@@ -429,9 +417,9 @@ class ReceivedBF16ExpertInput:
 
 
 class BF16ExpertInputWorkspace:
-    """Bound host scratch for exact BF16 expert-input reconstruction."""
+    """Bound device scratch for exact BF16 expert-input reconstruction."""
 
-    __slots__ = ("row_capacity", "columns", "device", "host_values")
+    __slots__ = ("row_capacity", "columns", "device", "device_indices")
 
     def __init__(self, row_capacity: int, columns: int, device: torch.device) -> None:
         if row_capacity <= 0 or columns <= 0:
@@ -441,11 +429,10 @@ class BF16ExpertInputWorkspace:
         self.device = torch.device(device)
         if self.device.type != "cuda":
             raise ValueError("BF16 expert input workspace requires a CUDA device")
-        self.host_values = torch.empty(
-            (row_capacity, columns),
-            device="cpu",
-            dtype=torch.bfloat16,
-            pin_memory=True,
+        self.device_indices = torch.empty(
+            row_capacity,
+            device=self.device,
+            dtype=torch.int64,
         )
 
     def check(self, rows: int, columns: int, device: torch.device) -> None:
@@ -465,13 +452,16 @@ def bf16_expert_transport_memory_bytes(
     if min(input_rows, output_rows) < 0 or columns <= 0 or reconstruction_rows <= 0:
         raise ValueError("BF16 expert transport memory shape is invalid")
     element_bytes = torch.tensor([], dtype=torch.bfloat16).element_size()
+    index_bytes = torch.tensor([], dtype=torch.int64).element_size()
     return {
-        "dispatch_output_cuda": output_rows * columns * element_bytes,
-        "combine_output_cuda": input_rows * columns * element_bytes,
-        "saved_dispatch_input_host": output_rows * columns * element_bytes,
-        "reconstruction_workspace_host": reconstruction_rows
+        "dispatch_capacity_cuda": max(input_rows, output_rows)
         * columns
         * element_bytes,
+        "saved_dispatch_input_cuda": output_rows * columns * element_bytes,
+        "combine_scratch_cuda": (input_rows + output_rows)
+        * ((columns + _BF16_COMBINE_ROUNDS - 1) // _BF16_COMBINE_ROUNDS)
+        * element_bytes,
+        "reconstruction_workspace_cuda": reconstruction_rows * index_bytes,
     }
 
 
@@ -808,6 +798,69 @@ def _validate_bf16_dispatch(
     return group
 
 
+def _streaming_bf16_combine(
+    routed_output: torch.Tensor,
+    output_splits: list[int],
+    input_splits: list[int],
+    group_name: str,
+    rounds: int,
+) -> torch.Tensor:
+    if rounds < 1:
+        raise ValueError("BF16 combine rounds must be at least 1")
+    group = _validate_bf16_dispatch(
+        routed_output,
+        output_splits,
+        input_splits,
+        group_name,
+    )
+    input_rows, columns = routed_output.shape
+    output_rows = sum(output_splits)
+    if routed_output.storage_offset() != 0:
+        raise ValueError("BF16 combine input must start at its storage origin")
+    storage_rows = (
+        routed_output.untyped_storage().nbytes()
+        // routed_output.element_size()
+        // columns
+    )
+    if output_rows > storage_rows:
+        raise RuntimeError("BF16 combine output exceeds reserved dispatch storage")
+
+    source = routed_output.as_strided((input_rows, columns), (columns, 1))
+    result = routed_output
+    result.as_strided_((output_rows, columns), (columns, 1))
+    for round_idx in range(rounds):
+        column_counts, column_offsets = _round_splits(
+            [columns], round_idx, rounds
+        )
+        round_columns = column_counts[0]
+        column_offset = column_offsets[0]
+        if not round_columns:
+            continue
+        send = _empty_with_cache_retry(
+            (input_rows, round_columns),
+            device=routed_output.device,
+            dtype=torch.bfloat16,
+        )
+        send.copy_(
+            source[:, column_offset : column_offset + round_columns]
+        )
+        receive = _empty_with_cache_retry(
+            (output_rows, round_columns),
+            device=routed_output.device,
+            dtype=torch.bfloat16,
+        )
+        with _EPTimer("fwd_combine"):
+            dist.all_to_all_single(
+                receive,
+                send,
+                output_splits,
+                input_splits,
+                group=group,
+            )
+        result[:, column_offset : column_offset + round_columns].copy_(receive)
+    return result
+
+
 class _BF16Dispatch(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -825,19 +878,40 @@ class _BF16Dispatch(torch.autograd.Function):
             input_splits,
             group_name,
         )
-        output = _empty_with_cache_retry(
-            (sum(output_splits), routed_input.shape[1]),
-            device=routed_input.device,
-            dtype=torch.bfloat16,
-        )
-        with _EPTimer(f"fwd_{tag}"):
-            dist.all_to_all_single(
-                output,
+        output_rows = sum(output_splits)
+        if tag == "combine":
+            if received_input is not None:
+                raise ValueError("BF16 combine cannot save an expert input")
+            ctx.mark_dirty(routed_input)
+            output = _streaming_bf16_combine(
                 routed_input,
                 output_splits,
                 input_splits,
-                group=group,
+                group_name,
+                _BF16_COMBINE_ROUNDS,
             )
+        elif tag == "dispatch":
+            capacity_rows = max(routed_input.shape[0], output_rows)
+            output = _empty_with_cache_retry(
+                (capacity_rows, routed_input.shape[1]),
+                device=routed_input.device,
+                dtype=torch.bfloat16,
+            )
+            if capacity_rows != output_rows:
+                output.as_strided_(
+                    (output_rows, routed_input.shape[1]),
+                    (routed_input.shape[1], 1),
+                )
+            with _EPTimer("fwd_dispatch"):
+                dist.all_to_all_single(
+                    output,
+                    routed_input,
+                    output_splits,
+                    input_splits,
+                    group=group,
+                )
+        else:
+            raise ValueError("BF16 expert transport tag must be dispatch or combine")
         if received_input is not None:
             if not isinstance(received_input, ReceivedBF16ExpertInput):
                 raise TypeError("BF16 expert dispatch received the wrong saved-input type")

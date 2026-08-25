@@ -17,13 +17,16 @@ from prime_rl.trainer.distributed.expert_parallel import (
     _INT4Dispatch,
     bf16_expert_transport_memory_bytes,
 )
+from prime_rl.trainer.models.layers.fp8_ada import scale_routed_output
 
 
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--cols", type=int, default=6144)
-    parser.add_argument("--iters", type=int, default=3)
+    parser.add_argument("--warmup", type=int, default=3)
+    parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--rows-per-peer", type=int, default=0)
+    parser.add_argument("--exact-production-rows", action="store_true")
     return parser.parse_args()
 
 
@@ -43,6 +46,13 @@ def relative_rmse(got: torch.Tensor, expected: torch.Tensor) -> float:
     )
 
 
+def median_time(callable, warmup: int, iterations: int):
+    for _ in range(warmup):
+        timed(callable)
+    times = [timed(callable)[1] for _ in range(iterations)]
+    return statistics.median(times)
+
+
 def main() -> None:
     args = arguments()
     rank = int(os.environ["RANK"])
@@ -53,12 +63,19 @@ def main() -> None:
     if world < 2:
         raise RuntimeError("the expert transport check requires at least two ranks")
 
-    input_splits = [
-        args.rows_per_peer + rank * world + peer + 1 for peer in range(world)
-    ]
-    output_splits = [
-        args.rows_per_peer + peer * world + rank + 1 for peer in range(world)
-    ]
+    if args.exact_production_rows:
+        if world != 8:
+            raise RuntimeError("exact production row splits require eight ranks")
+        split_pattern = [0, 2048, 3072, 4096, 5120, 6144, 7168, 5120]
+        input_splits = [split_pattern[(peer - rank) % world] for peer in range(world)]
+        output_splits = [split_pattern[(rank - peer) % world] for peer in range(world)]
+    else:
+        input_splits = [
+            args.rows_per_peer + rank * world + peer + 1 for peer in range(world)
+        ]
+        output_splits = [
+            args.rows_per_peer + peer * world + rank + 1 for peer in range(world)
+        ]
     rows = sum(input_splits)
 
     generator = torch.Generator(device="cuda").manual_seed(20260810 + rank)
@@ -84,9 +101,11 @@ def main() -> None:
         )
         return reference
 
-    for _ in range(2):
-        reference_dispatch()
-    _, reference_seconds = timed(reference_dispatch)
+    reference_seconds = median_time(
+        reference_dispatch,
+        args.warmup,
+        args.iters,
+    )
 
     saved_input = ReceivedBF16ExpertInput()
     train_value = value.detach().clone().requires_grad_()
@@ -103,11 +122,11 @@ def main() -> None:
     if not torch.equal(exact, reference):
         raise RuntimeError("BF16 dispatch changed activation values")
     torch.cuda.synchronize()
-    if not torch.equal(saved_input.values, reference.cpu()):
+    if not torch.equal(saved_input.values, reference):
         raise RuntimeError("BF16 saved expert input changed activation values")
     no_grad_input = ReceivedBF16ExpertInput(save_for_backward=False)
     no_grad_input.prepare(reference)
-    if no_grad_input.values is not None or no_grad_input.copy_done is not None:
+    if no_grad_input.values is not None:
         raise RuntimeError("BF16 no-grad transport retained a saved expert input")
 
     selected_rows = torch.tensor(
@@ -143,6 +162,89 @@ def main() -> None:
     if not torch.equal(combined, value):
         raise RuntimeError("BF16 combine changed activation values")
 
+    raw_dispatch = torch.empty_like(reference)
+    raw_combined = torch.empty_like(value)
+
+    def raw_chain():
+        dist.all_to_all_single(
+            raw_dispatch,
+            value,
+            output_splits,
+            input_splits,
+        )
+        dist.all_to_all_single(
+            raw_combined,
+            raw_dispatch,
+            input_splits,
+            output_splits,
+        )
+        return raw_combined
+
+    raw_chain_seconds = median_time(raw_chain, args.warmup, args.iters)
+    if not torch.equal(raw_chain(), value):
+        raise RuntimeError("raw BF16 chain changed activation values")
+
+    legacy_host = torch.empty_like(reference, device="cpu", pin_memory=True)
+    legacy_restored = torch.empty_like(reference)
+
+    def current_chain():
+        dist.all_to_all_single(
+            raw_dispatch,
+            value,
+            output_splits,
+            input_splits,
+        )
+        legacy_host.copy_(raw_dispatch, non_blocking=True)
+        dist.all_to_all_single(
+            raw_combined,
+            raw_dispatch,
+            input_splits,
+            output_splits,
+        )
+        legacy_restored.copy_(legacy_host, non_blocking=True)
+        return raw_combined
+
+    current_chain_seconds = median_time(
+        current_chain,
+        args.warmup,
+        args.iters,
+    )
+    if not torch.equal(current_chain(), value):
+        raise RuntimeError("current BF16 chain changed activation values")
+    if not torch.equal(legacy_restored, reference):
+        raise RuntimeError("current BF16 saved input roundtrip changed values")
+
+    def optimized_chain():
+        saved = ReceivedBF16ExpertInput()
+        dispatched = _BF16Dispatch.apply(
+            value,
+            output_splits,
+            input_splits,
+            dist.group.WORLD.group_name,
+            "dispatch",
+            saved,
+        )
+        result = _BF16Dispatch.apply(
+            dispatched,
+            input_splits,
+            output_splits,
+            dist.group.WORLD.group_name,
+            "combine",
+            None,
+        )
+        return result, saved
+
+    optimized_chain_seconds = median_time(
+        optimized_chain,
+        args.warmup,
+        args.iters,
+    )
+    optimized_result, optimized_saved = optimized_chain()
+    if not torch.equal(optimized_result, value):
+        raise RuntimeError("optimized BF16 chain changed activation values")
+    if not torch.equal(optimized_saved.values, reference):
+        raise RuntimeError("optimized BF16 saved input changed activation values")
+
     chain_input = value.detach().clone().requires_grad_()
     chain_dispatch = _BF16Dispatch.apply(
         chain_input,
@@ -160,27 +262,53 @@ def main() -> None:
         "combine",
         None,
     )
+    route_scores = torch.linspace(
+        0.1,
+        0.9,
+        chain_output.shape[0],
+        device="cuda",
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    scaled_chain_output = scale_routed_output(chain_output, route_scores)
     chain_upstream = torch.randn(
-        chain_output.shape,
+        scaled_chain_output.shape,
         device="cuda",
         dtype=torch.bfloat16,
         generator=generator,
     ).mul_(1e-4)
-    chain_gradient = torch.autograd.grad(
-        chain_output,
-        chain_input,
+    chain_gradient, score_gradient = torch.autograd.grad(
+        scaled_chain_output,
+        (chain_input, route_scores),
         chain_upstream,
-    )[0]
-    if not torch.equal(chain_gradient, chain_upstream):
-        raise RuntimeError("BF16 dispatch and combine changed the chain gradient")
+    )
+    expected_chain_gradient = (
+        chain_upstream.float() * route_scores.detach()[:, None]
+    ).to(torch.bfloat16)
+    expected_score_gradient = (
+        chain_upstream.float() * chain_input.detach().float()
+    ).sum(dim=-1)
+    if not torch.equal(chain_gradient, expected_chain_gradient):
+        raise RuntimeError("BF16 dispatch, combine, and route scaling changed input gradients")
+    if not torch.equal(score_gradient, expected_score_gradient):
+        raise RuntimeError("BF16 dispatch, combine, and route scaling changed score gradients")
 
+    gradient_input = value.detach().clone().requires_grad_()
+    gradient_output = _BF16Dispatch.apply(
+        gradient_input,
+        output_splits,
+        input_splits,
+        dist.group.WORLD.group_name,
+        "dispatch",
+        None,
+    )
     upstream = torch.randn(
-        exact.shape,
+        gradient_output.shape,
         device="cuda",
         dtype=torch.bfloat16,
         generator=generator,
     ).mul_(1e-4)
-    expected_gradient = torch.empty_like(train_value)
+    expected_gradient = torch.empty_like(gradient_input)
     dist.all_to_all_single(
         expected_gradient,
         upstream,
@@ -188,7 +316,7 @@ def main() -> None:
         output_splits,
     )
     gradient, bf16_backward_seconds = timed(
-        lambda: torch.autograd.grad(exact, train_value, upstream)[0]
+        lambda: torch.autograd.grad(gradient_output, gradient_input, upstream)[0]
     )
     if not torch.equal(gradient, expected_gradient):
         raise RuntimeError("BF16 expert transport backward changed gradient values")
@@ -255,6 +383,9 @@ def main() -> None:
             reference_seconds,
             bf16_seconds,
             bf16_backward_seconds,
+            current_chain_seconds,
+            raw_chain_seconds,
+            optimized_chain_seconds,
             statistics.median(forward_times),
             backward_seconds,
             forward_rel_rmse,
@@ -271,10 +402,13 @@ def main() -> None:
             f"reference_forward_s={metrics[0]:.4f} "
             f"bf16_forward_s={metrics[1]:.4f} "
             f"bf16_backward_s={metrics[2]:.4f} "
-            f"int4_forward_s={metrics[3]:.4f} "
-            f"fp8_backward_s={metrics[4]:.4f} "
-            f"forward_rel_rmse={metrics[5]:.6f} "
-            f"backward_rel_rmse={metrics[6]:.6f} "
+            f"current_chain_s={metrics[3]:.4f} "
+            f"raw_chain_s={metrics[4]:.4f} "
+            f"optimized_chain_s={metrics[5]:.4f} "
+            f"int4_forward_s={metrics[6]:.4f} "
+            f"fp8_backward_s={metrics[7]:.4f} "
+            f"forward_rel_rmse={metrics[8]:.6f} "
+            f"backward_rel_rmse={metrics[9]:.6f} "
             f"memory={memory}",
             flush=True,
         )
