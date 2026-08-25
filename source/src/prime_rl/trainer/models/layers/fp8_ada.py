@@ -53,6 +53,12 @@ _SCATTERMOE_LORA_VALUE = os.environ.get("PRIME_FP8_SCATTERMOE_LORA", "0")
 if _SCATTERMOE_LORA_VALUE not in {"0", "1"}:
     raise ValueError("PRIME_FP8_SCATTERMOE_LORA must be 0 or 1")
 _SCATTERMOE_LORA = _SCATTERMOE_LORA_VALUE == "1"
+_SCATTERMOE_LORA_BWD_VALUE = os.environ.get(
+    "PRIME_FP8_SCATTERMOE_LORA_BWD", "0"
+)
+if _SCATTERMOE_LORA_BWD_VALUE not in {"0", "1"}:
+    raise ValueError("PRIME_FP8_SCATTERMOE_LORA_BWD must be 0 or 1")
+_SCATTERMOE_LORA_BWD = _SCATTERMOE_LORA_BWD_VALUE == "1"
 _DIAGNOSE_LINEAR_BACKWARD = False
 _REPORTED_LINEAR_BACKWARD: set[tuple[tuple[int, ...], bool, bool]] = set()
 _REPORTED_INPUT_GRAD: set[str] = set()
@@ -475,12 +481,98 @@ if hasattr(triton, "jit"):
         previous = tl.load(output + output_offsets, mask=output_mask, other=0.0)
         tl.store(output + output_offsets, previous + accumulator, mask=output_mask)
 
+    @triton.jit
+    def _scattermoe_outer_accumulate_kernel(
+        left,
+        right,
+        row_indices,
+        offsets,
+        output,
+        source_rows,
+        left_size: tl.constexpr,
+        right_size: tl.constexpr,
+        stride_lm,
+        stride_ln,
+        stride_rm,
+        stride_rn,
+        stride_im,
+        stride_oe,
+        stride_ol,
+        stride_or,
+        BLOCK_ROWS: tl.constexpr,
+        BLOCK_LEFT: tl.constexpr,
+        BLOCK_RIGHT: tl.constexpr,
+    ):
+        """Accumulate one row-mapped LoRA outer product in FP32.
+
+        ``left`` is sorted expert-major data. ``row_indices`` maps those
+        rows to source-major ``right`` rows. Each program owns one expert and
+        one output tile, so the only temporary is a bounded FP32 accumulator;
+        launches for successive chunks add to the persistent FP32 gradient
+        buffer without BF16 rounding between chunks.
+        """
+        expert = tl.program_id(0)
+        left_block = tl.program_id(1)
+        right_block = tl.program_id(2)
+        expert_start = tl.load(
+            offsets + expert - 1,
+            mask=expert > 0,
+            other=0,
+        )
+        expert_end = tl.load(offsets + expert)
+        left_columns = left_block * BLOCK_LEFT + tl.arange(0, BLOCK_LEFT)
+        right_columns = right_block * BLOCK_RIGHT + tl.arange(0, BLOCK_RIGHT)
+        accumulator = tl.zeros((BLOCK_LEFT, BLOCK_RIGHT), dtype=tl.float32)
+
+        for row_start in tl.range(expert_start, expert_end, BLOCK_ROWS):
+            sorted_rows = row_start + tl.arange(0, BLOCK_ROWS)
+            row_mask = sorted_rows < expert_end
+            source_index = tl.load(
+                row_indices + sorted_rows * stride_im,
+                mask=row_mask,
+                other=0,
+            )
+            source_valid = (
+                row_mask
+                & (source_index >= 0)
+                & (source_index < source_rows)
+            )
+            safe_source = tl.where(source_valid, source_index, 0)
+            left_values = tl.load(
+                left
+                + sorted_rows[:, None] * stride_lm
+                + left_columns[None, :] * stride_ln,
+                mask=row_mask[:, None] & (left_columns[None, :] < left_size),
+                other=0.0,
+            ).to(tl.bfloat16)
+            right_values = tl.load(
+                right
+                + safe_source[:, None] * stride_rm
+                + right_columns[None, :] * stride_rn,
+                mask=source_valid[:, None]
+                & (right_columns[None, :] < right_size),
+                other=0.0,
+            ).to(tl.bfloat16)
+            accumulator += tl.dot(tl.trans(left_values), right_values)
+
+        output_offsets = (
+            expert * stride_oe
+            + left_columns[:, None] * stride_ol
+            + right_columns[None, :] * stride_or
+        )
+        output_mask = (left_columns[:, None] < left_size) & (
+            right_columns[None, :] < right_size
+        )
+        previous = tl.load(output + output_offsets, mask=output_mask, other=0.0)
+        tl.store(output + output_offsets, previous + accumulator, mask=output_mask)
+
 else:
     _scattermoe_lora_forward_kernel = None
     _expert_scatter_kernel = None
     _block_fp8_mm_kernel = None
     _w8a16_input_grad_kernel = None
     _grouped_outer_accumulate_kernel = None
+    _scattermoe_outer_accumulate_kernel = None
 
 
 def set_diagnose_linear_backward(enabled: bool) -> None:
@@ -2581,6 +2673,66 @@ def _grouped_outer_accumulate(left, right, offsets, output):
     )
 
 
+def _scattermoe_outer_accumulate(left, right, row_indices, offsets, output):
+    """Accumulate a row-mapped LoRA outer product into an FP32 buffer."""
+    if _scattermoe_outer_accumulate_kernel is None:
+        raise RuntimeError("Triton is unavailable for ScatterMoE LoRA backward")
+    if not all(
+        value.is_cuda for value in (left, right, row_indices, offsets, output)
+    ):
+        raise RuntimeError("ScatterMoE LoRA backward requires CUDA tensors")
+    if left.dtype != torch.bfloat16 or right.dtype != torch.bfloat16:
+        raise TypeError("ScatterMoE LoRA backward inputs must be BF16")
+    if output.dtype != torch.float32:
+        raise TypeError("ScatterMoE LoRA backward outputs must be FP32")
+    if row_indices.dtype not in (torch.int32, torch.int64):
+        raise TypeError("ScatterMoE row indices must be INT32 or INT64")
+    if offsets.dtype != torch.int32 or offsets.ndim != 1:
+        raise TypeError("ScatterMoE offsets must be a one-dimensional INT32 tensor")
+    if not all(value.is_contiguous() for value in (left, right, row_indices, offsets, output)):
+        raise ValueError("ScatterMoE LoRA backward tensors must be contiguous")
+    if left.ndim != 2 or right.ndim != 2 or row_indices.ndim != 1:
+        raise ValueError("ScatterMoE LoRA backward tensors have invalid dimensions")
+    if left.shape[0] != row_indices.shape[0]:
+        raise ValueError("ScatterMoE rows and row indices have different lengths")
+    expected = (offsets.shape[0], left.shape[1], right.shape[1])
+    if tuple(output.shape) != expected:
+        raise ValueError(
+            f"ScatterMoE gradient shape {tuple(output.shape)} does not match {expected}"
+        )
+
+    block_left = 32
+    block_right = 32
+    _scattermoe_outer_accumulate_kernel[
+        (
+            offsets.shape[0],
+            triton.cdiv(left.shape[1], block_left),
+            triton.cdiv(right.shape[1], block_right),
+        )
+    ](
+        left,
+        right,
+        row_indices,
+        offsets,
+        output,
+        right.shape[0],
+        left.shape[1],
+        right.shape[1],
+        left.stride(0),
+        left.stride(1),
+        right.stride(0),
+        right.stride(1),
+        row_indices.stride(0),
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
+        BLOCK_ROWS=32,
+        BLOCK_LEFT=block_left,
+        BLOCK_RIGHT=block_right,
+        num_warps=4,
+    )
+
+
 def _grouped_lora_backward(
     x,
     lora_a,
@@ -2627,6 +2779,71 @@ def _grouped_lora_backward(
     )
     _grouped_outer_accumulate(low_rank_grad, x, offsets, grad_a)
     _grouped_outer_accumulate(grad_output, low_rank, offsets, grad_b)
+    return input_grad
+
+
+def _scattermoe_lora_backward(
+    x,
+    lora_a,
+    lora_b,
+    offsets,
+    grad_output,
+    grad_a,
+    grad_b,
+    row_indices,
+    low_rank=None,
+):
+    """Run rank-32 backward with FP32 row-mapped parameter gradients.
+
+    The grouped GEMMs keep the validated input-gradient math. Parameter
+    gradients use the row-mapped kernel and remain FP32 across all chunks;
+    the custom autograd function casts them to the BF16 parameter dtype once
+    after the final chunk.
+    """
+    if lora_a.shape[1] != 32:
+        raise RuntimeError(
+            f"ScatterMoE LoRA backward supports rank 32, got {lora_a.shape[1]}"
+        )
+    if grad_a.dtype != torch.float32 or grad_b.dtype != torch.float32:
+        raise TypeError("ScatterMoE LoRA parameter gradients must be FP32")
+    if grad_output.dtype != x.dtype:
+        raise TypeError("expert LoRA output gradient must use the activation dtype")
+    if low_rank is None:
+        low_rank = torch._grouped_mm(
+            x,
+            lora_a.transpose(-2, -1),
+            offs=offsets,
+        )
+    elif (
+        low_rank.device != x.device
+        or low_rank.dtype != x.dtype
+        or low_rank.shape != (x.shape[0], lora_a.shape[1])
+    ):
+        raise ValueError("saved expert LoRA low-rank activation is invalid")
+    low_rank_grad = torch._grouped_mm(
+        grad_output,
+        lora_b,
+        offs=offsets,
+    )
+    input_grad = torch._grouped_mm(
+        low_rank_grad,
+        lora_a,
+        offs=offsets,
+    )
+    _scattermoe_outer_accumulate(
+        low_rank_grad,
+        x,
+        row_indices,
+        offsets,
+        grad_a,
+    )
+    _scattermoe_outer_accumulate(
+        grad_output,
+        low_rank,
+        row_indices,
+        offsets,
+        grad_b,
+    )
     return input_grad
 
 
@@ -2947,16 +3164,20 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
             raise RuntimeError("native expert row-index device changed before backward")
         grad = grad.contiguous()
         workspace = ctx.received_input.make_workspace(ctx.chunk_rows, grad.device)
+        lora_parameters = (
+            w1_lora_a,
+            w1_lora_b,
+            w2_lora_a,
+            w2_lora_b,
+            w3_lora_a,
+            w3_lora_b,
+        )
         parameter_grads = [
-            torch.zeros_like(value)
-            for value in (
-                w1_lora_a,
-                w1_lora_b,
-                w2_lora_a,
-                w2_lora_b,
-                w3_lora_a,
-                w3_lora_b,
+            torch.zeros_like(
+                value,
+                dtype=torch.float32 if _SCATTERMOE_LORA_BWD else value.dtype,
             )
+            for value in lora_parameters
         ]
 
         rows = saved_permuted_indices.shape[0]
@@ -2973,6 +3194,11 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
             grad_chunk = _index_select_rows_with_cache_retry(grad, safe_indices)
             grad_chunk.masked_fill_((~real).unsqueeze(-1), 0)
             chunk_offsets = _expert_chunk_offsets(offsets, start, end)
+            backward_row_indices = torch.arange(
+                end - start,
+                device=grad.device,
+                dtype=torch.int64,
+            )
 
             q1_device = q1[start:end].to(grad.device, non_blocking=True)
             z1 = q1_device.to(grad.dtype).mul_(qs1[start:end].to(grad.dtype))
@@ -2993,16 +3219,29 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                 if ctx.reuse_w2_low_rank
                 else None
             )
-            lora_hidden_grad = _grouped_lora_backward(
-                hidden,
-                w2_lora_a,
-                w2_lora_b,
-                chunk_offsets,
-                grad_chunk.mul(ctx.scaling),
-                parameter_grads[2],
-                parameter_grads[3],
-                low_rank=saved_w2_low_rank,
-            )
+            if _SCATTERMOE_LORA_BWD:
+                lora_hidden_grad = _scattermoe_lora_backward(
+                    hidden,
+                    w2_lora_a,
+                    w2_lora_b,
+                    chunk_offsets,
+                    grad_chunk.mul(ctx.scaling),
+                    parameter_grads[2],
+                    parameter_grads[3],
+                    backward_row_indices,
+                    low_rank=saved_w2_low_rank,
+                )
+            else:
+                lora_hidden_grad = _grouped_lora_backward(
+                    hidden,
+                    w2_lora_a,
+                    w2_lora_b,
+                    chunk_offsets,
+                    grad_chunk.mul(ctx.scaling),
+                    parameter_grads[2],
+                    parameter_grads[3],
+                    low_rank=saved_w2_low_rank,
+                )
             hidden_grad.add_(lora_hidden_grad)
             del lora_hidden_grad, hidden, saved_w2_low_rank
 
@@ -3028,26 +3267,50 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                 reconstructed_x,
                 workspace,
             )
-            lora_x_grad = _grouped_lora_backward(
-                reconstructed_x,
-                w1_lora_a,
-                w1_lora_b,
-                chunk_offsets,
-                z1_grad.mul(ctx.scaling),
-                parameter_grads[0],
-                parameter_grads[1],
-            )
+            if _SCATTERMOE_LORA_BWD:
+                lora_x_grad = _scattermoe_lora_backward(
+                    reconstructed_x,
+                    w1_lora_a,
+                    w1_lora_b,
+                    chunk_offsets,
+                    z1_grad.mul(ctx.scaling),
+                    parameter_grads[0],
+                    parameter_grads[1],
+                    backward_row_indices,
+                )
+            else:
+                lora_x_grad = _grouped_lora_backward(
+                    reconstructed_x,
+                    w1_lora_a,
+                    w1_lora_b,
+                    chunk_offsets,
+                    z1_grad.mul(ctx.scaling),
+                    parameter_grads[0],
+                    parameter_grads[1],
+                )
             x_grad.add_(lora_x_grad)
             del lora_x_grad
-            lora_x_grad = _grouped_lora_backward(
-                reconstructed_x,
-                w3_lora_a,
-                w3_lora_b,
-                chunk_offsets,
-                z3_grad.mul(ctx.scaling),
-                parameter_grads[4],
-                parameter_grads[5],
-            )
+            if _SCATTERMOE_LORA_BWD:
+                lora_x_grad = _scattermoe_lora_backward(
+                    reconstructed_x,
+                    w3_lora_a,
+                    w3_lora_b,
+                    chunk_offsets,
+                    z3_grad.mul(ctx.scaling),
+                    parameter_grads[4],
+                    parameter_grads[5],
+                    backward_row_indices,
+                )
+            else:
+                lora_x_grad = _grouped_lora_backward(
+                    reconstructed_x,
+                    w3_lora_a,
+                    w3_lora_b,
+                    chunk_offsets,
+                    z3_grad.mul(ctx.scaling),
+                    parameter_grads[4],
+                    parameter_grads[5],
+                )
             x_grad.add_(lora_x_grad)
             x_grad.add_(x_grad_w3)
             _index_copy_real_rows_with_cache_retry(grad, indices, x_grad, real)
@@ -3063,11 +3326,21 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                 x_grad_w3,
                 reconstructed_x,
                 lora_x_grad,
+                backward_row_indices,
             )
 
         if _EXPERT_PROFILE:
             profile_end.record()
             _profile_expert_backward(profile_start, profile_end)
+        if _SCATTERMOE_LORA_BWD:
+            parameter_grads = [
+                value.to(parameter.dtype)
+                for value, parameter in zip(
+                    parameter_grads,
+                    lora_parameters,
+                    strict=True,
+                )
+            ]
         del ctx.owner, ctx.received_input, ctx.offload_done
         return (
             grad,

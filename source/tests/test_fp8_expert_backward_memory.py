@@ -50,7 +50,9 @@ class FP8ExpertBackwardMemoryTest(unittest.TestCase):
         )[0]
         self.assertNotIn("torch.autograd.grad", native_lora)
         self.assertEqual(native_lora.count("_grouped_lora_backward("), 3)
+        self.assertEqual(native_lora.count("_scattermoe_lora_backward("), 4)
         self.assertEqual(native_lora.count("_grouped_outer_accumulate("), 2)
+        self.assertEqual(native_lora.count("_scattermoe_outer_accumulate("), 2)
 
     def test_grouped_output_allocation_has_one_cache_recovery_retry(self):
         dispatch = SOURCE.split("def _dispatch_grouped_mm", 1)[1].split(

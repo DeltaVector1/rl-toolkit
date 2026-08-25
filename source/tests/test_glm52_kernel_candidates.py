@@ -21,6 +21,10 @@ class GLM52KernelCandidateTest(unittest.TestCase):
         self.assertIn('"PRIME_FP8_LORA_W2_LOW_RANK_REUSE", "0"', FP8_SOURCE)
         self.assertIn('"PRIME_FP8_SCATTERMOE_LORA", "0"', FP8_SOURCE)
         self.assertIn(
+            "_SCATTERMOE_LORA_BWD_VALUE = os.environ.get(",
+            FP8_SOURCE,
+        )
+        self.assertIn(
             'os.environ.get("PRIME_SPARSE_BWD_VARIANT", "baseline")',
             SPARSE_BWD_SOURCE,
         )
@@ -55,6 +59,20 @@ class GLM52KernelCandidateTest(unittest.TestCase):
             "def _scattermoe_lora_forward_kernel", 1
         )[1].split("def _expert_scatter_kernel", 1)[0]
         self.assertNotIn("tl.program_id(1)", scatter_kernel)
+
+    def test_scattermoe_lora_backward_is_fp32_and_bounded(self):
+        self.assertIn("def _scattermoe_outer_accumulate_kernel", FP8_SOURCE)
+        self.assertIn("def _scattermoe_outer_accumulate(", FP8_SOURCE)
+        self.assertIn("_scattermoe_lora_backward", FP8_SOURCE)
+        self.assertIn("dtype=torch.float32 if _SCATTERMOE_LORA_BWD", FP8_SOURCE)
+        self.assertIn("value.to(parameter.dtype)", FP8_SOURCE)
+        self.assertIn("BLOCK_ROWS=32", FP8_SOURCE)
+        self.assertIn("output.dtype != torch.float32", FP8_SOURCE)
+        backward = FP8_SOURCE.split(
+            "class _InplacePermutedLoRAExperts", 1
+        )[1].split("\n\nclass _ScaleRoutedOutput", 1)[0]
+        self.assertIn("_scattermoe_lora_backward(", backward)
+        self.assertIn("backward_row_indices = torch.arange", backward)
 
     def test_low_rank_reuse_is_host_saved_and_backward_optional(self):
         forward = FP8_SOURCE.split(
