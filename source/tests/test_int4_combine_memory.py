@@ -309,9 +309,9 @@ class Int4CombineMemoryTests(unittest.TestCase):
         self.assertIn('"dispatch_capacity_cuda"', function)
         self.assertIn('"saved_dispatch_input_cuda"', function)
         self.assertIn('"combine_scratch_cuda"', function)
-        self.assertIn('"reconstruction_workspace_cuda"', function)
+        self.assertIn('"reconstruction_temporaries_cuda"', function)
         self.assertEqual(function.count("* element_bytes"), 3)
-        self.assertEqual(function.count("* index_bytes"), 1)
+        self.assertIn("index_bytes + 2 * mask_bytes", function)
 
     def test_bf16_saved_input_is_only_kept_for_backward(self):
         saved_input = SOURCE.split("class ReceivedBF16ExpertInput", 1)[1].split(
@@ -324,8 +324,21 @@ class Int4CombineMemoryTests(unittest.TestCase):
         self.assertIn("self.values = values.detach().clone()", saved_input)
         self.assertNotIn("pin_memory=True", saved_input)
         self.assertNotIn("synchronize()", saved_input)
+        self.assertIn("row_indices.dtype != torch.int64", saved_input)
+        self.assertIn("row_indices.device != self.values.device", saved_input)
+        self.assertNotIn("device_indices", saved_input)
         self.assertIn("torch.index_select(self.values", saved_input)
         self.assertIn("save_for_backward=torch.is_grad_enabled()", native)
+
+    def test_transport_types_declare_their_row_index_device(self):
+        int4 = SOURCE.split("class ReceivedINT4ExpertInput", 1)[1].split(
+            "\n\nclass INT4ExpertInputWorkspace", 1
+        )[0]
+        bf16 = SOURCE.split("class ReceivedBF16ExpertInput", 1)[1].split(
+            "\n\nclass BF16ExpertInputWorkspace", 1
+        )[0]
+        self.assertIn('row_index_device = "cpu"', int4)
+        self.assertIn('row_index_device = "cuda"', bf16)
 
 
 if __name__ == "__main__":

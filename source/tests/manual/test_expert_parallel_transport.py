@@ -13,6 +13,7 @@ import torch.distributed as dist
 from prime_rl.trainer.distributed.expert_parallel import (
     BF16ExpertInputWorkspace,
     ReceivedBF16ExpertInput,
+    ReceivedINT4ExpertInput,
     _BF16Dispatch,
     _INT4Dispatch,
     bf16_expert_transport_memory_bytes,
@@ -131,7 +132,7 @@ def main() -> None:
 
     selected_rows = torch.tensor(
         [0, exact.shape[0] - 1, -1, exact.shape[0]],
-        device="cpu",
+        device="cuda",
         dtype=torch.int64,
     )
     reconstructed = torch.empty(
@@ -150,6 +151,46 @@ def main() -> None:
     )
     if not torch.equal(reconstructed, expected_rows):
         raise RuntimeError("BF16 saved expert input reconstruction is not exact")
+
+    int4_saved_input = ReceivedINT4ExpertInput()
+    int4_received = _INT4Dispatch.apply(
+        value,
+        output_splits,
+        input_splits,
+        dist.group.WORLD.group_name,
+        "dispatch",
+        None,
+        int4_saved_input,
+    )
+    int4_selected_rows = selected_rows.cpu()
+    int4_reconstructed = torch.empty_like(reconstructed)
+    int4_workspace = int4_saved_input.make_workspace(
+        int4_selected_rows.shape[0],
+        int4_reconstructed.device,
+    )
+    int4_saved_input.reconstruct_rows(
+        int4_selected_rows,
+        int4_reconstructed,
+        int4_workspace,
+    )
+    expected_int4_rows = torch.stack(
+        (
+            int4_received[0],
+            int4_received[-1],
+            torch.zeros_like(int4_received[0]),
+            torch.zeros_like(int4_received[0]),
+        )
+    )
+    if not torch.equal(int4_reconstructed, expected_int4_rows):
+        raise RuntimeError("INT4 saved expert input reconstruction changed values")
+    del (
+        int4_saved_input,
+        int4_received,
+        int4_selected_rows,
+        int4_reconstructed,
+        int4_workspace,
+        expected_int4_rows,
+    )
 
     combined = _BF16Dispatch.apply(
         exact,

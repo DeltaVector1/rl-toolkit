@@ -172,6 +172,8 @@ def _round_splits(
 class ReceivedINT4ExpertInput:
     """Own the exact compressed expert input received by one dispatch call."""
 
+    row_index_device = "cpu"
+
     __slots__ = ("values", "scales", "columns", "copy_done", "copy_ready")
 
     def __init__(self) -> None:
@@ -356,6 +358,8 @@ class INT4ExpertInputWorkspace:
 class ReceivedBF16ExpertInput:
     """Own the exact BF16 expert input received by one dispatch call."""
 
+    row_index_device = "cuda"
+
     __slots__ = (
         "values",
         "columns",
@@ -387,9 +391,15 @@ class ReceivedBF16ExpertInput:
     ) -> None:
         if self.values is None:
             raise RuntimeError("received BF16 expert input is incomplete")
-        if row_indices.device.type != "cpu" or row_indices.ndim != 1:
+        if (
+            row_indices.device != self.values.device
+            or row_indices.dtype != torch.int64
+            or row_indices.ndim != 1
+            or not row_indices.is_contiguous()
+        ):
             raise ValueError(
-                "received BF16 row indices must be a one-dimensional CPU tensor"
+                "received BF16 row indices must be a contiguous CUDA INT64 tensor "
+                "on the saved-input device"
             )
         if output.device.type != "cuda" or output.dtype != torch.bfloat16:
             raise ValueError(
@@ -403,11 +413,9 @@ class ReceivedBF16ExpertInput:
         if not self.values.shape[0]:
             raise ValueError("cannot reconstruct rows from an empty received BF16 input")
 
-        indices = workspace.device_indices[: row_indices.shape[0]]
-        indices.copy_(row_indices, non_blocking=True)
-        real_rows = (indices >= 0) & (indices < self.values.shape[0])
-        indices.clamp_(0, self.values.shape[0] - 1)
-        torch.index_select(self.values, 0, indices, out=output)
+        real_rows = (row_indices >= 0) & (row_indices < self.values.shape[0])
+        safe_indices = row_indices.clamp(0, self.values.shape[0] - 1)
+        torch.index_select(self.values, 0, safe_indices, out=output)
         output.masked_fill_((~real_rows).unsqueeze(-1), 0)
 
     def make_workspace(
@@ -417,9 +425,9 @@ class ReceivedBF16ExpertInput:
 
 
 class BF16ExpertInputWorkspace:
-    """Bound device scratch for exact BF16 expert-input reconstruction."""
+    """Validate bounded exact BF16 expert-input reconstruction."""
 
-    __slots__ = ("row_capacity", "columns", "device", "device_indices")
+    __slots__ = ("row_capacity", "columns", "device")
 
     def __init__(self, row_capacity: int, columns: int, device: torch.device) -> None:
         if row_capacity <= 0 or columns <= 0:
@@ -429,12 +437,6 @@ class BF16ExpertInputWorkspace:
         self.device = torch.device(device)
         if self.device.type != "cuda":
             raise ValueError("BF16 expert input workspace requires a CUDA device")
-        self.device_indices = torch.empty(
-            row_capacity,
-            device=self.device,
-            dtype=torch.int64,
-        )
-
     def check(self, rows: int, columns: int, device: torch.device) -> None:
         if rows > self.row_capacity:
             raise ValueError("BF16 expert input workspace row capacity is too small")
@@ -453,6 +455,7 @@ def bf16_expert_transport_memory_bytes(
         raise ValueError("BF16 expert transport memory shape is invalid")
     element_bytes = torch.tensor([], dtype=torch.bfloat16).element_size()
     index_bytes = torch.tensor([], dtype=torch.int64).element_size()
+    mask_bytes = torch.tensor([], dtype=torch.bool).element_size()
     return {
         "dispatch_capacity_cuda": max(input_rows, output_rows)
         * columns
@@ -461,7 +464,8 @@ def bf16_expert_transport_memory_bytes(
         "combine_scratch_cuda": (input_rows + output_rows)
         * ((columns + _BF16_COMBINE_ROUNDS - 1) // _BF16_COMBINE_ROUNDS)
         * element_bytes,
-        "reconstruction_workspace_cuda": reconstruction_rows * index_bytes,
+        "reconstruction_temporaries_cuda": reconstruction_rows
+        * (index_bytes + 2 * mask_bytes),
     }
 
 

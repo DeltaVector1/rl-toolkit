@@ -2449,12 +2449,18 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
 
         qs1 = torch.cat(qs1_parts, dim=0)
         qs3 = torch.cat(qs3_parts, dim=0)
-        permuted_indices_host = torch.empty_like(
-            permuted_indices,
-            device="cpu",
-            pin_memory=True,
-        )
-        permuted_indices_host.copy_(permuted_indices, non_blocking=True)
+        row_index_device = getattr(received_input, "row_index_device", None)
+        if row_index_device == "cuda":
+            saved_permuted_indices = permuted_indices.to(torch.int64)
+        elif row_index_device == "cpu":
+            saved_permuted_indices = torch.empty_like(
+                permuted_indices,
+                device="cpu",
+                pin_memory=True,
+            )
+            saved_permuted_indices.copy_(permuted_indices, non_blocking=True)
+        else:
+            raise TypeError("native expert input has no supported row-index device")
         offload_done = torch.cuda.Event()
         offload_done.record(torch.cuda.current_stream(x.device))
         ctx.has_backward_state = True
@@ -2462,6 +2468,7 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
         ctx.received_input = received_input
         ctx.offload_done = offload_done
         ctx.source_rows = x.shape[0]
+        ctx.row_index_device = row_index_device
         ctx.chunk_rows = min(chunk_rows, _FP8_EXPERT_BACKWARD_CHUNK_ROWS)
         ctx.scaling = scaling
         ctx.save_for_backward(
@@ -2469,8 +2476,7 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
             qs1,
             q3_host,
             qs3,
-            permuted_indices,
-            permuted_indices_host,
+            saved_permuted_indices,
             offsets,
             w1_lora_a,
             w1_lora_b,
@@ -2497,8 +2503,7 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
             qs1,
             q3,
             qs3,
-            permuted_indices,
-            permuted_indices_host,
+            saved_permuted_indices,
             offsets,
             w1_lora_a,
             w1_lora_b,
@@ -2525,7 +2530,10 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
         )
 
         torch.cuda.current_stream(grad.device).wait_event(ctx.offload_done)
-        ctx.offload_done.synchronize()
+        if ctx.row_index_device == "cpu":
+            ctx.offload_done.synchronize()
+        elif ctx.row_index_device != "cuda":
+            raise RuntimeError("native expert row-index device changed before backward")
         grad = grad.contiguous()
         workspace = ctx.received_input.make_workspace(ctx.chunk_rows, grad.device)
         parameter_grads = [
@@ -2540,11 +2548,15 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
             )
         ]
 
-        rows = permuted_indices.shape[0]
+        rows = saved_permuted_indices.shape[0]
         for start in range(0, rows, ctx.chunk_rows):
             end = min(start + ctx.chunk_rows, rows)
-            host_indices = permuted_indices_host[start:end]
-            indices = permuted_indices[start:end]
+            reconstruction_indices = saved_permuted_indices[start:end]
+            indices = (
+                reconstruction_indices
+                if ctx.row_index_device == "cuda"
+                else reconstruction_indices.to(grad.device, non_blocking=True)
+            )
             real = (indices >= 0) & (indices < ctx.source_rows)
             safe_indices = indices.clamp(min=0, max=ctx.source_rows - 1).long()
             grad_chunk = _index_select_rows_with_cache_retry(grad, safe_indices)
@@ -2595,7 +2607,7 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
 
             reconstructed_x = grad_chunk
             ctx.received_input.reconstruct_rows(
-                host_indices,
+                reconstruction_indices,
                 reconstructed_x,
                 workspace,
             )

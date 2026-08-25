@@ -21,7 +21,28 @@ class FP8ExpertBackwardMemoryTest(unittest.TestCase):
         self.assertLess(branch, quantize)
         self.assertLess(quantize, skip)
         self.assertNotIn('.to("cpu")', forward)
-        self.assertIn("permuted_indices_host.copy_(permuted_indices", forward)
+        self.assertIn('if row_index_device == "cuda":', forward)
+        self.assertIn(
+            "saved_permuted_indices = permuted_indices.to(torch.int64)", forward
+        )
+        self.assertIn('elif row_index_device == "cpu":', forward)
+        self.assertIn("pin_memory=True", forward)
+        self.assertNotIn("permuted_indices_host", forward)
+
+    def test_native_lora_backward_only_waits_on_cpu_for_int4_indices(self):
+        backward = SOURCE.split("class _InplacePermutedLoRAExperts", 1)[1].split(
+            "\n\nclass _ScaleRoutedOutput", 1
+        )[0].split("    @staticmethod\n    def backward", 1)[1]
+        cpu_branch = backward.split('if ctx.row_index_device == "cpu":', 1)[1].split(
+            'elif ctx.row_index_device != "cuda":', 1
+        )[0]
+        self.assertIn("ctx.offload_done.synchronize()", cpu_branch)
+        self.assertEqual(backward.count("ctx.offload_done.synchronize()"), 1)
+        self.assertNotIn("permuted_indices_host", backward)
+        self.assertIn(
+            "ctx.received_input.reconstruct_rows(\n                reconstruction_indices,",
+            backward,
+        )
 
     def test_native_lora_backward_has_no_nested_autograd(self):
         native_lora = SOURCE.split("def _grouped_lora_backward", 1)[1].split(
