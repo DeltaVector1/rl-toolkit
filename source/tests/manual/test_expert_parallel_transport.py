@@ -118,6 +118,7 @@ def main() -> None:
             dist.group.WORLD.group_name,
             "dispatch",
             saved_input,
+            "bf16",
         )
     )
     if not torch.equal(exact, reference):
@@ -199,6 +200,7 @@ def main() -> None:
         dist.group.WORLD.group_name,
         "combine",
         None,
+        "bf16",
     )
     if not torch.equal(combined, value):
         raise RuntimeError("BF16 combine changed activation values")
@@ -264,6 +266,7 @@ def main() -> None:
             dist.group.WORLD.group_name,
             "dispatch",
             saved,
+            "bf16",
         )
         result = _BF16Dispatch.apply(
             dispatched,
@@ -272,6 +275,7 @@ def main() -> None:
             dist.group.WORLD.group_name,
             "combine",
             None,
+            "bf16",
         )
         return result, saved
 
@@ -294,6 +298,7 @@ def main() -> None:
         dist.group.WORLD.group_name,
         "dispatch",
         None,
+        "bf16",
     )
     chain_output = _BF16Dispatch.apply(
         chain_dispatch,
@@ -302,6 +307,7 @@ def main() -> None:
         dist.group.WORLD.group_name,
         "combine",
         None,
+        "bf16",
     )
     route_scores = torch.linspace(
         0.1,
@@ -342,6 +348,7 @@ def main() -> None:
         dist.group.WORLD.group_name,
         "dispatch",
         None,
+        "bf16",
     )
     upstream = torch.randn(
         gradient_output.shape,
