@@ -119,6 +119,7 @@ def bwd(
     dtype=T.bfloat16,
     accum_dtype=T.float32,
     split_store=2,
+    low_memory_dkv=False,
 ):
     assert is_causal is True, "non-casual is not supported now"
     assert topk % block_size == 0, "otherwise will load some index=0 thus causing wrong kv to be loaded"
@@ -127,6 +128,8 @@ def bwd(
     assert indices_dtype == T.int32
     assert split_store in (2, 4)
     assert block_size % split_store == 0
+    if low_memory_dkv:
+        assert split_store == 4, "low-memory dKV uses the split_store=4 tile"
 
     if sm_scale is None:
         sm_scale = (D + D_tail) ** (-0.5)
@@ -180,16 +183,34 @@ def bwd(
             acc_dp = T.alloc_fragment([block_H, BS], accum_dtype)
             acc_dq = T.alloc_fragment([block_H, D], accum_dtype)
             acc_dq_tail = T.alloc_fragment([block_H, D_tail], accum_dtype)
-            acc_dkv = T.alloc_fragment([BS, D], accum_dtype)
-            acc_dkv_tail = T.alloc_fragment([BS, D_tail], accum_dtype)
-            # Keep the staging tile FP32 so the dKV atomic accumulation stays
+            # Keep the dKV staging tile FP32 so atomic accumulation stays
             # exact relative to the existing reference.  The opt-in
-            # split_store=4 variant halves this tile again without changing
-            # the dKV dtype; it only performs more store/atomic slices.
-            acc_dkv_shared = T.alloc_shared([BS // split_store, D], accum_dtype)
-            acc_dkv_tail_shared = T.alloc_shared(
-                [BS // split_store, D_tail], accum_dtype
-            )
+            # low-memory path computes each split directly and avoids the
+            # full [BS, D] and [BS, D_tail] FP32 fragments without changing
+            # the dKV dtype.
+            dkv_split_rows = BS // split_store
+            if low_memory_dkv:
+                P_dkv_shared = T.alloc_shared(
+                    [block_H, dkv_split_rows], dtype
+                )
+                dP_dkv_shared = T.alloc_shared(
+                    [block_H, dkv_split_rows], dtype
+                )
+                acc_dkv = T.alloc_fragment(
+                    [dkv_split_rows, D], accum_dtype
+                )
+                acc_dkv_tail = T.alloc_fragment(
+                    [dkv_split_rows, D_tail], accum_dtype
+                )
+            else:
+                acc_dkv = T.alloc_fragment([BS, D], accum_dtype)
+                acc_dkv_tail = T.alloc_fragment([BS, D_tail], accum_dtype)
+                acc_dkv_shared = T.alloc_shared(
+                    [dkv_split_rows, D], accum_dtype
+                )
+                acc_dkv_tail_shared = T.alloc_shared(
+                    [dkv_split_rows, D_tail], accum_dtype
+                )
 
             # See sparse_mla_fwd: sentinel is at index S_kv - 1 (zero KV), valid indices
             # live in [0, S_kv - 1). Using this single bound makes the kernel work for
@@ -239,27 +260,76 @@ def bwd(
                 T.gemm(dP_shared_cast, KV_shared, acc_dq, policy=T.GemmWarpPolicy.FullCol)
                 T.gemm(dP_shared_cast, KV_tail_shared, acc_dq_tail, policy=T.GemmWarpPolicy.FullCol)
 
-                T.gemm(
-                    dP_shared_cast,
-                    Q_shared,
-                    acc_dkv,
-                    transpose_A=True,
-                    policy=T.GemmWarpPolicy.FullCol,
-                    clear_accum=True,
-                )
-                T.gemm(P_shared_cast, dO_shared, acc_dkv, transpose_A=True, policy=T.GemmWarpPolicy.FullCol)
+                if not low_memory_dkv:
+                    T.gemm(
+                        dP_shared_cast,
+                        Q_shared,
+                        acc_dkv,
+                        transpose_A=True,
+                        policy=T.GemmWarpPolicy.FullCol,
+                        clear_accum=True,
+                    )
+                    T.gemm(
+                        P_shared_cast,
+                        dO_shared,
+                        acc_dkv,
+                        transpose_A=True,
+                        policy=T.GemmWarpPolicy.FullCol,
+                    )
 
-                T.clear(acc_dkv_tail)
-                T.gemm(dP_shared_cast, Q_tail_shared, acc_dkv_tail, transpose_A=True, policy=T.GemmWarpPolicy.FullCol)
+                    T.clear(acc_dkv_tail)
+                    T.gemm(
+                        dP_shared_cast,
+                        Q_tail_shared,
+                        acc_dkv_tail,
+                        transpose_A=True,
+                        policy=T.GemmWarpPolicy.FullCol,
+                    )
 
                 for s in range(split_store):
-                    for bi_i, d_i in T.Parallel(BS, D):
-                        if bi_i < BS // split_store:
-                            acc_dkv_shared[bi_i, d_i] = acc_dkv[bi_i + s * (BS // split_store), d_i]
+                    if low_memory_dkv:
+                        for h_i, bi_i in T.Parallel(block_H, dkv_split_rows):
+                            P_dkv_shared[h_i, bi_i] = P_shared_cast[
+                                h_i, bi_i + s * dkv_split_rows
+                            ]
+                            dP_dkv_shared[h_i, bi_i] = dP_shared_cast[
+                                h_i, bi_i + s * dkv_split_rows
+                            ]
+                        T.gemm(
+                            dP_dkv_shared,
+                            Q_shared,
+                            acc_dkv,
+                            transpose_A=True,
+                            policy=T.GemmWarpPolicy.FullCol,
+                            clear_accum=True,
+                        )
+                        T.gemm(
+                            P_dkv_shared,
+                            dO_shared,
+                            acc_dkv,
+                            transpose_A=True,
+                            policy=T.GemmWarpPolicy.FullCol,
+                        )
+                        T.clear(acc_dkv_tail)
+                        T.gemm(
+                            dP_dkv_shared,
+                            Q_tail_shared,
+                            acc_dkv_tail,
+                            transpose_A=True,
+                            policy=T.GemmWarpPolicy.FullCol,
+                        )
+                    else:
+                        for bi_i, d_i in T.Parallel(BS, D):
+                            if bi_i < dkv_split_rows:
+                                acc_dkv_shared[bi_i, d_i] = acc_dkv[
+                                    bi_i + s * dkv_split_rows, d_i
+                                ]
 
-                    for bi_i, d_i in T.Parallel(BS, D_tail):
-                        if bi_i < BS // split_store:
-                            acc_dkv_tail_shared[bi_i, d_i] = acc_dkv_tail[bi_i + s * (BS // split_store), d_i]
+                        for bi_i, d_i in T.Parallel(BS, D_tail):
+                            if bi_i < dkv_split_rows:
+                                acc_dkv_tail_shared[bi_i, d_i] = acc_dkv_tail[
+                                    bi_i + s * dkv_split_rows, d_i
+                                ]
 
                     if vectorized_atomic:
                         for bi_i, d_i in T.Parallel(BS // split_store, D // 4):
@@ -270,7 +340,11 @@ def bwd(
                                     bz // NH,
                                     d_i * 4,
                                 ],
-                                acc_dkv_shared[bi_i, d_i * 4],
+                                (
+                                    acc_dkv[bi_i, d_i * 4]
+                                    if low_memory_dkv
+                                    else acc_dkv_shared[bi_i, d_i * 4]
+                                ),
                             )
 
                         for bi_i, d_i in T.Parallel(BS // split_store, D_tail // 4):
@@ -281,7 +355,11 @@ def bwd(
                                     bz // NH,
                                     D + d_i * 4,
                                 ],
-                                acc_dkv_tail_shared[bi_i, d_i * 4],
+                                (
+                                    acc_dkv_tail[bi_i, d_i * 4]
+                                    if low_memory_dkv
+                                    else acc_dkv_tail_shared[bi_i, d_i * 4]
+                                ),
                             )
                     else:
                         for bi_i, d_i in T.Parallel(BS // split_store, D):
@@ -292,7 +370,11 @@ def bwd(
                                     bz // NH,
                                     d_i,
                                 ],
-                                acc_dkv_shared[bi_i, d_i],
+                                (
+                                    acc_dkv[bi_i, d_i]
+                                    if low_memory_dkv
+                                    else acc_dkv_shared[bi_i, d_i]
+                                ),
                             )
 
                         for bi_i, d_i in T.Parallel(BS // split_store, D_tail):
@@ -303,7 +385,11 @@ def bwd(
                                     bz // NH,
                                     D + d_i,
                                 ],
-                                acc_dkv_tail_shared[bi_i, d_i],
+                                (
+                                    acc_dkv_tail[bi_i, d_i]
+                                    if low_memory_dkv
+                                    else acc_dkv_tail_shared[bi_i, d_i]
+                                ),
                             )
 
             T.copy(acc_dq, dQ_shared)
@@ -336,6 +422,18 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None):
             "PRIME_SPARSE_BWD_FP32_SPLIT_STORE must be 2 or 4"
         )
     split_store = int(split_store_value)
+    low_memory_dkv_value = os.environ.get(
+        "PRIME_SPARSE_BWD_LOW_MEMORY_DKV", "0"
+    )
+    if low_memory_dkv_value not in {"0", "1"}:
+        raise ValueError(
+            "PRIME_SPARSE_BWD_LOW_MEMORY_DKV must be 0 or 1"
+        )
+    low_memory_dkv = low_memory_dkv_value == "1"
+    if low_memory_dkv and split_store != 4:
+        raise ValueError(
+            "PRIME_SPARSE_BWD_LOW_MEMORY_DKV requires split_store=4"
+        )
     capability = torch.cuda.get_device_capability(q.device)
     preprocess_kernel = preprocess(H, D)
     if capability[0] < 9:
@@ -373,6 +471,7 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None):
             threads=threads,
             vectorized_atomic=False,
             split_store=split_store,
+            low_memory_dkv=low_memory_dkv,
         )
     else:
         bwd_kernel = bwd(
@@ -385,6 +484,7 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None):
             True,
             vectorized_atomic=True,
             split_store=split_store,
+            low_memory_dkv=low_memory_dkv,
         )
 
     delta = preprocess_kernel(o, do)

@@ -119,7 +119,25 @@ class GLM52KernelCandidateTest(unittest.TestCase):
         )
         self.assertIn("split_store_value not in {\"2\", \"4\"}", SPARSE_BWD_SOURCE)
         self.assertIn("split_store=split_store", SPARSE_BWD_SOURCE)
-        self.assertIn("split_store=4 variant halves this tile again", SPARSE_BWD_SOURCE)
+        self.assertIn("low-memory path computes each split directly", SPARSE_BWD_SOURCE)
+
+    def test_sparse_low_memory_dkv_is_opt_in_and_split_sized(self):
+        self.assertIn(
+            'os.environ.get(\n        "PRIME_SPARSE_BWD_LOW_MEMORY_DKV", "0"',
+            SPARSE_BWD_SOURCE,
+        )
+        self.assertIn(
+            '"PRIME_SPARSE_BWD_LOW_MEMORY_DKV must be 0 or 1"',
+            SPARSE_BWD_SOURCE,
+        )
+        self.assertIn(
+            '"PRIME_SPARSE_BWD_LOW_MEMORY_DKV requires split_store=4"',
+            SPARSE_BWD_SOURCE,
+        )
+        self.assertIn("if low_memory_dkv:", SPARSE_BWD_SOURCE)
+        self.assertIn("P_dkv_shared", SPARSE_BWD_SOURCE)
+        self.assertIn("dP_dkv_shared", SPARSE_BWD_SOURCE)
+        self.assertIn("[dkv_split_rows, D]", SPARSE_BWD_SOURCE)
 
     def test_w2_chunk_candidate_has_bounded_values(self):
         self.assertIn(
