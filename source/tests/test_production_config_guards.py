@@ -160,7 +160,7 @@ def test_production_allocator_does_not_strand_large_reserved_blocks() -> None:
     assert "max_split_size_mb" not in allocator
 
 
-def test_glm52_stability_and_production_use_exact_bf16_expert_transport() -> None:
+def test_glm52_stability_and_production_use_hybrid_expert_transport() -> None:
     for relative in (
         "configs/qualification/glm52-native-stability20.toml",
         "configs/qualification/glm52-native-b2048.toml",
@@ -168,7 +168,10 @@ def test_glm52_stability_and_production_use_exact_bf16_expert_transport() -> Non
     ):
         config = _load(relative)
         assert config.get("env_vars", {}) == {}, relative
-        assert config["model"]["quantization"]["expert_activation_transport"] == "bf16"
+        assert (
+            config["model"]["quantization"]["expert_activation_transport"]
+            == "bf16_forward_fp8_backward"
+        )
 
     launcher = (ROOT / "scripts/china/cluster.sh").read_text()
     assert 'env_vars.get("PRIME_INT4_COMBINE_ROUNDS", "")' in launcher
@@ -239,7 +242,12 @@ def test_all_glm52_trainers_use_h200_w8a8_semantics() -> None:
         assert "w8a16_modules" in quantization, relative
         assert quantization["w8a16_modules"] == [], relative
         assert quantization["fused_qkv_a_fp8"] is True, relative
-        assert quantization["expert_activation_transport"] == "bf16", relative
+        expected_transport = (
+            "bf16"
+            if relative == "configs/qualification/glm52-policy-parity-trainer.toml"
+            else "bf16_forward_fp8_backward"
+        )
+        assert quantization["expert_activation_transport"] == expected_transport, relative
         assert "PRIME_INT4_COMBINE_ROUNDS" not in config.get("env_vars", {}), relative
         assert "PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD" not in config.get(
             "env_vars", {}
