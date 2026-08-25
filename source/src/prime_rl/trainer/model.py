@@ -111,6 +111,47 @@ def iter_layers(layers):
     return layers.values() if isinstance(layers, _nn.ModuleDict) else layers
 
 
+def _virtual_stage_blocks(language_model: nn.Module) -> list[list[nn.Module]]:
+    ranges = getattr(language_model, "pp_layer_ranges", None)
+    if ranges is None:
+        return [list(iter_layers(language_model.layers))]
+
+    layers = language_model.layers
+    if not hasattr(layers, "items"):
+        raise RuntimeError("recorded pipeline ranges require globally keyed layers")
+    by_index = {int(name): block for name, block in layers.items()}
+    groups: list[list[nn.Module]] = []
+    owned: list[int] = []
+    for start, end in ranges:
+        if start >= end:
+            raise RuntimeError(f"invalid virtual pipeline range: {(start, end)}")
+        indices = list(range(start, end))
+        if any(index not in by_index for index in indices):
+            raise RuntimeError(f"pipeline range has missing layers: {(start, end)}")
+        groups.append([by_index[index] for index in indices])
+        owned.extend(indices)
+    if len(owned) != len(set(owned)) or set(owned) != set(by_index):
+        raise RuntimeError("pipeline ranges do not cover the owned layers exactly")
+    return groups
+
+
+def _virtual_stage_prefetch_pairs(
+    language_model: nn.Module,
+) -> tuple[list[list[nn.Module]], list[tuple[nn.Module, nn.Module]], list[tuple[nn.Module, nn.Module]]]:
+    groups = _virtual_stage_blocks(language_model)
+    forward_pairs = [
+        (current, following)
+        for group in groups
+        for current, following in zip(group, group[1:])
+    ]
+    backward_pairs = [
+        (current, preceding)
+        for group in reversed(groups)
+        for current, preceding in zip(reversed(group), reversed(group[:-1]))
+    ]
+    return groups, forward_pairs, backward_pairs
+
+
 def pre_download_model(model_name: str) -> None:
     """Pre-download model from HuggingFace Hub so all nodes have cached weights before training."""
     if Path(model_name).exists():
@@ -1308,61 +1349,59 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
     # if EP is enabled, d2h syncs in the dispatch/combine can interfere with FSDP prefetch, that's why we set it below manually
     # the rest of the function handles only that
 
-    transformer_blocks = list(iter_layers(language_model.layers))
-    next_transformer_blocks = transformer_blocks[1:] + [None]
+    virtual_stage_blocks, forward_prefetch_pairs, backward_prefetch_pairs = _virtual_stage_prefetch_pairs(
+        language_model
+    )
+    transformer_blocks = [block for group in virtual_stage_blocks for block in group]
 
     embed_module = getattr(language_model, "embed_tokens", None) or getattr(language_model, "embeddings", None)
     if embed_module is not None and len(language_model.layers) > 0:
         if shard_norm_and_lm_head:
-            embed_module.set_modules_to_forward_prefetch([transformer_blocks[0]])
+            embed_module.set_modules_to_forward_prefetch([virtual_stage_blocks[0][0]])
 
-    for transformer_block, next_transformer_block in zip(transformer_blocks, next_transformer_blocks):
-        if next_transformer_block is not None:
-            next_mlp = getattr(next_transformer_block, "mlp", None)
-            if next_mlp is not None and isinstance(next_mlp, (MoE, LatentMoE)):
-                prefetch_modules = [next_transformer_block]
-                if isinstance(next_mlp.router, FSDPModule):
-                    prefetch_modules.append(next_mlp.router)
-                if (
-                    isinstance(next_mlp.experts, FSDPModule)
-                    and (not native_fp8 or config.native_fp8_expert_prefetch)
-                ):
-                    prefetch_modules.append(next_mlp.experts)
-                transformer_block.set_modules_to_forward_prefetch(prefetch_modules)
-            else:
-                transformer_block.set_modules_to_forward_prefetch([next_transformer_block])
-        elif language_model.norm is not None and model.lm_head is not None:
-            if shard_norm_and_lm_head:
-                transformer_block.set_modules_to_forward_prefetch([language_model.norm, model.lm_head])
+    for transformer_block, next_transformer_block in forward_prefetch_pairs:
+        next_mlp = getattr(next_transformer_block, "mlp", None)
+        if next_mlp is not None and isinstance(next_mlp, (MoE, LatentMoE)):
+            prefetch_modules = [next_transformer_block]
+            if isinstance(next_mlp.router, FSDPModule):
+                prefetch_modules.append(next_mlp.router)
+            if (
+                isinstance(next_mlp.experts, FSDPModule)
+                and (not native_fp8 or config.native_fp8_expert_prefetch)
+            ):
+                prefetch_modules.append(next_mlp.experts)
+            transformer_block.set_modules_to_forward_prefetch(prefetch_modules)
+        else:
+            transformer_block.set_modules_to_forward_prefetch([next_transformer_block])
+
+    if transformer_blocks and language_model.norm is not None and model.lm_head is not None:
+        if shard_norm_and_lm_head:
+            virtual_stage_blocks[-1][-1].set_modules_to_forward_prefetch([language_model.norm, model.lm_head])
 
     # backward
-    reversed_transformer_blocks = list(reversed(list(iter_layers(language_model.layers))))
-    prev_transformer_blocks = reversed_transformer_blocks[1:] + [None]
-
     if language_model.norm is not None and model.lm_head is not None and len(language_model.layers) > 0:
         if shard_norm_and_lm_head:
-            model.lm_head.set_modules_to_backward_prefetch([reversed_transformer_blocks[0]])
+            model.lm_head.set_modules_to_backward_prefetch([virtual_stage_blocks[-1][-1]])
         else:
-            model.set_modules_to_backward_prefetch([reversed_transformer_blocks[0]])
+            model.set_modules_to_backward_prefetch([virtual_stage_blocks[-1][-1]])
 
-    for transformer_block, prev_transformer_block in zip(reversed_transformer_blocks, prev_transformer_blocks):
-        if prev_transformer_block is not None:
-            prev_mlp = getattr(prev_transformer_block, "mlp", None)
-            if prev_mlp is not None and isinstance(prev_mlp, (MoE, LatentMoE)):
-                prefetch_modules = [prev_transformer_block]
-                if (
-                    isinstance(prev_mlp.experts, FSDPModule)
-                    and (not native_fp8 or config.native_fp8_expert_prefetch)
-                ):
-                    prefetch_modules.append(prev_mlp.experts)
-                if isinstance(prev_mlp.router, FSDPModule):
-                    prefetch_modules.append(prev_mlp.router)
-                transformer_block.set_modules_to_backward_prefetch(prefetch_modules)
-            else:
-                transformer_block.set_modules_to_backward_prefetch([prev_transformer_block])
-        elif embed_module is not None:
-            if shard_norm_and_lm_head:
-                transformer_block.set_modules_to_backward_prefetch([embed_module])
+    for transformer_block, prev_transformer_block in backward_prefetch_pairs:
+        prev_mlp = getattr(prev_transformer_block, "mlp", None)
+        if prev_mlp is not None and isinstance(prev_mlp, (MoE, LatentMoE)):
+            prefetch_modules = [prev_transformer_block]
+            if (
+                isinstance(prev_mlp.experts, FSDPModule)
+                and (not native_fp8 or config.native_fp8_expert_prefetch)
+            ):
+                prefetch_modules.append(prev_mlp.experts)
+            if isinstance(prev_mlp.router, FSDPModule):
+                prefetch_modules.append(prev_mlp.router)
+            transformer_block.set_modules_to_backward_prefetch(prefetch_modules)
+        else:
+            transformer_block.set_modules_to_backward_prefetch([prev_transformer_block])
+
+    if transformer_blocks and embed_module is not None and shard_norm_and_lm_head:
+        virtual_stage_blocks[0][0].set_modules_to_backward_prefetch([embed_module])
 
 
 def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):

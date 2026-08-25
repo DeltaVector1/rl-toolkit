@@ -171,6 +171,46 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
         ).read_text()
         self.assertIn("native_fp8_expert_prefetch: bool = False", trainer_config)
 
+    def test_prefetch_pairs_stop_at_virtual_stage_boundaries(self):
+        tree = ast.parse(MODEL.read_text())
+        helpers = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name in {"_virtual_stage_blocks", "_virtual_stage_prefetch_pairs"}
+        ]
+        module = ast.Module(body=helpers, type_ignores=[])
+        ast.fix_missing_locations(module)
+        namespace = {
+            "RuntimeError": RuntimeError,
+            "nn": type("NN", (), {"Module": object}),
+        }
+        exec(compile(module, str(MODEL), "exec"), namespace)
+
+        class Layer:
+            def __init__(self, index):
+                self.index = index
+
+        layers = {str(index): Layer(index) for index in (0, 1, 8, 9)}
+        language_model = type(
+            "LanguageModel",
+            (),
+            {"layers": layers, "pp_layer_ranges": ((0, 2), (8, 10))},
+        )()
+        groups, forward, backward = namespace["_virtual_stage_prefetch_pairs"](language_model)
+
+        self.assertEqual([[layer.index for layer in group] for group in groups], [[0, 1], [8, 9]])
+        self.assertEqual([(left.index, right.index) for left, right in forward], [(0, 1), (8, 9)])
+        self.assertEqual([(left.index, right.index) for left, right in backward], [(9, 8), (1, 0)])
+
+    def test_small_profile_uses_recompute_backward_transport(self):
+        with (ROOT / "configs/qualification/glm52-native-small.toml").open("rb") as stream:
+            config = tomllib.load(stream)
+        self.assertEqual(
+            config["model"]["quantization"]["expert_activation_transport"],
+            "bf16_forward_fp8_recompute_backward",
+        )
+
     def test_b2048_profile_uses_64_full_context_microbatches(self):
         with (ROOT / "configs/operations.toml").open("rb") as stream:
             operations = tomllib.load(stream)
@@ -320,7 +360,10 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
         self.assertGreaterEqual(
             setup_source.count("preserve_glm_moe_bias_precision(model)"), 4
         )
-        self.assertIn("apply_pp_layers(model, pp_rank, parallel_dims.pp)", setup_source)
+        self.assertIn(
+            "apply_pp_layers(model, pp_rank, parallel_dims.pp, virtual_stages=virtual_stages)",
+            setup_source,
+        )
         self.assertIn("setup_fsdp(model, config, parallel_dims)", setup_source)
         self.assertIn("load_dcp_from_hf(model, config, parallel_dims)", setup_source)
 
