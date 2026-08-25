@@ -1,3 +1,4 @@
+import weakref
 from dataclasses import dataclass
 
 import torch
@@ -99,17 +100,184 @@ def apply_rope_interleave_single(
     return (t * cos) + (rotate_half(t) * sin)
 
 
+class _PackedIndexerProjection(nn.Module):
+    input_size = 6144
+    key_size = 128
+    head_count = 32
+    output_size = key_size + head_count
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.in_features = self.input_size
+        self.out_features = self.output_size
+        self.weight = nn.Parameter(
+            torch.empty(
+                self.output_size,
+                self.input_size,
+                dtype=torch.bfloat16,
+            ),
+            requires_grad=False,
+        )
+        self.bias = None
+
+    def _validate(self, x: torch.Tensor) -> None:
+        if tuple(self.weight.shape) != (self.output_size, self.input_size):
+            raise ValueError(
+                f"packed indexer weight has shape {tuple(self.weight.shape)}; "
+                f"expected {(self.output_size, self.input_size)}"
+            )
+        if self.weight.dtype != torch.bfloat16:
+            raise TypeError(
+                f"packed indexer weight must be BF16; got {self.weight.dtype}"
+            )
+        if x.dtype != torch.bfloat16:
+            raise TypeError(f"packed indexer input must be BF16; got {x.dtype}")
+        if x.shape[-1] != self.input_size:
+            raise ValueError(
+                f"packed indexer input width is {x.shape[-1]}; expected {self.input_size}"
+            )
+        if x.device != self.weight.device:
+            raise ValueError("packed indexer input and weight must use one device")
+        if self.bias is not None:
+            raise ValueError("packed indexer projection does not support bias")
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        self._validate(x)
+        combined = torch.nn.functional.linear(x, self.weight)
+        if combined.dtype != torch.bfloat16:
+            raise TypeError(f"packed indexer output must be BF16; got {combined.dtype}")
+        return combined.split((self.key_size, self.head_count), dim=-1)
+
+
+class _PackedIndexerWeightSlice(nn.Module):
+    def __init__(self, owner: _PackedIndexerProjection) -> None:
+        super().__init__()
+        object.__setattr__(self, "_owner_ref", weakref.ref(owner))
+        self.in_features = owner.input_size
+        self.out_features = owner.head_count
+        self.bias = None
+
+    @property
+    def owner(self) -> _PackedIndexerProjection:
+        owner = self._owner_ref()
+        if owner is None:
+            raise RuntimeError("packed indexer projection owner no longer exists")
+        return owner
+
+    @property
+    def weight(self) -> torch.Tensor:
+        return self.owner.weight.narrow(0, self.owner.key_size, self.owner.head_count)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        raise RuntimeError(
+            "indexer weights projection must run through the packed indexer call"
+        )
+
+
 class Indexer(nn.Module):
     def __init__(self, args: SparseMlaAttentionArgs):
         super().__init__()
+        expected = {
+            "hidden_size": _PackedIndexerProjection.input_size,
+            "index_head_dim": _PackedIndexerProjection.key_size,
+            "index_n_heads": _PackedIndexerProjection.head_count,
+        }
+        actual = {
+            "hidden_size": args.hidden_size,
+            "index_head_dim": args.index_head_dim,
+            "index_n_heads": args.index_n_heads,
+        }
+        if actual != expected:
+            raise ValueError(
+                f"packed GLM indexer dimensions are {actual}; expected {expected}"
+            )
+        if args.attention_bias:
+            raise ValueError("packed GLM indexer does not support attention bias")
         self.n_head = args.index_n_heads
         self.head_dim = args.index_head_dim
         self.rope_dim = args.qk_rope_head_dim
         self.wq_b = nn.Linear(args.q_lora_rank, self.n_head * self.head_dim, bias=False)
-        self.wk = nn.Linear(args.hidden_size, self.head_dim, bias=args.attention_bias)
+        self.wk = _PackedIndexerProjection()
         self.k_norm = LayerNorm(dim=self.head_dim, eps=1e-6)
-        self.weights_proj = nn.Linear(args.hidden_size, self.n_head, bias=False)
+        self.weights_proj = _PackedIndexerWeightSlice(self.wk)
         self.weight_scale = (self.head_dim**-0.5) * (self.n_head**-0.5)
+        self._register_state_dict_hook(self._split_packed_indexer_state)
+        self._register_load_state_dict_pre_hook(
+            self._pack_indexer_load_state, with_module=True
+        )
+
+    @staticmethod
+    def _split_packed_indexer_state(
+        module: nn.Module,
+        state_dict: dict[str, torch.Tensor],
+        prefix: str,
+        local_metadata: dict,
+    ) -> None:
+        del local_metadata
+        if not isinstance(module, Indexer):
+            raise TypeError("packed indexer state hook received the wrong module")
+        wk_key = f"{prefix}wk.weight"
+        weights_key = f"{prefix}weights_proj.weight"
+        if wk_key not in state_dict or weights_key in state_dict:
+            raise KeyError("packed indexer state keys are not in their internal form")
+        packed = state_dict[wk_key]
+        if tuple(packed.shape) != (
+            _PackedIndexerProjection.output_size,
+            _PackedIndexerProjection.input_size,
+        ):
+            raise ValueError(f"packed indexer state has shape {tuple(packed.shape)}")
+        if packed.dtype != torch.bfloat16:
+            raise TypeError(f"packed indexer state must be BF16; got {packed.dtype}")
+        if module.wk.bias is not None or module.weights_proj.bias is not None:
+            raise ValueError("packed indexer state does not support bias")
+        state_dict[wk_key] = packed.narrow(0, 0, _PackedIndexerProjection.key_size)
+        state_dict[weights_key] = packed.narrow(
+            0,
+            _PackedIndexerProjection.key_size,
+            _PackedIndexerProjection.head_count,
+        )
+
+    @staticmethod
+    def _pack_indexer_load_state(
+        module: nn.Module,
+        state_dict: dict[str, torch.Tensor],
+        prefix: str,
+        local_metadata: dict,
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_msgs: list[str],
+    ) -> None:
+        del local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        if not isinstance(module, Indexer):
+            raise TypeError("packed indexer load hook received the wrong module")
+        wk_key = f"{prefix}wk.weight"
+        weights_key = f"{prefix}weights_proj.weight"
+        if wk_key not in state_dict or weights_key not in state_dict:
+            raise KeyError(
+                "packed indexer load requires wk.weight and weights_proj.weight"
+            )
+        wk = state_dict[wk_key]
+        weights = state_dict.pop(weights_key)
+        expected_wk = (
+            _PackedIndexerProjection.key_size,
+            _PackedIndexerProjection.input_size,
+        )
+        expected_weights = (
+            _PackedIndexerProjection.head_count,
+            _PackedIndexerProjection.input_size,
+        )
+        if tuple(wk.shape) != expected_wk or tuple(weights.shape) != expected_weights:
+            raise ValueError(
+                "packed indexer load shapes differ: "
+                f"wk={tuple(wk.shape)}, weights={tuple(weights.shape)}"
+            )
+        if wk.dtype != torch.bfloat16 or weights.dtype != torch.bfloat16:
+            raise TypeError(
+                "packed indexer load requires BF16 tensors; "
+                f"got wk={wk.dtype}, weights={weights.dtype}"
+            )
+        state_dict[wk_key] = torch.cat((wk, weights), dim=0)
 
     @torch.no_grad()
     def compute_sparse_indices(
@@ -129,8 +297,8 @@ class Indexer(nn.Module):
         s_local = hidden_states_local.shape[1]
 
         q_idx = self.wq_b(q_latent_local[0]).view(s_local, self.n_head, self.head_dim)
-        k_idx_local = self.k_norm(self.wk(hidden_states_local[0]))
-        w = self.weights_proj(hidden_states_local[0])
+        k_idx_local, w = self.wk(hidden_states_local[0])
+        k_idx_local = self.k_norm(k_idx_local)
 
         if cp_world_size > 1:
             k_idx = gather_for_cp(k_idx_local.unsqueeze(0), cp_group).squeeze(0)
