@@ -169,13 +169,14 @@ def _round_splits(
 class ReceivedINT4ExpertInput:
     """Own the exact compressed expert input received by one dispatch call."""
 
-    __slots__ = ("values", "scales", "columns", "copy_done")
+    __slots__ = ("values", "scales", "columns", "copy_done", "copy_ready")
 
     def __init__(self) -> None:
         self.values = None
         self.scales = None
         self.columns = 0
         self.copy_done = None
+        self.copy_ready = False
 
     def prepare(self, rows: int, columns: int) -> None:
         if self.values is not None:
@@ -269,8 +270,9 @@ class ReceivedINT4ExpertInput:
                 "cannot reconstruct rows from an empty received INT4 input"
             )
 
-        stream = torch.cuda.current_stream(output.device)
-        stream.wait_event(self.copy_done)
+        if not self.copy_ready:
+            self.copy_done.synchronize()
+            self.copy_ready = True
         real_rows = (row_indices >= 0) & (row_indices < self.values.shape[0])
         safe_indices = row_indices.clamp(0, self.values.shape[0] - 1).long()
         host_values = workspace.host_values[: row_indices.shape[0]]
@@ -291,6 +293,11 @@ class ReceivedINT4ExpertInput:
             num_warps=8,
         )
         output.masked_fill_((~real_rows).to(output.device).unsqueeze(-1), 0)
+
+    def make_workspace(
+        self, row_capacity: int, device: torch.device
+    ) -> "INT4ExpertInputWorkspace":
+        return INT4ExpertInputWorkspace(row_capacity, self.columns, device)
 
 
 class INT4ExpertInputWorkspace:
@@ -341,6 +348,131 @@ class INT4ExpertInputWorkspace:
             raise ValueError("INT4 expert input workspace row capacity is too small")
         if columns != self.columns or torch.device(device) != self.device:
             raise ValueError("INT4 expert input workspace does not match the output")
+
+
+class ReceivedBF16ExpertInput:
+    """Own the exact BF16 expert input received by one dispatch call."""
+
+    __slots__ = (
+        "values",
+        "columns",
+        "copy_done",
+        "copy_ready",
+        "save_for_backward",
+    )
+
+    def __init__(self, save_for_backward: bool = True) -> None:
+        self.values = None
+        self.columns = 0
+        self.copy_done = None
+        self.copy_ready = False
+        self.save_for_backward = save_for_backward
+
+    def prepare(self, values: torch.Tensor) -> None:
+        if self.values is not None:
+            raise RuntimeError("received BF16 expert input was prepared more than once")
+        if values.device.type != "cuda" or values.dtype != torch.bfloat16:
+            raise TypeError("received BF16 expert input must be a CUDA BF16 tensor")
+        if values.ndim != 2 or values.shape[1] <= 0:
+            raise ValueError("received BF16 expert input shape is invalid")
+        self.columns = values.shape[1]
+        if not self.save_for_backward:
+            return
+        self.values = torch.empty(
+            values.shape,
+            device="cpu",
+            dtype=torch.bfloat16,
+            pin_memory=True,
+        )
+        self.values.copy_(values, non_blocking=True)
+        self.copy_done = torch.cuda.Event()
+        self.copy_done.record(torch.cuda.current_stream(values.device))
+
+    def reconstruct_rows(
+        self,
+        row_indices: torch.Tensor,
+        output: torch.Tensor,
+        workspace,
+    ) -> None:
+        if self.values is None or self.copy_done is None:
+            raise RuntimeError("received BF16 expert input is incomplete")
+        if row_indices.device.type != "cpu" or row_indices.ndim != 1:
+            raise ValueError(
+                "received BF16 row indices must be a one-dimensional CPU tensor"
+            )
+        if output.device.type != "cuda" or output.dtype != torch.bfloat16:
+            raise ValueError(
+                "received BF16 rows must be reconstructed into CUDA BF16 storage"
+            )
+        if output.shape != (row_indices.shape[0], self.columns):
+            raise ValueError("received BF16 reconstruction output has the wrong shape")
+        workspace.check(row_indices.shape[0], self.columns, output.device)
+        if not row_indices.shape[0]:
+            return
+        if not self.values.shape[0]:
+            raise ValueError("cannot reconstruct rows from an empty received BF16 input")
+
+        if not self.copy_ready:
+            self.copy_done.synchronize()
+            self.copy_ready = True
+        real_rows = (row_indices >= 0) & (row_indices < self.values.shape[0])
+        safe_indices = row_indices.clamp(0, self.values.shape[0] - 1).long()
+        host_values = workspace.host_values[: row_indices.shape[0]]
+        torch.index_select(self.values, 0, safe_indices, out=host_values)
+        output.copy_(host_values, non_blocking=True)
+        output.masked_fill_((~real_rows).to(output.device).unsqueeze(-1), 0)
+
+    def make_workspace(
+        self, row_capacity: int, device: torch.device
+    ) -> "BF16ExpertInputWorkspace":
+        return BF16ExpertInputWorkspace(row_capacity, self.columns, device)
+
+
+class BF16ExpertInputWorkspace:
+    """Bound host scratch for exact BF16 expert-input reconstruction."""
+
+    __slots__ = ("row_capacity", "columns", "device", "host_values")
+
+    def __init__(self, row_capacity: int, columns: int, device: torch.device) -> None:
+        if row_capacity <= 0 or columns <= 0:
+            raise ValueError("BF16 expert input workspace shape is invalid")
+        self.row_capacity = row_capacity
+        self.columns = columns
+        self.device = torch.device(device)
+        if self.device.type != "cuda":
+            raise ValueError("BF16 expert input workspace requires a CUDA device")
+        self.host_values = torch.empty(
+            (row_capacity, columns),
+            device="cpu",
+            dtype=torch.bfloat16,
+            pin_memory=True,
+        )
+
+    def check(self, rows: int, columns: int, device: torch.device) -> None:
+        if rows > self.row_capacity:
+            raise ValueError("BF16 expert input workspace row capacity is too small")
+        if columns != self.columns or torch.device(device) != self.device:
+            raise ValueError("BF16 expert input workspace does not match the output")
+
+
+def bf16_expert_transport_memory_bytes(
+    input_rows: int,
+    output_rows: int,
+    columns: int,
+    reconstruction_rows: int,
+) -> dict[str, int]:
+    """Return the added BF16 transport storage for one expert call."""
+    if min(input_rows, output_rows) < 0 or columns <= 0 or reconstruction_rows <= 0:
+        raise ValueError("BF16 expert transport memory shape is invalid")
+    element_bytes = torch.tensor([], dtype=torch.bfloat16).element_size()
+    return {
+        "dispatch_output_cuda": output_rows * columns * element_bytes,
+        "combine_output_cuda": input_rows * columns * element_bytes,
+        "saved_dispatch_input_host": output_rows * columns * element_bytes,
+        "reconstruction_workspace_host": reconstruction_rows
+        * columns
+        * element_bytes,
+    }
 
 
 def _streaming_int4_forward(
@@ -655,6 +787,91 @@ def _streaming_fp8_backward(
     return dequantized
 
 
+def _validate_bf16_dispatch(
+    value: torch.Tensor,
+    output_splits: list[int],
+    input_splits: list[int],
+    group_name: str,
+) -> ProcessGroup:
+    if value.device.type != "cuda" or value.dtype != torch.bfloat16:
+        raise TypeError("BF16 expert transport requires a CUDA BF16 tensor")
+    if value.ndim != 2 or not value.is_contiguous() or value.shape[1] <= 0:
+        raise ValueError("BF16 expert transport requires a contiguous matrix")
+    if any(split < 0 for split in (*output_splits, *input_splits)):
+        raise ValueError("BF16 expert transport splits cannot be negative")
+    group = _resolve_process_group(group_name)
+    world_size = dist.get_world_size(group)
+    if len(output_splits) != world_size or len(input_splits) != world_size:
+        raise ValueError("BF16 expert transport needs one split for every EP rank")
+    if sum(input_splits) != value.shape[0]:
+        raise ValueError("BF16 expert transport input splits do not match the input")
+    return group
+
+
+class _BF16Dispatch(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        routed_input,
+        output_splits,
+        input_splits,
+        group_name,
+        tag="a2a",
+        received_input=None,
+    ):
+        group = _validate_bf16_dispatch(
+            routed_input,
+            output_splits,
+            input_splits,
+            group_name,
+        )
+        output = _empty_with_cache_retry(
+            (sum(output_splits), routed_input.shape[1]),
+            device=routed_input.device,
+            dtype=torch.bfloat16,
+        )
+        with _EPTimer(f"fwd_{tag}"):
+            dist.all_to_all_single(
+                output,
+                routed_input,
+                output_splits,
+                input_splits,
+                group=group,
+            )
+        if received_input is not None:
+            if not isinstance(received_input, ReceivedBF16ExpertInput):
+                raise TypeError("BF16 expert dispatch received the wrong saved-input type")
+            received_input.prepare(output)
+        ctx.input_splits = input_splits
+        ctx.output_splits = output_splits
+        ctx.group_name = group_name
+        ctx.tag = tag
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        group = _validate_bf16_dispatch(
+            grad_output,
+            ctx.input_splits,
+            ctx.output_splits,
+            ctx.group_name,
+        )
+        grad_input = _empty_with_cache_retry(
+            (sum(ctx.input_splits), grad_output.shape[1]),
+            device=grad_output.device,
+            dtype=torch.bfloat16,
+        )
+        with _EPTimer(f"bwd_{ctx.tag}"):
+            dist.all_to_all_single(
+                grad_input,
+                grad_output,
+                ctx.input_splits,
+                ctx.output_splits,
+                group=group,
+            )
+        return grad_input, None, None, None, None, None
+
+
 class _INT4Dispatch(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -812,8 +1029,7 @@ class MXFP8AllToAllExpertParallel(ExpertParallel):
             return None
         return slot
 
-    def _token_dispatch(self, mod, inputs, device_mesh):
-        routed_input, num_tokens_per_expert = inputs
+    def _exchange_metadata(self, num_tokens_per_expert, device_mesh):
         if _EP_AC_CACHE and _in_backward() and self._meta_cache is not None:
             num_tokens_per_expert_group, self.input_splits, self.output_splits = (
                 self._meta_cache
@@ -846,6 +1062,14 @@ class MXFP8AllToAllExpertParallel(ExpertParallel):
                     self.input_splits,
                     self.output_splits,
                 )
+        return num_tokens_per_expert_group
+
+    def _token_dispatch(self, mod, inputs, device_mesh):
+        routed_input, num_tokens_per_expert = inputs
+        num_tokens_per_expert_group = self._exchange_metadata(
+            num_tokens_per_expert,
+            device_mesh,
+        )
         _ep_profile_tick()
         received_input = (
             ReceivedINT4ExpertInput()
@@ -880,6 +1104,72 @@ class MXFP8AllToAllExpertParallel(ExpertParallel):
 class NativeFP8LoRAAllToAllExpertParallel(MXFP8AllToAllExpertParallel):
     """Shard the native FP8 base and every routed-expert LoRA factor."""
 
+    def __init__(self, expert_activation_transport: str):
+        super().__init__()
+        if expert_activation_transport not in {"bf16", "int4"}:
+            raise ValueError(
+                "native FP8 routed-expert LoRA transport must be 'bf16' or 'int4'"
+            )
+        self.expert_activation_transport = expert_activation_transport
+
+    def _token_dispatch(self, mod, inputs, device_mesh):
+        if not getattr(mod, "requires_received_expert_input", False):
+            raise TypeError("native FP8 routed-expert LoRA needs its received input")
+        routed_input, num_tokens_per_expert = inputs
+        num_tokens_per_expert_group = self._exchange_metadata(
+            num_tokens_per_expert,
+            device_mesh,
+        )
+        _ep_profile_tick()
+        if self.expert_activation_transport == "bf16":
+            received_input = ReceivedBF16ExpertInput(
+                save_for_backward=torch.is_grad_enabled()
+            )
+            routed_input = _BF16Dispatch.apply(
+                routed_input,
+                self.output_splits,
+                self.input_splits,
+                device_mesh.get_group().group_name,
+                "dispatch",
+                received_input,
+            )
+        elif self.expert_activation_transport == "int4":
+            received_input = ReceivedINT4ExpertInput()
+            routed_input = _INT4Dispatch.apply(
+                routed_input,
+                self.output_splits,
+                self.input_splits,
+                device_mesh.get_group().group_name,
+                "dispatch",
+                self._cache_slot(self._dispatch_cache),
+                received_input,
+            )
+        else:
+            raise RuntimeError("native FP8 routed-expert LoRA transport is invalid")
+        return routed_input, num_tokens_per_expert_group, received_input
+
+    def _token_combine(self, mod, routed_output, device_mesh):
+        if self.expert_activation_transport == "bf16":
+            return _BF16Dispatch.apply(
+                routed_output,
+                self.input_splits,
+                self.output_splits,
+                device_mesh.get_group().group_name,
+                "combine",
+                None,
+            )
+        if self.expert_activation_transport == "int4":
+            return _INT4Dispatch.apply(
+                routed_output,
+                self.input_splits,
+                self.output_splits,
+                device_mesh.get_group().group_name,
+                "combine",
+                self._cache_slot(self._combine_cache),
+                None,
+            )
+        raise RuntimeError("native FP8 routed-expert LoRA transport is invalid")
+
     @staticmethod
     def _shard_direct_parameters(mod: nn.Module, device_mesh: DeviceMesh) -> None:
         for parameter_name, parameter in list(mod.named_parameters(recurse=False)):
@@ -898,7 +1188,7 @@ class NativeFP8LoRAAllToAllExpertParallel(MXFP8AllToAllExpertParallel):
         mod: nn.Module,
         device_mesh: DeviceMesh,
     ) -> None:
-        if not getattr(mod, "requires_received_int4_input", False):
+        if not getattr(mod, "requires_received_expert_input", False):
             return
         base_layer = getattr(mod, "base_layer", None)
         if base_layer is None or not getattr(base_layer, "fp8_checkpoint", False):

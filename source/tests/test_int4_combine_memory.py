@@ -132,10 +132,11 @@ class Int4CombineMemoryTests(unittest.TestCase):
         )[0]
         reconstruction = received_input.split("def reconstruct_rows", 1)[1]
         workspace = SOURCE.split("class INT4ExpertInputWorkspace", 1)[1].split(
-            "\n\ndef _streaming_int4_forward", 1
+            "\n\nclass ReceivedBF16ExpertInput", 1
         )[0]
         self.assertIn("workspace.check(row_indices.shape[0]", reconstruction)
-        self.assertIn("stream.wait_event(self.copy_done)", reconstruction)
+        self.assertIn("self.copy_done.synchronize()", reconstruction)
+        self.assertIn("if not self.copy_ready", reconstruction)
         self.assertIn("torch.index_select(self.values", reconstruction)
         self.assertIn("_dequantize_int4_kernel", reconstruction)
         self.assertNotIn("torch.empty", reconstruction)
@@ -192,7 +193,7 @@ class Int4CombineMemoryTests(unittest.TestCase):
 
     def test_combine_backward_is_streamed_and_reuses_incoming_gradient(self):
         function = SOURCE.split("def _streaming_fp8_backward", 1)[1].split(
-            "\n\nclass _INT4Dispatch", 1
+            "\n\ndef _validate_bf16_dispatch", 1
         )[0]
         self.assertIn("for round_idx in range(rounds)", function)
         self.assertIn("dequantized = grad_output", function)
@@ -206,7 +207,7 @@ class Int4CombineMemoryTests(unittest.TestCase):
 
     def test_combine_backward_receive_has_one_cache_recovery_retry(self):
         function = SOURCE.split("def _streaming_fp8_backward", 1)[1].split(
-            "\n\nclass _INT4Dispatch", 1
+            "\n\ndef _validate_bf16_dispatch", 1
         )[0]
         self.assertEqual(function.count("_empty_with_cache_retry("), 2)
         result_allocation = function.index("dequantized = _empty_with_cache_retry(")
@@ -255,6 +256,48 @@ class Int4CombineMemoryTests(unittest.TestCase):
         self.assertEqual(result, "allocated")
         self.assertEqual(cache_clears, [True])
         self.assertEqual(calls[0], calls[1])
+
+    def test_native_expert_transport_uses_the_requested_codec(self):
+        native = SOURCE.split(
+            "class NativeFP8LoRAAllToAllExpertParallel", 1
+        )[1].split("\n\nclass DeepEPExpertParallel", 1)[0]
+        bf16_branch = native.split(
+            'if self.expert_activation_transport == "bf16"', 1
+        )[1].split('elif self.expert_activation_transport == "int4"', 1)[0]
+        self.assertIn("ReceivedBF16ExpertInput(", bf16_branch)
+        self.assertIn("_BF16Dispatch.apply", bf16_branch)
+        self.assertNotIn("_INT4Dispatch", bf16_branch)
+        self.assertIn("expert_activation_transport not in", native)
+        self.assertIn("transport is invalid", native)
+
+    def test_bf16_transport_has_no_quantization(self):
+        bf16 = SOURCE.split("class _BF16Dispatch", 1)[1].split(
+            "\n\nclass _INT4Dispatch", 1
+        )[0]
+        self.assertIn("dist.all_to_all_single", bf16)
+        self.assertIn("dtype=torch.bfloat16", bf16)
+        self.assertNotIn("quant", bf16.lower())
+        self.assertNotIn("scale", bf16.lower())
+
+    def test_bf16_transport_memory_is_counted_in_bytes(self):
+        function = SOURCE.split("def bf16_expert_transport_memory_bytes", 1)[1].split(
+            "\n\ndef _streaming_int4_forward", 1
+        )[0]
+        self.assertIn('"dispatch_output_cuda"', function)
+        self.assertIn('"combine_output_cuda"', function)
+        self.assertIn('"saved_dispatch_input_host"', function)
+        self.assertIn('"reconstruction_workspace_host"', function)
+        self.assertEqual(function.count("* element_bytes"), 4)
+
+    def test_bf16_saved_input_is_only_kept_for_backward(self):
+        saved_input = SOURCE.split("class ReceivedBF16ExpertInput", 1)[1].split(
+            "\n\nclass BF16ExpertInputWorkspace", 1
+        )[0]
+        native = SOURCE.split(
+            "class NativeFP8LoRAAllToAllExpertParallel", 1
+        )[1].split("\n\nclass DeepEPExpertParallel", 1)[0]
+        self.assertIn("if not self.save_for_backward", saved_input)
+        self.assertIn("save_for_backward=torch.is_grad_enabled()", native)
 
 
 if __name__ == "__main__":

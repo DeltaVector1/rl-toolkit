@@ -1,4 +1,4 @@
-"""Eight-rank correctness and latency gate for compressed EP transport."""
+"""Multi-rank correctness and latency check for expert transport."""
 
 from __future__ import annotations
 
@@ -10,14 +10,20 @@ import time
 import torch
 import torch.distributed as dist
 
-from prime_rl.trainer.distributed.expert_parallel import _INT4Dispatch
+from prime_rl.trainer.distributed.expert_parallel import (
+    BF16ExpertInputWorkspace,
+    ReceivedBF16ExpertInput,
+    _BF16Dispatch,
+    _INT4Dispatch,
+    bf16_expert_transport_memory_bytes,
+)
 
 
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--rows", type=int, default=32768)
     parser.add_argument("--cols", type=int, default=6144)
     parser.add_argument("--iters", type=int, default=3)
+    parser.add_argument("--rows-per-peer", type=int, default=0)
     return parser.parse_args()
 
 
@@ -44,35 +50,154 @@ def main() -> None:
     torch.cuda.set_device(local_rank)
     dist.init_process_group("nccl")
     world = dist.get_world_size()
-    if world != 8:
-        raise RuntimeError("the production EP transport gate requires eight ranks")
-    if args.rows % world:
-        raise ValueError("rows must divide evenly across ranks")
+    if world < 2:
+        raise RuntimeError("the expert transport check requires at least two ranks")
+
+    input_splits = [
+        args.rows_per_peer + rank * world + peer + 1 for peer in range(world)
+    ]
+    output_splits = [
+        args.rows_per_peer + peer * world + rank + 1 for peer in range(world)
+    ]
+    rows = sum(input_splits)
 
     generator = torch.Generator(device="cuda").manual_seed(20260810 + rank)
     value = torch.randn(
-        args.rows,
+        rows,
         args.cols,
         device="cuda",
         dtype=torch.bfloat16,
         generator=generator,
     ).mul_(0.02)
-    splits = [args.rows // world] * world
-    reference = torch.empty_like(value)
+    reference = torch.empty(
+        (sum(output_splits), args.cols),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
 
-    def bf16_dispatch():
-        dist.all_to_all_single(reference, value, splits, splits)
+    def reference_dispatch():
+        dist.all_to_all_single(
+            reference,
+            value,
+            output_splits,
+            input_splits,
+        )
         return reference
 
     for _ in range(2):
-        bf16_dispatch()
-    _, bf16_seconds = timed(bf16_dispatch)
+        reference_dispatch()
+    _, reference_seconds = timed(reference_dispatch)
+
+    saved_input = ReceivedBF16ExpertInput()
+    train_value = value.detach().clone().requires_grad_()
+    exact, bf16_seconds = timed(
+        lambda: _BF16Dispatch.apply(
+            train_value,
+            output_splits,
+            input_splits,
+            dist.group.WORLD.group_name,
+            "dispatch",
+            saved_input,
+        )
+    )
+    if not torch.equal(exact, reference):
+        raise RuntimeError("BF16 dispatch changed activation values")
+    torch.cuda.synchronize()
+    if not torch.equal(saved_input.values, reference.cpu()):
+        raise RuntimeError("BF16 saved expert input changed activation values")
+    no_grad_input = ReceivedBF16ExpertInput(save_for_backward=False)
+    no_grad_input.prepare(reference)
+    if no_grad_input.values is not None or no_grad_input.copy_done is not None:
+        raise RuntimeError("BF16 no-grad transport retained a saved expert input")
+
+    selected_rows = torch.tensor(
+        [0, exact.shape[0] - 1, -1, exact.shape[0]],
+        device="cpu",
+        dtype=torch.int64,
+    )
+    reconstructed = torch.empty(
+        (selected_rows.shape[0], args.cols),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    workspace = BF16ExpertInputWorkspace(
+        selected_rows.shape[0],
+        args.cols,
+        reconstructed.device,
+    )
+    saved_input.reconstruct_rows(selected_rows, reconstructed, workspace)
+    expected_rows = torch.stack(
+        (reference[0], reference[-1], torch.zeros_like(reference[0]), torch.zeros_like(reference[0]))
+    )
+    if not torch.equal(reconstructed, expected_rows):
+        raise RuntimeError("BF16 saved expert input reconstruction is not exact")
+
+    combined = _BF16Dispatch.apply(
+        exact,
+        input_splits,
+        output_splits,
+        dist.group.WORLD.group_name,
+        "combine",
+        None,
+    )
+    if not torch.equal(combined, value):
+        raise RuntimeError("BF16 combine changed activation values")
+
+    chain_input = value.detach().clone().requires_grad_()
+    chain_dispatch = _BF16Dispatch.apply(
+        chain_input,
+        output_splits,
+        input_splits,
+        dist.group.WORLD.group_name,
+        "dispatch",
+        None,
+    )
+    chain_output = _BF16Dispatch.apply(
+        chain_dispatch,
+        input_splits,
+        output_splits,
+        dist.group.WORLD.group_name,
+        "combine",
+        None,
+    )
+    chain_upstream = torch.randn(
+        chain_output.shape,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    ).mul_(1e-4)
+    chain_gradient = torch.autograd.grad(
+        chain_output,
+        chain_input,
+        chain_upstream,
+    )[0]
+    if not torch.equal(chain_gradient, chain_upstream):
+        raise RuntimeError("BF16 dispatch and combine changed the chain gradient")
+
+    upstream = torch.randn(
+        exact.shape,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    ).mul_(1e-4)
+    expected_gradient = torch.empty_like(train_value)
+    dist.all_to_all_single(
+        expected_gradient,
+        upstream,
+        input_splits,
+        output_splits,
+    )
+    gradient, bf16_backward_seconds = timed(
+        lambda: torch.autograd.grad(exact, train_value, upstream)[0]
+    )
+    if not torch.equal(gradient, expected_gradient):
+        raise RuntimeError("BF16 expert transport backward changed gradient values")
 
     def compressed_dispatch(input_value):
         return _INT4Dispatch.apply(
             input_value,
-            splits,
-            splits,
+            output_splits,
+            input_splits,
             dist.group.WORLD.group_name,
             "gate",
             None,
@@ -89,21 +214,26 @@ def main() -> None:
     assert compressed is not None
     forward_rel_rmse = relative_rmse(compressed, reference)
 
-    train_value = value.detach().clone().requires_grad_()
-    upstream = torch.randn(
+    int4_train_value = value.detach().clone().requires_grad_()
+    int4_upstream = torch.randn(
         reference.shape,
         device="cuda",
         dtype=torch.bfloat16,
         generator=generator,
     ).mul_(1e-4)
-    expected_gradient = torch.empty_like(train_value)
-    dist.all_to_all_single(expected_gradient, upstream, splits, splits)
-    output = compressed_dispatch(train_value)
-    gradient, backward_seconds = timed(
-        lambda: torch.autograd.grad(output, train_value, upstream)[0]
+    int4_expected_gradient = torch.empty_like(int4_train_value)
+    dist.all_to_all_single(
+        int4_expected_gradient,
+        int4_upstream,
+        input_splits,
+        output_splits,
     )
-    backward_rel_rmse = relative_rmse(gradient, expected_gradient)
-    if not bool(torch.isfinite(gradient).all()):
+    output = compressed_dispatch(int4_train_value)
+    int4_gradient, backward_seconds = timed(
+        lambda: torch.autograd.grad(output, int4_train_value, int4_upstream)[0]
+    )
+    backward_rel_rmse = relative_rmse(int4_gradient, int4_expected_gradient)
+    if not bool(torch.isfinite(int4_gradient).all()):
         raise RuntimeError("compressed EP backward produced nonfinite gradients")
     if forward_rel_rmse > 0.20:
         raise RuntimeError(
@@ -114,9 +244,17 @@ def main() -> None:
             f"FP8 backward relative RMSE is too large: {backward_rel_rmse}"
         )
 
+    memory = bf16_expert_transport_memory_bytes(
+        rows,
+        sum(output_splits),
+        args.cols,
+        selected_rows.shape[0],
+    )
     metrics = torch.tensor(
         [
+            reference_seconds,
             bf16_seconds,
+            bf16_backward_seconds,
             statistics.median(forward_times),
             backward_seconds,
             forward_rel_rmse,
@@ -129,12 +267,15 @@ def main() -> None:
     if rank == 0:
         print(
             "expert_parallel_transport=PASS "
-            f"rows={args.rows} cols={args.cols} "
-            f"bf16_forward_s={metrics[0]:.4f} "
-            f"int4_forward_s={metrics[1]:.4f} "
-            f"fp8_backward_s={metrics[2]:.4f} "
-            f"forward_rel_rmse={metrics[3]:.6f} "
-            f"backward_rel_rmse={metrics[4]:.6f}",
+            f"world={world} rows={rows} cols={args.cols} "
+            f"reference_forward_s={metrics[0]:.4f} "
+            f"bf16_forward_s={metrics[1]:.4f} "
+            f"bf16_backward_s={metrics[2]:.4f} "
+            f"int4_forward_s={metrics[3]:.4f} "
+            f"fp8_backward_s={metrics[4]:.4f} "
+            f"forward_rel_rmse={metrics[5]:.6f} "
+            f"backward_rel_rmse={metrics[6]:.6f} "
+            f"memory={memory}",
             flush=True,
         )
     dist.barrier()

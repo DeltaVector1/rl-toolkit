@@ -160,9 +160,8 @@ def test_production_allocator_does_not_strand_large_reserved_blocks() -> None:
     assert "max_split_size_mb" not in allocator
 
 
-def test_glm52_stability_and_production_pin_bounded_transport_env() -> None:
+def test_glm52_stability_and_production_use_exact_bf16_expert_transport() -> None:
     expected = {
-        "PRIME_INT4_COMBINE_ROUNDS": "8",
         "PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD": "0",
     }
     for relative in (
@@ -172,6 +171,7 @@ def test_glm52_stability_and_production_pin_bounded_transport_env() -> None:
     ):
         config = _load(relative)
         assert config["env_vars"] == expected, relative
+        assert config["model"]["quantization"]["expert_activation_transport"] == "bf16"
 
     launcher = (ROOT / "scripts/china/cluster.sh").read_text()
     assert 'env_vars.get("PRIME_INT4_COMBINE_ROUNDS", "")' in launcher
@@ -209,6 +209,8 @@ def test_all_glm52_trainers_use_h200_w8a8_semantics() -> None:
         assert "w8a16_modules" in quantization, relative
         assert quantization["w8a16_modules"] == [], relative
         assert quantization["fused_qkv_a_fp8"] is True, relative
+        assert quantization["expert_activation_transport"] == "bf16", relative
+        assert "PRIME_INT4_COMBINE_ROUNDS" not in config.get("env_vars", {}), relative
 
     model_source = (ROOT / "source/src/prime_rl/trainer/model.py").read_text()
     fp8_source = (
@@ -222,6 +224,9 @@ def test_all_glm52_trainers_use_h200_w8a8_semantics() -> None:
     assert 'get_mesh("pp").get_group()' in model_source
     assert "validate_w8a16_matches" in model_source
     assert "apply_quantization(model, config, parallel_dims)" in model_source
+    assert "NativeFP8LoRAAllToAllExpertParallel(" in model_source
+    assert "quant.expert_activation_transport" in model_source
+    assert "native FP8 routed-expert LoRA requires FP8 quantization" in model_source
     assert 'rf"(?:^|\\.){re.escape(name)}$"' in fp8_source
     assert "Pipeline-aware W8A16 validation requires an initialized process group" in fp8_source
 

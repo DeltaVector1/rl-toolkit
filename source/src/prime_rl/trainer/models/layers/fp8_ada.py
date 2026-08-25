@@ -2204,7 +2204,7 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
             raise TypeError("native routed-expert LoRA requires CUDA BF16 activations")
         if received_input is None:
             raise RuntimeError(
-                "native routed-expert LoRA requires the exact received INT4 dispatch input"
+                "native routed-expert LoRA requires the exact received dispatch input"
             )
         if chunk_rows <= 0:
             raise ValueError("native routed-expert LoRA chunk size must be positive")
@@ -2363,17 +2363,9 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
             for value in (w1, s1, w2, s2, w3, s3)
         )
 
-        from prime_rl.trainer.distributed.expert_parallel import (
-            INT4ExpertInputWorkspace,
-        )
-
         torch.cuda.current_stream(grad.device).wait_event(ctx.offload_done)
         grad = grad.contiguous()
-        workspace = INT4ExpertInputWorkspace(
-            ctx.chunk_rows,
-            grad.shape[1],
-            grad.device,
-        )
+        workspace = ctx.received_input.make_workspace(ctx.chunk_rows, grad.device)
         parameter_grads = [
             torch.zeros_like(value)
             for value in (

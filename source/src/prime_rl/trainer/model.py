@@ -1753,7 +1753,7 @@ def apply_ep(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims)
         if block_mlp is not None and isinstance(block_mlp, (MoE, LatentMoE)):
             native_fp8_expert_lora = getattr(
                 block_mlp.experts,
-                "requires_received_int4_input",
+                "requires_received_expert_input",
                 False,
             )
             if native_fp8_expert_lora and config.ep_comm_backend != "torch":
@@ -1761,7 +1761,13 @@ def apply_ep(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims)
             if config.ep_comm_backend == "torch":
                 quant = config.quantization
                 if native_fp8_expert_lora:
-                    parallelize_plan = NativeFP8LoRAAllToAllExpertParallel()
+                    if not isinstance(quant, FP8Config):
+                        raise TypeError(
+                            "native FP8 routed-expert LoRA requires FP8 quantization"
+                        )
+                    parallelize_plan = NativeFP8LoRAAllToAllExpertParallel(
+                        quant.expert_activation_transport
+                    )
                 elif (isinstance(quant, MXFP8Config) and quant.enable_a2a) or (
                     isinstance(quant, FP8Config)
                     and (

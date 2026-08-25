@@ -16,7 +16,7 @@ from prime_rl.trainer.models.layers.moe import GroupedExperts
 class NativeFP8MultiLoRAGroupedExperts(MultiLoRAModule):
     """Standard expert LoRA with a frozen native block-FP8 base."""
 
-    requires_received_int4_input = True
+    requires_received_expert_input = True
     fp8_checkpoint = True
 
     def __init__(

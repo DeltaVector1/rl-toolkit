@@ -50,7 +50,7 @@ type = "fp8"
 dequantize_checkpoint = false
 diagnose_linear_backward = true
 fused_qkv_a_fp8 = true
-expert_activation_transport = "int4"
+expert_activation_transport = "bf16"
 w8a16_modules = []
 
 [model.lora]
