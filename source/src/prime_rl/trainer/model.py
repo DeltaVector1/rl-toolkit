@@ -829,26 +829,6 @@ def freeze_sparse_indexer(model: nn.Module) -> None:
         logger.info(f"Froze {num_frozen} sparse indexer parameters")
 
 
-def packed_sparse_indexer_parameters(model: nn.Module) -> set[nn.Parameter]:
-    parameters = set()
-    for module in model.modules():
-        if not isinstance(module, Indexer):
-            continue
-        weight = module.wk.weight
-        if not isinstance(weight, nn.Parameter):
-            raise TypeError("packed sparse indexer weight must be a Parameter")
-        if tuple(weight.shape) != (160, 6144) or weight.dtype != torch.bfloat16:
-            raise ValueError(
-                "packed sparse indexer weight must have BF16 shape [160, 6144]"
-            )
-        if module.wk.bias is not None or module.weights_proj.bias is not None:
-            raise ValueError("packed sparse indexer does not support bias")
-        if tuple(module.weights_proj.parameters()):
-            raise ValueError("packed sparse indexer slice must not own parameters")
-        parameters.add(weight)
-    return parameters
-
-
 def apply_force_balanced_routing(model: nn.Module) -> None:
     """Force MoE token-choice routers into round-robin assignment for balanced-routing checks."""
     logger = get_logger()
@@ -1203,7 +1183,6 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
         "reshard_after_forward": True,
     }
     native_fp8 = getattr(model.config, "fp8_checkpoint", False)
-    replicated_indexer_parameters = packed_sparse_indexer_parameters(model)
 
     hsdp_mesh = parallel_dims.get_mesh("hsdp")
     partial_reshard_mesh: DeviceMesh | None = None
@@ -1215,15 +1194,8 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
         get_logger().info(
             f"Keeping transformer-block parameters sharded across {requested_reshard} ranks until backward"
         )
-    block_fsdp_config = {
-        **fsdp_config,
-        "ignored_params": replicated_indexer_parameters,
-    }
-    native_block_fsdp_config = {
-        **packed_fsdp_config,
-        "reshard_after_forward": True,
-        "ignored_params": replicated_indexer_parameters,
-    }
+    native_block_fsdp_config = {**packed_fsdp_config, "reshard_after_forward": True}
+
     dp_mod_ep_mesh: DeviceMesh | None = None
     if parallel_dims.ep_enabled:
         dp_mod_ep_mesh_dim_names = []
@@ -1283,7 +1255,7 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
         fully_shard(
             transformer_block,
             mesh=hsdp_mesh,
-            **(native_block_fsdp_config if native_fp8 else block_fsdp_config),
+            **(native_block_fsdp_config if native_fp8 else fsdp_config),
         )
         if native_fp8:
             install_w8a16_reshard_wait(transformer_block)
@@ -1328,7 +1300,6 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
         mp_policy=mp_policy,
         offload_policy=offload_policy,
         reshard_after_forward=fsdp_config["reshard_after_forward"],
-        ignored_params=replicated_indexer_parameters,
     )
 
     if not parallel_dims.ep_enabled:
