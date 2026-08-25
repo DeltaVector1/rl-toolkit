@@ -8082,7 +8082,8 @@ def start(
         env = (
             f"{isolated_env}trainer_nodes='{trainer_nodes}' RUN={run} RUN_NAME={name} "
             f"TRAINER_CONFIG={trainer_config} PRIME_EP_PROFILE=0 PRIME_EP_AC_CACHE=0 "
-            "PRIME_INT4_COMBINE_ROUNDS=8 PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD=1"
+            "PRIME_INT4_COMBINE_ROUNDS=8 PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD=1 "
+            "PRIME_NCCL_CHANNELS=16"
         )
 
     def launch_trainer():
@@ -8517,7 +8518,7 @@ def qualify(
         f"TRAINER_CONFIG={remote_repo}/{relative_config} "
         f"{qualification_env}"
         "PRIME_EP_PROFILE=0 PRIME_EP_AC_CACHE=0 PRIME_INT4_COMBINE_ROUNDS=1 "
-        "PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD=0"
+        "PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD=0 PRIME_NCCL_CHANNELS=16"
     )
     if resume_adapter is not None:
         env += (

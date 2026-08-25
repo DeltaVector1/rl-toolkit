@@ -2580,6 +2580,7 @@ raise SystemExit(99)
             "configs/qualification/glm52-native-small.toml",
             launch,
         )
+        self.assertIn("PRIME_NCCL_CHANNELS=16", launch)
 
     def test_qualification_launch_reports_launcher_error(self):
         def fake_ssh(host, command, timeout=120):
