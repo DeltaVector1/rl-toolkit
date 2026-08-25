@@ -1051,11 +1051,92 @@ class ParityRouterTraceTest(unittest.TestCase):
         with patch.dict(os.environ, environment, clear=True):
             trainer = diagnostic_capture_preflight(metadata, "trainer")
             h200 = diagnostic_capture_preflight(metadata, "h200")
-        self.assertEqual(trainer["files"], 18)
-        self.assertEqual(trainer["estimated_bytes"], 89_296_896)
-        self.assertEqual(h200["files"], 24)
-        self.assertEqual(h200["estimated_bytes"], 96_784_384)
+        self.assertEqual(trainer["files"], 23)
+        self.assertEqual(trainer["estimated_bytes"], 90_902_528)
+        self.assertEqual(h200["files"], 29)
+        self.assertEqual(h200["estimated_bytes"], 98_390_016)
         self.assertEqual(len(h200["names"]), len(set(h200["names"])))
+        self.assertIn("layer3_shared_output_full", trainer["names"])
+        self.assertNotIn("layer3_shared_output_local_tp0", trainer["names"])
+        self.assertIn("layer3_shared_output_local_tp0", h200["names"])
+        self.assertNotIn("layer3_shared_output_full", h200["names"])
+
+    def test_compact_bfloat16_diagnostic_preserves_raw_bits(self):
+        bfloat16 = object()
+        torch = fake_torch()
+        torch.bfloat16 = bfloat16
+        torch.uint16 = np.uint16
+
+        class ExactBfloat16Tensor:
+            dtype = bfloat16
+            ndim = 2
+            shape = (2, 3)
+
+            def __init__(self):
+                self.bits = np.asarray(
+                    [[0x3F80, 0xBF80, 0x7F80], [0x0000, 0x8000, 0x7FC1]],
+                    dtype=np.uint16,
+                )
+
+            def detach(self):
+                return self
+
+            def reshape(self, *_shape):
+                return self
+
+            def __getitem__(self, _key):
+                return self
+
+            def to(self, *, device=None):
+                self.device = device
+                return self
+
+            def contiguous(self):
+                return self
+
+            def view(self, dtype):
+                self.dtype = dtype
+                return FakeTensor(self.bits)
+
+        value = ExactBfloat16Tensor()
+        with patch.dict(sys.modules, {"torch": torch}):
+            array, _source_dtype = parity_trace._diagnostic_array(
+                value, 2, preserve_bfloat16=True
+            )
+        np.testing.assert_array_equal(array, value.bits)
+
+    def test_internal_dense_hooks_require_exact_topology(self):
+        class HookTarget:
+            def __init__(self):
+                self.forward_hooks = []
+                self.pre_hooks = []
+
+            def register_forward_hook(self, hook):
+                self.forward_hooks.append(hook)
+                return types.SimpleNamespace(remove=lambda: None)
+
+            def register_forward_pre_hook(self, hook):
+                self.pre_hooks.append(hook)
+                return types.SimpleNamespace(remove=lambda: None)
+
+        trainer = HookTarget()
+        trainer.gate_proj = HookTarget()
+        trainer.up_proj = HookTarget()
+        trainer.down_proj = HookTarget()
+        h200 = HookTarget()
+        h200.gate_up_proj = HookTarget()
+        h200.act_fn = HookTarget()
+        h200.down_proj = HookTarget()
+        with patch.object(parity_trace, "_diagnostic_hooks", []):
+            parity_trace._install_trainer_dense_diagnostics(trainer)
+            parity_trace._install_h200_dense_diagnostics(h200)
+        self.assertEqual(len(trainer.pre_hooks), 1)
+        self.assertEqual(len(trainer.gate_proj.forward_hooks), 1)
+        self.assertEqual(len(trainer.up_proj.forward_hooks), 1)
+        self.assertEqual(len(trainer.down_proj.pre_hooks), 1)
+        self.assertEqual(len(h200.pre_hooks), 1)
+        self.assertEqual(len(h200.gate_up_proj.forward_hooks), 1)
+        self.assertEqual(len(h200.act_fn.forward_hooks), 1)
 
     def test_diagnostic_plan_refuses_existing_cap_overflow(self):
         metadata = TraceSession(
@@ -1071,7 +1152,7 @@ class ParityRouterTraceTest(unittest.TestCase):
             "PRIME_PARITY_DIAGNOSTICS": "1",
             "PRIME_PARITY_DIAGNOSTIC_TOKENS": "256",
             "PRIME_PARITY_DIAGNOSTIC_MAX_FILES": "64",
-            "PRIME_PARITY_DIAGNOSTIC_MAX_BYTES": "96485375",
+            "PRIME_PARITY_DIAGNOSTIC_MAX_BYTES": "98390015",
         }
         with patch.dict(os.environ, environment, clear=True), self.assertRaisesRegex(
             ValueError, "exceeds"
@@ -1195,8 +1276,11 @@ class ParityRouterTraceTest(unittest.TestCase):
                     filename = (
                         "h200-rank-0-pp-0-cp-0-diagnostic-" f"{kind}.npz"
                     )
+                    compact = kind.startswith(
+                        ("layer0_dense_", "layer3_shared_", "layer3_moe_combined")
+                    )
                     values = np.full(
-                        semantic["shape"], float(index), dtype=np.float32
+                        semantic["shape"], index, dtype=np.uint16 if compact else np.float32
                     )
                     np.savez(
                         trace / filename,
@@ -1256,7 +1340,7 @@ class ParityRouterTraceTest(unittest.TestCase):
                 )
             copied = output / retained["entries"][0]["file"]
             self.assertTrue(copied.is_file())
-            self.assertEqual(retained["files"], 24)
+            self.assertEqual(retained["files"], 29)
             self.assertEqual(retained["binding"], binding)
             with np.load(copied, allow_pickle=False) as stored:
                 self.assertEqual(stored["values"].dtype, np.float32)
@@ -1277,11 +1361,33 @@ class ParityRouterTraceTest(unittest.TestCase):
                     ),
                     current_names,
                 )
+                previous_names = {
+                    name
+                    for name in current_names
+                    if not name.startswith(
+                        ("layer0_dense_", "layer3_shared_", "layer3_moe_combined")
+                    )
+                }
                 legacy_names = (
-                    current_names - parity_script.legacy_h200_missing_diagnostics
+                    previous_names - parity_script.legacy_h200_missing_diagnostics
                 )
-                self.assertEqual(len(current_names), 24)
+                self.assertEqual(len(current_names), 29)
+                self.assertEqual(len(previous_names), 24)
                 self.assertEqual(len(legacy_names), 20)
+                old_direct = json.loads(json.dumps(direct))
+                old_direct["diagnostics"]["entries"] = [
+                    entry
+                    for entry in old_direct["diagnostics"]["entries"]
+                    if entry["name"] in previous_names
+                ]
+                with self.assertRaisesRegex(ValueError, "no diagnostic files"):
+                    retain_h200_diagnostics(
+                        old_direct,
+                        root / "old-capture",
+                        trace,
+                        64,
+                        100_000_000,
+                    )
                 self.assertEqual(
                     set(parity_script.accepted_h200_diagnostic_entries(legacy_names)),
                     legacy_names,
@@ -1307,13 +1413,13 @@ class ParityRouterTraceTest(unittest.TestCase):
                 for entry in legacy_manifest["direct_router_diagnostic"][
                     "diagnostics"
                 ]["entries"]
-                if entry["name"] not in parity_script.legacy_h200_missing_diagnostics
+                if entry["name"] in legacy_names
             ]
             legacy_retained = legacy_manifest["retained_diagnostics"]
             legacy_retained["entries"] = [
                 entry
                 for entry in legacy_retained["entries"]
-                if entry["name"] not in parity_script.legacy_h200_missing_diagnostics
+                if entry["name"] in legacy_names
             ]
             legacy_retained["files"] = len(legacy_retained["entries"])
             legacy_retained["bytes"] = sum(

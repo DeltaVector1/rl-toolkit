@@ -3758,6 +3758,21 @@ def _diagnostic_capture_preflight(
     ):
         names.append(name)
         capture_shapes.append((1, width))
+    internal_tokens = 32
+    internal = [
+        ("layer0_dense_input", 6144),
+        ("layer0_dense_gate_up_raw_tp0", 1024),
+        ("layer0_dense_post_silu_tp0", 512),
+        (
+            "layer3_shared_output_full"
+            if side == "trainer"
+            else "layer3_shared_output_local_tp0",
+            6144,
+        ),
+        ("layer3_moe_combined", 6144),
+    ]
+    names.extend(name for name, _width in internal)
+    capture_shapes.extend((internal_tokens, width) for _name, width in internal)
     if side == "h200":
         extra = {
             "layer3_h200_input": 6144,
@@ -3778,9 +3793,10 @@ def _diagnostic_capture_preflight(
         or PurePosixPath(qualification_root).as_posix() != qualification_root
     ):
         raise Refused("diagnostic qualification root is invalid")
+    internal_names = {name for name, _width in internal}
     estimated_bytes = sum(
-        entry_tokens * width * 4 + 64 * 1024
-        for entry_tokens, width in capture_shapes
+        entry_tokens * width * (2 if name in internal_names else 4) + 64 * 1024
+        for name, (entry_tokens, width) in zip(names, capture_shapes, strict=True)
     )
     if len(names) > max_files or estimated_bytes > max_bytes:
         raise Refused("diagnostic capture plan exceeds its configured cap")

@@ -1244,6 +1244,7 @@ diagnostic_file_limit = 16 * 1024 * 1024
 retained_diagnostic_file_limit = 64
 retained_diagnostic_byte_limit = 100_000_000
 retained_diagnostic_tokens = 256
+internal_diagnostic_tokens = 32
 retained_diagnostic_members = {
     "values.npy",
     "session_identity.npy",
@@ -1451,6 +1452,15 @@ def expected_h200_diagnostic_entries() -> dict[str, dict[str, Any]]:
             ("layer3_h200_route_weights", retained_diagnostic_tokens, 8, "torch.float32"),
         )
     )
+    semantics.extend(
+        (
+            ("layer0_dense_input", internal_diagnostic_tokens, 6144, "torch.bfloat16"),
+            ("layer0_dense_gate_up_raw_tp0", internal_diagnostic_tokens, 1024, "torch.bfloat16"),
+            ("layer0_dense_post_silu_tp0", internal_diagnostic_tokens, 512, "torch.bfloat16"),
+            ("layer3_shared_output_local_tp0", internal_diagnostic_tokens, 6144, "torch.bfloat16"),
+            ("layer3_moe_combined", internal_diagnostic_tokens, 6144, "torch.bfloat16"),
+        )
+    )
     return {
         f"{name}-rank-0-pp-0-cp-0": {
             "shape": [tokens, width],
@@ -1475,11 +1485,20 @@ def accepted_h200_diagnostic_entries(
     names: set[str],
 ) -> dict[str, dict[str, Any]]:
     current = expected_h200_diagnostic_entries()
-    if len(current) != 24 or not legacy_h200_missing_diagnostics < set(current):
+    if len(current) != 29 or not legacy_h200_missing_diagnostics < set(current):
         raise RuntimeError("H200 diagnostic plan changed without a schema update")
     if names == set(current):
         return current
-    legacy_names = set(current) - legacy_h200_missing_diagnostics
+    previous = {
+        name
+        for name in current
+        if not name.startswith(("layer0_dense_", "layer3_shared_", "layer3_moe_combined"))
+    }
+    if len(previous) != 24:
+        raise RuntimeError("previous H200 diagnostic plan is invalid")
+    if names == previous:
+        return {name: current[name] for name in current if name in previous}
+    legacy_names = previous - legacy_h200_missing_diagnostics
     if len(legacy_names) != 20:
         raise RuntimeError("legacy H200 diagnostic plan is invalid")
     if names == legacy_names:
@@ -1518,9 +1537,13 @@ def validate_retained_diagnostic_content_fd(
         stored_binding = {
             name: str(values.get(name, "").item()) for name in binding
         }
+    compact_bfloat16 = (
+        stored_dtype == "torch.bfloat16"
+        and stored_name.startswith(("layer0_dense_", "layer3_shared_", "layer3_moe_combined"))
+    )
     if (
-        array.dtype != np.dtype("float32")
-        or not np.isfinite(array).all()
+        array.dtype != np.dtype("uint16" if compact_bfloat16 else "float32")
+        or (not compact_bfloat16 and not np.isfinite(array).all())
         or list(array.shape) != entry["shape"]
         or stored_name != entry["name"]
         or stored_dtype != entry["source_dtype"]
@@ -1699,11 +1722,14 @@ def retain_h200_diagnostics(
 ) -> dict[str, Any]:
     diagnostics = result.get("diagnostics")
     binding = h200_diagnostic_binding(result)
-    plan = expected_h200_diagnostic_entries()
     if not isinstance(diagnostics, dict):
         raise ValueError("H200 diagnostic response has no diagnostic manifest")
     entries = diagnostics.get("entries")
-    if not isinstance(entries, list) or len(entries) != len(plan):
+    if not isinstance(entries, list):
+        raise ValueError("H200 diagnostic response has no diagnostic files")
+    plan = expected_h200_diagnostic_entries()
+    entry_names = {entry.get("name") for entry in entries if isinstance(entry, dict)}
+    if len(entries) != len(plan) or entry_names != set(plan):
         raise ValueError("H200 diagnostic response has no diagnostic files")
     if (
         isinstance(max_files, bool)

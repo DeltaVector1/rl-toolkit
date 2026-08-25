@@ -46,6 +46,13 @@ diagnostic_max_bytes_env = "PRIME_PARITY_DIAGNOSTIC_MAX_BYTES"
 diagnostic_hidden_width = 6144
 diagnostic_max_request_bytes = 16 * 1024 * 1024
 diagnostic_npz_overhead_bytes = 64 * 1024
+internal_diagnostic_tokens = 32
+
+
+def _compact_internal_diagnostic(name: str) -> bool:
+    return name.startswith(("layer0_dense_", "layer3_moe_", "layer3_shared_"))
+
+
 diagnostic_token0_widths = {
     "layer0_normalized_input": 6144,
     "layer0_kv_before_norm": 512,
@@ -439,6 +446,20 @@ def diagnostic_capture_preflight(session: TraceSession, side: str) -> dict[str, 
     hidden_names.append(f"layer{session.dense_layers}_router_input")
     plan = [(name, diagnostic_hidden_width, limits["tokens"]) for name in hidden_names]
     plan.extend((name, width, 1) for name, width in diagnostic_token0_widths.items())
+    shared_output_name = (
+        "layer3_shared_output_full"
+        if side == "trainer"
+        else "layer3_shared_output_local_tp0"
+    )
+    plan.extend(
+        (
+            ("layer0_dense_input", 6144, internal_diagnostic_tokens),
+            ("layer0_dense_gate_up_raw_tp0", 1024, internal_diagnostic_tokens),
+            ("layer0_dense_post_silu_tp0", 512, internal_diagnostic_tokens),
+            (shared_output_name, 6144, internal_diagnostic_tokens),
+            ("layer3_moe_combined", 6144, internal_diagnostic_tokens),
+        )
+    )
     if side == "h200":
         plan.extend(
             (
@@ -454,7 +475,7 @@ def diagnostic_capture_preflight(session: TraceSession, side: str) -> dict[str, 
     if len(names) != len(set(names)):
         raise ValueError("diagnostic capture plan contains duplicate semantic files")
     estimated_bytes = sum(
-        tokens * width * np.dtype(np.float32).itemsize
+        tokens * width * (2 if _compact_internal_diagnostic(_name) else 4)
         + diagnostic_npz_overhead_bytes
         for _name, width, tokens in plan
     )
@@ -1385,21 +1406,31 @@ def publish_trainer_bundle(
         raise RuntimeError("trainer provenance bundle failed on trainer head")
 
 
-def _diagnostic_array(value: Any, limit: int) -> tuple[np.ndarray, str]:
+def _diagnostic_array(
+    value: Any, limit: int, preserve_bfloat16: bool = False
+) -> tuple[np.ndarray, str]:
     tensor = value.detach()
     source_dtype = str(getattr(tensor, "dtype", "unknown"))
     if getattr(tensor, "ndim", 0) < 2:
         raise ValueError("diagnostic tensor must have at least two dimensions")
     tensor = tensor.reshape(-1, tensor.shape[-1])[:limit]
-    tensor = tensor.to(dtype=__import__("torch").float32, device="cpu")
+    torch = __import__("torch")
+    if preserve_bfloat16:
+        if tensor.dtype != torch.bfloat16:
+            raise TypeError("compact diagnostic input must be BF16")
+        tensor = tensor.to(device="cpu").contiguous().view(torch.uint16)
+    else:
+        tensor = tensor.to(dtype=torch.float32, device="cpu")
     array = np.ascontiguousarray(tensor.numpy())
-    if array.ndim != 2 or not np.isfinite(array).all():
+    if array.ndim != 2 or (
+        not preserve_bfloat16 and not np.isfinite(array).all()
+    ):
         raise ValueError("diagnostic tensor is invalid")
     return array, source_dtype
 
 
 def _diagnostic_tensor_metadata(
-    value: Any, limit: int, expected_width: int | None
+    value: Any, limit: int, expected_width: int | None, item_size: int = 4
 ) -> tuple[int, str, int]:
     tensor = value.detach()
     shape = tuple(int(item) for item in getattr(tensor, "shape", ()))
@@ -1412,7 +1443,7 @@ def _diagnostic_tensor_metadata(
     if token_count < 1:
         raise ValueError("diagnostic tensor has no tokens")
     source_dtype = str(getattr(tensor, "dtype", "unknown"))
-    estimated_bytes = token_count * shape[-1] * 4 + diagnostic_npz_overhead_bytes
+    estimated_bytes = token_count * shape[-1] * item_size + diagnostic_npz_overhead_bytes
     return token_count, source_dtype, estimated_bytes
 
 
@@ -1422,6 +1453,7 @@ def write_hidden_diagnostic(
     *,
     expected_width: int | None = diagnostic_hidden_width,
     token_limit: int | None = None,
+    preserve_bfloat16: bool = False,
 ) -> None:
     """Write one bounded activation capture when explicitly enabled."""
     global _diagnostic_files, _diagnostic_bytes, _diagnostic_session
@@ -1453,7 +1485,7 @@ def write_hidden_diagnostic(
             _diagnostic_bytes = 0
             _diagnostic_session = session_identity
         token_count, source_dtype, estimated_bytes = _diagnostic_tensor_metadata(
-            value, token_limit, expected_width
+            value, token_limit, expected_width, 2 if preserve_bfloat16 else 4
         )
         filename = (
             f"{_process_side}-rank-{_process_rank}-pp-{_process_pp_rank}-"
@@ -1489,7 +1521,9 @@ def write_hidden_diagnostic(
                 or existing_bytes + estimated_bytes > limits["max_bytes"]
             ):
                 raise ValueError("parity diagnostic file or byte limit exceeded")
-            array, source_dtype = _diagnostic_array(value, token_limit)
+            array, source_dtype = _diagnostic_array(
+                value, token_limit, preserve_bfloat16
+            )
             if array.shape[0] != token_count:
                 raise ValueError("diagnostic tensor changed during capture")
             temporary = root / f".{filename}.{os.getpid()}"
@@ -1827,6 +1861,131 @@ def _install_layer0_token_diagnostics(layer: Any) -> None:
     )
 
 
+def _diagnostic_output_tensor(output: Any, label: str) -> Any:
+    if hasattr(output, "detach"):
+        return output
+    if isinstance(output, tuple) and output and hasattr(output[0], "detach"):
+        return output[0]
+    raise ValueError(f"{label} output is not a tensor")
+
+
+def _capture_named_output(kind: str, width: int, output: Any) -> None:
+    write_hidden_diagnostic(
+        kind,
+        _diagnostic_output_tensor(output, kind),
+        expected_width=width,
+        token_limit=internal_diagnostic_tokens,
+        preserve_bfloat16=True,
+    )
+
+
+def _capture_named_input(kind: str, width: int, inputs: Any) -> None:
+    if not isinstance(inputs, tuple) or not inputs or not hasattr(inputs[0], "detach"):
+        raise ValueError(f"{kind} input is not a tensor")
+    write_hidden_diagnostic(
+        kind,
+        inputs[0],
+        expected_width=width,
+        token_limit=internal_diagnostic_tokens,
+        preserve_bfloat16=True,
+    )
+
+
+def _install_trainer_dense_diagnostics(module: Any) -> None:
+    gate = getattr(module, "gate_proj", None)
+    up = getattr(module, "up_proj", None)
+    down = getattr(module, "down_proj", None)
+    if any(item is None for item in (gate, up, down)):
+        raise ValueError("layer 0 cannot find trainer dense projections")
+    projection_state: dict[str, Any] = {}
+    _diagnostic_hooks.append(
+        module.register_forward_pre_hook(
+            lambda _module, inputs: _capture_named_input(
+                "layer0_dense_input", 6144, inputs
+            )
+        )
+    )
+    _diagnostic_hooks.append(
+        gate.register_forward_hook(
+            lambda _module, _inputs, output: projection_state.__setitem__(
+                "gate", _diagnostic_output_tensor(output, "layer 0 dense gate")
+            )
+        )
+    )
+
+    def capture_up(_module: Any, _inputs: Any, output: Any) -> None:
+        gate_output = projection_state.pop("gate", None)
+        if gate_output is None:
+            raise ValueError("layer 0 dense gate output was not captured")
+        up_output = _diagnostic_output_tensor(output, "layer 0 dense up")
+        if gate_output.shape[-1] != 4096 or up_output.shape[-1] != 4096:
+            raise ValueError("layer 0 trainer dense projection width is not 4096")
+        packed = __import__("torch").cat(
+            (gate_output[..., :512], up_output[..., :512]), dim=-1
+        )
+        _capture_named_output("layer0_dense_gate_up_raw_tp0", 1024, packed)
+
+    _diagnostic_hooks.append(up.register_forward_hook(capture_up))
+
+    def capture_post_silu(_module: Any, inputs: Any) -> None:
+        value = _diagnostic_output_tensor(inputs, "layer 0 dense post-SiLU")
+        if value.shape[-1] != 4096:
+            raise ValueError("layer 0 trainer post-SiLU width is not 4096")
+        _capture_named_output("layer0_dense_post_silu_tp0", 512, value[..., :512])
+
+    _diagnostic_hooks.append(down.register_forward_pre_hook(capture_post_silu))
+
+
+def _install_h200_dense_diagnostics(module: Any) -> None:
+    gate_up = getattr(module, "gate_up_proj", None)
+    activation = getattr(module, "act_fn", None)
+    down = getattr(module, "down_proj", None)
+    if any(item is None for item in (gate_up, activation, down)):
+        raise ValueError("layer 0 cannot find H200 dense projections")
+    _diagnostic_hooks.append(
+        module.register_forward_pre_hook(
+            lambda _module, inputs: _capture_named_input(
+                "layer0_dense_input", 6144, inputs
+            )
+        )
+    )
+
+    def capture_gate_up(_module: Any, _inputs: Any, output: Any) -> None:
+        packed = _diagnostic_output_tensor(output, "layer 0 packed gate/up")
+        if packed.shape[-1] != 1024:
+            raise ValueError("layer 0 packed gate/up width is not 1024")
+        _capture_named_output("layer0_dense_gate_up_raw_tp0", 1024, packed)
+
+    _diagnostic_hooks.append(gate_up.register_forward_hook(capture_gate_up))
+    _diagnostic_hooks.append(
+        activation.register_forward_hook(
+            lambda _module, _inputs, output: _capture_named_output(
+                "layer0_dense_post_silu_tp0", 512, output
+            )
+        )
+    )
+
+
+def _install_h200_moe_diagnostics(module: Any) -> None:
+    shared = getattr(module, "shared_experts", None)
+    if shared is None:
+        raise ValueError("layer 3 H200 diagnostics cannot find the shared expert")
+    _diagnostic_hooks.append(
+        shared.register_forward_hook(
+            lambda _module, _inputs, output: _capture_named_output(
+                "layer3_shared_output_local_tp0", 6144, output
+            )
+        )
+    )
+    _diagnostic_hooks.append(
+        module.register_forward_hook(
+            lambda _module, _inputs, output: _capture_named_output(
+                "layer3_moe_combined", 6144, output
+            )
+        )
+    )
+
+
 def configure_hidden_diagnostics(
     language_model: Any, layer_start: int, layer_end: int
 ) -> None:
@@ -1847,7 +2006,27 @@ def configure_hidden_diagnostics(
     items = layers.items() if hasattr(layers, "items") else enumerate(layers)
     for raw_layer, layer in items:
         layer_number = int(getattr(layer, "layer_idx", raw_layer))
-        if layer_number < layer_start or layer_number >= layer_end or layer_number > 2:
+        if layer_number < layer_start or layer_number >= layer_end or layer_number > 3:
+            continue
+        if layer_number == 3:
+            mlp = getattr(layer, "mlp", None)
+            shared = getattr(mlp, "shared_expert", None)
+            if mlp is None or shared is None:
+                raise ValueError("trainer layer 3 MoE diagnostic modules are missing")
+            _diagnostic_hooks.append(
+                shared.register_forward_hook(
+                    lambda _module, _inputs, output: _capture_named_output(
+                        "layer3_shared_output_full", 6144, output
+                    )
+                )
+            )
+            _diagnostic_hooks.append(
+                mlp.register_forward_hook(
+                    lambda _module, _inputs, output: _capture_named_output(
+                        "layer3_moe_combined", 6144, output
+                    )
+                )
+            )
             continue
         attention = getattr(layer, "self_attn", None)
         if attention is not None:
@@ -1883,6 +2062,9 @@ def configure_hidden_diagnostics(
         )
         if layer_number == 0:
             _install_layer0_token_diagnostics(layer)
+            if mlp is None:
+                raise ValueError("trainer layer 0 dense MLP is missing")
+            _install_trainer_dense_diagnostics(mlp)
 
 
 def _capture_h200_attention_boundary(
@@ -1946,10 +2128,10 @@ def configure_h200_boundary_diagnostics(model: Any) -> None:
     selected: dict[int, Any] = {}
     for raw_layer, layer in layer_items:
         layer_number = int(getattr(layer, "layer_idx", raw_layer))
-        if layer_number in {0, 1, 2}:
+        if layer_number in {0, 1, 2, 3}:
             selected[layer_number] = layer
-    if set(selected) != {0, 1, 2}:
-        raise ValueError("H200 diagnostics require local logical layers 0, 1, and 2")
+    if set(selected) != {0, 1, 2, 3}:
+        raise ValueError("H200 diagnostics require local logical layers 0 through 3")
     for layer_number in range(3):
         layer = selected[layer_number]
         if not hasattr(layer, "register_forward_pre_hook"):
@@ -1992,6 +2174,8 @@ def configure_h200_boundary_diagnostics(model: Any) -> None:
         )
         if layer_number == 0:
             _install_layer0_token_diagnostics(layer)
+            _install_h200_dense_diagnostics(mlp)
+    _install_h200_moe_diagnostics(getattr(selected[3], "mlp", None))
 
 
 def _lifecycle_path(root: Path, rank: int) -> Path:
