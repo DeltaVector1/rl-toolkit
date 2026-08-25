@@ -7945,6 +7945,16 @@ def deploy(path: str, nodes: list[str] | None = None) -> bool:
 
     def one(h):
         staging = f"/tmp/training-ops-{want}-{Path(path).name}"
+        check = (
+            f"if test -f {shlex.quote(remote)}; then "
+            f"sha256sum {shlex.quote(remote)} | cut -d' ' -f1; "
+            f"else printf MISSING; fi"
+        )
+        rc, observed = _ssh(h, check, timeout=60)
+        if rc:
+            return f"remote preflight failed: {observed.strip()[:120]}"
+        if observed.strip() == want:
+            return "ok"
         try:
             p = subprocess.run(
                 [

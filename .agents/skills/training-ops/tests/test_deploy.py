@@ -1,6 +1,7 @@
 import hashlib
 import tempfile
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -297,6 +298,72 @@ class DeployTest(unittest.TestCase):
                 self.assertTrue(training_ops.deploy("configs/runtime/test.toml"))
 
             self.assertCountEqual(copied_to, training_ops.inference_hosts)
+
+    def test_deploy_skips_scp_when_remote_file_matches(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            local = repo / "source" / "mounted.py"
+            local.parent.mkdir(parents=True)
+            local.write_text("current\n")
+            want = hashlib.sha256(local.read_bytes()).hexdigest()
+
+            with (
+                patch.object(training_ops, "repo_root", repo),
+                patch.object(training_ops, "_mounted_on", return_value=True),
+                patch.object(
+                    training_ops,
+                    "_ssh",
+                    return_value=(0, want),
+                ) as ssh,
+                patch.object(
+                    training_ops,
+                    "_ssh_control_masters",
+                    return_value=nullcontext(),
+                ),
+                patch.object(training_ops.subprocess, "run") as run,
+            ):
+                self.assertTrue(training_ops.deploy("source/mounted.py", nodes=["n78"]))
+
+            run.assert_not_called()
+            ssh.assert_called_once()
+
+    def test_deploy_copies_when_remote_file_differs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            local = repo / "source" / "mounted.py"
+            local.parent.mkdir(parents=True)
+            local.write_text("current\n")
+            want = hashlib.sha256(local.read_bytes()).hexdigest()
+            copied_to = []
+
+            def fake_run(command, **kwargs):
+                del kwargs
+                if command[0] == "scp":
+                    copied_to.append(command[-1].split(":", 1)[0])
+                return Mock(returncode=0, stdout="", stderr="")
+
+            def fake_ssh(host, command, timeout=120):
+                del host, timeout
+                if command.startswith("if test -f "):
+                    return 0, "different"
+                if command.startswith("test -f "):
+                    return 0, want
+                return 0, ""
+
+            with (
+                patch.object(training_ops, "repo_root", repo),
+                patch.object(training_ops, "_mounted_on", return_value=True),
+                patch.object(training_ops, "_ssh", side_effect=fake_ssh),
+                patch.object(
+                    training_ops,
+                    "_ssh_control_masters",
+                    return_value=nullcontext(),
+                ),
+                patch.object(training_ops.subprocess, "run", side_effect=fake_run),
+            ):
+                self.assertTrue(training_ops.deploy("source/mounted.py", nodes=["n83"]))
+
+            self.assertEqual(copied_to, ["n83"])
 
 if __name__ == "__main__":
     unittest.main()
