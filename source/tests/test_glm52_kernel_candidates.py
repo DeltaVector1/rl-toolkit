@@ -1,0 +1,69 @@
+"""Static gates for opt-in GLM-5.2 kernel candidates.
+
+These tests do not import CUDA or vLLM.  The production-shaped benchmark must
+run on an idle RTX 4090 after the candidate is compiled in isolation.
+"""
+
+from pathlib import Path
+import unittest
+
+
+ROOT = Path(__file__).resolve().parents[1]
+FP8_SOURCE = (ROOT / "src/prime_rl/trainer/models/layers/fp8_ada.py").read_text()
+SPARSE_BWD_SOURCE = (
+    ROOT / "src/prime_rl/trainer/models/kernels/sparse_mla_bwd.py"
+).read_text()
+
+
+class GLM52KernelCandidateTest(unittest.TestCase):
+    def test_candidates_are_disabled_by_default(self):
+        self.assertIn('"PRIME_FP8_EXPERT_TRITON_SCATTER", "0"', FP8_SOURCE)
+        self.assertIn('"PRIME_FP8_LORA_W2_LOW_RANK_REUSE", "0"', FP8_SOURCE)
+        self.assertIn(
+            'os.environ.get("PRIME_SPARSE_BWD_VARIANT", "baseline")',
+            SPARSE_BWD_SOURCE,
+        )
+
+    def test_scatter_candidate_validates_permuted_rows(self):
+        helper = FP8_SOURCE.split(
+            "def _index_copy_real_rows_with_cache_retry", 1
+        )[1].split("\n\ndef _grouped_mm_pair_chunks", 1)[0]
+        self.assertIn("_expert_scatter_kernel", helper)
+        self.assertIn("indices.dtype != torch.int64", helper)
+        self.assertIn("indices.shape != (source.shape[0],)", helper)
+        self.assertIn("destination.device.type != \"cuda\"", helper)
+        self.assertIn("return destination", helper)
+
+    def test_low_rank_reuse_is_host_saved_and_backward_optional(self):
+        forward = FP8_SOURCE.split(
+            "class _InplacePermutedLoRAExperts", 1
+        )[1].split("    @staticmethod\n    def backward", 1)[0]
+        backward = FP8_SOURCE.split(
+            "class _InplacePermutedLoRAExperts", 1
+        )[1].split("    @staticmethod\n    def backward", 1)[1].split(
+            "\n\nclass _ScaleRoutedOutput", 1
+        )[0]
+        self.assertIn("reuse_w2_low_rank", forward)
+        self.assertIn("w2_low_rank_host", forward)
+        self.assertIn("pin_memory=True", forward)
+        self.assertIn("low_rank=saved_w2_low_rank", backward)
+        self.assertIn("if low_rank is None", FP8_SOURCE)
+
+    def test_sparse_bh32_candidate_does_not_change_forward(self):
+        self.assertIn('variant not in {"baseline", "bh32"}', SPARSE_BWD_SOURCE)
+        self.assertIn('variant == "bh32"', SPARSE_BWD_SOURCE)
+        self.assertEqual(SPARSE_BWD_SOURCE.count("PRIME_SPARSE_BWD_VARIANT"), 2)
+
+    def test_w2_chunk_candidate_has_bounded_values(self):
+        self.assertIn(
+            'os.environ.get("PRIME_FP8_W2_CHUNK_ROWS", "2048")',
+            FP8_SOURCE,
+        )
+        self.assertIn(
+            '_FP8_W2_CHUNK_ROWS_VALUE not in {"2048", "4096"}',
+            FP8_SOURCE,
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

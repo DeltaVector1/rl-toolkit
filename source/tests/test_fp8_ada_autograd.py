@@ -244,6 +244,67 @@ class FP8AdaAutogradTest(unittest.TestCase):
                 torch.zeros(1, 8, 16, dtype=torch.bfloat16),
             )
 
+    def test_grouped_lora_backward_accepts_saved_low_rank(self):
+        torch.manual_seed(17)
+        offsets = torch.tensor([2, 2, 7], dtype=torch.int32)
+        x = torch.randn(7, 40, dtype=torch.bfloat16)
+        a = torch.randn(3, 32, 40, dtype=torch.bfloat16)
+        b = torch.randn(3, 48, 32, dtype=torch.bfloat16)
+        grad = torch.randn(7, 48, dtype=torch.bfloat16)
+
+        def dense_grouped(value, weights, *, offs):
+            output = torch.empty(value.shape[0], weights.shape[2], dtype=value.dtype)
+            start = 0
+            for expert, end in enumerate(offs.tolist()):
+                output[start:end] = value[start:end] @ weights[expert]
+                start = end
+            return output
+
+        def dense_outer(left, right, chunk_offsets, output):
+            start = 0
+            for expert, end in enumerate(chunk_offsets.tolist()):
+                output[expert].add_(left[start:end].T @ right[start:end])
+                start = end
+
+        with mock.patch.object(torch, "_grouped_mm", dense_grouped):
+            output, saved_low_rank = fp8_ada._grouped_lora_projection_with_low_rank(
+                x, a, b, offsets
+            )
+            grad_a = torch.zeros_like(a)
+            grad_b = torch.zeros_like(b)
+            with mock.patch.object(fp8_ada, "_grouped_outer_accumulate", dense_outer):
+                got = fp8_ada._grouped_lora_backward(
+                    x,
+                    a,
+                    b,
+                    offsets,
+                    grad,
+                    grad_a,
+                    grad_b,
+                    low_rank=saved_low_rank,
+                )
+
+        with torch.enable_grad():
+            x_ref = x.detach().requires_grad_(True)
+            a_ref = a.detach().requires_grad_(True)
+            b_ref = b.detach().requires_grad_(True)
+            expected_output = x_ref.new_empty(x.shape[0], b.shape[1])
+            start = 0
+            for expert, end in enumerate(offsets.tolist()):
+                expected_output[start:end] = (
+                    x_ref[start:end] @ a_ref[expert].T @ b_ref[expert].T
+                )
+                start = end
+            expected = torch.autograd.grad(
+                expected_output,
+                (x_ref, a_ref, b_ref),
+                grad_outputs=grad,
+            )
+
+        for value, reference in zip((got, grad_a, grad_b), expected, strict=True):
+            torch.testing.assert_close(value, reference, rtol=0.02, atol=0.125)
+        self.assertEqual(tuple(saved_low_rank.shape), (7, 32))
+
     def test_dequant_weight_expands_each_128_square_block(self):
         weight = (
             torch.arange(256 * 384, dtype=torch.int32)

@@ -94,7 +94,11 @@ class FP8ExpertBackwardMemoryTest(unittest.TestCase):
 
     def test_forward_expert_workspace_is_bounded_to_4096_rows(self):
         self.assertIn("_FP8_W13_CHUNK_ROWS = 4096", SOURCE)
-        self.assertIn("_FP8_W2_CHUNK_ROWS = 2048", SOURCE)
+        self.assertIn(
+            '"PRIME_FP8_W2_CHUNK_ROWS", "2048"',
+            SOURCE,
+        )
+        self.assertIn("_FP8_W2_CHUNK_ROWS = int(_FP8_W2_CHUNK_ROWS_VALUE)", SOURCE)
 
     def test_expert_row_gather_has_one_cache_recovery_retry(self):
         helper = SOURCE.split(

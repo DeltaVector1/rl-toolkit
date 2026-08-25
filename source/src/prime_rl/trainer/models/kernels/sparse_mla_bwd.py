@@ -325,9 +325,27 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None):
 
     preprocess_kernel = preprocess(H, D)
     if torch.cuda.get_device_capability(q.device)[0] < 9:
+        # The baseline uses 16 heads per tile and 64 threads.  ``bh32`` is an
+        # opt-in SM89 candidate measured separately at the production shape.
+        # It changes only the reduction tile; it does not change the forward
+        # kernel or the attention equation.  Keep the baseline when the
+        # variable is absent so a qualification cannot change by accident.
+        variant = os.environ.get("PRIME_SPARSE_BWD_VARIANT", "baseline")
+        if variant not in {"baseline", "bh32"}:
+            raise ValueError(
+                "PRIME_SPARSE_BWD_VARIANT must be 'baseline' or 'bh32'"
+            )
         block_size = int(os.environ.get("PRIME_SPARSE_BWD_BLOCK_SIZE", "16"))
-        block_heads = int(os.environ.get("PRIME_SPARSE_BWD_BLOCK_HEADS", "16"))
-        threads = int(os.environ.get("PRIME_SPARSE_BWD_THREADS", "64"))
+        if variant == "bh32":
+            block_heads = int(
+                os.environ.get("PRIME_SPARSE_BWD_BLOCK_HEADS", "32")
+            )
+            threads = int(os.environ.get("PRIME_SPARSE_BWD_THREADS", "128"))
+        else:
+            block_heads = int(
+                os.environ.get("PRIME_SPARSE_BWD_BLOCK_HEADS", "16")
+            )
+            threads = int(os.environ.get("PRIME_SPARSE_BWD_THREADS", "64"))
         bwd_kernel = bwd(
             H,
             D,

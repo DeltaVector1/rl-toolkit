@@ -28,12 +28,27 @@ from prime_rl.trainer.models.layers.lm_head import (
 
 block_shape = [128, 128]
 _FP8_W13_CHUNK_ROWS = 4096
-_FP8_W2_CHUNK_ROWS = 2048
+_FP8_W2_CHUNK_ROWS_VALUE = os.environ.get("PRIME_FP8_W2_CHUNK_ROWS", "2048")
+if _FP8_W2_CHUNK_ROWS_VALUE not in {"2048", "4096"}:
+    raise ValueError("PRIME_FP8_W2_CHUNK_ROWS must be 2048 or 4096")
+_FP8_W2_CHUNK_ROWS = int(_FP8_W2_CHUNK_ROWS_VALUE)
 _FP8_EXPERT_BACKWARD_CHUNK_ROWS = 4096
 _FP8_ROUTE_SCALE_CHUNK_ROWS = 4096
 _FP8_EXPERT_ACTIVATION_OFFLOAD = (
     os.environ.get("PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD", "") == "1"
 )
+_EXPERT_TRITON_SCATTER_VALUE = os.environ.get(
+    "PRIME_FP8_EXPERT_TRITON_SCATTER", "0"
+)
+if _EXPERT_TRITON_SCATTER_VALUE not in {"0", "1"}:
+    raise ValueError("PRIME_FP8_EXPERT_TRITON_SCATTER must be 0 or 1")
+_EXPERT_TRITON_SCATTER = _EXPERT_TRITON_SCATTER_VALUE == "1"
+_LORA_W2_LOW_RANK_REUSE_VALUE = os.environ.get(
+    "PRIME_FP8_LORA_W2_LOW_RANK_REUSE", "0"
+)
+if _LORA_W2_LOW_RANK_REUSE_VALUE not in {"0", "1"}:
+    raise ValueError("PRIME_FP8_LORA_W2_LOW_RANK_REUSE must be 0 or 1")
+_LORA_W2_LOW_RANK_REUSE = _LORA_W2_LOW_RANK_REUSE_VALUE == "1"
 _DIAGNOSE_LINEAR_BACKWARD = False
 _REPORTED_LINEAR_BACKWARD: set[tuple[tuple[int, ...], bool, bool]] = set()
 _REPORTED_INPUT_GRAD: set[str] = set()
@@ -131,6 +146,48 @@ def _profile_expert_backward(start, end) -> None:
 
 
 if hasattr(triton, "jit"):
+    @triton.jit
+    def _expert_scatter_kernel(
+        destination,
+        indices,
+        source,
+        destination_rows,
+        columns,
+        destination_row_stride,
+        source_row_stride,
+        BLOCK_COLUMNS: tl.constexpr,
+    ):
+        """Scatter source rows without materializing ``source[real]``.
+
+        The EP permutation contains one destination for each real source row.
+        Invalid alignment rows are read from the zeroed source chunk and are
+        masked at the destination.  The caller enables this kernel only for
+        an isolated benchmark because the first Triton compile adds a small
+        one-time allocation at the full model live set.
+        """
+        source_row = tl.program_id(0)
+        columns_offset = tl.program_id(1) * BLOCK_COLUMNS + tl.arange(
+            0, BLOCK_COLUMNS
+        )
+        destination_row = tl.load(indices + source_row)
+        mask = (
+            (destination_row >= 0)
+            & (destination_row < destination_rows)
+            & (columns_offset < columns)
+        )
+        values = tl.load(
+            source + source_row * source_row_stride + columns_offset,
+            mask=columns_offset < columns,
+            other=0,
+        )
+        tl.store(
+            destination
+            + destination_row * destination_row_stride
+            + columns_offset,
+            values,
+            mask=mask,
+        )
+
     @triton.jit
     def _block_fp8_mm_kernel(
         x,
@@ -310,6 +367,7 @@ if hasattr(triton, "jit"):
         tl.store(output + output_offsets, previous + accumulator, mask=output_mask)
 
 else:
+    _expert_scatter_kernel = None
     _block_fp8_mm_kernel = None
     _w8a16_input_grad_kernel = None
     _grouped_outer_accumulate_kernel = None
@@ -1746,11 +1804,56 @@ def _index_select_rows_with_cache_retry(x, indices):
 def _index_copy_real_rows_with_cache_retry(destination, indices, source, real):
     """Scatter one bounded real-row chunk with one fragmentation retry.
 
-    Keep this on PyTorch's already-loaded indexing path. A custom Triton
-    scatter first encountered a new kernel variant during x79p step 4 and
-    failed while loading its CUDA module at the full model live set. The
-    4,096-row bound limits the boolean source gather to 48 MiB here.
+    The default uses PyTorch's already-loaded indexing path. The opt-in
+    Triton path avoids the boolean source gather, but must be compiled before
+    a production-shaped run because its first compile can allocate memory.
+    The 4,096-row bound limits the source chunk in either path.
     """
+    if _EXPERT_TRITON_SCATTER:
+        if _expert_scatter_kernel is None:
+            raise RuntimeError("Triton is unavailable for expert scatter")
+        if (
+            destination.device.type != "cuda"
+            or source.device != destination.device
+            or indices.device != destination.device
+        ):
+            raise ValueError("expert Triton scatter requires one CUDA device")
+        if destination.dtype != source.dtype or not (
+            destination.is_contiguous() and source.is_contiguous()
+        ):
+            raise ValueError("expert Triton scatter requires equal contiguous tensors")
+        if destination.ndim == source.ndim == 1:
+            columns = 1
+            destination_row_stride = source_row_stride = 1
+        elif (
+            destination.ndim == source.ndim == 2
+            and destination.shape[1] == source.shape[1]
+        ):
+            columns = source.shape[1]
+            destination_row_stride = destination.stride(0)
+            source_row_stride = source.stride(0)
+        else:
+            raise ValueError("expert Triton scatter requires equal-width rows")
+        if indices.dtype != torch.int64 or indices.shape != (source.shape[0],):
+            raise ValueError(
+                "expert Triton scatter requires one INT64 index per source row"
+            )
+        block_columns = 1024
+        _expert_scatter_kernel[
+            (source.shape[0], triton.cdiv(columns, block_columns))
+        ](
+            destination,
+            indices,
+            source,
+            destination.shape[0],
+            columns,
+            destination_row_stride,
+            source_row_stride,
+            BLOCK_COLUMNS=block_columns,
+            num_warps=8,
+        )
+        return destination
+
     try:
         destination.index_copy_(0, indices[real].long(), source[real])
     except torch.OutOfMemoryError:
@@ -2194,6 +2297,22 @@ class _InplacePermutedExperts(torch.autograd.Function):
 
 def _grouped_lora_projection(x, lora_a, lora_b, offsets):
     """Run one expert LoRA projection without changing the FP8 base path."""
+    output, _ = _grouped_lora_projection_with_low_rank(
+        x,
+        lora_a,
+        lora_b,
+        offsets,
+    )
+    return output
+
+
+def _grouped_lora_projection_with_low_rank(x, lora_a, lora_b, offsets):
+    """Return an expert LoRA output and its first GEMM result.
+
+    The first result is small for rank-32 adapters.  The opt-in routed-expert
+    path stores it on pinned host memory and reuses it in backward.  The
+    default path retains the previous recomputation behavior.
+    """
     if x.dtype not in (torch.bfloat16, torch.float16):
         raise TypeError(f"expert LoRA input must be BF16 or FP16, got {x.dtype}")
     if lora_a.dtype != x.dtype or lora_b.dtype != x.dtype:
@@ -2215,10 +2334,13 @@ def _grouped_lora_projection(x, lora_a, lora_b, offsets):
         lora_a.transpose(-2, -1),
         offs=offsets,
     )
-    return torch._grouped_mm(
+    return (
+        torch._grouped_mm(
+            low_rank,
+            lora_b.transpose(-2, -1),
+            offs=offsets,
+        ),
         low_rank,
-        lora_b.transpose(-2, -1),
-        offs=offsets,
     )
 
 
@@ -2279,6 +2401,7 @@ def _grouped_lora_backward(
     grad_output,
     grad_a,
     grad_b,
+    low_rank=None,
 ):
     """Compute one grouped LoRA backward without nested autograd."""
     if grad_output.dtype != x.dtype:
@@ -2292,11 +2415,18 @@ def _grouped_lora_backward(
             f"native expert LoRA backward supports rank 32, got {lora_a.shape[1]}"
         )
 
-    low_rank = torch._grouped_mm(
-        x,
-        lora_a.transpose(-2, -1),
-        offs=offsets,
-    )
+    if low_rank is None:
+        low_rank = torch._grouped_mm(
+            x,
+            lora_a.transpose(-2, -1),
+            offs=offsets,
+        )
+    elif (
+        low_rank.device != x.device
+        or low_rank.dtype != x.dtype
+        or low_rank.shape != (x.shape[0], lora_a.shape[1])
+    ):
+        raise ValueError("saved expert LoRA low-rank activation is invalid")
     low_rank_grad = torch._grouped_mm(
         grad_output,
         lora_b,
@@ -2354,6 +2484,7 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
         save_backward_state = bool(
             getattr(received_input, "save_for_backward", True)
         )
+        reuse_w2_low_rank = _LORA_W2_LOW_RANK_REUSE and save_backward_state
         if save_backward_state:
             q1_host = torch.empty(
                 rows,
@@ -2365,6 +2496,14 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
             q3_host = torch.empty_like(q1_host, pin_memory=True)
             qs1_parts = []
             qs3_parts = []
+            if reuse_w2_low_rank:
+                w2_low_rank_host = torch.empty(
+                    rows,
+                    w2_lora_a.shape[1],
+                    device="cpu",
+                    dtype=x.dtype,
+                    pin_memory=True,
+                )
 
         for start in range(0, rows, chunk_rows):
             end = min(start + chunk_rows, rows)
@@ -2422,21 +2561,23 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                 s2,
                 chunk_offsets,
             )
-            chunk_out.add_(
-                _grouped_lora_projection(
-                    z1,
-                    w2_lora_a,
-                    w2_lora_b,
-                    chunk_offsets,
-                ),
-                alpha=scaling,
+            lora_w2, w2_low_rank = _grouped_lora_projection_with_low_rank(
+                z1,
+                w2_lora_a,
+                w2_lora_b,
+                chunk_offsets,
             )
+            chunk_out.add_(lora_w2, alpha=scaling)
+            if reuse_w2_low_rank:
+                w2_low_rank_host[start:end].copy_(w2_low_rank, non_blocking=True)
             _index_copy_real_rows_with_cache_retry(x, indices, chunk_out, real)
             del (
                 chunk_x,
                 safe_indices,
                 z1,
                 chunk_out,
+                lora_w2,
+                w2_low_rank,
                 indices,
                 real,
                 chunk_offsets,
@@ -2471,20 +2612,38 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
         ctx.row_index_device = row_index_device
         ctx.chunk_rows = min(chunk_rows, _FP8_EXPERT_BACKWARD_CHUNK_ROWS)
         ctx.scaling = scaling
-        ctx.save_for_backward(
-            q1_host,
-            qs1,
-            q3_host,
-            qs3,
-            saved_permuted_indices,
-            offsets,
-            w1_lora_a,
-            w1_lora_b,
-            w2_lora_a,
-            w2_lora_b,
-            w3_lora_a,
-            w3_lora_b,
-        )
+        ctx.reuse_w2_low_rank = reuse_w2_low_rank
+        if reuse_w2_low_rank:
+            ctx.save_for_backward(
+                q1_host,
+                qs1,
+                q3_host,
+                qs3,
+                w2_low_rank_host,
+                saved_permuted_indices,
+                offsets,
+                w1_lora_a,
+                w1_lora_b,
+                w2_lora_a,
+                w2_lora_b,
+                w3_lora_a,
+                w3_lora_b,
+            )
+        else:
+            ctx.save_for_backward(
+                q1_host,
+                qs1,
+                q3_host,
+                qs3,
+                saved_permuted_indices,
+                offsets,
+                w1_lora_a,
+                w1_lora_b,
+                w2_lora_a,
+                w2_lora_b,
+                w3_lora_a,
+                w3_lora_b,
+            )
         ctx.mark_dirty(x)
         return x
 
@@ -2498,20 +2657,37 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
             profile_start = torch.cuda.Event(enable_timing=True)
             profile_end = torch.cuda.Event(enable_timing=True)
             profile_start.record()
-        (
-            q1,
-            qs1,
-            q3,
-            qs3,
-            saved_permuted_indices,
-            offsets,
-            w1_lora_a,
-            w1_lora_b,
-            w2_lora_a,
-            w2_lora_b,
-            w3_lora_a,
-            w3_lora_b,
-        ) = ctx.saved_tensors
+        if ctx.reuse_w2_low_rank:
+            (
+                q1,
+                qs1,
+                q3,
+                qs3,
+                w2_low_rank_host,
+                saved_permuted_indices,
+                offsets,
+                w1_lora_a,
+                w1_lora_b,
+                w2_lora_a,
+                w2_lora_b,
+                w3_lora_a,
+                w3_lora_b,
+            ) = ctx.saved_tensors
+        else:
+            (
+                q1,
+                qs1,
+                q3,
+                qs3,
+                saved_permuted_indices,
+                offsets,
+                w1_lora_a,
+                w1_lora_b,
+                w2_lora_a,
+                w2_lora_b,
+                w3_lora_a,
+                w3_lora_b,
+            ) = ctx.saved_tensors
         owner = ctx.owner
         w1, s1, w2, s2, w3, s3 = (
             getattr(owner.base_layer, name)
@@ -2577,6 +2753,11 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                 s2.transpose(-2, -1),
                 chunk_offsets,
             )
+            saved_w2_low_rank = (
+                w2_low_rank_host[start:end].to(grad.device, non_blocking=True)
+                if ctx.reuse_w2_low_rank
+                else None
+            )
             lora_hidden_grad = _grouped_lora_backward(
                 hidden,
                 w2_lora_a,
@@ -2585,9 +2766,10 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                 grad_chunk.mul(ctx.scaling),
                 parameter_grads[2],
                 parameter_grads[3],
+                low_rank=saved_w2_low_rank,
             )
             hidden_grad.add_(lora_hidden_grad)
-            del lora_hidden_grad, hidden
+            del lora_hidden_grad, hidden, saved_w2_low_rank
 
             z1_grad, z3_grad = _silu_glu_backward_inplace(
                 hidden_grad,
