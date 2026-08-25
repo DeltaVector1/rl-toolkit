@@ -444,6 +444,103 @@ class BF16ExpertInputWorkspace:
             raise ValueError("BF16 expert input workspace does not match the output")
 
 
+class ReceivedFP8ExpertInput:
+    """Own the per-token FP8 payload received by one dispatch call."""
+
+    row_index_device = "cuda"
+
+    __slots__ = ("values", "scales", "columns")
+
+    def __init__(self) -> None:
+        self.values = None
+        self.scales = None
+        self.columns = 0
+
+    def prepare(self, values: torch.Tensor, scales: torch.Tensor) -> None:
+        if self.values is not None or self.scales is not None:
+            raise RuntimeError("received FP8 expert input was prepared more than once")
+        if values.device.type != "cuda" or values.dtype != torch.float8_e4m3fn:
+            raise TypeError("received FP8 expert input must be a CUDA FP8 tensor")
+        if scales.device != values.device or scales.dtype != torch.float32:
+            raise TypeError("received FP8 scales must be CUDA FP32")
+        if values.ndim != 2 or values.shape[1] <= 0:
+            raise ValueError("received FP8 expert input shape is invalid")
+        if scales.ndim != 1 or scales.shape[0] != values.shape[0]:
+            raise ValueError("received FP8 scales shape is invalid")
+        self.values = values
+        self.scales = scales
+        self.columns = values.shape[1]
+
+    def reconstruct_rows(
+        self,
+        row_indices: torch.Tensor,
+        output: torch.Tensor,
+        workspace,
+    ) -> None:
+        if self.values is None or self.scales is None:
+            raise RuntimeError("received FP8 expert input is incomplete")
+        if (
+            row_indices.device != self.values.device
+            or row_indices.dtype != torch.int64
+            or row_indices.ndim != 1
+            or not row_indices.is_contiguous()
+        ):
+            raise ValueError(
+                "received FP8 row indices must be contiguous CUDA INT64"
+            )
+        if output.device.type != "cuda" or output.dtype != torch.bfloat16:
+            raise ValueError(
+                "received FP8 rows must be reconstructed into CUDA BF16 storage"
+            )
+        if output.shape != (row_indices.shape[0], self.columns):
+            raise ValueError("received FP8 reconstruction output has the wrong shape")
+        workspace.check(row_indices.shape[0], self.columns, output.device)
+        if not row_indices.shape[0]:
+            return
+        if not self.values.shape[0]:
+            raise ValueError("cannot reconstruct rows from an empty received FP8 input")
+
+        real_rows = (row_indices >= 0) & (row_indices < self.values.shape[0])
+        safe_indices = row_indices.clamp(0, self.values.shape[0] - 1)
+        values = workspace.values[: row_indices.shape[0]]
+        scales = workspace.scales[: row_indices.shape[0]]
+        torch.index_select(self.values, 0, safe_indices, out=values)
+        torch.index_select(self.scales, 0, safe_indices, out=scales)
+        output.copy_(values.to(output.dtype))
+        output.mul_(scales.to(output.dtype)[:, None])
+        output.masked_fill_((~real_rows).unsqueeze(-1), 0)
+
+    def make_workspace(
+        self, row_capacity: int, device: torch.device
+    ) -> "FP8ExpertInputWorkspace":
+        return FP8ExpertInputWorkspace(row_capacity, self.columns, device)
+
+
+class FP8ExpertInputWorkspace:
+    """Bound GPU scratch for per-token FP8 expert-input reconstruction."""
+
+    __slots__ = ("row_capacity", "columns", "device", "values", "scales")
+
+    def __init__(self, row_capacity: int, columns: int, device: torch.device) -> None:
+        if row_capacity <= 0 or columns <= 0:
+            raise ValueError("FP8 expert input workspace shape is invalid")
+        self.row_capacity = row_capacity
+        self.columns = columns
+        self.device = torch.device(device)
+        if self.device.type != "cuda":
+            raise ValueError("FP8 expert input workspace requires a CUDA device")
+        self.values = torch.empty(
+            (row_capacity, columns), device=self.device, dtype=torch.float8_e4m3fn
+        )
+        self.scales = torch.empty(row_capacity, device=self.device, dtype=torch.float32)
+
+    def check(self, rows: int, columns: int, device: torch.device) -> None:
+        if rows > self.row_capacity:
+            raise ValueError("FP8 expert input workspace row capacity is too small")
+        if columns != self.columns or torch.device(device) != self.device:
+            raise ValueError("FP8 expert input workspace does not match the output")
+
+
 def bf16_expert_transport_memory_bytes(
     input_rows: int,
     output_rows: int,
@@ -950,6 +1047,136 @@ class _BF16Dispatch(torch.autograd.Function):
         return grad_input, None, None, None, None, None
 
 
+def _validate_fp8_dispatch(
+    value: torch.Tensor,
+    output_splits: list[int],
+    input_splits: list[int],
+    group_name: str,
+) -> ProcessGroup:
+    if value.device.type != "cuda" or value.dtype != torch.bfloat16:
+        raise TypeError("FP8 expert transport requires a CUDA BF16 tensor")
+    if value.ndim != 2 or not value.is_contiguous() or value.shape[1] <= 0:
+        raise ValueError("FP8 expert transport requires a contiguous matrix")
+    if any(split < 0 for split in (*output_splits, *input_splits)):
+        raise ValueError("FP8 expert transport splits cannot be negative")
+    group = _resolve_process_group(group_name)
+    world_size = dist.get_world_size(group)
+    if len(output_splits) != world_size or len(input_splits) != world_size:
+        raise ValueError("FP8 expert transport needs one split for every EP rank")
+    if sum(input_splits) != value.shape[0]:
+        raise ValueError("FP8 expert transport input splits do not match the input")
+    return group
+
+
+class _FP8Dispatch(torch.autograd.Function):
+    """Experimental per-token FP8 expert dispatch and combine.
+
+    The payload uses one E4M3 value and one FP32 scale per token. Expert
+    kernels still receive BF16 after the all-to-all. The received payload is
+    retained so the LoRA backward reconstructs the exact expert input without
+    retaining a second BF16 copy.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        routed_input,
+        output_splits,
+        input_splits,
+        group_name,
+        tag="dispatch",
+        received_input=None,
+    ):
+        group = _validate_fp8_dispatch(
+            routed_input,
+            output_splits,
+            input_splits,
+            group_name,
+        )
+        output_rows = sum(output_splits)
+        quantized, scale = ops.scaled_fp8_quant(
+            routed_input, use_per_token_if_dynamic=True
+        )
+        if quantized.dtype != torch.float8_e4m3fn:
+            raise TypeError("per-token FP8 transport must use E4M3 payloads")
+        scale = scale.flatten()
+        if scale.dtype != torch.float32 or scale.shape[0] != routed_input.shape[0]:
+            raise TypeError("per-token FP8 transport requires one FP32 scale per row")
+        received = torch.empty(
+            (output_rows, routed_input.shape[1]),
+            device=routed_input.device,
+            dtype=torch.float8_e4m3fn,
+        )
+        received_scale = torch.empty(
+            output_rows, device=routed_input.device, dtype=torch.float32
+        )
+        with _EPTimer(f"fwd_{tag}"):
+            dist.all_to_all_single(
+                received,
+                quantized,
+                output_splits,
+                input_splits,
+                group=group,
+            )
+            dist.all_to_all_single(
+                received_scale,
+                scale,
+                output_splits,
+                input_splits,
+                group=group,
+            )
+        output = received.to(torch.bfloat16)
+        output.mul_(received_scale.to(output.dtype)[:, None])
+        if received_input is not None:
+            if not isinstance(received_input, ReceivedFP8ExpertInput):
+                raise TypeError("FP8 expert dispatch received the wrong saved-input type")
+            received_input.prepare(received, received_scale)
+        ctx.input_splits = input_splits
+        ctx.output_splits = output_splits
+        ctx.group_name = group_name
+        ctx.tag = tag
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        group = _validate_fp8_dispatch(
+            grad_output,
+            ctx.input_splits,
+            ctx.output_splits,
+            ctx.group_name,
+        )
+        quantized, scale = ops.scaled_fp8_quant(
+            grad_output, use_per_token_if_dynamic=True
+        )
+        scale = scale.flatten()
+        grad_input_q = torch.empty(
+            (sum(ctx.input_splits), grad_output.shape[1]),
+            device=grad_output.device,
+            dtype=torch.float8_e4m3fn,
+        )
+        grad_input_scale = torch.empty(
+            sum(ctx.input_splits), device=grad_output.device, dtype=torch.float32
+        )
+        with _EPTimer(f"bwd_{ctx.tag}"):
+            dist.all_to_all_single(
+                grad_input_q,
+                quantized,
+                ctx.input_splits,
+                ctx.output_splits,
+                group=group,
+            )
+            dist.all_to_all_single(
+                grad_input_scale,
+                scale,
+                ctx.input_splits,
+                ctx.output_splits,
+                group=group,
+            )
+        grad_input = grad_input_q.to(grad_output.dtype)
+        grad_input.mul_(grad_input_scale.to(grad_output.dtype)[:, None])
+        return grad_input, None, None, None, None, None
+
+
 class _INT4Dispatch(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -1184,9 +1411,9 @@ class NativeFP8LoRAAllToAllExpertParallel(MXFP8AllToAllExpertParallel):
 
     def __init__(self, expert_activation_transport: str):
         super().__init__()
-        if expert_activation_transport not in {"bf16", "int4"}:
+        if expert_activation_transport not in {"bf16", "int4", "fp8"}:
             raise ValueError(
-                "native FP8 routed-expert LoRA transport must be 'bf16' or 'int4'"
+                "native FP8 routed-expert LoRA transport must be 'bf16', 'fp8', or 'int4'"
             )
         self.expert_activation_transport = expert_activation_transport
 
@@ -1204,6 +1431,16 @@ class NativeFP8LoRAAllToAllExpertParallel(MXFP8AllToAllExpertParallel):
                 save_for_backward=torch.is_grad_enabled()
             )
             routed_input = _BF16Dispatch.apply(
+                routed_input,
+                self.output_splits,
+                self.input_splits,
+                device_mesh.get_group().group_name,
+                "dispatch",
+                received_input,
+            )
+        elif self.expert_activation_transport == "fp8":
+            received_input = ReceivedFP8ExpertInput()
+            routed_input = _FP8Dispatch.apply(
                 routed_input,
                 self.output_splits,
                 self.input_splits,
@@ -1229,6 +1466,15 @@ class NativeFP8LoRAAllToAllExpertParallel(MXFP8AllToAllExpertParallel):
     def _token_combine(self, mod, routed_output, device_mesh):
         if self.expert_activation_transport == "bf16":
             return _BF16Dispatch.apply(
+                routed_output,
+                self.input_splits,
+                self.output_splits,
+                device_mesh.get_group().group_name,
+                "combine",
+                None,
+            )
+        if self.expert_activation_transport == "fp8":
+            return _FP8Dispatch.apply(
                 routed_output,
                 self.input_splits,
                 self.output_splits,
