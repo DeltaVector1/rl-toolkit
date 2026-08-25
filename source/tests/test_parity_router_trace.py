@@ -1137,6 +1137,47 @@ class ParityRouterTraceTest(unittest.TestCase):
         self.assertEqual(len(h200.pre_hooks), 1)
         self.assertEqual(len(h200.gate_up_proj.forward_hooks), 1)
         self.assertEqual(len(h200.act_fn.forward_hooks), 1)
+        torch = fake_torch()
+        torch.cat = lambda values, dim: FakeTensor(
+            np.concatenate([value.value for value in values], axis=dim)
+        )
+        trainer.gate_proj.forward_hooks[0](
+            trainer.gate_proj, (), FakeTensor(np.zeros((2, 12288)))
+        )
+        with patch.dict(sys.modules, {"torch": torch}), patch.object(
+            parity_trace, "_capture_named_output"
+        ) as capture:
+            trainer.up_proj.forward_hooks[0](
+                trainer.up_proj, (), FakeTensor(np.zeros((2, 12288)))
+            )
+            name, width, value = capture.call_args.args
+            self.assertEqual((name, width, value.shape), (
+                "layer0_dense_gate_up_raw_tp0", 3072, (2, 3072)
+            ))
+            capture.reset_mock()
+            trainer.down_proj.pre_hooks[0](
+                trainer.down_proj, (FakeTensor(np.zeros((2, 12288))),)
+            )
+            name, width, value = capture.call_args.args
+            self.assertEqual((name, width, value.shape), (
+                "layer0_dense_post_silu_tp0", 1536, (2, 1536)
+            ))
+            capture.reset_mock()
+            h200.gate_up_proj.forward_hooks[0](
+                h200.gate_up_proj, (), FakeTensor(np.zeros((2, 3072)))
+            )
+            self.assertEqual(
+                capture.call_args.args[:2],
+                ("layer0_dense_gate_up_raw_tp0", 3072),
+            )
+            capture.reset_mock()
+            h200.act_fn.forward_hooks[0](
+                h200.act_fn, (), FakeTensor(np.zeros((2, 1536)))
+            )
+            self.assertEqual(
+                capture.call_args.args[:2],
+                ("layer0_dense_post_silu_tp0", 1536),
+            )
 
     def test_diagnostic_plan_refuses_existing_cap_overflow(self):
         metadata = TraceSession(
