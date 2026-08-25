@@ -238,6 +238,10 @@ if hasattr(triton, "jit"):
                 a_values.to(tl.float32) * x_values[None, :].to(tl.float32),
                 axis=1,
             )
+        # The validated grouped path materializes the first GEMM as BF16
+        # before feeding it to the second GEMM. Keep that rounding boundary so
+        # the fused candidate has the same two-stage LoRA math.
+        low_rank_bf16 = low_rank.to(tl.bfloat16)
 
         # Keep the rank vector in registers while streaming B's output
         # columns.  The loop is important: a second grid dimension would
@@ -254,7 +258,9 @@ if hasattr(triton, "jit"):
                 & valid_columns[None, :],
                 other=0,
             ).to(tl.float32)
-            result = tl.sum(low_rank[:, None] * b_values, axis=0)
+            result = tl.sum(
+                low_rank_bf16[:, None] * b_values.to(tl.float32), axis=0
+            )
             tl.store(
                 output + row * stride_om + n * stride_on,
                 result,

@@ -43,6 +43,11 @@ class GLM52KernelCandidateTest(unittest.TestCase):
         self.assertIn("def _scattermoe_lora_forward_kernel", FP8_SOURCE)
         self.assertIn("INPUT_SIZE: tl.constexpr", FP8_SOURCE)
         self.assertIn("Accumulation is FP32", FP8_SOURCE)
+        self.assertIn("low_rank_bf16 = low_rank.to(tl.bfloat16)", FP8_SOURCE)
+        self.assertIn(
+            "low_rank_bf16[:, None] * b_values.to(tl.float32), axis=0",
+            FP8_SOURCE,
+        )
         self.assertIn("_scattermoe_lora_projection", FP8_SOURCE)
         self.assertIn("_SCATTERMOE_LORA", FP8_SOURCE)
         self.assertIn("_grouped_mm_pair(", FP8_SOURCE)
