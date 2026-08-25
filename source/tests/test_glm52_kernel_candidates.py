@@ -180,6 +180,16 @@ class GLM52KernelCandidateTest(unittest.TestCase):
         self.assertIn("dP_dkv_shared", SPARSE_BWD_SOURCE)
         self.assertIn("[dkv_gemm_rows, D]", SPARSE_BWD_SOURCE)
 
+    def test_sparse_low_memory_padding_covers_only_real_rows(self):
+        for block_size in (32, 48, 64, 80):
+            split_rows = block_size // 4
+            gemm_rows = max(16, ((split_rows + 15) // 16) * 16)
+            self.assertEqual(gemm_rows % 16, 0)
+            for split in range(4):
+                first = split * split_rows
+                self.assertLess(first + split_rows - 1, block_size)
+                self.assertGreaterEqual(gemm_rows, split_rows)
+
     def test_w2_chunk_candidate_has_bounded_values(self):
         self.assertIn(
             'os.environ.get("PRIME_FP8_W2_CHUNK_ROWS", "2048")',
