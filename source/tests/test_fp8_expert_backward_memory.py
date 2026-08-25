@@ -11,6 +11,26 @@ SOURCE = (
 
 
 class FP8ExpertBackwardMemoryTest(unittest.TestCase):
+    def test_native_lora_discarded_forward_does_not_save_intermediates(self):
+        forward = SOURCE.split("class _InplacePermutedLoRAExperts", 1)[1].split(
+            "    @staticmethod\n    def backward", 1
+        )[0]
+        branch = forward.index("if save_backward_state:")
+        quantize = forward.index("ops.scaled_fp8_quant", branch)
+        skip = forward.index("if not save_backward_state:", quantize)
+        self.assertLess(branch, quantize)
+        self.assertLess(quantize, skip)
+        self.assertNotIn('.to("cpu")', forward)
+        self.assertIn("permuted_indices_host.copy_(permuted_indices", forward)
+
+    def test_native_lora_backward_has_no_nested_autograd(self):
+        native_lora = SOURCE.split("def _grouped_lora_backward", 1)[1].split(
+            "\n\nclass _ScaleRoutedOutput", 1
+        )[0]
+        self.assertNotIn("torch.autograd.grad", native_lora)
+        self.assertEqual(native_lora.count("_grouped_lora_backward("), 3)
+        self.assertEqual(native_lora.count("_grouped_outer_accumulate("), 2)
+
     def test_grouped_output_allocation_has_one_cache_recovery_retry(self):
         dispatch = SOURCE.split("def _dispatch_grouped_mm", 1)[1].split(
             "\n\n@torch.compiler.disable", 1
@@ -45,7 +65,7 @@ class FP8ExpertBackwardMemoryTest(unittest.TestCase):
         self.assertNotIn("_scatter_permuted_rows_kernel", SOURCE)
 
         inplace = SOURCE.split("class _InplacePermutedExperts", 1)[1].split(
-            "\n\nclass _ScaleRoutedOutput", 1
+            "\n\nclass _InplacePermutedLoRAExperts", 1
         )[0]
         self.assertEqual(
             inplace.count("_index_copy_real_rows_with_cache_retry("), 2
@@ -63,7 +83,7 @@ class FP8ExpertBackwardMemoryTest(unittest.TestCase):
         self.assertEqual(helper.count("return x.index_select(0, indices)"), 2)
 
         inplace = SOURCE.split("class _InplacePermutedExperts", 1)[1].split(
-            "\n\nclass _ScaleRoutedOutput", 1
+            "\n\nclass _InplacePermutedLoRAExperts", 1
         )[0]
         self.assertEqual(
             inplace.count("_index_select_rows_with_cache_retry("), 2

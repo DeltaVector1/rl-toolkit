@@ -166,6 +166,84 @@ def _expanded_block_scale(scale: torch.Tensor, shape: tuple[int, int]):
 
 
 class FP8AdaAutogradTest(unittest.TestCase):
+    def test_grouped_lora_backward_matches_autograd(self):
+        torch.manual_seed(13)
+        offsets = torch.tensor([2, 2, 7], dtype=torch.int32)
+        x = torch.randn(7, 40, dtype=torch.bfloat16)
+        a = torch.randn(3, 32, 40, dtype=torch.bfloat16)
+        b = torch.randn(3, 48, 32, dtype=torch.bfloat16)
+        grad = torch.randn(7, 48, dtype=torch.bfloat16)
+
+        def dense_grouped(value, weights, *, offs):
+            output = torch.empty(
+                value.shape[0],
+                weights.shape[2],
+                dtype=value.dtype,
+            )
+            start = 0
+            for expert, end in enumerate(offs.tolist()):
+                output[start:end] = value[start:end] @ weights[expert]
+                start = end
+            return output
+
+        def dense_outer(left, right, chunk_offsets, output):
+            start = 0
+            for expert, end in enumerate(chunk_offsets.tolist()):
+                output[expert].add_(left[start:end].T @ right[start:end])
+                start = end
+
+        with mock.patch.object(torch, "_grouped_mm", dense_grouped):
+            with torch.enable_grad():
+                x_ref = x.detach().requires_grad_(True)
+                a_ref = a.detach().requires_grad_(True)
+                b_ref = b.detach().requires_grad_(True)
+                output = fp8_ada._grouped_lora_projection(
+                    x_ref,
+                    a_ref,
+                    b_ref,
+                    offsets,
+                )
+                expected = torch.autograd.grad(
+                    output,
+                    (x_ref, a_ref, b_ref),
+                    grad_outputs=grad,
+                )
+            grad_a = torch.zeros_like(a)
+            grad_b = torch.zeros_like(b)
+            with mock.patch.object(
+                fp8_ada,
+                "_grouped_outer_accumulate",
+                dense_outer,
+            ):
+                input_grad = fp8_ada._grouped_lora_backward(
+                    x,
+                    a,
+                    b,
+                    offsets,
+                    grad,
+                    grad_a,
+                    grad_b,
+                )
+
+        for value, reference in zip(
+            (input_grad, grad_a, grad_b),
+            expected,
+            strict=True,
+        ):
+            torch.testing.assert_close(value, reference, rtol=0.02, atol=0.125)
+
+    def test_grouped_lora_backward_rejects_other_ranks(self):
+        with self.assertRaisesRegex(RuntimeError, "supports rank 32"):
+            fp8_ada._grouped_lora_backward(
+                torch.empty(2, 8, dtype=torch.bfloat16),
+                torch.empty(1, 16, 8, dtype=torch.bfloat16),
+                torch.empty(1, 8, 16, dtype=torch.bfloat16),
+                torch.tensor([2], dtype=torch.int32),
+                torch.empty(2, 8, dtype=torch.bfloat16),
+                torch.zeros(1, 16, 8, dtype=torch.bfloat16),
+                torch.zeros(1, 8, 16, dtype=torch.bfloat16),
+            )
+
     def test_dequant_weight_expands_each_128_square_block(self):
         weight = (
             torch.arange(256 * 384, dtype=torch.int32)
