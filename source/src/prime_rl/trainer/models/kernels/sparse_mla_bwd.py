@@ -131,6 +131,7 @@ def bwd(
     if low_memory_dkv:
         assert split_store == 4, "low-memory dKV uses the split_store=4 tile"
         assert block_size >= 32, "low-memory dKV requires block_size >= 32"
+        assert block_size % 16 == 0, "low-memory dKV requires block_size % 16 == 0"
 
     if sm_scale is None:
         sm_scale = (D + D_tail) ** (-0.5)
@@ -152,6 +153,11 @@ def bwd(
     padded_H = max(tilelang.math.next_power_of_2(H_kv), 16)
     block_H = min(block_H, padded_H)
     assert padded_H % block_H == 0
+    if low_memory_dkv:
+        assert block_H % 16 == 0, "low-memory dKV requires block_H % 16 == 0"
+        assert D % 16 == 0 and D_tail % 16 == 0, (
+            "low-memory dKV requires D and D_tail to be multiples of 16"
+        )
     NH = padded_H // block_H
     BS = block_size
     NS = tilelang.cdiv(topk, block_size)
@@ -194,7 +200,9 @@ def bwd(
                 # CUDA BF16 MMA requires an M tile of at least 16 rows.  A
                 # split-4 block has 8 real rows at BS=32, so pad the compute
                 # tile while atomically storing only the real rows.
-                dkv_gemm_rows = max(16, dkv_split_rows)
+                dkv_gemm_rows = max(
+                    16, ((dkv_split_rows + 15) // 16) * 16
+                )
                 P_dkv_shared = T.alloc_shared(
                     [block_H, dkv_gemm_rows], dtype
                 )

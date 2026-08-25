@@ -72,6 +72,9 @@ class GLM52KernelCandidateTest(unittest.TestCase):
             "def _scattermoe_lora_forward_kernel", 1
         )[1].split("def _expert_scatter_kernel", 1)[0]
         self.assertNotIn("tl.program_id(1)", scatter_kernel)
+        self.assertIn("source_valid & valid_columns", scatter_kernel)
+        self.assertIn("offsets + (MAX_EXPERTS - 1)", scatter_kernel)
+        self.assertIn("mask=expert_index > 0", scatter_kernel)
 
     def test_scattermoe_lora_backward_is_fp32_and_bounded(self):
         self.assertIn("def _scattermoe_outer_accumulate_kernel", FP8_SOURCE)
@@ -90,6 +93,11 @@ class GLM52KernelCandidateTest(unittest.TestCase):
         )[1].split("\n\nclass _ScaleRoutedOutput", 1)[0]
         self.assertIn("_scattermoe_lora_backward(", backward)
         self.assertIn("backward_row_indices = torch.arange", backward)
+        outer_kernel = FP8_SOURCE.split(
+            "def _scattermoe_outer_accumulate_kernel", 1
+        )[1].split("else:\n    _scattermoe_lora_forward_kernel", 1)[0]
+        self.assertIn("row_mask[:, None]", outer_kernel)
+        self.assertIn("source_valid[:, None]", outer_kernel)
 
     def test_low_rank_reuse_is_host_saved_and_backward_optional(self):
         forward = FP8_SOURCE.split(
@@ -151,7 +159,22 @@ class GLM52KernelCandidateTest(unittest.TestCase):
             '"low-memory dKV requires block_size >= 32"',
             SPARSE_BWD_SOURCE,
         )
-        self.assertIn("dkv_gemm_rows = max(16, dkv_split_rows)", SPARSE_BWD_SOURCE)
+        self.assertIn(
+            '"low-memory dKV requires block_size % 16 == 0"',
+            SPARSE_BWD_SOURCE,
+        )
+        self.assertIn(
+            '"low-memory dKV requires block_H % 16 == 0"',
+            SPARSE_BWD_SOURCE,
+        )
+        self.assertIn(
+            '"low-memory dKV requires D and D_tail to be multiples of 16"',
+            SPARSE_BWD_SOURCE,
+        )
+        self.assertIn(
+            "((dkv_split_rows + 15) // 16) * 16",
+            SPARSE_BWD_SOURCE,
+        )
         self.assertIn("safe_source_column", SPARSE_BWD_SOURCE)
         self.assertIn("P_dkv_shared", SPARSE_BWD_SOURCE)
         self.assertIn("dP_dkv_shared", SPARSE_BWD_SOURCE)
