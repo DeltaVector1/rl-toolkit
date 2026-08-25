@@ -977,6 +977,62 @@ def test_refresh_fixture_preserves_current_wrapper_and_rebinds_diagnostic(tmp_pa
         ]
 
 
+def test_refresh_fixture_rolls_over_expired_wrapper_with_exact_provenance(tmp_path):
+    profile, source, session, export, diagnostic = _refresh_fixture_inputs(tmp_path)
+    current = tmp_path / "current"
+    first_diagnostic = tmp_path / "first-diagnostic.npz"
+    parity.refresh_fixture_from_trainer_export(
+        profile,
+        source,
+        session,
+        export,
+        diagnostic,
+        current,
+        first_diagnostic,
+        7,
+    )
+    stale_manifest = json.loads((current / "manifest.json").read_text())
+    stale_manifest["created_utc"] = "2020-01-01T00:00:00+00:00"
+    (current / "manifest.json").write_bytes(parity.json_bytes(stale_manifest))
+    _bind_refresh_inputs_to_fixture(current, session, diagnostic)
+    stale_sha256 = parity.fixture_digest(current)
+    stale_arrays = {
+        name: parity.load_array(current, stale_manifest, name)
+        for name in stale_manifest["arrays"]
+    }
+
+    output = tmp_path / "rolled-over"
+    output_diagnostic = tmp_path / "rolled-over-diagnostic.npz"
+    result = parity.refresh_fixture_from_trainer_export(
+        profile,
+        current,
+        session,
+        export,
+        diagnostic,
+        output,
+        output_diagnostic,
+        7,
+    )
+
+    manifest = parity.load_manifest(output, "glm52_policy_parity_fixture")
+    parity.check_fresh(profile, output, manifest)
+    assert result["input_fixture_sha256"] == stale_sha256
+    assert result["source_fixture_sha256"] == stale_sha256
+    assert result["fixture_sha256"] != stale_sha256
+    assert manifest["source"]["fixture_sha256"] == stale_sha256
+    session_value = json.loads(session.read_text())
+    session_identity = hashlib.sha256(
+        json.dumps(session_value, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    assert manifest["source"]["session_identity"] == session_identity
+    assert manifest["source"]["token_export_sha256"] == parity.file_sha256(export)
+    for name, expected in stale_arrays.items():
+        assert np.array_equal(parity.load_array(output, manifest, name), expected)
+    with np.load(output_diagnostic, allow_pickle=False) as values:
+        assert str(values["source_fixture_sha256"].item()) == stale_sha256
+        assert str(values["fixture_sha256"].item()) == result["fixture_sha256"]
+
+
 @pytest.mark.parametrize(
     "change,error",
     [

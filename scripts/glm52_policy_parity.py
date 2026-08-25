@@ -404,6 +404,11 @@ def refresh_fixture_from_trainer_export(
     recorded_source = source_manifest.get("source")
     source_fixture_sha256 = source_wrapper_sha256
     session_fixture_sha256 = source_wrapper_sha256
+    source_created = parse_time(source_manifest.get("created_utc"))
+    source_age = dt.datetime.now(dt.timezone.utc) - source_created
+    rollover_wrapper = recorded_source is not None and source_age > dt.timedelta(
+        hours=profile.get("max_fixture_age_hours")
+    )
     if recorded_source is not None:
         source_fields = {
             "fixture_sha256",
@@ -701,7 +706,7 @@ def refresh_fixture_from_trainer_export(
         raise FileExistsError("refreshed parity fixture output already exists")
     try:
         output.mkdir(parents=False)
-        if recorded_source is not None:
+        if recorded_source is not None and not rollover_wrapper:
             for filename in sorted(expected_files):
                 shutil.copyfile(source_fixture / filename, output / filename)
             manifest = load_manifest(output, "glm52_policy_parity_fixture")
@@ -728,7 +733,11 @@ def refresh_fixture_from_trainer_export(
                 "prompt_length": profile.get("prompt_length"),
                 "max_output_length": profile.get("max_output_length"),
                 "source": {
-                    "fixture_sha256": source_fixture_sha256,
+                    "fixture_sha256": (
+                        source_wrapper_sha256
+                        if rollover_wrapper
+                        else source_fixture_sha256
+                    ),
                     "session_identity": source_session_identity,
                     "token_export_sha256": trainer_source_sha256,
                     "rank": expected_rank,
@@ -747,11 +756,15 @@ def refresh_fixture_from_trainer_export(
         refreshed_fixture_sha256 = fixture_digest(output)
         if (
             recorded_source is not None
+            and not rollover_wrapper
             and refreshed_fixture_sha256 != source_wrapper_sha256
         ):
             raise ValueError("refreshed fixture wrapper reconstruction differs")
+        output_source_fixture_sha256 = (
+            source_wrapper_sha256 if rollover_wrapper else source_fixture_sha256
+        )
         diagnostic["source_fixture_sha256"] = np.asarray(
-            source_fixture_sha256, dtype="<U64"
+            output_source_fixture_sha256, dtype="<U64"
         )
         diagnostic["fixture_sha256"] = np.asarray(
             refreshed_fixture_sha256, dtype="<U64"
@@ -766,7 +779,7 @@ def refresh_fixture_from_trainer_export(
     return {
         "fixture_sha256": refreshed_fixture_sha256,
         "input_fixture_sha256": source_wrapper_sha256,
-        "source_fixture_sha256": source_fixture_sha256,
+        "source_fixture_sha256": output_source_fixture_sha256,
         "token_ids_sha256": token_ids_sha256,
         "positions_sha256": export_semantic_hashes["positions"],
         "advantages_sha256": export_semantic_hashes["advantages"],
