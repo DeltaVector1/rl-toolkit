@@ -17,11 +17,11 @@ from torch.distributed.pipelining import ScheduleInterleaved1F1B
 
 from prime_rl.trainer.distributed.pp_runner import (
     _bounded_pipeline_stage_cls,
+    derive_interleaved_transport_capacities,
     _sparse_cache_pipeline_stage_cls,
 )
 
 
-MICROBATCHES = 8
 STAGES = 4
 HIDDEN = 4
 
@@ -68,7 +68,7 @@ def _expected_parameter_grads(inputs: torch.Tensor, stage_index: int) -> tuple[f
     return (float((value * downstream).sum()), float(inputs.shape[0] * HIDDEN * downstream))
 
 
-def _run(rank: int, sparse: bool) -> dict[str, object] | None:
+def _run(rank: int, sparse: bool, microbatches: int) -> dict[str, object] | None:
     device = torch.device("cuda", torch.cuda.current_device())
     stage_cls = _sparse_cache_pipeline_stage_cls() if sparse else _bounded_pipeline_stage_cls()
     hidden_example = torch.empty((1, HIDDEN), device=device)
@@ -80,7 +80,6 @@ def _run(rank: int, sparse: bool) -> dict[str, object] | None:
         module = Affine(stage_index, sparse).to(device)
         modules.append(module)
         first = stage_index == 0
-        last = stage_index == STAGES - 1
         input_example = hidden_example if first else (
             (hidden_example, cache_example) if sparse else hidden_example
         )
@@ -102,21 +101,30 @@ def _run(rank: int, sparse: bool) -> dict[str, object] | None:
         )
     schedule = ScheduleInterleaved1F1B(
         stages,
-        n_microbatches=MICROBATCHES,
+        n_microbatches=microbatches,
         loss_fn=(lambda output, _target: output[0].sum()) if sparse else (
             lambda output, _target: output.sum()
         ),
         scale_grads=False,
     )
-    inputs = torch.arange(MICROBATCHES * HIDDEN, device=device, dtype=torch.float32)
-    inputs = inputs.view(MICROBATCHES, HIDDEN)
+    capacities = derive_interleaved_transport_capacities(
+        schedule.pipeline_order_with_comms,
+        schedule.stage_index_to_group_rank,
+        num_stages=STAGES,
+        num_microbatches=microbatches,
+    )
+    for stage in stages:
+        stage.require_exact_transport_capacities()
+        stage.set_transport_capacities(capacities[stage.stage_index])
+    inputs = torch.arange(microbatches * HIDDEN, device=device, dtype=torch.float32)
+    inputs = inputs.view(microbatches, HIDDEN)
     expected = _expected_hidden(inputs)
     before = torch.cuda.memory_allocated()
     if rank == 0:
         result = schedule.step(inputs, return_outputs=False)
     else:
         result = schedule.step(
-            target=torch.zeros(MICROBATCHES, device=device), return_outputs=True
+            target=torch.zeros(microbatches, device=device), return_outputs=True
         )
     torch.cuda.synchronize()
     after = torch.cuda.memory_allocated()
@@ -148,15 +156,16 @@ def _run(rank: int, sparse: bool) -> dict[str, object] | None:
         )
 
     for stage in stages:
-        expected_slots = min(MICROBATCHES, STAGES)
-        if stage._transport_slot_count != expected_slots:
-            raise AssertionError("transport ring is not bounded by stage count")
-        if not stage.is_first and len(stage._forward_slots) != expected_slots:
+        expected = capacities[stage.stage_index]
+        if stage._transport_slot_count != max(expected.values()):
+            raise AssertionError("transport slot summary is incorrect")
+        if len(stage._forward_slots) != expected["forward"]:
             raise AssertionError("hidden-state receive ring has the wrong size")
-        if not stage.is_last and len(stage._backward_slots) != expected_slots:
+        if len(stage._backward_slots) != expected["backward"]:
             raise AssertionError("gradient receive ring has the wrong size")
-        if sparse and not stage.is_first and len(stage._sparse_cache_slot_owner) != expected_slots:
-            raise AssertionError("sparse-cache receive ring has the wrong size")
+        if sparse and not stage.is_first and expected["sparse"] > 0:
+            if len(stage._sparse_cache_slot_owner) != expected["sparse"]:
+                raise AssertionError("sparse-cache receive ring has the wrong size")
 
     if rank == 0:
         ring_bytes = sum(
@@ -175,8 +184,8 @@ def _run(rank: int, sparse: bool) -> dict[str, object] | None:
         return {
             "sparse": sparse,
             "torch": torch.__version__,
-            "microbatches": MICROBATCHES,
-            "transport_slots": min(MICROBATCHES, STAGES),
+            "microbatches": microbatches,
+            "transport_capacities": capacities,
             "ring_bytes_hidden_and_gradient": ring_bytes,
             "cuda_allocated_before": before,
             "cuda_allocated_after": after,
@@ -193,11 +202,17 @@ def main() -> None:
     reports = []
     try:
         only = os.environ.get("PRIME_INTERLEAVED_ONLY")
-        cases = (False,) if only == "nonsparse" else (True,) if only == "sparse" else (False, True)
-        for sparse in cases:
-            report = _run(rank, sparse)
-            if report is not None:
-                reports.append(report)
+        sparse_cases = (False,) if only == "nonsparse" else (True,) if only == "sparse" else (False, True)
+        microbatch_cases = tuple(
+            int(value)
+            for value in os.environ.get("PRIME_INTERLEAVED_MICROBATCHES", "16,64").split(",")
+            if value
+        )
+        for microbatches in microbatch_cases:
+            for sparse in sparse_cases:
+                report = _run(rank, sparse, microbatches)
+                if report is not None:
+                    reports.append(report)
         if rank == 0:
             print(json.dumps({"status": "pass", "reports": reports}, sort_keys=True))
     finally:

@@ -225,6 +225,73 @@ class SideInputKeyTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "multiple of the number of rounds"):
             self.runner.validate_interleaved_microbatches(13, 6)
 
+    def test_interleaved_transport_capacity_parser_and_modulo_reuse(self):
+        def action(stage, microbatch, kind):
+            return types.SimpleNamespace(
+                stage_index=stage,
+                microbatch_index=microbatch,
+                computation_type=types.SimpleNamespace(value=kind),
+                sub_actions=None,
+            )
+
+        actions = {
+            0: [
+                action(0, 0, "F"),
+                action(0, 1, "F"),
+                action(0, 0, "RECV_B"),
+                action(0, 0, "B"),
+                action(0, 1, "RECV_B"),
+                action(0, 1, "B"),
+            ],
+            1: [
+                action(1, 0, "RECV_F"),
+                action(1, 0, "F"),
+                action(1, 1, "RECV_F"),
+                action(1, 1, "F"),
+                action(1, 0, "B"),
+                action(1, 1, "B"),
+            ],
+        }
+        capacities = self.runner.derive_interleaved_transport_capacities(
+            actions,
+            {0: 0, 1: 1},
+            num_stages=2,
+            num_microbatches=2,
+        )
+        self.assertEqual(
+            capacities,
+            {
+                0: {"forward": 0, "backward": 1, "sparse": 0},
+                1: {"forward": 2, "backward": 0, "sparse": 1},
+            },
+        )
+        actions[1].append(action(1, 0, "F"))
+        with self.assertRaisesRegex(RuntimeError, "duplicate"):
+            self.runner.derive_interleaved_transport_capacities(
+                actions,
+                {0: 0, 1: 1},
+                num_stages=2,
+                num_microbatches=2,
+            )
+
+    def test_glm_interleaved_ring_projection(self):
+        forward_slots = [0, 16, 16, 16, 16, 14, 12, 10, 8, 8, 8, 8, 8, 6, 4, 2]
+        backward_slots = [1, 1, 1, 1, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 0]
+        sparse_slots = [0, 2, 2, 2, 2, 2, 2, 2, 1, 2, 2, 2, 2, 2, 2, 2]
+        hidden_slot_bytes = 4096 * 6144 * 2
+        sparse_slot_bytes = 4096 * 2048 * 2
+        exact_bytes = (
+            (sum(forward_slots) + sum(backward_slots)) * hidden_slot_bytes
+            + sum(sparse_slots) * sparse_slot_bytes
+        )
+        global_slot_bytes = (
+            (15 * 16 + 15 * 16) * hidden_slot_bytes
+            + (15 * 16) * sparse_slot_bytes
+        )
+        self.assertEqual(exact_bytes, 8.328125 * 2**30)
+        self.assertEqual(global_slot_bytes, 26.25 * 2**30)
+        self.assertLess(exact_bytes, global_slot_bytes)
+
     def test_sparse_cache_slot_reuse_does_not_block_the_cpu(self):
         source = (
             SOURCE / "src/prime_rl/trainer/distributed/pp_runner.py"

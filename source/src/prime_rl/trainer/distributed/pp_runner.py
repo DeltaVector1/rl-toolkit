@@ -56,6 +56,194 @@ def validate_interleaved_microbatches(num_microbatches: int, pp_size: int) -> in
     return rounds
 
 
+def _flatten_schedule_action(action):
+    sub_actions = getattr(action, "sub_actions", None)
+    if sub_actions is None:
+        return (action,)
+    flattened = []
+    for sub_action in sub_actions:
+        flattened.extend(_flatten_schedule_action(sub_action))
+    return tuple(flattened)
+
+
+def _schedule_action_positions(actions_by_rank):
+    positions = {}
+    for rank, actions in actions_by_rank.items():
+        position = 0
+        for action in actions:
+            if action is None:
+                continue
+            for flat_action in _flatten_schedule_action(action):
+                kind = getattr(getattr(flat_action, "computation_type", None), "value", None)
+                stage_index = getattr(flat_action, "stage_index", None)
+                microbatch_index = getattr(flat_action, "microbatch_index", None)
+                if kind not in {"F", "B", "I", "RECV_F", "RECV_B"}:
+                    position += 1
+                    continue
+                if not isinstance(stage_index, int) or not isinstance(microbatch_index, int):
+                    raise RuntimeError(
+                        "interleaved transport action has an invalid stage or microbatch"
+                    )
+                key = (stage_index, microbatch_index, kind)
+                if key in positions:
+                    raise RuntimeError(f"duplicate interleaved transport action {key}")
+                positions[key] = (rank, position)
+                position += 1
+    return positions
+
+
+def _interval_capacity(intervals):
+    if not intervals:
+        return 0
+    events = []
+    for start, end, _microbatch in intervals:
+        if start > end:
+            raise RuntimeError("interleaved transport interval ends before it starts")
+        events.append((start, 1))
+        events.append((end + 1, -1))
+    events.sort()
+    active = 0
+    capacity = 0
+    for _position, change in events:
+        active += change
+        if active < 0:
+            raise RuntimeError("interleaved transport interval accounting underflow")
+        capacity = max(capacity, active)
+    return capacity
+
+
+def _validate_modulo_slots(intervals, capacity, label):
+    if not intervals:
+        if capacity != 0:
+            raise RuntimeError(f"{label} has slots but no receive intervals")
+        return
+    if capacity < 1:
+        raise RuntimeError(f"{label} has receive intervals but no slots")
+    by_slot = {}
+    for start, end, microbatch in intervals:
+        by_slot.setdefault(microbatch % capacity, []).append((start, end, microbatch))
+    for slot, slot_intervals in by_slot.items():
+        slot_intervals.sort()
+        for previous, current in zip(slot_intervals, slot_intervals[1:]):
+            if current[0] <= previous[1]:
+                raise RuntimeError(
+                    f"{label} modulo slot {slot} overlaps microbatches "
+                    f"{previous[2]} and {current[2]}"
+                )
+
+
+def derive_interleaved_transport_capacities(
+    actions_by_rank,
+    stage_to_rank,
+    num_stages: int,
+    num_microbatches: int,
+):
+    """Derive exact receive-ring sizes from Torch's lowered schedule.
+
+    Hidden inputs remain owned through backward because they require gradients.
+    Sparse cache inputs are read during forward only.
+    """
+    if not isinstance(actions_by_rank, dict) or not actions_by_rank:
+        raise RuntimeError("Torch did not expose interleaved pipeline actions")
+    if not isinstance(stage_to_rank, dict):
+        raise RuntimeError("Torch did not expose interleaved stage ownership")
+    if num_stages < 1 or num_microbatches < 1:
+        raise ValueError("interleaved transport dimensions must be positive")
+    positions = _schedule_action_positions(actions_by_rank)
+    capacities = {}
+    for stage_index in range(num_stages):
+        if stage_index not in stage_to_rank:
+            raise RuntimeError(f"missing rank for interleaved stage {stage_index}")
+        rank = stage_to_rank[stage_index]
+        if rank not in actions_by_rank:
+            raise RuntimeError(f"missing action list for interleaved rank {rank}")
+        expects_forward_receive = (
+            stage_index > 0
+            and stage_to_rank[stage_index - 1] != rank
+        )
+        expects_backward_receive = (
+            stage_index < num_stages - 1
+            and stage_to_rank[stage_index + 1] != rank
+        )
+        forward_intervals = []
+        backward_intervals = []
+        sparse_intervals = []
+        for microbatch in range(num_microbatches):
+            forward = positions.get((stage_index, microbatch, "F"))
+            backward = positions.get((stage_index, microbatch, "B"))
+            backward_input = positions.get((stage_index, microbatch, "I"))
+            if backward is not None and backward_input is not None:
+                raise RuntimeError(
+                    f"interleaved stage {stage_index} has two backward actions "
+                    f"for microbatch {microbatch}"
+                )
+            backward_end = backward or backward_input
+            if forward is None or backward_end is None:
+                raise RuntimeError(
+                    f"incomplete compute actions for stage {stage_index}, "
+                    f"microbatch {microbatch}"
+                )
+            if forward[0] != rank or backward_end[0] != rank:
+                raise RuntimeError(
+                    f"compute action for stage {stage_index} is owned by the wrong rank"
+                )
+            forward_receive = positions.get((stage_index, microbatch, "RECV_F"))
+            backward_receive = positions.get((stage_index, microbatch, "RECV_B"))
+            if forward_receive is not None:
+                if not expects_forward_receive:
+                    raise RuntimeError(
+                        f"stage {stage_index} has an unexpected forward receive action"
+                    )
+                if forward_receive[0] != rank:
+                    raise RuntimeError("forward receive is owned by the wrong rank")
+                if forward is None or backward_end is None:
+                    raise RuntimeError(
+                        f"incomplete forward interval for stage {stage_index}, "
+                        f"microbatch {microbatch}"
+                    )
+                forward_intervals.append(
+                    (forward_receive[1], backward_end[1], microbatch)
+                )
+                sparse_intervals.append(
+                    (forward_receive[1], forward[1], microbatch)
+                )
+            elif forward is not None and expects_forward_receive:
+                raise RuntimeError(
+                    f"stage {stage_index} has forward work without a receive action"
+                )
+            if backward_receive is not None:
+                if not expects_backward_receive:
+                    raise RuntimeError(
+                        f"stage {stage_index} has an unexpected backward receive action"
+                    )
+                if backward_receive[0] != rank:
+                    raise RuntimeError("backward receive is owned by the wrong rank")
+                if backward_end is None:
+                    raise RuntimeError(
+                        f"incomplete backward interval for stage {stage_index}, "
+                        f"microbatch {microbatch}"
+                    )
+                backward_intervals.append(
+                    (backward_receive[1], backward_end[1], microbatch)
+                )
+            elif backward_end is not None and expects_backward_receive:
+                raise RuntimeError(
+                    f"stage {stage_index} has backward work without a receive action"
+                )
+        forward_slots = _interval_capacity(forward_intervals)
+        backward_slots = _interval_capacity(backward_intervals)
+        sparse_slots = _interval_capacity(sparse_intervals)
+        _validate_modulo_slots(forward_intervals, forward_slots, "forward transport")
+        _validate_modulo_slots(backward_intervals, backward_slots, "backward transport")
+        _validate_modulo_slots(sparse_intervals, sparse_slots, "sparse-cache transport")
+        capacities[stage_index] = {
+            "forward": forward_slots,
+            "backward": backward_slots,
+            "sparse": sparse_slots,
+        }
+    return capacities
+
+
 class PipelineStageModule(nn.Module):
     """One pipeline stage: hidden states in, hidden states (or loss) out.
 
@@ -351,11 +539,54 @@ def _bounded_pipeline_stage_cls():
     )
 
     class BoundedPipelineStage(_keyed_pipeline_stage_cls()):
+        def require_exact_transport_capacities(self) -> None:
+            self._require_exact_transport_capacities = True
+
+        def set_transport_capacities(self, capacities) -> None:
+            if not self._require_exact_transport_capacities:
+                raise RuntimeError("exact transport capacities were not requested")
+            if not isinstance(capacities, dict):
+                raise RuntimeError("interleaved transport capacities are invalid")
+            try:
+                forward = int(capacities["forward"])
+                backward = int(capacities["backward"])
+                sparse = int(capacities["sparse"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError("interleaved transport capacities are incomplete") from exc
+            if min(forward, backward, sparse) < 0:
+                raise RuntimeError("interleaved transport capacities cannot be negative")
+            if self.is_first and forward != 0:
+                raise RuntimeError("first interleaved stage cannot receive hidden states")
+            if not self.is_first and forward == 0:
+                raise RuntimeError("non-first interleaved stage needs hidden receive slots")
+            if self.is_last and backward != 0:
+                raise RuntimeError("last interleaved stage cannot receive gradients")
+            if not self.is_last and backward == 0:
+                raise RuntimeError("non-last interleaved stage needs gradient slots")
+            if not self.is_first and sparse == 0:
+                raise RuntimeError("non-first interleaved stage needs sparse-cache slots")
+            self._forward_slot_count = forward
+            self._backward_slot_count = backward
+            self._sparse_cache_slot_count = sparse
+            self._transport_slot_count = max(forward, backward, sparse)
+            self._transport_capacities_set = True
+
         def _prepare_transport_rings(self, num_microbatches):
             if num_microbatches < 1:
                 raise RuntimeError("pipeline needs at least one micro-batch")
             slot_count = min(num_microbatches, max(1, self.num_stages))
-            self._transport_slot_count = slot_count
+            if getattr(self, "_require_exact_transport_capacities", False):
+                if not getattr(self, "_transport_capacities_set", False):
+                    raise RuntimeError(
+                        "interleaved transport capacities were not set before stage initialization"
+                    )
+                forward_slot_count = self._forward_slot_count
+                backward_slot_count = self._backward_slot_count
+            else:
+                forward_slot_count = slot_count if not self.is_first else 0
+                backward_slot_count = slot_count if not self.is_last else 0
+                self._sparse_cache_slot_count = slot_count if not self.is_first else 0
+                self._transport_slot_count = slot_count
             if self.is_first:
                 self._forward_slots = []
                 self._forward_slot_by_key = {}
@@ -365,14 +596,14 @@ def _bounded_pipeline_stage_cls():
             else:
                 self._forward_slots = [
                     _make_tensor_from_meta(self.inputs_meta[0], self.device)
-                    for _ in range(slot_count)
+                    for _ in range(forward_slot_count)
                 ]
                 self._forward_slot_by_key = {
-                    (self.stage_index, chunk_id): chunk_id % slot_count
+                    (self.stage_index, chunk_id): chunk_id % forward_slot_count
                     for chunk_id in range(num_microbatches)
                 }
-                self._forward_slot_owner = [None] * slot_count
-                self._forward_events = [None] * slot_count
+                self._forward_slot_owner = [None] * forward_slot_count
+                self._forward_events = [None] * forward_slot_count
                 self._forward_receive_keys = set()
             if self.is_last:
                 self._backward_slots = []
@@ -384,14 +615,14 @@ def _bounded_pipeline_stage_cls():
                 output_meta = self.get_outputs_meta()[0]
                 self._backward_slots = [
                     _make_tensor_from_meta(output_meta, self.device)
-                    for _ in range(slot_count)
+                    for _ in range(backward_slot_count)
                 ]
                 self._backward_slot_by_key = {
-                    (self.stage_index, chunk_id): chunk_id % slot_count
+                    (self.stage_index, chunk_id): chunk_id % backward_slot_count
                     for chunk_id in range(num_microbatches)
                 }
-                self._backward_slot_owner = [None] * slot_count
-                self._backward_events = [None] * slot_count
+                self._backward_slot_owner = [None] * backward_slot_count
+                self._backward_events = [None] * backward_slot_count
                 self._backward_receive_keys = set()
 
         def _begin_forward_receive(self, fwd_chunk_id):
@@ -587,7 +818,7 @@ def _sparse_cache_pipeline_stage_cls():
                     raise RuntimeError(
                         "sparse-cache pipeline stages require hidden-state and cache inputs"
                     )
-                slot_count = self._transport_slot_count
+                slot_count = self._sparse_cache_slot_count
                 slots = [
                     _make_tensor_from_meta(self.inputs_meta[1], self.device)
                     for _ in range(slot_count)
@@ -765,6 +996,7 @@ def build_schedule(
         list(example_output) if schedule_name == "interleaved_1f1b" else [example_output]
     )
     local_stage_count = len(stage_modules)
+    exact_transport_capacities = schedule_name == "interleaved_1f1b"
     for local_index, module in enumerate(stage_modules):
         if module.transfer_sparse_indices:
             if True not in stage_classes:
@@ -779,8 +1011,7 @@ def build_schedule(
             raise ValueError(
                 f"stage identity {module.stage_identity} does not match pipeline index {stage_index}"
             )
-        stages.append(
-            stage_cls(
+        stage = stage_cls(
                 module,
                 stage_index=stage_index,
                 num_stages=pp_size * local_stage_count,
@@ -789,7 +1020,9 @@ def build_schedule(
                 input_args=example_inputs[local_index],
                 output_args=example_outputs[local_index],
             )
-        )
+        if exact_transport_capacities:
+            stage.require_exact_transport_capacities()
+        stages.append(stage)
     schedules = {
         "1f1b": Schedule1F1B,
         "interleaved_1f1b": ScheduleInterleaved1F1B,
@@ -805,12 +1038,22 @@ def build_schedule(
     # the non-PP path accumulates loss.backward() per micro-batch unscaled, so
     # the default silently shrank gradients ~n_microbatches-fold (effective LR
     # of lr/N with N varying per batch -- the unexplained tiny grad norms).
-    return cls(
+    schedule = cls(
         stages if schedule_name == "interleaved_1f1b" else stages[0],
         n_microbatches=n_microbatches,
         loss_fn=lambda output, target: output,
         scale_grads=False,
     )
+    if schedule_name == "interleaved_1f1b":
+        capacities = derive_interleaved_transport_capacities(
+            schedule.pipeline_order_with_comms,
+            schedule.stage_index_to_group_rank,
+            num_stages=pp_size * local_stage_count,
+            num_microbatches=n_microbatches,
+        )
+        for stage in stages:
+            stage.set_transport_capacities(capacities[stage.stage_index])
+    return schedule
 
 
 def pad_side_inputs_to_common_length(
