@@ -159,8 +159,6 @@ if hasattr(triton, "jit"):
         lora_b,
         output,
         source_rows,
-        input_size,
-        output_size,
         stride_xm,
         stride_xk,
         stride_indices,
@@ -175,6 +173,7 @@ if hasattr(triton, "jit"):
         stride_on,
         MAX_EXPERTS: tl.constexpr,
         INPUT_SIZE: tl.constexpr,
+        OUTPUT_SIZE: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
         BLOCK_D: tl.constexpr,
@@ -189,9 +188,6 @@ if hasattr(triton, "jit"):
         Accumulation is FP32 and the result is stored as BF16.
         """
         row = tl.program_id(0)
-        n_block = tl.program_id(1)
-        n = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
-        valid_columns = n < output_size
         source_index = tl.load(row_indices + row * stride_indices)
         route_rows = tl.load(offsets + (MAX_EXPERTS - 1) * stride_offsets)
         source_valid = (
@@ -220,7 +216,7 @@ if hasattr(triton, "jit"):
             d = d_start + tl.arange(0, BLOCK_D)
             x_values = tl.load(
                 x + safe_source * stride_xm + d * stride_xk,
-                mask=(source_valid & (d < input_size)),
+                mask=(source_valid & (d < INPUT_SIZE)),
                 other=0,
             ).to(tl.bfloat16)
             a_values = tl.load(
@@ -229,7 +225,7 @@ if hasattr(triton, "jit"):
                 + tl.arange(0, BLOCK_K)[:, None] * stride_ak
                 + d[None, :] * stride_ad,
                 mask=(tl.arange(0, BLOCK_K)[:, None] < BLOCK_K)
-                & (d[None, :] < input_size),
+                & (d[None, :] < INPUT_SIZE),
                 other=0,
             ).to(tl.bfloat16)
             low_rank += tl.sum(
@@ -237,21 +233,27 @@ if hasattr(triton, "jit"):
                 axis=1,
             )
 
-        b_values = tl.load(
-            lora_b
-            + expert * stride_be
-            + n[None, :] * stride_bn
-            + tl.arange(0, BLOCK_K)[:, None] * stride_bk,
-            mask=(tl.arange(0, BLOCK_K)[:, None] < BLOCK_K)
-            & valid_columns[None, :],
-            other=0,
-        ).to(tl.float32)
-        result = tl.sum(low_rank[:, None] * b_values, axis=0)
-        tl.store(
-            output + row * stride_om + n * stride_on,
-            result,
-            mask=source_valid & valid_columns,
-        )
+        # Keep the rank vector in registers while streaming B's output
+        # columns.  The loop is important: a second grid dimension would
+        # recompute x @ A.T once for every output block.
+        for n_start in tl.range(0, OUTPUT_SIZE, BLOCK_N):
+            n = n_start + tl.arange(0, BLOCK_N)
+            valid_columns = n < OUTPUT_SIZE
+            b_values = tl.load(
+                lora_b
+                + expert * stride_be
+                + n[None, :] * stride_bn
+                + tl.arange(0, BLOCK_K)[:, None] * stride_bk,
+                mask=(tl.arange(0, BLOCK_K)[:, None] < BLOCK_K)
+                & valid_columns[None, :],
+                other=0,
+            ).to(tl.float32)
+            result = tl.sum(low_rank[:, None] * b_values, axis=0)
+            tl.store(
+                output + row * stride_om + n * stride_on,
+                result,
+                mask=source_valid & valid_columns,
+            )
 
     @triton.jit
     def _expert_scatter_kernel(
@@ -2016,9 +2018,7 @@ def _scattermoe_lora_projection(x, row_indices, lora_a, lora_b, offsets):
         dtype=x.dtype,
     )
     block_n = 128
-    _scattermoe_lora_forward_kernel[
-        (row_indices.shape[0], triton.cdiv(lora_b.shape[1], block_n))
-    ](
+    _scattermoe_lora_forward_kernel[(row_indices.shape[0],)](
         x,
         row_indices,
         offsets,
@@ -2026,8 +2026,6 @@ def _scattermoe_lora_projection(x, row_indices, lora_a, lora_b, offsets):
         lora_b,
         output,
         x.shape[0],
-        x.shape[1],
-        lora_b.shape[1],
         x.stride(0),
         x.stride(1),
         row_indices.stride(0),
@@ -2042,6 +2040,7 @@ def _scattermoe_lora_projection(x, row_indices, lora_a, lora_b, offsets):
         output.stride(1),
         MAX_EXPERTS=lora_a.shape[0],
         INPUT_SIZE=x.shape[1],
+        OUTPUT_SIZE=lora_b.shape[1],
         BLOCK_N=block_n,
         BLOCK_K=32,
         BLOCK_D=128,

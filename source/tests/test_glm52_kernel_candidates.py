@@ -43,6 +43,18 @@ class GLM52KernelCandidateTest(unittest.TestCase):
         self.assertIn("_SCATTERMOE_LORA", FP8_SOURCE)
         self.assertIn("_grouped_mm_pair(", FP8_SOURCE)
         self.assertIn("ScatterMoE LoRA candidate requires rank 32", FP8_SOURCE)
+        self.assertIn(
+            "for n_start in tl.range(0, OUTPUT_SIZE, BLOCK_N)",
+            FP8_SOURCE,
+        )
+        self.assertIn(
+            "_scattermoe_lora_forward_kernel[(row_indices.shape[0],)]",
+            FP8_SOURCE,
+        )
+        scatter_kernel = FP8_SOURCE.split(
+            "def _scattermoe_lora_forward_kernel", 1
+        )[1].split("def _expert_scatter_kernel", 1)[0]
+        self.assertNotIn("tl.program_id(1)", scatter_kernel)
 
     def test_low_rank_reuse_is_host_saved_and_backward_optional(self):
         forward = FP8_SOURCE.split(
