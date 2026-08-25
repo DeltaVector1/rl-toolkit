@@ -6,8 +6,12 @@ deployment=${prime_deployment:-/data/glm52-rl/deployment-glm52-optims}
 trainer_container=${prime_trainer_container:-glm52-optims-trainer}
 orchestrator_container=${prime_orchestrator_container:-glm52-optims-orchestrator}
 nccl_channels=${PRIME_NCCL_CHANNELS:-4}
-profile_pp_stage=${PRIME_PROFILE_PP_STAGE:-0}
-profile_pp_rank=${PRIME_PROFILE_PP_RANK:--1}
+profile_pp_stage=0
+profile_pp_rank=-1
+ep_profile=0
+ep_profile_every=150
+expert_profile_every=90
+layer_profile_every=180
 # RUN selects which config pair under configs/china to use and where logs land.
 # Defaults keep the historical r33 layout.
 RUN=${RUN:-r33}
@@ -130,7 +134,7 @@ case ${1:-} in
     if [ "$rank" -lt 0 ]; then
       echo "node $node is not in trainer_nodes ($trainer_nodes)" >&2; exit 1
     fi
-    IFS='|' read -r rollout_transport trainer_output trainer_only parity_trace_dir parity_trace_source parity_pp parity_cp parity_batch parity_max_calls parity_max_files parity_max_bytes parity_diagnostics parity_diagnostic_tokens parity_diagnostic_max_files parity_diagnostic_max_bytes configured_int4_combine_rounds configured_fp8_expert_activation_offload < <(
+    IFS='|' read -r rollout_transport trainer_output trainer_only parity_trace_dir parity_trace_source parity_pp parity_cp parity_batch parity_max_calls parity_max_files parity_max_bytes parity_diagnostics parity_diagnostic_tokens parity_diagnostic_max_files parity_diagnostic_max_bytes configured_int4_combine_rounds configured_fp8_expert_activation_offload configured_profile_requested configured_profile_pp_stage configured_ep_profile configured_ep_profile_every configured_expert_profile_every configured_layer_profile_every < <(
       python3 - "$trainer_config" <<'PY'
 import sys
 import tomllib
@@ -147,6 +151,17 @@ memory_env = (
     env_vars.get("PRIME_INT4_COMBINE_ROUNDS", ""),
     env_vars.get("PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD", ""),
 )
+profile_names = (
+    "PRIME_PROFILE_PP_STAGE",
+    "PRIME_EP_PROFILE",
+    "PRIME_EP_PROFILE_EVERY",
+    "PRIME_EXPERT_PROFILE_EVERY",
+    "PRIME_LAYER_PROFILE_EVERY",
+)
+profile_present = tuple(name in env_vars for name in profile_names)
+if any(profile_present) and not all(profile_present):
+    raise SystemExit("trainer config must define every CUDA profiling value or none")
+profile_env = (int(all(profile_present)), *(env_vars.get(name, "") for name in profile_names))
 values = (
     config["rollout_transport"]["type"],
     config["output_dir"],
@@ -164,8 +179,9 @@ values = (
     env_vars.get("PRIME_PARITY_DIAGNOSTIC_MAX_FILES", ""),
     env_vars.get("PRIME_PARITY_DIAGNOSTIC_MAX_BYTES", ""),
     *memory_env,
+    *profile_env,
 )
-if any("|" in str(value) for value in values):
+if any(any(char in str(value) for char in "|\r\n") for value in values):
     raise SystemExit("trainer config value contains the parser separator")
 print("|".join(str(value) for value in values))
 PY
@@ -184,6 +200,25 @@ PY
     else
       int4_combine_rounds="${PRIME_INT4_COMBINE_ROUNDS:-1}"
       fp8_expert_activation_offload="${PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD:-0}"
+    fi
+    if [ "$configured_profile_requested" = "1" ]; then
+      [ "$(readlink -f "$trainer_config")" = "$(readlink -f "$deployment/configs/qualification/glm52-native-small.toml")" ] || {
+        echo "CUDA profiling may only be enabled by the GLM small qualification config" >&2
+        exit 1
+      }
+      [ "$trainer_output" = "/data/glm52-rl/qualifications/glm52-r32-native-small" ] || {
+        echo "GLM small qualification profiling output differs" >&2
+        exit 1
+      }
+      [ "$configured_profile_pp_stage:$configured_ep_profile:$configured_ep_profile_every:$configured_expert_profile_every:$configured_layer_profile_every" = "1:1:160:80:64" ] || {
+        echo "GLM small qualification profiling values differ from the measured profile" >&2
+        exit 1
+      }
+      profile_pp_stage="$configured_profile_pp_stage"
+      ep_profile="$configured_ep_profile"
+      ep_profile_every="$configured_ep_profile_every"
+      expert_profile_every="$configured_expert_profile_every"
+      layer_profile_every="$configured_layer_profile_every"
     fi
     parity_trace_runtime=""
     parity_image_digest=""
@@ -454,9 +489,10 @@ PY
       --env-file /data/trinity/training.env \
       -e PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,garbage_collection_threshold:0.8}" \
       -e TORCHINDUCTOR_COMPILE_THREADS=8 \
-      -e PRIME_EP_PROFILE="${PRIME_EP_PROFILE:-0}" \
-      -e PRIME_EP_PROFILE_EVERY="${PRIME_EP_PROFILE_EVERY:-150}" \
-      -e PRIME_EXPERT_PROFILE_EVERY="${PRIME_EXPERT_PROFILE_EVERY:-90}" \
+      -e PRIME_EP_PROFILE="$ep_profile" \
+      -e PRIME_EP_PROFILE_EVERY="$ep_profile_every" \
+      -e PRIME_EXPERT_PROFILE_EVERY="$expert_profile_every" \
+      -e PRIME_LAYER_PROFILE_EVERY="$layer_profile_every" \
       -e PRIME_BIND_GPU_NUMA="${PRIME_BIND_GPU_NUMA:-0}" \
       -e PRIME_NCCL_CHANNELS="$nccl_channels" \
       -e PRIME_PROFILE_PP_STAGE="$profile_pp_stage" \

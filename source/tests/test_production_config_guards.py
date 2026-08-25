@@ -193,6 +193,18 @@ def test_only_glm52_small_qualification_enables_cuda_profiling() -> None:
     small = _load("configs/qualification/glm52-native-small.toml")
     assert small["env_vars"] == expected
     assert small["model"]["quantization"]["diagnose_linear_backward"] is False
+    launcher = (ROOT / "scripts/china/cluster.sh").read_text()
+    assert 'trainer_output" = "/data/glm52-rl/qualifications/glm52-r32-native-small"' in launcher
+    assert 'deployment/configs/qualification/glm52-native-small.toml' in launcher
+    assert 'profile_pp_stage=0' in launcher
+    assert 'ep_profile=0' in launcher
+    assert 'profile_present = tuple(name in env_vars for name in profile_names)' in launcher
+    assert 'if any(profile_present) and not all(profile_present):' in launcher
+    assert 'for char in "|\\r\\n"' in launcher
+    for name in expected:
+        assert f'"{name}",' in launcher
+    assert '-e PRIME_EP_PROFILE="$ep_profile"' in launcher
+    assert '-e PRIME_LAYER_PROFILE_EVERY="$layer_profile_every"' in launcher
     for relative in (
         "configs/qualification/glm52-policy-parity-trainer.toml",
         "configs/qualification/glm52-native-b2048.toml",
