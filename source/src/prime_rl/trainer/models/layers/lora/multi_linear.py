@@ -1,5 +1,6 @@
 import math
 import os
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
@@ -68,6 +69,63 @@ else:
     _lora_mm_kernel = None
 
 
+@dataclass(frozen=True)
+class _LoraMmConfig:
+    block_m: int
+    block_n: int
+    block_k: int
+    num_warps: int
+
+
+_LEGACY_LORA_MM_CONFIGS = {
+    "rank_output": _LoraMmConfig(32, 32, 32, 4),
+    "paired_rank_output": _LoraMmConfig(64, 64, 32, 4),
+    "short_rows": _LoraMmConfig(32, 128, 32, 4),
+    "wide_output": _LoraMmConfig(64, 128, 32, 8),
+}
+
+_SM89_R32_LORA_MM_CONFIGS = {
+    "rank_output": _LoraMmConfig(128, 32, 64, 8),
+    "rank_output_short": _LoraMmConfig(32, 32, 32, 4),
+    "paired_rank_output": _LoraMmConfig(64, 64, 64, 4),
+    "short_rows": _LoraMmConfig(32, 128, 32, 4),
+    "short_rows_long_reduction": _LoraMmConfig(32, 128, 64, 4),
+    "wide_output": _LoraMmConfig(64, 128, 32, 8),
+    "wide_output_long_reduction": _LoraMmConfig(64, 128, 64, 8),
+}
+
+
+def _lora_mm_config(
+    rows: int,
+    reduction: int,
+    columns: int,
+    profile: str | None = None,
+) -> _LoraMmConfig:
+    profile = profile or os.environ.get("PRIME_LORA_MM_PROFILE", "legacy")
+    if profile not in {"auto", "legacy", "sm89-r32"}:
+        raise ValueError(
+            "PRIME_LORA_MM_PROFILE must be auto, legacy, or sm89-r32"
+        )
+    configs = (
+        _LEGACY_LORA_MM_CONFIGS
+        if profile == "legacy"
+        else _SM89_R32_LORA_MM_CONFIGS
+    )
+    if columns <= 32:
+        if configs is _SM89_R32_LORA_MM_CONFIGS and rows < 1024:
+            return configs["rank_output_short"]
+        return configs["rank_output"]
+    if columns <= 64:
+        return configs["paired_rank_output"]
+    if rows <= 32:
+        if configs is _SM89_R32_LORA_MM_CONFIGS and reduction >= 2048:
+            return configs["short_rows_long_reduction"]
+        return configs["short_rows"]
+    if configs is _SM89_R32_LORA_MM_CONFIGS and reduction >= 2048:
+        return configs["wide_output_long_reduction"]
+    return configs["wide_output"]
+
+
 def _lora_mm(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
     """BF16/FP16 GEMM with FP32 tensor-core accumulation and no cuBLAS handle.
 
@@ -95,16 +153,11 @@ def _lora_mm(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
 
     rows, reduction = left.shape
     columns = right.shape[1]
-    if columns <= 32:
-        block_m, block_n, block_k, num_warps = 32, 32, 32, 4
-    elif rows <= 32:
-        block_m, block_n, block_k, num_warps = 32, 128, 32, 4
-    else:
-        block_m, block_n, block_k, num_warps = 64, 128, 32, 8
+    config = _lora_mm_config(rows, reduction, columns)
     out = torch.empty(rows, columns, device=left.device, dtype=left.dtype)
     grid = (
-        triton.cdiv(rows, block_m),
-        triton.cdiv(columns, block_n),
+        triton.cdiv(rows, config.block_m),
+        triton.cdiv(columns, config.block_n),
     )
     _lora_mm_kernel[grid](
         left,
@@ -119,10 +172,10 @@ def _lora_mm(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
         right.stride(1),
         out.stride(0),
         out.stride(1),
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        BLOCK_K=block_k,
-        num_warps=num_warps,
+        BLOCK_M=config.block_m,
+        BLOCK_N=config.block_n,
+        BLOCK_K=config.block_k,
+        num_warps=config.num_warps,
         num_stages=2,
     )
     return out

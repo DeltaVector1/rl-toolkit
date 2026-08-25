@@ -46,11 +46,24 @@ class ActivationCheckpointConfig(BaseConfig):
     targets: list[str] = ["norm"]
     """Selective checkpoint targets. ``norm`` checkpoints every norm module inside selected layers. ``attention`` checkpoints the complete attention module. ``attn_proj`` checkpoints projection-side attention work outside the kernel (input/output projections, attention-local norms, RoPE, gating, model-specific MLA projection helpers). ``mlp`` checkpoints the entire dense MLP forward (not for MoE). ``mla_up_proj`` checkpoints MLA Q/KV up-projection where supported. ``routed_experts`` checkpoints routed expert compute in MoE layers (including LatentMoE). ``linear_attn`` checkpoints non-softmax token mixers (NemotronH Mamba, Qwen3.5-MoE GatedDeltaNet, AFMoE sliding-window attention)."""
 
+    keep_routed_expert_activations_from_pp_stage: int | None = Field(None, ge=0)
+    """For ``reentrant_attention_all_experts``, keep routed-expert backward
+    state on this pipeline stage and later stages. Earlier stages still
+    recompute routed experts. This is disabled by default."""
+
     @model_validator(mode="after")
     def validate_selective_targets(self):
         self.targets = list(dict.fromkeys(self.targets))
         if self.mode == "selective" and not self.targets:
             raise ValueError("Selective activation checkpointing requires at least one target.")
+        if (
+            self.keep_routed_expert_activations_from_pp_stage is not None
+            and self.mode != "reentrant_attention_all_experts"
+        ):
+            raise ValueError(
+                "keep_routed_expert_activations_from_pp_stage requires "
+                "mode='reentrant_attention_all_experts'"
+            )
         return self
 
 
@@ -154,6 +167,7 @@ class FP8Config(BaseConfig):
         "fp8",
         "bf16_forward_fp8_backward",
         "bf16_forward_fp8_recompute_backward",
+        "bf16_forward_fp8_local_recompute_backward",
     ] = "bf16"
     """Precision used for expert-parallel activation transport."""
     ignore_patterns: list[str] = _DEFAULT_FP8_IGNORE_PATTERNS
@@ -245,6 +259,15 @@ class ModelConfig(BaseModelConfig):
     pp_transfer_sparse_indices: bool = False
     """Transfer sparse-attention index caches with pipeline activations. This
     permits balanced stage boundaries that start on IndexShare layers."""
+
+    pp_limit_receive_buffers: bool = False
+    """Use the minimum receive-buffer count for the 1F1B pipeline schedule."""
+
+    pp_boundary_plan: Literal["balanced", "explicit"] = "balanced"
+    """Pipeline layer boundary source."""
+
+    pp_layer_boundaries: list[int] | None = None
+    """Complete layer boundaries for the explicit boundary plan."""
 
     cp_style: Literal["ring", "ulysses"] = "ring"
     """CP communication style. ``ring`` uses ring-attention all-gather/reduce-scatter (requires custom kernels per attention type). ``ulysses`` uses all-to-all to redistribute Q/K/V from sequence-sharded to head-sharded, runs vanilla attention locally on the full sequence, then all-to-all back — works out-of-the-box with any attention kernel (softmax FA, linear attention, mamba, etc.)."""
@@ -357,6 +380,40 @@ class ModelConfig(BaseModelConfig):
         if isinstance(self.ep, int) and self.ep <= 1:
             raise ValueError(f"model.ep_comm_backend='{self.ep_comm_backend}' requires model.ep > 1.")
 
+        return self
+
+    @model_validator(mode="after")
+    def validate_local_expert_recompute(self):
+        local_recompute = (
+            isinstance(self.quantization, FP8Config)
+            and self.quantization.expert_activation_transport
+            == "bf16_forward_fp8_local_recompute_backward"
+        )
+        if not local_recompute:
+            return self
+        if (
+            self.pp <= 1
+            or self.pp_schedule == "interleaved_1f1b"
+            or self.ep_comm_backend != "torch"
+            or (isinstance(self.ep, int) and self.ep <= 1)
+        ):
+            raise ValueError(
+                "local expert recompute requires non-interleaved pipeline parallelism and torch expert parallelism"
+            )
+        cutoff = (
+            self.ac.keep_routed_expert_activations_from_pp_stage
+            if self.ac is not None
+            else None
+        )
+        if (
+            self.ac is None
+            or self.ac.mode != "reentrant_attention_all_experts"
+            or cutoff is None
+            or cutoff >= self.pp
+        ):
+            raise ValueError(
+                "local expert recompute requires a valid eager routed-expert pipeline cutoff"
+            )
         return self
 
     @model_validator(mode="after")

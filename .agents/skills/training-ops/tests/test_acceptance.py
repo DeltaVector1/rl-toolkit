@@ -22,7 +22,7 @@ weight_decay = 0.0
 
 orchestrator_config = """
 seq_len = 8192
-batch_size = 1024
+batch_size = 2048
 group_size = 16
 
 [optim]
@@ -58,7 +58,9 @@ max_norm = 1.0
 weight_decay = 0.0
 """
 
-muse_orchestrator_config = orchestrator_config
+muse_orchestrator_config = orchestrator_config.replace(
+    "batch_size = 2048", "batch_size = 1024"
+)
 
 
 def jsonl(*rows):

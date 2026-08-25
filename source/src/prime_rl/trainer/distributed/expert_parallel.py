@@ -449,15 +449,29 @@ class ReceivedFP8ExpertInput:
 
     row_index_device = "cuda"
 
-    __slots__ = ("values", "scales", "columns")
+    __slots__ = (
+        "values",
+        "scales",
+        "columns",
+        "save_for_backward",
+        "local_recompute",
+        "prepared",
+    )
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        save_for_backward: bool = True,
+        local_recompute: bool = False,
+    ) -> None:
         self.values = None
         self.scales = None
         self.columns = 0
+        self.save_for_backward = save_for_backward
+        self.local_recompute = local_recompute
+        self.prepared = False
 
     def prepare(self, values: torch.Tensor, scales: torch.Tensor) -> None:
-        if self.values is not None or self.scales is not None:
+        if self.prepared:
             raise RuntimeError("received FP8 expert input was prepared more than once")
         if values.device.type != "cuda" or values.dtype != torch.float8_e4m3fn:
             raise TypeError("received FP8 expert input must be a CUDA FP8 tensor")
@@ -467,9 +481,29 @@ class ReceivedFP8ExpertInput:
             raise ValueError("received FP8 expert input shape is invalid")
         if scales.ndim != 1 or scales.shape[0] != values.shape[0]:
             raise ValueError("received FP8 scales shape is invalid")
-        self.values = values
-        self.scales = scales
         self.columns = values.shape[1]
+        self.prepared = True
+        if self.save_for_backward:
+            self.values = values
+            self.scales = scales
+
+    def prepare_from_bf16(self, values: torch.Tensor) -> None:
+        if self.prepared:
+            raise RuntimeError("received FP8 expert input was prepared more than once")
+        if values.device.type != "cuda" or values.dtype != torch.bfloat16:
+            raise TypeError("saved FP8 expert input requires a CUDA BF16 tensor")
+        if values.ndim != 2 or not values.is_contiguous() or values.shape[1] <= 0:
+            raise ValueError("saved FP8 expert input requires a contiguous matrix")
+        if not self.save_for_backward:
+            self.columns = values.shape[1]
+            self.prepared = True
+            return
+        quantized, scales = ops.scaled_fp8_quant(
+            values, use_per_token_if_dynamic=True
+        )
+        if quantized.shape != values.shape:
+            raise RuntimeError("saved FP8 expert input changed the BF16 input shape")
+        self.prepare(quantized, scales.flatten())
 
     def reconstruct_rows(
         self,
@@ -477,7 +511,7 @@ class ReceivedFP8ExpertInput:
         output: torch.Tensor,
         workspace,
     ) -> None:
-        if self.values is None or self.scales is None:
+        if not self.prepared or self.values is None or self.scales is None:
             raise RuntimeError("received FP8 expert input is incomplete")
         if (
             row_indices.device != self.values.device
@@ -1019,9 +1053,12 @@ class _BF16Dispatch(torch.autograd.Function):
         else:
             raise ValueError("BF16 expert transport tag must be dispatch or combine")
         if received_input is not None:
-            if not isinstance(received_input, ReceivedBF16ExpertInput):
+            if isinstance(received_input, ReceivedBF16ExpertInput):
+                received_input.prepare(output)
+            elif isinstance(received_input, ReceivedFP8ExpertInput):
+                received_input.prepare_from_bf16(output)
+            else:
                 raise TypeError("BF16 expert dispatch received the wrong saved-input type")
-            received_input.prepare(output)
         ctx.input_splits = input_splits
         ctx.output_splits = output_splits
         ctx.group_name = group_name
@@ -1068,6 +1105,78 @@ class _BF16Dispatch(torch.autograd.Function):
         if not ctx.has_backward_transport_arg:
             return result[:-1]
         return result
+
+
+def _validate_route_score_dispatch(
+    scores: torch.Tensor,
+    output_splits: list[int],
+    input_splits: list[int],
+    group_name: str,
+) -> ProcessGroup:
+    if scores.device.type != "cuda" or not scores.dtype.is_floating_point:
+        raise TypeError("route score dispatch requires a floating-point CUDA tensor")
+    if scores.ndim != 1 or not scores.is_contiguous():
+        raise ValueError("route score dispatch requires a contiguous vector")
+    if any(split < 0 for split in (*output_splits, *input_splits)):
+        raise ValueError("route score dispatch splits cannot be negative")
+    group = _resolve_process_group(group_name)
+    world_size = dist.get_world_size(group)
+    if len(output_splits) != world_size or len(input_splits) != world_size:
+        raise ValueError("route score dispatch needs one split for every EP rank")
+    if sum(input_splits) != scores.shape[0]:
+        raise ValueError("route score dispatch input splits do not match the scores")
+    return group
+
+
+class _RouteScoreDispatch(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, scores, output_splits, input_splits, group_name):
+        group = _validate_route_score_dispatch(
+            scores,
+            output_splits,
+            input_splits,
+            group_name,
+        )
+        received = torch.empty(
+            sum(output_splits),
+            device=scores.device,
+            dtype=scores.dtype,
+        )
+        with _EPTimer("fwd_scores"):
+            dist.all_to_all_single(
+                received,
+                scores,
+                output_splits,
+                input_splits,
+                group=group,
+            )
+        ctx.output_splits = output_splits
+        ctx.input_splits = input_splits
+        ctx.group_name = group_name
+        return received
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        group = _validate_route_score_dispatch(
+            grad_output,
+            ctx.input_splits,
+            ctx.output_splits,
+            ctx.group_name,
+        )
+        grad_input = torch.empty(
+            sum(ctx.input_splits),
+            device=grad_output.device,
+            dtype=grad_output.dtype,
+        )
+        with _EPTimer("bwd_scores"):
+            dist.all_to_all_single(
+                grad_input,
+                grad_output,
+                ctx.input_splits,
+                ctx.output_splits,
+                group=group,
+            )
+        return grad_input, None, None, None
 
 
 def _validate_fp8_dispatch(
@@ -1429,10 +1538,47 @@ class MXFP8AllToAllExpertParallel(ExpertParallel):
         )
 
 
+def _resolve_native_fp8_expert_transport(
+    requested: str,
+    pp_stage: int | None = None,
+    pp_size: int | None = None,
+    local_recompute_cutoff: int | None = None,
+) -> tuple[str, bool]:
+    local_name = "bf16_forward_fp8_local_recompute_backward"
+    if requested != local_name:
+        if any(
+            value is not None
+            for value in (pp_stage, pp_size, local_recompute_cutoff)
+        ):
+            raise ValueError(
+                "pipeline stage selection is only valid for local expert recompute"
+            )
+        return requested, False
+    values = (pp_stage, pp_size, local_recompute_cutoff)
+    if any(not isinstance(value, int) or isinstance(value, bool) for value in values):
+        raise TypeError("local expert recompute pipeline values must be integers")
+    if pp_size <= 1 or not 0 <= pp_stage < pp_size:
+        raise ValueError("local expert recompute pipeline stage is invalid")
+    if not 0 <= local_recompute_cutoff < pp_size:
+        raise ValueError("local expert recompute pipeline cutoff is invalid")
+    active = pp_stage >= local_recompute_cutoff
+    return (
+        local_name if active else "bf16_forward_fp8_recompute_backward",
+        active,
+    )
+
+
 class NativeFP8LoRAAllToAllExpertParallel(MXFP8AllToAllExpertParallel):
     """Shard the native FP8 base and every routed-expert LoRA factor."""
 
-    def __init__(self, expert_activation_transport: str):
+    def __init__(
+        self,
+        expert_activation_transport: str,
+        *,
+        pp_stage: int | None = None,
+        pp_size: int | None = None,
+        local_recompute_cutoff: int | None = None,
+    ):
         super().__init__()
         if expert_activation_transport not in {
             "bf16",
@@ -1440,16 +1586,41 @@ class NativeFP8LoRAAllToAllExpertParallel(MXFP8AllToAllExpertParallel):
             "fp8",
             "bf16_forward_fp8_backward",
             "bf16_forward_fp8_recompute_backward",
+            "bf16_forward_fp8_local_recompute_backward",
         }:
             raise ValueError(
                 "native FP8 routed-expert LoRA transport is invalid"
             )
-        self.expert_activation_transport = expert_activation_transport
+        (
+            self.expert_activation_transport,
+            self.local_recompute_active,
+        ) = _resolve_native_fp8_expert_transport(
+            expert_activation_transport,
+            pp_stage,
+            pp_size,
+            local_recompute_cutoff,
+        )
 
     def _token_dispatch(self, mod, inputs, device_mesh):
         if not getattr(mod, "requires_received_expert_input", False):
             raise TypeError("native FP8 routed-expert LoRA needs its received input")
-        routed_input, num_tokens_per_expert = inputs
+        local_recompute = (
+            self.expert_activation_transport
+            == "bf16_forward_fp8_local_recompute_backward"
+        )
+        if local_recompute:
+            if len(inputs) != 3:
+                raise RuntimeError(
+                    "local expert recompute requires routed input, token counts, and route scores"
+                )
+            routed_input, num_tokens_per_expert, route_scores = inputs
+            if route_scores.shape != (routed_input.shape[0],):
+                raise ValueError("local expert recompute route scores have the wrong shape")
+        else:
+            if len(inputs) != 2:
+                raise RuntimeError("native FP8 routed experts received unexpected inputs")
+            routed_input, num_tokens_per_expert = inputs
+            route_scores = None
         num_tokens_per_expert_group = self._exchange_metadata(
             num_tokens_per_expert,
             device_mesh,
@@ -1475,16 +1646,25 @@ class NativeFP8LoRAAllToAllExpertParallel(MXFP8AllToAllExpertParallel):
             "bf16",
             "bf16_forward_fp8_backward",
             "bf16_forward_fp8_recompute_backward",
+            "bf16_forward_fp8_local_recompute_backward",
         }:
-            received_input = ReceivedBF16ExpertInput(
-                save_for_backward=torch.is_grad_enabled()
-            )
+            save_for_backward = torch.is_grad_enabled()
+            if self.expert_activation_transport == (
+                "bf16_forward_fp8_local_recompute_backward"
+            ):
+                received_input = ReceivedFP8ExpertInput(
+                    save_for_backward,
+                    local_recompute=local_recompute,
+                )
+            else:
+                received_input = ReceivedBF16ExpertInput(save_for_backward)
             backward_transport = (
                 "fp8"
                 if self.expert_activation_transport
                 in {
                     "bf16_forward_fp8_backward",
                     "bf16_forward_fp8_recompute_backward",
+                    "bf16_forward_fp8_local_recompute_backward",
                 }
                 else "bf16"
             )
@@ -1498,7 +1678,7 @@ class NativeFP8LoRAAllToAllExpertParallel(MXFP8AllToAllExpertParallel):
                 backward_transport,
             )
         elif self.expert_activation_transport == "fp8":
-            received_input = ReceivedFP8ExpertInput()
+            received_input = ReceivedFP8ExpertInput(torch.is_grad_enabled())
             routed_input = _FP8Dispatch.apply(
                 routed_input,
                 self.output_splits,
@@ -1520,6 +1700,19 @@ class NativeFP8LoRAAllToAllExpertParallel(MXFP8AllToAllExpertParallel):
             )
         else:
             raise RuntimeError("native FP8 routed-expert LoRA transport is invalid")
+        if local_recompute:
+            route_scores = _RouteScoreDispatch.apply(
+                route_scores,
+                self.output_splits,
+                self.input_splits,
+                device_mesh.get_group().group_name,
+            )
+            return (
+                routed_input,
+                num_tokens_per_expert_group,
+                received_input,
+                route_scores,
+            )
         return routed_input, num_tokens_per_expert_group, received_input
 
     def _token_combine(self, mod, routed_output, device_mesh):
@@ -1541,6 +1734,7 @@ class NativeFP8LoRAAllToAllExpertParallel(MXFP8AllToAllExpertParallel):
             "bf16",
             "bf16_forward_fp8_backward",
             "bf16_forward_fp8_recompute_backward",
+            "bf16_forward_fp8_local_recompute_backward",
         }:
             backward_transport = (
                 "fp8"
@@ -1616,6 +1810,7 @@ class NativeFP8LoRAAllToAllExpertParallel(MXFP8AllToAllExpertParallel):
         mod._ep_group = device_mesh.get_group()
 
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
+        module.local_recompute_backward = self.local_recompute_active
         return distribute_module(
             module,
             device_mesh,

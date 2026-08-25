@@ -150,6 +150,54 @@ class PipelineBalanceTest(unittest.TestCase):
             [0, 8, 18, 28, 38, 48, 58, 68, 78],
         )
 
+    def test_explicit_transferred_index_plan_keeps_requested_boundaries(self):
+        config = types.SimpleNamespace(
+            pp_boundary_plan="explicit",
+            pp_layer_boundaries=[0, 8, 18, 28, 38, 48, 58, 69, 78],
+            pp_transfer_sparse_indices=True,
+            indexer_types=GLM_INDEXER_TYPES,
+            num_hidden_layers=78,
+        )
+        bounds = [
+            self.pp.stage_layer_range(78, stage, 8, config)[0]
+            for stage in range(8)
+        ] + [78]
+        self.assertEqual(bounds, config.pp_layer_boundaries)
+
+    def test_explicit_plan_rejects_shared_boundary_without_cache_transfer(self):
+        config = types.SimpleNamespace(
+            pp_boundary_plan="explicit",
+            pp_layer_boundaries=[0, 8, 18, 28, 38, 48, 58, 69, 78],
+            pp_transfer_sparse_indices=False,
+            indexer_types=GLM_INDEXER_TYPES,
+            num_hidden_layers=78,
+        )
+        with self.assertRaisesRegex(ValueError, "index-cache chain"):
+            self.pp.stage_layer_range(78, 0, 8, config)
+
+    def test_explicit_shared_boundary_transfers_sparse_cache(self):
+        config = types.SimpleNamespace(
+            pp_boundary_plan="explicit",
+            pp_layer_boundaries=[0, 8, 18, 28, 38, 48, 58, 69, 78],
+            pp_transfer_sparse_indices=True,
+            indexer_types=GLM_INDEXER_TYPES,
+            num_hidden_layers=78,
+        )
+        language_model = types.SimpleNamespace(config=config)
+        model_module = types.ModuleType("prime_rl.trainer.model")
+        model_module.get_language_model = lambda _model: language_model
+        with mock.patch.dict(
+            sys.modules, {"prime_rl.trainer.model": model_module}
+        ):
+            self.assertEqual(
+                self.pp.sparse_cache_stage_flags(object(), 6, 8),
+                (False, True),
+            )
+            self.assertEqual(
+                self.pp.sparse_cache_stage_flags(object(), 7, 8),
+                (True, False),
+            )
+
     def test_interleaved_plan_has_two_nonempty_ranges_per_rank(self):
         config = types.SimpleNamespace(
             hidden_size=6144,
@@ -166,6 +214,7 @@ class PipelineBalanceTest(unittest.TestCase):
         self.assertEqual(sum(end - start for start, end in ranges), 78)
         for physical_rank in range(8):
             self.assertTrue(ranges[physical_rank + 8][0] >= ranges[physical_rank][1])
+
 
 
 class SideInputKeyTest(unittest.TestCase):
@@ -224,6 +273,30 @@ class SideInputKeyTest(unittest.TestCase):
             self.runner.validate_interleaved_microbatches(7, 8)
         with self.assertRaisesRegex(ValueError, "multiple of the number of rounds"):
             self.runner.validate_interleaved_microbatches(13, 6)
+
+    def test_1f1b_transport_capacity_matches_warmup_and_steady_state(self):
+        capacities = [
+            self.runner.derive_1f1b_transport_capacities(stage, 8, 64)
+            for stage in range(8)
+        ]
+        self.assertEqual(
+            [item["forward"] for item in capacities],
+            [0, 7, 6, 5, 4, 3, 2, 1],
+        )
+        self.assertEqual(
+            [item["backward"] for item in capacities],
+            [1, 1, 1, 1, 1, 1, 1, 0],
+        )
+        self.assertEqual(
+            [item["sparse"] for item in capacities],
+            [0, 1, 1, 1, 1, 1, 1, 1],
+        )
+
+    def test_1f1b_transport_capacity_rejects_invalid_dimensions(self):
+        with self.assertRaisesRegex(ValueError, "one micro-batch per stage"):
+            self.runner.derive_1f1b_transport_capacities(0, 8, 7)
+        with self.assertRaisesRegex(ValueError, "outside"):
+            self.runner.derive_1f1b_transport_capacities(8, 8, 8)
 
     def test_interleaved_transport_capacity_parser_and_modulo_reuse(self):
         def action(stage, microbatch, kind):

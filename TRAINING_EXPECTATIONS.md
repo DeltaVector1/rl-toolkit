@@ -35,11 +35,28 @@ these direct checks pass.
 ## GLM-5.2
 
 - Use the native FP8 trainer path and measure it against H200 FP8 inference.
-- Use batch 1,024, group 16, context 32,768, maximum output 16,384, learning
+- Use batch 2,048, group 16, context 32,768, maximum output 16,384, learning
   rate `8e-6`, maximum gradient norm 1.0, and weight decay 0.
-- After step 1, forward and backward must take 10 to 15 minutes.
+- After step 1, each forward and backward pass must take no more than 15
+  minutes. The median must be no more than 12.5 minutes, and p90 must be no
+  more than 1.2 times the median.
 - Active rollout generation should take about 10 minutes per batch.
-- Validate the path to batch 2,048 before using that batch in production.
+- Before rollout production, complete 20 trainer-only production-shaped steps
+  at batch 2,048. Use changing generated input, real backward work, and real
+  optimizer updates. Do not generate, cache, or reuse rollouts for this run.
+- Each trainer-only step must stay below 46 GiB. The last five steps must not
+  use more than 0.5 GiB above the first five-step median. Stop on an OOM,
+  nonfinite value, worker failure, or growing memory use.
+- Before rollout production, compare the updated trainer with the reference
+  behavior on fixed batches and small dummy RL runs. Rewards, masks, selected
+  rows, and GRPO advantages must match. Also pass the trainer/H200 policy
+  parity limits.
+- After these checks pass, complete 20 production steps with real rollouts.
+  Tell the owner immediately before this run starts. If the run stays healthy,
+  continue the same run to at least step 50.
+- Keep optional FP8 sparse-attention and ScatterMoE kernel work in a separate
+  worktree. Do not deploy it into a stability or production run until its
+  gradient, memory, and production-shape speed checks pass.
 
 ## Final acceptance
 

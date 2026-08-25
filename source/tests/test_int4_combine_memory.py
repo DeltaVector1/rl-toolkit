@@ -341,7 +341,8 @@ class Int4CombineMemoryTests(unittest.TestCase):
         self.assertIn("row_indices.device != self.values.device", saved_input)
         self.assertNotIn("device_indices", saved_input)
         self.assertIn("torch.index_select(self.values", saved_input)
-        self.assertIn("save_for_backward=torch.is_grad_enabled()", native)
+        self.assertIn("save_for_backward = torch.is_grad_enabled()", native)
+        self.assertIn("ReceivedBF16ExpertInput(save_for_backward)", native)
 
     def test_transport_types_declare_their_row_index_device(self):
         int4 = SOURCE.split("class ReceivedINT4ExpertInput", 1)[1].split(

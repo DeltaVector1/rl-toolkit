@@ -27,7 +27,7 @@ def test_only_policy_parity_fake_data_enables_router_replay() -> None:
                 assert enabled is False, path
 
 
-def test_current_glm52_profile_is_batch_1024_without_rollout_cache() -> None:
+def test_current_glm52_profile_is_batch_2048_without_rollout_cache() -> None:
     operations = _load("configs/operations.toml")
     assert set(operations["profiles"]) == {
         "current",
@@ -45,14 +45,14 @@ def test_current_glm52_profile_is_batch_1024_without_rollout_cache() -> None:
     }
     trainer = _load(current["trainer"])
     orchestrator = _load(current["orchestrator"])
-    assert orchestrator["batch_size"] == 1024
+    assert orchestrator["batch_size"] == 2048
     assert "rollout_cache" not in trainer.get("data", {})
 
     for name, profile in operations["profiles"].items():
         profile_trainer = _load(profile["trainer"])
         assert "rollout_cache" not in profile_trainer.get("data", {}), name
         if "orchestrator" in profile:
-            assert _load(profile["orchestrator"])["batch_size"] == 1024, name
+            assert _load(profile["orchestrator"])["batch_size"] == 2048, name
 
     large_batch = operations["profiles"]["glm52-native-b2048"]
     assert "orchestrator" not in large_batch
@@ -64,7 +64,7 @@ def test_current_glm52_profile_is_batch_1024_without_rollout_cache() -> None:
     assert parity_trainer["data"]["fake"]["batch_size"] == 8
     assert parity_trainer["model"]["pp"] == 8
     assert operations["requirements"]["glm52"] == {
-        "batch_size": 1024,
+        "batch_size": 2048,
         "context_length": 32768,
         "trainer_seconds_min": 600,
         "trainer_seconds_max": 900,
@@ -160,18 +160,23 @@ def test_production_allocator_does_not_strand_large_reserved_blocks() -> None:
     assert "max_split_size_mb" not in allocator
 
 
-def test_glm52_stability_and_production_use_hybrid_expert_transport() -> None:
+def test_glm52_stability_and_production_use_local_expert_recompute() -> None:
     for relative in (
         "configs/qualification/glm52-native-stability20.toml",
         "configs/qualification/glm52-native-b2048.toml",
         "configs/paused/trainer.glm52-production.toml",
     ):
         config = _load(relative)
-        assert config.get("env_vars", {}) == {}, relative
+        assert config.get("env_vars", {}) == {
+            "PRIME_LORA_MM_PROFILE": "sm89-r32"
+        }, relative
         assert (
             config["model"]["quantization"]["expert_activation_transport"]
-            == "bf16_forward_fp8_backward"
+            == "bf16_forward_fp8_local_recompute_backward"
         )
+        assert config["model"]["ac"]["keep_routed_expert_activations_from_pp_stage"] == 5
+        assert config["model"]["pp_limit_receive_buffers"] is True
+        assert config["model"]["pp_layer_boundaries"] == [0, 8, 18, 28, 38, 48, 58, 69, 78]
 
     launcher = (ROOT / "scripts/china/cluster.sh").read_text()
     assert 'env_vars.get("PRIME_INT4_COMBINE_ROUNDS", "")' in launcher
@@ -185,8 +190,8 @@ def test_glm52_stability_and_production_use_hybrid_expert_transport() -> None:
     assert "PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD" not in muse.get("env_vars", {})
 
 
-def test_only_glm52_small_qualification_enables_cuda_profiling() -> None:
-    expected = {
+def test_glm52_production_profiles_disable_cuda_profiling() -> None:
+    profiling_names = {
         "PRIME_PROFILE_PP_STAGE": "1",
         "PRIME_EP_PROFILE": "1",
         "PRIME_EP_PROFILE_EVERY": "160",
@@ -194,18 +199,17 @@ def test_only_glm52_small_qualification_enables_cuda_profiling() -> None:
         "PRIME_LAYER_PROFILE_EVERY": "64",
     }
     small = _load("configs/qualification/glm52-native-small.toml")
-    assert small["env_vars"] == expected
-    assert small["model"]["pp_schedule"] == "interleaved_1f1b"
+    assert small["env_vars"] == {"PRIME_LORA_MM_PROFILE": "sm89-r32"}
+    assert small["model"]["pp_schedule"] == "1f1b"
     assert small["model"]["quantization"]["diagnose_linear_backward"] is False
     launcher = (ROOT / "scripts/china/cluster.sh").read_text()
-    assert 'trainer_output" = "/data/glm52-rl/qualifications/glm52-r32-native-small"' in launcher
     assert 'deployment/configs/qualification/glm52-native-small.toml' in launcher
     assert 'profile_pp_stage=0' in launcher
     assert 'ep_profile=0' in launcher
     assert 'profile_present = tuple(name in env_vars for name in profile_names)' in launcher
     assert 'if any(profile_present) and not all(profile_present):' in launcher
     assert 'for char in "|\\r\\n"' in launcher
-    for name in expected:
+    for name in profiling_names:
         assert f'"{name}",' in launcher
     assert '-e PRIME_EP_PROFILE="$ep_profile"' in launcher
     assert '-e PRIME_LAYER_PROFILE_EVERY="$layer_profile_every"' in launcher
@@ -216,7 +220,7 @@ def test_only_glm52_small_qualification_enables_cuda_profiling() -> None:
         "configs/paused/trainer.glm52-production.toml",
     ):
         env_vars = _load(relative).get("env_vars", {})
-        assert not set(expected) & set(env_vars), relative
+        assert not set(profiling_names) & set(env_vars), relative
 
 
 def test_all_glm52_trainers_use_h200_w8a8_semantics() -> None:
@@ -246,7 +250,7 @@ def test_all_glm52_trainers_use_h200_w8a8_semantics() -> None:
         expected_transport = (
             "bf16"
             if relative == "configs/qualification/glm52-policy-parity-trainer.toml"
-            else "bf16_forward_fp8_backward"
+            else "bf16_forward_fp8_local_recompute_backward"
         )
         assert quantization["expert_activation_transport"] == expected_transport, relative
         assert "PRIME_INT4_COMBINE_ROUNDS" not in config.get("env_vars", {}), relative
@@ -298,7 +302,7 @@ def test_glm52_production_profile_matches_requirements() -> None:
         "orchestrator": "configs/paused/orchestrator.glm52-production.toml",
         "environment": "configs/paused/env.glm52-production.toml",
     }
-    assert orchestrator["batch_size"] == 1024
+    assert orchestrator["batch_size"] == 2048
     assert orchestrator["group_size"] == 16
     assert orchestrator["seq_len"] == 32768
     assert orchestrator["train"]["sampling"]["max_completion_tokens"] == 16384
@@ -309,9 +313,19 @@ def test_glm52_production_profile_matches_requirements() -> None:
     assert trainer["model"]["pp"] == 8
     assert trainer["model"]["cp"] == 8
     assert trainer["model"]["ep"] == 8
+    assert trainer["model"]["pp_schedule"] == "1f1b"
+    assert trainer["model"]["pp_limit_receive_buffers"] is True
+    assert trainer["model"]["pp_boundary_plan"] == "explicit"
+    assert trainer["model"]["pp_layer_boundaries"] == [0, 8, 18, 28, 38, 48, 58, 69, 78]
     assert trainer["model"]["cp_style"] == "ring"
     assert trainer["model"]["quantization"]["type"] == "fp8"
     assert trainer["model"]["quantization"]["dequantize_checkpoint"] is False
+    assert (
+        trainer["model"]["quantization"]["expert_activation_transport"]
+        == "bf16_forward_fp8_local_recompute_backward"
+    )
+    assert trainer["model"]["ac"]["keep_routed_expert_activations_from_pp_stage"] == 5
+    assert trainer["env_vars"] == {"PRIME_LORA_MM_PROFILE": "sm89-r32"}
     assert trainer["optim"] == {
         "type": "muon",
         "lr": 8e-6,

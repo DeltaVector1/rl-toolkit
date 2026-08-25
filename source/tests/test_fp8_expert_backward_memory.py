@@ -15,7 +15,7 @@ class FP8ExpertBackwardMemoryTest(unittest.TestCase):
         forward = SOURCE.split("class _InplacePermutedLoRAExperts", 1)[1].split(
             "    @staticmethod\n    def backward", 1
         )[0]
-        branch = forward.index("if save_backward_state:")
+        branch = forward.index("if save_intermediates:")
         quantize = forward.index("ops.scaled_fp8_quant", branch)
         skip = forward.index("if not save_backward_state:", quantize)
         self.assertLess(branch, quantize)
@@ -39,10 +39,26 @@ class FP8ExpertBackwardMemoryTest(unittest.TestCase):
         self.assertIn("ctx.offload_done.synchronize()", cpu_branch)
         self.assertEqual(backward.count("ctx.offload_done.synchronize()"), 1)
         self.assertNotIn("permuted_indices_host", backward)
-        self.assertIn(
-            "ctx.received_input.reconstruct_rows(\n                reconstruction_indices,",
-            backward,
+        self.assertEqual(backward.count("ctx.received_input.reconstruct_rows("), 2)
+
+    def test_native_lora_reacquires_current_parameter_storage(self):
+        section = SOURCE.split("class _InplacePermutedLoRAExperts", 1)[1].split(
+            "\n\nclass _ScaleRoutedOutput", 1
+        )[0]
+        forward, backward = section.split(
+            "    @staticmethod\n    def backward", 1
         )
+        saved = forward.split("ctx.save_for_backward(", 1)[1].split(
+            "        )\n", 1
+        )[0]
+        self.assertNotIn("w1_lora_a", saved)
+        self.assertNotIn("w3_lora_b", saved)
+        self.assertIn("ctx.lora_parameter_metadata", forward)
+        self.assertIn(
+            'getattr(owner, f"{projection}_lora_{factor}")[0]', backward
+        )
+        self.assertIn("value.to_local() if isinstance(value, DTensor)", backward)
+        self.assertIn("*parameter_grads,", backward)
 
     def test_native_lora_backward_has_no_nested_autograd(self):
         native_lora = SOURCE.split("def _grouped_lora_backward", 1)[1].split(
@@ -135,6 +151,17 @@ class FP8ExpertBackwardMemoryTest(unittest.TestCase):
         loop_end = backward.index("if _EXPERT_PROFILE:", release)
         self.assertLess(release, loop_end)
         self.assertIn("x_grad_w3,", backward[release:loop_end])
+
+    def test_native_lora_releases_second_base_gradient_before_reconstruction(self):
+        backward = SOURCE.split("class _InplacePermutedLoRAExperts", 1)[1].split(
+            "\n\nclass _ScaleRoutedOutput", 1
+        )[0].split("    @staticmethod\n    def backward", 1)[1]
+        combine = backward.index("x_grad.add_(x_grad_w3)")
+        release = backward.index("del x_grad_w3", combine)
+        reconstruct = backward.index("ctx.received_input.reconstruct_rows", release)
+        self.assertLess(combine, release)
+        self.assertLess(release, reconstruct)
+        self.assertNotIn("x_grad_w3,", backward[reconstruct:])
 
 
 if __name__ == "__main__":

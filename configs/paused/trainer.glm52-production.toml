@@ -3,6 +3,9 @@ max_steps = 200
 dist_timeout_seconds = 5400
 enable_router_replay = true
 
+[env_vars]
+PRIME_LORA_MM_PROFILE = "sm89-r32"
+
 [parity_guard]
 max_unmasked_mismatch_kl = 0.1
 max_masked_mismatch_kl = 0.5
@@ -16,7 +19,7 @@ ranks_filter = [0]
 project = "prod-run"
 name = "trainer-glm52-1"
 group = "glm52-decensor-r32"
-tags = ["glm-5.2", "native-fp8", "lora-r32", "full-expert-lora", "pp8", "cp8", "ep8", "64x4090", "b1024", "g16", "32768", "lr8e-6", "production"]
+tags = ["glm-5.2", "native-fp8", "lora-r32", "full-expert-lora", "pp8", "cp8", "ep8", "64x4090", "b2048", "g16", "32768", "lr8e-6", "production"]
 
 [file_monitor]
 filename = "run_glm52-1/trainer-metrics.jsonl"
@@ -29,7 +32,11 @@ seq_len = 32768
 attn = "flash_attention_2"
 cp = 8
 pp = 8
+pp_schedule = "1f1b"
 pp_transfer_sparse_indices = true
+pp_limit_receive_buffers = true
+pp_boundary_plan = "explicit"
+pp_layer_boundaries = [0, 8, 18, 28, 38, 48, 58, 69, 78]
 cp_style = "ring"
 ep = 8
 global_ep = false
@@ -55,7 +62,7 @@ type = "fp8"
 dequantize_checkpoint = false
 diagnose_linear_backward = false
 fused_qkv_a_fp8 = true
-expert_activation_transport = "bf16_forward_fp8_backward"
+expert_activation_transport = "bf16_forward_fp8_local_recompute_backward"
 w8a16_modules = []
 
 [model.lora]
@@ -67,6 +74,7 @@ target_modules = ["q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_
 [model.ac]
 mode = "reentrant_attention_all_experts"
 freq = 1
+keep_routed_expert_activations_from_pp_stage = 5
 
 [optim]
 type = "muon"

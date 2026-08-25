@@ -106,6 +106,7 @@ fi
 prime_configs_mount=(
   -v "$deployment/source/packages/prime-rl-configs/src/prime_rl/configs/trainer.py":/app/packages/prime-rl-configs/src/prime_rl/configs/trainer.py:ro
 )
+
 if [ -n "${PRIME_CONFIGS_OVERRIDE_DIR:-}" ]; then
   test -f "$PRIME_CONFIGS_OVERRIDE_DIR/configs/trainer.py" || {
     echo "PRIME_CONFIGS_OVERRIDE_DIR must contain configs/trainer.py" >&2
@@ -134,7 +135,7 @@ case ${1:-} in
     if [ "$rank" -lt 0 ]; then
       echo "node $node is not in trainer_nodes ($trainer_nodes)" >&2; exit 1
     fi
-    IFS='|' read -r rollout_transport trainer_output trainer_only parity_trace_dir parity_trace_source parity_pp parity_cp parity_batch parity_max_calls parity_max_files parity_max_bytes parity_diagnostics parity_diagnostic_tokens parity_diagnostic_max_files parity_diagnostic_max_bytes configured_int4_combine_rounds configured_fp8_expert_activation_offload configured_profile_requested configured_profile_pp_stage configured_ep_profile configured_ep_profile_every configured_expert_profile_every configured_layer_profile_every < <(
+    IFS='|' read -r rollout_transport trainer_output trainer_only parity_trace_dir parity_trace_source parity_pp parity_cp parity_batch parity_max_calls parity_max_files parity_max_bytes parity_diagnostics parity_diagnostic_tokens parity_diagnostic_max_files parity_diagnostic_max_bytes configured_int4_combine_rounds configured_fp8_expert_activation_offload configured_lora_mm_profile configured_profile_requested configured_profile_pp_stage configured_ep_profile configured_ep_profile_every configured_expert_profile_every configured_layer_profile_every < <(
       python3 - "$trainer_config" <<'PY'
 import sys
 import tomllib
@@ -150,6 +151,7 @@ fake = data.get("fake", {})
 memory_env = (
     env_vars.get("PRIME_INT4_COMBINE_ROUNDS", ""),
     env_vars.get("PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD", ""),
+    env_vars.get("PRIME_LORA_MM_PROFILE", ""),
 )
 profile_names = (
     "PRIME_PROFILE_PP_STAGE",
@@ -201,6 +203,10 @@ PY
       int4_combine_rounds="${PRIME_INT4_COMBINE_ROUNDS:-1}"
       fp8_expert_activation_offload="${PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD:-0}"
     fi
+    case "${configured_lora_mm_profile:-legacy}" in
+      auto|legacy|sm89-r32) lora_mm_profile="${configured_lora_mm_profile:-legacy}" ;;
+      *) echo "PRIME_LORA_MM_PROFILE must be auto, legacy, or sm89-r32" >&2; exit 1 ;;
+    esac
     if [ "$configured_profile_requested" = "1" ]; then
       [ "$(readlink -f "$trainer_config")" = "$(readlink -f "$deployment/configs/qualification/glm52-native-small.toml")" ] || {
         echo "CUDA profiling may only be enabled by the GLM small qualification config" >&2
@@ -500,6 +506,7 @@ PY
       -e PRIME_EP_AC_CACHE="${PRIME_EP_AC_CACHE:-0}" \
       -e PRIME_INT4_COMBINE_ROUNDS="$int4_combine_rounds" \
       -e PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD="$fp8_expert_activation_offload" \
+      -e PRIME_LORA_MM_PROFILE="$lora_mm_profile" \
       -e PRIME_PP_MAX_MICRO="${PRIME_PP_MAX_MICRO:-}" \
       -e PRIME_STATS_DEBUG="${PRIME_STATS_DEBUG:-}" \
       --entrypoint /app/.venv/bin/torchrun "$image" \

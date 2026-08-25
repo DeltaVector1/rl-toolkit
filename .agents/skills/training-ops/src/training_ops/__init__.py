@@ -6872,13 +6872,13 @@ def _glm_qualification_limits() -> tuple[int, int, float, float]:
     if (
         isinstance(duration, bool)
         or not isinstance(duration, (int, float))
-        or not 1 <= duration <= 480
+        or duration != 900
     ):
         raise Refused("GLM qualification trainer time limit is invalid")
     if (
         isinstance(memory, bool)
         or not isinstance(memory, (int, float))
-        or not 1 <= memory < 47.5
+        or memory != 46.0
     ):
         raise Refused("GLM qualification memory limit is invalid")
     return age, session_duration, float(duration), float(memory)
@@ -7045,6 +7045,44 @@ def _validate_trainer_qualification(
             elif input_sha256 == previous_input:
                 failures.append(f"qualification step {row['step']} reused the previous input")
             previous_input = input_sha256
+        if profile_name == "glm52-native-stability20":
+            steady_times = sorted(
+                float(row["time/forward_backward"])
+                for row in records[1:]
+                if isinstance(row, dict)
+                and isinstance(row.get("time/forward_backward"), (int, float))
+                and not isinstance(row.get("time/forward_backward"), bool)
+                and math.isfinite(row["time/forward_backward"])
+            )
+            if len(steady_times) != 19:
+                failures.append("qualification steady trainer times are incomplete")
+            else:
+                median_time = statistics.median(steady_times)
+                p90_time = steady_times[math.ceil(0.9 * len(steady_times)) - 1]
+                if median_time > 750:
+                    failures.append("qualification median trainer time exceeds the limit")
+                if p90_time > 1.2 * median_time:
+                    failures.append("qualification trainer time is not stable")
+            first_memory = [
+                float(row["perf/peak_memory"])
+                for row in records[:5]
+                if isinstance(row, dict)
+                and isinstance(row.get("perf/peak_memory"), (int, float))
+                and not isinstance(row.get("perf/peak_memory"), bool)
+                and math.isfinite(row["perf/peak_memory"])
+            ]
+            last_memory = [
+                float(row["perf/peak_memory"])
+                for row in records[-5:]
+                if isinstance(row, dict)
+                and isinstance(row.get("perf/peak_memory"), (int, float))
+                and not isinstance(row.get("perf/peak_memory"), bool)
+                and math.isfinite(row["perf/peak_memory"])
+            ]
+            if len(first_memory) != 5 or len(last_memory) != 5:
+                failures.append("qualification memory trend is incomplete")
+            elif max(last_memory) > statistics.median(first_memory) + 0.5:
+                failures.append("qualification memory use grew across the run")
     runtime_ranks = result.get("runtime_ranks")
     expected_runtime = []
     if isinstance(image_digests, dict) and isinstance(source_files, dict):

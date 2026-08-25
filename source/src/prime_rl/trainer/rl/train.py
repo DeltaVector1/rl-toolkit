@@ -1979,6 +1979,7 @@ def train(config: TrainerConfig):
                     if config.model.pp_schedule == "interleaved_1f1b"
                     else _example_outputs[0]
                 ),
+                limit_receive_buffers=config.model.pp_limit_receive_buffers,
             )
             # FSDP must be initialised before the schedule issues its first
             # prefetch, which happens before any forward on some stages.

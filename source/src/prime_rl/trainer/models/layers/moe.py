@@ -1023,9 +1023,25 @@ class MoE(nn.Module):
         if self.score_before_experts:
             routed_input = (routed_input.to(torch.float32) * top_scores_experts_sorted.reshape(-1, 1)).to(x.dtype)
 
-        routed_output = self.experts(routed_input, num_tokens_per_expert)
+        local_recompute = getattr(
+            self.experts,
+            "local_recompute_backward",
+            False,
+        )
+        if local_recompute:
+            if self.score_before_experts:
+                raise RuntimeError(
+                    "local expert recompute requires route scores after expert compute"
+                )
+            routed_output = self.experts(
+                routed_input,
+                num_tokens_per_expert,
+                top_scores_experts_sorted,
+            )
+        else:
+            routed_output = self.experts(routed_input, num_tokens_per_expert)
 
-        if not self.score_before_experts:
+        if not self.score_before_experts and not local_recompute:
             if self.experts.fp8_checkpoint:
                 routed_output = scale_routed_output(
                     routed_output,

@@ -244,6 +244,29 @@ def derive_interleaved_transport_capacities(
     return capacities
 
 
+def derive_1f1b_transport_capacities(
+    stage_index: int,
+    num_stages: int,
+    num_microbatches: int,
+) -> dict[str, int]:
+    """Return the live receive-buffer counts for ``Schedule1F1B``."""
+    if num_stages < 1 or num_microbatches < num_stages:
+        raise ValueError(
+            "1f1b transport sizing needs at least one micro-batch per stage"
+        )
+    if not 0 <= stage_index < num_stages:
+        raise ValueError(f"pipeline stage {stage_index} is outside [0, {num_stages})")
+
+    if stage_index == 0:
+        forward = 0
+        sparse = 0
+    else:
+        forward = min(num_microbatches, num_stages - stage_index)
+        sparse = 1
+    backward = 0 if stage_index == num_stages - 1 else 1
+    return {"forward": forward, "backward": backward, "sparse": sparse}
+
+
 class PipelineStageModule(nn.Module):
     """One pipeline stage: hidden states in, hidden states (or loss) out.
 
@@ -964,6 +987,7 @@ def build_schedule(
     schedule_name: str,
     example_input=None,
     example_output=None,
+    limit_receive_buffers: bool = False,
 ):
     """Wrap ``stage_module`` in a PipelineStage and pick a schedule.
 
@@ -996,7 +1020,9 @@ def build_schedule(
         list(example_output) if schedule_name == "interleaved_1f1b" else [example_output]
     )
     local_stage_count = len(stage_modules)
-    exact_transport_capacities = schedule_name == "interleaved_1f1b"
+    exact_transport_capacities = schedule_name == "interleaved_1f1b" or (
+        schedule_name == "1f1b" and limit_receive_buffers
+    )
     for local_index, module in enumerate(stage_modules):
         if module.transfer_sparse_indices:
             if True not in stage_classes:
@@ -1053,6 +1079,14 @@ def build_schedule(
         )
         for stage in stages:
             stage.set_transport_capacities(capacities[stage.stage_index])
+    elif schedule_name == "1f1b" and limit_receive_buffers:
+        stages[0].set_transport_capacities(
+            derive_1f1b_transport_capacities(
+                stages[0].stage_index,
+                pp_size,
+                n_microbatches,
+            )
+        )
     return schedule
 
 

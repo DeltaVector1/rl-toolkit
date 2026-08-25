@@ -172,7 +172,7 @@ class EdgeOperationsTest(unittest.TestCase):
             "glm52-native-stability20"
         )
         result["steps"][0]["data/rollout_rows"] = 2047
-        result["steps"][1]["time/forward_backward"] = 481
+        result["steps"][1]["time/forward_backward"] = 901
         result["steps"][2]["perf/peak_memory"] = 46.1
         result["adapter"] = None
         failures = training_ops._validate_trainer_qualification(
@@ -199,6 +199,20 @@ class EdgeOperationsTest(unittest.TestCase):
         self.assertTrue(any("reused" in failure for failure in failures))
         self.assertTrue(any("stale" in failure for failure in failures))
         self.assertTrue(any("runtime rank" in failure for failure in failures))
+
+    def test_stability20_rejects_unstable_time_and_growing_memory(self):
+        session, result, profile, now = self.qualification_evidence(
+            "glm52-native-stability20"
+        )
+        result["steps"][-2]["time/forward_backward"] = 500
+        result["steps"][-1]["time/forward_backward"] = 500
+        for row in result["steps"][-5:]:
+            row["perf/peak_memory"] = 44.6
+        failures = training_ops._validate_trainer_qualification(
+            session, result, profile, "glm52-native-stability20", now=now
+        )
+        self.assertTrue(any("trainer time is not stable" in failure for failure in failures))
+        self.assertTrue(any("memory use grew" in failure for failure in failures))
 
     def test_trainer_qualification_rejects_adapter_path_config_and_checksum(self):
         session, result, profile, now = self.qualification_evidence(

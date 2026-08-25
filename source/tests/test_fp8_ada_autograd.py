@@ -125,6 +125,7 @@ def _install_lora_import_stubs() -> None:
 _install_fp8_import_stubs()
 _install_lora_import_stubs()
 fp8_ada = _load_module("_fp8_ada_under_test", FP8_ADA_PATH)
+sys.modules["prime_rl.trainer.models.layers.fp8_ada"] = fp8_ada
 multi_linear = _load_module("_multi_linear_under_test", MULTI_LINEAR_PATH)
 
 
@@ -197,11 +198,13 @@ class FP8AdaAutogradTest(unittest.TestCase):
                 x_ref = x.detach().requires_grad_(True)
                 a_ref = a.detach().requires_grad_(True)
                 b_ref = b.detach().requires_grad_(True)
-                output = fp8_ada._grouped_lora_projection(
-                    x_ref,
-                    a_ref,
-                    b_ref,
-                    offsets,
+                output, saved_low_rank = (
+                    fp8_ada._grouped_lora_projection_with_low_rank(
+                        x_ref,
+                        a_ref,
+                        b_ref,
+                        offsets,
+                    )
                 )
                 expected = torch.autograd.grad(
                     output,
@@ -223,6 +226,7 @@ class FP8AdaAutogradTest(unittest.TestCase):
                     grad,
                     grad_a,
                     grad_b,
+                    low_rank=saved_low_rank.detach(),
                 )
 
         for value, reference in zip(
@@ -1327,6 +1331,34 @@ class FP8AdaAutogradTest(unittest.TestCase):
 
 
 class MultiLinearAutogradTest(unittest.TestCase):
+    def test_sm89_rank32_lora_config_covers_glm_shapes(self):
+        self.assertEqual(
+            multi_linear._lora_mm_config(4096, 6144, 32, "sm89-r32"),
+            multi_linear._LoraMmConfig(128, 32, 64, 8),
+        )
+        self.assertEqual(
+            multi_linear._lora_mm_config(4096, 32, 24576, "sm89-r32"),
+            multi_linear._LoraMmConfig(64, 128, 32, 8),
+        )
+        self.assertEqual(
+            multi_linear._lora_mm_config(32, 4096, 6144, "sm89-r32"),
+            multi_linear._LoraMmConfig(32, 128, 64, 4),
+        )
+
+    def test_legacy_lora_config_remains_selectable(self):
+        self.assertEqual(
+            multi_linear._lora_mm_config(4096, 6144, 32, "legacy"),
+            multi_linear._LoraMmConfig(32, 32, 32, 4),
+        )
+        self.assertEqual(
+            multi_linear._lora_mm_config(4096, 6144, 24576, "legacy"),
+            multi_linear._LoraMmConfig(64, 128, 32, 8),
+        )
+
+    def test_lora_config_rejects_unknown_profile(self):
+        with self.assertRaisesRegex(ValueError, "must be auto, legacy, or sm89-r32"):
+            multi_linear._lora_mm_config(4096, 6144, 32, "unknown")
+
     def test_lora_mm_rejects_mismatched_shapes(self):
         with self.assertRaisesRegex(ValueError, "LoRA matrix mismatch"):
             multi_linear._lora_mm(torch.randn(2, 3), torch.randn(4, 5))

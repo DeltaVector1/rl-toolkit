@@ -18,6 +18,7 @@ class NativeFP8MultiLoRAGroupedExperts(MultiLoRAModule):
 
     requires_received_expert_input = True
     fp8_checkpoint = True
+    local_recompute_backward = False
 
     def __init__(
         self,
@@ -148,6 +149,7 @@ class NativeFP8MultiLoRAGroupedExperts(MultiLoRAModule):
         x: torch.Tensor,
         num_tokens_per_expert: torch.Tensor,
         received_input=None,
+        received_scores=None,
     ) -> torch.Tensor:
         adapter_index = 0
         scaling = self.alpha / self.rank
@@ -168,5 +170,6 @@ class NativeFP8MultiLoRAGroupedExperts(MultiLoRAModule):
             x,
             num_tokens_per_expert,
             received_input,
+            received_scores,
             owner=self,
         )

@@ -203,12 +203,16 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
         self.assertEqual([(left.index, right.index) for left, right in forward], [(0, 1), (8, 9)])
         self.assertEqual([(left.index, right.index) for left, right in backward], [(9, 8), (1, 0)])
 
-    def test_small_profile_uses_recompute_backward_transport(self):
+    def test_small_profile_uses_late_stage_local_recompute(self):
         with (ROOT / "configs/qualification/glm52-native-small.toml").open("rb") as stream:
             config = tomllib.load(stream)
         self.assertEqual(
             config["model"]["quantization"]["expert_activation_transport"],
-            "bf16_forward_fp8_recompute_backward",
+            "bf16_forward_fp8_local_recompute_backward",
+        )
+        self.assertEqual(
+            config["model"]["ac"]["keep_routed_expert_activations_from_pp_stage"],
+            5,
         )
 
     def test_b2048_profile_uses_64_full_context_microbatches(self):

@@ -1007,6 +1007,8 @@ def get_model(
             subconfig.use_cache = False
     model_config.use_grouped_mm = config.moe_use_grouped_mm
     model_config.pp_transfer_sparse_indices = config.pp_transfer_sparse_indices
+    model_config.pp_boundary_plan = config.pp_boundary_plan
+    model_config.pp_layer_boundaries = config.pp_layer_boundaries
     checkpoint_quantization = getattr(model_config, "quantization_config", {})
     model_config.fp8_source_checkpoint = isinstance(config.quantization, FP8Config) and (
         checkpoint_quantization.get("quant_method") == "fp8"
@@ -1617,6 +1619,25 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
     logger = get_logger()
     language_model = get_language_model(model)
     target_list = sorted(frozenset(ac_config.targets))
+    keep_routed_expert_activations = False
+    routed_expert_cutoff = ac_config.keep_routed_expert_activations_from_pp_stage
+    if routed_expert_cutoff is not None:
+        pp_rank = getattr(language_model, "pp_physical_rank", None)
+        pp_size = getattr(language_model, "pp_physical_size", None)
+        virtual_stages = getattr(language_model, "pp_virtual_stages", 1)
+        if pp_rank is None or pp_size is None or pp_size <= 1:
+            raise ValueError(
+                "keep_routed_expert_activations_from_pp_stage requires pipeline parallelism"
+            )
+        if virtual_stages != 1:
+            raise ValueError(
+                "keep_routed_expert_activations_from_pp_stage does not support interleaved pipeline stages"
+            )
+        if routed_expert_cutoff >= pp_size:
+            raise ValueError(
+                "keep_routed_expert_activations_from_pp_stage must be less than the pipeline size"
+            )
+        keep_routed_expert_activations = pp_rank >= routed_expert_cutoff
     selective_layers = 0
     full_layers = 0
     fallback_layer_types: set[str] = set()
@@ -1642,7 +1663,10 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
             set_reentrant_attention_shared_expert_checkpointing(transformer_block)
             full_layers += 1
         elif ac_config.mode == "reentrant_attention_all_experts":
-            set_reentrant_attention_all_experts_checkpointing(transformer_block)
+            if keep_routed_expert_activations:
+                set_reentrant_attention_shared_expert_checkpointing(transformer_block)
+            else:
+                set_reentrant_attention_all_experts_checkpointing(transformer_block)
             full_layers += 1
         elif ac_config.mode == "selective" and supports_selective_activation_checkpointing(transformer_block):
             model_supported_targets.update(get_supported_targets(transformer_block))
@@ -1677,7 +1701,8 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
 
     logger.info(
         f"Applied activation checkpointing (mode={ac_config.mode}, "
-        f"freq={ac_config.freq}, layers={full_layers})"
+        f"freq={ac_config.freq}, layers={full_layers}, "
+        f"keep_routed_expert_activations={keep_routed_expert_activations})"
     )
 
 
@@ -1804,8 +1829,33 @@ def apply_ep(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims)
                         raise TypeError(
                             "native FP8 routed-expert LoRA requires FP8 quantization"
                         )
+                    transport = quant.expert_activation_transport
+                    stage_selection = {}
+                    if (
+                        transport
+                        == "bf16_forward_fp8_local_recompute_backward"
+                    ):
+                        if config.ac is None:
+                            raise RuntimeError(
+                                "local expert recompute has no activation-checkpoint configuration"
+                            )
+                        cutoff = (
+                            config.ac.keep_routed_expert_activations_from_pp_stage
+                        )
+                        if cutoff is None or not parallel_dims.pp_enabled:
+                            raise RuntimeError(
+                                "local expert recompute has no pipeline cutoff"
+                            )
+                        stage_selection = {
+                            "pp_stage": parallel_dims.get_mesh(
+                                "pp"
+                            ).get_local_rank(),
+                            "pp_size": parallel_dims.pp,
+                            "local_recompute_cutoff": cutoff,
+                        }
                     parallelize_plan = NativeFP8LoRAAllToAllExpertParallel(
-                        quant.expert_activation_transport
+                        transport,
+                        **stage_selection,
                     )
                 elif (isinstance(quant, MXFP8Config) and quant.enable_a2a) or (
                     isinstance(quant, FP8Config)

@@ -87,7 +87,7 @@ h200_parity_listener_stabilization_seconds = 30
 [limits.glm52_qualification]
 evidence_max_age_seconds = 86400
 session_duration_seconds_max = 14400
-forward_backward_seconds_max = 480
+forward_backward_seconds_max = 900
 peak_memory_gib_max = 46.0
 
 [limits.h200_parity_cleanup]
@@ -135,7 +135,7 @@ trainer_seconds_max = 480
 rollout_seconds_max = 1200
 
 [requirements.glm52]
-batch_size = 1024
+batch_size = 2048
 context_length = 32768
 trainer_seconds_min = 600
 trainer_seconds_max = 900

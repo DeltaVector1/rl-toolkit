@@ -2194,6 +2194,16 @@ class _InplacePermutedExperts(torch.autograd.Function):
 
 def _grouped_lora_projection(x, lora_a, lora_b, offsets):
     """Run one expert LoRA projection without changing the FP8 base path."""
+    output, _ = _grouped_lora_projection_with_low_rank(
+        x,
+        lora_a,
+        lora_b,
+        offsets,
+    )
+    return output
+
+
+def _grouped_lora_projection_with_low_rank(x, lora_a, lora_b, offsets):
     if x.dtype not in (torch.bfloat16, torch.float16):
         raise TypeError(f"expert LoRA input must be BF16 or FP16, got {x.dtype}")
     if lora_a.dtype != x.dtype or lora_b.dtype != x.dtype:
@@ -2215,10 +2225,13 @@ def _grouped_lora_projection(x, lora_a, lora_b, offsets):
         lora_a.transpose(-2, -1),
         offs=offsets,
     )
-    return torch._grouped_mm(
+    return (
+        torch._grouped_mm(
+            low_rank,
+            lora_b.transpose(-2, -1),
+            offs=offsets,
+        ),
         low_rank,
-        lora_b.transpose(-2, -1),
-        offs=offsets,
     )
 
 
@@ -2279,6 +2292,7 @@ def _grouped_lora_backward(
     grad_output,
     grad_a,
     grad_b,
+    low_rank=None,
 ):
     """Compute one grouped LoRA backward without nested autograd."""
     if grad_output.dtype != x.dtype:
@@ -2292,11 +2306,18 @@ def _grouped_lora_backward(
             f"native expert LoRA backward supports rank 32, got {lora_a.shape[1]}"
         )
 
-    low_rank = torch._grouped_mm(
-        x,
-        lora_a.transpose(-2, -1),
-        offs=offsets,
-    )
+    if low_rank is None:
+        low_rank = torch._grouped_mm(
+            x,
+            lora_a.transpose(-2, -1),
+            offs=offsets,
+        )
+    elif (
+        low_rank.device != x.device
+        or low_rank.dtype != x.dtype
+        or low_rank.shape != (x.shape[0], lora_a.shape[1])
+    ):
+        raise ValueError("saved expert LoRA low-rank activation is invalid")
     low_rank_grad = torch._grouped_mm(
         grad_output,
         lora_b,
@@ -2336,6 +2357,7 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
         offsets,
         owner,
         received_input,
+        received_scores,
         chunk_rows,
     ):
         if not x.is_cuda or x.dtype != torch.bfloat16:
@@ -2349,12 +2371,29 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
         scaling = float(scaling)
         if not math.isfinite(scaling) or scaling <= 0:
             raise ValueError("native routed-expert LoRA scaling must be finite and positive")
+        local_recompute = bool(
+            getattr(received_input, "local_recompute", False)
+        )
+        if local_recompute != (received_scores is not None):
+            raise RuntimeError(
+                "native expert local recompute state does not match its route scores"
+            )
+        if local_recompute and (
+            received_scores.device != x.device
+            or received_scores.dtype != torch.float32
+            or received_scores.shape != (x.shape[0],)
+            or not received_scores.is_contiguous()
+        ):
+            raise ValueError(
+                "native expert local recompute requires contiguous CUDA FP32 route scores"
+            )
 
         rows = permuted_indices.shape[0]
         save_backward_state = bool(
             getattr(received_input, "save_for_backward", True)
         )
-        if save_backward_state:
+        save_intermediates = save_backward_state and not local_recompute
+        if save_intermediates:
             q1_host = torch.empty(
                 rows,
                 w1.shape[1],
@@ -2404,7 +2443,7 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                 alpha=scaling,
             )
 
-            if save_backward_state:
+            if save_intermediates:
                 q1, qs1 = ops.scaled_fp8_quant(z1, use_per_token_if_dynamic=True)
                 q3, qs3 = ops.scaled_fp8_quant(z3, use_per_token_if_dynamic=True)
                 q1_host[start:end].copy_(q1, non_blocking=True)
@@ -2442,13 +2481,24 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                 chunk_offsets,
             )
 
+        if local_recompute:
+            for start in range(0, x.shape[0], chunk_rows):
+                end = min(start + chunk_rows, x.shape[0])
+                x[start:end].copy_(
+                    (
+                        x[start:end].float()
+                        * received_scores[start:end, None]
+                    ).to(x.dtype)
+                )
+
         if not save_backward_state:
             ctx.has_backward_state = False
             ctx.mark_dirty(x)
             return x
 
-        qs1 = torch.cat(qs1_parts, dim=0)
-        qs3 = torch.cat(qs3_parts, dim=0)
+        if save_intermediates:
+            qs1 = torch.cat(qs1_parts, dim=0)
+            qs3 = torch.cat(qs3_parts, dim=0)
         row_index_device = getattr(received_input, "row_index_device", None)
         if row_index_device == "cuda":
             saved_permuted_indices = permuted_indices.to(torch.int64)
@@ -2471,20 +2521,33 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
         ctx.row_index_device = row_index_device
         ctx.chunk_rows = min(chunk_rows, _FP8_EXPERT_BACKWARD_CHUNK_ROWS)
         ctx.scaling = scaling
-        ctx.save_for_backward(
-            q1_host,
-            qs1,
-            q3_host,
-            qs3,
-            saved_permuted_indices,
-            offsets,
-            w1_lora_a,
-            w1_lora_b,
-            w2_lora_a,
-            w2_lora_b,
-            w3_lora_a,
-            w3_lora_b,
+        ctx.local_recompute = local_recompute
+        ctx.lora_parameter_metadata = tuple(
+            (tuple(value.shape), value.dtype)
+            for value in (
+                w1_lora_a,
+                w1_lora_b,
+                w2_lora_a,
+                w2_lora_b,
+                w3_lora_a,
+                w3_lora_b,
+            )
         )
+        if local_recompute:
+            ctx.save_for_backward(
+                saved_permuted_indices,
+                offsets,
+                received_scores,
+            )
+        else:
+            ctx.save_for_backward(
+                q1_host,
+                qs1,
+                q3_host,
+                qs3,
+                saved_permuted_indices,
+                offsets,
+            )
         ctx.mark_dirty(x)
         return x
 
@@ -2498,20 +2561,19 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
             profile_start = torch.cuda.Event(enable_timing=True)
             profile_end = torch.cuda.Event(enable_timing=True)
             profile_start.record()
-        (
-            q1,
-            qs1,
-            q3,
-            qs3,
-            saved_permuted_indices,
-            offsets,
-            w1_lora_a,
-            w1_lora_b,
-            w2_lora_a,
-            w2_lora_b,
-            w3_lora_a,
-            w3_lora_b,
-        ) = ctx.saved_tensors
+        if ctx.local_recompute:
+            saved_permuted_indices, offsets, received_scores = ctx.saved_tensors
+            q1 = qs1 = q3 = qs3 = None
+        else:
+            (
+                q1,
+                qs1,
+                q3,
+                qs3,
+                saved_permuted_indices,
+                offsets,
+            ) = ctx.saved_tensors
+            received_scores = None
         owner = ctx.owner
         w1, s1, w2, s2, w3, s3 = (
             getattr(owner.base_layer, name)
@@ -2528,16 +2590,20 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
             value.to_local() if isinstance(value, DTensor) else value
             for value in (w1, s1, w2, s2, w3, s3)
         )
-
-        torch.cuda.current_stream(grad.device).wait_event(ctx.offload_done)
-        if ctx.row_index_device == "cpu":
-            ctx.offload_done.synchronize()
-        elif ctx.row_index_device != "cuda":
-            raise RuntimeError("native expert row-index device changed before backward")
-        grad = grad.contiguous()
-        workspace = ctx.received_input.make_workspace(ctx.chunk_rows, grad.device)
-        parameter_grads = [
-            torch.zeros_like(value)
+        (
+            w1_lora_a,
+            w1_lora_b,
+            w2_lora_a,
+            w2_lora_b,
+            w3_lora_a,
+            w3_lora_b,
+        ) = (
+            getattr(owner, f"{projection}_lora_{factor}")[0]
+            for projection in ("w1", "w2", "w3")
+            for factor in ("A", "B")
+        )
+        w1_lora_a, w1_lora_b, w2_lora_a, w2_lora_b, w3_lora_a, w3_lora_b = (
+            value.to_local() if isinstance(value, DTensor) else value
             for value in (
                 w1_lora_a,
                 w1_lora_b,
@@ -2546,7 +2612,34 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                 w3_lora_a,
                 w3_lora_b,
             )
-        ]
+        )
+        lora_parameters = (
+            w1_lora_a,
+            w1_lora_b,
+            w2_lora_a,
+            w2_lora_b,
+            w3_lora_a,
+            w3_lora_b,
+        )
+        current_metadata = tuple(
+            (tuple(value.shape), value.dtype) for value in lora_parameters
+        )
+        if current_metadata != ctx.lora_parameter_metadata:
+            raise RuntimeError("native expert LoRA parameter metadata changed before backward")
+
+        torch.cuda.current_stream(grad.device).wait_event(ctx.offload_done)
+        if ctx.row_index_device == "cpu":
+            ctx.offload_done.synchronize()
+        elif ctx.row_index_device != "cuda":
+            raise RuntimeError("native expert row-index device changed before backward")
+        grad = grad.contiguous()
+        workspace = ctx.received_input.make_workspace(ctx.chunk_rows, grad.device)
+        parameter_grads = [torch.zeros_like(value) for value in lora_parameters]
+        score_grads = (
+            torch.empty_like(received_scores)
+            if ctx.local_recompute
+            else None
+        )
 
         rows = saved_permuted_indices.shape[0]
         for start in range(0, rows, ctx.chunk_rows):
@@ -2562,14 +2655,135 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
             grad_chunk = _index_select_rows_with_cache_retry(grad, safe_indices)
             grad_chunk.masked_fill_((~real).unsqueeze(-1), 0)
             chunk_offsets = _expert_chunk_offsets(offsets, start, end)
+            recomputed_w1_low_rank = None
+            recomputed_w3_low_rank = None
 
-            q1_device = q1[start:end].to(grad.device, non_blocking=True)
-            z1 = q1_device.to(grad.dtype).mul_(qs1[start:end].to(grad.dtype))
-            del q1_device
-            q3_device = q3[start:end].to(grad.device, non_blocking=True)
-            z3 = q3_device.to(grad.dtype).mul_(qs3[start:end].to(grad.dtype))
-            del q3_device
-            hidden = F.silu(z1) * z3
+            if ctx.local_recompute:
+                reconstructed_x = torch.empty_like(grad_chunk)
+                ctx.received_input.reconstruct_rows(
+                    reconstruction_indices,
+                    reconstructed_x,
+                    workspace,
+                )
+                z1, z3 = _grouped_mm_pair(
+                    reconstructed_x,
+                    w1,
+                    s1,
+                    reconstructed_x,
+                    w3,
+                    s3,
+                    chunk_offsets,
+                    shared_input=True,
+                )
+                (
+                    z1_lora,
+                    recomputed_w1_low_rank,
+                ) = _grouped_lora_projection_with_low_rank(
+                    reconstructed_x,
+                    w1_lora_a,
+                    w1_lora_b,
+                    chunk_offsets,
+                )
+                z1.add_(
+                    z1_lora,
+                    alpha=ctx.scaling,
+                )
+                (
+                    z3_lora,
+                    recomputed_w3_low_rank,
+                ) = _grouped_lora_projection_with_low_rank(
+                    reconstructed_x,
+                    w3_lora_a,
+                    w3_lora_b,
+                    chunk_offsets,
+                )
+                z3.add_(
+                    z3_lora,
+                    alpha=ctx.scaling,
+                )
+                forward_hidden = F.silu(z1) * z3
+                chunk_out = _grouped_mm_chunked(
+                    forward_hidden,
+                    w2,
+                    s2,
+                    chunk_offsets,
+                )
+                chunk_out.add_(
+                    _grouped_lora_projection(
+                        forward_hidden,
+                        w2_lora_a,
+                        w2_lora_b,
+                        chunk_offsets,
+                    ),
+                    alpha=ctx.scaling,
+                )
+                quantized_out, output_scales = ops.scaled_fp8_quant(
+                    chunk_out,
+                    use_per_token_if_dynamic=True,
+                )
+                chunk_out = quantized_out.to(chunk_out.dtype).mul_(
+                    output_scales.to(chunk_out.dtype)
+                )
+                chunk_score_grads = (
+                    grad_chunk.float() * chunk_out.float()
+                ).sum(dim=-1)
+                _index_copy_real_rows_with_cache_retry(
+                    score_grads,
+                    indices,
+                    chunk_score_grads,
+                    real,
+                )
+                del (
+                    chunk_out,
+                    quantized_out,
+                    output_scales,
+                    chunk_score_grads,
+                )
+                chunk_scores = received_scores.index_select(0, safe_indices)
+                grad_chunk.copy_(
+                    (grad_chunk.float() * chunk_scores[:, None]).to(grad.dtype)
+                )
+                grad_chunk.masked_fill_((~real).unsqueeze(-1), 0)
+                quantized_grad, grad_scales = ops.scaled_fp8_quant(
+                    grad_chunk,
+                    use_per_token_if_dynamic=True,
+                )
+                grad_chunk.copy_(
+                    quantized_grad.to(grad.dtype).mul_(
+                        grad_scales.to(grad.dtype)
+                    )
+                )
+                del quantized_grad, grad_scales, chunk_scores
+                quantized_z1, z1_scales = ops.scaled_fp8_quant(
+                    z1,
+                    use_per_token_if_dynamic=True,
+                )
+                z1 = quantized_z1.to(z1.dtype).mul_(
+                    z1_scales.to(z1.dtype)
+                )
+                del quantized_z1, z1_scales
+                quantized_z3, z3_scales = ops.scaled_fp8_quant(
+                    z3,
+                    use_per_token_if_dynamic=True,
+                )
+                z3 = quantized_z3.to(z3.dtype).mul_(
+                    z3_scales.to(z3.dtype)
+                )
+                del quantized_z3, z3_scales
+                hidden = F.silu(z1) * z3
+                del forward_hidden
+            else:
+                q1_device = q1[start:end].to(grad.device, non_blocking=True)
+                z1 = q1_device.to(grad.dtype).mul_(
+                    qs1[start:end].to(grad.dtype)
+                )
+                del q1_device
+                q3_device = q3[start:end].to(grad.device, non_blocking=True)
+                z3 = q3_device.to(grad.dtype).mul_(
+                    qs3[start:end].to(grad.dtype)
+                )
+                del q3_device
+                hidden = F.silu(z1) * z3
 
             hidden_grad = _grouped_mm_chunked(
                 grad_chunk,
@@ -2604,13 +2818,16 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                 s3.transpose(-2, -1),
                 chunk_offsets,
             )
+            x_grad.add_(x_grad_w3)
+            del x_grad_w3
 
-            reconstructed_x = grad_chunk
-            ctx.received_input.reconstruct_rows(
-                reconstruction_indices,
-                reconstructed_x,
-                workspace,
-            )
+            if not ctx.local_recompute:
+                reconstructed_x = grad_chunk
+                ctx.received_input.reconstruct_rows(
+                    reconstruction_indices,
+                    reconstructed_x,
+                    workspace,
+                )
             lora_x_grad = _grouped_lora_backward(
                 reconstructed_x,
                 w1_lora_a,
@@ -2619,6 +2836,7 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                 z1_grad.mul(ctx.scaling),
                 parameter_grads[0],
                 parameter_grads[1],
+                low_rank=recomputed_w1_low_rank,
             )
             x_grad.add_(lora_x_grad)
             del lora_x_grad
@@ -2630,9 +2848,9 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                 z3_grad.mul(ctx.scaling),
                 parameter_grads[4],
                 parameter_grads[5],
+                low_rank=recomputed_w3_low_rank,
             )
             x_grad.add_(lora_x_grad)
-            x_grad.add_(x_grad_w3)
             _index_copy_real_rows_with_cache_retry(grad, indices, x_grad, real)
             del (
                 indices,
@@ -2643,15 +2861,21 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                 z1_grad,
                 z3_grad,
                 x_grad,
-                x_grad_w3,
                 reconstructed_x,
                 lora_x_grad,
+                recomputed_w1_low_rank,
+                recomputed_w3_low_rank,
             )
 
         if _EXPERT_PROFILE:
             profile_end.record()
             _profile_expert_backward(profile_start, profile_end)
-        del ctx.owner, ctx.received_input, ctx.offload_done
+        del (
+            ctx.owner,
+            ctx.received_input,
+            ctx.offload_done,
+            ctx.lora_parameter_metadata,
+        )
         return (
             grad,
             None,
@@ -2666,6 +2890,7 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
             None,
             None,
             None,
+            score_grads,
             None,
         )
 
@@ -2864,6 +3089,7 @@ def fp8_lora_experts(
     x,
     num_tokens_per_expert,
     received_input,
+    received_scores=None,
     *,
     owner,
 ):
@@ -2947,5 +3173,6 @@ def fp8_lora_experts(
         offsets,
         owner,
         received_input,
+        received_scores,
         _FP8_W13_CHUNK_ROWS,
     )
