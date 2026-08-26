@@ -34,6 +34,7 @@ def test_current_glm52_profile_is_batch_2048_without_rollout_cache() -> None:
         "glm52-native-small",
         "glm52-policy-parity",
         "glm52-native-b2048",
+        "glm52-native-delta3",
         "glm52-native-stability20",
     }
     current = operations["profiles"]["current"]
@@ -228,6 +229,7 @@ def test_all_glm52_trainers_use_h200_w8a8_semantics() -> None:
         "configs/qualification/glm52-policy-parity-trainer.toml",
         "configs/qualification/glm52-native-small.toml",
         "configs/qualification/glm52-native-b2048.toml",
+        "configs/qualification/glm52-native-delta3.toml",
         "configs/qualification/glm52-native-stability20.toml",
         "configs/paused/trainer.glm52-production.toml",
     }

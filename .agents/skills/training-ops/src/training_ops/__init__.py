@@ -7978,12 +7978,16 @@ def _validate_trainer_qualification(
     )
     expected_step_counts = {
         "glm52-native-b2048": 2,
+        "glm52-native-delta3": 3,
         "glm52-native-stability20": 20,
     }
     if profile_name not in expected_step_counts:
         raise Refused("GLM qualification profile is invalid")
     expected_steps = expected_step_counts[profile_name]
-    expected_adapter = profile_name == "glm52-native-stability20"
+    expected_adapter = profile_name in {
+        "glm52-native-delta3",
+        "glm52-native-stability20",
+    }
     profile_sha = hashlib.sha256(
         (repo_root / f"configs/qualification/{profile_name}.toml").read_bytes()
     ).hexdigest()
@@ -8215,7 +8219,7 @@ def _validate_trainer_qualification(
             PurePosixPath(profile["output_dir"])
             / "run_trainer_only"
             / "broadcasts"
-            / "step_20"
+            / f"step_{expected_steps}"
         )
         expected_paths = {
             "path": str(adapter_root / "adapter_model.safetensors"),
@@ -8226,7 +8230,7 @@ def _validate_trainer_qualification(
         layout = adapter.get("layout") if isinstance(adapter, dict) else None
         if (
             not isinstance(adapter, dict)
-            or adapter.get("step") != 20
+            or adapter.get("step") != expected_steps
             or re.fullmatch(r"[0-9a-f]{64}", str(adapter.get("sha256"))) is None
             or not isinstance(adapter.get("size"), int)
             or not isinstance(layout, dict)
@@ -10155,6 +10159,7 @@ def _qualify_connected(
         config = tomllib.load(stream)
     strict_qualification = name in {
         "glm52-native-b2048",
+        "glm52-native-delta3",
         "glm52-native-stability20",
     }
     if strict_qualification and nodes != [trainer_head] + [
