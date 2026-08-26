@@ -2271,6 +2271,81 @@ def _grouped_lora_projection(x, lora_a, lora_b, offsets):
     return output
 
 
+def _grouped_lora_projection_pair(
+    x,
+    first_lora_a,
+    first_lora_b,
+    second_lora_a,
+    second_lora_b,
+    offsets,
+):
+    """Share the first grouped GEMM for two projections with one input.
+
+    The W1 and W3 LoRA projections have the same input and row assignment.
+    Concatenating only their A factors removes one grouped launch. The two B
+    GEMMs remain separate because their output matrices are different.
+    """
+    first_output, second_output, _, _ = _grouped_lora_projection_pair_with_low_rank(
+        x,
+        first_lora_a,
+        first_lora_b,
+        second_lora_a,
+        second_lora_b,
+        offsets,
+    )
+    return first_output, second_output
+
+
+def _grouped_lora_projection_pair_with_low_rank(
+    x,
+    first_lora_a,
+    first_lora_b,
+    second_lora_a,
+    second_lora_b,
+    offsets,
+):
+    """Return paired LoRA outputs and both rank-sized intermediates."""
+    if x.dtype not in (torch.bfloat16, torch.float16):
+        raise TypeError(f"expert LoRA input must be BF16 or FP16, got {x.dtype}")
+    if first_lora_a.shape != second_lora_a.shape:
+        raise ValueError("paired expert LoRA A factors must have equal shapes")
+    if first_lora_b.shape != second_lora_b.shape:
+        raise ValueError("paired expert LoRA B factors must have equal shapes")
+    if first_lora_a.shape[1] != second_lora_a.shape[1]:
+        raise ValueError("paired expert LoRA ranks must match")
+    if first_lora_a.shape[2] != x.shape[1]:
+        raise ValueError("paired expert LoRA input widths do not match x")
+    if first_lora_a.dtype != x.dtype or second_lora_a.dtype != x.dtype:
+        raise TypeError("paired expert LoRA A factors must use the input dtype")
+    if first_lora_b.dtype != x.dtype or second_lora_b.dtype != x.dtype:
+        raise TypeError("paired expert LoRA B factors must use the input dtype")
+    if offsets.shape[0] != first_lora_a.shape[0]:
+        raise ValueError("paired expert LoRA factors and offsets have different expert counts")
+
+    joined_a = torch.cat((first_lora_a, second_lora_a), dim=1)
+    joined_low_rank = torch._grouped_mm(
+        x,
+        joined_a.transpose(-2, -1),
+        offs=offsets,
+    )
+    rank = first_lora_a.shape[1]
+    first_low_rank, second_low_rank = joined_low_rank.split(rank, dim=-1)
+    return (
+        torch._grouped_mm(
+            first_low_rank,
+            first_lora_b.transpose(-2, -1),
+            offs=offsets,
+        ),
+        torch._grouped_mm(
+            second_low_rank,
+            second_lora_b.transpose(-2, -1),
+            offs=offsets,
+        ),
+        first_low_rank,
+        second_low_rank,
+    )
+
+
 def _grouped_lora_projection_with_low_rank(x, lora_a, lora_b, offsets):
     if x.dtype not in (torch.bfloat16, torch.float16):
         raise TypeError(f"expert LoRA input must be BF16 or FP16, got {x.dtype}")
@@ -2504,24 +2579,23 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
             )
             _expert_phase_end(phase_timer)
             phase_timer = _expert_phase_start("forward.w13_lora")
+            z1_lora, z3_lora = _grouped_lora_projection_pair(
+                chunk_x,
+                w1_lora_a,
+                w1_lora_b,
+                w3_lora_a,
+                w3_lora_b,
+                chunk_offsets,
+            )
             z1.add_(
-                _grouped_lora_projection(
-                    chunk_x,
-                    w1_lora_a,
-                    w1_lora_b,
-                    chunk_offsets,
-                ),
+                z1_lora,
                 alpha=scaling,
             )
             z3.add_(
-                _grouped_lora_projection(
-                    chunk_x,
-                    w3_lora_a,
-                    w3_lora_b,
-                    chunk_offsets,
-                ),
+                z3_lora,
                 alpha=scaling,
             )
+            del z1_lora, z3_lora
             _expert_phase_end(phase_timer)
 
             # The gathered source rows are no longer needed after W1/W3 and
@@ -2780,30 +2854,26 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                 phase_timer = _expert_phase_start("backward.w13_lora")
                 (
                     z1_lora,
+                    z3_lora,
                     recomputed_w1_low_rank,
-                ) = _grouped_lora_projection_with_low_rank(
+                    recomputed_w3_low_rank,
+                ) = _grouped_lora_projection_pair_with_low_rank(
                     reconstructed_x,
                     w1_lora_a,
                     w1_lora_b,
+                    w3_lora_a,
+                    w3_lora_b,
                     chunk_offsets,
                 )
                 z1.add_(
                     z1_lora,
                     alpha=ctx.scaling,
                 )
-                (
-                    z3_lora,
-                    recomputed_w3_low_rank,
-                ) = _grouped_lora_projection_with_low_rank(
-                    reconstructed_x,
-                    w3_lora_a,
-                    w3_lora_b,
-                    chunk_offsets,
-                )
                 z3.add_(
                     z3_lora,
                     alpha=ctx.scaling,
                 )
+                del z1_lora, z3_lora
                 _expert_phase_end(phase_timer)
                 phase_timer = _expert_phase_start("backward.activation_restore")
                 forward_hidden = F.silu(z1) * z3

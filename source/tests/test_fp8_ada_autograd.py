@@ -167,6 +167,40 @@ def _expanded_block_scale(scale: torch.Tensor, shape: tuple[int, int]):
 
 
 class FP8AdaAutogradTest(unittest.TestCase):
+    def test_paired_lora_projection_matches_two_grouped_projections(self):
+        torch.manual_seed(17)
+        offsets = torch.tensor([3, 7], dtype=torch.int32)
+        x = torch.randn(7, 40, dtype=torch.bfloat16)
+        first_a = torch.randn(2, 32, 40, dtype=torch.bfloat16)
+        first_b = torch.randn(2, 48, 32, dtype=torch.bfloat16)
+        second_a = torch.randn(2, 32, 40, dtype=torch.bfloat16)
+        second_b = torch.randn(2, 48, 32, dtype=torch.bfloat16)
+
+        def dense_grouped(value, weights, *, offs):
+            output = []
+            start = 0
+            for end, weight in zip(offs.tolist(), weights, strict=True):
+                output.append(value[start:end] @ weight)
+                start = end
+            return torch.cat(output, dim=0)
+
+        with mock.patch.object(torch, "_grouped_mm", dense_grouped):
+            expected = (
+                fp8_ada._grouped_lora_projection(x, first_a, first_b, offsets),
+                fp8_ada._grouped_lora_projection(x, second_a, second_b, offsets),
+            )
+            actual = fp8_ada._grouped_lora_projection_pair(
+                x,
+                first_a,
+                first_b,
+                second_a,
+                second_b,
+                offsets,
+            )
+
+        for result, reference in zip(actual, expected, strict=True):
+            torch.testing.assert_close(result, reference, rtol=0.0, atol=0.0)
+
     def test_grouped_lora_backward_matches_autograd_with_non_power_of_two_scaling(self):
         torch.manual_seed(13)
         scaling = 0.73
