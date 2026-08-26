@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import struct
+import tempfile
 import threading
 import time
 import urllib.request
@@ -24,6 +25,11 @@ _GLM_RANGE_GZIP_ENV = "PRIME_GLM_ADAPTER_GZIP"
 _GLM_RANGE_CODEC_ENV = "PRIME_GLM_ADAPTER_CODEC"
 _GLM_RANGE_CHUNK_BYTES = 256 * 1024 * 1024
 _GLM_RANGE_ATTEMPTS = 3
+_ADAPTER_CONFIG_NAME = "adapter_config.json"
+_ADAPTER_CHECKSUM_NAME = "adapter_model.safetensors.sha256"
+_ADAPTER_MODEL_NAME = "adapter_model.safetensors"
+_ADAPTER_READY_NAME = "READY"
+_ADAPTER_IDENTITY_VERSION = 1
 _ZSTD_FRAME_BYTES = 8 * 1024 * 1024
 _zstd = None
 
@@ -104,6 +110,53 @@ def _sha256_file(path: Path) -> str:
         for block in iter(lambda: source.read(16 * 1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _adapter_identity(config: Path, checksum: Path) -> dict[str, object]:
+    """Read the export identity without trusting a cache marker."""
+    expected_model = checksum.read_text(encoding="ascii").strip()
+    if len(expected_model) != 64 or any(
+        character not in "0123456789abcdef" for character in expected_model
+    ):
+        raise ValueError("adapter SHA-256 file is invalid")
+    config_sha256 = _sha256_file(config)
+    identity = {
+        "version": _ADAPTER_IDENTITY_VERSION,
+        "adapter_config_sha256": config_sha256,
+        "adapter_model_sha256": expected_model,
+    }
+    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    identity["identity_sha256"] = hashlib.sha256(encoded).hexdigest()
+    return identity
+
+
+def _cached_adapter_matches(destination: Path, expected: dict[str, object]) -> bool:
+    """Accept a cached adapter only after checking all bound content."""
+    ready = destination / _ADAPTER_READY_NAME
+    if not ready.is_file() or ready.is_symlink():
+        return False
+    try:
+        cached = json.loads(ready.read_text(encoding="ascii"))
+    except (OSError, UnicodeError, ValueError):
+        return False
+    if cached != expected:
+        return False
+    config = destination / _ADAPTER_CONFIG_NAME
+    checksum = destination / _ADAPTER_CHECKSUM_NAME
+    model = destination / _ADAPTER_MODEL_NAME
+    if any(
+        not path.is_file() or path.is_symlink()
+        for path in (config, checksum, model)
+    ):
+        return False
+    try:
+        actual = _adapter_identity(config, checksum)
+        return (
+            actual == expected
+            and _sha256_file(model) == expected["adapter_model_sha256"]
+        )
+    except (OSError, UnicodeError, ValueError):
+        return False
 
 
 def _content_length(source_urls: list[str]) -> int:
@@ -496,25 +549,60 @@ class FileSystemWeightUpdateWorker(Worker):
         destination.parent.mkdir(parents=True, exist_ok=True)
         with (destination.parent / f"{destination.name}.lock").open("w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            if (destination / "READY").exists():
-                return
-            temporary = destination.with_name(f"{destination.name}.partial")
-            temporary.mkdir(exist_ok=True)
-            for filename in (
-                "adapter_config.json",
-                "adapter_model.safetensors.sha256",
-                "adapter_model.safetensors",
+            if destination.is_symlink() or (
+                destination.exists() and not destination.is_dir()
             ):
-                download(f"{source_url.rstrip('/')}/{filename}", temporary / filename)
-            expected_digest = (temporary / "adapter_model.safetensors.sha256").read_text().strip()
-            if len(expected_digest) != 64 or any(character not in "0123456789abcdef" for character in expected_digest):
-                raise ValueError("adapter SHA-256 file is invalid")
-            actual_digest = _sha256_file(temporary / "adapter_model.safetensors")
-            if actual_digest != expected_digest:
-                raise ValueError("downloaded adapter SHA-256 does not match the trainer export")
-            (temporary / "READY").touch()
-            shutil.rmtree(destination, ignore_errors=True)
-            temporary.rename(destination)
+                raise OSError(f"adapter cache path is unsafe: {destination}")
+            temporary = Path(
+                tempfile.mkdtemp(
+                    prefix=f"{destination.name}.partial-",
+                    dir=destination.parent,
+                )
+            )
+            try:
+                # The URL hash is only a storage location. Read the export's
+                # identity before accepting that location as a cache hit.
+                for filename in (_ADAPTER_CONFIG_NAME, _ADAPTER_CHECKSUM_NAME):
+                    download(
+                        f"{source_url.rstrip('/')}/{filename}",
+                        temporary / filename,
+                        create_only=True,
+                    )
+                expected = _adapter_identity(
+                    temporary / _ADAPTER_CONFIG_NAME,
+                    temporary / _ADAPTER_CHECKSUM_NAME,
+                )
+                if destination.is_dir() and _cached_adapter_matches(
+                    destination, expected
+                ):
+                    return
+
+                download(
+                    f"{source_url.rstrip('/')}/{_ADAPTER_MODEL_NAME}",
+                    temporary / _ADAPTER_MODEL_NAME,
+                    create_only=True,
+                )
+                actual_model = _sha256_file(temporary / _ADAPTER_MODEL_NAME)
+                if actual_model != expected["adapter_model_sha256"]:
+                    raise ValueError(
+                        "downloaded adapter SHA-256 does not match the trainer export"
+                    )
+                (temporary / _ADAPTER_READY_NAME).write_text(
+                    json.dumps(
+                        expected,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n",
+                    encoding="ascii",
+                )
+                if destination.exists():
+                    shutil.rmtree(destination)
+                temporary.rename(destination)
+                temporary = None
+            finally:
+                if temporary is not None:
+                    shutil.rmtree(temporary, ignore_errors=True)
 
     def update_weights_from_path(self, weight_path: str) -> None:
         """Update weights from a specified path in shared filesystem containing a HF-compatible checkpoint."""
