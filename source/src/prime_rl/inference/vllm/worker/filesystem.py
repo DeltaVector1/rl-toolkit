@@ -1,4 +1,6 @@
 import argparse
+import ctypes
+import ctypes.util
 import fcntl
 import gzip
 import hashlib
@@ -6,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import threading
 import time
 import urllib.request
@@ -18,8 +21,75 @@ from urllib.parse import urlsplit, urlunsplit
 _PARALLEL_DOWNLOAD_THRESHOLD = 16 * 1024 * 1024
 _PARALLEL_DOWNLOAD_STREAMS = 8
 _GLM_RANGE_GZIP_ENV = "PRIME_GLM_ADAPTER_GZIP"
+_GLM_RANGE_CODEC_ENV = "PRIME_GLM_ADAPTER_CODEC"
 _GLM_RANGE_CHUNK_BYTES = 256 * 1024 * 1024
 _GLM_RANGE_ATTEMPTS = 3
+_ZSTD_FRAME_BYTES = 8 * 1024 * 1024
+_zstd = None
+
+
+def _zstd_library():
+    global _zstd
+    if _zstd is None:
+        library = ctypes.util.find_library("zstd") or "libzstd.so.1"
+        try:
+            loaded = ctypes.CDLL(library)
+        except OSError as error:
+            raise OSError("zstd adapter transfer requires libzstd") from error
+        size_t = ctypes.c_size_t
+        loaded.ZSTD_decompress.argtypes = [
+            ctypes.c_void_p,
+            size_t,
+            ctypes.c_void_p,
+            size_t,
+        ]
+        loaded.ZSTD_decompress.restype = size_t
+        loaded.ZSTD_isError.argtypes = [size_t]
+        loaded.ZSTD_isError.restype = ctypes.c_uint
+        loaded.ZSTD_getErrorName.argtypes = [size_t]
+        loaded.ZSTD_getErrorName.restype = ctypes.c_char_p
+        _zstd = loaded
+    return _zstd
+
+
+def _zstd_decompress(encoded: bytes, raw_size: int) -> bytes:
+    library = _zstd_library()
+    output = ctypes.create_string_buffer(raw_size)
+    result = int(library.ZSTD_decompress(output, raw_size, encoded, len(encoded)))
+    if library.ZSTD_isError(result):
+        message = library.ZSTD_getErrorName(result).decode("utf-8", errors="replace")
+        raise OSError(f"zstd adapter decompression failed: {message}")
+    if result != raw_size:
+        raise OSError(f"zstd frame has wrong raw length: {result} != {raw_size}")
+    return output.raw[:result]
+
+
+def _read_exact(source, size: int) -> bytes:
+    chunks = []
+    remaining = size
+    while remaining:
+        chunk = source.read(remaining)
+        if not chunk:
+            raise EOFError("zstd adapter frame ended early")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _copy_zstd_range(source, output, raw_size: int) -> None:
+    remaining = raw_size
+    while remaining:
+        encoded_size, frame_size = struct.unpack("!II", _read_exact(source, 8))
+        if (
+            encoded_size == 0
+            or frame_size == 0
+            or frame_size > _ZSTD_FRAME_BYTES
+            or frame_size > remaining
+        ):
+            raise OSError("zstd adapter frame header is invalid")
+        encoded = _read_exact(source, encoded_size)
+        output.write(_zstd_decompress(encoded, frame_size))
+        remaining -= frame_size
 
 
 def adapter_cache_path(source_url: str) -> Path:
@@ -60,9 +130,14 @@ def _download_range(
     end: int,
     max_attempts: int = 10,
 ) -> None:
-    gzip_required = os.environ.get(_GLM_RANGE_GZIP_ENV, "0")
-    if gzip_required not in {"0", "1"}:
-        raise OSError(f"{_GLM_RANGE_GZIP_ENV} must be 0 or 1")
+    codec = os.environ.get(_GLM_RANGE_CODEC_ENV)
+    if codec is None:
+        gzip_required = os.environ.get(_GLM_RANGE_GZIP_ENV, "0")
+        if gzip_required not in {"0", "1"}:
+            raise OSError(f"{_GLM_RANGE_GZIP_ENV} must be 0 or 1")
+        codec = "gzip" if gzip_required == "1" else "identity"
+    if codec not in {"identity", "gzip", "zstd"}:
+        raise OSError(f"{_GLM_RANGE_CODEC_ENV} must be identity, gzip, or zstd")
     for attempt in range(max_attempts):
         try:
             source_url = source_urls[(source_index + attempt) % len(source_urls)]
@@ -77,8 +152,8 @@ def _download_range(
                 present = 0
             requested_start = start + present
             headers = {"Range": f"bytes={requested_start}-{end}"}
-            if gzip_required == "1":
-                headers["Accept-Encoding"] = "gzip"
+            if codec != "identity":
+                headers["Accept-Encoding"] = codec
             request = urllib.request.Request(source_url, headers=headers)
             with urllib.request.urlopen(request, timeout=60) as response:
                 if response.status != 206:
@@ -94,7 +169,7 @@ def _download_range(
                     or int(content_range.group(3)) <= end
                 ):
                     raise OSError("adapter server returned the wrong byte range")
-                if gzip_required == "1":
+                if codec == "gzip":
                     if response.headers.get("Content-Encoding", "").lower() != "gzip":
                         raise OSError("adapter server did not return required gzip")
                     if response.headers.get("X-Prime-Raw-Length") != str(
@@ -107,6 +182,19 @@ def _download_range(
                     ):
                         shutil.copyfileobj(
                             source, output, length=16 * 1024 * 1024
+                        )
+                elif codec == "zstd":
+                    if response.headers.get("Content-Encoding", "").lower() != "zstd":
+                        raise OSError("adapter server did not return required zstd")
+                    if response.headers.get("X-Prime-Codec") != "zstd-frames-v1":
+                        raise OSError("adapter server did not return framed zstd")
+                    if response.headers.get("X-Prime-Raw-Length") != str(
+                        end - requested_start + 1
+                    ):
+                        raise OSError("adapter zstd range length differs")
+                    with destination.open("ab" if present else "wb") as output:
+                        _copy_zstd_range(
+                            response, output, end - requested_start + 1
                         )
                 else:
                     with destination.open("ab" if present else "wb") as output:

@@ -234,6 +234,52 @@ class ParallelAdapterDownloadTest(unittest.TestCase):
             ):
                 self.module.download(self.url, rejected)
 
+    def test_glm_zstd_ranges_assemble_exact_file(self):
+        adapter_server = _load_adapter_server_module()
+
+        class Handler(adapter_server.GzipRangeHandler):
+            def log_message(self, *_args):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "runs").mkdir()
+            source = root / "runs/adapter"
+            source.write_bytes(_RangeHandler.payload)
+            server = ThreadingHTTPServer(
+                ("127.0.0.1", 0),
+                lambda *args, **kwargs: Handler(
+                    *args, directory=str(root), **kwargs
+                ),
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            destination = root / "downloaded.safetensors"
+            url = f"http://127.0.0.1:{server.server_port}/runs/adapter"
+            try:
+                with (
+                    patch.dict(
+                        os.environ,
+                        {
+                            "PRIME_GLM_ADAPTER_CODEC": "zstd",
+                            "PRIME_GLM_ADAPTER_GZIP": "0",
+                            "PRIME_ADAPTER_PORTS": "",
+                        },
+                    ),
+                    patch.object(self.module, "_PARALLEL_DOWNLOAD_THRESHOLD", 1),
+                    patch.object(self.module, "_GLM_RANGE_CHUNK_BYTES", 65536),
+                ):
+                    self.module.download(url, destination, create_only=True)
+            finally:
+                server.shutdown()
+                thread.join()
+                server.server_close()
+
+            self.assertEqual(destination.read_bytes(), _RangeHandler.payload)
+            self.assertFalse(
+                destination.with_name(f"{destination.name}.parts").exists()
+            )
+
     def test_glm_head_and_small_get_use_alternate_ports(self):
         adapter_server = _load_adapter_server_module()
 
