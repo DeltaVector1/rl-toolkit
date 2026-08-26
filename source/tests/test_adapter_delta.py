@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import shutil
 import struct
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from prime_rl.utils.adapter_delta import (
     ADAPTER_DELTA_FILE,
@@ -15,11 +18,13 @@ from prime_rl.utils.adapter_delta import (
     apply_adapter_delta,
     build_adapter_delta,
     load_adapter_delta_manifest,
+    load_adapter_delta_manifest_from_mapping,
     adapter_cache_identity,
     safetensors_metadata_sha256,
     select_adapter_transfer,
     wire_size_break_even,
 )
+from source.tests.test_adapter_cache_identity import _load_filesystem_module
 
 
 def _write_safetensors(path: Path, payload: bytes) -> None:
@@ -81,6 +86,8 @@ class AdapterDeltaTest(unittest.TestCase):
             corrupt = bytearray(delta.read_bytes())
             corrupt[-1] ^= 1
             delta.write_bytes(corrupt)
+            manifest = load_adapter_delta_manifest(target / "adapter_delta.json")
+            manifest["delta_sha256"] = hashlib.sha256(corrupt).hexdigest()
             active = root / "active.safetensors"
             active.write_bytes(b"active adapter")
             with self.assertRaises(AdapterDeltaError):
@@ -88,7 +95,7 @@ class AdapterDeltaTest(unittest.TestCase):
                     base / "adapter_model.safetensors",
                     delta,
                     active,
-                    load_adapter_delta_manifest(target / "adapter_delta.json"),
+                    manifest,
                 )
             self.assertEqual(active.read_bytes(), b"active adapter")
 
@@ -133,6 +140,114 @@ class AdapterDeltaTest(unittest.TestCase):
         old = "0" * 64
         new = "1" * 64
         self.assertNotEqual(adapter_cache_identity(url, old), adapter_cache_identity(url, new))
+        self.assertEqual(
+            adapter_cache_identity(url, old),
+            adapter_cache_identity("http://127.0.0.1:8100/runs/other-step", old),
+        )
+
+    def test_manifest_requires_base_identity_and_frame_size(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base = _export(root, "step_1", b"a" * 8192)
+            target = _export(root, "step_2", b"b" * 8192)
+            build_adapter_delta(base, target, max_ratio=0.99)
+            manifest = load_adapter_delta_manifest(target / "adapter_delta.json")
+            for field in ("base_size", "base_adapter_config_sha256", "base_tensor_metadata_sha256", "frame_bytes"):
+                invalid = dict(manifest)
+                invalid.pop(field)
+                with self.assertRaises(AdapterDeltaError):
+                    load_adapter_delta_manifest_from_mapping(invalid)
+
+    def test_oversize_frame_is_rejected_before_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base = _export(root, "step_1", b"a" * 8192)
+            target = _export(root, "step_2", b"b" * 8192)
+            build_adapter_delta(base, target, max_ratio=0.99)
+            manifest = load_adapter_delta_manifest(target / "adapter_delta.json")
+            manifest["frame_bytes"] = 1
+            output = root / "oversize.safetensors"
+            with self.assertRaisesRegex(AdapterDeltaError, "frame header"):
+                apply_adapter_delta(
+                    base / "adapter_model.safetensors",
+                    target / ADAPTER_DELTA_FILE,
+                    output,
+                    manifest,
+                )
+            self.assertFalse(output.exists())
+
+    def test_two_step_different_urls_reuses_base_without_full_target_download(self) -> None:
+        filesystem = _load_filesystem_module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sources = {
+                "step1": _export(root, "step1", b"a" * 8192),
+                "step2": _export(root, "step2", b"a" * 8191 + b"b"),
+            }
+            build_adapter_delta(sources["step1"], sources["step2"], max_ratio=0.99)
+            calls: list[str] = []
+
+            def fake_download(source_url, destination, create_only=False, **_kwargs):
+                self.assertTrue(create_only)
+                calls.append(source_url)
+                parts = source_url.rstrip("/").split("/")
+                step, filename = parts[-2], parts[-1]
+                source = sources[step] / filename
+                if not source.is_file():
+                    raise FileNotFoundError(source)
+                shutil.copyfile(source, destination)
+
+            with patch.dict(
+                os.environ,
+                {
+                    "PRIME_LORA_CACHE_DIR": str(root / "cache"),
+                    "PRIME_ADAPTER_DELTA": "1",
+                },
+                clear=False,
+            ), patch.object(filesystem, "download", side_effect=fake_download):
+                first = filesystem.stage_lora_adapter_files("http://adapter/step1")
+                calls.clear()
+                second = filesystem.stage_lora_adapter_files("http://adapter/step2")
+
+            self.assertEqual(
+                first.joinpath("adapter_model.safetensors").read_bytes(),
+                sources["step1"].joinpath("adapter_model.safetensors").read_bytes(),
+            )
+            self.assertEqual(
+                second.joinpath("adapter_model.safetensors").read_bytes(),
+                sources["step2"].joinpath("adapter_model.safetensors").read_bytes(),
+            )
+            self.assertTrue(any(url.endswith("/adapter_model.safetensors.delta") for url in calls))
+            self.assertFalse(any(url.endswith("/adapter_model.safetensors") for url in calls))
+
+    def test_cache_prune_caps_stale_entries_and_keeps_active_base(self) -> None:
+        filesystem = _load_filesystem_module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache = root / "cache"
+            keep_active = cache / "active"
+            keep_base = cache / "base"
+            stale_old = cache / "stale-old"
+            stale_new = cache / "stale-new"
+            for entry in (keep_active, keep_base, stale_old, stale_new):
+                entry.mkdir(parents=True)
+                (entry / "READY").write_text("{}")
+                (entry / "payload").write_bytes(b"x" * 10)
+            os.utime(stale_old, (1, 1))
+            os.utime(stale_new, (2, 2))
+            with patch.dict(
+                os.environ,
+                {
+                    "PRIME_LORA_CACHE_MAX_BYTES": "10000",
+                    "PRIME_LORA_CACHE_MAX_STALE_ENTRIES": "1",
+                },
+                clear=False,
+            ):
+                filesystem._prune_adapter_cache(cache, {keep_active, keep_base})
+            self.assertTrue(keep_active.exists())
+            self.assertTrue(keep_base.exists())
+            self.assertFalse(stale_old.exists())
+            self.assertTrue(stale_new.exists())
 
     def test_fallback_selection_is_explicit(self) -> None:
         manifest = {
@@ -149,8 +264,21 @@ class AdapterDeltaTest(unittest.TestCase):
                 target_sha256="b" * 64,
                 target_size=1000,
                 enabled=True,
+                full_wire_size=1000,
+                manifest_wire_size=20,
             ),
             "delta",
+        )
+        self.assertEqual(
+            select_adapter_transfer(
+                manifest,
+                base_available=True,
+                base_sha256="a" * 64,
+                target_sha256="b" * 64,
+                target_size=1000,
+                enabled=True,
+            ),
+            "full",
         )
         self.assertEqual(
             select_adapter_transfer(
@@ -172,6 +300,8 @@ class AdapterDeltaTest(unittest.TestCase):
                 target_sha256="b" * 64,
                 target_size=1000,
                 enabled=True,
+                full_wire_size=1000,
+                manifest_wire_size=20,
             ),
             "full",
         )

@@ -239,10 +239,20 @@ The wire-size break-even is exact:
 delta_bytes + manifest_bytes < full_transfer_wire_bytes
 ```
 
-The default selector uses a 0.90 delta-to-target-size guard when no measured
-full wire size is available.  A missing or mismatched base, an invalid frame,
-or a ratio at or above the guard selects the current complete adapter transfer.
+The exporter uses a 0.90 delta-to-target-size guard.  At runtime the selector
+also requires a current full-transfer wire estimate or a known complete-file
+size, and compares `delta_bytes + manifest_bytes` with that value.  Without
+that estimate it selects the current complete adapter transfer.  A missing or
+mismatched base, an invalid frame, or a ratio at or above the guard selects the
+same fallback.
 The normal gzip transfer and production profiles are unchanged.
+
+The digest-keyed H200 adapter cache has a 61,540,000,000-byte default cap
+(two 30.77 GB generations) and keeps at most one additional stale generation.
+The active target and the adjacent base considered for a transfer are
+protected from pruning.  Operators can set `PRIME_LORA_CACHE_MAX_BYTES` and
+`PRIME_LORA_CACHE_MAX_STALE_ENTRIES` for a smaller local limit; pruning removes
+old stale entries first and never removes a protected entry.
 
 The measurement gate is exactly two adjacent real exports from one run:
 

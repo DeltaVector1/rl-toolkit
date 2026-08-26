@@ -63,6 +63,13 @@ _ADAPTER_CHECKSUM_NAME = "adapter_model.safetensors.sha256"
 _ADAPTER_MODEL_NAME = "adapter_model.safetensors"
 _ADAPTER_READY_NAME = "READY"
 _ADAPTER_IDENTITY_VERSION = 1
+_ADAPTER_CACHE_MAX_BYTES_ENV = "PRIME_LORA_CACHE_MAX_BYTES"
+_ADAPTER_CACHE_MAX_STALE_ENV = "PRIME_LORA_CACHE_MAX_STALE_ENTRIES"
+# Two 30.77 GB adapter generations fit by default: the active generation and
+# the adjacent base needed for the next delta.  A single older generation is
+# retained for a safe retry, and is removed first when either cap is reached.
+_ADAPTER_CACHE_MAX_BYTES = 2 * 30_770_000_000
+_ADAPTER_CACHE_MAX_STALE_ENTRIES = 1
 _ZSTD_FRAME_BYTES = 8 * 1024 * 1024
 _zstd = None
 
@@ -168,6 +175,7 @@ def _adapter_identity(config: Path, checksum: Path, model: Path | None = None) -
         "target_sha256": expected_model,
     }
     if model is not None:
+        identity["adapter_model_size"] = model.stat().st_size
         try:
             identity["tensor_metadata_sha256"] = safetensors_metadata_sha256(model)
         except (OSError, ValueError, AdapterDeltaError):
@@ -206,6 +214,67 @@ def _cached_adapter_matches(destination: Path, expected: dict[str, object]) -> b
         )
     except (OSError, UnicodeError, ValueError):
         return False
+
+
+def _adapter_cache_limits() -> tuple[int, int]:
+    try:
+        max_bytes = int(
+            os.environ.get(
+                _ADAPTER_CACHE_MAX_BYTES_ENV, str(_ADAPTER_CACHE_MAX_BYTES)
+            )
+        )
+        max_stale = int(
+            os.environ.get(
+                _ADAPTER_CACHE_MAX_STALE_ENV,
+                str(_ADAPTER_CACHE_MAX_STALE_ENTRIES),
+            )
+        )
+    except ValueError as error:
+        raise OSError("adapter cache limits must be integers") from error
+    if max_bytes <= 0 or max_stale < 0:
+        raise OSError("adapter cache limits are invalid")
+    return max_bytes, max_stale
+
+
+def _adapter_cache_size(path: Path) -> int:
+    total = 0
+    for child in path.rglob("*"):
+        if child.is_symlink():
+            continue
+        if child.is_file():
+            total += child.stat().st_size
+    return total
+
+
+def _prune_adapter_cache(cache_dir: Path, keep: set[Path]) -> None:
+    """Bound stale adapter storage without deleting active or base entries."""
+    if not cache_dir.is_dir() or cache_dir.is_symlink():
+        return
+    max_bytes, max_stale = _adapter_cache_limits()
+    entries = []
+    for entry in cache_dir.iterdir():
+        if entry.is_symlink() or not entry.is_dir() or entry in keep:
+            continue
+        if not (entry / _ADAPTER_READY_NAME).is_file():
+            continue
+        entries.append((entry.stat().st_mtime, entry))
+    entries.sort()
+    completed = [
+        entry
+        for entry in cache_dir.iterdir()
+        if entry.is_dir()
+        and not entry.is_symlink()
+        and (entry / _ADAPTER_READY_NAME).is_file()
+    ]
+    total = sum(_adapter_cache_size(entry) for entry in completed)
+    stale_count = len(entries)
+    for _mtime, entry in entries:
+        if stale_count <= max_stale and total <= max_bytes:
+            break
+        size = _adapter_cache_size(entry)
+        shutil.rmtree(entry)
+        stale_count -= 1
+        total -= size
 
 
 def _content_length(source_urls: list[str]) -> int:
@@ -603,9 +672,11 @@ def stage_lora_adapter_files(source_url: str) -> Path:
             ):
                 raise OSError(f"adapter cache path is unsafe: {destination}")
             if destination.is_dir() and _cached_adapter_matches(destination, basic_identity):
+                _prune_adapter_cache(destination.parent, {destination})
                 return destination
 
             transfer = "full"
+            base_destination = None
             delta_manifest = None
             if _delta_enabled():
                 manifest_path = temporary / ADAPTER_DELTA_MANIFEST
@@ -634,8 +705,12 @@ def stage_lora_adapter_files(source_url: str) -> Path:
                         base_expected = {
                             "version": _ADAPTER_IDENTITY_VERSION,
                             "adapter_model_sha256": base_sha256,
+                            "adapter_model_size": delta_manifest["base_size"],
                             "adapter_config_sha256": delta_manifest.get(
                                 "base_adapter_config_sha256"
+                            ),
+                            "tensor_metadata_sha256": delta_manifest.get(
+                                "base_tensor_metadata_sha256"
                             ),
                         }
                         base_available = (
@@ -650,6 +725,7 @@ def stage_lora_adapter_files(source_url: str) -> Path:
                             target_sha256=target_sha256,
                             target_size=target_size,
                             enabled=True,
+                            full_wire_size=target_size,
                             manifest_wire_size=manifest_path.stat().st_size,
                         )
                         if choice == "delta":
@@ -714,6 +790,13 @@ def stage_lora_adapter_files(source_url: str) -> Path:
             if destination.exists():
                 shutil.rmtree(destination)
             temporary.rename(destination)
+            keep = {destination}
+            # Keep the adjacent base even when applying the delta failed and
+            # we fell back to the full transfer: it can still be the active
+            # adapter, and is the only safe base for the next retry.
+            if base_destination is not None and base_destination.is_dir():
+                keep.add(base_destination)
+            _prune_adapter_cache(destination.parent, keep)
             temporary = None
             return destination
         finally:

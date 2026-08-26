@@ -32,6 +32,9 @@ ADAPTER_DELTA_ENABLE_ENV = "PRIME_ADAPTER_DELTA"
 ADAPTER_DELTA_MAX_RATIO_ENV = "PRIME_ADAPTER_DELTA_MAX_RATIO"
 ADAPTER_DELTA_MAX_RATIO = 0.90
 ADAPTER_DELTA_FRAME_BYTES = 8 * 1024 * 1024
+ADAPTER_DELTA_MAX_ENCODED_FRAME_BYTES = (
+    ADAPTER_DELTA_FRAME_BYTES + ADAPTER_DELTA_FRAME_BYTES // 100 + 64 * 1024
+)
 _FRAME_HEADER = struct.Struct("!II")
 _IO_CHUNK = 16 * 1024 * 1024
 _MAX_SAFETENSORS_HEADER = 256 * 1024 * 1024
@@ -49,6 +52,10 @@ def _valid_sha(value: object) -> bool:
     return isinstance(value, str) and len(value) == 64 and set(value) <= _HEX
 
 
+def _valid_positive_int(value: object) -> bool:
+    return type(value) is int and value > 0
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -62,10 +69,16 @@ def _sha256_bytes(value: bytes) -> str:
 
 
 def adapter_cache_identity(source_url: str, target_sha256: str) -> str:
-    """Hash the URL and target digest used for a completed cache directory."""
+    """Hash the target digest for a completed cache directory.
+
+    ``source_url`` stays in the API for compatibility, but is intentionally
+    not part of the key.  A later step can use a base export published under a
+    different URL when its content digest matches.
+    """
     if not _valid_sha(target_sha256):
         raise ValueError("adapter target SHA-256 is invalid")
-    return _sha256_bytes(f"{source_url}\x00{target_sha256}".encode())
+    del source_url
+    return _sha256_bytes(f"prime-adapter\x00{target_sha256}".encode())
 
 
 def _read_safetensors_header(path: Path) -> Mapping[str, object]:
@@ -282,24 +295,45 @@ def load_adapter_delta_manifest(path: Path) -> dict[str, object]:
         "codec_version",
         "base_sha256",
         "target_sha256",
+        "base_size",
+        "base_adapter_config_sha256",
+        "base_tensor_metadata_sha256",
         "adapter_config_sha256",
         "tensor_metadata_sha256",
+        "frame_bytes",
         "uncompressed_size",
         "delta_size",
         "delta_sha256",
     )
     if any(key not in value for key in required):
         raise AdapterDeltaError("adapter delta manifest is missing an identity field")
-    if value["version"] != ADAPTER_DELTA_VERSION or value["codec"] != ADAPTER_DELTA_CODEC:
+    if (
+        type(value["version"]) is not int
+        or value["version"] != ADAPTER_DELTA_VERSION
+        or value["codec"] != ADAPTER_DELTA_CODEC
+    ):
         raise AdapterDeltaError("adapter delta codec is unsupported")
-    if value["codec_version"] != ADAPTER_DELTA_VERSION:
+    if type(value["codec_version"]) is not int or value["codec_version"] != ADAPTER_DELTA_VERSION:
         raise AdapterDeltaError("adapter delta codec version is unsupported")
-    for key in ("base_sha256", "target_sha256", "adapter_config_sha256", "tensor_metadata_sha256", "delta_sha256"):
+    for key in (
+        "base_sha256",
+        "target_sha256",
+        "base_adapter_config_sha256",
+        "base_tensor_metadata_sha256",
+        "adapter_config_sha256",
+        "tensor_metadata_sha256",
+        "delta_sha256",
+    ):
         if not _valid_sha(value[key]):
             raise AdapterDeltaError(f"adapter delta manifest has invalid {key}")
-    for key in ("uncompressed_size", "delta_size"):
-        if not isinstance(value[key], int) or value[key] <= 0:
+    for key in ("base_size", "uncompressed_size", "delta_size"):
+        if not _valid_positive_int(value[key]):
             raise AdapterDeltaError(f"adapter delta manifest has invalid {key}")
+    if (
+        type(value["frame_bytes"]) is not int
+        or not 0 < value["frame_bytes"] <= ADAPTER_DELTA_FRAME_BYTES
+    ):
+        raise AdapterDeltaError("adapter delta manifest has invalid frame_bytes")
     return value
 
 
@@ -318,19 +352,18 @@ def select_adapter_transfer(
     """Choose ``delta`` only when every identity and size gate passes."""
     if not enabled or manifest is None or not base_available:
         return FULL_TRANSFER
-    if full_wire_size is not None and (full_wire_size <= 0 or manifest_wire_size < 0):
+    if full_wire_size is None:
+        return FULL_TRANSFER
+    if full_wire_size <= 0 or manifest_wire_size < 0:
         return FULL_TRANSFER
     try:
         if (
             manifest.get("base_sha256") != base_sha256
             or manifest.get("target_sha256") != target_sha256
             or manifest.get("uncompressed_size") != target_size
-            or not isinstance(manifest.get("delta_size"), int)
+            or not _valid_positive_int(manifest.get("delta_size"))
             or manifest["delta_size"] / target_size >= _max_ratio(max_ratio)
-            or (
-                full_wire_size is not None
-                and manifest["delta_size"] + manifest_wire_size >= full_wire_size
-            )
+            or manifest["delta_size"] + manifest_wire_size >= full_wire_size
         ):
             return FULL_TRANSFER
     except (TypeError, ValueError):
@@ -380,13 +413,24 @@ def apply_adapter_delta(
                 if len(header) != _FRAME_HEADER.size:
                     raise AdapterDeltaError("adapter delta frame header ended early")
                 raw_size, encoded_size = _FRAME_HEADER.unpack(header)
-                if raw_size <= 0 or raw_size > ADAPTER_DELTA_FRAME_BYTES or encoded_size <= 0:
+                if (
+                    raw_size <= 0
+                    or raw_size > validated["frame_bytes"]
+                    or encoded_size <= 0
+                    or encoded_size > ADAPTER_DELTA_MAX_ENCODED_FRAME_BYTES
+                    or written + raw_size > validated["uncompressed_size"]
+                ):
                     raise AdapterDeltaError("adapter delta frame header is invalid")
                 encoded = _read_exact(delta, encoded_size)
                 try:
                     decoder = zlib.decompressobj()
-                    raw = decoder.decompress(encoded)
-                    raw += decoder.flush()
+                    raw = decoder.decompress(encoded, raw_size + 1)
+                    if len(raw) > raw_size or decoder.unconsumed_tail:
+                        raise AdapterDeltaError("adapter delta frame exceeds its output bound")
+                    tail = decoder.flush()
+                    if len(raw) + len(tail) > raw_size:
+                        raise AdapterDeltaError("adapter delta frame exceeds its output bound")
+                    raw += tail
                 except zlib.error as error:
                     raise AdapterDeltaError("adapter delta frame is corrupt") from error
                 if (
@@ -431,24 +475,45 @@ def load_adapter_delta_manifest_from_mapping(value: Mapping[str, object]) -> dic
         "codec_version",
         "base_sha256",
         "target_sha256",
+        "base_size",
+        "base_adapter_config_sha256",
+        "base_tensor_metadata_sha256",
         "adapter_config_sha256",
         "tensor_metadata_sha256",
+        "frame_bytes",
         "uncompressed_size",
         "delta_size",
         "delta_sha256",
     )
     if any(key not in value for key in required):
         raise AdapterDeltaError("adapter delta manifest is missing an identity field")
-    if value["version"] != ADAPTER_DELTA_VERSION or value["codec"] != ADAPTER_DELTA_CODEC:
+    if (
+        type(value["version"]) is not int
+        or value["version"] != ADAPTER_DELTA_VERSION
+        or value["codec"] != ADAPTER_DELTA_CODEC
+    ):
         raise AdapterDeltaError("adapter delta codec is unsupported")
-    if value["codec_version"] != ADAPTER_DELTA_VERSION:
+    if type(value["codec_version"]) is not int or value["codec_version"] != ADAPTER_DELTA_VERSION:
         raise AdapterDeltaError("adapter delta codec version is unsupported")
-    for key in ("base_sha256", "target_sha256", "adapter_config_sha256", "tensor_metadata_sha256", "delta_sha256"):
+    for key in (
+        "base_sha256",
+        "target_sha256",
+        "base_adapter_config_sha256",
+        "base_tensor_metadata_sha256",
+        "adapter_config_sha256",
+        "tensor_metadata_sha256",
+        "delta_sha256",
+    ):
         if not _valid_sha(value[key]):
             raise AdapterDeltaError(f"adapter delta manifest has invalid {key}")
-    for key in ("uncompressed_size", "delta_size"):
-        if not isinstance(value[key], int) or value[key] <= 0:
+    for key in ("base_size", "uncompressed_size", "delta_size"):
+        if not _valid_positive_int(value[key]):
             raise AdapterDeltaError(f"adapter delta manifest has invalid {key}")
+    if (
+        type(value["frame_bytes"]) is not int
+        or not 0 < value["frame_bytes"] <= ADAPTER_DELTA_FRAME_BYTES
+    ):
+        raise AdapterDeltaError("adapter delta manifest has invalid frame_bytes")
     return dict(value)
 
 
