@@ -31,20 +31,15 @@ class AdapterPrefetchGateTest(unittest.TestCase):
 
     def test_glm_adapter_uses_twelve_independent_range_streams(self):
         inventory = OPERATIONS["ports"]
+        self.assertEqual(inventory["adapter_tunnel"], 18100)
         self.assertEqual(inventory["glm_adapter"], 8101)
-        self.assertEqual(inventory["glm_adapter_tunnel"], 18100)
-        self.assertEqual(inventory["glm_adapter_tunnel_extra_first"], 18200)
-        self.assertEqual(inventory["glm_adapter_tunnel_extra_last"], 18210)
-        self.assertEqual(inventory["glm_adapter_staging_tunnel_first"], 18200)
-        self.assertEqual(inventory["glm_adapter_staging_tunnel_last"], 18211)
+        self.assertEqual(inventory["glm_adapter_tunnel_first"], 18200)
+        self.assertEqual(inventory["glm_adapter_tunnel_last"], 18211)
         ports = " ".join(
             str(port)
-            for port in (
-                inventory["glm_adapter_tunnel"],
-                *range(
-                    inventory["glm_adapter_tunnel_extra_first"],
-                    inventory["glm_adapter_tunnel_extra_last"] + 1,
-                ),
+            for port in range(
+                inventory["glm_adapter_tunnel_first"],
+                inventory["glm_adapter_tunnel_last"] + 1,
             )
         )
         self.assertIn(f"adapter_tunnel_ports=({ports})", START)
@@ -58,6 +53,17 @@ class AdapterPrefetchGateTest(unittest.TestCase):
         self.assertIn("adapter_backend_port=8100", START)
         self.assertIn("adapter_compression=yes", START)
         self.assertIn('adapter_tunnel_ports=(18100)', START)
+        self.assertIn("strict_glm_tunnel()", START)
+        self.assertIn(
+            'ERROR: GLM adapter tunnel could not bind port $lp', START
+        )
+        self.assertIn(
+            'if ! strict_glm_tunnel "$adapter_port"', START
+        )
+        self.assertIn("cleanup_new_glm_tunnels", START)
+        self.assertIn('current=$(awk \'{print $22}\' "/proc/$pid/stat")', START)
+        self.assertIn('kill -- "-$pid"', START)
+        self.assertIn("exit 1", START)
         self.assertIn(
             'tunnel "$adapter_port" "127.0.0.1:$adapter_backend_port" '
             'china-trainer "$adapter_compression"',
@@ -70,6 +76,10 @@ class AdapterPrefetchGateTest(unittest.TestCase):
         self.assertIn('-e PRIME_GLM_ADAPTER_GZIP=1', INFERENCE_START)
         self.assertIn(
             'adapter_source_path="runs/$RUN/$RUN_NAME"',
+            START,
+        )
+        self.assertIn(
+            'ADAPTER_SOURCE_BASE="http://127.0.0.1:$adapter_canonical_port/',
             START,
         )
         self.assertEqual(OPERATIONS["paths"]["glm_adapter_root"], "/data/glm52-rl")

@@ -27,12 +27,12 @@ class ControlTunnelWatchdogTest(unittest.TestCase):
         probe = SCRIPT.split("if curl", 1)[1].split("else", 1)[0]
         self.assertIn("misses=0", probe)
 
-    def test_glm_control_tunnel_uses_uncompressed_gzip_server_path(self):
+    def test_shared_control_tunnel_keeps_muse_server_path(self):
         ports = OPERATIONS["ports"]
-        self.assertIn("-o Compression=no", SCRIPT)
+        self.assertIn("-o Compression=yes", SCRIPT)
         self.assertIn(
-            f'127.0.0.1:{ports["glm_adapter_tunnel"]}:'
-            f'127.0.0.1:{ports["glm_adapter"]}',
+            f'127.0.0.1:{ports["adapter_tunnel"]}:'
+            f'127.0.0.1:{ports["adapter"]}',
             SCRIPT,
         )
 

@@ -343,7 +343,7 @@ def test_glm52_production_profile_matches_requirements() -> None:
     assert environment["output_dir"] == f"{run_dir}/{run_name}/env"
     assert orchestrator["weight_broadcast"]["source_dir"] == run_dir
     assert orchestrator["weight_broadcast"]["source_url"] == (
-        f"http://127.0.0.1:18100/runs/{run}"
+        f"http://127.0.0.1:18200/runs/{run}"
     )
 
     targets = {

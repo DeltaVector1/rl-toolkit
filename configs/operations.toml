@@ -12,12 +12,10 @@ inference_tunnel_first = 18001
 inference_tunnel_last = 18048
 judge = 26406
 adapter = 8100
+adapter_tunnel = 18100
 glm_adapter = 8101
-glm_adapter_tunnel = 18100
-glm_adapter_tunnel_extra_first = 18200
-glm_adapter_tunnel_extra_last = 18210
-glm_adapter_staging_tunnel_first = 18200
-glm_adapter_staging_tunnel_last = 18211
+glm_adapter_tunnel_first = 18200
+glm_adapter_tunnel_last = 18211
 batch = 29620
 h200_parity_backend = 8100
 

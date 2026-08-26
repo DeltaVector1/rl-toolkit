@@ -96,14 +96,9 @@ inference_tunnel_ports = list(
 judge_port = ports["judge"]
 adapter_port = ports["adapter"]
 glm_adapter_port = ports["glm_adapter"]
-glm_adapter_tunnel_port = ports["glm_adapter_tunnel"]
-glm_adapter_tunnel_extra_ports = range(
-    ports["glm_adapter_tunnel_extra_first"],
-    ports["glm_adapter_tunnel_extra_last"] + 1,
-)
-glm_adapter_staging_tunnel_ports = range(
-    ports["glm_adapter_staging_tunnel_first"],
-    ports["glm_adapter_staging_tunnel_last"] + 1,
+glm_adapter_tunnel_ports = range(
+    ports["glm_adapter_tunnel_first"],
+    ports["glm_adapter_tunnel_last"] + 1,
 )
 batch_port = ports["batch"]
 h200_parity_backend_port = ports["h200_parity_backend"]
@@ -2551,7 +2546,7 @@ def _check_glm_adapter_range_server(source_path: str) -> dict[str, object]:
 
 
 def _step20_adapter_tunnel_command(port: int) -> list[str]:
-    if port not in glm_adapter_staging_tunnel_ports:
+    if port not in glm_adapter_tunnel_ports:
         raise Refused("temporary adapter tunnel port is invalid")
     return [
         "ssh",
@@ -2582,7 +2577,7 @@ def _start_step20_adapter_tunnels(host: str, source_url: str) -> list[dict]:
     if (
         host != inference_hosts[0]
         or re.fullmatch(
-            rf"http://127\.0\.0\.1:{glm_adapter_staging_tunnel_ports.start}/qualifications/[A-Za-z0-9_./-]+",
+            rf"http://127\.0\.0\.1:{glm_adapter_tunnel_ports.start}/qualifications/[A-Za-z0-9_./-]+",
             source_url,
         )
         is None
@@ -2591,7 +2586,7 @@ def _start_step20_adapter_tunnels(host: str, source_url: str) -> list[dict]:
         raise Refused("temporary adapter tunnel source is invalid")
     commands = [
         _step20_adapter_tunnel_command(port)
-        for port in glm_adapter_staging_tunnel_ports
+        for port in glm_adapter_tunnel_ports
     ]
     encoded = base64.b64encode(
         json.dumps(commands, separators=(",", ":")).encode()
@@ -2654,11 +2649,11 @@ except BaseException:
         raise RuntimeError("temporary adapter tunnel record is invalid") from error
     expected = {
         port: _step20_adapter_tunnel_command(port)
-        for port in glm_adapter_staging_tunnel_ports
+        for port in glm_adapter_tunnel_ports
     }
     if (
         not isinstance(records, list)
-        or len(records) != len(glm_adapter_staging_tunnel_ports)
+        or len(records) != len(glm_adapter_tunnel_ports)
         or {
             record.get("port")
             for record in records
@@ -2681,11 +2676,11 @@ except BaseException:
 def _stop_step20_adapter_tunnels(host: str, records: list[dict]) -> None:
     expected = {
         port: _step20_adapter_tunnel_command(port)
-        for port in glm_adapter_staging_tunnel_ports
+        for port in glm_adapter_tunnel_ports
     }
     if (
         host != inference_hosts[0]
-        or len(records) != len(glm_adapter_staging_tunnel_ports)
+        or len(records) != len(glm_adapter_tunnel_ports)
         or any(
             not isinstance(record, dict)
             or record.get("cmdline") != expected.get(record.get("port"))
@@ -2771,11 +2766,11 @@ def _download_glm_adapter_direct(
     )
     served_path = source.relative_to(glm_adapter_root)
     source_url = (
-        f"http://127.0.0.1:{glm_adapter_staging_tunnel_ports.start}/"
+        f"http://127.0.0.1:{glm_adapter_tunnel_ports.start}/"
         f"{served_path}"
     )
     adapter_ports = ",".join(
-        str(port) for port in glm_adapter_staging_tunnel_ports
+        str(port) for port in glm_adapter_tunnel_ports
     )
     command = shlex.join(
         [
@@ -8904,7 +8899,7 @@ def _stage_step20_adapter_on_h200(adapter: dict, result_sha256: str) -> str:
         str(source_paths["adapter_model.safetensors"][0])
     ).relative_to(glm_adapter_root)
     source_url = (
-        f"http://127.0.0.1:{glm_adapter_staging_tunnel_ports.start}/{served_path}"
+        f"http://127.0.0.1:{glm_adapter_tunnel_ports.start}/{served_path}"
     )
     _ensure_glm_adapter_range_server(
         str(source_paths["adapter_model.safetensors"][0])

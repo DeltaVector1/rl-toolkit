@@ -10,8 +10,8 @@ while true; do
     -o ServerAliveCountMax=3 \
     -o TCPKeepAlive=yes \
     -o IPQoS=none \
-    -o Compression=no \
-    -L 127.0.0.1:18100:127.0.0.1:8101 \
+    -o Compression=yes \
+    -L 127.0.0.1:18100:127.0.0.1:8100 \
     china-trainer &
   tunnel_pid=$!
   misses=0

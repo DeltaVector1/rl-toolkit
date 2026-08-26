@@ -61,8 +61,64 @@ tunnel() { # local_port  target_host:port  ssh_target  [compress]
     done" >/dev/null 2>&1 < /dev/null &
 }
 
+new_glm_tunnels=()
+cleanup_new_glm_tunnels() {
+  local record pid started current
+  for record in "${new_glm_tunnels[@]}"; do
+    pid=${record%%:*}
+    started=${record#*:}
+    if [ -r "/proc/$pid/stat" ]; then
+      current=$(awk '{print $22}' "/proc/$pid/stat")
+      if [ "$current" = "$started" ]; then
+        kill -- "-$pid" 2>/dev/null || true
+      fi
+    fi
+  done
+}
+
+strict_glm_tunnel() { # local_port target_host:port
+  local lp=$1 tgt=$2 supervisor started loop
+  if ss -H -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)$lp$"; then
+    echo "ERROR: GLM adapter tunnel port $lp is already in use" >&2
+    return 1
+  fi
+  if pgrep -f -- "-L 127.0.0.1:$lp:" >/dev/null; then
+    echo "ERROR: a GLM adapter tunnel process already claims port $lp" >&2
+    return 1
+  fi
+  loop="while true; do
+      ssh -NT -o BatchMode=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes \\
+          -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes \\
+          -o IPQoS=none -o Compression=no \\
+          -L 127.0.0.1:$lp:$tgt china-trainer
+      sleep 3
+    done"
+  setsid nohup bash -c "$loop" \
+    >"/data/glm52-rl/glm-adapter-tunnel-$lp.log" 2>&1 < /dev/null &
+  supervisor=$!
+  started=$(awk '{print $22}' "/proc/$supervisor/stat") || {
+    kill -- "-$supervisor" 2>/dev/null || true
+    echo "ERROR: cannot record GLM adapter tunnel supervisor for port $lp" >&2
+    return 1
+  }
+  new_glm_tunnels+=("$supervisor:$started")
+  for _ in $(seq 1 90); do
+    if ! kill -0 "$supervisor" 2>/dev/null; then
+      echo "ERROR: GLM adapter tunnel supervisor exited for port $lp" >&2
+      return 1
+    fi
+    if ss -H -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)$lp$"; then
+      echo "GLM adapter tunnel :$lp up"
+      return 0
+    fi
+    sleep 0.5
+  done
+  echo "ERROR: GLM adapter tunnel could not bind port $lp" >&2
+  return 1
+}
+
 if [ "$adapter_transfer" = glm-gzip ]; then
-  adapter_tunnel_ports=(18100 18200 18201 18202 18203 18204 18205 18206 18207 18208 18209 18210)
+  adapter_tunnel_ports=(18200 18201 18202 18203 18204 18205 18206 18207 18208 18209 18210 18211)
   adapter_backend_port=8101
   adapter_compression=no
   adapter_source_path="runs/$RUN/$RUN_NAME"
@@ -72,9 +128,19 @@ else
   adapter_compression=yes
   adapter_source_path="$RUN/$RUN_NAME"
 fi
-for adapter_port in "${adapter_tunnel_ports[@]}"; do
-  tunnel "$adapter_port" "127.0.0.1:$adapter_backend_port" china-trainer "$adapter_compression"
-done
+if [ "$adapter_transfer" = glm-gzip ]; then
+  for adapter_port in "${adapter_tunnel_ports[@]}"; do
+    if ! strict_glm_tunnel "$adapter_port" "127.0.0.1:$adapter_backend_port"; then
+      cleanup_new_glm_tunnels
+      exit 1
+    fi
+  done
+else
+  for adapter_port in "${adapter_tunnel_ports[@]}"; do
+    tunnel "$adapter_port" "127.0.0.1:$adapter_backend_port" china-trainer "$adapter_compression"
+  done
+fi
+adapter_canonical_port=${adapter_tunnel_ports[0]}
 ports=("${adapter_tunnel_ports[@]}")
 if [[ " $adapter_admin_urls " == *":18111 "* ]]; then
   tunnel 18101 127.0.0.1:8000 "-p 40051 -i /root/.ssh/china_rollout_ed25519 root@152.236.142.243"
@@ -214,7 +280,7 @@ if [ "$transport" = filesystem ]; then
   fi
   nohup setsid env SOURCE_RUN_DIR="$orchestrator_output" DEST_RUN_DIR="$orchestrator_output" \
     DEST_HOST=china-trainer \
-    ADAPTER_SOURCE_BASE="http://127.0.0.1:18100/$adapter_source_path" \
+    ADAPTER_SOURCE_BASE="http://127.0.0.1:$adapter_canonical_port/$adapter_source_path" \
     ADAPTER_ADMIN_URLS="$adapter_admin_urls" \
     "$deployment/scripts/h200/sync_rollout_batches.sh" \
     >>"/data/glm52-rl/batch-sync-$RUN.log" 2>&1 </dev/null &
