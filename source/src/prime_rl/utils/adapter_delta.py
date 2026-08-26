@@ -348,9 +348,10 @@ def select_adapter_transfer(
     max_ratio: float | None = None,
     full_wire_size: int | None = None,
     manifest_wire_size: int = 0,
+    codec: str | None = None,
 ) -> str:
     """Choose ``delta`` only when every identity and size gate passes."""
-    if not enabled or manifest is None or not base_available:
+    if codec != "gzip" or not enabled or manifest is None or not base_available:
         return FULL_TRANSFER
     if full_wire_size is None:
         return FULL_TRANSFER

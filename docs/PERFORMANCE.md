@@ -253,6 +253,8 @@ The range server emits `X-Prime-Wire-Length`, `X-Prime-Wire-Codec`, and
 `X-Prime-Raw-Length` on a full-file `HEAD`; the client rejects missing or
 mismatched identity metadata.
 The normal gzip transfer and production profiles are unchanged.
+Adjacent delta selection is currently limited to gzip.  zstd and other codecs
+always use the existing complete transfer until their wire accounting is exact.
 
 The digest-keyed H200 adapter cache has a 61,540,000,000-byte default cap
 (two 30.77 GB generations) and keeps at most one additional stale generation.

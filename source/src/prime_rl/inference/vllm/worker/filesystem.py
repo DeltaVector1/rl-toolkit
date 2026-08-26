@@ -442,6 +442,24 @@ def _content_length(source_urls: list[str]) -> int:
     raise OSError(f"cannot read adapter content length: {error}")
 
 
+def _adapter_transfer_codec() -> str:
+    codec = os.environ.get(_GLM_RANGE_CODEC_ENV)
+    if codec is None:
+        gzip_required = os.environ.get(_GLM_RANGE_GZIP_ENV, "0")
+        if gzip_required not in {"0", "1"}:
+            raise OSError(f"{_GLM_RANGE_GZIP_ENV} must be 0 or 1")
+        codec = "gzip" if gzip_required == "1" else "identity"
+    if codec not in {"identity", "gzip", "zstd"}:
+        raise OSError(f"{_GLM_RANGE_CODEC_ENV} must be identity, gzip, or zstd")
+    return codec
+
+
+def _adapter_delta_codec_supported(codec: str) -> bool:
+    # ponytail: keep zstd on the existing full path until its wire accounting
+    # matches the range server exactly.
+    return codec == "gzip"
+
+
 def _full_wire_size_estimate(source_url: str, target_size: int) -> int | None:
     """Get a current complete-transfer size without downloading the model."""
     configured = os.environ.get(_ADAPTER_FULL_WIRE_SIZE_ENV)
@@ -451,12 +469,10 @@ def _full_wire_size_estimate(source_url: str, target_size: int) -> int | None:
         except ValueError:
             return None
         return value if value > 0 else None
-    codec = os.environ.get(_GLM_RANGE_CODEC_ENV)
-    if codec is None:
-        gzip_required = os.environ.get(_GLM_RANGE_GZIP_ENV, "0")
-        if gzip_required not in {"0", "1"}:
-            return None
-        codec = "gzip" if gzip_required == "1" else "identity"
+    try:
+        codec = _adapter_transfer_codec()
+    except OSError:
+        return None
     if codec == "identity":
         # The sidecar is an exact byte count for the normal uncompressed path.
         return target_size
@@ -495,14 +511,7 @@ def _download_range(
     end: int,
     max_attempts: int = 10,
 ) -> None:
-    codec = os.environ.get(_GLM_RANGE_CODEC_ENV)
-    if codec is None:
-        gzip_required = os.environ.get(_GLM_RANGE_GZIP_ENV, "0")
-        if gzip_required not in {"0", "1"}:
-            raise OSError(f"{_GLM_RANGE_GZIP_ENV} must be 0 or 1")
-        codec = "gzip" if gzip_required == "1" else "identity"
-    if codec not in {"identity", "gzip", "zstd"}:
-        raise OSError(f"{_GLM_RANGE_CODEC_ENV} must be identity, gzip, or zstd")
+    codec = _adapter_transfer_codec()
     for attempt in range(max_attempts):
         try:
             source_url = source_urls[(source_index + attempt) % len(source_urls)]
@@ -847,6 +856,16 @@ def stage_lora_adapter_files(source_url: str) -> Path:
             tempfile.mkdtemp(prefix=f"{cache_root.name}.partial-", dir=cache_root.parent)
         )
         try:
+            delta_requested = _delta_enabled()
+            transfer_codec = _adapter_transfer_codec()
+            delta_enabled = delta_requested and _adapter_delta_codec_supported(
+                transfer_codec
+            )
+            if delta_requested and not delta_enabled:
+                _LOGGER.info(
+                    "adapter delta fallback: codec %s is not supported; using full transfer",
+                    transfer_codec,
+                )
             for filename in (_ADAPTER_CONFIG_NAME, _ADAPTER_CHECKSUM_NAME):
                 download(
                     f"{source_url.rstrip('/')}/{filename}",
@@ -865,7 +884,7 @@ def stage_lora_adapter_files(source_url: str) -> Path:
                 raise OSError(f"adapter cache path is unsafe: {destination}")
             if destination.is_dir() and _cached_adapter_matches(destination, basic_identity):
                 keep = {destination}
-                if _delta_enabled():
+                if delta_enabled:
                     hit_manifest = temporary / ADAPTER_DELTA_MANIFEST
                     if _download_optional(
                         f"{source_url.rstrip('/')}/{ADAPTER_DELTA_MANIFEST}",
@@ -905,7 +924,7 @@ def stage_lora_adapter_files(source_url: str) -> Path:
             transfer = "full"
             base_destination = None
             delta_manifest = None
-            if _delta_enabled():
+            if delta_enabled:
                 manifest_path = temporary / ADAPTER_DELTA_MANIFEST
                 if _download_optional(
                     f"{source_url.rstrip('/')}/{ADAPTER_DELTA_MANIFEST}",
@@ -967,6 +986,7 @@ def stage_lora_adapter_files(source_url: str) -> Path:
                                 target_size,
                             ),
                             manifest_wire_size=manifest_path.stat().st_size,
+                            codec=transfer_codec,
                         )
                         if choice == "delta":
                             delta_path = temporary / ADAPTER_DELTA_FILE

@@ -207,6 +207,8 @@ class AdapterDeltaTest(unittest.TestCase):
                 {
                     "PRIME_LORA_CACHE_DIR": str(root / "cache"),
                     "PRIME_ADAPTER_DELTA": "1",
+                    "PRIME_GLM_ADAPTER_CODEC": "gzip",
+                    "PRIME_ADAPTER_FULL_WIRE_SIZE": "100000",
                 },
                 clear=False,
             ), patch.object(filesystem, "download", side_effect=fake_download):
@@ -295,6 +297,11 @@ class AdapterDeltaTest(unittest.TestCase):
                     filesystem._full_wire_size_estimate("http://adapter/model", 100)
                 )
 
+    def test_delta_runtime_gate_allows_gzip_only(self) -> None:
+        filesystem = _load_filesystem_module()
+        self.assertTrue(filesystem._adapter_delta_codec_supported("gzip"))
+        self.assertFalse(filesystem._adapter_delta_codec_supported("zstd"))
+        self.assertFalse(filesystem._adapter_delta_codec_supported("identity"))
     def test_range_server_generates_full_gzip_wire_metadata(self) -> None:
         from scripts.ops.glm_adapter_range_server import _FULL_WIRE_CHUNK_BYTES, _full_wire_length
 
@@ -508,6 +515,8 @@ class AdapterDeltaTest(unittest.TestCase):
                 {
                     "PRIME_LORA_CACHE_DIR": str(root / "cache"),
                     "PRIME_ADAPTER_DELTA": "1",
+                    "PRIME_GLM_ADAPTER_CODEC": "gzip",
+                    "PRIME_ADAPTER_FULL_WIRE_SIZE": "100000",
                 },
                 clear=False,
             ), patch.object(filesystem, "download", side_effect=fake_download):
@@ -544,6 +553,8 @@ class AdapterDeltaTest(unittest.TestCase):
                 {
                     "PRIME_LORA_CACHE_DIR": str(root / "cache"),
                     "PRIME_ADAPTER_DELTA": "1",
+                    "PRIME_GLM_ADAPTER_CODEC": "gzip",
+                    "PRIME_ADAPTER_FULL_WIRE_SIZE": "100000",
                     "PRIME_LORA_CACHE_MAX_STALE_ENTRIES": "0",
                 },
                 clear=False,
@@ -581,6 +592,7 @@ class AdapterDeltaTest(unittest.TestCase):
                 enabled=True,
                 full_wire_size=1000,
                 manifest_wire_size=20,
+                codec="gzip",
             ),
             "delta",
         )
@@ -592,6 +604,20 @@ class AdapterDeltaTest(unittest.TestCase):
                 target_sha256="b" * 64,
                 target_size=1000,
                 enabled=True,
+            ),
+            "full",
+        )
+        self.assertEqual(
+            select_adapter_transfer(
+                manifest,
+                base_available=True,
+                base_sha256="a" * 64,
+                target_sha256="b" * 64,
+                target_size=1000,
+                enabled=True,
+                full_wire_size=1000,
+                manifest_wire_size=20,
+                codec="zstd",
             ),
             "full",
         )
