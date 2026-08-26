@@ -234,6 +234,90 @@ class ParallelAdapterDownloadTest(unittest.TestCase):
             ):
                 self.module.download(self.url, rejected)
 
+    def test_glm_head_and_small_get_use_alternate_ports(self):
+        adapter_server = _load_adapter_server_module()
+
+        class Handler(adapter_server.GzipRangeHandler):
+            modes = {}
+            heads = []
+            gets = []
+            lock = threading.Lock()
+
+            def log_message(self, *_args):
+                pass
+
+            def do_HEAD(self):
+                port = self.server.server_port
+                with type(self).lock:
+                    type(self).heads.append(port)
+                if type(self).modes[port] == "head-failure":
+                    self.send_error(503)
+                    return
+                return super().do_HEAD()
+
+            def do_GET(self):
+                port = self.server.server_port
+                with type(self).lock:
+                    type(self).gets.append(port)
+                if type(self).modes[port] == "get-failure":
+                    self.send_error(503)
+                    return
+                return super().do_GET()
+
+        servers = []
+        threads = []
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "runs").mkdir()
+            (root / "runs/adapter").write_bytes(_RangeHandler.payload)
+            try:
+                for _ in range(2):
+                    server = ThreadingHTTPServer(
+                        ("127.0.0.1", 0),
+                        lambda *args, **kwargs: Handler(
+                            *args, directory=str(root), **kwargs
+                        ),
+                    )
+                    servers.append(server)
+                    thread = threading.Thread(
+                        target=server.serve_forever, daemon=True
+                    )
+                    thread.start()
+                    threads.append(thread)
+                first, second = (server.server_port for server in servers)
+                environment = {
+                    "PRIME_GLM_ADAPTER_GZIP": "1",
+                    "PRIME_ADAPTER_PORTS": f"{first},{second}",
+                }
+                url = f"http://127.0.0.1:{first}/runs/adapter"
+                with (
+                    patch.dict(os.environ, environment),
+                    patch.object(
+                        self.module,
+                        "_PARALLEL_DOWNLOAD_THRESHOLD",
+                        len(_RangeHandler.payload) + 1,
+                    ),
+                    patch.object(self.module.time, "sleep"),
+                ):
+                    Handler.modes = {first: "head-failure", second: "good"}
+                    head_recovered = root / "head-recovered"
+                    self.module.download(url, head_recovered, create_only=True)
+                    self.assertEqual(Handler.heads[-2:], [first, second])
+                    self.assertEqual(head_recovered.read_bytes(), _RangeHandler.payload)
+
+                    Handler.modes = {first: "get-failure", second: "good"}
+                    get_recovered = root / "get-recovered"
+                    self.module.download(url, get_recovered, create_only=True)
+                    self.assertEqual(Handler.gets[-2:], [first, second])
+                    self.assertEqual(get_recovered.read_bytes(), _RangeHandler.payload)
+            finally:
+                for server in servers:
+                    server.shutdown()
+                for thread in threads:
+                    thread.join()
+                for server in servers:
+                    server.server_close()
+
     def test_glm_chunk_queue_lets_fast_ports_take_more_exact_chunks(self):
         adapter_server = _load_adapter_server_module()
 
@@ -358,6 +442,34 @@ class ParallelAdapterDownloadTest(unittest.TestCase):
             self.assertFalse(
                 destination.with_name(f"{destination.name}.parts").exists()
             )
+
+    def test_non_glm_failure_keeps_parts_for_resume(self):
+        def fail_with_partial(_urls, _source_index, part, *_range, **_options):
+            part.write_bytes(b"partial")
+            raise OSError("failed")
+
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "adapter_model.safetensors"
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "PRIME_GLM_ADAPTER_GZIP": "0",
+                        "PRIME_ADAPTER_PORTS": "",
+                        "PRIME_ADAPTER_DOWNLOAD_STREAMS": "2",
+                    },
+                ),
+                patch.object(self.module, "_content_length", return_value=1024),
+                patch.object(self.module, "_PARALLEL_DOWNLOAD_THRESHOLD", 1),
+                patch.object(
+                    self.module, "_download_range", side_effect=fail_with_partial
+                ),
+                self.assertRaisesRegex(OSError, "failed"),
+            ):
+                self.module.download("http://example.invalid/adapter", destination)
+            parts = destination.with_name(f"{destination.name}.parts")
+            self.assertTrue(parts.is_dir())
+            self.assertTrue(any(parts.iterdir()))
 
     def test_glm_truncated_chunk_retries_on_another_port_then_fails_at_three(self):
         adapter_server = _load_adapter_server_module()

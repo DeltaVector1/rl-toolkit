@@ -36,9 +36,20 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _content_length(source_url: str) -> int:
-    with urllib.request.urlopen(urllib.request.Request(source_url, method="HEAD"), timeout=60) as response:
-        return int(response.headers["Content-Length"])
+def _content_length(source_urls: list[str]) -> int:
+    error = None
+    for source_url in source_urls:
+        try:
+            with urllib.request.urlopen(
+                urllib.request.Request(source_url, method="HEAD"), timeout=60
+            ) as response:
+                total = int(response.headers["Content-Length"])
+                if total <= 0:
+                    raise OSError("adapter content length is invalid")
+                return total
+        except (KeyError, ValueError, OSError) as failure:
+            error = failure
+    raise OSError(f"cannot read adapter content length: {error}")
 
 
 def _download_range(
@@ -200,12 +211,6 @@ def download(
     create_only: bool = False,
     _attempt_report: list[int] | None = None,
 ) -> None:
-    total = _content_length(source_url)
-    if create_only and (destination.exists() or destination.is_symlink()):
-        raise FileExistsError(f"adapter destination already exists: {destination}")
-    if not create_only and destination.exists() and destination.stat().st_size == total:
-        return
-
     ports = [value.strip() for value in os.environ.get("PRIME_ADAPTER_PORTS", "").split(",") if value.strip()]
     source_urls = [source_url]
     if ports:
@@ -216,19 +221,39 @@ def download(
             urlunsplit((parsed.scheme, f"{parsed.hostname}:{int(port)}", parsed.path, parsed.query, parsed.fragment))
             for port in ports
         ]
+    total = _content_length(source_urls)
+    if create_only and (destination.exists() or destination.is_symlink()):
+        raise FileExistsError(f"adapter destination already exists: {destination}")
+    if not create_only and destination.exists() and destination.stat().st_size == total:
+        return
 
     streams = len(source_urls) if ports else max(
         1,
         int(os.environ.get("PRIME_ADAPTER_DOWNLOAD_STREAMS", str(_PARALLEL_DOWNLOAD_STREAMS))),
     )
+    glm_gzip = os.environ.get(_GLM_RANGE_GZIP_ENV, "0") == "1"
     if total < _PARALLEL_DOWNLOAD_THRESHOLD or streams == 1:
+        range_urls = source_urls if glm_gzip else [source_url]
+        attempts = len(range_urls) if glm_gzip else 10
         if not create_only:
-            _download_range([source_url], 0, destination, 0, total - 1)
+            _download_range(
+                range_urls, 0, destination, 0, total - 1, max_attempts=attempts
+            )
             return
         assembling = destination.with_name(f"{destination.name}.assembling")
         assembling.unlink(missing_ok=True)
-        _download_range([source_url], 0, assembling, 0, total - 1)
-        _publish_download(assembling, destination, True)
+        try:
+            _download_range(
+                range_urls, 0, assembling, 0, total - 1, max_attempts=attempts
+            )
+            _publish_download(assembling, destination, True)
+        except BaseException as error:
+            if glm_gzip:
+                try:
+                    assembling.unlink(missing_ok=True)
+                except OSError as cleanup_error:
+                    error.add_note(f"cannot clean {assembling}: {cleanup_error}")
+            raise
         return
 
     if not create_only:
@@ -240,7 +265,6 @@ def download(
     parts.mkdir(exist_ok=True)
     if parts.is_symlink() or not parts.is_dir():
         raise OSError(f"adapter parts path is unsafe: {parts}")
-    glm_gzip = os.environ.get(_GLM_RANGE_GZIP_ENV, "0") == "1"
     chunk = (
         _GLM_RANGE_CHUNK_BYTES
         if glm_gzip
@@ -284,15 +308,16 @@ def download(
             raise OSError(f"assembled adapter file has the wrong size: {destination.name}")
         _publish_download(assembling, destination, create_only)
     except BaseException as error:
-        try:
-            assembling.unlink(missing_ok=True)
-        except OSError as cleanup_error:
-            error.add_note(f"cannot clean {assembling}: {cleanup_error}")
-        try:
-            if parts.exists():
-                shutil.rmtree(parts)
-        except OSError as cleanup_error:
-            error.add_note(f"cannot clean {parts}: {cleanup_error}")
+        if glm_gzip:
+            try:
+                assembling.unlink(missing_ok=True)
+            except OSError as cleanup_error:
+                error.add_note(f"cannot clean {assembling}: {cleanup_error}")
+            try:
+                if parts.exists():
+                    shutil.rmtree(parts)
+            except OSError as cleanup_error:
+                error.add_note(f"cannot clean {parts}: {cleanup_error}")
         raise
     shutil.rmtree(parts)
 
