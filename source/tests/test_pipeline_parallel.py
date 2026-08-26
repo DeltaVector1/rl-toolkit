@@ -256,6 +256,21 @@ class SideInputKeyTest(unittest.TestCase):
             ],
         )
 
+    def test_pipeline_timing_reports_inclusive_union_and_overlap(self):
+        timing = self.runner.PipelineTiming()
+        timing.enabled = True
+        timing._record_host("pp.p2p_wait", 0.0, 2.0)
+        timing._record_host("pp.p2p_wait", 1.0, 3.0)
+        timing._record_host("side_input_h2d", 4.0, 5.0)
+        summary = timing.summary()
+
+        self.assertEqual(summary["categories"]["pp.p2p_wait"]["host_inclusive_s"], 4.0)
+        self.assertEqual(summary["categories"]["pp.p2p_wait"]["host_union_s"], 3.0)
+        self.assertEqual(summary["categories"]["pp.p2p_wait"]["host_overlap_s"], 1.0)
+        self.assertEqual(summary["all"]["inclusive_s"], 5.0)
+        self.assertEqual(summary["all"]["union_s"], 4.0)
+        self.assertEqual(summary["all"]["overlap_s"], 1.0)
+
     def test_missing_and_duplicate_side_inputs_fail_closed(self):
         stage = self.runner.PipelineStageModule(
             model=object(), is_first=False, is_last=False, stage_identity=3

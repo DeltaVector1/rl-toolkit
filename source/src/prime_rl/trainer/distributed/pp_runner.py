@@ -17,11 +17,261 @@ Design notes, because the obvious approaches do not fit this trainer:
 """
 
 import os
+import time
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
+from functools import wraps
 from typing import Any, Callable
 
 import torch
 import torch.nn as nn
+
+
+_PIPELINE_TIMING_ENV = "PRIME_PROFILE_PP_TIMING"
+
+
+def _interval_union(intervals: Sequence[tuple[float, float]]) -> float:
+    """Return the wall-clock union of half-open intervals."""
+    if not intervals:
+        return 0.0
+    ordered = sorted((start, end) for start, end in intervals if end >= start)
+    if not ordered:
+        return 0.0
+    total = 0.0
+    start, end = ordered[0]
+    for next_start, next_end in ordered[1:]:
+        if next_start > end:
+            total += end - start
+            start, end = next_start, next_end
+        else:
+            end = max(end, next_end)
+    return total + end - start
+
+
+class PipelineTiming:
+    """Small opt-in timing collector for one trainer rank.
+
+    Host intervals are retained so inclusive time, union time, and overlap can
+    be reported. CUDA intervals use events and are resolved only when a report
+    is requested. No event or synchronisation is created when the flag is off.
+    """
+
+    def __init__(self) -> None:
+        self.enabled = os.environ.get(_PIPELINE_TIMING_ENV, "0") == "1"
+        self._host: dict[str, list[tuple[float, float]]] = {}
+        self._cuda: dict[str, list[tuple[Any, Any]]] = {}
+
+    def _record_host(self, name: str, start: float, end: float) -> None:
+        self._host.setdefault(name, []).append((start, end))
+
+    @contextmanager
+    def host_span(self, name: str):
+        if not self.enabled:
+            yield
+            return
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            self._record_host(name, start, time.perf_counter())
+
+    @contextmanager
+    def cuda_span(self, name: str, stream=None):
+        if not self.enabled:
+            yield
+            return
+        start = end = None
+        try:
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            if stream is None:
+                start.record()
+            else:
+                start.record(stream)
+        except (AttributeError, RuntimeError, AssertionError):
+            # Keep an opt-in diagnostic from changing a run on a CPU-only
+            # import or a backend without CUDA event support.
+            start = end = None
+        try:
+            yield
+        finally:
+            if start is not None and end is not None:
+                if stream is None:
+                    end.record()
+                else:
+                    end.record(stream)
+                self._cuda.setdefault(name, []).append((start, end))
+
+    @contextmanager
+    def span(self, name: str, *, cuda: bool = False, stream=None):
+        with self.host_span(name):
+            if cuda:
+                with self.cuda_span(name, stream=stream):
+                    yield
+            else:
+                yield
+
+    def record_schedule(self, start: float) -> float:
+        """Synchronize one profiled schedule and record its inclusive host span."""
+        if not self.enabled:
+            return 0.0
+        torch.cuda.synchronize()
+        end = time.perf_counter()
+        self._record_host("pp.schedule", start, end)
+        return end - start
+
+    def summary(self, *, clear: bool = False) -> dict[str, Any]:
+        if not self.enabled:
+            return {"categories": {}, "all": {"count": 0, "inclusive_s": 0.0, "union_s": 0.0, "overlap_s": 0.0}}
+        if self._cuda:
+            torch.cuda.synchronize()
+        categories: dict[str, dict[str, float | int]] = {}
+        all_host: list[tuple[float, float]] = []
+        for name in sorted(set(self._host) | set(self._cuda)):
+            host = self._host.get(name, [])
+            # The schedule interval is the enclosing reference interval. Do
+            # not include it in the category union, or the residual would
+            # always be reported as zero.
+            if name != "pp.schedule":
+                all_host.extend(host)
+            host_inclusive = sum(end - start for start, end in host)
+            host_union = _interval_union(host)
+            cuda_events = self._cuda.get(name, [])
+            cuda_inclusive = sum(start.elapsed_time(end) / 1000.0 for start, end in cuda_events)
+            categories[name] = {
+                "count": max(len(host), len(cuda_events)),
+                "host_inclusive_s": host_inclusive,
+                "host_union_s": host_union,
+                "host_overlap_s": max(0.0, host_inclusive - host_union),
+                "cuda_inclusive_s": cuda_inclusive,
+            }
+        all_inclusive = sum(end - start for start, end in all_host)
+        all_union = _interval_union(all_host)
+        result: dict[str, Any] = {
+            "categories": categories,
+            "all": {
+                "count": len(all_host),
+                "inclusive_s": all_inclusive,
+                "union_s": all_union,
+                "overlap_s": max(0.0, all_inclusive - all_union),
+            },
+        }
+        if clear:
+            self._host.clear()
+            self._cuda.clear()
+        return result
+
+    @staticmethod
+    def format_reports(reports: Sequence[dict[str, Any]], baseline_s: float = 233.675) -> str:
+        """Format max-per-stage timings without emitting per-call records."""
+        if not reports:
+            return "[pp-timing] no rank reports"
+        by_stage: dict[int, list[dict[str, Any]]] = {}
+        for report in reports:
+            by_stage.setdefault(int(report["stage"]), []).append(report)
+        lines = [f"[pp-timing] clean_baseline={baseline_s:.3f}s"]
+        for stage in sorted(by_stage):
+            rows = by_stage[stage]
+            schedule = max(float(row["schedule_s"]) for row in rows)
+            all_rows = [row["summary"]["all"] for row in rows]
+            all_union = max(float(row["union_s"]) for row in all_rows)
+            all_inclusive = max(float(row["inclusive_s"]) for row in all_rows)
+            lines.append(
+                f"[pp-timing] stage={stage} schedule={schedule:.3f}s "
+                f"delta_vs_clean={schedule - baseline_s:+.3f}s "
+                f"all_inclusive={all_inclusive:.3f}s all_union={all_union:.3f}s "
+                f"all_overlap={max(0.0, all_inclusive - all_union):.3f}s "
+                f"residual_host={max(0.0, schedule - all_union):.3f}s"
+            )
+            names = sorted({name for row in rows for name in row["summary"]["categories"]})
+            for name in names:
+                values = [row["summary"]["categories"].get(name, {}) for row in rows]
+                host_inclusive = max(float(value.get("host_inclusive_s", 0.0)) for value in values)
+                host_union = max(float(value.get("host_union_s", 0.0)) for value in values)
+                cuda_inclusive = max(float(value.get("cuda_inclusive_s", 0.0)) for value in values)
+                count = sum(int(value.get("count", 0)) for value in values)
+                lines.append(
+                    f"[pp-timing] stage={stage} category={name} count={count} "
+                    f"host_inclusive={host_inclusive:.3f}s host_union={host_union:.3f}s "
+                    f"host_overlap={max(0.0, host_inclusive - host_union):.3f}s "
+                    f"cuda_inclusive={cuda_inclusive:.3f}s"
+                )
+        return "\n".join(lines)
+
+
+_PIPELINE_TIMING = PipelineTiming()
+
+
+def get_pipeline_timing() -> PipelineTiming:
+    return _PIPELINE_TIMING
+
+
+def install_pipeline_p2p_timing() -> None:
+    """Wrap torch pipelining issue/wait helpers once when timing is enabled."""
+    timing = get_pipeline_timing()
+    if not timing.enabled:
+        return
+    from torch.distributed.pipelining import schedules
+
+    if getattr(schedules, "_prime_pipeline_timing_installed", False):
+        return
+    original_batch = schedules._batch_p2p
+    original_wait = schedules._wait_batch_p2p
+
+    @wraps(original_batch)
+    def traced_batch(p2p_ops, desc=None):
+        with timing.host_span("pp.p2p_issue"):
+            return original_batch(p2p_ops, desc=desc)
+
+    @wraps(original_wait)
+    def traced_wait(work):
+        with timing.host_span("pp.p2p_wait"):
+            return original_wait(work)
+
+    schedules._batch_p2p = traced_batch
+    schedules._wait_batch_p2p = traced_wait
+    schedules._prime_pipeline_timing_installed = True
+
+
+def install_fsdp_timing() -> None:
+    """Wrap FSDP unshard/prefetch and stream waits once when enabled."""
+    timing = get_pipeline_timing()
+    if not timing.enabled:
+        return
+    from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
+
+    if getattr(FSDPParamGroup, "_prime_pipeline_timing_installed", False):
+        return
+    original_unshard = FSDPParamGroup.unshard
+    original_wait = FSDPParamGroup.wait_for_unshard
+    original_prefetch = FSDPParamGroup._prefetch_unshard
+    original_stream_wait = FSDPParamGroup._wait_all_gather_streams_on_event
+
+    @wraps(original_unshard)
+    def traced_unshard(self, *args, **kwargs):
+        with timing.span("fsdp.unshard", cuda=True):
+            return original_unshard(self, *args, **kwargs)
+
+    @wraps(original_wait)
+    def traced_wait_for_unshard(self, *args, **kwargs):
+        with timing.span("fsdp.wait_for_unshard", cuda=True):
+            return original_wait(self, *args, **kwargs)
+
+    @wraps(original_prefetch)
+    def traced_prefetch(target_fsdp_param_group, pass_type):
+        with timing.span(f"fsdp.prefetch_{pass_type}", cuda=True):
+            return original_prefetch(target_fsdp_param_group, pass_type)
+
+    @wraps(original_stream_wait)
+    def traced_stream_wait(self, *args, **kwargs):
+        with timing.span("fsdp.wait_streams", cuda=True):
+            return original_stream_wait(self, *args, **kwargs)
+
+    FSDPParamGroup.unshard = traced_unshard
+    FSDPParamGroup.wait_for_unshard = traced_wait_for_unshard
+    FSDPParamGroup._prefetch_unshard = staticmethod(traced_prefetch)
+    FSDPParamGroup._wait_all_gather_streams_on_event = traced_stream_wait
+    FSDPParamGroup._prime_pipeline_timing_installed = True
 
 
 def minimum_pipeline_microbatches(schedule_name: str, pp_size: int) -> int:
@@ -416,9 +666,10 @@ class PipelineStageModule(nn.Module):
         out = {}
         for k, v in cpu.items():
             if torch.is_tensor(v):
-                v = v.to("cuda", non_blocking=True)
-                if k == "routed_experts":
-                    v = v.to(torch.int32)
+                with get_pipeline_timing().span("side_input_h2d", cuda=True):
+                    v = v.to("cuda", non_blocking=True)
+                    if k == "routed_experts":
+                        v = v.to(torch.int32)
             out[k] = v
         return out
 
@@ -774,12 +1025,13 @@ def _bounded_pipeline_stage_cls():
         def forward_one_chunk(
             self, fwd_chunk_id, args, kwargs=None, save_forward_output=True
         ):
-            output = super().forward_one_chunk(
-                fwd_chunk_id,
-                args,
-                kwargs,
-                save_forward_output=save_forward_output,
-            )
+            with get_pipeline_timing().cuda_span("pp.forward_chunk"):
+                output = super().forward_one_chunk(
+                    fwd_chunk_id,
+                    args,
+                    kwargs,
+                    save_forward_output=save_forward_output,
+                )
             return output
 
         def get_bwd_recv_ops(self, bwd_chunk_id):
@@ -790,12 +1042,16 @@ def _bounded_pipeline_stage_cls():
         def backward_one_chunk(
             self, bwd_chunk_id, loss=None, full_backward=True, last_backward=False
         ):
-            output = super().backward_one_chunk(
-                bwd_chunk_id,
-                loss=loss,
-                full_backward=full_backward,
-                last_backward=last_backward,
-            )
+            # This wraps every stage, including stage 0. The output-side
+            # receive bookkeeping below is intentionally outside the event so
+            # the event covers the actual backward work only.
+            with get_pipeline_timing().cuda_span("pp.backward_chunk"):
+                output = super().backward_one_chunk(
+                    bwd_chunk_id,
+                    loss=loss,
+                    full_backward=full_backward,
+                    last_backward=last_backward,
+                )
             if not self.is_first:
                 self._finish_forward_receive(bwd_chunk_id)
             if not self.is_last:
@@ -968,6 +1224,8 @@ def force_fsdp_lazy_init(model: nn.Module) -> int:
     """
     from torch.distributed.fsdp import FSDPModule
 
+    install_fsdp_timing()
+
     count = 0
     for module in model.modules():
         if isinstance(module, FSDPModule):
@@ -1004,6 +1262,8 @@ def build_schedule(
         ScheduleGPipe,
         ScheduleInterleaved1F1B,
     )
+
+    install_pipeline_p2p_timing()
 
     stage_modules = list(stage_module) if isinstance(stage_module, (list, tuple)) else [stage_module]
     if schedule_name == "interleaved_1f1b" and len(stage_modules) != 2:

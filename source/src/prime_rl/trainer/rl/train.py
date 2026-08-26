@@ -1246,6 +1246,7 @@ def train(config: TrainerConfig):
     # Pipeline parallelism: build one or two local virtual stages before the loop.
     pp_stage_module = None
     pp_stage_modules = None
+    pipeline_timing = None
     pp_rank = 0
     if parallel_dims.pp_enabled:
         from prime_rl.trainer.distributed.pp_runner import PipelineStageModule
@@ -1256,6 +1257,7 @@ def train(config: TrainerConfig):
             pad_side_inputs_to_common_length as pad_pp_side_inputs,
         )
         from prime_rl.trainer.distributed.pp_runner import force_fsdp_lazy_init
+        from prime_rl.trainer.distributed.pp_runner import get_pipeline_timing
         from prime_rl.trainer.distributed.pp_runner import minimum_pipeline_microbatches
         from prime_rl.trainer.distributed.pp_runner import sparse_cache_transport_shape
         from prime_rl.trainer.distributed.pipeline_parallel import (
@@ -1264,6 +1266,7 @@ def train(config: TrainerConfig):
         )
 
         pp_rank = parallel_dims.get_mesh("pp").get_local_rank()
+        pipeline_timing = get_pipeline_timing()
         # Weight broadcast: tell the gatherer to merge stage dicts over the pp
         # group. "Stage master" = the first rank within each stage, which is
         # exactly the membership of the global master's pp group.
@@ -2183,6 +2186,11 @@ def train(config: TrainerConfig):
                 else nullcontext()
             )
             with schedule_profiler:
+                pipeline_schedule_start = (
+                    time.perf_counter()
+                    if pipeline_timing is not None and pipeline_timing.enabled
+                    else None
+                )
                 if pp_rank == 0:
                     pp_schedule.step(pp_inputs, return_outputs=False)
                 elif pp_rank == parallel_dims.pp - 1:
@@ -2195,6 +2203,11 @@ def train(config: TrainerConfig):
                     )
                 else:
                     pp_schedule.step(return_outputs=False)
+            pipeline_schedule_s = (
+                pipeline_timing.record_schedule(pipeline_schedule_start)
+                if pipeline_timing is not None and pipeline_schedule_start is not None
+                else 0.0
+            )
             if dist.get_rank() == profile_rank:
                 logger.info(
                     "PP CUDA profile:\n"
@@ -2241,6 +2254,22 @@ def train(config: TrainerConfig):
                     logger.info(
                         "PP stage profile ms (stage, schedule, forward, backward): "
                         f"{stage_profiles}"
+                    )
+            if pipeline_timing is not None and pipeline_timing.enabled:
+                local_timing_report = {
+                    "rank": dist.get_rank(),
+                    "stage": pp_rank,
+                    "schedule_s": pipeline_schedule_s,
+                    "summary": pipeline_timing.summary(clear=True),
+                }
+                timing_reports = [None] * dist.get_world_size()
+                dist.all_gather_object(timing_reports, local_timing_report)
+                if dist.get_rank() == 0:
+                    logger.info(
+                        get_pipeline_timing().format_reports(
+                            timing_reports,
+                            baseline_s=233.675,
+                        )
                     )
             for stage_module in pp_stage_modules:
                 stage_module.assert_side_inputs_consumed()

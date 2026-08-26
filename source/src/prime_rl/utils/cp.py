@@ -127,15 +127,22 @@ def shard_position_ids_for_cp(position_ids: torch.Tensor, cp_rank: int, cp_world
 
 
 def gather_for_cp(t: torch.Tensor, cp_group: dist.ProcessGroup) -> torch.Tensor:
-    gathered_t = dist_nn.all_gather(t, group=cp_group)
+    # Import lazily to keep this utility usable during early trainer startup.
+    # The timing collector is a no-op unless PRIME_PROFILE_PP_TIMING=1.
+    from prime_rl.trainer.distributed.pp_runner import get_pipeline_timing
 
-    return torch.cat(gathered_t, dim=1)
+    with get_pipeline_timing().span("cp.gather_grad", cuda=True):
+        gathered_t = dist_nn.all_gather(t, group=cp_group)
+        return torch.cat(gathered_t, dim=1)
 
 
 def gather_for_cp_wo_grad(t: torch.Tensor, cp_world_size: int, cp_group: dist.ProcessGroup) -> torch.Tensor:
-    empty_like_t = [torch.empty_like(t) for _ in range(cp_world_size)]
-    dist.all_gather(empty_like_t, t, group=cp_group)
-    return torch.cat(empty_like_t, dim=1)
+    from prime_rl.trainer.distributed.pp_runner import get_pipeline_timing
+
+    with get_pipeline_timing().span("cp.gather_nograd", cuda=True):
+        empty_like_t = [torch.empty_like(t) for _ in range(cp_world_size)]
+        dist.all_gather(empty_like_t, t, group=cp_group)
+        return torch.cat(empty_like_t, dim=1)
 
 
 def setup_cp_params(
@@ -180,7 +187,10 @@ def setup_cp_attention_params(
     )
 
     if cp_style == "ring":
-        update_ring_flash_attn_params(cu_seqlens, cp_group)
+        from prime_rl.trainer.distributed.pp_runner import get_pipeline_timing
+
+        with get_pipeline_timing().span("cp.ring_params", cuda=True):
+            update_ring_flash_attn_params(cu_seqlens, cp_group)
     elif cp_style == "ulysses":
         # Delayed import: ulysses_attn lives under trainer.models, which imports
         # back into prime_rl.utils — top-level import would deadlock at startup.

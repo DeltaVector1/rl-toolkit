@@ -8,6 +8,7 @@ orchestrator_container=${prime_orchestrator_container:-glm52-optims-orchestrator
 nccl_channels=${PRIME_NCCL_CHANNELS:-4}
 profile_pp_stage=0
 profile_pp_rank=-1
+profile_pp_timing=0
 ep_profile=0
 ep_profile_every=150
 expert_profile_every=90
@@ -135,7 +136,7 @@ case ${1:-} in
     if [ "$rank" -lt 0 ]; then
       echo "node $node is not in trainer_nodes ($trainer_nodes)" >&2; exit 1
     fi
-    IFS='|' read -r rollout_transport trainer_output trainer_only parity_trace_dir parity_trace_source parity_pp parity_cp parity_batch parity_max_calls parity_max_files parity_max_bytes parity_diagnostics parity_diagnostic_tokens parity_diagnostic_max_files parity_diagnostic_max_bytes configured_int4_combine_rounds configured_fp8_expert_activation_offload configured_lora_mm_profile configured_profile_requested configured_profile_pp_stage configured_ep_profile configured_ep_profile_every configured_expert_profile_every configured_layer_profile_every configured_expert_phase_profile configured_expert_phase_profile_every < <(
+    IFS='|' read -r rollout_transport trainer_output trainer_only parity_trace_dir parity_trace_source parity_pp parity_cp parity_batch parity_max_calls parity_max_files parity_max_bytes parity_diagnostics parity_diagnostic_tokens parity_diagnostic_max_files parity_diagnostic_max_bytes configured_int4_combine_rounds configured_fp8_expert_activation_offload configured_lora_mm_profile configured_profile_requested configured_profile_pp_stage configured_ep_profile configured_ep_profile_every configured_expert_profile_every configured_layer_profile_every configured_pp_timing configured_expert_phase_profile configured_expert_phase_profile_every < <(
       python3 - "$trainer_config" <<'PY'
 import sys
 import tomllib
@@ -164,6 +165,9 @@ profile_present = tuple(name in env_vars for name in profile_names)
 if any(profile_present) and not all(profile_present):
     raise SystemExit("trainer config must define every CUDA profiling value or none")
 profile_env = (int(all(profile_present)), *(env_vars.get(name, "") for name in profile_names))
+configured_pp_timing = env_vars.get("PRIME_PROFILE_PP_TIMING", "")
+if configured_pp_timing not in {"", "0", "1"}:
+    raise SystemExit("PRIME_PROFILE_PP_TIMING must be 0 or 1")
 phase_profile_names = (
     "PRIME_EXPERT_PHASE_PROFILE",
     "PRIME_EXPERT_PHASE_PROFILE_EVERY",
@@ -190,6 +194,7 @@ values = (
     env_vars.get("PRIME_PARITY_DIAGNOSTIC_MAX_BYTES", ""),
     *memory_env,
     *profile_env,
+    configured_pp_timing,
     *phase_profile_env,
 )
 if any(any(char in str(value) for char in "|\r\n") for value in values):
@@ -234,6 +239,13 @@ PY
       ep_profile_every="$configured_ep_profile_every"
       expert_profile_every="$configured_expert_profile_every"
       layer_profile_every="$configured_layer_profile_every"
+    fi
+    if [ "$configured_pp_timing" = "1" ]; then
+      [ "$(readlink -f "$trainer_config")" = "$(readlink -f "$deployment/configs/qualification/glm52-native-small.toml")" ] || {
+        echo "pipeline timing profiling may only be enabled by the GLM small qualification config" >&2
+        exit 1
+      }
+      profile_pp_timing=1
     fi
     parity_trace_runtime=""
     parity_image_digest=""
@@ -513,6 +525,7 @@ PY
       -e PRIME_BIND_GPU_NUMA="${PRIME_BIND_GPU_NUMA:-0}" \
       -e PRIME_NCCL_CHANNELS="$nccl_channels" \
       -e PRIME_PROFILE_PP_STAGE="$profile_pp_stage" \
+      -e PRIME_PROFILE_PP_TIMING="$profile_pp_timing" \
       -e PRIME_PROFILE_PP_RANK="$profile_pp_rank" \
       -e PRIME_EP_AC_CACHE="${PRIME_EP_AC_CACHE:-0}" \
       -e PRIME_INT4_COMBINE_ROUNDS="$int4_combine_rounds" \
