@@ -5,6 +5,7 @@ import re
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 import urllib.request
@@ -192,6 +193,11 @@ class ParallelAdapterDownloadTest(unittest.TestCase):
                 with (
                     patch.dict(os.environ, environment),
                     patch.object(self.module, "_PARALLEL_DOWNLOAD_THRESHOLD", 1),
+                    patch.object(
+                        self.module,
+                        "_GLM_RANGE_CHUNK_BYTES",
+                        len(_RangeHandler.payload) // 8,
+                    ),
                 ):
                     self.module.download(url, destination, create_only=True)
                     with self.assertRaises(FileExistsError):
@@ -227,6 +233,222 @@ class ParallelAdapterDownloadTest(unittest.TestCase):
                 ),
             ):
                 self.module.download(self.url, rejected)
+
+    def test_glm_chunk_queue_lets_fast_ports_take_more_exact_chunks(self):
+        adapter_server = _load_adapter_server_module()
+
+        class Handler(adapter_server.GzipRangeHandler):
+            counts = {}
+            ranges = []
+            delays = {}
+            lock = threading.Lock()
+
+            def log_message(self, *_args):
+                pass
+
+            def do_GET(self):
+                port = self.server.server_port
+                value = self.headers.get("Range")
+                if value:
+                    match = re.fullmatch(r"bytes=(\d+)-(\d+)", value)
+                    if match is None:
+                        self.send_error(416)
+                        return
+                    with type(self).lock:
+                        type(self).counts[port] = type(self).counts.get(port, 0) + 1
+                        type(self).ranges.append(
+                            (int(match.group(1)), int(match.group(2)))
+                        )
+                    time.sleep(type(self).delays[port])
+                return super().do_GET()
+
+        chunk = 64 * 1024
+        servers = []
+        threads = []
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "runs").mkdir()
+            source = root / "runs/adapter"
+            source.write_bytes(_RangeHandler.payload)
+            try:
+                for delay in (0.0, 0.03, 0.03, 0.03):
+                    server = ThreadingHTTPServer(
+                        ("127.0.0.1", 0),
+                        lambda *args, **kwargs: Handler(
+                            *args, directory=str(root), **kwargs
+                        ),
+                    )
+                    Handler.delays[server.server_port] = delay
+                    servers.append(server)
+                    thread = threading.Thread(
+                        target=server.serve_forever, daemon=True
+                    )
+                    thread.start()
+                    threads.append(thread)
+                destination = root / "downloaded.safetensors"
+                environment = {
+                    "PRIME_GLM_ADAPTER_GZIP": "1",
+                    "PRIME_ADAPTER_PORTS": ",".join(
+                        str(server.server_port) for server in servers
+                    ),
+                }
+                url = f"http://127.0.0.1:{servers[0].server_port}/runs/adapter"
+                attempts = []
+                with (
+                    patch.dict(os.environ, environment),
+                    patch.object(self.module, "_PARALLEL_DOWNLOAD_THRESHOLD", 1),
+                    patch.object(self.module, "_GLM_RANGE_CHUNK_BYTES", chunk),
+                ):
+                    self.module.download(
+                        url,
+                        destination,
+                        create_only=True,
+                        _attempt_report=attempts,
+                    )
+            finally:
+                for server in servers:
+                    server.shutdown()
+                for thread in threads:
+                    thread.join()
+                for server in servers:
+                    server.server_close()
+
+            expected = [
+                (start, min(start + chunk, len(_RangeHandler.payload)) - 1)
+                for start in range(0, len(_RangeHandler.payload), chunk)
+            ]
+            self.assertEqual(destination.read_bytes(), _RangeHandler.payload)
+            self.assertEqual(sorted(Handler.ranges), expected)
+            self.assertEqual(attempts, [1] * len(expected))
+            fast = Handler.counts[servers[0].server_port]
+            slow = [Handler.counts.get(server.server_port, 0) for server in servers[1:]]
+            self.assertGreater(fast, max(slow))
+            self.assertFalse(
+                destination.with_name(f"{destination.name}.parts").exists()
+            )
+
+    def test_glm_chunk_failure_removes_only_temporary_outputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "adapter_model.safetensors"
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "PRIME_GLM_ADAPTER_GZIP": "1",
+                        "PRIME_ADAPTER_PORTS": "18001,18002",
+                    },
+                ),
+                patch.object(self.module, "_content_length", return_value=1024),
+                patch.object(self.module, "_PARALLEL_DOWNLOAD_THRESHOLD", 1),
+                patch.object(self.module, "_GLM_RANGE_CHUNK_BYTES", 128),
+                patch.object(
+                    self.module, "_download_range", side_effect=OSError("failed")
+                ),
+                self.assertRaisesRegex(OSError, "failed"),
+            ):
+                self.module.download(
+                    "http://127.0.0.1:18001/adapter",
+                    destination,
+                    create_only=True,
+                )
+            self.assertFalse(destination.exists())
+            self.assertFalse(
+                destination.with_name(f"{destination.name}.assembling").exists()
+            )
+            self.assertFalse(
+                destination.with_name(f"{destination.name}.parts").exists()
+            )
+
+    def test_glm_truncated_chunk_retries_on_another_port_then_fails_at_three(self):
+        adapter_server = _load_adapter_server_module()
+
+        class Handler(adapter_server.GzipRangeHandler):
+            failures_left = 0
+            request_ports = []
+            lock = threading.Lock()
+
+            def log_message(self, *_args):
+                pass
+
+            def do_GET(self):
+                with type(self).lock:
+                    type(self).request_ports.append(self.server.server_port)
+                return super().do_GET()
+
+            def copyfile(self, source, output):
+                with type(self).lock:
+                    truncate = type(self).failures_left > 0
+                    if truncate:
+                        type(self).failures_left -= 1
+                if truncate:
+                    self.remaining //= 2
+                return super().copyfile(source, output)
+
+        servers = []
+        threads = []
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "runs").mkdir()
+            (root / "runs/adapter").write_bytes(_RangeHandler.payload)
+            try:
+                for _ in range(2):
+                    server = ThreadingHTTPServer(
+                        ("127.0.0.1", 0),
+                        lambda *args, **kwargs: Handler(
+                            *args, directory=str(root), **kwargs
+                        ),
+                    )
+                    servers.append(server)
+                    thread = threading.Thread(
+                        target=server.serve_forever, daemon=True
+                    )
+                    thread.start()
+                    threads.append(thread)
+                environment = {
+                    "PRIME_GLM_ADAPTER_GZIP": "1",
+                    "PRIME_ADAPTER_PORTS": ",".join(
+                        str(server.server_port) for server in servers
+                    ),
+                }
+                url = f"http://127.0.0.1:{servers[0].server_port}/runs/adapter"
+                with (
+                    patch.dict(os.environ, environment),
+                    patch.object(self.module, "_PARALLEL_DOWNLOAD_THRESHOLD", 1),
+                    patch.object(
+                        self.module,
+                        "_GLM_RANGE_CHUNK_BYTES",
+                        len(_RangeHandler.payload),
+                    ),
+                ):
+                    Handler.failures_left = 1
+                    attempts = []
+                    recovered = root / "recovered.safetensors"
+                    self.module.download(
+                        url,
+                        recovered,
+                        create_only=True,
+                        _attempt_report=attempts,
+                    )
+                    self.assertEqual(attempts, [2])
+                    self.assertEqual(recovered.read_bytes(), _RangeHandler.payload)
+                    self.assertEqual(len(set(Handler.request_ports[-2:])), 2)
+
+                    Handler.failures_left = 10
+                    failed = root / "failed.safetensors"
+                    with self.assertRaisesRegex(OSError, "failed after 3 attempts"):
+                        self.module.download(url, failed, create_only=True)
+                    self.assertFalse(failed.exists())
+                    self.assertFalse(
+                        failed.with_name(f"{failed.name}.parts").exists()
+                    )
+                    self.assertGreaterEqual(len(set(Handler.request_ports[-3:])), 2)
+            finally:
+                for server in servers:
+                    server.shutdown()
+                for thread in threads:
+                    thread.join()
+                for server in servers:
+                    server.server_close()
 
 
 if __name__ == "__main__":

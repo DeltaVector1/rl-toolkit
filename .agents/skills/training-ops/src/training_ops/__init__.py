@@ -2804,7 +2804,7 @@ def _download_glm_adapter_direct(
     destination_path: str,
     expected_digest: str,
     expected_size: int,
-) -> dict[str, float | int | str]:
+) -> dict[str, object]:
     source = PurePosixPath(source_path)
     destination = PurePosixPath(destination_path)
     qualification_root = glm_adapter_root / "qualifications"
@@ -2871,6 +2871,14 @@ def _download_glm_adapter_direct(
         or isinstance(result.get("seconds"), bool)
         or not isinstance(result.get("seconds"), (int, float))
         or result["seconds"] <= 0
+        or not isinstance(result.get("chunk_attempts"), list)
+        or not result["chunk_attempts"]
+        or any(
+            isinstance(attempt, bool)
+            or not isinstance(attempt, int)
+            or not 1 <= attempt <= 3
+            for attempt in result["chunk_attempts"]
+        )
     ):
         raise RuntimeError("direct adapter download identity differs")
     return result

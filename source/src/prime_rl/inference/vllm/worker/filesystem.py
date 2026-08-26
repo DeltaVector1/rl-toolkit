@@ -6,16 +6,20 @@ import json
 import os
 import re
 import shutil
+import threading
 import time
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from queue import Empty, Queue
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit, urlunsplit
 
 _PARALLEL_DOWNLOAD_THRESHOLD = 16 * 1024 * 1024
 _PARALLEL_DOWNLOAD_STREAMS = 8
 _GLM_RANGE_GZIP_ENV = "PRIME_GLM_ADAPTER_GZIP"
+_GLM_RANGE_CHUNK_BYTES = 256 * 1024 * 1024
+_GLM_RANGE_ATTEMPTS = 3
 
 
 def adapter_cache_path(source_url: str) -> Path:
@@ -43,14 +47,17 @@ def _download_range(
     destination: Path,
     start: int,
     end: int,
+    max_attempts: int = 10,
 ) -> None:
     gzip_required = os.environ.get(_GLM_RANGE_GZIP_ENV, "0")
     if gzip_required not in {"0", "1"}:
         raise OSError(f"{_GLM_RANGE_GZIP_ENV} must be 0 or 1")
-    for attempt in range(10):
+    for attempt in range(max_attempts):
         try:
             source_url = source_urls[(source_index + attempt) % len(source_urls)]
             size = end - start + 1
+            if destination.is_symlink():
+                raise OSError(f"adapter range path is a symlink: {destination.name}")
             present = destination.stat().st_size if destination.exists() else 0
             if present == size:
                 return
@@ -99,7 +106,7 @@ def _download_range(
                 raise OSError(f"incomplete adapter range: {destination.name}")
             return
         except (EOFError, OSError):
-            if attempt == 9:
+            if attempt == max_attempts - 1:
                 raise
             time.sleep(min(2**attempt, 10))
 
@@ -112,7 +119,87 @@ def _publish_download(temporary: Path, destination: Path, create_only: bool) -> 
         temporary.replace(destination)
 
 
-def download(source_url: str, destination: Path, create_only: bool = False) -> None:
+def _download_glm_chunks(
+    source_urls: list[str], parts: Path, ranges: list[tuple[int, int, int]]
+) -> list[int]:
+    pending = Queue()
+    for index, start, end in ranges:
+        pending.put((index, start, end, -1))
+    cancelled = threading.Event()
+    finished = threading.Event()
+    attempts = [0] * len(ranges)
+    errors = []
+    lock = threading.Lock()
+
+    def worker(source_index: int, source_url: str) -> None:
+        while not finished.is_set():
+            try:
+                index, start, end, previous_source = pending.get(timeout=0.1)
+            except Empty:
+                continue
+            if cancelled.is_set():
+                pending.task_done()
+                continue
+            if previous_source == source_index and len(source_urls) > 1:
+                pending.put((index, start, end, previous_source))
+                pending.task_done()
+                time.sleep(0.01)
+                continue
+            with lock:
+                attempts[index] += 1
+            try:
+                _download_range(
+                    [source_url],
+                    0,
+                    parts / f"part-{index:06d}-{start:012x}-{end:012x}",
+                    start,
+                    end,
+                    max_attempts=1,
+                )
+            except (EOFError, OSError) as error:
+                if attempts[index] < _GLM_RANGE_ATTEMPTS:
+                    pending.put((index, start, end, source_index))
+                else:
+                    with lock:
+                        errors.append(
+                            OSError(
+                                f"adapter chunk {index} failed after "
+                                f"{attempts[index]} attempts: {error}"
+                            )
+                        )
+                    cancelled.set()
+            except BaseException as error:
+                with lock:
+                    errors.append(error)
+                cancelled.set()
+            finally:
+                pending.task_done()
+
+    with ThreadPoolExecutor(max_workers=len(source_urls)) as executor:
+        futures = [
+            executor.submit(worker, source_index, source_url)
+            for source_index, source_url in enumerate(source_urls)
+        ]
+        try:
+            pending.join()
+        except BaseException:
+            cancelled.set()
+            raise
+        finally:
+            finished.set()
+        for future in as_completed(futures):
+            future.result()
+    if errors:
+        raise errors[0]
+    return attempts
+
+
+def download(
+    source_url: str,
+    destination: Path,
+    create_only: bool = False,
+    _attempt_report: list[int] | None = None,
+) -> None:
     total = _content_length(source_url)
     if create_only and (destination.exists() or destination.is_symlink()):
         raise FileExistsError(f"adapter destination already exists: {destination}")
@@ -147,35 +234,66 @@ def download(source_url: str, destination: Path, create_only: bool = False) -> N
     if not create_only:
         destination.unlink(missing_ok=True)
     parts = destination.with_name(f"{destination.name}.parts")
+    assembling = destination.with_name(f"{destination.name}.assembling")
+    if assembling.is_symlink():
+        raise OSError(f"adapter assembly path is unsafe: {assembling}")
     parts.mkdir(exist_ok=True)
-    chunk = (total + streams - 1) // streams
+    if parts.is_symlink() or not parts.is_dir():
+        raise OSError(f"adapter parts path is unsafe: {parts}")
+    glm_gzip = os.environ.get(_GLM_RANGE_GZIP_ENV, "0") == "1"
+    chunk = (
+        _GLM_RANGE_CHUNK_BYTES
+        if glm_gzip
+        else (total + streams - 1) // streams
+    )
     ranges = [
         (index, start, min(start + chunk, total) - 1)
         for index, start in enumerate(range(0, total, chunk))
     ]
-    with ThreadPoolExecutor(max_workers=len(ranges)) as executor:
-        futures = [
-            executor.submit(
-                _download_range,
-                source_urls,
-                index,
-                parts / f"part-{index:03d}",
-                start,
-                end,
-            )
-            for index, start, end in ranges
-        ]
-        for future in futures:
-            future.result()
+    try:
+        if glm_gzip:
+            attempts = _download_glm_chunks(source_urls, parts, ranges)
+            if _attempt_report is not None:
+                _attempt_report.extend(attempts)
+        else:
+            with ThreadPoolExecutor(max_workers=len(ranges)) as executor:
+                futures = [
+                    executor.submit(
+                        _download_range,
+                        source_urls,
+                        index,
+                        parts / f"part-{index:03d}",
+                        start,
+                        end,
+                    )
+                    for index, start, end in ranges
+                ]
+                for future in futures:
+                    future.result()
 
-    assembling = destination.with_name(f"{destination.name}.assembling")
-    with assembling.open("wb") as output:
-        for index, _, _ in ranges:
-            with (parts / f"part-{index:03d}").open("rb") as part:
-                shutil.copyfileobj(part, output, length=16 * 1024 * 1024)
-    if assembling.stat().st_size != total:
-        raise OSError(f"assembled adapter file has the wrong size: {destination.name}")
-    _publish_download(assembling, destination, create_only)
+        with assembling.open("wb") as output:
+            for index, start, end in ranges:
+                name = (
+                    f"part-{index:06d}-{start:012x}-{end:012x}"
+                    if glm_gzip
+                    else f"part-{index:03d}"
+                )
+                with (parts / name).open("rb") as part:
+                    shutil.copyfileobj(part, output, length=16 * 1024 * 1024)
+        if assembling.stat().st_size != total:
+            raise OSError(f"assembled adapter file has the wrong size: {destination.name}")
+        _publish_download(assembling, destination, create_only)
+    except BaseException as error:
+        try:
+            assembling.unlink(missing_ok=True)
+        except OSError as cleanup_error:
+            error.add_note(f"cannot clean {assembling}: {cleanup_error}")
+        try:
+            if parts.exists():
+                shutil.rmtree(parts)
+        except OSError as cleanup_error:
+            error.add_note(f"cannot clean {parts}: {cleanup_error}")
+        raise
     shutil.rmtree(parts)
 
 
@@ -193,7 +311,13 @@ def _download_cli() -> int:
     ):
         raise ValueError("adapter identity is invalid")
     started = time.monotonic()
-    download(args.source_url, args.destination, create_only=True)
+    chunk_attempts = []
+    download(
+        args.source_url,
+        args.destination,
+        create_only=True,
+        _attempt_report=chunk_attempts,
+    )
     actual_size = args.destination.stat().st_size
     actual_sha256 = _sha256_file(args.destination)
     if actual_size != args.expected_size or actual_sha256 != args.expected_sha256:
@@ -205,6 +329,7 @@ def _download_cli() -> int:
                 "bytes": actual_size,
                 "seconds": time.monotonic() - started,
                 "sha256": actual_sha256,
+                "chunk_attempts": chunk_attempts,
             },
             sort_keys=True,
             separators=(",", ":"),

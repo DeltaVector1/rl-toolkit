@@ -1126,7 +1126,14 @@ class EdgeOperationsTest(unittest.TestCase):
 
     def test_direct_glm_adapter_download_requires_gzip_ranges(self):
         digest = "a" * 64
-        report = json.dumps({"bytes": 123, "seconds": 9.5, "sha256": digest})
+        report = json.dumps(
+            {
+                "bytes": 123,
+                "seconds": 9.5,
+                "sha256": digest,
+                "chunk_attempts": [1, 2, 1],
+            }
+        )
         with patch.object(training_ops, "_remote_ok", return_value=report) as remote:
             result = training_ops._download_glm_adapter_direct(
                 training_ops.inference_hosts[0],
@@ -1137,6 +1144,7 @@ class EdgeOperationsTest(unittest.TestCase):
                 123,
             )
         self.assertEqual(result["seconds"], 9.5)
+        self.assertEqual(result["chunk_attempts"], [1, 2, 1])
         arguments = shlex.split(remote.call_args.args[1])
         self.assertIn("PRIME_GLM_ADAPTER_GZIP=1", arguments)
         self.assertIn(
