@@ -222,6 +222,15 @@ class ModelConfig(BaseModelConfig):
     native_fp8_expert_prefetch: bool = False
     """Prefetch native-FP8 expert parameters before expert compute."""
 
+    fsdp_param_comm_overlap: bool = False
+    """Use conservative asynchronous FSDP2 parameter prefetching.
+
+    This keeps ``reshard_after_forward`` enabled and prefetches only one
+    future parameter group at a time. It is an opt-in native-FP8/EP
+    qualification setting. It is disabled by default because the expected
+    benefit depends on the CUDA/NCCL topology and allocator state.
+    """
+
     dp_replicate: int = 1
     """Data parallel dim where model weights are replicated."""
 

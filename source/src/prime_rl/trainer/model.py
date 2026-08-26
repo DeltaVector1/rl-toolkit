@@ -152,6 +152,56 @@ def _virtual_stage_prefetch_pairs(
     return groups, forward_pairs, backward_pairs
 
 
+def _configure_fsdp_param_comm_overlap(
+    model: nn.Module,
+    config: ModelConfig,
+    parallel_dims: ParallelDims,
+    native_fp8: bool,
+) -> None:
+    """Enable bounded async FSDP2 unshards for the native-FP8 EP path.
+
+    FSDP2's async unshard mode is useful only when explicit prefetching is
+    configured. ``setup_fsdp`` installs one-step prefetches before calling
+    this helper. The helper deliberately rejects configurations where the
+    conservative memory assumptions do not hold. In particular, it never
+    changes ``reshard_after_forward``: frozen native-FP8 parameters still
+    become sharded after each forward and are gathered again for backward.
+
+    The method is private in PyTorch 2.11, so fail closed if the pinned
+    runtime does not provide it rather than silently running a different
+    schedule.
+    """
+    if not config.fsdp_param_comm_overlap:
+        return
+    if not native_fp8:
+        raise ValueError(
+            "fsdp_param_comm_overlap requires a native FP8 checkpoint"
+        )
+    if config.reshard_after_forward is not True:
+        raise ValueError(
+            "fsdp_param_comm_overlap requires reshard_after_forward=true"
+        )
+    if config.fsdp_cpu_offload or config.cold_cpu_offload:
+        raise ValueError(
+            "fsdp_param_comm_overlap does not support CPU-offloaded parameters"
+        )
+    if not parallel_dims.ep_enabled:
+        raise ValueError(
+            "fsdp_param_comm_overlap requires expert parallelism"
+        )
+    setter = getattr(model, "_set_unshard_async_op", None)
+    if not callable(setter):
+        raise RuntimeError(
+            "fsdp_param_comm_overlap requires PyTorch FSDP2 "
+            "_set_unshard_async_op support"
+        )
+    setter(True)
+    get_logger().info(
+        "Enabled conservative FSDP parameter communication overlap "
+        "(async unshard, singleton prefetch, reshard_after_forward=true)"
+    )
+
+
 def pre_download_model(model_name: str) -> None:
     """Pre-download model from HuggingFace Hub so all nodes have cached weights before training."""
     if Path(model_name).exists():
@@ -1346,6 +1396,7 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
     )
 
     if not parallel_dims.ep_enabled:
+        _configure_fsdp_param_comm_overlap(model, config, parallel_dims, native_fp8)
         return
 
     # if EP is enabled, d2h syncs in the dispatch/combine can interfere with FSDP prefetch, that's why we set it below manually
@@ -1372,13 +1423,26 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
                 and (not native_fp8 or config.native_fp8_expert_prefetch)
             ):
                 prefetch_modules.append(next_mlp.experts)
+            if config.fsdp_param_comm_overlap:
+                # FSDP2 lists of two or more targets use more reserved memory.
+                # Keep only the next decoder block in the opt-in path. Its
+                # nested router/expert groups are gathered at their own use.
+                prefetch_modules = prefetch_modules[:1]
             transformer_block.set_modules_to_forward_prefetch(prefetch_modules)
         else:
             transformer_block.set_modules_to_forward_prefetch([next_transformer_block])
 
     if transformer_blocks and language_model.norm is not None and model.lm_head is not None:
         if shard_norm_and_lm_head:
-            virtual_stage_blocks[-1][-1].set_modules_to_forward_prefetch([language_model.norm, model.lm_head])
+            # ``norm`` and ``lm_head`` share one FSDP parameter group. A
+            # singleton target is enough to unshard both and keeps the
+            # explicit-prefetch contract bounded in the opt-in path.
+            final_prefetch = (
+                [language_model.norm]
+                if config.fsdp_param_comm_overlap
+                else [language_model.norm, model.lm_head]
+            )
+            virtual_stage_blocks[-1][-1].set_modules_to_forward_prefetch(final_prefetch)
 
     # backward
     if language_model.norm is not None and model.lm_head is not None and len(language_model.layers) > 0:
@@ -1398,12 +1462,18 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
                 prefetch_modules.append(prev_mlp.experts)
             if isinstance(prev_mlp.router, FSDPModule):
                 prefetch_modules.append(prev_mlp.router)
+            if config.fsdp_param_comm_overlap:
+                # See the forward prefetch above: one previous block bounds
+                # live unsharded parameters during 1F1B backward.
+                prefetch_modules = prefetch_modules[:1]
             transformer_block.set_modules_to_backward_prefetch(prefetch_modules)
         else:
             transformer_block.set_modules_to_backward_prefetch([prev_transformer_block])
 
     if transformer_blocks and embed_module is not None and shard_norm_and_lm_head:
         virtual_stage_blocks[0][0].set_modules_to_backward_prefetch([embed_module])
+
+    _configure_fsdp_param_comm_overlap(model, config, parallel_dims, native_fp8)
 
 
 def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):

@@ -172,6 +172,106 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
         ).read_text()
         self.assertIn("native_fp8_expert_prefetch: bool = False", trainer_config)
 
+    def test_fsdp_param_comm_overlap_is_opt_in_and_bounded(self):
+        model_source = MODEL.read_text()
+        trainer_config = (
+            ROOT
+            / "source/packages/prime-rl-configs/src/prime_rl/configs/trainer.py"
+        ).read_text()
+        self.assertIn("fsdp_param_comm_overlap: bool = False", trainer_config)
+        self.assertIn("_set_unshard_async_op", model_source)
+        self.assertIn("prefetch_modules = prefetch_modules[:1]", model_source)
+
+        tree = ast.parse(model_source)
+        helper = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_configure_fsdp_param_comm_overlap"
+        )
+        module = ast.Module(body=[helper], type_ignores=[])
+        ast.fix_missing_locations(module)
+        calls = []
+
+        class Model:
+            def _set_unshard_async_op(self, value):
+                calls.append(value)
+
+        config = type(
+            "Config",
+            (),
+            {
+                "fsdp_param_comm_overlap": True,
+                "reshard_after_forward": True,
+                "fsdp_cpu_offload": False,
+                "cold_cpu_offload": False,
+            },
+        )()
+        parallel_dims = type("Dims", (), {"ep_enabled": True})()
+        namespace = {
+            "ValueError": ValueError,
+            "RuntimeError": RuntimeError,
+            "nn": type("NN", (), {"Module": object}),
+            "ModelConfig": object,
+            "ParallelDims": object,
+            "get_logger": lambda: type("Logger", (), {"info": lambda *_: None})(),
+        }
+        exec(compile(module, str(MODEL), "exec"), namespace)
+        namespace["_configure_fsdp_param_comm_overlap"](
+            Model(), config, parallel_dims, True
+        )
+        self.assertEqual(calls, [True])
+
+        config.reshard_after_forward = False
+        with self.assertRaisesRegex(ValueError, "reshard_after_forward=true"):
+            namespace["_configure_fsdp_param_comm_overlap"](
+                Model(), config, parallel_dims, True
+            )
+
+    def test_fsdp_param_comm_overlap_rejects_non_native_or_missing_ep(self):
+        tree = ast.parse(MODEL.read_text())
+        helper = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_configure_fsdp_param_comm_overlap"
+        )
+        module = ast.Module(body=[helper], type_ignores=[])
+        ast.fix_missing_locations(module)
+        namespace = {
+            "ValueError": ValueError,
+            "RuntimeError": RuntimeError,
+            "nn": type("NN", (), {"Module": object}),
+            "ModelConfig": object,
+            "ParallelDims": object,
+            "get_logger": lambda: type("Logger", (), {"info": lambda *_: None})(),
+        }
+        exec(compile(module, str(MODEL), "exec"), namespace)
+
+        config = type(
+            "Config",
+            (),
+            {
+                "fsdp_param_comm_overlap": True,
+                "reshard_after_forward": True,
+                "fsdp_cpu_offload": False,
+                "cold_cpu_offload": False,
+            },
+        )()
+        dims = type("Dims", (), {"ep_enabled": True})()
+        with self.assertRaisesRegex(ValueError, "native FP8"):
+            namespace["_configure_fsdp_param_comm_overlap"](
+                object(), config, dims, False
+            )
+        with self.assertRaisesRegex(ValueError, "expert parallelism"):
+            namespace["_configure_fsdp_param_comm_overlap"](
+                object(), config, type("Dims", (), {"ep_enabled": False})(), True
+            )
+        with self.assertRaisesRegex(RuntimeError, "FSDP2"):
+            namespace["_configure_fsdp_param_comm_overlap"](
+                object(), config, dims, True
+            )
+
     def test_prefetch_pairs_stop_at_virtual_stage_boundaries(self):
         tree = ast.parse(MODEL.read_text())
         helpers = [
@@ -247,6 +347,7 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
         self.assertEqual(config["model"]["ep"], 8)
         self.assertIs(config["model"]["reshard_after_forward"], True)
         self.assertFalse(config["model"]["native_fp8_expert_prefetch"])
+        self.assertFalse(config["model"].get("fsdp_param_comm_overlap", False))
 
     def test_stability_profile_matches_production_shape(self):
         with (ROOT / "configs/operations.toml").open("rb") as stream:
@@ -281,6 +382,7 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
         self.assertEqual(config["model"]["ep"], 8)
         self.assertIs(config["model"]["reshard_after_forward"], True)
         self.assertFalse(config["model"]["native_fp8_expert_prefetch"])
+        self.assertFalse(config["model"].get("fsdp_param_comm_overlap", False))
         self.assertTrue(config["model"]["freeze_moe_router"])
         self.assertEqual(config["optim"]["lr"], 8e-6)
         self.assertEqual(config["model"]["lora"]["rank"], 32)
@@ -295,6 +397,7 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
             production = tomllib.load(stream)
         self.assertIs(production["model"]["reshard_after_forward"], True)
         self.assertFalse(production["model"]["native_fp8_expert_prefetch"])
+        self.assertFalse(production["model"].get("fsdp_param_comm_overlap", False))
 
     def test_glm_router_keeps_bf16_gate_and_uses_h200_order(self):
         model_source = MODEL.read_text()
