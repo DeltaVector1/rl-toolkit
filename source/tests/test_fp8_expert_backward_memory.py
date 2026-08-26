@@ -8,6 +8,9 @@ SOURCE = (
     Path(__file__).resolve().parents[1]
     / "src/prime_rl/trainer/models/layers/fp8_ada.py"
 ).read_text()
+LAUNCHER = (
+    Path(__file__).resolve().parents[2] / "scripts/china/cluster.sh"
+).read_text()
 
 
 class FP8ExpertBackwardMemoryTest(unittest.TestCase):
@@ -162,6 +165,40 @@ class FP8ExpertBackwardMemoryTest(unittest.TestCase):
         self.assertLess(combine, release)
         self.assertLess(release, reconstruct)
         self.assertNotIn("x_grad_w3,", backward[reconstruct:])
+
+    def test_native_lora_phase_profiler_is_opt_in_and_passed_to_trainers(self):
+        self.assertIn(
+            'os.environ.get("PRIME_EXPERT_PHASE_PROFILE", "0")',
+            SOURCE,
+        )
+        self.assertIn(
+            'os.environ.get("PRIME_EXPERT_PHASE_PROFILE_EVERY", "180")',
+            SOURCE,
+        )
+        for phase in (
+            '"forward.input_gather"',
+            '"forward.w13_base"',
+            '"forward.w2_lora"',
+            '"backward.activation_restore"',
+            '"backward.w1_lora"',
+            '"backward.w3_lora"',
+            '"backward.reconstruct"',
+        ):
+            self.assertIn(phase, SOURCE)
+        self.assertIn("def _expert_phase_start", SOURCE)
+        self.assertIn("def _expert_phase_end", SOURCE)
+        self.assertIn("end.synchronize()", SOURCE)
+        self.assertIn("[fp8-expert-phase-prof]", SOURCE)
+        self.assertIn('"PRIME_EXPERT_PHASE_PROFILE",', LAUNCHER)
+        self.assertIn('"PRIME_EXPERT_PHASE_PROFILE_EVERY",', LAUNCHER)
+        self.assertIn(
+            '-e PRIME_EXPERT_PHASE_PROFILE="${configured_expert_phase_profile:-0}"',
+            LAUNCHER,
+        )
+        self.assertIn(
+            '-e PRIME_EXPERT_PHASE_PROFILE_EVERY="${configured_expert_phase_profile_every:-180}"',
+            LAUNCHER,
+        )
 
 
 if __name__ == "__main__":
