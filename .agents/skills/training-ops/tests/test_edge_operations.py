@@ -831,6 +831,7 @@ class EdgeOperationsTest(unittest.TestCase):
         adapter = {
             "path": "/source/adapter_model.safetensors",
             "sha256": hashlib.sha256(payloads["adapter_model.safetensors"]).hexdigest(),
+            "size": len(payloads["adapter_model.safetensors"]),
             "config_path": "/source/adapter_config.json",
             "config_sha256": hashlib.sha256(payloads["adapter_config.json"]).hexdigest(),
             "stable_path": "/source/STABLE",
@@ -844,12 +845,22 @@ class EdgeOperationsTest(unittest.TestCase):
         payloads["qualification-result.json"] = b"qualification\n"
         uploads = []
         remote = []
+        streams = []
 
         def download(source, destination):
             destination.write_bytes(payloads[Path(source).name])
 
         def command(arguments, _label, timeout):
             uploads.append((arguments, timeout))
+
+        def stream(*arguments):
+            streams.append(arguments)
+            return {
+                "bytes": len(payloads["adapter_model.safetensors"]),
+                "seconds": 1.0,
+                "gib_per_second": 0.1,
+                "sha256": adapter["sha256"],
+            }
 
         def remote_ok(_host, command_text, _label, timeout=60):
             remote.append((command_text, timeout))
@@ -858,6 +869,7 @@ class EdgeOperationsTest(unittest.TestCase):
         with (
             patch.object(training_ops, "_download_adapter_file", side_effect=download),
             patch.object(training_ops, "_local_command", side_effect=command),
+            patch.object(training_ops, "_stream_adapter_file", side_effect=stream),
             patch.object(training_ops, "_remote_ok", side_effect=remote_ok),
             patch.object(training_ops.secrets, "token_hex", return_value="1" * 16),
         ):
@@ -867,7 +879,12 @@ class EdgeOperationsTest(unittest.TestCase):
                 ),
                 training_ops.glm_step20_h200_gate["adapter"],
             )
-        self.assertEqual(len(uploads), 5)
+        self.assertEqual(len(streams), 1)
+        self.assertEqual(streams[0][0], training_ops.trainer_head)
+        self.assertEqual(streams[0][1], adapter["path"])
+        self.assertIn(".adapter-candidate-" + "1" * 16, streams[0][3])
+        self.assertEqual(streams[0][4:6], (adapter["sha256"], adapter["size"]))
+        self.assertEqual(len(uploads), 4)
         self.assertTrue(all(call[0][0] == "scp" and call[1] == 1800 for call in uploads))
         self.assertTrue(
             all(".adapter-candidate-" + "1" * 16 in call[0][-1] for call in uploads)
@@ -975,6 +992,58 @@ class EdgeOperationsTest(unittest.TestCase):
                 {path.name: path.read_bytes() for path in candidate.iterdir()},
                 expected_files,
             )
+
+    def test_adapter_stream_checks_hashes_and_uses_create_only(self):
+        payload = (b"adapter-data\n" * 1000) + b"end"
+        digest = hashlib.sha256(payload).hexdigest()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.safetensors"
+            candidate = root / "candidate"
+            source.write_bytes(payload)
+            candidate.mkdir()
+
+            def local_command(_host, script, _timeout):
+                return ["bash", "-c", script]
+
+            with patch.object(
+                training_ops, "_ssh_stream_command", side_effect=local_command
+            ):
+                with self.assertRaisesRegex(RuntimeError, "destination stream failed"):
+                    training_ops._stream_adapter_file(
+                        "source-host",
+                        str(source),
+                        "destination-host",
+                        str(candidate / "rejected.safetensors"),
+                        "0" * 64,
+                        len(payload),
+                        timeout=30,
+                    )
+                self.assertFalse((candidate / "rejected.safetensors").exists())
+                result = training_ops._stream_adapter_file(
+                    "source-host",
+                    str(source),
+                    "destination-host",
+                    str(candidate / "adapter_model.safetensors"),
+                    digest,
+                    len(payload),
+                    timeout=30,
+                )
+                self.assertEqual(result["bytes"], len(payload))
+                self.assertEqual(result["sha256"], digest)
+                self.assertEqual(
+                    (candidate / "adapter_model.safetensors").read_bytes(), payload
+                )
+                with self.assertRaisesRegex(RuntimeError, "destination stream failed"):
+                    training_ops._stream_adapter_file(
+                        "source-host",
+                        str(source),
+                        "destination-host",
+                        str(candidate / "adapter_model.safetensors"),
+                        digest,
+                        len(payload),
+                        timeout=30,
+                    )
 
     def test_step20_trainer_parity_action_pins_exact_adapter_and_step(self):
         with patch.object(training_ops, "qualify") as qualify:
