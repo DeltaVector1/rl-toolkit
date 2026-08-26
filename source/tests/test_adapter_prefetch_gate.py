@@ -35,6 +35,8 @@ class AdapterPrefetchGateTest(unittest.TestCase):
         self.assertEqual(inventory["glm_adapter_tunnel"], 18100)
         self.assertEqual(inventory["glm_adapter_tunnel_extra_first"], 18200)
         self.assertEqual(inventory["glm_adapter_tunnel_extra_last"], 18210)
+        self.assertEqual(inventory["glm_adapter_staging_tunnel_first"], 18200)
+        self.assertEqual(inventory["glm_adapter_staging_tunnel_last"], 18211)
         ports = " ".join(
             str(port)
             for port in (

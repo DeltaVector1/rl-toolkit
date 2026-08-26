@@ -871,7 +871,7 @@ class EdgeOperationsTest(unittest.TestCase):
                 "port": port,
                 "cmdline": training_ops._step20_adapter_tunnel_command(port),
             }
-            for port in range(18200, 18211)
+            for port in range(18200, 18212)
         ]
         with (
             patch.object(training_ops, "_download_adapter_file", side_effect=download),
@@ -887,6 +887,9 @@ class EdgeOperationsTest(unittest.TestCase):
                 "_start_step20_adapter_tunnels",
                 return_value=tunnel_records,
             ),
+            patch.object(
+                training_ops, "_ensure_glm_adapter_range_server"
+            ) as ensure_server,
             patch.object(training_ops, "_stop_step20_adapter_tunnels") as stop_tunnels,
             patch.object(training_ops, "_cleanup_step20_adapter_candidate") as cleanup,
             patch.object(training_ops.secrets, "token_hex", return_value="1" * 16),
@@ -900,6 +903,7 @@ class EdgeOperationsTest(unittest.TestCase):
         stop_tunnels.assert_called_once_with(
             training_ops.inference_hosts[0], tunnel_records
         )
+        ensure_server.assert_called_once_with(adapter["path"])
         cleanup.assert_not_called()
         self.assertEqual(len(direct), 1)
         self.assertEqual(direct[0][1], adapter["path"])
@@ -1021,6 +1025,7 @@ class EdgeOperationsTest(unittest.TestCase):
                 "_start_step20_adapter_tunnels",
                 return_value=tunnel_records,
             ),
+            patch.object(training_ops, "_ensure_glm_adapter_range_server"),
             patch.object(
                 training_ops,
                 "_download_glm_adapter_direct",
@@ -1045,6 +1050,58 @@ class EdgeOperationsTest(unittest.TestCase):
             training_ops.inference_hosts[0], tunnel_records
         )
 
+    def test_glm_adapter_server_is_deployed_supervised_and_exact(self):
+        source = (
+            "/data/glm52-rl/qualifications/test/adapter_model.safetensors"
+        )
+        digest = hashlib.sha256(
+            (
+                training_ops.repo_root
+                / "scripts/ops/glm_adapter_range_server.py"
+            ).read_bytes()
+        ).hexdigest()
+        reports = (
+            json.dumps(
+                {"state": "started", "raw_bytes": 1024, "script_sha256": digest}
+            ),
+            json.dumps(
+                {"state": "checked", "raw_bytes": 1024, "script_sha256": digest}
+            ),
+        )
+        with (
+            patch.object(training_ops, "deploy", return_value=True) as deploy,
+            patch.object(training_ops, "_remote_ok", side_effect=reports) as remote,
+        ):
+            started = training_ops._ensure_glm_adapter_range_server(source)
+            checked = training_ops._check_glm_adapter_range_server(source)
+        self.assertEqual(started["state"], "started")
+        self.assertEqual(checked["state"], "checked")
+        deploy.assert_called_once_with(
+            "scripts/ops/glm_adapter_range_server.py",
+            nodes=[training_ops.trainer_head],
+        )
+        ensure_arguments = shlex.split(remote.call_args_list[0].args[1])
+        check_arguments = shlex.split(remote.call_args_list[1].args[1])
+        self.assertEqual(ensure_arguments[-2], "ensure")
+        self.assertEqual(check_arguments[-2], "check")
+        compile(ensure_arguments[2], "<glm-adapter-server-manager>", "exec")
+        expected = json.loads(
+            base64.b64decode(ensure_arguments[-1], validate=True)
+        )
+        self.assertEqual(
+            expected["name"], training_ops.glm_adapter_server_container
+        )
+        self.assertEqual(expected["port"], training_ops.glm_adapter_port)
+        self.assertEqual(expected["root"], str(training_ops.glm_adapter_root))
+        self.assertEqual(expected["script_sha256"], digest)
+        manager = ensure_arguments[2]
+        self.assertIn('"--restart","unless-stopped"', manager)
+        self.assertIn('"--read-only"', manager)
+        self.assertIn('"prime.glm-adapter-server=1"', manager)
+        self.assertIn("refusing wrong GLM adapter server identity", manager)
+        self.assertIn('"Content-Encoding"', manager)
+        self.assertIn('"X-Prime-Raw-Length"', manager)
+
     def test_direct_glm_adapter_download_requires_gzip_ranges(self):
         digest = "a" * 64
         report = json.dumps({"bytes": 123, "seconds": 9.5, "sha256": digest})
@@ -1061,18 +1118,18 @@ class EdgeOperationsTest(unittest.TestCase):
         arguments = shlex.split(remote.call_args.args[1])
         self.assertIn("PRIME_GLM_ADAPTER_GZIP=1", arguments)
         self.assertIn(
-            "PRIME_ADAPTER_PORTS=18100,18200,18201,18202,18203,18204,18205,18206,18207,18208,18209,18210",
+            "PRIME_ADAPTER_PORTS=18200,18201,18202,18203,18204,18205,18206,18207,18208,18209,18210,18211",
             arguments,
         )
         self.assertIn(
-            "http://127.0.0.1:18100/qualifications/test/adapter_model.safetensors",
+            "http://127.0.0.1:18200/qualifications/test/adapter_model.safetensors",
             arguments,
         )
 
     def test_step20_tunnels_record_and_clean_only_exact_processes(self):
         commands = [
             training_ops._step20_adapter_tunnel_command(port)
-            for port in range(18200, 18211)
+            for port in range(18200, 18212)
         ]
         records = [
             {"pid": 1000 + index, "cmdline": command, "port": 18200 + index}
@@ -1084,14 +1141,17 @@ class EdgeOperationsTest(unittest.TestCase):
         ) as remote:
             observed = training_ops._start_step20_adapter_tunnels(
                 training_ops.inference_hosts[0],
-                "http://127.0.0.1:18100/qualifications/test/adapter_model.safetensors",
+                "http://127.0.0.1:18200/qualifications/test/adapter_model.safetensors",
             )
             training_ops._stop_step20_adapter_tunnels(
                 training_ops.inference_hosts[0], observed
             )
         self.assertEqual(observed, records)
         start_arguments = shlex.split(remote.call_args_list[0].args[1])
-        self.assertIn("required GLM gzip adapter server is not ready", start_arguments[2])
+        self.assertIn(
+            "required GLM gzip adapter server is not ready through temporary staging tunnels",
+            start_arguments[2],
+        )
         compile(start_arguments[2], "<step20-adapter-tunnel-start>", "exec")
         self.assertEqual(
             json.loads(base64.b64decode(start_arguments[-1], validate=True)),

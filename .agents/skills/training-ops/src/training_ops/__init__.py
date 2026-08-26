@@ -101,6 +101,10 @@ glm_adapter_tunnel_extra_ports = range(
     ports["glm_adapter_tunnel_extra_first"],
     ports["glm_adapter_tunnel_extra_last"] + 1,
 )
+glm_adapter_staging_tunnel_ports = range(
+    ports["glm_adapter_staging_tunnel_first"],
+    ports["glm_adapter_staging_tunnel_last"] + 1,
+)
 batch_port = ports["batch"]
 h200_parity_backend_port = ports["h200_parity_backend"]
 remote_repo = paths["remote_repository"]
@@ -122,6 +126,7 @@ inference_image = containers["inference_image"]
 orchestrator_container = containers["orchestrator"]
 environment_container = containers["environment"]
 glm_inference_container = containers["glm52_inference"]
+glm_adapter_server_container = containers["glm52_adapter_server"]
 muse_inference_container = containers["muse_inference"]
 glm_model_volume = containers["glm52_model_volume"]
 glm_model = models["glm52"]
@@ -2373,8 +2378,180 @@ def _download_adapter_file(remote_path: str, local_path: Path) -> None:
     _local_command(command, f"download {remote_path}", timeout=1800)
 
 
+def _glm_adapter_range_server(
+    source_path: str, *, replace_if_needed: bool
+) -> dict[str, object]:
+    source = PurePosixPath(source_path)
+    qualification_root = glm_adapter_root / "qualifications"
+    relative_script = "scripts/ops/glm_adapter_range_server.py"
+    local_script = repo_root / relative_script
+    remote_script = f"{remote_repo}/{relative_script}"
+    if (
+        qualification_root not in source.parents
+        or ".." in source.parts
+        or re.fullmatch(r"[A-Za-z0-9_./-]+", str(source)) is None
+        or not local_script.is_file()
+    ):
+        raise Refused("GLM adapter server source is invalid")
+    script_sha256 = hashlib.sha256(local_script.read_bytes()).hexdigest()
+    if replace_if_needed and not deploy(relative_script, nodes=[trainer_head]):
+        raise RuntimeError("failed to deploy the GLM adapter range server")
+    expected = {
+        "name": glm_adapter_server_container,
+        "image": trainer_image,
+        "port": glm_adapter_port,
+        "root": str(glm_adapter_root),
+        "script": remote_script,
+        "script_sha256": script_sha256,
+        "source": str(source.relative_to(glm_adapter_root)),
+        "labels": {
+            "prime.glm-adapter-server": "1",
+            "prime.repository": remote_repo,
+        },
+    }
+    encoded = base64.b64encode(
+        json.dumps(expected, sort_keys=True, separators=(",", ":")).encode()
+    ).decode()
+    mode = "ensure" if replace_if_needed else "check"
+    script = r'''import base64,gzip,json,os,re,socket,subprocess,sys,time,urllib.parse,urllib.request
+mode,encoded=sys.argv[1:]
+expected=json.loads(base64.b64decode(encoded,validate=True))
+name=expected["name"]
+def docker(*arguments,check=True):
+ result=subprocess.run(["sudo","docker",*arguments],capture_output=True,text=True)
+ if check and result.returncode: raise RuntimeError("docker command failed: "+result.stderr.strip()[:300])
+ return result
+def inspect(reference):
+ result=docker("inspect",reference,check=False)
+ if result.returncode:
+  if "No such object" in result.stderr or "No such container" in result.stderr: return None
+  raise RuntimeError("cannot inspect GLM adapter server: "+result.stderr.strip()[:300])
+ records=json.loads(result.stdout)
+ if len(records)!=1: raise RuntimeError("GLM adapter server inspect count differs")
+ return records[0]
+def fixed_errors(record,require_current):
+ config=record.get("Config") or {}; host=record.get("HostConfig") or {}; state=record.get("State") or {}
+ labels=config.get("Labels") or {}; mounts=record.get("Mounts") or []
+ by_destination={mount.get("Destination"):mount for mount in mounts}
+ errors=[]
+ if record.get("Name")!="/"+name: errors.append("name")
+ if config.get("Image")!=expected["image"]: errors.append("image")
+ if config.get("User")!="1000:1000": errors.append("user")
+ if config.get("Entrypoint")!=["/app/.venv/bin/python"]: errors.append("entrypoint")
+ if config.get("Cmd")!=["/ops/glm_adapter_range_server.py","--port",str(expected["port"]),"--directory",expected["root"]]: errors.append("command")
+ if any(labels.get(key)!=value for key,value in expected["labels"].items()): errors.append("labels")
+ digest=labels.get("prime.script-sha256","")
+ if re.fullmatch(r"[0-9a-f]{64}",digest) is None: errors.append("script label")
+ if require_current and digest!=expected["script_sha256"]: errors.append("script version")
+ if host.get("NetworkMode")!="host": errors.append("network")
+ if host.get("ReadonlyRootfs") is not True: errors.append("read-only root")
+ if (host.get("RestartPolicy") or {}).get("Name")!="unless-stopped": errors.append("restart policy")
+ if host.get("PidsLimit")!=64: errors.append("PID limit")
+ if host.get("Memory")!=536870912: errors.append("memory limit")
+ if host.get("Init") is not True: errors.append("init")
+ if "ALL" not in (host.get("CapDrop") or []): errors.append("capabilities")
+ if not any(value.startswith("no-new-privileges") for value in (host.get("SecurityOpt") or [])): errors.append("security")
+ wanted={"/ops/glm_adapter_range_server.py":expected["script"],expected["root"]:expected["root"]}
+ for destination,source in wanted.items():
+  mount=by_destination.get(destination) or {}
+  if mount.get("Type")!="bind" or mount.get("Source")!=source or mount.get("RW") is not False: errors.append("mount "+destination)
+ if require_current and state.get("Running") is not True: errors.append("running state")
+ return errors
+def listening():
+ with socket.socket() as client:
+  client.settimeout(1); return client.connect_ex(("127.0.0.1",expected["port"]))==0
+def probe():
+ path=urllib.parse.quote(expected["source"],safe="/")
+ request=urllib.request.Request(f'http://127.0.0.1:{expected["port"]}/{path}',headers={"Range":"bytes=0-1023","Accept-Encoding":"gzip"})
+ with urllib.request.urlopen(request,timeout=30) as response:
+  raw_length=response.headers.get("X-Prime-Raw-Length","")
+  if response.status!=206 or response.headers.get("Content-Encoding","").lower()!="gzip" or not raw_length.isdigit(): raise RuntimeError("GLM adapter server did not return gzip range evidence")
+  with gzip.GzipFile(fileobj=response,mode="rb") as stream: data=stream.read()
+  if len(data)!=int(raw_length) or not 1<=len(data)<=1024: raise RuntimeError("GLM adapter server raw range length differs")
+ return len(data)
+def remove_exact(record):
+ identity=record.get("Id","")
+ if re.fullmatch(r"[0-9a-f]{64}",identity) is None: raise RuntimeError("GLM adapter server container ID is invalid")
+ current=inspect(identity)
+ if current is None or fixed_errors(current,False): raise RuntimeError("GLM adapter server changed identity before replacement")
+ docker("rm","-f",identity)
+def created_by_action(record,identity):
+ if record.get("Id")!=identity or record.get("Name")!="/"+name: return False
+ labels=(record.get("Config") or {}).get("Labels") or {}
+ return all(labels.get(key)==value for key,value in {**expected["labels"],"prime.script-sha256":expected["script_sha256"]}.items())
+if mode not in {"check","ensure"}: raise RuntimeError("GLM adapter server mode is invalid")
+if not os.path.isfile(expected["script"]): raise RuntimeError("GLM adapter server script is missing")
+digest=subprocess.run(["sha256sum",expected["script"]],capture_output=True,text=True,check=True).stdout.split()[0]
+if digest!=expected["script_sha256"]: raise RuntimeError("GLM adapter server script checksum differs")
+existing=inspect(name)
+if mode=="check":
+ errors=["absent"] if existing is None else fixed_errors(existing,True)
+ if errors: raise RuntimeError("GLM adapter server identity differs: "+", ".join(errors))
+ measured=probe()
+ print(json.dumps({"state":"checked","raw_bytes":measured,"script_sha256":digest},separators=(",",":")))
+ raise SystemExit
+if existing is not None:
+ errors=fixed_errors(existing,False)
+ if errors: raise RuntimeError("refusing wrong GLM adapter server identity: "+", ".join(errors))
+ if not fixed_errors(existing,True):
+  try:
+   measured=probe()
+   print(json.dumps({"state":"reused","raw_bytes":measured,"script_sha256":digest},separators=(",",":")))
+   raise SystemExit
+  except (OSError,RuntimeError): pass
+ remove_exact(existing)
+if listening(): raise RuntimeError("GLM adapter server port is owned by another process")
+arguments=["run","-d","--name",name,"--restart","unless-stopped","--network","host","--read-only","--init","--user","1000:1000","--cap-drop","ALL","--security-opt","no-new-privileges:true","--pids-limit","64","--memory","512m","--label","prime.glm-adapter-server=1","--label","prime.repository="+expected["labels"]["prime.repository"],"--label","prime.script-sha256="+digest,"--mount","type=bind,src="+expected["script"]+",dst=/ops/glm_adapter_range_server.py,readonly","--mount","type=bind,src="+expected["root"]+",dst="+expected["root"]+",readonly","--entrypoint","/app/.venv/bin/python",expected["image"],"/ops/glm_adapter_range_server.py","--port",str(expected["port"]),"--directory",expected["root"]]
+created=docker(*arguments).stdout.strip()
+try:
+ if re.fullmatch(r"[0-9a-f]{64}",created) is None: raise RuntimeError("GLM adapter server start returned invalid ID")
+ record=inspect(created); errors=[] if record is not None else ["absent after start"]
+ if record is not None: errors.extend(fixed_errors(record,True))
+ if errors: raise RuntimeError("new GLM adapter server identity differs: "+", ".join(errors))
+ deadline=time.monotonic()+30
+ while True:
+  try: measured=probe(); break
+  except (OSError,RuntimeError):
+   if time.monotonic()>=deadline: raise
+   time.sleep(0.25)
+ print(json.dumps({"state":"started","raw_bytes":measured,"script_sha256":digest},separators=(",",":")))
+except BaseException:
+ record=inspect(created)
+ if record is not None and created_by_action(record,created): docker("rm","-f",created)
+ raise
+'''
+    output = _remote_ok(
+        trainer_head,
+        shlex.join(["python3", "-c", script, mode, encoded]),
+        "GLM adapter range server",
+        timeout=180,
+    ).strip()
+    try:
+        result = json.loads(output)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("GLM adapter server report is invalid") from error
+    allowed_states = {"started", "reused"} if replace_if_needed else {"checked"}
+    if (
+        result.get("state") not in allowed_states
+        or result.get("script_sha256") != script_sha256
+        or isinstance(result.get("raw_bytes"), bool)
+        or not isinstance(result.get("raw_bytes"), int)
+        or not 1 <= result["raw_bytes"] <= 1024
+    ):
+        raise RuntimeError("GLM adapter server report differs")
+    return result
+
+
+def _ensure_glm_adapter_range_server(source_path: str) -> dict[str, object]:
+    return _glm_adapter_range_server(source_path, replace_if_needed=True)
+
+
+def _check_glm_adapter_range_server(source_path: str) -> dict[str, object]:
+    return _glm_adapter_range_server(source_path, replace_if_needed=False)
+
+
 def _step20_adapter_tunnel_command(port: int) -> list[str]:
-    if port not in glm_adapter_tunnel_extra_ports:
+    if port not in glm_adapter_staging_tunnel_ports:
         raise Refused("temporary adapter tunnel port is invalid")
     return [
         "ssh",
@@ -2405,7 +2582,7 @@ def _start_step20_adapter_tunnels(host: str, source_url: str) -> list[dict]:
     if (
         host != inference_hosts[0]
         or re.fullmatch(
-            rf"http://127\.0\.0\.1:{glm_adapter_tunnel_port}/qualifications/[A-Za-z0-9_./-]+",
+            rf"http://127\.0\.0\.1:{glm_adapter_staging_tunnel_ports.start}/qualifications/[A-Za-z0-9_./-]+",
             source_url,
         )
         is None
@@ -2414,7 +2591,7 @@ def _start_step20_adapter_tunnels(host: str, source_url: str) -> list[dict]:
         raise Refused("temporary adapter tunnel source is invalid")
     commands = [
         _step20_adapter_tunnel_command(port)
-        for port in glm_adapter_tunnel_extra_ports
+        for port in glm_adapter_staging_tunnel_ports
     ]
     encoded = base64.b64encode(
         json.dumps(commands, separators=(",", ":")).encode()
@@ -2442,13 +2619,6 @@ def cleanup():
    if cmdline(pid)==command: os.killpg(pid,signal.SIGKILL)
   except (FileNotFoundError,ProcessLookupError): pass
 try:
- request=urllib.request.Request(source_url,headers={"Range":"bytes=0-1023","Accept-Encoding":"gzip"})
- try:
-  with urllib.request.urlopen(request,timeout=30) as response:
-   if response.status!=206 or response.headers.get("Content-Encoding","").lower()!="gzip" or response.headers.get("X-Prime-Raw-Length")!="1024": raise RuntimeError
-   with gzip.GzipFile(fileobj=response,mode="rb") as stream:
-    if len(stream.read())!=1024: raise RuntimeError
- except BaseException as error: raise RuntimeError("required GLM gzip adapter server is not ready on supervised port 18100") from error
  for command in commands:
   port=int(command[command.index("-L")+1].split(":")[1])
   if listening(port): raise RuntimeError(f"temporary adapter tunnel port {port} is already in use")
@@ -2460,6 +2630,14 @@ try:
   port=int(command[command.index("-L")+1].split(":")[1])
   if process.poll() is not None or not listening(port) or cmdline(process.pid)!=command: raise RuntimeError(f"temporary adapter tunnel {port} did not start with its exact command")
   records.append({"pid":process.pid,"cmdline":command,"port":port})
+ request=urllib.request.Request(source_url,headers={"Range":"bytes=0-1023","Accept-Encoding":"gzip"})
+ try:
+  with urllib.request.urlopen(request,timeout=30) as response:
+   raw_length=response.headers.get("X-Prime-Raw-Length","")
+   if response.status!=206 or response.headers.get("Content-Encoding","").lower()!="gzip" or not raw_length.isdigit(): raise RuntimeError
+   with gzip.GzipFile(fileobj=response,mode="rb") as stream: data=stream.read()
+   if len(data)!=int(raw_length) or not 1<=len(data)<=1024: raise RuntimeError
+ except BaseException as error: raise RuntimeError("required GLM gzip adapter server is not ready through temporary staging tunnels") from error
  print(json.dumps(records,separators=(",",":")))
 except BaseException:
  cleanup(); raise
@@ -2476,11 +2654,11 @@ except BaseException:
         raise RuntimeError("temporary adapter tunnel record is invalid") from error
     expected = {
         port: _step20_adapter_tunnel_command(port)
-        for port in glm_adapter_tunnel_extra_ports
+        for port in glm_adapter_staging_tunnel_ports
     }
     if (
         not isinstance(records, list)
-        or len(records) != len(glm_adapter_tunnel_extra_ports)
+        or len(records) != len(glm_adapter_staging_tunnel_ports)
         or {
             record.get("port")
             for record in records
@@ -2503,11 +2681,11 @@ except BaseException:
 def _stop_step20_adapter_tunnels(host: str, records: list[dict]) -> None:
     expected = {
         port: _step20_adapter_tunnel_command(port)
-        for port in glm_adapter_tunnel_extra_ports
+        for port in glm_adapter_staging_tunnel_ports
     }
     if (
         host != inference_hosts[0]
-        or len(records) != len(glm_adapter_tunnel_extra_ports)
+        or len(records) != len(glm_adapter_staging_tunnel_ports)
         or any(
             not isinstance(record, dict)
             or record.get("cmdline") != expected.get(record.get("port"))
@@ -2592,10 +2770,12 @@ def _download_glm_adapter_direct(
         f"{remote_repo}/source/src/prime_rl/inference/vllm/worker/filesystem.py"
     )
     served_path = source.relative_to(glm_adapter_root)
-    source_url = f"http://127.0.0.1:{glm_adapter_tunnel_port}/{served_path}"
+    source_url = (
+        f"http://127.0.0.1:{glm_adapter_staging_tunnel_ports.start}/"
+        f"{served_path}"
+    )
     adapter_ports = ",".join(
-        str(port)
-        for port in (glm_adapter_tunnel_port, *glm_adapter_tunnel_extra_ports)
+        str(port) for port in glm_adapter_staging_tunnel_ports
     )
     command = shlex.join(
         [
@@ -8724,7 +8904,10 @@ def _stage_step20_adapter_on_h200(adapter: dict, result_sha256: str) -> str:
         str(source_paths["adapter_model.safetensors"][0])
     ).relative_to(glm_adapter_root)
     source_url = (
-        f"http://127.0.0.1:{glm_adapter_tunnel_port}/{served_path}"
+        f"http://127.0.0.1:{glm_adapter_staging_tunnel_ports.start}/{served_path}"
+    )
+    _ensure_glm_adapter_range_server(
+        str(source_paths["adapter_model.safetensors"][0])
     )
     tunnel_records = _start_step20_adapter_tunnels(host, source_url)
     setup = f"""
@@ -9117,6 +9300,17 @@ def production_start_preflight() -> dict[str, object]:
                     )
         except (KeyError, OSError, Refused, RuntimeError, tomllib.TOMLDecodeError) as error:
             failures.append(f"{profile_name}: {error}")
+    try:
+        adapter = (
+            stability_result.get("adapter")
+            if isinstance(stability_result, dict)
+            else None
+        )
+        if not isinstance(adapter, dict) or not isinstance(adapter.get("path"), str):
+            raise Refused("step-20 adapter server source is missing")
+        _check_glm_adapter_range_server(adapter["path"])
+    except (OSError, Refused, RuntimeError) as error:
+        failures.append(f"GLM adapter server: {error}")
     try:
         if (
             not isinstance(parity_report, dict)
@@ -12417,6 +12611,16 @@ def _stage_glm52_step20_adapter_action(arguments: list[str]):
     }
 
 
+def _prepare_glm52_adapter_server_action(arguments: list[str]):
+    if arguments:
+        raise Refused("prepare-glm52-adapter-server takes no arguments")
+    stability, _result_sha256 = _step20_stability_evidence()
+    adapter = stability.get("adapter")
+    if not isinstance(adapter, dict) or not isinstance(adapter.get("path"), str):
+        raise Refused("step-20 adapter server source is missing")
+    return _ensure_glm_adapter_range_server(adapter["path"])
+
+
 def _cleanup_glm52_parity_engine_action(arguments: list[str]):
     if arguments:
         raise Refused("cleanup-glm52-parity-engine takes no arguments")
@@ -12443,6 +12647,7 @@ actions = {
     "stage-glm52-parity": lambda a: stage_glm52_policy_parity(a or None),
     "collect-glm52-parity": lambda a: collect_glm52_policy_parity(a[0] if a else ""),
     "qualify-glm52-step20-parity": _qualify_glm52_step20_parity_action,
+    "prepare-glm52-adapter-server": _prepare_glm52_adapter_server_action,
     "stage-glm52-step20-adapter": _stage_glm52_step20_adapter_action,
     "diagnose-glm52-parity": _diagnose_glm52_parity_action,
     "cleanup-glm52-parity-engine": _cleanup_glm52_parity_engine_action,

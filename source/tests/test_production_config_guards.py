@@ -368,6 +368,10 @@ def test_glm52_production_profile_matches_requirements() -> None:
     assert operations["models"]["glm52"] == inference["model"]["name"]
     assert operations["containers"]["inference_image"] == "prime-rl:glm52-v080-full"
     assert operations["containers"]["glm52_model_volume"] == "glm52-fp8-model"
+    assert (
+        operations["containers"]["glm52_adapter_server"]
+        == "glm52-optims-adapter-gzip"
+    )
     assert inference["parallel"] == {"tp": 8, "dp": 1}
     assert operations["inference"]["h200a"]["glm52"] == {
         "gpu_count": 8,

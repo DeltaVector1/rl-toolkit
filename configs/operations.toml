@@ -16,6 +16,8 @@ glm_adapter = 8101
 glm_adapter_tunnel = 18100
 glm_adapter_tunnel_extra_first = 18200
 glm_adapter_tunnel_extra_last = 18210
+glm_adapter_staging_tunnel_first = 18200
+glm_adapter_staging_tunnel_last = 18211
 batch = 29620
 h200_parity_backend = 8100
 
@@ -32,6 +34,7 @@ inference_image = "prime-rl:glm52-v080-full"
 orchestrator = "glm52-optims-orchestrator"
 environment = "glm52-optims-env-train"
 glm52_inference = "glm52-optims-h200"
+glm52_adapter_server = "glm52-optims-adapter-gzip"
 muse_inference = "muse-glimmer-h200"
 glm52_model_volume = "glm52-fp8-model"
 
