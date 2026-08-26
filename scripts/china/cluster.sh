@@ -466,6 +466,7 @@ PY
       "${verifiers_mount[@]}" \
       "${prime_configs_mount[@]}" \
       -e TMPDIR=/scratch-tmp \
+      -e PRIME_ADAPTER_DELTA="${PRIME_ADAPTER_DELTA:-0}" \
       -e PYTHONPATH="$deployment/env":/app/packages/prime-rl-configs/src:/app/src \
       "${parity_env[@]}" \
       "${qualification_env[@]}" \
@@ -484,6 +485,7 @@ PY
       -v "$deployment/source/src/prime_rl/trainer/parallel_dims.py":/app/src/prime_rl/trainer/parallel_dims.py:ro \
       -v "$deployment/source/src/prime_rl/utils/cp.py":/app/src/prime_rl/utils/cp.py:ro \
       -v "$deployment/source/src/prime_rl/utils/checkpoint_delta.py":/app/src/prime_rl/utils/checkpoint_delta.py:ro \
+      -v "$deployment/source/src/prime_rl/utils/adapter_delta.py":/app/src/prime_rl/utils/adapter_delta.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/rl/train.py":/app/src/prime_rl/trainer/rl/train.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/rl/token_export.py":/app/src/prime_rl/trainer/rl/token_export.py:ro \
       -v "$deployment/source/src/prime_rl/parity_router_trace.py":/app/src/prime_rl/parity_router_trace.py:ro \
@@ -574,6 +576,7 @@ PY
       -v "$deployment/source/src/prime_rl/orchestrator/watcher.py":/app/src/prime_rl/orchestrator/watcher.py:ro \
       -v "$deployment/source/src/prime_rl/utils/client.py":/app/src/prime_rl/utils/client.py:ro \
       -v "$deployment/source/src/prime_rl/utils/checkpoint_delta.py":/app/src/prime_rl/utils/checkpoint_delta.py:ro \
+      -v "$deployment/source/src/prime_rl/utils/adapter_delta.py":/app/src/prime_rl/utils/adapter_delta.py:ro \
       --entrypoint /app/.venv/bin/orchestrator "$image" \
       @ "$orchestrator_config/orchestrator${CONFIG_TAG}.toml"
     ;;

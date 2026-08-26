@@ -191,6 +191,7 @@ sudo docker run -d --name "$orchestrator_container" \
   -v "$deployment/source/src/prime_rl/orchestrator/watcher.py":/app/src/prime_rl/orchestrator/watcher.py:ro \
   -v "$deployment/source/src/prime_rl/utils/client.py":/app/src/prime_rl/utils/client.py:ro \
   -v "$deployment/source/src/prime_rl/utils/checkpoint_delta.py":/app/src/prime_rl/utils/checkpoint_delta.py:ro \
+  -v "$deployment/source/src/prime_rl/utils/adapter_delta.py":/app/src/prime_rl/utils/adapter_delta.py:ro \
   --entrypoint /bin/sh "$image" \
   -c 'cd /app/deps/verifiers && patch -s -p1 < /tmp/v1-serialize-env-replies.patch && exec runuser -u appuser -- /app/.venv/bin/orchestrator "$@"' \
   sh @ "$config_file"

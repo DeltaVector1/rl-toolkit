@@ -19,6 +19,39 @@ from queue import Empty, Queue
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit, urlunsplit
 
+try:
+    from prime_rl.utils.adapter_delta import (
+        ADAPTER_DELTA_ENABLE_ENV,
+        ADAPTER_DELTA_FILE,
+        ADAPTER_DELTA_MANIFEST,
+        AdapterDeltaError,
+        adapter_cache_identity,
+        apply_adapter_delta,
+        load_adapter_delta_manifest,
+        safetensors_metadata_sha256,
+        select_adapter_transfer,
+    )
+except ModuleNotFoundError:  # unit tests load this worker file in isolation
+    import importlib.util
+
+    _adapter_delta_path = Path(__file__).parents[3] / "utils" / "adapter_delta.py"
+    _adapter_delta_spec = importlib.util.spec_from_file_location(
+        "prime_rl_utils_adapter_delta", _adapter_delta_path
+    )
+    if _adapter_delta_spec is None or _adapter_delta_spec.loader is None:
+        raise
+    _adapter_delta_module = importlib.util.module_from_spec(_adapter_delta_spec)
+    _adapter_delta_spec.loader.exec_module(_adapter_delta_module)
+    ADAPTER_DELTA_ENABLE_ENV = _adapter_delta_module.ADAPTER_DELTA_ENABLE_ENV
+    ADAPTER_DELTA_FILE = _adapter_delta_module.ADAPTER_DELTA_FILE
+    ADAPTER_DELTA_MANIFEST = _adapter_delta_module.ADAPTER_DELTA_MANIFEST
+    AdapterDeltaError = _adapter_delta_module.AdapterDeltaError
+    adapter_cache_identity = _adapter_delta_module.adapter_cache_identity
+    apply_adapter_delta = _adapter_delta_module.apply_adapter_delta
+    load_adapter_delta_manifest = _adapter_delta_module.load_adapter_delta_manifest
+    safetensors_metadata_sha256 = _adapter_delta_module.safetensors_metadata_sha256
+    select_adapter_transfer = _adapter_delta_module.select_adapter_transfer
+
 _PARALLEL_DOWNLOAD_THRESHOLD = 16 * 1024 * 1024
 _PARALLEL_DOWNLOAD_STREAMS = 8
 _GLM_RANGE_GZIP_ENV = "PRIME_GLM_ADAPTER_GZIP"
@@ -98,10 +131,18 @@ def _copy_zstd_range(source, output, raw_size: int) -> None:
         remaining -= frame_size
 
 
-def adapter_cache_path(source_url: str) -> Path:
-    return Path(os.environ.get("PRIME_LORA_CACHE_DIR", "/tmp/prime-rl-lora")) / hashlib.sha256(
-        source_url.encode()
-    ).hexdigest()
+def adapter_cache_path(source_url: str, target_sha256: str | None = None) -> Path:
+    """Return a cache path bound to the URL and, when known, target bytes.
+
+    The optional digest keeps callers that only need a lock path compatible.
+    Completed adapter caches always use the digest-bound form.
+    """
+    cache_name = (
+        hashlib.sha256(source_url.encode()).hexdigest()
+        if target_sha256 is None
+        else adapter_cache_identity(source_url, target_sha256)
+    )
+    return Path(os.environ.get("PRIME_LORA_CACHE_DIR", "/tmp/prime-rl-lora")) / cache_name
 
 
 def _sha256_file(path: Path) -> str:
@@ -112,7 +153,7 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _adapter_identity(config: Path, checksum: Path) -> dict[str, object]:
+def _adapter_identity(config: Path, checksum: Path, model: Path | None = None) -> dict[str, object]:
     """Read the export identity without trusting a cache marker."""
     expected_model = checksum.read_text(encoding="ascii").strip()
     if len(expected_model) != 64 or any(
@@ -124,7 +165,16 @@ def _adapter_identity(config: Path, checksum: Path) -> dict[str, object]:
         "version": _ADAPTER_IDENTITY_VERSION,
         "adapter_config_sha256": config_sha256,
         "adapter_model_sha256": expected_model,
+        "target_sha256": expected_model,
     }
+    if model is not None:
+        try:
+            identity["tensor_metadata_sha256"] = safetensors_metadata_sha256(model)
+        except (OSError, ValueError, AdapterDeltaError):
+            # Existing development fixtures use arbitrary model bytes.  Delta
+            # mode requires real safetensors and will reject these later; the
+            # normal full transfer keeps its established identity behavior.
+            identity["tensor_metadata_sha256"] = None
     encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
     identity["identity_sha256"] = hashlib.sha256(encoded).hexdigest()
     return identity
@@ -139,8 +189,6 @@ def _cached_adapter_matches(destination: Path, expected: dict[str, object]) -> b
         cached = json.loads(ready.read_text(encoding="ascii"))
     except (OSError, UnicodeError, ValueError):
         return False
-    if cached != expected:
-        return False
     config = destination / _ADAPTER_CONFIG_NAME
     checksum = destination / _ADAPTER_CHECKSUM_NAME
     model = destination / _ADAPTER_MODEL_NAME
@@ -150,9 +198,10 @@ def _cached_adapter_matches(destination: Path, expected: dict[str, object]) -> b
     ):
         return False
     try:
-        actual = _adapter_identity(config, checksum)
+        actual = _adapter_identity(config, checksum, model)
         return (
-            actual == expected
+            all(cached.get(key) == value for key, value in expected.items())
+            and cached == actual
             and _sha256_file(model) == expected["adapter_model_sha256"]
         )
     except (OSError, UnicodeError, ValueError):
@@ -504,6 +553,208 @@ def _download_cli() -> int:
     return 0
 
 
+def _download_optional(source_url: str, destination: Path) -> bool:
+    """Download an optional delta artifact and report absence as fallback."""
+    try:
+        download(source_url, destination, create_only=True)
+    except (EOFError, OSError, ValueError):
+        destination.unlink(missing_ok=True)
+        return False
+    return True
+
+
+def _delta_enabled() -> bool:
+    value = os.environ.get(ADAPTER_DELTA_ENABLE_ENV, "0")
+    if value not in {"0", "1"}:
+        raise OSError(f"{ADAPTER_DELTA_ENABLE_ENV} must be 0 or 1")
+    return value == "1"
+
+
+def stage_lora_adapter_files(source_url: str) -> Path:
+    """Stage one adapter, using an exact adjacent delta only when enabled.
+
+    The complete adapter is downloaded into a unique directory.  The active
+    cache directory is changed only after the complete model, checksum,
+    safetensors metadata, and READY marker pass verification.
+    """
+    cache_root = adapter_cache_path(source_url)
+    cache_root.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = cache_root.parent / f"{cache_root.name}.lock"
+    with lock_path.open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        temporary = Path(
+            tempfile.mkdtemp(prefix=f"{cache_root.name}.partial-", dir=cache_root.parent)
+        )
+        try:
+            for filename in (_ADAPTER_CONFIG_NAME, _ADAPTER_CHECKSUM_NAME):
+                download(
+                    f"{source_url.rstrip('/')}/{filename}",
+                    temporary / filename,
+                    create_only=True,
+                )
+            basic_identity = _adapter_identity(
+                temporary / _ADAPTER_CONFIG_NAME,
+                temporary / _ADAPTER_CHECKSUM_NAME,
+            )
+            target_sha256 = basic_identity["adapter_model_sha256"]
+            destination = adapter_cache_path(source_url, target_sha256)
+            if destination.is_symlink() or (
+                destination.exists() and not destination.is_dir()
+            ):
+                raise OSError(f"adapter cache path is unsafe: {destination}")
+            if destination.is_dir() and _cached_adapter_matches(destination, basic_identity):
+                return destination
+
+            transfer = "full"
+            delta_manifest = None
+            if _delta_enabled():
+                manifest_path = temporary / ADAPTER_DELTA_MANIFEST
+                if _download_optional(
+                    f"{source_url.rstrip('/')}/{ADAPTER_DELTA_MANIFEST}",
+                    manifest_path,
+                ):
+                    try:
+                        delta_manifest = load_adapter_delta_manifest(manifest_path)
+                        # The model size is not known until the manifest is
+                        # checked.  The manifest itself supplies the target
+                        # size and must bind the target checksum and config.
+                        target_size = int(delta_manifest["uncompressed_size"])
+                        manifest_target = {
+                            "target_sha256": target_sha256,
+                            "adapter_config_sha256": basic_identity["adapter_config_sha256"],
+                            "uncompressed_size": target_size,
+                        }
+                        if any(
+                            delta_manifest.get(key) != value
+                            for key, value in manifest_target.items()
+                        ):
+                            raise AdapterDeltaError("adapter delta target identity differs")
+                        base_sha256 = delta_manifest["base_sha256"]
+                        base_destination = adapter_cache_path(source_url, base_sha256)
+                        base_expected = {
+                            "version": _ADAPTER_IDENTITY_VERSION,
+                            "adapter_model_sha256": base_sha256,
+                            "adapter_config_sha256": delta_manifest.get(
+                                "base_adapter_config_sha256"
+                            ),
+                        }
+                        base_available = (
+                            base_destination.is_dir()
+                            and base_expected["adapter_config_sha256"] is not None
+                            and _cached_adapter_matches(base_destination, base_expected)
+                        )
+                        choice = select_adapter_transfer(
+                            delta_manifest,
+                            base_available=base_available,
+                            base_sha256=base_sha256 if base_available else None,
+                            target_sha256=target_sha256,
+                            target_size=target_size,
+                            enabled=True,
+                            manifest_wire_size=manifest_path.stat().st_size,
+                        )
+                        if choice == "delta":
+                            delta_path = temporary / ADAPTER_DELTA_FILE
+                            if not _download_optional(
+                                f"{source_url.rstrip('/')}/{ADAPTER_DELTA_FILE}",
+                                delta_path,
+                            ):
+                                raise AdapterDeltaError("adapter delta artifact is unavailable")
+                            apply_adapter_delta(
+                                base_destination / _ADAPTER_MODEL_NAME,
+                                delta_path,
+                                temporary / _ADAPTER_MODEL_NAME,
+                                delta_manifest,
+                            )
+                            if (
+                                safetensors_metadata_sha256(
+                                    temporary / _ADAPTER_MODEL_NAME
+                                )
+                                != delta_manifest["tensor_metadata_sha256"]
+                            ):
+                                raise AdapterDeltaError(
+                                    "reconstructed safetensors metadata differs"
+                                )
+                            transfer = "delta"
+                        else:
+                            raise AdapterDeltaError(
+                                "adapter delta base is absent, mismatched, or too large"
+                            )
+                    except (AdapterDeltaError, OSError, ValueError, TypeError, KeyError):
+                        # Delta is an optimization.  A failed or ineligible
+                        # delta must select the complete current transfer.
+                        transfer = "full"
+                        temporary.joinpath(_ADAPTER_MODEL_NAME).unlink(missing_ok=True)
+
+            if transfer == "full":
+                download(
+                    f"{source_url.rstrip('/')}/{_ADAPTER_MODEL_NAME}",
+                    temporary / _ADAPTER_MODEL_NAME,
+                    create_only=True,
+                )
+                actual_model = _sha256_file(temporary / _ADAPTER_MODEL_NAME)
+                if actual_model != target_sha256:
+                    raise ValueError(
+                        "downloaded adapter SHA-256 does not match the trainer export"
+                    )
+
+            marker = _adapter_identity(
+                temporary / _ADAPTER_CONFIG_NAME,
+                temporary / _ADAPTER_CHECKSUM_NAME,
+                temporary / _ADAPTER_MODEL_NAME,
+            )
+            if marker["adapter_model_sha256"] != target_sha256:
+                raise ValueError("staged adapter identity changed during transfer")
+            # Delta mode must bind metadata.  Full mode also records it when
+            # this is a real safetensors file, which makes later base checks
+            # strict without changing the default full transfer.
+            (temporary / _ADAPTER_READY_NAME).write_text(
+                json.dumps(marker, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="ascii",
+            )
+            if destination.exists():
+                shutil.rmtree(destination)
+            temporary.rename(destination)
+            temporary = None
+            return destination
+        finally:
+            if temporary is not None:
+                shutil.rmtree(temporary, ignore_errors=True)
+
+
+def stage_full_checkpoint_files(source_url: str) -> Path:
+    """Stage a complete checkpoint for the legacy Muse endpoint.
+
+    This helper only restores the endpoint import contract.  Adapter delta
+    staging above is independent from full-weight transfer.
+    """
+    destination = Path(
+        os.environ.get("PRIME_FULL_CHECKPOINT_CACHE_DIR", "/tmp/prime-rl-checkpoints")
+    ) / hashlib.sha256(source_url.encode()).hexdigest()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.is_dir():
+        return destination
+    temporary = Path(tempfile.mkdtemp(prefix=f"{destination.name}.partial-", dir=destination.parent))
+    try:
+        # The full checkpoint endpoint serves its index and files.  Download
+        # the index first, then the shard names declared by that index.
+        index_name = "model.safetensors.index.json"
+        download(f"{source_url.rstrip('/')}/{index_name}", temporary / index_name, create_only=True)
+        index = json.loads((temporary / index_name).read_text(encoding="utf-8"))
+        shards = sorted(set(index.get("weight_map", {}).values()))
+        if not shards:
+            raise OSError("checkpoint index has no shards")
+        for filename in shards:
+            if not isinstance(filename, str) or Path(filename).name != filename:
+                raise OSError("checkpoint index contains an unsafe shard name")
+            download(f"{source_url.rstrip('/')}/{filename}", temporary / filename, create_only=True)
+        temporary.rename(destination)
+        temporary = None
+        return destination
+    finally:
+        if temporary is not None:
+            shutil.rmtree(temporary, ignore_errors=True)
+
+
 if __name__ == "__main__":
     raise SystemExit(_download_cli())
 
@@ -544,65 +795,9 @@ class FileSystemWeightUpdateWorker(Worker):
 
         return run_h200_router_diagnostic(self.model_runner, payload)
 
-    def stage_lora_adapter(self, source_url: str) -> None:
-        destination = adapter_cache_path(source_url)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        with (destination.parent / f"{destination.name}.lock").open("w") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            if destination.is_symlink() or (
-                destination.exists() and not destination.is_dir()
-            ):
-                raise OSError(f"adapter cache path is unsafe: {destination}")
-            temporary = Path(
-                tempfile.mkdtemp(
-                    prefix=f"{destination.name}.partial-",
-                    dir=destination.parent,
-                )
-            )
-            try:
-                # The URL hash is only a storage location. Read the export's
-                # identity before accepting that location as a cache hit.
-                for filename in (_ADAPTER_CONFIG_NAME, _ADAPTER_CHECKSUM_NAME):
-                    download(
-                        f"{source_url.rstrip('/')}/{filename}",
-                        temporary / filename,
-                        create_only=True,
-                    )
-                expected = _adapter_identity(
-                    temporary / _ADAPTER_CONFIG_NAME,
-                    temporary / _ADAPTER_CHECKSUM_NAME,
-                )
-                if destination.is_dir() and _cached_adapter_matches(
-                    destination, expected
-                ):
-                    return
-
-                download(
-                    f"{source_url.rstrip('/')}/{_ADAPTER_MODEL_NAME}",
-                    temporary / _ADAPTER_MODEL_NAME,
-                    create_only=True,
-                )
-                actual_model = _sha256_file(temporary / _ADAPTER_MODEL_NAME)
-                if actual_model != expected["adapter_model_sha256"]:
-                    raise ValueError(
-                        "downloaded adapter SHA-256 does not match the trainer export"
-                    )
-                (temporary / _ADAPTER_READY_NAME).write_text(
-                    json.dumps(
-                        expected,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    )
-                    + "\n",
-                    encoding="ascii",
-                )
-                if destination.exists():
-                    shutil.rmtree(destination)
-                temporary.rename(destination)
-                temporary = None
-            finally:
-                if temporary is not None:
-                    shutil.rmtree(temporary, ignore_errors=True)
+    def stage_lora_adapter(self, source_url: str) -> str:
+        """Stage an adapter and return its digest-bound cache directory."""
+        return str(stage_lora_adapter_files(source_url))
 
     def update_weights_from_path(self, weight_path: str) -> None:
         """Update weights from a specified path in shared filesystem containing a HF-compatible checkpoint."""

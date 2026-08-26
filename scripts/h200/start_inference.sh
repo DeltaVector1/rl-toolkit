@@ -248,6 +248,7 @@ container_id=$(docker run -d --cidfile "$engine_cidfile" \
   --mount "type=bind,source=$overlay_root/vllm/v1/core/sched/scheduler.py,target=/app/.venv/lib/python3.12/site-packages/vllm/v1/core/sched/scheduler.py,readonly" \
   --mount "type=bind,source=$bootstrap_fifo,target=/run/prime-parity-bootstrap" \
   -v "$deployment/source/src/prime_rl/inference/vllm/worker/filesystem.py":/app/src/prime_rl/inference/vllm/worker/filesystem.py:ro \
+  -v "$deployment/source/src/prime_rl/utils/adapter_delta.py":/app/src/prime_rl/utils/adapter_delta.py:ro \
   -v "$deployment/source/src/prime_rl/inference/vllm/server.py":/app/src/prime_rl/inference/vllm/server.py:ro \
   -v "$deployment/source/src/prime_rl/parity_router_trace.py":/app/src/prime_rl/parity_router_trace.py:ro \
   -e CUDA_DEVICE_ORDER=PCI_BUS_ID \
@@ -261,6 +262,7 @@ container_id=$(docker run -d --cidfile "$engine_cidfile" \
   -e PRIME_ADAPTER_PORTS="$adapter_ports" \
   -e PRIME_GLM_ADAPTER_CODEC="$adapter_codec" \
   -e PRIME_GLM_ADAPTER_GZIP=1 \
+  -e PRIME_ADAPTER_DELTA="${PRIME_ADAPTER_DELTA:-0}" \
   -e PRIME_PARITY_BOOTSTRAP_FIFO=/run/prime-parity-bootstrap \
   -e PRIME_PARITY_ROUTER_TRACE_DIR="$parity_trace_dir" \
   --entrypoint /app/.venv/bin/inference \

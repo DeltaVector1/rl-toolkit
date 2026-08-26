@@ -225,6 +225,37 @@ rollouts a minute, over a path that loses 7.5 percent of its packets.
 
 The useful content, the tokens and their logprobs, is under 5 percent of it.
 
+# OPT-IN ADJACENT ADAPTER DELTAS
+
+The adapter delta is disabled by default.  Set `PRIME_ADAPTER_DELTA=1` only
+for a measured qualification.  The exporter XORs the serialized adapter bytes
+and compresses independent zlib frames.  The H200 checks the base SHA-256,
+target SHA-256, adapter configuration hash, safetensors tensor-metadata hash,
+frame codec, and byte count before it writes `READY`.
+
+The wire-size break-even is exact:
+
+```
+delta_bytes + manifest_bytes < full_transfer_wire_bytes
+```
+
+The default selector uses a 0.90 delta-to-target-size guard when no measured
+full wire size is available.  A missing or mismatched base, an invalid frame,
+or a ratio at or above the guard selects the current complete adapter transfer.
+The normal gzip transfer and production profiles are unchanged.
+
+The measurement gate is exactly two adjacent real exports from one run:
+
+1. Save step `S` and the immediately following step `S+1` with the normal
+   safetensors exporter and `STABLE` markers.
+2. Record the complete gzip wire bytes for `S+1`, the delta frames plus
+   manifest for `S -> S+1`, transfer time for each, and all source/H200 SHA-256
+   and tensor-metadata checks.
+3. Repeat for the next adjacent pair `S+1 -> S+2`.  Both pairs must reconstruct
+   byte-for-byte, pass metadata checks, and have delta wire bytes below the
+   complete gzip wire bytes.  A single synthetic pair or one adjacent pair is
+   not a production gate.
+
 This described x24 with router replay enabled. x25 disables router replay and
 routed-expert return together, so this field no longer limits batch size.
 

@@ -167,3 +167,24 @@ def apply_xor_delta_file(
     if digest.hexdigest() != expected_sha256:
         raise OSError(f"reconstructed checksum mismatch for {target_path.name}")
     temporary.replace(target_path)
+
+
+# Adapter exports use the adjacent-step protocol in ``adapter_delta``.  Keep
+# these imports here so deployment code that already imports checkpoint-delta
+# helpers can opt in without creating a second module path.
+from prime_rl.utils.adapter_delta import (  # noqa: E402  (compatibility exports)
+    ADAPTER_DELTA_CODEC,
+    ADAPTER_DELTA_FILE,
+    ADAPTER_DELTA_FILE_NAME,
+    ADAPTER_DELTA_MANIFEST,
+    ADAPTER_DELTA_MANIFEST_NAME,
+    ADAPTER_DELTA_VERSION,
+    apply_adapter_delta,
+    apply_adapter_delta_file,
+    apply_xor_adapter_delta,
+    build_adapter_delta,
+    build_adapter_delta_checkpoint,
+    build_xor_adapter_delta,
+    select_adapter_transfer,
+    wire_size_break_even,
+)

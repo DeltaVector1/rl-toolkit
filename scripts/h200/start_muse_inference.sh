@@ -53,6 +53,7 @@ start_replica() {
   -v /data:/data \
   -v "$deployment/source/src/prime_rl/inference/vllm/worker/filesystem.py":"$runtime/prime_rl/inference/vllm/worker/filesystem.py":ro \
   -v "$deployment/source/src/prime_rl/utils/checkpoint_delta.py":"$runtime/prime_rl/utils/checkpoint_delta.py":ro \
+  -v "$deployment/source/src/prime_rl/utils/adapter_delta.py":"$runtime/prime_rl/utils/adapter_delta.py":ro \
   -e PYTHONPATH="$runtime" \
   -e MUSE_TP_SIZE="$tp_size" \
   -e VLLM_PLUGINS=muse_file_server \
@@ -60,6 +61,7 @@ start_replica() {
   -e PRIME_FULL_CHECKPOINT_CACHE_DIR=/data/muse-glimmer/weight-cache \
   -e PRIME_LORA_DOWNLOAD_STREAMS=8 \
   -e PRIME_FULL_CHECKPOINT_PORTS="$weight_tunnel_ports" \
+  -e PRIME_ADAPTER_DELTA="${PRIME_ADAPTER_DELTA:-0}" \
   -e CUDA_DEVICE_ORDER=PCI_BUS_ID \
   -e PYTHONUNBUFFERED=1 \
   -e OMP_NUM_THREADS=1 \

@@ -1,3 +1,4 @@
+import os
 import shutil
 import time
 from pathlib import Path
@@ -17,6 +18,7 @@ from prime_rl.trainer.weights import (
     save_state_dict,
 )
 from prime_rl.trainer.world import get_world
+from prime_rl.utils.adapter_delta import build_adapter_delta
 from prime_rl.utils.checkpoint_delta import sha256_file
 from prime_rl.utils.utils import get_broadcast_dir, get_step_path
 
@@ -106,6 +108,31 @@ class FileSystemWeightBroadcast(WeightBroadcast):
                         adapter_path = save_dir / "adapter_model.safetensors"
                         digest_path = save_dir / "adapter_model.safetensors.sha256"
                         digest_path.write_text(f"{sha256_file(adapter_path)}\n")
+
+                        # Adjacent-step deltas are deliberately opt-in.  The
+                        # normal export remains a complete adapter, so an
+                        # absent or poor delta always selects full transfer.
+                        if os.environ.get("PRIME_ADAPTER_DELTA") == "1":
+                            previous_dir = get_step_path(
+                                get_broadcast_dir(self.multi_run_manager.get_run_dir(idx)),
+                                self.multi_run_manager.progress[idx].step - 2,
+                            )
+                            delta_manifest = build_adapter_delta(
+                                previous_dir,
+                                save_dir,
+                                base_url="",
+                                target_url="",
+                            )
+                            if delta_manifest is None:
+                                self.logger.info(
+                                    "adapter delta not published for step %s; using full adapter transfer",
+                                    self.multi_run_manager.progress[idx].step - 1,
+                                )
+                            else:
+                                self.logger.info(
+                                    "published exact adjacent adapter delta: %s",
+                                    delta_manifest,
+                                )
 
                     self._notify_orchestrator(save_dir)
 

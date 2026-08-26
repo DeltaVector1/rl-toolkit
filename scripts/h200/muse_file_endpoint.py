@@ -9,7 +9,6 @@ from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.entrypoints.serve.lora.protocol import LoadLoRAAdapterRequest
 
 from prime_rl.inference.vllm.worker.filesystem import (
-    adapter_cache_path,
     stage_full_checkpoint_files,
     stage_lora_adapter_files,
 )
@@ -129,9 +128,6 @@ class MuseFileEndpoint:
                 if lora_request.lora_path.startswith(("http://", "https://")):
                     source_url = lora_request.lora_path
                     destination = await asyncio.to_thread(stage_lora_adapter_files, source_url)
-                    expected = adapter_cache_path(source_url)
-                    if destination != expected:
-                        raise RuntimeError("adapter cache path changed during staging")
                     lora_request.lora_path = destination.as_posix()
                 lora_request.load_inplace = True
                 handler = request.app.state.openai_serving_models

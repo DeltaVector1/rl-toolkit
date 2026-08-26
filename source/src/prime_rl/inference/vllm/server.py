@@ -29,7 +29,6 @@ from prime_rl.inference.patches import (
     monkey_patch_strip_routed_experts_from_chat,
     monkey_patch_tokenize_params_validation,
 )
-from prime_rl.inference.vllm.worker.filesystem import adapter_cache_path
 from prime_rl.parity_router_trace import (
     TraceSession,
     assemble_chunks,
@@ -94,6 +93,19 @@ def engine_client(request: Request) -> EngineClient:
 
 def models(request: Request) -> OpenAIServingModels:
     return request.app.state.openai_serving_models
+
+
+def _collective_staged_path(result, source_url: str) -> Path:
+    """Read the digest-bound cache path returned by worker staging."""
+    values = result if isinstance(result, (list, tuple)) else [result]
+    for value in values:
+        if isinstance(value, str) and value:
+            path = Path(value)
+            if path.is_dir():
+                return path
+    # Older worker extensions returned None.  Keep a clear error rather than
+    # loading an URL-only cache path that is not bound to target bytes.
+    raise RuntimeError(f"adapter staging returned no verified cache path for {source_url}")
 
 
 def parity_trace_root() -> Path:
@@ -227,8 +239,10 @@ async def load_lora_adapter(lora_request: LoadLoRAAdapterRequest, raw_request: R
         handler = models(raw_request)
         if lora_request.lora_path.startswith(("http://", "https://")):
             source_url = lora_request.lora_path
-            await engine_client(raw_request).collective_rpc("stage_lora_adapter", args=(source_url,))
-            lora_request.lora_path = adapter_cache_path(source_url).as_posix()
+            staged = await engine_client(raw_request).collective_rpc(
+                "stage_lora_adapter", args=(source_url,)
+            )
+            lora_request.lora_path = _collective_staged_path(staged, source_url).as_posix()
         lora_request.load_inplace = True
         response = await handler.load_lora_adapter(lora_request)
         stored = handler.lora_requests.get(lora_request.lora_name)
