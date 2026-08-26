@@ -2,7 +2,7 @@ import warnings
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypeAlias
 
-from pydantic import Field, StrictBool, model_validator
+from pydantic import Field, StrictBool, StrictInt, model_validator
 
 from prime_rl.configs.shared import (
     BaseModelConfig,
@@ -22,6 +22,27 @@ from prime_rl.utils.config import BaseConfig
 
 AttnImplementation: TypeAlias = Literal["flash_attention_2", "flash_attention_3", "flash_attention_4", "auto"]
 EPCommBackend: TypeAlias = Literal["torch", "deepep"]
+
+
+def validate_adapter_export_steps(
+    steps: list[int], max_steps: int | None
+) -> tuple[int, ...]:
+    """Validate explicit LoRA export steps for a finite qualification."""
+    if not steps:
+        return ()
+    if any(type(step) is not int or step <= 0 for step in steps):
+        raise ValueError("adapter_export_steps must contain only positive integers")
+    if any(left >= right for left, right in zip(steps, steps[1:])):
+        raise ValueError(
+            "adapter_export_steps must be positive, unique, and strictly increasing"
+        )
+    if max_steps is None:
+        raise ValueError("adapter_export_steps requires a finite max_steps")
+    if any(step > max_steps for step in steps):
+        raise ValueError(
+            f"adapter_export_steps must be within max_steps ({max_steps})"
+        )
+    return tuple(steps)
 
 
 class GCConfig(BaseConfig):
@@ -631,6 +652,14 @@ class FakeDataLoaderConfig(BaseConfig):
     export_final_adapter: bool = False
     """Write the final LoRA adapter for an inference qualification."""
 
+    adapter_export_steps: list[StrictInt] = Field(default_factory=list)
+    """Additional LoRA-only export steps for trainer qualification.
+
+    An empty list keeps the existing final-only export behavior when
+    ``export_final_adapter`` is enabled. These steps are validated against the
+    trainer's finite ``max_steps`` by ``TrainerConfig``.
+    """
+
     @model_validator(mode="after")
     def validate_grouped_samples(self):
         if (self.samples_per_micro_batch is None) != (self.group_size is None):
@@ -823,6 +852,12 @@ class TrainerConfig(BaseConfig):
 
     enable_token_export: bool = False
     """Opt-in per-token JSONL export for rollout debugging. When enabled, writes token ids and aligned trainer metrics after each forward pass."""
+
+    @model_validator(mode="after")
+    def validate_adapter_export_steps(self):
+        steps = self.data.fake.adapter_export_steps if self.data.fake else []
+        validate_adapter_export_steps(steps, self.max_steps)
+        return self
 
     env_vars: EnvVars = {}
     """Extra environment variables for the trainer process(es). Merged on top of the launcher defaults."""

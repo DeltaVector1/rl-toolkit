@@ -25,7 +25,7 @@ from prime_rl.trainer.ckpt import setup_ckpt_managers
 from prime_rl.trainer.multi_ckpt import setup_multi_checkpoint_manager
 from prime_rl.trainer.optim import setup_optimizer, setup_multi_optimizer
 from prime_rl.trainer.scheduler import setup_scheduler, setup_multi_scheduler
-from prime_rl.configs.trainer import TrainerConfig
+from prime_rl.configs.trainer import TrainerConfig, validate_adapter_export_steps
 from prime_rl.trainer.rl.data import DataLoader, FakeDataLoader, RolloutCacheDataLoader
 from prime_rl.utils.cp import (
     gather_for_cp,
@@ -940,8 +940,14 @@ def train(config: TrainerConfig):
     )
     logger.info(f"Starting RL trainer in {world} in {config.output_dir}")
     qualification_identity = _qualification_environment()
+    fake = config.data.fake
+    adapter_export_steps = validate_adapter_export_steps(
+        list(getattr(fake, "adapter_export_steps", [])) if fake is not None else [],
+        config.max_steps,
+    )
+    if adapter_export_steps and qualification_identity is None:
+        raise RuntimeError("adapter_export_steps is only supported for qualification runs")
     if qualification_identity is not None:
-        fake = config.data.fake
         expected_steps = {
             "glm52-native-b2048": (2, False),
             "glm52-native-stability20": (20, True),
@@ -1193,10 +1199,14 @@ def train(config: TrainerConfig):
             f"scale={expected_scale:g}; reset {reset_b_shards} nonzero B shards"
         )
 
-    export_final_adapter = bool(
-        config.data.fake is not None and config.data.fake.export_final_adapter
-    )
-    if trainer_only and not export_final_adapter:
+    export_final_adapter = bool(fake is not None and fake.export_final_adapter)
+    if export_final_adapter:
+        if config.max_steps is None:
+            raise RuntimeError("export_final_adapter requires a finite max_steps")
+        if config.max_steps not in adapter_export_steps:
+            adapter_export_steps = (*adapter_export_steps, config.max_steps)
+    adapter_export_steps = frozenset(adapter_export_steps)
+    if trainer_only and not adapter_export_steps:
         weight_broadcast = None
         logger.info("Skipping weight broadcast setup for trainer-only qualification")
     else:
@@ -1415,6 +1425,8 @@ def train(config: TrainerConfig):
         is_last_step = (
             config.max_steps is not None and progress.step == config.max_steps
         )
+        export_adapter_step = trainer_only and progress.step in adapter_export_steps
+        adapter_export_time = 0.0
 
         logger.debug(f"Starting training step {progress.step}")
         step_start_time = time.perf_counter()
@@ -2437,11 +2449,11 @@ def train(config: TrainerConfig):
         # Broadcast the model just produced (policy v{progress.step}) so the orchestrator can
         # sample its next step from it. In-memory transports retain their two-step shutdown
         # window; filesystem broadcast still writes every version for resume.
-        if trainer_only and export_final_adapter and is_last_step:
+        if export_adapter_step:
             for idx in multi_run_manager.used_idxs:
                 multi_run_manager.ready_to_update[idx] = True
                 multi_run_manager.progress[idx].step = progress.step + 1
-        if weight_broadcast is None or (trainer_only and not is_last_step):
+        if weight_broadcast is None or (trainer_only and not export_adapter_step):
             broadcast_weights_time = 0
         else:
             broadcast_unused = (
@@ -2455,8 +2467,10 @@ def train(config: TrainerConfig):
                 broadcast_weights_time = (
                     time.perf_counter() - broadcast_weights_start_time
                 )
+                if export_adapter_step:
+                    adapter_export_time = broadcast_weights_time
                 # Clean up old broadcast directories (unless at ckpt interval if using filesystem weight broadcast)
-                if config.weight_broadcast.type == "filesystem":
+                if config.weight_broadcast.type == "filesystem" and not trainer_only:
                     interval_to_keep = config.ckpt and config.ckpt.interval
                     weight_broadcast.maybe_clean(interval_to_keep)
             else:
@@ -2592,6 +2606,7 @@ def train(config: TrainerConfig):
             "time/wait_for_batch": wait_for_batch_time,
             "time/load_data": load_data_time,
             "time/broadcast_weights": broadcast_weights_time,
+            "time/export_adapter": adapter_export_time,
             "time/save_ckpt": save_ckpt_time,
             "time/forward_backward": forward_backward_time,
             "step": progress.step,
