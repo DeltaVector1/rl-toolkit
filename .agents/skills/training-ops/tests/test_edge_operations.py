@@ -3748,6 +3748,10 @@ raise SystemExit(99)
             "scripts/h200/glm_adapter_tunnels.py",
             nodes=[training_ops.orchestrator_host],
         )
+        deploy_file.assert_any_call(
+            "configs/operations.toml",
+            nodes=[training_ops.orchestrator_host],
+        )
         self.assertTrue(
             any(
                 host == training_ops.orchestrator_host
@@ -3797,9 +3801,36 @@ raise SystemExit(99)
         self.assertTrue(
             any(
                 host == training_ops.orchestrator_host
-                and "glm_adapter_tunnels.py stop" in command
+                and "glm_adapter_tunnels.py --operations" in command
+                and command.endswith(" stop; elif test -e /data/glm52-rl/glm-adapter-tunnels.json; then echo 'GLM adapter tunnel state exists without its exact manager or inventory' >&2; exit 44; fi")
                 for host, command in calls
             )
+        )
+
+    def test_status_reports_glm_adapter_without_using_muse_health(self):
+        status = training_ops.Status(
+            kind="glm52",
+            mode="rl",
+            adapter="000",
+            glm_adapter="200",
+            glm_tunnels_recorded=12,
+            glm_tunnels_healthy=12,
+            glm_tunnels_committed=True,
+        )
+        warnings = training_ops._warnings(status)
+        report = status.report()
+        self.assertFalse(any("Muse adapter" in warning for warning in warnings))
+        self.assertFalse(any("GLM gzip adapter" in warning for warning in warnings))
+        self.assertFalse(any("GLM adapter tunnels" in warning for warning in warnings))
+        self.assertIn("Muse/raw 8100 000", report)
+        self.assertIn("GLM/gzip 8101 200", report)
+        self.assertIn("GLM tunnels 12/12 recorded, committed=yes", report)
+        self.assertIn("http://127.0.0.1:8101/", training_ops._head_script())
+        self.assertIn(
+            "glm_adapter_tunnels.py --operations "
+            + training_ops.remote_repo
+            + "/configs/operations.toml status",
+            training_ops._orchestrator_script(),
         )
 
 

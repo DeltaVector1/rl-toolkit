@@ -73,6 +73,7 @@ parity_trace_root = "/data/glm52-rl/qualifications/glm52-policy-parity/trainer-t
 parity_token_root = "/data/glm52-rl/qualifications/glm52-policy-parity/trainer/token_exports"
 
 trainer_head = hosts["trainer_head"]
+trainer_ssh = hosts["trainer_ssh"]
 trainer_hosts = list(hosts["trainers"])
 trainer_internal_addresses = dict(hosts["trainer_internal_addresses"])
 inference_hosts = list(hosts["inference"])
@@ -80,7 +81,9 @@ orchestrator_host = hosts["orchestrator"]
 metric_hosts = list(hosts["metrics"])
 blocked_hosts = set(hosts["blocked"])
 if (
-    set(trainer_internal_addresses) != set(trainer_hosts)
+    not isinstance(trainer_ssh, str)
+    or re.fullmatch(r"[A-Za-z0-9_.-]+", trainer_ssh) is None
+    or set(trainer_internal_addresses) != set(trainer_hosts)
     or len(set(trainer_internal_addresses.values())) != len(trainer_hosts)
     or any(
         not isinstance(address, str)
@@ -763,7 +766,8 @@ echo "FAILS5M $(sudo docker logs --since 5m __ORCH__ 2>&1 | grep -ac 'Rollout fa
 echo "TRAINER_LOGAGE $(sudo docker logs -t --tail 1 __TRAINER__ 2>&1 | tail -1 | cut -d' ' -f1)"
 echo "ORCH_LOGAGE $(sudo docker logs -t --tail 1 __ORCH__ 2>&1 | tail -1 | cut -d' ' -f1)"
 echo "JUDGE $(curl -s -o /dev/null -m 10 -w '%{http_code}' http://127.0.0.1:__JUDGE__/v1/models)"
-echo "ADAPTER $(curl -s -o /dev/null -m 10 -w '%{http_code}' http://127.0.0.1:__ADAPTER__/)"
+echo "MUSE_ADAPTER $(curl -s -o /dev/null -m 10 -w '%{http_code}' http://127.0.0.1:__ADAPTER__/)"
+echo "GLM_ADAPTER $(curl -s -o /dev/null -m 10 -w '%{http_code}' http://127.0.0.1:__GLM_ADAPTER__/)"
 echo "SUP_RUN $(pgrep -f 'bash .*[r]un_supervisor.sh' | wc -l)"
 echo "SUP_TUN $(pgrep -f 'bash .*[t]unnel_watchdog.sh' | wc -l)"
 echo "SUP_TUN_LOG $(tail -1 /data/glm52-rl/tunnel_watchdog.log 2>/dev/null | cut -d' ' -f1)"
@@ -792,6 +796,11 @@ echo "ORCH_LAST $(sudo docker logs __ORCH__ 2>&1 | strip | grep -a 'SUCCESS Step
 echo "BATCH $(sudo docker logs --tail 40 __ORCH__ 2>&1 | grep -oE 'batch [0-9]+/[0-9]+[^;]*; [0-9]+ inflight' | tail -1)"
 echo "FAILS5M $(sudo docker logs --since 5m __ORCH__ 2>&1 | grep -ac 'Rollout failed')"
 echo "ORCH_LOGAGE $(sudo docker logs -t --tail 1 __ORCH__ 2>&1 | tail -1 | cut -d' ' -f1)"
+if test -r __GLM_TUNNEL_MANAGER__ && test -r __OPERATIONS__; then
+  echo "GLM_TUNNELS $(python3 __GLM_TUNNEL_MANAGER__ --operations __OPERATIONS__ status 2>/dev/null || echo error)"
+else
+  echo "GLM_TUNNELS error"
+fi
 """
 
 node_probe = r"""
@@ -868,8 +877,19 @@ def _head_script() -> str:
         .replace("__ORCH__", orchestrator_container)
         .replace("__JUDGE__", str(judge_port))
         .replace("__ADAPTER__", str(adapter_port))
+        .replace("__GLM_ADAPTER__", str(glm_adapter_port))
         .replace("__TUNNEL_FIRST__", str(inference_tunnel_ports[0]))
         .replace("__TUNNEL_LAST__", str(inference_tunnel_ports[-1]))
+    )
+
+
+def _orchestrator_script() -> str:
+    manager = f"{remote_repo}/scripts/h200/glm_adapter_tunnels.py"
+    deployed_operations = f"{remote_repo}/configs/operations.toml"
+    return (
+        orchestrator_probe.replace("__ORCH__", orchestrator_container)
+        .replace("__GLM_TUNNEL_MANAGER__", shlex.quote(manager))
+        .replace("__OPERATIONS__", shlex.quote(deployed_operations))
     )
 
 
@@ -1116,6 +1136,7 @@ class AcceptanceReport:
 class Status:
     when: str = ""
     run: str = ""
+    kind: str = ""
     mode: str = "rl"
     tunnels_ok: int = 0
     tunnels_bad: list[int] = field(default_factory=list)
@@ -1135,6 +1156,10 @@ class Status:
     orch_log_age: float | None = None
     judge: str = "000"
     adapter: str = "000"
+    glm_adapter: str = "000"
+    glm_tunnels_recorded: int = 0
+    glm_tunnels_healthy: int = 0
+    glm_tunnels_committed: bool = False
     supervisor_run: bool = False
     supervisor_tunnel: bool = False
     supervisor_tunnel_log_age: float | None = None
@@ -1172,7 +1197,13 @@ class Status:
             L.append(
                 f"trainer {trainer_state} | "
                 f"orchestrator {'up' if self.orch_up else 'down'} | "
-                f"tunnels {self.tunnels_ok}/{len(inference_tunnel_ports)} | judge {self.judge} | adapter {self.adapter}"
+                f"tunnels {self.tunnels_ok}/{len(inference_tunnel_ports)} | judge {self.judge}"
+            )
+            L.append(
+                f"adapter servers: Muse/raw {adapter_port} {self.adapter} | "
+                f"GLM/gzip {glm_adapter_port} {self.glm_adapter} | "
+                f"GLM tunnels {self.glm_tunnels_healthy}/{self.glm_tunnels_recorded} "
+                f"recorded, committed={'yes' if self.glm_tunnels_committed else 'no'}"
             )
         L.append(
             f"run steps {self.trainer_steps} | failures in 5m {self.fails_5m} | {self.batch or 'no batch line'}"
@@ -1866,7 +1897,9 @@ def status(run: str = "", quiet: bool = False) -> Status:
     engine_model = muse_model if muse_run else glm_model
     engine_container = muse_inference_container if muse_run else glm_inference_container
     s = Status(
-        when=_dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), run=run
+        when=_dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        run=run,
+        kind="muse" if muse_run else "glm52",
     )
     try:
         trainer_only = not trainer_absent and _trainer_mode() == "trainer-only"
@@ -1901,7 +1934,7 @@ def status(run: str = "", quiet: bool = False) -> Status:
             f_edge_orch = ex.submit(
                 _ssh,
                 orchestrator_host,
-                orchestrator_probe.replace("__ORCH__", orchestrator_container),
+                _orchestrator_script(),
                 120,
             )
             f_nodes = ex.submit(_fan, trainer_hosts, node)
@@ -1921,6 +1954,7 @@ def status(run: str = "", quiet: bool = False) -> Status:
         "BATCH",
         "FAILS5M",
         "ORCH_LOGAGE",
+        "GLM_TUNNELS",
     )
     for key in edge_keys:
         h.pop(key, None)
@@ -1944,7 +1978,25 @@ def status(run: str = "", quiet: bool = False) -> Status:
     s.trainer_log_age = _age(h.get("TRAINER_LOGAGE", ""))
     s.orch_log_age = _age(h.get("ORCH_LOGAGE", ""))
     s.judge = h.get("JUDGE", "000")
-    s.adapter = h.get("ADAPTER", "000")
+    s.adapter = h.get("MUSE_ADAPTER", "000")
+    s.glm_adapter = h.get("GLM_ADAPTER", "000")
+    try:
+        tunnel_status = json.loads(h.get("GLM_TUNNELS", "error"))
+        if (
+            not isinstance(tunnel_status, dict)
+            or set(tunnel_status) != {"recorded", "healthy", "committed"}
+            or isinstance(tunnel_status["recorded"], bool)
+            or not isinstance(tunnel_status["recorded"], int)
+            or isinstance(tunnel_status["healthy"], bool)
+            or not isinstance(tunnel_status["healthy"], int)
+            or not isinstance(tunnel_status["committed"], bool)
+        ):
+            raise ValueError
+        s.glm_tunnels_recorded = tunnel_status["recorded"]
+        s.glm_tunnels_healthy = tunnel_status["healthy"]
+        s.glm_tunnels_committed = tunnel_status["committed"]
+    except (TypeError, ValueError):
+        pass
     s.supervisor_run = int(h.get("SUP_RUN", 0) or 0) > 0
     s.supervisor_tunnel = int(h.get("SUP_TUN", 0) or 0) > 0
     s.supervisor_tunnel_log_age = _age(h.get("SUP_TUN_LOG", ""))
@@ -2044,11 +2096,23 @@ def _warnings(s: Status) -> list[str]:
         w.append(
             f"judge returned {s.judge}; every reward multiplies by the judge score"
         )
-    if not trainer_only and s.adapter != "200":
-        w.append(
-            f"adapter server returned {s.adapter} on port {adapter_port}. "
-            "If the engines cannot fetch the LoRA, they keep serving the base model and nothing learns."
-        )
+    if not trainer_only and s.kind == "muse" and s.adapter != "200":
+        w.append(f"Muse adapter server returned {s.adapter} on port {adapter_port}")
+    if not trainer_only and s.kind == "glm52":
+        if s.glm_adapter != "200":
+            w.append(
+                f"GLM gzip adapter server returned {s.glm_adapter} on port {glm_adapter_port}"
+            )
+        expected_tunnels = len(glm_adapter_tunnel_ports)
+        if (
+            s.glm_tunnels_recorded != expected_tunnels
+            or s.glm_tunnels_healthy != expected_tunnels
+            or not s.glm_tunnels_committed
+        ):
+            w.append(
+                f"GLM adapter tunnels are {s.glm_tunnels_healthy}/{s.glm_tunnels_recorded} "
+                f"healthy/recorded; expected {expected_tunnels} committed"
+            )
     if not trainer_only and not s.supervisor_run:
         w.append("fail-closed run supervisor is not running")
     if not trainer_only and not s.supervisor_tunnel:
@@ -9622,6 +9686,7 @@ def start(
         (selected["environment"], [orchestrator_host]),
         ("scripts/h200/start_orchestrator.sh", [orchestrator_host]),
         ("scripts/h200/glm_adapter_tunnels.py", [orchestrator_host]),
+        ("configs/operations.toml", [orchestrator_host]),
         ("scripts/h200/trainer_failure_watchdog.sh", [orchestrator_host]),
     ]
     required_files.extend(
@@ -12504,12 +12569,15 @@ def stop_legacy_qualification(expected_output_path: str) -> None:
 def stop() -> None:
     """Stop only the isolated containers. Live deployment processes are untouched."""
     tunnel_manager = f"{remote_repo}/scripts/h200/glm_adapter_tunnels.py"
+    deployed_operations = f"{remote_repo}/configs/operations.toml"
     _remote_ok(
         orchestrator_host,
-        f"if test -f {shlex.quote(tunnel_manager)}; then "
-        f"python3 {shlex.quote(tunnel_manager)} stop; "
+        f"if test -f {shlex.quote(tunnel_manager)} && "
+        f"test -f {shlex.quote(deployed_operations)}; then "
+        f"python3 {shlex.quote(tunnel_manager)} --operations "
+        f"{shlex.quote(deployed_operations)} stop; "
         f"elif test -e {shlex.quote(glm_adapter_tunnel_state)}; then "
-        "echo 'GLM adapter tunnel state exists without its exact manager' >&2; "
+        "echo 'GLM adapter tunnel state exists without its exact manager or inventory' >&2; "
         "exit 44; fi",
         "GLM adapter tunnels stop",
     )

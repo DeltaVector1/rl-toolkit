@@ -9,20 +9,78 @@ import stat
 import subprocess
 import sys
 import time
+import tomllib
 import uuid
 from pathlib import Path
 
 
-state_path = Path("/data/glm52-rl/glm-adapter-tunnels.json")
-ports = tuple(range(18200, 18212))
-target = "127.0.0.1:8101"
-ssh_target = "china-trainer"
+operations_path: Path | None = None
+state_path: Path | None = None
+ports: tuple[int, ...] = ()
+target = ""
+ssh_target = ""
+
+
+def _configure(path: Path) -> None:
+    global operations_path, state_path, ports, target, ssh_target
+    try:
+        details = path.stat(follow_symlinks=False)
+        if not stat.S_ISREG(details.st_mode):
+            raise RuntimeError("operations config is not a regular file")
+        with path.open("rb") as stream:
+            config = tomllib.load(stream)
+        config_hosts = config["hosts"]
+        config_ports = config["ports"]
+        config_paths = config["paths"]
+        first = config_ports["glm_adapter_tunnel_first"]
+        last = config_ports["glm_adapter_tunnel_last"]
+        backend = config_ports["glm_adapter"]
+        shared = config_ports["adapter_tunnel"]
+        root = Path(config_paths["glm_adapter_root"])
+        configured_state = Path(config_paths["glm_adapter_tunnel_state"])
+        configured_ssh = config_hosts["trainer_ssh"]
+    except (OSError, KeyError, TypeError, tomllib.TOMLDecodeError) as error:
+        raise RuntimeError(f"operations config is invalid: {error}") from error
+    values = (first, last, backend, shared)
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in values):
+        raise RuntimeError("GLM adapter port inventory is invalid")
+    configured_ports = tuple(range(first, last + 1))
+    if (
+        len(configured_ports) != 12
+        or any(not 1 <= port <= 65535 for port in (*configured_ports, backend, shared))
+        or shared in configured_ports
+        or not root.is_absolute()
+        or not configured_state.is_absolute()
+        or configured_state.parent != root
+        or not isinstance(configured_ssh, str)
+        or re.fullmatch(r"[A-Za-z0-9_.-]+", configured_ssh) is None
+    ):
+        raise RuntimeError("GLM adapter tunnel inventory is invalid")
+    operations_path = path.resolve()
+    state_path = configured_state
+    ports = configured_ports
+    target = f"127.0.0.1:{backend}"
+    ssh_target = configured_ssh
+
+
+def _require_configuration() -> tuple[Path, Path]:
+    if operations_path is None or state_path is None:
+        raise RuntimeError("operations config was not loaded")
+    return operations_path, state_path
 
 
 def _supervisor_command(port: int) -> list[str]:
+    configured_operations, _ = _require_configuration()
     if port not in ports:
         raise RuntimeError("GLM adapter tunnel port is invalid")
-    return [sys.executable, str(Path(__file__).resolve()), "supervise", str(port)]
+    return [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--operations",
+        str(configured_operations),
+        "supervise",
+        str(port),
+    ]
 
 
 def _ssh_command(port: int) -> list[str]:
@@ -100,6 +158,7 @@ def _record_matches(record: dict, identity: dict | None) -> bool:
 
 
 def _validate_state(value: object) -> dict:
+    _require_configuration()
     if not isinstance(value, dict):
         raise RuntimeError("GLM adapter tunnel state is not an object")
     expected_keys = {
@@ -123,7 +182,8 @@ def _validate_state(value: object) -> dict:
         or value["target"] != target
         or value["ssh_target"] != ssh_target
         or not isinstance(value["records"], list)
-        or len(value["records"]) != len(ports)
+        or len(value["records"]) > len(ports)
+        or (value["committed"] and len(value["records"]) != len(ports))
     ):
         raise RuntimeError("GLM adapter tunnel state identity differs")
     seen = set()
@@ -151,14 +211,17 @@ def _validate_state(value: object) -> dict:
         ):
             raise RuntimeError("GLM adapter tunnel record identity differs")
         seen.add(port)
-    if seen != set(ports):
+    if [record["port"] for record in value["records"]] != list(
+        ports[: len(value["records"])]
+    ):
         raise RuntimeError("GLM adapter tunnel record ports differ")
     return value
 
 
 def _read_state() -> dict | None:
+    _, configured_state = _require_configuration()
     try:
-        details = state_path.stat(follow_symlinks=False)
+        details = configured_state.stat(follow_symlinks=False)
     except FileNotFoundError:
         return None
     if (
@@ -168,13 +231,16 @@ def _read_state() -> dict | None:
         or details.st_uid != os.getuid()
     ):
         raise RuntimeError("GLM adapter tunnel state file identity differs")
-    return _validate_state(json.loads(state_path.read_text()))
+    return _validate_state(json.loads(configured_state.read_text()))
 
 
 def _write_state(value: dict) -> None:
+    _, configured_state = _require_configuration()
     _validate_state(value)
-    state_path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
-    temporary = state_path.with_name(f".{state_path.name}.{uuid.uuid4().hex}.tmp")
+    configured_state.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    temporary = configured_state.with_name(
+        f".{configured_state.name}.{uuid.uuid4().hex}.tmp"
+    )
     descriptor = os.open(
         temporary,
         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
@@ -193,10 +259,10 @@ def _write_state(value: dict) -> None:
     else:
         os.close(descriptor)
     try:
-        os.replace(temporary, state_path)
+        os.replace(temporary, configured_state)
     finally:
         temporary.unlink(missing_ok=True)
-    directory = os.open(state_path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    directory = os.open(configured_state.parent, os.O_RDONLY | os.O_DIRECTORY)
     try:
         os.fsync(directory)
     finally:
@@ -204,13 +270,14 @@ def _write_state(value: dict) -> None:
 
 
 def _unlink_state() -> None:
+    _, configured_state = _require_configuration()
     try:
-        details = state_path.stat(follow_symlinks=False)
+        details = configured_state.stat(follow_symlinks=False)
     except FileNotFoundError:
         return
     if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
         raise RuntimeError("refusing unsafe GLM adapter tunnel state cleanup")
-    state_path.unlink()
+    configured_state.unlink()
 
 
 def _stop_records(records: list[dict]) -> set[int]:
@@ -258,54 +325,67 @@ def start() -> str:
         _unlink_state()
     else:
         _wait_ports_free()
-    records = []
+    launch_id = uuid.uuid4().hex
+    state = {
+        "schema_version": 1,
+        "script_sha256": _script_sha256(),
+        "launch_id": launch_id,
+        "committed": False,
+        "ports": list(ports),
+        "target": target,
+        "ssh_target": ssh_target,
+        "records": [],
+    }
+    _write_state(state)
     try:
         for port in ports:
-            pid = _spawn_supervisor(port)
-            deadline = time.monotonic() + 5
-            identity = None
-            while time.monotonic() < deadline:
-                identity = _process_identity(pid)
-                if identity is not None:
-                    break
-                time.sleep(0.05)
-            if identity is None or identity["pgid"] != pid or identity["cmdline"] != _supervisor_command(port):
-                raise RuntimeError(f"GLM adapter tunnel supervisor {port} has wrong identity")
-            records.append(
-                {
-                    "pid": pid,
-                    "starttime": identity["starttime"],
-                    "port": port,
-                    "target": target,
-                    "cmdline": _supervisor_command(port),
-                }
-            )
+            blocked = {signal.SIGTERM, signal.SIGHUP, signal.SIGINT}
+            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
+            try:
+                pid = _spawn_supervisor(port)
+                deadline = time.monotonic() + 5
+                identity = None
+                while time.monotonic() < deadline:
+                    identity = _process_identity(pid)
+                    if identity is not None:
+                        break
+                    time.sleep(0.05)
+                if (
+                    identity is None
+                    or identity["pgid"] != pid
+                    or identity["cmdline"] != _supervisor_command(port)
+                ):
+                    raise RuntimeError(
+                        f"GLM adapter tunnel supervisor {port} has wrong identity"
+                    )
+                state["records"].append(
+                    {
+                        "pid": pid,
+                        "starttime": identity["starttime"],
+                        "port": port,
+                        "target": target,
+                        "cmdline": _supervisor_command(port),
+                    }
+                )
+                _write_state(state)
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         deadline = time.monotonic() + 45
         while time.monotonic() < deadline:
             if all(_listening(port) for port in ports) and all(
                 _record_matches(record, _process_identity(record["pid"]))
-                for record in records
+                for record in state["records"]
             ):
                 break
             time.sleep(0.2)
         else:
             raise RuntimeError("GLM adapter tunnels did not bind every intended port")
-        launch_id = uuid.uuid4().hex
-        _write_state(
-            {
-                "schema_version": 1,
-                "script_sha256": _script_sha256(),
-                "launch_id": launch_id,
-                "committed": False,
-                "ports": list(ports),
-                "target": target,
-                "ssh_target": ssh_target,
-                "records": records,
-            }
-        )
         return launch_id
-    except BaseException:
-        _stop_records(records)
+    except BaseException as error:
+        try:
+            cleanup(launch_id)
+        except Exception as cleanup_error:
+            error.add_note(f"GLM adapter tunnel cleanup failed: {cleanup_error}")
         raise
 
 
@@ -341,6 +421,22 @@ def cleanup(launch_id: str | None = None) -> None:
     _unlink_state()
 
 
+def status() -> dict[str, object]:
+    state = _read_state()
+    if state is None:
+        return {"recorded": 0, "healthy": 0, "committed": False}
+    healthy = sum(
+        _record_matches(record, _process_identity(record["pid"]))
+        and _listening(record["port"])
+        for record in state["records"]
+    )
+    return {
+        "recorded": len(state["records"]),
+        "healthy": healthy,
+        "committed": state["committed"],
+    }
+
+
 def supervise(port: int) -> None:
     if port not in ports:
         raise RuntimeError("GLM adapter tunnel supervisor port is invalid")
@@ -369,12 +465,28 @@ def supervise(port: int) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=("start", "commit", "cleanup", "stop", "supervise"))
+    parser.add_argument("--operations", type=Path, required=True)
+    parser.add_argument(
+        "action", choices=("start", "commit", "cleanup", "stop", "status", "supervise")
+    )
     parser.add_argument("value", nargs="?")
     args = parser.parse_args()
+    _configure(args.operations)
     if args.action == "start":
         if args.value is not None:
             raise RuntimeError("start takes no value")
+
+        def stop_uncommitted(received, _frame):
+            try:
+                current = _read_state()
+                if current is not None and not current["committed"]:
+                    cleanup(current["launch_id"])
+            except Exception as error:
+                print(f"GLM adapter tunnel signal cleanup failed: {error}", file=sys.stderr)
+            raise SystemExit(128 + received)
+
+        for received in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            signal.signal(received, stop_uncommitted)
         print(start())
     elif args.action == "commit":
         if re.fullmatch(r"[0-9a-f]{32}", args.value or "") is None:
@@ -388,6 +500,10 @@ def main() -> None:
         if args.value is not None:
             raise RuntimeError("stop takes no value")
         cleanup()
+    elif args.action == "status":
+        if args.value is not None:
+            raise RuntimeError("status takes no value")
+        print(json.dumps(status(), sort_keys=True, separators=(",", ":")))
     else:
         if args.value is None or not args.value.isdigit():
             raise RuntimeError("supervisor port is invalid")

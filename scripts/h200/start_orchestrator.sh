@@ -17,6 +17,7 @@ trainer_container=${prime_trainer_container:-glm52-optims-trainer}
 config_file=${ORCH_CONFIG:-$config/orchestrator${CONFIG_TAG}.toml}
 env_config_file=${ENV_CONFIG:-$config/env${CONFIG_TAG}.toml}
 glm_tunnel_manager=$deployment/scripts/h200/glm_adapter_tunnels.py
+operations_file=$deployment/configs/operations.toml
 orchestrator_output=$(python3 - "$config_file" <<'PY'
 import sys
 import tomllib
@@ -49,6 +50,28 @@ with open(sys.argv[1], "rb") as stream:
 print("glm-gzip" if model == "/models/glm52-fp8" else "default")
 PY
 )
+adapter_inventory=$(python3 - "$operations_file" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as stream:
+    config = tomllib.load(stream)
+ports = config["ports"]
+first = ports["glm_adapter_tunnel_first"]
+last = ports["glm_adapter_tunnel_last"]
+print(",".join(str(port) for port in range(first, last + 1)))
+print(ports["glm_adapter"])
+print(ports["adapter_tunnel"])
+print(ports["adapter"])
+print(config["hosts"]["trainer_ssh"])
+PY
+)
+mapfile -t adapter_values <<<"$adapter_inventory"
+IFS=, read -r -a glm_adapter_tunnel_ports <<<"${adapter_values[0]}"
+glm_adapter_backend_port=${adapter_values[1]}
+muse_adapter_tunnel_port=${adapter_values[2]}
+muse_adapter_backend_port=${adapter_values[3]}
+adapter_ssh_target=${adapter_values[4]}
 
 tunnel() { # local_port  target_host:port  ssh_target  [compress]
   local lp=$1 tgt=$2 via=$3 comp=${4:-no}
@@ -63,13 +86,13 @@ tunnel() { # local_port  target_host:port  ssh_target  [compress]
 }
 
 if [ "$adapter_transfer" = glm-gzip ]; then
-  adapter_tunnel_ports=(18200 18201 18202 18203 18204 18205 18206 18207 18208 18209 18210 18211)
-  adapter_backend_port=8101
+  adapter_tunnel_ports=("${glm_adapter_tunnel_ports[@]}")
+  adapter_backend_port=$glm_adapter_backend_port
   adapter_compression=no
   adapter_source_path="runs/$RUN/$RUN_NAME"
 else
-  adapter_tunnel_ports=(18100)
-  adapter_backend_port=8100
+  adapter_tunnel_ports=("$muse_adapter_tunnel_port")
+  adapter_backend_port=$muse_adapter_backend_port
   adapter_compression=yes
   adapter_source_path="$RUN/$RUN_NAME"
 fi
@@ -78,23 +101,23 @@ if [ "$adapter_transfer" = glm-gzip ]; then
     echo "ERROR: GLM adapter tunnel manager is missing" >&2
     exit 1
   }
-  glm_tunnel_launch_id=$(python3 "$glm_tunnel_manager" start)
+  glm_tunnel_launch_id=$(python3 "$glm_tunnel_manager" --operations "$operations_file" start)
   cleanup_uncommitted_glm_tunnels() {
     local status=$?
     trap - EXIT
-    python3 "$glm_tunnel_manager" cleanup "$glm_tunnel_launch_id" || \
+    python3 "$glm_tunnel_manager" --operations "$operations_file" cleanup "$glm_tunnel_launch_id" || \
       echo "ERROR: GLM adapter tunnel cleanup failed" >&2
     exit "$status"
   }
   commit_glm_tunnels() {
-    python3 "$glm_tunnel_manager" commit "$glm_tunnel_launch_id"
+    python3 "$glm_tunnel_manager" --operations "$operations_file" commit "$glm_tunnel_launch_id"
     glm_tunnel_launch_id=
     trap - EXIT
   }
   trap cleanup_uncommitted_glm_tunnels EXIT
 else
   for adapter_port in "${adapter_tunnel_ports[@]}"; do
-    tunnel "$adapter_port" "127.0.0.1:$adapter_backend_port" china-trainer "$adapter_compression"
+    tunnel "$adapter_port" "127.0.0.1:$adapter_backend_port" "$adapter_ssh_target" "$adapter_compression"
   done
 fi
 adapter_canonical_port=${adapter_tunnel_ports[0]}

@@ -12,6 +12,7 @@ SCRIPT = ROOT / "scripts/h200/glm_adapter_tunnels.py"
 spec = importlib.util.spec_from_file_location("glm_adapter_tunnels", SCRIPT)
 tunnels = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(tunnels)
+tunnels._configure(ROOT / "configs/operations.toml")
 
 
 class ProcessSimulation:
@@ -136,13 +137,59 @@ class GlmAdapterTunnelTest(unittest.TestCase):
             with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7]:
                 launch_id = tunnels.start()
                 state = json.loads(tunnels.state_path.read_text())
-                self.assertEqual(state["ports"], list(range(18200, 18212)))
-                self.assertEqual(state["target"], "127.0.0.1:8101")
+                self.assertEqual(state["ports"], list(tunnels.ports))
+                self.assertEqual(state["target"], tunnels.target)
                 for record in state["records"]:
                     self.assertEqual(
                         record["cmdline"],
                         tunnels._supervisor_command(record["port"]),
                     )
+                tunnels.cleanup(launch_id)
+
+    def test_interrupt_after_three_spawns_cleans_durable_partial_state(self):
+        simulation = ProcessSimulation()
+        observed = []
+
+        def interrupting_spawn(port):
+            if len(observed) == 3:
+                state = tunnels._read_state()
+                self.assertFalse(state["committed"])
+                self.assertEqual(len(state["records"]), 3)
+                raise KeyboardInterrupt
+            pid = simulation.spawn(port)
+            observed.append(pid)
+            return pid
+
+        with tempfile.TemporaryDirectory() as directory:
+            patches = self.run_with_simulation(directory, simulation)
+            with (
+                patches[0],
+                patch.object(tunnels, "_spawn_supervisor", side_effect=interrupting_spawn),
+                patches[2],
+                patches[3],
+                patches[4],
+                patches[5],
+                patches[6],
+                patches[7],
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    tunnels.start()
+                self.assertEqual(simulation.identities, {})
+                self.assertEqual(simulation.listeners, set())
+                self.assertIsNone(tunnels._read_state())
+
+    def test_status_reports_recorded_and_healthy_tunnels(self):
+        simulation = ProcessSimulation()
+        with tempfile.TemporaryDirectory() as directory:
+            patches = self.run_with_simulation(directory, simulation)
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7]:
+                launch_id = tunnels.start()
+                self.assertEqual(
+                    tunnels.status(),
+                    {"recorded": 12, "healthy": 12, "committed": False},
+                )
+                tunnels.commit(launch_id)
+                self.assertTrue(tunnels.status()["committed"])
                 tunnels.cleanup(launch_id)
 
 

@@ -43,21 +43,30 @@ class AdapterPrefetchGateTest(unittest.TestCase):
                 inventory["glm_adapter_tunnel_last"] + 1,
             )
         )
-        self.assertIn(f"adapter_tunnel_ports=({ports})", START)
-        self.assertIn('for adapter_port in "${adapter_tunnel_ports[@]}"', START)
+        self.assertIn('adapter_tunnel_ports=("${glm_adapter_tunnel_ports[@]}")', START)
         self.assertIn(
             'model == "/models/glm52-fp8"',
             START,
         )
-        self.assertIn(f'adapter_backend_port={inventory["glm_adapter"]}', START)
+        self.assertIn('adapter_backend_port=$glm_adapter_backend_port', START)
         self.assertIn("adapter_compression=no", START)
-        self.assertIn("adapter_backend_port=8100", START)
+        self.assertIn('adapter_backend_port=$muse_adapter_backend_port', START)
         self.assertIn("adapter_compression=yes", START)
-        self.assertIn('adapter_tunnel_ports=(18100)', START)
-        self.assertIn('glm_tunnel_launch_id=$(python3 "$glm_tunnel_manager" start)', START)
+        self.assertIn('adapter_tunnel_ports=("$muse_adapter_tunnel_port")', START)
+        self.assertIn(
+            'glm_tunnel_launch_id=$(python3 "$glm_tunnel_manager" '
+            '--operations "$operations_file" start)',
+            START,
+        )
         self.assertIn("trap cleanup_uncommitted_glm_tunnels EXIT", START)
-        self.assertIn('python3 "$glm_tunnel_manager" cleanup', START)
-        self.assertIn('python3 "$glm_tunnel_manager" commit', START)
+        self.assertIn(
+            'python3 "$glm_tunnel_manager" --operations "$operations_file" cleanup',
+            START,
+        )
+        self.assertIn(
+            'python3 "$glm_tunnel_manager" --operations "$operations_file" commit',
+            START,
+        )
         self.assertLess(
             START.index("trap cleanup_uncommitted_glm_tunnels EXIT"),
             START.index('if [ ! -r "$env_config_file" ]'),
@@ -66,21 +75,20 @@ class AdapterPrefetchGateTest(unittest.TestCase):
             START.rindex("commit_glm_tunnels"),
             START.index("durable batch publisher started"),
         )
-        self.assertIn('ports = tuple(range(18200, 18212))', GLM_TUNNELS)
-        self.assertIn('target = "127.0.0.1:8101"', GLM_TUNNELS)
+        self.assertIn('config_ports["glm_adapter_tunnel_first"]', GLM_TUNNELS)
+        self.assertIn('config_ports["glm_adapter_tunnel_last"]', GLM_TUNNELS)
+        self.assertIn('config_ports["glm_adapter"]', GLM_TUNNELS)
+        self.assertIn('config_hosts["trainer_ssh"]', GLM_TUNNELS)
         self.assertIn('"starttime"', GLM_TUNNELS)
         self.assertIn("_record_matches", GLM_TUNNELS)
         self.assertEqual(
             OPERATIONS["paths"]["glm_adapter_tunnel_state"],
             "/data/glm52-rl/glm-adapter-tunnels.json",
         )
-        self.assertIn(
-            'state_path = Path("/data/glm52-rl/glm-adapter-tunnels.json")',
-            GLM_TUNNELS,
-        )
+        self.assertIn('config_paths["glm_adapter_tunnel_state"]', GLM_TUNNELS)
         self.assertIn(
             'tunnel "$adapter_port" "127.0.0.1:$adapter_backend_port" '
-            'china-trainer "$adapter_compression"',
+            '"$adapter_ssh_target" "$adapter_compression"',
             START,
         )
         self.assertIn(
