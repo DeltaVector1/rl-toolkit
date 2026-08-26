@@ -45,6 +45,7 @@ class EdgeOperationsTest(unittest.TestCase):
                 self.pid = pid
                 self.command = command
                 self.outcome = outcome
+                self.started_at = now
                 self.killed = False
 
             def poll(self):
@@ -80,7 +81,15 @@ class EdgeOperationsTest(unittest.TestCase):
 
             def connect_ex(self, address):
                 process = latest.get(address[1])
-                return 0 if process and process.outcome == "success" and not process.killed else 1
+                ready = process and (
+                    process.outcome == "success"
+                    or (
+                        isinstance(process.outcome, tuple)
+                        and process.outcome[0] == "slow"
+                        and now - process.started_at >= process.outcome[1]
+                    )
+                )
+                return 0 if ready and not process.killed else 1
 
         def killpg(pid, action):
             if pid in kill_race_pids and action == signal.SIGTERM:
@@ -89,9 +98,11 @@ class EdgeOperationsTest(unittest.TestCase):
             processes[pid].killed = True
 
         def monotonic():
-            nonlocal now
-            now += 0.2
             return now
+
+        def sleep(seconds):
+            nonlocal now
+            now += seconds
 
         class Response(io.BytesIO):
             status = 206
@@ -116,7 +127,7 @@ class EdgeOperationsTest(unittest.TestCase):
             patch("builtins.open", side_effect=open_process),
             patch("os.killpg", side_effect=killpg),
             patch("time.monotonic", side_effect=monotonic),
-            patch("time.sleep"),
+            patch("time.sleep", side_effect=sleep),
             patch(
                 "urllib.request.urlopen",
                 side_effect=lambda *_args, **_kwargs: Response(gzip.compress(b"x" * 1024)),
@@ -1289,8 +1300,10 @@ class EdgeOperationsTest(unittest.TestCase):
         )
         self.assertIn("for attempt in range(3)", start_arguments[2])
         self.assertIn("time.sleep(0.25)", start_arguments[2])
-        self.assertIn("cleanup_process(process,command)", start_arguments[2])
-        self.assertIn("except ProcessLookupError: return", start_arguments[2])
+        self.assertIn("pending=launched", start_arguments[2])
+        self.assertIn("if port in started: continue", start_arguments[2])
+        self.assertIn("cleanup_processes(failed)", start_arguments[2])
+        self.assertIn("except ProcessLookupError: continue", start_arguments[2])
         compile(start_arguments[2], "<step20-adapter-tunnel-start>", "exec")
         self.assertEqual(
             json.loads(base64.b64decode(start_arguments[-1], validate=True)),
@@ -1298,15 +1311,16 @@ class EdgeOperationsTest(unittest.TestCase):
         )
         self.assertTrue(all(command[-1] == training_ops.trainer_ssh for command in commands))
         proven_max = (
-            len(training_ops.glm_adapter_tunnel_ports)
-            * training_ops.step20_tunnel_attempts
+            training_ops.step20_tunnel_attempts
             * (
-                training_ops.step20_tunnel_launch_stagger_seconds
+                len(training_ops.glm_adapter_tunnel_ports)
+                * training_ops.step20_tunnel_launch_stagger_seconds
                 + training_ops.step20_tunnel_start_seconds
                 + training_ops.step20_tunnel_cleanup_seconds
             )
             + training_ops.step20_tunnel_probe_seconds
         )
+        self.assertEqual(proven_max, 189.0)
         self.assertGreaterEqual(
             training_ops.step20_tunnel_outer_timeout_seconds,
             proven_max + 60,
@@ -1332,6 +1346,15 @@ class EdgeOperationsTest(unittest.TestCase):
         self.assertEqual(killed, [])
         self.assertEqual(json.loads(printed[-1])[0]["pid"], 3002)
 
+        processes, killed, printed = self._run_tunnel_start_script(
+            script,
+            [first_command],
+            {first_port: [("slow", 8.0)]},
+        )
+        self.assertEqual(len(processes), 1)
+        self.assertEqual(killed, [])
+        self.assertEqual(json.loads(printed[-1])[0]["pid"], 3001)
+
         with self.assertRaisesRegex(RuntimeError, "failed after 3 exact attempts"):
             self._run_tunnel_start_script(
                 script,
@@ -1342,10 +1365,8 @@ class EdgeOperationsTest(unittest.TestCase):
                 },
             )
         processes, killed, _printed = self._tunnel_simulation
-        self.assertEqual(
-            killed,
-            [(3001, signal.SIGTERM)],
-        )
+        self.assertEqual(len(processes), 4)
+        self.assertEqual(killed, [(3001, signal.SIGTERM)])
 
         processes, killed, printed = self._run_tunnel_start_script(
             script,

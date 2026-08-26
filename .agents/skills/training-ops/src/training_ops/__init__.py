@@ -104,11 +104,11 @@ glm_adapter_tunnel_ports = range(
     ports["glm_adapter_tunnel_last"] + 1,
 )
 step20_tunnel_attempts = 3
-step20_tunnel_start_seconds = 5
+step20_tunnel_start_seconds = 45
 step20_tunnel_cleanup_seconds = 5
 step20_tunnel_launch_stagger_seconds = 0.25
 step20_tunnel_probe_seconds = 30
-step20_tunnel_outer_timeout_seconds = 480
+step20_tunnel_outer_timeout_seconds = 270
 batch_port = ports["batch"]
 h200_parity_backend_port = ports["h200_parity_backend"]
 remote_repo = paths["remote_repository"]
@@ -2667,52 +2667,71 @@ def _start_step20_adapter_tunnels(host: str, source_url: str) -> list[dict]:
 source_url,encoded=sys.argv[1:]
 commands=json.loads(base64.b64decode(encoded,validate=True))
 processes=[]
+started={}
 def listening(port):
  with socket.socket() as client:
   client.settimeout(1); return client.connect_ex(("127.0.0.1",port))==0
 def cmdline(pid):
  with open(f"/proc/{pid}/cmdline","rb") as source: return [value.decode() for value in source.read().split(b"\\0") if value]
-def cleanup_process(process,command):
- try:
-  if process.poll() is not None or cmdline(process.pid)!=command: return
- except (FileNotFoundError,ProcessLookupError): return
- try: os.killpg(process.pid,signal.SIGTERM)
- except ProcessLookupError: return
+def exact(process,command):
+ try: return process.poll() is None and cmdline(process.pid)==command
+ except (FileNotFoundError,ProcessLookupError): return False
+def cleanup_processes(items):
+ remaining=[]
+ for process,command in items:
+  if not exact(process,command): continue
+  try: os.killpg(process.pid,signal.SIGTERM)
+  except ProcessLookupError: continue
+  remaining.append((process,command))
  deadline=time.monotonic()+__CLEANUP_SECONDS__
- while time.monotonic()<deadline:
-  try:
-   if cmdline(process.pid)!=command: return
-  except (FileNotFoundError,ProcessLookupError): return
+ while remaining and time.monotonic()<deadline:
+  remaining=[item for item in remaining if exact(*item)]
+  if not remaining: break
   time.sleep(0.1)
- try:
-  if cmdline(process.pid)==command: os.killpg(process.pid,signal.SIGKILL)
- except (FileNotFoundError,ProcessLookupError): pass
+ for process,command in remaining:
+  if not exact(process,command): continue
+  try: os.killpg(process.pid,signal.SIGKILL)
+  except ProcessLookupError: pass
 def cleanup():
- for process,command in reversed(processes): cleanup_process(process,command)
+ cleanup_processes(reversed(processes))
 try:
  for command in commands:
   port=int(command[command.index("-L")+1].split(":")[1])
   if listening(port): raise RuntimeError(f"temporary adapter tunnel port {port} is already in use")
-  for attempt in range(__ATTEMPTS__):
-   process=subprocess.Popen(command,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
-   time.sleep(__STAGGER_SECONDS__)
-   deadline=time.monotonic()+__START_SECONDS__
-   started=False
-   while time.monotonic()<deadline:
-    if process.poll() is not None: break
-    try:
-     if cmdline(process.pid)!=command: break
-    except (FileNotFoundError,ProcessLookupError): break
-    if listening(port): started=True; break
-    time.sleep(0.1)
-   if started:
-    processes.append((process,command)); break
-   cleanup_process(process,command)
+ for attempt in range(__ATTEMPTS__):
+  launched=[]
+  for command in commands:
+   port=int(command[command.index("-L")+1].split(":")[1])
+   if port in started: continue
    if listening(port): raise RuntimeError(f"temporary adapter tunnel port {port} changed owner")
-   if attempt==__LAST_ATTEMPT__: raise RuntimeError(f"temporary adapter tunnel {port} failed after __ATTEMPTS__ exact attempts")
+   process=subprocess.Popen(command,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
+   processes.append((process,command))
+   launched.append((process,command,port))
+   time.sleep(__STAGGER_SECONDS__)
+  deadline=time.monotonic()+__START_SECONDS__
+  pending=launched
+  while pending and time.monotonic()<deadline:
+   waiting=[]
+   for process,command,port in pending:
+    if not exact(process,command): continue
+    if listening(port): started[port]=(process,command); continue
+    waiting.append((process,command,port))
+   pending=waiting
+   if pending:
+    time.sleep(0.1)
+  failed=[(process,command) for process,command,port in launched if port not in started]
+  cleanup_processes(failed)
+  for _process,command in failed:
+   port=int(command[command.index("-L")+1].split(":")[1])
+   if listening(port): raise RuntimeError(f"temporary adapter tunnel port {port} changed owner")
+  if len(started)==len(commands): break
+  if attempt==__LAST_ATTEMPT__:
+   missing=sorted(int(command[command.index("-L")+1].split(":")[1]) for command in commands if int(command[command.index("-L")+1].split(":")[1]) not in started)
+   raise RuntimeError(f"temporary adapter tunnels {missing} failed after __ATTEMPTS__ exact attempts")
  records=[]
- for process,command in processes:
+ for command in commands:
   port=int(command[command.index("-L")+1].split(":")[1])
+  process,command=started[port]
   if process.poll() is not None or not listening(port) or cmdline(process.pid)!=command: raise RuntimeError(f"temporary adapter tunnel {port} did not start with its exact command")
   records.append({"pid":process.pid,"cmdline":command,"port":port})
  request=urllib.request.Request(source_url,headers={"Range":"bytes=0-1023","Accept-Encoding":"gzip"})
