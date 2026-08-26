@@ -104,6 +104,7 @@ batch_port = ports["batch"]
 h200_parity_backend_port = ports["h200_parity_backend"]
 remote_repo = paths["remote_repository"]
 glm_adapter_root = PurePosixPath(paths["glm_adapter_root"])
+glm_adapter_tunnel_state = paths["glm_adapter_tunnel_state"]
 glm_parity_inference_config = (
     f"{remote_repo}/configs/qualification/glm52-policy-parity-h200.toml"
 )
@@ -9620,6 +9621,7 @@ def start(
         (selected["orchestrator"], [orchestrator_host]),
         (selected["environment"], [orchestrator_host]),
         ("scripts/h200/start_orchestrator.sh", [orchestrator_host]),
+        ("scripts/h200/glm_adapter_tunnels.py", [orchestrator_host]),
         ("scripts/h200/trainer_failure_watchdog.sh", [orchestrator_host]),
     ]
     required_files.extend(
@@ -12501,6 +12503,16 @@ def stop_legacy_qualification(expected_output_path: str) -> None:
 
 def stop() -> None:
     """Stop only the isolated containers. Live deployment processes are untouched."""
+    tunnel_manager = f"{remote_repo}/scripts/h200/glm_adapter_tunnels.py"
+    _remote_ok(
+        orchestrator_host,
+        f"if test -f {shlex.quote(tunnel_manager)}; then "
+        f"python3 {shlex.quote(tunnel_manager)} stop; "
+        f"elif test -e {shlex.quote(glm_adapter_tunnel_state)}; then "
+        "echo 'GLM adapter tunnel state exists without its exact manager' >&2; "
+        "exit 44; fi",
+        "GLM adapter tunnels stop",
+    )
     _remote_ok(
         orchestrator_host,
         f"sudo docker rm -f {orchestrator_container} {environment_container} "

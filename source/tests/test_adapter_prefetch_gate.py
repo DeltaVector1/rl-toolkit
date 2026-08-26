@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SYNC = (ROOT / "scripts/h200/sync_rollout_batches.sh").read_text()
 START = (ROOT / "scripts/h200/start_orchestrator.sh").read_text()
 INFERENCE_START = (ROOT / "scripts/h200/start_inference.sh").read_text()
+GLM_TUNNELS = (ROOT / "scripts/h200/glm_adapter_tunnels.py").read_text()
 with (ROOT / "configs/operations.toml").open("rb") as stream:
     OPERATIONS = tomllib.load(stream)
 
@@ -53,17 +54,30 @@ class AdapterPrefetchGateTest(unittest.TestCase):
         self.assertIn("adapter_backend_port=8100", START)
         self.assertIn("adapter_compression=yes", START)
         self.assertIn('adapter_tunnel_ports=(18100)', START)
-        self.assertIn("strict_glm_tunnel()", START)
-        self.assertIn(
-            'ERROR: GLM adapter tunnel could not bind port $lp', START
+        self.assertIn('glm_tunnel_launch_id=$(python3 "$glm_tunnel_manager" start)', START)
+        self.assertIn("trap cleanup_uncommitted_glm_tunnels EXIT", START)
+        self.assertIn('python3 "$glm_tunnel_manager" cleanup', START)
+        self.assertIn('python3 "$glm_tunnel_manager" commit', START)
+        self.assertLess(
+            START.index("trap cleanup_uncommitted_glm_tunnels EXIT"),
+            START.index('if [ ! -r "$env_config_file" ]'),
+        )
+        self.assertGreater(
+            START.rindex("commit_glm_tunnels"),
+            START.index("durable batch publisher started"),
+        )
+        self.assertIn('ports = tuple(range(18200, 18212))', GLM_TUNNELS)
+        self.assertIn('target = "127.0.0.1:8101"', GLM_TUNNELS)
+        self.assertIn('"starttime"', GLM_TUNNELS)
+        self.assertIn("_record_matches", GLM_TUNNELS)
+        self.assertEqual(
+            OPERATIONS["paths"]["glm_adapter_tunnel_state"],
+            "/data/glm52-rl/glm-adapter-tunnels.json",
         )
         self.assertIn(
-            'if ! strict_glm_tunnel "$adapter_port"', START
+            'state_path = Path("/data/glm52-rl/glm-adapter-tunnels.json")',
+            GLM_TUNNELS,
         )
-        self.assertIn("cleanup_new_glm_tunnels", START)
-        self.assertIn('current=$(awk \'{print $22}\' "/proc/$pid/stat")', START)
-        self.assertIn('kill -- "-$pid"', START)
-        self.assertIn("exit 1", START)
         self.assertIn(
             'tunnel "$adapter_port" "127.0.0.1:$adapter_backend_port" '
             'china-trainer "$adapter_compression"',

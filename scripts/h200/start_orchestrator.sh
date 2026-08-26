@@ -2,7 +2,7 @@
 # Run the orchestrator on h200a instead of n82.
 # Engine traffic stays local. Only adapter and completed batch data cross the
 # China link.
-set -uo pipefail
+set -euo pipefail
 
 CONFIG_TAG=${CONFIG_TAG:-.x7h}
 RUN=${RUN:?set RUN}
@@ -16,6 +16,7 @@ env_container=${prime_env_container:-glm52-optims-env-train}
 trainer_container=${prime_trainer_container:-glm52-optims-trainer}
 config_file=${ORCH_CONFIG:-$config/orchestrator${CONFIG_TAG}.toml}
 env_config_file=${ENV_CONFIG:-$config/env${CONFIG_TAG}.toml}
+glm_tunnel_manager=$deployment/scripts/h200/glm_adapter_tunnels.py
 orchestrator_output=$(python3 - "$config_file" <<'PY'
 import sys
 import tomllib
@@ -61,62 +62,6 @@ tunnel() { # local_port  target_host:port  ssh_target  [compress]
     done" >/dev/null 2>&1 < /dev/null &
 }
 
-new_glm_tunnels=()
-cleanup_new_glm_tunnels() {
-  local record pid started current
-  for record in "${new_glm_tunnels[@]}"; do
-    pid=${record%%:*}
-    started=${record#*:}
-    if [ -r "/proc/$pid/stat" ]; then
-      current=$(awk '{print $22}' "/proc/$pid/stat")
-      if [ "$current" = "$started" ]; then
-        kill -- "-$pid" 2>/dev/null || true
-      fi
-    fi
-  done
-}
-
-strict_glm_tunnel() { # local_port target_host:port
-  local lp=$1 tgt=$2 supervisor started loop
-  if ss -H -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)$lp$"; then
-    echo "ERROR: GLM adapter tunnel port $lp is already in use" >&2
-    return 1
-  fi
-  if pgrep -f -- "-L 127.0.0.1:$lp:" >/dev/null; then
-    echo "ERROR: a GLM adapter tunnel process already claims port $lp" >&2
-    return 1
-  fi
-  loop="while true; do
-      ssh -NT -o BatchMode=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes \\
-          -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes \\
-          -o IPQoS=none -o Compression=no \\
-          -L 127.0.0.1:$lp:$tgt china-trainer
-      sleep 3
-    done"
-  setsid nohup bash -c "$loop" \
-    >"/data/glm52-rl/glm-adapter-tunnel-$lp.log" 2>&1 < /dev/null &
-  supervisor=$!
-  started=$(awk '{print $22}' "/proc/$supervisor/stat") || {
-    kill -- "-$supervisor" 2>/dev/null || true
-    echo "ERROR: cannot record GLM adapter tunnel supervisor for port $lp" >&2
-    return 1
-  }
-  new_glm_tunnels+=("$supervisor:$started")
-  for _ in $(seq 1 90); do
-    if ! kill -0 "$supervisor" 2>/dev/null; then
-      echo "ERROR: GLM adapter tunnel supervisor exited for port $lp" >&2
-      return 1
-    fi
-    if ss -H -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)$lp$"; then
-      echo "GLM adapter tunnel :$lp up"
-      return 0
-    fi
-    sleep 0.5
-  done
-  echo "ERROR: GLM adapter tunnel could not bind port $lp" >&2
-  return 1
-}
-
 if [ "$adapter_transfer" = glm-gzip ]; then
   adapter_tunnel_ports=(18200 18201 18202 18203 18204 18205 18206 18207 18208 18209 18210 18211)
   adapter_backend_port=8101
@@ -129,12 +74,24 @@ else
   adapter_source_path="$RUN/$RUN_NAME"
 fi
 if [ "$adapter_transfer" = glm-gzip ]; then
-  for adapter_port in "${adapter_tunnel_ports[@]}"; do
-    if ! strict_glm_tunnel "$adapter_port" "127.0.0.1:$adapter_backend_port"; then
-      cleanup_new_glm_tunnels
-      exit 1
-    fi
-  done
+  test -f "$glm_tunnel_manager" || {
+    echo "ERROR: GLM adapter tunnel manager is missing" >&2
+    exit 1
+  }
+  glm_tunnel_launch_id=$(python3 "$glm_tunnel_manager" start)
+  cleanup_uncommitted_glm_tunnels() {
+    local status=$?
+    trap - EXIT
+    python3 "$glm_tunnel_manager" cleanup "$glm_tunnel_launch_id" || \
+      echo "ERROR: GLM adapter tunnel cleanup failed" >&2
+    exit "$status"
+  }
+  commit_glm_tunnels() {
+    python3 "$glm_tunnel_manager" commit "$glm_tunnel_launch_id"
+    glm_tunnel_launch_id=
+    trap - EXIT
+  }
+  trap cleanup_uncommitted_glm_tunnels EXIT
 else
   for adapter_port in "${adapter_tunnel_ports[@]}"; do
     tunnel "$adapter_port" "127.0.0.1:$adapter_backend_port" china-trainer "$adapter_compression"
@@ -291,6 +248,9 @@ if [ "$transport" = filesystem ]; then
     exit 1
   fi
   echo "durable batch publisher started (pid $publisher_pid)"
+  if [ "$adapter_transfer" = glm-gzip ]; then
+    commit_glm_tunnels
+  fi
   exit
 fi
 
@@ -306,4 +266,7 @@ if [ -f "$ctl" ]; then
     || echo "WARNING: could not ship orch.toml to the trainer; it will not start" >&2
 else
   echo "WARNING: $ctl never appeared; trainer will not start" >&2
+fi
+if [ "$adapter_transfer" = glm-gzip ]; then
+  commit_glm_tunnels
 fi

@@ -3744,6 +3744,10 @@ raise SystemExit(99)
             "source/deps/renderers/renderers/base.py",
             nodes=[training_ops.orchestrator_host],
         )
+        deploy_file.assert_any_call(
+            "scripts/h200/glm_adapter_tunnels.py",
+            nodes=[training_ops.orchestrator_host],
+        )
         self.assertTrue(
             any(
                 host == training_ops.orchestrator_host
@@ -3787,6 +3791,13 @@ raise SystemExit(99)
                 host == training_ops.orchestrator_host
                 and training_ops.orchestrator_container in command
                 and training_ops.environment_container in command
+                for host, command in calls
+            )
+        )
+        self.assertTrue(
+            any(
+                host == training_ops.orchestrator_host
+                and "glm_adapter_tunnels.py stop" in command
                 for host, command in calls
             )
         )

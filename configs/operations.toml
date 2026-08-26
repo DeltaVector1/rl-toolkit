@@ -23,6 +23,7 @@ h200_parity_backend = 8100
 remote_repository = "/data/glm52-rl/deployment-glm52-optims"
 runs = "/data/glm52-rl/runs"
 glm_adapter_root = "/data/glm52-rl"
+glm_adapter_tunnel_state = "/data/glm52-rl/glm-adapter-tunnels.json"
 adapter_bucket = "hf://buckets/NewEden/muse-lora-checkpoints"
 
 [containers]
