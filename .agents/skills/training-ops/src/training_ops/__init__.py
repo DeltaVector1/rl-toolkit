@@ -2666,26 +2666,43 @@ def listening(port):
   client.settimeout(1); return client.connect_ex(("127.0.0.1",port))==0
 def cmdline(pid):
  with open(f"/proc/{pid}/cmdline","rb") as source: return [value.decode() for value in source.read().split(b"\\0") if value]
-def cleanup():
- exact=[]
- for process,command in reversed(processes):
-  try:
-   if cmdline(process.pid)==command:
-    os.killpg(process.pid,signal.SIGTERM); exact.append((process.pid,command))
-  except (FileNotFoundError,ProcessLookupError): pass
+def cleanup_process(process,command):
+ try:
+  if process.poll() is not None or cmdline(process.pid)!=command: return
+ except (FileNotFoundError,ProcessLookupError): return
+ os.killpg(process.pid,signal.SIGTERM)
  deadline=time.monotonic()+5
- while time.monotonic()<deadline and any(os.path.exists(f"/proc/{pid}") for pid,_command in exact): time.sleep(0.1)
- for pid,command in exact:
+ while time.monotonic()<deadline:
   try:
-   if cmdline(pid)==command: os.killpg(pid,signal.SIGKILL)
-  except (FileNotFoundError,ProcessLookupError): pass
+   if cmdline(process.pid)!=command: return
+  except (FileNotFoundError,ProcessLookupError): return
+  time.sleep(0.1)
+ try:
+  if cmdline(process.pid)==command: os.killpg(process.pid,signal.SIGKILL)
+ except (FileNotFoundError,ProcessLookupError): pass
+def cleanup():
+ for process,command in reversed(processes): cleanup_process(process,command)
 try:
  for command in commands:
   port=int(command[command.index("-L")+1].split(":")[1])
   if listening(port): raise RuntimeError(f"temporary adapter tunnel port {port} is already in use")
-  processes.append((subprocess.Popen(command,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True),command))
- deadline=time.monotonic()+45
- while time.monotonic()<deadline and not all(listening(int(command[command.index("-L")+1].split(":")[1])) for _process,command in processes): time.sleep(0.2)
+  for attempt in range(3):
+   process=subprocess.Popen(command,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
+   time.sleep(0.25)
+   deadline=time.monotonic()+5
+   started=False
+   while time.monotonic()<deadline:
+    if process.poll() is not None: break
+    try:
+     if cmdline(process.pid)!=command: break
+    except (FileNotFoundError,ProcessLookupError): break
+    if listening(port): started=True; break
+    time.sleep(0.1)
+   if started:
+    processes.append((process,command)); break
+   cleanup_process(process,command)
+   if listening(port): raise RuntimeError(f"temporary adapter tunnel port {port} changed owner")
+   if attempt==2: raise RuntimeError(f"temporary adapter tunnel {port} failed after 3 exact attempts")
  records=[]
  for process,command in processes:
   port=int(command[command.index("-L")+1].split(":")[1])

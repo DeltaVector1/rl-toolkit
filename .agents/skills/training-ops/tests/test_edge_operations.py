@@ -3,14 +3,18 @@ import base64
 import datetime
 import gzip
 import hashlib
+import io
 import json
 import os
 import shlex
+import signal
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
+import urllib.request
 from contextlib import nullcontext
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
@@ -26,6 +30,103 @@ def _trainer_inspect_record(run_records, command):
 
 
 class EdgeOperationsTest(unittest.TestCase):
+    def _run_tunnel_start_script(self, script, commands, outcomes):
+        processes = {}
+        latest = {}
+        killed = []
+        printed = []
+        next_pid = 3000
+        now = 0.0
+
+        class Process:
+            def __init__(self, pid, command, outcome):
+                self.pid = pid
+                self.command = command
+                self.outcome = outcome
+                self.killed = False
+
+            def poll(self):
+                return 1 if self.outcome == "exit" else -15 if self.killed else None
+
+        def popen(command, **_kwargs):
+            nonlocal next_pid
+            next_pid += 1
+            port = int(command[command.index("-L") + 1].split(":")[1])
+            outcome = outcomes[port].pop(0)
+            process = Process(next_pid, command, outcome)
+            processes[next_pid] = process
+            latest[port] = process
+            return process
+
+        def open_process(path, mode="r", *_args, **_kwargs):
+            pid = int(str(path).split("/")[2])
+            process = processes[pid]
+            if process.killed or process.outcome == "exit":
+                raise FileNotFoundError(path)
+            command = ["wrong"] if process.outcome == "wrong" else process.command
+            return io.BytesIO(b"\0".join(value.encode() for value in command) + b"\0")
+
+        class Socket:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                pass
+
+            def settimeout(self, _timeout):
+                pass
+
+            def connect_ex(self, address):
+                process = latest.get(address[1])
+                return 0 if process and process.outcome == "success" and not process.killed else 1
+
+        def killpg(pid, action):
+            killed.append((pid, action))
+            processes[pid].killed = True
+
+        def monotonic():
+            nonlocal now
+            now += 0.2
+            return now
+
+        class Response(io.BytesIO):
+            status = 206
+            headers = {
+                "Content-Encoding": "gzip",
+                "X-Prime-Raw-Length": "1024",
+            }
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        encoded = base64.b64encode(
+            json.dumps(commands, separators=(",", ":")).encode()
+        ).decode()
+        self._tunnel_simulation = processes, killed, printed
+        with (
+            patch("subprocess.Popen", side_effect=popen),
+            patch("socket.socket", return_value=Socket()),
+            patch("builtins.open", side_effect=open_process),
+            patch("os.killpg", side_effect=killpg),
+            patch("time.monotonic", side_effect=monotonic),
+            patch("time.sleep"),
+            patch(
+                "urllib.request.urlopen",
+                side_effect=lambda *_args, **_kwargs: Response(gzip.compress(b"x" * 1024)),
+            ),
+            patch("builtins.print", side_effect=lambda value: printed.append(value)),
+            patch.object(
+                sys,
+                "argv",
+                ["tunnels", "http://127.0.0.1:18200/file", encoded],
+            ),
+        ):
+            exec(compile(script, "<tunnel-start>", "exec"), {})
+        return processes, killed, printed
+
     def qualification_evidence(self, profile_name="glm52-native-b2048"):
         with (
             training_ops.repo_root
@@ -1182,6 +1283,9 @@ class EdgeOperationsTest(unittest.TestCase):
             "required GLM gzip adapter server is not ready through temporary staging tunnels",
             start_arguments[2],
         )
+        self.assertIn("for attempt in range(3)", start_arguments[2])
+        self.assertIn("time.sleep(0.25)", start_arguments[2])
+        self.assertIn("cleanup_process(process,command)", start_arguments[2])
         compile(start_arguments[2], "<step20-adapter-tunnel-start>", "exec")
         self.assertEqual(
             json.loads(base64.b64decode(start_arguments[-1], validate=True)),
@@ -1192,6 +1296,41 @@ class EdgeOperationsTest(unittest.TestCase):
         self.assertIn("current!=record[\"cmdline\"]", stop_arguments[2])
         self.assertIn("os.killpg", stop_arguments[2])
         compile(stop_arguments[2], "<step20-adapter-tunnel-stop>", "exec")
+
+        script = start_arguments[2]
+        first_command, second_command = commands[:2]
+        first_port, second_port = 18200, 18201
+        processes, killed, printed = self._run_tunnel_start_script(
+            script,
+            [first_command],
+            {first_port: ["exit", "success"]},
+        )
+        self.assertEqual(len(processes), 2)
+        self.assertEqual(killed, [])
+        self.assertEqual(json.loads(printed[-1])[0]["pid"], 3002)
+
+        with self.assertRaisesRegex(RuntimeError, "failed after 3 exact attempts"):
+            self._run_tunnel_start_script(
+                script,
+                [first_command, second_command],
+                {
+                    first_port: ["success"],
+                    second_port: ["exit", "exit", "exit"],
+                },
+            )
+        processes, killed, _printed = self._tunnel_simulation
+        self.assertEqual(
+            killed,
+            [(3001, signal.SIGTERM)],
+        )
+
+        processes, killed, printed = self._run_tunnel_start_script(
+            script,
+            [first_command],
+            {first_port: ["wrong", "success"]},
+        )
+        self.assertNotIn(3001, {pid for pid, _action in killed})
+        self.assertEqual(json.loads(printed[-1])[0]["pid"], 3002)
 
     def test_step20_candidate_cleanup_is_limited_to_random_candidate(self):
         candidate = (
