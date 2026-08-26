@@ -66,6 +66,20 @@ _REPORTED_W8A16_INPUT_GRAD: set[tuple[str, bool, bool]] = set()
 _EXPERT_PROFILE = os.environ.get("PRIME_EP_PROFILE", "") == "1"
 _EXPERT_BACKWARD_EVENTS: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
 _EXPERT_PROFILE_EVERY = int(os.environ.get("PRIME_EXPERT_PROFILE_EVERY", "90"))
+_EXPERT_PHASE_PROFILE_VALUE = os.environ.get("PRIME_EXPERT_PHASE_PROFILE", "0")
+if _EXPERT_PHASE_PROFILE_VALUE not in {"0", "1"}:
+    raise ValueError("PRIME_EXPERT_PHASE_PROFILE must be 0 or 1")
+_EXPERT_PHASE_PROFILE = _EXPERT_PHASE_PROFILE_VALUE == "1"
+_EXPERT_PHASE_PROFILE_EVERY = int(
+    os.environ.get("PRIME_EXPERT_PHASE_PROFILE_EVERY", "180")
+)
+if _EXPERT_PHASE_PROFILE_EVERY <= 0:
+    raise ValueError("PRIME_EXPERT_PHASE_PROFILE_EVERY must be positive")
+_EXPERT_PHASE_EVENTS: dict[
+    str, list[tuple[torch.cuda.Event, torch.cuda.Event]]
+] = {}
+_EXPERT_PHASE_CALLS: dict[str, int] = {"forward": 0, "backward": 0}
+_EXPERT_PHASE_LAST_END: dict[str, torch.cuda.Event] = {}
 # Fallback for direct function calls that have no owning module. Production
 # modules reacquire current unsharded FSDP parameters from their owner.
 # Values are [weight, scale, refcount].
@@ -151,6 +165,58 @@ def _profile_expert_backward(start, end) -> None:
             f"[fp8-expert-prof] rank={os.environ.get('RANK', '0')} "
             f"backward_calls={_EXPERT_PROFILE_EVERY} "
             f"cuda={elapsed / 1000:.2f}s",
+            flush=True,
+        )
+
+
+def _expert_phase_start(phase: str):
+    """Start one routed-LoRA CUDA phase, or return None when disabled."""
+    if not _EXPERT_PHASE_PROFILE:
+        return None
+    start = torch.cuda.Event(enable_timing=True)
+    start.record()
+    return phase, start
+
+
+def _expert_phase_end(timer) -> None:
+    """End one routed-LoRA CUDA phase without synchronizing the stream."""
+    if timer is None:
+        return
+    phase, start = timer
+    end = torch.cuda.Event(enable_timing=True)
+    end.record()
+    _EXPERT_PHASE_EVENTS.setdefault(phase, []).append((start, end))
+    direction = phase.split(".", 1)[0]
+    _EXPERT_PHASE_LAST_END[direction] = end
+
+
+def _profile_expert_phases_tick(direction: str) -> None:
+    """Report aggregate routed-LoRA phase CUDA time at a low frequency."""
+    if not _EXPERT_PHASE_PROFILE:
+        return
+    _EXPERT_PHASE_CALLS[direction] += 1
+    if _EXPERT_PHASE_CALLS[direction] % _EXPERT_PHASE_PROFILE_EVERY:
+        return
+    end = _EXPERT_PHASE_LAST_END.get(direction)
+    if end is None:
+        return
+    end.synchronize()
+    prefix = f"{direction}."
+    totals = {}
+    for phase, events in _EXPERT_PHASE_EVENTS.items():
+        if phase.startswith(prefix):
+            totals[phase[len(prefix) :]] = sum(
+                start.elapsed_time(stop) for start, stop in events
+            ) / 1000.0
+    for phase in tuple(_EXPERT_PHASE_EVENTS):
+        if phase.startswith(prefix):
+            del _EXPERT_PHASE_EVENTS[phase]
+    _EXPERT_PHASE_LAST_END.pop(direction, None)
+    if int(os.environ.get("LOCAL_RANK", "0")) == 0:
+        parts = " ".join(f"{name}={value:.2f}s" for name, value in sorted(totals.items()))
+        print(
+            f"[fp8-expert-phase-prof] rank={os.environ.get('RANK', '0')} "
+            f"direction={direction} calls={_EXPERT_PHASE_PROFILE_EVERY} {parts}",
             flush=True,
         )
 
@@ -2949,10 +3015,13 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
             indices = permuted_indices[start:end]
             real = (indices >= 0) & (indices < x.shape[0])
             safe_indices = indices.clamp(min=0, max=x.shape[0] - 1).long()
+            phase_timer = _expert_phase_start("forward.input_gather")
             chunk_x = _index_select_rows_with_cache_retry(x, safe_indices)
             chunk_x.masked_fill_((~real).unsqueeze(-1), 0)
+            _expert_phase_end(phase_timer)
             chunk_offsets = _expert_chunk_offsets(offsets, start, end)
 
+            phase_timer = _expert_phase_start("forward.w13_base")
             z1, z3 = _grouped_mm_pair(
                 chunk_x,
                 w1,
@@ -2963,7 +3032,9 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                 chunk_offsets,
                 shared_input=True,
             )
+            _expert_phase_end(phase_timer)
             if _SCATTERMOE_LORA:
+                phase_timer = _expert_phase_start("forward.w13_lora")
                 z1.add_(
                     _scattermoe_lora_projection(
                         x,
@@ -2984,7 +3055,9 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                     ),
                     alpha=scaling,
                 )
+                _expert_phase_end(phase_timer)
             else:
+                phase_timer = _expert_phase_start("forward.w13_lora")
                 z1.add_(
                     _grouped_lora_projection(
                         chunk_x,
@@ -3003,6 +3076,7 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                     ),
                     alpha=scaling,
                 )
+                _expert_phase_end(phase_timer)
 
             # The gathered source rows are no longer needed after W1/W3 and
             # their LoRA updates. Release this bounded copy before W2 allocates
@@ -3011,6 +3085,7 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
             # allocator peak for every routed-LoRA chunk.
             del chunk_x, safe_indices
             if save_backward_state:
+                phase_timer = _expert_phase_start("forward.quantize_offload")
                 q1, qs1 = ops.scaled_fp8_quant(z1, use_per_token_if_dynamic=True)
                 q3, qs3 = ops.scaled_fp8_quant(z3, use_per_token_if_dynamic=True)
                 q1_host[start:end].copy_(q1, non_blocking=True)
@@ -3018,16 +3093,22 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                 qs1_parts.append(qs1)
                 qs3_parts.append(qs3)
                 del q1, q3
+                _expert_phase_end(phase_timer)
 
+            phase_timer = _expert_phase_start("forward.glu")
             F.silu(z1, inplace=True)
             z1.mul_(z3)
+            _expert_phase_end(phase_timer)
             del z3
+            phase_timer = _expert_phase_start("forward.w2_base")
             chunk_out = _grouped_mm_chunked(
                 z1,
                 w2,
                 s2,
                 chunk_offsets,
             )
+            _expert_phase_end(phase_timer)
+            phase_timer = _expert_phase_start("forward.w2_lora")
             if _SCATTERMOE_LORA:
                 w2_row_indices = torch.arange(
                     end - start,
@@ -3057,7 +3138,10 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                         "ScatterMoE LoRA cannot reuse an uncomputed W2 low-rank value"
                     )
                 w2_low_rank_host[start:end].copy_(w2_low_rank, non_blocking=True)
+            _expert_phase_end(phase_timer)
+            phase_timer = _expert_phase_start("forward.combine")
             _index_copy_real_rows_with_cache_retry(x, indices, chunk_out, real)
+            _expert_phase_end(phase_timer)
             del (
                 z1,
                 chunk_out,
@@ -3070,6 +3154,7 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
             )
 
         if not save_backward_state:
+            _profile_expert_phases_tick("forward")
             ctx.has_backward_state = False
             ctx.mark_dirty(x)
             return x
@@ -3088,6 +3173,7 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
             saved_permuted_indices.copy_(permuted_indices, non_blocking=True)
         else:
             raise TypeError("native expert input has no supported row-index device")
+        _profile_expert_phases_tick("forward")
         offload_done = torch.cuda.Event()
         offload_done.record(torch.cuda.current_stream(x.device))
         ctx.has_backward_state = True
@@ -3218,6 +3304,7 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
         for start in range(0, rows, ctx.chunk_rows):
             end = min(start + ctx.chunk_rows, rows)
             reconstruction_indices = saved_permuted_indices[start:end]
+            phase_timer = _expert_phase_start("backward.input_gather")
             indices = (
                 reconstruction_indices
                 if ctx.row_index_device == "cuda"
@@ -3227,6 +3314,7 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
             safe_indices = indices.clamp(min=0, max=ctx.source_rows - 1).long()
             grad_chunk = _index_select_rows_with_cache_retry(grad, safe_indices)
             grad_chunk.masked_fill_((~real).unsqueeze(-1), 0)
+            _expert_phase_end(phase_timer)
             chunk_offsets = _expert_chunk_offsets(offsets, start, end)
             backward_row_indices = (
                 torch.arange(
@@ -3238,6 +3326,7 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                 else None
             )
 
+            phase_timer = _expert_phase_start("backward.activation_restore")
             q1_device = q1[start:end].to(grad.device, non_blocking=True)
             z1 = q1_device.to(grad.dtype).mul_(qs1[start:end].to(grad.dtype))
             del q1_device
@@ -3245,13 +3334,17 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
             z3 = q3_device.to(grad.dtype).mul_(qs3[start:end].to(grad.dtype))
             del q3_device
             hidden = F.silu(z1) * z3
+            _expert_phase_end(phase_timer)
 
+            phase_timer = _expert_phase_start("backward.w2_base")
             hidden_grad = _grouped_mm_chunked(
                 grad_chunk,
                 w2.transpose(-2, -1),
                 s2.transpose(-2, -1),
                 chunk_offsets,
             )
+            _expert_phase_end(phase_timer)
+            phase_timer = _expert_phase_start("backward.w2_lora")
             saved_w2_low_rank = (
                 w2_low_rank_host[start:end].to(grad.device, non_blocking=True)
                 if ctx.reuse_w2_low_rank
@@ -3283,14 +3376,18 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                     scaling=ctx.scaling,
                 )
             hidden_grad.add_(lora_hidden_grad)
+            _expert_phase_end(phase_timer)
             del lora_hidden_grad, hidden, saved_w2_low_rank
 
+            phase_timer = _expert_phase_start("backward.glu")
             z1_grad, z3_grad = _silu_glu_backward_inplace(
                 hidden_grad,
                 z1,
                 z3,
             )
+            _expert_phase_end(phase_timer)
             del hidden_grad, z1, z3
+            phase_timer = _expert_phase_start("backward.w13_base")
             x_grad, x_grad_w3 = _grouped_mm_pair(
                 z1_grad,
                 w1.transpose(-2, -1),
@@ -3300,13 +3397,17 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                 s3.transpose(-2, -1),
                 chunk_offsets,
             )
+            _expert_phase_end(phase_timer)
 
             reconstructed_x = grad_chunk
+            phase_timer = _expert_phase_start("backward.reconstruct")
             ctx.received_input.reconstruct_rows(
                 reconstruction_indices,
                 reconstructed_x,
                 workspace,
             )
+            _expert_phase_end(phase_timer)
+            phase_timer = _expert_phase_start("backward.w1_lora")
             if _SCATTERMOE_LORA_BWD:
                 lora_x_grad = _scattermoe_lora_backward(
                     reconstructed_x,
@@ -3331,7 +3432,9 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                     scaling=ctx.scaling,
                 )
             x_grad.add_(lora_x_grad)
+            _expert_phase_end(phase_timer)
             del lora_x_grad
+            phase_timer = _expert_phase_start("backward.w3_lora")
             if _SCATTERMOE_LORA_BWD:
                 lora_x_grad = _scattermoe_lora_backward(
                     reconstructed_x,
@@ -3356,8 +3459,11 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                     scaling=ctx.scaling,
                 )
             x_grad.add_(lora_x_grad)
+            _expert_phase_end(phase_timer)
+            phase_timer = _expert_phase_start("backward.combine")
             x_grad.add_(x_grad_w3)
             _index_copy_real_rows_with_cache_retry(grad, indices, x_grad, real)
+            _expert_phase_end(phase_timer)
             del (
                 indices,
                 real,
@@ -3373,6 +3479,7 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                 backward_row_indices,
             )
 
+        _profile_expert_phases_tick("backward")
         if _EXPERT_PROFILE:
             profile_end.record()
             _profile_expert_backward(profile_start, profile_end)

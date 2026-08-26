@@ -138,6 +138,28 @@ class GLM52KernelCandidateTest(unittest.TestCase):
             forward.index("chunk_out = _grouped_mm_chunked"),
         )
 
+    def test_routed_lora_phase_profiler_is_opt_in_and_aggregated(self):
+        self.assertIn(
+            'os.environ.get("PRIME_EXPERT_PHASE_PROFILE", "0")',
+            FP8_SOURCE,
+        )
+        self.assertIn(
+            'os.environ.get("PRIME_EXPERT_PHASE_PROFILE_EVERY", "180")',
+            FP8_SOURCE,
+        )
+        self.assertIn("def _expert_phase_start", FP8_SOURCE)
+        self.assertIn("def _expert_phase_end", FP8_SOURCE)
+        self.assertIn('"forward.w13_base"', FP8_SOURCE)
+        self.assertIn('"forward.w2_lora"', FP8_SOURCE)
+        self.assertIn('"backward.w2_base"', FP8_SOURCE)
+        self.assertIn('"backward.w1_lora"', FP8_SOURCE)
+        self.assertIn('"backward.w3_lora"', FP8_SOURCE)
+        self.assertIn('"backward.reconstruct"', FP8_SOURCE)
+        self.assertIn('_profile_expert_phases_tick("forward")', FP8_SOURCE)
+        self.assertIn('_profile_expert_phases_tick("backward")', FP8_SOURCE)
+        self.assertIn("end.synchronize()", FP8_SOURCE)
+        self.assertIn("[fp8-expert-phase-prof]", FP8_SOURCE)
+
     def test_sparse_bh32_candidate_does_not_change_forward(self):
         self.assertIn('variant not in {"baseline", "bh32"}', SPARSE_BWD_SOURCE)
         self.assertIn('variant == "bh32"', SPARSE_BWD_SOURCE)
