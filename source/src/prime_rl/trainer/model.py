@@ -152,6 +152,91 @@ def _virtual_stage_prefetch_pairs(
     return groups, forward_pairs, backward_pairs
 
 
+def _configure_fsdp_param_comm_overlap(
+    model: nn.Module,
+    config: ModelConfig,
+    parallel_dims: ParallelDims,
+    native_fp8: bool,
+) -> None:
+    """Enable bounded async FSDP2 unshards for the native-FP8 EP path.
+
+    FSDP2's async unshard mode is useful only when explicit prefetching is
+    configured. ``setup_fsdp`` installs one-step prefetches before calling
+    this helper. The helper deliberately rejects configurations where the
+    conservative memory assumptions do not hold. In particular, it never
+    changes ``reshard_after_forward``: frozen native-FP8 parameters still
+    become sharded after each forward and are gathered again for backward.
+
+    The method is private in PyTorch 2.11, so fail closed if the pinned
+    runtime does not provide it rather than silently running a different
+    schedule.
+    """
+    _validate_fsdp_param_comm_overlap(config, parallel_dims, native_fp8)
+    if not config.fsdp_param_comm_overlap:
+        return
+    set_unshard_async_op = getattr(model, "_set_unshard_async_op", None)
+    if not callable(set_unshard_async_op):
+        raise RuntimeError(
+            "fsdp_param_comm_overlap requires FSDP2 _set_unshard_async_op"
+        )
+    set_unshard_async_op(True)
+    get_logger().info("Enabled bounded async FSDP parameter communication overlap")
+
+
+def _validate_fsdp_param_comm_overlap(
+    config: ModelConfig,
+    parallel_dims: ParallelDims,
+    native_fp8: bool,
+) -> None:
+    """Validate overlap assumptions before any module is FSDP-wrapped."""
+    if not config.fsdp_param_comm_overlap:
+        return
+    if not native_fp8:
+        raise ValueError(
+            "fsdp_param_comm_overlap requires a native FP8 checkpoint"
+        )
+    if config.reshard_after_forward is not True:
+        raise ValueError(
+            "fsdp_param_comm_overlap requires reshard_after_forward=true"
+        )
+    if config.fsdp_cpu_offload or config.cold_cpu_offload:
+        raise ValueError(
+            "fsdp_param_comm_overlap does not support CPU-offloaded parameters"
+        )
+    if not parallel_dims.ep_enabled:
+        raise ValueError(
+            "fsdp_param_comm_overlap requires expert parallelism"
+        )
+
+
+def _set_bounded_nested_backward_prefetch(
+    current_block: nn.Module,
+    previous_block: nn.Module | None,
+    native_fp8_expert_prefetch: bool,
+) -> None:
+    """Set one explicit backward target for each nested MoE FSDP group.
+
+    A singleton target gives FSDP2 one bounded prefetch opportunity. The
+    self-target is intentional: it disables implicit reverse prefetch for a
+    group that is not part of the existing conservative policy.
+    """
+    current_mlp = getattr(current_block, "mlp", None)
+    if not isinstance(current_mlp, (MoE, LatentMoE)):
+        return
+    previous_mlp = getattr(previous_block, "mlp", None) if previous_block is not None else None
+    for group_name in ("router", "experts", "shared_expert"):
+        current_group = getattr(current_mlp, group_name, None)
+        if not isinstance(current_group, FSDPModule):
+            continue
+        previous_group = getattr(previous_mlp, group_name, None) if previous_mlp is not None else None
+        can_prefetch_previous = isinstance(previous_group, FSDPModule) and (
+            group_name == "router"
+            or (group_name == "experts" and native_fp8_expert_prefetch)
+        )
+        target = previous_group if can_prefetch_previous else current_group
+        current_group.set_modules_to_backward_prefetch([target])
+
+
 def pre_download_model(model_name: str) -> None:
     """Pre-download model from HuggingFace Hub so all nodes have cached weights before training."""
     if Path(model_name).exists():
@@ -1226,6 +1311,9 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
         "reshard_after_forward": True,
     }
     native_fp8 = getattr(model.config, "fp8_checkpoint", False)
+    # Validate opt-in assumptions before the first fully_shard call. This
+    # prevents a bad qualification config from partially mutating the model.
+    _validate_fsdp_param_comm_overlap(config, parallel_dims, native_fp8)
 
     hsdp_mesh = parallel_dims.get_mesh("hsdp")
     partial_reshard_mesh: DeviceMesh | None = None
@@ -1355,6 +1443,18 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
         language_model
     )
     transformer_blocks = [block for group in virtual_stage_blocks for block in group]
+    if config.fsdp_param_comm_overlap:
+        # Nested groups do not inherit the parent block's explicit policy.
+        # Configure every router, expert, and shared-expert state, including
+        # the first block in each virtual stage where there is no predecessor.
+        for virtual_group in virtual_stage_blocks:
+            for index, transformer_block in enumerate(virtual_group):
+                previous_transformer_block = virtual_group[index - 1] if index else None
+                _set_bounded_nested_backward_prefetch(
+                    transformer_block,
+                    previous_transformer_block,
+                    config.native_fp8_expert_prefetch,
+                )
 
     embed_module = getattr(language_model, "embed_tokens", None) or getattr(language_model, "embeddings", None)
     if embed_module is not None and len(language_model.layers) > 0:

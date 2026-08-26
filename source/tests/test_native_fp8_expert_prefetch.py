@@ -166,13 +166,194 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
         )
         self.assertIn("prefetch_modules.append(next_mlp.experts)", source)
         self.assertIn("prefetch_modules.append(prev_mlp.experts)", source)
-        self.assertEqual(source.count("config.native_fp8_expert_prefetch"), 2)
+        self.assertEqual(source.count("config.native_fp8_expert_prefetch"), 3)
 
         trainer_config = (
             ROOT
             / "source/packages/prime-rl-configs/src/prime_rl/configs/trainer.py"
         ).read_text()
         self.assertIn("native_fp8_expert_prefetch: bool = False", trainer_config)
+
+    def test_fsdp_param_comm_overlap_is_opt_in_and_bounded(self):
+        model_source = MODEL.read_text()
+        trainer_config = (
+            ROOT
+            / "source/packages/prime-rl-configs/src/prime_rl/configs/trainer.py"
+        ).read_text()
+        self.assertIn("fsdp_param_comm_overlap: bool = False", trainer_config)
+        self.assertIn("_set_unshard_async_op", model_source)
+        self.assertIn("prefetch_modules = prefetch_modules[:1]", model_source)
+
+        tree = ast.parse(model_source)
+        helper = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_configure_fsdp_param_comm_overlap"
+        )
+        validator = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_validate_fsdp_param_comm_overlap"
+        )
+        module = ast.Module(body=[validator, helper], type_ignores=[])
+        ast.fix_missing_locations(module)
+        calls = []
+
+        class Model:
+            def _set_unshard_async_op(self, value):
+                calls.append(value)
+
+        config = type(
+            "Config",
+            (),
+            {
+                "fsdp_param_comm_overlap": True,
+                "reshard_after_forward": True,
+                "fsdp_cpu_offload": False,
+                "cold_cpu_offload": False,
+            },
+        )()
+        parallel_dims = type("Dims", (), {"ep_enabled": True})()
+        namespace = {
+            "ValueError": ValueError,
+            "RuntimeError": RuntimeError,
+            "nn": type("NN", (), {"Module": object}),
+            "ModelConfig": object,
+            "ParallelDims": object,
+            "get_logger": lambda: type("Logger", (), {"info": lambda *_: None})(),
+        }
+        exec(compile(module, str(MODEL), "exec"), namespace)
+        namespace["_configure_fsdp_param_comm_overlap"](
+            Model(), config, parallel_dims, True
+        )
+        self.assertEqual(calls, [True])
+
+        config.reshard_after_forward = False
+        with self.assertRaisesRegex(ValueError, "reshard_after_forward=true"):
+            namespace["_configure_fsdp_param_comm_overlap"](
+                Model(), config, parallel_dims, True
+            )
+
+    def test_fsdp_param_comm_overlap_rejects_non_native_or_missing_ep(self):
+        tree = ast.parse(MODEL.read_text())
+        helper = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_configure_fsdp_param_comm_overlap"
+        )
+        validator = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_validate_fsdp_param_comm_overlap"
+        )
+        module = ast.Module(body=[validator, helper], type_ignores=[])
+        ast.fix_missing_locations(module)
+        namespace = {
+            "ValueError": ValueError,
+            "RuntimeError": RuntimeError,
+            "nn": type("NN", (), {"Module": object}),
+            "ModelConfig": object,
+            "ParallelDims": object,
+            "get_logger": lambda: type("Logger", (), {"info": lambda *_: None})(),
+        }
+        exec(compile(module, str(MODEL), "exec"), namespace)
+
+        config = type(
+            "Config",
+            (),
+            {
+                "fsdp_param_comm_overlap": True,
+                "reshard_after_forward": True,
+                "fsdp_cpu_offload": False,
+                "cold_cpu_offload": False,
+            },
+        )()
+        dims = type("Dims", (), {"ep_enabled": True})()
+        with self.assertRaisesRegex(ValueError, "native FP8"):
+            namespace["_configure_fsdp_param_comm_overlap"](
+                object(), config, dims, False
+            )
+        with self.assertRaisesRegex(ValueError, "expert parallelism"):
+            namespace["_configure_fsdp_param_comm_overlap"](
+                object(), config, type("Dims", (), {"ep_enabled": False})(), True
+            )
+        with self.assertRaisesRegex(RuntimeError, "FSDP2"):
+            namespace["_configure_fsdp_param_comm_overlap"](
+                object(), config, dims, True
+            )
+
+    def test_overlap_sets_all_nested_backward_prefetch_lists_in_cpu_world_size2_trace(self):
+        model_source = MODEL.read_text()
+        tree = ast.parse(model_source)
+        helper = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_set_bounded_nested_backward_prefetch"
+        )
+        module = ast.Module(body=[helper], type_ignores=[])
+        ast.fix_missing_locations(module)
+
+        class FakeFSDP:
+            def __init__(self):
+                self.backward_prefetch = []
+
+            def set_modules_to_backward_prefetch(self, modules):
+                self.backward_prefetch.append(list(modules))
+
+        class FakeMoE:
+            pass
+
+        namespace = {
+            "MoE": FakeMoE,
+            "LatentMoE": type("FakeLatentMoE", (), {}),
+            "FSDPModule": FakeFSDP,
+            "nn": type("NN", (), {"Module": object}),
+        }
+        exec(compile(module, str(MODEL), "exec"), namespace)
+
+        def make_block():
+            mlp = FakeMoE()
+            mlp.router = FakeFSDP()
+            mlp.experts = FakeFSDP()
+            mlp.shared_expert = FakeFSDP()
+            block = type("Block", (), {})()
+            block.mlp = mlp
+            return block
+
+        # Both ranks in a CPU world-size-2 trace receive the same bounded
+        # policy. A disabled expert prefetch remains explicit but self-targeted.
+        for _rank in (0, 1):
+            previous = make_block()
+            current = make_block()
+            namespace["_set_bounded_nested_backward_prefetch"](current, previous, False)
+            groups = [current.mlp.router, current.mlp.experts, current.mlp.shared_expert]
+            self.assertEqual(sum(len(group.backward_prefetch) for group in groups), 3)
+            self.assertLessEqual(
+                sum(len(targets) for group in groups for targets in group.backward_prefetch),
+                3,
+            )
+            self.assertEqual(current.mlp.router.backward_prefetch[0], [previous.mlp.router])
+            self.assertEqual(current.mlp.experts.backward_prefetch[0], [current.mlp.experts])
+            self.assertEqual(current.mlp.shared_expert.backward_prefetch[0], [current.mlp.shared_expert])
+
+            namespace["_set_bounded_nested_backward_prefetch"](current, previous, True)
+            self.assertEqual(current.mlp.experts.backward_prefetch[-1], [previous.mlp.experts])
+
+    def test_overlap_validation_is_before_first_fsdp_wrap_and_final_group_is_retained(self):
+        tree = ast.parse(MODEL.read_text())
+        setup = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "setup_fsdp")
+        setup_source = ast.unparse(setup)
+        self.assertLess(
+            setup_source.index("_validate_fsdp_param_comm_overlap"),
+            setup_source.index("fully_shard("),
+        )
+        self.assertIn("reshard_after_forward=False", setup_source)
+        self.assertIn("final_prefetch = [language_model.norm]", setup_source)
 
     def test_prefetch_pairs_stop_at_virtual_stage_boundaries(self):
         tree = ast.parse(MODEL.read_text())
