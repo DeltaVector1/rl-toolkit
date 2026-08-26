@@ -1,3 +1,4 @@
+import ast
 import base64
 import datetime
 import gzip
@@ -12,6 +13,7 @@ import threading
 import unittest
 from contextlib import nullcontext
 from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import tomllib
@@ -1101,6 +1103,26 @@ class EdgeOperationsTest(unittest.TestCase):
         self.assertIn("refusing wrong GLM adapter server identity", manager)
         self.assertIn('"Content-Encoding"', manager)
         self.assertIn('"X-Prime-Raw-Length"', manager)
+        tree = ast.parse(manager)
+        inspect_function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "inspect"
+        )
+        namespace = {
+            "docker": lambda *_args, **_kwargs: SimpleNamespace(
+                returncode=1,
+                stderr="error: no such object: glm52-optims-adapter-gzip\n",
+                stdout="",
+            ),
+            "json": json,
+        }
+        ast.fix_missing_locations(inspect_function)
+        exec(
+            compile(ast.Module(body=[inspect_function], type_ignores=[]), "<inspect>", "exec"),
+            namespace,
+        )
+        self.assertIsNone(namespace["inspect"](training_ops.glm_adapter_server_container))
 
     def test_direct_glm_adapter_download_requires_gzip_ranges(self):
         digest = "a" * 64

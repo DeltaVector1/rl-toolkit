@@ -2484,7 +2484,8 @@ def docker(*arguments,check=True):
 def inspect(reference):
  result=docker("inspect",reference,check=False)
  if result.returncode:
-  if "No such object" in result.stderr or "No such container" in result.stderr: return None
+  error=result.stderr.casefold()
+  if "no such object:" in error or "no such container:" in error: return None
   raise RuntimeError("cannot inspect GLM adapter server: "+result.stderr.strip()[:300])
  records=json.loads(result.stdout)
  if len(records)!=1: raise RuntimeError("GLM adapter server inspect count differs")
