@@ -1,10 +1,12 @@
 import argparse
+from contextlib import contextmanager
 import ctypes
 import ctypes.util
 import fcntl
 import gzip
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -70,8 +72,16 @@ _ADAPTER_CACHE_MAX_STALE_ENV = "PRIME_LORA_CACHE_MAX_STALE_ENTRIES"
 # retained for a safe retry, and is removed first when either cap is reached.
 _ADAPTER_CACHE_MAX_BYTES = 2 * 30_770_000_000
 _ADAPTER_CACHE_MAX_STALE_ENTRIES = 1
+_ADAPTER_CACHE_PARTIAL_MAX_AGE_ENV = "PRIME_LORA_CACHE_PARTIAL_MAX_AGE_SECONDS"
+_ADAPTER_CACHE_PARTIAL_MAX_AGE_SECONDS = 60 * 60
+_ADAPTER_FULL_WIRE_SIZE_ENV = "PRIME_ADAPTER_FULL_WIRE_SIZE"
 _ZSTD_FRAME_BYTES = 8 * 1024 * 1024
 _zstd = None
+_LOGGER = logging.getLogger(__name__)
+
+
+class AdapterDiskSpaceError(OSError):
+    """Raised when staging cannot safely assemble another adapter."""
 
 
 def _zstd_library():
@@ -246,11 +256,59 @@ def _adapter_cache_size(path: Path) -> int:
     return total
 
 
-def _prune_adapter_cache(cache_dir: Path, keep: set[Path]) -> None:
-    """Bound stale adapter storage without deleting active or base entries."""
+def _adapter_cache_lock(cache_dir: Path):
+    """Lock all staging and pruning for one cache, regardless of source URL."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return (cache_dir / ".adapter-cache.lock").open("w")
+
+
+@contextmanager
+def _adapter_stage_lock(cache_dir: Path, source_lock_name: str):
+    """Serialize cache mutations globally, then preserve per-source locking."""
+    with _adapter_cache_lock(cache_dir) as cache_lock:
+        fcntl.flock(cache_lock, fcntl.LOCK_EX)
+        with (cache_dir / f"{source_lock_name}.lock").open("w") as source_lock:
+            fcntl.flock(source_lock, fcntl.LOCK_EX)
+            yield
+
+
+def _partial_max_age() -> float:
+    try:
+        age = float(
+            os.environ.get(
+                _ADAPTER_CACHE_PARTIAL_MAX_AGE_ENV,
+                str(_ADAPTER_CACHE_PARTIAL_MAX_AGE_SECONDS),
+            )
+        )
+    except ValueError as error:
+        raise OSError("adapter partial age limit must be numeric") from error
+    if age < 0:
+        raise OSError("adapter partial age limit must be non-negative")
+    return age
+
+
+def _prune_adapter_cache_locked(cache_dir: Path, keep: set[Path]) -> None:
+    """Bound stale adapter storage; caller holds the cache-global lock."""
     if not cache_dir.is_dir() or cache_dir.is_symlink():
         return
     max_bytes, max_stale = _adapter_cache_limits()
+    partial_age = _partial_max_age()
+    now = time.time()
+    # A process can die after creating its unique assembly directory.  Remove
+    # only old partials; recent ones belong to another active transfer and are
+    # counted below instead of being touched.
+    partials = []
+    for entry in cache_dir.iterdir():
+        if (
+            entry.is_dir()
+            and not entry.is_symlink()
+            and ".partial-" in entry.name
+        ):
+            age = max(0.0, now - entry.stat().st_mtime)
+            if age >= partial_age:
+                shutil.rmtree(entry)
+            else:
+                partials.append(entry)
     entries = []
     for entry in cache_dir.iterdir():
         if entry.is_symlink() or not entry.is_dir() or entry in keep:
@@ -266,7 +324,7 @@ def _prune_adapter_cache(cache_dir: Path, keep: set[Path]) -> None:
         and not entry.is_symlink()
         and (entry / _ADAPTER_READY_NAME).is_file()
     ]
-    total = sum(_adapter_cache_size(entry) for entry in completed)
+    total = sum(_adapter_cache_size(entry) for entry in (*completed, *partials))
     stale_count = len(entries)
     for _mtime, entry in entries:
         if stale_count <= max_stale and total <= max_bytes:
@@ -275,6 +333,58 @@ def _prune_adapter_cache(cache_dir: Path, keep: set[Path]) -> None:
         shutil.rmtree(entry)
         stale_count -= 1
         total -= size
+
+
+def _prune_adapter_cache(cache_dir: Path, keep: set[Path]) -> None:
+    """Lock and bound stale adapter storage."""
+    with _adapter_cache_lock(cache_dir) as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        _prune_adapter_cache_locked(cache_dir, keep)
+
+
+def _safe_prune_adapter_cache(cache_dir: Path, keep: set[Path]) -> None:
+    """Pruning is cleanup; never turn a verified publication into a failure."""
+    try:
+        _prune_adapter_cache(cache_dir, keep)
+    except Exception as error:
+        _LOGGER.warning("adapter cache cleanup failed after verified staging: %s", error)
+
+
+def _safe_prune_adapter_cache_locked(cache_dir: Path, keep: set[Path]) -> None:
+    """Best-effort cleanup for callers already holding the cache lock."""
+    try:
+        _prune_adapter_cache_locked(cache_dir, keep)
+    except Exception as error:
+        _LOGGER.warning("adapter cache cleanup failed after verified staging: %s", error)
+
+
+def _cache_adapter_bytes(cache_dir: Path) -> int:
+    """Count completed and in-progress adapter bytes for disk preflight."""
+    if not cache_dir.is_dir() or cache_dir.is_symlink():
+        return 0
+    total = 0
+    for entry in cache_dir.iterdir():
+        if entry.is_dir() and not entry.is_symlink():
+            total += _adapter_cache_size(entry)
+    return total
+
+
+def _check_adapter_disk_space(cache_dir: Path, target_size: int, base_size: int = 0) -> None:
+    """Require room for active, base, and an assembling target before transfer."""
+    if target_size <= 0 or base_size < 0:
+        raise OSError("adapter disk preflight sizes are invalid")
+    active_size = 0
+    if cache_dir.is_dir() and not cache_dir.is_symlink():
+        for entry in cache_dir.iterdir():
+            model = entry / _ADAPTER_MODEL_NAME
+            if entry.is_dir() and not entry.is_symlink() and model.is_file():
+                active_size = max(active_size, model.stat().st_size)
+    required = active_size + base_size + target_size
+    available = shutil.disk_usage(cache_dir).free
+    if available < required:
+        raise AdapterDiskSpaceError(
+            f"insufficient adapter disk space: need {required} bytes, have {available}"
+        )
 
 
 def _content_length(source_urls: list[str]) -> int:
@@ -291,6 +401,45 @@ def _content_length(source_urls: list[str]) -> int:
         except (KeyError, ValueError, OSError) as failure:
             error = failure
     raise OSError(f"cannot read adapter content length: {error}")
+
+
+def _full_wire_size_estimate(source_url: str, target_size: int) -> int | None:
+    """Get a current complete-transfer size without downloading the model."""
+    configured = os.environ.get(_ADAPTER_FULL_WIRE_SIZE_ENV)
+    if configured is not None:
+        try:
+            value = int(configured)
+        except ValueError:
+            return None
+        return value if value > 0 else None
+    codec = os.environ.get(_GLM_RANGE_CODEC_ENV)
+    if codec is None:
+        gzip_required = os.environ.get(_GLM_RANGE_GZIP_ENV, "0")
+        if gzip_required not in {"0", "1"}:
+            return None
+        codec = "gzip" if gzip_required == "1" else "identity"
+    if codec == "identity":
+        # The sidecar is an exact byte count for the normal uncompressed path.
+        return target_size
+    if codec not in {"gzip", "zstd"}:
+        return None
+    try:
+        request = urllib.request.Request(
+            source_url,
+            method="HEAD",
+            headers={"Accept-Encoding": codec},
+        )
+        with urllib.request.urlopen(request, timeout=60) as response:
+            explicit = response.headers.get("X-Prime-Wire-Length")
+            if explicit is not None:
+                value = int(explicit)
+                return value if value > 0 else None
+            if response.headers.get("Content-Encoding", "").lower() != codec:
+                return None
+            value = int(response.headers["Content-Length"])
+            return value if value > 0 else None
+    except (KeyError, ValueError, OSError):
+        return None
 
 
 def _download_range(
@@ -648,9 +797,7 @@ def stage_lora_adapter_files(source_url: str) -> Path:
     """
     cache_root = adapter_cache_path(source_url)
     cache_root.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = cache_root.parent / f"{cache_root.name}.lock"
-    with lock_path.open("w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with _adapter_stage_lock(cache_root.parent, cache_root.name):
         temporary = Path(
             tempfile.mkdtemp(prefix=f"{cache_root.name}.partial-", dir=cache_root.parent)
         )
@@ -672,7 +819,42 @@ def stage_lora_adapter_files(source_url: str) -> Path:
             ):
                 raise OSError(f"adapter cache path is unsafe: {destination}")
             if destination.is_dir() and _cached_adapter_matches(destination, basic_identity):
-                _prune_adapter_cache(destination.parent, {destination})
+                keep = {destination}
+                if _delta_enabled():
+                    hit_manifest = temporary / ADAPTER_DELTA_MANIFEST
+                    if _download_optional(
+                        f"{source_url.rstrip('/')}/{ADAPTER_DELTA_MANIFEST}",
+                        hit_manifest,
+                    ):
+                        try:
+                            hit_identity = load_adapter_delta_manifest(hit_manifest)
+                            hit_base = adapter_cache_path(
+                                source_url, hit_identity["base_sha256"]
+                            )
+                            hit_base_expected = {
+                                "version": _ADAPTER_IDENTITY_VERSION,
+                                "adapter_model_sha256": hit_identity["base_sha256"],
+                                "adapter_model_size": hit_identity["base_size"],
+                                "adapter_config_sha256": hit_identity[
+                                    "base_adapter_config_sha256"
+                                ],
+                                "tensor_metadata_sha256": hit_identity[
+                                    "base_tensor_metadata_sha256"
+                                ],
+                            }
+                            if hit_base.is_dir() and _cached_adapter_matches(
+                                hit_base, hit_base_expected
+                            ):
+                                keep.add(hit_base)
+                        except (
+                            AdapterDeltaError,
+                            OSError,
+                            ValueError,
+                            TypeError,
+                            KeyError,
+                        ):
+                            pass
+                _safe_prune_adapter_cache_locked(destination.parent, keep)
                 return destination
 
             transfer = "full"
@@ -700,6 +882,11 @@ def stage_lora_adapter_files(source_url: str) -> Path:
                             for key, value in manifest_target.items()
                         ):
                             raise AdapterDeltaError("adapter delta target identity differs")
+                        _check_adapter_disk_space(
+                            destination.parent,
+                            target_size,
+                            delta_manifest["base_size"],
+                        )
                         base_sha256 = delta_manifest["base_sha256"]
                         base_destination = adapter_cache_path(source_url, base_sha256)
                         base_expected = {
@@ -725,7 +912,10 @@ def stage_lora_adapter_files(source_url: str) -> Path:
                             target_sha256=target_sha256,
                             target_size=target_size,
                             enabled=True,
-                            full_wire_size=target_size,
+                            full_wire_size=_full_wire_size_estimate(
+                                f"{source_url.rstrip('/')}/{_ADAPTER_MODEL_NAME}",
+                                target_size,
+                            ),
                             manifest_wire_size=manifest_path.stat().st_size,
                         )
                         if choice == "delta":
@@ -755,6 +945,8 @@ def stage_lora_adapter_files(source_url: str) -> Path:
                             raise AdapterDeltaError(
                                 "adapter delta base is absent, mismatched, or too large"
                             )
+                    except AdapterDiskSpaceError:
+                        raise
                     except (AdapterDeltaError, OSError, ValueError, TypeError, KeyError):
                         # Delta is an optimization.  A failed or ineligible
                         # delta must select the complete current transfer.
@@ -796,7 +988,7 @@ def stage_lora_adapter_files(source_url: str) -> Path:
             # adapter, and is the only safe base for the next retry.
             if base_destination is not None and base_destination.is_dir():
                 keep.add(base_destination)
-            _prune_adapter_cache(destination.parent, keep)
+            _safe_prune_adapter_cache_locked(destination.parent, keep)
             temporary = None
             return destination
         finally:

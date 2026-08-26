@@ -8,8 +8,12 @@ import os
 import shutil
 import struct
 import tempfile
+import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from prime_rl.utils.adapter_delta import (
@@ -248,6 +252,173 @@ class AdapterDeltaTest(unittest.TestCase):
             self.assertTrue(keep_base.exists())
             self.assertFalse(stale_old.exists())
             self.assertTrue(stale_new.exists())
+
+    def test_compressed_break_even_requires_current_wire_size(self) -> None:
+        filesystem = _load_filesystem_module()
+        with patch.dict(
+            os.environ,
+            {
+                "PRIME_GLM_ADAPTER_CODEC": "gzip",
+                "PRIME_ADAPTER_FULL_WIRE_SIZE": "80",
+            },
+            clear=False,
+        ):
+            with patch.object(filesystem, "_content_length", return_value=80):
+                self.assertEqual(
+                    filesystem._full_wire_size_estimate("http://adapter/model", 100),
+                    80,
+                )
+            with patch.dict(os.environ, {"PRIME_ADAPTER_FULL_WIRE_SIZE": ""}), patch.object(
+                filesystem.urllib.request, "urlopen", side_effect=OSError("no HEAD")
+            ):
+                self.assertIsNone(
+                    filesystem._full_wire_size_estimate("http://adapter/model", 100)
+                )
+
+    def test_interrupted_partial_cache_is_removed_and_recent_partial_is_counted(self) -> None:
+        filesystem = _load_filesystem_module()
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "cache"
+            old_partial = cache / "source.partial-interrupted"
+            recent_partial = cache / "source.partial-active"
+            old_partial.mkdir(parents=True)
+            recent_partial.mkdir(parents=True)
+            (old_partial / "model").write_bytes(b"old")
+            (recent_partial / "model").write_bytes(b"recent")
+            os.utime(old_partial, (1, 1))
+            with patch.dict(
+                os.environ,
+                {"PRIME_LORA_CACHE_PARTIAL_MAX_AGE_SECONDS": "1"},
+                clear=False,
+            ):
+                filesystem._prune_adapter_cache(cache, set())
+            self.assertFalse(old_partial.exists())
+            self.assertTrue(recent_partial.exists())
+            self.assertGreaterEqual(filesystem._cache_adapter_bytes(cache), len(b"recent"))
+
+    def test_disk_preflight_requires_active_base_and_assembling_space(self) -> None:
+        filesystem = _load_filesystem_module()
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "cache"
+            active = cache / "active"
+            active.mkdir(parents=True)
+            (active / "adapter_model.safetensors").write_bytes(b"x" * 20)
+            with patch.object(
+                filesystem.shutil,
+                "disk_usage",
+                return_value=SimpleNamespace(free=169),
+            ):
+                with self.assertRaises(filesystem.AdapterDiskSpaceError):
+                    filesystem._check_adapter_disk_space(cache, 100, 50)
+            with patch.object(
+                filesystem.shutil,
+                "disk_usage",
+                return_value=SimpleNamespace(free=170),
+            ):
+                filesystem._check_adapter_disk_space(cache, 100, 50)
+
+    def test_cache_global_lock_serializes_different_source_urls(self) -> None:
+        filesystem = _load_filesystem_module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sources = {
+                "one": _export(root, "one", b"a" * 8192),
+                "two": _export(root, "two", b"b" * 8192),
+            }
+            active = 0
+            maximum = 0
+            state_lock = threading.Lock()
+
+            def fake_download(source_url, destination, create_only=False, **_kwargs):
+                nonlocal active, maximum
+                step, filename = source_url.rstrip("/").split("/")[-2:]
+                source = sources[step] / filename
+                with state_lock:
+                    active += 1
+                    maximum = max(maximum, active)
+                try:
+                    time.sleep(0.02)
+                    shutil.copyfile(source, destination)
+                finally:
+                    with state_lock:
+                        active -= 1
+
+            with patch.dict(
+                os.environ,
+                {"PRIME_LORA_CACHE_DIR": str(root / "cache")},
+                clear=False,
+            ), patch.object(filesystem, "download", side_effect=fake_download):
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    list(
+                        pool.map(
+                            filesystem.stage_lora_adapter_files,
+                            ("http://adapter/one", "http://adapter/two"),
+                        )
+                    )
+            self.assertEqual(maximum, 1)
+
+    def test_prune_failure_does_not_invalidate_verified_ready_target(self) -> None:
+        filesystem = _load_filesystem_module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = _export(root, "source", b"a" * 8192)
+
+            def fake_download(source_url, destination, create_only=False, **_kwargs):
+                shutil.copyfile(source / source_url.rsplit("/", 1)[-1], destination)
+
+            with patch.dict(
+                os.environ,
+                {"PRIME_LORA_CACHE_DIR": str(root / "cache")},
+                clear=False,
+            ), patch.object(filesystem, "download", side_effect=fake_download), patch.object(
+                filesystem,
+                "_prune_adapter_cache_locked",
+                side_effect=OSError("cleanup unavailable"),
+            ):
+                destination = filesystem.stage_lora_adapter_files("http://adapter/source")
+            self.assertTrue(destination.joinpath("READY").is_file())
+
+    def test_cache_hit_keeps_valid_adjacent_base(self) -> None:
+        filesystem = _load_filesystem_module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sources = {
+                "one": _export(root, "one", b"a" * 8192),
+                "two": _export(root, "two", b"a" * 8191 + b"b"),
+            }
+            build_adapter_delta(sources["one"], sources["two"], max_ratio=0.99)
+
+            def fake_download(source_url, destination, create_only=False, **_kwargs):
+                step, filename = source_url.rstrip("/").split("/")[-2:]
+                source = sources[step] / filename
+                if not source.is_file():
+                    raise FileNotFoundError(source)
+                shutil.copyfile(source, destination)
+
+            with patch.dict(
+                os.environ,
+                {
+                    "PRIME_LORA_CACHE_DIR": str(root / "cache"),
+                    "PRIME_ADAPTER_DELTA": "1",
+                    "PRIME_LORA_CACHE_MAX_STALE_ENTRIES": "0",
+                },
+                clear=False,
+            ), patch.object(filesystem, "download", side_effect=fake_download):
+                filesystem.stage_lora_adapter_files("http://adapter/one")
+                target = filesystem.stage_lora_adapter_files("http://adapter/two")
+                base_sha256 = hashlib.sha256(
+                    sources["one"].joinpath("adapter_model.safetensors").read_bytes()
+                ).hexdigest()
+                base = filesystem.adapter_cache_path(
+                    "http://adapter/other-url", base_sha256
+                )
+                stale = target.parent / "stale"
+                stale.mkdir()
+                (stale / "READY").write_text("{}")
+                filesystem.stage_lora_adapter_files("http://adapter/two")
+            self.assertTrue(target.exists())
+            self.assertTrue(base.exists())
+            self.assertFalse(stale.exists())
 
     def test_fallback_selection_is_explicit(self) -> None:
         manifest = {

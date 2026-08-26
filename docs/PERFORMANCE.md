@@ -245,6 +245,10 @@ size, and compares `delta_bytes + manifest_bytes` with that value.  Without
 that estimate it selects the current complete adapter transfer.  A missing or
 mismatched base, an invalid frame, or a ratio at or above the guard selects the
 same fallback.
+For gzip or zstd, the estimate must be an encoded response length (from
+`X-Prime-Wire-Length`, an encoded `Content-Length`, or
+`PRIME_ADAPTER_FULL_WIRE_SIZE`); a raw target size is not used as a compressed
+wire estimate.
 The normal gzip transfer and production profiles are unchanged.
 
 The digest-keyed H200 adapter cache has a 61,540,000,000-byte default cap
@@ -253,6 +257,10 @@ The active target and the adjacent base considered for a transfer are
 protected from pruning.  Operators can set `PRIME_LORA_CACHE_MAX_BYTES` and
 `PRIME_LORA_CACHE_MAX_STALE_ENTRIES` for a smaller local limit; pruning removes
 old stale entries first and never removes a protected entry.
+Orphaned `.partial-*` directories older than one hour are removed; newer
+partials count toward cache bytes.  Before a delta download, staging checks
+free space for active adapter + base adapter + assembling target and fails
+before transfer when that peak does not fit.
 
 The measurement gate is exactly two adjacent real exports from one run:
 
