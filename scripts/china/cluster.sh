@@ -353,11 +353,37 @@ deployment, session_path, expected_session_sha256, host = sys.argv[1:]
 session_bytes = Path(session_path).read_bytes()
 if hashlib.sha256(session_bytes).hexdigest() != expected_session_sha256:
     raise SystemExit("qualification session checksum differs")
-session = json.loads(session_bytes)
+class DuplicateKey(ValueError):
+    pass
+
+def reject_duplicate_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise DuplicateKey(key)
+        result[key] = value
+    return result
+
+try:
+    session = json.loads(session_bytes, object_pairs_hook=reject_duplicate_keys)
+except DuplicateKey as error:
+    raise SystemExit("qualification session JSON has duplicate keys") from error
+except ValueError as error:
+    raise SystemExit("qualification session JSON is invalid") from error
 source_files = session.get("source_files")
-if not isinstance(source_files, dict) or len(source_files) != 46:
+if not isinstance(source_files, dict):
     raise SystemExit("qualification source manifest is invalid")
 root = Path(deployment).resolve(strict=True)
+launcher = root / "scripts/china/cluster.sh"
+try:
+    mounted_paths = re.findall(
+        r'-v "\$deployment/([^\"]+)":', launcher.read_text()
+    )
+except OSError as error:
+    raise SystemExit("qualification launcher inventory is unavailable") from error
+expected_paths = set(mounted_paths) | {"scripts/china/cluster.sh"}
+if set(source_files) != expected_paths:
+    raise SystemExit("qualification source manifest differs from launcher mounts")
 observed = {}
 for relative, expected in source_files.items():
     path = PurePosixPath(relative) if isinstance(relative, str) else None

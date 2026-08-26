@@ -137,7 +137,9 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
 
     def test_qualification_launcher_binds_runtime_source_image_and_launcher(self):
         launcher = (ROOT / "scripts/china/cluster.sh").read_text()
-        self.assertIn('len(source_files) != 46', launcher)
+        self.assertIn('expected_paths = set(mounted_paths)', launcher)
+        self.assertIn('set(source_files) != expected_paths', launcher)
+        self.assertNotIn('len(source_files) != 46', launcher)
         self.assertIn('candidate.read_bytes()', launcher)
         self.assertIn('qualification source checksum differs', launcher)
         self.assertIn('qualification launcher checksum differs', launcher)

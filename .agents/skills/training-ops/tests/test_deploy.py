@@ -184,6 +184,49 @@ class DeployTest(unittest.TestCase):
                     {"source/mounted.py": digest},
                 )
 
+    def test_mount_preflight_refuses_unexpected_or_duplicate_records(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            source = repo / "source" / "mounted.py"
+            source.parent.mkdir(parents=True)
+            source.write_text("current\n")
+            digest = hashlib.sha256(source.read_bytes()).hexdigest()
+            with (
+                patch.object(training_ops, "repo_root", repo),
+                patch.object(training_ops, "_mounts_in", return_value={"source/mounted.py"}),
+                patch.object(
+                    training_ops,
+                    "_fan",
+                    return_value={
+                        "n82": (
+                            0,
+                            f"source/mounted.py\t{digest}\n"
+                            f"source/extra.py\t{'0' * 64}\n",
+                        )
+                    },
+                ),
+            ):
+                with self.assertRaisesRegex(training_ops.Refused, "unexpected"):
+                    training_ops.trainer_mount_preflight(["n82"])
+
+            with (
+                patch.object(training_ops, "repo_root", repo),
+                patch.object(training_ops, "_mounts_in", return_value={"source/mounted.py"}),
+                patch.object(
+                    training_ops,
+                    "_fan",
+                    return_value={
+                        "n82": (
+                            0,
+                            f"source/mounted.py\t{digest}\n"
+                            f"source/mounted.py\t{digest}\n",
+                        )
+                    },
+                ),
+            ):
+                with self.assertRaisesRegex(training_ops.Refused, "duplicate"):
+                    training_ops.trainer_mount_preflight(["n82"])
+
     def test_adapter_bucket_folder_uses_hyphenated_muse_run_name(self):
         self.assertEqual(training_ops._adapter_bucket_run_folder("muse18"), "muse-18-run")
         self.assertEqual(training_ops._adapter_bucket_run_folder("muse-19"), "muse-19-run")

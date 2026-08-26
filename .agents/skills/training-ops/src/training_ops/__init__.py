@@ -7166,6 +7166,15 @@ def _mounts_in(script: Path) -> set[str]:
     return set(re.findall(r'-v "\$deployment/(\S+?)":', script.read_text()))
 
 
+def _qualification_source_paths() -> set[str]:
+    """Return the exact source inventory used by the trainer launcher."""
+    launcher = "scripts/china/cluster.sh"
+    mounted = _mounts_in(repo_root / launcher)
+    if not mounted:
+        raise Refused("trainer launcher has no repository source mounts")
+    return {launcher, *mounted}
+
+
 def mounted_files() -> list[str]:
     """The source paths that the trainer and H200 launchers mount.
 
@@ -7212,10 +7221,22 @@ def trainer_mount_preflight(nodes: list[str] | None = None) -> dict[str, str]:
             failures.append(f"{host}: manifest command failed: {output.strip()[:120]}")
             continue
         observed: dict[str, str] = {}
+        duplicates: set[str] = set()
         for line in output.splitlines():
             path, separator, digest = line.partition("\t")
             if separator:
+                if path in observed:
+                    duplicates.add(path)
                 observed[path] = digest.strip()
+        if duplicates:
+            failures.append(
+                f"{host}: duplicate trainer mount records: {', '.join(sorted(duplicates))}"
+            )
+        unexpected = sorted(set(observed) - set(expected))
+        if unexpected:
+            failures.append(
+                f"{host}: unexpected trainer mount records: {', '.join(unexpected)}"
+            )
         for path, digest in expected.items():
             actual = observed.get(path, "MISSING")
             if actual != digest:
@@ -7234,6 +7255,9 @@ def trainer_mount_preflight(nodes: list[str] | None = None) -> dict[str, str]:
 def _trainer_qualification_source_files(nodes: list[str]) -> dict[str, str]:
     source_files = trainer_mount_preflight(nodes)
     launcher = "scripts/china/cluster.sh"
+    expected_paths = _qualification_source_paths()
+    if set(source_files) != expected_paths - {launcher}:
+        raise Refused("trainer source manifest differs from launcher mounts")
     digest = hashlib.sha256((repo_root / launcher).read_bytes()).hexdigest()
     remote = f"{remote_repo}/{launcher}"
     results = _fan(
@@ -7254,7 +7278,10 @@ def _trainer_qualification_source_files(nodes: list[str]) -> dict[str, str]:
         raise Refused(
             "qualification launcher checksum differs on " + ", ".join(failures)
         )
-    return {**source_files, launcher: digest}
+    manifest = {**source_files, launcher: digest}
+    if set(manifest) != expected_paths:
+        raise Refused("trainer qualification source manifest is incomplete")
+    return manifest
 
 
 production_parity_report = "/data/glm52-rl/qualifications/glm52-policy-parity/report.json"
@@ -7942,14 +7969,22 @@ def _qualification_sources_match(
     current_sources: dict[str, str],
 ) -> bool:
     source_files = session.get("source_files")
+    try:
+        expected_paths = _qualification_source_paths()
+    except Refused:
+        return False
+    if (
+        not isinstance(current_sources, dict)
+        or set(current_sources) != expected_paths
+    ):
+        return False
     if source_files == current_sources:
         return True
     if (
         profile_name != "glm52-native-stability20"
         or not _exact_stability_recovery(result, profile)
         or not isinstance(source_files, dict)
-        or len(source_files) != 46
-        or len(current_sources) != 46
+        or set(source_files) != expected_paths
         or set(source_files) != set(current_sources)
         or source_files.get(qualification_train_source)
         != legacy_stability20_train_sha256
@@ -8047,10 +8082,9 @@ def _validate_trainer_qualification(
     source_files = session.get("source_files")
     if (
         not isinstance(source_files, dict)
-        or len(source_files) != 46
-        or "scripts/china/cluster.sh" not in source_files
+        or set(source_files) != _qualification_source_paths()
     ):
-        failures.append("qualification source file evidence is missing")
+        failures.append("qualification source file evidence differs from launcher mounts")
     elif hashlib.sha256(
         (json.dumps(source_files, sort_keys=True, separators=(",", ":")) + "\n").encode()
     ).hexdigest() != session.get("source_sha256"):
@@ -9249,8 +9283,8 @@ def production_start_preflight() -> dict[str, object]:
             host for host in trainer_hosts if host != trainer_head
         ]
         current_sources = _trainer_qualification_source_files(ranked_hosts)
-        if len(current_sources) != 46:
-            failures.append("qualification source manifest is not exactly 46 files")
+        if set(current_sources) != _qualification_source_paths():
+            failures.append("qualification source manifest differs from launcher mounts")
         current_images = _trainer_image_digest_map(
             ranked_hosts
         )
@@ -9973,8 +10007,7 @@ def _prepare_trainer_qualification_session(
     if output is None or output.parent != qualification_root:
         raise Refused("qualification output directory is not an exact child of its root")
     if (
-        len(source_files) != 46
-        or "scripts/china/cluster.sh" not in source_files
+        set(source_files) != _qualification_source_paths()
         or any(
         not isinstance(path, str)
         or not isinstance(digest, str)

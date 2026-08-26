@@ -299,6 +299,21 @@ class EdgeOperationsTest(unittest.TestCase):
                 [],
             )
 
+    def test_trainer_qualification_rejects_source_manifest_set_mismatch(self):
+        session, result, profile, now = self.qualification_evidence()
+        session["source_files"].pop(next(iter(session["source_files"])))
+        failures = training_ops._validate_trainer_qualification(
+            session, result, profile, "glm52-native-b2048", now=now
+        )
+        self.assertTrue(any("launcher mounts" in failure for failure in failures))
+
+        session, result, profile, now = self.qualification_evidence()
+        session["source_files"]["source/unexpected.py"] = "0" * 64
+        failures = training_ops._validate_trainer_qualification(
+            session, result, profile, "glm52-native-b2048", now=now
+        )
+        self.assertTrue(any("launcher mounts" in failure for failure in failures))
+
     def test_trainer_qualification_rejects_bad_batch_time_memory_and_adapter(self):
         session, result, profile, now = self.qualification_evidence(
             "glm52-native-stability20"
@@ -491,8 +506,8 @@ class EdgeOperationsTest(unittest.TestCase):
         ).open("rb") as stream:
             profile = tomllib.load(stream)
         source_files = {
-            f"source/file-{index}.py": hashlib.sha256(str(index).encode()).hexdigest()
-            for index in range(45)
+            source: hashlib.sha256(source.encode()).hexdigest()
+            for source in training_ops._qualification_source_paths()
         }
         source_files[training_ops.qualification_train_source] = (
             training_ops.legacy_stability20_train_sha256
@@ -1505,6 +1520,11 @@ class EdgeOperationsTest(unittest.TestCase):
             ),
             patch.object(
                 training_ops,
+                "_qualification_source_paths",
+                return_value={"source/a.py", "scripts/china/cluster.sh"},
+            ),
+            patch.object(
+                training_ops,
                 "_fan",
                 return_value={host: (0, digest + "\n") for host in hosts},
             ),
@@ -1522,6 +1542,11 @@ class EdgeOperationsTest(unittest.TestCase):
                 training_ops,
                 "trainer_mount_preflight",
                 return_value={"source/a.py": "a" * 64},
+            ),
+            patch.object(
+                training_ops,
+                "_qualification_source_paths",
+                return_value={"source/a.py", "scripts/china/cluster.sh"},
             ),
             patch.object(
                 training_ops,
