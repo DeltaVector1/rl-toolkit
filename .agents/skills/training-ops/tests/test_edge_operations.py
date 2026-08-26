@@ -989,7 +989,7 @@ class EdgeOperationsTest(unittest.TestCase):
                 "port": port,
                 "cmdline": training_ops._step20_adapter_tunnel_command(port),
             }
-            for port in range(18200, 18212)
+            for port in range(18200, 18208)
         ]
         with (
             patch.object(training_ops, "_download_adapter_file", side_effect=download),
@@ -1264,7 +1264,7 @@ class EdgeOperationsTest(unittest.TestCase):
         arguments = shlex.split(remote.call_args.args[1])
         self.assertIn("PRIME_GLM_ADAPTER_GZIP=1", arguments)
         self.assertIn(
-            "PRIME_ADAPTER_PORTS=18200,18201,18202,18203,18204,18205,18206,18207,18208,18209,18210,18211",
+            "PRIME_ADAPTER_PORTS=18200,18201,18202,18203,18204,18205,18206,18207",
             arguments,
         )
         self.assertIn(
@@ -1275,7 +1275,7 @@ class EdgeOperationsTest(unittest.TestCase):
     def test_step20_tunnels_record_and_clean_only_exact_processes(self):
         commands = [
             training_ops._step20_adapter_tunnel_command(port)
-            for port in range(18200, 18212)
+            for port in range(18200, 18208)
         ]
         records = [
             {"pid": 1000 + index, "cmdline": command, "port": 18200 + index}
@@ -1313,14 +1313,14 @@ class EdgeOperationsTest(unittest.TestCase):
         proven_max = (
             training_ops.step20_tunnel_attempts
             * (
-                len(training_ops.glm_adapter_tunnel_ports)
+                len(training_ops.glm_adapter_staging_tunnel_ports)
                 * training_ops.step20_tunnel_launch_stagger_seconds
                 + training_ops.step20_tunnel_start_seconds
                 + training_ops.step20_tunnel_cleanup_seconds
             )
             + training_ops.step20_tunnel_probe_seconds
         )
-        self.assertEqual(proven_max, 189.0)
+        self.assertEqual(proven_max, 186.0)
         self.assertGreaterEqual(
             training_ops.step20_tunnel_outer_timeout_seconds,
             proven_max + 60,

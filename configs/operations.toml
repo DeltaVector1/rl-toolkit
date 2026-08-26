@@ -17,6 +17,8 @@ adapter_tunnel = 18100
 glm_adapter = 8101
 glm_adapter_tunnel_first = 18200
 glm_adapter_tunnel_last = 18211
+glm_adapter_staging_tunnel_first = 18200
+glm_adapter_staging_tunnel_last = 18207
 batch = 29620
 h200_parity_backend = 8100
 
