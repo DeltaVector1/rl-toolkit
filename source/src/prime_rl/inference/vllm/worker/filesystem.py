@@ -14,6 +14,7 @@ import struct
 import tempfile
 import threading
 import time
+from urllib.error import HTTPError
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -76,6 +77,7 @@ _ADAPTER_CACHE_PARTIAL_MAX_AGE_ENV = "PRIME_LORA_CACHE_PARTIAL_MAX_AGE_SECONDS"
 _ADAPTER_CACHE_PARTIAL_MAX_AGE_SECONDS = 60 * 60
 _ADAPTER_FULL_WIRE_SIZE_ENV = "PRIME_ADAPTER_FULL_WIRE_SIZE"
 _ADAPTER_DISK_GUARD_BYTES = 256 * 1024 * 1024
+_ADAPTER_CONNECT_READ_TIMEOUT_SECONDS = 60
 _ZSTD_FRAME_BYTES = 8 * 1024 * 1024
 _zstd = None
 _LOGGER = logging.getLogger(__name__)
@@ -83,6 +85,10 @@ _LOGGER = logging.getLogger(__name__)
 
 class AdapterDiskSpaceError(OSError):
     """Raised when staging cannot safely assemble another adapter."""
+
+
+class AdapterArtifactNotFound(FileNotFoundError):
+    """Raised only when the adapter service returns HTTP 404."""
 
 
 def _zstd_library():
@@ -428,17 +434,28 @@ def _check_adapter_disk_space(
 
 def _content_length(source_urls: list[str]) -> int:
     error = None
+    not_found = None
     for source_url in source_urls:
         try:
             with urllib.request.urlopen(
-                urllib.request.Request(source_url, method="HEAD"), timeout=60
+                urllib.request.Request(source_url, method="HEAD"),
+                timeout=_ADAPTER_CONNECT_READ_TIMEOUT_SECONDS,
             ) as response:
                 total = int(response.headers["Content-Length"])
                 if total <= 0:
                     raise OSError("adapter content length is invalid")
                 return total
+        except HTTPError as failure:
+            if failure.code == 404:
+                not_found = failure
+                continue
+            error = failure
         except (KeyError, ValueError, OSError) as failure:
             error = failure
+    if error is None and not_found is not None:
+        raise AdapterArtifactNotFound(
+            f"adapter artifact was not found: {source_urls[0]}"
+        ) from not_found
     raise OSError(f"cannot read adapter content length: {error}")
 
 
@@ -484,7 +501,9 @@ def _full_wire_size_estimate(source_url: str, target_size: int) -> int | None:
             method="HEAD",
             headers={"Accept-Encoding": codec},
         )
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with urllib.request.urlopen(
+            request, timeout=_ADAPTER_CONNECT_READ_TIMEOUT_SECONDS
+        ) as response:
             raw_length = response.headers.get("X-Prime-Raw-Length")
             if raw_length is not None and int(raw_length) != target_size:
                 return None
@@ -499,7 +518,12 @@ def _full_wire_size_estimate(source_url: str, target_size: int) -> int | None:
                 return None
             value = int(response.headers["Content-Length"])
             return value if value > 0 else None
-    except (KeyError, ValueError, OSError):
+    except (KeyError, ValueError, OSError) as error:
+        _LOGGER.warning(
+            "adapter wire-size probe failed for %s: %s; delta size cannot be compared",
+            source_url,
+            error,
+        )
         return None
 
 
@@ -511,6 +535,10 @@ def _download_range(
     end: int,
     max_attempts: int = 10,
 ) -> None:
+    if not source_urls:
+        raise ValueError("adapter range source list is empty")
+    if max_attempts <= 0:
+        raise ValueError("adapter range attempt limit must be positive")
     codec = _adapter_transfer_codec()
     for attempt in range(max_attempts):
         try:
@@ -529,7 +557,9 @@ def _download_range(
             if codec != "identity":
                 headers["Accept-Encoding"] = codec
             request = urllib.request.Request(source_url, headers=headers)
-            with urllib.request.urlopen(request, timeout=60) as response:
+            with urllib.request.urlopen(
+                request, timeout=_ADAPTER_CONNECT_READ_TIMEOUT_SECONDS
+            ) as response:
                 if response.status != 206:
                     raise OSError("adapter server did not honor byte range")
                 content_range = re.fullmatch(
@@ -826,12 +856,17 @@ def _download_cli() -> int:
 
 
 def _download_optional(source_url: str, destination: Path) -> bool:
-    """Download an optional delta artifact and report absence as fallback."""
+    """Download an optional artifact; only HTTP 404 means it is absent."""
     try:
         download(source_url, destination, create_only=True)
-    except (EOFError, OSError, ValueError):
+    except (AdapterArtifactNotFound, FileNotFoundError):
         destination.unlink(missing_ok=True)
         return False
+    except (EOFError, OSError, ValueError) as error:
+        destination.unlink(missing_ok=True)
+        raise OSError(
+            f"adapter artifact transfer failed for {source_url}: {error}"
+        ) from error
     return True
 
 
@@ -1012,32 +1047,15 @@ def stage_lora_adapter_files(source_url: str) -> Path:
                                 )
                             transfer = "delta"
                         else:
-                            raise AdapterDeltaError(
-                                "adapter delta base is absent, mismatched, or too large"
+                            _LOGGER.warning(
+                                "adapter delta not selected for %s; using full transfer",
+                                source_url,
                             )
                     except AdapterDiskSpaceError:
                         raise
-                    except (AdapterDeltaError, OSError, ValueError, TypeError, KeyError):
-                        # Delta is an optimization.  A failed or ineligible
-                        # delta must select the complete current transfer.
-                        transfer = "full"
-                        if delta_path is not None:
-                            delta_path.unlink(missing_ok=True)
-                            delta_path = None
+                    except AdapterDeltaError:
                         temporary.joinpath(_ADAPTER_MODEL_NAME).unlink(missing_ok=True)
-                        if delta_manifest is not None:
-                            _check_adapter_disk_space(
-                                destination.parent,
-                                int(delta_manifest["uncompressed_size"]),
-                                int(delta_manifest["base_size"]),
-                                0,
-                                0,
-                                base_path=(
-                                    base_destination / _ADAPTER_MODEL_NAME
-                                    if base_destination is not None
-                                    else None
-                                ),
-                            )
+                        raise
 
             if transfer == "full":
                 download(

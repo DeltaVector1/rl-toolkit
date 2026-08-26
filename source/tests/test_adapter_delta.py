@@ -485,7 +485,7 @@ class AdapterDeltaTest(unittest.TestCase):
                 destination = filesystem.stage_lora_adapter_files("http://adapter/source")
             self.assertTrue(destination.joinpath("READY").is_file())
 
-    def test_failed_delta_is_removed_before_full_fallback(self) -> None:
+    def test_failed_delta_is_terminal_before_full_transfer(self) -> None:
         filesystem = _load_filesystem_module()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -526,10 +526,16 @@ class AdapterDeltaTest(unittest.TestCase):
                     "apply_adapter_delta",
                     side_effect=filesystem.AdapterDeltaError("corrupt delta"),
                 ):
-                    destination = filesystem.stage_lora_adapter_files("http://adapter/two")
-            self.assertTrue(destination.joinpath("READY").is_file())
+                    with self.assertRaisesRegex(filesystem.AdapterDeltaError, "corrupt delta"):
+                        filesystem.stage_lora_adapter_files("http://adapter/two")
             self.assertFalse(delta_present_during_full)
-            self.assertTrue(any(url.endswith("/adapter_model.safetensors") for url in calls))
+            self.assertFalse(
+                any(
+                    url.endswith("/adapter_model.safetensors")
+                    and "/two/" in url
+                    for url in calls
+                )
+            )
 
     def test_cache_hit_keeps_valid_adjacent_base(self) -> None:
         filesystem = _load_filesystem_module()
@@ -657,6 +663,24 @@ class AdapterDeltaTest(unittest.TestCase):
             ),
             "full",
         )
+
+    def test_optional_transport_failure_is_not_treated_as_missing(self) -> None:
+        filesystem = _load_filesystem_module()
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "artifact"
+            with patch.object(
+                filesystem,
+                "download",
+                side_effect=ConnectionRefusedError("tunnel is down"),
+            ):
+                with self.assertRaisesRegex(
+                    OSError, "adapter artifact transfer failed"
+                ):
+                    filesystem._download_optional(
+                        "http://127.0.0.1:39219/step/adapter_delta.json",
+                        destination,
+                    )
+            self.assertFalse(destination.exists())
 
 
 if __name__ == "__main__":
