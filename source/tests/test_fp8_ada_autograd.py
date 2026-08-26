@@ -167,8 +167,9 @@ def _expanded_block_scale(scale: torch.Tensor, shape: tuple[int, int]):
 
 
 class FP8AdaAutogradTest(unittest.TestCase):
-    def test_grouped_lora_backward_matches_autograd(self):
+    def test_grouped_lora_backward_matches_autograd_with_non_power_of_two_scaling(self):
         torch.manual_seed(13)
+        scaling = 0.73
         offsets = torch.tensor([2, 2, 7], dtype=torch.int32)
         x = torch.randn(7, 40, dtype=torch.bfloat16)
         a = torch.randn(3, 32, 40, dtype=torch.bfloat16)
@@ -209,7 +210,7 @@ class FP8AdaAutogradTest(unittest.TestCase):
                 expected = torch.autograd.grad(
                     output,
                     (x_ref, a_ref, b_ref),
-                    grad_outputs=grad,
+                    grad_outputs=grad * scaling,
                 )
             grad_a = torch.zeros_like(a)
             grad_b = torch.zeros_like(b)
@@ -227,6 +228,7 @@ class FP8AdaAutogradTest(unittest.TestCase):
                     grad_a,
                     grad_b,
                     low_rank=saved_low_rank.detach(),
+                    scaling=scaling,
                 )
 
         for value, reference in zip(
@@ -247,6 +249,36 @@ class FP8AdaAutogradTest(unittest.TestCase):
                 torch.zeros(1, 16, 8, dtype=torch.bfloat16),
                 torch.zeros(1, 8, 16, dtype=torch.bfloat16),
             )
+
+    def test_grouped_lora_backward_rejects_invalid_saved_low_rank_shape(self):
+        with self.assertRaisesRegex(ValueError, "saved expert LoRA low-rank activation"):
+            fp8_ada._grouped_lora_backward(
+                torch.empty(2, 8, dtype=torch.bfloat16),
+                torch.empty(1, 32, 8, dtype=torch.bfloat16),
+                torch.empty(1, 8, 32, dtype=torch.bfloat16),
+                torch.tensor([2], dtype=torch.int32),
+                torch.empty(2, 8, dtype=torch.bfloat16),
+                torch.zeros(1, 32, 8, dtype=torch.bfloat16),
+                torch.zeros(1, 8, 32, dtype=torch.bfloat16),
+                low_rank=torch.empty(1, 32, dtype=torch.bfloat16),
+            )
+
+    def test_route_score_gradient_preserves_activation_and_score_dtypes(self):
+        torch.manual_seed(23)
+        x = torch.randn(7, 5, dtype=torch.bfloat16, requires_grad=True)
+        scores = torch.rand(7, dtype=torch.float32, requires_grad=True)
+        upstream = torch.randn(7, 5, dtype=torch.bfloat16)
+
+        output = fp8_ada.scale_routed_output(x, scores, chunk_rows=3)
+        self.assertEqual(output.dtype, torch.bfloat16)
+        output.backward(upstream)
+
+        expected_x = (upstream.float() * scores.detach()[:, None]).to(x.dtype)
+        expected_scores = (upstream.float() * x.detach().float()).sum(dim=-1)
+        self.assertEqual(x.grad.dtype, torch.bfloat16)
+        self.assertEqual(scores.grad.dtype, torch.float32)
+        torch.testing.assert_close(x.grad, expected_x, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(scores.grad, expected_scores, rtol=0.0, atol=0.0)
 
     def test_dequant_weight_expands_each_128_square_block(self):
         weight = (

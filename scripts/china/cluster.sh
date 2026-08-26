@@ -135,7 +135,7 @@ case ${1:-} in
     if [ "$rank" -lt 0 ]; then
       echo "node $node is not in trainer_nodes ($trainer_nodes)" >&2; exit 1
     fi
-    IFS='|' read -r rollout_transport trainer_output trainer_only parity_trace_dir parity_trace_source parity_pp parity_cp parity_batch parity_max_calls parity_max_files parity_max_bytes parity_diagnostics parity_diagnostic_tokens parity_diagnostic_max_files parity_diagnostic_max_bytes configured_int4_combine_rounds configured_fp8_expert_activation_offload configured_lora_mm_profile configured_profile_requested configured_profile_pp_stage configured_ep_profile configured_ep_profile_every configured_expert_profile_every configured_layer_profile_every < <(
+    IFS='|' read -r rollout_transport trainer_output trainer_only parity_trace_dir parity_trace_source parity_pp parity_cp parity_batch parity_max_calls parity_max_files parity_max_bytes parity_diagnostics parity_diagnostic_tokens parity_diagnostic_max_files parity_diagnostic_max_bytes configured_int4_combine_rounds configured_fp8_expert_activation_offload configured_lora_mm_profile configured_profile_requested configured_profile_pp_stage configured_ep_profile configured_ep_profile_every configured_expert_profile_every configured_layer_profile_every configured_expert_phase_profile configured_expert_phase_profile_every < <(
       python3 - "$trainer_config" <<'PY'
 import sys
 import tomllib
@@ -164,6 +164,14 @@ profile_present = tuple(name in env_vars for name in profile_names)
 if any(profile_present) and not all(profile_present):
     raise SystemExit("trainer config must define every CUDA profiling value or none")
 profile_env = (int(all(profile_present)), *(env_vars.get(name, "") for name in profile_names))
+phase_profile_names = (
+    "PRIME_EXPERT_PHASE_PROFILE",
+    "PRIME_EXPERT_PHASE_PROFILE_EVERY",
+)
+phase_profile_present = tuple(name in env_vars for name in phase_profile_names)
+if any(phase_profile_present) and not all(phase_profile_present):
+    raise SystemExit("trainer config must define every expert phase profiling value or none")
+phase_profile_env = tuple(env_vars.get(name, "") for name in phase_profile_names)
 values = (
     config["rollout_transport"]["type"],
     config["output_dir"],
@@ -182,6 +190,7 @@ values = (
     env_vars.get("PRIME_PARITY_DIAGNOSTIC_MAX_BYTES", ""),
     *memory_env,
     *profile_env,
+    *phase_profile_env,
 )
 if any(any(char in str(value) for char in "|\r\n") for value in values):
     raise SystemExit("trainer config value contains the parser separator")
@@ -499,6 +508,8 @@ PY
       -e PRIME_EP_PROFILE_EVERY="$ep_profile_every" \
       -e PRIME_EXPERT_PROFILE_EVERY="$expert_profile_every" \
       -e PRIME_LAYER_PROFILE_EVERY="$layer_profile_every" \
+      -e PRIME_EXPERT_PHASE_PROFILE="${configured_expert_phase_profile:-0}" \
+      -e PRIME_EXPERT_PHASE_PROFILE_EVERY="${configured_expert_phase_profile_every:-180}" \
       -e PRIME_BIND_GPU_NUMA="${PRIME_BIND_GPU_NUMA:-0}" \
       -e PRIME_NCCL_CHANNELS="$nccl_channels" \
       -e PRIME_PROFILE_PP_STAGE="$profile_pp_stage" \
