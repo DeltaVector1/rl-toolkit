@@ -46,7 +46,7 @@ def _configure(path: Path) -> None:
         raise RuntimeError("GLM adapter port inventory is invalid")
     configured_ports = tuple(range(first, last + 1))
     if (
-        len(configured_ports) != 12
+        len(configured_ports) != 8
         or any(not 1 <= port <= 65535 for port in (*configured_ports, backend, shared))
         or shared in configured_ports
         or not root.is_absolute()

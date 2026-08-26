@@ -1313,7 +1313,7 @@ class EdgeOperationsTest(unittest.TestCase):
         proven_max = (
             training_ops.step20_tunnel_attempts
             * (
-                len(training_ops.glm_adapter_staging_tunnel_ports)
+                len(training_ops.glm_adapter_tunnel_ports)
                 * training_ops.step20_tunnel_launch_stagger_seconds
                 + training_ops.step20_tunnel_start_seconds
                 + training_ops.step20_tunnel_cleanup_seconds
@@ -4040,8 +4040,8 @@ raise SystemExit(99)
             mode="rl",
             adapter="000",
             glm_adapter="200",
-            glm_tunnels_recorded=12,
-            glm_tunnels_healthy=12,
+            glm_tunnels_recorded=8,
+            glm_tunnels_healthy=8,
             glm_tunnels_committed=True,
         )
         warnings = training_ops._warnings(status)
@@ -4051,7 +4051,7 @@ raise SystemExit(99)
         self.assertFalse(any("GLM adapter tunnels" in warning for warning in warnings))
         self.assertIn("Muse/raw 8100 000", report)
         self.assertIn("GLM/gzip 8101 200", report)
-        self.assertIn("GLM tunnels 12/12 recorded, committed=yes", report)
+        self.assertIn("GLM tunnels 8/8 recorded, committed=yes", report)
         self.assertIn("http://127.0.0.1:8101/", training_ops._head_script())
         self.assertIn(
             "glm_adapter_tunnels.py --operations "

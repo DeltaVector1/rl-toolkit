@@ -186,7 +186,7 @@ class GlmAdapterTunnelTest(unittest.TestCase):
                 launch_id = tunnels.start()
                 self.assertEqual(
                     tunnels.status(),
-                    {"recorded": 12, "healthy": 12, "committed": False},
+                    {"recorded": 8, "healthy": 8, "committed": False},
                 )
                 tunnels.commit(launch_id)
                 self.assertTrue(tunnels.status()["committed"])

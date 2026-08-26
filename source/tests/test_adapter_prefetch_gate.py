@@ -30,14 +30,12 @@ class AdapterPrefetchGateTest(unittest.TestCase):
         pull = SYNC.split("pull_stable_markers()", 1)[1].split("\n}\n", 1)[0]
         self.assertIn('prefetch_adapter "$relative" || continue', pull)
 
-    def test_glm_adapter_uses_twelve_independent_range_streams(self):
+    def test_glm_adapter_uses_eight_independent_range_streams(self):
         inventory = OPERATIONS["ports"]
         self.assertEqual(inventory["adapter_tunnel"], 18100)
         self.assertEqual(inventory["glm_adapter"], 8101)
         self.assertEqual(inventory["glm_adapter_tunnel_first"], 18200)
-        self.assertEqual(inventory["glm_adapter_tunnel_last"], 18211)
-        self.assertEqual(inventory["glm_adapter_staging_tunnel_first"], 18200)
-        self.assertEqual(inventory["glm_adapter_staging_tunnel_last"], 18207)
+        self.assertEqual(inventory["glm_adapter_tunnel_last"], 18207)
         ports = " ".join(
             str(port)
             for port in range(
