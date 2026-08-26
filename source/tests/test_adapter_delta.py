@@ -15,6 +15,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.error import HTTPError
 from unittest.mock import patch
 
 from prime_rl.utils.adapter_delta import (
@@ -274,9 +275,8 @@ class AdapterDeltaTest(unittest.TestCase):
             with patch.dict(os.environ, {"PRIME_ADAPTER_FULL_WIRE_SIZE": ""}), patch.object(
                 filesystem.urllib.request, "urlopen", side_effect=OSError("no HEAD")
             ):
-                self.assertIsNone(
+                with self.assertRaisesRegex(OSError, "comparison HEAD failed"):
                     filesystem._full_wire_size_estimate("http://adapter/model", 100)
-                )
             class Response:
                 headers = {
                     "X-Prime-Wire-Length": "80",
@@ -292,6 +292,16 @@ class AdapterDeltaTest(unittest.TestCase):
 
             with patch.dict(os.environ, {"PRIME_ADAPTER_FULL_WIRE_SIZE": ""}), patch.object(
                 filesystem.urllib.request, "urlopen", return_value=Response()
+            ):
+                with self.assertRaisesRegex(OSError, "raw length differs"):
+                    filesystem._full_wire_size_estimate("http://adapter/model", 100)
+
+            with patch.dict(os.environ, {"PRIME_ADAPTER_FULL_WIRE_SIZE": ""}), patch.object(
+                filesystem.urllib.request,
+                "urlopen",
+                side_effect=HTTPError(
+                    "http://adapter/model", 404, "not found", {}, None
+                ),
             ):
                 self.assertIsNone(
                     filesystem._full_wire_size_estimate("http://adapter/model", 100)
@@ -529,6 +539,50 @@ class AdapterDeltaTest(unittest.TestCase):
                     with self.assertRaisesRegex(filesystem.AdapterDeltaError, "corrupt delta"):
                         filesystem.stage_lora_adapter_files("http://adapter/two")
             self.assertFalse(delta_present_during_full)
+            self.assertFalse(
+                any(
+                    url.endswith("/adapter_model.safetensors")
+                    and "/two/" in url
+                    for url in calls
+                )
+            )
+
+    def test_failed_full_wire_comparison_is_terminal_before_full_transfer(self) -> None:
+        filesystem = _load_filesystem_module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sources = {
+                "one": _export(root, "one", b"a" * 8192),
+                "two": _export(root, "two", b"a" * 8191 + b"b"),
+            }
+            build_adapter_delta(sources["one"], sources["two"], max_ratio=0.99)
+            calls: list[str] = []
+
+            def fake_download(source_url, destination, create_only=False, **_kwargs):
+                calls.append(source_url)
+                step, filename = source_url.rstrip("/").split("/")[-2:]
+                source = sources[step] / filename
+                if not source.is_file():
+                    raise FileNotFoundError(source)
+                shutil.copyfile(source, destination)
+
+            with patch.dict(
+                os.environ,
+                {
+                    "PRIME_LORA_CACHE_DIR": str(root / "cache"),
+                    "PRIME_ADAPTER_DELTA": "1",
+                    "PRIME_GLM_ADAPTER_CODEC": "gzip",
+                    "PRIME_ADAPTER_FULL_WIRE_SIZE": "",
+                },
+                clear=False,
+            ), patch.object(filesystem, "download", side_effect=fake_download), patch.object(
+                filesystem,
+                "_full_wire_size_estimate",
+                side_effect=OSError("comparison HEAD failed"),
+            ):
+                filesystem.stage_lora_adapter_files("http://adapter/one")
+                with self.assertRaisesRegex(OSError, "comparison HEAD failed"):
+                    filesystem.stage_lora_adapter_files("http://adapter/two")
             self.assertFalse(
                 any(
                     url.endswith("/adapter_model.safetensors")

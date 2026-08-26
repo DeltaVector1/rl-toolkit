@@ -501,23 +501,22 @@ def _adapter_delta_codec_supported(codec: str) -> bool:
 
 
 def _full_wire_size_estimate(source_url: str, target_size: int) -> int | None:
-    """Get a current complete-transfer size without downloading the model."""
+    """Get a complete-transfer size; only HTTP 404 means unavailable."""
     configured = os.environ.get(_ADAPTER_FULL_WIRE_SIZE_ENV)
-    if configured is not None:
+    if configured:
         try:
             value = int(configured)
-        except ValueError:
-            return None
-        return value if value > 0 else None
-    try:
-        codec = _adapter_transfer_codec()
-    except OSError:
-        return None
+        except ValueError as error:
+            raise OSError("configured adapter wire size is invalid") from error
+        if value <= 0:
+            raise OSError("configured adapter wire size is invalid")
+        return value
+    codec = _adapter_transfer_codec()
     if codec == "identity":
         # The sidecar is an exact byte count for the normal uncompressed path.
         return target_size
     if codec not in {"gzip", "zstd"}:
-        return None
+        raise OSError(f"adapter wire-size comparison codec is unsupported: {codec}")
     try:
         request = urllib.request.Request(
             source_url,
@@ -529,25 +528,32 @@ def _full_wire_size_estimate(source_url: str, target_size: int) -> int | None:
         ) as response:
             raw_length = response.headers.get("X-Prime-Raw-Length")
             if raw_length is not None and int(raw_length) != target_size:
-                return None
+                raise OSError("adapter wire-size comparison raw length differs")
             wire_codec = response.headers.get("X-Prime-Wire-Codec")
             if wire_codec is not None and wire_codec.lower() != codec:
-                return None
+                raise OSError("adapter wire-size comparison codec differs")
             explicit = response.headers.get("X-Prime-Wire-Length")
             if explicit is not None:
                 value = int(explicit)
-                return value if value > 0 else None
+                if value <= 0:
+                    raise OSError("adapter wire-size comparison length is invalid")
+                return value
             if response.headers.get("Content-Encoding", "").lower() != codec:
-                return None
+                raise OSError("adapter wire-size comparison lacks encoded length")
             value = int(response.headers["Content-Length"])
-            return value if value > 0 else None
+            if value <= 0:
+                raise OSError("adapter wire-size comparison length is invalid")
+            return value
+    except HTTPError as error:
+        if error.code == 404:
+            return None
+        raise OSError(
+            f"adapter wire-size comparison HEAD failed for {source_url}: HTTP {error.code}"
+        ) from error
     except (KeyError, ValueError, OSError) as error:
-        _LOGGER.warning(
-            "adapter wire-size probe failed for %s: %s; delta size cannot be compared",
-            source_url,
-            error,
-        )
-        return None
+        raise OSError(
+            f"adapter wire-size comparison HEAD failed for {source_url}: {error}"
+        ) from error
 
 
 def _download_range(
@@ -746,10 +752,11 @@ def download(
         1,
         int(os.environ.get("PRIME_ADAPTER_DOWNLOAD_STREAMS", str(_PARALLEL_DOWNLOAD_STREAMS))),
     )
-    glm_gzip = os.environ.get(_GLM_RANGE_GZIP_ENV, "0") == "1"
+    codec = _adapter_transfer_codec()
+    compressed = codec != "identity"
     if total < _PARALLEL_DOWNLOAD_THRESHOLD or streams == 1:
-        range_urls = source_urls if glm_gzip else [source_url]
-        attempts = len(range_urls) if glm_gzip else 10
+        range_urls = source_urls if compressed else [source_url]
+        attempts = len(range_urls) if compressed else 10
         if not create_only:
             _download_range(
                 range_urls, 0, destination, 0, total - 1, max_attempts=attempts
@@ -763,7 +770,7 @@ def download(
             )
             _publish_download(assembling, destination, True)
         except BaseException as error:
-            if glm_gzip:
+            if compressed:
                 try:
                     assembling.unlink(missing_ok=True)
                 except OSError as cleanup_error:
@@ -782,7 +789,7 @@ def download(
         raise OSError(f"adapter parts path is unsafe: {parts}")
     chunk = (
         _GLM_RANGE_CHUNK_BYTES
-        if glm_gzip
+        if compressed
         else (total + streams - 1) // streams
     )
     ranges = [
@@ -790,7 +797,7 @@ def download(
         for index, start in enumerate(range(0, total, chunk))
     ]
     try:
-        if glm_gzip:
+        if compressed:
             attempts = _download_glm_chunks(source_urls, parts, ranges)
             if _attempt_report is not None:
                 _attempt_report.extend(attempts)
@@ -814,7 +821,7 @@ def download(
             for index, start, end in ranges:
                 name = (
                     f"part-{index:06d}-{start:012x}-{end:012x}"
-                    if glm_gzip
+                    if compressed
                     else f"part-{index:03d}"
                 )
                 with (parts / name).open("rb") as part:
@@ -823,7 +830,7 @@ def download(
             raise OSError(f"assembled adapter file has the wrong size: {destination.name}")
         _publish_download(assembling, destination, create_only)
     except BaseException as error:
-        if glm_gzip:
+        if compressed:
             try:
                 assembling.unlink(missing_ok=True)
             except OSError as cleanup_error:
