@@ -48,6 +48,27 @@ def _interval_union(intervals: Sequence[tuple[float, float]]) -> float:
     return total + end - start
 
 
+def _reduce_inclusive_union_overlap(
+    values: Sequence[Mapping[str, Any]],
+    *,
+    inclusive_key: str,
+    union_key: str,
+    overlap_key: str,
+) -> tuple[float, float, float]:
+    """Reduce inclusive, union, and overlap after computing them per rank."""
+    per_rank = []
+    for value in values:
+        inclusive = float(value.get(inclusive_key, 0.0))
+        union = float(value.get(union_key, 0.0))
+        overlap = value.get(overlap_key)
+        if overlap is None:
+            overlap = max(0.0, inclusive - union)
+        per_rank.append((inclusive, union, max(0.0, float(overlap))))
+    if not per_rank:
+        return 0.0, 0.0, 0.0
+    return tuple(max(row[index] for row in per_rank) for index in range(3))
+
+
 class PipelineTiming:
     """Small opt-in timing collector for one trainer rank.
 
@@ -163,7 +184,7 @@ class PipelineTiming:
 
     @staticmethod
     def format_reports(reports: Sequence[dict[str, Any]], baseline_s: float = 233.675) -> str:
-        """Format max-per-stage timings without emitting per-call records."""
+        """Format per-rank-reduced timings without emitting per-call records."""
         if not reports:
             return "[pp-timing] no rank reports"
         by_stage: dict[int, list[dict[str, Any]]] = {}
@@ -174,26 +195,41 @@ class PipelineTiming:
             rows = by_stage[stage]
             schedule = max(float(row["schedule_s"]) for row in rows)
             all_rows = [row["summary"]["all"] for row in rows]
-            all_union = max(float(row["union_s"]) for row in all_rows)
-            all_inclusive = max(float(row["inclusive_s"]) for row in all_rows)
+            all_inclusive, all_union, all_overlap = _reduce_inclusive_union_overlap(
+                all_rows,
+                inclusive_key="inclusive_s",
+                union_key="union_s",
+                overlap_key="overlap_s",
+            )
+            residual_host = max(
+                max(
+                    0.0,
+                    float(row["schedule_s"])
+                    - float(row["summary"]["all"].get("union_s", 0.0)),
+                )
+                for row in rows
+            )
             lines.append(
                 f"[pp-timing] stage={stage} schedule={schedule:.3f}s "
                 f"delta_vs_clean={schedule - baseline_s:+.3f}s "
                 f"all_inclusive={all_inclusive:.3f}s all_union={all_union:.3f}s "
-                f"all_overlap={max(0.0, all_inclusive - all_union):.3f}s "
-                f"residual_host={max(0.0, schedule - all_union):.3f}s"
+                f"all_overlap={all_overlap:.3f}s residual_host={residual_host:.3f}s"
             )
             names = sorted({name for row in rows for name in row["summary"]["categories"]})
             for name in names:
                 values = [row["summary"]["categories"].get(name, {}) for row in rows]
-                host_inclusive = max(float(value.get("host_inclusive_s", 0.0)) for value in values)
-                host_union = max(float(value.get("host_union_s", 0.0)) for value in values)
+                host_inclusive, host_union, host_overlap = _reduce_inclusive_union_overlap(
+                    values,
+                    inclusive_key="host_inclusive_s",
+                    union_key="host_union_s",
+                    overlap_key="host_overlap_s",
+                )
                 cuda_inclusive = max(float(value.get("cuda_inclusive_s", 0.0)) for value in values)
                 count = sum(int(value.get("count", 0)) for value in values)
                 lines.append(
                     f"[pp-timing] stage={stage} category={name} count={count} "
                     f"host_inclusive={host_inclusive:.3f}s host_union={host_union:.3f}s "
-                    f"host_overlap={max(0.0, host_inclusive - host_union):.3f}s "
+                    f"host_overlap={host_overlap:.3f}s "
                     f"cuda_inclusive={cuda_inclusive:.3f}s"
                 )
         return "\n".join(lines)

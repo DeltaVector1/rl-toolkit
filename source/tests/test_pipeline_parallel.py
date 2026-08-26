@@ -271,6 +271,84 @@ class SideInputKeyTest(unittest.TestCase):
         self.assertEqual(summary["all"]["union_s"], 4.0)
         self.assertEqual(summary["all"]["overlap_s"], 1.0)
 
+    def test_pipeline_timing_reduces_rank_metrics_without_mixing(self):
+        reports = [
+            {
+                "rank": 0,
+                "stage": 0,
+                "schedule_s": 18.0,
+                "summary": {
+                    "all": {
+                        "inclusive_s": 12.0,
+                        "union_s": 10.0,
+                        "overlap_s": 2.0,
+                    },
+                    "categories": {
+                        "cp.gather_grad": {
+                            "count": 2,
+                            "host_inclusive_s": 5.0,
+                            "host_union_s": 3.0,
+                            "host_overlap_s": 2.0,
+                            "cuda_inclusive_s": 4.0,
+                        },
+                        "pp.p2p_wait": {
+                            "count": 2,
+                            "host_inclusive_s": 12.0,
+                            "host_union_s": 10.0,
+                            "host_overlap_s": 2.0,
+                            "cuda_inclusive_s": 9.0,
+                        },
+                    },
+                },
+            },
+            {
+                "rank": 1,
+                "stage": 0,
+                "schedule_s": 24.0,
+                "summary": {
+                    "all": {
+                        "inclusive_s": 16.0,
+                        "union_s": 8.0,
+                        "overlap_s": 8.0,
+                    },
+                    "categories": {
+                        "cp.gather_grad": {
+                            "count": 3,
+                            "host_inclusive_s": 4.0,
+                            "host_union_s": 4.0,
+                            "host_overlap_s": 0.0,
+                            "cuda_inclusive_s": 6.0,
+                        },
+                        "pp.p2p_wait": {
+                            "count": 3,
+                            "host_inclusive_s": 16.0,
+                            "host_union_s": 8.0,
+                            "host_overlap_s": 8.0,
+                            "cuda_inclusive_s": 7.0,
+                        },
+                    },
+                },
+            },
+        ]
+
+        report = self.runner.PipelineTiming.format_reports(reports, baseline_s=0.0)
+
+        self.assertIn(
+            "all_inclusive=16.000s all_union=10.000s all_overlap=8.000s "
+            "residual_host=16.000s",
+            report,
+        )
+        self.assertIn(
+            "category=cp.gather_grad count=5 host_inclusive=5.000s "
+            "host_union=4.000s host_overlap=2.000s cuda_inclusive=6.000s",
+            report,
+        )
+        self.assertIn(
+            "category=pp.p2p_wait count=5 host_inclusive=16.000s "
+            "host_union=10.000s host_overlap=8.000s cuda_inclusive=9.000s",
+            report,
+        )
+
     def test_missing_and_duplicate_side_inputs_fail_closed(self):
         stage = self.runner.PipelineStageModule(
             model=object(), is_first=False, is_last=False, stage_identity=3
