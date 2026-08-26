@@ -512,6 +512,7 @@ PY
       -v "$deployment/source/src/prime_rl/utils/cp.py":/app/src/prime_rl/utils/cp.py:ro \
       -v "$deployment/source/src/prime_rl/utils/checkpoint_delta.py":/app/src/prime_rl/utils/checkpoint_delta.py:ro \
       -v "$deployment/source/src/prime_rl/utils/adapter_delta.py":/app/src/prime_rl/utils/adapter_delta.py:ro \
+      -v "$deployment/source/src/prime_rl/utils/adapter_references.py":/app/src/prime_rl/utils/adapter_references.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/rl/train.py":/app/src/prime_rl/trainer/rl/train.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/rl/token_export.py":/app/src/prime_rl/trainer/rl/token_export.py:ro \
       -v "$deployment/source/src/prime_rl/parity_router_trace.py":/app/src/prime_rl/parity_router_trace.py:ro \
@@ -603,6 +604,7 @@ PY
       -v "$deployment/source/src/prime_rl/utils/client.py":/app/src/prime_rl/utils/client.py:ro \
       -v "$deployment/source/src/prime_rl/utils/checkpoint_delta.py":/app/src/prime_rl/utils/checkpoint_delta.py:ro \
       -v "$deployment/source/src/prime_rl/utils/adapter_delta.py":/app/src/prime_rl/utils/adapter_delta.py:ro \
+      -v "$deployment/source/src/prime_rl/utils/adapter_references.py":/app/src/prime_rl/utils/adapter_references.py:ro \
       --entrypoint /app/.venv/bin/orchestrator "$image" \
       @ "$orchestrator_config/orchestrator${CONFIG_TAG}.toml"
     ;;

@@ -54,6 +54,7 @@ start_replica() {
   -v "$deployment/source/src/prime_rl/inference/vllm/worker/filesystem.py":"$runtime/prime_rl/inference/vllm/worker/filesystem.py":ro \
   -v "$deployment/source/src/prime_rl/utils/checkpoint_delta.py":"$runtime/prime_rl/utils/checkpoint_delta.py":ro \
   -v "$deployment/source/src/prime_rl/utils/adapter_delta.py":"$runtime/prime_rl/utils/adapter_delta.py":ro \
+  -v "$deployment/source/src/prime_rl/utils/adapter_references.py":"$runtime/prime_rl/utils/adapter_references.py":ro \
   -e PYTHONPATH="$runtime" \
   -e MUSE_TP_SIZE="$tp_size" \
   -e VLLM_PLUGINS=muse_file_server \

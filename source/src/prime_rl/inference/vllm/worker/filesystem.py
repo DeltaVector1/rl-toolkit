@@ -34,7 +34,15 @@ try:
         safetensors_metadata_sha256,
         select_adapter_transfer,
     )
-except ModuleNotFoundError:  # unit tests load this worker file in isolation
+    from prime_rl.utils.adapter_references import (
+        ADAPTER_REFERENCE_HEADER,
+        ADAPTER_REFERENCE_MANIFEST,
+        ADAPTER_REFERENCE_PAYLOAD,
+        AdapterReferenceError,
+        apply_adapter_references,
+        load_adapter_reference_manifest,
+    )
+except (AttributeError, ModuleNotFoundError):  # unit tests load this worker file in isolation
     import importlib.util
 
     _adapter_delta_path = Path(__file__).parents[3] / "utils" / "adapter_delta.py"
@@ -54,6 +62,20 @@ except ModuleNotFoundError:  # unit tests load this worker file in isolation
     load_adapter_delta_manifest = _adapter_delta_module.load_adapter_delta_manifest
     safetensors_metadata_sha256 = _adapter_delta_module.safetensors_metadata_sha256
     select_adapter_transfer = _adapter_delta_module.select_adapter_transfer
+    _adapter_reference_path = Path(__file__).parents[3] / "utils" / "adapter_references.py"
+    _adapter_reference_spec = importlib.util.spec_from_file_location(
+        "prime_rl_utils_adapter_references", _adapter_reference_path
+    )
+    if _adapter_reference_spec is None or _adapter_reference_spec.loader is None:
+        raise
+    _adapter_reference_module = importlib.util.module_from_spec(_adapter_reference_spec)
+    _adapter_reference_spec.loader.exec_module(_adapter_reference_module)
+    ADAPTER_REFERENCE_HEADER = _adapter_reference_module.ADAPTER_REFERENCE_HEADER
+    ADAPTER_REFERENCE_MANIFEST = _adapter_reference_module.ADAPTER_REFERENCE_MANIFEST
+    ADAPTER_REFERENCE_PAYLOAD = _adapter_reference_module.ADAPTER_REFERENCE_PAYLOAD
+    AdapterReferenceError = _adapter_reference_module.AdapterReferenceError
+    apply_adapter_references = _adapter_reference_module.apply_adapter_references
+    load_adapter_reference_manifest = _adapter_reference_module.load_adapter_reference_manifest
 
 _PARALLEL_DOWNLOAD_THRESHOLD = 16 * 1024 * 1024
 _PARALLEL_DOWNLOAD_STREAMS = 8
@@ -76,6 +98,7 @@ _ADAPTER_CACHE_MAX_STALE_ENTRIES = 1
 _ADAPTER_CACHE_PARTIAL_MAX_AGE_ENV = "PRIME_LORA_CACHE_PARTIAL_MAX_AGE_SECONDS"
 _ADAPTER_CACHE_PARTIAL_MAX_AGE_SECONDS = 60 * 60
 _ADAPTER_FULL_WIRE_SIZE_ENV = "PRIME_ADAPTER_FULL_WIRE_SIZE"
+_ADAPTER_REFERENCES_ENABLE_ENV = "PRIME_ADAPTER_REFERENCES"
 _ADAPTER_DISK_GUARD_BYTES = 256 * 1024 * 1024
 _ADAPTER_CONNECT_READ_TIMEOUT_SECONDS = 60
 _ZSTD_FRAME_BYTES = 8 * 1024 * 1024
@@ -877,8 +900,15 @@ def _delta_enabled() -> bool:
     return value == "1"
 
 
+def _references_enabled() -> bool:
+    value = os.environ.get(_ADAPTER_REFERENCES_ENABLE_ENV, "0")
+    if value not in {"0", "1"}:
+        raise OSError(f"{_ADAPTER_REFERENCES_ENABLE_ENV} must be 0 or 1")
+    return value == "1"
+
+
 def stage_lora_adapter_files(source_url: str) -> Path:
-    """Stage one adapter, using an exact adjacent delta only when enabled.
+    """Stage one adapter, using opt-in exact delta or reference transfer.
 
     The complete adapter is downloaded into a unique directory.  The active
     cache directory is changed only after the complete model, checksum,
@@ -892,6 +922,7 @@ def stage_lora_adapter_files(source_url: str) -> Path:
         )
         try:
             delta_requested = _delta_enabled()
+            references_requested = _references_enabled()
             transfer_codec = _adapter_transfer_codec()
             delta_enabled = delta_requested and _adapter_delta_codec_supported(
                 transfer_codec
@@ -1056,6 +1087,104 @@ def stage_lora_adapter_files(source_url: str) -> Path:
                     except AdapterDeltaError:
                         temporary.joinpath(_ADAPTER_MODEL_NAME).unlink(missing_ok=True)
                         raise
+
+            if transfer == "full" and references_requested:
+                reference_manifest_path = temporary / ADAPTER_REFERENCE_MANIFEST
+                reference_available = _download_optional(
+                    f"{source_url.rstrip('/')}/{ADAPTER_REFERENCE_MANIFEST}",
+                    reference_manifest_path,
+                )
+                if not reference_available:
+                    _LOGGER.info(
+                        "adapter references unavailable; using full transfer"
+                    )
+                else:
+                    reference_header_path = temporary / ADAPTER_REFERENCE_HEADER
+                    reference_payload_path = temporary / ADAPTER_REFERENCE_PAYLOAD
+                    try:
+                        reference_manifest = load_adapter_reference_manifest(
+                            reference_manifest_path
+                        )
+                        reference_target = {
+                            "target_sha256": target_sha256,
+                            "adapter_config_sha256": basic_identity[
+                                "adapter_config_sha256"
+                            ],
+                            "target_size": int(reference_manifest["target_size"]),
+                        }
+                        if any(
+                            reference_manifest.get(key) != value
+                            for key, value in reference_target.items()
+                        ):
+                            raise AdapterReferenceError(
+                                "reference target identity differs"
+                            )
+                        reference_payload_size = int(
+                            reference_manifest["unique_payload_size"]
+                        )
+                        reference_header_size = int(reference_manifest["header_size"])
+                        reference_manifest_size = reference_manifest_path.stat().st_size
+                        if (
+                            reference_payload_size
+                            + reference_header_size
+                            + reference_manifest_size
+                            >= int(reference_manifest["target_size"])
+                        ):
+                            raise AdapterReferenceError(
+                                "reference package is not smaller than the adapter"
+                            )
+                        _check_adapter_disk_space(
+                            destination.parent,
+                            int(reference_manifest["target_size"]),
+                            int(delta_manifest["base_size"])
+                            if delta_manifest is not None
+                            else 0,
+                            reference_payload_size + reference_header_size,
+                            reference_manifest_size,
+                            base_path=(
+                                base_destination / _ADAPTER_MODEL_NAME
+                                if base_destination is not None
+                                else None
+                            ),
+                        )
+                        if not _download_optional(
+                            f"{source_url.rstrip('/')}/{ADAPTER_REFERENCE_HEADER}",
+                            reference_header_path,
+                        ):
+                            raise AdapterReferenceError(
+                                "reference header is unavailable"
+                            )
+                        if not _download_optional(
+                            f"{source_url.rstrip('/')}/{ADAPTER_REFERENCE_PAYLOAD}",
+                            reference_payload_path,
+                        ):
+                            raise AdapterReferenceError(
+                                "reference payload is unavailable"
+                            )
+                        apply_adapter_references(
+                            reference_header_path,
+                            reference_payload_path,
+                            temporary / _ADAPTER_MODEL_NAME,
+                            reference_manifest,
+                        )
+                        transfer = "references"
+                    except AdapterDiskSpaceError:
+                        raise
+                    except (
+                        AdapterReferenceError,
+                        OSError,
+                        ValueError,
+                        TypeError,
+                        KeyError,
+                    ) as error:
+                        _LOGGER.warning("adapter references rejected: %s", error)
+                        for path in (
+                            reference_manifest_path,
+                            reference_header_path,
+                            reference_payload_path,
+                            temporary / _ADAPTER_MODEL_NAME,
+                        ):
+                            path.unlink(missing_ok=True)
 
             if transfer == "full":
                 download(

@@ -249,6 +249,7 @@ container_id=$(docker run -d --cidfile "$engine_cidfile" \
   --mount "type=bind,source=$bootstrap_fifo,target=/run/prime-parity-bootstrap" \
   -v "$deployment/source/src/prime_rl/inference/vllm/worker/filesystem.py":/app/src/prime_rl/inference/vllm/worker/filesystem.py:ro \
   -v "$deployment/source/src/prime_rl/utils/adapter_delta.py":/app/src/prime_rl/utils/adapter_delta.py:ro \
+  -v "$deployment/source/src/prime_rl/utils/adapter_references.py":/app/src/prime_rl/utils/adapter_references.py:ro \
   -v "$deployment/source/src/prime_rl/inference/vllm/server.py":/app/src/prime_rl/inference/vllm/server.py:ro \
   -v "$deployment/source/src/prime_rl/parity_router_trace.py":/app/src/prime_rl/parity_router_trace.py:ro \
   -e CUDA_DEVICE_ORDER=PCI_BUS_ID \
