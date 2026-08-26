@@ -617,11 +617,14 @@ PY
   adapter-http)
     test "$node" = 82 || { echo "the adapter server runs on n82" >&2; exit 1; }
     broadcast_root=${BROADCAST_ROOT:-/data/glm52-rl/runs}
+    qualification_root=/data/glm52-rl/qualifications
     test -d "$broadcast_root" || { echo "broadcast root does not exist: $broadcast_root" >&2; exit 1; }
+    test -d "$qualification_root" || { echo "qualification root does not exist: $qualification_root" >&2; exit 1; }
     sudo docker rm -f glm52-adapter-http >/dev/null 2>&1 || true
     sudo docker run -d --name glm52-adapter-http --restart unless-stopped \
       --network host \
-      -v "$broadcast_root":/broadcast:ro \
+      -v "$broadcast_root":/broadcast/runs:ro \
+      -v "$qualification_root":/broadcast/qualifications:ro \
       -v "$deployment/scripts/china/adapter_server.py":/app/adapter_server.py:ro \
       --entrypoint /app/.venv/bin/python "$image" \
       /app/adapter_server.py --port 8100 --directory /broadcast

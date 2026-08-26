@@ -1,6 +1,10 @@
+import argparse
 import fcntl
+import gzip
 import hashlib
+import json
 import os
+import re
 import shutil
 import time
 import urllib.request
@@ -9,10 +13,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit, urlunsplit
 
-from torch.nn import Module
-from vllm.model_executor.model_loader import DefaultModelLoader, get_model_loader
-
-from prime_rl.inference.vllm.worker.weight_transfer import load_weights_checkpoint_layerwise
+_PARALLEL_DOWNLOAD_THRESHOLD = 16 * 1024 * 1024
+_PARALLEL_DOWNLOAD_STREAMS = 8
+_GLM_RANGE_GZIP_ENV = "PRIME_GLM_ADAPTER_GZIP"
 
 
 def adapter_cache_path(source_url: str) -> Path:
@@ -41,6 +44,9 @@ def _download_range(
     start: int,
     end: int,
 ) -> None:
+    gzip_required = os.environ.get(_GLM_RANGE_GZIP_ENV, "0")
+    if gzip_required not in {"0", "1"}:
+        raise OSError(f"{_GLM_RANGE_GZIP_ENV} must be 0 or 1")
     for attempt in range(10):
         try:
             source_url = source_urls[(source_index + attempt) % len(source_urls)]
@@ -51,27 +57,66 @@ def _download_range(
             if present > size:
                 destination.unlink()
                 present = 0
-            request = urllib.request.Request(
-                source_url,
-                headers={"Range": f"bytes={start + present}-{end}"},
-            )
+            requested_start = start + present
+            headers = {"Range": f"bytes={requested_start}-{end}"}
+            if gzip_required == "1":
+                headers["Accept-Encoding"] = "gzip"
+            request = urllib.request.Request(source_url, headers=headers)
             with urllib.request.urlopen(request, timeout=60) as response:
                 if response.status != 206:
                     raise OSError("adapter server did not honor byte range")
-                with destination.open("ab" if present else "wb") as output:
-                    shutil.copyfileobj(response, output, length=16 * 1024 * 1024)
+                content_range = re.fullmatch(
+                    r"bytes (\d+)-(\d+)/(\d+)",
+                    response.headers.get("Content-Range", ""),
+                )
+                if (
+                    content_range is None
+                    or int(content_range.group(1)) != requested_start
+                    or int(content_range.group(2)) != end
+                    or int(content_range.group(3)) <= end
+                ):
+                    raise OSError("adapter server returned the wrong byte range")
+                if gzip_required == "1":
+                    if response.headers.get("Content-Encoding", "").lower() != "gzip":
+                        raise OSError("adapter server did not return required gzip")
+                    if response.headers.get("X-Prime-Raw-Length") != str(
+                        end - requested_start + 1
+                    ):
+                        raise OSError("adapter gzip range length differs")
+                    with (
+                        gzip.GzipFile(fileobj=response, mode="rb") as source,
+                        destination.open("ab" if present else "wb") as output,
+                    ):
+                        shutil.copyfileobj(
+                            source, output, length=16 * 1024 * 1024
+                        )
+                else:
+                    with destination.open("ab" if present else "wb") as output:
+                        shutil.copyfileobj(
+                            response, output, length=16 * 1024 * 1024
+                        )
             if destination.stat().st_size != size:
                 raise OSError(f"incomplete adapter range: {destination.name}")
             return
-        except OSError:
+        except (EOFError, OSError):
             if attempt == 9:
                 raise
             time.sleep(min(2**attempt, 10))
 
 
-def download(source_url: str, destination: Path) -> None:
+def _publish_download(temporary: Path, destination: Path, create_only: bool) -> None:
+    if create_only:
+        os.link(temporary, destination, follow_symlinks=False)
+        temporary.unlink()
+    else:
+        temporary.replace(destination)
+
+
+def download(source_url: str, destination: Path, create_only: bool = False) -> None:
     total = _content_length(source_url)
-    if destination.exists() and destination.stat().st_size == total:
+    if create_only and (destination.exists() or destination.is_symlink()):
+        raise FileExistsError(f"adapter destination already exists: {destination}")
+    if not create_only and destination.exists() and destination.stat().st_size == total:
         return
 
     ports = [value.strip() for value in os.environ.get("PRIME_ADAPTER_PORTS", "").split(",") if value.strip()]
@@ -85,12 +130,22 @@ def download(source_url: str, destination: Path) -> None:
             for port in ports
         ]
 
-    streams = len(source_urls) if ports else max(1, int(os.environ.get("PRIME_ADAPTER_DOWNLOAD_STREAMS", "8")))
-    if total < 16 * 1024 * 1024 or streams == 1:
-        _download_range([source_url], 0, destination, 0, total - 1)
+    streams = len(source_urls) if ports else max(
+        1,
+        int(os.environ.get("PRIME_ADAPTER_DOWNLOAD_STREAMS", str(_PARALLEL_DOWNLOAD_STREAMS))),
+    )
+    if total < _PARALLEL_DOWNLOAD_THRESHOLD or streams == 1:
+        if not create_only:
+            _download_range([source_url], 0, destination, 0, total - 1)
+            return
+        assembling = destination.with_name(f"{destination.name}.assembling")
+        assembling.unlink(missing_ok=True)
+        _download_range([source_url], 0, assembling, 0, total - 1)
+        _publish_download(assembling, destination, True)
         return
 
-    destination.unlink(missing_ok=True)
+    if not create_only:
+        destination.unlink(missing_ok=True)
     parts = destination.with_name(f"{destination.name}.parts")
     parts.mkdir(exist_ok=True)
     chunk = (total + streams - 1) // streams
@@ -120,8 +175,57 @@ def download(source_url: str, destination: Path) -> None:
                 shutil.copyfileobj(part, output, length=16 * 1024 * 1024)
     if assembling.stat().st_size != total:
         raise OSError(f"assembled adapter file has the wrong size: {destination.name}")
-    assembling.replace(destination)
+    _publish_download(assembling, destination, create_only)
     shutil.rmtree(parts)
+
+
+def _download_cli() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("source_url")
+    parser.add_argument("destination", type=Path)
+    parser.add_argument("expected_sha256")
+    parser.add_argument("expected_size", type=int)
+    args = parser.parse_args()
+    if (
+        len(args.expected_sha256) != 64
+        or any(value not in "0123456789abcdef" for value in args.expected_sha256)
+        or args.expected_size <= 0
+    ):
+        raise ValueError("adapter identity is invalid")
+    started = time.monotonic()
+    download(args.source_url, args.destination, create_only=True)
+    actual_size = args.destination.stat().st_size
+    actual_sha256 = _sha256_file(args.destination)
+    if actual_size != args.expected_size or actual_sha256 != args.expected_sha256:
+        args.destination.unlink()
+        raise ValueError("downloaded adapter identity differs")
+    print(
+        json.dumps(
+            {
+                "bytes": actual_size,
+                "seconds": time.monotonic() - started,
+                "sha256": actual_sha256,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_download_cli())
+
+
+from torch.nn import Module  # noqa: E402
+from vllm.model_executor.model_loader import (  # noqa: E402
+    DefaultModelLoader,
+    get_model_loader,
+)
+
+from prime_rl.inference.vllm.worker.weight_transfer import (  # noqa: E402
+    load_weights_checkpoint_layerwise,
+)
 
 
 # This is to get type hints for the Worker class but not actually extend it at runtime as this is required by vLLM worker extension

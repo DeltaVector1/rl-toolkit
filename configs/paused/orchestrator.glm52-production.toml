@@ -73,7 +73,7 @@ api_key_var = "VLLM_API_KEY"
 
 [weight_broadcast]
 type = "filesystem"
-source_url = "http://127.0.0.1:18100/glm52-1"
+source_url = "http://127.0.0.1:18100/runs/glm52-1"
 source_dir = "/data/glm52-rl/runs/glm52-1"
 
 [rollout_transport]

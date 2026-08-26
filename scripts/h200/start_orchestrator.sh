@@ -54,7 +54,7 @@ tunnel() { # local_port  target_host:port  ssh_target  [compress]
 
 adapter_tunnel_ports=(18100 18200 18201 18202 18203 18204 18205 18206)
 for adapter_port in "${adapter_tunnel_ports[@]}"; do
-  tunnel "$adapter_port" 127.0.0.1:8100 china-trainer yes
+  tunnel "$adapter_port" 127.0.0.1:8100 china-trainer no
 done
 ports=("${adapter_tunnel_ports[@]}")
 if [[ " $adapter_admin_urls " == *":18111 "* ]]; then
@@ -195,7 +195,7 @@ if [ "$transport" = filesystem ]; then
   fi
   nohup setsid env SOURCE_RUN_DIR="$orchestrator_output" DEST_RUN_DIR="$orchestrator_output" \
     DEST_HOST=china-trainer \
-    ADAPTER_SOURCE_BASE="http://127.0.0.1:18100/$RUN/$RUN_NAME" \
+    ADAPTER_SOURCE_BASE="http://127.0.0.1:18100/runs/$RUN/$RUN_NAME" \
     ADAPTER_ADMIN_URLS="$adapter_admin_urls" \
     "$deployment/scripts/h200/sync_rollout_batches.sh" \
     >>"/data/glm52-rl/batch-sync-$RUN.log" 2>&1 </dev/null &

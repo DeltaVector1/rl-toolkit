@@ -2366,163 +2366,77 @@ def _download_adapter_file(remote_path: str, local_path: Path) -> None:
     _local_command(command, f"download {remote_path}", timeout=1800)
 
 
-def _ssh_stream_command(host: str, script: str, timeout: int) -> list[str]:
-    _check_host(host)
-    return [
-        "timeout",
-        "--signal=TERM",
-        "--kill-after=10s",
-        f"{timeout}s",
-        *ssh_command,
-        *_active_ssh_control_options(host),
-        host,
-        script,
-    ]
-
-
-def _stream_adapter_file(
-    source_host: str,
+def _download_glm_adapter_direct(
+    host: str,
     source_path: str,
-    destination_host: str,
     destination_path: str,
     expected_digest: str,
     expected_size: int,
-    timeout: int = 7200,
 ) -> dict[str, float | int | str]:
     source = PurePosixPath(source_path)
     destination = PurePosixPath(destination_path)
+    qualification_root = PurePosixPath("/data/glm52-rl/qualifications")
+    destination_root = PurePosixPath(glm_step20_h200_gate["adapter"]).parent
     if (
-        not source.is_absolute()
+        host != inference_hosts[0]
+        or qualification_root not in source.parents
         or ".." in source.parts
         or not destination.is_absolute()
         or ".." in destination.parts
+        or destination.parent.parent != destination_root
+        or re.fullmatch(
+            r"\.adapter-candidate-[0-9a-f]{16}", destination.parent.name
+        )
+        is None
+        or destination.name != "adapter_model.safetensors"
         or re.fullmatch(r"[0-9a-f]{64}", expected_digest) is None
         or isinstance(expected_size, bool)
         or not isinstance(expected_size, int)
         or expected_size <= 0
-        or isinstance(timeout, bool)
-        or not isinstance(timeout, int)
-        or timeout < 1
     ):
-        raise Refused("adapter stream identity is invalid")
-    source_reader = """import os,stat,sys
-path,wanted=sys.argv[1],int(sys.argv[2])
-fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW)
-try:
- info=os.fstat(fd)
- if not stat.S_ISREG(info.st_mode) or info.st_nlink!=1 or info.st_size!=wanted: raise RuntimeError("source identity differs")
- while block:=os.read(fd,4194304):
-  view=memoryview(block)
-  while view: view=view[os.write(1,view):]
-finally: os.close(fd)
-"""
-    destination_writer = """import hashlib,json,os,stat,sys
-parent,name,wanted_digest,wanted_size=sys.argv[1],sys.argv[2],sys.argv[3],int(sys.argv[4])
-directory=os.open(parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
-fd=None
-created=False
-try:
- fd=os.open(name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=directory)
- created=True
- digest=hashlib.sha256()
- size=0
- while block:=os.read(0,4194304):
-  digest.update(block); size+=len(block)
-  view=memoryview(block)
-  while view: view=view[os.write(fd,view):]
- os.fsync(fd)
- actual=digest.hexdigest()
- if size!=wanted_size or actual!=wanted_digest: raise RuntimeError("destination identity differs")
- print(json.dumps({"sha256":actual,"size":size},separators=(",",":")))
-except BaseException:
- if fd is not None: os.close(fd); fd=None
- if created: os.unlink(name,dir_fd=directory)
- raise
-finally:
- if fd is not None: os.close(fd)
- os.close(directory)
-"""
-    source_script = shlex.join(
-        ["python3", "-c", source_reader, source_path, str(expected_size)]
+        raise Refused("direct GLM adapter identity is invalid")
+    downloader = (
+        f"{remote_repo}/source/src/prime_rl/inference/vllm/worker/filesystem.py"
     )
-    destination_script = shlex.join(
+    served_path = source.relative_to(PurePosixPath("/data/glm52-rl"))
+    source_url = f"http://127.0.0.1:18100/{served_path}"
+    ports = "18100,18200,18201,18202,18203,18204,18205,18206"
+    command = shlex.join(
         [
+            "timeout",
+            "--signal=TERM",
+            "--kill-after=10s",
+            "3300s",
+            "env",
+            "PRIME_GLM_ADAPTER_GZIP=1",
+            f"PRIME_ADAPTER_PORTS={ports}",
             "python3",
-            "-c",
-            destination_writer,
-            str(destination.parent),
-            destination.name,
+            downloader,
+            source_url,
+            destination_path,
             expected_digest,
             str(expected_size),
         ]
     )
-    started = time.monotonic()
-    source_process = None
-    destination_process = None
-    transferred = 0
-    digest = hashlib.sha256()
+    output = _remote_ok(
+        host,
+        command,
+        "direct step-20 adapter download",
+        timeout=3360,
+    ).strip()
     try:
-        destination_process = subprocess.Popen(
-            _ssh_stream_command(destination_host, destination_script, timeout),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        source_process = subprocess.Popen(
-            _ssh_stream_command(source_host, source_script, timeout),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        assert source_process.stdout is not None
-        assert destination_process.stdin is not None
-        while block := source_process.stdout.read(4 * 1024 * 1024):
-            digest.update(block)
-            transferred += len(block)
-            destination_process.stdin.write(block)
-        destination_process.stdin.close()
-        destination_process.stdin = None
-        source_code = source_process.wait(timeout=30)
-        source_error = source_process.stderr.read().decode(errors="replace")
-        destination_output, destination_error = destination_process.communicate(timeout=60)
-        if source_code:
-            detail = source_error.strip()
-            raise RuntimeError(
-                "adapter source stream failed: "
-                + (detail.splitlines()[-1] if detail else f"exit {source_code}")[:160]
-            )
-        if destination_process.returncode:
-            detail = destination_error.decode(errors="replace").strip()
-            raise RuntimeError(
-                "adapter destination stream failed: "
-                + (
-                    detail.splitlines()[-1]
-                    if detail
-                    else f"exit {destination_process.returncode}"
-                )[:160]
-            )
-    except (BrokenPipeError, OSError, subprocess.TimeoutExpired) as error:
-        raise RuntimeError(f"adapter stream failed: {error}") from error
-    finally:
-        for process in (source_process, destination_process):
-            if process is not None and process.poll() is None:
-                process.kill()
-                process.wait()
-    source_digest = digest.hexdigest()
-    if transferred != expected_size or source_digest != expected_digest:
-        raise RuntimeError("adapter source stream checksum or size differs")
-    try:
-        destination_report = json.loads(destination_output)
-    except (UnboundLocalError, UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise RuntimeError("adapter destination stream report is invalid") from error
-    if destination_report != {"sha256": expected_digest, "size": expected_size}:
-        raise RuntimeError("adapter destination stream checksum or size differs")
-    seconds = time.monotonic() - started
-    return {
-        "bytes": transferred,
-        "seconds": seconds,
-        "gib_per_second": transferred / (1024**3) / seconds if seconds else 0.0,
-        "sha256": source_digest,
-    }
+        result = json.loads(output)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("direct adapter download report is invalid") from error
+    if (
+        result.get("bytes") != expected_size
+        or result.get("sha256") != expected_digest
+        or isinstance(result.get("seconds"), bool)
+        or not isinstance(result.get("seconds"), (int, float))
+        or result["seconds"] <= 0
+    ):
+        raise RuntimeError("direct adapter download identity differs")
+    return result
 
 
 def _archive_one_file(local_path: Path, remote_uri: str, expected_digest: str) -> None:
@@ -8552,20 +8466,18 @@ install -d -m 0750 "$candidate"
 """
     _remote_ok(host, setup, "step-20 H200 adapter candidate", timeout=60)
     transfer_started = time.monotonic()
-    stream_result = _stream_adapter_file(
-        trainer_head,
-        str(source_paths["adapter_model.safetensors"][0]),
+    transfer = _download_glm_adapter_direct(
         host,
+        str(source_paths["adapter_model.safetensors"][0]),
         str(candidate / "adapter_model.safetensors"),
         str(source_paths["adapter_model.safetensors"][1]),
         adapter_size,
     )
     print(
-        "Staged adapter weights: "
-        f"{stream_result['bytes'] / (1024**3):.2f} GiB in "
-        f"{stream_result['seconds']:.1f} seconds "
-        f"({stream_result['gib_per_second']:.3f} GiB/s); "
-        "both SHA-256 values match."
+        "Staged adapter weights directly: "
+        f"{transfer['bytes'] / (1024**3):.2f} GiB in "
+        f"{transfer['seconds']:.1f} seconds "
+        f"({transfer['bytes'] / (1024**3) / transfer['seconds']:.3f} GiB/s)."
     )
     metadata_started = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="glm52-step20-adapter-") as temporary:
@@ -8590,7 +8502,7 @@ install -d -m 0750 "$candidate"
                 timeout=1800,
             )
     print(
-        f"Staged {len(source_paths) - 1} adapter metadata files in "
+        f"Staged {len(source_paths) - 1} metadata files in "
         f"{time.monotonic() - metadata_started:.1f} seconds; "
         f"total staging time {time.monotonic() - transfer_started:.1f} seconds."
     )

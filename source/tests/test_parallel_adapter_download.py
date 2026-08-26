@@ -1,4 +1,5 @@
 import importlib.util
+import os
 import re
 import sys
 import tempfile
@@ -23,6 +24,8 @@ def _load_filesystem_module():
         "prime_rl.inference.vllm.worker.weight_transfer"
     )
     weight_transfer.load_weights_checkpoint_layerwise = lambda *_args, **_kwargs: None
+    parity_trace = types.ModuleType("prime_rl.parity_router_trace")
+    parity_trace.install_vllm_parity_trace = lambda: None
 
     stubs = {
         "torch": torch,
@@ -37,6 +40,7 @@ def _load_filesystem_module():
             "prime_rl.inference.vllm.worker"
         ),
         "prime_rl.inference.vllm.worker.weight_transfer": weight_transfer,
+        "prime_rl.parity_router_trace": parity_trace,
     }
     path = (
         Path(__file__).parents[1]
@@ -46,6 +50,14 @@ def _load_filesystem_module():
     module = importlib.util.module_from_spec(spec)
     with patch.dict(sys.modules, stubs):
         spec.loader.exec_module(module)
+    return module
+
+
+def _load_adapter_server_module():
+    path = Path(__file__).parents[2] / "scripts/china/adapter_server.py"
+    spec = importlib.util.spec_from_file_location("adapter_server", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
     return module
 
 
@@ -107,6 +119,13 @@ class ParallelAdapterDownloadTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory) / "adapter_model.safetensors"
             with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "PRIME_ADAPTER_PORTS": "",
+                        "PRIME_GLM_ADAPTER_GZIP": "0",
+                    },
+                ),
                 patch.object(self.module, "_PARALLEL_DOWNLOAD_THRESHOLD", 1),
                 patch.object(self.module, "_PARALLEL_DOWNLOAD_STREAMS", 4),
             ):
@@ -123,33 +142,77 @@ class ParallelAdapterDownloadTest(unittest.TestCase):
             destination = Path(directory) / "part"
             destination.write_bytes(_RangeHandler.payload[1000:1123])
             self.module._download_range(
-                self.url,
+                [self.url],
+                0,
                 destination,
                 1000,
                 4999,
             )
             self.assertEqual(destination.read_bytes(), _RangeHandler.payload[1000:5000])
 
-    def test_stage_marks_complete_cache_and_reuses_it(self):
+    def test_glm_gzip_ranges_are_required_and_create_only(self):
+        adapter_server = _load_adapter_server_module()
+
+        class Handler(adapter_server.RangeHandler):
+            gzip_requests = 0
+
+            def log_message(self, *_args):
+                pass
+
+            def do_GET(self):
+                if self.headers.get("Accept-Encoding") == "gzip":
+                    type(self).gzip_requests += 1
+                return super().do_GET()
+
         with tempfile.TemporaryDirectory() as directory:
-            cache = Path(directory) / "cache"
-            calls = []
-
-            def fake_download(url, destination):
-                calls.append(url)
-                destination.write_bytes(url.encode())
-
+            root = Path(directory)
+            (root / "runs").mkdir()
+            source = root / "runs/adapter"
+            source.write_bytes(_RangeHandler.payload)
+            server = ThreadingHTTPServer(
+                ("127.0.0.1", 0),
+                lambda *args, **kwargs: Handler(
+                    *args, directory=str(root), **kwargs
+                ),
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            destination = root / "downloaded.safetensors"
+            url = f"http://127.0.0.1:{server.server_port}/adapter"
+            environment = {
+                "PRIME_GLM_ADAPTER_GZIP": "1",
+                "PRIME_ADAPTER_PORTS": ",".join([str(server.server_port)] * 4),
+            }
+            try:
+                with (
+                    patch.dict(os.environ, environment),
+                    patch.object(self.module, "_PARALLEL_DOWNLOAD_THRESHOLD", 1),
+                ):
+                    self.module.download(url, destination, create_only=True)
+                    with self.assertRaises(FileExistsError):
+                        self.module.download(url, destination, create_only=True)
+            finally:
+                server.shutdown()
+                thread.join()
+                server.server_close()
+            self.assertEqual(destination.read_bytes(), _RangeHandler.payload)
+            self.assertGreaterEqual(Handler.gzip_requests, 4)
+            rejected = root / "rejected.safetensors"
             with (
-                patch.object(self.module, "adapter_cache_path", return_value=cache),
-                patch.object(self.module, "download", side_effect=fake_download),
+                patch.dict(
+                    os.environ,
+                    {
+                        "PRIME_GLM_ADAPTER_GZIP": "1",
+                        "PRIME_ADAPTER_PORTS": "",
+                    },
+                ),
+                patch.object(self.module, "_PARALLEL_DOWNLOAD_THRESHOLD", 1),
+                patch.object(self.module.time, "sleep"),
+                self.assertRaisesRegex(
+                    OSError, "did not return required gzip"
+                ),
             ):
-                first = self.module.stage_lora_adapter_files(self.url)
-                second = self.module.stage_lora_adapter_files(self.url)
-
-            self.assertEqual(first, cache)
-            self.assertEqual(second, cache)
-            self.assertTrue((cache / "READY").exists())
-            self.assertEqual(len(calls), 2)
+                self.module.download(self.url, rejected)
 
 
 if __name__ == "__main__":

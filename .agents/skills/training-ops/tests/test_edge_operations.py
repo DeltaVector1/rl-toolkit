@@ -829,7 +829,7 @@ class EdgeOperationsTest(unittest.TestCase):
             + "\n"
         ).encode()
         adapter = {
-            "path": "/source/adapter_model.safetensors",
+            "path": "/data/glm52-rl/qualifications/test/adapter_model.safetensors",
             "sha256": hashlib.sha256(payloads["adapter_model.safetensors"]).hexdigest(),
             "size": len(payloads["adapter_model.safetensors"]),
             "config_path": "/source/adapter_config.json",
@@ -845,7 +845,7 @@ class EdgeOperationsTest(unittest.TestCase):
         payloads["qualification-result.json"] = b"qualification\n"
         uploads = []
         remote = []
-        streams = []
+        direct = []
 
         def download(source, destination):
             destination.write_bytes(payloads[Path(source).name])
@@ -853,12 +853,11 @@ class EdgeOperationsTest(unittest.TestCase):
         def command(arguments, _label, timeout):
             uploads.append((arguments, timeout))
 
-        def stream(*arguments):
-            streams.append(arguments)
+        def direct_download(*arguments):
+            direct.append(arguments)
             return {
-                "bytes": len(payloads["adapter_model.safetensors"]),
+                "bytes": adapter["size"],
                 "seconds": 1.0,
-                "gib_per_second": 0.1,
                 "sha256": adapter["sha256"],
             }
 
@@ -869,7 +868,11 @@ class EdgeOperationsTest(unittest.TestCase):
         with (
             patch.object(training_ops, "_download_adapter_file", side_effect=download),
             patch.object(training_ops, "_local_command", side_effect=command),
-            patch.object(training_ops, "_stream_adapter_file", side_effect=stream),
+            patch.object(
+                training_ops,
+                "_download_glm_adapter_direct",
+                side_effect=direct_download,
+            ),
             patch.object(training_ops, "_remote_ok", side_effect=remote_ok),
             patch.object(training_ops.secrets, "token_hex", return_value="1" * 16),
         ):
@@ -879,11 +882,10 @@ class EdgeOperationsTest(unittest.TestCase):
                 ),
                 training_ops.glm_step20_h200_gate["adapter"],
             )
-        self.assertEqual(len(streams), 1)
-        self.assertEqual(streams[0][0], training_ops.trainer_head)
-        self.assertEqual(streams[0][1], adapter["path"])
-        self.assertIn(".adapter-candidate-" + "1" * 16, streams[0][3])
-        self.assertEqual(streams[0][4:6], (adapter["sha256"], adapter["size"]))
+        self.assertEqual(len(direct), 1)
+        self.assertEqual(direct[0][1], adapter["path"])
+        self.assertIn(".adapter-candidate-" + "1" * 16, direct[0][2])
+        self.assertEqual(direct[0][3:5], (adapter["sha256"], adapter["size"]))
         self.assertEqual(len(uploads), 4)
         self.assertTrue(all(call[0][0] == "scp" and call[1] == 1800 for call in uploads))
         self.assertTrue(
@@ -993,57 +995,29 @@ class EdgeOperationsTest(unittest.TestCase):
                 expected_files,
             )
 
-    def test_adapter_stream_checks_hashes_and_uses_create_only(self):
-        payload = (b"adapter-data\n" * 1000) + b"end"
-        digest = hashlib.sha256(payload).hexdigest()
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            source = root / "source.safetensors"
-            candidate = root / "candidate"
-            source.write_bytes(payload)
-            candidate.mkdir()
-
-            def local_command(_host, script, _timeout):
-                return ["bash", "-c", script]
-
-            with patch.object(
-                training_ops, "_ssh_stream_command", side_effect=local_command
-            ):
-                with self.assertRaisesRegex(RuntimeError, "destination stream failed"):
-                    training_ops._stream_adapter_file(
-                        "source-host",
-                        str(source),
-                        "destination-host",
-                        str(candidate / "rejected.safetensors"),
-                        "0" * 64,
-                        len(payload),
-                        timeout=30,
-                    )
-                self.assertFalse((candidate / "rejected.safetensors").exists())
-                result = training_ops._stream_adapter_file(
-                    "source-host",
-                    str(source),
-                    "destination-host",
-                    str(candidate / "adapter_model.safetensors"),
-                    digest,
-                    len(payload),
-                    timeout=30,
-                )
-                self.assertEqual(result["bytes"], len(payload))
-                self.assertEqual(result["sha256"], digest)
-                self.assertEqual(
-                    (candidate / "adapter_model.safetensors").read_bytes(), payload
-                )
-                with self.assertRaisesRegex(RuntimeError, "destination stream failed"):
-                    training_ops._stream_adapter_file(
-                        "source-host",
-                        str(source),
-                        "destination-host",
-                        str(candidate / "adapter_model.safetensors"),
-                        digest,
-                        len(payload),
-                        timeout=30,
-                    )
+    def test_direct_glm_adapter_download_requires_gzip_ranges(self):
+        digest = "a" * 64
+        report = json.dumps({"bytes": 123, "seconds": 9.5, "sha256": digest})
+        with patch.object(training_ops, "_remote_ok", return_value=report) as remote:
+            result = training_ops._download_glm_adapter_direct(
+                training_ops.inference_hosts[0],
+                "/data/glm52-rl/qualifications/test/adapter_model.safetensors",
+                "/data/glm52-rl/qualifications/glm52-step20-h200/"
+                ".adapter-candidate-1111111111111111/adapter_model.safetensors",
+                digest,
+                123,
+            )
+        self.assertEqual(result["seconds"], 9.5)
+        arguments = shlex.split(remote.call_args.args[1])
+        self.assertIn("PRIME_GLM_ADAPTER_GZIP=1", arguments)
+        self.assertIn(
+            "PRIME_ADAPTER_PORTS=18100,18200,18201,18202,18203,18204,18205,18206",
+            arguments,
+        )
+        self.assertIn(
+            "http://127.0.0.1:18100/qualifications/test/adapter_model.safetensors",
+            arguments,
+        )
 
     def test_step20_trainer_parity_action_pins_exact_adapter_and_step(self):
         with patch.object(training_ops, "qualify") as qualify:

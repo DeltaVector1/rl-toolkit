@@ -31,12 +31,17 @@ class AdapterPrefetchGateTest(unittest.TestCase):
         self.assertIn(f"adapter_tunnel_ports=({ports})", START)
         self.assertIn('for adapter_port in "${adapter_tunnel_ports[@]}"', START)
         self.assertIn(
-            'tunnel "$adapter_port" 127.0.0.1:8100 china-trainer yes',
+            'tunnel "$adapter_port" 127.0.0.1:8100 china-trainer no',
             START,
         )
         self.assertIn(
             "adapter_ports=${prime_adapter_ports:-" + ports.replace(" ", ",") + "}",
             INFERENCE_START,
+        )
+        self.assertIn('-e PRIME_GLM_ADAPTER_GZIP=1', INFERENCE_START)
+        self.assertIn(
+            'ADAPTER_SOURCE_BASE="http://127.0.0.1:18100/runs/$RUN/$RUN_NAME"',
+            START,
         )
 
     def test_parallel_batch_copy_staggers_ssh_handshakes(self):

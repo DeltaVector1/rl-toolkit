@@ -251,6 +251,7 @@ container_id=$(docker run -d --cidfile "$engine_cidfile" \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False \
   -e VLLM_ENGINE_READY_TIMEOUT_S=7200 \
   -e PRIME_ADAPTER_PORTS="$adapter_ports" \
+  -e PRIME_GLM_ADAPTER_GZIP=1 \
   -e PRIME_PARITY_BOOTSTRAP_FIFO=/run/prime-parity-bootstrap \
   -e PRIME_PARITY_ROUTER_TRACE_DIR="$parity_trace_dir" \
   --entrypoint /app/.venv/bin/inference \
