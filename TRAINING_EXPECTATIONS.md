@@ -44,9 +44,11 @@ these direct checks pass.
 - Before rollout production, complete 20 trainer-only production-shaped steps
   at batch 2,048. Use changing generated input, real backward work, and real
   optimizer updates. Do not generate, cache, or reuse rollouts for this run.
-- Each trainer-only step must stay below 46 GiB. The last five steps must not
-  use more than 0.5 GiB above the first five-step median. Stop on an OOM,
-  nonfinite value, worker failure, or growing memory use.
+- Each trainer-only step, including adapter export, must stay below 46 GiB.
+  Record the forward/backward peak before adapter export. The last five
+  forward/backward peaks must not use more than 0.5 GiB above the first
+  five-step median. Stop on an OOM, nonfinite value, worker failure, or
+  growing memory use.
 - Before rollout production, compare the updated trainer with the reference
   behavior on fixed batches and small dummy RL runs. Rewards, masks, selected
   rows, and GRPO advantages must match. Also pass the trainer/H200 policy

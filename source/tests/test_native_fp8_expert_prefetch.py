@@ -122,6 +122,7 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
                     {
                         "step": step,
                         "perf/peak_memory": 44.0,
+                        "perf/forward_backward_peak_memory": 43.5,
                         "time/forward_backward": 300.0,
                     },
                 )

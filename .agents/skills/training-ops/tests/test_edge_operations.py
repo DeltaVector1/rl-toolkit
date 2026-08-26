@@ -1,5 +1,6 @@
 import base64
 import datetime
+import gzip
 import hashlib
 import json
 import os
@@ -115,6 +116,7 @@ class EdgeOperationsTest(unittest.TestCase):
                     "optim/grad_norm": 0.8,
                     "optim/lr": 8e-6,
                     "perf/peak_memory": 44.0,
+                    "perf/forward_backward_peak_memory": 43.5,
                     "time/forward_backward": 300.0,
                     "input_sha256": hashlib.sha256(str(step).encode()).hexdigest(),
                 }
@@ -137,7 +139,7 @@ class EdgeOperationsTest(unittest.TestCase):
             result["adapter"] = {
                 "path": profile["output_dir"] + "/run_trainer_only/broadcasts/step_20/adapter_model.safetensors",
                 "sha256": "d" * 64,
-                "size": 300_000_000,
+                "size": 30_767_549_784,
                 "step": 20,
                 "config_path": profile["output_dir"] + "/run_trainer_only/broadcasts/step_20/adapter_config.json",
                 "config_sha256": "e" * 64,
@@ -150,9 +152,21 @@ class EdgeOperationsTest(unittest.TestCase):
                     "r": 32,
                     "lora_alpha": 64,
                     "lora_dropout": 0.0,
-                    "target_modules": sorted(
-                        profile["model"]["lora"]["target_modules"]
-                    ),
+                    "target_modules": sorted(training_ops.qualification_adapter_targets),
+                },
+                "inventory": {
+                    "leaf_targets": sorted(training_ops.qualification_adapter_targets),
+                    "tensor_count": 116_448,
+                    "attention_tensors": 780,
+                    "dense_mlp_tensors": 18,
+                    "shared_expert_tensors": 450,
+                    "routed_expert_tensors": 115_200,
+                    "key_sha256": "1" * 64,
+                },
+                "layout": {
+                    "header_bytes": 15_379_792,
+                    "tensor_bytes": 30_752_169_984,
+                    "file_bytes": 30_767_549_784,
                 },
             }
         return session, result, profile, now
@@ -207,12 +221,55 @@ class EdgeOperationsTest(unittest.TestCase):
         result["steps"][-2]["time/forward_backward"] = 500
         result["steps"][-1]["time/forward_backward"] = 500
         for row in result["steps"][-5:]:
-            row["perf/peak_memory"] = 44.6
+            row["perf/forward_backward_peak_memory"] = 44.1
         failures = training_ops._validate_trainer_qualification(
             session, result, profile, "glm52-native-stability20", now=now
         )
         self.assertTrue(any("trainer time is not stable" in failure for failure in failures))
         self.assertTrue(any("memory use grew" in failure for failure in failures))
+
+    def test_stability20_export_peak_does_not_change_forward_backward_trend(self):
+        session, result, profile, now = self.qualification_evidence(
+            "glm52-native-stability20"
+        )
+        result["steps"][-1]["perf/peak_memory"] = 45.9
+        self.assertEqual(
+            training_ops._validate_trainer_qualification(
+                session, result, profile, "glm52-native-stability20", now=now
+            ),
+            [],
+        )
+
+    def test_safetensors_layout_requires_exact_contiguous_tensor_bytes(self):
+        header = {
+            "a": {
+                "dtype": "BF16",
+                "shape": [2, 3],
+                "data_offsets": [0, 12],
+            },
+            "b": {
+                "dtype": "BF16",
+                "shape": [4],
+                "data_offsets": [12, 20],
+            },
+        }
+        self.assertEqual(
+            training_ops._safetensors_layout(header, 128),
+            {"header_bytes": 128, "tensor_bytes": 20, "file_bytes": 156},
+        )
+        header["b"]["data_offsets"] = [13, 21]
+        with self.assertRaisesRegex(training_ops.Refused, "contiguous"):
+            training_ops._safetensors_layout(header, 128)
+
+    def test_stability20_adapter_size_must_equal_header_layout(self):
+        session, result, profile, now = self.qualification_evidence(
+            "glm52-native-stability20"
+        )
+        result["adapter"]["size"] += 1
+        failures = training_ops._validate_trainer_qualification(
+            session, result, profile, "glm52-native-stability20", now=now
+        )
+        self.assertTrue(any("adapter evidence" in failure for failure in failures))
 
     def test_trainer_qualification_rejects_adapter_path_config_and_checksum(self):
         session, result, profile, now = self.qualification_evidence(
@@ -220,12 +277,14 @@ class EdgeOperationsTest(unittest.TestCase):
         )
         result["adapter"]["path"] = profile["output_dir"] + "/adapter.safetensors"
         result["adapter"]["config"]["r"] = 16
+        result["adapter"]["inventory"]["shared_expert_tensors"] = 449
         result["adapter"]["checksum_value"] = "0" * 64
         failures = training_ops._validate_trainer_qualification(
             session, result, profile, "glm52-native-stability20", now=now
         )
         self.assertTrue(any("adapter path" in failure for failure in failures))
         self.assertTrue(any("adapter configuration" in failure for failure in failures))
+        self.assertTrue(any("tensor coverage" in failure for failure in failures))
         self.assertTrue(any("checksum content" in failure for failure in failures))
 
     def test_trainer_qualification_rejects_overlong_fresh_session(self):
@@ -238,6 +297,349 @@ class EdgeOperationsTest(unittest.TestCase):
             session, result, profile, "glm52-native-b2048", now=now
         )
         self.assertTrue(any("stale" in failure for failure in failures))
+
+    def test_stability20_recovery_keeps_original_source_and_marks_missing_inputs(self):
+        session, result, profile, now = self.qualification_evidence(
+            "glm52-native-stability20"
+        )
+        session["source_files"][training_ops.qualification_train_source] = (
+            training_ops.legacy_stability20_train_sha256
+        )
+        session["source_sha256"] = hashlib.sha256(
+            (
+                json.dumps(
+                    session["source_files"], sort_keys=True, separators=(",", ":")
+                )
+                + "\n"
+            ).encode()
+        ).hexdigest()
+        result["source_sha256"] = session["source_sha256"]
+        result["session_sha256"] = training_ops._canonical_json_sha256(session)
+        for record in result["runtime_ranks"]:
+            record["source_sha256"] = session["source_sha256"]
+        result["runtime_sha256"] = hashlib.sha256(
+            (
+                json.dumps(
+                    result["runtime_ranks"], sort_keys=True, separators=(",", ":")
+                )
+                + "\n"
+            ).encode()
+        ).hexdigest()
+        for row in result["steps"]:
+            row.pop("input_sha256")
+            row.pop("perf/forward_backward_peak_memory")
+        result["steps"][-1]["perf/peak_memory"] = 44.9921875
+        result["recovery"] = {
+            "reason": "adapter_leaf_target_metadata",
+            "original_train_sha256": training_ops.legacy_stability20_train_sha256,
+            "input_checks": "executed_not_persisted",
+            "runtime_records": "derived_from_session",
+            "finalizer_sha256": "2" * 64,
+            "metrics_archive_path": (
+                f"{profile['output_dir']}/{profile['file_monitor']['filename']}.gz"
+            ),
+            "metrics_archive_sha256": "3" * 64,
+            "forward_backward_memory": (
+                "steps_1_19_total_without_adapter_export"
+            ),
+            "step20_forward_backward_peak": "not_persisted",
+            "step20_total_export_peak_gib": result["steps"][-1][
+                "perf/peak_memory"
+            ],
+        }
+        self.assertEqual(
+            training_ops._validate_trainer_qualification(
+                session, result, profile, "glm52-native-stability20", now=now
+            ),
+            [],
+        )
+        result["recovery"]["step20_total_export_peak_gib"] = 44.0
+        failures = training_ops._validate_trainer_qualification(
+            session, result, profile, "glm52-native-stability20", now=now
+        )
+        self.assertTrue(any("export memory differs" in failure for failure in failures))
+        result["recovery"]["step20_total_export_peak_gib"] = result["steps"][-1][
+            "perf/peak_memory"
+        ]
+        result["recovery"]["original_train_sha256"] = "0" * 64
+        failures = training_ops._validate_trainer_qualification(
+            session, result, profile, "glm52-native-stability20", now=now
+        )
+        self.assertTrue(any("recovery" in failure for failure in failures))
+
+    def test_stability20_recovery_allows_only_pinned_train_source_change(self):
+        with (
+            training_ops.repo_root / training_ops.production_stability20_profile
+        ).open("rb") as stream:
+            profile = tomllib.load(stream)
+        source_files = {
+            f"source/file-{index}.py": hashlib.sha256(str(index).encode()).hexdigest()
+            for index in range(45)
+        }
+        source_files[training_ops.qualification_train_source] = (
+            training_ops.legacy_stability20_train_sha256
+        )
+        current_sources = dict(source_files)
+        current_sources[training_ops.qualification_train_source] = (
+            training_ops.approved_recovery_train_sha256
+        )
+        result = {
+            "recovery": {
+                "reason": "adapter_leaf_target_metadata",
+                "original_train_sha256": (
+                    training_ops.legacy_stability20_train_sha256
+                ),
+                "input_checks": "executed_not_persisted",
+                "runtime_records": "derived_from_session",
+                "finalizer_sha256": "1" * 64,
+                "metrics_archive_path": (
+                    f"{profile['output_dir']}/{profile['file_monitor']['filename']}.gz"
+                ),
+                "metrics_archive_sha256": "2" * 64,
+                "forward_backward_memory": (
+                    "steps_1_19_total_without_adapter_export"
+                ),
+                "step20_forward_backward_peak": "not_persisted",
+                "step20_total_export_peak_gib": 44.9921875,
+            }
+        }
+        session = {"source_files": source_files}
+        self.assertEqual(
+            hashlib.sha256(
+                (
+                    training_ops.repo_root / training_ops.qualification_train_source
+                ).read_bytes()
+            ).hexdigest(),
+            training_ops.approved_recovery_train_sha256,
+        )
+        self.assertTrue(
+            training_ops._qualification_sources_match(
+                session,
+                result,
+                profile,
+                "glm52-native-stability20",
+                current_sources,
+            )
+        )
+        changed_other = dict(current_sources)
+        changed_other["source/file-0.py"] = "3" * 64
+        self.assertFalse(
+            training_ops._qualification_sources_match(
+                session,
+                result,
+                profile,
+                "glm52-native-stability20",
+                changed_other,
+            )
+        )
+        changed_train = dict(current_sources)
+        changed_train[training_ops.qualification_train_source] = "4" * 64
+        self.assertFalse(
+            training_ops._qualification_sources_match(
+                session,
+                result,
+                profile,
+                "glm52-native-stability20",
+                changed_train,
+            )
+        )
+        result["recovery"]["unexpected"] = True
+        self.assertFalse(
+            training_ops._qualification_sources_match(
+                session,
+                result,
+                profile,
+                "glm52-native-stability20",
+                current_sources,
+            )
+        )
+
+    def test_stability20_recovery_write_is_create_only_and_atomic(self):
+        captured = {}
+
+        def remote(_host, script, _label, timeout):
+            captured["script"] = script
+            captured["timeout"] = timeout
+            return ""
+
+        destination = (
+            "/data/glm52-rl/qualifications/glm52-native-stability20/"
+            "qualification-result.json"
+        )
+        with patch.object(training_ops, "_remote_ok", side_effect=remote):
+            training_ops._write_remote_qualification_result(destination, {"ok": True})
+        script = captured["script"]
+        embedded = script.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+        compile(embedded, "<qualification-recovery-write>", "exec")
+        self.assertIn("qualification result already exists", embedded)
+        self.assertIn("os.O_EXCL | os.O_NOFOLLOW", embedded)
+        self.assertIn("os.link(", embedded)
+        self.assertEqual(captured["timeout"], 60)
+
+    def test_stability20_stat_parser_accepts_actual_gnu_stat_output(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "adapter file"
+            path.write_bytes(b"weights")
+            output = subprocess.run(
+                ["stat", "-c", "%n|%s|%Y", "--", str(path)],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+        size, modified = training_ops._parse_qualification_file_stats(
+            output, {str(path)}
+        )[str(path)]
+        self.assertEqual(size, 7)
+        self.assertGreater(modified, 0)
+
+    def test_stability20_completion_allows_one_second_monitor_flush(self):
+        paths = {
+            "metrics": "metrics.jsonl",
+            "adapter": "adapter.safetensors",
+            "config": "adapter_config.json",
+            "stable": "STABLE",
+            "checksum": "adapter.safetensors.sha256",
+        }
+        stats = {
+            paths["metrics"]: (100, 1787711315),
+            paths["adapter"]: (200, 1787711295),
+            paths["config"]: (300, 1787711295),
+            paths["stable"]: (0, 1787711314),
+            paths["checksum"]: (65, 1787711314),
+        }
+        self.assertEqual(
+            training_ops._qualification_recovery_completed_epoch(
+                stats, paths, 1787711200
+            ),
+            1787711315,
+        )
+
+    def test_stability20_completion_rejects_late_monitor_flush(self):
+        paths = {
+            "metrics": "metrics.jsonl",
+            "adapter": "adapter.safetensors",
+            "config": "adapter_config.json",
+            "stable": "STABLE",
+            "checksum": "adapter.safetensors.sha256",
+        }
+        stats = {
+            paths["metrics"]: (100, 1787711317),
+            paths["adapter"]: (200, 1787711295),
+            paths["config"]: (300, 1787711295),
+            paths["stable"]: (0, 1787711314),
+            paths["checksum"]: (65, 1787711314),
+        }
+        with self.assertRaisesRegex(training_ops.Refused, "monitor flush"):
+            training_ops._qualification_recovery_completed_epoch(
+                stats, paths, 1787711200
+            )
+
+    def qualification_metric_fragments(self, timestamp=150.0):
+        rows = []
+        for step in (1, 2):
+            step_time = timestamp + step
+            rows.extend(
+                (
+                    {
+                        "step": step,
+                        "time": step_time,
+                        "data/rollout_rows": 2048,
+                        "perf/peak_memory": 44.0,
+                    },
+                    {
+                        "step": step,
+                        "time": step_time + 0.1,
+                        "optim/lr": 8e-6,
+                        "optim/grad_norm": 0.02,
+                    },
+                    {
+                        "step": step,
+                        "time": step_time + 0.2,
+                        "loss/mean": 0.001,
+                    },
+                    {
+                        "step": step,
+                        "time": step_time + 0.3,
+                        "time/forward_backward": 700.0,
+                    },
+                    {"step": step, "time": step_time + 0.4, "system/free": 1},
+                )
+            )
+        return rows
+
+    def test_stability20_metric_fragments_merge_per_step(self):
+        metrics = "".join(
+            json.dumps(row) + "\n" for row in self.qualification_metric_fragments()
+        )
+        steps = training_ops._qualification_recovery_steps(
+            metrics, 100.0, 200, expected_steps=2
+        )
+        self.assertEqual([row["step"] for row in steps], [1, 2])
+        self.assertEqual(steps[0]["data/rollout_rows"], 2048)
+        self.assertEqual(steps[1]["time/forward_backward"], 700.0)
+
+    def test_stability20_metric_fragments_exclude_older_runs(self):
+        rows = self.qualification_metric_fragments()
+        older = [
+            {**row, "time": 99.0, "data/rollout_rows": 1}
+            for row in rows
+        ]
+        metrics = "".join(json.dumps(row) + "\n" for row in older + rows)
+        steps = training_ops._qualification_recovery_steps(
+            metrics, 100.0, 200, expected_steps=2
+        )
+        self.assertEqual([row["data/rollout_rows"] for row in steps], [2048, 2048])
+
+    def test_stability20_metric_fragments_reject_duplicate_required_value(self):
+        rows = self.qualification_metric_fragments()
+        rows.append(
+            {"step": 1, "time": 152.0, "loss/mean": rows[2]["loss/mean"]}
+        )
+        metrics = "".join(json.dumps(row) + "\n" for row in rows)
+        with self.assertRaisesRegex(training_ops.Refused, "repeats loss/mean"):
+            training_ops._qualification_recovery_steps(
+                metrics, 100.0, 200, expected_steps=2
+            )
+
+    def test_stability20_metric_gzip_restore_is_create_only(self):
+        payload = b'{"step":1,"time":150}\n'
+        archive_bytes = gzip.compress(payload, mtime=0)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = root / "trainer-metrics.jsonl.gz"
+            archive.write_bytes(archive_bytes)
+            os.utime(archive, (1787711315, 1787711315))
+            script = training_ops._qualification_metrics_restore_script(
+                str(root),
+                "trainer-metrics.jsonl",
+                archive.name,
+                hashlib.sha256(archive_bytes).hexdigest(),
+                len(archive_bytes),
+                hashlib.sha256(payload).hexdigest(),
+                len(payload),
+            )
+            subprocess.run(["bash", "-c", script], check=True, capture_output=True)
+            restored = root / "trainer-metrics.jsonl"
+            self.assertEqual(restored.read_bytes(), payload)
+            self.assertEqual(archive.read_bytes(), archive_bytes)
+            self.assertEqual(int(restored.stat().st_mtime), 1787711315)
+            repeated = subprocess.run(
+                ["bash", "-c", script], check=False, capture_output=True, text=True
+            )
+            self.assertNotEqual(repeated.returncode, 0)
+            self.assertIn("already exists", repeated.stderr)
+            self.assertEqual(restored.read_bytes(), payload)
+
+    def test_remote_file_reader_streams_without_replacing_source(self):
+        payload = b"evidence\n"
+        encoded = base64.b64encode(gzip.compress(payload)).decode()
+        with patch.object(training_ops, "_ssh", return_value=(0, encoded)) as remote:
+            self.assertEqual(
+                training_ops._remote_file_bytes("trainer", "/data/evidence", 100),
+                payload,
+            )
+        command = remote.call_args.args[1]
+        self.assertIn("gzip -1 -c --", command)
 
     def step20_h200_evidence(self):
         _session, stability, _trainer_profile, now = self.qualification_evidence(

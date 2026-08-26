@@ -370,6 +370,205 @@ _qualification_environment_names = (
     "PRIME_TRAINER_HEAD",
 )
 
+_qualification_source_targets = frozenset(
+    {
+        "q_a_proj",
+        "q_b_proj",
+        "kv_a_proj_with_mqa",
+        "kv_b_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+        "shared_expert",
+        "experts",
+    }
+)
+_qualification_adapter_targets = _qualification_source_targets - {"shared_expert"}
+
+
+def _qualification_adapter_inventory(
+    tensor_shapes: dict[str, tuple[int, ...]],
+) -> dict[str, object]:
+    attention = set()
+    dense = set()
+    shared = set()
+    routed = set()
+    unexpected = []
+    patterns = (
+        (
+            re.compile(
+                r"^model\.layers\.(\d+)\.self_attn\."
+                r"(q_a_proj|q_b_proj|kv_a_proj_with_mqa|kv_b_proj|o_proj)\."
+                r"lora_([AB])\.weight$"
+            ),
+            attention,
+        ),
+        (
+            re.compile(
+                r"^model\.layers\.(\d+)\.mlp\."
+                r"(gate_proj|up_proj|down_proj)\.lora_([AB])\.weight$"
+            ),
+            dense,
+        ),
+        (
+            re.compile(
+                r"^model\.layers\.(\d+)\.mlp\.shared_experts\."
+                r"(gate_proj|up_proj|down_proj)\.lora_([AB])\.weight$"
+            ),
+            shared,
+        ),
+        (
+            re.compile(
+                r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\."
+                r"(gate_proj|up_proj|down_proj)\.lora_([AB])\.weight$"
+            ),
+            routed,
+        ),
+    )
+    for name, shape in tensor_shapes.items():
+        match = None
+        destination = None
+        for pattern, candidate in patterns:
+            match = pattern.fullmatch(name)
+            if match is not None:
+                destination = candidate
+                break
+        if match is None or destination is None:
+            unexpected.append(name)
+            continue
+        values = list(match.groups())
+        factor = values.pop()
+        values[0] = int(values[0])
+        if destination is routed:
+            values[1] = int(values[1])
+        destination.add(tuple(values + [factor]))
+        if (
+            len(shape) != 2
+            or shape[0 if factor == "A" else 1] != 32
+            or min(shape) <= 0
+        ):
+            raise RuntimeError(f"qualification adapter tensor shape differs: {name}={shape}")
+
+    expected_attention = {
+        (layer, projection, factor)
+        for layer in range(78)
+        for projection in (
+            "q_a_proj",
+            "q_b_proj",
+            "kv_a_proj_with_mqa",
+            "kv_b_proj",
+            "o_proj",
+        )
+        for factor in "AB"
+    }
+    expected_dense = {
+        (layer, projection, factor)
+        for layer in range(3)
+        for projection in ("gate_proj", "up_proj", "down_proj")
+        for factor in "AB"
+    }
+    expected_shared = {
+        (layer, projection, factor)
+        for layer in range(3, 78)
+        for projection in ("gate_proj", "up_proj", "down_proj")
+        for factor in "AB"
+    }
+    expected_routed = {
+        (layer, expert, projection, factor)
+        for layer in range(3, 78)
+        for expert in range(256)
+        for projection in ("gate_proj", "up_proj", "down_proj")
+        for factor in "AB"
+    }
+    failures = []
+    for name, actual, expected in (
+        ("attention", attention, expected_attention),
+        ("dense MLP", dense, expected_dense),
+        ("shared expert", shared, expected_shared),
+        ("routed expert", routed, expected_routed),
+    ):
+        if actual != expected:
+            failures.append(
+                f"{name} missing={len(expected - actual)} extra={len(actual - expected)}"
+            )
+    if unexpected:
+        failures.append(f"unexpected={unexpected[:3]} ({len(unexpected)} total)")
+    if failures:
+        raise RuntimeError("qualification adapter tensor coverage differs: " + "; ".join(failures))
+    keys = sorted(tensor_shapes)
+    return {
+        "leaf_targets": sorted(_qualification_adapter_targets),
+        "tensor_count": len(keys),
+        "attention_tensors": len(attention),
+        "dense_mlp_tensors": len(dense),
+        "shared_expert_tensors": len(shared),
+        "routed_expert_tensors": len(routed),
+        "key_sha256": hashlib.sha256(("\n".join(keys) + "\n").encode()).hexdigest(),
+    }
+
+
+def _read_qualification_adapter_inventory(path: Path) -> dict[str, object]:
+    from safetensors import safe_open
+
+    with safe_open(path, framework="pt", device="cpu") as adapter:
+        shapes = {
+            name: tuple(adapter.get_slice(name).get_shape()) for name in adapter.keys()
+        }
+    return _qualification_adapter_inventory(shapes)
+
+
+def _read_qualification_adapter_layout(path: Path) -> dict[str, int]:
+    with path.open("rb") as stream:
+        prefix = stream.read(8)
+        if len(prefix) != 8:
+            raise RuntimeError("qualification adapter header length is invalid")
+        header_size = int.from_bytes(prefix, "little")
+        if not 2 <= header_size <= 64 * 1024 * 1024:
+            raise RuntimeError("qualification adapter header length is invalid")
+        header_bytes = stream.read(header_size)
+        if len(header_bytes) != header_size:
+            raise RuntimeError("qualification adapter header is incomplete")
+        header = json.loads(header_bytes)
+    if not isinstance(header, dict):
+        raise RuntimeError("qualification adapter header is not an object")
+    offsets = []
+    for name, value in header.items():
+        if name == "__metadata__":
+            continue
+        shape = value.get("shape") if isinstance(value, dict) else None
+        data_offsets = value.get("data_offsets") if isinstance(value, dict) else None
+        if (
+            not isinstance(value, dict)
+            or value.get("dtype") != "BF16"
+            or not isinstance(shape, list)
+            or any(isinstance(size, bool) or not isinstance(size, int) for size in shape)
+            or not isinstance(data_offsets, list)
+            or len(data_offsets) != 2
+            or any(
+                isinstance(offset, bool) or not isinstance(offset, int)
+                for offset in data_offsets
+            )
+        ):
+            raise RuntimeError(f"qualification adapter tensor layout is invalid: {name}")
+        start, end = data_offsets
+        if start < 0 or end - start != 2 * math.prod(shape):
+            raise RuntimeError(f"qualification adapter tensor layout is invalid: {name}")
+        offsets.append((start, end))
+    cursor = 0
+    for start, end in sorted(offsets):
+        if start != cursor:
+            raise RuntimeError("qualification adapter tensor data is not contiguous")
+        cursor = end
+    layout = {
+        "header_bytes": header_size,
+        "tensor_bytes": cursor,
+        "file_bytes": 8 + header_size + cursor,
+    }
+    if path.stat().st_size != layout["file_bytes"]:
+        raise RuntimeError("qualification adapter file size differs from its header")
+    return layout
+
 
 def _qualification_environment() -> dict[str, str] | None:
     values = {name: os.environ.get(name, "") for name in _qualification_environment_names}
@@ -490,6 +689,7 @@ def _qualification_step_records(
         "optim/grad_norm",
         "optim/lr",
         "perf/peak_memory",
+        "perf/forward_backward_peak_memory",
         "time/forward_backward",
     )
     merged = {step: {"step": step} for step in range(1, max_steps + 1)}
@@ -645,18 +845,6 @@ def _write_qualification_result(
         if checksum_value != f"{adapter_sha256}\n":
             raise RuntimeError("qualification final adapter checksum file differs")
         adapter_config_value = json.loads(adapter_config.read_bytes())
-        expected_targets = {
-            "q_a_proj",
-            "q_b_proj",
-            "kv_a_proj_with_mqa",
-            "kv_b_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-            "shared_expert",
-            "experts",
-        }
         adapter_targets = adapter_config_value.get("target_modules")
         if (
             isinstance(adapter_config_value.get("r"), bool)
@@ -667,10 +855,12 @@ def _write_qualification_result(
             or adapter_config_value.get("lora_dropout") != 0.0
             or not isinstance(adapter_targets, list)
             or any(not isinstance(target, str) for target in adapter_targets)
-            or len(adapter_targets) != len(expected_targets)
-            or set(adapter_targets) != expected_targets
+            or len(adapter_targets) != len(_qualification_adapter_targets)
+            or set(adapter_targets) != _qualification_adapter_targets
         ):
             raise RuntimeError("qualification final adapter configuration differs")
+        inventory = _read_qualification_adapter_inventory(adapter_path)
+        layout = _read_qualification_adapter_layout(adapter_path)
         adapter = {
             "path": str(adapter_path),
             "sha256": adapter_sha256,
@@ -684,6 +874,8 @@ def _write_qualification_result(
             "checksum_sha256": sha256_file(digest_path),
             "checksum_value": checksum_value.rstrip("\n"),
             "config": adapter_config_value,
+            "inventory": inventory,
+            "layout": layout,
         }
     fake = config.data.fake
     result = {
@@ -754,18 +946,6 @@ def train(config: TrainerConfig):
             "glm52-native-b2048": (2, False),
             "glm52-native-stability20": (20, True),
         }[qualification_identity["PRIME_QUALIFICATION_PROFILE"]]
-        expected_targets = {
-            "q_a_proj",
-            "q_b_proj",
-            "kv_a_proj_with_mqa",
-            "kv_b_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-            "shared_expert",
-            "experts",
-        }
         if (
             fake is None
             or config.data.rollout_cache is not None
@@ -779,7 +959,7 @@ def train(config: TrainerConfig):
             or config.model.lora is None
             or config.model.lora.rank != 32
             or config.model.lora.alpha != 64
-            or set(config.model.lora.target_modules) != expected_targets
+            or set(config.model.lora.target_modules) != _qualification_source_targets
         ):
             raise RuntimeError("qualification trainer configuration differs")
     if numa_binding is not None:
@@ -2252,6 +2432,7 @@ def train(config: TrainerConfig):
             )
             dist.all_reduce(maximum_forward_backward, op=dist.ReduceOp.MAX)
             forward_backward_time = float(maximum_forward_backward.item())
+        forward_backward_peak_memory = torch.cuda.max_memory_reserved() / 1024**3
 
         # Broadcast the model just produced (policy v{progress.step}) so the orchestrator can
         # sample its next step from it. In-memory transports retain their two-step shutdown
@@ -2346,9 +2527,15 @@ def train(config: TrainerConfig):
         # Report the WORST rank, not rank 0. Under pipeline parallelism rank 0 is
         # stage 0, which owns the fewest layers; reporting it hid 12-layer stages
         # sitting at 46 of 47.4 GiB until they OOM'd.
-        _peak = torch.tensor(torch.cuda.max_memory_reserved() / 1024**3, device="cuda")
-        dist.all_reduce(_peak, op=dist.ReduceOp.MAX)
-        peak_memory = _peak.item()  # GiB, max across ranks
+        _peaks = torch.tensor(
+            (
+                forward_backward_peak_memory,
+                torch.cuda.max_memory_reserved() / 1024**3,
+            ),
+            device="cuda",
+        )
+        dist.all_reduce(_peaks, op=dist.ReduceOp.MAX)
+        forward_backward_peak_memory, peak_memory = _peaks.tolist()
 
         # Log step metrics
         step_time = time.perf_counter() - step_start_time
@@ -2372,6 +2559,7 @@ def train(config: TrainerConfig):
             "perf/throughput_per_gpu": throughput / world.world_size,
             "perf/mfu": mfu,
             "perf/peak_memory": peak_memory,
+            "perf/forward_backward_peak_memory": forward_backward_peak_memory,
             "data/rollout_rows": rollout_rows,
             "step": progress.step,
         }

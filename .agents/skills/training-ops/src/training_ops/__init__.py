@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import ast
 import base64
 import binascii
 import datetime as _dt
+import gzip
 import hashlib
+import io
 import json
 import math
 import os
@@ -6612,6 +6615,362 @@ production_batch2048_profile = "configs/qualification/glm52-native-b2048.toml"
 production_stability20_profile = "configs/qualification/glm52-native-stability20.toml"
 production_step20_h200_profile = glm_step20_h200_gate["profile"]
 production_step20_h200_result = glm_step20_h200_gate["result"]
+qualification_train_source = "source/src/prime_rl/trainer/rl/train.py"
+legacy_stability20_train_sha256 = (
+    "88bb92799b5133ee820b212bc38aa0818e9a87d8dc81ba439c6bec6780655ac0"
+)
+approved_recovery_train_sha256 = (
+    "e4e6a1ba16ed10a1c46e1405e6d135d7735f2a84ff02749e0cadbefc79d75a93"
+)
+qualification_source_targets = {
+    "q_a_proj",
+    "q_b_proj",
+    "kv_a_proj_with_mqa",
+    "kv_b_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+    "shared_expert",
+    "experts",
+}
+qualification_adapter_targets = qualification_source_targets - {"shared_expert"}
+
+
+def _glm52_adapter_inventory(
+    header: dict[str, object],
+) -> dict[str, object]:
+    train_path = repo_root / qualification_train_source
+    tree = ast.parse(train_path.read_text())
+    body = [
+        node
+        for node in tree.body
+        if (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id
+                in {
+                    "_qualification_source_targets",
+                    "_qualification_adapter_targets",
+                }
+                for target in node.targets
+            )
+        )
+        or (
+            isinstance(node, ast.FunctionDef)
+            and node.name == "_qualification_adapter_inventory"
+        )
+    ]
+    namespace = {"hashlib": hashlib, "re": re}
+    exec(compile(ast.Module(body=body, type_ignores=[]), str(train_path), "exec"), namespace)
+    shapes = {}
+    for name, value in header.items():
+        if name == "__metadata__":
+            continue
+        if (
+            not isinstance(name, str)
+            or not isinstance(value, dict)
+            or value.get("dtype") != "BF16"
+            or not isinstance(value.get("shape"), list)
+            or any(isinstance(size, bool) or not isinstance(size, int) for size in value["shape"])
+        ):
+            raise Refused(f"qualification adapter tensor header is invalid: {name}")
+        shapes[name] = tuple(value["shape"])
+    return namespace["_qualification_adapter_inventory"](shapes)
+
+
+def _safetensors_layout(
+    header: dict[str, object], header_size: int
+) -> dict[str, int]:
+    offsets = []
+    for name, value in header.items():
+        if name == "__metadata__":
+            continue
+        shape = value.get("shape") if isinstance(value, dict) else None
+        data_offsets = value.get("data_offsets") if isinstance(value, dict) else None
+        if (
+            not isinstance(value, dict)
+            or value.get("dtype") != "BF16"
+            or not isinstance(shape, list)
+            or any(isinstance(size, bool) or not isinstance(size, int) for size in shape)
+            or not isinstance(data_offsets, list)
+            or len(data_offsets) != 2
+            or any(
+                isinstance(offset, bool) or not isinstance(offset, int)
+                for offset in data_offsets
+            )
+        ):
+            raise Refused(f"qualification adapter tensor layout is invalid: {name}")
+        start, end = data_offsets
+        if start < 0 or end - start != 2 * math.prod(shape):
+            raise Refused(f"qualification adapter tensor layout is invalid: {name}")
+        offsets.append((start, end))
+    cursor = 0
+    for start, end in sorted(offsets):
+        if start != cursor:
+            raise Refused("qualification adapter tensor data is not contiguous")
+        cursor = end
+    return {
+        "header_bytes": header_size,
+        "tensor_bytes": cursor,
+        "file_bytes": 8 + header_size + cursor,
+    }
+
+
+def _remote_safetensors_header_and_size(
+    host: str, path: str
+) -> tuple[dict[str, object], int]:
+    code, encoded = _ssh(
+        host,
+        f"head -c 8 -- {shlex.quote(path)} | base64 -w0",
+        timeout=60,
+    )
+    try:
+        raw = base64.b64decode(encoded.strip(), validate=True)
+        header_size = struct.unpack("<Q", raw)[0]
+    except (ValueError, struct.error) as error:
+        raise Refused("qualification adapter header length is invalid") from error
+    if code or not 2 <= header_size <= 64 * 1024 * 1024:
+        raise Refused("qualification adapter header length is invalid")
+    code, encoded = _ssh(
+        host,
+        "set -o pipefail; "
+        f"dd if={shlex.quote(path)} iflag=skip_bytes,count_bytes skip=8 "
+        f"count={header_size} status=none | gzip -1 | base64 -w0",
+        timeout=180,
+    )
+    if code:
+        raise Refused("qualification adapter header is unreadable")
+    try:
+        header = json.loads(gzip.decompress(base64.b64decode(encoded.strip(), validate=True)))
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        raise Refused("qualification adapter header is invalid") from error
+    if not isinstance(header, dict):
+        raise Refused("qualification adapter header is not an object")
+    return header, header_size
+
+
+def _remote_safetensors_header(host: str, path: str) -> dict[str, object]:
+    return _remote_safetensors_header_and_size(host, path)[0]
+
+
+def _remote_safetensors_header_and_layout(
+    host: str, path: str
+) -> tuple[dict[str, object], dict[str, int]]:
+    header, header_size = _remote_safetensors_header_and_size(host, path)
+    layout = _safetensors_layout(header, header_size)
+    code, output = _ssh(host, f"stat -c %s -- {shlex.quote(path)}", timeout=60)
+    try:
+        observed_size = int(output.strip())
+    except ValueError as error:
+        raise Refused("qualification adapter file size is invalid") from error
+    if code or observed_size != layout["file_bytes"]:
+        raise Refused("qualification adapter file size differs from its header")
+    return header, layout
+
+
+def _remote_file_bytes(host: str, path: str, maximum: int) -> bytes:
+    code, output = _ssh(
+        host,
+        f"size=$(stat -c %s -- {shlex.quote(path)}) && "
+        f"test \"$size\" -le {maximum} && gzip -1 -c -- {shlex.quote(path)} | base64 -w0",
+        timeout=180,
+    )
+    if code:
+        raise Refused(f"required evidence file is unreadable on {host}: {path}")
+    try:
+        return gzip.decompress(base64.b64decode(output.strip(), validate=True))
+    except (OSError, ValueError) as error:
+        raise Refused(f"required evidence file is invalid on {host}: {path}") from error
+
+
+def _qualification_metrics_restore_script(
+    directory: str,
+    name: str,
+    archive_name: str,
+    archive_sha256: str,
+    archive_size: int,
+    metrics_sha256: str,
+    metrics_size: int,
+) -> str:
+    return f"""set -euo pipefail
+python3 - {shlex.quote(directory)} {shlex.quote(name)} {shlex.quote(archive_name)} {archive_sha256} {archive_size} {metrics_sha256} {metrics_size} <<'PY'
+import gzip
+import hashlib
+import os
+import stat
+import sys
+
+root, name, archive_name, archive_sha256, archive_size, metrics_sha256, metrics_size = sys.argv[1:]
+archive_size = int(archive_size)
+metrics_size = int(metrics_size)
+directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+temporary = f".{{name}}-recovering-{{os.getpid()}}"
+try:
+    try:
+        os.stat(name, dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
+        raise SystemExit("qualification metric file already exists")
+    archive = os.open(archive_name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+    try:
+        archive_stat = os.fstat(archive)
+        if not stat.S_ISREG(archive_stat.st_mode) or archive_stat.st_size != archive_size:
+            raise SystemExit("qualification metric archive identity differs")
+        compressed = bytearray()
+        while len(compressed) <= archive_size:
+            block = os.read(archive, min(1024 * 1024, archive_size + 1 - len(compressed)))
+            if not block:
+                break
+            compressed.extend(block)
+    finally:
+        os.close(archive)
+    if len(compressed) != archive_size or hashlib.sha256(compressed).hexdigest() != archive_sha256:
+        raise SystemExit("qualification metric archive checksum differs")
+    try:
+        payload = gzip.decompress(compressed)
+    except (EOFError, OSError) as error:
+        raise SystemExit("qualification metric archive is invalid") from error
+    if len(payload) != metrics_size or hashlib.sha256(payload).hexdigest() != metrics_sha256:
+        raise SystemExit("qualification metric payload differs")
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o644,
+        dir_fd=directory,
+    )
+    try:
+        written = 0
+        while written < len(payload):
+            written += os.write(descriptor, payload[written:])
+        os.fsync(descriptor)
+        os.utime(
+            descriptor,
+            ns=(archive_stat.st_atime_ns, archive_stat.st_mtime_ns),
+        )
+        os.fsync(descriptor)
+        restored = os.fstat(descriptor)
+        if not stat.S_ISREG(restored.st_mode):
+            raise SystemExit("qualification metric output is not a file")
+    finally:
+        os.close(descriptor)
+    try:
+        os.link(
+            temporary,
+            name,
+            src_dir_fd=directory,
+            dst_dir_fd=directory,
+            follow_symlinks=False,
+        )
+    finally:
+        try:
+            os.unlink(temporary, dir_fd=directory)
+        except FileNotFoundError:
+            pass
+    os.fsync(directory)
+finally:
+    os.close(directory)
+PY
+"""
+
+
+def _restore_remote_qualification_metrics(
+    path: str,
+    archive_path: str,
+    archive_sha256: str,
+    archive_size: int,
+    metrics_sha256: str,
+    metrics_size: int,
+) -> None:
+    destination = PurePosixPath(path)
+    archive = PurePosixPath(archive_path)
+    expected = (
+        PurePosixPath("/data/glm52-rl/qualifications/glm52-native-stability20")
+        / "trainer-metrics.jsonl"
+    )
+    if destination != expected or archive != PurePosixPath(f"{expected}.gz"):
+        raise Refused("qualification metric recovery destination differs")
+    script = _qualification_metrics_restore_script(
+        str(destination.parent),
+        destination.name,
+        archive.name,
+        archive_sha256,
+        archive_size,
+        metrics_sha256,
+        metrics_size,
+    )
+    _remote_ok(trainer_head, script, "qualification metric recovery", timeout=60)
+
+
+def _write_remote_qualification_result(path: str, result: dict) -> None:
+    destination = PurePosixPath(path)
+    if (
+        destination
+        != PurePosixPath("/data/glm52-rl/qualifications/glm52-native-stability20")
+        / "qualification-result.json"
+    ):
+        raise Refused("qualification recovery destination differs")
+    payload = (json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    encoded = base64.b64encode(payload).decode()
+    expected = hashlib.sha256(payload).hexdigest()
+    script = f"""set -euo pipefail
+python3 - {shlex.quote(str(destination.parent))} {shlex.quote(destination.name)} {expected} {shlex.quote(encoded)} <<'PY'
+import base64
+import hashlib
+import os
+import stat
+import sys
+
+root, name, expected, encoded = sys.argv[1:]
+payload = base64.b64decode(encoded, validate=True)
+if hashlib.sha256(payload).hexdigest() != expected:
+    raise SystemExit("qualification recovery payload differs")
+directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+temporary = f".{{name}}-recovering"
+try:
+    try:
+        os.stat(name, dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
+        raise SystemExit("qualification result already exists")
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o644,
+        dir_fd=directory,
+    )
+    try:
+        written = 0
+        while written < len(payload):
+            written += os.write(descriptor, payload[written:])
+        os.fsync(descriptor)
+        result = os.fstat(descriptor)
+        if not stat.S_ISREG(result.st_mode):
+            raise SystemExit("qualification recovery output is not a file")
+    finally:
+        os.close(descriptor)
+    try:
+        os.link(
+            temporary,
+            name,
+            src_dir_fd=directory,
+            dst_dir_fd=directory,
+            follow_symlinks=False,
+        )
+    finally:
+        try:
+            os.unlink(temporary, dir_fd=directory)
+        except FileNotFoundError:
+            pass
+    os.fsync(directory)
+finally:
+    os.close(directory)
+PY
+"""
+    _remote_ok(trainer_head, script, "qualification recovery write", timeout=60)
 
 
 def _remote_json(host: str, path: str) -> dict:
@@ -6884,6 +7243,78 @@ def _glm_qualification_limits() -> tuple[int, int, float, float]:
     return age, session_duration, float(duration), float(memory)
 
 
+def _exact_stability_recovery(result: dict, profile: dict) -> bool:
+    recovery = result.get("recovery")
+    expected_metrics_archive = str(
+        PurePosixPath(profile["output_dir"])
+        / f"{profile['file_monitor']['filename']}.gz"
+    )
+    return (
+        isinstance(recovery, dict)
+        and recovery.get("reason") == "adapter_leaf_target_metadata"
+        and recovery.get("original_train_sha256")
+        == legacy_stability20_train_sha256
+        and recovery.get("input_checks") == "executed_not_persisted"
+        and recovery.get("runtime_records") == "derived_from_session"
+        and re.fullmatch(r"[0-9a-f]{64}", str(recovery.get("finalizer_sha256")))
+        is not None
+        and recovery.get("metrics_archive_path") == expected_metrics_archive
+        and re.fullmatch(
+            r"[0-9a-f]{64}", str(recovery.get("metrics_archive_sha256"))
+        )
+        is not None
+        and recovery.get("forward_backward_memory")
+        == "steps_1_19_total_without_adapter_export"
+        and recovery.get("step20_forward_backward_peak") == "not_persisted"
+        and isinstance(recovery.get("step20_total_export_peak_gib"), (int, float))
+        and not isinstance(recovery.get("step20_total_export_peak_gib"), bool)
+        and math.isfinite(recovery["step20_total_export_peak_gib"])
+        and set(recovery)
+        == {
+            "reason",
+            "original_train_sha256",
+            "input_checks",
+            "runtime_records",
+            "finalizer_sha256",
+            "metrics_archive_path",
+            "metrics_archive_sha256",
+            "forward_backward_memory",
+            "step20_forward_backward_peak",
+            "step20_total_export_peak_gib",
+        }
+    )
+
+
+def _qualification_sources_match(
+    session: dict,
+    result: dict,
+    profile: dict,
+    profile_name: str,
+    current_sources: dict[str, str],
+) -> bool:
+    source_files = session.get("source_files")
+    if source_files == current_sources:
+        return True
+    if (
+        profile_name != "glm52-native-stability20"
+        or not _exact_stability_recovery(result, profile)
+        or not isinstance(source_files, dict)
+        or len(source_files) != 46
+        or len(current_sources) != 46
+        or set(source_files) != set(current_sources)
+        or source_files.get(qualification_train_source)
+        != legacy_stability20_train_sha256
+        or current_sources.get(qualification_train_source)
+        != approved_recovery_train_sha256
+    ):
+        return False
+    return all(
+        source_files[path] == current_sources[path]
+        for path in source_files
+        if path != qualification_train_source
+    )
+
+
 def _validate_trainer_qualification(
     session: dict,
     result: dict,
@@ -6915,18 +7346,17 @@ def _validate_trainer_qualification(
         "dp_replicate": 1,
         "dp_shard": 1,
     }
-    expected_targets = {
-        "q_a_proj",
-        "q_b_proj",
-        "kv_a_proj_with_mqa",
-        "kv_b_proj",
-        "o_proj",
-        "gate_proj",
-        "up_proj",
-        "down_proj",
-        "shared_expert",
-        "experts",
-    }
+    expected_targets = qualification_source_targets
+    recovery = result.get("recovery")
+    recovered = _exact_stability_recovery(result, profile)
+    if recovery is not None and not recovered:
+        failures.append("qualification recovery evidence is invalid")
+    if recovered and (
+        profile_name != "glm52-native-stability20"
+        or session.get("source_files", {}).get(qualification_train_source)
+        != legacy_stability20_train_sha256
+    ):
+        failures.append("qualification recovery source differs")
     if session.get("schema_version") != 1 or session.get("kind") != (
         "glm52_trainer_qualification_session"
     ):
@@ -7023,6 +7453,8 @@ def _validate_trainer_qualification(
                 "perf/peak_memory",
                 "time/forward_backward",
             )
+            if not recovered:
+                numeric = (*numeric, "perf/forward_backward_peak_memory")
             if any(
                 isinstance(row.get(key), bool)
                 or not isinstance(row.get(key), (int, float))
@@ -7039,7 +7471,16 @@ def _validate_trainer_qualification(
                 failures.append(f"qualification step {row['step']} trainer time exceeds the limit")
             if row["perf/peak_memory"] <= 0 or row["perf/peak_memory"] > memory_limit:
                 failures.append(f"qualification step {row['step']} memory exceeds the limit")
+            if not recovered and (
+                row["perf/forward_backward_peak_memory"] <= 0
+                or row["perf/forward_backward_peak_memory"] > row["perf/peak_memory"]
+            ):
+                failures.append(
+                    f"qualification step {row['step']} forward/backward memory is invalid"
+                )
             input_sha256 = row.get("input_sha256")
+            if recovered and input_sha256 is None:
+                continue
             if re.fullmatch(r"[0-9a-f]{64}", str(input_sha256)) is None:
                 failures.append(f"qualification step {row['step']} input checksum is invalid")
             elif input_sha256 == previous_input:
@@ -7063,26 +7504,36 @@ def _validate_trainer_qualification(
                     failures.append("qualification median trainer time exceeds the limit")
                 if p90_time > 1.2 * median_time:
                     failures.append("qualification trainer time is not stable")
+            memory_name = (
+                "perf/peak_memory"
+                if recovered
+                else "perf/forward_backward_peak_memory"
+            )
             first_memory = [
-                float(row["perf/peak_memory"])
+                float(row[memory_name])
                 for row in records[:5]
                 if isinstance(row, dict)
-                and isinstance(row.get("perf/peak_memory"), (int, float))
-                and not isinstance(row.get("perf/peak_memory"), bool)
-                and math.isfinite(row["perf/peak_memory"])
+                and isinstance(row.get(memory_name), (int, float))
+                and not isinstance(row.get(memory_name), bool)
+                and math.isfinite(row[memory_name])
             ]
+            late_records = records[14:19] if recovered else records[-5:]
             last_memory = [
-                float(row["perf/peak_memory"])
-                for row in records[-5:]
+                float(row[memory_name])
+                for row in late_records
                 if isinstance(row, dict)
-                and isinstance(row.get("perf/peak_memory"), (int, float))
-                and not isinstance(row.get("perf/peak_memory"), bool)
-                and math.isfinite(row["perf/peak_memory"])
+                and isinstance(row.get(memory_name), (int, float))
+                and not isinstance(row.get(memory_name), bool)
+                and math.isfinite(row[memory_name])
             ]
             if len(first_memory) != 5 or len(last_memory) != 5:
                 failures.append("qualification memory trend is incomplete")
             elif max(last_memory) > statistics.median(first_memory) + 0.5:
                 failures.append("qualification memory use grew across the run")
+            if recovered and recovery.get("step20_total_export_peak_gib") != records[
+                -1
+            ].get("perf/peak_memory"):
+                failures.append("qualification recovery export memory differs")
     runtime_ranks = result.get("runtime_ranks")
     expected_runtime = []
     if isinstance(image_digests, dict) and isinstance(source_files, dict):
@@ -7123,12 +7574,23 @@ def _validate_trainer_qualification(
             "stable_path": str(adapter_root / "STABLE"),
             "checksum_path": str(adapter_root / "adapter_model.safetensors.sha256"),
         }
+        layout = adapter.get("layout") if isinstance(adapter, dict) else None
         if (
             not isinstance(adapter, dict)
             or adapter.get("step") != 20
             or re.fullmatch(r"[0-9a-f]{64}", str(adapter.get("sha256"))) is None
             or not isinstance(adapter.get("size"), int)
-            or not 0 < adapter["size"] <= 1_000_000_000
+            or not isinstance(layout, dict)
+            or set(layout) != {"header_bytes", "tensor_bytes", "file_bytes"}
+            or any(
+                isinstance(layout.get(name), bool)
+                or not isinstance(layout.get(name), int)
+                or layout[name] <= 0
+                for name in layout
+            )
+            or layout["file_bytes"]
+            != 8 + layout["header_bytes"] + layout["tensor_bytes"]
+            or adapter["size"] != layout["file_bytes"]
         ):
             failures.append("qualification final adapter evidence is invalid")
         elif any(adapter.get(name) != path for name, path in expected_paths.items()):
@@ -7160,10 +7622,23 @@ def _validate_trainer_qualification(
             or adapter_config.get("lora_dropout") != 0.0
             or not isinstance(adapter_targets, list)
             or any(not isinstance(target, str) for target in adapter_targets)
-            or len(adapter_targets) != len(expected_targets)
-            or set(adapter_targets) != expected_targets
+            or len(adapter_targets) != len(qualification_adapter_targets)
+            or set(adapter_targets) != qualification_adapter_targets
         ):
             failures.append("qualification adapter configuration differs")
+        inventory = adapter.get("inventory") if isinstance(adapter, dict) else None
+        if (
+            not isinstance(inventory, dict)
+            or inventory.get("leaf_targets") != sorted(qualification_adapter_targets)
+            or inventory.get("tensor_count") != 116_448
+            or inventory.get("attention_tensors") != 780
+            or inventory.get("dense_mlp_tensors") != 18
+            or inventory.get("shared_expert_tensors") != 450
+            or inventory.get("routed_expert_tensors") != 115_200
+            or re.fullmatch(r"[0-9a-f]{64}", str(inventory.get("key_sha256")))
+            is None
+        ):
+            failures.append("qualification adapter tensor coverage differs")
         if isinstance(adapter, dict) and adapter.get("checksum_value") != adapter.get(
             "sha256"
         ):
@@ -7186,6 +7661,338 @@ def _validate_trainer_qualification(
     except (KeyError, TypeError, ValueError):
         failures.append("qualification evidence time is invalid")
     return failures
+
+
+def _parse_qualification_file_stats(
+    output: str, expected: set[str]
+) -> dict[str, tuple[int, int]]:
+    stats = {}
+    for line in output.splitlines():
+        fields = line.rsplit("|", 2)
+        if len(fields) != 3 or fields[0] not in expected or fields[0] in stats:
+            raise Refused("qualification recovery file identity is invalid")
+        try:
+            stats[fields[0]] = (int(fields[1]), int(fields[2]))
+        except ValueError as error:
+            raise Refused("qualification recovery file identity is invalid") from error
+    if set(stats) != expected:
+        raise Refused("qualification recovery file identity is incomplete")
+    return stats
+
+
+def _qualification_recovery_completed_epoch(
+    stats: dict[str, tuple[int, int]], paths: dict[str, str], created_epoch: int
+) -> int:
+    if any(mtime < created_epoch for _size, mtime in stats.values()):
+        raise Refused("qualification recovery file predates its session")
+    adapter_epoch = stats[paths["adapter"]][1]
+    config_epoch = stats[paths["config"]][1]
+    checksum_epoch = stats[paths["checksum"]][1]
+    stable_epoch = stats[paths["stable"]][1]
+    metrics_epoch = stats[paths["metrics"]][1]
+    if checksum_epoch > stable_epoch or stable_epoch - checksum_epoch > 1:
+        raise Refused("qualification recovery completion markers differ")
+    if adapter_epoch > checksum_epoch or config_epoch > checksum_epoch:
+        raise Refused("qualification recovery adapter is newer than its checksum")
+    if metrics_epoch > stable_epoch + 2:
+        raise Refused("qualification recovery monitor flush is too late")
+    return max(mtime for _size, mtime in stats.values())
+
+
+def _qualification_metrics_from_gzip(archive: bytes, maximum: int) -> bytes:
+    try:
+        with gzip.GzipFile(fileobj=io.BytesIO(archive)) as stream:
+            metrics = stream.read(maximum + 1)
+    except (EOFError, OSError) as error:
+        raise Refused("qualification metric archive is invalid") from error
+    if len(metrics) > maximum:
+        raise Refused("qualification metric archive is too large")
+    return metrics
+
+
+def _qualification_recovery_steps(
+    metrics: str,
+    created_time: float,
+    completed_epoch: int,
+    expected_steps: int = 20,
+) -> list[dict[str, float | int]]:
+    required = (
+        "data/rollout_rows",
+        "loss/mean",
+        "optim/grad_norm",
+        "optim/lr",
+        "perf/peak_memory",
+        "time/forward_backward",
+    )
+    merged = {step: {"step": step} for step in range(1, expected_steps + 1)}
+    selected_steps = set()
+    for line_number, line in enumerate(metrics.splitlines(), 1):
+        try:
+            row = json.loads(line)
+        except (TypeError, ValueError) as error:
+            raise Refused(
+                f"qualification metric JSON is invalid on line {line_number}"
+            ) from error
+        if not isinstance(row, dict):
+            raise Refused(f"qualification metric line {line_number} is not an object")
+        timestamp = row.get("time")
+        if (
+            isinstance(timestamp, bool)
+            or not isinstance(timestamp, (int, float))
+            or not math.isfinite(timestamp)
+        ):
+            raise Refused(f"qualification metric line {line_number} has no valid time")
+        if not created_time <= timestamp < completed_epoch + 1:
+            continue
+        step = row.get("step")
+        if (
+            isinstance(step, bool)
+            or not isinstance(step, (int, float))
+            or not math.isfinite(step)
+            or int(step) != step
+            or int(step) not in merged
+        ):
+            raise Refused("qualification recovery contains an unexpected step")
+        step = int(step)
+        selected_steps.add(step)
+        for name in required:
+            if name not in row:
+                continue
+            value = row[name]
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+            ):
+                raise Refused(
+                    f"qualification recovery step {step} has invalid {name}"
+                )
+            if name in merged[step]:
+                raise Refused(
+                    f"qualification recovery step {step} repeats {name}"
+                )
+            merged[step][name] = value
+    if selected_steps != set(merged):
+        raise Refused("qualification recovery does not contain exact steps 1-20")
+    for step, row in merged.items():
+        missing = set(required) - set(row)
+        if missing:
+            raise Refused(
+                f"qualification recovery step {step} is missing {sorted(missing)[0]}"
+            )
+    return list(merged.values())
+
+
+def finalize_glm52_stability20(source_sha256: str) -> dict:
+    """Recover the result file after the pinned leaf-target metadata failure."""
+    with (repo_root / production_stability20_profile).open("rb") as stream:
+        profile = tomllib.load(stream)
+    output_dir = profile["output_dir"].rstrip("/")
+    result_path = f"{output_dir}/qualification-result.json"
+    session = _remote_json(
+        trainer_head, f"{output_dir}/qualification-session.json"
+    )
+    if source_sha256 != session.get("source_sha256"):
+        raise Refused("qualification recovery source confirmation differs")
+    mounted = sorted(_mounts_in(repo_root / "scripts/china/cluster.sh"))
+    expected_sources = {
+        path: hashlib.sha256((repo_root / path).read_bytes()).hexdigest()
+        for path in mounted
+    }
+    expected_sources[qualification_train_source] = legacy_stability20_train_sha256
+    expected_sources["scripts/china/cluster.sh"] = hashlib.sha256(
+        (repo_root / "scripts/china/cluster.sh").read_bytes()
+    ).hexdigest()
+    if session.get("source_files") != expected_sources:
+        raise Refused("qualification recovery is not from the exact legacy source")
+    code, state = _ssh(
+        trainer_head,
+        f"if test -e {shlex.quote(result_path)}; then echo EXISTS; else echo MISSING; fi",
+        timeout=60,
+    )
+    if code or state.strip() != "MISSING":
+        raise Refused("qualification result already exists or cannot be checked")
+
+    adapter_root = PurePosixPath(output_dir) / "run_trainer_only/broadcasts/step_20"
+    paths = {
+        "metrics": str(PurePosixPath(output_dir) / profile["file_monitor"]["filename"]),
+        "metrics_archive": str(
+            PurePosixPath(output_dir) / f"{profile['file_monitor']['filename']}.gz"
+        ),
+        "adapter": str(adapter_root / "adapter_model.safetensors"),
+        "config": str(adapter_root / "adapter_config.json"),
+        "stable": str(adapter_root / "STABLE"),
+        "checksum": str(adapter_root / "adapter_model.safetensors.sha256"),
+    }
+    code, raw_state = _ssh(
+        trainer_head,
+        f"if test -L {shlex.quote(paths['metrics'])}; then echo INVALID; "
+        f"elif test -f {shlex.quote(paths['metrics'])}; then echo FILE; "
+        f"elif test -e {shlex.quote(paths['metrics'])}; then echo INVALID; "
+        "else echo MISSING; fi",
+        timeout=60,
+    )
+    if code or raw_state.strip() not in {"FILE", "MISSING"}:
+        raise Refused("qualification recovery metric file identity is invalid")
+    restore_metrics = raw_state.strip() == "MISSING"
+    timed_paths = dict(paths)
+    timed_paths["metrics"] = paths["metrics_archive"]
+    stat_paths = {path for name, path in timed_paths.items() if name != "metrics_archive"}
+    stat_command = "stat -c '%n|%s|%Y' -- " + " ".join(
+        shlex.quote(path) for path in sorted(stat_paths)
+    )
+    code, stat_output = _ssh(trainer_head, stat_command, timeout=60)
+    if code:
+        raise Refused("qualification recovery files are incomplete")
+    stats = _parse_qualification_file_stats(stat_output, stat_paths)
+    try:
+        created = _dt.datetime.fromisoformat(session["created_utc"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise Refused("qualification recovery session time is invalid") from error
+    if created.tzinfo is None:
+        raise Refused("qualification recovery session time is invalid")
+    created_epoch = int(created.timestamp())
+    completed_epoch = _qualification_recovery_completed_epoch(
+        stats, timed_paths, created_epoch
+    )
+
+    archive_bytes = _remote_file_bytes(
+        trainer_head, paths["metrics_archive"], 4 * 1024 * 1024
+    )
+    if len(archive_bytes) != stats[paths["metrics_archive"]][0]:
+        raise Refused("qualification metric archive size differs")
+    metrics_bytes = _qualification_metrics_from_gzip(
+        archive_bytes, 16 * 1024 * 1024
+    )
+    archive_sha256 = hashlib.sha256(archive_bytes).hexdigest()
+    metrics_sha256 = hashlib.sha256(metrics_bytes).hexdigest()
+    if not restore_metrics:
+        current_metrics = _remote_file_bytes(
+            trainer_head, paths["metrics"], 16 * 1024 * 1024
+        )
+        if current_metrics != metrics_bytes:
+            raise Refused("qualification metric file differs from its archive")
+    try:
+        metrics_text = metrics_bytes.decode()
+    except UnicodeError as error:
+        raise Refused("qualification metric file is not UTF-8") from error
+    steps = _qualification_recovery_steps(
+        metrics_text,
+        created.timestamp(),
+        completed_epoch,
+    )
+
+    adapter_config = _remote_json(trainer_head, paths["config"])
+    adapter_header, adapter_header_size = _remote_safetensors_header_and_size(
+        trainer_head, paths["adapter"]
+    )
+    inventory = _glm52_adapter_inventory(adapter_header)
+    adapter_layout = _safetensors_layout(adapter_header, adapter_header_size)
+    if stats[paths["adapter"]][0] != adapter_layout["file_bytes"]:
+        raise Refused("qualification adapter file size differs from its header")
+    adapter_sha256 = _remote_sha256(paths["adapter"])
+    checksum = _remote_file_bytes(trainer_head, paths["checksum"], 1024)
+    if checksum != f"{adapter_sha256}\n".encode():
+        raise Refused("qualification recovery adapter checksum differs")
+    runtime_ranks = [
+        {
+            "global_rank": rank,
+            "local_rank": rank % 8,
+            "host": session["trainer_hosts"][rank // 8],
+            "image_digest": session["image_digests"][
+                session["trainer_hosts"][rank // 8]
+            ],
+            "source_sha256": session["source_sha256"],
+            "launcher_sha256": session["source_files"]["scripts/china/cluster.sh"],
+        }
+        for rank in range(64)
+    ]
+    result = {
+        "schema_version": 1,
+        "kind": "glm52_trainer_qualification",
+        "session_id": session["session_id"],
+        "profile": session["profile"],
+        "session_sha256": _canonical_json_sha256(session),
+        "config_sha256": session["config_sha256"],
+        "source_sha256": session["source_sha256"],
+        "trainer_head": session["trainer_head"],
+        "trainer_head_image_digest": session["image_digests"][trainer_head],
+        "completed_utc": _dt.datetime.fromtimestamp(
+            completed_epoch, _dt.timezone.utc
+        ).isoformat(),
+        "topology": session["topology"],
+        "fake_data": {
+            "batch_size": 64,
+            "samples_per_micro_batch": 32,
+            "group_size": 16,
+            "sequence_length": 32768,
+            "rollout_cache": False,
+        },
+        "lora": {
+            "rank": 32,
+            "alpha": 64,
+            "targets": sorted(profile["model"]["lora"]["target_modules"]),
+        },
+        "max_steps": 20,
+        "steps": steps,
+        "runtime_ranks": runtime_ranks,
+        "runtime_sha256": hashlib.sha256(
+            (json.dumps(runtime_ranks, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        ).hexdigest(),
+        "metrics_path": paths["metrics"],
+        "metrics_sha256": metrics_sha256,
+        "adapter": {
+            "path": paths["adapter"],
+            "sha256": adapter_sha256,
+            "size": stats[paths["adapter"]][0],
+            "step": 20,
+            "config_path": paths["config"],
+            "config_sha256": _remote_sha256(paths["config"]),
+            "stable_path": paths["stable"],
+            "stable_sha256": _remote_sha256(paths["stable"]),
+            "checksum_path": paths["checksum"],
+            "checksum_sha256": _remote_sha256(paths["checksum"]),
+            "checksum_value": adapter_sha256,
+            "config": adapter_config,
+            "inventory": inventory,
+            "layout": adapter_layout,
+        },
+        "recovery": {
+            "reason": "adapter_leaf_target_metadata",
+            "original_train_sha256": legacy_stability20_train_sha256,
+            "input_checks": "executed_not_persisted",
+            "runtime_records": "derived_from_session",
+            "finalizer_sha256": _sha256_file(Path(__file__), "training operations source"),
+            "metrics_archive_path": paths["metrics_archive"],
+            "metrics_archive_sha256": archive_sha256,
+            "forward_backward_memory": "steps_1_19_total_without_adapter_export",
+            "step20_forward_backward_peak": "not_persisted",
+            "step20_total_export_peak_gib": steps[-1]["perf/peak_memory"],
+        },
+    }
+    failures = _validate_trainer_qualification(
+        session,
+        result,
+        profile,
+        "glm52-native-stability20",
+    )
+    if failures:
+        raise Refused("qualification recovery failed: " + "; ".join(failures))
+    if restore_metrics:
+        _restore_remote_qualification_metrics(
+            paths["metrics"],
+            paths["metrics_archive"],
+            archive_sha256,
+            len(archive_bytes),
+            metrics_sha256,
+            len(metrics_bytes),
+        )
+    if _remote_sha256(paths["metrics"]) != metrics_sha256:
+        raise RuntimeError("qualification recovery metric file differs after restore")
+    _write_remote_qualification_result(result_path, result)
+    if _remote_json(trainer_head, result_path) != result:
+        raise RuntimeError("qualification recovery result differs after write")
+    return result
 
 
 def _validate_step20_h200_gate(
@@ -7488,12 +8295,27 @@ def _step20_stability_evidence() -> tuple[dict, str]:
     ranked_hosts = [trainer_head] + [
         host for host in trainer_hosts if host != trainer_head
     ]
-    if session.get("source_files") != _trainer_qualification_source_files(
-        ranked_hosts
+    current_sources = _trainer_qualification_source_files(ranked_hosts)
+    if not _qualification_sources_match(
+        session,
+        result,
+        profile,
+        "glm52-native-stability20",
+        current_sources,
     ):
         failures.append("stability20 source differs from current trainer mounts")
     if session.get("image_digests") != _trainer_image_digest_map(ranked_hosts):
         failures.append("stability20 images differ from current trainer images")
+    adapter = result.get("adapter")
+    if isinstance(adapter, dict) and isinstance(adapter.get("path"), str):
+        adapter_header, observed_layout = _remote_safetensors_header_and_layout(
+            trainer_head, adapter["path"]
+        )
+        observed_inventory = _glm52_adapter_inventory(adapter_header)
+        if adapter.get("inventory") != observed_inventory:
+            failures.append("stability20 adapter tensor coverage differs")
+        if adapter.get("layout") != observed_layout:
+            failures.append("stability20 adapter file layout differs")
     code, result_sha256 = _ssh(
         trainer_head,
         f"sha256sum {shlex.quote(result_path)} | cut -d' ' -f1",
@@ -7749,7 +8571,9 @@ def production_start_preflight() -> dict[str, object]:
                     session, result, profile, profile_name
                 )
             )
-            if current_sources is not None and session.get("source_files") != current_sources:
+            if current_sources is not None and not _qualification_sources_match(
+                session, result, profile, profile_name, current_sources
+            ):
                 failures.append(f"{profile_name}: qualification source differs from current mounts")
             if current_images is not None and session.get("image_digests") != current_images:
                 failures.append(f"{profile_name}: qualification images differ from current images")
@@ -7757,6 +8581,14 @@ def production_start_preflight() -> dict[str, object]:
                 PurePosixPath(output_dir) / profile["file_monitor"]["filename"]
             )
             files = [(metrics_path, result.get("metrics_sha256"))]
+            recovery = result.get("recovery")
+            if isinstance(recovery, dict):
+                files.append(
+                    (
+                        f"{metrics_path}.gz",
+                        recovery.get("metrics_archive_sha256"),
+                    )
+                )
             adapter = result.get("adapter")
             if isinstance(adapter, dict):
                 adapter_dir = (
@@ -7784,7 +8616,8 @@ def production_start_preflight() -> dict[str, object]:
                 )
             for path, expected in files:
                 if (
-                    not isinstance(expected, str)
+                    not isinstance(path, str)
+                    or not isinstance(expected, str)
                     or re.fullmatch(r"[0-9a-f]{64}", expected) is None
                 ):
                     failures.append(f"{profile_name}: evidence file identity is invalid")
@@ -7821,18 +8654,6 @@ def production_start_preflight() -> dict[str, object]:
                     trainer_head, str(adapter_dir / "adapter_config.json")
                 )
                 targets = adapter_config.get("target_modules")
-                expected_targets = {
-                    "q_a_proj",
-                    "q_b_proj",
-                    "kv_a_proj_with_mqa",
-                    "kv_b_proj",
-                    "o_proj",
-                    "gate_proj",
-                    "up_proj",
-                    "down_proj",
-                    "shared_expert",
-                    "experts",
-                }
                 if (
                     isinstance(adapter_config.get("r"), bool)
                     or isinstance(adapter_config.get("lora_alpha"), bool)
@@ -7842,11 +8663,26 @@ def production_start_preflight() -> dict[str, object]:
                     or adapter_config.get("lora_dropout") != 0.0
                     or not isinstance(targets, list)
                     or any(not isinstance(target, str) for target in targets)
-                    or len(targets) != len(expected_targets)
-                    or set(targets) != expected_targets
+                    or len(targets) != len(qualification_adapter_targets)
+                    or set(targets) != qualification_adapter_targets
                 ):
                     failures.append(
                         f"{profile_name}: adapter configuration differs"
+                    )
+                adapter_header, observed_layout = (
+                    _remote_safetensors_header_and_layout(
+                        trainer_head,
+                        str(adapter_dir / "adapter_model.safetensors"),
+                    )
+                )
+                observed_inventory = _glm52_adapter_inventory(adapter_header)
+                if (
+                    not isinstance(adapter, dict)
+                    or adapter.get("inventory") != observed_inventory
+                    or adapter.get("layout") != observed_layout
+                ):
+                    failures.append(
+                        f"{profile_name}: adapter tensor coverage or layout differs"
                     )
                 checksum_path = str(
                     adapter_dir / "adapter_model.safetensors.sha256"
