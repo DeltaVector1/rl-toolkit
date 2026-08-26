@@ -4,13 +4,18 @@ import ctypes.util
 import gzip
 import os
 import struct
+import threading
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 
 _ZSTD_LEVEL = 1
 _ZSTD_FRAME_BYTES = 8 * 1024 * 1024
+_FULL_WIRE_CHUNK_BYTES = 256 * 1024 * 1024
 _zstd = None
+_wire_size_cache = {}
+_wire_size_lock = threading.Lock()
 
 
 def _zstd_library():
@@ -49,6 +54,42 @@ def _zstd_compress(raw: bytes) -> bytes:
         message = library.ZSTD_getErrorName(result).decode("utf-8", errors="replace")
         raise OSError(f"zstd adapter compression failed: {message}")
     return output.raw[:result]
+
+
+class _ByteCounter:
+    def __init__(self):
+        self.total = 0
+
+    def write(self, value: bytes) -> int:
+        self.total += len(value)
+        return len(value)
+
+
+def _full_wire_length(path: str, codec: str) -> int:
+    """Measure the complete framed transfer without retaining the adapter."""
+    file_path = Path(path)
+    stat = file_path.stat()
+    key = (str(file_path), stat.st_size, stat.st_mtime_ns, codec)
+    with _wire_size_lock:
+        cached = _wire_size_cache.get(key)
+    if cached is not None:
+        return cached
+    total = 0
+    with file_path.open("rb") as source:
+        while raw := source.read(_FULL_WIRE_CHUNK_BYTES):
+            if codec == "gzip":
+                counter = _ByteCounter()
+                with gzip.GzipFile(
+                    fileobj=counter, mode="wb", compresslevel=1, mtime=0
+                ) as compressed:
+                    compressed.write(raw)
+                total += counter.total
+            else:
+                encoded = _zstd_compress(raw)
+                total += 8 + len(encoded)
+    with _wire_size_lock:
+        _wire_size_cache[key] = total
+    return total
 
 
 class GzipRangeHandler(SimpleHTTPRequestHandler):
@@ -97,6 +138,21 @@ class GzipRangeHandler(SimpleHTTPRequestHandler):
             self.send_header("Vary", "Accept-Encoding")
         else:
             self.send_header("Content-Length", str(end - start + 1))
+            if self.command == "HEAD" and not value:
+                if "zstd" in accepted:
+                    self.send_header("X-Prime-Wire-Codec", "zstd")
+                    self.send_header("X-Prime-Raw-Length", str(size))
+                    self.send_header(
+                        "X-Prime-Wire-Length",
+                        str(_full_wire_length(path, "zstd")),
+                    )
+                elif "gzip" in accepted:
+                    self.send_header("X-Prime-Wire-Codec", "gzip")
+                    self.send_header("X-Prime-Raw-Length", str(size))
+                    self.send_header(
+                        "X-Prime-Wire-Length",
+                        str(_full_wire_length(path, "gzip")),
+                    )
         self.send_header(
             "Last-Modified",
             self.date_time_string(os.fstat(source.fileno()).st_mtime),

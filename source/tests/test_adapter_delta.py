@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import gzip
 import json
 import os
 import shutil
@@ -274,6 +275,36 @@ class AdapterDeltaTest(unittest.TestCase):
                 self.assertIsNone(
                     filesystem._full_wire_size_estimate("http://adapter/model", 100)
                 )
+            class Response:
+                headers = {
+                    "X-Prime-Wire-Length": "80",
+                    "X-Prime-Raw-Length": "99",
+                    "X-Prime-Wire-Codec": "gzip",
+                }
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_args):
+                    return False
+
+            with patch.dict(os.environ, {"PRIME_ADAPTER_FULL_WIRE_SIZE": ""}), patch.object(
+                filesystem.urllib.request, "urlopen", return_value=Response()
+            ):
+                self.assertIsNone(
+                    filesystem._full_wire_size_estimate("http://adapter/model", 100)
+                )
+
+    def test_range_server_generates_full_gzip_wire_metadata(self) -> None:
+        from scripts.ops.glm_adapter_range_server import _FULL_WIRE_CHUNK_BYTES, _full_wire_length
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "adapter_model.safetensors"
+            payload = b"adapter bytes" * 100
+            path.write_bytes(payload)
+            expected = len(gzip.compress(payload, compresslevel=1, mtime=0))
+            self.assertEqual(_full_wire_length(str(path), "gzip"), expected)
+            self.assertLess(_FULL_WIRE_CHUNK_BYTES, 1024 * 1024 * 1024)
 
     def test_interrupted_partial_cache_is_removed_and_recent_partial_is_counted(self) -> None:
         filesystem = _load_filesystem_module()
@@ -309,13 +340,82 @@ class AdapterDeltaTest(unittest.TestCase):
                 return_value=SimpleNamespace(free=169),
             ):
                 with self.assertRaises(filesystem.AdapterDiskSpaceError):
-                    filesystem._check_adapter_disk_space(cache, 100, 50)
+                    filesystem._check_adapter_disk_space(cache, 100, 50, guard_bytes=0)
             with patch.object(
                 filesystem.shutil,
                 "disk_usage",
                 return_value=SimpleNamespace(free=170),
             ):
-                filesystem._check_adapter_disk_space(cache, 100, 50)
+                filesystem._check_adapter_disk_space(cache, 100, 50, guard_bytes=0)
+
+    def test_disk_preflight_30_77gb_boundary_counts_delta_and_guard_once(self) -> None:
+        filesystem = _load_filesystem_module()
+        adapter = 30_770_000_000
+        delta = 10_000_000
+        manifest = 2_000
+        guard = 256 * 1024 * 1024
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "cache"
+            active = cache / "active"
+            base = cache / "base"
+            active.mkdir(parents=True)
+            base.mkdir(parents=True)
+            active_model = active / "adapter_model.safetensors"
+            base_model = base / "adapter_model.safetensors"
+            with active_model.open("wb") as output:
+                output.truncate(adapter)
+            with base_model.open("wb") as output:
+                output.truncate(adapter)
+            required = adapter + adapter + delta + manifest + adapter + guard
+            with patch.object(
+                filesystem.shutil,
+                "disk_usage",
+                return_value=SimpleNamespace(free=required),
+            ):
+                filesystem._check_adapter_disk_space(
+                    cache,
+                    adapter,
+                    adapter,
+                    delta,
+                    manifest,
+                    active_path=active_model,
+                    base_path=base_model,
+                    guard_bytes=guard,
+                )
+            with patch.object(
+                filesystem.shutil,
+                "disk_usage",
+                return_value=SimpleNamespace(free=required - 1),
+            ):
+                with self.assertRaises(filesystem.AdapterDiskSpaceError):
+                    filesystem._check_adapter_disk_space(
+                        cache,
+                        adapter,
+                        adapter,
+                        delta,
+                        manifest,
+                        active_path=active_model,
+                        base_path=base_model,
+                        guard_bytes=guard,
+                    )
+            with patch.object(
+                filesystem.shutil,
+                "disk_usage",
+                return_value=SimpleNamespace(
+                    free=adapter + adapter + delta + manifest + guard
+                ),
+            ):
+                # Active and base are the same generation: do not double count.
+                filesystem._check_adapter_disk_space(
+                    cache,
+                    adapter,
+                    adapter,
+                    delta,
+                    manifest,
+                    active_path=active_model,
+                    base_path=active_model,
+                    guard_bytes=guard,
+                )
 
     def test_cache_global_lock_serializes_different_source_urls(self) -> None:
         filesystem = _load_filesystem_module()
@@ -377,6 +477,50 @@ class AdapterDeltaTest(unittest.TestCase):
             ):
                 destination = filesystem.stage_lora_adapter_files("http://adapter/source")
             self.assertTrue(destination.joinpath("READY").is_file())
+
+    def test_failed_delta_is_removed_before_full_fallback(self) -> None:
+        filesystem = _load_filesystem_module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sources = {
+                "one": _export(root, "one", b"a" * 8192),
+                "two": _export(root, "two", b"a" * 8191 + b"b"),
+            }
+            build_adapter_delta(sources["one"], sources["two"], max_ratio=0.99)
+            calls: list[str] = []
+            delta_present_during_full = None
+
+            def fake_download(source_url, destination, create_only=False, **_kwargs):
+                nonlocal delta_present_during_full
+                calls.append(source_url)
+                step, filename = source_url.rstrip("/").split("/")[-2:]
+                source = sources[step] / filename
+                if not source.is_file():
+                    raise FileNotFoundError(source)
+                if filename == "adapter_model.safetensors" and step == "two":
+                    delta_present_during_full = destination.parent.joinpath(
+                        ADAPTER_DELTA_FILE
+                    ).exists()
+                shutil.copyfile(source, destination)
+
+            with patch.dict(
+                os.environ,
+                {
+                    "PRIME_LORA_CACHE_DIR": str(root / "cache"),
+                    "PRIME_ADAPTER_DELTA": "1",
+                },
+                clear=False,
+            ), patch.object(filesystem, "download", side_effect=fake_download):
+                filesystem.stage_lora_adapter_files("http://adapter/one")
+                with patch.object(
+                    filesystem,
+                    "apply_adapter_delta",
+                    side_effect=filesystem.AdapterDeltaError("corrupt delta"),
+                ):
+                    destination = filesystem.stage_lora_adapter_files("http://adapter/two")
+            self.assertTrue(destination.joinpath("READY").is_file())
+            self.assertFalse(delta_present_during_full)
+            self.assertTrue(any(url.endswith("/adapter_model.safetensors") for url in calls))
 
     def test_cache_hit_keeps_valid_adjacent_base(self) -> None:
         filesystem = _load_filesystem_module()

@@ -75,6 +75,7 @@ _ADAPTER_CACHE_MAX_STALE_ENTRIES = 1
 _ADAPTER_CACHE_PARTIAL_MAX_AGE_ENV = "PRIME_LORA_CACHE_PARTIAL_MAX_AGE_SECONDS"
 _ADAPTER_CACHE_PARTIAL_MAX_AGE_SECONDS = 60 * 60
 _ADAPTER_FULL_WIRE_SIZE_ENV = "PRIME_ADAPTER_FULL_WIRE_SIZE"
+_ADAPTER_DISK_GUARD_BYTES = 256 * 1024 * 1024
 _ZSTD_FRAME_BYTES = 8 * 1024 * 1024
 _zstd = None
 _LOGGER = logging.getLogger(__name__)
@@ -369,17 +370,55 @@ def _cache_adapter_bytes(cache_dir: Path) -> int:
     return total
 
 
-def _check_adapter_disk_space(cache_dir: Path, target_size: int, base_size: int = 0) -> None:
-    """Require room for active, base, and an assembling target before transfer."""
-    if target_size <= 0 or base_size < 0:
+def _check_adapter_disk_space(
+    cache_dir: Path,
+    target_size: int,
+    base_size: int = 0,
+    delta_size: int = 0,
+    manifest_size: int = 0,
+    *,
+    active_path: Path | None = None,
+    base_path: Path | None = None,
+    guard_bytes: int = _ADAPTER_DISK_GUARD_BYTES,
+) -> None:
+    """Require room for distinct active/base/delta/target bytes plus guard."""
+    if (
+        target_size <= 0
+        or base_size < 0
+        or delta_size < 0
+        or manifest_size < 0
+        or guard_bytes < 0
+    ):
         raise OSError("adapter disk preflight sizes are invalid")
-    active_size = 0
+    protected: dict[Path, int] = {}
+    if active_path is not None and active_path.is_file():
+        protected[active_path] = active_path.stat().st_size
     if cache_dir.is_dir() and not cache_dir.is_symlink():
         for entry in cache_dir.iterdir():
             model = entry / _ADAPTER_MODEL_NAME
             if entry.is_dir() and not entry.is_symlink() and model.is_file():
-                active_size = max(active_size, model.stat().st_size)
-    required = active_size + base_size + target_size
+                protected.setdefault(model, model.stat().st_size)
+    # If the active path is not supplied, retain the largest cached generation
+    # as the active one.  The protected base is added only when it is distinct.
+    if active_path is not None and active_path.is_file():
+        active_key = active_path
+    else:
+        active_key = max(protected, key=protected.get, default=None)
+    active_size = protected.get(active_key, 0)
+    base_key = base_path if base_path is not None and base_path.is_file() else None
+    base_extra = 0
+    if base_key is not None:
+        base_extra = 0 if base_key == active_key else base_key.stat().st_size
+    elif base_size:
+        base_extra = base_size
+    required = (
+        active_size
+        + base_extra
+        + delta_size
+        + manifest_size
+        + target_size
+        + guard_bytes
+    )
     available = shutil.disk_usage(cache_dir).free
     if available < required:
         raise AdapterDiskSpaceError(
@@ -430,6 +469,12 @@ def _full_wire_size_estimate(source_url: str, target_size: int) -> int | None:
             headers={"Accept-Encoding": codec},
         )
         with urllib.request.urlopen(request, timeout=60) as response:
+            raw_length = response.headers.get("X-Prime-Raw-Length")
+            if raw_length is not None and int(raw_length) != target_size:
+                return None
+            wire_codec = response.headers.get("X-Prime-Wire-Codec")
+            if wire_codec is not None and wire_codec.lower() != codec:
+                return None
             explicit = response.headers.get("X-Prime-Wire-Length")
             if explicit is not None:
                 value = int(explicit)
@@ -866,6 +911,7 @@ def stage_lora_adapter_files(source_url: str) -> Path:
                     f"{source_url.rstrip('/')}/{ADAPTER_DELTA_MANIFEST}",
                     manifest_path,
                 ):
+                    delta_path = None
                     try:
                         delta_manifest = load_adapter_delta_manifest(manifest_path)
                         # The model size is not known until the manifest is
@@ -882,13 +928,16 @@ def stage_lora_adapter_files(source_url: str) -> Path:
                             for key, value in manifest_target.items()
                         ):
                             raise AdapterDeltaError("adapter delta target identity differs")
+                        base_sha256 = delta_manifest["base_sha256"]
+                        base_destination = adapter_cache_path(source_url, base_sha256)
                         _check_adapter_disk_space(
                             destination.parent,
                             target_size,
                             delta_manifest["base_size"],
+                            delta_manifest["delta_size"],
+                            manifest_path.stat().st_size,
+                            base_path=base_destination / _ADAPTER_MODEL_NAME,
                         )
-                        base_sha256 = delta_manifest["base_sha256"]
-                        base_destination = adapter_cache_path(source_url, base_sha256)
                         base_expected = {
                             "version": _ADAPTER_IDENTITY_VERSION,
                             "adapter_model_sha256": base_sha256,
@@ -905,6 +954,7 @@ def stage_lora_adapter_files(source_url: str) -> Path:
                             and base_expected["adapter_config_sha256"] is not None
                             and _cached_adapter_matches(base_destination, base_expected)
                         )
+                        delta_path = None
                         choice = select_adapter_transfer(
                             delta_manifest,
                             base_available=base_available,
@@ -951,7 +1001,23 @@ def stage_lora_adapter_files(source_url: str) -> Path:
                         # Delta is an optimization.  A failed or ineligible
                         # delta must select the complete current transfer.
                         transfer = "full"
+                        if delta_path is not None:
+                            delta_path.unlink(missing_ok=True)
+                            delta_path = None
                         temporary.joinpath(_ADAPTER_MODEL_NAME).unlink(missing_ok=True)
+                        if delta_manifest is not None:
+                            _check_adapter_disk_space(
+                                destination.parent,
+                                int(delta_manifest["uncompressed_size"]),
+                                int(delta_manifest["base_size"]),
+                                0,
+                                0,
+                                base_path=(
+                                    base_destination / _ADAPTER_MODEL_NAME
+                                    if base_destination is not None
+                                    else None
+                                ),
+                            )
 
             if transfer == "full":
                 download(

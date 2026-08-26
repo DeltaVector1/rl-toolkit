@@ -249,6 +249,9 @@ For gzip or zstd, the estimate must be an encoded response length (from
 `X-Prime-Wire-Length`, an encoded `Content-Length`, or
 `PRIME_ADAPTER_FULL_WIRE_SIZE`); a raw target size is not used as a compressed
 wire estimate.
+The range server emits `X-Prime-Wire-Length`, `X-Prime-Wire-Codec`, and
+`X-Prime-Raw-Length` on a full-file `HEAD`; the client rejects missing or
+mismatched identity metadata.
 The normal gzip transfer and production profiles are unchanged.
 
 The digest-keyed H200 adapter cache has a 61,540,000,000-byte default cap
