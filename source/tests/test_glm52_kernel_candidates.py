@@ -92,7 +92,8 @@ class GLM52KernelCandidateTest(unittest.TestCase):
             "class _InplacePermutedLoRAExperts", 1
         )[1].split("\n\nclass _ScaleRoutedOutput", 1)[0]
         self.assertIn("_scattermoe_lora_backward(", backward)
-        self.assertIn("backward_row_indices = torch.arange", backward)
+        self.assertIn("backward_row_indices = (", backward)
+        self.assertIn("torch.arange(", backward)
         outer_kernel = FP8_SOURCE.split(
             "def _scattermoe_outer_accumulate_kernel", 1
         )[1].split("else:\n    _scattermoe_lora_forward_kernel", 1)[0]
@@ -113,6 +114,29 @@ class GLM52KernelCandidateTest(unittest.TestCase):
         self.assertIn("pin_memory=True", forward)
         self.assertIn("low_rank=saved_w2_low_rank", backward)
         self.assertIn("if low_rank is None", FP8_SOURCE)
+
+    def test_lora_backward_scales_intermediates_in_place(self):
+        backward = FP8_SOURCE.split(
+            "class _InplacePermutedLoRAExperts", 1
+        )[1].split("\n\nclass _ScaleRoutedOutput", 1)[0]
+        self.assertIn("scaling=1.0", FP8_SOURCE)
+        self.assertIn("low_rank_grad.mul_(scaling)", FP8_SOURCE)
+        self.assertIn("low_rank.mul_(scaling)", FP8_SOURCE)
+        self.assertNotIn("grad_chunk.mul(ctx.scaling)", backward)
+        self.assertNotIn("z1_grad.mul(ctx.scaling)", backward)
+        self.assertNotIn("z3_grad.mul(ctx.scaling)", backward)
+        self.assertIn("scaling=ctx.scaling", backward)
+        self.assertIn("if _SCATTERMOE_LORA_BWD", backward)
+
+    def test_lora_forward_releases_gathered_input_before_w2(self):
+        forward = FP8_SOURCE.split(
+            "class _InplacePermutedLoRAExperts", 1
+        )[1].split("    @staticmethod\n    def backward", 1)[0]
+        self.assertIn("del chunk_x, safe_indices", forward)
+        self.assertLess(
+            forward.index("del chunk_x, safe_indices"),
+            forward.index("chunk_out = _grouped_mm_chunked"),
+        )
 
     def test_sparse_bh32_candidate_does_not_change_forward(self):
         self.assertIn('variant not in {"baseline", "bh32"}', SPARSE_BWD_SOURCE)

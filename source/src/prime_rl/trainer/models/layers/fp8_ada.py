@@ -2760,6 +2760,7 @@ def _grouped_lora_backward(
     grad_a,
     grad_b,
     low_rank=None,
+    scaling=1.0,
 ):
     """Compute one grouped LoRA backward without nested autograd."""
     if grad_output.dtype != x.dtype:
@@ -2790,12 +2791,18 @@ def _grouped_lora_backward(
         lora_b,
         offs=offsets,
     )
+    # Scale the intermediate in place. This avoids a full-width temporary for
+    # each expert projection while preserving the usual LoRA gradient scale.
+    if scaling != 1.0:
+        low_rank_grad.mul_(scaling)
     input_grad = torch._grouped_mm(
         low_rank_grad,
         lora_a,
         offs=offsets,
     )
     _grouped_outer_accumulate(low_rank_grad, x, offsets, grad_a)
+    if scaling != 1.0:
+        low_rank.mul_(scaling)
     _grouped_outer_accumulate(grad_output, low_rank, offsets, grad_b)
     return input_grad
 
@@ -2810,6 +2817,7 @@ def _scattermoe_lora_backward(
     grad_b,
     row_indices,
     low_rank=None,
+    scaling=1.0,
 ):
     """Run rank-32 backward with FP32 row-mapped parameter gradients.
 
@@ -2843,6 +2851,8 @@ def _scattermoe_lora_backward(
         lora_b,
         offs=offsets,
     )
+    if scaling != 1.0:
+        low_rank_grad.mul_(scaling)
     input_grad = torch._grouped_mm(
         low_rank_grad,
         lora_a,
@@ -2855,6 +2865,8 @@ def _scattermoe_lora_backward(
         offsets,
         grad_a,
     )
+    if scaling != 1.0:
+        low_rank.mul_(scaling)
     _scattermoe_outer_accumulate(
         grad_output,
         low_rank,
@@ -2992,6 +3004,12 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                     alpha=scaling,
                 )
 
+            # The gathered source rows are no longer needed after W1/W3 and
+            # their LoRA updates. Release this bounded copy before W2 allocates
+            # its hidden-width output. The non-LoRA streamed path follows the
+            # same lifetime rule; retaining it here needlessly raises the
+            # allocator peak for every routed-LoRA chunk.
+            del chunk_x, safe_indices
             if save_backward_state:
                 q1, qs1 = ops.scaled_fp8_quant(z1, use_per_token_if_dynamic=True)
                 q3, qs3 = ops.scaled_fp8_quant(z3, use_per_token_if_dynamic=True)
@@ -3041,8 +3059,6 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                 w2_low_rank_host[start:end].copy_(w2_low_rank, non_blocking=True)
             _index_copy_real_rows_with_cache_retry(x, indices, chunk_out, real)
             del (
-                chunk_x,
-                safe_indices,
                 z1,
                 chunk_out,
                 lora_w2,
@@ -3212,10 +3228,14 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
             grad_chunk = _index_select_rows_with_cache_retry(grad, safe_indices)
             grad_chunk.masked_fill_((~real).unsqueeze(-1), 0)
             chunk_offsets = _expert_chunk_offsets(offsets, start, end)
-            backward_row_indices = torch.arange(
-                end - start,
-                device=grad.device,
-                dtype=torch.int64,
+            backward_row_indices = (
+                torch.arange(
+                    end - start,
+                    device=grad.device,
+                    dtype=torch.int64,
+                )
+                if _SCATTERMOE_LORA_BWD
+                else None
             )
 
             q1_device = q1[start:end].to(grad.device, non_blocking=True)
@@ -3243,11 +3263,12 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                     w2_lora_a,
                     w2_lora_b,
                     chunk_offsets,
-                    grad_chunk.mul(ctx.scaling),
+                    grad_chunk,
                     parameter_grads[2],
                     parameter_grads[3],
                     backward_row_indices,
                     low_rank=saved_w2_low_rank,
+                    scaling=ctx.scaling,
                 )
             else:
                 lora_hidden_grad = _grouped_lora_backward(
@@ -3255,10 +3276,11 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                     w2_lora_a,
                     w2_lora_b,
                     chunk_offsets,
-                    grad_chunk.mul(ctx.scaling),
+                    grad_chunk,
                     parameter_grads[2],
                     parameter_grads[3],
                     low_rank=saved_w2_low_rank,
+                    scaling=ctx.scaling,
                 )
             hidden_grad.add_(lora_hidden_grad)
             del lora_hidden_grad, hidden, saved_w2_low_rank
@@ -3291,10 +3313,11 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                     w1_lora_a,
                     w1_lora_b,
                     chunk_offsets,
-                    z1_grad.mul(ctx.scaling),
+                    z1_grad,
                     parameter_grads[0],
                     parameter_grads[1],
                     backward_row_indices,
+                    scaling=ctx.scaling,
                 )
             else:
                 lora_x_grad = _grouped_lora_backward(
@@ -3302,9 +3325,10 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                     w1_lora_a,
                     w1_lora_b,
                     chunk_offsets,
-                    z1_grad.mul(ctx.scaling),
+                    z1_grad,
                     parameter_grads[0],
                     parameter_grads[1],
+                    scaling=ctx.scaling,
                 )
             x_grad.add_(lora_x_grad)
             del lora_x_grad
@@ -3314,10 +3338,11 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                     w3_lora_a,
                     w3_lora_b,
                     chunk_offsets,
-                    z3_grad.mul(ctx.scaling),
+                    z3_grad,
                     parameter_grads[4],
                     parameter_grads[5],
                     backward_row_indices,
+                    scaling=ctx.scaling,
                 )
             else:
                 lora_x_grad = _grouped_lora_backward(
@@ -3325,9 +3350,10 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                     w3_lora_a,
                     w3_lora_b,
                     chunk_offsets,
-                    z3_grad.mul(ctx.scaling),
+                    z3_grad,
                     parameter_grads[4],
                     parameter_grads[5],
+                    scaling=ctx.scaling,
                 )
             x_grad.add_(lora_x_grad)
             x_grad.add_(x_grad_w3)
