@@ -30,7 +30,9 @@ def _trainer_inspect_record(run_records, command):
 
 
 class EdgeOperationsTest(unittest.TestCase):
-    def _run_tunnel_start_script(self, script, commands, outcomes):
+    def _run_tunnel_start_script(
+        self, script, commands, outcomes, kill_race_pids=()
+    ):
         processes = {}
         latest = {}
         killed = []
@@ -81,6 +83,8 @@ class EdgeOperationsTest(unittest.TestCase):
                 return 0 if process and process.outcome == "success" and not process.killed else 1
 
         def killpg(pid, action):
+            if pid in kill_race_pids and action == signal.SIGTERM:
+                raise ProcessLookupError(pid)
             killed.append((pid, action))
             processes[pid].killed = True
 
@@ -1286,12 +1290,31 @@ class EdgeOperationsTest(unittest.TestCase):
         self.assertIn("for attempt in range(3)", start_arguments[2])
         self.assertIn("time.sleep(0.25)", start_arguments[2])
         self.assertIn("cleanup_process(process,command)", start_arguments[2])
+        self.assertIn("except ProcessLookupError: return", start_arguments[2])
         compile(start_arguments[2], "<step20-adapter-tunnel-start>", "exec")
         self.assertEqual(
             json.loads(base64.b64decode(start_arguments[-1], validate=True)),
             commands,
         )
         self.assertTrue(all(command[-1] == training_ops.trainer_ssh for command in commands))
+        proven_max = (
+            len(training_ops.glm_adapter_tunnel_ports)
+            * training_ops.step20_tunnel_attempts
+            * (
+                training_ops.step20_tunnel_launch_stagger_seconds
+                + training_ops.step20_tunnel_start_seconds
+                + training_ops.step20_tunnel_cleanup_seconds
+            )
+            + training_ops.step20_tunnel_probe_seconds
+        )
+        self.assertGreaterEqual(
+            training_ops.step20_tunnel_outer_timeout_seconds,
+            proven_max + 60,
+        )
+        self.assertEqual(
+            remote.call_args_list[0].kwargs["timeout"],
+            training_ops.step20_tunnel_outer_timeout_seconds,
+        )
         stop_arguments = shlex.split(remote.call_args_list[1].args[1])
         self.assertIn("current!=record[\"cmdline\"]", stop_arguments[2])
         self.assertIn("os.killpg", stop_arguments[2])
@@ -1331,6 +1354,19 @@ class EdgeOperationsTest(unittest.TestCase):
         )
         self.assertNotIn(3001, {pid for pid, _action in killed})
         self.assertEqual(json.loads(printed[-1])[0]["pid"], 3002)
+
+        with self.assertRaisesRegex(RuntimeError, "failed after 3 exact attempts"):
+            self._run_tunnel_start_script(
+                script,
+                [first_command, second_command],
+                {
+                    first_port: ["success"],
+                    second_port: ["exit", "exit", "exit"],
+                },
+                kill_race_pids={3001},
+            )
+        _processes, killed, _printed = self._tunnel_simulation
+        self.assertEqual(killed, [])
 
     def test_step20_candidate_cleanup_is_limited_to_random_candidate(self):
         candidate = (

@@ -103,6 +103,12 @@ glm_adapter_tunnel_ports = range(
     ports["glm_adapter_tunnel_first"],
     ports["glm_adapter_tunnel_last"] + 1,
 )
+step20_tunnel_attempts = 3
+step20_tunnel_start_seconds = 5
+step20_tunnel_cleanup_seconds = 5
+step20_tunnel_launch_stagger_seconds = 0.25
+step20_tunnel_probe_seconds = 30
+step20_tunnel_outer_timeout_seconds = 480
 batch_port = ports["batch"]
 h200_parity_backend_port = ports["h200_parity_backend"]
 remote_repo = paths["remote_repository"]
@@ -2670,8 +2676,9 @@ def cleanup_process(process,command):
  try:
   if process.poll() is not None or cmdline(process.pid)!=command: return
  except (FileNotFoundError,ProcessLookupError): return
- os.killpg(process.pid,signal.SIGTERM)
- deadline=time.monotonic()+5
+ try: os.killpg(process.pid,signal.SIGTERM)
+ except ProcessLookupError: return
+ deadline=time.monotonic()+__CLEANUP_SECONDS__
  while time.monotonic()<deadline:
   try:
    if cmdline(process.pid)!=command: return
@@ -2686,10 +2693,10 @@ try:
  for command in commands:
   port=int(command[command.index("-L")+1].split(":")[1])
   if listening(port): raise RuntimeError(f"temporary adapter tunnel port {port} is already in use")
-  for attempt in range(3):
+  for attempt in range(__ATTEMPTS__):
    process=subprocess.Popen(command,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
-   time.sleep(0.25)
-   deadline=time.monotonic()+5
+   time.sleep(__STAGGER_SECONDS__)
+   deadline=time.monotonic()+__START_SECONDS__
    started=False
    while time.monotonic()<deadline:
     if process.poll() is not None: break
@@ -2702,7 +2709,7 @@ try:
     processes.append((process,command)); break
    cleanup_process(process,command)
    if listening(port): raise RuntimeError(f"temporary adapter tunnel port {port} changed owner")
-   if attempt==2: raise RuntimeError(f"temporary adapter tunnel {port} failed after 3 exact attempts")
+   if attempt==__LAST_ATTEMPT__: raise RuntimeError(f"temporary adapter tunnel {port} failed after __ATTEMPTS__ exact attempts")
  records=[]
  for process,command in processes:
   port=int(command[command.index("-L")+1].split(":")[1])
@@ -2710,7 +2717,7 @@ try:
   records.append({"pid":process.pid,"cmdline":command,"port":port})
  request=urllib.request.Request(source_url,headers={"Range":"bytes=0-1023","Accept-Encoding":"gzip"})
  try:
-  with urllib.request.urlopen(request,timeout=30) as response:
+  with urllib.request.urlopen(request,timeout=__PROBE_SECONDS__) as response:
    raw_length=response.headers.get("X-Prime-Raw-Length","")
    if response.status!=206 or response.headers.get("Content-Encoding","").lower()!="gzip" or not raw_length.isdigit(): raise RuntimeError
    with gzip.GzipFile(fileobj=response,mode="rb") as stream: data=stream.read()
@@ -2720,11 +2727,21 @@ try:
 except BaseException:
  cleanup(); raise
 """
+    script = (
+        script.replace("__ATTEMPTS__", str(step20_tunnel_attempts))
+        .replace("__LAST_ATTEMPT__", str(step20_tunnel_attempts - 1))
+        .replace("__START_SECONDS__", str(step20_tunnel_start_seconds))
+        .replace("__CLEANUP_SECONDS__", str(step20_tunnel_cleanup_seconds))
+        .replace(
+            "__STAGGER_SECONDS__", str(step20_tunnel_launch_stagger_seconds)
+        )
+        .replace("__PROBE_SECONDS__", str(step20_tunnel_probe_seconds))
+    )
     output = _remote_ok(
         host,
         shlex.join(["python3", "-c", script, source_url, encoded]),
         "temporary step-20 adapter tunnels",
-        timeout=90,
+        timeout=step20_tunnel_outer_timeout_seconds,
     ).strip()
     try:
         records = json.loads(output)
