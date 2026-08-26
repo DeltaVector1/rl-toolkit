@@ -440,6 +440,9 @@ def status() -> dict[str, object]:
 def supervise(port: int) -> None:
     if port not in ports:
         raise RuntimeError("GLM adapter tunnel supervisor port is invalid")
+    signal.pthread_sigmask(
+        signal.SIG_UNBLOCK, {signal.SIGTERM, signal.SIGHUP, signal.SIGINT}
+    )
     stopping = False
     child = None
 
@@ -450,6 +453,7 @@ def supervise(port: int) -> None:
             child.terminate()
 
     signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGHUP, stop)
     signal.signal(signal.SIGINT, stop)
     while not stopping:
         child = subprocess.Popen(_ssh_command(port))

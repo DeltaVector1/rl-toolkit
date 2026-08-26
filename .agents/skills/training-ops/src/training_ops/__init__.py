@@ -2634,7 +2634,7 @@ def _step20_adapter_tunnel_command(port: int) -> list[str]:
         "Compression=no",
         "-L",
         f"127.0.0.1:{port}:127.0.0.1:{glm_adapter_port}",
-        "china-trainer",
+        trainer_ssh,
     ]
 
 

@@ -192,6 +192,24 @@ class GlmAdapterTunnelTest(unittest.TestCase):
                 self.assertTrue(tunnels.status()["committed"])
                 tunnels.cleanup(launch_id)
 
+    def test_supervisor_unblocks_stop_signals_before_registering_handlers(self):
+        calls = []
+
+        def register(received, handler):
+            calls.append(received)
+            if received == signal.SIGTERM:
+                handler(received, None)
+
+        with (
+            patch.object(tunnels.signal, "pthread_sigmask") as mask,
+            patch.object(tunnels.signal, "signal", side_effect=register),
+        ):
+            tunnels.supervise(tunnels.ports[0])
+        mask.assert_called_once_with(
+            signal.SIG_UNBLOCK, {signal.SIGTERM, signal.SIGHUP, signal.SIGINT}
+        )
+        self.assertEqual(calls, [signal.SIGTERM, signal.SIGHUP, signal.SIGINT])
+
 
 if __name__ == "__main__":
     unittest.main()

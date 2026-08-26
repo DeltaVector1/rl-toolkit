@@ -1157,6 +1157,7 @@ class EdgeOperationsTest(unittest.TestCase):
             json.loads(base64.b64decode(start_arguments[-1], validate=True)),
             commands,
         )
+        self.assertTrue(all(command[-1] == training_ops.trainer_ssh for command in commands))
         stop_arguments = shlex.split(remote.call_args_list[1].args[1])
         self.assertIn("current!=record[\"cmdline\"]", stop_arguments[2])
         self.assertIn("os.killpg", stop_arguments[2])
