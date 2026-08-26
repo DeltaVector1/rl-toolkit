@@ -52,8 +52,11 @@ tunnel() { # local_port  target_host:port  ssh_target  [compress]
     done" >/dev/null 2>&1 < /dev/null &
 }
 
-tunnel 18100 127.0.0.1:8100 china-trainer yes
-ports=(18100)
+adapter_tunnel_ports=(18100 18200 18201 18202 18203 18204 18205 18206)
+for adapter_port in "${adapter_tunnel_ports[@]}"; do
+  tunnel "$adapter_port" 127.0.0.1:8100 china-trainer yes
+done
+ports=("${adapter_tunnel_ports[@]}")
 if [[ " $adapter_admin_urls " == *":18111 "* ]]; then
   tunnel 18101 127.0.0.1:8000 "-p 40051 -i /root/.ssh/china_rollout_ed25519 root@152.236.142.243"
   tunnel 18111 127.0.0.1:8001 "-p 40051 -i /root/.ssh/china_rollout_ed25519 root@152.236.142.243"

@@ -25,7 +25,7 @@ if [[ "$inference_config" != "$expected_inference_config" ]]; then
 fi
 image=${prime_image:-prime-rl:glm52-v080-full}
 model_volume=${prime_model_volume:-glm52-fp8-model}
-adapter_ports=${prime_adapter_ports:-18100}
+adapter_ports=${prime_adapter_ports:-18100,18200,18201,18202,18203,18204,18205,18206}
 engine_container=${prime_inference_container:-glm52-optims-h200}
 require_absent=${prime_require_absent:-0}
 if [[ "$require_absent" != "0" && "$require_absent" != "1" ]]; then

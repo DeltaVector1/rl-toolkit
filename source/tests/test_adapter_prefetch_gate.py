@@ -7,6 +7,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 SYNC = (ROOT / "scripts/h200/sync_rollout_batches.sh").read_text()
 START = (ROOT / "scripts/h200/start_orchestrator.sh").read_text()
+INFERENCE_START = (ROOT / "scripts/h200/start_inference.sh").read_text()
 
 
 class AdapterPrefetchGateTest(unittest.TestCase):
@@ -18,15 +19,25 @@ class AdapterPrefetchGateTest(unittest.TestCase):
         )
 
     def test_prefetch_uses_root_admin_routes_on_both_hosts(self):
-        self.assertIn(
-            'ADAPTER_ADMIN_URLS="http://127.0.0.1:8000 http://127.0.0.1:18101"',
-            START,
-        )
-        self.assertNotIn("127.0.0.1:8000/v1 http://127.0.0.1:18101/v1", START)
+        self.assertIn('print(url.removesuffix("/v1"), end=" ")', START)
+        self.assertIn('ADAPTER_ADMIN_URLS="$adapter_admin_urls"', START)
 
     def test_failed_prefetch_does_not_publish_stable_marker(self):
         pull = SYNC.split("pull_stable_markers()", 1)[1].split("\n}\n", 1)[0]
         self.assertIn('prefetch_adapter "$relative" || continue', pull)
+
+    def test_glm_adapter_uses_eight_independent_range_streams(self):
+        ports = "18100 18200 18201 18202 18203 18204 18205 18206"
+        self.assertIn(f"adapter_tunnel_ports=({ports})", START)
+        self.assertIn('for adapter_port in "${adapter_tunnel_ports[@]}"', START)
+        self.assertIn(
+            'tunnel "$adapter_port" 127.0.0.1:8100 china-trainer yes',
+            START,
+        )
+        self.assertIn(
+            "adapter_ports=${prime_adapter_ports:-" + ports.replace(" ", ",") + "}",
+            INFERENCE_START,
+        )
 
     def test_parallel_batch_copy_staggers_ssh_handshakes(self):
         copy = SYNC.split("copy_parallel()", 1)[1].split("\n}\n", 1)[0]
