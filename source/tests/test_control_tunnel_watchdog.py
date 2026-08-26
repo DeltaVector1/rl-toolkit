@@ -1,12 +1,17 @@
 """Regression checks for the adapter control-tunnel progress probe."""
 
 from pathlib import Path
+import tomllib
 import unittest
 
 
 SCRIPT = (
     Path(__file__).resolve().parents[2] / "scripts/h200/start_control_tunnel.sh"
 ).read_text()
+with (
+    Path(__file__).resolve().parents[2] / "configs/operations.toml"
+).open("rb") as stream:
+    OPERATIONS = tomllib.load(stream)
 
 
 class ControlTunnelWatchdogTest(unittest.TestCase):
@@ -21,6 +26,15 @@ class ControlTunnelWatchdogTest(unittest.TestCase):
         self.assertIn("misses=0", SCRIPT)
         probe = SCRIPT.split("if curl", 1)[1].split("else", 1)[0]
         self.assertIn("misses=0", probe)
+
+    def test_glm_control_tunnel_uses_uncompressed_gzip_server_path(self):
+        ports = OPERATIONS["ports"]
+        self.assertIn("-o Compression=no", SCRIPT)
+        self.assertIn(
+            f'127.0.0.1:{ports["glm_adapter_tunnel"]}:'
+            f'127.0.0.1:{ports["glm_adapter"]}',
+            SCRIPT,
+        )
 
 
 if __name__ == "__main__":

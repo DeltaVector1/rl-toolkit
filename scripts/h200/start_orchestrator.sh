@@ -39,6 +39,15 @@ for url in config["model"]["client"]["admin_base_url"]:
     print(url.removesuffix("/v1"), end=" ")
 PY
 )
+adapter_transfer=$(python3 - "$config_file" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as stream:
+    model = tomllib.load(stream)["model"]["name"]
+print("glm-gzip" if model == "/models/glm52-fp8" else "default")
+PY
+)
 
 tunnel() { # local_port  target_host:port  ssh_target  [compress]
   local lp=$1 tgt=$2 via=$3 comp=${4:-no}
@@ -52,9 +61,19 @@ tunnel() { # local_port  target_host:port  ssh_target  [compress]
     done" >/dev/null 2>&1 < /dev/null &
 }
 
-adapter_tunnel_ports=(18100 18200 18201 18202 18203 18204 18205 18206)
+if [ "$adapter_transfer" = glm-gzip ]; then
+  adapter_tunnel_ports=(18100 18200 18201 18202 18203 18204 18205 18206 18207 18208 18209 18210)
+  adapter_backend_port=8101
+  adapter_compression=no
+  adapter_source_path="runs/$RUN/$RUN_NAME"
+else
+  adapter_tunnel_ports=(18100)
+  adapter_backend_port=8100
+  adapter_compression=yes
+  adapter_source_path="$RUN/$RUN_NAME"
+fi
 for adapter_port in "${adapter_tunnel_ports[@]}"; do
-  tunnel "$adapter_port" 127.0.0.1:8100 china-trainer no
+  tunnel "$adapter_port" "127.0.0.1:$adapter_backend_port" china-trainer "$adapter_compression"
 done
 ports=("${adapter_tunnel_ports[@]}")
 if [[ " $adapter_admin_urls " == *":18111 "* ]]; then
@@ -195,7 +214,7 @@ if [ "$transport" = filesystem ]; then
   fi
   nohup setsid env SOURCE_RUN_DIR="$orchestrator_output" DEST_RUN_DIR="$orchestrator_output" \
     DEST_HOST=china-trainer \
-    ADAPTER_SOURCE_BASE="http://127.0.0.1:18100/runs/$RUN/$RUN_NAME" \
+    ADAPTER_SOURCE_BASE="http://127.0.0.1:18100/$adapter_source_path" \
     ADAPTER_ADMIN_URLS="$adapter_admin_urls" \
     "$deployment/scripts/h200/sync_rollout_batches.sh" \
     >>"/data/glm52-rl/batch-sync-$RUN.log" 2>&1 </dev/null &

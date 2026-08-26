@@ -12,12 +12,17 @@ inference_tunnel_first = 18001
 inference_tunnel_last = 18048
 judge = 26406
 adapter = 8100
+glm_adapter = 8101
+glm_adapter_tunnel = 18100
+glm_adapter_tunnel_extra_first = 18200
+glm_adapter_tunnel_extra_last = 18210
 batch = 29620
 h200_parity_backend = 8100
 
 [paths]
 remote_repository = "/data/glm52-rl/deployment-glm52-optims"
 runs = "/data/glm52-rl/runs"
+glm_adapter_root = "/data/glm52-rl"
 adapter_bucket = "hf://buckets/NewEden/muse-lora-checkpoints"
 
 [containers]

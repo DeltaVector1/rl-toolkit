@@ -11,7 +11,7 @@ import tempfile
 import threading
 import unittest
 from contextlib import nullcontext
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from unittest.mock import patch
 
 import tomllib
@@ -865,6 +865,14 @@ class EdgeOperationsTest(unittest.TestCase):
             remote.append((command_text, timeout))
             return "installed\n" if "sudo python3" in command_text else ""
 
+        tunnel_records = [
+            {
+                "pid": 1000 + port,
+                "port": port,
+                "cmdline": training_ops._step20_adapter_tunnel_command(port),
+            }
+            for port in range(18200, 18211)
+        ]
         with (
             patch.object(training_ops, "_download_adapter_file", side_effect=download),
             patch.object(training_ops, "_local_command", side_effect=command),
@@ -874,6 +882,13 @@ class EdgeOperationsTest(unittest.TestCase):
                 side_effect=direct_download,
             ),
             patch.object(training_ops, "_remote_ok", side_effect=remote_ok),
+            patch.object(
+                training_ops,
+                "_start_step20_adapter_tunnels",
+                return_value=tunnel_records,
+            ),
+            patch.object(training_ops, "_stop_step20_adapter_tunnels") as stop_tunnels,
+            patch.object(training_ops, "_cleanup_step20_adapter_candidate") as cleanup,
             patch.object(training_ops.secrets, "token_hex", return_value="1" * 16),
         ):
             self.assertEqual(
@@ -882,6 +897,10 @@ class EdgeOperationsTest(unittest.TestCase):
                 ),
                 training_ops.glm_step20_h200_gate["adapter"],
             )
+        stop_tunnels.assert_called_once_with(
+            training_ops.inference_hosts[0], tunnel_records
+        )
+        cleanup.assert_not_called()
         self.assertEqual(len(direct), 1)
         self.assertEqual(direct[0][1], adapter["path"])
         self.assertIn(".adapter-candidate-" + "1" * 16, direct[0][2])
@@ -995,6 +1014,37 @@ class EdgeOperationsTest(unittest.TestCase):
                 expected_files,
             )
 
+        with (
+            patch.object(training_ops, "_remote_ok", return_value=""),
+            patch.object(
+                training_ops,
+                "_start_step20_adapter_tunnels",
+                return_value=tunnel_records,
+            ),
+            patch.object(
+                training_ops,
+                "_download_glm_adapter_direct",
+                side_effect=RuntimeError("injected transfer failure"),
+            ),
+            patch.object(
+                training_ops, "_cleanup_step20_adapter_candidate"
+            ) as cleanup,
+            patch.object(
+                training_ops, "_stop_step20_adapter_tunnels"
+            ) as stop_tunnels,
+            patch.object(training_ops.secrets, "token_hex", return_value="2" * 16),
+            self.assertRaisesRegex(RuntimeError, "injected transfer failure"),
+        ):
+            training_ops._stage_step20_adapter_on_h200(adapter, result_sha256)
+        cleanup.assert_called_once_with(
+            training_ops.inference_hosts[0],
+            PurePosixPath(training_ops.glm_step20_h200_gate["adapter"]).parent
+            / (".adapter-candidate-" + "2" * 16),
+        )
+        stop_tunnels.assert_called_once_with(
+            training_ops.inference_hosts[0], tunnel_records
+        )
+
     def test_direct_glm_adapter_download_requires_gzip_ranges(self):
         digest = "a" * 64
         report = json.dumps({"bytes": 123, "seconds": 9.5, "sha256": digest})
@@ -1011,13 +1061,62 @@ class EdgeOperationsTest(unittest.TestCase):
         arguments = shlex.split(remote.call_args.args[1])
         self.assertIn("PRIME_GLM_ADAPTER_GZIP=1", arguments)
         self.assertIn(
-            "PRIME_ADAPTER_PORTS=18100,18200,18201,18202,18203,18204,18205,18206",
+            "PRIME_ADAPTER_PORTS=18100,18200,18201,18202,18203,18204,18205,18206,18207,18208,18209,18210",
             arguments,
         )
         self.assertIn(
             "http://127.0.0.1:18100/qualifications/test/adapter_model.safetensors",
             arguments,
         )
+
+    def test_step20_tunnels_record_and_clean_only_exact_processes(self):
+        commands = [
+            training_ops._step20_adapter_tunnel_command(port)
+            for port in range(18200, 18211)
+        ]
+        records = [
+            {"pid": 1000 + index, "cmdline": command, "port": 18200 + index}
+            for index, command in enumerate(commands)
+        ]
+        replies = iter((json.dumps(records), "cleaned\n"))
+        with patch.object(
+            training_ops, "_remote_ok", side_effect=lambda *_args, **_kwargs: next(replies)
+        ) as remote:
+            observed = training_ops._start_step20_adapter_tunnels(
+                training_ops.inference_hosts[0],
+                "http://127.0.0.1:18100/qualifications/test/adapter_model.safetensors",
+            )
+            training_ops._stop_step20_adapter_tunnels(
+                training_ops.inference_hosts[0], observed
+            )
+        self.assertEqual(observed, records)
+        start_arguments = shlex.split(remote.call_args_list[0].args[1])
+        self.assertIn("required GLM gzip adapter server is not ready", start_arguments[2])
+        compile(start_arguments[2], "<step20-adapter-tunnel-start>", "exec")
+        self.assertEqual(
+            json.loads(base64.b64decode(start_arguments[-1], validate=True)),
+            commands,
+        )
+        stop_arguments = shlex.split(remote.call_args_list[1].args[1])
+        self.assertIn("current!=record[\"cmdline\"]", stop_arguments[2])
+        self.assertIn("os.killpg", stop_arguments[2])
+        compile(stop_arguments[2], "<step20-adapter-tunnel-stop>", "exec")
+
+    def test_step20_candidate_cleanup_is_limited_to_random_candidate(self):
+        candidate = (
+            PurePosixPath(training_ops.glm_step20_h200_gate["adapter"]).parent
+            / ".adapter-candidate-1111111111111111"
+        )
+        with patch.object(training_ops, "_remote_ok", return_value="removed\n") as remote:
+            training_ops._cleanup_step20_adapter_candidate(
+                training_ops.inference_hosts[0], candidate
+            )
+        arguments = shlex.split(remote.call_args.args[1])
+        compile(arguments[2], "<step20-adapter-candidate-cleanup>", "exec")
+        self.assertIn("os.O_NOFOLLOW", arguments[2])
+        self.assertIn('parts_name="adapter_model.safetensors.parts"', arguments[2])
+        self.assertNotIn("adapter-step20", arguments[2])
+        self.assertNotIn("rm -rf", arguments[2])
 
     def test_step20_trainer_parity_action_pins_exact_adapter_and_step(self):
         with patch.object(training_ops, "qualify") as qualify:

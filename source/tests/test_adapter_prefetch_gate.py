@@ -1,6 +1,7 @@
 """Regression checks for pre-policy adapter staging on the H200 hosts."""
 
 from pathlib import Path
+import tomllib
 import unittest
 
 
@@ -8,6 +9,8 @@ ROOT = Path(__file__).resolve().parents[2]
 SYNC = (ROOT / "scripts/h200/sync_rollout_batches.sh").read_text()
 START = (ROOT / "scripts/h200/start_orchestrator.sh").read_text()
 INFERENCE_START = (ROOT / "scripts/h200/start_inference.sh").read_text()
+with (ROOT / "configs/operations.toml").open("rb") as stream:
+    OPERATIONS = tomllib.load(stream)
 
 
 class AdapterPrefetchGateTest(unittest.TestCase):
@@ -26,12 +29,36 @@ class AdapterPrefetchGateTest(unittest.TestCase):
         pull = SYNC.split("pull_stable_markers()", 1)[1].split("\n}\n", 1)[0]
         self.assertIn('prefetch_adapter "$relative" || continue', pull)
 
-    def test_glm_adapter_uses_eight_independent_range_streams(self):
-        ports = "18100 18200 18201 18202 18203 18204 18205 18206"
+    def test_glm_adapter_uses_twelve_independent_range_streams(self):
+        inventory = OPERATIONS["ports"]
+        self.assertEqual(inventory["glm_adapter"], 8101)
+        self.assertEqual(inventory["glm_adapter_tunnel"], 18100)
+        self.assertEqual(inventory["glm_adapter_tunnel_extra_first"], 18200)
+        self.assertEqual(inventory["glm_adapter_tunnel_extra_last"], 18210)
+        ports = " ".join(
+            str(port)
+            for port in (
+                inventory["glm_adapter_tunnel"],
+                *range(
+                    inventory["glm_adapter_tunnel_extra_first"],
+                    inventory["glm_adapter_tunnel_extra_last"] + 1,
+                ),
+            )
+        )
         self.assertIn(f"adapter_tunnel_ports=({ports})", START)
         self.assertIn('for adapter_port in "${adapter_tunnel_ports[@]}"', START)
         self.assertIn(
-            'tunnel "$adapter_port" 127.0.0.1:8100 china-trainer no',
+            'model == "/models/glm52-fp8"',
+            START,
+        )
+        self.assertIn(f'adapter_backend_port={inventory["glm_adapter"]}', START)
+        self.assertIn("adapter_compression=no", START)
+        self.assertIn("adapter_backend_port=8100", START)
+        self.assertIn("adapter_compression=yes", START)
+        self.assertIn('adapter_tunnel_ports=(18100)', START)
+        self.assertIn(
+            'tunnel "$adapter_port" "127.0.0.1:$adapter_backend_port" '
+            'china-trainer "$adapter_compression"',
             START,
         )
         self.assertIn(
@@ -40,9 +67,10 @@ class AdapterPrefetchGateTest(unittest.TestCase):
         )
         self.assertIn('-e PRIME_GLM_ADAPTER_GZIP=1', INFERENCE_START)
         self.assertIn(
-            'ADAPTER_SOURCE_BASE="http://127.0.0.1:18100/runs/$RUN/$RUN_NAME"',
+            'adapter_source_path="runs/$RUN/$RUN_NAME"',
             START,
         )
+        self.assertEqual(OPERATIONS["paths"]["glm_adapter_root"], "/data/glm52-rl")
 
     def test_parallel_batch_copy_staggers_ssh_handshakes(self):
         copy = SYNC.split("copy_parallel()", 1)[1].split("\n}\n", 1)[0]

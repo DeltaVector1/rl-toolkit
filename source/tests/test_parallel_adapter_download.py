@@ -1,4 +1,5 @@
 import importlib.util
+import gzip
 import os
 import re
 import sys
@@ -6,6 +7,7 @@ import tempfile
 import threading
 import types
 import unittest
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
@@ -54,7 +56,7 @@ def _load_filesystem_module():
 
 
 def _load_adapter_server_module():
-    path = Path(__file__).parents[2] / "scripts/china/adapter_server.py"
+    path = Path(__file__).parents[2] / "scripts/ops/glm_adapter_range_server.py"
     spec = importlib.util.spec_from_file_location("adapter_server", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -153,7 +155,7 @@ class ParallelAdapterDownloadTest(unittest.TestCase):
     def test_glm_gzip_ranges_are_required_and_create_only(self):
         adapter_server = _load_adapter_server_module()
 
-        class Handler(adapter_server.RangeHandler):
+        class Handler(adapter_server.GzipRangeHandler):
             gzip_requests = 0
 
             def log_message(self, *_args):
@@ -167,8 +169,11 @@ class ParallelAdapterDownloadTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "runs").mkdir()
+            (root / "qualifications").mkdir()
             source = root / "runs/adapter"
             source.write_bytes(_RangeHandler.payload)
+            qualification_source = root / "qualifications/adapter"
+            qualification_source.write_bytes(_RangeHandler.payload)
             server = ThreadingHTTPServer(
                 ("127.0.0.1", 0),
                 lambda *args, **kwargs: Handler(
@@ -178,7 +183,7 @@ class ParallelAdapterDownloadTest(unittest.TestCase):
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             destination = root / "downloaded.safetensors"
-            url = f"http://127.0.0.1:{server.server_port}/adapter"
+            url = f"http://127.0.0.1:{server.server_port}/runs/adapter"
             environment = {
                 "PRIME_GLM_ADAPTER_GZIP": "1",
                 "PRIME_ADAPTER_PORTS": ",".join([str(server.server_port)] * 4),
@@ -191,6 +196,15 @@ class ParallelAdapterDownloadTest(unittest.TestCase):
                     self.module.download(url, destination, create_only=True)
                     with self.assertRaises(FileExistsError):
                         self.module.download(url, destination, create_only=True)
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{server.server_port}/qualifications/adapter",
+                    headers={"Range": "bytes=10-99", "Accept-Encoding": "gzip"},
+                )
+                with urllib.request.urlopen(request) as response:
+                    self.assertEqual(
+                        gzip.decompress(response.read()),
+                        _RangeHandler.payload[10:100],
+                    )
             finally:
                 server.shutdown()
                 thread.join()

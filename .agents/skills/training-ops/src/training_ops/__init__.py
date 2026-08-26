@@ -95,9 +95,16 @@ inference_tunnel_ports = list(
 )
 judge_port = ports["judge"]
 adapter_port = ports["adapter"]
+glm_adapter_port = ports["glm_adapter"]
+glm_adapter_tunnel_port = ports["glm_adapter_tunnel"]
+glm_adapter_tunnel_extra_ports = range(
+    ports["glm_adapter_tunnel_extra_first"],
+    ports["glm_adapter_tunnel_extra_last"] + 1,
+)
 batch_port = ports["batch"]
 h200_parity_backend_port = ports["h200_parity_backend"]
 remote_repo = paths["remote_repository"]
+glm_adapter_root = PurePosixPath(paths["glm_adapter_root"])
 glm_parity_inference_config = (
     f"{remote_repo}/configs/qualification/glm52-policy-parity-h200.toml"
 )
@@ -2366,6 +2373,192 @@ def _download_adapter_file(remote_path: str, local_path: Path) -> None:
     _local_command(command, f"download {remote_path}", timeout=1800)
 
 
+def _step20_adapter_tunnel_command(port: int) -> list[str]:
+    if port not in glm_adapter_tunnel_extra_ports:
+        raise Refused("temporary adapter tunnel port is invalid")
+    return [
+        "ssh",
+        "-NT",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=30",
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-o",
+        "ServerAliveInterval=10",
+        "-o",
+        "ServerAliveCountMax=3",
+        "-o",
+        "TCPKeepAlive=yes",
+        "-o",
+        "IPQoS=none",
+        "-o",
+        "Compression=no",
+        "-L",
+        f"127.0.0.1:{port}:127.0.0.1:{glm_adapter_port}",
+        "china-trainer",
+    ]
+
+
+def _start_step20_adapter_tunnels(host: str, source_url: str) -> list[dict]:
+    if (
+        host != inference_hosts[0]
+        or re.fullmatch(
+            rf"http://127\.0\.0\.1:{glm_adapter_tunnel_port}/qualifications/[A-Za-z0-9_./-]+",
+            source_url,
+        )
+        is None
+        or ".." in source_url
+    ):
+        raise Refused("temporary adapter tunnel source is invalid")
+    commands = [
+        _step20_adapter_tunnel_command(port)
+        for port in glm_adapter_tunnel_extra_ports
+    ]
+    encoded = base64.b64encode(
+        json.dumps(commands, separators=(",", ":")).encode()
+    ).decode()
+    script = """import base64,gzip,json,os,signal,socket,subprocess,sys,time,urllib.request
+source_url,encoded=sys.argv[1:]
+commands=json.loads(base64.b64decode(encoded,validate=True))
+processes=[]
+def listening(port):
+ with socket.socket() as client:
+  client.settimeout(1); return client.connect_ex(("127.0.0.1",port))==0
+def cmdline(pid):
+ with open(f"/proc/{pid}/cmdline","rb") as source: return [value.decode() for value in source.read().split(b"\\0") if value]
+def cleanup():
+ exact=[]
+ for process,command in reversed(processes):
+  try:
+   if cmdline(process.pid)==command:
+    os.killpg(process.pid,signal.SIGTERM); exact.append((process.pid,command))
+  except (FileNotFoundError,ProcessLookupError): pass
+ deadline=time.monotonic()+5
+ while time.monotonic()<deadline and any(os.path.exists(f"/proc/{pid}") for pid,_command in exact): time.sleep(0.1)
+ for pid,command in exact:
+  try:
+   if cmdline(pid)==command: os.killpg(pid,signal.SIGKILL)
+  except (FileNotFoundError,ProcessLookupError): pass
+try:
+ request=urllib.request.Request(source_url,headers={"Range":"bytes=0-1023","Accept-Encoding":"gzip"})
+ try:
+  with urllib.request.urlopen(request,timeout=30) as response:
+   if response.status!=206 or response.headers.get("Content-Encoding","").lower()!="gzip" or response.headers.get("X-Prime-Raw-Length")!="1024": raise RuntimeError
+   with gzip.GzipFile(fileobj=response,mode="rb") as stream:
+    if len(stream.read())!=1024: raise RuntimeError
+ except BaseException as error: raise RuntimeError("required GLM gzip adapter server is not ready on supervised port 18100") from error
+ for command in commands:
+  port=int(command[command.index("-L")+1].split(":")[1])
+  if listening(port): raise RuntimeError(f"temporary adapter tunnel port {port} is already in use")
+  processes.append((subprocess.Popen(command,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True),command))
+ deadline=time.monotonic()+45
+ while time.monotonic()<deadline and not all(listening(int(command[command.index("-L")+1].split(":")[1])) for _process,command in processes): time.sleep(0.2)
+ records=[]
+ for process,command in processes:
+  port=int(command[command.index("-L")+1].split(":")[1])
+  if process.poll() is not None or not listening(port) or cmdline(process.pid)!=command: raise RuntimeError(f"temporary adapter tunnel {port} did not start with its exact command")
+  records.append({"pid":process.pid,"cmdline":command,"port":port})
+ print(json.dumps(records,separators=(",",":")))
+except BaseException:
+ cleanup(); raise
+"""
+    output = _remote_ok(
+        host,
+        shlex.join(["python3", "-c", script, source_url, encoded]),
+        "temporary step-20 adapter tunnels",
+        timeout=90,
+    ).strip()
+    try:
+        records = json.loads(output)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("temporary adapter tunnel record is invalid") from error
+    expected = {
+        port: _step20_adapter_tunnel_command(port)
+        for port in glm_adapter_tunnel_extra_ports
+    }
+    if (
+        not isinstance(records, list)
+        or len(records) != len(glm_adapter_tunnel_extra_ports)
+        or {
+            record.get("port")
+            for record in records
+            if isinstance(record, dict)
+        }
+        != set(expected)
+        or any(
+            not isinstance(record, dict)
+            or isinstance(record.get("pid"), bool)
+            or not isinstance(record.get("pid"), int)
+            or record["pid"] <= 1
+            or record.get("cmdline") != expected.get(record.get("port"))
+            for record in records
+        )
+    ):
+        raise RuntimeError("temporary adapter tunnel identity differs")
+    return records
+
+
+def _stop_step20_adapter_tunnels(host: str, records: list[dict]) -> None:
+    expected = {
+        port: _step20_adapter_tunnel_command(port)
+        for port in glm_adapter_tunnel_extra_ports
+    }
+    if (
+        host != inference_hosts[0]
+        or len(records) != len(glm_adapter_tunnel_extra_ports)
+        or any(
+            not isinstance(record, dict)
+            or record.get("cmdline") != expected.get(record.get("port"))
+            or isinstance(record.get("pid"), bool)
+            or not isinstance(record.get("pid"), int)
+            or record["pid"] <= 1
+            for record in records
+        )
+    ):
+        raise Refused("temporary adapter tunnel cleanup identity is invalid")
+    encoded = base64.b64encode(
+        json.dumps(records, separators=(",", ":")).encode()
+    ).decode()
+    script = """import base64,json,os,signal,sys,time
+records=json.loads(base64.b64decode(sys.argv[1],validate=True))
+def cmdline(pid):
+ with open(f"/proc/{pid}/cmdline","rb") as source: return [value.decode() for value in source.read().split(b"\\0") if value]
+errors=[]
+exact=[]
+for record in records:
+ pid=record["pid"]
+ try: current=cmdline(pid)
+ except FileNotFoundError: continue
+ if current!=record["cmdline"]:
+  errors.append(f"temporary adapter tunnel PID {pid} changed identity"); continue
+ os.killpg(pid,signal.SIGTERM); exact.append(record)
+deadline=time.monotonic()+10
+alive=[]
+while time.monotonic()<deadline:
+ alive=[]
+ for record in exact:
+  try: alive.append((record,cmdline(record["pid"])))
+  except FileNotFoundError: pass
+ if not alive: break
+ time.sleep(0.1)
+for record,current in alive:
+ if current!=record["cmdline"]: errors.append(f"temporary adapter tunnel PID {record['pid']} changed identity")
+ else: os.killpg(record["pid"],signal.SIGKILL)
+if errors: raise RuntimeError("; ".join(errors))
+print("cleaned")
+"""
+    result = _remote_ok(
+        host,
+        shlex.join(["python3", "-c", script, encoded]),
+        "temporary step-20 adapter tunnel cleanup",
+        timeout=30,
+    ).strip()
+    if result != "cleaned":
+        raise RuntimeError("temporary adapter tunnel cleanup returned invalid state")
+
+
 def _download_glm_adapter_direct(
     host: str,
     source_path: str,
@@ -2375,7 +2568,7 @@ def _download_glm_adapter_direct(
 ) -> dict[str, float | int | str]:
     source = PurePosixPath(source_path)
     destination = PurePosixPath(destination_path)
-    qualification_root = PurePosixPath("/data/glm52-rl/qualifications")
+    qualification_root = glm_adapter_root / "qualifications"
     destination_root = PurePosixPath(glm_step20_h200_gate["adapter"]).parent
     if (
         host != inference_hosts[0]
@@ -2398,9 +2591,12 @@ def _download_glm_adapter_direct(
     downloader = (
         f"{remote_repo}/source/src/prime_rl/inference/vllm/worker/filesystem.py"
     )
-    served_path = source.relative_to(PurePosixPath("/data/glm52-rl"))
-    source_url = f"http://127.0.0.1:18100/{served_path}"
-    ports = "18100,18200,18201,18202,18203,18204,18205,18206"
+    served_path = source.relative_to(glm_adapter_root)
+    source_url = f"http://127.0.0.1:{glm_adapter_tunnel_port}/{served_path}"
+    adapter_ports = ",".join(
+        str(port)
+        for port in (glm_adapter_tunnel_port, *glm_adapter_tunnel_extra_ports)
+    )
     command = shlex.join(
         [
             "timeout",
@@ -2409,7 +2605,7 @@ def _download_glm_adapter_direct(
             "3300s",
             "env",
             "PRIME_GLM_ADAPTER_GZIP=1",
-            f"PRIME_ADAPTER_PORTS={ports}",
+            f"PRIME_ADAPTER_PORTS={adapter_ports}",
             "python3",
             downloader,
             source_url,
@@ -2437,6 +2633,82 @@ def _download_glm_adapter_direct(
     ):
         raise RuntimeError("direct adapter download identity differs")
     return result
+
+
+def _cleanup_step20_adapter_candidate(host: str, candidate: PurePosixPath) -> None:
+    final = PurePosixPath(glm_step20_h200_gate["adapter"])
+    if (
+        host != inference_hosts[0]
+        or candidate.parent != final.parent
+        or re.fullmatch(r"\.adapter-candidate-[0-9a-f]{16}", candidate.name)
+        is None
+    ):
+        raise Refused("step-20 candidate cleanup identity is invalid")
+    script = """import os,re,stat,sys
+root,candidate_name=sys.argv[1:]
+directory=os.open(root,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+allowed={"adapter_model.safetensors","adapter_config.json","STABLE","adapter_model.safetensors.sha256",".qualification-result.json","adapter_model.safetensors.assembling","adapter_model.safetensors.parts"}
+try:
+ try: candidate=os.open(candidate_name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=directory)
+ except FileNotFoundError: print("absent"); raise SystemExit
+ try:
+  info=os.fstat(candidate)
+  if info.st_uid not in {0,1000} or info.st_gid not in {0,1000} or stat.S_IMODE(info.st_mode) not in {0o750,0o755}: raise RuntimeError("candidate directory identity differs")
+  names=set(os.listdir(candidate))
+  if not names<=allowed: raise RuntimeError("candidate cleanup file set differs")
+  parts_name="adapter_model.safetensors.parts"
+  if parts_name in names:
+   parts=os.open(parts_name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=candidate)
+   try:
+    part_names=os.listdir(parts)
+    if any(re.fullmatch(r"part-[0-9]{3}",name) is None for name in part_names): raise RuntimeError("candidate part file set differs")
+    for name in part_names:
+     fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=parts)
+     try:
+      item=os.fstat(fd)
+      if not stat.S_ISREG(item.st_mode) or item.st_nlink!=1: raise RuntimeError("candidate part identity differs")
+     finally: os.close(fd)
+     os.unlink(name,dir_fd=parts)
+   finally: os.close(parts)
+   os.rmdir(parts_name,dir_fd=candidate)
+   names.remove(parts_name)
+  for name in names:
+   fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=candidate)
+   try:
+    item=os.fstat(fd)
+    if not stat.S_ISREG(item.st_mode) or item.st_nlink!=1: raise RuntimeError("candidate file identity differs")
+   finally: os.close(fd)
+   os.unlink(name,dir_fd=candidate)
+ finally: os.close(candidate)
+ os.rmdir(candidate_name,dir_fd=directory)
+ os.fsync(directory)
+ print("removed")
+finally: os.close(directory)
+"""
+    state = _remote_ok(
+        host,
+        shlex.join(["python3", "-c", script, str(candidate.parent), candidate.name]),
+        "step-20 adapter candidate cleanup",
+        timeout=120,
+    ).strip()
+    if state not in {"absent", "removed"}:
+        raise RuntimeError("step-20 adapter candidate cleanup returned invalid state")
+
+
+def _cleanup_failed_step20_adapter_stage(
+    error: BaseException,
+    host: str,
+    candidate: PurePosixPath,
+    tunnel_records: list[dict],
+) -> None:
+    for cleanup in (
+        lambda: _cleanup_step20_adapter_candidate(host, candidate),
+        lambda: _stop_step20_adapter_tunnels(host, tunnel_records),
+    ):
+        try:
+            cleanup()
+        except (OSError, Refused, RuntimeError) as cleanup_error:
+            error.add_note(f"step-20 failure cleanup also failed: {cleanup_error}")
 
 
 def _archive_one_file(local_path: Path, remote_uri: str, expected_digest: str) -> None:
@@ -8448,6 +8720,13 @@ def _stage_step20_adapter_on_h200(adapter: dict, result_sha256: str) -> str:
     nonce = secrets.token_hex(8)
     candidate = root / f".adapter-candidate-{nonce}"
     host = inference_hosts[0]
+    served_path = PurePosixPath(
+        str(source_paths["adapter_model.safetensors"][0])
+    ).relative_to(glm_adapter_root)
+    source_url = (
+        f"http://127.0.0.1:{glm_adapter_tunnel_port}/{served_path}"
+    )
+    tunnel_records = _start_step20_adapter_tunnels(host, source_url)
     setup = f"""
 set -euo pipefail
 root={shlex.quote(str(root))}
@@ -8464,15 +8743,27 @@ test ! -e "$candidate"
 test ! -L "$candidate"
 install -d -m 0750 "$candidate"
 """
-    _remote_ok(host, setup, "step-20 H200 adapter candidate", timeout=60)
+    try:
+        _remote_ok(host, setup, "step-20 H200 adapter candidate", timeout=60)
+    except BaseException as error:
+        _cleanup_failed_step20_adapter_stage(
+            error, host, candidate, tunnel_records
+        )
+        raise
     transfer_started = time.monotonic()
-    transfer = _download_glm_adapter_direct(
-        host,
-        str(source_paths["adapter_model.safetensors"][0]),
-        str(candidate / "adapter_model.safetensors"),
-        str(source_paths["adapter_model.safetensors"][1]),
-        adapter_size,
-    )
+    try:
+        transfer = _download_glm_adapter_direct(
+            host,
+            str(source_paths["adapter_model.safetensors"][0]),
+            str(candidate / "adapter_model.safetensors"),
+            str(source_paths["adapter_model.safetensors"][1]),
+            adapter_size,
+        )
+    except BaseException as error:
+        _cleanup_failed_step20_adapter_stage(
+            error, host, candidate, tunnel_records
+        )
+        raise
     print(
         "Staged adapter weights directly: "
         f"{transfer['bytes'] / (1024**3):.2f} GiB in "
@@ -8480,27 +8771,35 @@ install -d -m 0750 "$candidate"
         f"({transfer['bytes'] / (1024**3) / transfer['seconds']:.3f} GiB/s)."
     )
     metadata_started = time.monotonic()
-    with tempfile.TemporaryDirectory(prefix="glm52-step20-adapter-") as temporary:
-        local_root = Path(temporary)
-        for name, (source, digest) in source_paths.items():
-            if name == "adapter_model.safetensors":
-                continue
-            local = local_root / name
-            _download_adapter_file(str(source), local)
-            if _sha256_file(local, name) != digest:
-                raise RuntimeError(f"step-20 adapter download checksum differs: {name}")
-            _local_command(
-                [
-                    "scp",
-                    "-q",
-                    "-o",
-                    "BatchMode=yes",
-                    str(local),
-                    f"{host}:{candidate}/{name}",
-                ],
-                f"stage step-20 adapter {name}",
-                timeout=1800,
-            )
+    try:
+        with tempfile.TemporaryDirectory(prefix="glm52-step20-adapter-") as temporary:
+            local_root = Path(temporary)
+            for name, (source, digest) in source_paths.items():
+                if name == "adapter_model.safetensors":
+                    continue
+                local = local_root / name
+                _download_adapter_file(str(source), local)
+                if _sha256_file(local, name) != digest:
+                    raise RuntimeError(
+                        f"step-20 adapter download checksum differs: {name}"
+                    )
+                _local_command(
+                    [
+                        "scp",
+                        "-q",
+                        "-o",
+                        "BatchMode=yes",
+                        str(local),
+                        f"{host}:{candidate}/{name}",
+                    ],
+                    f"stage step-20 adapter {name}",
+                    timeout=1800,
+                )
+    except BaseException as error:
+        _cleanup_failed_step20_adapter_stage(
+            error, host, candidate, tunnel_records
+        )
+        raise
     print(
         f"Staged {len(source_paths) - 1} metadata files in "
         f"{time.monotonic() - metadata_started:.1f} seconds; "
@@ -8594,9 +8893,18 @@ try:
   print("reused")
 finally: os.close(directory)
 PY"""
-    state = _remote_ok(host, install, "step-20 H200 adapter install", timeout=600).strip()
-    if state not in {"installed", "replaced", "reused"}:
-        raise RuntimeError("step-20 H200 adapter install returned invalid state")
+    try:
+        state = _remote_ok(
+            host, install, "step-20 H200 adapter install", timeout=600
+        ).strip()
+        if state not in {"installed", "replaced", "reused"}:
+            raise RuntimeError("step-20 H200 adapter install returned invalid state")
+    except BaseException as error:
+        _cleanup_failed_step20_adapter_stage(
+            error, host, candidate, tunnel_records
+        )
+        raise
+    _stop_step20_adapter_tunnels(host, tunnel_records)
     return str(final)
 
 
