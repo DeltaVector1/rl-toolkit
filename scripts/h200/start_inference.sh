@@ -26,6 +26,14 @@ fi
 image=${prime_image:-prime-rl:glm52-v080-full}
 model_volume=${prime_model_volume:-glm52-fp8-model}
 adapter_ports=${prime_adapter_ports:-18200,18201,18202,18203,18204,18205,18206,18207}
+adapter_codec=${prime_adapter_codec:-gzip}
+case "$adapter_codec" in
+  gzip|zstd|identity) ;;
+  *)
+    echo "refusing invalid GLM adapter codec: $adapter_codec" >&2
+    exit 2
+    ;;
+esac
 engine_container=${prime_inference_container:-glm52-optims-h200}
 require_absent=${prime_require_absent:-0}
 if [[ "$require_absent" != "0" && "$require_absent" != "1" ]]; then
@@ -251,6 +259,7 @@ container_id=$(docker run -d --cidfile "$engine_cidfile" \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False \
   -e VLLM_ENGINE_READY_TIMEOUT_S=7200 \
   -e PRIME_ADAPTER_PORTS="$adapter_ports" \
+  -e PRIME_GLM_ADAPTER_CODEC="$adapter_codec" \
   -e PRIME_GLM_ADAPTER_GZIP=1 \
   -e PRIME_PARITY_BOOTSTRAP_FIFO=/run/prime-parity-bootstrap \
   -e PRIME_PARITY_ROUTER_TRACE_DIR="$parity_trace_dir" \
