@@ -1,4 +1,4 @@
-output_dir = "/data/glm52-rl/qualifications/glm52-native-b2048-local-recompute-cutoff5"
+output_dir = "/data/glm52-rl/qualifications/glm52-native-b2048-fp8"
 max_steps = 2
 dist_timeout_seconds = 5400
 enable_router_replay = false
@@ -58,7 +58,7 @@ type = "fp8"
 dequantize_checkpoint = false
 diagnose_linear_backward = false
 fused_qkv_a_fp8 = true
-expert_activation_transport = "bf16_forward_fp8_local_recompute_backward"
+expert_activation_transport = "fp8"
 w8a16_modules = []
 
 [model.lora]

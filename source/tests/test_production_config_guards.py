@@ -163,7 +163,6 @@ def test_production_allocator_does_not_strand_large_reserved_blocks() -> None:
 def test_glm52_stability_and_production_use_local_expert_recompute() -> None:
     for relative in (
         "configs/qualification/glm52-native-stability20.toml",
-        "configs/qualification/glm52-native-b2048.toml",
         "configs/paused/trainer.glm52-production.toml",
     ):
         config = _load(relative)
@@ -250,6 +249,8 @@ def test_all_glm52_trainers_use_h200_w8a8_semantics() -> None:
         expected_transport = (
             "bf16"
             if relative == "configs/qualification/glm52-policy-parity-trainer.toml"
+            else "fp8"
+            if relative == "configs/qualification/glm52-native-b2048.toml"
             else "bf16_forward_fp8_local_recompute_backward"
         )
         assert quantization["expert_activation_transport"] == expected_transport, relative
