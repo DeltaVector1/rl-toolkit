@@ -4,6 +4,10 @@ The profiler is inactive unless ``PRIME_PHASE_PROFILE=1``.  It records CUDA
 events only on selected steps and resolves them with one device
 synchronization at the end of that step.  It does not change execution order,
 streams, or tensor values.
+
+The separate Nsight Systems CUDA+NVTX range is application-controlled.  It
+starts on one selected post-warmup step and stops after that step's backward
+pass, before optimizer work.
 """
 
 from __future__ import annotations
@@ -43,12 +47,13 @@ _CUDA_CAPTURE_ACTIVE = False
 _CUDA_CAPTURE_API = None
 
 
-def _cuda_capture_step_set() -> frozenset[int]:
-    value = os.environ.get("PRIME_CUDA_PROFILE_STEPS", "1")
-    steps = frozenset(int(part) for part in value.split(",") if part)
-    if not steps or min(steps) < 1:
-        raise ValueError("PRIME_CUDA_PROFILE_STEPS must contain positive integers")
-    return steps
+def _cuda_capture_step() -> int:
+    value = os.environ.get("PRIME_CUDA_PROFILE_STEPS", "2")
+    if not value.isdecimal() or int(value) < 2:
+        raise ValueError(
+            "PRIME_CUDA_PROFILE_STEPS must be one unsigned integer >= 2"
+        )
+    return int(value)
 
 
 def start_cuda_capture(step: int) -> bool:
@@ -57,17 +62,24 @@ def start_cuda_capture(step: int) -> bool:
     target = os.environ.get("PRIME_CUDA_PROFILE_RANK", "")
     if os.environ.get("PRIME_CUDA_PROFILE", "0") != "1" or not target:
         return False
-    if int(os.environ.get("RANK", "-1")) != int(target):
+    if not target.isdecimal() or not os.environ.get("RANK", "").isdecimal():
+        raise ValueError("PRIME_CUDA_PROFILE_RANK and RANK must be unsigned integers")
+    if int(os.environ["RANK"]) != int(target):
         return False
-    if int(step) not in _cuda_capture_step_set():
+    if int(step) != _cuda_capture_step():
         return False
     if _CUDA_CAPTURE_ACTIVE:
         raise RuntimeError("CUDA profiler capture is already active")
-    _CUDA_CAPTURE_API = torch.cuda.cudart()
-    result = _CUDA_CAPTURE_API.cudaProfilerStart()
+    api = torch.cuda.cudart()
+    result = api.cudaProfilerStart()
     if result not in (None, 0):
         raise RuntimeError(f"cudaProfilerStart failed with error {result}")
-    torch.cuda.nvtx.range_push(f"prime_nsys_training_step_{int(step)}")
+    try:
+        torch.cuda.nvtx.range_push(f"prime_nsys_training_step_{int(step)}")
+    except BaseException:
+        api.cudaProfilerStop()
+        raise
+    _CUDA_CAPTURE_API = api
     _CUDA_CAPTURE_ACTIVE = True
     return True
 
@@ -77,12 +89,24 @@ def stop_cuda_capture() -> bool:
     global _CUDA_CAPTURE_ACTIVE, _CUDA_CAPTURE_API
     if not _CUDA_CAPTURE_ACTIVE:
         return False
-    torch.cuda.nvtx.range_pop()
-    result = _CUDA_CAPTURE_API.cudaProfilerStop()
-    if result not in (None, 0):
-        raise RuntimeError(f"cudaProfilerStop failed with error {result}")
-    _CUDA_CAPTURE_ACTIVE = False
-    _CUDA_CAPTURE_API = None
+    api = _CUDA_CAPTURE_API
+    error = None
+    try:
+        torch.cuda.nvtx.range_pop()
+    except BaseException as caught:
+        error = caught
+    try:
+        result = api.cudaProfilerStop()
+        if result not in (None, 0) and error is None:
+            error = RuntimeError(f"cudaProfilerStop failed with error {result}")
+    except BaseException as caught:
+        if error is None:
+            error = caught
+    finally:
+        _CUDA_CAPTURE_ACTIVE = False
+        _CUDA_CAPTURE_API = None
+    if error is not None:
+        raise error
     return True
 
 

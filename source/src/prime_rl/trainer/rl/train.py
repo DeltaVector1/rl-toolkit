@@ -590,7 +590,7 @@ def _qualification_environment() -> dict[str, str] | None:
     if not re.fullmatch(r"[0-9a-f]{32}", values["PRIME_QUALIFICATION_SESSION_ID"]):
         raise RuntimeError("qualification session ID is invalid")
     if not re.fullmatch(
-        r"glm52-native-(?:b2048|delta3|stability20)",
+        r"glm52-native-(?:b2048|b2048-nsys|delta3|stability20)",
         values["PRIME_QUALIFICATION_PROFILE"],
     ):
         raise RuntimeError("qualification profile is invalid")
@@ -936,7 +936,7 @@ def _write_qualification_result(
 
 
 @clean_exit
-def train(config: TrainerConfig):
+def _train_impl(config: TrainerConfig):
     # Setup world and logger
     world = get_world()
     numa_binding = bind_worker_to_gpu_numa_node()
@@ -956,6 +956,7 @@ def train(config: TrainerConfig):
     if qualification_identity is not None:
         expected_steps = {
             "glm52-native-b2048": (2, False),
+            "glm52-native-b2048-nsys": (2, False),
             "glm52-native-delta3": (3, True),
             "glm52-native-stability20": (20, True),
         }[qualification_identity["PRIME_QUALIFICATION_PROFILE"]]
@@ -2425,6 +2426,10 @@ def train(config: TrainerConfig):
                 flush=True,
             )
 
+        # Keep optimizer and scheduler work outside the application-controlled
+        # Nsight range.  Step 2 is the first completed warm step after startup
+        # and step 1's optimizer compilation.
+        stop_cuda_capture()
         zero_grad_ratio = get_zero_gradient_ratio(model.parameters(), parallel_dims.dp_replicate)
 
         # Update the model parameters
@@ -2441,7 +2446,6 @@ def train(config: TrainerConfig):
         phase_report = phase_profiler.end_step(
             rank=dist.get_rank(), stage=pp_rank
         )
-        stop_cuda_capture()
         if phase_report is not None:
             phase_reports = [None] * dist.get_world_size()
             dist.all_gather_object(phase_reports, phase_report)
@@ -2768,6 +2772,14 @@ def train(config: TrainerConfig):
         if config.bench.output_json:
             export_benchmark_json(history, config.bench.output_json)
             logger.info(f"Benchmark results written to {config.bench.output_json}")
+
+
+def train(config: TrainerConfig):
+    """Run training and close an active diagnostic capture on any error."""
+    try:
+        return _train_impl(config)
+    finally:
+        stop_cuda_capture()
 
 
 def main():

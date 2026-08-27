@@ -340,6 +340,31 @@ def _profile(name: str = "current") -> dict:
         raise RuntimeError(f"profile {name!r} has no readable environment config")
     return profile
 
+
+_QUALIFICATION_LAUNCH_ENV_PATTERNS = {
+    "PRIME_NSYS_PROFILE": re.compile(r"[01]"),
+    "PRIME_CUDA_PROFILE": re.compile(r"[01]"),
+    "PRIME_CUDA_PROFILE_RANK": re.compile(r"[0-9]+"),
+    "PRIME_CUDA_PROFILE_STEPS": re.compile(r"(?:[2-9]|[1-9][0-9]+)"),
+}
+
+
+def _qualification_launch_env(profile: dict) -> dict[str, str]:
+    """Validate the allowlisted, application-controlled capture environment."""
+    launch_env = profile.get("launch_env", {})
+    if not isinstance(launch_env, dict):
+        raise Refused("qualification launch_env must be a mapping")
+    validated = {}
+    for key, value in launch_env.items():
+        if not isinstance(key, str) or key not in _QUALIFICATION_LAUNCH_ENV_PATTERNS:
+            raise Refused(f"qualification launch_env key {key!r} is not allowed")
+        if not isinstance(value, str) or not value:
+            raise Refused(f"qualification launch_env {key} must be a non-empty string")
+        if _QUALIFICATION_LAUNCH_ENV_PATTERNS[key].fullmatch(value) is None:
+            raise Refused(f"qualification launch_env {key} has an invalid value")
+        validated[key] = value
+    return validated
+
 ssh_command = [
     "ssh",
     "-o",
@@ -8013,6 +8038,7 @@ def _validate_trainer_qualification(
     )
     expected_step_counts = {
         "glm52-native-b2048": 2,
+        "glm52-native-b2048-nsys": 2,
         "glm52-native-delta3": 3,
         "glm52-native-stability20": 20,
     }
@@ -10175,6 +10201,7 @@ def _qualify_connected(
     _assert_live_services_are_down(nodes, include_inference=False)
 
     selected = _profile(name)
+    launch_env = _qualification_launch_env(selected)
     if "orchestrator" in selected:
         raise Refused(f"profile {name!r} is a full run; use start()")
     relative_config = selected["trainer"]
@@ -10336,6 +10363,8 @@ def _qualify_connected(
             " TRANSFORMERS_OVERRIDE_DIR=/data/muse-glimmer/transformers"
             " MUSE_PYTHON_OVERRIDE_DIR=/data/muse-glimmer/python-overrides"
         )
+    for key, value in launch_env.items():
+        env += f" {key}={shlex.quote(value)}"
 
     containers_to_remove = sorted(set(active + stopped))
     if containers_to_remove:

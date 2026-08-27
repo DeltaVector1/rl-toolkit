@@ -141,6 +141,42 @@ case ${1:-} in
     if [ "$rank" -lt 0 ]; then
       echo "node $node is not in trainer_nodes ($trainer_nodes)" >&2; exit 1
     fi
+    capture_node=""
+    if [ "${PRIME_NSYS_PROFILE:-0}" = "1" ]; then
+      [ "${PRIME_CUDA_PROFILE:-0}" = "1" ] || {
+        echo "Nsight Systems requires application-controlled CUDA capture" >&2
+        exit 1
+      }
+      case "${PRIME_CUDA_PROFILE_RANK:-24}" in
+        24) capture_rank=24 ;;
+        *) echo "Nsight Systems capture is pinned to representative rank 24" >&2; exit 1 ;;
+      esac
+      if ! [[ "${PRIME_CUDA_PROFILE_STEPS:-2}" =~ ^([2-9]|[1-9][0-9]+)$ ]]; then
+        echo "Nsight Systems capture must select one completed warm step >= 2" >&2
+        exit 1
+      fi
+      [ -z "${PRIME_CUDA_PROFILE_SECONDS:-}" ] || {
+        echo "Nsight Systems capture does not accept an external duration" >&2
+        exit 1
+      }
+      capture_node_index=$((capture_rank / 8))
+      capture_idx=0
+      for n in $trainer_nodes; do
+        if [ "$capture_idx" -eq "$capture_node_index" ]; then capture_node=$n; fi
+        capture_idx=$((capture_idx + 1))
+      done
+      [ -n "$capture_node" ] || {
+        echo "Nsight Systems capture rank is outside trainer_nodes" >&2
+        exit 1
+      }
+      [ "$capture_node" = "78" ] || {
+        echo "Nsight Systems capture rank 24 must map to n78" >&2
+        exit 1
+      }
+      if [ "$node" != "$capture_node" ]; then
+        echo "Nsight disabled on n$node; capture owner is n$capture_node rank $capture_rank"
+      fi
+    fi
     IFS='|' read -r rollout_transport trainer_output trainer_only parity_trace_dir parity_trace_source parity_pp parity_cp parity_batch parity_max_calls parity_max_files parity_max_bytes parity_diagnostics parity_diagnostic_tokens parity_diagnostic_max_files parity_diagnostic_max_bytes configured_int4_combine_rounds configured_fp8_expert_activation_offload configured_lora_mm_profile configured_profile_requested configured_profile_pp_stage configured_ep_profile configured_ep_profile_every configured_expert_profile_every configured_layer_profile_every configured_expert_phase_profile configured_expert_phase_profile_every configured_phase_profile configured_phase_profile_steps configured_phase_profile_sample_every < <(
       python3 - "$trainer_config" <<'PY'
 import sys
@@ -359,7 +395,7 @@ PY
         echo "qualification session ID is invalid" >&2; exit 1
       }
       case "${PRIME_QUALIFICATION_PROFILE:-}" in
-        glm52-native-b2048|glm52-native-delta3|glm52-native-stability20) ;;
+        glm52-native-b2048|glm52-native-b2048-nsys|glm52-native-delta3|glm52-native-stability20) ;;
         *) echo "qualification profile is invalid" >&2; exit 1 ;;
       esac
       for value in \
@@ -482,15 +518,7 @@ PY
         -e "PRIME_TRAINER_HEAD=n$trainer_head_node"
       )
     fi
-    if [ "${PRIME_NSYS_PROFILE:-0}" = "1" ]; then
-      [ "$node" = "78" ] || {
-        echo "Nsight Systems capture must run on n78" >&2
-        exit 1
-      }
-      [ "${PRIME_CUDA_PROFILE_RANK:-24}" = "24" ] || {
-        echo "Nsight Systems capture is pinned to representative rank 24" >&2
-        exit 1
-      }
+    if [ "${PRIME_NSYS_PROFILE:-0}" = "1" ] && [ "$node" = "$capture_node" ]; then
       nsys_mounts=(
         -v /opt/nvidia/nsight-systems:/opt/nvidia/nsight-systems:ro
       )
@@ -501,14 +529,18 @@ PY
         --session-new="$nsys_session"
         --trace=cuda,nvtx
         --sample=none
+        --event-sample=none
         --cpuctxsw=none
         --backtrace=none
         --cudabacktrace=none
         --cuda-memory-usage=false
+        --flush-on-cudaprofilerstop=true
         --capture-range=cudaProfilerApi
         --capture-range-end=stop
+        --stop-on-exit=true
+        --kill=none
         --force-overwrite=true
-        -o "$trainer_output/nsys-rank-${PRIME_CUDA_PROFILE_RANK:-24}"
+        -o "$trainer_output/nsys-rank-$capture_rank"
         /app/.venv/bin/torchrun
       )
     fi
@@ -609,7 +641,7 @@ PY
       -e PRIME_PHASE_PROFILE_SAMPLE_EVERY="$phase_profile_sample_every" \
       -e PRIME_CUDA_PROFILE="${PRIME_CUDA_PROFILE:-0}" \
       -e PRIME_CUDA_PROFILE_RANK="${PRIME_CUDA_PROFILE_RANK:-24}" \
-      -e PRIME_CUDA_PROFILE_STEPS="${PRIME_CUDA_PROFILE_STEPS:-1}" \
+      -e PRIME_CUDA_PROFILE_STEPS="${PRIME_CUDA_PROFILE_STEPS:-2}" \
       -e PRIME_BIND_GPU_NUMA="${PRIME_BIND_GPU_NUMA:-0}" \
       -e PRIME_NCCL_CHANNELS="$nccl_channels" \
       -e PRIME_PROFILE_PP_STAGE="$profile_pp_stage" \
