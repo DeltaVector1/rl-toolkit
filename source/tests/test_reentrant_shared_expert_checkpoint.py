@@ -73,7 +73,7 @@ class ReentrantSharedExpertCheckpointTest(unittest.TestCase):
             "\ndef apply_ac", 1
         )[0]
         self.assertIn("pp_size <= 1", helper)
-        self.assertIn("routed_expert_cutoff >= pp_size", helper)
+        self.assertIn("not 0 <= routed_expert_cutoff < pp_size", helper)
         self.assertIn("pp_layer_ranges", helper)
 
     def test_virtual_chunks_on_one_rank_get_different_policies(self):

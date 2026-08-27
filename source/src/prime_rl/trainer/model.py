@@ -1639,9 +1639,13 @@ def _routed_expert_checkpoint_policy(
         raise ValueError(
             "keep_routed_expert_activations_from_pp_stage requires pipeline parallelism"
         )
-    if routed_expert_cutoff >= pp_size:
+    if (
+        not isinstance(routed_expert_cutoff, int)
+        or isinstance(routed_expert_cutoff, bool)
+        or not 0 <= routed_expert_cutoff < pp_size
+    ):
         raise ValueError(
-            "keep_routed_expert_activations_from_pp_stage must be less than the pipeline size"
+            "keep_routed_expert_activations_from_pp_stage must be an integer in the pipeline range"
         )
 
     layer_names = [name for name, _ in language_model.layers.named_children()]
@@ -1893,7 +1897,27 @@ def apply_quantization(
 
 def apply_ep(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
     language_model = get_language_model(model)
-    for transformer_block in iter_layers(language_model.layers):
+    local_recompute_policy = None
+    if (
+        isinstance(config.quantization, FP8Config)
+        and config.quantization.expert_activation_transport
+        == "bf16_forward_fp8_local_recompute_backward"
+        and config.pp_schedule == "interleaved_1f1b"
+    ):
+        if config.ac is None:
+            raise RuntimeError(
+                "local expert recompute has no activation-checkpoint configuration"
+            )
+        cutoff = config.ac.keep_routed_expert_activations_from_pp_stage
+        if cutoff is None:
+            raise RuntimeError("local expert recompute has no pipeline cutoff")
+        local_recompute_policy = _routed_expert_checkpoint_policy(language_model, cutoff)
+
+    if isinstance(language_model.layers, nn.ModuleDict):
+        layer_items = language_model.layers.items()
+    else:
+        layer_items = ((str(index), layer) for index, layer in enumerate(language_model.layers))
+    for layer_name, transformer_block in layer_items:
         block_mlp = getattr(transformer_block, "mlp", None)
         if block_mlp is not None and isinstance(block_mlp, (MoE, LatentMoE)):
             native_fp8_expert_lora = getattr(
@@ -1934,6 +1958,16 @@ def apply_ep(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims)
                             "pp_size": parallel_dims.pp,
                             "local_recompute_cutoff": cutoff,
                         }
+                        if local_recompute_policy is not None:
+                            global_layer_id = int(layer_name)
+                            try:
+                                stage_selection["local_recompute_active"] = (
+                                    local_recompute_policy[global_layer_id]
+                                )
+                            except KeyError as error:
+                                raise RuntimeError(
+                                    "interleaved local expert recompute has no global-layer policy"
+                                ) from error
                     parallelize_plan = NativeFP8LoRAAllToAllExpertParallel(
                         transport,
                         **stage_selection,

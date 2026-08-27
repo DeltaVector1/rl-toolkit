@@ -1543,12 +1543,18 @@ def _resolve_native_fp8_expert_transport(
     pp_stage: int | None = None,
     pp_size: int | None = None,
     local_recompute_cutoff: int | None = None,
+    local_recompute_active: bool | None = None,
 ) -> tuple[str, bool]:
     local_name = "bf16_forward_fp8_local_recompute_backward"
     if requested != local_name:
         if any(
             value is not None
-            for value in (pp_stage, pp_size, local_recompute_cutoff)
+            for value in (
+                pp_stage,
+                pp_size,
+                local_recompute_cutoff,
+                local_recompute_active,
+            )
         ):
             raise ValueError(
                 "pipeline stage selection is only valid for local expert recompute"
@@ -1561,7 +1567,13 @@ def _resolve_native_fp8_expert_transport(
         raise ValueError("local expert recompute pipeline stage is invalid")
     if not 0 <= local_recompute_cutoff < pp_size:
         raise ValueError("local expert recompute pipeline cutoff is invalid")
-    active = pp_stage >= local_recompute_cutoff
+    if local_recompute_active is not None and not isinstance(local_recompute_active, bool):
+        raise TypeError("local expert recompute selection must be a boolean")
+    active = (
+        local_recompute_active
+        if local_recompute_active is not None
+        else pp_stage >= local_recompute_cutoff
+    )
     return (
         local_name if active else "bf16_forward_fp8_recompute_backward",
         active,
@@ -1578,6 +1590,7 @@ class NativeFP8LoRAAllToAllExpertParallel(MXFP8AllToAllExpertParallel):
         pp_stage: int | None = None,
         pp_size: int | None = None,
         local_recompute_cutoff: int | None = None,
+        local_recompute_active: bool | None = None,
     ):
         super().__init__()
         if expert_activation_transport not in {
@@ -1599,6 +1612,7 @@ class NativeFP8LoRAAllToAllExpertParallel(MXFP8AllToAllExpertParallel):
             pp_stage,
             pp_size,
             local_recompute_cutoff,
+            local_recompute_active,
         )
 
     def _token_dispatch(self, mod, inputs, device_mesh):

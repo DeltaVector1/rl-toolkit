@@ -47,6 +47,51 @@ def load_transport_selector():
     return namespace["_resolve_native_fp8_expert_transport"]
 
 
+def load_checkpoint_policy():
+    model_source = (
+        Path(__file__).parents[1] / "src" / "prime_rl" / "trainer" / "model.py"
+    ).read_text()
+    tree = ast.parse(model_source)
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_routed_expert_checkpoint_policy"
+    )
+    # The helper only needs ``nn.Module`` for its annotation. Keep this test
+    # independent of the training image's CUDA and model dependencies.
+    class FakeNN:
+        Module = object
+
+    namespace = {"nn": FakeNN}
+    exec(
+        compile(ast.Module(body=[function], type_ignores=[]), "model.py", "exec"),
+        namespace,
+    )
+    return namespace["_routed_expert_checkpoint_policy"]
+
+
+class _LayerNames:
+    def __init__(self, names):
+        self._names = tuple(names)
+
+    def named_children(self):
+        return [(str(name), object()) for name in self._names]
+
+
+class _FakeLanguageModel:
+    # PP rank 1 owns virtual stages 1 and 9 in the production PP8 x 2 plan.
+    pp_physical_rank = 1
+    pp_physical_size = 8
+    pp_virtual_stages = 2
+    pp_layer_ranges = ((5, 10), (45, 50))
+    layers = _LayerNames(tuple(range(5, 10)) + tuple(range(45, 50)))
+
+    class config:
+        num_hidden_layers = 78
+        pp_layer_boundaries = [0, 10, 20, 30, 40, 48, 58, 68, 78]
+
+
 class FP8LocalRecomputeTests(unittest.TestCase):
     def test_local_recompute_requires_an_explicit_config(self):
         self.assertIn('] = "bf16"', CONFIG_SOURCE)
@@ -61,7 +106,46 @@ class FP8LocalRecomputeTests(unittest.TestCase):
         )
         self.assertIn('self.ac.mode != "reentrant_attention_all_experts"', CONFIG_SOURCE)
         self.assertIn('self.ep_comm_backend != "torch"', CONFIG_SOURCE)
-        self.assertIn('self.pp_schedule == "interleaved_1f1b"', CONFIG_SOURCE)
+        validator = CONFIG_SOURCE.split(
+            "def validate_local_expert_recompute", 1
+        )[1].split("def mxfp8_only_with_torch_ep_backend", 1)[0]
+        self.assertNotIn('self.pp_schedule == "interleaved_1f1b"', validator)
+
+    def test_interleaved_policy_maps_both_virtual_chunks_to_global_layers(self):
+        policy = load_checkpoint_policy()
+        actual = policy(_FakeLanguageModel(), 5)
+        expected = {
+            **{layer: False for layer in (5, 6, 7, 8, 9, 45, 46, 47)},
+            **{layer: True for layer in (48, 49)},
+        }
+        self.assertEqual(actual, expected)
+
+    def test_interleaved_policy_fails_closed_for_bad_ranges(self):
+        policy = load_checkpoint_policy()
+
+        class Overlapping(_FakeLanguageModel):
+            pp_layer_ranges = ((5, 10), (9, 50))
+            layers = _LayerNames(range(5, 50))
+
+        with self.assertRaisesRegex(ValueError, "overlapping"):
+            policy(Overlapping(), 5)
+
+        class Missing(_FakeLanguageModel):
+            pp_layer_ranges = ((5, 10), (45, 49))
+
+        with self.assertRaisesRegex(ValueError, "omit owned layers"):
+            policy(Missing(), 5)
+
+        class BadPhysicalBoundaries(_FakeLanguageModel):
+            class config:
+                num_hidden_layers = 78
+                pp_layer_boundaries = [0, 10, 20, 30, 40, 48, 58, 68]
+
+        with self.assertRaisesRegex(ValueError, "one entry per physical stage"):
+            policy(BadPhysicalBoundaries(), 5)
+
+        with self.assertRaisesRegex(ValueError, "pipeline range"):
+            policy(_FakeLanguageModel(), -1)
 
     def test_cutoff_five_selects_only_late_pipeline_stages(self):
         select = load_transport_selector()
@@ -88,6 +172,24 @@ class FP8LocalRecomputeTests(unittest.TestCase):
             select(local, 7, 8, 8)
         with self.assertRaisesRegex(ValueError, "only valid"):
             select("bf16", 7, 8, 5)
+        with self.assertRaisesRegex(ValueError, "only valid"):
+            select("bf16", 7, 8, 5, local_recompute_active=True)
+        with self.assertRaisesRegex(TypeError, "selection must be a boolean"):
+            select(local, 7, 8, 5, local_recompute_active=1)
+
+    def test_interleaved_layer_selection_overrides_physical_stage_boolean(self):
+        select = load_transport_selector()
+        local = "bf16_forward_fp8_local_recompute_backward"
+        # Physical stage 5 is after cutoff 5, but layer 47 is before the
+        # global physical boundary at layer 48.
+        self.assertEqual(
+            select(local, 5, 8, 5, local_recompute_active=False),
+            ("bf16_forward_fp8_recompute_backward", False),
+        )
+        self.assertEqual(
+            select(local, 5, 8, 5, local_recompute_active=True),
+            (local, True),
+        )
 
     def test_early_stages_keep_checkpoint_recompute_transport(self):
         select = load_transport_selector()
@@ -127,6 +229,8 @@ class FP8LocalRecomputeTests(unittest.TestCase):
         self.assertIn('parallel_dims.get_mesh(\n                                "pp"', apply_ep)
         self.assertIn('"pp_size": parallel_dims.pp', apply_ep)
         self.assertIn('"local_recompute_cutoff": cutoff', apply_ep)
+        self.assertIn('local_recompute_policy[global_layer_id]', apply_ep)
+        self.assertIn('language_model.layers.items()', apply_ep)
 
     def test_local_recompute_retains_only_compact_tensor_state(self):
         expert = (

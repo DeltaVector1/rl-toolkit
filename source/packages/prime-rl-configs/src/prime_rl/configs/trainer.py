@@ -435,12 +435,11 @@ class ModelConfig(BaseModelConfig):
             return self
         if (
             self.pp <= 1
-            or self.pp_schedule == "interleaved_1f1b"
             or self.ep_comm_backend != "torch"
             or (isinstance(self.ep, int) and self.ep <= 1)
         ):
             raise ValueError(
-                "local expert recompute requires non-interleaved pipeline parallelism and torch expert parallelism"
+                "local expert recompute requires pipeline parallelism and torch expert parallelism"
             )
         cutoff = (
             self.ac.keep_routed_expert_activations_from_pp_stage
