@@ -290,6 +290,13 @@ class ModelConfig(BaseModelConfig):
     pp_layer_boundaries: list[int] | None = None
     """Complete layer boundaries for the explicit boundary plan."""
 
+    pp_virtual_layer_boundaries: list[int] | None = None
+    """Complete boundaries for interleaved virtual stages.
+
+    Interleaved schedules require this plan explicitly. This is separate from
+    ``pp_layer_boundaries`` because physical 1F1B uses eight stages.
+    """
+
     cp_style: Literal["ring", "ulysses"] = "ring"
     """CP communication style. ``ring`` uses ring-attention all-gather/reduce-scatter (requires custom kernels per attention type). ``ulysses`` uses all-to-all to redistribute Q/K/V from sequence-sharded to head-sharded, runs vanilla attention locally on the full sequence, then all-to-all back — works out-of-the-box with any attention kernel (softmax FA, linear attention, mamba, etc.)."""
 
@@ -366,6 +373,20 @@ class ModelConfig(BaseModelConfig):
         """Automatically enable activation checkpointing when activation offloading is enabled."""
         if self.ac_offloading is not None and self.ac is None:
             self.ac = ActivationCheckpointConfig()
+        return self
+
+    @model_validator(mode="after")
+    def interleaved_ac_requires_global_frequency(self):
+        """Keep interleaved checkpoint selection aligned to global layers."""
+        if (
+            self.pp_schedule == "interleaved_1f1b"
+            and self.ac is not None
+            and self.ac.freq != 1
+        ):
+            raise ValueError(
+                "interleaved_1f1b requires model.ac.freq=1 unless checkpoint "
+                "selection uses global layer positions"
+            )
         return self
 
     @model_validator(mode="after")

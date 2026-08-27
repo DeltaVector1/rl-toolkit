@@ -215,6 +215,135 @@ class PipelineBalanceTest(unittest.TestCase):
         for physical_rank in range(8):
             self.assertTrue(ranges[physical_rank + 8][0] >= ranges[physical_rank][1])
 
+    def test_glm_interleaved_plan_uses_modeled_virtual_chunks(self):
+        config = types.SimpleNamespace(
+            pp_schedule="interleaved_1f1b",
+            pp_transfer_sparse_indices=True,
+            pp_boundary_plan="balanced",
+            pp_layer_boundaries=[0, 8, 18, 28, 38, 48, 58, 69, 78],
+            pp_virtual_layer_boundaries=[0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 78],
+        )
+        bounds = [
+            self.pp.stage_layer_range(78, stage, 16, config)[0]
+            for stage in range(16)
+        ] + [78]
+        self.assertEqual(bounds, [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 78])
+
+    def test_interleaved_plan_requires_explicit_virtual_boundaries(self):
+        config = types.SimpleNamespace(
+            pp_schedule="interleaved_1f1b",
+            pp_transfer_sparse_indices=True,
+            pp_boundary_plan="balanced",
+            num_hidden_layers=78,
+        )
+        with self.assertRaisesRegex(ValueError, "explicit pp_virtual_layer_boundaries"):
+            self.pp.stage_layer_range(78, 0, 16, config)
+
+    def test_glm_interleaved_sparse_cache_metadata_matches_production(self):
+        """Check shape and contiguous stride at every virtual boundary.
+
+        ``train.py`` builds a per-stage cache example.  A stage either receives
+        a real sparse cache, receives a one-element placeholder, or is stage 0
+        and receives no cache.  The same three choices apply to its output,
+        except that stage 15 returns the scalar loss.
+        """
+        config = types.SimpleNamespace(
+            pp_schedule="interleaved_1f1b",
+            pp_transfer_sparse_indices=True,
+            pp_boundary_plan="balanced",
+            pp_layer_boundaries=[0, 8, 18, 28, 38, 48, 58, 69, 78],
+            pp_virtual_layer_boundaries=[0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 78],
+            num_hidden_layers=78,
+            indexer_types=GLM_INDEXER_TYPES,
+        )
+        language_model = types.SimpleNamespace(config=config)
+        model_module = types.ModuleType("prime_rl.trainer.model")
+        model_module.get_language_model = lambda _model: language_model
+
+        def contiguous_stride(shape):
+            stride = 1
+            result = []
+            for size in reversed(shape):
+                result.append(stride)
+                stride *= size
+            return tuple(reversed(result))
+
+        length, hidden, topk = 4096, 6144, 2048
+        hidden_shape = (1, length, hidden)
+        hidden_stride = contiguous_stride(hidden_shape)
+        sparse_shape = (1, length, 1, topk)
+        sparse_stride = contiguous_stride(sparse_shape)
+        placeholder_shape = (1,)
+        placeholder_stride = (1,)
+        hidden_meta = (hidden_shape, hidden_stride, "bfloat16")
+        sparse_meta = (sparse_shape, sparse_stride, "float16")
+        placeholder_meta = (placeholder_shape, placeholder_stride, "float16")
+        expected = []
+        with mock.patch.dict(sys.modules, {"prime_rl.trainer.model": model_module}):
+            for stage in range(16):
+                receive, send = self.pp.sparse_cache_stage_flags(
+                    object(), stage % 8, 8, virtual_stage=stage // 8, virtual_stages=2
+                )
+                if stage == 0:
+                    input_meta = ((1, length), contiguous_stride((1, length)), "int64")
+                else:
+                    input_meta = (
+                        hidden_meta,
+                        sparse_meta
+                        if receive
+                        else placeholder_meta,
+                    )
+                if stage == 15:
+                    output_meta = ((), (), "float32")
+                else:
+                    output_meta = (
+                        hidden_meta,
+                        sparse_meta if send else placeholder_meta,
+                    )
+                expected.append((stage, receive, send, input_meta, output_meta))
+
+        self.assertEqual(len(expected), 16)
+        self.assertEqual(
+            [(stage, receive, send) for stage, receive, send, _, _ in expected],
+            [
+                (0, False, True),
+                (1, True, False),
+                (2, False, True),
+                (3, True, True),
+                (4, True, True),
+                (5, True, False),
+                (6, False, True),
+                (7, True, True),
+                (8, True, True),
+                (9, True, False),
+                (10, False, True),
+                (11, True, True),
+                (12, True, True),
+                (13, True, False),
+                (14, False, True),
+                (15, True, False),
+            ],
+        )
+        for stage, receive, send, input_meta, output_meta in expected:
+            if stage == 0:
+                self.assertEqual(input_meta, ((1, length), (length, 1), "int64"))
+            else:
+                self.assertEqual(input_meta[0], hidden_meta)
+                self.assertEqual(
+                    input_meta[1],
+                    sparse_meta
+                    if receive
+                    else placeholder_meta,
+                )
+            if stage == 15:
+                self.assertEqual(output_meta, ((), (), "float32"))
+            else:
+                self.assertEqual(len(output_meta), 2)
+                self.assertEqual(output_meta[0], hidden_meta)
+                self.assertEqual(
+                    output_meta[1], sparse_meta if send else placeholder_meta
+                )
+
 
 
 class SideInputKeyTest(unittest.TestCase):
@@ -269,10 +398,11 @@ class SideInputKeyTest(unittest.TestCase):
 
     def test_interleaved_microbatch_count_is_validated(self):
         self.assertEqual(self.runner.validate_interleaved_microbatches(64, 8), 8)
+        self.assertEqual(self.runner.validate_interleaved_microbatches(95, 8), 12)
+        self.assertEqual(self.runner.validate_interleaved_microbatches(15, 8), 1)
         with self.assertRaisesRegex(ValueError, "at least 8"):
             self.runner.validate_interleaved_microbatches(7, 8)
-        with self.assertRaisesRegex(ValueError, "multiple of the number of rounds"):
-            self.runner.validate_interleaved_microbatches(13, 6)
+        self.assertEqual(self.runner.validate_interleaved_microbatches(13, 6), 3)
 
     def test_1f1b_transport_capacity_matches_warmup_and_steady_state(self):
         capacities = [
@@ -348,9 +478,15 @@ class SideInputKeyTest(unittest.TestCase):
             )
 
     def test_glm_interleaved_ring_projection(self):
+        # Exact capacities from the lowered 95-microbatch schedule. The
+        # routed-expert checkpoint policy changes recomputation only; it does
+        # not add receive-ring slots, so this is the extra-memory bound for
+        # the policy-enabled schedule.
         forward_slots = [0, 16, 16, 16, 16, 14, 12, 10, 8, 8, 8, 8, 8, 6, 4, 2]
-        backward_slots = [1, 1, 1, 1, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 0]
-        sparse_slots = [0, 2, 2, 2, 2, 2, 2, 2, 1, 2, 2, 2, 2, 2, 2, 2]
+        backward_slots = [1, 1, 1, 1, 1, 1, 1, 4, 1, 1, 1, 1, 1, 1, 1, 0]
+        # Stage 8 is the first virtual stage on physical rank 0. Its sparse
+        # cache receive ring has eight slots in the lowered schedule.
+        sparse_slots = [0, 2, 2, 2, 2, 2, 2, 2, 8, 2, 2, 2, 2, 2, 2, 2]
         hidden_slot_bytes = 4096 * 6144 * 2
         sparse_slot_bytes = 4096 * 2048 * 2
         exact_bytes = (
@@ -361,7 +497,16 @@ class SideInputKeyTest(unittest.TestCase):
             (15 * 16 + 15 * 16) * hidden_slot_bytes
             + (15 * 16) * sparse_slot_bytes
         )
-        self.assertEqual(exact_bytes, 8.328125 * 2**30)
+        self.assertEqual(exact_bytes, 8.53125 * 2**30)
+        per_physical_rank = [
+            sum(
+                (forward_slots[stage] + backward_slots[stage]) * hidden_slot_bytes
+                + sparse_slots[stage] * sparse_slot_bytes
+                for stage in (rank, rank + 8)
+            )
+            for rank in range(8)
+        ]
+        self.assertEqual(max(per_physical_rank), 1.28125 * 2**30)
         self.assertEqual(global_slot_bytes, 26.25 * 2**30)
         self.assertLess(exact_bytes, global_slot_bytes)
 

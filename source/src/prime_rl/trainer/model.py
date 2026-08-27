@@ -1009,6 +1009,8 @@ def get_model(
     model_config.pp_transfer_sparse_indices = config.pp_transfer_sparse_indices
     model_config.pp_boundary_plan = config.pp_boundary_plan
     model_config.pp_layer_boundaries = config.pp_layer_boundaries
+    model_config.pp_virtual_layer_boundaries = config.pp_virtual_layer_boundaries
+    model_config.pp_schedule = config.pp_schedule
     checkpoint_quantization = getattr(model_config, "quantization_config", {})
     model_config.fp8_source_checkpoint = isinstance(config.quantization, FP8Config) and (
         checkpoint_quantization.get("quant_method") == "fp8"
@@ -1615,36 +1617,108 @@ def reshard_module(model: nn.Module):
             module.reshard()
 
 
+def _routed_expert_checkpoint_policy(
+    language_model: nn.Module, routed_expert_cutoff: int | None
+) -> dict[int, bool]:
+    """Return the routed-expert retention policy for each owned global layer.
+
+    The configuration cutoff is expressed in physical PP stages. Interleaved
+    schedules have two virtual chunks on each physical rank, so a physical
+    rank-wide boolean is not sufficient. Map the physical cutoff to the
+    accepted physical layer boundary, then apply it by global layer index
+    inside each virtual chunk. The GLM-5.2 PP8 cutoff of 5 therefore starts
+    retention at layer 48, including layers 48 and 49 in the [45, 50) chunk.
+    """
+    if routed_expert_cutoff is None:
+        return {}
+
+    pp_rank = getattr(language_model, "pp_physical_rank", None)
+    pp_size = getattr(language_model, "pp_physical_size", None)
+    virtual_stages = getattr(language_model, "pp_virtual_stages", 1)
+    if pp_rank is None or pp_size is None or pp_size <= 1:
+        raise ValueError(
+            "keep_routed_expert_activations_from_pp_stage requires pipeline parallelism"
+        )
+    if routed_expert_cutoff >= pp_size:
+        raise ValueError(
+            "keep_routed_expert_activations_from_pp_stage must be less than the pipeline size"
+        )
+
+    layer_names = [name for name, _ in language_model.layers.named_children()]
+    layer_ids = [int(name) for name in layer_names]
+    if virtual_stages == 1:
+        keep = pp_rank >= routed_expert_cutoff
+        return {layer_id: keep for layer_id in layer_ids}
+
+    ranges = tuple(getattr(language_model, "pp_layer_ranges", ()))
+    if len(ranges) != virtual_stages:
+        raise ValueError(
+            "interleaved pipeline stages must record one layer range per virtual stage"
+        )
+    if any(start >= end for start, end in ranges):
+        raise ValueError(f"invalid interleaved pipeline layer ranges: {ranges}")
+
+    config = getattr(language_model, "config", None)
+    num_layers = int(
+        getattr(config, "num_hidden_layers", max(end for _, end in ranges))
+    )
+    # ``pp_layer_boundaries`` remains the physical-stage plan. Do not use the
+    # virtual boundary list for this lookup: it has 17 entries for PP8 x 2.
+    physical_boundaries = getattr(config, "pp_layer_boundaries", None)
+    if physical_boundaries is not None:
+        physical_boundaries = [int(value) for value in physical_boundaries]
+        if len(physical_boundaries) != pp_size + 1:
+            raise ValueError(
+                "physical PP boundaries must have one entry per physical stage"
+            )
+        if physical_boundaries[0] != 0 or physical_boundaries[-1] != num_layers:
+            raise ValueError("physical PP boundaries must cover the model layers")
+        if any(start >= end for start, end in zip(physical_boundaries, physical_boundaries[1:])):
+            raise ValueError("physical PP boundaries must be non-empty and ordered")
+    else:
+        # Keep the fallback consistent with stage_layer_range without passing
+        # the virtual boundary field back into that planner.
+        from prime_rl.trainer.distributed.pipeline_parallel import (
+            _index_computing_layers,
+            balanced_boundaries,
+            compute_balanced_boundaries,
+        )
+
+        if getattr(config, "pp_transfer_sparse_indices", False):
+            physical_boundaries = compute_balanced_boundaries(num_layers, pp_size, config)
+        else:
+            allowed = _index_computing_layers(config)
+            physical_boundaries = balanced_boundaries(num_layers, pp_size, allowed)
+    cutoff_layer = physical_boundaries[routed_expert_cutoff]
+
+    policy: dict[int, bool] = {}
+    for start, end in ranges:
+        for layer_id in range(start, end):
+            if layer_id in policy:
+                raise ValueError(f"overlapping interleaved pipeline layer ranges: {ranges}")
+            policy[layer_id] = layer_id >= cutoff_layer
+    missing = sorted(set(layer_ids) - policy.keys())
+    if missing:
+        raise ValueError(f"interleaved pipeline ranges omit owned layers: {missing}")
+    return {layer_id: policy[layer_id] for layer_id in layer_ids}
+
+
 def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
     logger = get_logger()
     language_model = get_language_model(model)
     target_list = sorted(frozenset(ac_config.targets))
     keep_routed_expert_activations = False
     routed_expert_cutoff = ac_config.keep_routed_expert_activations_from_pp_stage
-    if routed_expert_cutoff is not None:
-        pp_rank = getattr(language_model, "pp_physical_rank", None)
-        pp_size = getattr(language_model, "pp_physical_size", None)
-        virtual_stages = getattr(language_model, "pp_virtual_stages", 1)
-        if pp_rank is None or pp_size is None or pp_size <= 1:
-            raise ValueError(
-                "keep_routed_expert_activations_from_pp_stage requires pipeline parallelism"
-            )
-        if virtual_stages != 1:
-            raise ValueError(
-                "keep_routed_expert_activations_from_pp_stage does not support interleaved pipeline stages"
-            )
-        if routed_expert_cutoff >= pp_size:
-            raise ValueError(
-                "keep_routed_expert_activations_from_pp_stage must be less than the pipeline size"
-            )
-        keep_routed_expert_activations = pp_rank >= routed_expert_cutoff
+    routed_expert_keep_by_layer = _routed_expert_checkpoint_policy(
+        language_model, routed_expert_cutoff
+    )
     selective_layers = 0
     full_layers = 0
     fallback_layer_types: set[str] = set()
     model_supported_targets: set[str] = set()
 
-    for layer_id, (layer_name, transformer_block) in enumerate(language_model.layers.named_children()):
-        if layer_id % ac_config.freq != 0:
+    for layer_index, (layer_name, transformer_block) in enumerate(language_model.layers.named_children()):
+        if layer_index % ac_config.freq != 0:
             continue
 
         if ac_config.mode == "reentrant_block":
@@ -1663,7 +1737,14 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
             set_reentrant_attention_shared_expert_checkpointing(transformer_block)
             full_layers += 1
         elif ac_config.mode == "reentrant_attention_all_experts":
-            if keep_routed_expert_activations:
+            global_layer_id = int(layer_name)
+            if routed_expert_cutoff is not None and global_layer_id not in routed_expert_keep_by_layer:
+                raise ValueError(
+                    f"missing routed-expert checkpoint policy for layer {global_layer_id}"
+                )
+            keep_for_layer = routed_expert_keep_by_layer.get(global_layer_id, False)
+            keep_routed_expert_activations = keep_routed_expert_activations or keep_for_layer
+            if keep_for_layer:
                 set_reentrant_attention_shared_expert_checkpointing(transformer_block)
             else:
                 set_reentrant_attention_all_experts_checkpointing(transformer_block)

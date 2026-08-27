@@ -22,6 +22,27 @@ import torch.nn as nn
 from prime_rl.utils.logger import get_logger
 
 
+def _configured_boundaries(
+    num_layers: int, pp_size: int, config
+) -> list[int] | None:
+    """Return a validated explicit plan for the requested stage topology."""
+    configured = getattr(config, "pp_virtual_layer_boundaries", None)
+    if configured is None:
+        configured = getattr(config, "pp_layer_boundaries", None)
+    if configured is None:
+        return None
+    bounds = [int(value) for value in configured]
+    if len(bounds) != pp_size + 1:
+        raise ValueError(
+            f"pipeline boundaries need {pp_size + 1} values, got {len(bounds)}"
+        )
+    if bounds[0] != 0 or bounds[-1] != num_layers:
+        raise ValueError(f"pipeline boundaries must cover [0, {num_layers})")
+    if any(start >= end for start, end in zip(bounds, bounds[1:])):
+        raise ValueError("pipeline boundaries must have non-empty ordered stages")
+    return bounds
+
+
 
 def _index_computing_layers(config) -> list[int] | None:
     """Layers that compute their own sparse-MLA top-k indices.
@@ -217,26 +238,30 @@ def stage_layer_range(num_layers: int, pp_rank: int, pp_size: int, config=None) 
     split is even with the remainder going to the earliest stages.
     """
     boundary_plan = getattr(config, "pp_boundary_plan", "balanced")
-    if config is not None and boundary_plan == "explicit":
-        configured = getattr(config, "pp_layer_boundaries", None)
-        if configured is None:
-            raise ValueError("explicit PP boundaries require pp_layer_boundaries")
-        bounds = [int(value) for value in configured]
-        if len(bounds) != pp_size + 1:
-            raise ValueError(
-                f"explicit PP boundaries need {pp_size + 1} values, got {len(bounds)}"
-            )
-        if bounds[0] != 0 or bounds[-1] != num_layers:
-            raise ValueError(
-                f"explicit PP boundaries must cover [0, {num_layers})"
-            )
-        if any(start >= end for start, end in zip(bounds, bounds[1:])):
-            raise ValueError("explicit PP boundaries must have non-empty ordered stages")
+    configured = (
+        _configured_boundaries(num_layers, pp_size, config)
+        if config is not None
+        else None
+    )
+    is_interleaved = (
+        config is not None and getattr(config, "pp_schedule", None) == "interleaved_1f1b"
+    )
+    if is_interleaved and getattr(config, "pp_virtual_layer_boundaries", None) is None:
+        raise ValueError(
+            "interleaved_1f1b requires explicit pp_virtual_layer_boundaries"
+        )
+    has_virtual_plan = (
+        config is not None
+        and getattr(config, "pp_virtual_layer_boundaries", None) is not None
+    )
+    if configured is not None and (has_virtual_plan or boundary_plan == "explicit"):
+        bounds = configured
         allowed = _index_computing_layers(config)
-        if allowed is not None and any(value not in allowed for value in bounds[1:-1]):
-            raise ValueError(
-                "explicit PP boundaries break the sparse index-cache chain"
-            )
+        if not getattr(config, "pp_transfer_sparse_indices", False):
+            if allowed is not None and any(value not in allowed for value in bounds[1:-1]):
+                raise ValueError(
+                    "explicit PP boundaries break the sparse index-cache chain"
+                )
     elif config is not None and getattr(config, "pp_transfer_sparse_indices", False):
         bounds = compute_balanced_boundaries(num_layers, pp_size, config)
     else:

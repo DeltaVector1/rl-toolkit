@@ -21,6 +21,14 @@ CONFIG_SOURCE = (
     / "configs"
     / "trainer.py"
 ).read_text()
+PP_RUNNER_SOURCE = (
+    Path(__file__).parents[1]
+    / "src"
+    / "prime_rl"
+    / "trainer"
+    / "distributed"
+    / "pp_runner.py"
+).read_text()
 
 
 def load_transport_selector():
@@ -98,6 +106,12 @@ class FP8LocalRecomputeTests(unittest.TestCase):
         )[0]
         self.assertEqual(effective, "bf16_forward_fp8_recompute_backward")
         self.assertIn('== "bf16_forward_fp8_recompute_backward"', recompute)
+
+    def test_interleaved_schedule_guards_private_api_and_ac_frequency(self):
+        self.assertIn("def _require_pinned_interleaved_schedule_api", PP_RUNNER_SOURCE)
+        self.assertIn('requires pinned PyTorch 2.11.0', PP_RUNNER_SOURCE)
+        self.assertIn('self.pp_schedule == "interleaved_1f1b"', CONFIG_SOURCE)
+        self.assertIn('self.ac.freq != 1', CONFIG_SOURCE)
 
     def test_model_passes_the_physical_stage_to_transport_selection(self):
         model = (

@@ -42,6 +42,13 @@ def minimum_pipeline_microbatches(schedule_name: str, pp_size: int) -> int:
 
 
 def validate_interleaved_microbatches(num_microbatches: int, pp_size: int) -> int:
+    """Validate an interleaved batch and return its round count.
+
+    PyTorch's interleaved schedule lowers equal-sized rounds.  A real rollout
+    batch can end with a short round (GLM uses 95 micro-batches), so callers
+    use the next divisible round count and the flexible schedule below drops
+    only the synthetic tail actions.  No input or loss entry is added.
+    """
     if num_microbatches < pp_size:
         raise ValueError(
             f"interleaved_1f1b needs at least {pp_size} micro-batches, "
@@ -49,11 +56,109 @@ def validate_interleaved_microbatches(num_microbatches: int, pp_size: int) -> in
         )
     rounds = max(1, num_microbatches // pp_size)
     if num_microbatches % rounds:
-        raise ValueError(
-            "interleaved_1f1b requires the number of micro-batches to be a "
-            f"multiple of the number of rounds ({rounds}), got {num_microbatches}"
-        )
+        rounds = (num_microbatches + pp_size - 1) // pp_size
     return rounds
+
+
+def _flexible_interleaved_schedule_cls(native_schedule_cls):
+    """Return a PyTorch interleaved schedule that accepts a short final round.
+
+    ``ScheduleInterleaved1F1B`` in the pinned PyTorch release requires
+    ``n_microbatches % number_of_rounds == 0``.  Keep its lowering and runtime,
+    but generate actions for the next divisible round and remove actions for
+    the synthetic tail IDs before communication lowering.  The runtime sees
+    only the real IDs, so loss scaling, gradient reduction, and side-input
+    ownership stay at the requested micro-batch count.
+    """
+    runtime_cls = _require_pinned_interleaved_schedule_api(native_schedule_cls)
+
+    class FlexibleInterleaved1F1B(native_schedule_cls):
+        def __init__(
+            self,
+            stages,
+            n_microbatches,
+            loss_fn=None,
+            args_chunk_spec=None,
+            kwargs_chunk_spec=None,
+            output_merge_spec=None,
+            scale_grads=True,
+            backward_requires_autograd=True,
+        ):
+            real_microbatches = int(n_microbatches)
+            group_size = stages[0].group_size
+            rounds = validate_interleaved_microbatches(real_microbatches, group_size)
+            padded_microbatches = rounds * group_size
+            # Initialise the same runtime state as the native schedule.  Do
+            # not call native_schedule_cls.__init__: it rejects the short
+            # final round before its schedule IR is available.
+            runtime_cls.__init__(
+                self,
+                stages=stages,
+                n_microbatches=real_microbatches,
+                loss_fn=loss_fn,
+                args_chunk_spec=args_chunk_spec,
+                kwargs_chunk_spec=kwargs_chunk_spec,
+                output_merge_spec=output_merge_spec,
+                scale_grads=scale_grads,
+                backward_requires_autograd=backward_requires_autograd,
+            )
+            self.n_local_stages = len(stages)
+            self.rank = stages[0].group_rank
+            self.number_of_rounds = rounds
+            self.microbatches_per_round = padded_microbatches // rounds
+
+            # Reuse PyTorch's proven action generator for the divisible plan.
+            # Its action counters are per stage, so filtering by the synthetic
+            # tail ID preserves every ordering relation among real actions.
+            self._n_microbatches = padded_microbatches
+            try:
+                self.pipeline_order = {
+                    rank: [
+                        action
+                        for action in self._calculate_single_rank_operations(rank)
+                        if action is None
+                        or action.microbatch_index is None
+                        or action.microbatch_index < real_microbatches
+                    ]
+                    for rank in range(self.pp_group_size)
+                }
+            finally:
+                self._n_microbatches = real_microbatches
+            self._prepare_schedule_with_comms(self.pipeline_order)
+
+    FlexibleInterleaved1F1B.__name__ = "FlexibleInterleaved1F1B"
+    return FlexibleInterleaved1F1B
+
+
+def _require_pinned_interleaved_schedule_api(native_schedule_cls):
+    """Fail closed when the private PyTorch schedule API is not pinned.
+
+    The flexible schedule reuses private lowering methods from PyTorch
+    2.11.0. A changed method can silently produce an invalid communication
+    plan, so do not attempt a best-effort fallback.
+    """
+    version = str(getattr(torch, "__version__", ""))
+    if not version.startswith("2.11.0"):
+        raise RuntimeError(
+            "flexible interleaved pipeline requires pinned PyTorch 2.11.0; "
+            f"got {version or 'unknown'}"
+        )
+    try:
+        from torch.distributed.pipelining.schedules import _PipelineScheduleRuntime
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError(
+            "flexible interleaved pipeline requires PyTorch private schedule API"
+        ) from exc
+    required_runtime = ("__init__", "_prepare_schedule_with_comms")
+    missing_runtime = [name for name in required_runtime if not callable(getattr(_PipelineScheduleRuntime, name, None))]
+    missing_native = [name for name in ("_calculate_single_rank_operations",) if not callable(getattr(native_schedule_cls, name, None))]
+    if missing_runtime or missing_native:
+        missing = ", ".join(missing_runtime + missing_native)
+        raise RuntimeError(
+            "flexible interleaved pipeline private API is incompatible; "
+            f"missing {missing}"
+        )
+    return _PipelineScheduleRuntime
 
 
 def _flatten_schedule_action(action):
@@ -1055,8 +1160,15 @@ def build_schedule(
         "gpipe": ScheduleGPipe,
     }
     minimum_pipeline_microbatches(schedule_name, pp_size)
+    interleaved_rounds = None
     if schedule_name == "interleaved_1f1b":
-        validate_interleaved_microbatches(n_microbatches, pp_size)
+        interleaved_rounds = validate_interleaved_microbatches(
+            n_microbatches, pp_size
+        )
+        if n_microbatches % interleaved_rounds:
+            schedules["interleaved_1f1b"] = _flexible_interleaved_schedule_cls(
+                ScheduleInterleaved1F1B
+            )
     cls = schedules[schedule_name]
     # scale_grads=False is load-bearing. The schedule's default divides every
     # gradient by n_microbatches, which is only correct for a loss that AVERAGES
