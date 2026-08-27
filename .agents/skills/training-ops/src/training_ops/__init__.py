@@ -9543,7 +9543,28 @@ def _mounted_on(path: str, host: str) -> bool:
     return any(path in _mounts_in(script) for script in scripts)
 
 
-def deploy(path: str, nodes: list[str] | None = None) -> bool:
+def _repository_root(name: str = "default") -> str:
+    """Return a configured repository root for a supported operation."""
+    keys = {
+        "default": "remote_repository",
+        "glm52-qualification": "glm52_qualification_repository",
+    }
+    try:
+        key = keys[name]
+    except KeyError as error:
+        raise Refused(f"unknown repository {name!r}") from error
+    root = paths.get(key)
+    if not isinstance(root, str) or not root.strip():
+        raise Refused(f"missing configured repository {key}")
+    return root.rstrip("/")
+
+
+def deploy(
+    path: str,
+    nodes: list[str] | None = None,
+    *,
+    repository: str = "default",
+) -> bool:
     """Push one repository file to its hosts and verify the checksum."""
     if nodes is None:
         if path.startswith("source/"):
@@ -9580,7 +9601,8 @@ def deploy(path: str, nodes: list[str] | None = None) -> bool:
                 "to list the union."
             )
     want = hashlib.sha256(local.read_bytes()).hexdigest()
-    remote = f"{remote_repo}/{path}"
+    repository_root = _repository_root(repository)
+    remote = f"{repository_root}/{path}"
     remote_mode = "0755" if local.stat().st_mode & 0o111 else "0644"
 
     def one(h):
@@ -10177,6 +10199,10 @@ def _qualify_connected(
     selected = _profile(name)
     if "orchestrator" in selected:
         raise Refused(f"profile {name!r} is a full run; use start()")
+    repository = (
+        "glm52-qualification" if selected["kind"] == "glm52" else "default"
+    )
+    repository_root = _repository_root(repository)
     relative_config = selected["trainer"]
     expected_step20_adapter = glm_step20_h200_gate["trainer_adapter"]
     if resume_adapter is not None and (
@@ -10258,7 +10284,7 @@ def _qualify_connected(
     qualification_identity = None
     qualification_env = ""
     for path in ("scripts/china/cluster.sh", *trainer_mounts, relative_config):
-        if not deploy(path, nodes=nodes):
+        if not deploy(path, nodes=nodes, repository=repository):
             raise RuntimeError(f"failed to deploy {path}")
     source_files = (
         _trainer_qualification_source_files(nodes)
@@ -10316,12 +10342,12 @@ def _qualify_connected(
 
     trainer_nodes = " ".join(host.removeprefix("n") for host in nodes)
     env = (
-        f"prime_deployment={shlex.quote(remote_repo)} "
+        f"prime_deployment={shlex.quote(repository_root)} "
         f"prime_image={shlex.quote(trainer_image)} "
         f"prime_trainer_container={shlex.quote(trainer_container)} "
         f"trainer_nodes='{trainer_nodes}' RUN={shlex.quote(name)} "
         f"RUN_NAME=run_{shlex.quote(name)} "
-        f"TRAINER_CONFIG={remote_repo}/{relative_config} "
+        f"TRAINER_CONFIG={repository_root}/{relative_config} "
         f"{qualification_env}"
         "PRIME_EP_PROFILE=0 PRIME_EP_AC_CACHE=0 PRIME_INT4_COMBINE_ROUNDS=1 "
         "PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD=0 PRIME_NCCL_CHANNELS=16"
@@ -10349,7 +10375,7 @@ def _qualify_connected(
         nodes,
         lambda host: _ssh(
             host,
-            f"{env} bash {trainer_launcher} trainer",
+            f"{env} bash {repository_root}/scripts/china/cluster.sh trainer",
             300,
         ),
     )
