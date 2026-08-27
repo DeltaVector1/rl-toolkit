@@ -19,12 +19,14 @@ from vllm.model_executor.layers.fused_moe.fused_moe import (
 )
 
 from prime_rl.trainer.models.layers.checkpointing import (
+    current_reentrant_block_phase,
     in_reentrant_block_checkpoint,
 )
 from prime_rl.trainer.models.layers.lm_head import (
     PrimeLmOutput,
     _online_logsumexp_and_weighted_update,
 )
+from prime_rl.trainer.phase_profiler import PROFILE_REQUESTED, get_phase_profiler
 
 block_shape = [128, 128]
 _FP8_W13_CHUNK_ROWS = 4096
@@ -146,6 +148,20 @@ def _profile_expert_backward(start, end) -> None:
 
 def _expert_phase_start(phase: str):
     """Start one routed-expert CUDA phase, or return None when disabled."""
+    if not PROFILE_REQUESTED and not _EXPERT_PHASE_PROFILE:
+        return None
+    profiler = get_phase_profiler()
+    if profiler.active:
+        direction, _, detail = phase.partition(".")
+        if "lora" in detail:
+            category = "lora_backward" if direction == "backward" else "lora_forward"
+        elif direction == "backward":
+            category = "routed_expert_base_backward"
+        elif current_reentrant_block_phase() == "recompute":
+            category = "routed_expert_base_recompute"
+        else:
+            category = "routed_expert_base_forward"
+        return ("phase", profiler.start_span(category))
     if not _EXPERT_PHASE_PROFILE:
         return None
     start = torch.cuda.Event(enable_timing=True)
@@ -156,6 +172,9 @@ def _expert_phase_start(phase: str):
 def _expert_phase_end(timer) -> None:
     """End one routed-expert CUDA phase without synchronizing the stream."""
     if timer is None:
+        return
+    if timer[0] == "phase":
+        get_phase_profiler().end_span(timer[1])
         return
     phase, start = timer
     end = torch.cuda.Event(enable_timing=True)

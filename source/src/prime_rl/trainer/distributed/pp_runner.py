@@ -1004,6 +1004,9 @@ def build_schedule(
         ScheduleGPipe,
         ScheduleInterleaved1F1B,
     )
+    from prime_rl.trainer.phase_profiler import install_pp_phase_hooks
+
+    install_pp_phase_hooks()
 
     stage_modules = list(stage_module) if isinstance(stage_module, (list, tuple)) else [stage_module]
     if schedule_name == "interleaved_1f1b" and len(stage_modules) != 2:

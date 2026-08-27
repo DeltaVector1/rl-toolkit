@@ -12,6 +12,9 @@ ep_profile=0
 ep_profile_every=150
 expert_profile_every=90
 layer_profile_every=180
+phase_profile=0
+phase_profile_steps=1
+phase_profile_sample_every=8
 # RUN selects which config pair under configs/china to use and where logs land.
 # Defaults keep the historical r33 layout.
 RUN=${RUN:-r33}
@@ -135,7 +138,7 @@ case ${1:-} in
     if [ "$rank" -lt 0 ]; then
       echo "node $node is not in trainer_nodes ($trainer_nodes)" >&2; exit 1
     fi
-    IFS='|' read -r rollout_transport trainer_output trainer_only parity_trace_dir parity_trace_source parity_pp parity_cp parity_batch parity_max_calls parity_max_files parity_max_bytes parity_diagnostics parity_diagnostic_tokens parity_diagnostic_max_files parity_diagnostic_max_bytes configured_int4_combine_rounds configured_fp8_expert_activation_offload configured_lora_mm_profile configured_profile_requested configured_profile_pp_stage configured_ep_profile configured_ep_profile_every configured_expert_profile_every configured_layer_profile_every configured_expert_phase_profile configured_expert_phase_profile_every < <(
+    IFS='|' read -r rollout_transport trainer_output trainer_only parity_trace_dir parity_trace_source parity_pp parity_cp parity_batch parity_max_calls parity_max_files parity_max_bytes parity_diagnostics parity_diagnostic_tokens parity_diagnostic_max_files parity_diagnostic_max_bytes configured_int4_combine_rounds configured_fp8_expert_activation_offload configured_lora_mm_profile configured_profile_requested configured_profile_pp_stage configured_ep_profile configured_ep_profile_every configured_expert_profile_every configured_layer_profile_every configured_expert_phase_profile configured_expert_phase_profile_every configured_phase_profile configured_phase_profile_steps configured_phase_profile_sample_every < <(
       python3 - "$trainer_config" <<'PY'
 import sys
 import tomllib
@@ -172,6 +175,17 @@ phase_profile_present = tuple(name in env_vars for name in phase_profile_names)
 if any(phase_profile_present) and not all(phase_profile_present):
     raise SystemExit("trainer config must define every expert phase profiling value or none")
 phase_profile_env = tuple(env_vars.get(name, "") for name in phase_profile_names)
+global_phase_profile_names = (
+    "PRIME_PHASE_PROFILE",
+    "PRIME_PHASE_PROFILE_STEPS",
+    "PRIME_PHASE_PROFILE_SAMPLE_EVERY",
+)
+global_phase_profile_present = tuple(name in env_vars for name in global_phase_profile_names)
+if any(global_phase_profile_present) and not all(global_phase_profile_present):
+    raise SystemExit("trainer config must define every phase profiling value or none")
+global_phase_profile_env = tuple(
+    env_vars.get(name, "") for name in global_phase_profile_names
+)
 values = (
     config["rollout_transport"]["type"],
     config["output_dir"],
@@ -191,6 +205,7 @@ values = (
     *memory_env,
     *profile_env,
     *phase_profile_env,
+    *global_phase_profile_env,
 )
 if any(any(char in str(value) for char in "|\r\n") for value in values):
     raise SystemExit("trainer config value contains the parser separator")
@@ -234,6 +249,22 @@ PY
       ep_profile_every="$configured_ep_profile_every"
       expert_profile_every="$configured_expert_profile_every"
       layer_profile_every="$configured_layer_profile_every"
+    fi
+    if [ -n "$configured_phase_profile" ]; then
+      case "$(readlink -f "$trainer_config")" in
+        "$(readlink -f "$deployment/configs/qualification/glm52-native-small.toml")"|"$(readlink -f "$deployment/configs/qualification/glm52-native-b2048.toml")") ;;
+        *)
+          echo "phase profiling may only be enabled by the GLM small or b2048 qualification config" >&2
+          exit 1
+          ;;
+      esac
+      [ "$configured_phase_profile" = "1" ] || {
+        echo "PRIME_PHASE_PROFILE must be 1 when configured" >&2
+        exit 1
+      }
+      phase_profile="$configured_phase_profile"
+      phase_profile_steps="$configured_phase_profile_steps"
+      phase_profile_sample_every="$configured_phase_profile_sample_every"
     fi
     parity_trace_runtime=""
     parity_image_digest=""
@@ -508,6 +539,7 @@ PY
       -v "$deployment/source/src/prime_rl/trainer/distributed/partial_reshard.py":/app/src/prime_rl/trainer/distributed/partial_reshard.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/distributed/pipeline_parallel.py":/app/src/prime_rl/trainer/distributed/pipeline_parallel.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/distributed/pp_runner.py":/app/src/prime_rl/trainer/distributed/pp_runner.py:ro \
+      -v "$deployment/source/src/prime_rl/trainer/phase_profiler.py":/app/src/prime_rl/trainer/phase_profiler.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/parallel_dims.py":/app/src/prime_rl/trainer/parallel_dims.py:ro \
       -v "$deployment/source/src/prime_rl/utils/cp.py":/app/src/prime_rl/utils/cp.py:ro \
       -v "$deployment/source/src/prime_rl/utils/checkpoint_delta.py":/app/src/prime_rl/utils/checkpoint_delta.py:ro \
@@ -538,6 +570,9 @@ PY
       -e PRIME_LAYER_PROFILE_EVERY="$layer_profile_every" \
       -e PRIME_EXPERT_PHASE_PROFILE="${configured_expert_phase_profile:-0}" \
       -e PRIME_EXPERT_PHASE_PROFILE_EVERY="${configured_expert_phase_profile_every:-180}" \
+      -e PRIME_PHASE_PROFILE="$phase_profile" \
+      -e PRIME_PHASE_PROFILE_STEPS="$phase_profile_steps" \
+      -e PRIME_PHASE_PROFILE_SAMPLE_EVERY="$phase_profile_sample_every" \
       -e PRIME_BIND_GPU_NUMA="${PRIME_BIND_GPU_NUMA:-0}" \
       -e PRIME_NCCL_CHANNELS="$nccl_channels" \
       -e PRIME_PROFILE_PP_STAGE="$profile_pp_stage" \

@@ -14,6 +14,7 @@ from prime_rl.trainer.models.layers.fp8_ada import (
     FP8CheckpointFusedQKVASlice,
 )
 from prime_rl.trainer.models.layers.lora.base import MultiLoRAModule, get_lora_num_tokens, get_multilora_scaling
+from prime_rl.trainer.phase_profiler import phase_span
 
 
 _REPORTED_NONFINITE_LORA: set[str] = set()
@@ -210,6 +211,7 @@ def _run_lora_for_loop(
 
 class _SingleLoRA(torch.autograd.Function):
     @staticmethod
+    @phase_span("lora_forward")
     def forward(ctx, x, lora_A, lora_B, fqn):
         a_out = _lora_mm(x, lora_A.T)
         ctx.save_for_backward(x, lora_A, lora_B, a_out)
@@ -217,6 +219,7 @@ class _SingleLoRA(torch.autograd.Function):
         return _lora_mm(a_out, lora_B.T)
 
     @staticmethod
+    @phase_span("lora_backward")
     def backward(ctx, grad):
         x, lora_A, lora_B, a_out = ctx.saved_tensors
         if grad.dtype in (torch.float16, torch.bfloat16):

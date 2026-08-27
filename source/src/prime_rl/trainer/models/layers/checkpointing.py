@@ -40,6 +40,11 @@ def in_reentrant_block_checkpoint() -> bool:
     return _REENTRANT_BLOCK_PHASE.get() is not None
 
 
+def current_reentrant_block_phase() -> str | None:
+    """Return ``forward`` or ``recompute`` inside a reentrant checkpoint."""
+    return _REENTRANT_BLOCK_PHASE.get()
+
+
 def _is_norm_module(module: nn.Module) -> bool:
     return "norm" in type(module).__name__.lower()
 
