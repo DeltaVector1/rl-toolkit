@@ -23,8 +23,6 @@ from typing import Any, Callable
 import torch
 import torch.nn as nn
 
-from prime_rl.trainer.phase_profiler import record_cuda_capture_microbatch
-
 
 def minimum_pipeline_microbatches(schedule_name: str, pp_size: int) -> int:
     """Return the minimum batch that the selected pipeline schedule accepts."""
@@ -802,11 +800,6 @@ def _bounded_pipeline_stage_cls():
                 self._finish_forward_receive(bwd_chunk_id)
             if not self.is_last:
                 self._finish_backward_receive(bwd_chunk_id)
-            # A pipeline schedule owns the real microbatch loop. Count each
-            # completed chunk after its backward and transport work, so
-            # Nsight can stop without waiting for the full batch or changing
-            # gradients.
-            record_cuda_capture_microbatch(bwd_chunk_id)
             return output
 
     return BoundedPipelineStage
@@ -1011,10 +1004,6 @@ def build_schedule(
         ScheduleGPipe,
         ScheduleInterleaved1F1B,
     )
-    from prime_rl.trainer.phase_profiler import install_pp_phase_hooks
-
-    install_pp_phase_hooks()
-
     stage_modules = list(stage_module) if isinstance(stage_module, (list, tuple)) else [stage_module]
     if schedule_name == "interleaved_1f1b" and len(stage_modules) != 2:
         raise ValueError("interleaved_1f1b requires exactly two local pipeline stages")

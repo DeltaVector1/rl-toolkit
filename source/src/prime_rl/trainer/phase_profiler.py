@@ -6,14 +6,16 @@ synchronization at the end of that step.  It does not change execution order,
 streams, or tensor values.
 
 The separate Nsight Systems CUDA+NVTX range is inactive unless
-``PRIME_CUDA_PROFILE=1``.  It starts on step 2 or later and stops after the
-configured two to four completed microbatches.
+``PRIME_CUDA_PROFILE=1``.  It starts on one selected post-warmup step and
+stops after a bounded wall-clock duration.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import statistics
+import threading
 from contextlib import contextmanager
 from functools import wraps
 from typing import Any, Callable, Iterator, Sequence
@@ -47,35 +49,21 @@ _EVENT_PAIR_COST_US = 20.0
 
 
 def _parse_cuda_capture_steps(value: str) -> frozenset[int]:
-    """Parse the one-capture step list, which must be after one warmup step."""
-    if not value:
-        raise ValueError("PRIME_CUDA_PROFILE_STEPS must name a step after warmup")
-    try:
-        steps = frozenset(int(part) for part in value.split(",") if part)
-    except ValueError as error:
+    """Parse one capture step after one warmup step."""
+    if re.fullmatch(r"(?:[2-9]|[1-9][0-9]+)", value) is None:
         raise ValueError(
-            "PRIME_CUDA_PROFILE_STEPS must contain integers after warmup"
-        ) from error
-    if not steps or min(steps) < 2:
-        raise ValueError(
-            "PRIME_CUDA_PROFILE_STEPS must contain only steps >= 2 (after warmup)"
+            "PRIME_CUDA_PROFILE_STEPS must be one unsigned integer >= 2 (after warmup)"
         )
-    return steps
+    return frozenset({int(value)})
 
 
-def _parse_cuda_capture_microbatches(value: str) -> int:
-    """Return a bounded capture length for real production microbatches."""
-    try:
-        limit = int(value)
-    except (TypeError, ValueError) as error:
+def _parse_cuda_capture_duration(value: str) -> int:
+    """Return a strict capture duration in seconds, from 30 through 120."""
+    if re.fullmatch(r"(?:[3-9][0-9]|1[01][0-9]|120)", value) is None:
         raise ValueError(
-            "PRIME_CUDA_PROFILE_MICROBATCHES must be an integer from 2 through 4"
-        ) from error
-    if limit not in (2, 3, 4):
-        raise ValueError(
-            "PRIME_CUDA_PROFILE_MICROBATCHES must be an integer from 2 through 4"
+            "PRIME_CUDA_PROFILE_SECONDS must be an integer from 30 through 120"
         )
-    return limit
+    return int(value)
 
 
 class _CudaCaptureController:
@@ -88,29 +76,36 @@ class _CudaCaptureController:
         rank: int = -1,
         target_rank: int = -1,
         steps: frozenset[int] = frozenset(),
-        microbatch_limit: int = 3,
+        duration_seconds: int = 60,
         cuda_api_factory: Callable[[], Any] | None = None,
         nvtx: Any | None = None,
+        timer_factory: Callable[[float, Callable[[], None]], threading.Timer]
+        | None = None,
     ) -> None:
         if enabled:
             if target_rank < 0:
                 raise ValueError("PRIME_CUDA_PROFILE_RANK must be non-negative")
-            if not steps or min(steps) < 2:
+            if len(steps) != 1 or min(steps) < 2:
                 raise ValueError(
-                    "PRIME_CUDA_PROFILE_STEPS must contain only steps >= 2 (after warmup)"
+                    "PRIME_CUDA_PROFILE_STEPS must contain one step >= 2 (after warmup)"
                 )
-            _parse_cuda_capture_microbatches(str(microbatch_limit))
+            duration_seconds = _parse_cuda_capture_duration(str(duration_seconds))
         self.enabled = enabled
         self.rank = rank
         self.target_rank = target_rank
         self.steps = steps
-        self.microbatch_limit = microbatch_limit
+        self.duration_seconds = duration_seconds
         self._cuda_api_factory = cuda_api_factory
         self._nvtx = nvtx
         self._cuda_api = None
         self._active = False
         self._capture_used = False
-        self._microbatch_ids: set[int] = set()
+        self._nvtx_active = False
+        self._cuda_stopped = False
+        self._timer: threading.Timer | None = None
+        self._timer_factory = timer_factory or threading.Timer
+        self._timer_error: BaseException | None = None
+        self._lock = threading.Lock()
 
     @classmethod
     def from_environment(cls) -> "_CudaCaptureController":
@@ -122,6 +117,8 @@ class _CudaCaptureController:
             raise ValueError(
                 "PRIME_CUDA_PROFILE_RANK is required when CUDA profiling is enabled"
             )
+        if re.fullmatch(r"[0-9]+", target_value) is None:
+            raise ValueError("PRIME_CUDA_PROFILE_RANK must be an unsigned integer")
         try:
             target_rank = int(target_value)
             rank = int(os.environ.get("RANK", "-1"))
@@ -132,15 +129,15 @@ class _CudaCaptureController:
         steps = _parse_cuda_capture_steps(
             os.environ.get("PRIME_CUDA_PROFILE_STEPS", "2")
         )
-        microbatch_limit = _parse_cuda_capture_microbatches(
-            os.environ.get("PRIME_CUDA_PROFILE_MICROBATCHES", "3")
+        duration_seconds = _parse_cuda_capture_duration(
+            os.environ.get("PRIME_CUDA_PROFILE_SECONDS", "60")
         )
         return cls(
             enabled=True,
             rank=rank,
             target_rank=target_rank,
             steps=steps,
-            microbatch_limit=microbatch_limit,
+            duration_seconds=duration_seconds,
             cuda_api_factory=torch.cuda.cudart,
             nvtx=torch.cuda.nvtx,
         )
@@ -149,13 +146,22 @@ class _CudaCaptureController:
     def active(self) -> bool:
         return self._active
 
+    @contextmanager
+    def step_scope(self, step: int) -> Iterator[None]:
+        """Stop and clean up a selected step on normal or error exit."""
+        self.start(step)
+        try:
+            yield
+        finally:
+            self.stop()
+
     def start(self, step: int) -> bool:
         """Start the single selected range on the configured global rank."""
         if not self.enabled or self.rank != self.target_rank:
             return False
         if self._capture_used or int(step) not in self.steps:
             return False
-        if self._active:
+        if self._active or self._nvtx_active:
             raise RuntimeError("CUDA profiler capture is already active")
         if self._cuda_api_factory is None or self._nvtx is None:
             raise RuntimeError("CUDA profiler capture dependencies are unavailable")
@@ -171,44 +177,75 @@ class _CudaCaptureController:
             raise
         self._cuda_api = api
         self._active = True
+        self._nvtx_active = True
+        self._cuda_stopped = False
+        self._timer_error = None
         self._capture_used = True
-        self._microbatch_ids.clear()
-        return True
-
-    def microbatch_complete(self, microbatch_id: int) -> bool:
-        """Count one completed real microbatch and stop at the configured limit."""
-        if not self._active:
-            return False
-        microbatch_id = int(microbatch_id)
-        if microbatch_id < 0:
-            raise ValueError("CUDA profiler microbatch IDs must be non-negative")
-        if microbatch_id in self._microbatch_ids:
-            return False
-        self._microbatch_ids.add(microbatch_id)
-        if len(self._microbatch_ids) < self.microbatch_limit:
-            return False
-        return self.stop()
-
-    def stop(self) -> bool:
-        """Stop the range exactly once; Nsight then keeps the app running."""
-        if not self._active:
-            return False
-        api = self._cuda_api
-        if api is None or self._nvtx is None:
-            raise RuntimeError("CUDA profiler capture state is incomplete")
-        error = None
+        timer = self._timer_factory(self.duration_seconds, self._timer_stop)
+        timer.daemon = True
+        self._timer = timer
         try:
+            timer.start()
+        except BaseException:
+            self._timer = None
+            self._active = False
             try:
                 self._nvtx.range_pop()
             finally:
-                result = api.cudaProfilerStop()
+                self._nvtx_active = False
+                api.cudaProfilerStop()
+            raise
+        return True
+
+    def _timer_stop(self) -> None:
+        """Stop collection from the timer; NVTX is popped by the owner thread."""
+        with self._lock:
+            if not self._active or self._cuda_stopped:
+                return
+            api = self._cuda_api
+            try:
+                result = api.cudaProfilerStop() if api is not None else 1
                 if result not in (None, 0):
                     raise RuntimeError(f"cudaProfilerStop failed with error {result}")
-        except BaseException as caught:
-            error = caught
-        finally:
-            self._cuda_api = None
-            self._active = False
+            except BaseException as error:
+                self._timer_error = error
+            finally:
+                self._cuda_stopped = True
+                self._active = False
+
+    def stop(self) -> bool:
+        """Cancel and join the timer, then stop and close the range exactly once."""
+        timer = self._timer
+        if timer is not None and timer is not threading.current_thread():
+            timer.cancel()
+            timer.join()
+        with self._lock:
+            if not self._active and not self._nvtx_active:
+                return False
+            api = self._cuda_api
+            if api is None or self._nvtx is None:
+                raise RuntimeError("CUDA profiler capture state is incomplete")
+            error = self._timer_error
+            self._timer = None
+            self._timer_error = None
+            try:
+                if self._nvtx_active:
+                    self._nvtx.range_pop()
+                    self._nvtx_active = False
+            except BaseException as caught:
+                error = error or caught
+            try:
+                if not self._cuda_stopped:
+                    result = api.cudaProfilerStop()
+                    if result not in (None, 0):
+                        raise RuntimeError(f"cudaProfilerStop failed with error {result}")
+            except BaseException as caught:
+                error = error or caught
+            finally:
+                self._cuda_stopped = True
+                self._cuda_api = None
+                self._active = False
+                self._nvtx_active = False
         if error is not None:
             raise error
         return True
@@ -229,13 +266,6 @@ def start_cuda_capture(step: int) -> bool:
     if not _CUDA_CAPTURE_REQUESTED:
         return False
     return _cuda_capture_controller().start(step)
-
-
-def record_cuda_capture_microbatch(microbatch_id: int) -> bool:
-    """Stop the opt-in Nsight range after complete real microbatches."""
-    if not _CUDA_CAPTURE_REQUESTED:
-        return False
-    return _cuda_capture_controller().microbatch_complete(microbatch_id)
 
 
 def stop_cuda_capture() -> bool:
@@ -506,77 +536,3 @@ def phase_span(phase: str | Callable[[], str]):
         return wrapped
 
     return decorator
-
-
-def _pp_phase(description, p2p_ops) -> str:
-    text = f"{description!s} {p2p_ops!s}".lower()
-    if "recv" in text and "send" not in text:
-        return "pp_recv"
-    if "send" in text and "recv" not in text:
-        return "pp_send"
-    return "pp_recv" if "recv" in text else "pp_send"
-
-
-def install_pp_phase_hooks() -> bool:
-    if not _PROFILER.enabled:
-        return False
-    try:
-        from torch.distributed.pipelining import schedules
-        original_batch = schedules._batch_p2p
-        original_wait = schedules._wait_batch_p2p
-    except (AttributeError, ImportError):
-        return False
-    if getattr(schedules, "_prime_phase_profile_installed", False):
-        return True
-
-    @wraps(original_batch)
-    def traced_batch(p2p_ops, desc=None):
-        with _PROFILER.span(_pp_phase(desc, p2p_ops)):
-            return original_batch(p2p_ops, desc=desc)
-
-    @wraps(original_wait)
-    def traced_wait(work):
-        with _PROFILER.span("pp_wait"):
-            return original_wait(work)
-
-    schedules._batch_p2p = traced_batch
-    schedules._wait_batch_p2p = traced_wait
-    schedules._prime_phase_profile_installed = True
-    return True
-
-
-def install_fsdp_phase_hooks() -> bool:
-    if not _PROFILER.enabled:
-        return False
-    try:
-        from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
-    except (AttributeError, ImportError):
-        return False
-    if getattr(FSDPParamGroup, "_prime_phase_profile_installed", False):
-        return True
-    hooks = (
-        ("unshard", "fsdp_collective"),
-        ("wait_for_unshard", "fsdp_wait"),
-        ("_wait_all_gather_streams_on_event", "fsdp_wait"),
-    )
-    for method_name, phase in hooks:
-        original = getattr(FSDPParamGroup, method_name, None)
-        if original is None:
-            continue
-
-        @wraps(original)
-        def traced(self, *args, _original=original, _phase=phase, **kwargs):
-            with _PROFILER.span(_phase):
-                return _original(self, *args, **kwargs)
-
-        setattr(FSDPParamGroup, method_name, traced)
-    original_prefetch = getattr(FSDPParamGroup, "_prefetch_unshard", None)
-    if original_prefetch is not None:
-        @wraps(original_prefetch)
-        def traced_prefetch(target_fsdp_param_group, pass_type):
-            with _PROFILER.span("fsdp_collective"):
-                return original_prefetch(target_fsdp_param_group, pass_type)
-
-        FSDPParamGroup._prefetch_unshard = staticmethod(traced_prefetch)
-    FSDPParamGroup._prime_phase_profile_installed = True
-    return True
