@@ -18,6 +18,7 @@ from types import SimpleNamespace
 from urllib.error import HTTPError
 from unittest.mock import patch
 
+import prime_rl.utils.adapter_delta as adapter_delta_module
 from prime_rl.utils.adapter_delta import (
     ADAPTER_DELTA_FILE,
     AdapterDeltaError,
@@ -62,6 +63,20 @@ def _export(root: Path, name: str, payload: bytes) -> Path:
 
 
 class AdapterDeltaTest(unittest.TestCase):
+    def test_xor_uses_the_compiled_numpy_helper(self) -> None:
+        expected = bytes([0xFF, 0x00, 0xA5])
+        with patch.object(
+            adapter_delta_module.np,
+            "bitwise_xor",
+            wraps=adapter_delta_module.np.bitwise_xor,
+        ) as helper:
+            actual = adapter_delta_module._xor(
+                bytes([0xF0, 0x0F, 0xAA]),
+                bytes([0x0F, 0x0F, 0x0F]),
+            )
+        self.assertEqual(actual, expected)
+        helper.assert_called_once()
+
     def test_adjacent_bf16_reconstructs_byte_for_byte(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -19,6 +19,8 @@ import zlib
 from pathlib import Path
 from typing import BinaryIO, Mapping
 
+import numpy as np
+
 
 ADAPTER_DELTA_VERSION = 1
 ADAPTER_DELTA_CODEC = "xor-zlib-frames"
@@ -167,7 +169,10 @@ def wire_size_break_even(full_wire_size: int, manifest_size: int = 0) -> int:
 def _xor(left: bytes, right: bytes) -> bytes:
     if len(left) != len(right):
         raise AdapterDeltaError("adapter delta inputs have different lengths")
-    return bytes(a ^ b for a, b in zip(left, right))
+    return np.bitwise_xor(
+        np.frombuffer(left, dtype=np.uint8),
+        np.frombuffer(right, dtype=np.uint8),
+    ).tobytes()
 
 
 def _remove_if_exists(path: Path) -> None:
@@ -212,8 +217,11 @@ def build_adapter_delta(
             _remove_if_exists(delta_path)
             _remove_if_exists(manifest_path)
             return None
-        base_identity = adapter_identity(base_model, base_config)
-        target_identity = adapter_identity(target_model, target_config)
+        model_size = base_model.stat().st_size
+        base_config_sha256 = sha256_file(base_config)
+        target_config_sha256 = sha256_file(target_config)
+        base_metadata_sha256 = safetensors_metadata_sha256(base_model)
+        target_metadata_sha256 = safetensors_metadata_sha256(target_model)
     except (OSError, AdapterDeltaError, ValueError):
         _remove_if_exists(delta_path)
         _remove_if_exists(manifest_path)
@@ -222,6 +230,9 @@ def build_adapter_delta(
     temporary = target_dir / f".{ADAPTER_DELTA_FILE}.{os.getpid()}.partial"
     _remove_if_exists(temporary)
     try:
+        base_digest = hashlib.sha256()
+        target_digest = hashlib.sha256()
+        delta_digest = hashlib.sha256()
         with (
             base_model.open("rb") as base,
             target_model.open("rb") as target,
@@ -231,21 +242,25 @@ def build_adapter_delta(
                 base_chunk = base.read(len(target_chunk))
                 if len(base_chunk) != len(target_chunk):
                     raise AdapterDeltaError("base adapter ended before target adapter")
+                base_digest.update(base_chunk)
+                target_digest.update(target_chunk)
                 encoded = zlib.compress(_xor(base_chunk, target_chunk), level=1)
-                output.write(_FRAME_HEADER.pack(len(target_chunk), len(encoded)))
+                header = _FRAME_HEADER.pack(len(target_chunk), len(encoded))
+                output.write(header)
                 output.write(encoded)
+                delta_digest.update(header)
+                delta_digest.update(encoded)
             if base.read(1):
                 raise AdapterDeltaError("base adapter is longer than target adapter")
             output.flush()
             os.fsync(output.fileno())
         delta_size = temporary.stat().st_size
-        ratio = delta_size / target_identity["uncompressed_size"]
+        ratio = delta_size / model_size
         if ratio >= _max_ratio(max_ratio):
             _remove_if_exists(temporary)
             _remove_if_exists(delta_path)
             _remove_if_exists(manifest_path)
             return None
-        delta_sha256 = sha256_file(temporary)
         manifest: dict[str, object] = {
             "version": ADAPTER_DELTA_VERSION,
             "codec": ADAPTER_DELTA_CODEC,
@@ -253,16 +268,16 @@ def build_adapter_delta(
             "frame_bytes": frame_bytes,
             "base_url": base_url,
             "target_url": target_url,
-            "base_sha256": base_identity["target_sha256"],
-            "target_sha256": target_identity["target_sha256"],
-            "base_adapter_config_sha256": base_identity["adapter_config_sha256"],
-            "adapter_config_sha256": target_identity["adapter_config_sha256"],
-            "base_tensor_metadata_sha256": base_identity["tensor_metadata_sha256"],
-            "tensor_metadata_sha256": target_identity["tensor_metadata_sha256"],
-            "base_size": base_identity["uncompressed_size"],
-            "uncompressed_size": target_identity["uncompressed_size"],
+            "base_sha256": base_digest.hexdigest(),
+            "target_sha256": target_digest.hexdigest(),
+            "base_adapter_config_sha256": base_config_sha256,
+            "adapter_config_sha256": target_config_sha256,
+            "base_tensor_metadata_sha256": base_metadata_sha256,
+            "tensor_metadata_sha256": target_metadata_sha256,
+            "base_size": model_size,
+            "uncompressed_size": model_size,
             "delta_size": delta_size,
-            "delta_sha256": delta_sha256,
+            "delta_sha256": delta_digest.hexdigest(),
         }
         manifest_temporary = target_dir / f".{ADAPTER_DELTA_MANIFEST}.{os.getpid()}.partial"
         _remove_if_exists(manifest_temporary)
@@ -392,18 +407,16 @@ def apply_adapter_delta(
 ) -> None:
     """Apply and verify a delta, replacing only the supplied temp target path."""
     validated = load_adapter_delta_manifest_from_mapping(manifest)
-    if sha256_file(base_path) != validated["base_sha256"]:
-        raise AdapterDeltaError("adapter delta base SHA-256 does not match")
     if base_path.stat().st_size != validated.get("base_size", validated["uncompressed_size"]):
         raise AdapterDeltaError("adapter delta base size does not match")
     if delta_path.stat().st_size != validated["delta_size"]:
         raise AdapterDeltaError("adapter delta file size does not match manifest")
-    if sha256_file(delta_path) != validated["delta_sha256"]:
-        raise AdapterDeltaError("adapter delta file SHA-256 does not match manifest")
 
     temporary = target_path.with_name(f".{target_path.name}.{os.getpid()}.assembling")
     _remove_if_exists(temporary)
     digest = hashlib.sha256()
+    base_digest = hashlib.sha256()
+    delta_digest = hashlib.sha256()
     written = 0
     try:
         with base_path.open("rb") as base, delta_path.open("rb") as delta, temporary.open("xb") as target:
@@ -413,6 +426,7 @@ def apply_adapter_delta(
                     break
                 if len(header) != _FRAME_HEADER.size:
                     raise AdapterDeltaError("adapter delta frame header ended early")
+                delta_digest.update(header)
                 raw_size, encoded_size = _FRAME_HEADER.unpack(header)
                 if (
                     raw_size <= 0
@@ -423,6 +437,7 @@ def apply_adapter_delta(
                 ):
                     raise AdapterDeltaError("adapter delta frame header is invalid")
                 encoded = _read_exact(delta, encoded_size)
+                delta_digest.update(encoded)
                 try:
                     decoder = zlib.decompressobj()
                     raw = decoder.decompress(encoded, raw_size + 1)
@@ -444,6 +459,7 @@ def apply_adapter_delta(
                 base_chunk = base.read(raw_size)
                 if len(base_chunk) != raw_size:
                     raise AdapterDeltaError("adapter delta is longer than base adapter")
+                base_digest.update(base_chunk)
                 target_chunk = _xor(base_chunk, raw)
                 target.write(target_chunk)
                 digest.update(target_chunk)
@@ -456,6 +472,10 @@ def apply_adapter_delta(
             os.fsync(target.fileno())
         if written != validated["uncompressed_size"]:
             raise AdapterDeltaError("reconstructed adapter size does not match manifest")
+        if base_digest.hexdigest() != validated["base_sha256"]:
+            raise AdapterDeltaError("adapter delta base SHA-256 does not match")
+        if delta_digest.hexdigest() != validated["delta_sha256"]:
+            raise AdapterDeltaError("adapter delta file SHA-256 does not match manifest")
         if digest.hexdigest() != validated["target_sha256"]:
             raise AdapterDeltaError("reconstructed adapter SHA-256 does not match manifest")
         os.replace(temporary, target_path)
