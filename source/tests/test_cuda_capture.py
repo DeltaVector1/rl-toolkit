@@ -185,8 +185,11 @@ class CudaCaptureTest(unittest.TestCase):
         ):
             with self.subTest(argument=argument):
                 self.assertIn(argument, text)
-        self.assertIn('echo "Nsight Systems capture must run on n78"', text)
-        self.assertIn('[ "${PRIME_CUDA_PROFILE_RANK:-24}" = "24" ]', text)
+        self.assertIn(
+            'echo "Nsight disabled on n$node; capture owner is n78 rank 24"',
+            text,
+        )
+        self.assertIn('[ "$capture_rank" = "24" ]', text)
 
     def test_capture_has_no_schedule_or_microbatch_control(self):
         profiler = Path(__file__).parents[1] / "src/prime_rl/trainer/phase_profiler.py"

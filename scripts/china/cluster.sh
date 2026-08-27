@@ -141,6 +141,27 @@ case ${1:-} in
     if [ "$rank" -lt 0 ]; then
       echo "node $node is not in trainer_nodes ($trainer_nodes)" >&2; exit 1
     fi
+    capture_rank="${PRIME_CUDA_PROFILE_RANK:-24}"
+    if [ "${PRIME_NSYS_PROFILE:-0}" = "1" ]; then
+      [ "$capture_rank" = "24" ] || {
+        echo "Nsight Systems capture is pinned to representative rank 24" >&2
+        exit 1
+      }
+      capture_node_index=$((capture_rank / 8))
+      capture_node=""
+      idx=0
+      for n in $trainer_nodes; do
+        if [ "$idx" -eq "$capture_node_index" ]; then capture_node="$n"; fi
+        idx=$((idx + 1))
+      done
+      [ "$capture_node" = "78" ] || {
+        echo "Nsight rank 24 must map to n78 in trainer_nodes order ($trainer_nodes)" >&2
+        exit 1
+      }
+      if [ "$node" != "78" ]; then
+        echo "Nsight disabled on n$node; capture owner is n78 rank 24"
+      fi
+    fi
     IFS='|' read -r rollout_transport trainer_output trainer_only parity_trace_dir parity_trace_source parity_pp parity_cp parity_batch parity_max_calls parity_max_files parity_max_bytes parity_diagnostics parity_diagnostic_tokens parity_diagnostic_max_files parity_diagnostic_max_bytes configured_int4_combine_rounds configured_fp8_expert_activation_offload configured_lora_mm_profile configured_profile_requested configured_profile_pp_stage configured_ep_profile configured_ep_profile_every configured_expert_profile_every configured_layer_profile_every configured_expert_phase_profile configured_expert_phase_profile_every configured_phase_profile configured_phase_profile_steps configured_phase_profile_sample_every < <(
       python3 - "$trainer_config" <<'PY'
 import sys
@@ -483,16 +504,8 @@ PY
       )
     fi
     if [ "${PRIME_NSYS_PROFILE:-0}" = "1" ]; then
-      [ "$node" = "78" ] || {
-        echo "Nsight Systems capture must run on n78" >&2
-        exit 1
-      }
       [ "${PRIME_CUDA_PROFILE:-0}" = "1" ] || {
         echo "PRIME_CUDA_PROFILE=1 is required for an Nsight Systems capture" >&2
-        exit 1
-      }
-      [ "${PRIME_CUDA_PROFILE_RANK:-24}" = "24" ] || {
-        echo "Nsight Systems capture is pinned to representative rank 24" >&2
         exit 1
       }
       if ! [[ "${PRIME_CUDA_PROFILE_STEPS:-2}" =~ ^([2-9]|[1-9][0-9]+)$ ]]; then
@@ -503,29 +516,31 @@ PY
         echo "PRIME_CUDA_PROFILE_SECONDS must be an integer from 30 through 120" >&2
         exit 1
       fi
-      nsys_mounts=(
-        -v /opt/nvidia/nsight-systems:/opt/nvidia/nsight-systems:ro
-      )
-      nsys_entrypoint=(/opt/nvidia/nsight-systems/2025.3.2/target-linux-x64/nsys)
-      nsys_session="glmkernel-r24-$$"
-      nsys_args=(
-        profile
-        --session-new="$nsys_session"
-        --trace=cuda,nvtx
-        --sample=none
-        --event-sample=none
-        --cpuctxsw=none
-        --backtrace=none
-        --cudabacktrace=none
-        --cuda-memory-usage=false
-        --capture-range=cudaProfilerApi
-        --capture-range-end=stop
-        --flush-on-cudaprofilerstop=true
-        --kill=none
-        --force-overwrite=true
-        -o "$trainer_output/nsys-rank-${PRIME_CUDA_PROFILE_RANK:-24}"
-        /app/.venv/bin/torchrun
-      )
+      if [ "$node" = "78" ]; then
+        nsys_mounts=(
+          -v /opt/nvidia/nsight-systems:/opt/nvidia/nsight-systems:ro
+        )
+        nsys_entrypoint=(/opt/nvidia/nsight-systems/2025.3.2/target-linux-x64/nsys)
+        nsys_session="glmkernel-r24-$$"
+        nsys_args=(
+          profile
+          --session-new="$nsys_session"
+          --trace=cuda,nvtx
+          --sample=none
+          --event-sample=none
+          --cpuctxsw=none
+          --backtrace=none
+          --cudabacktrace=none
+          --cuda-memory-usage=false
+          --capture-range=cudaProfilerApi
+          --capture-range-end=stop
+          --flush-on-cudaprofilerstop=true
+          --kill=none
+          --force-overwrite=true
+          -o "$trainer_output/nsys-rank-${PRIME_CUDA_PROFILE_RANK:-24}"
+          /app/.venv/bin/torchrun
+        )
+      fi
     fi
     sudo install -d -o 1000 -g 1000 -m 0755 "$trainer_output"
     if [ "$rank" -eq 0 ]; then
