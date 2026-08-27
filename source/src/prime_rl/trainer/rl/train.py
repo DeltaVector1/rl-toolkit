@@ -99,22 +99,6 @@ from ring_flash_attn import substitute_hf_flash_attn
 from torchtitan.distributed.utils import clip_grad_norm_
 
 
-_DEFER_PP_DIAGNOSTICS = os.environ.get("PRIME_DEFER_PP_DIAGNOSTICS", "") == "1"
-
-
-def _detach_pp_diagnostic(value: torch.Tensor) -> torch.Tensor:
-    """Keep detached PP metrics on CUDA until post-schedule aggregation when opted in.
-
-    This candidate is for a future Nsight comparison. ``Tensors.compute_stats``
-    still runs before parity and other fail-closed checks; only the storage
-    device and timing of this diagnostic copy change.
-    """
-    value = value.detach()
-    if _DEFER_PP_DIAGNOSTICS:
-        return value
-    return value.to("cpu")
-
-
 def _parse_cpu_list(value: str) -> set[int]:
     cpus = set()
     for part in value.strip().split(","):
@@ -2057,12 +2041,12 @@ def train(config: TrainerConfig):
                     ce_scale=ce_scale,
                     ref_kl_scale=ref_kl_scale,
                 )
-                tensors["loss"].append(_detach_pp_diagnostic(loss).unsqueeze(0))
+                tensors["loss"].append(loss.detach().to("cpu").unsqueeze(0))
                 tensors["entropy/all"].append(
-                    _detach_pp_diagnostic(o["entropy"][side["loss_mask"]])
+                    o["entropy"][side["loss_mask"]].detach().to("cpu")
                 )
                 for k, v in loss_tensors.items():
-                    tensors[k].append(_detach_pp_diagnostic(v))
+                    tensors[k].append(v.detach().to("cpu"))
                 token_exporter.export(
                     progress.step,
                     side["micro_step"],
