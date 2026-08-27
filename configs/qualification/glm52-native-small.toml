@@ -1,4 +1,4 @@
-output_dir = "/data/glm52-rl/qualifications/glm52-native-small-local-recompute-cutoff5"
+output_dir = "/data/glm52-rl/qualifications/glm52-native-small-phase-profile-20260827"
 max_steps = 1
 dist_timeout_seconds = 5400
 enable_router_replay = false
@@ -75,7 +75,7 @@ keep_routed_expert_activations_from_pp_stage = 5
 
 [optim]
 type = "muon"
-lr = 0.0
+lr = 8e-6
 weight_decay = 0.0
 max_norm = 1.0
 
