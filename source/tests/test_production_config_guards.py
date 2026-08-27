@@ -187,7 +187,12 @@ def test_glm52_stability_and_production_use_local_expert_recompute() -> None:
         )
         assert config["model"]["ac"]["keep_routed_expert_activations_from_pp_stage"] == 5
         assert config["model"]["pp_limit_receive_buffers"] is True
-        assert config["model"]["pp_layer_boundaries"] == [0, 8, 18, 28, 38, 48, 58, 69, 78]
+        expected_boundaries = (
+            [0, 8, 18, 28, 38, 48, 58, 68, 78]
+            if "native-b2048" in relative
+            else [0, 8, 18, 28, 38, 48, 58, 69, 78]
+        )
+        assert config["model"]["pp_layer_boundaries"] == expected_boundaries
 
     launcher = (ROOT / "scripts/china/cluster.sh").read_text()
     assert 'env_vars.get("PRIME_INT4_COMBINE_ROUNDS", "")' in launcher
@@ -201,20 +206,18 @@ def test_glm52_stability_and_production_use_local_expert_recompute() -> None:
     assert "PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD" not in muse.get("env_vars", {})
 
 
-def test_glm52_interleaved_qualification_uses_uneven_two_chunk_layout() -> None:
-    expected = [0, 3, 7, 11, 15, 19, 23, 27, 31, 36, 42, 48, 54, 60, 66, 72, 78]
+def test_glm52_b2048_qualification_uses_plain_physical_layout() -> None:
+    expected = [0, 8, 18, 28, 38, 48, 58, 68, 78]
     for relative in (
         "configs/qualification/glm52-native-b2048.toml",
+        "configs/qualification/glm52-native-b2048-memory.toml",
         "configs/qualification/glm52-native-b2048-nsys.toml",
     ):
         model = _load(relative)["model"]
-        assert model["pp_schedule"] == "interleaved_1f1b"
+        assert model["pp_schedule"] == "1f1b"
         assert model["pp_transfer_sparse_indices"] is True
-        assert model["pp_virtual_layer_boundaries"] == expected
-        counts = [end - start for start, end in zip(expected, expected[1:])]
-        assert [counts[r] + counts[r + 8] for r in range(8)] == [
-            8, 10, 10, 10, 10, 10, 10, 10
-        ]
+        assert model["pp_layer_boundaries"] == expected
+        assert "pp_virtual_layer_boundaries" not in model
 
 
 def test_glm52_memory_qualification_mounts_synthetic_cuda_gate_only() -> None:
