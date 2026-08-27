@@ -86,6 +86,17 @@ def test_glm52_launchers_cannot_use_live_muse_container_names() -> None:
     assert 'prime_orchestrator_container="$orchestrator_container"' in edge
 
 
+def test_b2048_nccl_channels_are_profile_pinned_and_passed_to_container() -> None:
+    operations = _load("configs/operations.toml")
+    profile = operations["profiles"]["glm52-native-b2048"]
+    assert profile["launch_env"] == {"PRIME_NCCL_CHANNELS": "16"}
+    launcher = (ROOT / "scripts/china/cluster.sh").read_text()
+    assert 'nccl_channels=${PRIME_NCCL_CHANNELS:-4}' in launcher
+    assert '-e NCCL_MIN_NCHANNELS="$nccl_channels"' in launcher
+    assert '-e NCCL_MAX_NCHANNELS="$nccl_channels"' in launcher
+    assert '-e PRIME_NCCL_CHANNELS="$nccl_channels"' in launcher
+
+
 def test_current_configuration_matches_training_expectations() -> None:
     trainer = _load("configs/china/trainer.muse13.toml")
     orchestrator = _load("configs/h200/orchestrator.muse13.toml")

@@ -7941,6 +7941,33 @@ def _mounted_on(path: str, host: str) -> bool:
     return any(path in _mounts_in(script) for script in scripts)
 
 
+_QUALIFICATION_LAUNCH_ENV_PATTERNS = {
+    "PRIME_NSYS_PROFILE": re.compile(r"[01]"),
+    "PRIME_CUDA_PROFILE": re.compile(r"[01]"),
+    "PRIME_CUDA_PROFILE_RANK": re.compile(r"[0-9]+"),
+    "PRIME_CUDA_PROFILE_STEPS": re.compile(r"(?:[2-9]|[1-9][0-9]+)"),
+    "PRIME_CUDA_PROFILE_SECONDS": re.compile(r"(?:[3-9][0-9]|1[01][0-9]|120)"),
+    "PRIME_NCCL_CHANNELS": re.compile(r"(?:[2-9]|1[0-9]|2[0-9]|3[0-2])"),
+}
+
+
+def _qualification_launch_env(profile: dict) -> dict[str, str]:
+    """Validate the optional, allowlisted trainer launch environment."""
+    launch_env = profile.get("launch_env", {})
+    if not isinstance(launch_env, dict):
+        raise Refused("qualification launch_env must be a mapping")
+    validated = {}
+    for key, value in launch_env.items():
+        if not isinstance(key, str) or key not in _QUALIFICATION_LAUNCH_ENV_PATTERNS:
+            raise Refused(f"qualification launch_env key {key!r} is not allowed")
+        if not isinstance(value, str) or not value:
+            raise Refused(f"qualification launch_env {key} must be a non-empty string")
+        if _QUALIFICATION_LAUNCH_ENV_PATTERNS[key].fullmatch(value) is None:
+            raise Refused(f"qualification launch_env {key} has an invalid value")
+        validated[key] = value
+    return validated
+
+
 def deploy(path: str, nodes: list[str] | None = None) -> bool:
     """Push one repository file to its hosts and verify the checksum."""
     if nodes is None:
@@ -8572,6 +8599,7 @@ def _qualify_connected(
     _assert_live_services_are_down(nodes, include_inference=False)
 
     selected = _profile(name)
+    launch_env = _qualification_launch_env(selected)
     if "orchestrator" in selected:
         raise Refused(f"profile {name!r} is a full run; use start()")
     relative_config = selected["trainer"]
@@ -8720,8 +8748,10 @@ def _qualify_connected(
         f"TRAINER_CONFIG={remote_repo}/{relative_config} "
         f"{qualification_env}"
         "PRIME_EP_PROFILE=0 PRIME_EP_AC_CACHE=0 PRIME_INT4_COMBINE_ROUNDS=1 "
-        "PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD=0 PRIME_NCCL_CHANNELS=16"
+        "PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD=0"
     )
+    for key, value in launch_env.items():
+        env += f" {key}={shlex.quote(value)}"
     if resume_adapter is not None:
         env += (
             f" PRIME_RL_RESUME_ADAPTER={shlex.quote(resume_adapter)}"
@@ -8772,6 +8802,13 @@ def _qualify_connected(
             "PRIME_TRAINER_HOST",
             "PRIME_TRAINER_HEAD",
         )
+        qualification_nccl_channels = launch_env.get("PRIME_NCCL_CHANNELS")
+        if qualification_nccl_channels is not None:
+            environment_keys += (
+                "PRIME_NCCL_CHANNELS",
+                "NCCL_MIN_NCHANNELS",
+                "NCCL_MAX_NCHANNELS",
+            )
         probe_source = """import json
 import subprocess
 import sys
@@ -8846,6 +8883,14 @@ print(json.dumps({
                 "PRIME_TRAINER_HOST": host,
                 "PRIME_TRAINER_HEAD": trainer_head,
             }
+            if qualification_nccl_channels is not None:
+                expected_environment.update(
+                    {
+                        "PRIME_NCCL_CHANNELS": qualification_nccl_channels,
+                        "NCCL_MIN_NCHANNELS": qualification_nccl_channels,
+                        "NCCL_MAX_NCHANNELS": qualification_nccl_channels,
+                    }
+                )
             mismatches = []
             if observed.get("name") != f"/{trainer_container}":
                 mismatches.append("container name")

@@ -2598,7 +2598,22 @@ raise SystemExit(99)
             "configs/qualification/glm52-native-small.toml",
             launch,
         )
-        self.assertIn("PRIME_NCCL_CHANNELS=16", launch)
+        self.assertNotIn("PRIME_NCCL_CHANNELS=", launch)
+
+    def test_qualification_launch_env_allows_selected_nccl_channels(self):
+        profile = tomllib.loads(
+            (training_ops.repo_root / "configs/operations.toml")
+            .read_text()
+        )["profiles"]["glm52-native-b2048"]
+        self.assertEqual(
+            training_ops._qualification_launch_env(profile),
+            {"PRIME_NCCL_CHANNELS": "16"},
+        )
+        for value in ("1", "33", "016", "24;touch /tmp/bad"):
+            with self.subTest(value=value), self.assertRaises(training_ops.Refused):
+                training_ops._qualification_launch_env(
+                    {"launch_env": {"PRIME_NCCL_CHANNELS": value}}
+                )
 
     def test_qualification_launch_reports_launcher_error(self):
         def fake_ssh(host, command, timeout=120):
@@ -2734,6 +2749,9 @@ raise SystemExit(99)
                     "PRIME_TRAINER_IMAGE_DIGEST": images[host],
                     "PRIME_TRAINER_HOST": host,
                     "PRIME_TRAINER_HEAD": training_ops.trainer_head,
+                    "PRIME_NCCL_CHANNELS": "16",
+                    "NCCL_MIN_NCHANNELS": "16",
+                    "NCCL_MAX_NCHANNELS": "16",
                 },
             }
 
@@ -2784,6 +2802,8 @@ raise SystemExit(99)
         self.assertEqual(
             sum("python3 -c" in command for _host, command in calls), len(nodes)
         )
+        launch = next(command for _host, command in calls if "cluster.sh trainer" in command)
+        self.assertIn("PRIME_NCCL_CHANNELS=16", launch)
         failures = (
             ("record", "image"),
             ("record", "image_digest"),
@@ -2793,6 +2813,9 @@ raise SystemExit(99)
             ("environment", "PRIME_TRAINER_IMAGE_DIGEST"),
             ("environment", "PRIME_TRAINER_HOST"),
             ("environment", "PRIME_TRAINER_HEAD"),
+            ("environment", "PRIME_NCCL_CHANNELS"),
+            ("environment", "NCCL_MIN_NCHANNELS"),
+            ("environment", "NCCL_MAX_NCHANNELS"),
         )
         for mutation in failures:
             with self.subTest(mutation=mutation), self.assertRaisesRegex(
