@@ -15,8 +15,8 @@ layer_profile_every=180
 phase_profile=0
 phase_profile_steps=1
 phase_profile_sample_every=8
-nsys_entrypoint=(/app/.venv/bin/torchrun)
-nsys_args=()
+trainer_module=prime_rl.trainer.rl.train
+nsys_env=()
 nsys_mounts=()
 # RUN selects which config pair under configs/china to use and where logs land.
 # Defaults keep the historical r33 layout.
@@ -519,30 +519,36 @@ PY
       )
     fi
     if [ "${PRIME_NSYS_PROFILE:-0}" = "1" ] && [ "$node" = "$capture_node" ]; then
+      nsys_host_root=/opt/nvidia/nsight-systems
+      nsys_host_bin=$(find "$nsys_host_root" -type f \
+        -path '*/target-linux*/nsys' -perm -u+x -print 2>/dev/null | sort -V | tail -n 1)
+      [ -n "$nsys_host_bin" ] && [ -x "$nsys_host_bin" ] || {
+        echo "Nsight Systems executable is not installed under $nsys_host_root" >&2
+        exit 1
+      }
+      nsys_relative_path=${nsys_host_bin#"$nsys_host_root"/}
+      [ "$nsys_relative_path" != "$nsys_host_bin" ] || {
+        echo "Nsight Systems executable is outside $nsys_host_root" >&2
+        exit 1
+      }
+      nsys_host_version=$("$nsys_host_bin" --version 2>&1 | tr '\n' ' ')
+      [[ "$nsys_host_version" =~ [0-9]+\.[0-9]+\.[0-9]+ ]] || {
+        echo "Nsight Systems version evidence is invalid: $nsys_host_version" >&2
+        exit 1
+      }
+      echo "Nsight Systems binary: $nsys_host_bin"
+      echo "Nsight Systems version: $nsys_host_version"
       nsys_mounts=(
         -v /opt/nvidia/nsight-systems:/opt/nvidia/nsight-systems:ro
       )
-      nsys_entrypoint=(/opt/nvidia/nsight-systems/2025.3.2/target-linux-x64/nsys)
       nsys_session="glmkernel-r24-$$"
-      nsys_args=(
-        profile
-        --session-new="$nsys_session"
-        --trace=cuda,nvtx
-        --sample=none
-        --event-sample=none
-        --cpuctxsw=none
-        --backtrace=none
-        --cudabacktrace=none
-        --cuda-memory-usage=false
-        --flush-on-cudaprofilerstop=true
-        --capture-range=cudaProfilerApi
-        --capture-range-end=stop
-        --stop-on-exit=true
-        --kill=none
-        --force-overwrite=true
-        -o "$trainer_output/nsys-rank-$capture_rank"
-        /app/.venv/bin/torchrun
+      nsys_env=(
+        -e "PRIME_NSYS_BIN=$nsys_host_root/$nsys_relative_path"
+        -e "PRIME_NSYS_VERSION=$nsys_host_version"
+        -e "PRIME_NSYS_OUTPUT=$trainer_output/nsys-rank-$capture_rank"
+        -e "PRIME_NSYS_SESSION=$nsys_session"
       )
+      trainer_module=prime_rl.trainer.nsys_worker
     fi
     sudo install -d -o 1000 -g 1000 -m 0755 "$trainer_output"
     if [ "$rank" -eq 0 ]; then
@@ -593,6 +599,7 @@ PY
       -e PYTHONPATH="$deployment/env":/app/packages/prime-rl-configs/src:/app/src \
       "${parity_env[@]}" \
       "${qualification_env[@]}" \
+      "${nsys_env[@]}" \
       -v "$deployment/source/src/prime_rl/trainer/fp8_checkpoint.py":/app/src/prime_rl/trainer/fp8_checkpoint.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/model.py":/app/src/prime_rl/trainer/model.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/models/layers/fp8_ada.py":/app/src/prime_rl/trainer/models/layers/fp8_ada.py:ro \
@@ -606,6 +613,7 @@ PY
       -v "$deployment/source/src/prime_rl/trainer/distributed/pipeline_parallel.py":/app/src/prime_rl/trainer/distributed/pipeline_parallel.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/distributed/pp_runner.py":/app/src/prime_rl/trainer/distributed/pp_runner.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/phase_profiler.py":/app/src/prime_rl/trainer/phase_profiler.py:ro \
+      -v "$deployment/source/src/prime_rl/trainer/nsys_worker.py":/app/src/prime_rl/trainer/nsys_worker.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/parallel_dims.py":/app/src/prime_rl/trainer/parallel_dims.py:ro \
       -v "$deployment/source/src/prime_rl/utils/cp.py":/app/src/prime_rl/utils/cp.py:ro \
       -v "$deployment/source/src/prime_rl/utils/checkpoint_delta.py":/app/src/prime_rl/utils/checkpoint_delta.py:ro \
@@ -652,8 +660,7 @@ PY
       -e PRIME_LORA_MM_PROFILE="$lora_mm_profile" \
       -e PRIME_PP_MAX_MICRO="${PRIME_PP_MAX_MICRO:-}" \
       -e PRIME_STATS_DEBUG="${PRIME_STATS_DEBUG:-}" \
-      --entrypoint "${nsys_entrypoint[0]}" "$image" \
-      "${nsys_args[@]}" \
+      --entrypoint /app/.venv/bin/torchrun "$image" \
       --role=trainer \
       --nnodes="$nnodes" \
       --nproc-per-node=8 \
@@ -665,7 +672,7 @@ PY
       --tee=3 \
       --redirects=3 \
       --local-ranks-filter=0 \
-      -m prime_rl.trainer.rl.train \
+      -m "$trainer_module" \
       @ "$trainer_config"
     ;;
   orchestrator)

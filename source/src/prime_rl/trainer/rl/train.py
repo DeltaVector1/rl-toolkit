@@ -1572,7 +1572,6 @@ def _train_impl(config: TrainerConfig):
 
         forward_backward_start_time = time.perf_counter()
         phase_profiler.begin_step(progress.step)
-        start_cuda_capture(progress.step)
         seq_len = micro_batches[0]["input_ids"].shape[1]
 
         # Normalize each loss component by its own global (dp_cp) token count, so every rank
@@ -1789,6 +1788,11 @@ def _train_impl(config: TrainerConfig):
                 )
                 continue
 
+            if micro_step == 0:
+                # Exclude batch preparation and global-scale collectives from
+                # the application-controlled forward/backward range.
+                start_cuda_capture(progress.step)
+
             # Forward pass with per-token temperatures
             with maybe_record_function("forward"), maybe_activation_offloading(
                 config.model.ac_offloading
@@ -1951,6 +1955,12 @@ def _train_impl(config: TrainerConfig):
             if "routing_confidence" in tensors:
                 micro_step_message += f" | Routing Conf. {tensors['routing_confidence'][-1].mean().item():.4f}"
             logger.debug(micro_step_message)
+
+        if not pp_enabled:
+            # The non-pipeline path completes forward/backward in the loop
+            # above. Keep later step diagnostics and gradient checks outside
+            # the capture as well.
+            stop_cuda_capture()
 
         if pp_enabled:
             # Loss for the last stage. Mirrors the non-PP path: temperature-scaled
@@ -2206,6 +2216,7 @@ def _train_impl(config: TrainerConfig):
                 if dist.get_rank() == profile_rank
                 else nullcontext()
             )
+            start_cuda_capture(progress.step)
             with schedule_profiler:
                 if pp_rank == 0:
                     pp_schedule.step(pp_inputs, return_outputs=False)
@@ -2219,6 +2230,10 @@ def _train_impl(config: TrainerConfig):
                     )
                 else:
                     pp_schedule.step(return_outputs=False)
+            # The Nsight range covers only the completed forward/backward
+            # schedule.  Keep all diagnostics, gradient scaling and checks,
+            # clipping, and optimizer work outside the range.
+            stop_cuda_capture()
             if dist.get_rank() == profile_rank:
                 logger.info(
                     "PP CUDA profile:\n"
@@ -2426,10 +2441,6 @@ def _train_impl(config: TrainerConfig):
                 flush=True,
             )
 
-        # Keep optimizer and scheduler work outside the application-controlled
-        # Nsight range.  Step 2 is the first completed warm step after startup
-        # and step 1's optimizer compilation.
-        stop_cuda_capture()
         zero_grad_ratio = get_zero_gradient_ratio(model.parameters(), parallel_dims.dp_replicate)
 
         # Update the model parameters
@@ -2777,9 +2788,18 @@ def _train_impl(config: TrainerConfig):
 def train(config: TrainerConfig):
     """Run training and close an active diagnostic capture on any error."""
     try:
-        return _train_impl(config)
-    finally:
+        result = _train_impl(config)
+    except BaseException:
+        # Preserve the training failure.  Cleanup is best effort on an error
+        # path, but remains strict after a normal return.
+        try:
+            stop_cuda_capture()
+        except BaseException:
+            pass
+        raise
+    else:
         stop_cuda_capture()
+        return result
 
 
 def main():
