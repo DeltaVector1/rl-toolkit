@@ -507,7 +507,7 @@ class EdgeOperationsTest(unittest.TestCase):
         )
         self.assertTrue(any("recovery" in failure for failure in failures))
 
-    def test_stability20_recovery_allows_only_pinned_train_source_change(self):
+    def test_stability20_recovery_rejects_changed_train_source(self):
         with (
             training_ops.repo_root / training_ops.production_stability20_profile
         ).open("rb") as stream:
@@ -521,7 +521,11 @@ class EdgeOperationsTest(unittest.TestCase):
         )
         current_sources = dict(source_files)
         current_sources[training_ops.qualification_train_source] = (
-            training_ops.approved_recovery_train_sha256
+            hashlib.sha256(
+                (
+                    training_ops.repo_root / training_ops.qualification_train_source
+                ).read_bytes()
+            ).hexdigest()
         )
         result = {
             "recovery": {
@@ -544,7 +548,7 @@ class EdgeOperationsTest(unittest.TestCase):
             }
         }
         session = {"source_files": source_files}
-        self.assertEqual(
+        self.assertNotEqual(
             hashlib.sha256(
                 (
                     training_ops.repo_root / training_ops.qualification_train_source
@@ -552,7 +556,7 @@ class EdgeOperationsTest(unittest.TestCase):
             ).hexdigest(),
             training_ops.approved_recovery_train_sha256,
         )
-        self.assertTrue(
+        self.assertFalse(
             training_ops._qualification_sources_match(
                 session,
                 result,

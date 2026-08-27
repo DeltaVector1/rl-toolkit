@@ -417,6 +417,7 @@ class _QualificationDeadline:
             raise RuntimeError("b2048 qualification deadlines are invalid")
         self._started = time.monotonic()
         self._startup_complete = False
+        self._completed = False
         self._forward_backward_started: float | None = None
         self._profiler_finalize_started: float | None = None
         self._lock = threading.Lock()
@@ -453,6 +454,15 @@ class _QualificationDeadline:
 
     def stop(self) -> None:
         self._stop.set()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join()
+
+    def mark_completed(self) -> None:
+        """Commit successful result completion before stopping the watcher."""
+        with self._lock:
+            self._completed = True
+        self.stop()
 
     def mark_startup_complete(self) -> None:
         with self._lock:
@@ -478,11 +488,18 @@ class _QualificationDeadline:
         while not self._stop.wait(0.25):
             reason = self._deadline_reason(time.monotonic())
             if reason is not None:
-                self._abort(reason)
+                # Hold the lock through the abort decision. A successful result
+                # marks completion under the same lock, so the watcher cannot
+                # terminate after result publication.
+                with self._lock:
+                    if not self._completed:
+                        self._abort(reason)
 
     def _deadline_reason(self, now: float) -> str | None:
         """Return the first expired phase without changing trainer state."""
         with self._lock:
+            if self._completed:
+                return None
             startup_complete = self._startup_complete
             forward_backward_started = self._forward_backward_started
             profiler_finalize_started = self._profiler_finalize_started
@@ -2920,7 +2937,7 @@ def _train_impl(config: TrainerConfig):
             raise RuntimeError("qualification result write failed")
 
     if qualification_deadline is not None:
-        qualification_deadline.stop()
+        qualification_deadline.mark_completed()
 
     logger.success("RL trainer finished!")
 

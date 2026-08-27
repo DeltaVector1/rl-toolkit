@@ -72,6 +72,14 @@ class QualificationDeadlineTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "evidence differs"):
             deadline.validate_session({"deadlines": {"session_seconds": 60}})
 
+    def test_completion_suppresses_expiry_and_joins_watcher(self):
+        deadline = self.deadline_class("glm52-native-b2048", self.values)
+        deadline._started = 0
+        deadline.start()
+        deadline.mark_completed()
+        self.assertFalse(deadline._thread.is_alive())
+        self.assertIsNone(deadline._deadline_reason(10_000))
+
 
 if __name__ == "__main__":
     unittest.main()

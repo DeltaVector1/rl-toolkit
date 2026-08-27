@@ -7433,7 +7433,7 @@ legacy_stability20_train_sha256 = (
     "88bb92799b5133ee820b212bc38aa0818e9a87d8dc81ba439c6bec6780655ac0"
 )
 approved_recovery_train_sha256 = (
-    "fca1dc6ceb0f4891259a391eb59f222ff12a59a169e77ccad6288a9da33140fe"
+    "e4e6a1ba16ed10a1c46e1405e6d135d7735f2a84ff02749e0cadbefc79d75a93"
 )
 qualification_source_targets = {
     "q_a_proj",
