@@ -151,7 +151,12 @@ def make_case(device: torch.device) -> Case:
         )
     permutation = permutation.to(torch.int64).contiguous()
     offsets = torch.cumsum(local_counts, dim=0, dtype=torch.int32)
-    if permutation.ndim != 1 or int(offsets[-1]) != permutation.shape[0]:
+    valid_routed_rows = int(offsets[-1])
+    if (
+        permutation.ndim != 1
+        or valid_routed_rows < SOURCE_ROWS
+        or valid_routed_rows > permutation.shape[0]
+    ):
         raise RuntimeError("generated production routing layout is invalid")
     if offsets.shape != (LOCAL_EXPERTS,):
         raise RuntimeError("generated local expert offsets have the wrong shape")
