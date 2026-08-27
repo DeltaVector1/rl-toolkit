@@ -120,6 +120,21 @@ class FP8LocalRecomputeTests(unittest.TestCase):
         }
         self.assertEqual(actual, expected)
 
+    def test_cutoff_four_maps_to_the_requested_layer_forty_boundary(self):
+        policy = load_checkpoint_policy()
+
+        class CutoffFourRankZero(_FakeLanguageModel):
+            pp_physical_rank = 0
+            pp_layer_ranges = ((0, 5), (40, 45))
+            layers = _LayerNames(tuple(range(0, 5)) + tuple(range(40, 45)))
+
+        actual = policy(CutoffFourRankZero(), 4)
+        expected = {
+            **{layer: False for layer in range(0, 5)},
+            **{layer: True for layer in range(40, 45)},
+        }
+        self.assertEqual(actual, expected)
+
     def test_interleaved_policy_fails_closed_for_bad_ranges(self):
         policy = load_checkpoint_policy()
 
