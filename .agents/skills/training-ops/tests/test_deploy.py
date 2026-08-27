@@ -9,6 +9,66 @@ import training_ops
 
 
 class DeployTest(unittest.TestCase):
+    def test_control_master_reuses_live_configured_socket(self):
+        host = training_ops.trainer_head
+        with tempfile.TemporaryDirectory() as directory:
+            socket = Path(directory) / "configured-master"
+            socket.touch()
+
+            def run(command, **kwargs):
+                del kwargs
+                if "-G" in command:
+                    return Mock(
+                        returncode=0,
+                        stdout=f"controlmaster auto\ncontrolpath {socket}\n",
+                        stderr="",
+                    )
+                if "-O" in command:
+                    return Mock(returncode=0, stdout="Master running\n", stderr="")
+                raise AssertionError(f"unexpected SSH command: {command}")
+
+            with patch.dict(
+                training_ops._ssh_control_paths, {}, clear=True
+            ), patch.object(training_ops.subprocess, "run", side_effect=run) as subprocess_run:
+                with training_ops._ssh_control_masters([host]):
+                    self.assertEqual(
+                        training_ops._active_ssh_control_options(host),
+                        ["-o", "ControlMaster=no", "-o", f"ControlPath={socket}"],
+                    )
+
+            commands = [call.args[0] for call in subprocess_run.call_args_list]
+            self.assertFalse(any("-MNf" in command for command in commands))
+            self.assertFalse(any("exit" in command for command in commands))
+            self.assertEqual(sum("-O" in command for command in commands), 1)
+            self.assertEqual(training_ops._ssh_control_paths, {})
+
+    def test_control_master_refuses_existing_stale_configured_socket(self):
+        host = training_ops.trainer_head
+        with tempfile.TemporaryDirectory() as directory:
+            socket = Path(directory) / "stale-master"
+            socket.touch()
+
+            def run(command, **kwargs):
+                del kwargs
+                if "-G" in command:
+                    return Mock(returncode=0, stdout=f"controlpath {socket}\n", stderr="")
+                if "-O" in command:
+                    return Mock(returncode=255, stdout="", stderr="Control socket stale")
+                raise AssertionError(f"unexpected SSH command: {command}")
+
+            with patch.dict(
+                training_ops._ssh_control_paths, {}, clear=True
+            ), patch.object(training_ops.subprocess, "run", side_effect=run) as subprocess_run:
+                with self.assertRaisesRegex(
+                    training_ops.Refused, "configured SSH control master is stale"
+                ):
+                    with training_ops._ssh_control_masters([host]):
+                        pass
+
+            commands = [call.args[0] for call in subprocess_run.call_args_list]
+            self.assertFalse(any("-MNf" in command for command in commands))
+            self.assertEqual(training_ops._ssh_control_paths, {})
+
     def test_control_master_starts_once_per_configured_host(self):
         hosts = [*training_ops.trainer_hosts, training_ops.trainer_hosts[0]]
         completed = Mock(returncode=0, stdout="", stderr="")
@@ -94,6 +154,8 @@ class DeployTest(unittest.TestCase):
 
             def run(command, **kwargs):
                 del kwargs
+                if "-G" in command:
+                    return Mock(returncode=0, stdout="", stderr="")
                 path = Path(command[command.index("-S") + 1])
                 if "-MNf" in command:
                     path.touch()
@@ -324,6 +386,8 @@ class DeployTest(unittest.TestCase):
             copied_to = []
 
             def fake_run(command, **kwargs):
+                if "-G" in command:
+                    return Mock(returncode=0, stdout="", stderr="")
                 if command[0] == "scp":
                     copied_to.append(command[-1].split(":", 1)[0])
                 return Mock(returncode=0)

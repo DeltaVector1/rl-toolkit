@@ -396,6 +396,7 @@ ssh_master_cleanup_attempts = 3
 ssh_master_cleanup_timeout_seconds = 10
 ssh_master_retry_delay_seconds = 1
 ssh_master_persist_seconds = 300
+ssh_config_resolve_timeout_seconds = 10
 _ssh_control_paths: dict[str, str] = {}
 _ssh_control_lock = Lock()
 
@@ -431,6 +432,77 @@ def _active_ssh_control_options(host: str) -> list[str]:
     if path is None:
         return []
     return ["-o", "ControlMaster=no", "-o", f"ControlPath={path}"]
+
+
+def _configured_ssh_control_path(host: str) -> str | None:
+    """Return a live configured control path, or fail closed if it is stale."""
+    _check_host(host)
+    try:
+        resolved = subprocess.run(
+            [*ssh_command, "-G", host],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=ssh_config_resolve_timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise Refused(f"SSH configuration resolution timed out on {host}") from error
+    except OSError as error:
+        raise Refused(f"SSH configuration resolution failed on {host}") from error
+    if resolved.returncode:
+        detail = (resolved.stderr or resolved.stdout or "configuration failed").strip()
+        raise Refused(
+            f"SSH configuration resolution failed on {host}: {detail[:160]}"
+        )
+    configured_path = None
+    for line in (resolved.stdout or "").splitlines():
+        key, separator, value = line.partition(" ")
+        if separator and key == "controlpath":
+            configured_path = value.strip()
+            break
+    if not configured_path or configured_path == "none":
+        return None
+    path = Path(configured_path)
+    if not path.is_absolute():
+        raise Refused(
+            f"SSH configuration has a non-absolute control path on {host}"
+        )
+    # An existing path must be a live master. Never silently fall back to a
+    # new credentialed connection when configured state is stale.
+    if not os.path.lexists(configured_path):
+        return None
+    try:
+        checked = subprocess.run(
+            [
+                *ssh_command,
+                "-S",
+                configured_path,
+                "-O",
+                "check",
+                host,
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=ssh_master_cleanup_timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise Refused(
+            f"configured SSH control master check timed out on {host}: "
+            f"{configured_path}"
+        ) from error
+    except OSError as error:
+        raise Refused(
+            f"configured SSH control master check failed on {host}: "
+            f"{configured_path}"
+        ) from error
+    if checked.returncode:
+        detail = (checked.stderr or checked.stdout or "control check failed").strip()
+        raise Refused(
+            f"configured SSH control master is stale on {host}: "
+            f"{configured_path} ({detail[:120]})"
+        )
+    return configured_path
 
 
 def _close_ssh_control_master(host: str, path: str) -> bool:
@@ -507,9 +579,16 @@ def _ssh_control_masters(hosts_to_open):
         yield
         return
     directory = Path(tempfile.mkdtemp(prefix="training-ops-ssh-"))
+    adopted: list[tuple[str, str]] = []
     opened: list[tuple[str, str]] = []
     try:
         for host in missing:
+            configured_path = _configured_ssh_control_path(host)
+            if configured_path is not None:
+                with _ssh_control_lock:
+                    _ssh_control_paths[host] = configured_path
+                adopted.append((host, configured_path))
+                continue
             name = hashlib.sha256(host.encode()).hexdigest()[:16]
             path = str(directory / name)
             _start_ssh_control_master(host, path)
@@ -519,7 +598,7 @@ def _ssh_control_masters(hosts_to_open):
         yield
     finally:
         with _ssh_control_lock:
-            for host, path in opened:
+            for host, path in [*adopted, *opened]:
                 if _ssh_control_paths.get(host) == path:
                     del _ssh_control_paths[host]
         failed = [
