@@ -34,6 +34,14 @@ _FP8_ROUTE_SCALE_CHUNK_ROWS = 4096
 _FP8_EXPERT_ACTIVATION_OFFLOAD = (
     os.environ.get("PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD", "") == "1"
 )
+# Local recompute normally rebuilds W2 in backward only to obtain the
+# pre-route-score expert output for the router gradient.  This opt-in cache
+# stores the exact FP8/QDQ value needed for that dot product on pinned host
+# memory.  It is disabled by default because it trades host memory and a
+# forward D2H copy for backward GEMMs.
+_FP8_EXPERT_ROUTE_OUTPUT_CACHE = (
+    os.environ.get("PRIME_FP8_EXPERT_ROUTE_OUTPUT_CACHE", "") == "1"
+)
 _DIAGNOSE_LINEAR_BACKWARD = False
 _REPORTED_LINEAR_BACKWARD: set[tuple[tuple[int, ...], bool, bool]] = set()
 _REPORTED_INPUT_GRAD: set[str] = set()
@@ -196,6 +204,58 @@ def _profile_expert_phases_tick(direction: str) -> None:
             f"direction={direction} calls={_EXPERT_PHASE_PROFILE_EVERY} {parts}",
             flush=True,
         )
+
+
+def _validate_route_output_cache(
+    values: torch.Tensor,
+    scales: torch.Tensor,
+    rows: int,
+    width: int,
+) -> None:
+    """Validate the compact local-recompute route-output cache."""
+    if values.device.type != "cpu" or values.dtype != torch.float8_e4m3fn:
+        raise TypeError("route-output cache values must be CPU E4M3 FP8")
+    if not values.is_pinned() or not values.is_contiguous():
+        raise ValueError("route-output cache values must be contiguous pinned memory")
+    if tuple(values.shape) != (rows, width):
+        raise ValueError(
+            f"route-output cache values have shape {tuple(values.shape)}, "
+            f"expected {(rows, width)}"
+        )
+    if scales.device.type != "cpu" or scales.dtype != torch.float32:
+        raise TypeError("route-output cache scales must be CPU FP32")
+    if not scales.is_pinned() or not scales.is_contiguous():
+        raise ValueError("route-output cache scales must be contiguous pinned memory")
+    if tuple(scales.shape) != (rows,):
+        raise ValueError(
+            f"route-output cache scales have shape {tuple(scales.shape)}, "
+            f"expected {(rows,)}"
+        )
+
+
+def _validate_route_output_indices(
+    permuted_indices: torch.Tensor,
+    offsets: torch.Tensor,
+    rows: int,
+    source_rows: int,
+    expert_count: int,
+    device: torch.device,
+) -> None:
+    """Validate the grouped row/index layout used by the opt-in cache."""
+    if permuted_indices.device != device or permuted_indices.ndim != 1:
+        raise ValueError("permuted expert indices must be a one-dimensional CUDA tensor")
+    if permuted_indices.numel() != rows or not permuted_indices.is_contiguous():
+        raise ValueError("permuted expert indices have the wrong shape or layout")
+    if permuted_indices.dtype not in (torch.int32, torch.int64):
+        raise TypeError("permuted expert indices must be int32 or int64")
+    if offsets.device != device or offsets.ndim != 1:
+        raise ValueError("expert offsets must be a one-dimensional CUDA tensor")
+    if offsets.numel() != expert_count or not offsets.is_contiguous():
+        raise ValueError("expert offsets have the wrong shape or layout")
+    if offsets.dtype not in (torch.int32, torch.int64):
+        raise TypeError("expert offsets must be int32 or int64")
+    if source_rows <= 0 or rows <= 0:
+        raise ValueError("expert index validation requires positive row counts")
 
 
 if hasattr(triton, "jit"):
@@ -2468,6 +2528,46 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
             getattr(received_input, "save_for_backward", True)
         )
         save_intermediates = save_backward_state and not local_recompute
+        cache_route_output = (
+            save_backward_state
+            and local_recompute
+            and _FP8_EXPERT_ROUTE_OUTPUT_CACHE
+        )
+        route_output_q_host = None
+        route_output_scales_host = None
+        if cache_route_output:
+            _validate_route_output_indices(
+                permuted_indices,
+                offsets,
+                rows,
+                x.shape[0],
+                w2.shape[0] if w2.ndim == 3 else 0,
+                x.device,
+            )
+            if w2.ndim != 3 or w2.shape[1] <= 0:
+                raise ValueError(
+                    "native expert route-output cache requires a 3D W2 "
+                    "with a positive output width"
+                )
+            route_output_q_host = torch.empty(
+                rows,
+                w2.shape[1],
+                device="cpu",
+                dtype=torch.float8_e4m3fn,
+                pin_memory=True,
+            )
+            route_output_scales_host = torch.empty(
+                rows,
+                device="cpu",
+                dtype=torch.float32,
+                pin_memory=True,
+            )
+            _validate_route_output_cache(
+                route_output_q_host,
+                route_output_scales_host,
+                rows,
+                w2.shape[1],
+            )
         if save_intermediates:
             q1_host = torch.empty(
                 rows,
@@ -2564,6 +2664,31 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                 alpha=scaling,
             )
             _expert_phase_end(phase_timer)
+            if cache_route_output:
+                phase_timer = _expert_phase_start("forward.route_output_cache")
+                quantized_out, output_scales = ops.scaled_fp8_quant(
+                    chunk_out,
+                    use_per_token_if_dynamic=True,
+                )
+                output_scales = output_scales.reshape(-1)
+                if tuple(quantized_out.shape) != tuple(chunk_out.shape):
+                    raise ValueError(
+                        "native expert route-output quantization changed its shape"
+                    )
+                if tuple(output_scales.shape) != (end - start,):
+                    raise ValueError(
+                        "native expert route-output scales must have one value per row"
+                    )
+                route_output_q_host[start:end].copy_(
+                    quantized_out,
+                    non_blocking=True,
+                )
+                route_output_scales_host[start:end].copy_(
+                    output_scales,
+                    non_blocking=True,
+                )
+                del quantized_out, output_scales
+                _expert_phase_end(phase_timer)
             phase_timer = _expert_phase_start("forward.combine")
             _index_copy_real_rows_with_cache_retry(x, indices, chunk_out, real)
             _expert_phase_end(phase_timer)
@@ -2618,6 +2743,7 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
         ctx.chunk_rows = min(chunk_rows, _FP8_EXPERT_BACKWARD_CHUNK_ROWS)
         ctx.scaling = scaling
         ctx.local_recompute = local_recompute
+        ctx.route_output_cache = cache_route_output
         ctx.lora_parameter_metadata = tuple(
             (tuple(value.shape), value.dtype)
             for value in (
@@ -2630,11 +2756,20 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
             )
         )
         if local_recompute:
-            ctx.save_for_backward(
-                saved_permuted_indices,
-                offsets,
-                received_scores,
-            )
+            if cache_route_output:
+                ctx.save_for_backward(
+                    route_output_q_host,
+                    route_output_scales_host,
+                    saved_permuted_indices,
+                    offsets,
+                    received_scores,
+                )
+            else:
+                ctx.save_for_backward(
+                    saved_permuted_indices,
+                    offsets,
+                    received_scores,
+                )
         else:
             ctx.save_for_backward(
                 q1_host,
@@ -2658,7 +2793,23 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
             profile_end = torch.cuda.Event(enable_timing=True)
             profile_start.record()
         if ctx.local_recompute:
-            saved_permuted_indices, offsets, received_scores = ctx.saved_tensors
+            if ctx.route_output_cache:
+                (
+                    route_output_q_host,
+                    route_output_scales_host,
+                    saved_permuted_indices,
+                    offsets,
+                    received_scores,
+                ) = ctx.saved_tensors
+                _validate_route_output_cache(
+                    route_output_q_host,
+                    route_output_scales_host,
+                    saved_permuted_indices.shape[0],
+                    route_output_q_host.shape[1],
+                )
+            else:
+                route_output_q_host = route_output_scales_host = None
+                saved_permuted_indices, offsets, received_scores = ctx.saved_tensors
             q1 = qs1 = q3 = qs3 = None
         else:
             (
@@ -2808,32 +2959,50 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                 phase_timer = _expert_phase_start("backward.activation_restore")
                 forward_hidden = F.silu(z1) * z3
                 _expert_phase_end(phase_timer)
-                phase_timer = _expert_phase_start("backward.w2_base")
-                chunk_out = _grouped_mm_chunked(
-                    forward_hidden,
-                    w2,
-                    s2,
-                    chunk_offsets,
-                )
-                _expert_phase_end(phase_timer)
-                phase_timer = _expert_phase_start("backward.w2_lora")
-                chunk_out.add_(
-                    _grouped_lora_projection(
+                if ctx.route_output_cache:
+                    phase_timer = _expert_phase_start(
+                        "backward.route_output_cache"
+                    )
+                    cached_out = route_output_q_host[start:end].to(
+                        grad.device,
+                        non_blocking=True,
+                    )
+                    cached_scales = route_output_scales_host[start:end].to(
+                        grad.device,
+                        non_blocking=True,
+                    )
+                    chunk_out = cached_out.to(grad.dtype).mul_(
+                        cached_scales.to(grad.dtype)[:, None]
+                    )
+                    del cached_out, cached_scales
+                    _expert_phase_end(phase_timer)
+                if not ctx.route_output_cache:
+                    phase_timer = _expert_phase_start("backward.w2_base")
+                    chunk_out = _grouped_mm_chunked(
                         forward_hidden,
-                        w2_lora_a,
-                        w2_lora_b,
+                        w2,
+                        s2,
                         chunk_offsets,
-                    ),
-                    alpha=ctx.scaling,
-                )
-                quantized_out, output_scales = ops.scaled_fp8_quant(
-                    chunk_out,
-                    use_per_token_if_dynamic=True,
-                )
-                chunk_out = quantized_out.to(chunk_out.dtype).mul_(
-                    output_scales.to(chunk_out.dtype)
-                )
-                _expert_phase_end(phase_timer)
+                    )
+                    _expert_phase_end(phase_timer)
+                    phase_timer = _expert_phase_start("backward.w2_lora")
+                    chunk_out.add_(
+                        _grouped_lora_projection(
+                            forward_hidden,
+                            w2_lora_a,
+                            w2_lora_b,
+                            chunk_offsets,
+                        ),
+                        alpha=ctx.scaling,
+                    )
+                    quantized_out, output_scales = ops.scaled_fp8_quant(
+                        chunk_out,
+                        use_per_token_if_dynamic=True,
+                    )
+                    chunk_out = quantized_out.to(chunk_out.dtype).mul_(
+                        output_scales.to(chunk_out.dtype)
+                    )
+                    _expert_phase_end(phase_timer)
                 chunk_score_grads = (
                     grad_chunk.float() * chunk_out.float()
                 ).sum(dim=-1)
@@ -2845,10 +3014,10 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                 )
                 del (
                     chunk_out,
-                    quantized_out,
-                    output_scales,
                     chunk_score_grads,
                 )
+                if not ctx.route_output_cache:
+                    del quantized_out, output_scales
                 chunk_scores = received_scores.index_select(0, safe_indices)
                 grad_chunk.copy_(
                     (grad_chunk.float() * chunk_scores[:, None]).to(grad.dtype)

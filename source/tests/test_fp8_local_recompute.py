@@ -184,9 +184,81 @@ class FP8LocalRecomputeTests(unittest.TestCase):
         score = local.index("grad_chunk.float() * chunk_scores[:, None]")
         grad_quant = local.index("ops.scaled_fp8_quant(\n                    grad_chunk", score)
         self.assertLess(score, grad_quant)
-        self.assertIn("ops.scaled_fp8_quant(\n                    chunk_out", local)
+        self.assertRegex(
+            local,
+            r"ops\.scaled_fp8_quant\(\n\s+chunk_out",
+        )
         self.assertIn("ops.scaled_fp8_quant(\n                    z1", local)
         self.assertIn("ops.scaled_fp8_quant(\n                    z3", local)
+
+    def test_route_output_cache_is_opt_in_and_keeps_fp8_qdq_state(self):
+        expert = (
+            Path(__file__).parents[1]
+            / "src"
+            / "prime_rl"
+            / "trainer"
+            / "models"
+            / "layers"
+            / "fp8_ada.py"
+        ).read_text()
+        self.assertIn(
+            'os.environ.get("PRIME_FP8_EXPERT_ROUTE_OUTPUT_CACHE", "") == "1"',
+            expert,
+        )
+        self.assertIn("pin_memory=True", expert)
+        self.assertIn("_validate_route_output_cache(", expert)
+        self.assertIn('"forward.route_output_cache"', expert)
+        self.assertIn('"backward.route_output_cache"', expert)
+        self.assertIn("route_output_q_host", expert)
+        self.assertIn("route_output_scales_host", expert)
+
+        backward = expert.split(
+            "class _InplacePermutedLoRAExperts", 1
+        )[1].split("\n\nclass _ScaleRoutedOutput", 1)[0]
+        self.assertIn("if ctx.route_output_cache:", backward)
+        cache_branch = backward.split(
+            '"backward.route_output_cache"', 1
+        )[1]
+        self.assertIn("route_output_q_host[start:end].to", cache_branch)
+        self.assertIn("route_output_scales_host[start:end].to", cache_branch)
+        self.assertIn("if not ctx.route_output_cache:", cache_branch)
+
+    def test_route_output_cache_rejects_invalid_layouts(self):
+        expert = (
+            Path(__file__).parents[1]
+            / "src"
+            / "prime_rl"
+            / "trainer"
+            / "models"
+            / "layers"
+            / "fp8_ada.py"
+        ).read_text()
+        validator = expert.split("def _validate_route_output_cache", 1)[1].split(
+            "\n\nif hasattr(triton", 1
+        )[0]
+        for text in (
+            'values.device.type != "cpu"',
+            'values.dtype != torch.float8_e4m3fn',
+            'not values.is_pinned()',
+            'scales.dtype != torch.float32',
+            'not scales.is_pinned()',
+            'tuple(values.shape) != (rows, width)',
+            'tuple(scales.shape) != (rows,)',
+        ):
+            self.assertIn(text, validator)
+
+        index_validator = expert.split(
+            "def _validate_route_output_indices", 1
+        )[1].split("\n\nif hasattr(triton", 1)[0]
+        for text in (
+            "permuted_indices.ndim != 1",
+            "permuted_indices.numel() != rows",
+            "permuted_indices.dtype not in (torch.int32, torch.int64)",
+            "offsets.ndim != 1",
+            "offsets.numel() != expert_count",
+            "offsets.dtype not in (torch.int32, torch.int64)",
+        ):
+            self.assertIn(text, index_validator)
 
         native = SOURCE.split(
             "class NativeFP8LoRAAllToAllExpertParallel", 1
