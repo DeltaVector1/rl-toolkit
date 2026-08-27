@@ -67,6 +67,8 @@ from prime_rl.trainer.perf import get_perf_counter
 from prime_rl.trainer.phase_profiler import (
     get_phase_profiler,
     install_fsdp_phase_hooks,
+    start_cuda_capture,
+    stop_cuda_capture,
 )
 from prime_rl.trainer.utils import (
     build_bin_cost,
@@ -1569,6 +1571,7 @@ def train(config: TrainerConfig):
 
         forward_backward_start_time = time.perf_counter()
         phase_profiler.begin_step(progress.step)
+        start_cuda_capture(progress.step)
         seq_len = micro_batches[0]["input_ids"].shape[1]
 
         # Normalize each loss component by its own global (dp_cp) token count, so every rank
@@ -2438,6 +2441,7 @@ def train(config: TrainerConfig):
         phase_report = phase_profiler.end_step(
             rank=dist.get_rank(), stage=pp_rank
         )
+        stop_cuda_capture()
         if phase_report is not None:
             phase_reports = [None] * dist.get_world_size()
             dist.all_gather_object(phase_reports, phase_report)

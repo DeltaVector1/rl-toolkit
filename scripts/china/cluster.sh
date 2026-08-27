@@ -15,6 +15,9 @@ layer_profile_every=180
 phase_profile=0
 phase_profile_steps=1
 phase_profile_sample_every=8
+nsys_entrypoint=(/app/.venv/bin/torchrun)
+nsys_args=()
+nsys_mounts=()
 # RUN selects which config pair under configs/china to use and where logs land.
 # Defaults keep the historical r33 layout.
 RUN=${RUN:-r33}
@@ -479,6 +482,36 @@ PY
         -e "PRIME_TRAINER_HEAD=n$trainer_head_node"
       )
     fi
+    if [ "${PRIME_NSYS_PROFILE:-0}" = "1" ]; then
+      [ "$node" = "78" ] || {
+        echo "Nsight Systems capture must run on n78" >&2
+        exit 1
+      }
+      [ "${PRIME_CUDA_PROFILE_RANK:-24}" = "24" ] || {
+        echo "Nsight Systems capture is pinned to representative rank 24" >&2
+        exit 1
+      }
+      nsys_mounts=(
+        -v /opt/nvidia/nsight-systems:/opt/nvidia/nsight-systems:ro
+      )
+      nsys_entrypoint=(/opt/nvidia/nsight-systems/2025.3.2/target-linux-x64/nsys)
+      nsys_session="glmkernel-r24-$$"
+      nsys_args=(
+        profile
+        --session-new="$nsys_session"
+        --trace=cuda,nvtx
+        --sample=none
+        --cpuctxsw=none
+        --backtrace=none
+        --cudabacktrace=none
+        --cuda-memory-usage=false
+        --capture-range=cudaProfilerApi
+        --capture-range-end=stop
+        --force-overwrite=true
+        -o "$trainer_output/nsys-rank-${PRIME_CUDA_PROFILE_RANK:-24}"
+        /app/.venv/bin/torchrun
+      )
+    fi
     sudo install -d -o 1000 -g 1000 -m 0755 "$trainer_output"
     if [ "$rank" -eq 0 ]; then
       if [ "$rollout_transport" = filesystem ] && [ "$trainer_only" = 0 ]; then
@@ -522,6 +555,7 @@ PY
       "${python_dependency_mounts[@]}" \
       "${verifiers_mount[@]}" \
       "${prime_configs_mount[@]}" \
+      "${nsys_mounts[@]}" \
       -e TMPDIR=/scratch-tmp \
       -e PRIME_ADAPTER_DELTA="${PRIME_ADAPTER_DELTA:-0}" \
       -e PYTHONPATH="$deployment/env":/app/packages/prime-rl-configs/src:/app/src \
@@ -573,6 +607,9 @@ PY
       -e PRIME_PHASE_PROFILE="$phase_profile" \
       -e PRIME_PHASE_PROFILE_STEPS="$phase_profile_steps" \
       -e PRIME_PHASE_PROFILE_SAMPLE_EVERY="$phase_profile_sample_every" \
+      -e PRIME_CUDA_PROFILE="${PRIME_CUDA_PROFILE:-0}" \
+      -e PRIME_CUDA_PROFILE_RANK="${PRIME_CUDA_PROFILE_RANK:-24}" \
+      -e PRIME_CUDA_PROFILE_STEPS="${PRIME_CUDA_PROFILE_STEPS:-1}" \
       -e PRIME_BIND_GPU_NUMA="${PRIME_BIND_GPU_NUMA:-0}" \
       -e PRIME_NCCL_CHANNELS="$nccl_channels" \
       -e PRIME_PROFILE_PP_STAGE="$profile_pp_stage" \
@@ -583,7 +620,8 @@ PY
       -e PRIME_LORA_MM_PROFILE="$lora_mm_profile" \
       -e PRIME_PP_MAX_MICRO="${PRIME_PP_MAX_MICRO:-}" \
       -e PRIME_STATS_DEBUG="${PRIME_STATS_DEBUG:-}" \
-      --entrypoint /app/.venv/bin/torchrun "$image" \
+      --entrypoint "${nsys_entrypoint[0]}" "$image" \
+      "${nsys_args[@]}" \
       --role=trainer \
       --nnodes="$nnodes" \
       --nproc-per-node=8 \

@@ -39,6 +39,51 @@ _PHASE_SET = frozenset(PHASES)
 _PROFILE_REQUESTED = os.environ.get("PRIME_PHASE_PROFILE", "0") == "1"
 PROFILE_REQUESTED = _PROFILE_REQUESTED
 _EVENT_PAIR_COST_US = 20.0
+_CUDA_CAPTURE_ACTIVE = False
+_CUDA_CAPTURE_API = None
+
+
+def _cuda_capture_step_set() -> frozenset[int]:
+    value = os.environ.get("PRIME_CUDA_PROFILE_STEPS", "1")
+    steps = frozenset(int(part) for part in value.split(",") if part)
+    if not steps or min(steps) < 1:
+        raise ValueError("PRIME_CUDA_PROFILE_STEPS must contain positive integers")
+    return steps
+
+
+def start_cuda_capture(step: int) -> bool:
+    """Start an opt-in Nsight CUDA-profiler range on one global rank."""
+    global _CUDA_CAPTURE_ACTIVE, _CUDA_CAPTURE_API
+    target = os.environ.get("PRIME_CUDA_PROFILE_RANK", "")
+    if os.environ.get("PRIME_CUDA_PROFILE", "0") != "1" or not target:
+        return False
+    if int(os.environ.get("RANK", "-1")) != int(target):
+        return False
+    if int(step) not in _cuda_capture_step_set():
+        return False
+    if _CUDA_CAPTURE_ACTIVE:
+        raise RuntimeError("CUDA profiler capture is already active")
+    _CUDA_CAPTURE_API = torch.cuda.cudart()
+    result = _CUDA_CAPTURE_API.cudaProfilerStart()
+    if result not in (None, 0):
+        raise RuntimeError(f"cudaProfilerStart failed with error {result}")
+    torch.cuda.nvtx.range_push(f"prime_nsys_training_step_{int(step)}")
+    _CUDA_CAPTURE_ACTIVE = True
+    return True
+
+
+def stop_cuda_capture() -> bool:
+    """End the one opt-in Nsight CUDA-profiler range."""
+    global _CUDA_CAPTURE_ACTIVE, _CUDA_CAPTURE_API
+    if not _CUDA_CAPTURE_ACTIVE:
+        return False
+    torch.cuda.nvtx.range_pop()
+    result = _CUDA_CAPTURE_API.cudaProfilerStop()
+    if result not in (None, 0):
+        raise RuntimeError(f"cudaProfilerStop failed with error {result}")
+    _CUDA_CAPTURE_ACTIVE = False
+    _CUDA_CAPTURE_API = None
+    return True
 
 
 def _parse_steps(value: str) -> frozenset[int]:
