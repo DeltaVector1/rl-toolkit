@@ -388,6 +388,9 @@ def main() -> None:
         compressed, seconds = timed(lambda: compressed_dispatch(value))
         forward_times.append(seconds)
     assert compressed is not None
+    repeated_compressed = compressed_dispatch(value)
+    if not torch.equal(compressed, repeated_compressed):
+        raise RuntimeError("INT4 expert transport forward is not deterministic")
     forward_rel_rmse = relative_rmse(compressed, reference)
 
     int4_train_value = value.detach().clone().requires_grad_()
@@ -408,6 +411,30 @@ def main() -> None:
     int4_gradient, backward_seconds = timed(
         lambda: torch.autograd.grad(output, int4_train_value, int4_upstream)[0]
     )
+    repeated_train_value = value.detach().clone().requires_grad_()
+    repeated_output = compressed_dispatch(repeated_train_value)
+    repeated_gradient = torch.autograd.grad(
+        repeated_output,
+        repeated_train_value,
+        int4_upstream,
+    )[0]
+    if not torch.equal(int4_gradient, repeated_gradient):
+        raise RuntimeError("INT4 expert transport backward is not deterministic")
+
+    def one_optimizer_step():
+        parameter = torch.nn.Parameter(value.float())
+        optimizer = torch.optim.SGD([parameter], lr=8e-6)
+        optimizer.zero_grad(set_to_none=True)
+        compressed_dispatch(parameter.to(torch.bfloat16)).float().sum().backward()
+        optimizer.step()
+        return parameter.detach()
+
+    first_update = one_optimizer_step()
+    second_update = one_optimizer_step()
+    if not torch.equal(first_update, second_update):
+        raise RuntimeError("INT4 expert transport optimizer update is not deterministic")
+    if torch.equal(first_update, value.float()):
+        raise RuntimeError("INT4 expert transport optimizer update did not change parameters")
     backward_rel_rmse = relative_rmse(int4_gradient, int4_expected_gradient)
     if not bool(torch.isfinite(int4_gradient).all()):
         raise RuntimeError("compressed EP backward produced nonfinite gradients")

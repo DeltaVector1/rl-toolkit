@@ -34,6 +34,7 @@ def test_current_glm52_profile_is_batch_2048_without_rollout_cache() -> None:
         "glm52-native-small",
         "glm52-policy-parity",
         "glm52-native-b2048",
+        "glm52-native-b2048-int4",
         "glm52-native-stability20",
     }
     current = operations["profiles"]["current"]
@@ -59,6 +60,10 @@ def test_current_glm52_profile_is_batch_2048_without_rollout_cache() -> None:
     large_fake = _load(large_batch["trainer"])["data"]["fake"]
     assert large_fake["batch_size"] * large_fake["samples_per_micro_batch"] == 2048
     assert large_fake["group_size"] == 16
+    int4_fake = _load(
+        operations["profiles"]["glm52-native-b2048-int4"]["trainer"]
+    )["data"]["fake"]
+    assert int4_fake == large_fake
     parity = operations["profiles"]["glm52-policy-parity"]
     parity_trainer = _load(parity["trainer"])
     assert parity_trainer["data"]["fake"]["batch_size"] == 8
@@ -190,6 +195,52 @@ def test_glm52_stability_and_production_use_local_expert_recompute() -> None:
     assert "PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD" not in muse.get("env_vars", {})
 
 
+def test_glm52_int4_qualification_keeps_the_accepted_training_contract() -> None:
+    candidate = _load("configs/qualification/glm52-native-b2048-int4.toml")
+    baseline = _load("configs/qualification/glm52-native-b2048.toml")
+    assert candidate["max_steps"] == 3
+    assert candidate["data"] == baseline["data"]
+    assert candidate["model"] == {
+        **baseline["model"],
+        "quantization": {
+            **baseline["model"]["quantization"],
+            "expert_activation_transport": "int4",
+        },
+    }
+    assert candidate["optim"] == {
+        "type": "muon",
+        "lr": 8e-6,
+        "weight_decay": 0.0,
+        "max_norm": 1.0,
+    }
+    assert candidate["env_vars"] == {
+        "PRIME_LORA_MM_PROFILE": "sm89-r32",
+        "PRIME_INT4_COMBINE_ROUNDS": "8",
+        "PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD": "0",
+    }
+    assert candidate["model"]["freeze_moe_router"] is True
+    assert set(candidate["model"]["lora"]["target_modules"]) == {
+        "q_a_proj",
+        "q_b_proj",
+        "kv_a_proj_with_mqa",
+        "kv_b_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+        "shared_expert",
+        "experts",
+    }
+
+    parity = _load("configs/qualification/glm52-policy-parity-trainer.toml")
+    assert parity["data"]["fake"]["generate_samples"] is False
+    assert parity["data"]["fake"]["reference_path"].endswith(
+        "/trainer-stage-final/trainer-reference.json"
+    )
+    assert parity["model"]["quantization"]["expert_activation_transport"] == "int4"
+    assert parity["env_vars"]["PRIME_INT4_COMBINE_ROUNDS"] == "8"
+
+
 def test_glm52_production_profiles_disable_cuda_profiling() -> None:
     profiling_names = {
         "PRIME_PROFILE_PP_STAGE": "1",
@@ -216,6 +267,7 @@ def test_glm52_production_profiles_disable_cuda_profiling() -> None:
     for relative in (
         "configs/qualification/glm52-policy-parity-trainer.toml",
         "configs/qualification/glm52-native-b2048.toml",
+        "configs/qualification/glm52-native-b2048-int4.toml",
         "configs/qualification/glm52-native-stability20.toml",
         "configs/paused/trainer.glm52-production.toml",
     ):
@@ -228,6 +280,7 @@ def test_all_glm52_trainers_use_h200_w8a8_semantics() -> None:
         "configs/qualification/glm52-policy-parity-trainer.toml",
         "configs/qualification/glm52-native-small.toml",
         "configs/qualification/glm52-native-b2048.toml",
+        "configs/qualification/glm52-native-b2048-int4.toml",
         "configs/qualification/glm52-native-stability20.toml",
         "configs/paused/trainer.glm52-production.toml",
     }
@@ -247,16 +300,23 @@ def test_all_glm52_trainers_use_h200_w8a8_semantics() -> None:
         assert "w8a16_modules" in quantization, relative
         assert quantization["w8a16_modules"] == [], relative
         assert quantization["fused_qkv_a_fp8"] is True, relative
+        int4_profiles = {
+            "configs/qualification/glm52-policy-parity-trainer.toml",
+            "configs/qualification/glm52-native-b2048-int4.toml",
+        }
         expected_transport = (
-            "bf16"
-            if relative == "configs/qualification/glm52-policy-parity-trainer.toml"
+            "int4"
+            if relative in int4_profiles
             else "bf16_forward_fp8_local_recompute_backward"
         )
         assert quantization["expert_activation_transport"] == expected_transport, relative
-        assert "PRIME_INT4_COMBINE_ROUNDS" not in config.get("env_vars", {}), relative
-        assert "PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD" not in config.get(
-            "env_vars", {}
-        ), relative
+        env_vars = config.get("env_vars", {})
+        if relative in int4_profiles:
+            assert env_vars["PRIME_INT4_COMBINE_ROUNDS"] == "8", relative
+            assert env_vars["PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD"] == "0", relative
+        else:
+            assert "PRIME_INT4_COMBINE_ROUNDS" not in env_vars, relative
+            assert "PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD" not in env_vars, relative
 
     model_source = (ROOT / "source/src/prime_rl/trainer/model.py").read_text()
     fp8_source = (
