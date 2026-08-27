@@ -200,7 +200,7 @@ class AdapterDeltaTest(unittest.TestCase):
                 step, filename = parts[-2], parts[-1]
                 source = sources[step] / filename
                 if not source.is_file():
-                    raise FileNotFoundError(source)
+                    raise filesystem.AdapterArtifactNotFound(source)
                 shutil.copyfile(source, destination)
 
             with patch.dict(
@@ -513,7 +513,7 @@ class AdapterDeltaTest(unittest.TestCase):
                 step, filename = source_url.rstrip("/").split("/")[-2:]
                 source = sources[step] / filename
                 if not source.is_file():
-                    raise FileNotFoundError(source)
+                    raise filesystem.AdapterArtifactNotFound(source)
                 if filename == "adapter_model.safetensors" and step == "two":
                     delta_present_during_full = destination.parent.joinpath(
                         ADAPTER_DELTA_FILE
@@ -563,7 +563,7 @@ class AdapterDeltaTest(unittest.TestCase):
                 step, filename = source_url.rstrip("/").split("/")[-2:]
                 source = sources[step] / filename
                 if not source.is_file():
-                    raise FileNotFoundError(source)
+                    raise filesystem.AdapterArtifactNotFound(source)
                 shutil.copyfile(source, destination)
 
             with patch.dict(
@@ -605,7 +605,7 @@ class AdapterDeltaTest(unittest.TestCase):
                 step, filename = source_url.rstrip("/").split("/")[-2:]
                 source = sources[step] / filename
                 if not source.is_file():
-                    raise FileNotFoundError(source)
+                    raise filesystem.AdapterArtifactNotFound(source)
                 shutil.copyfile(source, destination)
 
             with patch.dict(
@@ -735,6 +735,19 @@ class AdapterDeltaTest(unittest.TestCase):
                         destination,
                     )
             self.assertFalse(destination.exists())
+
+            with patch.object(
+                filesystem,
+                "download",
+                side_effect=FileNotFoundError("local destination failed"),
+            ):
+                with self.assertRaisesRegex(
+                    OSError, "adapter artifact transfer failed"
+                ):
+                    filesystem._download_optional(
+                        "http://127.0.0.1:39219/step/adapter_delta.json",
+                        destination,
+                    )
 
 
 if __name__ == "__main__":

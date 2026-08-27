@@ -889,7 +889,7 @@ def _download_optional(source_url: str, destination: Path) -> bool:
     """Download an optional artifact; only HTTP 404 means it is absent."""
     try:
         download(source_url, destination, create_only=True)
-    except (AdapterArtifactNotFound, FileNotFoundError):
+    except AdapterArtifactNotFound:
         destination.unlink(missing_ok=True)
         return False
     except (EOFError, OSError, ValueError) as error:
@@ -1183,8 +1183,7 @@ def stage_lora_adapter_files(source_url: str) -> Path:
                         ValueError,
                         TypeError,
                         KeyError,
-                    ) as error:
-                        _LOGGER.warning("adapter references rejected: %s", error)
+                    ):
                         for path in (
                             reference_manifest_path,
                             reference_header_path,
@@ -1192,6 +1191,7 @@ def stage_lora_adapter_files(source_url: str) -> Path:
                             temporary / _ADAPTER_MODEL_NAME,
                         ):
                             path.unlink(missing_ok=True)
+                        raise
 
             if transfer == "full":
                 download(

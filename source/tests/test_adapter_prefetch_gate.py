@@ -97,6 +97,10 @@ class AdapterPrefetchGateTest(unittest.TestCase):
         )
         self.assertIn('-e PRIME_GLM_ADAPTER_GZIP=1', INFERENCE_START)
         self.assertIn(
+            '-e PRIME_ADAPTER_REFERENCES="${PRIME_ADAPTER_REFERENCES:-0}"',
+            INFERENCE_START,
+        )
+        self.assertIn(
             'adapter_source_path="runs/$RUN/$RUN_NAME"',
             START,
         )
