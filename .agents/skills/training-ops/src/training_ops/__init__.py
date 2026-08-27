@@ -8013,6 +8013,7 @@ def _validate_trainer_qualification(
     )
     expected_step_counts = {
         "glm52-native-b2048": 2,
+        "glm52-native-fsdp-overlap": 2,
         "glm52-native-delta3": 3,
         "glm52-native-stability20": 20,
     }
@@ -10247,6 +10248,7 @@ def _qualify_connected(
         config = tomllib.load(stream)
     strict_qualification = name in {
         "glm52-native-b2048",
+        "glm52-native-fsdp-overlap",
         "glm52-native-delta3",
         "glm52-native-stability20",
     }

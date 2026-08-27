@@ -380,7 +380,7 @@ PY
         echo "qualification session ID is invalid" >&2; exit 1
       }
       case "${PRIME_QUALIFICATION_PROFILE:-}" in
-        glm52-native-b2048|glm52-native-delta3|glm52-native-stability20) ;;
+        glm52-native-b2048|glm52-native-fsdp-overlap|glm52-native-delta3|glm52-native-stability20) ;;
         *) echo "qualification profile is invalid" >&2; exit 1 ;;
       esac
       for value in \

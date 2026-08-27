@@ -243,6 +243,9 @@ class ModelConfig(BaseModelConfig):
     native_fp8_expert_prefetch: bool = False
     """Prefetch native-FP8 expert parameters before expert compute."""
 
+    fsdp_param_comm_overlap: bool = False
+    """Enable bounded asynchronous FSDP2 parameter communication overlap."""
+
     dp_replicate: int = 1
     """Data parallel dim where model weights are replicated."""
 

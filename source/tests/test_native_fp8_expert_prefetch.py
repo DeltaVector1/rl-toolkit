@@ -213,9 +213,31 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
                 "reshard_after_forward": True,
                 "fsdp_cpu_offload": False,
                 "cold_cpu_offload": False,
+                "optim_cpu_offload": False,
+                "pp_schedule": "1f1b",
+                "ep_comm_backend": "torch",
+                "ac": type(
+                    "AC",
+                    (),
+                    {
+                        "mode": "reentrant_attention_all_experts",
+                        "keep_routed_expert_activations_from_pp_stage": 5,
+                    },
+                )(),
             },
         )()
-        parallel_dims = type("Dims", (), {"ep_enabled": True})()
+        parallel_dims = type(
+            "Dims",
+            (),
+            {
+                "ep_enabled": True,
+                "pp": 8,
+                "cp": 8,
+                "ep": 8,
+                "dp_replicate": 1,
+                "global_ep": False,
+            },
+        )()
         namespace = {
             "ValueError": ValueError,
             "RuntimeError": RuntimeError,
@@ -270,20 +292,147 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
                 "reshard_after_forward": True,
                 "fsdp_cpu_offload": False,
                 "cold_cpu_offload": False,
+                "optim_cpu_offload": False,
+                "pp_schedule": "1f1b",
+                "ep_comm_backend": "torch",
+                "ac": type(
+                    "AC",
+                    (),
+                    {
+                        "mode": "reentrant_attention_all_experts",
+                        "keep_routed_expert_activations_from_pp_stage": 5,
+                    },
+                )(),
             },
         )()
-        dims = type("Dims", (), {"ep_enabled": True})()
+        dims = type(
+            "Dims",
+            (),
+            {
+                "ep_enabled": True,
+                "pp": 8,
+                "cp": 8,
+                "ep": 8,
+                "dp_replicate": 1,
+                "global_ep": False,
+            },
+        )()
         with self.assertRaisesRegex(ValueError, "native FP8"):
             namespace["_configure_fsdp_param_comm_overlap"](
                 object(), config, dims, False
             )
         with self.assertRaisesRegex(ValueError, "expert parallelism"):
             namespace["_configure_fsdp_param_comm_overlap"](
-                object(), config, type("Dims", (), {"ep_enabled": False})(), True
+                object(),
+                config,
+                type(
+                    "Dims",
+                    (),
+                    {
+                        "ep_enabled": False,
+                        "pp": 8,
+                        "cp": 8,
+                        "ep": 8,
+                        "dp_replicate": 1,
+                        "global_ep": False,
+                    },
+                )(),
+                True,
             )
         with self.assertRaisesRegex(RuntimeError, "FSDP2"):
             namespace["_configure_fsdp_param_comm_overlap"](
                 object(), config, dims, True
+            )
+
+    def test_fsdp_param_comm_overlap_rejects_other_topology_offload_or_checkpoint(self):
+        tree = ast.parse(MODEL.read_text())
+        helper = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_configure_fsdp_param_comm_overlap"
+        )
+        validator = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_validate_fsdp_param_comm_overlap"
+        )
+        module = ast.Module(body=[validator, helper], type_ignores=[])
+        ast.fix_missing_locations(module)
+        namespace = {
+            "ValueError": ValueError,
+            "RuntimeError": RuntimeError,
+            "nn": type("NN", (), {"Module": object}),
+            "ModelConfig": object,
+            "ParallelDims": object,
+            "get_logger": lambda: type("Logger", (), {"info": lambda *_: None})(),
+        }
+        exec(compile(module, str(MODEL), "exec"), namespace)
+
+        config = type(
+            "Config",
+            (),
+            {
+                "fsdp_param_comm_overlap": True,
+                "reshard_after_forward": True,
+                "fsdp_cpu_offload": False,
+                "cold_cpu_offload": False,
+                "optim_cpu_offload": False,
+                "pp_schedule": "1f1b",
+                "ep_comm_backend": "torch",
+                "ac": type(
+                    "AC",
+                    (),
+                    {
+                        "mode": "reentrant_attention_all_experts",
+                        "keep_routed_expert_activations_from_pp_stage": 5,
+                    },
+                )(),
+            },
+        )()
+        dims_type = {
+            "ep_enabled": True,
+            "pp": 8,
+            "cp": 8,
+            "ep": 8,
+            "dp_replicate": 1,
+            "global_ep": False,
+        }
+
+        def validate(**changes):
+            values = {**dims_type, **changes.pop("dims", {})}
+            dims = type("Dims", (), values)()
+            originals = {}
+            for name, value in changes.items():
+                originals[name] = getattr(config, name)
+                setattr(config, name, value)
+            try:
+                namespace["_configure_fsdp_param_comm_overlap"](object(), config, dims, True)
+            finally:
+                for name, value in originals.items():
+                    setattr(config, name, value)
+
+        with self.assertRaisesRegex(ValueError, "PP8/CP8/EP8"):
+            validate(dims={"cp": 4})
+        with self.assertRaisesRegex(ValueError, "global_ep=false"):
+            validate(dims={"global_ep": True})
+        with self.assertRaisesRegex(ValueError, "pp_schedule=1f1b"):
+            validate(pp_schedule="gpipe")
+        with self.assertRaisesRegex(ValueError, "torch expert parallelism"):
+            validate(ep_comm_backend="deepep")
+        with self.assertRaisesRegex(ValueError, "optimizer offload"):
+            validate(optim_cpu_offload=True)
+        with self.assertRaisesRegex(ValueError, "checkpointing"):
+            validate(
+                ac=type(
+                    "AC",
+                    (),
+                    {
+                        "mode": "full",
+                        "keep_routed_expert_activations_from_pp_stage": 5,
+                    },
+                )()
             )
 
     def test_overlap_sets_all_nested_backward_prefetch_lists_in_cpu_world_size2_trace(self):
@@ -430,6 +579,51 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
         self.assertEqual(config["model"]["ep"], 8)
         self.assertIs(config["model"]["reshard_after_forward"], True)
         self.assertFalse(config["model"]["native_fp8_expert_prefetch"])
+
+    def test_fsdp_overlap_profile_is_full_shape_and_unprofiled(self):
+        with (ROOT / "configs/operations.toml").open("rb") as stream:
+            operations = tomllib.load(stream)
+        profile = operations["profiles"]["glm52-native-fsdp-overlap"]
+        self.assertEqual(
+            profile,
+            {
+                "kind": "glm52",
+                "trainer": "configs/qualification/glm52-native-fsdp-overlap.toml",
+            },
+        )
+        with (ROOT / profile["trainer"]).open("rb") as stream:
+            config = tomllib.load(stream)
+
+        self.assertEqual(config["max_steps"], 2)
+        self.assertEqual(config["output_dir"], "/data/glm52-rl/qualifications/glm52-native-fsdp-overlap-20260827")
+        self.assertEqual(
+            config["env_vars"],
+            {"PRIME_LORA_MM_PROFILE": "sm89-r32"},
+        )
+        self.assertEqual(config["data"]["fake"]["batch_size"] * config["data"]["fake"]["samples_per_micro_batch"], 2048)
+        model = config["model"]
+        self.assertEqual(
+            {name: model[name] for name in ("pp", "cp", "ep", "dp_replicate", "global_ep")},
+            {"pp": 8, "cp": 8, "ep": 8, "dp_replicate": 1, "global_ep": False},
+        )
+        self.assertEqual(model["pp_schedule"], "1f1b")
+        self.assertEqual(model["ep_comm_backend"], "torch")
+        self.assertTrue(model["fsdp_param_comm_overlap"])
+        self.assertFalse(model["native_fp8_expert_prefetch"])
+        self.assertFalse(model["fsdp_cpu_offload"])
+        self.assertFalse(model["cold_cpu_offload"])
+        self.assertFalse(model["optim_cpu_offload"])
+        self.assertTrue(model["reshard_after_forward"])
+        self.assertEqual(model["optimization_dtype"], "bfloat16")
+        self.assertEqual(model["reduce_dtype"], "bfloat16")
+        self.assertEqual(model["lora"]["rank"], 32)
+        self.assertEqual(len(model["lora"]["target_modules"]), 10)
+        self.assertTrue(model["freeze_moe_router"])
+        self.assertEqual(model["ac"]["keep_routed_expert_activations_from_pp_stage"], 5)
+        self.assertEqual(
+            model["quantization"]["expert_activation_transport"],
+            "bf16_forward_fp8_local_recompute_backward",
+        )
 
     def test_stability_profile_matches_production_shape(self):
         with (ROOT / "configs/operations.toml").open("rb") as stream:
