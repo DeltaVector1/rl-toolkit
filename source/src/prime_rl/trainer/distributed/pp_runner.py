@@ -31,12 +31,15 @@ def minimum_pipeline_microbatches(schedule_name: str, pp_size: int) -> int:
         # this before schedule construction so a rollout batch with mostly
         # failed samples can be discarded without stopping all trainer ranks.
         return pp_size
+    if schedule_name == "1f1b_async":
+        # The local asynchronous subclass preserves Schedule1F1B's minimum.
+        return pp_size
     if schedule_name == "interleaved_1f1b":
         return pp_size
     if schedule_name == "gpipe":
         return 1
     raise ValueError(
-        "pp_schedule must be one of ['1f1b', 'interleaved_1f1b', 'gpipe'], "
+        "pp_schedule must be one of ['1f1b', '1f1b_async', 'interleaved_1f1b', 'gpipe'], "
         f"got {schedule_name!r}"
     )
 
@@ -1129,7 +1132,7 @@ def build_schedule(
     )
     local_stage_count = len(stage_modules)
     exact_transport_capacities = schedule_name == "interleaved_1f1b" or (
-        schedule_name == "1f1b" and limit_receive_buffers
+        schedule_name in ("1f1b", "1f1b_async") and limit_receive_buffers
     )
     for local_index, module in enumerate(stage_modules):
         if module.transfer_sparse_indices:
@@ -1162,6 +1165,10 @@ def build_schedule(
         "interleaved_1f1b": ScheduleInterleaved1F1B,
         "gpipe": ScheduleGPipe,
     }
+    if schedule_name == "1f1b_async":
+        from prime_rl.trainer.distributed.async_schedule import make_schedule_1f1b_async
+
+        schedules["1f1b_async"] = make_schedule_1f1b_async()
     minimum_pipeline_microbatches(schedule_name, pp_size)
     interleaved_rounds = None
     if schedule_name == "interleaved_1f1b":
@@ -1194,7 +1201,7 @@ def build_schedule(
         )
         for stage in stages:
             stage.set_transport_capacities(capacities[stage.stage_index])
-    elif schedule_name == "1f1b" and limit_receive_buffers:
+    elif schedule_name in ("1f1b", "1f1b_async") and limit_receive_buffers:
         stages[0].set_transport_capacities(
             derive_1f1b_transport_capacities(
                 stages[0].stage_index,

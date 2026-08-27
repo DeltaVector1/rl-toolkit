@@ -273,9 +273,11 @@ class ModelConfig(BaseModelConfig):
     ``layers/pp`` layers sharded ``world/pp`` ways instead of all layers sharded
     ``world`` ways."""
 
-    pp_schedule: Literal["1f1b", "gpipe", "interleaved_1f1b"] = "1f1b"
+    pp_schedule: Literal["1f1b", "1f1b_async", "gpipe", "interleaved_1f1b"] = "1f1b"
     """Pipeline schedule. ``1f1b`` keeps activation memory to one stage's depth and
-    is the default; ``gpipe`` is simpler but holds every micro-batch's activations."""
+    is the default; ``1f1b_async`` keeps the same compute order while posting
+    bounded P2P work on a communication stream; ``gpipe`` is simpler but holds
+    every micro-batch's activations."""
 
     pp_transfer_sparse_indices: bool = False
     """Transfer sparse-attention index caches with pipeline activations. This
