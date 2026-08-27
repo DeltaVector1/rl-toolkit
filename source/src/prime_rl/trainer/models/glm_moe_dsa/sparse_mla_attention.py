@@ -201,6 +201,12 @@ class GlmMoeDsaAttention(nn.Module):
         self.indexer = Indexer(args) if not args.skip_topk else None
         self.use_index_cache = args.use_index_cache
         self.skip_topk = args.skip_topk
+        self.scaling = self.qk_head_dim ** (-0.5)
+
+        self._cp_group: dist.ProcessGroup | None = None
+        self._cp_rank: int = 0
+        self._cp_world_size: int = 1
+
         self._phase_backward_timer = None
         if get_phase_profiler().enabled:
             self.register_full_backward_pre_hook(self._phase_backward_start)
@@ -214,11 +220,6 @@ class GlmMoeDsaAttention(nn.Module):
     def _phase_backward_end(self, _module, _grad_input, _grad_output) -> None:
         get_phase_profiler().end_span(self._phase_backward_timer)
         self._phase_backward_timer = None
-        self.scaling = self.qk_head_dim ** (-0.5)
-
-        self._cp_group: dist.ProcessGroup | None = None
-        self._cp_rank: int = 0
-        self._cp_world_size: int = 1
 
     def set_context_parallel_attributes(self, cp_group: dist.ProcessGroup, cp_rank: int, cp_world_size: int) -> None:
         self._cp_group = cp_group

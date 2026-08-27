@@ -13,6 +13,30 @@ def _load(relative: str) -> dict:
         return tomllib.load(stream)
 
 
+def test_glm52_attention_constructor_initializes_first_forward_state() -> None:
+    path = ROOT / "source/src/prime_rl/trainer/models/glm_moe_dsa/sparse_mla_attention.py"
+    tree = ast.parse(path.read_text())
+    attention = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "GlmMoeDsaAttention"
+    )
+    constructor = next(
+        node
+        for node in attention.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    )
+    assigned = {
+        node.attr
+        for node in ast.walk(constructor)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.ctx, ast.Store)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "self"
+    }
+    assert {"scaling", "_cp_group", "_cp_rank", "_cp_world_size"} <= assigned
+
+
 def test_only_policy_parity_fake_data_enables_router_replay() -> None:
     for path in (ROOT / "configs/qualification").glob("*.toml"):
         config = _load(str(path.relative_to(ROOT)))
