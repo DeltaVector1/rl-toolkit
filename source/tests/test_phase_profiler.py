@@ -91,13 +91,14 @@ class PhaseProfilerTest(unittest.TestCase):
             {
                 "PRIME_CUDA_MEMORY_CAPTURE": "1",
                 "PRIME_CUDA_MEMORY_CAPTURE_PATH": f"{output_dir}/capture.json",
-                "RANK": "0",
+                "PRIME_CUDA_MEMORY_CAPTURE_RANK": "3",
+                "PRIME_CUDA_MEMORY_CAPTURE_STEP": "7",
+                "PRIME_CUDA_MEMORY_CAPTURE_STACKS": "1",
+                "RANK": "3",
             },
         ):
             capture = CudaMemoryCapture()
-            self.assertFalse(capture.begin_step(2))
-            self.assertEqual(FakeMemory.history_calls, [])
-            self.assertTrue(capture.begin_step(1))
+            self.assertTrue(capture.begin_step(7))
             self.assertTrue(capture.active)
             self.assertEqual(
                 FakeMemory.history_calls,
@@ -112,20 +113,26 @@ class PhaseProfilerTest(unittest.TestCase):
                 ],
             )
             self.assertEqual(FakeMemory.snapshot_calls, 0)
-            self.assertTrue(capture.end_step())
+            class FakeOOM(Exception):
+                pass
+
+            with patch.object(phase_profiler.torch, "OutOfMemoryError", FakeOOM, create=True):
+                self.assertTrue(capture.dump_on_oom(FakeOOM("CUDA out of memory")))
             self.assertFalse(capture.active)
-            self.assertFalse(capture.begin_step(1))
             self.assertEqual(FakeMemory.snapshot_calls, 1)
             self.assertEqual(FakeMemory.history_calls[-1], {"enabled": None})
+            artifact = pathlib.Path(output_dir) / "capture.rank_3.json"
             record = json.loads(
-                (pathlib.Path(output_dir) / "capture.json").read_text()
+                artifact.read_text()
             )
-            self.assertEqual(record["status"], "end")
+            self.assertEqual(record["status"], "cuda_oom")
+            self.assertEqual(record["rank"], 3)
+            self.assertEqual(record["step"], 7)
             self.assertLessEqual(
-                (pathlib.Path(output_dir) / "capture.json").stat().st_size,
+                artifact.stat().st_size,
                 _CUDA_MEMORY_CAPTURE_MAX_OUTPUT_BYTES,
             )
-            compact = record["snapshot"]
+            compact = record["allocator"]["snapshot"]
             self.assertLessEqual(
                 len(compact["largest_segments"]), _CUDA_MEMORY_CAPTURE_MAX_SEGMENTS
             )
@@ -136,7 +143,7 @@ class PhaseProfilerTest(unittest.TestCase):
                 len(compact["trace_tail"]), _CUDA_MEMORY_CAPTURE_MAX_TRACE_ENTRIES
             )
 
-    def test_cuda_memory_capture_dumps_only_cuda_oom_or_explicit_end(self):
+    def test_cuda_memory_capture_writes_non_rank0_oom_with_lightweight_stats(self):
         class FakeMemory:
             history_calls = []
             snapshot_calls = 0
@@ -150,10 +157,45 @@ class PhaseProfilerTest(unittest.TestCase):
                 cls.snapshot_calls += 1
                 return {"segments": [], "device_traces": [[]]}
 
+        class FakeCuda:
+            memory = FakeMemory
+
+            @staticmethod
+            def memory_stats():
+                return {
+                    "allocated_bytes.all.current": 123,
+                    "reserved_bytes.all.current": 456,
+                    "num_ooms": 1,
+                }
+
+            @staticmethod
+            def memory_allocated():
+                return 123
+
+            @staticmethod
+            def memory_reserved():
+                return 456
+
+            @staticmethod
+            def max_memory_allocated():
+                return 789
+
+            @staticmethod
+            def max_memory_reserved():
+                return 987
+
+            @staticmethod
+            def mem_get_info():
+                return 1000, 2000
+
+            @staticmethod
+            def synchronize():
+                raise AssertionError("memory diagnostics must not synchronize CUDA")
+
         class FakeOOM(Exception):
             pass
 
-        fake_cuda = types.SimpleNamespace(memory=FakeMemory)
+        fake_cuda = FakeCuda
         with tempfile.TemporaryDirectory() as output_dir, patch.object(
             phase_profiler.torch, "cuda", fake_cuda, create=True
         ), patch.object(
@@ -163,28 +205,65 @@ class PhaseProfilerTest(unittest.TestCase):
             {
                 "PRIME_CUDA_MEMORY_CAPTURE": "1",
                 "PRIME_CUDA_MEMORY_CAPTURE_PATH": f"{output_dir}/capture.json",
-                "RANK": "0",
+                "PRIME_CUDA_MEMORY_CAPTURE_RANK": "0",
+                "PRIME_CUDA_MEMORY_CAPTURE_STEP": "23",
+                "RANK": "17",
             },
         ):
             capture = CudaMemoryCapture()
-            self.assertTrue(capture.begin_step(1))
+            self.assertTrue(capture.begin_step(23))
             self.assertFalse(capture.dump_on_oom(RuntimeError("other failure")))
             self.assertTrue(capture.active)
             self.assertEqual(FakeMemory.snapshot_calls, 0)
             self.assertTrue(capture.dump_on_oom(FakeOOM("CUDA out of memory")))
             self.assertFalse(capture.active)
+            artifact = pathlib.Path(output_dir) / "capture.rank_17.json"
             record = json.loads(
-                (pathlib.Path(output_dir) / "capture.json").read_text()
+                artifact.read_text()
             )
             self.assertEqual(record["status"], "cuda_oom")
+            self.assertEqual(record["rank"], 17)
+            self.assertEqual(record["step"], 23)
             self.assertEqual(record["error"]["message"], "CUDA out of memory")
+            self.assertFalse(record["allocator"]["history_enabled"])
+            self.assertEqual(record["memory"]["num_ooms"], 1)
+            self.assertEqual(FakeMemory.snapshot_calls, 0)
 
-        with patch.dict(
+    def test_cuda_memory_capture_end_step_does_not_write_success_artifact(self):
+        class FakeMemory:
+            history_calls = []
+            snapshot_calls = 0
+
+            @classmethod
+            def _record_memory_history(cls, **kwargs):
+                cls.history_calls.append(kwargs)
+
+            @classmethod
+            def _snapshot(cls):
+                cls.snapshot_calls += 1
+                return {"segments": [], "device_traces": [[]]}
+
+        with tempfile.TemporaryDirectory() as output_dir, patch.object(
+            phase_profiler.torch,
+            "cuda",
+            types.SimpleNamespace(memory=FakeMemory),
+            create=True,
+        ), patch.dict(
             "os.environ",
-            {"PRIME_CUDA_MEMORY_CAPTURE": "1", "RANK": "1"},
+            {
+                "PRIME_CUDA_MEMORY_CAPTURE": "1",
+                "PRIME_CUDA_MEMORY_CAPTURE_PATH": f"{output_dir}/capture.json",
+                "PRIME_CUDA_MEMORY_CAPTURE_RANK": "0",
+                "PRIME_CUDA_MEMORY_CAPTURE_STEP": "4",
+                "RANK": "0",
+            },
         ):
             capture = CudaMemoryCapture()
-            self.assertFalse(capture.begin_step(1))
+            self.assertTrue(capture.begin_step(4))
+            self.assertTrue(capture.end_step())
+            self.assertFalse((pathlib.Path(output_dir) / "capture.rank_0.json").exists())
+            self.assertEqual(FakeMemory.snapshot_calls, 0)
+            self.assertEqual(FakeMemory.history_calls[-1], {"enabled": None})
 
     def test_cuda_capture_lifecycle_is_single_use_and_step_selected(self):
         class CudaApi:

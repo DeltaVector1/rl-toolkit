@@ -8,6 +8,9 @@ streams, or tensor values.
 The separate Nsight Systems CUDA+NVTX range is application-controlled.  It
 starts on one selected post-warmup step and stops after that step's backward
 pass, before optimizer work.
+
+CUDA OOM diagnostics are independent of phase timing.  They collect small
+rank-local records on the error path and do not issue distributed operations.
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ import heapq
 import json
 import os
 import statistics
+import tempfile
 from collections import deque
 from contextlib import contextmanager
 from functools import wraps
@@ -49,11 +53,16 @@ _EVENT_PAIR_COST_US = 20.0
 _CUDA_CAPTURE_ACTIVE = False
 _CUDA_CAPTURE_API = None
 
+# CUDA memory diagnostics are intentionally much smaller than the full PyTorch
+# allocator snapshot.  A snapshot is only requested from explicitly selected
+# ranks and only while a selected step is running.  Every rank still keeps the
+# cheap OOM path armed so a local failure does not depend on a collective.
 _CUDA_MEMORY_CAPTURE_MAX_ENTRIES = 4096
-_CUDA_MEMORY_CAPTURE_MAX_OUTPUT_BYTES = 1 << 20
+_CUDA_MEMORY_CAPTURE_MAX_OUTPUT_BYTES = 256 * 1024
 _CUDA_MEMORY_CAPTURE_MAX_SEGMENTS = 64
 _CUDA_MEMORY_CAPTURE_MAX_BLOCKS = 256
 _CUDA_MEMORY_CAPTURE_MAX_TRACE_ENTRIES = 256
+_CUDA_MEMORY_CAPTURE_MAX_ERROR_CHARS = 512
 
 
 def _safe_int(value: Any) -> int:
@@ -64,11 +73,14 @@ def _safe_int(value: Any) -> int:
 
 
 def _safe_text(value: Any, limit: int = 160) -> str:
-    return str(value)[:limit]
+    try:
+        return str(value)[:limit]
+    except BaseException:
+        return type(value).__name__[:limit]
 
 
 def _compact_frame(frames: Any) -> dict[str, Any]:
-    frame = frames[0] if frames else {}
+    frame = frames[0] if isinstance(frames, (list, tuple)) and frames else {}
     if not isinstance(frame, dict):
         return {"frame": _safe_text(frame)}
     return {
@@ -172,130 +184,401 @@ def _compact_memory_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _parse_unsigned_env(name: str, *, default: int | None = None) -> int | None:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    if not value.isdecimal():
+        raise ValueError(f"{name} must be an unsigned integer")
+    return int(value)
+
+
+def _parse_rank_selector(value: str) -> frozenset[int]:
+    """Parse the optional allocator-history rank selector.
+
+    The selector is deliberately separate from artifact collection.  An empty
+    selector means that every rank writes lightweight OOM evidence but no rank
+    enables allocator history.  ``all`` is accepted only as an explicit opt-in.
+    """
+    value = value.strip()
+    if not value:
+        return frozenset()
+    if value.lower() == "all":
+        return frozenset({-1})
+    ranks = []
+    for part in value.split(","):
+        part = part.strip()
+        if not part.isdecimal():
+            raise ValueError(
+                "PRIME_CUDA_MEMORY_CAPTURE_RANK must contain unsigned integers"
+            )
+        ranks.append(int(part))
+    return frozenset(ranks)
+
+
+def _rank_artifact_path(base: Path, rank: int) -> Path:
+    """Return a unique path for one rank without changing the configured base."""
+    if base.suffix:
+        return base.with_name(f"{base.stem}.rank_{rank}{base.suffix}")
+    return base / f"rank_{rank}.json"
+
+
+def _safe_stat(value: Any) -> int | float | None:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return value if value == value and value not in (float("inf"), float("-inf")) else None
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _cuda_memory_stats() -> dict[str, int | float]:
+    """Read a small set of allocator/driver counters without synchronizing CUDA."""
+    stats: dict[str, int | float] = {}
+    cuda = getattr(torch, "cuda", None)
+    for name in (
+        "memory_allocated",
+        "memory_reserved",
+        "max_memory_allocated",
+        "max_memory_reserved",
+    ):
+        function = getattr(cuda, name, None)
+        if not callable(function):
+            continue
+        try:
+            value = _safe_stat(function())
+        except BaseException:
+            continue
+        if value is not None:
+            stats[name] = value
+
+    memory_stats = getattr(cuda, "memory_stats", None)
+    if callable(memory_stats):
+        try:
+            raw = memory_stats()
+        except BaseException:
+            raw = {}
+        for key in (
+            "allocated_bytes.all.current",
+            "allocated_bytes.all.peak",
+            "reserved_bytes.all.current",
+            "reserved_bytes.all.peak",
+            "active_bytes.all.current",
+            "inactive_split_bytes.all.current",
+            "num_alloc_retries",
+            "num_ooms",
+        ):
+            value = _safe_stat(raw.get(key)) if hasattr(raw, "get") else None
+            if value is not None:
+                stats[key] = value
+
+    mem_get_info = getattr(cuda, "mem_get_info", None)
+    if callable(mem_get_info):
+        try:
+            free_bytes, total_bytes = mem_get_info()
+            free = _safe_stat(free_bytes)
+            total = _safe_stat(total_bytes)
+            if free is not None:
+                stats["driver_free_bytes"] = free
+            if total is not None:
+                stats["driver_total_bytes"] = total
+        except BaseException:
+            pass
+    return stats
+
+
+def _nvml_memory_stats() -> dict[str, int | float | str]:
+    """Read optional NVML counters; importing NVML is deferred to the OOM path."""
+    try:
+        import pynvml
+    except (ImportError, ModuleNotFoundError):
+        return {"available": False}
+
+    initialized = False
+    try:
+        pynvml.nvmlInit()
+        initialized = True
+        index = _parse_unsigned_env("LOCAL_RANK", default=0) or 0
+        handle = pynvml.nvmlDeviceGetHandleByIndex(index)
+        info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        result: dict[str, int | float | str] = {"available": True}
+        for name in ("free", "total", "used"):
+            value = _safe_stat(getattr(info, name, None))
+            if value is not None:
+                result[f"{name}_bytes"] = value
+        utilization = getattr(pynvml, "nvmlDeviceGetUtilizationRates", None)
+        if callable(utilization):
+            rates = utilization(handle)
+            for name in ("gpu", "memory"):
+                value = _safe_stat(getattr(rates, name, None))
+                if value is not None:
+                    result[f"{name}_utilization_pct"] = value
+        return result
+    except BaseException as error:
+        return {"available": False, "error": type(error).__name__[:64]}
+    finally:
+        if initialized:
+            try:
+                pynvml.nvmlShutdown()
+            except BaseException:
+                pass
+
+
 class CudaMemoryCapture:
-    """Capture one bounded CUDA allocator snapshot for rank 0, step 1."""
+    """Arm a rank-local OOM diagnostic without distributed or CUDA sync calls.
+
+    Every rank is armed when the feature is enabled.  The optional allocator
+    history is enabled only on ``PRIME_CUDA_MEMORY_CAPTURE_RANK`` (or an
+    explicit rank list), and Python stack recording requires the separate
+    ``PRIME_CUDA_MEMORY_CAPTURE_STACKS=1`` opt-in.  A normal step end only
+    disables history; it never writes a diagnostic artifact.
+    """
 
     def __init__(self) -> None:
-        self.enabled = os.environ.get("PRIME_CUDA_MEMORY_CAPTURE", "0") == "1"
+        self.enabled = False
         self._active = False
-        self._captured = False
-        self._path: Path | None = None
+        self._history_active = False
+        self._history_error: str | None = None
+        self._written = False
+        self._rank: int | None = None
+        self._step: int | None = None
+        self._target_step = 1
+        self._base_path: Path | None = None
+        self._artifact_path: Path | None = None
+        self._refresh_configuration()
 
     @property
     def active(self) -> bool:
         return self._active
 
-    def begin_step(self, step: int) -> bool:
+    @property
+    def artifact_path(self) -> Path | None:
+        return self._artifact_path
+
+    def _refresh_configuration(self) -> bool:
+        self.enabled = os.environ.get("PRIME_CUDA_MEMORY_CAPTURE", "0") == "1"
         if not self.enabled:
             return False
-        if int(step) != 1 or os.environ.get("RANK", "") != "0":
+        self._rank = _parse_unsigned_env("RANK")
+        if self._rank is None:
             return False
-        if self._active:
-            raise RuntimeError("CUDA memory capture is already active")
-        if self._captured:
-            return False
+        self._target_step = _parse_unsigned_env(
+            "PRIME_CUDA_MEMORY_CAPTURE_STEP", default=1
+        ) or 1
         output = os.environ.get("PRIME_CUDA_MEMORY_CAPTURE_PATH", "")
         if not output:
             raise ValueError(
                 "PRIME_CUDA_MEMORY_CAPTURE_PATH is required when CUDA memory capture is enabled"
             )
-        memory = getattr(torch.cuda, "memory", None)
+        self._base_path = Path(output)
+        self._artifact_path = _rank_artifact_path(self._base_path, self._rank)
+        return True
+
+    def _history_selected(self) -> bool:
+        if self._rank is None or self._step != self._target_step:
+            return False
+        selected = _parse_rank_selector(
+            os.environ.get("PRIME_CUDA_MEMORY_CAPTURE_RANK", "")
+        )
+        return -1 in selected or self._rank in selected
+
+    def _start_allocator_history(self) -> None:
+        memory = getattr(getattr(torch, "cuda", None), "memory", None)
         record_history = getattr(memory, "_record_memory_history", None)
         snapshot = getattr(memory, "_snapshot", None)
         if not callable(record_history) or not callable(snapshot):
-            raise RuntimeError(
-                "CUDA memory capture requires the pinned PyTorch memory history APIs"
-            )
+            self._history_error = "allocator_history_api_unavailable"
+            return
+        kwargs: dict[str, Any] = {
+            "enabled": "all",
+            "context": "all",
+            "max_entries": _CUDA_MEMORY_CAPTURE_MAX_ENTRIES,
+            "clear_history": True,
+        }
+        if os.environ.get("PRIME_CUDA_MEMORY_CAPTURE_STACKS", "0") == "1":
+            kwargs["stacks"] = "python"
         try:
-            record_history(
-                enabled="all",
-                context="all",
-                stacks="python",
-                max_entries=_CUDA_MEMORY_CAPTURE_MAX_ENTRIES,
-                clear_history=True,
-            )
-            self._path = Path(output)
-        except BaseException:
+            record_history(**kwargs)
+        except BaseException as error:
+            self._history_error = type(error).__name__[:64]
             try:
                 record_history(enabled=None)
             except BaseException:
                 pass
-            raise
+            return
+        self._history_active = True
+
+    def _stop_allocator_history(self) -> None:
+        if not self._history_active:
+            return
+        memory = getattr(getattr(torch, "cuda", None), "memory", None)
+        record_history = getattr(memory, "_record_memory_history", None)
+        if callable(record_history):
+            try:
+                record_history(enabled=None)
+            except BaseException:
+                pass
+        self._history_active = False
+
+    def begin_step(self, step: int) -> bool:
+        """Arm this rank for one runtime step and optionally start history."""
+        if self._active:
+            raise RuntimeError("CUDA memory capture step was not ended")
+        if self._written or not self._refresh_configuration():
+            return False
+        self._step = int(step)
         self._active = True
-        self._captured = True
+        self._history_error = None
+        if self._history_selected():
+            self._start_allocator_history()
         return True
 
     @staticmethod
     def _is_cuda_oom(error: BaseException) -> bool:
-        oom_type = getattr(torch, "OutOfMemoryError", None)
-        return (
-            oom_type is not None
-            and isinstance(error, oom_type)
-            and "cuda" in str(error).lower()
+        oom_types = tuple(
+            candidate
+            for candidate in (
+                getattr(torch, "OutOfMemoryError", None),
+                getattr(getattr(torch, "cuda", None), "OutOfMemoryError", None),
+            )
+            if isinstance(candidate, type)
+        )
+        seen: set[int] = set()
+        current: BaseException | None = error
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            text = str(current).lower()
+            if oom_types and isinstance(current, oom_types):
+                return "cpu" not in text
+            if "cuda" in text and "out of memory" in text:
+                return True
+            current = current.__cause__ or current.__context__
+        return False
+
+    @staticmethod
+    def _encode_record(record: dict[str, Any]) -> bytes:
+        return json.dumps(record, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
         )
 
-    def _finish(self, status: str, error: BaseException | None = None) -> bool:
-        if not self._active:
-            return False
-        memory = getattr(torch.cuda, "memory", None)
-        snapshot = getattr(memory, "_snapshot", None)
-        record_history = getattr(memory, "_record_memory_history", None)
-        path = self._path
-        diagnostic_error = None
-        try:
-            if not callable(snapshot) or path is None:
-                raise RuntimeError("CUDA memory capture was not initialized")
-            record = {
-                "format": "prime-cuda-memory-capture-v1",
-                "rank": 0,
-                "step": 1,
-                "status": status,
-                "snapshot": _compact_memory_snapshot(snapshot()),
+    @classmethod
+    def _bounded_payload(cls, record: dict[str, Any]) -> bytes:
+        payload = cls._encode_record(record)
+        if len(payload) <= _CUDA_MEMORY_CAPTURE_MAX_OUTPUT_BYTES:
+            return payload
+
+        # Drop the potentially large fields in stages.  The final record still
+        # contains rank, runtime step, status, and the OOM type/message.
+        reduced = dict(record)
+        reduced["truncated"] = True
+        reduced.pop("snapshot", None)
+        reduced.pop("memory", None)
+        reduced.pop("nvml", None)
+        payload = cls._encode_record(reduced)
+        if len(payload) <= _CUDA_MEMORY_CAPTURE_MAX_OUTPUT_BYTES:
+            return payload
+
+        error = reduced.get("error")
+        if isinstance(error, dict):
+            reduced["error"] = {
+                "type": str(error.get("type", ""))[:64],
+                "message": str(error.get("message", ""))[:128],
             }
-            if error is not None:
-                record["error"] = {
-                    "type": type(error).__name__,
-                    "message": str(error)[:512],
-                }
-            payload = json.dumps(record, sort_keys=True, separators=(",", ":"))
-            payload_bytes = payload.encode("utf-8")
-            if len(payload_bytes) > _CUDA_MEMORY_CAPTURE_MAX_OUTPUT_BYTES:
-                record = {
-                    "format": "prime-cuda-memory-capture-v1",
-                    "rank": 0,
-                    "step": 1,
-                    "status": status,
-                    "truncated": True,
-                }
-                payload_bytes = json.dumps(
-                    record, sort_keys=True, separators=(",", ":")
-                ).encode("utf-8")
-            if len(payload_bytes) > _CUDA_MEMORY_CAPTURE_MAX_OUTPUT_BYTES:
-                raise RuntimeError("CUDA memory capture output exceeds its fixed limit")
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(payload_bytes)
-        except BaseException as caught:
-            diagnostic_error = caught
+        return cls._encode_record(reduced)
+
+    @staticmethod
+    def _atomic_write(path: Path, payload: bytes) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as output:
+                temporary = Path(output.name)
+                output.write(payload)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, path)
+            temporary = None
         finally:
-            if callable(record_history):
+            if temporary is not None:
                 try:
-                    record_history(enabled=None)
-                except BaseException as caught:
-                    if diagnostic_error is None:
-                        diagnostic_error = caught
-            self._path = None
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
+
+    def _finish_oom(self, error: BaseException) -> bool:
+        if self._written:
+            return False
+        # Refresh here as well as in begin_step.  The outer train() handler can
+        # see an OOM during setup, before the first runtime step is entered.
+        if not self._refresh_configuration():
+            return False
+        if self._rank is None:
+            return False
+        if self._artifact_path is None:
+            if self._base_path is None:
+                return False
+            self._artifact_path = _rank_artifact_path(self._base_path, self._rank)
+
+        memory = getattr(getattr(torch, "cuda", None), "memory", None)
+        snapshot_function = getattr(memory, "_snapshot", None)
+        allocator: dict[str, Any] = {"history_enabled": self._history_active}
+        if self._history_active and callable(snapshot_function):
+            try:
+                allocator["snapshot"] = _compact_memory_snapshot(snapshot_function())
+            except BaseException as snapshot_error:
+                allocator["error"] = type(snapshot_error).__name__[:64]
+        elif self._history_error is not None:
+            allocator["error"] = self._history_error
+
+        record = {
+            "format": "prime-cuda-memory-capture-v2",
+            "rank": self._rank,
+            "step": self._step if self._step is not None else self._target_step,
+            "status": "cuda_oom",
+            "error": {
+                "type": type(error).__name__[:64],
+                "message": _safe_text(error, _CUDA_MEMORY_CAPTURE_MAX_ERROR_CHARS),
+            },
+            "memory": _cuda_memory_stats(),
+            "nvml": _nvml_memory_stats(),
+            "allocator": allocator,
+        }
+        self._stop_allocator_history()
+        try:
+            self._atomic_write(self._artifact_path, self._bounded_payload(record))
+        except BaseException:
+            # Diagnostics cannot replace the original OOM.  Mark this attempt
+            # consumed so a later teardown path does not repeat expensive work.
+            self._written = True
             self._active = False
-        if diagnostic_error is not None:
-            raise diagnostic_error
+            return False
+        self._written = True
+        self._active = False
         return True
 
     def end_step(self) -> bool:
-        return self._finish("end")
+        """Stop optional history; successful steps produce no artifact."""
+        if not self._active:
+            return False
+        self._stop_allocator_history()
+        self._active = False
+        return True
 
     def dump_on_oom(self, error: BaseException) -> bool:
-        if not self._active or not self._is_cuda_oom(error):
+        """Write one rank-local artifact for a CUDA OOM, without collectives."""
+        if not self._is_cuda_oom(error):
             return False
-        return self._finish("cuda_oom", error)
+        return self._finish_oom(error)
 
 
 _MEMORY_CAPTURE = CudaMemoryCapture()
