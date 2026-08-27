@@ -384,7 +384,11 @@ _qualification_deadline_environment_names = (
     "PRIME_QUALIFICATION_PROFILER_FINALIZE_DEADLINE_SECONDS",
 )
 _b2048_qualification_profiles = frozenset(
-    {"glm52-native-b2048", "glm52-native-b2048-nsys"}
+    {
+        "glm52-native-b2048",
+        "glm52-native-b2048-memory",
+        "glm52-native-b2048-nsys",
+    }
 )
 
 
@@ -742,7 +746,7 @@ def _qualification_environment() -> dict[str, str] | None:
     if not re.fullmatch(r"[0-9a-f]{32}", values["PRIME_QUALIFICATION_SESSION_ID"]):
         raise RuntimeError("qualification session ID is invalid")
     if not re.fullmatch(
-        r"glm52-native-(?:b2048|b2048-nsys|delta3|stability20)",
+        r"glm52-native-(?:b2048|b2048-memory|b2048-nsys|delta3|stability20)",
         values["PRIME_QUALIFICATION_PROFILE"],
     ):
         raise RuntimeError("qualification profile is invalid")
@@ -1115,6 +1119,7 @@ def _train_impl(config: TrainerConfig):
     if qualification_identity is not None:
         expected_steps = {
             "glm52-native-b2048": (2, False),
+            "glm52-native-b2048-memory": (2, False),
             "glm52-native-b2048-nsys": (2, False),
             "glm52-native-delta3": (3, True),
             "glm52-native-stability20": (20, True),

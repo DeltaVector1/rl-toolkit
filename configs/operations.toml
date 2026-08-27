@@ -82,6 +82,12 @@ kind = "glm52"
 trainer_container = "glm52_qualification_trainer"
 trainer = "configs/qualification/glm52-native-b2048.toml"
 
+[profiles.glm52-native-b2048-memory]
+kind = "glm52"
+trainer_container = "glm52_qualification_trainer"
+trainer = "configs/qualification/glm52-native-b2048-memory.toml"
+launch_env = { PRIME_CUDA_MEMORY_CAPTURE = "1", PRIME_CUDA_MEMORY_CAPTURE_RANK = "0", PRIME_CUDA_MEMORY_CAPTURE_STEP = "1", PRIME_CUDA_MEMORY_CAPTURE_PATH = "/data/glm52-rl/qualifications/glm52-native-b2048-memory/cuda-memory-capture.json" }
+
 [profiles.glm52-native-b2048-nsys]
 kind = "glm52"
 trainer_container = "glm52_qualification_trainer"
