@@ -3443,7 +3443,9 @@ raise SystemExit(99)
             training_ops.qualify("glm52-native-small", nodes=["n82"])
 
         deploy_file.assert_any_call(
-            "source/src/prime_rl/trainer/rl/token_export.py", nodes=["n82"]
+            "source/src/prime_rl/trainer/rl/token_export.py",
+            nodes=["n82"],
+            repository="glm52-qualification",
         )
         launch = next(command for host, command in calls if "cluster.sh trainer" in command)
         self.assertIn("prime_deployment=/data/glm52-rl/deployment-glm52-optims", launch)
@@ -3455,6 +3457,62 @@ raise SystemExit(99)
             launch,
         )
         self.assertIn("PRIME_NCCL_CHANNELS=16", launch)
+
+    def test_qualification_launch_forwards_allowlisted_profile_environment(self):
+        calls = []
+
+        def fake_ssh(host, command, timeout=120):
+            del timeout
+            calls.append((host, command))
+            return 0, ""
+
+        def fake_fan(hosts, function, workers=None):
+            del workers
+            return {host: function(host) for host in hosts}
+
+        profile = {
+            "kind": "muse",
+            "trainer": "configs/qualification/glm52-native-small.toml",
+            "launch_env": {
+                "PRIME_NSYS_PROFILE": "1",
+                "PRIME_CUDA_PROFILE": "1",
+                "PRIME_CUDA_PROFILE_RANK": "24",
+                "PRIME_CUDA_PROFILE_STEPS": "2",
+                "PRIME_CUDA_PROFILE_SECONDS": "60",
+            },
+        }
+        with (
+            patch.object(training_ops, "_profile", return_value=profile),
+            patch.object(training_ops, "_ssh", side_effect=fake_ssh),
+            patch.object(training_ops, "_fan", side_effect=fake_fan),
+            patch.object(training_ops, "deploy", return_value=True),
+            patch.object(
+                training_ops, "_ssh_control_masters", side_effect=lambda _hosts: nullcontext()
+            ),
+            patch.object(training_ops, "_assert_live_services_are_down"),
+            patch.object(training_ops, "trainer_mount_preflight"),
+        ):
+            training_ops.qualify("profile-test", nodes=["n82"])
+
+        launch = next(command for _host, command in calls if "cluster.sh trainer" in command)
+        self.assertIn("PRIME_NSYS_PROFILE=1", launch)
+        self.assertIn("PRIME_CUDA_PROFILE=1", launch)
+        self.assertIn("PRIME_CUDA_PROFILE_RANK=24", launch)
+        self.assertIn("PRIME_CUDA_PROFILE_STEPS=2", launch)
+        self.assertIn("PRIME_CUDA_PROFILE_SECONDS=60", launch)
+
+    def test_qualification_launch_rejects_invalid_profile_environment(self):
+        for launch_env in (
+            {"UNKNOWN": "1"},
+            {"PRIME_NSYS_PROFILE": "1; touch /tmp/bad"},
+            {"PRIME_CUDA_PROFILE_RANK": 24},
+            {"PRIME_CUDA_PROFILE_STEPS": "1"},
+            {"PRIME_CUDA_PROFILE_SECONDS": "121"},
+        ):
+            with self.subTest(launch_env=launch_env), self.assertRaises(
+                training_ops.Refused
+            ):
+                training_ops._qualification_launch_env({"launch_env": launch_env})
 
     def test_qualification_launch_reports_launcher_error(self):
         def fake_ssh(host, command, timeout=120):

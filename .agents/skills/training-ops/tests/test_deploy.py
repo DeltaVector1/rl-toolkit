@@ -9,6 +9,28 @@ import training_ops
 
 
 class DeployTest(unittest.TestCase):
+    def test_repository_root_accepts_only_configured_names(self):
+        with patch.dict(
+            training_ops.paths,
+            {
+                "remote_repository": "/data/default",
+                "glm52_qualification_repository": "/data/glm52-qualification",
+            },
+        ):
+            self.assertEqual(
+                training_ops._repository_root(), "/data/default"
+            )
+            self.assertEqual(
+                training_ops._repository_root("glm52-qualification"),
+                "/data/glm52-qualification",
+            )
+        with self.assertRaisesRegex(training_ops.Refused, "unknown repository"):
+            training_ops._repository_root("arbitrary")
+        with patch.dict(
+            training_ops.paths, {"glm52_qualification_repository": ""}
+        ), self.assertRaisesRegex(training_ops.Refused, "missing configured"):
+            training_ops._repository_root("glm52-qualification")
+
     def test_control_master_starts_once_per_configured_host(self):
         hosts = [*training_ops.trainer_hosts, training_ops.trainer_hosts[0]]
         completed = Mock(returncode=0, stdout="", stderr="")
