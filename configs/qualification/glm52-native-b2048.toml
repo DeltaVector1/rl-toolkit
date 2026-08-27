@@ -40,7 +40,10 @@ dp_replicate = 1
 ep_comm_backend = "torch"
 fsdp_cpu_offload = false
 cold_cpu_offload = false
-optim_cpu_offload = false
+# Keep Muon state on pinned host memory between optimizer steps. Parameters and
+# gradients stay on the GPU; this frees the largest stage's 4.125 GiB state
+# allocation without changing the optimizer update.
+optim_cpu_offload = true
 reshard_after_forward = true
 native_fp8_expert_prefetch = false
 optimization_dtype = "bfloat16"
