@@ -467,10 +467,43 @@ def _configured_ssh_control_path(host: str) -> str | None:
         raise Refused(
             f"SSH configuration has a non-absolute control path on {host}"
         )
-    # An existing path must be a live master. Never silently fall back to a
-    # new credentialed connection when configured state is stale.
-    if not os.path.lexists(configured_path):
+    # Do not follow a configured path or any parent component. An existing
+    # path must be a Unix socket owned by a live master. Never silently fall
+    # back to a new credentialed connection when configured state is stale.
+    for parent in reversed(path.parents):
+        try:
+            parent_stat = os.lstat(parent)
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise Refused(
+                f"cannot inspect configured SSH control path on {host}: "
+                f"{configured_path}"
+            ) from error
+        if stat.S_ISLNK(parent_stat.st_mode):
+            raise Refused(
+                f"configured SSH control path has a symlinked parent on {host}: "
+                f"{configured_path}"
+            )
+    try:
+        control_stat = os.lstat(path)
+    except FileNotFoundError:
         return None
+    except OSError as error:
+        raise Refused(
+            f"cannot inspect configured SSH control path on {host}: "
+            f"{configured_path}"
+        ) from error
+    if stat.S_ISLNK(control_stat.st_mode):
+        raise Refused(
+            f"configured SSH control path is a symlink on {host}: "
+            f"{configured_path}"
+        )
+    if not stat.S_ISSOCK(control_stat.st_mode):
+        raise Refused(
+            f"configured SSH control path is not a Unix socket on {host}: "
+            f"{configured_path}"
+        )
     try:
         checked = subprocess.run(
             [
