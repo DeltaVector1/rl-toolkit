@@ -123,5 +123,116 @@ class DeployTest(unittest.TestCase):
 
             self.assertCountEqual(copied_to, training_ops.inference_hosts)
 
+    def test_deploy_selects_only_configured_repository(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            local = repo / "configs" / "runtime" / "test.toml"
+            local.parent.mkdir(parents=True)
+            local.write_text("value = 1\n")
+            want = hashlib.md5(local.read_bytes()).hexdigest()
+            copied_to = []
+
+            def fake_run(command, **kwargs):
+                if command[0] == "scp":
+                    copied_to.append(command[-1])
+                return Mock(returncode=0)
+
+            def fake_ssh(host, command, timeout=120):
+                if command.startswith("md5sum "):
+                    return 0, want
+                return 0, ""
+
+            with (
+                patch.object(training_ops, "repo_root", repo),
+                patch.object(training_ops, "_ssh", side_effect=fake_ssh),
+                patch.object(training_ops.subprocess, "run", side_effect=fake_run),
+            ):
+                self.assertTrue(
+                    training_ops.deploy("configs/runtime/test.toml", nodes=["n82"])
+                )
+                self.assertTrue(
+                    training_ops.deploy(
+                        "configs/runtime/test.toml",
+                        nodes=["n82"],
+                        repository="glm52-qualification",
+                    )
+                )
+
+            self.assertEqual(
+                copied_to,
+                [
+                    f"n82:{training_ops.paths['remote_repository']}/configs/runtime/test.toml",
+                    f"n82:{training_ops.paths['glm52_qualification_repository']}/configs/runtime/test.toml",
+                ],
+            )
+
+    def test_deploy_rejects_unknown_or_missing_repository(self):
+        with self.assertRaises(training_ops.Refused):
+            training_ops._repository_root("arbitrary")
+        with patch.object(training_ops, "paths", {"remote_repository": "/safe"}):
+            with self.assertRaises(training_ops.Refused):
+                training_ops._repository_root("glm52-qualification")
+
+    def test_deploy_rejects_blocked_host_before_copy(self):
+        with patch.object(training_ops.subprocess, "run") as run:
+            with self.assertRaises(training_ops.Refused):
+                training_ops.deploy(
+                    "configs/runtime/glm52-inference.toml",
+                    nodes=["n79"],
+                    repository="glm52-qualification",
+                )
+        run.assert_not_called()
+
+    def test_glm_qualification_uses_isolated_repository(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            config = repo / "configs" / "qualification" / "glm.toml"
+            config.parent.mkdir(parents=True)
+            config.write_text("[data.fake]\ncount = 1\n")
+            deploys = []
+            launches = []
+
+            def fake_deploy(path, nodes=None, repository="default"):
+                deploys.append((path, repository))
+                return True
+
+            def fake_ssh(host, command, timeout=120):
+                if "docker ps" in command:
+                    return 0, ""
+                launches.append(command)
+                return 0, ""
+
+            def fake_fan(hosts, function, workers=None):
+                return {host: function(host) for host in hosts}
+
+            with (
+                patch.object(training_ops, "repo_root", repo),
+                patch.object(
+                    training_ops,
+                    "_profile",
+                    return_value={"kind": "glm52", "trainer": "configs/qualification/glm.toml"},
+                ),
+                patch.object(training_ops, "_ssh", side_effect=fake_ssh),
+                patch.object(training_ops, "_fan", side_effect=fake_fan),
+                patch.object(training_ops, "deploy", side_effect=fake_deploy),
+                patch.object(training_ops.time, "sleep"),
+            ):
+                training_ops.qualify("glm-q1", nodes=["n82"])
+
+            self.assertEqual(
+                deploys,
+                [
+                    ("scripts/china/cluster.sh", "glm52-qualification"),
+                    ("configs/qualification/glm.toml", "glm52-qualification"),
+                ],
+            )
+            self.assertTrue(
+                any(
+                    f"bash {training_ops.paths['glm52_qualification_repository']}/scripts/china/cluster.sh trainer"
+                    in command
+                    for command in launches
+                )
+            )
+
 if __name__ == "__main__":
     unittest.main()

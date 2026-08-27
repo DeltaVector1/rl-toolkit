@@ -15,6 +15,7 @@ batch = 29620
 
 [paths]
 remote_repository = "/data/glm52-rl/deployment"
+glm52_qualification_repository = "/data/glm52-rl/deployment-glm52-optims"
 runs = "/data/glm52-rl/runs"
 adapter_bucket = "hf://buckets/NewEden/muse-lora-checkpoints"
 

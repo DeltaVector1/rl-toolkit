@@ -2432,8 +2432,30 @@ def _mounted_on(path: str, host: str) -> bool:
     return any(path in _mounts_in(script) for script in scripts)
 
 
-def deploy(path: str, nodes: list[str] | None = None) -> bool:
+def _repository_root(name: str = "default") -> str:
+    """Resolve a configured repository name to its remote root."""
+    keys = {
+        "default": "remote_repository",
+        "glm52-qualification": "glm52_qualification_repository",
+    }
+    key = keys.get(name)
+    if key is None:
+        raise Refused(
+            f"unknown repository {name!r}; choose from {', '.join(sorted(keys))}"
+        )
+    root = paths.get(key)
+    if not isinstance(root, str) or not root.startswith("/"):
+        raise Refused(f"repository {name!r} is missing from operations config")
+    return root.rstrip("/")
+
+
+def deploy(
+    path: str,
+    nodes: list[str] | None = None,
+    repository: str = "default",
+) -> bool:
     """Push one repository file to its hosts and verify the checksum."""
+    repository_root = _repository_root(repository)
     if nodes is None:
         if path.startswith("source/"):
             nodes = [
@@ -2469,7 +2491,7 @@ def deploy(path: str, nodes: list[str] | None = None) -> bool:
                 "to list the union."
             )
     want = __import__("hashlib").md5(local.read_bytes()).hexdigest()
-    remote = f"{remote_repo}/{path}"
+    remote = f"{repository_root}/{path}"
     remote_mode = "0755" if local.stat().st_mode & 0o111 else "0644"
 
     def one(h):
@@ -2809,15 +2831,18 @@ def qualify(
             + "; use mode='restart' only when replacing it is intended"
         )
 
+    repository = "glm52-qualification" if selected["kind"] == "glm52" else "default"
+    repository_root = _repository_root(repository)
+    deploy_options = {} if repository == "default" else {"repository": repository}
     for path in ("scripts/china/cluster.sh", relative_config):
-        if not deploy(path, nodes=nodes):
+        if not deploy(path, nodes=nodes, **deploy_options):
             raise RuntimeError(f"failed to deploy {path}")
 
     trainer_nodes = " ".join(host.removeprefix("n") for host in nodes)
     env = (
         f"trainer_nodes='{trainer_nodes}' RUN={shlex.quote(name)} "
         f"RUN_NAME=run_{shlex.quote(name)} "
-        f"TRAINER_CONFIG={remote_repo}/{relative_config} "
+        f"TRAINER_CONFIG={repository_root}/{relative_config} "
         "PRIME_EP_PROFILE=0 PRIME_EP_AC_CACHE=0 PRIME_INT4_COMBINE_ROUNDS=1 "
         "PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD=0"
     )
@@ -2842,7 +2867,7 @@ def qualify(
         nodes,
         lambda host: _ssh(
             host,
-            f"{env} bash {trainer_launcher} trainer >/dev/null 2>&1; echo done",
+            f"{env} bash {repository_root}/scripts/china/cluster.sh trainer >/dev/null 2>&1; echo done",
             300,
         ),
     )
