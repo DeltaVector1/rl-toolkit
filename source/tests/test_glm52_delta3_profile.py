@@ -48,7 +48,8 @@ def test_delta3_profile_is_trainer_only_and_allowlisted() -> None:
         ROOT / ".agents/skills/training-ops/src/training_ops/__init__.py"
     ).read_text()
     assert (
-        "glm52-native-b2048|glm52-native-b2048-memory|glm52-native-b2048-nsys|glm52-native-delta3|glm52-native-stability20"
+        "glm52-native-b2048|glm52-native-b2048-memory|glm52-native-b2048-nsys|"
+        "glm52-native-delta3|glm52-native-pp-async|glm52-native-stability20"
         in cluster
     )
     assert '"glm52-native-delta3": (3, True)' in trainer

@@ -746,7 +746,7 @@ def _qualification_environment() -> dict[str, str] | None:
     if not re.fullmatch(r"[0-9a-f]{32}", values["PRIME_QUALIFICATION_SESSION_ID"]):
         raise RuntimeError("qualification session ID is invalid")
     if not re.fullmatch(
-        r"glm52-native-(?:b2048|b2048-memory|b2048-nsys|delta3|stability20)",
+        r"glm52-native-(?:b2048|b2048-memory|b2048-nsys|delta3|pp-async|stability20)",
         values["PRIME_QUALIFICATION_PROFILE"],
     ):
         raise RuntimeError("qualification profile is invalid")
@@ -1093,6 +1093,10 @@ def _write_qualification_result(
 
 @clean_exit
 def _train_impl(config: TrainerConfig):
+    # Recheck the opt-in topology before world, network, model, or schedule
+    # setup. This also protects callers that construct TrainerConfig without
+    # going through the normal CLI parser.
+    config.model.validate_async_1f1b_topology()
     # Setup world and logger
     world = get_world()
     numa_binding = bind_worker_to_gpu_numa_node()
@@ -1122,6 +1126,7 @@ def _train_impl(config: TrainerConfig):
             "glm52-native-b2048-memory": (2, False),
             "glm52-native-b2048-nsys": (2, False),
             "glm52-native-delta3": (3, True),
+            "glm52-native-pp-async": (2, False),
             "glm52-native-stability20": (20, True),
         }[qualification_identity["PRIME_QUALIFICATION_PROFILE"]]
         if (

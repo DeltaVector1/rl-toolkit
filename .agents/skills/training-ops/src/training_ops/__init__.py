@@ -7733,7 +7733,7 @@ legacy_stability20_train_sha256 = (
     "88bb92799b5133ee820b212bc38aa0818e9a87d8dc81ba439c6bec6780655ac0"
 )
 approved_recovery_train_sha256 = (
-    "e4e6a1ba16ed10a1c46e1405e6d135d7735f2a84ff02749e0cadbefc79d75a93"
+    "2898225487a00147e329c25c2f9f41823de8d282f9917f40d5989ab40cd1e8fc"
 )
 qualification_source_targets = {
     "q_a_proj",
@@ -8481,6 +8481,7 @@ def _validate_trainer_qualification(
         "glm52-native-b2048-memory": 2,
         "glm52-native-b2048-nsys": 2,
         "glm52-native-delta3": 3,
+        "glm52-native-pp-async": 2,
         "glm52-native-stability20": 20,
     }
     if profile_name not in expected_step_counts:
@@ -10760,6 +10761,7 @@ def _qualify_connected(
         "glm52-native-b2048-memory",
         "glm52-native-b2048-nsys",
         "glm52-native-delta3",
+        "glm52-native-pp-async",
         "glm52-native-stability20",
     }
     if strict_qualification and nodes != [trainer_head] + [

@@ -104,6 +104,10 @@ kind = "glm52"
 trainer_container = "glm52_qualification_trainer"
 trainer = "configs/qualification/glm52-native-stability20.toml"
 
+[profiles.glm52-native-pp-async]
+kind = "glm52"
+trainer = "configs/qualification/glm52-native-pp-async.toml"
+
 [reward]
 minimum_steps = 10
 spread_multiplier = 2.0
