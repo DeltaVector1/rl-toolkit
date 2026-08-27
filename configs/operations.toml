@@ -76,14 +76,6 @@ trainer = "configs/qualification/glm52-policy-parity-trainer.toml"
 kind = "glm52"
 trainer = "configs/qualification/glm52-native-b2048.toml"
 
-[profiles.glm52-native-interleaved-small]
-kind = "glm52"
-trainer = "configs/qualification/glm52-native-interleaved-small.toml"
-
-[profiles.glm52-native-interleaved-b2048]
-kind = "glm52"
-trainer = "configs/qualification/glm52-native-interleaved-b2048.toml"
-
 [profiles.glm52-native-delta3]
 kind = "glm52"
 trainer = "configs/qualification/glm52-native-delta3.toml"
