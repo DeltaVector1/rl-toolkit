@@ -22,6 +22,7 @@ h200_parity_backend = 8100
 
 [paths]
 remote_repository = "/data/glm52-rl/deployment-glm52-optims"
+glm52_qualification_repository = "/data/glm52-rl/deployment-glm52-optims"
 runs = "/data/glm52-rl/runs"
 glm_adapter_root = "/data/glm52-rl"
 glm_adapter_tunnel_state = "/data/glm52-rl/glm-adapter-tunnels.json"
@@ -29,6 +30,7 @@ adapter_bucket = "hf://buckets/NewEden/muse-lora-checkpoints"
 
 [containers]
 trainer = "glm52-optims-trainer"
+glm52_qualification_trainer = "glm52-optims-trainer"
 trainer_image = "prime-rl:glm52-v080-qual"
 inference_image = "prime-rl:glm52-v080-full"
 orchestrator = "glm52-optims-orchestrator"
@@ -60,33 +62,40 @@ ports = [8000]
 
 [profiles.current]
 kind = "glm52"
+trainer_container = "trainer"
 trainer = "configs/paused/trainer.glm52-production.toml"
 orchestrator = "configs/paused/orchestrator.glm52-production.toml"
 environment = "configs/paused/env.glm52-production.toml"
 
 [profiles.glm52-native-small]
 kind = "glm52"
+trainer_container = "glm52_qualification_trainer"
 trainer = "configs/qualification/glm52-native-small.toml"
 
 [profiles.glm52-policy-parity]
 kind = "glm52"
+trainer_container = "glm52_qualification_trainer"
 trainer = "configs/qualification/glm52-policy-parity-trainer.toml"
 
 [profiles.glm52-native-b2048]
 kind = "glm52"
+trainer_container = "glm52_qualification_trainer"
 trainer = "configs/qualification/glm52-native-b2048.toml"
 
 [profiles.glm52-native-b2048-nsys]
 kind = "glm52"
+trainer_container = "glm52_qualification_trainer"
 trainer = "configs/qualification/glm52-native-b2048-nsys.toml"
 launch_env = { PRIME_NSYS_PROFILE = "1", PRIME_CUDA_PROFILE = "1", PRIME_CUDA_PROFILE_RANK = "24", PRIME_CUDA_PROFILE_STEPS = "2" }
 
 [profiles.glm52-native-delta3]
 kind = "glm52"
+trainer_container = "glm52_qualification_trainer"
 trainer = "configs/qualification/glm52-native-delta3.toml"
 
 [profiles.glm52-native-stability20]
 kind = "glm52"
+trainer_container = "glm52_qualification_trainer"
 trainer = "configs/qualification/glm52-native-stability20.toml"
 
 [reward]
