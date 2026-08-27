@@ -179,6 +179,10 @@ class GlmMoeDsaAttention(nn.Module):
         self.qk_nope_head_dim = args.qk_nope_head_dim
         self.qk_head_dim = args.qk_head_dim
         self.v_head_dim = args.v_head_dim
+        self.scaling = self.qk_head_dim ** (-0.5)
+        self._cp_group: dist.ProcessGroup | None = None
+        self._cp_rank: int = 0
+        self._cp_world_size: int = 1
 
         self.q_a_proj = nn.Linear(args.hidden_size, args.q_lora_rank, bias=args.attention_bias)
         self.q_a_layernorm = RMSNorm(RMSNormConfig(hidden_size=args.q_lora_rank, eps=args.rms_norm_eps))
@@ -214,11 +218,6 @@ class GlmMoeDsaAttention(nn.Module):
     def _phase_backward_end(self, _module, _grad_input, _grad_output) -> None:
         get_phase_profiler().end_span(self._phase_backward_timer)
         self._phase_backward_timer = None
-        self.scaling = self.qk_head_dim ** (-0.5)
-
-        self._cp_group: dist.ProcessGroup | None = None
-        self._cp_rank: int = 0
-        self._cp_world_size: int = 1
 
     def set_context_parallel_attributes(self, cp_group: dist.ProcessGroup, cp_rank: int, cp_world_size: int) -> None:
         self._cp_group = cp_group
