@@ -210,7 +210,17 @@ class DeployTest(unittest.TestCase):
                 patch.object(
                     training_ops,
                     "_profile",
-                    return_value={"kind": "glm52", "trainer": "configs/qualification/glm.toml"},
+                    return_value={
+                        "kind": "glm52",
+                        "trainer": "configs/qualification/glm.toml",
+                        "launch_env": {
+                            "PRIME_NSYS_PROFILE": "1",
+                            "PRIME_CUDA_PROFILE": "1",
+                            "PRIME_CUDA_PROFILE_RANK": "24",
+                            "PRIME_CUDA_PROFILE_STEPS": "2",
+                            "PRIME_CUDA_PROFILE_SECONDS": "60",
+                        },
+                    },
                 ),
                 patch.object(training_ops, "_ssh", side_effect=fake_ssh),
                 patch.object(training_ops, "_fan", side_effect=fake_fan),
@@ -233,6 +243,33 @@ class DeployTest(unittest.TestCase):
                     for command in launches
                 )
             )
+            launch = launches[-1]
+            for key, value in (
+                ("PRIME_NSYS_PROFILE", "1"),
+                ("PRIME_CUDA_PROFILE", "1"),
+                ("PRIME_CUDA_PROFILE_RANK", "24"),
+                ("PRIME_CUDA_PROFILE_STEPS", "2"),
+                ("PRIME_CUDA_PROFILE_SECONDS", "60"),
+            ):
+                self.assertIn(f"{key}={value}", launch)
+
+    def test_qualification_launch_env_rejects_unsafe_values(self):
+        invalid_profiles = (
+            {"UNKNOWN": "1"},
+            {"PRIME_NSYS_PROFILE": ""},
+            {"PRIME_CUDA_PROFILE": "yes"},
+            {"PRIME_CUDA_PROFILE_RANK": "2; echo bad"},
+            {"PRIME_CUDA_PROFILE_STEPS": "1"},
+            {"PRIME_CUDA_PROFILE_SECONDS": "121"},
+            {"PRIME_CUDA_PROFILE": 1},
+        )
+        for launch_env in invalid_profiles:
+            with self.subTest(launch_env=launch_env):
+                with self.assertRaises(training_ops.Refused):
+                    training_ops._qualification_launch_env({"launch_env": launch_env})
+
+        with self.assertRaises(training_ops.Refused):
+            training_ops._qualification_launch_env({"launch_env": ["PRIME_CUDA_PROFILE"]})
 
 if __name__ == "__main__":
     unittest.main()

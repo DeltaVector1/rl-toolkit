@@ -2449,6 +2449,34 @@ def _repository_root(name: str = "default") -> str:
     return root.rstrip("/")
 
 
+_QUALIFICATION_LAUNCH_ENV_PATTERNS = {
+    "PRIME_NSYS_PROFILE": re.compile(r"[01]"),
+    "PRIME_CUDA_PROFILE": re.compile(r"[01]"),
+    "PRIME_CUDA_PROFILE_RANK": re.compile(r"[0-9]+"),
+    "PRIME_CUDA_PROFILE_STEPS": re.compile(r"(?:[2-9]|[1-9][0-9]+)"),
+    "PRIME_CUDA_PROFILE_SECONDS": re.compile(
+        r"(?:[3-9][0-9]|1[01][0-9]|120)"
+    ),
+}
+
+
+def _qualification_launch_env(profile: dict) -> dict[str, str]:
+    """Validate the optional, allowlisted trainer launch environment."""
+    launch_env = profile.get("launch_env", {})
+    if not isinstance(launch_env, dict):
+        raise Refused("qualification launch_env must be a mapping")
+    validated = {}
+    for key, value in launch_env.items():
+        if not isinstance(key, str) or key not in _QUALIFICATION_LAUNCH_ENV_PATTERNS:
+            raise Refused(f"qualification launch_env key {key!r} is not allowed")
+        if not isinstance(value, str) or not value:
+            raise Refused(f"qualification launch_env {key} must be a non-empty string")
+        if _QUALIFICATION_LAUNCH_ENV_PATTERNS[key].fullmatch(value) is None:
+            raise Refused(f"qualification launch_env {key} has an invalid value")
+        validated[key] = value
+    return validated
+
+
 def deploy(
     path: str,
     nodes: list[str] | None = None,
@@ -2790,6 +2818,7 @@ def qualify(
         nodes = [trainer_head] + [host for host in nodes if host != trainer_head]
 
     selected = _profile(name)
+    launch_env = _qualification_launch_env(selected)
     if "orchestrator" in selected:
         raise Refused(f"profile {name!r} is a full run; use start()")
     relative_config = selected["trainer"]
@@ -2851,6 +2880,8 @@ def qualify(
             " TRANSFORMERS_OVERRIDE_DIR=/data/muse-glimmer/transformers"
             " MUSE_PYTHON_OVERRIDE_DIR=/data/muse-glimmer/python-overrides"
         )
+    for key, value in launch_env.items():
+        env += f" {key}={shlex.quote(value)}"
 
     if active:
         _fan(
