@@ -467,28 +467,209 @@ class CudaMemoryCapture:
 
     @classmethod
     def _bounded_payload(cls, record: dict[str, Any]) -> bytes:
-        payload = cls._encode_record(record)
-        if len(payload) <= _CUDA_MEMORY_CAPTURE_MAX_OUTPUT_BYTES:
+        """Encode a record without ever returning a payload above the limit.
+
+        Allocator snapshots are nested under ``allocator.snapshot``.  Build a
+        small metadata record first so an arbitrary nested snapshot is never
+        copied into an oversized fallback candidate.  A compact snapshot from
+        ``_compact_memory_snapshot`` is retained when it fits; otherwise the
+        fixed minimal record is used.
+        """
+
+        def small_mapping(value: Any) -> dict[str, int | float | str | bool]:
+            if not isinstance(value, dict):
+                return {}
+            result: dict[str, int | float | str | bool] = {}
+            for key, item in list(value.items())[:32]:
+                safe_value = _safe_stat(item)
+                if safe_value is None:
+                    if isinstance(item, bool):
+                        safe_value = item
+                    elif isinstance(item, str):
+                        safe_value = _safe_text(item, 128)
+                    else:
+                        continue
+                result[_safe_text(key, 96)] = safe_value
+            return result
+
+        allocator = record.get("allocator")
+        nested_snapshot = allocator.get("snapshot") if isinstance(allocator, dict) else None
+        top_level_snapshot = record.get("snapshot")
+        snapshot = nested_snapshot if nested_snapshot is not None else top_level_snapshot
+
+        base: dict[str, Any] = {
+            "format": _safe_text(record.get("format", "prime-cuda-memory-capture-v2"), 64),
+            "rank": _safe_int(record.get("rank")),
+            "step": _safe_int(record.get("step")),
+            "status": _safe_text(record.get("status", "cuda_oom"), 32),
+            "error": {
+                "type": _safe_text(
+                    record.get("error", {}).get("type", "")
+                    if isinstance(record.get("error"), dict)
+                    else "",
+                    64,
+                ),
+                "message": _safe_text(
+                    record.get("error", {}).get("message", "")
+                    if isinstance(record.get("error"), dict)
+                    else "",
+                    _CUDA_MEMORY_CAPTURE_MAX_ERROR_CHARS,
+                ),
+            },
+            "memory": small_mapping(record.get("memory")),
+            "nvml": small_mapping(record.get("nvml")),
+            "allocator": small_mapping(allocator),
+        }
+
+        def fit(candidate: dict[str, Any]) -> bytes | None:
+            try:
+                payload = cls._encode_record(candidate)
+            except BaseException:
+                return None
+            return payload if len(payload) <= _CUDA_MEMORY_CAPTURE_MAX_OUTPUT_BYTES else None
+
+        # Normal lightweight records are already small.  Try the compact
+        # allocator summary only when it has the shape produced by our
+        # compactor; arbitrary user-provided objects stay out of the encoder.
+        compact_snapshot = isinstance(snapshot, dict) and {
+            "segment_count",
+            "active_block_count",
+            "trace_count",
+            "largest_segments",
+            "largest_active_blocks",
+            "trace_tail",
+        }.issuperset(snapshot)
+        if compact_snapshot:
+            # Add rows one at a time and retain only candidates that already
+            # fit.  This avoids constructing an oversized JSON payload when a
+            # compact summary is still too large for the artifact budget.
+            def compact_row(key: str, item: Any) -> dict[str, Any] | None:
+                if not isinstance(item, dict):
+                    return None
+                if key == "largest_segments":
+                    return {
+                        "address": _safe_int(item.get("address")),
+                        "total_size": _safe_int(item.get("total_size")),
+                        "allocated_size": _safe_int(item.get("allocated_size")),
+                        "active_size": _safe_int(item.get("active_size")),
+                        "segment_type": _safe_text(item.get("segment_type", ""), 32),
+                    }
+                if key == "largest_active_blocks":
+                    row = {
+                        "address": _safe_int(item.get("address")),
+                        "size": _safe_int(item.get("size")),
+                        "requested_size": _safe_int(item.get("requested_size")),
+                        "state": _safe_text(item.get("state", ""), 32),
+                    }
+                else:
+                    row = {
+                        "action": _safe_text(item.get("action", ""), 32),
+                        "addr": _safe_int(item.get("addr")),
+                        "size": _safe_int(item.get("size")),
+                        "stream": _safe_int(item.get("stream")),
+                        "device_free": _safe_int(item.get("device_free")),
+                    }
+                frame = item.get("frame")
+                if isinstance(frame, dict):
+                    row["frame"] = {
+                        "filename": _safe_text(frame.get("filename", "<unknown>")),
+                        "line": _safe_int(frame.get("line", 0)),
+                        "name": _safe_text(frame.get("name", "")),
+                    }
+                elif frame is not None:
+                    row["frame"] = {"frame": _safe_text(frame)}
+                return row
+
+            snapshot_candidate: dict[str, Any] = {}
+            for key in ("segment_count", "active_block_count", "trace_count"):
+                value = _safe_stat(snapshot.get(key))
+                if value is not None:
+                    snapshot_candidate[key] = value
+            omitted = False
+            for key, limit in (
+                ("largest_segments", _CUDA_MEMORY_CAPTURE_MAX_SEGMENTS),
+                ("largest_active_blocks", _CUDA_MEMORY_CAPTURE_MAX_BLOCKS),
+                ("trace_tail", _CUDA_MEMORY_CAPTURE_MAX_TRACE_ENTRIES),
+            ):
+                values = snapshot.get(key)
+                rows: list[Any] = []
+                if isinstance(values, (list, tuple)):
+                    for item in values:
+                        if len(rows) >= limit:
+                            omitted = True
+                            break
+                        row = compact_row(key, item)
+                        if row is None:
+                            omitted = True
+                            continue
+                        candidate_snapshot = dict(snapshot_candidate)
+                        candidate_snapshot[key] = [*rows, row]
+                        candidate = dict(base)
+                        candidate["allocator"] = dict(base["allocator"])
+                        candidate["allocator"]["snapshot"] = candidate_snapshot
+                        if fit(candidate) is None:
+                            omitted = True
+                            continue
+                        rows.append(row)
+                elif values is not None:
+                    omitted = True
+                snapshot_candidate[key] = rows
+            with_snapshot = dict(base)
+            with_snapshot["allocator"] = dict(base["allocator"])
+            with_snapshot["allocator"]["snapshot"] = snapshot_candidate
+            if omitted:
+                with_snapshot["truncated"] = True
+            payload = fit(with_snapshot)
+            if payload is not None:
+                return payload
+
+        without_snapshot = dict(base)
+        if snapshot is not None:
+            without_snapshot["truncated"] = True
+        payload = fit(without_snapshot)
+        if payload is not None:
             return payload
 
-        # Drop the potentially large fields in stages.  The final record still
-        # contains rank, runtime step, status, and the OOM type/message.
-        reduced = dict(record)
+        reduced = dict(without_snapshot)
         reduced["truncated"] = True
-        reduced.pop("snapshot", None)
         reduced.pop("memory", None)
         reduced.pop("nvml", None)
-        payload = cls._encode_record(reduced)
-        if len(payload) <= _CUDA_MEMORY_CAPTURE_MAX_OUTPUT_BYTES:
+        reduced["allocator"] = {
+            key: value
+            for key, value in base["allocator"].items()
+            if key != "snapshot"
+        }
+        payload = fit(reduced)
+        if payload is not None:
             return payload
 
-        error = reduced.get("error")
-        if isinstance(error, dict):
-            reduced["error"] = {
-                "type": str(error.get("type", ""))[:64],
-                "message": str(error.get("message", ""))[:128],
-            }
-        return cls._encode_record(reduced)
+        minimal = {
+            "format": "prime-cuda-memory-capture-v2",
+            "rank": _safe_int(record.get("rank")),
+            "step": _safe_int(record.get("step")),
+            "status": "cuda_oom",
+            "truncated": True,
+            "error": {
+                "type": _safe_text(
+                    record.get("error", {}).get("type", "")
+                    if isinstance(record.get("error"), dict)
+                    else "",
+                    64,
+                ),
+                "message": _safe_text(
+                    record.get("error", {}).get("message", "")
+                    if isinstance(record.get("error"), dict)
+                    else "",
+                    128,
+                ),
+            },
+        }
+        payload = fit(minimal)
+        if payload is not None:
+            return payload
+        # This literal is a final invariant even if an encoder is replaced by
+        # a test double or returns an unexpected value.
+        return b'{"format":"prime-cuda-memory-capture-v2","status":"cuda_oom","truncated":true}'
 
     @staticmethod
     def _atomic_write(path: Path, payload: bytes) -> None:

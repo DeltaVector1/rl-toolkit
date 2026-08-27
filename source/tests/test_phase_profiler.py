@@ -265,6 +265,37 @@ class PhaseProfilerTest(unittest.TestCase):
             self.assertEqual(FakeMemory.snapshot_calls, 0)
             self.assertEqual(FakeMemory.history_calls[-1], {"enabled": None})
 
+    def test_cuda_memory_capture_nested_snapshot_is_bounded(self):
+        # This models a compact allocator summary that is still larger than
+        # the per-rank limit.  The real summary is nested under allocator.
+        oversized_snapshot = {
+            "segment_count": 1,
+            "active_block_count": 1,
+            "trace_count": 1,
+            "largest_segments": [],
+            "largest_active_blocks": [],
+            "trace_tail": ["x" * 1024 for _ in range(280)],
+        }
+        record = {
+            "format": "prime-cuda-memory-capture-v2",
+            "rank": 17,
+            "step": 23,
+            "status": "cuda_oom",
+            "error": {"type": "OutOfMemoryError", "message": "CUDA out of memory"},
+            "memory": {"num_ooms": 1},
+            "nvml": {"available": False},
+            "allocator": {"history_enabled": True, "snapshot": oversized_snapshot},
+        }
+        payload = CudaMemoryCapture._bounded_payload(record)
+        self.assertLessEqual(len(payload), _CUDA_MEMORY_CAPTURE_MAX_OUTPUT_BYTES)
+        reduced = json.loads(payload)
+        self.assertTrue(reduced["truncated"])
+        retained = reduced["allocator"].get("snapshot")
+        if retained is not None:
+            self.assertLessEqual(
+                len(retained["trace_tail"]), _CUDA_MEMORY_CAPTURE_MAX_TRACE_ENTRIES
+            )
+
     def test_cuda_capture_lifecycle_is_single_use_and_step_selected(self):
         class CudaApi:
             def __init__(self):
