@@ -106,6 +106,9 @@ evidence_max_age_seconds = 86400
 session_duration_seconds_max = 14400
 forward_backward_seconds_max = 900
 peak_memory_gib_max = 46.0
+b2048_session_duration_seconds_max = 3600
+b2048_startup_seconds_max = 900
+b2048_profiler_finalize_seconds_max = 120
 
 [limits.h200_parity_cleanup]
 settle_timeout_seconds = 120

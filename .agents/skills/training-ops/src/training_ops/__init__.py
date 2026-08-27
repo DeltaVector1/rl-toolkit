@@ -7433,7 +7433,7 @@ legacy_stability20_train_sha256 = (
     "88bb92799b5133ee820b212bc38aa0818e9a87d8dc81ba439c6bec6780655ac0"
 )
 approved_recovery_train_sha256 = (
-    "e4e6a1ba16ed10a1c46e1405e6d135d7735f2a84ff02749e0cadbefc79d75a93"
+    "fca1dc6ceb0f4891259a391eb59f222ff12a59a169e77ccad6288a9da33140fe"
 )
 qualification_source_targets = {
     "q_a_proj",
@@ -8056,6 +8056,34 @@ def _glm_qualification_limits() -> tuple[int, int, float, float]:
     return age, session_duration, float(duration), float(memory)
 
 
+def _glm_b2048_deadlines() -> tuple[int, int, int, int]:
+    """Return the measured fail-fast limits for the two-step b2048 check."""
+    values = limits.get("glm52_qualification")
+    if not isinstance(values, dict):
+        raise Refused("GLM qualification limits are missing")
+    session = values.get("b2048_session_duration_seconds_max")
+    startup = values.get("b2048_startup_seconds_max")
+    step = values.get("forward_backward_seconds_max")
+    profiler = values.get("b2048_profiler_finalize_seconds_max")
+    for name, value in (
+        ("b2048 session duration", session),
+        ("b2048 startup", startup),
+        ("b2048 profiler finalization", profiler),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise Refused(f"GLM qualification {name} limit is invalid")
+    if (
+        isinstance(step, bool)
+        or not isinstance(step, (int, float))
+        or step != 900
+        or (session, startup, profiler) != (3600, 900, 120)
+        or startup >= session
+        or profiler >= session
+    ):
+        raise Refused("GLM b2048 qualification deadline limits are invalid")
+    return int(session), int(startup), int(step), int(profiler)
+
+
 def _exact_stability_recovery(result: dict, profile: dict) -> bool:
     recovery = result.get("recovery")
     expected_metrics_archive = str(
@@ -8187,6 +8215,17 @@ def _validate_trainer_qualification(
         "glm52_trainer_qualification_session"
     ):
         failures.append("qualification session schema is invalid")
+    if profile_name in {"glm52-native-b2048", "glm52-native-b2048-nsys"}:
+        session_deadline, startup_deadline, step_deadline, profiler_deadline = (
+            _glm_b2048_deadlines()
+        )
+        if session.get("deadlines") != {
+            "session_seconds": session_deadline,
+            "startup_seconds": startup_deadline,
+            "forward_backward_seconds": step_deadline,
+            "profiler_finalize_seconds": profiler_deadline,
+        }:
+            failures.append("qualification deadline evidence differs")
     if result.get("schema_version") != 1 or result.get("kind") != (
         "glm52_trainer_qualification"
     ):
@@ -10157,6 +10196,18 @@ def _prepare_trainer_qualification_session(
 
     image_digests = _trainer_image_digest_map(nodes)
 
+    deadline_values = None
+    if profile in {"glm52-native-b2048", "glm52-native-b2048-nsys"}:
+        session_deadline, startup_deadline, step_deadline, profiler_deadline = (
+            _glm_b2048_deadlines()
+        )
+        deadline_values = {
+            "session_seconds": session_deadline,
+            "startup_seconds": startup_deadline,
+            "forward_backward_seconds": step_deadline,
+            "profiler_finalize_seconds": profiler_deadline,
+        }
+
     source_sha256 = hashlib.sha256(
         (json.dumps(source_files, sort_keys=True, separators=(",", ":")) + "\n").encode()
     ).hexdigest()
@@ -10182,6 +10233,8 @@ def _prepare_trainer_qualification_session(
             "dp_shard": 1,
         },
     }
+    if deadline_values is not None:
+        manifest["deadlines"] = deadline_values
     payload = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
     session_sha256 = hashlib.sha256(payload).hexdigest()
     encoded = base64.b64encode(payload).decode()
@@ -10262,6 +10315,13 @@ PY
         f"PRIME_QUALIFICATION_SOURCE_SHA256={source_sha256} "
         f"PRIME_QUALIFICATION_SESSION_SHA256={session_sha256} "
     )
+    if deadline_values is not None:
+        environment += (
+            f"PRIME_QUALIFICATION_SESSION_DEADLINE_SECONDS={deadline_values['session_seconds']} "
+            f"PRIME_QUALIFICATION_STARTUP_DEADLINE_SECONDS={deadline_values['startup_seconds']} "
+            f"PRIME_QUALIFICATION_STEP_DEADLINE_SECONDS={deadline_values['forward_backward_seconds']} "
+            f"PRIME_QUALIFICATION_PROFILER_FINALIZE_DEADLINE_SECONDS={deadline_values['profiler_finalize_seconds']} "
+        )
     return TrainerQualificationIdentity(
         environment=environment,
         session_id=session_id,
@@ -10331,6 +10391,7 @@ def _qualify_connected(
         config = tomllib.load(stream)
     strict_qualification = name in {
         "glm52-native-b2048",
+        "glm52-native-b2048-nsys",
         "glm52-native-delta3",
         "glm52-native-stability20",
     }
@@ -10516,6 +10577,10 @@ def _qualify_connected(
             "PRIME_TRAINER_IMAGE_DIGEST",
             "PRIME_TRAINER_HOST",
             "PRIME_TRAINER_HEAD",
+            "PRIME_QUALIFICATION_SESSION_DEADLINE_SECONDS",
+            "PRIME_QUALIFICATION_STARTUP_DEADLINE_SECONDS",
+            "PRIME_QUALIFICATION_STEP_DEADLINE_SECONDS",
+            "PRIME_QUALIFICATION_PROFILER_FINALIZE_DEADLINE_SECONDS",
         )
         probe_source = """import json
 import subprocess
@@ -10591,6 +10656,18 @@ print(json.dumps({
                 "PRIME_TRAINER_HOST": host,
                 "PRIME_TRAINER_HEAD": trainer_head,
             }
+            if name in {"glm52-native-b2048", "glm52-native-b2048-nsys"}:
+                session_deadline, startup_deadline, step_deadline, profiler_deadline = (
+                    _glm_b2048_deadlines()
+                )
+                expected_environment.update(
+                    {
+                        "PRIME_QUALIFICATION_SESSION_DEADLINE_SECONDS": str(session_deadline),
+                        "PRIME_QUALIFICATION_STARTUP_DEADLINE_SECONDS": str(startup_deadline),
+                        "PRIME_QUALIFICATION_STEP_DEADLINE_SECONDS": str(step_deadline),
+                        "PRIME_QUALIFICATION_PROFILER_FINALIZE_DEADLINE_SECONDS": str(profiler_deadline),
+                    }
+                )
             mismatches = []
             if observed.get("name") != f"/{trainer_container}":
                 mismatches.append("container name")

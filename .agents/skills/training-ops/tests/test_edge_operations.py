@@ -189,6 +189,13 @@ class EdgeOperationsTest(unittest.TestCase):
                 "dp_shard": 1,
             },
         }
+        if profile_name == "glm52-native-b2048":
+            session["deadlines"] = {
+                "session_seconds": 3600,
+                "startup_seconds": 900,
+                "forward_backward_seconds": 900,
+                "profiler_finalize_seconds": 120,
+            }
         count = 2 if profile_name == "glm52-native-b2048" else 20
         runtime_ranks = [
             {
@@ -3590,6 +3597,10 @@ raise SystemExit(99)
                     "PRIME_TRAINER_IMAGE_DIGEST": images[host],
                     "PRIME_TRAINER_HOST": host,
                     "PRIME_TRAINER_HEAD": training_ops.trainer_head,
+                    "PRIME_QUALIFICATION_SESSION_DEADLINE_SECONDS": "3600",
+                    "PRIME_QUALIFICATION_STARTUP_DEADLINE_SECONDS": "900",
+                    "PRIME_QUALIFICATION_STEP_DEADLINE_SECONDS": "900",
+                    "PRIME_QUALIFICATION_PROFILER_FINALIZE_DEADLINE_SECONDS": "120",
                 },
             }
 

@@ -7,6 +7,7 @@ import math
 import os
 from pathlib import Path
 import re
+import threading
 import subprocess
 import time
 from datetime import datetime, timedelta, timezone
@@ -375,6 +376,139 @@ _qualification_environment_names = (
     "PRIME_TRAINER_HOST",
     "PRIME_TRAINER_HEAD",
 )
+_qualification_deadline_environment_names = (
+    "PRIME_QUALIFICATION_SESSION_DEADLINE_SECONDS",
+    "PRIME_QUALIFICATION_STARTUP_DEADLINE_SECONDS",
+    "PRIME_QUALIFICATION_STEP_DEADLINE_SECONDS",
+    "PRIME_QUALIFICATION_PROFILER_FINALIZE_DEADLINE_SECONDS",
+)
+_b2048_qualification_profiles = frozenset(
+    {"glm52-native-b2048", "glm52-native-b2048-nsys"}
+)
+
+
+class _QualificationDeadline:
+    """Fail a b2048 qualification while a bounded phase is still stuck."""
+
+    def __init__(self, profile: str, values: dict[str, str]) -> None:
+        try:
+            parsed = {
+                name: int(values[name]) for name in _qualification_deadline_environment_names
+            }
+        except (KeyError, TypeError, ValueError) as error:
+            raise RuntimeError("b2048 qualification deadlines are incomplete") from error
+        self.profile = profile
+        self.session_seconds = parsed[_qualification_deadline_environment_names[0]]
+        self.startup_seconds = parsed[_qualification_deadline_environment_names[1]]
+        self.step_seconds = parsed[_qualification_deadline_environment_names[2]]
+        self.profiler_finalize_seconds = parsed[_qualification_deadline_environment_names[3]]
+        if (
+            min(parsed.values()) <= 0
+            or self.step_seconds != 900
+            or (
+                self.session_seconds,
+                self.startup_seconds,
+                self.profiler_finalize_seconds,
+            )
+            != (3600, 900, 120)
+            or self.startup_seconds >= self.session_seconds
+            or self.profiler_finalize_seconds >= self.session_seconds
+        ):
+            raise RuntimeError("b2048 qualification deadlines are invalid")
+        self._started = time.monotonic()
+        self._startup_complete = False
+        self._forward_backward_started: float | None = None
+        self._profiler_finalize_started: float | None = None
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    @classmethod
+    def from_environment(cls, profile: str) -> "_QualificationDeadline | None":
+        if profile not in _b2048_qualification_profiles:
+            return None
+        return cls(
+            profile,
+            {name: os.environ.get(name, "") for name in _qualification_deadline_environment_names},
+        )
+
+    @property
+    def session_values(self) -> dict[str, int]:
+        return {
+            "session_seconds": self.session_seconds,
+            "startup_seconds": self.startup_seconds,
+            "forward_backward_seconds": self.step_seconds,
+            "profiler_finalize_seconds": self.profiler_finalize_seconds,
+        }
+
+    def validate_session(self, session: dict) -> None:
+        if session.get("deadlines") != self.session_values:
+            raise RuntimeError("b2048 qualification deadline session evidence differs")
+
+    def start(self) -> None:
+        self._thread = threading.Thread(
+            target=self._watch, name="qualification-deadline", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def mark_startup_complete(self) -> None:
+        with self._lock:
+            self._startup_complete = True
+
+    def begin_forward_backward(self) -> None:
+        with self._lock:
+            self._forward_backward_started = time.monotonic()
+
+    def end_forward_backward(self) -> None:
+        with self._lock:
+            self._forward_backward_started = None
+
+    def begin_profiler_finalize(self) -> None:
+        with self._lock:
+            self._profiler_finalize_started = time.monotonic()
+
+    def end_profiler_finalize(self) -> None:
+        with self._lock:
+            self._profiler_finalize_started = None
+
+    def _watch(self) -> None:
+        while not self._stop.wait(0.25):
+            reason = self._deadline_reason(time.monotonic())
+            if reason is not None:
+                self._abort(reason)
+
+    def _deadline_reason(self, now: float) -> str | None:
+        """Return the first expired phase without changing trainer state."""
+        with self._lock:
+            startup_complete = self._startup_complete
+            forward_backward_started = self._forward_backward_started
+            profiler_finalize_started = self._profiler_finalize_started
+        if now - self._started >= self.session_seconds:
+            return "session"
+        if not startup_complete and now - self._started >= self.startup_seconds:
+            return "startup/model-load"
+        if (
+            forward_backward_started is not None
+            and now - forward_backward_started >= self.step_seconds
+        ):
+            return "forward/backward"
+        if (
+            profiler_finalize_started is not None
+            and now - profiler_finalize_started >= self.profiler_finalize_seconds
+        ):
+            return "profiler finalization"
+        return None
+
+    @staticmethod
+    def _abort(phase: str) -> None:
+        message = f"qualification deadline exceeded during {phase}\n".encode()
+        try:
+            os.write(2, message)
+        finally:
+            os._exit(124)
 
 _qualification_source_targets = frozenset(
     {
@@ -946,6 +1080,13 @@ def _train_impl(config: TrainerConfig):
     )
     logger.info(f"Starting RL trainer in {world} in {config.output_dir}")
     qualification_identity = _qualification_environment()
+    qualification_deadline = None
+    if qualification_identity is not None:
+        qualification_deadline = _QualificationDeadline.from_environment(
+            qualification_identity["PRIME_QUALIFICATION_PROFILE"]
+        )
+        if qualification_deadline is not None:
+            qualification_deadline.start()
     fake = config.data.fake
     adapter_export_steps = validate_adapter_export_steps(
         list(getattr(fake, "adapter_export_steps", [])) if fake is not None else [],
@@ -1065,6 +1206,8 @@ def _train_impl(config: TrainerConfig):
         qualification_session = _load_qualification_session(
             config, qualification_identity
         )
+        if qualification_deadline is not None:
+            qualification_deadline.validate_session(qualification_session)
         qualification_runtime_records = _qualification_runtime_records(
             qualification_identity, world, qualification_session
         )
@@ -1427,6 +1570,8 @@ def _train_impl(config: TrainerConfig):
         ).__enter__()
         maybe_record_function = record_function
     start_step = progress.step
+    if qualification_deadline is not None:
+        qualification_deadline.mark_startup_complete()
     while True:
         # Reset peak memory stats
         torch.cuda.reset_peak_memory_stats()
@@ -1571,6 +1716,8 @@ def _train_impl(config: TrainerConfig):
             memory_profiler = MemoryProfiler(progress.step, config.memory_profiler_path)
 
         forward_backward_start_time = time.perf_counter()
+        if qualification_deadline is not None:
+            qualification_deadline.begin_forward_backward()
         phase_profiler.begin_step(progress.step)
         seq_len = micro_batches[0]["input_ids"].shape[1]
 
@@ -2454,9 +2601,9 @@ def _train_impl(config: TrainerConfig):
         # Update learning rate scheduler
         scheduler.step()
 
-        phase_report = phase_profiler.end_step(
-            rank=dist.get_rank(), stage=pp_rank
-        )
+        if qualification_deadline is not None:
+            qualification_deadline.begin_profiler_finalize()
+        phase_report = phase_profiler.end_step(rank=dist.get_rank(), stage=pp_rank)
         if phase_report is not None:
             phase_reports = [None] * dist.get_world_size()
             dist.all_gather_object(phase_reports, phase_report)
@@ -2464,6 +2611,8 @@ def _train_impl(config: TrainerConfig):
                 logger.info(
                     get_phase_profiler().format_aggregate(phase_reports)
                 )
+        if qualification_deadline is not None:
+            qualification_deadline.end_profiler_finalize()
 
         if os.environ.get("PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD", "") == "1":
             torch.cuda.synchronize()
@@ -2486,6 +2635,8 @@ def _train_impl(config: TrainerConfig):
             )
             dist.all_reduce(maximum_forward_backward, op=dist.ReduceOp.MAX)
             forward_backward_time = float(maximum_forward_backward.item())
+        if qualification_deadline is not None:
+            qualification_deadline.end_forward_backward()
         forward_backward_peak_memory = torch.cuda.max_memory_reserved() / 1024**3
 
         # Broadcast the model just produced (policy v{progress.step}) so the orchestrator can
@@ -2767,6 +2918,9 @@ def _train_impl(config: TrainerConfig):
         dist.broadcast(qualification_failed, src=0)
         if qualification_failed.item():
             raise RuntimeError("qualification result write failed")
+
+    if qualification_deadline is not None:
+        qualification_deadline.stop()
 
     logger.success("RL trainer finished!")
 

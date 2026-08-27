@@ -398,6 +398,29 @@ PY
         glm52-native-b2048|glm52-native-b2048-nsys|glm52-native-delta3|glm52-native-stability20) ;;
         *) echo "qualification profile is invalid" >&2; exit 1 ;;
       esac
+      if [ "${PRIME_QUALIFICATION_PROFILE}" = "glm52-native-b2048" ] || [ "${PRIME_QUALIFICATION_PROFILE}" = "glm52-native-b2048-nsys" ]; then
+        for deadline in \
+          "${PRIME_QUALIFICATION_SESSION_DEADLINE_SECONDS:-}" \
+          "${PRIME_QUALIFICATION_STARTUP_DEADLINE_SECONDS:-}" \
+          "${PRIME_QUALIFICATION_STEP_DEADLINE_SECONDS:-}" \
+          "${PRIME_QUALIFICATION_PROFILER_FINALIZE_DEADLINE_SECONDS:-}"; do
+          [[ "$deadline" =~ ^[1-9][0-9]*$ ]] || {
+            echo "b2048 qualification deadline is missing or invalid" >&2; exit 1
+          }
+        done
+        [ "$PRIME_QUALIFICATION_STEP_DEADLINE_SECONDS" -eq 900 ] || {
+          echo "b2048 qualification step deadline differs from the pinned 900-second ceiling" >&2
+          exit 1
+        }
+        [ "$PRIME_QUALIFICATION_STARTUP_DEADLINE_SECONDS" -lt "$PRIME_QUALIFICATION_SESSION_DEADLINE_SECONDS" ] || {
+          echo "b2048 qualification startup deadline must be below its session deadline" >&2
+          exit 1
+        }
+        [ "$PRIME_QUALIFICATION_PROFILER_FINALIZE_DEADLINE_SECONDS" -lt "$PRIME_QUALIFICATION_SESSION_DEADLINE_SECONDS" ] || {
+          echo "b2048 qualification profiler deadline must be below its session deadline" >&2
+          exit 1
+        }
+      fi
       for value in \
         "${PRIME_QUALIFICATION_CONFIG_SHA256:-}" \
         "${PRIME_QUALIFICATION_SOURCE_SHA256:-}" \
@@ -517,6 +540,14 @@ PY
         -e "PRIME_TRAINER_HOST=n$node"
         -e "PRIME_TRAINER_HEAD=n$trainer_head_node"
       )
+      if [ "$PRIME_QUALIFICATION_PROFILE" = "glm52-native-b2048" ] || [ "$PRIME_QUALIFICATION_PROFILE" = "glm52-native-b2048-nsys" ]; then
+        qualification_env+=(
+          -e "PRIME_QUALIFICATION_SESSION_DEADLINE_SECONDS=$PRIME_QUALIFICATION_SESSION_DEADLINE_SECONDS"
+          -e "PRIME_QUALIFICATION_STARTUP_DEADLINE_SECONDS=$PRIME_QUALIFICATION_STARTUP_DEADLINE_SECONDS"
+          -e "PRIME_QUALIFICATION_STEP_DEADLINE_SECONDS=$PRIME_QUALIFICATION_STEP_DEADLINE_SECONDS"
+          -e "PRIME_QUALIFICATION_PROFILER_FINALIZE_DEADLINE_SECONDS=$PRIME_QUALIFICATION_PROFILER_FINALIZE_DEADLINE_SECONDS"
+        )
+      fi
     fi
     if [ "${PRIME_NSYS_PROFILE:-0}" = "1" ] && [ "$node" = "$capture_node" ]; then
       nsys_host_root=/opt/nvidia/nsight-systems
