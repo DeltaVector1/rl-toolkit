@@ -714,6 +714,7 @@ PY
       -v "$deployment/source/src/prime_rl/trainer/distributed/partial_reshard.py":/app/src/prime_rl/trainer/distributed/partial_reshard.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/distributed/pipeline_parallel.py":/app/src/prime_rl/trainer/distributed/pipeline_parallel.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/distributed/pp_runner.py":/app/src/prime_rl/trainer/distributed/pp_runner.py:ro \
+      -v "$deployment/source/src/prime_rl/trainer/distributed/async_schedule.py":/app/src/prime_rl/trainer/distributed/async_schedule.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/phase_profiler.py":/app/src/prime_rl/trainer/phase_profiler.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/nsys_worker.py":/app/src/prime_rl/trainer/nsys_worker.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/parallel_dims.py":/app/src/prime_rl/trainer/parallel_dims.py:ro \
