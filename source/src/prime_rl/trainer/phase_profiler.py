@@ -12,14 +12,17 @@ pass, before optimizer work.
 
 from __future__ import annotations
 
+import heapq
+import json
 import os
 import statistics
+from collections import deque
 from contextlib import contextmanager
 from functools import wraps
+from pathlib import Path
 from typing import Any, Callable, Iterator, Sequence
 
 import torch
-
 
 PHASES = (
     "attention_forward",
@@ -45,6 +48,261 @@ PROFILE_REQUESTED = _PROFILE_REQUESTED
 _EVENT_PAIR_COST_US = 20.0
 _CUDA_CAPTURE_ACTIVE = False
 _CUDA_CAPTURE_API = None
+
+_CUDA_MEMORY_CAPTURE_MAX_ENTRIES = 4096
+_CUDA_MEMORY_CAPTURE_MAX_OUTPUT_BYTES = 1 << 20
+_CUDA_MEMORY_CAPTURE_MAX_SEGMENTS = 64
+_CUDA_MEMORY_CAPTURE_MAX_BLOCKS = 256
+_CUDA_MEMORY_CAPTURE_MAX_TRACE_ENTRIES = 256
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _safe_text(value: Any, limit: int = 160) -> str:
+    return str(value)[:limit]
+
+
+def _compact_frame(frames: Any) -> dict[str, Any]:
+    frame = frames[0] if frames else {}
+    if not isinstance(frame, dict):
+        return {"frame": _safe_text(frame)}
+    return {
+        "filename": _safe_text(frame.get("filename", "<unknown>")),
+        "line": _safe_int(frame.get("line", 0)),
+        "name": _safe_text(frame.get("name", "")),
+    }
+
+
+def _compact_memory_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Keep a bounded allocator summary from a CUDA memory snapshot."""
+    segments = snapshot.get("segments", ())
+    segment_heap = []
+    block_heap = []
+    segment_count = 0
+    active_block_count = 0
+    for segment in segments if isinstance(segments, (list, tuple)) else ():
+        if not isinstance(segment, dict):
+            continue
+        segment_count += 1
+        segment_row = {
+            "address": _safe_int(segment.get("address")),
+            "total_size": _safe_int(segment.get("total_size")),
+            "allocated_size": _safe_int(segment.get("allocated_size")),
+            "active_size": _safe_int(segment.get("active_size")),
+            "segment_type": _safe_text(segment.get("segment_type", ""), 32),
+        }
+        segment_item = (
+            segment_row["active_size"],
+            segment_row["total_size"],
+            segment_count,
+            segment_row,
+        )
+        if len(segment_heap) < _CUDA_MEMORY_CAPTURE_MAX_SEGMENTS:
+            heapq.heappush(segment_heap, segment_item)
+        else:
+            heapq.heappushpop(segment_heap, segment_item)
+        blocks = segment.get("blocks", ())
+        for block in blocks if isinstance(blocks, (list, tuple)) else ():
+            if not isinstance(block, dict):
+                continue
+            state = _safe_text(block.get("state", ""), 32)
+            if not state.startswith("active"):
+                continue
+            active_block_count += 1
+            block_row = {
+                "address": _safe_int(block.get("address")),
+                "size": _safe_int(block.get("size")),
+                "requested_size": _safe_int(block.get("requested_size")),
+                "state": state,
+                "frame": _compact_frame(block.get("frames", ())),
+            }
+            block_item = (
+                block_row["size"],
+                block_row["address"],
+                active_block_count,
+                block_row,
+            )
+            if len(block_heap) < _CUDA_MEMORY_CAPTURE_MAX_BLOCKS:
+                heapq.heappush(block_heap, block_item)
+            else:
+                heapq.heappushpop(block_heap, block_item)
+
+    traces = snapshot.get("device_traces", ())
+    trace_rows = deque(maxlen=_CUDA_MEMORY_CAPTURE_MAX_TRACE_ENTRIES)
+    if isinstance(traces, (list, tuple)):
+        for device_trace in traces:
+            if not isinstance(device_trace, (list, tuple)):
+                continue
+            trace_rows.extend(
+                device_trace[-_CUDA_MEMORY_CAPTURE_MAX_TRACE_ENTRIES :]
+            )
+    compact_traces = []
+    for trace in trace_rows:
+        if not isinstance(trace, dict):
+            continue
+        compact_traces.append(
+            {
+                "action": _safe_text(trace.get("action", ""), 32),
+                "addr": _safe_int(trace.get("addr")),
+                "size": _safe_int(trace.get("size")),
+                "stream": _safe_int(trace.get("stream")),
+                "device_free": _safe_int(trace.get("device_free")),
+                "frame": _compact_frame(trace.get("frames", ())),
+            }
+        )
+
+    segment_rows = [item[3] for item in sorted(segment_heap, reverse=True)]
+    block_rows = [item[3] for item in sorted(block_heap, reverse=True)]
+    return {
+        "segment_count": segment_count,
+        "active_block_count": active_block_count,
+        "trace_count": sum(
+            len(trace) for trace in traces if isinstance(trace, (list, tuple))
+        )
+        if isinstance(traces, (list, tuple))
+        else 0,
+        "largest_segments": segment_rows,
+        "largest_active_blocks": block_rows,
+        "trace_tail": compact_traces,
+    }
+
+
+class CudaMemoryCapture:
+    """Capture one bounded CUDA allocator snapshot for rank 0, step 1."""
+
+    def __init__(self) -> None:
+        self.enabled = os.environ.get("PRIME_CUDA_MEMORY_CAPTURE", "0") == "1"
+        self._active = False
+        self._captured = False
+        self._path: Path | None = None
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    def begin_step(self, step: int) -> bool:
+        if not self.enabled:
+            return False
+        if int(step) != 1 or os.environ.get("RANK", "") != "0":
+            return False
+        if self._active:
+            raise RuntimeError("CUDA memory capture is already active")
+        if self._captured:
+            return False
+        output = os.environ.get("PRIME_CUDA_MEMORY_CAPTURE_PATH", "")
+        if not output:
+            raise ValueError(
+                "PRIME_CUDA_MEMORY_CAPTURE_PATH is required when CUDA memory capture is enabled"
+            )
+        memory = getattr(torch.cuda, "memory", None)
+        record_history = getattr(memory, "_record_memory_history", None)
+        snapshot = getattr(memory, "_snapshot", None)
+        if not callable(record_history) or not callable(snapshot):
+            raise RuntimeError(
+                "CUDA memory capture requires the pinned PyTorch memory history APIs"
+            )
+        try:
+            record_history(
+                enabled="all",
+                context="all",
+                stacks="python",
+                max_entries=_CUDA_MEMORY_CAPTURE_MAX_ENTRIES,
+                clear_history=True,
+            )
+            self._path = Path(output)
+        except BaseException:
+            try:
+                record_history(enabled=None)
+            except BaseException:
+                pass
+            raise
+        self._active = True
+        self._captured = True
+        return True
+
+    @staticmethod
+    def _is_cuda_oom(error: BaseException) -> bool:
+        oom_type = getattr(torch, "OutOfMemoryError", None)
+        return (
+            oom_type is not None
+            and isinstance(error, oom_type)
+            and "cuda" in str(error).lower()
+        )
+
+    def _finish(self, status: str, error: BaseException | None = None) -> bool:
+        if not self._active:
+            return False
+        memory = getattr(torch.cuda, "memory", None)
+        snapshot = getattr(memory, "_snapshot", None)
+        record_history = getattr(memory, "_record_memory_history", None)
+        path = self._path
+        diagnostic_error = None
+        try:
+            if not callable(snapshot) or path is None:
+                raise RuntimeError("CUDA memory capture was not initialized")
+            record = {
+                "format": "prime-cuda-memory-capture-v1",
+                "rank": 0,
+                "step": 1,
+                "status": status,
+                "snapshot": _compact_memory_snapshot(snapshot()),
+            }
+            if error is not None:
+                record["error"] = {
+                    "type": type(error).__name__,
+                    "message": str(error)[:512],
+                }
+            payload = json.dumps(record, sort_keys=True, separators=(",", ":"))
+            payload_bytes = payload.encode("utf-8")
+            if len(payload_bytes) > _CUDA_MEMORY_CAPTURE_MAX_OUTPUT_BYTES:
+                record = {
+                    "format": "prime-cuda-memory-capture-v1",
+                    "rank": 0,
+                    "step": 1,
+                    "status": status,
+                    "truncated": True,
+                }
+                payload_bytes = json.dumps(
+                    record, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            if len(payload_bytes) > _CUDA_MEMORY_CAPTURE_MAX_OUTPUT_BYTES:
+                raise RuntimeError("CUDA memory capture output exceeds its fixed limit")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload_bytes)
+        except BaseException as caught:
+            diagnostic_error = caught
+        finally:
+            if callable(record_history):
+                try:
+                    record_history(enabled=None)
+                except BaseException as caught:
+                    if diagnostic_error is None:
+                        diagnostic_error = caught
+            self._path = None
+            self._active = False
+        if diagnostic_error is not None:
+            raise diagnostic_error
+        return True
+
+    def end_step(self) -> bool:
+        return self._finish("end")
+
+    def dump_on_oom(self, error: BaseException) -> bool:
+        if not self._active or not self._is_cuda_oom(error):
+            return False
+        return self._finish("cuda_oom", error)
+
+
+_MEMORY_CAPTURE = CudaMemoryCapture()
+
+
+def get_cuda_memory_capture() -> CudaMemoryCapture:
+    return _MEMORY_CAPTURE
 
 
 def _cuda_capture_step() -> int:

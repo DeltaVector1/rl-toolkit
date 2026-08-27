@@ -66,6 +66,7 @@ from prime_rl.trainer.model import (
 from prime_rl.trainer.parallel_dims import get_parallel_dims, resolve_ep
 from prime_rl.trainer.perf import get_perf_counter
 from prime_rl.trainer.phase_profiler import (
+    get_cuda_memory_capture,
     get_phase_profiler,
     install_fsdp_phase_hooks,
     start_cuda_capture,
@@ -1259,6 +1260,7 @@ def _train_impl(config: TrainerConfig):
     loading_from_ckpt_later = config.ckpt and checkpoint_step is not None
     model = setup_model(config.model, parallel_dims, loading_from_ckpt_later)
     phase_profiler = get_phase_profiler()
+    cuda_memory_capture = get_cuda_memory_capture()
     install_fsdp_phase_hooks()
     if trainer_only and config.model.lora is not None:
         multi_run_manager.create_trainer_only_run(config.model.lora)
@@ -1732,6 +1734,7 @@ def _train_impl(config: TrainerConfig):
         if config.memory_profiler_path is not None:
             memory_profiler = MemoryProfiler(progress.step, config.memory_profiler_path)
 
+        cuda_memory_capture.begin_step(progress.step)
         forward_backward_start_time = time.perf_counter()
         if qualification_deadline is not None:
             qualification_deadline.begin_forward_backward()
@@ -2630,6 +2633,7 @@ def _train_impl(config: TrainerConfig):
                 )
         if qualification_deadline is not None:
             qualification_deadline.end_profiler_finalize()
+        cuda_memory_capture.end_step()
 
         if os.environ.get("PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD", "") == "1":
             torch.cuda.synchronize()
@@ -2960,9 +2964,13 @@ def train(config: TrainerConfig):
     """Run training and close an active diagnostic capture on any error."""
     try:
         result = _train_impl(config)
-    except BaseException:
+    except BaseException as error:
         # Preserve the training failure.  Cleanup is best effort on an error
         # path, but remains strict after a normal return.
+        try:
+            get_cuda_memory_capture().dump_on_oom(error)
+        except BaseException:
+            pass
         try:
             stop_cuda_capture()
         except BaseException:
