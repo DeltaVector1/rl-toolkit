@@ -3,6 +3,11 @@ import types
 import unittest
 from pathlib import Path
 
+try:
+    import torch
+except ModuleNotFoundError:  # pragma: no cover - dependency is present in CI
+    torch = None
+
 
 SOURCE_PATH = (
     Path(__file__).parents[1]
@@ -49,6 +54,50 @@ def load_received_input_type():
     namespace = {"torch": fake_torch}
     exec(compile(module, str(SOURCE_PATH), "exec"), namespace)
     return namespace["ReceivedINT4ExpertInput"]
+
+
+def load_bf16_combine():
+    """Load the pure combine function with a one-rank fake collective."""
+    if torch is None:
+        raise unittest.SkipTest("PyTorch is not installed")
+    tree = ast.parse(SOURCE)
+    definitions = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"_round_splits", "_streaming_bf16_combine"}
+    ]
+
+    class FakeDist:
+        @staticmethod
+        def all_to_all_single(receive, send, output_splits, input_splits, group):
+            del output_splits, input_splits, group
+            receive.copy_(send)
+
+    class FakeTimer:
+        def __init__(self, tag):
+            del tag
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    namespace = {
+        "torch": torch,
+        "dist": FakeDist,
+        "_validate_bf16_dispatch": lambda *args: object(),
+        "_empty_with_cache_retry": lambda *size, **kwargs: torch.empty(
+            *size, **kwargs
+        ),
+        "_EPTimer": FakeTimer,
+    }
+    exec(
+        compile(ast.Module(body=definitions, type_ignores=[]), str(SOURCE_PATH), "exec"),
+        namespace,
+    )
+    return namespace["_streaming_bf16_combine"]
 
 
 class FakeTensor:
@@ -308,6 +357,59 @@ class Int4CombineMemoryTests(unittest.TestCase):
         self.assertIn("capacity_rows = max(routed_input.shape[0], output_rows)", dispatch)
         self.assertIn("ctx.mark_dirty(routed_input)", dispatch)
         self.assertIn("_BF16_COMBINE_ROUNDS", dispatch)
+
+    def test_bf16_combine_releases_round_buffers_before_next_allocation(self):
+        function = SOURCE.split("def _streaming_bf16_combine", 1)[1].split(
+            "\n\nclass _BF16Dispatch", 1
+        )[0]
+        copy = function.index(
+            "result[:, column_offset : column_offset + round_columns].copy_(receive)"
+        )
+        release = function.index("del send, receive", copy)
+        loop_end = function.index("return result", release)
+        self.assertLess(copy, release)
+        self.assertLess(release, loop_end)
+        self.assertEqual(function.count("del send, receive"), 1)
+
+    @unittest.skipUnless(torch is not None, "PyTorch is not installed")
+    def test_bf16_combine_cpu_preserves_values_and_dtype(self):
+        combine = load_bf16_combine()
+        rows, columns, rounds = 6, 7, 3
+        source = torch.arange(rows * columns, dtype=torch.bfloat16).reshape(
+            rows, columns
+        )
+        expected = source.clone()
+        result = combine(source, [rows], [rows], "one-rank", rounds)
+        self.assertIs(result, source)
+        self.assertEqual(result.dtype, torch.bfloat16)
+        self.assertTrue(torch.equal(result, expected))
+
+    @unittest.skipUnless(
+        torch is not None and torch.cuda.is_available(), "CUDA is not available"
+    )
+    def test_bf16_combine_cuda_preserves_values_and_dtype(self):
+        combine = load_bf16_combine()
+        rows, columns, rounds = 6, 7, 3
+        source = torch.arange(
+            rows * columns, device="cuda", dtype=torch.bfloat16
+        ).reshape(rows, columns)
+        expected = source.clone()
+        result = combine(source, [rows], [rows], "one-rank", rounds)
+        torch.cuda.synchronize()
+        self.assertIs(result, source)
+        self.assertEqual(result.dtype, torch.bfloat16)
+        self.assertTrue(torch.equal(result, expected))
+
+    def test_bf16_combine_peak_estimate_excludes_stale_receive(self):
+        # Use the observed 84,086 x 768 rank shape.  The released buffers
+        # reduce the later-round peak by one output chunk.
+        rows, columns, rounds, element_bytes = 84086, 768, 8, 2
+        chunk_columns = (columns + rounds - 1) // rounds
+        current_peak = (rows + rows) * chunk_columns * element_bytes
+        stale_peak = (rows + 2 * rows) * chunk_columns * element_bytes
+        self.assertEqual(stale_peak - current_peak, 16144512)
+        self.assertEqual(current_peak, 32289024)
+        self.assertEqual(stale_peak, 48433536)
 
     def test_bf16_combine_rounds_fail_closed(self):
         prefix = SOURCE.split("def _in_backward", 1)[0]

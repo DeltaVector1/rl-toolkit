@@ -993,6 +993,11 @@ def _streaming_bf16_combine(
                 group=group,
             )
         result[:, column_offset : column_offset + round_columns].copy_(receive)
+        # The collective and result copy are complete.  Release both temporary
+        # buffers before the next round so the allocator can reuse their blocks;
+        # otherwise the previous receive remains live while the next receive is
+        # allocated, adding one full output chunk to the peak.
+        del send, receive
     return result
 
 
