@@ -31,7 +31,7 @@ class FakeOp:
 
 
 class FakeTransport:
-    def __init__(self, module, log):
+    def __init__(self, module, log, *, fwd_window=2, bwd_window=2):
         self.module = module
         self.log = log
         self.state = module.AsyncP2PState(
@@ -39,10 +39,16 @@ class FakeTransport:
             self._post_send,
             self._wait_receive,
             self._wait_send,
+            max_window={"fwd": fwd_window, "bwd": bwd_window},
         )
+        self.fwd_window = fwd_window
+        self.bwd_window = bwd_window
 
-    def receive_window(self, _direction):
-        return 2
+    def receive_window(self, direction):
+        return self.fwd_window if direction == "fwd" else self.bwd_window
+
+    def receive_capacity_available(self, direction):
+        return self.state.receive_capacity_available(direction)
 
     def _post_receive(self, ops):
         token = tuple((op.kind, op.microbatch) for op in ops)
@@ -61,13 +67,16 @@ class FakeTransport:
         self.log.append(("wait_send", token))
 
     def prepost_receive(self, direction, microbatch, ops, *, buffer=None):
-        self.state.prepost_receive(direction, microbatch, ops, buffer=buffer)
+        return self.state.prepost_receive(direction, microbatch, ops, buffer=buffer)
 
     def wait_receive(self, direction, microbatch):
         self.state.wait_receive(direction, microbatch)
 
     def release_receive(self, direction, microbatch):
         self.state.release_receive(direction, microbatch)
+
+    def release_receive_buffer(self, direction, microbatch, buffer_index):
+        self.state.release_receive_buffer(direction, microbatch, buffer_index)
 
     def post_send(self, direction, microbatch, ops):
         self.state.post_send(direction, microbatch, ops)
@@ -88,12 +97,17 @@ class ReferenceTransport:
 
     def prepost_receive(self, direction, microbatch, _ops, *, buffer=None):
         self.received.add((direction, microbatch))
+        return True
 
     def wait_receive(self, direction, microbatch):
         assert (direction, microbatch) in self.received
 
     def release_receive(self, direction, microbatch):
         self.received.remove((direction, microbatch))
+
+    def release_receive_buffer(self, direction, microbatch, _buffer_index):
+        # Reference transport has no buffer ownership model.
+        del direction, microbatch
 
     def post_send(self, _direction, _microbatch, _ops):
         pass
@@ -106,23 +120,28 @@ class ReferenceTransport:
 
 
 class FakeStage:
-    stage_index = 1
     is_first = False
     is_last = False
 
-    def __init__(self, log, fail_forward=None):
+    def __init__(self, log, fail_forward=None, *, stage_index=1, sparse=False):
         self.log = log
         self.fail_forward = fail_forward
+        self.stage_index = stage_index
+        self.receive_sparse_indices = sparse
         self.outputs = {}
         self.gradients = []
         self._fwd_buffers = [object() for _ in range(8)]
         self._bwd_buffers = [object() for _ in range(8)]
+        self._cache_buffers = [object()]
 
     def get_fwd_recv_ops(self, microbatch):
-        return [FakeOp("fwd_recv", microbatch, self._fwd_buffers[microbatch])]
+        ops = [FakeOp("fwd_recv", microbatch, self._fwd_buffers[microbatch % 8])]
+        if self.receive_sparse_indices:
+            ops.append(FakeOp("cache_recv", microbatch, self._cache_buffers[0]))
+        return ops
 
     def get_bwd_recv_ops(self, microbatch):
-        return [FakeOp("bwd_recv", microbatch, self._bwd_buffers[microbatch])]
+        return [FakeOp("bwd_recv", microbatch, self._bwd_buffers[microbatch % 8])]
 
     def forward_one_chunk(self, microbatch, args, _kwargs, save_forward_output=True):
         self.log.append(("forward", microbatch))
@@ -147,13 +166,14 @@ class FakeStage:
 
 
 class FakeSchedule:
-    _n_microbatches = 5
-    _num_microbatches = 5
     _num_stages = 4
     scale_grads = False
 
-    def __init__(self, stage):
+    def __init__(self, stage, n_microbatches=5, *, num_stages=4):
         self._stage = stage
+        self._n_microbatches = n_microbatches
+        self._num_microbatches = n_microbatches
+        self._num_stages = num_stages
         self.losses = []
         self.updated_losses = None
 
@@ -180,13 +200,17 @@ class AsyncP2PStateTest(unittest.TestCase):
         first_buffer = object()
         transport.prepost_receive("fwd", 0, [FakeOp("recv", 0, first_buffer)])
         transport.prepost_receive("fwd", 1, [FakeOp("recv", 1, object())])
-        with self.assertRaisesRegex(RuntimeError, "window exceeded"):
+        self.assertFalse(
             transport.prepost_receive("fwd", 2, [FakeOp("recv", 2, first_buffer)])
+        )
         transport.wait_receive("fwd", 0)
-        with self.assertRaisesRegex(RuntimeError, "still owned"):
+        self.assertFalse(
             transport.prepost_receive("fwd", 2, [FakeOp("recv", 2, first_buffer)])
+        )
         transport.release_receive("fwd", 0)
-        transport.prepost_receive("fwd", 2, [FakeOp("recv", 2, first_buffer)])
+        self.assertTrue(
+            transport.prepost_receive("fwd", 2, [FakeOp("recv", 2, first_buffer)])
+        )
         self.assertEqual(transport.state.max_pending_receives["fwd"], 2)
         self.assertEqual(
             log[:2], [("post_recv", (("recv", 0),)), ("post_recv", (("recv", 1),))]
@@ -265,6 +289,64 @@ class AsyncP2PStateTest(unittest.TestCase):
         )
         self.assertLessEqual(async_transport.state.max_pending_sends, 2)
 
+    def test_stage_one_to_six_64_microbatch_wraparound_and_sparse_ring(self):
+        """All non-edge PP8 stages preserve 1F1B order across ring wraparound."""
+        for stage_index in range(1, 7):
+            async_stage = FakeStage([], stage_index=stage_index)
+            async_schedule = FakeSchedule(async_stage, 64, num_stages=8)
+            async_transport = FakeTransport(self.module, [], fwd_window=2, bwd_window=1)
+            self.module.run_1f1b_async_step(
+                async_schedule,
+                async_transport,
+                list(range(64)),
+                [{} for _ in range(64)],
+                [0] * 64,
+                [],
+                True,
+            )
+            reference_stage = FakeStage([], stage_index=stage_index)
+            reference_schedule = FakeSchedule(reference_stage, 64, num_stages=8)
+            self.module.run_1f1b_async_step(
+                reference_schedule,
+                ReferenceTransport(),
+                list(range(64)),
+                [{} for _ in range(64)],
+                [0] * 64,
+                [],
+                True,
+            )
+            self.assertEqual(async_stage.outputs, reference_stage.outputs)
+            self.assertEqual(async_stage.gradients, reference_stage.gradients)
+            self.assertLessEqual(async_transport.state.max_pending_receives["fwd"], 2)
+            self.assertLessEqual(async_transport.state.max_pending_receives["bwd"], 1)
+
+        sparse_log = []
+        sparse_stage = FakeStage(sparse_log, stage_index=3, sparse=True)
+        sparse_schedule = FakeSchedule(sparse_stage, 64, num_stages=8)
+        sparse_transport = FakeTransport(self.module, sparse_log, fwd_window=1, bwd_window=1)
+        self.module.run_1f1b_async_step(
+            sparse_schedule,
+            sparse_transport,
+            list(range(64)),
+            [{} for _ in range(64)],
+            [0] * 64,
+            [],
+            True,
+        )
+        self.assertEqual(sparse_transport.state.max_pending_receives["fwd"], 1)
+        cache_posts = [
+            item
+            for item in sparse_log
+            if item[0] == "post_recv"
+            and any(op[0] == "cache_recv" for op in item[1])
+        ]
+        self.assertEqual(len(cache_posts), 64)
+        for left, right in zip(cache_posts, cache_posts[1:]):
+            self.assertLessEqual(
+                sparse_log.index(left) + 1,
+                sparse_log.index(right),
+            )
+
     def test_error_cleans_all_outstanding_work(self):
         log = []
         stage = FakeStage(log, fail_forward=1)
@@ -296,14 +378,40 @@ class AsyncP2PStateTest(unittest.TestCase):
         self.assertIn('"1f1b_async"', config_source)
         self.assertNotIn('pp_schedule = "1f1b_async"', runner_source)
 
+    def test_sparse_receive_lookahead_is_one(self):
+        stage = FakeStage([], sparse=True)
+        self.assertEqual(self.module.receive_window_for_stage(stage, "fwd"), 1)
+        stage.receive_sparse_indices = False
+        stage._forward_slot_count = 2
+        self.assertEqual(self.module.receive_window_for_stage(stage, "fwd"), 2)
+
+    def test_live_stage_ring_slot_is_deferred(self):
+        stage = FakeStage([])
+        stage._forward_slot_by_key = {(stage.stage_index, 0): 0, (stage.stage_index, 8): 0}
+        stage._forward_slot_owner = [(stage.stage_index, 0)]
+        stage._forward_events = [None]
+        self.assertFalse(self.module._stage_receive_slot_available(stage, "fwd", 8))
+        stage._forward_events[0] = object()
+        self.assertTrue(self.module._stage_receive_slot_available(stage, "fwd", 8))
+
+    def test_async_topology_guard_is_fail_closed(self):
+        runner_source = (SOURCE / "src/prime_rl/trainer/distributed/pp_runner.py").read_text()
+        self.assertIn("validate_async_topology", runner_source)
+        self.assertIn('"cutoff": 5', runner_source)
+        self.assertIn('"pp_limit_receive_buffers": True', runner_source)
+        self.assertIn("if not limit_receive_buffers or pp_size != 8", runner_source)
+
     def test_cuda_transport_uses_explicit_stream_dependencies(self):
         source = MODULE_PATH.read_text()
         self.assertIn("torch.cuda.Stream(device=stage.device)", source)
         self.assertIn("with self._torch.cuda.stream(self._stream)", source)
         self.assertIn("self._stream.wait_event(ready)", source)
-        self.assertIn("current_stream().wait_event(pending.event)", source)
+        self.assertIn("work.wait()", source)
+        receive_body = source.split("    def _post_receive", 1)[1].split(
+            "    def _post_send", 1
+        )[0]
+        self.assertNotIn("event.record", receive_body)
 
 
 if __name__ == "__main__":
     unittest.main()
-

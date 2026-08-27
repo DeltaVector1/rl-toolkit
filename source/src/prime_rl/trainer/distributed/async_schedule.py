@@ -21,6 +21,53 @@ from typing import Any, Callable, Iterable
 MAX_P2P_WINDOW = 2
 
 
+def receive_window_for_stage(stage: Any, direction: str) -> int:
+    """Return a safe receive lookahead for a PipelineStage ring.
+
+    Sparse index cache receives use one slot.  A cache tensor is consumed by
+    the stage forward and can still be referenced by its backward recompute;
+    posting two cache receives would therefore overwrite a live slot.
+    """
+    if direction not in ("fwd", "bwd"):
+        raise ValueError(f"unknown P2P direction {direction!r}")
+    if direction == "fwd" and bool(getattr(stage, "receive_sparse_indices", False)):
+        return 1
+    count_attr = "_forward_slot_count" if direction == "fwd" else "_backward_slot_count"
+    return min(MAX_P2P_WINDOW, max(1, int(getattr(stage, count_attr, MAX_P2P_WINDOW))))
+
+
+def _stage_receive_slot_available(stage: Any, direction: str, microbatch: int) -> bool:
+    """Check all receive rings before asking NCCL to write into a slot.
+
+    PipelineStage owns these rings.  The event/owner fields are intentionally
+    queried rather than inferred from microbatch modulo arithmetic, because a
+    slot remains live after communication completion until backward consumes it.
+    """
+    suffix = "forward" if direction == "fwd" else "backward"
+    key = (stage.stage_index, int(microbatch))
+    rings = [(f"_{suffix}_slot_by_key", f"_{suffix}_slot_owner", f"_{suffix}_events")]
+    if direction == "fwd":
+        rings.append(
+            ("_sparse_cache_slot_by_key", "_sparse_cache_slot_owner", "_sparse_cache_events")
+        )
+    for mapping_name, owner_name, events_name in rings:
+        if mapping_name is None:
+            continue
+        mapping = getattr(stage, mapping_name, None)
+        owners = getattr(stage, owner_name, None)
+        if mapping is None or owners is None:
+            continue
+        slot = mapping.get(key)
+        if slot is None:
+            continue
+        if owners[slot] is not None and (
+            getattr(stage, events_name, None) is None
+            or getattr(stage, events_name)[slot] is None
+        ):
+            return False
+    return True
+
+
 @dataclass
 class _PendingReceive:
     key: tuple[str, int]
@@ -96,16 +143,14 @@ class AsyncP2PState:
         ops: Iterable[Any],
         *,
         buffer: Any = None,
-    ) -> None:
-        """Post one receive and retain its token until the tensor is used."""
+    ) -> bool:
+        """Post one receive, or defer it when its ring slot is still live."""
         key = self._key(direction, microbatch)
         pending = self._receives[direction]
         if key[1] in pending or key in self._received_keys:
             raise RuntimeError(f"duplicate {direction} receive for microbatch {key[1]}")
         if len(pending) >= self.max_window[direction]:
-            raise RuntimeError(
-                f"{direction} receive window exceeded {self.max_window[direction]} entries"
-            )
+            return False
         op_list = list(ops)
         if buffer is None:
             # ``dist.P2POp`` has a public ``tensor`` field.  Record every
@@ -116,7 +161,7 @@ class AsyncP2PState:
                 for tensor in (getattr(op, "tensor", None) for op in op_list)
                 if tensor is not None
             )
-        elif buffer:
+        elif buffer is not None:
             if isinstance(buffer, int):
                 buffer_ids = (buffer,)
             elif isinstance(buffer, (tuple, list, set)):
@@ -129,16 +174,27 @@ class AsyncP2PState:
             for buffer_id in buffer_ids:
                 owner = self._receive_buffer_owner.get(buffer_id)
                 if owner is not None:
-                    raise RuntimeError(
-                        f"receive buffer is still owned by {owner[0]}:{owner[1]}"
-                    )
+                    return False
                 self._receive_buffer_owner[buffer_id] = key
-        token = self._post_receive(op_list) if op_list else None
+        try:
+            token = self._post_receive(op_list) if op_list else None
+        except BaseException:
+            for buffer_id in buffer_ids:
+                if self._receive_buffer_owner.get(buffer_id) == key:
+                    del self._receive_buffer_owner[buffer_id]
+            raise
         pending[key[1]] = _PendingReceive(key, token, buffer_ids)
         self._receive_order[direction].append(key[1])
         self.max_pending_receives[direction] = max(
             self.max_pending_receives[direction], len(pending)
         )
+        return True
+
+    def receive_capacity_available(self, direction: str) -> bool:
+        """Report window capacity before PipelineStage constructs receive ops."""
+        if direction not in ("fwd", "bwd"):
+            raise ValueError(f"unknown P2P direction {direction!r}")
+        return len(self._receives[direction]) < self.max_window[direction]
 
     def wait_receive(self, direction: str, microbatch: int) -> None:
         """Wait for a receive immediately before its stage tensor is read."""
@@ -171,6 +227,27 @@ class AsyncP2PState:
         for buffer_id in item.buffer or ():
             if self._receive_buffer_owner.get(buffer_id) == key:
                 del self._receive_buffer_owner[buffer_id]
+
+    def release_receive_buffer(
+        self, direction: str, microbatch: int, buffer_index: int
+    ) -> None:
+        """Release one receive tensor while retaining other tensors in a P2P op."""
+        key = self._key(direction, microbatch)
+        item = self._completed_receives[direction].get(key[1])
+        if item is None:
+            raise RuntimeError(f"{direction} receive {key[1]} was not completed")
+        buffers = item.buffer or ()
+        try:
+            buffer_id = buffers[buffer_index]
+        except IndexError as exc:
+            raise RuntimeError(
+                f"{direction} receive {key[1]} has no buffer {buffer_index}"
+            ) from exc
+        if self._receive_buffer_owner.get(buffer_id) == key:
+            del self._receive_buffer_owner[buffer_id]
+        item.buffer = tuple(
+            value for index, value in enumerate(buffers) if index != buffer_index
+        )
 
     def post_send(
         self,
@@ -262,32 +339,8 @@ class CudaAsyncP2P:
         self._stream = torch.cuda.Stream(device=stage.device)
         if max_window is None:
             max_window = {
-                "fwd": min(
-                    MAX_P2P_WINDOW,
-                    max(
-                        1,
-                        int(
-                            getattr(
-                                stage,
-                                "_forward_slot_count",
-                                MAX_P2P_WINDOW,
-                            )
-                        ),
-                    ),
-                ),
-                "bwd": min(
-                    MAX_P2P_WINDOW,
-                    max(
-                        1,
-                        int(
-                            getattr(
-                                stage,
-                                "_backward_slot_count",
-                                MAX_P2P_WINDOW,
-                            )
-                        ),
-                    ),
-                ),
+                direction: receive_window_for_stage(stage, direction)
+                for direction in ("fwd", "bwd")
             }
         self._state = AsyncP2PState(
             self._post_receive,
@@ -311,9 +364,9 @@ class CudaAsyncP2P:
     def _post_receive(self, ops: list[Any]) -> _CudaPending:
         with self._torch.cuda.stream(self._stream):
             works = self._dist.batch_isend_irecv(ops)
-            event = self._torch.cuda.Event()
-            event.record(self._stream)
-        return _CudaPending(list(works), event)
+        # An event recorded at post time is not a receive-completion event.
+        # Work.wait below is the only completion boundary used by this path.
+        return _CudaPending(list(works))
 
     def _post_send(self, ops: list[Any]) -> _CudaPending:
         # The send tensor is produced on the default compute stream.  Make the
@@ -327,12 +380,9 @@ class CudaAsyncP2P:
         return _CudaPending(list(works))
 
     def _wait_receive(self, pending: _CudaPending) -> None:
-        # Work.wait surfaces transport errors.  The event adds an explicit
-        # compute-stream dependency, including for backends whose Work.wait is
-        # host-only.
+        # Work.wait surfaces transport errors and establishes the read boundary.
         for work in pending.works:
             work.wait()
-        self._torch.cuda.current_stream().wait_event(pending.event)
 
     @staticmethod
     def _wait_send(pending: _CudaPending) -> None:
@@ -341,14 +391,22 @@ class CudaAsyncP2P:
 
     def prepost_receive(
         self, direction: str, microbatch: int, ops: Iterable[Any], *, buffer=None
-    ) -> None:
-        self._state.prepost_receive(direction, microbatch, ops, buffer=buffer)
+    ) -> bool:
+        return self._state.prepost_receive(direction, microbatch, ops, buffer=buffer)
+
+    def receive_capacity_available(self, direction: str) -> bool:
+        return self._state.receive_capacity_available(direction)
 
     def wait_receive(self, direction: str, microbatch: int) -> None:
         self._state.wait_receive(direction, microbatch)
 
     def release_receive(self, direction: str, microbatch: int) -> None:
         self._state.release_receive(direction, microbatch)
+
+    def release_receive_buffer(
+        self, direction: str, microbatch: int, buffer_index: int
+    ) -> None:
+        self._state.release_receive_buffer(direction, microbatch, buffer_index)
 
     def post_send(self, direction: str, microbatch: int, ops: Iterable[Any]) -> None:
         self._state.post_send(direction, microbatch, ops)
@@ -383,19 +441,31 @@ def _run_1f1b_async_step(
     posted_fwd: set[int] = set()
     posted_bwd: set[int] = set()
 
-    def post_fwd(microbatch: int) -> None:
+    def post_fwd(microbatch: int) -> bool:
         if stage.is_first or microbatch in posted_fwd:
-            return
+            return True
+        if not _stage_receive_slot_available(stage, "fwd", microbatch):
+            return False
+        if hasattr(transport, "receive_capacity_available") and not transport.receive_capacity_available("fwd"):
+            return False
         ops = stage.get_fwd_recv_ops(microbatch)
-        transport.prepost_receive("fwd", microbatch, ops)
+        if not transport.prepost_receive("fwd", microbatch, ops):
+            return False
         posted_fwd.add(microbatch)
+        return True
 
-    def post_bwd(microbatch: int) -> None:
+    def post_bwd(microbatch: int) -> bool:
         if stage.is_last or microbatch in posted_bwd:
-            return
+            return True
+        if not _stage_receive_slot_available(stage, "bwd", microbatch):
+            return False
+        if hasattr(transport, "receive_capacity_available") and not transport.receive_capacity_available("bwd"):
+            return False
         ops = stage.get_bwd_recv_ops(microbatch)
-        transport.prepost_receive("bwd", microbatch, ops)
+        if not transport.prepost_receive("bwd", microbatch, ops):
+            return False
         posted_bwd.add(microbatch)
+        return True
 
     def prime_fwd(next_mb: int) -> None:
         if stage.is_first:
@@ -407,7 +477,10 @@ def _run_1f1b_async_step(
         )
         for microbatch in range(next_mb, min(n_microbatches, next_mb + window)):
             if microbatch not in posted_fwd:
-                post_fwd(microbatch)
+                # A live ring slot defers lookahead.  The current microbatch
+                # is checked again at its use boundary below.
+                if not post_fwd(microbatch):
+                    break
 
     def prime_bwd(next_mb: int) -> None:
         if stage.is_last:
@@ -419,12 +492,28 @@ def _run_1f1b_async_step(
         )
         for microbatch in range(next_mb, min(n_microbatches, next_mb + window)):
             if microbatch not in posted_bwd:
-                post_bwd(microbatch)
+                if not post_bwd(microbatch):
+                    break
+
+    def release_sparse_cache(microbatch: int) -> None:
+        if (
+            not stage.is_first
+            and bool(getattr(stage, "receive_sparse_indices", False))
+            and hasattr(transport, "release_receive_buffer")
+        ):
+            # get_fwd_recv_ops orders hidden state before the sparse cache.
+            # The cache is read by forward only, unlike hidden state which is
+            # retained until its backward, so release its ring slot now.
+            transport.release_receive_buffer("fwd", microbatch, 1)
 
     # Warmup.
     for _ in range(warmup_chunks):
         prime_fwd(fwd_mb_index)
         if not stage.is_first:
+            if fwd_mb_index not in posted_fwd and not post_fwd(fwd_mb_index):
+                raise RuntimeError(
+                    f"fwd receive {fwd_mb_index} ring slot is still live at tensor use"
+                )
             transport.wait_receive("fwd", fwd_mb_index)
         output = stage.forward_one_chunk(
             fwd_mb_index,
@@ -433,6 +522,7 @@ def _run_1f1b_async_step(
             save_forward_output=return_outputs,
         )
         transport.post_send("fwd", fwd_mb_index, stage.get_fwd_send_ops(fwd_mb_index))
+        release_sparse_cache(fwd_mb_index)
         schedule._maybe_compute_loss(stage, output, target_mbs, fwd_mb_index)
         fwd_mb_index += 1
 
@@ -440,6 +530,10 @@ def _run_1f1b_async_step(
     while True:
         prime_bwd(bwd_mb_index)
         if not stage.is_last:
+            if bwd_mb_index not in posted_bwd and not post_bwd(bwd_mb_index):
+                raise RuntimeError(
+                    f"bwd receive {bwd_mb_index} ring slot is still live at tensor use"
+                )
             transport.wait_receive("bwd", bwd_mb_index)
         loss = schedule._maybe_get_loss(stage, bwd_mb_index)
         stage.backward_one_chunk(
@@ -459,6 +553,10 @@ def _run_1f1b_async_step(
 
         prime_fwd(fwd_mb_index)
         if not stage.is_first:
+            if fwd_mb_index not in posted_fwd and not post_fwd(fwd_mb_index):
+                raise RuntimeError(
+                    f"fwd receive {fwd_mb_index} ring slot is still live at tensor use"
+                )
             transport.wait_receive("fwd", fwd_mb_index)
         output = stage.forward_one_chunk(
             fwd_mb_index,
@@ -467,6 +565,7 @@ def _run_1f1b_async_step(
             save_forward_output=return_outputs,
         )
         transport.post_send("fwd", fwd_mb_index, stage.get_fwd_send_ops(fwd_mb_index))
+        release_sparse_cache(fwd_mb_index)
         schedule._maybe_compute_loss(stage, output, target_mbs, fwd_mb_index)
         fwd_mb_index += 1
 
@@ -474,6 +573,10 @@ def _run_1f1b_async_step(
     while bwd_mb_index < n_microbatches:
         prime_bwd(bwd_mb_index)
         if not stage.is_last:
+            if bwd_mb_index not in posted_bwd and not post_bwd(bwd_mb_index):
+                raise RuntimeError(
+                    f"bwd receive {bwd_mb_index} ring slot is still live at tensor use"
+                )
             transport.wait_receive("bwd", bwd_mb_index)
         loss = schedule._maybe_get_loss(stage, bwd_mb_index)
         stage.backward_one_chunk(
@@ -584,4 +687,3 @@ def estimate_extra_buffer_bytes(
     if sparse_shape is not None:
         per_slot += numel(sparse_shape) * int(sparse_element_size)
     return 2 * int(slots_per_direction) * per_slot
-

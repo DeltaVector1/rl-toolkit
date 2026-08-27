@@ -2366,6 +2366,22 @@ def _train_impl(config: TrainerConfig):
                     else _example_outputs[0]
                 ),
                 limit_receive_buffers=config.model.pp_limit_receive_buffers,
+                async_topology=(
+                    {
+                        "pp_limit_receive_buffers": config.model.pp_limit_receive_buffers,
+                        "pp": parallel_dims.pp,
+                        "cp": parallel_dims.cp,
+                        "ep": parallel_dims.ep,
+                        "base_schedule": "1f1b",
+                        "cutoff": (
+                            config.ac.keep_routed_expert_activations_from_pp_stage
+                            if config.ac is not None
+                            else None
+                        ),
+                    }
+                    if config.model.pp_schedule == "1f1b_async"
+                    else None
+                ),
             )
             # FSDP must be initialised before the schedule issues its first
             # prefetch, which happens before any forward on some stages.

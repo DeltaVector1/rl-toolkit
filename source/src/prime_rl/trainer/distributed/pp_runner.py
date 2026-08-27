@@ -44,6 +44,30 @@ def minimum_pipeline_microbatches(schedule_name: str, pp_size: int) -> int:
     )
 
 
+def validate_async_topology(topology: Mapping[str, Any] | None) -> None:
+    """Fail closed unless the measured PP8 candidate topology is active."""
+    expected = {
+        "pp_limit_receive_buffers": True,
+        "pp": 8,
+        "cp": 8,
+        "ep": 8,
+        "base_schedule": "1f1b",
+        "cutoff": 5,
+    }
+    if topology is None:
+        raise ValueError("1f1b_async requires the exact PP8/CP8/EP8 cutoff5 topology")
+    mismatches = {
+        key: (expected[key], topology.get(key))
+        for key in expected
+        if topology.get(key) != expected[key]
+    }
+    if mismatches:
+        raise ValueError(
+            "1f1b_async is enabled only for the exact PP8/CP8/EP8/1f1b/cutoff5 "
+            f"topology; mismatches={mismatches}"
+        )
+
+
 def validate_interleaved_microbatches(num_microbatches: int, pp_size: int) -> int:
     """Validate an interleaved batch and return its round count.
 
@@ -1096,6 +1120,7 @@ def build_schedule(
     example_input=None,
     example_output=None,
     limit_receive_buffers: bool = False,
+    async_topology: Mapping[str, Any] | None = None,
 ):
     """Wrap ``stage_module`` in a PipelineStage and pick a schedule.
 
@@ -1116,6 +1141,12 @@ def build_schedule(
 
     install_pp_phase_hooks()
 
+    if schedule_name == "1f1b_async":
+        if not limit_receive_buffers or pp_size != 8:
+            raise ValueError(
+                "1f1b_async requires pp_limit_receive_buffers and PP size 8"
+            )
+        validate_async_topology(async_topology)
     stage_modules = list(stage_module) if isinstance(stage_module, (list, tuple)) else [stage_module]
     if schedule_name == "interleaved_1f1b" and len(stage_modules) != 2:
         raise ValueError("interleaved_1f1b requires exactly two local pipeline stages")
