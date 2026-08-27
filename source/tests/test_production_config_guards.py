@@ -238,6 +238,22 @@ def test_glm52_memory_qualification_mounts_synthetic_cuda_gate_only() -> None:
     assert source not in (ROOT / "scripts/h200/start_orchestrator.sh").read_text()
 
 
+def test_glm52_memory_qualification_pins_bf16_combine_rounds() -> None:
+    operations = _load("configs/operations.toml")
+    memory = operations["profiles"]["glm52-native-b2048-memory"]
+    assert memory["launch_env"]["PRIME_BF16_COMBINE_ROUNDS"] == "8"
+    for name, profile in operations["profiles"].items():
+        if name != "glm52-native-b2048-memory":
+            assert "PRIME_BF16_COMBINE_ROUNDS" not in profile.get("launch_env", {})
+    config = _load(memory["trainer"])
+    assert config["env_vars"]["PRIME_BF16_COMBINE_ROUNDS"] == "8"
+    launcher = (ROOT / "scripts/china/cluster.sh").read_text()
+    assert 'env_vars.get("PRIME_BF16_COMBINE_ROUNDS", "")' in launcher
+    assert 'configured_bf16_combine_rounds' in launcher
+    assert '"${bf16_combine_env[@]}"' in launcher
+    assert '-e "PRIME_BF16_COMBINE_ROUNDS=${configured_bf16_combine_rounds}"' in launcher
+
+
 def test_glm52_production_profiles_disable_cuda_profiling() -> None:
     profiling_names = {
         "PRIME_PROFILE_PP_STAGE": "1",

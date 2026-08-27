@@ -69,6 +69,7 @@ def test_b2048_memory_profile_has_strict_rank_zero_step_one_capture() -> None:
             "/data/glm52-rl/qualifications/glm52-native-b2048-memory/"
             "cuda-memory-capture.json"
         ),
+        "PRIME_BF16_COMBINE_ROUNDS": "8",
     }
     assert profile == {
         "kind": "glm52",
@@ -90,6 +91,10 @@ def test_b2048_memory_profile_has_strict_rank_zero_step_one_capture() -> None:
     sys.modules[spec.name] = training_ops
     spec.loader.exec_module(training_ops)
     assert training_ops._qualification_launch_env(profile) == capture
+    assert capture["PRIME_BF16_COMBINE_ROUNDS"] == "8"
+    for name, other in operations["profiles"].items():
+        if name != "glm52-native-b2048-memory":
+            assert "PRIME_BF16_COMBINE_ROUNDS" not in other.get("launch_env", {})
     gate = "source/tests/test_final_pp16_cuda.py"
     assert gate not in training_ops.mounted_files()
     assert gate not in training_ops._qualification_source_paths("glm52-native-b2048")

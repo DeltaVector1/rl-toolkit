@@ -20,6 +20,7 @@ nsys_env=()
 nsys_mounts=()
 qualification_test_mounts=()
 cuda_memory_env=()
+bf16_combine_env=()
 # RUN selects which config pair under configs/china to use and where logs land.
 # Defaults keep the historical r33 layout.
 RUN=${RUN:-r33}
@@ -179,7 +180,7 @@ case ${1:-} in
         echo "Nsight disabled on n$node; capture owner is n$capture_node rank $capture_rank"
       fi
     fi
-    IFS='|' read -r rollout_transport trainer_output trainer_only parity_trace_dir parity_trace_source parity_pp parity_cp parity_batch parity_max_calls parity_max_files parity_max_bytes parity_diagnostics parity_diagnostic_tokens parity_diagnostic_max_files parity_diagnostic_max_bytes configured_int4_combine_rounds configured_fp8_expert_activation_offload configured_lora_mm_profile configured_profile_requested configured_profile_pp_stage configured_ep_profile configured_ep_profile_every configured_expert_profile_every configured_layer_profile_every configured_expert_phase_profile configured_expert_phase_profile_every configured_phase_profile configured_phase_profile_steps configured_phase_profile_sample_every < <(
+    IFS='|' read -r rollout_transport trainer_output trainer_only parity_trace_dir parity_trace_source parity_pp parity_cp parity_batch parity_max_calls parity_max_files parity_max_bytes parity_diagnostics parity_diagnostic_tokens parity_diagnostic_max_files parity_diagnostic_max_bytes configured_int4_combine_rounds configured_bf16_combine_rounds configured_fp8_expert_activation_offload configured_lora_mm_profile configured_profile_requested configured_profile_pp_stage configured_ep_profile configured_ep_profile_every configured_expert_profile_every configured_layer_profile_every configured_expert_phase_profile configured_expert_phase_profile_every configured_phase_profile configured_phase_profile_steps configured_phase_profile_sample_every < <(
       python3 - "$trainer_config" <<'PY'
 import sys
 import tomllib
@@ -194,6 +195,7 @@ model = config.get("model", {})
 fake = data.get("fake", {})
 memory_env = (
     env_vars.get("PRIME_INT4_COMBINE_ROUNDS", ""),
+    env_vars.get("PRIME_BF16_COMBINE_ROUNDS", ""),
     env_vars.get("PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD", ""),
     env_vars.get("PRIME_LORA_MM_PROFILE", ""),
 )
@@ -267,6 +269,26 @@ PY
     else
       int4_combine_rounds="${PRIME_INT4_COMBINE_ROUNDS:-1}"
       fp8_expert_activation_offload="${PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD:-0}"
+    fi
+    if [ -n "$configured_bf16_combine_rounds" ]; then
+      [ "${PRIME_QUALIFICATION_PROFILE:-}" = "glm52-native-b2048-memory" ] || {
+        echo "PRIME_BF16_COMBINE_ROUNDS may only be configured by the GLM b2048 memory qualification profile" >&2
+        exit 1
+      }
+      [ "$configured_bf16_combine_rounds" = "8" ] || {
+        echo "GLM memory qualification must pin PRIME_BF16_COMBINE_ROUNDS=8" >&2
+        exit 1
+      }
+      [ "${PRIME_BF16_COMBINE_ROUNDS:-}" = "$configured_bf16_combine_rounds" ] || {
+        echo "PRIME_BF16_COMBINE_ROUNDS must match the memory qualification config" >&2
+        exit 1
+      }
+      bf16_combine_env=(
+        -e "PRIME_BF16_COMBINE_ROUNDS=${configured_bf16_combine_rounds}"
+      )
+    elif [ -n "${PRIME_BF16_COMBINE_ROUNDS:-}" ]; then
+      echo "PRIME_BF16_COMBINE_ROUNDS must be declared by the GLM b2048 memory qualification profile" >&2
+      exit 1
     fi
     case "${configured_lora_mm_profile:-legacy}" in
       auto|legacy|sm89-r32) lora_mm_profile="${configured_lora_mm_profile:-legacy}" ;;
@@ -673,6 +695,7 @@ PY
       "${nsys_mounts[@]}" \
       "${qualification_test_mounts[@]}" \
       "${cuda_memory_env[@]}" \
+      "${bf16_combine_env[@]}" \
       -e TMPDIR=/scratch-tmp \
       -e PRIME_ADAPTER_DELTA="${PRIME_ADAPTER_DELTA:-0}" \
       -e PYTHONPATH="$deployment/env":/app/packages/prime-rl-configs/src:/app/src \

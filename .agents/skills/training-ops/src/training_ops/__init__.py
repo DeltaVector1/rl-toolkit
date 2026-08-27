@@ -390,6 +390,7 @@ _QUALIFICATION_LAUNCH_ENV_PATTERNS = {
         r"/data/glm52-rl/qualifications/glm52-native-b2048-memory/"
         r"cuda-memory-capture\.json"
     ),
+    "PRIME_BF16_COMBINE_ROUNDS": re.compile(r"8"),
 }
 
 _CUDA_MEMORY_CAPTURE_PROFILE = "glm52-native-b2048-memory"
@@ -409,6 +410,14 @@ _CUDA_MEMORY_CAPTURE_ENV = {
         "/data/glm52-rl/qualifications/glm52-native-b2048-memory/"
         "cuda-memory-capture.json"
     ),
+}
+
+_BF16_COMBINE_ROUNDS_PROFILE = "glm52-native-b2048-memory"
+_BF16_COMBINE_ROUNDS_KEYS = frozenset({"PRIME_BF16_COMBINE_ROUNDS"})
+_BF16_COMBINE_ROUNDS_ENV = {"PRIME_BF16_COMBINE_ROUNDS": "8"}
+_MEMORY_PROFILE_LAUNCH_ENV = {
+    **_CUDA_MEMORY_CAPTURE_ENV,
+    **_BF16_COMBINE_ROUNDS_ENV,
 }
 
 _NSYS_QUALIFICATION_PROFILE = "glm52-native-b2048-nsys"
@@ -10619,11 +10628,23 @@ def _qualify_connected(
     selected = _profile(name)
     launch_env = _qualification_launch_env(selected)
     memory_keys = set(launch_env) & _CUDA_MEMORY_CAPTURE_KEYS
-    if name == _CUDA_MEMORY_CAPTURE_PROFILE and launch_env != _CUDA_MEMORY_CAPTURE_ENV:
-        raise Refused("CUDA memory capture profile is not pinned to rank 0 step 1")
+    bf16_combine_keys = set(launch_env) & _BF16_COMBINE_ROUNDS_KEYS
+    if name == _CUDA_MEMORY_CAPTURE_PROFILE and launch_env != _MEMORY_PROFILE_LAUNCH_ENV:
+        raise Refused(
+            "CUDA memory profile is not pinned to rank 0 step 1 and BF16 rounds 8"
+        )
     if memory_keys and name != _CUDA_MEMORY_CAPTURE_PROFILE:
         raise Refused(
             "CUDA memory capture is only allowed by the b2048 memory profile"
+        )
+    if name == _BF16_COMBINE_ROUNDS_PROFILE:
+        if launch_env.get("PRIME_BF16_COMBINE_ROUNDS") != "8":
+            raise Refused(
+                "BF16 combine rounds must be pinned to 8 in the b2048 memory profile"
+            )
+    elif bf16_combine_keys:
+        raise Refused(
+            "BF16 combine rounds are only allowed by the b2048 memory profile"
         )
     selected_trainer_container = _profile_trainer_container(selected)
     if "orchestrator" in selected:
