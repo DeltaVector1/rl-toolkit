@@ -2379,8 +2379,8 @@ def _train_impl(config: TrainerConfig):
                         "ep": parallel_dims.ep,
                         "base_schedule": "1f1b",
                         "cutoff": (
-                            config.ac.keep_routed_expert_activations_from_pp_stage
-                            if config.ac is not None
+                            config.model.ac.keep_routed_expert_activations_from_pp_stage
+                            if config.model.ac is not None
                             else None
                         ),
                     }

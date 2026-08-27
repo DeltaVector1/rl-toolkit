@@ -1,7 +1,9 @@
-"""Static checks for the isolated full-shape asynchronous PP qualification."""
+"""Checks for the isolated full-shape asynchronous PP qualification."""
 
+import ast
 import tomllib
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -105,3 +107,35 @@ def test_async_profile_is_allowlisted_and_validated_before_setup() -> None:
     assert train.index("config.model.validate_async_1f1b_topology()") < train.index(
         "setup_torch_distributed("
     )
+
+
+def test_async_topology_runtime_uses_model_checkpoint_config() -> None:
+    """Exercise the schedule argument with the real TrainerConfig shape."""
+    train_path = ROOT / "source/src/prime_rl/trainer/rl/train.py"
+    tree = ast.parse(train_path.read_text())
+    expression = None
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        for keyword in node.keywords:
+            if keyword.arg == "async_topology":
+                expression = keyword.value
+                break
+        if expression is not None:
+            break
+    assert expression is not None
+
+    config = SimpleNamespace(
+        model=SimpleNamespace(
+            pp_schedule="1f1b_async",
+            pp_limit_receive_buffers=True,
+            ac=SimpleNamespace(keep_routed_expert_activations_from_pp_stage=5),
+        )
+    )
+    parallel_dims = SimpleNamespace(pp=8, cp=8, ep=8)
+    topology = eval(
+        compile(ast.Expression(expression), str(train_path), "eval"),
+        {"config": config, "parallel_dims": parallel_dims},
+    )
+    assert topology["cutoff"] == 5
+    assert topology["pp"] == topology["cp"] == topology["ep"] == 8
