@@ -3606,6 +3606,7 @@ raise SystemExit(99)
                     "PRIME_QUALIFICATION_STEP_DEADLINE_SECONDS": "900",
                     "PRIME_QUALIFICATION_PROFILER_FINALIZE_DEADLINE_SECONDS": "120",
                 },
+                "nsys_environment": {},
             }
 
         def run(mutation=None):
@@ -3670,6 +3671,126 @@ raise SystemExit(99)
                 RuntimeError, "qualification identity mismatch"
             ):
                 run(mutation)
+
+    def test_nsys_qualification_identity_is_pinned_to_rank24_and_n78(self):
+        nodes = ["n82", "n76", "n77", "n78", "n80", "n83", "n84", "n85"]
+        launch_env = {
+            "PRIME_NSYS_PROFILE": "1",
+            "PRIME_CUDA_PROFILE": "1",
+            "PRIME_CUDA_PROFILE_RANK": "24",
+            "PRIME_CUDA_PROFILE_STEPS": "2",
+        }
+        output_dir = "/data/glm52-rl/qualifications/glm52-native-b2048-nsys-20260827"
+        capture = training_ops._qualification_nsys_capture(
+            "glm52-native-b2048-nsys", launch_env, nodes, output_dir
+        )
+        self.assertEqual(capture.rank, 24)
+        self.assertEqual(capture.host, "n78")
+        self.assertEqual(capture.output, output_dir + "/nsys-rank-24")
+
+        observed = {
+            "PRIME_NSYS_BIN": (
+                "/opt/nvidia/nsight-systems/2025.5.2/"
+                "target-linux-x64/nsys"
+            ),
+            "PRIME_NSYS_VERSION": "NVIDIA Nsight Systems version 2025.5.2",
+            "PRIME_NSYS_OUTPUT": capture.output,
+            "PRIME_NSYS_SESSION": "glmkernel-r24-12345",
+        }
+        self.assertEqual(
+            training_ops._qualification_nsys_environment_mismatches(
+                observed, capture, "n78"
+            ),
+            [],
+        )
+        self.assertEqual(
+            training_ops._qualification_nsys_environment_mismatches(
+                observed, capture, "n76"
+            ),
+            ["Nsight environment keys"],
+        )
+        for key, value, mismatch in (
+            ("PRIME_NSYS_BIN", "/tmp/nsys", "Nsight binary"),
+            ("PRIME_NSYS_VERSION", "unknown", "Nsight version"),
+            ("PRIME_NSYS_OUTPUT", "/wrong/output", "Nsight output"),
+            ("PRIME_NSYS_SESSION", "bad session", "Nsight session"),
+        ):
+            with self.subTest(key=key):
+                invalid = dict(observed)
+                invalid[key] = value
+                self.assertIn(
+                    mismatch,
+                    " ".join(
+                        training_ops._qualification_nsys_environment_mismatches(
+                            invalid, capture, "n78"
+                        )
+                    ),
+                )
+
+        with self.assertRaisesRegex(
+            training_ops.Refused, "capture rank is not 24"
+        ):
+            training_ops._qualification_nsys_capture(
+                "glm52-native-b2048-nsys",
+                {**launch_env, "PRIME_CUDA_PROFILE_RANK": "25"},
+                nodes,
+                output_dir,
+            )
+        with self.assertRaisesRegex(
+            training_ops.Refused, "capture step is not 2"
+        ):
+            training_ops._qualification_nsys_capture(
+                "glm52-native-b2048-nsys",
+                {**launch_env, "PRIME_CUDA_PROFILE_STEPS": "3"},
+                nodes,
+                output_dir,
+            )
+        with self.assertRaisesRegex(
+            training_ops.Refused, "must run on n78"
+        ):
+            training_ops._qualification_nsys_capture(
+                "glm52-native-b2048-nsys",
+                launch_env,
+                ["n82", "n76", "n77", "n85", "n80", "n83", "n84", "n78"],
+                output_dir,
+            )
+
+    def test_nsys_environment_rejects_extra_or_missing_worker_metadata(self):
+        launch_env = {
+            "PRIME_NSYS_PROFILE": "1",
+            "PRIME_CUDA_PROFILE": "1",
+            "PRIME_CUDA_PROFILE_RANK": "24",
+            "PRIME_CUDA_PROFILE_STEPS": "2",
+        }
+        capture = training_ops._qualification_nsys_capture(
+            "glm52-native-b2048-nsys",
+            launch_env,
+            ["n82", "n76", "n77", "n78", "n80", "n83", "n84", "n85"],
+            "/data/glm52-rl/qualifications/glm52-native-b2048-nsys-20260827",
+        )
+        valid = {
+            "PRIME_NSYS_BIN": (
+                "/opt/nvidia/nsight-systems/2025.5.2/"
+                "target-linux-x64/nsys"
+            ),
+            "PRIME_NSYS_VERSION": "2025.5.2",
+            "PRIME_NSYS_OUTPUT": capture.output,
+            "PRIME_NSYS_SESSION": "glmkernel-r24-12345",
+        }
+        self.assertIn(
+            "Nsight environment keys",
+            training_ops._qualification_nsys_environment_mismatches(
+                {**valid, "PRIME_NSYS_EXTRA": "1"}, capture, "n78"
+            ),
+        )
+        self.assertIn(
+            "Nsight environment keys",
+            training_ops._qualification_nsys_environment_mismatches(
+                {key: value for key, value in valid.items() if key != "PRIME_NSYS_BIN"},
+                capture,
+                "n78",
+            ),
+        )
 
     def test_current_run_reports_absent_container(self):
         with patch.object(
@@ -3766,6 +3887,37 @@ raise SystemExit(99)
         self.assertEqual(result.run, "none")
         self.assertFalse(result.trainer_up)
         self.assertEqual(inspect_trainer.call_count, 1)
+
+    def test_status_resolves_configured_container_for_normal_and_qualification(self):
+        container_values = {
+            "trainer": "normal-trainer",
+            "glm52_qualification_trainer": "qualification-trainer",
+        }
+        for profile_name in ("current", "glm52-native-b2048"):
+            with self.subTest(profile=profile_name):
+                profile = training_ops._profile(profile_name)
+                expected = container_values[profile["trainer_container"]]
+                with patch.dict(training_ops.containers, container_values):
+                    with (
+                        patch.object(
+                            training_ops,
+                            "_trainer_container_config",
+                            side_effect=training_ops._TrainerContainerAbsent("absent"),
+                        ) as inspect_trainer,
+                        patch.object(training_ops, "_ssh", return_value=(0, "")),
+                        patch.object(training_ops, "_fan", return_value={}),
+                    ):
+                        result = training_ops.status(profile=profile_name, quiet=True)
+                self.assertEqual(result.run, "none")
+                inspect_trainer.assert_called_once_with(expected)
+
+    def test_profile_trainer_container_rejects_unconfigured_key(self):
+        with self.assertRaisesRegex(
+            training_ops.Refused, "not a configured container"
+        ):
+            training_ops._profile_trainer_container(
+                {"trainer_container": "missing"}
+            )
 
     def test_engines_do_not_require_an_active_trainer_after_stop(self):
         with (

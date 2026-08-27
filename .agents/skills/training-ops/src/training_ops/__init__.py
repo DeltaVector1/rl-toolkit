@@ -341,12 +341,145 @@ def _profile(name: str = "current") -> dict:
     return profile
 
 
+def _repository_root(name: str = "default") -> str:
+    """Resolve a configured repository name to its remote root."""
+    keys = {
+        "default": "remote_repository",
+        "glm52-qualification": "glm52_qualification_repository",
+    }
+    key = keys.get(name)
+    if key is None:
+        raise Refused(f"unknown repository {name!r}")
+    root = paths.get(key)
+    if not isinstance(root, str) or not root.startswith("/"):
+        raise Refused(f"repository {name!r} is missing from operations config")
+    return root.rstrip("/")
+
+
+def _profile_trainer_container(profile: dict) -> str:
+    """Resolve the configured trainer container for one profile."""
+    key = profile.get("trainer_container", "trainer")
+    if not isinstance(key, str) or key not in containers:
+        raise Refused(
+            f"profile trainer_container {key!r} is not a configured container"
+        )
+    container = containers[key]
+    if (
+        not isinstance(container, str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", container)
+    ):
+        raise Refused(f"configured trainer container {key!r} is invalid")
+    return container
+
+
+def _profile_trainer_repository(profile: dict) -> str:
+    """Resolve the configured repository used by a profile's trainer."""
+    qualification = profile.get("kind") == "glm52" and "orchestrator" not in profile
+    return _repository_root("glm52-qualification" if qualification else "default")
+
+
 _QUALIFICATION_LAUNCH_ENV_PATTERNS = {
     "PRIME_NSYS_PROFILE": re.compile(r"[01]"),
     "PRIME_CUDA_PROFILE": re.compile(r"[01]"),
     "PRIME_CUDA_PROFILE_RANK": re.compile(r"[0-9]+"),
     "PRIME_CUDA_PROFILE_STEPS": re.compile(r"(?:[2-9]|[1-9][0-9]+)"),
 }
+
+_NSYS_QUALIFICATION_PROFILE = "glm52-native-b2048-nsys"
+_NSYS_TRAINER_MODULE = "prime_rl.trainer.nsys_worker"
+_NSYS_ENV_KEYS = (
+    "PRIME_NSYS_BIN",
+    "PRIME_NSYS_VERSION",
+    "PRIME_NSYS_OUTPUT",
+    "PRIME_NSYS_SESSION",
+)
+_NSYS_BIN_PATTERN = re.compile(
+    r"/opt/nvidia/nsight-systems/[A-Za-z0-9][A-Za-z0-9._+-]*/"
+    r"target-linux[A-Za-z0-9._+-]*/nsys"
+)
+
+
+@dataclass(frozen=True)
+class _QualificationNsightCapture:
+    rank: int
+    host: str
+    output: str
+
+
+def _qualification_nsys_capture(
+    profile: str,
+    launch_env: dict[str, str],
+    nodes: list[str],
+    trainer_output: str,
+) -> _QualificationNsightCapture | None:
+    """Resolve the one allowed Nsight worker for a strict qualification."""
+    if profile != _NSYS_QUALIFICATION_PROFILE:
+        return None
+    if launch_env.get("PRIME_NSYS_PROFILE") != "1":
+        raise Refused("Nsight qualification profile is not enabled")
+    if launch_env.get("PRIME_CUDA_PROFILE") != "1":
+        raise Refused("Nsight qualification requires CUDA profiler capture")
+    if launch_env.get("PRIME_CUDA_PROFILE_RANK") != "24":
+        raise Refused("Nsight qualification capture rank is not 24")
+    if launch_env.get("PRIME_CUDA_PROFILE_STEPS") != "2":
+        raise Refused("Nsight qualification capture step is not 2")
+    try:
+        rank = int(launch_env["PRIME_CUDA_PROFILE_RANK"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise Refused("Nsight qualification capture rank is invalid") from error
+    node_index, local_rank = divmod(rank, 8)
+    if local_rank != 0 or node_index >= len(nodes):
+        raise Refused("Nsight qualification capture rank is outside the topology")
+    host = nodes[node_index]
+    if host != "n78":
+        raise Refused("Nsight qualification rank 24 must run on n78")
+    output = PurePosixPath(trainer_output)
+    if output.is_absolute() is False or ".." in output.parts:
+        raise Refused("Nsight qualification output directory is invalid")
+    return _QualificationNsightCapture(
+        rank=rank,
+        host=host,
+        output=str(output / f"nsys-rank-{rank}"),
+    )
+
+
+def _qualification_nsys_environment_mismatches(
+    observed: object,
+    capture: _QualificationNsightCapture | None,
+    host: str,
+) -> list[str]:
+    """Validate the dynamic Nsight environment and reject stray copies."""
+    if not isinstance(observed, dict):
+        return ["Nsight environment"]
+    expected_keys = set(_NSYS_ENV_KEYS) if capture is not None and host == capture.host else set()
+    mismatches = []
+    if set(observed) != expected_keys:
+        mismatches.append("Nsight environment keys")
+    if capture is None or host != capture.host:
+        return mismatches
+    binary = observed.get("PRIME_NSYS_BIN")
+    if (
+        not isinstance(binary, str)
+        or _NSYS_BIN_PATTERN.fullmatch(binary) is None
+        or ".." in PurePosixPath(binary).parts
+    ):
+        mismatches.append("Nsight binary")
+    version = observed.get("PRIME_NSYS_VERSION")
+    if (
+        not isinstance(version, str)
+        or len(version) > 256
+        or any(char in version for char in "\0\r\n")
+        or re.search(r"\b[0-9]+\.[0-9]+\.[0-9]+\b", version) is None
+    ):
+        mismatches.append("Nsight version")
+    if observed.get("PRIME_NSYS_OUTPUT") != capture.output:
+        mismatches.append("Nsight output")
+    if (
+        not isinstance(observed.get("PRIME_NSYS_SESSION"), str)
+        or re.fullmatch(r"glmkernel-r24-[0-9]+", observed["PRIME_NSYS_SESSION"]) is None
+    ):
+        mismatches.append("Nsight session")
+    return mismatches
 
 
 def _qualification_launch_env(profile: dict) -> dict[str, str]:
@@ -1016,9 +1149,9 @@ def _inference_script(host: str, model: str, container: str) -> str:
     )
 
 
-def _head_script() -> str:
+def _head_script(container: str = trainer_container) -> str:
     return (
-        trainer_probe.replace("__TRAINER__", trainer_container)
+        trainer_probe.replace("__TRAINER__", container)
         .replace("__ORCH__", orchestrator_container)
         .replace("__JUDGE__", str(judge_port))
         .replace("__ADAPTER__", str(adapter_port))
@@ -1038,7 +1171,9 @@ def _orchestrator_script() -> str:
     )
 
 
-def _trainer_container_config() -> tuple[list[str], list[str]]:
+def _trainer_container_config(
+    container: str = trainer_container,
+) -> tuple[list[str], list[str]]:
     inspect_filter = (
         "import json,sys; records=json.load(sys.stdin); "
         "valid=isinstance(records,list) and len(records)==1 and "
@@ -1054,7 +1189,7 @@ def _trainer_container_config() -> tuple[list[str], list[str]]:
     )
     inspect_command = (
         "inspection=$(sudo docker inspect --type container "
-        f"{shlex.quote(trainer_container)} 2>&1); status=$?; "
+        f"{shlex.quote(container)} 2>&1); status=$?; "
         "if [ \"$status\" -ne 0 ]; then printf '%s\\n' \"$inspection\"; "
         "exit \"$status\"; fi; printf '%s\\n' \"$inspection\""
     )
@@ -1066,23 +1201,23 @@ def _trainer_container_config() -> tuple[list[str], list[str]]:
     if rc:
         detail = output.strip() or f"docker inspect returned status {rc}"
         absent_details = {
-            f"Error: No such object: {trainer_container}",
+            f"Error: No such object: {container}",
             "[]\n"
-            f"Error response from daemon: No such container: {trainer_container}",
+            f"Error response from daemon: No such container: {container}",
         }
         if rc == 1 and detail in absent_details:
             raise _TrainerContainerAbsent(
-                f"no active trainer container {trainer_container} on {trainer_head}"
+                f"no active trainer container {container} on {trainer_head}"
             )
         raise RuntimeError(
-            f"cannot inspect trainer container {trainer_container} on "
+            f"cannot inspect trainer container {container} on "
             f"{trainer_head}: {detail}"
         )
     try:
         record = json.loads(output)
     except (TypeError, json.JSONDecodeError) as error:
         raise RuntimeError(
-            f"trainer container {trainer_container} returned invalid configuration"
+            f"trainer container {container} returned invalid configuration"
         ) from error
     if (
         not isinstance(record, dict)
@@ -1093,14 +1228,17 @@ def _trainer_container_config() -> tuple[list[str], list[str]]:
         or not all(isinstance(value, str) for value in record["command"])
     ):
         raise RuntimeError(
-            f"trainer container {trainer_container} returned invalid configuration"
+            f"trainer container {container} returned invalid configuration"
         )
     return record["run_records"], record["command"]
 
 
-def _trainer_mode() -> str:
+def _trainer_mode(
+    container: str = trainer_container,
+    repository_root: str = remote_repo,
+) -> str:
     """Return `trainer-only` when the active trainer uses `[data.fake]`."""
-    _, command = _trainer_container_config()
+    _, command = _trainer_container_config(container)
     markers = [index for index, value in enumerate(command) if value == "@"]
     config_paths = [value for value in command if value.endswith(".toml")]
     if (
@@ -1110,10 +1248,10 @@ def _trainer_mode() -> str:
         or command[markers[0] + 1] != config_paths[0]
     ):
         raise RuntimeError(
-            f"trainer container {trainer_container} must have one TOML config"
+            f"trainer container {container} must have one TOML config"
         )
     config = PurePosixPath(config_paths[0])
-    config_root = PurePosixPath(remote_repo) / "configs"
+    config_root = PurePosixPath(repository_root) / "configs"
     if (
         not config.is_absolute()
         or ".." in config.parts
@@ -1122,7 +1260,7 @@ def _trainer_mode() -> str:
         or str(config) != config_paths[0]
     ):
         raise RuntimeError(
-            f"trainer container {trainer_container} has an unapproved TOML config"
+            f"trainer container {container} has an unapproved TOML config"
         )
     rc, out = _ssh(
         trainer_head,
@@ -2029,16 +2167,23 @@ PY
     return summary
 
 
-def status(run: str = "", quiet: bool = False) -> Status:
+def status(
+    run: str = "",
+    quiet: bool = False,
+    profile: str = "current",
+) -> Status:
     """Probe every part of the run once and return the whole picture."""
+    selected = _profile(profile)
+    selected_trainer_container = _profile_trainer_container(selected)
+    selected_trainer_repository = _profile_trainer_repository(selected)
     trainer_absent = False
     if not run:
         try:
-            run = current_run()
+            run = current_run(selected_trainer_container)
         except _TrainerContainerAbsent:
             run = "none"
             trainer_absent = True
-    muse_run = _profile()["kind"] == "muse"
+    muse_run = selected["kind"] == "muse"
     engine_model = muse_model if muse_run else glm_model
     engine_container = muse_inference_container if muse_run else glm_inference_container
     s = Status(
@@ -2047,12 +2192,23 @@ def status(run: str = "", quiet: bool = False) -> Status:
         kind="muse" if muse_run else "glm52",
     )
     try:
-        trainer_only = not trainer_absent and _trainer_mode() == "trainer-only"
+        trainer_only = (
+            not trainer_absent
+            and _trainer_mode(
+                selected_trainer_container,
+                selected_trainer_repository,
+            )
+            == "trainer-only"
+        )
     except _TrainerContainerAbsent:
         trainer_only = False
 
     def node(h):
-        return _ssh(h, node_probe.replace("__TRAINER__", trainer_container), timeout=60)
+        return _ssh(
+            h,
+            node_probe.replace("__TRAINER__", selected_trainer_container),
+            timeout=60,
+        )
 
     def engine(h):
         return _ssh(
@@ -2066,7 +2222,9 @@ def status(run: str = "", quiet: bool = False) -> Status:
             f_head = ex.submit(
                 _ssh,
                 trainer_head,
-                trainer_only_probe.replace("__TRAINER__", trainer_container),
+                trainer_only_probe.replace(
+                    "__TRAINER__", selected_trainer_container
+                ),
                 120,
             )
             f_nodes = ex.submit(_fan, trainer_hosts, node)
@@ -2075,7 +2233,9 @@ def status(run: str = "", quiet: bool = False) -> Status:
             edge_orch_rc, edge_orch_out = 0, ""
             engines_out = {}
         else:
-            f_head = ex.submit(_ssh, trainer_head, _head_script(), 300)
+            f_head = ex.submit(
+                _ssh, trainer_head, _head_script(selected_trainer_container), 300
+            )
             f_edge_orch = ex.submit(
                 _ssh,
                 orchestrator_host,
@@ -2299,27 +2459,27 @@ def _warnings(s: Status) -> list[str]:
     return w
 
 
-def current_run() -> str:
+def current_run(container: str = trainer_container) -> str:
     """The run name the trainer container was started with."""
-    run_records, command = _trainer_container_config()
+    run_records, command = _trainer_container_config(container)
     run_names = [value.removeprefix("RUN=") for value in run_records]
     if len(run_names) > 1:
-        raise RuntimeError(f"trainer container {trainer_container} has conflicting RUN records")
+        raise RuntimeError(f"trainer container {container} has conflicting RUN records")
     for value in run_names:
         if not re.fullmatch(r"[A-Za-z0-9_-]+", value):
-            raise RuntimeError(f"trainer container {trainer_container} has an invalid RUN record")
+            raise RuntimeError(f"trainer container {container} has an invalid RUN record")
 
     log_prefix = f"--log-dir={run_root}/"
     log_arguments = [value for value in command if value.startswith("--log-dir=")]
     if len(log_arguments) > 1:
         raise RuntimeError(
-            f"trainer container {trainer_container} has conflicting log directories"
+            f"trainer container {container} has conflicting log directories"
         )
     command_runs: list[str] = []
     for value in log_arguments:
         if not value.startswith(log_prefix):
             raise RuntimeError(
-                f"trainer container {trainer_container} has an invalid log directory"
+                f"trainer container {container} has an invalid log directory"
             )
         relative_text = value.removeprefix(log_prefix)
         relative = PurePosixPath(relative_text)
@@ -2330,17 +2490,17 @@ def current_run() -> str:
             or not re.fullmatch(r"[A-Za-z0-9_-]+", relative.parts[0])
         ):
             raise RuntimeError(
-                f"trainer container {trainer_container} has an invalid log directory"
+                f"trainer container {container} has an invalid log directory"
             )
         command_runs.append(relative.parts[0])
 
     recorded = run_names + command_runs
     if not recorded:
         raise RuntimeError(
-            f"trainer container {trainer_container} has no valid run metadata"
+            f"trainer container {container} has no valid run metadata"
         )
     if len(set(recorded)) != 1:
-        raise RuntimeError(f"trainer container {trainer_container} has conflicting run records")
+        raise RuntimeError(f"trainer container {container} has conflicting run records")
     return recorded[0]
 
 
@@ -10374,6 +10534,7 @@ def _qualify_connected(
 
     selected = _profile(name)
     launch_env = _qualification_launch_env(selected)
+    selected_trainer_container = _profile_trainer_container(selected)
     if "orchestrator" in selected:
         raise Refused(f"profile {name!r} is a full run; use start()")
     relative_config = selected["trainer"]
@@ -10389,6 +10550,12 @@ def _qualify_connected(
         raise Refused(f"missing qualification config {relative_config}")
     with local_config.open("rb") as stream:
         config = tomllib.load(stream)
+    nsys_capture = _qualification_nsys_capture(
+        name,
+        launch_env,
+        nodes,
+        str(config.get("output_dir", "")),
+    )
     strict_qualification = name in {
         "glm52-native-b2048",
         "glm52-native-b2048-nsys",
@@ -10419,7 +10586,7 @@ def _qualify_connected(
     def trainer_container_state(host: str) -> tuple[int, str]:
         return _ssh(
             host,
-            f"sudo docker ps -a --filter name=^{trainer_container}$ "
+            f"sudo docker ps -a --filter name=^{selected_trainer_container}$ "
             "--format '{{.Names}} {{.State}}'",
         )
 
@@ -10435,7 +10602,7 @@ def _qualify_connected(
         if not observed:
             continue
         fields = observed.split()
-        if len(fields) != 2 or fields[0] != trainer_container:
+        if len(fields) != 2 or fields[0] != selected_trainer_container:
             state_errors.append(f"{host}: unexpected trainer container record {observed!r}")
         elif fields[1] == "running":
             active.append(host)
@@ -10518,7 +10685,7 @@ def _qualify_connected(
     env = (
         f"prime_deployment={shlex.quote(remote_repo)} "
         f"prime_image={shlex.quote(trainer_image)} "
-        f"prime_trainer_container={shlex.quote(trainer_container)} "
+        f"prime_trainer_container={shlex.quote(selected_trainer_container)} "
         f"trainer_nodes='{trainer_nodes}' RUN={shlex.quote(name)} "
         f"RUN_NAME=run_{shlex.quote(name)} "
         f"TRAINER_CONFIG={remote_repo}/{relative_config} "
@@ -10543,7 +10710,9 @@ def _qualify_connected(
     if containers_to_remove:
         _fan(
             containers_to_remove,
-            lambda host: _ssh(host, f"sudo docker rm -f {trainer_container}", 60),
+            lambda host: _ssh(
+                host, f"sudo docker rm -f {selected_trainer_container}", 60
+            ),
         )
         time.sleep(20)
 
@@ -10581,6 +10750,9 @@ def _qualify_connected(
             "PRIME_QUALIFICATION_STARTUP_DEADLINE_SECONDS",
             "PRIME_QUALIFICATION_STEP_DEADLINE_SECONDS",
             "PRIME_QUALIFICATION_PROFILER_FINALIZE_DEADLINE_SECONDS",
+            "PRIME_CUDA_PROFILE",
+            "PRIME_CUDA_PROFILE_RANK",
+            "PRIME_CUDA_PROFILE_STEPS",
         )
         probe_source = """import json
 import subprocess
@@ -10590,10 +10762,13 @@ container, encoded_keys = sys.argv[1:]
 keys = json.loads(encoded_keys)
 record = json.loads(subprocess.check_output(["sudo", "docker", "inspect", container]))[0]
 environment = {}
+nsys_environment = {}
 for assignment in record["Config"]["Env"]:
     key, separator, value = assignment.partition("=")
     if separator and key in keys:
         environment[key] = value
+    if separator and key.startswith("PRIME_NSYS_"):
+        nsys_environment[key] = value
 print(json.dumps({
     "name": record["Name"],
     "status": record["State"]["Status"],
@@ -10602,6 +10777,7 @@ print(json.dumps({
     "path": record["Path"],
     "command": record["Config"]["Cmd"],
     "environment": environment,
+    "nsys_environment": nsys_environment,
 }, sort_keys=True, separators=(",", ":")))
 """
         encoded_keys = json.dumps(environment_keys, separators=(",", ":"))
@@ -10610,12 +10786,14 @@ print(json.dumps({
             return _ssh(
                 host,
                 f"python3 -c {shlex.quote(probe_source)} "
-                f"{shlex.quote(trainer_container)} {shlex.quote(encoded_keys)}",
+                f"{shlex.quote(selected_trainer_container)} "
+                f"{shlex.quote(encoded_keys)}",
                 60,
             )
 
         observed_states = _fan(nodes, trainer_qualification_state)
         verification_failures = []
+        observed_nsys_hosts = []
         for rank, host in enumerate(nodes):
             rc, output = observed_states.get(host, (1, "missing result"))
             try:
@@ -10627,6 +10805,11 @@ print(json.dumps({
                     f"{host}: trainer identity is unreadable"
                 )
                 continue
+            trainer_module = (
+                _NSYS_TRAINER_MODULE
+                if nsys_capture is not None and host == nsys_capture.host
+                else "prime_rl.trainer.rl.train"
+            )
             expected_command = [
                 "--role=trainer",
                 f"--nnodes={len(nodes)}",
@@ -10640,7 +10823,7 @@ print(json.dumps({
                 "--redirects=3",
                 "--local-ranks-filter=0",
                 "-m",
-                "prime_rl.trainer.rl.train",
+                trainer_module,
                 "@",
                 f"{remote_repo}/{relative_config}",
             ]
@@ -10668,8 +10851,10 @@ print(json.dumps({
                         "PRIME_QUALIFICATION_PROFILER_FINALIZE_DEADLINE_SECONDS": str(profiler_deadline),
                     }
                 )
+            if nsys_capture is not None:
+                expected_environment.update(launch_env)
             mismatches = []
-            if observed.get("name") != f"/{trainer_container}":
+            if observed.get("name") != f"/{selected_trainer_container}":
                 mismatches.append("container name")
             if observed.get("status") != "running":
                 mismatches.append("running state")
@@ -10681,6 +10866,14 @@ print(json.dumps({
                 mismatches.append("container entrypoint")
             if observed.get("command") != expected_command:
                 mismatches.append("trainer command")
+            observed_command = observed.get("command")
+            if isinstance(observed_command, list):
+                try:
+                    module_index = observed_command.index("-m") + 1
+                    if observed_command[module_index] == _NSYS_TRAINER_MODULE:
+                        observed_nsys_hosts.append(host)
+                except (ValueError, IndexError):
+                    pass
             observed_environment = observed.get("environment")
             if not isinstance(observed_environment, dict):
                 mismatches.append("qualification environment")
@@ -10690,10 +10883,21 @@ print(json.dumps({
                     for key, expected in expected_environment.items()
                     if observed_environment.get(key) != expected
                 )
+            mismatches.extend(
+                _qualification_nsys_environment_mismatches(
+                    observed.get("nsys_environment"), nsys_capture, host
+                )
+            )
             if mismatches:
                 verification_failures.append(
                     f"{host}: qualification identity mismatch for {', '.join(mismatches)}"
                 )
+        expected_nsys_hosts = [nsys_capture.host] if nsys_capture is not None else []
+        if observed_nsys_hosts != expected_nsys_hosts:
+            verification_failures.append(
+                "Nsight worker host/count differs: "
+                f"expected={expected_nsys_hosts!r} observed={observed_nsys_hosts!r}"
+            )
         if verification_failures:
             raise RuntimeError(
                 "trainer qualification launch verification failed: "
