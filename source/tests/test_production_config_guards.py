@@ -199,6 +199,22 @@ def test_glm52_stability_and_production_use_local_expert_recompute() -> None:
     assert "PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD" not in muse.get("env_vars", {})
 
 
+def test_glm52_interleaved_qualification_uses_uneven_two_chunk_layout() -> None:
+    expected = [0, 3, 7, 11, 15, 19, 23, 27, 31, 36, 42, 48, 54, 60, 66, 72, 78]
+    for relative in (
+        "configs/qualification/glm52-native-b2048.toml",
+        "configs/qualification/glm52-native-b2048-nsys.toml",
+    ):
+        model = _load(relative)["model"]
+        assert model["pp_schedule"] == "interleaved_1f1b"
+        assert model["pp_transfer_sparse_indices"] is True
+        assert model["pp_virtual_layer_boundaries"] == expected
+        counts = [end - start for start, end in zip(expected, expected[1:])]
+        assert [counts[r] + counts[r + 8] for r in range(8)] == [
+            8, 10, 10, 10, 10, 10, 10, 10
+        ]
+
+
 def test_glm52_production_profiles_disable_cuda_profiling() -> None:
     profiling_names = {
         "PRIME_PROFILE_PP_STAGE": "1",
