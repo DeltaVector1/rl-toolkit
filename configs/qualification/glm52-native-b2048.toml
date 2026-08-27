@@ -6,6 +6,9 @@ enable_token_export = false
 
 [env_vars]
 PRIME_LORA_MM_PROFILE = "sm89-r32"
+PRIME_PHASE_PROFILE = "1"
+PRIME_PHASE_PROFILE_STEPS = "1"
+PRIME_PHASE_PROFILE_SAMPLE_EVERY = "8"
 
 [data.fake]
 batch_size = 64

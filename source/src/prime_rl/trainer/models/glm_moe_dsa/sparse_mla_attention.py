@@ -10,8 +10,10 @@ from prime_rl.trainer.models.layers.lora.multi_linear import (
     MultiLoRALinear,
     fused_frozen_linear_pair,
 )
+from prime_rl.trainer.models.layers.checkpointing import current_reentrant_block_phase
 from prime_rl.trainer.models.layers.norms import LayerNorm, RMSNorm, RMSNormConfig
 from prime_rl.trainer.models.layers.rotary_emb import rotate_half
+from prime_rl.trainer.phase_profiler import get_phase_profiler, phase_span
 from prime_rl.utils.cp import gather_for_cp
 
 _flex_attention = torch.compile(flex_attention, dynamic=True)
@@ -65,6 +67,7 @@ class _SparseMLA(torch.autograd.Function):
         return out
 
     @staticmethod
+    @phase_span("sparse_mla_backward")
     def backward(ctx, do):
         q, kv, out, indices, lse = ctx.saved_tensors
         dq, dkv = sparse_mla_bwd(
@@ -198,6 +201,19 @@ class GlmMoeDsaAttention(nn.Module):
         self.indexer = Indexer(args) if not args.skip_topk else None
         self.use_index_cache = args.use_index_cache
         self.skip_topk = args.skip_topk
+        self._phase_backward_timer = None
+        if get_phase_profiler().enabled:
+            self.register_full_backward_pre_hook(self._phase_backward_start)
+            self.register_full_backward_hook(self._phase_backward_end)
+
+    def _phase_backward_start(self, _module, _grad_output) -> None:
+        self._phase_backward_timer = get_phase_profiler().start_span(
+            "attention_backward"
+        )
+
+    def _phase_backward_end(self, _module, _grad_input, _grad_output) -> None:
+        get_phase_profiler().end_span(self._phase_backward_timer)
+        self._phase_backward_timer = None
         self.scaling = self.qk_head_dim ** (-0.5)
 
         self._cp_group: dist.ProcessGroup | None = None
@@ -315,6 +331,13 @@ class GlmMoeDsaAttention(nn.Module):
         attn_output = attn_output.reshape(batch_size, total_tokens, -1)
         return self.o_proj(attn_output)
 
+    @phase_span(
+        lambda: (
+            "attention_recompute"
+            if current_reentrant_block_phase() == "recompute"
+            else "attention_forward"
+        )
+    )
     def forward(
         self,
         hidden_states: torch.Tensor,

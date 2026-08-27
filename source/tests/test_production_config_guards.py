@@ -168,9 +168,16 @@ def test_glm52_stability_and_production_use_local_expert_recompute() -> None:
         "configs/paused/trainer.glm52-production.toml",
     ):
         config = _load(relative)
-        assert config.get("env_vars", {}) == {
-            "PRIME_LORA_MM_PROFILE": "sm89-r32"
-        }, relative
+        expected_env = {"PRIME_LORA_MM_PROFILE": "sm89-r32"}
+        if relative.endswith("native-b2048.toml"):
+            expected_env.update(
+                {
+                    "PRIME_PHASE_PROFILE": "1",
+                    "PRIME_PHASE_PROFILE_STEPS": "1",
+                    "PRIME_PHASE_PROFILE_SAMPLE_EVERY": "8",
+                }
+            )
+        assert config.get("env_vars", {}) == expected_env, relative
         assert (
             config["model"]["quantization"]["expert_activation_transport"]
             == "bf16_forward_fp8_local_recompute_backward"
@@ -200,7 +207,15 @@ def test_glm52_production_profiles_disable_cuda_profiling() -> None:
         "PRIME_LAYER_PROFILE_EVERY": "64",
     }
     small = _load("configs/qualification/glm52-native-small.toml")
-    assert small["env_vars"] == {"PRIME_LORA_MM_PROFILE": "sm89-r32"}
+    phase_profile = {
+        "PRIME_PHASE_PROFILE": "1",
+        "PRIME_PHASE_PROFILE_STEPS": "1",
+        "PRIME_PHASE_PROFILE_SAMPLE_EVERY": "8",
+    }
+    assert small["env_vars"] == {
+        "PRIME_LORA_MM_PROFILE": "sm89-r32",
+        **phase_profile,
+    }
     assert small["model"]["pp_schedule"] == "1f1b"
     assert small["model"]["quantization"]["diagnose_linear_backward"] is False
     launcher = (ROOT / "scripts/china/cluster.sh").read_text()
@@ -214,6 +229,15 @@ def test_glm52_production_profiles_disable_cuda_profiling() -> None:
         assert f'"{name}",' in launcher
     assert '-e PRIME_EP_PROFILE="$ep_profile"' in launcher
     assert '-e PRIME_LAYER_PROFILE_EVERY="$layer_profile_every"' in launcher
+    assert 'global_phase_profile_names = (' in launcher
+    assert '-e PRIME_PHASE_PROFILE="$phase_profile"' in launcher
+    assert '-e PRIME_PHASE_PROFILE_STEPS="$phase_profile_steps"' in launcher
+    assert '-e PRIME_PHASE_PROFILE_SAMPLE_EVERY="$phase_profile_sample_every"' in launcher
+    b2048 = _load("configs/qualification/glm52-native-b2048.toml")
+    assert b2048["env_vars"] == {
+        "PRIME_LORA_MM_PROFILE": "sm89-r32",
+        **phase_profile,
+    }
     for relative in (
         "configs/qualification/glm52-policy-parity-trainer.toml",
         "configs/qualification/glm52-native-b2048.toml",
@@ -222,6 +246,13 @@ def test_glm52_production_profiles_disable_cuda_profiling() -> None:
     ):
         env_vars = _load(relative).get("env_vars", {})
         assert not set(profiling_names) & set(env_vars), relative
+    for relative in (
+        "configs/qualification/glm52-native-stability20.toml",
+        "configs/qualification/glm52-policy-parity-trainer.toml",
+        "configs/paused/trainer.glm52-production.toml",
+    ):
+        env_vars = _load(relative).get("env_vars", {})
+        assert not set(phase_profile) & set(env_vars), relative
 
 
 def test_all_glm52_trainers_use_h200_w8a8_semantics() -> None:

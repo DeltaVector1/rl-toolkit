@@ -64,6 +64,10 @@ from prime_rl.trainer.model import (
 )
 from prime_rl.trainer.parallel_dims import get_parallel_dims, resolve_ep
 from prime_rl.trainer.perf import get_perf_counter
+from prime_rl.trainer.phase_profiler import (
+    get_phase_profiler,
+    install_fsdp_phase_hooks,
+)
 from prime_rl.trainer.utils import (
     build_bin_cost,
     GarbageCollection,
@@ -1091,6 +1095,8 @@ def train(config: TrainerConfig):
     logger.info(f"Initializing model ({config.model})")
     loading_from_ckpt_later = config.ckpt and checkpoint_step is not None
     model = setup_model(config.model, parallel_dims, loading_from_ckpt_later)
+    phase_profiler = get_phase_profiler()
+    install_fsdp_phase_hooks()
     if trainer_only and config.model.lora is not None:
         multi_run_manager.create_trainer_only_run(config.model.lora)
     group_timeout = timedelta(seconds=config.dist_timeout_seconds)
@@ -1562,6 +1568,7 @@ def train(config: TrainerConfig):
             memory_profiler = MemoryProfiler(progress.step, config.memory_profiler_path)
 
         forward_backward_start_time = time.perf_counter()
+        phase_profiler.begin_step(progress.step)
         seq_len = micro_batches[0]["input_ids"].shape[1]
 
         # Normalize each loss component by its own global (dp_cp) token count, so every rank
@@ -2418,11 +2425,26 @@ def train(config: TrainerConfig):
         zero_grad_ratio = get_zero_gradient_ratio(model.parameters(), parallel_dims.dp_replicate)
 
         # Update the model parameters
-        optimizer.step()
-        optimizer.zero_grad()
+        optimizer_timer = phase_profiler.start_span("optimizer")
+        try:
+            optimizer.step()
+            optimizer.zero_grad()
+        finally:
+            phase_profiler.end_span(optimizer_timer)
 
         # Update learning rate scheduler
         scheduler.step()
+
+        phase_report = phase_profiler.end_step(
+            rank=dist.get_rank(), stage=pp_rank
+        )
+        if phase_report is not None:
+            phase_reports = [None] * dist.get_world_size()
+            dist.all_gather_object(phase_reports, phase_report)
+            if dist.get_rank() == 0:
+                logger.info(
+                    get_phase_profiler().format_aggregate(phase_reports)
+                )
 
         if os.environ.get("PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD", "") == "1":
             torch.cuda.synchronize()
