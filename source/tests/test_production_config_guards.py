@@ -13,12 +13,15 @@ def _load(relative: str) -> dict:
         return tomllib.load(stream)
 
 
-def test_only_policy_parity_fake_data_enables_router_replay() -> None:
+def test_only_fixed_token_profiles_enable_router_replay() -> None:
     for path in (ROOT / "configs/qualification").glob("*.toml"):
         config = _load(str(path.relative_to(ROOT)))
         if "fake" in config.get("data", {}):
             enabled = config.get("enable_router_replay", False)
-            if path.name == "glm52-policy-parity-trainer.toml":
+            if path.name in {
+                "glm52-policy-parity-trainer.toml",
+                "glm52-int4-fixed-token-trainer.toml",
+            }:
                 assert enabled is True
                 assert config["data"]["fake"]["reference_path"].endswith(
                     "/trainer-stage-final/trainer-reference.json"
@@ -35,6 +38,7 @@ def test_current_glm52_profile_is_batch_2048_without_rollout_cache() -> None:
         "glm52-policy-parity",
         "glm52-native-b2048",
         "glm52-native-b2048-int4",
+        "glm52-int4-fixed-token-trainer",
         "glm52-native-stability20",
     }
     current = operations["profiles"]["current"]
@@ -64,6 +68,13 @@ def test_current_glm52_profile_is_batch_2048_without_rollout_cache() -> None:
         operations["profiles"]["glm52-native-b2048-int4"]["trainer"]
     )["data"]["fake"]
     assert int4_fake == large_fake
+    fixed_int4 = _load(
+        operations["profiles"]["glm52-int4-fixed-token-trainer"]["trainer"]
+    )
+    assert fixed_int4["data"]["fake"]["generate_samples"] is False
+    assert fixed_int4["data"]["fake"]["reference_path"].endswith(
+        "/trainer-stage-final/trainer-reference.json"
+    )
     parity = operations["profiles"]["glm52-policy-parity"]
     parity_trainer = _load(parity["trainer"])
     assert parity_trainer["data"]["fake"]["batch_size"] == 8
@@ -232,13 +243,26 @@ def test_glm52_int4_qualification_keeps_the_accepted_training_contract() -> None
         "experts",
     }
 
+    fixed = _load("configs/qualification/glm52-int4-fixed-token-trainer.toml")
     parity = _load("configs/qualification/glm52-policy-parity-trainer.toml")
-    assert parity["data"]["fake"]["generate_samples"] is False
-    assert parity["data"]["fake"]["reference_path"].endswith(
-        "/trainer-stage-final/trainer-reference.json"
-    )
-    assert parity["model"]["quantization"]["expert_activation_transport"] == "int4"
-    assert parity["env_vars"]["PRIME_INT4_COMBINE_ROUNDS"] == "8"
+    assert fixed["max_steps"] == 1
+    assert fixed["enable_router_replay"] is True
+    assert fixed["enable_token_export"] is True
+    assert fixed["data"] == parity["data"]
+    assert fixed["model"] == {
+        **parity["model"],
+        "quantization": {
+            **parity["model"]["quantization"],
+            "expert_activation_transport": "int4",
+        },
+    }
+    assert fixed["optim"] == {
+        **parity["optim"],
+        "lr": 8e-6,
+    }
+    assert fixed["env_vars"] == candidate["env_vars"]
+    assert parity["model"]["quantization"]["expert_activation_transport"] == "bf16"
+    assert parity["optim"]["lr"] == 0.0
 
 
 def test_glm52_production_profiles_disable_cuda_profiling() -> None:
@@ -268,6 +292,7 @@ def test_glm52_production_profiles_disable_cuda_profiling() -> None:
         "configs/qualification/glm52-policy-parity-trainer.toml",
         "configs/qualification/glm52-native-b2048.toml",
         "configs/qualification/glm52-native-b2048-int4.toml",
+        "configs/qualification/glm52-int4-fixed-token-trainer.toml",
         "configs/qualification/glm52-native-stability20.toml",
         "configs/paused/trainer.glm52-production.toml",
     ):
@@ -281,6 +306,7 @@ def test_all_glm52_trainers_use_h200_w8a8_semantics() -> None:
         "configs/qualification/glm52-native-small.toml",
         "configs/qualification/glm52-native-b2048.toml",
         "configs/qualification/glm52-native-b2048-int4.toml",
+        "configs/qualification/glm52-int4-fixed-token-trainer.toml",
         "configs/qualification/glm52-native-stability20.toml",
         "configs/paused/trainer.glm52-production.toml",
     }
@@ -301,13 +327,17 @@ def test_all_glm52_trainers_use_h200_w8a8_semantics() -> None:
         assert quantization["w8a16_modules"] == [], relative
         assert quantization["fused_qkv_a_fp8"] is True, relative
         int4_profiles = {
-            "configs/qualification/glm52-policy-parity-trainer.toml",
             "configs/qualification/glm52-native-b2048-int4.toml",
+            "configs/qualification/glm52-int4-fixed-token-trainer.toml",
         }
         expected_transport = (
             "int4"
             if relative in int4_profiles
-            else "bf16_forward_fp8_local_recompute_backward"
+            else (
+                "bf16"
+                if relative == "configs/qualification/glm52-policy-parity-trainer.toml"
+                else "bf16_forward_fp8_local_recompute_backward"
+            )
         )
         assert quantization["expert_activation_transport"] == expected_transport, relative
         env_vars = config.get("env_vars", {})

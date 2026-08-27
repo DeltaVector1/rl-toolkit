@@ -51,7 +51,7 @@ type = "fp8"
 dequantize_checkpoint = false
 diagnose_linear_backward = false
 fused_qkv_a_fp8 = true
-expert_activation_transport = "int4"
+expert_activation_transport = "bf16"
 w8a16_modules = []
 
 [model.lora]
@@ -81,9 +81,6 @@ save_format = "safetensors"
 type = "filesystem"
 
 [env_vars]
-PRIME_LORA_MM_PROFILE = "sm89-r32"
-PRIME_INT4_COMBINE_ROUNDS = "8"
-PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD = "0"
 PRIME_PARITY_ROUTER_TRACE_DIR = "/data/glm52-rl/qualifications/glm52-policy-parity/trainer-traces"
 PRIME_PARITY_QUALIFICATION_ROOT = "/data/glm52-rl/qualifications/glm52-policy-parity"
 PRIME_PARITY_ROUTER_TRACE_SOURCE = "/data/glm52-rl/qualifications/glm52-policy-parity/trainer-stage-final/trainer-router-trace"
