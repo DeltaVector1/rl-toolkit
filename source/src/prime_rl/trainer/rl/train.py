@@ -67,8 +67,8 @@ from prime_rl.trainer.perf import get_perf_counter
 from prime_rl.trainer.phase_profiler import (
     get_phase_profiler,
     install_fsdp_phase_hooks,
+    record_cuda_capture_microbatch,
     start_cuda_capture,
-    stop_cuda_capture,
 )
 from prime_rl.trainer.utils import (
     build_bin_cost,
@@ -1571,7 +1571,6 @@ def train(config: TrainerConfig):
 
         forward_backward_start_time = time.perf_counter()
         phase_profiler.begin_step(progress.step)
-        start_cuda_capture(progress.step)
         seq_len = micro_batches[0]["input_ids"].shape[1]
 
         # Normalize each loss component by its own global (dp_cp) token count, so every rank
@@ -1630,6 +1629,10 @@ def train(config: TrainerConfig):
                 pp_target_length += cp_size - (pp_target_length % cp_size)
 
         for micro_step, micro_batch in enumerate(micro_batches):
+            if not pp_enabled and micro_step == 0:
+                # Start immediately before the first real forward. The range
+                # ends from the microbatch completion path, not at step end.
+                start_cuda_capture(progress.step)
             pad_micro_batch_to_distributed_max(micro_batch, dp_cp_group)
             if pp_enabled:
                 pad_micro_batch_to_length(micro_batch, pp_target_length)
@@ -1865,6 +1868,7 @@ def train(config: TrainerConfig):
             # Backward pass
             with maybe_record_function("backward"):
                 loss.backward()
+            record_cuda_capture_microbatch(micro_step)
 
             # Add relevant tensors to tensor dict for logging purposes
             entropy = out["entropy"][loss_mask].detach().to("cpu")
@@ -2191,6 +2195,9 @@ def train(config: TrainerConfig):
             pp_inputs = torch.cat([sd["input_ids"] for sd in pp_side_inputs], dim=0).to(
                 "cuda"
             )
+            # Start immediately before the real pipeline schedule. The stage
+            # callback stops capture after complete microbatches on one rank.
+            start_cuda_capture(progress.step)
             profile_pp_stage = os.environ.get("PRIME_PROFILE_PP_STAGE") == "1"
             if dist.get_rank() == 0 or profile_pp_stage:
                 torch.cuda.synchronize()
@@ -2441,7 +2448,6 @@ def train(config: TrainerConfig):
         phase_report = phase_profiler.end_step(
             rank=dist.get_rank(), stage=pp_rank
         )
-        stop_cuda_capture()
         if phase_report is not None:
             phase_reports = [None] * dist.get_world_size()
             dist.all_gather_object(phase_reports, phase_report)

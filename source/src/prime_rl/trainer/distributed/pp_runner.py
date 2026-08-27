@@ -23,6 +23,8 @@ from typing import Any, Callable
 import torch
 import torch.nn as nn
 
+from prime_rl.trainer.phase_profiler import record_cuda_capture_microbatch
+
 
 def minimum_pipeline_microbatches(schedule_name: str, pp_size: int) -> int:
     """Return the minimum batch that the selected pipeline schedule accepts."""
@@ -800,6 +802,11 @@ def _bounded_pipeline_stage_cls():
                 self._finish_forward_receive(bwd_chunk_id)
             if not self.is_last:
                 self._finish_backward_receive(bwd_chunk_id)
+            # A pipeline schedule owns the real microbatch loop. Count each
+            # completed chunk after its backward and transport work, so
+            # Nsight can stop without waiting for the full batch or changing
+            # gradients.
+            record_cuda_capture_microbatch(bwd_chunk_id)
             return output
 
     return BoundedPipelineStage

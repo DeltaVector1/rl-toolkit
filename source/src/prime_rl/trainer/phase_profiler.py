@@ -4,6 +4,10 @@ The profiler is inactive unless ``PRIME_PHASE_PROFILE=1``.  It records CUDA
 events only on selected steps and resolves them with one device
 synchronization at the end of that step.  It does not change execution order,
 streams, or tensor values.
+
+The separate Nsight Systems CUDA+NVTX range is inactive unless
+``PRIME_CUDA_PROFILE=1``.  It starts on step 2 or later and stops after the
+configured two to four completed microbatches.
 """
 
 from __future__ import annotations
@@ -38,52 +42,207 @@ PHASES = (
 _PHASE_SET = frozenset(PHASES)
 _PROFILE_REQUESTED = os.environ.get("PRIME_PHASE_PROFILE", "0") == "1"
 PROFILE_REQUESTED = _PROFILE_REQUESTED
+_CUDA_CAPTURE_REQUESTED = os.environ.get("PRIME_CUDA_PROFILE", "0") == "1"
 _EVENT_PAIR_COST_US = 20.0
-_CUDA_CAPTURE_ACTIVE = False
-_CUDA_CAPTURE_API = None
 
 
-def _cuda_capture_step_set() -> frozenset[int]:
-    value = os.environ.get("PRIME_CUDA_PROFILE_STEPS", "1")
-    steps = frozenset(int(part) for part in value.split(",") if part)
-    if not steps or min(steps) < 1:
-        raise ValueError("PRIME_CUDA_PROFILE_STEPS must contain positive integers")
+def _parse_cuda_capture_steps(value: str) -> frozenset[int]:
+    """Parse the one-capture step list, which must be after one warmup step."""
+    if not value:
+        raise ValueError("PRIME_CUDA_PROFILE_STEPS must name a step after warmup")
+    try:
+        steps = frozenset(int(part) for part in value.split(",") if part)
+    except ValueError as error:
+        raise ValueError(
+            "PRIME_CUDA_PROFILE_STEPS must contain integers after warmup"
+        ) from error
+    if not steps or min(steps) < 2:
+        raise ValueError(
+            "PRIME_CUDA_PROFILE_STEPS must contain only steps >= 2 (after warmup)"
+        )
     return steps
 
 
+def _parse_cuda_capture_microbatches(value: str) -> int:
+    """Return a bounded capture length for real production microbatches."""
+    try:
+        limit = int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "PRIME_CUDA_PROFILE_MICROBATCHES must be an integer from 2 through 4"
+        ) from error
+    if limit not in (2, 3, 4):
+        raise ValueError(
+            "PRIME_CUDA_PROFILE_MICROBATCHES must be an integer from 2 through 4"
+        )
+    return limit
+
+
+class _CudaCaptureController:
+    """Control one CUDA-profiler range without changing trainer computation."""
+
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        rank: int = -1,
+        target_rank: int = -1,
+        steps: frozenset[int] = frozenset(),
+        microbatch_limit: int = 3,
+        cuda_api_factory: Callable[[], Any] | None = None,
+        nvtx: Any | None = None,
+    ) -> None:
+        if enabled:
+            if target_rank < 0:
+                raise ValueError("PRIME_CUDA_PROFILE_RANK must be non-negative")
+            if not steps or min(steps) < 2:
+                raise ValueError(
+                    "PRIME_CUDA_PROFILE_STEPS must contain only steps >= 2 (after warmup)"
+                )
+            _parse_cuda_capture_microbatches(str(microbatch_limit))
+        self.enabled = enabled
+        self.rank = rank
+        self.target_rank = target_rank
+        self.steps = steps
+        self.microbatch_limit = microbatch_limit
+        self._cuda_api_factory = cuda_api_factory
+        self._nvtx = nvtx
+        self._cuda_api = None
+        self._active = False
+        self._capture_used = False
+        self._microbatch_ids: set[int] = set()
+
+    @classmethod
+    def from_environment(cls) -> "_CudaCaptureController":
+        enabled = os.environ.get("PRIME_CUDA_PROFILE", "0") == "1"
+        if not enabled:
+            return cls(enabled=False)
+        target_value = os.environ.get("PRIME_CUDA_PROFILE_RANK", "")
+        if not target_value:
+            raise ValueError(
+                "PRIME_CUDA_PROFILE_RANK is required when CUDA profiling is enabled"
+            )
+        try:
+            target_rank = int(target_value)
+            rank = int(os.environ.get("RANK", "-1"))
+        except ValueError as error:
+            raise ValueError("CUDA profiler ranks must be integers") from error
+        if target_rank < 0:
+            raise ValueError("PRIME_CUDA_PROFILE_RANK must be non-negative")
+        steps = _parse_cuda_capture_steps(
+            os.environ.get("PRIME_CUDA_PROFILE_STEPS", "2")
+        )
+        microbatch_limit = _parse_cuda_capture_microbatches(
+            os.environ.get("PRIME_CUDA_PROFILE_MICROBATCHES", "3")
+        )
+        return cls(
+            enabled=True,
+            rank=rank,
+            target_rank=target_rank,
+            steps=steps,
+            microbatch_limit=microbatch_limit,
+            cuda_api_factory=torch.cuda.cudart,
+            nvtx=torch.cuda.nvtx,
+        )
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    def start(self, step: int) -> bool:
+        """Start the single selected range on the configured global rank."""
+        if not self.enabled or self.rank != self.target_rank:
+            return False
+        if self._capture_used or int(step) not in self.steps:
+            return False
+        if self._active:
+            raise RuntimeError("CUDA profiler capture is already active")
+        if self._cuda_api_factory is None or self._nvtx is None:
+            raise RuntimeError("CUDA profiler capture dependencies are unavailable")
+        api = self._cuda_api_factory()
+        result = api.cudaProfilerStart()
+        if result not in (None, 0):
+            raise RuntimeError(f"cudaProfilerStart failed with error {result}")
+        try:
+            self._nvtx.range_push(f"prime_nsys_training_step_{int(step)}")
+        except BaseException:
+            # Do not leave the CUDA profiler running if the NVTX marker failed.
+            api.cudaProfilerStop()
+            raise
+        self._cuda_api = api
+        self._active = True
+        self._capture_used = True
+        self._microbatch_ids.clear()
+        return True
+
+    def microbatch_complete(self, microbatch_id: int) -> bool:
+        """Count one completed real microbatch and stop at the configured limit."""
+        if not self._active:
+            return False
+        microbatch_id = int(microbatch_id)
+        if microbatch_id < 0:
+            raise ValueError("CUDA profiler microbatch IDs must be non-negative")
+        if microbatch_id in self._microbatch_ids:
+            return False
+        self._microbatch_ids.add(microbatch_id)
+        if len(self._microbatch_ids) < self.microbatch_limit:
+            return False
+        return self.stop()
+
+    def stop(self) -> bool:
+        """Stop the range exactly once; Nsight then keeps the app running."""
+        if not self._active:
+            return False
+        api = self._cuda_api
+        if api is None or self._nvtx is None:
+            raise RuntimeError("CUDA profiler capture state is incomplete")
+        error = None
+        try:
+            try:
+                self._nvtx.range_pop()
+            finally:
+                result = api.cudaProfilerStop()
+                if result not in (None, 0):
+                    raise RuntimeError(f"cudaProfilerStop failed with error {result}")
+        except BaseException as caught:
+            error = caught
+        finally:
+            self._cuda_api = None
+            self._active = False
+        if error is not None:
+            raise error
+        return True
+
+
+_CUDA_CAPTURE_CONTROLLER: _CudaCaptureController | None = None
+
+
+def _cuda_capture_controller() -> _CudaCaptureController:
+    global _CUDA_CAPTURE_CONTROLLER
+    if _CUDA_CAPTURE_CONTROLLER is None:
+        _CUDA_CAPTURE_CONTROLLER = _CudaCaptureController.from_environment()
+    return _CUDA_CAPTURE_CONTROLLER
+
+
 def start_cuda_capture(step: int) -> bool:
-    """Start an opt-in Nsight CUDA-profiler range on one global rank."""
-    global _CUDA_CAPTURE_ACTIVE, _CUDA_CAPTURE_API
-    target = os.environ.get("PRIME_CUDA_PROFILE_RANK", "")
-    if os.environ.get("PRIME_CUDA_PROFILE", "0") != "1" or not target:
+    """Start the opt-in Nsight range on one rank after the warmup step."""
+    if not _CUDA_CAPTURE_REQUESTED:
         return False
-    if int(os.environ.get("RANK", "-1")) != int(target):
+    return _cuda_capture_controller().start(step)
+
+
+def record_cuda_capture_microbatch(microbatch_id: int) -> bool:
+    """Stop the opt-in Nsight range after complete real microbatches."""
+    if not _CUDA_CAPTURE_REQUESTED:
         return False
-    if int(step) not in _cuda_capture_step_set():
-        return False
-    if _CUDA_CAPTURE_ACTIVE:
-        raise RuntimeError("CUDA profiler capture is already active")
-    _CUDA_CAPTURE_API = torch.cuda.cudart()
-    result = _CUDA_CAPTURE_API.cudaProfilerStart()
-    if result not in (None, 0):
-        raise RuntimeError(f"cudaProfilerStart failed with error {result}")
-    torch.cuda.nvtx.range_push(f"prime_nsys_training_step_{int(step)}")
-    _CUDA_CAPTURE_ACTIVE = True
-    return True
+    return _cuda_capture_controller().microbatch_complete(microbatch_id)
 
 
 def stop_cuda_capture() -> bool:
-    """End the one opt-in Nsight CUDA-profiler range."""
-    global _CUDA_CAPTURE_ACTIVE, _CUDA_CAPTURE_API
-    if not _CUDA_CAPTURE_ACTIVE:
+    """Retain the old API for callers that need an explicit emergency stop."""
+    if not _CUDA_CAPTURE_REQUESTED:
         return False
-    torch.cuda.nvtx.range_pop()
-    result = _CUDA_CAPTURE_API.cudaProfilerStop()
-    if result not in (None, 0):
-        raise RuntimeError(f"cudaProfilerStop failed with error {result}")
-    _CUDA_CAPTURE_ACTIVE = False
-    _CUDA_CAPTURE_API = None
-    return True
+    return _cuda_capture_controller().stop()
 
 
 def _parse_steps(value: str) -> frozenset[int]:

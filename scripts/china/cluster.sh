@@ -487,10 +487,25 @@ PY
         echo "Nsight Systems capture must run on n78" >&2
         exit 1
       }
+      [ "${PRIME_CUDA_PROFILE:-0}" = "1" ] || {
+        echo "PRIME_CUDA_PROFILE=1 is required for an Nsight Systems capture" >&2
+        exit 1
+      }
       [ "${PRIME_CUDA_PROFILE_RANK:-24}" = "24" ] || {
         echo "Nsight Systems capture is pinned to representative rank 24" >&2
         exit 1
       }
+      case "${PRIME_CUDA_PROFILE_MICROBATCHES:-3}" in
+        2|3|4) ;;
+        *)
+          echo "PRIME_CUDA_PROFILE_MICROBATCHES must be 2, 3, or 4" >&2
+          exit 1
+          ;;
+      esac
+      if ! [[ "${PRIME_CUDA_PROFILE_STEPS:-2}" =~ ^([2-9]|[1-9][0-9]+)(,([2-9]|[1-9][0-9]+))*$ ]]; then
+        echo "PRIME_CUDA_PROFILE_STEPS must contain only steps >= 2 (after warmup)" >&2
+        exit 1
+      fi
       nsys_mounts=(
         -v /opt/nvidia/nsight-systems:/opt/nvidia/nsight-systems:ro
       )
@@ -501,12 +516,15 @@ PY
         --session-new="$nsys_session"
         --trace=cuda,nvtx
         --sample=none
+        --event-sample=none
         --cpuctxsw=none
         --backtrace=none
         --cudabacktrace=none
         --cuda-memory-usage=false
         --capture-range=cudaProfilerApi
         --capture-range-end=stop
+        --flush-on-cudaprofilerstop=true
+        --kill=none
         --force-overwrite=true
         -o "$trainer_output/nsys-rank-${PRIME_CUDA_PROFILE_RANK:-24}"
         /app/.venv/bin/torchrun
@@ -609,7 +627,8 @@ PY
       -e PRIME_PHASE_PROFILE_SAMPLE_EVERY="$phase_profile_sample_every" \
       -e PRIME_CUDA_PROFILE="${PRIME_CUDA_PROFILE:-0}" \
       -e PRIME_CUDA_PROFILE_RANK="${PRIME_CUDA_PROFILE_RANK:-24}" \
-      -e PRIME_CUDA_PROFILE_STEPS="${PRIME_CUDA_PROFILE_STEPS:-1}" \
+      -e PRIME_CUDA_PROFILE_STEPS="${PRIME_CUDA_PROFILE_STEPS:-2}" \
+      -e PRIME_CUDA_PROFILE_MICROBATCHES="${PRIME_CUDA_PROFILE_MICROBATCHES:-3}" \
       -e PRIME_BIND_GPU_NUMA="${PRIME_BIND_GPU_NUMA:-0}" \
       -e PRIME_NCCL_CHANNELS="$nccl_channels" \
       -e PRIME_PROFILE_PP_STAGE="$profile_pp_stage" \
