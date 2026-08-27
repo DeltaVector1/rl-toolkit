@@ -16,9 +16,17 @@ import json
 import os
 import struct
 import zlib
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import BinaryIO, Mapping
 
+# The trainer head has 128 logical CPUs and 503 GiB RAM.  Eight workers use
+# at most one sixteenth of its CPUs.  Sixteen queued 8 MiB frame pairs bound
+# input, XOR, and encoded buffers below 1 GiB even at the encoded-frame limit.
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
 import numpy as np
 
 
@@ -37,6 +45,8 @@ ADAPTER_DELTA_FRAME_BYTES = 8 * 1024 * 1024
 ADAPTER_DELTA_MAX_ENCODED_FRAME_BYTES = (
     ADAPTER_DELTA_FRAME_BYTES + ADAPTER_DELTA_FRAME_BYTES // 100 + 64 * 1024
 )
+ADAPTER_DELTA_BUILD_WORKERS = 8
+ADAPTER_DELTA_BUILD_INFLIGHT_FRAMES = 2 * ADAPTER_DELTA_BUILD_WORKERS
 _FRAME_HEADER = struct.Struct("!II")
 _IO_CHUNK = 16 * 1024 * 1024
 _MAX_SAFETENSORS_HEADER = 256 * 1024 * 1024
@@ -175,6 +185,23 @@ def _xor(left: bytes, right: bytes) -> bytes:
     ).tobytes()
 
 
+def _encode_delta_frame(base_chunk: bytes, target_chunk: bytes) -> tuple[bytes, bytes]:
+    encoded = zlib.compress(_xor(base_chunk, target_chunk), level=1)
+    return _FRAME_HEADER.pack(len(target_chunk), len(encoded)), encoded
+
+
+def _write_delta_frame(
+    output: BinaryIO,
+    delta_digest,
+    future: Future[tuple[bytes, bytes]],
+) -> None:
+    header, encoded = future.result()
+    output.write(header)
+    output.write(encoded)
+    delta_digest.update(header)
+    delta_digest.update(encoded)
+
+
 def _remove_if_exists(path: Path) -> None:
     try:
         path.unlink()
@@ -233,6 +260,8 @@ def build_adapter_delta(
         base_digest = hashlib.sha256()
         target_digest = hashlib.sha256()
         delta_digest = hashlib.sha256()
+        pending: deque[Future[tuple[bytes, bytes]]] = deque()
+        executor = ThreadPoolExecutor(max_workers=ADAPTER_DELTA_BUILD_WORKERS)
         with (
             base_model.open("rb") as base,
             target_model.open("rb") as target,
@@ -244,16 +273,18 @@ def build_adapter_delta(
                     raise AdapterDeltaError("base adapter ended before target adapter")
                 base_digest.update(base_chunk)
                 target_digest.update(target_chunk)
-                encoded = zlib.compress(_xor(base_chunk, target_chunk), level=1)
-                header = _FRAME_HEADER.pack(len(target_chunk), len(encoded))
-                output.write(header)
-                output.write(encoded)
-                delta_digest.update(header)
-                delta_digest.update(encoded)
+                pending.append(
+                    executor.submit(_encode_delta_frame, base_chunk, target_chunk)
+                )
+                if len(pending) >= ADAPTER_DELTA_BUILD_INFLIGHT_FRAMES:
+                    _write_delta_frame(output, delta_digest, pending.popleft())
             if base.read(1):
                 raise AdapterDeltaError("base adapter is longer than target adapter")
+            while pending:
+                _write_delta_frame(output, delta_digest, pending.popleft())
             output.flush()
             os.fsync(output.fileno())
+        executor.shutdown(wait=True)
         delta_size = temporary.stat().st_size
         ratio = delta_size / model_size
         if ratio >= _max_ratio(max_ratio):
@@ -292,6 +323,10 @@ def build_adapter_delta(
         finally:
             _remove_if_exists(manifest_temporary)
     except BaseException:
+        for future in pending if "pending" in locals() else ():
+            future.cancel()
+        if "executor" in locals():
+            executor.shutdown(wait=True, cancel_futures=True)
         _remove_if_exists(temporary)
         raise
     return manifest_path

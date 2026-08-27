@@ -20,6 +20,8 @@ from unittest.mock import patch
 
 import prime_rl.utils.adapter_delta as adapter_delta_module
 from prime_rl.utils.adapter_delta import (
+    ADAPTER_DELTA_BUILD_INFLIGHT_FRAMES,
+    ADAPTER_DELTA_BUILD_WORKERS,
     ADAPTER_DELTA_FILE,
     AdapterDeltaError,
     apply_adapter_delta,
@@ -63,6 +65,58 @@ def _export(root: Path, name: str, payload: bytes) -> Path:
 
 
 class AdapterDeltaTest(unittest.TestCase):
+    def test_parallel_builder_has_fixed_bounds_and_no_nested_blas(self) -> None:
+        self.assertEqual(ADAPTER_DELTA_BUILD_WORKERS, 8)
+        self.assertEqual(
+            ADAPTER_DELTA_BUILD_INFLIGHT_FRAMES,
+            2 * ADAPTER_DELTA_BUILD_WORKERS,
+        )
+        self.assertEqual(os.environ["OPENBLAS_NUM_THREADS"], "1")
+        self.assertEqual(os.environ["OMP_NUM_THREADS"], "1")
+        self.assertEqual(os.environ["MKL_NUM_THREADS"], "1")
+
+    def test_parallel_builder_is_deterministic_and_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = bytes((index * 29) % 256 for index in range(32 * 1024))
+            changed = bytearray(payload)
+            changed[::97] = bytes([0xA5]) * len(changed[::97])
+            base = _export(root, "base", payload)
+            first = _export(root, "first", bytes(changed))
+            second = _export(root, "second", bytes(changed))
+            first_manifest = build_adapter_delta(
+                base, first, max_ratio=0.99, frame_bytes=1024
+            )
+            second_manifest = build_adapter_delta(
+                base, second, max_ratio=0.99, frame_bytes=1024
+            )
+            self.assertEqual(
+                (first / ADAPTER_DELTA_FILE).read_bytes(),
+                (second / ADAPTER_DELTA_FILE).read_bytes(),
+            )
+            self.assertEqual(
+                first_manifest.read_bytes(),
+                second_manifest.read_bytes(),
+            )
+
+            failed = _export(root, "failed", bytes(changed))
+            with patch.object(
+                adapter_delta_module,
+                "_encode_delta_frame",
+                side_effect=AdapterDeltaError("compiled encode failed"),
+            ):
+                with self.assertRaisesRegex(
+                    AdapterDeltaError, "compiled encode failed"
+                ):
+                    build_adapter_delta(
+                        base, failed, max_ratio=0.99, frame_bytes=1024
+                    )
+            self.assertFalse((failed / ADAPTER_DELTA_FILE).exists())
+            self.assertFalse((failed / "adapter_delta.json").exists())
+            self.assertFalse(
+                any(".partial" in path.name for path in failed.iterdir())
+            )
+
     def test_xor_uses_the_compiled_numpy_helper(self) -> None:
         expected = bytes([0xFF, 0x00, 0xA5])
         with patch.object(
