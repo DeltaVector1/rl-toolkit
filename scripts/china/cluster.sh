@@ -18,6 +18,8 @@ phase_profile_sample_every=8
 trainer_module=prime_rl.trainer.rl.train
 nsys_env=()
 nsys_mounts=()
+qualification_test_mounts=()
+cuda_memory_env=()
 # RUN selects which config pair under configs/china to use and where logs land.
 # Defaults keep the historical r33 layout.
 RUN=${RUN:-r33}
@@ -291,9 +293,9 @@ PY
     fi
     if [ -n "$configured_phase_profile" ]; then
       case "$(readlink -f "$trainer_config")" in
-        "$(readlink -f "$deployment/configs/qualification/glm52-native-small.toml")"|"$(readlink -f "$deployment/configs/qualification/glm52-native-b2048.toml")") ;;
+        "$(readlink -f "$deployment/configs/qualification/glm52-native-small.toml")"|"$(readlink -f "$deployment/configs/qualification/glm52-native-b2048.toml")"|"$(readlink -f "$deployment/configs/qualification/glm52-native-b2048-memory.toml")") ;;
         *)
-          echo "phase profiling may only be enabled by the GLM small or b2048 qualification config" >&2
+          echo "phase profiling may only be enabled by a GLM small or b2048 qualification config" >&2
           exit 1
           ;;
       esac
@@ -304,6 +306,43 @@ PY
       phase_profile="$configured_phase_profile"
       phase_profile_steps="$configured_phase_profile_steps"
       phase_profile_sample_every="$configured_phase_profile_sample_every"
+    fi
+    if [ "${PRIME_QUALIFICATION_PROFILE:-}" = "glm52-native-b2048-memory" ]; then
+      [ "$(readlink -f "$trainer_config")" = "$(readlink -f "$deployment/configs/qualification/glm52-native-b2048-memory.toml")" ] || {
+        echo "CUDA memory capture may only be enabled by the GLM b2048 memory qualification config" >&2
+        exit 1
+      }
+      [ "${PRIME_CUDA_MEMORY_CAPTURE:-}" = "1" ] || {
+        echo "PRIME_CUDA_MEMORY_CAPTURE must be 1 when configured" >&2
+        exit 1
+      }
+      [ "${PRIME_CUDA_MEMORY_CAPTURE_RANK:-}" = "0" ] || {
+        echo "CUDA memory capture rank is pinned to rank 0" >&2
+        exit 1
+      }
+      [ "${PRIME_CUDA_MEMORY_CAPTURE_STEP:-}" = "1" ] || {
+        echo "CUDA memory capture step is pinned to step 1" >&2
+        exit 1
+      }
+      [ "${PRIME_CUDA_MEMORY_CAPTURE_PATH:-}" = "$trainer_output/cuda-memory-capture.json" ] || {
+        echo "CUDA memory capture path must be under the selected qualification output" >&2
+        exit 1
+      }
+      qualification_test_mounts=(
+        -v "$deployment/source/tests/test_final_pp16_cuda.py":/app/tests/test_final_pp16_cuda.py:ro
+      )
+      cuda_memory_env=(
+        -e "PRIME_CUDA_MEMORY_CAPTURE=${PRIME_CUDA_MEMORY_CAPTURE}"
+        -e "PRIME_CUDA_MEMORY_CAPTURE_RANK=${PRIME_CUDA_MEMORY_CAPTURE_RANK}"
+        -e "PRIME_CUDA_MEMORY_CAPTURE_STEP=${PRIME_CUDA_MEMORY_CAPTURE_STEP}"
+        -e "PRIME_CUDA_MEMORY_CAPTURE_PATH=${PRIME_CUDA_MEMORY_CAPTURE_PATH}"
+      )
+    elif [ -n "${PRIME_CUDA_MEMORY_CAPTURE:-}" ] || \
+         [ -n "${PRIME_CUDA_MEMORY_CAPTURE_RANK:-}" ] || \
+         [ -n "${PRIME_CUDA_MEMORY_CAPTURE_STEP:-}" ] || \
+         [ -n "${PRIME_CUDA_MEMORY_CAPTURE_PATH:-}" ]; then
+      echo "CUDA memory capture may only be enabled by the GLM b2048 memory qualification profile" >&2
+      exit 1
     fi
     parity_trace_runtime=""
     parity_image_digest=""
@@ -395,10 +434,10 @@ PY
         echo "qualification session ID is invalid" >&2; exit 1
       }
       case "${PRIME_QUALIFICATION_PROFILE:-}" in
-        glm52-native-b2048|glm52-native-b2048-nsys|glm52-native-delta3|glm52-native-stability20) ;;
+        glm52-native-b2048|glm52-native-b2048-memory|glm52-native-b2048-nsys|glm52-native-delta3|glm52-native-stability20) ;;
         *) echo "qualification profile is invalid" >&2; exit 1 ;;
       esac
-      if [ "${PRIME_QUALIFICATION_PROFILE}" = "glm52-native-b2048" ] || [ "${PRIME_QUALIFICATION_PROFILE}" = "glm52-native-b2048-nsys" ]; then
+      if [ "${PRIME_QUALIFICATION_PROFILE}" = "glm52-native-b2048" ] || [ "${PRIME_QUALIFICATION_PROFILE}" = "glm52-native-b2048-memory" ] || [ "${PRIME_QUALIFICATION_PROFILE}" = "glm52-native-b2048-nsys" ]; then
         for deadline in \
           "${PRIME_QUALIFICATION_SESSION_DEADLINE_SECONDS:-}" \
           "${PRIME_QUALIFICATION_STARTUP_DEADLINE_SECONDS:-}" \
@@ -438,6 +477,7 @@ PY
         python3 - "$deployment" "$qualification_session" "$PRIME_QUALIFICATION_SESSION_SHA256" "n$node" <<'PY'
 import hashlib
 import json
+import os
 from pathlib import Path, PurePosixPath
 import re
 import sys
@@ -474,6 +514,12 @@ try:
     )
 except OSError as error:
     raise SystemExit("qualification launcher inventory is unavailable") from error
+if os.environ.get("PRIME_QUALIFICATION_PROFILE") != "glm52-native-b2048-memory":
+    mounted_paths = [
+        path
+        for path in mounted_paths
+        if path != "source/tests/test_final_pp16_cuda.py"
+    ]
 expected_paths = set(mounted_paths) | {"scripts/china/cluster.sh"}
 if set(source_files) != expected_paths:
     raise SystemExit("qualification source manifest differs from launcher mounts")
@@ -540,7 +586,7 @@ PY
         -e "PRIME_TRAINER_HOST=n$node"
         -e "PRIME_TRAINER_HEAD=n$trainer_head_node"
       )
-      if [ "$PRIME_QUALIFICATION_PROFILE" = "glm52-native-b2048" ] || [ "$PRIME_QUALIFICATION_PROFILE" = "glm52-native-b2048-nsys" ]; then
+      if [ "$PRIME_QUALIFICATION_PROFILE" = "glm52-native-b2048" ] || [ "$PRIME_QUALIFICATION_PROFILE" = "glm52-native-b2048-memory" ] || [ "$PRIME_QUALIFICATION_PROFILE" = "glm52-native-b2048-nsys" ]; then
         qualification_env+=(
           -e "PRIME_QUALIFICATION_SESSION_DEADLINE_SECONDS=$PRIME_QUALIFICATION_SESSION_DEADLINE_SECONDS"
           -e "PRIME_QUALIFICATION_STARTUP_DEADLINE_SECONDS=$PRIME_QUALIFICATION_STARTUP_DEADLINE_SECONDS"
@@ -625,6 +671,8 @@ PY
       "${verifiers_mount[@]}" \
       "${prime_configs_mount[@]}" \
       "${nsys_mounts[@]}" \
+      "${qualification_test_mounts[@]}" \
+      "${cuda_memory_env[@]}" \
       -e TMPDIR=/scratch-tmp \
       -e PRIME_ADAPTER_DELTA="${PRIME_ADAPTER_DELTA:-0}" \
       -e PYTHONPATH="$deployment/env":/app/packages/prime-rl-configs/src:/app/src \

@@ -383,6 +383,32 @@ _QUALIFICATION_LAUNCH_ENV_PATTERNS = {
     "PRIME_CUDA_PROFILE": re.compile(r"[01]"),
     "PRIME_CUDA_PROFILE_RANK": re.compile(r"[0-9]+"),
     "PRIME_CUDA_PROFILE_STEPS": re.compile(r"(?:[2-9]|[1-9][0-9]+)"),
+    "PRIME_CUDA_MEMORY_CAPTURE": re.compile(r"1"),
+    "PRIME_CUDA_MEMORY_CAPTURE_RANK": re.compile(r"0"),
+    "PRIME_CUDA_MEMORY_CAPTURE_STEP": re.compile(r"1"),
+    "PRIME_CUDA_MEMORY_CAPTURE_PATH": re.compile(
+        r"/data/glm52-rl/qualifications/glm52-native-b2048-memory/"
+        r"cuda-memory-capture\.json"
+    ),
+}
+
+_CUDA_MEMORY_CAPTURE_PROFILE = "glm52-native-b2048-memory"
+_CUDA_MEMORY_CAPTURE_KEYS = frozenset(
+    {
+        "PRIME_CUDA_MEMORY_CAPTURE",
+        "PRIME_CUDA_MEMORY_CAPTURE_RANK",
+        "PRIME_CUDA_MEMORY_CAPTURE_STEP",
+        "PRIME_CUDA_MEMORY_CAPTURE_PATH",
+    }
+)
+_CUDA_MEMORY_CAPTURE_ENV = {
+    "PRIME_CUDA_MEMORY_CAPTURE": "1",
+    "PRIME_CUDA_MEMORY_CAPTURE_RANK": "0",
+    "PRIME_CUDA_MEMORY_CAPTURE_STEP": "1",
+    "PRIME_CUDA_MEMORY_CAPTURE_PATH": (
+        "/data/glm52-rl/qualifications/glm52-native-b2048-memory/"
+        "cuda-memory-capture.json"
+    ),
 }
 
 _NSYS_QUALIFICATION_PROFILE = "glm52-native-b2048-nsys"
@@ -496,6 +522,15 @@ def _qualification_launch_env(profile: dict) -> dict[str, str]:
         if _QUALIFICATION_LAUNCH_ENV_PATTERNS[key].fullmatch(value) is None:
             raise Refused(f"qualification launch_env {key} has an invalid value")
         validated[key] = value
+    memory_keys = set(validated) & _CUDA_MEMORY_CAPTURE_KEYS
+    if memory_keys and memory_keys != _CUDA_MEMORY_CAPTURE_KEYS:
+        raise Refused(
+            "CUDA memory capture launch_env must define all pinned capture values"
+        )
+    if memory_keys and {
+        key: validated[key] for key in _CUDA_MEMORY_CAPTURE_KEYS
+    } != _CUDA_MEMORY_CAPTURE_ENV:
+        raise Refused("CUDA memory capture launch_env differs from the pinned profile")
     return validated
 
 ssh_command = [
@@ -7458,15 +7493,31 @@ def _repair_supervisors() -> str:
     return msg
 
 
+_QUALIFICATION_ONLY_MOUNTS = {
+    _CUDA_MEMORY_CAPTURE_PROFILE: frozenset({"source/tests/test_final_pp16_cuda.py"}),
+}
+
+
 def _mounts_in(script: Path) -> set[str]:
-    """Repository paths mounted by one container launcher."""
-    return set(re.findall(r'-v "\$deployment/(\S+?)":', script.read_text()))
+    """Repository paths mounted by the normal container launcher."""
+    mounted = set(re.findall(r'-v "\$deployment/(\S+?)":', script.read_text()))
+    for paths in _QUALIFICATION_ONLY_MOUNTS.values():
+        mounted.difference_update(paths)
+    return mounted
 
 
-def _qualification_source_paths() -> set[str]:
-    """Return the exact source inventory used by the trainer launcher."""
+def _qualification_mounts(profile_name: str | None = None) -> set[str]:
+    """Return normal mounts plus mounts selected by one qualification profile."""
+    mounted = _mounts_in(repo_root / "scripts" / "china" / "cluster.sh")
+    if profile_name is not None:
+        mounted.update(_QUALIFICATION_ONLY_MOUNTS.get(profile_name, ()))
+    return mounted
+
+
+def _qualification_source_paths(profile_name: str | None = None) -> set[str]:
+    """Return the exact source inventory used by one trainer qualification."""
     launcher = "scripts/china/cluster.sh"
-    mounted = _mounts_in(repo_root / launcher)
+    mounted = _qualification_mounts(profile_name)
     if not mounted:
         raise Refused("trainer launcher has no repository source mounts")
     return {launcher, *mounted}
@@ -7487,10 +7538,15 @@ def mounted_files() -> list[str]:
     return sorted(set().union(*(_mounts_in(script) for script in scripts)))
 
 
-def trainer_mount_preflight(nodes: list[str] | None = None) -> dict[str, str]:
+def trainer_mount_preflight(
+    nodes: list[str] | None = None,
+    profile_name: str | None = None,
+    repository_root: str | None = None,
+) -> dict[str, str]:
     """Require every configured trainer bind source to match this worktree."""
     nodes = [_check_host(host) for host in (nodes or trainer_hosts)]
-    manifest = sorted(_mounts_in(repo_root / "scripts" / "china" / "cluster.sh"))
+    manifest = sorted(_qualification_mounts(profile_name))
+    remote_root = repository_root or remote_repo
     missing_local = [path for path in manifest if not (repo_root / path).is_file()]
     if missing_local:
         raise Refused(
@@ -7503,7 +7559,7 @@ def trainer_mount_preflight(nodes: list[str] | None = None) -> dict[str, str]:
     }
     checks = []
     for path in manifest:
-        remote = f"{remote_repo}/{path}"
+        remote = f"{remote_root}/{path}"
         checks.append(
             f"if test -f {shlex.quote(remote)}; then "
             f"printf '%s\\t' {shlex.quote(path)}; "
@@ -7549,14 +7605,21 @@ def trainer_mount_preflight(nodes: list[str] | None = None) -> dict[str, str]:
     return expected
 
 
-def _trainer_qualification_source_files(nodes: list[str]) -> dict[str, str]:
-    source_files = trainer_mount_preflight(nodes)
+def _trainer_qualification_source_files(
+    nodes: list[str],
+    profile_name: str | None = None,
+    repository_root: str | None = None,
+) -> dict[str, str]:
+    source_files = trainer_mount_preflight(
+        nodes, profile_name=profile_name, repository_root=repository_root
+    )
     launcher = "scripts/china/cluster.sh"
-    expected_paths = _qualification_source_paths()
+    expected_paths = _qualification_source_paths(profile_name)
     if set(source_files) != expected_paths - {launcher}:
         raise Refused("trainer source manifest differs from launcher mounts")
     digest = hashlib.sha256((repo_root / launcher).read_bytes()).hexdigest()
-    remote = f"{remote_repo}/{launcher}"
+    remote_root = repository_root or remote_repo
+    remote = f"{remote_root}/{launcher}"
     results = _fan(
         nodes,
         lambda host: _ssh(
@@ -8295,7 +8358,7 @@ def _qualification_sources_match(
 ) -> bool:
     source_files = session.get("source_files")
     try:
-        expected_paths = _qualification_source_paths()
+        expected_paths = _qualification_source_paths(profile_name)
     except Refused:
         return False
     if (
@@ -8338,6 +8401,7 @@ def _validate_trainer_qualification(
     )
     expected_step_counts = {
         "glm52-native-b2048": 2,
+        "glm52-native-b2048-memory": 2,
         "glm52-native-b2048-nsys": 2,
         "glm52-native-delta3": 3,
         "glm52-native-stability20": 20,
@@ -8375,7 +8439,11 @@ def _validate_trainer_qualification(
         "glm52_trainer_qualification_session"
     ):
         failures.append("qualification session schema is invalid")
-    if profile_name in {"glm52-native-b2048", "glm52-native-b2048-nsys"}:
+    if profile_name in {
+        "glm52-native-b2048",
+        "glm52-native-b2048-memory",
+        "glm52-native-b2048-nsys",
+    }:
         session_deadline, startup_deadline, step_deadline, profiler_deadline = (
             _glm_b2048_deadlines()
         )
@@ -8419,7 +8487,7 @@ def _validate_trainer_qualification(
     source_files = session.get("source_files")
     if (
         not isinstance(source_files, dict)
-        or set(source_files) != _qualification_source_paths()
+        or set(source_files) != _qualification_source_paths(profile_name)
     ):
         failures.append("qualification source file evidence differs from launcher mounts")
     elif hashlib.sha256(
@@ -9868,7 +9936,7 @@ def production_start_preflight() -> dict[str, object]:
     return result
 
 
-def _mounted_on(path: str, host: str) -> bool:
+def _mounted_on(path: str, host: str, profile_name: str | None = None) -> bool:
     if host in inference_hosts:
         scripts = (
             repo_root / "scripts" / "h200" / "start_orchestrator.sh",
@@ -9877,17 +9945,27 @@ def _mounted_on(path: str, host: str) -> bool:
         )
     else:
         scripts = (repo_root / "scripts" / "china" / "cluster.sh",)
-    return any(path in _mounts_in(script) for script in scripts)
+    if any(path in _mounts_in(script) for script in scripts):
+        return True
+    return host in trainer_hosts and path in _QUALIFICATION_ONLY_MOUNTS.get(
+        profile_name, ()
+    )
 
 
-def deploy(path: str, nodes: list[str] | None = None) -> bool:
+def deploy(
+    path: str,
+    nodes: list[str] | None = None,
+    repository: str = "default",
+    profile_name: str | None = None,
+) -> bool:
     """Push one repository file to its hosts and verify the checksum."""
+    repository_root = _repository_root(repository)
     if nodes is None:
         if path.startswith("source/"):
             nodes = [
                 host
                 for host in dict.fromkeys([*trainer_hosts, *inference_hosts])
-                if _mounted_on(path, host)
+                if _mounted_on(path, host, profile_name)
             ]
         elif path.startswith("environments/"):
             nodes = [orchestrator_host]
@@ -9908,7 +9986,9 @@ def deploy(path: str, nodes: list[str] | None = None) -> bool:
     if not local.is_file():
         raise Refused(f"not in the repository: {local}")
     if path.startswith("source/"):
-        unmounted = [host for host in nodes if not _mounted_on(path, host)]
+        unmounted = [
+            host for host in nodes if not _mounted_on(path, host, profile_name)
+        ]
         if unmounted:
             raise Refused(
                 f"{path} is not mounted by the launcher for {unmounted}, so the "
@@ -9917,7 +9997,7 @@ def deploy(path: str, nodes: list[str] | None = None) -> bool:
                 "to list the union."
             )
     want = hashlib.sha256(local.read_bytes()).hexdigest()
-    remote = f"{remote_repo}/{path}"
+    remote = f"{repository_root}/{path}"
     remote_mode = "0755" if local.stat().st_mode & 0o111 else "0644"
 
     def one(h):
@@ -10344,7 +10424,7 @@ def _prepare_trainer_qualification_session(
     if output is None or output.parent != qualification_root:
         raise Refused("qualification output directory is not an exact child of its root")
     if (
-        set(source_files) != _qualification_source_paths()
+        set(source_files) != _qualification_source_paths(profile)
         or any(
         not isinstance(path, str)
         or not isinstance(digest, str)
@@ -10357,7 +10437,11 @@ def _prepare_trainer_qualification_session(
     image_digests = _trainer_image_digest_map(nodes)
 
     deadline_values = None
-    if profile in {"glm52-native-b2048", "glm52-native-b2048-nsys"}:
+    if profile in {
+        "glm52-native-b2048",
+        "glm52-native-b2048-memory",
+        "glm52-native-b2048-nsys",
+    }:
         session_deadline, startup_deadline, step_deadline, profiler_deadline = (
             _glm_b2048_deadlines()
         )
@@ -10534,6 +10618,13 @@ def _qualify_connected(
 
     selected = _profile(name)
     launch_env = _qualification_launch_env(selected)
+    memory_keys = set(launch_env) & _CUDA_MEMORY_CAPTURE_KEYS
+    if name == _CUDA_MEMORY_CAPTURE_PROFILE and launch_env != _CUDA_MEMORY_CAPTURE_ENV:
+        raise Refused("CUDA memory capture profile is not pinned to rank 0 step 1")
+    if memory_keys and name != _CUDA_MEMORY_CAPTURE_PROFILE:
+        raise Refused(
+            "CUDA memory capture is only allowed by the b2048 memory profile"
+        )
     selected_trainer_container = _profile_trainer_container(selected)
     if "orchestrator" in selected:
         raise Refused(f"profile {name!r} is a full run; use start()")
@@ -10548,6 +10639,7 @@ def _qualify_connected(
     local_config = repo_root / relative_config
     if not local_config.is_file():
         raise Refused(f"missing qualification config {relative_config}")
+    repository_root = _profile_trainer_repository(selected)
     with local_config.open("rb") as stream:
         config = tomllib.load(stream)
     nsys_capture = _qualification_nsys_capture(
@@ -10558,6 +10650,7 @@ def _qualify_connected(
     )
     strict_qualification = name in {
         "glm52-native-b2048",
+        "glm52-native-b2048-memory",
         "glm52-native-b2048-nsys",
         "glm52-native-delta3",
         "glm52-native-stability20",
@@ -10620,17 +10713,28 @@ def _qualify_connected(
         )
 
     trainer_mounts = sorted(
-        _mounts_in(repo_root / "scripts" / "china" / "cluster.sh")
+        _qualification_mounts(name)
+        if strict_qualification
+        else _mounts_in(repo_root / "scripts" / "china" / "cluster.sh")
     )
     qualification_identity = None
     qualification_env = ""
+    deploy_options = {}
+    if repository_root != remote_repo:
+        deploy_options["repository"] = "glm52-qualification"
+    if name in _QUALIFICATION_ONLY_MOUNTS:
+        deploy_options["profile_name"] = name
     for path in ("scripts/china/cluster.sh", *trainer_mounts, relative_config):
-        if not deploy(path, nodes=nodes):
+        if not deploy(path, nodes=nodes, **deploy_options):
             raise RuntimeError(f"failed to deploy {path}")
     source_files = (
-        _trainer_qualification_source_files(nodes)
+        _trainer_qualification_source_files(
+            nodes, profile_name=name, repository_root=repository_root
+        )
         if strict_qualification
-        else trainer_mount_preflight(nodes)
+        else trainer_mount_preflight(
+            nodes, profile_name=name, repository_root=repository_root
+        )
     )
     if strict_qualification:
         qualification_identity = _prepare_trainer_qualification_session(
@@ -10683,12 +10787,12 @@ def _qualify_connected(
 
     trainer_nodes = " ".join(host.removeprefix("n") for host in nodes)
     env = (
-        f"prime_deployment={shlex.quote(remote_repo)} "
+        f"prime_deployment={shlex.quote(repository_root)} "
         f"prime_image={shlex.quote(trainer_image)} "
         f"prime_trainer_container={shlex.quote(selected_trainer_container)} "
         f"trainer_nodes='{trainer_nodes}' RUN={shlex.quote(name)} "
         f"RUN_NAME=run_{shlex.quote(name)} "
-        f"TRAINER_CONFIG={remote_repo}/{relative_config} "
+        f"TRAINER_CONFIG={repository_root}/{relative_config} "
         f"{qualification_env}"
         "PRIME_EP_PROFILE=0 PRIME_EP_AC_CACHE=0 PRIME_INT4_COMBINE_ROUNDS=1 "
         "PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD=0 PRIME_NCCL_CHANNELS=16"
@@ -10720,7 +10824,7 @@ def _qualify_connected(
         nodes,
         lambda host: _ssh(
             host,
-            f"{env} bash {trainer_launcher} trainer",
+            f"{env} bash {repository_root}/scripts/china/cluster.sh trainer",
             300,
         ),
     )
@@ -10753,6 +10857,7 @@ def _qualify_connected(
             "PRIME_CUDA_PROFILE",
             "PRIME_CUDA_PROFILE_RANK",
             "PRIME_CUDA_PROFILE_STEPS",
+            *launch_env,
         )
         probe_source = """import json
 import subprocess
@@ -10825,7 +10930,7 @@ print(json.dumps({
                 "-m",
                 trainer_module,
                 "@",
-                f"{remote_repo}/{relative_config}",
+                f"{repository_root}/{relative_config}",
             ]
             expected_environment = {
                 "PRIME_QUALIFICATION_SESSION_ID": qualification_identity.session_id,
@@ -10839,7 +10944,11 @@ print(json.dumps({
                 "PRIME_TRAINER_HOST": host,
                 "PRIME_TRAINER_HEAD": trainer_head,
             }
-            if name in {"glm52-native-b2048", "glm52-native-b2048-nsys"}:
+            if name in {
+                "glm52-native-b2048",
+                "glm52-native-b2048-memory",
+                "glm52-native-b2048-nsys",
+            }:
                 session_deadline, startup_deadline, step_deadline, profiler_deadline = (
                     _glm_b2048_deadlines()
                 )
@@ -10851,7 +10960,10 @@ print(json.dumps({
                         "PRIME_QUALIFICATION_PROFILER_FINALIZE_DEADLINE_SECONDS": str(profiler_deadline),
                     }
                 )
-            if nsys_capture is not None:
+            if launch_env and (
+                memory_keys
+                or (nsys_capture is not None and host == nsys_capture.host)
+            ):
                 expected_environment.update(launch_env)
             mismatches = []
             if observed.get("name") != f"/{selected_trainer_container}":

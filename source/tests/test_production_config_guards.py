@@ -34,6 +34,7 @@ def test_current_glm52_profile_is_batch_2048_without_rollout_cache() -> None:
         "glm52-native-small",
         "glm52-policy-parity",
         "glm52-native-b2048",
+        "glm52-native-b2048-memory",
         "glm52-native-b2048-nsys",
         "glm52-native-delta3",
         "glm52-native-stability20",
@@ -41,6 +42,7 @@ def test_current_glm52_profile_is_batch_2048_without_rollout_cache() -> None:
     current = operations["profiles"]["current"]
     assert current == {
         "kind": "glm52",
+        "trainer_container": "trainer",
         "trainer": "configs/paused/trainer.glm52-production.toml",
         "orchestrator": "configs/paused/orchestrator.glm52-production.toml",
         "environment": "configs/paused/env.glm52-production.toml",
@@ -215,6 +217,24 @@ def test_glm52_interleaved_qualification_uses_uneven_two_chunk_layout() -> None:
         ]
 
 
+def test_glm52_memory_qualification_mounts_synthetic_cuda_gate_only() -> None:
+    launcher = (ROOT / "scripts/china/cluster.sh").read_text()
+    source = '"$deployment/source/tests/test_final_pp16_cuda.py"'
+    selector = (
+        'if [ "${PRIME_QUALIFICATION_PROFILE:-}" = '
+        '"glm52-native-b2048-memory" ]; then'
+    )
+    assert "qualification_test_mounts=()" in launcher
+    assert selector in launcher
+    assert (
+        '-v "$deployment/source/tests/test_final_pp16_cuda.py":'
+        "/app/tests/test_final_pp16_cuda.py:ro"
+    ) in launcher
+    assert '"${qualification_test_mounts[@]}"' in launcher
+    assert launcher.count(source) == 1
+    assert source not in (ROOT / "scripts/h200/start_orchestrator.sh").read_text()
+
+
 def test_glm52_production_profiles_disable_cuda_profiling() -> None:
     profiling_names = {
         "PRIME_PROFILE_PP_STAGE": "1",
@@ -281,6 +301,7 @@ def test_all_glm52_trainers_use_h200_w8a8_semantics() -> None:
         "configs/qualification/glm52-policy-parity-trainer.toml",
         "configs/qualification/glm52-native-small.toml",
         "configs/qualification/glm52-native-b2048.toml",
+        "configs/qualification/glm52-native-b2048-memory.toml",
         "configs/qualification/glm52-native-b2048-nsys.toml",
         "configs/qualification/glm52-native-delta3.toml",
         "configs/qualification/glm52-native-stability20.toml",
@@ -353,6 +374,7 @@ def test_glm52_production_profile_matches_requirements() -> None:
 
     assert operations["profiles"]["current"] == {
         "kind": "glm52",
+        "trainer_container": "trainer",
         "trainer": "configs/paused/trainer.glm52-production.toml",
         "orchestrator": "configs/paused/orchestrator.glm52-production.toml",
         "environment": "configs/paused/env.glm52-production.toml",
