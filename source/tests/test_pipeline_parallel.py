@@ -32,6 +32,13 @@ GLM_INDEXER_TYPES = [
     "shared",
 ] + [kind for _ in range(18) for kind in ("full", "shared", "shared", "shared")]
 
+# Qualification layout for interleaved PP8. Ranks own virtual stages
+# ``rank`` and ``rank + 8``. The pair totals are [8, 10, ..., 10], so rank 0
+# has eight layers and the remaining ranks have ten layers each.
+GLM_INTERLEAVED_BOUNDARIES = [
+    0, 3, 7, 11, 15, 19, 23, 27, 31, 36, 42, 48, 54, 60, 66, 72, 78
+]
+
 
 class _Module:
     def __init__(self, *args, **kwargs):
@@ -221,13 +228,49 @@ class PipelineBalanceTest(unittest.TestCase):
             pp_transfer_sparse_indices=True,
             pp_boundary_plan="balanced",
             pp_layer_boundaries=[0, 8, 18, 28, 38, 48, 58, 69, 78],
-            pp_virtual_layer_boundaries=[0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 78],
+            pp_virtual_layer_boundaries=GLM_INTERLEAVED_BOUNDARIES,
         )
         bounds = [
             self.pp.stage_layer_range(78, stage, 16, config)[0]
             for stage in range(16)
         ] + [78]
-        self.assertEqual(bounds, [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 78])
+        self.assertEqual(bounds, GLM_INTERLEAVED_BOUNDARIES)
+
+        virtual_counts = [
+            end - start for start, end in zip(bounds, bounds[1:])
+        ]
+        self.assertEqual(
+            virtual_counts,
+            [3, 4, 4, 4, 4, 4, 4, 4, 5, 6, 6, 6, 6, 6, 6, 6],
+        )
+        self.assertEqual(
+            [virtual_counts[rank] + virtual_counts[rank + 8] for rank in range(8)],
+            [8, 10, 10, 10, 10, 10, 10, 10],
+        )
+        owned_layers = [
+            layer
+            for rank in range(8)
+            for stage in (rank, rank + 8)
+            for layer in range(bounds[stage], bounds[stage + 1])
+        ]
+        self.assertEqual(sorted(owned_layers), list(range(78)))
+        self.assertEqual(sum(virtual_counts), 78)
+
+        # The qualification estimate uses the measured per-layer weight and
+        # in-flight activation costs. Check both the stage and physical-rank
+        # peaks so a layer move cannot hide a new local maximum.
+        stage_costs = [
+            size * (1.50 + 0.137 * (16 - stage))
+            for stage, size in enumerate(virtual_counts)
+        ]
+        rank_costs = [
+            stage_costs[rank] + stage_costs[rank + 8]
+            for rank in range(8)
+        ]
+        self.assertAlmostEqual(max(stage_costs), 14.754)
+        self.assertAlmostEqual(max(rank_costs), 28.974)
+        self.assertAlmostEqual(rank_costs[0], 24.056)
+        self.assertLess(max(rank_costs), 31.44)
 
     def test_interleaved_plan_requires_explicit_virtual_boundaries(self):
         config = types.SimpleNamespace(
@@ -252,7 +295,7 @@ class PipelineBalanceTest(unittest.TestCase):
             pp_transfer_sparse_indices=True,
             pp_boundary_plan="balanced",
             pp_layer_boundaries=[0, 8, 18, 28, 38, 48, 58, 69, 78],
-            pp_virtual_layer_boundaries=[0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 78],
+            pp_virtual_layer_boundaries=GLM_INTERLEAVED_BOUNDARIES,
             num_hidden_layers=78,
             indexer_types=GLM_INDEXER_TYPES,
         )
@@ -307,18 +350,18 @@ class PipelineBalanceTest(unittest.TestCase):
             [(stage, receive, send) for stage, receive, send, _, _ in expected],
             [
                 (0, False, True),
-                (1, True, False),
-                (2, False, True),
+                (1, True, True),
+                (2, True, True),
                 (3, True, True),
                 (4, True, True),
-                (5, True, False),
-                (6, False, True),
+                (5, True, True),
+                (6, True, True),
                 (7, True, True),
                 (8, True, True),
                 (9, True, False),
                 (10, False, True),
-                (11, True, True),
-                (12, True, True),
+                (11, True, False),
+                (12, False, True),
                 (13, True, False),
                 (14, False, True),
                 (15, True, False),
