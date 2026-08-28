@@ -486,16 +486,13 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None):
 
     delta = preprocess_kernel(o, do)
     if use_two_stage:
-        # The TileLang signature retains a dKV pointer, but the compile-time
-        # compute_dkv=False path never reads or writes it.
-        dkv = torch.empty(1, device=kv.device, dtype=torch.float32)
+        dkv = torch.empty_like(kv, dtype=torch.float32)
     else:
         dkv = torch.zeros_like(kv, dtype=torch.float32)
     dq = bwd_kernel(q, kv, do, indices, lse, delta, dkv)
     if use_two_stage:
         from prime_rl.trainer.models.kernels.sparse_mla_two_stage import sparse_mla_dkv_two_stage
 
-        del dkv
         dkv, _memory = sparse_mla_dkv_two_stage(
             q,
             kv,
@@ -504,6 +501,7 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None):
             lse,
             delta,
             sm_scale=sm_scale,
+            output=dkv,
         )
     else:
         dkv = postprocess_kernel(dkv)

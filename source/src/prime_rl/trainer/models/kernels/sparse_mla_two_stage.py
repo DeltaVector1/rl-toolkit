@@ -22,8 +22,9 @@ ROPE_WIDTH = 64
 TOTAL_WIDTH = VALUE_WIDTH + ROPE_WIDTH
 GROUPS = 1
 TOPK = 2048
-BLOCK_WIDTH = 128
-ROUTE_BYTES_PER_ENTRY = 28
+BLOCK_WIDTH = 1024
+ROUTE_BYTES_PER_ENTRY = 29
+ROUTE_FILTER_BYTES_PER_ENTRY = 13
 MAX_WORKSPACE_BYTES = 256 * 1024 * 1024
 LOG2_E = 1.4426950408889634
 
@@ -31,6 +32,7 @@ LOG2_E = 1.4426950408889634
 @dataclass(frozen=True)
 class TwoStageMemory:
     sequence_kv: int
+    route_filter_bytes: int
     route_sort_bytes: int
     reduction_bytes: int
     total_bytes: int
@@ -41,25 +43,28 @@ def two_stage_memory(
     *,
     route_count: int = QUERY_TOKENS * TOPK,
 ) -> TwoStageMemory:
-    """Return the conservative peak workspace bound.
+    """Return the conservative peak workspace bound in bytes.
 
-    Route compaction and sorting happen before the FP32 output is allocated.
-    The larger of that temporary and the reduction buffers is the bound.
+    The sort ledger includes keys, positions, stable-sort order, sort scratch,
+    and sorted positions.  Reduction includes route positions, offsets, and
+    the FP32/BF16 output pair.
     """
 
     if sequence_kv < 1 or route_count < 0:
         raise ValueError("two-stage memory dimensions must be non-negative")
+    route_filter_bytes = route_count * ROUTE_FILTER_BYTES_PER_ENTRY
     route_sort_bytes = route_count * ROUTE_BYTES_PER_ENTRY
     reduction_bytes = (
         route_count * 4
         + (sequence_kv + 1) * 8
-        + sequence_kv * TOTAL_WIDTH * 4
+        + sequence_kv * TOTAL_WIDTH * (4 + 2)
     )
     return TwoStageMemory(
         sequence_kv=sequence_kv,
+        route_filter_bytes=route_filter_bytes,
         route_sort_bytes=route_sort_bytes,
         reduction_bytes=reduction_bytes,
-        total_bytes=max(route_sort_bytes, reduction_bytes),
+        total_bytes=max(route_filter_bytes, route_sort_bytes, reduction_bytes),
     )
 
 
@@ -113,8 +118,7 @@ if triton is not None:
         BLOCK_WIDTH: tl.constexpr,
     ):
         key_id = tl.program_id(0)
-        width_block = tl.program_id(1)
-        width = width_block * BLOCK_WIDTH + tl.arange(0, BLOCK_WIDTH)
+        width = tl.arange(0, BLOCK_WIDTH)
         output_mask = width < TOTAL_WIDTH
         route_start = tl.load(key_offsets + key_id)
         route_end = tl.load(key_offsets + key_id + 1)
@@ -146,7 +150,6 @@ if triton is not None:
 
                 lse_value = tl.load(lse + query_id * lse_stride_s + head * lse_stride_h)
                 probability = tl.exp2(score * (sm_scale * LOG2_E) - lse_value)
-                probability = tl.where(probability == probability, probability, 0.0)
 
                 dp_score = tl.zeros((), dtype=tl.float32)
                 for score_start in range(0, VALUE_WIDTH, BLOCK_WIDTH):
@@ -165,7 +168,6 @@ if triton is not None:
                     dp_score += tl.sum(do_score * kv_score, axis=0)
                 delta_value = tl.load(delta + query_id * delta_stride_s + head * delta_stride_h)
                 dp = probability * (dp_score - delta_value) * sm_scale
-                dp = tl.where(dp == dp, dp, 0.0)
 
                 q_output = tl.load(q + q_base + width, mask=output_mask, other=0.0).to(tl.float32)
                 do_output = tl.load(
@@ -194,12 +196,10 @@ def _sorted_route_positions(
     keys = flat.masked_select(valid)
     positions = positions.masked_select(valid)
     del flat, valid
+    counts = torch.bincount(keys, minlength=sequence_kv)
     order = torch.argsort(keys, stable=True)
-    sorted_keys = keys.index_select(0, order)
     sorted_positions = positions.index_select(0, order)
     del keys, positions, order
-    counts = torch.bincount(sorted_keys, minlength=sequence_kv)
-    del sorted_keys
     offsets = torch.cat(
         (
             torch.zeros(1, dtype=torch.int64, device=indices.device),
@@ -219,6 +219,7 @@ def sparse_mla_dkv_two_stage(
     *,
     sm_scale: float | None = None,
     max_workspace_bytes: int = MAX_WORKSPACE_BYTES,
+    output: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, TwoStageMemory]:
     """Compute BF16 dKV with one GPU reduction kernel.
 
@@ -231,6 +232,8 @@ def sparse_mla_dkv_two_stage(
     tensors = (q, kv, do, indices, lse, delta)
     if not all(t.is_cuda for t in tensors):
         raise ValueError("two-stage sparse MLA requires CUDA tensors")
+    if len({t.device for t in tensors}) != 1:
+        raise ValueError("two-stage sparse MLA requires same-device tensors")
     if triton is None or _two_stage_dkv_kernel is None:
         raise RuntimeError("two-stage sparse MLA requires Triton")
     capability = torch.cuda.get_device_capability(q.device)
@@ -242,14 +245,31 @@ def sparse_mla_dkv_two_stage(
         raise TypeError("two-stage sparse MLA requires BF16 inputs")
     if indices.dtype != torch.int32:
         raise TypeError("two-stage sparse MLA requires int32 indices")
+    if lse.dtype != torch.float32 or delta.dtype != torch.float32:
+        raise TypeError("two-stage sparse MLA requires FP32 LSE and Delta")
     if tuple(lse.shape) != (1, QUERY_TOKENS, ATTENTION_HEADS):
         raise ValueError("two-stage sparse MLA requires GLM LSE shape")
     if tuple(delta.shape) != tuple(lse.shape):
         raise ValueError("two-stage sparse MLA requires matching Delta shape")
+    sequence_kv = int(kv.shape[1])
+    if output is None:
+        output_buffer = None
+    else:
+        if not output.is_cuda or output.device != q.device:
+            raise ValueError("two-stage sparse MLA output must share the input device")
+        if output.dtype != torch.float32:
+            raise TypeError("two-stage sparse MLA output must be FP32")
+        if not output.is_contiguous():
+            raise ValueError("two-stage sparse MLA output must be contiguous")
+        if tuple(output.shape) == tuple(kv.shape):
+            output_buffer = output.view(sequence_kv, TOTAL_WIDTH)
+        elif tuple(output.shape) == (sequence_kv, TOTAL_WIDTH):
+            output_buffer = output
+        else:
+            raise ValueError("two-stage sparse MLA output has the wrong shape")
     if sm_scale is None:
         sm_scale = TOTAL_WIDTH**-0.5
 
-    sequence_kv = int(kv.shape[1])
     memory = two_stage_memory(sequence_kv)
     if max_workspace_bytes > MAX_WORKSPACE_BYTES or memory.total_bytes > max_workspace_bytes:
         raise RuntimeError(
@@ -258,13 +278,15 @@ def sparse_mla_dkv_two_stage(
         )
 
     route_positions, key_offsets = _sorted_route_positions(indices, sequence_kv)
-    output = torch.zeros(
-        sequence_kv,
-        TOTAL_WIDTH,
-        dtype=torch.float32,
-        device=q.device,
-    )
-    grid = (sequence_kv, triton.cdiv(TOTAL_WIDTH, BLOCK_WIDTH))
+    if output_buffer is None:
+        output_buffer = torch.empty(
+            sequence_kv,
+            TOTAL_WIDTH,
+            dtype=torch.float32,
+            device=q.device,
+        )
+    output_buffer.zero_()
+    grid = (sequence_kv,)
     _two_stage_dkv_kernel[grid](
         q,
         kv,
@@ -273,7 +295,7 @@ def sparse_mla_dkv_two_stage(
         delta,
         route_positions,
         key_offsets,
-        output,
+        output_buffer,
         q.stride(1),
         q.stride(2),
         kv.stride(1),
@@ -283,12 +305,10 @@ def sparse_mla_dkv_two_stage(
         lse.stride(2),
         delta.stride(1),
         delta.stride(2),
-        output.stride(0),
+        output_buffer.stride(0),
         float(sm_scale),
         BLOCK_WIDTH=BLOCK_WIDTH,
         num_warps=4,
         num_stages=1,
     )
-    if not torch.isfinite(output).all():
-        raise RuntimeError("two-stage sparse MLA produced nonfinite dKV")
-    return output.view_as(kv).to(dtype=kv.dtype), memory
+    return output_buffer.view_as(kv).to(dtype=kv.dtype), memory
