@@ -9,6 +9,7 @@ from prime_rl.trainer.models.kernels.fp8_indexer import fp8_indexer
 from prime_rl.trainer.models.layers.norms import LayerNorm, RMSNorm, RMSNormConfig
 from prime_rl.trainer.models.layers.rotary_emb import rotate_half
 from prime_rl.utils.cp import gather_for_cp
+from prime_rl.trainer.models.glm_moe_dsa.sparse_index_stats import record_sparse_index_tensor
 
 _flex_attention = torch.compile(flex_attention, dynamic=True)
 _ADA_FLEX_OPTIONS = {
@@ -48,6 +49,7 @@ class SparseMlaAttentionArgs:
     index_topk: int
     use_index_cache: bool = False
     skip_topk: bool = False
+    layer_index: int = -1
 
 
 class _SparseMLA(torch.autograd.Function):
@@ -101,6 +103,7 @@ class Indexer(nn.Module):
         self.n_head = args.index_n_heads
         self.head_dim = args.index_head_dim
         self.rope_dim = args.qk_rope_head_dim
+        self.layer_index = args.layer_index
         self.wq_b = nn.Linear(args.q_lora_rank, self.n_head * self.head_dim, bias=False)
         self.wk = nn.Linear(args.hidden_size, self.head_dim, bias=args.attention_bias)
         self.k_norm = LayerNorm(dim=self.head_dim, eps=1e-6)
@@ -157,6 +160,13 @@ class Indexer(nn.Module):
         k_idx = torch.cat([k_pe, k_nope], dim=-1)
 
         indices = fp8_indexer(q_idx, k_idx, w, ks, ke, index_topk, self.weight_scale)
+        record_sparse_index_tensor(
+            indices,
+            sequence_kv=int(k_idx.shape[0]) + 1,
+            layer_index=self.layer_index,
+            cp_rank=cp_rank,
+            cp_world_size=cp_world_size,
+        )
         # indices shape: [S_local, topk] in K's coordinate space (sentinel = s_full)
         # KV passed to sparse MLA has length s_full + 1 (sentinel zeros at index s_full).
         return indices.view(1, s_local, 1, index_topk)
