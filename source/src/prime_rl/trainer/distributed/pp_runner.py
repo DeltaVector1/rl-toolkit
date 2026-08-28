@@ -24,6 +24,55 @@ import torch
 import torch.nn as nn
 
 
+_PIPELINE_COMMON_SIDE_FIELDS = frozenset(
+    {
+        "position_ids",
+        "seq_lens",
+        "seq_lens_are_pre_shard",
+        "routed_experts",
+    }
+)
+_PIPELINE_LAST_SIDE_FIELDS = frozenset(
+    {
+        "labels",
+        "temperatures",
+        "sequence_lengths",
+        "inference_logprobs",
+        "ref_logprobs",
+        "advantages",
+        "loss_mask",
+        "rl_weights",
+        "ce_weights",
+        "ref_kl_weights",
+        "export_micro_batch",
+        "micro_step",
+    }
+)
+
+
+def pipeline_side_input_fields(
+    *,
+    is_first: bool,
+    is_last: bool,
+    include_parity_input_ids: bool = False,
+) -> frozenset[str]:
+    """Return the side-input fields used by one pipeline stage.
+
+    Every decoder stage needs the positional and routing inputs. The schedule
+    supplies token IDs to the first stage separately. The last stage needs the
+    output-loss fields; token IDs are needed there only for the optional parity
+    dump.
+    """
+    if is_first and is_last:
+        raise ValueError("a pipeline stage cannot be both first and last")
+    fields = set(_PIPELINE_COMMON_SIDE_FIELDS)
+    if is_last:
+        fields.update(_PIPELINE_LAST_SIDE_FIELDS)
+        if include_parity_input_ids:
+            fields.add("input_ids")
+    return frozenset(fields)
+
+
 def minimum_pipeline_microbatches(schedule_name: str, pp_size: int) -> int:
     """Return the minimum batch that the selected pipeline schedule accepts."""
     if schedule_name == "1f1b":
@@ -427,6 +476,7 @@ class PipelineStageModule(nn.Module):
         self._side: dict[tuple[int, int], dict] = {}
         self._consumed_side: set[tuple[int, int]] = set()
         self._active_microbatch: int | None = None
+        self._required_side_fields: frozenset[str] | None = None
 
     def _record_backward_start(self, _module, _grad_output) -> None:
         event = torch.cuda.Event(enable_timing=True)
@@ -453,7 +503,19 @@ class PipelineStageModule(nn.Module):
             self._backward_events.clear()
         return forward, backward
 
-    def set_side_inputs(self, side: Mapping | Sequence[dict]) -> None:
+    def set_side_inputs(
+        self,
+        side: Mapping | Sequence[dict],
+        *,
+        fields: frozenset[str] | set[str] | None = None,
+    ) -> None:
+        self._required_side_fields = None if fields is None else frozenset(fields)
+
+        def select(value):
+            if fields is None or not isinstance(value, Mapping):
+                return value
+            return {key: item for key, item in value.items() if key in fields}
+
         if isinstance(side, Mapping):
             entries = {}
             for key, value in side.items():
@@ -464,11 +526,11 @@ class PipelineStageModule(nn.Module):
                 normalized = (int(key[0]), int(key[1]))
                 if normalized in entries:
                     raise RuntimeError(f"duplicate pipeline side-input key {normalized}")
-                entries[normalized] = value
+                entries[normalized] = select(value)
             self._side = entries
         else:
             self._side = {
-                (self.stage_identity, microbatch_id): value
+                (self.stage_identity, microbatch_id): select(value)
                 for microbatch_id, value in enumerate(side)
             }
         self._consumed_side.clear()
@@ -478,6 +540,7 @@ class PipelineStageModule(nn.Module):
         self._side.clear()
         self._consumed_side.clear()
         self._active_microbatch = None
+        self._required_side_fields = None
 
     def set_active_microbatch(self, microbatch_id: int) -> None:
         if self._active_microbatch is not None:
@@ -518,6 +581,13 @@ class PipelineStageModule(nn.Module):
         self._consumed_side.add(key)
         if not isinstance(cpu, Mapping):
             raise RuntimeError(f"pipeline side inputs for {key} are not a mapping")
+        if self._required_side_fields is not None:
+            missing = self._required_side_fields.difference(cpu)
+            if missing:
+                raise RuntimeError(
+                    f"pipeline side inputs for {key} are missing required fields "
+                    f"{sorted(missing)}"
+                )
         out = {}
         for k, v in cpu.items():
             if torch.is_tensor(v):

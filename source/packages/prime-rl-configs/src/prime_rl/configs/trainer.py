@@ -284,6 +284,9 @@ class ModelConfig(BaseModelConfig):
     pp_limit_receive_buffers: bool = False
     """Use the minimum receive-buffer count for the 1F1B pipeline schedule."""
 
+    pp_stage_specific_side_inputs: bool = False
+    """Move only the side-input fields used by the local pipeline stage."""
+
     pp_boundary_plan: Literal["balanced", "explicit"] = "balanced"
     """Pipeline layer boundary source."""
 

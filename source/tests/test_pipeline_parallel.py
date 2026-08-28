@@ -428,6 +428,75 @@ class SideInputKeyTest(unittest.TestCase):
             ],
         )
 
+    def test_stage_field_sets_cover_first_middle_and_last(self):
+        first = self.runner.pipeline_side_input_fields(is_first=True, is_last=False)
+        middle = self.runner.pipeline_side_input_fields(is_first=False, is_last=False)
+        last = self.runner.pipeline_side_input_fields(is_first=False, is_last=True)
+        last_with_parity = self.runner.pipeline_side_input_fields(
+            is_first=False, is_last=True, include_parity_input_ids=True
+        )
+
+        self.assertEqual(first, {
+            "position_ids",
+            "seq_lens",
+            "seq_lens_are_pre_shard",
+            "routed_experts",
+        })
+        self.assertEqual(middle, {
+            "position_ids",
+            "seq_lens",
+            "seq_lens_are_pre_shard",
+            "routed_experts",
+        })
+        self.assertNotIn("input_ids", last)
+        self.assertIn("labels", last)
+        self.assertIn("loss_mask", last)
+        self.assertNotIn("input_ids", last)
+        self.assertIn("input_ids", last_with_parity)
+        with self.assertRaisesRegex(ValueError, "both first and last"):
+            self.runner.pipeline_side_input_fields(is_first=True, is_last=True)
+
+    def test_stage_specific_selection_keeps_required_values_and_drops_unused(self):
+        fields = self.runner.pipeline_side_input_fields(is_first=False, is_last=False)
+        position_ids = _Tensor("position_ids")
+        loss_mask = _Tensor("loss_mask")
+        stage = self.runner.PipelineStageModule(
+            model=object(), is_first=False, is_last=False
+        )
+        stage.set_side_inputs(
+            [{
+                "position_ids": position_ids,
+                "seq_lens": _Tensor("seq_lens"),
+                "seq_lens_are_pre_shard": True,
+                "routed_experts": None,
+                "loss_mask": loss_mask,
+            }],
+            fields=fields,
+        )
+        got = stage._next_side(0)
+        self.assertIn("position_ids", got)
+        self.assertNotIn("loss_mask", got)
+        self.assertEqual(len(loss_mask.moves), 0)
+        self.assertEqual(len(position_ids.moves), 1)
+
+    def test_stage_specific_selection_fails_on_missing_required_field(self):
+        fields = self.runner.pipeline_side_input_fields(is_first=True, is_last=False)
+        stage = self.runner.PipelineStageModule(
+            model=object(), is_first=True, is_last=False
+        )
+        stage.set_side_inputs([{"position_ids": _Tensor("position_ids")}], fields=fields)
+        with self.assertRaisesRegex(RuntimeError, "missing required fields"):
+            stage._next_side(0)
+
+    def test_disabled_selection_preserves_existing_side_input_behavior(self):
+        extra = _Tensor("extra")
+        stage = self.runner.PipelineStageModule(
+            model=object(), is_first=False, is_last=False
+        )
+        stage.set_side_inputs([{"extra": extra}])
+        self.assertIn("extra", stage._next_side(0))
+        self.assertEqual(len(extra.moves), 1)
+
     def test_missing_and_duplicate_side_inputs_fail_closed(self):
         stage = self.runner.PipelineStageModule(
             model=object(), is_first=False, is_last=False, stage_identity=3

@@ -1444,6 +1444,7 @@ def _train_impl(config: TrainerConfig):
         )
         from prime_rl.trainer.distributed.pp_runner import force_fsdp_lazy_init
         from prime_rl.trainer.distributed.pp_runner import minimum_pipeline_microbatches
+        from prime_rl.trainer.distributed.pp_runner import pipeline_side_input_fields
         from prime_rl.trainer.distributed.pp_runner import sparse_cache_transport_shape
         from prime_rl.trainer.distributed.pipeline_parallel import (
             pp_layer_ranges,
@@ -2276,9 +2277,25 @@ def _train_impl(config: TrainerConfig):
             pp_side_inputs = pad_pp_side_inputs(pp_side_inputs, cp_world_size=parallel_dims.cp)
             if pp_stage_modules is None:
                 raise RuntimeError("pipeline stage modules were not initialized")
+            parity_side_input_ids = (
+                (config.data.fake and config.data.fake.reference_path is not None)
+                or (
+                    not config.data.fake
+                    and config.parity_guard is not None
+                    and progress.step == 1
+                )
+            )
             for stage_module in pp_stage_modules:
                 stage_module.loss_closure = _pp_loss
-                stage_module.set_side_inputs(pp_side_inputs)
+                if config.model.pp_stage_specific_side_inputs:
+                    stage_fields = pipeline_side_input_fields(
+                        is_first=stage_module.is_first,
+                        is_last=stage_module.is_last,
+                        include_parity_input_ids=parity_side_input_ids,
+                    )
+                    stage_module.set_side_inputs(pp_side_inputs, fields=stage_fields)
+                else:
+                    stage_module.set_side_inputs(pp_side_inputs)
             # All micro-batches share one padded shape, so hand the stage its
             # exact tensors and skip the metadata-exchange rendezvous.
             _L = pp_side_inputs[0]["input_ids"].shape[1]
