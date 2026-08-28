@@ -5,8 +5,12 @@ import unittest
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-SOURCE = (ROOT / "src/prime_rl/trainer/models/kernels/sparse_mla_bucketed.py").read_text()
-BENCHMARK = (ROOT.parent / "scripts/ops/benchmark_sparse_mla_bucketed_sm89.py").read_text()
+SOURCE = (
+    ROOT / "src/prime_rl/trainer/models/kernels/sparse_mla_bucketed.py"
+).read_text()
+BENCHMARK = (
+    ROOT.parent / "scripts/ops/benchmark_sparse_mla_bucketed_sm89.py"
+).read_text()
 
 
 def cpu_bucket(values: list[int], sequence_kv: int) -> tuple[list[int], list[int]]:
@@ -74,7 +78,7 @@ class SparseMlaBucketedTest(unittest.TestCase):
         self.assertIn("max_workspace_bytes > MAX_WORKSPACE_BYTES", SOURCE)
         config_root = ROOT.parent / "configs"
         for path in config_root.rglob("*.toml"):
-            self.assertNotIn("PRIME_SPARSE_BWD_BUCKETED = \"1\"", path.read_text())
+            self.assertNotIn('PRIME_SPARSE_BWD_BUCKETED = "1"', path.read_text())
 
     def test_benchmark_checks_parity_and_both_cuda_memory_counters(self):
         self.assertIn("rtol=2e-2, atol=2e-3", BENCHMARK)
@@ -83,6 +87,15 @@ class SparseMlaBucketedTest(unittest.TestCase):
         self.assertIn("measured allocated-memory bound failed", BENCHMARK)
         self.assertIn("measured reserved-memory bound failed", BENCHMARK)
         self.assertIn("order=atomic", BENCHMARK)
+
+    def test_benchmark_covers_wide_and_skewed_route_patterns(self):
+        self.assertIn(
+            'ROUTE_DISTRIBUTIONS = ("collision", "uniform-wide", "moderate-skew")',
+            BENCHMARK,
+        )
+        self.assertIn('choices=(*ROUTE_DISTRIBUTIONS, "all")', BENCHMARK)
+        self.assertIn('route_distribution == "uniform-wide"', BENCHMARK)
+        self.assertIn('route_distribution == "moderate-skew"', BENCHMARK)
 
 
 if __name__ == "__main__":
