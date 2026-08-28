@@ -192,6 +192,7 @@ def test_cuda_smoke_profile_is_small_and_n82_only() -> None:
         "output_root": "/data/glm52-rl/qualifications/glm52-pp-async-cuda-smoke",
         "steps": 2,
         "gpus": 8,
+        "transport": "glm52_trainer",
     }
     script = (ROOT / "source/tests/test_pp_async_cuda.py").read_text()
     assert "stages = 8" in script
@@ -212,6 +213,9 @@ def test_cuda_smoke_profile_is_small_and_n82_only() -> None:
     assert "@record\ndef main()" in script
     assert "model-fp8" not in script
     assert "/data/ZiphuAI" not in script
+    assert "timeout=_process_group_timeout()" in script
+    assert "device_id=_process_group_device_id(local_rank)" in script
+    assert 'dist.init_process_group("nccl")' not in script
 
 
 def test_cuda_smoke_journal_is_bounded_and_fsynced() -> None:
@@ -362,13 +366,75 @@ def test_cuda_smoke_overrides_have_a_closed_prime_rl_import_graph() -> None:
     assert visited == {entry, *mounted.values()}
 
 
-def test_cuda_smoke_has_a_resolvable_hostname_without_network_access() -> None:
+def test_cuda_smoke_uses_the_host_network() -> None:
     source = (
         ROOT / ".agents/skills/training-ops/src/training_ops/__init__.py"
     ).read_text()
-    assert "--network none \\\n  --hostname localhost --read-only" in source
-    assert '"torchrun --standalone --nproc-per-node=8 "' in source
+    assert "--network {shlex.quote(transport['network_mode'])} --read-only" in source
+    assert 'f"torchrun --standalone --nproc-per-node={gpu_count} "' in source
     assert '"--log-dir /output/torchrun --redirects 3 --tee 3 "' in source
+
+
+def test_cuda_smoke_uses_the_configured_trainer_transport() -> None:
+    operations = _load("configs/operations.toml")
+    transport = operations["transport"]["glm52_trainer"]
+    assert transport == {
+        "network_mode": "host",
+        "process_group_timeout_seconds": 5400,
+        "device_id": "local_rank",
+        "env": {
+            "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+            "PYTHONUNBUFFERED": "1",
+            "OMP_NUM_THREADS": "1",
+            "NCCL_SOCKET_IFNAME": "vlan130",
+            "GLOO_SOCKET_IFNAME": "vlan130",
+            "NCCL_IB_DISABLE": "1",
+            "NCCL_P2P_DISABLE": "1",
+            "NCCL_SOCKET_NTHREADS": "1",
+            "NCCL_NSOCKS_PERTHREAD": "1",
+            "NCCL_BUFFSIZE": "1048576",
+            "NCCL_CUMEM_HOST_ENABLE": "0",
+            "NCCL_MIN_NCHANNELS": "16",
+            "NCCL_MAX_NCHANNELS": "16",
+            "TORCH_NCCL_TRACE_BUFFER_SIZE": "1048576",
+            "TORCH_NCCL_DUMP_ON_TIMEOUT": "1",
+            "TORCH_NCCL_ASYNC_ERROR_HANDLING": "1",
+            "TORCH_NCCL_ENABLE_MONITORING": "1",
+            "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC": "600",
+        },
+    }
+    qualification = operations["qualification"]["glm52_pp_async_cuda"]
+    trainer = _load(operations["profiles"]["current"]["trainer"])
+    assert qualification["transport"] == "glm52_trainer"
+    assert transport["process_group_timeout_seconds"] == trainer["dist_timeout_seconds"]
+
+    launcher = (ROOT / "scripts/china/cluster.sh").read_text()
+    for key, value in transport["env"].items():
+        assert f"-e {key}=" in launcher
+        assert value in launcher
+    assert "--network host" in launcher
+    assert "--ipc host" in launcher
+
+
+def test_cuda_smoke_rejects_a_blocked_transport_host() -> None:
+    training_ops = _load_training_ops("training_ops_pp_async_blocked_host")
+    qualification = training_ops.operations["qualification"]["glm52_pp_async_cuda"]
+    old_head = training_ops.trainer_head
+    old_host = qualification["host"]
+    qualification["host"] = "n79"
+    training_ops.trainer_head = "n79"
+    try:
+        with pytest.raises(training_ops.Refused, match="configured trainer head"):
+            training_ops.qualify_glm52_pp_async_cuda()
+    finally:
+        qualification["host"] = old_host
+        training_ops.trainer_head = old_head
+
+
+def test_cuda_smoke_requires_transport_configuration() -> None:
+    training_ops = _load_training_ops("training_ops_pp_async_missing_transport")
+    with pytest.raises(training_ops.Refused, match="not configured"):
+        training_ops._pp_async_cuda_transport({"transport": "missing"})
 
 
 def test_phase_profiler_is_a_shared_trainer_mount() -> None:
@@ -471,8 +537,13 @@ def test_exited_trainer_is_allowed_and_cuda_command_is_fail_closed() -> None:
     assert "--nproc-per-node=8" in launch
     assert "--log-dir /output/torchrun" in launch
     assert "--redirects 3 --tee 3" in launch
-    assert "--network none" in launch
-    assert "--hostname localhost" in launch
+    assert "--network host" in launch
+    assert "--network none" not in launch
+    assert "--hostname localhost" not in launch
+    for key, value in training_ops.operations["transport"]["glm52_trainer"]["env"].items():
+        assert f"-e {key}={value}" in launch
+    assert "-e PRIME_PROCESS_GROUP_TIMEOUT_SECONDS=5400" in launch
+    assert "-e PRIME_PROCESS_GROUP_DEVICE_ID=local_rank" in launch
     assert "/app/src/prime_rl/trainer/phase_profiler.py:ro" in launch
     assert "--read-only" in launch
     assert "--cidfile" in launch
