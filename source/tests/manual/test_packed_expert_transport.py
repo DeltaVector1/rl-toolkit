@@ -38,9 +38,7 @@ def synchronized_call(callable):
 def median_chain(callable, warmup: int, iterations: int) -> float:
     for _ in range(warmup):
         synchronized_call(callable)
-    return statistics.median(
-        synchronized_call(callable)[1] for _ in range(iterations)
-    )
+    return statistics.median(synchronized_call(callable)[1] for _ in range(iterations))
 
 
 def pinned_bytes() -> int:
@@ -103,7 +101,9 @@ def main() -> None:
     torch.cuda.set_device(local_rank)
     capability = torch.cuda.get_device_capability()
     if capability != (8, 9):
-        raise RuntimeError(f"this benchmark requires SM89, found SM{capability[0]}{capability[1]}")
+        raise RuntimeError(
+            f"this benchmark requires SM89, found SM{capability[0]}{capability[1]}"
+        )
     dist.init_process_group("nccl")
     world = dist.get_world_size()
     if world != 8:
@@ -111,7 +111,9 @@ def main() -> None:
 
     input_splits, output_splits = production_splits(rank, world)
     if input_splits == output_splits:
-        raise RuntimeError("production case must use different source and destination layouts")
+        raise RuntimeError(
+            "production case must use different source and destination layouts"
+        )
     rows = sum(input_splits)
     output_rows = sum(output_splits)
     generator = torch.Generator(device="cuda").manual_seed(20260828 + rank)
@@ -212,7 +214,9 @@ def main() -> None:
 
     speed_gain = (base_seconds - packed_seconds) / base_seconds
     gpu_increase_mib = (packed_peak - base_peak) / (1024 * 1024)
-    projected_step_saving = max(0.0, base_seconds - packed_seconds) * args.expert_layers * 2
+    projected_step_saving = (
+        max(0.0, base_seconds - packed_seconds) * args.expert_layers * 2
+    )
     passed = (
         gpu_increase_mib <= 64.0
         and packed_pinned <= base_pinned

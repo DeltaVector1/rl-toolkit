@@ -53,12 +53,17 @@ class PackedExpertTransportTests(unittest.TestCase):
         self.assertIn("def incoming_only_splits", BENCHMARK)
         self.assertIn("sum(incoming_output_splits) == 0", BENCHMARK)
         self.assertIn("sum(incoming_input_splits) > 0", BENCHMARK)
-        self.assertIn("production case must use different source and destination layouts", BENCHMARK)
+        self.assertIn(
+            "production case must use different source and destination layouts",
+            BENCHMARK,
+        )
 
     def test_fp8_payload_requires_e4m3_and_four_byte_scales(self):
         self.assertIn("packed FP8 transport requires E4M3 values", SOURCE)
         self.assertIn("scales.element_size() != 4", SOURCE)
-        self.assertIn("packed FP8 transport requires one 4-byte FP32 scale per row", SOURCE)
+        self.assertIn(
+            "packed FP8 transport requires one 4-byte FP32 scale per row", SOURCE
+        )
 
     def test_benchmark_requires_sm89_and_eight_ranks(self):
         self.assertIn("capability != (8, 9)", BENCHMARK)

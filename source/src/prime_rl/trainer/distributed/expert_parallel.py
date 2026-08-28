@@ -69,9 +69,9 @@ def _dequantize_int4_strided_kernel(
     row = tl.program_id(0)
     pair = tl.arange(0, block)
     col0 = pair * 2
-    value = tl.load(
-        packed + row * packed_stride + pair, mask=col0 < cols, other=0
-    ).to(tl.int32)
+    value = tl.load(packed + row * packed_stride + pair, mask=col0 < cols, other=0).to(
+        tl.int32
+    )
     row_scale = tl.load(scale + row)
     tl.store(
         output + row * cols + col0, ((value & 15) - 8) * row_scale, mask=col0 < cols
@@ -114,11 +114,15 @@ def _copy_value_scale_payload(
     if scales.ndim != 1 or not scales.is_contiguous():
         raise ValueError("packed transport scales must be a contiguous vector")
     if values.shape[0] != scales.shape[0] or payload.shape[0] != values.shape[0]:
-        raise ValueError("packed transport values, scales, and payload must have equal rows")
+        raise ValueError(
+            "packed transport values, scales, and payload must have equal rows"
+        )
     value_bytes = values.shape[1] * values.element_size()
     scale_bytes = scales.element_size()
     if payload.shape[1] != value_bytes + scale_bytes:
-        raise ValueError("packed transport payload width does not match its values and scale")
+        raise ValueError(
+            "packed transport payload width does not match its values and scale"
+        )
     payload[:, :value_bytes].copy_(
         values.view(torch.uint8).view(values.shape[0], value_bytes)
     )
@@ -508,7 +512,9 @@ class ReceivedBF16ExpertInput:
         if not row_indices.shape[0]:
             return
         if not self.values.shape[0]:
-            raise ValueError("cannot reconstruct rows from an empty received BF16 input")
+            raise ValueError(
+                "cannot reconstruct rows from an empty received BF16 input"
+            )
 
         real_rows = (row_indices >= 0) & (row_indices < self.values.shape[0])
         safe_indices = row_indices.clamp(0, self.values.shape[0] - 1)
@@ -534,6 +540,7 @@ class BF16ExpertInputWorkspace:
         self.device = torch.device(device)
         if self.device.type != "cuda":
             raise ValueError("BF16 expert input workspace requires a CUDA device")
+
     def check(self, rows: int, columns: int, device: torch.device) -> None:
         if rows > self.row_capacity:
             raise ValueError("BF16 expert input workspace row capacity is too small")
@@ -595,9 +602,7 @@ class ReceivedFP8ExpertInput:
             self.columns = values.shape[1]
             self.prepared = True
             return
-        quantized, scales = ops.scaled_fp8_quant(
-            values, use_per_token_if_dynamic=True
-        )
+        quantized, scales = ops.scaled_fp8_quant(values, use_per_token_if_dynamic=True)
         if quantized.shape != values.shape:
             raise RuntimeError("saved FP8 expert input changed the BF16 input shape")
         self.prepare(quantized, scales.flatten())
@@ -616,9 +621,7 @@ class ReceivedFP8ExpertInput:
             or row_indices.ndim != 1
             or not row_indices.is_contiguous()
         ):
-            raise ValueError(
-                "received FP8 row indices must be contiguous CUDA INT64"
-            )
+            raise ValueError("received FP8 row indices must be contiguous CUDA INT64")
         if output.device.type != "cuda" or output.dtype != torch.bfloat16:
             raise ValueError(
                 "received FP8 rows must be reconstructed into CUDA BF16 storage"
@@ -814,9 +817,7 @@ def _streaming_int4_forward(
 
         round_payload = None
         if packed_transport:
-            round_payload, _ = _pack_value_scale_payload(
-                round_quantized, round_scale
-            )
+            round_payload, _ = _pack_value_scale_payload(round_quantized, round_scale)
             send = []
             cursor = 0
             for count in input_counts:
@@ -1129,9 +1130,7 @@ def _streaming_fp8_backward(
         for count, offset in zip(receive_counts, receive_offsets):
             if count:
                 target = dequantized[offset : offset + count]
-                target.copy_(
-                    received_values[cursor : cursor + count].to(target.dtype)
-                )
+                target.copy_(received_values[cursor : cursor + count].to(target.dtype))
                 target.mul_(
                     received_scale[cursor : cursor + count].to(target.dtype)[:, None]
                 )
@@ -1197,9 +1196,7 @@ def _streaming_bf16_combine(
     result = routed_output
     result.as_strided_((output_rows, columns), (columns, 1))
     for round_idx in range(rounds):
-        column_counts, column_offsets = _round_splits(
-            [columns], round_idx, rounds
-        )
+        column_counts, column_offsets = _round_splits([columns], round_idx, rounds)
         round_columns = column_counts[0]
         column_offset = column_offsets[0]
         if not round_columns:
@@ -1209,9 +1206,7 @@ def _streaming_bf16_combine(
             device=routed_output.device,
             dtype=torch.bfloat16,
         )
-        send.copy_(
-            source[:, column_offset : column_offset + round_columns]
-        )
+        send.copy_(source[:, column_offset : column_offset + round_columns])
         receive = _empty_with_cache_retry(
             (output_rows, round_columns),
             device=routed_output.device,
@@ -1291,7 +1286,9 @@ class _BF16Dispatch(torch.autograd.Function):
             elif isinstance(received_input, ReceivedFP8ExpertInput):
                 received_input.prepare_from_bf16(output)
             else:
-                raise TypeError("BF16 expert dispatch received the wrong saved-input type")
+                raise TypeError(
+                    "BF16 expert dispatch received the wrong saved-input type"
+                )
         ctx.input_splits = input_splits
         ctx.output_splits = output_splits
         ctx.group_name = group_name
@@ -1498,7 +1495,9 @@ class _FP8Dispatch(torch.autograd.Function):
         output.mul_(received_scale.to(output.dtype)[:, None])
         if received_input is not None:
             if not isinstance(received_input, ReceivedFP8ExpertInput):
-                raise TypeError("FP8 expert dispatch received the wrong saved-input type")
+                raise TypeError(
+                    "FP8 expert dispatch received the wrong saved-input type"
+                )
             received_input.prepare(received, received_scale)
         ctx.input_splits = input_splits
         ctx.output_splits = output_splits
@@ -1832,8 +1831,7 @@ def _resolve_native_fp8_expert_transport(
     local_name = "bf16_forward_fp8_local_recompute_backward"
     if requested != local_name:
         if any(
-            value is not None
-            for value in (pp_stage, pp_size, local_recompute_cutoff)
+            value is not None for value in (pp_stage, pp_size, local_recompute_cutoff)
         ):
             raise ValueError(
                 "pipeline stage selection is only valid for local expert recompute"
@@ -1873,9 +1871,7 @@ class NativeFP8LoRAAllToAllExpertParallel(MXFP8AllToAllExpertParallel):
             "bf16_forward_fp8_recompute_backward",
             "bf16_forward_fp8_local_recompute_backward",
         }:
-            raise ValueError(
-                "native FP8 routed-expert LoRA transport is invalid"
-            )
+            raise ValueError("native FP8 routed-expert LoRA transport is invalid")
         (
             self.expert_activation_transport,
             self.local_recompute_active,
@@ -1900,10 +1896,14 @@ class NativeFP8LoRAAllToAllExpertParallel(MXFP8AllToAllExpertParallel):
                 )
             routed_input, num_tokens_per_expert, route_scores = inputs
             if route_scores.shape != (routed_input.shape[0],):
-                raise ValueError("local expert recompute route scores have the wrong shape")
+                raise ValueError(
+                    "local expert recompute route scores have the wrong shape"
+                )
         else:
             if len(inputs) != 2:
-                raise RuntimeError("native FP8 routed experts received unexpected inputs")
+                raise RuntimeError(
+                    "native FP8 routed experts received unexpected inputs"
+                )
             routed_input, num_tokens_per_expert = inputs
             route_scores = None
         num_tokens_per_expert_group = self._exchange_metadata(
@@ -1912,8 +1912,7 @@ class NativeFP8LoRAAllToAllExpertParallel(MXFP8AllToAllExpertParallel):
         )
         _ep_profile_tick()
         recompute_fp8 = (
-            self.expert_activation_transport
-            == "bf16_forward_fp8_recompute_backward"
+            self.expert_activation_transport == "bf16_forward_fp8_recompute_backward"
             and _in_backward()
         )
         if recompute_fp8:
@@ -2002,8 +2001,7 @@ class NativeFP8LoRAAllToAllExpertParallel(MXFP8AllToAllExpertParallel):
 
     def _token_combine(self, mod, routed_output, device_mesh):
         recompute_fp8 = (
-            self.expert_activation_transport
-            == "bf16_forward_fp8_recompute_backward"
+            self.expert_activation_transport == "bf16_forward_fp8_recompute_backward"
             and _in_backward()
         )
         if recompute_fp8:
@@ -2082,7 +2080,9 @@ class NativeFP8LoRAAllToAllExpertParallel(MXFP8AllToAllExpertParallel):
             return
         base_layer = getattr(mod, "base_layer", None)
         if base_layer is None or not getattr(base_layer, "fp8_checkpoint", False):
-            raise TypeError("native FP8 LoRA expert parallelism requires an FP8 base layer")
+            raise TypeError(
+                "native FP8 LoRA expert parallelism requires an FP8 base layer"
+            )
         cls._shard_direct_parameters(base_layer, device_mesh)
         for projection in ("w1", "w2", "w3"):
             for factor in ("A", "B"):
