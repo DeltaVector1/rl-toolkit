@@ -389,6 +389,7 @@ _b2048_qualification_profiles = frozenset(
         "glm52-native-b2048-memory",
         "glm52-native-b2048-nsys",
         "glm52-native-pp-async",
+        "glm52-native-pp-grouped",
     }
 )
 
@@ -747,7 +748,7 @@ def _qualification_environment() -> dict[str, str] | None:
     if not re.fullmatch(r"[0-9a-f]{32}", values["PRIME_QUALIFICATION_SESSION_ID"]):
         raise RuntimeError("qualification session ID is invalid")
     if not re.fullmatch(
-        r"glm52-native-(?:b2048|b2048-memory|b2048-nsys|delta3|pp-async|stability20)",
+        r"glm52-native-(?:b2048|b2048-memory|b2048-nsys|delta3|pp-async|pp-grouped|stability20)",
         values["PRIME_QUALIFICATION_PROFILE"],
     ):
         raise RuntimeError("qualification profile is invalid")
@@ -1102,10 +1103,10 @@ def _train_impl(config: TrainerConfig):
     if config.model.pp_schedule == "1f1b_async" and (
         qualification_identity is None
         or qualification_identity["PRIME_QUALIFICATION_PROFILE"]
-        != "glm52-native-pp-async"
+        not in {"glm52-native-pp-async", "glm52-native-pp-grouped"}
     ):
         raise RuntimeError(
-            "1f1b_async is only available in the GLM async qualification profile"
+            "1f1b_async is only available in a GLM async qualification profile"
         )
     # Setup world and logger
     world = get_world()
@@ -1136,6 +1137,7 @@ def _train_impl(config: TrainerConfig):
             "glm52-native-b2048-nsys": (2, False),
             "glm52-native-delta3": (3, True),
             "glm52-native-pp-async": (2, False),
+            "glm52-native-pp-grouped": (2, False),
             "glm52-native-stability20": (20, True),
         }[qualification_identity["PRIME_QUALIFICATION_PROFILE"]]
         if (

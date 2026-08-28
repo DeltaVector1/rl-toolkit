@@ -143,7 +143,7 @@ def test_async_profile_is_allowlisted_and_validated_before_setup() -> None:
     assert '"glm52-native-pp-async",' in training_ops
     assert "validate_async_1f1b_topology" in config
     assert (
-        "1f1b_async is only available in the GLM async qualification profile" in train
+        "1f1b_async is only available in a GLM async qualification profile" in train
     )
     assert train.index("config.model.validate_async_1f1b_topology()") < train.index(
         "setup_torch_distributed("
