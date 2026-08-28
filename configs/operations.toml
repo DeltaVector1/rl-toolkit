@@ -73,7 +73,9 @@ environment = "configs/paused/env.glm52-production20.toml"
 [profiles.glm52-production20.identity]
 prime_rl_revision = "60bc29547a8824ad1de7b9af8d265e2b27b2a72d"
 trainer_image = "prime-rl:glm52-v080-qual"
-trainer_image_digest = ""
+trainer_runtime_aggregate_sha256 = "a543c7ba787d25e20ae0410f7411112a4915f202714ff480ab156f33aa79dc77"
+trainer_loaded_library_manifest_sha256 = "fcb5927503546e70ac2ec41ad524b94daa8053f5ad630387259ca1b784c13cbd"
+trainer_image_digests = { n76 = "sha256:0ca228acaa8b8f1433c20ac5cab5886eb6002ca3a9b246daa8bd82b7c20a8418", n77 = "sha256:8779dedefa5c5ff13fb50e14fdb87d423e373ae3bbc4a4983e4519c575ed7058", n78 = "sha256:f450a4a72844a7fc732110fbe8bda7c94f5d5b8296947afe6eef2196e9c52fad", n80 = "sha256:b7fdf743e6c3118fd77192bd680be28951d856ca410b3007f4fcb5a1ac3935a7", n82 = "sha256:5821b362605aefc3c1e33d0b068a682b236faeee04487115489936e251c8a520", n83 = "sha256:d21a3a43e93abc455773cfb9106f3152f6892149dea2120aa4600e91e9403825", n84 = "sha256:8ad511aa9dcbe78dc84bddd320a1f897d2c9c89d17dcd0cc429242071f20289a", n85 = "sha256:3ec3d0d1635691357043ffcbcc68166be615bfa8250b9cb4cb217517dcdc6311" }
 inference_image = "prime-rl:glm52-v080-full"
 h200_image_digest = "sha256:2f803571329212bfb4e27982efec7559f20379bcde73ac6ccee6bb8be3c46ade"
 trainer_model_path = "/data/ZiphuAI/GLM-5.2-FP8"

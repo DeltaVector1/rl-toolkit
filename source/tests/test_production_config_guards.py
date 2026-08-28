@@ -92,7 +92,21 @@ def test_glm52_production20_requires_identity_and_no_rollout_cache() -> None:
         sys.path.remove(str(skill_source))
 
     assert profile["identity"]["rollout_cache"] is False
-    assert "identity trainer_image_digest is missing" in failures
+    assert profile["identity"]["trainer_runtime_aggregate_sha256"] == (
+        "a543c7ba787d25e20ae0410f7411112a4915f202714ff480ab156f33aa79dc77"
+    )
+    assert profile["identity"]["trainer_loaded_library_manifest_sha256"] == (
+        "fcb5927503546e70ac2ec41ad524b94daa8053f5ad630387259ca1b784c13cbd"
+    )
+    incomplete = dict(profile)
+    incomplete["identity"] = dict(profile["identity"])
+    incomplete["identity"].pop("trainer_runtime_aggregate_sha256")
+    incomplete["identity"].pop("trainer_loaded_library_manifest_sha256")
+    incomplete_failures = training_ops._production20_identity_failures(
+        "glm52-production20", incomplete, trainer, orchestrator, environment
+    )
+    assert "identity trainer_runtime_aggregate_sha256 is missing" in incomplete_failures
+    assert "identity trainer_loaded_library_manifest_sha256 is missing" in incomplete_failures
     assert "identity model_content_sha256 is missing" in failures
     assert "identity model_manifest_sha256 is missing" in failures
     assert not any("rollout cache" in failure for failure in failures)
@@ -100,6 +114,55 @@ def test_glm52_production20_requires_identity_and_no_rollout_cache() -> None:
     assert trainer["model"]["name"] == "/data/ZiphuAI/GLM-5.2-FP8"
     assert profile["identity"]["trainer_model_path"] == trainer["model"]["name"]
     assert profile["identity"]["h200_model_alias"] == orchestrator["model"]["name"]
+    assert set(profile["identity"]["trainer_image_digests"]) == set(
+        operations["hosts"]["trainers"]
+    )
+
+    diagnostic_only = dict(profile)
+    diagnostic_only["identity"] = dict(profile["identity"])
+    diagnostic_only["identity"]["trainer_image_digests"] = {
+        host: "sha256:" + "a" * 64 for host in operations["hosts"]["trainers"]
+    }
+    diagnostic_failures = training_ops._production20_identity_failures(
+        "glm52-production20",
+        diagnostic_only,
+        trainer,
+        orchestrator,
+        environment,
+    )
+    assert not any("trainer image" in failure for failure in diagnostic_failures)
+
+    wrong_runtime = dict(profile)
+    wrong_runtime["identity"] = dict(profile["identity"])
+    wrong_runtime["identity"]["trainer_runtime_aggregate_sha256"] = "a" * 64
+    wrong_runtime_failures = training_ops._production20_identity_failures(
+        "glm52-production20",
+        wrong_runtime,
+        trainer,
+        orchestrator,
+        environment,
+    )
+    assert (
+        "identity trainer runtime aggregate differs from verified runtime"
+        in wrong_runtime_failures
+    )
+
+    wrong_library_manifest = dict(profile)
+    wrong_library_manifest["identity"] = dict(profile["identity"])
+    wrong_library_manifest["identity"]["trainer_loaded_library_manifest_sha256"] = (
+        "b" * 64
+    )
+    wrong_library_failures = training_ops._production20_identity_failures(
+        "glm52-production20",
+        wrong_library_manifest,
+        trainer,
+        orchestrator,
+        environment,
+    )
+    assert (
+        "identity trainer loaded-library manifest differs from verified runtime"
+        in wrong_library_failures
+    )
 
     broken = dict(profile)
     broken["identity"] = dict(profile["identity"])

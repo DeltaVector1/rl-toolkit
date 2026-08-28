@@ -56,6 +56,12 @@ limits = operations["limits"]
 shared_requirements = operations["requirements"]["shared"]
 muse_requirements = operations["requirements"]["muse"]
 glm_requirements = operations["requirements"]["glm52"]
+glm52_verified_runtime_aggregate_sha256 = (
+    "a543c7ba787d25e20ae0410f7411112a4915f202714ff480ab156f33aa79dc77"
+)
+glm52_verified_loaded_library_manifest_sha256 = (
+    "fcb5927503546e70ac2ec41ad524b94daa8053f5ad630387259ca1b784c13cbd"
+)
 glm_parity_paths = operations["parity"]["glm52"]
 glm_step20_h200_gate = operations["gate"]["glm52_step20_h200"]
 glm_parity_root = "/data/glm52-rl/qualifications/glm52-policy-parity"
@@ -397,7 +403,35 @@ def _production20_identity_failures(
     inference_tag = required_text("inference_image")
     if inference_tag is not None and inference_tag != containers.get("inference_image"):
         failures.append("identity inference image differs from operations metadata")
-    required_text("trainer_image_digest", r"sha256:[0-9a-f]{64}")
+    runtime_aggregate = required_text(
+        "trainer_runtime_aggregate_sha256", r"[0-9a-f]{64}"
+    )
+    if (
+        runtime_aggregate is not None
+        and runtime_aggregate != glm52_verified_runtime_aggregate_sha256
+    ):
+        failures.append("identity trainer runtime aggregate differs from verified runtime")
+    loaded_library_manifest = required_text(
+        "trainer_loaded_library_manifest_sha256", r"[0-9a-f]{64}"
+    )
+    if (
+        loaded_library_manifest is not None
+        and loaded_library_manifest != glm52_verified_loaded_library_manifest_sha256
+    ):
+        failures.append(
+            "identity trainer loaded-library manifest differs from verified runtime"
+        )
+    trainer_image_digests = identity.get("trainer_image_digests")
+    if not isinstance(trainer_image_digests, dict):
+        failures.append("identity trainer image diagnostics are missing")
+    elif set(trainer_image_digests) != set(trainer_hosts):
+        failures.append("identity trainer image diagnostics do not cover all hosts")
+    elif any(
+        not isinstance(digest, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None
+        for digest in trainer_image_digests.values()
+    ):
+        failures.append("identity trainer image diagnostics contain an invalid digest")
     h200_digest = required_text("h200_image_digest", r"sha256:[0-9a-f]{64}")
     parity_digest = parity.get("inference_image_digest")
     if h200_digest is not None and h200_digest != parity_digest:
