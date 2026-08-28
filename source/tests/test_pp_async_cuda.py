@@ -8,6 +8,7 @@ import os
 import time
 import types
 from contextlib import contextmanager
+from datetime import timedelta
 from pathlib import Path
 
 import torch
@@ -392,6 +393,23 @@ def assert_parity(baseline: dict, candidate: dict) -> None:
                 raise AssertionError(f"{field} differs at step {old['step']}")
 
 
+def _process_group_timeout() -> timedelta:
+    raw = os.environ.get("PRIME_PROCESS_GROUP_TIMEOUT_SECONDS")
+    if raw is None or not raw.isdecimal() or int(raw) < 1:
+        raise RuntimeError(
+            "PRIME_PROCESS_GROUP_TIMEOUT_SECONDS must be a positive integer"
+        )
+    return timedelta(seconds=int(raw))
+
+
+def _process_group_device_id(local_rank: int) -> int:
+    if os.environ.get("PRIME_PROCESS_GROUP_DEVICE_ID") != "local_rank":
+        raise RuntimeError(
+            "PRIME_PROCESS_GROUP_DEVICE_ID must be configured as local_rank"
+        )
+    return local_rank
+
+
 @record
 def main() -> None:
     if int(os.environ.get("WORLD_SIZE", "0")) != stages:
@@ -405,7 +423,11 @@ def main() -> None:
         torch.cuda.set_device(local_rank)
         journal.write("cuda_device_after", local_rank=local_rank)
         journal.write("group_init_before")
-        dist.init_process_group("nccl")
+        dist.init_process_group(
+            "nccl",
+            timeout=_process_group_timeout(),
+            device_id=_process_group_device_id(local_rank),
+        )
         rank = dist.get_rank()
         journal.write("group_init_after", rank=rank)
         baseline = run_mode("1f1b", rank, torch.device("cuda", local_rank), journal)

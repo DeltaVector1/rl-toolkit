@@ -10176,7 +10176,7 @@ def deploy(
     return not bad
 
 
-def _pp_async_cuda_diagnostic_program(output_dir: str) -> str:
+def _pp_async_cuda_diagnostic_program(output_dir: str, rank_count: int = 8) -> str:
     return f"""
 import json
 import os
@@ -10266,7 +10266,7 @@ if torchrun_resolved is not None:
                     traceback = message.get("message")
             else:
                 traceback = message
-            if not 0 <= rank < 8 or not isinstance(traceback, str) or not traceback:
+            if not 0 <= rank < {rank_count} or not isinstance(traceback, str) or not traceback:
                 continue
             records.append({{
                 "rank": rank,
@@ -10280,23 +10280,96 @@ print(json.dumps(records[0] if records else {{"status": "missing"}}, sort_keys=T
 """
 
 
+def _pp_async_cuda_transport(profile: dict[str, object]) -> dict[str, object]:
+    transport_name = profile.get("transport")
+    if not isinstance(transport_name, str) or not transport_name:
+        raise Refused("the PP async CUDA transport profile is missing")
+    configured = operations.get("transport")
+    if not isinstance(configured, dict):
+        raise Refused("the operations config has no transport inventory")
+    transport = configured.get(transport_name)
+    if not isinstance(transport, dict):
+        raise Refused(f"the PP async CUDA transport {transport_name!r} is not configured")
+    required = {
+        "network_mode",
+        "process_group_timeout_seconds",
+        "device_id",
+        "env",
+    }
+    missing = required - set(transport)
+    if missing:
+        raise Refused(
+            "the PP async CUDA transport is missing: " + ", ".join(sorted(missing))
+        )
+    network_mode = transport["network_mode"]
+    if network_mode != "host":
+        raise Refused("the PP async CUDA qualification requires the configured host network")
+    timeout_seconds = transport["process_group_timeout_seconds"]
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, int)
+        or timeout_seconds < 1
+    ):
+        raise Refused(
+            "the PP async CUDA process-group timeout must be a positive integer"
+        )
+    device_id = transport["device_id"]
+    if device_id != "local_rank":
+        raise Refused(
+            "the PP async CUDA device_id must use the configured local_rank mode"
+        )
+    env = transport["env"]
+    if not isinstance(env, dict) or not env:
+        raise Refused("the PP async CUDA transport environment is missing")
+    if any(
+        not isinstance(key, str)
+        or not key
+        or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key)
+        or not isinstance(value, str)
+        or not value
+        for key, value in env.items()
+    ):
+        raise Refused("the PP async CUDA transport environment is invalid")
+    return {
+        "network_mode": network_mode,
+        "process_group_timeout_seconds": timeout_seconds,
+        "device_id": device_id,
+        "env": dict(env),
+    }
+
+
 def qualify_glm52_pp_async_cuda() -> dict[str, object]:
     """Run the fixed two-step PP8 CUDA smoke check on the trainer head."""
     profile = operations.get("qualification", {}).get("glm52_pp_async_cuda")
+    if not isinstance(profile, dict):
+        raise Refused("the PP async CUDA qualification profile is missing")
+    transport = _pp_async_cuda_transport(profile)
+    host = profile.get("host")
     expected = {
         "kind": "glm52",
-        "host": "n82",
         "container": "glm52_pp_async_cuda_smoke",
         "script": "source/tests/test_pp_async_cuda.py",
         "output_root": "/data/glm52-rl/qualifications/glm52-pp-async-cuda-smoke",
-        "steps": 2,
-        "gpus": 8,
+        "steps": profile.get("steps"),
+        "gpus": profile.get("gpus"),
+        "transport": profile.get("transport"),
     }
-    if not isinstance(profile, dict) or profile != expected or trainer_head != "n82":
-        raise Refused("the PP async CUDA profile must remain fixed to n82 and eight GPUs")
-    host = profile["host"]
-    if host in blocked_hosts or host != trainer_head:
+    observed = {key: profile.get(key) for key in expected}
+    if observed != expected:
+        raise Refused("the PP async CUDA qualification profile is invalid")
+    if (
+        not isinstance(host, str)
+        or not re.fullmatch(r"[A-Za-z0-9_.-]+", host)
+        or host in blocked_hosts
+        or host != trainer_head
+    ):
         raise Refused("the PP async CUDA host is not the configured trainer head")
+    gpu_count = profile.get("gpus")
+    if isinstance(gpu_count, bool) or not isinstance(gpu_count, int) or gpu_count < 1:
+        raise Refused("the PP async CUDA GPU count is invalid")
+    step_count = profile.get("steps")
+    if isinstance(step_count, bool) or not isinstance(step_count, int) or step_count < 1:
+        raise Refused("the PP async CUDA step count is invalid")
     container_key = profile["container"]
     container = containers.get(container_key)
     if not isinstance(container, str) or not re.fullmatch(
@@ -10322,20 +10395,25 @@ def qualify_glm52_pp_async_cuda() -> dict[str, object]:
         timeout=60,
     )
     if code:
-        raise RuntimeError(f"cannot inspect n82 for the PP async CUDA check: {output.strip()}")
+        raise RuntimeError(
+            f"cannot inspect {host} for the PP async CUDA check: {output.strip()}"
+        )
     state = _kv(output)
     if set(state) != {"GPUS", "PIDS", "RUNNING"}:
         raise Refused("the PP async CUDA preflight returned incomplete state")
-    if state.get("GPUS") != "8":
-        raise Refused(f"the PP async CUDA check requires eight GPUs, got {state.get('GPUS', '?')}")
+    if state.get("GPUS") != str(gpu_count):
+        raise Refused(
+            f"the PP async CUDA check requires {gpu_count} GPUs, "
+            f"got {state.get('GPUS', '?')}"
+        )
     if state.get("PIDS"):
         raise Refused(
-            "n82 has active GPU processes; the PP async CUDA check did not start: "
+            f"{host} has active GPU processes; the PP async CUDA check did not start: "
             f"pids={state['PIDS']}"
         )
     if state.get("RUNNING"):
         raise Refused(
-            "n82 has a running trainer or CUDA qualification container; "
+            f"{host} has a running trainer or CUDA qualification container; "
             f"the PP async CUDA check did not start: containers={state['RUNNING']}"
         )
 
@@ -10373,7 +10451,7 @@ printf 'STALE removed:%s\n' "$candidate_id"
     stale_code, stale_output = _ssh(host, stale_command, timeout=60)
     if stale_code:
         raise RuntimeError(
-            "cannot clean a stale n82 PP async CUDA candidate: "
+            f"cannot clean a stale {host} PP async CUDA candidate: "
             + (stale_output.strip()[-500:] or f"ssh exit {stale_code}")
         )
     stale_state = _kv(stale_output)
@@ -10381,7 +10459,9 @@ printf 'STALE removed:%s\n' "$candidate_id"
         stale_state["STALE"] == "none"
         or re.fullmatch(r"removed:[0-9a-f]{64}", stale_state["STALE"])
     ):
-        raise RuntimeError("stale n82 PP async CUDA candidate cleanup returned invalid state")
+        raise RuntimeError(
+            f"stale {host} PP async CUDA candidate cleanup returned invalid state"
+        )
 
     source_paths = (
         profile["script"],
@@ -10409,7 +10489,7 @@ printf 'STALE removed:%s\n' "$candidate_id"
     runner_path = f"{repository}/source/src/prime_rl/trainer/distributed/pp_runner.py"
     phase_profiler_path = f"{repository}/source/src/prime_rl/trainer/phase_profiler.py"
     inner = (
-        "torchrun --standalone --nproc-per-node=8 "
+        f"torchrun --standalone --nproc-per-node={gpu_count} "
         "--log-dir /output/torchrun --redirects 3 --tee 3 "
         "/qualification/test_pp_async_cuda.py"
     )
@@ -10480,8 +10560,8 @@ sudo timeout --foreground --signal=TERM --kill-after=30s {startup_deadline}s \
   docker run --rm --cidfile {shlex.quote(cid_path)} \
   --label prime.qualification={shlex.quote(qualification_label)} \
   --label prime.session={shlex.quote(session)} \
-  --name {shlex.quote(container)} --gpus all --ipc host --network none \
-  --hostname localhost --read-only \
+  --name {shlex.quote(container)} --gpus all --ipc host \
+  --network {shlex.quote(transport['network_mode'])} --read-only \
   --cap-drop ALL --security-opt no-new-privileges --pids-limit 1024 \
   --tmpfs /tmp:rw,nosuid,nodev,size=1g \
   -v {shlex.quote(script_path)}:/qualification/test_pp_async_cuda.py:ro \
@@ -10489,7 +10569,10 @@ sudo timeout --foreground --signal=TERM --kill-after=30s {startup_deadline}s \
   -v {shlex.quote(runner_path)}:/app/src/prime_rl/trainer/distributed/pp_runner.py:ro \
   -v {shlex.quote(phase_profiler_path)}:/app/src/prime_rl/trainer/phase_profiler.py:ro \
   -v {shlex.quote(output_dir)}:/output:rw \
-  -e PYTHONPATH=/app/src -e NCCL_ASYNC_ERROR_HANDLING=1 \
+  -e PYTHONPATH=/app/src \
+  {" ".join(f"-e {shlex.quote(key)}={shlex.quote(value)}" for key, value in sorted(transport["env"].items()))} \
+  -e PRIME_PROCESS_GROUP_TIMEOUT_SECONDS={transport['process_group_timeout_seconds']} \
+  -e PRIME_PROCESS_GROUP_DEVICE_ID={shlex.quote(transport['device_id'])} \
   --entrypoint /bin/bash {shlex.quote(trainer_image)} -lc {shlex.quote(inner)}
 test -s {shlex.quote(result_path)}
 cat {shlex.quote(result_path)}
@@ -10509,19 +10592,19 @@ cat {shlex.quote(result_path)}
     postflight_error = None
     if postflight_code:
         postflight_error = (
-            f"n82 postflight failed with ssh exit {postflight_code}: "
+            f"{host} postflight failed with ssh exit {postflight_code}: "
             f"{postflight_output.strip()[-500:]}"
         )
     elif set(postflight) != {"CONTAINERS", "PIDS"}:
-        postflight_error = "n82 postflight returned incomplete state"
+        postflight_error = f"{host} postflight returned incomplete state"
     elif postflight.get("CONTAINERS") or postflight.get("PIDS"):
         postflight_error = (
-            "n82 postflight found remaining container or GPU process: "
+            f"{host} postflight found remaining container or GPU process: "
             f"containers={postflight.get('CONTAINERS', '')} "
             f"pids={postflight.get('PIDS', '')}"
         )
     if code:
-        diagnostic_program = _pp_async_cuda_diagnostic_program(output_dir)
+        diagnostic_program = _pp_async_cuda_diagnostic_program(output_dir, gpu_count)
         diagnostic_code, diagnostic_output = _ssh(
             host,
             "python3 -c " + shlex.quote(diagnostic_program),
@@ -10545,7 +10628,7 @@ cat {shlex.quote(result_path)}
                 if (
                     isinstance(rank, int)
                     and not isinstance(rank, bool)
-                    and 0 <= rank < 8
+                    and 0 <= rank < gpu_count
                     and path is not None
                     and not path.is_absolute()
                     and path.parts[:1] == ("torchrun",)
@@ -10601,8 +10684,8 @@ cat {shlex.quote(result_path)}
     }
     if (
         result.get("status") != "pass"
-        or result.get("ranks") != 8
-        or result.get("steps") != 2
+        or result.get("ranks") != gpu_count
+        or result.get("steps") != step_count
         or result.get("microbatches") != 8
         or result.get("action_loss_grad_update_parity") is not True
         or result.get("all_async_nccl_work_drained") is not True
@@ -10610,11 +10693,11 @@ cat {shlex.quote(result_path)}
     ):
         raise RuntimeError("PP async CUDA qualification result failed validation")
     reports = result.get("rank_reports")
-    if not isinstance(reports, list) or len(reports) != 8:
+    if not isinstance(reports, list) or len(reports) != gpu_count:
         raise RuntimeError("PP async CUDA qualification has incomplete rank reports")
     if sorted(
         report.get("rank") for report in reports if isinstance(report, dict)
-    ) != list(range(8)):
+    ) != list(range(gpu_count)):
         raise RuntimeError("PP async CUDA qualification has invalid rank reports")
     for report in reports:
         for mode in ("baseline", "async"):
@@ -10622,7 +10705,7 @@ cat {shlex.quote(result_path)}
             mode_steps = mode_report.get("steps") if isinstance(mode_report, dict) else None
             if (
                 not isinstance(mode_steps, list)
-                or len(mode_steps) != 2
+                or len(mode_steps) != step_count
                 or any(
                     not isinstance(item, dict)
                     or not isinstance(item.get("cuda_ms"), (int, float))
@@ -10637,8 +10720,8 @@ cat {shlex.quote(result_path)}
     result["output_dir"] = output_dir
     summary = {
         "status": "pass",
-        "steps": 2,
-        "ranks": 8,
+        "steps": step_count,
+        "ranks": gpu_count,
         "baseline_cuda_ms_max": max(
             step["cuda_ms"] for report in reports for step in report["baseline"]["steps"]
         ),

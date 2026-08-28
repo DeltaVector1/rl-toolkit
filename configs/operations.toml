@@ -118,6 +118,32 @@ script = "source/tests/test_pp_async_cuda.py"
 output_root = "/data/glm52-rl/qualifications/glm52-pp-async-cuda-smoke"
 steps = 2
 gpus = 8
+transport = "glm52_trainer"
+
+[transport.glm52_trainer]
+network_mode = "host"
+process_group_timeout_seconds = 5400
+device_id = "local_rank"
+
+[transport.glm52_trainer.env]
+CUDA_DEVICE_ORDER = "PCI_BUS_ID"
+PYTHONUNBUFFERED = "1"
+OMP_NUM_THREADS = "1"
+NCCL_SOCKET_IFNAME = "vlan130"
+GLOO_SOCKET_IFNAME = "vlan130"
+NCCL_IB_DISABLE = "1"
+NCCL_P2P_DISABLE = "1"
+NCCL_SOCKET_NTHREADS = "1"
+NCCL_NSOCKS_PERTHREAD = "1"
+NCCL_BUFFSIZE = "1048576"
+NCCL_CUMEM_HOST_ENABLE = "0"
+NCCL_MIN_NCHANNELS = "16"
+NCCL_MAX_NCHANNELS = "16"
+TORCH_NCCL_TRACE_BUFFER_SIZE = "1048576"
+TORCH_NCCL_DUMP_ON_TIMEOUT = "1"
+TORCH_NCCL_ASYNC_ERROR_HANDLING = "1"
+TORCH_NCCL_ENABLE_MONITORING = "1"
+TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC = "600"
 
 [reward]
 minimum_steps = 10
