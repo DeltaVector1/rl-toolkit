@@ -26,6 +26,16 @@ steps = 2
 rows = 2
 columns = 4
 learning_rate = 1e-4
+junction_sparse_flags = (
+    (False, True),
+    (True, False),
+    (False, True),
+    (True, False),
+    (False, True),
+    (True, False),
+    (False, True),
+    (True, False),
+)
 journal_max_bytes = 256 * 1024
 journal_max_records = 2048
 journal_max_record_bytes = 1024
@@ -176,6 +186,87 @@ class AffineStage(nn.Module):
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         output = hidden * self.scale + self.bias
         return output.sum() if self.is_last else output
+
+
+class SparseAffineStage(AffineStage):
+    transfer_sparse_indices = True
+
+    def __init__(self, stage_index: int):
+        super().__init__(stage_index)
+        self.receive_sparse_indices, self.send_sparse_indices = junction_sparse_flags[
+            stage_index
+        ]
+        self._cache_received: list[tuple[int, int]] = []
+        self._cache_sent: list[tuple[int, int]] = []
+
+    def _cache(self, source_stage: int, microbatch: int, device) -> torch.Tensor:
+        values = torch.arange(8, device=device, dtype=torch.int16)
+        values.add_(source_stage * 31 + microbatch * 7 + 1)
+        return values.view(torch.float16).view(1, 2, 1, 4)
+
+    def _cache_source(self) -> int:
+        for stage in range(self.stage_identity - 1, -1, -1):
+            if junction_sparse_flags[stage][1]:
+                return stage
+        raise AssertionError(f"stage {self.stage_identity} has no cache source")
+
+    def forward(self, hidden: torch.Tensor, cache: torch.Tensor | None = None):
+        microbatch = self._active_microbatch
+        if microbatch is None:
+            raise AssertionError("sparse stage ran without an active microbatch")
+        if self.receive_sparse_indices:
+            if cache is None:
+                raise AssertionError(
+                    f"stage {self.stage_identity} did not receive its sparse cache"
+                )
+            expected = self._cache(self._cache_source(), microbatch, cache.device)
+            if not torch.equal(cache.view(torch.int16), expected.view(torch.int16)):
+                raise AssertionError(
+                    f"stage {self.stage_identity} received the wrong cache for "
+                    f"microbatch {microbatch}"
+                )
+            self._cache_received.append((self.stage_identity, microbatch))
+        elif cache is None or cache.numel() != 1:
+            raise AssertionError(
+                f"stage {self.stage_identity} expected a one-element cache placeholder"
+            )
+
+        output = hidden * self.scale + self.bias
+        if self.is_last:
+            if not self.receive_sparse_indices:
+                raise AssertionError("the last stage must receive the sparse cache")
+            return output.sum()
+        if self.send_sparse_indices:
+            cache_out = self._cache(self.stage_identity, microbatch, hidden.device)
+            self._cache_sent.append((self.stage_identity, microbatch))
+        else:
+            cache_out = torch.zeros(1, dtype=torch.float16, device=hidden.device)
+        return output, cache_out
+
+    def assert_cache_lifecycle(self) -> None:
+        expected = list(range(microbatches)) * steps
+        if (
+            self.receive_sparse_indices
+            and [mb for _stage, mb in self._cache_received] != expected
+        ):
+            raise AssertionError(
+                f"stage {self.stage_identity} did not consume every sparse cache"
+            )
+        if not self.receive_sparse_indices and self._cache_received:
+            raise AssertionError(
+                f"stage {self.stage_identity} consumed an unexpected cache"
+            )
+        if (
+            self.send_sparse_indices
+            and [mb for _stage, mb in self._cache_sent] != expected
+        ):
+            raise AssertionError(
+                f"stage {self.stage_identity} did not produce every sparse cache"
+            )
+        if not self.send_sparse_indices and self._cache_sent:
+            raise AssertionError(
+                f"stage {self.stage_identity} produced an unexpected cache"
+            )
 
 
 class WorkLifecycle:
@@ -396,21 +487,53 @@ def record_actions(stage, actions: list[tuple[str, int]], journal: RankJournal) 
     )
 
 
-def run_mode(mode: str, rank: int, device: torch.device, journal: RankJournal) -> dict:
+def run_mode(
+    mode: str,
+    rank: int,
+    device: torch.device,
+    journal: RankJournal,
+    *,
+    sparse: bool = False,
+) -> dict:
+    schedule_name = "1f1b_async" if mode.startswith("1f1b_async") else mode
+    is_async = schedule_name == "1f1b_async"
     journal.mode = mode
     journal.step = -1
     journal.write("schedule_build_before", rank=rank)
-    module = AffineStage(rank).to(device)
+    module = (SparseAffineStage(rank) if sparse else AffineStage(rank)).to(device)
     example = torch.empty((1, rows, columns), device=device)
+    cache_example = None
+    placeholder_example = None
+    if sparse:
+        cache_example = torch.empty((1, 2, 1, 4), dtype=torch.float16, device=device)
+        placeholder_example = torch.empty((1,), dtype=torch.float16, device=device)
+    if rank == 0:
+        example_input = example
+    elif sparse:
+        example_input = (
+            example,
+            cache_example if module.receive_sparse_indices else placeholder_example,
+        )
+    else:
+        example_input = example
+    if module.is_last:
+        example_output = torch.empty((), device=device)
+    elif sparse:
+        example_output = (
+            example,
+            cache_example if module.send_sparse_indices else placeholder_example,
+        )
+    else:
+        example_output = example
     schedule = pp_runner.build_schedule(
         module,
         pp_rank=rank,
         pp_size=stages,
         n_microbatches=microbatches,
         pp_group=dist.group.WORLD,
-        schedule_name=mode,
-        example_input=example,
-        example_output=torch.empty((), device=device) if module.is_last else example,
+        schedule_name=schedule_name,
+        example_input=example_input,
+        example_output=example_output,
         limit_receive_buffers=True,
         async_topology={
             "pp_limit_receive_buffers": True,
@@ -420,7 +543,7 @@ def run_mode(mode: str, rank: int, device: torch.device, journal: RankJournal) -
             "base_schedule": "1f1b",
             "cutoff": 5,
         }
-        if mode == "1f1b_async"
+        if is_async
         else None,
     )
     journal.write("schedule_build_after", rank=rank)
@@ -470,7 +593,7 @@ def run_mode(mode: str, rank: int, device: torch.device, journal: RankJournal) -
             module.bias.grad
         ):
             raise AssertionError(f"{mode} has a nonfinite gradient at step {step}")
-        if mode == "1f1b_async":
+        if is_async:
             created = AuditedTransport.instances[transport_start:]
             if len(created) != 1 or not created[0].drained:
                 raise AssertionError(f"async transport did not drain at step {step}")
@@ -505,6 +628,16 @@ def run_mode(mode: str, rank: int, device: torch.device, journal: RankJournal) -
         journal.write("step_barrier_after")
         journal.write("step_after")
 
+    if sparse:
+        module.assert_cache_lifecycle()
+        cache_lifecycle = {
+            "received": len(module._cache_received),
+            "sent": len(module._cache_sent),
+            "steps": steps,
+            "microbatches": microbatches,
+        }
+    else:
+        cache_lifecycle = None
     peak = torch.tensor(
         torch.cuda.max_memory_allocated(device) - before,
         device=device,
@@ -514,7 +647,9 @@ def run_mode(mode: str, rank: int, device: torch.device, journal: RankJournal) -
     return {
         "steps": reports,
         "peak_memory_bytes_max": int(peak),
-        "all_async_nccl_work_drained": mode != "1f1b_async"
+        "sparse_cache": sparse,
+        "sparse_cache_lifecycle": cache_lifecycle,
+        "all_async_nccl_work_drained": not is_async
         or all(item.drained for item in AuditedTransport.instances),
     }
 
@@ -586,11 +721,27 @@ def main() -> None:
             candidate = run_mode(
                 "1f1b_async", rank, torch.device("cuda", local_rank), journal
             )
+            assert_parity(baseline, candidate)
+            journal.write("mode_barrier_before", mode="1f1b_async")
+            dist.barrier()
+            journal.write("mode_barrier_after", mode="1f1b_async")
+            sparse = run_mode(
+                "1f1b_async_sparse",
+                rank,
+                torch.device("cuda", local_rank),
+                journal,
+                sparse=True,
+            )
         finally:
             AuditedTransport.journal = None
             async_schedule.CudaAsyncP2P = original
-        assert_parity(baseline, candidate)
-        local = {"rank": rank, "baseline": baseline, "async": candidate}
+        assert_parity(baseline, sparse)
+        local = {
+            "rank": rank,
+            "baseline": baseline,
+            "async": candidate,
+            "async_sparse": sparse,
+        }
         rank_reports = [None] * stages if rank == 0 else None
         dist.gather_object(local, rank_reports, dst=0)
         if rank == 0:
@@ -602,6 +753,10 @@ def main() -> None:
                 "action_loss_grad_update_parity": True,
                 "all_async_nccl_work_drained": all(
                     item["async"]["all_async_nccl_work_drained"]
+                    for item in rank_reports
+                ),
+                "all_sparse_cache_nccl_work_drained": all(
+                    item["async_sparse"]["all_async_nccl_work_drained"]
                     for item in rank_reports
                 ),
                 "rank_reports": rank_reports,

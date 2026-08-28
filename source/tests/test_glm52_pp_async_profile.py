@@ -210,13 +210,65 @@ def test_cuda_smoke_profile_is_small_and_n82_only() -> None:
         and node.args
         and isinstance(node.args[0], ast.Constant)
     }
-    assert run_modes == {"1f1b", "1f1b_async"}
+    assert run_modes == {"1f1b", "1f1b_async", "1f1b_async_sparse"}
     assert "@record\ndef main()" in script
     assert "model-fp8" not in script
     assert "/data/ZiphuAI" not in script
     assert "timeout=_process_group_timeout()" in script
     assert "device_id=_process_group_device_id(local_rank)" in script
     assert 'dist.init_process_group("nccl")' not in script
+
+
+def test_cuda_sparse_mode_checks_production_boundary_ownership_after_dense_modes() -> (
+    None
+):
+    source = (ROOT / "source/tests/test_pp_async_cuda.py").read_text()
+    tree = ast.parse(source)
+    flags = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "junction_sparse_flags"
+            for target in node.targets
+        )
+    )
+    assert ast.literal_eval(flags.value) == (
+        (False, True),
+        (True, False),
+        (False, True),
+        (True, False),
+        (False, True),
+        (True, False),
+        (False, True),
+        (True, False),
+    )
+    main = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "main"
+    )
+    calls = [
+        node
+        for node in ast.walk(main)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "run_mode"
+    ]
+    calls.sort(key=lambda node: node.lineno)
+    modes = [call.args[0].value for call in calls if call.args]
+    assert modes[-3:] == ["1f1b", "1f1b_async", "1f1b_async_sparse"]
+    sparse_call = calls[-1]
+    assert any(
+        keyword.arg == "sparse"
+        and isinstance(keyword.value, ast.Constant)
+        and keyword.value.value is True
+        for keyword in sparse_call.keywords
+    )
+    assert "assert_cache_lifecycle" in source
+    assert '"async_sparse"' in source
+    assert '"sparse_cache_lifecycle"' in source
+    assert '"all_sparse_cache_nccl_work_drained"' in source
 
 
 def _new_cuda_dummy_stage():
