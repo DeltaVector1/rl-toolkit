@@ -10423,41 +10423,63 @@ def _copy_resume_adapter(path: str, nodes: list[str]) -> None:
 set -euo pipefail
 source_file={quoted_path}
 test -f "$source_file"
-digest=$(sha256sum "$source_file" | cut -d' ' -f1)
+digest=$(sha256sum -- "$source_file" | cut -d' ' -f1)
+digest=${{digest#\\\\}}
 ssh_opts=(-o BatchMode=yes -o ConnectTimeout=10 -o ControlMaster=no -o ControlPath=none)
+encode_path() {{
+  printf '%s' "$1" | base64 | tr -d '\\n'
+}}
+remote_command() {{
+  local target=$1 operation=$2 final=$3 staging=$4
+  local encoded_final encoded_staging
+  encoded_final=$(encode_path "$final")
+  encoded_staging=$(encode_path "$staging")
+  ssh "${{ssh_opts[@]}}" "$target" bash -s -- "$operation" "$encoded_final" "$encoded_staging" <<'REMOTE_SCRIPT'
+set -euo pipefail
+operation=$1
+final=$(printf '%s' "$2" | base64 -d)
+staging=$(printf '%s' "$3" | base64 -d)
+file_digest() {{
+  local digest
+  digest=$(sha256sum -- "$1" 2>/dev/null | cut -d' ' -f1) || return
+  printf '%s\\n' "${{digest#\\\\}}"
+}}
+case "$operation" in
+  final_digest) file_digest "$final" ;;
+  make_directory) mkdir -p -- "$(dirname -- "$final")" ;;
+  partial_digest) file_digest "$staging" ;;
+  install) mv -- "$staging" "$final" ;;
+  *) exit 2 ;;
+esac
+REMOTE_SCRIPT
+}}
 copy_one() {{
   target=$1
   final=$source_file
-  directory=$(dirname "$final")
-  partial="$directory/.adapter_model.$digest.partial"
-  remote_digest=$(ssh -n "${{ssh_opts[@]}}" "$target" \
-    "sha256sum '$final' 2>/dev/null | cut -d' ' -f1" || true)
+  staging="/tmp/prime-rl-adapter.$digest.partial"
+  remote_digest=$(remote_command "$target" final_digest "$final" "$staging" || true)
   [ "$remote_digest" = "$digest" ] && return 0
   [ -z "$remote_digest" ] || {{
     echo "$target has a different adapter at $final" >&2
     return 1
   }}
-  ssh -n "${{ssh_opts[@]}}" "$target" \
-    "mkdir -p '$directory'"
+  remote_command "$target" make_directory "$final" "$staging"
   transfer=rsync
-  ssh -n "${{ssh_opts[@]}}" "$target" \
-    "command -v rsync >/dev/null" || transfer=scp
+  ssh "${{ssh_opts[@]}}" "$target" command -v rsync >/dev/null || transfer=scp
   for attempt in 1 2 3; do
     if [ "$transfer" = rsync ]; then
       rsync -a --partial --append-verify --timeout=120 \
         -e "ssh ${{ssh_opts[*]}}" \
-        "$source_file" "$target:$partial" && copied=1 || copied=0
+        "$source_file" "$target:$staging" && copied=1 || copied=0
     else
       scp -p "${{ssh_opts[@]}}" \
         -o ServerAliveInterval=15 -o ServerAliveCountMax=8 \
-        "$source_file" "$target:$partial" && copied=1 || copied=0
+        "$source_file" "$target:$staging" && copied=1 || copied=0
     fi
     if [ "$copied" = 1 ]; then
-      remote_digest=$(ssh -n "${{ssh_opts[@]}}" "$target" \
-        "sha256sum '$partial' | cut -d' ' -f1")
+      remote_digest=$(remote_command "$target" partial_digest "$final" "$staging")
       if [ "$remote_digest" = "$digest" ]; then
-        ssh -n "${{ssh_opts[@]}}" "$target" \
-          "mv '$partial' '$final'"
+        remote_command "$target" install "$final" "$staging"
         return 0
       fi
     fi
