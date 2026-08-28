@@ -6,6 +6,13 @@ from dataclasses import dataclass
 
 import torch
 
+try:
+    import triton
+    import triton.language as tl
+except ImportError:
+    triton = None
+    tl = None
+
 
 SM89 = (8, 9)
 QUERY_TOKENS = 4096
@@ -15,11 +22,8 @@ ROPE_WIDTH = 64
 TOTAL_WIDTH = VALUE_WIDTH + ROPE_WIDTH
 GROUPS = 1
 TOPK = 2048
-QUERY_CHUNK = 32
-ENTRY_CHUNK = 64
-HEAD_BLOCK = 64
-LIVE_CONTRIBUTION_TENSORS = 6
-ROUTE_BYTES_PER_ENTRY = 32
+BLOCK_WIDTH = 128
+ROUTE_BYTES_PER_ENTRY = 28
 MAX_WORKSPACE_BYTES = 256 * 1024 * 1024
 LOG2_E = 1.4426950408889634
 
@@ -27,38 +31,35 @@ LOG2_E = 1.4426950408889634
 @dataclass(frozen=True)
 class TwoStageMemory:
     sequence_kv: int
-    partial_bytes: int
-    route_bytes: int
-    contribution_bytes: int
+    route_sort_bytes: int
+    reduction_bytes: int
     total_bytes: int
 
 
 def two_stage_memory(
     sequence_kv: int,
     *,
-    query_chunk: int = QUERY_CHUNK,
-    entry_chunk: int = ENTRY_CHUNK,
-    head_block: int = HEAD_BLOCK,
+    route_count: int = QUERY_TOKENS * TOPK,
 ) -> TwoStageMemory:
-    """Return the conservative live FP32 workspace bound."""
+    """Return the conservative peak workspace bound.
 
-    if sequence_kv < 1 or query_chunk <= 0 or entry_chunk <= 0 or head_block <= 0:
-        raise ValueError("two-stage memory dimensions must be positive")
-    # One reusable partial and one fixed-order accumulator are live.  Route
-    # metadata uses int32/int32/int64.  The last term covers gathered inputs,
-    # probabilities, and the FP32 contribution for one entry chunk.
-    partial_bytes = 2 * sequence_kv * TOTAL_WIDTH * 4
-    route_bytes = query_chunk * TOPK * ROUTE_BYTES_PER_ENTRY
-    contribution_bytes = (
-        entry_chunk * head_block * TOTAL_WIDTH * 4 * LIVE_CONTRIBUTION_TENSORS
+    Route compaction and sorting happen before the FP32 output is allocated.
+    The larger of that temporary and the reduction buffers is the bound.
+    """
+
+    if sequence_kv < 1 or route_count < 0:
+        raise ValueError("two-stage memory dimensions must be non-negative")
+    route_sort_bytes = route_count * ROUTE_BYTES_PER_ENTRY
+    reduction_bytes = (
+        route_count * 4
+        + (sequence_kv + 1) * 8
+        + sequence_kv * TOTAL_WIDTH * 4
     )
-    total_bytes = partial_bytes + route_bytes + contribution_bytes
     return TwoStageMemory(
         sequence_kv=sequence_kv,
-        partial_bytes=partial_bytes,
-        route_bytes=route_bytes,
-        contribution_bytes=contribution_bytes,
-        total_bytes=total_bytes,
+        route_sort_bytes=route_sort_bytes,
+        reduction_bytes=reduction_bytes,
+        total_bytes=max(route_sort_bytes, reduction_bytes),
     )
 
 
@@ -86,61 +87,126 @@ def supports_glm_sm89_shape(
     return tuple(indices.shape) == (1, QUERY_TOKENS, GROUPS, TOPK)
 
 
-def _segment_sum(values: torch.Tensor, keys: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    if keys.numel() == 0:
-        return values[:0], keys
-    starts = torch.ones(keys.numel(), dtype=torch.bool, device=keys.device)
-    starts[1:] = keys[1:] != keys[:-1]
-    first = torch.nonzero(starts, as_tuple=False).flatten()
-    ends = torch.cat((first[1:], keys.new_tensor([keys.numel()])))
-    lengths = ends - first
-    segment_reduce = getattr(torch, "segment_reduce", None)
-    if segment_reduce is not None:
-        reduced = segment_reduce(values, "sum", lengths=lengths)
-    else:
-        reduced = torch.stack(
-            [values[int(start) : int(end)].sum(dim=0) for start, end in zip(first, ends)]
+if triton is not None:
+
+    @triton.jit
+    def _two_stage_dkv_kernel(
+        q,
+        kv,
+        do,
+        lse,
+        delta,
+        route_positions,
+        key_offsets,
+        output,
+        q_stride_s,
+        q_stride_h,
+        kv_stride_s,
+        do_stride_s,
+        do_stride_h,
+        lse_stride_s,
+        lse_stride_h,
+        delta_stride_s,
+        delta_stride_h,
+        output_stride_s,
+        sm_scale,
+        BLOCK_WIDTH: tl.constexpr,
+    ):
+        key_id = tl.program_id(0)
+        width_block = tl.program_id(1)
+        width = width_block * BLOCK_WIDTH + tl.arange(0, BLOCK_WIDTH)
+        output_mask = width < TOTAL_WIDTH
+        route_start = tl.load(key_offsets + key_id)
+        route_end = tl.load(key_offsets + key_id + 1)
+        accumulator = tl.zeros((BLOCK_WIDTH,), dtype=tl.float32)
+
+        for head in tl.range(0, ATTENTION_HEADS):
+            head_partial = tl.zeros((BLOCK_WIDTH,), dtype=tl.float32)
+            for route_index in tl.range(route_start, route_end):
+                position = tl.load(route_positions + route_index)
+                query_id = position // TOPK
+                q_base = query_id * q_stride_s + head * q_stride_h
+                kv_base = key_id * kv_stride_s
+
+                score = tl.zeros((), dtype=tl.float32)
+                for score_start in range(0, TOTAL_WIDTH, BLOCK_WIDTH):
+                    score_width = score_start + tl.arange(0, BLOCK_WIDTH)
+                    score_mask = score_width < TOTAL_WIDTH
+                    q_score = tl.load(
+                        q + q_base + score_width,
+                        mask=score_mask,
+                        other=0.0,
+                    ).to(tl.float32)
+                    kv_score = tl.load(
+                        kv + kv_base + score_width,
+                        mask=score_mask,
+                        other=0.0,
+                    ).to(tl.float32)
+                    score += tl.sum(q_score * kv_score, axis=0)
+
+                lse_value = tl.load(lse + query_id * lse_stride_s + head * lse_stride_h)
+                probability = tl.exp2(score * (sm_scale * LOG2_E) - lse_value)
+                probability = tl.where(probability == probability, probability, 0.0)
+
+                dp_score = tl.zeros((), dtype=tl.float32)
+                for score_start in range(0, VALUE_WIDTH, BLOCK_WIDTH):
+                    score_width = score_start + tl.arange(0, BLOCK_WIDTH)
+                    score_mask = score_width < VALUE_WIDTH
+                    do_score = tl.load(
+                        do + query_id * do_stride_s + head * do_stride_h + score_width,
+                        mask=score_mask,
+                        other=0.0,
+                    ).to(tl.float32)
+                    kv_score = tl.load(
+                        kv + kv_base + score_width,
+                        mask=score_mask,
+                        other=0.0,
+                    ).to(tl.float32)
+                    dp_score += tl.sum(do_score * kv_score, axis=0)
+                delta_value = tl.load(delta + query_id * delta_stride_s + head * delta_stride_h)
+                dp = probability * (dp_score - delta_value) * sm_scale
+                dp = tl.where(dp == dp, dp, 0.0)
+
+                q_output = tl.load(q + q_base + width, mask=output_mask, other=0.0).to(tl.float32)
+                do_output = tl.load(
+                    do + query_id * do_stride_s + head * do_stride_h + width,
+                    mask=output_mask & (width < VALUE_WIDTH),
+                    other=0.0,
+                ).to(tl.float32)
+                head_partial += dp * q_output + probability * do_output
+            accumulator += head_partial
+
+        tl.store(output + key_id * output_stride_s + width, accumulator, mask=output_mask)
+
+else:
+    _two_stage_dkv_kernel = None
+
+
+def _sorted_route_positions(
+    indices: torch.Tensor,
+    sequence_kv: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build key-major route positions with GPU tensor operations only."""
+
+    flat = indices.reshape(-1)
+    positions = torch.arange(flat.numel(), device=indices.device, dtype=torch.int32)
+    valid = (flat >= 0) & (flat < sequence_kv - 1)
+    keys = flat.masked_select(valid)
+    positions = positions.masked_select(valid)
+    del flat, valid
+    order = torch.argsort(keys, stable=True)
+    sorted_keys = keys.index_select(0, order)
+    sorted_positions = positions.index_select(0, order)
+    del keys, positions, order
+    counts = torch.bincount(sorted_keys, minlength=sequence_kv)
+    del sorted_keys
+    offsets = torch.cat(
+        (
+            torch.zeros(1, dtype=torch.int64, device=indices.device),
+            counts.cumsum(0, dtype=torch.int64),
         )
-    return reduced, keys.index_select(0, first)
-
-
-def _route_contribution(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    do: torch.Tensor,
-    lse: torch.Tensor,
-    delta: torch.Tensor,
-    positions: torch.Tensor,
-    keys: torch.Tensor,
-    *,
-    head_start: int,
-    head_count: int,
-    sm_scale: float,
-) -> torch.Tensor:
-    query_ids = positions.to(torch.int64) // TOPK
-    head_ids = torch.arange(
-        head_start,
-        head_start + head_count,
-        dtype=torch.int64,
-        device=q.device,
-    )[None, :]
-    q_rows = q[0, query_ids[:, None], head_ids, :].float()
-    do_rows = do[0, query_ids[:, None], head_ids, :].float()
-    kv_rows = kv[0, keys.to(torch.int64), 0, :].float()
-    lse_rows = lse[0, query_ids[:, None], head_ids].float()
-    delta_rows = delta[0, query_ids[:, None], head_ids].float()
-
-    score = (q_rows * kv_rows[:, None, :]).sum(dim=-1)
-    probabilities = torch.exp2(score * (sm_scale * LOG2_E) - lse_rows)
-    probabilities = torch.where(
-        torch.isfinite(probabilities), probabilities, torch.zeros_like(probabilities)
     )
-    dp_score = (do_rows * kv_rows[:, None, :VALUE_WIDTH]).sum(dim=-1)
-    dp = probabilities * (dp_score - delta_rows) * sm_scale
-    dp = torch.where(torch.isfinite(dp), dp, torch.zeros_like(dp))
-    value = (dp[..., None] * q_rows[..., :VALUE_WIDTH] + probabilities[..., None] * do_rows).sum(dim=1)
-    rope = (dp[..., None] * q_rows[..., VALUE_WIDTH:]).sum(dim=1)
-    return torch.nan_to_num(torch.cat((value, rope), dim=-1))
+    return sorted_positions, offsets
 
 
 def sparse_mla_dkv_two_stage(
@@ -154,75 +220,75 @@ def sparse_mla_dkv_two_stage(
     sm_scale: float | None = None,
     max_workspace_bytes: int = MAX_WORKSPACE_BYTES,
 ) -> tuple[torch.Tensor, TwoStageMemory]:
-    """Compute dKV without global scalar atomics.
+    """Compute BF16 dKV with one GPU reduction kernel.
 
-    Stage one writes one reusable FP32 partial for each query chunk.  Stage
-    two adds each partial to the FP32 result in query order.  Stable key sort
-    preserves route order for duplicate keys.  The returned tensor is BF16;
-    the FP32 comparison tolerance for this prototype is rtol=2e-2,
-    atol=2e-3 against the existing TileLang path.
+    GPU sorting makes routes key-major.  The Triton kernel accumulates each
+    key's FP32 head partials in route order and writes one FP32 output row.
+    The result is compared with the existing TileLang path at rtol=2e-2 and
+    atol=2e-3 during qualification.
     """
 
-    if not (q.is_cuda and kv.is_cuda and do.is_cuda and indices.is_cuda):
+    tensors = (q, kv, do, indices, lse, delta)
+    if not all(t.is_cuda for t in tensors):
         raise ValueError("two-stage sparse MLA requires CUDA tensors")
+    if triton is None or _two_stage_dkv_kernel is None:
+        raise RuntimeError("two-stage sparse MLA requires Triton")
     capability = torch.cuda.get_device_capability(q.device)
     if not supports_glm_sm89_shape(q, kv, do, indices, capability=capability):
         raise ValueError("two-stage sparse MLA requires the exact GLM SM89 CP shape")
-    if not all(t.is_contiguous() for t in (q, kv, do, indices, lse, delta)):
+    if not all(t.is_contiguous() for t in tensors):
         raise ValueError("two-stage sparse MLA requires contiguous tensors")
-    if tuple(lse.shape) != (1, QUERY_TOKENS, ATTENTION_HEADS):
-        raise ValueError("two-stage sparse MLA requires GLM LSE shape")
-    if tuple(delta.shape) != tuple(lse.shape):
-        raise ValueError("two-stage sparse MLA requires matching Delta shape")
     if q.dtype != torch.bfloat16 or kv.dtype != torch.bfloat16 or do.dtype != torch.bfloat16:
         raise TypeError("two-stage sparse MLA requires BF16 inputs")
     if indices.dtype != torch.int32:
         raise TypeError("two-stage sparse MLA requires int32 indices")
+    if tuple(lse.shape) != (1, QUERY_TOKENS, ATTENTION_HEADS):
+        raise ValueError("two-stage sparse MLA requires GLM LSE shape")
+    if tuple(delta.shape) != tuple(lse.shape):
+        raise ValueError("two-stage sparse MLA requires matching Delta shape")
     if sm_scale is None:
         sm_scale = TOTAL_WIDTH**-0.5
 
-    memory = two_stage_memory(int(kv.shape[1]))
-    if memory.total_bytes > max_workspace_bytes or max_workspace_bytes > MAX_WORKSPACE_BYTES:
+    sequence_kv = int(kv.shape[1])
+    memory = two_stage_memory(sequence_kv)
+    if max_workspace_bytes > MAX_WORKSPACE_BYTES or memory.total_bytes > max_workspace_bytes:
         raise RuntimeError(
             "two-stage sparse MLA workspace exceeds the 256 MiB qualification bound: "
             f"{memory.total_bytes} > {max_workspace_bytes} bytes"
         )
 
-    sequence_kv = int(kv.shape[1])
-    partial = torch.zeros(
-        sequence_kv, TOTAL_WIDTH, dtype=torch.float32, device=q.device
+    route_positions, key_offsets = _sorted_route_positions(indices, sequence_kv)
+    output = torch.zeros(
+        sequence_kv,
+        TOTAL_WIDTH,
+        dtype=torch.float32,
+        device=q.device,
     )
-    result = torch.zeros_like(partial)
-    for query_start in range(0, QUERY_TOKENS, QUERY_CHUNK):
-        query_end = min(query_start + QUERY_CHUNK, QUERY_TOKENS)
-        partial.zero_()
-        route_values = indices[0, query_start:query_end, 0].reshape(-1)
-        valid = (route_values >= 0) & (route_values < sequence_kv - 1)
-        positions = torch.nonzero(valid, as_tuple=False).flatten().to(torch.int32)
-        keys = route_values.index_select(0, positions)
-        if positions.numel():
-            order = torch.argsort(keys, stable=True)
-            positions = positions.index_select(0, order)
-            keys = keys.index_select(0, order)
-            for entry_start in range(0, int(positions.numel()), ENTRY_CHUNK):
-                entry_end = min(int(positions.numel()), entry_start + ENTRY_CHUNK)
-                positions_chunk = positions[entry_start:entry_end]
-                keys_chunk = keys[entry_start:entry_end]
-                for head_start in range(0, ATTENTION_HEADS, HEAD_BLOCK):
-                    contribution = _route_contribution(
-                        q,
-                        kv,
-                        do,
-                        lse,
-                        delta,
-                        positions_chunk + query_start * TOPK,
-                        keys_chunk,
-                        head_start=head_start,
-                        head_count=HEAD_BLOCK,
-                        sm_scale=float(sm_scale),
-                    )
-                    reduced, unique_keys = _segment_sum(contribution, keys_chunk)
-                    old = partial.index_select(0, unique_keys.to(torch.int64))
-                    partial.index_copy_(0, unique_keys.to(torch.int64), old + reduced)
-        result.add_(partial)
-    return result.view_as(kv).to(dtype=kv.dtype), memory
+    grid = (sequence_kv, triton.cdiv(TOTAL_WIDTH, BLOCK_WIDTH))
+    _two_stage_dkv_kernel[grid](
+        q,
+        kv,
+        do,
+        lse,
+        delta,
+        route_positions,
+        key_offsets,
+        output,
+        q.stride(1),
+        q.stride(2),
+        kv.stride(1),
+        do.stride(1),
+        do.stride(2),
+        lse.stride(1),
+        lse.stride(2),
+        delta.stride(1),
+        delta.stride(2),
+        output.stride(0),
+        float(sm_scale),
+        BLOCK_WIDTH=BLOCK_WIDTH,
+        num_warps=4,
+        num_stages=1,
+    )
+    if not torch.isfinite(output).all():
+        raise RuntimeError("two-stage sparse MLA produced nonfinite dKV")
+    return output.view_as(kv).to(dtype=kv.dtype), memory

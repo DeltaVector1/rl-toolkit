@@ -188,22 +188,23 @@ def bwd(
             acc_dp = T.alloc_fragment([block_H, BS], accum_dtype)
             acc_dq = T.alloc_fragment([block_H, D], accum_dtype)
             acc_dq_tail = T.alloc_fragment([block_H, D_tail], accum_dtype)
-            acc_dkv = T.alloc_fragment([BS, D], accum_dtype)
-            acc_dkv_tail = T.alloc_fragment([BS, D_tail], accum_dtype)
-            if reuse_dq_shared:
-                acc_dkv_shared = T.view(
-                    dQ_shared,
-                    [BS // split_store, D],
-                    accum_dtype,
-                )
-                acc_dkv_tail_shared = T.view(
-                    dQ_tail_shared,
-                    [BS // split_store, D_tail],
-                    accum_dtype,
-                )
-            else:
-                acc_dkv_shared = T.alloc_shared([BS // split_store, D], accum_dtype)
-                acc_dkv_tail_shared = T.alloc_shared([BS // split_store, D_tail], accum_dtype)
+            if compute_dkv:
+                acc_dkv = T.alloc_fragment([BS, D], accum_dtype)
+                acc_dkv_tail = T.alloc_fragment([BS, D_tail], accum_dtype)
+                if reuse_dq_shared:
+                    acc_dkv_shared = T.view(
+                        dQ_shared,
+                        [BS // split_store, D],
+                        accum_dtype,
+                    )
+                    acc_dkv_tail_shared = T.view(
+                        dQ_tail_shared,
+                        [BS // split_store, D_tail],
+                        accum_dtype,
+                    )
+                else:
+                    acc_dkv_shared = T.alloc_shared([BS // split_store, D], accum_dtype)
+                    acc_dkv_tail_shared = T.alloc_shared([BS // split_store, D_tail], accum_dtype)
 
             # See sparse_mla_fwd: sentinel is at index S_kv - 1 (zero KV), valid indices
             # live in [0, S_kv - 1). Using this single bound makes the kernel work for
@@ -279,20 +280,21 @@ def bwd(
                 T.gemm(dP_shared_cast, KV_shared, acc_dq, policy=T.GemmWarpPolicy.FullCol)
                 T.gemm(dP_shared_cast, KV_tail_shared, acc_dq_tail, policy=T.GemmWarpPolicy.FullCol)
 
-                T.gemm(
-                    dP_shared_cast,
-                    Q_shared,
-                    acc_dkv,
-                    transpose_A=True,
-                    policy=T.GemmWarpPolicy.FullCol,
-                    clear_accum=True,
-                )
-                T.gemm(P_shared_cast, dO_shared, acc_dkv, transpose_A=True, policy=T.GemmWarpPolicy.FullCol)
+                if compute_dkv:
+                    T.gemm(
+                        dP_shared_cast,
+                        Q_shared,
+                        acc_dkv,
+                        transpose_A=True,
+                        policy=T.GemmWarpPolicy.FullCol,
+                        clear_accum=True,
+                    )
+                    T.gemm(P_shared_cast, dO_shared, acc_dkv, transpose_A=True, policy=T.GemmWarpPolicy.FullCol)
 
-                T.clear(acc_dkv_tail)
-                T.gemm(dP_shared_cast, Q_tail_shared, acc_dkv_tail, transpose_A=True, policy=T.GemmWarpPolicy.FullCol)
+                    T.clear(acc_dkv_tail)
+                    T.gemm(dP_shared_cast, Q_tail_shared, acc_dkv_tail, transpose_A=True, policy=T.GemmWarpPolicy.FullCol)
 
-                for s in range(split_store):
+                    for s in range(split_store):
                         # Keep the full dKV GEMM above.  This is important for
                         # parity: splitting the GEMM changes the FP32 reduction
                         # order even though each split computes the same rows.
@@ -316,7 +318,7 @@ def bwd(
                                     0,
                                 )
 
-                        if compute_dkv and vectorized_atomic:
+                        if vectorized_atomic:
                             for bi_i, d_i in T.Parallel(BS // split_store, D // 4):
                                 source_row = bi_i + s * (BS // split_store)
                                 safe_index = safe_indices[source_row]
@@ -352,7 +354,7 @@ def bwd(
                                     ),
                                     T.evaluate(0),
                                 )
-                        if compute_dkv and not vectorized_atomic:
+                        else:
                             for bi_i, d_i in T.Parallel(BS // split_store, D):
                                 source_row = bi_i + s * (BS // split_store)
                                 safe_index = safe_indices[source_row]
@@ -483,7 +485,12 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None):
     postprocess_kernel = postprocess(D, D_tail, kv_group)
 
     delta = preprocess_kernel(o, do)
-    dkv = torch.zeros_like(kv, dtype=torch.float32)
+    if use_two_stage:
+        # The TileLang signature retains a dKV pointer, but the compile-time
+        # compute_dkv=False path never reads or writes it.
+        dkv = torch.empty(1, device=kv.device, dtype=torch.float32)
+    else:
+        dkv = torch.zeros_like(kv, dtype=torch.float32)
     dq = bwd_kernel(q, kv, do, indices, lse, delta, dkv)
     if use_two_stage:
         from prime_rl.trainer.models.kernels.sparse_mla_two_stage import sparse_mla_dkv_two_stage

@@ -9,16 +9,14 @@ SOURCE = (ROOT / "src/prime_rl/trainer/models/kernels/sparse_mla_two_stage.py").
 
 TOTAL_WIDTH = 576
 TOPK = 2048
-QUERY_CHUNK = 32
-ENTRY_CHUNK = 64
 MAX_WORKSPACE_BYTES = 256 * 1024 * 1024
+ROUTE_BYTES_PER_ENTRY = 28
 
 
 def memory_bound(sequence_kv: int) -> int:
-    partial = 2 * sequence_kv * TOTAL_WIDTH * 4
-    route = QUERY_CHUNK * TOPK * 32
-    contribution = ENTRY_CHUNK * 64 * TOTAL_WIDTH * 4 * 6
-    return partial + route + contribution
+    route_sort = 4096 * TOPK * ROUTE_BYTES_PER_ENTRY
+    reduction = (4096 * TOPK * 4) + ((sequence_kv + 1) * 8) + (sequence_kv * TOTAL_WIDTH * 4)
+    return max(route_sort, reduction)
 
 
 def stable_segment_sum(values: list[list[float]], keys: list[int]):
@@ -36,7 +34,7 @@ def stable_segment_sum(values: list[list[float]], keys: list[int]):
 class SparseMlaTwoStageTest(unittest.TestCase):
     def test_production_workspace_is_bounded(self):
         total = memory_bound(32769)
-        self.assertEqual(2 * 32769 * TOTAL_WIDTH * 4, 150999552)
+        self.assertEqual(4096 * TOPK * ROUTE_BYTES_PER_ENTRY, 234881024)
         self.assertLess(total, MAX_WORKSPACE_BYTES)
         self.assertLess(total / 2**20, 256)
 
@@ -45,7 +43,7 @@ class SparseMlaTwoStageTest(unittest.TestCase):
         self.assertIn("(1, QUERY_TOKENS, ATTENTION_HEADS, TOTAL_WIDTH)", SOURCE)
         self.assertIn("(1, QUERY_TOKENS, GROUPS, TOPK)", SOURCE)
         self.assertIn("(1, 32768 + 1, GROUPS, TOTAL_WIDTH)", SOURCE)
-        self.assertIn("ROUTE_BYTES_PER_ENTRY = 32", SOURCE)
+        self.assertIn("ROUTE_BYTES_PER_ENTRY = 28", SOURCE)
 
     def test_duplicate_routes_reduce_in_stable_key_order(self):
         reduced, unique = stable_segment_sum(
@@ -58,7 +56,12 @@ class SparseMlaTwoStageTest(unittest.TestCase):
         self.assertIn('os.environ.get("PRIME_SPARSE_BWD_TWO_STAGE", "0")', BWD_SOURCE)
         self.assertIn("compute_dkv=not use_two_stage", BWD_SOURCE)
         self.assertIn("sparse_mla_dkv_two_stage", BWD_SOURCE)
+        self.assertIn("torch.empty(1, device=kv.device, dtype=torch.float32)", BWD_SOURCE)
+        self.assertIn("if compute_dkv:", BWD_SOURCE)
         self.assertIn("MAX_WORKSPACE_BYTES = 256 * 1024 * 1024", SOURCE)
+        self.assertNotIn("torch.nonzero", SOURCE)
+        self.assertNotIn(".item()", SOURCE)
+        self.assertIn("@triton.jit", SOURCE)
 
 
 if __name__ == "__main__":
