@@ -340,6 +340,106 @@ def _profile(name: str = "current") -> dict:
         raise RuntimeError(f"profile {name!r} has no readable environment config")
     return profile
 
+
+def _production20_identity_failures(
+    profile_name: str,
+    profile: dict,
+    trainer_values: dict,
+    orchestrator_values: dict,
+    environment_values: dict,
+) -> list[str]:
+    if profile_name != "glm52-production20":
+        return []
+    failures: list[str] = []
+    identity = profile.get("identity")
+    if not isinstance(identity, dict):
+        return ["profile identity is missing"]
+
+    def required_text(name: str, pattern: str | None = None) -> str | None:
+        value = identity.get(name)
+        if not isinstance(value, str) or not value:
+            failures.append(f"identity {name} is missing")
+            return None
+        if pattern is not None and re.fullmatch(pattern, value) is None:
+            failures.append(f"identity {name} is invalid")
+            return None
+        return value
+
+    if identity.get("rollout_cache") is not False:
+        failures.append("rollout cache must be explicitly false")
+    for name, values in (
+        ("trainer", trainer_values),
+        ("orchestrator", orchestrator_values),
+        ("environment", environment_values),
+    ):
+        data = values.get("data", {})
+        if not isinstance(data, dict):
+            failures.append(f"{name} data configuration is invalid")
+        elif "rollout_cache" in values or "rollout_cache" in data:
+            failures.append(f"{name} config contains a rollout cache setting")
+
+    parity_path = repo_root / "configs/qualification/glm52-policy-parity.toml"
+    try:
+        with parity_path.open("rb") as stream:
+            parity = tomllib.load(stream)
+    except (OSError, tomllib.TOMLDecodeError):
+        failures.append("parity identity metadata is unavailable")
+        parity = {}
+
+    source_revision = required_text("prime_rl_revision", r"[0-9a-f]{40}")
+    parity_revision = parity.get("prime_rl_revision")
+    if source_revision is not None and source_revision != parity_revision:
+        failures.append("identity Prime-RL revision differs from parity metadata")
+
+    trainer_tag = required_text("trainer_image")
+    if trainer_tag is not None and trainer_tag != containers.get("trainer_image"):
+        failures.append("identity trainer image differs from operations metadata")
+    inference_tag = required_text("inference_image")
+    if inference_tag is not None and inference_tag != containers.get("inference_image"):
+        failures.append("identity inference image differs from operations metadata")
+    required_text("trainer_image_digest", r"sha256:[0-9a-f]{64}")
+    h200_digest = required_text("h200_image_digest", r"sha256:[0-9a-f]{64}")
+    parity_digest = parity.get("inference_image_digest")
+    if h200_digest is not None and h200_digest != parity_digest:
+        failures.append("identity H200 image digest differs from parity metadata")
+
+    model = trainer_values.get("model")
+    if not isinstance(model, dict):
+        failures.append("trainer model configuration is missing")
+        model = {}
+    model_name = required_text("model_name")
+    if model_name is not None and model_name != model.get("name"):
+        failures.append("identity model name differs from trainer configuration")
+    model_revision = required_text("model_revision", r"[0-9a-f]{40}")
+    if model_revision is not None and model_revision != parity.get("model_revision"):
+        failures.append("identity model revision differs from parity metadata")
+    model_sha256 = required_text("model_sha256", r"[0-9a-f]{64}")
+
+    base_alias = required_text("base_model_alias")
+    if base_alias is not None and base_alias != model_name:
+        failures.append("adapter base model alias differs from model identity")
+    base_revision = required_text("base_model_revision", r"[0-9a-f]{40}")
+    if base_revision is not None and base_revision != model_revision:
+        failures.append("adapter base model revision differs from model identity")
+    base_sha256 = required_text("base_model_sha256", r"[0-9a-f]{64}")
+    if base_sha256 is not None and base_sha256 != model_sha256:
+        failures.append("adapter base model hash differs from model identity")
+
+    lora = model.get("lora")
+    if not isinstance(lora, dict):
+        failures.append("trainer LoRA configuration is missing")
+        lora = {}
+    if identity.get("adapter_rank") != lora.get("rank"):
+        failures.append("adapter rank identity differs from trainer configuration")
+    if identity.get("adapter_alpha") != lora.get("alpha"):
+        failures.append("adapter alpha identity differs from trainer configuration")
+    if identity.get("adapter_dropout") != lora.get("dropout"):
+        failures.append("adapter dropout identity differs from trainer configuration")
+    targets = identity.get("adapter_target_modules")
+    if not isinstance(targets, list) or targets != lora.get("target_modules"):
+        failures.append("adapter target identity differs from trainer configuration")
+    return failures
+
 ssh_command = [
     "ssh",
     "-o",
@@ -9728,6 +9828,18 @@ def start(
         raise Refused(
             f"profile {profile!r} is configured for {configured_paths}; "
             f"the requested run {run!r} requires {expected_paths}"
+        )
+    identity_failures = _production20_identity_failures(
+        profile,
+        selected,
+        trainer_values,
+        orchestrator_values,
+        environment_values,
+    )
+    if identity_failures:
+        raise Refused(
+            "GLM production profile identity preflight failed: "
+            + "; ".join(identity_failures)
         )
     if selected["kind"] == "glm52":
         production_start_preflight()

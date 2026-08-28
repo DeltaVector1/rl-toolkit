@@ -74,6 +74,39 @@ def test_current_glm52_profile_is_batch_2048_without_rollout_cache() -> None:
     }
 
 
+def test_glm52_production20_requires_identity_and_no_rollout_cache() -> None:
+    operations = _load("configs/operations.toml")
+    profile = operations["profiles"]["glm52-production20"]
+    trainer = _load(profile["trainer"])
+    orchestrator = _load(profile["orchestrator"])
+    environment = _load(profile["environment"])
+    skill_source = ROOT / ".agents/skills/training-ops/src"
+    sys.path.insert(0, str(skill_source))
+    try:
+        import training_ops
+
+        failures = training_ops._production20_identity_failures(
+            "glm52-production20", profile, trainer, orchestrator, environment
+        )
+    finally:
+        sys.path.remove(str(skill_source))
+
+    assert profile["identity"]["rollout_cache"] is False
+    assert "identity trainer_image_digest is missing" in failures
+    assert "identity model_sha256 is missing" in failures
+    assert "identity base_model_sha256 is missing" in failures
+    assert not any("rollout cache" in failure for failure in failures)
+
+    broken = dict(profile)
+    broken["identity"] = dict(profile["identity"])
+    broken["identity"]["rollout_cache"] = True
+    assert "rollout cache must be explicitly false" in (
+        training_ops._production20_identity_failures(
+            "glm52-production20", broken, trainer, orchestrator, environment
+        )
+    )
+
+
 def test_glm52_launchers_cannot_use_live_muse_container_names() -> None:
     cluster = (ROOT / "scripts/china/cluster.sh").read_text()
     watchdog = (ROOT / "scripts/h200/trainer_failure_watchdog.sh").read_text()

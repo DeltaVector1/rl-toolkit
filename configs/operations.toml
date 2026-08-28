@@ -70,6 +70,35 @@ trainer = "configs/paused/trainer.glm52-production20.toml"
 orchestrator = "configs/paused/orchestrator.glm52-production20.toml"
 environment = "configs/paused/env.glm52-production20.toml"
 
+[profiles.glm52-production20.identity]
+prime_rl_revision = "60bc29547a8824ad1de7b9af8d265e2b27b2a72d"
+trainer_image = "prime-rl:glm52-v080-qual"
+trainer_image_digest = ""
+inference_image = "prime-rl:glm52-v080-full"
+h200_image_digest = "sha256:2f803571329212bfb4e27982efec7559f20379bcde73ac6ccee6bb8be3c46ade"
+model_name = "/data/glm52-rl/model-fp8"
+model_revision = "ba978f7d347eaf65d22f1a86833408afdb953541"
+model_sha256 = ""
+base_model_alias = "/data/glm52-rl/model-fp8"
+base_model_revision = "ba978f7d347eaf65d22f1a86833408afdb953541"
+base_model_sha256 = ""
+rollout_cache = false
+adapter_rank = 32
+adapter_alpha = 64
+adapter_dropout = 0.0
+adapter_target_modules = [
+  "q_a_proj",
+  "q_b_proj",
+  "kv_a_proj_with_mqa",
+  "kv_b_proj",
+  "o_proj",
+  "gate_proj",
+  "up_proj",
+  "down_proj",
+  "shared_expert",
+  "experts",
+]
+
 [profiles.glm52-native-small]
 kind = "glm52"
 trainer = "configs/qualification/glm52-native-small.toml"
