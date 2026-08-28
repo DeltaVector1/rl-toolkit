@@ -3755,6 +3755,24 @@ raise SystemExit(99)
                 output_dir,
             )
 
+    def test_nsys_phase_record_path_is_allowlisted(self):
+        profile = training_ops._profile("glm52-native-b2048-nsys")
+        launch_env = training_ops._qualification_launch_env(profile)
+        self.assertEqual(
+            launch_env["PRIME_PHASE_PROFILE_RECORD_PATH"],
+            "/data/glm52-rl/qualifications/glm52-native-b2048-nsys-20260827/"
+            "phase-profile.json",
+        )
+        invalid = dict(profile)
+        invalid["launch_env"] = {
+            **profile["launch_env"],
+            "PRIME_PHASE_PROFILE_RECORD_PATH": "/tmp/phase-profile.json",
+        }
+        with self.assertRaisesRegex(
+            training_ops.Refused, "PRIME_PHASE_PROFILE_RECORD_PATH"
+        ):
+            training_ops._qualification_launch_env(invalid)
+
     def test_nsys_environment_rejects_extra_or_missing_worker_metadata(self):
         launch_env = {
             "PRIME_NSYS_PROFILE": "1",

@@ -389,6 +389,86 @@ class PhaseProfilerTest(unittest.TestCase):
             0.02,
         )
 
+    def test_phase_records_are_disabled_without_a_qualification_path(self):
+        with patch.dict("os.environ", {}, clear=True):
+            profiler = PhaseProfiler()
+        report = {"rank": 4, "stage": 2, "step": 3}
+        self.assertFalse(profiler.write_report(report))
+
+    def test_phase_record_path_requires_qualification(self):
+        with tempfile.TemporaryDirectory() as output_dir, patch.dict(
+            "os.environ",
+            {"PRIME_PHASE_PROFILE_RECORD_PATH": f"{output_dir}/phase.json"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "qualification profile"):
+                PhaseProfiler()
+
+    def test_phase_record_is_atomic_rank_stage_file_and_bounded(self):
+        report = {
+            "rank": 17,
+            "stage": 5,
+            "step": 23,
+            "step_ms": 123.5,
+            "sample_every": 8,
+            "classified_sum_ms": 100.0,
+            "modeled_overhead_fraction": 0.01,
+            "categories": {
+                phase: {
+                    "calls": 4,
+                    "sampled": 1,
+                    "estimated": True,
+                    "inclusive_ms": 10.0,
+                    "exclusive_ms": 9.0,
+                }
+                for phase in PHASES
+            },
+        }
+        with tempfile.TemporaryDirectory() as output_dir, patch.dict(
+            "os.environ",
+            {
+                "PRIME_QUALIFICATION_PROFILE": "glm52-native-b2048-nsys",
+                "PRIME_PHASE_PROFILE_RECORD_PATH": f"{output_dir}/phase.json",
+            },
+            clear=True,
+        ):
+            profiler = PhaseProfiler()
+            self.assertTrue(profiler.write_report(report))
+            artifact = pathlib.Path(output_dir) / "phase.rank_17.step_23.json"
+            self.assertTrue(artifact.is_file())
+            self.assertFalse(list(pathlib.Path(output_dir).glob("*.tmp")))
+            self.assertLessEqual(
+                artifact.stat().st_size,
+                phase_profiler._PHASE_PROFILE_MAX_OUTPUT_BYTES,
+            )
+            record = json.loads(artifact.read_text())
+            self.assertEqual(
+                {record[key] for key in ("rank", "stage", "step")},
+                {17, 5, 23},
+            )
+            self.assertEqual(set(record["categories"]), set(PHASES))
+
+    def test_phase_record_payload_remains_bounded_for_untrusted_values(self):
+        report = {
+            "rank": 1,
+            "stage": 0,
+            "step": 2,
+            "categories": {
+                phase: {
+                    "calls": 10**100,
+                    "sampled": 10**100,
+                    "inclusive_ms": "x" * 10**7,
+                    "exclusive_ms": float("nan"),
+                }
+                for phase in PHASES
+            },
+        }
+        payload = PhaseProfiler._bounded_record_payload(report)
+        self.assertLessEqual(
+            len(payload), phase_profiler._PHASE_PROFILE_MAX_OUTPUT_BYTES
+        )
+        self.assertEqual(json.loads(payload)["status"], "ok")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -390,6 +390,10 @@ _QUALIFICATION_LAUNCH_ENV_PATTERNS = {
         r"/data/glm52-rl/qualifications/glm52-native-b2048-memory/"
         r"cuda-memory-capture\.json"
     ),
+    "PRIME_PHASE_PROFILE_RECORD_PATH": re.compile(
+        r"/data/glm52-rl/qualifications/glm52-native-b2048-nsys-[0-9]{8}/"
+        r"phase-profile\.json"
+    ),
     "PRIME_BF16_COMBINE_ROUNDS": re.compile(r"8"),
 }
 
