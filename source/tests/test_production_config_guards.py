@@ -208,6 +208,34 @@ def test_glm52_stability_and_production_use_local_expert_recompute() -> None:
     assert "PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD" not in muse.get("env_vars", {})
 
 
+def test_glm_qkv_a_lora_fusion_is_explicit_and_mounted() -> None:
+    config = _load("configs/qualification/glm52-native-small.toml")
+    assert config["model"]["lora"]["fused_qkv_a_lora"] is False
+
+    trainer_config = (
+        ROOT / "source/packages/prime-rl-configs/src/prime_rl/configs/trainer.py"
+    ).read_text()
+    model_source = (ROOT / "source/src/prime_rl/trainer/model.py").read_text()
+    glm_source = (
+        ROOT / "source/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py"
+    ).read_text()
+    attention_source = (
+        ROOT
+        / "source/src/prime_rl/trainer/models/glm_moe_dsa/sparse_mla_attention.py"
+    ).read_text()
+    launcher = (ROOT / "scripts/china/cluster.sh").read_text()
+
+    assert "fused_qkv_a_lora: bool = False" in trainer_config
+    assert "model_config.fused_qkv_a_lora" in model_source
+    assert "fused_qkv_a_lora=getattr(config, \"fused_qkv_a_lora\", False)" in glm_source
+    assert "self.fused_qkv_a_lora = args.fused_qkv_a_lora" in attention_source
+    assert "PRIME_FUSED_QKV_A_LORA" not in attention_source
+    assert "fused_qkv_a_lora = lora.get" in launcher
+    assert "configured_fused_qkv_a_lora" in launcher
+    assert "source/src/prime_rl/trainer/models/glm_moe_dsa/sparse_mla_attention.py" in launcher
+    assert "source/src/prime_rl/trainer/models/layers/lora/multi_linear.py" in launcher
+
+
 def test_glm52_b2048_qualification_uses_plain_physical_layout() -> None:
     expected = [0, 8, 18, 28, 38, 48, 58, 68, 78]
     for relative in (
