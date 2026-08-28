@@ -1238,8 +1238,6 @@ def response_logprob(entry: Any, token_id: int, index: int) -> float:
         if key in entry:
             value = entry[key]
             break
-    if value is None and len(entry) == 1:
-        value = next(iter(entry.values()))
     if isinstance(value, dict):
         value = value.get("logprob")
     elif hasattr(value, "logprob"):
