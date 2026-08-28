@@ -4,7 +4,9 @@ import ast
 import hashlib
 import importlib.util
 import json
+import subprocess
 import sys
+import tempfile
 import tomllib
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,6 +41,21 @@ def _load_training_ops(name: str):
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _run_worker_diagnostic(training_ops, session: Path) -> dict:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            training_ops._pp_async_cuda_diagnostic_program(str(session)),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout.strip())
 
 
 def test_async_profile_is_isolated_and_full_shape() -> None:
@@ -374,6 +391,67 @@ def test_rank_four_failure_artifact_survives_a_missing_result() -> None:
     diagnostic = calls[4][1]
     assert "error.json" in diagnostic
     assert 'traceback[-6000:]' in diagnostic
+
+
+def test_worker_diagnostic_reads_a_valid_rank_four_artifact() -> None:
+    training_ops = _load_training_ops("training_ops_pp_async_valid_artifact")
+    with tempfile.TemporaryDirectory() as directory:
+        session = Path(directory) / "session"
+        rank_dir = session / "torchrun" / "run" / "attempt_0" / "4"
+        rank_dir.mkdir(parents=True)
+        traceback = "Traceback (most recent call last):\nrank four failed"
+        (rank_dir / "error.json").write_text(
+            json.dumps(
+                {
+                    "message": {
+                        "message": "RuntimeError: rank four failed",
+                        "extraInfo": {"py_callstack": traceback},
+                    }
+                }
+            )
+        )
+        assert _run_worker_diagnostic(training_ops, session) == {
+            "rank": 4,
+            "error_path": "torchrun/run/attempt_0/4/error.json",
+            "traceback": traceback,
+        }
+
+
+def test_worker_diagnostic_rejects_symlinks_corrupt_and_oversized_files() -> None:
+    training_ops = _load_training_ops("training_ops_pp_async_invalid_artifact")
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        session = root / "session"
+        session.mkdir()
+        outside = root / "outside"
+        (outside / "4").mkdir(parents=True)
+        (outside / "4" / "error.json").write_text('{"message": "escaped"}')
+        (session / "torchrun").symlink_to(outside, target_is_directory=True)
+        assert _run_worker_diagnostic(training_ops, session) == {"status": "missing"}
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        session = root / "session"
+        torchrun = session / "torchrun"
+        torchrun.mkdir(parents=True)
+        outside = root / "outside"
+        (outside / "attempt_0" / "4").mkdir(parents=True)
+        (outside / "attempt_0" / "4" / "error.json").write_text(
+            '{"message": "escaped"}'
+        )
+        (torchrun / "run").symlink_to(outside, target_is_directory=True)
+        assert _run_worker_diagnostic(training_ops, session) == {"status": "missing"}
+
+    for payload in (b"not json", b"x" * 1048577):
+        with tempfile.TemporaryDirectory() as directory:
+            session = Path(directory) / "session"
+            rank_dir = session / "torchrun" / "run" / "attempt_0" / "4"
+            rank_dir.mkdir(parents=True)
+            (rank_dir / "error.json").write_bytes(payload)
+            assert _run_worker_diagnostic(training_ops, session) == {
+                "status": "missing"
+            }
 
 
 def test_preflight_reports_gpu_pids_and_running_containers_separately() -> None:

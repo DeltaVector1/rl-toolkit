@@ -10176,6 +10176,110 @@ def deploy(
     return not bad
 
 
+def _pp_async_cuda_diagnostic_program(output_dir: str) -> str:
+    return f"""
+import json
+import os
+import stat
+from pathlib import Path
+
+session_root = Path({output_dir!r})
+torchrun_root = session_root / "torchrun"
+records = []
+try:
+    session_metadata = session_root.lstat()
+    torchrun_metadata = torchrun_root.lstat()
+    if (
+        not stat.S_ISDIR(session_metadata.st_mode)
+        or stat.S_ISLNK(session_metadata.st_mode)
+        or not stat.S_ISDIR(torchrun_metadata.st_mode)
+        or stat.S_ISLNK(torchrun_metadata.st_mode)
+    ):
+        raise OSError("diagnostic root identity differs")
+    session_resolved = session_root.resolve(strict=True)
+    torchrun_resolved = torchrun_root.resolve(strict=True)
+    if torchrun_resolved != session_resolved / "torchrun":
+        raise OSError("diagnostic root escaped its session")
+except OSError:
+    session_resolved = None
+    torchrun_resolved = None
+
+if torchrun_resolved is not None:
+    for directory, names, files in os.walk(torchrun_root, topdown=True, followlinks=False):
+        base = Path(directory)
+        try:
+            base_metadata = base.lstat()
+            base_resolved = base.resolve(strict=True)
+            base_resolved.relative_to(torchrun_resolved)
+            if not stat.S_ISDIR(base_metadata.st_mode) or stat.S_ISLNK(base_metadata.st_mode):
+                raise OSError("diagnostic directory identity differs")
+        except (OSError, ValueError):
+            names[:] = []
+            continue
+        safe_names = []
+        for name in names:
+            child = base / name
+            try:
+                child_metadata = child.lstat()
+                child_resolved = child.resolve(strict=True)
+                child_resolved.relative_to(torchrun_resolved)
+                if stat.S_ISDIR(child_metadata.st_mode) and not stat.S_ISLNK(
+                    child_metadata.st_mode
+                ):
+                    safe_names.append(name)
+            except (OSError, ValueError):
+                continue
+        names[:] = safe_names
+        if "error.json" not in files:
+            continue
+        path = base / "error.json"
+        try:
+            metadata = path.lstat()
+            resolved = path.resolve(strict=True)
+            resolved.relative_to(torchrun_resolved)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_size > 1048576
+            ):
+                continue
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                opened_resolved = Path(f"/proc/self/fd/{{descriptor}}").resolve(
+                    strict=True
+                )
+                opened_resolved.relative_to(torchrun_resolved)
+                if opened_resolved != resolved:
+                    continue
+                payload = os.read(descriptor, 1048577)
+            finally:
+                os.close(descriptor)
+            if len(payload) > 1048576:
+                continue
+            record = json.loads(payload)
+            rank = int(path.parent.name)
+            message = record.get("message")
+            if isinstance(message, dict):
+                extra = message.get("extraInfo")
+                traceback = extra.get("py_callstack") if isinstance(extra, dict) else None
+                if not isinstance(traceback, str):
+                    traceback = message.get("message")
+            else:
+                traceback = message
+            if not 0 <= rank < 8 or not isinstance(traceback, str) or not traceback:
+                continue
+            records.append({{
+                "rank": rank,
+                "error_path": str(resolved.relative_to(session_resolved)),
+                "traceback": traceback[-6000:],
+            }})
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+records.sort(key=lambda item: ("Traceback" not in item["traceback"], item["rank"]))
+print(json.dumps(records[0] if records else {{"status": "missing"}}, sort_keys=True))
+"""
+
+
 def qualify_glm52_pp_async_cuda() -> dict[str, object]:
     """Run the fixed two-step PP8 CUDA smoke check on the trainer head."""
     profile = operations.get("qualification", {}).get("glm52_pp_async_cuda")
@@ -10414,54 +10518,7 @@ cat {shlex.quote(result_path)}
             f"pids={postflight.get('PIDS', '')}"
         )
     if code:
-        diagnostic_program = f"""
-import json
-import os
-import stat
-from pathlib import Path
-
-root = Path({output_dir!r})
-records = []
-if root.is_dir() and not root.is_symlink():
-    for directory, names, files in os.walk(root / "torchrun", followlinks=False):
-        base = Path(directory)
-        names[:] = [name for name in names if not (base / name).is_symlink()]
-        if "error.json" not in files:
-            continue
-        path = base / "error.json"
-        try:
-            metadata = path.lstat()
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 1048576:
-                continue
-            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-            try:
-                payload = os.read(descriptor, 1048577)
-            finally:
-                os.close(descriptor)
-            if len(payload) > 1048576:
-                continue
-            record = json.loads(payload)
-            rank = int(path.parent.name)
-            message = record.get("message")
-            if isinstance(message, dict):
-                extra = message.get("extraInfo")
-                traceback = extra.get("py_callstack") if isinstance(extra, dict) else None
-                if not isinstance(traceback, str):
-                    traceback = message.get("message")
-            else:
-                traceback = message
-            if not 0 <= rank < 8 or not isinstance(traceback, str) or not traceback:
-                continue
-            records.append({{
-                "rank": rank,
-                "error_path": str(path.relative_to(root)),
-                "traceback": traceback[-6000:],
-            }})
-        except (OSError, ValueError, json.JSONDecodeError):
-            continue
-records.sort(key=lambda item: ("Traceback" not in item["traceback"], item["rank"]))
-print(json.dumps(records[0] if records else {{"status": "missing"}}, sort_keys=True))
-"""
+        diagnostic_program = _pp_async_cuda_diagnostic_program(output_dir)
         diagnostic_code, diagnostic_output = _ssh(
             host,
             "python3 -c " + shlex.quote(diagnostic_program),
