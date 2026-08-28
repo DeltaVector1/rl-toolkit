@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import heapq
 import json
+import math
 import os
 import statistics
 import sys
@@ -65,6 +66,10 @@ _CUDA_MEMORY_CAPTURE_MAX_BLOCKS = 256
 _CUDA_MEMORY_CAPTURE_MAX_TRACE_ENTRIES = 256
 _CUDA_MEMORY_CAPTURE_MAX_ERROR_CHARS = 512
 _PHASE_PROFILE_MAX_OUTPUT_BYTES = 256 * 1024
+_PHASE_PROFILE_MAX_INTEGER = (1 << 63) - 1
+_PHASE_PROFILE_MINIMAL_PAYLOAD = (
+    b'{"format":"prime-phase-profile-v1","status":"truncated"}'
+)
 
 
 def _safe_int(value: Any) -> int:
@@ -1057,67 +1062,81 @@ class PhaseProfiler:
 
     @staticmethod
     def _record_number(value: Any) -> float:
-        parsed = _safe_stat(value)
-        return float(parsed) if parsed is not None else 0.0
+        try:
+            parsed = float(value)
+        except Exception:
+            return 0.0
+        return parsed if math.isfinite(parsed) else 0.0
+
+    @staticmethod
+    def _record_integer(value: Any, *, minimum: int = 0, default: int = 0) -> int:
+        try:
+            parsed = int(value)
+        except Exception:
+            return default
+        return min(_PHASE_PROFILE_MAX_INTEGER, max(minimum, parsed))
+
+    @staticmethod
+    def _encode_bounded_record(record: dict[str, Any]) -> bytes:
+        try:
+            payload = json.dumps(
+                record, sort_keys=True, separators=(",", ":"), allow_nan=False
+            ).encode("utf-8")
+        except Exception:
+            return _PHASE_PROFILE_MINIMAL_PAYLOAD
+        if len(payload) > _PHASE_PROFILE_MAX_OUTPUT_BYTES:
+            return _PHASE_PROFILE_MINIMAL_PAYLOAD
+        return payload
 
     @classmethod
     def _bounded_record_payload(cls, report: dict[str, Any]) -> bytes:
         """Encode the fixed phase record within the artifact size limit."""
-        raw_categories = report.get("categories", {})
-        categories: dict[str, dict[str, float | int | bool]] = {}
-        for phase in PHASES:
-            raw = raw_categories.get(phase, {}) if isinstance(raw_categories, dict) else {}
-            if not isinstance(raw, dict):
-                raw = {}
-            categories[phase] = {
-                "calls": max(0, _safe_int(raw.get("calls", 0))),
-                "sampled": max(0, _safe_int(raw.get("sampled", 0))),
-                "estimated": bool(raw.get("estimated", False)),
-                "inclusive_ms": cls._record_number(raw.get("inclusive_ms", 0.0)),
-                "exclusive_ms": cls._record_number(raw.get("exclusive_ms", 0.0)),
-            }
-        record = {
-            "format": "prime-phase-profile-v1",
-            "status": "ok",
-            "rank": max(0, _safe_int(report.get("rank", 0))),
-            "stage": max(0, _safe_int(report.get("stage", 0))),
-            "step": max(0, _safe_int(report.get("step", 0))),
-            "step_ms": cls._record_number(report.get("step_ms", 0.0)),
-            "sample_every": max(1, _safe_int(report.get("sample_every", 1))),
-            "classified_sum_ms": cls._record_number(
-                report.get("classified_sum_ms", 0.0)
-            ),
-            "modeled_overhead_fraction": cls._record_number(
-                report.get("modeled_overhead_fraction", 0.0)
-            ),
-            "categories": categories,
-        }
-        payload = json.dumps(
-            record, sort_keys=True, separators=(",", ":"), allow_nan=False
-        ).encode("utf-8")
-        if len(payload) > _PHASE_PROFILE_MAX_OUTPUT_BYTES:
-            # The schema above is fixed, but keep a strict bound if a future
-            # edit adds an unexpectedly large field.
+        try:
+            raw_categories = report.get("categories", {})
+            categories: dict[str, dict[str, float | int | bool]] = {}
+            for phase in PHASES:
+                raw = (
+                    raw_categories.get(phase, {})
+                    if isinstance(raw_categories, dict)
+                    else {}
+                )
+                if not isinstance(raw, dict):
+                    raw = {}
+                categories[phase] = {
+                    "calls": cls._record_integer(raw.get("calls", 0)),
+                    "sampled": cls._record_integer(raw.get("sampled", 0)),
+                    "estimated": bool(raw.get("estimated", False)),
+                    "inclusive_ms": cls._record_number(raw.get("inclusive_ms", 0.0)),
+                    "exclusive_ms": cls._record_number(raw.get("exclusive_ms", 0.0)),
+                }
             record = {
                 "format": "prime-phase-profile-v1",
-                "status": "truncated",
-                "rank": record["rank"],
-                "stage": record["stage"],
-                "step": record["step"],
+                "status": "ok",
+                "rank": cls._record_integer(report.get("rank", 0)),
+                "stage": cls._record_integer(report.get("stage", 0)),
+                "step": cls._record_integer(report.get("step", 0)),
+                "step_ms": cls._record_number(report.get("step_ms", 0.0)),
+                "sample_every": cls._record_integer(
+                    report.get("sample_every", 1), minimum=1, default=1
+                ),
+                "classified_sum_ms": cls._record_number(
+                    report.get("classified_sum_ms", 0.0)
+                ),
+                "modeled_overhead_fraction": cls._record_number(
+                    report.get("modeled_overhead_fraction", 0.0)
+                ),
+                "categories": categories,
             }
-            payload = json.dumps(
-                record, sort_keys=True, separators=(",", ":"), allow_nan=False
-            ).encode("utf-8")
-        if len(payload) > _PHASE_PROFILE_MAX_OUTPUT_BYTES:
-            raise RuntimeError("phase profile record exceeds its size limit")
-        return payload
+            return cls._encode_bounded_record(record)
+        except Exception:
+            return _PHASE_PROFILE_MINIMAL_PAYLOAD
 
     def write_report(self, report: dict[str, Any]) -> bool:
         """Write one local rank/stage record when qualification capture is enabled."""
         if self._record_path is None:
             return False
-        rank = max(0, _safe_int(report.get("rank", 0)))
-        step = max(0, _safe_int(report.get("step", 0)))
+        rank = self._record_integer(report.get("rank", 0))
+        step = self._record_integer(report.get("step", 0))
         path = _phase_record_path(self._record_path, rank, step)
         try:
             _atomic_write(path, self._bounded_record_payload(report))
