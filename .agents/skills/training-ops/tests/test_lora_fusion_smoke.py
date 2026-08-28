@@ -11,20 +11,23 @@ import training_ops
 
 ROOT = pathlib.Path(training_ops.__file__).resolve().parents[5]
 SCRIPT = ROOT / "scripts/ops/benchmark_fused_qkv_a_lora_sm89.py"
+SOURCE_MODULES = (
+    "source/src/prime_rl/trainer/models/layers/lora/multi_linear.py",
+    "source/src/prime_rl/trainer/models/layers/fp8_ada.py",
+    "source/src/prime_rl/trainer/models/layers/checkpointing.py",
+    "source/src/prime_rl/trainer/phase_profiler.py",
+)
 
 
 class LoraFusionSmokeTest(unittest.TestCase):
     def test_registered_command_is_bounded_and_inventory_driven(self):
-        host, image, script, module, remote_timeout, ssh_timeout = (
+        host, image, script, modules, remote_timeout, ssh_timeout = (
             training_ops._lora_fusion_smoke_spec()
         )
         self.assertEqual(host, training_ops.trainer_head)
         self.assertEqual(image, training_ops.containers["trainer_image"])
         self.assertEqual(script, "scripts/ops/benchmark_fused_qkv_a_lora_sm89.py")
-        self.assertEqual(
-            module,
-            "source/src/prime_rl/trainer/models/layers/lora/multi_linear.py",
-        )
+        self.assertEqual(modules, SOURCE_MODULES)
         self.assertEqual((remote_timeout, ssh_timeout), (180, 240))
 
     def test_remote_command_is_gpu_zero_ephemeral_and_model_free(self):
@@ -32,7 +35,7 @@ class LoraFusionSmokeTest(unittest.TestCase):
             "/data/glm52-rl/deployment-glm52-optims",
             "prime-rl:glm52-v080-qual",
             "scripts/ops/benchmark_fused_qkv_a_lora_sm89.py",
-            "source/src/prime_rl/trainer/models/layers/lora/multi_linear.py",
+            SOURCE_MODULES,
             "glm52-lora-fusion-smoke-0123456789abcdef",
             0,
             180,
@@ -52,6 +55,75 @@ class LoraFusionSmokeTest(unittest.TestCase):
             self.assertIn(text, command)
         for text in ("src=/models/", "rollout", "PRIME_BATCH_CACHE", "ZiphuAI"):
             self.assertNotIn(text, command)
+
+    def test_import_closure_matches_every_registered_local_module(self):
+        closure = training_ops._lora_fusion_import_closure(SOURCE_MODULES[0])
+        self.assertEqual(set(closure), set(SOURCE_MODULES))
+
+    def test_registered_command_refuses_an_incomplete_import_closure(self):
+        settings = dict(
+            training_ops.qualification_commands["glm52_lora_fusion_smoke"]
+        )
+        settings["source_modules"] = [SOURCE_MODULES[0]]
+        with patch.dict(
+            training_ops.qualification_commands,
+            {"glm52_lora_fusion_smoke": settings},
+        ):
+            with self.assertRaises(training_ops.Refused):
+                training_ops._lora_fusion_smoke_spec()
+
+    def test_generated_mounts_cover_script_and_import_closure(self):
+        repository = "/data/glm52-rl/deployment-glm52-optims"
+        script = "scripts/ops/benchmark_fused_qkv_a_lora_sm89.py"
+        mounts = training_ops._lora_fusion_smoke_mounts(
+            repository, script, SOURCE_MODULES
+        )
+        self.assertEqual(
+            {relative for relative, _source, _destination, _digest in mounts},
+            {script, *SOURCE_MODULES},
+        )
+        destinations = {
+            relative: destination
+            for relative, _source, destination, _digest in mounts
+        }
+        self.assertEqual(
+            destinations[script], "/opt/glm52-lora-fusion-smoke.py"
+        )
+        for module in SOURCE_MODULES:
+            self.assertEqual(
+                destinations[module],
+                f"/app/src/{module.removeprefix('source/src/')}",
+            )
+        for relative, source, _destination, digest in mounts:
+            self.assertEqual(source, f"{repository}/{relative}")
+            self.assertRegex(digest, r"^[0-9a-f]{64}$")
+
+    def test_command_verifies_hashes_import_paths_and_required_symbols(self):
+        command = training_ops._lora_fusion_smoke_command(
+            "/data/glm52-rl/deployment-glm52-optims",
+            "prime-rl:glm52-v080-qual",
+            "scripts/ops/benchmark_fused_qkv_a_lora_sm89.py",
+            SOURCE_MODULES,
+            "glm52-lora-fusion-smoke-0123456789abcdef",
+            0,
+            180,
+        )
+        for text in (
+            "mounted source hash differs",
+            "module loaded from wrong path",
+            "FP8CheckpointFusedQKVA",
+            "FP8CheckpointFusedQKVASlice",
+            "_SingleLoRA",
+            "_FusedPairLoRA",
+        ):
+            self.assertIn(text, command)
+        for module in SOURCE_MODULES:
+            destination = f"/app/src/{module.removeprefix('source/src/')}"
+            self.assertIn(destination, command)
+        self.assertLess(
+            command.index("mounted source hash differs"),
+            command.index("exec python3 /opt/glm52-lora-fusion-smoke.py"),
+        )
 
     def test_benchmark_declares_glm_shapes_and_twenty_repeats(self):
         source = SCRIPT.read_text()
@@ -167,7 +239,14 @@ class LoraFusionSmokeTest(unittest.TestCase):
         preflight.assert_called_once_with(
             [training_ops.trainer_head], include_inference=False
         )
-        self.assertEqual(deploy.call_count, 2)
+        self.assertEqual(deploy.call_count, 1 + len(SOURCE_MODULES))
+        self.assertEqual(
+            [call.args[0] for call in deploy.call_args_list],
+            [
+                "scripts/ops/benchmark_fused_qkv_a_lora_sm89.py",
+                *SOURCE_MODULES,
+            ],
+        )
         ssh.assert_called_once()
         self.assertEqual(ssh.call_args.kwargs["timeout"], 240)
 

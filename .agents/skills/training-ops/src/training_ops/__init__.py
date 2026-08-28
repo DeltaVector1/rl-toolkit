@@ -10202,7 +10202,62 @@ def deploy(
     return not bad
 
 
-def _lora_fusion_smoke_spec() -> tuple[str, str, str, str, int, int]:
+def _lora_fusion_module_path(module_name: str) -> str | None:
+    if not module_name.startswith("prime_rl."):
+        return None
+    relative = f"source/src/{module_name.replace('.', '/')}.py"
+    path = repo_root / relative
+    return relative if path.is_file() and not path.is_symlink() else None
+
+
+def _lora_fusion_local_imports(relative: str) -> tuple[str, ...]:
+    path = repo_root / relative
+    try:
+        tree = ast.parse(path.read_text(), filename=str(path))
+    except (OSError, SyntaxError) as error:
+        raise Refused(f"cannot parse LoRA fusion source {relative}: {error}") from error
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        names: list[str] = []
+        if isinstance(node, ast.Import):
+            names.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            names.append(node.module)
+            names.extend(
+                f"{node.module}.{alias.name}"
+                for alias in node.names
+                if alias.name != "*"
+            )
+        for name in names:
+            local = _lora_fusion_module_path(name)
+            if local is not None:
+                imported.add(local)
+    return tuple(sorted(imported))
+
+
+def _lora_fusion_import_closure(entry: str) -> tuple[str, ...]:
+    if _lora_fusion_module_path(
+        entry.removeprefix("source/src/").removesuffix(".py").replace("/", ".")
+    ) != entry:
+        raise Refused("GLM LoRA fusion entry module is not a local Python source")
+    closure: list[str] = []
+    pending = [entry]
+    while pending:
+        relative = pending.pop(0)
+        if relative in closure:
+            continue
+        closure.append(relative)
+        pending.extend(
+            imported
+            for imported in _lora_fusion_local_imports(relative)
+            if imported not in closure and imported not in pending
+        )
+    return tuple(closure)
+
+
+def _lora_fusion_smoke_spec() -> tuple[
+    str, str, str, tuple[str, ...], int, int
+]:
     settings = qualification_commands.get("glm52_lora_fusion_smoke")
     if not isinstance(settings, dict):
         raise Refused("GLM LoRA fusion smoke is missing from operations config")
@@ -10214,11 +10269,26 @@ def _lora_fusion_smoke_spec() -> tuple[str, str, str, str, int, int]:
     if image_key != "trainer_image" or image_key not in containers:
         raise Refused("GLM LoRA fusion smoke must use the configured trainer image")
     script = settings.get("script")
-    module = settings.get("source_module")
+    modules = settings.get("source_modules")
     if script != "scripts/ops/benchmark_fused_qkv_a_lora_sm89.py":
         raise Refused("GLM LoRA fusion smoke script differs from its registered command")
-    if module != "source/src/prime_rl/trainer/models/layers/lora/multi_linear.py":
-        raise Refused("GLM LoRA fusion smoke source module differs from its registered command")
+    entry = "source/src/prime_rl/trainer/models/layers/lora/multi_linear.py"
+    if (
+        not isinstance(modules, list)
+        or not modules
+        or not all(isinstance(module, str) for module in modules)
+        or len(modules) != len(set(modules))
+        or modules[0] != entry
+    ):
+        raise Refused("GLM LoRA fusion source module inventory is invalid")
+    closure = _lora_fusion_import_closure(entry)
+    if set(modules) != set(closure):
+        missing = sorted(set(closure) - set(modules))
+        extra = sorted(set(modules) - set(closure))
+        raise Refused(
+            "GLM LoRA fusion import closure differs from operations config: "
+            f"missing={missing}, extra={extra}"
+        )
     remote_timeout = settings.get("remote_timeout_seconds")
     ssh_timeout = settings.get("ssh_timeout_seconds")
     if (
@@ -10235,23 +10305,115 @@ def _lora_fusion_smoke_spec() -> tuple[str, str, str, str, int, int]:
     image = containers[image_key]
     if not isinstance(image, str) or not image:
         raise Refused("GLM LoRA fusion smoke image is invalid")
-    return host, image, script, module, remote_timeout, ssh_timeout
+    return host, image, script, tuple(modules), remote_timeout, ssh_timeout
+
+
+def _lora_fusion_smoke_mounts(
+    repository: str,
+    script: str,
+    modules: tuple[str, ...],
+) -> tuple[tuple[str, str, str, str], ...]:
+    files = (script, *modules)
+    mounts = []
+    destinations: set[str] = set()
+    for relative in files:
+        local = repo_root / relative
+        if not local.is_file() or local.is_symlink():
+            raise Refused(f"GLM LoRA fusion mount source is invalid: {relative}")
+        if relative == script:
+            destination = "/opt/glm52-lora-fusion-smoke.py"
+        elif relative.startswith("source/src/prime_rl/") and relative.endswith(".py"):
+            destination = f"/app/src/{relative.removeprefix('source/src/')}"
+        else:
+            raise Refused(f"GLM LoRA fusion module path is invalid: {relative}")
+        if destination in destinations:
+            raise Refused(f"GLM LoRA fusion mount destination repeats: {destination}")
+        destinations.add(destination)
+        digest = hashlib.sha256(local.read_bytes()).hexdigest()
+        mounts.append(
+            (relative, f"{repository}/{relative}", destination, digest)
+        )
+    return tuple(mounts)
+
+
+def _lora_fusion_smoke_verifier(
+    mounts: tuple[tuple[str, str, str, str], ...],
+    modules: tuple[str, ...],
+) -> str:
+    destinations = {
+        relative: destination
+        for relative, _source, destination, _digest in mounts
+    }
+    manifest = {
+        "hashes": {
+            destination: digest
+            for _relative, _source, destination, digest in mounts
+        },
+        "imports": {
+            module.removeprefix("source/src/")
+            .removesuffix(".py")
+            .replace("/", "."): destinations[module]
+            for module in modules
+        },
+        "symbols": {
+            "prime_rl.trainer.models.layers.lora.multi_linear": [
+                "_SingleLoRA",
+                "_FusedPairLoRA",
+            ],
+            "prime_rl.trainer.models.layers.fp8_ada": [
+                "FP8CheckpointFusedQKVA",
+                "FP8CheckpointFusedQKVASlice",
+            ],
+        },
+    }
+    payload = json.dumps(manifest, sort_keys=True)
+    return f"""import hashlib
+import importlib
+import json
+from pathlib import Path
+
+manifest = json.loads({payload!r})
+for path, expected in manifest["hashes"].items():
+    actual = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    if actual != expected:
+        raise SystemExit(f"mounted source hash differs: {{path}}")
+for name, expected in manifest["imports"].items():
+    module = importlib.import_module(name)
+    actual = Path(module.__file__).resolve()
+    if actual != Path(expected).resolve():
+        raise SystemExit(f"module loaded from wrong path: {{name}}: {{actual}}")
+for name, symbols in manifest["symbols"].items():
+    module = importlib.import_module(name)
+    for symbol in symbols:
+        if not hasattr(module, symbol):
+            raise SystemExit(f"module is missing required symbol: {{name}}.{{symbol}}")
+"""
 
 
 def _lora_fusion_smoke_command(
     repository: str,
     image: str,
     script: str,
-    module: str,
+    modules: tuple[str, ...],
     container: str,
     gpu: int,
     remote_timeout: int,
 ) -> str:
     quoted_container = shlex.quote(container)
     quoted_gpu = shlex.quote(str(gpu))
-    quoted_script = shlex.quote(f"{repository}/{script}")
-    quoted_module = shlex.quote(f"{repository}/{module}")
     quoted_image = shlex.quote(image)
+    mounts = _lora_fusion_smoke_mounts(repository, script, modules)
+    mount_options = "".join(
+        f"  --mount {shlex.quote(f'type=bind,src={source},dst={destination},readonly')} \\\n"
+        for _relative, source, destination, _digest in mounts
+    )
+    verifier = _lora_fusion_smoke_verifier(mounts, modules)
+    container_command = shlex.quote(
+        "set -euo pipefail\n"
+        f"python3 -c {shlex.quote(verifier)}\n"
+        "exec python3 /opt/glm52-lora-fusion-smoke.py "
+        "--warmup 5 --iterations 20 --tokens 4096"
+    )
     return f"""set -euo pipefail
 container={quoted_container}
 gpu={quoted_gpu}
@@ -10285,10 +10447,7 @@ sudo timeout --foreground --signal=TERM --kill-after=20s {remote_timeout}s sudo 
   --env PRIME_LORA_MM_PROFILE=sm89-r32 --env PRIME_EP_PROFILE=0 \\
   --env PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD=0 \\
   --env PYTHONPATH=/app/src:/app/packages/prime-rl-configs/src \\
-  --mount type=bind,src={quoted_script},dst=/opt/glm52-lora-fusion-smoke.py,readonly \\
-  --mount type=bind,src={quoted_module},dst=/app/src/prime_rl/trainer/models/layers/lora/multi_linear.py,readonly \\
-  {quoted_image} python3 /opt/glm52-lora-fusion-smoke.py \\
-  --warmup 5 --iterations 20 --tokens 4096 || status=$?
+{mount_options}  {quoted_image} bash -euo pipefail -c {container_command} || status=$?
 cleanup
 clean=0
 for _ in $(seq 1 20); do
@@ -10370,12 +10529,14 @@ fi
 
 def qualify_glm52_lora_fusion() -> dict[str, object]:
     """Run the opt-in one-GPU GLM LoRA fusion smoke."""
-    host, image, script, module, remote_timeout, ssh_timeout = _lora_fusion_smoke_spec()
+    host, image, script, modules, remote_timeout, ssh_timeout = (
+        _lora_fusion_smoke_spec()
+    )
     repository = _repository_root("glm52-qualification")
     with _ssh_control_masters(trainer_hosts):
         _lora_fusion_smoke_preflight()
         _assert_live_services_are_down([host], include_inference=False)
-        for path in (script, module):
+        for path in (script, *modules):
             if not deploy(
                 path,
                 nodes=[host],
@@ -10390,7 +10551,7 @@ def qualify_glm52_lora_fusion() -> dict[str, object]:
                 repository,
                 image,
                 script,
-                module,
+                modules,
                 container,
                 0,
                 remote_timeout,
