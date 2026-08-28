@@ -1,12 +1,15 @@
-"""Bounded benchmark for the opt-in SM89 two-stage sparse MLA reducer."""
+"""Bounded end-to-end benchmark for the opt-in SM89 sparse MLA reducer."""
 
 from __future__ import annotations
 
 import argparse
+import os
 import statistics
 
 import torch
 
+from prime_rl.trainer.models.kernels.sparse_mla_bwd import preprocess, sparse_mla_bwd
+from prime_rl.trainer.models.kernels.sparse_mla_fwd import sparse_mla_fwd_interface
 from prime_rl.trainer.models.kernels.sparse_mla_two_stage import (
     MAX_WORKSPACE_BYTES,
     sparse_mla_dkv_two_stage,
@@ -14,8 +17,8 @@ from prime_rl.trainer.models.kernels.sparse_mla_two_stage import (
 )
 
 
-MAX_WARMUP = 2
-MAX_ITERATIONS = 5
+MAX_WARMUP = 1
+MAX_ITERATIONS = 3
 
 
 def arguments() -> argparse.Namespace:
@@ -34,9 +37,7 @@ def make_inputs(sequence_kv: int) -> tuple[torch.Tensor, ...]:
     do = torch.randn(1, 4096, 64, 512, device="cuda", dtype=torch.bfloat16, generator=generator)
     indices = torch.arange(2048, device="cuda", dtype=torch.int32)
     indices = indices.view(1, 1, 1, 2048).expand(1, 4096, 1, 2048).contiguous()
-    lse = torch.zeros(1, 4096, 64, device="cuda", dtype=torch.float32)
-    delta = torch.zeros_like(lse)
-    return q, kv, do, indices, lse, delta
+    return q, kv, do, indices
 
 
 def timed(callable) -> tuple[object, float]:
@@ -63,18 +64,48 @@ def main() -> None:
     memory = two_stage_memory(args.sequence_kv)
     if memory.total_bytes > MAX_WORKSPACE_BYTES:
         raise SystemExit(f"workspace bound failed: {memory.total_bytes} bytes")
-    inputs = make_inputs(args.sequence_kv)
-    for _ in range(args.warmup):
-        sparse_mla_dkv_two_stage(*inputs)
+    q, kv, do, indices = make_inputs(args.sequence_kv)
+    scale = 576**-0.5
+    os.environ["PRIME_SPARSE_BWD_TWO_STAGE"] = "0"
+    output, lse = sparse_mla_fwd_interface(q, kv, indices, sm_scale=scale)
+    (baseline_dq, baseline_dkv), baseline_ms = timed(
+        lambda: sparse_mla_bwd(q, kv, output, do, indices, lse, sm_scale=scale)
+    )
+    os.environ["PRIME_SPARSE_BWD_TWO_STAGE"] = "1"
+    candidate, candidate_ms = timed(
+        lambda: sparse_mla_bwd(q, kv, output, do, indices, lse, sm_scale=scale)
+    )
+    if not torch.equal(baseline_dq, candidate[0]):
+        raise SystemExit("dQ is not exact against the baseline")
+    torch.testing.assert_close(candidate[1], baseline_dkv, rtol=2e-2, atol=2e-3)
+    if not bool(torch.isfinite(candidate[0]).all() and torch.isfinite(candidate[1]).all()):
+        raise SystemExit("candidate returned a nonfinite gradient")
+    delta_kernel = preprocess(64, 512)
+    delta = delta_kernel(output, do)
     torch.cuda.synchronize()
+    allocated_before = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    direct_candidate, _ = timed(
+        lambda: sparse_mla_dkv_two_stage(
+            q, kv, do, indices, lse, delta, sm_scale=scale
+        )
+    )
+    peak_workspace = torch.cuda.max_memory_allocated() - allocated_before
+    if peak_workspace > MAX_WORKSPACE_BYTES:
+        raise SystemExit(
+            f"measured workspace bound failed: {peak_workspace} > {MAX_WORKSPACE_BYTES} bytes"
+        )
+    torch.testing.assert_close(direct_candidate[0], baseline_dkv, rtol=2e-2, atol=2e-3)
+    if not bool(torch.isfinite(direct_candidate[0]).all()):
+        raise SystemExit("direct candidate returned a nonfinite dKV")
     times: list[float] = []
-    first = None
+    for _ in range(args.warmup):
+        sparse_mla_bwd(q, kv, output, do, indices, lse, sm_scale=scale)
+    torch.cuda.synchronize()
     for _ in range(args.iterations):
-        result, elapsed = timed(lambda: sparse_mla_dkv_two_stage(*inputs))
-        if first is None:
-            first = result[0]
-        elif not torch.equal(first, result[0]):
-            raise SystemExit("repeat output is not exact")
+        _, elapsed = timed(
+            lambda: sparse_mla_bwd(q, kv, output, do, indices, lse, sm_scale=scale)
+        )
         times.append(elapsed)
     print(
         f"device={torch.cuda.get_device_name()} capability=sm_89 "
@@ -82,11 +113,12 @@ def main() -> None:
     )
     print(
         f"workspace_bytes={memory.total_bytes} workspace_mib={memory.total_bytes / 2**20:.2f} "
-        f"workspace_limit_bytes={MAX_WORKSPACE_BYTES} repeat_exact=1"
+        f"workspace_limit_bytes={MAX_WORKSPACE_BYTES} measured_workspace_bytes={peak_workspace} "
+        f"dq_exact=1 dkv_close=1 finite=1"
     )
     print(
-        f"median_ms={statistics.median(times):.3f} max_ms={max(times):.3f} "
-        f"iterations={args.iterations}"
+        f"baseline_ms={baseline_ms:.3f} candidate_first_ms={candidate_ms:.3f} "
+        f"candidate_median_ms={statistics.median(times):.3f} candidate_max_ms={max(times):.3f}"
     )
 
 

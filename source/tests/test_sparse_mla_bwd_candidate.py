@@ -138,12 +138,18 @@ class SparseMlaBackwardCandidateTest(unittest.TestCase):
             "requires SM89 block=16 heads=16 threads=64",
             SOURCE,
         )
-        self.assertIn("T.gemm(\n                    dP_shared_cast,\n                    Q_shared,", SOURCE)
+        self.assertTrue(
+            "T.gemm(\n                    dP_shared_cast,\n                    Q_shared," in SOURCE
+            or "T.gemm(\n                        dP_shared_cast,\n                        Q_shared," in SOURCE
+        )
         self.assertIn(
             "acc_dkv_shared = T.view(",
             SOURCE,
         )
-        self.assertIn("dQ_shared,\n                    [BS // split_store, D]", SOURCE)
+        self.assertTrue(
+            "dQ_shared,\n                    [BS // split_store, D]" in SOURCE
+            or "dQ_shared,\n                        [BS // split_store, D]" in SOURCE
+        )
         self.assertIn("acc_dkv_shared[bi_i, d_i]", SOURCE)
         # Splitting this GEMM was the rejected low-memory design because it
         # changes FP32 reduction order.  The candidate must not reintroduce it.
