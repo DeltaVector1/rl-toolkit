@@ -68,13 +68,76 @@ class LoraFusionSmokeTest(unittest.TestCase):
             (32, 6144, 2048, 576),
         )
         self.assertGreaterEqual(constants["DEFAULT_ITERATIONS"], 20)
+        self.assertIn("_SingleLoRA.apply", source)
         self.assertIn("_FusedPairLoRA", source)
+        self.assertIn("_error_metrics", source)
+        self.assertIn("max_abs_error", source)
+        self.assertIn("max_relative_error", source)
+        self.assertIn("reference_gradient_norms", source)
+        self.assertIn("_perturbation_checks", source)
+        self.assertIn("forward output", source)
+        self.assertIn("input gradient", source)
+        self.assertIn("parameter gradient", source)
+        multi_linear = (
+            ROOT / "source/src/prime_rl/trainer/models/layers/lora/multi_linear.py"
+        ).read_text()
+        self.assertIn("def _lora_mm", multi_linear)
+
+    def test_preflight_inventory_includes_configured_and_protected_trainers(self):
+        names = training_ops._lora_fusion_smoke_trainer_containers()
+        self.assertIn(training_ops.containers["trainer"], names)
+        self.assertIn(
+            training_ops.containers["glm52_qualification_trainer"], names
+        )
+        self.assertIn(training_ops.protected_trainer, names)
+
+    def test_preflight_checks_every_trainer_host(self):
+        seen = []
+
+        def fake_ssh(host, command, timeout=120, connect_timeout=None):
+            seen.append((host, command, timeout))
+            return 0, ""
+
+        with patch.object(training_ops, "_ssh", side_effect=fake_ssh):
+            training_ops._lora_fusion_smoke_preflight()
+        self.assertEqual(
+            {host for host, _command, _timeout in seen}, set(training_ops.trainer_hosts)
+        )
+        self.assertTrue(all(timeout == 60 for _host, _command, timeout in seen))
+        self.assertTrue(
+            all("docker ps -a" in command for _host, command, _timeout in seen)
+        )
+        self.assertTrue(
+            all("nvidia-smi" in command for _host, command, _timeout in seen)
+        )
+
+    def test_preflight_refuses_a_configured_container(self):
+        def fake_ssh(host, command, timeout=120, connect_timeout=None):
+            if host == training_ops.trainer_head:
+                return 20, "configured trainer container is present"
+            return 0, ""
+
+        with patch.object(training_ops, "_ssh", side_effect=fake_ssh):
+            with self.assertRaises(training_ops.Refused):
+                training_ops._lora_fusion_smoke_preflight()
+
+    def test_preflight_refuses_a_compute_process(self):
+        def fake_ssh(host, command, timeout=120, connect_timeout=None):
+            if host == training_ops.trainer_head:
+                return 21, "GPU 0 has compute processes"
+            return 0, ""
+
+        with patch.object(training_ops, "_ssh", side_effect=fake_ssh):
+            with self.assertRaises(training_ops.Refused):
+                training_ops._lora_fusion_smoke_preflight()
 
     def test_command_runs_only_after_live_service_preflight(self):
         result = {"status": "passed", "iterations": 20}
         with patch.object(
             training_ops, "_ssh_control_masters", return_value=nullcontext()
         ), patch.object(
+            training_ops, "_lora_fusion_smoke_preflight"
+        ) as smoke_preflight, patch.object(
             training_ops, "_assert_live_services_are_down"
         ) as preflight, patch.object(
             training_ops, "deploy", return_value=True
@@ -83,6 +146,7 @@ class LoraFusionSmokeTest(unittest.TestCase):
         ) as ssh:
             observed = training_ops.qualify_glm52_lora_fusion()
         self.assertEqual(observed, result)
+        smoke_preflight.assert_called_once_with()
         preflight.assert_called_once_with(
             [training_ops.trainer_head], include_inference=False
         )
