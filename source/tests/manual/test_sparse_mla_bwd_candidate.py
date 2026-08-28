@@ -2,7 +2,7 @@
 
 Run on an idle RTX 4090 with the trainer environment, for example:
 
-    PRIME_SPARSE_BWD_DIRECT_DKV=1 python3 -m \
+    PRIME_SPARSE_BWD_REUSE_DQ_SHARED=1 python3 -m \
         source.tests.manual.test_sparse_mla_bwd_candidate
 
 The test compares the candidate with the reference in one process.  dQ must
@@ -16,12 +16,12 @@ import os
 
 import torch
 
-from prime_rl.trainer.models.kernels.sparse_mla_bwd import sparse_mla_bwd
+from prime_rl.trainer.models.kernels.sparse_mla_bwd import bwd, sparse_mla_bwd
 from prime_rl.trainer.models.kernels.sparse_mla_fwd import sparse_mla_fwd_interface
 
 
-def _set_direct(enabled: bool) -> None:
-    os.environ["PRIME_SPARSE_BWD_DIRECT_DKV"] = "1" if enabled else "0"
+def _set_candidate(enabled: bool) -> None:
+    os.environ["PRIME_SPARSE_BWD_REUSE_DQ_SHARED"] = "1" if enabled else "0"
 
 
 def _assert_close(candidate, reference, label: str) -> None:
@@ -75,11 +75,11 @@ def _production_case():
 
 def test_duplicate_parity_and_repeated_calls() -> None:
     query, key_value, output, output_gradient, indices, lse = _production_case()
-    _set_direct(False)
+    _set_candidate(False)
     reference_q, reference_kv = sparse_mla_bwd(
         query, key_value, output, output_gradient, indices, lse
     )
-    _set_direct(True)
+    _set_candidate(True)
     candidate_q, candidate_kv = sparse_mla_bwd(
         query, key_value, output, output_gradient, indices, lse
     )
@@ -88,10 +88,10 @@ def test_duplicate_parity_and_repeated_calls() -> None:
     )
     torch.cuda.synchronize()
     if not torch.equal(candidate_q, repeat_q):
-        raise AssertionError("repeated direct dQ is not deterministic")
-    _assert_close(candidate_q, reference_q, "direct dQ parity")
-    _assert_close(candidate_kv, reference_kv, "direct dKV duplicate parity")
-    _assert_close(repeat_kv, candidate_kv, "direct dKV repeated-call parity")
+        raise AssertionError("repeated candidate dQ is not deterministic")
+    _assert_close(candidate_q, reference_q, "candidate dQ parity")
+    _assert_close(candidate_kv, reference_kv, "candidate dKV duplicate parity")
+    _assert_close(repeat_kv, candidate_kv, "candidate dKV repeated-call parity")
 
 
 def test_malformed_indices_and_nonfinite_lse_are_fail_closed() -> None:
@@ -113,7 +113,7 @@ def test_malformed_indices_and_nonfinite_lse_are_fail_closed() -> None:
     output = torch.zeros(batch, sequence, heads, 512, device=device, dtype=torch.bfloat16)
     output_gradient = torch.ones_like(output)
     lse = torch.full((batch, sequence, heads), float("inf"), device=device)
-    _set_direct(True)
+    _set_candidate(True)
     query_gradient, key_value_gradient = sparse_mla_bwd(
         query, key_value, output, output_gradient, indices, lse
     )
@@ -162,11 +162,11 @@ def test_tail_shapes_match_reference() -> None:
         )
         output_gradient = torch.randn_like(output)
         lse = torch.zeros(batch, sequence, heads, device=device, dtype=torch.float32)
-        _set_direct(False)
+        _set_candidate(False)
         reference_q, reference_kv = sparse_mla_bwd(
             query, key_value, output, output_gradient, indices, lse
         )
-        _set_direct(True)
+        _set_candidate(True)
         candidate_q, candidate_kv = sparse_mla_bwd(
             query, key_value, output, output_gradient, indices, lse
         )
@@ -174,12 +174,33 @@ def test_tail_shapes_match_reference() -> None:
         _assert_close(candidate_kv, reference_kv, f"tail={tail} dKV parity")
 
 
+def test_compile_paths() -> None:
+    for heads, topk in ((16, 32), (64, 128)):
+        for reuse in (False, True):
+            bwd(
+                heads,
+                512,
+                64,
+                topk,
+                1,
+                576**-0.5,
+                True,
+                block_size=16,
+                block_H=16,
+                threads=64,
+                vectorized_atomic=False,
+                reuse_dq_shared=reuse,
+            )
+
+
 def main() -> None:
     if not torch.cuda.is_available():
         print("SKIP: CUDA is not available")
         return
+    test_compile_paths()
     if torch.cuda.get_device_capability() != (8, 9):
-        raise RuntimeError("this candidate gate requires an SM89 CUDA device")
+        print("sparse MLA backward candidate compile paths: PASS")
+        return
     test_duplicate_parity_and_repeated_calls()
     test_malformed_indices_and_nonfinite_lse_are_fail_closed()
     test_tail_shapes_match_reference()

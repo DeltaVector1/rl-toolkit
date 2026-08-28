@@ -17,6 +17,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 SOURCE = (
     ROOT / "src/prime_rl/trainer/models/kernels/sparse_mla_bwd.py"
 ).read_text()
+BENCHMARK = (
+    ROOT.parent / "scripts/ops/benchmark_sparse_mla_bwd_sm89.py"
+).read_text()
 
 
 def valid_index(index: int, kv_length: int) -> bool:
@@ -76,6 +79,17 @@ def full_dq(d_p: list[list[float]], kv: list[list[float]]) -> list[list[float]]:
 
 
 class SparseMlaBackwardCandidateTest(unittest.TestCase):
+    def test_benchmark_is_bounded_and_has_a_contention_case(self):
+        self.assertIn("MAX_WARMUP = 5", BENCHMARK)
+        self.assertIn("MAX_ITERATIONS = 20", BENCHMARK)
+        self.assertIn("0 <= args.warmup <= MAX_WARMUP", BENCHMARK)
+        self.assertIn("1 <= args.iterations <= MAX_ITERATIONS", BENCHMARK)
+        self.assertIn('"head_contention"', BENCHMARK)
+        self.assertIn("sequence=32", BENCHMARK)
+        self.assertIn("heads=64", BENCHMARK)
+        self.assertIn("topk=128", BENCHMARK)
+        self.assertIn("route_keys=8", BENCHMARK)
+
     def test_malformed_indices_fail_closed_to_zero_sentinel(self):
         kv_length = 9
         malformed = [-7, kv_length - 1, kv_length, 2**31 - 1]
@@ -87,8 +101,9 @@ class SparseMlaBackwardCandidateTest(unittest.TestCase):
             accumulate_dkv(malformed, [1.0] * len(malformed), kv_length),
             [0.0] * kv_length,
         )
-        self.assertIn("T.all(index >= 0, index <= max_kv_i)", SOURCE)
-        self.assertIn("safe_index = T.if_then_else(mask[bi_i], index, S_kv - 1)", SOURCE)
+        self.assertNotIn("T.all(", SOURCE)
+        self.assertIn("safe_indices = T.alloc_shared([BS], indices_dtype)", SOURCE)
+        self.assertIn("safe_index = safe_indices[bi_i]", SOURCE)
         self.assertIn("safe_index, bz // NH", SOURCE)
         self.assertNotIn("KV[by, Indices[", SOURCE)
         self.assertNotIn("dKV[\n                                    by,\n                                    Indices[", SOURCE)
@@ -112,12 +127,12 @@ class SparseMlaBackwardCandidateTest(unittest.TestCase):
             self.assertGreater(tail, 0)
             self.assertEqual(tail & (tail - 1), 0)
 
-    def test_direct_candidate_keeps_full_gemm_and_is_disabled_by_default(self):
-        self.assertIn('os.environ.get("PRIME_SPARSE_BWD_DIRECT_DKV", "0")', SOURCE)
-        self.assertIn('direct_value not in {"0", "1"}', SOURCE)
-        self.assertIn("direct_dkv_store=False", SOURCE)
-        self.assertIn("if not direct_dkv_store:", SOURCE)
-        self.assertIn("direct_dkv_store and capability != (8, 9)", SOURCE)
+    def test_shared_reuse_keeps_full_gemm_and_is_disabled_by_default(self):
+        self.assertIn('os.environ.get("PRIME_SPARSE_BWD_REUSE_DQ_SHARED", "0")', SOURCE)
+        self.assertIn('reuse_value not in {"0", "1"}', SOURCE)
+        self.assertIn("reuse_dq_shared=False", SOURCE)
+        self.assertIn("if reuse_dq_shared:", SOURCE)
+        self.assertIn("reuse_dq_shared and capability != (8, 9)", SOURCE)
         self.assertIn("requires an SM89 CUDA device", SOURCE)
         self.assertIn(
             "requires SM89 block=16 heads=16 threads=64",
@@ -125,9 +140,11 @@ class SparseMlaBackwardCandidateTest(unittest.TestCase):
         )
         self.assertIn("T.gemm(\n                    dP_shared_cast,\n                    Q_shared,", SOURCE)
         self.assertIn(
-            "The direct candidate reads acc_dkv/acc_dkv_tail instead.",
+            "acc_dkv_shared = T.view(",
             SOURCE,
         )
+        self.assertIn("dQ_shared,\n                    [BS // split_store, D]", SOURCE)
+        self.assertIn("acc_dkv_shared[bi_i, d_i]", SOURCE)
         # Splitting this GEMM was the rejected low-memory design because it
         # changes FP32 reduction order.  The candidate must not reintroduce it.
         self.assertNotIn("low_memory_dkv", SOURCE)
@@ -144,9 +161,9 @@ class SparseMlaBackwardCandidateTest(unittest.TestCase):
         self.assertEqual(first_dkv, second_dkv)
         self.assertEqual(first_dq, second_dq)
         self.assertIn("T.atomic_add", SOURCE)
-        self.assertIn("source_valid", SOURCE)
+        self.assertIn("source_valid = safe_indices[source_row] != S_kv - 1", SOURCE)
 
-    def test_dq_and_dkv_direct_store_have_reference_parity(self):
+    def test_dq_and_dkv_shared_reuse_have_reference_parity(self):
         d_p = [[0.25, -0.5], [0.125, 0.75], [-0.25, 0.5]]
         p = [[0.5, 0.25], [-0.125, 0.75], [0.25, -0.5]]
         q = [[1.0, -2.0], [0.5, 0.25], [-1.0, 0.75]]

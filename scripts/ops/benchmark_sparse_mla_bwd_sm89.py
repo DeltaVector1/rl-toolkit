@@ -15,11 +15,39 @@ from __future__ import annotations
 import argparse
 import os
 import statistics
+from dataclasses import dataclass
 
 import torch
 
 from prime_rl.trainer.models.kernels.sparse_mla_bwd import sparse_mla_bwd
 from prime_rl.trainer.models.kernels.sparse_mla_fwd import sparse_mla_fwd_interface
+
+
+MAX_WARMUP = 5
+MAX_ITERATIONS = 20
+
+
+@dataclass(frozen=True)
+class Case:
+    name: str
+    sequence: int
+    heads: int
+    sequence_kv: int
+    topk: int
+    route_keys: int
+
+
+CASES = (
+    Case("smoke", sequence=4, heads=16, sequence_kv=9, topk=32, route_keys=9),
+    Case(
+        "head_contention",
+        sequence=32,
+        heads=64,
+        sequence_kv=33,
+        topk=128,
+        route_keys=8,
+    ),
+)
 
 
 def _args() -> argparse.Namespace:
@@ -51,38 +79,52 @@ def _summary(times: list[float]) -> tuple[float, float]:
     return statistics.median(ordered), ordered[-1]
 
 
-def _case(device: torch.device) -> tuple[torch.Tensor, ...]:
+def _case(device: torch.device, case: Case) -> tuple[torch.Tensor, ...]:
     generator = torch.Generator(device=device).manual_seed(20260828)
-    batch, sequence, heads, sequence_kv, groups, topk = 1, 4, 16, 9, 1, 32
+    batch, groups = 1, 1
     query = torch.randn(
-        batch, sequence, heads, 576, device=device, dtype=torch.bfloat16, generator=generator
+        batch,
+        case.sequence,
+        case.heads,
+        576,
+        device=device,
+        dtype=torch.bfloat16,
+        generator=generator,
     ).mul_(0.02)
     key_value = torch.randn(
-        batch, sequence_kv, groups, 576, device=device, dtype=torch.bfloat16, generator=generator
+        batch,
+        case.sequence_kv,
+        groups,
+        576,
+        device=device,
+        dtype=torch.bfloat16,
+        generator=generator,
     ).mul_(0.02)
     key_value[:, -1].zero_()
-    route = torch.arange(topk, device=device, dtype=torch.int32).remainder(sequence_kv)
-    indices = route.view(1, 1, 1, topk).expand(batch, sequence, groups, topk).contiguous()
+    route = torch.arange(case.topk, device=device, dtype=torch.int32).remainder(
+        case.route_keys
+    )
+    indices = (
+        route.view(1, 1, 1, case.topk)
+        .expand(batch, case.sequence, groups, case.topk)
+        .contiguous()
+    )
     output_gradient = torch.randn(
-        batch, sequence, heads, 512, device=device, dtype=torch.bfloat16, generator=generator
+        batch,
+        case.sequence,
+        case.heads,
+        512,
+        device=device,
+        dtype=torch.bfloat16,
+        generator=generator,
     ).mul_(1e-3)
     return query, key_value, indices, output_gradient
 
 
-def main() -> None:
-    args = _args()
-    if not torch.cuda.is_available():
-        raise SystemExit("CUDA is required")
-    capability = torch.cuda.get_device_capability()
-    if capability != (8, 9):
-        raise SystemExit(f"SM89 is required, found sm_{capability[0]}{capability[1]}")
-    if args.warmup < 0 or args.iterations < 1:
-        raise SystemExit("warmup must be non-negative and iterations must be positive")
-
-    device = torch.device("cuda")
-    query, key_value, indices, output_gradient = _case(device)
+def _run_case(device: torch.device, case: Case, warmup: int, iterations: int) -> None:
+    query, key_value, indices, output_gradient = _case(device, case)
     scale = 576**-0.5
-    os.environ["PRIME_SPARSE_BWD_DIRECT_DKV"] = "0"
+    os.environ["PRIME_SPARSE_BWD_REUSE_DQ_SHARED"] = "0"
     reference_output, reference_lse = sparse_mla_fwd_interface(
         query, key_value, indices, sm_scale=scale
     )
@@ -98,17 +140,17 @@ def main() -> None:
         lambda: sparse_mla_bwd(
             query, key_value, reference_output, output_gradient, indices, reference_lse, sm_scale=scale
         ),
-        args.warmup,
-        args.iterations,
+        warmup,
+        iterations,
     )
 
-    os.environ["PRIME_SPARSE_BWD_DIRECT_DKV"] = "1"
+    os.environ["PRIME_SPARSE_BWD_REUSE_DQ_SHARED"] = "1"
     candidate, candidate_times = _timed(
         lambda: sparse_mla_bwd(
             query, key_value, reference_output, output_gradient, indices, reference_lse, sm_scale=scale
         ),
-        args.warmup,
-        args.iterations,
+        warmup,
+        iterations,
     )
     torch.cuda.synchronize()
     if not torch.equal(reference[0], candidate[0]):
@@ -120,14 +162,32 @@ def main() -> None:
     reference_median, reference_max = _summary(reference_times)
     candidate_median, candidate_max = _summary(candidate_times)
     print(
-        f"device={torch.cuda.get_device_name()} capability=sm_{capability[0]}{capability[1]} "
-        "shape=B1,S4,S_kv9,H16,G1,topk32,tail64"
+        f"case={case.name} shape=B1,S{case.sequence},S_kv{case.sequence_kv},"
+        f"H{case.heads},G1,topk{case.topk},route_keys{case.route_keys},tail64"
     )
     print("forward_exact=1 dQ_exact=1 dKV_close=1 finite_gradients=1")
     print(
         f"reference_ms_median={reference_median:.3f} reference_ms_max={reference_max:.3f} "
         f"candidate_ms_median={candidate_median:.3f} candidate_ms_max={candidate_max:.3f}"
     )
+
+
+def main() -> None:
+    args = _args()
+    if not torch.cuda.is_available():
+        raise SystemExit("CUDA is required")
+    capability = torch.cuda.get_device_capability()
+    if capability != (8, 9):
+        raise SystemExit(f"SM89 is required, found sm_{capability[0]}{capability[1]}")
+    if not 0 <= args.warmup <= MAX_WARMUP:
+        raise SystemExit(f"warmup must be between 0 and {MAX_WARMUP}")
+    if not 1 <= args.iterations <= MAX_ITERATIONS:
+        raise SystemExit(f"iterations must be between 1 and {MAX_ITERATIONS}")
+
+    print(f"device={torch.cuda.get_device_name()} capability=sm_89")
+    device = torch.device("cuda")
+    for case in CASES:
+        _run_case(device, case, args.warmup, args.iterations)
 
 
 if __name__ == "__main__":
