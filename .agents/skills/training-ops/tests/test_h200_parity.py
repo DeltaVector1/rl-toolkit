@@ -706,6 +706,10 @@ sleep() {{
             args=[], returncode=0, stdout="ready\n", stderr=""
         )
         with patch.object(
+            training_ops,
+            "_ssh_control_options",
+            return_value=["-o", "ControlMaster=no", "-o", "ControlPath=none"],
+        ), patch.object(
             training_ops.subprocess, "run", return_value=completed
         ) as run:
             result = training_ops._ssh(
@@ -715,6 +719,9 @@ sleep() {{
         expected = list(training_ops.ssh_command)
         option = expected.index("ConnectTimeout=25")
         expected[option] = "ConnectTimeout=45"
+        expected.extend(
+            ["-o", "ControlMaster=no", "-o", "ControlPath=none"]
+        )
         self.assertEqual(result, (0, "ready\n"))
         self.assertEqual(run.call_args.args[0], expected + ["n76", "true"])
         self.assertEqual(run.call_args.kwargs["timeout"], 60)
@@ -729,6 +736,10 @@ sleep() {{
             args=[], returncode=0, stdout="", stderr=""
         )
         with patch.object(
+            training_ops,
+            "_ssh_control_options",
+            return_value=["-o", "ControlMaster=no", "-o", "ControlPath=none"],
+        ), patch.object(
             training_ops.subprocess, "run", return_value=completed
         ) as run:
             training_ops._ssh("n76", "true", connect_timeout=45)
@@ -736,16 +747,17 @@ sleep() {{
         arguments = run.call_args.args[0]
         self.assertNotIn("-M", arguments)
         self.assertNotIn("-O", arguments)
-        self.assertFalse(
-            any(
-                value.startswith(("ControlMaster=", "ControlPath=", "ControlPersist="))
-                for value in arguments
-            )
-        )
+        self.assertIn("ControlMaster=no", arguments)
+        self.assertIn("ControlPath=none", arguments)
+        self.assertNotIn("ControlPersist=", arguments)
         run.assert_called_once()
 
     def test_provenance_ssh_timeout_is_bounded_and_not_retried(self):
         with patch.object(
+            training_ops,
+            "_ssh_control_options",
+            return_value=["-o", "ControlMaster=no", "-o", "ControlPath=none"],
+        ), patch.object(
             training_ops.subprocess,
             "run",
             side_effect=subprocess.TimeoutExpired(cmd="ssh", timeout=60),
@@ -762,6 +774,10 @@ sleep() {{
     def test_ssh_timeout_retains_only_bounded_partial_output(self):
         partial = "x" * 70000 + "parity-engine-identity:" + "d" * 64
         with patch.object(
+            training_ops,
+            "_ssh_control_options",
+            return_value=["-o", "ControlMaster=no", "-o", "ControlPath=none"],
+        ), patch.object(
             training_ops.subprocess,
             "run",
             side_effect=subprocess.TimeoutExpired(
@@ -835,7 +851,11 @@ sleep() {{
         completed = subprocess.CompletedProcess(
             args=[], returncode=1, stdout="", stderr=f"remote repeated {secret}"
         )
-        with patch.object(training_ops.subprocess, "run", return_value=completed) as run:
+        with patch.object(
+            training_ops,
+            "_ssh_control_options",
+            return_value=["-o", "ControlMaster=no", "-o", "ControlPath=none"],
+        ), patch.object(training_ops.subprocess, "run", return_value=completed) as run:
             with self.assertRaises(RuntimeError) as caught:
                 training_ops._sensitive_ssh_input(
                     "h200a", "run isolated command", secret, "diagnostic", 30
@@ -850,7 +870,11 @@ sleep() {{
         completed = subprocess.CompletedProcess(
             args=[], returncode=0, stdout=secret + "\n", stderr=""
         )
-        with patch.object(training_ops.subprocess, "run", return_value=completed) as run:
+        with patch.object(
+            training_ops,
+            "_ssh_control_options",
+            return_value=["-o", "ControlMaster=no", "-o", "ControlPath=none"],
+        ), patch.object(training_ops.subprocess, "run", return_value=completed) as run:
             token = training_ops._receive_parity_bootstrap("h200a", "read fifo", 30)
         self.assertEqual(token, secret)
         self.assertNotIn(secret, " ".join(run.call_args.args[0]))
@@ -858,7 +882,11 @@ sleep() {{
         self.assertEqual(run.call_args.kwargs["timeout"], 30)
 
         failed = subprocess.CompletedProcess(args=[], returncode=1, stdout=secret + "\n", stderr=secret)
-        with patch.object(training_ops.subprocess, "run", return_value=failed), self.assertRaises(
+        with patch.object(
+            training_ops,
+            "_ssh_control_options",
+            return_value=["-o", "ControlMaster=no", "-o", "ControlPath=none"],
+        ), patch.object(training_ops.subprocess, "run", return_value=failed), self.assertRaises(
             RuntimeError
         ) as caught:
             training_ops._receive_parity_bootstrap("h200a", "read fifo", 30)

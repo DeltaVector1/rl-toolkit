@@ -52,6 +52,73 @@ class DeployTest(unittest.TestCase):
             finally:
                 listener.close()
 
+    def test_unmanaged_ssh_disables_configured_multiplexing(self):
+        host = training_ops.trainer_head
+        with patch.dict(training_ops._ssh_control_paths, {}, clear=True):
+            self.assertEqual(
+                training_ops._ssh_control_options(host),
+                ["-o", "ControlMaster=no", "-o", "ControlPath=none"],
+            )
+
+    def test_managed_ssh_uses_only_recorded_control_path(self):
+        host = training_ops.trainer_head
+        with patch.dict(
+            training_ops._ssh_control_paths,
+            {host: "/tmp/managed-training-ops"},
+            clear=True,
+        ):
+            self.assertEqual(
+                training_ops._ssh_control_options(host),
+                [
+                    "-o",
+                    "ControlMaster=no",
+                    "-o",
+                    "ControlPath=/tmp/managed-training-ops",
+                ],
+            )
+
+    def test_ssh_command_does_not_use_configured_socket_without_manager(self):
+        with patch.dict(training_ops._ssh_control_paths, {}, clear=True), patch.object(
+            training_ops,
+            "_ssh_control_options",
+            return_value=["-o", "ControlMaster=no", "-o", "ControlPath=none"],
+        ), patch.object(
+            training_ops.subprocess,
+            "run",
+            return_value=Mock(returncode=0, stdout="ready\n", stderr=""),
+        ) as run:
+            self.assertEqual(training_ops._ssh("n82", "true"), (0, "ready\n"))
+
+        command = run.call_args.args[0]
+        self.assertIn("ControlMaster=no", command)
+        self.assertIn("ControlPath=none", command)
+
+    def test_ssh_command_uses_managed_socket(self):
+        with patch.dict(
+            training_ops._ssh_control_paths,
+            {"n82": "/tmp/managed-training-ops"},
+            clear=True,
+        ), patch.object(
+            training_ops.subprocess,
+            "run",
+            return_value=Mock(returncode=0, stdout="ready\n", stderr=""),
+        ) as run:
+            self.assertEqual(training_ops._ssh("n82", "true"), (0, "ready\n"))
+
+        command = run.call_args.args[0]
+        self.assertIn("ControlMaster=no", command)
+        self.assertIn("ControlPath=/tmp/managed-training-ops", command)
+
+    def test_ssh_refuses_stale_configured_socket_without_connecting(self):
+        with patch.dict(training_ops._ssh_control_paths, {}, clear=True), patch.object(
+            training_ops,
+            "_configured_ssh_control_path",
+            side_effect=training_ops.Refused("configured SSH control master is stale"),
+        ), patch.object(training_ops.subprocess, "run") as run:
+            with self.assertRaisesRegex(training_ops.Refused, "stale"):
+                training_ops._ssh("n82", "true")
+        run.assert_not_called()
+
     def test_control_master_refuses_final_symlink(self):
         host = training_ops.trainer_head
         with tempfile.TemporaryDirectory() as directory:
@@ -381,6 +448,10 @@ class DeployTest(unittest.TestCase):
 
     def test_ssh_reports_silent_failure_with_exit_status(self):
         with patch.object(
+            training_ops,
+            "_ssh_control_options",
+            return_value=["-o", "ControlMaster=no", "-o", "ControlPath=none"],
+        ), patch.object(
             training_ops.subprocess,
             "run",
             return_value=Mock(returncode=255, stdout="", stderr=""),
