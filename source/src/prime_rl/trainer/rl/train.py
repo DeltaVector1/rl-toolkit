@@ -385,7 +385,7 @@ def _qualification_environment() -> dict[str, str] | None:
     if not re.fullmatch(r"[0-9a-f]{32}", values["PRIME_QUALIFICATION_SESSION_ID"]):
         raise RuntimeError("qualification session ID is invalid")
     if not re.fullmatch(
-        r"glm52-native-(?:b2048|stability20)",
+        r"glm52-native-(?:b2048|b2048-nccl16|stability20)",
         values["PRIME_QUALIFICATION_PROFILE"],
     ):
         raise RuntimeError("qualification profile is invalid")
@@ -752,6 +752,7 @@ def train(config: TrainerConfig):
         fake = config.data.fake
         expected_steps = {
             "glm52-native-b2048": (2, False),
+            "glm52-native-b2048-nccl16": (2, False),
             "glm52-native-stability20": (20, True),
         }[qualification_identity["PRIME_QUALIFICATION_PROFILE"]]
         expected_targets = {
