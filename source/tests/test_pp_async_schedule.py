@@ -5,7 +5,10 @@ from __future__ import annotations
 import importlib.util
 import pathlib
 import sys
+import types
 import unittest
+from contextlib import contextmanager
+from unittest import mock
 
 
 SOURCE = pathlib.Path(__file__).resolve().parents[1]
@@ -28,6 +31,98 @@ class FakeOp:
         self.kind = kind
         self.microbatch = microbatch
         self.tensor = tensor
+
+
+class FakeCuda:
+    def __init__(self, log):
+        self.log = log
+        self.compute_stream = object()
+        self.streams = []
+        self.events = []
+
+    def Stream(self, *, device):
+        stream = FakeCudaStream(self.log, device, len(self.streams))
+        self.streams.append(stream)
+        return stream
+
+    def Event(self):
+        event = FakeCudaEvent(self.log, len(self.events))
+        self.events.append(event)
+        return event
+
+    def current_stream(self):
+        return self.compute_stream
+
+    @contextmanager
+    def stream(self, stream):
+        self.log.append(("stream_enter", stream.index))
+        yield
+        self.log.append(("stream_exit", stream.index))
+
+
+class FakeCudaStream:
+    def __init__(self, log, device, index):
+        self.log = log
+        self.device = device
+        self.index = index
+        self.log.append(("stream_create", index, device))
+
+    def wait_event(self, event):
+        self.log.append(("stream_wait_event", self.index, event.index))
+
+    def synchronize(self):
+        self.log.append(("stream_sync", self.index))
+
+
+class FakeCudaEvent:
+    def __init__(self, log, index):
+        self.log = log
+        self.index = index
+        self.log.append(("event_create", index))
+
+    def record(self, stream):
+        self.log.append(("event_record", self.index, stream))
+
+
+class FakeCudaWork:
+    def __init__(self, log, index):
+        self.log = log
+        self.index = index
+
+    def wait(self):
+        self.log.append(("work_wait", self.index))
+
+
+class FakeCudaDist(types.ModuleType):
+    def __init__(self, log):
+        super().__init__("torch.distributed")
+        self.log = log
+        self.calls = 0
+
+    def batch_isend_irecv(self, ops):
+        self.log.append(("batch_isend_irecv", self.calls, tuple(ops)))
+        work = FakeCudaWork(self.log, self.calls)
+        self.calls += 1
+        return [work]
+
+
+def make_cuda_transport(module, log):
+    cuda = FakeCuda(log)
+    dist = FakeCudaDist(log)
+    torch = types.ModuleType("torch")
+    torch.__path__ = []
+    torch.cuda = cuda
+    torch.distributed = dist
+    stage = types.SimpleNamespace(
+        device="cuda:0",
+        receive_sparse_indices=False,
+        _forward_slot_count=2,
+        _backward_slot_count=2,
+    )
+    modules = {"torch": torch, "torch.distributed": dist}
+    with mock.patch.dict(sys.modules, modules):
+        transport = module.CudaAsyncP2P(stage)
+    return transport, cuda
 
 
 class FakeTransport:
@@ -407,10 +502,48 @@ class AsyncP2PStateTest(unittest.TestCase):
         self.assertIn("with self._torch.cuda.stream(self._stream)", source)
         self.assertIn("self._stream.wait_event(ready)", source)
         self.assertIn("work.wait()", source)
-        receive_body = source.split("    def _post_receive", 1)[1].split(
-            "    def _post_send", 1
-        )[0]
-        self.assertNotIn("event.record", receive_body)
+
+    def test_cuda_transport_keeps_event_alive_and_drains_stream(self):
+        log = []
+        transport, cuda = make_cuda_transport(self.module, log)
+        init_record = next(i for i, item in enumerate(log) if item[0] == "event_record")
+        init_wait = next(
+            i for i, item in enumerate(log) if item[0] == "stream_wait_event"
+        )
+        self.assertLess(init_record, init_wait)
+
+        transport.prepost_receive("fwd", 0, ["receive"])
+        transport.post_send("fwd", 0, ["send"])
+        first_batch = next(
+            i for i, item in enumerate(log) if item[0] == "batch_isend_irecv"
+        )
+        self.assertLess(init_wait, first_batch)
+        send_token = transport._state._sends[0][2]
+        self.assertIs(send_token.event, cuda.events[1])
+        transport.wait_receive("fwd", 0)
+        transport.release_receive("fwd", 0)
+        transport.drain()
+
+        waits = [i for i, item in enumerate(log) if item[0] == "work_wait"]
+        stream_sync = next(i for i, item in enumerate(log) if item[0] == "stream_sync")
+        self.assertTrue(waits)
+        self.assertTrue(all(index < stream_sync for index in waits))
+        transport.cleanup()
+        self.assertEqual(
+            [item for item in log if item[0] == "stream_sync"], [("stream_sync", 0)]
+        )
+
+    def test_cuda_transport_finishes_old_stream_before_next_step(self):
+        log = []
+        first, _cuda = make_cuda_transport(self.module, log)
+        first.post_send("fwd", 0, ["step_one"])
+        first.drain()
+        first_sync = log.index(("stream_sync", 0))
+
+        second, _cuda = make_cuda_transport(self.module, log)
+        second_create = len(log) - 1 - log[::-1].index(("stream_create", 0, "cuda:0"))
+        self.assertLess(first_sync, second_create)
+        second.cleanup()
 
 
 if __name__ == "__main__":

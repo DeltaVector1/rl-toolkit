@@ -337,6 +337,11 @@ class CudaAsyncP2P:
         self._torch = torch
         self._dist = dist
         self._stream = torch.cuda.Stream(device=stage.device)
+        self._initialization_ready = torch.cuda.Event()
+        self._initialization_ready.record(torch.cuda.current_stream())
+        with torch.cuda.stream(self._stream):
+            self._stream.wait_event(self._initialization_ready)
+        self._stream_synchronized = False
         if max_window is None:
             max_window = {
                 direction: receive_window_for_stage(stage, direction)
@@ -362,6 +367,7 @@ class CudaAsyncP2P:
         return self._state.max_window[direction]
 
     def _post_receive(self, ops: list[Any]) -> _CudaPending:
+        self._stream_synchronized = False
         with self._torch.cuda.stream(self._stream):
             works = self._dist.batch_isend_irecv(ops)
         # An event recorded at post time is not a receive-completion event.
@@ -374,10 +380,11 @@ class CudaAsyncP2P:
         # reads the tensor.
         ready = self._torch.cuda.Event()
         ready.record(self._torch.cuda.current_stream())
+        self._stream_synchronized = False
         with self._torch.cuda.stream(self._stream):
             self._stream.wait_event(ready)
             works = self._dist.batch_isend_irecv(ops)
-        return _CudaPending(list(works))
+        return _CudaPending(list(works), ready)
 
     def _wait_receive(self, pending: _CudaPending) -> None:
         # Work.wait surfaces transport errors and establishes the read boundary.
@@ -413,9 +420,20 @@ class CudaAsyncP2P:
 
     def drain(self) -> None:
         self._state.drain()
+        self._synchronize_stream()
 
     def cleanup(self) -> None:
         self._state.cleanup()
+        try:
+            self._synchronize_stream()
+        except BaseException:
+            pass
+
+    def _synchronize_stream(self) -> None:
+        if self._stream_synchronized:
+            return
+        self._stream.synchronize()
+        self._stream_synchronized = True
 
 
 def _run_1f1b_async_step(
