@@ -36,6 +36,7 @@ def test_current_glm52_profile_is_batch_2048_without_rollout_cache() -> None:
         "glm52-native-b2048",
         "glm52-native-stability20",
         "glm52-production20",
+        "glm52-production3",
     }
     current = operations["profiles"]["current"]
     assert current == {
@@ -199,6 +200,54 @@ def test_glm52_production_and_parity_model_identities_match() -> None:
         assert production[name] == parity[name]
 
 
+def test_glm52_production3_is_a_fresh_production20_copy() -> None:
+    operations = _load("configs/operations.toml")
+    profile = operations["profiles"]["glm52-production3"]
+    trainer = _load(profile["trainer"])
+    orchestrator = _load(profile["orchestrator"])
+    environment = _load(profile["environment"])
+
+    assert trainer["output_dir"] == "/data/glm52-rl/runs/glm52-3"
+    assert orchestrator["output_dir"] == "/data/glm52-rl/runs/glm52-3/run_glm52-3"
+    assert environment["output_dir"] == "/data/glm52-rl/runs/glm52-3/run_glm52-3/env"
+    assert trainer["max_steps"] == 50
+    assert orchestrator["max_steps"] == 50
+    assert orchestrator["batch_size"] == 2048
+    assert orchestrator["group_size"] == 16
+    assert orchestrator["max_inflight_episodes"] == 128
+    assert trainer["enable_router_replay"] is True
+    assert trainer["model"]["freeze_moe_router"] is True
+    assert trainer["model"]["seq_len"] == 32768
+    assert trainer["model"]["lora"]["rank"] == 32
+    assert set(trainer["model"]["lora"]["target_modules"]) == {
+        "q_a_proj",
+        "q_b_proj",
+        "kv_a_proj_with_mqa",
+        "kv_b_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+        "shared_expert",
+        "experts",
+    }
+    assert profile["identity"]["rollout_cache"] is False
+    assert profile["identity"]["mtp_method"] == "disabled"
+    assert profile["identity"]["mtp_tokens"] == 0
+
+    skill_source = ROOT / ".agents/skills/training-ops/src"
+    sys.path.insert(0, str(skill_source))
+    try:
+        import training_ops
+
+        failures = training_ops._production20_identity_failures(
+            "glm52-production3", profile, trainer, orchestrator, environment
+        )
+    finally:
+        sys.path.remove(str(skill_source))
+    assert failures == []
+
+
 def test_glm52_launchers_cannot_use_live_muse_container_names() -> None:
     cluster = (ROOT / "scripts/china/cluster.sh").read_text()
     watchdog = (ROOT / "scripts/h200/trainer_failure_watchdog.sh").read_text()
@@ -292,6 +341,7 @@ def test_glm52_stability_and_production_use_local_expert_recompute() -> None:
         "configs/qualification/glm52-native-b2048.toml",
         "configs/paused/trainer.glm52-production.toml",
         "configs/paused/trainer.glm52-production20.toml",
+        "configs/paused/trainer.glm52-production3.toml",
     ):
         config = _load(relative)
         assert config.get("env_vars", {}) == {
@@ -346,6 +396,7 @@ def test_glm52_production_profiles_disable_cuda_profiling() -> None:
         "configs/qualification/glm52-native-stability20.toml",
         "configs/paused/trainer.glm52-production.toml",
         "configs/paused/trainer.glm52-production20.toml",
+        "configs/paused/trainer.glm52-production3.toml",
     ):
         env_vars = _load(relative).get("env_vars", {})
         assert not set(profiling_names) & set(env_vars), relative
@@ -359,6 +410,7 @@ def test_all_glm52_trainers_use_h200_w8a8_semantics() -> None:
         "configs/qualification/glm52-native-stability20.toml",
         "configs/paused/trainer.glm52-production.toml",
         "configs/paused/trainer.glm52-production20.toml",
+        "configs/paused/trainer.glm52-production3.toml",
     }
     operations = _load("configs/operations.toml")
     profiles = {

@@ -354,7 +354,7 @@ def _production20_identity_failures(
     orchestrator_values: dict,
     environment_values: dict,
 ) -> list[str]:
-    if profile_name != "glm52-production20":
+    if not profile_name.startswith("glm52-production"):
         return []
     failures: list[str] = []
     identity = profile.get("identity")
@@ -373,6 +373,10 @@ def _production20_identity_failures(
 
     if identity.get("rollout_cache") is not False:
         failures.append("rollout cache must be explicitly false")
+    if identity.get("mtp_method") != "disabled":
+        failures.append("MTP must be explicitly disabled for the pinned GLM image")
+    if identity.get("mtp_tokens") != 0:
+        failures.append("MTP token count must be zero for the pinned GLM image")
     for name, values in (
         ("trainer", trainer_values),
         ("orchestrator", orchestrator_values),
@@ -9991,7 +9995,7 @@ def start(
                 f" PRIME_RL_RESUME_ADAPTER_STEP={resume_step}"
             )
     identity_env: dict[str, str] = {}
-    if not muse_run and profile == "glm52-production20":
+    if not muse_run and profile.startswith("glm52-production"):
         env = (
             f"{isolated_env}trainer_nodes='{trainer_nodes}' RUN={run} RUN_NAME={name} "
             f"TRAINER_CONFIG={trainer_config} PRIME_EP_PROFILE=0 PRIME_EP_AC_CACHE=0 "
