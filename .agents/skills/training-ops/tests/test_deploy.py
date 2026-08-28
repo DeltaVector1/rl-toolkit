@@ -145,14 +145,15 @@ class DeployTest(unittest.TestCase):
                     if "-G" in command:
                         return Mock(returncode=0, stdout=f"controlpath {socket}\n", stderr="")
                     if "-O" in command:
-                        return Mock(returncode=255, stdout="", stderr="Control socket stale")
+                        return Mock(returncode=255, stdout="", stderr="")
                     raise AssertionError(f"unexpected SSH command: {command}")
 
                 with patch.dict(
                     training_ops._ssh_control_paths, {}, clear=True
                 ), patch.object(training_ops.subprocess, "run", side_effect=run) as subprocess_run:
                     with self.assertRaisesRegex(
-                        training_ops.Refused, "configured SSH control master is stale"
+                        training_ops.Refused,
+                        "configured SSH control master is stale.*exited with status 255",
                     ):
                         with training_ops._ssh_control_masters([host]):
                             pass
@@ -162,6 +163,26 @@ class DeployTest(unittest.TestCase):
                 self.assertEqual(training_ops._ssh_control_paths, {})
             finally:
                 listener.close()
+
+    def test_deploy_refuses_duplicate_nodes_before_fanout(self):
+        with patch.object(training_ops, "_ssh") as ssh, patch.object(
+            training_ops, "_ssh_control_masters"
+        ) as masters:
+            with self.assertRaisesRegex(training_ops.Refused, "deploy nodes must be unique"):
+                training_ops.deploy("scripts/china/cluster.sh", nodes=["n78", "n78"])
+        ssh.assert_not_called()
+        masters.assert_not_called()
+
+    def test_qualify_refuses_duplicate_nodes_before_fanout(self):
+        with patch.object(training_ops, "_ssh") as ssh, patch.object(
+            training_ops, "_ssh_control_masters"
+        ) as masters:
+            with self.assertRaisesRegex(
+                training_ops.Refused, "qualification nodes must be unique"
+            ):
+                training_ops.qualify("glm52-native-small", nodes=["n78", "n78"])
+        ssh.assert_not_called()
+        masters.assert_not_called()
 
     def test_control_master_starts_once_per_configured_host(self):
         hosts = [*training_ops.trainer_hosts, training_ops.trainer_hosts[0]]

@@ -707,7 +707,9 @@ def _configured_ssh_control_path(host: str) -> str | None:
             f"{configured_path}"
         ) from error
     if checked.returncode:
-        detail = (checked.stderr or checked.stdout or "control check failed").strip()
+        detail = (checked.stderr or checked.stdout or "").strip()
+        if not detail:
+            detail = f"control check exited with status {checked.returncode}"
         raise Refused(
             f"configured SSH control master is stale on {host}: "
             f"{configured_path} ({detail[:120]})"
@@ -10057,6 +10059,8 @@ def deploy(
         if not nodes:
             raise Refused(f"no configured host mounts {path}")
     nodes = [_check_host(h) for h in nodes]
+    if len(nodes) != len(set(nodes)):
+        raise Refused("deploy nodes must be unique")
     local = repo_root / path
     if not local.is_file():
         raise Refused(f"not in the repository: {local}")
@@ -10683,6 +10687,8 @@ def qualify(
     if (resume_adapter is None) != (resume_step is None):
         raise Refused("qualification resume adapter and step must be set together")
     nodes = [_check_host(host) for host in (nodes or trainer_hosts)]
+    if len(nodes) != len(set(nodes)):
+        raise Refused("qualification nodes must be unique")
     if trainer_head in nodes:
         nodes = [trainer_head] + [host for host in nodes if host != trainer_head]
     with _ssh_control_masters(nodes):
