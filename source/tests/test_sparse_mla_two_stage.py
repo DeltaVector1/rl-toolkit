@@ -77,7 +77,22 @@ class SparseMlaTwoStageTest(unittest.TestCase):
         self.assertIn("route_skew=2048_keys_x_4096_routes", BENCHMARK)
         self.assertIn("signal.setitimer(signal.ITIMER_REAL", BENCHMARK)
         self.assertIn("peak_reserved_delta", BENCHMARK)
+        self.assertIn("peak_allocated_delta", BENCHMARK)
+        self.assertIn("measured allocated-memory bound failed", BENCHMARK)
         self.assertIn("free_hbm_before", BENCHMARK)
+
+    def test_prototype_is_not_enabled_by_any_run_config(self):
+        config_root = ROOT.parent / "configs"
+        enabled = []
+        for path in config_root.rglob("*.toml"):
+            if "PRIME_SPARSE_BWD_TWO_STAGE" in path.read_text():
+                enabled.append(str(path.relative_to(config_root)))
+        self.assertEqual(enabled, [])
+
+    def test_workspace_limit_validation_is_fail_closed(self):
+        self.assertIn("max_workspace_bytes <= 0", SOURCE)
+        self.assertIn("not isinstance(max_workspace_bytes, int)", SOURCE)
+        self.assertIn("workspace limit must be a positive integer", SOURCE)
 
     def test_integration_is_opt_in_and_skips_atomic_dkv_kernel(self):
         self.assertIn('os.environ.get("PRIME_SPARSE_BWD_TWO_STAGE", "0")', BWD_SOURCE)

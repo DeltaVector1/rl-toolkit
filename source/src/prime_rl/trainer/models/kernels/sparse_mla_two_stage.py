@@ -241,6 +241,12 @@ def sparse_mla_dkv_two_stage(
     atol=2e-3 during qualification.
     """
 
+    if (
+        isinstance(max_workspace_bytes, bool)
+        or not isinstance(max_workspace_bytes, int)
+        or max_workspace_bytes <= 0
+    ):
+        raise ValueError("two-stage sparse MLA workspace limit must be a positive integer")
     tensors = (q, kv, do, indices, lse, delta)
     if not all(t.is_cuda for t in tensors):
         raise ValueError("two-stage sparse MLA requires CUDA tensors")
