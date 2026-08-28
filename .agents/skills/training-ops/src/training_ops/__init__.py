@@ -10779,6 +10779,8 @@ cat {shlex.quote(result_path)}
 
 def _copy_resume_adapter(path: str, nodes: list[str]) -> None:
     """Copy one adapter from the trainer head to missing trainer nodes."""
+    if "\x00" in path:
+        raise Refused("resume adapter path contains NUL")
     exact_step20 = glm_step20_h200_gate["trainer_adapter"]
     if not path.startswith(f"{run_root}/") and path != exact_step20:
         raise Refused("resume adapter is outside an allowed exact root")
@@ -10841,7 +10843,15 @@ case "$operation" in
       [ "$existing_digest" = "$staged_digest" ] || exit 3
       rm -f -- "$staging"
     else
-      mv -- "$staging" "$final"
+      if ln -- "$staging" "$final"; then
+        rm -f -- "$staging"
+      elif [ -e "$final" ]; then
+        existing_digest=$(file_digest "$final") || exit 1
+        [ "$existing_digest" = "$staged_digest" ] || exit 3
+        rm -f -- "$staging"
+      else
+        exit 4
+      fi
     fi
     ;;
   *) exit 2 ;;
@@ -10868,7 +10878,9 @@ copy_one() {{
     echo "$target has a different adapter at $final" >&2
     return 1
   }}
-  current_staging=$(remote_command "$target" create_staging "$final" "")
+  if ! current_staging=$(remote_command "$target" create_staging "$final" ""); then
+    return 1
+  fi
   transfer=rsync
   ssh "${{ssh_opts[@]}}" "$target" command -v rsync >/dev/null || transfer=scp
   for attempt in 1 2 3; do
@@ -10884,9 +10896,12 @@ copy_one() {{
     if [ "$copied" = 1 ]; then
       remote_digest=$(remote_command "$target" partial_digest "$final" "$current_staging")
       if [ "$remote_digest" = "$digest" ]; then
-        remote_command "$target" install "$final" "$current_staging"
-        current_staging=
-        return 0
+        if remote_command "$target" install "$final" "$current_staging"; then
+          current_staging=
+          return 0
+        fi
+        cleanup_current_staging
+        return 1
       fi
     fi
     echo "$target adapter copy attempt $attempt failed" >&2
