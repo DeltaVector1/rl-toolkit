@@ -431,20 +431,26 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None):
     if two_stage_value not in {"0", "1"}:
         raise ValueError("PRIME_SPARSE_BWD_TWO_STAGE must be 0 or 1")
     use_two_stage = two_stage_value == "1"
+    bucketed_value = os.environ.get("PRIME_SPARSE_BWD_BUCKETED", "0")
+    if bucketed_value not in {"0", "1"}:
+        raise ValueError("PRIME_SPARSE_BWD_BUCKETED must be 0 or 1")
+    use_bucketed = bucketed_value == "1"
+    if use_two_stage and use_bucketed:
+        raise ValueError("PRIME_SPARSE_BWD_TWO_STAGE and PRIME_SPARSE_BWD_BUCKETED are mutually exclusive")
     capability = torch.cuda.get_device_capability(q.device)
     if reuse_dq_shared and capability != (8, 9):
         raise ValueError(
             "PRIME_SPARSE_BWD_REUSE_DQ_SHARED requires an SM89 CUDA device"
         )
-    if use_two_stage:
+    if use_two_stage or use_bucketed:
         if reuse_dq_shared:
-            raise ValueError("PRIME_SPARSE_BWD_TWO_STAGE cannot reuse dQ shared memory")
+            raise ValueError("sparse route reducers cannot reuse dQ shared memory")
         from prime_rl.trainer.models.kernels.sparse_mla_two_stage import (
             supports_glm_sm89_shape,
         )
 
         if not supports_glm_sm89_shape(q, kv, do, indices, capability=capability):
-            raise ValueError("PRIME_SPARSE_BWD_TWO_STAGE requires the exact GLM SM89 CP shape")
+            raise ValueError("sparse route reducers require the exact GLM SM89 CP shape")
 
     preprocess_kernel = preprocess(H, D)
     if capability[0] < 9:
@@ -468,7 +474,7 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None):
             threads=threads,
             vectorized_atomic=False,
             reuse_dq_shared=reuse_dq_shared,
-            compute_dkv=not use_two_stage,
+            compute_dkv=not (use_two_stage or use_bucketed),
         )
     else:
         bwd_kernel = bwd(
@@ -480,12 +486,12 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None):
             sm_scale,
             True,
             reuse_dq_shared=reuse_dq_shared,
-            compute_dkv=not use_two_stage,
+            compute_dkv=not (use_two_stage or use_bucketed),
         )
     postprocess_kernel = postprocess(D, D_tail, kv_group)
 
     delta = preprocess_kernel(o, do)
-    if use_two_stage:
+    if use_two_stage or use_bucketed:
         dkv = torch.empty_like(kv, dtype=torch.float32)
     else:
         dkv = torch.zeros_like(kv, dtype=torch.float32)
@@ -494,6 +500,19 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None):
         from prime_rl.trainer.models.kernels.sparse_mla_two_stage import sparse_mla_dkv_two_stage
 
         dkv, _memory = sparse_mla_dkv_two_stage(
+            q,
+            kv,
+            do,
+            indices,
+            lse,
+            delta,
+            sm_scale=sm_scale,
+            output=dkv,
+        )
+    elif use_bucketed:
+        from prime_rl.trainer.models.kernels.sparse_mla_bucketed import sparse_mla_dkv_bucketed
+
+        dkv, _memory = sparse_mla_dkv_bucketed(
             q,
             kv,
             do,

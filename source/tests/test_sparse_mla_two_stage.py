@@ -102,7 +102,9 @@ class SparseMlaTwoStageTest(unittest.TestCase):
 
     def test_integration_is_opt_in_and_skips_atomic_dkv_kernel(self):
         self.assertIn('os.environ.get("PRIME_SPARSE_BWD_TWO_STAGE", "0")', BWD_SOURCE)
-        self.assertIn("compute_dkv=not use_two_stage", BWD_SOURCE)
+        self.assertIn('os.environ.get("PRIME_SPARSE_BWD_BUCKETED", "0")', BWD_SOURCE)
+        self.assertIn("sparse_mla_dkv_bucketed", BWD_SOURCE)
+        self.assertIn("compute_dkv=not (use_two_stage or use_bucketed)", BWD_SOURCE)
         self.assertIn("sparse_mla_dkv_two_stage", BWD_SOURCE)
         self.assertIn("torch.empty_like(kv, dtype=torch.float32)", BWD_SOURCE)
         self.assertIn("output=dkv", BWD_SOURCE)
