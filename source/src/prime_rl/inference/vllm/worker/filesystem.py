@@ -497,6 +497,7 @@ class FileSystemWeightUpdateWorker(Worker):
         with (destination.parent / f"{destination.name}.lock").open("w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             if (destination / "READY").exists():
+                self._validate_staged_glm_adapter(destination)
                 return
             temporary = destination.with_name(f"{destination.name}.partial")
             temporary.mkdir(exist_ok=True)
@@ -512,9 +513,35 @@ class FileSystemWeightUpdateWorker(Worker):
             actual_digest = _sha256_file(temporary / "adapter_model.safetensors")
             if actual_digest != expected_digest:
                 raise ValueError("downloaded adapter SHA-256 does not match the trainer export")
+            self._validate_staged_glm_adapter(temporary)
             (temporary / "READY").touch()
             shutil.rmtree(destination, ignore_errors=True)
             temporary.rename(destination)
+
+    @staticmethod
+    def _validate_staged_glm_adapter(adapter_path: Path) -> dict[str, object] | None:
+        try:
+            from prime_rl.inference.vllm.adapter_validation import (
+                expected_model_identity,
+                validation_enabled,
+                validate_glm52_adapter,
+            )
+
+            if validation_enabled():
+                identity = expected_model_identity()
+                return validate_glm52_adapter(
+                    adapter_path,
+                    expected_alias=identity["alias"],
+                    expected_revision=identity["revision"],
+                    expected_sha256=identity["sha256"],
+                )
+        except ImportError:
+            raise RuntimeError("GLM adapter validation module is unavailable")
+        return None
+
+    def validate_lora_adapter(self, adapter_path: str) -> dict[str, object] | None:
+        """Validate a local adapter on every vLLM worker when enabled."""
+        return self._validate_staged_glm_adapter(Path(adapter_path))
 
     def update_weights_from_path(self, weight_path: str) -> None:
         """Update weights from a specified path in shared filesystem containing a HF-compatible checkpoint."""

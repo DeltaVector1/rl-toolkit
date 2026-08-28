@@ -22,6 +22,7 @@ from vllm.logger import init_logger
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from prime_rl.configs.inference import InferenceConfig
+from prime_rl.inference.vllm.adapter_validation import validation_enabled
 from prime_rl.inference.patches import (
     monkey_patch_dp_coordinator_startup_timeout,
     monkey_patch_harmony_stop_token_propagation,
@@ -220,15 +221,23 @@ async def update_weights(request: Request):
 async def load_lora_adapter(lora_request: LoadLoRAAdapterRequest, raw_request: Request):
     """Stage remote adapters and serialize loads so retries cannot overlap."""
     async with lora_load_lock:
-        if os.environ.get("PRIME_MOE_LORA_FORMAT") == "2d":
+        validate_glm_adapter = validation_enabled()
+        if os.environ.get("PRIME_MOE_LORA_FORMAT") == "2d" or validate_glm_adapter:
             if not hasattr(lora_request, "is_3d_lora_weight"):
                 raise RuntimeError("this vLLM version cannot load per-expert LoRA weights")
+            if getattr(lora_request, "is_3d_lora_weight", False) is True:
+                raise RuntimeError("GLM adapter requests must use 2D per-expert weights")
             lora_request.is_3d_lora_weight = False
         handler = models(raw_request)
-        if lora_request.lora_path.startswith(("http://", "https://")):
+        remote_adapter = lora_request.lora_path.startswith(("http://", "https://"))
+        if remote_adapter:
             source_url = lora_request.lora_path
             await engine_client(raw_request).collective_rpc("stage_lora_adapter", args=(source_url,))
             lora_request.lora_path = adapter_cache_path(source_url).as_posix()
+        if validate_glm_adapter and not remote_adapter:
+            await engine_client(raw_request).collective_rpc(
+                "validate_lora_adapter", args=(lora_request.lora_path,)
+            )
         lora_request.load_inplace = True
         response = await handler.load_lora_adapter(lora_request)
         stored = handler.lora_requests.get(lora_request.lora_name)

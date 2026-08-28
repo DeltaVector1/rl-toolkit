@@ -640,6 +640,7 @@ def save_lora_config(model: nn.Module, save_path, rank: int, alpha: float, dropo
         dropout: LoRA dropout rate
     """
     import json
+    import os
     from pathlib import Path
 
     save_path = Path(save_path)
@@ -672,6 +673,21 @@ def save_lora_config(model: nn.Module, save_path, rank: int, alpha: float, dropo
         "target_modules": sorted(list(target_modules)),
         "modules_to_save": sorted(list(modules_to_save)) if modules_to_save else None,
     }
+    identity = {
+        "base_model_alias": os.environ.get("PRIME_LORA_BASE_MODEL_ALIAS", ""),
+        "base_model_revision": os.environ.get("PRIME_LORA_BASE_MODEL_REVISION", ""),
+        "base_model_sha256": os.environ.get("PRIME_LORA_BASE_MODEL_SHA256", ""),
+    }
+    if any(identity.values()):
+        if not all(identity.values()):
+            raise ValueError("LoRA model identity is incomplete")
+        adapter_config["base_model_name_or_path"] = identity["base_model_alias"]
+        adapter_config.update(
+            {
+                "base_model_revision": identity["base_model_revision"],
+                "base_model_sha256": identity["base_model_sha256"],
+            }
+        )
 
     config_path = save_path / "adapter_config.json"
     with open(config_path, "w") as f:
