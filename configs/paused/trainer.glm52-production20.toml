@@ -25,7 +25,7 @@ tags = ["glm-5.2", "native-fp8", "lora-r32", "full-expert-lora", "pp8", "cp8", "
 filename = "run_glm52-2/trainer-metrics.jsonl"
 
 [model]
-name = "/data/glm52-rl/model-fp8"
+name = "/data/ZiphuAI/GLM-5.2-FP8"
 impl = "custom"
 freeze_moe_router = true
 seq_len = 32768

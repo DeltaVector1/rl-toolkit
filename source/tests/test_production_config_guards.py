@@ -93,9 +93,13 @@ def test_glm52_production20_requires_identity_and_no_rollout_cache() -> None:
 
     assert profile["identity"]["rollout_cache"] is False
     assert "identity trainer_image_digest is missing" in failures
-    assert "identity model_sha256 is missing" in failures
-    assert "identity base_model_sha256 is missing" in failures
+    assert "identity model_content_sha256 is missing" in failures
+    assert "identity model_manifest_sha256 is missing" in failures
     assert not any("rollout cache" in failure for failure in failures)
+
+    assert trainer["model"]["name"] == "/data/ZiphuAI/GLM-5.2-FP8"
+    assert profile["identity"]["trainer_model_path"] == trainer["model"]["name"]
+    assert profile["identity"]["h200_model_alias"] == orchestrator["model"]["name"]
 
     broken = dict(profile)
     broken["identity"] = dict(profile["identity"])

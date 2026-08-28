@@ -536,6 +536,8 @@ class FileSystemWeightUpdateWorker(Worker):
                     expected_variant=identity["variant"],
                     expected_content_sha256=identity["content_sha256"],
                     expected_manifest_sha256=identity["manifest_sha256"],
+                    expected_trainer_model_path=identity["trainer_model_path"],
+                    expected_h200_model_alias=identity["h200_model_alias"],
                 )
         except ImportError:
             raise RuntimeError("GLM adapter validation module is unavailable")

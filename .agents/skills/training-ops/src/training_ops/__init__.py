@@ -407,23 +407,27 @@ def _production20_identity_failures(
     if not isinstance(model, dict):
         failures.append("trainer model configuration is missing")
         model = {}
-    model_name = required_text("model_name")
-    if model_name is not None and model_name != model.get("name"):
-        failures.append("identity model name differs from trainer configuration")
+    trainer_model_path = required_text("trainer_model_path")
+    if trainer_model_path is not None and trainer_model_path != model.get("name"):
+        failures.append("identity trainer model path differs from trainer configuration")
+    orchestrator_model = orchestrator_values.get("model")
+    if not isinstance(orchestrator_model, dict):
+        failures.append("orchestrator model configuration is missing")
+        orchestrator_model = {}
+    h200_model_alias = required_text("h200_model_alias")
+    if h200_model_alias is not None and h200_model_alias != orchestrator_model.get("name"):
+        failures.append("identity H200 model alias differs from orchestrator configuration")
+    required_text(
+        "model_repo_id", r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*"
+    )
     model_revision = required_text("model_revision", r"[0-9a-f]{40}")
     if model_revision is not None and model_revision != parity.get("model_revision"):
         failures.append("identity model revision differs from parity metadata")
-    model_sha256 = required_text("model_sha256", r"[0-9a-f]{64}")
-
-    base_alias = required_text("base_model_alias")
-    if base_alias is not None and base_alias != model_name:
-        failures.append("adapter base model alias differs from model identity")
-    base_revision = required_text("base_model_revision", r"[0-9a-f]{40}")
-    if base_revision is not None and base_revision != model_revision:
-        failures.append("adapter base model revision differs from model identity")
-    base_sha256 = required_text("base_model_sha256", r"[0-9a-f]{64}")
-    if base_sha256 is not None and base_sha256 != model_sha256:
-        failures.append("adapter base model hash differs from model identity")
+    model_variant = required_text("model_variant", r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+    if model_variant is not None and model_variant != parity.get("quantization"):
+        failures.append("identity model variant differs from parity metadata")
+    required_text("model_content_sha256", r"[0-9a-f]{64}")
+    required_text("model_manifest_sha256", r"[0-9a-f]{64}")
 
     lora = model.get("lora")
     if not isinstance(lora, dict):
@@ -9941,7 +9945,30 @@ def start(
                 f" PRIME_RL_RESUME_ADAPTER={shlex.quote(resume_adapter)}"
                 f" PRIME_RL_RESUME_ADAPTER_STEP={resume_step}"
             )
-    else:
+    identity_env: dict[str, str] = {}
+    if not muse_run and profile == "glm52-production20":
+        env = (
+            f"{isolated_env}trainer_nodes='{trainer_nodes}' RUN={run} RUN_NAME={name} "
+            f"TRAINER_CONFIG={trainer_config} PRIME_EP_PROFILE=0 PRIME_EP_AC_CACHE=0 "
+            "PRIME_INT4_COMBINE_ROUNDS=8 PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD=1 "
+            "PRIME_NCCL_CHANNELS=16"
+        )
+        identity = selected.get("identity")
+        if not isinstance(identity, dict):
+            raise Refused("GLM production profile identity is missing")
+        identity_env = {
+            "PRIME_LORA_BASE_MODEL_REPO_ID": "model_repo_id",
+            "PRIME_LORA_BASE_MODEL_REVISION": "model_revision",
+            "PRIME_LORA_BASE_MODEL_VARIANT": "model_variant",
+            "PRIME_LORA_BASE_MODEL_CONTENT_SHA256": "model_content_sha256",
+            "PRIME_LORA_BASE_MODEL_MANIFEST_SHA256": "model_manifest_sha256",
+            "PRIME_LORA_BASE_MODEL_TRAINER_PATH": "trainer_model_path",
+            "PRIME_LORA_BASE_MODEL_H200_ALIAS": "h200_model_alias",
+        }
+        for environment_name, identity_name in identity_env.items():
+            env += f" {environment_name}={shlex.quote(identity[identity_name])}"
+        env += " PRIME_GLM_ADAPTER_VALIDATE=1"
+    elif not muse_run:
         env = (
             f"{isolated_env}trainer_nodes='{trainer_nodes}' RUN={run} RUN_NAME={name} "
             f"TRAINER_CONFIG={trainer_config} PRIME_EP_PROFILE=0 PRIME_EP_AC_CACHE=0 "
@@ -9963,6 +9990,12 @@ def start(
 
     def launch_orch():
         print(f"starting edge orchestrator on {orchestrator_host}")
+        identity_assignments = " ".join(
+            f"{environment_name}={shlex.quote(identity[identity_name])}"
+            for environment_name, identity_name in identity_env.items()
+        )
+        if identity_assignments:
+            identity_assignments += " PRIME_GLM_ADAPTER_VALIDATE=1"
         rc, out = _ssh(
             orchestrator_host,
             f"prime_deployment={shlex.quote(remote_repo)} "
@@ -9972,7 +10005,7 @@ def start(
             f"prime_orchestrator_container={shlex.quote(orchestrator_container)} "
             f"prime_env_container={shlex.quote(environment_container)} "
             f"RUN={run} RUN_NAME={name} ORCH_CONFIG={edge_config} "
-            f"ENV_CONFIG={environment_config} "
+            f"ENV_CONFIG={environment_config} {identity_assignments} "
             f"bash {orchestrator_launcher}",
             300,
         )

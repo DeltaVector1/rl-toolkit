@@ -49,12 +49,13 @@ class GlmAdapterValidationTest(unittest.TestCase):
         return {
             "peft_type": "LORA",
             "task_type": "CAUSAL_LM",
-            "base_model_name_or_path": "org/glm-base",
+            "base_model_name_or_path": "/data/ZiphuAI/GLM-5.2-FP8",
             "base_model_repo_id": "org/glm-base",
             "base_model_revision": "a" * 40,
             "base_model_variant": "native_fp8",
             "base_model_content_sha256": "b" * 64,
             "base_model_manifest_sha256": "c" * 64,
+            "base_model_h200_name_or_path": "/models/glm52-fp8",
             "r": 32,
             "lora_alpha": 64,
             "lora_dropout": 0.0,
@@ -103,6 +104,8 @@ class GlmAdapterValidationTest(unittest.TestCase):
                     expected_variant="native_fp8",
                     expected_content_sha256="b" * 64,
                     expected_manifest_sha256="c" * 64,
+                    expected_trainer_model_path="/data/ZiphuAI/GLM-5.2-FP8",
+                    expected_h200_model_alias="/models/glm52-fp8",
                 )
             self.assertEqual(result["tensor_count"], 2)
             self.assertFalse(result["is_3d_lora_weight"])
@@ -124,6 +127,8 @@ class GlmAdapterValidationTest(unittest.TestCase):
                         expected_variant="native_fp8",
                         expected_content_sha256="b" * 64,
                         expected_manifest_sha256="c" * 64,
+                        expected_trainer_model_path="/data/ZiphuAI/GLM-5.2-FP8",
+                        expected_h200_model_alias="/models/glm52-fp8",
                     )
 
     def test_wrong_dtype_shape_and_3d_request_are_rejected(self):
@@ -156,6 +161,8 @@ class GlmAdapterValidationTest(unittest.TestCase):
                         expected_variant="native_fp8",
                         expected_content_sha256="b" * 64,
                         expected_manifest_sha256="c" * 64,
+                        expected_trainer_model_path="/data/ZiphuAI/GLM-5.2-FP8",
+                        expected_h200_model_alias="/models/glm52-fp8",
                     )
                 with self.assertRaisesRegex(ValueError, "2D"):
                     self.module.validate_glm52_adapter(
@@ -165,6 +172,8 @@ class GlmAdapterValidationTest(unittest.TestCase):
                         expected_variant="native_fp8",
                         expected_content_sha256="b" * 64,
                         expected_manifest_sha256="c" * 64,
+                        expected_trainer_model_path="/data/ZiphuAI/GLM-5.2-FP8",
+                        expected_h200_model_alias="/models/glm52-fp8",
                         is_3d_lora_weight=True,
                     )
 
@@ -185,6 +194,8 @@ class GlmAdapterValidationTest(unittest.TestCase):
                         expected_variant="native_fp8",
                         expected_content_sha256="b" * 64,
                         expected_manifest_sha256="c" * 64,
+                        expected_trainer_model_path="/data/ZiphuAI/GLM-5.2-FP8",
+                        expected_h200_model_alias="/models/glm52-fp8",
                     )
 
     def test_model_content_identity_mismatch_is_rejected(self):
@@ -204,6 +215,8 @@ class GlmAdapterValidationTest(unittest.TestCase):
                         expected_variant="native_fp8",
                         expected_content_sha256="d" * 64,
                         expected_manifest_sha256="c" * 64,
+                        expected_trainer_model_path="/data/ZiphuAI/GLM-5.2-FP8",
+                        expected_h200_model_alias="/models/glm52-fp8",
                     )
 
     def test_model_path_is_not_a_repository_identity(self):
@@ -215,6 +228,8 @@ class GlmAdapterValidationTest(unittest.TestCase):
                 expected_variant="native_fp8",
                 expected_content_sha256="b" * 64,
                 expected_manifest_sha256="c" * 64,
+                expected_trainer_model_path="/data/ZiphuAI/GLM-5.2-FP8",
+                expected_h200_model_alias="/models/glm52-fp8",
             )
 
     def test_wrong_shape_and_missing_identity_are_rejected(self):
@@ -238,6 +253,8 @@ class GlmAdapterValidationTest(unittest.TestCase):
                         expected_variant="native_fp8",
                         expected_content_sha256="b" * 64,
                         expected_manifest_sha256="c" * 64,
+                        expected_trainer_model_path="/data/ZiphuAI/GLM-5.2-FP8",
+                        expected_h200_model_alias="/models/glm52-fp8",
                     )
         with patch.dict(self.module.os.environ, {}, clear=True):
             with self.assertRaisesRegex(ValueError, "canonical model identity"):
@@ -250,6 +267,8 @@ class GlmAdapterValidationTest(unittest.TestCase):
             "PRIME_LORA_BASE_MODEL_VARIANT": "native_fp8",
             "PRIME_LORA_BASE_MODEL_CONTENT_SHA256": "b" * 64,
             "PRIME_LORA_BASE_MODEL_MANIFEST_SHA256": "c" * 64,
+            "PRIME_LORA_BASE_MODEL_TRAINER_PATH": "/data/ZiphuAI/GLM-5.2-FP8",
+            "PRIME_LORA_BASE_MODEL_H200_ALIAS": "/models/glm52-fp8",
         }
         with patch.dict(self.module.os.environ, values, clear=True):
             self.assertEqual(
@@ -260,6 +279,8 @@ class GlmAdapterValidationTest(unittest.TestCase):
                     "variant": "native_fp8",
                     "content_sha256": "b" * 64,
                     "manifest_sha256": "c" * 64,
+                    "trainer_model_path": "/data/ZiphuAI/GLM-5.2-FP8",
+                    "h200_model_alias": "/models/glm52-fp8",
                 },
             )
 

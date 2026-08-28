@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from prime_rl.model_identity import (
-    expected_model_identity,
+    expected_model_identity as _expected_model_identity,
     validate_model_identity,
 )
 
@@ -48,6 +48,10 @@ _TARGET_MODULES = frozenset(
 
 class AdapterValidationError(ValueError):
     """Raised when an adapter cannot be proven compatible with GLM-5.2."""
+
+
+def expected_model_identity() -> dict[str, str]:
+    return _expected_model_identity()
 
 
 def validation_enabled() -> bool:
@@ -192,6 +196,8 @@ def validate_glm52_adapter(
     expected_variant: str,
     expected_content_sha256: str,
     expected_manifest_sha256: str,
+    expected_trainer_model_path: str,
+    expected_h200_model_alias: str,
     is_3d_lora_weight: bool = False,
 ) -> dict[str, object]:
     """Validate one complete, global-shape GLM-5.2 2D adapter export."""
@@ -206,6 +212,8 @@ def validate_glm52_adapter(
             "variant": expected_variant,
             "content_sha256": expected_content_sha256,
             "manifest_sha256": expected_manifest_sha256,
+            "trainer_model_path": expected_trainer_model_path,
+            "h200_model_alias": expected_h200_model_alias,
         }
         validate_model_identity(expected_identity)
     except ValueError as error:
@@ -245,8 +253,8 @@ def validate_glm52_adapter(
         or set(targets) != _TARGET_MODULES
     ):
         raise AdapterValidationError("adapter target modules differ from GLM-5.2")
-    if config.get("base_model_name_or_path") != expected_repo_id:
-        raise AdapterValidationError("adapter base model repository ID differs")
+    if config.get("base_model_name_or_path") != expected_trainer_model_path:
+        raise AdapterValidationError("adapter trainer model path differs")
     if config.get("base_model_repo_id") != expected_repo_id:
         raise AdapterValidationError("adapter base model repository ID differs")
     if config.get("base_model_revision") != expected_revision:
@@ -257,6 +265,8 @@ def validate_glm52_adapter(
         raise AdapterValidationError("adapter base model content SHA-256 differs")
     if config.get("base_model_manifest_sha256") != expected_manifest_sha256:
         raise AdapterValidationError("adapter base model manifest SHA-256 differs")
+    if config.get("base_model_h200_name_or_path") != expected_h200_model_alias:
+        raise AdapterValidationError("adapter H200 model alias differs")
 
     try:
         checksum = checksum_path.read_text(encoding="ascii")
@@ -272,9 +282,11 @@ def validate_glm52_adapter(
         "alpha": GLM_LORA_ALPHA,
         "is_3d_lora_weight": False,
         "base_model_repo_id": expected_repo_id,
+        "base_model_name_or_path": expected_trainer_model_path,
         "base_model_revision": expected_revision,
         "base_model_variant": expected_variant,
         "base_model_content_sha256": expected_content_sha256,
         "base_model_manifest_sha256": expected_manifest_sha256,
+        "base_model_h200_name_or_path": expected_h200_model_alias,
         "adapter_sha256": checksum.rstrip("\n"),
     }

@@ -641,6 +641,7 @@ def save_lora_config(model: nn.Module, save_path, rank: int, alpha: float, dropo
         dropout: LoRA dropout rate
     """
     import json
+    import os
     from pathlib import Path
 
     save_path = Path(save_path)
@@ -673,9 +674,20 @@ def save_lora_config(model: nn.Module, save_path, rank: int, alpha: float, dropo
         "target_modules": sorted(list(target_modules)),
         "modules_to_save": sorted(list(modules_to_save)) if modules_to_save else None,
     }
-    if getattr(model.config, "model_type", None) == "glm_moe_dsa":
+    identity_env = (
+        "PRIME_LORA_BASE_MODEL_REPO_ID",
+        "PRIME_LORA_BASE_MODEL_REVISION",
+        "PRIME_LORA_BASE_MODEL_VARIANT",
+        "PRIME_LORA_BASE_MODEL_CONTENT_SHA256",
+        "PRIME_LORA_BASE_MODEL_MANIFEST_SHA256",
+        "PRIME_LORA_BASE_MODEL_TRAINER_PATH",
+        "PRIME_LORA_BASE_MODEL_H200_ALIAS",
+    )
+    if getattr(model.config, "model_type", None) == "glm_moe_dsa" and any(
+        os.environ.get(name) for name in identity_env
+    ):
         identity = expected_model_identity()
-        adapter_config["base_model_name_or_path"] = identity["repo_id"]
+        adapter_config["base_model_name_or_path"] = identity["trainer_model_path"]
         adapter_config.update(
             {
                 "base_model_repo_id": identity["repo_id"],
@@ -683,6 +695,7 @@ def save_lora_config(model: nn.Module, save_path, rank: int, alpha: float, dropo
                 "base_model_variant": identity["variant"],
                 "base_model_content_sha256": identity["content_sha256"],
                 "base_model_manifest_sha256": identity["manifest_sha256"],
+                "base_model_h200_name_or_path": identity["h200_model_alias"],
             }
         )
 
