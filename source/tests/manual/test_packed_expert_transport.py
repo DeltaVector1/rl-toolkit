@@ -73,6 +73,29 @@ def max_across_ranks(value: float, device: torch.device) -> float:
     return float(tensor.item())
 
 
+def production_splits(rank: int, world: int):
+    split_pattern = [0, 2048, 3072, 4096, 5120, 6144, 7168, 5120]
+    input_splits = [split_pattern[(peer - rank) % world] for peer in range(world)]
+    output_splits = [split_pattern[(rank - peer) % world] for peer in range(world)]
+    return input_splits, output_splits
+
+
+def incoming_only_splits(rank: int, world: int):
+    matrix = [[0 for _ in range(world)] for _ in range(world)]
+    for source in range(world):
+        if source == 0:
+            matrix[source][1] = 1024
+            matrix[source][2] = 3072
+            continue
+        first = (source + 1) % (world - 1) + 1
+        second = (source + 3) % (world - 1) + 1
+        matrix[source][first] = 512 + source * 128
+        matrix[source][second] = 1024 + source * 192
+    input_splits = matrix[rank]
+    output_splits = [matrix[source][rank] for source in range(world)]
+    return input_splits, output_splits
+
+
 def main() -> None:
     args = arguments()
     rank = int(os.environ["RANK"])
@@ -86,9 +109,9 @@ def main() -> None:
     if world != 8:
         raise RuntimeError(f"this benchmark requires eight ranks, found {world}")
 
-    split_pattern = [0, 2048, 3072, 4096, 5120, 6144, 7168, 5120]
-    input_splits = [split_pattern[(peer - rank) % world] for peer in range(world)]
-    output_splits = [split_pattern[(rank - peer) % world] for peer in range(world)]
+    input_splits, output_splits = production_splits(rank, world)
+    if input_splits == output_splits:
+        raise RuntimeError("production case must use different source and destination layouts")
     rows = sum(input_splits)
     output_rows = sum(output_splits)
     generator = torch.Generator(device="cuda").manual_seed(20260828 + rank)
@@ -109,6 +132,46 @@ def main() -> None:
         raise RuntimeError("packed transport changed forward values")
     if not torch.equal(base_gradient, packed_gradient):
         raise RuntimeError("packed transport changed backward gradients")
+
+    incoming_input_splits, incoming_output_splits = incoming_only_splits(rank, world)
+    if rank == 0 and not (
+        sum(incoming_output_splits) == 0 and sum(incoming_input_splits) > 0
+    ):
+        raise RuntimeError("incoming-only case did not create an empty-output rank")
+    incoming_rows = sum(incoming_input_splits)
+    incoming_output_rows = sum(incoming_output_splits)
+    incoming_value = torch.randn(
+        incoming_rows,
+        args.cols,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    ).mul_(0.02)
+    incoming_upstream = torch.randn(
+        incoming_output_rows,
+        args.cols,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    ).mul_(1e-4)
+    incoming_base_output, incoming_base_gradient = run_chain(
+        incoming_value,
+        incoming_upstream,
+        incoming_output_splits,
+        incoming_input_splits,
+        packed=False,
+    )
+    incoming_packed_output, incoming_packed_gradient = run_chain(
+        incoming_value,
+        incoming_upstream,
+        incoming_output_splits,
+        incoming_input_splits,
+        packed=True,
+    )
+    if not torch.equal(incoming_base_output, incoming_packed_output):
+        raise RuntimeError("packed incoming-only case changed forward values")
+    if not torch.equal(incoming_base_gradient, incoming_packed_gradient):
+        raise RuntimeError("packed incoming-only case changed backward gradients")
 
     gc.collect()
     torch.cuda.empty_cache()

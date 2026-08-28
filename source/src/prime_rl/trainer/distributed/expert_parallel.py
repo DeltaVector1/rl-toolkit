@@ -127,6 +127,18 @@ def _copy_value_scale_payload(
     )
 
 
+def _validate_fp8_value_scale(values: torch.Tensor, scales: torch.Tensor) -> None:
+    if values.dtype != torch.float8_e4m3fn:
+        raise TypeError("packed FP8 transport requires E4M3 values")
+    if (
+        scales.dtype != torch.float32
+        or scales.element_size() != 4
+        or scales.ndim != 1
+        or scales.shape[0] != values.shape[0]
+    ):
+        raise TypeError("packed FP8 transport requires one 4-byte FP32 scale per row")
+
+
 def _unpack_value_scale_payload(
     payload: torch.Tensor, value_bytes: int, scales: torch.Tensor
 ) -> torch.Tensor:
@@ -976,10 +988,12 @@ def _streaming_fp8_backward(
                         grad_output[source_cursor : source_cursor + count],
                         use_per_token_if_dynamic=True,
                     )
+                    scale_part = scale_part.flatten()
+                    _validate_fp8_value_scale(quantized_part, scale_part)
                     _copy_value_scale_payload(
                         packed_send_all[source_cursor : source_cursor + count],
                         quantized_part,
-                        scale_part.flatten(),
+                        scale_part,
                     )
                     del quantized_part, scale_part
                     source_cursor += count
@@ -1021,8 +1035,10 @@ def _streaming_fp8_backward(
                         grad_output[offset : offset + count],
                         use_per_token_if_dynamic=True,
                     )
+                    scale_part = scale_part.flatten()
+                    _validate_fp8_value_scale(quantized_part, scale_part)
                     payload, value_bytes = _pack_value_scale_payload(
-                        quantized_part, scale_part.flatten()
+                        quantized_part, scale_part
                     )
                     send.append(payload)
                     del quantized_part, scale_part
@@ -1449,7 +1465,11 @@ class _FP8Dispatch(torch.autograd.Function):
         if quantized.dtype != torch.float8_e4m3fn:
             raise TypeError("per-token FP8 transport must use E4M3 payloads")
         scale = scale.flatten()
-        if scale.dtype != torch.float32 or scale.shape[0] != routed_input.shape[0]:
+        if (
+            scale.dtype != torch.float32
+            or scale.element_size() != 4
+            or scale.shape[0] != routed_input.shape[0]
+        ):
             raise TypeError("per-token FP8 transport requires one FP32 scale per row")
         received = torch.empty(
             (output_rows, routed_input.shape[1]),
