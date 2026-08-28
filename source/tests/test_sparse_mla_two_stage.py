@@ -12,7 +12,7 @@ BENCHMARK = (ROOT.parent / "scripts/ops/benchmark_sparse_mla_two_stage_sm89.py")
 TOTAL_WIDTH = 576
 TOPK = 2048
 MAX_WORKSPACE_BYTES = 256 * 1024 * 1024
-ROUTE_BYTES_PER_ENTRY = 20
+ROUTE_BYTES_PER_ENTRY = 16
 ROUTE_FILTER_BYTES_PER_ENTRY = 17
 
 
@@ -50,8 +50,8 @@ def stable_segment_sum(values: list[list[float]], keys: list[int]):
 class SparseMlaTwoStageTest(unittest.TestCase):
     def test_production_workspace_is_bounded(self):
         total = memory_bound(32769)
-        self.assertEqual(4096 * TOPK * ROUTE_BYTES_PER_ENTRY, 167772160)
-        self.assertEqual(total, 243271936)
+        self.assertEqual(4096 * TOPK * ROUTE_BYTES_PER_ENTRY, 134217728)
+        self.assertEqual(total, 218106112)
         self.assertLess(total, MAX_WORKSPACE_BYTES)
         self.assertLess(total / 2**20, 256)
 
@@ -61,9 +61,9 @@ class SparseMlaTwoStageTest(unittest.TestCase):
         self.assertIn("(1, QUERY_TOKENS, GROUPS, TOPK)", SOURCE)
         self.assertIn("(1, 32768 + 1, GROUPS, TOTAL_WIDTH)", SOURCE)
         self.assertIn("PACKED_ROUTE_BYTES = 4", SOURCE)
-        self.assertIn("ROUTE_ORDER_BYTES = 8", SOURCE)
-        self.assertIn("ARGSORT_SCRATCH_BYTES = 8", SOURCE)
-        self.assertIn("ROUTE_BYTES_PER_ENTRY = PACKED_ROUTE_BYTES", SOURCE)
+        self.assertIn("SORTED_ROUTE_BYTES = 4", SOURCE)
+        self.assertIn("SORT_SCRATCH_BYTES = 8", SOURCE)
+        self.assertIn("ROUTE_BYTES_PER_ENTRY = PACKED_ROUTE_BYTES + SORTED_ROUTE_BYTES", SOURCE)
         self.assertIn("ROUTE_FILTER_BYTES_PER_ENTRY = 4 + 1 + 4 + 4 + 4", SOURCE)
 
     def test_duplicate_routes_reduce_in_stable_key_order(self):
@@ -116,10 +116,13 @@ class SparseMlaTwoStageTest(unittest.TestCase):
         self.assertNotIn("dp == dp", SOURCE)
         self.assertIn("BLOCK_WIDTH = 1024", SOURCE)
         self.assertIn("grid = (sequence_kv,)", SOURCE)
-        self.assertIn("torch.argsort(route_ids, stable=True)", SOURCE)
+        self.assertIn("torch.sort(route_ids, stable=True).values", SOURCE)
         self.assertIn("QUERY_ID_BITS = 12", SOURCE)
-        self.assertIn("route_ids = (keys << QUERY_ID_BITS)", SOURCE)
-        self.assertNotIn("sorted_positions", SOURCE)
+        self.assertIn("route_ids.bitwise_left_shift_(QUERY_ID_BITS)", SOURCE)
+        self.assertIn("counts[-1] = 0", SOURCE)
+        self.assertIn("offsets = torch.empty(sequence_kv + 1", SOURCE)
+        self.assertNotIn("masked_select", SOURCE)
+        self.assertNotIn("route_order", SOURCE)
         self.assertIn("same-device tensors", SOURCE)
         self.assertIn("@triton.jit", SOURCE)
 

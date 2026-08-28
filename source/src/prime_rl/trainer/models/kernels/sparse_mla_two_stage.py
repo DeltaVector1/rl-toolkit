@@ -26,9 +26,9 @@ BLOCK_WIDTH = 1024
 QUERY_ID_BITS = 12
 QUERY_ID_MASK = QUERY_TOKENS - 1
 PACKED_ROUTE_BYTES = 4
-ROUTE_ORDER_BYTES = 8
-ARGSORT_SCRATCH_BYTES = 8
-ROUTE_BYTES_PER_ENTRY = PACKED_ROUTE_BYTES + ROUTE_ORDER_BYTES + ARGSORT_SCRATCH_BYTES
+SORTED_ROUTE_BYTES = 4
+SORT_SCRATCH_BYTES = 8
+ROUTE_BYTES_PER_ENTRY = PACKED_ROUTE_BYTES + SORTED_ROUTE_BYTES + SORT_SCRATCH_BYTES
 ROUTE_FILTER_BYTES_PER_ENTRY = 4 + 1 + 4 + 4 + 4
 MAX_WORKSPACE_BYTES = 256 * 1024 * 1024
 LOG2_E = 1.4426950408889634
@@ -112,7 +112,6 @@ if triton is not None:
         lse,
         delta,
         route_ids,
-        route_order,
         key_offsets,
         output,
         q_stride_s,
@@ -143,8 +142,7 @@ if triton is not None:
         for head in tl.range(0, ATTENTION_HEADS):
             head_partial = tl.zeros((BLOCK_WIDTH,), dtype=tl.float32)
             for route_index in tl.range(route_start, route_end):
-                source_index = tl.load(route_order + route_index)
-                route_id = tl.load(route_ids + source_index)
+                route_id = tl.load(route_ids + route_index)
                 query_id = route_id & QUERY_ID_MASK
                 q_base = query_id * q_stride_s + head * q_stride_h
                 kv_base = key_id * kv_stride_s
@@ -208,26 +206,31 @@ else:
 def _sorted_route_ids(
     indices: torch.Tensor,
     sequence_kv: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build packed, key-major route IDs with GPU tensor operations only."""
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build stable, key-major route IDs with GPU tensor operations only."""
 
     flat = indices.reshape(-1)
-    positions = torch.arange(flat.numel(), device=indices.device, dtype=torch.int32)
-    valid = (flat >= 0) & (flat < sequence_kv - 1)
-    keys = flat.masked_select(valid)
-    positions = positions.masked_select(valid)
-    del flat, valid
-    route_ids = (keys << QUERY_ID_BITS) | (positions // TOPK)
-    del keys, positions
-    counts = torch.bincount(route_ids >> QUERY_ID_BITS, minlength=sequence_kv)
-    route_order = torch.argsort(route_ids, stable=True)
-    offsets = torch.cat(
-        (
-            torch.zeros(1, dtype=torch.int64, device=indices.device),
-            counts.cumsum(0, dtype=torch.int64),
-        )
-    )
-    return route_ids, route_order, offsets
+    route_ids = flat.clone()
+    invalid = flat < 0
+    route_ids.masked_fill_(invalid, sequence_kv - 1)
+    del invalid
+    invalid = flat >= sequence_kv - 1
+    route_ids.masked_fill_(invalid, sequence_kv - 1)
+    del flat, invalid
+    positions = torch.arange(route_ids.numel(), device=indices.device, dtype=torch.int32)
+    positions.div_(TOPK)
+    route_ids.bitwise_left_shift_(QUERY_ID_BITS)
+    route_ids.bitwise_or_(positions)
+    del positions
+    sorted_route_ids = torch.sort(route_ids, stable=True).values
+    del route_ids
+    counts = torch.bincount(sorted_route_ids >> QUERY_ID_BITS, minlength=sequence_kv)
+    counts[-1] = 0
+    offsets = torch.empty(sequence_kv + 1, dtype=torch.int64, device=indices.device)
+    offsets[0] = 0
+    offsets[1:] = counts.cumsum(0, dtype=torch.int64)
+    del counts
+    return sorted_route_ids, offsets
 
 
 def sparse_mla_dkv_two_stage(
@@ -304,7 +307,7 @@ def sparse_mla_dkv_two_stage(
             f"{memory.total_bytes} > {max_workspace_bytes} bytes"
         )
 
-    route_ids, route_order, key_offsets = _sorted_route_ids(indices, sequence_kv)
+    route_ids, key_offsets = _sorted_route_ids(indices, sequence_kv)
     if output_buffer is None:
         output_buffer = torch.empty(
             sequence_kv,
@@ -321,7 +324,6 @@ def sparse_mla_dkv_two_stage(
         lse,
         delta,
         route_ids,
-        route_order,
         key_offsets,
         output_buffer,
         q.stride(1),
@@ -344,5 +346,5 @@ def sparse_mla_dkv_two_stage(
         num_warps=4,
         num_stages=1,
     )
-    del route_ids, route_order, key_offsets
+    del route_ids, key_offsets
     return output_buffer.view_as(kv).to(dtype=kv.dtype), memory
