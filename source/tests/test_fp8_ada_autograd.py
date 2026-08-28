@@ -1622,8 +1622,133 @@ class MultiLinearAutogradTest(unittest.TestCase):
         )
         self.assertIsNone(base.weight.grad)
 
+    def test_fused_pair_lora_matches_separate_forward_and_gradients(self):
+        torch.manual_seed(8)
+        first_base = nn.Linear(8, 6, bias=False, dtype=torch.double)
+        second_base = nn.Linear(8, 4, bias=False, dtype=torch.double)
+        first_base.requires_grad_(False)
+        second_base.requires_grad_(False)
+        first = multi_linear.MultiLoRALinear(
+            first_base, rank=2, n_adapters=1, alpha=2, use_grouped_mm=False
+        )
+        second = multi_linear.MultiLoRALinear(
+            second_base, rank=2, n_adapters=1, alpha=2, use_grouped_mm=False
+        )
+        with torch.no_grad():
+            for parameter in (*first.lora_A, *first.lora_B, *second.lora_A, *second.lora_B):
+                parameter.normal_()
+        x = torch.randn(3, 8, dtype=torch.double, requires_grad=True)
+        expected_x = x.detach().clone().requires_grad_()
+
+        expected_first = first.adapter_output(expected_x)
+        expected_second = second.adapter_output(expected_x)
+        expected = torch.cat((expected_first, expected_second), dim=-1)
+        actual_first, actual_second = multi_linear.fused_lora_adapter_pair(
+            x, first, second
+        )
+        actual = torch.cat((actual_first, actual_second), dim=-1)
+        torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
+        first_parameter_ids = tuple(id(parameter) for parameter in first.parameters())
+        second_parameter_ids = tuple(id(parameter) for parameter in second.parameters())
+
+        upstream = torch.randn_like(actual)
+        expected.backward(upstream)
+        expected_x_grad = expected_x.grad.detach().clone()
+        expected_parameter_grads = [
+            parameter.grad.detach().clone()
+            for parameter in (*first.lora_A, *first.lora_B, *second.lora_A, *second.lora_B)
+        ]
+        expected_x.grad = None
+        for parameter in (*first.lora_A, *first.lora_B, *second.lora_A, *second.lora_B):
+            parameter.grad = None
+        actual.backward(upstream)
+        torch.testing.assert_close(x.grad, expected_x_grad, rtol=1e-12, atol=1e-12)
+        for actual_parameter, expected_parameter in zip(
+            (*first.lora_A, *first.lora_B, *second.lora_A, *second.lora_B),
+            expected_parameter_grads,
+            strict=True,
+        ):
+            self.assertIsNotNone(actual_parameter.grad)
+            torch.testing.assert_close(
+                actual_parameter.grad, expected_parameter, rtol=1e-12, atol=1e-12
+            )
+            self.assertTrue(bool(torch.isfinite(actual_parameter.grad).all()))
+        self.assertEqual(
+            set(first.state_dict()), {"base_layer.weight", "lora_A.0", "lora_B.0"}
+        )
+        self.assertEqual(
+            set(second.state_dict()), {"base_layer.weight", "lora_A.0", "lora_B.0"}
+        )
+        self.assertEqual(
+            tuple(id(parameter) for parameter in first.parameters()), first_parameter_ids
+        )
+        self.assertEqual(
+            tuple(id(parameter) for parameter in second.parameters()), second_parameter_ids
+        )
+
+    def test_fused_pair_lora_preserves_multi_adapter_output_order(self):
+        first_base = nn.Linear(8, 6, bias=False, dtype=torch.double)
+        second_base = nn.Linear(8, 4, bias=False, dtype=torch.double)
+        first_base.requires_grad_(False)
+        second_base.requires_grad_(False)
+        first = multi_linear.MultiLoRALinear(
+            first_base, rank=2, n_adapters=2, use_grouped_mm=False
+        )
+        second = multi_linear.MultiLoRALinear(
+            second_base, rank=2, n_adapters=2, use_grouped_mm=False
+        )
+        first._lora_num_tokens = second._lora_num_tokens = torch.tensor([2, 3])
+        first._scaling_factors = second._scaling_factors = torch.tensor([0.5, 1.5])
+        with torch.no_grad():
+            for parameter in (*first.lora_A, *first.lora_B, *second.lora_A, *second.lora_B):
+                parameter.normal_()
+        x = torch.randn(5, 8, dtype=torch.double)
+        expected_first = first.adapter_output(x)
+        expected_second = second.adapter_output(x)
+        actual_first, actual_second = multi_linear.fused_lora_adapter_pair(
+            x, first, second
+        )
+        torch.testing.assert_close(actual_first, expected_first, rtol=1e-12, atol=1e-12)
+        torch.testing.assert_close(actual_second, expected_second, rtol=1e-12, atol=1e-12)
+
+    def test_fused_pair_lora_releases_combined_rank_buffer(self):
+        first_base = nn.Linear(6144, 2048, bias=False, dtype=torch.bfloat16)
+        second_base = nn.Linear(6144, 576, bias=False, dtype=torch.bfloat16)
+        first_base.requires_grad_(False)
+        second_base.requires_grad_(False)
+        first = multi_linear.MultiLoRALinear(
+            first_base, rank=32, n_adapters=1, use_grouped_mm=False
+        )
+        second = multi_linear.MultiLoRALinear(
+            second_base, rank=32, n_adapters=1, use_grouped_mm=False
+        )
+        x = torch.randn(3, 6144, dtype=torch.bfloat16, requires_grad=True)
+        combined_buffers = []
+        real_cat = multi_linear.torch.cat
+
+        def record_cat(values, *args, **kwargs):
+            value = real_cat(values, *args, **kwargs)
+            if tuple(value.shape) == (64, 6144):
+                combined_buffers.append(
+                    (weakref.ref(value), value.numel() * value.element_size())
+                )
+            return value
+
+        with mock.patch.object(multi_linear.torch, "cat", record_cat):
+            outputs = multi_linear.fused_lora_adapter_pair(x, first, second)
+            torch.cat(outputs, dim=-1).sum().backward()
+        gc.collect()
+
+        self.assertEqual(len(combined_buffers), 1)
+        self.assertEqual(
+            combined_buffers[0][1],
+            64 * 6144 * first.lora_A[0].element_size(),
+        )
+        self.assertIsNone(combined_buffers[0][0]())
+
     def test_glm_attention_adds_q_and_kv_adapters_after_fused_base(self):
         sparse_attention = _load_sparse_attention_module()
+        self.assertFalse(sparse_attention._FUSE_QKV_A_LORA)
         attention = sparse_attention.GlmMoeDsaAttention.__new__(
             sparse_attention.GlmMoeDsaAttention
         )
