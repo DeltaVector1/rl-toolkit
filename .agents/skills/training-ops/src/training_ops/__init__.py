@@ -8521,6 +8521,7 @@ def _validate_trainer_qualification(
         "glm52-native-b2048",
         "glm52-native-b2048-memory",
         "glm52-native-b2048-nsys",
+        "glm52-native-pp-async",
     }:
         session_deadline, startup_deadline, step_deadline, profiler_deadline = (
             _glm_b2048_deadlines()
@@ -10535,6 +10536,7 @@ def _prepare_trainer_qualification_session(
         "glm52-native-b2048",
         "glm52-native-b2048-memory",
         "glm52-native-b2048-nsys",
+        "glm52-native-pp-async",
     }:
         session_deadline, startup_deadline, step_deadline, profiler_deadline = (
             _glm_b2048_deadlines()
@@ -11057,6 +11059,7 @@ print(json.dumps({
                 "glm52-native-b2048",
                 "glm52-native-b2048-memory",
                 "glm52-native-b2048-nsys",
+                "glm52-native-pp-async",
             }:
                 session_deadline, startup_deadline, step_deadline, profiler_deadline = (
                     _glm_b2048_deadlines()

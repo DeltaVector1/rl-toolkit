@@ -388,6 +388,7 @@ _b2048_qualification_profiles = frozenset(
         "glm52-native-b2048",
         "glm52-native-b2048-memory",
         "glm52-native-b2048-nsys",
+        "glm52-native-pp-async",
     }
 )
 
@@ -1097,6 +1098,15 @@ def _train_impl(config: TrainerConfig):
     # setup. This also protects callers that construct TrainerConfig without
     # going through the normal CLI parser.
     config.model.validate_async_1f1b_topology()
+    qualification_identity = _qualification_environment()
+    if config.model.pp_schedule == "1f1b_async" and (
+        qualification_identity is None
+        or qualification_identity["PRIME_QUALIFICATION_PROFILE"]
+        != "glm52-native-pp-async"
+    ):
+        raise RuntimeError(
+            "1f1b_async is only available in the GLM async qualification profile"
+        )
     # Setup world and logger
     world = get_world()
     numa_binding = bind_worker_to_gpu_numa_node()
@@ -1105,7 +1115,6 @@ def _train_impl(config: TrainerConfig):
         json_logging=config.log.json_logging,
     )
     logger.info(f"Starting RL trainer in {world} in {config.output_dir}")
-    qualification_identity = _qualification_environment()
     qualification_deadline = None
     if qualification_identity is not None:
         qualification_deadline = _QualificationDeadline.from_environment(

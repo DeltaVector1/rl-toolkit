@@ -1,4 +1,4 @@
-output_dir = "/data/glm52-rl/qualifications/glm52-native-pp-async-20260827"
+output_dir = "/data/glm52-rl/qualifications/glm52-native-pp-async"
 max_steps = 2
 dist_timeout_seconds = 5400
 enable_router_replay = false
@@ -32,7 +32,7 @@ pp_schedule = "1f1b_async"
 pp_transfer_sparse_indices = true
 pp_limit_receive_buffers = true
 pp_boundary_plan = "explicit"
-pp_layer_boundaries = [0, 8, 18, 28, 38, 48, 58, 69, 78]
+pp_layer_boundaries = [0, 8, 18, 28, 38, 48, 58, 68, 78]
 cp_style = "ring"
 ep = 8
 global_ep = false

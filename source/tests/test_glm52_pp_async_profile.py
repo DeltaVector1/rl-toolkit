@@ -35,9 +35,7 @@ def test_async_profile_is_isolated_and_full_shape() -> None:
     }
 
     config = _load(PROFILE)
-    assert config["output_dir"].startswith(
-        "/data/glm52-rl/qualifications/glm52-native-pp-async-"
-    )
+    assert config["output_dir"] == "/data/glm52-rl/qualifications/glm52-native-pp-async"
     assert config["max_steps"] == 2
     assert config["data"]["fake"] == {
         "batch_size": 64,
@@ -55,6 +53,7 @@ def test_async_profile_is_isolated_and_full_shape() -> None:
     assert model["pp_schedule"] == "1f1b_async"
     assert model["pp_limit_receive_buffers"] is True
     assert model["pp_transfer_sparse_indices"] is True
+    assert model["pp_layer_boundaries"] == [0, 8, 18, 28, 38, 48, 58, 68, 78]
     assert model["freeze_moe_router"] is True
     assert model["ac"]["keep_routed_expert_activations_from_pp_stage"] == 5
     assert model["quantization"] == {
@@ -104,6 +103,7 @@ def test_async_profile_is_allowlisted_and_validated_before_setup() -> None:
     assert '"glm52-native-pp-async": 2' in training_ops
     assert '"glm52-native-pp-async",' in training_ops
     assert "validate_async_1f1b_topology" in config
+    assert "1f1b_async is only available in the GLM async qualification profile" in train
     assert train.index("config.model.validate_async_1f1b_topology()") < train.index(
         "setup_torch_distributed("
     )
