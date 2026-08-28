@@ -65,7 +65,7 @@ def run_chain(value, upstream, output_splits, input_splits, packed):
         None,
         None,
     )
-    gradient = torch.autograd.grad(output, input_value, upstream)[0]
+    gradient = torch.autograd.grad(output, input_value, upstream.detach().clone())[0]
     return output.detach(), gradient.detach()
 
 
