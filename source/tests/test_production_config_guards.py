@@ -35,6 +35,7 @@ def test_current_glm52_profile_is_batch_2048_without_rollout_cache() -> None:
         "glm52-policy-parity",
         "glm52-native-b2048",
         "glm52-native-stability20",
+        "glm52-production20",
     }
     current = operations["profiles"]["current"]
     assert current == {
@@ -165,6 +166,7 @@ def test_glm52_stability_and_production_use_local_expert_recompute() -> None:
         "configs/qualification/glm52-native-stability20.toml",
         "configs/qualification/glm52-native-b2048.toml",
         "configs/paused/trainer.glm52-production.toml",
+        "configs/paused/trainer.glm52-production20.toml",
     ):
         config = _load(relative)
         assert config.get("env_vars", {}) == {
@@ -218,6 +220,7 @@ def test_glm52_production_profiles_disable_cuda_profiling() -> None:
         "configs/qualification/glm52-native-b2048.toml",
         "configs/qualification/glm52-native-stability20.toml",
         "configs/paused/trainer.glm52-production.toml",
+        "configs/paused/trainer.glm52-production20.toml",
     ):
         env_vars = _load(relative).get("env_vars", {})
         assert not set(profiling_names) & set(env_vars), relative
@@ -230,6 +233,7 @@ def test_all_glm52_trainers_use_h200_w8a8_semantics() -> None:
         "configs/qualification/glm52-native-b2048.toml",
         "configs/qualification/glm52-native-stability20.toml",
         "configs/paused/trainer.glm52-production.toml",
+        "configs/paused/trainer.glm52-production20.toml",
     }
     operations = _load("configs/operations.toml")
     profiles = {
