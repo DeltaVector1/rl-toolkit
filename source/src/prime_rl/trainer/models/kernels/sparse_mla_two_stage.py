@@ -126,6 +126,11 @@ if triton is not None:
         delta_stride_h,
         output_stride_s,
         sm_scale,
+        ATTENTION_HEADS: tl.constexpr,
+        VALUE_WIDTH: tl.constexpr,
+        TOTAL_WIDTH: tl.constexpr,
+        QUERY_ID_MASK: tl.constexpr,
+        LOG2_E: tl.constexpr,
         BLOCK_WIDTH: tl.constexpr,
     ):
         key_id = tl.program_id(0)
@@ -326,6 +331,11 @@ def sparse_mla_dkv_two_stage(
         delta.stride(2),
         output_buffer.stride(0),
         float(sm_scale),
+        ATTENTION_HEADS=ATTENTION_HEADS,
+        VALUE_WIDTH=VALUE_WIDTH,
+        TOTAL_WIDTH=TOTAL_WIDTH,
+        QUERY_ID_MASK=QUERY_ID_MASK,
+        LOG2_E=LOG2_E,
         BLOCK_WIDTH=BLOCK_WIDTH,
         num_warps=4,
         num_stages=1,

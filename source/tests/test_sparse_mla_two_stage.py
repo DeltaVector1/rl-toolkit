@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import pathlib
 import unittest
 
@@ -121,6 +122,57 @@ class SparseMlaTwoStageTest(unittest.TestCase):
         self.assertNotIn("sorted_positions", SOURCE)
         self.assertIn("same-device tensors", SOURCE)
         self.assertIn("@triton.jit", SOURCE)
+
+    def test_triton_kernel_receives_all_global_constants_as_constexpr(self):
+        tree = ast.parse(SOURCE)
+        kernel = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_two_stage_dkv_kernel"
+        )
+        constexpr_names = {
+            arg.arg
+            for arg in kernel.args.args
+            if isinstance(arg.annotation, ast.Attribute)
+            and arg.annotation.attr == "constexpr"
+        }
+        expected = {
+            "ATTENTION_HEADS",
+            "VALUE_WIDTH",
+            "TOTAL_WIDTH",
+            "QUERY_ID_MASK",
+            "LOG2_E",
+            "BLOCK_WIDTH",
+        }
+        self.assertTrue(expected <= constexpr_names)
+
+        launch = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Subscript)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "_two_stage_dkv_kernel"
+        )
+        launch_constants = {keyword.arg for keyword in launch.keywords}
+        self.assertTrue(expected <= launch_constants)
+
+        module_constants = {
+            "ATTENTION_HEADS",
+            "VALUE_WIDTH",
+            "TOTAL_WIDTH",
+            "QUERY_ID_MASK",
+            "LOG2_E",
+        }
+        global_references = {
+            node.id
+            for node in ast.walk(kernel)
+            if isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
+            and node.id in module_constants
+        }
+        self.assertTrue(global_references <= constexpr_names)
 
 
 if __name__ == "__main__":
