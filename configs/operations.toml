@@ -37,6 +37,7 @@ orchestrator = "glm52-optims-orchestrator"
 environment = "glm52-optims-env-train"
 glm52_inference = "glm52-optims-h200"
 glm52_adapter_server = "glm52-optims-adapter-gzip"
+glm52_pp_async_cuda_smoke = "glm52-pp-async-cuda-smoke"
 muse_inference = "muse-glimmer-h200"
 glm52_model_volume = "glm52-fp8-model"
 
@@ -107,6 +108,15 @@ trainer = "configs/qualification/glm52-native-stability20.toml"
 [profiles.glm52-native-pp-async]
 kind = "glm52"
 trainer = "configs/qualification/glm52-native-pp-async.toml"
+
+[qualification.glm52_pp_async_cuda]
+kind = "glm52"
+host = "n82"
+container = "glm52_pp_async_cuda_smoke"
+script = "source/tests/test_pp_async_cuda.py"
+output_root = "/data/glm52-rl/qualifications/glm52-pp-async-cuda-smoke"
+steps = 2
+gpus = 8
 
 [reward]
 minimum_steps = 10

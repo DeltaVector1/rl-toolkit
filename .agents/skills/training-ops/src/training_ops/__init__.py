@@ -71,6 +71,7 @@ glm_parity_stage_outer_timeout = (
 )
 parity_trace_root = "/data/glm52-rl/qualifications/glm52-policy-parity/trainer-traces"
 parity_token_root = "/data/glm52-rl/qualifications/glm52-policy-parity/trainer/token_exports"
+_PP_ASYNC_CUDA_PROFILE = "glm52-pp-async-cuda-smoke"
 
 trainer_head = hosts["trainer_head"]
 trainer_ssh = hosts["trainer_ssh"]
@@ -7572,6 +7573,7 @@ def _repair_supervisors() -> str:
 
 _QUALIFICATION_ONLY_MOUNTS = {
     _CUDA_MEMORY_CAPTURE_PROFILE: frozenset({"source/tests/test_final_pp16_cuda.py"}),
+    _PP_ASYNC_CUDA_PROFILE: frozenset({"source/tests/test_pp_async_cuda.py"}),
 }
 
 
@@ -10026,9 +10028,11 @@ def _mounted_on(path: str, host: str, profile_name: str | None = None) -> bool:
         scripts = (repo_root / "scripts" / "china" / "cluster.sh",)
     if any(path in _mounts_in(script) for script in scripts):
         return True
-    return host in trainer_hosts and path in _QUALIFICATION_ONLY_MOUNTS.get(
-        profile_name, ()
-    )
+    if path not in _QUALIFICATION_ONLY_MOUNTS.get(profile_name, ()):
+        return False
+    if profile_name == _PP_ASYNC_CUDA_PROFILE:
+        return host == trainer_head
+    return host in trainer_hosts
 
 
 def deploy(
@@ -10165,6 +10169,170 @@ def deploy(
                 "This runs on the host. Restart the process only if it is a long-running loop."
             )
     return not bad
+
+
+def qualify_glm52_pp_async_cuda() -> dict[str, object]:
+    """Run the fixed two-step PP8 CUDA smoke check on the trainer head."""
+    profile = operations.get("qualification", {}).get("glm52_pp_async_cuda")
+    expected = {
+        "kind": "glm52",
+        "host": "n82",
+        "container": "glm52_pp_async_cuda_smoke",
+        "script": "source/tests/test_pp_async_cuda.py",
+        "output_root": "/data/glm52-rl/qualifications/glm52-pp-async-cuda-smoke",
+        "steps": 2,
+        "gpus": 8,
+    }
+    if not isinstance(profile, dict) or profile != expected or trainer_head != "n82":
+        raise Refused("the PP async CUDA profile must remain fixed to n82 and eight GPUs")
+    host = profile["host"]
+    if host in blocked_hosts or host != trainer_head:
+        raise Refused("the PP async CUDA host is not the configured trainer head")
+    container_key = profile["container"]
+    container = containers.get(container_key)
+    if not isinstance(container, str) or not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9_.-]*", container
+    ):
+        raise Refused("the PP async CUDA container is not configured")
+    if container in {trainer_container, protected_trainer}:
+        raise Refused("the PP async CUDA container is not isolated")
+
+    _assert_live_services_are_down([host], include_inference=False)
+    code, output = _ssh(
+        host,
+        "gpu_count=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l); "
+        "pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits "
+        "2>/dev/null | grep -E '^[0-9]+$' | paste -sd, - || true); "
+        f"active=$(sudo docker ps --format '{{{{.Names}}}}' | "
+        f"grep -E '^({re.escape(trainer_container)}|{re.escape(container)})$' | "
+        "paste -sd, - || true); "
+        "printf 'GPUS %s\nPIDS %s\nACTIVE %s\n' \"$gpu_count\" \"$pids\" \"$active\"",
+        timeout=60,
+    )
+    if code:
+        raise RuntimeError(f"cannot inspect n82 for the PP async CUDA check: {output.strip()}")
+    state = _kv(output)
+    if state.get("GPUS") != "8":
+        raise Refused(f"the PP async CUDA check requires eight GPUs, got {state.get('GPUS', '?')}")
+    if state.get("PIDS") or state.get("ACTIVE"):
+        raise Refused("n82 GPUs are in use; the PP async CUDA check did not start")
+
+    source_paths = (
+        profile["script"],
+        "source/src/prime_rl/trainer/distributed/async_schedule.py",
+        "source/src/prime_rl/trainer/distributed/pp_runner.py",
+    )
+    for path in source_paths:
+        if not deploy(
+            path,
+            nodes=[host],
+            repository="glm52-qualification",
+            profile_name=_PP_ASYNC_CUDA_PROFILE,
+        ):
+            raise RuntimeError(f"failed to deploy {path} to {host}")
+
+    repository = _repository_root("glm52-qualification")
+    session = secrets.token_hex(8)
+    output_dir = f"{profile['output_root']}/{session}"
+    result_path = f"{output_dir}/result.json"
+    script_path = f"{repository}/{profile['script']}"
+    async_path = (
+        f"{repository}/source/src/prime_rl/trainer/distributed/async_schedule.py"
+    )
+    runner_path = f"{repository}/source/src/prime_rl/trainer/distributed/pp_runner.py"
+    inner = "torchrun --standalone --nproc-per-node=8 /qualification/test_pp_async_cuda.py"
+    command = (
+        "set -euo pipefail; "
+        f"sudo install -d -o 1000 -g 1000 -m 0755 {shlex.quote(output_dir)}; "
+        f"sudo docker run --rm --name {shlex.quote(container)} --gpus all "
+        "--ipc host --network none --read-only --cap-drop ALL "
+        "--security-opt no-new-privileges --pids-limit 1024 "
+        "--tmpfs /tmp:rw,nosuid,nodev,size=1g "
+        f"-v {shlex.quote(script_path)}:/qualification/test_pp_async_cuda.py:ro "
+        f"-v {shlex.quote(async_path)}:/app/src/prime_rl/trainer/distributed/async_schedule.py:ro "
+        f"-v {shlex.quote(runner_path)}:/app/src/prime_rl/trainer/distributed/pp_runner.py:ro "
+        f"-v {shlex.quote(output_dir)}:/output:rw "
+        "-e PYTHONPATH=/app/src -e NCCL_ASYNC_ERROR_HANDLING=1 "
+        f"--entrypoint /bin/bash {shlex.quote(trainer_image)} -lc {shlex.quote(inner)}; "
+        f"test -s {shlex.quote(result_path)}; cat {shlex.quote(result_path)}"
+    )
+    _session_deadline, startup_deadline, _step_deadline, _finalize_deadline = (
+        _glm_b2048_deadlines()
+    )
+    code, output = _ssh(host, command, timeout=startup_deadline)
+    if code:
+        raise RuntimeError(
+            "PP async CUDA qualification failed: "
+            + (output.strip()[-2000:] or f"ssh exit {code}")
+        )
+    try:
+        result = json.loads(output.strip().splitlines()[-1])
+    except (IndexError, json.JSONDecodeError) as error:
+        raise RuntimeError("PP async CUDA qualification returned no result") from error
+    expected_hashes = {
+        "test_sha256": hashlib.sha256((repo_root / source_paths[0]).read_bytes()).hexdigest(),
+        "async_schedule_sha256": hashlib.sha256(
+            (repo_root / source_paths[1]).read_bytes()
+        ).hexdigest(),
+        "pp_runner_sha256": hashlib.sha256(
+            (repo_root / source_paths[2]).read_bytes()
+        ).hexdigest(),
+    }
+    if (
+        result.get("status") != "pass"
+        or result.get("ranks") != 8
+        or result.get("steps") != 2
+        or result.get("microbatches") != 8
+        or result.get("action_loss_grad_update_parity") is not True
+        or result.get("all_async_nccl_work_drained") is not True
+        or any(result.get(key) != value for key, value in expected_hashes.items())
+    ):
+        raise RuntimeError("PP async CUDA qualification result failed validation")
+    reports = result.get("rank_reports")
+    if not isinstance(reports, list) or len(reports) != 8:
+        raise RuntimeError("PP async CUDA qualification has incomplete rank reports")
+    if sorted(
+        report.get("rank") for report in reports if isinstance(report, dict)
+    ) != list(range(8)):
+        raise RuntimeError("PP async CUDA qualification has invalid rank reports")
+    for report in reports:
+        for mode in ("baseline", "async"):
+            mode_report = report.get(mode) if isinstance(report, dict) else None
+            mode_steps = mode_report.get("steps") if isinstance(mode_report, dict) else None
+            if (
+                not isinstance(mode_steps, list)
+                or len(mode_steps) != 2
+                or any(
+                    not isinstance(item, dict)
+                    or not isinstance(item.get("cuda_ms"), (int, float))
+                    or item["cuda_ms"] <= 0
+                    for item in mode_steps
+                )
+                or not isinstance(mode_report, dict)
+                or not isinstance(mode_report.get("peak_memory_bytes_max"), int)
+                or mode_report["peak_memory_bytes_max"] < 0
+            ):
+                raise RuntimeError("PP async CUDA qualification has invalid measurements")
+    result["output_dir"] = output_dir
+    summary = {
+        "status": "pass",
+        "steps": 2,
+        "ranks": 8,
+        "baseline_cuda_ms_max": max(
+            step["cuda_ms"] for report in reports for step in report["baseline"]["steps"]
+        ),
+        "async_cuda_ms_max": max(
+            step["cuda_ms"] for report in reports for step in report["async"]["steps"]
+        ),
+        "peak_memory_bytes_max": max(
+            report[mode]["peak_memory_bytes_max"]
+            for report in reports
+            for mode in ("baseline", "async")
+        ),
+        "output_dir": output_dir,
+    }
+    print("PP async CUDA qualification passed: " + json.dumps(summary, sort_keys=True))
+    return result
 
 
 def _copy_resume_adapter(path: str, nodes: list[str]) -> None:
@@ -13450,6 +13618,12 @@ def _cleanup_glm52_parity_engine_action(arguments: list[str]):
     return cleanup_glm52_policy_parity_engine()
 
 
+def _qualify_glm52_pp_async_cuda_action(arguments: list[str]):
+    if arguments:
+        raise Refused("qualify-glm52-pp-async-cuda takes no arguments")
+    return qualify_glm52_pp_async_cuda()
+
+
 actions = {
     "status": lambda a: status(*a),
     "acceptance": lambda a: acceptance(*a),
@@ -13467,6 +13641,7 @@ actions = {
     "start": _start_action,
     "archive": _archive_action,
     "qualify": lambda a: qualify(*a),
+    "qualify-glm52-pp-async-cuda": _qualify_glm52_pp_async_cuda_action,
     "stage-glm52-parity": lambda a: stage_glm52_policy_parity(a or None),
     "collect-glm52-parity": lambda a: collect_glm52_policy_parity(a[0] if a else ""),
     "qualify-glm52-step20-parity": _qualify_glm52_step20_parity_action,
@@ -13507,6 +13682,7 @@ usage = f"""training-ops <action> [args]
   archive <run> [step ...]      upload stable old LoRA adapters
                                 add --finished after another run is active
   qualify <profile>             start a trainer-only profile
+  qualify-glm52-pp-async-cuda  run fixed two-step PP8 CUDA parity on n82
   qualify-glm52-step20-parity  score fixed parity tokens with the step-20 adapter
   stage-glm52-step20-adapter   copy the exact step-20 adapter to H200
   stage-glm52-parity [node ...] validate and stage the exact parity reference

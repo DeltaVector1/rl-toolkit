@@ -1,6 +1,10 @@
 """Checks for the isolated full-shape asynchronous PP qualification."""
 
 import ast
+import hashlib
+import importlib.util
+import json
+import sys
 import tomllib
 from pathlib import Path
 from types import SimpleNamespace
@@ -139,3 +143,98 @@ def test_async_topology_runtime_uses_model_checkpoint_config() -> None:
     )
     assert topology["cutoff"] == 5
     assert topology["pp"] == topology["cp"] == topology["ep"] == 8
+
+
+def test_cuda_smoke_profile_is_small_and_n82_only() -> None:
+    operations = _load("configs/operations.toml")
+    assert operations["qualification"]["glm52_pp_async_cuda"] == {
+        "kind": "glm52",
+        "host": "n82",
+        "container": "glm52_pp_async_cuda_smoke",
+        "script": "source/tests/test_pp_async_cuda.py",
+        "output_root": "/data/glm52-rl/qualifications/glm52-pp-async-cuda-smoke",
+        "steps": 2,
+        "gpus": 8,
+    }
+    script = (ROOT / "source/tests/test_pp_async_cuda.py").read_text()
+    assert "stages = 8" in script
+    assert "microbatches = 8" in script
+    assert "steps = 2" in script
+    assert "Schedule1F1BAsync" not in script
+    assert 'run_mode("1f1b"' in script
+    assert 'run_mode("1f1b_async"' in script
+    assert "model-fp8" not in script
+    assert "/data/ZiphuAI" not in script
+
+
+def test_cuda_smoke_command_is_fail_closed_and_has_no_model_mount() -> None:
+    module_path = ROOT / ".agents/skills/training-ops/src/training_ops/__init__.py"
+    spec = importlib.util.spec_from_file_location("training_ops_pp_async_smoke", module_path)
+    assert spec is not None and spec.loader is not None
+    training_ops = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = training_ops
+    spec.loader.exec_module(training_ops)
+
+    smoke = "glm52-pp-async-cuda-smoke"
+    test_path = "source/tests/test_pp_async_cuda.py"
+    assert training_ops._mounted_on(test_path, "n82", profile_name=smoke)
+    assert not training_ops._mounted_on(test_path, "n76", profile_name=smoke)
+    assert not training_ops._mounted_on(test_path, "n82")
+
+    source_paths = (
+        test_path,
+        "source/src/prime_rl/trainer/distributed/async_schedule.py",
+        "source/src/prime_rl/trainer/distributed/pp_runner.py",
+    )
+    hashes = {
+        "test_sha256": hashlib.sha256((ROOT / source_paths[0]).read_bytes()).hexdigest(),
+        "async_schedule_sha256": hashlib.sha256(
+            (ROOT / source_paths[1]).read_bytes()
+        ).hexdigest(),
+        "pp_runner_sha256": hashlib.sha256((ROOT / source_paths[2]).read_bytes()).hexdigest(),
+    }
+    mode = {
+        "steps": [{"cuda_ms": 1.0}, {"cuda_ms": 1.0}],
+        "peak_memory_bytes_max": 1,
+        "all_async_nccl_work_drained": True,
+    }
+    result = {
+        "status": "pass",
+        "ranks": 8,
+        "steps": 2,
+        "microbatches": 8,
+        "action_loss_grad_update_parity": True,
+        "all_async_nccl_work_drained": True,
+        "rank_reports": [
+            {"rank": rank, "baseline": mode, "async": mode} for rank in range(8)
+        ],
+        **hashes,
+    }
+    calls = []
+
+    def fake_ssh(host, command, timeout=120, **_kwargs):
+        calls.append((host, command, timeout))
+        if len(calls) == 1:
+            return 0, "GPUS 8\nPIDS\nACTIVE\n"
+        return 0, json.dumps(result)
+
+    deployed = []
+    training_ops._assert_live_services_are_down = lambda nodes, include_inference: (
+        nodes == ["n82"] and include_inference is False
+    ) or (_ for _ in ()).throw(AssertionError("unsafe live-service scope"))
+    training_ops._ssh = fake_ssh
+    training_ops.deploy = lambda path, **kwargs: deployed.append((path, kwargs)) or True
+    training_ops.secrets.token_hex = lambda _size: "0123456789abcdef"
+
+    report = training_ops.qualify_glm52_pp_async_cuda()
+    assert report["status"] == "pass"
+    assert [item[0] for item in deployed] == list(source_paths)
+    assert all(item[1]["nodes"] == ["n82"] for item in deployed)
+    assert all(host == "n82" for host, _command, _timeout in calls)
+    launch = calls[-1][1]
+    assert "--nproc-per-node=8" in launch
+    assert "--network none" in launch
+    assert "--read-only" in launch
+    assert "/models" not in launch
+    assert "/data/ZiphuAI" not in launch
+    assert "training.env" not in launch

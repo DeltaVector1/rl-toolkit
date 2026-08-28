@@ -59,6 +59,7 @@ process.
 training_ops.deploy("source/path.py")
 training_ops.start("muse19", profile="current")
 training_ops.qualify("muse-qualification")
+training_ops.qualify_glm52_pp_async_cuda()
 training_ops.repair("tunnels")
 training_ops.repair("engine:h200a")
 training_ops.repair("supervisors")
