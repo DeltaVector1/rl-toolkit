@@ -119,3 +119,75 @@ def test_grouped_schedule_is_not_the_production_default():
     assert _load("configs/qualification/glm52-native-b2048.toml")["model"][
         "pp_schedule"
     ] == "1f1b"
+
+
+def test_grouped_lora_profile_only_adds_gpu_proven_qkv_a_fusion():
+    operations = _load("configs/operations.toml")
+    profile = operations["profiles"]["glm52-native-pp-grouped-lora"]
+    assert profile == {
+        "kind": "glm52",
+        "trainer_container": "glm52_qualification_trainer",
+        "trainer": "configs/qualification/glm52-native-pp-grouped-lora.toml",
+        "launch_env": {
+            "PRIME_PHASE_PROFILE_RECORD_PATH": (
+                "/data/glm52-rl/qualifications/glm52-native-pp-grouped-lora/"
+                "phase-profile.json"
+            )
+        },
+    }
+    grouped = _load("configs/qualification/glm52-native-pp-grouped.toml")
+    fused = _load(profile["trainer"])
+    assert fused["output_dir"] == (
+        "/data/glm52-rl/qualifications/glm52-native-pp-grouped-lora"
+    )
+    assert fused["max_steps"] == grouped["max_steps"] == 2
+    assert fused["data"] == grouped["data"]
+    assert {
+        key: value for key, value in fused["model"].items() if key != "lora"
+    } == {
+        key: value for key, value in grouped["model"].items() if key != "lora"
+    }
+    assert fused["model"]["lora"] == (
+        grouped["model"]["lora"] | {"fused_qkv_a_lora": True}
+    )
+    assert fused["model"]["lora"]["fused_qkv_a_lora"] is True
+    assert fused["model"]["pp"] == fused["model"]["cp"] == fused["model"]["ep"] == 8
+    assert fused["model"]["pp_schedule"] == "1f1b_async"
+    assert "rollout_cache" not in fused["data"]
+
+
+def test_native_b2048_lora_profile_keeps_plain_pipeline_schedule():
+    operations = _load("configs/operations.toml")
+    profile = operations["profiles"]["glm52-native-b2048-lora"]
+    assert profile == {
+        "kind": "glm52",
+        "trainer_container": "glm52_qualification_trainer",
+        "trainer": "configs/qualification/glm52-native-b2048-lora.toml",
+        "launch_env": {
+            "PRIME_PHASE_PROFILE_RECORD_PATH": (
+                "/data/glm52-rl/qualifications/glm52-native-b2048-lora/"
+                "phase-profile.json"
+            )
+        },
+    }
+    baseline = _load("configs/qualification/glm52-native-b2048.toml")
+    fused = _load(profile["trainer"])
+    assert fused["output_dir"] == (
+        "/data/glm52-rl/qualifications/glm52-native-b2048-lora"
+    )
+    assert {
+        key: value for key, value in fused.items() if key != "output_dir"
+    } != {
+        key: value for key, value in baseline.items() if key != "output_dir"
+    }
+    assert fused["model"]["pp_schedule"] == "1f1b"
+    assert {
+        key: value for key, value in fused["model"].items() if key != "lora"
+    } == {
+        key: value for key, value in baseline["model"].items() if key != "lora"
+    }
+    assert fused["model"]["lora"] == (
+        baseline["model"]["lora"] | {"fused_qkv_a_lora": True}
+    )
+    assert fused["model"]["pp"] == fused["model"]["cp"] == fused["model"]["ep"] == 8
+    assert "rollout_cache" not in fused["data"]

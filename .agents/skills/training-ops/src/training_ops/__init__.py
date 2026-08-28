@@ -394,7 +394,8 @@ _QUALIFICATION_LAUNCH_ENV_PATTERNS = {
     ),
     "PRIME_PHASE_PROFILE_RECORD_PATH": re.compile(
         r"/data/glm52-rl/qualifications/"
-        r"(?:glm52-native-b2048-nsys-[0-9]{8}|glm52-native-pp-grouped)/"
+        r"(?:glm52-native-b2048-nsys-[0-9]{8}|glm52-native-b2048-lora|"
+        r"glm52-native-pp-grouped(?:-lora)?)/"
         r"phase-profile\.json"
     ),
     "PRIME_BF16_COMBINE_ROUNDS": re.compile(r"8"),
@@ -8522,11 +8523,13 @@ def _validate_trainer_qualification(
     )
     expected_step_counts = {
         "glm52-native-b2048": 2,
+        "glm52-native-b2048-lora": 2,
         "glm52-native-b2048-memory": 2,
         "glm52-native-b2048-nsys": 2,
         "glm52-native-delta3": 3,
         "glm52-native-pp-async": 2,
         "glm52-native-pp-grouped": 2,
+        "glm52-native-pp-grouped-lora": 2,
         "glm52-native-stability20": 20,
     }
     if profile_name not in expected_step_counts:
@@ -8564,10 +8567,12 @@ def _validate_trainer_qualification(
         failures.append("qualification session schema is invalid")
     if profile_name in {
         "glm52-native-b2048",
+        "glm52-native-b2048-lora",
         "glm52-native-b2048-memory",
         "glm52-native-b2048-nsys",
         "glm52-native-pp-async",
         "glm52-native-pp-grouped",
+        "glm52-native-pp-grouped-lora",
     }:
         session_deadline, startup_deadline, step_deadline, profiler_deadline = (
             _glm_b2048_deadlines()
@@ -8642,6 +8647,14 @@ def _validate_trainer_qualification(
         or set(lora.get("targets", [])) != expected_targets
     ):
         failures.append("qualification LoRA coverage differs")
+    if (
+        profile_name in {
+            "glm52-native-b2048-lora",
+            "glm52-native-pp-grouped-lora",
+        }
+        and profile.get("model", {}).get("lora", {}).get("fused_qkv_a_lora") is not True
+    ):
+        failures.append("qualification LoRA fusion is not enabled")
     if profile.get("optim", {}).get("lr") != 8e-6 or result.get("max_steps") != expected_steps:
         failures.append("qualification learning rate or step count differs")
     expected_metrics_path = str(
@@ -11612,10 +11625,12 @@ def _prepare_trainer_qualification_session(
     deadline_values = None
     if profile in {
         "glm52-native-b2048",
+        "glm52-native-b2048-lora",
         "glm52-native-b2048-memory",
         "glm52-native-b2048-nsys",
         "glm52-native-pp-async",
         "glm52-native-pp-grouped",
+        "glm52-native-pp-grouped-lora",
     }:
         session_deadline, startup_deadline, step_deadline, profiler_deadline = (
             _glm_b2048_deadlines()
@@ -11839,11 +11854,13 @@ def _qualify_connected(
     )
     strict_qualification = name in {
         "glm52-native-b2048",
+        "glm52-native-b2048-lora",
         "glm52-native-b2048-memory",
         "glm52-native-b2048-nsys",
         "glm52-native-delta3",
         "glm52-native-pp-async",
         "glm52-native-pp-grouped",
+        "glm52-native-pp-grouped-lora",
         "glm52-native-stability20",
     }
     if strict_qualification and nodes != [trainer_head] + [
@@ -12137,10 +12154,12 @@ print(json.dumps({
             }
             if name in {
                 "glm52-native-b2048",
+                "glm52-native-b2048-lora",
                 "glm52-native-b2048-memory",
                 "glm52-native-b2048-nsys",
                 "glm52-native-pp-async",
                 "glm52-native-pp-grouped",
+                "glm52-native-pp-grouped-lora",
             }:
                 session_deadline, startup_deadline, step_deadline, profiler_deadline = (
                     _glm_b2048_deadlines()

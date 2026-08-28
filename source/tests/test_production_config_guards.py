@@ -34,11 +34,13 @@ def test_current_glm52_profile_is_batch_2048_without_rollout_cache() -> None:
         "glm52-native-small",
         "glm52-policy-parity",
         "glm52-native-b2048",
+        "glm52-native-b2048-lora",
         "glm52-native-b2048-memory",
         "glm52-native-b2048-nsys",
         "glm52-native-delta3",
         "glm52-native-pp-async",
         "glm52-native-pp-grouped",
+        "glm52-native-pp-grouped-lora",
         "glm52-native-stability20",
     }
     current = operations["profiles"]["current"]
@@ -170,11 +172,12 @@ def test_glm52_stability_and_production_use_local_expert_recompute() -> None:
     for relative in (
         "configs/qualification/glm52-native-stability20.toml",
         "configs/qualification/glm52-native-b2048.toml",
+        "configs/qualification/glm52-native-b2048-lora.toml",
         "configs/paused/trainer.glm52-production.toml",
     ):
         config = _load(relative)
         expected_env = {"PRIME_LORA_MM_PROFILE": "sm89-r32"}
-        if relative.endswith("native-b2048.toml"):
+        if relative.endswith(("native-b2048.toml", "native-b2048-lora.toml")):
             expected_env.update(
                 {
                     "PRIME_PHASE_PROFILE": "1",
@@ -240,6 +243,7 @@ def test_glm52_b2048_qualification_uses_plain_physical_layout() -> None:
     expected = [0, 8, 18, 28, 38, 48, 58, 68, 78]
     for relative in (
         "configs/qualification/glm52-native-b2048.toml",
+        "configs/qualification/glm52-native-b2048-lora.toml",
         "configs/qualification/glm52-native-b2048-memory.toml",
         "configs/qualification/glm52-native-b2048-nsys.toml",
     ):
@@ -331,6 +335,7 @@ def test_glm52_production_profiles_disable_cuda_profiling() -> None:
     for relative in (
         "configs/qualification/glm52-policy-parity-trainer.toml",
         "configs/qualification/glm52-native-b2048.toml",
+        "configs/qualification/glm52-native-b2048-lora.toml",
         "configs/qualification/glm52-native-stability20.toml",
         "configs/paused/trainer.glm52-production.toml",
     ):
@@ -350,11 +355,13 @@ def test_all_glm52_trainers_use_h200_w8a8_semantics() -> None:
         "configs/qualification/glm52-policy-parity-trainer.toml",
         "configs/qualification/glm52-native-small.toml",
         "configs/qualification/glm52-native-b2048.toml",
+        "configs/qualification/glm52-native-b2048-lora.toml",
         "configs/qualification/glm52-native-b2048-memory.toml",
         "configs/qualification/glm52-native-b2048-nsys.toml",
         "configs/qualification/glm52-native-delta3.toml",
         "configs/qualification/glm52-native-pp-async.toml",
         "configs/qualification/glm52-native-pp-grouped.toml",
+        "configs/qualification/glm52-native-pp-grouped-lora.toml",
         "configs/qualification/glm52-native-stability20.toml",
         "configs/paused/trainer.glm52-production.toml",
     }
