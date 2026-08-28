@@ -125,6 +125,53 @@ class AffineStage(nn.Module):
         self.is_last = stage_index == stages - 1
         self.scale = nn.Parameter(torch.tensor(1.0 + stage_index * 0.01))
         self.bias = nn.Parameter(torch.tensor(stage_index * 0.001))
+        self._active_microbatch: int | None = None
+        self._microbatch_step: int | None = None
+        self._microbatch_records: list[dict[str, object]] = []
+        self._current_record: dict[str, object] | None = None
+
+    def begin_microbatch_step(self, step: int) -> None:
+        if self._active_microbatch is not None or self._current_record is not None:
+            raise AssertionError("the previous dummy microbatch step is still active")
+        if step != len(self._microbatch_records):
+            raise AssertionError(f"unexpected dummy step {step}")
+        self._microbatch_step = int(step)
+        self._current_record = {"step": int(step), "set": [], "clear": []}
+
+    def set_active_microbatch(self, microbatch_id: int) -> None:
+        if self._current_record is None or self._microbatch_step is None:
+            raise AssertionError("the dummy microbatch step was not started")
+        if self._active_microbatch is not None:
+            raise AssertionError(
+                f"dummy stage {self.stage_identity} already has active microbatch "
+                f"{self._active_microbatch}"
+            )
+        microbatch_id = int(microbatch_id)
+        seen = self._current_record["set"]
+        if not 0 <= microbatch_id < microbatches or microbatch_id in seen:
+            raise AssertionError(f"invalid dummy microbatch {microbatch_id}")
+        self._active_microbatch = microbatch_id
+        seen.append(microbatch_id)
+
+    def clear_active_microbatch(self) -> None:
+        if self._current_record is None or self._active_microbatch is None:
+            raise AssertionError("the dummy stage has no active microbatch")
+        self._current_record["clear"].append(self._active_microbatch)
+        self._active_microbatch = None
+
+    def assert_microbatch_step_complete(self) -> None:
+        if self._current_record is None or self._microbatch_step is None:
+            raise AssertionError("the dummy microbatch step was not started")
+        expected = list(range(microbatches))
+        if self._active_microbatch is not None:
+            raise AssertionError("the dummy stage still has an active microbatch")
+        if sorted(self._current_record["set"]) != expected:
+            raise AssertionError("the dummy stage did not set every microbatch")
+        if self._current_record["clear"] != self._current_record["set"]:
+            raise AssertionError("the dummy stage did not clear every microbatch")
+        self._microbatch_records.append(self._current_record)
+        self._current_record = None
+        self._microbatch_step = None
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         output = hidden * self.scale + self.bias
@@ -304,6 +351,7 @@ def run_mode(mode: str, rank: int, device: torch.device, journal: RankJournal) -
     for step in range(steps):
         journal.step = step
         journal.write("step_before")
+        module.begin_microbatch_step(step)
         optimizer.zero_grad(set_to_none=True)
         inputs = fixed_input(step, device)
         losses = [] if module.is_last else None
@@ -324,6 +372,7 @@ def run_mode(mode: str, rank: int, device: torch.device, journal: RankJournal) -
             else:
                 schedule.step(return_outputs=False)
         journal.write("step_schedule_after")
+        module.assert_microbatch_step_complete()
         end.record()
         end.synchronize()
 
@@ -351,6 +400,7 @@ def run_mode(mode: str, rank: int, device: torch.device, journal: RankJournal) -
             "scale_grad": float(module.scale.grad),
             "bias_grad": float(module.bias.grad),
             "cuda_ms": start.elapsed_time(end),
+            "microbatch_lifecycle": module._microbatch_records[-1],
         }
         optimizer.step()
         report["scale_after_update"] = float(module.scale)
@@ -388,6 +438,7 @@ def assert_parity(baseline: dict, candidate: dict) -> None:
             "bias_grad",
             "scale_after_update",
             "bias_after_update",
+            "microbatch_lifecycle",
         ):
             if old[field] != new[field]:
                 raise AssertionError(f"{field} differs at step {old['step']}")

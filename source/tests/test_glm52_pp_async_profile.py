@@ -219,6 +219,98 @@ def test_cuda_smoke_profile_is_small_and_n82_only() -> None:
     assert 'dist.init_process_group("nccl")' not in script
 
 
+def _new_cuda_dummy_stage():
+    path = ROOT / "source/tests/test_pp_async_cuda.py"
+    tree = ast.parse(path.read_text())
+    stage = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "AffineStage"
+    )
+    names = {
+        "begin_microbatch_step",
+        "set_active_microbatch",
+        "clear_active_microbatch",
+        "assert_microbatch_step_complete",
+    }
+    contract = ast.ClassDef(
+        name="AffineStageContract",
+        bases=[],
+        keywords=[],
+        decorator_list=[],
+        body=[
+            node
+            for node in stage.body
+            if isinstance(node, ast.FunctionDef) and node.name in names
+        ],
+    )
+    namespace = {"microbatches": 8}
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=[contract], type_ignores=[])),
+            str(path),
+            "exec",
+        ),
+        namespace,
+    )
+    dummy = namespace["AffineStageContract"]()
+    dummy.stage_identity = 0
+    dummy._active_microbatch = None
+    dummy._microbatch_step = None
+    dummy._microbatch_records = []
+    dummy._current_record = None
+    return dummy
+
+
+def test_cuda_dummy_implements_the_pipeline_runner_microbatch_interface() -> None:
+    runner = ast.parse(
+        (ROOT / "source/src/prime_rl/trainer/distributed/pp_runner.py").read_text()
+    )
+    factory = next(
+        node
+        for node in runner.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_keyed_pipeline_stage_cls"
+    )
+    keyed_stage = next(
+        node
+        for node in factory.body
+        if isinstance(node, ast.ClassDef) and node.name == "KeyedPipelineStage"
+    )
+    consumers = {
+        node.func.attr
+        for node in ast.walk(keyed_stage)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Attribute)
+        and isinstance(node.func.value.value, ast.Name)
+        and node.func.value.value.id == "self"
+        and node.func.value.attr == "submod"
+    }
+    assert consumers == {"set_active_microbatch", "clear_active_microbatch"}
+    dummy = _new_cuda_dummy_stage()
+    assert dummy._active_microbatch is None
+    assert all(callable(getattr(dummy, method)) for method in consumers)
+
+
+def test_cuda_dummy_resets_microbatch_state_across_two_steps() -> None:
+    dummy = _new_cuda_dummy_stage()
+    for step in range(2):
+        dummy.begin_microbatch_step(step)
+        for microbatch in range(8):
+            dummy.set_active_microbatch(microbatch)
+            assert dummy._active_microbatch == microbatch
+            dummy.clear_active_microbatch()
+        dummy.assert_microbatch_step_complete()
+        assert dummy._active_microbatch is None
+        assert dummy._microbatch_step is None
+        assert dummy._current_record is None
+    assert dummy._microbatch_records == [
+        {"step": step, "set": list(range(8)), "clear": list(range(8))}
+        for step in range(2)
+    ]
+
+
 def test_cuda_smoke_journal_is_bounded_and_fsynced() -> None:
     path = ROOT / "source/tests/test_pp_async_cuda.py"
     tree = ast.parse(path.read_text())
@@ -569,7 +661,9 @@ def test_exited_trainer_is_allowed_and_cuda_command_is_fail_closed() -> None:
     assert "--network host" in launch
     assert "--network none" not in launch
     assert "--hostname localhost" not in launch
-    for key, value in training_ops.operations["transport"]["glm52_trainer"]["env"].items():
+    for key, value in training_ops.operations["transport"]["glm52_trainer"][
+        "env"
+    ].items():
         assert f"-e {key}={value}" in launch
     assert "-e PRIME_PROCESS_GROUP_TIMEOUT_SECONDS=240" in launch
     assert "-e PRIME_PROCESS_GROUP_DEVICE_ID=local_rank" in launch
