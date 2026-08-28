@@ -23,8 +23,13 @@ TOTAL_WIDTH = VALUE_WIDTH + ROPE_WIDTH
 GROUPS = 1
 TOPK = 2048
 BLOCK_WIDTH = 1024
-ROUTE_BYTES_PER_ENTRY = 29
-ROUTE_FILTER_BYTES_PER_ENTRY = 13
+QUERY_ID_BITS = 12
+QUERY_ID_MASK = QUERY_TOKENS - 1
+PACKED_ROUTE_BYTES = 4
+ROUTE_ORDER_BYTES = 8
+ARGSORT_SCRATCH_BYTES = 8
+ROUTE_BYTES_PER_ENTRY = PACKED_ROUTE_BYTES + ROUTE_ORDER_BYTES + ARGSORT_SCRATCH_BYTES
+ROUTE_FILTER_BYTES_PER_ENTRY = 4 + 1 + 4 + 4 + 4
 MAX_WORKSPACE_BYTES = 256 * 1024 * 1024
 LOG2_E = 1.4426950408889634
 
@@ -35,6 +40,7 @@ class TwoStageMemory:
     route_filter_bytes: int
     route_sort_bytes: int
     reduction_bytes: int
+    output_pair_bytes: int
     total_bytes: int
 
 
@@ -45,26 +51,30 @@ def two_stage_memory(
 ) -> TwoStageMemory:
     """Return the conservative peak workspace bound in bytes.
 
-    The sort ledger includes keys, positions, stable-sort order, sort scratch,
-    and sorted positions.  Reduction includes route positions, offsets, and
-    the FP32/BF16 output pair.
+    The sort ledger includes packed routes, sort order, and stable-sort
+    scratch.  The output buffer exists during sorting in production.
     """
 
     if sequence_kv < 1 or route_count < 0:
         raise ValueError("two-stage memory dimensions must be non-negative")
     route_filter_bytes = route_count * ROUTE_FILTER_BYTES_PER_ENTRY
     route_sort_bytes = route_count * ROUTE_BYTES_PER_ENTRY
+    fp32_output_bytes = sequence_kv * TOTAL_WIDTH * 4
+    output_pair_bytes = sequence_kv * TOTAL_WIDTH * (4 + 2)
     reduction_bytes = (
-        route_count * 4
+        route_count * (4 + 8)
         + (sequence_kv + 1) * 8
-        + sequence_kv * TOTAL_WIDTH * (4 + 2)
+        + fp32_output_bytes
     )
+    filter_peak = route_filter_bytes + fp32_output_bytes
+    sort_peak = route_sort_bytes + fp32_output_bytes
     return TwoStageMemory(
         sequence_kv=sequence_kv,
         route_filter_bytes=route_filter_bytes,
         route_sort_bytes=route_sort_bytes,
         reduction_bytes=reduction_bytes,
-        total_bytes=max(route_filter_bytes, route_sort_bytes, reduction_bytes),
+        output_pair_bytes=output_pair_bytes,
+        total_bytes=max(filter_peak, sort_peak, reduction_bytes, output_pair_bytes),
     )
 
 
@@ -101,7 +111,8 @@ if triton is not None:
         do,
         lse,
         delta,
-        route_positions,
+        route_ids,
+        route_order,
         key_offsets,
         output,
         q_stride_s,
@@ -127,8 +138,9 @@ if triton is not None:
         for head in tl.range(0, ATTENTION_HEADS):
             head_partial = tl.zeros((BLOCK_WIDTH,), dtype=tl.float32)
             for route_index in tl.range(route_start, route_end):
-                position = tl.load(route_positions + route_index)
-                query_id = position // TOPK
+                source_index = tl.load(route_order + route_index)
+                route_id = tl.load(route_ids + source_index)
+                query_id = route_id & QUERY_ID_MASK
                 q_base = query_id * q_stride_s + head * q_stride_h
                 kv_base = key_id * kv_stride_s
 
@@ -184,11 +196,11 @@ else:
     _two_stage_dkv_kernel = None
 
 
-def _sorted_route_positions(
+def _sorted_route_ids(
     indices: torch.Tensor,
     sequence_kv: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build key-major route positions with GPU tensor operations only."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build packed, key-major route IDs with GPU tensor operations only."""
 
     flat = indices.reshape(-1)
     positions = torch.arange(flat.numel(), device=indices.device, dtype=torch.int32)
@@ -196,17 +208,17 @@ def _sorted_route_positions(
     keys = flat.masked_select(valid)
     positions = positions.masked_select(valid)
     del flat, valid
-    counts = torch.bincount(keys, minlength=sequence_kv)
-    order = torch.argsort(keys, stable=True)
-    sorted_positions = positions.index_select(0, order)
-    del keys, positions, order
+    route_ids = (keys << QUERY_ID_BITS) | (positions // TOPK)
+    del keys, positions
+    counts = torch.bincount(route_ids >> QUERY_ID_BITS, minlength=sequence_kv)
+    route_order = torch.argsort(route_ids, stable=True)
     offsets = torch.cat(
         (
             torch.zeros(1, dtype=torch.int64, device=indices.device),
             counts.cumsum(0, dtype=torch.int64),
         )
     )
-    return sorted_positions, offsets
+    return route_ids, route_order, offsets
 
 
 def sparse_mla_dkv_two_stage(
@@ -277,7 +289,7 @@ def sparse_mla_dkv_two_stage(
             f"{memory.total_bytes} > {max_workspace_bytes} bytes"
         )
 
-    route_positions, key_offsets = _sorted_route_positions(indices, sequence_kv)
+    route_ids, route_order, key_offsets = _sorted_route_ids(indices, sequence_kv)
     if output_buffer is None:
         output_buffer = torch.empty(
             sequence_kv,
@@ -293,7 +305,8 @@ def sparse_mla_dkv_two_stage(
         do,
         lse,
         delta,
-        route_positions,
+        route_ids,
+        route_order,
         key_offsets,
         output_buffer,
         q.stride(1),
@@ -311,4 +324,5 @@ def sparse_mla_dkv_two_stage(
         num_warps=4,
         num_stages=1,
     )
+    del route_ids, route_order, key_offsets
     return output_buffer.view_as(kv).to(dtype=kv.dtype), memory

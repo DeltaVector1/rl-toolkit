@@ -11,19 +11,27 @@ BENCHMARK = (ROOT.parent / "scripts/ops/benchmark_sparse_mla_two_stage_sm89.py")
 TOTAL_WIDTH = 576
 TOPK = 2048
 MAX_WORKSPACE_BYTES = 256 * 1024 * 1024
-ROUTE_BYTES_PER_ENTRY = 29
-ROUTE_FILTER_BYTES_PER_ENTRY = 13
+ROUTE_BYTES_PER_ENTRY = 20
+ROUTE_FILTER_BYTES_PER_ENTRY = 17
 
 
 def memory_bound(sequence_kv: int) -> int:
+    route_count = 4096 * TOPK
     route_filter = 4096 * TOPK * ROUTE_FILTER_BYTES_PER_ENTRY
-    route_sort = 4096 * TOPK * ROUTE_BYTES_PER_ENTRY
+    route_sort = route_count * ROUTE_BYTES_PER_ENTRY
+    fp32_output = sequence_kv * TOTAL_WIDTH * 4
     reduction = (
-        (4096 * TOPK * 4)
+        (route_count * (4 + 8))
         + ((sequence_kv + 1) * 8)
-        + (sequence_kv * TOTAL_WIDTH * (4 + 2))
+        + fp32_output
     )
-    return max(route_filter, route_sort, reduction)
+    output_pair = sequence_kv * TOTAL_WIDTH * (4 + 2)
+    return max(
+        route_filter + fp32_output,
+        route_sort + fp32_output,
+        reduction,
+        output_pair,
+    )
 
 
 def stable_segment_sum(values: list[list[float]], keys: list[int]):
@@ -41,7 +49,8 @@ def stable_segment_sum(values: list[list[float]], keys: list[int]):
 class SparseMlaTwoStageTest(unittest.TestCase):
     def test_production_workspace_is_bounded(self):
         total = memory_bound(32769)
-        self.assertEqual(4096 * TOPK * ROUTE_BYTES_PER_ENTRY, 243269632)
+        self.assertEqual(4096 * TOPK * ROUTE_BYTES_PER_ENTRY, 167772160)
+        self.assertEqual(total, 243271936)
         self.assertLess(total, MAX_WORKSPACE_BYTES)
         self.assertLess(total / 2**20, 256)
 
@@ -50,8 +59,11 @@ class SparseMlaTwoStageTest(unittest.TestCase):
         self.assertIn("(1, QUERY_TOKENS, ATTENTION_HEADS, TOTAL_WIDTH)", SOURCE)
         self.assertIn("(1, QUERY_TOKENS, GROUPS, TOPK)", SOURCE)
         self.assertIn("(1, 32768 + 1, GROUPS, TOTAL_WIDTH)", SOURCE)
-        self.assertIn("ROUTE_BYTES_PER_ENTRY = 29", SOURCE)
-        self.assertIn("ROUTE_FILTER_BYTES_PER_ENTRY = 13", SOURCE)
+        self.assertIn("PACKED_ROUTE_BYTES = 4", SOURCE)
+        self.assertIn("ROUTE_ORDER_BYTES = 8", SOURCE)
+        self.assertIn("ARGSORT_SCRATCH_BYTES = 8", SOURCE)
+        self.assertIn("ROUTE_BYTES_PER_ENTRY = PACKED_ROUTE_BYTES", SOURCE)
+        self.assertIn("ROUTE_FILTER_BYTES_PER_ENTRY = 4 + 1 + 4 + 4 + 4", SOURCE)
 
     def test_duplicate_routes_reduce_in_stable_key_order(self):
         reduced, unique = stable_segment_sum(
@@ -83,7 +95,10 @@ class SparseMlaTwoStageTest(unittest.TestCase):
         self.assertNotIn("dp == dp", SOURCE)
         self.assertIn("BLOCK_WIDTH = 1024", SOURCE)
         self.assertIn("grid = (sequence_kv,)", SOURCE)
-        self.assertIn("torch.argsort(keys, stable=True)", SOURCE)
+        self.assertIn("torch.argsort(route_ids, stable=True)", SOURCE)
+        self.assertIn("QUERY_ID_BITS = 12", SOURCE)
+        self.assertIn("route_ids = (keys << QUERY_ID_BITS)", SOURCE)
+        self.assertNotIn("sorted_positions", SOURCE)
         self.assertIn("same-device tensors", SOURCE)
         self.assertIn("@triton.jit", SOURCE)
 
