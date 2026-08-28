@@ -72,9 +72,10 @@ decision first. `repair` is allowed only for an error that `status()` shows.
 lists. Pass `nodes=[...]` when the destination cannot be derived. It refuses
 an unmounted source file.
 
-`run_on_hosts()` runs an explicit command on the configured `trainer`,
-`inference`, or `all` group. Treat it as a write unless the command is clearly
-read-only.
+`run_on_hosts()` runs an explicit command on the configured `trainer_head`,
+`trainer`, `inference`, or `all` group. The `trainer_head` group contains only
+the inventory `trainer_head` host. Treat it as a write unless the command is
+clearly read-only.
 
 ## Start order
 

@@ -2708,6 +2708,7 @@ def run_on_hosts(
     """Run one explicit command on one configured host group."""
     groups = {
         "trainer": trainer_hosts,
+        "trainer_head": [trainer_head],
         "inference": inference_hosts,
         "all": list(dict.fromkeys([*trainer_hosts, *inference_hosts])),
     }
@@ -13493,7 +13494,7 @@ usage = f"""training-ops <action> [args]
   engines                       test every configured inference endpoint
   logs [role] [lines]           read one service log
   parity [run]                  read the trainer parity record
-  remote <group> <command>      run on trainer, inference, or all hosts
+  remote <group> <command>      run on trainer_head, trainer, inference, or all hosts
   versions [package ...]        show installed package versions
   watch [hours] [seconds]       monitor in the foreground
   repair <name>                 repair tunnels, an engine, or supervisors

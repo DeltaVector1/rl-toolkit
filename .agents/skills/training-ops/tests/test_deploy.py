@@ -184,6 +184,31 @@ class DeployTest(unittest.TestCase):
         ssh.assert_not_called()
         masters.assert_not_called()
 
+    def test_run_on_hosts_supports_inventory_trainer_head_group(self):
+        seen = []
+
+        def fan(hosts, function, workers=None):
+            del workers
+            seen.append(list(hosts))
+            return {host: function(host) for host in hosts}
+
+        with patch.object(training_ops, "_fan", side_effect=fan), patch.object(
+            training_ops, "_ssh", return_value=(0, "ready\n")
+        ) as ssh:
+            result = training_ops.run_on_hosts("true", group="trainer_head")
+
+        self.assertEqual(seen, [[training_ops.trainer_head]])
+        self.assertEqual(result, {training_ops.trainer_head: (0, "ready\n")})
+        ssh.assert_called_once_with(training_ops.trainer_head, "true", 120)
+
+    def test_run_on_hosts_trainer_head_group_keeps_blocked_host_check(self):
+        with patch.object(training_ops, "trainer_head", "n79"), patch.object(
+            training_ops, "_ssh"
+        ) as ssh:
+            with self.assertRaisesRegex(training_ops.Refused, "n79 is off limits"):
+                training_ops.run_on_hosts("true", group="trainer_head")
+        ssh.assert_not_called()
+
     def test_control_master_starts_once_per_configured_host(self):
         hosts = [*training_ops.trainer_hosts, training_ops.trainer_hosts[0]]
         completed = Mock(returncode=0, stdout="", stderr="")
