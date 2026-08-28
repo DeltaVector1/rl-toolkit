@@ -7578,12 +7578,7 @@ def _repair_supervisors() -> str:
 
 _QUALIFICATION_ONLY_MOUNTS = {
     _CUDA_MEMORY_CAPTURE_PROFILE: frozenset({"source/tests/test_final_pp16_cuda.py"}),
-    _PP_ASYNC_CUDA_PROFILE: frozenset(
-        {
-            "source/tests/test_pp_async_cuda.py",
-            "source/src/prime_rl/trainer/phase_profiler.py",
-        }
-    ),
+    _PP_ASYNC_CUDA_PROFILE: frozenset({"source/tests/test_pp_async_cuda.py"}),
 }
 
 

@@ -263,17 +263,29 @@ def test_cuda_smoke_has_a_resolvable_hostname_without_network_access() -> None:
     assert '"--log-dir /output/torchrun --redirects 3 --tee 3 "' in source
 
 
+def test_phase_profiler_is_a_shared_trainer_mount() -> None:
+    training_ops = _load_training_ops("training_ops_phase_profiler_mount")
+    path = "source/src/prime_rl/trainer/phase_profiler.py"
+    assert training_ops._mounted_on(path, "n82")
+    assert training_ops._mounted_on(
+        path,
+        "n82",
+        profile_name="glm52-native-b2048",
+    )
+    assert training_ops._mounted_on(
+        path,
+        "n82",
+        profile_name="glm52-pp-async-cuda-smoke",
+    )
+    assert training_ops._mounted_on(path, "n76")
+
+
 def test_exited_trainer_is_allowed_and_cuda_command_is_fail_closed() -> None:
     training_ops = _load_training_ops("training_ops_pp_async_smoke")
 
     smoke = "glm52-pp-async-cuda-smoke"
     test_path = "source/tests/test_pp_async_cuda.py"
     assert training_ops._mounted_on(test_path, "n82", profile_name=smoke)
-    assert training_ops._mounted_on(
-        "source/src/prime_rl/trainer/phase_profiler.py",
-        "n82",
-        profile_name=smoke,
-    )
     assert not training_ops._mounted_on(test_path, "n76", profile_name=smoke)
     assert not training_ops._mounted_on(test_path, "n82")
 
