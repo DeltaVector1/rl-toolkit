@@ -50,6 +50,10 @@ def pinned_bytes() -> int:
 
 
 def run_chain(value, upstream, output_splits, input_splits, packed):
+    if value.shape[0] != sum(input_splits):
+        raise ValueError("benchmark input shape does not match input splits")
+    if upstream.shape[0] != sum(output_splits):
+        raise ValueError("benchmark upstream shape does not match output splits")
     expert_parallel._PACKED_EXPERT_TRANSPORT = packed
     input_value = value.detach().clone().requires_grad_()
     output = expert_parallel._INT4Dispatch.apply(
