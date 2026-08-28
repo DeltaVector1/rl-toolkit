@@ -10210,22 +10210,74 @@ def qualify_glm52_pp_async_cuda() -> dict[str, object]:
         "--format=csv,noheader,nounits 2>/dev/null) || exit 96; "
         "pids=$(printf '%s\n' \"$pid_output\" | grep -E '^[0-9]+$' | "
         "paste -sd, - || true); "
-        f"container_output=$(sudo docker ps -a --format '{{{{.Names}}}}') || exit 97; "
-        f"active=$(printf '%s\n' \"$container_output\" | "
+        f"container_output=$(sudo docker ps --format '{{{{.Names}}}}') || exit 97; "
+        f"running=$(printf '%s\n' \"$container_output\" | "
         f"grep -E '^({re.escape(trainer_container)}|{re.escape(container)})$' | "
         "paste -sd, - || true); "
-        "printf 'GPUS %s\nPIDS %s\nACTIVE %s\n' \"$gpu_count\" \"$pids\" \"$active\"",
+        "printf 'GPUS %s\nPIDS %s\nRUNNING %s\n' \"$gpu_count\" \"$pids\" \"$running\"",
         timeout=60,
     )
     if code:
         raise RuntimeError(f"cannot inspect n82 for the PP async CUDA check: {output.strip()}")
     state = _kv(output)
-    if set(state) != {"GPUS", "PIDS", "ACTIVE"}:
+    if set(state) != {"GPUS", "PIDS", "RUNNING"}:
         raise Refused("the PP async CUDA preflight returned incomplete state")
     if state.get("GPUS") != "8":
         raise Refused(f"the PP async CUDA check requires eight GPUs, got {state.get('GPUS', '?')}")
-    if state.get("PIDS") or state.get("ACTIVE"):
-        raise Refused("n82 GPUs are in use; the PP async CUDA check did not start")
+    if state.get("PIDS"):
+        raise Refused(
+            "n82 has active GPU processes; the PP async CUDA check did not start: "
+            f"pids={state['PIDS']}"
+        )
+    if state.get("RUNNING"):
+        raise Refused(
+            "n82 has a running trainer or CUDA qualification container; "
+            f"the PP async CUDA check did not start: containers={state['RUNNING']}"
+        )
+
+    stale_command = f"""set -euo pipefail
+candidate_ids=$(sudo docker ps -aq --no-trunc --filter name=^{container}$)
+if [ -z "$candidate_ids" ]; then
+  printf 'STALE none\n'
+  exit 0
+fi
+candidate_id=$(printf '%s\n' "$candidate_ids" | sed '/^$/d')
+if ! [[ "$candidate_id" =~ ^[0-9a-f]{{64}}$ ]]; then
+  echo "stale CUDA qualification candidate count or ID is invalid" >&2
+  exit 98
+fi
+identity=$(sudo docker inspect --type container --format \
+  '{{{{.Id}}}}|{{{{.Name}}}}|{{{{index .Config.Labels "prime.qualification"}}}}|{{{{index .Config.Labels "prime.session"}}}}|{{{{.State.Running}}}}' \
+  "$candidate_id") || exit 97
+IFS='|' read -r observed_id observed_name observed_qualification observed_session observed_running <<< "$identity"
+if [ "$observed_id" != "$candidate_id" ] || \
+   [ "$observed_name" != "/{container}" ] || \
+   [ "$observed_qualification" != "{_PP_ASYNC_CUDA_PROFILE}" ] || \
+   ! [[ "$observed_session" =~ ^[0-9a-f]{{16}}$ ]] || \
+   [ "$observed_running" != "false" ]; then
+  echo "stale CUDA qualification candidate identity differs" >&2
+  exit 96
+fi
+sudo docker rm "$candidate_id" >/dev/null || exit 95
+remaining=$(sudo docker ps -aq --filter name=^{container}$) || exit 94
+if [ -n "$remaining" ]; then
+  echo "stale CUDA qualification candidate remains after cleanup" >&2
+  exit 93
+fi
+printf 'STALE removed:%s\n' "$candidate_id"
+"""
+    stale_code, stale_output = _ssh(host, stale_command, timeout=60)
+    if stale_code:
+        raise RuntimeError(
+            "cannot clean a stale n82 PP async CUDA candidate: "
+            + (stale_output.strip()[-500:] or f"ssh exit {stale_code}")
+        )
+    stale_state = _kv(stale_output)
+    if set(stale_state) != {"STALE"} or not (
+        stale_state["STALE"] == "none"
+        or re.fullmatch(r"removed:[0-9a-f]{64}", stale_state["STALE"])
+    ):
+        raise RuntimeError("stale n82 PP async CUDA candidate cleanup returned invalid state")
 
     source_paths = (
         profile["script"],

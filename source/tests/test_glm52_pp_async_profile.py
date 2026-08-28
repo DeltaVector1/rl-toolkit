@@ -31,6 +31,16 @@ def _load(relative: str) -> dict:
         return tomllib.load(stream)
 
 
+def _load_training_ops(name: str):
+    module_path = ROOT / ".agents/skills/training-ops/src/training_ops/__init__.py"
+    spec = importlib.util.spec_from_file_location(name, module_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_async_profile_is_isolated_and_full_shape() -> None:
     operations = _load("configs/operations.toml")
     assert operations["profiles"]["glm52-native-pp-async"] == {
@@ -168,13 +178,8 @@ def test_cuda_smoke_profile_is_small_and_n82_only() -> None:
     assert "/data/ZiphuAI" not in script
 
 
-def test_cuda_smoke_command_is_fail_closed_and_has_no_model_mount() -> None:
-    module_path = ROOT / ".agents/skills/training-ops/src/training_ops/__init__.py"
-    spec = importlib.util.spec_from_file_location("training_ops_pp_async_smoke", module_path)
-    assert spec is not None and spec.loader is not None
-    training_ops = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = training_ops
-    spec.loader.exec_module(training_ops)
+def test_exited_trainer_is_allowed_and_cuda_command_is_fail_closed() -> None:
+    training_ops = _load_training_ops("training_ops_pp_async_smoke")
 
     smoke = "glm52-pp-async-cuda-smoke"
     test_path = "source/tests/test_pp_async_cuda.py"
@@ -216,8 +221,10 @@ def test_cuda_smoke_command_is_fail_closed_and_has_no_model_mount() -> None:
     def fake_ssh(host, command, timeout=120, **_kwargs):
         calls.append((host, command, timeout))
         if len(calls) == 1:
-            return 0, "GPUS 8\nPIDS\nACTIVE\n"
+            return 0, "GPUS 8\nPIDS\nRUNNING\n"
         if len(calls) == 2:
+            return 0, "STALE none\n"
+        if len(calls) == 3:
             return 0, json.dumps(result)
         return 0, "CONTAINERS\nPIDS\n"
 
@@ -234,8 +241,15 @@ def test_cuda_smoke_command_is_fail_closed_and_has_no_model_mount() -> None:
     assert [item[0] for item in deployed] == list(source_paths)
     assert all(item[1]["nodes"] == ["n82"] for item in deployed)
     assert all(host == "n82" for host, _command, _timeout in calls)
-    assert len(calls) == 3
-    launch = calls[1][1]
+    assert len(calls) == 4
+    preflight = calls[0][1]
+    assert "docker ps --format" in preflight
+    assert "docker ps -a" not in preflight
+    stale_cleanup = calls[1][1]
+    assert "docker ps -aq --no-trunc" in stale_cleanup
+    assert "docker inspect --type container" in stale_cleanup
+    assert "docker rm \"$candidate_id\"" in stale_cleanup
+    launch = calls[2][1]
     assert "--nproc-per-node=8" in launch
     assert "--network none" in launch
     assert "--read-only" in launch
@@ -247,8 +261,8 @@ def test_cuda_smoke_command_is_fail_closed_and_has_no_model_mount() -> None:
     assert "docker inspect --type container" in launch
     assert "docker rm -f" in launch
     assert "cleanup also failed" in launch
-    assert calls[1][2] == 960
-    postflight = calls[2][1]
+    assert calls[2][2] == 960
+    postflight = calls[3][1]
     assert "docker ps -aq" in postflight
     assert "nvidia-smi --query-compute-apps=pid" in postflight
     assert "/models" not in launch
@@ -258,8 +272,10 @@ def test_cuda_smoke_command_is_fail_closed_and_has_no_model_mount() -> None:
     def timed_out_ssh(host, command, timeout=120, **_kwargs):
         timeout_calls.append((host, command, timeout))
         if len(timeout_calls) == 1:
-            return 0, "GPUS 8\nPIDS\nACTIVE\n"
+            return 0, "GPUS 8\nPIDS\nRUNNING\n"
         if len(timeout_calls) == 2:
+            return 0, "STALE none\n"
+        if len(timeout_calls) == 3:
             return 124, "host-side timeout"
         return 0, "CONTAINERS\nPIDS\n"
 
@@ -272,15 +288,17 @@ def test_cuda_smoke_command_is_fail_closed_and_has_no_model_mount() -> None:
         assert "cleanup/postflight also failed" not in str(error)
     else:
         raise AssertionError("a timed-out CUDA qualification passed")
-    assert len(timeout_calls) == 3
-    assert "--cidfile" in timeout_calls[1][1]
-    assert "trap cleanup EXIT" in timeout_calls[1][1]
+    assert len(timeout_calls) == 4
+    assert "--cidfile" in timeout_calls[2][1]
+    assert "trap cleanup EXIT" in timeout_calls[2][1]
 
     def failed_cleanup_ssh(host, command, timeout=120, **_kwargs):
         failed_calls.append((host, command, timeout))
         if len(failed_calls) == 1:
-            return 0, "GPUS 8\nPIDS\nACTIVE\n"
+            return 0, "GPUS 8\nPIDS\nRUNNING\n"
         if len(failed_calls) == 2:
+            return 0, "STALE none\n"
+        if len(failed_calls) == 3:
             return 124, "original host timeout"
         return 0, "CONTAINERS abc123\nPIDS 77\n"
 
@@ -296,3 +314,72 @@ def test_cuda_smoke_command_is_fail_closed_and_has_no_model_mount() -> None:
         assert "containers=abc123 pids=77" in message
     else:
         raise AssertionError("a failed cleanup replaced the original error")
+
+
+def test_preflight_reports_gpu_pids_and_running_containers_separately() -> None:
+    training_ops = _load_training_ops("training_ops_pp_async_preflight")
+    training_ops._assert_live_services_are_down = lambda *_args, **_kwargs: None
+    training_ops.deploy = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("a refused preflight deployed files")
+    )
+
+    cases = (
+        (
+            "GPUS 8\nPIDS 42,43\nRUNNING\n",
+            "active GPU processes",
+            "pids=42,43",
+        ),
+        (
+            "GPUS 8\nPIDS\nRUNNING glm52-optims-trainer\n",
+            "running trainer or CUDA qualification container",
+            "containers=glm52-optims-trainer",
+        ),
+    )
+    for output, reason, identity in cases:
+        calls = []
+
+        def fake_ssh(host, command, timeout=120, **_kwargs):
+            calls.append((host, command, timeout))
+            return 0, output
+
+        training_ops._ssh = fake_ssh
+        try:
+            training_ops.qualify_glm52_pp_async_cuda()
+        except training_ops.Refused as error:
+            assert reason in str(error)
+            assert identity in str(error)
+        else:
+            raise AssertionError("an occupied n82 preflight passed")
+        assert len(calls) == 1
+        assert "docker ps --format" in calls[0][1]
+        assert "docker ps -a" not in calls[0][1]
+
+
+def test_stale_candidate_cleanup_is_fail_closed() -> None:
+    training_ops = _load_training_ops("training_ops_pp_async_stale")
+    training_ops._assert_live_services_are_down = lambda *_args, **_kwargs: None
+    calls = []
+
+    def fake_ssh(host, command, timeout=120, **_kwargs):
+        calls.append((host, command, timeout))
+        if len(calls) == 1:
+            return 0, "GPUS 8\nPIDS\nRUNNING\n"
+        return 96, "stale CUDA qualification candidate identity differs"
+
+    training_ops._ssh = fake_ssh
+    training_ops.deploy = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("invalid stale state deployed files")
+    )
+    try:
+        training_ops.qualify_glm52_pp_async_cuda()
+    except RuntimeError as error:
+        assert "cannot clean a stale n82 PP async CUDA candidate" in str(error)
+        assert "identity differs" in str(error)
+    else:
+        raise AssertionError("an invalid stale candidate was removed or ignored")
+    assert len(calls) == 2
+    stale_cleanup = calls[1][1]
+    assert "docker ps -aq --no-trunc" in stale_cleanup
+    assert "docker inspect --type container" in stale_cleanup
+    assert "observed_running" in stale_cleanup
+    assert "docker rm \"$candidate_id\"" in stale_cleanup
