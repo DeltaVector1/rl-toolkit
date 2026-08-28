@@ -68,19 +68,6 @@ def validate_async_topology(topology: Mapping[str, Any] | None) -> None:
         )
 
 
-def validate_async_stage_modules(stage_modules: Sequence[Any]) -> None:
-    sparse = [
-        int(getattr(module, "stage_identity", index))
-        for index, module in enumerate(stage_modules)
-        if bool(getattr(module, "transfer_sparse_indices", False))
-    ]
-    if sparse:
-        raise ValueError(
-            "1f1b_async does not support sparse-cache pipeline transport; "
-            f"stages={sparse}"
-        )
-
-
 def validate_interleaved_microbatches(num_microbatches: int, pp_size: int) -> int:
     """Validate an interleaved batch and return its round count.
 
@@ -1196,16 +1183,16 @@ def build_schedule(
     install_pp_phase_hooks()
 
     if schedule_name == "1f1b_async":
-        raise ValueError(
-            "1f1b_async is disabled because its P2P order is not matched across ranks"
-        )
+        if not limit_receive_buffers or pp_size != 8:
+            raise ValueError(
+                "1f1b_async requires pp_limit_receive_buffers and PP size 8"
+            )
+        validate_async_topology(async_topology)
     stage_modules = (
         list(stage_module)
         if isinstance(stage_module, (list, tuple))
         else [stage_module]
     )
-    if schedule_name == "1f1b_async":
-        validate_async_stage_modules(stage_modules)
     if schedule_name == "interleaved_1f1b" and len(stage_modules) != 2:
         raise ValueError("interleaved_1f1b requires exactly two local pipeline stages")
     if schedule_name != "interleaved_1f1b" and len(stage_modules) != 1:

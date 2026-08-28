@@ -37,7 +37,7 @@ class FakeOp:
 class FakeCuda:
     def __init__(self, log):
         self.log = log
-        self.compute_stream = object()
+        self.compute_stream = FakeComputeStream(log)
         self.streams = []
         self.events = []
 
@@ -73,6 +73,16 @@ class FakeCudaStream:
 
     def synchronize(self):
         self.log.append(("stream_sync", self.index))
+
+
+class FakeComputeStream:
+    index = -1
+
+    def __init__(self, log):
+        self.log = log
+
+    def wait_event(self, event):
+        self.log.append(("stream_wait_event", self.index, event.index))
 
 
 class FakeCudaEvent:
@@ -139,6 +149,8 @@ class FakeTransport:
         )
         self.fwd_window = fwd_window
         self.bwd_window = bwd_window
+        self.groups = []
+        self.max_groups = 0
 
     def receive_window(self, direction):
         return self.fwd_window if direction == "fwd" else self.bwd_window
@@ -177,11 +189,37 @@ class FakeTransport:
     def post_send(self, direction, microbatch, ops):
         self.state.post_send(direction, microbatch, ops)
 
+    def post_group(self, description, ops):
+        op_list = tuple(ops)
+        if not op_list:
+            return None
+        if len(self.groups) >= self.module.MAX_P2P_WINDOW:
+            raise RuntimeError("fake grouped P2P bound exceeded")
+        token = (description, op_list)
+        self.groups.append(token)
+        self.max_groups = max(self.max_groups, len(self.groups))
+        self.log.append(
+            (
+                "post_group",
+                description,
+                tuple((op.kind, op.microbatch) for op in op_list),
+            )
+        )
+        return token
+
+    def wait_group(self, token):
+        if token is None:
+            return
+        self.groups.remove(token)
+        self.log.append(("wait_group", token[0]))
+
     def drain(self):
+        assert not self.groups
         self.state.drain()
 
     def cleanup(self):
         self.log.append(("cleanup",))
+        self.groups.clear()
         self.state.cleanup()
 
 
@@ -206,6 +244,13 @@ class ReferenceTransport:
         del direction, microbatch
 
     def post_send(self, _direction, _microbatch, _ops):
+        pass
+
+    def post_group(self, _description, ops):
+        op_list = tuple(ops)
+        return op_list or None
+
+    def wait_group(self, _token):
         pass
 
     def drain(self):
@@ -261,29 +306,35 @@ class FakeStage:
         self.log.append(("reduce", scale))
 
 
-class SparsePeerStage(FakeStage):
-    def __init__(self, log, stage_index):
-        super().__init__(log, stage_index=stage_index, sparse=True)
+class PeerStage(FakeStage):
+    def __init__(self, log, stage_index, sparse):
+        super().__init__(log, stage_index=stage_index, sparse=sparse)
         self.is_first = stage_index == 0
         self.is_last = stage_index == 7
 
     def get_fwd_recv_ops(self, microbatch):
         if self.is_first:
             return []
-        return [
+        ops = [
             FakeOp(
                 "fwd", microbatch, self._fwd_buffers[microbatch], self.stage_index - 1
-            ),
-            FakeOp("cache", microbatch, self._cache_buffers[0], self.stage_index - 1),
+            )
         ]
+        if self.receive_sparse_indices:
+            ops.append(
+                FakeOp(
+                    "cache", microbatch, self._cache_buffers[0], self.stage_index - 1
+                )
+            )
+        return ops
 
     def get_fwd_send_ops(self, microbatch):
         if self.is_last:
             return []
-        return [
-            FakeOp("fwd", microbatch, peer=self.stage_index + 1),
-            FakeOp("cache", microbatch, peer=self.stage_index + 1),
-        ]
+        ops = [FakeOp("fwd", microbatch, peer=self.stage_index + 1)]
+        if self.receive_sparse_indices:
+            ops.append(FakeOp("cache", microbatch, peer=self.stage_index + 1))
+        return ops
 
     def get_bwd_recv_ops(self, microbatch):
         if self.is_last:
@@ -331,6 +382,27 @@ class EdgeTraceTransport(FakeTransport):
                 )
             )
         return op_list
+
+    def post_group(self, description, ops):
+        op_list = tuple(ops)
+        if not op_list:
+            return None
+        by_peer = {}
+        for op in op_list:
+            by_peer.setdefault(op.peer, []).append(op)
+        for peer, peer_ops in by_peer.items():
+            self.trace.append(
+                (
+                    self.rank,
+                    peer,
+                    description,
+                    tuple((op.kind, op.microbatch) for op in peer_ops),
+                )
+            )
+        token = (description, op_list)
+        self.groups.append(token)
+        self.max_groups = max(self.max_groups, len(self.groups))
+        return token
 
 
 class FakeSchedule:
@@ -445,17 +517,10 @@ class AsyncP2PStateTest(unittest.TestCase):
             ],
         )
         self.assertLess(
-            async_log.index(("wait_recv", (("fwd_recv", 0),))),
+            async_log.index(("post_group", "fwd_recv", (("fwd_recv", 0),))),
             async_log.index(("forward", 0)),
         )
-        self.assertLess(
-            async_log.index(("post_recv", (("fwd_recv", 1),))),
-            async_log.index(("forward", 0)),
-        )
-        self.assertEqual(
-            async_transport.state.max_pending_receives, {"fwd": 2, "bwd": 2}
-        )
-        self.assertLessEqual(async_transport.state.max_pending_sends, 2)
+        self.assertLessEqual(async_transport.max_groups, 2)
 
     def test_stage_one_to_six_64_microbatch_wraparound_and_sparse_ring(self):
         """All non-edge PP8 stages preserve 1F1B order across ring wraparound."""
@@ -503,11 +568,11 @@ class AsyncP2PStateTest(unittest.TestCase):
             [],
             True,
         )
-        self.assertEqual(sparse_transport.state.max_pending_receives["fwd"], 1)
+        self.assertLessEqual(sparse_transport.max_groups, 2)
         cache_posts = [
             item
             for item in sparse_log
-            if item[0] == "post_recv" and any(op[0] == "cache_recv" for op in item[1])
+            if item[0] == "post_group" and any(op[0] == "cache_recv" for op in item[2])
         ]
         self.assertEqual(len(cache_posts), 64)
         for left, right in zip(cache_posts, cache_posts[1:]):
@@ -516,30 +581,47 @@ class AsyncP2PStateTest(unittest.TestCase):
                 sparse_log.index(right),
             )
 
-    def test_sparse_pp8_window_one_has_an_unmatched_eighth_edge_call(self):
-        traces = {}
-        for rank in range(8):
-            trace = []
-            stage = SparsePeerStage([], rank)
-            schedule = FakeSchedule(stage, 8, num_stages=8)
-            transport = EdgeTraceTransport(self.module, rank, trace)
-            self.module.run_1f1b_async_step(
-                schedule,
-                transport,
-                list(range(8)),
-                [{} for _ in range(8)],
-                [0] * 8,
-                [],
-                True,
-            )
-            traces[rank] = trace
+    def test_dense_and_sparse_pp8_groups_match_on_every_edge(self):
+        def normalized(rank, peer, ops):
+            messages = []
+            for kind, microbatch in ops:
+                forward = kind in ("fwd", "cache")
+                sends = (forward and peer == rank + 1) or (
+                    kind == "bwd" and peer == rank - 1
+                )
+                source, target = (rank, peer) if sends else (peer, rank)
+                messages.append((source, target, kind, microbatch))
+            return tuple(messages)
 
-        rank_zero = [item for item in traces[0] if item[1] == 1]
-        rank_one = [item for item in traces[1] if item[1] == 0]
-        self.assertEqual(rank_zero[7][2:], ("send", (("fwd", 7), ("cache", 7))))
-        self.assertEqual(rank_one[7][2:], ("send", (("bwd", 0),)))
-        self.assertNotEqual(rank_zero[7][2], "receive")
-        self.assertNotEqual(rank_one[7][2], "receive")
+        for sparse in (False, True):
+            traces = {}
+            for rank in range(8):
+                trace = []
+                stage = PeerStage([], rank, sparse)
+                schedule = FakeSchedule(stage, 8, num_stages=8)
+                transport = EdgeTraceTransport(self.module, rank, trace)
+                self.module.run_1f1b_async_step(
+                    schedule,
+                    transport,
+                    list(range(8)),
+                    [{} for _ in range(8)],
+                    [0] * 8,
+                    [],
+                    True,
+                )
+                self.assertLessEqual(transport.max_groups, 2)
+                traces[rank] = trace
+
+            for left in range(7):
+                right = left + 1
+                left_calls = [item for item in traces[left] if item[1] == right]
+                right_calls = [item for item in traces[right] if item[1] == left]
+                self.assertEqual(len(left_calls), len(right_calls))
+                for left_call, right_call in zip(left_calls, right_calls):
+                    self.assertEqual(
+                        set(normalized(left, right, left_call[3])),
+                        set(normalized(right, left, right_call[3])),
+                    )
 
     def test_error_cleans_all_outstanding_work(self):
         log = []
@@ -572,10 +654,6 @@ class AsyncP2PStateTest(unittest.TestCase):
         self.assertIn('"1f1b_async"', config_source)
         self.assertNotIn('pp_schedule = "1f1b_async"', runner_source)
 
-    def test_async_schedule_factory_is_fail_closed(self):
-        with self.assertRaisesRegex(RuntimeError, "P2P order is not matched"):
-            self.module.make_schedule_1f1b_async()
-
     def test_sparse_receive_lookahead_is_one(self):
         stage = FakeStage([], sparse=True)
         self.assertEqual(self.module.receive_window_for_stage(stage, "fwd"), 1)
@@ -602,7 +680,7 @@ class AsyncP2PStateTest(unittest.TestCase):
         self.assertIn("validate_async_topology", runner_source)
         self.assertIn('"cutoff": 5', runner_source)
         self.assertIn('"pp_limit_receive_buffers": True', runner_source)
-        self.assertIn("1f1b_async is disabled", runner_source)
+        self.assertIn("if not limit_receive_buffers or pp_size != 8", runner_source)
 
     def test_cuda_transport_uses_explicit_stream_dependencies(self):
         source = MODULE_PATH.read_text()
@@ -652,6 +730,22 @@ class AsyncP2PStateTest(unittest.TestCase):
         second_create = len(log) - 1 - log[::-1].index(("stream_create", 0, "cuda:0"))
         self.assertLess(first_sync, second_create)
         second.cleanup()
+
+    def test_cuda_group_posts_one_batch_and_connects_both_streams(self):
+        log = []
+        transport, cuda = make_cuda_transport(self.module, log)
+        pending = transport.post_group("paired", ["send", "receive"])
+        self.assertIsNotNone(pending)
+        batches = [item for item in log if item[0] == "batch_isend_irecv"]
+        self.assertEqual(len(batches), 1)
+        self.assertEqual(batches[0][2], ("send", "receive"))
+        transport.wait_group(pending)
+        self.assertIn(("stream_wait_event", 0, pending.event.index), log)
+        self.assertIn(
+            ("stream_wait_event", cuda.compute_stream.index, pending.completed.index),
+            log,
+        )
+        transport.drain()
 
 
 if __name__ == "__main__":

@@ -174,6 +174,36 @@ class AuditedTransport(async_schedule.CudaAsyncP2P):
             self.journal.write("async_send_wait_after", count=len(pending.works))
         return result
 
+    def post_group(self, description, ops):
+        op_list = list(ops)
+        if self.journal is not None:
+            self.journal.write(
+                "async_group_post_before",
+                description=description,
+                ops=_p2p_summary(op_list),
+            )
+        pending = super().post_group(description, op_list)
+        if pending is not None:
+            self.work.extend(pending.works)
+        if self.journal is not None:
+            self.journal.write(
+                "async_group_post_after",
+                description=description,
+                count=0 if pending is None else len(pending.works),
+            )
+        return pending
+
+    def wait_group(self, pending):
+        if self.journal is not None:
+            self.journal.write(
+                "async_group_wait_before",
+                count=0 if pending is None else len(pending.works),
+            )
+        result = super().wait_group(pending)
+        if self.journal is not None:
+            self.journal.write("async_group_wait_after")
+        return result
+
     def drain(self):
         if self.journal is not None:
             self.journal.write("async_drain_before")

@@ -1,10 +1,9 @@
 """Opt-in asynchronous P2P transport for the single-stage 1F1B schedule.
 
-The driver below keeps the compute schedule identical to PyTorch's
-``Schedule1F1B``.  It changes only when the P2P work is posted and waited:
-receives are posted up to two micro-batches ahead, and sends are posted on a
-dedicated CUDA stream after an event from the compute stream.  Receive buffers
-are owned by ``PipelineStage``; this module allocates no activation buffers.
+The driver below keeps PyTorch's ``Schedule1F1B`` compute and P2P groups. Each
+group is posted on one dedicated CUDA stream after an event from the compute
+stream. Receive buffers are owned by ``PipelineStage``; this module allocates
+no activation buffers.
 
 This module does not alter ``torch.distributed`` or the installed PyTorch
 classes.  The subclass is created lazily by ``make_schedule_1f1b_async`` so
@@ -48,7 +47,11 @@ def _stage_receive_slot_available(stage: Any, direction: str, microbatch: int) -
     rings = [(f"_{suffix}_slot_by_key", f"_{suffix}_slot_owner", f"_{suffix}_events")]
     if direction == "fwd":
         rings.append(
-            ("_sparse_cache_slot_by_key", "_sparse_cache_slot_owner", "_sparse_cache_events")
+            (
+                "_sparse_cache_slot_by_key",
+                "_sparse_cache_slot_owner",
+                "_sparse_cache_events",
+            )
         )
     for mapping_name, owner_name, events_name in rings:
         if mapping_name is None:
@@ -320,11 +323,14 @@ class AsyncP2PState:
 
 
 class _CudaPending:
-    __slots__ = ("works", "event")
+    __slots__ = ("works", "event", "completed")
 
-    def __init__(self, works: list[Any], event: Any = None) -> None:
+    def __init__(
+        self, works: list[Any], event: Any = None, completed: Any = None
+    ) -> None:
         self.works = works
         self.event = event
+        self.completed = completed
 
 
 class CudaAsyncP2P:
@@ -354,6 +360,7 @@ class CudaAsyncP2P:
             self._wait_send,
             max_window=max_window,
         )
+        self._groups: list[_CudaPending] = []
 
     @property
     def max_pending_receives(self) -> dict[str, int]:
@@ -418,11 +425,49 @@ class CudaAsyncP2P:
     def post_send(self, direction: str, microbatch: int, ops: Iterable[Any]) -> None:
         self._state.post_send(direction, microbatch, ops)
 
+    def post_group(self, description: str, ops: Iterable[Any]) -> _CudaPending | None:
+        del description
+        op_list = list(ops)
+        if not op_list:
+            return None
+        if len(self._groups) >= MAX_P2P_WINDOW:
+            raise RuntimeError("grouped P2P work exceeded the fixed two-group bound")
+        ready = self._torch.cuda.Event()
+        ready.record(self._torch.cuda.current_stream())
+        self._stream_synchronized = False
+        with self._torch.cuda.stream(self._stream):
+            self._stream.wait_event(ready)
+            works = self._dist.batch_isend_irecv(op_list)
+            completed = self._torch.cuda.Event()
+            completed.record(self._stream)
+        pending = _CudaPending(list(works), ready, completed)
+        self._groups.append(pending)
+        return pending
+
+    def wait_group(self, pending: _CudaPending | None) -> None:
+        if pending is None:
+            return
+        if pending not in self._groups:
+            raise RuntimeError("grouped P2P work is not live")
+        for work in pending.works:
+            work.wait()
+        self._torch.cuda.current_stream().wait_event(pending.completed)
+        self._groups.remove(pending)
+
     def drain(self) -> None:
+        if self._groups:
+            raise RuntimeError("grouped P2P work remained at schedule end")
         self._state.drain()
         self._synchronize_stream()
 
     def cleanup(self) -> None:
+        while self._groups:
+            pending = self._groups.pop(0)
+            for work in pending.works:
+                try:
+                    work.wait()
+                except BaseException:
+                    pass
         self._state.cleanup()
         try:
             self._synchronize_stream()
@@ -445,170 +490,79 @@ def _run_1f1b_async_step(
     losses: list | None,
     return_outputs: bool,
 ) -> None:
-    """Run the exact PyTorch 1F1B action order with asynchronous transport.
-
-    The only additional operations are receive preposts.  Every stage forward
-    and backward call, loss callback, and final gradient reduction is in the
-    same order as ``torch.distributed.pipelining.Schedule1F1B``.
-    """
+    """Run PyTorch's exact 1F1B compute and grouped P2P order."""
     stage = schedule._stage
     n_microbatches = schedule._n_microbatches
     warmup_chunks = min(n_microbatches, schedule._num_stages - stage.stage_index)
     fwd_mb_index = 0
     bwd_mb_index = 0
-    posted_fwd: set[int] = set()
-    posted_bwd: set[int] = set()
-
-    def post_fwd(microbatch: int) -> bool:
-        if stage.is_first or microbatch in posted_fwd:
-            return True
-        if not _stage_receive_slot_available(stage, "fwd", microbatch):
-            return False
-        if hasattr(transport, "receive_capacity_available") and not transport.receive_capacity_available("fwd"):
-            return False
-        ops = stage.get_fwd_recv_ops(microbatch)
-        if not transport.prepost_receive("fwd", microbatch, ops):
-            return False
-        posted_fwd.add(microbatch)
-        return True
-
-    def post_bwd(microbatch: int) -> bool:
-        if stage.is_last or microbatch in posted_bwd:
-            return True
-        if not _stage_receive_slot_available(stage, "bwd", microbatch):
-            return False
-        if hasattr(transport, "receive_capacity_available") and not transport.receive_capacity_available("bwd"):
-            return False
-        ops = stage.get_bwd_recv_ops(microbatch)
-        if not transport.prepost_receive("bwd", microbatch, ops):
-            return False
-        posted_bwd.add(microbatch)
-        return True
-
-    def prime_fwd(next_mb: int) -> None:
-        if stage.is_first:
-            return
-        window = int(
-            getattr(transport, "receive_window", lambda _direction: MAX_P2P_WINDOW)(
-                "fwd"
-            )
-        )
-        for microbatch in range(next_mb, min(n_microbatches, next_mb + window)):
-            if microbatch not in posted_fwd:
-                # A live ring slot defers lookahead.  The current microbatch
-                # is checked again at its use boundary below.
-                if not post_fwd(microbatch):
-                    break
-
-    def prime_bwd(next_mb: int) -> None:
-        if stage.is_last:
-            return
-        window = int(
-            getattr(transport, "receive_window", lambda _direction: MAX_P2P_WINDOW)(
-                "bwd"
-            )
-        )
-        for microbatch in range(next_mb, min(n_microbatches, next_mb + window)):
-            if microbatch not in posted_bwd:
-                if not post_bwd(microbatch):
-                    break
-
-    def release_sparse_cache(microbatch: int) -> None:
-        if (
-            not stage.is_first
-            and bool(getattr(stage, "receive_sparse_indices", False))
-            and hasattr(transport, "release_receive_buffer")
-        ):
-            # get_fwd_recv_ops orders hidden state before the sparse cache.
-            # The cache is read by forward only, unlike hidden state which is
-            # retained until its backward, so release its ring slot now.
-            transport.release_receive_buffer("fwd", microbatch, 1)
-
-    # Warmup.
+    send_work = None
+    fwd_sends = []
     for _ in range(warmup_chunks):
-        prime_fwd(fwd_mb_index)
-        if not stage.is_first:
-            if fwd_mb_index not in posted_fwd and not post_fwd(fwd_mb_index):
-                raise RuntimeError(
-                    f"fwd receive {fwd_mb_index} ring slot is still live at tensor use"
-                )
-            transport.wait_receive("fwd", fwd_mb_index)
+        fwd_recvs = stage.get_fwd_recv_ops(fwd_mb_index)
+        receive_work = transport.post_group("fwd_recv", fwd_recvs)
+        transport.wait_group(receive_work)
         output = stage.forward_one_chunk(
             fwd_mb_index,
             arg_mbs[fwd_mb_index],
             kwarg_mbs[fwd_mb_index],
             save_forward_output=return_outputs,
         )
-        transport.post_send("fwd", fwd_mb_index, stage.get_fwd_send_ops(fwd_mb_index))
-        release_sparse_cache(fwd_mb_index)
+        transport.wait_group(send_work)
+        fwd_sends = stage.get_fwd_send_ops(fwd_mb_index)
+        if fwd_mb_index != warmup_chunks - 1:
+            send_work = transport.post_group("fwd_send", fwd_sends)
+        else:
+            send_work = None
         schedule._maybe_compute_loss(stage, output, target_mbs, fwd_mb_index)
         fwd_mb_index += 1
 
-    # 1B1F steady state.  Keep the same backward-first ordering as PyTorch.
     while True:
-        prime_bwd(bwd_mb_index)
-        if not stage.is_last:
-            if bwd_mb_index not in posted_bwd and not post_bwd(bwd_mb_index):
-                raise RuntimeError(
-                    f"bwd receive {bwd_mb_index} ring slot is still live at tensor use"
-                )
-            transport.wait_receive("bwd", bwd_mb_index)
+        bwd_recvs = stage.get_bwd_recv_ops(bwd_mb_index)
+        grouped = transport.post_group("fwd_send_bwd_recv", [*fwd_sends, *bwd_recvs])
+        transport.wait_group(grouped)
         loss = schedule._maybe_get_loss(stage, bwd_mb_index)
         stage.backward_one_chunk(
             bwd_mb_index,
             loss=loss,
             last_backward=bwd_mb_index == n_microbatches - 1,
         )
-        if not stage.is_first:
-            transport.release_receive("fwd", bwd_mb_index)
-        if not stage.is_last:
-            transport.release_receive("bwd", bwd_mb_index)
-        transport.post_send("bwd", bwd_mb_index, stage.get_bwd_send_ops(bwd_mb_index))
+        bwd_sends = stage.get_bwd_send_ops(bwd_mb_index)
         bwd_mb_index += 1
 
         if fwd_mb_index == n_microbatches:
             break
 
-        prime_fwd(fwd_mb_index)
-        if not stage.is_first:
-            if fwd_mb_index not in posted_fwd and not post_fwd(fwd_mb_index):
-                raise RuntimeError(
-                    f"fwd receive {fwd_mb_index} ring slot is still live at tensor use"
-                )
-            transport.wait_receive("fwd", fwd_mb_index)
+        fwd_recvs = stage.get_fwd_recv_ops(fwd_mb_index)
+        grouped = transport.post_group("bwd_send_fwd_recv", [*bwd_sends, *fwd_recvs])
+        transport.wait_group(grouped)
         output = stage.forward_one_chunk(
             fwd_mb_index,
             arg_mbs[fwd_mb_index],
             kwarg_mbs[fwd_mb_index],
             save_forward_output=return_outputs,
         )
-        transport.post_send("fwd", fwd_mb_index, stage.get_fwd_send_ops(fwd_mb_index))
-        release_sparse_cache(fwd_mb_index)
         schedule._maybe_compute_loss(stage, output, target_mbs, fwd_mb_index)
+        fwd_sends = stage.get_fwd_send_ops(fwd_mb_index)
         fwd_mb_index += 1
 
-    # Cooldown.
+    send_work = transport.post_group("bwd_send", bwd_sends)
     while bwd_mb_index < n_microbatches:
-        prime_bwd(bwd_mb_index)
-        if not stage.is_last:
-            if bwd_mb_index not in posted_bwd and not post_bwd(bwd_mb_index):
-                raise RuntimeError(
-                    f"bwd receive {bwd_mb_index} ring slot is still live at tensor use"
-                )
-            transport.wait_receive("bwd", bwd_mb_index)
+        bwd_recvs = stage.get_bwd_recv_ops(bwd_mb_index)
+        receive_work = transport.post_group("bwd_recv", bwd_recvs)
+        transport.wait_group(receive_work)
         loss = schedule._maybe_get_loss(stage, bwd_mb_index)
         stage.backward_one_chunk(
             bwd_mb_index,
             loss=loss,
             last_backward=bwd_mb_index == n_microbatches - 1,
         )
-        if not stage.is_first:
-            transport.release_receive("fwd", bwd_mb_index)
-        if not stage.is_last:
-            transport.release_receive("bwd", bwd_mb_index)
-        transport.post_send("bwd", bwd_mb_index, stage.get_bwd_send_ops(bwd_mb_index))
+        transport.wait_group(send_work)
+        bwd_sends = stage.get_bwd_send_ops(bwd_mb_index)
+        send_work = transport.post_group("bwd_send", bwd_sends)
         bwd_mb_index += 1
 
+    transport.wait_group(send_work)
     transport.drain()
     schedule._update_losses(stage, losses)
     stage.perform_reduce_grad(n_microbatches if schedule.scale_grads else 1)
@@ -640,9 +594,6 @@ def run_1f1b_async_step(
 
 def make_schedule_1f1b_async() -> type:
     """Create the local opt-in schedule subclass from installed PyTorch."""
-    raise RuntimeError(
-        "1f1b_async is disabled because its P2P order is not matched across ranks"
-    )
     from torch.distributed.pipelining import Schedule1F1B
 
     class Schedule1F1BAsync(Schedule1F1B):
