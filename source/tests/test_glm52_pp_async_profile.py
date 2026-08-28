@@ -371,7 +371,8 @@ def test_cuda_smoke_uses_the_host_network() -> None:
         ROOT / ".agents/skills/training-ops/src/training_ops/__init__.py"
     ).read_text()
     assert "--network {shlex.quote(transport['network_mode'])} --read-only" in source
-    assert 'f"torchrun --standalone --nproc-per-node={gpu_count} "' in source
+    assert 'f"torchrun --standalone --local-addr=127.0.0.1 "' in source
+    assert 'f"--nproc-per-node={gpu_count} "' in source
     assert '"--log-dir /output/torchrun --redirects 3 --tee 3 "' in source
 
 
@@ -380,7 +381,7 @@ def test_cuda_smoke_uses_the_configured_trainer_transport() -> None:
     transport = operations["transport"]["glm52_trainer"]
     assert transport == {
         "network_mode": "host",
-        "process_group_timeout_seconds": 5400,
+        "process_group_timeout_seconds": 240,
         "device_id": "local_rank",
         "env": {
             "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
@@ -406,7 +407,9 @@ def test_cuda_smoke_uses_the_configured_trainer_transport() -> None:
     qualification = operations["qualification"]["glm52_pp_async_cuda"]
     trainer = _load(operations["profiles"]["current"]["trainer"])
     assert qualification["transport"] == "glm52_trainer"
-    assert transport["process_group_timeout_seconds"] == trainer["dist_timeout_seconds"]
+    assert transport["process_group_timeout_seconds"] == 240
+    assert transport["process_group_timeout_seconds"] < 300
+    assert trainer["dist_timeout_seconds"] == 5400
 
     launcher = (ROOT / "scripts/china/cluster.sh").read_text()
     for key, value in transport["env"].items():
@@ -435,6 +438,18 @@ def test_cuda_smoke_requires_transport_configuration() -> None:
     training_ops = _load_training_ops("training_ops_pp_async_missing_transport")
     with pytest.raises(training_ops.Refused, match="not configured"):
         training_ops._pp_async_cuda_transport({"transport": "missing"})
+
+
+def test_cuda_smoke_rejects_a_timeout_that_can_outlive_its_controller() -> None:
+    training_ops = _load_training_ops("training_ops_pp_async_long_timeout")
+    transport = training_ops.operations["transport"]["glm52_trainer"]
+    old_timeout = transport["process_group_timeout_seconds"]
+    transport["process_group_timeout_seconds"] = 300
+    try:
+        with pytest.raises(training_ops.Refused, match="1 through 299"):
+            training_ops._pp_async_cuda_transport({"transport": "glm52_trainer"})
+    finally:
+        transport["process_group_timeout_seconds"] = old_timeout
 
 
 def test_phase_profiler_is_a_shared_trainer_mount() -> None:
@@ -534,6 +549,7 @@ def test_exited_trainer_is_allowed_and_cuda_command_is_fail_closed() -> None:
     assert "docker inspect --type container" in stale_cleanup
     assert 'docker rm "$candidate_id"' in stale_cleanup
     launch = calls[2][1]
+    assert "torchrun --standalone --local-addr=127.0.0.1" in launch
     assert "--nproc-per-node=8" in launch
     assert "--log-dir /output/torchrun" in launch
     assert "--redirects 3 --tee 3" in launch
@@ -542,7 +558,7 @@ def test_exited_trainer_is_allowed_and_cuda_command_is_fail_closed() -> None:
     assert "--hostname localhost" not in launch
     for key, value in training_ops.operations["transport"]["glm52_trainer"]["env"].items():
         assert f"-e {key}={value}" in launch
-    assert "-e PRIME_PROCESS_GROUP_TIMEOUT_SECONDS=5400" in launch
+    assert "-e PRIME_PROCESS_GROUP_TIMEOUT_SECONDS=240" in launch
     assert "-e PRIME_PROCESS_GROUP_DEVICE_ID=local_rank" in launch
     assert "/app/src/prime_rl/trainer/phase_profiler.py:ro" in launch
     assert "--read-only" in launch

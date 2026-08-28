@@ -122,7 +122,7 @@ transport = "glm52_trainer"
 
 [transport.glm52_trainer]
 network_mode = "host"
-process_group_timeout_seconds = 5400
+process_group_timeout_seconds = 240
 device_id = "local_rank"
 
 [transport.glm52_trainer.env]

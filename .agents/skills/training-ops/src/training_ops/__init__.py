@@ -10308,10 +10308,10 @@ def _pp_async_cuda_transport(profile: dict[str, object]) -> dict[str, object]:
     if (
         isinstance(timeout_seconds, bool)
         or not isinstance(timeout_seconds, int)
-        or timeout_seconds < 1
+        or not 1 <= timeout_seconds < 300
     ):
         raise Refused(
-            "the PP async CUDA process-group timeout must be a positive integer"
+            "the PP async CUDA process-group timeout must be an integer from 1 through 299 seconds"
         )
     device_id = transport["device_id"]
     if device_id != "local_rank":
@@ -10489,7 +10489,8 @@ printf 'STALE removed:%s\n' "$candidate_id"
     runner_path = f"{repository}/source/src/prime_rl/trainer/distributed/pp_runner.py"
     phase_profiler_path = f"{repository}/source/src/prime_rl/trainer/phase_profiler.py"
     inner = (
-        f"torchrun --standalone --nproc-per-node={gpu_count} "
+        f"torchrun --standalone --local-addr=127.0.0.1 "
+        f"--nproc-per-node={gpu_count} "
         "--log-dir /output/torchrun --redirects 3 --tee 3 "
         "/qualification/test_pp_async_cuda.py"
     )
