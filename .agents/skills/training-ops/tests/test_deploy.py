@@ -1,5 +1,9 @@
+import base64
 import hashlib
+import json
+import os
 import socket
+import subprocess
 import tempfile
 import unittest
 from contextlib import nullcontext
@@ -135,6 +139,89 @@ class DeployTest(unittest.TestCase):
         )
         self.assertIn('-e "ssh ${ssh_opts[*]}"', script)
         self.assertNotIn('ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$target"', script)
+
+    def test_remote_adapter_copy_keeps_special_path_data_out_of_remote_shell(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "adapter ' ; $HOME value\nnext"
+            source.write_bytes(b"adapter\n")
+            ssh_log = root / "ssh.jsonl"
+            scp_log = root / "scp.jsonl"
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_ssh = fake_bin / "ssh"
+            fake_ssh.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                "with open(os.environ['SSH_LOG'], 'a') as stream:\n"
+                "    stream.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                "operations = {'final_digest', 'make_directory', 'partial_digest', 'install'}\n"
+                "operation = next((value for value in sys.argv if value in operations), None)\n"
+                "if operation is not None: sys.stdin.buffer.read()\n"
+                "if operation == 'final_digest': raise SystemExit(1)\n"
+                "if operation == 'partial_digest': print(os.environ['EXPECTED_DIGEST'])\n"
+                "raise SystemExit(0 if operation in {'make_directory', 'partial_digest', 'install'} else 1)\n"
+            )
+            fake_ssh.chmod(0o700)
+            fake_scp = fake_bin / "scp"
+            fake_scp.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                "with open(os.environ['SCP_LOG'], 'a') as stream:\n"
+                "    stream.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            )
+            fake_scp.chmod(0o700)
+            with patch.object(training_ops, "run_root", str(root)), patch.object(
+                training_ops, "_ssh", return_value=(0, "")
+            ) as outer_ssh:
+                training_ops._copy_resume_adapter(
+                    str(source), [training_ops.trainer_head, "n76"]
+                )
+            script = outer_ssh.call_args.args[1]
+            digest = hashlib.sha256(source.read_bytes()).hexdigest()
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "PATH": f"{fake_bin}:{environment['PATH']}",
+                    "SSH_LOG": str(ssh_log),
+                    "SCP_LOG": str(scp_log),
+                    "EXPECTED_DIGEST": digest,
+                }
+            )
+            completed = subprocess.run(
+                ["bash", "-c", script],
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            ssh_calls = [json.loads(line) for line in ssh_log.read_text().splitlines()]
+            operation_names = {
+                "final_digest", "make_directory", "partial_digest", "install"
+            }
+            remote_calls = {
+                next(value for value in call if value in operation_names): call
+                for call in ssh_calls
+                if any(value in operation_names for value in call)
+            }
+            self.assertEqual(set(remote_calls), {
+                "final_digest", "make_directory", "partial_digest", "install"
+            })
+            for call in remote_calls.values():
+                self.assertNotIn(str(source), call)
+                operation = next(value for value in call if value in operation_names)
+                marker = call.index(operation)
+                self.assertEqual(
+                    base64.b64decode(call[marker + 1]).decode(),
+                    str(source),
+                )
+            scp_calls = [json.loads(line) for line in scp_log.read_text().splitlines()]
+            self.assertEqual(len(scp_calls), 1)
+            self.assertTrue(any(str(source) in call for call in scp_calls))
+            self.assertTrue(
+                all("/tmp/prime-rl-adapter." in value for call in scp_calls for value in call if ":" in value)
+            )
 
     def test_ssh_command_does_not_use_configured_socket_without_manager(self):
         with patch.dict(training_ops._ssh_control_paths, {}, clear=True), patch.object(
