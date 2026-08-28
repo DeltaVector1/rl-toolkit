@@ -25,6 +25,11 @@ from prime_rl.trainer.models.layers.mlp import MLP, MLPConfig
 from prime_rl.trainer.models.layers.moe import MoE, MoEArgs
 from prime_rl.trainer.models.layers.norms import RMSNorm, RMSNormConfig
 from prime_rl.trainer.models.layers.rotary_emb import RotaryEmbedding, RotaryEmbeddingConfig
+from prime_rl.trainer.models.glm_moe_dsa.position_metadata_cache import (
+    PositionMetadata,
+    PositionMetadataCache,
+    rotary_revision,
+)
 
 
 _LAYER_PROFILE = os.environ.get("PRIME_EP_PROFILE", "") == "1"
@@ -275,8 +280,19 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
         )
         self.rotary_emb = RotaryEmbedding(rotary_config)
         self.gradient_checkpointing = False
-
+        cache_entries = int(getattr(config, "cp_position_metadata_cache_size", 0))
+        cache_bytes = int(
+            getattr(config, "cp_position_metadata_cache_max_bytes", 64 * 1024 * 1024)
+        )
+        self._position_metadata_revision = 0
+        self._position_metadata_cache = PositionMetadataCache(cache_entries, cache_bytes)
+        self._position_metadata_group = None
+        self._position_metadata_rotary = self.rotary_emb
         self.post_init()
+
+    def clear_position_metadata_cache(self) -> None:
+        self._position_metadata_revision += 1
+        self._position_metadata_cache.clear()
 
     def _context_parallel_state(self) -> tuple[dist.ProcessGroup | None, int, int]:
         if len(self.layers) == 0:
@@ -340,22 +356,62 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
         else:
             position_ids_full = position_ids
 
-        flat_position_ids = position_ids_full.view(-1)
-        S_full = flat_position_ids.shape[0]
-        ks_full = torch.arange(S_full, dtype=torch.int32, device=flat_position_ids.device) - flat_position_ids.to(
-            torch.int32
-        )
-        ke_full = torch.arange(1, S_full + 1, dtype=torch.int32, device=flat_position_ids.device)
-
-        # Position embeddings are computed over the full sequence: K uses cos/sin[0:S_full]
-        # while Q uses the local CP slice. ks/ke are computed in K's global coordinate
-        # system and then sharded to the local Q range so the indexer's per-token
-        # causal/varlen mask aligns with the gathered K.
         hidden_states = inputs_embeds
-        position_embeddings = self.rotary_emb(hidden_states, position_ids_full)
+
+        def compute_position_metadata() -> PositionMetadata:
+            flat_position_ids = position_ids_full.view(-1)
+            sequence_length = flat_position_ids.shape[0]
+            ks = torch.arange(
+                sequence_length, dtype=torch.int32, device=flat_position_ids.device
+            ) - flat_position_ids.to(torch.int32)
+            ke = torch.arange(
+                1, sequence_length + 1, dtype=torch.int32, device=flat_position_ids.device
+            )
+            # K uses the full sequence. Q is sliced below for CP.
+            position_embeddings = self.rotary_emb(hidden_states, position_ids_full)
+            return PositionMetadata(position_embeddings, ks, ke)
+
+        if self._position_metadata_cache.enabled:
+            if (
+                self._position_metadata_group is not cp_group
+                or self._position_metadata_rotary is not self.rotary_emb
+            ):
+                self._position_metadata_group = cp_group
+                self._position_metadata_rotary = self.rotary_emb
+                self.clear_position_metadata_cache()
+            rotary_state = rotary_revision(self.rotary_emb, self._position_metadata_revision)
+            cache_key = self._position_metadata_cache.make_key(
+                position_ids=position_ids_full,
+                hidden_states=hidden_states,
+                cp_group=cp_group,
+                cp_rank=cp_rank,
+                cp_world_size=cp_world_size,
+                rotary_state=rotary_state,
+                source_position_ids=position_ids,
+            )
+            position_metadata = self._position_metadata_cache.get(cache_key, position_ids_full)
+            if position_metadata is None:
+                position_metadata = compute_position_metadata()
+                # Dynamic RoPE can update inv_freq during the call.  Store the
+                # entry under the state that produced its values.
+                cache_key = self._position_metadata_cache.make_key(
+                    position_ids=position_ids_full,
+                    hidden_states=hidden_states,
+                    cp_group=cp_group,
+                    cp_rank=cp_rank,
+                    cp_world_size=cp_world_size,
+                    rotary_state=rotary_revision(self.rotary_emb, self._position_metadata_revision),
+                    source_position_ids=position_ids,
+                )
+                self._position_metadata_cache.put(cache_key, position_ids_full, position_metadata)
+        else:
+            position_metadata = compute_position_metadata()
+        ks_full = position_metadata.ks
+        ke_full = position_metadata.ke
+        position_embeddings = position_metadata.position_embeddings
 
         if cp_world_size > 1:
-            s_local = S_full // cp_world_size
+            s_local = ks_full.shape[0] // cp_world_size
             ks = ks_full[cp_rank * s_local : (cp_rank + 1) * s_local].contiguous()
             ke = ke_full[cp_rank * s_local : (cp_rank + 1) * s_local].contiguous()
         else:
@@ -489,6 +545,7 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
     def init_buffers_post_meta(self):
         buffer_names = [name for name, _ in self.named_buffers()]
         if "model.rotary_emb.inv_freq" in buffer_names:
+            self.model.clear_position_metadata_cache()
             rotary_emb = self.model.rotary_emb
             inv_freq, rotary_emb.attention_scaling = rotary_emb.rope_init_fn(
                 rotary_emb.config, rotary_emb.inv_freq.device

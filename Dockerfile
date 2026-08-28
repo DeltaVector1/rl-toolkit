@@ -23,6 +23,7 @@ COPY --chmod=644 source/src/prime_rl/trainer/mxfp4.py /app/src/prime_rl/trainer/
 COPY --chmod=644 source/src/prime_rl/trainer/models/layers/fp8_ada.py /app/src/prime_rl/trainer/models/layers/fp8_ada.py
 COPY --chmod=644 source/src/prime_rl/trainer/distributed/expert_parallel.py /app/src/prime_rl/trainer/distributed/expert_parallel.py
 COPY --chmod=644 source/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py /app/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py
+COPY --chmod=644 source/src/prime_rl/trainer/models/glm_moe_dsa/position_metadata_cache.py /app/src/prime_rl/trainer/models/glm_moe_dsa/position_metadata_cache.py
 COPY --chmod=644 source/src/prime_rl/trainer/models/glm_moe_dsa/sparse_mla_attention.py /app/src/prime_rl/trainer/models/glm_moe_dsa/sparse_mla_attention.py
 COPY --chmod=644 source/src/prime_rl/trainer/models/layers/checkpointing.py /app/src/prime_rl/trainer/models/layers/checkpointing.py
 COPY --chmod=644 source/src/prime_rl/trainer/models/layers/lora/multi_linear.py /app/src/prime_rl/trainer/models/layers/lora/multi_linear.py

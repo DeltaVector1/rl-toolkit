@@ -300,6 +300,12 @@ class ModelConfig(BaseModelConfig):
     cp_style: Literal["ring", "ulysses"] = "ring"
     """CP communication style. ``ring`` uses ring-attention all-gather/reduce-scatter (requires custom kernels per attention type). ``ulysses`` uses all-to-all to redistribute Q/K/V from sequence-sharded to head-sharded, runs vanilla attention locally on the full sequence, then all-to-all back — works out-of-the-box with any attention kernel (softmax FA, linear attention, mamba, etc.)."""
 
+    cp_position_metadata_cache_size: int = Field(0, ge=0)
+    """Number of exact CP position metadata entries to retain. Zero disables the cache."""
+
+    cp_position_metadata_cache_max_bytes: int = Field(64 * 1024 * 1024, gt=0)
+    """Maximum device memory reserved by the CP position metadata cache."""
+
     impl: Literal["hf", "custom", "auto"] = "auto"
     """Model implementation. ``auto`` selects ``custom`` if supported by the model, otherwise ``hf``."""
 
