@@ -140,6 +140,13 @@ class DeployTest(unittest.TestCase):
         self.assertIn('-e "ssh ${ssh_opts[*]}"', script)
         self.assertNotIn('ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$target"', script)
 
+    def test_remote_adapter_copy_rejects_nul_before_building_script(self):
+        path = f"{training_ops.run_root}/muse19/adapter_model\x00.safetensors"
+        with patch.object(training_ops, "_ssh") as ssh:
+            with self.assertRaises(training_ops.Refused):
+                training_ops._copy_resume_adapter(path, [training_ops.trainer_head, "n76"])
+        ssh.assert_not_called()
+
     def test_remote_adapter_copy_keeps_special_path_data_out_of_remote_shell(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -236,6 +243,8 @@ class DeployTest(unittest.TestCase):
             self.assertTrue(
                 all("/tmp/adapter-copy." in value for call in scp_calls for value in call if ":" in value)
             )
+            self.assertNotIn('mv -- "$staging" "$final"', script)
+            self.assertIn('ln -- "$staging" "$final"', script)
 
     def test_remote_adapter_copy_cleans_failed_staging(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -284,6 +293,113 @@ class DeployTest(unittest.TestCase):
             self.assertEqual(completed.returncode, 1)
             calls = [json.loads(line) for line in (fake_ssh.with_name("ssh.log")).read_text().splitlines()]
             self.assertIn("cleanup", [value for call in calls for value in call])
+
+    def test_remote_adapter_copy_different_content_never_overwrites(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_a = root / "source-a" / "adapter.safetensors"
+            source_b = root / "source-b" / "adapter.safetensors"
+            source_a.parent.mkdir()
+            source_b.parent.mkdir()
+            source_a.write_bytes(b"adapter-a\n")
+            source_b.write_bytes(b"adapter-b\n")
+            state = root / "race-state.json"
+            state.write_text('{"final_digest": null, "install_results": []}')
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_ssh = fake_bin / "ssh"
+            fake_ssh.write_text(
+                "#!/usr/bin/env python3\n"
+                "import base64, fcntl, json, os, sys\n"
+                "args = sys.argv[1:]\n"
+                "operations = {'final_digest', 'create_staging', 'partial_digest', 'cleanup', 'install'}\n"
+                "operation = next((value for value in args if value in operations), None)\n"
+                "if operation is not None: sys.stdin.buffer.read()\n"
+                "def argument(offset):\n"
+                "    return args[args.index(operation) + offset]\n"
+                "def decoded(offset):\n"
+                "    return base64.b64decode(argument(offset)).decode()\n"
+                "if operation == 'final_digest': raise SystemExit(1)\n"
+                "if operation == 'create_staging':\n"
+                "    suffix = 'a' if '/source-a/' in decoded(1) else 'b'\n"
+                "    print(f'/tmp/adapter-race-{suffix}.partial')\n"
+                "    raise SystemExit(0)\n"
+                "if operation == 'partial_digest':\n"
+                "    suffix = decoded(2).rsplit('-', 1)[-1].split('.', 1)[0]\n"
+                "    print(os.environ[f'DIGEST_{suffix.upper()}'])\n"
+                "    raise SystemExit(0)\n"
+                "if operation == 'cleanup': raise SystemExit(0)\n"
+                "if operation == 'install':\n"
+                "    suffix = decoded(2).rsplit('-', 1)[-1].split('.', 1)[0]\n"
+                "    digest = os.environ[f'DIGEST_{suffix.upper()}']\n"
+                "    with open(os.environ['RACE_STATE'], 'r+') as stream:\n"
+                "        fcntl.flock(stream, fcntl.LOCK_EX)\n"
+                "        data = json.load(stream)\n"
+                "        if data['final_digest'] is None:\n"
+                "            data['final_digest'] = digest\n"
+                "            data['install_results'].append('installed')\n"
+                "            result = 0\n"
+                "        elif data['final_digest'] == digest:\n"
+                "            data['install_results'].append('already-present')\n"
+                "            result = 0\n"
+                "        else:\n"
+                "            data['install_results'].append('different-content')\n"
+                "            result = 3\n"
+                "        stream.seek(0)\n"
+                "        stream.truncate()\n"
+                "        json.dump(data, stream)\n"
+                "        stream.flush()\n"
+                "        os.fsync(stream.fileno())\n"
+                "    raise SystemExit(result)\n"
+                "raise SystemExit(1)\n"
+            )
+            fake_ssh.chmod(0o700)
+            fake_scp = fake_bin / "scp"
+            fake_scp.write_text("#!/bin/sh\nexit 0\n")
+            fake_scp.chmod(0o700)
+            fake_sleep = fake_bin / "sleep"
+            fake_sleep.write_text("#!/bin/sh\nexit 0\n")
+            fake_sleep.chmod(0o700)
+            with patch.object(training_ops, "run_root", str(root)), patch.object(
+                training_ops, "_ssh", return_value=(0, "")
+            ) as outer_ssh:
+                training_ops._copy_resume_adapter(
+                    str(source_a), [training_ops.trainer_head, "n76"]
+                )
+                script_a = outer_ssh.call_args.args[1]
+                training_ops._copy_resume_adapter(
+                    str(source_b), [training_ops.trainer_head, "n76"]
+                )
+                script_b = outer_ssh.call_args.args[1]
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "PATH": f"{fake_bin}:{environment['PATH']}",
+                    "RACE_STATE": str(state),
+                    "DIGEST_A": hashlib.sha256(source_a.read_bytes()).hexdigest(),
+                    "DIGEST_B": hashlib.sha256(source_b.read_bytes()).hexdigest(),
+                }
+            )
+            processes = [
+                subprocess.Popen(
+                    ["bash", "-c", script],
+                    env=environment,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                for script in (script_a, script_b)
+            ]
+            completed = [process.communicate(timeout=30) for process in processes]
+            self.assertEqual(
+                {process.returncode for process in processes},
+                {0, 1},
+                completed,
+            )
+            result = json.loads(state.read_text())
+            self.assertEqual(result["install_results"].count("installed"), 1)
+            self.assertEqual(result["install_results"].count("different-content"), 1)
+            self.assertIn(result["final_digest"], {environment["DIGEST_A"], environment["DIGEST_B"]})
 
     def test_ssh_command_does_not_use_configured_socket_without_manager(self):
         with patch.dict(training_ops._ssh_control_paths, {}, clear=True), patch.object(
