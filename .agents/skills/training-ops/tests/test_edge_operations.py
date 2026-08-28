@@ -2920,6 +2920,10 @@ raise SystemExit(99)
     def test_parity_stage_copy_timeout_is_bounded(self):
         with tempfile.TemporaryDirectory() as temporary:
             with patch.object(
+                training_ops,
+                "_ssh_control_options",
+                return_value=["-o", "ControlMaster=no", "-o", "ControlPath=none"],
+            ), patch.object(
                 training_ops.subprocess,
                 "run",
                 side_effect=subprocess.TimeoutExpired("scp", 600),
@@ -2932,6 +2936,10 @@ raise SystemExit(99)
     def test_parity_stage_copy_and_fanout_are_compressed_and_bounded(self):
         copied = subprocess.CompletedProcess([], 0, "", "")
         with tempfile.TemporaryDirectory() as temporary, patch.object(
+            training_ops,
+            "_ssh_control_options",
+            return_value=["-o", "ControlMaster=no", "-o", "ControlPath=none"],
+        ), patch.object(
             training_ops.subprocess, "run", return_value=copied
         ) as run:
             training_ops._copy_glm_parity_stage(
@@ -2940,7 +2948,8 @@ raise SystemExit(99)
                 Path(temporary),
             )
         command = run.call_args.args[0]
-        self.assertEqual(command[:6], ["scp", "-C", "-q", "-o", "BatchMode=yes", "-r"])
+        self.assertEqual(command[:5], ["scp", "-C", "-q", "-o", "BatchMode=yes"])
+        self.assertIn("-r", command)
         self.assertEqual(run.call_args.kwargs["timeout"], 600)
         candidate = (
             f"{training_ops.glm_parity_stage_candidate_root}/"

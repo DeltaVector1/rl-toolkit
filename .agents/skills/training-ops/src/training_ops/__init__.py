@@ -616,6 +616,17 @@ def _active_ssh_control_options(host: str) -> list[str]:
     return ["-o", "ControlMaster=no", "-o", f"ControlPath={path}"]
 
 
+def _ssh_control_options(host: str) -> list[str]:
+    """Use a validated configured master or disable multiplexing."""
+    active = _active_ssh_control_options(host)
+    if active:
+        return active
+    configured = _configured_ssh_control_path(host)
+    if configured is not None:
+        return ["-o", "ControlMaster=no", "-o", f"ControlPath={configured}"]
+    return ["-o", "ControlMaster=no", "-o", "ControlPath=none"]
+
+
 def _configured_ssh_control_path(host: str) -> str | None:
     """Return a live configured control path, or fail closed if it is stale."""
     _check_host(host)
@@ -887,7 +898,6 @@ def _ssh(
     connect_timeout: int | None = None,
 ) -> tuple[int, str]:
     _check_host(host)
-    command = [*ssh_command, *_active_ssh_control_options(host)]
     if connect_timeout is not None:
         if (
             isinstance(connect_timeout, bool)
@@ -895,6 +905,15 @@ def _ssh(
             or not 1 <= connect_timeout <= 120
         ):
             raise Refused("SSH connect timeout must be an integer from 1 to 120 seconds")
+        timeout_options = [
+            index
+            for index, value in enumerate(ssh_command)
+            if value.startswith("ConnectTimeout=")
+        ]
+        if len(timeout_options) != 1:
+            raise Refused("SSH connect timeout inventory is invalid")
+    command = [*ssh_command, *_ssh_control_options(host)]
+    if connect_timeout is not None:
         timeout_options = [
             index
             for index, value in enumerate(command)
@@ -2855,6 +2874,7 @@ def _download_adapter_file(remote_path: str, local_path: Path) -> None:
         "PasswordAuthentication=no",
         "-o",
         "ConnectTimeout=25",
+        *_ssh_control_options(trainer_head),
         f"{trainer_head}:{remote_path}",
         str(local_path),
     ]
@@ -5637,7 +5657,7 @@ def _sensitive_ssh_input(
     _check_host(host)
     try:
         process = subprocess.run(
-            ssh_command + [host, command],
+            [*ssh_command, *_ssh_control_options(host), host, command],
             input=secret + "\n",
             capture_output=True,
             text=True,
@@ -5656,7 +5676,7 @@ def _receive_parity_bootstrap(host: str, command: str, timeout: int) -> str:
     _check_host(host)
     try:
         process = subprocess.run(
-            ssh_command + [host, command],
+            [*ssh_command, *_ssh_control_options(host), host, command],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
@@ -6254,6 +6274,7 @@ def _copy_parity_diagnostic_input(
                 "-q",
                 "-o",
                 "BatchMode=yes",
+                *_ssh_control_options(source_host),
                 f"{source_host}:{source_path}",
                 str(local_input),
             ],
@@ -6269,6 +6290,7 @@ def _copy_parity_diagnostic_input(
                 "-q",
                 "-o",
                 "BatchMode=yes",
+                *_ssh_control_options(destination_host),
                 str(local_input),
                 f"{destination_host}:{destination_path}",
             ],
@@ -6362,6 +6384,7 @@ def _copy_parity_refresh_file(
                     "-q",
                     "-o",
                     "BatchMode=yes",
+                    *_ssh_control_options(source_host),
                     f"{source_host}:{source_path}",
                     str(local),
                 ],
@@ -6373,6 +6396,7 @@ def _copy_parity_refresh_file(
                     "-q",
                     "-o",
                     "BatchMode=yes",
+                    *_ssh_control_options(destination_host),
                     str(local),
                     f"{destination_host}:{destination_path}",
                 ],
@@ -9622,6 +9646,7 @@ install -d -m 0750 "$candidate"
                         "-q",
                         "-o",
                         "BatchMode=yes",
+                        *_ssh_control_options(host),
                         str(local),
                         f"{host}:{candidate}/{name}",
                     ],
@@ -12508,6 +12533,7 @@ def _copy_glm_parity_stage(host: str, stage: str, local_parent: Path) -> Path:
                 "-q",
                 "-o",
                 "BatchMode=yes",
+                *_ssh_control_options(host),
                 "-r",
                 f"{host}:{stage}",
                 str(local_parent),
@@ -13329,7 +13355,16 @@ def collect_glm52_policy_parity(name: str, nodes: list[str] | None = None) -> di
     def copy_tree(host: str, remote: str, local: Path) -> None:
         _check_host(host)
         result = subprocess.run(
-            ["scp", "-q", "-o", "BatchMode=yes", "-r", f"{host}:{remote}", str(local)],
+            [
+                "scp",
+                "-q",
+                "-o",
+                "BatchMode=yes",
+                *_ssh_control_options(host),
+                "-r",
+                f"{host}:{remote}",
+                str(local),
+            ],
             capture_output=True,
             text=True,
             timeout=1800,
@@ -13410,8 +13445,15 @@ def collect_glm52_policy_parity(name: str, nodes: list[str] | None = None) -> di
         local_digest = hashlib.sha256(report.read_bytes()).hexdigest()
         temporary_report = f"{remote_root}/.report-{name}-{local_digest}.json"
         copy_result = subprocess.run(
-            ["scp", "-q", "-o", "BatchMode=yes", str(report),
-             f"{orchestrator_host}:{temporary_report}"],
+            [
+                "scp",
+                "-q",
+                "-o",
+                "BatchMode=yes",
+                *_ssh_control_options(orchestrator_host),
+                str(report),
+                f"{orchestrator_host}:{temporary_report}",
+            ],
             capture_output=True,
             text=True,
             timeout=300,
