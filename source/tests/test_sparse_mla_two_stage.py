@@ -123,6 +123,13 @@ class SparseMlaTwoStageTest(unittest.TestCase):
         self.assertIn("same-device tensors", SOURCE)
         self.assertIn("@triton.jit", SOURCE)
 
+    def test_dkv_matches_reference_bf16_conversion_boundary(self):
+        self.assertIn(
+            "probability = probability.to(tl.bfloat16).to(tl.float32)",
+            SOURCE,
+        )
+        self.assertIn("dp = dp.to(tl.bfloat16).to(tl.float32)", SOURCE)
+
     def test_triton_kernel_receives_all_global_constants_as_constexpr(self):
         tree = ast.parse(SOURCE)
         kernel = next(

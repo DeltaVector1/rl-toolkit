@@ -186,6 +186,10 @@ if triton is not None:
                 delta_value = tl.load(delta + query_id * delta_stride_s + head * delta_stride_h)
                 dp = probability * (dp_score - delta_value) * sm_scale
 
+                # Match the reference BF16 shared-memory conversion.
+                probability = probability.to(tl.bfloat16).to(tl.float32)
+                dp = dp.to(tl.bfloat16).to(tl.float32)
+
                 q_output = tl.load(q + q_base + width, mask=output_mask, other=0.0).to(tl.float32)
                 do_output = tl.load(
                     do + query_id * do_stride_s + head * do_stride_h + width,
