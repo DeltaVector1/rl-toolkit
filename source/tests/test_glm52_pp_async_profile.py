@@ -196,6 +196,64 @@ def test_cuda_smoke_profile_is_small_and_n82_only() -> None:
     assert "/data/ZiphuAI" not in script
 
 
+def test_cuda_smoke_overrides_have_a_closed_prime_rl_import_graph() -> None:
+    entry = "source/tests/test_pp_async_cuda.py"
+    mounted = {
+        "prime_rl.trainer.distributed.async_schedule": (
+            "source/src/prime_rl/trainer/distributed/async_schedule.py"
+        ),
+        "prime_rl.trainer.distributed.pp_runner": (
+            "source/src/prime_rl/trainer/distributed/pp_runner.py"
+        ),
+        "prime_rl.trainer.phase_profiler": (
+            "source/src/prime_rl/trainer/phase_profiler.py"
+        ),
+    }
+    image_modules = {
+        "prime_rl.trainer.model",
+        "prime_rl.utils.act_offloading",
+    }
+
+    def imports(relative: str) -> set[str]:
+        tree = ast.parse((ROOT / relative).read_text())
+        dependencies = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                dependencies.update(
+                    alias.name
+                    for alias in node.names
+                    if alias.name.startswith("prime_rl.")
+                )
+            elif (
+                isinstance(node, ast.ImportFrom)
+                and node.module is not None
+                and node.module.startswith("prime_rl.")
+            ):
+                for alias in node.names:
+                    candidate = f"{node.module}.{alias.name}"
+                    candidate_path = (
+                        ROOT / "source/src" / (candidate.replace(".", "/") + ".py")
+                    )
+                    dependencies.add(candidate if candidate_path.is_file() else node.module)
+        return dependencies
+
+    pending = [entry]
+    visited = set()
+    missing = set()
+    while pending:
+        relative = pending.pop()
+        if relative in visited:
+            continue
+        visited.add(relative)
+        for module in imports(relative):
+            if module in mounted:
+                pending.append(mounted[module])
+            elif module not in image_modules:
+                missing.add(module)
+    assert not missing
+    assert visited == {entry, *mounted.values()}
+
+
 def test_cuda_smoke_has_a_resolvable_hostname_without_network_access() -> None:
     source = (
         ROOT / ".agents/skills/training-ops/src/training_ops/__init__.py"
@@ -211,6 +269,11 @@ def test_exited_trainer_is_allowed_and_cuda_command_is_fail_closed() -> None:
     smoke = "glm52-pp-async-cuda-smoke"
     test_path = "source/tests/test_pp_async_cuda.py"
     assert training_ops._mounted_on(test_path, "n82", profile_name=smoke)
+    assert training_ops._mounted_on(
+        "source/src/prime_rl/trainer/phase_profiler.py",
+        "n82",
+        profile_name=smoke,
+    )
     assert not training_ops._mounted_on(test_path, "n76", profile_name=smoke)
     assert not training_ops._mounted_on(test_path, "n82")
 
@@ -218,6 +281,7 @@ def test_exited_trainer_is_allowed_and_cuda_command_is_fail_closed() -> None:
         test_path,
         "source/src/prime_rl/trainer/distributed/async_schedule.py",
         "source/src/prime_rl/trainer/distributed/pp_runner.py",
+        "source/src/prime_rl/trainer/phase_profiler.py",
     )
     hashes = {
         "test_sha256": hashlib.sha256((ROOT / source_paths[0]).read_bytes()).hexdigest(),
@@ -225,6 +289,9 @@ def test_exited_trainer_is_allowed_and_cuda_command_is_fail_closed() -> None:
             (ROOT / source_paths[1]).read_bytes()
         ).hexdigest(),
         "pp_runner_sha256": hashlib.sha256((ROOT / source_paths[2]).read_bytes()).hexdigest(),
+        "phase_profiler_sha256": hashlib.sha256(
+            (ROOT / source_paths[3]).read_bytes()
+        ).hexdigest(),
     }
     mode = {
         "steps": [{"cuda_ms": 1.0}, {"cuda_ms": 1.0}],
@@ -282,6 +349,7 @@ def test_exited_trainer_is_allowed_and_cuda_command_is_fail_closed() -> None:
     assert "--redirects 3 --tee 3" in launch
     assert "--network none" in launch
     assert "--hostname localhost" in launch
+    assert "/app/src/prime_rl/trainer/phase_profiler.py:ro" in launch
     assert "--read-only" in launch
     assert "--cidfile" in launch
     assert "--label prime.qualification=glm52-pp-async-cuda-smoke" in launch

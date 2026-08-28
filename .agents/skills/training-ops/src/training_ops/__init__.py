@@ -7578,7 +7578,12 @@ def _repair_supervisors() -> str:
 
 _QUALIFICATION_ONLY_MOUNTS = {
     _CUDA_MEMORY_CAPTURE_PROFILE: frozenset({"source/tests/test_final_pp16_cuda.py"}),
-    _PP_ASYNC_CUDA_PROFILE: frozenset({"source/tests/test_pp_async_cuda.py"}),
+    _PP_ASYNC_CUDA_PROFILE: frozenset(
+        {
+            "source/tests/test_pp_async_cuda.py",
+            "source/src/prime_rl/trainer/phase_profiler.py",
+        }
+    ),
 }
 
 
@@ -10387,6 +10392,7 @@ printf 'STALE removed:%s\n' "$candidate_id"
         profile["script"],
         "source/src/prime_rl/trainer/distributed/async_schedule.py",
         "source/src/prime_rl/trainer/distributed/pp_runner.py",
+        "source/src/prime_rl/trainer/phase_profiler.py",
     )
     for path in source_paths:
         if not deploy(
@@ -10406,6 +10412,7 @@ printf 'STALE removed:%s\n' "$candidate_id"
         f"{repository}/source/src/prime_rl/trainer/distributed/async_schedule.py"
     )
     runner_path = f"{repository}/source/src/prime_rl/trainer/distributed/pp_runner.py"
+    phase_profiler_path = f"{repository}/source/src/prime_rl/trainer/phase_profiler.py"
     inner = (
         "torchrun --standalone --nproc-per-node=8 "
         "--log-dir /output/torchrun --redirects 3 --tee 3 "
@@ -10485,6 +10492,7 @@ sudo timeout --foreground --signal=TERM --kill-after=30s {startup_deadline}s \
   -v {shlex.quote(script_path)}:/qualification/test_pp_async_cuda.py:ro \
   -v {shlex.quote(async_path)}:/app/src/prime_rl/trainer/distributed/async_schedule.py:ro \
   -v {shlex.quote(runner_path)}:/app/src/prime_rl/trainer/distributed/pp_runner.py:ro \
+  -v {shlex.quote(phase_profiler_path)}:/app/src/prime_rl/trainer/phase_profiler.py:ro \
   -v {shlex.quote(output_dir)}:/output:rw \
   -e PYTHONPATH=/app/src -e NCCL_ASYNC_ERROR_HANDLING=1 \
   --entrypoint /bin/bash {shlex.quote(trainer_image)} -lc {shlex.quote(inner)}
@@ -10591,6 +10599,9 @@ cat {shlex.quote(result_path)}
         ).hexdigest(),
         "pp_runner_sha256": hashlib.sha256(
             (repo_root / source_paths[2]).read_bytes()
+        ).hexdigest(),
+        "phase_profiler_sha256": hashlib.sha256(
+            (repo_root / source_paths[3]).read_bytes()
         ).hexdigest(),
     }
     if (

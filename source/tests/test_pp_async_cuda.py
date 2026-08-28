@@ -13,6 +13,7 @@ import torch.distributed as dist
 from torch import nn
 from torch.distributed.elastic.multiprocessing.errors import record
 
+from prime_rl.trainer import phase_profiler
 from prime_rl.trainer.distributed import async_schedule, pp_runner
 
 
@@ -259,6 +260,9 @@ def main() -> None:
                 ).hexdigest(),
                 "pp_runner_sha256": hashlib.sha256(
                     Path(pp_runner.__file__).read_bytes()
+                ).hexdigest(),
+                "phase_profiler_sha256": hashlib.sha256(
+                    Path(phase_profiler.__file__).read_bytes()
                 ).hexdigest(),
                 "test_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
             }
