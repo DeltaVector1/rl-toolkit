@@ -454,14 +454,25 @@ def _production20_identity_failures(
     required_text(
         "model_repo_id", r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*"
     )
+    model_repo_id = identity.get("model_repo_id")
+    if model_repo_id is not None and model_repo_id != parity.get("model_repo_id"):
+        failures.append("identity model repository differs from parity metadata")
     model_revision = required_text("model_revision", r"[0-9a-f]{40}")
     if model_revision is not None and model_revision != parity.get("model_revision"):
         failures.append("identity model revision differs from parity metadata")
     model_variant = required_text("model_variant", r"[A-Za-z0-9][A-Za-z0-9_.-]*")
-    if model_variant is not None and model_variant != parity.get("quantization"):
+    if model_variant is not None and model_variant != parity.get("model_variant"):
         failures.append("identity model variant differs from parity metadata")
-    required_text("model_content_sha256", r"[0-9a-f]{64}")
-    required_text("model_manifest_sha256", r"[0-9a-f]{64}")
+    model_content_sha256 = required_text("model_content_sha256", r"[0-9a-f]{64}")
+    if model_content_sha256 is not None and model_content_sha256 != parity.get(
+        "model_content_sha256"
+    ):
+        failures.append("identity model content hash differs from parity metadata")
+    model_manifest_sha256 = required_text("model_manifest_sha256", r"[0-9a-f]{64}")
+    if model_manifest_sha256 is not None and model_manifest_sha256 != parity.get(
+        "model_manifest_sha256"
+    ):
+        failures.append("identity model manifest hash differs from parity metadata")
 
     lora = model.get("lora")
     if not isinstance(lora, dict):

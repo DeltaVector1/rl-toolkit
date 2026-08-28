@@ -98,6 +98,17 @@ def test_glm52_production20_requires_identity_and_no_rollout_cache() -> None:
     assert profile["identity"]["trainer_loaded_library_manifest_sha256"] == (
         "fcb5927503546e70ac2ec41ad524b94daa8053f5ad630387259ca1b784c13cbd"
     )
+    assert profile["identity"]["model_repo_id"] == "zai-org/GLM-5.2-FP8"
+    assert profile["identity"]["model_revision"] == (
+        "ba978f7d347eaf65d22f1a86833408afdb953541"
+    )
+    assert profile["identity"]["model_variant"] == "native_fp8"
+    assert profile["identity"]["model_content_sha256"] == (
+        "2e938176b7dba6a2fec8e07f36a1d13e0c5015ea048384ac2612285a93a3a170"
+    )
+    assert profile["identity"]["model_manifest_sha256"] == (
+        "2e938176b7dba6a2fec8e07f36a1d13e0c5015ea048384ac2612285a93a3a170"
+    )
     incomplete = dict(profile)
     incomplete["identity"] = dict(profile["identity"])
     incomplete["identity"].pop("trainer_runtime_aggregate_sha256")
@@ -107,8 +118,8 @@ def test_glm52_production20_requires_identity_and_no_rollout_cache() -> None:
     )
     assert "identity trainer_runtime_aggregate_sha256 is missing" in incomplete_failures
     assert "identity trainer_loaded_library_manifest_sha256 is missing" in incomplete_failures
-    assert "identity model_content_sha256 is missing" in failures
-    assert "identity model_manifest_sha256 is missing" in failures
+    assert not any("model content hash" in failure for failure in failures)
+    assert not any("model manifest hash" in failure for failure in failures)
     assert not any("rollout cache" in failure for failure in failures)
 
     assert trainer["model"]["name"] == "/data/ZiphuAI/GLM-5.2-FP8"
@@ -172,6 +183,20 @@ def test_glm52_production20_requires_identity_and_no_rollout_cache() -> None:
             "glm52-production20", broken, trainer, orchestrator, environment
         )
     )
+
+
+def test_glm52_production_and_parity_model_identities_match() -> None:
+    operations = _load("configs/operations.toml")
+    production = operations["profiles"]["glm52-production20"]["identity"]
+    parity = _load("configs/qualification/glm52-policy-parity.toml")
+    for name in (
+        "model_repo_id",
+        "model_revision",
+        "model_variant",
+        "model_content_sha256",
+        "model_manifest_sha256",
+    ):
+        assert production[name] == parity[name]
 
 
 def test_glm52_launchers_cannot_use_live_muse_container_names() -> None:

@@ -50,7 +50,11 @@ def _profile_repository(path: Path) -> Path:
 
 def _validate_profile_identity_values(values: dict[str, Any], path: Path) -> None:
     expected = {
+        "model_repo_id": "zai-org/GLM-5.2-FP8",
         "model_revision": "ba978f7d347eaf65d22f1a86833408afdb953541",
+        "model_variant": "native_fp8",
+        "model_content_sha256": "2e938176b7dba6a2fec8e07f36a1d13e0c5015ea048384ac2612285a93a3a170",
+        "model_manifest_sha256": "2e938176b7dba6a2fec8e07f36a1d13e0c5015ea048384ac2612285a93a3a170",
         "adapter_alias": "glm52-policy-parity-r32-fresh",
         "adapter_path": "/data/glm52-rl/qualifications/glm52-step20-h200/adapter-step20",
         "adapter_is_merged": False,
@@ -325,6 +329,10 @@ def _profile_runtime_identity(profile: Profile, side: str) -> dict[str, Any] | N
     )
     return {
         "model_revision": values["model_revision"],
+        "model_repo_id": values.get("model_repo_id"),
+        "model_variant": values.get("model_variant"),
+        "model_content_sha256": values.get("model_content_sha256"),
+        "model_manifest_sha256": values.get("model_manifest_sha256"),
         "adapter_alias": values["adapter_alias"],
         "adapter_path": values["adapter_path"],
         "adapter_is_merged": values["adapter_is_merged"],
@@ -345,6 +353,10 @@ def _validate_runtime_identity(
         return
     for name in (
         "model_revision",
+        "model_repo_id",
+        "model_variant",
+        "model_content_sha256",
+        "model_manifest_sha256",
         "adapter_alias",
         "adapter_is_merged",
         "rollout_cache",
@@ -1219,6 +1231,14 @@ def record_trace(
                 "router_request_mode": identity["router_request_mode"],
             }
         )
+        for name in (
+            "model_repo_id",
+            "model_variant",
+            "model_content_sha256",
+            "model_manifest_sha256",
+        ):
+            if identity[name] is not None:
+                manifest[name] = identity[name]
         _validate_runtime_identity(profile, manifest, side)
     (output / "manifest.json").write_bytes(json_bytes(manifest))
     return manifest
@@ -2501,6 +2521,14 @@ def capture_h200(
                 "router_request_mode": identity["router_request_mode"],
             }
         )
+        for name in (
+            "model_repo_id",
+            "model_variant",
+            "model_content_sha256",
+            "model_manifest_sha256",
+        ):
+            if identity[name] is not None:
+                manifest[name] = identity[name]
         _validate_runtime_identity(profile, manifest, "h200")
     (output / "manifest.json").write_bytes(json_bytes(manifest))
     normalize_h200_capture_permissions(output, manifest)
