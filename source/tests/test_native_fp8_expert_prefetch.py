@@ -166,13 +166,164 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
         )
         self.assertIn("prefetch_modules.append(next_mlp.experts)", source)
         self.assertIn("prefetch_modules.append(prev_mlp.experts)", source)
-        self.assertEqual(source.count("config.native_fp8_expert_prefetch"), 2)
+        self.assertEqual(source.count("config.native_fp8_expert_prefetch"), 3)
 
         trainer_config = (
             ROOT
             / "source/packages/prime-rl-configs/src/prime_rl/configs/trainer.py"
         ).read_text()
         self.assertIn("native_fp8_expert_prefetch: bool = False", trainer_config)
+
+    def test_fsdp_param_comm_overlap_is_qualification_only_and_bounded(self):
+        model_source = MODEL.read_text()
+        trainer_config = (
+            ROOT / "source/packages/prime-rl-configs/src/prime_rl/configs/trainer.py"
+        ).read_text()
+        self.assertIn("fsdp_param_comm_overlap: bool = False", trainer_config)
+        setup = next(
+            node
+            for node in ast.parse(model_source).body
+            if isinstance(node, ast.FunctionDef) and node.name == "setup_fsdp"
+        )
+        setup_source = ast.unparse(setup)
+        self.assertLess(
+            setup_source.index("_validate_fsdp_param_comm_overlap"),
+            setup_source.index("fully_shard("),
+        )
+        self.assertIn("prefetch_modules = prefetch_modules[:1]", setup_source)
+        self.assertIn("_configure_fsdp_param_comm_overlap", setup_source)
+
+        profile = tomllib.loads(
+            (ROOT / "configs/qualification/glm52-native-fsdp-overlap.toml").read_text()
+        )
+        self.assertTrue(profile["model"]["fsdp_param_comm_overlap"])
+        for relative in (
+            "configs/paused/trainer.glm52-production.toml",
+            "configs/qualification/glm52-native-b2048.toml",
+            "configs/qualification/glm52-native-stability20.toml",
+        ):
+            current = tomllib.loads((ROOT / relative).read_text())
+            self.assertFalse(current["model"].get("fsdp_param_comm_overlap", False), relative)
+
+    def test_fsdp_param_comm_overlap_requires_supported_runtime_and_shape(self):
+        tree = ast.parse(MODEL.read_text())
+        selected = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name
+            in {
+                "_validate_fsdp_param_comm_overlap",
+                "_configure_fsdp_param_comm_overlap",
+            }
+        ]
+        module = ast.Module(body=selected, type_ignores=[])
+        ast.fix_missing_locations(module)
+        namespace = {
+            "ValueError": ValueError,
+            "RuntimeError": RuntimeError,
+            "nn": type("NN", (), {"Module": object}),
+            "ModelConfig": object,
+            "ParallelDims": object,
+            "get_logger": lambda: type("Logger", (), {"info": lambda *_: None})(),
+        }
+        exec(compile(module, str(MODEL), "exec"), namespace)
+
+        config = type(
+            "Config",
+            (),
+            {
+                "fsdp_param_comm_overlap": True,
+                "reshard_after_forward": True,
+                "fsdp_cpu_offload": False,
+                "cold_cpu_offload": False,
+                "optim_cpu_offload": False,
+                "pp_schedule": "1f1b",
+                "ep_comm_backend": "torch",
+                "ac": type(
+                    "AC",
+                    (),
+                    {
+                        "mode": "reentrant_attention_all_experts",
+                        "keep_routed_expert_activations_from_pp_stage": 5,
+                    },
+                )(),
+            },
+        )()
+        dims = type(
+            "Dims",
+            (),
+            {
+                "ep_enabled": True,
+                "pp": 8,
+                "cp": 8,
+                "ep": 8,
+                "dp_replicate": 1,
+                "global_ep": False,
+            },
+        )()
+        calls = []
+
+        class Model:
+            def _set_unshard_async_op(self, value):
+                calls.append(value)
+
+        namespace["_configure_fsdp_param_comm_overlap"](Model(), config, dims, True)
+        self.assertEqual(calls, [True])
+
+        with self.assertRaisesRegex(ValueError, "native FP8"):
+            namespace["_configure_fsdp_param_comm_overlap"](Model(), config, dims, False)
+        with self.assertRaisesRegex(ValueError, "PP8/CP8/EP8"):
+            bad_dims = type("Dims", (), {**dims.__dict__, "cp": 4})()
+            namespace["_configure_fsdp_param_comm_overlap"](Model(), config, bad_dims, True)
+        with self.assertRaisesRegex(RuntimeError, "FSDP2"):
+            namespace["_configure_fsdp_param_comm_overlap"](object(), config, dims, True)
+
+    def test_fsdp_param_comm_overlap_limits_nested_prefetch_to_one_target(self):
+        helper = next(
+            node
+            for node in ast.parse(MODEL.read_text()).body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_set_bounded_nested_backward_prefetch"
+        )
+        module = ast.Module(body=[helper], type_ignores=[])
+        ast.fix_missing_locations(module)
+
+        class FakeFSDP:
+            def __init__(self):
+                self.targets = []
+
+            def set_modules_to_backward_prefetch(self, modules):
+                self.targets.append(list(modules))
+
+        class FakeMoE:
+            pass
+
+        namespace = {
+            "MoE": FakeMoE,
+            "LatentMoE": type("LatentMoE", (), {}),
+            "FSDPModule": FakeFSDP,
+            "nn": type("NN", (), {"Module": object}),
+        }
+        exec(compile(module, str(MODEL), "exec"), namespace)
+
+        def block():
+            current = type("Block", (), {})()
+            current.mlp = FakeMoE()
+            current.mlp.router = FakeFSDP()
+            current.mlp.experts = FakeFSDP()
+            current.mlp.shared_expert = FakeFSDP()
+            return current
+
+        previous, current = block(), block()
+        namespace["_set_bounded_nested_backward_prefetch"](current, previous, False)
+        self.assertEqual(current.mlp.router.targets, [[previous.mlp.router]])
+        self.assertEqual(current.mlp.experts.targets, [[current.mlp.experts]])
+        self.assertEqual(current.mlp.shared_expert.targets, [[current.mlp.shared_expert]])
+        self.assertTrue(all(len(targets) == 1 for group in (current.mlp.router, current.mlp.experts, current.mlp.shared_expert) for targets in group.targets))
+
+        namespace["_set_bounded_nested_backward_prefetch"](current, previous, True)
+        self.assertEqual(current.mlp.experts.targets[-1], [previous.mlp.experts])
 
     def test_prefetch_pairs_stop_at_virtual_stage_boundaries(self):
         tree = ast.parse(MODEL.read_text())

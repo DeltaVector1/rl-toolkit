@@ -152,6 +152,85 @@ def _virtual_stage_prefetch_pairs(
     return groups, forward_pairs, backward_pairs
 
 
+def _validate_fsdp_param_comm_overlap(
+    config: ModelConfig,
+    parallel_dims: ParallelDims,
+    native_fp8: bool,
+) -> None:
+    if not config.fsdp_param_comm_overlap:
+        return
+    if not native_fp8:
+        raise ValueError("fsdp_param_comm_overlap requires a native FP8 checkpoint")
+    topology = {
+        "pp": getattr(parallel_dims, "pp", None),
+        "cp": getattr(parallel_dims, "cp", None),
+        "ep": getattr(parallel_dims, "ep", None),
+        "dp_replicate": getattr(parallel_dims, "dp_replicate", None),
+    }
+    if topology != {"pp": 8, "cp": 8, "ep": 8, "dp_replicate": 1}:
+        raise ValueError("fsdp_param_comm_overlap requires PP8/CP8/EP8 and dp_replicate=1")
+    if getattr(parallel_dims, "global_ep", None) is not False:
+        raise ValueError("fsdp_param_comm_overlap requires global_ep=false")
+    if getattr(config, "pp_schedule", None) != "1f1b":
+        raise ValueError("fsdp_param_comm_overlap requires pp_schedule=1f1b")
+    if getattr(config, "ep_comm_backend", None) != "torch":
+        raise ValueError("fsdp_param_comm_overlap requires torch expert parallelism")
+    if config.reshard_after_forward is not True:
+        raise ValueError("fsdp_param_comm_overlap requires reshard_after_forward=true")
+    if config.fsdp_cpu_offload or config.cold_cpu_offload or config.optim_cpu_offload:
+        raise ValueError("fsdp_param_comm_overlap does not support parameter or optimizer offload")
+    if not parallel_dims.ep_enabled:
+        raise ValueError("fsdp_param_comm_overlap requires expert parallelism")
+    ac = getattr(config, "ac", None)
+    if (
+        ac is None
+        or getattr(ac, "mode", None) != "reentrant_attention_all_experts"
+        or getattr(ac, "keep_routed_expert_activations_from_pp_stage", None) != 5
+    ):
+        raise ValueError(
+            "fsdp_param_comm_overlap requires reentrant all-experts checkpointing with routed-expert cutoff5"
+        )
+
+
+def _configure_fsdp_param_comm_overlap(
+    model: nn.Module,
+    config: ModelConfig,
+    parallel_dims: ParallelDims,
+    native_fp8: bool,
+) -> None:
+    _validate_fsdp_param_comm_overlap(config, parallel_dims, native_fp8)
+    if not config.fsdp_param_comm_overlap:
+        return
+    setter = getattr(model, "_set_unshard_async_op", None)
+    if not callable(setter):
+        raise RuntimeError("fsdp_param_comm_overlap requires FSDP2 _set_unshard_async_op")
+    setter(True)
+    get_logger().info("Enabled bounded async FSDP parameter communication overlap")
+
+
+def _set_bounded_nested_backward_prefetch(
+    current_block: nn.Module,
+    previous_block: nn.Module | None,
+    native_fp8_expert_prefetch: bool,
+) -> None:
+    current_mlp = getattr(current_block, "mlp", None)
+    if not isinstance(current_mlp, (MoE, LatentMoE)):
+        return
+    previous_mlp = getattr(previous_block, "mlp", None) if previous_block is not None else None
+    for group_name in ("router", "experts", "shared_expert"):
+        current_group = getattr(current_mlp, group_name, None)
+        if not isinstance(current_group, FSDPModule):
+            continue
+        previous_group = getattr(previous_mlp, group_name, None) if previous_mlp is not None else None
+        can_prefetch_previous = isinstance(previous_group, FSDPModule) and (
+            group_name == "router"
+            or (group_name == "experts" and native_fp8_expert_prefetch)
+        )
+        current_group.set_modules_to_backward_prefetch(
+            [previous_group if can_prefetch_previous else current_group]
+        )
+
+
 def pre_download_model(model_name: str) -> None:
     """Pre-download model from HuggingFace Hub so all nodes have cached weights before training."""
     if Path(model_name).exists():
@@ -1228,6 +1307,7 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
         "reshard_after_forward": True,
     }
     native_fp8 = getattr(model.config, "fp8_checkpoint", False)
+    _validate_fsdp_param_comm_overlap(config, parallel_dims, native_fp8)
 
     hsdp_mesh = parallel_dims.get_mesh("hsdp")
     partial_reshard_mesh: DeviceMesh | None = None
@@ -1358,6 +1438,15 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
     )
     transformer_blocks = [block for group in virtual_stage_blocks for block in group]
 
+    if config.fsdp_param_comm_overlap:
+        for virtual_group in virtual_stage_blocks:
+            for index, transformer_block in enumerate(virtual_group):
+                _set_bounded_nested_backward_prefetch(
+                    transformer_block,
+                    virtual_group[index - 1] if index else None,
+                    config.native_fp8_expert_prefetch,
+                )
+
     embed_module = getattr(language_model, "embed_tokens", None) or getattr(language_model, "embeddings", None)
     if embed_module is not None and len(language_model.layers) > 0:
         if shard_norm_and_lm_head:
@@ -1374,13 +1463,20 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
                 and (not native_fp8 or config.native_fp8_expert_prefetch)
             ):
                 prefetch_modules.append(next_mlp.experts)
+            if config.fsdp_param_comm_overlap:
+                prefetch_modules = prefetch_modules[:1]
             transformer_block.set_modules_to_forward_prefetch(prefetch_modules)
         else:
             transformer_block.set_modules_to_forward_prefetch([next_transformer_block])
 
     if transformer_blocks and language_model.norm is not None and model.lm_head is not None:
         if shard_norm_and_lm_head:
-            virtual_stage_blocks[-1][-1].set_modules_to_forward_prefetch([language_model.norm, model.lm_head])
+            final_prefetch = (
+                [language_model.norm]
+                if config.fsdp_param_comm_overlap
+                else [language_model.norm, model.lm_head]
+            )
+            virtual_stage_blocks[-1][-1].set_modules_to_forward_prefetch(final_prefetch)
 
     # backward
     if language_model.norm is not None and model.lm_head is not None and len(language_model.layers) > 0:
@@ -1400,12 +1496,16 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
                 prefetch_modules.append(prev_mlp.experts)
             if isinstance(prev_mlp.router, FSDPModule):
                 prefetch_modules.append(prev_mlp.router)
+            if config.fsdp_param_comm_overlap:
+                prefetch_modules = prefetch_modules[:1]
             transformer_block.set_modules_to_backward_prefetch(prefetch_modules)
         else:
             transformer_block.set_modules_to_backward_prefetch([prev_transformer_block])
 
     if transformer_blocks and embed_module is not None and shard_norm_and_lm_head:
         virtual_stage_blocks[0][0].set_modules_to_backward_prefetch([embed_module])
+
+    _configure_fsdp_param_comm_overlap(model, config, parallel_dims, native_fp8)
 
 
 def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
