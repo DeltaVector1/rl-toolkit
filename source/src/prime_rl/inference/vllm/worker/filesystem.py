@@ -531,9 +531,11 @@ class FileSystemWeightUpdateWorker(Worker):
                 identity = expected_model_identity()
                 return validate_glm52_adapter(
                     adapter_path,
-                    expected_alias=identity["alias"],
+                    expected_repo_id=identity["repo_id"],
                     expected_revision=identity["revision"],
-                    expected_sha256=identity["sha256"],
+                    expected_variant=identity["variant"],
+                    expected_content_sha256=identity["content_sha256"],
+                    expected_manifest_sha256=identity["manifest_sha256"],
                 )
         except ImportError:
             raise RuntimeError("GLM adapter validation module is unavailable")

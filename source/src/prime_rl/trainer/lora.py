@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from prime_rl.configs.trainer import LoRAConfig
+from prime_rl.model_identity import expected_model_identity
 from prime_rl.trainer.models.layers.fp8_ada import (
     FP8CheckpointFusedQKVA,
     FP8CheckpointFusedQKVASlice,
@@ -640,7 +641,6 @@ def save_lora_config(model: nn.Module, save_path, rank: int, alpha: float, dropo
         dropout: LoRA dropout rate
     """
     import json
-    import os
     from pathlib import Path
 
     save_path = Path(save_path)
@@ -673,19 +673,16 @@ def save_lora_config(model: nn.Module, save_path, rank: int, alpha: float, dropo
         "target_modules": sorted(list(target_modules)),
         "modules_to_save": sorted(list(modules_to_save)) if modules_to_save else None,
     }
-    identity = {
-        "base_model_alias": os.environ.get("PRIME_LORA_BASE_MODEL_ALIAS", ""),
-        "base_model_revision": os.environ.get("PRIME_LORA_BASE_MODEL_REVISION", ""),
-        "base_model_sha256": os.environ.get("PRIME_LORA_BASE_MODEL_SHA256", ""),
-    }
-    if any(identity.values()):
-        if not all(identity.values()):
-            raise ValueError("LoRA model identity is incomplete")
-        adapter_config["base_model_name_or_path"] = identity["base_model_alias"]
+    if getattr(model.config, "model_type", None) == "glm_moe_dsa":
+        identity = expected_model_identity()
+        adapter_config["base_model_name_or_path"] = identity["repo_id"]
         adapter_config.update(
             {
-                "base_model_revision": identity["base_model_revision"],
-                "base_model_sha256": identity["base_model_sha256"],
+                "base_model_repo_id": identity["repo_id"],
+                "base_model_revision": identity["revision"],
+                "base_model_variant": identity["variant"],
+                "base_model_content_sha256": identity["content_sha256"],
+                "base_model_manifest_sha256": identity["manifest_sha256"],
             }
         )
 

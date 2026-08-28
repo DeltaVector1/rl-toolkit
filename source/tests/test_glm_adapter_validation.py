@@ -2,6 +2,7 @@ import hashlib
 import importlib.util
 import json
 import struct
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +11,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "src/prime_rl/inference/vllm/adapter_validation.py"
+sys.path.insert(0, str(ROOT / "src"))
 
 
 def _load_module():
@@ -47,9 +49,12 @@ class GlmAdapterValidationTest(unittest.TestCase):
         return {
             "peft_type": "LORA",
             "task_type": "CAUSAL_LM",
-            "base_model_name_or_path": "glm-base",
+            "base_model_name_or_path": "org/glm-base",
+            "base_model_repo_id": "org/glm-base",
             "base_model_revision": "a" * 40,
-            "base_model_sha256": "b" * 64,
+            "base_model_variant": "native_fp8",
+            "base_model_content_sha256": "b" * 64,
+            "base_model_manifest_sha256": "c" * 64,
             "r": 32,
             "lora_alpha": 64,
             "lora_dropout": 0.0,
@@ -93,9 +98,11 @@ class GlmAdapterValidationTest(unittest.TestCase):
             with patch.object(self.module, "_expected_shapes", return_value=shapes):
                 result = self.module.validate_glm52_adapter(
                     root,
-                    expected_alias="glm-base",
+                    expected_repo_id="org/glm-base",
                     expected_revision="a" * 40,
-                    expected_sha256="b" * 64,
+                    expected_variant="native_fp8",
+                    expected_content_sha256="b" * 64,
+                    expected_manifest_sha256="c" * 64,
                 )
             self.assertEqual(result["tensor_count"], 2)
             self.assertFalse(result["is_3d_lora_weight"])
@@ -112,9 +119,11 @@ class GlmAdapterValidationTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "missing=1"):
                     self.module.validate_glm52_adapter(
                         root,
-                        expected_alias="glm-base",
+                        expected_repo_id="org/glm-base",
                         expected_revision="a" * 40,
-                        expected_sha256="b" * 64,
+                        expected_variant="native_fp8",
+                        expected_content_sha256="b" * 64,
+                        expected_manifest_sha256="c" * 64,
                     )
 
     def test_wrong_dtype_shape_and_3d_request_are_rejected(self):
@@ -142,16 +151,20 @@ class GlmAdapterValidationTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "dtype is not BF16"):
                     self.module.validate_glm52_adapter(
                         root,
-                        expected_alias="glm-base",
+                        expected_repo_id="org/glm-base",
                         expected_revision="a" * 40,
-                        expected_sha256="b" * 64,
+                        expected_variant="native_fp8",
+                        expected_content_sha256="b" * 64,
+                        expected_manifest_sha256="c" * 64,
                     )
                 with self.assertRaisesRegex(ValueError, "2D"):
                     self.module.validate_glm52_adapter(
                         root,
-                        expected_alias="glm-base",
+                        expected_repo_id="org/glm-base",
                         expected_revision="a" * 40,
-                        expected_sha256="b" * 64,
+                        expected_variant="native_fp8",
+                        expected_content_sha256="b" * 64,
+                        expected_manifest_sha256="c" * 64,
                         is_3d_lora_weight=True,
                     )
 
@@ -167,10 +180,42 @@ class GlmAdapterValidationTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "base model revision differs"):
                     self.module.validate_glm52_adapter(
                         root,
-                        expected_alias="glm-base",
+                        expected_repo_id="org/glm-base",
                         expected_revision="c" * 40,
-                        expected_sha256="b" * 64,
+                        expected_variant="native_fp8",
+                        expected_content_sha256="b" * 64,
+                        expected_manifest_sha256="c" * 64,
                     )
+
+    def test_model_content_identity_mismatch_is_rejected(self):
+        shapes = {
+            "one.lora_A.weight": (32, 4),
+            "one.lora_B.weight": (8, 32),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._adapter(root, shapes)
+            with patch.object(self.module, "_expected_shapes", return_value=shapes):
+                with self.assertRaisesRegex(ValueError, "content SHA-256 differs"):
+                    self.module.validate_glm52_adapter(
+                        root,
+                        expected_repo_id="org/glm-base",
+                        expected_revision="a" * 40,
+                        expected_variant="native_fp8",
+                        expected_content_sha256="d" * 64,
+                        expected_manifest_sha256="c" * 64,
+                    )
+
+    def test_model_path_is_not_a_repository_identity(self):
+        with self.assertRaisesRegex(ValueError, "repository ID is invalid"):
+            self.module.validate_glm52_adapter(
+                Path("/tmp/missing"),
+                expected_repo_id="/data/glm52-fp8",
+                expected_revision="a" * 40,
+                expected_variant="native_fp8",
+                expected_content_sha256="b" * 64,
+                expected_manifest_sha256="c" * 64,
+            )
 
     def test_wrong_shape_and_missing_identity_are_rejected(self):
         expected = {
@@ -188,13 +233,35 @@ class GlmAdapterValidationTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "shape differs"):
                     self.module.validate_glm52_adapter(
                         root,
-                        expected_alias="glm-base",
+                        expected_repo_id="org/glm-base",
                         expected_revision="a" * 40,
-                        expected_sha256="b" * 64,
+                        expected_variant="native_fp8",
+                        expected_content_sha256="b" * 64,
+                        expected_manifest_sha256="c" * 64,
                     )
         with patch.dict(self.module.os.environ, {}, clear=True):
             with self.assertRaisesRegex(ValueError, "canonical model identity"):
                 self.module.expected_model_identity()
+
+    def test_environment_identity_contains_revision_and_both_content_hashes(self):
+        values = {
+            "PRIME_LORA_BASE_MODEL_REPO_ID": "zai-org/GLM-5.2-FP8",
+            "PRIME_LORA_BASE_MODEL_REVISION": "a" * 40,
+            "PRIME_LORA_BASE_MODEL_VARIANT": "native_fp8",
+            "PRIME_LORA_BASE_MODEL_CONTENT_SHA256": "b" * 64,
+            "PRIME_LORA_BASE_MODEL_MANIFEST_SHA256": "c" * 64,
+        }
+        with patch.dict(self.module.os.environ, values, clear=True):
+            self.assertEqual(
+                self.module.expected_model_identity(),
+                {
+                    "repo_id": "zai-org/GLM-5.2-FP8",
+                    "revision": "a" * 40,
+                    "variant": "native_fp8",
+                    "content_sha256": "b" * 64,
+                    "manifest_sha256": "c" * 64,
+                },
+            )
 
 
 if __name__ == "__main__":

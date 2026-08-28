@@ -11,15 +11,16 @@ import struct
 from pathlib import Path
 from typing import Any
 
+from prime_rl.model_identity import (
+    expected_model_identity,
+    validate_model_identity,
+)
 
 ADAPTER_CONFIG_NAME = "adapter_config.json"
 ADAPTER_MODEL_NAME = "adapter_model.safetensors"
 ADAPTER_CHECKSUM_NAME = "adapter_model.safetensors.sha256"
 ADAPTER_READY_NAME = "READY"
 
-GLM_MODEL_ALIAS_ENV = "PRIME_LORA_BASE_MODEL_ALIAS"
-GLM_MODEL_REVISION_ENV = "PRIME_LORA_BASE_MODEL_REVISION"
-GLM_MODEL_SHA256_ENV = "PRIME_LORA_BASE_MODEL_SHA256"
 GLM_VALIDATION_ENV = "PRIME_GLM_ADAPTER_VALIDATE"
 
 GLM_LAYER_COUNT = 78
@@ -30,7 +31,6 @@ GLM_LORA_ALPHA = 64
 
 _MAX_HEADER_BYTES = 64 * 1024 * 1024
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
-_REVISION = re.compile(r"[0-9a-f]{40}\Z")
 _TARGET_MODULES = frozenset(
     {
         "q_a_proj",
@@ -55,25 +55,6 @@ def validation_enabled() -> bool:
     if value not in {"0", "1"}:
         raise AdapterValidationError(f"{GLM_VALIDATION_ENV} must be 0 or 1")
     return value == "1" or os.environ.get("PRIME_MOE_LORA_FORMAT") == "2d"
-
-
-def expected_model_identity() -> dict[str, str]:
-    values = {
-        "alias": os.environ.get(GLM_MODEL_ALIAS_ENV, ""),
-        "revision": os.environ.get(GLM_MODEL_REVISION_ENV, ""),
-        "sha256": os.environ.get(GLM_MODEL_SHA256_ENV, ""),
-    }
-    missing = [key for key, value in values.items() if not value]
-    if missing:
-        raise AdapterValidationError(
-            "GLM adapter validation requires canonical model identity: "
-            + ", ".join(missing)
-        )
-    if not _REVISION.fullmatch(values["revision"]):
-        raise AdapterValidationError("canonical GLM model revision is invalid")
-    if not _SHA256.fullmatch(values["sha256"]):
-        raise AdapterValidationError("canonical GLM model SHA-256 is invalid")
-    return values
 
 
 def _sha256_file(path: Path) -> str:
@@ -206,18 +187,29 @@ def _validate_safetensors(
 def validate_glm52_adapter(
     adapter_dir: str | Path,
     *,
-    expected_alias: str,
+    expected_repo_id: str,
     expected_revision: str,
-    expected_sha256: str,
+    expected_variant: str,
+    expected_content_sha256: str,
+    expected_manifest_sha256: str,
     is_3d_lora_weight: bool = False,
 ) -> dict[str, object]:
     """Validate one complete, global-shape GLM-5.2 2D adapter export."""
     if is_3d_lora_weight is not False:
         raise AdapterValidationError("GLM adapter must use 2D per-expert weights")
-    if not expected_alias or not _REVISION.fullmatch(expected_revision or ""):
+    if not expected_repo_id:
         raise AdapterValidationError("expected GLM model identity is invalid")
-    if not _SHA256.fullmatch(expected_sha256 or ""):
-        raise AdapterValidationError("expected GLM model SHA-256 is invalid")
+    try:
+        expected_identity = {
+            "repo_id": expected_repo_id,
+            "revision": expected_revision,
+            "variant": expected_variant,
+            "content_sha256": expected_content_sha256,
+            "manifest_sha256": expected_manifest_sha256,
+        }
+        validate_model_identity(expected_identity)
+    except ValueError as error:
+        raise AdapterValidationError(str(error)) from error
 
     root = Path(adapter_dir)
     if root.is_symlink() or not root.is_dir():
@@ -253,12 +245,18 @@ def validate_glm52_adapter(
         or set(targets) != _TARGET_MODULES
     ):
         raise AdapterValidationError("adapter target modules differ from GLM-5.2")
-    if config.get("base_model_name_or_path") != expected_alias:
-        raise AdapterValidationError("adapter base model alias differs")
+    if config.get("base_model_name_or_path") != expected_repo_id:
+        raise AdapterValidationError("adapter base model repository ID differs")
+    if config.get("base_model_repo_id") != expected_repo_id:
+        raise AdapterValidationError("adapter base model repository ID differs")
     if config.get("base_model_revision") != expected_revision:
         raise AdapterValidationError("adapter base model revision differs")
-    if config.get("base_model_sha256") != expected_sha256:
-        raise AdapterValidationError("adapter base model SHA-256 differs")
+    if config.get("base_model_variant") != expected_variant:
+        raise AdapterValidationError("adapter base model variant differs")
+    if config.get("base_model_content_sha256") != expected_content_sha256:
+        raise AdapterValidationError("adapter base model content SHA-256 differs")
+    if config.get("base_model_manifest_sha256") != expected_manifest_sha256:
+        raise AdapterValidationError("adapter base model manifest SHA-256 differs")
 
     try:
         checksum = checksum_path.read_text(encoding="ascii")
@@ -273,7 +271,10 @@ def validate_glm52_adapter(
         "rank": GLM_LORA_RANK,
         "alpha": GLM_LORA_ALPHA,
         "is_3d_lora_weight": False,
+        "base_model_repo_id": expected_repo_id,
         "base_model_revision": expected_revision,
-        "base_model_sha256": expected_sha256,
+        "base_model_variant": expected_variant,
+        "base_model_content_sha256": expected_content_sha256,
+        "base_model_manifest_sha256": expected_manifest_sha256,
         "adapter_sha256": checksum.rstrip("\n"),
     }
