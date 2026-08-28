@@ -197,7 +197,12 @@ host_group = "trainer_head"
 gpu = 0
 image = "trainer_image"
 script = "scripts/ops/benchmark_fused_qkv_a_lora_sm89.py"
-source_module = "source/src/prime_rl/trainer/models/layers/lora/multi_linear.py"
+source_modules = [
+  "source/src/prime_rl/trainer/models/layers/lora/multi_linear.py",
+  "source/src/prime_rl/trainer/models/layers/fp8_ada.py",
+  "source/src/prime_rl/trainer/models/layers/checkpointing.py",
+  "source/src/prime_rl/trainer/phase_profiler.py",
+]
 remote_timeout_seconds = 180
 ssh_timeout_seconds = 240
 
