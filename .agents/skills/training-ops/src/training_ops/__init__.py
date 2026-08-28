@@ -10235,16 +10235,16 @@ assert_no_compute_pids() {{
   fi
   test -z "$pids"
 }}
-assert_container_absent() {{
-  local containers
-  if ! containers=$(sudo docker ps -aq --filter name=^"$container"$); then
+assert_container_name_free() {{
+  local matches
+  if ! matches=$(sudo docker ps -a --filter "name=^/$container$" --format '{{{{.Names}}}}'); then
     echo "cannot inspect smoke container" >&2
     return 1
   fi
-  test -z "$containers"
+  test -z "$matches"
 }}
 assert_no_compute_pids
-assert_container_absent
+assert_container_name_free
 status=0
 sudo timeout --foreground --signal=TERM --kill-after=20s {remote_timeout}s sudo docker run --rm \\
   --name "$container" --gpus device="$gpu" --network none --ipc private \\
@@ -10261,7 +10261,7 @@ sudo timeout --foreground --signal=TERM --kill-after=20s {remote_timeout}s sudo 
 cleanup
 clean=0
 for _ in $(seq 1 20); do
-  if assert_no_compute_pids && assert_container_absent; then
+  if assert_no_compute_pids && assert_container_name_free; then
     clean=1
     break
   fi
@@ -10309,7 +10309,7 @@ def _lora_fusion_smoke_preflight() -> None:
     quoted_names = " ".join(shlex.quote(name) for name in trainer_containers)
     script = f"""set -euo pipefail
 names=({quoted_names})
-running=$(sudo docker ps -a --format '{{{{.Names}}}}')
+running=$(sudo docker ps --format '{{{{.Names}}}}')
 for name in "${{names[@]}}"; do
   if printf '%s\\n' "$running" | grep -Fx -- "$name" >/dev/null; then
     echo "configured trainer container is present: $name" >&2
