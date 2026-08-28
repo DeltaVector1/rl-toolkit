@@ -14,6 +14,29 @@ SOURCE_PATH = (
     / "sparse_mla_bwd.py"
 )
 SOURCE = SOURCE_PATH.read_text()
+BENCHMARK_PATH = Path(__file__).parent / "manual" / "test_sparse_mla_block_h.py"
+BENCHMARK_SOURCE = BENCHMARK_PATH.read_text()
+
+
+def _benchmark_constants():
+    tree = ast.parse(BENCHMARK_SOURCE)
+    assignments = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.Assign, ast.AnnAssign))
+        and not any(
+            isinstance(child, ast.Name) and child.id == "torch"
+            for child in ast.walk(node)
+        )
+    ]
+    namespace = {"frozenset": frozenset}
+    exec(
+        compile(
+            ast.Module(body=assignments, type_ignores=[]), str(BENCHMARK_PATH), "exec"
+        ),
+        namespace,
+    )
+    return namespace
 
 
 def _load_selector():
@@ -81,7 +104,13 @@ def test_sm89_backward_geometry_rejects_malformed_or_mismatched_settings():
     select = _load_selector()
     for values, error_type in (
         ({"PRIME_SPARSE_BWD_USE_BLOCK_H32": "yes"}, ValueError),
-        ({"PRIME_SPARSE_BWD_USE_BLOCK_H32": "0", "PRIME_SPARSE_BWD_BLOCK_HEADS": "8"}, ValueError),
+        (
+            {
+                "PRIME_SPARSE_BWD_USE_BLOCK_H32": "0",
+                "PRIME_SPARSE_BWD_BLOCK_HEADS": "8",
+            },
+            ValueError,
+        ),
         (
             {
                 "PRIME_SPARSE_BWD_USE_BLOCK_H32": "1",
@@ -119,8 +148,7 @@ def test_backward_launch_uses_only_the_selected_geometry_on_sm89():
         call
         for call in calls
         if any(
-            isinstance(keyword.value, ast.Name)
-            and keyword.value.id == "block_heads"
+            isinstance(keyword.value, ast.Name) and keyword.value.id == "block_heads"
             for keyword in call.keywords
         )
     )
@@ -171,3 +199,70 @@ def test_invalid_geometry_is_rejected_before_kernel_compilation():
     )
     assert backward.body.index(is_sm89) < preprocess_call
     assert is_sm89.body.index(block_selection) >= 0
+
+
+def test_benchmark_has_fixed_production_dimensions_and_bounded_work():
+    benchmark = _benchmark_constants()
+    assert benchmark["sequence_lengths"] == (32, 128)
+    assert benchmark["backward_head_tiles"] == (16, 32, 64)
+    assert benchmark["batch_size"] == 1
+    assert benchmark["attention_heads"] == 64
+    assert benchmark["selected_keys"] == 2048
+    assert benchmark["backward_key_tile"] == 16
+    assert benchmark["backward_threads"] == 64
+    assert benchmark["warmup_runs"] == 1
+    assert benchmark["timed_runs"] == 2
+    assert benchmark["relative_tolerance"] == 0.05
+    assert benchmark["absolute_scale_fraction"] == 0.01
+    assert "this benchmark has no variable command-line options" in BENCHMARK_SOURCE
+
+
+def test_benchmark_requires_one_sm89_gpu_and_one_rank():
+    assert 'os.environ.get("CUDA_VISIBLE_DEVICES")' in BENCHMARK_SOURCE
+    assert 'visible.split(",")' in BENCHMARK_SOURCE
+    assert '"WORLD_SIZE": (1, 1)' in BENCHMARK_SOURCE
+    assert '"LOCAL_WORLD_SIZE": (1, 1)' in BENCHMARK_SOURCE
+    assert '"RANK": (0, 0)' in BENCHMARK_SOURCE
+    assert '"LOCAL_RANK": (0, 0)' in BENCHMARK_SOURCE
+    assert "torch.cuda.device_count() != 1" in BENCHMARK_SOURCE
+    assert "torch.cuda.get_device_capability(0) != (8, 9)" in BENCHMARK_SOURCE
+    assert "profile not in qualification_profiles" in BENCHMARK_SOURCE
+
+
+def test_benchmark_rejects_setting_overrides():
+    benchmark = _benchmark_constants()
+    assert benchmark["expected_optional_settings"] == {
+        "PRIME_SPARSE_BWD_BLOCK_SIZE": "16",
+        "PRIME_SPARSE_BWD_THREADS": "64",
+        "PRIME_SPARSE_FWD_BLOCK_SIZE": "32",
+        "PRIME_SPARSE_FWD_BLOCK_HEADS": "32",
+        "PRIME_SPARSE_FWD_THREADS": "128",
+    }
+    assert benchmark["forbidden_settings"] == (
+        "PRIME_SPARSE_BWD_BLOCK_HEADS",
+        "PRIME_SPARSE_BWD_USE_BLOCK_H32",
+    )
+    assert "configured != expected" in BENCHMARK_SOURCE
+    assert "if name in os.environ" in BENCHMARK_SOURCE
+    assert "os.environ[name] = value" in BENCHMARK_SOURCE
+    assert "_apply_exact_settings()" in BENCHMARK_SOURCE
+
+
+def test_benchmark_rejects_zero_and_nonfinite_gradients():
+    assert "value.numel() == 0" in BENCHMARK_SOURCE
+    assert "torch.isfinite(value).all()" in BENCHMARK_SOURCE
+    assert "torch.count_nonzero(value).item()" in BENCHMARK_SOURCE
+    assert 'f"{name} is zero"' in BENCHMARK_SOURCE
+
+
+def test_benchmark_uses_scale_aware_gradient_tolerance():
+    assert "reference_scale * absolute_scale_fraction" in BENCHMARK_SOURCE
+    assert (
+        "absolute_tolerance + relative_tolerance * reference_float.abs()"
+        in BENCHMARK_SOURCE
+    )
+    assert '"max_abs": float(difference.max().item())' in BENCHMARK_SOURCE
+    assert '"max_rel": float(relative.max().item())' in BENCHMARK_SOURCE
+    assert '"violations": int((difference > allowed).sum().item())' in BENCHMARK_SOURCE
+    assert "for block_heads in (32, 64)" in BENCHMARK_SOURCE
+    assert "baseline = results[16]" in BENCHMARK_SOURCE
