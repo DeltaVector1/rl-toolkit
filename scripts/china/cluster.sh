@@ -181,7 +181,7 @@ case ${1:-} in
         echo "Nsight disabled on n$node; capture owner is n$capture_node rank $capture_rank"
       fi
     fi
-    IFS='|' read -r rollout_transport trainer_output trainer_only parity_trace_dir parity_trace_source parity_pp parity_cp parity_batch parity_max_calls parity_max_files parity_max_bytes parity_diagnostics parity_diagnostic_tokens parity_diagnostic_max_files parity_diagnostic_max_bytes configured_int4_combine_rounds configured_bf16_combine_rounds configured_fp8_expert_activation_offload configured_lora_mm_profile configured_profile_requested configured_profile_pp_stage configured_ep_profile configured_ep_profile_every configured_expert_profile_every configured_layer_profile_every configured_expert_phase_profile configured_expert_phase_profile_every configured_phase_profile configured_phase_profile_steps configured_phase_profile_sample_every < <(
+    IFS='|' read -r rollout_transport trainer_output trainer_only parity_trace_dir parity_trace_source parity_pp parity_cp parity_batch parity_max_calls parity_max_files parity_max_bytes parity_diagnostics parity_diagnostic_tokens parity_diagnostic_max_files parity_diagnostic_max_bytes configured_int4_combine_rounds configured_bf16_combine_rounds configured_fp8_expert_activation_offload configured_lora_mm_profile configured_fused_qkv_a_lora configured_profile_requested configured_profile_pp_stage configured_ep_profile configured_ep_profile_every configured_expert_profile_every configured_layer_profile_every configured_expert_phase_profile configured_expert_phase_profile_every configured_phase_profile configured_phase_profile_steps configured_phase_profile_sample_every < <(
       python3 - "$trainer_config" <<'PY'
 import sys
 import tomllib
@@ -194,12 +194,16 @@ trainer_only = "fake" in data or cache.get("mode") == "replay"
 env_vars = config.get("env_vars", {})
 model = config.get("model", {})
 fake = data.get("fake", {})
+lora = model.get("lora", {})
 memory_env = (
     env_vars.get("PRIME_INT4_COMBINE_ROUNDS", ""),
     env_vars.get("PRIME_BF16_COMBINE_ROUNDS", ""),
     env_vars.get("PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD", ""),
     env_vars.get("PRIME_LORA_MM_PROFILE", ""),
 )
+fused_qkv_a_lora = lora.get("fused_qkv_a_lora", False)
+if type(fused_qkv_a_lora) is not bool:
+    raise SystemExit("model.lora.fused_qkv_a_lora must be true or false")
 profile_names = (
     "PRIME_PROFILE_PP_STAGE",
     "PRIME_EP_PROFILE",
@@ -247,6 +251,7 @@ values = (
     env_vars.get("PRIME_PARITY_DIAGNOSTIC_MAX_FILES", ""),
     env_vars.get("PRIME_PARITY_DIAGNOSTIC_MAX_BYTES", ""),
     *memory_env,
+    int(fused_qkv_a_lora),
     *profile_env,
     *phase_profile_env,
     *global_phase_profile_env,
@@ -256,6 +261,10 @@ if any(any(char in str(value) for char in "|\r\n") for value in values):
 print("|".join(str(value) for value in values))
 PY
     )
+    case "$configured_fused_qkv_a_lora" in
+      0|1) ;;
+      *) echo "model.lora.fused_qkv_a_lora must be true or false" >&2; exit 1 ;;
+    esac
     if [ -n "$configured_int4_combine_rounds" ] || [ -n "$configured_fp8_expert_activation_offload" ]; then
       [ "$configured_int4_combine_rounds" = "8" ] || {
         echo "GLM trainer configs must pin PRIME_INT4_COMBINE_ROUNDS=8" >&2

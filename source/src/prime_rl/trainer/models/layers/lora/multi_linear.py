@@ -329,10 +329,10 @@ class _FusedPairLoRA(torch.autograd.Function):
         input_grad = _lora_mm(first_grad_a, first_a) + _lora_mm(
             second_grad_a, second_a
         )
-        first_a_grad = (first_grad_a.T @ x).to(first_a.dtype)
-        first_b_grad = (first_grad.T @ first_low_rank).to(first_b.dtype)
-        second_a_grad = (second_grad_a.T @ x).to(second_a.dtype)
-        second_b_grad = (second_grad.T @ second_low_rank).to(second_b.dtype)
+        first_a_grad = _lora_mm(first_grad_a.T, x).to(first_a.dtype)
+        first_b_grad = _lora_mm(first_grad.T, first_low_rank).to(first_b.dtype)
+        second_a_grad = _lora_mm(second_grad_a.T, x).to(second_a.dtype)
+        second_b_grad = _lora_mm(second_grad.T, second_low_rank).to(second_b.dtype)
         return (
             input_grad.to(x.dtype),
             first_a_grad,

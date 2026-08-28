@@ -1,4 +1,3 @@
-import os
 from dataclasses import dataclass
 
 import torch
@@ -30,7 +29,6 @@ _ADA_FLEX_OPTIONS = {
     "num_stages": 1,
     "PRESCALE_QK": True,
 }
-_FUSE_QKV_A_LORA = os.environ.get("PRIME_FUSED_QKV_A_LORA", "0") == "1"
 
 try:
     from prime_rl.trainer.models.kernels.sparse_mla_bwd import sparse_mla_bwd
@@ -57,6 +55,7 @@ class SparseMlaAttentionArgs:
     index_topk: int
     use_index_cache: bool = False
     skip_topk: bool = False
+    fused_qkv_a_lora: bool = False
 
 
 class _SparseMLA(torch.autograd.Function):
@@ -208,6 +207,7 @@ class GlmMoeDsaAttention(nn.Module):
         self.indexer = Indexer(args) if not args.skip_topk else None
         self.use_index_cache = args.use_index_cache
         self.skip_topk = args.skip_topk
+        self.fused_qkv_a_lora = args.fused_qkv_a_lora
         self._phase_backward_timer = None
         if get_phase_profiler().enabled:
             self.register_full_backward_pre_hook(self._phase_backward_start)
@@ -244,7 +244,7 @@ class GlmMoeDsaAttention(nn.Module):
                 q_projection.base_layer,
                 kv_projection.base_layer,
             )
-            if _FUSE_QKV_A_LORA:
+            if self.fused_qkv_a_lora:
                 q_adapter, kv_adapter = fused_lora_adapter_pair(
                     hidden_states, q_projection, kv_projection
                 )

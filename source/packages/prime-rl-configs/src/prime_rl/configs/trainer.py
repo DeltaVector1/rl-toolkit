@@ -124,6 +124,9 @@ class LoRAConfig(BaseConfig):
     dropout: float = Field(0.0, ge=0, le=1)
     """LoRA dropout rate."""
 
+    fused_qkv_a_lora: bool = False
+    """Combine the temporary Q-A and KV-A LoRA input projections for GLM."""
+
     target_modules: list[str] = [
         "q_proj",
         "k_proj",

@@ -66,6 +66,7 @@ w8a16_modules = []
 rank = 32
 alpha = 64
 dropout = 0.0
+fused_qkv_a_lora = false
 target_modules = ["q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "shared_expert", "experts"]
 
 [model.ac]

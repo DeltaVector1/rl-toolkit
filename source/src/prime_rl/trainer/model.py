@@ -1006,6 +1006,9 @@ def get_model(
         if subconfig is not None and hasattr(subconfig, "use_cache"):
             subconfig.use_cache = False
     model_config.use_grouped_mm = config.moe_use_grouped_mm
+    model_config.fused_qkv_a_lora = bool(
+        config.lora is not None and config.lora.fused_qkv_a_lora
+    )
     model_config.pp_transfer_sparse_indices = config.pp_transfer_sparse_indices
     model_config.pp_boundary_plan = config.pp_boundary_plan
     model_config.pp_layer_boundaries = config.pp_layer_boundaries

@@ -1711,6 +1711,52 @@ class MultiLinearAutogradTest(unittest.TestCase):
         torch.testing.assert_close(actual_first, expected_first, rtol=1e-12, atol=1e-12)
         torch.testing.assert_close(actual_second, expected_second, rtol=1e-12, atol=1e-12)
 
+    def test_fused_pair_lora_bf16_matches_forward_and_parameter_gradients(self):
+        torch.manual_seed(9)
+        first_base = nn.Linear(8, 6, bias=False, dtype=torch.bfloat16)
+        second_base = nn.Linear(8, 4, bias=False, dtype=torch.bfloat16)
+        first_base.requires_grad_(False)
+        second_base.requires_grad_(False)
+        first = multi_linear.MultiLoRALinear(
+            first_base, rank=2, n_adapters=1, alpha=2, use_grouped_mm=False
+        )
+        second = multi_linear.MultiLoRALinear(
+            second_base, rank=2, n_adapters=1, alpha=2, use_grouped_mm=False
+        )
+        with torch.no_grad():
+            for parameter in (*first.lora_A, *first.lora_B, *second.lora_A, *second.lora_B):
+                parameter.normal_()
+        x = torch.randn(3, 8, dtype=torch.bfloat16, requires_grad=True)
+        expected_x = x.detach().clone().requires_grad_()
+        expected = torch.cat(
+            (first.adapter_output(expected_x), second.adapter_output(expected_x)), dim=-1
+        )
+        actual_first, actual_second = multi_linear.fused_lora_adapter_pair(x, first, second)
+        actual = torch.cat((actual_first, actual_second), dim=-1)
+        torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
+
+        upstream = torch.randn_like(actual)
+        expected.backward(upstream)
+        expected_x_grad = expected_x.grad.detach().clone()
+        expected_parameter_grads = [
+            parameter.grad.detach().clone()
+            for parameter in (*first.lora_A, *first.lora_B, *second.lora_A, *second.lora_B)
+        ]
+        expected_x.grad = None
+        for parameter in (*first.lora_A, *first.lora_B, *second.lora_A, *second.lora_B):
+            parameter.grad = None
+        actual.backward(upstream)
+        torch.testing.assert_close(x.grad, expected_x_grad, rtol=0.02, atol=0.02)
+        for actual_parameter, expected_parameter in zip(
+            (*first.lora_A, *first.lora_B, *second.lora_A, *second.lora_B),
+            expected_parameter_grads,
+            strict=True,
+        ):
+            self.assertIsNotNone(actual_parameter.grad)
+            torch.testing.assert_close(
+                actual_parameter.grad, expected_parameter, rtol=0.02, atol=0.02
+            )
+
     def test_fused_pair_lora_releases_combined_rank_buffer(self):
         first_base = nn.Linear(6144, 2048, bias=False, dtype=torch.bfloat16)
         second_base = nn.Linear(6144, 576, bias=False, dtype=torch.bfloat16)
@@ -1748,7 +1794,6 @@ class MultiLinearAutogradTest(unittest.TestCase):
 
     def test_glm_attention_adds_q_and_kv_adapters_after_fused_base(self):
         sparse_attention = _load_sparse_attention_module()
-        self.assertFalse(sparse_attention._FUSE_QKV_A_LORA)
         attention = sparse_attention.GlmMoeDsaAttention.__new__(
             sparse_attention.GlmMoeDsaAttention
         )
@@ -1767,6 +1812,7 @@ class MultiLinearAutogradTest(unittest.TestCase):
         attention.kv_a_layernorm = nn.Identity()
         attention.kv_lora_rank = 2
         attention.qk_rope_head_dim = 2
+        attention.fused_qkv_a_lora = False
         with torch.no_grad():
             attention.q_a_proj.lora_B[0].normal_()
             attention.kv_a_proj_with_mqa.lora_B[0].normal_()

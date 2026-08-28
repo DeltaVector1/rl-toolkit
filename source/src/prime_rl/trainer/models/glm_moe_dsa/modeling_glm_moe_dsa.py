@@ -80,6 +80,7 @@ def _sparse_mla_attention_args(config: GlmMoeDsaConfig, layer_idx: int) -> Spars
         index_topk=config.index_topk,
         use_index_cache=getattr(config, "use_index_cache", False),
         skip_topk=_index_cache_skip_topk(config, layer_idx),
+        fused_qkv_a_lora=getattr(config, "fused_qkv_a_lora", False),
     )
 
 
