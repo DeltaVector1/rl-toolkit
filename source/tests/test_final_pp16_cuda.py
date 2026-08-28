@@ -12,6 +12,8 @@ import json
 import logging
 import os
 from dataclasses import dataclass
+from datetime import timedelta
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -35,6 +37,8 @@ FULL_INDEX_LAYERS = frozenset(
 HIDDEN_SLOT_BYTES = 4096 * 6144 * 2
 SPARSE_SLOT_BYTES = 4096 * 2048 * 2
 MAX_PROJECTED_BYTES = int(1.28125 * 2**30)
+PROCESS_GROUP_TIMEOUT_ENV = "PRIME_PP_CUDA_PROCESS_GROUP_TIMEOUT_SECONDS"
+RESULT_PATH_ENV = "PRIME_PP_CUDA_RESULT_PATH"
 
 
 def side_value(stage: int, microbatch: int) -> float:
@@ -409,16 +413,50 @@ def run_repeat(rank: int, reference: Reference, repeat: int) -> dict[str, object
     return report
 
 
+def distributed_launch() -> tuple[int, torch.device, int]:
+    try:
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        timeout_seconds = int(os.environ.get(PROCESS_GROUP_TIMEOUT_ENV, "120"))
+    except (KeyError, ValueError) as error:
+        raise RuntimeError("the CUDA qualification launch environment is invalid") from error
+    if world_size != PHYSICAL or local_world_size != PHYSICAL:
+        raise RuntimeError(
+            f"expected exactly {PHYSICAL} local ranks, got "
+            f"world={world_size} local_world={local_world_size}"
+        )
+    if not 0 <= local_rank < PHYSICAL:
+        raise RuntimeError(f"local CUDA rank is invalid: {local_rank}")
+    if torch.cuda.device_count() != PHYSICAL:
+        raise RuntimeError(
+            f"expected exactly {PHYSICAL} CUDA devices, got {torch.cuda.device_count()}"
+        )
+    if not 1 <= timeout_seconds <= 300:
+        raise RuntimeError("process-group timeout must be from 1 to 300 seconds")
+    device = torch.device("cuda", local_rank)
+    torch.cuda.set_device(device)
+    return local_rank, device, timeout_seconds
+
+
 def main() -> None:
     # The pinned runtime prints the full 1,145-step schedule on an exception.
     # Keep the failure traceback readable during this gate.
     logging.getLogger("torch.distributed.pipelining.schedules").setLevel(logging.CRITICAL)
-    dist.init_process_group("nccl")
-    rank = dist.get_rank()
-    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    local_rank, device, timeout_seconds = distributed_launch()
+    ready = False
     try:
-        if rank >= PHYSICAL:
-            raise AssertionError(f"expected exactly {PHYSICAL} ranks, got {dist.get_world_size()}")
+        dist.init_process_group(
+            "nccl",
+            timeout=timedelta(seconds=timeout_seconds),
+            device_id=device,
+        )
+        ready = True
+        rank = dist.get_rank()
+        if rank != int(os.environ["RANK"]) or dist.get_world_size() != PHYSICAL:
+            raise RuntimeError("initialized process-group identity differs from torchrun")
+        if torch.cuda.current_device() != local_rank:
+            raise RuntimeError("initialized process group changed the local CUDA device")
         reports = []
         previous = None
         for repeat in range(3):
@@ -440,9 +478,24 @@ def main() -> None:
             if rank == 0:
                 reports.append(report)
         if rank == 0:
-            print(json.dumps({"status": "pass", "reports": reports}, sort_keys=True), flush=True)
+            result = {
+                "status": "pass",
+                "ranks": PHYSICAL,
+                "repeats": len(reports),
+                "reports": reports,
+            }
+            result_path = os.environ.get(RESULT_PATH_ENV)
+            if result_path:
+                destination = Path(result_path)
+                if destination != Path("/output/result.json"):
+                    raise RuntimeError("the CUDA qualification result path is invalid")
+                temporary = destination.with_suffix(".tmp")
+                temporary.write_text(json.dumps(result, sort_keys=True) + "\n")
+                os.replace(temporary, destination)
+            print(json.dumps(result, sort_keys=True), flush=True)
     finally:
-        dist.destroy_process_group()
+        if ready:
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":

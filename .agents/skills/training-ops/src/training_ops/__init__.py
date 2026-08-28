@@ -425,6 +425,8 @@ _MEMORY_PROFILE_LAUNCH_ENV = {
 }
 
 _NSYS_QUALIFICATION_PROFILE = "glm52-native-b2048-nsys"
+_RANK_BALANCED_PROFILE = "glm52-native-interleaved-rank-balanced"
+_RANK_BALANCED_CUDA_LABEL = "glm52-rank-balanced-cuda"
 _NSYS_TRAINER_MODULE = "prime_rl.trainer.nsys_worker"
 _NSYS_ENV_KEYS = (
     "PRIME_NSYS_BIN",
@@ -7577,6 +7579,9 @@ def _repair_supervisors() -> str:
 
 _QUALIFICATION_ONLY_MOUNTS = {
     _CUDA_MEMORY_CAPTURE_PROFILE: frozenset({"source/tests/test_final_pp16_cuda.py"}),
+    _RANK_BALANCED_CUDA_LABEL: frozenset(
+        {"source/tests/test_final_pp16_cuda.py"}
+    ),
 }
 
 
@@ -8485,6 +8490,7 @@ def _validate_trainer_qualification(
         "glm52-native-b2048": 2,
         "glm52-native-b2048-memory": 2,
         "glm52-native-b2048-nsys": 2,
+        _RANK_BALANCED_PROFILE: 2,
         "glm52-native-delta3": 3,
         "glm52-native-stability20": 20,
     }
@@ -8525,6 +8531,7 @@ def _validate_trainer_qualification(
         "glm52-native-b2048",
         "glm52-native-b2048-memory",
         "glm52-native-b2048-nsys",
+        _RANK_BALANCED_PROFILE,
     }:
         session_deadline, startup_deadline, step_deadline, profiler_deadline = (
             _glm_b2048_deadlines()
@@ -10170,6 +10177,267 @@ def deploy(
     return not bad
 
 
+def qualify_glm52_rank_balanced_cuda() -> dict[str, object]:
+    """Run the rank-balanced PP8 CUDA check on the configured trainer head."""
+    settings = operations.get("qualification", {}).get("glm52_rank_balanced_cuda")
+    if not isinstance(settings, dict):
+        raise Refused("the rank-balanced CUDA qualification is not configured")
+    required = {
+        "kind",
+        "profile",
+        "host_group",
+        "container",
+        "script",
+        "runner",
+        "output_root",
+        "gpus",
+        "network",
+        "outer_timeout_seconds",
+        "process_group_timeout_seconds",
+        "transport_env",
+    }
+    if set(settings) != required or settings.get("kind") != "glm52":
+        raise Refused("the rank-balanced CUDA qualification profile is invalid")
+    if settings.get("profile") != _RANK_BALANCED_PROFILE:
+        raise Refused("the rank-balanced CUDA trainer profile is invalid")
+    selected = _profile(_RANK_BALANCED_PROFILE)
+    if selected.get("trainer") != (
+        "configs/qualification/glm52-native-interleaved-rank-balanced.toml"
+    ):
+        raise Refused("the rank-balanced CUDA trainer config is invalid")
+    if settings.get("host_group") != "trainer_head":
+        raise Refused("the rank-balanced CUDA qualification must use the trainer head")
+    host = trainer_head
+    if host not in trainer_hosts or host in blocked_hosts:
+        raise Refused("the configured trainer head is not allowed")
+    if settings.get("gpus") != 8 or settings.get("network") != "host":
+        raise Refused("the rank-balanced CUDA qualification requires eight local GPUs")
+    timeout = settings.get("outer_timeout_seconds")
+    process_group_timeout = settings.get("process_group_timeout_seconds")
+    if timeout != 300 or not isinstance(process_group_timeout, int) or not (
+        1 <= process_group_timeout <= timeout
+    ):
+        raise Refused("the rank-balanced CUDA time limits are invalid")
+
+    container_key = settings.get("container")
+    container = containers.get(container_key) if isinstance(container_key, str) else None
+    if (
+        not isinstance(container, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", container) is None
+        or container in {trainer_container, protected_trainer}
+    ):
+        raise Refused("the rank-balanced CUDA container is not isolated")
+    script = settings.get("script")
+    runner = settings.get("runner")
+    if script != "source/tests/test_final_pp16_cuda.py" or runner != (
+        "source/src/prime_rl/trainer/distributed/pp_runner.py"
+    ):
+        raise Refused("the rank-balanced CUDA source inventory is invalid")
+    if not (repo_root / script).is_file() or not (repo_root / runner).is_file():
+        raise Refused("the rank-balanced CUDA source is missing")
+    output_root = settings.get("output_root")
+    expected_root = PurePosixPath("/data/glm52-rl/qualifications")
+    output_path = PurePosixPath(output_root) if isinstance(output_root, str) else None
+    if output_path is None or output_path.parent != expected_root:
+        raise Refused("the rank-balanced CUDA output root is invalid")
+
+    transport = settings.get("transport_env")
+    required_transport = {
+        "CUDA_DEVICE_ORDER",
+        "NCCL_SOCKET_IFNAME",
+        "GLOO_SOCKET_IFNAME",
+        "NCCL_IB_DISABLE",
+        "NCCL_P2P_DISABLE",
+        "NCCL_SOCKET_NTHREADS",
+        "NCCL_NSOCKS_PERTHREAD",
+        "NCCL_BUFFSIZE",
+        "NCCL_CUMEM_HOST_ENABLE",
+        "NCCL_MIN_NCHANNELS",
+        "NCCL_MAX_NCHANNELS",
+        "TORCH_NCCL_ASYNC_ERROR_HANDLING",
+    }
+    if (
+        not isinstance(transport, dict)
+        or set(transport) != required_transport
+        or any(
+            not isinstance(value, str)
+            or re.fullmatch(r"[A-Za-z0-9_.:-]+", value) is None
+            for value in transport.values()
+        )
+    ):
+        raise Refused("the rank-balanced CUDA transport settings are invalid")
+
+    with (repo_root / selected["trainer"]).open("rb") as stream:
+        trainer_config = tomllib.load(stream)
+    data = trainer_config.get("data", {})
+    model = trainer_config.get("model", {})
+    if (
+        "fake" not in data
+        or "rollout_cache" in data
+        or model.get("pp") != 8
+        or model.get("pp_virtual_layer_boundaries")
+        != [0, 3, 7, 11, 15, 19, 23, 27, 31, 36, 42, 48, 54, 60, 66, 72, 78]
+    ):
+        raise Refused("the rank-balanced CUDA trainer config is not qualification-only")
+
+    _assert_live_services_are_down([host], include_inference=False)
+    code, output = _ssh(
+        host,
+        "gpu_count=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l); "
+        "pid_output=$(nvidia-smi --query-compute-apps=pid "
+        "--format=csv,noheader,nounits 2>/dev/null) || exit 96; "
+        "pids=$(printf '%s\\n' \"$pid_output\" | grep -E '^[0-9]+$' | "
+        "paste -sd, - || true); "
+        f"running=$(sudo docker ps --filter name=^{container}$ "
+        "--format '{{.Names}}' | paste -sd, -); "
+        "printf 'GPUS %s\\nPIDS %s\\nRUNNING %s\\n' "
+        "\"$gpu_count\" \"$pids\" \"$running\"",
+        timeout=60,
+    )
+    state = _kv(output)
+    if code or set(state) != {"GPUS", "PIDS", "RUNNING"}:
+        raise RuntimeError("the rank-balanced CUDA preflight failed")
+    if state["GPUS"] != str(settings["gpus"]):
+        raise Refused("the trainer head does not have exactly eight visible GPUs")
+    if state["PIDS"] or state["RUNNING"]:
+        raise Refused("the trainer head has an active GPU process or qualification")
+
+    stale = f"""set -euo pipefail
+candidate=$(sudo docker ps -aq --no-trunc --filter name=^{container}$)
+if [ -z "$candidate" ]; then printf 'STALE none\n'; exit 0; fi
+if ! [[ "$candidate" =~ ^[0-9a-f]{{64}}$ ]]; then exit 98; fi
+identity=$(sudo docker inspect --type container --format '{{{{.Id}}}}|{{{{.Name}}}}|{{{{index .Config.Labels "prime.qualification"}}}}|{{{{.State.Running}}}}' "$candidate")
+expected="$candidate|/{container}|{_RANK_BALANCED_CUDA_LABEL}|false"
+[ "$identity" = "$expected" ] || exit 97
+sudo docker rm "$candidate" >/dev/null
+printf 'STALE removed:%s\n' "$candidate"
+"""
+    stale_code, stale_output = _ssh(host, stale, timeout=60)
+    stale_state = _kv(stale_output)
+    if stale_code or set(stale_state) != {"STALE"} or not (
+        stale_state["STALE"] == "none"
+        or re.fullmatch(r"removed:[0-9a-f]{64}", stale_state["STALE"])
+    ):
+        raise RuntimeError("the stale rank-balanced CUDA cleanup failed")
+
+    for source_path in (script, runner):
+        if not deploy(
+            source_path,
+            nodes=[host],
+            repository="glm52-qualification",
+            profile_name=_RANK_BALANCED_CUDA_LABEL,
+        ):
+            raise RuntimeError(f"failed to deploy {source_path}")
+
+    repository = _repository_root("glm52-qualification")
+    session = secrets.token_hex(8)
+    output_dir = f"{output_root}/{session}"
+    result_path = f"{output_dir}/result.json"
+    cid_path = f"{output_dir}/container.cid"
+    env = dict(transport)
+    env["PRIME_PP_CUDA_PROCESS_GROUP_TIMEOUT_SECONDS"] = str(process_group_timeout)
+    env["PRIME_PP_CUDA_RESULT_PATH"] = "/output/result.json"
+    env_args = " ".join(
+        f"-e {shlex.quote(name + '=' + value)}" for name, value in sorted(env.items())
+    )
+    inner = (
+        "torchrun --standalone --nproc-per-node=8 --log-dir /output/torchrun "
+        "--redirects 3 --tee 3 /qualification/test_final_pp16_cuda.py"
+    )
+    command = f"""set -euo pipefail
+sudo install -d -o 1000 -g 1000 -m 0755 {shlex.quote(output_dir)}
+cleanup() {{
+  primary=$?
+  trap - EXIT
+  set +e
+  cleanup_error=0
+  cid=""
+  if [ -e {shlex.quote(cid_path)} ]; then
+    if [ ! -f {shlex.quote(cid_path)} ] || [ -L {shlex.quote(cid_path)} ]; then cleanup_error=91; else IFS= read -r cid < {shlex.quote(cid_path)}; fi
+  fi
+  if [[ "$cid" =~ ^[0-9a-f]{{64}}$ ]]; then
+    identity=$(sudo docker inspect --type container --format '{{{{.Id}}}}|{{{{.Name}}}}|{{{{index .Config.Labels "prime.qualification"}}}}|{{{{index .Config.Labels "prime.session"}}}}' "$cid" 2>/dev/null)
+    if [ "$?" -eq 0 ]; then
+      expected="$cid|/{container}|{_RANK_BALANCED_CUDA_LABEL}|{session}"
+      if [ "$identity" = "$expected" ]; then sudo docker rm -f "$cid" >/dev/null 2>&1 || cleanup_error=92; else cleanup_error=93; fi
+    fi
+  elif [ -n "$cid" ]; then cleanup_error=94; fi
+  remaining=$(sudo docker ps -aq --filter name=^{container}$) || cleanup_error=95
+  pid_output=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null) || cleanup_error=96
+  pids=$(printf '%s\\n' "$pid_output" | grep -E '^[0-9]+$' | paste -sd, - || true)
+  if [ -n "$remaining" ] || [ -n "$pids" ]; then [ "$cleanup_error" -ne 0 ] || cleanup_error=97; fi
+  if [ "$primary" -ne 0 ]; then exit "$primary"; fi
+  exit "$cleanup_error"
+}}
+trap cleanup EXIT
+sudo timeout --foreground --signal=TERM --kill-after=20s {timeout}s docker run --rm \
+  --cidfile {shlex.quote(cid_path)} --name {shlex.quote(container)} \
+  --label prime.qualification={_RANK_BALANCED_CUDA_LABEL} --label prime.session={session} \
+  --gpus all --ipc host --network {shlex.quote(settings['network'])} --read-only \
+  --cap-drop ALL --security-opt no-new-privileges --pids-limit 1024 \
+  --tmpfs /tmp:rw,nosuid,nodev,size=1g \
+  -v {shlex.quote(repository + '/' + script)}:/qualification/test_final_pp16_cuda.py:ro \
+  -v {shlex.quote(repository + '/' + runner)}:/app/src/prime_rl/trainer/distributed/pp_runner.py:ro \
+  -v {shlex.quote(output_dir)}:/output:rw \
+  -e PYTHONPATH=/app/src {env_args} \
+  --entrypoint /bin/bash {shlex.quote(trainer_image)} -lc {shlex.quote(inner)}
+test -s {shlex.quote(result_path)}
+cat {shlex.quote(result_path)}
+"""
+    code, output = _ssh(host, command, timeout=timeout)
+    postflight_code, postflight_output = _ssh(
+        host,
+        f"remaining=$(sudo docker ps -aq --filter name=^{container}$) || exit 97; "
+        "pid_output=$(nvidia-smi --query-compute-apps=pid "
+        "--format=csv,noheader,nounits 2>/dev/null) || exit 96; "
+        "pids=$(printf '%s\\n' \"$pid_output\" | grep -E '^[0-9]+$' | "
+        "paste -sd, - || true); "
+        "printf 'CONTAINERS %s\\nPIDS %s\\n' \"$remaining\" \"$pids\"",
+        timeout=60,
+    )
+    postflight = _kv(postflight_output)
+    postflight_failed = (
+        postflight_code != 0
+        or set(postflight) != {"CONTAINERS", "PIDS"}
+        or any(postflight.values())
+    )
+    if code:
+        message = (
+            "the rank-balanced CUDA qualification failed: "
+            + (output.strip()[-2000:] or f"ssh exit {code}")
+        )
+        if postflight_failed:
+            message += "; cleanup or postflight also failed"
+        raise RuntimeError(message)
+    if postflight_failed:
+        raise RuntimeError("the rank-balanced CUDA postflight failed")
+    try:
+        result = json.loads(output.strip().splitlines()[-1])
+    except (IndexError, json.JSONDecodeError) as error:
+        raise RuntimeError("the rank-balanced CUDA qualification returned no result") from error
+    reports = result.get("reports")
+    if (
+        result.get("status") != "pass"
+        or result.get("ranks") != 8
+        or result.get("repeats") != 3
+        or not isinstance(reports, list)
+        or len(reports) != 3
+        or any(not isinstance(report, dict) for report in reports)
+        or any(
+            report.get("virtual_boundaries")
+            != [0, 3, 7, 11, 15, 19, 23, 27, 31, 36, 42, 48, 54, 60, 66, 72, 78]
+            or report.get("real_forward_actions") != 1520
+            or report.get("real_backward_actions") != 1520
+            or report.get("projected_peak_bytes_max") > int(1.28125 * 2**30)
+            for report in reports
+        )
+    ):
+        raise RuntimeError("the rank-balanced CUDA qualification result is invalid")
+    result["output_dir"] = output_dir
+    print("Rank-balanced CUDA qualification passed: " + json.dumps(result, sort_keys=True))
+    return result
+
+
 def _copy_resume_adapter(path: str, nodes: list[str]) -> None:
     """Copy one adapter from the trainer head to missing trainer nodes."""
     exact_step20 = glm_step20_h200_gate["trainer_adapter"]
@@ -10539,6 +10807,7 @@ def _prepare_trainer_qualification_session(
         "glm52-native-b2048",
         "glm52-native-b2048-memory",
         "glm52-native-b2048-nsys",
+        _RANK_BALANCED_PROFILE,
     }:
         session_deadline, startup_deadline, step_deadline, profiler_deadline = (
             _glm_b2048_deadlines()
@@ -10764,6 +11033,7 @@ def _qualify_connected(
         "glm52-native-b2048",
         "glm52-native-b2048-memory",
         "glm52-native-b2048-nsys",
+        _RANK_BALANCED_PROFILE,
         "glm52-native-delta3",
         "glm52-native-stability20",
     }
@@ -11060,6 +11330,7 @@ print(json.dumps({
                 "glm52-native-b2048",
                 "glm52-native-b2048-memory",
                 "glm52-native-b2048-nsys",
+                _RANK_BALANCED_PROFILE,
             }:
                 session_deadline, startup_deadline, step_deadline, profiler_deadline = (
                     _glm_b2048_deadlines()
@@ -13419,6 +13690,12 @@ def _qualify_glm52_step20_parity_action(arguments: list[str]):
     )
 
 
+def _qualify_glm52_rank_balanced_cuda_action(arguments: list[str]):
+    if arguments:
+        raise Refused("qualify-glm52-rank-balanced-cuda takes no arguments")
+    return qualify_glm52_rank_balanced_cuda()
+
+
 def _stage_glm52_step20_adapter_action(arguments: list[str]):
     if arguments:
         raise Refused("stage-glm52-step20-adapter takes no arguments")
@@ -13470,6 +13747,7 @@ actions = {
     "stage-glm52-parity": lambda a: stage_glm52_policy_parity(a or None),
     "collect-glm52-parity": lambda a: collect_glm52_policy_parity(a[0] if a else ""),
     "qualify-glm52-step20-parity": _qualify_glm52_step20_parity_action,
+    "qualify-glm52-rank-balanced-cuda": _qualify_glm52_rank_balanced_cuda_action,
     "prepare-glm52-adapter-server": _prepare_glm52_adapter_server_action,
     "stage-glm52-step20-adapter": _stage_glm52_step20_adapter_action,
     "diagnose-glm52-parity": _diagnose_glm52_parity_action,
@@ -13508,6 +13786,8 @@ usage = f"""training-ops <action> [args]
                                 add --finished after another run is active
   qualify <profile>             start a trainer-only profile
   qualify-glm52-step20-parity  score fixed parity tokens with the step-20 adapter
+  qualify-glm52-rank-balanced-cuda
+                                run the isolated PP8 CUDA check on the trainer head
   stage-glm52-step20-adapter   copy the exact step-20 adapter to H200
   stage-glm52-parity [node ...] validate and stage the exact parity reference
   diagnose-glm52-parity <run>  capture H200 parity and replay trainer layer 3

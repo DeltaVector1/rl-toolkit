@@ -31,6 +31,7 @@ adapter_bucket = "hf://buckets/NewEden/muse-lora-checkpoints"
 [containers]
 trainer = "glm52-optims-trainer"
 glm52_qualification_trainer = "glm52-optims-trainer"
+glm52_rank_balanced_cuda = "glm52-rank-balanced-cuda"
 trainer_image = "prime-rl:glm52-v080-qual"
 inference_image = "prime-rl:glm52-v080-full"
 orchestrator = "glm52-optims-orchestrator"
@@ -94,6 +95,11 @@ trainer_container = "glm52_qualification_trainer"
 trainer = "configs/qualification/glm52-native-b2048-nsys.toml"
 launch_env = { PRIME_NSYS_PROFILE = "1", PRIME_CUDA_PROFILE = "1", PRIME_CUDA_PROFILE_RANK = "24", PRIME_CUDA_PROFILE_STEPS = "2", PRIME_PHASE_PROFILE_RECORD_PATH = "/data/glm52-rl/qualifications/glm52-native-b2048-nsys-20260827/phase-profile.json" }
 
+[profiles.glm52-native-interleaved-rank-balanced]
+kind = "glm52"
+trainer_container = "glm52_qualification_trainer"
+trainer = "configs/qualification/glm52-native-interleaved-rank-balanced.toml"
+
 [profiles.glm52-native-delta3]
 kind = "glm52"
 trainer_container = "glm52_qualification_trainer"
@@ -103,6 +109,20 @@ trainer = "configs/qualification/glm52-native-delta3.toml"
 kind = "glm52"
 trainer_container = "glm52_qualification_trainer"
 trainer = "configs/qualification/glm52-native-stability20.toml"
+
+[qualification.glm52_rank_balanced_cuda]
+kind = "glm52"
+profile = "glm52-native-interleaved-rank-balanced"
+host_group = "trainer_head"
+container = "glm52_rank_balanced_cuda"
+script = "source/tests/test_final_pp16_cuda.py"
+runner = "source/src/prime_rl/trainer/distributed/pp_runner.py"
+output_root = "/data/glm52-rl/qualifications/glm52-rank-balanced-cuda"
+gpus = 8
+network = "host"
+outer_timeout_seconds = 300
+process_group_timeout_seconds = 120
+transport_env = { CUDA_DEVICE_ORDER = "PCI_BUS_ID", NCCL_SOCKET_IFNAME = "vlan130", GLOO_SOCKET_IFNAME = "vlan130", NCCL_IB_DISABLE = "1", NCCL_P2P_DISABLE = "1", NCCL_SOCKET_NTHREADS = "1", NCCL_NSOCKS_PERTHREAD = "1", NCCL_BUFFSIZE = "1048576", NCCL_CUMEM_HOST_ENABLE = "0", NCCL_MIN_NCHANNELS = "4", NCCL_MAX_NCHANNELS = "4", TORCH_NCCL_ASYNC_ERROR_HANDLING = "1" }
 
 [reward]
 minimum_steps = 10

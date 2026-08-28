@@ -36,6 +36,7 @@ def test_current_glm52_profile_is_batch_2048_without_rollout_cache() -> None:
         "glm52-native-b2048",
         "glm52-native-b2048-memory",
         "glm52-native-b2048-nsys",
+        "glm52-native-interleaved-rank-balanced",
         "glm52-native-delta3",
         "glm52-native-stability20",
     }
@@ -322,6 +323,7 @@ def test_all_glm52_trainers_use_h200_w8a8_semantics() -> None:
         "configs/qualification/glm52-native-b2048.toml",
         "configs/qualification/glm52-native-b2048-memory.toml",
         "configs/qualification/glm52-native-b2048-nsys.toml",
+        "configs/qualification/glm52-native-interleaved-rank-balanced.toml",
         "configs/qualification/glm52-native-delta3.toml",
         "configs/qualification/glm52-native-stability20.toml",
         "configs/paused/trainer.glm52-production.toml",

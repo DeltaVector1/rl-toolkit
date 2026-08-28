@@ -316,7 +316,7 @@ PY
     fi
     if [ -n "$configured_phase_profile" ]; then
       case "$(readlink -f "$trainer_config")" in
-        "$(readlink -f "$deployment/configs/qualification/glm52-native-small.toml")"|"$(readlink -f "$deployment/configs/qualification/glm52-native-b2048.toml")"|"$(readlink -f "$deployment/configs/qualification/glm52-native-b2048-memory.toml")"|"$(readlink -f "$deployment/configs/qualification/glm52-native-b2048-nsys.toml")") ;;
+        "$(readlink -f "$deployment/configs/qualification/glm52-native-small.toml")"|"$(readlink -f "$deployment/configs/qualification/glm52-native-b2048.toml")"|"$(readlink -f "$deployment/configs/qualification/glm52-native-b2048-memory.toml")"|"$(readlink -f "$deployment/configs/qualification/glm52-native-b2048-nsys.toml")"|"$(readlink -f "$deployment/configs/qualification/glm52-native-interleaved-rank-balanced.toml")") ;;
         *)
           echo "phase profiling may only be enabled by a GLM qualification config" >&2
           exit 1
@@ -472,10 +472,10 @@ PY
         echo "qualification session ID is invalid" >&2; exit 1
       }
       case "${PRIME_QUALIFICATION_PROFILE:-}" in
-        glm52-native-b2048|glm52-native-b2048-memory|glm52-native-b2048-nsys|glm52-native-delta3|glm52-native-stability20) ;;
+        glm52-native-b2048|glm52-native-b2048-memory|glm52-native-b2048-nsys|glm52-native-interleaved-rank-balanced|glm52-native-delta3|glm52-native-stability20) ;;
         *) echo "qualification profile is invalid" >&2; exit 1 ;;
       esac
-      if [ "${PRIME_QUALIFICATION_PROFILE}" = "glm52-native-b2048" ] || [ "${PRIME_QUALIFICATION_PROFILE}" = "glm52-native-b2048-memory" ] || [ "${PRIME_QUALIFICATION_PROFILE}" = "glm52-native-b2048-nsys" ]; then
+      if [ "${PRIME_QUALIFICATION_PROFILE}" = "glm52-native-b2048" ] || [ "${PRIME_QUALIFICATION_PROFILE}" = "glm52-native-b2048-memory" ] || [ "${PRIME_QUALIFICATION_PROFILE}" = "glm52-native-b2048-nsys" ] || [ "${PRIME_QUALIFICATION_PROFILE}" = "glm52-native-interleaved-rank-balanced" ]; then
         for deadline in \
           "${PRIME_QUALIFICATION_SESSION_DEADLINE_SECONDS:-}" \
           "${PRIME_QUALIFICATION_STARTUP_DEADLINE_SECONDS:-}" \
@@ -624,7 +624,7 @@ PY
         -e "PRIME_TRAINER_HOST=n$node"
         -e "PRIME_TRAINER_HEAD=n$trainer_head_node"
       )
-      if [ "$PRIME_QUALIFICATION_PROFILE" = "glm52-native-b2048" ] || [ "$PRIME_QUALIFICATION_PROFILE" = "glm52-native-b2048-memory" ] || [ "$PRIME_QUALIFICATION_PROFILE" = "glm52-native-b2048-nsys" ]; then
+      if [ "$PRIME_QUALIFICATION_PROFILE" = "glm52-native-b2048" ] || [ "$PRIME_QUALIFICATION_PROFILE" = "glm52-native-b2048-memory" ] || [ "$PRIME_QUALIFICATION_PROFILE" = "glm52-native-b2048-nsys" ] || [ "$PRIME_QUALIFICATION_PROFILE" = "glm52-native-interleaved-rank-balanced" ]; then
         qualification_env+=(
           -e "PRIME_QUALIFICATION_SESSION_DEADLINE_SECONDS=$PRIME_QUALIFICATION_SESSION_DEADLINE_SECONDS"
           -e "PRIME_QUALIFICATION_STARTUP_DEADLINE_SECONDS=$PRIME_QUALIFICATION_STARTUP_DEADLINE_SECONDS"
