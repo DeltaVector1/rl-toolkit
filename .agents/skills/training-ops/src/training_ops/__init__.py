@@ -10370,7 +10370,8 @@ sudo timeout --foreground --signal=TERM --kill-after=30s {startup_deadline}s \
   docker run --rm --cidfile {shlex.quote(cid_path)} \
   --label prime.qualification={shlex.quote(qualification_label)} \
   --label prime.session={shlex.quote(session)} \
-  --name {shlex.quote(container)} --gpus all --ipc host --network none --read-only \
+  --name {shlex.quote(container)} --gpus all --ipc host --network none \
+  --hostname localhost --read-only \
   --cap-drop ALL --security-opt no-new-privileges --pids-limit 1024 \
   --tmpfs /tmp:rw,nosuid,nodev,size=1g \
   -v {shlex.quote(script_path)}:/qualification/test_pp_async_cuda.py:ro \

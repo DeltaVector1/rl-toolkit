@@ -178,6 +178,14 @@ def test_cuda_smoke_profile_is_small_and_n82_only() -> None:
     assert "/data/ZiphuAI" not in script
 
 
+def test_cuda_smoke_has_a_resolvable_hostname_without_network_access() -> None:
+    source = (
+        ROOT / ".agents/skills/training-ops/src/training_ops/__init__.py"
+    ).read_text()
+    assert "--network none \\\n  --hostname localhost --read-only" in source
+    assert 'inner = "torchrun --standalone --nproc-per-node=8' in source
+
+
 def test_exited_trainer_is_allowed_and_cuda_command_is_fail_closed() -> None:
     training_ops = _load_training_ops("training_ops_pp_async_smoke")
 
@@ -252,6 +260,7 @@ def test_exited_trainer_is_allowed_and_cuda_command_is_fail_closed() -> None:
     launch = calls[2][1]
     assert "--nproc-per-node=8" in launch
     assert "--network none" in launch
+    assert "--hostname localhost" in launch
     assert "--read-only" in launch
     assert "--cidfile" in launch
     assert "--label prime.qualification=glm52-pp-async-cuda-smoke" in launch
