@@ -271,6 +271,52 @@ def test_cuda_sparse_mode_checks_production_boundary_ownership_after_dense_modes
     assert '"all_sparse_cache_nccl_work_drained"' in source
 
 
+def test_rank_zero_sparse_forward_requires_no_input_cache() -> None:
+    torch = pytest.importorskip("torch")
+    source_path = ROOT / "source/tests/test_pp_async_cuda.py"
+    tree = ast.parse(source_path.read_text())
+    selected = []
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name)
+            and target.id
+            in {"stages", "microbatches", "steps", "junction_sparse_flags"}
+            for target in node.targets
+        ):
+            selected.append(node)
+        elif isinstance(node, ast.ClassDef) and node.name in {
+            "AffineStage",
+            "SparseAffineStage",
+        }:
+            selected.append(node)
+    namespace = {"torch": torch, "nn": torch.nn}
+    exec(
+        compile(ast.Module(body=selected, type_ignores=[]), str(source_path), "exec"),
+        namespace,
+    )
+    module = namespace["SparseAffineStage"](0)
+    module.begin_microbatch_step(0)
+    hidden = torch.zeros((1, 2, 4), dtype=torch.float32)
+    for microbatch in range(8):
+        module.set_active_microbatch(microbatch)
+        output = module(hidden)
+        module.clear_active_microbatch()
+    module.assert_microbatch_step_complete()
+    assert output[0].shape == hidden.shape
+    assert output[1].shape == (1, 2, 1, 4)
+
+    module.begin_microbatch_step(1)
+    for microbatch in range(8):
+        module.set_active_microbatch(microbatch)
+        if microbatch == 0:
+            with pytest.raises(AssertionError, match="stage 0 must not receive"):
+                module(hidden, torch.zeros((1,), dtype=torch.float16))
+        else:
+            module(hidden)
+        module.clear_active_microbatch()
+    module.assert_microbatch_step_complete()
+
+
 def _new_cuda_dummy_stage():
     path = ROOT / "source/tests/test_pp_async_cuda.py"
     tree = ast.parse(path.read_text())
@@ -726,10 +772,42 @@ def test_exited_trainer_is_allowed_and_cuda_command_is_fail_closed() -> None:
         ).hexdigest(),
     }
     mode = {
-        "steps": [{"cuda_ms": 1.0}, {"cuda_ms": 1.0}],
+        "steps": [
+            {
+                "cuda_ms": 1.0,
+                "work_lifecycle": {
+                    "created": 1,
+                    "waited": 1,
+                    "retired": 1,
+                    "live": 0,
+                },
+            },
+            {
+                "cuda_ms": 1.0,
+                "work_lifecycle": {
+                    "created": 1,
+                    "waited": 1,
+                    "retired": 1,
+                    "live": 0,
+                },
+            },
+        ],
         "peak_memory_bytes_max": 1,
         "all_async_nccl_work_drained": True,
     }
+
+    def sparse_mode(rank: int) -> dict[str, object]:
+        return {
+            **mode,
+            "sparse_cache": True,
+            "sparse_cache_lifecycle": {
+                "received": 16 if rank % 2 else 0,
+                "sent": 16 if rank % 2 == 0 else 0,
+                "steps": 2,
+                "microbatches": 8,
+            },
+        }
+
     result = {
         "status": "pass",
         "ranks": 8,
@@ -737,8 +815,15 @@ def test_exited_trainer_is_allowed_and_cuda_command_is_fail_closed() -> None:
         "microbatches": 8,
         "action_loss_grad_update_parity": True,
         "all_async_nccl_work_drained": True,
+        "all_sparse_cache_nccl_work_drained": True,
         "rank_reports": [
-            {"rank": rank, "baseline": mode, "async": mode} for rank in range(8)
+            {
+                "rank": rank,
+                "baseline": mode,
+                "async": mode,
+                "async_sparse": sparse_mode(rank),
+            }
+            for rank in range(8)
         ],
         **hashes,
     }
@@ -899,6 +984,120 @@ def test_rank_four_failure_artifact_survives_a_missing_result() -> None:
     diagnostic = calls[4][1]
     assert "error.json" in diagnostic
     assert "traceback[-6000:]" in diagnostic
+
+
+def _valid_pp_async_result() -> dict[str, object]:
+    source_paths = (
+        "source/tests/test_pp_async_cuda.py",
+        "source/src/prime_rl/trainer/distributed/async_schedule.py",
+        "source/src/prime_rl/trainer/distributed/pp_runner.py",
+        "source/src/prime_rl/trainer/phase_profiler.py",
+    )
+    hashes = {
+        f"{name}_sha256": hashlib.sha256((ROOT / path).read_bytes()).hexdigest()
+        for name, path in zip(
+            ("test", "async_schedule", "pp_runner", "phase_profiler"),
+            source_paths,
+        )
+    }
+    lifecycle = {
+        "created": 1,
+        "waited": 1,
+        "retired": 1,
+        "live": 0,
+    }
+    grouped = {
+        "steps": [
+            {"cuda_ms": 1.0, "work_lifecycle": dict(lifecycle)},
+            {"cuda_ms": 1.0, "work_lifecycle": dict(lifecycle)},
+        ],
+        "peak_memory_bytes_max": 1,
+        "all_async_nccl_work_drained": True,
+    }
+    reports = []
+    for rank in range(8):
+        sparse = {
+            **grouped,
+            "sparse_cache": True,
+            "sparse_cache_lifecycle": {
+                "received": 16 if rank % 2 else 0,
+                "sent": 16 if rank % 2 == 0 else 0,
+                "steps": 2,
+                "microbatches": 8,
+            },
+        }
+        reports.append(
+            {
+                "rank": rank,
+                "baseline": grouped,
+                "async": grouped,
+                "async_sparse": sparse,
+            }
+        )
+    return {
+        "status": "pass",
+        "ranks": 8,
+        "steps": 2,
+        "microbatches": 8,
+        "action_loss_grad_update_parity": True,
+        "all_async_nccl_work_drained": True,
+        "all_sparse_cache_nccl_work_drained": True,
+        "rank_reports": reports,
+        **hashes,
+    }
+
+
+def _run_mocked_pp_async_result(result: dict[str, object], module_name: str) -> None:
+    training_ops = _load_training_ops(module_name)
+    calls = []
+
+    def fake_ssh(host, command, timeout=120, **_kwargs):
+        calls.append((host, command, timeout))
+        if len(calls) == 1:
+            return 0, "GPUS 8\nPIDS\nRUNNING\n"
+        if len(calls) == 2:
+            return 0, "STALE none\n"
+        if len(calls) == 3:
+            return 0, json.dumps(result)
+        return 0, "CONTAINERS\nPIDS\n"
+
+    training_ops._assert_live_services_are_down = lambda *_args, **_kwargs: None
+    training_ops._ssh = fake_ssh
+    training_ops.deploy = lambda *_args, **_kwargs: True
+    training_ops.secrets.token_hex = lambda _size: "0123456789abcdef"
+    with pytest.raises(RuntimeError, match="PP async CUDA qualification"):
+        training_ops.qualify_glm52_pp_async_cuda()
+
+
+def test_pp_async_result_rejects_incomplete_sparse_evidence() -> None:
+    cases = []
+
+    undrained = _valid_pp_async_result()
+    undrained["all_sparse_cache_nccl_work_drained"] = False
+    cases.append(undrained)
+
+    missing_sparse_steps = _valid_pp_async_result()
+    missing_sparse_steps["rank_reports"][0]["async_sparse"]["steps"] = []
+    cases.append(missing_sparse_steps)
+
+    missing_peak = _valid_pp_async_result()
+    del missing_peak["rank_reports"][0]["async_sparse"]["peak_memory_bytes_max"]
+    cases.append(missing_peak)
+
+    invalid_work = _valid_pp_async_result()
+    invalid_work["rank_reports"][0]["async_sparse"]["steps"][0]["work_lifecycle"][
+        "waited"
+    ] = 0
+    cases.append(invalid_work)
+
+    invalid_cache_count = _valid_pp_async_result()
+    invalid_cache_count["rank_reports"][1]["async_sparse"]["sparse_cache_lifecycle"][
+        "received"
+    ] = 15
+    cases.append(invalid_cache_count)
+
+    for index, result in enumerate(cases):
+        _run_mocked_pp_async_result(result, f"training_ops_pp_async_malformed_{index}")
 
 
 def test_worker_diagnostic_reads_a_valid_rank_four_artifact() -> None:

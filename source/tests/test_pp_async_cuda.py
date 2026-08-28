@@ -226,7 +226,9 @@ class SparseAffineStage(AffineStage):
                     f"microbatch {microbatch}"
                 )
             self._cache_received.append((self.stage_identity, microbatch))
-        elif cache is None or cache.numel() != 1:
+        elif self.stage_identity == 0 and cache is not None:
+            raise AssertionError("stage 0 must not receive a sparse cache")
+        elif self.stage_identity != 0 and (cache is None or cache.numel() != 1):
             raise AssertionError(
                 f"stage {self.stage_identity} expected a one-element cache placeholder"
             )

@@ -10727,6 +10727,7 @@ cat {shlex.quote(result_path)}
         or result.get("microbatches") != 8
         or result.get("action_loss_grad_update_parity") is not True
         or result.get("all_async_nccl_work_drained") is not True
+        or result.get("all_sparse_cache_nccl_work_drained") is not True
         or any(result.get(key) != value for key, value in expected_hashes.items())
     ):
         raise RuntimeError("PP async CUDA qualification result failed validation")
@@ -10738,7 +10739,8 @@ cat {shlex.quote(result_path)}
     ) != list(range(gpu_count)):
         raise RuntimeError("PP async CUDA qualification has invalid rank reports")
     for report in reports:
-        for mode in ("baseline", "async"):
+        rank = report.get("rank") if isinstance(report, dict) else None
+        for mode in ("baseline", "async", "async_sparse"):
             mode_report = report.get(mode) if isinstance(report, dict) else None
             mode_steps = mode_report.get("steps") if isinstance(mode_report, dict) else None
             if (
@@ -10746,15 +10748,71 @@ cat {shlex.quote(result_path)}
                 or len(mode_steps) != step_count
                 or any(
                     not isinstance(item, dict)
+                    or isinstance(item.get("cuda_ms"), bool)
                     or not isinstance(item.get("cuda_ms"), (int, float))
                     or item["cuda_ms"] <= 0
                     for item in mode_steps
                 )
                 or not isinstance(mode_report, dict)
+                or isinstance(mode_report.get("peak_memory_bytes_max"), bool)
                 or not isinstance(mode_report.get("peak_memory_bytes_max"), int)
                 or mode_report["peak_memory_bytes_max"] < 0
             ):
                 raise RuntimeError("PP async CUDA qualification has invalid measurements")
+            if mode != "baseline":
+                if mode_report.get("all_async_nccl_work_drained") is not True:
+                    raise RuntimeError(
+                        "PP async CUDA qualification has undrained grouped work"
+                    )
+                for item in mode_steps:
+                    lifecycle = item.get("work_lifecycle")
+                    if not isinstance(lifecycle, dict):
+                        raise RuntimeError(
+                            "PP async CUDA qualification has an incomplete work lifecycle"
+                        )
+                    counts = [lifecycle.get(key) for key in ("created", "waited", "retired", "live")]
+                    if (
+                        any(
+                            isinstance(value, bool) or not isinstance(value, int) or value < 0
+                            for value in counts
+                        )
+                        or counts[0] != counts[1]
+                        or counts[1] != counts[2]
+                        or counts[3] != 0
+                    ):
+                        raise RuntimeError(
+                            "PP async CUDA qualification has an invalid work lifecycle"
+                        )
+            if mode == "async_sparse":
+                if mode_report.get("sparse_cache") is not True:
+                    raise RuntimeError(
+                        "PP async CUDA qualification sparse mode is not marked"
+                    )
+                cache = mode_report.get("sparse_cache_lifecycle")
+                if not isinstance(cache, dict):
+                    raise RuntimeError(
+                        "PP async CUDA qualification has no sparse-cache lifecycle"
+                    )
+                received = cache.get("received")
+                sent = cache.get("sent")
+                cache_steps = cache.get("steps")
+                cache_microbatches = cache.get("microbatches")
+                if (
+                    isinstance(received, bool)
+                    or not isinstance(received, int)
+                    or received < 0
+                    or isinstance(sent, bool)
+                    or not isinstance(sent, int)
+                    or sent < 0
+                    or cache_steps != step_count
+                    or cache_microbatches != 8
+                    or rank is None
+                    or (rank % 2 == 0 and (sent != step_count * 8 or received != 0))
+                    or (rank % 2 == 1 and (received != step_count * 8 or sent != 0))
+                ):
+                    raise RuntimeError(
+                        "PP async CUDA qualification has invalid sparse-cache counts"
+                    )
     result["output_dir"] = output_dir
     summary = {
         "status": "pass",
@@ -10766,10 +10824,15 @@ cat {shlex.quote(result_path)}
         "async_cuda_ms_max": max(
             step["cuda_ms"] for report in reports for step in report["async"]["steps"]
         ),
+        "async_sparse_cuda_ms_max": max(
+            step["cuda_ms"]
+            for report in reports
+            for step in report["async_sparse"]["steps"]
+        ),
         "peak_memory_bytes_max": max(
             report[mode]["peak_memory_bytes_max"]
             for report in reports
-            for mode in ("baseline", "async")
+            for mode in ("baseline", "async", "async_sparse")
         ),
         "output_dir": output_dir,
     }
