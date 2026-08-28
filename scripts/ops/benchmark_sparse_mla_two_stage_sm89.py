@@ -125,6 +125,11 @@ def run(args: argparse.Namespace) -> None:
     peak_allocated_delta = torch.cuda.max_memory_allocated(q.device) - allocated_before
     peak_reserved_delta = torch.cuda.max_memory_reserved(q.device) - reserved_before
     free_hbm_after, _ = torch.cuda.mem_get_info(q.device)
+    if peak_allocated_delta > MAX_WORKSPACE_BYTES:
+        raise SystemExit(
+            "measured allocated-memory bound failed: "
+            f"{peak_allocated_delta} > {MAX_WORKSPACE_BYTES} bytes"
+        )
     if peak_reserved_delta > MAX_WORKSPACE_BYTES:
         raise SystemExit(
             "measured reserved-memory bound failed: "
