@@ -739,6 +739,44 @@ def _close_ssh_control_master(host: str, path: str) -> bool:
     return False
 
 
+def _check_started_ssh_control_master(host: str, path: str) -> tuple[bool, str]:
+    """Verify that a newly forked control master is ready for sessions."""
+    try:
+        control_stat = os.lstat(path)
+    except FileNotFoundError:
+        return False, "control socket was not created"
+    except OSError as error:
+        return False, f"cannot inspect control socket: {error}"
+    if stat.S_ISLNK(control_stat.st_mode):
+        return False, "control socket is a symlink"
+    if not stat.S_ISSOCK(control_stat.st_mode):
+        return False, "control path is not a Unix socket"
+    try:
+        checked = subprocess.run(
+            [
+                *ssh_command,
+                "-S",
+                path,
+                "-O",
+                "check",
+                host,
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=ssh_master_cleanup_timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "control master check timed out"
+    except OSError as error:
+        return False, f"control master check failed: {error}"
+    if checked.returncode:
+        return False, _process_detail(
+            checked, f"control master check exited with status {checked.returncode}"
+        )
+    return True, ""
+
+
 def _start_ssh_control_master(host: str, path: str) -> None:
     detail = "connection failed"
     for attempt in range(ssh_master_attempts):
@@ -761,8 +799,14 @@ def _start_ssh_control_master(host: str, path: str) -> None:
                 timeout=ssh_master_start_timeout_seconds,
             )
             if result.returncode == 0:
-                return
-            detail = (result.stderr or result.stdout or detail).strip()
+                ready, check_detail = _check_started_ssh_control_master(host, path)
+                if ready:
+                    return
+                detail = check_detail
+            else:
+                detail = _process_detail(
+                    result, f"ssh exited with status {result.returncode}"
+                )
         except subprocess.TimeoutExpired:
             detail = "connection timed out"
         if not _close_ssh_control_master(host, path):
@@ -774,7 +818,7 @@ def _start_ssh_control_master(host: str, path: str) -> None:
             time.sleep(ssh_master_retry_delay_seconds)
     raise RuntimeError(
         f"SSH connection setup failed on {host} after {ssh_master_attempts} attempts: "
-        f"{detail[:160]}"
+        f"{detail[:240]}"
     )
 
 
@@ -861,6 +905,8 @@ def _ssh(
             timeout=timeout,
         )
         output = p.stdout if p.returncode == 0 else p.stdout + p.stderr
+        if p.returncode and not output.strip():
+            output = f"ssh exited with status {p.returncode}"
         return p.returncode, output
     except subprocess.TimeoutExpired as error:
         parts = []
@@ -944,6 +990,26 @@ def _hms(sec: float | None) -> str:
     if sec < 5400:
         return f"{sec // 60}m"
     return f"{sec // 3600}h{(sec % 3600) // 60:02d}m"
+
+
+def _process_detail(result, fallback: str) -> str:
+    """Return bounded stderr/stdout detail, including silent failures."""
+    details = []
+    for value in (getattr(result, "stderr", None), getattr(result, "stdout", None)):
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", errors="replace")
+        if isinstance(value, str) and value.strip():
+            details.append(value.strip())
+    detail = " | ".join(details).replace("\n", " ")
+    if not detail:
+        return fallback
+    return detail[:240]
+
+
+def _sha256_from_output(output: str) -> str | None:
+    """Extract one SHA-256 digest from a checksum command's output."""
+    matches = re.findall(r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])", output)
+    return matches[0] if len(matches) == 1 else None
 
 
 def _shown(value) -> str:
@@ -10013,14 +10079,23 @@ def deploy(
         staging = f"/tmp/training-ops-{want}-{Path(path).name}"
         check = (
             f"if test -f {shlex.quote(remote)}; then "
-            f"sha256sum {shlex.quote(remote)} | cut -d' ' -f1; "
+            f"sha256sum -- {shlex.quote(remote)}; "
             f"else printf MISSING; fi"
         )
         rc, observed = _ssh(h, check, timeout=60)
         if rc:
-            return f"remote preflight failed: {observed.strip()[:120]}"
-        if observed.strip() == want:
+            return (
+                f"remote preflight failed (ssh exit {rc}): "
+                f"{observed.strip()[:160] or 'no output'}"
+            )
+        observed_digest = _sha256_from_output(observed)
+        if observed_digest == want:
             return "ok"
+        if observed.strip() != "MISSING" and observed_digest is None:
+            return (
+                "remote preflight returned no unambiguous SHA-256: "
+                f"{observed.strip()[:160] or 'no output'}"
+            )
         try:
             p = subprocess.run(
                 [
@@ -10038,8 +10113,10 @@ def deploy(
         except subprocess.TimeoutExpired:
             return "scp failed: timed out after 120 seconds"
         if p.returncode:
-            detail = p.stderr.strip().replace("\n", " ")
-            return f"scp failed: {detail[:160]}"
+            detail = _process_detail(
+                p, f"scp exited with status {p.returncode}"
+            )
+            return f"scp failed: {detail}"
         rc, out = _ssh(
             h,
             f"if test -d {shlex.quote(remote)}; then "
@@ -10050,15 +10127,18 @@ def deploy(
             f"{shlex.quote(remote)} && rm -f {shlex.quote(staging)}",
         )
         if rc:
-            return f"install failed: {out.strip()[:80]}"
+            return f"install failed (ssh exit {rc}): {out.strip()[:160] or 'no output'}"
         rc, got = _ssh(
             h,
             f"test -f {shlex.quote(remote)} && "
-            f"sha256sum {shlex.quote(remote)} | cut -d' ' -f1",
+            f"sha256sum -- {shlex.quote(remote)}",
         )
         if rc:
-            return f"verify failed: {got.strip()[:80]}"
-        return "ok" if got.strip() == want else f"MISMATCH {got.strip()[:12]}"
+            return f"verify failed (ssh exit {rc}): {got.strip()[:160] or 'no output'}"
+        got_digest = _sha256_from_output(got)
+        if got_digest == want:
+            return "ok"
+        return f"MISMATCH {got_digest[:12] if got_digest else 'invalid checksum'}"
 
     with _ssh_control_masters(nodes):
         res = _fan(nodes, one)

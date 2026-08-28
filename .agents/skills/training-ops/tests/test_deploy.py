@@ -170,7 +170,11 @@ class DeployTest(unittest.TestCase):
             training_ops._ssh_control_paths, {}, clear=True
         ), patch.object(
             training_ops.subprocess, "run", return_value=completed
-        ) as run:
+        ) as run, patch.object(
+            training_ops,
+            "_check_started_ssh_control_master",
+            return_value=(True, ""),
+        ):
             with training_ops._ssh_control_masters(hosts):
                 with training_ops._ssh_control_masters(reversed(hosts)):
                     for host in training_ops.trainer_hosts:
@@ -217,6 +221,10 @@ class DeployTest(unittest.TestCase):
         ), patch.object(
             training_ops.subprocess, "run", side_effect=run
         ) as subprocess_run, patch.object(
+            training_ops,
+            "_check_started_ssh_control_master",
+            return_value=(True, ""),
+        ), patch.object(
             training_ops.time, "sleep"
         ) as sleep, self.assertRaisesRegex(
             RuntimeError, "after 3 attempts.*Exceeded MaxStartups"
@@ -263,6 +271,10 @@ class DeployTest(unittest.TestCase):
             ), patch.object(
                 training_ops.subprocess, "run", side_effect=run
             ) as subprocess_run, patch.object(
+                training_ops,
+                "_check_started_ssh_control_master",
+                return_value=(True, ""),
+            ), patch.object(
                 training_ops.time, "sleep"
             ), self.assertRaisesRegex(
                 RuntimeError, "control sockets retained"
@@ -291,6 +303,46 @@ class DeployTest(unittest.TestCase):
             with training_ops._ssh_control_masters([blocked]):
                 pass
         run.assert_not_called()
+
+    def test_started_control_master_requires_a_live_socket(self):
+        host = training_ops.trainer_head
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "master"
+            listener = self._unix_socket(path)
+            try:
+                with patch.object(
+                    training_ops.subprocess,
+                    "run",
+                    return_value=Mock(returncode=0, stdout="Master running\n", stderr=""),
+                ) as run:
+                    self.assertEqual(
+                        training_ops._check_started_ssh_control_master(host, str(path)),
+                        (True, ""),
+                    )
+                command = run.call_args.args[0]
+                self.assertIn("-O", command)
+                self.assertIn("check", command)
+            finally:
+                listener.close()
+
+    def test_started_control_master_reports_missing_socket(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ready, detail = training_ops._check_started_ssh_control_master(
+                training_ops.trainer_head, str(Path(directory) / "missing")
+            )
+        self.assertFalse(ready)
+        self.assertEqual(detail, "control socket was not created")
+
+    def test_ssh_reports_silent_failure_with_exit_status(self):
+        with patch.object(
+            training_ops.subprocess,
+            "run",
+            return_value=Mock(returncode=255, stdout="", stderr=""),
+        ):
+            self.assertEqual(
+                training_ops._ssh(training_ops.trainer_head, "true"),
+                (255, "ssh exited with status 255"),
+            )
 
     def test_mount_preflight_refuses_missing_local_source(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -487,6 +539,8 @@ class DeployTest(unittest.TestCase):
                 return Mock(returncode=0)
 
             def fake_ssh(host, command, timeout=120):
+                if command.startswith("if test -f "):
+                    return 0, "0" * 64
                 if command.startswith("test -f "):
                     return 0, want
                 return 0, ""
@@ -494,6 +548,9 @@ class DeployTest(unittest.TestCase):
             with (
                 patch.object(training_ops, "repo_root", repo),
                 patch.object(training_ops, "_ssh", side_effect=fake_ssh),
+                patch.object(
+                    training_ops, "_ssh_control_masters", return_value=nullcontext()
+                ),
                 patch.object(training_ops.subprocess, "run", side_effect=fake_run),
             ):
                 self.assertTrue(training_ops.deploy("configs/runtime/test.toml"))
@@ -528,6 +585,109 @@ class DeployTest(unittest.TestCase):
             run.assert_not_called()
             ssh.assert_called_once()
 
+    def test_deploy_accepts_checksum_output_with_filename(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            local = repo / "source" / "mounted.py"
+            local.parent.mkdir(parents=True)
+            local.write_text("current\n")
+            want = hashlib.sha256(local.read_bytes()).hexdigest()
+
+            with (
+                patch.object(training_ops, "repo_root", repo),
+                patch.object(training_ops, "_mounted_on", return_value=True),
+                patch.object(
+                    training_ops,
+                    "_ssh",
+                    return_value=(0, f"{want}  /data/glm52-rl/deployment-glm52-optims/source/mounted.py\n"),
+                ) as ssh,
+                patch.object(
+                    training_ops,
+                    "_ssh_control_masters",
+                    return_value=nullcontext(),
+                ),
+                patch.object(training_ops.subprocess, "run") as run,
+            ):
+                self.assertTrue(training_ops.deploy("source/mounted.py", nodes=["n78"]))
+
+            run.assert_not_called()
+            ssh.assert_called_once()
+
+    def test_deploy_reports_silent_scp_failure_with_exit_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            local = repo / "source" / "mounted.py"
+            local.parent.mkdir(parents=True)
+            local.write_text("current\n")
+            calls = []
+
+            def fake_ssh(host, command, timeout=120):
+                del host, timeout
+                calls.append(command)
+                if command.startswith("if test -f "):
+                    return 0, "0" * 64
+                return 0, ""
+
+            def fake_run(command, **kwargs):
+                del kwargs
+                if command[0] == "scp":
+                    return Mock(returncode=17, stdout="", stderr="")
+                raise AssertionError(f"unexpected local command: {command}")
+
+            with (
+                patch.object(training_ops, "repo_root", repo),
+                patch.object(training_ops, "_mounted_on", return_value=True),
+                patch.object(training_ops, "_ssh", side_effect=fake_ssh),
+                patch.object(
+                    training_ops,
+                    "_ssh_control_masters",
+                    return_value=nullcontext(),
+                ),
+                patch.object(training_ops.subprocess, "run", side_effect=fake_run),
+                patch("builtins.print") as print_call,
+            ):
+                self.assertFalse(training_ops.deploy("source/mounted.py", nodes=["n83"]))
+
+            rendered = "\n".join(
+                " ".join(str(arg) for arg in call.args)
+                for call in print_call.call_args_list
+            )
+            self.assertIn("scp exited with status 17", rendered)
+            self.assertEqual(len(calls), 1)
+
+    def test_deploy_refuses_unparseable_preflight_without_scp(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            local = repo / "source" / "mounted.py"
+            local.parent.mkdir(parents=True)
+            local.write_text("current\n")
+
+            with (
+                patch.object(training_ops, "repo_root", repo),
+                patch.object(training_ops, "_mounted_on", return_value=True),
+                patch.object(
+                    training_ops,
+                    "_ssh",
+                    return_value=(0, "sha256sum: input/output error\n"),
+                ) as ssh,
+                patch.object(
+                    training_ops,
+                    "_ssh_control_masters",
+                    return_value=nullcontext(),
+                ),
+                patch.object(training_ops.subprocess, "run") as run,
+                patch("builtins.print") as print_call,
+            ):
+                self.assertFalse(training_ops.deploy("source/mounted.py", nodes=["n78"]))
+
+            run.assert_not_called()
+            ssh.assert_called_once()
+            rendered = "\n".join(
+                " ".join(str(arg) for arg in call.args)
+                for call in print_call.call_args_list
+            )
+            self.assertIn("no unambiguous SHA-256", rendered)
+
     def test_deploy_copies_when_remote_file_differs(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -546,7 +706,7 @@ class DeployTest(unittest.TestCase):
             def fake_ssh(host, command, timeout=120):
                 del host, timeout
                 if command.startswith("if test -f "):
-                    return 0, "different"
+                    return 0, "0" * 64
                 if command.startswith("test -f "):
                     return 0, want
                 return 0, ""
