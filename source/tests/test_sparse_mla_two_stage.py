@@ -87,7 +87,10 @@ class SparseMlaTwoStageTest(unittest.TestCase):
         config_root = ROOT.parent / "configs"
         enabled = []
         for path in config_root.rglob("*.toml"):
-            if "PRIME_SPARSE_BWD_TWO_STAGE" in path.read_text():
+            if (
+                "PRIME_SPARSE_BWD_TWO_STAGE" in path.read_text()
+                and path.name != "operations.toml"
+            ):
                 enabled.append(str(path.relative_to(config_root)))
         self.assertEqual(enabled, [])
 

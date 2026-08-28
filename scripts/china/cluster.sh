@@ -16,6 +16,8 @@ phase_profile=0
 phase_profile_steps=1
 phase_profile_sample_every=8
 phase_profile_record_path=""
+sparse_bwd_two_stage=0
+sparse_two_stage_mount=()
 trainer_module=prime_rl.trainer.rl.train
 nsys_env=()
 nsys_mounts=()
@@ -304,6 +306,20 @@ PY
       auto|legacy|sm89-r32) lora_mm_profile="${configured_lora_mm_profile:-legacy}" ;;
       *) echo "PRIME_LORA_MM_PROFILE must be auto, legacy, or sm89-r32" >&2; exit 1 ;;
     esac
+    case "${PRIME_SPARSE_BWD_TWO_STAGE:-0}" in
+      0) sparse_bwd_two_stage=0 ;;
+      1)
+        [ "${PRIME_QUALIFICATION_PROFILE:-}" = "glm52-native-pp-grouped-lora-sparse-two-stage" ] || {
+          echo "PRIME_SPARSE_BWD_TWO_STAGE may only be enabled by the sparse two-stage qualification profile" >&2
+          exit 1
+        }
+        sparse_bwd_two_stage=1
+        sparse_two_stage_mount=(
+          -v "$deployment/source/src/prime_rl/trainer/models/kernels/sparse_mla_two_stage.py":/app/src/prime_rl/trainer/models/kernels/sparse_mla_two_stage.py:ro
+        )
+        ;;
+      *) echo "PRIME_SPARSE_BWD_TWO_STAGE must be 0 or 1" >&2; exit 1 ;;
+    esac
     if [ "$configured_profile_requested" = "1" ]; then
       [ "$(readlink -f "$trainer_config")" = "$(readlink -f "$deployment/configs/qualification/glm52-native-small.toml")" ] || {
         echo "CUDA profiling may only be enabled by the GLM small qualification config" >&2
@@ -325,7 +341,7 @@ PY
     fi
     if [ -n "$configured_phase_profile" ]; then
       case "$(readlink -f "$trainer_config")" in
-        "$(readlink -f "$deployment/configs/qualification/glm52-native-small.toml")"|"$(readlink -f "$deployment/configs/qualification/glm52-native-b2048.toml")"|"$(readlink -f "$deployment/configs/qualification/glm52-native-b2048-lora.toml")"|"$(readlink -f "$deployment/configs/qualification/glm52-native-b2048-memory.toml")"|"$(readlink -f "$deployment/configs/qualification/glm52-native-b2048-nsys.toml")"|"$(readlink -f "$deployment/configs/qualification/glm52-native-pp-grouped.toml")"|"$(readlink -f "$deployment/configs/qualification/glm52-native-pp-grouped-lora.toml")") ;;
+        "$(readlink -f "$deployment/configs/qualification/glm52-native-small.toml")"|"$(readlink -f "$deployment/configs/qualification/glm52-native-b2048.toml")"|"$(readlink -f "$deployment/configs/qualification/glm52-native-b2048-lora.toml")"|"$(readlink -f "$deployment/configs/qualification/glm52-native-b2048-memory.toml")"|"$(readlink -f "$deployment/configs/qualification/glm52-native-b2048-nsys.toml")"|"$(readlink -f "$deployment/configs/qualification/glm52-native-pp-grouped.toml")"|"$(readlink -f "$deployment/configs/qualification/glm52-native-pp-grouped-lora.toml")"|"$(readlink -f "$deployment/configs/qualification/glm52-native-pp-grouped-lora-sparse-two-stage.toml")") ;;
         *)
           echo "phase profiling may only be enabled by a GLM qualification config" >&2
           exit 1
@@ -481,10 +497,10 @@ PY
         echo "qualification session ID is invalid" >&2; exit 1
       }
       case "${PRIME_QUALIFICATION_PROFILE:-}" in
-        glm52-native-b2048|glm52-native-b2048-lora|glm52-native-b2048-memory|glm52-native-b2048-nsys|glm52-native-delta3|glm52-native-pp-async|glm52-native-pp-grouped|glm52-native-pp-grouped-lora|glm52-native-stability20) ;;
+        glm52-native-b2048|glm52-native-b2048-lora|glm52-native-b2048-memory|glm52-native-b2048-nsys|glm52-native-delta3|glm52-native-pp-async|glm52-native-pp-grouped|glm52-native-pp-grouped-lora|glm52-native-pp-grouped-lora-sparse-two-stage|glm52-native-stability20) ;;
         *) echo "qualification profile is invalid" >&2; exit 1 ;;
       esac
-      if [ "${PRIME_QUALIFICATION_PROFILE}" = "glm52-native-b2048" ] || [ "${PRIME_QUALIFICATION_PROFILE}" = "glm52-native-b2048-lora" ] || [ "${PRIME_QUALIFICATION_PROFILE}" = "glm52-native-b2048-memory" ] || [ "${PRIME_QUALIFICATION_PROFILE}" = "glm52-native-b2048-nsys" ] || [ "${PRIME_QUALIFICATION_PROFILE}" = "glm52-native-pp-async" ] || [ "${PRIME_QUALIFICATION_PROFILE}" = "glm52-native-pp-grouped" ] || [ "${PRIME_QUALIFICATION_PROFILE}" = "glm52-native-pp-grouped-lora" ]; then
+      if [ "${PRIME_QUALIFICATION_PROFILE}" = "glm52-native-b2048" ] || [ "${PRIME_QUALIFICATION_PROFILE}" = "glm52-native-b2048-lora" ] || [ "${PRIME_QUALIFICATION_PROFILE}" = "glm52-native-b2048-memory" ] || [ "${PRIME_QUALIFICATION_PROFILE}" = "glm52-native-b2048-nsys" ] || [ "${PRIME_QUALIFICATION_PROFILE}" = "glm52-native-pp-async" ] || [ "${PRIME_QUALIFICATION_PROFILE}" = "glm52-native-pp-grouped" ] || [ "${PRIME_QUALIFICATION_PROFILE}" = "glm52-native-pp-grouped-lora" ] || [ "${PRIME_QUALIFICATION_PROFILE}" = "glm52-native-pp-grouped-lora-sparse-two-stage" ]; then
         for deadline in \
           "${PRIME_QUALIFICATION_SESSION_DEADLINE_SECONDS:-}" \
           "${PRIME_QUALIFICATION_STARTUP_DEADLINE_SECONDS:-}" \
@@ -567,6 +583,12 @@ if os.environ.get("PRIME_QUALIFICATION_PROFILE") != "glm52-native-b2048-memory":
         for path in mounted_paths
         if path != "source/tests/test_final_pp16_cuda.py"
     ]
+if os.environ.get("PRIME_QUALIFICATION_PROFILE") != "glm52-native-pp-grouped-lora-sparse-two-stage":
+    mounted_paths = [
+        path
+        for path in mounted_paths
+        if path != "source/src/prime_rl/trainer/models/kernels/sparse_mla_two_stage.py"
+    ]
 expected_paths = set(mounted_paths) | {"scripts/china/cluster.sh"}
 if set(source_files) != expected_paths:
     raise SystemExit("qualification source manifest differs from launcher mounts")
@@ -633,7 +655,7 @@ PY
         -e "PRIME_TRAINER_HOST=n$node"
         -e "PRIME_TRAINER_HEAD=n$trainer_head_node"
       )
-      if [ "$PRIME_QUALIFICATION_PROFILE" = "glm52-native-b2048" ] || [ "$PRIME_QUALIFICATION_PROFILE" = "glm52-native-b2048-lora" ] || [ "$PRIME_QUALIFICATION_PROFILE" = "glm52-native-b2048-memory" ] || [ "$PRIME_QUALIFICATION_PROFILE" = "glm52-native-b2048-nsys" ] || [ "$PRIME_QUALIFICATION_PROFILE" = "glm52-native-pp-async" ] || [ "$PRIME_QUALIFICATION_PROFILE" = "glm52-native-pp-grouped" ] || [ "$PRIME_QUALIFICATION_PROFILE" = "glm52-native-pp-grouped-lora" ]; then
+      if [ "$PRIME_QUALIFICATION_PROFILE" = "glm52-native-b2048" ] || [ "$PRIME_QUALIFICATION_PROFILE" = "glm52-native-b2048-lora" ] || [ "$PRIME_QUALIFICATION_PROFILE" = "glm52-native-b2048-memory" ] || [ "$PRIME_QUALIFICATION_PROFILE" = "glm52-native-b2048-nsys" ] || [ "$PRIME_QUALIFICATION_PROFILE" = "glm52-native-pp-async" ] || [ "$PRIME_QUALIFICATION_PROFILE" = "glm52-native-pp-grouped" ] || [ "$PRIME_QUALIFICATION_PROFILE" = "glm52-native-pp-grouped-lora" ] || [ "$PRIME_QUALIFICATION_PROFILE" = "glm52-native-pp-grouped-lora-sparse-two-stage" ]; then
         qualification_env+=(
           -e "PRIME_QUALIFICATION_SESSION_DEADLINE_SECONDS=$PRIME_QUALIFICATION_SESSION_DEADLINE_SECONDS"
           -e "PRIME_QUALIFICATION_STARTUP_DEADLINE_SECONDS=$PRIME_QUALIFICATION_STARTUP_DEADLINE_SECONDS"
@@ -719,6 +741,7 @@ PY
       "${prime_configs_mount[@]}" \
       "${nsys_mounts[@]}" \
       "${qualification_test_mounts[@]}" \
+      "${sparse_two_stage_mount[@]}" \
       "${cuda_memory_env[@]}" \
       "${bf16_combine_env[@]}" \
       -e TMPDIR=/scratch-tmp \
@@ -784,6 +807,7 @@ PY
       -e PRIME_PROFILE_PP_STAGE="$profile_pp_stage" \
       -e PRIME_PROFILE_PP_RANK="$profile_pp_rank" \
       -e PRIME_EP_AC_CACHE="${PRIME_EP_AC_CACHE:-0}" \
+      -e PRIME_SPARSE_BWD_TWO_STAGE="$sparse_bwd_two_stage" \
       -e PRIME_INT4_COMBINE_ROUNDS="$int4_combine_rounds" \
       -e PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD="$fp8_expert_activation_offload" \
       -e PRIME_LORA_MM_PROFILE="$lora_mm_profile" \

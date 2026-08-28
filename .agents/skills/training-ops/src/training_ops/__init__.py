@@ -395,10 +395,11 @@ _QUALIFICATION_LAUNCH_ENV_PATTERNS = {
     "PRIME_PHASE_PROFILE_RECORD_PATH": re.compile(
         r"/data/glm52-rl/qualifications/"
         r"(?:glm52-native-b2048-nsys-[0-9]{8}|glm52-native-b2048-lora|"
-        r"glm52-native-pp-grouped(?:-lora)?)/"
+        r"glm52-native-pp-grouped(?:-lora(?:-sparse-two-stage)?)?)/"
         r"phase-profile\.json"
     ),
     "PRIME_BF16_COMBINE_ROUNDS": re.compile(r"8"),
+    "PRIME_SPARSE_BWD_TWO_STAGE": re.compile(r"1"),
 }
 
 _CUDA_MEMORY_CAPTURE_PROFILE = "glm52-native-b2048-memory"
@@ -427,6 +428,7 @@ _MEMORY_PROFILE_LAUNCH_ENV = {
     **_CUDA_MEMORY_CAPTURE_ENV,
     **_BF16_COMBINE_ROUNDS_ENV,
 }
+_SPARSE_TWO_STAGE_PROFILE = "glm52-native-pp-grouped-lora-sparse-two-stage"
 
 _NSYS_QUALIFICATION_PROFILE = "glm52-native-b2048-nsys"
 _NSYS_TRAINER_MODULE = "prime_rl.trainer.nsys_worker"
@@ -7617,6 +7619,9 @@ def _repair_supervisors() -> str:
 _QUALIFICATION_ONLY_MOUNTS = {
     _CUDA_MEMORY_CAPTURE_PROFILE: frozenset({"source/tests/test_final_pp16_cuda.py"}),
     _PP_ASYNC_CUDA_PROFILE: frozenset({"source/tests/test_pp_async_cuda.py"}),
+    _SPARSE_TWO_STAGE_PROFILE: frozenset({
+        "source/src/prime_rl/trainer/models/kernels/sparse_mla_two_stage.py",
+    }),
 }
 
 
@@ -8530,6 +8535,7 @@ def _validate_trainer_qualification(
         "glm52-native-pp-async": 2,
         "glm52-native-pp-grouped": 2,
         "glm52-native-pp-grouped-lora": 2,
+        "glm52-native-pp-grouped-lora-sparse-two-stage": 2,
         "glm52-native-stability20": 20,
     }
     if profile_name not in expected_step_counts:
@@ -8573,6 +8579,7 @@ def _validate_trainer_qualification(
         "glm52-native-pp-async",
         "glm52-native-pp-grouped",
         "glm52-native-pp-grouped-lora",
+        "glm52-native-pp-grouped-lora-sparse-two-stage",
     }:
         session_deadline, startup_deadline, step_deadline, profiler_deadline = (
             _glm_b2048_deadlines()
@@ -8651,6 +8658,7 @@ def _validate_trainer_qualification(
         profile_name in {
             "glm52-native-b2048-lora",
             "glm52-native-pp-grouped-lora",
+            "glm52-native-pp-grouped-lora-sparse-two-stage",
         }
         and profile.get("model", {}).get("lora", {}).get("fused_qkv_a_lora") is not True
     ):
@@ -11631,6 +11639,7 @@ def _prepare_trainer_qualification_session(
         "glm52-native-pp-async",
         "glm52-native-pp-grouped",
         "glm52-native-pp-grouped-lora",
+        "glm52-native-pp-grouped-lora-sparse-two-stage",
     }:
         session_deadline, startup_deadline, step_deadline, profiler_deadline = (
             _glm_b2048_deadlines()
@@ -11861,6 +11870,7 @@ def _qualify_connected(
         "glm52-native-pp-async",
         "glm52-native-pp-grouped",
         "glm52-native-pp-grouped-lora",
+        "glm52-native-pp-grouped-lora-sparse-two-stage",
         "glm52-native-stability20",
     }
     if strict_qualification and nodes != [trainer_head] + [
@@ -12160,6 +12170,7 @@ print(json.dumps({
                 "glm52-native-pp-async",
                 "glm52-native-pp-grouped",
                 "glm52-native-pp-grouped-lora",
+                "glm52-native-pp-grouped-lora-sparse-two-stage",
             }:
                 session_deadline, startup_deadline, step_deadline, profiler_deadline = (
                     _glm_b2048_deadlines()
@@ -12175,6 +12186,7 @@ print(json.dumps({
             if launch_env and (
                 memory_keys
                 or (nsys_capture is not None and host == nsys_capture.host)
+                or name == _SPARSE_TWO_STAGE_PROFILE
             ):
                 expected_environment.update(launch_env)
             mismatches = []

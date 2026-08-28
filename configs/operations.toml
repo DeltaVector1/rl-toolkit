@@ -128,6 +128,12 @@ trainer_container = "glm52_qualification_trainer"
 trainer = "configs/qualification/glm52-native-pp-grouped-lora.toml"
 launch_env = { PRIME_PHASE_PROFILE_RECORD_PATH = "/data/glm52-rl/qualifications/glm52-native-pp-grouped-lora/phase-profile.json" }
 
+[profiles.glm52-native-pp-grouped-lora-sparse-two-stage]
+kind = "glm52"
+trainer_container = "glm52_qualification_trainer"
+trainer = "configs/qualification/glm52-native-pp-grouped-lora-sparse-two-stage.toml"
+launch_env = { PRIME_PHASE_PROFILE_RECORD_PATH = "/data/glm52-rl/qualifications/glm52-native-pp-grouped-lora-sparse-two-stage/phase-profile.json", PRIME_SPARSE_BWD_TWO_STAGE = "1" }
+
 [qualification.glm52_pp_async_cuda]
 kind = "glm52"
 host = "n82"
