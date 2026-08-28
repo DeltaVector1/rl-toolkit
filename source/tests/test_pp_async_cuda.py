@@ -178,13 +178,92 @@ class AffineStage(nn.Module):
         return output.sum() if self.is_last else output
 
 
+class WorkLifecycle:
+    def __init__(self, journal=None):
+        self.journal = journal
+        self.created = 0
+        self.waited = 0
+        self.retired = 0
+        self._pending: dict[int, tuple[str, tuple[int, ...]]] = {}
+        self._live: dict[int, object] = {}
+        self._waited: set[int] = set()
+
+    def _write(self, event: str, work_id: int, description: str) -> None:
+        if self.journal is not None:
+            self.journal.write(
+                event,
+                work_id=work_id,
+                description=description,
+            )
+
+    def create(self, pending, description: str) -> None:
+        if pending is None:
+            return
+        pending_id = id(pending)
+        if pending_id in self._pending:
+            raise AssertionError("NCCL pending group was recorded twice")
+        work_ids = []
+        for work in pending.works:
+            work_id = self.created
+            self.created += 1
+            self._live[work_id] = work
+            work_ids.append(work_id)
+            self._write("async_work_created", work_id, description)
+        self._pending[pending_id] = (description, tuple(work_ids))
+
+    def mark_waited(self, pending) -> None:
+        if pending is None:
+            return
+        record = self._pending.get(id(pending))
+        if record is None:
+            raise AssertionError("NCCL pending group was not recorded")
+        description, work_ids = record
+        for work_id in work_ids:
+            if work_id in self._waited:
+                raise AssertionError(f"NCCL work {work_id} was waited twice")
+            self._waited.add(work_id)
+            self.waited += 1
+            self._write("async_work_waited", work_id, description)
+
+    def retire(self, pending) -> None:
+        if pending is None:
+            return
+        record = self._pending.pop(id(pending), None)
+        if record is None:
+            raise AssertionError("NCCL pending group was not recorded")
+        description, work_ids = record
+        for work_id in work_ids:
+            if work_id not in self._waited or work_id not in self._live:
+                raise AssertionError(f"NCCL work {work_id} was not waited")
+            del self._live[work_id]
+            self._waited.remove(work_id)
+            self.retired += 1
+            self._write("async_work_retired", work_id, description)
+
+    def assert_drained(self) -> None:
+        if any(not work.is_completed() for work in self._live.values()):
+            raise AssertionError("NCCL work remained active after drain")
+        if self._pending or self._live or self._waited:
+            raise AssertionError("NCCL work remained active after drain")
+        if self.created != self.waited or self.waited != self.retired:
+            raise AssertionError("NCCL work lifecycle counts differ after drain")
+
+    def counts(self) -> dict[str, int]:
+        return {
+            "created": self.created,
+            "waited": self.waited,
+            "retired": self.retired,
+            "live": len(self._live),
+        }
+
+
 class AuditedTransport(async_schedule.CudaAsyncP2P):
     instances: list["AuditedTransport"] = []
     journal: RankJournal | None = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.work = []
+        self.lifecycle = WorkLifecycle(self.journal)
         self.drained = False
         self.instances.append(self)
 
@@ -192,24 +271,26 @@ class AuditedTransport(async_schedule.CudaAsyncP2P):
         if self.journal is not None:
             self.journal.write("async_receive_post_before", ops=_p2p_summary(ops))
         pending = super()._post_receive(ops)
+        self.lifecycle.create(pending, "receive")
         if self.journal is not None:
             self.journal.write("async_receive_post_after", count=len(pending.works))
-        self.work.extend(pending.works)
         return pending
 
     def _post_send(self, ops):
         if self.journal is not None:
             self.journal.write("async_send_post_before", ops=_p2p_summary(ops))
         pending = super()._post_send(ops)
+        self.lifecycle.create(pending, "send")
         if self.journal is not None:
             self.journal.write("async_send_post_after", count=len(pending.works))
-        self.work.extend(pending.works)
         return pending
 
     def _wait_receive(self, pending):
         if self.journal is not None:
             self.journal.write("async_receive_wait_before", count=len(pending.works))
         result = super()._wait_receive(pending)
+        self.lifecycle.mark_waited(pending)
+        self.lifecycle.retire(pending)
         if self.journal is not None:
             self.journal.write("async_receive_wait_after", count=len(pending.works))
         return result
@@ -218,6 +299,8 @@ class AuditedTransport(async_schedule.CudaAsyncP2P):
         if self.journal is not None:
             self.journal.write("async_send_wait_before", count=len(pending.works))
         result = super()._wait_send(pending)
+        self.lifecycle.mark_waited(pending)
+        self.lifecycle.retire(pending)
         if self.journal is not None:
             self.journal.write("async_send_wait_after", count=len(pending.works))
         return result
@@ -231,8 +314,7 @@ class AuditedTransport(async_schedule.CudaAsyncP2P):
                 ops=_p2p_summary(op_list),
             )
         pending = super().post_group(description, op_list)
-        if pending is not None:
-            self.work.extend(pending.works)
+        self.lifecycle.create(pending, description)
         if self.journal is not None:
             self.journal.write(
                 "async_group_post_after",
@@ -248,6 +330,8 @@ class AuditedTransport(async_schedule.CudaAsyncP2P):
                 count=0 if pending is None else len(pending.works),
             )
         result = super().wait_group(pending)
+        self.lifecycle.mark_waited(pending)
+        self.lifecycle.retire(pending)
         if self.journal is not None:
             self.journal.write("async_group_wait_after")
         return result
@@ -263,8 +347,7 @@ class AuditedTransport(async_schedule.CudaAsyncP2P):
             raise AssertionError("send work remained after drain")
         if not self._stream_synchronized or not self._stream.query():
             raise AssertionError("communication stream remained active after drain")
-        if any(not item.is_completed() for item in self.work):
-            raise AssertionError("NCCL work remained active after drain")
+        self.lifecycle.assert_drained()
         self.drained = True
         if self.journal is not None:
             self.journal.write("async_drain_after")
@@ -391,6 +474,16 @@ def run_mode(mode: str, rank: int, device: torch.device, journal: RankJournal) -
             created = AuditedTransport.instances[transport_start:]
             if len(created) != 1 or not created[0].drained:
                 raise AssertionError(f"async transport did not drain at step {step}")
+            work_lifecycle = created[0].lifecycle.counts()
+            if not (
+                work_lifecycle["created"]
+                == work_lifecycle["waited"]
+                == work_lifecycle["retired"]
+                and work_lifecycle["live"] == 0
+            ):
+                raise AssertionError(f"async work lifecycle differs at step {step}")
+        else:
+            work_lifecycle = None
 
         report = {
             "step": step,
@@ -401,6 +494,7 @@ def run_mode(mode: str, rank: int, device: torch.device, journal: RankJournal) -
             "bias_grad": float(module.bias.grad),
             "cuda_ms": start.elapsed_time(end),
             "microbatch_lifecycle": module._microbatch_records[-1],
+            "work_lifecycle": work_lifecycle,
         }
         optimizer.step()
         report["scale_after_update"] = float(module.scale)

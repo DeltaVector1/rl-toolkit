@@ -262,6 +262,26 @@ def _new_cuda_dummy_stage():
     return dummy
 
 
+def _load_cuda_work_lifecycle():
+    path = ROOT / "source/tests/test_pp_async_cuda.py"
+    tree = ast.parse(path.read_text())
+    lifecycle = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "WorkLifecycle"
+    )
+    namespace = {}
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=[lifecycle], type_ignores=[])),
+            str(path),
+            "exec",
+        ),
+        namespace,
+    )
+    return namespace["WorkLifecycle"]
+
+
 def test_cuda_dummy_implements_the_pipeline_runner_microbatch_interface() -> None:
     runner = ast.parse(
         (ROOT / "source/src/prime_rl/trainer/distributed/pp_runner.py").read_text()
@@ -309,6 +329,56 @@ def test_cuda_dummy_resets_microbatch_state_across_two_steps() -> None:
         {"step": step, "set": list(range(8)), "clear": list(range(8))}
         for step in range(2)
     ]
+
+
+def test_cuda_work_lifecycle_retires_every_rank_and_step() -> None:
+    lifecycle_class = _load_cuda_work_lifecycle()
+
+    class Work:
+        def is_completed(self):
+            return True
+
+    class Journal:
+        def __init__(self):
+            self.events = []
+
+        def write(self, event, **fields):
+            self.events.append((event, fields))
+
+    for rank in range(8):
+        for step in range(2):
+            journal = Journal()
+            lifecycle = lifecycle_class(journal)
+            expected = 0
+            for group in range(32 - 2 * rank):
+                works = [Work() for _ in range(1 + (group + step) % 2)]
+                pending = SimpleNamespace(works=works)
+                lifecycle.create(pending, f"rank={rank};step={step};group={group}")
+                lifecycle.mark_waited(pending)
+                lifecycle.retire(pending)
+                expected += len(works)
+            lifecycle.assert_drained()
+            assert lifecycle.counts() == {
+                "created": expected,
+                "waited": expected,
+                "retired": expected,
+                "live": 0,
+            }
+            assert [event for event, _fields in journal.events].count(
+                "async_work_created"
+            ) == expected
+            assert [event for event, _fields in journal.events].count(
+                "async_work_waited"
+            ) == expected
+            assert [event for event, _fields in journal.events].count(
+                "async_work_retired"
+            ) == expected
+
+    lifecycle = lifecycle_class()
+    pending = SimpleNamespace(works=[Work()])
+    lifecycle.create(pending, "unretired")
+    with pytest.raises(AssertionError, match="NCCL work remained active"):
+        lifecycle.assert_drained()
 
 
 def test_cuda_smoke_journal_is_bounded_and_fsynced() -> None:
