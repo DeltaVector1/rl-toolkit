@@ -193,6 +193,7 @@ def test_cuda_smoke_profile_is_small_and_n82_only() -> None:
         "steps": 2,
         "gpus": 8,
         "transport": "glm52_trainer",
+        "outer_timeout_seconds": 300,
     }
     script = (ROOT / "source/tests/test_pp_async_cuda.py").read_text()
     assert "stages = 8" in script
@@ -437,19 +438,31 @@ def test_cuda_smoke_rejects_a_blocked_transport_host() -> None:
 def test_cuda_smoke_requires_transport_configuration() -> None:
     training_ops = _load_training_ops("training_ops_pp_async_missing_transport")
     with pytest.raises(training_ops.Refused, match="not configured"):
-        training_ops._pp_async_cuda_transport({"transport": "missing"})
+        training_ops._pp_async_cuda_transport(
+            {"transport": "missing", "outer_timeout_seconds": 300}
+        )
 
 
 def test_cuda_smoke_rejects_a_timeout_that_can_outlive_its_controller() -> None:
     training_ops = _load_training_ops("training_ops_pp_async_long_timeout")
     transport = training_ops.operations["transport"]["glm52_trainer"]
+    profile = training_ops.operations["qualification"]["glm52_pp_async_cuda"]
     old_timeout = transport["process_group_timeout_seconds"]
     transport["process_group_timeout_seconds"] = 300
     try:
-        with pytest.raises(training_ops.Refused, match="1 through 299"):
-            training_ops._pp_async_cuda_transport({"transport": "glm52_trainer"})
+        with pytest.raises(training_ops.Refused, match="below the outer timeout"):
+            training_ops._pp_async_cuda_transport(profile)
     finally:
         transport["process_group_timeout_seconds"] = old_timeout
+
+
+@pytest.mark.parametrize("value", [None, True, 300.0, 301])
+def test_cuda_smoke_requires_the_fixed_outer_timeout(value) -> None:
+    training_ops = _load_training_ops(f"training_ops_pp_async_outer_{value!r}")
+    profile = dict(training_ops.operations["qualification"]["glm52_pp_async_cuda"])
+    profile["outer_timeout_seconds"] = value
+    with pytest.raises(training_ops.Refused, match="must be 300 seconds"):
+        training_ops._pp_async_cuda_transport(profile)
 
 
 def test_phase_profiler_is_a_shared_trainer_mount() -> None:
@@ -565,12 +578,12 @@ def test_exited_trainer_is_allowed_and_cuda_command_is_fail_closed() -> None:
     assert "--cidfile" in launch
     assert "--label prime.qualification=glm52-pp-async-cuda-smoke" in launch
     assert "--label prime.session=0123456789abcdef" in launch
-    assert "timeout --foreground --signal=TERM --kill-after=30s 900s" in launch
+    assert "timeout --foreground --signal=TERM --kill-after=30s 300s" in launch
     assert "trap cleanup EXIT" in launch
     assert "docker inspect --type container" in launch
     assert "docker rm -f" in launch
     assert "cleanup also failed" in launch
-    assert calls[2][2] == 960
+    assert calls[2][2] == 360
     postflight = calls[3][1]
     assert "docker ps -aq" in postflight
     assert "nvidia-smi --query-compute-apps=pid" in postflight

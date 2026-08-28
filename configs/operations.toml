@@ -119,6 +119,7 @@ output_root = "/data/glm52-rl/qualifications/glm52-pp-async-cuda-smoke"
 steps = 2
 gpus = 8
 transport = "glm52_trainer"
+outer_timeout_seconds = 300
 
 [transport.glm52_trainer]
 network_mode = "host"

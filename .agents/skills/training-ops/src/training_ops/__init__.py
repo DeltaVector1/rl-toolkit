@@ -10281,6 +10281,13 @@ print(json.dumps(records[0] if records else {{"status": "missing"}}, sort_keys=T
 
 
 def _pp_async_cuda_transport(profile: dict[str, object]) -> dict[str, object]:
+    outer_timeout_seconds = profile.get("outer_timeout_seconds")
+    if (
+        isinstance(outer_timeout_seconds, bool)
+        or not isinstance(outer_timeout_seconds, int)
+        or outer_timeout_seconds != 300
+    ):
+        raise Refused("the PP async CUDA outer timeout must be 300 seconds")
     transport_name = profile.get("transport")
     if not isinstance(transport_name, str) or not transport_name:
         raise Refused("the PP async CUDA transport profile is missing")
@@ -10308,10 +10315,10 @@ def _pp_async_cuda_transport(profile: dict[str, object]) -> dict[str, object]:
     if (
         isinstance(timeout_seconds, bool)
         or not isinstance(timeout_seconds, int)
-        or not 1 <= timeout_seconds < 300
+        or not 1 <= timeout_seconds < outer_timeout_seconds
     ):
         raise Refused(
-            "the PP async CUDA process-group timeout must be an integer from 1 through 299 seconds"
+            "the PP async CUDA process-group timeout must be a positive integer below the outer timeout"
         )
     device_id = transport["device_id"]
     if device_id != "local_rank":
@@ -10332,6 +10339,7 @@ def _pp_async_cuda_transport(profile: dict[str, object]) -> dict[str, object]:
         raise Refused("the PP async CUDA transport environment is invalid")
     return {
         "network_mode": network_mode,
+        "outer_timeout_seconds": outer_timeout_seconds,
         "process_group_timeout_seconds": timeout_seconds,
         "device_id": device_id,
         "env": dict(env),
@@ -10494,9 +10502,7 @@ printf 'STALE removed:%s\n' "$candidate_id"
         "--log-dir /output/torchrun --redirects 3 --tee 3 "
         "/qualification/test_pp_async_cuda.py"
     )
-    _session_deadline, startup_deadline, _step_deadline, _finalize_deadline = (
-        _glm_b2048_deadlines()
-    )
+    outer_timeout_seconds = transport["outer_timeout_seconds"]
     cid_path = f"{output_dir}/container.cid"
     qualification_label = _PP_ASYNC_CUDA_PROFILE
     command = f"""set -euo pipefail
@@ -10557,7 +10563,7 @@ cleanup() {{
   exit "$cleanup_error"
 }}
 trap cleanup EXIT
-sudo timeout --foreground --signal=TERM --kill-after=30s {startup_deadline}s \
+sudo timeout --foreground --signal=TERM --kill-after=30s {outer_timeout_seconds}s \
   docker run --rm --cidfile {shlex.quote(cid_path)} \
   --label prime.qualification={shlex.quote(qualification_label)} \
   --label prime.session={shlex.quote(session)} \
@@ -10578,7 +10584,7 @@ sudo timeout --foreground --signal=TERM --kill-after=30s {startup_deadline}s \
 test -s {shlex.quote(result_path)}
 cat {shlex.quote(result_path)}
 """
-    code, output = _ssh(host, command, timeout=startup_deadline + 60)
+    code, output = _ssh(host, command, timeout=outer_timeout_seconds + 60)
     postflight_code, postflight_output = _ssh(
         host,
         f"remaining=$(sudo docker ps -aq --filter name=^{container}$) || exit 97; "
