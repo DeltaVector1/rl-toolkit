@@ -11,6 +11,7 @@ import training_ops
 
 ROOT = pathlib.Path(training_ops.__file__).resolve().parents[5]
 SCRIPT = ROOT / "scripts/ops/benchmark_fused_qkv_a_lora_sm89.py"
+TRITON_PREFLIGHT = ROOT / "scripts/ops/preflight_triton_exec.py"
 SOURCE_MODULES = (
     "source/src/prime_rl/trainer/models/layers/lora/multi_linear.py",
     "source/src/prime_rl/trainer/models/layers/fp8_ada.py",
@@ -21,12 +22,13 @@ SOURCE_MODULES = (
 
 class LoraFusionSmokeTest(unittest.TestCase):
     def test_registered_command_is_bounded_and_inventory_driven(self):
-        host, image, script, modules, remote_timeout, ssh_timeout = (
+        host, image, script, triton_preflight, modules, remote_timeout, ssh_timeout = (
             training_ops._lora_fusion_smoke_spec()
         )
         self.assertEqual(host, training_ops.trainer_head)
         self.assertEqual(image, training_ops.containers["trainer_image"])
         self.assertEqual(script, "scripts/ops/benchmark_fused_qkv_a_lora_sm89.py")
+        self.assertEqual(triton_preflight, "scripts/ops/preflight_triton_exec.py")
         self.assertEqual(modules, SOURCE_MODULES)
         self.assertEqual((remote_timeout, ssh_timeout), (180, 240))
 
@@ -35,6 +37,7 @@ class LoraFusionSmokeTest(unittest.TestCase):
             "/data/glm52-rl/deployment-glm52-optims",
             "prime-rl:glm52-v080-qual",
             "scripts/ops/benchmark_fused_qkv_a_lora_sm89.py",
+            "scripts/ops/preflight_triton_exec.py",
             SOURCE_MODULES,
             "glm52-lora-fusion-smoke-0123456789abcdef",
             0,
@@ -45,6 +48,8 @@ class LoraFusionSmokeTest(unittest.TestCase):
             "--gpus device=\"$gpu\"",
             "--network none",
             "--read-only",
+            "--tmpfs /tmp:rw,exec,nosuid,nodev,size=1024m",
+            "TRITON_CACHE_DIR=/tmp/triton",
             "--iterations 20",
             "timeout --foreground --signal=TERM --kill-after=20s 180s",
             "docker rm -f",
@@ -76,11 +81,14 @@ class LoraFusionSmokeTest(unittest.TestCase):
         repository = "/data/glm52-rl/deployment-glm52-optims"
         script = "scripts/ops/benchmark_fused_qkv_a_lora_sm89.py"
         mounts = training_ops._lora_fusion_smoke_mounts(
-            repository, script, SOURCE_MODULES
+            repository,
+            script,
+            "scripts/ops/preflight_triton_exec.py",
+            SOURCE_MODULES,
         )
         self.assertEqual(
             {relative for relative, _source, _destination, _digest in mounts},
-            {script, *SOURCE_MODULES},
+            {script, "scripts/ops/preflight_triton_exec.py", *SOURCE_MODULES},
         )
         destinations = {
             relative: destination
@@ -88,6 +96,10 @@ class LoraFusionSmokeTest(unittest.TestCase):
         }
         self.assertEqual(
             destinations[script], "/opt/glm52-lora-fusion-smoke.py"
+        )
+        self.assertEqual(
+            destinations["scripts/ops/preflight_triton_exec.py"],
+            "/opt/glm52-triton-preflight.py",
         )
         for module in SOURCE_MODULES:
             self.assertEqual(
@@ -103,6 +115,7 @@ class LoraFusionSmokeTest(unittest.TestCase):
             "/data/glm52-rl/deployment-glm52-optims",
             "prime-rl:glm52-v080-qual",
             "scripts/ops/benchmark_fused_qkv_a_lora_sm89.py",
+            "scripts/ops/preflight_triton_exec.py",
             SOURCE_MODULES,
             "glm52-lora-fusion-smoke-0123456789abcdef",
             0,
@@ -122,8 +135,25 @@ class LoraFusionSmokeTest(unittest.TestCase):
             self.assertIn(destination, command)
         self.assertLess(
             command.index("mounted source hash differs"),
+            command.index("python3 /opt/glm52-triton-preflight.py"),
+        )
+        self.assertLess(
+            command.index("python3 /opt/glm52-triton-preflight.py"),
             command.index("exec python3 /opt/glm52-lora-fusion-smoke.py"),
         )
+
+    def test_triton_preflight_compiles_loads_and_checks_a_kernel(self):
+        source = TRITON_PREFLIGHT.read_text()
+        tree = ast.parse(source)
+        self.assertTrue(any(isinstance(node, ast.FunctionDef) for node in tree.body))
+        for text in (
+            "@triton.jit",
+            "_write_sequence[(1,)]",
+            "torch.cuda.synchronize()",
+            "torch.equal(output, expected)",
+            'cache != "/tmp/triton"',
+        ):
+            self.assertIn(text, source)
 
     def test_benchmark_declares_glm_shapes_and_twenty_repeats(self):
         source = SCRIPT.read_text()
@@ -239,11 +269,12 @@ class LoraFusionSmokeTest(unittest.TestCase):
         preflight.assert_called_once_with(
             [training_ops.trainer_head], include_inference=False
         )
-        self.assertEqual(deploy.call_count, 1 + len(SOURCE_MODULES))
+        self.assertEqual(deploy.call_count, 2 + len(SOURCE_MODULES))
         self.assertEqual(
             [call.args[0] for call in deploy.call_args_list],
             [
                 "scripts/ops/benchmark_fused_qkv_a_lora_sm89.py",
+                "scripts/ops/preflight_triton_exec.py",
                 *SOURCE_MODULES,
             ],
         )
