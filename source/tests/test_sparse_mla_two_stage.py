@@ -6,17 +6,24 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 BWD_SOURCE = (ROOT / "src/prime_rl/trainer/models/kernels/sparse_mla_bwd.py").read_text()
 SOURCE = (ROOT / "src/prime_rl/trainer/models/kernels/sparse_mla_two_stage.py").read_text()
+BENCHMARK = (ROOT.parent / "scripts/ops/benchmark_sparse_mla_two_stage_sm89.py").read_text()
 
 TOTAL_WIDTH = 576
 TOPK = 2048
 MAX_WORKSPACE_BYTES = 256 * 1024 * 1024
-ROUTE_BYTES_PER_ENTRY = 28
+ROUTE_BYTES_PER_ENTRY = 29
+ROUTE_FILTER_BYTES_PER_ENTRY = 13
 
 
 def memory_bound(sequence_kv: int) -> int:
+    route_filter = 4096 * TOPK * ROUTE_FILTER_BYTES_PER_ENTRY
     route_sort = 4096 * TOPK * ROUTE_BYTES_PER_ENTRY
-    reduction = (4096 * TOPK * 4) + ((sequence_kv + 1) * 8) + (sequence_kv * TOTAL_WIDTH * 4)
-    return max(route_sort, reduction)
+    reduction = (
+        (4096 * TOPK * 4)
+        + ((sequence_kv + 1) * 8)
+        + (sequence_kv * TOTAL_WIDTH * (4 + 2))
+    )
+    return max(route_filter, route_sort, reduction)
 
 
 def stable_segment_sum(values: list[list[float]], keys: list[int]):
@@ -34,7 +41,7 @@ def stable_segment_sum(values: list[list[float]], keys: list[int]):
 class SparseMlaTwoStageTest(unittest.TestCase):
     def test_production_workspace_is_bounded(self):
         total = memory_bound(32769)
-        self.assertEqual(4096 * TOPK * ROUTE_BYTES_PER_ENTRY, 234881024)
+        self.assertEqual(4096 * TOPK * ROUTE_BYTES_PER_ENTRY, 243269632)
         self.assertLess(total, MAX_WORKSPACE_BYTES)
         self.assertLess(total / 2**20, 256)
 
@@ -43,7 +50,8 @@ class SparseMlaTwoStageTest(unittest.TestCase):
         self.assertIn("(1, QUERY_TOKENS, ATTENTION_HEADS, TOTAL_WIDTH)", SOURCE)
         self.assertIn("(1, QUERY_TOKENS, GROUPS, TOPK)", SOURCE)
         self.assertIn("(1, 32768 + 1, GROUPS, TOTAL_WIDTH)", SOURCE)
-        self.assertIn("ROUTE_BYTES_PER_ENTRY = 28", SOURCE)
+        self.assertIn("ROUTE_BYTES_PER_ENTRY = 29", SOURCE)
+        self.assertIn("ROUTE_FILTER_BYTES_PER_ENTRY = 13", SOURCE)
 
     def test_duplicate_routes_reduce_in_stable_key_order(self):
         reduced, unique = stable_segment_sum(
@@ -52,15 +60,31 @@ class SparseMlaTwoStageTest(unittest.TestCase):
         self.assertEqual(unique, [4, 7])
         self.assertEqual(reduced, [[4.0, 6.0], [-2.0, 1.0]])
 
+    def test_benchmark_uses_production_shape_and_host_timeout(self):
+        self.assertIn("SEQUENCE_KV = 32769", BENCHMARK)
+        self.assertIn("route_skew=2048_keys_x_4096_routes", BENCHMARK)
+        self.assertIn("signal.setitimer(signal.ITIMER_REAL", BENCHMARK)
+        self.assertIn("peak_reserved_delta", BENCHMARK)
+        self.assertIn("free_hbm_before", BENCHMARK)
+
     def test_integration_is_opt_in_and_skips_atomic_dkv_kernel(self):
         self.assertIn('os.environ.get("PRIME_SPARSE_BWD_TWO_STAGE", "0")', BWD_SOURCE)
         self.assertIn("compute_dkv=not use_two_stage", BWD_SOURCE)
         self.assertIn("sparse_mla_dkv_two_stage", BWD_SOURCE)
-        self.assertIn("torch.empty(1, device=kv.device, dtype=torch.float32)", BWD_SOURCE)
+        self.assertIn("torch.empty_like(kv, dtype=torch.float32)", BWD_SOURCE)
+        self.assertIn("output=dkv", BWD_SOURCE)
         self.assertIn("if compute_dkv:", BWD_SOURCE)
         self.assertIn("MAX_WORKSPACE_BYTES = 256 * 1024 * 1024", SOURCE)
         self.assertNotIn("torch.nonzero", SOURCE)
         self.assertNotIn(".item()", SOURCE)
+        self.assertNotIn("torch.isfinite(output).all()", SOURCE)
+        self.assertNotIn("torch.nan_to_num", SOURCE)
+        self.assertNotIn("probability == probability", SOURCE)
+        self.assertNotIn("dp == dp", SOURCE)
+        self.assertIn("BLOCK_WIDTH = 1024", SOURCE)
+        self.assertIn("grid = (sequence_kv,)", SOURCE)
+        self.assertIn("torch.argsort(keys, stable=True)", SOURCE)
+        self.assertIn("same-device tensors", SOURCE)
         self.assertIn("@triton.jit", SOURCE)
 
 
