@@ -213,6 +213,7 @@ class H200ParityLauncherTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             work = pathlib.Path(directory) / "work"
             work.mkdir(mode=0o750)
+            work.chmod(0o750)
             cid = work / "engine.cid"
             cid.write_bytes(b"d" * 64)
             cid.chmod(0o600)
@@ -273,6 +274,7 @@ class H200ParityLauncherTest(unittest.TestCase):
             root = pathlib.Path(directory)
             work = root / "work"
             work.mkdir(mode=0o750)
+            work.chmod(0o750)
             cid = work / "engine.cid"
             cid.write_text(container_id)
             cid.chmod(0o600)

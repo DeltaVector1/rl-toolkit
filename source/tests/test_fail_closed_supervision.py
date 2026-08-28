@@ -22,8 +22,8 @@ def test_china_supervisor_checks_all_nodes_and_never_restarts() -> None:
 
 def test_edge_watchdog_stops_generation_and_publisher() -> None:
     script = _read("scripts/h200/trainer_failure_watchdog.sh")
-    assert "MAX_MISSES" in script
-    assert "docker rm -f \"$ORCH_CT\"" in script
+    assert "max_misses" in script
+    assert 'docker rm -f "$orchestrator_container" "$environment_container"' in script
     assert "[s]ync_rollout_batches.sh" in script
 
 

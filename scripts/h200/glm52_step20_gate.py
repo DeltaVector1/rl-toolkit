@@ -651,6 +651,7 @@ def write_atomic(path: Path, value: dict[str, Any]) -> None:
             dir_fd=directory,
         )
         try:
+            os.fchmod(descriptor, 0o644)
             remaining = memoryview(payload)
             while remaining:
                 written = os.write(descriptor, remaining)
