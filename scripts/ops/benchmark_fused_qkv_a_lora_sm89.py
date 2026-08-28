@@ -21,6 +21,7 @@ MAX_WARMUP = 10
 MAX_ITERATIONS = 100
 BF16_RTOL = 2e-2
 BF16_ATOL = 2e-2
+BF16_NORM_RTOL = 5e-2
 BF16_BYTES = 2
 FUSED_COMBINED_A_TEMPORARY_BYTES = 2 * RANK * HIDDEN * BF16_BYTES
 
@@ -177,14 +178,14 @@ def _measure(
     def forward() -> tuple[torch.Tensor, torch.Tensor]:
         return implementation(*tensors)
 
-    def backward() -> None:
+    def forward_backward() -> None:
         _run_backward(implementation, tensors, upstream)
 
     for _ in range(warmup):
         result = forward()
         _assert_finite(result, "warmup output")
         del result
-        backward()
+        forward_backward()
         _assert_gradients_finite(tensors, "warmup gradient")
         _clear_gradients(tensors)
     torch.cuda.synchronize()
@@ -198,16 +199,16 @@ def _measure(
         del result
     forward_peak = int(torch.cuda.max_memory_allocated(device))
     torch.cuda.reset_peak_memory_stats(device)
-    backward_times = []
+    forward_backward_times = []
     for _ in range(iterations):
-        _, elapsed = _cuda_timed(backward)
+        _, elapsed = _cuda_timed(forward_backward)
         _assert_gradients_finite(tensors, "gradient")
-        backward_times.append(elapsed)
+        forward_backward_times.append(elapsed)
         _clear_gradients(tensors)
     torch.cuda.synchronize()
     return {
         "forward": _summary(forward_times),
-        "backward": _summary(backward_times),
+        "forward_backward": _summary(forward_backward_times),
         "peak_forward_allocated_bytes": forward_peak,
         "peak_backward_allocated_bytes": int(
             torch.cuda.max_memory_allocated(device)
@@ -221,12 +222,25 @@ def _error_metrics(
     actual_float = actual.float()
     expected_float = expected.float()
     difference = (actual_float - expected_float).abs()
-    allowed = BF16_ATOL + BF16_RTOL * expected_float.abs()
-    relative = difference / expected_float.abs().clamp_min(BF16_ATOL)
+    expected_norm = float(torch.linalg.vector_norm(expected_float).item())
+    actual_norm = float(torch.linalg.vector_norm(actual_float).item())
+    reference_scale = max(
+        expected_norm / (expected_float.numel() ** 0.5),
+        float(expected_float.abs().max().item()),
+    )
+    if not reference_scale > 0.0:
+        raise RuntimeError("reference tensor scale is zero")
+    allowed = BF16_ATOL * reference_scale + BF16_RTOL * expected_float.abs()
+    relative = difference / reference_scale
+    norm_relative = abs(actual_norm - expected_norm) / expected_norm
     return {
         "max_abs_error": float(difference.max().item()),
         "max_relative_error": float(relative.max().item()),
         "max_tolerance_ratio": float((difference / allowed).max().item()),
+        "reference_scale": reference_scale,
+        "reference_norm": expected_norm,
+        "candidate_norm": actual_norm,
+        "norm_relative_error": norm_relative,
     }
 
 
@@ -237,25 +251,44 @@ def _assert_close(
     if not bool(
         torch.all(
             (actual.float() - expected.float()).abs()
-            <= BF16_ATOL + BF16_RTOL * expected.float().abs()
+            <= BF16_ATOL * metrics["reference_scale"]
+            + BF16_RTOL * expected.float().abs()
         )
-    ):
+    ) or metrics["norm_relative_error"] > BF16_NORM_RTOL:
         raise RuntimeError(f"{label} exceeds BF16 tolerance: {metrics}")
     return metrics
 
 
-def _perturbation_checks(device: torch.device) -> None:
-    expected = torch.ones((4, 4), device=device, dtype=torch.bfloat16)
-    for label in ("forward output", "input gradient", "parameter gradient"):
-        actual = expected.clone()
-        actual[0, 0] += 1
-        try:
-            _assert_close(actual, expected, label)
-        except RuntimeError as error:
-            if label not in str(error):
-                raise RuntimeError(f"{label} perturbation error was not identified") from error
-        else:
-            raise RuntimeError(f"{label} perturbation was accepted")
+def _expect_rejected(actual: torch.Tensor, expected: torch.Tensor, label: str) -> None:
+    try:
+        _assert_close(actual, expected, label)
+    except RuntimeError as error:
+        if label not in str(error):
+            raise RuntimeError(f"{label} failure was not identified") from error
+    else:
+        raise RuntimeError(f"{label} invalid candidate was accepted")
+
+
+def _perturbation_checks(values: dict[str, torch.Tensor]) -> None:
+    for label, expected in values.items():
+        expected_float = expected.float()
+        scale = max(
+            float(torch.linalg.vector_norm(expected_float).item())
+            / (expected_float.numel() ** 0.5),
+            float(expected_float.abs().max().item()),
+        )
+        if not scale > 0.0:
+            raise RuntimeError(f"{label} reference scale is zero")
+        actual = expected.detach().clone()
+        actual.reshape(-1)[0] += 0.1 * scale
+        _expect_rejected(actual, expected, f"{label} small perturbation")
+
+
+def _zero_candidate_checks(values: dict[str, torch.Tensor]) -> None:
+    for label, expected in values.items():
+        _expect_rejected(
+            torch.zeros_like(expected), expected, f"{label} zero candidate"
+        )
 
 
 def _compare(tokens: int, device: torch.device) -> dict[str, object]:
@@ -279,6 +312,17 @@ def _compare(tokens: int, device: torch.device) -> dict[str, object]:
     reference_norms = _gradient_norms(
         reference_gradients, ("input", "q_a", "q_b", "kv_a", "kv_b")
     )
+    validation_values = {
+        "q_a output": reference_outputs[0],
+        "kv_a output": reference_outputs[1],
+        "input gradient": reference_gradients[0],
+        "q_a gradient": reference_gradients[1],
+        "q_b gradient": reference_gradients[2],
+        "kv_a gradient": reference_gradients[3],
+        "kv_b gradient": reference_gradients[4],
+    }
+    _zero_candidate_checks(validation_values)
+    _perturbation_checks(validation_values)
     _clear_gradients(reference_tensors)
     _run_backward(candidate_pair, candidate_tensors, upstream)
     candidate_gradients = _collect_gradients(candidate_tensors)
@@ -313,7 +357,6 @@ def main() -> None:
     if capability != (8, 9):
         raise SystemExit(f"SM89 is required, found sm_{capability[0]}{capability[1]}")
     device = torch.device("cuda")
-    _perturbation_checks(device)
     comparison = _compare(args.tokens, device)
     baseline = _measure(reference_pair, args.tokens, device, args.warmup, args.iterations)
     fused = _measure(candidate_pair, args.tokens, device, args.warmup, args.iterations)
@@ -333,7 +376,11 @@ def main() -> None:
                 },
                 "warmup": args.warmup,
                 "iterations": args.iterations,
-                "bf16_tolerance": {"rtol": BF16_RTOL, "atol": BF16_ATOL},
+                "bf16_tolerance": {
+                    "rtol": BF16_RTOL,
+                    "atol_fraction_of_reference_scale": BF16_ATOL,
+                    "norm_rtol": BF16_NORM_RTOL,
+                },
                 "comparison": comparison,
                 "baseline": baseline,
                 "fused": fused,

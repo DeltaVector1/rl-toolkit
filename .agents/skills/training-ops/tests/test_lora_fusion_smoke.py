@@ -1,4 +1,5 @@
 import ast
+import inspect
 import json
 import pathlib
 import unittest
@@ -45,6 +46,8 @@ class LoraFusionSmokeTest(unittest.TestCase):
             "timeout --foreground --signal=TERM --kill-after=20s 180s",
             "docker rm -f",
             "nvidia-smi",
+            "assert_container_name_free",
+            "docker ps -a",
         ):
             self.assertIn(text, command)
         for text in ("src=/models/", "rollout", "PRIME_BATCH_CACHE", "ZiphuAI"):
@@ -73,11 +76,20 @@ class LoraFusionSmokeTest(unittest.TestCase):
         self.assertIn("_error_metrics", source)
         self.assertIn("max_abs_error", source)
         self.assertIn("max_relative_error", source)
+        self.assertIn("reference_scale", source)
+        self.assertIn("reference_norm", source)
+        self.assertIn("candidate_norm", source)
+        self.assertIn("norm_relative_error", source)
         self.assertIn("reference_gradient_norms", source)
+        self.assertIn('"forward_backward"', source)
         self.assertIn("_perturbation_checks", source)
+        self.assertIn("_zero_candidate_checks", source)
         self.assertIn("forward output", source)
+        self.assertIn("kv_a output", source)
         self.assertIn("input gradient", source)
         self.assertIn("parameter gradient", source)
+        for name in ("q_a", "q_b", "kv_a", "kv_b"):
+            self.assertIn(f'"{name} gradient"', source)
         multi_linear = (
             ROOT / "source/src/prime_rl/trainer/models/layers/lora/multi_linear.py"
         ).read_text()
@@ -105,11 +117,16 @@ class LoraFusionSmokeTest(unittest.TestCase):
         )
         self.assertTrue(all(timeout == 60 for _host, _command, timeout in seen))
         self.assertTrue(
-            all("docker ps -a" in command for _host, command, _timeout in seen)
+            all("docker ps --format" in command for _host, command, _timeout in seen)
         )
         self.assertTrue(
             all("nvidia-smi" in command for _host, command, _timeout in seen)
         )
+
+    def test_preflight_running_check_allows_stopped_container_names(self):
+        source = inspect.getsource(training_ops._lora_fusion_smoke_preflight)
+        self.assertIn("docker ps --format", source)
+        self.assertNotIn("docker ps -a", source)
 
     def test_preflight_refuses_a_configured_container(self):
         def fake_ssh(host, command, timeout=120, connect_timeout=None):
