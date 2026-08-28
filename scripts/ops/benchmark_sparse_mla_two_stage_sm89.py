@@ -98,13 +98,17 @@ def run(args: argparse.Namespace) -> None:
     delta_kernel = preprocess(64, 512)
     delta = delta_kernel(output, do)
     torch.cuda.synchronize()
-    direct_output = torch.empty_like(kv, dtype=torch.float32)
     free_hbm_before, total_hbm = torch.cuda.mem_get_info(q.device)
     allocated_before = torch.cuda.memory_allocated(q.device)
     reserved_before = torch.cuda.memory_reserved(q.device)
     torch.cuda.reset_peak_memory_stats(q.device)
-    direct_candidate, direct_ms = timed(
-        lambda: sparse_mla_dkv_two_stage(
+
+    direct_output = None
+
+    def direct_call():
+        nonlocal direct_output
+        direct_output = torch.empty_like(kv, dtype=torch.float32)
+        return sparse_mla_dkv_two_stage(
             q,
             kv,
             do,
@@ -114,6 +118,9 @@ def run(args: argparse.Namespace) -> None:
             sm_scale=scale,
             output=direct_output,
         )
+
+    direct_candidate, direct_ms = timed(
+        direct_call
     )
     peak_allocated_delta = torch.cuda.max_memory_allocated(q.device) - allocated_before
     peak_reserved_delta = torch.cuda.max_memory_reserved(q.device) - reserved_before
@@ -143,7 +150,8 @@ def run(args: argparse.Namespace) -> None:
     print(
         f"workspace_bytes={memory.total_bytes} workspace_mib={memory.total_bytes / 2**20:.2f} "
         f"route_sort_bytes={memory.route_sort_bytes} route_filter_bytes={memory.route_filter_bytes} "
-        f"reduction_bytes={memory.reduction_bytes} workspace_limit_bytes={MAX_WORKSPACE_BYTES} "
+        f"reduction_bytes={memory.reduction_bytes} output_pair_bytes={memory.output_pair_bytes} "
+        f"workspace_limit_bytes={MAX_WORKSPACE_BYTES} "
         f"peak_allocated_delta={peak_allocated_delta} peak_reserved_delta={peak_reserved_delta} "
         f"free_hbm_before={free_hbm_before} free_hbm_after={free_hbm_after} total_hbm={total_hbm} "
         f"dq_exact=1 dkv_close=1 finite=1"
