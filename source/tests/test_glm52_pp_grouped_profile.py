@@ -9,6 +9,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 PROFILE_NAME = "glm52-native-pp-grouped"
 PROFILE_PATH = "configs/qualification/glm52-native-pp-grouped.toml"
+STABILITY_PROFILE_NAME = "glm52-native-pp-grouped-stability20"
+STABILITY_PROFILE_PATH = (
+    "configs/qualification/glm52-native-pp-grouped-stability20.toml"
+)
 TARGETS = {
     "q_a_proj",
     "q_b_proj",
@@ -119,3 +123,36 @@ def test_grouped_schedule_is_not_the_production_default():
     assert _load("configs/qualification/glm52-native-b2048.toml")["model"][
         "pp_schedule"
     ] == "1f1b"
+
+
+def test_grouped_stability_profile_keeps_the_same_shape_for_twenty_steps():
+    operations = _load("configs/operations.toml")
+    assert operations["profiles"][STABILITY_PROFILE_NAME] == {
+        "kind": "glm52",
+        "trainer_container": "glm52_qualification_trainer",
+        "trainer": STABILITY_PROFILE_PATH,
+    }
+
+    config = _load(STABILITY_PROFILE_PATH)
+    assert config["output_dir"] == (
+        "/data/glm52-rl/qualifications/glm52-native-pp-grouped-stability20"
+    )
+    assert config["max_steps"] == 20
+    assert config["data"]["fake"] == {
+        "batch_size": 64,
+        "generate_samples": True,
+        "samples_per_micro_batch": 32,
+        "group_size": 16,
+    }
+    assert config["data"]["fake"]["batch_size"] * config["data"]["fake"][
+        "samples_per_micro_batch"
+    ] == 2048
+    model = config["model"]
+    assert (model["pp"], model["cp"], model["ep"]) == (8, 8, 8)
+    assert model["pp_schedule"] == "1f1b_async"
+    assert model["pp_layer_boundaries"] == [0, 8, 18, 28, 38, 48, 58, 68, 78]
+    assert model["lora"]["rank"] == 32
+    assert set(model["lora"]["target_modules"]) == TARGETS
+    assert len(model["lora"]["target_modules"]) == 10
+    assert config["env_vars"] == {"PRIME_LORA_MM_PROFILE": "sm89-r32"}
+    assert "rollout_cache" not in config["data"]

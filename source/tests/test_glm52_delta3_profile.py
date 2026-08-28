@@ -50,13 +50,14 @@ def test_delta3_profile_is_trainer_only_and_allowlisted() -> None:
     assert (
         "glm52-native-b2048|glm52-native-b2048-memory|glm52-native-b2048-nsys|"
         "glm52-native-delta3|glm52-native-pp-async|glm52-native-pp-grouped|"
-        "glm52-native-stability20"
+        "glm52-native-pp-grouped-stability20|glm52-native-stability20"
         in cluster
     )
     assert '"glm52-native-delta3": (3, True)' in trainer
     assert '"glm52-native-b2048-memory": (2, False)' in trainer
     assert '"glm52-native-delta3": 3' in training_ops
     assert '"glm52-native-delta3",' in training_ops
+    assert '"glm52-native-pp-grouped-stability20": 20' in training_ops
 
 
 def test_b2048_memory_profile_has_strict_rank_zero_step_one_capture() -> None:

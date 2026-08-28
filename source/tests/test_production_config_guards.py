@@ -39,6 +39,7 @@ def test_current_glm52_profile_is_batch_2048_without_rollout_cache() -> None:
         "glm52-native-delta3",
         "glm52-native-pp-async",
         "glm52-native-pp-grouped",
+        "glm52-native-pp-grouped-stability20",
         "glm52-native-stability20",
     }
     current = operations["profiles"]["current"]
@@ -327,6 +328,7 @@ def test_all_glm52_trainers_use_h200_w8a8_semantics() -> None:
         "configs/qualification/glm52-native-delta3.toml",
         "configs/qualification/glm52-native-pp-async.toml",
         "configs/qualification/glm52-native-pp-grouped.toml",
+        "configs/qualification/glm52-native-pp-grouped-stability20.toml",
         "configs/qualification/glm52-native-stability20.toml",
         "configs/paused/trainer.glm52-production.toml",
     }

@@ -116,6 +116,11 @@ trainer_container = "glm52_qualification_trainer"
 trainer = "configs/qualification/glm52-native-pp-grouped.toml"
 launch_env = { PRIME_PHASE_PROFILE_RECORD_PATH = "/data/glm52-rl/qualifications/glm52-native-pp-grouped/phase-profile.json" }
 
+[profiles.glm52-native-pp-grouped-stability20]
+kind = "glm52"
+trainer_container = "glm52_qualification_trainer"
+trainer = "configs/qualification/glm52-native-pp-grouped-stability20.toml"
+
 [qualification.glm52_pp_async_cuda]
 kind = "glm52"
 host = "n82"

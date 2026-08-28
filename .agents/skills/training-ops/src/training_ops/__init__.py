@@ -8526,6 +8526,7 @@ def _validate_trainer_qualification(
         "glm52-native-delta3": 3,
         "glm52-native-pp-async": 2,
         "glm52-native-pp-grouped": 2,
+        "glm52-native-pp-grouped-stability20": 20,
         "glm52-native-stability20": 20,
     }
     if profile_name not in expected_step_counts:
@@ -8567,6 +8568,7 @@ def _validate_trainer_qualification(
         "glm52-native-b2048-nsys",
         "glm52-native-pp-async",
         "glm52-native-pp-grouped",
+        "glm52-native-pp-grouped-stability20",
     }:
         session_deadline, startup_deadline, step_deadline, profiler_deadline = (
             _glm_b2048_deadlines()
@@ -8702,7 +8704,10 @@ def _validate_trainer_qualification(
             elif input_sha256 == previous_input:
                 failures.append(f"qualification step {row['step']} reused the previous input")
             previous_input = input_sha256
-        if profile_name == "glm52-native-stability20":
+        if profile_name in {
+            "glm52-native-pp-grouped-stability20",
+            "glm52-native-stability20",
+        }:
             steady_times = sorted(
                 float(row["time/forward_backward"])
                 for row in records[1:]
@@ -11228,6 +11233,7 @@ def _prepare_trainer_qualification_session(
         "glm52-native-b2048-nsys",
         "glm52-native-pp-async",
         "glm52-native-pp-grouped",
+        "glm52-native-pp-grouped-stability20",
     }:
         session_deadline, startup_deadline, step_deadline, profiler_deadline = (
             _glm_b2048_deadlines()
@@ -11456,6 +11462,7 @@ def _qualify_connected(
         "glm52-native-delta3",
         "glm52-native-pp-async",
         "glm52-native-pp-grouped",
+        "glm52-native-pp-grouped-stability20",
         "glm52-native-stability20",
     }
     if strict_qualification and nodes != [trainer_head] + [
@@ -11753,6 +11760,7 @@ print(json.dumps({
                 "glm52-native-b2048-nsys",
                 "glm52-native-pp-async",
                 "glm52-native-pp-grouped",
+                "glm52-native-pp-grouped-stability20",
             }:
                 session_deadline, startup_deadline, step_deadline, profiler_deadline = (
                     _glm_b2048_deadlines()
