@@ -36,7 +36,23 @@ GLM_INDEXER_TYPES = [
 # ``rank`` and ``rank + 8``. The pair totals are [8, 10, ..., 10], so rank 0
 # has eight layers and the remaining ranks have ten layers each.
 GLM_INTERLEAVED_BOUNDARIES = [
-    0, 3, 7, 11, 15, 19, 23, 27, 31, 36, 42, 48, 54, 60, 66, 72, 78
+    0,
+    3,
+    7,
+    11,
+    15,
+    19,
+    23,
+    27,
+    31,
+    36,
+    42,
+    48,
+    54,
+    60,
+    66,
+    72,
+    78,
 ]
 
 
@@ -99,7 +115,9 @@ class PipelineBalanceTest(unittest.TestCase):
             [end - start for start, end in zip(bounds, bounds[1:])],
             [6, 8, 8, 8, 12, 12, 12, 12],
         )
-        self.assertTrue(all(GLM_INDEXER_TYPES[start] == "full" for start in bounds[:-1]))
+        self.assertTrue(
+            all(GLM_INDEXER_TYPES[start] == "full" for start in bounds[:-1])
+        )
 
     def test_twelve_layers_is_the_smallest_cache_safe_maximum(self):
         allowed = [i for i, kind in enumerate(GLM_INDEXER_TYPES) if kind == "full"]
@@ -118,13 +136,11 @@ class PipelineBalanceTest(unittest.TestCase):
             bounds = (0, *cuts, 78)
             sizes = [end - start for start, end in zip(bounds, bounds[1:])]
             return max(
-                size * (1.50 + 0.137 * (8 - stage))
-                for stage, size in enumerate(sizes)
+                size * (1.50 + 0.137 * (8 - stage)) for stage, size in enumerate(sizes)
             )
 
         ranked = sorted(
-            (maximum_cost(cuts), cuts)
-            for cuts in itertools.combinations(interior, 7)
+            (maximum_cost(cuts), cuts) for cuts in itertools.combinations(interior, 7)
         )
         self.assertAlmostEqual(ranked[0][0], 24.576)
         self.assertEqual(ranked[0][1], (6, 14, 22, 30, 42, 54, 66))
@@ -166,8 +182,7 @@ class PipelineBalanceTest(unittest.TestCase):
             num_hidden_layers=78,
         )
         bounds = [
-            self.pp.stage_layer_range(78, stage, 8, config)[0]
-            for stage in range(8)
+            self.pp.stage_layer_range(78, stage, 8, config)[0] for stage in range(8)
         ] + [78]
         self.assertEqual(bounds, config.pp_layer_boundaries)
 
@@ -193,9 +208,7 @@ class PipelineBalanceTest(unittest.TestCase):
         language_model = types.SimpleNamespace(config=config)
         model_module = types.ModuleType("prime_rl.trainer.model")
         model_module.get_language_model = lambda _model: language_model
-        with mock.patch.dict(
-            sys.modules, {"prime_rl.trainer.model": model_module}
-        ):
+        with mock.patch.dict(sys.modules, {"prime_rl.trainer.model": model_module}):
             self.assertEqual(
                 self.pp.sparse_cache_stage_flags(object(), 6, 8),
                 (False, True),
@@ -213,10 +226,7 @@ class PipelineBalanceTest(unittest.TestCase):
         )
         bounds = self.pp.compute_balanced_boundaries(78, 16, config)
         self.assertEqual(len(bounds), 17)
-        ranges = [
-            (bounds[rank], bounds[rank + 1])
-            for rank in range(16)
-        ]
+        ranges = [(bounds[rank], bounds[rank + 1]) for rank in range(16)]
         self.assertTrue(all(start < end for start, end in ranges))
         self.assertEqual(sum(end - start for start, end in ranges), 78)
         for physical_rank in range(8):
@@ -231,14 +241,11 @@ class PipelineBalanceTest(unittest.TestCase):
             pp_virtual_layer_boundaries=GLM_INTERLEAVED_BOUNDARIES,
         )
         bounds = [
-            self.pp.stage_layer_range(78, stage, 16, config)[0]
-            for stage in range(16)
+            self.pp.stage_layer_range(78, stage, 16, config)[0] for stage in range(16)
         ] + [78]
         self.assertEqual(bounds, GLM_INTERLEAVED_BOUNDARIES)
 
-        virtual_counts = [
-            end - start for start, end in zip(bounds, bounds[1:])
-        ]
+        virtual_counts = [end - start for start, end in zip(bounds, bounds[1:])]
         self.assertEqual(
             virtual_counts,
             [3, 4, 4, 4, 4, 4, 4, 4, 5, 6, 6, 6, 6, 6, 6, 6],
@@ -263,10 +270,7 @@ class PipelineBalanceTest(unittest.TestCase):
             size * (1.50 + 0.137 * (16 - stage))
             for stage, size in enumerate(virtual_counts)
         ]
-        rank_costs = [
-            stage_costs[rank] + stage_costs[rank + 8]
-            for rank in range(8)
-        ]
+        rank_costs = [stage_costs[rank] + stage_costs[rank + 8] for rank in range(8)]
         self.assertAlmostEqual(max(stage_costs), 14.754)
         self.assertAlmostEqual(max(rank_costs), 28.974)
         self.assertAlmostEqual(rank_costs[0], 24.056)
@@ -332,9 +336,7 @@ class PipelineBalanceTest(unittest.TestCase):
                 else:
                     input_meta = (
                         hidden_meta,
-                        sparse_meta
-                        if receive
-                        else placeholder_meta,
+                        sparse_meta if receive else placeholder_meta,
                     )
                 if stage == 15:
                     output_meta = ((), (), "float32")
@@ -374,9 +376,7 @@ class PipelineBalanceTest(unittest.TestCase):
                 self.assertEqual(input_meta[0], hidden_meta)
                 self.assertEqual(
                     input_meta[1],
-                    sparse_meta
-                    if receive
-                    else placeholder_meta,
+                    sparse_meta if receive else placeholder_meta,
                 )
             if stage == 15:
                 self.assertEqual(output_meta, ((), (), "float32"))
@@ -386,7 +386,6 @@ class PipelineBalanceTest(unittest.TestCase):
                 self.assertEqual(
                     output_meta[1], sparse_meta if send else placeholder_meta
                 )
-
 
 
 class SideInputKeyTest(unittest.TestCase):
@@ -418,8 +417,8 @@ class SideInputKeyTest(unittest.TestCase):
 
         self.assertEqual((got0["marker"], got1["marker"]), ("micro-0", "micro-1"))
         self.assertEqual(stage._side, {})
-        self.assertEqual(first.moves, [(('cuda',), {"non_blocking": True})])
-        self.assertEqual(second.moves, [(('cuda',), {"non_blocking": True})])
+        self.assertEqual(first.moves, [(("cuda",), {"non_blocking": True})])
+        self.assertEqual(second.moves, [(("cuda",), {"non_blocking": True})])
         self.assertEqual(
             routed.moves,
             [
@@ -470,6 +469,57 @@ class SideInputKeyTest(unittest.TestCase):
             self.runner.derive_1f1b_transport_capacities(0, 8, 7)
         with self.assertRaisesRegex(ValueError, "outside"):
             self.runner.derive_1f1b_transport_capacities(8, 8, 8)
+
+    def test_async_schedule_rejects_sparse_cache_transport(self):
+        dense = types.SimpleNamespace(
+            stage_identity=0,
+            transfer_sparse_indices=False,
+        )
+        sparse = types.SimpleNamespace(
+            stage_identity=3,
+            transfer_sparse_indices=True,
+        )
+        self.runner.validate_async_stage_modules([dense])
+        with self.assertRaisesRegex(ValueError, "sparse-cache.*stages=\\[3\\]"):
+            self.runner.validate_async_stage_modules([dense, sparse])
+
+    def test_bounded_transport_state_is_reset_between_steps(self):
+        class FakePipelineStage:
+            def clear_runtime_states(self):
+                self.parent_clear_calls += 1
+
+        pipelining = types.ModuleType("torch.distributed.pipelining")
+        pipelining.PipelineStage = FakePipelineStage
+        stage_module = types.ModuleType("torch.distributed.pipelining.stage")
+        stage_module._RecvInfo = object
+        stage_module._RootArgPlaceholder = object
+        stage_module._make_tensor_from_meta = lambda *_args: object()
+        modules = {
+            "torch.distributed": types.ModuleType("torch.distributed"),
+            "torch.distributed.pipelining": pipelining,
+            "torch.distributed.pipelining.stage": stage_module,
+        }
+        with mock.patch.dict(sys.modules, modules):
+            stage_class = self.runner._bounded_pipeline_stage_cls()
+        stage = stage_class.__new__(stage_class)
+        stage.parent_clear_calls = 0
+        stage._forward_receive_keys = {(3, 0)}
+        stage._forward_slot_owner = [(3, 0)]
+        stage._forward_events = [object()]
+        stage._backward_receive_keys = {(3, 0)}
+        stage._backward_slot_owner = [(3, 0)]
+        stage._backward_events = [object()]
+        stage._sparse_cache_receive_keys = {(3, 0)}
+        stage._sparse_cache_slot_owner = [(3, 0)]
+        stage._sparse_cache_events = [object()]
+
+        stage.clear_runtime_states()
+
+        self.assertEqual(stage.parent_clear_calls, 1)
+        for prefix in ("forward", "backward", "sparse_cache"):
+            self.assertEqual(getattr(stage, f"_{prefix}_receive_keys"), set())
+            self.assertEqual(getattr(stage, f"_{prefix}_slot_owner"), [None])
+            self.assertEqual(getattr(stage, f"_{prefix}_events"), [None])
 
     def test_interleaved_transport_capacity_parser_and_modulo_reuse(self):
         def action(stage, microbatch, kind):
@@ -533,13 +583,11 @@ class SideInputKeyTest(unittest.TestCase):
         hidden_slot_bytes = 4096 * 6144 * 2
         sparse_slot_bytes = 4096 * 2048 * 2
         exact_bytes = (
-            (sum(forward_slots) + sum(backward_slots)) * hidden_slot_bytes
-            + sum(sparse_slots) * sparse_slot_bytes
-        )
-        global_slot_bytes = (
-            (15 * 16 + 15 * 16) * hidden_slot_bytes
-            + (15 * 16) * sparse_slot_bytes
-        )
+            sum(forward_slots) + sum(backward_slots)
+        ) * hidden_slot_bytes + sum(sparse_slots) * sparse_slot_bytes
+        global_slot_bytes = (15 * 16 + 15 * 16) * hidden_slot_bytes + (
+            15 * 16
+        ) * sparse_slot_bytes
         self.assertEqual(exact_bytes, 8.53125 * 2**30)
         per_physical_rank = [
             sum(
@@ -554,9 +602,7 @@ class SideInputKeyTest(unittest.TestCase):
         self.assertLess(exact_bytes, global_slot_bytes)
 
     def test_sparse_cache_slot_reuse_does_not_block_the_cpu(self):
-        source = (
-            SOURCE / "src/prime_rl/trainer/distributed/pp_runner.py"
-        ).read_text()
+        source = (SOURCE / "src/prime_rl/trainer/distributed/pp_runner.py").read_text()
         sparse_source = source.split("def _sparse_cache_pipeline_stage_cls", 1)[1]
         method = sparse_source.split("        def get_fwd_recv_ops", 1)[1].split(
             "        def forward_one_chunk", 1

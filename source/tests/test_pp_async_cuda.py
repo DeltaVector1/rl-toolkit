@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 import types
+from contextlib import contextmanager
 from pathlib import Path
 
 import torch
@@ -23,6 +25,94 @@ steps = 2
 rows = 2
 columns = 4
 learning_rate = 1e-4
+journal_max_bytes = 256 * 1024
+journal_max_records = 2048
+journal_max_record_bytes = 1024
+
+
+class RankJournal:
+    def __init__(self, local_rank: int, output_root: Path = Path("/output")):
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= os.O_NOFOLLOW
+        self.path = output_root / f"rank-{int(local_rank)}.journal.jsonl"
+        self.fd = os.open(self.path, flags, 0o600)
+        self.bytes_written = 0
+        self.records_written = 0
+        self.mode = "startup"
+        self.step = -1
+
+    def write(self, event: str, **fields) -> None:
+        if self.records_written >= journal_max_records:
+            raise RuntimeError("rank journal record limit reached")
+        record = {
+            "time_ns": time.monotonic_ns(),
+            "mode": self.mode,
+            "step": self.step,
+            "event": str(event),
+            **fields,
+        }
+        payload = (
+            json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+        if len(payload) > journal_max_record_bytes:
+            raise RuntimeError("rank journal record is too large")
+        if self.bytes_written + len(payload) > journal_max_bytes:
+            raise RuntimeError("rank journal byte limit reached")
+        offset = 0
+        while offset < len(payload):
+            offset += os.write(self.fd, payload[offset:])
+        os.fsync(self.fd)
+        self.bytes_written += len(payload)
+        self.records_written += 1
+
+    def close(self) -> None:
+        if self.fd < 0:
+            return
+        os.fsync(self.fd)
+        os.close(self.fd)
+        self.fd = -1
+
+
+def _p2p_summary(ops) -> list[dict[str, object]]:
+    result = []
+    for op in ops:
+        function = getattr(op, "op", None)
+        result.append(
+            {
+                "op": getattr(function, "__name__", type(function).__name__),
+                "peer": int(getattr(op, "group_peer", getattr(op, "peer", -1))),
+            }
+        )
+    return result
+
+
+@contextmanager
+def journal_native_transport(journal: RankJournal):
+    from torch.distributed.pipelining import schedules
+
+    original_batch = schedules._batch_p2p
+    original_wait = schedules._wait_batch_p2p
+
+    def traced_batch(p2p_ops, desc=None):
+        summary = _p2p_summary(p2p_ops)
+        journal.write("p2p_post_before", description=str(desc or ""), ops=summary)
+        work = original_batch(p2p_ops, desc=desc)
+        journal.write("p2p_post_after", description=str(desc or ""), count=len(work))
+        return work
+
+    def traced_wait(work):
+        journal.write("p2p_wait_before", count=len(work))
+        result = original_wait(work)
+        journal.write("p2p_wait_after", count=len(work))
+        return result
+
+    schedules._batch_p2p = traced_batch
+    schedules._wait_batch_p2p = traced_wait
+    try:
+        yield
+    finally:
+        schedules._batch_p2p = original_batch
+        schedules._wait_batch_p2p = original_wait
 
 
 class AffineStage(nn.Module):
@@ -42,6 +132,7 @@ class AffineStage(nn.Module):
 
 class AuditedTransport(async_schedule.CudaAsyncP2P):
     instances: list["AuditedTransport"] = []
+    journal: RankJournal | None = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -50,16 +141,42 @@ class AuditedTransport(async_schedule.CudaAsyncP2P):
         self.instances.append(self)
 
     def _post_receive(self, ops):
+        if self.journal is not None:
+            self.journal.write("async_receive_post_before", ops=_p2p_summary(ops))
         pending = super()._post_receive(ops)
+        if self.journal is not None:
+            self.journal.write("async_receive_post_after", count=len(pending.works))
         self.work.extend(pending.works)
         return pending
 
     def _post_send(self, ops):
+        if self.journal is not None:
+            self.journal.write("async_send_post_before", ops=_p2p_summary(ops))
         pending = super()._post_send(ops)
+        if self.journal is not None:
+            self.journal.write("async_send_post_after", count=len(pending.works))
         self.work.extend(pending.works)
         return pending
 
+    def _wait_receive(self, pending):
+        if self.journal is not None:
+            self.journal.write("async_receive_wait_before", count=len(pending.works))
+        result = super()._wait_receive(pending)
+        if self.journal is not None:
+            self.journal.write("async_receive_wait_after", count=len(pending.works))
+        return result
+
+    def _wait_send(self, pending):
+        if self.journal is not None:
+            self.journal.write("async_send_wait_before", count=len(pending.works))
+        result = super()._wait_send(pending)
+        if self.journal is not None:
+            self.journal.write("async_send_wait_after", count=len(pending.works))
+        return result
+
     def drain(self):
+        if self.journal is not None:
+            self.journal.write("async_drain_before")
         super().drain()
         state = self._state
         if any(state._receives.values()) or any(state._completed_receives.values()):
@@ -71,6 +188,8 @@ class AuditedTransport(async_schedule.CudaAsyncP2P):
         if any(not item.is_completed() for item in self.work):
             raise AssertionError("NCCL work remained active after drain")
         self.drained = True
+        if self.journal is not None:
+            self.journal.write("async_drain_after")
 
 
 def fixed_input(step: int, device: torch.device) -> torch.Tensor:
@@ -79,20 +198,28 @@ def fixed_input(step: int, device: torch.device) -> torch.Tensor:
         device=device,
         dtype=torch.float32,
     )
-    return values.view(microbatches, rows, columns).add_(step).div_(1000).requires_grad_()
+    return (
+        values.view(microbatches, rows, columns).add_(step).div_(1000).requires_grad_()
+    )
 
 
-def record_actions(stage, actions: list[tuple[str, int]]) -> None:
+def record_actions(stage, actions: list[tuple[str, int]], journal: RankJournal) -> None:
     forward = stage.forward_one_chunk
     backward = stage.backward_one_chunk
 
     def forward_one_chunk(microbatch, *args, **kwargs):
+        journal.write("action_before", action="forward", microbatch=int(microbatch))
         actions.append(("F", int(microbatch)))
-        return forward(microbatch, *args, **kwargs)
+        result = forward(microbatch, *args, **kwargs)
+        journal.write("action_after", action="forward", microbatch=int(microbatch))
+        return result
 
     def backward_one_chunk(microbatch, *args, **kwargs):
+        journal.write("action_before", action="backward", microbatch=int(microbatch))
         actions.append(("B", int(microbatch)))
-        return backward(microbatch, *args, **kwargs)
+        result = backward(microbatch, *args, **kwargs)
+        journal.write("action_after", action="backward", microbatch=int(microbatch))
+        return result
 
     stage.forward_one_chunk = types.MethodType(
         lambda _stage, microbatch, *args, **kwargs: forward_one_chunk(
@@ -108,7 +235,10 @@ def record_actions(stage, actions: list[tuple[str, int]]) -> None:
     )
 
 
-def run_mode(mode: str, rank: int, device: torch.device) -> dict:
+def run_mode(mode: str, rank: int, device: torch.device, journal: RankJournal) -> dict:
+    journal.mode = mode
+    journal.step = -1
+    journal.write("schedule_build_before", rank=rank)
     module = AffineStage(rank).to(device)
     example = torch.empty((1, rows, columns), device=device)
     schedule = pp_runner.build_schedule(
@@ -132,14 +262,17 @@ def run_mode(mode: str, rank: int, device: torch.device) -> dict:
         if mode == "1f1b_async"
         else None,
     )
+    journal.write("schedule_build_after", rank=rank)
     actions = []
-    record_actions(schedule._stage, actions)
+    record_actions(schedule._stage, actions, journal)
     optimizer = torch.optim.SGD(module.parameters(), lr=learning_rate)
     reports = []
     torch.cuda.reset_peak_memory_stats(device)
     before = torch.cuda.memory_allocated(device)
 
     for step in range(steps):
+        journal.step = step
+        journal.write("step_before")
         optimizer.zero_grad(set_to_none=True)
         inputs = fixed_input(step, device)
         losses = [] if module.is_last else None
@@ -148,14 +281,18 @@ def run_mode(mode: str, rank: int, device: torch.device) -> dict:
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        if rank == 0:
-            schedule.step(inputs, return_outputs=False)
-        else:
-            schedule.step(
-                target=torch.zeros(microbatches, device=device),
-                losses=losses,
-                return_outputs=False,
-            )
+        with journal_native_transport(journal):
+            if rank == 0:
+                schedule.step(inputs, return_outputs=False)
+            elif rank == stages - 1:
+                schedule.step(
+                    target=torch.zeros(microbatches, device=device),
+                    losses=losses,
+                    return_outputs=False,
+                )
+            else:
+                schedule.step(return_outputs=False)
+        journal.write("step_schedule_after")
         end.record()
         end.synchronize()
 
@@ -166,7 +303,9 @@ def run_mode(mode: str, rank: int, device: torch.device) -> dict:
             raise AssertionError(f"{mode} action set differs at step {step}")
         if module.scale.grad is None or module.bias.grad is None:
             raise AssertionError(f"{mode} has a missing gradient at step {step}")
-        if not torch.isfinite(module.scale.grad) or not torch.isfinite(module.bias.grad):
+        if not torch.isfinite(module.scale.grad) or not torch.isfinite(
+            module.bias.grad
+        ):
             raise AssertionError(f"{mode} has a nonfinite gradient at step {step}")
         if mode == "1f1b_async":
             created = AuditedTransport.instances[transport_start:]
@@ -186,7 +325,10 @@ def run_mode(mode: str, rank: int, device: torch.device) -> dict:
         report["scale_after_update"] = float(module.scale)
         report["bias_after_update"] = float(module.bias)
         reports.append(report)
+        journal.write("step_barrier_before")
         dist.barrier()
+        journal.write("step_barrier_after")
+        journal.write("step_after")
 
     peak = torch.tensor(
         torch.cuda.max_memory_allocated(device) - before,
@@ -227,17 +369,28 @@ def main() -> None:
     if torch.cuda.device_count() != stages:
         raise AssertionError("this qualification requires exactly eight visible GPUs")
     local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    dist.init_process_group("nccl")
-    rank = dist.get_rank()
+    journal = RankJournal(local_rank)
     try:
-        baseline = run_mode("1f1b", rank, torch.device("cuda", local_rank))
+        journal.write("cuda_device_before", local_rank=local_rank)
+        torch.cuda.set_device(local_rank)
+        journal.write("cuda_device_after", local_rank=local_rank)
+        journal.write("group_init_before")
+        dist.init_process_group("nccl")
+        rank = dist.get_rank()
+        journal.write("group_init_after", rank=rank)
+        baseline = run_mode("1f1b", rank, torch.device("cuda", local_rank), journal)
+        journal.write("mode_barrier_before", mode="1f1b")
         dist.barrier()
+        journal.write("mode_barrier_after", mode="1f1b")
         original = async_schedule.CudaAsyncP2P
         async_schedule.CudaAsyncP2P = AuditedTransport
+        AuditedTransport.journal = journal
         try:
-            candidate = run_mode("1f1b_async", rank, torch.device("cuda", local_rank))
+            candidate = run_mode(
+                "1f1b_async", rank, torch.device("cuda", local_rank), journal
+            )
         finally:
+            AuditedTransport.journal = None
             async_schedule.CudaAsyncP2P = original
         assert_parity(baseline, candidate)
         local = {"rank": rank, "baseline": baseline, "async": candidate}
@@ -270,7 +423,11 @@ def main() -> None:
                 json.dumps(result, sort_keys=True) + "\n"
             )
     finally:
-        dist.destroy_process_group()
+        if dist.is_initialized():
+            journal.write("group_destroy_before")
+            dist.destroy_process_group()
+            journal.write("group_destroy_after")
+        journal.close()
 
 
 if __name__ == "__main__":

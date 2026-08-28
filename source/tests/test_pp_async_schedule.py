@@ -27,10 +27,11 @@ def _load_module():
 
 
 class FakeOp:
-    def __init__(self, kind: str, microbatch: int, tensor=None):
+    def __init__(self, kind: str, microbatch: int, tensor=None, peer=None):
         self.kind = kind
         self.microbatch = microbatch
         self.tensor = tensor
+        self.peer = peer
 
 
 class FakeCuda:
@@ -260,6 +261,78 @@ class FakeStage:
         self.log.append(("reduce", scale))
 
 
+class SparsePeerStage(FakeStage):
+    def __init__(self, log, stage_index):
+        super().__init__(log, stage_index=stage_index, sparse=True)
+        self.is_first = stage_index == 0
+        self.is_last = stage_index == 7
+
+    def get_fwd_recv_ops(self, microbatch):
+        if self.is_first:
+            return []
+        return [
+            FakeOp(
+                "fwd", microbatch, self._fwd_buffers[microbatch], self.stage_index - 1
+            ),
+            FakeOp("cache", microbatch, self._cache_buffers[0], self.stage_index - 1),
+        ]
+
+    def get_fwd_send_ops(self, microbatch):
+        if self.is_last:
+            return []
+        return [
+            FakeOp("fwd", microbatch, peer=self.stage_index + 1),
+            FakeOp("cache", microbatch, peer=self.stage_index + 1),
+        ]
+
+    def get_bwd_recv_ops(self, microbatch):
+        if self.is_last:
+            return []
+        return [
+            FakeOp(
+                "bwd", microbatch, self._bwd_buffers[microbatch], self.stage_index + 1
+            )
+        ]
+
+    def get_bwd_send_ops(self, microbatch):
+        if self.is_first:
+            return []
+        return [FakeOp("bwd", microbatch, peer=self.stage_index - 1)]
+
+
+class EdgeTraceTransport(FakeTransport):
+    def __init__(self, module, rank, trace):
+        self.rank = rank
+        self.trace = trace
+        super().__init__(module, [], fwd_window=1, bwd_window=1)
+
+    def _post_receive(self, ops):
+        op_list = tuple(ops)
+        if op_list:
+            self.trace.append(
+                (
+                    self.rank,
+                    op_list[0].peer,
+                    "receive",
+                    tuple((op.kind, op.microbatch) for op in op_list),
+                )
+            )
+        return op_list
+
+    def _post_send(self, ops):
+        op_list = tuple(ops)
+        if op_list:
+            self.trace.append(
+                (
+                    self.rank,
+                    op_list[0].peer,
+                    "send",
+                    tuple((op.kind, op.microbatch) for op in op_list),
+                )
+            )
+        return op_list
+
+
 class FakeSchedule:
     _num_stages = 4
     scale_grads = False
@@ -418,7 +491,9 @@ class AsyncP2PStateTest(unittest.TestCase):
         sparse_log = []
         sparse_stage = FakeStage(sparse_log, stage_index=3, sparse=True)
         sparse_schedule = FakeSchedule(sparse_stage, 64, num_stages=8)
-        sparse_transport = FakeTransport(self.module, sparse_log, fwd_window=1, bwd_window=1)
+        sparse_transport = FakeTransport(
+            self.module, sparse_log, fwd_window=1, bwd_window=1
+        )
         self.module.run_1f1b_async_step(
             sparse_schedule,
             sparse_transport,
@@ -432,8 +507,7 @@ class AsyncP2PStateTest(unittest.TestCase):
         cache_posts = [
             item
             for item in sparse_log
-            if item[0] == "post_recv"
-            and any(op[0] == "cache_recv" for op in item[1])
+            if item[0] == "post_recv" and any(op[0] == "cache_recv" for op in item[1])
         ]
         self.assertEqual(len(cache_posts), 64)
         for left, right in zip(cache_posts, cache_posts[1:]):
@@ -441,6 +515,31 @@ class AsyncP2PStateTest(unittest.TestCase):
                 sparse_log.index(left) + 1,
                 sparse_log.index(right),
             )
+
+    def test_sparse_pp8_window_one_has_an_unmatched_eighth_edge_call(self):
+        traces = {}
+        for rank in range(8):
+            trace = []
+            stage = SparsePeerStage([], rank)
+            schedule = FakeSchedule(stage, 8, num_stages=8)
+            transport = EdgeTraceTransport(self.module, rank, trace)
+            self.module.run_1f1b_async_step(
+                schedule,
+                transport,
+                list(range(8)),
+                [{} for _ in range(8)],
+                [0] * 8,
+                [],
+                True,
+            )
+            traces[rank] = trace
+
+        rank_zero = [item for item in traces[0] if item[1] == 1]
+        rank_one = [item for item in traces[1] if item[1] == 0]
+        self.assertEqual(rank_zero[7][2:], ("send", (("fwd", 7), ("cache", 7))))
+        self.assertEqual(rank_one[7][2:], ("send", (("bwd", 0),)))
+        self.assertNotEqual(rank_zero[7][2], "receive")
+        self.assertNotEqual(rank_one[7][2], "receive")
 
     def test_error_cleans_all_outstanding_work(self):
         log = []
@@ -482,7 +581,10 @@ class AsyncP2PStateTest(unittest.TestCase):
 
     def test_live_stage_ring_slot_is_deferred(self):
         stage = FakeStage([])
-        stage._forward_slot_by_key = {(stage.stage_index, 0): 0, (stage.stage_index, 8): 0}
+        stage._forward_slot_by_key = {
+            (stage.stage_index, 0): 0,
+            (stage.stage_index, 8): 0,
+        }
         stage._forward_slot_owner = [(stage.stage_index, 0)]
         stage._forward_events = [None]
         self.assertFalse(self.module._stage_receive_slot_available(stage, "fwd", 8))
@@ -490,7 +592,9 @@ class AsyncP2PStateTest(unittest.TestCase):
         self.assertTrue(self.module._stage_receive_slot_available(stage, "fwd", 8))
 
     def test_async_topology_guard_is_fail_closed(self):
-        runner_source = (SOURCE / "src/prime_rl/trainer/distributed/pp_runner.py").read_text()
+        runner_source = (
+            SOURCE / "src/prime_rl/trainer/distributed/pp_runner.py"
+        ).read_text()
         self.assertIn("validate_async_topology", runner_source)
         self.assertIn('"cutoff": 5', runner_source)
         self.assertIn('"pp_limit_receive_buffers": True', runner_source)

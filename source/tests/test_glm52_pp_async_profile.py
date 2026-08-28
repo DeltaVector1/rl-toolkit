@@ -4,12 +4,15 @@ import ast
 import hashlib
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
 import tomllib
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -75,7 +78,11 @@ def test_async_profile_is_isolated_and_full_shape() -> None:
         "samples_per_micro_batch": 32,
         "group_size": 16,
     }
-    assert config["data"]["fake"]["batch_size"] * config["data"]["fake"]["samples_per_micro_batch"] == 2048
+    assert (
+        config["data"]["fake"]["batch_size"]
+        * config["data"]["fake"]["samples_per_micro_batch"]
+        == 2048
+    )
 
     model = config["model"]
     assert (model["pp"], model["cp"], model["ep"]) == (8, 8, 8)
@@ -135,7 +142,9 @@ def test_async_profile_is_allowlisted_and_validated_before_setup() -> None:
     assert '"glm52-native-pp-async": 2' in training_ops
     assert '"glm52-native-pp-async",' in training_ops
     assert "validate_async_1f1b_topology" in config
-    assert "1f1b_async is only available in the GLM async qualification profile" in train
+    assert (
+        "1f1b_async is only available in the GLM async qualification profile" in train
+    )
     assert train.index("config.model.validate_async_1f1b_topology()") < train.index(
         "setup_torch_distributed("
     )
@@ -189,11 +198,108 @@ def test_cuda_smoke_profile_is_small_and_n82_only() -> None:
     assert "microbatches = 8" in script
     assert "steps = 2" in script
     assert "Schedule1F1BAsync" not in script
-    assert 'run_mode("1f1b"' in script
-    assert 'run_mode("1f1b_async"' in script
+    tree = ast.parse(script)
+    run_modes = {
+        node.args[0].value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "run_mode"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+    }
+    assert run_modes == {"1f1b", "1f1b_async"}
     assert "@record\ndef main()" in script
     assert "model-fp8" not in script
     assert "/data/ZiphuAI" not in script
+
+
+def test_cuda_smoke_journal_is_bounded_and_fsynced() -> None:
+    path = ROOT / "source/tests/test_pp_async_cuda.py"
+    tree = ast.parse(path.read_text())
+    selected = []
+    names = {
+        "journal_max_bytes",
+        "journal_max_records",
+        "journal_max_record_bytes",
+    }
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id in names
+            for target in node.targets
+        ):
+            selected.append(node)
+        elif isinstance(node, ast.ClassDef) and node.name == "RankJournal":
+            selected.append(node)
+    namespace = {"json": json, "os": os, "time": __import__("time"), "Path": Path}
+    exec(
+        compile(ast.Module(body=selected, type_ignores=[]), str(path), "exec"),
+        namespace,
+    )
+
+    with tempfile.TemporaryDirectory() as directory:
+        journal = namespace["RankJournal"](4, Path(directory))
+        journal.write("action_before", action="forward", microbatch=0)
+        journal.close()
+        rows = (Path(directory) / "rank-4.journal.jsonl").read_text().splitlines()
+        assert len(rows) == 1
+        assert json.loads(rows[0])["event"] == "action_before"
+
+        with pytest.raises(FileExistsError):
+            namespace["RankJournal"](4, Path(directory))
+
+
+def test_pp8_native_crossover_batches_match_on_every_edge() -> None:
+    microbatch_count = 8
+    stage_count = 8
+    for left in range(stage_count - 1):
+        right = left + 1
+        forward = microbatch_count - right
+        backward = 0
+        left_batch = {
+            ("send", left, right, "forward", forward),
+            ("receive", right, left, "backward", backward),
+        }
+        right_batch = {
+            ("send", right, left, "backward", backward),
+            ("receive", left, right, "forward", forward),
+        }
+        normalized_left = {
+            (source, target, direction, microbatch)
+            for _op, source, target, direction, microbatch in left_batch
+        }
+        normalized_right = {
+            (source, target, direction, microbatch)
+            for _op, source, target, direction, microbatch in right_batch
+        }
+        assert normalized_left == normalized_right
+
+
+def test_cuda_smoke_records_all_blocking_boundaries() -> None:
+    source = (ROOT / "source/tests/test_pp_async_cuda.py").read_text()
+    for event in (
+        "group_init_before",
+        "group_init_after",
+        "schedule_build_before",
+        "schedule_build_after",
+        "step_before",
+        "step_schedule_after",
+        "action_before",
+        "action_after",
+        "p2p_wait_before",
+        "p2p_wait_after",
+        "async_receive_wait_before",
+        "async_receive_wait_after",
+        "async_send_wait_before",
+        "async_send_wait_after",
+        "async_drain_before",
+        "async_drain_after",
+        "step_after",
+    ):
+        assert f'"{event}"' in source
+    assert "os.O_EXCL" in source
+    assert "os.O_NOFOLLOW" in source
+    assert "os.fsync(self.fd)" in source
 
 
 def test_cuda_smoke_overrides_have_a_closed_prime_rl_import_graph() -> None:
@@ -234,7 +340,9 @@ def test_cuda_smoke_overrides_have_a_closed_prime_rl_import_graph() -> None:
                     candidate_path = (
                         ROOT / "source/src" / (candidate.replace(".", "/") + ".py")
                     )
-                    dependencies.add(candidate if candidate_path.is_file() else node.module)
+                    dependencies.add(
+                        candidate if candidate_path.is_file() else node.module
+                    )
         return dependencies
 
     pending = [entry]
@@ -296,11 +404,15 @@ def test_exited_trainer_is_allowed_and_cuda_command_is_fail_closed() -> None:
         "source/src/prime_rl/trainer/phase_profiler.py",
     )
     hashes = {
-        "test_sha256": hashlib.sha256((ROOT / source_paths[0]).read_bytes()).hexdigest(),
+        "test_sha256": hashlib.sha256(
+            (ROOT / source_paths[0]).read_bytes()
+        ).hexdigest(),
         "async_schedule_sha256": hashlib.sha256(
             (ROOT / source_paths[1]).read_bytes()
         ).hexdigest(),
-        "pp_runner_sha256": hashlib.sha256((ROOT / source_paths[2]).read_bytes()).hexdigest(),
+        "pp_runner_sha256": hashlib.sha256(
+            (ROOT / source_paths[2]).read_bytes()
+        ).hexdigest(),
         "phase_profiler_sha256": hashlib.sha256(
             (ROOT / source_paths[3]).read_bytes()
         ).hexdigest(),
@@ -354,7 +466,7 @@ def test_exited_trainer_is_allowed_and_cuda_command_is_fail_closed() -> None:
     stale_cleanup = calls[1][1]
     assert "docker ps -aq --no-trunc" in stale_cleanup
     assert "docker inspect --type container" in stale_cleanup
-    assert "docker rm \"$candidate_id\"" in stale_cleanup
+    assert 'docker rm "$candidate_id"' in stale_cleanup
     launch = calls[2][1]
     assert "--nproc-per-node=8" in launch
     assert "--log-dir /output/torchrun" in launch
@@ -470,7 +582,7 @@ def test_rank_four_failure_artifact_survives_a_missing_result() -> None:
     assert "--log-dir /output/torchrun" in launch
     diagnostic = calls[4][1]
     assert "error.json" in diagnostic
-    assert 'traceback[-6000:]' in diagnostic
+    assert "traceback[-6000:]" in diagnostic
 
 
 def test_worker_diagnostic_reads_a_valid_rank_four_artifact() -> None:
@@ -600,4 +712,4 @@ def test_stale_candidate_cleanup_is_fail_closed() -> None:
     assert "docker ps -aq --no-trunc" in stale_cleanup
     assert "docker inspect --type container" in stale_cleanup
     assert "observed_running" in stale_cleanup
-    assert "docker rm \"$candidate_id\"" in stale_cleanup
+    assert 'docker rm "$candidate_id"' in stale_cleanup

@@ -68,6 +68,19 @@ def validate_async_topology(topology: Mapping[str, Any] | None) -> None:
         )
 
 
+def validate_async_stage_modules(stage_modules: Sequence[Any]) -> None:
+    sparse = [
+        int(getattr(module, "stage_identity", index))
+        for index, module in enumerate(stage_modules)
+        if bool(getattr(module, "transfer_sparse_indices", False))
+    ]
+    if sparse:
+        raise ValueError(
+            "1f1b_async does not support sparse-cache pipeline transport; "
+            f"stages={sparse}"
+        )
+
+
 def validate_interleaved_microbatches(num_microbatches: int, pp_size: int) -> int:
     """Validate an interleaved batch and return its round count.
 
@@ -177,8 +190,16 @@ def _require_pinned_interleaved_schedule_api(native_schedule_cls):
             "flexible interleaved pipeline requires PyTorch private schedule API"
         ) from exc
     required_runtime = ("__init__", "_prepare_schedule_with_comms")
-    missing_runtime = [name for name in required_runtime if not callable(getattr(_PipelineScheduleRuntime, name, None))]
-    missing_native = [name for name in ("_calculate_single_rank_operations",) if not callable(getattr(native_schedule_cls, name, None))]
+    missing_runtime = [
+        name
+        for name in required_runtime
+        if not callable(getattr(_PipelineScheduleRuntime, name, None))
+    ]
+    missing_native = [
+        name
+        for name in ("_calculate_single_rank_operations",)
+        if not callable(getattr(native_schedule_cls, name, None))
+    ]
     if missing_runtime or missing_native:
         missing = ", ".join(missing_runtime + missing_native)
         raise RuntimeError(
@@ -206,13 +227,17 @@ def _schedule_action_positions(actions_by_rank):
             if action is None:
                 continue
             for flat_action in _flatten_schedule_action(action):
-                kind = getattr(getattr(flat_action, "computation_type", None), "value", None)
+                kind = getattr(
+                    getattr(flat_action, "computation_type", None), "value", None
+                )
                 stage_index = getattr(flat_action, "stage_index", None)
                 microbatch_index = getattr(flat_action, "microbatch_index", None)
                 if kind not in {"F", "B", "I", "RECV_F", "RECV_B"}:
                     position += 1
                     continue
-                if not isinstance(stage_index, int) or not isinstance(microbatch_index, int):
+                if not isinstance(stage_index, int) or not isinstance(
+                    microbatch_index, int
+                ):
                     raise RuntimeError(
                         "interleaved transport action has an invalid stage or microbatch"
                     )
@@ -290,12 +315,10 @@ def derive_interleaved_transport_capacities(
         if rank not in actions_by_rank:
             raise RuntimeError(f"missing action list for interleaved rank {rank}")
         expects_forward_receive = (
-            stage_index > 0
-            and stage_to_rank[stage_index - 1] != rank
+            stage_index > 0 and stage_to_rank[stage_index - 1] != rank
         )
         expects_backward_receive = (
-            stage_index < num_stages - 1
-            and stage_to_rank[stage_index + 1] != rank
+            stage_index < num_stages - 1 and stage_to_rank[stage_index + 1] != rank
         )
         forward_intervals = []
         backward_intervals = []
@@ -336,9 +359,7 @@ def derive_interleaved_transport_capacities(
                 forward_intervals.append(
                     (forward_receive[1], backward_end[1], microbatch)
                 )
-                sparse_intervals.append(
-                    (forward_receive[1], forward[1], microbatch)
-                )
+                sparse_intervals.append((forward_receive[1], forward[1], microbatch))
             elif forward is not None and expects_forward_receive:
                 raise RuntimeError(
                     f"stage {stage_index} has forward work without a receive action"
@@ -443,7 +464,9 @@ class PipelineStageModule(nn.Module):
             else receive_sparse_indices
         )
         self.send_sparse_indices = (
-            transfer_sparse_indices if send_sparse_indices is None else send_sparse_indices
+            transfer_sparse_indices
+            if send_sparse_indices is None
+            else send_sparse_indices
         )
         self.profile_stage = os.environ.get("PRIME_PROFILE_PP_STAGE") == "1"
         self._forward_events = []
@@ -490,7 +513,9 @@ class PipelineStageModule(nn.Module):
                     )
                 normalized = (int(key[0]), int(key[1]))
                 if normalized in entries:
-                    raise RuntimeError(f"duplicate pipeline side-input key {normalized}")
+                    raise RuntimeError(
+                        f"duplicate pipeline side-input key {normalized}"
+                    )
                 entries[normalized] = value
             self._side = entries
         else:
@@ -642,7 +667,9 @@ class PipelineStageModule(nn.Module):
         if not self.transfer_sparse_indices:
             return out.last_hidden_state
         if not self.send_sparse_indices:
-            placeholder = torch.zeros(1, dtype=torch.float16, device=out.last_hidden_state.device)
+            placeholder = torch.zeros(
+                1, dtype=torch.float16, device=out.last_hidden_state.device
+            )
             return out.last_hidden_state, placeholder
         if out.past_key_values is None:
             raise RuntimeError(
@@ -694,6 +721,19 @@ def _bounded_pipeline_stage_cls():
     )
 
     class BoundedPipelineStage(_keyed_pipeline_stage_cls()):
+        def clear_runtime_states(self) -> None:
+            super().clear_runtime_states()
+            for prefix in ("forward", "backward", "sparse_cache"):
+                keys = getattr(self, f"_{prefix}_receive_keys", None)
+                if keys is not None:
+                    keys.clear()
+                owners = getattr(self, f"_{prefix}_slot_owner", None)
+                if owners is not None:
+                    owners[:] = [None] * len(owners)
+                events = getattr(self, f"_{prefix}_events", None)
+                if events is not None:
+                    events[:] = [None] * len(events)
+
         def require_exact_transport_capacities(self) -> None:
             self._require_exact_transport_capacities = True
 
@@ -707,19 +747,29 @@ def _bounded_pipeline_stage_cls():
                 backward = int(capacities["backward"])
                 sparse = int(capacities["sparse"])
             except (KeyError, TypeError, ValueError) as exc:
-                raise RuntimeError("interleaved transport capacities are incomplete") from exc
+                raise RuntimeError(
+                    "interleaved transport capacities are incomplete"
+                ) from exc
             if min(forward, backward, sparse) < 0:
-                raise RuntimeError("interleaved transport capacities cannot be negative")
+                raise RuntimeError(
+                    "interleaved transport capacities cannot be negative"
+                )
             if self.is_first and forward != 0:
-                raise RuntimeError("first interleaved stage cannot receive hidden states")
+                raise RuntimeError(
+                    "first interleaved stage cannot receive hidden states"
+                )
             if not self.is_first and forward == 0:
-                raise RuntimeError("non-first interleaved stage needs hidden receive slots")
+                raise RuntimeError(
+                    "non-first interleaved stage needs hidden receive slots"
+                )
             if self.is_last and backward != 0:
                 raise RuntimeError("last interleaved stage cannot receive gradients")
             if not self.is_last and backward == 0:
                 raise RuntimeError("non-last interleaved stage needs gradient slots")
             if not self.is_first and sparse == 0:
-                raise RuntimeError("non-first interleaved stage needs sparse-cache slots")
+                raise RuntimeError(
+                    "non-first interleaved stage needs sparse-cache slots"
+                )
             self._forward_slot_count = forward
             self._backward_slot_count = backward
             self._sparse_cache_slot_count = sparse
@@ -794,7 +844,9 @@ def _bounded_pipeline_stage_cls():
             if owner is not None:
                 event = self._forward_events[slot]
                 if event is None:
-                    raise RuntimeError(f"hidden-state buffer overwrite before {owner} completed")
+                    raise RuntimeError(
+                        f"hidden-state buffer overwrite before {owner} completed"
+                    )
                 event.synchronize()
             self._forward_receive_keys.add(key)
             self._forward_slot_owner[slot] = key
@@ -822,7 +874,9 @@ def _bounded_pipeline_stage_cls():
             if owner is not None:
                 event = self._backward_events[slot]
                 if event is None:
-                    raise RuntimeError(f"gradient buffer overwrite before {owner} completed")
+                    raise RuntimeError(
+                        f"gradient buffer overwrite before {owner} completed"
+                    )
                 event.synchronize()
             self._backward_receive_keys.add(key)
             self._backward_slot_owner[slot] = key
@@ -1147,7 +1201,13 @@ def build_schedule(
                 "1f1b_async requires pp_limit_receive_buffers and PP size 8"
             )
         validate_async_topology(async_topology)
-    stage_modules = list(stage_module) if isinstance(stage_module, (list, tuple)) else [stage_module]
+    stage_modules = (
+        list(stage_module)
+        if isinstance(stage_module, (list, tuple))
+        else [stage_module]
+    )
+    if schedule_name == "1f1b_async":
+        validate_async_stage_modules(stage_modules)
     if schedule_name == "interleaved_1f1b" and len(stage_modules) != 2:
         raise ValueError("interleaved_1f1b requires exactly two local pipeline stages")
     if schedule_name != "interleaved_1f1b" and len(stage_modules) != 1:
@@ -1159,7 +1219,9 @@ def build_schedule(
         list(example_input) if schedule_name == "interleaved_1f1b" else [example_input]
     )
     example_outputs = (
-        list(example_output) if schedule_name == "interleaved_1f1b" else [example_output]
+        list(example_output)
+        if schedule_name == "interleaved_1f1b"
+        else [example_output]
     )
     local_stage_count = len(stage_modules)
     exact_transport_capacities = schedule_name == "interleaved_1f1b" or (
@@ -1180,14 +1242,14 @@ def build_schedule(
                 f"stage identity {module.stage_identity} does not match pipeline index {stage_index}"
             )
         stage = stage_cls(
-                module,
-                stage_index=stage_index,
-                num_stages=pp_size * local_stage_count,
-                device=torch.device("cuda"),
-                group=pp_group,
-                input_args=example_inputs[local_index],
-                output_args=example_outputs[local_index],
-            )
+            module,
+            stage_index=stage_index,
+            num_stages=pp_size * local_stage_count,
+            device=torch.device("cuda"),
+            group=pp_group,
+            input_args=example_inputs[local_index],
+            output_args=example_outputs[local_index],
+        )
         if exact_transport_capacities:
             stage.require_exact_transport_capacities()
         stages.append(stage)
@@ -1203,9 +1265,7 @@ def build_schedule(
     minimum_pipeline_microbatches(schedule_name, pp_size)
     interleaved_rounds = None
     if schedule_name == "interleaved_1f1b":
-        interleaved_rounds = validate_interleaved_microbatches(
-            n_microbatches, pp_size
-        )
+        interleaved_rounds = validate_interleaved_microbatches(n_microbatches, pp_size)
         if n_microbatches % interleaved_rounds:
             schedules["interleaved_1f1b"] = _flexible_interleaved_schedule_cls(
                 ScheduleInterleaved1F1B
