@@ -79,6 +79,8 @@ class SparseMlaTwoStageTest(unittest.TestCase):
         self.assertIn("peak_reserved_delta", BENCHMARK)
         self.assertIn("peak_allocated_delta", BENCHMARK)
         self.assertIn("measured allocated-memory bound failed", BENCHMARK)
+        self.assertIn('"PRIME_SPARSE_BWD_REUSE_DQ_SHARED"', BENCHMARK)
+        self.assertIn('"PRIME_SPARSE_BWD_BLOCK_SIZE"', BENCHMARK)
         self.assertIn("free_hbm_before", BENCHMARK)
 
     def test_prototype_is_not_enabled_by_any_run_config(self):

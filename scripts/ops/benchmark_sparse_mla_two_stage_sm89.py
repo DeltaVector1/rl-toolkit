@@ -74,6 +74,13 @@ def run(args: argparse.Namespace) -> None:
     memory = two_stage_memory(SEQUENCE_KV)
     if memory.total_bytes > MAX_WORKSPACE_BYTES:
         raise SystemExit(f"workspace bound failed: {memory.total_bytes} bytes")
+    for name in (
+        "PRIME_SPARSE_BWD_REUSE_DQ_SHARED",
+        "PRIME_SPARSE_BWD_BLOCK_SIZE",
+        "PRIME_SPARSE_BWD_BLOCK_HEADS",
+        "PRIME_SPARSE_BWD_THREADS",
+    ):
+        os.environ.pop(name, None)
     q, kv, do, indices = make_inputs(SEQUENCE_KV)
     scale = 576**-0.5
     os.environ["PRIME_SPARSE_BWD_TWO_STAGE"] = "0"
