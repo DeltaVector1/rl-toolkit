@@ -40,6 +40,7 @@ from prime_rl.configs.trainer import (
     MXFP8Config,
     TokenizerConfig,
 )
+from prime_rl.glm52_routing import require_glm_routing_config
 from prime_rl.trainer.distributed import DeepEPExpertParallel, MXFP8AllToAllExpertParallel
 from prime_rl.trainer.distributed.expert_parallel import (
     NativeFP8LoRAAllToAllExpertParallel,
@@ -109,6 +110,31 @@ def iter_layers(layers):
     import torch.nn as _nn
 
     return layers.values() if isinstance(layers, _nn.ModuleDict) else layers
+
+
+def validate_glm_routing_setup(model: nn.Module, config: ModelConfig) -> None:
+    model_config = getattr(model, "config", None)
+    if getattr(model_config, "model_type", None) != "glm_moe_dsa":
+        return
+
+    language_model = get_language_model(model)
+    moe_layers = 0
+    correction_bias_present = True
+    for layer in iter_layers(language_model.layers):
+        mlp = getattr(layer, "mlp", None)
+        if not isinstance(mlp, (MoE, LatentMoE)):
+            continue
+        moe_layers += 1
+        correction_bias_present &= getattr(mlp, "expert_bias", None) is not None
+
+    if moe_layers == 0:
+        correction_bias_present = False
+    require_glm_routing_config(
+        model_config,
+        router_frozen=config.freeze_moe_router,
+        correction_bias_present=correction_bias_present,
+        side="trainer",
+    )
 
 
 def _virtual_stage_blocks(language_model: nn.Module) -> list[list[nn.Module]]:
@@ -1966,6 +1992,7 @@ def setup_model(
 
     # 1. We load to meta device by default
     model = get_model(config, device=torch.device("meta"), dtype=DTYPE_MAP[config.optimization_dtype])
+    validate_glm_routing_setup(model, config)
     model._glm_freeze_moe_router = bool(config.freeze_moe_router)
     configure_moe_ep_backend(model, config)
 

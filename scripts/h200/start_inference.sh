@@ -27,6 +27,14 @@ image=${prime_image:-prime-rl:glm52-v080-full}
 model_volume=${prime_model_volume:-glm52-fp8-model}
 adapter_ports=${prime_adapter_ports:-18200,18201,18202,18203,18204,18205,18206,18207}
 adapter_codec=${prime_adapter_codec:-gzip}
+model_mount=$(docker volume inspect --format '{{.Mountpoint}}' "$model_volume" 2>/dev/null || true)
+if [[ -z "$model_mount" || ! -f "$model_mount/config.json" ]]; then
+  echo "refusing H200 start without the checkpoint config: $model_volume" >&2
+  exit 2
+fi
+python3 "$deployment/scripts/glm52_h200_startup_preflight.py" \
+  --config "$inference_config" \
+  --model-config "$model_mount/config.json"
 case "$adapter_codec" in
   gzip|zstd|identity) ;;
   *)

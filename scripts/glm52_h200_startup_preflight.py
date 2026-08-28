@@ -9,9 +9,14 @@ accommodate the observed warm-up allocation.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import tomllib
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "source" / "src"))
+
+from prime_rl.glm52_routing import glm_routing_errors
 
 
 TARGET_MODULES = {
@@ -37,6 +42,17 @@ POST_ALLOCATION_CUSHION_MIB = 1024.0
 def load_config(path: Path) -> dict:
     with path.open("rb") as stream:
         return tomllib.load(stream)
+
+
+def load_model_config(path: Path) -> dict:
+    try:
+        with path.open("rb") as stream:
+            value = json.load(stream)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"invalid GLM model config: {path}") from error
+    if not isinstance(value, dict):
+        raise ValueError(f"GLM model config must be an object: {path}")
+    return value
 
 
 def static_errors(config: dict, max_num_batched_tokens: int, max_num_seqs: int) -> list[str]:
@@ -84,10 +100,20 @@ def main() -> int:
         type=float,
         help="Measured free memory before profile_run; omit for static checks only.",
     )
+    parser.add_argument(
+        "--model-config",
+        type=Path,
+        required=True,
+        help="GLM checkpoint config.json used by the H200 server.",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
     errors = static_errors(config, args.max_num_batched_tokens, args.max_num_seqs)
+    try:
+        errors.extend(glm_routing_errors(load_model_config(args.model_config)))
+    except ValueError as error:
+        errors.append(str(error))
     if errors:
         for error in errors:
             print(f"ERROR: {error}", file=sys.stderr)
