@@ -143,7 +143,7 @@ class DeployTest(unittest.TestCase):
     def test_remote_adapter_copy_keeps_special_path_data_out_of_remote_shell(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            source = root / "adapter ' ; $HOME value\nnext"
+            source = root / "adapter ' ; $HOME value\nnext\n"
             source.write_bytes(b"adapter\n")
             ssh_log = root / "ssh.jsonl"
             scp_log = root / "scp.jsonl"
@@ -155,12 +155,13 @@ class DeployTest(unittest.TestCase):
                 "import json, os, sys\n"
                 "with open(os.environ['SSH_LOG'], 'a') as stream:\n"
                 "    stream.write(json.dumps(sys.argv[1:]) + '\\n')\n"
-                "operations = {'final_digest', 'make_directory', 'partial_digest', 'install'}\n"
+                "operations = {'final_digest', 'create_staging', 'partial_digest', 'cleanup', 'install'}\n"
                 "operation = next((value for value in sys.argv if value in operations), None)\n"
                 "if operation is not None: sys.stdin.buffer.read()\n"
                 "if operation == 'final_digest': raise SystemExit(1)\n"
+                "if operation == 'create_staging': print(f'/tmp/adapter-copy.{os.getpid()}.partial')\n"
                 "if operation == 'partial_digest': print(os.environ['EXPECTED_DIGEST'])\n"
-                "raise SystemExit(0 if operation in {'make_directory', 'partial_digest', 'install'} else 1)\n"
+                "raise SystemExit(0 if operation in {'create_staging', 'partial_digest', 'cleanup', 'install'} else 1)\n"
             )
             fake_ssh.chmod(0o700)
             fake_scp = fake_bin / "scp"
@@ -188,17 +189,24 @@ class DeployTest(unittest.TestCase):
                     "EXPECTED_DIGEST": digest,
                 }
             )
-            completed = subprocess.run(
-                ["bash", "-c", script],
-                env=environment,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            self.assertEqual(completed.returncode, 0, completed.stderr)
+            processes = [
+                subprocess.Popen(
+                    ["bash", "-c", script],
+                    env=environment,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                for _ in range(2)
+            ]
+            completed = [process.communicate(timeout=30) for process in processes]
+            for returncode, (_, stderr) in zip(
+                (process.returncode for process in processes), completed
+            ):
+                self.assertEqual(returncode, 0, stderr)
             ssh_calls = [json.loads(line) for line in ssh_log.read_text().splitlines()]
             operation_names = {
-                "final_digest", "make_directory", "partial_digest", "install"
+                "final_digest", "create_staging", "partial_digest", "cleanup", "install"
             }
             remote_calls = {
                 next(value for value in call if value in operation_names): call
@@ -206,7 +214,7 @@ class DeployTest(unittest.TestCase):
                 if any(value in operation_names for value in call)
             }
             self.assertEqual(set(remote_calls), {
-                "final_digest", "make_directory", "partial_digest", "install"
+                "final_digest", "create_staging", "partial_digest", "install"
             })
             for call in remote_calls.values():
                 self.assertNotIn(str(source), call)
@@ -216,12 +224,66 @@ class DeployTest(unittest.TestCase):
                     base64.b64decode(call[marker + 1]).decode(),
                     str(source),
                 )
+            staging_values = {
+                base64.b64decode(call[call.index("partial_digest") + 2]).decode()
+                for call in ssh_calls
+                if "partial_digest" in call
+            }
+            self.assertEqual(len(staging_values), 2)
             scp_calls = [json.loads(line) for line in scp_log.read_text().splitlines()]
-            self.assertEqual(len(scp_calls), 1)
+            self.assertEqual(len(scp_calls), 2)
             self.assertTrue(any(str(source) in call for call in scp_calls))
             self.assertTrue(
-                all("/tmp/prime-rl-adapter." in value for call in scp_calls for value in call if ":" in value)
+                all("/tmp/adapter-copy." in value for call in scp_calls for value in call if ":" in value)
             )
+
+    def test_remote_adapter_copy_cleans_failed_staging(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "adapter.safetensors"
+            source.write_bytes(b"adapter\n")
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_ssh = fake_bin / "ssh"
+            fake_ssh.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, sys\n"
+                "with open(sys.argv[0] + '.log', 'a') as stream:\n"
+                "    stream.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                "operations = {'final_digest', 'create_staging', 'partial_digest', 'cleanup', 'install'}\n"
+                "operation = next((value for value in sys.argv if value in operations), None)\n"
+                "if operation is not None: sys.stdin.buffer.read()\n"
+                "if operation == 'final_digest': raise SystemExit(1)\n"
+                "if operation == 'create_staging': print('/tmp/stale-adapter-stage.partial')\n"
+                "if operation == 'partial_digest': print('wrong-digest')\n"
+                "raise SystemExit(0 if operation in {'create_staging', 'partial_digest', 'cleanup', 'install'} else 1)\n"
+            )
+            fake_ssh.chmod(0o700)
+            fake_scp = fake_bin / "scp"
+            fake_scp.write_text("#!/bin/sh\nexit 0\n")
+            fake_scp.chmod(0o700)
+            fake_sleep = fake_bin / "sleep"
+            fake_sleep.write_text("#!/bin/sh\nexit 0\n")
+            fake_sleep.chmod(0o700)
+            with patch.object(training_ops, "run_root", str(root)), patch.object(
+                training_ops, "_ssh", return_value=(0, "")
+            ) as outer_ssh:
+                training_ops._copy_resume_adapter(
+                    str(source), [training_ops.trainer_head, "n76"]
+                )
+            script = outer_ssh.call_args.args[1]
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+            completed = subprocess.run(
+                ["bash", "-c", script],
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(completed.returncode, 1)
+            calls = [json.loads(line) for line in (fake_ssh.with_name("ssh.log")).read_text().splitlines()]
+            self.assertIn("cleanup", [value for call in calls for value in call])
 
     def test_ssh_command_does_not_use_configured_socket_without_manager(self):
         with patch.dict(training_ops._ssh_control_paths, {}, clear=True), patch.object(
