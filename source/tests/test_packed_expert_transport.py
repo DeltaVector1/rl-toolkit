@@ -37,6 +37,18 @@ class PackedExpertTransportTests(unittest.TestCase):
         self.assertIn("payload width does not match its scale", SOURCE)
         self.assertIn("payload rows do not match its scale", SOURCE)
 
+    def test_reused_backward_storage_is_packed_before_write(self):
+        backward = SOURCE.split("def _streaming_fp8_backward", 1)[1].split(
+            "\n\ndef _validate_bf16_dispatch", 1
+        )[0]
+        self.assertIn("value_bytes = cols", backward)
+        self.assertIn("packed_send_all = torch.empty", backward)
+        self.assertLess(
+            backward.index("_copy_value_scale_payload"),
+            backward.index("grad_output.as_strided_((input_rows, cols)"),
+        )
+        self.assertIn("packed_send_all[offset : offset + count]", backward)
+
     def test_benchmark_requires_sm89_and_eight_ranks(self):
         self.assertIn("capability != (8, 9)", BENCHMARK)
         self.assertIn("world != 8", BENCHMARK)

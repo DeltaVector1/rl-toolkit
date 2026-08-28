@@ -98,13 +98,33 @@ def _pack_value_scale_payload(values: torch.Tensor, scales: torch.Tensor):
         device=values.device,
         dtype=torch.uint8,
     )
+    _copy_value_scale_payload(payload, values, scales)
+    return payload, value_bytes
+
+
+def _copy_value_scale_payload(
+    payload: torch.Tensor, values: torch.Tensor, scales: torch.Tensor
+) -> None:
+    if payload.ndim != 2 or payload.dtype != torch.uint8:
+        raise TypeError("packed transport payload must be a uint8 matrix")
+    if not payload.is_contiguous():
+        raise ValueError("packed transport payload must be contiguous")
+    if values.ndim != 2 or not values.is_contiguous():
+        raise ValueError("packed transport values must be a contiguous matrix")
+    if scales.ndim != 1 or not scales.is_contiguous():
+        raise ValueError("packed transport scales must be a contiguous vector")
+    if values.shape[0] != scales.shape[0] or payload.shape[0] != values.shape[0]:
+        raise ValueError("packed transport values, scales, and payload must have equal rows")
+    value_bytes = values.shape[1] * values.element_size()
+    scale_bytes = scales.element_size()
+    if payload.shape[1] != value_bytes + scale_bytes:
+        raise ValueError("packed transport payload width does not match its values and scale")
     payload[:, :value_bytes].copy_(
         values.view(torch.uint8).view(values.shape[0], value_bytes)
     )
     payload[:, value_bytes:].copy_(
         scales.view(torch.uint8).view(scales.shape[0], scale_bytes)
     )
-    return payload, value_bytes
 
 
 def _unpack_value_scale_payload(
@@ -680,6 +700,7 @@ def _streaming_int4_forward(
     packed_cols = (cols + 1) // 2
     packed_transport = _PACKED_EXPERT_TRANSPORT
     payload_cols = packed_cols + 2
+    value_bytes = packed_cols
     block = triton.next_power_of_2(packed_cols)
     output_rows = sum(output_splits)
     if received_input is not None:
@@ -781,7 +802,7 @@ def _streaming_int4_forward(
 
         round_payload = None
         if packed_transport:
-            round_payload, value_bytes = _pack_value_scale_payload(
+            round_payload, _ = _pack_value_scale_payload(
                 round_quantized, round_scale
             )
             send = []
@@ -932,6 +953,7 @@ def _streaming_fp8_backward(
     """
     rows, cols = grad_output.shape
     packed_transport = _PACKED_EXPERT_TRANSPORT
+    value_bytes = cols
     payload_cols = cols + 4
     input_rows = sum(input_splits)
     storage_rows = 0
@@ -941,9 +963,28 @@ def _streaming_fp8_backward(
         )
         storage_rows = (storage_elements - grad_output.storage_offset()) // cols
     reuse_output = input_rows <= storage_rows
+    packed_send_all = None
     if reuse_output:
         if packed_transport:
-            quantized = scale = None
+            packed_send_all = torch.empty(
+                (rows, payload_cols), device=grad_output.device, dtype=torch.uint8
+            )
+            source_cursor = 0
+            for count in output_splits:
+                if count:
+                    quantized_part, scale_part = ops.scaled_fp8_quant(
+                        grad_output[source_cursor : source_cursor + count],
+                        use_per_token_if_dynamic=True,
+                    )
+                    _copy_value_scale_payload(
+                        packed_send_all[source_cursor : source_cursor + count],
+                        quantized_part,
+                        scale_part.flatten(),
+                    )
+                    del quantized_part, scale_part
+                    source_cursor += count
+                else:
+                    source_cursor += count
             dequantized = grad_output.as_strided((input_rows, cols), (cols, 1))
         else:
             quantized, scale = ops.scaled_fp8_quant(
@@ -965,7 +1006,13 @@ def _streaming_fp8_backward(
         receive_counts, receive_offsets = _round_splits(input_splits, round_idx, rounds)
         receive_rows = sum(receive_counts)
 
-        if packed_transport:
+        if packed_transport and reuse_output:
+            send = [
+                packed_send_all[offset : offset + count]
+                for count, offset in zip(send_counts, send_offsets)
+            ]
+            send_scale = None
+        elif packed_transport:
             send = []
             send_scale = None
             for count, offset in zip(send_counts, send_offsets):
@@ -978,6 +1025,7 @@ def _streaming_fp8_backward(
                         quantized_part, scale_part.flatten()
                     )
                     send.append(payload)
+                    del quantized_part, scale_part
                 else:
                     send.append(
                         torch.empty(
