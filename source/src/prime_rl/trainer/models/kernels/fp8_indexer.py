@@ -201,10 +201,11 @@ def fp8_indexer(q, k, w, ks, ke, topk, weight_scale=1.0):
 
     logits = torch.empty(S_q, S_k, dtype=torch.float32, device=device)
 
-    grid = lambda meta: (
-        triton.cdiv(S_q, meta["BLOCK_M"]),
-        triton.cdiv(S_k, meta["BLOCK_N"]),
-    )
+    def grid(meta):
+        return (
+            triton.cdiv(S_q, meta["BLOCK_M"]),
+            triton.cdiv(S_k, meta["BLOCK_N"]),
+        )
     _triton_fp8_indexer_kernel[grid](
         q_fp8,
         k_fp8,

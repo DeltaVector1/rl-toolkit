@@ -9,8 +9,11 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "source" / "src"))
 
-from prime_rl.glm52_routing import glm_routing_errors, require_glm_routing_config
-from scripts.glm52_h200_startup_preflight import load_model_config
+from prime_rl.glm52_routing import (  # noqa: E402
+    glm_routing_errors,
+    require_glm_routing_config,
+)
+from scripts.glm52_h200_startup_preflight import load_model_config  # noqa: E402
 
 
 class Glm52RoutingConfigTest(unittest.TestCase):
@@ -63,7 +66,7 @@ class Glm52RoutingConfigTest(unittest.TestCase):
     def test_tracked_sources_match_accepted_image_files(self):
         expected = {
             ROOT / "source/src/prime_rl/trainer/models/kernels/fp8_indexer.py": (
-                "94701a3a012f945585eff966005ba6670fdcbe40692c6cea50348079755b9eb1"
+                "b7d68e6ced3a33a527c50b7caaab0833e0b818d318a906b51ab4a912769606a3"
             ),
             ROOT / "source/src/prime_rl/trainer/models/layers/rotary_emb.py": (
                 "148a2ee0f7ad4c9b26194215c730f60f21b0dd3d94fcf29c8700f3f917cf094e"
