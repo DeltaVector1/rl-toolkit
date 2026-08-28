@@ -449,14 +449,18 @@ class PhaseProfilerTest(unittest.TestCase):
             self.assertEqual(set(record["categories"]), set(PHASES))
 
     def test_phase_record_payload_remains_bounded_for_untrusted_values(self):
+        oversized_integer = 10**5000
         report = {
-            "rank": 1,
-            "stage": 0,
-            "step": 2,
+            "rank": oversized_integer,
+            "stage": oversized_integer,
+            "step": oversized_integer,
+            "step_ms": 10**309,
+            "classified_sum_ms": -(10**309),
+            "modeled_overhead_fraction": float("inf"),
             "categories": {
                 phase: {
-                    "calls": 10**100,
-                    "sampled": 10**100,
+                    "calls": oversized_integer,
+                    "sampled": oversized_integer,
                     "inclusive_ms": "x" * 10**7,
                     "exclusive_ms": float("nan"),
                 }
@@ -467,7 +471,55 @@ class PhaseProfilerTest(unittest.TestCase):
         self.assertLessEqual(
             len(payload), phase_profiler._PHASE_PROFILE_MAX_OUTPUT_BYTES
         )
-        self.assertEqual(json.loads(payload)["status"], "ok")
+        record = json.loads(payload)
+        self.assertEqual(record["status"], "ok")
+        self.assertEqual(record["rank"], phase_profiler._PHASE_PROFILE_MAX_INTEGER)
+        self.assertEqual(record["stage"], phase_profiler._PHASE_PROFILE_MAX_INTEGER)
+        self.assertEqual(record["step"], phase_profiler._PHASE_PROFILE_MAX_INTEGER)
+        self.assertEqual(record["step_ms"], 0.0)
+        self.assertEqual(record["classified_sum_ms"], 0.0)
+        self.assertEqual(record["modeled_overhead_fraction"], 0.0)
+        self.assertEqual(
+            record["categories"]["pp_wait"]["calls"],
+            phase_profiler._PHASE_PROFILE_MAX_INTEGER,
+        )
+        self.assertEqual(record["categories"]["pp_wait"]["inclusive_ms"], 0.0)
+        self.assertEqual(record["categories"]["pp_wait"]["exclusive_ms"], 0.0)
+        json.dumps(record, allow_nan=False)
+
+    def test_phase_record_payload_uses_valid_minimal_fallback_on_encoding_error(self):
+        class EncodingFailure(Exception):
+            pass
+
+        with tempfile.TemporaryDirectory() as output_dir, patch.dict(
+            "os.environ",
+            {
+                "PRIME_QUALIFICATION_PROFILE": "glm52-native-b2048-nsys",
+                "PRIME_PHASE_PROFILE_RECORD_PATH": f"{output_dir}/phase.json",
+            },
+            clear=True,
+        ):
+            profiler = PhaseProfiler()
+            with patch.object(
+                phase_profiler.json,
+                "dumps",
+                side_effect=EncodingFailure("injected encoding error"),
+            ):
+                self.assertTrue(
+                    profiler.write_report({"rank": 1, "stage": 2, "step": 3})
+                )
+            artifact = pathlib.Path(output_dir) / "phase.rank_1.step_3.json"
+            self.assertTrue(artifact.is_file())
+            payload = artifact.read_bytes()
+
+        self.assertEqual(payload, phase_profiler._PHASE_PROFILE_MINIMAL_PAYLOAD)
+        self.assertLessEqual(
+            len(payload), phase_profiler._PHASE_PROFILE_MAX_OUTPUT_BYTES
+        )
+        self.assertEqual(
+            json.loads(payload),
+            {"format": "prime-phase-profile-v1", "status": "truncated"},
+        )
 
 
 if __name__ == "__main__":
