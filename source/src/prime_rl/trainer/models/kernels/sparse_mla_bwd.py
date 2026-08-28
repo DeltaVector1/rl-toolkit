@@ -19,6 +19,47 @@ import torch
 from tilelang import language as T
 
 
+_SM89_BWD_QUALIFICATION_PROFILES = frozenset(
+    {
+        "glm52-native-small",
+        "glm52-native-b2048",
+        "glm52-native-b2048-memory",
+        "glm52-native-b2048-nsys",
+        "glm52-native-delta3",
+        "glm52-native-stability20",
+    }
+)
+
+
+def _sm89_bwd_block_heads() -> int:
+    """Select the SM89 backward tile, with 32 heads reserved for qualification."""
+    use_block_h32 = os.environ.get("PRIME_SPARSE_BWD_USE_BLOCK_H32", "0")
+    legacy_block_heads = os.environ.get("PRIME_SPARSE_BWD_BLOCK_HEADS", "")
+    if use_block_h32 not in {"0", "1"}:
+        raise ValueError("PRIME_SPARSE_BWD_USE_BLOCK_H32 must be 0 or 1")
+
+    if use_block_h32 == "0":
+        if legacy_block_heads not in {"", "16"}:
+            raise ValueError(
+                "PRIME_SPARSE_BWD_BLOCK_HEADS only supports 16 unless "
+                "PRIME_SPARSE_BWD_USE_BLOCK_H32=1 is enabled for qualification"
+            )
+        return 16
+
+    profile = os.environ.get("PRIME_QUALIFICATION_PROFILE", "")
+    if profile not in _SM89_BWD_QUALIFICATION_PROFILES:
+        raise RuntimeError(
+            "PRIME_SPARSE_BWD_USE_BLOCK_H32 is qualification-only and requires "
+            "an allowlisted GLM qualification profile"
+        )
+    if legacy_block_heads not in {"", "32"}:
+        raise ValueError(
+            "PRIME_SPARSE_BWD_BLOCK_HEADS must be empty or 32 when "
+            "PRIME_SPARSE_BWD_USE_BLOCK_H32=1"
+        )
+    return 32
+
+
 @tilelang.jit(out_idx=[-1])
 def preprocess(
     H,
@@ -429,15 +470,17 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None):
             "PRIME_SPARSE_BWD_REUSE_DQ_SHARED requires an SM89 CUDA device"
         )
 
-    preprocess_kernel = preprocess(H, D)
     if capability[0] < 9:
         block_size = int(os.environ.get("PRIME_SPARSE_BWD_BLOCK_SIZE", "16"))
-        block_heads = int(os.environ.get("PRIME_SPARSE_BWD_BLOCK_HEADS", "16"))
+        block_heads = _sm89_bwd_block_heads()
         threads = int(os.environ.get("PRIME_SPARSE_BWD_THREADS", "64"))
         if reuse_dq_shared and (block_size, block_heads, threads) != (16, 16, 64):
             raise ValueError(
                 "PRIME_SPARSE_BWD_REUSE_DQ_SHARED requires SM89 block=16 heads=16 threads=64"
             )
+
+    preprocess_kernel = preprocess(H, D)
+    if capability[0] < 9:
         bwd_kernel = bwd(
             H,
             D,
