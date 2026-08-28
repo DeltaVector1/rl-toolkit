@@ -34,6 +34,7 @@ def test_current_glm52_profile_is_batch_2048_without_rollout_cache() -> None:
         "glm52-native-small",
         "glm52-policy-parity",
         "glm52-native-b2048",
+        "glm52-native-b2048-nccl16",
         "glm52-native-stability20",
     }
     current = operations["profiles"]["current"]
@@ -95,6 +96,21 @@ def test_b2048_nccl_channels_are_profile_pinned_and_passed_to_container() -> Non
     assert '-e NCCL_MIN_NCHANNELS="$nccl_channels"' in launcher
     assert '-e NCCL_MAX_NCHANNELS="$nccl_channels"' in launcher
     assert '-e PRIME_NCCL_CHANNELS="$nccl_channels"' in launcher
+
+
+def test_b2048_nccl16_profile_only_changes_output_and_channel_guard() -> None:
+    operations = _load("configs/operations.toml")
+    stable = _load("configs/qualification/glm52-native-b2048.toml")
+    candidate = _load("configs/qualification/glm52-native-b2048-nccl16.toml")
+    stable_output = stable.pop("output_dir")
+    candidate_output = candidate.pop("output_dir")
+    assert candidate == stable
+    assert stable_output != candidate_output
+    assert operations["profiles"]["glm52-native-b2048-nccl16"] == {
+        "kind": "glm52",
+        "trainer": "configs/qualification/glm52-native-b2048-nccl16.toml",
+        "launch_env": {"PRIME_NCCL_CHANNELS": "16"},
+    }
 
 
 def test_current_configuration_matches_training_expectations() -> None:
@@ -175,6 +191,7 @@ def test_glm52_stability_and_production_use_local_expert_recompute() -> None:
     for relative in (
         "configs/qualification/glm52-native-stability20.toml",
         "configs/qualification/glm52-native-b2048.toml",
+        "configs/qualification/glm52-native-b2048-nccl16.toml",
         "configs/paused/trainer.glm52-production.toml",
     ):
         config = _load(relative)
@@ -227,6 +244,7 @@ def test_glm52_production_profiles_disable_cuda_profiling() -> None:
     for relative in (
         "configs/qualification/glm52-policy-parity-trainer.toml",
         "configs/qualification/glm52-native-b2048.toml",
+        "configs/qualification/glm52-native-b2048-nccl16.toml",
         "configs/qualification/glm52-native-stability20.toml",
         "configs/paused/trainer.glm52-production.toml",
     ):
@@ -239,6 +257,7 @@ def test_all_glm52_trainers_use_h200_w8a8_semantics() -> None:
         "configs/qualification/glm52-policy-parity-trainer.toml",
         "configs/qualification/glm52-native-small.toml",
         "configs/qualification/glm52-native-b2048.toml",
+        "configs/qualification/glm52-native-b2048-nccl16.toml",
         "configs/qualification/glm52-native-stability20.toml",
         "configs/paused/trainer.glm52-production.toml",
     }

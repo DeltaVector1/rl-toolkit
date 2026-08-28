@@ -71,6 +71,13 @@ trainer = "configs/qualification/glm52-native-b2048.toml"
 [profiles.glm52-native-b2048.launch_env]
 PRIME_NCCL_CHANNELS = "16"
 
+[profiles.glm52-native-b2048-nccl16]
+kind = "glm52"
+trainer = "configs/qualification/glm52-native-b2048-nccl16.toml"
+
+[profiles.glm52-native-b2048-nccl16.launch_env]
+PRIME_NCCL_CHANNELS = "16"
+
 [profiles.glm52-native-stability20]
 kind = "glm52"
 trainer = "configs/qualification/glm52-native-stability20.toml"

@@ -70,7 +70,10 @@ class EdgeOperationsTest(unittest.TestCase):
                 "dp_shard": 1,
             },
         }
-        count = 2 if profile_name == "glm52-native-b2048" else 20
+        count = 2 if profile_name in {
+            "glm52-native-b2048",
+            "glm52-native-b2048-nccl16",
+        } else 20
         runtime_ranks = [
             {
                 "global_rank": rank,
@@ -158,7 +161,11 @@ class EdgeOperationsTest(unittest.TestCase):
         return session, result, profile, now
 
     def test_trainer_qualification_evidence_is_exact_and_fresh(self):
-        for name in ("glm52-native-b2048", "glm52-native-stability20"):
+        for name in (
+            "glm52-native-b2048",
+            "glm52-native-b2048-nccl16",
+            "glm52-native-stability20",
+        ):
             session, result, profile, now = self.qualification_evidence(name)
             self.assertEqual(
                 training_ops._validate_trainer_qualification(
@@ -2601,14 +2608,16 @@ raise SystemExit(99)
         self.assertNotIn("PRIME_NCCL_CHANNELS=", launch)
 
     def test_qualification_launch_env_allows_selected_nccl_channels(self):
-        profile = tomllib.loads(
+        operations = tomllib.loads(
             (training_ops.repo_root / "configs/operations.toml")
             .read_text()
-        )["profiles"]["glm52-native-b2048"]
-        self.assertEqual(
-            training_ops._qualification_launch_env(profile),
-            {"PRIME_NCCL_CHANNELS": "16"},
         )
+        for name in ("glm52-native-b2048", "glm52-native-b2048-nccl16"):
+            profile = operations["profiles"][name]
+            self.assertEqual(
+                training_ops._qualification_launch_env(profile),
+                {"PRIME_NCCL_CHANNELS": "16"},
+            )
         for value in ("1", "33", "016", "24;touch /tmp/bad"):
             with self.subTest(value=value), self.assertRaises(training_ops.Refused):
                 training_ops._qualification_launch_env(

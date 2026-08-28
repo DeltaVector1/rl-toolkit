@@ -6898,6 +6898,7 @@ def _validate_trainer_qualification(
     )
     expected_step_counts = {
         "glm52-native-b2048": 2,
+        "glm52-native-b2048-nccl16": 2,
         "glm52-native-stability20": 20,
     }
     if profile_name not in expected_step_counts:
@@ -8617,6 +8618,7 @@ def _qualify_connected(
         config = tomllib.load(stream)
     strict_qualification = name in {
         "glm52-native-b2048",
+        "glm52-native-b2048-nccl16",
         "glm52-native-stability20",
     }
     if strict_qualification and nodes != [trainer_head] + [
