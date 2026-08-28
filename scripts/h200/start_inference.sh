@@ -222,10 +222,10 @@ for stale_container in "$engine_container" "$engine_container-0" "$engine_contai
   fi
 done
 
-# Do not enable native MTP here with the pinned vLLM and FlashMLA. The MTP
-# draft layer pads 8 query heads to 64. At 32,768 tokens its BF16 query has a
-# 2,415,919,104-byte stride, which exceeds FlashMLA's int32 limit and
-# terminates every tensor-parallel worker.
+# Do not enable native MTP in this production launcher. The isolated
+# qualification uses the vLLM slot-mapping fixes from PRs #46908 and #47013,
+# plus the bounded FlashMLA workspace-chunking patch. Production remains on
+# the previously qualified non-MTP path until the MTP profile passes its gate.
 cleanup_unreported_container() {
   status=$?
   trap - EXIT

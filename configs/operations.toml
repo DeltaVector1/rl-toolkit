@@ -210,10 +210,30 @@ qualification_result = "/data/glm52-rl/qualifications/glm52-step20-h200/adapter-
 trainer_adapter = "/data/glm52-rl/qualifications/glm52-native-stability20/run_trainer_only/broadcasts/step_20/adapter_model.safetensors"
 
 [qualification.glm52_mtp_h200]
+host = "h200a"
+container = "glm52-optims-mtp-h200"
+qualification_root = "/data/glm52-rl/qualifications/glm52-mtp-h200"
+trace_dir = "/data/glm52-rl/qualifications/glm52-mtp-h200/run/router-trace"
 profile = "configs/qualification/glm52-mtp-h200.toml"
 launcher = "scripts/h200/start_mtp_qualification.sh"
 benchmark = "scripts/h200/benchmark_glm52_mtp.py"
 output = "benchmarks/glm52-mtp-h200.json"
+deploy_files = [
+  "configs/operations.toml",
+  "configs/qualification/glm52-mtp-h200.toml",
+  "scripts/glm52_h200_mtp_preflight.py",
+  "scripts/h200/benchmark_glm52_mtp.py",
+  "scripts/h200/flashmla_overlay_preflight.py",
+  "scripts/h200/start_mtp_qualification.sh",
+  "patches/vllm/0001-v026-flashmla-sparse-scratch-limit.patch",
+  "patches/vllm/0002-v026-flashmla-sparse-mixed-batch-chunks.patch",
+  "patches/vllm/0003-v026-exact-target-prompt-logprobs.patch",
+  "patches/vllm/0004-v026-request-exact-router-trace.patch",
+  "patches/vllm/0005-v026-exact-monolithic-route-sinks.patch",
+  "patches/vllm/0006-v026-mtp-slot-mapping-46908.patch",
+  "patches/vllm/0007-v026-mtp-slot-mapping-47013.patch",
+  "patches/vllm/test_flashmla_sparse_chunk_v026.py",
+]
 
 [requirements.shared]
 group_size = 16

@@ -28,8 +28,10 @@ backend_port = 8100
 
 # The target keeps the existing CUDA-graph capture setting.  The MTP draft is
 # eager because DeepSeek-v3.2 MTP CUDA graphs are not a safe path in vLLM 0.26.
-# Router traces are requested only on the target request by the benchmark; a
-# draft request must never write a route trace.
+# Router traces are requested only with the target request's
+# extra_args.prime_router_trace flag by the benchmark. Draft requests carry no
+# trace flag and must never write a route trace. An environment variable is not
+# used as the route selector.
 [vllm_extra]
 kv_cache_dtype = "bfloat16"
 max_num_seqs = 128

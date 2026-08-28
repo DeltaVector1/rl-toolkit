@@ -19,12 +19,11 @@
 - Verifiers: `0.2.2.dev17`
 - SwanLab: `0.9.0`
 
-MTP is disabled for the GLM-5.2 production profile. The pinned vLLM 0.24.0
-FlashMLA sparse path fails at the 32K context length: its MTP query stride is
-2,415,919,104 bytes, above the kernel int32 limit. Upstream vLLM has GLM MTP
-code, but current GLM-5.2 reports still include invalid output and long-run
-OOM failures. Do not enable MTP until a newer image passes one-token decode,
-trainer/H200 parity, and long-run memory checks.
+MTP is disabled for the GLM-5.2 production profile. The isolated qualification
+uses the vLLM slot-mapping fixes from PRs #46908 and #47013 and bounded
+FlashMLA workspace chunking. Do not enable MTP in production until the
+qualification passes one-token decode, trainer/H200 parity, and long-run
+memory checks.
 
 ## Model and environment revisions
 

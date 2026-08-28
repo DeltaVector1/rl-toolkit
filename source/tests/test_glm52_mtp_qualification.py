@@ -31,6 +31,12 @@ def _phase(*, elapsed: float, peak: float = 120000.0) -> dict:
         "route_ids_mismatch": 0,
         "route_weights_max_abs_error": 0.001,
         "route_trace_mode": "target-only",
+        "target_request_flags": {
+            "prime_router_trace": True,
+            "prime_router_trace_session": "b" * 64,
+            "prime_router_trace_request": "c" * 32,
+        },
+        "draft_request_flags": {},
         "target_route_trace_requests": 1,
         "draft_route_trace_requests": 0,
     }
@@ -51,12 +57,20 @@ def _report() -> dict:
 
 def test_profile_is_registered_without_changing_production_identity():
     operations = tomllib.loads((ROOT / "configs/operations.toml").read_text())
-    assert operations["qualification"]["glm52_mtp_h200"] == {
+    mtp = operations["qualification"]["glm52_mtp_h200"]
+    assert mtp == {
+        "host": "h200a",
+        "container": "glm52-optims-mtp-h200",
+        "qualification_root": "/data/glm52-rl/qualifications/glm52-mtp-h200",
+        "trace_dir": "/data/glm52-rl/qualifications/glm52-mtp-h200/run/router-trace",
         "profile": "configs/qualification/glm52-mtp-h200.toml",
         "launcher": "scripts/h200/start_mtp_qualification.sh",
         "benchmark": "scripts/h200/benchmark_glm52_mtp.py",
         "output": "benchmarks/glm52-mtp-h200.json",
+        "deploy_files": mtp["deploy_files"],
     }
+    assert "patches/vllm/0006-v026-mtp-slot-mapping-46908.patch" in mtp["deploy_files"]
+    assert "patches/vllm/0007-v026-mtp-slot-mapping-47013.patch" in mtp["deploy_files"]
     for name in ("glm52-production3", "current"):
         identity = operations["profiles"][name].get("identity", {})
         if identity:
@@ -95,6 +109,9 @@ def test_both_launchers_mount_every_patched_vllm_file():
                 in source
             )
     assert "--restart=no" in (ROOT / "scripts/h200/start_mtp_qualification.sh").read_text()
+    assert "PRIME_MTP_ROUTE_TRACE_MODE" not in (
+        ROOT / "scripts/h200/start_mtp_qualification.sh"
+    ).read_text()
 
 
 def test_benchmark_accepts_only_complete_off_on_evidence():

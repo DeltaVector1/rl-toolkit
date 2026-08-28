@@ -14,9 +14,11 @@ class H200MTPGuardTest(unittest.TestCase):
     def test_native_mtp_is_not_enabled(self):
         self.assertNotIn('"speculative_config"', START)
 
-    def test_flashmla_stride_failure_is_documented(self):
-        self.assertIn("2,415,919,104-byte stride", START)
-        self.assertIn("exceeds FlashMLA's int32 limit", START)
+    def test_production_launcher_names_the_actual_mtp_fixes(self):
+        self.assertIn("PRs #46908 and #47013", START)
+        self.assertIn("workspace-chunking patch", START)
+        self.assertNotIn("2,415,919,104", START)
+        self.assertNotIn("stride", START.lower())
 
     def test_glm52_production3_keeps_mtp_disabled(self):
         identity = OPERATIONS["profiles"]["glm52-production3"]["identity"]

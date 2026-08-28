@@ -65,8 +65,31 @@ glm52_verified_loaded_library_manifest_sha256 = (
 glm_parity_paths = operations["parity"]["glm52"]
 glm_step20_h200_gate = operations["gate"]["glm52_step20_h200"]
 glm52_mtp_h200_qualification = operations["qualification"]["glm52_mtp_h200"]
-if set(glm52_mtp_h200_qualification) != {"profile", "launcher", "benchmark", "output"}:
+if set(glm52_mtp_h200_qualification) != {
+    "host",
+    "container",
+    "qualification_root",
+    "trace_dir",
+    "profile",
+    "launcher",
+    "benchmark",
+    "output",
+    "deploy_files",
+}:
     raise RuntimeError("GLM MTP H200 qualification inventory is invalid")
+if not re.fullmatch(
+    r"[A-Za-z0-9_.-]+",
+    glm52_mtp_h200_qualification["container"]
+    if isinstance(glm52_mtp_h200_qualification.get("container"), str)
+    else "",
+):
+    raise RuntimeError("GLM MTP H200 qualification container name is invalid")
+inference_qualification_deploy_files = frozenset(
+    path
+    for qualification in operations.get("qualification", {}).values()
+    if isinstance(qualification, dict)
+    for path in qualification.get("deploy_files", [])
+)
 glm_parity_root = "/data/glm52-rl/qualifications/glm52-policy-parity"
 glm_parity_stage_candidate_root = f"{glm_parity_root}/.stage-candidates"
 glm_parity_stage_docker_timeout = 1800
@@ -89,6 +112,11 @@ inference_hosts = list(hosts["inference"])
 orchestrator_host = hosts["orchestrator"]
 metric_hosts = list(hosts["metrics"])
 blocked_hosts = set(hosts["blocked"])
+if (
+    glm52_mtp_h200_qualification["host"] not in inference_hosts
+    or glm52_mtp_h200_qualification["host"] in blocked_hosts
+):
+    raise RuntimeError("GLM MTP H200 qualification host is not an allowed inference host")
 if (
     not isinstance(trainer_ssh, str)
     or re.fullmatch(r"[A-Za-z0-9_.-]+", trainer_ssh) is None
@@ -9672,6 +9700,8 @@ def deploy(path: str, nodes: list[str] | None = None) -> bool:
             ]
         elif path.startswith("environments/"):
             nodes = [orchestrator_host]
+        elif path in inference_qualification_deploy_files:
+            nodes = inference_hosts
         elif path.startswith(("scripts/h200/", "configs/runtime/")):
             nodes = inference_hosts
         elif path.startswith("scripts/china/"):
@@ -9684,6 +9714,15 @@ def deploy(path: str, nodes: list[str] | None = None) -> bool:
             raise Refused("destination is not clear; pass nodes explicitly")
         if not nodes:
             raise Refused(f"no configured host mounts {path}")
+    if path in inference_qualification_deploy_files or path.startswith(
+        ("scripts/h200/", "configs/runtime/")
+    ):
+        unsafe_nodes = [host for host in (nodes or []) if host not in inference_hosts]
+        if unsafe_nodes:
+            raise Refused(
+                f"inference-only file {path} cannot be deployed to "
+                f"non-inference host(s): {unsafe_nodes}"
+            )
     nodes = [_check_host(h) for h in nodes]
     local = repo_root / path
     if not local.is_file():
@@ -9771,6 +9810,338 @@ def deploy(path: str, nodes: list[str] | None = None) -> bool:
                 "This runs on the host. Restart the process only if it is a long-running loop."
             )
     return not bad
+
+
+def _inference_qualification_spec(name: str) -> dict[str, object]:
+    """Return one registered isolated inference qualification only."""
+    if not isinstance(name, str) or re.fullmatch(r"[A-Za-z0-9_-]+", name) is None:
+        raise Refused("inference qualification name contains invalid characters")
+    qualifications = operations.get("qualification", {})
+    inventory_name = name.replace("-", "_")
+    spec = qualifications.get(name) or qualifications.get(inventory_name)
+    if not isinstance(spec, dict):
+        raise Refused(f"inference qualification {name!r} is not registered")
+    required = {
+        "host",
+        "container",
+        "qualification_root",
+        "trace_dir",
+        "profile",
+        "launcher",
+        "benchmark",
+        "output",
+        "deploy_files",
+    }
+    if set(spec) != required:
+        raise Refused(f"inference qualification {name!r} inventory is invalid")
+    host = spec["host"]
+    if not isinstance(host, str):
+        raise Refused("inference qualification host is invalid")
+    _check_host(host)
+    if host not in inference_hosts or host != orchestrator_host:
+        raise Refused(
+            "inference qualification host must be the configured H200 host: "
+            f"{orchestrator_host}"
+        )
+    container = spec["container"]
+    if (
+        not isinstance(container, str)
+        or re.fullmatch(r"[A-Za-z0-9_.-]+", container) is None
+        or container in set(protected_inference)
+        or container in {protected_orchestrator, protected_trainer}
+    ):
+        raise Refused("inference qualification container is not isolated")
+    path_prefixes = {
+        "profile": ("configs", "qualification"),
+        "launcher": ("scripts", "h200"),
+        "benchmark": ("scripts", "h200"),
+        "output": ("benchmarks",),
+    }
+    for key in ("profile", "launcher", "benchmark", "output"):
+        relative = spec[key]
+        path = PurePosixPath(relative) if isinstance(relative, str) else None
+        if (
+            path is None
+            or path.is_absolute()
+            or not path.parts
+            or ".." in path.parts
+            or path.parts[: len(path_prefixes[key])] != path_prefixes[key]
+        ):
+            raise Refused(f"inference qualification {key} path is invalid")
+        local = repo_root / Path(*path.parts)
+        try:
+            resolved = local.resolve(strict=True)
+        except OSError as error:
+            raise Refused(f"inference qualification {key} path is invalid") from error
+        if (
+            local.is_symlink()
+            or not local.is_file()
+            or not resolved.is_relative_to(repo_root.resolve())
+        ):
+            raise Refused(f"inference qualification {key} path is invalid")
+    for key in ("qualification_root", "trace_dir"):
+        value = spec[key]
+        path = PurePosixPath(value) if isinstance(value, str) else None
+        if path is None or not path.is_absolute() or ".." in path.parts:
+            raise Refused(f"inference qualification {key} is invalid")
+    root = PurePosixPath(spec["qualification_root"])
+    trace = PurePosixPath(spec["trace_dir"])
+    qualification_parent = PurePosixPath(paths["runs"]).parent / "qualifications"
+    if root.parent != qualification_parent or root not in trace.parents or trace == root:
+        raise Refused("inference qualification trace directory is outside its root")
+    deploy_files = spec["deploy_files"]
+    if (
+        not isinstance(deploy_files, list)
+        or not deploy_files
+    ):
+        raise Refused("inference qualification deploy file inventory is invalid")
+    if any(not isinstance(path, str) for path in deploy_files):
+        raise Refused("inference qualification deploy file inventory is invalid")
+    if (
+        len(deploy_files) != len(set(deploy_files))
+        or any(
+            spec[key] not in deploy_files for key in ("profile", "launcher", "benchmark")
+        )
+        or any(
+            PurePosixPath(path).is_absolute()
+            or ".." in PurePosixPath(path).parts
+            or path not in inference_qualification_deploy_files
+            for path in deploy_files
+        )
+    ):
+        raise Refused("inference qualification deploy file inventory is invalid")
+    for path in deploy_files:
+        local = repo_root / Path(*PurePosixPath(path).parts)
+        try:
+            resolved = local.resolve(strict=True)
+        except OSError as error:
+            raise Refused("inference qualification deploy file is invalid") from error
+        if (
+            local.is_symlink()
+            or not local.is_file()
+            or not resolved.is_relative_to(repo_root.resolve())
+        ):
+            raise Refused("inference qualification deploy file is invalid")
+    return spec
+
+
+def _inference_qualification_ports(spec: dict[str, object]) -> list[int]:
+    profile = repo_root / Path(*PurePosixPath(spec["profile"]).parts)
+    try:
+        with profile.open("rb") as stream:
+            config = tomllib.load(stream)
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise Refused("inference qualification profile cannot be read") from error
+    server = config.get("server")
+    backend = config.get("backend_port")
+    port = server.get("port") if isinstance(server, dict) else None
+    values = [port, backend]
+    if (
+        any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 1 <= value <= 65535
+            for value in values
+        )
+        or len(set(values)) != len(values)
+    ):
+        raise Refused("inference qualification ports are invalid or duplicated")
+    return values
+
+
+def _inference_qualification_port_conflicts(
+    host: str, ports_to_check: list[int]
+) -> None:
+    _check_host(host)
+    ports_text = " ".join(str(port) for port in ports_to_check)
+    command = f"""
+set -euo pipefail
+command -v ss >/dev/null
+for port in {ports_text}; do
+  if ss -H -ltn \"sport = :$port\" | grep -q .; then
+    printf '%s\\n' \"$port\"
+  fi
+done
+"""
+    code, output = _ssh(host, command, timeout=60)
+    if code:
+        raise RuntimeError(
+            f"cannot check inference qualification ports on {host}: {output.strip()}"
+        )
+    conflicts = [line.strip() for line in output.splitlines() if line.strip()]
+    if conflicts:
+        raise Refused(
+            "inference qualification port conflict on "
+            f"{host}: {', '.join(conflicts)}"
+        )
+
+
+def _inference_qualification_identity(spec: dict[str, object]) -> dict[str, object]:
+    host = str(spec["host"])
+    name = str(spec["container"])
+    command = f"""
+set -euo pipefail
+name={shlex.quote(name)}
+if ! inspect_output=$(sudo docker inspect \"$name\" 2>&1); then
+  if grep -Eq 'No such (object|container)' <<<\"$inspect_output\"; then
+    printf 'ABSENT\\n'
+    exit 0
+  fi
+  printf '%s\\n' \"$inspect_output\" >&2
+  exit 1
+fi
+sudo docker inspect \"$name\" --format '{{{{json .State.Status}}}}\\t{{{{json .RestartCount}}}}\\t{{{{json .Config.Image}}}}\\t{{{{json .Config.Cmd}}}}\\t{{{{json .HostConfig.RestartPolicy.Name}}}}\\t{{{{json .HostConfig.Init}}}}'
+"""
+    code, output = _ssh(host, command, timeout=60)
+    if code:
+        raise RuntimeError(
+            f"cannot inspect inference qualification on {host}: {output.strip()}"
+        )
+    line = output.strip()
+    if line == "ABSENT":
+        return {"host": host, "container": name, "status": "absent"}
+    fields = line.split("\t")
+    if len(fields) != 6:
+        raise RuntimeError(
+            "inference qualification inspection returned an invalid record"
+        )
+    try:
+        status, restarts, image, command_value, restart_policy, init = (
+            json.loads(value) for value in fields
+        )
+    except json.JSONDecodeError as error:
+        raise RuntimeError(
+            "inference qualification inspection is not valid JSON"
+        ) from error
+    if (
+        not isinstance(status, str)
+        or isinstance(restarts, bool)
+        or not isinstance(restarts, int)
+    ):
+        raise RuntimeError("inference qualification inspection has invalid state")
+    return {
+        "host": host,
+        "container": name,
+        "status": status,
+        "restart_count": restarts,
+        "image": image,
+        "command": command_value,
+        "restart_policy": restart_policy,
+        "init": init,
+    }
+
+
+def status_inference_qualification(name: str) -> dict[str, object]:
+    spec = _inference_qualification_spec(name)
+    result = _inference_qualification_identity(spec)
+    print(
+        f"{result['host']}: {result['container']} "
+        f"{result['status']} (restarts={result.get('restart_count', 0)})"
+    )
+    return result
+
+
+def qualify_inference(name: str) -> dict[str, object]:
+    """Deploy and run one registered inference qualification in the foreground."""
+    spec = _inference_qualification_spec(name)
+    host = str(spec["host"])
+    ports_to_check = _inference_qualification_ports(spec)
+    existing = _inference_qualification_identity(spec)
+    if existing["status"] != "absent":
+        raise Refused(
+            f"inference qualification container already exists on {host}: "
+            f"{existing['status']}"
+        )
+    _inference_qualification_port_conflicts(host, ports_to_check)
+    for relative in spec["deploy_files"]:
+        if not deploy(relative, nodes=[host]):
+            raise RuntimeError(
+                f"failed to deploy inference qualification file: {relative}"
+            )
+    root = shlex.quote(str(spec["qualification_root"]))
+    trace = shlex.quote(str(spec["trace_dir"]))
+    setup = f"""
+set -euo pipefail
+for path in {root} {root}/run {trace}; do
+  if test -L \"$path\"; then
+    echo \"refusing symlinked inference qualification path: $path\" >&2
+    exit 2
+  fi
+done
+sudo install -d -o 1000 -g 1000 -m 0750 {root}
+sudo install -d -o 1000 -g 1000 -m 0750 {root}/run
+sudo install -d -o 1000 -g 1000 -m 0750 {trace}
+test -d {root} && test ! -L {root} && test \"$(realpath -e {root})\" = {root}
+test -d {trace} && test ! -L {trace} && test \"$(realpath -e {trace})\" = {trace}
+"""
+    _remote_ok(host, setup, "inference qualification trace directory setup", 120)
+    launcher = f"{remote_repo}/{spec['launcher']}"
+    command = (
+        "set -euo pipefail; "
+        f"env prime_deployment={shlex.quote(remote_repo)} "
+        f"prime_image={shlex.quote(inference_image)} "
+        f"prime_model_volume={shlex.quote(glm_model_volume)} "
+        f"prime_mtp_container={shlex.quote(str(spec['container']))} "
+        f"prime_mtp_trace_dir={trace} "
+        f"bash {shlex.quote(launcher)}"
+    )
+    # Keep this SSH invocation in the foreground. Do not add nohup, setsid, or &.
+    output = _remote_ok(host, command, "inference qualification launch", 300)
+    match = re.findall(r"mtp-qualification-container:([0-9a-f]{64})", output)
+    if len(match) != 1:
+        raise RuntimeError(
+            "inference qualification launcher returned no exact container ID"
+        )
+    result = {
+        "profile": name,
+        "host": host,
+        "container": str(spec["container"]),
+        "container_id": match[0],
+        "ports": ports_to_check,
+        "output": output.strip(),
+    }
+    print(
+        f"started inference qualification {name} on {host}; "
+        f"container={match[0]}"
+    )
+    return result
+
+
+def stop_inference_qualification(name: str) -> str:
+    """Remove only the exact isolated inference qualification container."""
+    spec = _inference_qualification_spec(name)
+    identity = _inference_qualification_identity(spec)
+    if identity["status"] == "absent":
+        print(f"{identity['host']}: {identity['container']} absent")
+        return "absent"
+    expected = ["@", f"{remote_repo}/{spec['profile']}"]
+    if (
+        identity.get("image") != inference_image
+        or identity.get("command") != expected
+        or identity.get("restart_policy") != "no"
+        or identity.get("init") is not True
+    ):
+        raise Refused(
+            "inference qualification container identity differs; refusing cleanup"
+        )
+    host = str(spec["host"])
+    name_value = shlex.quote(str(spec["container"]))
+    output = _remote_ok(
+        host,
+        f"set -euo pipefail; sudo docker rm -f {name_value} >/dev/null; "
+        f"test -z \"$(sudo docker ps -a --filter 'name=^/{name_value}$' --format '{{{{.Names}}}}')\"; "
+        "printf 'removed\\n'",
+        "inference qualification cleanup",
+        120,
+    ).strip()
+    if output != "removed":
+        raise RuntimeError("inference qualification cleanup returned an invalid result")
+    print(f"removed inference qualification {name} on {host}")
+    return output
+
+
+qualify_inference_status = status_inference_qualification
+cleanup_inference_qualification = stop_inference_qualification
 
 
 def _copy_resume_adapter(path: str, nodes: list[str]) -> None:
@@ -12963,6 +13334,24 @@ def _cleanup_glm52_parity_engine_action(arguments: list[str]):
     return cleanup_glm52_policy_parity_engine()
 
 
+def _qualify_inference_action(arguments: list[str]):
+    if len(arguments) != 1:
+        raise Refused("qualify-inference needs exactly one registered profile")
+    return qualify_inference(arguments[0])
+
+
+def _status_inference_qualification_action(arguments: list[str]):
+    if len(arguments) != 1:
+        raise Refused("qualify-inference-status needs exactly one registered profile")
+    return status_inference_qualification(arguments[0])
+
+
+def _stop_inference_qualification_action(arguments: list[str]):
+    if len(arguments) != 1:
+        raise Refused("stop-qualify-inference needs exactly one registered profile")
+    return stop_inference_qualification(arguments[0])
+
+
 actions = {
     "status": lambda a: status(*a),
     "acceptance": lambda a: acceptance(*a),
@@ -12987,6 +13376,9 @@ actions = {
     "stage-glm52-step20-adapter": _stage_glm52_step20_adapter_action,
     "diagnose-glm52-parity": _diagnose_glm52_parity_action,
     "cleanup-glm52-parity-engine": _cleanup_glm52_parity_engine_action,
+    "qualify-inference": _qualify_inference_action,
+    "qualify-inference-status": _status_inference_qualification_action,
+    "stop-qualify-inference": _stop_inference_qualification_action,
     "stop-legacy-qualification": lambda a: stop_legacy_qualification(*a),
     "stop": lambda a: stop(),
     "mounts": lambda a: print("\n".join(mounted_files())),
@@ -13020,6 +13412,11 @@ usage = f"""training-ops <action> [args]
   archive <run> [step ...]      upload stable old LoRA adapters
                                 add --finished after another run is active
   qualify <profile>             start a trainer-only profile
+  qualify-inference <profile>   deploy and start one H200 qualification
+  qualify-inference-status <profile>
+                                inspect one H200 qualification
+  stop-qualify-inference <profile>
+                                remove one verified H200 qualification
   qualify-glm52-step20-parity  score fixed parity tokens with the step-20 adapter
   stage-glm52-step20-adapter   copy the exact step-20 adapter to H200
   stage-glm52-parity [node ...] validate and stage the exact parity reference

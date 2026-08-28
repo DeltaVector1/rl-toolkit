@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import math
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,7 @@ MAX_MTP_EXTRA_VRAM_MIB = 4096.0
 MIN_ACCEPTANCE_RATE = 0.50
 MIN_SPEEDUP = 1.05
 MAX_WORKER_RESTARTS = 0
+DRAFT_ROUTE_TRACE_FLAGS = {}
 
 PHASE_FIELDS = {
     "output_tokens",
@@ -42,6 +44,8 @@ PHASE_FIELDS = {
     "route_ids_mismatch",
     "route_weights_max_abs_error",
     "route_trace_mode",
+    "target_request_flags",
+    "draft_request_flags",
     "target_route_trace_requests",
     "draft_route_trace_requests",
 }
@@ -93,6 +97,23 @@ def _phase_errors(name: str, phase: Any, *, mtp: bool = False) -> list[str]:
         failures.append(f"{name} route weight error exceeds {MAX_ROUTE_WEIGHT_ABS_ERROR}")
     if phase["route_trace_mode"] != "target-only":
         failures.append(f"{name} route trace mode is not target-only")
+    target_flags = phase["target_request_flags"]
+    if (
+        not isinstance(target_flags, dict)
+        or set(target_flags)
+        != {
+            "prime_router_trace",
+            "prime_router_trace_session",
+            "prime_router_trace_request",
+        }
+        or target_flags.get("prime_router_trace") is not True
+        or not _hex64(target_flags.get("prime_router_trace_session"))
+        or not isinstance(target_flags.get("prime_router_trace_request"), str)
+        or not re.fullmatch(r"[0-9a-f]{32}", target_flags["prime_router_trace_request"])
+    ):
+        failures.append(f"{name} target request does not set the exact trace flags")
+    if phase["draft_request_flags"] != DRAFT_ROUTE_TRACE_FLAGS:
+        failures.append(f"{name} draft request carries a route trace flag")
     if phase["target_route_trace_requests"] <= 0 or phase["draft_route_trace_requests"] != 0:
         failures.append(f"{name} route trace was not isolated to target requests")
     if mtp:

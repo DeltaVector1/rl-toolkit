@@ -82,7 +82,6 @@ container_id=$(docker run -d \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False \
   -e VLLM_ENGINE_READY_TIMEOUT_S=7200 \
   -e PRIME_MTP_QUALIFICATION=1 \
-  -e PRIME_MTP_ROUTE_TRACE_MODE=target-only \
   -e PRIME_PARITY_ENGINE=1 \
   -e PRIME_PARITY_ROUTER_TRACE_DIR="$trace_dir" \
   -e PRIME_PARITY_QUALIFICATION_ROOT="$(dirname "$(dirname "$trace_dir")")" \
