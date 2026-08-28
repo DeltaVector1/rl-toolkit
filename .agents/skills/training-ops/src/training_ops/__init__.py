@@ -10201,9 +10201,12 @@ def qualify_glm52_pp_async_cuda() -> dict[str, object]:
     code, output = _ssh(
         host,
         "gpu_count=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l); "
-        "pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits "
-        "2>/dev/null | grep -E '^[0-9]+$' | paste -sd, - || true); "
-        f"active=$(sudo docker ps --format '{{{{.Names}}}}' | "
+        "pid_output=$(nvidia-smi --query-compute-apps=pid "
+        "--format=csv,noheader,nounits 2>/dev/null) || exit 96; "
+        "pids=$(printf '%s\n' \"$pid_output\" | grep -E '^[0-9]+$' | "
+        "paste -sd, - || true); "
+        f"container_output=$(sudo docker ps -a --format '{{{{.Names}}}}') || exit 97; "
+        f"active=$(printf '%s\n' \"$container_output\" | "
         f"grep -E '^({re.escape(trainer_container)}|{re.escape(container)})$' | "
         "paste -sd, - || true); "
         "printf 'GPUS %s\nPIDS %s\nACTIVE %s\n' \"$gpu_count\" \"$pids\" \"$active\"",
@@ -10212,6 +10215,8 @@ def qualify_glm52_pp_async_cuda() -> dict[str, object]:
     if code:
         raise RuntimeError(f"cannot inspect n82 for the PP async CUDA check: {output.strip()}")
     state = _kv(output)
+    if set(state) != {"GPUS", "PIDS", "ACTIVE"}:
+        raise Refused("the PP async CUDA preflight returned incomplete state")
     if state.get("GPUS") != "8":
         raise Refused(f"the PP async CUDA check requires eight GPUs, got {state.get('GPUS', '?')}")
     if state.get("PIDS") or state.get("ACTIVE"):
@@ -10241,29 +10246,122 @@ def qualify_glm52_pp_async_cuda() -> dict[str, object]:
     )
     runner_path = f"{repository}/source/src/prime_rl/trainer/distributed/pp_runner.py"
     inner = "torchrun --standalone --nproc-per-node=8 /qualification/test_pp_async_cuda.py"
-    command = (
-        "set -euo pipefail; "
-        f"sudo install -d -o 1000 -g 1000 -m 0755 {shlex.quote(output_dir)}; "
-        f"sudo docker run --rm --name {shlex.quote(container)} --gpus all "
-        "--ipc host --network none --read-only --cap-drop ALL "
-        "--security-opt no-new-privileges --pids-limit 1024 "
-        "--tmpfs /tmp:rw,nosuid,nodev,size=1g "
-        f"-v {shlex.quote(script_path)}:/qualification/test_pp_async_cuda.py:ro "
-        f"-v {shlex.quote(async_path)}:/app/src/prime_rl/trainer/distributed/async_schedule.py:ro "
-        f"-v {shlex.quote(runner_path)}:/app/src/prime_rl/trainer/distributed/pp_runner.py:ro "
-        f"-v {shlex.quote(output_dir)}:/output:rw "
-        "-e PYTHONPATH=/app/src -e NCCL_ASYNC_ERROR_HANDLING=1 "
-        f"--entrypoint /bin/bash {shlex.quote(trainer_image)} -lc {shlex.quote(inner)}; "
-        f"test -s {shlex.quote(result_path)}; cat {shlex.quote(result_path)}"
-    )
     _session_deadline, startup_deadline, _step_deadline, _finalize_deadline = (
         _glm_b2048_deadlines()
     )
-    code, output = _ssh(host, command, timeout=startup_deadline)
+    cid_path = f"{output_dir}/container.cid"
+    qualification_label = _PP_ASYNC_CUDA_PROFILE
+    command = f"""set -euo pipefail
+sudo install -d -o 1000 -g 1000 -m 0755 {shlex.quote(output_dir)}
+cleanup() {{
+  primary=$?
+  trap - EXIT
+  set +e
+  cleanup_error=0
+  cid=""
+  if [ -e {shlex.quote(cid_path)} ]; then
+    if [ ! -f {shlex.quote(cid_path)} ] || [ -L {shlex.quote(cid_path)} ]; then
+      echo "qualification CID file is not a regular file" >&2
+      cleanup_error=91
+    else
+      IFS= read -r cid < {shlex.quote(cid_path)}
+    fi
+  fi
+  if [[ "$cid" =~ ^[0-9a-f]{{64}}$ ]]; then
+    identity=$(sudo docker inspect --type container --format \
+      '{{{{.Id}}}}|{{{{.Name}}}}|{{{{index .Config.Labels "prime.qualification"}}}}|{{{{index .Config.Labels "prime.session"}}}}' \
+      "$cid" 2>/dev/null)
+    inspect_status=$?
+    if [ "$inspect_status" -eq 0 ]; then
+      expected="$cid|/{container}|{qualification_label}|{session}"
+      if [ "$identity" = "$expected" ]; then
+        sudo docker rm -f "$cid" >/dev/null 2>&1 || cleanup_error=92
+      else
+        echo "qualification container identity differs" >&2
+        cleanup_error=93
+      fi
+    fi
+  elif [ -n "$cid" ]; then
+    echo "qualification CID is invalid" >&2
+    cleanup_error=94
+  fi
+  remaining=$(sudo docker ps -aq --filter name=^{container}$)
+  remaining_status=$?
+  if [ "$remaining_status" -ne 0 ]; then
+    echo "qualification postflight could not inspect containers" >&2
+    [ "$cleanup_error" -ne 0 ] || cleanup_error=97
+  fi
+  pid_output=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null)
+  pid_status=$?
+  if [ "$pid_status" -ne 0 ]; then
+    echo "qualification postflight could not inspect GPU processes" >&2
+    [ "$cleanup_error" -ne 0 ] || cleanup_error=96
+  fi
+  pids=$(printf '%s\n' "$pid_output" | grep -E '^[0-9]+$' | paste -sd, - || true)
+  if [ -n "$remaining" ] || [ -n "$pids" ]; then
+    echo "qualification postflight found container=$remaining gpu_pids=$pids" >&2
+    [ "$cleanup_error" -ne 0 ] || cleanup_error=95
+  fi
+  if [ "$primary" -ne 0 ]; then
+    [ "$cleanup_error" -eq 0 ] || echo "cleanup also failed with status $cleanup_error" >&2
+    exit "$primary"
+  fi
+  exit "$cleanup_error"
+}}
+trap cleanup EXIT
+sudo timeout --foreground --signal=TERM --kill-after=30s {startup_deadline}s \
+  docker run --rm --cidfile {shlex.quote(cid_path)} \
+  --label prime.qualification={shlex.quote(qualification_label)} \
+  --label prime.session={shlex.quote(session)} \
+  --name {shlex.quote(container)} --gpus all --ipc host --network none --read-only \
+  --cap-drop ALL --security-opt no-new-privileges --pids-limit 1024 \
+  --tmpfs /tmp:rw,nosuid,nodev,size=1g \
+  -v {shlex.quote(script_path)}:/qualification/test_pp_async_cuda.py:ro \
+  -v {shlex.quote(async_path)}:/app/src/prime_rl/trainer/distributed/async_schedule.py:ro \
+  -v {shlex.quote(runner_path)}:/app/src/prime_rl/trainer/distributed/pp_runner.py:ro \
+  -v {shlex.quote(output_dir)}:/output:rw \
+  -e PYTHONPATH=/app/src -e NCCL_ASYNC_ERROR_HANDLING=1 \
+  --entrypoint /bin/bash {shlex.quote(trainer_image)} -lc {shlex.quote(inner)}
+test -s {shlex.quote(result_path)}
+cat {shlex.quote(result_path)}
+"""
+    code, output = _ssh(host, command, timeout=startup_deadline + 60)
+    postflight_code, postflight_output = _ssh(
+        host,
+        f"remaining=$(sudo docker ps -aq --filter name=^{container}$) || exit 97; "
+        "pid_output=$(nvidia-smi --query-compute-apps=pid "
+        "--format=csv,noheader,nounits 2>/dev/null) || exit 96; "
+        "pids=$(printf '%s\n' \"$pid_output\" | grep -E '^[0-9]+$' | "
+        "paste -sd, - || true); "
+        "printf 'CONTAINERS %s\nPIDS %s\n' \"$remaining\" \"$pids\"",
+        timeout=60,
+    )
+    postflight = _kv(postflight_output)
+    postflight_error = None
+    if postflight_code:
+        postflight_error = (
+            f"n82 postflight failed with ssh exit {postflight_code}: "
+            f"{postflight_output.strip()[-500:]}"
+        )
+    elif set(postflight) != {"CONTAINERS", "PIDS"}:
+        postflight_error = "n82 postflight returned incomplete state"
+    elif postflight.get("CONTAINERS") or postflight.get("PIDS"):
+        postflight_error = (
+            "n82 postflight found remaining container or GPU process: "
+            f"containers={postflight.get('CONTAINERS', '')} "
+            f"pids={postflight.get('PIDS', '')}"
+        )
     if code:
-        raise RuntimeError(
+        primary_error = (
             "PP async CUDA qualification failed: "
             + (output.strip()[-2000:] or f"ssh exit {code}")
+        )
+        if postflight_error is not None:
+            primary_error += "; cleanup/postflight also failed: " + postflight_error
+        raise RuntimeError(primary_error)
+    if postflight_error is not None:
+        raise RuntimeError(
+            "PP async CUDA qualification cleanup/postflight failed: " + postflight_error
         )
     try:
         result = json.loads(output.strip().splitlines()[-1])

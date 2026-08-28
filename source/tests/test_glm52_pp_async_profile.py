@@ -216,7 +216,9 @@ def test_cuda_smoke_command_is_fail_closed_and_has_no_model_mount() -> None:
         calls.append((host, command, timeout))
         if len(calls) == 1:
             return 0, "GPUS 8\nPIDS\nACTIVE\n"
-        return 0, json.dumps(result)
+        if len(calls) == 2:
+            return 0, json.dumps(result)
+        return 0, "CONTAINERS\nPIDS\n"
 
     deployed = []
     training_ops._assert_live_services_are_down = lambda nodes, include_inference: (
@@ -231,10 +233,65 @@ def test_cuda_smoke_command_is_fail_closed_and_has_no_model_mount() -> None:
     assert [item[0] for item in deployed] == list(source_paths)
     assert all(item[1]["nodes"] == ["n82"] for item in deployed)
     assert all(host == "n82" for host, _command, _timeout in calls)
-    launch = calls[-1][1]
+    assert len(calls) == 3
+    launch = calls[1][1]
     assert "--nproc-per-node=8" in launch
     assert "--network none" in launch
     assert "--read-only" in launch
+    assert "--cidfile" in launch
+    assert "--label prime.qualification=glm52-pp-async-cuda-smoke" in launch
+    assert "--label prime.session=0123456789abcdef" in launch
+    assert "timeout --foreground --signal=TERM --kill-after=30s 900s" in launch
+    assert "trap cleanup EXIT" in launch
+    assert "docker inspect --type container" in launch
+    assert "docker rm -f" in launch
+    assert "cleanup also failed" in launch
+    assert calls[1][2] == 960
+    postflight = calls[2][1]
+    assert "docker ps -aq" in postflight
+    assert "nvidia-smi --query-compute-apps=pid" in postflight
     assert "/models" not in launch
     assert "/data/ZiphuAI" not in launch
     assert "training.env" not in launch
+
+    def timed_out_ssh(host, command, timeout=120, **_kwargs):
+        timeout_calls.append((host, command, timeout))
+        if len(timeout_calls) == 1:
+            return 0, "GPUS 8\nPIDS\nACTIVE\n"
+        if len(timeout_calls) == 2:
+            return 124, "host-side timeout"
+        return 0, "CONTAINERS\nPIDS\n"
+
+    timeout_calls = []
+    training_ops._ssh = timed_out_ssh
+    try:
+        training_ops.qualify_glm52_pp_async_cuda()
+    except RuntimeError as error:
+        assert "host-side timeout" in str(error)
+        assert "cleanup/postflight also failed" not in str(error)
+    else:
+        raise AssertionError("a timed-out CUDA qualification passed")
+    assert len(timeout_calls) == 3
+    assert "--cidfile" in timeout_calls[1][1]
+    assert "trap cleanup EXIT" in timeout_calls[1][1]
+
+    def failed_cleanup_ssh(host, command, timeout=120, **_kwargs):
+        failed_calls.append((host, command, timeout))
+        if len(failed_calls) == 1:
+            return 0, "GPUS 8\nPIDS\nACTIVE\n"
+        if len(failed_calls) == 2:
+            return 124, "original host timeout"
+        return 0, "CONTAINERS abc123\nPIDS 77\n"
+
+    failed_calls = []
+    training_ops._ssh = failed_cleanup_ssh
+    try:
+        training_ops.qualify_glm52_pp_async_cuda()
+    except RuntimeError as error:
+        message = str(error)
+        assert message.index("original host timeout") < message.index(
+            "cleanup/postflight also failed"
+        )
+        assert "containers=abc123 pids=77" in message
+    else:
+        raise AssertionError("a failed cleanup replaced the original error")
