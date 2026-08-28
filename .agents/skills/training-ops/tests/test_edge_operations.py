@@ -14,7 +14,6 @@ import sys
 import tempfile
 import threading
 import unittest
-import urllib.request
 from contextlib import nullcontext
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
