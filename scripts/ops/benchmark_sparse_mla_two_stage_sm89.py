@@ -161,8 +161,10 @@ def run(args: argparse.Namespace) -> None:
     )
     print(
         f"workspace_bytes={memory.total_bytes} workspace_mib={memory.total_bytes / 2**20:.2f} "
+        f"route_chunk_entries={memory.route_chunk_entries} chunk_count={memory.chunk_count} "
         f"route_sort_bytes={memory.route_sort_bytes} route_filter_bytes={memory.route_filter_bytes} "
-        f"reduction_bytes={memory.reduction_bytes} output_pair_bytes={memory.output_pair_bytes} "
+        f"offset_bytes={memory.offset_bytes} reduction_bytes={memory.reduction_bytes} "
+        f"output_pair_bytes={memory.output_pair_bytes} "
         f"workspace_limit_bytes={MAX_WORKSPACE_BYTES} "
         f"peak_allocated_delta={peak_allocated_delta} peak_reserved_delta={peak_reserved_delta} "
         f"free_hbm_before={free_hbm_before} free_hbm_after={free_hbm_after} total_hbm={total_hbm} "

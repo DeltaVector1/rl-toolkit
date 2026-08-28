@@ -23,13 +23,19 @@ TOTAL_WIDTH = VALUE_WIDTH + ROPE_WIDTH
 GROUPS = 1
 TOPK = 2048
 BLOCK_WIDTH = 1024
+ROUTE_CHUNK_ENTRIES = 1 << 20
 QUERY_ID_BITS = 12
 QUERY_ID_MASK = QUERY_TOKENS - 1
 PACKED_ROUTE_BYTES = 4
 ROUTE_ORDER_BYTES = 8
-ARGSORT_SCRATCH_BYTES = 8
-ROUTE_BYTES_PER_ENTRY = PACKED_ROUTE_BYTES + ROUTE_ORDER_BYTES + ARGSORT_SCRATCH_BYTES
+# The sort implementation can use temporary storage in addition to its
+# output index.  Keep this ledger conservative so the qualification bound is
+# checked before a kernel launch.
+ARGSORT_SCRATCH_BYTES = 64
 ROUTE_FILTER_BYTES_PER_ENTRY = 4 + 1 + 4 + 4 + 4
+ROUTE_SORT_BYTES_PER_ENTRY = PACKED_ROUTE_BYTES + ROUTE_ORDER_BYTES + ARGSORT_SCRATCH_BYTES
+# Kept as a compatibility name for qualification reports.
+ROUTE_BYTES_PER_ENTRY = ROUTE_SORT_BYTES_PER_ENTRY
 MAX_WORKSPACE_BYTES = 256 * 1024 * 1024
 LOG2_E = 1.4426950408889634
 
@@ -37,11 +43,14 @@ LOG2_E = 1.4426950408889634
 @dataclass(frozen=True)
 class TwoStageMemory:
     sequence_kv: int
+    route_chunk_entries: int
     route_filter_bytes: int
     route_sort_bytes: int
+    offset_bytes: int
     reduction_bytes: int
     output_pair_bytes: int
     total_bytes: int
+    chunk_count: int
 
 
 def two_stage_memory(
@@ -49,32 +58,38 @@ def two_stage_memory(
     *,
     route_count: int = QUERY_TOKENS * TOPK,
 ) -> TwoStageMemory:
-    """Return the conservative peak workspace bound in bytes.
+    """Return the conservative peak allocation bound in bytes.
 
-    The sort ledger includes packed routes, sort order, and stable-sort
-    scratch.  The output buffer exists during sorting in production.
+    Routes are sorted in bounded chunks.  The output is FP32 while chunks are
+    reduced, then one BF16 output is made after all temporary route storage is
+    released.  No full route-sized sort buffer is included or needed.
     """
 
     if sequence_kv < 1 or route_count < 0:
         raise ValueError("two-stage memory dimensions must be non-negative")
-    route_filter_bytes = route_count * ROUTE_FILTER_BYTES_PER_ENTRY
-    route_sort_bytes = route_count * ROUTE_BYTES_PER_ENTRY
+    chunk_entries = min(route_count, ROUTE_CHUNK_ENTRIES)
+    route_filter_bytes = chunk_entries * ROUTE_FILTER_BYTES_PER_ENTRY
+    route_sort_bytes = chunk_entries * ROUTE_SORT_BYTES_PER_ENTRY
+    offset_bytes = (sequence_kv + 1) * 8 + sequence_kv * 8
     fp32_output_bytes = sequence_kv * TOTAL_WIDTH * 4
     output_pair_bytes = sequence_kv * TOTAL_WIDTH * (4 + 2)
     reduction_bytes = (
-        route_count * (4 + 8)
-        + (sequence_kv + 1) * 8
+        chunk_entries * (PACKED_ROUTE_BYTES + ROUTE_ORDER_BYTES)
+        + offset_bytes
         + fp32_output_bytes
     )
-    filter_peak = route_filter_bytes + fp32_output_bytes
-    sort_peak = route_sort_bytes + fp32_output_bytes
+    filter_peak = route_filter_bytes + PACKED_ROUTE_BYTES * chunk_entries + fp32_output_bytes
+    sort_peak = route_sort_bytes + offset_bytes + fp32_output_bytes
     return TwoStageMemory(
         sequence_kv=sequence_kv,
+        route_chunk_entries=chunk_entries,
         route_filter_bytes=route_filter_bytes,
         route_sort_bytes=route_sort_bytes,
+        offset_bytes=offset_bytes,
         reduction_bytes=reduction_bytes,
         output_pair_bytes=output_pair_bytes,
         total_bytes=max(filter_peak, sort_peak, reduction_bytes, output_pair_bytes),
+        chunk_count=(route_count + ROUTE_CHUNK_ENTRIES - 1) // ROUTE_CHUNK_ENTRIES,
     )
 
 
@@ -126,6 +141,7 @@ if triton is not None:
         delta_stride_h,
         output_stride_s,
         sm_scale,
+        ACCUMULATE: tl.constexpr,
         ATTENTION_HEADS: tl.constexpr,
         VALUE_WIDTH: tl.constexpr,
         TOTAL_WIDTH: tl.constexpr,
@@ -199,34 +215,43 @@ if triton is not None:
                 head_partial += dp * q_output + probability * do_output
             accumulator += head_partial
 
+        if ACCUMULATE:
+            accumulator += tl.load(
+                output + key_id * output_stride_s + width,
+                mask=output_mask,
+                other=0.0,
+            )
         tl.store(output + key_id * output_stride_s + width, accumulator, mask=output_mask)
 
 else:
     _two_stage_dkv_kernel = None
 
 
-def _sorted_route_ids(
-    indices: torch.Tensor,
+def _sorted_route_chunk(
+    flat_indices: torch.Tensor,
+    start: int,
+    end: int,
     sequence_kv: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build packed, key-major route IDs with GPU tensor operations only."""
+    """Build one bounded key-major route chunk on the GPU."""
 
-    flat = indices.reshape(-1)
-    positions = torch.arange(flat.numel(), device=indices.device, dtype=torch.int32)
-    valid = (flat >= 0) & (flat < sequence_kv - 1)
-    keys = flat.masked_select(valid)
-    positions = positions.masked_select(valid)
-    del flat, valid
-    route_ids = (keys << QUERY_ID_BITS) | (positions // TOPK)
-    del keys, positions
-    counts = torch.bincount(route_ids >> QUERY_ID_BITS, minlength=sequence_kv)
+    chunk = flat_indices[start:end]
+    positions = torch.arange(start, end, device=flat_indices.device, dtype=torch.int32)
+    valid = (chunk >= 0) & (chunk < sequence_kv - 1)
+    keys = chunk.masked_select(valid)
+    query_positions = positions.masked_select(valid)
+    del chunk, positions
+    route_ids = (keys << QUERY_ID_BITS) | (query_positions // TOPK)
+    del keys, query_positions, valid
     route_order = torch.argsort(route_ids, stable=True)
+    counts = torch.bincount(route_ids >> QUERY_ID_BITS, minlength=sequence_kv)
     offsets = torch.cat(
         (
-            torch.zeros(1, dtype=torch.int64, device=indices.device),
+            torch.zeros(1, dtype=torch.int64, device=flat_indices.device),
             counts.cumsum(0, dtype=torch.int64),
         )
     )
+    del counts
     return route_ids, route_order, offsets
 
 
@@ -242,12 +267,11 @@ def sparse_mla_dkv_two_stage(
     max_workspace_bytes: int = MAX_WORKSPACE_BYTES,
     output: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, TwoStageMemory]:
-    """Compute BF16 dKV with one GPU reduction kernel.
+    """Compute BF16 dKV with bounded GPU route sorts.
 
-    GPU sorting makes routes key-major.  The Triton kernel accumulates each
-    key's FP32 head partials in route order and writes one FP32 output row.
-    The result is compared with the existing TileLang path at rtol=2e-2 and
-    atol=2e-3 during qualification.
+    Each route chunk is stable-sorted by key and query order.  The reduction
+    kernel adds each chunk to the FP32 output in chunk order.  This gives a
+    deterministic per-key reduction without a full 8M-entry sort.
     """
 
     if (
@@ -304,7 +328,6 @@ def sparse_mla_dkv_two_stage(
             f"{memory.total_bytes} > {max_workspace_bytes} bytes"
         )
 
-    route_ids, route_order, key_offsets = _sorted_route_ids(indices, sequence_kv)
     if output_buffer is None:
         output_buffer = torch.empty(
             sequence_kv,
@@ -313,36 +336,46 @@ def sparse_mla_dkv_two_stage(
             device=q.device,
         )
     output_buffer.zero_()
-    grid = (sequence_kv,)
-    _two_stage_dkv_kernel[grid](
-        q,
-        kv,
-        do,
-        lse,
-        delta,
-        route_ids,
-        route_order,
-        key_offsets,
-        output_buffer,
-        q.stride(1),
-        q.stride(2),
-        kv.stride(1),
-        do.stride(1),
-        do.stride(2),
-        lse.stride(1),
-        lse.stride(2),
-        delta.stride(1),
-        delta.stride(2),
-        output_buffer.stride(0),
-        float(sm_scale),
-        ATTENTION_HEADS=ATTENTION_HEADS,
-        VALUE_WIDTH=VALUE_WIDTH,
-        TOTAL_WIDTH=TOTAL_WIDTH,
-        QUERY_ID_MASK=QUERY_ID_MASK,
-        LOG2_E=LOG2_E,
-        BLOCK_WIDTH=BLOCK_WIDTH,
-        num_warps=4,
-        num_stages=1,
-    )
-    del route_ids, route_order, key_offsets
+    flat_indices = indices.reshape(-1)
+    for start in range(0, flat_indices.numel(), ROUTE_CHUNK_ENTRIES):
+        end = min(start + ROUTE_CHUNK_ENTRIES, flat_indices.numel())
+        route_ids, route_order, key_offsets = _sorted_route_chunk(
+            flat_indices,
+            start,
+            end,
+            sequence_kv,
+        )
+        _two_stage_dkv_kernel[(sequence_kv,)](
+            q,
+            kv,
+            do,
+            lse,
+            delta,
+            route_ids,
+            route_order,
+            key_offsets,
+            output_buffer,
+            q.stride(1),
+            q.stride(2),
+            kv.stride(1),
+            do.stride(1),
+            do.stride(2),
+            lse.stride(1),
+            lse.stride(2),
+            delta.stride(1),
+            delta.stride(2),
+            output_buffer.stride(0),
+            float(sm_scale),
+            ACCUMULATE=start != 0,
+            ATTENTION_HEADS=ATTENTION_HEADS,
+            VALUE_WIDTH=VALUE_WIDTH,
+            TOTAL_WIDTH=TOTAL_WIDTH,
+            QUERY_ID_MASK=QUERY_ID_MASK,
+            LOG2_E=LOG2_E,
+            BLOCK_WIDTH=BLOCK_WIDTH,
+            num_warps=4,
+            num_stages=1,
+        )
+        del route_ids, route_order, key_offsets
+    del flat_indices
     return output_buffer.view_as(kv).to(dtype=kv.dtype), memory

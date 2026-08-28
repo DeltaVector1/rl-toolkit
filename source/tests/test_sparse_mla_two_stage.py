@@ -11,25 +11,33 @@ BENCHMARK = (ROOT.parent / "scripts/ops/benchmark_sparse_mla_two_stage_sm89.py")
 
 TOTAL_WIDTH = 576
 TOPK = 2048
+ROUTE_CHUNK_ENTRIES = 1 << 20
 MAX_WORKSPACE_BYTES = 256 * 1024 * 1024
-ROUTE_BYTES_PER_ENTRY = 20
+PACKED_ROUTE_BYTES = 4
+ROUTE_ORDER_BYTES = 8
+ARGSORT_SCRATCH_BYTES = 64
+ROUTE_SORT_BYTES_PER_ENTRY = PACKED_ROUTE_BYTES + ROUTE_ORDER_BYTES + ARGSORT_SCRATCH_BYTES
 ROUTE_FILTER_BYTES_PER_ENTRY = 17
 
 
 def memory_bound(sequence_kv: int) -> int:
     route_count = 4096 * TOPK
-    route_filter = 4096 * TOPK * ROUTE_FILTER_BYTES_PER_ENTRY
-    route_sort = route_count * ROUTE_BYTES_PER_ENTRY
+    chunk_entries = min(route_count, ROUTE_CHUNK_ENTRIES)
+    route_filter = chunk_entries * ROUTE_FILTER_BYTES_PER_ENTRY
+    route_sort = chunk_entries * ROUTE_SORT_BYTES_PER_ENTRY
+    offsets = (sequence_kv + 1) * 8 + sequence_kv * 8
     fp32_output = sequence_kv * TOTAL_WIDTH * 4
     reduction = (
-        (route_count * (4 + 8))
-        + ((sequence_kv + 1) * 8)
+        (chunk_entries * (PACKED_ROUTE_BYTES + ROUTE_ORDER_BYTES))
+        + offsets
         + fp32_output
     )
     output_pair = sequence_kv * TOTAL_WIDTH * (4 + 2)
+    filter_peak = route_filter + PACKED_ROUTE_BYTES * chunk_entries + fp32_output
+    sort_peak = route_sort + offsets + fp32_output
     return max(
-        route_filter + fp32_output,
-        route_sort + fp32_output,
+        filter_peak,
+        sort_peak,
         reduction,
         output_pair,
     )
@@ -50,10 +58,20 @@ def stable_segment_sum(values: list[list[float]], keys: list[int]):
 class SparseMlaTwoStageTest(unittest.TestCase):
     def test_production_workspace_is_bounded(self):
         total = memory_bound(32769)
-        self.assertEqual(4096 * TOPK * ROUTE_BYTES_PER_ENTRY, 167772160)
-        self.assertEqual(total, 243271936)
+        self.assertEqual(4096 * TOPK // ROUTE_CHUNK_ENTRIES, 8)
+        self.assertEqual(total, 155715864)
         self.assertLess(total, MAX_WORKSPACE_BYTES)
-        self.assertLess(total / 2**20, 256)
+        self.assertLess(total / 2**20, 157)
+
+    def test_route_storage_is_bounded_by_one_chunk(self):
+        self.assertIn("ROUTE_CHUNK_ENTRIES = 1 << 20", SOURCE)
+        self.assertIn(
+            "for start in range(0, flat_indices.numel(), ROUTE_CHUNK_ENTRIES)",
+            SOURCE,
+        )
+        self.assertIn("_sorted_route_chunk", SOURCE)
+        self.assertIn("chunk_entries = min(route_count, ROUTE_CHUNK_ENTRIES)", SOURCE)
+        self.assertIn("chunk_count=(route_count + ROUTE_CHUNK_ENTRIES - 1)", SOURCE)
 
     def test_exact_shape_gate_fails_closed(self):
         self.assertIn("capability != SM89", SOURCE)
@@ -62,8 +80,8 @@ class SparseMlaTwoStageTest(unittest.TestCase):
         self.assertIn("(1, 32768 + 1, GROUPS, TOTAL_WIDTH)", SOURCE)
         self.assertIn("PACKED_ROUTE_BYTES = 4", SOURCE)
         self.assertIn("ROUTE_ORDER_BYTES = 8", SOURCE)
-        self.assertIn("ARGSORT_SCRATCH_BYTES = 8", SOURCE)
-        self.assertIn("ROUTE_BYTES_PER_ENTRY = PACKED_ROUTE_BYTES", SOURCE)
+        self.assertIn("ARGSORT_SCRATCH_BYTES = 64", SOURCE)
+        self.assertIn("ROUTE_SORT_BYTES_PER_ENTRY = PACKED_ROUTE_BYTES", SOURCE)
         self.assertIn("ROUTE_FILTER_BYTES_PER_ENTRY = 4 + 1 + 4 + 4 + 4", SOURCE)
 
     def test_duplicate_routes_reduce_in_stable_key_order(self):
@@ -80,6 +98,8 @@ class SparseMlaTwoStageTest(unittest.TestCase):
         self.assertIn("peak_reserved_delta", BENCHMARK)
         self.assertIn("peak_allocated_delta", BENCHMARK)
         self.assertIn("measured allocated-memory bound failed", BENCHMARK)
+        self.assertIn("route_chunk_entries", BENCHMARK)
+        self.assertIn("chunk_count", BENCHMARK)
         self.assertIn('"PRIME_SPARSE_BWD_REUSE_DQ_SHARED"', BENCHMARK)
         self.assertIn('"PRIME_SPARSE_BWD_BLOCK_SIZE"', BENCHMARK)
         self.assertIn("free_hbm_before", BENCHMARK)
@@ -115,7 +135,7 @@ class SparseMlaTwoStageTest(unittest.TestCase):
         self.assertNotIn("probability == probability", SOURCE)
         self.assertNotIn("dp == dp", SOURCE)
         self.assertIn("BLOCK_WIDTH = 1024", SOURCE)
-        self.assertIn("grid = (sequence_kv,)", SOURCE)
+        self.assertIn("_two_stage_dkv_kernel[(sequence_kv,)]", SOURCE)
         self.assertIn("torch.argsort(route_ids, stable=True)", SOURCE)
         self.assertIn("QUERY_ID_BITS = 12", SOURCE)
         self.assertIn("route_ids = (keys << QUERY_ID_BITS)", SOURCE)
@@ -145,6 +165,7 @@ class SparseMlaTwoStageTest(unittest.TestCase):
             and arg.annotation.attr == "constexpr"
         }
         expected = {
+            "ACCUMULATE",
             "ATTENTION_HEADS",
             "VALUE_WIDTH",
             "TOTAL_WIDTH",
