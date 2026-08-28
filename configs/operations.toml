@@ -192,6 +192,15 @@ workers = 7
 trainer_budget_seconds = 210
 inference_budget_seconds = 105
 
+[qualification_commands.glm52_lora_fusion_smoke]
+host_group = "trainer_head"
+gpu = 0
+image = "trainer_image"
+script = "scripts/ops/benchmark_fused_qkv_a_lora_sm89.py"
+source_module = "source/src/prime_rl/trainer/models/layers/lora/multi_linear.py"
+remote_timeout_seconds = 180
+ssh_timeout_seconds = 240
+
 [parity.glm52]
 fixture = "/data/glm52-rl/qualifications/glm52-policy-parity/fixture"
 h200_capture = "/data/glm52-rl/qualifications/glm52-policy-parity/h200-capture-final"

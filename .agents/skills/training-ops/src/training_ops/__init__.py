@@ -53,6 +53,7 @@ models = operations["models"]
 inference_settings = operations["inference"]
 reward_settings = operations["reward"]
 limits = operations["limits"]
+qualification_commands = operations["qualification_commands"]
 shared_requirements = operations["requirements"]["shared"]
 muse_requirements = operations["requirements"]["muse"]
 glm_requirements = operations["requirements"]["glm52"]
@@ -10780,6 +10781,150 @@ cat {shlex.quote(result_path)}
     return result
 
 
+def _lora_fusion_smoke_spec() -> tuple[str, str, str, str, int, int]:
+    settings = qualification_commands.get("glm52_lora_fusion_smoke")
+    if not isinstance(settings, dict):
+        raise Refused("GLM LoRA fusion smoke is missing from operations config")
+    if settings.get("host_group") != "trainer_head":
+        raise Refused("GLM LoRA fusion smoke must use the configured trainer_head group")
+    if settings.get("gpu") != 0:
+        raise Refused("GLM LoRA fusion smoke must use GPU 0")
+    image_key = settings.get("image")
+    if image_key != "trainer_image" or image_key not in containers:
+        raise Refused("GLM LoRA fusion smoke must use the configured trainer image")
+    script = settings.get("script")
+    module = settings.get("source_module")
+    if script != "scripts/ops/benchmark_fused_qkv_a_lora_sm89.py":
+        raise Refused("GLM LoRA fusion smoke script differs from its registered command")
+    if module != "source/src/prime_rl/trainer/models/layers/lora/multi_linear.py":
+        raise Refused("GLM LoRA fusion smoke source module differs from its registered command")
+    remote_timeout = settings.get("remote_timeout_seconds")
+    ssh_timeout = settings.get("ssh_timeout_seconds")
+    if (
+        isinstance(remote_timeout, bool)
+        or not isinstance(remote_timeout, int)
+        or remote_timeout != 180
+        or isinstance(ssh_timeout, bool)
+        or not isinstance(ssh_timeout, int)
+        or ssh_timeout != 240
+    ):
+        raise Refused("GLM LoRA fusion smoke deadlines must be 180 seconds and 240 seconds")
+    host = trainer_head
+    _check_host(host)
+    image = containers[image_key]
+    if not isinstance(image, str) or not image:
+        raise Refused("GLM LoRA fusion smoke image is invalid")
+    return host, image, script, module, remote_timeout, ssh_timeout
+
+
+def _lora_fusion_smoke_command(
+    repository: str,
+    image: str,
+    script: str,
+    module: str,
+    container: str,
+    gpu: int,
+    remote_timeout: int,
+) -> str:
+    quoted_container = shlex.quote(container)
+    quoted_gpu = shlex.quote(str(gpu))
+    quoted_script = shlex.quote(f"{repository}/{script}")
+    quoted_module = shlex.quote(f"{repository}/{module}")
+    quoted_image = shlex.quote(image)
+    return f"""set -euo pipefail
+container={quoted_container}
+gpu={quoted_gpu}
+cleanup() {{ sudo docker rm -f "$container" >/dev/null 2>&1 || true; }}
+trap cleanup EXIT
+compute_pids() {{ sudo nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits -i "$gpu"; }}
+assert_no_compute_pids() {{
+  local pids
+  if ! pids=$(compute_pids | sed '/^[[:space:]]*$/d'); then
+    echo "cannot inspect GPU $gpu processes" >&2
+    return 1
+  fi
+  test -z "$pids"
+}}
+assert_container_absent() {{
+  local containers
+  if ! containers=$(sudo docker ps -aq --filter name=^"$container"$); then
+    echo "cannot inspect smoke container" >&2
+    return 1
+  fi
+  test -z "$containers"
+}}
+assert_no_compute_pids
+assert_container_absent
+status=0
+sudo timeout --foreground --signal=TERM --kill-after=20s {remote_timeout}s sudo docker run --rm \\
+  --name "$container" --gpus device="$gpu" --network none --ipc private \\
+  --read-only --cap-drop=ALL --security-opt=no-new-privileges \\
+  --tmpfs /tmp:rw,nosuid,nodev,size=1024m \\
+  --env CUDA_VISIBLE_DEVICES=0 --env HOME=/tmp --env TRITON_CACHE_DIR=/tmp/triton \\
+  --env PRIME_LORA_MM_PROFILE=sm89-r32 --env PRIME_EP_PROFILE=0 \\
+  --env PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD=0 \\
+  --env PYTHONPATH=/app/src:/app/packages/prime-rl-configs/src \\
+  --mount type=bind,src={quoted_script},dst=/opt/glm52-lora-fusion-smoke.py,readonly \\
+  --mount type=bind,src={quoted_module},dst=/app/src/prime_rl/trainer/models/layers/lora/multi_linear.py,readonly \\
+  {quoted_image} python3 /opt/glm52-lora-fusion-smoke.py \\
+  --warmup 5 --iterations 20 --tokens 4096 || status=$?
+cleanup
+clean=0
+for _ in $(seq 1 20); do
+  if assert_no_compute_pids && assert_container_absent; then
+    clean=1
+    break
+  fi
+  sleep 1
+done
+if test "$clean" -ne 1; then
+  echo "GLM LoRA fusion smoke cleanup failed" >&2
+  test "$status" -ne 0 || status=125
+fi
+exit "$status"
+"""
+
+
+def qualify_glm52_lora_fusion() -> dict[str, object]:
+    """Run the opt-in one-GPU GLM LoRA fusion smoke."""
+    host, image, script, module, remote_timeout, ssh_timeout = _lora_fusion_smoke_spec()
+    repository = _repository_root("glm52-qualification")
+    with _ssh_control_masters([host]):
+        _assert_live_services_are_down([host], include_inference=False)
+        for path in (script, module):
+            if not deploy(
+                path,
+                nodes=[host],
+                repository="glm52-qualification",
+                profile_name="glm52-lora-fusion-smoke",
+            ):
+                raise RuntimeError(f"failed to deploy {path}")
+        container = f"glm52-lora-fusion-smoke-{secrets.token_hex(8)}"
+        code, output = _ssh(
+            host,
+            _lora_fusion_smoke_command(
+                repository,
+                image,
+                script,
+                module,
+                container,
+                0,
+                remote_timeout,
+            ),
+            timeout=ssh_timeout,
+        )
+    if code:
+        raise RuntimeError(f"GLM LoRA fusion SM89 smoke failed on {host}: {output.strip()}")
+    try:
+        result = json.loads(output.strip())
+    except json.JSONDecodeError as error:
+        raise RuntimeError("GLM LoRA fusion SM89 smoke returned invalid JSON") from error
+    if not isinstance(result, dict) or result.get("status") != "passed":
+        raise RuntimeError("GLM LoRA fusion SM89 smoke did not pass")
+    print(json.dumps(result, sort_keys=True))
+    return result
+
+
 def _copy_resume_adapter(path: str, nodes: list[str]) -> None:
     """Copy one adapter from the trainer head to missing trainer nodes."""
     if "\x00" in path:
@@ -14122,6 +14267,12 @@ def _qualify_glm52_step20_parity_action(arguments: list[str]):
     )
 
 
+def _qualify_glm52_lora_fusion_action(arguments: list[str]):
+    if arguments:
+        raise Refused("qualify-glm52-lora-fusion takes no arguments")
+    return qualify_glm52_lora_fusion()
+
+
 def _stage_glm52_step20_adapter_action(arguments: list[str]):
     if arguments:
         raise Refused("stage-glm52-step20-adapter takes no arguments")
@@ -14177,6 +14328,7 @@ actions = {
     "archive": _archive_action,
     "qualify": lambda a: qualify(*a),
     "qualify-glm52-pp-async-cuda": _qualify_glm52_pp_async_cuda_action,
+    "qualify-glm52-lora-fusion": _qualify_glm52_lora_fusion_action,
     "stage-glm52-parity": lambda a: stage_glm52_policy_parity(a or None),
     "collect-glm52-parity": lambda a: collect_glm52_policy_parity(a[0] if a else ""),
     "qualify-glm52-step20-parity": _qualify_glm52_step20_parity_action,
@@ -14218,6 +14370,7 @@ usage = f"""training-ops <action> [args]
                                 add --finished after another run is active
   qualify <profile>             start a trainer-only profile
   qualify-glm52-pp-async-cuda  run fixed two-step PP8 CUDA parity on n82
+  qualify-glm52-lora-fusion    run the opt-in one-GPU SM89 LoRA smoke
   qualify-glm52-step20-parity  score fixed parity tokens with the step-20 adapter
   stage-glm52-step20-adapter   copy the exact step-20 adapter to H200
   stage-glm52-parity [node ...] validate and stage the exact parity reference
