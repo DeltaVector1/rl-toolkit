@@ -10211,7 +10211,6 @@ def deploy(
     return not bad
 
 
-<<<<<<< HEAD
 def _pp_async_cuda_diagnostic_program(output_dir: str, rank_count: int = 8) -> str:
     return f"""
 import json
