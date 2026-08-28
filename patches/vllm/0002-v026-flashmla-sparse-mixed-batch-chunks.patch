@@ -1,5 +1,5 @@
 diff --git a/vllm/v1/attention/backends/mla/flashmla_sparse.py b/vllm/v1/attention/backends/mla/flashmla_sparse.py
-index e8be7ad5b..ec60522a4 100644
+index e8be7ad5b..1f7f6c060 100644
 --- a/vllm/v1/attention/backends/mla/flashmla_sparse.py
 +++ b/vllm/v1/attention/backends/mla/flashmla_sparse.py
 @@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, ClassVar
@@ -10,18 +10,31 @@ index e8be7ad5b..ec60522a4 100644
  from vllm.config import VllmConfig, get_current_vllm_config
  from vllm.config.cache import CacheDType
  from vllm.logger import init_logger
-@@ -60,6 +61,20 @@ logger = init_logger(__name__)
+@@ -60,6 +61,33 @@ logger = init_logger(__name__)
  # batch mode (#1).
  MIN_HEADS_FOR_BF16_PREFILL = 32
  
 +# FlashMLA holds two float32 scratch tensors with shape [tokens, 64, 512].
 +fp8_sparse_scratch_bytes_per_token = 2 * 64 * 512 * 4
 +
++# The FP8 decode kernel receives a [batch, tokens, heads, dim] query.  Its
++# batch stride is passed as signed int32 bytes.  GLM TP8 has 8 local heads,
++# which the kernel pads to 64; at 32K this is 2,415,919,104 bytes.
++FP8_SPARSE_QUERY_STRIDE_BYTES_PER_TOKEN = 64 * 576 * 2
++FP8_SPARSE_MAX_INT32_STRIDE_BYTES = (1 << 31) - 1
++
 +
 +def fp8_mixed_batch_chunk_size(max_scratch_mb: int) -> int:
 +    if max_scratch_mb <= 0:
 +        raise ValueError("VLLM_FLASHMLA_SPARSE_MAX_SCRATCH_MB must be positive")
-+    return (max_scratch_mb * 1024 * 1024) // fp8_sparse_scratch_bytes_per_token
++    scratch_tokens = (
++        max_scratch_mb * 1024 * 1024
++    ) // fp8_sparse_scratch_bytes_per_token
++    stride_tokens = (
++        FP8_SPARSE_MAX_INT32_STRIDE_BYTES
++        // FP8_SPARSE_QUERY_STRIDE_BYTES_PER_TOKEN
++    )
++    return min(scratch_tokens, stride_tokens)
 +
 +
 +fp8_mixed_batch_chunk_tokens = fp8_mixed_batch_chunk_size(
