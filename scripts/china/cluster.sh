@@ -15,6 +15,7 @@ layer_profile_every=180
 phase_profile=0
 phase_profile_steps=1
 phase_profile_sample_every=8
+phase_profile_record_path=""
 trainer_module=prime_rl.trainer.rl.train
 nsys_env=()
 nsys_mounts=()
@@ -315,9 +316,9 @@ PY
     fi
     if [ -n "$configured_phase_profile" ]; then
       case "$(readlink -f "$trainer_config")" in
-        "$(readlink -f "$deployment/configs/qualification/glm52-native-small.toml")"|"$(readlink -f "$deployment/configs/qualification/glm52-native-b2048.toml")"|"$(readlink -f "$deployment/configs/qualification/glm52-native-b2048-memory.toml")") ;;
+        "$(readlink -f "$deployment/configs/qualification/glm52-native-small.toml")"|"$(readlink -f "$deployment/configs/qualification/glm52-native-b2048.toml")"|"$(readlink -f "$deployment/configs/qualification/glm52-native-b2048-memory.toml")"|"$(readlink -f "$deployment/configs/qualification/glm52-native-b2048-nsys.toml")") ;;
         *)
-          echo "phase profiling may only be enabled by a GLM small or b2048 qualification config" >&2
+          echo "phase profiling may only be enabled by a GLM qualification config" >&2
           exit 1
           ;;
       esac
@@ -328,6 +329,21 @@ PY
       phase_profile="$configured_phase_profile"
       phase_profile_steps="$configured_phase_profile_steps"
       phase_profile_sample_every="$configured_phase_profile_sample_every"
+    fi
+    if [ -n "${PRIME_PHASE_PROFILE_RECORD_PATH:-}" ]; then
+      [ -n "${PRIME_QUALIFICATION_PROFILE:-}" ] || {
+        echo "phase profile records require a qualification profile" >&2
+        exit 1
+      }
+      [ "$phase_profile" = "1" ] || {
+        echo "phase profile records require phase profiling" >&2
+        exit 1
+      }
+      [ "$PRIME_PHASE_PROFILE_RECORD_PATH" = "$trainer_output/phase-profile.json" ] || {
+        echo "phase profile record path must be under the selected qualification output" >&2
+        exit 1
+      }
+      phase_profile_record_path="$PRIME_PHASE_PROFILE_RECORD_PATH"
     fi
     if [ "${PRIME_QUALIFICATION_PROFILE:-}" = "glm52-native-b2048-memory" ]; then
       [ "$(readlink -f "$trainer_config")" = "$(readlink -f "$deployment/configs/qualification/glm52-native-b2048-memory.toml")" ] || {
@@ -749,6 +765,7 @@ PY
       -e PRIME_PHASE_PROFILE="$phase_profile" \
       -e PRIME_PHASE_PROFILE_STEPS="$phase_profile_steps" \
       -e PRIME_PHASE_PROFILE_SAMPLE_EVERY="$phase_profile_sample_every" \
+      -e PRIME_PHASE_PROFILE_RECORD_PATH="$phase_profile_record_path" \
       -e PRIME_CUDA_PROFILE="${PRIME_CUDA_PROFILE:-0}" \
       -e PRIME_CUDA_PROFILE_RANK="${PRIME_CUDA_PROFILE_RANK:-24}" \
       -e PRIME_CUDA_PROFILE_STEPS="${PRIME_CUDA_PROFILE_STEPS:-2}" \

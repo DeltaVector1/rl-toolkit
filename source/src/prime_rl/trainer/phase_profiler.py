@@ -19,6 +19,7 @@ import heapq
 import json
 import os
 import statistics
+import sys
 import tempfile
 from collections import deque
 from contextlib import contextmanager
@@ -63,6 +64,7 @@ _CUDA_MEMORY_CAPTURE_MAX_SEGMENTS = 64
 _CUDA_MEMORY_CAPTURE_MAX_BLOCKS = 256
 _CUDA_MEMORY_CAPTURE_MAX_TRACE_ENTRIES = 256
 _CUDA_MEMORY_CAPTURE_MAX_ERROR_CHARS = 512
+_PHASE_PROFILE_MAX_OUTPUT_BYTES = 256 * 1024
 
 
 def _safe_int(value: Any) -> int:
@@ -221,6 +223,41 @@ def _rank_artifact_path(base: Path, rank: int) -> Path:
     if base.suffix:
         return base.with_name(f"{base.stem}.rank_{rank}{base.suffix}")
     return base / f"rank_{rank}.json"
+
+
+def _phase_record_path(base: Path, rank: int, step: int) -> Path:
+    """Return one unique path for a rank and profiled step."""
+    if base.suffix:
+        return base.with_name(
+            f"{base.stem}.rank_{int(rank)}.step_{int(step)}{base.suffix}"
+        )
+    return base / f"rank_{int(rank)}.step_{int(step)}.json"
+
+
+def _atomic_write(path: Path, payload: bytes) -> None:
+    """Write one bounded diagnostic file without exposing a partial file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as output:
+            temporary = Path(output.name)
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def _safe_stat(value: Any) -> int | float | None:
@@ -867,6 +904,21 @@ class PhaseProfiler:
         self._calls: dict[str, int] = {}
         self._spans: list[tuple[str, Any, Any, str | None]] = []
         self._stack: list[str] = []
+        self._record_path: Path | None = None
+        configured_record_path = os.environ.get(
+            "PRIME_PHASE_PROFILE_RECORD_PATH", ""
+        ).strip()
+        if configured_record_path:
+            if not os.environ.get("PRIME_QUALIFICATION_PROFILE", "").strip():
+                raise ValueError(
+                    "PRIME_PHASE_PROFILE_RECORD_PATH requires a qualification profile"
+                )
+            record_path = Path(configured_record_path)
+            if not record_path.is_absolute():
+                raise ValueError(
+                    "PRIME_PHASE_PROFILE_RECORD_PATH must be an absolute path"
+                )
+            self._record_path = record_path
 
     @property
     def active(self) -> bool:
@@ -1002,6 +1054,84 @@ class PhaseProfiler:
         self._spans.clear()
         self._calls.clear()
         return result
+
+    @staticmethod
+    def _record_number(value: Any) -> float:
+        parsed = _safe_stat(value)
+        return float(parsed) if parsed is not None else 0.0
+
+    @classmethod
+    def _bounded_record_payload(cls, report: dict[str, Any]) -> bytes:
+        """Encode the fixed phase record within the artifact size limit."""
+        raw_categories = report.get("categories", {})
+        categories: dict[str, dict[str, float | int | bool]] = {}
+        for phase in PHASES:
+            raw = raw_categories.get(phase, {}) if isinstance(raw_categories, dict) else {}
+            if not isinstance(raw, dict):
+                raw = {}
+            categories[phase] = {
+                "calls": max(0, _safe_int(raw.get("calls", 0))),
+                "sampled": max(0, _safe_int(raw.get("sampled", 0))),
+                "estimated": bool(raw.get("estimated", False)),
+                "inclusive_ms": cls._record_number(raw.get("inclusive_ms", 0.0)),
+                "exclusive_ms": cls._record_number(raw.get("exclusive_ms", 0.0)),
+            }
+        record = {
+            "format": "prime-phase-profile-v1",
+            "status": "ok",
+            "rank": max(0, _safe_int(report.get("rank", 0))),
+            "stage": max(0, _safe_int(report.get("stage", 0))),
+            "step": max(0, _safe_int(report.get("step", 0))),
+            "step_ms": cls._record_number(report.get("step_ms", 0.0)),
+            "sample_every": max(1, _safe_int(report.get("sample_every", 1))),
+            "classified_sum_ms": cls._record_number(
+                report.get("classified_sum_ms", 0.0)
+            ),
+            "modeled_overhead_fraction": cls._record_number(
+                report.get("modeled_overhead_fraction", 0.0)
+            ),
+            "categories": categories,
+        }
+        payload = json.dumps(
+            record, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
+        if len(payload) > _PHASE_PROFILE_MAX_OUTPUT_BYTES:
+            # The schema above is fixed, but keep a strict bound if a future
+            # edit adds an unexpectedly large field.
+            record = {
+                "format": "prime-phase-profile-v1",
+                "status": "truncated",
+                "rank": record["rank"],
+                "stage": record["stage"],
+                "step": record["step"],
+            }
+            payload = json.dumps(
+                record, sort_keys=True, separators=(",", ":"), allow_nan=False
+            ).encode("utf-8")
+        if len(payload) > _PHASE_PROFILE_MAX_OUTPUT_BYTES:
+            raise RuntimeError("phase profile record exceeds its size limit")
+        return payload
+
+    def write_report(self, report: dict[str, Any]) -> bool:
+        """Write one local rank/stage record when qualification capture is enabled."""
+        if self._record_path is None:
+            return False
+        rank = max(0, _safe_int(report.get("rank", 0)))
+        step = max(0, _safe_int(report.get("step", 0)))
+        path = _phase_record_path(self._record_path, rank, step)
+        try:
+            _atomic_write(path, self._bounded_record_payload(report))
+        except Exception as error:
+            # A diagnostic write must not leave peer ranks waiting in the
+            # existing all-gather.  Surface the error and keep training alive.
+            print(
+                f"[phase-profile] record write failed: {path}: "
+                f"{type(error).__name__}: {str(error)[:160]}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return False
+        return True
 
     @staticmethod
     def modeled_overhead_fraction(

@@ -92,7 +92,7 @@ launch_env = { PRIME_CUDA_MEMORY_CAPTURE = "1", PRIME_CUDA_MEMORY_CAPTURE_RANK =
 kind = "glm52"
 trainer_container = "glm52_qualification_trainer"
 trainer = "configs/qualification/glm52-native-b2048-nsys.toml"
-launch_env = { PRIME_NSYS_PROFILE = "1", PRIME_CUDA_PROFILE = "1", PRIME_CUDA_PROFILE_RANK = "24", PRIME_CUDA_PROFILE_STEPS = "2" }
+launch_env = { PRIME_NSYS_PROFILE = "1", PRIME_CUDA_PROFILE = "1", PRIME_CUDA_PROFILE_RANK = "24", PRIME_CUDA_PROFILE_STEPS = "2", PRIME_PHASE_PROFILE_RECORD_PATH = "/data/glm52-rl/qualifications/glm52-native-b2048-nsys-20260827/phase-profile.json" }
 
 [profiles.glm52-native-delta3]
 kind = "glm52"

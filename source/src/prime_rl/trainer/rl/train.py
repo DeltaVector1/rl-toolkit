@@ -2632,6 +2632,7 @@ def _train_impl(config: TrainerConfig):
         if phase_report is not None:
             phase_reports = [None] * dist.get_world_size()
             dist.all_gather_object(phase_reports, phase_report)
+            phase_profiler.write_report(phase_report)
             if dist.get_rank() == 0:
                 logger.info(
                     get_phase_profiler().format_aggregate(phase_reports)
