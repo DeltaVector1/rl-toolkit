@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "kind": "glm52_mtp_h200_benchmark",
+  "profile": "glm52-mtp-h200",
+  "status": "not_run",
+  "baseline": null,
+  "mtp": null
+}

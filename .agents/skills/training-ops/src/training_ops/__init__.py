@@ -64,6 +64,9 @@ glm52_verified_loaded_library_manifest_sha256 = (
 )
 glm_parity_paths = operations["parity"]["glm52"]
 glm_step20_h200_gate = operations["gate"]["glm52_step20_h200"]
+glm52_mtp_h200_qualification = operations["qualification"]["glm52_mtp_h200"]
+if set(glm52_mtp_h200_qualification) != {"profile", "launcher", "benchmark", "output"}:
+    raise RuntimeError("GLM MTP H200 qualification inventory is invalid")
 glm_parity_root = "/data/glm52-rl/qualifications/glm52-policy-parity"
 glm_parity_stage_candidate_root = f"{glm_parity_root}/.stage-candidates"
 glm_parity_stage_docker_timeout = 1800

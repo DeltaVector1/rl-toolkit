@@ -251,6 +251,10 @@ container_id=$(docker run -d --cidfile "$engine_cidfile" \
   --mount "type=bind,source=$overlay_root/vllm/v1/attention/backends/mla/flashmla_sparse.py,target=/app/.venv/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/flashmla_sparse.py,readonly" \
   --mount "type=bind,source=$overlay_root/vllm/model_executor/layers/logits_processor.py,target=/app/.venv/lib/python3.12/site-packages/vllm/model_executor/layers/logits_processor.py,readonly" \
   --mount "type=bind,source=$overlay_root/vllm/model_executor/models/deepseek_v2.py,target=/app/.venv/lib/python3.12/site-packages/vllm/model_executor/models/deepseek_v2.py,readonly" \
+  --mount "type=bind,source=$overlay_root/vllm/model_executor/layers/attention/attention.py,target=/app/.venv/lib/python3.12/site-packages/vllm/model_executor/layers/attention/attention.py,readonly" \
+  --mount "type=bind,source=$overlay_root/vllm/model_executor/layers/attention/mla_attention.py,target=/app/.venv/lib/python3.12/site-packages/vllm/model_executor/layers/attention/mla_attention.py,readonly" \
+  --mount "type=bind,source=$overlay_root/vllm/model_executor/models/extract_hidden_states.py,target=/app/.venv/lib/python3.12/site-packages/vllm/model_executor/models/extract_hidden_states.py,readonly" \
+  --mount "type=bind,source=$overlay_root/vllm/models/deepseek_v32/nvidia/attention.py,target=/app/.venv/lib/python3.12/site-packages/vllm/models/deepseek_v32/nvidia/attention.py,readonly" \
   --mount "type=bind,source=$overlay_root/vllm/v1/worker/gpu_model_runner.py,target=/app/.venv/lib/python3.12/site-packages/vllm/v1/worker/gpu_model_runner.py,readonly" \
   --mount "type=bind,source=$overlay_root/vllm/v1/core/sched/output.py,target=/app/.venv/lib/python3.12/site-packages/vllm/v1/core/sched/output.py,readonly" \
   --mount "type=bind,source=$overlay_root/vllm/v1/core/sched/scheduler.py,target=/app/.venv/lib/python3.12/site-packages/vllm/v1/core/sched/scheduler.py,readonly" \

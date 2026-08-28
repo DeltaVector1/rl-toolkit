@@ -1,0 +1,79 @@
+# Isolated GLM-5.2 H200 MTP qualification.  This file is not a production
+# profile.  Use scripts/h200/start_mtp_qualification.sh only after the
+# non-MTP adapter path has passed its acceptance checks.
+
+enable_lora = true
+max_loras = 1
+max_cpu_loras = 2
+max_lora_rank = 32
+lora_target_modules = [
+  "q_a_proj",
+  "q_b_proj",
+  "kv_a_proj_with_mqa",
+  "kv_b_proj",
+  "o_proj",
+  "gate_proj",
+  "up_proj",
+  "down_proj",
+  "shared_expert",
+  "experts",
+]
+gpu_memory_utilization = 0.92
+enable_prefix_caching = true
+enable_expert_parallel = false
+enable_eplb = false
+enable_return_routed_experts = true
+api_server_count = 1
+backend_port = 8100
+
+# The target keeps the existing CUDA-graph capture setting.  The MTP draft is
+# eager because DeepSeek-v3.2 MTP CUDA graphs are not a safe path in vLLM 0.26.
+# Router traces are requested only on the target request by the benchmark; a
+# draft request must never write a route trace.
+[vllm_extra]
+kv_cache_dtype = "bfloat16"
+max_num_seqs = 128
+max_num_batched_tokens = 32768
+
+[vllm_extra.attention_config]
+backend = "FLASH_ATTN_MLA_SPARSE"
+mla_prefill_backend = "FLASH_ATTN"
+
+[vllm_extra.speculative_config]
+method = "mtp"
+num_speculative_tokens = 1
+draft_tensor_parallel_size = 8
+max_model_len = 32768
+attention_backend = "FLASH_ATTN_MLA_SPARSE"
+kv_cache_dtype = "bfloat16"
+enforce_eager = true
+
+[vllm_extra.compilation_config]
+max_cudagraph_capture_size = 256
+
+[server]
+host = "0.0.0.0"
+port = 8000
+liveness_timeout_seconds = 120.0
+
+[log]
+level = "info"
+
+[model]
+name = "/models/glm52-fp8"
+dtype = "bfloat16"
+max_model_len = 32768
+reasoning_parser = "glm45"
+tool_call_parser = "glm47"
+
+[parallel]
+tp = 8
+dp = 1
+
+[weight_broadcast]
+type = "filesystem"
+
+[env_vars]
+PRIME_LORA_CACHE_DIR = "/data/glm52-rl/lora-cache"
+VLLM_WORKER_MULTIPROC_METHOD = "spawn"
+NCCL_SOCKET_IFNAME = "eth0"

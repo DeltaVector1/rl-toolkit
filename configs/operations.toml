@@ -209,6 +209,12 @@ adapter = "/data/glm52-rl/qualifications/glm52-step20-h200/adapter-step20"
 qualification_result = "/data/glm52-rl/qualifications/glm52-step20-h200/adapter-step20/.qualification-result.json"
 trainer_adapter = "/data/glm52-rl/qualifications/glm52-native-stability20/run_trainer_only/broadcasts/step_20/adapter_model.safetensors"
 
+[qualification.glm52_mtp_h200]
+profile = "configs/qualification/glm52-mtp-h200.toml"
+launcher = "scripts/h200/start_mtp_qualification.sh"
+benchmark = "scripts/h200/benchmark_glm52_mtp.py"
+output = "benchmarks/glm52-mtp-h200.json"
+
 [requirements.shared]
 group_size = 16
 max_output_length = 16384

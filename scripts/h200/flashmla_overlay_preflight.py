@@ -38,6 +38,22 @@ FILES = {
     "extract_hidden_states": "vllm/model_executor/models/extract_hidden_states.py",
     "deepseek_v32_attention": "vllm/models/deepseek_v32/nvidia/attention.py",
 }
+# Every patched package file must be mounted into the runtime.  Keeping this
+# list in the preflight manifest makes an omitted mount a startup error rather
+# than a silent fallback to the image's unpatched vLLM code.
+RUNTIME_MOUNTS = {
+    "envs": "/app/.venv/lib/python3.12/site-packages/vllm/envs.py",
+    "flashmla": "/app/.venv/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/flashmla_sparse.py",
+    "logits_processor": "/app/.venv/lib/python3.12/site-packages/vllm/model_executor/layers/logits_processor.py",
+    "deepseek_v2": "/app/.venv/lib/python3.12/site-packages/vllm/model_executor/models/deepseek_v2.py",
+    "attention": "/app/.venv/lib/python3.12/site-packages/vllm/model_executor/layers/attention/attention.py",
+    "mla_attention": "/app/.venv/lib/python3.12/site-packages/vllm/model_executor/layers/attention/mla_attention.py",
+    "extract_hidden_states": "/app/.venv/lib/python3.12/site-packages/vllm/model_executor/models/extract_hidden_states.py",
+    "deepseek_v32_attention": "/app/.venv/lib/python3.12/site-packages/vllm/models/deepseek_v32/nvidia/attention.py",
+    "gpu_model_runner": "/app/.venv/lib/python3.12/site-packages/vllm/v1/worker/gpu_model_runner.py",
+    "scheduler_output": "/app/.venv/lib/python3.12/site-packages/vllm/v1/core/sched/output.py",
+    "scheduler": "/app/.venv/lib/python3.12/site-packages/vllm/v1/core/sched/scheduler.py",
+}
 SOURCE_FILES = {
     "parity_router_trace": "source/src/prime_rl/parity_router_trace.py",
 }
@@ -96,6 +112,8 @@ def verify_manifest(deployment: Path, overlay: Path, image: str) -> dict[str, ob
         raise OverlayError(f"overlay preflight manifest is unreadable: {manifest_path}") from error
     if manifest.get("preflight_passed") is not True:
         raise OverlayError("overlay preflight marker is not passed")
+    if manifest.get("runtime_mounts") != RUNTIME_MOUNTS:
+        raise OverlayError("overlay runtime mount manifest is missing or differs")
     actual_image_id = image_id(image)
     if manifest.get("image_id") != actual_image_id or actual_image_id != EXPECTED_IMAGE_ID:
         raise OverlayError(
@@ -122,6 +140,11 @@ def verify_manifest(deployment: Path, overlay: Path, image: str) -> dict[str, ob
     if not launcher.is_file():
         raise OverlayError(f"inference launcher is missing: {launcher}")
     launcher_text = launcher.read_text()
+    for name, target in RUNTIME_MOUNTS.items():
+        relative = FILES[name]
+        mount = f"source=$overlay_root/{relative},target={target},readonly"
+        if mount not in launcher_text:
+            raise OverlayError(f"launcher is missing the {name} overlay mount")
     if (
         '"$deployment/source/src/prime_rl/parity_router_trace.py":/app/src/prime_rl/parity_router_trace.py:ro'
         not in launcher_text
@@ -235,6 +258,7 @@ def prepare(deployment: Path, overlay: Path, image: str) -> dict[str, object]:
         "image": image,
         "image_id": image_id(image),
         "files": {name: sha256(overlay / relative) for name, relative in FILES.items()},
+        "runtime_mounts": RUNTIME_MOUNTS,
         "patches": {relative: sha256(deployment / relative) for relative in PATCHES},
         "test_sha256": sha256(test_path),
         "source_files": {name: sha256(deployment / relative) for name, relative in SOURCE_FILES.items()},

@@ -31,6 +31,12 @@ class FlashMLAOverlayTests(unittest.TestCase):
         launcher.write_text(
             '"$deployment/source/src/prime_rl/parity_router_trace.py":'
             "/app/src/prime_rl/parity_router_trace.py:ro\n"
+            + "\n".join(
+                f'--mount "type=bind,source=$overlay_root/{relative},'
+                f'target={overlay.RUNTIME_MOUNTS[name]},readonly"'
+                for name, relative in overlay.FILES.items()
+            )
+            + "\n"
         )
         for relative in overlay.SOURCE_FILES.values():
             path = self.deployment / relative
@@ -43,6 +49,7 @@ class FlashMLAOverlayTests(unittest.TestCase):
                 name: hashlib.sha256((self.overlay / relative).read_bytes()).hexdigest()
                 for name, relative in overlay.FILES.items()
             },
+            "runtime_mounts": overlay.RUNTIME_MOUNTS,
             "patches": {
                 relative: hashlib.sha256((self.deployment / relative).read_bytes()).hexdigest()
                 for relative in overlay.PATCHES
@@ -86,8 +93,19 @@ class FlashMLAOverlayTests(unittest.TestCase):
 
     def test_launcher_has_exact_read_only_mounts(self):
         launcher = (Path(__file__).parents[1] / "scripts/h200/start_inference.sh").read_text()
-        self.assertIn("target=/app/.venv/lib/python3.12/site-packages/vllm/envs.py,readonly", launcher)
-        self.assertIn("target=/app/.venv/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/flashmla_sparse.py,readonly", launcher)
+        for name, target in overlay.RUNTIME_MOUNTS.items():
+            self.assertIn(
+                f"source=$overlay_root/{overlay.FILES[name]},target={target},readonly",
+                launcher,
+            )
+
+    def test_manifest_requires_the_complete_runtime_mount_set(self):
+        manifest = json.loads((self.overlay / "manifest.json").read_text())
+        manifest.pop("runtime_mounts")
+        (self.overlay / "manifest.json").write_text(json.dumps(manifest))
+        with mock.patch.object(overlay, "image_id", return_value=overlay.EXPECTED_IMAGE_ID):
+            with self.assertRaises(overlay.OverlayError):
+                overlay.verify_manifest(self.deployment, self.overlay, "base")
 
 
 if __name__ == "__main__":
