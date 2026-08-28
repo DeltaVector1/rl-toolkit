@@ -392,7 +392,7 @@ _b2048_qualification_profiles = frozenset(
         "glm52-native-pp-async",
         "glm52-native-pp-grouped",
         "glm52-native-pp-grouped-lora",
-        "glm52-native-pp-grouped-lora-sparse-two-stage",
+        "glm52-native-pp-1f1b-lora-sparse-two-stage",
     }
 )
 
@@ -1110,7 +1110,7 @@ def _train_impl(config: TrainerConfig):
             "glm52-native-pp-async",
             "glm52-native-pp-grouped",
             "glm52-native-pp-grouped-lora",
-            "glm52-native-pp-grouped-lora-sparse-two-stage",
+            "glm52-native-pp-1f1b-lora-sparse-two-stage",
         }
     ):
         raise RuntimeError(
@@ -1148,7 +1148,7 @@ def _train_impl(config: TrainerConfig):
             "glm52-native-pp-async": (2, False),
             "glm52-native-pp-grouped": (2, False),
             "glm52-native-pp-grouped-lora": (2, False),
-            "glm52-native-pp-grouped-lora-sparse-two-stage": (2, False),
+            "glm52-native-pp-1f1b-lora-sparse-two-stage": (2, False),
             "glm52-native-stability20": (20, True),
         }[qualification_identity["PRIME_QUALIFICATION_PROFILE"]]
         if (
@@ -1170,7 +1170,7 @@ def _train_impl(config: TrainerConfig):
                 in {
                     "glm52-native-b2048-lora",
                     "glm52-native-pp-grouped-lora",
-                    "glm52-native-pp-grouped-lora-sparse-two-stage",
+                    "glm52-native-pp-1f1b-lora-sparse-two-stage",
                 }
                 and config.model.lora.fused_qkv_a_lora is not True
             )

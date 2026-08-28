@@ -195,14 +195,14 @@ def test_native_b2048_lora_profile_keeps_plain_pipeline_schedule():
 
 def test_sparse_two_stage_profile_is_opt_in_and_keeps_qualification_shape():
     operations = _load("configs/operations.toml")
-    profile = operations["profiles"]["glm52-native-pp-grouped-lora-sparse-two-stage"]
+    profile = operations["profiles"]["glm52-native-pp-1f1b-lora-sparse-two-stage"]
     assert profile == {
         "kind": "glm52",
         "trainer_container": "glm52_qualification_trainer",
-        "trainer": "configs/qualification/glm52-native-pp-grouped-lora-sparse-two-stage.toml",
+        "trainer": "configs/qualification/glm52-native-pp-1f1b-lora-sparse-two-stage.toml",
         "launch_env": {
             "PRIME_PHASE_PROFILE_RECORD_PATH": (
-                "/data/glm52-rl/qualifications/glm52-native-pp-grouped-lora-sparse-two-stage/"
+                "/data/glm52-rl/qualifications/glm52-native-pp-1f1b-lora-sparse-two-stage/"
                 "phase-profile.json"
             ),
             "PRIME_SPARSE_BWD_TWO_STAGE": "1",
@@ -221,12 +221,13 @@ def test_sparse_two_stage_profile_is_opt_in_and_keeps_qualification_shape():
     assert model["lora"]["rank"] == 32
     assert set(model["lora"]["target_modules"]) == TARGETS
     assert model["lora"]["fused_qkv_a_lora"] is True
+    assert model["pp_schedule"] == "1f1b"
     assert "rollout_cache" not in config["data"]
 
     training_ops = _training_ops()
     assert "source/src/prime_rl/trainer/models/kernels/sparse_mla_two_stage.py" not in training_ops._qualification_mounts(PROFILE_NAME)
     sparse_mounts = training_ops._qualification_mounts(
-        "glm52-native-pp-grouped-lora-sparse-two-stage"
+        "glm52-native-pp-1f1b-lora-sparse-two-stage"
     )
     assert "source/src/prime_rl/trainer/models/kernels/sparse_mla_two_stage.py" in sparse_mounts
     assert training_ops._qualification_launch_env(profile) == profile["launch_env"]
@@ -234,3 +235,17 @@ def test_sparse_two_stage_profile_is_opt_in_and_keeps_qualification_shape():
     cluster = (ROOT / "scripts/china/cluster.sh").read_text()
     assert 'PRIME_SPARSE_BWD_TWO_STAGE may only be enabled by the sparse two-stage qualification profile' in cluster
     assert 'PRIME_SPARSE_BWD_TWO_STAGE="$sparse_bwd_two_stage"' in cluster
+
+
+def test_sparse_two_stage_profile_differs_from_native_lora_only_by_output_path():
+    baseline = _load("configs/qualification/glm52-native-b2048-lora.toml")
+    candidate = _load(
+        "configs/qualification/glm52-native-pp-1f1b-lora-sparse-two-stage.toml"
+    )
+    baseline["output_dir"] = candidate["output_dir"]
+    assert candidate == baseline
+
+    operations = _load("configs/operations.toml")
+    for name, profile in operations["profiles"].items():
+        if name != "glm52-native-pp-1f1b-lora-sparse-two-stage":
+            assert "PRIME_SPARSE_BWD_TWO_STAGE" not in profile.get("launch_env", {})

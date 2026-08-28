@@ -52,7 +52,7 @@ def test_delta3_profile_is_trainer_only_and_allowlisted() -> None:
         "glm52-native-b2048-nsys|"
         "glm52-native-delta3|glm52-native-pp-async|glm52-native-pp-grouped|"
         "glm52-native-pp-grouped-lora|"
-        "glm52-native-pp-grouped-lora-sparse-two-stage|"
+        "glm52-native-pp-1f1b-lora-sparse-two-stage|"
         "glm52-native-stability20"
         in cluster
     )

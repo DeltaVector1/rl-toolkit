@@ -395,7 +395,8 @@ _QUALIFICATION_LAUNCH_ENV_PATTERNS = {
     "PRIME_PHASE_PROFILE_RECORD_PATH": re.compile(
         r"/data/glm52-rl/qualifications/"
         r"(?:glm52-native-b2048-nsys-[0-9]{8}|glm52-native-b2048-lora|"
-        r"glm52-native-pp-grouped(?:-lora(?:-sparse-two-stage)?)?)/"
+        r"glm52-native-pp-grouped|glm52-native-pp-grouped-lora|"
+        r"glm52-native-pp-1f1b-lora-sparse-two-stage)/"
         r"phase-profile\.json"
     ),
     "PRIME_BF16_COMBINE_ROUNDS": re.compile(r"8"),
@@ -428,7 +429,7 @@ _MEMORY_PROFILE_LAUNCH_ENV = {
     **_CUDA_MEMORY_CAPTURE_ENV,
     **_BF16_COMBINE_ROUNDS_ENV,
 }
-_SPARSE_TWO_STAGE_PROFILE = "glm52-native-pp-grouped-lora-sparse-two-stage"
+_SPARSE_TWO_STAGE_PROFILE = "glm52-native-pp-1f1b-lora-sparse-two-stage"
 
 _NSYS_QUALIFICATION_PROFILE = "glm52-native-b2048-nsys"
 _NSYS_TRAINER_MODULE = "prime_rl.trainer.nsys_worker"
@@ -8535,7 +8536,7 @@ def _validate_trainer_qualification(
         "glm52-native-pp-async": 2,
         "glm52-native-pp-grouped": 2,
         "glm52-native-pp-grouped-lora": 2,
-        "glm52-native-pp-grouped-lora-sparse-two-stage": 2,
+        "glm52-native-pp-1f1b-lora-sparse-two-stage": 2,
         "glm52-native-stability20": 20,
     }
     if profile_name not in expected_step_counts:
@@ -8579,7 +8580,7 @@ def _validate_trainer_qualification(
         "glm52-native-pp-async",
         "glm52-native-pp-grouped",
         "glm52-native-pp-grouped-lora",
-        "glm52-native-pp-grouped-lora-sparse-two-stage",
+        "glm52-native-pp-1f1b-lora-sparse-two-stage",
     }:
         session_deadline, startup_deadline, step_deadline, profiler_deadline = (
             _glm_b2048_deadlines()
@@ -8658,7 +8659,7 @@ def _validate_trainer_qualification(
         profile_name in {
             "glm52-native-b2048-lora",
             "glm52-native-pp-grouped-lora",
-            "glm52-native-pp-grouped-lora-sparse-two-stage",
+            "glm52-native-pp-1f1b-lora-sparse-two-stage",
         }
         and profile.get("model", {}).get("lora", {}).get("fused_qkv_a_lora") is not True
     ):
@@ -11639,7 +11640,7 @@ def _prepare_trainer_qualification_session(
         "glm52-native-pp-async",
         "glm52-native-pp-grouped",
         "glm52-native-pp-grouped-lora",
-        "glm52-native-pp-grouped-lora-sparse-two-stage",
+        "glm52-native-pp-1f1b-lora-sparse-two-stage",
     }:
         session_deadline, startup_deadline, step_deadline, profiler_deadline = (
             _glm_b2048_deadlines()
@@ -11870,7 +11871,7 @@ def _qualify_connected(
         "glm52-native-pp-async",
         "glm52-native-pp-grouped",
         "glm52-native-pp-grouped-lora",
-        "glm52-native-pp-grouped-lora-sparse-two-stage",
+        "glm52-native-pp-1f1b-lora-sparse-two-stage",
         "glm52-native-stability20",
     }
     if strict_qualification and nodes != [trainer_head] + [
@@ -12170,7 +12171,7 @@ print(json.dumps({
                 "glm52-native-pp-async",
                 "glm52-native-pp-grouped",
                 "glm52-native-pp-grouped-lora",
-                "glm52-native-pp-grouped-lora-sparse-two-stage",
+                "glm52-native-pp-1f1b-lora-sparse-two-stage",
             }:
                 session_deadline, startup_deadline, step_deadline, profiler_deadline = (
                     _glm_b2048_deadlines()

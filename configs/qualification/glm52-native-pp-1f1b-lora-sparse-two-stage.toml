@@ -1,4 +1,4 @@
-output_dir = "/data/glm52-rl/qualifications/glm52-native-pp-grouped-lora-sparse-two-stage"
+output_dir = "/data/glm52-rl/qualifications/glm52-native-pp-1f1b-lora-sparse-two-stage"
 max_steps = 2
 dist_timeout_seconds = 5400
 enable_router_replay = false
@@ -31,7 +31,7 @@ seq_len = 32768
 attn = "flash_attention_2"
 cp = 8
 pp = 8
-pp_schedule = "1f1b_async"
+pp_schedule = "1f1b"
 pp_transfer_sparse_indices = true
 pp_limit_receive_buffers = true
 pp_boundary_plan = "explicit"
