@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass
 
 import torch
@@ -8,6 +9,7 @@ from torch.nn.attention.flex_attention import flex_attention
 from prime_rl.trainer.models.kernels.fp8_indexer import fp8_indexer
 from prime_rl.trainer.models.layers.lora.multi_linear import (
     MultiLoRALinear,
+    fused_lora_adapter_pair,
     fused_frozen_linear_pair,
 )
 from prime_rl.trainer.models.layers.checkpointing import current_reentrant_block_phase
@@ -28,6 +30,7 @@ _ADA_FLEX_OPTIONS = {
     "num_stages": 1,
     "PRESCALE_QK": True,
 }
+_FUSE_QKV_A_LORA = os.environ.get("PRIME_FUSED_QKV_A_LORA", "0") == "1"
 
 try:
     from prime_rl.trainer.models.kernels.sparse_mla_bwd import sparse_mla_bwd
@@ -241,8 +244,15 @@ class GlmMoeDsaAttention(nn.Module):
                 q_projection.base_layer,
                 kv_projection.base_layer,
             )
-            q_latent = q_latent + q_projection.adapter_output(hidden_states)
-            compressed_kv = compressed_kv + kv_projection.adapter_output(hidden_states)
+            if _FUSE_QKV_A_LORA:
+                q_adapter, kv_adapter = fused_lora_adapter_pair(
+                    hidden_states, q_projection, kv_projection
+                )
+            else:
+                q_adapter = q_projection.adapter_output(hidden_states)
+                kv_adapter = kv_projection.adapter_output(hidden_states)
+            q_latent = q_latent + q_adapter
+            compressed_kv = compressed_kv + kv_adapter
         elif isinstance(q_projection, MultiLoRALinear) or isinstance(
             kv_projection, MultiLoRALinear
         ):

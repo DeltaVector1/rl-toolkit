@@ -265,6 +265,164 @@ class _SingleLoRA(torch.autograd.Function):
         )
 
 
+class _FusedPairLoRA(torch.autograd.Function):
+    @staticmethod
+    @phase_span("lora_forward")
+    def forward(ctx, x, first_a, first_b, second_a, second_b):
+        if first_a.ndim != 2 or first_b.ndim != 2 or second_b.ndim != 2:
+            raise ValueError("fused Q/KV-A LoRA factors must be rank-2 tensors")
+        rank = first_a.shape[0]
+        if tuple(second_a.shape) != tuple(first_a.shape):
+            raise ValueError("fused Q/KV-A LoRA A factors must have the same shape")
+        if first_b.shape[1] != rank or second_b.shape[1] != rank:
+            raise ValueError("fused Q/KV-A LoRA B factors must match the rank")
+        if first_a.dtype not in (
+            torch.bfloat16,
+            torch.float16,
+            torch.float32,
+            torch.float64,
+        ):
+            raise TypeError(f"unsupported fused Q/KV-A LoRA dtype: {first_a.dtype}")
+        if any(
+            factor.dtype != first_a.dtype
+            for factor in (first_b, second_a, second_b)
+        ):
+            raise TypeError("fused Q/KV-A LoRA factors must use one dtype")
+        if x.ndim != 2 or x.shape[1] != first_a.shape[1]:
+            raise ValueError("fused Q/KV-A LoRA input width does not match A factors")
+
+        combined_a = torch.cat((first_a, second_a), dim=0)
+        combined = _lora_mm(x, combined_a.T)
+        first_low_rank = combined[:, :rank]
+        second_low_rank = combined[:, rank:]
+        first_out = _lora_mm(first_low_rank, first_b.T)
+        second_out = _lora_mm(second_low_rank, second_b.T)
+        ctx.save_for_backward(
+            x,
+            first_a,
+            first_b,
+            second_a,
+            second_b,
+            first_low_rank,
+            second_low_rank,
+        )
+        return first_out, second_out
+
+    @staticmethod
+    @phase_span("lora_backward")
+    def backward(ctx, first_grad, second_grad):
+        (
+            x,
+            first_a,
+            first_b,
+            second_a,
+            second_b,
+            first_low_rank,
+            second_low_rank,
+        ) = ctx.saved_tensors
+        if first_grad is None:
+            first_grad = first_low_rank.new_zeros((x.shape[0], first_b.shape[0]))
+        if second_grad is None:
+            second_grad = second_low_rank.new_zeros((x.shape[0], second_b.shape[0]))
+        first_grad_a = _lora_mm(first_grad, first_b)
+        second_grad_a = _lora_mm(second_grad, second_b)
+        input_grad = _lora_mm(first_grad_a, first_a) + _lora_mm(
+            second_grad_a, second_a
+        )
+        first_a_grad = (first_grad_a.T @ x).to(first_a.dtype)
+        first_b_grad = (first_grad.T @ first_low_rank).to(first_b.dtype)
+        second_a_grad = (second_grad_a.T @ x).to(second_a.dtype)
+        second_b_grad = (second_grad.T @ second_low_rank).to(second_b.dtype)
+        return (
+            input_grad.to(x.dtype),
+            first_a_grad,
+            first_b_grad,
+            second_a_grad,
+            second_b_grad,
+        )
+
+
+def fused_lora_adapter_pair(
+    x: torch.Tensor,
+    first: "MultiLoRALinear",
+    second: "MultiLoRALinear",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run two same-input LoRA projections with one combined A projection.
+
+    The two modules and their parameter lists remain separate. This function
+    only combines the temporary A factors for execution, so adapter state keys,
+    optimizer ownership, and checkpoint conversion are unchanged.
+    """
+    if first.rank != second.rank or first.n_adapters != second.n_adapters:
+        raise ValueError("fused Q/KV-A LoRA modules must have equal rank and slots")
+    if first.in_features != second.in_features or x.shape[-1] != first.in_features:
+        raise ValueError("fused Q/KV-A LoRA input widths do not match")
+    if not isinstance(first.lora_dropout, nn.Identity) or not isinstance(
+        second.lora_dropout, nn.Identity
+    ):
+        raise ValueError("fused Q/KV-A LoRA requires dropout=0")
+    if first._lora_num_tokens.shape != second._lora_num_tokens.shape or not torch.equal(
+        first._lora_num_tokens, second._lora_num_tokens
+    ):
+        raise ValueError("fused Q/KV-A LoRA modules must use the same token counts")
+    if not torch.equal(first._scaling_factors, second._scaling_factors):
+        raise ValueError("fused Q/KV-A LoRA modules must use the same scales")
+
+    shape = x.shape[:-1]
+    x = x.reshape(-1, x.shape[-1])
+    if first.n_adapters == 1:
+        first_out, second_out = _FusedPairLoRA.apply(
+            x,
+            first.lora_A[0],
+            first.lora_B[0],
+            second.lora_A[0],
+            second.lora_B[0],
+        )
+        scale = first._scaling_factors[0]
+        return (
+            (scale * first_out).view(*shape, first.out_features),
+            (scale * second_out).view(*shape, second.out_features),
+        )
+
+    offsets = first._lora_num_tokens.cumsum(dim=0, dtype=torch.int32)
+    if offsets.numel() == 0 or int(offsets[-1]) != x.shape[0]:
+        raise ValueError(
+            "fused Q/KV-A LoRA token counts do not match the input: "
+            f"counts={first._lora_num_tokens.tolist()}, rows={x.shape[0]}"
+        )
+    first_outputs = []
+    second_outputs = []
+    start = 0
+    for index, end_tensor in enumerate(offsets):
+        end = int(end_tensor)
+        if end == start:
+            zero = (
+                first.lora_A[index].sum()
+                + first.lora_B[index].sum()
+                + second.lora_A[index].sum()
+                + second.lora_B[index].sum()
+            ) * 0
+            first_outputs.append(zero.expand(0, first.out_features))
+            second_outputs.append(zero.expand(0, second.out_features))
+            start = end
+            continue
+        first_out, second_out = _FusedPairLoRA.apply(
+            x[start:end],
+            first.lora_A[index],
+            first.lora_B[index],
+            second.lora_A[index],
+            second.lora_B[index],
+        )
+        scale = first._scaling_factors[index]
+        first_outputs.append(scale * first_out)
+        second_outputs.append(scale * second_out)
+        start = end
+    return (
+        torch.cat(first_outputs, dim=0).view(*shape, first.out_features),
+        torch.cat(second_outputs, dim=0).view(*shape, second.out_features),
+    )
+
+
 def _local_frozen_weight(module: nn.Linear) -> torch.Tensor:
     weight = module.weight
     if weight.requires_grad:
