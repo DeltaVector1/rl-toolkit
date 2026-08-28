@@ -44,6 +44,56 @@ required_targets = (
 )
 
 
+def _profile_repository(path: Path) -> Path:
+    return path.resolve().parents[2]
+
+
+def _validate_profile_identity_values(values: dict[str, Any], path: Path) -> None:
+    expected = {
+        "model_revision": "ba978f7d347eaf65d22f1a86833408afdb953541",
+        "adapter_alias": "glm52-policy-parity-r32-fresh",
+        "adapter_path": "/data/glm52-rl/qualifications/glm52-step20-h200/adapter-step20",
+        "adapter_is_merged": False,
+        "rollout_cache": False,
+        "trainer_config": "configs/qualification/glm52-policy-parity-trainer.toml",
+        "trainer_config_sha256": "4bce831cd721f93a93db7356735ebe754d7fc0e66f085c211f4a881299139d86",
+        "inference_config": "configs/qualification/glm52-policy-parity-h200.toml",
+        "inference_config_sha256": "154209ec042979abd69508c0dcbdf8d870161994e5900014cac129d0984d6df0",
+        "inference_image_digest": "sha256:2f803571329212bfb4e27982efec7559f20379bcde73ac6ccee6bb8be3c46ade",
+        "graph_request_mode": "normal_cuda_graph",
+        "router_request_mode": "force_eager_skip_compiled",
+        "fixture_seed": 52052,
+    }
+    for name, wanted in expected.items():
+        if values.get(name) != wanted:
+            raise ValueError(f"profile {name} must be {wanted!r}")
+    repository = _profile_repository(path)
+    for field, relative in (
+        ("trainer_config_sha256", values["trainer_config"]),
+        ("inference_config_sha256", values["inference_config"]),
+    ):
+        config_path = repository / relative
+        if not config_path.is_file() or file_sha256(config_path) != values[field]:
+            raise ValueError(f"profile {field} does not match {relative}")
+    for name in ("trainer_config_sha256", "inference_config_sha256"):
+        if re.fullmatch(r"[0-9a-f]{64}", str(values[name])) is None:
+            raise ValueError(f"profile {name} must be a lowercase SHA-256")
+    with (repository / values["trainer_config"]).open("rb") as stream:
+        trainer_config = tomllib.load(stream)
+    if trainer_config.get("rollout_cache", False) is not False or trainer_config.get(
+        "data", {}
+    ).get("rollout_cache", False) is not False:
+        raise ValueError("parity trainer config cannot use rollout cache")
+    if trainer_config.get("max_steps") != 1:
+        raise ValueError("parity trainer config must run exactly one step")
+    if trainer_config.get("optim", {}).get("lr") != 0.0:
+        raise ValueError("parity trainer config must have lr=0")
+    if trainer_config.get("enable_router_replay") is not True:
+        raise ValueError("parity trainer config must replay router outputs")
+    if trainer_config.get("enable_token_export") is not True:
+        raise ValueError("parity trainer config must export trainer tokens")
+
+
 def json_bytes(value: Any) -> bytes:
     return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
@@ -261,11 +311,116 @@ class Profile:
         return self.values[name]
 
 
+def _profile_runtime_identity(profile: Profile, side: str) -> dict[str, Any] | None:
+    values = profile.values
+    if "model_revision" not in values:
+        return None
+    if side not in {"trainer", "h200"}:
+        raise ValueError("parity runtime side is invalid")
+    image_field = "trainer_image" if side == "trainer" else "inference_image"
+    config_field = (
+        "trainer_config_sha256"
+        if side == "trainer"
+        else "inference_config_sha256"
+    )
+    return {
+        "model_revision": values["model_revision"],
+        "adapter_alias": values["adapter_alias"],
+        "adapter_path": values["adapter_path"],
+        "adapter_is_merged": values["adapter_is_merged"],
+        "rollout_cache": values["rollout_cache"],
+        "image": values[image_field],
+        "config_sha256": values[config_field],
+        "inference_image_digest": values.get("inference_image_digest"),
+        "graph_request_mode": values["graph_request_mode"],
+        "router_request_mode": values["router_request_mode"],
+    }
+
+
+def _validate_runtime_identity(
+    profile: Profile, manifest: dict[str, Any], side: str
+) -> None:
+    expected = _profile_runtime_identity(profile, side)
+    if expected is None:
+        return
+    for name in (
+        "model_revision",
+        "adapter_alias",
+        "adapter_is_merged",
+        "rollout_cache",
+        "image",
+        "config_sha256",
+        "graph_request_mode",
+        "router_request_mode",
+    ):
+        if manifest.get(name) != expected[name]:
+            raise ValueError(f"{side} parity identity {name} differs from profile")
+    if side == "h200" and manifest.get("inference_image_digest") != expected[
+        "inference_image_digest"
+    ]:
+        raise ValueError("H200 parity image digest differs from profile")
+    if side == "h200":
+        if manifest.get("model") != expected["adapter_alias"]:
+            raise ValueError("H200 parity model alias differs from profile")
+        if manifest.get("adapter_loaded") is not True:
+            raise ValueError("H200 parity did not load the fresh adapter")
+        if manifest.get("adapter_path") != expected["adapter_path"]:
+            raise ValueError("H200 parity adapter path differs from profile")
+
+
+def _validate_unmerged_adapter(
+    profile: Profile, adapter_path: Path, adapter_sha256: str
+) -> None:
+    required_files = (
+        "adapter_model.safetensors",
+        "adapter_config.json",
+        "STABLE",
+        "adapter_model.safetensors.sha256",
+    )
+    if (
+        not adapter_path.is_dir()
+        or adapter_path.is_symlink()
+        or any(
+            (adapter_path / name).is_symlink()
+            or not (adapter_path / name).is_file()
+            for name in required_files
+        )
+    ):
+        raise ValueError("H200 parity adapter is not an unmerged adapter directory")
+    weights = adapter_path / "adapter_model.safetensors"
+    actual_sha256 = file_sha256(weights)
+    if actual_sha256 != adapter_sha256:
+        raise ValueError("H200 parity adapter hash differs from the supplied hash")
+    if (adapter_path / "adapter_model.safetensors.sha256").read_text() != (
+        f"{actual_sha256}\n"
+    ):
+        raise ValueError("H200 parity adapter checksum file differs")
+    try:
+        adapter_config = json.loads((adapter_path / "adapter_config.json").read_bytes())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("H200 parity adapter configuration is invalid") from error
+    targets = adapter_config.get("target_modules")
+    if (
+        isinstance(adapter_config.get("r"), bool)
+        or adapter_config.get("r") != profile.get("lora_rank")
+        or isinstance(adapter_config.get("lora_alpha"), bool)
+        or adapter_config.get("lora_alpha") != profile.get("lora_alpha")
+        or isinstance(adapter_config.get("lora_dropout"), bool)
+        or adapter_config.get("lora_dropout") != 0.0
+        or not isinstance(targets, list)
+        or tuple(targets) != required_targets
+    ):
+        raise ValueError("H200 parity adapter configuration differs from profile")
+
+
 def load_profile(path: Path) -> Profile:
     with path.open("rb") as stream:
         values = tomllib.load(stream)
     exact = {
         "schema_version": schema_version,
+        "trainer_image": "prime-rl:glm52-v080-qual",
+        "inference_image": "prime-rl:glm52-v080-full",
+        "model_name": "/data/glm52-rl/model-fp8",
         "quantization": "native_fp8",
         "model_architecture": "GlmMoeDsaForCausalLM",
         "context_length": 32768,
@@ -310,6 +465,7 @@ def load_profile(path: Path) -> Profile:
         raise ValueError("profile needs one full Prime-RL revision")
     if values.get("max_fixture_age_hours", 0) <= 0:
         raise ValueError("max_fixture_age_hours must be positive")
+    _validate_profile_identity_values(values, path)
     return Profile(path=path, values=values)
 
 
@@ -328,7 +484,11 @@ def make_fixture(
     seed: int | None,
     created_utc: str | None = None,
 ) -> dict[str, Any]:
-    seed = secrets.randbits(64) if seed is None else seed
+    seed = profile.values.get("fixture_seed") if seed is None else seed
+    if seed is None:
+        seed = secrets.randbits(64)
+    if "fixture_seed" in profile.values and seed != profile.values["fixture_seed"]:
+        raise ValueError("fixture seed differs from the profile")
     length = profile.get("context_length")
     vocab_size = profile.get("vocab_size")
     generator = np.random.Generator(np.random.PCG64(seed))
@@ -880,6 +1040,10 @@ def load_array(root: Path, manifest: dict[str, Any], name: str) -> np.ndarray:
 def check_fresh(profile: Profile, fixture: Path, manifest: dict[str, Any]) -> None:
     if manifest.get("profile_sha256") != file_sha256(profile.path):
         raise ValueError("fixture profile checksum does not match")
+    if "fixture_seed" in profile.values and manifest.get("seed") != profile.get(
+        "fixture_seed"
+    ):
+        raise ValueError("fixture seed does not match the profile")
     created = dt.datetime.fromisoformat(manifest["created_utc"])
     if created.tzinfo is None:
         raise ValueError("fixture time has no timezone")
@@ -993,6 +1157,11 @@ def record_trace(
         raise ValueError("model revision must be a full 40-character revision")
     if len(adapter_sha256) != 64 or any(c not in "0123456789abcdef" for c in adapter_sha256):
         raise ValueError("adapter checksum must be 64 lowercase hex characters")
+    identity = _profile_runtime_identity(profile, side)
+    if identity is not None:
+        if model_revision != identity["model_revision"]:
+            raise ValueError(f"{side} model revision differs from profile")
+        image = identity["image"]
     logprobs = validate_logprobs(profile, np.load(selected_logprobs_path, allow_pickle=False))
     router_ids = validate_router_ids(profile, np.load(router_ids_path, allow_pickle=False))
     router_weights = None
@@ -1039,6 +1208,18 @@ def record_trace(
         "max_output_length": profile.get("max_output_length"),
         "arrays": entries,
     }
+    if identity is not None:
+        manifest.update(
+            {
+                "adapter_alias": identity["adapter_alias"],
+                "adapter_is_merged": identity["adapter_is_merged"],
+                "rollout_cache": identity["rollout_cache"],
+                "config_sha256": identity["config_sha256"],
+                "graph_request_mode": identity["graph_request_mode"],
+                "router_request_mode": identity["router_request_mode"],
+            }
+        )
+        _validate_runtime_identity(profile, manifest, side)
     (output / "manifest.json").write_bytes(json_bytes(manifest))
     return manifest
 
@@ -2011,6 +2192,19 @@ def capture_h200(
 ) -> dict[str, Any]:
     fixture_manifest = load_manifest(fixture, "glm52_policy_parity_fixture")
     check_fresh(profile, fixture, fixture_manifest)
+    identity = _profile_runtime_identity(profile, "h200")
+    request_model = model
+    if identity is not None:
+        if model_revision != identity["model_revision"]:
+            raise ValueError("H200 model revision differs from profile")
+        if image != identity["image"]:
+            raise ValueError("H200 image reference differs from profile")
+        if adapter_path is None:
+            raise ValueError("H200 parity requires one fresh adapter load")
+        if str(adapter_path) != profile.get("adapter_path"):
+            raise ValueError("H200 parity adapter path differs from profile")
+        _validate_unmerged_adapter(profile, adapter_path, adapter_sha256)
+        request_model = identity["adapter_alias"]
     base = base_url.rstrip("/").removesuffix("/v1")
     control = control_url.rstrip("/").removesuffix("/v1")
     api_key = os.environ.get(api_key_env) if api_key_env else None
@@ -2040,13 +2234,13 @@ def capture_h200(
             timeout=min(timeout, 120),
         ).get("data", [])
         if any(
-            isinstance(item, dict) and item.get("id") == model
+            isinstance(item, dict) and item.get("id") == request_model
             for item in existing_cards
         ):
             raise ValueError("H200 parity adapter alias exists before fresh load")
         load_result = request_json(
             f"{control}/load_lora_adapter",
-            body={"lora_name": model, "lora_path": str(adapter_path)},
+            body={"lora_name": request_model, "lora_path": str(adapter_path)},
             api_key=api_key,
             timeout=min(timeout, 600),
         )
@@ -2055,9 +2249,16 @@ def capture_h200(
     cards = request_json(
         f"{base}/v1/models", body=None, api_key=api_key, timeout=min(timeout, 120)
     ).get("data", [])
-    card = next((item for item in cards if isinstance(item, dict) and item.get("id") == model), None)
+    card = next(
+        (
+            item
+            for item in cards
+            if isinstance(item, dict) and item.get("id") == request_model
+        ),
+        None,
+    )
     if card is None:
-        raise ValueError(f"H200 does not serve model {model!r}")
+        raise ValueError(f"H200 does not serve model {request_model!r}")
     if card.get("max_model_len") != profile.get("h200_scoring_context_length"):
         raise ValueError(
             "H200 direct scoring needs max_model_len 32769 so it can prefill all "
@@ -2083,7 +2284,7 @@ def capture_h200(
     }
     seed = int(fixture_manifest["seed"] & 0x7FFFFFFF)
     common_body = {
-        "model": model,
+        "model": request_model,
         "token_ids": token_ids.tolist(),
     }
     graph_body = {
@@ -2250,7 +2451,7 @@ def capture_h200(
         "profile_sha256": file_sha256(profile.path),
         "base_url": base_url,
         "control_url": control_url,
-        "model": model,
+        "model": request_model,
         "graph_request_id": graph_response.get("request_id"),
         "eager_request_id": eager_response.get("request_id"),
         "model_revision": model_revision,
@@ -2269,14 +2470,14 @@ def capture_h200(
         "phases": {
             "graph": {
                 "fixture_sha256": fixture_digest(fixture),
-                "model": model,
+                "model": request_model,
                 "model_revision": model_revision,
                 "adapter_sha256": adapter_sha256,
                 "mode": "normal_cuda_graph",
             },
             "eager_trace": {
                 "fixture_sha256": fixture_digest(fixture),
-                "model": model,
+                "model": request_model,
                 "model_revision": model_revision,
                 "adapter_sha256": adapter_sha256,
                 "mode": "force_eager_skip_compiled",
@@ -2290,6 +2491,19 @@ def capture_h200(
         },
         "arrays": entries,
     }
+    if identity is not None:
+        manifest.update(
+            {
+                "adapter_alias": identity["adapter_alias"],
+                "adapter_is_merged": identity["adapter_is_merged"],
+                "rollout_cache": identity["rollout_cache"],
+                "config_sha256": identity["config_sha256"],
+                "inference_image_digest": identity["inference_image_digest"],
+                "graph_request_mode": identity["graph_request_mode"],
+                "router_request_mode": identity["router_request_mode"],
+            }
+        )
+        _validate_runtime_identity(profile, manifest, "h200")
     (output / "manifest.json").write_bytes(json_bytes(manifest))
     normalize_h200_capture_permissions(output, manifest)
     validate_h200_capture_permissions(output, manifest)
@@ -3019,6 +3233,8 @@ def compare(
     trainer_manifest = load_manifest(trainer, "glm52_policy_parity_trace")
     h200_manifest = load_manifest(h200, "glm52_policy_parity_h200_capture")
     validate_h200_capture_sources(h200_manifest)
+    _validate_runtime_identity(profile, trainer_manifest, "trainer")
+    _validate_runtime_identity(profile, h200_manifest, "h200")
     if trainer_manifest.get("side") != "trainer":
         raise ValueError("trainer trace side is not trainer")
     expected_fixture = fixture_digest(fixture)
