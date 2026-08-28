@@ -108,7 +108,7 @@ def run_distribution(
 
     baseline_output = torch.empty_like(kv, dtype=torch.float32)
     candidate_output = torch.empty_like(kv, dtype=torch.float32)
-    _, baseline_ms = timed(
+    _, baseline_first_ms = timed(
         lambda q=q,
         kv=kv,
         do=do,
@@ -135,6 +135,26 @@ def run_distribution(
     torch.testing.assert_close(candidate, baseline, rtol=2e-2, atol=2e-3)
     if not bool(torch.isfinite(candidate).all() and torch.isfinite(baseline).all()):
         raise SystemExit("bucketed candidate returned nonfinite dKV")
+
+    for _ in range(warmup):
+        sparse_mla_dkv_two_stage(
+            q, kv, do, indices, lse, delta, sm_scale=scale, output=baseline_output
+        )
+    torch.cuda.synchronize()
+    baseline_times: list[float] = []
+    for _ in range(iterations):
+        _, elapsed = timed(
+            lambda q=q,
+            kv=kv,
+            do=do,
+            indices=indices,
+            lse=lse,
+            delta=delta,
+            output=baseline_output: sparse_mla_dkv_two_stage(
+                q, kv, do, indices, lse, delta, sm_scale=scale, output=output
+            )
+        )
+        baseline_times.append(elapsed)
 
     for _ in range(warmup):
         sparse_mla_dkv_bucketed(
@@ -179,7 +199,9 @@ def run_distribution(
         f"output_bf16_bytes={memory.output_bf16_bytes} workspace_limit_bytes={MAX_WORKSPACE_BYTES} "
         f"peak_allocated_delta={peak_allocated_delta} peak_reserved_delta={peak_reserved_delta} "
         "dkv_close=1 finite=1",
-        f"baseline_ms={baseline_ms:.3f} candidate_first_ms={candidate_first_ms:.3f} "
+        f"baseline_first_ms={baseline_first_ms:.3f} "
+        f"baseline_median_ms={statistics.median(baseline_times):.3f} "
+        f"candidate_first_ms={candidate_first_ms:.3f} "
         f"candidate_median_ms={statistics.median(times):.3f} candidate_max_ms={max(times):.3f}",
     )
     del q, kv, do, indices, output, lse, delta, baseline_output, candidate_output
