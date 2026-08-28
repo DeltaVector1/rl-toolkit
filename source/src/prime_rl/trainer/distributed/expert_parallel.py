@@ -62,6 +62,70 @@ def _dequantize_int4_kernel(
     )
 
 
+@triton.jit
+def _dequantize_int4_strided_kernel(
+    packed, scale, output, cols: tl.constexpr, packed_stride, block: tl.constexpr
+):
+    row = tl.program_id(0)
+    pair = tl.arange(0, block)
+    col0 = pair * 2
+    value = tl.load(
+        packed + row * packed_stride + pair, mask=col0 < cols, other=0
+    ).to(tl.int32)
+    row_scale = tl.load(scale + row)
+    tl.store(
+        output + row * cols + col0, ((value & 15) - 8) * row_scale, mask=col0 < cols
+    )
+    tl.store(
+        output + row * cols + col0 + 1,
+        ((value >> 4) - 8) * row_scale,
+        mask=col0 + 1 < cols,
+    )
+
+
+def _pack_value_scale_payload(values: torch.Tensor, scales: torch.Tensor):
+    """Pack row-wise values and scales into one contiguous byte payload."""
+    if values.ndim != 2 or not values.is_contiguous():
+        raise ValueError("packed transport values must be a contiguous matrix")
+    if scales.ndim != 1 or not scales.is_contiguous():
+        raise ValueError("packed transport scales must be a contiguous vector")
+    if values.shape[0] != scales.shape[0]:
+        raise ValueError("packed transport values and scales must have equal rows")
+    value_bytes = values.shape[1] * values.element_size()
+    scale_bytes = scales.element_size()
+    payload = torch.empty(
+        (values.shape[0], value_bytes + scale_bytes),
+        device=values.device,
+        dtype=torch.uint8,
+    )
+    payload[:, :value_bytes].copy_(
+        values.view(torch.uint8).view(values.shape[0], value_bytes)
+    )
+    payload[:, value_bytes:].copy_(
+        scales.view(torch.uint8).view(scales.shape[0], scale_bytes)
+    )
+    return payload, value_bytes
+
+
+def _unpack_value_scale_payload(
+    payload: torch.Tensor, value_bytes: int, scales: torch.Tensor
+) -> torch.Tensor:
+    """Return the value-byte view and copy the trailing scale bytes."""
+    if payload.ndim != 2 or payload.dtype != torch.uint8:
+        raise TypeError("packed transport payload must be a uint8 matrix")
+    if not payload.is_contiguous() or value_bytes < 1:
+        raise ValueError("packed transport payload must be contiguous")
+    scale_bytes = scales.element_size()
+    if payload.shape[1] != value_bytes + scale_bytes:
+        raise ValueError("packed transport payload width does not match its scale")
+    if scales.ndim != 1 or scales.shape[0] != payload.shape[0]:
+        raise ValueError("packed transport payload rows do not match its scale")
+    scales.view(torch.uint8).view(scales.shape[0], scale_bytes).copy_(
+        payload[:, value_bytes:]
+    )
+    return payload[:, :value_bytes]
+
+
 # When selective activation checkpointing targets "routed_experts", the whole
 # dispatch -> experts -> combine region is re-run during backward, which repeats
 # both all-to-alls. On this cluster the all-to-all is the dominant cost, so we
@@ -81,6 +145,7 @@ if _INT4_COMBINE_ROUNDS < 1:
 _BF16_COMBINE_ROUNDS = int(os.environ.get("PRIME_BF16_COMBINE_ROUNDS", "8"))
 if not 1 <= _BF16_COMBINE_ROUNDS <= 64:
     raise ValueError("PRIME_BF16_COMBINE_ROUNDS must be between 1 and 64")
+_PACKED_EXPERT_TRANSPORT = os.environ.get("PRIME_PACKED_EXPERT_TRANSPORT", "") == "1"
 
 
 def _in_backward() -> bool:
@@ -613,6 +678,8 @@ def _streaming_int4_forward(
     """Run an INT4 all-to-all with bounded send and receive rounds."""
     rows, cols = routed_input.shape
     packed_cols = (cols + 1) // 2
+    packed_transport = _PACKED_EXPERT_TRANSPORT
+    payload_cols = packed_cols + 2
     block = triton.next_power_of_2(packed_cols)
     output_rows = sum(output_splits)
     if received_input is not None:
@@ -633,7 +700,7 @@ def _streaming_int4_forward(
         # into the reserved BF16 storage after all collectives finish.  This
         # replaces a complete INT4 send copy with one round of send scratch.
         received_all = _empty_with_cache_retry(
-            (output_rows, packed_cols),
+            (output_rows, payload_cols if packed_transport else packed_cols),
             device=routed_input.device,
             dtype=torch.uint8,
         )
@@ -667,7 +734,9 @@ def _streaming_int4_forward(
         send_rows = sum(input_counts)
         receive_rows = sum(output_counts)
 
-        round_packed_bytes = send_rows * packed_cols
+        round_packed_bytes = send_rows * (
+            payload_cols if packed_transport else packed_cols
+        )
         if reuse_input and round_packed_bytes <= tail_bytes:
             # Dispatch reserved BF16 capacity for a larger inverse-combine
             # result.  Before expansion, that tail is outside the live input.
@@ -710,13 +779,25 @@ def _streaming_int4_forward(
             send_scale.append(scale_part)
             send_cursor += count
 
+        round_payload = None
+        if packed_transport:
+            round_payload, value_bytes = _pack_value_scale_payload(
+                round_quantized, round_scale
+            )
+            send = []
+            cursor = 0
+            for count in input_counts:
+                send.append(round_payload[cursor : cursor + count])
+                cursor += count
+            send_scale = None
+
         if reuse_input:
             received = received_all
             received_scale = received_scale_all
             received_offsets = output_offsets
         else:
             received = _empty_with_cache_retry(
-                (receive_rows, packed_cols),
+                (receive_rows, payload_cols if packed_transport else packed_cols),
                 device=routed_input.device,
                 dtype=torch.uint8,
             )
@@ -732,13 +813,26 @@ def _streaming_int4_forward(
             received[offset : offset + count]
             for count, offset in zip(output_counts, received_offsets)
         ]
-        receive_scale = [
-            received_scale[offset : offset + count]
-            for count, offset in zip(output_counts, received_offsets)
-        ]
         with _EPTimer(f"fwd_{tag}"):
             dist.all_to_all(receive, send, group=group)
-            dist.all_to_all(receive_scale, send_scale, group=group)
+            if not packed_transport:
+                receive_scale = [
+                    received_scale[offset : offset + count]
+                    for count, offset in zip(output_counts, received_offsets)
+                ]
+                dist.all_to_all(receive_scale, send_scale, group=group)
+
+        if packed_transport:
+            for count, offset in zip(output_counts, received_offsets):
+                if count:
+                    _unpack_value_scale_payload(
+                        received[offset : offset + count],
+                        value_bytes,
+                        received_scale[offset : offset + count],
+                    )
+            received_values = received[:, :packed_cols]
+        else:
+            received_values = received
 
         if received_input is not None:
             if reuse_input:
@@ -750,7 +844,7 @@ def _streaming_int4_forward(
                     receive_source_offsets.append(receive_cursor)
                     receive_cursor += count
             received_input.copy_slices(
-                received,
+                received_values,
                 received_scale,
                 output_counts,
                 receive_source_offsets,
@@ -761,17 +855,32 @@ def _streaming_int4_forward(
             cursor = 0
             for count, offset in zip(output_counts, output_offsets):
                 if count:
-                    _dequantize_int4_kernel[(count,)](
-                        received[cursor : cursor + count],
-                        received_scale[cursor : cursor + count],
-                        dequantized[offset : offset + count],
-                        cols,
-                        block,
-                        num_warps=8,
-                    )
+                    if packed_transport:
+                        _dequantize_int4_strided_kernel[(count,)](
+                            received[cursor : cursor + count],
+                            received_scale[cursor : cursor + count],
+                            dequantized[offset : offset + count],
+                            cols,
+                            received.shape[1],
+                            block,
+                            num_warps=8,
+                        )
+                    else:
+                        _dequantize_int4_kernel[(count,)](
+                            received[cursor : cursor + count],
+                            received_scale[cursor : cursor + count],
+                            dequantized[offset : offset + count],
+                            cols,
+                            block,
+                            num_warps=8,
+                        )
                     cursor += count
 
-        del send, send_scale, receive, receive_scale, round_quantized, round_scale
+        del send, receive, round_quantized, round_scale
+        if not packed_transport:
+            del send_scale, receive_scale
+        else:
+            del round_payload
         if not reuse_input:
             del received, received_scale
 
@@ -779,14 +888,25 @@ def _streaming_int4_forward(
         # as_strided_ changes only tensor metadata.  The dispatch allocation
         # reserved enough rows for the inverse-combine result.
         routed_input.as_strided_((output_rows, cols), (cols, 1))
-        _dequantize_int4_kernel[(output_rows,)](
-            received_all,
-            received_scale_all,
-            routed_input,
-            cols,
-            block,
-            num_warps=8,
-        )
+        if packed_transport:
+            _dequantize_int4_strided_kernel[(output_rows,)](
+                received_all,
+                received_scale_all,
+                routed_input,
+                cols,
+                received_all.shape[1],
+                block,
+                num_warps=8,
+            )
+        else:
+            _dequantize_int4_kernel[(output_rows,)](
+                received_all,
+                received_scale_all,
+                routed_input,
+                cols,
+                block,
+                num_warps=8,
+            )
 
     if received_input is not None:
         received_input.finish_copy(routed_input.device)
@@ -811,6 +931,8 @@ def _streaming_fp8_backward(
     a new result, but still receive only one FP8 round at a time.
     """
     rows, cols = grad_output.shape
+    packed_transport = _PACKED_EXPERT_TRANSPORT
+    payload_cols = cols + 4
     input_rows = sum(input_splits)
     storage_rows = 0
     if grad_output.is_contiguous():
@@ -820,12 +942,16 @@ def _streaming_fp8_backward(
         storage_rows = (storage_elements - grad_output.storage_offset()) // cols
     reuse_output = input_rows <= storage_rows
     if reuse_output:
-        quantized, scale = ops.scaled_fp8_quant(
-            grad_output, use_per_token_if_dynamic=True
-        )
-        scale = scale.flatten()
-        grad_output.as_strided_((input_rows, cols), (cols, 1))
-        dequantized = grad_output
+        if packed_transport:
+            quantized = scale = None
+            dequantized = grad_output.as_strided((input_rows, cols), (cols, 1))
+        else:
+            quantized, scale = ops.scaled_fp8_quant(
+                grad_output, use_per_token_if_dynamic=True
+            )
+            scale = scale.flatten()
+            grad_output.as_strided_((input_rows, cols), (cols, 1))
+            dequantized = grad_output
     else:
         dequantized = _empty_with_cache_retry(
             (input_rows, cols), device=grad_output.device, dtype=grad_output.dtype
@@ -839,7 +965,28 @@ def _streaming_fp8_backward(
         receive_counts, receive_offsets = _round_splits(input_splits, round_idx, rounds)
         receive_rows = sum(receive_counts)
 
-        if reuse_output:
+        if packed_transport:
+            send = []
+            send_scale = None
+            for count, offset in zip(send_counts, send_offsets):
+                if count:
+                    quantized_part, scale_part = ops.scaled_fp8_quant(
+                        grad_output[offset : offset + count],
+                        use_per_token_if_dynamic=True,
+                    )
+                    payload, value_bytes = _pack_value_scale_payload(
+                        quantized_part, scale_part.flatten()
+                    )
+                    send.append(payload)
+                else:
+                    send.append(
+                        torch.empty(
+                            (0, payload_cols),
+                            device=grad_output.device,
+                            dtype=torch.uint8,
+                        )
+                    )
+        elif reuse_output:
             send = [
                 quantized[offset : offset + count]
                 for count, offset in zip(send_counts, send_offsets)
@@ -875,10 +1022,14 @@ def _streaming_fp8_backward(
         # for this bounded receive. A true live-memory OOM remains fatal on the
         # retry because the requested shape and lifetime do not change.
         received = _empty_with_cache_retry(
-            (receive_rows, cols), device=grad_output.device, dtype=send[0].dtype
+            (receive_rows, payload_cols if packed_transport else cols),
+            device=grad_output.device,
+            dtype=torch.uint8 if packed_transport else send[0].dtype,
         )
         received_scale = torch.empty(
-            receive_rows, device=grad_output.device, dtype=send_scale[0].dtype
+            receive_rows,
+            device=grad_output.device,
+            dtype=torch.float32 if packed_transport else send_scale[0].dtype,
         )
         receive_round_offsets = []
         cursor = 0
@@ -895,19 +1046,37 @@ def _streaming_fp8_backward(
         ]
         with _EPTimer(f"bwd_{tag}"):
             dist.all_to_all(receive, send, group=group)
-            dist.all_to_all(receive_scale, send_scale, group=group)
+            if not packed_transport:
+                dist.all_to_all(receive_scale, send_scale, group=group)
+
+        if packed_transport:
+            for count, offset in zip(receive_counts, receive_round_offsets):
+                if count:
+                    _unpack_value_scale_payload(
+                        received[offset : offset + count],
+                        value_bytes,
+                        received_scale[offset : offset + count],
+                    )
+            received_values = received[:, :cols].view(torch.float8_e4m3fn)
+        else:
+            received_values = received
 
         cursor = 0
         for count, offset in zip(receive_counts, receive_offsets):
             if count:
                 target = dequantized[offset : offset + count]
-                target.copy_(received[cursor : cursor + count])
+                target.copy_(
+                    received_values[cursor : cursor + count].to(target.dtype)
+                )
                 target.mul_(
                     received_scale[cursor : cursor + count].to(target.dtype)[:, None]
                 )
                 cursor += count
 
         del received, received_scale, send, send_scale, receive, receive_scale
+
+    if packed_transport and reuse_output:
+        grad_output.as_strided_((input_rows, cols), (cols, 1))
 
     return dequantized
 
@@ -1374,16 +1543,36 @@ class _INT4Dispatch(torch.autograd.Function):
             _quantize_int4_kernel[(rows,)](
                 routed_input, quantized, scale, cols, block, num_warps=8
             )
-            output = quantized.new_empty((sum(output_splits), packed_cols))
-            output_scale = scale.new_empty(sum(output_splits))
             group = _resolve_process_group(group_name)
-            with _EPTimer(f"fwd_{tag}"):
-                dist.all_to_all_single(
-                    output, quantized, output_splits, input_splits, group=group
+            if _PACKED_EXPERT_TRANSPORT:
+                payload, value_bytes = _pack_value_scale_payload(quantized, scale)
+                received_payload = torch.empty(
+                    (sum(output_splits), packed_cols + scale.element_size()),
+                    device=routed_input.device,
+                    dtype=torch.uint8,
                 )
-                dist.all_to_all_single(
-                    output_scale, scale, output_splits, input_splits, group=group
+                with _EPTimer(f"fwd_{tag}"):
+                    dist.all_to_all_single(
+                        received_payload,
+                        payload,
+                        output_splits,
+                        input_splits,
+                        group=group,
+                    )
+                output_scale = scale.new_empty(sum(output_splits))
+                output = _unpack_value_scale_payload(
+                    received_payload, value_bytes, output_scale
                 )
+            else:
+                output = quantized.new_empty((sum(output_splits), packed_cols))
+                output_scale = scale.new_empty(sum(output_splits))
+                with _EPTimer(f"fwd_{tag}"):
+                    dist.all_to_all_single(
+                        output, quantized, output_splits, input_splits, group=group
+                    )
+                    dist.all_to_all_single(
+                        output_scale, scale, output_splits, input_splits, group=group
+                    )
             # NOTE: do not test torch.is_grad_enabled() here. autograd.Function
             # forward always runs with grad disabled, so that check would never
             # pass and nothing would ever be cached. The caller decides whether
@@ -1397,9 +1586,20 @@ class _INT4Dispatch(torch.autograd.Function):
         dequantized = torch.empty(
             (sum(output_splits), cols), device=output.device, dtype=routed_input.dtype
         )
-        _dequantize_int4_kernel[(sum(output_splits),)](
-            output, output_scale, dequantized, cols, block, num_warps=8
-        )
+        if _PACKED_EXPERT_TRANSPORT:
+            _dequantize_int4_strided_kernel[(sum(output_splits),)](
+                output,
+                output_scale,
+                dequantized,
+                cols,
+                output.stride(0),
+                block,
+                num_warps=8,
+            )
+        else:
+            _dequantize_int4_kernel[(sum(output_splits),)](
+                output, output_scale, dequantized, cols, block, num_warps=8
+            )
         if received_input is not None:
             received_input.prepare(sum(output_splits), cols)
             received_input.copy_slices(
@@ -1423,6 +1623,23 @@ class _INT4Dispatch(torch.autograd.Function):
                     ctx.group_name,
                     ctx.tag,
                     ctx.rounds,
+                ),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        if _PACKED_EXPERT_TRANSPORT:
+            return (
+                _streaming_fp8_backward(
+                    grad_output,
+                    ctx.output_splits,
+                    ctx.input_splits,
+                    ctx.group_name,
+                    ctx.tag,
+                    1,
                 ),
                 None,
                 None,
