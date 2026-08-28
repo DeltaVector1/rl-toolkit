@@ -110,6 +110,22 @@ def test_nonfinite_logit_is_rejected():
         distributed_logprobs(shards, [2, 2], [0, 2], np.asarray([0]))
 
 
+def test_response_logprob_accepts_single_exact_token_key():
+    entry = {"123": {"logprob": -0.4}}
+    assert parity.response_logprob(entry, 123, 1) == pytest.approx(-0.4)
+
+
+def test_response_logprob_rejects_single_wrong_token_key():
+    entry = {"999": {"logprob": -0.4}}
+    with pytest.raises(ValueError, match="no numeric value for token 123"):
+        parity.response_logprob(entry, 123, 1)
+
+
+def test_response_logprob_uses_exact_key_in_multi_key_entry():
+    entry = {"999": {"logprob": -0.9}, "123": {"logprob": -0.4}}
+    assert parity.response_logprob(entry, 123, 1) == pytest.approx(-0.4)
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_low_precision_shards_match_full_fp32_log_softmax(dtype):
     generator = torch.Generator().manual_seed(29)
