@@ -1298,6 +1298,16 @@ class EdgeOperationsTest(unittest.TestCase):
             arguments,
         )
 
+    def test_step20_tunnel_builder_does_not_inspect_configured_socket(self):
+        with patch.dict(training_ops._ssh_control_paths, {}, clear=True), patch.object(
+            training_ops,
+            "_configured_ssh_control_path",
+            side_effect=AssertionError("adapter tunnel inspected configured state"),
+        ):
+            command = training_ops._step20_adapter_tunnel_command(18200)
+        self.assertIn("ControlMaster=no", command)
+        self.assertIn("ControlPath=none", command)
+
     def test_step20_tunnels_record_and_clean_only_exact_processes(self):
         commands = [
             training_ops._step20_adapter_tunnel_command(port)
@@ -1336,6 +1346,9 @@ class EdgeOperationsTest(unittest.TestCase):
             commands,
         )
         self.assertTrue(all(command[-1] == training_ops.trainer_ssh for command in commands))
+        for command in commands:
+            self.assertIn("ControlMaster=no", command)
+            self.assertIn("ControlPath=none", command)
         proven_max = (
             training_ops.step20_tunnel_attempts
             * (
@@ -1784,13 +1797,13 @@ class EdgeOperationsTest(unittest.TestCase):
                     destination,
                 )
 
+        self.assertEqual(calls[0][0][0], "ssh")
+        self.assertIn("StrictHostKeyChecking=accept-new", calls[0][0])
+        self.assertIn("ControlMaster=no", calls[0][0])
+        self.assertIn("ControlPath=none", calls[0][0])
         self.assertEqual(
-            calls[0][0],
+            calls[0][0][-6:],
             [
-                "ssh",
-                "-o",
-                "BatchMode=yes",
-                "n82",
                 "tar",
                 "-C",
                 "/data/glm52-rl/qualifications/glm52-policy-parity/trainer-traces/run-1",

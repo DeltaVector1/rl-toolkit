@@ -60,6 +60,24 @@ class DeployTest(unittest.TestCase):
                 ["-o", "ControlMaster=no", "-o", "ControlPath=none"],
             )
 
+    def test_unmanaged_builders_ignore_configured_socket(self):
+        host = training_ops.trainer_head
+        with patch.dict(training_ops._ssh_control_paths, {}, clear=True), patch.object(
+            training_ops,
+            "_configured_ssh_control_path",
+            return_value="/tmp/live-configured-master",
+        ) as configured:
+            ssh = training_ops._ssh_transport_command(host, "true")
+            scp = training_ops._scp_transport_command(
+                host, "source", f"{host}:destination", prefix_options=("-q",)
+            )
+        configured.assert_not_called()
+        for command in (ssh, scp):
+            self.assertIn("ControlMaster=no", command)
+            self.assertIn("ControlPath=none", command)
+            self.assertNotIn("ControlPath=/tmp/live-configured-master", command)
+            self.assertIn("StrictHostKeyChecking=accept-new", command)
+
     def test_managed_ssh_uses_only_recorded_control_path(self):
         host = training_ops.trainer_head
         with patch.dict(
@@ -76,6 +94,47 @@ class DeployTest(unittest.TestCase):
                     "ControlPath=/tmp/managed-training-ops",
                 ],
             )
+
+    def test_managed_builders_use_recorded_control_path(self):
+        host = training_ops.trainer_head
+        path = "/tmp/managed-training-ops"
+        with patch.dict(training_ops._ssh_control_paths, {host: path}, clear=True):
+            commands = (
+                training_ops._ssh_transport_command(host, "true"),
+                training_ops._scp_transport_command(
+                    host, "source", f"{host}:destination"
+                ),
+            )
+        for command in commands:
+            self.assertIn("ControlMaster=no", command)
+            self.assertIn(f"ControlPath={path}", command)
+            self.assertNotIn("ControlPath=none", command)
+
+    def test_adapter_download_uses_unmanaged_transport_builder(self):
+        with patch.dict(training_ops._ssh_control_paths, {}, clear=True), patch.object(
+            training_ops,
+            "_configured_ssh_control_path",
+            side_effect=AssertionError("adapter download inspected configured state"),
+        ), patch.object(training_ops, "_local_command") as local_command:
+            training_ops._download_adapter_file(
+                "/data/glm52-rl/runs/muse19/adapter.json", Path("/tmp/adapter.json")
+            )
+        command = local_command.call_args.args[0]
+        self.assertEqual(command[0:2], ["scp", "-q"])
+        self.assertIn("ControlMaster=no", command)
+        self.assertIn("ControlPath=none", command)
+
+    def test_remote_adapter_copy_script_disables_configured_multiplexing(self):
+        path = f"{training_ops.run_root}/muse19/adapter_model.safetensors"
+        with patch.object(training_ops, "_ssh", return_value=(0, "")) as ssh:
+            training_ops._copy_resume_adapter(path, [training_ops.trainer_head, "n76"])
+        script = ssh.call_args.args[1]
+        self.assertIn(
+            "ssh_opts=(-o BatchMode=yes -o ConnectTimeout=10 -o ControlMaster=no -o ControlPath=none)",
+            script,
+        )
+        self.assertIn('-e "ssh ${ssh_opts[*]}"', script)
+        self.assertNotIn('ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$target"', script)
 
     def test_ssh_command_does_not_use_configured_socket_without_manager(self):
         with patch.dict(training_ops._ssh_control_paths, {}, clear=True), patch.object(
@@ -109,15 +168,18 @@ class DeployTest(unittest.TestCase):
         self.assertIn("ControlMaster=no", command)
         self.assertIn("ControlPath=/tmp/managed-training-ops", command)
 
-    def test_ssh_refuses_stale_configured_socket_without_connecting(self):
+    def test_unmanaged_ssh_does_not_inspect_stale_configured_socket(self):
         with patch.dict(training_ops._ssh_control_paths, {}, clear=True), patch.object(
             training_ops,
             "_configured_ssh_control_path",
-            side_effect=training_ops.Refused("configured SSH control master is stale"),
-        ), patch.object(training_ops.subprocess, "run") as run:
-            with self.assertRaisesRegex(training_ops.Refused, "stale"):
-                training_ops._ssh("n82", "true")
-        run.assert_not_called()
+            side_effect=AssertionError("unmanaged code inspected configured state"),
+        ), patch.object(
+            training_ops.subprocess,
+            "run",
+            return_value=Mock(returncode=0, stdout="ready\n", stderr=""),
+        ) as run:
+            self.assertEqual(training_ops._ssh("n82", "true"), (0, "ready\n"))
+        self.assertIn("ControlPath=none", run.call_args.args[0])
 
     def test_control_master_refuses_final_symlink(self):
         host = training_ops.trainer_head
@@ -813,10 +875,12 @@ class DeployTest(unittest.TestCase):
             local.write_text("current\n")
             want = hashlib.sha256(local.read_bytes()).hexdigest()
             copied_to = []
+            copied_commands = []
 
             def fake_run(command, **kwargs):
                 del kwargs
                 if command[0] == "scp":
+                    copied_commands.append(command)
                     copied_to.append(command[-1].split(":", 1)[0])
                 return Mock(returncode=0, stdout="", stderr="")
 
@@ -842,6 +906,9 @@ class DeployTest(unittest.TestCase):
                 self.assertTrue(training_ops.deploy("source/mounted.py", nodes=["n83"]))
 
             self.assertEqual(copied_to, ["n83"])
+            self.assertEqual(len(copied_commands), 1)
+            self.assertIn("ControlMaster=no", copied_commands[0])
+            self.assertIn("ControlPath=none", copied_commands[0])
 
 if __name__ == "__main__":
     unittest.main()

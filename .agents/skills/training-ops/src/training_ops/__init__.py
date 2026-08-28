@@ -617,14 +617,47 @@ def _active_ssh_control_options(host: str) -> list[str]:
 
 
 def _ssh_control_options(host: str) -> list[str]:
-    """Use a validated configured master or disable multiplexing."""
+    """Return only a manager-owned path or explicit no-multiplexing options."""
+    _check_host(host)
     active = _active_ssh_control_options(host)
     if active:
         return active
-    configured = _configured_ssh_control_path(host)
-    if configured is not None:
-        return ["-o", "ControlMaster=no", "-o", f"ControlPath={configured}"]
     return ["-o", "ControlMaster=no", "-o", "ControlPath=none"]
+
+
+def _ssh_transport_options(
+    host: str, *, trainer: bool = False, managed: bool = True
+) -> list[str]:
+    """Build SSH options without resolving configured control paths."""
+    _check_host(host)
+    base = trainer_ssh_command if trainer else ssh_command
+    if trainer and not managed:
+        return [*base[1:]]
+    control = _ssh_control_options(host) if managed else [
+        "-o", "ControlMaster=no", "-o", "ControlPath=none"
+    ]
+    return [*base[1:], *control]
+
+
+def _ssh_transport_command(
+    host: str, *remote_command: str, trainer: bool = False
+) -> list[str]:
+    """Build an SSH transport with explicit control-socket behavior."""
+    _check_host(host)
+    return [
+        "ssh",
+        *_ssh_transport_options(host, trainer=trainer),
+        host,
+        *remote_command,
+    ]
+
+
+def _scp_transport_command(
+    host: str, *arguments: str, prefix_options: tuple[str, ...] = ()
+) -> list[str]:
+    """Build an SCP transport with explicit control-socket behavior."""
+    _check_host(host)
+    return ["scp", *prefix_options, *_ssh_transport_options(host), *arguments]
 
 
 def _configured_ssh_control_path(host: str) -> str | None:
@@ -912,7 +945,7 @@ def _ssh(
         ]
         if len(timeout_options) != 1:
             raise Refused("SSH connect timeout inventory is invalid")
-    command = [*ssh_command, *_ssh_control_options(host)]
+    command = _ssh_transport_command(host)
     if connect_timeout is not None:
         timeout_options = [
             index
@@ -924,7 +957,7 @@ def _ssh(
         command[timeout_options[0]] = f"ConnectTimeout={connect_timeout}"
     try:
         p = subprocess.run(
-            command + [host, script],
+            command + [script],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
@@ -2863,21 +2896,12 @@ def _confirmed_active_policy_step(run: str) -> int:
 
 
 def _download_adapter_file(remote_path: str, local_path: Path) -> None:
-    command = [
-        "scp",
-        "-q",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "NumberOfPasswordPrompts=0",
-        "-o",
-        "PasswordAuthentication=no",
-        "-o",
-        "ConnectTimeout=25",
-        *_ssh_control_options(trainer_head),
+    command = _scp_transport_command(
+        trainer_head,
         f"{trainer_head}:{remote_path}",
         str(local_path),
-    ]
+        prefix_options=("-q",),
+    )
     _local_command(command, f"download {remote_path}", timeout=1800)
 
 
@@ -3059,9 +3083,8 @@ def _step20_adapter_tunnel_command(port: int) -> list[str]:
         raise Refused("temporary adapter tunnel port is invalid")
     return [
         "ssh",
+        *_ssh_transport_options(trainer_ssh, managed=False),
         "-NT",
-        "-o",
-        "BatchMode=yes",
         "-o",
         "ConnectTimeout=30",
         "-o",
@@ -5657,7 +5680,7 @@ def _sensitive_ssh_input(
     _check_host(host)
     try:
         process = subprocess.run(
-            [*ssh_command, *_ssh_control_options(host), host, command],
+            _ssh_transport_command(host, command),
             input=secret + "\n",
             capture_output=True,
             text=True,
@@ -5676,7 +5699,7 @@ def _receive_parity_bootstrap(host: str, command: str, timeout: int) -> str:
     _check_host(host)
     try:
         process = subprocess.run(
-            [*ssh_command, *_ssh_control_options(host), host, command],
+            _ssh_transport_command(host, command),
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
@@ -6269,15 +6292,12 @@ def _copy_parity_diagnostic_input(
     with tempfile.TemporaryDirectory(prefix="glm52-parity-diagnostic-") as temporary:
         local_input = Path(temporary) / "layer3-router-input.npz"
         download = subprocess.run(
-            [
-                "scp",
-                "-q",
-                "-o",
-                "BatchMode=yes",
-                *_ssh_control_options(source_host),
+            _scp_transport_command(
+                source_host,
                 f"{source_host}:{source_path}",
                 str(local_input),
-            ],
+                prefix_options=("-q",),
+            ),
             capture_output=True,
             text=True,
             timeout=300,
@@ -6285,15 +6305,12 @@ def _copy_parity_diagnostic_input(
         if download.returncode or not local_input.is_file() or local_input.is_symlink():
             raise RuntimeError("trainer CP0 diagnostic input copy failed")
         upload = subprocess.run(
-            [
-                "scp",
-                "-q",
-                "-o",
-                "BatchMode=yes",
-                *_ssh_control_options(destination_host),
+            _scp_transport_command(
+                destination_host,
                 str(local_input),
                 f"{destination_host}:{destination_path}",
-            ],
+                prefix_options=("-q",),
+            ),
             capture_output=True,
             text=True,
             timeout=300,
@@ -6379,27 +6396,21 @@ def _copy_parity_refresh_file(
         local = Path(temporary) / source.name
         for arguments, label in (
             (
-                [
-                    "scp",
-                    "-q",
-                    "-o",
-                    "BatchMode=yes",
-                    *_ssh_control_options(source_host),
+                _scp_transport_command(
+                    source_host,
                     f"{source_host}:{source_path}",
                     str(local),
-                ],
+                    prefix_options=("-q",),
+                ),
                 "trainer parity refresh download",
             ),
             (
-                [
-                    "scp",
-                    "-q",
-                    "-o",
-                    "BatchMode=yes",
-                    *_ssh_control_options(destination_host),
+                _scp_transport_command(
+                    destination_host,
                     str(local),
                     f"{destination_host}:{destination_path}",
-                ],
+                    prefix_options=("-q",),
+                ),
                 "H200 parity refresh upload",
             ),
         ):
@@ -9641,15 +9652,12 @@ install -d -m 0750 "$candidate"
                         f"step-20 adapter download checksum differs: {name}"
                     )
                 _local_command(
-                    [
-                        "scp",
-                        "-q",
-                        "-o",
-                        "BatchMode=yes",
-                        *_ssh_control_options(host),
+                    _scp_transport_command(
+                        host,
                         str(local),
                         f"{host}:{candidate}/{name}",
-                    ],
+                        prefix_options=("-q",),
+                    ),
                     f"stage step-20 adapter {name}",
                     timeout=1800,
                 )
@@ -10133,14 +10141,12 @@ def deploy(
             )
         try:
             p = subprocess.run(
-                [
-                    "scp",
-                    "-q",
-                    *ssh_command[1:],
-                    *_active_ssh_control_options(h),
+                _scp_transport_command(
+                    h,
                     str(local),
                     f"{h}:{staging}",
-                ],
+                    prefix_options=("-q",),
+                ),
                 capture_output=True,
                 text=True,
                 timeout=120,
@@ -10418,38 +10424,39 @@ set -euo pipefail
 source_file={quoted_path}
 test -f "$source_file"
 digest=$(sha256sum "$source_file" | cut -d' ' -f1)
+ssh_opts=(-o BatchMode=yes -o ConnectTimeout=10 -o ControlMaster=no -o ControlPath=none)
 copy_one() {{
   target=$1
   final=$source_file
   directory=$(dirname "$final")
   partial="$directory/.adapter_model.$digest.partial"
-  remote_digest=$(ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$target" \
+  remote_digest=$(ssh -n "${{ssh_opts[@]}}" "$target" \
     "sha256sum '$final' 2>/dev/null | cut -d' ' -f1" || true)
   [ "$remote_digest" = "$digest" ] && return 0
   [ -z "$remote_digest" ] || {{
     echo "$target has a different adapter at $final" >&2
     return 1
   }}
-  ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$target" \
+  ssh -n "${{ssh_opts[@]}}" "$target" \
     "mkdir -p '$directory'"
   transfer=rsync
-  ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$target" \
+  ssh -n "${{ssh_opts[@]}}" "$target" \
     "command -v rsync >/dev/null" || transfer=scp
   for attempt in 1 2 3; do
     if [ "$transfer" = rsync ]; then
       rsync -a --partial --append-verify --timeout=120 \
-        -e "ssh -o BatchMode=yes -o ConnectTimeout=10" \
+        -e "ssh ${{ssh_opts[*]}}" \
         "$source_file" "$target:$partial" && copied=1 || copied=0
     else
-      scp -p -o BatchMode=yes -o ConnectTimeout=10 \
+      scp -p "${{ssh_opts[@]}}" \
         -o ServerAliveInterval=15 -o ServerAliveCountMax=8 \
         "$source_file" "$target:$partial" && copied=1 || copied=0
     fi
     if [ "$copied" = 1 ]; then
-      remote_digest=$(ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$target" \
+      remote_digest=$(ssh -n "${{ssh_opts[@]}}" "$target" \
         "sha256sum '$partial' | cut -d' ' -f1")
       if [ "$remote_digest" = "$digest" ]; then
-        ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$target" \
+        ssh -n "${{ssh_opts[@]}}" "$target" \
           "mv '$partial' '$final'"
         return 0
       fi
@@ -12527,17 +12534,13 @@ def _cleanup_glm_parity_stage_candidate(
 def _copy_glm_parity_stage(host: str, stage: str, local_parent: Path) -> Path:
     try:
         copied = subprocess.run(
-            [
-                "scp",
-                "-C",
-                "-q",
-                "-o",
-                "BatchMode=yes",
-                *_ssh_control_options(host),
+            _scp_transport_command(
+                host,
                 "-r",
                 f"{host}:{stage}",
                 str(local_parent),
-            ],
+                prefix_options=("-C", "-q"),
+            ),
             capture_output=True,
             text=True,
             timeout=600,
@@ -12577,7 +12580,10 @@ def _glm_parity_transfer_command(
     return [
         "timeout", "--signal=TERM", "--kill-after=5s", "540s", "rsync",
         "--archive", "--compress", "--partial", "--append-verify",
-        "--timeout=120", "--quiet", "-e", shlex.join(trainer_ssh_command),
+        "--timeout=120", "--quiet", "-e",
+        shlex.join(
+            ["ssh", *_ssh_transport_options(target, trainer=True, managed=False)]
+        ),
         f"--rsync-path={remote}", f"{source}/.", f"{target}:{candidate}/",
     ]
 
@@ -12622,7 +12628,10 @@ os.execvp("tar",["tar","--extract","--gzip","--file","-","--directory",f"/proc/s
             "manifest.json", "trainer-reference.json", "trainer-router-trace",
         ]
     )
-    pipeline = f"{archive} | {shlex.join([*trainer_ssh_command, target, receive])}"
+    pipeline = (
+        f"{archive} | "
+        f"{shlex.join(['ssh', *_ssh_transport_options(target, trainer=True, managed=False), target, receive])}"
+    )
     return shlex.join(
         [
             "timeout", "--signal=TERM", "--kill-after=5s", "540s",
@@ -12656,7 +12665,7 @@ def _glm_parity_transfer_preflight(
         code, detail = _ssh(
             source_host,
             f"{source_check} && "
-            f"{shlex.join([*trainer_ssh_command, target, target_check])}",
+            f"{shlex.join(['ssh', *_ssh_transport_options(target, trainer=True, managed=False), target, target_check])}",
         )
     return None if code == 0 else (detail.strip()[:120] or f"exit {code}")
 
@@ -13236,10 +13245,7 @@ def _copy_parity_tree_stream(host: str, remote: str, local: Path) -> None:
         raise RuntimeError(f"parity evidence destination is not a directory: {local}")
     local.mkdir(parents=True, exist_ok=True)
     remote_process = subprocess.Popen(
-        [
-            "ssh",
-            "-o",
-            "BatchMode=yes",
+        _ssh_transport_command(
             host,
             "tar",
             "-C",
@@ -13247,7 +13253,7 @@ def _copy_parity_tree_stream(host: str, remote: str, local: Path) -> None:
             "-cf",
             "-",
             ".",
-        ],
+        ),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -13355,16 +13361,13 @@ def collect_glm52_policy_parity(name: str, nodes: list[str] | None = None) -> di
     def copy_tree(host: str, remote: str, local: Path) -> None:
         _check_host(host)
         result = subprocess.run(
-            [
-                "scp",
-                "-q",
-                "-o",
-                "BatchMode=yes",
-                *_ssh_control_options(host),
+            _scp_transport_command(
+                host,
                 "-r",
                 f"{host}:{remote}",
                 str(local),
-            ],
+                prefix_options=("-q",),
+            ),
             capture_output=True,
             text=True,
             timeout=1800,
@@ -13445,15 +13448,12 @@ def collect_glm52_policy_parity(name: str, nodes: list[str] | None = None) -> di
         local_digest = hashlib.sha256(report.read_bytes()).hexdigest()
         temporary_report = f"{remote_root}/.report-{name}-{local_digest}.json"
         copy_result = subprocess.run(
-            [
-                "scp",
-                "-q",
-                "-o",
-                "BatchMode=yes",
-                *_ssh_control_options(orchestrator_host),
+            _scp_transport_command(
+                orchestrator_host,
                 str(report),
                 f"{orchestrator_host}:{temporary_report}",
-            ],
+                prefix_options=("-q",),
+            ),
             capture_output=True,
             text=True,
             timeout=300,
