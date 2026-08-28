@@ -58,6 +58,63 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "incomplete"):
                 read()
 
+    def test_sparse_two_stage_profile_is_accepted_but_near_misses_are_rejected(self):
+        train_path = ROOT / "source/src/prime_rl/trainer/rl/train.py"
+        tree = ast.parse(train_path.read_text())
+        names = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "_qualification_environment_names"
+                for target in node.targets
+            )
+        )
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_qualification_environment"
+        )
+        module = ast.Module(body=[names, function], type_ignores=[])
+        ast.fix_missing_locations(module)
+        namespace = {"os": os, "re": __import__("re")}
+        exec(compile(module, str(train_path), "exec"), namespace)
+        read = namespace["_qualification_environment"]
+        identity = {
+            "PRIME_QUALIFICATION_SESSION_ID": "1" * 32,
+            "PRIME_QUALIFICATION_PROFILE": "glm52-native-pp-1f1b-lora-sparse-two-stage",
+            "PRIME_QUALIFICATION_CONFIG_SHA256": "2" * 64,
+            "PRIME_QUALIFICATION_SOURCE_SHA256": "3" * 64,
+            "PRIME_QUALIFICATION_SESSION_SHA256": "4" * 64,
+            "PRIME_QUALIFICATION_RUNTIME_SOURCE_SHA256": "5" * 64,
+            "PRIME_QUALIFICATION_LAUNCHER_SHA256": "6" * 64,
+            "PRIME_TRAINER_IMAGE_DIGEST": "sha256:" + "7" * 64,
+            "PRIME_TRAINER_HOST": "n82",
+            "PRIME_TRAINER_HEAD": "n82",
+        }
+        with patch.dict(os.environ, identity, clear=True):
+            self.assertEqual(
+                read()["PRIME_QUALIFICATION_PROFILE"],
+                identity["PRIME_QUALIFICATION_PROFILE"],
+            )
+            for near_miss in (
+                "glm52-native-pp-1f1b-lora-sparse-two-stage-extra",
+                "glm52-native-pp-1f1b-lora-sparse-two-stag",
+                "glm52-native-pp-1f1b-lora-sparse-two-stage/other",
+            ):
+                with patch.dict(
+                    os.environ,
+                    {
+                        **identity,
+                        "PRIME_QUALIFICATION_PROFILE": near_miss,
+                    },
+                    clear=True,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "profile is invalid"):
+                        read()
+
     @unittest.skipIf(torch is None, "PyTorch is unavailable")
     def test_qualification_input_digest_binds_tokens_lengths_and_order(self):
         train_path = ROOT / "source/src/prime_rl/trainer/rl/train.py"

@@ -751,7 +751,7 @@ def _qualification_environment() -> dict[str, str] | None:
     if not re.fullmatch(r"[0-9a-f]{32}", values["PRIME_QUALIFICATION_SESSION_ID"]):
         raise RuntimeError("qualification session ID is invalid")
     if not re.fullmatch(
-        r"glm52-native-(?:b2048|b2048-lora|b2048-memory|b2048-nsys|delta3|pp-async|pp-grouped|pp-grouped-lora|stability20)",
+        r"glm52-native-(?:b2048|b2048-lora|b2048-memory|b2048-nsys|delta3|pp-async|pp-grouped|pp-grouped-lora|pp-1f1b-lora-sparse-two-stage|stability20)",
         values["PRIME_QUALIFICATION_PROFILE"],
     ):
         raise RuntimeError("qualification profile is invalid")
