@@ -472,10 +472,10 @@ PY
         echo "qualification session ID is invalid" >&2; exit 1
       }
       case "${PRIME_QUALIFICATION_PROFILE:-}" in
-        glm52-native-b2048|glm52-native-b2048-memory|glm52-native-b2048-nsys|glm52-native-delta3|glm52-native-stability20) ;;
+        glm52-native-b2048|glm52-native-b2048-memory|glm52-native-b2048-nsys|glm52-native-delta3|glm52-native-pp-async|glm52-native-stability20) ;;
         *) echo "qualification profile is invalid" >&2; exit 1 ;;
       esac
-      if [ "${PRIME_QUALIFICATION_PROFILE}" = "glm52-native-b2048" ] || [ "${PRIME_QUALIFICATION_PROFILE}" = "glm52-native-b2048-memory" ] || [ "${PRIME_QUALIFICATION_PROFILE}" = "glm52-native-b2048-nsys" ]; then
+      if [ "${PRIME_QUALIFICATION_PROFILE}" = "glm52-native-b2048" ] || [ "${PRIME_QUALIFICATION_PROFILE}" = "glm52-native-b2048-memory" ] || [ "${PRIME_QUALIFICATION_PROFILE}" = "glm52-native-b2048-nsys" ] || [ "${PRIME_QUALIFICATION_PROFILE}" = "glm52-native-pp-async" ]; then
         for deadline in \
           "${PRIME_QUALIFICATION_SESSION_DEADLINE_SECONDS:-}" \
           "${PRIME_QUALIFICATION_STARTUP_DEADLINE_SECONDS:-}" \
@@ -624,7 +624,7 @@ PY
         -e "PRIME_TRAINER_HOST=n$node"
         -e "PRIME_TRAINER_HEAD=n$trainer_head_node"
       )
-      if [ "$PRIME_QUALIFICATION_PROFILE" = "glm52-native-b2048" ] || [ "$PRIME_QUALIFICATION_PROFILE" = "glm52-native-b2048-memory" ] || [ "$PRIME_QUALIFICATION_PROFILE" = "glm52-native-b2048-nsys" ]; then
+      if [ "$PRIME_QUALIFICATION_PROFILE" = "glm52-native-b2048" ] || [ "$PRIME_QUALIFICATION_PROFILE" = "glm52-native-b2048-memory" ] || [ "$PRIME_QUALIFICATION_PROFILE" = "glm52-native-b2048-nsys" ] || [ "$PRIME_QUALIFICATION_PROFILE" = "glm52-native-pp-async" ]; then
         qualification_env+=(
           -e "PRIME_QUALIFICATION_SESSION_DEADLINE_SECONDS=$PRIME_QUALIFICATION_SESSION_DEADLINE_SECONDS"
           -e "PRIME_QUALIFICATION_STARTUP_DEADLINE_SECONDS=$PRIME_QUALIFICATION_STARTUP_DEADLINE_SECONDS"
@@ -730,6 +730,7 @@ PY
       -v "$deployment/source/src/prime_rl/trainer/distributed/partial_reshard.py":/app/src/prime_rl/trainer/distributed/partial_reshard.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/distributed/pipeline_parallel.py":/app/src/prime_rl/trainer/distributed/pipeline_parallel.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/distributed/pp_runner.py":/app/src/prime_rl/trainer/distributed/pp_runner.py:ro \
+      -v "$deployment/source/src/prime_rl/trainer/distributed/async_schedule.py":/app/src/prime_rl/trainer/distributed/async_schedule.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/phase_profiler.py":/app/src/prime_rl/trainer/phase_profiler.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/nsys_worker.py":/app/src/prime_rl/trainer/nsys_worker.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/parallel_dims.py":/app/src/prime_rl/trainer/parallel_dims.py:ro \

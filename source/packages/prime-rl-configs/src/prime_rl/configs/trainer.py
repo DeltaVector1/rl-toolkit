@@ -273,9 +273,11 @@ class ModelConfig(BaseModelConfig):
     ``layers/pp`` layers sharded ``world/pp`` ways instead of all layers sharded
     ``world`` ways."""
 
-    pp_schedule: Literal["1f1b", "gpipe", "interleaved_1f1b"] = "1f1b"
+    pp_schedule: Literal["1f1b", "1f1b_async", "gpipe", "interleaved_1f1b"] = "1f1b"
     """Pipeline schedule. ``1f1b`` keeps activation memory to one stage's depth and
-    is the default; ``gpipe`` is simpler but holds every micro-batch's activations."""
+    is the default; ``1f1b_async`` keeps the same compute order while posting
+    bounded P2P work on a communication stream; ``gpipe`` is simpler but holds
+    every micro-batch's activations."""
 
     pp_transfer_sparse_indices: bool = False
     """Transfer sparse-attention index caches with pipeline activations. This
@@ -461,6 +463,70 @@ class ModelConfig(BaseModelConfig):
     def mxfp8_only_with_torch_ep_backend(self):
         if isinstance(self.quantization, MXFP8Config) and self.ep_comm_backend != "torch":
             raise ValueError(f"{self.quantization.type.upper()} quantization requires model.ep_comm_backend='torch'.")
+        return self
+
+    @model_validator(mode="after")
+    def validate_async_1f1b_topology(self):
+        """Reject asynchronous PP before distributed setup or schedule creation."""
+        if self.pp_schedule != "1f1b_async":
+            return self
+
+        expected = {
+            "pp": 8,
+            "cp": 8,
+            "ep": 8,
+            "dp_replicate": 1,
+            "global_ep": False,
+            "ep_comm_backend": "torch",
+            "pp_limit_receive_buffers": True,
+            "pp_transfer_sparse_indices": True,
+            "reshard_after_forward": True,
+            "optimization_dtype": "bfloat16",
+            "reduce_dtype": "bfloat16",
+            "native_fp8_expert_prefetch": False,
+            "fsdp_cpu_offload": False,
+            "cold_cpu_offload": False,
+            "optim_cpu_offload": False,
+        }
+        observed = {name: getattr(self, name) for name in expected}
+        if self.quantization is None:
+            observed["quantization"] = None
+        else:
+            observed["quantization"] = {
+                "type": self.quantization.type,
+                "dequantize_checkpoint": self.quantization.dequantize_checkpoint,
+                "expert_activation_transport": getattr(
+                    self.quantization, "expert_activation_transport", None
+                ),
+            }
+        expected["quantization"] = {
+            "type": "fp8",
+            "dequantize_checkpoint": False,
+            "expert_activation_transport": "bf16_forward_fp8_local_recompute_backward",
+        }
+        cutoff = (
+            self.ac.keep_routed_expert_activations_from_pp_stage
+            if self.ac is not None
+            else None
+        )
+        observed["checkpoint_cutoff"] = cutoff
+        expected["checkpoint_cutoff"] = 5
+        observed["checkpoint_mode"] = self.ac.mode if self.ac is not None else None
+        expected["checkpoint_mode"] = "reentrant_attention_all_experts"
+        if self.ac_offloading is not None:
+            observed["ac_offloading"] = "enabled"
+            expected["ac_offloading"] = "disabled"
+
+        mismatches = {
+            name: (expected[name], observed.get(name))
+            for name in expected
+            if observed.get(name) != expected[name]
+        }
+        if mismatches:
+            raise ValueError(
+                "1f1b_async requires the exact PP8/CP8/EP8 native-FP8 topology; "
+                f"mismatches={mismatches}"
+            )
         return self
 
 

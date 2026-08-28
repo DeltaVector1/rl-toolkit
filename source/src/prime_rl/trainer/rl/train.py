@@ -388,6 +388,7 @@ _b2048_qualification_profiles = frozenset(
         "glm52-native-b2048",
         "glm52-native-b2048-memory",
         "glm52-native-b2048-nsys",
+        "glm52-native-pp-async",
     }
 )
 
@@ -746,7 +747,7 @@ def _qualification_environment() -> dict[str, str] | None:
     if not re.fullmatch(r"[0-9a-f]{32}", values["PRIME_QUALIFICATION_SESSION_ID"]):
         raise RuntimeError("qualification session ID is invalid")
     if not re.fullmatch(
-        r"glm52-native-(?:b2048|b2048-memory|b2048-nsys|delta3|stability20)",
+        r"glm52-native-(?:b2048|b2048-memory|b2048-nsys|delta3|pp-async|stability20)",
         values["PRIME_QUALIFICATION_PROFILE"],
     ):
         raise RuntimeError("qualification profile is invalid")
@@ -1093,6 +1094,19 @@ def _write_qualification_result(
 
 @clean_exit
 def _train_impl(config: TrainerConfig):
+    # Recheck the opt-in topology before world, network, model, or schedule
+    # setup. This also protects callers that construct TrainerConfig without
+    # going through the normal CLI parser.
+    config.model.validate_async_1f1b_topology()
+    qualification_identity = _qualification_environment()
+    if config.model.pp_schedule == "1f1b_async" and (
+        qualification_identity is None
+        or qualification_identity["PRIME_QUALIFICATION_PROFILE"]
+        != "glm52-native-pp-async"
+    ):
+        raise RuntimeError(
+            "1f1b_async is only available in the GLM async qualification profile"
+        )
     # Setup world and logger
     world = get_world()
     numa_binding = bind_worker_to_gpu_numa_node()
@@ -1101,7 +1115,6 @@ def _train_impl(config: TrainerConfig):
         json_logging=config.log.json_logging,
     )
     logger.info(f"Starting RL trainer in {world} in {config.output_dir}")
-    qualification_identity = _qualification_environment()
     qualification_deadline = None
     if qualification_identity is not None:
         qualification_deadline = _QualificationDeadline.from_environment(
@@ -1122,6 +1135,7 @@ def _train_impl(config: TrainerConfig):
             "glm52-native-b2048-memory": (2, False),
             "glm52-native-b2048-nsys": (2, False),
             "glm52-native-delta3": (3, True),
+            "glm52-native-pp-async": (2, False),
             "glm52-native-stability20": (20, True),
         }[qualification_identity["PRIME_QUALIFICATION_PROFILE"]]
         if (
@@ -2366,6 +2380,22 @@ def _train_impl(config: TrainerConfig):
                     else _example_outputs[0]
                 ),
                 limit_receive_buffers=config.model.pp_limit_receive_buffers,
+                async_topology=(
+                    {
+                        "pp_limit_receive_buffers": config.model.pp_limit_receive_buffers,
+                        "pp": parallel_dims.pp,
+                        "cp": parallel_dims.cp,
+                        "ep": parallel_dims.ep,
+                        "base_schedule": "1f1b",
+                        "cutoff": (
+                            config.model.ac.keep_routed_expert_activations_from_pp_stage
+                            if config.model.ac is not None
+                            else None
+                        ),
+                    }
+                    if config.model.pp_schedule == "1f1b_async"
+                    else None
+                ),
             )
             # FSDP must be initialised before the schedule issues its first
             # prefetch, which happens before any forward on some stages.

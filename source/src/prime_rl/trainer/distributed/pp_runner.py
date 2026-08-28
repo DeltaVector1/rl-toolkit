@@ -31,14 +31,41 @@ def minimum_pipeline_microbatches(schedule_name: str, pp_size: int) -> int:
         # this before schedule construction so a rollout batch with mostly
         # failed samples can be discarded without stopping all trainer ranks.
         return pp_size
+    if schedule_name == "1f1b_async":
+        # The local asynchronous subclass preserves Schedule1F1B's minimum.
+        return pp_size
     if schedule_name == "interleaved_1f1b":
         return pp_size
     if schedule_name == "gpipe":
         return 1
     raise ValueError(
-        "pp_schedule must be one of ['1f1b', 'interleaved_1f1b', 'gpipe'], "
+        "pp_schedule must be one of ['1f1b', '1f1b_async', 'interleaved_1f1b', 'gpipe'], "
         f"got {schedule_name!r}"
     )
+
+
+def validate_async_topology(topology: Mapping[str, Any] | None) -> None:
+    """Fail closed unless the measured PP8 candidate topology is active."""
+    expected = {
+        "pp_limit_receive_buffers": True,
+        "pp": 8,
+        "cp": 8,
+        "ep": 8,
+        "base_schedule": "1f1b",
+        "cutoff": 5,
+    }
+    if topology is None:
+        raise ValueError("1f1b_async requires the exact PP8/CP8/EP8 cutoff5 topology")
+    mismatches = {
+        key: (expected[key], topology.get(key))
+        for key in expected
+        if topology.get(key) != expected[key]
+    }
+    if mismatches:
+        raise ValueError(
+            "1f1b_async is enabled only for the exact PP8/CP8/EP8/1f1b/cutoff5 "
+            f"topology; mismatches={mismatches}"
+        )
 
 
 def validate_interleaved_microbatches(num_microbatches: int, pp_size: int) -> int:
@@ -1093,6 +1120,7 @@ def build_schedule(
     example_input=None,
     example_output=None,
     limit_receive_buffers: bool = False,
+    async_topology: Mapping[str, Any] | None = None,
 ):
     """Wrap ``stage_module`` in a PipelineStage and pick a schedule.
 
@@ -1113,6 +1141,12 @@ def build_schedule(
 
     install_pp_phase_hooks()
 
+    if schedule_name == "1f1b_async":
+        if not limit_receive_buffers or pp_size != 8:
+            raise ValueError(
+                "1f1b_async requires pp_limit_receive_buffers and PP size 8"
+            )
+        validate_async_topology(async_topology)
     stage_modules = list(stage_module) if isinstance(stage_module, (list, tuple)) else [stage_module]
     if schedule_name == "interleaved_1f1b" and len(stage_modules) != 2:
         raise ValueError("interleaved_1f1b requires exactly two local pipeline stages")
@@ -1129,7 +1163,7 @@ def build_schedule(
     )
     local_stage_count = len(stage_modules)
     exact_transport_capacities = schedule_name == "interleaved_1f1b" or (
-        schedule_name == "1f1b" and limit_receive_buffers
+        schedule_name in ("1f1b", "1f1b_async") and limit_receive_buffers
     )
     for local_index, module in enumerate(stage_modules):
         if module.transfer_sparse_indices:
@@ -1162,6 +1196,10 @@ def build_schedule(
         "interleaved_1f1b": ScheduleInterleaved1F1B,
         "gpipe": ScheduleGPipe,
     }
+    if schedule_name == "1f1b_async":
+        from prime_rl.trainer.distributed.async_schedule import make_schedule_1f1b_async
+
+        schedules["1f1b_async"] = make_schedule_1f1b_async()
     minimum_pipeline_microbatches(schedule_name, pp_size)
     interleaved_rounds = None
     if schedule_name == "interleaved_1f1b":
@@ -1194,7 +1232,7 @@ def build_schedule(
         )
         for stage in stages:
             stage.set_transport_capacities(capacities[stage.stage_index])
-    elif schedule_name == "1f1b" and limit_receive_buffers:
+    elif schedule_name in ("1f1b", "1f1b_async") and limit_receive_buffers:
         stages[0].set_transport_capacities(
             derive_1f1b_transport_capacities(
                 stages[0].stage_index,
