@@ -1,0 +1,28 @@
+# Upstream vLLM PR #47013, commit 30030761508a9801f4a8db2a140137d8fefd11ac.
+# Keep the base-model slot mapping at index 0 for remaining KV-cache consumers.
+diff --git a/vllm/model_executor/models/extract_hidden_states.py b/vllm/model_executor/models/extract_hidden_states.py
+index 87dba7b5c..2cc86f003 100644
+--- a/vllm/model_executor/models/extract_hidden_states.py
++++ b/vllm/model_executor/models/extract_hidden_states.py
+@@ -54,6 +54,8 @@ def unified_kv_cache_update(
+     kv_cache = attn_layer.kv_cache
+ 
+     slot_mapping = forward_context.slot_mapping
++    if isinstance(slot_mapping, list):
++        slot_mapping = slot_mapping[0]  # spec decode: [0] is the base model
+     assert isinstance(slot_mapping, dict), (
+         f"Expected slot_mapping to be a dict, got {type(slot_mapping)}. "
+     )
+diff --git a/vllm/models/deepseek_v32/nvidia/attention.py b/vllm/models/deepseek_v32/nvidia/attention.py
+index dcf955ad5..a3beb000b 100644
+--- a/vllm/models/deepseek_v32/nvidia/attention.py
++++ b/vllm/models/deepseek_v32/nvidia/attention.py
+@@ -395,6 +395,8 @@ class DeepseekV32Attention(MLAAttention):
+             attn_metadata = attn_metadata_raw
+ 
+         slot_mapping = forward_context.slot_mapping
++        if isinstance(slot_mapping, list):
++            slot_mapping = slot_mapping[0]  # spec decode: [0] is the base model
+         assert isinstance(slot_mapping, dict)
+         mla_slot = slot_mapping.get(self.layer_name)
+ 

@@ -20,6 +20,9 @@ PATCHES = (
     "patches/vllm/0002-v026-flashmla-sparse-mixed-batch-chunks.patch",
     "patches/vllm/0003-v026-exact-target-prompt-logprobs.patch",
     "patches/vllm/0004-v026-request-exact-router-trace.patch",
+    "patches/vllm/0005-v026-exact-monolithic-route-sinks.patch",
+    "patches/vllm/0006-v026-mtp-slot-mapping-46908.patch",
+    "patches/vllm/0007-v026-mtp-slot-mapping-47013.patch",
 )
 TEST_FILE = "patches/vllm/test_flashmla_sparse_chunk_v026.py"
 FILES = {
@@ -30,6 +33,10 @@ FILES = {
     "gpu_model_runner": "vllm/v1/worker/gpu_model_runner.py",
     "scheduler_output": "vllm/v1/core/sched/output.py",
     "scheduler": "vllm/v1/core/sched/scheduler.py",
+    "attention": "vllm/model_executor/layers/attention/attention.py",
+    "mla_attention": "vllm/model_executor/layers/attention/mla_attention.py",
+    "extract_hidden_states": "vllm/model_executor/models/extract_hidden_states.py",
+    "deepseek_v32_attention": "vllm/models/deepseek_v32/nvidia/attention.py",
 }
 SOURCE_FILES = {
     "parity_router_trace": "source/src/prime_rl/parity_router_trace.py",
@@ -172,6 +179,14 @@ def prepare(deployment: Path, overlay: Path, image: str) -> dict[str, object]:
             "/overlay/vllm/v1/core/sched/output.py && "
             "cp /app/.venv/lib/python3.12/site-packages/vllm/v1/core/sched/scheduler.py "
             "/overlay/vllm/v1/core/sched/scheduler.py && "
+            "cp /app/.venv/lib/python3.12/site-packages/vllm/model_executor/layers/attention/attention.py "
+            "/overlay/vllm/model_executor/layers/attention/attention.py && "
+            "cp /app/.venv/lib/python3.12/site-packages/vllm/model_executor/layers/attention/mla_attention.py "
+            "/overlay/vllm/model_executor/layers/attention/mla_attention.py && "
+            "cp /app/.venv/lib/python3.12/site-packages/vllm/model_executor/models/extract_hidden_states.py "
+            "/overlay/vllm/model_executor/models/extract_hidden_states.py && "
+            "cp /app/.venv/lib/python3.12/site-packages/vllm/models/deepseek_v32/nvidia/attention.py "
+            "/overlay/vllm/models/deepseek_v32/nvidia/attention.py && "
             "chmod 0644 " + " ".join(f"/overlay/{relative}" for relative in FILES.values()),
         ]
     )
