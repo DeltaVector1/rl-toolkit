@@ -483,6 +483,16 @@ class SideInputKeyTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "sparse-cache.*stages=\\[3\\]"):
             self.runner.validate_async_stage_modules([dense, sparse])
 
+    def test_async_schedule_is_disabled_before_stage_construction(self):
+        source = (
+            SOURCE / "src/prime_rl/trainer/distributed/pp_runner.py"
+        ).read_text()
+        disabled = source.index(
+            'raise ValueError(\n            "1f1b_async is disabled'
+        )
+        stage_construction = source.index("stage_modules = (")
+        self.assertLess(disabled, stage_construction)
+
     def test_bounded_transport_state_is_reset_between_steps(self):
         class FakePipelineStage:
             def clear_runtime_states(self):

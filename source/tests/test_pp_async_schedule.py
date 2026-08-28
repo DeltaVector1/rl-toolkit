@@ -572,6 +572,10 @@ class AsyncP2PStateTest(unittest.TestCase):
         self.assertIn('"1f1b_async"', config_source)
         self.assertNotIn('pp_schedule = "1f1b_async"', runner_source)
 
+    def test_async_schedule_factory_is_fail_closed(self):
+        with self.assertRaisesRegex(RuntimeError, "P2P order is not matched"):
+            self.module.make_schedule_1f1b_async()
+
     def test_sparse_receive_lookahead_is_one(self):
         stage = FakeStage([], sparse=True)
         self.assertEqual(self.module.receive_window_for_stage(stage, "fwd"), 1)
@@ -598,7 +602,7 @@ class AsyncP2PStateTest(unittest.TestCase):
         self.assertIn("validate_async_topology", runner_source)
         self.assertIn('"cutoff": 5', runner_source)
         self.assertIn('"pp_limit_receive_buffers": True', runner_source)
-        self.assertIn("if not limit_receive_buffers or pp_size != 8", runner_source)
+        self.assertIn("1f1b_async is disabled", runner_source)
 
     def test_cuda_transport_uses_explicit_stream_dependencies(self):
         source = MODULE_PATH.read_text()

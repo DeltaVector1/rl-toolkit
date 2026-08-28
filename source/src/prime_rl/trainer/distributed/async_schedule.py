@@ -640,6 +640,9 @@ def run_1f1b_async_step(
 
 def make_schedule_1f1b_async() -> type:
     """Create the local opt-in schedule subclass from installed PyTorch."""
+    raise RuntimeError(
+        "1f1b_async is disabled because its P2P order is not matched across ranks"
+    )
     from torch.distributed.pipelining import Schedule1F1B
 
     class Schedule1F1BAsync(Schedule1F1B):
