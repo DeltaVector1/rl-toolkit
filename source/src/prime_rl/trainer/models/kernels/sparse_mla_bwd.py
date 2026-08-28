@@ -118,17 +118,16 @@ def bwd(
     indices_dtype=T.int32,
     dtype=T.bfloat16,
     accum_dtype=T.float32,
-    direct_dkv_store=False,
+    reuse_dq_shared=False,
 ):
     assert is_causal is True, "non-casual is not supported now"
     assert topk % block_size == 0, "otherwise will load some index=0 thus causing wrong kv to be loaded"
     assert dtype == T.bfloat16
     assert accum_dtype == T.float32
     assert indices_dtype == T.int32
-    # This option only removes the shared-memory staging copy.  It retains
-    # the full FP32 dKV GEMM, so it does not change reduction order.  A split
-    # GEMM would change accumulation order and is intentionally not supported.
-    assert isinstance(direct_dkv_store, bool)
+    # The candidate reuses the dQ output staging buffer for dKV stores.  The
+    # full FP32 dKV GEMM and shared-memory layout conversion stay unchanged.
+    assert isinstance(reuse_dq_shared, bool)
 
     if sm_scale is None:
         sm_scale = (D + D_tail) ** (-0.5)
@@ -155,6 +154,8 @@ def bwd(
     NS = tilelang.cdiv(topk, block_size)
 
     split_store = 2
+    if reuse_dq_shared:
+        assert block_H == BS
 
     @T.prim_func
     def sparse_mla_bwd_kernel(
@@ -173,6 +174,7 @@ def bwd(
             KV_shared = T.alloc_shared([BS, D], dtype)
             KV_tail_shared = T.alloc_shared([BS, D_tail], dtype)
             dO_shared = T.alloc_shared([block_H, D], dtype)
+            safe_indices = T.alloc_shared([BS], indices_dtype)
             mask = T.alloc_fragment([BS], "bool")
 
             P_shared_cast = T.alloc_shared([block_H, BS], dtype)
@@ -186,9 +188,18 @@ def bwd(
             acc_dq_tail = T.alloc_fragment([block_H, D_tail], accum_dtype)
             acc_dkv = T.alloc_fragment([BS, D], accum_dtype)
             acc_dkv_tail = T.alloc_fragment([BS, D_tail], accum_dtype)
-            if not direct_dkv_store:
-                # Reference path: stage each split before atomic stores.
-                # The direct candidate reads acc_dkv/acc_dkv_tail instead.
+            if reuse_dq_shared:
+                acc_dkv_shared = T.view(
+                    dQ_shared,
+                    [BS // split_store, D],
+                    accum_dtype,
+                )
+                acc_dkv_tail_shared = T.view(
+                    dQ_tail_shared,
+                    [BS // split_store, D_tail],
+                    accum_dtype,
+                )
+            else:
                 acc_dkv_shared = T.alloc_shared([BS // split_store, D], accum_dtype)
                 acc_dkv_tail_shared = T.alloc_shared([BS // split_store, D_tail], accum_dtype)
 
@@ -210,21 +221,28 @@ def bwd(
                     # bounds: negative indices are also malformed.  Every
                     # memory access below uses the guarded index.
                     index = Indices[by, s_i, bz // NH, i_i * BS + bi_i]
-                    mask[bi_i] = T.all(index >= 0, index <= max_kv_i)
+                    mask[bi_i] = T.if_then_else(
+                        index >= 0,
+                        index <= max_kv_i,
+                        False,
+                    )
+                    safe_indices[bi_i] = T.if_then_else(
+                        index >= 0,
+                        T.if_then_else(index <= max_kv_i, index, S_kv - 1),
+                        S_kv - 1,
+                    )
 
                 for h_i, bi_i in T.Parallel(block_H, BS):
                     acc_p[h_i, bi_i] = T.if_then_else(mask[bi_i], 0, -T.infinity(acc_p.dtype))
 
                 for bi_i, d_i in T.Parallel(BS, D):
-                    index = Indices[by, s_i, bz // NH, i_i * BS + bi_i]
-                    safe_index = T.if_then_else(mask[bi_i], index, S_kv - 1)
+                    safe_index = safe_indices[bi_i]
                     KV_shared[bi_i, d_i] = KV[by, safe_index, bz // NH, d_i]
 
                 T.gemm(Q_shared, KV_shared, acc_p, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
 
                 for bi_i, d_i in T.Parallel(BS, D_tail):
-                    index = Indices[by, s_i, bz // NH, i_i * BS + bi_i]
-                    safe_index = T.if_then_else(mask[bi_i], index, S_kv - 1)
+                    safe_index = safe_indices[bi_i]
                     KV_tail_shared[bi_i, d_i] = KV[by, safe_index, bz // NH, D + d_i]
                 T.gemm(Q_tail_shared, KV_tail_shared, acc_p, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
 
@@ -276,37 +294,31 @@ def bwd(
                     # Keep the full dKV GEMM above.  This is important for
                     # parity: splitting the GEMM changes the FP32 reduction
                     # order even though each split computes the same rows.
-                    if not direct_dkv_store:
-                        for bi_i, d_i in T.Parallel(BS, D):
-                            if bi_i < BS // split_store:
-                                source_row = bi_i + s * (BS // split_store)
-                                source_valid = mask[source_row]
-                                acc_dkv_shared[bi_i, d_i] = T.if_then_else(
-                                    source_valid,
-                                    acc_dkv[source_row, d_i],
-                                    0,
-                                )
+                    for bi_i, d_i in T.Parallel(BS, D):
+                        if bi_i < BS // split_store:
+                            source_row = bi_i + s * (BS // split_store)
+                            source_valid = safe_indices[source_row] != S_kv - 1
+                            acc_dkv_shared[bi_i, d_i] = T.if_then_else(
+                                source_valid,
+                                acc_dkv[source_row, d_i],
+                                0,
+                            )
 
-                        for bi_i, d_i in T.Parallel(BS, D_tail):
-                            if bi_i < BS // split_store:
-                                source_row = bi_i + s * (BS // split_store)
-                                source_valid = mask[source_row]
-                                acc_dkv_tail_shared[bi_i, d_i] = T.if_then_else(
-                                    source_valid,
-                                    acc_dkv_tail[source_row, d_i],
-                                    0,
-                                )
+                    for bi_i, d_i in T.Parallel(BS, D_tail):
+                        if bi_i < BS // split_store:
+                            source_row = bi_i + s * (BS // split_store)
+                            source_valid = safe_indices[source_row] != S_kv - 1
+                            acc_dkv_tail_shared[bi_i, d_i] = T.if_then_else(
+                                source_valid,
+                                acc_dkv_tail[source_row, d_i],
+                                0,
+                            )
 
                     if vectorized_atomic:
                         for bi_i, d_i in T.Parallel(BS // split_store, D // 4):
                             source_row = bi_i + s * (BS // split_store)
-                            source_valid = mask[source_row]
-                            source_index = Indices[
-                                by, s_i, bz // NH, i_i * BS + source_row
-                            ]
-                            safe_index = T.if_then_else(
-                                source_valid, source_index, S_kv - 1
-                            )
+                            safe_index = safe_indices[source_row]
+                            source_valid = safe_index != S_kv - 1
                             T.if_then_else(
                                 source_valid,
                                 T.atomic_addx4(
@@ -316,22 +328,15 @@ def bwd(
                                         bz // NH,
                                         d_i * 4,
                                     ],
-                                    acc_dkv[source_row, d_i * 4]
-                                    if direct_dkv_store
-                                    else acc_dkv_shared[bi_i, d_i * 4],
+                                    acc_dkv_shared[bi_i, d_i * 4],
                                 ),
                                 T.evaluate(0),
                             )
 
                         for bi_i, d_i in T.Parallel(BS // split_store, D_tail // 4):
                             source_row = bi_i + s * (BS // split_store)
-                            source_valid = mask[source_row]
-                            source_index = Indices[
-                                by, s_i, bz // NH, i_i * BS + source_row
-                            ]
-                            safe_index = T.if_then_else(
-                                source_valid, source_index, S_kv - 1
-                            )
+                            safe_index = safe_indices[source_row]
+                            source_valid = safe_index != S_kv - 1
                             T.if_then_else(
                                 source_valid,
                                 T.atomic_addx4(
@@ -341,22 +346,15 @@ def bwd(
                                         bz // NH,
                                         D + d_i * 4,
                                     ],
-                                    acc_dkv_tail[source_row, d_i * 4]
-                                    if direct_dkv_store
-                                    else acc_dkv_tail_shared[bi_i, d_i * 4],
+                                    acc_dkv_tail_shared[bi_i, d_i * 4],
                                 ),
                                 T.evaluate(0),
                             )
                     else:
                         for bi_i, d_i in T.Parallel(BS // split_store, D):
                             source_row = bi_i + s * (BS // split_store)
-                            source_valid = mask[source_row]
-                            source_index = Indices[
-                                by, s_i, bz // NH, i_i * BS + source_row
-                            ]
-                            safe_index = T.if_then_else(
-                                source_valid, source_index, S_kv - 1
-                            )
+                            safe_index = safe_indices[source_row]
+                            source_valid = safe_index != S_kv - 1
                             T.atomic_add(
                                 dKV[
                                     by,
@@ -366,22 +364,15 @@ def bwd(
                                 ],
                                 T.if_then_else(
                                     source_valid,
-                                    acc_dkv[source_row, d_i]
-                                    if direct_dkv_store
-                                    else acc_dkv_shared[bi_i, d_i],
+                                    acc_dkv_shared[bi_i, d_i],
                                     0,
                                 ),
                             )
 
                         for bi_i, d_i in T.Parallel(BS // split_store, D_tail):
                             source_row = bi_i + s * (BS // split_store)
-                            source_valid = mask[source_row]
-                            source_index = Indices[
-                                by, s_i, bz // NH, i_i * BS + source_row
-                            ]
-                            safe_index = T.if_then_else(
-                                source_valid, source_index, S_kv - 1
-                            )
+                            safe_index = safe_indices[source_row]
+                            source_valid = safe_index != S_kv - 1
                             T.atomic_add(
                                 dKV[
                                     by,
@@ -391,9 +382,7 @@ def bwd(
                                 ],
                                 T.if_then_else(
                                     source_valid,
-                                    acc_dkv_tail[source_row, d_i]
-                                    if direct_dkv_store
-                                    else acc_dkv_tail_shared[bi_i, d_i],
+                                    acc_dkv_tail_shared[bi_i, d_i],
                                     0,
                                 ),
                             )
@@ -430,14 +419,14 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None):
     if indices.dtype != torch.int32:
         raise TypeError("sparse MLA indices must be int32")
 
-    direct_value = os.environ.get("PRIME_SPARSE_BWD_DIRECT_DKV", "0")
-    if direct_value not in {"0", "1"}:
-        raise ValueError("PRIME_SPARSE_BWD_DIRECT_DKV must be 0 or 1")
-    direct_dkv_store = direct_value == "1"
+    reuse_value = os.environ.get("PRIME_SPARSE_BWD_REUSE_DQ_SHARED", "0")
+    if reuse_value not in {"0", "1"}:
+        raise ValueError("PRIME_SPARSE_BWD_REUSE_DQ_SHARED must be 0 or 1")
+    reuse_dq_shared = reuse_value == "1"
     capability = torch.cuda.get_device_capability(q.device)
-    if direct_dkv_store and capability != (8, 9):
+    if reuse_dq_shared and capability != (8, 9):
         raise ValueError(
-            "PRIME_SPARSE_BWD_DIRECT_DKV requires an SM89 CUDA device"
+            "PRIME_SPARSE_BWD_REUSE_DQ_SHARED requires an SM89 CUDA device"
         )
 
     preprocess_kernel = preprocess(H, D)
@@ -445,9 +434,9 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None):
         block_size = int(os.environ.get("PRIME_SPARSE_BWD_BLOCK_SIZE", "16"))
         block_heads = int(os.environ.get("PRIME_SPARSE_BWD_BLOCK_HEADS", "16"))
         threads = int(os.environ.get("PRIME_SPARSE_BWD_THREADS", "64"))
-        if direct_dkv_store and (block_size, block_heads, threads) != (16, 16, 64):
+        if reuse_dq_shared and (block_size, block_heads, threads) != (16, 16, 64):
             raise ValueError(
-                "PRIME_SPARSE_BWD_DIRECT_DKV requires SM89 block=16 heads=16 threads=64"
+                "PRIME_SPARSE_BWD_REUSE_DQ_SHARED requires SM89 block=16 heads=16 threads=64"
             )
         bwd_kernel = bwd(
             H,
@@ -461,7 +450,7 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None):
             block_H=block_heads,
             threads=threads,
             vectorized_atomic=False,
-            direct_dkv_store=direct_dkv_store,
+            reuse_dq_shared=reuse_dq_shared,
         )
     else:
         bwd_kernel = bwd(
@@ -472,7 +461,7 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None):
             kv_group,
             sm_scale,
             True,
-            direct_dkv_store=direct_dkv_store,
+            reuse_dq_shared=reuse_dq_shared,
         )
     postprocess_kernel = postprocess(D, D_tail, kv_group)
 
