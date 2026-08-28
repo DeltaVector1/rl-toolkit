@@ -10805,8 +10805,20 @@ remote_command() {{
   ssh "${{ssh_opts[@]}}" "$target" bash -s -- "$operation" "$encoded_final" "$encoded_staging" <<'REMOTE_SCRIPT'
 set -euo pipefail
 operation=$1
-final=$(printf '%s' "$2" | base64 -d)
-staging=$(printf '%s' "$3" | base64 -d)
+path_dir=$(mktemp -d)
+trap 'rm -rf -- "$path_dir"' EXIT
+printf '%s' "$2" | base64 -d > "$path_dir/final"
+printf '%s' "$3" | base64 -d > "$path_dir/staging"
+for path_file in "$path_dir/final" "$path_dir/staging"; do
+  cmp -s "$path_file" <(LC_ALL=C tr -d '\\000' < "$path_file") || exit 2
+done
+read_path() {{
+  local path_file=$1 variable=$2 value=
+  IFS= read -r -d '' value < "$path_file" || true
+  printf -v "$variable" '%s' "$value"
+}}
+read_path "$path_dir/final" final
+read_path "$path_dir/staging" staging
 file_digest() {{
   local digest
   digest=$(sha256sum -- "$1" 2>/dev/null | cut -d' ' -f1) || return
@@ -10814,46 +10826,73 @@ file_digest() {{
 }}
 case "$operation" in
   final_digest) file_digest "$final" ;;
-  make_directory) mkdir -p -- "$(dirname -- "$final")" ;;
+  create_staging)
+    directory=${{final%/*}}
+    [ "$directory" = "$final" ] && directory=.
+    mkdir -p -- "$directory"
+    mktemp --tmpdir="$directory" '.adapter_model.XXXXXXXX.partial'
+    ;;
   partial_digest) file_digest "$staging" ;;
-  install) mv -- "$staging" "$final" ;;
+  cleanup) [ -z "$staging" ] || rm -f -- "$staging" ;;
+  install)
+    staged_digest=$(file_digest "$staging") || exit 1
+    if [ -e "$final" ]; then
+      existing_digest=$(file_digest "$final") || exit 1
+      [ "$existing_digest" = "$staged_digest" ] || exit 3
+      rm -f -- "$staging"
+    else
+      mv -- "$staging" "$final"
+    fi
+    ;;
   *) exit 2 ;;
 esac
 REMOTE_SCRIPT
 }}
+current_target=
+current_staging=
+cleanup_current_staging() {{
+  if [ -n "$current_staging" ]; then
+    remote_command "$current_target" cleanup "$source_file" "$current_staging" >/dev/null || true
+    current_staging=
+  fi
+}}
+trap cleanup_current_staging EXIT
 copy_one() {{
   target=$1
   final=$source_file
-  staging="/tmp/prime-rl-adapter.$digest.partial"
-  remote_digest=$(remote_command "$target" final_digest "$final" "$staging" || true)
+  current_target=$target
+  current_staging=
+  remote_digest=$(remote_command "$target" final_digest "$final" "" || true)
   [ "$remote_digest" = "$digest" ] && return 0
   [ -z "$remote_digest" ] || {{
     echo "$target has a different adapter at $final" >&2
     return 1
   }}
-  remote_command "$target" make_directory "$final" "$staging"
+  current_staging=$(remote_command "$target" create_staging "$final" "")
   transfer=rsync
   ssh "${{ssh_opts[@]}}" "$target" command -v rsync >/dev/null || transfer=scp
   for attempt in 1 2 3; do
     if [ "$transfer" = rsync ]; then
       rsync -a --partial --append-verify --timeout=120 \
         -e "ssh ${{ssh_opts[*]}}" \
-        "$source_file" "$target:$staging" && copied=1 || copied=0
+        "$source_file" "$target:$current_staging" && copied=1 || copied=0
     else
       scp -p "${{ssh_opts[@]}}" \
         -o ServerAliveInterval=15 -o ServerAliveCountMax=8 \
-        "$source_file" "$target:$staging" && copied=1 || copied=0
+        "$source_file" "$target:$current_staging" && copied=1 || copied=0
     fi
     if [ "$copied" = 1 ]; then
-      remote_digest=$(remote_command "$target" partial_digest "$final" "$staging")
+      remote_digest=$(remote_command "$target" partial_digest "$final" "$current_staging")
       if [ "$remote_digest" = "$digest" ]; then
-        remote_command "$target" install "$final" "$staging"
+        remote_command "$target" install "$final" "$current_staging"
+        current_staging=
         return 0
       fi
     fi
     echo "$target adapter copy attempt $attempt failed" >&2
     sleep 5
   done
+  cleanup_current_staging
   return 1
 }}
 fail=0
