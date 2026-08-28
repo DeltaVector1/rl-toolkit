@@ -11,6 +11,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 from torch import nn
+from torch.distributed.elastic.multiprocessing.errors import record
 
 from prime_rl.trainer.distributed import async_schedule, pp_runner
 
@@ -218,6 +219,7 @@ def assert_parity(baseline: dict, candidate: dict) -> None:
                 raise AssertionError(f"{field} differs at step {old['step']}")
 
 
+@record
 def main() -> None:
     if int(os.environ.get("WORLD_SIZE", "0")) != stages:
         raise AssertionError("this qualification requires exactly eight ranks")

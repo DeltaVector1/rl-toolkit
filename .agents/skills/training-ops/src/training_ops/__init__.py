@@ -10302,7 +10302,11 @@ printf 'STALE removed:%s\n' "$candidate_id"
         f"{repository}/source/src/prime_rl/trainer/distributed/async_schedule.py"
     )
     runner_path = f"{repository}/source/src/prime_rl/trainer/distributed/pp_runner.py"
-    inner = "torchrun --standalone --nproc-per-node=8 /qualification/test_pp_async_cuda.py"
+    inner = (
+        "torchrun --standalone --nproc-per-node=8 "
+        "--log-dir /output/torchrun --redirects 3 --tee 3 "
+        "/qualification/test_pp_async_cuda.py"
+    )
     _session_deadline, startup_deadline, _step_deadline, _finalize_deadline = (
         _glm_b2048_deadlines()
     )
@@ -10410,10 +10414,108 @@ cat {shlex.quote(result_path)}
             f"pids={postflight.get('PIDS', '')}"
         )
     if code:
+        diagnostic_program = f"""
+import json
+import os
+import stat
+from pathlib import Path
+
+root = Path({output_dir!r})
+records = []
+if root.is_dir() and not root.is_symlink():
+    for directory, names, files in os.walk(root / "torchrun", followlinks=False):
+        base = Path(directory)
+        names[:] = [name for name in names if not (base / name).is_symlink()]
+        if "error.json" not in files:
+            continue
+        path = base / "error.json"
+        try:
+            metadata = path.lstat()
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 1048576:
+                continue
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                payload = os.read(descriptor, 1048577)
+            finally:
+                os.close(descriptor)
+            if len(payload) > 1048576:
+                continue
+            record = json.loads(payload)
+            rank = int(path.parent.name)
+            message = record.get("message")
+            if isinstance(message, dict):
+                extra = message.get("extraInfo")
+                traceback = extra.get("py_callstack") if isinstance(extra, dict) else None
+                if not isinstance(traceback, str):
+                    traceback = message.get("message")
+            else:
+                traceback = message
+            if not 0 <= rank < 8 or not isinstance(traceback, str) or not traceback:
+                continue
+            records.append({{
+                "rank": rank,
+                "error_path": str(path.relative_to(root)),
+                "traceback": traceback[-6000:],
+            }})
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+records.sort(key=lambda item: ("Traceback" not in item["traceback"], item["rank"]))
+print(json.dumps(records[0] if records else {{"status": "missing"}}, sort_keys=True))
+"""
+        diagnostic_code, diagnostic_output = _ssh(
+            host,
+            "python3 -c " + shlex.quote(diagnostic_program),
+            timeout=60,
+        )
+        worker_failure = None
+        if diagnostic_code == 0:
+            try:
+                candidate = json.loads(diagnostic_output.strip().splitlines()[-1])
+            except (IndexError, json.JSONDecodeError):
+                candidate = None
+            if isinstance(candidate, dict) and set(candidate) == {
+                "rank",
+                "error_path",
+                "traceback",
+            }:
+                error_path = candidate.get("error_path")
+                traceback = candidate.get("traceback")
+                rank = candidate.get("rank")
+                path = PurePosixPath(error_path) if isinstance(error_path, str) else None
+                if (
+                    isinstance(rank, int)
+                    and not isinstance(rank, bool)
+                    and 0 <= rank < 8
+                    and path is not None
+                    and not path.is_absolute()
+                    and path.parts[:1] == ("torchrun",)
+                    and ".." not in path.parts
+                    and path.name == "error.json"
+                    and isinstance(traceback, str)
+                    and 0 < len(traceback) <= 6000
+                ):
+                    worker_failure = {
+                        "rank": rank,
+                        "error_path": str(PurePosixPath(output_dir) / path),
+                        "traceback": traceback,
+                    }
         primary_error = (
             "PP async CUDA qualification failed: "
             + (output.strip()[-2000:] or f"ssh exit {code}")
         )
+        if worker_failure is not None:
+            primary_error += (
+                f"; failing_rank={worker_failure['rank']}"
+                f"; error_path={worker_failure['error_path']}"
+                f"; traceback={worker_failure['traceback']}"
+            )
+        elif diagnostic_code:
+            primary_error += (
+                "; worker diagnostic failed: "
+                + (diagnostic_output.strip()[-500:] or f"ssh exit {diagnostic_code}")
+            )
+        else:
+            primary_error += "; worker error artifact is missing"
         if postflight_error is not None:
             primary_error += "; cleanup/postflight also failed: " + postflight_error
         raise RuntimeError(primary_error)

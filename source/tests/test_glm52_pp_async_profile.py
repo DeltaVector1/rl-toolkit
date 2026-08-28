@@ -174,6 +174,7 @@ def test_cuda_smoke_profile_is_small_and_n82_only() -> None:
     assert "Schedule1F1BAsync" not in script
     assert 'run_mode("1f1b"' in script
     assert 'run_mode("1f1b_async"' in script
+    assert "@record\ndef main()" in script
     assert "model-fp8" not in script
     assert "/data/ZiphuAI" not in script
 
@@ -183,7 +184,8 @@ def test_cuda_smoke_has_a_resolvable_hostname_without_network_access() -> None:
         ROOT / ".agents/skills/training-ops/src/training_ops/__init__.py"
     ).read_text()
     assert "--network none \\\n  --hostname localhost --read-only" in source
-    assert 'inner = "torchrun --standalone --nproc-per-node=8' in source
+    assert '"torchrun --standalone --nproc-per-node=8 "' in source
+    assert '"--log-dir /output/torchrun --redirects 3 --tee 3 "' in source
 
 
 def test_exited_trainer_is_allowed_and_cuda_command_is_fail_closed() -> None:
@@ -259,6 +261,8 @@ def test_exited_trainer_is_allowed_and_cuda_command_is_fail_closed() -> None:
     assert "docker rm \"$candidate_id\"" in stale_cleanup
     launch = calls[2][1]
     assert "--nproc-per-node=8" in launch
+    assert "--log-dir /output/torchrun" in launch
+    assert "--redirects 3 --tee 3" in launch
     assert "--network none" in launch
     assert "--hostname localhost" in launch
     assert "--read-only" in launch
@@ -297,7 +301,7 @@ def test_exited_trainer_is_allowed_and_cuda_command_is_fail_closed() -> None:
         assert "cleanup/postflight also failed" not in str(error)
     else:
         raise AssertionError("a timed-out CUDA qualification passed")
-    assert len(timeout_calls) == 4
+    assert len(timeout_calls) == 5
     assert "--cidfile" in timeout_calls[2][1]
     assert "trap cleanup EXIT" in timeout_calls[2][1]
 
@@ -323,6 +327,53 @@ def test_exited_trainer_is_allowed_and_cuda_command_is_fail_closed() -> None:
         assert "containers=abc123 pids=77" in message
     else:
         raise AssertionError("a failed cleanup replaced the original error")
+
+
+def test_rank_four_failure_artifact_survives_a_missing_result() -> None:
+    training_ops = _load_training_ops("training_ops_pp_async_rank_failure")
+    training_ops._assert_live_services_are_down = lambda *_args, **_kwargs: None
+    training_ops.deploy = lambda *_args, **_kwargs: True
+    training_ops.secrets.token_hex = lambda _size: "0123456789abcdef"
+    calls = []
+    artifact = {
+        "rank": 4,
+        "error_path": "torchrun/run/attempt_0/4/error.json",
+        "traceback": "Traceback: rank four failed before result.json",
+    }
+
+    def fake_ssh(host, command, timeout=120, **_kwargs):
+        calls.append((host, command, timeout))
+        if len(calls) == 1:
+            return 0, "GPUS 8\nPIDS\nRUNNING\n"
+        if len(calls) == 2:
+            return 0, "STALE none\n"
+        if len(calls) == 3:
+            return 1, "ChildFailedError: rank 4"
+        if len(calls) == 4:
+            return 0, "CONTAINERS\nPIDS\n"
+        return 0, json.dumps(artifact)
+
+    training_ops._ssh = fake_ssh
+    try:
+        training_ops.qualify_glm52_pp_async_cuda()
+    except RuntimeError as error:
+        message = str(error)
+        assert "failing_rank=4" in message
+        assert (
+            "error_path=/data/glm52-rl/qualifications/"
+            "glm52-pp-async-cuda-smoke/0123456789abcdef/"
+            "torchrun/run/attempt_0/4/error.json"
+        ) in message
+        assert artifact["traceback"] in message
+        assert "worker error artifact is missing" not in message
+    else:
+        raise AssertionError("a missing result hid the rank-four worker failure")
+    assert len(calls) == 5
+    launch = calls[2][1]
+    assert "--log-dir /output/torchrun" in launch
+    diagnostic = calls[4][1]
+    assert "error.json" in diagnostic
+    assert 'traceback[-6000:]' in diagnostic
 
 
 def test_preflight_reports_gpu_pids_and_running_containers_separately() -> None:
