@@ -21,6 +21,8 @@ MAX_WARMUP = 10
 MAX_ITERATIONS = 100
 BF16_RTOL = 2e-2
 BF16_ATOL = 2e-2
+BF16_BYTES = 2
+FUSED_COMBINED_A_TEMPORARY_BYTES = 2 * RANK * HIDDEN * BF16_BYTES
 
 
 def reference_pair(
@@ -30,9 +32,12 @@ def reference_pair(
     kv_a: torch.Tensor,
     kv_b: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    q_low = x @ q_a.T
-    kv_low = x @ kv_a.T
-    return q_low @ q_b.T, kv_low @ kv_b.T
+    from prime_rl.trainer.models.layers.lora.multi_linear import _SingleLoRA
+
+    return (
+        _SingleLoRA.apply(x, q_a, q_b, "sm89-smoke.q_a_proj"),
+        _SingleLoRA.apply(x, kv_a, kv_b, "sm89-smoke.kv_a_proj_with_mqa"),
+    )
 
 
 def candidate_pair(
@@ -101,26 +106,44 @@ def _assert_finite(values: tuple[torch.Tensor, ...], label: str) -> None:
         raise RuntimeError(f"{label} contains a nonfinite value")
 
 
-def _backward(
+def _run_backward(
     implementation: Callable[..., tuple[torch.Tensor, torch.Tensor]],
     tensors: tuple[torch.Tensor, ...],
     upstream: tuple[torch.Tensor, ...],
-) -> tuple[torch.Tensor, ...]:
+) -> None:
     outputs = implementation(*tensors)
-    _assert_finite(outputs, "forward output")
     torch.autograd.backward(outputs, upstream)
-    gradients = tuple(
-        value.grad.detach().clone() for value in tensors if value.grad is not None
-    )
-    if len(gradients) != len(tensors):
+
+
+def _collect_gradients(tensors: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
+    if any(value.grad is None for value in tensors):
         raise RuntimeError("backward did not produce every input or parameter gradient")
+    gradients = tuple(value.grad.detach().clone() for value in tensors)
     _assert_finite(gradients, "gradient")
     return gradients
+
+
+def _gradient_norms(
+    gradients: tuple[torch.Tensor, ...], names: tuple[str, ...]
+) -> dict[str, float]:
+    norms = {}
+    for name, gradient in zip(names, gradients, strict=True):
+        norm = float(torch.linalg.vector_norm(gradient.float()).item())
+        if not norm > 0.0:
+            raise RuntimeError(f"reference {name} gradient norm is zero")
+        norms[name] = norm
+    return norms
 
 
 def _clear_gradients(tensors: tuple[torch.Tensor, ...]) -> None:
     for value in tensors:
         value.grad = None
+
+
+def _assert_gradients_finite(tensors: tuple[torch.Tensor, ...], label: str) -> None:
+    if any(value.grad is None for value in tensors):
+        raise RuntimeError(f"{label} is missing a gradient")
+    _assert_finite(tuple(value.grad for value in tensors), label)
 
 
 def _cuda_timed(callable: Callable[[], object]) -> tuple[object, float]:
@@ -155,14 +178,15 @@ def _measure(
         return implementation(*tensors)
 
     def backward() -> None:
-        _backward(implementation, tensors, upstream)
-        _clear_gradients(tensors)
+        _run_backward(implementation, tensors, upstream)
 
     for _ in range(warmup):
         result = forward()
         _assert_finite(result, "warmup output")
         del result
         backward()
+        _assert_gradients_finite(tensors, "warmup gradient")
+        _clear_gradients(tensors)
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats(device)
 
@@ -172,16 +196,66 @@ def _measure(
         _assert_finite(result, "forward output")
         forward_times.append(elapsed)
         del result
+    forward_peak = int(torch.cuda.max_memory_allocated(device))
+    torch.cuda.reset_peak_memory_stats(device)
     backward_times = []
     for _ in range(iterations):
         _, elapsed = _cuda_timed(backward)
+        _assert_gradients_finite(tensors, "gradient")
         backward_times.append(elapsed)
+        _clear_gradients(tensors)
     torch.cuda.synchronize()
     return {
         "forward": _summary(forward_times),
         "backward": _summary(backward_times),
-        "peak_allocated_bytes": int(torch.cuda.max_memory_allocated(device)),
+        "peak_forward_allocated_bytes": forward_peak,
+        "peak_backward_allocated_bytes": int(
+            torch.cuda.max_memory_allocated(device)
+        ),
     }
+
+
+def _error_metrics(
+    actual: torch.Tensor, expected: torch.Tensor
+) -> dict[str, float]:
+    actual_float = actual.float()
+    expected_float = expected.float()
+    difference = (actual_float - expected_float).abs()
+    allowed = BF16_ATOL + BF16_RTOL * expected_float.abs()
+    relative = difference / expected_float.abs().clamp_min(BF16_ATOL)
+    return {
+        "max_abs_error": float(difference.max().item()),
+        "max_relative_error": float(relative.max().item()),
+        "max_tolerance_ratio": float((difference / allowed).max().item()),
+    }
+
+
+def _assert_close(
+    actual: torch.Tensor, expected: torch.Tensor, label: str
+) -> dict[str, float]:
+    metrics = _error_metrics(actual, expected)
+    if not bool(
+        torch.all(
+            (actual.float() - expected.float()).abs()
+            <= BF16_ATOL + BF16_RTOL * expected.float().abs()
+        )
+    ):
+        raise RuntimeError(f"{label} exceeds BF16 tolerance: {metrics}")
+    return metrics
+
+
+def _perturbation_checks(device: torch.device) -> None:
+    expected = torch.ones((4, 4), device=device, dtype=torch.bfloat16)
+    for label in ("forward output", "input gradient", "parameter gradient"):
+        actual = expected.clone()
+        actual[0, 0] += 1
+        try:
+            _assert_close(actual, expected, label)
+        except RuntimeError as error:
+            if label not in str(error):
+                raise RuntimeError(f"{label} perturbation error was not identified") from error
+        else:
+            raise RuntimeError(f"{label} perturbation was accepted")
 
 
 def _compare(tokens: int, device: torch.device) -> dict[str, object]:
@@ -192,24 +266,40 @@ def _compare(tokens: int, device: torch.device) -> dict[str, object]:
     upstream = _upstream(tokens, device, 20260831)
     reference_outputs = reference_pair(*reference_tensors)
     candidate_outputs = candidate_pair(*candidate_tensors)
-    for actual, expected in zip(candidate_outputs, reference_outputs, strict=True):
-        torch.testing.assert_close(actual, expected, rtol=BF16_RTOL, atol=BF16_ATOL)
-    reference_gradients = _backward(reference_pair, reference_tensors, upstream)
-    candidate_gradients = _backward(candidate_pair, candidate_tensors, upstream)
-    torch.testing.assert_close(
-        candidate_gradients[0],
-        reference_gradients[0],
-        rtol=BF16_RTOL,
-        atol=BF16_ATOL,
+    _assert_finite(reference_outputs, "reference output")
+    _assert_finite(candidate_outputs, "candidate output")
+    output_metrics = {
+        name: _assert_close(actual, expected, f"{name} output")
+        for name, actual, expected in zip(
+            ("q_a", "kv_a"), candidate_outputs, reference_outputs, strict=True
+        )
+    }
+    _run_backward(reference_pair, reference_tensors, upstream)
+    reference_gradients = _collect_gradients(reference_tensors)
+    reference_norms = _gradient_norms(
+        reference_gradients, ("input", "q_a", "q_b", "kv_a", "kv_b")
     )
-    for actual, expected in zip(
-        candidate_gradients[1:], reference_gradients[1:], strict=True
-    ):
-        torch.testing.assert_close(actual, expected, rtol=BF16_RTOL, atol=BF16_ATOL)
+    _clear_gradients(reference_tensors)
+    _run_backward(candidate_pair, candidate_tensors, upstream)
+    candidate_gradients = _collect_gradients(candidate_tensors)
+    _clear_gradients(candidate_tensors)
+    input_metrics = _assert_close(
+        candidate_gradients[0], reference_gradients[0], "input gradient"
+    )
+    parameter_metrics = {
+        name: _assert_close(actual, expected, f"{name} gradient")
+        for name, actual, expected in zip(
+            ("q_a", "q_b", "kv_a", "kv_b"),
+            candidate_gradients[1:],
+            reference_gradients[1:],
+            strict=True,
+        )
+    }
     return {
-        "forward": "passed",
-        "input_gradient": "passed",
-        "parameter_gradients": "passed",
+        "forward": output_metrics,
+        "input_gradient": input_metrics,
+        "parameter_gradients": parameter_metrics,
+        "reference_gradient_norms": reference_norms,
         "finite": "passed",
     }
 
@@ -223,9 +313,11 @@ def main() -> None:
     if capability != (8, 9):
         raise SystemExit(f"SM89 is required, found sm_{capability[0]}{capability[1]}")
     device = torch.device("cuda")
+    _perturbation_checks(device)
     comparison = _compare(args.tokens, device)
     baseline = _measure(reference_pair, args.tokens, device, args.warmup, args.iterations)
     fused = _measure(candidate_pair, args.tokens, device, args.warmup, args.iterations)
+    fused["fused_combined_a_temporary_bytes"] = FUSED_COMBINED_A_TEMPORARY_BYTES
     print(
         json.dumps(
             {

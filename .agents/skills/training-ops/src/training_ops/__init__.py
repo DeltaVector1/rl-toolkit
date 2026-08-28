@@ -10885,11 +10885,74 @@ exit "$status"
 """
 
 
+def _lora_fusion_smoke_trainer_containers() -> tuple[str, ...]:
+    names: set[str] = set()
+    for key, value in containers.items():
+        if key == "trainer" or key.endswith("_trainer"):
+            if not isinstance(value, str) or not value:
+                raise Refused(f"configured trainer container {key!r} is invalid")
+            names.add(value)
+    for profile_name, profile in operations.get("profiles", {}).items():
+        if not isinstance(profile, dict):
+            raise Refused(f"profile {profile_name!r} is invalid")
+        reference = profile.get("trainer_container")
+        if reference is None:
+            continue
+        if not isinstance(reference, str) or reference not in containers:
+            raise Refused(
+                f"profile {profile_name!r} refers to an unknown trainer container"
+            )
+        value = containers[reference]
+        if not isinstance(value, str) or not value:
+            raise Refused(
+                f"profile {profile_name!r} refers to an invalid trainer container"
+            )
+        names.add(value)
+    names.add(protected_trainer)
+    if not names:
+        raise Refused("no configured trainer containers are available for preflight")
+    return tuple(sorted(names))
+
+
+def _lora_fusion_smoke_preflight() -> None:
+    trainer_containers = _lora_fusion_smoke_trainer_containers()
+    quoted_names = " ".join(shlex.quote(name) for name in trainer_containers)
+    script = f"""set -euo pipefail
+names=({quoted_names})
+running=$(sudo docker ps -a --format '{{{{.Names}}}}')
+for name in "${{names[@]}}"; do
+  if printf '%s\\n' "$running" | grep -Fx -- "$name" >/dev/null; then
+    echo "configured trainer container is present: $name" >&2
+    exit 20
+  fi
+done
+pids=$(sudo nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits -i 0)
+if test -n "$(printf '%s\\n' "$pids" | sed '/^[[:space:]]*$/d')"; then
+  echo "GPU 0 has compute processes" >&2
+  printf '%s\\n' "$pids" >&2
+  exit 21
+fi
+"""
+
+    def check(host: str) -> str:
+        code, output = _ssh(host, script, timeout=60)
+        if code:
+            return output.strip() or f"ssh exited with status {code}"
+        return "ok"
+
+    results = _fan(trainer_hosts, check, workers=min(8, len(trainer_hosts)))
+    failures = {host: detail for host, detail in results.items() if detail != "ok"}
+    if failures:
+        detail = "; ".join(f"{host}: {reason[:200]}" for host, reason in failures.items())
+        raise Refused(f"GLM LoRA fusion smoke preflight refused: {detail}")
+
+
 def qualify_glm52_lora_fusion() -> dict[str, object]:
     """Run the opt-in one-GPU GLM LoRA fusion smoke."""
     host, image, script, module, remote_timeout, ssh_timeout = _lora_fusion_smoke_spec()
     repository = _repository_root("glm52-qualification")
-    with _ssh_control_masters([host]):
+    with _ssh_control_masters(trainer_hosts):
+        _lora_fusion_smoke_preflight()
         _assert_live_services_are_down([host], include_inference=False)
         for path in (script, module):
             if not deploy(
