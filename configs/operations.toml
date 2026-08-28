@@ -149,6 +149,7 @@ host_group = "trainer_head"
 gpu = 0
 image = "trainer_image"
 script = "scripts/ops/benchmark_fused_qkv_a_lora_sm89.py"
+triton_preflight = "scripts/ops/preflight_triton_exec.py"
 source_modules = [
   "source/src/prime_rl/trainer/models/layers/lora/multi_linear.py",
   "source/src/prime_rl/trainer/models/layers/fp8_ada.py",

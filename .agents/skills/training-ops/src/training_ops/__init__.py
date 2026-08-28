@@ -10256,7 +10256,7 @@ def _lora_fusion_import_closure(entry: str) -> tuple[str, ...]:
 
 
 def _lora_fusion_smoke_spec() -> tuple[
-    str, str, str, tuple[str, ...], int, int
+    str, str, str, str, tuple[str, ...], int, int
 ]:
     settings = qualification_commands.get("glm52_lora_fusion_smoke")
     if not isinstance(settings, dict):
@@ -10269,9 +10269,12 @@ def _lora_fusion_smoke_spec() -> tuple[
     if image_key != "trainer_image" or image_key not in containers:
         raise Refused("GLM LoRA fusion smoke must use the configured trainer image")
     script = settings.get("script")
+    triton_preflight = settings.get("triton_preflight")
     modules = settings.get("source_modules")
     if script != "scripts/ops/benchmark_fused_qkv_a_lora_sm89.py":
         raise Refused("GLM LoRA fusion smoke script differs from its registered command")
+    if triton_preflight != "scripts/ops/preflight_triton_exec.py":
+        raise Refused("GLM LoRA fusion Triton preflight differs from its registered command")
     entry = "source/src/prime_rl/trainer/models/layers/lora/multi_linear.py"
     if (
         not isinstance(modules, list)
@@ -10305,15 +10308,24 @@ def _lora_fusion_smoke_spec() -> tuple[
     image = containers[image_key]
     if not isinstance(image, str) or not image:
         raise Refused("GLM LoRA fusion smoke image is invalid")
-    return host, image, script, tuple(modules), remote_timeout, ssh_timeout
+    return (
+        host,
+        image,
+        script,
+        triton_preflight,
+        tuple(modules),
+        remote_timeout,
+        ssh_timeout,
+    )
 
 
 def _lora_fusion_smoke_mounts(
     repository: str,
     script: str,
+    triton_preflight: str,
     modules: tuple[str, ...],
 ) -> tuple[tuple[str, str, str, str], ...]:
-    files = (script, *modules)
+    files = (script, triton_preflight, *modules)
     mounts = []
     destinations: set[str] = set()
     for relative in files:
@@ -10322,6 +10334,8 @@ def _lora_fusion_smoke_mounts(
             raise Refused(f"GLM LoRA fusion mount source is invalid: {relative}")
         if relative == script:
             destination = "/opt/glm52-lora-fusion-smoke.py"
+        elif relative == triton_preflight:
+            destination = "/opt/glm52-triton-preflight.py"
         elif relative.startswith("source/src/prime_rl/") and relative.endswith(".py"):
             destination = f"/app/src/{relative.removeprefix('source/src/')}"
         else:
@@ -10394,6 +10408,7 @@ def _lora_fusion_smoke_command(
     repository: str,
     image: str,
     script: str,
+    triton_preflight: str,
     modules: tuple[str, ...],
     container: str,
     gpu: int,
@@ -10402,7 +10417,9 @@ def _lora_fusion_smoke_command(
     quoted_container = shlex.quote(container)
     quoted_gpu = shlex.quote(str(gpu))
     quoted_image = shlex.quote(image)
-    mounts = _lora_fusion_smoke_mounts(repository, script, modules)
+    mounts = _lora_fusion_smoke_mounts(
+        repository, script, triton_preflight, modules
+    )
     mount_options = "".join(
         f"  --mount {shlex.quote(f'type=bind,src={source},dst={destination},readonly')} \\\n"
         for _relative, source, destination, _digest in mounts
@@ -10411,6 +10428,7 @@ def _lora_fusion_smoke_command(
     container_command = shlex.quote(
         "set -euo pipefail\n"
         f"python3 -c {shlex.quote(verifier)}\n"
+        "python3 /opt/glm52-triton-preflight.py\n"
         "exec python3 /opt/glm52-lora-fusion-smoke.py "
         "--warmup 5 --iterations 20 --tokens 4096"
     )
@@ -10442,7 +10460,7 @@ status=0
 sudo timeout --foreground --signal=TERM --kill-after=20s {remote_timeout}s sudo docker run --rm \\
   --name "$container" --gpus device="$gpu" --network none --ipc private \\
   --read-only --cap-drop=ALL --security-opt=no-new-privileges \\
-  --tmpfs /tmp:rw,nosuid,nodev,size=1024m \\
+  --tmpfs /tmp:rw,exec,nosuid,nodev,size=1024m \\
   --env CUDA_VISIBLE_DEVICES=0 --env HOME=/tmp --env TRITON_CACHE_DIR=/tmp/triton \\
   --env PRIME_LORA_MM_PROFILE=sm89-r32 --env PRIME_EP_PROFILE=0 \\
   --env PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD=0 \\
@@ -10529,14 +10547,14 @@ fi
 
 def qualify_glm52_lora_fusion() -> dict[str, object]:
     """Run the opt-in one-GPU GLM LoRA fusion smoke."""
-    host, image, script, modules, remote_timeout, ssh_timeout = (
+    host, image, script, triton_preflight, modules, remote_timeout, ssh_timeout = (
         _lora_fusion_smoke_spec()
     )
     repository = _repository_root("glm52-qualification")
     with _ssh_control_masters(trainer_hosts):
         _lora_fusion_smoke_preflight()
         _assert_live_services_are_down([host], include_inference=False)
-        for path in (script, *modules):
+        for path in (script, triton_preflight, *modules):
             if not deploy(
                 path,
                 nodes=[host],
@@ -10551,6 +10569,7 @@ def qualify_glm52_lora_fusion() -> dict[str, object]:
                 repository,
                 image,
                 script,
+                triton_preflight,
                 modules,
                 container,
                 0,
