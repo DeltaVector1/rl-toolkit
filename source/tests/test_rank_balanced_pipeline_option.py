@@ -178,7 +178,7 @@ class RankBalancedPipelineOptionTest(unittest.TestCase):
         self.assertNotIn("rollout", launch.lower())
         self.assertNotIn("cache", launch.lower())
         self.assertNotIn("/models", launch)
-        self.assertEqual(calls[2][2], 300)
+        self.assertEqual(calls[2][2], 360)
 
 
 if __name__ == "__main__":

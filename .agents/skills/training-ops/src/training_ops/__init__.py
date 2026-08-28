@@ -10384,7 +10384,7 @@ sudo timeout --foreground --signal=TERM --kill-after=20s {timeout}s docker run -
 test -s {shlex.quote(result_path)}
 cat {shlex.quote(result_path)}
 """
-    code, output = _ssh(host, command, timeout=timeout)
+    code, output = _ssh(host, command, timeout=timeout + 60)
     postflight_code, postflight_output = _ssh(
         host,
         f"remaining=$(sudo docker ps -aq --filter name=^{container}$) || exit 97; "
