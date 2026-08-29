@@ -13,6 +13,7 @@ import shlex
 import statistics
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import tomllib
@@ -99,6 +100,7 @@ glm_rollout_max_seconds = glm_requirements["rollout_seconds_max"]
 
 adapter_archive_bucket = paths["adapter_bucket"]
 adapter_archive_files = ("adapter_config.json", "adapter_model.safetensors")
+dependency_manifest_name = ".training-ops-manifest"
 
 if set(inference_hosts) != set(inference_settings):
     raise RuntimeError("each inference host must have one [inference.<host>] entry")
@@ -2608,38 +2610,262 @@ def deploy(
     return not bad
 
 
+def _dependency_inventory_for_bundle(
+    required_files: list[tuple[str, list[str]]],
+) -> tuple[dict[str, Path], dict[str, list[str]]]:
+    """Validate dependency paths and return files plus their host selections."""
+    files: dict[str, Path] = {}
+    destinations: dict[str, list[str]] = {}
+    root = repo_root.resolve()
+    for item in required_files:
+        if not isinstance(item, (tuple, list)) or len(item) != 2:
+            raise Refused("invalid trainer dependency entry")
+        path, hosts_for_path = item
+        if not isinstance(path, str) or not path:
+            raise Refused("trainer dependency path must be a non-empty string")
+        relative = PurePosixPath(path)
+        if (
+            relative.is_absolute()
+            or relative.as_posix() != path
+            or ".." in relative.parts
+            or any(ord(char) < 0x20 for char in path)
+            or path == dependency_manifest_name
+        ):
+            raise Refused(f"unsafe trainer dependency path: {path!r}")
+        if isinstance(hosts_for_path, str) or not hosts_for_path:
+            raise Refused(f"no configured host for trainer dependency {path}")
+        selected_hosts = []
+        for host in hosts_for_path:
+            if not isinstance(host, str):
+                raise Refused(f"invalid host for trainer dependency {path}")
+            host = _check_host(host)
+            if host not in selected_hosts:
+                selected_hosts.append(host)
+        local = repo_root / path
+        try:
+            resolved = local.resolve(strict=True)
+        except OSError as error:
+            raise Refused(f"cannot resolve trainer dependency {path}: {error}") from error
+        if not resolved.is_relative_to(root) or not local.is_file() or local.is_symlink():
+            raise Refused(f"trainer dependency is not a regular repository file: {path}")
+        files[path] = local
+        current = destinations.setdefault(path, [])
+        for host in selected_hosts:
+            if host not in current:
+                current.append(host)
+    return files, destinations
+
+
+def _create_dependency_bundle(
+    required_files: list[tuple[str, list[str]]], directory: Path
+) -> tuple[Path, dict[str, list[str]]]:
+    """Create one tar bundle and its checksum manifest for trainer files."""
+    files, destinations = _dependency_inventory_for_bundle(required_files)
+    if not files:
+        raise Refused("no trainer dependency files")
+    directory.mkdir(parents=True, exist_ok=True)
+    manifest = directory / dependency_manifest_name
+    manifest.write_text(
+        "".join(
+            f"{_sha256_file(files[path], path)}\t{path}\n"
+            for path in sorted(files)
+        ),
+        encoding="utf-8",
+    )
+    bundle = directory / f"trainer-dependencies-{directory.name}.tar"
+    with tarfile.open(bundle, mode="w") as archive:
+        for path in sorted(files):
+            archive.add(files[path], arcname=path, recursive=False)
+        archive.add(manifest, arcname=dependency_manifest_name, recursive=False)
+    return bundle, destinations
+
+
+def _dependency_remote_script(
+    bundle_path: str, repository_root: str, install_paths: list[str]
+) -> str:
+    """Build the bounded remote extraction, verification, and install script."""
+    install_array = " ".join(shlex.quote(path) for path in install_paths)
+    return f"""set -euo pipefail
+archive={shlex.quote(bundle_path)}
+repository={shlex.quote(repository_root)}
+manifest_name={shlex.quote(dependency_manifest_name)}
+install_paths=({install_array})
+temp=""
+cleanup() {{
+  status=$?
+  set +e
+  [ -z "$temp" ] || rm -rf -- "$temp"
+  rm -f -- "$archive"
+  exit "$status"
+}}
+trap cleanup EXIT
+die() {{ echo "trainer dependency bundle: $1" >&2; exit 1; }}
+temp=$(mktemp -d /tmp/training-ops-dependencies.XXXXXX)
+archive_list="$temp/archive.list"
+manifest="$temp/$manifest_name"
+expected_paths="$temp/expected.paths"
+tar -tf "$archive" > "$archive_list" || die "cannot list archive"
+
+# Reject traversal, absolute names, and directory entries before extraction.
+while IFS= read -r member; do
+  case "$member" in
+    ""|/*|..|../*|*/..|*/../*|*/)
+      die "unsafe archive member: $member"
+      ;;
+  esac
+done < "$archive_list"
+manifest_count=$(grep -Fxc -- "$manifest_name" "$archive_list" || true)
+[ "$manifest_count" -eq 1 ] || die "archive must contain one checksum manifest"
+tar -xOf "$archive" "$manifest_name" > "$manifest" || die "cannot extract checksum manifest"
+[ -f "$manifest" ] && [ ! -L "$manifest" ] || die "checksum manifest is not a regular file"
+
+: > "$expected_paths"
+expected_count=0
+while IFS="$(printf '\\t')" read -r digest member extra; do
+  [ -n "$digest" ] && [ -n "$member" ] && [ -z "${{extra:-}}" ] || die "invalid checksum manifest line"
+  if ! printf '%s\\n' "$digest" | grep -Eq '^[0-9a-f]{{64}}$'; then
+    die "invalid checksum for $member"
+  fi
+  case "$member" in
+    ""|/*|..|../*|*/..|*/../*|*/|"$manifest_name")
+      die "unsafe manifest path: $member"
+      ;;
+  esac
+  if grep -Fqx -- "$member" "$expected_paths"; then
+    die "duplicate manifest path: $member"
+  fi
+  printf '%s\\n' "$member" >> "$expected_paths"
+  expected_count=$((expected_count + 1))
+done < "$manifest"
+[ "$expected_count" -gt 0 ] || die "empty checksum manifest"
+archive_count=$(wc -l < "$archive_list")
+[ "$archive_count" -eq $((expected_count + 1)) ] || die "archive member count mismatch"
+
+while IFS= read -r member; do
+  [ "$member" = "$manifest_name" ] && continue
+  grep -Fqx -- "$member" "$expected_paths" || die "unlisted archive member: $member"
+done < "$archive_list"
+while IFS= read -r member; do
+  member_count=$(grep -Fxc -- "$member" "$archive_list" || true)
+  [ "$member_count" -eq 1 ] || die "missing or duplicate archive path: $member"
+done < "$expected_paths"
+
+tar -xpf "$archive" -C "$temp" --no-same-owner --no-overwrite-dir || die "cannot extract archive"
+while IFS="$(printf '\\t')" read -r digest member extra; do
+  source="$temp/$member"
+  [ -f "$source" ] && [ ! -L "$source" ] || die "missing extracted path: $member"
+  got=$(sha256sum -- "$source" | cut -d' ' -f1) || die "cannot checksum $member"
+  [ "$got" = "$digest" ] || die "checksum mismatch: $member"
+done < "$manifest"
+
+for member in "${{install_paths[@]}}"; do
+  grep -Fqx -- "$member" "$expected_paths" || die "install path is not listed: $member"
+  source="$temp/$member"
+  destination="$repository/$member"
+  mkdir -p -- "$(dirname -- "$destination")" || die "cannot create destination for $member"
+  [ ! -L "$destination" ] || die "destination is a symlink: $member"
+  cp -p -- "$source" "$destination" || die "cannot install $member"
+  [ -f "$destination" ] && [ ! -L "$destination" ] || die "invalid installed path: $member"
+  source_digest=$(sha256sum -- "$source" | cut -d' ' -f1) || die "cannot checksum $member"
+  got=$(sha256sum -- "$destination" | cut -d' ' -f1) || die "cannot verify $member"
+  [ "$got" = "$source_digest" ] || die "installed checksum mismatch: $member"
+done
+echo "installed ${{#install_paths[@]}} trainer dependency files"
+"""
+
+
 def _deploy_dependencies(required_files: list[tuple[str, list[str]]]) -> None:
-    """Deploy distinct dependency files with bounded, visible progress."""
-    total = len(required_files)
-    if not total:
+    """Deploy trainer dependencies as one verified archive per host."""
+    if not required_files:
         print("trainer dependency deployment: no files")
         return
-    workers = min(deployment_file_workers, total)
-    print(
-        f"deploying {total} trainer dependency files with "
-        f"{workers} parallel workers"
-    )
-    completed = 0
-    failures = []
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {
-            executor.submit(deploy, path, nodes=destinations): path
-            for path, destinations in required_files
-        }
-        for future in as_completed(futures):
-            path = futures[future]
+    repository_root = _repository_root()
+    with tempfile.TemporaryDirectory(prefix="training-ops-dependencies-") as work:
+        bundle, destinations = _create_dependency_bundle(required_files, Path(work))
+        hosts_for_bundle = sorted(
+            {host for selected_hosts in destinations.values() for host in selected_hosts}
+        )
+        if not hosts_for_bundle:
+            raise Refused("no configured trainer hosts for dependency bundle")
+        print(
+            f"trainer dependency bundle: created {len(destinations)} files "
+            f"({bundle.stat().st_size} bytes)"
+        )
+        workers = min(deployment_host_workers, len(hosts_for_bundle))
+        print(
+            f"trainer dependency bundle: uploading to {len(hosts_for_bundle)} hosts "
+            f"with {workers} parallel workers"
+        )
+        remote_archive = f"/tmp/{bundle.name}"
+
+        def one(host: str) -> str:
+            selected = [
+                path for path, selected_hosts in destinations.items() if host in selected_hosts
+            ]
+
+            def remove_partial_archive() -> None:
+                try:
+                    _ssh(
+                        host,
+                        f"rm -f -- {shlex.quote(remote_archive)}",
+                        timeout=deployment_mkdir_timeout_seconds,
+                    )
+                except Exception:
+                    pass
+
             try:
-                ok = future.result()
+                uploaded = subprocess.run(
+                    scp_command + [str(bundle), f"{host}:{remote_archive}"],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    timeout=deployment_scp_timeout_seconds,
+                )
+            except subprocess.TimeoutExpired:
+                remove_partial_archive()
+                return "scp TIMEOUT"
+            except OSError as error:
+                remove_partial_archive()
+                return f"scp failed: {error}"
+            if uploaded.returncode:
+                detail = ((uploaded.stdout or "") + (uploaded.stderr or "")).strip()
+                remove_partial_archive()
+                return f"scp failed: {detail[:120]}"
+            try:
+                code, output = _ssh(
+                    host,
+                    _dependency_remote_script(remote_archive, repository_root, selected),
+                    timeout=deployment_scp_timeout_seconds,
+                )
             except Exception as error:
-                ok = False
-                failures.append(f"{path}: {error}")
-            if not ok and not any(item.startswith(f"{path}:") for item in failures):
-                failures.append(f"{path}: deploy returned failure")
-            completed += 1
-            status = "ok" if ok else "FAILED"
-            print(f"dependency deployment {completed}/{total}: {path} [{status}]")
-    if failures:
-        raise RuntimeError("failed to deploy dependencies: " + "; ".join(failures))
+                remove_partial_archive()
+                return f"remote failed: {error}"
+            if code:
+                detail = " | ".join(output.strip().splitlines()[-3:]) if output.strip() else "no output"
+                remove_partial_archive()
+                return f"remote failed ({code}): {detail[:160]}"
+            return "ok"
+
+        failures = []
+        completed = 0
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(one, host): host for host in hosts_for_bundle}
+            for future in as_completed(futures):
+                host = futures[future]
+                try:
+                    result = future.result()
+                except Exception as error:
+                    result = f"failed: {error}"
+                completed += 1
+                if result != "ok":
+                    failures.append(f"{host}: {result}")
+                print(
+                    f"trainer dependency bundle: {host} "
+                    f"[{result}] ({completed}/{len(hosts_for_bundle)})"
+                )
+        if failures:
+            raise RuntimeError("failed to deploy dependency bundle: " + "; ".join(failures))
+        print("trainer dependency bundle: complete")
 
 
 def _trainer_dependency_inventory(
