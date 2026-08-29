@@ -385,7 +385,9 @@ def _production20_identity_failures(
     orchestrator_values: dict,
     environment_values: dict,
 ) -> list[str]:
-    if not profile_name.startswith("glm52-production"):
+    if not (
+        profile_name.startswith("glm52-production") or profile_name == "glm52-mtp20"
+    ):
         return []
     failures: list[str] = []
     identity = profile.get("identity")
@@ -404,10 +406,37 @@ def _production20_identity_failures(
 
     if identity.get("rollout_cache") is not False:
         failures.append("rollout cache must be explicitly false")
-    if identity.get("mtp_method") != "disabled":
-        failures.append("MTP must be explicitly disabled for the pinned GLM image")
-    if identity.get("mtp_tokens") != 0:
-        failures.append("MTP token count must be zero for the pinned GLM image")
+    if profile_name == "glm52-mtp20":
+        if identity.get("mtp_method") != "mtp":
+            failures.append("MTP must be explicitly enabled for the MTP production profile")
+        if identity.get("mtp_tokens") != 1:
+            failures.append("MTP token count must be one for the MTP production profile")
+        inference_config = required_text(
+            "inference_config", r"configs/paused/inference\.glm52-mtp20\.toml"
+        )
+        inference_launcher = required_text(
+            "inference_launcher", r"scripts/h200/start_mtp_production\.sh"
+        )
+        inference_container = required_text(
+            "inference_container", r"[A-Za-z0-9_.-]+"
+        )
+        if inference_config is not None and not (
+            repo_root / inference_config
+        ).is_file():
+            failures.append("identity inference config is not readable")
+        if inference_launcher is not None and not (
+            repo_root / inference_launcher
+        ).is_file():
+            failures.append("identity inference launcher is not readable")
+        if inference_container is not None and inference_container in set(
+            protected_inference
+        ):
+            failures.append("identity inference container is protected")
+    else:
+        if identity.get("mtp_method") != "disabled":
+            failures.append("MTP must be explicitly disabled for the pinned GLM image")
+        if identity.get("mtp_tokens") != 0:
+            failures.append("MTP token count must be zero for the pinned GLM image")
     for name, values in (
         ("trainer", trainer_values),
         ("orchestrator", orchestrator_values),
@@ -523,6 +552,223 @@ def _production20_identity_failures(
     if not isinstance(targets, list) or targets != lora.get("target_modules"):
         failures.append("adapter target identity differs from trainer configuration")
     return failures
+
+
+_mtp_production_states = frozenset(
+    {"created", "running", "restarting", "removing", "paused", "exited", "dead"}
+)
+
+
+def _mtp_production_spec(profile_name: str, profile: dict) -> dict[str, str]:
+    """Validate and return the isolated MTP engine contract for one profile."""
+    if profile_name != "glm52-mtp20":
+        raise Refused(f"profile {profile_name!r} is not an MTP production profile")
+    identity = profile.get("identity")
+    if not isinstance(identity, dict):
+        raise Refused("GLM MTP production profile identity is missing")
+    values = {
+        key: identity.get(key)
+        for key in ("inference_config", "inference_launcher", "inference_container")
+    }
+    if any(not isinstance(value, str) or not value for value in values.values()):
+        raise Refused("GLM MTP production inference identity is incomplete")
+    config = PurePosixPath(values["inference_config"])
+    launcher = PurePosixPath(values["inference_launcher"])
+    if (
+        config.is_absolute()
+        or ".." in config.parts
+        or config.parts[:2] != ("configs", "paused")
+        or config.name != "inference.glm52-mtp20.toml"
+        or launcher.is_absolute()
+        or ".." in launcher.parts
+        or launcher.parts[:2] != ("scripts", "h200")
+        or launcher.name != "start_mtp_production.sh"
+        or re.fullmatch(r"[A-Za-z0-9_.-]+", values["inference_container"]) is None
+        or values["inference_container"] in set(protected_inference)
+    ):
+        raise Refused("GLM MTP production inference identity is invalid")
+    for key in ("inference_config", "inference_launcher"):
+        path = repo_root / Path(*PurePosixPath(values[key]).parts)
+        if path.is_symlink() or not path.is_file():
+            raise Refused(f"GLM MTP production {key} is not readable")
+    return values
+
+
+def _mtp_production_container_identity(spec: dict[str, str]) -> dict[str, object]:
+    """Read the exact isolated MTP container identity without exposing env secrets."""
+    host = orchestrator_host
+    name = spec["inference_container"]
+    config = f"{remote_repo}/{spec['inference_config']}"
+    command = """
+set -euo pipefail
+name=__MTP_NAME__
+if ! inspect_output=$(sudo docker inspect "$name" 2>&1); then
+  if grep -Eq 'No such (object|container)' <<<"$inspect_output"; then
+    printf 'ABSENT\\n'
+    exit 0
+  fi
+  printf '%s\\n' "$inspect_output" >&2
+  exit 1
+fi
+sudo docker inspect "$name" | python3 -c 'import json,sys; record=json.load(sys.stdin)[0]; config=record.get("Config") or {}; host_config=record.get("HostConfig") or {}; state=record.get("State") or {}; allowed={"PRIME_LORA_BASE_MODEL_REPO_ID","PRIME_LORA_BASE_MODEL_REVISION","PRIME_LORA_BASE_MODEL_VARIANT","PRIME_LORA_BASE_MODEL_CONTENT_SHA256","PRIME_LORA_BASE_MODEL_MANIFEST_SHA256","PRIME_LORA_BASE_MODEL_TRAINER_PATH","PRIME_LORA_BASE_MODEL_H200_ALIAS","PRIME_GLM_ADAPTER_VALIDATE","PRIME_LORA_CACHE_DIR","PRIME_ADAPTER_PORTS","PRIME_GLM_ADAPTER_CODEC"}; environment=[item for item in config.get("Env",[]) if isinstance(item,str) and item.split("=",1)[0] in allowed]; values=[state.get("Status"),record.get("Id"),record.get("Name"),record.get("Image"),config.get("Image"),config.get("Cmd"),((host_config.get("RestartPolicy") or {}).get("Name")),host_config.get("Init"),environment,record.get("Mounts")]; [print(json.dumps(value,separators=(",",":"))) for value in values]'
+""".replace("__MTP_NAME__", shlex.quote(name))
+    code, output = _ssh(host, command, timeout=60)
+    if code:
+        raise RuntimeError(f"cannot inspect MTP production container on {host}: {output.strip()}")
+    if output.strip() == "ABSENT":
+        return {"host": host, "container": name, "status": "absent"}
+    fields = output.strip().splitlines()
+    if len(fields) != 10:
+        raise RuntimeError("MTP production container inspection returned an invalid record")
+    try:
+        status, container_id, container_name, image_digest, image, command_value, restart_policy, init, environment, mounts = (
+            json.loads(value) for value in fields
+        )
+    except json.JSONDecodeError as error:
+        raise RuntimeError("MTP production container inspection is not valid JSON") from error
+    if (
+        not isinstance(status, str)
+        or not isinstance(container_id, str)
+        or not isinstance(container_name, str)
+        or not isinstance(image_digest, str)
+        or not isinstance(image, str)
+        or not isinstance(command_value, list)
+        or any(not isinstance(value, str) for value in command_value)
+        or not isinstance(restart_policy, str)
+        or not isinstance(init, bool)
+        or not isinstance(environment, list)
+        or any(not isinstance(value, str) for value in environment)
+        or not isinstance(mounts, list)
+    ):
+        raise RuntimeError("MTP production container inspection has invalid fields")
+    return {
+        "host": host,
+        "container": name,
+        "status": status,
+        "id": container_id,
+        "name": container_name,
+        "image_digest": image_digest,
+        "image": image,
+        "command": command_value,
+        "restart_policy": restart_policy,
+        "init": init,
+        "environment": environment,
+        "mounts": mounts,
+        "expected_command": ["@", config],
+    }
+
+
+def _require_mtp_production_container_identity(
+    spec: dict[str, str], identity: dict[str, object]
+) -> None:
+    if identity.get("status") not in _mtp_production_states:
+        raise Refused("MTP production container state is unknown; refusing operation")
+    profile = _profile("glm52-mtp20")
+    metadata = profile["identity"]
+    expected_env = {
+        "PRIME_LORA_BASE_MODEL_REPO_ID": metadata["model_repo_id"],
+        "PRIME_LORA_BASE_MODEL_REVISION": metadata["model_revision"],
+        "PRIME_LORA_BASE_MODEL_VARIANT": metadata["model_variant"],
+        "PRIME_LORA_BASE_MODEL_CONTENT_SHA256": metadata["model_content_sha256"],
+        "PRIME_LORA_BASE_MODEL_MANIFEST_SHA256": metadata["model_manifest_sha256"],
+        "PRIME_LORA_BASE_MODEL_TRAINER_PATH": metadata["trainer_model_path"],
+        "PRIME_LORA_BASE_MODEL_H200_ALIAS": metadata["h200_model_alias"],
+        "PRIME_GLM_ADAPTER_VALIDATE": "1",
+        "PRIME_LORA_CACHE_DIR": "/data/glm52-rl/lora-cache",
+        "PRIME_ADAPTER_PORTS": ",".join(str(port) for port in glm_adapter_tunnel_ports),
+        "PRIME_GLM_ADAPTER_CODEC": "gzip",
+    }
+    environment = identity.get("environment", [])
+    env_map = {
+        value.split("=", 1)[0]: value.split("=", 1)[1]
+        for value in environment
+        if "=" in value
+    }
+    mismatches = []
+    if identity.get("host") != orchestrator_host:
+        mismatches.append("host")
+    if identity.get("container") != spec["inference_container"]:
+        mismatches.append("container name")
+    if identity.get("name") != f"/{spec['inference_container']}":
+        mismatches.append("container name")
+    if identity.get("image_digest") != metadata["h200_image_digest"]:
+        mismatches.append("image digest")
+    if identity.get("image") != metadata["inference_image"]:
+        mismatches.append("image")
+    if identity.get("command") != identity.get("expected_command"):
+        mismatches.append("config")
+    if identity.get("restart_policy") != "unless-stopped":
+        mismatches.append("restart policy")
+    if identity.get("init") is not True:
+        mismatches.append("init")
+    mounts = identity.get("mounts", [])
+    if not any(
+        isinstance(mount, dict)
+        and mount.get("Type") == "volume"
+        and mount.get("Name") == glm_model_volume
+        and mount.get("Destination") == metadata["h200_model_alias"]
+        and mount.get("RW") is False
+        for mount in mounts
+    ):
+        mismatches.append("model mount")
+    mismatches.extend(
+        key for key, expected in expected_env.items() if env_map.get(key) != expected
+    )
+    if mismatches:
+        raise Refused(
+            "MTP production container identity differs; refusing operation: "
+            + ", ".join(dict.fromkeys(mismatches))
+        )
+
+
+def _start_or_attach_mtp_production(profile: dict) -> None:
+    """Launch a fresh MTP engine or attach only to its exact existing identity."""
+    spec = _mtp_production_spec("glm52-mtp20", profile)
+    identity = profile["identity"]
+    observed = _mtp_production_container_identity(spec)
+    if observed.get("status") != "absent":
+        _require_mtp_production_container_identity(spec, observed)
+        print(
+            f"attached to MTP production inference {spec['inference_container']}"
+        )
+        return
+    assignments = " ".join(
+        f"{name}={shlex.quote(identity[key])}"
+        for name, key in (
+            ("PRIME_LORA_BASE_MODEL_REPO_ID", "model_repo_id"),
+            ("PRIME_LORA_BASE_MODEL_REVISION", "model_revision"),
+            ("PRIME_LORA_BASE_MODEL_VARIANT", "model_variant"),
+            ("PRIME_LORA_BASE_MODEL_CONTENT_SHA256", "model_content_sha256"),
+            ("PRIME_LORA_BASE_MODEL_MANIFEST_SHA256", "model_manifest_sha256"),
+            ("PRIME_LORA_BASE_MODEL_TRAINER_PATH", "trainer_model_path"),
+            ("PRIME_LORA_BASE_MODEL_H200_ALIAS", "h200_model_alias"),
+        )
+    )
+    command = (
+        "set -euo pipefail; "
+        f"prime_deployment={shlex.quote(remote_repo)} "
+        f"prime_image={shlex.quote(identity['inference_image'])} "
+        f"prime_model_volume={shlex.quote(glm_model_volume)} "
+        f"prime_mtp_container={shlex.quote(spec['inference_container'])} "
+        f"PRIME_MTP_PROFILE={shlex.quote(remote_repo + '/' + spec['inference_config'])} "
+        f"PRIME_MTP_IMAGE_DIGEST={shlex.quote(identity['h200_image_digest'])} "
+        f"{assignments} PRIME_GLM_ADAPTER_VALIDATE=1 "
+        f"PRIME_LORA_CACHE_DIR=/data/glm52-rl/lora-cache "
+        f"PRIME_ADAPTER_PORTS={shlex.quote(','.join(str(port) for port in glm_adapter_tunnel_ports))} "
+        "PRIME_GLM_ADAPTER_CODEC=gzip "
+        f"bash {shlex.quote(remote_repo + '/' + spec['inference_launcher'])}"
+    )
+    output = _remote_ok(
+        orchestrator_host, command, "MTP production inference launch", 300
+    )
+    match = re.findall(r"mtp-production-container:([0-9a-f]{64})", output)
+    if len(match) != 1:
+        raise RuntimeError("MTP production launcher returned no exact container ID")
+    observed = _mtp_production_container_identity(spec)
+    _require_mtp_production_container_identity(spec, observed)
+    if observed.get("id") != match[0]:
+        raise RuntimeError("MTP production launcher returned a different container ID")
+    print(f"started MTP production inference {spec['inference_container']}")
 
 ssh_command = [
     "ssh",
@@ -828,7 +1074,11 @@ def _run_dir(run: str) -> str:
     )
 
 
-def _assert_live_services_are_down(nodes: list[str], include_inference: bool) -> None:
+def _assert_live_services_are_down(
+    nodes: list[str],
+    include_inference: bool,
+    allowed_inference_container: str | None = None,
+) -> None:
     """Refuse an isolated launch while the live deployment uses the same GPUs."""
 
     active: list[str] = []
@@ -923,11 +1173,22 @@ def _assert_live_services_are_down(nodes: list[str], include_inference: bool) ->
                 "the live deployment is active on the requested GPUs: "
                 + ", ".join(active)
             )
-        code, output = check(
-            orchestrator_host,
-            "nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits",
-            inference_deadline,
+        gpu_owner_probe = (
+            "nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits"
         )
+        if allowed_inference_container is not None:
+            # An exact isolated MTP container may remain running for an attach.
+            # Filter only its Docker top PIDs; every other GPU owner remains a
+            # safety failure.
+            gpu_owner_probe = (
+                f"allowed=$(sudo docker top {shlex.quote(allowed_inference_container)} "
+                "-eo pid 2>/dev/null | awk 'NR > 1 {print $1}'); "
+                "for pid in $(nvidia-smi --query-compute-apps=pid "
+                "--format=csv,noheader,nounits); do "
+                "grep -qx \"$pid\" <<<\"$allowed\" || printf '%s\\n' \"$pid\"; "
+                "done"
+            )
+        code, output = check(orchestrator_host, gpu_owner_probe, inference_deadline)
         if code:
             raise RuntimeError(
                 f"cannot check live inference GPU owners on {orchestrator_host}: "
@@ -10493,6 +10754,14 @@ def start(
             "GLM production profile identity preflight failed: "
             + "; ".join(identity_failures)
         )
+    mtp_production = profile == "glm52-mtp20"
+    mtp_spec = _mtp_production_spec(profile, selected) if mtp_production else None
+    mtp_existing = None
+    if mtp_production:
+        assert mtp_spec is not None
+        mtp_existing = _mtp_production_container_identity(mtp_spec)
+        if mtp_existing.get("status") != "absent":
+            _require_mtp_production_container_identity(mtp_spec, mtp_existing)
     if selected["kind"] == "glm52":
         production_start_preflight()
     muse_run = selected["kind"] == "muse"
@@ -10506,7 +10775,16 @@ def start(
     nodes = [_check_host(h) for h in (nodes or trainer_hosts)]
     if trainer_head in nodes:  # rank 0 is the rendezvous master and carries the readable log
         nodes = [trainer_head] + [n for n in nodes if n != trainer_head]
-    _assert_live_services_are_down(nodes, include_inference=True)
+    _assert_live_services_are_down(
+        nodes,
+        include_inference=True,
+        allowed_inference_container=(
+            mtp_spec["inference_container"]
+            if mtp_production and mtp_existing is not None
+            and mtp_existing.get("status") != "absent"
+            else None
+        ),
+    )
     required_files = [
         ("scripts/china/cluster.sh", nodes),
         (selected["trainer"], nodes),
@@ -10529,6 +10807,26 @@ def start(
             _mounts_in(repo_root / "scripts" / "h200" / "start_orchestrator.sh")
         )
     )
+    if mtp_production:
+        assert mtp_spec is not None
+        required_files.extend(
+            (
+                path,
+                [orchestrator_host],
+            )
+            for path in (
+                mtp_spec["inference_config"],
+                mtp_spec["inference_launcher"],
+                "scripts/glm52_h200_mtp_preflight.py",
+                "scripts/h200/flashmla_overlay_preflight.py",
+            )
+        )
+        required_files.extend(
+            (path, [orchestrator_host])
+            for path in sorted(
+                _mounts_in(repo_root / "scripts" / "h200" / "start_mtp_production.sh")
+            )
+        )
     for path, destinations in required_files:
         if not deploy(path, nodes=destinations):
             raise RuntimeError(f"failed to deploy {path}")
@@ -10594,7 +10892,9 @@ def start(
                 f" PRIME_RL_RESUME_ADAPTER_STEP={resume_step}"
             )
     identity_env: dict[str, str] = {}
-    if not muse_run and profile.startswith("glm52-production"):
+    if not muse_run and (
+        profile.startswith("glm52-production") or profile == "glm52-mtp20"
+    ):
         env = (
             f"{isolated_env}trainer_nodes='{trainer_nodes}' RUN={run} RUN_NAME={name} "
             f"TRAINER_CONFIG={trainer_config} PRIME_EP_PROFILE=0 PRIME_EP_AC_CACHE=0 "
@@ -10660,6 +10960,9 @@ def start(
         if rc:
             raise RuntimeError(f"edge orchestrator start failed on {orchestrator_host}: {out}")
 
+    def launch_mtp():
+        _start_or_attach_mtp_production(selected)
+
     print(f"stopping any previous containers for {run}")
     _remote_ok(
         orchestrator_host,
@@ -10684,6 +10987,8 @@ def start(
         raise RuntimeError(f"old trainer stop failed on {stop_failures}")
     time.sleep(20)
 
+    if mtp_production:
+        launch_mtp()
     if mode == "cold":
         launch_orch()
         launch_trainer()
