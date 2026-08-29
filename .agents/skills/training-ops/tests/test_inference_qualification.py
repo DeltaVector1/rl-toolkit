@@ -7,6 +7,54 @@ import training_ops
 
 
 class InferenceQualificationTest(unittest.TestCase):
+    def test_prime_rl_local_import_closure_is_deployed_and_read_only_mounted(self):
+        spec = training_ops._inference_qualification_spec("glm52-mtp-h200")
+        closure = training_ops._prime_rl_local_import_closure()
+        self.assertEqual(
+            set(closure),
+            set(training_ops._inference_prime_rl_entry_modules)
+            | {
+                "prime_rl._compat",
+                "prime_rl.configs.orchestrator",
+                "prime_rl.configs.shared",
+                "prime_rl.configs.trainer",
+                "prime_rl.inference.vllm.adapter_validation",
+                "prime_rl.model_identity",
+                "prime_rl.trainer.distributed.expert_parallel",
+                "prime_rl.trainer.distributed.partial_reshard",
+                "prime_rl.trainer.distributed.pipeline_parallel",
+                "prime_rl.trainer.fp8_checkpoint",
+                "prime_rl.trainer.lora",
+                "prime_rl.trainer.model",
+                "prime_rl.trainer.models.glm_moe_dsa.sparse_mla_attention",
+                "prime_rl.trainer.models.kernels.fp8_indexer",
+                "prime_rl.trainer.models.kernels.sparse_mla_bwd",
+                "prime_rl.trainer.models.kernels.sparse_mla_fwd",
+                "prime_rl.trainer.models.layers.checkpointing",
+                "prime_rl.trainer.models.layers.fp8_ada",
+                "prime_rl.trainer.models.layers.lora.multi_linear",
+                "prime_rl.trainer.models.layers.lora.native_fp8_moe",
+                "prime_rl.trainer.models.layers.moe",
+                "prime_rl.trainer.models.layers.norms",
+                "prime_rl.trainer.models.layers.rotary_emb",
+                "prime_rl.trainer.mxfp4",
+                "prime_rl.trainer.parallel_dims",
+                "prime_rl.trainer.runs",
+                "prime_rl.trainer.weights",
+                "prime_rl.utils.cp",
+                "prime_rl.utils.vlm",
+            },
+        )
+        inventory = set(spec["deploy_files"])
+        self.assertTrue(set(closure.values()) <= inventory)
+        launcher = (training_ops.repo_root / spec["launcher"]).read_text()
+        for path in closure.values():
+            self.assertRegex(
+                launcher,
+                rf'\$deployment/{re.escape(path)}"?:[^\n]*:ro\s*\\',
+                path,
+            )
+
     def test_overlay_inspected_launchers_are_deployed_to_h200a(self):
         spec = training_ops._inference_qualification_spec("glm52-mtp-h200")
         overlay_preflight = (
@@ -207,6 +255,52 @@ class InferenceQualificationTest(unittest.TestCase):
             self.assertEqual(training_ops.stop_inference_qualification("glm52-mtp-h200"), "removed")
         self.assertEqual(remote.call_args.args[0], spec["host"])
         self.assertIn("docker rm -f", remote.call_args.args[1])
+
+    def test_exited_exact_identity_is_reported_and_removed(self):
+        spec = dict(training_ops.glm52_mtp_h200_qualification)
+        record = {
+            "host": spec["host"],
+            "container": spec["container"],
+            "status": "exited",
+            "restart_count": 1,
+            "image": training_ops.inference_image,
+            "command": ["@", f"{training_ops.remote_repo}/{spec['profile']}"],
+            "restart_policy": "no",
+            "init": True,
+        }
+        with (
+            patch.object(training_ops, "_inference_qualification_spec", return_value=spec),
+            patch.object(training_ops, "_inference_qualification_identity", return_value=record),
+            patch.object(training_ops, "_remote_ok", return_value="removed\n") as remote,
+        ):
+            self.assertEqual(
+                training_ops.status_inference_qualification("glm52-mtp-h200")["status"],
+                "exited",
+            )
+            self.assertEqual(training_ops.stop_inference_qualification("glm52-mtp-h200"), "removed")
+        cleanup = remote.call_args.args[1]
+        self.assertIn("--filter 'name=^/glm52-optims-mtp-h200$'", cleanup)
+
+    def test_unknown_identity_is_refused_before_cleanup(self):
+        spec = dict(training_ops.glm52_mtp_h200_qualification)
+        record = {
+            "host": spec["host"],
+            "container": spec["container"],
+            "status": "exited",
+            "restart_count": 0,
+            "image": "unexpected:image",
+            "command": ["unexpected"],
+            "restart_policy": "no",
+            "init": True,
+        }
+        with (
+            patch.object(training_ops, "_inference_qualification_spec", return_value=spec),
+            patch.object(training_ops, "_inference_qualification_identity", return_value=record),
+            patch.object(training_ops, "_remote_ok") as remote,
+        ):
+            with self.assertRaisesRegex(training_ops.Refused, "identity differs"):
+                training_ops.stop_inference_qualification("glm52-mtp-h200")
+        remote.assert_not_called()
 
     def test_status_parser_rejects_malformed_remote_identity(self):
         spec = dict(training_ops.glm52_mtp_h200_qualification)

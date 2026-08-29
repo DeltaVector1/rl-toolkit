@@ -7374,6 +7374,119 @@ def _mounts_in(script: Path) -> set[str]:
     return set(re.findall(r'-v "\$deployment/(\S+?)":', script.read_text()))
 
 
+_inference_prime_rl_entry_modules = (
+    "prime_rl.inference.vllm.server",
+    "prime_rl.inference.vllm.worker.filesystem",
+    "prime_rl.parity_router_trace",
+    "prime_rl.glm52_routing",
+)
+_prime_rl_source_roots = (
+    ("source/src", "prime_rl"),
+    ("source/packages/prime-rl-configs/src", "prime_rl"),
+)
+
+
+def _prime_rl_local_module_path(module: str) -> str | None:
+    """Resolve a project-local Prime-RL module to its repository path.
+
+    The H200 image supplies the upstream Prime-RL package.  Only files that
+    exist in this deployment source tree are part of this closure; unresolved
+    modules are therefore image dependencies and are intentionally omitted.
+    """
+    if not module.startswith("prime_rl"):
+        return None
+    for relative_root, package_root in _prime_rl_source_roots:
+        prefix = package_root + "."
+        if module == package_root:
+            continue
+        if not module.startswith(prefix):
+            continue
+        relative = module[len(package_root) + 1 :].replace(".", "/") + ".py"
+        path = f"{relative_root}/{package_root}/{relative}"
+        if (repo_root / path).is_file():
+            return path
+    return None
+
+
+def _prime_rl_imported_modules(module: str, source: str) -> tuple[str, ...]:
+    """Return Prime-RL module names imported by one source file."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as error:
+        raise Refused(f"Prime-RL source has invalid syntax: {module}") from error
+    imported: list[str] = []
+    current_parts = module.split(".")
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.extend(alias.name for alias in node.names)
+            continue
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        if node.level:
+            package_parts = current_parts[:-1]
+            if node.level > len(package_parts) + 1:
+                continue
+            package_parts = package_parts[: len(package_parts) - node.level + 1]
+            base = ".".join(package_parts)
+            if node.module:
+                base = ".".join((base, node.module))
+            imported.append(base)
+            imported.extend(
+                ".".join((base, alias.name))
+                for alias in node.names
+                if alias.name != "*"
+            )
+        else:
+            imported.append(node.module)
+            imported.extend(
+                ".".join((node.module, alias.name))
+                for alias in node.names
+                if alias.name != "*"
+            )
+    return tuple(name for name in imported if name.startswith("prime_rl"))
+
+
+def _prime_rl_local_import_closure(
+    entries: tuple[str, ...] = _inference_prime_rl_entry_modules,
+) -> dict[str, str]:
+    """Compute the recursive closure of repository-local Prime-RL imports."""
+    closure: dict[str, str] = {}
+    pending = list(entries)
+    while pending:
+        module = pending.pop()
+        if module in closure:
+            continue
+        path = _prime_rl_local_module_path(module)
+        if path is None:
+            continue
+        closure[module] = path
+        for imported in _prime_rl_imported_modules(module, (repo_root / path).read_text()):
+            if imported not in closure:
+                pending.append(imported)
+    return dict(sorted(closure.items()))
+
+
+def _prime_rl_mount_paths(script: Path) -> set[str]:
+    """Return all repository paths mounted by a launcher, including --mount."""
+    text = script.read_text()
+    paths = set(re.findall(r'-v "\$deployment/(\S+?)":', text))
+    paths.update(re.findall(r'source=\$deployment/([^,]+),', text))
+    return paths
+
+
+def _prime_rl_mount_is_read_only(script: Path, path: str) -> bool:
+    """Return whether a repository bind mount is explicitly read-only."""
+    marker = f"$deployment/{path}"
+    for line in script.read_text().splitlines():
+        if marker not in line:
+            continue
+        if re.search(r":ro(?:\s|\\|$)", line) or re.search(
+            r"(?:^|,)readonly(?:,|$)", line
+        ):
+            return True
+    return False
+
+
 def _inference_qualification_launchers() -> tuple[Path, ...]:
     """Return configured H200 qualification launcher paths."""
     qualifications = operations.get("qualification", {})
@@ -9971,6 +10084,30 @@ def _inference_qualification_spec(name: str) -> dict[str, object]:
             or not resolved.is_relative_to(repo_root.resolve())
         ):
             raise Refused("inference qualification deploy file is invalid")
+    closure = _prime_rl_local_import_closure()
+    closure_paths = set(closure.values())
+    missing_inventory = sorted(closure_paths - set(deploy_files))
+    if missing_inventory:
+        raise Refused(
+            "inference qualification is missing local Prime-RL imports from deploy inventory: "
+            + ", ".join(missing_inventory)
+        )
+    launcher = repo_root / Path(*PurePosixPath(spec["launcher"]).parts)
+    mounted = _prime_rl_mount_paths(launcher)
+    missing_mounts = sorted(closure_paths - mounted)
+    if missing_mounts:
+        raise Refused(
+            "inference qualification launcher is missing local Prime-RL import mounts: "
+            + ", ".join(missing_mounts)
+        )
+    writable_mounts = sorted(
+        path for path in closure_paths if not _prime_rl_mount_is_read_only(launcher, path)
+    )
+    if writable_mounts:
+        raise Refused(
+            "inference qualification local Prime-RL import mounts are not read-only: "
+            + ", ".join(writable_mounts)
+        )
     return spec
 
 
@@ -10080,9 +10217,46 @@ sudo docker inspect \"$name\" --format '{{{{json .State.Status}}}}\\t{{{{json .R
     }
 
 
+_inference_qualification_states = frozenset(
+    {"created", "running", "restarting", "removing", "paused", "exited", "dead"}
+)
+
+
+def _require_inference_qualification_identity(
+    spec: dict[str, object], identity: dict[str, object]
+) -> None:
+    """Require a known Docker state and the exact isolated launch contract."""
+    status = identity.get("status")
+    if status not in _inference_qualification_states:
+        raise Refused(
+            "inference qualification container state is unknown; refusing operation"
+        )
+    expected = ["@", f"{remote_repo}/{spec['profile']}"]
+    mismatches = []
+    if identity.get("host") != spec["host"]:
+        mismatches.append("host")
+    if identity.get("container") != spec["container"]:
+        mismatches.append("container name")
+    if identity.get("image") != inference_image:
+        mismatches.append("image")
+    if identity.get("command") != expected:
+        mismatches.append("command")
+    if identity.get("restart_policy") != "no":
+        mismatches.append("restart policy")
+    if identity.get("init") is not True:
+        mismatches.append("init")
+    if mismatches:
+        raise Refused(
+            "inference qualification container identity differs; refusing operation: "
+            + ", ".join(mismatches)
+        )
+
+
 def status_inference_qualification(name: str) -> dict[str, object]:
     spec = _inference_qualification_spec(name)
     result = _inference_qualification_identity(spec)
+    if result["status"] != "absent":
+        _require_inference_qualification_identity(spec, result)
     print(
         f"{result['host']}: {result['container']} "
         f"{result['status']} (restarts={result.get('restart_count', 0)})"
@@ -10098,6 +10272,7 @@ def qualify_inference(name: str) -> dict[str, object]:
     ports_to_check = _inference_qualification_ports(spec)
     existing = _inference_qualification_identity(spec)
     if existing["status"] != "absent":
+        _require_inference_qualification_identity(spec, existing)
         raise Refused(
             f"inference qualification container already exists on {host}: "
             f"{existing['status']}"
@@ -10164,22 +10339,14 @@ def stop_inference_qualification(name: str) -> str:
     if identity["status"] == "absent":
         print(f"{identity['host']}: {identity['container']} absent")
         return "absent"
-    expected = ["@", f"{remote_repo}/{spec['profile']}"]
-    if (
-        identity.get("image") != inference_image
-        or identity.get("command") != expected
-        or identity.get("restart_policy") != "no"
-        or identity.get("init") is not True
-    ):
-        raise Refused(
-            "inference qualification container identity differs; refusing cleanup"
-        )
+    _require_inference_qualification_identity(spec, identity)
     host = str(spec["host"])
     name_value = shlex.quote(str(spec["container"]))
+    name_filter = shlex.quote(f"name=^/{spec['container']}$")
     output = _remote_ok(
         host,
         f"set -euo pipefail; sudo docker rm -f {name_value} >/dev/null; "
-        f"test -z \"$(sudo docker ps -a --filter 'name=^/{name_value}$' --format '{{{{.Names}}}}')\"; "
+        f"test -z \"$(sudo docker ps -a --filter {name_filter} --format '{{{{.Names}}}}')\"; "
         "printf 'removed\\n'",
         "inference qualification cleanup",
         120,
