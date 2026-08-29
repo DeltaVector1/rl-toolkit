@@ -1,4 +1,7 @@
+import math
 import os
+import re
+import weakref
 
 import torch
 import torch.distributed as dist
@@ -7,13 +10,6 @@ import triton
 import triton.language as tl
 from torch import nn
 from torch.distributed.tensor import DTensor
-from prime_rl.trainer.models.layers.checkpointing import (
-    in_reentrant_block_checkpoint,
-)
-from prime_rl.trainer.models.layers.lm_head import (
-    PrimeLmOutput,
-    _online_logsumexp_and_weighted_update,
-)
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.fused_moe.fused_moe import (
     _prepare_expert_assignment,
@@ -22,18 +18,26 @@ from vllm.model_executor.layers.fused_moe.fused_moe import (
     moe_kernel_quantize_input,
 )
 
+from prime_rl.trainer.models.layers.checkpointing import (
+    in_reentrant_block_checkpoint,
+)
+from prime_rl.trainer.models.layers.lm_head import (
+    PrimeLmOutput,
+    _online_logsumexp_and_weighted_update,
+)
 
 block_shape = [128, 128]
-_FP8_W13_CHUNK_ROWS = 2048
+_FP8_W13_CHUNK_ROWS = 4096
 _FP8_W2_CHUNK_ROWS = 2048
-_FP8_EXPERT_BACKWARD_CHUNK_ROWS = 2048
+_FP8_EXPERT_BACKWARD_CHUNK_ROWS = 4096
 _FP8_ROUTE_SCALE_CHUNK_ROWS = 4096
 _FP8_EXPERT_ACTIVATION_OFFLOAD = (
     os.environ.get("PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD", "") == "1"
 )
 _DIAGNOSE_LINEAR_BACKWARD = False
 _REPORTED_LINEAR_BACKWARD: set[tuple[tuple[int, ...], bool, bool]] = set()
-_REPORTED_INPUT_GRAD: set[tuple[int, ...]] = set()
+_REPORTED_INPUT_GRAD: set[str] = set()
+_REPORTED_W8A16_INPUT_GRAD: set[tuple[str, bool, bool]] = set()
 _EXPERT_PROFILE = os.environ.get("PRIME_EP_PROFILE", "") == "1"
 _EXPERT_BACKWARD_EVENTS: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
 _EXPERT_PROFILE_EVERY = int(os.environ.get("PRIME_EXPERT_PROFILE_EVERY", "90"))
@@ -41,6 +45,47 @@ _EXPERT_PROFILE_EVERY = int(os.environ.get("PRIME_EXPERT_PROFILE_EVERY", "90"))
 # modules reacquire current unsharded FSDP parameters from their owner.
 # Values are [weight, scale, refcount].
 _LINEAR_SNAPSHOT_CACHE: dict[str, list] = {}
+
+
+class W8A16BackwardFence:
+    def __init__(self) -> None:
+        self.event: torch.cuda.Event | None = None
+        self.pending = False
+        self.producer_stream: torch.cuda.Stream | None = None
+
+    def record(self, device: torch.device) -> None:
+        stream = torch.cuda.current_stream(device)
+        if self.pending and self.producer_stream != stream:
+            raise RuntimeError("one W8A16 FSDP unit used more than one CUDA stream")
+        if self.event is None:
+            self.event = torch.cuda.Event()
+        self.event.record(stream)
+        self.producer_stream = stream
+        self.pending = True
+
+    def wait_before_reshard(self, group) -> None:
+        if not self.pending:
+            return
+        if self.event is None:
+            raise RuntimeError("W8A16 backward event is missing")
+        streams = {
+            group.device_handle.current_stream(),
+            group.comm_ctx.all_gather_copy_in_stream,
+            group.comm_ctx.all_gather_stream,
+        }
+        for stream in streams:
+            stream.wait_event(self.event)
+        self.pending = False
+        self.producer_stream = None
+
+
+def exact_module_patterns(module_names, *, label="FP8") -> list[str]:
+    if len(module_names) != len(set(module_names)):
+        raise ValueError(f"{label} module names must be unique")
+    for name in module_names:
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None:
+            raise ValueError(f"Invalid {label} module name: {name!r}")
+    return [rf"(?:^|\.){re.escape(name)}$" for name in module_names]
 
 
 def _acquire_linear_snapshot(
@@ -103,7 +148,6 @@ if hasattr(triton, "jit"):
         stride_s1,
         stride_om,
         stride_on,
-        weight_is_output_major: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
@@ -128,27 +172,21 @@ if hasattr(triton, "jit"):
                 mask=(offs_m[:, None] < rows) & (offs_k[None, :] < reduction_size),
                 other=0.0,
             ).to(tl.bfloat16)
-            if weight_is_output_major:
-                weight_fragment = tl.load(
-                    weight + offs_n[None, :] * stride_w0 + offs_k[:, None] * stride_w1,
-                    mask=(offs_n[None, :] < output_size)
-                    & (offs_k[:, None] < reduction_size),
-                    other=0.0,
-                ).to(tl.bfloat16)
-                inverse_scale = tl.load(
-                    scale + (pid_n * stride_s0) + ((k_start // 128) * stride_s1)
-                )
-            else:
-                weight_fragment = tl.load(
-                    weight + offs_k[:, None] * stride_w0 + offs_n[None, :] * stride_w1,
-                    mask=(offs_k[:, None] < reduction_size)
-                    & (offs_n[None, :] < output_size),
-                    other=0.0,
-                ).to(tl.bfloat16)
-                inverse_scale = tl.load(
-                    scale + ((k_start // 128) * stride_s0) + (pid_n * stride_s1)
-                )
-            accumulator += tl.dot(activation, weight_fragment) * inverse_scale
+            weight_fragment = tl.load(
+                weight + offs_n[None, :] * stride_w0 + offs_k[:, None] * stride_w1,
+                mask=(offs_n[None, :] < output_size)
+                & (offs_k[:, None] < reduction_size),
+                other=0.0,
+            ).to(tl.bfloat16)
+            inverse_scale = tl.load(
+                scale + (pid_n * stride_s0) + ((k_start // 128) * stride_s1)
+            )
+            block_product = tl.dot(
+                activation,
+                weight_fragment,
+                out_dtype=tl.float32,
+            )
+            accumulator = accumulator + block_product * inverse_scale
 
         tl.store(
             out + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on,
@@ -156,8 +194,125 @@ if hasattr(triton, "jit"):
             mask=(offs_m[:, None] < rows) & (offs_n[None, :] < output_size),
         )
 
+    @triton.jit
+    def _w8a16_input_grad_kernel(
+        grad,
+        weight,
+        scale,
+        out,
+        rows,
+        input_size: tl.constexpr,
+        output_size: tl.constexpr,
+        stride_gm,
+        stride_gk,
+        stride_wk,
+        stride_wn,
+        stride_sk,
+        stride_sn,
+        stride_om,
+        stride_on,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        """Compute dX from BF16 dY and checkpoint-layout block-FP8 W."""
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        for k_start in tl.range(0, output_size, BLOCK_K, num_stages=2):
+            offs_k = k_start + tl.arange(0, BLOCK_K)
+            grad_fragment = tl.load(
+                grad + offs_m[:, None] * stride_gm + offs_k[None, :] * stride_gk,
+                mask=(offs_m[:, None] < rows) & (offs_k[None, :] < output_size),
+                other=0.0,
+            ).to(tl.bfloat16)
+            weight_fragment = tl.load(
+                weight + offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn,
+                mask=(offs_k[:, None] < output_size)
+                & (offs_n[None, :] < input_size),
+                other=0.0,
+            ).to(tl.bfloat16)
+            inverse_scale = tl.load(
+                scale + (k_start // 128) * stride_sk + pid_n * stride_sn
+            ).to(tl.bfloat16)
+            dequantized_weight = (weight_fragment * inverse_scale).to(tl.bfloat16)
+            accumulator += tl.dot(grad_fragment, dequantized_weight)
+
+        tl.store(
+            out + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on,
+            accumulator,
+            mask=(offs_m[:, None] < rows) & (offs_n[None, :] < input_size),
+        )
+
+    @triton.jit
+    def _grouped_outer_accumulate_kernel(
+        left,
+        right,
+        offsets,
+        output,
+        left_size: tl.constexpr,
+        right_size: tl.constexpr,
+        stride_lm,
+        stride_ln,
+        stride_rm,
+        stride_rn,
+        stride_oe,
+        stride_ol,
+        stride_or,
+        BLOCK_ROWS: tl.constexpr,
+        BLOCK_LEFT: tl.constexpr,
+        BLOCK_RIGHT: tl.constexpr,
+    ):
+        expert = tl.program_id(0)
+        left_block = tl.program_id(1)
+        right_block = tl.program_id(2)
+        expert_start = tl.load(
+            offsets + expert - 1,
+            mask=expert > 0,
+            other=0,
+        )
+        expert_end = tl.load(offsets + expert)
+        left_columns = left_block * BLOCK_LEFT + tl.arange(0, BLOCK_LEFT)
+        right_columns = right_block * BLOCK_RIGHT + tl.arange(0, BLOCK_RIGHT)
+        accumulator = tl.zeros((BLOCK_LEFT, BLOCK_RIGHT), dtype=tl.float32)
+
+        for row_start in tl.range(expert_start, expert_end, BLOCK_ROWS):
+            row_indices = row_start + tl.arange(0, BLOCK_ROWS)
+            row_mask = row_indices < expert_end
+            left_values = tl.load(
+                left
+                + row_indices[:, None] * stride_lm
+                + left_columns[None, :] * stride_ln,
+                mask=row_mask[:, None] & (left_columns[None, :] < left_size),
+                other=0.0,
+            ).to(tl.bfloat16)
+            right_values = tl.load(
+                right
+                + row_indices[:, None] * stride_rm
+                + right_columns[None, :] * stride_rn,
+                mask=row_mask[:, None] & (right_columns[None, :] < right_size),
+                other=0.0,
+            ).to(tl.bfloat16)
+            accumulator += tl.dot(tl.trans(left_values), right_values)
+
+        output_offsets = (
+            expert * stride_oe
+            + left_columns[:, None] * stride_ol
+            + right_columns[None, :] * stride_or
+        )
+        output_mask = (left_columns[:, None] < left_size) & (
+            right_columns[None, :] < right_size
+        )
+        previous = tl.load(output + output_offsets, mask=output_mask, other=0.0)
+        tl.store(output + output_offsets, previous + accumulator, mask=output_mask)
+
 else:
     _block_fp8_mm_kernel = None
+    _w8a16_input_grad_kernel = None
+    _grouped_outer_accumulate_kernel = None
 
 
 def set_diagnose_linear_backward(enabled: bool) -> None:
@@ -165,33 +320,19 @@ def set_diagnose_linear_backward(enabled: bool) -> None:
     _DIAGNOSE_LINEAR_BACKWARD = enabled
 
 
-def _native_block_fp8_mm(x, weight, scale, *, weight_is_output_major):
-    """Multiply by serialized block-E4M3 weights without dequantizing them.
-
-    With ``weight_is_output_major=True`` this computes ``x @ weight.T`` (the
-    checkpoint forward layout).  False computes ``x @ weight`` and is the dX
-    layout.  The output is always contiguous; x may have arbitrary positive
-    two-dimensional strides.
-    """
+def _native_block_fp8_mm(x, weight, scale):
+    """Compute x @ weight.T from output-major block-E4M3 weights."""
     if _block_fp8_mm_kernel is None:
         raise RuntimeError("Triton is unavailable")
     if x.ndim != 2 or weight.ndim != 2 or scale.ndim != 2:
         raise ValueError("native block-FP8 GEMM requires 2-D tensors")
     reduction_size = x.shape[1]
-    if weight_is_output_major:
-        output_size = weight.shape[0]
-        expected_reduction = weight.shape[1]
-        expected_scale = (
-            (output_size + 127) // 128,
-            (reduction_size + 127) // 128,
-        )
-    else:
-        expected_reduction = weight.shape[0]
-        output_size = weight.shape[1]
-        expected_scale = (
-            (reduction_size + 127) // 128,
-            (output_size + 127) // 128,
-        )
+    output_size = weight.shape[0]
+    expected_reduction = weight.shape[1]
+    expected_scale = (
+        (output_size + 127) // 128,
+        (reduction_size + 127) // 128,
+    )
     if reduction_size != expected_reduction:
         raise ValueError(
             f"reduction mismatch: activation {reduction_size}, weight {tuple(weight.shape)}"
@@ -233,12 +374,85 @@ def _native_block_fp8_mm(x, weight, scale, *, weight_is_output_major):
         scale.stride(1),
         out.stride(0),
         out.stride(1),
-        weight_is_output_major,
         BLOCK_M=block_m,
         BLOCK_N=128,
         BLOCK_K=128,
         num_warps=num_warps,
         num_stages=2,
+    )
+    return out
+
+
+def _native_w8a16_input_grad(grad, weight, scale):
+    """Compute dX with BF16 activations and block-FP8 checkpoint weights."""
+    if _w8a16_input_grad_kernel is None:
+        raise RuntimeError("Triton is unavailable")
+    if grad.ndim != 2 or weight.ndim != 2 or scale.ndim != 2:
+        raise ValueError("native W8A16 input gradient requires 2-D tensors")
+    if grad.dtype != torch.bfloat16:
+        raise TypeError(f"W8A16 gradient must be BF16, got {grad.dtype}")
+    if weight.dtype != torch.float8_e4m3fn:
+        raise TypeError(f"W8A16 weight must be FP8, got {weight.dtype}")
+    if scale.dtype != torch.float32:
+        raise TypeError(f"W8A16 scale must be FP32, got {scale.dtype}")
+    if not (grad.is_cuda and weight.is_cuda and scale.is_cuda):
+        raise ValueError("native W8A16 input gradient requires CUDA tensors")
+    if grad.device != weight.device or grad.device != scale.device:
+        raise ValueError("W8A16 gradient, weight, and scale must share one device")
+    output_size, input_size = weight.shape
+    if grad.shape[1] != output_size:
+        raise ValueError(
+            f"reduction mismatch: gradient {grad.shape[1]}, weight {tuple(weight.shape)}"
+        )
+    expected_scale = (
+        (output_size + 127) // 128,
+        (input_size + 127) // 128,
+    )
+    if tuple(scale.shape) != expected_scale:
+        raise ValueError(
+            f"scale shape {tuple(scale.shape)} does not cover weight "
+            f"{tuple(weight.shape)}; expected {expected_scale}"
+        )
+
+    out = torch.empty(
+        grad.shape[0], input_size, device=grad.device, dtype=torch.bfloat16
+    )
+    if grad.shape[0] <= 64:
+        block_m, num_warps = 16, 4
+    elif grad.shape[0] <= 512:
+        block_m, num_warps = 32, 4
+    elif grad.shape[0] <= 2048:
+        block_m, num_warps = 64, 8
+    else:
+        block_m, num_warps = 128, 8
+    grid = (
+        triton.cdiv(grad.shape[0], block_m),
+        triton.cdiv(input_size, 128),
+    )
+    stream = torch.cuda.current_stream(grad.device)
+    grad.record_stream(stream)
+    weight.record_stream(stream)
+    scale.record_stream(stream)
+    _w8a16_input_grad_kernel[grid](
+        grad,
+        weight,
+        scale,
+        out,
+        grad.shape[0],
+        input_size,
+        output_size,
+        grad.stride(0),
+        grad.stride(1),
+        weight.stride(0),
+        weight.stride(1),
+        scale.stride(0),
+        scale.stride(1),
+        out.stride(0),
+        out.stride(1),
+        BLOCK_M=block_m,
+        BLOCK_N=128,
+        BLOCK_K=128,
+        num_warps=num_warps,
     )
     return out
 
@@ -272,6 +486,65 @@ def _linear(x, weight, scale):
     # change at an arbitrary row-count boundary.
     offsets = torch.tensor([x.shape[0]], device=x.device, dtype=torch.int32)
     return _grouped_mm(x, weight.unsqueeze(0), scale.unsqueeze(0), offsets).view(shape)
+
+
+def _w8a16_linear(x, weight, scale):
+    if x.dtype != torch.bfloat16:
+        raise TypeError(f"W8A16 input must be BF16, got {x.dtype}")
+    if weight.dtype != torch.float8_e4m3fn:
+        raise TypeError(f"W8A16 weight must be FP8, got {weight.dtype}")
+    if scale.dtype != torch.float32:
+        raise TypeError(f"W8A16 scale must be FP32, got {scale.dtype}")
+    if x.shape[-1] != weight.shape[1]:
+        raise ValueError(
+            f"W8A16 input width {x.shape[-1]} does not match weight width {weight.shape[1]}"
+        )
+    shape = (*x.shape[:-1], weight.shape[0])
+    x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+    return _native_block_fp8_mm(x_2d, weight, scale).view(shape)
+
+
+def _w8a16_input_grad(
+    grad, weight, scale, *, fqn="<unassigned-fp8-linear>"
+):
+    if grad.dtype != torch.bfloat16:
+        raise TypeError(f"W8A16 gradient must be BF16, got {grad.dtype}")
+    if weight.dtype != torch.float8_e4m3fn:
+        raise TypeError(f"W8A16 weight must be FP8, got {weight.dtype}")
+    if scale.dtype != torch.float32:
+        raise TypeError(f"W8A16 scale must be FP32, got {scale.dtype}")
+    if grad.shape[-1] != weight.shape[0]:
+        raise ValueError(
+            f"W8A16 gradient width {grad.shape[-1]} does not match "
+            f"weight output width {weight.shape[0]}"
+        )
+    shape = (*grad.shape[:-1], weight.shape[1])
+    grad_2d = grad.reshape(-1, grad.shape[-1]).contiguous()
+    input_grad = _native_w8a16_input_grad(grad_2d, weight, scale).view(shape)
+    if (
+        _DIAGNOSE_LINEAR_BACKWARD
+        or os.environ.get("PRIME_FP8_DIAG_LINEAR_BACKWARD", "") == "1"
+    ):
+        incoming_finite = bool(torch.isfinite(grad).all())
+        output_finite = bool(torch.isfinite(input_grad).all())
+        report_key = (fqn, incoming_finite, output_finite)
+        if (
+            (not incoming_finite or not output_finite)
+            and report_key not in _REPORTED_W8A16_INPUT_GRAD
+        ):
+            _REPORTED_W8A16_INPUT_GRAD.add(report_key)
+            finite_grad = grad[torch.isfinite(grad)]
+            finite_output = input_grad[torch.isfinite(input_grad)]
+            print(
+                "[fp8-w8a16-input-grad] "
+                f"fqn={fqn} weight={tuple(weight.shape)} grad={tuple(grad.shape)} "
+                f"incoming_finite={incoming_finite} "
+                f"incoming_absmax={float(finite_grad.abs().max()) if finite_grad.numel() else float('nan'):.6e} "
+                f"output_finite={output_finite} "
+                f"output_absmax={float(finite_output.abs().max()) if finite_output.numel() else float('nan'):.6e}",
+                flush=True,
+            )
+    return input_grad
 
 
 def _linear_input_grad_oracle(
@@ -455,9 +728,134 @@ class _Linear(torch.autograd.Function):
         return input_grad, None, None, None, None
 
 
+class _W8A16Linear(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight, scale, fqn, owner):
+        ctx.owner = owner
+        ctx.fqn = fqn
+        if owner is not None:
+            ctx.weight_snapshot = None
+            ctx.scale_snapshot = None
+            ctx.owns_snapshot = False
+            ctx.snapshot_key = None
+        elif in_reentrant_block_checkpoint():
+            ctx.weight_snapshot = weight
+            ctx.scale_snapshot = scale
+            ctx.owns_snapshot = False
+            ctx.snapshot_key = None
+        elif ctx.needs_input_grad[0]:
+            ctx.weight_snapshot, ctx.scale_snapshot = _acquire_linear_snapshot(
+                fqn, weight, scale
+            )
+            ctx.owns_snapshot = True
+            ctx.snapshot_key = fqn
+        else:
+            ctx.weight_snapshot = weight
+            ctx.scale_snapshot = scale
+            ctx.owns_snapshot = False
+            ctx.snapshot_key = None
+        try:
+            return _w8a16_linear(x, weight, scale)
+        except BaseException:
+            if ctx.snapshot_key is not None:
+                _release_linear_snapshot(ctx.snapshot_key)
+                ctx.snapshot_key = None
+            raise
+
+    @staticmethod
+    def backward(ctx, grad):
+        if ctx.owner is not None:
+            owner, weight_name, scale_name = ctx.owner
+            weight = getattr(owner, weight_name)
+            scale = getattr(owner, scale_name)
+            if isinstance(weight, DTensor):
+                weight = weight.to_local()
+            if isinstance(scale, DTensor):
+                scale = scale.to_local()
+        else:
+            weight = ctx.weight_snapshot
+            scale = ctx.scale_snapshot
+        try:
+            input_grad = _w8a16_input_grad(grad, weight, scale, fqn=ctx.fqn)
+            if ctx.owner is not None:
+                fence = getattr(ctx.owner[0], "_w8a16_backward_fence", None)
+                if fence is not None:
+                    fence.record(input_grad.device)
+        finally:
+            if ctx.snapshot_key is not None:
+                _release_linear_snapshot(ctx.snapshot_key)
+            del ctx.weight_snapshot, ctx.scale_snapshot, ctx.owner
+        return input_grad, None, None, None, None
+
+
+class _FusedQKVALinear(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight, scale, fqn, owner):
+        ctx.owner = owner
+        ctx.fqn = fqn
+        if owner is not None:
+            ctx.weight_snapshot = None
+            ctx.scale_snapshot = None
+            ctx.snapshot_key = None
+        elif in_reentrant_block_checkpoint():
+            ctx.weight_snapshot = weight
+            ctx.scale_snapshot = scale
+            ctx.snapshot_key = None
+        elif ctx.needs_input_grad[0]:
+            ctx.weight_snapshot, ctx.scale_snapshot = _acquire_linear_snapshot(
+                fqn, weight, scale
+            )
+            ctx.snapshot_key = fqn
+        else:
+            ctx.weight_snapshot = weight
+            ctx.scale_snapshot = scale
+            ctx.snapshot_key = None
+        try:
+            return _linear(x, weight, scale)
+        except BaseException:
+            if ctx.snapshot_key is not None:
+                _release_linear_snapshot(ctx.snapshot_key)
+                ctx.snapshot_key = None
+            raise
+
+    @staticmethod
+    def backward(ctx, grad):
+        if ctx.owner is not None:
+            owner, weight_name, scale_name = ctx.owner
+            weight = getattr(owner, weight_name)
+            scale = getattr(owner, scale_name)
+            if isinstance(weight, DTensor):
+                weight = weight.to_local()
+            if isinstance(scale, DTensor):
+                scale = scale.to_local()
+        else:
+            weight = ctx.weight_snapshot
+            scale = ctx.scale_snapshot
+        try:
+            input_grad = _w8a16_input_grad(grad, weight, scale, fqn=ctx.fqn)
+            if ctx.owner is not None:
+                fence = getattr(ctx.owner[0], "_w8a16_backward_fence", None)
+                if fence is not None:
+                    fence.record(input_grad.device)
+        finally:
+            if ctx.snapshot_key is not None:
+                _release_linear_snapshot(ctx.snapshot_key)
+            del ctx.weight_snapshot, ctx.scale_snapshot, ctx.owner
+        return input_grad, None, None, None, None
+
+
 class FP8CheckpointLinear(nn.Linear):
     def forward(self, x):
         fqn = getattr(self, "_fp8_fqn", f"<unassigned-fp8-linear:{id(self)}>")
+        if getattr(self, "w8a16", False):
+            out = _W8A16Linear.apply(
+                x,
+                self.weight,
+                self.weight_scale_inv,
+                fqn,
+                (self, "weight", "weight_scale_inv"),
+            )
+            return out if self.bias is None else out + self.bias
         out = _Linear.apply(
             x,
             self.weight,
@@ -468,7 +866,7 @@ class FP8CheckpointLinear(nn.Linear):
         return out if self.bias is None else out + self.bias
 
     @classmethod
-    def from_linear(cls, linear):
+    def from_linear(cls, linear, *, w8a16=False):
         with torch.device("meta"):
             module = cls(
                 linear.in_features,
@@ -489,7 +887,217 @@ class FP8CheckpointLinear(nn.Linear):
             requires_grad=False,
         )
         module.bias = linear.bias
+        module.w8a16 = bool(w8a16)
         return module
+
+
+class FP8CheckpointFusedQKVA(nn.Module):
+    input_size = 6144
+    q_output_size = 2048
+    kv_output_size = 576
+
+    def __init__(self, *, device: torch.device | str | None = None) -> None:
+        super().__init__()
+        self.in_features = self.input_size
+        self.out_features = self.q_output_size
+        self.bias = None
+        output_size = self.q_output_size + self.kv_output_size
+        self.weight = nn.Parameter(
+            torch.empty(
+                output_size,
+                self.input_size,
+                device=device,
+                dtype=torch.float8_e4m3fn,
+            ),
+            requires_grad=False,
+        )
+        self.weight_scale_inv = nn.Parameter(
+            torch.empty(
+                math.ceil(output_size / 128),
+                self.input_size // 128,
+                device=device,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+
+    @classmethod
+    def from_linears(cls, q_projection: nn.Linear, kv_projection: nn.Linear):
+        if q_projection.bias is not None or kv_projection.bias is not None:
+            raise ValueError("fused GLM Q-A and KV-A projections do not support bias")
+        expected = (
+            cls.input_size,
+            cls.q_output_size,
+            cls.kv_output_size,
+        )
+        actual = (
+            q_projection.in_features,
+            q_projection.out_features,
+            kv_projection.out_features,
+        )
+        if (
+            kv_projection.in_features != q_projection.in_features
+            or actual != expected
+        ):
+            raise ValueError(
+                "fused GLM Q-A and KV-A shapes must be "
+                f"input={expected[0]}, q={expected[1]}, kv={expected[2]}; got "
+                f"q={tuple(q_projection.weight.shape)}, "
+                f"kv={tuple(kv_projection.weight.shape)}"
+            )
+        return cls(device=q_projection.weight.device)
+
+    def combined(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dtype != torch.bfloat16:
+            raise TypeError(
+                f"fused GLM Q-A and KV-A input must be BF16, got {x.dtype}"
+            )
+        if self.weight.dtype != torch.float8_e4m3fn:
+            raise TypeError(
+                "fused GLM Q-A and KV-A weight must be FP8 E4M3FN, "
+                f"got {self.weight.dtype}"
+            )
+        if self.weight_scale_inv.dtype != torch.float32:
+            raise TypeError(
+                "fused GLM Q-A and KV-A scales must be FP32, "
+                f"got {self.weight_scale_inv.dtype}"
+            )
+        if self.weight.device != x.device or self.weight_scale_inv.device != x.device:
+            raise ValueError(
+                "fused GLM Q-A and KV-A input, weight, and scales must use one device"
+            )
+        expected_weight = (
+            self.q_output_size + self.kv_output_size,
+            self.input_size,
+        )
+        expected_scale = (
+            math.ceil(expected_weight[0] / 128),
+            self.input_size // 128,
+        )
+        if tuple(self.weight.shape) != expected_weight:
+            raise ValueError(
+                f"fused GLM Q-A and KV-A weight has shape {tuple(self.weight.shape)}; "
+                f"expected {expected_weight}"
+            )
+        if tuple(self.weight_scale_inv.shape) != expected_scale:
+            raise ValueError(
+                "fused GLM Q-A and KV-A scale has shape "
+                f"{tuple(self.weight_scale_inv.shape)}; expected {expected_scale}"
+            )
+        if x.shape[-1] != self.input_size:
+            raise ValueError(
+                f"fused GLM Q-A and KV-A input width is {x.shape[-1]}; "
+                f"expected {self.input_size}"
+            )
+        fqn = getattr(self, "_fp8_fqn", "<unassigned-fused-qkv-a>")
+        return _FusedQKVALinear.apply(
+            x,
+            self.weight,
+            self.weight_scale_inv,
+            fqn,
+            (self, "weight", "weight_scale_inv"),
+        )
+
+    def split(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.combined(x).split(
+            (self.q_output_size, self.kv_output_size), dim=-1
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.split(x)[0]
+
+
+class FP8CheckpointFusedQKVASlice(nn.Module):
+    def __init__(self, owner: FP8CheckpointFusedQKVA) -> None:
+        super().__init__()
+        object.__setattr__(self, "_owner_ref", weakref.ref(owner))
+        self.in_features = owner.input_size
+        self.out_features = owner.kv_output_size
+        self.bias = None
+
+    @property
+    def owner(self) -> FP8CheckpointFusedQKVA:
+        owner = self._owner_ref()
+        if owner is None:
+            raise RuntimeError("fused GLM Q-A and KV-A owner no longer exists")
+        return owner
+
+    @property
+    def weight(self) -> torch.Tensor:
+        return self.owner.weight.narrow(
+            0, self.owner.q_output_size, self.owner.kv_output_size
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.owner.split(x)[1]
+
+
+def replace_glm_qkv_a(model: nn.Module) -> int:
+    if getattr(getattr(model, "config", None), "model_type", None) != "glm_moe_dsa":
+        raise ValueError("fused Q-A and KV-A FP8 is only valid for GLM-MoE-DSA")
+    replaced = 0
+    for name, module in list(model.named_modules()):
+        if name.rsplit(".", 1)[-1] != "q_a_proj":
+            continue
+        if not isinstance(module, nn.Linear):
+            raise TypeError(f"{name} must be nn.Linear before fused FP8 replacement")
+        parent_name = name.rsplit(".", 1)[0]
+        parent = model.get_submodule(parent_name)
+        kv_projection = getattr(parent, "kv_a_proj_with_mqa", None)
+        if not isinstance(kv_projection, nn.Linear):
+            raise TypeError(
+                f"{parent_name}.kv_a_proj_with_mqa must be nn.Linear before "
+                "fused FP8 replacement"
+            )
+        fused = FP8CheckpointFusedQKVA.from_linears(module, kv_projection)
+        fused._fp8_fqn = name
+        parent.q_a_proj = fused
+        parent.kv_a_proj_with_mqa = FP8CheckpointFusedQKVASlice(fused)
+        replaced += 1
+    expected = sum(
+        1
+        for module in model.modules()
+        if type(module).__name__ == "GlmMoeDsaDecoderLayer"
+    )
+    if expected == 0 or replaced != expected:
+        raise ValueError(
+            f"fused Q-A and KV-A FP8 replaced {replaced} pairs; expected {expected}"
+        )
+    return replaced
+
+
+def install_w8a16_reshard_wait(module: nn.Module) -> bool:
+    linears = [
+        child
+        for child in module.modules()
+        if (
+            isinstance(child, FP8CheckpointLinear)
+            and getattr(child, "w8a16", False)
+        )
+        or isinstance(child, FP8CheckpointFusedQKVA)
+    ]
+    if not linears:
+        return False
+    state = module._get_fsdp_state()
+    group = state._fsdp_param_group
+    if group is None:
+        raise RuntimeError("W8A16 reshard wait requires an FSDP parameter group")
+    if getattr(group, "_prime_w8a16_reshard_wait", False):
+        raise RuntimeError("W8A16 reshard wait is already installed")
+
+    fence = W8A16BackwardFence()
+    for linear in linears:
+        linear._w8a16_backward_fence = fence
+    original_post_backward = group.post_backward
+
+    def post_backward(*args, **kwargs):
+        fence.wait_before_reshard(group)
+        return original_post_backward(*args, **kwargs)
+
+    group.post_backward = post_backward
+    group._prime_w8a16_fence = fence
+    group._prime_w8a16_reshard_wait = True
+    return True
 
 
 class FP8CheckpointEmbedding(nn.Embedding):
@@ -798,13 +1406,76 @@ def _fp8_lm_head_forward(self, hidden_states, labels=None, temperature=None):
     return PrimeLmOutput(logprobs=logprobs.view(b, s), entropy=entropy.view(b, s))
 
 
-def replace_linear(model, embed=False, lm_head=False):
+def validate_w8a16_matches(
+    matched_pattern_ids: set[int],
+    patterns: tuple[str, ...] | list[str],
+    *,
+    process_group=None,
+) -> None:
+    """Require every configured W8A16 pattern locally or across PP stages."""
+    if not patterns:
+        return
+
+    invalid = set(matched_pattern_ids).difference(range(len(patterns)))
+    if invalid:
+        raise ValueError(f"invalid W8A16 pattern IDs: {sorted(invalid)}")
+
+    if process_group is None:
+        present = set(matched_pattern_ids)
+    else:
+        if not dist.is_available() or not dist.is_initialized():
+            raise RuntimeError(
+                "Pipeline-aware W8A16 validation requires an initialized process group"
+            )
+        backend = str(dist.get_backend(process_group)).lower()
+        device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if backend == "nccl"
+            else torch.device("cpu")
+        )
+        present_mask = torch.zeros(len(patterns), dtype=torch.int32, device=device)
+        if matched_pattern_ids:
+            present_mask[list(matched_pattern_ids)] = 1
+        dist.all_reduce(present_mask, op=dist.ReduceOp.MAX, group=process_group)
+        present = {
+            index
+            for index, value in enumerate(present_mask.detach().cpu().tolist())
+            if value
+        }
+
+    missing = [
+        pattern
+        for index, pattern in enumerate(patterns)
+        if index not in present
+    ]
+    if missing:
+        scope = (
+            "configured W8A16 modules were not installed across pipeline stages"
+            if process_group is not None
+            else "configured W8A16 modules were not installed"
+        )
+        raise ValueError(f"{scope}: {missing}")
+
+
+def replace_linear(
+    model,
+    embed=False,
+    lm_head=False,
+    ignore_patterns=(),
+    w8a16_patterns=(),
+    validate_w8a16_patterns=True,
+    fused_qkv_a_fp8=False,
+):
+    if fused_qkv_a_fp8:
+        replace_glm_qkv_a(model)
     exclusions = set(model.config.quantization_config["modules_to_not_convert"])
+    matched_w8a16 = set()
     for name, module in list(model.named_modules()):
         if (
             not isinstance(module, nn.Linear)
             or name in exclusions
             or name.replace(".mlp.router.gate", ".mlp.gate") in exclusions
+            or any(re.search(pattern, name) for pattern in ignore_patterns)
             or name.endswith((".self_attn.kv_b_proj", ".self_attn.indexer.wk"))
         ):
             continue
@@ -812,7 +1483,20 @@ def replace_linear(model, embed=False, lm_head=False):
             continue
         parent_name, attr = name.rsplit(".", 1) if "." in name else ("", name)
         parent = model.get_submodule(parent_name) if parent_name else model
-        setattr(parent, attr, FP8CheckpointLinear.from_linear(module))
+        matched = tuple(
+            index
+            for index, pattern in enumerate(w8a16_patterns)
+            if re.search(pattern, name)
+        )
+        matched_w8a16.update(matched)
+        setattr(
+            parent,
+            attr,
+            FP8CheckpointLinear.from_linear(module, w8a16=bool(matched)),
+        )
+
+    if validate_w8a16_patterns:
+        validate_w8a16_matches(matched_w8a16, w8a16_patterns)
 
     # Shape-only diagnostics are ambiguous in GLM because many projections
     # share geometry. Persist the model path on every native checkpoint
@@ -829,7 +1513,7 @@ def replace_linear(model, embed=False, lm_head=False):
             model.model.embed_tokens
         )
     if not lm_head:
-        return
+        return matched_w8a16
     model.lm_head.weight = nn.Parameter(
         torch.empty(
             model.lm_head.out_features,
@@ -848,6 +1532,7 @@ def replace_linear(model, embed=False, lm_head=False):
         requires_grad=False,
     )
     model.lm_head.forward = _fp8_lm_head_forward.__get__(model.lm_head)
+    return matched_w8a16
 
 
 def _prepare_grouped_mm(x, weight, offsets):
@@ -1064,7 +1749,7 @@ def _index_copy_real_rows_with_cache_retry(destination, indices, source, real):
     Keep this on PyTorch's already-loaded indexing path. A custom Triton
     scatter first encountered a new kernel variant during x79p step 4 and
     failed while loading its CUDA module at the full model live set. The
-    2,048-row bound limits the boolean source gather to 24 MiB here.
+    4,096-row bound limits the boolean source gather to 48 MiB here.
     """
     try:
         destination.index_copy_(0, indices[real].long(), source[real])
@@ -1507,6 +2192,709 @@ class _InplacePermutedExperts(torch.autograd.Function):
         return grad, None, None, None, None, None, None, None, None, None, None
 
 
+def _grouped_lora_projection(x, lora_a, lora_b, offsets):
+    """Run one expert LoRA projection without changing the FP8 base path."""
+    output, _ = _grouped_lora_projection_with_low_rank(
+        x,
+        lora_a,
+        lora_b,
+        offsets,
+    )
+    return output
+
+
+def _grouped_lora_projection_with_low_rank(x, lora_a, lora_b, offsets):
+    if x.dtype not in (torch.bfloat16, torch.float16):
+        raise TypeError(f"expert LoRA input must be BF16 or FP16, got {x.dtype}")
+    if lora_a.dtype != x.dtype or lora_b.dtype != x.dtype:
+        raise TypeError(
+            "expert LoRA factors must use the activation dtype: "
+            f"x={x.dtype}, A={lora_a.dtype}, B={lora_b.dtype}"
+        )
+    if lora_a.ndim != 3 or lora_b.ndim != 3:
+        raise ValueError("expert LoRA factors must be expert-major three-dimensional tensors")
+    if lora_a.shape[0] != lora_b.shape[0] or offsets.shape[0] != lora_a.shape[0]:
+        raise ValueError("expert LoRA factors and offsets have different expert counts")
+    if lora_a.shape[1] != lora_b.shape[2]:
+        raise ValueError("expert LoRA A and B ranks do not match")
+    if lora_a.shape[2] != x.shape[1]:
+        raise ValueError("expert LoRA A input width does not match the activation")
+
+    low_rank = torch._grouped_mm(
+        x,
+        lora_a.transpose(-2, -1),
+        offs=offsets,
+    )
+    return (
+        torch._grouped_mm(
+            low_rank,
+            lora_b.transpose(-2, -1),
+            offs=offsets,
+        ),
+        low_rank,
+    )
+
+
+def _grouped_outer_accumulate(left, right, offsets, output):
+    if _grouped_outer_accumulate_kernel is None:
+        raise RuntimeError("Triton is unavailable for expert LoRA backward")
+    if not all(value.is_cuda for value in (left, right, offsets, output)):
+        raise RuntimeError("expert LoRA backward requires CUDA tensors")
+    if left.dtype != torch.bfloat16 or right.dtype != torch.bfloat16:
+        raise TypeError("expert LoRA backward inputs must be BF16")
+    if output.dtype != torch.bfloat16:
+        raise TypeError("expert LoRA parameter gradients must be BF16")
+    if offsets.dtype != torch.int32 or offsets.ndim != 1:
+        raise TypeError("expert LoRA offsets must be a one-dimensional INT32 tensor")
+    if left.ndim != 2 or right.ndim != 2 or output.ndim != 3:
+        raise ValueError("expert LoRA outer product has invalid tensor dimensions")
+    if left.shape[0] != right.shape[0]:
+        raise ValueError("expert LoRA outer-product inputs have different row counts")
+    expected = (offsets.shape[0], left.shape[1], right.shape[1])
+    if tuple(output.shape) != expected:
+        raise ValueError(
+            f"expert LoRA gradient shape {tuple(output.shape)} does not match {expected}"
+        )
+
+    block_left = 32
+    block_right = 32
+    grid = (
+        offsets.shape[0],
+        triton.cdiv(left.shape[1], block_left),
+        triton.cdiv(right.shape[1], block_right),
+    )
+    _grouped_outer_accumulate_kernel[grid](
+        left,
+        right,
+        offsets,
+        output,
+        left.shape[1],
+        right.shape[1],
+        left.stride(0),
+        left.stride(1),
+        right.stride(0),
+        right.stride(1),
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
+        BLOCK_ROWS=32,
+        BLOCK_LEFT=block_left,
+        BLOCK_RIGHT=block_right,
+        num_warps=4,
+    )
+
+
+def _grouped_lora_backward(
+    x,
+    lora_a,
+    lora_b,
+    offsets,
+    grad_output,
+    grad_a,
+    grad_b,
+    low_rank=None,
+):
+    """Compute one grouped LoRA backward without nested autograd."""
+    if grad_output.dtype != x.dtype:
+        raise TypeError("expert LoRA output gradient must use the activation dtype")
+    if tuple(grad_a.shape) != tuple(lora_a.shape) or tuple(grad_b.shape) != tuple(
+        lora_b.shape
+    ):
+        raise ValueError("expert LoRA gradient buffers do not match their factors")
+    if lora_a.shape[1] != 32:
+        raise RuntimeError(
+            f"native expert LoRA backward supports rank 32, got {lora_a.shape[1]}"
+        )
+
+    if low_rank is None:
+        low_rank = torch._grouped_mm(
+            x,
+            lora_a.transpose(-2, -1),
+            offs=offsets,
+        )
+    elif (
+        low_rank.device != x.device
+        or low_rank.dtype != x.dtype
+        or low_rank.shape != (x.shape[0], lora_a.shape[1])
+    ):
+        raise ValueError("saved expert LoRA low-rank activation is invalid")
+    low_rank_grad = torch._grouped_mm(
+        grad_output,
+        lora_b,
+        offs=offsets,
+    )
+    input_grad = torch._grouped_mm(
+        low_rank_grad,
+        lora_a,
+        offs=offsets,
+    )
+    _grouped_outer_accumulate(low_rank_grad, x, offsets, grad_a)
+    _grouped_outer_accumulate(grad_output, low_rank, offsets, grad_b)
+    return input_grad
+
+
+class _InplacePermutedLoRAExperts(torch.autograd.Function):
+    """Native block-FP8 experts with standard LoRA on W1, W2, and W3."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        x,
+        w1,
+        s1,
+        w2,
+        s2,
+        w3,
+        s3,
+        w1_lora_a,
+        w1_lora_b,
+        w2_lora_a,
+        w2_lora_b,
+        w3_lora_a,
+        w3_lora_b,
+        scaling,
+        permuted_indices,
+        offsets,
+        owner,
+        received_input,
+        received_scores,
+        chunk_rows,
+    ):
+        if not x.is_cuda or x.dtype != torch.bfloat16:
+            raise TypeError("native routed-expert LoRA requires CUDA BF16 activations")
+        if received_input is None:
+            raise RuntimeError(
+                "native routed-expert LoRA requires the exact received dispatch input"
+            )
+        if chunk_rows <= 0:
+            raise ValueError("native routed-expert LoRA chunk size must be positive")
+        scaling = float(scaling)
+        if not math.isfinite(scaling) or scaling <= 0:
+            raise ValueError("native routed-expert LoRA scaling must be finite and positive")
+        local_recompute = bool(
+            getattr(received_input, "local_recompute", False)
+        )
+        if local_recompute != (received_scores is not None):
+            raise RuntimeError(
+                "native expert local recompute state does not match its route scores"
+            )
+        if local_recompute and (
+            received_scores.device != x.device
+            or received_scores.dtype != torch.float32
+            or received_scores.shape != (x.shape[0],)
+            or not received_scores.is_contiguous()
+        ):
+            raise ValueError(
+                "native expert local recompute requires contiguous CUDA FP32 route scores"
+            )
+
+        rows = permuted_indices.shape[0]
+        save_backward_state = bool(
+            getattr(received_input, "save_for_backward", True)
+        )
+        save_intermediates = save_backward_state and not local_recompute
+        if save_intermediates:
+            q1_host = torch.empty(
+                rows,
+                w1.shape[1],
+                device="cpu",
+                dtype=torch.float8_e4m3fn,
+                pin_memory=True,
+            )
+            q3_host = torch.empty_like(q1_host, pin_memory=True)
+            qs1_parts = []
+            qs3_parts = []
+
+        for start in range(0, rows, chunk_rows):
+            end = min(start + chunk_rows, rows)
+            indices = permuted_indices[start:end]
+            real = (indices >= 0) & (indices < x.shape[0])
+            safe_indices = indices.clamp(min=0, max=x.shape[0] - 1).long()
+            chunk_x = _index_select_rows_with_cache_retry(x, safe_indices)
+            chunk_x.masked_fill_((~real).unsqueeze(-1), 0)
+            chunk_offsets = _expert_chunk_offsets(offsets, start, end)
+
+            z1, z3 = _grouped_mm_pair(
+                chunk_x,
+                w1,
+                s1,
+                chunk_x,
+                w3,
+                s3,
+                chunk_offsets,
+                shared_input=True,
+            )
+            z1.add_(
+                _grouped_lora_projection(
+                    chunk_x,
+                    w1_lora_a,
+                    w1_lora_b,
+                    chunk_offsets,
+                ),
+                alpha=scaling,
+            )
+            z3.add_(
+                _grouped_lora_projection(
+                    chunk_x,
+                    w3_lora_a,
+                    w3_lora_b,
+                    chunk_offsets,
+                ),
+                alpha=scaling,
+            )
+
+            if save_intermediates:
+                q1, qs1 = ops.scaled_fp8_quant(z1, use_per_token_if_dynamic=True)
+                q3, qs3 = ops.scaled_fp8_quant(z3, use_per_token_if_dynamic=True)
+                q1_host[start:end].copy_(q1, non_blocking=True)
+                q3_host[start:end].copy_(q3, non_blocking=True)
+                qs1_parts.append(qs1)
+                qs3_parts.append(qs3)
+                del q1, q3
+
+            F.silu(z1, inplace=True)
+            z1.mul_(z3)
+            del z3
+            chunk_out = _grouped_mm_chunked(
+                z1,
+                w2,
+                s2,
+                chunk_offsets,
+            )
+            chunk_out.add_(
+                _grouped_lora_projection(
+                    z1,
+                    w2_lora_a,
+                    w2_lora_b,
+                    chunk_offsets,
+                ),
+                alpha=scaling,
+            )
+            _index_copy_real_rows_with_cache_retry(x, indices, chunk_out, real)
+            del (
+                chunk_x,
+                safe_indices,
+                z1,
+                chunk_out,
+                indices,
+                real,
+                chunk_offsets,
+            )
+
+        if local_recompute:
+            for start in range(0, x.shape[0], chunk_rows):
+                end = min(start + chunk_rows, x.shape[0])
+                x[start:end].copy_(
+                    (
+                        x[start:end].float()
+                        * received_scores[start:end, None]
+                    ).to(x.dtype)
+                )
+
+        if not save_backward_state:
+            ctx.has_backward_state = False
+            ctx.mark_dirty(x)
+            return x
+
+        if save_intermediates:
+            qs1 = torch.cat(qs1_parts, dim=0)
+            qs3 = torch.cat(qs3_parts, dim=0)
+        row_index_device = getattr(received_input, "row_index_device", None)
+        if row_index_device == "cuda":
+            saved_permuted_indices = permuted_indices.to(torch.int64)
+        elif row_index_device == "cpu":
+            saved_permuted_indices = torch.empty_like(
+                permuted_indices,
+                device="cpu",
+                pin_memory=True,
+            )
+            saved_permuted_indices.copy_(permuted_indices, non_blocking=True)
+        else:
+            raise TypeError("native expert input has no supported row-index device")
+        offload_done = torch.cuda.Event()
+        offload_done.record(torch.cuda.current_stream(x.device))
+        ctx.has_backward_state = True
+        ctx.owner = owner
+        ctx.received_input = received_input
+        ctx.offload_done = offload_done
+        ctx.source_rows = x.shape[0]
+        ctx.row_index_device = row_index_device
+        ctx.chunk_rows = min(chunk_rows, _FP8_EXPERT_BACKWARD_CHUNK_ROWS)
+        ctx.scaling = scaling
+        ctx.local_recompute = local_recompute
+        ctx.lora_parameter_metadata = tuple(
+            (tuple(value.shape), value.dtype)
+            for value in (
+                w1_lora_a,
+                w1_lora_b,
+                w2_lora_a,
+                w2_lora_b,
+                w3_lora_a,
+                w3_lora_b,
+            )
+        )
+        if local_recompute:
+            ctx.save_for_backward(
+                saved_permuted_indices,
+                offsets,
+                received_scores,
+            )
+        else:
+            ctx.save_for_backward(
+                q1_host,
+                qs1,
+                q3_host,
+                qs3,
+                saved_permuted_indices,
+                offsets,
+            )
+        ctx.mark_dirty(x)
+        return x
+
+    @staticmethod
+    def backward(ctx, grad):
+        if not ctx.has_backward_state:
+            raise RuntimeError(
+                "native expert LoRA backward state was not saved during checkpoint forward"
+            )
+        if _EXPERT_PROFILE:
+            profile_start = torch.cuda.Event(enable_timing=True)
+            profile_end = torch.cuda.Event(enable_timing=True)
+            profile_start.record()
+        if ctx.local_recompute:
+            saved_permuted_indices, offsets, received_scores = ctx.saved_tensors
+            q1 = qs1 = q3 = qs3 = None
+        else:
+            (
+                q1,
+                qs1,
+                q3,
+                qs3,
+                saved_permuted_indices,
+                offsets,
+            ) = ctx.saved_tensors
+            received_scores = None
+        owner = ctx.owner
+        w1, s1, w2, s2, w3, s3 = (
+            getattr(owner.base_layer, name)
+            for name in (
+                "w1",
+                "w1_scale_inv",
+                "w2",
+                "w2_scale_inv",
+                "w3",
+                "w3_scale_inv",
+            )
+        )
+        w1, s1, w2, s2, w3, s3 = (
+            value.to_local() if isinstance(value, DTensor) else value
+            for value in (w1, s1, w2, s2, w3, s3)
+        )
+        (
+            w1_lora_a,
+            w1_lora_b,
+            w2_lora_a,
+            w2_lora_b,
+            w3_lora_a,
+            w3_lora_b,
+        ) = (
+            getattr(owner, f"{projection}_lora_{factor}")[0]
+            for projection in ("w1", "w2", "w3")
+            for factor in ("A", "B")
+        )
+        w1_lora_a, w1_lora_b, w2_lora_a, w2_lora_b, w3_lora_a, w3_lora_b = (
+            value.to_local() if isinstance(value, DTensor) else value
+            for value in (
+                w1_lora_a,
+                w1_lora_b,
+                w2_lora_a,
+                w2_lora_b,
+                w3_lora_a,
+                w3_lora_b,
+            )
+        )
+        lora_parameters = (
+            w1_lora_a,
+            w1_lora_b,
+            w2_lora_a,
+            w2_lora_b,
+            w3_lora_a,
+            w3_lora_b,
+        )
+        current_metadata = tuple(
+            (tuple(value.shape), value.dtype) for value in lora_parameters
+        )
+        if current_metadata != ctx.lora_parameter_metadata:
+            raise RuntimeError("native expert LoRA parameter metadata changed before backward")
+
+        torch.cuda.current_stream(grad.device).wait_event(ctx.offload_done)
+        if ctx.row_index_device == "cpu":
+            ctx.offload_done.synchronize()
+        elif ctx.row_index_device != "cuda":
+            raise RuntimeError("native expert row-index device changed before backward")
+        grad = grad.contiguous()
+        workspace = ctx.received_input.make_workspace(ctx.chunk_rows, grad.device)
+        parameter_grads = [torch.zeros_like(value) for value in lora_parameters]
+        score_grads = (
+            torch.empty_like(received_scores)
+            if ctx.local_recompute
+            else None
+        )
+
+        rows = saved_permuted_indices.shape[0]
+        for start in range(0, rows, ctx.chunk_rows):
+            end = min(start + ctx.chunk_rows, rows)
+            reconstruction_indices = saved_permuted_indices[start:end]
+            indices = (
+                reconstruction_indices
+                if ctx.row_index_device == "cuda"
+                else reconstruction_indices.to(grad.device, non_blocking=True)
+            )
+            real = (indices >= 0) & (indices < ctx.source_rows)
+            safe_indices = indices.clamp(min=0, max=ctx.source_rows - 1).long()
+            grad_chunk = _index_select_rows_with_cache_retry(grad, safe_indices)
+            grad_chunk.masked_fill_((~real).unsqueeze(-1), 0)
+            chunk_offsets = _expert_chunk_offsets(offsets, start, end)
+            recomputed_w1_low_rank = None
+            recomputed_w3_low_rank = None
+
+            if ctx.local_recompute:
+                reconstructed_x = torch.empty_like(grad_chunk)
+                ctx.received_input.reconstruct_rows(
+                    reconstruction_indices,
+                    reconstructed_x,
+                    workspace,
+                )
+                z1, z3 = _grouped_mm_pair(
+                    reconstructed_x,
+                    w1,
+                    s1,
+                    reconstructed_x,
+                    w3,
+                    s3,
+                    chunk_offsets,
+                    shared_input=True,
+                )
+                (
+                    z1_lora,
+                    recomputed_w1_low_rank,
+                ) = _grouped_lora_projection_with_low_rank(
+                    reconstructed_x,
+                    w1_lora_a,
+                    w1_lora_b,
+                    chunk_offsets,
+                )
+                z1.add_(
+                    z1_lora,
+                    alpha=ctx.scaling,
+                )
+                (
+                    z3_lora,
+                    recomputed_w3_low_rank,
+                ) = _grouped_lora_projection_with_low_rank(
+                    reconstructed_x,
+                    w3_lora_a,
+                    w3_lora_b,
+                    chunk_offsets,
+                )
+                z3.add_(
+                    z3_lora,
+                    alpha=ctx.scaling,
+                )
+                forward_hidden = F.silu(z1) * z3
+                chunk_out = _grouped_mm_chunked(
+                    forward_hidden,
+                    w2,
+                    s2,
+                    chunk_offsets,
+                )
+                chunk_out.add_(
+                    _grouped_lora_projection(
+                        forward_hidden,
+                        w2_lora_a,
+                        w2_lora_b,
+                        chunk_offsets,
+                    ),
+                    alpha=ctx.scaling,
+                )
+                quantized_out, output_scales = ops.scaled_fp8_quant(
+                    chunk_out,
+                    use_per_token_if_dynamic=True,
+                )
+                chunk_out = quantized_out.to(chunk_out.dtype).mul_(
+                    output_scales.to(chunk_out.dtype)
+                )
+                chunk_score_grads = (
+                    grad_chunk.float() * chunk_out.float()
+                ).sum(dim=-1)
+                _index_copy_real_rows_with_cache_retry(
+                    score_grads,
+                    indices,
+                    chunk_score_grads,
+                    real,
+                )
+                del (
+                    chunk_out,
+                    quantized_out,
+                    output_scales,
+                    chunk_score_grads,
+                )
+                chunk_scores = received_scores.index_select(0, safe_indices)
+                grad_chunk.copy_(
+                    (grad_chunk.float() * chunk_scores[:, None]).to(grad.dtype)
+                )
+                grad_chunk.masked_fill_((~real).unsqueeze(-1), 0)
+                quantized_grad, grad_scales = ops.scaled_fp8_quant(
+                    grad_chunk,
+                    use_per_token_if_dynamic=True,
+                )
+                grad_chunk.copy_(
+                    quantized_grad.to(grad.dtype).mul_(
+                        grad_scales.to(grad.dtype)
+                    )
+                )
+                del quantized_grad, grad_scales, chunk_scores
+                quantized_z1, z1_scales = ops.scaled_fp8_quant(
+                    z1,
+                    use_per_token_if_dynamic=True,
+                )
+                z1 = quantized_z1.to(z1.dtype).mul_(
+                    z1_scales.to(z1.dtype)
+                )
+                del quantized_z1, z1_scales
+                quantized_z3, z3_scales = ops.scaled_fp8_quant(
+                    z3,
+                    use_per_token_if_dynamic=True,
+                )
+                z3 = quantized_z3.to(z3.dtype).mul_(
+                    z3_scales.to(z3.dtype)
+                )
+                del quantized_z3, z3_scales
+                hidden = F.silu(z1) * z3
+                del forward_hidden
+            else:
+                q1_device = q1[start:end].to(grad.device, non_blocking=True)
+                z1 = q1_device.to(grad.dtype).mul_(
+                    qs1[start:end].to(grad.dtype)
+                )
+                del q1_device
+                q3_device = q3[start:end].to(grad.device, non_blocking=True)
+                z3 = q3_device.to(grad.dtype).mul_(
+                    qs3[start:end].to(grad.dtype)
+                )
+                del q3_device
+                hidden = F.silu(z1) * z3
+
+            hidden_grad = _grouped_mm_chunked(
+                grad_chunk,
+                w2.transpose(-2, -1),
+                s2.transpose(-2, -1),
+                chunk_offsets,
+            )
+            lora_hidden_grad = _grouped_lora_backward(
+                hidden,
+                w2_lora_a,
+                w2_lora_b,
+                chunk_offsets,
+                grad_chunk.mul(ctx.scaling),
+                parameter_grads[2],
+                parameter_grads[3],
+            )
+            hidden_grad.add_(lora_hidden_grad)
+            del lora_hidden_grad, hidden
+
+            z1_grad, z3_grad = _silu_glu_backward_inplace(
+                hidden_grad,
+                z1,
+                z3,
+            )
+            del hidden_grad, z1, z3
+            x_grad, x_grad_w3 = _grouped_mm_pair(
+                z1_grad,
+                w1.transpose(-2, -1),
+                s1.transpose(-2, -1),
+                z3_grad,
+                w3.transpose(-2, -1),
+                s3.transpose(-2, -1),
+                chunk_offsets,
+            )
+            x_grad.add_(x_grad_w3)
+            del x_grad_w3
+
+            if not ctx.local_recompute:
+                reconstructed_x = grad_chunk
+                ctx.received_input.reconstruct_rows(
+                    reconstruction_indices,
+                    reconstructed_x,
+                    workspace,
+                )
+            lora_x_grad = _grouped_lora_backward(
+                reconstructed_x,
+                w1_lora_a,
+                w1_lora_b,
+                chunk_offsets,
+                z1_grad.mul(ctx.scaling),
+                parameter_grads[0],
+                parameter_grads[1],
+                low_rank=recomputed_w1_low_rank,
+            )
+            x_grad.add_(lora_x_grad)
+            del lora_x_grad
+            lora_x_grad = _grouped_lora_backward(
+                reconstructed_x,
+                w3_lora_a,
+                w3_lora_b,
+                chunk_offsets,
+                z3_grad.mul(ctx.scaling),
+                parameter_grads[4],
+                parameter_grads[5],
+                low_rank=recomputed_w3_low_rank,
+            )
+            x_grad.add_(lora_x_grad)
+            _index_copy_real_rows_with_cache_retry(grad, indices, x_grad, real)
+            del (
+                indices,
+                real,
+                safe_indices,
+                grad_chunk,
+                chunk_offsets,
+                z1_grad,
+                z3_grad,
+                x_grad,
+                reconstructed_x,
+                lora_x_grad,
+                recomputed_w1_low_rank,
+                recomputed_w3_low_rank,
+            )
+
+        if _EXPERT_PROFILE:
+            profile_end.record()
+            _profile_expert_backward(profile_start, profile_end)
+        del (
+            ctx.owner,
+            ctx.received_input,
+            ctx.offload_done,
+            ctx.lora_parameter_metadata,
+        )
+        return (
+            grad,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            *parameter_grads,
+            None,
+            None,
+            None,
+            None,
+            None,
+            score_grads,
+            None,
+        )
+
+
 class _ScaleRoutedOutput(torch.autograd.Function):
     """Apply FP32 route scores with bounded temporary storage.
 
@@ -1682,3 +3070,109 @@ def fp8_experts(
     out_unpermuted = permuted_x
     out_unpermuted[permuted_indices[real_rows], :] = out[real_rows]
     return out_unpermuted[: x.shape[0]]
+
+
+def fp8_lora_experts(
+    w1,
+    w2,
+    w3,
+    s1,
+    s2,
+    s3,
+    w1_lora_a,
+    w1_lora_b,
+    w2_lora_a,
+    w2_lora_b,
+    w3_lora_a,
+    w3_lora_b,
+    scaling,
+    x,
+    num_tokens_per_expert,
+    received_input,
+    received_scores=None,
+    *,
+    owner,
+):
+    """Run expert-sharded standard LoRA inside the native FP8 expert path."""
+    values = (
+        w1,
+        w2,
+        w3,
+        s1,
+        s2,
+        s3,
+        w1_lora_a,
+        w1_lora_b,
+        w2_lora_a,
+        w2_lora_b,
+        w3_lora_a,
+        w3_lora_b,
+    )
+    values = tuple(
+        value.to_local() if isinstance(value, DTensor) else value
+        for value in values
+    )
+    (
+        w1,
+        w2,
+        w3,
+        s1,
+        s2,
+        s3,
+        w1_lora_a,
+        w1_lora_b,
+        w2_lora_a,
+        w2_lora_b,
+        w3_lora_a,
+        w3_lora_b,
+    ) = values
+
+    if x.shape[0] == 0:
+        return x
+    local_experts = w1.shape[0]
+    if num_tokens_per_expert.shape[0] == local_experts:
+        raise RuntimeError(
+            "native routed-expert LoRA qualification requires real EP dispatch; "
+            "the direct local path has no captured INT4 input"
+        )
+    if num_tokens_per_expert.shape[0] % local_experts:
+        raise ValueError(
+            "EP token counts must be a whole number of local expert groups: "
+            f"{num_tokens_per_expert.shape[0]} counts for {local_experts} experts"
+        )
+
+    from torchtitan.distributed.expert_parallel import TOKEN_GROUP_ALIGN_SIZE_M
+    from torchtitan.experiments.kernels.moe.indices import generate_permute_indices
+
+    ep_size = num_tokens_per_expert.shape[0] // local_experts
+    with torch.no_grad():
+        permuted_indices, local_counts, _ = generate_permute_indices(
+            num_tokens_per_expert,
+            local_experts,
+            ep_size,
+            x.shape[0] + local_experts * TOKEN_GROUP_ALIGN_SIZE_M,
+            TOKEN_GROUP_ALIGN_SIZE_M,
+        )
+    offsets = torch.cumsum(local_counts, 0, dtype=torch.int32)
+    return _InplacePermutedLoRAExperts.apply(
+        x,
+        w1,
+        s1,
+        w2,
+        s2,
+        w3,
+        s3,
+        w1_lora_a,
+        w1_lora_b,
+        w2_lora_a,
+        w2_lora_b,
+        w3_lora_a,
+        w3_lora_b,
+        scaling,
+        permuted_indices,
+        offsets,
+        owner,
+        received_input,
+        received_scores,
+        _FP8_W13_CHUNK_ROWS,
+    )

@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import hashlib
 from dataclasses import dataclass
 from typing import Literal
 
@@ -14,12 +15,66 @@ from torch.distributed.tensor import DTensor
 from torchtitan.distributed.expert_parallel import expert_parallel
 
 from prime_rl.configs.trainer import EPCommBackend
-from prime_rl.trainer.mxfp4 import dequant_mxfp4
 from prime_rl.trainer.models.layers.fp8_ada import (
     _Linear,
     fp8_experts,
     scale_routed_output,
 )
+from prime_rl.trainer.mxfp4 import dequant_mxfp4
+
+
+def static_expert_bias_identity(value: torch.Tensor) -> tuple[int, int, str, str, int]:
+    data_ptr = value.data_ptr() if hasattr(value, "data_ptr") else 0
+    version = int(getattr(value, "_version", -1))
+    return id(value), int(data_ptr), str(value.device), str(value.dtype), version
+
+
+def _validate_static_expert_bias(
+    module: nn.Module, *, actual_hash: str | None = None
+) -> torch.Tensor:
+    value = getattr(module, "_fp32_expert_bias", None)
+    source_hash = getattr(module, "_fp32_expert_bias_source_sha256", None)
+    cache_hash = getattr(module, "_fp32_expert_bias_cache_sha256", None)
+    if value is None:
+        raise RuntimeError("Frozen GLM routing requires an FP32 bias cache")
+    if value.dtype != torch.float32:
+        raise RuntimeError("Frozen GLM routing bias cache must remain float32")
+    if not source_hash or not cache_hash or source_hash != cache_hash:
+        raise RuntimeError("Frozen GLM routing bias hashes are incomplete")
+    local_value = value.to_local() if hasattr(value, "to_local") else value
+    if actual_hash is None:
+        raw = local_value.detach().to(device="cpu").contiguous().view(torch.uint8).numpy().tobytes()
+        actual_hash = hashlib.sha256(raw).hexdigest()
+    if actual_hash != source_hash or actual_hash != cache_hash:
+        raise RuntimeError("Frozen GLM routing bias cache changed after source capture")
+    module._fp32_expert_bias_validation = static_expert_bias_identity(value)
+    return value
+
+
+def _require_static_expert_bias(module: nn.Module) -> torch.Tensor:
+    value = getattr(module, "_fp32_expert_bias", None)
+    source_hash = getattr(module, "_fp32_expert_bias_source_sha256", None)
+    cache_hash = getattr(module, "_fp32_expert_bias_cache_sha256", None)
+    if value is None:
+        raise RuntimeError("Frozen GLM routing requires an FP32 bias cache")
+    if value.dtype != torch.float32:
+        raise RuntimeError("Frozen GLM routing bias cache must remain float32")
+    if not source_hash or not cache_hash or source_hash != cache_hash:
+        raise RuntimeError("Frozen GLM routing bias hashes are incomplete")
+    expected = getattr(module, "_fp32_expert_bias_validation", None)
+    if expected != static_expert_bias_identity(value):
+        raise RuntimeError("Frozen GLM routing bias cache changed after validation")
+    return value
+
+
+def _move_static_expert_bias(module: nn.Module, device: torch.device) -> torch.Tensor:
+    value = getattr(module, "_fp32_expert_bias", None)
+    if value is None:
+        raise RuntimeError("Frozen GLM routing requires an FP32 bias cache")
+    value = value.to(device=device, dtype=torch.float32)
+    module._fp32_expert_bias_validation = None
+    module._fp32_expert_bias = value
+    return _validate_static_expert_bias(module)
 
 
 @dataclass
@@ -579,6 +634,24 @@ def _selected_probability_mass_sum(
         return selected_prob_mass.sum(dim=-1).sum()
 
 
+class _BF16RouterGemm(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, hidden_states: torch.Tensor, gate_weight: torch.Tensor) -> torch.Tensor:
+        if gate_weight.requires_grad:
+            raise RuntimeError("BF16 router GEMM requires frozen router weights")
+        ctx.input_dtype = hidden_states.dtype
+        ctx.save_for_backward(gate_weight)
+        return torch.mm(hidden_states, gate_weight.t(), out_dtype=torch.float32)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        (gate_weight,) = ctx.saved_tensors
+        hidden_grad = torch.mm(
+            grad_output.to(torch.float32), gate_weight.to(torch.float32)
+        )
+        return hidden_grad.to(ctx.input_dtype), None
+
+
 class TokenChoiceTopKRouter(nn.Module):
     """This class implements token-choice routing. In token-choice top-K routing, each token is
         routed to top K experts based on the router scores.
@@ -609,12 +682,17 @@ class TokenChoiceTopKRouter(nn.Module):
         self.route_norm = route_norm
         self.route_scale = route_scale
         self.force_balanced = False
-        # Set via model.moe_router_dtype='float32': the gate weight is kept in fp32
-        # (exempt from FSDP bf16 casting) and the gate GEMM runs in fp32.
-        self.fp32_gate = False
+        self.parity_trace_layer: int | None = None
+        self.use_fp32_router_output = False
 
     def forward(
-        self, x: torch.Tensor, expert_bias: torch.Tensor | None = None, routed_experts: torch.Tensor | None = None
+        self,
+        x: torch.Tensor,
+        expert_bias: torch.Tensor | None = None,
+        routed_experts: torch.Tensor | None = None,
+        expert_bias_is_static: bool = False,
+        expert_bias_source_sha256: str | None = None,
+        expert_bias_cache_sha256: str | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -638,11 +716,32 @@ class TokenChoiceTopKRouter(nn.Module):
         assert routed_experts is None or routed_experts.shape[-1] == self.top_k, (
             f"routed_experts shape: {routed_experts.shape}, top_k: {self.top_k}"
         )
-        scores = self.gate(x.to(torch.float32)) if self.fp32_gate else self.gate(x)
+        router_debug_active = False
+        if self.parity_trace_layer is not None:
+            from prime_rl.parity_router_trace import router_debug_enabled
+
+            router_debug_active = router_debug_enabled(self.parity_trace_layer)
+        if self.use_fp32_router_output:
+            gate_weight = self.gate.weight
+            if gate_weight.dtype == torch.bfloat16:
+                gate_input = x.to(torch.bfloat16)
+                scores = _BF16RouterGemm.apply(gate_input, gate_weight)
+            else:
+                gate_input = x.to(gate_weight.dtype)
+                scores = self.gate(gate_input)
+        else:
+            scores = self.gate(x)
+        if router_debug_active:
+            raw_router_logits = scores.to(torch.float32)
 
         # By default, sigmoid or softmax is performed in float32 to avoid loss explosion
         if self.score_func == "sigmoid":
-            scores = torch.sigmoid(scores.to(torch.float32))
+            scores = scores.to(torch.float32)
+            if self.use_fp32_router_output:
+                # vLLM's GLM grouped-topk kernel uses this tanhf form.
+                scores = 0.5 * torch.tanh(0.5 * scores) + 0.5
+            else:
+                scores = torch.sigmoid(scores)
         elif self.score_func == "softmax":
             scores = F.softmax(scores.to(torch.float32), dim=1)
         else:
@@ -651,6 +750,26 @@ class TokenChoiceTopKRouter(nn.Module):
         # top scores shape (bs*slen, top_k)
         # NOTE: The expert_bias is only used for routing. The gating value
         #       top_scores is still derived from the original scores.
+        selection_bias = expert_bias
+        selection_scores = scores
+        if selection_bias is not None:
+            selection_scores = selection_scores + selection_bias.to(torch.float32)
+
+        if router_debug_active:
+            from prime_rl.parity_router_trace import write_router_debug_chunk
+
+            write_router_debug_chunk(
+                self.parity_trace_layer,
+                x,
+                raw_router_logits,
+                scores,
+                selection_scores,
+                selection_bias,
+                expert_bias_source_sha256,
+                expert_bias_cache_sha256,
+                expert_bias_is_static,
+            )
+            del raw_router_logits
 
         if routed_experts is not None:
             selected_experts_indices = routed_experts
@@ -668,17 +787,30 @@ class TokenChoiceTopKRouter(nn.Module):
             selected_experts_indices = (arange % self.num_experts).view(num_tokens, self.top_k)
             top_scores = scores.gather(dim=1, index=selected_experts_indices)
         elif expert_bias is not None:
-            _, selected_experts_indices = torch.topk(scores + expert_bias, k=self.top_k, dim=1)
+            _, selected_experts_indices = torch.topk(
+                selection_scores, k=self.top_k, dim=1
+            )
             top_scores = scores.gather(dim=1, index=selected_experts_indices)
         else:
-            top_scores, selected_experts_indices = torch.topk(scores, k=self.top_k, dim=1)
+            top_scores, selected_experts_indices = torch.topk(
+                scores, k=self.top_k, dim=1
+            )
 
         routing_confidence_sum = _selected_probability_mass_sum(scores, top_scores, self.score_func)
 
         if self.route_norm:
             denominator = top_scores.sum(dim=-1, keepdim=True) + 1e-20
             top_scores = top_scores / denominator
-        top_scores = top_scores * self.route_scale
+
+        if self.parity_trace_layer is not None:
+            from prime_rl.parity_router_trace import write_route_chunk
+
+            write_route_chunk(
+                self.parity_trace_layer,
+                selected_experts_indices,
+                top_scores,
+                route_output_scale=self.route_scale,
+            )
 
         # group tokens together by expert indices from 0 to num_experts and pass that to experts forward
         num_tokens_per_expert = torch.histc(
@@ -715,7 +847,7 @@ class TokenReorderer(nn.Module):
         self,
         top_scores: torch.Tensor,
         selected_experts_indices: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Reorders token indices to match the order of experts for MoE routing.
 
@@ -742,16 +874,53 @@ class TokenReorderer(nn.Module):
 
         # Reorder the token indices to match the order of the experts
         # token_indices_experts_sorted shape (bs*slen*top_k,)
-        token_indices_experts_sorted = torch.argsort(selected_experts_indices, stable=True)
+        expert_order = torch.argsort(selected_experts_indices, stable=True)
 
-        top_scores_experts_sorted = top_scores.view(-1)[token_indices_experts_sorted]
-        token_indices_experts_sorted = token_indices_experts_sorted // self.top_k
+        top_scores_experts_sorted = top_scores.view(-1)[expert_order]
+        token_indices_experts_sorted = expert_order // self.top_k
 
         return (
             top_scores_experts_sorted,
             token_indices_experts_sorted,
             num_tokens_per_expert,
+            expert_order,
         )
+
+
+def combine_expert_outputs(
+    shared_output: torch.Tensor,
+    routed_output: torch.Tensor,
+    expert_order: torch.Tensor,
+    top_k: int,
+) -> torch.Tensor:
+    """Add expert outputs in the model's fixed top-k order."""
+    token_count, width = shared_output.shape
+    expected_rows = token_count * top_k
+    if routed_output.shape != (expected_rows, width):
+        raise ValueError(
+            f"routed output shape {tuple(routed_output.shape)} does not match "
+            f"({expected_rows}, {width})"
+        )
+    if expert_order.shape != (expected_rows,):
+        raise ValueError(
+            f"expert order shape {tuple(expert_order.shape)} does not match "
+            f"({expected_rows},)"
+        )
+
+    sorted_row_for_token_slot = torch.empty_like(expert_order)
+    sorted_row_for_token_slot[expert_order] = torch.arange(
+        expected_rows,
+        device=expert_order.device,
+        dtype=expert_order.dtype,
+    )
+    sorted_row_for_token_slot = sorted_row_for_token_slot.view(token_count, top_k)
+
+    output = shared_output
+    for slot in range(top_k):
+        rows = sorted_row_for_token_slot[:, slot]
+        contribution = routed_output.index_select(0, rows)
+        output = output + contribution
+    return output
 
 
 class MoE(nn.Module):
@@ -854,9 +1023,25 @@ class MoE(nn.Module):
         if self.score_before_experts:
             routed_input = (routed_input.to(torch.float32) * top_scores_experts_sorted.reshape(-1, 1)).to(x.dtype)
 
-        routed_output = self.experts(routed_input, num_tokens_per_expert)
+        local_recompute = getattr(
+            self.experts,
+            "local_recompute_backward",
+            False,
+        )
+        if local_recompute:
+            if self.score_before_experts:
+                raise RuntimeError(
+                    "local expert recompute requires route scores after expert compute"
+                )
+            routed_output = self.experts(
+                routed_input,
+                num_tokens_per_expert,
+                top_scores_experts_sorted,
+            )
+        else:
+            routed_output = self.experts(routed_input, num_tokens_per_expert)
 
-        if not self.score_before_experts:
+        if not self.score_before_experts and not local_recompute:
             if self.experts.fp8_checkpoint:
                 routed_output = scale_routed_output(
                     routed_output,
@@ -885,8 +1070,7 @@ class MoE(nn.Module):
         from prime_rl.trainer.distributed.expert_parallel import get_ep_group
 
         if x.shape[0] == 0:
-            shared_output = self.shared_expert(x) if self.shared_expert is not None else None
-            return x.new_zeros(x.shape) if shared_output is None else shared_output
+            return x.new_zeros(x.shape)
 
         group = get_ep_group(self.experts)
         chunk_size = min(self.deepep_token_chunk_size or x.shape[0], x.shape[0])
@@ -909,9 +1093,8 @@ class MoE(nn.Module):
             )
             sync_combine()
 
-        shared_output = self.shared_expert(x) if self.shared_expert is not None else None
         routed_output = routed_outputs[0] if len(routed_outputs) == 1 else torch.cat(routed_outputs, dim=0)
-        return routed_output if shared_output is None else shared_output + routed_output
+        return routed_output
 
     def forward(
         self,
@@ -937,12 +1120,31 @@ class MoE(nn.Module):
 
         # top_scores and selected_experts_indices shape (bs*slen*top_k,)
         # num_tokens_per_expert shape (num_experts,)
+        static_expert_bias = getattr(self, "_use_static_expert_bias", False)
+        if static_expert_bias and getattr(self, "_fp32_expert_bias_source_sha256", None) is None:
+            raise RuntimeError("Frozen GLM routing requires an exact source bias hash")
+        if static_expert_bias:
+            expert_bias = _require_static_expert_bias(self)
+        else:
+            expert_bias = self.expert_bias
+        if expert_bias is not None and expert_bias.device != x.device:
+            if static_expert_bias:
+                expert_bias = _move_static_expert_bias(self, x.device)
+            else:
+                expert_bias = expert_bias.to(device=x.device, dtype=torch.float32)
         (
             top_scores,
             selected_experts_indices,
             num_tokens_per_expert,
             routing_confidence_sum,
-        ) = self.router(x, self.expert_bias, routed_experts=routed_experts)
+        ) = self.router(
+            x,
+            expert_bias,
+            routed_experts=routed_experts,
+            expert_bias_is_static=static_expert_bias,
+            expert_bias_source_sha256=getattr(self, "_fp32_expert_bias_source_sha256", None),
+            expert_bias_cache_sha256=getattr(self, "_fp32_expert_bias_cache_sha256", None),
+        )
 
         # tokens_per_expert will be used to update the expert bias for load balancing.
         # and also to count the expert usage
@@ -950,11 +1152,15 @@ class MoE(nn.Module):
         # in backward. The selective MoE path avoids that by checkpointing only the
         # routed expert compute below.
         with torch.no_grad():
-            self.tokens_per_expert.add_(num_tokens_per_expert)
+            if self.load_balance_coeff is not None:
+                self.tokens_per_expert.add_(num_tokens_per_expert)
             self.routing_confidence_sum.add_(routing_confidence_sum)
 
         if self.ep_comm_backend == "deepep":
             routed_output = self._run_deepep_routed_experts(x, selected_experts_indices, top_scores)
+            routed_output = routed_output * self.router.route_scale
+            if self.shared_expert is not None:
+                routed_output = self.shared_expert(x) + routed_output
             return routed_output.reshape(bs, slen, dim)
 
         # top_scores and token_indices_experts_sorted shape (bs*slen*top_k,)
@@ -969,6 +1175,7 @@ class MoE(nn.Module):
             top_scores_experts_sorted,
             token_indices_experts_sorted,
             num_tokens_per_expert,
+            expert_order,
         ) = self.reorderer(top_scores, selected_experts_indices)
 
         routed_output = self._run_routed_experts(
@@ -977,13 +1184,18 @@ class MoE(nn.Module):
             num_tokens_per_expert,
             top_scores_experts_sorted,
         )
+        routed_output = routed_output * self.router.route_scale
         if self.shared_expert is not None:
             out = self.shared_expert(x)
         else:
             out = torch.zeros_like(x)
 
-        routed_indices = token_indices_experts_sorted.reshape(-1, 1).expand(-1, dim)
-        out = out.scatter_add(dim=0, index=routed_indices, src=routed_output)
+        out = combine_expert_outputs(
+            out,
+            routed_output,
+            expert_order,
+            self.router.top_k,
+        )
         out = out.reshape(bs, slen, dim)
         return out
 
@@ -1178,10 +1390,10 @@ class NemotronHRouter(nn.Module):
             # are intentionally skipped here.
             selected_experts_indices = routed_experts
         else:
-            scores_for_choice = scores + self.e_score_correction_bias
+            scores_for_choice = scores + self.e_score_correction_bias.to(torch.float32)
 
             if expert_bias is not None:
-                scores_for_choice = scores_for_choice + expert_bias
+                scores_for_choice = scores_for_choice + expert_bias.to(torch.float32)
 
             # Group-based routing
             if self.n_group > 1:
@@ -1398,12 +1610,25 @@ class LatentMoE(nn.Module):
             _, _, top_k = routed_experts.shape
             routed_experts = routed_experts.reshape(-1, top_k)
 
+        static_expert_bias = getattr(self, "_use_static_expert_bias", False)
+        if static_expert_bias and getattr(self, "_fp32_expert_bias_source_sha256", None) is None:
+            raise RuntimeError("Frozen GLM routing requires an exact source bias hash")
+        if static_expert_bias:
+            expert_bias = _require_static_expert_bias(self)
+        else:
+            expert_bias = self.expert_bias
+        if expert_bias is not None and expert_bias.device != x_flat.device:
+            if static_expert_bias:
+                expert_bias = _move_static_expert_bias(self, x_flat.device)
+            else:
+                expert_bias = expert_bias.to(device=x_flat.device, dtype=torch.float32)
         top_scores, selected_experts_indices, num_tokens_per_expert, routing_confidence_sum = self.router(
-            x_flat, self.expert_bias, routed_experts=routed_experts
+            x_flat, expert_bias, routed_experts=routed_experts
         )
 
         with torch.no_grad():
-            self.tokens_per_expert.add_(num_tokens_per_expert)
+            if self.load_balance_coeff is not None:
+                self.tokens_per_expert.add_(num_tokens_per_expert)
             self.routing_confidence_sum.add_(routing_confidence_sum)
 
         if self.ep_comm_backend == "deepep":
@@ -1414,6 +1639,7 @@ class LatentMoE(nn.Module):
             top_scores_experts_sorted,
             token_indices_experts_sorted,
             num_tokens_per_expert,
+            expert_order,
         ) = self.reorderer(top_scores, selected_experts_indices)
 
         routed_output = self._run_routed_experts(
@@ -1425,8 +1651,12 @@ class LatentMoE(nn.Module):
 
         out = self.shared_expert(x_flat)
 
-        token_indices_full = token_indices_experts_sorted.reshape(-1, 1).expand(-1, dim)
-        out = out.scatter_add(dim=0, index=token_indices_full, src=routed_output)
+        out = combine_expert_outputs(
+            out,
+            routed_output,
+            expert_order,
+            self.router.top_k,
+        )
         out = out.reshape(bs, slen, dim)
         return out
 

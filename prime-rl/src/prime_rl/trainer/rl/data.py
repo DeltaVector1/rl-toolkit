@@ -1,5 +1,11 @@
-from collections.abc import Callable, Sequence
+# ruff: noqa: F722, F821
+
+import base64
+import binascii
+import hashlib
 import json
+import os
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TypedDict
 
@@ -7,7 +13,7 @@ import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
-from prime_rl.configs.trainer import FakeDataLoaderConfig
+from prime_rl.configs.trainer import FakeDataLoaderConfig, RolloutCacheConfig
 from prime_rl.trainer.rl.packer import BasePacker, setup_packer
 from prime_rl.trainer.runs import get_multi_run_manager
 from prime_rl.trainer.world import get_world
@@ -17,6 +23,82 @@ from prime_rl.transport import (
     TransportConfig,
     setup_micro_batch_receiver,
 )
+
+
+_REFERENCE_ROUTE_FIELDS = {
+    "schema_version",
+    "encoding",
+    "dtype",
+    "shape",
+    "dense_layers",
+    "experts",
+    "sha256",
+    "data",
+}
+_MAX_REFERENCE_ROUTE_BYTES = 512 * 1024 * 1024
+
+
+def _decode_reference_routed_experts(value: object, token_count: int) -> Tensor:
+    if not isinstance(value, dict) or set(value) != _REFERENCE_ROUTE_FIELDS:
+        raise ValueError("fake reference routed experts have an invalid schema")
+    shape = value["shape"]
+    valid_shape = (
+        isinstance(shape, list)
+        and len(shape) == 3
+        and all(
+            not isinstance(item, bool) and isinstance(item, int) and item > 0
+            for item in shape
+        )
+        and shape[0] == token_count
+    )
+    if (
+        value["schema_version"] != 1
+        or value["encoding"] != "base64"
+        or value["dtype"] != "uint8"
+        or not valid_shape
+    ):
+        raise ValueError("fake reference routed experts have invalid metadata")
+    dense_layers = value["dense_layers"]
+    experts = value["experts"]
+    if (
+        isinstance(dense_layers, bool)
+        or not isinstance(dense_layers, int)
+        or not 0 <= dense_layers < shape[1]
+        or isinstance(experts, bool)
+        or not isinstance(experts, int)
+        or not 1 <= experts <= 256
+    ):
+        raise ValueError("fake reference routed experts have invalid model limits")
+    expected_bytes = shape[0] * shape[1] * shape[2]
+    encoded = value["data"]
+    digest = value["sha256"]
+    expected_encoded_length = 4 * ((expected_bytes + 2) // 3)
+    if (
+        expected_bytes > _MAX_REFERENCE_ROUTE_BYTES
+        or not isinstance(encoded, str)
+        or len(encoded) != expected_encoded_length
+        or not isinstance(digest, str)
+        or len(digest) != 64
+    ):
+        raise ValueError("fake reference routed experts have invalid size or checksum")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise ValueError("fake reference routed experts are not valid base64") from error
+    if len(raw) != expected_bytes or hashlib.sha256(raw).hexdigest() != digest:
+        raise ValueError("fake reference routed experts do not match their checksum")
+    routed = torch.frombuffer(bytearray(raw), dtype=torch.uint8).reshape(shape)
+    dense = routed[:, :dense_layers, :]
+    if dense.numel() and torch.count_nonzero(dense):
+        raise ValueError("fake reference dense-layer router IDs must be zero")
+    sparse = routed[:, dense_layers:, :]
+    if sparse.numel() and (
+        int(sparse.max()) >= experts
+        or not torch.count_nonzero(sparse)
+        or torch.any(torch.diff(torch.sort(sparse, dim=-1).values, dim=-1) == 0)
+    ):
+        raise ValueError("fake reference sparse router IDs are invalid")
+    return routed
 
 
 class TensorMicroBatch(TypedDict):
@@ -75,10 +157,19 @@ class FakeDataLoader:
         self.dp_rank = dp_rank
 
         self.batch_size = config.batch_size
+        if self.batch_size % self.dp_world_size:
+            raise ValueError(
+                f"fake batch_size={self.batch_size} is not divisible by "
+                f"dp_world_size={self.dp_world_size}"
+            )
         self.num_micro_batches = self.batch_size // self.dp_world_size
         self.seq_len = seq_len
         self.generate_samples = config.generate_samples
         self.ce_only = config.ce_only
+        self.samples_per_micro_batch = getattr(
+            config, "samples_per_micro_batch", None
+        )
+        self.group_size = getattr(config, "group_size", None)
         reference_payload = (
             json.loads(config.reference_path.read_text())
             if config.reference_path is not None
@@ -116,6 +207,12 @@ class FakeDataLoader:
                 raise ValueError("fake reference advantages do not align with its tokens")
             if sum(reference["sequence_lengths"]) != token_count:
                 raise ValueError("fake reference sequence lengths do not cover its tokens")
+            routed_reference = reference.get("routed_experts")
+            reference["_routed_experts_tensor"] = (
+                _decode_reference_routed_experts(routed_reference, token_count)
+                if routed_reference is not None
+                else None
+            )
         self.batch_counter = 0
         self.multi_run_manager = get_multi_run_manager()
 
@@ -157,8 +254,6 @@ class FakeDataLoader:
         )
         offset = 0
         for length in sequence_lengths:
-            # A sequence has no preceding token in its own attention block.
-            # Keep this false even when a supplied rollout mask is malformed.
             loss_mask[offset] = False
             offset += length
         reference_advantages = reference.get("advantages")
@@ -183,7 +278,11 @@ class FakeDataLoader:
             "loss_mask": loss_mask.unsqueeze(0),
             "lora_num_tokens": lora_num_tokens,
             "seq_lens": torch.tensor(sequence_lengths, dtype=torch.long),
-            "routed_experts": None,
+            "routed_experts": (
+                reference["_routed_experts_tensor"].unsqueeze(0)
+                if reference["_routed_experts_tensor"] is not None
+                else None
+            ),
             "mm_kwargs": None,
             "mm_token_type_ids": None,
             "rl_weights": None,
@@ -199,13 +298,31 @@ class FakeDataLoader:
         position_ids = []
         sequence_lengths = []
 
-        while total_seq_len < self.seq_len:
-            # Generate reasonably long documents
-            seq_len_to_generate = torch.randint(1, self.seq_len // 8, (1,), generator=generator).item()
-            if seq_len_to_generate + total_seq_len > self.seq_len:
-                seq_len_to_generate = self.seq_len - total_seq_len
-            total_seq_len += seq_len_to_generate
-            sequence_lengths.append(seq_len_to_generate)
+        if self.samples_per_micro_batch is None:
+            while total_seq_len < self.seq_len:
+                seq_len_to_generate = torch.randint(
+                    1, self.seq_len // 8, (1,), generator=generator
+                ).item()
+                if seq_len_to_generate + total_seq_len > self.seq_len:
+                    seq_len_to_generate = self.seq_len - total_seq_len
+                total_seq_len += seq_len_to_generate
+                sequence_lengths.append(seq_len_to_generate)
+        else:
+            if self.samples_per_micro_batch > self.seq_len:
+                raise ValueError(
+                    "samples_per_micro_batch cannot exceed the token count"
+                )
+            weights = torch.rand(
+                self.samples_per_micro_batch, generator=generator
+            ).add_(0.5)
+            available = self.seq_len - self.samples_per_micro_batch
+            lengths = torch.floor(weights / weights.sum() * available).to(torch.long)
+            lengths.add_(1)
+            remainder = self.seq_len - int(lengths.sum())
+            lengths[:remainder].add_(1)
+            sequence_lengths = lengths.tolist()
+
+        for seq_len_to_generate in sequence_lengths:
             tmp_input_ids = torch.randint(0, 120000, (seq_len_to_generate,), generator=generator).long()
             tmp_position_ids = torch.arange(seq_len_to_generate).long()
 
@@ -215,7 +332,21 @@ class FakeDataLoader:
         input_ids = torch.cat(input_ids, dim=0)
         position_ids = torch.cat(position_ids, dim=0)
         loss_mask = torch.ones(input_ids.shape[0], dtype=torch.bool)
-        advantages = torch.randn(input_ids.shape[0], generator=generator)
+        if self.group_size is None:
+            advantages = torch.randn(input_ids.shape[0], generator=generator)
+        else:
+            rewards = torch.randn(len(sequence_lengths), generator=generator)
+            sample_advantages = []
+            for offset in range(0, len(sequence_lengths), self.group_size):
+                group = rewards[offset : offset + self.group_size]
+                group = group - group.mean()
+                sample_advantages.append(
+                    group / group.std(unbiased=False).clamp_min(1e-6)
+                )
+            advantages = torch.repeat_interleave(
+                torch.cat(sample_advantages),
+                torch.tensor(sequence_lengths, dtype=torch.long),
+            )
         inference_logprobs = torch.randn(input_ids.shape[0], generator=generator)
         lora_num_tokens = torch.zeros(self.multi_run_manager.max_runs, dtype=torch.int32)
         lora_num_tokens[0] = input_ids.shape[0]
@@ -386,6 +517,209 @@ class DataLoader:
             run_id=micro_batch.run_id,
             run_step=micro_batch.run_step,
         )
+
+
+def _copy_cached_value(value):
+    if isinstance(value, torch.Tensor):
+        return value.clone()
+    if isinstance(value, dict):
+        return {key: _copy_cached_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_copy_cached_value(item) for item in value]
+    return value
+
+
+_TOKEN_FIELDS = (
+    "input_ids",
+    "position_ids",
+    "advantages",
+    "inference_logprobs",
+    "ref_logprobs",
+    "loss_mask",
+    "temperatures",
+    "mm_token_type_ids",
+    "routed_experts",
+    "rl_weights",
+    "ce_weights",
+    "ref_kl_weights",
+)
+
+
+def _combine_cached_batches(
+    first: TensorMicroBatch,
+    second: TensorMicroBatch,
+) -> TensorMicroBatch:
+    if first["input_ids"].shape[0] != 1 or second["input_ids"].shape[0] != 1:
+        raise ValueError("cached rollout replay only combines single-row packed batches")
+    if first["mm_kwargs"] is not None or second["mm_kwargs"] is not None:
+        raise ValueError("cached rollout replay cannot combine multimodal batches")
+    if first["run_id"] != second["run_id"] or first["run_step"] != second["run_step"]:
+        raise ValueError("cached rollout replay cannot combine different runs or policy steps")
+
+    combined = _copy_cached_value(first)
+    for name in _TOKEN_FIELDS:
+        left = first[name]
+        right = second[name]
+        if (left is None) != (right is None):
+            raise ValueError(f"cached rollout field {name} is present in only one batch")
+        combined[name] = None if left is None else torch.cat((left, right), dim=1)
+    combined["env_names"] = first["env_names"] + second["env_names"]
+    combined["sequence_lengths"] = first["sequence_lengths"] + second["sequence_lengths"]
+    combined["lora_num_tokens"] = first["lora_num_tokens"] + second["lora_num_tokens"]
+    combined["seq_lens"] = torch.cat((first["seq_lens"], second["seq_lens"]))
+    return combined
+
+
+def _combine_partial_cached_batches(
+    batches: list[TensorMicroBatch],
+    maximum_tokens: int,
+) -> list[TensorMicroBatch]:
+    combined = []
+    current = None
+    for batch in batches:
+        tokens = batch["input_ids"].shape[1]
+        if tokens > maximum_tokens:
+            raise ValueError(
+                f"cached rollout batch has {tokens} tokens; maximum is {maximum_tokens}"
+            )
+        if current is None:
+            current = batch
+            continue
+        if current["input_ids"].shape[1] + tokens <= maximum_tokens:
+            current = _combine_cached_batches(current, batch)
+        else:
+            combined.append(current)
+            current = batch
+    if current is not None:
+        combined.append(current)
+    return combined
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+class RolloutCacheDataLoader:
+    """Record one real batch or replay it without rollout services."""
+
+    format_version = 1
+
+    def __init__(
+        self,
+        config: RolloutCacheConfig,
+        source: DataLoader | None,
+        seq_len: int,
+        dp_world_size: int,
+        dp_rank: int,
+        cp_size: int,
+    ) -> None:
+        self.config = config
+        self.source = source
+        self.seq_len = seq_len
+        self.dp_world_size = dp_world_size
+        self.dp_rank = dp_rank
+        self.cp_size = cp_size
+        self.world = get_world()
+        source_rank = self.world.rank
+        if config.recorded_cp_size is not None:
+            if config.recorded_cp_size != dp_world_size * cp_size:
+                raise ValueError(
+                    "recorded_cp_size must equal the replay data-parallel size "
+                    "times the replay context-parallel size"
+                )
+            source_rank = (
+                self.world.rank // config.recorded_cp_size * config.recorded_cp_size
+                + self.world.rank % cp_size
+            )
+        self.source_rank = source_rank
+        self.path = config.directory / f"rank-{source_rank}.pt"
+        self.digest_path = config.directory / f"rank-{source_rank}.sha256"
+        self.cached_batch = None
+        self.recorded = False
+
+        if config.mode == "record":
+            if source is None:
+                raise ValueError("rollout cache record mode requires the real data loader")
+            config.directory.mkdir(parents=True, exist_ok=True)
+        else:
+            if source is not None:
+                raise ValueError("rollout cache replay mode cannot use the real data loader")
+            self.cached_batch = self._load()
+
+    def wait_for_batch(self) -> None:
+        if self.source is not None:
+            self.source.wait_for_batch()
+
+    def get_batch(self) -> list[TensorMicroBatch]:
+        if self.config.mode == "record":
+            if self.recorded:
+                raise RuntimeError("rollout cache record mode accepts one batch only")
+            batch = self.source.get_batch()
+            self._save(batch)
+            self.recorded = True
+            return batch
+        batches = [
+            micro_batch
+            for _ in range(self.config.repeats)
+            for micro_batch in _copy_cached_value(self.cached_batch)
+        ]
+        if self.config.combine_partial_batches:
+            return _combine_partial_cached_batches(batches, self.seq_len)
+        return batches
+
+    def _metadata(self) -> dict:
+        return {
+            "format_version": self.format_version,
+            "policy_id": self.config.policy_id,
+            "rank": self.world.rank,
+            "world_size": self.world.world_size,
+            "dp_world_size": self.dp_world_size,
+            "dp_rank": self.dp_rank,
+            "seq_len": self.seq_len,
+            "cp_size": self.cp_size,
+        }
+
+    def _save(self, batch: list[TensorMicroBatch]) -> None:
+        payload = {"metadata": self._metadata(), "micro_batches": batch}
+        temporary = self.path.with_suffix(".tmp")
+        torch.save(payload, temporary)
+        digest = _sha256_file(temporary)
+        os.replace(temporary, self.path)
+        digest_temporary = self.digest_path.with_suffix(".tmp")
+        digest_temporary.write_text(f"{digest}\n")
+        os.replace(digest_temporary, self.digest_path)
+
+    def _load(self) -> list[TensorMicroBatch]:
+        if not self.path.is_file() or not self.digest_path.is_file():
+            raise FileNotFoundError(
+                f"rollout cache is incomplete for trainer rank {self.world.rank}: {self.path}"
+            )
+        expected_digest = self.digest_path.read_text().strip()
+        actual_digest = _sha256_file(self.path)
+        if actual_digest != expected_digest:
+            raise ValueError(f"rollout cache digest does not match for {self.path}")
+        payload = torch.load(self.path, map_location="cpu", weights_only=False)
+        expected_metadata = self._metadata()
+        if self.config.recorded_cp_size is not None:
+            expected_metadata.update(
+                rank=self.source_rank,
+                dp_world_size=1,
+                dp_rank=0,
+                cp_size=self.config.recorded_cp_size,
+            )
+        if payload.get("metadata") != expected_metadata:
+            raise ValueError(
+                "rollout cache metadata does not match this trainer: "
+                f"expected={expected_metadata}, found={payload.get('metadata')}"
+            )
+        batch = payload.get("micro_batches")
+        if not isinstance(batch, list) or not batch:
+            raise ValueError(f"rollout cache contains no micro-batches: {self.path}")
+        return batch
 
 
 def _torch_dtype(name: str) -> torch.dtype:

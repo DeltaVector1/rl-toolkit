@@ -3,9 +3,13 @@ import prime_rl._compat  # noqa: F401 — patch ring_flash_attn compat before im
 from contextlib import nullcontext
 import hashlib
 import json
+import math
 import os
+from pathlib import Path
+import re
+import subprocess
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 # Import environment before any other imports
 # ruff: noqa: I001
@@ -22,13 +26,14 @@ from prime_rl.trainer.multi_ckpt import setup_multi_checkpoint_manager
 from prime_rl.trainer.optim import setup_optimizer, setup_multi_optimizer
 from prime_rl.trainer.scheduler import setup_scheduler, setup_multi_scheduler
 from prime_rl.configs.trainer import TrainerConfig
-from prime_rl.trainer.rl.data import DataLoader, FakeDataLoader
+from prime_rl.trainer.rl.data import DataLoader, FakeDataLoader, RolloutCacheDataLoader
 from prime_rl.utils.cp import (
     gather_for_cp,
     gather_for_cp_wo_grad,
     setup_cp_params,
     shard_for_cp,
 )
+from prime_rl.utils.checkpoint_delta import sha256_file
 from prime_rl.utils.logger import format_time, setup_logger
 from prime_rl.trainer.rl.loss import (
     compute_entropy,
@@ -40,6 +45,11 @@ from prime_rl.trainer.rl.loss import (
     shift_tensor_right,
 )
 from prime_rl.trainer.rl.token_export import setup_token_exporter
+from prime_rl.parity_router_trace import (
+    prepare_trainer_bundle_communication,
+    publish_trainer_bundle,
+    trace_dir_env,
+)
 from prime_rl.trainer.model import (
     DTYPE_MAP,
     forward,
@@ -47,6 +57,10 @@ from prime_rl.trainer.model import (
     setup_model,
     is_tt_moe_model,
     get_load_balance_stats,
+    preserve_glm_moe_bias_precision,
+    cache_glm_moe_bias_values,
+    restore_glm_moe_bias_values,
+    validate_glm_moe_bias_values,
 )
 from prime_rl.trainer.parallel_dims import get_parallel_dims, resolve_ep
 from prime_rl.trainer.perf import get_perf_counter
@@ -74,9 +88,63 @@ from prime_rl.utils.metrics_server import HealthServer, MetricsServer, RunStats
 from prime_rl.utils.monitor import setup_monitor
 from prime_rl.utils.config import cli
 from prime_rl.utils.process import set_proc_title
-from prime_rl.utils.utils import clean_exit, resolve_latest_ckpt_step, to_col_format
-from prime_rl.trainer.models.layers.hf_ring_attn import substitute_hf_flash_attn
+from prime_rl.utils.utils import (
+    clean_exit,
+    get_broadcast_dir,
+    get_step_path,
+    resolve_latest_ckpt_step,
+    to_col_format,
+)
+from ring_flash_attn import substitute_hf_flash_attn
 from torchtitan.distributed.utils import clip_grad_norm_
+
+
+def _parse_cpu_list(value: str) -> set[int]:
+    cpus = set()
+    for part in value.strip().split(","):
+        start, separator, end = part.partition("-")
+        if not start:
+            raise ValueError(f"invalid CPU list {value!r}")
+        first = int(start)
+        last = int(end) if separator else first
+        if last < first:
+            raise ValueError(f"invalid CPU range {part!r}")
+        cpus.update(range(first, last + 1))
+    if not cpus:
+        raise ValueError("CPU list is empty")
+    return cpus
+
+
+def bind_worker_to_gpu_numa_node() -> tuple[int, int] | None:
+    """Bind one trainer worker and its communication threads near its GPU."""
+    if os.environ.get("PRIME_BIND_GPU_NUMA", "0") != "1":
+        return None
+    local_rank = int(os.environ["LOCAL_RANK"])
+    result = subprocess.run(
+        ["nvidia-smi", "--query-gpu=pci.bus_id", "--format=csv,noheader"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    bus_ids = [line.strip().lower() for line in result.stdout.splitlines() if line.strip()]
+    if local_rank >= len(bus_ids):
+        raise RuntimeError(
+            f"local rank {local_rank} has no GPU PCI address in {bus_ids}"
+        )
+    pci_address = bus_ids[local_rank][-12:]
+    node_path = Path("/sys/bus/pci/devices") / pci_address / "numa_node"
+    try:
+        numa_node = int(node_path.read_text().strip())
+    except (FileNotFoundError, ValueError) as error:
+        raise RuntimeError(
+            f"cannot read NUMA node for local GPU {local_rank} at {node_path}"
+        ) from error
+    if numa_node < 0:
+        raise RuntimeError(f"local GPU {local_rank} has no NUMA node")
+    cpu_path = Path(f"/sys/devices/system/node/node{numa_node}/cpulist")
+    cpus = _parse_cpu_list(cpu_path.read_text())
+    os.sched_setaffinity(0, cpus)
+    return numa_node, len(cpus)
 
 
 def move_micro_batch_to_cuda(micro_batch) -> None:
@@ -178,7 +246,9 @@ def verify_pipeline_batch_identity(micro_batches, pp_group) -> None:
             digest.update(str(tensor.dtype).encode())
             digest.update(bytes(tensor.numpy().data))
         digest.update(json.dumps(micro_batch["sequence_lengths"]).encode())
-        digests.append(int.from_bytes(digest.digest()[:8], "little") & ((1 << 63) - 1))
+        digests.append(
+            int.from_bytes(digest.digest()[:8], "little") & ((1 << 63) - 1)
+        )
     local = torch.tensor(digests, dtype=torch.int64, device="cuda")
     minimum = local.clone()
     maximum = local.clone()
@@ -192,27 +262,6 @@ def verify_pipeline_batch_identity(micro_batches, pp_group) -> None:
         )
 
 
-def register_fake_lora_run(multi_run_manager, lora_config) -> None:
-    """Create adapter slot zero without an orchestrator in fake-data mode.
-
-    The normal LoRA optimizer waits until MultiRunManager discovers an
-    orchestrator run because discovery resets the adapter. A trainer-only
-    qualification deliberately has no orchestrator. Register the one local
-    adapter directly after model construction, when every LoRA module has
-    already attached itself to the manager.
-    """
-    if multi_run_manager.used_idxs:
-        raise RuntimeError("fake-data LoRA qualification found an unexpected RL run")
-    run_id = "fake_qualification"
-    idx = 0
-    multi_run_manager.idx_2_id[idx] = run_id
-    multi_run_manager.id_2_idx[run_id] = idx
-    multi_run_manager.unused_idxs.remove(idx)
-    multi_run_manager.progress[idx] = Progress()
-    multi_run_manager.scaling_factors[idx] = lora_config.alpha / lora_config.rank
-    multi_run_manager.reset_run_parameters(idx)
-
-
 def initialize_fresh_lora_policy(
     multi_run_manager, lora_config, device: torch.device | str
 ) -> tuple[int, int]:
@@ -221,7 +270,7 @@ def initialize_fresh_lora_policy(
     fresh_b = [
         (name, parameter)
         for name, parameter in fresh_parameters
-        if ".lora_B" in name
+        if "lora_B" in name
     ]
     if not fresh_b:
         raise RuntimeError("fresh LoRA policy has no B matrices")
@@ -278,27 +327,29 @@ def initialize_fresh_lora_policy(
 
 
 def parity_guard_failures(tensor_stats: dict, guard) -> list[str]:
-    """Return measured parity violations. Missing required evidence fails closed."""
+    """Return parity violations. Missing or nonfinite evidence fails closed."""
     failures = []
     unmasked = tensor_stats.get("unmasked_mismatch_kl/mean")
     masked = tensor_stats.get("masked_mismatch_kl/mean")
     masked_fraction = tensor_stats.get("is_masked/mean")
-    if unmasked is None:
-        failures.append("unmasked mismatch KL is missing")
+
+    if unmasked is None or not math.isfinite(unmasked):
+        failures.append("unmasked mismatch KL is missing or nonfinite")
     elif unmasked > guard.max_unmasked_mismatch_kl:
         failures.append(
             f"unmasked mismatch KL {unmasked:.6f} > {guard.max_unmasked_mismatch_kl:.6f}"
         )
-    if masked_fraction is None:
-        failures.append("masked token fraction is missing")
+
+    if masked_fraction is None or not math.isfinite(masked_fraction):
+        failures.append("masked token fraction is missing or nonfinite")
     else:
         if masked_fraction > guard.max_masked_fraction:
             failures.append(
                 f"masked token fraction {masked_fraction:.6f} > {guard.max_masked_fraction:.6f}"
             )
         if masked_fraction > 0:
-            if masked is None:
-                failures.append("masked mismatch KL is missing")
+            if masked is None or not math.isfinite(masked):
+                failures.append("masked mismatch KL is missing or nonfinite")
             elif masked > guard.max_masked_mismatch_kl:
                 failures.append(
                     f"masked mismatch KL {masked:.6f} > {guard.max_masked_mismatch_kl:.6f}"
@@ -306,15 +357,436 @@ def parity_guard_failures(tensor_stats: dict, guard) -> list[str]:
     return failures
 
 
+_qualification_environment_names = (
+    "PRIME_QUALIFICATION_SESSION_ID",
+    "PRIME_QUALIFICATION_PROFILE",
+    "PRIME_QUALIFICATION_CONFIG_SHA256",
+    "PRIME_QUALIFICATION_SOURCE_SHA256",
+    "PRIME_QUALIFICATION_SESSION_SHA256",
+    "PRIME_QUALIFICATION_RUNTIME_SOURCE_SHA256",
+    "PRIME_QUALIFICATION_LAUNCHER_SHA256",
+    "PRIME_TRAINER_IMAGE_DIGEST",
+    "PRIME_TRAINER_HOST",
+    "PRIME_TRAINER_HEAD",
+)
+
+
+def _qualification_environment() -> dict[str, str] | None:
+    values = {name: os.environ.get(name, "") for name in _qualification_environment_names}
+    qualification_names = [
+        name
+        for name in _qualification_environment_names
+        if name.startswith("PRIME_QUALIFICATION_")
+    ]
+    if not any(values[name] for name in qualification_names):
+        return None
+    if not all(values.values()):
+        raise RuntimeError("qualification identity is incomplete")
+    if not re.fullmatch(r"[0-9a-f]{32}", values["PRIME_QUALIFICATION_SESSION_ID"]):
+        raise RuntimeError("qualification session ID is invalid")
+    if not re.fullmatch(
+        r"glm52-native-(?:b2048|stability20)",
+        values["PRIME_QUALIFICATION_PROFILE"],
+    ):
+        raise RuntimeError("qualification profile is invalid")
+    for name in (
+        "PRIME_QUALIFICATION_CONFIG_SHA256",
+        "PRIME_QUALIFICATION_SOURCE_SHA256",
+        "PRIME_QUALIFICATION_SESSION_SHA256",
+        "PRIME_QUALIFICATION_RUNTIME_SOURCE_SHA256",
+        "PRIME_QUALIFICATION_LAUNCHER_SHA256",
+    ):
+        if not re.fullmatch(r"[0-9a-f]{64}", values[name]):
+            raise RuntimeError(f"{name} is invalid")
+    if not re.fullmatch(
+        r"sha256:[0-9a-f]{64}", values["PRIME_TRAINER_IMAGE_DIGEST"]
+    ):
+        raise RuntimeError("trainer image digest is invalid")
+    for name in ("PRIME_TRAINER_HOST", "PRIME_TRAINER_HEAD"):
+        if not re.fullmatch(r"n[0-9]+", values[name]):
+            raise RuntimeError(f"{name} is invalid")
+    return values
+
+
+def _qualification_runtime_records(
+    identity: dict[str, str], world, session: dict
+) -> list[dict]:
+    local = {
+        "global_rank": world.rank,
+        "local_rank": world.local_rank,
+        "host": identity["PRIME_TRAINER_HOST"],
+        "image_digest": identity["PRIME_TRAINER_IMAGE_DIGEST"],
+        "source_sha256": identity["PRIME_QUALIFICATION_RUNTIME_SOURCE_SHA256"],
+        "launcher_sha256": identity["PRIME_QUALIFICATION_LAUNCHER_SHA256"],
+    }
+    payload = json.dumps(local, sort_keys=True, separators=(",", ":")).encode()
+    if len(payload) > 1024:
+        raise RuntimeError("qualification runtime identity is too large")
+    encoded = torch.zeros(1024, dtype=torch.uint8, device="cuda")
+    encoded[: len(payload)] = torch.tensor(list(payload), dtype=torch.uint8, device="cuda")
+    gathered = [torch.empty_like(encoded) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered, encoded)
+    failed = torch.zeros((), dtype=torch.int32, device="cuda")
+    records = []
+    if world.is_master:
+        try:
+            for value in gathered:
+                raw = bytes(value.cpu().tolist()).split(b"\0", 1)[0]
+                records.append(json.loads(raw))
+            hosts = session["trainer_hosts"]
+            images = session["image_digests"]
+            source_sha256 = session["source_sha256"]
+            launcher_sha256 = session["source_files"]["scripts/china/cluster.sh"]
+            if len(records) != 64 or len(hosts) != 8:
+                raise RuntimeError("qualification runtime identity count differs")
+            for rank, record in enumerate(records):
+                expected_host = hosts[rank // 8]
+                if (
+                    record.get("global_rank") != rank
+                    or record.get("local_rank") != rank % 8
+                    or record.get("host") != expected_host
+                    or record.get("image_digest") != images.get(expected_host)
+                    or record.get("source_sha256") != source_sha256
+                    or record.get("launcher_sha256") != launcher_sha256
+                ):
+                    raise RuntimeError(
+                        f"qualification runtime identity differs at rank {rank}"
+                    )
+        except Exception:
+            failed.fill_(1)
+    dist.broadcast(failed, src=0)
+    if failed.item():
+        raise RuntimeError("qualification runtime identity validation failed")
+    return records
+
+
+def _qualification_batch_sha256(micro_batches: list[dict]) -> str:
+    digest = hashlib.sha256()
+    for index, micro_batch in enumerate(micro_batches):
+        input_ids = micro_batch["input_ids"].detach().cpu().contiguous()
+        lengths = micro_batch["sequence_lengths"]
+        digest.update(index.to_bytes(4, "little"))
+        digest.update(str(input_ids.dtype).encode())
+        digest.update(json.dumps(list(input_ids.shape), separators=(",", ":")).encode())
+        digest.update(input_ids.numpy().tobytes())
+        digest.update(json.dumps(lengths, separators=(",", ":")).encode())
+    return digest.hexdigest()
+
+
+def _verify_qualification_batch_sha256(value: str) -> None:
+    encoded = torch.tensor(list(bytes.fromhex(value)), dtype=torch.uint8, device="cuda")
+    gathered = [torch.empty_like(encoded) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered, encoded)
+    if any(not torch.equal(item, encoded) for item in gathered):
+        raise RuntimeError("qualification input differs between ranks")
+
+
+def _qualification_step_records(
+    history: list[dict], max_steps: int, input_sha256: dict[int, str]
+) -> list[dict]:
+    keys = (
+        "data/rollout_rows",
+        "loss/mean",
+        "optim/grad_norm",
+        "optim/lr",
+        "perf/peak_memory",
+        "time/forward_backward",
+    )
+    merged = {step: {"step": step} for step in range(1, max_steps + 1)}
+    for record in history:
+        step = record.get("step") if isinstance(record, dict) else None
+        if step not in merged:
+            continue
+        for key in keys:
+            if key not in record:
+                continue
+            value = record[key]
+            if isinstance(value, torch.Tensor):
+                if value.numel() != 1:
+                    raise RuntimeError(f"qualification metric {key} is not scalar")
+                value = value.item()
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise RuntimeError(f"qualification metric {key} is not numeric")
+            value = float(value)
+            previous = merged[step].get(key)
+            if previous is not None and previous != value:
+                raise RuntimeError(f"qualification metric {key} conflicts at step {step}")
+            merged[step][key] = value
+    for step, record in merged.items():
+        missing = set(keys) - set(record)
+        if missing:
+            raise RuntimeError(
+                f"qualification step {step} is missing metrics: {sorted(missing)}"
+            )
+        if not all(math.isfinite(record[key]) for key in keys):
+            raise RuntimeError(f"qualification step {step} has a nonfinite metric")
+        digest = input_sha256.get(step)
+        if digest is None or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise RuntimeError(f"qualification step {step} input checksum is missing")
+        record["input_sha256"] = digest
+        if step > 1 and digest == input_sha256.get(step - 1):
+            raise RuntimeError(f"qualification step {step} reused the previous input")
+    return list(merged.values())
+
+
+def _write_atomic_json(path: Path, value: dict, session_id: str) -> None:
+    payload = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    temporary = path.parent / f".{path.name}-{session_id}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(temporary, flags, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb", closefd=False) as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+    finally:
+        os.close(descriptor)
+    os.replace(temporary, path)
+    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def _validate_resume_adapter_inventory(
+    adapter_shapes: dict[str, tuple[int, ...]],
+    expected_by_rank: list[dict[str, tuple[int, ...]]],
+) -> None:
+    expected: dict[str, tuple[int, ...]] = {}
+    conflicts: list[str] = []
+    for rank_expected in expected_by_rank:
+        for key, shape in rank_expected.items():
+            previous = expected.setdefault(key, shape)
+            if previous != shape:
+                conflicts.append(key)
+    missing = sorted(set(expected) - set(adapter_shapes))
+    unexpected = sorted(set(adapter_shapes) - set(expected))
+    mismatched = sorted(
+        key
+        for key in set(expected) & set(adapter_shapes)
+        if expected[key] != adapter_shapes[key]
+    )
+    if conflicts or missing or unexpected or mismatched:
+        raise ValueError(
+            "Resume adapter inventory differs from the complete distributed LoRA model: "
+            f"conflicts={conflicts[:5]} ({len(conflicts)} total), "
+            f"missing={missing[:5]} ({len(missing)} total), "
+            f"unexpected={unexpected[:5]} ({len(unexpected)} total), "
+            f"shape_mismatch={mismatched[:5]} ({len(mismatched)} total)"
+        )
+
+
+def _load_qualification_session(
+    config: TrainerConfig, identity: dict[str, str]
+) -> dict:
+    session_path = config.output_dir / "qualification-session.json"
+    session_bytes = session_path.read_bytes()
+    if hashlib.sha256(session_bytes).hexdigest() != identity[
+        "PRIME_QUALIFICATION_SESSION_SHA256"
+    ]:
+        raise RuntimeError("qualification session file checksum differs")
+    session = json.loads(session_bytes)
+    if (
+        session.get("session_id") != identity["PRIME_QUALIFICATION_SESSION_ID"]
+        or session.get("profile") != identity["PRIME_QUALIFICATION_PROFILE"]
+        or session.get("config_sha256")
+        != identity["PRIME_QUALIFICATION_CONFIG_SHA256"]
+        or session.get("source_sha256")
+        != identity["PRIME_QUALIFICATION_SOURCE_SHA256"]
+    ):
+        raise RuntimeError("qualification session file identity differs")
+    return session
+
+
+def _write_qualification_result(
+    config: TrainerConfig,
+    parallel_dims,
+    monitor,
+    progress: Progress,
+    identity: dict[str, str],
+    runtime_records: list[dict],
+    input_sha256: dict[int, str],
+    adapter_path: Path | None,
+) -> None:
+    _load_qualification_session(config, identity)
+    if config.max_steps is None or progress.step != config.max_steps:
+        raise RuntimeError("qualification did not finish its exact step count")
+    records = _qualification_step_records(
+        monitor.history, config.max_steps, input_sha256
+    )
+    metrics_path = config.output_dir / config.file_monitor.filename
+    adapter = None
+    if config.data.fake.export_final_adapter:
+        expected_adapter_path = (
+            config.output_dir
+            / "run_trainer_only"
+            / "broadcasts"
+            / f"step_{progress.step}"
+            / "adapter_model.safetensors"
+        )
+        if adapter_path != expected_adapter_path:
+            raise RuntimeError("qualification final adapter path differs")
+        if adapter_path is None or not adapter_path.is_file():
+            raise RuntimeError("qualification final adapter is missing")
+        stable = adapter_path.parent / "STABLE"
+        adapter_config = adapter_path.parent / "adapter_config.json"
+        digest_path = adapter_path.parent / "adapter_model.safetensors.sha256"
+        if (
+            not stable.is_file()
+            or not adapter_config.is_file()
+            or not digest_path.is_file()
+        ):
+            raise RuntimeError("qualification final adapter is incomplete")
+        adapter_sha256 = sha256_file(adapter_path)
+        checksum_value = digest_path.read_text()
+        if checksum_value != f"{adapter_sha256}\n":
+            raise RuntimeError("qualification final adapter checksum file differs")
+        adapter_config_value = json.loads(adapter_config.read_bytes())
+        expected_targets = {
+            "q_a_proj",
+            "q_b_proj",
+            "kv_a_proj_with_mqa",
+            "kv_b_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+            "shared_expert",
+            "experts",
+        }
+        adapter_targets = adapter_config_value.get("target_modules")
+        if (
+            isinstance(adapter_config_value.get("r"), bool)
+            or adapter_config_value.get("r") != 32
+            or isinstance(adapter_config_value.get("lora_alpha"), bool)
+            or adapter_config_value.get("lora_alpha") != 64
+            or isinstance(adapter_config_value.get("lora_dropout"), bool)
+            or adapter_config_value.get("lora_dropout") != 0.0
+            or not isinstance(adapter_targets, list)
+            or any(not isinstance(target, str) for target in adapter_targets)
+            or len(adapter_targets) != len(expected_targets)
+            or set(adapter_targets) != expected_targets
+        ):
+            raise RuntimeError("qualification final adapter configuration differs")
+        adapter = {
+            "path": str(adapter_path),
+            "sha256": adapter_sha256,
+            "size": adapter_path.stat().st_size,
+            "step": progress.step,
+            "config_path": str(adapter_config),
+            "config_sha256": sha256_file(adapter_config),
+            "stable_path": str(stable),
+            "stable_sha256": sha256_file(stable),
+            "checksum_path": str(digest_path),
+            "checksum_sha256": sha256_file(digest_path),
+            "checksum_value": checksum_value.rstrip("\n"),
+            "config": adapter_config_value,
+        }
+    fake = config.data.fake
+    result = {
+        "schema_version": 1,
+        "kind": "glm52_trainer_qualification",
+        "session_id": identity["PRIME_QUALIFICATION_SESSION_ID"],
+        "profile": identity["PRIME_QUALIFICATION_PROFILE"],
+        "session_sha256": identity["PRIME_QUALIFICATION_SESSION_SHA256"],
+        "config_sha256": identity["PRIME_QUALIFICATION_CONFIG_SHA256"],
+        "source_sha256": identity["PRIME_QUALIFICATION_SOURCE_SHA256"],
+        "trainer_head": identity["PRIME_TRAINER_HEAD"],
+        "trainer_head_image_digest": identity["PRIME_TRAINER_IMAGE_DIGEST"],
+        "completed_utc": datetime.now(timezone.utc).isoformat(),
+        "topology": {
+            "world_size": dist.get_world_size(),
+            "pp": parallel_dims.pp,
+            "cp": parallel_dims.cp,
+            "ep": parallel_dims.ep,
+            "dp_replicate": parallel_dims.dp_replicate,
+            "dp_shard": parallel_dims.dp_shard,
+        },
+        "fake_data": {
+            "batch_size": fake.batch_size,
+            "samples_per_micro_batch": fake.samples_per_micro_batch,
+            "group_size": fake.group_size,
+            "sequence_length": config.model.seq_len,
+            "rollout_cache": False,
+        },
+        "lora": {
+            "rank": config.model.lora.rank,
+            "alpha": config.model.lora.alpha,
+            "targets": sorted(config.model.lora.target_modules),
+        },
+        "max_steps": config.max_steps,
+        "steps": records,
+        "runtime_ranks": runtime_records,
+        "runtime_sha256": hashlib.sha256(
+            (
+                json.dumps(runtime_records, sort_keys=True, separators=(",", ":"))
+                + "\n"
+            ).encode()
+        ).hexdigest(),
+        "metrics_path": str(metrics_path),
+        "metrics_sha256": sha256_file(metrics_path),
+        "adapter": adapter,
+    }
+    _write_atomic_json(
+        config.output_dir / "qualification-result.json",
+        result,
+        identity["PRIME_QUALIFICATION_SESSION_ID"],
+    )
+
+
 @clean_exit
 def train(config: TrainerConfig):
     # Setup world and logger
     world = get_world()
+    numa_binding = bind_worker_to_gpu_numa_node()
     logger = setup_logger(
         config.log.level,
         json_logging=config.log.json_logging,
     )
     logger.info(f"Starting RL trainer in {world} in {config.output_dir}")
+    qualification_identity = _qualification_environment()
+    if qualification_identity is not None:
+        fake = config.data.fake
+        expected_steps = {
+            "glm52-native-b2048": (2, False),
+            "glm52-native-stability20": (20, True),
+        }[qualification_identity["PRIME_QUALIFICATION_PROFILE"]]
+        expected_targets = {
+            "q_a_proj",
+            "q_b_proj",
+            "kv_a_proj_with_mqa",
+            "kv_b_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+            "shared_expert",
+            "experts",
+        }
+        if (
+            fake is None
+            or config.data.rollout_cache is not None
+            or fake.batch_size != 64
+            or fake.samples_per_micro_batch != 32
+            or fake.group_size != 16
+            or fake.export_final_adapter is not expected_steps[1]
+            or config.max_steps != expected_steps[0]
+            or config.model.seq_len != 32768
+            or config.optim.lr != 8e-6
+            or config.model.lora is None
+            or config.model.lora.rank != 32
+            or config.model.lora.alpha != 64
+            or set(config.model.lora.target_modules) != expected_targets
+        ):
+            raise RuntimeError("qualification trainer configuration differs")
+    if numa_binding is not None:
+        logger.info(
+            f"Bound local GPU {world.local_rank} worker to NUMA node "
+            f"{numa_binding[0]} ({numa_binding[1]} CPUs)"
+        )
 
     # Print warning if running in benchmark mode
     if config.bench is not None:
@@ -374,12 +846,34 @@ def train(config: TrainerConfig):
         torch.device("cuda", world.local_rank),
         config.model.lora,
     )
+    replay_rollouts = (
+        config.data.rollout_cache is not None
+        and config.data.rollout_cache.mode == "replay"
+    )
+    trainer_only = config.data.fake is not None or replay_rollouts
 
     # Resolve ep="auto" to a concrete integer before creating parallel dims
     resolve_ep(config.model)
 
     # Initialize parallel dimensions
     parallel_dims = get_parallel_dims(config.model)
+    if qualification_identity is not None and (
+        world.world_size,
+        parallel_dims.pp,
+        parallel_dims.cp,
+        parallel_dims.ep,
+        parallel_dims.dp_replicate,
+        parallel_dims.dp_shard,
+    ) != (64, 8, 8, 8, 1, 1):
+        raise RuntimeError("qualification trainer topology differs")
+    qualification_runtime_records = []
+    if qualification_identity is not None:
+        qualification_session = _load_qualification_session(
+            config, qualification_identity
+        )
+        qualification_runtime_records = _qualification_runtime_records(
+            qualification_identity, world, qualification_session
+        )
 
     # For single-run, check for checkpoint to resume from
     checkpoint_step = None
@@ -406,23 +900,12 @@ def train(config: TrainerConfig):
         )
         logger.info("Initialized multi-run checkpoint manager")
 
-    resume_adapter = (
-        os.environ.get("PRIME_RL_RESUME_ADAPTER") if checkpoint_step is None else None
-    )
-    if resume_adapter:
-        if config.model.lora is None:
-            raise ValueError("PRIME_RL_RESUME_ADAPTER requires model.lora")
-        configured_adapter = config.model.lora.initial_adapter_path
-        if configured_adapter is not None and configured_adapter != resume_adapter:
-            raise ValueError(
-                "PRIME_RL_RESUME_ADAPTER conflicts with model.lora.initial_adapter_path"
-            )
-        config.model.lora.initial_adapter_path = resume_adapter
-
     # Initialize the model and tokenizer
     logger.info(f"Initializing model ({config.model})")
     loading_from_ckpt_later = config.ckpt and checkpoint_step is not None
     model = setup_model(config.model, parallel_dims, loading_from_ckpt_later)
+    if trainer_only and config.model.lora is not None:
+        multi_run_manager.create_trainer_only_run(config.model.lora)
     group_timeout = timedelta(seconds=config.dist_timeout_seconds)
     process_groups = {}
     for mesh in (parallel_dims.world_mesh, *parallel_dims._submeshes.values()):
@@ -433,6 +916,48 @@ def train(config: TrainerConfig):
     logger.info(
         f"Set {len(process_groups)} distributed group timeouts to {config.dist_timeout_seconds} seconds"
     )
+    resume_adapter = (
+        os.environ.get("PRIME_RL_RESUME_ADAPTER") if checkpoint_step is None else None
+    )
+    if resume_adapter:
+        from safetensors.torch import load_file
+        from torch.distributed.tensor import DTensor, distribute_tensor
+
+        adapter = load_file(resume_adapter)
+        expected: dict[str, tuple[int, ...]] = {}
+        parameters = {}
+        for name, parameter in model.named_parameters():
+            if ".lora_A.0" not in name and ".lora_B.0" not in name:
+                continue
+            key = (
+                name.replace("._checkpoint_wrapped_module", "")
+                .replace(".lora_A.0", ".lora_A.weight")
+                .replace(".lora_B.0", ".lora_B.weight")
+            )
+            expected[key] = tuple(parameter.shape)
+            parameters[key] = parameter
+        expected_by_rank: list[dict[str, tuple[int, ...]] | None] = [
+            None
+        ] * dist.get_world_size()
+        dist.all_gather_object(expected_by_rank, expected)
+        if any(value is None for value in expected_by_rank):
+            raise RuntimeError("Resume adapter inventory gather is incomplete")
+        _validate_resume_adapter_inventory(
+            {key: tuple(value.shape) for key, value in adapter.items()},
+            [value for value in expected_by_rank if value is not None],
+        )
+        with torch.no_grad():
+            for key, parameter in parameters.items():
+                value = adapter[key].to("cuda", dtype=parameter.dtype)
+                if isinstance(parameter, DTensor):
+                    value = distribute_tensor(
+                        value, parameter.device_mesh, parameter.placements
+                    )
+                parameter.copy_(value)
+        logger.info(
+            f"Loaded {len(parameters)} local tensors from complete adapter {resume_adapter}"
+        )
+
     logger.info(f"Initializing tokenizer ({config.tokenizer})")
     tokenizer = setup_tokenizer(config.tokenizer)
 
@@ -447,10 +972,6 @@ def train(config: TrainerConfig):
 
     # Set up the optimizer
     logger.info(f"Initializing optimizer ({config.optim})")
-
-    if config.data.fake and config.model.lora:
-        register_fake_lora_run(multi_run_manager, config.model.lora)
-        logger.info("Registered local LoRA adapter slot for fake-data qualification")
 
     if config.max_concurrent_runs == 1:
         optimizer = setup_optimizer(
@@ -475,19 +996,14 @@ def train(config: TrainerConfig):
 
     logger.info(f"Using `{config.scheduler.type}` scheduler ({config.scheduler})")
 
-    # A fresh filesystem-LoRA run generates policy-v0 rollouts with the base
-    # model before the trainer can broadcast an adapter.  The trainer must
-    # therefore start with an exactly zero-output adapter.  Run discovery
-    # resets LoRA slots after FSDP construction; make the required B=0 state
-    # explicit after that reset and verify every local shard before accepting
-    # a rollout batch.  A and B must also be finite.
     fresh_lora_policy = (
         config.model.lora is not None
-        and not config.data.fake
+        and not trainer_only
         and checkpoint_step is None
         and not resume_adapter
     )
     if fresh_lora_policy:
+        multi_run_manager.wait_for_run(0)
         fresh_b_count, reset_b_shards = initialize_fresh_lora_policy(
             multi_run_manager, config.model.lora, torch.device("cuda", world.local_rank)
         )
@@ -497,10 +1013,12 @@ def train(config: TrainerConfig):
             f"scale={expected_scale:g}; reset {reset_b_shards} nonzero B shards"
         )
 
-    # Set up weight broadcast (skip when using fake data since there's no inference server)
-    if config.data.fake:
+    export_final_adapter = bool(
+        config.data.fake is not None and config.data.fake.export_final_adapter
+    )
+    if trainer_only and not export_final_adapter:
         weight_broadcast = None
-        logger.info("Skipping weight broadcast setup (fake data mode)")
+        logger.info("Skipping weight broadcast setup for trainer-only qualification")
     else:
         logger.info(f"Initializing weight broadcast ({config.weight_broadcast})")
         weight_broadcast = setup_weight_broadcast(
@@ -545,8 +1063,9 @@ def train(config: TrainerConfig):
         if config.model.cp_style == "ulysses":
             setup_model_cp(model, cp_group, cp_rank, parallel_dims.cp)
 
-    # Pipeline parallelism: wrap this rank's stage once, before the loop.
+    # Pipeline parallelism: build one or two local virtual stages before the loop.
     pp_stage_module = None
+    pp_stage_modules = None
     pp_rank = 0
     if parallel_dims.pp_enabled:
         from prime_rl.trainer.distributed.pp_runner import PipelineStageModule
@@ -559,6 +1078,10 @@ def train(config: TrainerConfig):
         from prime_rl.trainer.distributed.pp_runner import force_fsdp_lazy_init
         from prime_rl.trainer.distributed.pp_runner import minimum_pipeline_microbatches
         from prime_rl.trainer.distributed.pp_runner import sparse_cache_transport_shape
+        from prime_rl.trainer.distributed.pipeline_parallel import (
+            pp_layer_ranges,
+            sparse_cache_stage_flags,
+        )
 
         pp_rank = parallel_dims.get_mesh("pp").get_local_rank()
         # Weight broadcast: tell the gatherer to merge stage dicts over the pp
@@ -572,40 +1095,69 @@ def train(config: TrainerConfig):
         _stage_master_ranks = [
             stage * _ranks_per_stage for stage in range(parallel_dims.pp)
         ]
-        _is_stage_master = dist.get_rank() in _stage_master_ranks
-        # Full-model BF16 broadcast moves about 7.5 GB from each stage master.
-        # Use a CPU/Gloo group containing only those eight ranks. An NCCL object
-        # collective stages serialized objects on GPU and cannot fit the 60 GB
-        # receive buffer on a 4090.
-        _pp_weight_gather_group = (
-            dist.new_group(
-                ranks=_stage_master_ranks,
-                backend="gloo",
-                timeout=group_timeout,
-                use_local_synchronization=True,
-            )
-            if _is_stage_master
-            else None
-        )
         set_pp_gather_context(
-            _pp_weight_gather_group,
-            is_stage_master=_is_stage_master,
+            parallel_dims.get_mesh("pp").get_group(),
+            is_stage_master=(dist.get_rank() % _ranks_per_stage) == 0,
+            stage_master_ranks=_stage_master_ranks,
         )
-        pp_stage_module = PipelineStageModule(
-            model,
-            is_first=pp_rank == 0,
-            is_last=pp_rank == parallel_dims.pp - 1,
-            offload_cfg=config.model.ac_offloading,
-            transfer_sparse_indices=config.model.pp_transfer_sparse_indices,
-            cp_group=cp_group if parallel_dims.cp_enabled else None,
-            cp_style=config.model.cp_style,
-            cp_world_size=parallel_dims.cp,
+        local_virtual_stages = 2 if config.model.pp_schedule == "interleaved_1f1b" else 1
+        ranges = pp_layer_ranges(
+            model.model,
+            pp_rank,
+            parallel_dims.pp,
         )
+        if len(ranges) != local_virtual_stages:
+            raise RuntimeError(
+                f"model has {len(ranges)} virtual ranges but schedule needs {local_virtual_stages}"
+            )
+        pp_stage_modules = []
+        for local_index, layer_range in enumerate(ranges):
+            stage_identity = pp_rank + local_index * parallel_dims.pp
+            receive_sparse_indices = False
+            send_sparse_indices = False
+            if config.model.pp_transfer_sparse_indices:
+                receive_sparse_indices, send_sparse_indices = sparse_cache_stage_flags(
+                    model,
+                    pp_rank,
+                    parallel_dims.pp,
+                    virtual_stage=local_index,
+                    virtual_stages=local_virtual_stages,
+                )
+            logger.info(
+                f"PP stage {stage_identity}/{parallel_dims.pp * local_virtual_stages}: "
+                f"layers={layer_range}, receive sparse cache={receive_sparse_indices}, "
+                f"send sparse cache={send_sparse_indices}"
+            )
+            pp_stage_modules.append(
+                PipelineStageModule(
+                    model,
+                    is_first=stage_identity == 0,
+                    is_last=stage_identity == parallel_dims.pp * local_virtual_stages - 1,
+                    offload_cfg=config.model.ac_offloading,
+                    transfer_sparse_indices=config.model.pp_transfer_sparse_indices,
+                    receive_sparse_indices=receive_sparse_indices,
+                    send_sparse_indices=send_sparse_indices,
+                    stage_identity=stage_identity,
+                    layer_indices=tuple(range(layer_range[0], layer_range[1])),
+                )
+            )
+        pp_stage_module = pp_stage_modules[0] if local_virtual_stages == 1 else pp_stage_modules
 
     # Optionally, resume training from a checkpoint
     progress = Progress()
     if checkpoint_step is not None:
+        preserve_glm_moe_bias_precision(model)
         ckpt_manager.load(checkpoint_step, model, [optimizer], scheduler, progress)
+        if config.model.freeze_moe_router:
+            base_snapshot = Path(config.model.name)
+            if not base_snapshot.is_dir():
+                raise RuntimeError(
+                    "Frozen GLM resume requires the local base model snapshot"
+                )
+            restore_glm_moe_bias_values(model, base_snapshot, parallel_dims)
+        else:
+            cache_glm_moe_bias_values(model)
+        validate_glm_moe_bias_values(model, parallel_dims)
         # The checkpoint finished step ``checkpoint_step``; resume training at the next step.
         progress.step += 1
         logger.info(f"Resuming training from checkpoint step {checkpoint_step}")
@@ -630,18 +1182,39 @@ def train(config: TrainerConfig):
             parallel_dims.get_mesh("dp").get_local_rank(),
         )
     else:
-        dataloader = DataLoader(
-            config.output_dir,
-            progress.step,
-            parallel_dims.get_mesh("dp").size(),
-            parallel_dims.get_mesh("dp").get_local_rank(),
-            config.model.seq_len,
-            config.model.cp,
-            bin_cost,
-            config.rollout_transport,
-        )
+        real_dataloader = None
+        if not replay_rollouts:
+            real_dataloader = DataLoader(
+                config.output_dir,
+                progress.step,
+                parallel_dims.get_mesh("dp").size(),
+                parallel_dims.get_mesh("dp").get_local_rank(),
+                config.model.seq_len,
+                config.model.cp,
+                bin_cost,
+                config.rollout_transport,
+            )
+        if config.data.rollout_cache is not None:
+            dataloader = RolloutCacheDataLoader(
+                config.data.rollout_cache,
+                real_dataloader,
+                config.model.seq_len,
+                parallel_dims.get_mesh("dp").size(),
+                parallel_dims.get_mesh("dp").get_local_rank(),
+                config.model.cp,
+            )
+        else:
+            dataloader = real_dataloader
 
-    token_exporter = setup_token_exporter(config, parallel_dims, world, logger)
+    token_exporter = setup_token_exporter(config, parallel_dims, world, logger, model)
+    parity_bundle_enabled = trace_dir_env in config.env_vars
+    if parity_bundle_enabled and not parallel_dims.pp_enabled:
+        raise ValueError("trainer parity bundle requires pipeline parallel training")
+    parity_bundle_communication = prepare_trainer_bundle_communication(
+        parity_bundle_enabled, torch.device("cuda", world.local_rank)
+    )
+    parity_bundle_readiness = None
+    qualification_input_sha256: dict[int, str] = {}
 
     gc_handler = GarbageCollection(config.gc.interval) if config.gc else None
 
@@ -666,20 +1239,12 @@ def train(config: TrainerConfig):
         logger.debug(f"Starting training step {progress.step}")
         step_start_time = time.perf_counter()
 
-        # Broadcast the incoming policy (v{progress.step-1}) before waiting for
-        # its rollouts. Filesystem transport needs this on adapter-only resumes;
-        # otherwise the orchestrator starts from the base model until the first
-        # optimizer update publishes an adapter.
+        # In-memory transfers broadcast the incoming policy (v{progress.step-1}) before waiting
+        # for its rollouts so the trainer and inference pool join the same update lifecycle.
         if (
             progress.step == start_step
             and weight_broadcast is not None
-            and (
-                config.weight_broadcast.type in ("nccl", "nixl")
-                or (
-                    config.weight_broadcast.type == "filesystem"
-                    and resume_adapter is not None
-                )
-            )
+            and config.weight_broadcast.type in ("nccl", "nixl")
         ):
             logger.info(
                 f"Broadcasting startup policy weights (v{progress.step - 1}) to inference engines"
@@ -698,11 +1263,6 @@ def train(config: TrainerConfig):
             f"Waited for batch to arrive for {wait_for_batch_time:.2f} seconds"
         )
         if fresh_lora_policy and progress.step == 1:
-            # Production synchronizes run state only after the rollout file
-            # arrives. That operation is absent from fake-data qualification
-            # and can reset adapter slots after the startup check. Re-establish
-            # policy zero at the actual forward boundary. No optimizer update
-            # has happened yet, so this changes no learned state.
             fresh_b_count, reset_b_shards = initialize_fresh_lora_policy(
                 multi_run_manager,
                 config.model.lora,
@@ -794,6 +1354,16 @@ def train(config: TrainerConfig):
             )
 
         batch_size = len(micro_batches)
+        if qualification_identity is not None:
+            input_sha256 = _qualification_batch_sha256(micro_batches)
+            _verify_qualification_batch_sha256(input_sha256)
+            previous_sha256 = qualification_input_sha256.get(progress.step - 1)
+            if previous_sha256 == input_sha256:
+                raise RuntimeError(
+                    f"qualification step {progress.step} reused the previous input"
+                )
+            qualification_input_sha256[progress.step] = input_sha256
+        rollout_rows = sum(len(micro_batch["sequence_lengths"]) for micro_batch in micro_batches)
         memory_profiler = None
         if config.memory_profiler_path is not None:
             memory_profiler = MemoryProfiler(progress.step, config.memory_profiler_path)
@@ -1009,6 +1579,8 @@ def train(config: TrainerConfig):
                         rl_weights=rl_weights,
                         ce_weights=ce_weights,
                         ref_kl_weights=ref_kl_weights,
+                        export_micro_batch=micro_batch,
+                        micro_step=micro_step,
                     )
                 )
                 continue
@@ -1219,10 +1791,6 @@ def train(config: TrainerConfig):
                     and progress.step == 1
                 )
                 if (qualification_dump or production_dump) and not direct_parity_dumped:
-                    # Every CP rank must join these gathers. Only DP0/CP0 writes
-                    # the diagnostic. Production writes only the first
-                    # microbatch of step 1, before the parity check can reject
-                    # it, so a failure always has token-level evidence.
                     full_input_ids = gather_for_cp_wo_grad(
                         side["input_ids"], cp_size, cp_group
                     )
@@ -1237,6 +1805,14 @@ def train(config: TrainerConfig):
                         )
                         delta = trainer_values - reference_values
                         valid = side["loss_mask"].squeeze(0).detach().cpu()
+                        if not valid.any():
+                            raise RuntimeError("direct parity data has no retained tokens")
+                        if not (
+                            torch.isfinite(trainer_values).all()
+                            and torch.isfinite(reference_values).all()
+                            and torch.isfinite(delta[valid]).all()
+                        ):
+                            raise RuntimeError("direct parity data contains non-finite values")
                         payload = {
                             "input_ids": full_input_ids.squeeze(0).cpu().tolist(),
                             "position_ids": full_position_ids.squeeze(0).cpu().tolist(),
@@ -1255,7 +1831,7 @@ def train(config: TrainerConfig):
                         )
                         dump_path.write_text(json.dumps(payload))
                         logger.info(
-                            "Wrote direct trainer/HF parity data to %s "
+                            "Wrote direct trainer/reference parity data to %s "
                             "(mean abs delta %.6f, max %.6f)",
                             dump_path,
                             payload["valid_mean_abs_delta"],
@@ -1291,39 +1867,36 @@ def train(config: TrainerConfig):
                 )
                 for k, v in loss_tensors.items():
                     tensors[k].append(v.detach().to("cpu"))
+                token_exporter.export(
+                    progress.step,
+                    side["micro_step"],
+                    side["export_micro_batch"],
+                    o,
+                    sl,
+                    config.loss,
+                )
                 return loss
 
             # Stage buffers are fixed size, so every micro-batch must share one
             # sequence length; the pad is appended as a masked-out sequence.
-            # PRIME_PP_MAX_MICRO truncates the micro-batch list so a debug step
-            # takes about a minute instead of thirteen. Never set in production.
-            _cap = int(os.environ.get("PRIME_PP_MAX_MICRO", "0") or 0)
-            if _cap and len(pp_side_inputs) > _cap:
-                pp_side_inputs = pp_side_inputs[:_cap]
-                logger.warning(
-                    f"PRIME_PP_MAX_MICRO: using only {_cap} micro-batches (debug only)"
-                )
-            _n = torch.tensor(
-                [len(pp_side_inputs), -len(pp_side_inputs)], device="cuda"
-            )
+            _n = torch.tensor([len(pp_side_inputs), -len(pp_side_inputs)], device="cuda")
             dist.all_reduce(_n, op=dist.ReduceOp.MAX)
             if _n[0].item() != -_n[1].item() or _n[0].item() == 0:
                 raise RuntimeError(
                     f"micro-batch count mismatch across ranks (max={_n[0].item()}, "
                     f"min={-_n[1].item()}); the pipeline schedule would deadlock"
                 )
-            pp_side_inputs = pad_pp_side_inputs(
-                pp_side_inputs, cp_world_size=parallel_dims.cp
-            )
-            pp_stage_module.loss_closure = _pp_loss
-            pp_stage_module.set_side_inputs(pp_side_inputs)
+            parity_bundle_readiness = _n
+            pp_side_inputs = pad_pp_side_inputs(pp_side_inputs, cp_world_size=parallel_dims.cp)
+            if pp_stage_modules is None:
+                raise RuntimeError("pipeline stage modules were not initialized")
+            for stage_module in pp_stage_modules:
+                stage_module.loss_closure = _pp_loss
+                stage_module.set_side_inputs(pp_side_inputs)
             # All micro-batches share one padded shape, so hand the stage its
             # exact tensors and skip the metadata-exchange rendezvous.
             _L = pp_side_inputs[0]["input_ids"].shape[1]
-            _hs = (
-                getattr(model.config, "hidden_size", None)
-                or model.config.text_config.hidden_size
-            )
+            _hs = getattr(model.config, "hidden_size", None) or model.config.text_config.hidden_size
             # The inter-stage buffers carry ACTIVATIONS, so their dtype is
             # optimization_dtype -- NOT the dtype of the first parameter. Those
             # coincided under bf16 weights, but with
@@ -1338,25 +1911,57 @@ def train(config: TrainerConfig):
             _stage_dtype = DTYPE_MAP[config.model.optimization_dtype]
             _hidden_ex = torch.empty(1, _L, _hs, dtype=_stage_dtype, device="cuda")
             _cache_ex = None
+            _cache_placeholder_ex = None
             if config.model.pp_transfer_sparse_indices:
+                _cache_placeholder_ex = torch.empty(
+                    (1,), dtype=torch.float16, device="cuda"
+                )
                 _cache_ex = torch.empty(
-                    sparse_cache_transport_shape(_L, model.config.index_topk),
+                    sparse_cache_transport_shape(_L, model.config.index_topk)
+                    if any(stage.receive_sparse_indices for stage in pp_stage_modules)
+                    else (1,),
                     # PipelineStage requires floating-point receive buffers.
                     # FP16 carries the lossless unsigned 16-bit index bits.
                     dtype=torch.float16,
                     device="cuda",
                 )
-            _is_last = pp_rank == parallel_dims.pp - 1
-            _example_input = (
-                torch.empty(1, _L, dtype=torch.int64, device="cuda")
-                if pp_rank == 0
-                else ((_hidden_ex, _cache_ex) if _cache_ex is not None else _hidden_ex)
-            )
-            _example_output = (
-                torch.empty((), dtype=torch.float32, device="cuda")
-                if _is_last
-                else ((_hidden_ex, _cache_ex) if _cache_ex is not None else _hidden_ex)
-            )
+            _example_inputs = []
+            _example_outputs = []
+            for stage_module in pp_stage_modules:
+                if stage_module.is_first:
+                    _example_input = torch.empty(
+                        1, _L, dtype=torch.int64, device="cuda"
+                    )
+                else:
+                    if config.model.pp_transfer_sparse_indices:
+                        _example_input = (
+                            _hidden_ex,
+                            _cache_ex
+                            if stage_module.receive_sparse_indices
+                            else _cache_placeholder_ex,
+                        )
+                    else:
+                        _example_input = _hidden_ex
+                _output_cache_ex = None
+                if config.model.pp_transfer_sparse_indices and not stage_module.is_last:
+                    _output_cache_ex = torch.empty(
+                        sparse_cache_transport_shape(_L, model.config.index_topk)
+                        if stage_module.send_sparse_indices
+                        else (1,),
+                        dtype=torch.float16,
+                        device="cuda",
+                    )
+                _example_output = (
+                    torch.empty((), dtype=torch.float32, device="cuda")
+                    if stage_module.is_last
+                    else (
+                        (_hidden_ex, _output_cache_ex)
+                        if _output_cache_ex is not None
+                        else _hidden_ex
+                    )
+                )
+                _example_inputs.append(_example_input)
+                _example_outputs.append(_example_output)
             pp_schedule = build_pp_schedule(
                 pp_stage_module,
                 pp_rank=pp_rank,
@@ -1364,8 +1969,17 @@ def train(config: TrainerConfig):
                 n_microbatches=len(pp_side_inputs),
                 pp_group=parallel_dims.get_mesh("pp").get_group(),
                 schedule_name=config.model.pp_schedule,
-                example_input=_example_input,
-                example_output=_example_output,
+                example_input=(
+                    _example_inputs
+                    if config.model.pp_schedule == "interleaved_1f1b"
+                    else _example_inputs[0]
+                ),
+                example_output=(
+                    _example_outputs
+                    if config.model.pp_schedule == "interleaved_1f1b"
+                    else _example_outputs[0]
+                ),
+                limit_receive_buffers=config.model.pp_limit_receive_buffers,
             )
             # FSDP must be initialised before the schedule issues its first
             # prefetch, which happens before any forward on some stages.
@@ -1374,38 +1988,99 @@ def train(config: TrainerConfig):
             pp_inputs = torch.cat([sd["input_ids"] for sd in pp_side_inputs], dim=0).to(
                 "cuda"
             )
-            if dist.get_rank() == 0:
+            profile_pp_stage = os.environ.get("PRIME_PROFILE_PP_STAGE") == "1"
+            if dist.get_rank() == 0 or profile_pp_stage:
                 torch.cuda.synchronize()
                 pp_start = time.perf_counter()
             # return_outputs=False: the schedule would otherwise concatenate the
             # last stage's per-micro-batch outputs, which are scalar losses --
             # "zero-dimensional tensor cannot be concatenated". The loss closure
             # already accumulates what the metrics need.
-            if pp_rank == 0:
-                pp_schedule.step(pp_inputs, return_outputs=False)
-            elif pp_rank == parallel_dims.pp - 1:
-                # The schedule indexes target_mbs unconditionally on the last
-                # stage; the loss closure ignores the value, so a zero per
-                # micro-batch is enough to satisfy it.
-                pp_schedule.step(
-                    target=torch.zeros(len(pp_side_inputs), device="cuda"),
-                    return_outputs=False,
-                )
-            else:
-                pp_schedule.step(return_outputs=False)
-            if dist.get_rank() == 0:
-                torch.cuda.synchronize()
+            profile_rank = int(os.environ.get("PRIME_PROFILE_PP_RANK", "-1"))
+            schedule_profiler = (
+                profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
+                if dist.get_rank() == profile_rank
+                else nullcontext()
+            )
+            with schedule_profiler:
+                if pp_rank == 0:
+                    pp_schedule.step(pp_inputs, return_outputs=False)
+                elif pp_rank == parallel_dims.pp - 1:
+                    # The schedule indexes target_mbs unconditionally on the last
+                    # stage; the loss closure ignores the value, so a zero per
+                    # micro-batch is enough to satisfy it.
+                    pp_schedule.step(
+                        target=torch.zeros(len(pp_side_inputs), device="cuda"),
+                        return_outputs=False,
+                    )
+                else:
+                    pp_schedule.step(return_outputs=False)
+            if dist.get_rank() == profile_rank:
                 logger.info(
-                    f"PP step: {len(pp_side_inputs)} micro-batches in {time.perf_counter() - pp_start:.2f}s"
+                    "PP CUDA profile:\n"
+                    + schedule_profiler.key_averages().table(
+                        sort_by="self_cpu_time_total", row_limit=40
+                    )
                 )
+            local_schedule_ms = 0.0
+            if dist.get_rank() == 0 or profile_pp_stage:
+                torch.cuda.synchronize()
+                local_schedule_ms = (time.perf_counter() - pp_start) * 1000.0
+            if dist.get_rank() == 0:
+                logger.info(
+                    f"PP step: {len(pp_side_inputs)} micro-batches in {local_schedule_ms / 1000.0:.2f}s"
+                )
+            if profile_pp_stage:
+                forward_ms = 0.0
+                backward_ms = 0.0
+                for stage_module in pp_stage_modules:
+                    stage_forward, stage_backward = stage_module.profile_times_ms(
+                        clear=True
+                    )
+                    forward_ms += stage_forward
+                    backward_ms += stage_backward
+                local_profile = torch.tensor(
+                    [float(pp_rank), local_schedule_ms, forward_ms, backward_ms],
+                    dtype=torch.float64,
+                    device="cuda",
+                )
+                gathered_profiles = [torch.empty_like(local_profile) for _ in range(dist.get_world_size())]
+                dist.all_gather(gathered_profiles, local_profile)
+                if dist.get_rank() == 0:
+                    stage_profiles = []
+                    for stage in range(parallel_dims.pp):
+                        rows = [row.tolist() for row in gathered_profiles if int(row[0].item()) == stage]
+                        stage_profiles.append(
+                            (
+                                stage,
+                                max(row[1] for row in rows),
+                                max(row[2] for row in rows),
+                                max(row[3] for row in rows),
+                            )
+                        )
+                    logger.info(
+                        "PP stage profile ms (stage, schedule, forward, backward): "
+                        f"{stage_profiles}"
+                    )
+            for stage_module in pp_stage_modules:
+                stage_module.assert_side_inputs_consumed()
             # Free this step's pipeline state NOW. The side inputs (including
             # routed_experts, tens of MB per micro-batch) and the stage's
             # per-micro-batch recv/grad buffers otherwise survive through the
             # optimizer step and overlap with the NEXT batch's allocations --
             # a multi-GB transient that ran the 47.4 GiB cards to the edge.
-            pp_stage_module.set_side_inputs([])
-            pp_stage_module.loss_closure = None
-            del pp_schedule, pp_inputs, _hidden_ex, _cache_ex, pp_side_inputs
+            for stage_module in pp_stage_modules:
+                stage_module.set_side_inputs([])
+                stage_module.loss_closure = None
+            del (
+                pp_schedule,
+                pp_inputs,
+                _hidden_ex,
+                _cache_ex,
+                _cache_placeholder_ex,
+                _output_cache_ex,
+                pp_side_inputs,
+            )
             pp_side_inputs = []
 
             # F6: MoE router stat buffers accumulate via add_ every forward and
@@ -1419,6 +2094,12 @@ def train(config: TrainerConfig):
 
         if config.enable_token_export:
             dist.barrier()
+            publish_trainer_bundle(
+                token_exporter.parity_source(),
+                parity_bundle_enabled,
+                parity_bundle_communication,
+                parity_bundle_readiness,
+            )
             ready_run_ids = {
                 multi_run_manager.idx_2_id[idx]
                 for idx in multi_run_manager.ready_to_update_idxs
@@ -1504,16 +2185,12 @@ def train(config: TrainerConfig):
                 ep_enabled=parallel_dims.ep_enabled,
                 # Each stage's DTensor meshes do not span pp, so without this the
                 # norm is per-stage and clipping diverges from the non-PP runs.
-                pp_mesh=parallel_dims.get_mesh("pp")
-                if parallel_dims.pp_enabled
-                else None,
+                pp_mesh=parallel_dims.get_mesh("pp") if parallel_dims.pp_enabled else None,
             )
             if grad_norm.device.type == "cpu":
                 grad_norm = grad_norm.to(torch.device("cuda"))
             if not torch.isfinite(grad_norm):
-                raise RuntimeError(
-                    f"Non-finite gradient norm at step {progress.step}; refusing to update or broadcast."
-                )
+                raise RuntimeError(f"Non-finite gradient norm at step {progress.step}; refusing to update or broadcast.")
             if dist.get_rank() == 0:
                 logger.info(f"grad_norm full precision: {grad_norm.item():.6e}")
 
@@ -1521,35 +2198,31 @@ def train(config: TrainerConfig):
             pp_enabled
             and dist.get_rank() % (dist.get_world_size() // parallel_dims.pp) == 0
         ):
-            # One line per stage master per step, full precision. A stage whose
-            # backward silently detached shows l1=0 here; the SUCCESS line's
-            # 4-decimal grad norm cannot distinguish that from a small gradient.
             import sys
 
-            # Operate on LOCAL shards only. Reducing a DTensor here would issue
-            # a collective on the stage mesh that the other 7 ranks of the stage
-            # never join (only the stage master runs this block), deadlocking
-            # the step -- a diagnostic must never alter collective ordering.
             from torch.distributed.tensor import DTensor as _DT
 
-            _l1 = 0.0
-            _n_with = 0
-            for _p in model.parameters():
-                if _p.grad is None:
+            stage_gradient_l1 = 0.0
+            parameters_with_gradient = 0
+            for parameter in model.parameters():
+                if parameter.grad is None:
                     continue
-                _n_with += 1
-                _g = _p.grad.to_local() if isinstance(_p.grad, _DT) else _p.grad
-                _l1 += float(_g.abs().sum())
+                parameters_with_gradient += 1
+                gradient = (
+                    parameter.grad.to_local()
+                    if isinstance(parameter.grad, _DT)
+                    else parameter.grad
+                )
+                stage_gradient_l1 += float(gradient.abs().sum())
             print(
                 f"[grad-check] step={progress.step} stage={pp_rank} "
-                f"lora_grad_l1={_l1:.6e} params_with_grad={_n_with}",
+                f"lora_grad_l1={stage_gradient_l1:.6e} "
+                f"params_with_grad={parameters_with_gradient}",
                 file=sys.stderr,
                 flush=True,
             )
 
-        zero_grad_ratio = get_zero_gradient_ratio(
-            model.parameters(), parallel_dims.dp_replicate
-        )
+        zero_grad_ratio = get_zero_gradient_ratio(model.parameters(), parallel_dims.dp_replicate)
 
         # Update the model parameters
         optimizer.step()
@@ -1558,11 +2231,6 @@ def train(config: TrainerConfig):
         # Update learning rate scheduler
         scheduler.step()
 
-        # x64p n76 grew from 380 to 391 GiB shared memory and fell from 76 to
-        # 62 GiB available by step 6 while streamed native-FP8 expert
-        # activation offload was active. All backward H2D copies are complete
-        # after this synchronization. Release unused pinned allocator blocks
-        # before the next variable-sized batch can establish a higher mark.
         if os.environ.get("PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD", "") == "1":
             torch.cuda.synchronize()
             host_empty_cache = getattr(torch._C, "_host_emptyCache", None)
@@ -1578,11 +2246,21 @@ def train(config: TrainerConfig):
         else:
             current_lr = optimizer.get_current_lr()
         forward_backward_time = time.perf_counter() - forward_backward_start_time
+        if qualification_identity is not None:
+            maximum_forward_backward = torch.tensor(
+                forward_backward_time, dtype=torch.float64, device="cuda"
+            )
+            dist.all_reduce(maximum_forward_backward, op=dist.ReduceOp.MAX)
+            forward_backward_time = float(maximum_forward_backward.item())
 
         # Broadcast the model just produced (policy v{progress.step}) so the orchestrator can
         # sample its next step from it. In-memory transports retain their two-step shutdown
         # window; filesystem broadcast still writes every version for resume.
-        if weight_broadcast is None:
+        if trainer_only and export_final_adapter and is_last_step:
+            for idx in multi_run_manager.used_idxs:
+                multi_run_manager.ready_to_update[idx] = True
+                multi_run_manager.progress[idx].step = progress.step + 1
+        if weight_broadcast is None or (trainer_only and not is_last_step):
             broadcast_weights_time = 0
         else:
             broadcast_unused = (
@@ -1694,6 +2372,7 @@ def train(config: TrainerConfig):
             "perf/throughput_per_gpu": throughput / world.world_size,
             "perf/mfu": mfu,
             "perf/peak_memory": peak_memory,
+            "data/rollout_rows": rollout_rows,
             "step": progress.step,
         }
         monitor.log(perf_metrics, step=progress.step)
@@ -1813,6 +2492,37 @@ def train(config: TrainerConfig):
     logger.info(
         f"Peak memory: {max(to_col_format(monitor.history)['perf/peak_memory']):.1f} GiB"
     )
+    if qualification_identity is not None:
+        dist.barrier()
+        qualification_failed = torch.zeros((), dtype=torch.int32, device="cuda")
+        if world.is_master:
+            try:
+                adapter_path = None
+                if export_final_adapter:
+                    adapter_path = (
+                        get_step_path(
+                            get_broadcast_dir(multi_run_manager.get_run_dir(0)),
+                            progress.step,
+                        )
+                        / "adapter_model.safetensors"
+                    )
+                _write_qualification_result(
+                    config,
+                    parallel_dims,
+                    monitor,
+                    progress,
+                    qualification_identity,
+                    qualification_runtime_records,
+                    qualification_input_sha256,
+                    adapter_path,
+                )
+            except Exception:
+                logger.exception("qualification result write failed")
+                qualification_failed.fill_(1)
+        dist.broadcast(qualification_failed, src=0)
+        if qualification_failed.item():
+            raise RuntimeError("qualification result write failed")
+
     logger.success("RL trainer finished!")
 
     # Stop metrics/health server if configured

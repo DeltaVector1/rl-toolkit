@@ -107,16 +107,26 @@ def save_state_dict(
 
 # ── pipeline parallelism context ─────────────────────────────────────────────
 # Set once by train.py when pp > 1. Under PP each rank's model holds only its
-# stage's layers, so the master's local state_dict is a fraction of the model.
-# The group is a CPU/Gloo group containing one master from each stage. This
-# keeps multi-gigabyte full-model objects out of GPU memory.
+# stage's layers, so the master's local state_dict is a fraction of the model;
+# saving it as the adapter would ship a truncated LoRA to the inference engines
+# with no error anywhere. The fix: each stage's first rank gathers its stage,
+# then the stage dicts are merged on the global master over the pp group.
 _PP_GROUP = None
+_PP_CPU_GROUP = None
+_PP_STAGE_MASTER_RANKS: tuple[int, ...] = ()
 _IS_STAGE_MASTER = False
 
 
-def set_pp_gather_context(pp_group, is_stage_master: bool) -> None:
-    global _PP_GROUP, _IS_STAGE_MASTER
+def set_pp_gather_context(
+    pp_group,
+    is_stage_master: bool,
+    cpu_group=None,
+    stage_master_ranks: list[int] | None = None,
+) -> None:
+    global _PP_GROUP, _PP_CPU_GROUP, _PP_STAGE_MASTER_RANKS, _IS_STAGE_MASTER
     _PP_GROUP = pp_group
+    _PP_CPU_GROUP = cpu_group
+    _PP_STAGE_MASTER_RANKS = tuple(stage_master_ranks or ())
     _IS_STAGE_MASTER = is_stage_master
 
 
@@ -141,26 +151,61 @@ def merge_pp_state_dict(state_dict: dict, is_master: bool) -> dict:
     """
     if _PP_GROUP is None:
         return state_dict
-
     if not _IS_STAGE_MASTER:
-        return state_dict
+        return {}
+    if not _PP_STAGE_MASTER_RANKS:
+        raise RuntimeError("pipeline adapter export has no stage leaders")
 
-    group_size = torch.distributed.get_world_size(group=_PP_GROUP)
-    gathered: list[dict | None] | None = [None] * group_size if is_master else None
+    global _PP_CPU_GROUP
+    if _PP_CPU_GROUP is None:
+        _PP_CPU_GROUP = torch.distributed.new_group(
+            ranks=list(_PP_STAGE_MASTER_RANKS),
+            backend="gloo",
+            use_local_synchronization=True,
+        )
+
+    rank = torch.distributed.get_rank()
+    master = _PP_STAGE_MASTER_RANKS[0]
+    metadata = [
+        (key, tuple(value.shape), str(value.dtype), value.numel() * value.element_size())
+        for key, value in state_dict.items()
+    ]
+    gathered_metadata = [None] * len(_PP_STAGE_MASTER_RANKS) if rank == master else None
     torch.distributed.gather_object(
-        state_dict,
-        object_gather_list=gathered,
-        dst=0,
-        group=_PP_GROUP,
+        metadata,
+        object_gather_list=gathered_metadata,
+        dst=master,
+        group=_PP_CPU_GROUP,
     )
-    if not is_master:
-        return state_dict
 
-    merged: dict[str, Tensor] = {}
-    assert gathered is not None
-    for part in gathered:
-        if part:
-            merged.update(part)
+    if rank == master:
+        merged = dict(state_dict)
+        duplicates: list[str] = []
+        assert gathered_metadata is not None
+        for source, part in zip(_PP_STAGE_MASTER_RANKS, gathered_metadata, strict=True):
+            if source == master:
+                continue
+            assert part is not None
+            for key, shape, dtype_name, byte_count in part:
+                raw = torch.empty(byte_count, dtype=torch.uint8)
+                torch.distributed.recv(raw, src=source, group=_PP_CPU_GROUP)
+                dtype = getattr(torch, dtype_name.removeprefix("torch."))
+                value = raw.view(dtype).reshape(shape)
+                if key in merged:
+                    duplicates.append(key)
+                merged[key] = value
+    else:
+        for value in state_dict.values():
+            raw = value.contiguous().view(torch.uint8).reshape(-1)
+            torch.distributed.send(raw, dst=master, group=_PP_CPU_GROUP)
+        merged = {}
+
+    torch.distributed.barrier(group=_PP_CPU_GROUP)
+    if rank == master and duplicates:
+        raise RuntimeError(
+            "pipeline adapter export found duplicate keys: "
+            + ", ".join(duplicates[:10])
+        )
     return merged
 
 
@@ -189,28 +234,24 @@ def gather_weights_on_master(
                 cpu_state[key] = value.to("cpu", non_blocking=False)
 
         if _PP_GROUP is not None:
-            # Gather only across the CPU stage-master group. Only rank 0
-            # receives the objects. all_gather_object replicated the complete
-            # BF16 model into all 64 trainer processes, which requires about
-            # 480 GB of host memory per node for a 30B full-model update.
-            if _IS_STAGE_MASTER:
-                group_size = torch.distributed.get_world_size(group=_PP_GROUP)
-                gathered: list[dict | None] | None = [None] * group_size if is_master else None
-                torch.distributed.gather_object(
-                    cpu_state,
-                    object_gather_list=gathered,
-                    dst=0,
-                    group=_PP_GROUP,
-                )
-                if is_master:
-                    assert gathered is not None
-                    merged: dict[str, Tensor] = {}
-                    for part in gathered:
-                        if part:
-                            merged.update(part)
-                    cpu_state = merged
-                else:
-                    cpu_state = {}
+            # Gather over the WORLD group, not the pp subgroup. all_gather_object
+            # sizes its receive buffers from the participating ranks, and mixing a
+            # mesh-derived subgroup with global rank bookkeeping produced garbage
+            # lengths -- a 3796 GiB allocation attempt inside recv_object_list.
+            # World-group gather needs no rank translation: every rank sends its
+            # stage dict (or {}), and layer names already carry global indices, so
+            # the union is exactly the full model.
+            world = torch.distributed.get_world_size()
+            gathered: list[dict | None] = [None] * world
+            torch.distributed.all_gather_object(gathered, cpu_state if _IS_STAGE_MASTER else {})
+            if is_master:
+                merged: dict[str, Tensor] = {}
+                for part in gathered:
+                    if part:
+                        merged.update(part)
+                cpu_state = merged
+            else:
+                cpu_state = {}
         torch.distributed.barrier()
 
     # Always clean up the state dict for HF compatibility

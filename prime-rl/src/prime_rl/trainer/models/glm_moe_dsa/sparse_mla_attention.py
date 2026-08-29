@@ -6,6 +6,10 @@ from torch import nn
 from torch.nn.attention.flex_attention import flex_attention
 
 from prime_rl.trainer.models.kernels.fp8_indexer import fp8_indexer
+from prime_rl.trainer.models.layers.lora.multi_linear import (
+    MultiLoRALinear,
+    fused_frozen_linear_pair,
+)
 from prime_rl.trainer.models.layers.norms import LayerNorm, RMSNorm, RMSNormConfig
 from prime_rl.trainer.models.layers.rotary_emb import rotate_half
 from prime_rl.utils.cp import gather_for_cp
@@ -209,10 +213,32 @@ class GlmMoeDsaAttention(nn.Module):
     def cp_enabled(self) -> bool:
         return self._cp_world_size > 1
 
-    def attn_projections(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        q_latent = self.q_a_layernorm(self.q_a_proj(hidden_states))
-        compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
-        k_compressed, k_rope = compressed_kv.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+    def attn_projections(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        q_projection = self.q_a_proj
+        kv_projection = self.kv_a_proj_with_mqa
+        if isinstance(q_projection, MultiLoRALinear) and isinstance(
+            kv_projection, MultiLoRALinear
+        ):
+            q_latent, compressed_kv = fused_frozen_linear_pair(
+                hidden_states,
+                q_projection.base_layer,
+                kv_projection.base_layer,
+            )
+            q_latent = q_latent + q_projection.adapter_output(hidden_states)
+            compressed_kv = compressed_kv + kv_projection.adapter_output(hidden_states)
+        elif isinstance(q_projection, MultiLoRALinear) or isinstance(
+            kv_projection, MultiLoRALinear
+        ):
+            raise ValueError("Q-A and KV-A must use LoRA together")
+        else:
+            q_latent = q_projection(hidden_states)
+            compressed_kv = kv_projection(hidden_states)
+        q_latent = self.q_a_layernorm(q_latent)
+        k_compressed, k_rope = compressed_kv.split(
+            [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+        )
         return q_latent, self.kv_a_layernorm(k_compressed), k_rope
 
     def mla_up_proj(
@@ -248,6 +274,22 @@ class GlmMoeDsaAttention(nn.Module):
         w_v = kv_b_w[:, self.qk_nope_head_dim :, :]
         q_absorbed = torch.einsum("bshd,hdk->bshk", q_nope, w_k_nope)
 
+        active_lora_factors = getattr(self.kv_b_proj, "active_lora_factors", None)
+        if active_lora_factors is not None:
+            lora_a, lora_b, lora_scaling = active_lora_factors()
+            lora_b = lora_b.view(
+                self.num_heads,
+                self.qk_nope_head_dim + self.v_head_dim,
+                lora_b.shape[-1],
+            )
+            key_lora_b = lora_b[:, : self.qk_nope_head_dim, :]
+            value_lora_b = lora_b[:, self.qk_nope_head_dim :, :]
+            q_low_rank = torch.einsum("bshd,hdr->bshr", q_nope, key_lora_b)
+            q_update = torch.einsum("bshr,rk->bshk", q_low_rank, lora_a)
+            q_update.mul_(lora_scaling)
+            q_absorbed.add_(q_update)
+            w_v = (w_v, lora_a, value_lora_b, lora_scaling)
+
         sparse_q = torch.cat([q_absorbed, q_rope], dim=-1)
         sparse_kv = torch.cat([k_compressed_normed_full, k_rope_full], dim=-1).unsqueeze(2)
 
@@ -256,7 +298,15 @@ class GlmMoeDsaAttention(nn.Module):
         assert sparse_kv.shape[1] == s_full + 1
         return sparse_q, sparse_kv, w_v
 
-    def _mla_unabsorb(self, out: torch.Tensor, w_v: torch.Tensor) -> torch.Tensor:
+    def _mla_unabsorb(self, out: torch.Tensor, w_v) -> torch.Tensor:
+        if isinstance(w_v, tuple):
+            base_w_v, lora_a, value_lora_b, lora_scaling = w_v
+            result = torch.einsum("bshk,hdk->bshd", out, base_w_v)
+            low_rank = torch.einsum("bshk,rk->bshr", out, lora_a)
+            value_update = torch.einsum("bshr,hdr->bshd", low_rank, value_lora_b)
+            value_update.mul_(lora_scaling)
+            result.add_(value_update)
+            return result
         return torch.einsum("bshk,hdk->bshd", out, w_v)
 
     def output_proj(self, attn_output: torch.Tensor, w_v: torch.Tensor) -> torch.Tensor:

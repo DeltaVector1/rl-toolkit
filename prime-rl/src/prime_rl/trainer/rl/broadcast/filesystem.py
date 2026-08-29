@@ -17,39 +17,8 @@ from prime_rl.trainer.weights import (
     save_state_dict,
 )
 from prime_rl.trainer.world import get_world
+from prime_rl.utils.checkpoint_delta import sha256_file
 from prime_rl.utils.utils import get_broadcast_dir, get_step_path
-
-
-def prepare_full_model_broadcast_dir(broadcast_dir: Path, save_step: int) -> list[Path]:
-    """Remove full-model policies that are older than the active policy.
-
-    A BF16 Muse policy is about 60 GB. The normal post-save cleanup briefly
-    needs three complete policies and also keeps checkpoint-interval policy
-    copies. That exceeds the trainer master's local disk. When policy N is
-    ready to save, the trainer has already consumed the rollout batch from
-    policy N-1. Keep N-1 while N is written, and remove every older policy.
-    Trainer checkpoints provide the durable interval copies.
-    """
-    removed: list[Path] = []
-    keep_from = max(save_step - 1, 0)
-    if not broadcast_dir.exists():
-        return removed
-
-    for candidate in broadcast_dir.iterdir():
-        if not candidate.is_dir() or not candidate.name.startswith("step_"):
-            continue
-        try:
-            candidate_step = int(candidate.name.removeprefix("step_"))
-        except ValueError:
-            continue
-        if candidate_step < keep_from:
-            # Every local trainer rank runs post-step cleanup. On the master
-            # host, another rank can remove this same old policy after the
-            # directory scan and before this call. Cleanup is idempotent; a
-            # missing candidate must not abort the new policy broadcast.
-            shutil.rmtree(candidate, ignore_errors=True)
-            removed.append(candidate)
-    return removed
 
 
 class FileSystemWeightBroadcast(WeightBroadcast):
@@ -109,27 +78,24 @@ class FileSystemWeightBroadcast(WeightBroadcast):
             # TODO: Broadcast ready to update in sync, then we dont need to gather on not ready
             if self.world.is_master:
                 try:
+                    run_id = self.multi_run_manager.idx_2_id[idx]
                     # pack() already advanced progress to the next step, so the model we just
                     # trained — policy v(step-1) — broadcasts to broadcasts/step_{step-1}.
-                    save_step = self.multi_run_manager.progress[idx].step - 1
-                    broadcast_dir = get_broadcast_dir(self.multi_run_manager.get_run_dir(idx))
-                    if not adapter_only:
-                        removed = prepare_full_model_broadcast_dir(broadcast_dir, save_step)
-                        if removed:
-                            self.logger.info(
-                                f"Removed old full-model broadcasts before saving policy {save_step}: "
-                                + ", ".join(path.name for path in removed)
-                            )
                     save_dir = get_step_path(
-                        broadcast_dir,
-                        save_step,
+                        get_broadcast_dir(self.multi_run_manager.get_run_dir(idx)),
+                        self.multi_run_manager.progress[idx].step - 1,
                     )
                     save_dir.mkdir(parents=True, exist_ok=True)
 
                     self.logger.debug(f"Saving weights for run {idx} to {save_dir}")
                     save_state_dict(state_dict, save_dir, self.save_format, self.save_sharded, adapter=adapter_only)
                     if adapter_only:
-                        orch_lora = self.multi_run_manager.config[idx].model.lora
+                        if run_id == "run_trainer_only":
+                            orch_lora = self.lora_config
+                        else:
+                            orch_lora = self.multi_run_manager.config[idx].model.lora
+                        if orch_lora is None:
+                            raise RuntimeError("adapter export has no LoRA configuration")
                         save_lora_config(
                             model,
                             save_dir,
@@ -137,18 +103,25 @@ class FileSystemWeightBroadcast(WeightBroadcast):
                             alpha=orch_lora.alpha,
                             dropout=self.lora_config.dropout,
                         )
+                        adapter_path = save_dir / "adapter_model.safetensors"
+                        digest_path = save_dir / "adapter_model.safetensors.sha256"
+                        digest_path.write_text(f"{sha256_file(adapter_path)}\n")
 
                     self._notify_orchestrator(save_dir)
 
                     # If the run is deleted, remove the run directory
                     # This is avoid the creation of zombie runs when the directory is deleted while we are broadcasting which recreates the directory
-                    if self.multi_run_manager.get_orchestrator_config(self.multi_run_manager.idx_2_id[idx]) is None:
+                    if (
+                        run_id != "run_trainer_only"
+                        and self.multi_run_manager.get_orchestrator_config(run_id) is None
+                    ):
                         shutil.rmtree(self.multi_run_manager.get_run_dir(idx))
 
                 except FileNotFoundError:
                     self.logger.warning(f"Run {idx} is deleted, skipping")
                 except Exception as e:
                     self.logger.error(f"Error broadcasting weights for run {idx}: {e}")
+                    raise
                 finally:
                     self.multi_run_manager.ready_to_update[idx] = False
 

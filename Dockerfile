@@ -1,5 +1,7 @@
 FROM prime-rl:glm52-decensor
 USER root
+COPY --chmod=644 prime-rl/src/prime_rl/_compat.py /app/src/prime_rl/_compat.py
+COPY --chmod=644 prime-rl/src/prime_rl/parity_router_trace.py /app/src/prime_rl/parity_router_trace.py
 COPY --chmod=644 prime-rl/packages/prime-rl-configs/src/prime_rl/configs/shared.py /app/packages/prime-rl-configs/src/prime_rl/configs/shared.py
 COPY --chmod=644 prime-rl/packages/prime-rl-configs/src/prime_rl/configs/trainer.py /app/packages/prime-rl-configs/src/prime_rl/configs/trainer.py
 COPY --chmod=644 prime-rl/packages/prime-rl-configs/src/prime_rl/configs/orchestrator.py /app/packages/prime-rl-configs/src/prime_rl/configs/orchestrator.py
@@ -11,11 +13,15 @@ COPY --chmod=644 prime-rl/src/prime_rl/trainer/fp8_checkpoint.py /app/src/prime_
 COPY --chmod=644 prime-rl/src/prime_rl/trainer/mxfp4.py /app/src/prime_rl/trainer/mxfp4.py
 COPY --chmod=644 prime-rl/src/prime_rl/trainer/models/layers/fp8_ada.py /app/src/prime_rl/trainer/models/layers/fp8_ada.py
 COPY --chmod=644 prime-rl/src/prime_rl/trainer/distributed/expert_parallel.py /app/src/prime_rl/trainer/distributed/expert_parallel.py
+COPY --chmod=644 prime-rl/src/prime_rl/trainer/distributed/partial_reshard.py /app/src/prime_rl/trainer/distributed/partial_reshard.py
 COPY --chmod=644 prime-rl/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py /app/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py
 COPY --chmod=644 prime-rl/src/prime_rl/trainer/models/glm_moe_dsa/sparse_mla_attention.py /app/src/prime_rl/trainer/models/glm_moe_dsa/sparse_mla_attention.py
 COPY --chmod=644 prime-rl/src/prime_rl/trainer/models/layers/checkpointing.py /app/src/prime_rl/trainer/models/layers/checkpointing.py
 COPY --chmod=644 prime-rl/src/prime_rl/trainer/models/layers/lora/multi_linear.py /app/src/prime_rl/trainer/models/layers/lora/multi_linear.py
+COPY --chmod=644 prime-rl/src/prime_rl/trainer/models/layers/lora/native_fp8_moe.py /app/src/prime_rl/trainer/models/layers/lora/native_fp8_moe.py
 COPY --chmod=644 prime-rl/src/prime_rl/trainer/models/layers/moe.py /app/src/prime_rl/trainer/models/layers/moe.py
+COPY --chmod=644 prime-rl/src/prime_rl/trainer/rl/token_export.py /app/src/prime_rl/trainer/rl/token_export.py
+COPY --chmod=644 prime-rl/src/prime_rl/trainer/runs.py /app/src/prime_rl/trainer/runs.py
 RUN sed -i \
     -e 's/nn.Parameter(self.to_sharded_dtensor(sharded_param))/nn.Parameter(self.to_sharded_dtensor(sharded_param), requires_grad=param.requires_grad)/' \
     -e 's/self.to_sharded_post_forward_dtensor(sharded_post_forward_tensor)$/self.to_sharded_post_forward_dtensor(sharded_post_forward_tensor), requires_grad=self.sharded_param.requires_grad/' \

@@ -2,19 +2,19 @@ import warnings
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypeAlias
 
-from pydantic import Field, model_validator
+from pydantic import Field, StrictBool, model_validator
 
 from prime_rl.configs.shared import (
     BaseModelConfig,
     EnvVars,
     FileMonitorConfig,
-    FileSystemTransportConfig,
     HeartbeatConfig,
     MetricsServerConfig,
     SwanlabConfig,
     TrainerLogConfig,
     TransportConfig,
     WandbConfig,
+    ZMQTransportConfig,
 )
 from prime_rl.utils.config import BaseConfig
 
@@ -36,8 +36,9 @@ class ActivationCheckpointConfig(BaseConfig):
         "reentrant_block",
         "reentrant_attention",
         "reentrant_attention_shared_expert",
+        "reentrant_attention_all_experts",
     ] = "full"
-    """Activation checkpoint implementation. ``full`` uses the ordinary non-reentrant whole-block wrapper. ``reentrant_block`` recomputes a complete decoder block after its FSDP pre-backward hook has restored sharded parameters. ``reentrant_attention`` uses the same safe ordering for attention only and keeps MLP activations eager. ``reentrant_attention_shared_expert`` also recomputes only the shared-expert branch; routed experts and their all-to-all remain eager. Use a reentrant mode for native-FP8 attention with ``reshard_after_forward``. ``selective`` checkpoints only the subcomponents listed in ``targets`` inside supported custom decoder layers."""
+    """Activation checkpoint implementation. ``full`` uses the ordinary non-reentrant whole-block wrapper. ``reentrant_block`` recomputes a complete decoder block after its FSDP pre-backward hook has restored sharded parameters. ``reentrant_attention`` uses the same safe ordering for attention only and keeps MLP activations eager. Use a reentrant mode for native-FP8 attention with ``reshard_after_forward``. ``selective`` checkpoints only the subcomponents listed in ``targets`` inside supported custom decoder layers."""
 
     freq: int = Field(1, ge=1)
     """Apply activation checkpointing to every N layers."""
@@ -45,11 +46,24 @@ class ActivationCheckpointConfig(BaseConfig):
     targets: list[str] = ["norm"]
     """Selective checkpoint targets. ``norm`` checkpoints every norm module inside selected layers. ``attention`` checkpoints the complete attention module. ``attn_proj`` checkpoints projection-side attention work outside the kernel (input/output projections, attention-local norms, RoPE, gating, model-specific MLA projection helpers). ``mlp`` checkpoints the entire dense MLP forward (not for MoE). ``mla_up_proj`` checkpoints MLA Q/KV up-projection where supported. ``routed_experts`` checkpoints routed expert compute in MoE layers (including LatentMoE). ``linear_attn`` checkpoints non-softmax token mixers (NemotronH Mamba, Qwen3.5-MoE GatedDeltaNet, AFMoE sliding-window attention)."""
 
+    keep_routed_expert_activations_from_pp_stage: int | None = Field(None, ge=0)
+    """For ``reentrant_attention_all_experts``, keep routed-expert backward
+    state on this pipeline stage and later stages. Earlier stages still
+    recompute routed experts. This is disabled by default."""
+
     @model_validator(mode="after")
     def validate_selective_targets(self):
         self.targets = list(dict.fromkeys(self.targets))
         if self.mode == "selective" and not self.targets:
             raise ValueError("Selective activation checkpointing requires at least one target.")
+        if (
+            self.keep_routed_expert_activations_from_pp_stage is not None
+            and self.mode != "reentrant_attention_all_experts"
+        ):
+            raise ValueError(
+                "keep_routed_expert_activations_from_pp_stage requires "
+                "mode='reentrant_attention_all_experts'"
+            )
         return self
 
 
@@ -145,21 +159,22 @@ class FP8Config(BaseConfig):
     enable_grouped_gemm: bool = True
     dequantize_checkpoint: bool = False
     """Load all serialized block-FP8 weights as BF16."""
-    dequantize_checkpoint_linears: bool = False
-    """Diagnostic: dequantize dense/attention FP8 matrices, but keep MoE FP8."""
-    dequantize_checkpoint_moe: bool = False
-    """Diagnostic: dequantize all routed/shared MoE matrices."""
-    dequantize_checkpoint_routed_moe: bool = False
-    """Diagnostic: dequantize routed-expert matrices only."""
-    dequantize_checkpoint_shared_moe: bool = False
-    """Diagnostic: dequantize shared-expert matrices only."""
     diagnose_linear_backward: bool = False
-    """Report the first nonfinite native-FP8 linear backward for each shape."""
-    expert_activation_transport: Literal["bf16", "int4"] = "bf16"
-    """Expert-parallel activation transport. ``int4`` keeps checkpoint weights
-    in FP8, quantizes only forward all-to-all payloads to INT4, and sends
-    backward payloads in FP8."""
+    """Report non-finite native-FP8 linear backward values with module-FQN attribution."""
+    expert_activation_transport: Literal[
+        "bf16",
+        "int4",
+        "fp8",
+        "bf16_forward_fp8_backward",
+        "bf16_forward_fp8_recompute_backward",
+        "bf16_forward_fp8_local_recompute_backward",
+    ] = "bf16"
+    """Precision used for expert-parallel activation transport."""
     ignore_patterns: list[str] = _DEFAULT_FP8_IGNORE_PATTERNS
+    bf16_modules: list[str] = []
+    w8a16_modules: list[str] = []
+    fused_qkv_a_fp8: bool = False
+    """Use one packed checkpoint-FP8 projection for GLM Q-A and KV-A."""
 
 
 class MXFP8Config(BaseConfig):
@@ -170,11 +185,7 @@ class MXFP8Config(BaseConfig):
     ignore_patterns: list[str] = _DEFAULT_FP8_IGNORE_PATTERNS
 
 
-class MXFP4Config(BaseConfig):
-    type: Literal["mxfp4"] = "mxfp4"
-
-
-QuantizationConfig: TypeAlias = Annotated[FP8Config | MXFP8Config | MXFP4Config, Field(discriminator="type")]
+QuantizationConfig: TypeAlias = Annotated[FP8Config | MXFP8Config, Field(discriminator="type")]
 
 
 class ModelConfig(BaseModelConfig):
@@ -205,8 +216,11 @@ class ModelConfig(BaseModelConfig):
     optim_cpu_offload: bool = True
     """Offload only optimizer states (momentum, variance) to CPU, keeping weights on GPU. Avoids the H2D all-gather overhead of FSDP CPU offload while still saving GPU memory."""
 
-    reshard_after_forward: bool = True
-    """Reshard the model after each forward pass."""
+    reshard_after_forward: StrictBool | Literal[4] = True
+    """Reshard after forward. Four keeps each block sharded across four ranks until backward."""
+
+    native_fp8_expert_prefetch: bool = False
+    """Prefetch native-FP8 expert parameters before expert compute."""
 
     dp_replicate: int = 1
     """Data parallel dim where model weights are replicated."""
@@ -246,6 +260,15 @@ class ModelConfig(BaseModelConfig):
     """Transfer sparse-attention index caches with pipeline activations. This
     permits balanced stage boundaries that start on IndexShare layers."""
 
+    pp_limit_receive_buffers: bool = False
+    """Use the minimum receive-buffer count for the 1F1B pipeline schedule."""
+
+    pp_boundary_plan: Literal["balanced", "explicit"] = "balanced"
+    """Pipeline layer boundary source."""
+
+    pp_layer_boundaries: list[int] | None = None
+    """Complete layer boundaries for the explicit boundary plan."""
+
     cp_style: Literal["ring", "ulysses"] = "ring"
     """CP communication style. ``ring`` uses ring-attention all-gather/reduce-scatter (requires custom kernels per attention type). ``ulysses`` uses all-to-all to redistribute Q/K/V from sequence-sharded to head-sharded, runs vanilla attention locally on the full sequence, then all-to-all back — works out-of-the-box with any attention kernel (softmax FA, linear attention, mamba, etc.)."""
 
@@ -259,7 +282,7 @@ class ModelConfig(BaseModelConfig):
     """dtype for gradient/parameter reductions."""
 
     moe_router_dtype: Literal["bfloat16", "float32"] = "float32"
-    """Compute dtype for MoE router gates. ``float32`` (default) keeps router gate weights in fp32 through forward and backward (exempt from FSDP bf16 parameter casting) and computes the gate GEMM and routing logits in fp32, matching models trained with fp32 routing (e.g. GLM-5.x via Megatron's ``--moe-router-dtype fp32``). ``bfloat16`` computes the gate GEMM in the model compute dtype. Router score functions (sigmoid/softmax) run in fp32 regardless. Only affects the custom MoE implementation; a no-op for non-MoE and HF-impl models."""
+    """Compute dtype for custom MoE router outputs. ``float32`` (default) computes the gate output and routing scores in fp32. GLM-MoE keeps its loaded BF16 gate weights and uses the H200-compatible BF16 gate matmul with an fp32 result. Other custom MoE routers keep the existing fp32 gate-weight behavior. ``bfloat16`` computes the gate matmul in the model compute dtype. Only affects the custom MoE implementation."""
 
     moe_use_grouped_mm: bool = True
     """Use grouped mm for MoE layers. Requires compute capability ≥ 9.0."""
@@ -357,6 +380,40 @@ class ModelConfig(BaseModelConfig):
         if isinstance(self.ep, int) and self.ep <= 1:
             raise ValueError(f"model.ep_comm_backend='{self.ep_comm_backend}' requires model.ep > 1.")
 
+        return self
+
+    @model_validator(mode="after")
+    def validate_local_expert_recompute(self):
+        local_recompute = (
+            isinstance(self.quantization, FP8Config)
+            and self.quantization.expert_activation_transport
+            == "bf16_forward_fp8_local_recompute_backward"
+        )
+        if not local_recompute:
+            return self
+        if (
+            self.pp <= 1
+            or self.pp_schedule == "interleaved_1f1b"
+            or self.ep_comm_backend != "torch"
+            or (isinstance(self.ep, int) and self.ep <= 1)
+        ):
+            raise ValueError(
+                "local expert recompute requires non-interleaved pipeline parallelism and torch expert parallelism"
+            )
+        cutoff = (
+            self.ac.keep_routed_expert_activations_from_pp_stage
+            if self.ac is not None
+            else None
+        )
+        if (
+            self.ac is None
+            or self.ac.mode != "reentrant_attention_all_experts"
+            or cutoff is None
+            or cutoff >= self.pp
+        ):
+            raise ValueError(
+                "local expert recompute requires a valid eager routed-expert pipeline cutoff"
+            )
         return self
 
     @model_validator(mode="after")
@@ -559,27 +616,83 @@ class FakeDataLoaderConfig(BaseConfig):
     generate_samples: bool = False
     """Generate separate samples and pack them into a single micro-batch instead of using random tensors."""
 
+    samples_per_micro_batch: int | None = Field(None, ge=1)
+    """Generate exactly this many samples in each packed micro-batch."""
+
+    group_size: int | None = Field(None, ge=2)
+    """Normalize generated sample advantages in groups of this size."""
+
     ce_only: bool = False
     """Use a CE-only objective so trainer stress tests do real backward work."""
 
     reference_path: Path | None = None
-    """Use deterministic token IDs and aligned HF log probabilities from this JSON file."""
+    """Use deterministic token IDs and aligned reference log probabilities from this JSON file."""
+
+    export_final_adapter: bool = False
+    """Write the final LoRA adapter for an inference qualification."""
+
+    @model_validator(mode="after")
+    def validate_grouped_samples(self):
+        if (self.samples_per_micro_batch is None) != (self.group_size is None):
+            raise ValueError(
+                "samples_per_micro_batch and group_size must be set together"
+            )
+        if self.samples_per_micro_batch is None:
+            return self
+        if not self.generate_samples:
+            raise ValueError("grouped fake samples require generate_samples=true")
+        if self.reference_path is not None:
+            raise ValueError("grouped fake samples cannot use a reference file")
+        if self.samples_per_micro_batch % self.group_size:
+            raise ValueError(
+                "samples_per_micro_batch must be divisible by group_size"
+            )
+        return self
+
+
+class RolloutCacheConfig(BaseConfig):
+    mode: Literal["record", "replay"]
+    directory: Path
+    policy_id: str = Field(min_length=1)
+    repeats: int = Field(1, ge=1, le=256)
+    combine_partial_batches: bool = False
+    recorded_cp_size: int | None = Field(None, ge=1)
+
+    @model_validator(mode="after")
+    def repeats_apply_to_replay_only(self):
+        if self.mode == "record" and self.repeats != 1:
+            raise ValueError("rollout cache record mode requires repeats=1")
+        if self.mode == "record" and self.combine_partial_batches:
+            raise ValueError(
+                "rollout cache record mode cannot combine partial batches"
+            )
+        if self.mode == "record" and self.recorded_cp_size is not None:
+            raise ValueError("rollout cache record mode cannot change the recorded topology")
+        return self
 
 
 class DataLoaderConfig(BaseConfig):
     fake: FakeDataLoaderConfig | None = None
     """Use a fake data loader sampling random micro-batches (for debugging)."""
 
+    rollout_cache: RolloutCacheConfig | None = None
+
+    @model_validator(mode="after")
+    def choose_one_debug_source(self):
+        if self.fake is not None and self.rollout_cache is not None:
+            raise ValueError("fake data and rollout cache cannot be enabled together")
+        return self
+
 
 class ParityGuardConfig(BaseConfig):
     max_unmasked_mismatch_kl: float = Field(0.1, ge=0)
-    """Reject the step before optimizer update when retained-token mismatch exceeds this value."""
+    """Reject the step when retained-token mismatch exceeds this value."""
 
     max_masked_mismatch_kl: float = Field(0.5, ge=0)
-    """Reject the step before optimizer update when masked-token mismatch exceeds this value."""
+    """Reject the step when masked-token mismatch exceeds this value."""
 
     max_masked_fraction: float = Field(0.06, ge=0, le=1)
-    """Reject the step before optimizer update when DPPO masks more than this token fraction."""
+    """Reject the step when DPPO masks more than this token fraction."""
 
 
 class BaseWeightBroadcastConfig(BaseConfig):
@@ -645,7 +758,7 @@ class TrainerConfig(BaseConfig):
     data: DataLoaderConfig = DataLoaderConfig()
 
     parity_guard: ParityGuardConfig | None = None
-    """Optional fail-closed trainer-to-inference parity limits for RL batches."""
+    """Optional fail-closed trainer-to-inference parity limits."""
 
     loss: LossConfig = DefaultLossConfig()
     """Loss config for the rl loss component (see ``setup_rl_loss_fn``). The ce / ref_kl components are fixed and do not read this."""
@@ -660,7 +773,7 @@ class TrainerConfig(BaseConfig):
     weight_broadcast: WeightBroadcastConfig = FileSystemWeightBroadcastConfig()
     """Transport used to broadcast updated weights from trainer to inference."""
 
-    rollout_transport: TransportConfig = FileSystemTransportConfig()
+    rollout_transport: TransportConfig = ZMQTransportConfig()
     """Transport used to ship rollouts from orchestrator to trainer."""
 
     log: TrainerLogConfig = TrainerLogConfig()
@@ -713,6 +826,17 @@ class TrainerConfig(BaseConfig):
 
     env_vars: EnvVars = {}
     """Extra environment variables for the trainer process(es). Merged on top of the launcher defaults."""
+
+    @model_validator(mode="after")
+    def validate_rollout_cache(self):
+        cache = self.data.rollout_cache
+        if cache is not None and cache.mode == "record" and self.max_steps != 1:
+            raise ValueError("rollout cache record mode requires max_steps=1")
+        if cache is not None and self.max_concurrent_runs != 1:
+            raise ValueError("rollout cache supports one run only")
+        if cache is not None and self.optim.lr != 0:
+            raise ValueError("rollout cache qualification requires optim.lr=0")
+        return self
 
     @model_validator(mode="after")
     def deepep_disables_grad_clipping(self):
@@ -822,5 +946,14 @@ class TrainerConfig(BaseConfig):
     def router_replay_only_with_custom_impl(self):
         if self.enable_router_replay and self.model.impl not in ("custom", "auto"):
             raise ValueError("Router replay is only supported with the custom implementation or auto mode")
+
+        if (
+            self.enable_router_replay
+            and self.data.fake is not None
+            and self.data.fake.reference_path is None
+        ):
+            raise ValueError(
+                "Router replay with fake data requires a reference file with route IDs"
+            )
 
         return self

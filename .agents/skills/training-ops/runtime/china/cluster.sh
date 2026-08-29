@@ -164,6 +164,8 @@ PY
       "${transformers_mount[@]}" \
       "${python_dependency_mounts[@]}" \
       -e TMPDIR=/scratch-tmp \
+      -v "$deployment/prime-rl/src/prime_rl/_compat.py":/app/src/prime_rl/_compat.py:ro \
+      -v "$deployment/prime-rl/src/prime_rl/parity_router_trace.py":/app/src/prime_rl/parity_router_trace.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/fp8_checkpoint.py":/app/src/prime_rl/trainer/fp8_checkpoint.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/model.py":/app/src/prime_rl/trainer/model.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/models/layers/fp8_ada.py":/app/src/prime_rl/trainer/models/layers/fp8_ada.py:ro \
@@ -173,18 +175,22 @@ PY
       -v "$deployment/prime-rl/src/prime_rl/trainer/models/layers/hf_ring_attn.py":/app/src/prime_rl/trainer/models/layers/hf_ring_attn.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/models/layers/lm_head_gemma.py":/app/src/prime_rl/trainer/models/layers/lm_head_gemma.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/distributed/expert_parallel.py":/app/src/prime_rl/trainer/distributed/expert_parallel.py:ro \
+      -v "$deployment/prime-rl/src/prime_rl/trainer/distributed/partial_reshard.py":/app/src/prime_rl/trainer/distributed/partial_reshard.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/distributed/pipeline_parallel.py":/app/src/prime_rl/trainer/distributed/pipeline_parallel.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/distributed/pp_runner.py":/app/src/prime_rl/trainer/distributed/pp_runner.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/parallel_dims.py":/app/src/prime_rl/trainer/parallel_dims.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/utils/cp.py":/app/src/prime_rl/utils/cp.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/rl/train.py":/app/src/prime_rl/trainer/rl/train.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/rl/data.py":/app/src/prime_rl/trainer/rl/data.py:ro \
+      -v "$deployment/prime-rl/src/prime_rl/trainer/rl/token_export.py":/app/src/prime_rl/trainer/rl/token_export.py:ro \
+      -v "$deployment/prime-rl/src/prime_rl/trainer/runs.py":/app/src/prime_rl/trainer/runs.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/weights.py":/app/src/prime_rl/trainer/weights.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/utils.py":/app/src/prime_rl/trainer/utils.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/rl/broadcast/filesystem.py":/app/src/prime_rl/trainer/rl/broadcast/filesystem.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py":/app/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/models/glm_moe_dsa/sparse_mla_attention.py":/app/src/prime_rl/trainer/models/glm_moe_dsa/sparse_mla_attention.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/models/layers/lora/multi_linear.py":/app/src/prime_rl/trainer/models/layers/lora/multi_linear.py:ro \
+      -v "$deployment/prime-rl/src/prime_rl/trainer/models/layers/lora/native_fp8_moe.py":/app/src/prime_rl/trainer/models/layers/lora/native_fp8_moe.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/lora.py":/app/src/prime_rl/trainer/lora.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/models/kernels/sparse_mla_fwd.py":/app/src/prime_rl/trainer/models/kernels/sparse_mla_fwd.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/models/kernels/sparse_mla_bwd.py":/app/src/prime_rl/trainer/models/kernels/sparse_mla_bwd.py:ro \

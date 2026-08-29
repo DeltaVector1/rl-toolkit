@@ -22,15 +22,6 @@ import torch.nn as nn
 from prime_rl.utils.logger import get_logger
 
 
-class SliceableModuleDict(nn.ModuleDict):
-    """A globally keyed stage layer set that HF forwards can also slice."""
-
-    def __getitem__(self, key):
-        if isinstance(key, slice):
-            return list(self.values())[key]
-        return super().__getitem__(key)
-
-
 
 def _index_computing_layers(config) -> list[int] | None:
     """Layers that compute their own sparse-MLA top-k indices.
@@ -55,6 +46,45 @@ def _index_computing_layers(config) -> list[int] | None:
     if freq and freq > 1:
         return list(range(0, len(range(getattr(config, "num_hidden_layers", 0))), freq))
     return None
+
+
+def sparse_cache_stage_flags(
+    model: nn.Module,
+    pp_rank: int,
+    pp_size: int,
+    virtual_stage: int = 0,
+    virtual_stages: int = 1,
+) -> tuple[bool, bool]:
+    from prime_rl.trainer.model import get_language_model
+
+    lm = get_language_model(model)
+    config = getattr(lm, "config", None) or getattr(model, "config", None)
+    types = getattr(config, "indexer_types", None)
+    if types is not None:
+        computes = {index for index, kind in enumerate(types) if kind != "shared"}
+    else:
+        pattern = getattr(config, "index_topk_pattern", None)
+        if pattern is not None:
+            computes = {index for index, kind in enumerate(pattern) if kind != "S"}
+        else:
+            frequency = getattr(config, "index_topk_freq", None)
+            computes = (
+                set(range(0, config.num_hidden_layers, frequency))
+                if frequency and frequency > 1
+                else None
+            )
+    stage_index = pp_rank + virtual_stage * pp_size
+    total_stages = pp_size * virtual_stages
+    if computes is None:
+        return stage_index > 0, stage_index < total_stages - 1
+    start = stage_layer_range(config.num_hidden_layers, stage_index, total_stages, config)
+    receive = stage_index > 0 and start[0] not in computes
+    if stage_index == total_stages - 1:
+        return receive, False
+    next_start = stage_layer_range(
+        config.num_hidden_layers, stage_index + 1, total_stages, config
+    )[0]
+    return receive, next_start not in computes
 
 
 def balanced_boundaries(num_layers: int, pp_size: int, allowed: list[int] | None) -> list[int]:
@@ -132,7 +162,7 @@ def balanced_boundaries(num_layers: int, pp_size: int, allowed: list[int] | None
     return [0] + list(result[2])
 
 
-def compute_balanced_boundaries(num_layers: int, pp_size: int) -> list[int]:
+def compute_balanced_boundaries(num_layers: int, pp_size: int, config=None) -> list[int]:
     """Minimize the maximum layer count when stages can transfer index caches.
 
     The ordinary planner prioritizes activation memory and deliberately leaves
@@ -142,11 +172,21 @@ def compute_balanced_boundaries(num_layers: int, pp_size: int) -> list[int]:
     """
     from functools import lru_cache
 
+    hidden_size = getattr(config, "hidden_size", 0)
+    vocab_size = getattr(config, "vocab_size", 0)
+    embedding_gb = hidden_size * vocab_size * 2 / 1_000_000_000
+    output_head_gb = 0.0 if getattr(config, "tie_word_embeddings", False) else embedding_gb
+
     @lru_cache(maxsize=None)
     def solve(stage: int, start: int):
         remaining_stages = pp_size - stage
         def stage_cost(size: int) -> float:
-            return size * (1.50 + 0.137 * remaining_stages)
+            cost = size * (1.50 + 0.137 * remaining_stages)
+            if stage == 0:
+                cost += embedding_gb
+            if stage == pp_size - 1:
+                cost += output_head_gb
+            return cost
 
         if remaining_stages == 1:
             size = num_layers - start
@@ -176,15 +216,50 @@ def stage_layer_range(num_layers: int, pp_rank: int, pp_size: int, config=None) 
     compute their own indices (see ``_index_computing_layers``); otherwise the
     split is even with the remainder going to the earliest stages.
     """
-    if config is not None and getattr(config, "pp_transfer_sparse_indices", False):
-        bounds = compute_balanced_boundaries(num_layers, pp_size)
+    boundary_plan = getattr(config, "pp_boundary_plan", "balanced")
+    if config is not None and boundary_plan == "explicit":
+        configured = getattr(config, "pp_layer_boundaries", None)
+        if configured is None:
+            raise ValueError("explicit PP boundaries require pp_layer_boundaries")
+        bounds = [int(value) for value in configured]
+        if len(bounds) != pp_size + 1:
+            raise ValueError(
+                f"explicit PP boundaries need {pp_size + 1} values, got {len(bounds)}"
+            )
+        if bounds[0] != 0 or bounds[-1] != num_layers:
+            raise ValueError(
+                f"explicit PP boundaries must cover [0, {num_layers})"
+            )
+        if any(start >= end for start, end in zip(bounds, bounds[1:])):
+            raise ValueError("explicit PP boundaries must have non-empty ordered stages")
+        allowed = _index_computing_layers(config)
+        if allowed is not None and any(value not in allowed for value in bounds[1:-1]):
+            raise ValueError(
+                "explicit PP boundaries break the sparse index-cache chain"
+            )
+    elif config is not None and getattr(config, "pp_transfer_sparse_indices", False):
+        bounds = compute_balanced_boundaries(num_layers, pp_size, config)
     else:
         allowed = _index_computing_layers(config) if config is not None else None
         bounds = balanced_boundaries(num_layers, pp_size, allowed)
     return bounds[pp_rank], bounds[pp_rank + 1]
 
 
-def apply_pp_layers(model: nn.Module, pp_rank: int, pp_size: int) -> tuple[int, int]:
+def pp_layer_ranges(model: nn.Module, pp_rank: int, pp_size: int) -> list[tuple[int, int]]:
+    lm = model
+    ranges = getattr(lm, "pp_layer_ranges", None)
+    if ranges is None:
+        raise RuntimeError("pipeline layer ranges were not recorded on the decoder")
+    if getattr(lm, "pp_physical_rank", pp_rank) != pp_rank:
+        raise RuntimeError("pipeline layer ranges belong to a different PP rank")
+    if getattr(lm, "pp_physical_size", pp_size) != pp_size:
+        raise RuntimeError("pipeline layer range size does not match the PP mesh")
+    return [tuple(pair) for pair in ranges]
+
+
+def apply_pp_layers(
+    model: nn.Module, pp_rank: int, pp_size: int, virtual_stages: int = 1
+) -> tuple[int, int]:
     """Trim ``model`` in place to the decoder layers owned by ``pp_rank``.
 
     Returns the (start, end) global layer range kept, and records the offset on
@@ -203,7 +278,21 @@ def apply_pp_layers(model: nn.Module, pp_rank: int, pp_size: int) -> tuple[int, 
     # The decoder config carries indexer_types, which constrains where a stage
     # may start; see stage_layer_range.
     cfg = getattr(lm, "config", None) or getattr(model, "config", None)
-    start, end = stage_layer_range(num_layers, pp_rank, pp_size, config=cfg)
+    if virtual_stages < 1:
+        raise ValueError(f"virtual_stages must be positive, got {virtual_stages}")
+    virtual_size = pp_size * virtual_stages
+    ranges = [
+        stage_layer_range(
+            num_layers,
+            pp_rank + local_index * pp_size,
+            virtual_size,
+            config=cfg,
+        )
+        for local_index in range(virtual_stages)
+    ]
+    if any(start >= end for start, end in ranges):
+        raise RuntimeError(f"empty pipeline virtual stage range: {ranges}")
+    start, end = ranges[0]
 
     # Key by GLOBAL layer index. A dense ModuleList would renumber layers 0..k
     # and the checkpoint keys (model.layers.69.*) would no longer resolve, so
@@ -211,22 +300,18 @@ def apply_pp_layers(model: nn.Module, pp_rank: int, pp_size: int) -> tuple[int, 
     # the original names and makes the key itself the global index, so router
     # replay needs no separate offset.
     layers = list(lm.layers)
-    lm.layers = SliceableModuleDict({str(i): layers[i] for i in range(start, end)})
+    owned_layers = [index for pair in ranges for index in range(pair[0], pair[1])]
+    lm.layers = nn.ModuleDict({str(i): layers[i] for i in owned_layers})
     lm.pp_layer_offset = start
-    if getattr(getattr(model, "config", None), "model_type", None) == "muse_glimmer":
-        # The stock Muse forward indexes these per-layer arrays with a local
-        # enumerate() index. Make its stage config local while the ModuleDict
-        # keys and decoder layer_idx values remain global for checkpoint I/O.
-        for name in ("layer_types", "layer_rope_theta"):
-            values = getattr(cfg, name, None)
-            if values is not None:
-                setattr(cfg, name, list(values[start:end]))
-        cfg.num_hidden_layers = end - start
+    lm.pp_layer_ranges = tuple(ranges)
+    lm.pp_physical_rank = pp_rank
+    lm.pp_physical_size = pp_size
+    lm.pp_virtual_stages = virtual_stages
     if pp_rank != 0:
         lm.embed_tokens = None
 
     get_logger().info(
-        f"PP stage {pp_rank}/{pp_size}: layers [{start}, {end}) of {num_layers}, layer_offset={start}"
+        f"PP stage {pp_rank}/{pp_size}: virtual ranges {ranges}, layer_offset={start}"
     )
     return start, end
 
@@ -242,13 +327,7 @@ def apply_pp_boundaries(model: nn.Module, pp_rank: int, pp_size: int) -> None:
 
     if pp_rank == pp_size - 1:
         return
-    lm = get_language_model(model)
-    if getattr(getattr(model, "config", None), "model_type", None) == "muse_glimmer":
-        # The stock Muse forward always calls its final norm. Identity keeps
-        # intermediate stages unnormalized without retaining norm weights.
-        lm.norm = nn.Identity()
-    else:
-        lm.norm = None
+    get_language_model(model).norm = None
     for attr in ("lm_head", "output"):
         if getattr(model, attr, None) is not None:
             setattr(model, attr, None)

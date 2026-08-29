@@ -7,7 +7,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from prime_rl.configs.trainer import LoRAConfig
-from prime_rl.trainer.models.layers.fp8_ada import _Linear
+from prime_rl.trainer.models.layers.fp8_ada import (
+    FP8CheckpointFusedQKVA,
+    FP8CheckpointFusedQKVASlice,
+    _Linear,
+)
 from prime_rl.trainer.models.layers.lora import (
     MultiLoRALinear,
     MultiLoRAModule,
@@ -15,14 +19,17 @@ from prime_rl.trainer.models.layers.lora import (
     get_multilora_scaling,
 )
 from prime_rl.trainer.models.layers.lora.multi_linear import (
-    _SingleLoRA,
     _run_lora_for_loop,
     _run_lora_grouped_mm,
+    _SingleLoRA,
 )
 from prime_rl.trainer.models.layers.lora.multi_moe import (
     MultiLoRAGptOssGroupedExperts,
     MultiLoRAGroupedExperts,
     MultiLoRANonGatedGroupedExperts,
+)
+from prime_rl.trainer.models.layers.lora.native_fp8_moe import (
+    NativeFP8MultiLoRAGroupedExperts,
 )
 from prime_rl.trainer.models.layers.moe import (
     FP8CheckpointFeedForward,
@@ -264,6 +271,8 @@ def _find_target_modules(model: nn.Module, target_patterns: List[str]) -> List[s
             module,
             (
                 nn.Linear,
+                FP8CheckpointFusedQKVA,
+                FP8CheckpointFusedQKVASlice,
                 FP8CheckpointFeedForward,
                 GroupedExperts,
                 NonGatedGroupedExperts,
@@ -278,6 +287,83 @@ def _find_target_modules(model: nn.Module, target_patterns: List[str]) -> List[s
                 break
 
     return target_modules
+
+
+def _validate_glm_lora_targets(
+    model: nn.Module,
+    configured_patterns: List[str],
+    target_modules: List[str],
+) -> None:
+    if getattr(getattr(model, "config", None), "model_type", None) != "glm_moe_dsa":
+        return
+
+    required_patterns = {
+        "q_a_proj",
+        "q_b_proj",
+        "kv_a_proj_with_mqa",
+        "kv_b_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+        "shared_expert",
+        "experts",
+    }
+    missing_patterns = required_patterns - set(configured_patterns)
+    if missing_patterns:
+        raise ValueError(
+            "GLM-5.2 LoRA does not cover the full attention and MLP path; "
+            f"missing target names: {sorted(missing_patterns)}"
+        )
+
+    attention_names = {
+        "q_a_proj",
+        "q_b_proj",
+        "kv_a_proj_with_mqa",
+        "kv_b_proj",
+        "o_proj",
+    }
+    dense_names = {"gate_proj", "up_proj", "down_proj"}
+    expected = set()
+    for name, module in model.named_modules():
+        final_name = name.rsplit(".", 1)[-1]
+        if isinstance(
+            module,
+            (nn.Linear, FP8CheckpointFusedQKVA, FP8CheckpointFusedQKVASlice),
+        ) and final_name in attention_names:
+            expected.add(name)
+        elif (
+            isinstance(module, nn.Linear)
+            and final_name in dense_names
+            and ".mlp." in f".{name}."
+        ):
+            expected.add(name)
+        elif isinstance(module, FP8CheckpointFeedForward) and final_name == "shared_expert":
+            expected.add(name)
+        elif isinstance(module, GroupedExperts) and final_name == "experts":
+            expected.add(name)
+
+    actual = set(target_modules)
+    missing = sorted(expected - actual)
+    unexpected = sorted(actual - expected)
+    if missing or unexpected:
+        raise ValueError(
+            "GLM-5.2 LoRA target inventory does not match this pipeline stage: "
+            f"missing={missing[:8]} ({len(missing)} total), "
+            f"unexpected={unexpected[:8]} ({len(unexpected)} total)"
+        )
+
+    layer_count = sum(
+        1
+        for _, module in model.named_modules()
+        if type(module).__name__ == "GlmMoeDsaDecoderLayer"
+    )
+    if not layer_count:
+        raise ValueError("GLM-5.2 LoRA target validation found no decoder layers")
+    get_logger().info(
+        "Validated full GLM-5.2 LoRA coverage on this pipeline stage: "
+        f"{len(expected)} module containers across {layer_count} decoder layers"
+    )
 
 
 def _should_keep_trainable(param_name: str, modules_to_save_patterns: List[str]) -> bool:
@@ -353,12 +439,16 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> None:
 
     if not target_modules:
         raise ValueError(f"No LoRA target modules found for patterns {config.target_modules}.")
+    _validate_glm_lora_targets(model, config.target_modules, target_modules)
 
     for module_name in target_modules:
         base_module = _get_module_by_name(model, module_name)
 
         # Handle Linear layers
-        if isinstance(base_module, nn.Linear):
+        if isinstance(
+            base_module,
+            (nn.Linear, FP8CheckpointFusedQKVA, FP8CheckpointFusedQKVASlice),
+        ):
             lora_module = MultiLoRALinear(
                 base_layer=base_module,
                 rank=config.rank,
@@ -376,16 +466,22 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> None:
             )
         # Handle GroupedExperts (MoE)
         elif isinstance(base_module, GroupedExperts):
-            lora_module = MultiLoRAGroupedExperts(
-                base_layer=base_module,
-                rank=config.rank,
-                n_adapters=n_loras,
-                alpha=config.alpha,
-                dropout=config.dropout,
-            )
-            for adapter_index in range(n_loras):
-                for _, parameter in lora_module.named_parameters_for_adapter(adapter_index):
-                    parameter.data = parameter.data.to(torch.bfloat16)
+            if base_module.fp8_checkpoint:
+                lora_module = NativeFP8MultiLoRAGroupedExperts(
+                    base_layer=base_module,
+                    rank=config.rank,
+                    n_adapters=n_loras,
+                    alpha=config.alpha,
+                    dropout=config.dropout,
+                )
+            else:
+                lora_module = MultiLoRAGroupedExperts(
+                    base_layer=base_module,
+                    rank=config.rank,
+                    n_adapters=n_loras,
+                    alpha=config.alpha,
+                    dropout=config.dropout,
+                )
         # Handle NonGatedGroupedExperts (relu2 experts used by NemotronH's LatentMoE)
         elif isinstance(base_module, NonGatedGroupedExperts):
             lora_module = MultiLoRANonGatedGroupedExperts(
@@ -457,7 +553,6 @@ def load_initial_lora_adapter(model: nn.Module, adapter_path: str, adapter_idx: 
     from pathlib import Path
 
     from safetensors.torch import load_file
-    from torch.distributed.tensor import DTensor, distribute_tensor
 
     path = Path(adapter_path)
     if path.is_dir():
@@ -476,12 +571,7 @@ def load_initial_lora_adapter(model: nn.Module, adapter_path: str, adapter_idx: 
                 f"{module_name} with {module.n_adapters} slots"
             )
         for param_name, param in module.named_parameters_for_adapter(adapter_idx):
-            key = f"{module_name}.{param_name}.weight".replace(
-                "._checkpoint_wrapped_module", ""
-            )
-            if key in expected:
-                raise ValueError(f"Duplicate normalized LoRA adapter key: {key}")
-            expected[key] = param
+            expected[f"{module_name}.{param_name}.weight"] = param
 
     if hasattr(type(model), "convert_adapter_to_hf"):
         expected = type(model).convert_adapter_to_hf(expected)
@@ -505,10 +595,7 @@ def load_initial_lora_adapter(model: nn.Module, adapter_path: str, adapter_idx: 
                     f"Initial LoRA adapter shape mismatch for {key}: "
                     f"checkpoint={tuple(value.shape)}, model={tuple(param.shape)}"
                 )
-            value = value.to(device=param.device, dtype=param.dtype)
-            if isinstance(param, DTensor):
-                value = distribute_tensor(value, param.device_mesh, param.placements)
-            param.copy_(value)
+            param.copy_(value.to(device=param.device, dtype=param.dtype))
 
     get_logger().info(
         f"Loaded {len(expected)} initial LoRA tensors from {path} into adapter slot "
