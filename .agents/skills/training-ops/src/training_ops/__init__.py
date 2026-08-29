@@ -89,6 +89,9 @@ deployment_bundle_scp_timeout_seconds = limits.get(
 adapter_update_engine_startup_timeout_seconds = limits[
     "adapter_update_engine_startup_timeout_seconds"
 ]
+orchestrator_repair_staging_max_seconds = limits.get(
+    "adapter_update_engine_startup_timeout_seconds", 900
+)
 if (
     isinstance(adapter_update_engine_startup_timeout_seconds, bool)
     or not isinstance(adapter_update_engine_startup_timeout_seconds, int)
@@ -2707,6 +2710,44 @@ done
 """
 
 
+def _orchestrator_resume_safety_script(
+    ports: list[int], staging_max_seconds: int = orchestrator_repair_staging_max_seconds
+) -> str:
+    """Check inference safety without requiring a completion request."""
+    if not ports or not all(isinstance(port, int) and 1 <= port <= 65535 for port in ports):
+        raise Refused("orchestrator resume check requires configured inference ports")
+    if (
+        isinstance(staging_max_seconds, bool)
+        or not isinstance(staging_max_seconds, int)
+        or staging_max_seconds <= 0
+    ):
+        raise Refused("orchestrator staging limit must be a positive integer")
+    port_list = " ".join(str(port) for port in ports)
+    return f"""set -euo pipefail
+for port in {port_list}; do
+  health=$(curl -sS -o /dev/null -m 30 -w '%{{http_code}}' "http://127.0.0.1:$port/health") || {{ echo "health request failed on $port" >&2; exit 31; }}
+  [ "$health" = 200 ] || {{ echo "health returned $health on $port" >&2; exit 32; }}
+  liveness=$(curl -sS -o /dev/null -m 30 -w '%{{http_code}}' "http://127.0.0.1:$port/liveness") || {{ echo "liveness request failed on $port" >&2; exit 33; }}
+  [ "$liveness" = 200 ] || {{ echo "liveness returned $liveness on $port" >&2; exit 34; }}
+  metrics=$(curl -sS -m 30 "http://127.0.0.1:$port/metrics") || {{ echo "metrics request failed on $port" >&2; exit 35; }}
+  running=$(printf '%s\\n' "$metrics" | awk '
+    $1 ~ /^vllm:num_requests_running(\\{{|$)/ {{
+      if ($NF !~ /^[0-9]+(\\.[0-9]+)?$/) bad=1
+      else {{ total += $NF; found=1 }}
+    }}
+    END {{ if (!found || bad || total != 0) exit 1; printf "%.0f", total }}
+  ') || {{ echo "active or unreadable requests on $port" >&2; exit 36; }}
+  staging=$(curl -sS -m 30 "http://127.0.0.1:$port/staging_status") || {{ echo "staging status request failed on $port" >&2; exit 37; }}
+  staging_state=$(printf '%s\\n' "$staging" | sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p')
+  staging_age=$(printf '%s\\n' "$staging" | sed -n 's/.*"age_seconds"[[:space:]]*:[[:space:]]*\\([0-9][0-9.]*\\).*/\\1/p')
+  [ "$staging_state" = idle ] || [ "$staging_state" = staging ] || {{ echo "unknown staging status on $port" >&2; exit 38; }}
+  [ -n "$staging_age" ] || {{ echo "staging age is missing on $port" >&2; exit 39; }}
+  awk -v age="$staging_age" -v limit={staging_max_seconds} 'BEGIN {{ exit !(age >= 0 && age <= limit) }}' || {{ echo "staging exceeds the bounded limit on $port" >&2; exit 40; }}
+  echo "port=$port health=$health liveness=$liveness running=$running staging=$staging_state age=$staging_age"
+done
+"""
+
+
 def _adapter_prefetch_stop_script(run_marker: str, service_marker: str, output_dir: str) -> str:
     for value in (run_marker, service_marker, output_dir):
         if not value or any(ch in value for ch in "'\\\n"):
@@ -2973,6 +3014,8 @@ def repair(what: str) -> str:
     """Apply a named repair to the configured hosts."""
     if what == "tunnels":
         return _repair_tunnels()
+    if what.startswith("engine-watchdog:"):
+        return _repair_engine_watchdog(what.split(":", 1)[1])
     if what.startswith("engine:"):
         return _repair_engine(what.split(":", 1)[1])
     if what == "supervisors":
@@ -2981,8 +3024,10 @@ def repair(what: str) -> str:
         return _repair_microbatch_sync()
     if what == "adapter-update":
         return _repair_adapter_update()
+    if what == "orchestrator":
+        return _repair_orchestrator()
     raise Refused(
-        f"unknown repair {what!r}. Use tunnels, engine:<host>, supervisors, microbatch-sync, or adapter-update."
+        f"unknown repair {what!r}. Use tunnels, engine-watchdog:<host>, engine:<host>, supervisors, microbatch-sync, adapter-update, or orchestrator."
     )
 
 
@@ -3156,6 +3201,85 @@ def _repair_microbatch_sync() -> str:
     return result
 
 
+def _repair_orchestrator() -> str:
+    """Resume the exact orchestrator after proving all peers are safe."""
+    run = current_run()
+    profile = _profile_for_run(run)
+    if not isinstance(profile.get("orchestrator"), str):
+        raise Refused(f"active profile for {run} has no orchestrator config")
+
+    before = status(run, quiet=True)
+    if not before.trainer_up or before.trainer_failed:
+        raise Refused("orchestrator repair requires a healthy trainer cluster")
+    if any(not node.reachable for node in before.nodes):
+        raise Refused("orchestrator repair requires every trainer host to be reachable")
+    if any(node.gpu_util >= 50 for node in before.nodes):
+        raise Refused("orchestrator repair requires the trainer to be idle or waiting")
+    inflight = re.search(r"(\d+) inflight", before.batch or "")
+    if inflight and int(inflight.group(1)) > 0:
+        raise Refused("orchestrator repair requires zero active rollout requests")
+
+    state_code, state_output = _ssh(
+        orchestrator_host,
+        _orchestrator_state_script(orchestrator_container),
+        timeout=90,
+    )
+    if state_code:
+        raise Refused(
+            "orchestrator repair requires one exact configured container: "
+            f"{state_output.strip()}"
+        )
+    observed_state = state_output.strip().splitlines()
+    if len(observed_state) != 1 or observed_state[0] not in {"running", "stopped"}:
+        raise Refused(
+            "orchestrator repair found an ambiguous container state: "
+            f"{state_output.strip() or 'no state'}"
+        )
+    was_running = observed_state[0] == "running"
+    if was_running != before.orch_up:
+        raise Refused(
+            "orchestrator container state changed during the safety check; "
+            "refusing an ambiguous resume"
+        )
+
+    kind = profile["kind"]
+    checks = _fan(
+        inference_hosts,
+        lambda host: _ssh(
+            host,
+            _orchestrator_resume_safety_script(
+                _inference_config(host, kind)["ports"],
+            ),
+            timeout=120,
+        ),
+    )
+    failed = {host: output.strip() for host, (code, output) in checks.items() if code}
+    if failed:
+        raise Refused(
+            "orchestrator repair requires healthy, live, idle inference endpoints: "
+            f"{failed}"
+        )
+
+    client_path = "prime-rl/src/prime_rl/utils/client.py"
+    if not deploy(client_path):
+        raise RuntimeError(f"orchestrator repair deployment failed for {client_path}")
+    resume_code, resume_output = _ssh(
+        orchestrator_host,
+        _start_or_restart_orchestrator_script(orchestrator_container, was_running),
+        timeout=180,
+    )
+    if resume_code:
+        raise RuntimeError(f"orchestrator resume failed: {resume_output.strip()}")
+    action = "restarted" if was_running else "started"
+    result = (
+        f"{action} exact orchestrator {orchestrator_container} for {run}; "
+        "trainer was idle, rollout requests were zero, inference health/liveness "
+        "passed, staging was bounded, and the resume-timeout client was deployed"
+    )
+    print(result)
+    return result
+
+
 def _repair_tunnels() -> str:
     rc, out = _ssh(
         trainer_head,
@@ -3237,6 +3361,173 @@ def _repair_engine(host: str) -> str:
         )
     print("Do not test with /v1/models. Test with engines() when the load finishes.")
     return out.strip()
+
+
+def _engine_watchdog_repair_script(watchdog_script: str, specs: list[dict]) -> str:
+    """Build an exact watchdog replacement without touching its engine."""
+    if not specs:
+        raise Refused("no configured watchdogs are available")
+    if not watchdog_script.startswith("/"):
+        raise Refused("watchdog script path must be absolute")
+
+    lines = [
+        "set -euo pipefail",
+        f"watchdog_script={shlex.quote(watchdog_script)}",
+        "test -x \"$watchdog_script\" || { echo 'watchdog script is missing or not executable' >&2; exit 70; }",
+        "watchdog_matches() {",
+        "  local pid=$1 command_line environment key value",
+        "  case \"$pid\" in ''|*[!0-9]*) return 1;; esac",
+        "  [ \"$pid\" -gt 1 ] || return 1",
+        "  [ -r \"/proc/$pid/cmdline\" ] && [ -r \"/proc/$pid/environ\" ] || return 1",
+        "  command_line=$(cat \"/proc/$pid/cmdline\" 2>/dev/null | tr '\\0' ' ' || true)",
+        "  case \"$command_line\" in",
+        "    \"bash $watchdog_script\"|\"/bin/bash $watchdog_script\"|\"/usr/bin/bash $watchdog_script\") ;;",
+        "    *) return 1;;",
+        "  esac",
+        "  environment=$(cat \"/proc/$pid/environ\" 2>/dev/null | tr '\\0' '\\n' || true)",
+    ]
+    for index, spec in enumerate(specs):
+        lines.append(f"  if [ \"${{watchdog_identity:-}}\" = {index!r} ]; then")
+        for key, value in spec["environment"].items():
+            lines.append(
+                f"    printf '%s\\n' \"$environment\" | grep -Fxq {shlex.quote(f'{key}={value}')} || return 1"
+            )
+        lines.append("  fi")
+    lines.extend(
+        [
+        "  return 0",
+        "}",
+        "watchdog_command_matches() {",
+        "  local pid=$1 command_line",
+        "  case \"$pid\" in ''|*[!0-9]*) return 1;; esac",
+        "  [ -r \"/proc/$pid/cmdline\" ] || return 1",
+        "  command_line=$(cat \"/proc/$pid/cmdline\" 2>/dev/null | tr '\\0' ' ' || true)",
+        "  case \"$command_line\" in \"bash $watchdog_script\"|\"/bin/bash $watchdog_script\"|\"/usr/bin/bash $watchdog_script\") return 0;; esac",
+        "  return 1",
+        "}",
+        "stop_watchdog() {",
+            "  local pid=$1 pgid",
+            "  watchdog_matches \"$pid\" || return 0",
+            "  pgid=$(awk '{print $5}' \"/proc/$pid/stat\" 2>/dev/null || true)",
+            "  [ \"$pgid\" = \"$pid\" ] || { echo \"watchdog identity is not its own process group: pid=$pid pgid=$pgid\" >&2; return 1; }",
+            "  kill -TERM -- \"-$pid\" 2>/dev/null || true",
+            "  for _ in $(seq 1 50); do watchdog_matches \"$pid\" || break; sleep 0.1; done",
+            "  if watchdog_matches \"$pid\"; then kill -KILL -- \"-$pid\" 2>/dev/null || true; fi",
+            "  for _ in $(seq 1 20); do watchdog_matches \"$pid\" || break; sleep 0.1; done",
+            "  watchdog_matches \"$pid\" && { echo \"watchdog did not exit: pid=$pid\" >&2; return 1; }",
+            "}",
+        ]
+    )
+    for index, spec in enumerate(specs):
+        lines.extend(
+            [
+                f"watchdog_identity={index}",
+                "matches=()",
+                "for proc_dir in /proc/[0-9]*; do",
+                "  pid=${proc_dir##*/}",
+                "  watchdog_matches \"$pid\" && matches+=(\"$pid\")",
+                "done",
+                f"if [ \"${{#matches[@]}}\" -gt 1 ]; then echo {shlex.quote(f'ambiguous watchdog identity for port {spec["environment"]["PORT"]}:')} \"${{matches[*]}}\" >&2; exit 71; fi",
+                "candidates=()",
+                "for proc_dir in /proc/[0-9]*; do",
+                "  pid=${proc_dir##*/}",
+                "  if watchdog_command_matches \"$pid\"; then",
+                f"    if tr '\\0' '\\n' <\"/proc/$pid/environ\" 2>/dev/null | grep -Fxq {shlex.quote(f'PORT={spec["environment"]["PORT"]}')}; then",
+                "      candidates+=(\"$pid\")",
+                "    elif ! tr '\\0' '\\n' <\"/proc/$pid/environ\" 2>/dev/null | grep -Eq '^PORT='; then",
+                f"      echo {shlex.quote(f'watchdog settings are not identifiable for port {spec["environment"]["PORT"]}')} >&2; exit 74",
+                "    fi",
+                "  fi",
+                "done",
+                f"[ \"${{#candidates[@]}}\" -le 1 ] || {{ echo {shlex.quote(f'ambiguous watchdog processes for port {spec["environment"]["PORT"]}:')} \"${{candidates[*]}}\" >&2; exit 71; }}",
+                f"if [ \"${{#candidates[@]}}\" = 1 ] && [ \"${{#matches[@]}}\" = 0 ]; then echo {shlex.quote(f'watchdog settings mismatch for port {spec["environment"]["PORT"]}')} >&2; exit 74; fi",
+                "if [ \"${#matches[@]}\" -eq 1 ]; then stop_watchdog \"${matches[0]}\"; fi",
+            ]
+        )
+        env_parts = [f"{key}={shlex.quote(str(value))}" for key, value in spec["environment"].items()]
+        lines.append("env " + " ".join(env_parts) + " \\")
+        lines.extend(
+            [
+                "  nohup setsid bash \"$watchdog_script\" >>" + shlex.quote(spec["log"]) + " 2>&1 </dev/null &",
+                "new_pid=$!",
+                "matched=0",
+                "for _ in $(seq 1 50); do",
+                "  if watchdog_matches \"$new_pid\"; then matched=1; break; fi",
+                "  sleep 0.1",
+                "done",
+                f"[ \"$matched\" = 1 ] || {{ echo {shlex.quote(f'new watchdog identity was not observed for port {spec["environment"]["PORT"]}')} >&2; exit 72; }}",
+                "matches=()",
+                "for proc_dir in /proc/[0-9]*; do",
+                "  pid=${proc_dir##*/}",
+                "  watchdog_matches \"$pid\" && matches+=(\"$pid\")",
+                "done",
+                f"[ \"${{#matches[@]}}\" = 1 ] || {{ echo {shlex.quote(f'watchdog identity is ambiguous after restart for port {spec["environment"]["PORT"]}:')} \"${{matches[*]}}\" >&2; exit 73; }}",
+            ]
+        )
+    lines.append('echo "reloaded exact engine watchdog(s) without restarting an engine"')
+    return "\n".join(lines) + "\n"
+
+
+def _repair_engine_watchdog(host: str) -> str:
+    """Deploy and reload only the active profile's exact watchdog process."""
+    _check_host(host)
+    if host not in inference_hosts:
+        raise Refused(f"{host} is not an engine host. Use one of {inference_hosts}.")
+    run = current_run()
+    profile = _profile_for_run(run)
+    kind = profile["kind"]
+    settings = _inference_config(host, kind)
+    configured_ports = settings.get("ports")
+    if not isinstance(configured_ports, list) or not configured_ports:
+        raise Refused(f"inference ports for {host} are missing")
+    if not all(isinstance(port, int) and 1 <= port <= 65535 for port in configured_ports):
+        raise Refused(f"inference ports for {host} are invalid")
+    muse_engine = kind == "muse"
+    model = muse_model if muse_engine else glm_model
+    container = muse_inference_container if muse_engine else glm_inference_container
+    start_script = (
+        f"{runtime_root}/h200/start_muse_inference.sh"
+        if muse_engine
+        else f"{runtime_root}/h200/start_inference.sh"
+    )
+    startup_grace = 600 if muse_engine else 180
+    specs = []
+    for replica, port in enumerate(configured_ports):
+        watchdog_container = f"{container}-{replica}" if muse_engine else container
+        environment = {
+            "STARTUP_GRACE": str(startup_grace),
+            "MODEL": model,
+            "START": start_script,
+            "ENGINE_CONTAINER": watchdog_container,
+            "PORT": str(port),
+        }
+        if muse_engine:
+            environment.update(
+                {
+                    "MUSE_GPU_COUNT": str(settings["gpu_count"]),
+                    "MUSE_TP_SIZE": str(settings["tensor_parallel_size"]),
+                    "MUSE_REPLICA_INDEX": str(replica),
+                }
+            )
+        specs.append(
+            {
+                "environment": environment,
+                "log": f"/root/engine_watchdog{f'-{replica}' if muse_engine else ''}.log",
+            }
+        )
+    watchdog_path = f"{runtime_root}/h200/engine_watchdog.sh"
+    if not deploy(".agents/skills/training-ops/runtime/h200/engine_watchdog.sh", [host]):
+        raise RuntimeError(f"watchdog deployment failed on {host}")
+    code, output = _ssh(
+        host,
+        _engine_watchdog_repair_script(watchdog_path, specs),
+        timeout=180,
+    )
+    if code:
+        raise RuntimeError(f"watchdog repair failed on {host}: {output.strip()}")
+    result = output.strip().splitlines()[-1] if output.strip() else "engine watchdog reloaded"
+    print(f"{host}: {result}")
+    return result
 
 
 def _repair_supervisors(profile: str = "current") -> str:

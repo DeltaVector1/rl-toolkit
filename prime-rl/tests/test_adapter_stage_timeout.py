@@ -121,6 +121,40 @@ class AdapterStageTimeoutTest(unittest.TestCase):
         self.assertIn("completion-miss restart checks resumed", source)
         self.assertIn("liveness_deferrals=0", source)
 
+    def test_named_watchdog_repair_preserves_active_profile_without_engine_restart(self):
+        import sys
+        from unittest import mock
+
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / ".agents/skills/training-ops/src"))
+        import training_ops
+
+        deployed = []
+        ssh_scripts = []
+
+        def fake_ssh(_host, script, timeout=120):
+            ssh_scripts.append((script, timeout))
+            return 0, "reloaded exact engine watchdog(s) without restarting an engine)\n"
+
+        with mock.patch.object(training_ops, "current_run", return_value="x85"), mock.patch.object(
+            training_ops, "deploy", side_effect=lambda *args: deployed.append(args) or True
+        ), mock.patch.object(
+            training_ops, "_ssh", side_effect=fake_ssh
+        ):
+            result = training_ops._repair_engine_watchdog("h200a")
+
+        self.assertIn("without restarting an engine", result)
+        self.assertEqual(deployed, [(".agents/skills/training-ops/runtime/h200/engine_watchdog.sh", ["h200a"])])
+        script = ssh_scripts[0][0]
+        self.assertIn("STARTUP_GRACE=180", script)
+        self.assertIn("MODEL=/models/glm52-fp8", script)
+        self.assertIn("START=/data/glm52-rl/deployment/.agents/skills/training-ops/runtime/h200/start_inference.sh", script)
+        self.assertIn("ENGINE_CONTAINER=glm52-decensor-h200", script)
+        self.assertIn("PORT=8000", script)
+        self.assertIn("ambiguous watchdog identity", script)
+        self.assertIn("kill -TERM --", script)
+        self.assertNotIn("docker", script)
+        self.assertNotIn("pkill", script)
+
 
 if __name__ == "__main__":
     unittest.main()
