@@ -20,6 +20,9 @@ class ColdCleanupTest(unittest.TestCase):
                 stale = target / "rollouts" / "step_1" / "train_rollouts.bin"
                 stale.parent.mkdir(parents=True)
                 stale.write_bytes(b"stale")
+                trainer_rollout = Path(training_ops.run_root) / "alpha" / "rollouts" / "step_1" / "rank_0.bin"
+                trainer_rollout.parent.mkdir(parents=True)
+                trainer_rollout.write_bytes(b"stale micro-batch")
                 (target / "control").mkdir()
                 (target / "control" / "orch.toml.delivered").write_text("old")
                 (target / "broadcasts").mkdir()
@@ -54,6 +57,7 @@ class ColdCleanupTest(unittest.TestCase):
                 self.assertTrue(all(timeout == 300 for _, _, timeout in calls))
                 self.assertTrue(target.exists())
                 self.assertFalse(stale.exists())
+                self.assertFalse(trainer_rollout.exists())
                 self.assertTrue(other.exists())
                 self.assertEqual(model.read_text(), "keep")
                 self.assertTrue(any("train_rollouts.bin" in line for line in output))

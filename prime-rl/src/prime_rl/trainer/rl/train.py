@@ -7,6 +7,7 @@ import math
 import os
 from pathlib import Path
 import re
+import socket
 import subprocess
 import time
 from datetime import datetime, timedelta, timezone
@@ -228,38 +229,130 @@ def pad_micro_batch_to_length(micro_batch, target_length: int) -> None:
     micro_batch["lora_num_tokens"][-1] += padding
 
 
-def verify_pipeline_batch_identity(micro_batches, pp_group) -> None:
-    """Fail before forward when stages in one pipeline loaded different data."""
-    digests = []
-    for micro_batch in micro_batches:
-        digest = hashlib.sha256()
-        for name in (
-            "input_ids",
-            "position_ids",
-            "inference_logprobs",
-            "loss_mask",
-            "lora_num_tokens",
-            "seq_lens",
-        ):
-            tensor = micro_batch[name].detach().cpu().contiguous()
-            digest.update(name.encode())
-            digest.update(str(tensor.dtype).encode())
-            digest.update(bytes(tensor.numpy().data))
-        digest.update(json.dumps(micro_batch["sequence_lengths"]).encode())
-        digests.append(
-            int.from_bytes(digest.digest()[:8], "little") & ((1 << 63) - 1)
+_BATCH_IDENTITY_FIELDS = (
+    "input_ids",
+    "position_ids",
+    "advantages",
+    "inference_logprobs",
+    "ref_logprobs",
+    "loss_mask",
+    "temperatures",
+    "env_names",
+    "sequence_lengths",
+    "lora_num_tokens",
+    "seq_lens",
+    "routed_experts",
+    "mm_kwargs",
+    "mm_token_type_ids",
+    "rl_weights",
+    "ce_weights",
+    "ref_kl_weights",
+    "run_id",
+    "run_step",
+)
+
+
+def _update_batch_identity(digest, value) -> None:
+    """Hash one batch value without relying on Python object serialization."""
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach().cpu().contiguous()
+        digest.update(b"tensor\0")
+        digest.update(str(tensor.dtype).encode())
+        digest.update(json.dumps(list(tensor.shape), separators=(",", ":")).encode())
+        digest.update(tensor.view(torch.uint8).numpy().tobytes())
+    elif isinstance(value, dict):
+        digest.update(b"dict\0")
+        for key in sorted(value):
+            digest.update(json.dumps(key, separators=(",", ":")).encode())
+            _update_batch_identity(digest, value[key])
+    elif isinstance(value, (list, tuple)):
+        digest.update(b"list\0")
+        digest.update(str(len(value)).encode())
+        for item in value:
+            _update_batch_identity(digest, item)
+    elif value is None:
+        digest.update(b"none\0")
+    else:
+        digest.update(json.dumps(value, sort_keys=True, separators=(",", ":")).encode())
+
+
+def _micro_batch_identity(micro_batch) -> str:
+    digest = hashlib.sha256()
+    for name in _BATCH_IDENTITY_FIELDS:
+        digest.update(name.encode())
+        _update_batch_identity(digest, micro_batch.get(name))
+    return digest.hexdigest()
+
+
+def _batch_identity(micro_batches) -> tuple[str, list[str]]:
+    micro_batch_hashes = [_micro_batch_identity(micro_batch) for micro_batch in micro_batches]
+    digest = hashlib.sha256()
+    for index, value in enumerate(micro_batch_hashes):
+        digest.update(index.to_bytes(8, "little"))
+        digest.update(value.encode())
+    return digest.hexdigest(), micro_batch_hashes
+
+
+def _batch_identity_record(micro_batches, local_error: str | None = None) -> dict:
+    batch_sha256 = None
+    micro_batch_hashes: list[str] = []
+    if local_error is None:
+        batch_sha256, micro_batch_hashes = _batch_identity(micro_batches)
+    return {
+        "rank": dist.get_rank(),
+        "host": os.environ.get("PRIME_TRAINER_NODE") or socket.gethostname(),
+        "microbatch_count": len(micro_batches),
+        "batch_sha256": batch_sha256,
+        "microbatch_sha256": micro_batch_hashes,
+        "error": local_error,
+    }
+
+
+def _format_batch_identity_records(records) -> str:
+    formatted = []
+    for record in sorted(records, key=lambda item: item["rank"]):
+        detail = (
+            f"rank={record['rank']} host={record['host']} "
+            f"microbatches={record['microbatch_count']} sha256={record['batch_sha256']}"
         )
-    local = torch.tensor(digests, dtype=torch.int64, device="cuda")
-    minimum = local.clone()
-    maximum = local.clone()
-    dist.all_reduce(minimum, op=dist.ReduceOp.MIN, group=pp_group)
-    dist.all_reduce(maximum, op=dist.ReduceOp.MAX, group=pp_group)
-    mismatched = torch.nonzero(minimum != maximum).flatten().tolist()
-    if mismatched:
+        if record.get("error"):
+            detail += f" error={record['error']}"
+        formatted.append(detail)
+    return "; ".join(formatted)
+
+
+def verify_pipeline_batch_identity(
+    micro_batches,
+    pp_group,
+    *,
+    compare_all_ranks: bool = False,
+    local_error: str | None = None,
+) -> None:
+    """Fail before forward when count or pipeline data differs across ranks."""
+    local = _batch_identity_record(micro_batches, local_error)
+    world_records = [None] * dist.get_world_size()
+    dist.all_gather_object(world_records, local)
+    errors = [record for record in world_records if record.get("error")]
+    counts = {record["microbatch_count"] for record in world_records}
+    hashes_differ = compare_all_ranks and len(
+        {record["batch_sha256"] for record in world_records}
+    ) > 1
+    if errors or len(counts) > 1 or hashes_differ:
         raise RuntimeError(
-            "pipeline stages loaded different trainer data for microbatches "
-            f"{mismatched[:10]}; check data-parallel rank mapping"
+            "trainer batch identity mismatch before pipeline data verification: "
+            + _format_batch_identity_records(world_records)
         )
+
+    # Data-parallel ranks intentionally load different data. Every rank in a
+    # pipeline group must still load the same batch for its pipeline stage.
+    if not compare_all_ranks:
+        group_records = [None] * dist.get_world_size(pp_group)
+        dist.all_gather_object(group_records, local, group=pp_group)
+        if len({record["batch_sha256"] for record in group_records}) > 1:
+            raise RuntimeError(
+                "pipeline stages loaded different trainer data before forward: "
+                + _format_batch_identity_records(group_records)
+            )
 
 
 def initialize_fresh_lora_policy(
@@ -1303,24 +1396,39 @@ def train(config: TrainerConfig):
                 _bad.append(
                     (_i, f"input_ids shape {tuple(_ids.shape)} (max len {_max_len})")
                 )
-        if _bad:
-            for _i, _why in _bad[:5]:
-                logger.error(f"Corrupt micro-batch {_i}: {_why}")
-            logger.error(
-                f"Discarding batch at step {progress.step}: {len(_bad)}/{len(micro_batches)} micro-batches corrupt. "
-                "Waiting for the next batch rather than crashing the run."
-            )
-            continue
 
         if parallel_dims.pp_enabled:
+            _local_error = None
+            if _bad:
+                _local_error = "; ".join(
+                    f"micro-batch {_i}: {_why}" for _i, _why in _bad[:5]
+                )
+            # GLM x85 has one data rank. Check every host before any rank can
+            # enter the pipeline schedule. A different final file otherwise
+            # leaves one host with an old parsed batch and only produced the
+            # generic count error below.
+            _compare_all_ranks = parallel_dims.get_mesh("dp").size() == 1
+            verify_pipeline_batch_identity(
+                micro_batches,
+                parallel_dims.get_mesh("pp").get_group(),
+                compare_all_ranks=_compare_all_ranks,
+                local_error=_local_error,
+            )
+            if _bad:
+                for _i, _why in _bad[:5]:
+                    logger.error(f"Corrupt micro-batch {_i}: {_why}")
+                logger.error(
+                    f"Discarding batch at step {progress.step}: {len(_bad)}/{len(micro_batches)} micro-batches corrupt. "
+                    "Waiting for the next batch rather than crashing the run."
+                )
+                continue
+
             # Schedule1F1B requires at least one micro-batch for each pipeline
             # stage. An engine restart can make almost all rollouts fail and
             # leave a much smaller packed trainer batch. x60r received two
             # micro-batches under PP8 and PyTorch stopped the complete trainer.
-            # Agree on the smallest rank-local count before any later
-            # collective, then consume and discard the undersized rollout
-            # batch. DataLoader advances to the next fresh batch while the
-            # trainer policy step remains unchanged.
+            # All ranks have already agreed on the count and identity above;
+            # consume and discard a uniformly undersized rollout batch.
             _minimum_count = torch.tensor(
                 len(micro_batches), dtype=torch.int64, device="cuda"
             )
@@ -1338,20 +1446,14 @@ def train(config: TrainerConfig):
                 )
                 continue
 
-            _count_range = torch.tensor(
-                [len(micro_batches), -len(micro_batches)],
-                dtype=torch.int64,
-                device="cuda",
+        elif _bad:
+            for _i, _why in _bad[:5]:
+                logger.error(f"Corrupt micro-batch {_i}: {_why}")
+            logger.error(
+                f"Discarding batch at step {progress.step}: {len(_bad)}/{len(micro_batches)} micro-batches corrupt. "
+                "Waiting for the next batch rather than crashing the run."
             )
-            dist.all_reduce(_count_range, op=dist.ReduceOp.MAX)
-            if _count_range[0].item() != -_count_range[1].item():
-                raise RuntimeError(
-                    "trainer ranks received different microbatch counts before "
-                    "pipeline data verification"
-                )
-            verify_pipeline_batch_identity(
-                micro_batches, parallel_dims.get_mesh("pp").get_group()
-            )
+            continue
 
         batch_size = len(micro_batches)
         if qualification_identity is not None:

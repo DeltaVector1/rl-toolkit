@@ -3209,6 +3209,7 @@ remove_file() {{
 # rollouts includes train_rollouts.bin and its .delivered/partial state;
 # broadcasts contains old adapters and STABLE markers; checkpoints contains
 # optimizer/progress state.  All paths remain below this exact run.
+remove_dir "$run_parent/rollouts" "trainer rollout batches and micro-batches"
 remove_dir "$run_dir/rollouts" "rollout train_rollouts.bin batches and delivery markers"
 remove_dir "$run_dir/broadcasts" "broadcast adapters and STABLE markers"
 remove_dir "$run_dir/checkpoints" "trainer checkpoints and optimizer state"

@@ -21,8 +21,17 @@ publish() {
     "sha256sum '$final' 2>/dev/null | cut -d' ' -f1" || true)
   [ "$remote_digest" = "$digest" ] && return
   if [ -n "$remote_digest" ]; then
-    echo "$host: refusing to replace $relative: destination hash differs" >&2
-    return 1
+    # A restarted run can leave the previous generation at this exact step.
+    # Move it out of the receiver's path before publishing the new immutable
+    # file. If the copy fails, the receiver sees no file instead of consuming
+    # the previous generation.
+    stale="$final.stale.$remote_digest"
+    ssh -n "${ssh_opts[@]}" "$host" \
+      "mv -f '$final' '$stale'" || {
+      echo "$host: cannot quarantine stale $relative ($remote_digest)" >&2
+      return 1
+    }
+    echo "$host: quarantined stale $relative ($remote_digest)" >&2
   fi
 
   ssh -n "${ssh_opts[@]}" "$host" \
@@ -47,13 +56,16 @@ scan() {
   local file host
   while IFS= read -r -d '' file; do
     for host in $nodes; do
-      publish "$file" "$host" || true
+      publish "$file" "$host" || return 1
     done
   done < <(find "$run_dir/rollouts" -type f -name 'rank_*.bin' -print0 2>/dev/null | sort -z)
 }
 
 while true; do
-  scan
+  scan || {
+    echo "microbatch sync stopped: publication failed" >&2
+    exit 1
+  }
   [ "${once:-0}" = 1 ] && exit
   sleep "$interval"
 done
