@@ -116,7 +116,12 @@ def _request_timeout(deadline: float | None) -> float:
     return min(_ADAPTER_LANE_TIMEOUT_S, deadline - time.monotonic())
 
 
-def _wait_for_futures(executor: ThreadPoolExecutor, futures, deadline: float | None) -> None:
+def _wait_for_futures(
+    executor: ThreadPoolExecutor,
+    futures,
+    deadline: float | None,
+    cancel_event: threading.Event | None = None,
+) -> None:
     try:
         for future in futures:
             if deadline is None:
@@ -130,9 +135,22 @@ def _wait_for_futures(executor: ThreadPoolExecutor, futures, deadline: float | N
             except FutureTimeoutError as exc:
                 raise TimeoutError("adapter delta staging exceeded its time limit") from exc
     except BaseException:
+        if cancel_event is not None:
+            cancel_event.set()
         for future in futures:
             future.cancel()
         executor.shutdown(wait=False, cancel_futures=True)
+        # Running urllib workers can still hold a private staging file open.
+        # Drain them for one bounded socket timeout before the caller cleans it.
+        stop_at = time.monotonic() + _ADAPTER_LANE_TIMEOUT_S
+        for future in futures:
+            remaining = stop_at - time.monotonic()
+            if remaining <= 0 or future.done():
+                continue
+            try:
+                future.result(timeout=remaining)
+            except BaseException:
+                continue
         raise
     else:
         executor.shutdown(wait=True)
@@ -511,10 +529,13 @@ def _download_range(
     end: int,
     progress=None,
     deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> None:
     """Download one inclusive byte range and resume its local part file."""
     size = end - start + 1
     for attempt in range(_ADAPTER_LANE_RETRIES):
+        if cancel_event is not None and cancel_event.is_set():
+            return
         _check_deadline(deadline)
         try:
             source_url = source_urls[(source_index + attempt) % len(source_urls)]
@@ -533,6 +554,8 @@ def _download_range(
                     raise OSError("adapter server did not honor byte range")
                 with destination.open("ab" if present else "wb") as output:
                     while present < size:
+                        if cancel_event is not None and cancel_event.is_set():
+                            return
                         _check_deadline(deadline)
                         chunk = response.read(min(16 * 1024 * 1024, size - present))
                         if not chunk:
@@ -557,7 +580,10 @@ def _download_range(
                 if remaining <= 0:
                     raise TimeoutError("adapter delta staging exceeded its time limit")
                 sleep_for = min(sleep_for, remaining)
-            time.sleep(sleep_for)
+            if cancel_event is None:
+                time.sleep(sleep_for)
+            else:
+                cancel_event.wait(sleep_for)
 
 
 def _sha256(path: Path, deadline: float | None = None) -> str:
@@ -674,6 +700,19 @@ def _transport_raw_sha256(delta: bytes) -> str:
     return hashlib.sha256(shuffle_bf16_bytes(delta)).hexdigest()
 
 
+def _cleanup_delta_stage_artifacts(destination: Path) -> None:
+    """Remove private delta staging paths after all transfer workers stop."""
+    for suffix in (".partial", ".parts", ".assembling"):
+        candidate = destination.with_name(f"{destination.name}{suffix}")
+        try:
+            if candidate.is_dir() and not candidate.is_symlink():
+                shutil.rmtree(candidate)
+            else:
+                candidate.unlink(missing_ok=True)
+        except FileNotFoundError:
+            continue
+
+
 def _stage_chunked_xor_adapter(
     source_url: str,
     transport: dict[str, object],
@@ -781,7 +820,11 @@ def _stage_chunked_xor_adapter(
     if not output_path.is_file() or output_path.stat().st_size != target_size:
         _preallocate(output_path, target_size)
 
+    cancel_event = threading.Event()
+
     def fetch(index: int, item: dict[str, object]) -> None:
+        if cancel_event.is_set():
+            return
         name = item["file"]
         assert isinstance(name, str)
         relative = Path(name)
@@ -801,8 +844,11 @@ def _stage_chunked_xor_adapter(
             progress=lane_report,
             source_urls=[chunk_url],
             deadline=deadline,
+            cancel_event=cancel_event,
         )
 
+        if cancel_event.is_set():
+            return
         _check_deadline(deadline)
         encoded = chunk_path.read_bytes()
         if len(encoded) != int(item["wire_size"]):
@@ -820,6 +866,8 @@ def _stage_chunked_xor_adapter(
         if _transport_raw_sha256(raw) != raw_sha256:
             raise OSError("adapter transport decoded chunk checksum mismatch")
         offset = int(item["offset"])
+        if cancel_event.is_set():
+            return
         base_fd = os.open(base_model, os.O_RDONLY)
         output_fd = os.open(output_path, os.O_RDWR)
         try:
@@ -835,7 +883,7 @@ def _stage_chunked_xor_adapter(
 
     executor = ThreadPoolExecutor(max_workers=min(len(chunks), _PARALLEL_DOWNLOAD_STREAMS))
     futures = [executor.submit(fetch, index, item) for index, item in enumerate(chunks)]
-    _wait_for_futures(executor, futures, deadline)
+    _wait_for_futures(executor, futures, deadline, cancel_event)
 
     if _sha256(output_path, deadline) != target_sha256:
         raise OSError("reconstructed adapter checksum mismatch")
@@ -909,6 +957,7 @@ def download(
     progress=None,
     source_urls: list[str] | None = None,
     deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> None:
     _check_deadline(deadline)
     explicit_source_urls = source_urls is not None
@@ -938,6 +987,8 @@ def download(
         # Preserve the old single-file resume path for small metadata files and
         # for an explicitly disabled parallel transfer.
         for attempt in range(_ADAPTER_LANE_RETRIES):
+            if cancel_event is not None and cancel_event.is_set():
+                return
             _check_deadline(deadline)
             try:
                 offset = destination.stat().st_size if destination.exists() else 0
@@ -954,6 +1005,8 @@ def download(
                         raise OSError("adapter server did not honor byte range")
                     with destination.open("ab" if offset else "wb") as output:
                         while offset < total:
+                            if cancel_event is not None and cancel_event.is_set():
+                                return
                             _check_deadline(deadline)
                             chunk = response.read(min(16 * 1024 * 1024, total - offset))
                             if not chunk:
@@ -982,7 +1035,10 @@ def download(
                     if remaining <= 0:
                         raise TimeoutError("adapter delta staging exceeded its time limit")
                     sleep_for = min(sleep_for, remaining)
-                time.sleep(sleep_for)
+                if cancel_event is None:
+                    time.sleep(sleep_for)
+                else:
+                    cancel_event.wait(sleep_for)
         return
 
     # Long-distance adapter downloads otherwise use one TCP congestion window
@@ -1016,6 +1072,7 @@ def download(
         _write_json(identity_path, identity)
 
     executor = ThreadPoolExecutor(max_workers=len(ranges))
+    cancel_event = cancel_event or threading.Event()
     futures = [
         executor.submit(
             _download_range,
@@ -1026,10 +1083,11 @@ def download(
             end,
             progress,
             deadline,
+            cancel_event,
         )
         for index, start, end in ranges
     ]
-    _wait_for_futures(executor, futures, deadline)
+    _wait_for_futures(executor, futures, deadline, cancel_event)
 
     assembling = destination.with_name(f"{destination.name}.assembling")
     with assembling.open("wb") as output:
@@ -1071,6 +1129,7 @@ def stage_lora_adapter_files(source_url: str, require_delta: bool = False) -> Pa
     # another and made it possible to publish a stale policy after a newer one.
     with (destination.parent / "adapter-staging.lock").open("w") as host_lock:
         _acquire_stage_lock(host_lock, delta_deadline)
+        transport: dict[str, object] | None = None
         try:
             transport = _read_chunked_xor_manifest(source_url, deadline=delta_deadline)
             if (
@@ -1138,7 +1197,9 @@ def stage_lora_adapter_files(source_url: str, require_delta: bool = False) -> Pa
                         _cleanup_previous_adapter_caches(destination.parent, destination)
                         return destination
                 _check_deadline(delta_deadline)
-                return _stage_chunked_xor_adapter(source_url, transport, manifest, deadline=delta_deadline)
+                return _stage_chunked_xor_adapter(
+                    source_url, transport, manifest, deadline=delta_deadline
+                )
             transport = None
 
             if (destination / "READY").is_file():
@@ -1257,6 +1318,8 @@ def stage_lora_adapter_files(source_url: str, require_delta: bool = False) -> Pa
             )
             return destination
         except BaseException as exc:
+            if require_delta or (isinstance(transport, dict) and transport.get("mode") == "delta"):
+                _cleanup_delta_stage_artifacts(destination)
             _write_stage_status(
                 destination.parent,
                 {
