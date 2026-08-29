@@ -111,6 +111,16 @@ class AdapterStageTimeoutTest(unittest.TestCase):
         self.assertIn("age < grace", source)
         self.assertIn("adapter staging exceeded grace", source)
 
+    def test_watchdog_checks_collective_liveness_before_restarting(self):
+        source = WATCHDOG_PATH.read_text(encoding="utf-8")
+        self.assertIn('LIVENESS_TIMEOUT=${LIVENESS_TIMEOUT:-15}', source)
+        self.assertIn('"http://127.0.0.1:$PORT/liveness"', source)
+        self.assertIn("engine liveness passed", source)
+        self.assertIn("engine liveness failed", source)
+        self.assertIn("restart deferred", source)
+        self.assertIn("completion-miss restart checks resumed", source)
+        self.assertIn("liveness_deferrals=0", source)
+
 
 if __name__ == "__main__":
     unittest.main()

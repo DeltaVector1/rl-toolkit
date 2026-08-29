@@ -32,7 +32,12 @@ RELOAD_TRIES=${RELOAD_TRIES:-40}
 RELOAD_WAIT=${RELOAD_WAIT:-30}
 STAGING_STATUS_TIMEOUT=${STAGING_STATUS_TIMEOUT:-5}
 STAGING_GRACE=${STAGING_GRACE:-7200}
+# /liveness runs the vLLM collective RPC. It can prove that the workers are
+# responsive while a tiny generation is delayed by a paused or busy engine.
+LIVENESS_TIMEOUT=${LIVENESS_TIMEOUT:-15}
+LIVENESS_LOG_EVERY=${LIVENESS_LOG_EVERY:-10}
 misses=0
+liveness_deferrals=0
 last_generation_tokens=-1
 
 log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
@@ -73,43 +78,63 @@ while true; do
     if [ "$staging_state" = "staging" ] && [ -n "$staging_age" ]; then
       log "adapter staging exceeded grace (age=${staging_age}s limit=${STAGING_GRACE}s)"
     fi
-    metrics=$(curl -s -m 5 "http://127.0.0.1:$PORT/metrics" 2>/dev/null || true)
-    running=$(printf '%s\n' "$metrics" | awk '/^vllm:num_requests_running[{]/ {sum += $NF} END {print sum + 0}')
-    generated=$(printf '%s\n' "$metrics" | awk '/^vllm:generation_tokens_total[{]/ {sum += $NF} END {print sum + 0}')
-    if [ "$running" != 0 ] &&
-       { [ "$last_generation_tokens" = -1 ] || awk "BEGIN {exit !($generated > $last_generation_tokens)}"; }; then
-      # A tiny completion can wait behind a saturated production queue for more
-      # than TIMEOUT. A rising token counter proves the EngineCore is working;
-      # restarting here discards every live rollout.
-      log "engine busy but progressing (running=$running generated=$generated); probe deferred"
+    # A paused engine can reject completions while its workers still answer
+    # the collective liveness RPC. Do not replace a live engine in that case.
+    liveness_code=$(curl -s -o /dev/null -m "$LIVENESS_TIMEOUT" -w "%{http_code}" \
+      "http://127.0.0.1:$PORT/liveness" 2>/dev/null)
+    if [ "$liveness_code" = "200" ]; then
+      liveness_deferrals=$((liveness_deferrals + 1))
+      if [ "$liveness_deferrals" -eq 1 ] ||
+         [ $((liveness_deferrals % LIVENESS_LOG_EVERY)) -eq 0 ]; then
+        log "engine liveness passed (completion code=${code:-none}); restart deferred (consecutive=$liveness_deferrals)"
+      fi
+      # The counter is only for bounded reporting. A later liveness failure
+      # resumes the normal completion-miss restart policy.
+      [ "$liveness_deferrals" -gt "$LIVENESS_LOG_EVERY" ] && liveness_deferrals=$LIVENESS_LOG_EVERY
       misses=0
     else
-      misses=$((misses + 1))
-      gpu=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader 2>/dev/null | head -1)
-      gpu_mib=$(printf '%s\n' "$gpu" | awk '{print $1 + 0}')
-      restart_after=$FAILS_BEFORE_RESTART
-      if [ "$running" != 0 ] || [ "$gpu_mib" -ge "$RESIDENT_ENGINE_MIN_MIB" ]; then
-        restart_after=$BUSY_STALL_FAILS_BEFORE_RESTART
+      if [ "$liveness_deferrals" -gt 0 ]; then
+        log "engine liveness failed (code=${liveness_code:-none}); completion-miss restart checks resumed"
+        liveness_deferrals=0
       fi
-      log "engine probe failed (code=${code:-none} running=$running generated=$generated gpu0=${gpu:-unknown}) miss=$misses/$restart_after"
-    if [ "$misses" -ge "$restart_after" ]; then
-      log "RESTARTING ENGINE (gpu0=${gpu:-unknown})"
-      sudo docker rm -f "$ENGINE_CONTAINER" >/dev/null 2>&1
-      if bash "$START" >/dev/null 2>&1; then
-        log "start_inference.sh returned ok; waiting for engine to load"
+      metrics=$(curl -s -m 5 "http://127.0.0.1:$PORT/metrics" 2>/dev/null || true)
+      running=$(printf '%s\n' "$metrics" | awk '/^vllm:num_requests_running[{]/ {sum += $NF} END {print sum + 0}')
+      generated=$(printf '%s\n' "$metrics" | awk '/^vllm:generation_tokens_total[{]/ {sum += $NF} END {print sum + 0}')
+      if [ "$running" != 0 ] &&
+         { [ "$last_generation_tokens" = -1 ] || awk "BEGIN {exit !($generated > $last_generation_tokens)}"; }; then
+        # A tiny completion can wait behind a saturated production queue for more
+        # than TIMEOUT. A rising token counter proves the EngineCore is working;
+        # restarting here discards every live rollout.
+        log "engine busy but progressing (running=$running generated=$generated); probe deferred"
+        misses=0
       else
-        log "WARNING start_inference.sh returned non-zero"
-      fi
-      # Loading the 745B checkpoint takes minutes; do not thrash it.
-      for _ in $(seq 1 "$RELOAD_TRIES"); do
-        sleep "$RELOAD_WAIT"
-        c=$(curl -s -o /dev/null -m "$TIMEOUT" -w "%{http_code}" \
-          -X POST "http://127.0.0.1:$PORT/v1/completions" \
-          -H "Content-Type: application/json" \
-          -d "{\"model\":\"$MODEL\",\"prompt\":\"hi\",\"max_tokens\":3}" 2>/dev/null)
-        [ "$c" = "200" ] && { log "engine back up (generation verified)"; break; }
-      done
-      misses=0
+        misses=$((misses + 1))
+        gpu=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader 2>/dev/null | head -1)
+        gpu_mib=$(printf '%s\n' "$gpu" | awk '{print $1 + 0}')
+        restart_after=$FAILS_BEFORE_RESTART
+        if [ "$running" != 0 ] || [ "$gpu_mib" -ge "$RESIDENT_ENGINE_MIN_MIB" ]; then
+          restart_after=$BUSY_STALL_FAILS_BEFORE_RESTART
+        fi
+        log "engine probe failed (code=${code:-none} running=$running generated=$generated gpu0=${gpu:-unknown}) miss=$misses/$restart_after"
+        if [ "$misses" -ge "$restart_after" ]; then
+          log "RESTARTING ENGINE (gpu0=${gpu:-unknown})"
+          sudo docker rm -f "$ENGINE_CONTAINER" >/dev/null 2>&1
+          if bash "$START" >/dev/null 2>&1; then
+            log "start_inference.sh returned ok; waiting for engine to load"
+          else
+            log "WARNING start_inference.sh returned non-zero"
+          fi
+          # Loading the 745B checkpoint takes minutes; do not thrash it.
+          for _ in $(seq 1 "$RELOAD_TRIES"); do
+            sleep "$RELOAD_WAIT"
+            c=$(curl -s -o /dev/null -m "$TIMEOUT" -w "%{http_code}" \
+              -X POST "http://127.0.0.1:$PORT/v1/completions" \
+              -H "Content-Type: application/json" \
+              -d "{\"model\":\"$MODEL\",\"prompt\":\"hi\",\"max_tokens\":3}" 2>/dev/null)
+            [ "$c" = "200" ] && { log "engine back up (generation verified)"; break; }
+          done
+          misses=0
+        fi
       fi
     fi
   fi
