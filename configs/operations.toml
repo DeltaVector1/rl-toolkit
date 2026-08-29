@@ -68,6 +68,7 @@ deployment_host_workers = 4
 deployment_bundle_workers = 2
 deployment_mkdir_timeout_seconds = 30
 deployment_scp_timeout_seconds = 300
+deployment_bundle_scp_timeout_seconds = 60
 
 [requirements.shared]
 group_size = 16

@@ -83,6 +83,9 @@ deployment_host_workers = limits["deployment_host_workers"]
 deployment_bundle_workers = limits.get("deployment_bundle_workers", 2)
 deployment_mkdir_timeout_seconds = limits["deployment_mkdir_timeout_seconds"]
 deployment_scp_timeout_seconds = limits["deployment_scp_timeout_seconds"]
+deployment_bundle_scp_timeout_seconds = limits.get(
+    "deployment_bundle_scp_timeout_seconds", 60
+)
 group_size = shared_requirements["group_size"]
 max_output_length = shared_requirements["max_output_length"]
 learning_rate = shared_requirements["learning_rate"]
@@ -2775,6 +2778,27 @@ echo "installed ${{#install_paths[@]}} trainer dependency files"
 """
 
 
+def _dependency_checksum_script(
+    repository_root: str, expected: list[tuple[str, str]]
+) -> str:
+    """Build one read-only remote check for the expected dependency files."""
+    lines = [
+        "set -euo pipefail",
+        f"repository={shlex.quote(repository_root)}",
+    ]
+    for path, digest in expected:
+        lines.extend(
+            [
+                f"file=\"$repository\"/{shlex.quote(path)}",
+                '[ -f "$file" ] && [ ! -L "$file" ]',
+                'got=$(sha256sum -- "$file" | cut -d\' \' -f1)',
+                f'[ "$got" = {shlex.quote(digest)} ]',
+            ]
+        )
+    lines.append("printf '%s\\n' 'checksums match'")
+    return "\n".join(lines)
+
+
 def _deploy_dependencies(required_files: list[tuple[str, list[str]]]) -> None:
     """Deploy trainer dependencies as one verified archive per host."""
     if not required_files:
@@ -2783,6 +2807,11 @@ def _deploy_dependencies(required_files: list[tuple[str, list[str]]]) -> None:
     repository_root = _repository_root()
     with tempfile.TemporaryDirectory(prefix="training-ops-dependencies-") as work:
         bundle, destinations = _create_dependency_bundle(required_files, Path(work))
+        manifest_path = Path(work) / dependency_manifest_name
+        manifest_entries = {}
+        for line in manifest_path.read_text(encoding="utf-8").splitlines():
+            digest, path = line.split("\t", 1)
+            manifest_entries[path] = digest
         hosts_for_bundle = sorted(
             {host for selected_hosts in destinations.values() for host in selected_hosts}
         )
@@ -2803,6 +2832,17 @@ def _deploy_dependencies(required_files: list[tuple[str, list[str]]]) -> None:
             selected = [
                 path for path, selected_hosts in destinations.items() if host in selected_hosts
             ]
+            expected = [(path, manifest_entries[path]) for path in selected]
+            try:
+                code, output = _ssh(
+                    host,
+                    _dependency_checksum_script(repository_root, expected),
+                    timeout=deployment_bundle_scp_timeout_seconds,
+                )
+            except Exception:
+                code, output = 1, ""
+            if code == 0 and output.strip() == "checksums match":
+                return "skipped"
 
             def remove_partial_archive() -> None:
                 try:
@@ -2823,10 +2863,12 @@ def _deploy_dependencies(required_files: list[tuple[str, list[str]]]) -> None:
                         stdin=subprocess.DEVNULL,
                         capture_output=True,
                         text=True,
-                        timeout=deployment_scp_timeout_seconds,
+                        timeout=deployment_bundle_scp_timeout_seconds,
                     )
                 except subprocess.TimeoutExpired as error:
-                    stderr = str(error.stderr or "")
+                    stderr = error.stderr or ""
+                    if isinstance(stderr, bytes):
+                        stderr = stderr.decode(errors="replace")
                     result = "scp TIMEOUT"
                     remove_partial_archive()
                 except OSError as error:
@@ -2836,6 +2878,8 @@ def _deploy_dependencies(required_files: list[tuple[str, list[str]]]) -> None:
                 else:
                     if uploaded.returncode:
                         stderr = uploaded.stderr or ""
+                        if isinstance(stderr, bytes):
+                            stderr = stderr.decode(errors="replace")
                         result = "scp failed"
                         remove_partial_archive()
                     else:
@@ -2887,7 +2931,7 @@ def _deploy_dependencies(required_files: list[tuple[str, list[str]]]) -> None:
                 except Exception as error:
                     result = f"failed: {error}"
                 completed += 1
-                if result != "ok":
+                if result not in {"ok", "skipped"}:
                     failures.append(f"{host}: {result}")
                 print(
                     f"trainer dependency bundle: {host} "

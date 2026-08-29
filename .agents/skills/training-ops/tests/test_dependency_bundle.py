@@ -97,6 +97,8 @@ class DependencyBundleTest(unittest.TestCase):
         def fake_ssh(host, script, timeout=0):
             if script.startswith("rm -f"):
                 return 0, ""
+            if "checksums match" in script:
+                return 1, "missing"
             remote_calls.append(host)
             return 0, "installed"
 
@@ -127,6 +129,10 @@ class DependencyBundleTest(unittest.TestCase):
             )
 
         def fake_ssh(_host, script, timeout=0):
+            if script.startswith("rm -f"):
+                return 0, ""
+            if "checksums match" in script:
+                return 1, "missing"
             self.fail(f"verification must not run after failed scp: {script}")
 
         output = io.StringIO()
@@ -144,6 +150,92 @@ class DependencyBundleTest(unittest.TestCase):
         self.assertEqual(scp_calls, ["n76", "n76", "n76"])
         self.assertEqual(errors.getvalue().count("scp: Connection closed"), 3)
         self.assertIn("attempt 3/3", errors.getvalue())
+
+    def test_checksum_match_skips_upload_without_marker(self):
+        ssh_calls = []
+
+        def fake_ssh(host, script, timeout=0):
+            ssh_calls.append((host, script, timeout))
+            if "checksums match" in script:
+                self.assertIn(hashlib.sha256(b"a\n").hexdigest(), script)
+                return 0, "checksums match\n"
+            self.fail(f"upload verification must not run after checksum skip: {script}")
+
+        def fail_scp(*_args, **_kwargs):
+            self.fail("SCP must not run when every remote checksum matches")
+
+        output = io.StringIO()
+        with (
+            mock.patch.object(training_ops.subprocess, "run", side_effect=fail_scp),
+            mock.patch.object(training_ops, "_ssh", side_effect=fake_ssh),
+            contextlib.redirect_stdout(output),
+        ):
+            training_ops._deploy_dependencies([("a.py", ["n76"])])
+
+        self.assertEqual(len(ssh_calls), 1)
+        self.assertEqual(ssh_calls[0][2], 60)
+        self.assertIn("[skipped]", output.getvalue())
+
+    def test_checksum_mismatch_uploads_with_bundle_timeout(self):
+        scp_calls = []
+        ssh_calls = []
+
+        def fake_ssh(host, script, timeout=0):
+            ssh_calls.append((host, script, timeout))
+            if "checksums match" in script:
+                self.assertNotIn("rm -f", script)
+                self.assertIn("sha256sum", script)
+                return 1, "checksum mismatch"
+            return 0, "installed"
+
+        def fake_run(command, **kwargs):
+            scp_calls.append((command, kwargs))
+            return training_ops.subprocess.CompletedProcess(command, 0, "", "")
+
+        output = io.StringIO()
+        with (
+            mock.patch.object(training_ops.subprocess, "run", side_effect=fake_run),
+            mock.patch.object(training_ops, "_ssh", side_effect=fake_ssh),
+            contextlib.redirect_stdout(output),
+        ):
+            training_ops._deploy_dependencies([("a.py", ["n76"])])
+
+        self.assertEqual(len(scp_calls), 1)
+        self.assertEqual(scp_calls[0][1]["timeout"], 60)
+        self.assertIn("ServerAliveInterval", " ".join(scp_calls[0][0]))
+        self.assertIn("ServerAliveCountMax", " ".join(scp_calls[0][0]))
+        self.assertEqual(len(ssh_calls), 2)
+        self.assertIn("[ok]", output.getvalue())
+
+    def test_scp_timeout_retries_three_times_and_preserves_stderr(self):
+        scp_calls = []
+        errors = io.StringIO()
+
+        def fake_ssh(_host, script, timeout=0):
+            if "checksums match" in script:
+                return 1, "missing"
+            if script.startswith("rm -f"):
+                return 0, ""
+            self.fail(f"verification must not run after SCP timeout: {script}")
+
+        def fake_run(command, **kwargs):
+            scp_calls.append((command, kwargs))
+            raise training_ops.subprocess.TimeoutExpired(
+                command, kwargs["timeout"], stderr=b"scp: stalled\n"
+            )
+
+        with (
+            mock.patch.object(training_ops.subprocess, "run", side_effect=fake_run),
+            mock.patch.object(training_ops, "_ssh", side_effect=fake_ssh),
+            mock.patch.object(training_ops.time, "sleep"),
+            contextlib.redirect_stderr(errors),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "failed to deploy dependency bundle"):
+                training_ops._deploy_dependencies([("a.py", ["n76"])])
+
+        self.assertEqual(len(scp_calls), 3)
+        self.assertTrue(all(call[1]["timeout"] == 60 for call in scp_calls))
+        self.assertEqual(errors.getvalue().count("scp: stalled\n"), 3)
 
 
 if __name__ == "__main__":
