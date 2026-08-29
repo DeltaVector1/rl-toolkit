@@ -23,11 +23,46 @@ training_ops.watch(hours=2)
 
 Prime Agent loads the same skill through `.prime/agent/skills/training-ops`.
 
+## Sub-agent work
+
+Use `fork_turns="none"` for a bounded task. Put all required context in the
+task message. Use a positive turn count only when the task needs recent user
+context. Do not use a full-history fork for normal implementation, audit, or
+live operation work.
+
+Each task message must state:
+
+- the exact worktree and expected commit;
+- whether the agent may read, edit, commit, or operate a live service;
+- the allowed files or service profile;
+- the required checks and final evidence.
+
+Use one writer for each branch. Other agents on that branch are read-only.
+Use one operator for each live qualification. A repair agent edits code but
+does not operate the live service. Reuse the same operator with
+`followup_task` after the shared branch contains the repair commit.
+
+An agent must first report `pwd`, the repository root, the current commit, and
+the worktree state. It must stop on a mismatch. A commit on an isolated ref is
+not ready for a live run until the target worktree contains that commit.
+
+Before a live start, check the configured source list, recursive imports,
+launcher mounts, patch targets, and remote file modes as one set. Do not fix
+one missing file and start again without checking the full set.
+
+After ten minutes without completion, report the measured state and the first
+blocking item. Do not continue a broad search. A final handoff must contain the
+outcome, measurements, changed files, commit, checks, and remaining blocker.
+
 ## Current system
 
 The current profile trains Muse-Glimmer-30B with GRPO. It uses BF16 base
 weights and a rank-128 LoRA adapter on all supported attention and MLP linear
-weights. GLM-5.2 is paused.
+weights.
+
+GLM-5.2 optimization work uses the sibling worktree
+`/home/mango/Misc/data-gen/glm52-decensor-glm52-optims` and its qualification
+profiles. Do not infer a GLM topology from the Muse profile below.
 
 - Eight trainer hosts use 64 RTX 4090 GPUs.
 - One inference host uses eight independent H200 replicas.

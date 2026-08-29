@@ -26,8 +26,8 @@ paths, containers, profiles, trend settings, and performance requirements.
 Do not add a host or replica count to Python code.
 
 `configs/current` contains the active run profile. `configs/paused` contains
-profiles that are not running. `configs/qualification` contains trainer-only
-checks.
+profiles that are not running. `configs/qualification` contains isolated
+trainer or inference checks.
 
 Missing configuration is an error. Do not guess a host, run, model, config,
 or metric location.
@@ -83,3 +83,27 @@ file. A restart starts the trainer first because the control file already
 exists. Do not change this order.
 
 The tool never forwards `PRIME_BATCH_CACHE`. It never touches a blocked host.
+
+## Delegated qualification
+
+Use one live operator for a qualification. The operator must use the exact
+configured profile and target worktree. It must report the commit before the
+start. It must not edit code during the live run.
+
+When a run fails, report the first exact error and stop the service through the
+configured operation. Give the repair to a separate writer. Before the next
+start, the operator must verify that the shared target worktree contains the
+repair commit.
+
+Before the first host action, verify these as one dependency set:
+
+- configured deployment files;
+- recursive Python imports;
+- launcher mounts;
+- patch source and target files;
+- file access modes;
+- container identity and cleanup parsing.
+
+Use focused searches and the named `training_ops` entry points. Do not scan a
+whole source tree when the profile, launcher, or error already names the
+relevant file.
