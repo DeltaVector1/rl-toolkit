@@ -30,7 +30,7 @@ docker run -d --name glm52-decensor-h200 --restart unless-stopped \
   -e NCCL_SOCKET_IFNAME=eth0 \
   -e GLOO_SOCKET_IFNAME=eth0 \
   -e NCCL_IB_DISABLE=1 \
-  -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False \
+  -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   -e VLLM_ENGINE_READY_TIMEOUT_S=7200 \
   --entrypoint /bin/bash \
   prime-rl:glm52-v080-glm52-h200-router \
