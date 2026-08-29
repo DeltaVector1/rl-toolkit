@@ -18,6 +18,7 @@ docker run -d --name glm52-decensor-h200 --restart unless-stopped \
   --ipc host \
   --ulimit stack=67108864:67108864 \
   -v /data:/data \
+  -v glm52-fp8-model:/models/glm52-fp8:ro \
   -v "$deployment/cache/vllm":/home/appuser/.cache \
   -v "$deployment/prime-rl/src/prime_rl/inference/vllm/worker/filesystem.py":/app/src/prime_rl/inference/vllm/worker/filesystem.py:ro \
   -v "$deployment/prime-rl/src/prime_rl/inference/vllm/server.py":/app/src/prime_rl/inference/vllm/server.py:ro \

@@ -27,7 +27,7 @@ glm52_inference = "glm52-decensor-h200"
 muse_inference = "muse-glimmer-h200"
 
 [models]
-glm52 = "/data/glm52-rl/model-fp8-stream"
+glm52 = "/models/glm52-fp8"
 muse = "/data/muse-glimmer/model"
 
 [inference.h200a.muse]

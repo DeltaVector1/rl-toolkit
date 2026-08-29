@@ -20,7 +20,7 @@ tags = ["x85", "glm-5.2", "lora-r32", "production", "20-step"]
 filename = "rollout-metrics.jsonl"
 
 [model]
-name = "/data/glm52-rl/model-fp8-stream"
+name = "/models/glm52-fp8"
 
 [model.lora]
 name = "glm52-decensor-r32-node-local"
