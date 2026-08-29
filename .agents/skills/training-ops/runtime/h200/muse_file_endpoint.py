@@ -11,6 +11,7 @@ from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.entrypoints.serve.lora.protocol import LoadLoRAAdapterRequest
 
 from prime_rl.inference.vllm.worker.filesystem import (
+    _delta_stage_timeout_s,
     adapter_cache_path,
     adapter_reader_lock,
     adapter_stage_status,
@@ -71,6 +72,17 @@ def _check_prefetched_adapter(destination: Path, source_url: str, require_delta:
         or proof.get("source_url") != source_url
     ):
         raise RuntimeError("delta adapter transport is required; prefetched cache is not an exact delta")
+
+
+async def _stage_adapter(source_url: str, require_delta: bool) -> Path:
+    call = asyncio.to_thread(
+        stage_lora_adapter_files,
+        source_url,
+        require_delta=require_delta,
+    )
+    if not require_delta:
+        return await call
+    return await asyncio.wait_for(call, timeout=_delta_stage_timeout_s())
 
 
 class MuseFileEndpoint:
@@ -143,11 +155,7 @@ class MuseFileEndpoint:
                 raise HTTPException(status_code=400, detail="require_delta must be a boolean")
             require_delta = _require_delta_for_url(source_url, require_delta)
             started = asyncio.get_running_loop().time()
-            destination = await asyncio.to_thread(
-                stage_lora_adapter_files,
-                source_url,
-                require_delta=require_delta,
-            )
+            destination = await _stage_adapter(source_url, require_delta)
             payload = {
                 "status": "ok",
                 "path": destination.as_posix(),
@@ -203,11 +211,7 @@ class MuseFileEndpoint:
                         destination = adapter_cache_path(source_url)
                         _check_prefetched_adapter(destination, source_url, require_delta)
                     else:
-                        destination = await asyncio.to_thread(
-                            stage_lora_adapter_files,
-                            source_url,
-                            require_delta=require_delta,
-                        )
+                        destination = await _stage_adapter(source_url, require_delta)
                     expected = adapter_cache_path(source_url)
                     if destination != expected:
                         raise RuntimeError("adapter cache path changed during staging")

@@ -96,6 +96,19 @@ def _check_deadline(deadline: float | None) -> None:
         raise TimeoutError("adapter delta staging exceeded its time limit")
 
 
+def _acquire_stage_lock(lock, deadline: float | None) -> None:
+    if deadline is None:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return
+    while True:
+        _check_deadline(deadline)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+
+
 def _request_timeout(deadline: float | None) -> float:
     _check_deadline(deadline)
     if deadline is None:
@@ -854,12 +867,14 @@ def _stage_chunked_xor_adapter(
         },
     )
     ready = temporary / "READY"
+    _check_deadline(deadline)
     ready.write_text("ready\n", encoding="utf-8")
     with ready.open("rb") as stream:
         stream.flush()
         os.fsync(stream.fileno())
     with _adapter_reader_lock(destination).open("a+") as reader_lock:
-        fcntl.flock(reader_lock, fcntl.LOCK_EX)
+        _acquire_stage_lock(reader_lock, deadline)
+        _check_deadline(deadline)
         if destination.exists():
             retired = destination.with_name(
                 f"{destination.name}.retired-{time.time_ns()}-{os.getpid()}"
@@ -1049,15 +1064,21 @@ def stage_lora_adapter_files(source_url: str, require_delta: bool = False) -> Pa
     """
     destination = adapter_cache_path(source_url)
     destination.parent.mkdir(parents=True, exist_ok=True)
+    started = time.monotonic()
+    delta_deadline = started + _delta_stage_timeout_s() if require_delta else None
     # The cache is shared by all replicas on this host. One global writer is
     # intentional: per-URL writers caused old policies to queue behind one
     # another and made it possible to publish a stale policy after a newer one.
     with (destination.parent / "adapter-staging.lock").open("w") as host_lock:
-        fcntl.flock(host_lock, fcntl.LOCK_EX)
-        started = time.monotonic()
+        _acquire_stage_lock(host_lock, delta_deadline)
         try:
-            delta_deadline = started + _delta_stage_timeout_s()
             transport = _read_chunked_xor_manifest(source_url, deadline=delta_deadline)
+            if (
+                delta_deadline is None
+                and transport is not None
+                and transport.get("mode") == "delta"
+            ):
+                delta_deadline = time.monotonic() + _delta_stage_timeout_s()
             manifest = _source_manifest(
                 source_url,
                 deadline=delta_deadline
