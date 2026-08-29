@@ -2929,6 +2929,46 @@ exit 53
 """
 
 
+def _orchestrator_state_script(container: str) -> str:
+    """Check the exact configured orchestrator container without changing it."""
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", container):
+        raise Refused(f"orchestrator container name is invalid: {container!r}")
+    quoted = shlex.quote(container)
+    return f"""set -euo pipefail
+container={quoted}
+name=$(sudo docker inspect --format '{{{{.Name}}}}' "$container" 2>/dev/null || true)
+[ "$name" = "/$container" ] || {{ echo "configured orchestrator container identity is not exact" >&2; exit 61; }}
+state=$(sudo docker inspect --format '{{{{.State.Running}}}}' "$container" 2>/dev/null || true)
+case "$state" in
+  true) echo running ;;
+  false) echo stopped ;;
+  *) echo "configured orchestrator container state is unknown" >&2; exit 62 ;;
+esac
+"""
+
+
+def _start_or_restart_orchestrator_script(container: str, was_running: bool) -> str:
+    """Resume the exact container state observed by the guarded repair."""
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", container):
+        raise Refused(f"orchestrator container name is invalid: {container!r}")
+    if not isinstance(was_running, bool):
+        raise Refused("orchestrator running state must be a boolean")
+    quoted = shlex.quote(container)
+    expected = "true" if was_running else "false"
+    action = "restart --time 30" if was_running else "start"
+    verb = "restarted" if was_running else "started"
+    return f"""set -euo pipefail
+container={quoted}
+name=$(sudo docker inspect --format '{{{{.Name}}}}' "$container" 2>/dev/null || true)
+[ "$name" = "/$container" ] || {{ echo "configured orchestrator container identity is not exact" >&2; exit 61; }}
+state=$(sudo docker inspect --format '{{{{.State.Running}}}}' "$container" 2>/dev/null || true)
+[ "$state" = {expected} ] || {{ echo "orchestrator state changed before repair resume" >&2; exit 62; }}
+sudo docker {action} "$container" >/dev/null
+test "$(sudo docker inspect --format '{{{{.State.Running}}}}' "$container" 2>/dev/null)" = true
+echo "{verb} exact orchestrator container $container"
+"""
+
+
 def repair(what: str) -> str:
     """Apply a named repair to the configured hosts."""
     if what == "tunnels":
@@ -2952,8 +2992,29 @@ def _repair_adapter_update() -> str:
     before = status(run, quiet=True)
     if not before.trainer_up or before.trainer_failed:
         raise Refused("adapter repair requires a healthy trainer cluster")
-    if not before.orch_up:
-        raise Refused("adapter repair requires the orchestrator to be up")
+    if any(
+        node.reachable and node.gpu_util >= 50
+        for node in before.nodes
+    ):
+        raise Refused("adapter repair requires the trainer to be waiting")
+    orchestrator_was_running = before.orch_up
+    if not orchestrator_was_running:
+        state_code, state_output = _ssh(
+            orchestrator_host,
+            _orchestrator_state_script(orchestrator_container),
+            timeout=90,
+        )
+        if state_code:
+            raise Refused(
+                "adapter repair requires the exact orchestrator container to be stopped: "
+                f"{state_output.strip()}"
+            )
+        observed_state = state_output.strip().splitlines()[-1:]
+        if observed_state != ["stopped"]:
+            raise Refused(
+                "adapter repair requires a stopped exact orchestrator container; "
+                f"observed {observed_state[-1] if observed_state else 'no state'}"
+            )
     if len(before.engines) != len(inference_hosts) or any(
         not engine.reachable
         or not engine.healthy
@@ -3057,25 +3118,22 @@ def _repair_adapter_update() -> str:
     if failed_post_idle:
         raise RuntimeError(f"inference was not idle after restart: {failed_post_idle}")
 
-    quoted_orchestrator = shlex.quote(orchestrator_container)
-    restart_code, restart_output = _ssh(
+    resume_code, resume_output = _ssh(
         orchestrator_host,
-        f"name=$(sudo docker inspect --format '{{{{.Name}}}}' {quoted_orchestrator} 2>/dev/null || true); "
-        f"[ \"$name\" = '/{orchestrator_container}' ] || exit 61; "
-        f"state=$(sudo docker inspect --format '{{{{.State.Running}}}}' {quoted_orchestrator} 2>/dev/null || true); "
-        f"[ \"$state\" = true ] || exit 62; "
-        f"sudo docker restart --time 30 {quoted_orchestrator} >/dev/null; "
-        f"test \"$(sudo docker inspect --format '{{{{.State.Running}}}}' {quoted_orchestrator} 2>/dev/null)\" = true",
+        _start_or_restart_orchestrator_script(
+            orchestrator_container, orchestrator_was_running
+        ),
         timeout=180,
     )
-    if restart_code:
-        raise RuntimeError(f"orchestrator restart failed: {restart_output.strip()}")
+    if resume_code:
+        raise RuntimeError(f"orchestrator resume failed: {resume_output.strip()}")
+    resume_action = "restarted" if orchestrator_was_running else "started"
     result = (
         f"adapter update repaired for {run}: {evidence}; stopped exact prefetch processes; "
         "deployed transfer timeout and host staging lock; "
         f"{'restarted' if restart_hosts else 'kept healthy'} inference on "
         f"{','.join(restart_hosts) if restart_hosts else 'all configured hosts'}; "
-        "restarted orchestrator only"
+        f"{resume_action} exact orchestrator only"
     )
     print(result)
     return result

@@ -67,6 +67,94 @@ class AdapterUpdateTest(unittest.TestCase):
                 "glm52-decensor-h200", 8000, startup_timeout_seconds=180
             )
 
+    def test_orchestrator_state_script_requires_exact_stopped_container(self):
+        script = training_ops._orchestrator_state_script(
+            "glm52-decensor-orchestrator"
+        )
+        self.assertIn("docker inspect", script)
+        self.assertIn('configured orchestrator container identity is not exact', script)
+        self.assertIn("false) echo stopped", script)
+        self.assertNotIn("docker start", script)
+        self.assertNotIn("docker restart", script)
+
+    def test_stopped_orchestrator_is_started_after_guarded_repair(self):
+        before = training_ops.Status(
+            trainer_up=True,
+            orch_up=False,
+            engines=[
+                training_ops.EngineState(
+                    host="h200a", gen_code="200", probes_ok=1, probes_total=1
+                )
+            ],
+        )
+        fan_results = iter(
+            [
+                {"h200a": (0, "idle")},
+                {"h200a": (0, "stopped 0")},
+                {"h200a": (0, "adapter engine ready")},
+                {"h200a": (0, "idle")},
+            ]
+        )
+        ssh_scripts = []
+
+        def ssh(_host, script, timeout=120):
+            ssh_scripts.append(script)
+            if "configured orchestrator container state is unknown" in script:
+                return 0, "stopped\n"
+            return 0, ""
+
+        with mock.patch.object(training_ops, "current_run", return_value="x85"), mock.patch.object(
+            training_ops, "status", return_value=before
+        ), mock.patch.object(
+            training_ops, "_adapter_stage_evidence", return_value="Failed to apply policy update 4"
+        ), mock.patch.object(
+            training_ops, "_fan", side_effect=lambda *_args, **_kwargs: next(fan_results)
+        ), mock.patch.object(training_ops, "deploy", return_value=True), mock.patch.object(
+            training_ops, "_ssh", side_effect=ssh
+        ):
+            result = training_ops._repair_adapter_update()
+
+        self.assertIn("started exact orchestrator", result)
+        resume_script = ssh_scripts[-1]
+        self.assertIn("sudo docker start", resume_script)
+        self.assertNotIn("sudo docker restart", resume_script)
+
+    def test_stopped_status_refuses_if_container_is_running(self):
+        before = training_ops.Status(
+            trainer_up=True,
+            orch_up=False,
+            engines=[
+                training_ops.EngineState(
+                    host="h200a", gen_code="200", probes_ok=1, probes_total=1
+                )
+            ],
+        )
+        with mock.patch.object(training_ops, "current_run", return_value="x85"), mock.patch.object(
+            training_ops, "status", return_value=before
+        ), mock.patch.object(training_ops, "_ssh", return_value=(0, "running\n")), mock.patch.object(
+            training_ops, "_adapter_stage_evidence"
+        ) as evidence, mock.patch.object(training_ops, "deploy") as deploy:
+            with self.assertRaisesRegex(training_ops.Refused, "stopped exact orchestrator"):
+                training_ops._repair_adapter_update()
+        evidence.assert_not_called()
+        deploy.assert_not_called()
+
+    def test_repair_refuses_while_trainer_is_busy(self):
+        before = training_ops.Status(
+            trainer_up=True,
+            orch_up=False,
+            nodes=[training_ops.NodeState(host="n82", gpu_util=80)],
+        )
+        with mock.patch.object(training_ops, "current_run", return_value="x85"), mock.patch.object(
+            training_ops, "status", return_value=before
+        ), mock.patch.object(training_ops, "_ssh") as ssh, mock.patch.object(
+            training_ops, "_adapter_stage_evidence"
+        ) as evidence:
+            with self.assertRaisesRegex(training_ops.Refused, "trainer to be waiting"):
+                training_ops._repair_adapter_update()
+        ssh.assert_not_called()
+        evidence.assert_not_called()
+
     def test_engine_repair_uses_active_run_profile(self):
         calls = []
 
