@@ -33,6 +33,7 @@ live operation work.
 Each task message must state:
 
 - the exact worktree and expected commit;
+- any expected dirty or untracked paths that must be preserved;
 - whether the agent may read, edit, commit, or operate a live service;
 - the allowed files or service profile;
 - the required checks and final evidence.
