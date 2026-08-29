@@ -10176,7 +10176,7 @@ if ! inspect_output=$(sudo docker inspect \"$name\" 2>&1); then
   printf '%s\\n' \"$inspect_output\" >&2
   exit 1
 fi
-sudo docker inspect \"$name\" --format '{{{{json .State.Status}}}}\\t{{{{json .RestartCount}}}}\\t{{{{json .Config.Image}}}}\\t{{{{json .Config.Cmd}}}}\\t{{{{json .HostConfig.RestartPolicy.Name}}}}\\t{{{{json .HostConfig.Init}}}}'
+sudo docker inspect \"$name\" --format '{{{{json .State.Status}}}}{{{{println}}}}{{{{json .RestartCount}}}}{{{{println}}}}{{{{json .Config.Image}}}}{{{{println}}}}{{{{json .Config.Cmd}}}}{{{{println}}}}{{{{json .HostConfig.RestartPolicy.Name}}}}{{{{println}}}}{{{{json .HostConfig.Init}}}}'
 """
     code, output = _ssh(host, command, timeout=60)
     if code:
@@ -10186,7 +10186,10 @@ sudo docker inspect \"$name\" --format '{{{{json .State.Status}}}}\\t{{{{json .R
     line = output.strip()
     if line == "ABSENT":
         return {"host": host, "container": name, "status": "absent"}
-    fields = line.split("\t")
+    # Use one JSON value per line. Docker's Go template formatter has emitted
+    # the literal characters ``\\t`` for a tab escape on some versions, so a
+    # tab-delimited record is not an unambiguous wire format.
+    fields = line.splitlines()
     if len(fields) != 6:
         raise RuntimeError(
             "inference qualification inspection returned an invalid record"
@@ -10203,6 +10206,11 @@ sudo docker inspect \"$name\" --format '{{{{json .State.Status}}}}\\t{{{{json .R
         not isinstance(status, str)
         or isinstance(restarts, bool)
         or not isinstance(restarts, int)
+        or not isinstance(image, str)
+        or not isinstance(command_value, list)
+        or any(not isinstance(value, str) for value in command_value)
+        or not isinstance(restart_policy, str)
+        or not isinstance(init, bool)
     ):
         raise RuntimeError("inference qualification inspection has invalid state")
     return {

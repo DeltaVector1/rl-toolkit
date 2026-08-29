@@ -236,6 +236,44 @@ class InferenceQualificationTest(unittest.TestCase):
             with self.assertRaises(training_ops.Refused):
                 training_ops._inference_qualification_spec("duplicate")
 
+    def test_identity_parser_accepts_exact_exited_docker_record(self):
+        spec = training_ops._inference_qualification_spec("glm52-mtp-h200")
+        raw = (
+            '"exited"\n'
+            "1\n"
+            '"prime-rl:glm52-v080-full"\n'
+            '["@","/data/glm52-rl/deployment-glm52-optims/configs/qualification/glm52-mtp-h200.toml"]\n'
+            '"no"\n'
+            "true\n"
+        )
+        with patch.object(training_ops, "_ssh", return_value=(0, raw)):
+            identity = training_ops._inference_qualification_identity(spec)
+        self.assertEqual(identity["status"], "exited")
+        self.assertEqual(identity["restart_count"], 1)
+        self.assertEqual(identity["image"], training_ops.inference_image)
+        self.assertEqual(identity["restart_policy"], "no")
+        self.assertIs(identity["init"], True)
+
+    def test_identity_parser_accepts_exact_running_docker_record(self):
+        spec = training_ops._inference_qualification_spec("glm52-mtp-h200")
+        raw = (
+            '"running"\n'
+            "0\n"
+            '"prime-rl:glm52-v080-full"\n'
+            '["@","/data/glm52-rl/deployment-glm52-optims/configs/qualification/glm52-mtp-h200.toml"]\n'
+            '"no"\n'
+            "true\n"
+        )
+        with patch.object(training_ops, "_ssh", return_value=(0, raw)):
+            identity = training_ops._inference_qualification_identity(spec)
+        self.assertEqual(identity["status"], "running")
+        self.assertEqual(identity["restart_count"], 0)
+        self.assertEqual(identity["command"][0], "@")
+        self.assertEqual(
+            identity["command"][1],
+            f"{training_ops.remote_repo}/{spec['profile']}",
+        )
+
     def test_status_and_cleanup_require_exact_container_identity(self):
         spec = dict(training_ops.glm52_mtp_h200_qualification)
         record = {
