@@ -180,6 +180,7 @@ PY
       -v "$deployment/prime-rl/src/prime_rl/trainer/distributed/pp_runner.py":/app/src/prime_rl/trainer/distributed/pp_runner.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/parallel_dims.py":/app/src/prime_rl/trainer/parallel_dims.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/utils/cp.py":/app/src/prime_rl/utils/cp.py:ro \
+      -v "$deployment/prime-rl/src/prime_rl/utils/checkpoint_delta.py":/app/src/prime_rl/utils/checkpoint_delta.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/rl/train.py":/app/src/prime_rl/trainer/rl/train.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/rl/data.py":/app/src/prime_rl/trainer/rl/data.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/rl/token_export.py":/app/src/prime_rl/trainer/rl/token_export.py:ro \
