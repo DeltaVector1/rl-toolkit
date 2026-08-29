@@ -3,9 +3,9 @@ diff --git a/vllm/v1/attention/backends/mla/flashmla_sparse.py b/vllm/v1/attenti
 +++ b/vllm/v1/attention/backends/mla/flashmla_sparse.py
 @@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, ClassVar
  import torch
++import os
  
  from vllm import _custom_ops as ops
-+from vllm import envs
  from vllm.config import VllmConfig, get_current_vllm_config
  from vllm.config.cache import CacheDType
  from vllm.logger import init_logger
@@ -32,7 +32,7 @@ diff --git a/vllm/v1/attention/backends/mla/flashmla_sparse.py b/vllm/v1/attenti
 +
 +
 +fp8_mixed_batch_chunk_tokens = fp8_mixed_batch_chunk_size(
-+    envs.VLLM_FLASHMLA_SPARSE_MAX_SCRATCH_MB
++    int(os.getenv("VLLM_FLASHMLA_SPARSE_MAX_SCRATCH_MB", "512"))
 +)
 +
  """
