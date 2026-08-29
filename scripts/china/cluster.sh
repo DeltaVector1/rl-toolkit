@@ -104,6 +104,8 @@ if [ -n "${VERIFIERS_OVERRIDE_DIR:-}" ]; then
 fi
 
 prime_configs_mount=(
+  -v "$deployment/source/packages/prime-rl-configs/src/prime_rl/configs/orchestrator.py":/app/packages/prime-rl-configs/src/prime_rl/configs/orchestrator.py:ro
+  -v "$deployment/source/packages/prime-rl-configs/src/prime_rl/configs/shared.py":/app/packages/prime-rl-configs/src/prime_rl/configs/shared.py:ro
   -v "$deployment/source/packages/prime-rl-configs/src/prime_rl/configs/trainer.py":/app/packages/prime-rl-configs/src/prime_rl/configs/trainer.py:ro
 )
 
@@ -351,7 +353,7 @@ if hashlib.sha256(session_bytes).hexdigest() != expected_session_sha256:
     raise SystemExit("qualification session checksum differs")
 session = json.loads(session_bytes)
 source_files = session.get("source_files")
-if not isinstance(source_files, dict) or len(source_files) != 49:
+if not isinstance(source_files, dict) or len(source_files) != 56:
     raise SystemExit("qualification source manifest is invalid")
 root = Path(deployment).resolve(strict=True)
 observed = {}
@@ -465,7 +467,10 @@ PY
       -e PYTHONPATH="$deployment/env":/app/packages/prime-rl-configs/src:/app/src \
       "${parity_env[@]}" \
       "${qualification_env[@]}" \
+      -v "$deployment/source/src/prime_rl/_compat.py":/app/src/prime_rl/_compat.py:ro \
+      -v "$deployment/source/src/prime_rl/glm52_routing.py":/app/src/prime_rl/glm52_routing.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/fp8_checkpoint.py":/app/src/prime_rl/trainer/fp8_checkpoint.py:ro \
+      -v "$deployment/source/src/prime_rl/trainer/mxfp4.py":/app/src/prime_rl/trainer/mxfp4.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/model.py":/app/src/prime_rl/trainer/model.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/models/layers/fp8_ada.py":/app/src/prime_rl/trainer/models/layers/fp8_ada.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/models/layers/moe.py":/app/src/prime_rl/trainer/models/layers/moe.py:ro \
@@ -499,6 +504,8 @@ PY
       -v "$deployment/source/src/prime_rl/trainer/models/kernels/sparse_mla_fwd.py":/app/src/prime_rl/trainer/models/kernels/sparse_mla_fwd.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/models/kernels/sparse_mla_bwd.py":/app/src/prime_rl/trainer/models/kernels/sparse_mla_bwd.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/model.py":/app/src/prime_rl/trainer/model.py:ro \
+      -v "$deployment/source/src/prime_rl/utils/monitor/__init__.py":/app/src/prime_rl/utils/monitor/__init__.py:ro \
+      -v "$deployment/source/src/prime_rl/utils/monitor/swanlab.py":/app/src/prime_rl/utils/monitor/swanlab.py:ro \
       -v "$deployment/source/src/prime_rl/utils/vlm.py":/app/src/prime_rl/utils/vlm.py:ro \
       --env-file /data/trinity/training.env \
       -e PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,garbage_collection_threshold:0.8}" \
