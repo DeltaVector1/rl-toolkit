@@ -2579,6 +2579,47 @@ def deploy(
     return not bad
 
 
+def _trainer_dependency_inventory(
+    relative_config: str, nodes: list[str]
+) -> list[tuple[str, list[str]]]:
+    """Return files required by the trainer launcher on the selected nodes."""
+    inventory: dict[str, list[str]] = {}
+
+    def add(path: str, destinations: list[str]) -> None:
+        destinations = list(dict.fromkeys(_check_host(host) for host in destinations))
+        if not destinations:
+            raise Refused(f"no configured host for trainer dependency {path}")
+        current = inventory.setdefault(path, [])
+        for host in destinations:
+            if host not in current:
+                current.append(host)
+
+    def add_files(root: str, destinations: list[str]) -> None:
+        base = repo_root / root
+        if not base.is_dir():
+            raise Refused(f"missing trainer dependency directory: {base}")
+        for local in sorted(base.rglob("*")):
+            if local.is_file():
+                add(local.relative_to(repo_root).as_posix(), destinations)
+
+    add_files(
+        ".agents/skills/training-ops/runtime/china",
+        nodes,
+    )
+    for path in mounted_files():
+        if not path.startswith("prime-rl/"):
+            continue
+        destinations = [host for host in nodes if _mounted_on(path, host)]
+        if destinations:
+            add(path, destinations)
+    add(relative_config, nodes)
+
+    missing = [path for path in inventory if not (repo_root / path).is_file()]
+    if missing:
+        raise Refused("missing trainer dependencies: " + ", ".join(missing))
+    return list(inventory.items())
+
+
 def _start_dependency_inventory(
     selected: dict, nodes: list[str]
 ) -> list[tuple[str, list[str]]]:
@@ -2948,9 +2989,9 @@ def qualify(
         )
 
     repository_root = _repository_root()
-    deploy_options = {}
-    for path in (".agents/skills/training-ops/runtime/china/cluster.sh", relative_config):
-        if not deploy(path, nodes=nodes, **deploy_options):
+    required_files = _trainer_dependency_inventory(relative_config, nodes)
+    for path, destinations in required_files:
+        if not deploy(path, nodes=destinations):
             raise RuntimeError(f"failed to deploy {path}")
 
     trainer_nodes = " ".join(host.removeprefix("n") for host in nodes)
