@@ -8,6 +8,7 @@ import asyncio
 import json
 import time
 from urllib.parse import quote
+from urllib.request import urlopen
 
 from modelexpress import p2p_pb2
 
@@ -38,6 +39,28 @@ def inference_weight_path(config: OrchestratorConfig, weights_path, lora_name: s
         f"{broadcast.source_url.rstrip('/')}/"
         f"{quote(weights_path.relative_to(broadcast.source_dir).as_posix())}"
     )
+
+
+def _read_adapter_manifest(path, source_url: str | None, timeout: float | int | None) -> tuple[dict[str, object], str]:
+    """Read a published adapter manifest from local storage or its source URL."""
+    manifest_path = path / "adapter_manifest.json"
+    if source_url is None or manifest_path.is_file():
+        try:
+            with manifest_path.open("r", encoding="utf-8") as source:
+                manifest = json.load(source)
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            raise RuntimeError("published adapter manifest is unavailable") from exc
+        location = manifest_path.as_posix()
+    else:
+        try:
+            with urlopen(f"{source_url.rstrip('/')}/adapter_manifest.json", timeout=timeout) as source:
+                manifest = json.load(source)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("published adapter manifest is unavailable from the adapter source") from exc
+        location = f"{source_url.rstrip('/')}/adapter_manifest.json"
+    if not isinstance(manifest, dict):
+        raise RuntimeError("published adapter manifest is not an object")
+    return manifest, location
 
 
 class WeightWatcher:
@@ -179,7 +202,12 @@ class WeightWatcher:
             return self.ckpt_step
         return max(self.policy.version, latest_ckpt_step)
 
-    def _adapter_delta_base(self, next_step: int, local_weights_path) -> str:
+    def _adapter_delta_base(
+        self,
+        next_step: int,
+        local_weights_path,
+        target_url: str | None = None,
+    ) -> str:
         """Return the verified adjacent base URL and published delta manifest."""
         if self.lora_name is None or next_step <= 0:
             raise RuntimeError("an adapter delta requires a positive LoRA policy step")
@@ -206,19 +234,23 @@ class WeightWatcher:
                 f"cannot apply adapter policy v{next_step}: verified base URL changed"
             )
 
-        manifest_path = local_weights_path / "adapter_manifest.json"
+        if target_url is None:
+            target_url = inference_weight_path(self.config, local_weights_path, self.lora_name)
         try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (FileNotFoundError, OSError, ValueError) as exc:
+            manifest, manifest_location = _read_adapter_manifest(
+                local_weights_path,
+                target_url if isinstance(target_url, str) else None,
+                self.config.weight_broadcast.timeout,
+            )
+        except RuntimeError as exc:
             raise RuntimeError(
-                f"cannot apply adapter policy v{next_step}: published adapter manifest is unavailable"
+                f"cannot apply adapter policy v{next_step}: {exc}"
             ) from exc
-        if not isinstance(manifest, dict):
-            raise RuntimeError(f"cannot apply adapter policy v{next_step}: adapter manifest is not an object")
         if (
             manifest.get("version") != 1
             or manifest.get("kind") != "lora-adapter"
             or manifest.get("mode") != "delta"
+            or manifest.get("transport") != "chunked-shuffled-xor-zstd"
             or manifest.get("target_step") != next_step
             or manifest.get("base_step") != next_step - 1
         ):
@@ -229,7 +261,7 @@ class WeightWatcher:
         self.last_adapter_delta_build_time = (
             float(build_seconds) if isinstance(build_seconds, (int, float)) and build_seconds >= 0 else -1.0
         )
-        return manifest_path.as_posix()
+        return manifest_location
 
     async def apply_policy_update(self, next_step: int) -> None:
         async with self.update_lock:
@@ -273,7 +305,7 @@ class WeightWatcher:
                 elif self.lora_name is not None and next_step > 0 and isinstance(weights_path, str):
                     if local_weights_path is None:
                         raise RuntimeError("adapter delta target path is not local")
-                    manifest_path = self._adapter_delta_base(next_step, local_weights_path)
+                    manifest_path = self._adapter_delta_base(next_step, local_weights_path, weights_path)
                     require_delta = True
                     build_time = (
                         format_time(self.last_adapter_delta_build_time)
