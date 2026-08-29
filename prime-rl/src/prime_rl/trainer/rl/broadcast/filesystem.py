@@ -149,6 +149,8 @@ class FileSystemWeightBroadcast(WeightBroadcast):
         stable_file.touch()
 
     def maybe_clean(self, interval_to_keep: int | None):
+        if not self.world.is_master:
+            return
         for idx in self.multi_run_manager.used_idxs:
             maybe_clean(
                 get_broadcast_dir(self.multi_run_manager.get_run_dir(idx)),

@@ -671,8 +671,10 @@ def maybe_clean(path: Path, step: int, interval_to_keep: int | None) -> None:
     ckpt from ``step - 1``; ``step - 2`` is therefore safe to remove unless it falls on a
     checkpoint interval that we want to preserve.
     """
+    if step < 2:
+        return
     logger = get_logger()
-    candidate_step = max(step - 2, 0)
+    candidate_step = step - 2
     candidate_path = get_step_path(path, candidate_step)
     if interval_to_keep and candidate_step % interval_to_keep == 0:
         logger.debug(f"Keeping path {candidate_path} (on ckpt interval)")
