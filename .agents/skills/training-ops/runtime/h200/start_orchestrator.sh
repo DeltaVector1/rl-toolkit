@@ -72,6 +72,7 @@ sudo docker run -d --name glm52-decensor-orchestrator \
   -e HF_HOME=/data/glm52-rl/hf-cache \
   -v /data/glm52-rl:/data/glm52-rl \
   -v /data/muse-glimmer/model:/data/muse-glimmer/model:ro \
+  -v glm52-fp8-model:/models/glm52-fp8:ro \
   -v "$deployment/prime-rl/deps/renderers/renderers/base.py":/app/deps/renderers/renderers/base.py:ro \
   -v "$deployment/prime-rl/deps/renderers/renderers/client.py":/app/deps/renderers/renderers/client.py:ro \
   -v "$deployment/prime-rl/deps/verifiers/verifiers/v1/clients/eval.py":/app/deps/verifiers/verifiers/v1/clients/eval.py:ro \

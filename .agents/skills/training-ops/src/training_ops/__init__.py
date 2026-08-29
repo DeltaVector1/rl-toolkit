@@ -1601,7 +1601,7 @@ def alive(pattern: str, host: str = trainer_head, log: str = "") -> bool:
     rc, out = _ssh(
         host,
         f"pgrep -f {json.dumps(_no_self_match(pattern))} | wc -l; "
-        + (f"tail -1 {log} 2>/dev/null" if log else ""),
+        + (f"tail -1 {log} 2>/dev/null || true" if log else ""),
     )
     if rc:
         raise RuntimeError(f"cannot check {pattern!r} on {host}: {out.strip()}")
@@ -2333,12 +2333,13 @@ def _repair_engine(host: str) -> str:
     return out.strip()
 
 
-def _repair_supervisors() -> str:
+def _repair_supervisors(profile: str = "current") -> str:
     out = []
     for pat, cmd, log in (
         (
             "bash .*tunnel_watchdog.sh",
-            f"nohup setsid env TIMEOUT=20 INTERVAL=45 bash {runtime_root}/china/tunnel_watchdog.sh "
+            f"nohup setsid env ports={shlex.quote(' '.join(map(str, inference_tunnel_ports)))} "
+            f"timeout=20 interval=45 bash {runtime_root}/china/tunnel_watchdog.sh "
             ">> /data/glm52-rl/tunnel_watchdog.log 2>&1 </dev/null & disown",
             "/data/glm52-rl/tunnel_watchdog.log",
         ),
@@ -2353,7 +2354,7 @@ def _repair_supervisors() -> str:
         else:
             out.append(f"{pat} already runs")
     for h in inference_hosts:
-        muse_engine = _profile()["kind"] == "muse"
+        muse_engine = _profile(profile)["kind"] == "muse"
         rc, count_text = _ssh(
             h,
             f"pgrep -f '^bash {runtime_root}/h200/engine_watchdog.sh$' | wc -l",
@@ -2877,7 +2878,7 @@ def start(
         if not n.isdigit() or int(n) < 1:
             raise RuntimeError(f"run supervisor did not start on {trainer_head}")
         print(f"run supervisor: {n} process(es) for {run}")
-        _repair_supervisors()
+        _repair_supervisors(profile)
     print(f"started {run} in {mode} mode. Call status() in a few minutes.")
 
 
