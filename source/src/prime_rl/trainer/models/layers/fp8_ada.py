@@ -42,6 +42,10 @@ _FP8_EXPERT_ACTIVATION_OFFLOAD = (
 _FP8_EXPERT_ROUTE_OUTPUT_CACHE = (
     os.environ.get("PRIME_FP8_EXPERT_ROUTE_OUTPUT_CACHE", "") == "1"
 )
+_FP8_EXPERT_FUSED_GLU_VALUE = os.environ.get("PRIME_FP8_EXPERT_FUSED_GLU", "0")
+if _FP8_EXPERT_FUSED_GLU_VALUE not in {"0", "1"}:
+    raise ValueError("PRIME_FP8_EXPERT_FUSED_GLU must be 0 or 1")
+_FP8_EXPERT_FUSED_GLU = _FP8_EXPERT_FUSED_GLU_VALUE == "1"
 _DIAGNOSE_LINEAR_BACKWARD = False
 _REPORTED_LINEAR_BACKWARD: set[tuple[tuple[int, ...], bool, bool]] = set()
 _REPORTED_INPUT_GRAD: set[str] = set()
@@ -437,10 +441,172 @@ if hasattr(triton, "jit"):
         previous = tl.load(output + output_offsets, mask=output_mask, other=0.0)
         tl.store(output + output_offsets, previous + accumulator, mask=output_mask)
 
+    @triton.jit
+    def _fused_glu_moe_kernel(
+        a_ptr,
+        w1_ptr,
+        w3_ptr,
+        d1_ptr,
+        d3_ptr,
+        c_ptr,
+        a_scale_ptr,
+        w1_scale_ptr,
+        w3_scale_ptr,
+        sorted_token_ids_ptr,
+        expert_ids_ptr,
+        num_tokens_post_padded_ptr,
+        N,
+        K,
+        EM,
+        num_valid_tokens,
+        stride_am,
+        stride_ak,
+        stride_w1e,
+        stride_w1k,
+        stride_w1n,
+        stride_w3e,
+        stride_w3k,
+        stride_w3n,
+        stride_d1m,
+        stride_d1n,
+        stride_d3m,
+        stride_d3n,
+        stride_cm,
+        stride_cn,
+        stride_asm,
+        stride_ask,
+        stride_w1se,
+        stride_w1sk,
+        stride_w1sn,
+        stride_w3se,
+        stride_w3sk,
+        stride_w3sn,
+        BLOCK_SIZE_M: tl.constexpr,
+        BLOCK_SIZE_N: tl.constexpr,
+        BLOCK_SIZE_K: tl.constexpr,
+        GROUP_SIZE_M: tl.constexpr,
+    ):
+        """Compute grouped FP8 W1/W3, LoRA add, and SiLU gating in one kernel.
+
+        This uses the same source-major token assignment as vLLM's grouped
+        W8A8 kernel. The two FP8 accumulators share each loaded activation
+        tile, then the BF16 LoRA deltas are added before SiLU. The output is
+        the intermediate consumed by the separate W2 projection.
+        """
+        pid = tl.program_id(0)
+        num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+        num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+        num_pid_in_group = GROUP_SIZE_M * num_pid_n
+        group_id = pid // num_pid_in_group
+        first_pid_m = group_id * GROUP_SIZE_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+        pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+        pid_n = (pid % num_pid_in_group) // group_size_m
+
+        offs = tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+        num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+        if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+            return
+        offs_token_id = pid_m * BLOCK_SIZE_M + offs
+        offs_token = tl.load(sorted_token_ids_ptr + offs_token_id).to(tl.int64)
+        token_mask = (offs_token >= 0) & (offs_token < num_valid_tokens)
+        off_expert = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+        offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+        n_mask = offs_n < N
+
+        if off_expert == -1:
+            zero = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.bfloat16)
+            tl.store(
+                c_ptr + offs_token[:, None] * stride_cm + offs_n[None, :] * stride_cn,
+                zero,
+                mask=token_mask[:, None] & n_mask[None, :],
+            )
+            return
+
+        offs_k = tl.arange(0, BLOCK_SIZE_K)
+        a_ptrs = a_ptr + (
+            offs_token[:, None] * stride_am + offs_k[None, :] * stride_ak
+        )
+        w1_ptrs = (
+            w1_ptr
+            + off_expert * stride_w1e
+            + offs_k[:, None] * stride_w1k
+            + offs_n[None, :] * stride_w1n
+        )
+        w3_ptrs = (
+            w3_ptr
+            + off_expert * stride_w3e
+            + offs_k[:, None] * stride_w3k
+            + offs_n[None, :] * stride_w3n
+        )
+        a_scale_row = a_scale_ptr + offs_token * stride_asm
+        w1_scale_row = w1_scale_ptr + off_expert * stride_w1se
+        w3_scale_row = w3_scale_ptr + off_expert * stride_w3se
+        acc1 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        acc3 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+        for k_start in range(0, K, BLOCK_SIZE_K):
+            k_mask = offs_k < K - k_start
+            a = tl.load(
+                a_ptrs,
+                mask=token_mask[:, None] & k_mask[None, :],
+                other=0.0,
+            )
+            w1 = tl.load(w1_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
+            w3 = tl.load(w3_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
+            a_scale = tl.load(
+                a_scale_row + (k_start // 128) * stride_ask,
+                mask=token_mask,
+                other=0.0,
+            )
+            w1_scale = tl.load(
+                w1_scale_row
+                + (k_start // 128) * stride_w1sk
+                + (offs_n // 128) * stride_w1sn,
+                mask=n_mask,
+                other=0.0,
+            )
+            w3_scale = tl.load(
+                w3_scale_row
+                + (k_start // 128) * stride_w3sk
+                + (offs_n // 128) * stride_w3sn,
+                mask=n_mask,
+                other=0.0,
+            )
+            acc1 += tl.dot(a, w1) * a_scale[:, None] * w1_scale[None, :]
+            acc3 += tl.dot(a, w3) * a_scale[:, None] * w3_scale[None, :]
+            a_ptrs += BLOCK_SIZE_K * stride_ak
+            w1_ptrs += BLOCK_SIZE_K * stride_w1k
+            w3_ptrs += BLOCK_SIZE_K * stride_w3k
+
+        # vLLM converts each base GEMM to BF16 before the LoRA add. Preserve
+        # that order so the fused path has the same rounding boundary.
+        gate = acc1.to(tl.bfloat16)
+        up = acc3.to(tl.bfloat16)
+        gate += tl.load(
+            d1_ptr + offs_token[:, None] * stride_d1m + offs_n[None, :] * stride_d1n,
+            mask=token_mask[:, None] & n_mask[None, :],
+            other=0.0,
+        )
+        up += tl.load(
+            d3_ptr + offs_token[:, None] * stride_d3m + offs_n[None, :] * stride_d3n,
+            mask=token_mask[:, None] & n_mask[None, :],
+            other=0.0,
+        )
+        gate_f32 = gate.to(tl.float32)
+        up_f32 = up.to(tl.float32)
+        gated = (gate_f32 * tl.sigmoid(gate_f32) * up_f32).to(tl.bfloat16)
+        tl.store(
+            c_ptr + offs_token[:, None] * stride_cm + offs_n[None, :] * stride_cn,
+            gated,
+            mask=token_mask[:, None] & n_mask[None, :],
+        )
+
 else:
     _block_fp8_mm_kernel = None
     _w8a16_input_grad_kernel = None
     _grouped_outer_accumulate_kernel = None
+    _fused_glu_moe_kernel = None
 
 
 def set_diagnose_linear_backward(enabled: bool) -> None:
@@ -1776,6 +1942,182 @@ def _dispatch_grouped_mm(
     return result
 
 
+def _fused_glu_eligibility(
+    x,
+    quantized,
+    w1,
+    s1,
+    w3,
+    s3,
+    delta1,
+    delta3,
+    activation_scale,
+    sorted_ids,
+    expert_ids,
+    padded,
+    config,
+):
+    if _fused_glu_moe_kernel is None:
+        return False, "triton-unavailable"
+    if not all(
+        value.is_cuda
+        for value in (
+            x,
+            quantized,
+            w1,
+            s1,
+            w3,
+            s3,
+            delta1,
+            delta3,
+            activation_scale,
+            sorted_ids,
+            expert_ids,
+            padded,
+        )
+    ):
+        return False, "not-cuda"
+    if torch.cuda.get_device_capability(x.device) != (8, 9):
+        return False, "not-sm89"
+    if x.dtype != torch.bfloat16 or quantized.dtype != torch.float8_e4m3fn:
+        return False, "activation-dtype"
+    if any(weight.dtype != torch.float8_e4m3fn for weight in (w1, w3)):
+        return False, "weight-dtype"
+    if any(scale.dtype != torch.float32 for scale in (s1, s3, activation_scale)):
+        return False, "scale-dtype"
+    if any(delta.dtype != torch.bfloat16 for delta in (delta1, delta3)):
+        return False, "delta-dtype"
+    if w1.ndim != 3 or w3.shape != w1.shape:
+        return False, "weight-shape"
+    experts, output_size, input_size = w1.shape
+    if x.ndim != 2 or tuple(x.shape) != (quantized.shape[0], input_size):
+        return False, "input-shape"
+    if tuple(delta1.shape) != (x.shape[0], output_size) or delta3.shape != delta1.shape:
+        return False, "delta-shape"
+    expected_weight_scale = (experts, (output_size + 127) // 128, (input_size + 127) // 128)
+    if tuple(s1.shape) != expected_weight_scale or tuple(s3.shape) != expected_weight_scale:
+        return False, "weight-scale-shape"
+    expected_activation_scale = (x.shape[0], (input_size + 127) // 128)
+    if tuple(activation_scale.shape) != expected_activation_scale:
+        return False, "activation-scale-shape"
+    if any(not value.is_contiguous() for value in (quantized, w1, w3, delta1, delta3)):
+        return False, "noncontiguous"
+    if sorted_ids.ndim != 1 or expert_ids.ndim != 1 or padded.ndim != 1:
+        return False, "assignment-shape"
+    if padded.numel() != 1 or sorted_ids.numel() == 0:
+        return False, "assignment-empty"
+    try:
+        block_m = int(config["BLOCK_SIZE_M"])
+        block_n = int(config["BLOCK_SIZE_N"])
+        block_k = int(config["BLOCK_SIZE_K"])
+        group_m = int(config["GROUP_SIZE_M"])
+    except (KeyError, TypeError, ValueError):
+        return False, "config-shape"
+    if block_m <= 0 or block_n <= 0 or block_k != 128 or group_m <= 0:
+        return False, "config-tile"
+    if output_size % 128 or input_size % 128:
+        return False, "block-shape"
+    if sorted_ids.dtype not in (torch.int32, torch.int64) or expert_ids.dtype not in (
+        torch.int32,
+        torch.int64,
+    ):
+        return False, "assignment-dtype"
+    return True, ""
+
+
+@torch.compiler.disable
+def _fused_grouped_mm_glu(
+    x,
+    w1,
+    s1,
+    w3,
+    s3,
+    delta1,
+    delta3,
+    offsets,
+):
+    """Run native FP8 W1/W3 plus LoRA and SiLU without base intermediates."""
+    config, rows, sorted_ids, expert_ids, padded = _prepare_grouped_mm(
+        x,
+        w1,
+        offsets,
+    )
+    quantized, activation_scale = _quantize_grouped_mm_input(x)
+    eligible, reason = _fused_glu_eligibility(
+        x,
+        quantized,
+        w1,
+        s1,
+        w3,
+        s3,
+        delta1,
+        delta3,
+        activation_scale,
+        sorted_ids,
+        expert_ids,
+        padded,
+        config,
+    )
+    if not eligible:
+        raise RuntimeError(f"fused SM89 expert GLU is not eligible: {reason}")
+
+    output_size = w1.shape[1]
+    out = torch.empty(x.shape[0], output_size, device=x.device, dtype=x.dtype)
+    block_m = int(config["BLOCK_SIZE_M"])
+    block_n = int(config["BLOCK_SIZE_N"])
+    block_k = int(config["BLOCK_SIZE_K"])
+    group_m = int(config["GROUP_SIZE_M"])
+    grid = (triton.cdiv(sorted_ids.shape[0], block_m),)
+    _fused_glu_moe_kernel[grid](
+        quantized,
+        w1,
+        w3,
+        delta1,
+        delta3,
+        out,
+        activation_scale,
+        s1,
+        s3,
+        sorted_ids,
+        expert_ids,
+        padded,
+        output_size,
+        x.shape[1],
+        sorted_ids.shape[0],
+        x.shape[0],
+        quantized.stride(0),
+        quantized.stride(1),
+        w1.stride(0),
+        w1.stride(2),
+        w1.stride(1),
+        w3.stride(0),
+        w3.stride(2),
+        w3.stride(1),
+        delta1.stride(0),
+        delta1.stride(1),
+        delta3.stride(0),
+        delta3.stride(1),
+        out.stride(0),
+        out.stride(1),
+        activation_scale.stride(0),
+        activation_scale.stride(1),
+        s1.stride(0),
+        s1.stride(2),
+        s1.stride(1),
+        s3.stride(0),
+        s3.stride(2),
+        s3.stride(1),
+        BLOCK_SIZE_M=block_m,
+        BLOCK_SIZE_N=block_n,
+        BLOCK_SIZE_K=block_k,
+        GROUP_SIZE_M=group_m,
+        num_warps=int(config.get("num_warps", 4)),
+        num_stages=int(config.get("num_stages", 2)),
+    )
+    out.masked_fill_((rows >= offsets[-1]).unsqueeze(-1), 0)
+    return out
+
+
 @torch.compiler.disable
 def _grouped_mm(x, weight, scale, offsets):
     prepared = _prepare_grouped_mm(x, weight, offsets)
@@ -2513,6 +2855,10 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
             raise RuntimeError(
                 "native expert local recompute state does not match its route scores"
             )
+        if _FP8_EXPERT_FUSED_GLU and not local_recompute:
+            raise RuntimeError(
+                "fused SM89 expert GLU requires local recompute backward state"
+            )
         if local_recompute and (
             received_scores.device != x.device
             or received_scores.dtype != torch.float32
@@ -2591,38 +2937,74 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
             _expert_phase_end(phase_timer)
             chunk_offsets = _expert_chunk_offsets(offsets, start, end)
 
-            phase_timer = _expert_phase_start("forward.w13_base")
-            z1, z3 = _grouped_mm_pair(
-                chunk_x,
-                w1,
-                s1,
-                chunk_x,
-                w3,
-                s3,
-                chunk_offsets,
-                shared_input=True,
-            )
-            _expert_phase_end(phase_timer)
-            phase_timer = _expert_phase_start("forward.w13_lora")
-            z1.add_(
-                _grouped_lora_projection(
+            if _FP8_EXPERT_FUSED_GLU:
+                # Compute only the LoRA deltas as materialized W1/W3
+                # intermediates. The fused native-FP8 kernel adds them to
+                # the two base accumulators before applying SiLU, so the
+                # large base gate/up tensors never reach HBM.
+                phase_timer = _expert_phase_start("forward.w13_lora")
+                z1_lora = _grouped_lora_projection(
                     chunk_x,
                     w1_lora_a,
                     w1_lora_b,
                     chunk_offsets,
-                ),
-                alpha=scaling,
-            )
-            z3.add_(
-                _grouped_lora_projection(
+                )
+                z3_lora = _grouped_lora_projection(
                     chunk_x,
                     w3_lora_a,
                     w3_lora_b,
                     chunk_offsets,
-                ),
-                alpha=scaling,
-            )
-            _expert_phase_end(phase_timer)
+                )
+                if scaling != 1.0:
+                    z1_lora.mul_(scaling)
+                    z3_lora.mul_(scaling)
+                _expert_phase_end(phase_timer)
+                phase_timer = _expert_phase_start("forward.fused_w13_glu")
+                z1 = _fused_grouped_mm_glu(
+                    chunk_x,
+                    w1,
+                    s1,
+                    w3,
+                    s3,
+                    z1_lora,
+                    z3_lora,
+                    chunk_offsets,
+                )
+                _expert_phase_end(phase_timer)
+                del z1_lora, z3_lora
+            else:
+                phase_timer = _expert_phase_start("forward.w13_base")
+                z1, z3 = _grouped_mm_pair(
+                    chunk_x,
+                    w1,
+                    s1,
+                    chunk_x,
+                    w3,
+                    s3,
+                    chunk_offsets,
+                    shared_input=True,
+                )
+                _expert_phase_end(phase_timer)
+                phase_timer = _expert_phase_start("forward.w13_lora")
+                z1.add_(
+                    _grouped_lora_projection(
+                        chunk_x,
+                        w1_lora_a,
+                        w1_lora_b,
+                        chunk_offsets,
+                    ),
+                    alpha=scaling,
+                )
+                z3.add_(
+                    _grouped_lora_projection(
+                        chunk_x,
+                        w3_lora_a,
+                        w3_lora_b,
+                        chunk_offsets,
+                    ),
+                    alpha=scaling,
+                )
+                _expert_phase_end(phase_timer)
 
             # The gathered source rows are no longer needed after W1/W3 and
             # their LoRA updates. Release this bounded copy before W2 allocates
@@ -2641,10 +3023,12 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
                 _expert_phase_end(phase_timer)
 
             phase_timer = _expert_phase_start("forward.glu")
-            F.silu(z1, inplace=True)
-            z1.mul_(z3)
+            if not _FP8_EXPERT_FUSED_GLU:
+                F.silu(z1, inplace=True)
+                z1.mul_(z3)
             _expert_phase_end(phase_timer)
-            del z3
+            if not _FP8_EXPERT_FUSED_GLU:
+                del z3
             phase_timer = _expert_phase_start("forward.w2_base")
             chunk_out = _grouped_mm_chunked(
                 z1,
