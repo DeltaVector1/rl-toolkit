@@ -317,6 +317,11 @@ PY
       }
       case "${PRIME_QUALIFICATION_PROFILE:-}" in
         glm52-native-b2048|glm52-native-stability20) ;;
+        glm52-mtp-stability20)
+          [ "$(readlink -f "$trainer_config")" = "$(readlink -f "$deployment/configs/qualification/glm52-mtp-stability20.toml")" ] || {
+            echo "MTP stability qualification trainer config path differs" >&2; exit 1
+          }
+          ;;
         *) echo "qualification profile is invalid" >&2; exit 1 ;;
       esac
       for value in \
