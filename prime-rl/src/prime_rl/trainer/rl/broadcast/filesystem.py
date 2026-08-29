@@ -1,4 +1,3 @@
-import json
 import shutil
 import time
 from pathlib import Path
@@ -18,7 +17,7 @@ from prime_rl.trainer.weights import (
     save_state_dict,
 )
 from prime_rl.trainer.world import get_world
-from prime_rl.utils.checkpoint_delta import sha256_file
+from prime_rl.utils.adapter_delta import publish_adapter_manifest
 from prime_rl.utils.utils import get_broadcast_dir, get_step_path
 
 
@@ -104,32 +103,24 @@ class FileSystemWeightBroadcast(WeightBroadcast):
                             alpha=orch_lora.alpha,
                             dropout=self.lora_config.dropout,
                         )
-                        adapter_path = save_dir / "adapter_model.safetensors"
-                        digest_path = save_dir / "adapter_model.safetensors.sha256"
-                        adapter_digest = sha256_file(adapter_path)
-                        digest_path.write_text(f"{adapter_digest}\n")
-                        # Publish sizes and digests before STABLE so remote
-                        # staging can validate every byte and resume safely.
-                        manifest = {
-                            "version": 1,
-                            "files": [
-                                {
-                                    "name": filename,
-                                    "size": (save_dir / filename).stat().st_size,
-                                    "sha256": (
-                                        adapter_digest
-                                        if filename == "adapter_model.safetensors"
-                                        else sha256_file(save_dir / filename)
-                                    ),
-                                }
-                                for filename in ("adapter_config.json", "adapter_model.safetensors")
-                            ],
-                        }
-                        manifest_temporary = save_dir / "adapter_manifest.json.partial"
-                        manifest_temporary.write_text(
-                            json.dumps(manifest, separators=(",", ":")), encoding="utf-8"
+                        broadcast_step = self.multi_run_manager.progress[idx].step - 1
+                        previous_dir = get_step_path(
+                            get_broadcast_dir(self.multi_run_manager.get_run_dir(idx)),
+                            broadcast_step - 1,
                         )
-                        manifest_temporary.replace(save_dir / "adapter_manifest.json")
+                        manifest = publish_adapter_manifest(
+                            save_dir,
+                            previous_dir if previous_dir.is_dir() else None,
+                            target_step=broadcast_step,
+                            base_step=broadcast_step - 1 if previous_dir.is_dir() else None,
+                        )
+                        self.logger.info(
+                            f"Published adapter {manifest['mode']} transport: "
+                            f"{manifest['encoded_size']} encoded bytes for "
+                            f"{manifest['full_size']} full bytes in "
+                            f"{manifest['build_seconds']}s using "
+                            f"{manifest['chunk_count']} chunks"
+                        )
 
                     self._notify_orchestrator(save_dir)
 

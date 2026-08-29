@@ -34,6 +34,7 @@ RUN sed -i \
     /app/.venv/lib/python3.12/site-packages/torchao/prototype/mx_formats/kernels.py
 COPY --chmod=644 prime-rl/src/prime_rl/utils/client.py /app/src/prime_rl/utils/client.py
 COPY --chmod=644 prime-rl/src/prime_rl/utils/checkpoint_delta.py /app/src/prime_rl/utils/checkpoint_delta.py
+COPY --chmod=644 prime-rl/src/prime_rl/utils/adapter_delta.py /app/src/prime_rl/utils/adapter_delta.py
 COPY --chmod=644 prime-rl/src/prime_rl/utils/monitor/__init__.py /app/src/prime_rl/utils/monitor/__init__.py
 COPY --chmod=644 prime-rl/src/prime_rl/utils/monitor/swanlab.py /app/src/prime_rl/utils/monitor/swanlab.py
 COPY --chmod=644 prime-rl/src/prime_rl/orchestrator/orchestrator.py /app/src/prime_rl/orchestrator/orchestrator.py

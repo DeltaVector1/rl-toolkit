@@ -5,6 +5,7 @@ orchestrator's barrier bounds the in-flight lead."""
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from urllib.parse import quote
 
@@ -67,12 +68,23 @@ class WeightWatcher:
 
         self.last_update_weights_time: float = 0.0
         self.last_stage_weights_time: float = 0.0
+        self.last_adapter_delta_build_time: float = -1.0
+        self.last_adapter_wire_stage_time: float = 0.0
+        self.last_adapter_reconstruct_time: float = -1.0
+        self.last_adapter_load_time: float = 0.0
         self.last_wait_for_ckpt_time: float = 0.0
         self.update_count: int = 0
         self.reconcile_count: int = 0
         self.last_reconcile_time: float = 0.0
         self.last_reconcile_check_at: float = 0.0
         self.current_weights_path = None
+
+        # A delta is safe only when the inference pool has confirmed the
+        # immediately previous adapter. A restarted watcher may trust the
+        # startup load, but it must never skip an adapter version.
+        self.verified_adapter_step: int | None = ckpt_step if lora_name is not None else None
+        self.verified_adapter_url: str | None = None
+        self.bootstrap_staged = lora_name is None or ckpt_step != 0 or model_express is not None
 
         self.task: asyncio.Task | None = None
         self.update_lock = asyncio.Lock()
@@ -82,6 +94,14 @@ class WeightWatcher:
         self.task = asyncio.current_task()
         try:
             while not self.stopped.is_set():
+                if not self.bootstrap_staged:
+                    try:
+                        await self.stage_bootstrap_adapter()
+                    except Exception:
+                        get_logger().exception("Failed to stage the initial adapter; retrying")
+                    if not self.bootstrap_staged:
+                        await asyncio.sleep(self.poll_interval)
+                        continue
                 next_step = self.compute_next_ckpt_step()
                 if next_step > self.ckpt_step:
                     try:
@@ -97,6 +117,35 @@ class WeightWatcher:
                 await asyncio.sleep(self.poll_interval)
         except asyncio.CancelledError:
             return
+
+    async def stage_bootstrap_adapter(self) -> None:
+        """Stage policy zero without loading it or advancing policy state."""
+        broadcast_dir = get_broadcast_dir(self.config.output_dir)
+        local_path = get_step_path(broadcast_dir, 0)
+        if not (local_path / "STABLE").is_file():
+            return
+        source_path = inference_weight_path(self.config, local_path, self.lora_name)
+        if isinstance(source_path, str):
+            started = time.perf_counter()
+            result = await stage_lora_adapter(
+                self.inference.admin_clients,
+                source_path,
+                require_delta=False,
+            )
+            self.last_adapter_wire_stage_time = float(result.get("wire_stage_seconds", 0.0))
+            reconstruct_seconds = result.get("reconstruct_seconds")
+            self.last_adapter_reconstruct_time = (
+                float(reconstruct_seconds) if reconstruct_seconds is not None else -1.0
+            )
+            self.last_stage_weights_time = time.perf_counter() - started
+            get_logger().info(
+                f"Staged initial adapter policy v0 on every inference host in "
+                f"{format_time(self.last_stage_weights_time)}"
+            )
+        self.current_weights_path = source_path
+        self.verified_adapter_step = 0
+        self.verified_adapter_url = str(source_path)
+        self.bootstrap_staged = True
 
     async def stop(self) -> None:
         self.stopped.set()
@@ -121,7 +170,66 @@ class WeightWatcher:
 
         broadcast_dir = get_broadcast_dir(self.config.output_dir)
         latest_ckpt_step = get_latest_ckpt_step(broadcast_dir) or 0
+        if self.lora_name is not None:
+            # Delta manifests are adjacent-step objects. Do not jump to the
+            # newest checkpoint: that would apply a delta against the wrong
+            # base after a delayed or restarted watcher.
+            if latest_ckpt_step > self.ckpt_step:
+                return self.ckpt_step + 1
+            return self.ckpt_step
         return max(self.policy.version, latest_ckpt_step)
+
+    def _adapter_delta_base(self, next_step: int, local_weights_path) -> str:
+        """Return the verified adjacent base URL and published delta manifest."""
+        if self.lora_name is None or next_step <= 0:
+            raise RuntimeError("an adapter delta requires a positive LoRA policy step")
+        if self.verified_adapter_step != next_step - 1:
+            raise RuntimeError(
+                f"cannot apply adapter policy v{next_step}: verified base is "
+                f"v{self.verified_adapter_step}, expected v{next_step - 1}"
+            )
+
+        broadcast_dir = get_broadcast_dir(self.config.output_dir)
+        previous_path = get_step_path(broadcast_dir, next_step - 1)
+        if not (previous_path / "STABLE").is_file():
+            raise RuntimeError(
+                f"cannot apply adapter policy v{next_step}: previous policy v{next_step - 1} "
+                "is not marked STABLE"
+            )
+        previous_url = inference_weight_path(self.config, previous_path, self.lora_name)
+        if not isinstance(previous_url, str):
+            raise RuntimeError(
+                f"cannot apply adapter policy v{next_step}: previous policy has no source URL"
+            )
+        if self.verified_adapter_url is not None and previous_url != self.verified_adapter_url:
+            raise RuntimeError(
+                f"cannot apply adapter policy v{next_step}: verified base URL changed"
+            )
+
+        manifest_path = local_weights_path / "adapter_manifest.json"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            raise RuntimeError(
+                f"cannot apply adapter policy v{next_step}: published adapter manifest is unavailable"
+            ) from exc
+        if not isinstance(manifest, dict):
+            raise RuntimeError(f"cannot apply adapter policy v{next_step}: adapter manifest is not an object")
+        if (
+            manifest.get("version") != 1
+            or manifest.get("kind") != "lora-adapter"
+            or manifest.get("mode") != "delta"
+            or manifest.get("target_step") != next_step
+            or manifest.get("base_step") != next_step - 1
+        ):
+            raise RuntimeError(
+                f"cannot apply adapter policy v{next_step}: manifest is not the adjacent delta"
+            )
+        build_seconds = manifest.get("build_seconds")
+        self.last_adapter_delta_build_time = (
+            float(build_seconds) if isinstance(build_seconds, (int, float)) and build_seconds >= 0 else -1.0
+        )
+        return manifest_path.as_posix()
 
     async def apply_policy_update(self, next_step: int) -> None:
         async with self.update_lock:
@@ -131,6 +239,8 @@ class WeightWatcher:
 
             t0 = time.perf_counter()
             weights_path = None
+            local_weights_path = None
+            require_delta = False
             if self.model_express is not None:
                 await self.wait_for_model_express_status(p2p_pb2.SOURCE_STATUS_READY)
             else:
@@ -160,6 +270,20 @@ class WeightWatcher:
                             get_logger().info(
                                 f"Built lossless checkpoint delta for policy v{next_step}: {delta_path}"
                             )
+                elif self.lora_name is not None and next_step > 0 and isinstance(weights_path, str):
+                    if local_weights_path is None:
+                        raise RuntimeError("adapter delta target path is not local")
+                    manifest_path = self._adapter_delta_base(next_step, local_weights_path)
+                    require_delta = True
+                    build_time = (
+                        format_time(self.last_adapter_delta_build_time)
+                        if self.last_adapter_delta_build_time >= 0
+                        else "not reported by trainer"
+                    )
+                    get_logger().info(
+                        f"Using lossless adapter delta for policy v{next_step}: {manifest_path} "
+                        f"(build {build_time})"
+                    )
             self.last_wait_for_ckpt_time = time.perf_counter() - t0
 
             # Remote LoRA files cross the high-loss China link. Stage them on
@@ -169,7 +293,19 @@ class WeightWatcher:
             if isinstance(weights_path, str):
                 stage_started = time.perf_counter()
                 if self.lora_name is not None:
-                    await stage_lora_adapter(self.inference.admin_clients, weights_path)
+                    stage_result = await stage_lora_adapter(
+                        self.inference.admin_clients,
+                        weights_path,
+                        require_delta=require_delta,
+                    )
+                    self.last_adapter_wire_stage_time = float(
+                        stage_result.get("wire_stage_seconds", time.perf_counter() - stage_started)
+                    )
+                    reconstruct_seconds = stage_result.get("reconstruct_seconds")
+                    if reconstruct_seconds is not None:
+                        self.last_adapter_reconstruct_time = float(reconstruct_seconds)
+                    else:
+                        self.last_adapter_reconstruct_time = -1.0
                 else:
                     await stage_full_checkpoint(self.inference.admin_clients, weights_path)
                 self.last_stage_weights_time = time.perf_counter() - stage_started
@@ -177,6 +313,17 @@ class WeightWatcher:
                     f"Staged policy v{next_step} on every inference host in "
                     f"{format_time(self.last_stage_weights_time)}"
                 )
+                if self.lora_name is not None:
+                    reconstruct = (
+                        format_time(self.last_adapter_reconstruct_time)
+                        if self.last_adapter_reconstruct_time >= 0
+                        else "not reported by inference host"
+                    )
+                    get_logger().info(
+                        f"Adapter v{next_step} transfer: wire-stage "
+                        f"{format_time(self.last_adapter_wire_stage_time)}, "
+                        f"reconstruct {reconstruct}"
+                    )
 
             # An observer can request a bounded safe boundary before we stop
             # old-policy work. The production orchestrator lets the current
@@ -205,13 +352,25 @@ class WeightWatcher:
             get_logger().debug(f"Updating weights to step {next_step}")
             t1 = time.perf_counter()
             lora_name = f"{self.lora_name}-slot{next_step % 2}" if self.lora_name is not None else None
-            await self.inference.update_weights(weights_path, lora_name=lora_name, step=next_step)
+            await self.inference.update_weights(
+                weights_path,
+                lora_name=lora_name,
+                step=next_step,
+                require_delta=require_delta,
+                prefetched=True,
+            )
             self.last_update_weights_time = time.perf_counter() - t1
+            if self.lora_name is not None:
+                self.last_adapter_load_time = self.last_update_weights_time
             self.update_count += 1
             get_logger().debug(f"Updated weights to step {next_step} in {format_time(self.last_update_weights_time)}")
             self.ckpt_step = next_step
             self.policy.version = next_step
             self.current_weights_path = weights_path
+
+            if self.lora_name is not None:
+                self.verified_adapter_step = next_step
+                self.verified_adapter_url = str(weights_path)
 
             if lora_name is not None:
                 self.inference.update_model_name(lora_name)
@@ -294,6 +453,10 @@ class WeightWatcher:
             "watcher/reconcile_count": float(self.reconcile_count),
             "watcher/last_update_weights_time": self.last_update_weights_time,
             "watcher/last_stage_weights_time": self.last_stage_weights_time,
+            "watcher/last_adapter_delta_build_time": self.last_adapter_delta_build_time,
+            "watcher/last_adapter_wire_stage_time": self.last_adapter_wire_stage_time,
+            "watcher/last_adapter_reconstruct_time": self.last_adapter_reconstruct_time,
+            "watcher/last_adapter_load_time": self.last_adapter_load_time,
             "watcher/last_wait_for_ckpt_time": self.last_wait_for_ckpt_time,
             "watcher/last_reconcile_time": self.last_reconcile_time,
         }

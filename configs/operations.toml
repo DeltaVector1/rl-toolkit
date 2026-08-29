@@ -1,5 +1,6 @@
 [hosts]
 trainer_head = "n82"
+trainer_ssh = "china-trainer"
 trainers = ["n76", "n77", "n78", "n80", "n82", "n83", "n84", "n85"]
 inference = ["h200a"]
 orchestrator = "h200a"
@@ -9,6 +10,8 @@ blocked = ["n79"]
 [ports]
 inference_tunnel_first = 18001
 inference_tunnel_last = 18048
+lora_source_first = 18100
+lora_source_last = 18107
 judge = 26406
 adapter = 8100
 batch = 29620
@@ -70,6 +73,7 @@ deployment_mkdir_timeout_seconds = 30
 deployment_scp_timeout_seconds = 300
 deployment_bundle_scp_timeout_seconds = 60
 adapter_update_engine_startup_timeout_seconds = 900
+adapter_delta_stage_timeout_seconds = 300
 
 [requirements.shared]
 group_size = 16

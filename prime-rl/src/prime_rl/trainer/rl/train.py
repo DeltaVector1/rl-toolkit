@@ -1121,6 +1121,28 @@ def train(config: TrainerConfig):
             config.model.lora,
         )
 
+    # Publish the untouched fresh adapter before the first rollout batch exists.
+    # This gives inference an exact policy-0 snapshot without an optimizer step.
+    if (
+        fresh_lora_policy
+        and weight_broadcast is not None
+        and config.weight_broadcast.type == "filesystem"
+    ):
+        if multi_run_manager.progress[0].step != 1:
+            raise RuntimeError("fresh LoRA bootstrap must publish policy step 0")
+        multi_run_manager.ready_to_update[0] = True
+        bootstrap_save_start_time = time.perf_counter()
+        try:
+            weight_broadcast.broadcast_weights(model, step=0)
+        finally:
+            # The filesystem broadcaster clears this only on the master rank.
+            multi_run_manager.ready_to_update[0] = False
+        if world.is_master:
+            logger.info(
+                "Filesystem policy-0 bootstrap save time: "
+                f"{format_time(time.perf_counter() - bootstrap_save_start_time)}"
+            )
+
     if parallel_dims.cp_enabled:
         cp_group = parallel_dims.world_mesh["cp"].get_group()
         cp_rank = parallel_dims.world_mesh["cp"].get_local_rank()
@@ -1403,10 +1425,7 @@ def train(config: TrainerConfig):
                 _local_error = "; ".join(
                     f"micro-batch {_i}: {_why}" for _i, _why in _bad[:5]
                 )
-            # GLM x85 has one data rank. Check every host before any rank can
-            # enter the pipeline schedule. A different final file otherwise
-            # leaves one host with an old parsed batch and only produced the
-            # generic count error below.
+            # With one data rank, check every host before entering the pipeline.
             _compare_all_ranks = parallel_dims.get_mesh("dp").size() == 1
             verify_pipeline_batch_identity(
                 micro_batches,

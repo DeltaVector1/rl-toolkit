@@ -3,6 +3,21 @@ set -euo pipefail
 
 deployment=/data/glm52-rl/deployment
 runtime=/data/muse-glimmer/runtime
+readarray -t lora_source_ports < <(python3 - "$deployment/configs/operations.toml" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as stream:
+    config = tomllib.load(stream)
+ports = config["ports"]
+first = ports["lora_source_first"]
+last = ports["lora_source_last"]
+if not isinstance(first, int) or not isinstance(last, int) or first < 1 or last < first:
+    raise SystemExit("invalid lora source port range")
+print(",".join(str(port) for port in range(first, last + 1)))
+PY
+)
+lora_source_port_list=${lora_source_ports[0]:?operations config has no LoRA source ports}
 install -d -m 0755 "$runtime/prime_rl/inference/vllm/worker"
 install -d -m 0755 "$runtime/prime_rl/utils"
 install -d -m 0755 "$runtime/muse_file_server-0.1.dist-info"
@@ -71,6 +86,7 @@ start_replica() {
   -v /data:/data \
   -v "$deployment/prime-rl/src/prime_rl/inference/vllm/worker/filesystem.py":"$runtime/prime_rl/inference/vllm/worker/filesystem.py":ro \
   -v "$deployment/prime-rl/src/prime_rl/utils/checkpoint_delta.py":"$runtime/prime_rl/utils/checkpoint_delta.py":ro \
+  -v "$deployment/prime-rl/src/prime_rl/utils/adapter_delta.py":"$runtime/prime_rl/utils/adapter_delta.py":ro \
   -e PYTHONPATH="$runtime" \
   -e MUSE_TP_SIZE="$tp_size" \
   -e VLLM_PLUGINS=muse_file_server \
@@ -78,6 +94,7 @@ start_replica() {
   -e PRIME_FULL_CHECKPOINT_CACHE_DIR=/data/muse-glimmer/weight-cache \
   -e PRIME_LORA_CACHE_DIR=/data/muse-glimmer/lora-cache \
   -e PRIME_LORA_DOWNLOAD_STREAMS=8 \
+  -e PRIME_LORA_SOURCE_PORTS="$lora_source_port_list" \
   -e PRIME_FULL_CHECKPOINT_PORTS="$weight_tunnel_ports" \
   -e CUDA_DEVICE_ORDER=PCI_BUS_ID \
   -e PYTHONUNBUFFERED=1 \

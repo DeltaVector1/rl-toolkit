@@ -6,6 +6,7 @@ import re
 import shutil
 import threading
 import time
+import tomllib
 import urllib.request
 from urllib.error import HTTPError
 from contextlib import contextmanager
@@ -51,10 +52,48 @@ _ADAPTER_FILES = ("adapter_config.json", "adapter_model.safetensors")
 _ADAPTER_MANIFEST = "adapter_manifest.json"
 _ADAPTER_DIGEST = "adapter_model.safetensors.sha256"
 _ADAPTER_STATUS = ".adapter-stage-status.json"
+_ADAPTER_DELTA_TRANSPORT = "chunked-shuffled-xor-zstd"
+_ADAPTER_MAX_CHUNKS = 65536
 _ADAPTER_LANE_TIMEOUT_S = float(os.environ.get("PRIME_LORA_LANE_TIMEOUT_S", "45"))
 _ADAPTER_LANE_RETRIES = int(os.environ.get("PRIME_LORA_LANE_RETRIES", "6"))
 _ADAPTER_STATUS_INTERVAL_S = float(os.environ.get("PRIME_LORA_STATUS_INTERVAL_S", "1"))
 _JSON_LOCK = threading.Lock()
+
+
+def _delta_stage_timeout_s() -> float:
+    configured = os.environ.get("PRIME_LORA_DELTA_STAGE_TIMEOUT_S")
+    if configured is not None:
+        try:
+            value = float(configured)
+        except ValueError as exc:
+            raise OSError("PRIME_LORA_DELTA_STAGE_TIMEOUT_S must be a number") from exc
+    else:
+        config_path = Path(
+            os.environ.get(
+                "PRIME_RL_OPERATIONS_CONFIG",
+                "/data/glm52-rl/deployment/configs/operations.toml",
+            )
+        )
+        try:
+            with config_path.open("rb") as stream:
+                config = tomllib.load(stream)
+        except FileNotFoundError as exc:
+            raise OSError(f"operations config is missing: {config_path}") from exc
+        except (OSError, tomllib.TOMLDecodeError) as exc:
+            raise OSError(f"cannot read operations config: {config_path}") from exc
+        else:
+            limits = config.get("limits")
+            if not isinstance(limits, dict) or "adapter_delta_stage_timeout_seconds" not in limits:
+                raise OSError("operations config has no adapter delta stage timeout")
+            value = limits["adapter_delta_stage_timeout_seconds"]
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        raise OSError("adapter delta stage timeout must be positive")
+    return float(value)
+
+
+def _check_deadline(deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError("adapter delta staging exceeded its time limit")
 
 
 def _content_length(source_url: str) -> int:
@@ -136,6 +175,166 @@ def _source_manifest(source_url: str) -> dict[str, object]:
     }
 
 
+def _adapter_source_urls(source_url: str) -> list[str]:
+    ports = [
+        value.strip()
+        for value in os.environ.get("PRIME_LORA_SOURCE_PORTS", "").split(",")
+        if value.strip()
+    ]
+    if not ports:
+        return [source_url]
+    parsed = urlsplit(source_url)
+    if parsed.hostname not in ("127.0.0.1", "localhost"):
+        raise OSError("adapter tunnel pool requires a loopback source URL")
+    source_urls: list[str] = []
+    for port in ports:
+        try:
+            value = int(port)
+        except ValueError as exc:
+            raise OSError(f"invalid adapter source port: {port!r}") from exc
+        if not 1 <= value <= 65535:
+            raise OSError(f"invalid adapter source port: {port!r}")
+        source_urls.append(
+            urlunsplit(
+                (
+                    parsed.scheme,
+                    f"{parsed.hostname}:{value}",
+                    parsed.path,
+                    parsed.query,
+                    parsed.fragment,
+                )
+            )
+        )
+    return source_urls
+
+
+def _read_chunked_xor_manifest(source_url: str) -> dict[str, object] | None:
+    """Read the exact version-one adapter transport manifest."""
+    source_root = source_url.rstrip("/")
+    try:
+        value = json.loads(_read_source_text(f"{source_root}/{_ADAPTER_MANIFEST}"))
+    except HTTPError as exc:
+        if exc.code == 404:
+            raise OSError("adapter manifest is missing; transfer mode is unknown") from exc
+        raise
+    if not isinstance(value, dict) or value.get("version") != 1:
+        raise OSError("invalid adapter transport manifest")
+    mode = value.get("mode")
+    if mode == "full":
+        return {"mode": "full"}
+    if mode != "delta" or value.get("kind") != "lora-adapter":
+        raise OSError("adapter manifest selects an unsupported mode")
+    if value.get("transport") != _ADAPTER_DELTA_TRANSPORT:
+        raise OSError("adapter manifest selects an unsupported transport")
+
+    target_step = value.get("target_step")
+    base_step = value.get("base_step")
+    if type(target_step) is not int or target_step <= 0 or base_step != target_step - 1:
+        raise OSError("adapter manifest steps are not consecutive")
+    parsed_source = urlsplit(source_url)
+    if parsed_source.scheme not in ("http", "https") or not parsed_source.hostname:
+        raise OSError("adapter source URL must use HTTP or HTTPS")
+    match = re.fullmatch(r"step_(\d+)", Path(parsed_source.path.rstrip("/")).name)
+    if match is None or int(match.group(1)) != target_step:
+        raise OSError("adapter source URL does not identify target step")
+    base_path = str(Path(parsed_source.path.rstrip("/")).parent / f"step_{base_step}")
+    base_url = urlunsplit(
+        (parsed_source.scheme, parsed_source.netloc, base_path, parsed_source.query, parsed_source.fragment)
+    )
+
+    base_sha256 = value.get("base_sha256")
+    target_sha256 = value.get("target_sha256")
+    full_sha256 = value.get("full_sha256")
+    target_size = value.get("target_size")
+    full_size = value.get("full_size")
+    config_sha256 = value.get("config_sha256")
+    config_size = value.get("config_size")
+    base_config_sha256 = value.get("base_config_sha256")
+
+    def valid_digest(item: object) -> bool:
+        return isinstance(item, str) and re.fullmatch(r"[0-9a-f]{64}", item) is not None
+
+    if (
+        not valid_digest(base_sha256)
+        or not valid_digest(target_sha256)
+        or target_sha256 != full_sha256
+        or type(target_size) is not int
+        or target_size <= 0
+        or target_size != full_size
+        or not valid_digest(config_sha256)
+        or type(config_size) is not int
+        or config_size < 0
+        or not valid_digest(base_config_sha256)
+    ):
+        raise OSError("adapter transport manifest is missing target identity")
+
+    raw_chunks = value.get("chunks")
+    if not isinstance(raw_chunks, list) or not raw_chunks or len(raw_chunks) > _ADAPTER_MAX_CHUNKS:
+        raise OSError("adapter transport manifest has an invalid chunk list")
+    chunks: list[dict[str, object]] = []
+    seen_files: set[str] = set()
+    for item in raw_chunks:
+        if not isinstance(item, dict):
+            raise OSError("adapter transport chunk is not an object")
+        name = item.get("file")
+        offset = item.get("offset")
+        raw_size = item.get("raw_size")
+        wire_size = item.get("wire_size")
+        wire_sha256 = item.get("wire_sha256")
+        raw_sha256 = item.get("raw_sha256")
+        if (
+            not isinstance(name, str)
+            or Path(name).name != name
+            or name in seen_files
+            or type(offset) is not int
+            or offset < 0
+            or type(raw_size) is not int
+            or raw_size <= 0
+            or type(wire_size) is not int
+            or wire_size <= 0
+            or offset + raw_size > target_size
+            or not valid_digest(wire_sha256)
+            or not valid_digest(raw_sha256)
+            or item.get("codec") != "zstd"
+        ):
+            raise OSError("adapter transport chunk identity is invalid")
+        seen_files.add(name)
+        chunks.append(
+            {
+                "file": name,
+                "offset": offset,
+                "raw_size": raw_size,
+                "wire_size": wire_size,
+                "wire_sha256": wire_sha256,
+                "raw_sha256": raw_sha256,
+            }
+        )
+    chunks.sort(key=lambda item: int(item["offset"]))
+    expected_offset = 0
+    for item in chunks:
+        if item["offset"] != expected_offset:
+            raise OSError("adapter transport chunks do not cover the target exactly")
+        expected_offset += int(item["raw_size"])
+    if expected_offset != target_size:
+        raise OSError("adapter transport chunks do not cover the target")
+    chunk_count = value.get("chunk_count")
+    if chunk_count is not None and chunk_count != len(chunks):
+        raise OSError("adapter transport chunk count differs")
+    return {
+        "version": 1,
+        "mode": "delta",
+        "transport": _ADAPTER_DELTA_TRANSPORT,
+        "base_url": base_url,
+        "base_sha256": base_sha256,
+        "target_sha256": target_sha256,
+        "target_size": target_size,
+        "config_sha256": config_sha256,
+        "config_size": config_size,
+        "base_config_sha256": base_config_sha256,
+        "chunks": chunks,
+    }
+
+
 def _write_json(path: Path, value: dict[str, object]) -> None:
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     temporary.write_text(json.dumps(value, separators=(",", ":")), encoding="utf-8")
@@ -197,6 +396,28 @@ def _cleanup_retired_adapters(cache_root: Path, active_name: str) -> None:
             continue
 
 
+def _cleanup_previous_adapter_caches(cache_root: Path, active: Path) -> None:
+    """Remove completed older adapter directories after publishing a new one."""
+    if not cache_root.exists():
+        return
+    for candidate in cache_root.iterdir():
+        if (
+            candidate == active
+            or not candidate.is_dir()
+            or re.fullmatch(r"[0-9a-f]{64}", candidate.name) is None
+            or not (candidate / "READY").is_file()
+        ):
+            continue
+        try:
+            with _adapter_reader_lock(candidate).open("a+") as reader_lock:
+                fcntl.flock(reader_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if candidate.exists() and (candidate / "READY").is_file():
+                    shutil.rmtree(candidate)
+                fcntl.flock(reader_lock, fcntl.LOCK_UN)
+        except (BlockingIOError, FileNotFoundError):
+            continue
+
+
 def _download_range(
     source_urls: list[str],
     source_index: int,
@@ -204,10 +425,12 @@ def _download_range(
     start: int,
     end: int,
     progress=None,
+    deadline: float | None = None,
 ) -> None:
     """Download one inclusive byte range and resume its local part file."""
     size = end - start + 1
     for attempt in range(_ADAPTER_LANE_RETRIES):
+        _check_deadline(deadline)
         try:
             source_url = source_urls[(source_index + attempt) % len(source_urls)]
             present = destination.stat().st_size if destination.exists() else 0
@@ -225,28 +448,356 @@ def _download_range(
                     raise OSError("adapter server did not honor byte range")
                 with destination.open("ab" if present else "wb") as output:
                     while present < size:
+                        _check_deadline(deadline)
                         chunk = response.read(min(16 * 1024 * 1024, size - present))
                         if not chunk:
                             raise OSError(f"adapter range ended early: {destination.name}")
                         output.write(chunk)
                         present += len(chunk)
+                        _check_deadline(deadline)
                         if progress is not None:
                             progress(source_index, len(chunk))
             if destination.stat().st_size != size:
                 raise OSError(f"incomplete adapter range: {destination.name}")
             return
-        except (OSError, TimeoutError):
+        except TimeoutError:
+            raise
+        except OSError:
             if attempt + 1 == _ADAPTER_LANE_RETRIES:
                 raise
             time.sleep(min(2**attempt, 10))
 
 
-def _sha256(path: Path) -> str:
+def _sha256(path: Path, deadline: float | None = None) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
-        while chunk := source.read(16 * 1024 * 1024):
+        while True:
+            _check_deadline(deadline)
+            chunk = source.read(16 * 1024 * 1024)
+            if not chunk:
+                break
             digest.update(chunk)
+    _check_deadline(deadline)
     return digest.hexdigest()
+
+
+def _decode_transport_chunk(payload: bytes, *, codec: str, raw_size: int) -> bytes:
+    """Use the shared bounded decoder for one transport chunk."""
+    try:
+        from prime_rl.utils.adapter_delta import decode_adapter_chunk
+    except ImportError as exc:
+        raise OSError("chunked adapter transport decoder is unavailable") from exc
+    try:
+        decoded = decode_adapter_chunk(
+            payload,
+            codec=codec,
+            max_output_size=raw_size,
+        )
+    except Exception as exc:
+        raise OSError("adapter transport chunk decompression failed") from exc
+    if not isinstance(decoded, bytes) or len(decoded) != raw_size:
+        raise OSError("adapter transport chunk has the wrong decoded size")
+    return decoded
+
+
+def _verified_adapter_base(
+    base_url: str,
+    expected_sha256: str,
+    *,
+    expected_config_sha256: str | None = None,
+) -> tuple[Path, Path]:
+    """Return a cached base only after checking its published identity."""
+    base_dir = adapter_cache_path(base_url)
+    model = base_dir / _ADAPTER_FILES[1]
+    config = base_dir / _ADAPTER_FILES[0]
+    if not (base_dir / "READY").is_file() or not model.is_file() or not config.is_file():
+        raise OSError("required base adapter is not cached")
+    try:
+        local_manifest = json.loads((base_dir / "manifest.json").read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        raise OSError("cached base adapter has no valid manifest") from exc
+    if not isinstance(local_manifest, dict) or local_manifest.get("source_url") != base_url:
+        raise OSError("cached base adapter URL differs from requested base")
+    files = local_manifest.get("files")
+    if not isinstance(files, dict):
+        raise OSError("cached base adapter manifest has no files")
+    model_spec = files.get(_ADAPTER_FILES[1])
+    config_spec = files.get(_ADAPTER_FILES[0])
+    if not isinstance(model_spec, dict) or model_spec.get("sha256") != expected_sha256:
+        raise OSError("cached base adapter manifest checksum differs")
+    if expected_config_sha256 is not None and (
+        not isinstance(config_spec, dict) or config_spec.get("sha256") != expected_config_sha256
+    ):
+        raise OSError("cached base adapter configuration checksum differs")
+    checksum = base_dir / _ADAPTER_DIGEST
+    if not checksum.is_file() or _read_checksum(checksum) != expected_sha256:
+        raise OSError("cached base adapter sidecar checksum differs")
+    if expected_config_sha256 is not None and _sha256(config) != expected_config_sha256:
+        raise OSError("cached base adapter configuration bytes differ")
+    return model, config
+
+
+def _read_checksum(path: Path) -> str:
+    value = path.read_text(encoding="ascii").strip()
+    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise OSError(f"invalid adapter checksum: {path.name}")
+    return value
+
+
+def _preallocate(path: Path, size: int) -> None:
+    with path.open("wb") as output:
+        if not hasattr(os, "posix_fallocate"):
+            raise OSError("adapter receiver requires posix_fallocate")
+        os.posix_fallocate(output.fileno(), 0, size)
+
+
+def _pwrite_all(file_descriptor: int, value: bytes, offset: int) -> None:
+    written = 0
+    while written < len(value):
+        count = os.pwrite(file_descriptor, value[written:], offset + written)
+        if count <= 0:
+            raise OSError("adapter transport output write failed")
+        written += count
+
+
+def _xor_bytes(left: bytes, right: bytes) -> bytes:
+    try:
+        from prime_rl.utils.adapter_delta import _xor
+    except ImportError as exc:
+        raise OSError("chunked adapter XOR helper is unavailable") from exc
+    try:
+        return _xor(left, right)
+    except Exception as exc:
+        raise OSError("adapter transport XOR failed") from exc
+
+
+def _transport_raw_sha256(delta: bytes) -> str:
+    try:
+        from prime_rl.utils.adapter_delta import shuffle_bf16_bytes
+    except ImportError as exc:
+        raise OSError("chunked adapter shuffle helper is unavailable") from exc
+    return hashlib.sha256(shuffle_bf16_bytes(delta)).hexdigest()
+
+
+def _stage_chunked_xor_adapter(
+    source_url: str,
+    transport: dict[str, object],
+    source_manifest: dict[str, object],
+    deadline: float | None = None,
+) -> Path:
+    destination = adapter_cache_path(source_url)
+    started = time.monotonic()
+    _check_deadline(deadline)
+    base_url = transport["base_url"]
+    base_sha256 = transport["base_sha256"]
+    target_sha256 = transport["target_sha256"]
+    target_size = transport["target_size"]
+    config_sha256 = transport["config_sha256"]
+    assert isinstance(base_url, str)
+    assert isinstance(base_sha256, str)
+    assert isinstance(target_sha256, str)
+    assert isinstance(target_size, int)
+    assert isinstance(config_sha256, str)
+    base_model, _ = _verified_adapter_base(
+        base_url,
+        base_sha256,
+        expected_config_sha256=(
+            transport["base_config_sha256"]
+            if isinstance(transport.get("base_config_sha256"), str)
+            else None
+        ),
+    )
+    chunks = transport["chunks"]
+    assert isinstance(chunks, list)
+    chunks = sorted(chunks, key=lambda item: int(item["offset"]))
+    temporary = destination.with_name(f"{destination.name}.partial")
+    transport_identity = json.dumps(transport, sort_keys=True, separators=(",", ":"))
+    identity_path = temporary / "transport-manifest.json"
+    if identity_path.is_file():
+        try:
+            if identity_path.read_text(encoding="utf-8") != transport_identity:
+                shutil.rmtree(temporary)
+        except OSError:
+            shutil.rmtree(temporary)
+    temporary.mkdir(exist_ok=True)
+    identity_path.write_text(transport_identity, encoding="utf-8")
+    chunk_root = temporary / "transport-chunks"
+    chunk_root.mkdir(exist_ok=True)
+    total_wire_bytes = sum(int(item["wire_size"]) for item in chunks)
+    config_size = transport.get("config_size")
+    if isinstance(config_size, int):
+        total_wire_bytes += config_size
+    progress_lock = threading.Lock()
+    progress_bytes = sum(
+        int(item["wire_size"])
+        for item in chunks
+        if (
+            isinstance(item, dict)
+            and isinstance(item.get("file"), str)
+            and (
+                chunk_root / Path(str(item["file"])).name
+            ).is_file()
+            and (chunk_root / Path(str(item["file"])).name).stat().st_size == int(item["wire_size"])
+        )
+    )
+    last_status = 0.0
+
+    def report(lane: int, amount: int) -> None:
+        nonlocal progress_bytes, last_status
+        with progress_lock:
+            progress_bytes += amount
+            now = time.monotonic()
+            if now - last_status < _ADAPTER_STATUS_INTERVAL_S and progress_bytes < total_wire_bytes:
+                return
+            last_status = now
+            _write_stage_status(
+                destination.parent,
+                {
+                    "status": "staging",
+                    "source_url": source_url,
+                    "path": destination.as_posix(),
+                    "transport": _ADAPTER_DELTA_TRANSPORT,
+                    "bytes_done": progress_bytes,
+                    "bytes_total": total_wire_bytes,
+                    "lane": lane,
+                    "updated_at": time.time(),
+                    "elapsed_seconds": round(now - started, 3),
+                },
+            )
+
+    _write_stage_status(
+        destination.parent,
+        {
+            "status": "staging",
+            "source_url": source_url,
+            "path": destination.as_posix(),
+            "transport": _ADAPTER_DELTA_TRANSPORT,
+            "bytes_done": progress_bytes,
+            "bytes_total": total_wire_bytes,
+            "updated_at": time.time(),
+            "elapsed_seconds": 0.0,
+        },
+    )
+
+    lane_urls = _adapter_source_urls(source_url)
+    output_path = temporary / _ADAPTER_FILES[1]
+    if not output_path.is_file() or output_path.stat().st_size != target_size:
+        _preallocate(output_path, target_size)
+
+    def fetch(index: int, item: dict[str, object], base_fd: int, output_fd: int) -> None:
+        name = item["file"]
+        assert isinstance(name, str)
+        relative = Path(name)
+        chunk_path = chunk_root / relative
+        chunk_path.parent.mkdir(parents=True, exist_ok=True)
+
+        def lane_report(_lane: int, amount: int) -> None:
+            report(index % len(lane_urls), amount)
+
+        download(
+            f"{source_url.rstrip('/')}/{name}",
+            chunk_path,
+            expected_size=int(item["wire_size"]),
+            expected_sha256=str(item["wire_sha256"]),
+            progress=lane_report,
+            source_urls=[lane_urls[index % len(lane_urls)]],
+            deadline=deadline,
+        )
+
+        _check_deadline(deadline)
+        encoded = chunk_path.read_bytes()
+        if len(encoded) != int(item["wire_size"]):
+            raise OSError("adapter transport chunk size changed")
+        if _sha256(chunk_path, deadline) != item["wire_sha256"]:
+            raise OSError("adapter transport chunk checksum mismatch")
+        raw = _decode_transport_chunk(
+            encoded,
+            codec=str(transport["transport"]),
+            raw_size=int(item["raw_size"]),
+        )
+        _check_deadline(deadline)
+        raw_sha256 = item.get("raw_sha256")
+        if _transport_raw_sha256(raw) != raw_sha256:
+            raise OSError("adapter transport decoded chunk checksum mismatch")
+        offset = int(item["offset"])
+        base_chunk = os.pread(base_fd, len(raw), offset)
+        if len(base_chunk) != len(raw):
+            raise OSError("cached base adapter ended before transport chunk")
+        _pwrite_all(output_fd, _xor_bytes(base_chunk, raw), offset)
+        _check_deadline(deadline)
+        chunk_path.unlink()
+
+    base_fd = os.open(base_model, os.O_RDONLY)
+    output_fd = os.open(output_path, os.O_RDWR)
+    try:
+        with ThreadPoolExecutor(max_workers=min(len(chunks), _PARALLEL_DOWNLOAD_STREAMS)) as executor:
+            futures = [executor.submit(fetch, index, item, base_fd, output_fd) for index, item in enumerate(chunks)]
+            for future in futures:
+                _check_deadline(deadline)
+                future.result()
+    finally:
+        os.close(output_fd)
+        os.close(base_fd)
+
+    if _sha256(output_path, deadline) != target_sha256:
+        raise OSError("reconstructed adapter checksum mismatch")
+    if output_path.stat().st_size != target_size:
+        raise OSError("reconstructed adapter size mismatch")
+
+    config_path = temporary / _ADAPTER_FILES[0]
+    download(
+        f"{source_url.rstrip('/')}/{_ADAPTER_FILES[0]}",
+        config_path,
+        expected_size=(config_size if isinstance(config_size, int) else None),
+        expected_sha256=config_sha256,
+        progress=report,
+        deadline=deadline,
+    )
+    if _sha256(config_path, deadline) != config_sha256:
+        raise OSError("adapter configuration checksum mismatch")
+    shutil.rmtree(chunk_root)
+    (temporary / _ADAPTER_DIGEST).write_text(f"{target_sha256}\n", encoding="ascii")
+    _write_json(temporary / "manifest.json", source_manifest)
+    _write_json(
+        temporary / "transport.json",
+        {
+            "mode": _ADAPTER_DELTA_TRANSPORT,
+            "source_url": source_url,
+            "base_url": base_url,
+            "base_sha256": base_sha256,
+            "target_sha256": target_sha256,
+        },
+    )
+    ready = temporary / "READY"
+    ready.write_text("ready\n", encoding="utf-8")
+    with ready.open("rb") as stream:
+        stream.flush()
+        os.fsync(stream.fileno())
+    with _adapter_reader_lock(destination).open("a+") as reader_lock:
+        fcntl.flock(reader_lock, fcntl.LOCK_EX)
+        if destination.exists():
+            retired = destination.with_name(
+                f"{destination.name}.retired-{time.time_ns()}-{os.getpid()}"
+            )
+            os.replace(destination, retired)
+        os.replace(temporary, destination)
+        fcntl.flock(reader_lock, fcntl.LOCK_UN)
+    _cleanup_retired_adapters(destination.parent, destination.name)
+    _cleanup_previous_adapter_caches(destination.parent, destination)
+    _write_stage_status(
+        destination.parent,
+        {
+            "status": "ready",
+            "source_url": source_url,
+            "path": destination.as_posix(),
+            "transport": _ADAPTER_DELTA_TRANSPORT,
+            "bytes_done": total_wire_bytes,
+            "bytes_total": total_wire_bytes,
+            "updated_at": time.time(),
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+        },
+    )
+    return destination
 
 
 def download(
@@ -256,42 +807,24 @@ def download(
     expected_size: int | None = None,
     expected_sha256: str | None = None,
     progress=None,
+    source_urls: list[str] | None = None,
+    deadline: float | None = None,
 ) -> None:
-    total = _content_length(source_url)
-    if expected_size is not None and total != expected_size:
-        raise OSError(
-            f"adapter source size changed for {source_url}: expected {expected_size}, got {total}"
-        )
+    _check_deadline(deadline)
+    source_urls = _adapter_source_urls(source_url) if source_urls is None else source_urls
+    if not source_urls:
+        raise OSError("adapter download has no source lane")
+    total = expected_size if expected_size is not None else _content_length(source_urls[0])
+    _check_deadline(deadline)
     if destination.exists() and destination.stat().st_size == total:
-        if expected_sha256 is None or _sha256(destination) == expected_sha256:
+        if expected_sha256 is None or _sha256(destination, deadline) == expected_sha256:
             return
         destination.unlink()
 
     # Full-checkpoint tunnels are not adapter sources. Reusing their 128-port
     # list here created 128 adapter lanes on every replica and collapsed the
     # link. Adapter fan-out is opt-in and has its own setting.
-    adapter_ports = [
-        value.strip()
-        for value in os.environ.get("PRIME_LORA_SOURCE_PORTS", "").split(",")
-        if value.strip()
-    ]
-    source_urls = [source_url]
-    if adapter_ports:
-        parsed = urlsplit(source_url)
-        if parsed.hostname not in ("127.0.0.1", "localhost"):
-            raise OSError("adapter tunnel pool requires a loopback source URL")
-        source_urls = [
-            urlunsplit(
-                (
-                    parsed.scheme,
-                    f"{parsed.hostname}:{int(port)}",
-                    parsed.path,
-                    parsed.query,
-                    parsed.fragment,
-                )
-            )
-            for port in checkpoint_ports
-        ]
+    adapter_ports = len(source_urls) > 1 or source_urls[0] != source_url
 
     streams = len(source_urls) if adapter_ports else max(
         1, int(os.environ.get("PRIME_LORA_DOWNLOAD_STREAMS", _PARALLEL_DOWNLOAD_STREAMS))
@@ -300,13 +833,14 @@ def download(
         # Preserve the old single-file resume path for small metadata files and
         # for an explicitly disabled parallel transfer.
         for attempt in range(_ADAPTER_LANE_RETRIES):
+            _check_deadline(deadline)
             try:
                 offset = destination.stat().st_size if destination.exists() else 0
                 if offset > total:
                     destination.unlink()
                     offset = 0
                 request = urllib.request.Request(
-                    source_url,
+                    source_urls[attempt % len(source_urls)],
                     headers={"Range": f"bytes={offset}-"} if offset else {},
                 )
                 with urllib.request.urlopen(request, timeout=_ADAPTER_LANE_TIMEOUT_S) as response:
@@ -315,22 +849,26 @@ def download(
                         raise OSError("adapter server did not honor byte range")
                     with destination.open("ab" if offset else "wb") as output:
                         while offset < total:
+                            _check_deadline(deadline)
                             chunk = response.read(min(16 * 1024 * 1024, total - offset))
                             if not chunk:
                                 raise OSError(f"adapter file ended early: {destination.name}")
                             output.write(chunk)
                             offset += len(chunk)
+                            _check_deadline(deadline)
                             if progress is not None:
                                 progress(0, len(chunk))
                 if destination.stat().st_size != total:
                     raise OSError(f"incomplete adapter file: {destination.name}")
-                if expected_sha256 is not None and _sha256(destination) != expected_sha256:
+                if expected_sha256 is not None and _sha256(destination, deadline) != expected_sha256:
                     # A complete but bad file must not be resumed from EOF on
                     # the next bounded attempt.
                     destination.unlink(missing_ok=True)
                     raise OSError(f"adapter checksum mismatch: {destination.name}")
                 return
-            except (OSError, TimeoutError):
+            except TimeoutError:
+                raise
+            except OSError:
                 if attempt + 1 == _ADAPTER_LANE_RETRIES:
                     raise
                 time.sleep(min(2**attempt, 10))
@@ -376,6 +914,7 @@ def download(
                 start,
                 end,
                 progress,
+                deadline,
             )
             for index, start, end in ranges
         ]
@@ -389,7 +928,7 @@ def download(
                 shutil.copyfileobj(part, output, length=16 * 1024 * 1024)
     if assembling.stat().st_size != total:
         raise OSError(f"assembled adapter file has the wrong size: {destination.name}")
-    if expected_sha256 is not None and _sha256(assembling) != expected_sha256:
+    if expected_sha256 is not None and _sha256(assembling, deadline) != expected_sha256:
         # Part sizes alone cannot detect a bad byte from a reset connection.
         # Drop the private parts after a whole-file mismatch so the next
         # stage attempt does not repeatedly assemble the same bad payload.
@@ -400,7 +939,7 @@ def download(
     shutil.rmtree(parts_dir)
 
 
-def stage_lora_adapter_files(source_url: str) -> Path:
+def stage_lora_adapter_files(source_url: str, require_delta: bool = False) -> Path:
     """Download one remote adapter into the host-shared cache.
 
     The API server can call this before it pauses generation. Worker-side
@@ -416,9 +955,60 @@ def stage_lora_adapter_files(source_url: str) -> Path:
         fcntl.flock(host_lock, fcntl.LOCK_EX)
         started = time.monotonic()
         try:
+            transport = _read_chunked_xor_manifest(source_url)
             manifest = _source_manifest(source_url)
             files = manifest["files"]
             assert isinstance(files, dict)
+
+            if require_delta and (transport is None or transport.get("mode") != "delta"):
+                raise OSError("delta adapter transport is required; full adapter fallback is disabled")
+
+            if transport is not None and transport.get("mode") == "delta":
+                target_spec = files.get(_ADAPTER_FILES[1])
+                config_spec = files.get(_ADAPTER_FILES[0])
+                if (
+                    not isinstance(target_spec, dict)
+                    or target_spec.get("sha256") != transport["target_sha256"]
+                    or target_spec.get("size") != transport["target_size"]
+                    or not isinstance(config_spec, dict)
+                    or config_spec.get("sha256") != transport["config_sha256"]
+                    or config_spec.get("size") != transport["config_size"]
+                ):
+                    raise OSError("adapter transport target differs from source manifest")
+                if (destination / "READY").is_file():
+                    try:
+                        with (destination / "transport.json").open("r", encoding="utf-8") as source:
+                            proof = json.load(source)
+                    except (FileNotFoundError, OSError, ValueError):
+                        proof = None
+                    if (
+                        isinstance(proof, dict)
+                        and proof.get("mode") == _ADAPTER_DELTA_TRANSPORT
+                        and proof.get("source_url") == source_url
+                        and proof.get("target_sha256") == transport["target_sha256"]
+                        and (destination / _ADAPTER_FILES[1]).is_file()
+                        and _sha256(destination / _ADAPTER_FILES[1]) == transport["target_sha256"]
+                        and (destination / _ADAPTER_FILES[0]).is_file()
+                        and _sha256(destination / _ADAPTER_FILES[0]) == transport["config_sha256"]
+                    ):
+                        _write_stage_status(
+                            destination.parent,
+                            {
+                                "status": "ready",
+                                "source_url": source_url,
+                                "path": destination.as_posix(),
+                                "transport": _ADAPTER_DELTA_TRANSPORT,
+                                "bytes_done": 0,
+                                "bytes_total": 0,
+                                "updated_at": time.time(),
+                            },
+                        )
+                        _cleanup_retired_adapters(destination.parent, destination.name)
+                        _cleanup_previous_adapter_caches(destination.parent, destination)
+                        return destination
+                deadline = time.monotonic() + _delta_stage_timeout_s()
+                return _stage_chunked_xor_adapter(source_url, transport, manifest, deadline=deadline)
+            transport = None
 
             if (destination / "READY").is_file():
                 try:
@@ -439,6 +1029,7 @@ def stage_lora_adapter_files(source_url: str) -> Path:
                         },
                     )
                     _cleanup_retired_adapters(destination.parent, destination.name)
+                    _cleanup_previous_adapter_caches(destination.parent, destination)
                     return destination
 
             total_bytes = sum(int(item["size"]) for item in files.values())
@@ -520,6 +1111,7 @@ def stage_lora_adapter_files(source_url: str) -> Path:
                 os.replace(temporary, destination)
                 fcntl.flock(reader_lock, fcntl.LOCK_UN)
             _cleanup_retired_adapters(destination.parent, destination.name)
+            _cleanup_previous_adapter_caches(destination.parent, destination)
             _write_stage_status(
                 destination.parent,
                 {
@@ -669,8 +1261,8 @@ class FileSystemWeightUpdateWorker(Worker):
         """No-op RPC used by the API server liveness endpoint."""
         return None
 
-    def stage_lora_adapter(self, source_url: str) -> None:
-        stage_lora_adapter_files(source_url)
+    def stage_lora_adapter(self, source_url: str, require_delta: bool = False) -> None:
+        stage_lora_adapter_files(source_url, require_delta=require_delta)
 
     def stage_full_checkpoint(self, source_url: str) -> str:
         return stage_full_checkpoint_files(source_url).as_posix()

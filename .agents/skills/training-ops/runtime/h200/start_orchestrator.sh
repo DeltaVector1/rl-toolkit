@@ -12,6 +12,57 @@ ORCH_CT=${ORCH_CT:?set ORCH_CT}
 deployment=/data/glm52-rl/deployment
 image=prime-rl:glm52-decensor
 config_file=${ORCH_CONFIG:-$deployment/configs/current/orchestrator.toml}
+readarray -t lora_source_ports < <(python3 - "$deployment/configs/operations.toml" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as stream:
+    config = tomllib.load(stream)
+ports = config["ports"]
+first = ports["lora_source_first"]
+last = ports["lora_source_last"]
+if not isinstance(first, int) or not isinstance(last, int) or first < 1 or last < first:
+    raise SystemExit("invalid lora source port range")
+for port in range(first, last + 1):
+    print(port)
+PY
+)
+if [ "${#lora_source_ports[@]}" -lt 1 ]; then
+  echo "operations config has no LoRA source ports" >&2
+  exit 2
+fi
+adapter_port=$(python3 - "$deployment/configs/operations.toml" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as stream:
+    config = tomllib.load(stream)
+value = config["ports"].get("adapter")
+if not isinstance(value, int) or not 1 <= value <= 65535:
+    raise SystemExit("operations config has no valid adapter port")
+print(value)
+PY
+)
+if [ -z "$adapter_port" ]; then
+  echo "operations config has no adapter port" >&2
+  exit 2
+fi
+trainer_ssh_target=$(python3 - "$deployment/configs/operations.toml" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as stream:
+    config = tomllib.load(stream)
+target = config["hosts"]["trainer_ssh"]
+if not isinstance(target, str) or not target:
+    raise SystemExit("operations config has no trainer SSH target")
+print(target)
+PY
+)
+if [ -z "$trainer_ssh_target" ]; then
+  echo "operations config has no trainer SSH target" >&2
+  exit 2
+fi
 transport=$(awk '
   $0 == "[rollout_transport]" { active=1; next }
   /^\[/ { active=0 }
@@ -44,8 +95,10 @@ tunnel() { # local_port  target_host:port  ssh_target  [compress]
     done" >/dev/null 2>&1 < /dev/null &
 }
 
-tunnel 18100 127.0.0.1:8100 china-trainer yes
-ports=(18100)
+for lora_source_port in "${lora_source_ports[@]}"; do
+  tunnel "$lora_source_port" "127.0.0.1:$adapter_port" "$trainer_ssh_target" no
+done
+ports=("${lora_source_ports[@]}")
 if [[ " $adapter_admin_urls " == *":18111 "* ]]; then
   tunnel 18101 127.0.0.1:8000 "-p 40051 -i /root/.ssh/china_rollout_ed25519 root@152.236.142.243"
   tunnel 18111 127.0.0.1:8001 "-p 40051 -i /root/.ssh/china_rollout_ed25519 root@152.236.142.243"
@@ -55,7 +108,7 @@ if [[ " $adapter_admin_urls " == *":18111 "* ]]; then
   ports+=(18101 18111 18112 18113 18114)
 fi
 if [ "$transport" = zmq ]; then
-  tunnel 29620 10.92.20.82:29620 china-trainer yes
+  tunnel 29620 10.92.20.82:29620 "$trainer_ssh_target" yes
   ports+=(29620)
 fi
 
@@ -72,6 +125,7 @@ sudo docker run -d --name "$ORCH_CT" \
   --network host --restart no \
   --env-file /data/trinity/training.env \
   -e VLLM_API_KEY=unused \
+  -e PRIME_RL_OPERATIONS_CONFIG="$deployment/configs/operations.toml" \
   -e PYTHONPATH="$deployment/environments/decensor/src:$deployment/environments/ornith/src:$deployment/evals/refusals-classifier/src:/app/src" \
   -e HF_HOME="/data/glm52-rl/runs/$RUN/$RUN_NAME/hf-cache" \
   -v /data/glm52-rl:/data/glm52-rl \
@@ -88,6 +142,7 @@ sudo docker run -d --name "$ORCH_CT" \
   -v "$deployment/prime-rl/src/prime_rl/orchestrator/watcher.py":/app/src/prime_rl/orchestrator/watcher.py:ro \
   -v "$deployment/prime-rl/src/prime_rl/utils/client.py":/app/src/prime_rl/utils/client.py:ro \
   -v "$deployment/prime-rl/src/prime_rl/utils/checkpoint_delta.py":/app/src/prime_rl/utils/checkpoint_delta.py:ro \
+  -v "$deployment/prime-rl/src/prime_rl/utils/adapter_delta.py":/app/src/prime_rl/utils/adapter_delta.py:ro \
   --entrypoint /app/.venv/bin/orchestrator "$image" \
   @ "$config_file"
 echo "orchestrator started on $(hostname) with $(basename "$config_file")"
@@ -154,8 +209,8 @@ if [ "$transport" = filesystem ]; then
     exit 1
   fi
   nohup setsid env SOURCE_RUN_DIR="/data/glm52-rl/runs/$RUN/$RUN_NAME" \
-    DEST_HOST=china-trainer \
-    ADAPTER_SOURCE_BASE="http://127.0.0.1:18100/$RUN/$RUN_NAME" \
+    DEST_HOST="$trainer_ssh_target" \
+    ADAPTER_SOURCE_BASE="http://127.0.0.1:${lora_source_ports[0]}/$RUN/$RUN_NAME" \
     ADAPTER_ADMIN_URLS="$adapter_admin_urls" \
     "$deployment/.agents/skills/training-ops/runtime/h200/sync_rollout_batches.sh" \
     >>"/data/glm52-rl/batch-sync-$RUN.log" 2>&1 </dev/null &
@@ -174,9 +229,9 @@ for _ in $(seq 1 60); do
   sleep 2
 done
 if [ -f "$ctl" ]; then
-  ssh -o BatchMode=yes -o ConnectTimeout=20 china-trainer \
+  ssh -o BatchMode=yes -o ConnectTimeout=20 "$trainer_ssh_target" \
       "mkdir -p /data/glm52-rl/runs/$RUN/$RUN_NAME/control" \
-    && scp -q -o BatchMode=yes "$ctl" "china-trainer:$ctl" \
+    && scp -q -o BatchMode=yes "$ctl" "$trainer_ssh_target:$ctl" \
     && echo "control/orch.toml -> trainer ok" \
     || echo "WARNING: could not ship orch.toml to the trainer; it will not start" >&2
 else

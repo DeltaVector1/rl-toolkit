@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
+import tomllib
 from collections.abc import Mapping
 from itertools import cycle
 from pathlib import Path
@@ -69,7 +71,14 @@ class InferencePool(Protocol):
         """Wait for inference pool to be ready."""
         ...
 
-    async def update_weights(self, weight_dir: Path | str | None, lora_name: str | None = None, step: int = 0) -> None:
+    async def update_weights(
+        self,
+        weight_dir: Path | str | None,
+        lora_name: str | None = None,
+        step: int = 0,
+        require_delta: bool = False,
+        prefetched: bool = False,
+    ) -> None:
         """Update weights on all inference servers."""
         ...
 
@@ -172,8 +181,22 @@ class StaticInferencePool:
         )
         await maybe_check_has_model(self._admin_clients, model_name, skip_model_check=self._skip_model_check)
 
-    async def update_weights(self, weight_dir: Path | str | None, lora_name: str | None = None, step: int = 0) -> None:
-        await update_weights(self._admin_clients, weight_dir, lora_name=lora_name, step=step)
+    async def update_weights(
+        self,
+        weight_dir: Path | str | None,
+        lora_name: str | None = None,
+        step: int = 0,
+        require_delta: bool = False,
+        prefetched: bool = False,
+    ) -> None:
+        await update_weights(
+            self._admin_clients,
+            weight_dir,
+            lora_name=lora_name,
+            step=step,
+            require_delta=require_delta,
+            prefetched=prefetched,
+        )
 
     async def score(self, token_ids: list[int]) -> list[float]:
         """Prefill-score ``token_ids`` under this pool's model (one logprob per
@@ -409,6 +432,33 @@ async def _admin_post(
             response.raise_for_status()
 
 
+async def _admin_post_response(
+    client: AsyncClient,
+    path: str,
+    *,
+    timeout_s: float = ADMIN_TIMEOUT_S,
+    total_timeout_s: float | None = None,
+    **kwargs,
+) -> httpx.Response:
+    """POST an admin operation and return its successful response."""
+    retry_budget = 2 * timeout_s if total_timeout_s is None else total_timeout_s
+    async for attempt in AsyncRetrying(
+        retry=retry_if_exception(_is_retryable_admin_error),
+        stop=stop_after_delay(retry_budget) | stop_after_attempt(10),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+    ):
+        with attempt:
+            response = await client.post(
+                path,
+                timeout=httpx.Timeout(connect=10.0, read=timeout_s, write=60.0, pool=10.0),
+                **kwargs,
+            )
+            response.raise_for_status()
+            return response
+    raise RuntimeError(f"admin operation did not complete: {path}")
+
+
 async def _pause_engines(admin_clients: list[AsyncClient], *, step: int) -> None:
     """Abort registered requests and pause every inference scheduler.
 
@@ -515,27 +565,81 @@ async def _resume_engines(admin_clients: list[AsyncClient]) -> None:
     logger.debug("All inference engines resumed")
 
 
-async def stage_lora_adapter(admin_clients: list[AsyncClient], lora_path: Path | str) -> None:
-    """Stage one shared-host adapter copy before the load fan-out.
+async def stage_lora_adapter(
+    admin_clients: list[AsyncClient],
+    lora_path: Path | str,
+    *,
+    require_delta: bool = False,
+) -> dict[str, float | int | None]:
+    """Stage one adapter copy per inference host.
 
-    The eight Muse endpoints are independent processes on one host and mount
-    the same cache. Sending the stage request to all of them created eight
-    collective calls for one file and made old policy versions queue behind
-    the current one. One request owns the host-level transfer; the subsequent
-    load request still fans out to every endpoint.
+    A LoRA delta is valid only for the adjacent policy version. The receiver
+    checks the manifest and its verified base. This function sends that
+    requirement explicitly and returns measured staging time for each host.
     """
     lora_path_posix = str(lora_path)
     if not lora_path_posix.startswith(("http://", "https://")):
-        return
+        return {"wire_stage_seconds": 0.0, "host_count": 0}
     if not admin_clients:
         raise RuntimeError("cannot stage an adapter without an inference endpoint")
-    await _admin_post(
-        admin_clients[0],
-        "/stage_lora_adapter",
-        json={"lora_path": lora_path_posix},
-        timeout_s=LORA_STAGE_ATTEMPT_TIMEOUT_S,
-        total_timeout_s=LORA_STAGE_TOTAL_TIMEOUT_S,
+
+    def host_key(client: AsyncClient) -> tuple[str, str]:
+        url = client.base_url
+        return (url.scheme, url.host or str(url))
+
+    hosts: dict[tuple[str, str], AsyncClient] = {}
+    for client in admin_clients:
+        hosts.setdefault(host_key(client), client)
+
+    async def _stage_one(client: AsyncClient) -> dict[str, float | None]:
+        started = time.perf_counter()
+        stage_timeout_s = _delta_stage_timeout_s() if require_delta else LORA_STAGE_ATTEMPT_TIMEOUT_S
+        stage_total_timeout_s = stage_timeout_s if require_delta else LORA_STAGE_TOTAL_TIMEOUT_S
+        response = await _admin_post_response(
+            client,
+            "/stage_lora_adapter",
+            json={
+                "lora_path": lora_path_posix,
+                "require_delta": require_delta,
+            },
+            timeout_s=stage_timeout_s,
+            total_timeout_s=stage_total_timeout_s,
+        )
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise RuntimeError(f"invalid adapter stage response from {client.base_url}") from exc
+        if not isinstance(payload, dict) or payload.get("status") != "ok":
+            raise RuntimeError(f"adapter stage failed on {client.base_url}: {payload!r}")
+        stage_seconds = payload.get("stage_seconds")
+        if not isinstance(stage_seconds, (int, float)) or stage_seconds < 0:
+            stage_seconds = time.perf_counter() - started
+        reconstruct_seconds = payload.get("reconstruct_seconds")
+        if not isinstance(reconstruct_seconds, (int, float)) or reconstruct_seconds < 0:
+            reconstruct_seconds = None
+        return {
+            "wire_stage_seconds": float(stage_seconds),
+            "reconstruct_seconds": float(reconstruct_seconds)
+            if reconstruct_seconds is not None
+            else None,
+        }
+
+    started = time.perf_counter()
+    results = await asyncio.gather(*(_stage_one(client) for client in hosts.values()))
+    wire_stage_seconds = max(
+        (float(result["wire_stage_seconds"]) for result in results),
+        default=time.perf_counter() - started,
     )
+    reconstruct_values = [
+        float(result["reconstruct_seconds"])
+        for result in results
+        if result["reconstruct_seconds"] is not None
+    ]
+    return {
+        "wire_stage_seconds": wire_stage_seconds,
+        "reconstruct_seconds": max(reconstruct_values) if reconstruct_values else None,
+        "host_count": len(hosts),
+    }
 
 
 async def stage_full_checkpoint(admin_clients: list[AsyncClient], checkpoint_url: Path | str) -> None:
@@ -567,6 +671,8 @@ async def update_weights(
     weight_dir: Path | str | None,
     lora_name: str | None = None,
     step: int = 0,
+    require_delta: bool = False,
+    prefetched: bool = False,
 ) -> None:
     """Update weights on static inference servers.
 
@@ -593,7 +699,13 @@ async def update_weights(
         # a bounded load failure.
         await _pause_engines(admin_clients, step=step)
         try:
-            await load_lora_adapter(admin_clients, lora_name, weight_dir)
+            await load_lora_adapter(
+                admin_clients,
+                lora_name,
+                weight_dir,
+                require_delta=require_delta,
+                prefetched=prefetched,
+            )
         finally:
             await _resume_engines(admin_clients)
     else:
@@ -656,7 +768,45 @@ LORA_STAGE_ATTEMPT_TIMEOUT_S = 3600.0
 LORA_STAGE_TOTAL_TIMEOUT_S = 7200.0
 
 
-async def load_lora_adapter(admin_clients: list[AsyncClient], lora_name: str, lora_path: Path | str) -> None:
+def _delta_stage_timeout_s() -> float:
+    configured = os.environ.get("PRIME_LORA_DELTA_STAGE_TIMEOUT_S")
+    if configured is not None:
+        try:
+            value = float(configured)
+        except ValueError as exc:
+            raise RuntimeError("PRIME_LORA_DELTA_STAGE_TIMEOUT_S must be a number") from exc
+    else:
+        config_path = Path(
+            os.environ.get(
+                "PRIME_RL_OPERATIONS_CONFIG",
+                "/data/glm52-rl/deployment/configs/operations.toml",
+            )
+        )
+        try:
+            with config_path.open("rb") as stream:
+                config = tomllib.load(stream)
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"operations config is missing: {config_path}") from exc
+        except (OSError, tomllib.TOMLDecodeError) as exc:
+            raise RuntimeError(f"cannot read operations config: {config_path}") from exc
+        else:
+            limits = config.get("limits")
+            if not isinstance(limits, dict) or "adapter_delta_stage_timeout_seconds" not in limits:
+                raise RuntimeError("operations config has no adapter delta stage timeout")
+            value = limits["adapter_delta_stage_timeout_seconds"]
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        raise RuntimeError("adapter delta stage timeout must be positive")
+    return float(value)
+
+
+async def load_lora_adapter(
+    admin_clients: list[AsyncClient],
+    lora_name: str,
+    lora_path: Path | str,
+    *,
+    require_delta: bool = False,
+    prefetched: bool = False,
+) -> None:
     """Make a HTTP post request to the vLLM server to load a LoRA adapter.
 
     Uses our wrapper around vLLM's /v1/load_lora_adapter. The prefix cache is not reset
@@ -687,7 +837,12 @@ async def load_lora_adapter(admin_clients: list[AsyncClient], lora_name: str, lo
             response = await asyncio.wait_for(
                 admin_client.post(
                     "/load_lora_adapter",
-                    json={"lora_name": lora_name, "lora_path": lora_path_posix},
+                    json={
+                        "lora_name": lora_name,
+                        "lora_path": lora_path_posix,
+                        "require_delta": require_delta,
+                        "prefetched": prefetched,
+                    },
                     timeout=httpx.Timeout(
                         connect=10.0,
                         read=LORA_LOAD_READ_TIMEOUT_S,

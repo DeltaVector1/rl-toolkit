@@ -1,48 +1,116 @@
 import ast
+import hashlib
+import importlib.util
+import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WORKER = ROOT / "src/prime_rl/inference/vllm/worker/filesystem.py"
-TRAINER_BROADCAST = ROOT / "src/prime_rl/trainer/rl/broadcast/filesystem.py"
-CLIENT = ROOT / "src/prime_rl/utils/client.py"
-ENDPOINT = ROOT.parent / ".agents/skills/training-ops/runtime/h200/muse_file_endpoint.py"
+REPOSITORY = ROOT.parent
+MODULE_PATH = ROOT / "src/prime_rl/utils/adapter_delta.py"
+SPEC = importlib.util.spec_from_file_location("adapter_delta", MODULE_PATH)
+assert SPEC is not None and SPEC.loader is not None
+adapter_delta = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(adapter_delta)
+
+
+def function_arguments(path: Path, name: str) -> list[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    function = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name
+    )
+    return [argument.arg for argument in function.args.args]
 
 
 class AdapterTransportStateTest(unittest.TestCase):
-    def test_worker_has_manifest_progress_and_reader_lease(self):
-        source = WORKER.read_text(encoding="utf-8")
-        self.assertIn("_ADAPTER_MANIFEST", source)
-        self.assertIn("_ADAPTER_STATUS", source)
-        self.assertIn("_ADAPTER_LANE_TIMEOUT_S", source)
-        self.assertIn("_ADAPTER_LANE_RETRIES", source)
-        self.assertIn("adapter_reader_lock", source)
-        self.assertIn("os.replace(temporary, destination)", source)
-        tree = ast.parse(source)
-        stage = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "stage_lora_adapter_files")
-        stage_source = ast.get_source_segment(source, stage)
-        assert stage_source is not None
-        self.assertNotIn("shutil.rmtree(destination, ignore_errors=True)", stage_source)
+    def test_exact_adjacent_delta_round_trip(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            base = root / "step_1"
+            target = root / "step_2"
+            base.mkdir()
+            target.mkdir()
+            original = bytes(range(251)) * 33
+            changed = bytearray(original)
+            changed[0] = 17
+            changed[4096] = 29
+            for directory, payload in ((base, original), (target, changed)):
+                (directory / "adapter_config.json").write_text("{}", encoding="utf-8")
+                (directory / "adapter_model.safetensors").write_bytes(payload)
 
-    def test_source_manifest_is_written_before_stable_marker(self):
-        source = TRAINER_BROADCAST.read_text(encoding="utf-8")
-        self.assertIn('"adapter_manifest.json"', source)
-        self.assertLess(source.index("manifest_temporary.replace"), source.index("self._notify_orchestrator"))
+            manifest = adapter_delta.publish_adapter_manifest(
+                target,
+                base,
+                target_url="http://source/step_2",
+                base_url="http://source/step_1",
+                target_step=2,
+                base_step=1,
+                chunk_size=1024,
+                max_workers=2,
+            )
 
-    def test_shared_host_staging_uses_one_request(self):
-        tree = ast.parse(CLIENT.read_text(encoding="utf-8"))
-        function = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "stage_lora_adapter")
-        source = ast.get_source_segment(CLIENT.read_text(encoding="utf-8"), function)
-        assert source is not None
-        self.assertIn("admin_clients[0]", source)
-        self.assertNotIn("asyncio.gather", source)
+            rebuilt = bytearray()
+            for chunk in manifest["chunks"]:
+                start = chunk["offset"]
+                wire = (target / chunk["file"]).read_bytes()
+                rebuilt.extend(
+                    adapter_delta.decode_delta_chunk(
+                        original[start : start + chunk["raw_size"]], wire, chunk["codec"]
+                    )
+                )
+            self.assertEqual(manifest["version"], 1)
+            self.assertEqual(manifest["mode"], "delta")
+            self.assertEqual(manifest["base_step"], 1)
+            self.assertEqual(bytes(rebuilt), bytes(changed))
+            self.assertEqual(manifest["target_sha256"], hashlib.sha256(changed).hexdigest())
 
-    def test_muse_endpoint_publishes_durable_status(self):
-        source = ENDPOINT.read_text(encoding="utf-8")
-        self.assertIn('app.get("/staging_status")', source)
-        self.assertIn("adapter_stage_status", source)
-        self.assertIn("adapter_reader_lock", source)
+    def test_bootstrap_does_not_duplicate_the_full_adapter(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "step_0"
+            target.mkdir()
+            (target / "adapter_config.json").write_text("{}", encoding="utf-8")
+            (target / "adapter_model.safetensors").write_bytes(bytes(range(251)) * 33)
+            manifest = adapter_delta.publish_adapter_manifest(target, target_step=0)
+            self.assertEqual(manifest["mode"], "full")
+            self.assertEqual(manifest["chunk_count"], 0)
+            self.assertEqual(list(target.glob("*.transport-*")), [])
+
+    def test_protocol_has_one_strict_delta_flag(self):
+        worker = ROOT / "src/prime_rl/inference/vllm/worker/filesystem.py"
+        client = ROOT / "src/prime_rl/utils/client.py"
+        server = ROOT / "src/prime_rl/inference/vllm/server.py"
+        watcher = ROOT / "src/prime_rl/orchestrator/watcher.py"
+        self.assertEqual(
+            function_arguments(worker, "stage_lora_adapter_files"),
+            ["source_url", "require_delta"],
+        )
+        self.assertEqual(
+            function_arguments(worker, "stage_lora_adapter"),
+            ["self", "source_url", "require_delta"],
+        )
+        for path in (client, server, watcher):
+            self.assertIn("require_delta", path.read_text(encoding="utf-8"))
+        worker_source = worker.read_text(encoding="utf-8")
+        self.assertIn("delta adapter transport is required", worker_source)
+        watcher_source = watcher.read_text(encoding="utf-8")
+        self.assertIn('manifest.get("version") != 1', watcher_source)
+        self.assertIn("next_step > 0", watcher_source)
+
+    def test_inventory_defines_bounded_eight_lane_transfer(self):
+        operations = REPOSITORY / "configs/operations.toml"
+        with operations.open("rb") as stream:
+            config = tomllib.load(stream)
+        ports = config["ports"]
+        self.assertEqual(ports["lora_source_last"] - ports["lora_source_first"] + 1, 8)
+        self.assertEqual(config["limits"]["adapter_delta_stage_timeout_seconds"], 300)
+        runtime = REPOSITORY / ".agents/skills/training-ops/runtime/h200"
+        for name in ("start_inference.sh", "start_muse_inference.sh"):
+            source = (runtime / name).read_text(encoding="utf-8")
+            self.assertIn('PRIME_LORA_SOURCE_PORTS="$lora_source_port_list"', source)
 
 
 if __name__ == "__main__":
