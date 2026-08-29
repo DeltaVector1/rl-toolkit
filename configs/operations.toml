@@ -69,6 +69,7 @@ deployment_bundle_workers = 2
 deployment_mkdir_timeout_seconds = 30
 deployment_scp_timeout_seconds = 300
 deployment_bundle_scp_timeout_seconds = 60
+adapter_update_engine_startup_timeout_seconds = 900
 
 [requirements.shared]
 group_size = 16

@@ -86,6 +86,17 @@ deployment_scp_timeout_seconds = limits["deployment_scp_timeout_seconds"]
 deployment_bundle_scp_timeout_seconds = limits.get(
     "deployment_bundle_scp_timeout_seconds", 60
 )
+adapter_update_engine_startup_timeout_seconds = limits[
+    "adapter_update_engine_startup_timeout_seconds"
+]
+if (
+    isinstance(adapter_update_engine_startup_timeout_seconds, bool)
+    or not isinstance(adapter_update_engine_startup_timeout_seconds, int)
+    or adapter_update_engine_startup_timeout_seconds < 600
+):
+    raise RuntimeError(
+        "limits.adapter_update_engine_startup_timeout_seconds must be an integer >= 600"
+    )
 group_size = shared_requirements["group_size"]
 max_output_length = shared_requirements["max_output_length"]
 learning_rate = shared_requirements["learning_rate"]
@@ -2794,11 +2805,109 @@ echo "stopped ${{#pids[@]}} exact adapter prefetch process(es)"
 """
 
 
-def _restart_adapter_engine_script(container: str, health_port: int) -> str:
+def _adapter_engine_state_script(
+    container: str,
+    ports: list[int],
+    run_marker: str,
+    service_marker: str,
+    output_dir: str,
+) -> str:
+    """Check exact engine identity, health, and stale adapter activity."""
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", container):
+        raise Refused(f"inference container name is invalid: {container!r}")
+    if not ports or not all(isinstance(port, int) and 1 <= port <= 65535 for port in ports):
+        raise Refused("inference health ports are invalid")
+    for value in (run_marker, service_marker, output_dir):
+        if not value or any(ch in value for ch in "'\\\n"):
+            raise Refused("adapter process identity marker is unsafe")
+    quoted = shlex.quote(container)
+    run_quoted = shlex.quote(run_marker)
+    service_quoted = shlex.quote(service_marker)
+    output_quoted = shlex.quote(output_dir)
+    port_list = " ".join(str(port) for port in ports)
+    return f"""set -euo pipefail
+container={quoted}
+run_marker={run_quoted}
+service_marker={service_quoted}
+service_dir={output_quoted}
+name=$(sudo docker inspect --format '{{{{.Name}}}}' "$container" 2>/dev/null || true)
+[ "$name" = "/$container" ] || {{ echo "configured inference container identity is not exact" >&2; exit 51; }}
+state=$(sudo docker inspect --format '{{{{.State.Running}}}}' "$container" 2>/dev/null || true)
+[ "$state" = true ] || {{ echo "configured inference container is not running" >&2; exit 52; }}
+
+proc_read() {{
+  sudo cat "$1" 2>/dev/null || cat "$1" 2>/dev/null
+}}
+
+staging_process_matches() {{
+  local pid=$1 exe command_line environment
+  case "$pid" in ''|*[!0-9]*) return 1;; esac
+  [ "$pid" -gt 1 ] || return 1
+  exe=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
+  case "${{exe##*/}}" in curl|timeout) ;; *) return 1;; esac
+  command_line=$(proc_read "/proc/$pid/cmdline" | tr '\\0' ' ') || return 2
+  [ -n "$command_line" ] || return 2
+  case "$command_line" in *"$run_marker"*) ;; *) return 1;; esac
+  case "$command_line" in *"$service_marker"*) ;; *) return 1;; esac
+  case "$command_line" in *stage_lora_adapter*) ;; *) return 1;; esac
+  environment=$(proc_read "/proc/$pid/environ" | tr '\\0' '\\n') || return 2
+  case " $environment " in *" SOURCE_RUN_DIR=$service_dir "*) ;; *) return 1;; esac
+  return 0
+}}
+
+staging_pids=()
+ambiguous=0
+for proc_dir in /proc/[0-9]*; do
+  pid=${{proc_dir##*/}}
+  if [ -e "$proc_dir/exe" ]; then
+    exe=$(readlink "$proc_dir/exe" 2>/dev/null || true)
+    case "${{exe##*/}}" in
+      curl|timeout)
+        if staging_process_matches "$pid"; then
+          staging_pids+=("$pid")
+        elif [ "$?" = 2 ]; then
+          ambiguous=1
+        fi
+        ;;
+    esac
+  fi
+done
+[ "$ambiguous" = 0 ] || {{ echo "adapter staging process identity is unreadable" >&2; exit 54; }}
+[ "${{#staging_pids[@]}}" = 0 ] || {{ echo "adapter staging remains: ${{staging_pids[*]}}" >&2; exit 55; }}
+
+healthy=1
+failed_ports=""
+for port in {port_list}; do
+  health=$(curl -sS -o /dev/null -m 30 -w '%{{http_code}}' "http://127.0.0.1:$port/health" 2>/dev/null || true)
+  if [ "$health" != 200 ]; then
+    healthy=0
+    failed_ports="$failed_ports $port:$health"
+  fi
+done
+if [ "$healthy" = 1 ]; then
+  echo "adapter engine ready: exact container $container is healthy and has no staging activity"
+  exit 0
+fi
+echo "adapter engine restart required: unhealthy ports:$failed_ports"
+exit 10
+"""
+
+
+def _restart_adapter_engine_script(
+    container: str,
+    health_port: int,
+    startup_timeout_seconds: int = adapter_update_engine_startup_timeout_seconds,
+) -> str:
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", container):
         raise Refused(f"inference container name is invalid: {container!r}")
     if not isinstance(health_port, int) or not 1 <= health_port <= 65535:
         raise Refused("inference health port is invalid")
+    if (
+        isinstance(startup_timeout_seconds, bool)
+        or not isinstance(startup_timeout_seconds, int)
+        or startup_timeout_seconds < 600
+    ):
+        raise Refused("inference startup timeout must be an integer >= 600 seconds")
     quoted = shlex.quote(container)
     return f"""set -euo pipefail
 container={quoted}
@@ -2807,7 +2916,7 @@ name=$(sudo docker inspect --format '{{{{.Name}}}}' "$container" 2>/dev/null || 
 state=$(sudo docker inspect --format '{{{{.State.Running}}}}' "$container" 2>/dev/null || true)
 [ "$state" = true ] || {{ echo "configured inference container is not running" >&2; exit 52; }}
 sudo docker restart --time 30 "$container" >/dev/null
-for _ in $(seq 1 180); do
+for _ in $(seq 1 {startup_timeout_seconds}); do
   health=$(curl -sS -o /dev/null -m 10 -w '%{{http_code}}' http://127.0.0.1:{health_port}/health 2>/dev/null || true)
   if [ "$health" = 200 ]; then
     echo "restarted exact inference container $container"
@@ -2892,19 +3001,47 @@ def _repair_adapter_update() -> str:
         if not deploy(path):
             raise RuntimeError(f"adapter repair deployment failed for {path}")
 
-    restarted = _fan(
+    engine_state = _fan(
         inference_hosts,
         lambda host: _ssh(
             host,
-            _restart_adapter_engine_script(
-                config["engine_container"], config["ports_by_host"][host][0]
+            _adapter_engine_state_script(
+                config["engine_container"],
+                config["ports_by_host"][host],
+                config["run_marker"],
+                config["service_marker"],
+                config["output_dir"],
             ),
-            timeout=240,
+            timeout=90,
         ),
     )
-    failed_restart = {host: output.strip() for host, (code, output) in restarted.items() if code}
-    if failed_restart:
-        raise RuntimeError(f"inference restart failed: {failed_restart}")
+    failed_state = {
+        host: output.strip()
+        for host, (code, output) in engine_state.items()
+        if code not in (0, 10)
+    }
+    if failed_state:
+        raise RuntimeError(f"inference identity or staging check failed: {failed_state}")
+    restart_hosts = [host for host, (code, _) in engine_state.items() if code == 10]
+    restarted = {}
+    if restart_hosts:
+        restarted = _fan(
+            restart_hosts,
+            lambda host: _ssh(
+                host,
+                _restart_adapter_engine_script(
+                    config["engine_container"],
+                    config["ports_by_host"][host][0],
+                    adapter_update_engine_startup_timeout_seconds,
+                ),
+                timeout=adapter_update_engine_startup_timeout_seconds + 120,
+            ),
+        )
+        failed_restart = {
+            host: output.strip() for host, (code, output) in restarted.items() if code
+        }
+        if failed_restart:
+            raise RuntimeError(f"inference restart failed: {failed_restart}")
 
     post_idle = _fan(
         inference_hosts,
@@ -2935,7 +3072,10 @@ def _repair_adapter_update() -> str:
         raise RuntimeError(f"orchestrator restart failed: {restart_output.strip()}")
     result = (
         f"adapter update repaired for {run}: {evidence}; stopped exact prefetch processes; "
-        "deployed transfer timeout and host staging lock; restarted inference and orchestrator only"
+        "deployed transfer timeout and host staging lock; "
+        f"{'restarted' if restart_hosts else 'kept healthy'} inference on "
+        f"{','.join(restart_hosts) if restart_hosts else 'all configured hosts'}; "
+        "restarted orchestrator only"
     )
     print(result)
     return result

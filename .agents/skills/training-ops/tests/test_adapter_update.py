@@ -43,6 +43,65 @@ class AdapterUpdateTest(unittest.TestCase):
         self.assertIn("vllm:num_requests_running", script)
         self.assertIn("!found || bad || total != 0", script)
 
+    def test_engine_state_requires_exact_identity_and_reports_restart_need(self):
+        script = training_ops._adapter_engine_state_script(
+            "glm52-decensor-h200",
+            [8000],
+            "/x85/",
+            "/run_x85/",
+            "/data/glm52-rl/runs/x85/run_x85",
+        )
+        self.assertIn('name=$(sudo docker inspect', script)
+        self.assertIn('configured inference container identity is not exact', script)
+        self.assertIn('staging_process_matches', script)
+        self.assertIn('adapter staging remains', script)
+        self.assertIn('exit 10', script)
+
+    def test_glm_restart_wait_is_configured_for_model_load(self):
+        script = training_ops._restart_adapter_engine_script(
+            "glm52-decensor-h200", 8000
+        )
+        self.assertIn("seq 1 900", script)
+        with self.assertRaisesRegex(training_ops.Refused, "integer >= 600"):
+            training_ops._restart_adapter_engine_script(
+                "glm52-decensor-h200", 8000, startup_timeout_seconds=180
+            )
+
+    def test_healthy_engine_skips_a_second_restart(self):
+        before = training_ops.Status(
+            trainer_up=True,
+            orch_up=True,
+            engines=[
+                training_ops.EngineState(
+                    host="h200a", gen_code="200", probes_ok=1, probes_total=1
+                )
+            ],
+        )
+        fan_results = iter(
+            [
+                {"h200a": (0, "idle")},
+                {"h200a": (0, "stopped 0")},
+                {"h200a": (0, "adapter engine ready")},
+                {"h200a": (0, "idle")},
+            ]
+        )
+        with mock.patch.object(training_ops, "current_run", return_value="x85"), mock.patch.object(
+            training_ops, "status", return_value=before
+        ), mock.patch.object(
+            training_ops, "_adapter_stage_evidence", return_value="Failed to apply policy update 4"
+        ), mock.patch.object(
+            training_ops, "_fan", side_effect=lambda *_args, **_kwargs: next(fan_results)
+        ), mock.patch.object(training_ops, "deploy", return_value=True) as deploy, mock.patch.object(
+            training_ops, "_ssh", return_value=(0, "")
+        ), mock.patch.object(
+            training_ops, "_restart_adapter_engine_script"
+        ) as restart_script:
+            result = training_ops._repair_adapter_update()
+
+        self.assertIn("kept healthy inference", result)
+        restart_script.assert_not_called()
+        self.assertEqual(deploy.call_count, 3)
+
     def test_prefetch_script_only_signals_exact_curl_or_timeout(self):
         script = training_ops._adapter_prefetch_stop_script(
             "/x85/", "/run_x85/", "/data/glm52-rl/runs/x85/run_x85"
