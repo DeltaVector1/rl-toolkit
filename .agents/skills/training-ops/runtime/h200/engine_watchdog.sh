@@ -30,6 +30,8 @@ START=${START:-/data/glm52-rl/deployment/.agents/skills/training-ops/runtime/h20
 ENGINE_CONTAINER=${ENGINE_CONTAINER:-glm52-decensor-h200}
 RELOAD_TRIES=${RELOAD_TRIES:-40}
 RELOAD_WAIT=${RELOAD_WAIT:-30}
+STAGING_STATUS_TIMEOUT=${STAGING_STATUS_TIMEOUT:-5}
+STAGING_GRACE=${STAGING_GRACE:-7200}
 misses=0
 last_generation_tokens=-1
 
@@ -54,6 +56,23 @@ while true; do
     [ "$misses" -gt 0 ] && log "engine recovered (was $misses miss(es))"
     misses=0
   else
+    staging_response=$(curl -sS -m "$STAGING_STATUS_TIMEOUT" \
+      "http://127.0.0.1:$PORT/staging_status" 2>/dev/null || true)
+    staging_state=$(printf '%s\n' "$staging_response" | sed -n \
+      's/.*"status"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    staging_age=$(printf '%s\n' "$staging_response" | sed -n \
+      's/.*"age_seconds"[[:space:]]*:[[:space:]]*\([0-9][0-9.]*\).*/\1/p')
+    if [ "$staging_state" = "staging" ] && [ -n "$staging_age" ] &&
+       awk -v age="$staging_age" -v grace="$STAGING_GRACE" \
+         'BEGIN {exit !(age >= 0 && age < grace)}'; then
+      log "adapter staging active (age=${staging_age}s); probe deferred"
+      misses=0
+      sleep "$INTERVAL"
+      continue
+    fi
+    if [ "$staging_state" = "staging" ] && [ -n "$staging_age" ]; then
+      log "adapter staging exceeded grace (age=${staging_age}s limit=${STAGING_GRACE}s)"
+    fi
     metrics=$(curl -s -m 5 "http://127.0.0.1:$PORT/metrics" 2>/dev/null || true)
     running=$(printf '%s\n' "$metrics" | awk '/^vllm:num_requests_running[{]/ {sum += $NF} END {print sum + 0}')
     generated=$(printf '%s\n' "$metrics" | awk '/^vllm:generation_tokens_total[{]/ {sum += $NF} END {print sum + 0}')

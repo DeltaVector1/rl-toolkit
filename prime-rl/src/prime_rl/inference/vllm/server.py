@@ -1,4 +1,6 @@
 import asyncio
+import threading
+import time
 from argparse import Namespace
 from typing import Any
 
@@ -57,6 +59,35 @@ logger = init_logger("vllm.entrypoints.openai.api_server")
 # Create our own router for custom endpoints
 router = APIRouter()
 lora_load_lock = asyncio.Lock()
+_lora_stage_lock = threading.Lock()
+_lora_stage_count = 0
+_lora_stage_started_at: float | None = None
+
+
+def _begin_lora_stage() -> None:
+    global _lora_stage_count, _lora_stage_started_at
+    with _lora_stage_lock:
+        if _lora_stage_count == 0:
+            _lora_stage_started_at = time.monotonic()
+        _lora_stage_count += 1
+
+
+def _end_lora_stage() -> None:
+    global _lora_stage_count, _lora_stage_started_at
+    with _lora_stage_lock:
+        _lora_stage_count = max(0, _lora_stage_count - 1)
+        if _lora_stage_count == 0:
+            _lora_stage_started_at = None
+
+
+def _lora_stage_status() -> dict[str, Any]:
+    with _lora_stage_lock:
+        if _lora_stage_count == 0 or _lora_stage_started_at is None:
+            return {"status": "idle", "age_seconds": 0.0}
+        return {
+            "status": "staging",
+            "age_seconds": round(max(0.0, time.monotonic() - _lora_stage_started_at), 3),
+        }
 
 
 def engine_client(request: Request) -> EngineClient:
@@ -103,18 +134,25 @@ async def load_lora_adapter(lora_request: LoadLoRAAdapterRequest, raw_request: R
     """Stage remote adapters and serialize loads so retries cannot overlap."""
     async with lora_load_lock:
         handler = models(raw_request)
-        if lora_request.lora_path.startswith(("http://", "https://")):
-            source_url = lora_request.lora_path
-            await engine_client(raw_request).collective_rpc("stage_lora_adapter", args=(source_url,))
-            lora_request.lora_path = adapter_cache_path(source_url).as_posix()
-        lora_request.load_inplace = True
-        response = await handler.load_lora_adapter(lora_request)
-        stored = handler.lora_requests.get(lora_request.lora_name)
-        if stored is not None:
-            stored.load_inplace = False
-        if isinstance(response, ErrorResponse):
-            return JSONResponse(content=response.model_dump(), status_code=response.error.code)
-        return {"status": "ok"}
+        remote_adapter = lora_request.lora_path.startswith(("http://", "https://"))
+        if remote_adapter:
+            _begin_lora_stage()
+        try:
+            if remote_adapter:
+                source_url = lora_request.lora_path
+                await engine_client(raw_request).collective_rpc("stage_lora_adapter", args=(source_url,))
+                lora_request.lora_path = adapter_cache_path(source_url).as_posix()
+            lora_request.load_inplace = True
+            response = await handler.load_lora_adapter(lora_request)
+            stored = handler.lora_requests.get(lora_request.lora_name)
+            if stored is not None:
+                stored.load_inplace = False
+            if isinstance(response, ErrorResponse):
+                return JSONResponse(content=response.model_dump(), status_code=response.error.code)
+            return {"status": "ok"}
+        finally:
+            if remote_adapter:
+                _end_lora_stage()
 
 
 @router.post("/stage_lora_adapter")
@@ -124,8 +162,17 @@ async def stage_lora_adapter(raw_request: Request):
     source_url = data.get("lora_path")
     if not isinstance(source_url, str) or not source_url.startswith(("http://", "https://")):
         return JSONResponse({"error": "lora_path must be an HTTP URL"}, status_code=400)
-    destination = await asyncio.to_thread(stage_lora_adapter_files, source_url)
-    return {"status": "ok", "path": destination.as_posix()}
+    _begin_lora_stage()
+    try:
+        destination = await asyncio.to_thread(stage_lora_adapter_files, source_url)
+        return {"status": "ok", "path": destination.as_posix()}
+    finally:
+        _end_lora_stage()
+
+
+@router.get("/staging_status")
+async def staging_status():
+    return _lora_stage_status()
 
 
 @router.post("/stage_full_checkpoint")
