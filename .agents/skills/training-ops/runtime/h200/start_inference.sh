@@ -11,6 +11,7 @@ docker rm -f glm52-decensor-trainer >/dev/null 2>&1 || true
 
 # Bound mixed FlashMLA batches below its signed-stride limit before MTP starts.
 docker run -d --name glm52-decensor-h200 --restart unless-stopped \
+  --user root \
   --log-opt max-size=512m --log-opt max-file=3 \
   --gpus all \
   --network host \
