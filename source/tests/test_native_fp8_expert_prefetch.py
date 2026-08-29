@@ -58,6 +58,46 @@ class NativeFP8ExpertPrefetchTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "incomplete"):
                 read()
 
+    def test_mtp_stability_profile_is_allowed_by_trainer_qualification_identity(self):
+        train_path = ROOT / "source/src/prime_rl/trainer/rl/train.py"
+        self.assertIn('"glm52-mtp-stability20": (20, True)', train_path.read_text())
+        tree = ast.parse(train_path.read_text())
+        names = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "_qualification_environment_names"
+                for target in node.targets
+            )
+        )
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_qualification_environment"
+        )
+        module = ast.Module(body=[names, function], type_ignores=[])
+        ast.fix_missing_locations(module)
+        namespace = {"os": os, "re": __import__("re")}
+        exec(compile(module, str(train_path), "exec"), namespace)
+        read = namespace["_qualification_environment"]
+        values = {
+            "PRIME_QUALIFICATION_SESSION_ID": "1" * 32,
+            "PRIME_QUALIFICATION_PROFILE": "glm52-mtp-stability20",
+            "PRIME_QUALIFICATION_CONFIG_SHA256": "2" * 64,
+            "PRIME_QUALIFICATION_SOURCE_SHA256": "3" * 64,
+            "PRIME_QUALIFICATION_SESSION_SHA256": "4" * 64,
+            "PRIME_QUALIFICATION_RUNTIME_SOURCE_SHA256": "5" * 64,
+            "PRIME_QUALIFICATION_LAUNCHER_SHA256": "6" * 64,
+            "PRIME_TRAINER_IMAGE_DIGEST": "sha256:" + "7" * 64,
+            "PRIME_TRAINER_HOST": "n82",
+            "PRIME_TRAINER_HEAD": "n82",
+        }
+        with patch.dict(os.environ, values, clear=True):
+            self.assertEqual(read(), values)
+
     @unittest.skipIf(torch is None, "PyTorch is unavailable")
     def test_qualification_input_digest_binds_tokens_lengths_and_order(self):
         train_path = ROOT / "source/src/prime_rl/trainer/rl/train.py"
