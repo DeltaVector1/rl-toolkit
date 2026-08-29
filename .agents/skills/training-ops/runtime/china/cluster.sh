@@ -116,12 +116,19 @@ PY
     sudo install -d -o 1000 -g 1000 -m 0755 "$trainer_output"
     if [ "$rank" -eq 0 ]; then
       if [ "$rollout_transport" = filesystem ] && [ "$fake_data" = 0 ]; then
+        trainer_sync_targets=${trainer_sync_targets:?set trainer_sync_targets}
+        read -r -a sync_targets <<<"$trainer_sync_targets"
+        if [ "${#sync_targets[@]}" -ne "$nnodes" ]; then
+          echo "trainer sync target count (${#sync_targets[@]}) differs from trainer node count ($nnodes)" >&2
+          exit 1
+        fi
         sync_nodes=()
+        sync_index=0
         for n in $trainer_nodes; do
-          n=${n#n}
           if [ "$n" != "$node" ] && [ "$n" != "$master_node" ]; then
-            sync_nodes+=("n$n")
+            sync_nodes+=("${sync_targets[$sync_index]}")
           fi
+          sync_index=$((sync_index + 1))
         done
         if ((${#sync_nodes[@]})); then
           sync_log="$storage/microbatch-sync-$RUN.log"

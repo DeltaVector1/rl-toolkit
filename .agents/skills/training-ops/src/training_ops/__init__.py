@@ -3155,10 +3155,64 @@ def _cold_run_paths(run: str) -> tuple[str, str, str]:
 def _cold_cleanup_script(run: str) -> str:
     """Build a bounded remote cleanup for one configured run only."""
     runs_path, run_parent, run_dir = _cold_run_paths(run)
+    sync_script = f"{runtime_root}/china/sync_microbatches.sh"
     return f"""set -euo pipefail
 runs_path={shlex.quote(runs_path)}
 run_parent={shlex.quote(run_parent)}
 run_dir={shlex.quote(run_dir)}
+sync_script={shlex.quote(sync_script)}
+
+# A PID file alone is not enough: the PID can be stale or reused. Require the
+# exact run_dir environment and sync command before sending a signal.
+sync_process_matches() {{
+  local pid=$1 expected_run_dir=$2 command_line
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$pid" -gt 1 ] || return 1
+  [ -r "/proc/$pid/environ" ] || return 1
+  [ -r "/proc/$pid/cmdline" ] || return 1
+  tr '\\0' '\\n' <"/proc/$pid/environ" 2>/dev/null |
+    grep -Fxq "run_dir=$expected_run_dir" || return 1
+  command_line=$(tr '\\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null) || return 1
+  case " $command_line " in
+    *" $sync_script "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}}
+
+stop_sync_processes() {{
+  local pid_file pid stale_run_dir command_line
+  for pid_file in "$runs_path"/*/run_*/.microbatch-sync.pid; do
+    [ -f "$pid_file" ] || continue
+    stale_run_dir=${{pid_file%/.microbatch-sync.pid}}
+    case "$stale_run_dir" in
+      "$runs_path"/*/run_*) ;;
+      *) continue ;;
+    esac
+    # Do not follow a symlink while deriving a process identity.
+    [ -L "$stale_run_dir" ] && continue
+    pid=$(cat "$pid_file" 2>/dev/null || true)
+    if ! sync_process_matches "$pid" "$stale_run_dir"; then
+      continue
+    fi
+    command_line=$(tr '\\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
+    echo "cold cleanup: stopping microbatch sync pid=$pid run=$stale_run_dir command=$command_line"
+    # sync_microbatches.sh is started under setsid, so its PID is also the
+    # process-group ID. The single-process fallback remains PID exact.
+    kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+    for _ in $(seq 1 50); do
+      sync_process_matches "$pid" "$stale_run_dir" || break
+      sleep 0.1
+    done
+    if sync_process_matches "$pid" "$stale_run_dir"; then
+      kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+    fi
+    if [ -f "$pid_file" ] && [ "$(cat "$pid_file" 2>/dev/null || true)" = "$pid" ]; then
+      rm -f -- "$pid_file"
+    fi
+  done
+}}
 
 # Refuse symlinked path components before removing anything.  A missing run is
 # a valid cold-start state and must not cause the parent directory to be made.
@@ -3174,6 +3228,7 @@ if [ -L "$runs_path" ] || [ -L "$run_parent" ] || [ -L "$run_dir" ]; then
   echo "cold cleanup refused: configured run path is a symlink" >&2
   exit 1
 fi
+stop_sync_processes
 if [ ! -e "$run_parent" ]; then
   echo "cold cleanup: no state at $run_parent"
   exit 0
@@ -3302,6 +3357,7 @@ def start(
         f"runs_path={shlex.quote(run_root)} "
         f"trainer_container_name={shlex.quote(trainer_container)} "
         f"master_node_id={shlex.quote(trainer_head.removeprefix('n'))} "
+        f"trainer_sync_targets={shlex.quote(trainer_addresses)} "
         f"adapter_node_id={shlex.quote(trainer_head.removeprefix('n'))} "
         f"adapter_service_port={adapter_port} "
         f"adapter_container_name={shlex.quote(adapter_container)}"
