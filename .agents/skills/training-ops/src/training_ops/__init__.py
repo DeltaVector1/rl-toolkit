@@ -2858,7 +2858,13 @@ def start(
         time.sleep(3)
         _remote_ok(
             trainer_head,
-            f"nohup setsid env RUN={run} RUN_NAME={name} INTERVAL=120 "
+            f"nohup setsid env run={shlex.quote(run)} run_name={shlex.quote(name)} "
+            f"runs_path={shlex.quote(run_root)} "
+            f"trainer_hosts={shlex.quote(' '.join(nodes))} "
+            f"local_host={shlex.quote(trainer_head)} "
+            f"trainer_container_name={shlex.quote(trainer_container)} "
+            f"orchestrator_container_name={shlex.quote(orchestrator_container)} "
+            "interval=120 "
             f"bash {runtime_root}/china/run_supervisor.sh >> /data/glm52-rl/run_supervisor.log 2>&1 </dev/null & disown",
             "run supervisor start",
         )

@@ -383,6 +383,9 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> None:
                 alpha=config.alpha,
                 dropout=config.dropout,
             )
+            for adapter_index in range(n_loras):
+                for _, parameter in lora_module.named_parameters_for_adapter(adapter_index):
+                    parameter.data = parameter.data.to(torch.bfloat16)
         # Handle NonGatedGroupedExperts (relu2 experts used by NemotronH's LatentMoE)
         elif isinstance(base_module, NonGatedGroupedExperts):
             lora_module = MultiLoRANonGatedGroupedExperts(
