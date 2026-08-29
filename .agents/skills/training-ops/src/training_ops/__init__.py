@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import datetime as _dt
 import hashlib
+import ipaddress
 import json
 import math
 import re
@@ -180,6 +181,35 @@ def _ssh(host: str, script: str, timeout: int = 120) -> tuple[int, str]:
         return p.returncode, output
     except subprocess.TimeoutExpired:
         return 124, "TIMEOUT"
+
+
+def _ssh_address(host: str) -> str:
+    """Return the IP selected by the configured SSH alias."""
+    _check_host(host)
+    try:
+        result = subprocess.run(
+            ssh_command + ["-G", host],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError(f"cannot resolve SSH alias {host}: {error}") from error
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip()
+        raise RuntimeError(f"cannot resolve SSH alias {host}: {detail}")
+    match = re.search(r"^hostname\s+(\S+)\s*$", result.stdout, re.MULTILINE)
+    if match is None:
+        raise RuntimeError(f"SSH alias {host} has no hostname")
+    address = match.group(1)
+    try:
+        ipaddress.ip_address(address)
+    except ValueError as error:
+        raise RuntimeError(
+            f"SSH alias {host} resolves to {address!r}, not an IP address"
+        ) from error
+    return address
 
 
 def _remote_ok(host: str, script: str, label: str, timeout: int = 120) -> str:
@@ -2720,9 +2750,7 @@ def start(
     if missing_trainer_config:
         raise Refused(f"missing trainer config {trainer_config} on {missing_trainer_config}")
     trainer_nodes = " ".join(n.lstrip("n") for n in nodes)
-    trainer_addresses = " ".join(
-        f"10.92.20.{n.removeprefix('n')}" for n in nodes
-    )
+    trainer_addresses = " ".join(_ssh_address(node) for node in nodes)
     runtime_env = (
         f"deployment_root={shlex.quote(remote_repo)} "
         f"storage_root={shlex.quote(storage_root)} "
