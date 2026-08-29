@@ -63,6 +63,10 @@ reference_spread = 0.039
 [limits]
 stall_seconds = 600
 final_steps = 50
+deployment_file_workers = 4
+deployment_host_workers = 4
+deployment_mkdir_timeout_seconds = 30
+deployment_scp_timeout_seconds = 300
 
 [requirements.shared]
 group_size = 16

@@ -16,7 +16,7 @@ import sys
 import tempfile
 import time
 import tomllib
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
@@ -77,6 +77,10 @@ minimum_trend_steps = reward_settings["minimum_steps"]
 trend_spread_multiplier = reward_settings["spread_multiplier"]
 stall_seconds = limits["stall_seconds"]
 final_validation_steps = limits["final_steps"]
+deployment_file_workers = limits["deployment_file_workers"]
+deployment_host_workers = limits["deployment_host_workers"]
+deployment_mkdir_timeout_seconds = limits["deployment_mkdir_timeout_seconds"]
+deployment_scp_timeout_seconds = limits["deployment_scp_timeout_seconds"]
 group_size = shared_requirements["group_size"]
 max_output_length = shared_requirements["max_output_length"]
 learning_rate = shared_requirements["learning_rate"]
@@ -149,8 +153,13 @@ ssh_command = [
     "-o",
     "ConnectTimeout=25",
     "-o",
+    "ServerAliveInterval=15",
+    "-o",
+    "ServerAliveCountMax=4",
+    "-o",
     "StrictHostKeyChecking=accept-new",
 ]
+scp_command = ["scp", "-q", *ssh_command[1:]]
 
 
 class Refused(RuntimeError):
@@ -2545,23 +2554,43 @@ def deploy(
     remote_mode = "0755" if local.stat().st_mode & 0o111 else "0644"
 
     def one(h):
-        subprocess.run(
-            ssh_command + [h, f"mkdir -p {str(Path(remote).parent)}"], capture_output=True
-        )
-        p = subprocess.run(
-            ["scp", "-q", "-o", "BatchMode=yes", str(local), f"{h}:{remote}"],
-            capture_output=True,
-            text=True,
-        )
+        try:
+            mkdir = subprocess.run(
+                ssh_command
+                + [
+                    h,
+                    f"mkdir -p {shlex.quote(str(Path(remote).parent))}",
+                ],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=deployment_mkdir_timeout_seconds,
+            )
+        except subprocess.TimeoutExpired:
+            return "mkdir TIMEOUT"
+        if mkdir.returncode:
+            detail = ((mkdir.stdout or "") + (mkdir.stderr or "")).strip()
+            return f"mkdir failed: {detail[:80]}"
+        try:
+            p = subprocess.run(
+                scp_command + [str(local), f"{h}:{remote}"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=deployment_scp_timeout_seconds,
+            )
+        except subprocess.TimeoutExpired:
+            return "scp TIMEOUT"
         if p.returncode:
-            return "scp failed"
+            detail = ((p.stdout or "") + (p.stderr or "")).strip()
+            return f"scp failed: {detail[:80]}"
         rc, out = _ssh(h, f"chmod {remote_mode} {shlex.quote(remote)}")
         if rc:
             return f"chmod failed: {out.strip()[:80]}"
         rc, got = _ssh(h, f"md5sum {remote} | cut -d' ' -f1")
         return "ok" if got.strip() == want else f"MISMATCH {got.strip()[:8]}"
 
-    res = _fan(nodes, one)
+    res = _fan(nodes, one, workers=deployment_host_workers)
     bad = [h for h, v in res.items() if v != "ok"]
     print(
         f"{path} -> {len(nodes) - len(bad)}/{len(nodes)} nodes"
@@ -2577,6 +2606,40 @@ def deploy(
                 "This runs on the host. Restart the process only if it is a long-running loop."
             )
     return not bad
+
+
+def _deploy_dependencies(required_files: list[tuple[str, list[str]]]) -> None:
+    """Deploy distinct dependency files with bounded, visible progress."""
+    total = len(required_files)
+    if not total:
+        print("trainer dependency deployment: no files")
+        return
+    workers = min(deployment_file_workers, total)
+    print(
+        f"deploying {total} trainer dependency files with "
+        f"{workers} parallel workers"
+    )
+    completed = 0
+    failures = []
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(deploy, path, nodes=destinations): path
+            for path, destinations in required_files
+        }
+        for future in as_completed(futures):
+            path = futures[future]
+            try:
+                ok = future.result()
+            except Exception as error:
+                ok = False
+                failures.append(f"{path}: {error}")
+            if not ok and not any(item.startswith(f"{path}:") for item in failures):
+                failures.append(f"{path}: deploy returned failure")
+            completed += 1
+            status = "ok" if ok else "FAILED"
+            print(f"dependency deployment {completed}/{total}: {path} [{status}]")
+    if failures:
+        raise RuntimeError("failed to deploy dependencies: " + "; ".join(failures))
 
 
 def _trainer_dependency_inventory(
@@ -2990,9 +3053,7 @@ def qualify(
 
     repository_root = _repository_root()
     required_files = _trainer_dependency_inventory(relative_config, nodes)
-    for path, destinations in required_files:
-        if not deploy(path, nodes=destinations):
-            raise RuntimeError(f"failed to deploy {path}")
+    _deploy_dependencies(required_files)
 
     trainer_nodes = " ".join(host.removeprefix("n") for host in nodes)
     runtime_env = (
