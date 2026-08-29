@@ -225,6 +225,7 @@ deploy_files = [
   "scripts/glm52_h200_mtp_preflight.py",
   "scripts/h200/benchmark_glm52_mtp.py",
   "scripts/h200/flashmla_overlay_preflight.py",
+  "scripts/h200/start_inference.sh",
   "scripts/h200/start_mtp_qualification.sh",
   "patches/vllm/0001-v026-flashmla-sparse-scratch-limit.patch",
   "patches/vllm/0002-v026-flashmla-sparse-mixed-batch-chunks.patch",

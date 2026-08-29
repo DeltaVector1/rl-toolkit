@@ -7,6 +7,26 @@ import training_ops
 
 
 class InferenceQualificationTest(unittest.TestCase):
+    def test_overlay_inspected_launchers_are_deployed_to_h200a(self):
+        spec = training_ops._inference_qualification_spec("glm52-mtp-h200")
+        overlay_preflight = (
+            training_ops.repo_root / "scripts/h200/flashmla_overlay_preflight.py"
+        )
+        inspected_launchers = set(
+            re.findall(
+                r'deployment / "(scripts/h200/[A-Za-z0-9_.-]+\.sh)"',
+                overlay_preflight.read_text(),
+            )
+        )
+
+        self.assertTrue(inspected_launchers)
+        self.assertTrue(
+            inspected_launchers <= set(spec["deploy_files"]),
+            inspected_launchers - set(spec["deploy_files"]),
+        )
+        self.assertEqual(spec["host"], "h200a")
+        self.assertEqual(spec["host"], training_ops.inference_hosts[0])
+
     def test_all_preflight_local_imports_are_deployed(self):
         spec = training_ops._inference_qualification_spec("glm52-mtp-h200")
         preflight = training_ops.repo_root / "scripts/glm52_h200_mtp_preflight.py"
