@@ -115,10 +115,20 @@ PY
     sudo install -d -o 1000 -g 1000 -m 0755 "$trainer_output"
     if [ "$rank" -eq 0 ]; then
       if [ "$rollout_transport" = filesystem ] && [ "$fake_data" = 0 ]; then
-        sync_log="$storage/microbatch-sync-$RUN.log"
-        nohup setsid env RUN_DIR="$trainer_output" \
-          "$deployment/.agents/skills/training-ops/runtime/china/sync_microbatches.sh" \
-          >>"$sync_log" 2>&1 </dev/null &
+        sync_nodes=()
+        for n in $trainer_nodes; do
+          n=${n#n}
+          if [ "$n" != "$node" ] && [ "$n" != "$master_node" ]; then
+            sync_nodes+=("n$n")
+          fi
+        done
+        if ((${#sync_nodes[@]})); then
+          sync_log="$storage/microbatch-sync-$RUN.log"
+          nohup setsid env \
+            run_dir="$trainer_output" nodes="${sync_nodes[*]}" \
+            "$deployment/.agents/skills/training-ops/runtime/china/sync_microbatches.sh" \
+            >>"$sync_log" 2>&1 </dev/null &
+        fi
       fi
     fi
     # The default fq_codel qdisc costs about a quarter of the all-to-all
