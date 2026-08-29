@@ -1,14 +1,18 @@
 from __future__ import annotations
 
-import json
 import random
 from collections import Counter
-from pathlib import Path
 from typing import Any
 
 from datasets import load_dataset
 
 from decensor_v1.text import WORD_REQUIREMENTS
+
+
+DECENSOR_DATASET = "NewEden/RL-seed-Decensor"
+MARKDOWN_SYSTEM_PROMPTS_DATASET = "Delta-Vector/Tauri-RL-Markdown-System-V2"
+PLAINTEXT_SYSTEM_PROMPTS_DATASET = "Delta-Vector/Tauri-RL-Plaintext-System-V2"
+STYLE_PROMPTS_DATASET = "Delta-Vector/Tauri-RL-Styles"
 
 
 def convert_sharegpt_messages(convo: list[dict]) -> list[dict[str, str]]:
@@ -125,76 +129,29 @@ def assign_style_flags(count: int, style_probability: float, seed: int) -> list[
     return styles
 
 
+def _load_text_column(dataset_name: str, column: str) -> list[str]:
+    dataset = load_dataset(dataset_name, split="train")
+    if column not in dataset.column_names:
+        raise ValueError(f"{dataset_name} has no '{column}' column")
+    values = [str(value).strip() for value in dataset[column] if str(value).strip()]
+    if not values:
+        raise ValueError(f"{dataset_name} has no usable '{column}' values")
+    return values
+
+
 def load_system_prompts() -> dict[str, list[str]]:
-    data_root = Path(__file__).resolve().parents[2] / "data"
-    styles_path = data_root / "decensor_styles" / "system_prompts.txt"
-    plaintext_path = (
-        data_root / "decensor_plaintext_system_prompts" / "system_prompts.jsonl"
-    )
-    markdown_path = (
-        data_root / "decensor_markdown_system_prompts" / "system_prompts.jsonl"
-    )
-    paths = (styles_path, plaintext_path, markdown_path)
-    missing = [path.as_posix() for path in paths if not path.is_file()]
-    if missing:
-        raise FileNotFoundError(f"missing system prompt files: {', '.join(missing)}")
-
-    out: dict[str, list[str]] = {}
-    with open(styles_path, "r", encoding="utf-8") as f:
-        out["style"] = [line.strip() for line in f if line.strip()]
-
-    pt_prompts: list[str] = []
-    with open(plaintext_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            p = str(json.loads(line).get("prompt", "")).strip()
-            if p:
-                pt_prompts.append(p)
-    out["plaintext"] = pt_prompts
-
-    markdown_prompts: list[str] = []
-    with open(markdown_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            p = str(json.loads(line).get("prompt", "")).strip()
-            if p:
-                markdown_prompts.append(p)
-    out["markdown"] = markdown_prompts
-
-    for k, v in out.items():
-        if not v:
-            raise ValueError(f"Prompt group '{k}' has no prompts loaded")
-    return out
+    return {
+        "markdown": _load_text_column(MARKDOWN_SYSTEM_PROMPTS_DATASET, "prompt"),
+        "plaintext": _load_text_column(PLAINTEXT_SYSTEM_PROMPTS_DATASET, "prompt"),
+        "style": _load_text_column(STYLE_PROMPTS_DATASET, "text"),
+    }
 
 
-def iter_decensor_rows(ds_name: str):
-    path = ds_name
-    if not path.endswith(".jsonl"):
-        path = f"{path.rstrip('/')}/rl.jsonl"
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line_no, line in enumerate(f, start=1):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    yield json.loads(line)
-                except json.JSONDecodeError as e:
-                    raise ValueError(
-                        f"Invalid decensor JSONL at {path}:{line_no}: {e}"
-                    ) from e
-        return
-    except FileNotFoundError:
-        pass
-    yield from load_dataset(ds_name, split="train", streaming=True)
+def iter_decensor_rows():
+    yield from load_dataset(DECENSOR_DATASET, split="train", streaming=True)
 
 
 def build_decensor_pool(
-    ds_name: str,
     target: int,
     decay: float,
     max_turns: int,
@@ -204,7 +161,7 @@ def build_decensor_pool(
         return []
     all_rows: list[dict[str, Any]] = []
     rows_by_asst_turns: dict[int, dict[str, list[int]]] = {}
-    for row in iter_decensor_rows(ds_name):
+    for row in iter_decensor_rows():
         conv = row.get("conversations") or []
         n_asst = sum(
             1
@@ -259,7 +216,6 @@ def build_decensor_pool(
 
 
 def build_rows(
-    ds_name: str,
     num_examples: int,
     seed: int,
     turn_decay_ratio: float,
@@ -270,9 +226,7 @@ def build_rows(
     output_prompt: str | None,
 ) -> list[dict[str, Any]]:
     system_prompts = load_system_prompts()
-    pool = build_decensor_pool(
-        ds_name, num_examples, turn_decay_ratio, max_turns, seed + 2
-    )
+    pool = build_decensor_pool(num_examples, turn_decay_ratio, max_turns, seed + 2)
     response_formats = assign_response_formats(
         len(pool),
         markdown_probability,

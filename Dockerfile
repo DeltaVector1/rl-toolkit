@@ -16,12 +16,6 @@ COPY --chmod=644 source/src/prime_rl/trainer/models/glm_moe_dsa/sparse_mla_atten
 COPY --chmod=644 source/src/prime_rl/trainer/models/layers/checkpointing.py /app/src/prime_rl/trainer/models/layers/checkpointing.py
 COPY --chmod=644 source/src/prime_rl/trainer/models/layers/lora/multi_linear.py /app/src/prime_rl/trainer/models/layers/lora/multi_linear.py
 COPY --chmod=644 source/src/prime_rl/trainer/models/layers/moe.py /app/src/prime_rl/trainer/models/layers/moe.py
-COPY --chmod=644 patches/prime-rl/runtime-deepep-score.patch /tmp/deepep-fused-score.patch
-RUN cd /app && if git apply --check --include=src/prime_rl/trainer/distributed/deepep.py /tmp/deepep-fused-score.patch; then \
-        git apply --include=src/prime_rl/trainer/distributed/deepep.py /tmp/deepep-fused-score.patch; \
-    else \
-        git apply --reverse --check --include=src/prime_rl/trainer/distributed/deepep.py /tmp/deepep-fused-score.patch; \
-    fi
 RUN sed -i \
     -e 's/nn.Parameter(self.to_sharded_dtensor(sharded_param))/nn.Parameter(self.to_sharded_dtensor(sharded_param), requires_grad=param.requires_grad)/' \
     -e 's/self.to_sharded_post_forward_dtensor(sharded_post_forward_tensor)$/self.to_sharded_post_forward_dtensor(sharded_post_forward_tensor), requires_grad=self.sharded_param.requires_grad/' \

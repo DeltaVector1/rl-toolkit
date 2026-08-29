@@ -58,7 +58,6 @@ class DecensorTaskConfig(vf.TaskConfig):
 
 
 class DecensorTasksetConfig(vf.TasksetConfig):
-    dataset_name: str = "NewEden/RL-seed-Decensor"
     num_examples: int = 2000
     dataset_seed: int = 42
     turn_decay_ratio: float = 0.5
@@ -383,7 +382,6 @@ class DecensorTaskset(vf.Taskset[DecensorTask, DecensorTasksetConfig]):
     def load(self) -> list[DecensorTask]:
         config = self.config
         rows = build_rows(
-            ds_name=config.dataset_name,
             num_examples=config.num_examples,
             seed=config.dataset_seed,
             turn_decay_ratio=config.turn_decay_ratio,

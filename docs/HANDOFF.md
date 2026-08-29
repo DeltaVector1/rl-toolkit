@@ -65,6 +65,16 @@ match.
 
 ## GLM-5.2 paused work
 
+### Qualification inventory defect
+
+The isolated GLM qualification launcher uses
+`/data/glm52-rl/deployment-glm52-optims`. This path is not in
+`configs/operations.toml`; `training_ops.deploy()` therefore updates
+`/data/glm52-rl/deployment` instead. Do not run or repair this qualification
+from the alternate repository until the path is added to the operations
+inventory. Verify the checksums of every launcher-mounted source file on all
+trainer hosts before each use.
+
 The last GLM run trained only attention projections. Future work must train the
 routed expert control, up, and down weights while the router stays frozen.
 
@@ -83,13 +93,6 @@ Their FSDP recomputation produced nonfinite sparse-query activations.
 
 Native MTP is disabled. A one-token trial made FlashMLA receive a stride above
 the signed 32-bit limit at 32K context and stopped every worker.
-
-Research and proposed GLM work are in:
-
-- `docs/research/glm52-performance-staging-plan.md`
-- `docs/research/glm52-routed-lora-backward-state.md`
-- `docs/research/glm52-external-design-review.md`
-- `docs/design/pipeline-parallel.md`
 
 ## Faults that must not return
 

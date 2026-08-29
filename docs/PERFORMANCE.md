@@ -23,6 +23,28 @@ trainer compute and 16.8 minutes waiting for rollouts. Trainer throughput was
 
 The MFU is 3.2 percent. The step time has much space to decrease.
 
+# 2026-08-27 BATCH-2048 NSIGHT BOUNDED RUN
+
+The trainer used PP8, CP8, node-local EP8, native FP8 base weights, BF16
+optimization, rank-32 full LoRA, and a frozen router. Fake trainer-only data
+provided batch 64 at sequence length 32,768. The launcher traced CUDA and NVTX
+on global rank 24 on n78. CPU sampling and backtraces were off.
+
+Forward and backward started at 03:20:29 UTC. It did not finish before the
+five-minute limit. The last check at 03:25:45 UTC was 316 seconds after the
+start. Sampled GPU utilization during the step was 90 to 100 percent. The run
+did not complete a step, so it does not provide a valid step-time comparison.
+
+There was no OOM, nonfinite value, TileLang `rhs is null` error, NCCL error, or
+optimizer update. The operator stopped the isolated trainer containers on all
+eight hosts. All 64 GPUs then reported 0 percent utilization and no compute
+process.
+
+Nsight did not create an `.nsys-rep` because the bounded stop occurred before
+the training code called `cudaProfilerStop()`. Kernel, CUDA API, and NVTX
+summaries are therefore unavailable. The per-host logs are preserved as
+`nsys-bounded-20260827-docker.log` in the qualification output directory.
+
 # X26 EDGE FILESYSTEM TEST
 
 Test x26 ran on 2026-08-07. The orchestrator ran on h200a and sent completed
@@ -121,7 +143,7 @@ to 13-16/min. x25 uses 48 ports, 18001-18048.
 Uncompressed bulk transfer measured less than 130 KB/s. Compressed transfer
 measured 4.9 MB/s. Therefore a batch can cross the link, but it must use a
 resumable, integrity-checked bulk transport. Individual rollout responses and
-WAN ZMQ do not provide that guarantee. See `docs/design/rollout-transport.md`.
+WAN ZMQ do not provide that guarantee.
 
 # THE TUNNEL CONCURRENCY CEILING
 
@@ -263,11 +285,10 @@ without any kernel module, but it needs a port. Measured from an engine host:
 UDP and arbitrary TCP to the jump host both time out. Only SSH on port 31331
 crosses. Ask the provider to open one UDP port if this route is wanted.
 
-`scripts/setup/tune_wan.sh` applies what is possible today: BBR on n82 for
-the two engine routes only, and on both ends `tcp_slow_start_after_idle=0`,
-`tcp_mtu_probing=1`, and a 32 MB buffer ceiling. Do not set BBR globally on
-n82. It is a trainer node and NCCL crosses the same interface, where cubic
-measured 87 percent against BBR's 36 percent.
+The tested host settings were BBR on n82 for the two engine routes only, plus
+`tcp_slow_start_after_idle=0`, `tcp_mtu_probing=1`, and a 32 MB buffer ceiling.
+Do not set BBR globally on n82. It is a trainer node and NCCL crosses the same
+interface, where cubic measured 87 percent against BBR's 36 percent.
 
 # THE MEMORY MEASUREMENTS
 
@@ -281,7 +302,7 @@ note was wrong and is retracted. The kernel trace showed `shmem_fault`,
 `shmem_alloc_folio`, `__alloc_pages`, and `out_of_memory`.
 
 The pipeline stage balance moved the peak GPU memory from 24.6 GB to 21.9 GB
-for each GPU. See `docs/design/pipeline-parallel.md`.
+for each GPU.
 
 # THE PRECISION MEASUREMENTS
 
@@ -343,7 +364,6 @@ The measured 103 to 108 seconds sat between skew 1 and skew 2, so live routing
 carried about a 1.5 times imbalance. `enable_router_replay` is on, so the
 trainer replays the routing of the inference engine and cannot flatten this.
 
-Reproduce with `scripts/china/a2a_bench.py`. An earlier version of that
-benchmark used idle GPUs and uniform splits. It reported a 1.89 times benefit
-from extra NCCL channels where 1.06 times was delivered. Any transport
-benchmark must model both contention and skew.
+An earlier benchmark used idle GPUs and uniform splits. It reported a 1.89
+times benefit from extra NCCL channels where 1.06 times was delivered. Any
+transport benchmark must model both contention and skew.

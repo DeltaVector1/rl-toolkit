@@ -53,7 +53,6 @@ name = "decensor"
 ratio = 1.0
 pool = { type = "static", num_workers = 16 }
 env.taskset.id = "decensor-v1"
-env.taskset.dataset_name = "/data/glm52-rl/decensor-data/rl.jsonl"
 env.taskset.num_examples = 2000
 env.agent.harness = { id = "null", runtime = { type = "subprocess" } }
 env.agent.max_output_tokens = 16384
