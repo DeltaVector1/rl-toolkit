@@ -62,6 +62,19 @@ lora_load_lock = asyncio.Lock()
 _lora_stage_lock = threading.Lock()
 _lora_stage_count = 0
 _lora_stage_started_at: float | None = None
+_engine_state_lock = threading.Lock()
+_engine_state = "running"
+
+
+def _set_engine_state(state: str) -> None:
+    global _engine_state
+    with _engine_state_lock:
+        _engine_state = state
+
+
+def _get_engine_state() -> str:
+    with _engine_state_lock:
+        return _engine_state
 
 
 def _begin_lora_stage() -> None:
@@ -112,13 +125,30 @@ async def pause(request: Request):
         return JSONResponse({"error": f"unsupported pause mode: {mode}"}, status_code=400)
     clear_cache = request.query_params.get("clear_cache", "true").lower() == "true"
     logger.debug(f"Received /pause request (mode={mode}, clear_cache={clear_cache})")
-    await engine_client(request).pause_generation(mode=mode, clear_cache=clear_cache)
+    _set_engine_state("pausing")
+    try:
+        await engine_client(request).pause_generation(mode=mode, clear_cache=clear_cache)
+    except BaseException:
+        _set_engine_state("unknown")
+        raise
+    _set_engine_state("paused")
     return {"status": "paused"}
+
+
+@router.get("/resume_status")
+async def resume_status():
+    return {"state": _get_engine_state()}
 
 
 @router.post("/resume")
 async def resume(request: Request):
-    await engine_client(request).resume_generation()
+    _set_engine_state("resuming")
+    try:
+        await engine_client(request).resume_generation()
+    except BaseException:
+        _set_engine_state("unknown")
+        raise
+    _set_engine_state("running")
     return {"status": "resumed"}
 
 

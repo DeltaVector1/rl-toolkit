@@ -371,6 +371,13 @@ ADMIN_TIMEOUT_S = 300.0
 # can take longer than the other admin ops.
 UPDATE_WEIGHTS_TIMEOUT_S = 720.0
 FULL_CHECKPOINT_STAGE_TIMEOUT_S = 7200.0
+# A TP8 LoRA load can leave the engine busy after the load request has completed.
+# Keep resume separate from the shorter pause and update budgets.
+RESUME_ATTEMPT_TIMEOUT_S = 900.0
+RESUME_TOTAL_TIMEOUT_S = 1800.0
+RESUME_CONFIRM_TIMEOUT_S = 120.0
+RESUME_PROBE_TIMEOUT_S = 10.0
+RESUME_PROBE_INTERVAL_S = 2.0
 
 
 async def _admin_post(
@@ -420,11 +427,91 @@ async def _pause_engines(admin_clients: list[AsyncClient], *, step: int) -> None
 async def _resume_engines(admin_clients: list[AsyncClient]) -> None:
     """Resume all inference engines after weight update.
 
-    Resuming is idempotent (it just clears the paused flag), so retrying transient
-    failures is safe; a dropped /resume would leave engines paused indefinitely.
+    Resuming is idempotent. A timeout does not prove that the request failed:
+    the engine can finish the request after the HTTP response deadline. Confirm
+    the server state before reporting a failed policy update.
     """
     logger = get_logger()
-    await asyncio.gather(*[_admin_post(client, "/resume") for client in admin_clients])
+
+    async def _read_resume_state(client: AsyncClient) -> tuple[str | None, bool, bool]:
+        """Return state, route availability, and explicit route absence."""
+        try:
+            response = await client.get(
+                "/resume_status",
+                timeout=httpx.Timeout(
+                    connect=10.0,
+                    read=RESUME_PROBE_TIMEOUT_S,
+                    write=10.0,
+                    pool=10.0,
+                ),
+            )
+        except (TimeoutError, httpx.TimeoutException, httpx.TransportError):
+            return None, False, False
+        if response.status_code == 404:
+            return None, False, True
+        response.raise_for_status()
+        state = response.json().get("state")
+        if state not in {"pausing", "paused", "resuming", "running", "unknown"}:
+            raise RuntimeError(f"invalid resume state from {client.base_url}: {state!r}")
+        return state, True, False
+
+    async def _is_live(client: AsyncClient) -> bool:
+        try:
+            response = await client.get(
+                "/liveness",
+                timeout=httpx.Timeout(
+                    connect=10.0,
+                    read=RESUME_PROBE_TIMEOUT_S,
+                    write=10.0,
+                    pool=10.0,
+                ),
+            )
+        except (TimeoutError, httpx.TimeoutException, httpx.TransportError):
+            return False
+        return response.status_code == 200
+
+    async def _confirm_resume(client: AsyncClient) -> tuple[bool, bool]:
+        deadline = asyncio.get_running_loop().time() + RESUME_CONFIRM_TIMEOUT_S
+        state_endpoint_available = False
+        while True:
+            state, route_available, route_missing = await _read_resume_state(client)
+            if route_available:
+                state_endpoint_available = True
+                if state == "running" and await _is_live(client):
+                    return True, True
+            elif route_missing and await _is_live(client):
+                # Older servers have no state route. Liveness is weaker evidence,
+                # so the log must identify that this path was used.
+                return True, False
+
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return False, state_endpoint_available
+            await asyncio.sleep(min(RESUME_PROBE_INTERVAL_S, remaining))
+
+    async def _resume_one(client: AsyncClient) -> None:
+        try:
+            await _admin_post(
+                client,
+                "/resume",
+                timeout_s=RESUME_ATTEMPT_TIMEOUT_S,
+                total_timeout_s=RESUME_TOTAL_TIMEOUT_S,
+            )
+        except (TimeoutError, httpx.TimeoutException, httpx.TransportError) as exc:
+            confirmed, state_endpoint_available = await _confirm_resume(client)
+            if confirmed:
+                evidence = "resume state and liveness" if state_endpoint_available else "liveness only"
+                logger.warning(
+                    f"Resume response from {client.base_url} timed out, but {evidence} "
+                    "confirmed the engine is running; accepting the resume"
+                )
+                return
+            raise RuntimeError(
+                f"Resume timed out on {client.base_url} and was not confirmed by "
+                "resume state and liveness probes"
+            ) from exc
+
+    await asyncio.gather(*[_resume_one(client) for client in admin_clients])
     logger.debug("All inference engines resumed")
 
 
