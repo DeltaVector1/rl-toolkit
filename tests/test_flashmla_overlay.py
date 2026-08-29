@@ -1,5 +1,7 @@
 import hashlib
 import json
+import os
+import stat
 import sys
 import tempfile
 import unittest
@@ -110,6 +112,27 @@ class FlashMLAOverlayTests(unittest.TestCase):
         with mock.patch.object(overlay, "image_id", return_value=overlay.EXPECTED_IMAGE_ID):
             with self.assertRaises(overlay.OverlayError):
                 overlay.verify_manifest(self.deployment, self.overlay, "base")
+
+    def test_restrictive_umask_makes_staging_traversable_without_write_access(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            staging = Path(temporary) / "staging"
+            old_umask = os.umask(0o077)
+            try:
+                staging.mkdir()
+                source = staging / "vllm/model_executor/layers/example.py"
+                source.parent.mkdir(parents=True)
+                source.write_text("pass\n")
+            finally:
+                os.umask(old_umask)
+
+            overlay._make_read_only_validation_tree(staging)
+
+            for path in (staging, source.parent, source):
+                mode = stat.S_IMODE(path.stat().st_mode)
+                expected = 0o755 if path.is_dir() else 0o644
+                self.assertEqual(mode, expected)
+            self.assertTrue(staging.stat().st_mode & stat.S_IXOTH)
+            self.assertFalse(source.stat().st_mode & stat.S_IWOTH)
 
     def _prepare_run(self, command, *, cwd=None, env=None):
         if command[0] != "docker":

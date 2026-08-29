@@ -103,6 +103,15 @@ def _manifest_path(overlay: Path) -> Path:
     return overlay / "manifest.json"
 
 
+def _make_read_only_validation_tree(root: Path) -> None:
+    """Allow an unprivileged validation container to traverse the overlay."""
+    for path in (root, *root.rglob("*")):
+        if path.is_dir():
+            path.chmod(0o755)
+        elif path.is_file():
+            path.chmod(0o644)
+
+
 def verify_manifest(deployment: Path, overlay: Path, image: str) -> dict[str, object]:
     _check_root(deployment, overlay)
     manifest_path = _manifest_path(overlay)
@@ -225,6 +234,7 @@ def prepare(deployment: Path, overlay: Path, image: str) -> dict[str, object]:
             _run(["git", "apply", "--unsafe-paths", str(deployment / relative)], cwd=staging)
         for relative in FILES.values():
             _run([sys.executable, "-m", "py_compile", str(staging / relative)])
+        _make_read_only_validation_tree(staging)
         test_path = deployment / TEST_FILE
         _run(
             [
@@ -276,6 +286,7 @@ def prepare(deployment: Path, overlay: Path, image: str) -> dict[str, object]:
             json.dump(manifest, stream, indent=2, sort_keys=True)
             stream.write("\n")
             temporary = Path(stream.name)
+        temporary.chmod(0o644)
         os.replace(temporary, _manifest_path(staging))
         verify_manifest(deployment, staging, image)
 
