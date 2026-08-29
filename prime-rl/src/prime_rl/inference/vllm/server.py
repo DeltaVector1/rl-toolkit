@@ -20,6 +20,8 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 from prime_rl.configs.inference import InferenceConfig
 from prime_rl.inference.vllm.worker.filesystem import (
     adapter_cache_path,
+    adapter_reader_lock,
+    adapter_stage_status,
     stage_full_checkpoint_files,
     stage_lora_adapter_files,
 )
@@ -173,7 +175,11 @@ async def load_lora_adapter(lora_request: LoadLoRAAdapterRequest, raw_request: R
                 await engine_client(raw_request).collective_rpc("stage_lora_adapter", args=(source_url,))
                 lora_request.lora_path = adapter_cache_path(source_url).as_posix()
             lora_request.load_inplace = True
-            response = await handler.load_lora_adapter(lora_request)
+            if remote_adapter:
+                with adapter_reader_lock(adapter_cache_path(source_url)):
+                    response = await handler.load_lora_adapter(lora_request)
+            else:
+                response = await handler.load_lora_adapter(lora_request)
             stored = handler.lora_requests.get(lora_request.lora_name)
             if stored is not None:
                 stored.load_inplace = False
@@ -202,7 +208,11 @@ async def stage_lora_adapter(raw_request: Request):
 
 @router.get("/staging_status")
 async def staging_status():
-    return _lora_stage_status()
+    state = _lora_stage_status()
+    transfer = adapter_stage_status()
+    if transfer.get("status") in {"staging", "failed"}:
+        state.update(transfer)
+    return state
 
 
 @router.post("/stage_full_checkpoint")

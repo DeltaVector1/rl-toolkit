@@ -1,3 +1,4 @@
+import json
 import shutil
 import time
 from pathlib import Path
@@ -105,7 +106,30 @@ class FileSystemWeightBroadcast(WeightBroadcast):
                         )
                         adapter_path = save_dir / "adapter_model.safetensors"
                         digest_path = save_dir / "adapter_model.safetensors.sha256"
-                        digest_path.write_text(f"{sha256_file(adapter_path)}\n")
+                        adapter_digest = sha256_file(adapter_path)
+                        digest_path.write_text(f"{adapter_digest}\n")
+                        # Publish sizes and digests before STABLE so remote
+                        # staging can validate every byte and resume safely.
+                        manifest = {
+                            "version": 1,
+                            "files": [
+                                {
+                                    "name": filename,
+                                    "size": (save_dir / filename).stat().st_size,
+                                    "sha256": (
+                                        adapter_digest
+                                        if filename == "adapter_model.safetensors"
+                                        else sha256_file(save_dir / filename)
+                                    ),
+                                }
+                                for filename in ("adapter_config.json", "adapter_model.safetensors")
+                            ],
+                        }
+                        manifest_temporary = save_dir / "adapter_manifest.json.partial"
+                        manifest_temporary.write_text(
+                            json.dumps(manifest, separators=(",", ":")), encoding="utf-8"
+                        )
+                        manifest_temporary.replace(save_dir / "adapter_manifest.json")
 
                     self._notify_orchestrator(save_dir)
 

@@ -2,10 +2,13 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
+import threading
 import time
 import urllib.request
 from urllib.error import HTTPError
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -44,11 +47,154 @@ def adapter_cache_path(source_url: str) -> Path:
 
 _PARALLEL_DOWNLOAD_THRESHOLD = 16 * 1024 * 1024
 _PARALLEL_DOWNLOAD_STREAMS = 8
+_ADAPTER_FILES = ("adapter_config.json", "adapter_model.safetensors")
+_ADAPTER_MANIFEST = "adapter_manifest.json"
+_ADAPTER_DIGEST = "adapter_model.safetensors.sha256"
+_ADAPTER_STATUS = ".adapter-stage-status.json"
+_ADAPTER_LANE_TIMEOUT_S = float(os.environ.get("PRIME_LORA_LANE_TIMEOUT_S", "45"))
+_ADAPTER_LANE_RETRIES = int(os.environ.get("PRIME_LORA_LANE_RETRIES", "6"))
+_ADAPTER_STATUS_INTERVAL_S = float(os.environ.get("PRIME_LORA_STATUS_INTERVAL_S", "1"))
+_JSON_LOCK = threading.Lock()
 
 
 def _content_length(source_url: str) -> int:
-    with urllib.request.urlopen(urllib.request.Request(source_url, method="HEAD"), timeout=60) as response:
-        return int(response.headers["Content-Length"])
+    with urllib.request.urlopen(
+        urllib.request.Request(source_url, method="HEAD"), timeout=_ADAPTER_LANE_TIMEOUT_S
+    ) as response:
+        try:
+            return int(response.headers["Content-Length"])
+        except (TypeError, ValueError) as exc:
+            raise OSError(f"adapter source has no valid Content-Length: {source_url}") from exc
+
+
+def _read_source_text(source_url: str) -> str:
+    return _read_source_bytes(source_url).decode("utf-8")
+
+
+def _read_source_bytes(source_url: str) -> bytes:
+    with urllib.request.urlopen(source_url, timeout=_ADAPTER_LANE_TIMEOUT_S) as response:
+        return response.read()
+
+
+def _source_manifest(source_url: str) -> dict[str, object]:
+    """Read the immutable adapter manifest published beside a STABLE marker.
+
+    Older broadcasts have only the model checksum sidecar. Keep that fallback,
+    but always return a local manifest with a size and digest for every file.
+    """
+    source_root = source_url.rstrip("/")
+    manifest_url = f"{source_root}/{_ADAPTER_MANIFEST}"
+    try:
+        value = json.loads(_read_source_text(manifest_url))
+    except HTTPError as exc:
+        if exc.code != 404:
+            raise
+        value = None
+    if value is not None:
+        if not isinstance(value, dict) or value.get("version") != 1:
+            raise OSError("invalid adapter source manifest")
+        raw_files = value.get("files")
+        if not isinstance(raw_files, list):
+            raise OSError("adapter source manifest has no files")
+        files: dict[str, dict[str, object]] = {}
+        for item in raw_files:
+            if not isinstance(item, dict):
+                raise OSError("invalid adapter source manifest file")
+            name = item.get("name")
+            size = item.get("size")
+            digest = item.get("sha256")
+            if (
+                not isinstance(name, str)
+                or name not in _ADAPTER_FILES
+                or not isinstance(size, int)
+                or size < 0
+                or not isinstance(digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            ):
+                raise OSError("invalid adapter source manifest entry")
+            files[name] = {"size": size, "sha256": digest}
+        if set(files) != set(_ADAPTER_FILES):
+            raise OSError("adapter source manifest is missing an adapter file")
+        return {"version": 1, "source_url": source_url, "files": files}
+
+    model_url = f"{source_root}/{_ADAPTER_FILES[1]}"
+    config_url = f"{source_root}/{_ADAPTER_FILES[0]}"
+    digest_text = _read_source_text(f"{source_root}/{_ADAPTER_DIGEST}").strip().split()
+    if not digest_text or re.fullmatch(r"[0-9a-f]{64}", digest_text[0]) is None:
+        raise OSError("adapter source has no valid model checksum")
+    config_bytes = _read_source_bytes(config_url)
+    return {
+        "version": 1,
+        "source_url": source_url,
+        "files": {
+            _ADAPTER_FILES[0]: {
+                "size": _content_length(config_url),
+                "sha256": hashlib.sha256(config_bytes).hexdigest(),
+            },
+            _ADAPTER_FILES[1]: {"size": _content_length(model_url), "sha256": digest_text[0]},
+        },
+    }
+
+
+def _write_json(path: Path, value: dict[str, object]) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(value, separators=(",", ":")), encoding="utf-8")
+    with temporary.open("rb") as stream:
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+
+
+def _write_stage_status(cache_root: Path, value: dict[str, object]) -> None:
+    # Calls can come from the range workers. The global staging flock prevents
+    # cross-process stages; this lock keeps status writes ordered within one.
+    with _JSON_LOCK:
+        _write_json(cache_root / _ADAPTER_STATUS, value)
+
+
+def adapter_stage_status() -> dict[str, object]:
+    cache_root = Path(os.environ.get("PRIME_LORA_CACHE_DIR", "/tmp/prime-rl-lora"))
+    path = cache_root / _ADAPTER_STATUS
+    try:
+        with path.open("r", encoding="utf-8") as source:
+            value = json.load(source)
+    except (FileNotFoundError, OSError, ValueError):
+        return {"status": "idle", "bytes_done": 0, "bytes_total": 0}
+    return value if isinstance(value, dict) else {"status": "idle", "bytes_done": 0, "bytes_total": 0}
+
+
+def _adapter_reader_lock(path: Path) -> Path:
+    return path.parent / f".{path.name}.readers.lock"
+
+
+@contextmanager
+def adapter_reader_lock(path: Path):
+    """Hold a shared lease while vLLM reads an adapter from the cache."""
+    lock_path = _adapter_reader_lock(path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_SH)
+        try:
+            yield path
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def _cleanup_retired_adapters(cache_root: Path, active_name: str) -> None:
+    prefix = f"{active_name}.retired-"
+    for candidate in cache_root.iterdir():
+        if not candidate.name.startswith(prefix) or not candidate.is_dir():
+            continue
+        lock_path = _adapter_reader_lock(cache_root / active_name)
+        try:
+            with lock_path.open("a+") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                shutil.rmtree(candidate)
+                fcntl.flock(lock, fcntl.LOCK_UN)
+        except (BlockingIOError, FileNotFoundError):
+            # A vLLM load still has the old directory open. Leave it for the
+            # next stage; deleting it here would create stale open files.
+            continue
 
 
 def _download_range(
@@ -57,12 +203,13 @@ def _download_range(
     destination: Path,
     start: int,
     end: int,
+    progress=None,
 ) -> None:
     """Download one inclusive byte range and resume its local part file."""
-    for attempt in range(10):
+    size = end - start + 1
+    for attempt in range(_ADAPTER_LANE_RETRIES):
         try:
             source_url = source_urls[(source_index + attempt) % len(source_urls)]
-            size = end - start + 1
             present = destination.stat().st_size if destination.exists() else 0
             if present == size:
                 return
@@ -73,35 +220,66 @@ def _download_range(
                 source_url,
                 headers={"Range": f"bytes={start + present}-{end}"},
             )
-            with urllib.request.urlopen(request, timeout=60) as response:
+            with urllib.request.urlopen(request, timeout=_ADAPTER_LANE_TIMEOUT_S) as response:
                 if response.status != 206:
                     raise OSError("adapter server did not honor byte range")
                 with destination.open("ab" if present else "wb") as output:
-                    shutil.copyfileobj(response, output, length=16 * 1024 * 1024)
+                    while present < size:
+                        chunk = response.read(min(16 * 1024 * 1024, size - present))
+                        if not chunk:
+                            raise OSError(f"adapter range ended early: {destination.name}")
+                        output.write(chunk)
+                        present += len(chunk)
+                        if progress is not None:
+                            progress(source_index, len(chunk))
             if destination.stat().st_size != size:
                 raise OSError(f"incomplete adapter range: {destination.name}")
             return
-        except OSError:
-            if attempt == 9:
+        except (OSError, TimeoutError):
+            if attempt + 1 == _ADAPTER_LANE_RETRIES:
                 raise
             time.sleep(min(2**attempt, 10))
 
 
-def download(source_url: str, destination: Path) -> None:
-    total = _content_length(source_url)
-    if destination.exists() and destination.stat().st_size == total:
-        return
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(16 * 1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
-    checkpoint_ports = [
+
+def download(
+    source_url: str,
+    destination: Path,
+    *,
+    expected_size: int | None = None,
+    expected_sha256: str | None = None,
+    progress=None,
+) -> None:
+    total = _content_length(source_url)
+    if expected_size is not None and total != expected_size:
+        raise OSError(
+            f"adapter source size changed for {source_url}: expected {expected_size}, got {total}"
+        )
+    if destination.exists() and destination.stat().st_size == total:
+        if expected_sha256 is None or _sha256(destination) == expected_sha256:
+            return
+        destination.unlink()
+
+    # Full-checkpoint tunnels are not adapter sources. Reusing their 128-port
+    # list here created 128 adapter lanes on every replica and collapsed the
+    # link. Adapter fan-out is opt-in and has its own setting.
+    adapter_ports = [
         value.strip()
-        for value in os.environ.get("PRIME_FULL_CHECKPOINT_PORTS", "").split(",")
+        for value in os.environ.get("PRIME_LORA_SOURCE_PORTS", "").split(",")
         if value.strip()
     ]
     source_urls = [source_url]
-    if checkpoint_ports:
+    if adapter_ports:
         parsed = urlsplit(source_url)
         if parsed.hostname not in ("127.0.0.1", "localhost"):
-            raise OSError("checkpoint tunnel pool requires a loopback source URL")
+            raise OSError("adapter tunnel pool requires a loopback source URL")
         source_urls = [
             urlunsplit(
                 (
@@ -115,13 +293,13 @@ def download(source_url: str, destination: Path) -> None:
             for port in checkpoint_ports
         ]
 
-    streams = len(source_urls) if checkpoint_ports else max(
+    streams = len(source_urls) if adapter_ports else max(
         1, int(os.environ.get("PRIME_LORA_DOWNLOAD_STREAMS", _PARALLEL_DOWNLOAD_STREAMS))
     )
     if total < _PARALLEL_DOWNLOAD_THRESHOLD or streams == 1:
         # Preserve the old single-file resume path for small metadata files and
         # for an explicitly disabled parallel transfer.
-        for attempt in range(10):
+        for attempt in range(_ADAPTER_LANE_RETRIES):
             try:
                 offset = destination.stat().st_size if destination.exists() else 0
                 if offset > total:
@@ -131,17 +309,29 @@ def download(source_url: str, destination: Path) -> None:
                     source_url,
                     headers={"Range": f"bytes={offset}-"} if offset else {},
                 )
-                with urllib.request.urlopen(request, timeout=60) as response:
+                with urllib.request.urlopen(request, timeout=_ADAPTER_LANE_TIMEOUT_S) as response:
                     if offset and response.status != 206:
                         destination.unlink(missing_ok=True)
                         raise OSError("adapter server did not honor byte range")
                     with destination.open("ab" if offset else "wb") as output:
-                        shutil.copyfileobj(response, output, length=16 * 1024 * 1024)
+                        while offset < total:
+                            chunk = response.read(min(16 * 1024 * 1024, total - offset))
+                            if not chunk:
+                                raise OSError(f"adapter file ended early: {destination.name}")
+                            output.write(chunk)
+                            offset += len(chunk)
+                            if progress is not None:
+                                progress(0, len(chunk))
                 if destination.stat().st_size != total:
                     raise OSError(f"incomplete adapter file: {destination.name}")
+                if expected_sha256 is not None and _sha256(destination) != expected_sha256:
+                    # A complete but bad file must not be resumed from EOF on
+                    # the next bounded attempt.
+                    destination.unlink(missing_ok=True)
+                    raise OSError(f"adapter checksum mismatch: {destination.name}")
                 return
-            except OSError:
-                if attempt == 9:
+            except (OSError, TimeoutError):
+                if attempt + 1 == _ADAPTER_LANE_RETRIES:
                     raise
                 time.sleep(min(2**attempt, 10))
         return
@@ -149,7 +339,6 @@ def download(source_url: str, destination: Path) -> None:
     # Long-distance adapter downloads otherwise use one TCP congestion window
     # across a 217 ms, lossy link. Independent range files are resumable and
     # let one reset retry without discarding the other completed ranges.
-    destination.unlink(missing_ok=True)
     parts_dir = destination.with_name(f"{destination.name}.parts")
     parts_dir.mkdir(exist_ok=True)
     chunk = (total + streams - 1) // streams
@@ -157,6 +346,26 @@ def download(source_url: str, destination: Path) -> None:
         (index, start, min(start + chunk, total) - 1)
         for index, start in enumerate(range(0, total, chunk))
     ]
+
+    identity = {
+        "source_url": source_url,
+        "size": total,
+        "sha256": expected_sha256,
+        "streams": len(ranges),
+    }
+    identity_path = parts_dir / "manifest.json"
+    try:
+        with identity_path.open("r", encoding="utf-8") as source:
+            existing_identity = json.load(source)
+    except (FileNotFoundError, OSError, ValueError):
+        existing_identity = None
+    if existing_identity != identity:
+        # Parts are private to this transfer. Remove only mismatched private
+        # parts; never remove a published adapter directory here.
+        shutil.rmtree(parts_dir)
+        parts_dir.mkdir()
+        _write_json(identity_path, identity)
+
     with ThreadPoolExecutor(max_workers=len(ranges)) as executor:
         futures = [
             executor.submit(
@@ -166,6 +375,7 @@ def download(source_url: str, destination: Path) -> None:
                 parts_dir / f"part-{index:03d}",
                 start,
                 end,
+                progress,
             )
             for index, start, end in ranges
         ]
@@ -179,6 +389,13 @@ def download(source_url: str, destination: Path) -> None:
                 shutil.copyfileobj(part, output, length=16 * 1024 * 1024)
     if assembling.stat().st_size != total:
         raise OSError(f"assembled adapter file has the wrong size: {destination.name}")
+    if expected_sha256 is not None and _sha256(assembling) != expected_sha256:
+        # Part sizes alone cannot detect a bad byte from a reset connection.
+        # Drop the private parts after a whole-file mismatch so the next
+        # stage attempt does not repeatedly assemble the same bad payload.
+        shutil.rmtree(parts_dir)
+        assembling.unlink(missing_ok=True)
+        raise OSError(f"adapter checksum mismatch: {destination.name}")
     assembling.replace(destination)
     shutil.rmtree(parts_dir)
 
@@ -192,22 +409,143 @@ def stage_lora_adapter_files(source_url: str) -> Path:
     """
     destination = adapter_cache_path(source_url)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    # Serialize all policy downloads. Per-URL locks allow eight large adapters
-    # to consume the host link at the same time.
+    # The cache is shared by all replicas on this host. One global writer is
+    # intentional: per-URL writers caused old policies to queue behind one
+    # another and made it possible to publish a stale policy after a newer one.
     with (destination.parent / "adapter-staging.lock").open("w") as host_lock:
         fcntl.flock(host_lock, fcntl.LOCK_EX)
-        with (destination.parent / f"{destination.name}.lock").open("w") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            if (destination / "READY").exists():
-                return destination
+        started = time.monotonic()
+        try:
+            manifest = _source_manifest(source_url)
+            files = manifest["files"]
+            assert isinstance(files, dict)
+
+            if (destination / "READY").is_file():
+                try:
+                    with (destination / "manifest.json").open("r", encoding="utf-8") as source:
+                        local_manifest = json.load(source)
+                except (FileNotFoundError, OSError, ValueError):
+                    local_manifest = None
+                if local_manifest == manifest:
+                    _write_stage_status(
+                        destination.parent,
+                        {
+                            "status": "ready",
+                            "source_url": source_url,
+                            "path": destination.as_posix(),
+                            "bytes_done": sum(int(item["size"]) for item in files.values()),
+                            "bytes_total": sum(int(item["size"]) for item in files.values()),
+                            "updated_at": time.time(),
+                        },
+                    )
+                    _cleanup_retired_adapters(destination.parent, destination.name)
+                    return destination
+
+            total_bytes = sum(int(item["size"]) for item in files.values())
+            progress_lock = threading.Lock()
+            progress_bytes = 0
+            last_status = 0.0
+
+            def report(lane: int, amount: int) -> None:
+                nonlocal progress_bytes, last_status
+                with progress_lock:
+                    progress_bytes += amount
+                    now = time.monotonic()
+                    if now - last_status < _ADAPTER_STATUS_INTERVAL_S and progress_bytes < total_bytes:
+                        return
+                    last_status = now
+                    _write_stage_status(
+                        destination.parent,
+                        {
+                            "status": "staging",
+                            "source_url": source_url,
+                            "path": destination.as_posix(),
+                            "bytes_done": progress_bytes,
+                            "bytes_total": total_bytes,
+                            "lane": lane,
+                            "updated_at": time.time(),
+                            "elapsed_seconds": round(now - started, 3),
+                        },
+                    )
+
+            _write_stage_status(
+                destination.parent,
+                {
+                    "status": "staging",
+                    "source_url": source_url,
+                    "path": destination.as_posix(),
+                    "bytes_done": 0,
+                    "bytes_total": total_bytes,
+                    "updated_at": time.time(),
+                    "elapsed_seconds": 0.0,
+                },
+            )
             temporary = destination.with_name(f"{destination.name}.partial")
             temporary.mkdir(exist_ok=True)
-            for filename in ("adapter_config.json", "adapter_model.safetensors"):
-                download(f"{source_url.rstrip('/')}/{filename}", temporary / filename)
-            (temporary / "READY").touch()
-            shutil.rmtree(destination, ignore_errors=True)
-            temporary.rename(destination)
-    return destination
+            _write_json(temporary / "manifest.json", manifest)
+            for filename in _ADAPTER_FILES:
+                item = files[filename]
+                assert isinstance(item, dict)
+                expected_sha256 = item.get("sha256")
+                download(
+                    f"{source_url.rstrip('/')}/{filename}",
+                    temporary / filename,
+                    expected_size=int(item["size"]),
+                    expected_sha256=expected_sha256 if isinstance(expected_sha256, str) else None,
+                    progress=report,
+                )
+                if expected_sha256 is None:
+                    item["sha256"] = _sha256(temporary / filename)
+                progress_bytes = sum(
+                    int(files[name]["size"])
+                    for name in _ADAPTER_FILES
+                    if (temporary / name).is_file() and (temporary / name).stat().st_size == int(files[name]["size"])
+                )
+            _write_json(temporary / "manifest.json", manifest)
+            ready = temporary / "READY"
+            ready.write_text("ready\n", encoding="utf-8")
+            with ready.open("rb") as stream:
+                os.fsync(stream.fileno())
+
+            # Keep the exclusive lease through both renames. This removes the
+            # short missing-path window between retiring the old directory and
+            # publishing the new one.
+            with _adapter_reader_lock(destination).open("a+") as reader_lock:
+                fcntl.flock(reader_lock, fcntl.LOCK_EX)
+                if destination.exists():
+                    retired = destination.with_name(
+                        f"{destination.name}.retired-{time.time_ns()}-{os.getpid()}"
+                    )
+                    os.replace(destination, retired)
+                os.replace(temporary, destination)
+                fcntl.flock(reader_lock, fcntl.LOCK_UN)
+            _cleanup_retired_adapters(destination.parent, destination.name)
+            _write_stage_status(
+                destination.parent,
+                {
+                    "status": "ready",
+                    "source_url": source_url,
+                    "path": destination.as_posix(),
+                    "bytes_done": total_bytes,
+                    "bytes_total": total_bytes,
+                    "updated_at": time.time(),
+                    "elapsed_seconds": round(time.monotonic() - started, 3),
+                },
+            )
+            return destination
+        except BaseException as exc:
+            _write_stage_status(
+                destination.parent,
+                {
+                    "status": "failed",
+                    "source_url": source_url,
+                    "path": destination.as_posix(),
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "updated_at": time.time(),
+                    "elapsed_seconds": round(time.monotonic() - started, 3),
+                },
+            )
+            raise
 
 
 def full_checkpoint_cache_path(source_url: str) -> Path:

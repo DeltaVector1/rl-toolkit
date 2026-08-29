@@ -10,6 +10,8 @@ from vllm.entrypoints.serve.lora.protocol import LoadLoRAAdapterRequest
 
 from prime_rl.inference.vllm.worker.filesystem import (
     adapter_cache_path,
+    adapter_reader_lock,
+    adapter_stage_status,
     stage_full_checkpoint_files,
     stage_lora_adapter_files,
 )
@@ -102,6 +104,12 @@ class MuseFileEndpoint:
             destination = await asyncio.to_thread(stage_lora_adapter_files, source_url)
             return {"status": "ok", "path": destination.as_posix()}
 
+        @app.get("/staging_status")
+        async def staging_status(request: Request):
+            """Expose durable transfer progress to the watchdog and operator."""
+            require_loopback(request)
+            return adapter_stage_status()
+
         @app.post("/pause")
         async def pause(request: Request):
             """Stop admission and abort registered decode requests for a policy load."""
@@ -126,6 +134,8 @@ class MuseFileEndpoint:
             data = await request.json()
             lora_request = LoadLoRAAdapterRequest.model_validate(data)
             async with _LORA_LOAD_LOCK:
+                source_url = None
+                destination = None
                 if lora_request.lora_path.startswith(("http://", "https://")):
                     source_url = lora_request.lora_path
                     destination = await asyncio.to_thread(stage_lora_adapter_files, source_url)
@@ -135,7 +145,14 @@ class MuseFileEndpoint:
                     lora_request.lora_path = destination.as_posix()
                 lora_request.load_inplace = True
                 handler = request.app.state.openai_serving_models
-                response = await handler.load_lora_adapter(lora_request)
+                if source_url is not None:
+                    # Keep a shared lease until vLLM has finished opening the
+                    # safetensors. A replacement stage may retire this cache
+                    # directory, but must not delete it while it is read.
+                    with adapter_reader_lock(destination):
+                        response = await handler.load_lora_adapter(lora_request)
+                else:
+                    response = await handler.load_lora_adapter(lora_request)
                 stored = handler.lora_requests.get(lora_request.lora_name)
                 if stored is not None:
                     stored.load_inplace = False

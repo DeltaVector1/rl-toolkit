@@ -516,21 +516,25 @@ async def _resume_engines(admin_clients: list[AsyncClient]) -> None:
 
 
 async def stage_lora_adapter(admin_clients: list[AsyncClient], lora_path: Path | str) -> None:
-    """Download a remote adapter on every host while generation continues."""
+    """Stage one shared-host adapter copy before the load fan-out.
+
+    The eight Muse endpoints are independent processes on one host and mount
+    the same cache. Sending the stage request to all of them created eight
+    collective calls for one file and made old policy versions queue behind
+    the current one. One request owns the host-level transfer; the subsequent
+    load request still fans out to every endpoint.
+    """
     lora_path_posix = str(lora_path)
     if not lora_path_posix.startswith(("http://", "https://")):
         return
-    await asyncio.gather(
-        *[
-            _admin_post(
-                client,
-                "/stage_lora_adapter",
-                json={"lora_path": lora_path_posix},
-                timeout_s=LORA_STAGE_ATTEMPT_TIMEOUT_S,
-                total_timeout_s=LORA_STAGE_TOTAL_TIMEOUT_S,
-            )
-            for client in admin_clients
-        ]
+    if not admin_clients:
+        raise RuntimeError("cannot stage an adapter without an inference endpoint")
+    await _admin_post(
+        admin_clients[0],
+        "/stage_lora_adapter",
+        json={"lora_path": lora_path_posix},
+        timeout_s=LORA_STAGE_ATTEMPT_TIMEOUT_S,
+        total_timeout_s=LORA_STAGE_TOTAL_TIMEOUT_S,
     )
 
 
