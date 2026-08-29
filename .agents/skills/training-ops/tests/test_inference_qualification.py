@@ -1,4 +1,5 @@
 import ast
+import re
 import unittest
 from unittest.mock import patch
 
@@ -20,6 +21,23 @@ class InferenceQualificationTest(unittest.TestCase):
 
         self.assertTrue(imported)
         self.assertTrue(imported <= set(spec["deploy_files"]))
+
+    def test_mtp_source_inventory_matches_launcher_mounts(self):
+        spec = training_ops._inference_qualification_spec("glm52-mtp-h200")
+        launcher = (training_ops.repo_root / spec["launcher"]).read_text()
+        inventory = {
+            path for path in spec["deploy_files"] if path.startswith("source/")
+        }
+        mounted = set(re.findall(r'-v "\$deployment/([^" ]+)":', launcher))
+        mounted.update(re.findall(r'source=\$deployment/([^,]+),', launcher))
+
+        launcher_sources = {path for path in mounted if path.startswith("source/")}
+        self.assertTrue(inventory <= launcher_sources, inventory - launcher_sources)
+        self.assertIn(
+            '-v "$deployment/source/src/prime_rl/glm52_routing.py":'
+            "/app/.venv/lib/python3.12/site-packages/prime_rl/glm52_routing.py:ro",
+            launcher,
+        )
 
     def test_registered_inventory_and_deploy_files_are_inference_scoped(self):
         spec = training_ops._inference_qualification_spec("glm52-mtp-h200")
