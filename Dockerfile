@@ -18,6 +18,7 @@ COPY --chmod=644 prime-rl/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_m
 COPY --chmod=644 prime-rl/src/prime_rl/trainer/models/glm_moe_dsa/sparse_mla_attention.py /app/src/prime_rl/trainer/models/glm_moe_dsa/sparse_mla_attention.py
 COPY --chmod=644 prime-rl/src/prime_rl/trainer/models/layers/checkpointing.py /app/src/prime_rl/trainer/models/layers/checkpointing.py
 COPY --chmod=644 prime-rl/src/prime_rl/trainer/models/layers/lora/multi_linear.py /app/src/prime_rl/trainer/models/layers/lora/multi_linear.py
+COPY --chmod=644 prime-rl/src/prime_rl/trainer/models/layers/lora/multi_moe.py /app/src/prime_rl/trainer/models/layers/lora/multi_moe.py
 COPY --chmod=644 prime-rl/src/prime_rl/trainer/models/layers/lora/native_fp8_moe.py /app/src/prime_rl/trainer/models/layers/lora/native_fp8_moe.py
 COPY --chmod=644 prime-rl/src/prime_rl/trainer/models/layers/moe.py /app/src/prime_rl/trainer/models/layers/moe.py
 COPY --chmod=644 prime-rl/src/prime_rl/trainer/rl/token_export.py /app/src/prime_rl/trainer/rl/token_export.py
