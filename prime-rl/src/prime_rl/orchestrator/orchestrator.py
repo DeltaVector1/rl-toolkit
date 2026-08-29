@@ -26,6 +26,7 @@ import json
 import os
 import time
 from typing import TYPE_CHECKING
+from urllib.request import urlopen
 
 import tomli_w
 import verifiers.v1 as vf
@@ -166,6 +167,7 @@ def _verify_startup_adapter_delta(
     lora_name: str | None,
     step: int,
     target_path,
+    target_url: str | None = None,
 ) -> None:
     """Reject a positive resume unless its published adjacent delta is exact."""
     if lora_name is None or step <= 0:
@@ -176,24 +178,76 @@ def _verify_startup_adapter_delta(
         raise RuntimeError(
             f"cannot resume LoRA policy v{step}: exact predecessor v{step - 1} is not STABLE"
         )
-    manifest_path = target_path / "adapter_manifest.json"
-    try:
-        with manifest_path.open("r", encoding="utf-8") as source:
-            manifest = json.load(source)
-    except (FileNotFoundError, OSError, ValueError) as exc:
-        raise RuntimeError(
-            f"cannot resume LoRA policy v{step}: exact adjacent delta manifest is unavailable"
-        ) from exc
+
+    def read_manifest(path, url: str | None) -> dict[str, object]:
+        try:
+            if url is None:
+                with (path / "adapter_manifest.json").open("r", encoding="utf-8") as source:
+                    value = json.load(source)
+            else:
+                with urlopen(f"{url.rstrip('/')}/adapter_manifest.json", timeout=config.weight_broadcast.timeout) as source:
+                    value = json.load(source)
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            raise RuntimeError(
+                f"cannot resume LoRA policy v{step}: adapter manifest is unavailable"
+            ) from exc
+        if not isinstance(value, dict):
+            raise RuntimeError(f"cannot resume LoRA policy v{step}: adapter manifest is not an object")
+        return value
+
+    manifest = read_manifest(target_path, target_url)
     if (
-        not isinstance(manifest, dict)
-        or manifest.get("version") != 1
+        manifest.get("version") != 1
         or manifest.get("kind") != "lora-adapter"
         or manifest.get("mode") != "delta"
+        or manifest.get("transport") != "chunked-shuffled-xor-zstd"
         or manifest.get("target_step") != step
         or manifest.get("base_step") != step - 1
     ):
         raise RuntimeError(
             f"cannot resume LoRA policy v{step}: published adapter is not the exact adjacent delta"
+        )
+
+    previous_url = inference_weight_path(config, previous_path, lora_name)
+    previous_manifest = read_manifest(previous_path, previous_url if isinstance(previous_url, str) else None)
+    if (
+        previous_manifest.get("version") != 1
+        or previous_manifest.get("kind") != "lora-adapter"
+        or previous_manifest.get("target_step") != step - 1
+    ):
+        raise RuntimeError(
+            f"cannot resume LoRA policy v{step}: predecessor manifest is not policy v{step - 1}"
+        )
+
+    def manifest_files(value: dict[str, object]) -> dict[str, dict[str, object]]:
+        raw_files = value.get("files")
+        if not isinstance(raw_files, list):
+            raise RuntimeError(f"cannot resume LoRA policy v{step}: adapter manifest has no files")
+        files: dict[str, dict[str, object]] = {}
+        for item in raw_files:
+            if isinstance(item, dict) and isinstance(item.get("name"), str):
+                files[item["name"]] = item
+        if set(files) != {"adapter_config.json", "adapter_model.safetensors"}:
+            raise RuntimeError(f"cannot resume LoRA policy v{step}: adapter manifest has incomplete files")
+        return files
+
+    target_files = manifest_files(manifest)
+    previous_files = manifest_files(previous_manifest)
+    target_weights = target_files["adapter_model.safetensors"]
+    target_config = target_files["adapter_config.json"]
+    previous_weights = previous_files["adapter_model.safetensors"]
+    previous_config = previous_files["adapter_config.json"]
+    if (
+        manifest.get("target_size") != target_weights.get("size")
+        or manifest.get("target_sha256") != target_weights.get("sha256")
+        or manifest.get("config_size") != target_config.get("size")
+        or manifest.get("config_sha256") != target_config.get("sha256")
+        or manifest.get("base_size") != previous_weights.get("size")
+        or manifest.get("base_sha256") != previous_weights.get("sha256")
+        or manifest.get("base_config_sha256") != previous_config.get("sha256")
+    ):
+        raise RuntimeError(
+            f"cannot resume LoRA policy v{step}: adjacent adapter base or SHA-256 identity differs"
         )
 
 
@@ -482,8 +536,15 @@ class Orchestrator:
                 weights_path = get_weight_dir(
                     config.output_dir, sync_version, check_exists=check_exists, wait_timeout=wait_timeout
                 )
-                _verify_startup_adapter_delta(config, self.lora_name, sync_version, weights_path)
-                weights_path = inference_weight_path(config, weights_path, self.lora_name)
+                source_weights_path = inference_weight_path(config, weights_path, self.lora_name)
+                _verify_startup_adapter_delta(
+                    config,
+                    self.lora_name,
+                    sync_version,
+                    weights_path,
+                    source_weights_path if isinstance(source_weights_path, str) else None,
+                )
+                weights_path = source_weights_path
             if self.model_express is not None:
                 await asyncio.to_thread(self.model_express.set_status, p2p_pb2.SOURCE_STATUS_READY)
             require_delta = self.lora_name is not None and sync_version > 0
