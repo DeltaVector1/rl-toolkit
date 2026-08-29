@@ -95,6 +95,25 @@ def test_profile_has_the_required_safe_mtp_contract():
     assert config["gpu_memory_utilization"] == 0.95
     assert config["enable_expert_parallel"] is True
     assert config["enable_eplb"] is False
+    assert config["vllm_extra"]["moe_backend"] == "triton"
+
+
+def test_mtp_preflight_rejects_non_triton_fp8_moe_backends():
+    config = tomllib.loads(
+        (ROOT / "configs/qualification/glm52-mtp-h200.toml").read_text()
+    )
+    preflight = _load_module(
+        ROOT / "scripts/glm52_h200_mtp_preflight.py", "glm52_mtp_preflight_moe_backend"
+    )
+    assert preflight.static_errors(config) == []
+
+    for backend in ("auto", "flashinfer_cutlass", "flashinfer_trtllm"):
+        invalid = tomllib.loads(
+            (ROOT / "configs/qualification/glm52-mtp-h200.toml").read_text()
+        )
+        invalid["vllm_extra"]["moe_backend"] = backend
+        errors = preflight.static_errors(invalid)
+        assert any("Triton MoE backend" in error for error in errors), backend
 
 
 def test_mtp_preflight_requires_h200_headroom_and_ep_without_eplb():
@@ -166,6 +185,25 @@ def test_both_launchers_mount_every_patched_vllm_file():
     assert "PRIME_MTP_ROUTE_TRACE_MODE" not in (
         ROOT / "scripts/h200/start_mtp_qualification.sh"
     ).read_text()
+
+
+def test_mtp_qualification_uses_the_profile_backend_and_overlay_patch_series():
+    launcher = (ROOT / "scripts/h200/start_mtp_qualification.sh").read_text()
+    profile = (ROOT / "configs/qualification/glm52-mtp-h200.toml").read_text()
+    overlay = _load_module(
+        ROOT / "scripts/h200/flashmla_overlay_preflight.py", "overlay_patch_series"
+    )
+    assert 'inference_config="$deployment/configs/qualification/glm52-mtp-h200.toml"' in launcher
+    assert '"moe_backend":"triton"' not in launcher
+    assert 'moe_backend = "triton"' in profile
+    required = {
+        "patches/vllm/0001-v026-flashmla-sparse-scratch-limit.patch",
+        "patches/vllm/0002-v026-flashmla-sparse-mixed-batch-chunks.patch",
+        "patches/vllm/0004-v026-request-exact-router-trace.patch",
+        "patches/vllm/0006-v026-mtp-slot-mapping-46908.patch",
+        "patches/vllm/0007-v026-mtp-slot-mapping-47013.patch",
+    }
+    assert required <= set(overlay.PATCHES)
 
 
 def test_benchmark_accepts_only_complete_off_on_evidence():

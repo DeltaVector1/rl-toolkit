@@ -33,6 +33,10 @@ backend_port = 8100
 # trace flag and must never write a route trace. An environment variable is not
 # used as the route selector.
 [vllm_extra]
+# FP8 expert parallelism must use vLLM's modular Triton implementation.  The
+# automatic selector can otherwise choose FlashInferExperts or monolithic
+# TRT-LLM experts, which do not provide the required LoRA path.
+moe_backend = "triton"
 kv_cache_dtype = "bfloat16"
 block_size = 64
 max_num_seqs = 128

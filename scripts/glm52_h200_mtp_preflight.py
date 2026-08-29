@@ -18,6 +18,7 @@ PROFILE_NAME = "glm52-mtp-h200"
 CONTEXT_TOKENS = 32768
 SUPPORTED_BLOCK_SIZES = frozenset({64})
 EXPECTED_GPU_MEMORY_UTILIZATION = 0.95
+EXPECTED_MOE_BACKEND = "triton"
 TARGET_MODULES = {
     "q_a_proj",
     "q_b_proj",
@@ -99,6 +100,8 @@ def static_errors(config: dict) -> list[str]:
         errors.append("parallel topology must be TP8/DP1")
     if extra.get("kv_cache_dtype") != "bfloat16":
         errors.append("target KV cache dtype must be bfloat16")
+    if extra.get("moe_backend") != EXPECTED_MOE_BACKEND:
+        errors.append("FP8 EP must explicitly use the modular Triton MoE backend")
     target_block_size = extra.get("block_size")
     draft_block_size = speculative.get("block_size", target_block_size)
     if target_block_size not in SUPPORTED_BLOCK_SIZES:
