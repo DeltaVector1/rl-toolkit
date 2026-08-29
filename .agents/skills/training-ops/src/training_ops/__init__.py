@@ -2571,6 +2571,255 @@ exit 26
 """
 
 
+def _adapter_update_config(run: str) -> dict:
+    """Resolve adapter update paths from the selected profile."""
+    selected = _profile_for_run(run)
+    orchestrator_path = selected.get("orchestrator")
+    if not isinstance(orchestrator_path, str):
+        raise Refused(f"profile for {run} has no orchestrator config")
+    path = repo_root / orchestrator_path
+    try:
+        with path.open("rb") as stream:
+            config = tomllib.load(stream)
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise RuntimeError(f"cannot read orchestrator config {path}: {error}") from error
+
+    run_base = _validated_run_base(run)
+    output_dir = config.get("output_dir")
+    if not isinstance(output_dir, str) or not output_dir.startswith(run_base + "/"):
+        raise Refused(
+            f"orchestrator output_dir {output_dir!r} is outside configured run {run!r}"
+        )
+    if any(part in {"", ".", ".."} for part in PurePosixPath(output_dir).parts):
+        raise Refused(f"orchestrator output_dir is unsafe: {output_dir!r}")
+    service_name = PurePosixPath(output_dir).name
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", service_name):
+        raise Refused(f"orchestrator run directory is invalid: {service_name!r}")
+
+    model = config.get("model")
+    client = model.get("client") if isinstance(model, dict) else None
+    if not isinstance(client, dict):
+        raise Refused("orchestrator model.client config is missing")
+    admin_urls = client.get("admin_base_url") or client.get("base_url")
+    if not isinstance(admin_urls, list) or not admin_urls or not all(
+        isinstance(url, str) and url.startswith(("http://", "https://"))
+        for url in admin_urls
+    ):
+        raise Refused("orchestrator model.client has no configured inference URLs")
+
+    broadcast = config.get("weight_broadcast")
+    source_url = broadcast.get("source_url") if isinstance(broadcast, dict) else None
+    if not isinstance(source_url, str) or not source_url.startswith(("http://", "https://")):
+        raise Refused("orchestrator weight_broadcast.source_url is missing")
+    if f"/{run}/" not in source_url.rstrip("/") + "/":
+        raise Refused("adapter source URL is not bound to the active run")
+
+    kind = selected["kind"]
+    ports_by_host = {}
+    for host in inference_hosts:
+        configured_ports = _inference_config(host, kind).get("ports")
+        if not isinstance(configured_ports, list) or not configured_ports:
+            raise Refused(f"inference ports for {host} are missing")
+        if not all(isinstance(port, int) and 1 <= port <= 65535 for port in configured_ports):
+            raise Refused(f"inference ports for {host} are invalid")
+        ports_by_host[host] = list(configured_ports)
+    return {
+        "kind": kind,
+        "engine_container": muse_inference_container
+        if kind == "muse"
+        else glm_inference_container,
+        "output_dir": output_dir,
+        "service_name": service_name,
+        "run_marker": f"/{run}/",
+        "service_marker": f"/{service_name}/",
+        "ports": ports_by_host[orchestrator_host],
+        "ports_by_host": ports_by_host,
+    }
+
+
+def _validate_adapter_stage_log(log: str) -> str:
+    """Require a current adapter transfer failure, not a generic error."""
+    failures = list(re.finditer(r"Failed to apply policy update \d+", log))
+    if not failures:
+        raise Refused("no failed adapter policy update is present in the orchestrator log")
+    latest_failure = failures[-1]
+    successes = list(re.finditer(r"Staged policy v\d+ on every inference host", log))
+    if successes and successes[-1].start() > latest_failure.start():
+        raise Refused("the latest adapter policy update already succeeded")
+    window = log[max(0, latest_failure.start() - 4000) : latest_failure.end() + 20000]
+    transfer_words = ("stage_lora_adapter", "adapter", "lora")
+    transport_words = (
+        "ReadTimeout",
+        "TimeoutError",
+        "timed out",
+        "ConnectError",
+        "TransportError",
+        "incomplete adapter",
+        "byte range",
+    )
+    if not any(word.lower() in window.lower() for word in transfer_words):
+        raise Refused("latest policy failure has no adapter staging evidence")
+    if not any(word.lower() in window.lower() for word in transport_words):
+        raise Refused("latest adapter failure has no transfer timeout evidence")
+    return latest_failure.group(0)
+
+
+def _adapter_stage_evidence() -> str:
+    code, output = _ssh(
+        orchestrator_host,
+        f"sudo docker logs --tail 10000 {shlex.quote(orchestrator_container)} 2>&1",
+        timeout=180,
+    )
+    if code:
+        raise RuntimeError(f"cannot read adapter staging log on {orchestrator_host}")
+    return _validate_adapter_stage_log(output)
+
+
+def _adapter_idle_script(ports: list[int]) -> str:
+    if not ports or not all(isinstance(port, int) and 1 <= port <= 65535 for port in ports):
+        raise Refused("adapter idle check requires configured inference ports")
+    port_list = " ".join(str(port) for port in ports)
+    return f"""set -euo pipefail
+for port in {port_list}; do
+  health=$(curl -sS -o /dev/null -m 30 -w '%{{http_code}}' "http://127.0.0.1:$port/health") || {{ echo "health request failed on $port" >&2; exit 31; }}
+  [ "$health" = 200 ] || {{ echo "health returned $health on $port" >&2; exit 32; }}
+  metrics=$(curl -sS -m 30 "http://127.0.0.1:$port/metrics") || {{ echo "metrics request failed on $port" >&2; exit 33; }}
+  running=$(printf '%s\\n' "$metrics" | awk '
+    $1 ~ /^vllm:num_requests_running(\\{{|$)/ {{
+      if ($NF !~ /^[0-9]+(\\.[0-9]+)?$/) bad=1
+      else {{ total += $NF; found=1 }}
+    }}
+    END {{ if (!found || bad || total != 0) exit 1; printf "%.0f", total }}
+  ') || {{ echo "active or unreadable requests on $port" >&2; exit 34; }}
+  echo "port=$port running=$running"
+done
+"""
+
+
+def _adapter_prefetch_stop_script(run_marker: str, service_marker: str, output_dir: str) -> str:
+    for value in (run_marker, service_marker, output_dir):
+        if not value or any(ch in value for ch in "'\\\n"):
+            raise Refused("adapter process identity marker is unsafe")
+    return f"""set -euo pipefail
+run_marker={shlex.quote(run_marker)}
+service_marker={shlex.quote(service_marker)}
+service_dir={shlex.quote(output_dir)}
+
+proc_read() {{
+  sudo cat "$1" 2>/dev/null || cat "$1" 2>/dev/null
+}}
+
+process_matches() {{
+  local pid=$1 exe command_line environment
+  case "$pid" in ''|*[!0-9]*) return 1;; esac
+  [ "$pid" -gt 1 ] || return 1
+  exe=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
+  case "${{exe##*/}}" in curl|timeout) ;; *) return 1;; esac
+  command_line=$(proc_read "/proc/$pid/cmdline" | tr '\\0' ' ') || return 2
+  [ -n "$command_line" ] || return 2
+  case "$command_line" in *stage_lora_adapter*) ;; *) return 1;; esac
+  case "$command_line" in *"$run_marker"*) ;; *) return 1;; esac
+  case "$command_line" in *"$service_marker"*) ;; *) return 1;; esac
+  environment=$(proc_read "/proc/$pid/environ" | tr '\\0' '\\n') || return 2
+  case " $environment " in *" SOURCE_RUN_DIR=$service_dir "*) ;; *) return 1;; esac
+  return 0
+}}
+
+pids=()
+ambiguous=0
+for proc_dir in /proc/[0-9]*; do
+  pid=${{proc_dir##*/}}
+  if [ -e "$proc_dir/exe" ]; then
+    exe=$(readlink "$proc_dir/exe" 2>/dev/null || true)
+    case "${{exe##*/}}" in
+      curl|timeout)
+        if process_matches "$pid"; then
+          pids+=("$pid")
+        elif [ "$?" = 2 ]; then
+          ambiguous=1
+        fi
+        ;;
+    esac
+  fi
+done
+[ "$ambiguous" = 0 ] || {{ echo "adapter prefetch identity is unreadable" >&2; exit 41; }}
+
+stop_one() {{
+  local pid=$1 match_status
+  if process_matches "$pid"; then :; else
+    match_status=$?
+    [ "$match_status" = 1 ] && return 0
+    return 2
+  fi
+  kill -TERM "$pid" 2>/dev/null || sudo kill -TERM "$pid" 2>/dev/null || return 1
+  for _ in $(seq 1 200); do
+    if process_matches "$pid"; then :; else
+      match_status=$?
+      [ "$match_status" = 1 ] && return 0
+      return 2
+    fi
+    sleep 0.1
+  done
+  if process_matches "$pid"; then :; else
+    match_status=$?
+    [ "$match_status" = 1 ] && return 0
+    return 2
+  fi
+  kill -KILL "$pid" 2>/dev/null || sudo kill -KILL "$pid" 2>/dev/null || return 1
+  for _ in $(seq 1 50); do
+    if process_matches "$pid"; then :; else
+      match_status=$?
+      [ "$match_status" = 1 ] && return 0
+      return 2
+    fi
+    sleep 0.1
+  done
+  return 1
+}}
+
+for pid in "${{pids[@]}}"; do
+  stop_one "$pid" || {{ echo "exact adapter prefetch pid $pid did not stop" >&2; exit 42; }}
+done
+for proc_dir in /proc/[0-9]*; do
+  pid=${{proc_dir##*/}}
+  if process_matches "$pid"; then
+    echo "adapter prefetch remains pid=$pid" >&2
+    exit 43
+  elif [ "$?" = 2 ]; then
+    echo "adapter prefetch identity became unreadable" >&2
+    exit 44
+  fi
+done
+echo "stopped ${{#pids[@]}} exact adapter prefetch process(es)"
+"""
+
+
+def _restart_adapter_engine_script(container: str, health_port: int) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", container):
+        raise Refused(f"inference container name is invalid: {container!r}")
+    if not isinstance(health_port, int) or not 1 <= health_port <= 65535:
+        raise Refused("inference health port is invalid")
+    quoted = shlex.quote(container)
+    return f"""set -euo pipefail
+container={quoted}
+name=$(sudo docker inspect --format '{{{{.Name}}}}' "$container" 2>/dev/null || true)
+[ "$name" = "/$container" ] || {{ echo "configured inference container identity is not exact" >&2; exit 51; }}
+state=$(sudo docker inspect --format '{{{{.State.Running}}}}' "$container" 2>/dev/null || true)
+[ "$state" = true ] || {{ echo "configured inference container is not running" >&2; exit 52; }}
+sudo docker restart --time 30 "$container" >/dev/null
+for _ in $(seq 1 180); do
+  health=$(curl -sS -o /dev/null -m 10 -w '%{{http_code}}' http://127.0.0.1:{health_port}/health 2>/dev/null || true)
+  if [ "$health" = 200 ]; then
+    echo "restarted exact inference container $container"
+    exit 0
+  fi
+  sleep 1
+done
+echo "inference container did not become healthy after restart" >&2
+exit 53
+"""
+
+
 def repair(what: str) -> str:
     """Apply a named repair to the configured hosts."""
     if what == "tunnels":
@@ -2581,9 +2830,115 @@ def repair(what: str) -> str:
         return _repair_supervisors()
     if what == "microbatch-sync":
         return _repair_microbatch_sync()
+    if what == "adapter-update":
+        return _repair_adapter_update()
     raise Refused(
-        f"unknown repair {what!r}. Use tunnels, engine:<host>, supervisors, or microbatch-sync."
+        f"unknown repair {what!r}. Use tunnels, engine:<host>, supervisors, microbatch-sync, or adapter-update."
     )
+
+
+def _repair_adapter_update() -> str:
+    run = current_run()
+    config = _adapter_update_config(run)
+    before = status(run, quiet=True)
+    if not before.trainer_up or before.trainer_failed:
+        raise Refused("adapter repair requires a healthy trainer cluster")
+    if not before.orch_up:
+        raise Refused("adapter repair requires the orchestrator to be up")
+    if len(before.engines) != len(inference_hosts) or any(
+        not engine.reachable
+        or not engine.healthy
+        or engine.probes_total <= 0
+        or engine.probes_ok != engine.probes_total
+        for engine in before.engines
+    ):
+        raise Refused("adapter repair requires every configured inference endpoint to be healthy")
+    inflight = re.search(r"(\d+) inflight", before.batch or "")
+    if inflight and int(inflight.group(1)) > 0:
+        raise Refused("adapter repair requires zero active rollout requests")
+
+    idle = _fan(
+        inference_hosts,
+        lambda host: _ssh(
+            host,
+            _adapter_idle_script(config["ports_by_host"][host]),
+            timeout=90,
+        ),
+    )
+    failed_idle = {host: output.strip() for host, (code, output) in idle.items() if code}
+    if failed_idle:
+        raise Refused(f"adapter repair requires idle healthy inference endpoints: {failed_idle}")
+    evidence = _adapter_stage_evidence()
+
+    stopped = _fan(
+        inference_hosts,
+        lambda host: _ssh(
+            host,
+            _adapter_prefetch_stop_script(
+                config["run_marker"], config["service_marker"], config["output_dir"]
+            ),
+            timeout=90,
+        ),
+    )
+    failed_stop = {host: output.strip() for host, (code, output) in stopped.items() if code}
+    if failed_stop:
+        raise RuntimeError(f"exact adapter prefetch stop failed: {failed_stop}")
+
+    for path in (
+        "prime-rl/src/prime_rl/utils/client.py",
+        "prime-rl/src/prime_rl/inference/vllm/worker/filesystem.py",
+        ".agents/skills/training-ops/runtime/h200/sync_rollout_batches.sh",
+    ):
+        if not deploy(path):
+            raise RuntimeError(f"adapter repair deployment failed for {path}")
+
+    restarted = _fan(
+        inference_hosts,
+        lambda host: _ssh(
+            host,
+            _restart_adapter_engine_script(
+                config["engine_container"], config["ports_by_host"][host][0]
+            ),
+            timeout=240,
+        ),
+    )
+    failed_restart = {host: output.strip() for host, (code, output) in restarted.items() if code}
+    if failed_restart:
+        raise RuntimeError(f"inference restart failed: {failed_restart}")
+
+    post_idle = _fan(
+        inference_hosts,
+        lambda host: _ssh(
+            host,
+            _adapter_idle_script(config["ports_by_host"][host]),
+            timeout=90,
+        ),
+    )
+    failed_post_idle = {
+        host: output.strip() for host, (code, output) in post_idle.items() if code
+    }
+    if failed_post_idle:
+        raise RuntimeError(f"inference was not idle after restart: {failed_post_idle}")
+
+    quoted_orchestrator = shlex.quote(orchestrator_container)
+    restart_code, restart_output = _ssh(
+        orchestrator_host,
+        f"name=$(sudo docker inspect --format '{{{{.Name}}}}' {quoted_orchestrator} 2>/dev/null || true); "
+        f"[ \"$name\" = '/{orchestrator_container}' ] || exit 61; "
+        f"state=$(sudo docker inspect --format '{{{{.State.Running}}}}' {quoted_orchestrator} 2>/dev/null || true); "
+        f"[ \"$state\" = true ] || exit 62; "
+        f"sudo docker restart --time 30 {quoted_orchestrator} >/dev/null; "
+        f"test \"$(sudo docker inspect --format '{{{{.State.Running}}}}' {quoted_orchestrator} 2>/dev/null)\" = true",
+        timeout=180,
+    )
+    if restart_code:
+        raise RuntimeError(f"orchestrator restart failed: {restart_output.strip()}")
+    result = (
+        f"adapter update repaired for {run}: {evidence}; stopped exact prefetch processes; "
+        "deployed transfer timeout and host staging lock; restarted inference and orchestrator only"
+    )
+    print(result)
+    return result
 
 
 def _repair_microbatch_sync() -> str:

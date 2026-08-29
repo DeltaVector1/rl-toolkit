@@ -11,6 +11,13 @@ SYNC_PATH = (
 
 
 class AdapterStageTimeoutTest(unittest.TestCase):
+    def test_staging_serializes_all_source_urls_on_one_host(self):
+        source = (CLIENT_PATH.parent.parent / "inference/vllm/worker/filesystem.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('destination.parent / "adapter-staging.lock"', source)
+        self.assertIn("fcntl.flock(host_lock, fcntl.LOCK_EX)", source)
+
     def test_staging_has_a_longer_explicit_budget_than_loading(self):
         tree = ast.parse(CLIENT_PATH.read_text(encoding="utf-8"))
         values = {}

@@ -192,17 +192,21 @@ def stage_lora_adapter_files(source_url: str) -> Path:
     """
     destination = adapter_cache_path(source_url)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with (destination.parent / f"{destination.name}.lock").open("w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        if (destination / "READY").exists():
-            return destination
-        temporary = destination.with_name(f"{destination.name}.partial")
-        temporary.mkdir(exist_ok=True)
-        for filename in ("adapter_config.json", "adapter_model.safetensors"):
-            download(f"{source_url.rstrip('/')}/{filename}", temporary / filename)
-        (temporary / "READY").touch()
-        shutil.rmtree(destination, ignore_errors=True)
-        temporary.rename(destination)
+    # Serialize all policy downloads. Per-URL locks allow eight large adapters
+    # to consume the host link at the same time.
+    with (destination.parent / "adapter-staging.lock").open("w") as host_lock:
+        fcntl.flock(host_lock, fcntl.LOCK_EX)
+        with (destination.parent / f"{destination.name}.lock").open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if (destination / "READY").exists():
+                return destination
+            temporary = destination.with_name(f"{destination.name}.partial")
+            temporary.mkdir(exist_ok=True)
+            for filename in ("adapter_config.json", "adapter_model.safetensors"):
+                download(f"{source_url.rstrip('/')}/{filename}", temporary / filename)
+            (temporary / "READY").touch()
+            shutil.rmtree(destination, ignore_errors=True)
+            temporary.rename(destination)
     return destination
 
 
