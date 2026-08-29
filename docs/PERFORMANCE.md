@@ -67,8 +67,8 @@ ranks then reported NCCL remote-process errors.
 
 # THE SETTINGS THAT STILL APPLY
 
-These came from Era 1 but they tune the NIC, not the parallelism. `cluster.sh`
-still applies them.
+These came from Era 1 but they tune the NIC, not the parallelism. The
+`training-ops/runtime/china/cluster.sh` launcher still applies them.
 
 # NCCL socket count
 
@@ -107,7 +107,8 @@ left on the wire.
 # Queueing discipline
 
 `fq` gives 87 percent wire efficiency. The default `fq_codel` gives 65 percent.
-`cluster.sh` applies `fq` before it starts the trainer.
+The `training-ops/runtime/china/cluster.sh` launcher applies `fq` before it
+starts the trainer.
 
 BBR congestion control is worse here: 36 percent. Stay on `cubic`.
 

@@ -21,8 +21,8 @@ docker run -d --name glm52-decensor-h200 --restart unless-stopped \
   --ulimit stack=67108864:67108864 \
   -v /data:/data \
   -v "$deployment/cache/vllm":/home/appuser/.cache \
-  -v "$deployment/source/src/prime_rl/inference/vllm/worker/filesystem.py":/app/src/prime_rl/inference/vllm/worker/filesystem.py:ro \
-  -v "$deployment/source/src/prime_rl/inference/vllm/server.py":/app/src/prime_rl/inference/vllm/server.py:ro \
+  -v "$deployment/prime-rl/src/prime_rl/inference/vllm/worker/filesystem.py":/app/src/prime_rl/inference/vllm/worker/filesystem.py:ro \
+  -v "$deployment/prime-rl/src/prime_rl/inference/vllm/server.py":/app/src/prime_rl/inference/vllm/server.py:ro \
   -e CUDA_DEVICE_ORDER=PCI_BUS_ID \
   -e PYTHONUNBUFFERED=1 \
   -e OMP_NUM_THREADS=1 \

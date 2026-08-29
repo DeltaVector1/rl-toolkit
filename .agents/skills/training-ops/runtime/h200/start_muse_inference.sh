@@ -8,14 +8,14 @@ install -d -m 0755 "$runtime/prime_rl/utils"
 install -d -m 0755 "$runtime/muse_file_server-0.1.dist-info"
 install -d -m 0755 /data/muse-glimmer/weight-cache
 install -d -m 0755 /data/muse-glimmer/lora-cache
-install -m 0644 "$deployment/scripts/h200/muse_file_endpoint.py" "$runtime/muse_file_endpoint.py"
-install -m 0644 "$deployment/scripts/h200/muse_file_server.entry_points.txt" \
+install -m 0644 "$deployment/.agents/skills/training-ops/runtime/h200/muse_file_endpoint.py" "$runtime/muse_file_endpoint.py"
+install -m 0644 "$deployment/.agents/skills/training-ops/runtime/h200/muse_file_server.entry_points.txt" \
   "$runtime/muse_file_server-0.1.dist-info/entry_points.txt"
-install -m 0644 "$deployment/scripts/h200/muse_file_server.METADATA" \
+install -m 0644 "$deployment/.agents/skills/training-ops/runtime/h200/muse_file_server.METADATA" \
   "$runtime/muse_file_server-0.1.dist-info/METADATA"
-install -m 0644 "$deployment/scripts/h200/muse_transformers_sitecustomize.py" \
+install -m 0644 "$deployment/.agents/skills/training-ops/runtime/h200/muse_transformers_sitecustomize.py" \
   "$runtime/sitecustomize.py"
-install -m 0644 "$deployment/scripts/h200/muse_replica_proxy.py" \
+install -m 0644 "$deployment/.agents/skills/training-ops/runtime/h200/muse_replica_proxy.py" \
   "$runtime/muse_replica_proxy.py"
 weight_tunnel_ports=$(seq -s, 19001 19128)
 vllm_image=${MUSE_VLLM_IMAGE:-vllm/vllm-openai:nightly-5a4c8d99242e9e069b604d0e9b969e77f7dd501d}
@@ -69,8 +69,8 @@ start_replica() {
   --ipc host \
   --ulimit stack=67108864:67108864 \
   -v /data:/data \
-  -v "$deployment/source/src/prime_rl/inference/vllm/worker/filesystem.py":"$runtime/prime_rl/inference/vllm/worker/filesystem.py":ro \
-  -v "$deployment/source/src/prime_rl/utils/checkpoint_delta.py":"$runtime/prime_rl/utils/checkpoint_delta.py":ro \
+  -v "$deployment/prime-rl/src/prime_rl/inference/vllm/worker/filesystem.py":"$runtime/prime_rl/inference/vllm/worker/filesystem.py":ro \
+  -v "$deployment/prime-rl/src/prime_rl/utils/checkpoint_delta.py":"$runtime/prime_rl/utils/checkpoint_delta.py":ro \
   -e PYTHONPATH="$runtime" \
   -e MUSE_TP_SIZE="$tp_size" \
   -e VLLM_PLUGINS=muse_file_server \

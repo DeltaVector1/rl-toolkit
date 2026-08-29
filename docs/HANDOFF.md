@@ -14,9 +14,9 @@ GRPO group to one replica. A measured 128-request test reached 2,789 output
 tokens per second. Four TP2 replicas reached 1,619 output tokens per second.
 Keep TP1 data-parallel serving for this workload.
 
-The current Muse launcher uses the Transformers model implementation. CUDA
-graphs are disabled because the native and graphed paths did not pass the
-trainer-to-inference comparison. Test any new path in isolation before use.
+The current Muse launcher uses the Transformers model implementation. It uses
+full CUDA graphs for decode-only batches. Prompt and mixed batches do not use
+a full graph. Test any new path in isolation before use.
 
 ## Policy transport
 
@@ -42,8 +42,9 @@ batch at 1008 of 1024 for more than 90 minutes.
 The orchestrator addresses every replica directly. Do not add a shared proxy
 to the production request path. It would remove group-to-replica ownership.
 
-The refusal evaluation is held out. Training uses a balanced periodic sample.
-The full evaluation runs outside training and reports each source separately.
+The refusal evaluation is held out. Training uses the balanced 4,000-prompt
+`training-eval-set`. The `final-eval-set` runs after training and reports each
+source separately.
 
 ## Trainer and inference comparison
 
@@ -65,15 +66,9 @@ match.
 
 ## GLM-5.2 paused work
 
-### Qualification inventory defect
-
-The isolated GLM qualification launcher uses
-`/data/glm52-rl/deployment-glm52-optims`. This path is not in
-`configs/operations.toml`; `training_ops.deploy()` therefore updates
-`/data/glm52-rl/deployment` instead. Do not run or repair this qualification
-from the alternate repository until the path is added to the operations
-inventory. Verify the checksums of every launcher-mounted source file on all
-trainer hosts before each use.
+GLM qualification and production files use the same repository and remote
+deployment path. `training_ops` copies every mounted Prime-RL file before a
+run starts.
 
 The last GLM run trained only attention projections. Future work must train the
 routed expert control, up, and down weights while the router stays frozen.

@@ -58,11 +58,14 @@ judge_port = ports["judge"]
 adapter_port = ports["adapter"]
 batch_port = ports["batch"]
 remote_repo = paths["remote_repository"]
+storage_root = paths["storage_root"]
 run_root = paths["runs"]
-trainer_launcher = f"{remote_repo}/scripts/china/cluster.sh"
-orchestrator_launcher = f"{remote_repo}/scripts/h200/start_orchestrator.sh"
+runtime_root = f"{remote_repo}/.agents/skills/training-ops/runtime"
+trainer_launcher = f"{runtime_root}/china/cluster.sh"
+orchestrator_launcher = f"{runtime_root}/h200/start_orchestrator.sh"
 trainer_container = containers["trainer"]
 orchestrator_container = containers["orchestrator"]
+adapter_container = containers["adapter"]
 glm_inference_container = containers["glm52_inference"]
 muse_inference_container = containers["muse_inference"]
 glm_model = models["glm52"]
@@ -2275,9 +2278,9 @@ def _repair_engine(host: str) -> str:
     engine_container = muse_inference_container if muse_engine else glm_inference_container
     engine_model = muse_model if muse_engine else glm_model
     start_script = (
-        f"{remote_repo}/scripts/h200/start_muse_inference.sh"
+        f"{runtime_root}/h200/start_muse_inference.sh"
         if muse_engine
-        else f"{remote_repo}/scripts/h200/start_inference.sh"
+        else f"{runtime_root}/h200/start_inference.sh"
     )
     startup_grace = 600 if muse_engine else 180
     print(
@@ -2285,7 +2288,7 @@ def _repair_engine(host: str) -> str:
     )
     stop_code, stop_output = _ssh(
         host,
-        f"pkill -f '^bash {remote_repo}/scripts/h200/engine_watchdog.sh$' 2>/dev/null; echo stopped",
+        f"pkill -f '^bash {runtime_root}/h200/engine_watchdog.sh$' 2>/dev/null; echo stopped",
     )
     if stop_code:
         raise RuntimeError(f"cannot stop the watchdog on {host}: {stop_output.strip()}")
@@ -2308,7 +2311,7 @@ def _repair_engine(host: str) -> str:
                 f"MUSE_TP_SIZE={settings['tensor_parallel_size']} "
                 f"PORT={port} MUSE_REPLICA_INDEX={replica} START={start_script} "
                 f"ENGINE_CONTAINER={engine_container}-{replica} "
-                f"bash {remote_repo}/scripts/h200/engine_watchdog.sh "
+                f"bash {runtime_root}/h200/engine_watchdog.sh "
                 f">> /root/engine_watchdog-{replica}.log 2>&1 </dev/null &"
             )
         watchdog_code, watchdog_output = _ssh(
@@ -2319,7 +2322,7 @@ def _repair_engine(host: str) -> str:
             host,
             f"nohup setsid env STARTUP_GRACE={startup_grace} MODEL={engine_model} "
             f"START={start_script} ENGINE_CONTAINER={engine_container} "
-            f"bash {remote_repo}/scripts/h200/engine_watchdog.sh "
+            f"bash {runtime_root}/h200/engine_watchdog.sh "
             ">> /root/engine_watchdog.log 2>&1 </dev/null & disown",
         )
     if watchdog_code:
@@ -2335,7 +2338,7 @@ def _repair_supervisors() -> str:
     for pat, cmd, log in (
         (
             "bash .*tunnel_watchdog.sh",
-            f"nohup setsid env TIMEOUT=20 INTERVAL=45 bash {remote_repo}/scripts/china/tunnel_watchdog.sh "
+            f"nohup setsid env TIMEOUT=20 INTERVAL=45 bash {runtime_root}/china/tunnel_watchdog.sh "
             ">> /data/glm52-rl/tunnel_watchdog.log 2>&1 </dev/null & disown",
             "/data/glm52-rl/tunnel_watchdog.log",
         ),
@@ -2353,7 +2356,7 @@ def _repair_supervisors() -> str:
         muse_engine = _profile()["kind"] == "muse"
         rc, count_text = _ssh(
             h,
-            f"pgrep -f '^bash {remote_repo}/scripts/h200/engine_watchdog.sh$' | wc -l",
+            f"pgrep -f '^bash {runtime_root}/h200/engine_watchdog.sh$' | wc -l",
         )
         if rc or not count_text.strip().isdigit():
             raise RuntimeError(f"cannot read watchdog count on {h}: {count_text.strip()}")
@@ -2368,12 +2371,12 @@ def _repair_supervisors() -> str:
             continue
         stop_code, stop_output = _ssh(
             h,
-            f"pkill -f '^bash {remote_repo}/scripts/h200/engine_watchdog.sh$' 2>/dev/null; true",
+            f"pkill -f '^bash {runtime_root}/h200/engine_watchdog.sh$' 2>/dev/null; true",
         )
         if stop_code:
             raise RuntimeError(f"cannot stop watchdogs on {h}: {stop_output.strip()}")
         if muse_engine:
-            start_script = f"{remote_repo}/scripts/h200/start_muse_inference.sh"
+            start_script = f"{runtime_root}/h200/start_muse_inference.sh"
             watchdogs = []
             for replica, port in enumerate(settings["ports"]):
                 watchdogs.append(
@@ -2382,14 +2385,14 @@ def _repair_supervisors() -> str:
                     f"MUSE_TP_SIZE={settings['tensor_parallel_size']} "
                     f"PORT={port} MUSE_REPLICA_INDEX={replica} START={start_script} "
                     f"ENGINE_CONTAINER={muse_inference_container}-{replica} "
-                    f"bash {remote_repo}/scripts/h200/engine_watchdog.sh "
+                    f"bash {runtime_root}/h200/engine_watchdog.sh "
                     f">> /root/engine_watchdog-{replica}.log 2>&1 </dev/null &"
                 )
             start_code, start_output = _ssh(h, " ".join(watchdogs) + " disown")
         else:
             start_code, start_output = _ssh(
                 h,
-                f"nohup setsid bash {remote_repo}/scripts/h200/engine_watchdog.sh >> /root/engine_watchdog.log 2>&1 </dev/null & disown",
+                f"nohup setsid bash {runtime_root}/h200/engine_watchdog.sh >> /root/engine_watchdog.log 2>&1 </dev/null & disown",
             )
         if start_code:
             raise RuntimeError(f"cannot start watchdogs on {h}: {start_output.strip()}")
@@ -2412,10 +2415,10 @@ def mounted_files() -> list[str]:
     copy baked into the image.
     """
     scripts = (
-        repo_root / "scripts" / "china" / "cluster.sh",
-        repo_root / "scripts" / "h200" / "start_orchestrator.sh",
-        repo_root / "scripts" / "h200" / "start_inference.sh",
-        repo_root / "scripts" / "h200" / "start_muse_inference.sh",
+        repo_root / ".agents" / "skills" / "training-ops" / "runtime" / "china" / "cluster.sh",
+        repo_root / ".agents" / "skills" / "training-ops" / "runtime" / "h200" / "start_orchestrator.sh",
+        repo_root / ".agents" / "skills" / "training-ops" / "runtime" / "h200" / "start_inference.sh",
+        repo_root / ".agents" / "skills" / "training-ops" / "runtime" / "h200" / "start_muse_inference.sh",
     )
     return sorted(set().union(*(_mounts_in(script) for script in scripts)))
 
@@ -2423,27 +2426,20 @@ def mounted_files() -> list[str]:
 def _mounted_on(path: str, host: str) -> bool:
     if host in inference_hosts:
         scripts = (
-            repo_root / "scripts" / "h200" / "start_orchestrator.sh",
-            repo_root / "scripts" / "h200" / "start_inference.sh",
-            repo_root / "scripts" / "h200" / "start_muse_inference.sh",
+            repo_root / ".agents" / "skills" / "training-ops" / "runtime" / "h200" / "start_orchestrator.sh",
+            repo_root / ".agents" / "skills" / "training-ops" / "runtime" / "h200" / "start_inference.sh",
+            repo_root / ".agents" / "skills" / "training-ops" / "runtime" / "h200" / "start_muse_inference.sh",
         )
     else:
-        scripts = (repo_root / "scripts" / "china" / "cluster.sh",)
+        scripts = (repo_root / ".agents" / "skills" / "training-ops" / "runtime" / "china" / "cluster.sh",)
     return any(path in _mounts_in(script) for script in scripts)
 
 
 def _repository_root(name: str = "default") -> str:
-    """Resolve a configured repository name to its remote root."""
-    keys = {
-        "default": "remote_repository",
-        "glm52-qualification": "glm52_qualification_repository",
-    }
-    key = keys.get(name)
-    if key is None:
-        raise Refused(
-            f"unknown repository {name!r}; choose from {', '.join(sorted(keys))}"
-        )
-    root = paths.get(key)
+    """Resolve the configured repository root."""
+    if name != "default":
+        raise Refused(f"unknown repository {name!r}; choose default")
+    root = paths.get("remote_repository")
     if not isinstance(root, str) or not root.startswith("/"):
         raise Refused(f"repository {name!r} is missing from operations config")
     return root.rstrip("/")
@@ -2485,19 +2481,19 @@ def deploy(
     """Push one repository file to its hosts and verify the checksum."""
     repository_root = _repository_root(repository)
     if nodes is None:
-        if path.startswith("source/"):
+        if path.startswith("prime-rl/"):
             nodes = [
                 host
                 for host in dict.fromkeys([*trainer_hosts, *inference_hosts])
                 if _mounted_on(path, host)
             ]
-        elif path.startswith("environments/"):
+        elif path.startswith(("environments/", "evals/")):
             nodes = [orchestrator_host]
-        elif path.startswith(("scripts/h200/", "configs/runtime/")):
+        elif path.startswith((".agents/skills/training-ops/runtime/h200/", "configs/runtime/")):
             nodes = inference_hosts
-        elif path.startswith("scripts/china/"):
+        elif path.startswith(".agents/skills/training-ops/runtime/china/"):
             nodes = trainer_hosts
-        elif path.endswith(("/trainer.toml", "muse-trainer.toml", "muse-parity.toml")):
+        elif path.endswith("/trainer.toml"):
             nodes = trainer_hosts
         elif path.endswith("/orchestrator.toml"):
             nodes = [orchestrator_host]
@@ -2509,7 +2505,7 @@ def deploy(
     local = repo_root / path
     if not local.is_file():
         raise Refused(f"not in the repository: {local}")
-    if path.startswith("source/"):
+    if path.startswith("prime-rl/"):
         unmounted = [host for host in nodes if not _mounted_on(path, host)]
         if unmounted:
             raise Refused(
@@ -2546,7 +2542,7 @@ def deploy(
         + (f", FAILED {bad}" if bad else "")
     )
     if not bad:
-        if path.startswith(("source/", "environments/")) or path.endswith("cluster.sh"):
+        if path.startswith(("prime-rl/", "environments/", "evals/")) or path.endswith("cluster.sh"):
             print(
                 "The running container still holds the old file. Recreate that container for this to take effect."
             )
@@ -2555,6 +2551,61 @@ def deploy(
                 "This runs on the host. Restart the process only if it is a long-running loop."
             )
     return not bad
+
+
+def _start_dependency_inventory(
+    selected: dict, nodes: list[str]
+) -> list[tuple[str, list[str]]]:
+    """Return and validate the files needed before a run's containers start."""
+    inventory: dict[str, list[str]] = {}
+
+    def add(path: str, destinations: list[str]) -> None:
+        destinations = list(dict.fromkeys(_check_host(host) for host in destinations))
+        if not destinations:
+            raise Refused(f"no configured host for start dependency {path}")
+        current = inventory.setdefault(path, [])
+        for host in destinations:
+            if host not in current:
+                current.append(host)
+
+    def add_files(root: str, destinations: list[str], suffix: str | None = None) -> None:
+        base = repo_root / root
+        if not base.is_dir():
+            raise Refused(f"missing start dependency directory: {base}")
+        for local in sorted(base.rglob("*")):
+            if local.is_file() and (suffix is None or local.suffix == suffix):
+                add(local.relative_to(repo_root).as_posix(), destinations)
+
+    trainer_destinations = list(dict.fromkeys([*nodes, trainer_head]))
+    add_files(
+        ".agents/skills/training-ops/runtime/china",
+        trainer_destinations,
+    )
+    add_files(
+        ".agents/skills/training-ops/runtime/h200",
+        inference_hosts,
+    )
+
+    configured_hosts = list(dict.fromkeys([*trainer_hosts, *inference_hosts]))
+    for path in mounted_files():
+        if not path.startswith("prime-rl/"):
+            continue
+        destinations = [host for host in configured_hosts if _mounted_on(path, host)]
+        add(path, destinations)
+
+    add(selected["trainer"], nodes)
+    add(selected["orchestrator"], [orchestrator_host])
+    for root in (
+        "environments/decensor/src",
+        "environments/ornith/src",
+        "evals/refusals-classifier",
+    ):
+        add_files(root, [orchestrator_host], suffix=".py")
+
+    missing = [path for path in inventory if not (repo_root / path).is_file()]
+    if missing:
+        raise Refused("missing start dependencies: " + ", ".join(missing))
+    return list(inventory.items())
 
 
 def _copy_resume_adapter(path: str, nodes: list[str]) -> None:
@@ -2652,12 +2703,7 @@ def start(
     nodes = [_check_host(h) for h in (nodes or trainer_hosts)]
     if trainer_head in nodes:  # rank 0 is the rendezvous master and carries the readable log
         nodes = [trainer_head] + [n for n in nodes if n != trainer_head]
-    required_files = (
-        ("scripts/china/cluster.sh", nodes),
-        (selected["trainer"], nodes),
-        (selected["orchestrator"], [orchestrator_host]),
-        ("scripts/h200/start_orchestrator.sh", [orchestrator_host]),
-    )
+    required_files = _start_dependency_inventory(selected, nodes)
     for path, destinations in required_files:
         if not deploy(path, nodes=destinations):
             raise RuntimeError(f"failed to deploy {path}")
@@ -2678,9 +2724,19 @@ def start(
     if missing_trainer_config:
         raise Refused(f"missing trainer config {trainer_config} on {missing_trainer_config}")
     trainer_nodes = " ".join(n.lstrip("n") for n in nodes)
+    runtime_env = (
+        f"deployment_root={shlex.quote(remote_repo)} "
+        f"storage_root={shlex.quote(storage_root)} "
+        f"runs_path={shlex.quote(run_root)} "
+        f"trainer_container_name={shlex.quote(trainer_container)} "
+        f"master_node_id={shlex.quote(trainer_head.removeprefix('n'))} "
+        f"adapter_node_id={shlex.quote(trainer_head.removeprefix('n'))} "
+        f"adapter_service_port={adapter_port} "
+        f"adapter_container_name={shlex.quote(adapter_container)}"
+    )
     if muse_run:
         env = (
-            f"trainer_nodes='{trainer_nodes}' RUN={run} RUN_NAME={name} "
+            f"{runtime_env} trainer_nodes='{trainer_nodes}' RUN={run} RUN_NAME={name} "
             f"TRAINER_CONFIG={trainer_config} PRIME_EP_PROFILE=0 PRIME_EP_AC_CACHE=0 "
             "PRIME_INT4_COMBINE_ROUNDS=1 PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD=0 "
             "TRANSFORMERS_OVERRIDE_DIR=/data/muse-glimmer/transformers "
@@ -2717,7 +2773,7 @@ def start(
             )
     else:
         env = (
-            f"trainer_nodes='{trainer_nodes}' RUN={run} RUN_NAME={name} "
+            f"{runtime_env} trainer_nodes='{trainer_nodes}' RUN={run} RUN_NAME={name} "
             f"TRAINER_CONFIG={trainer_config} PRIME_EP_PROFILE=0 PRIME_EP_AC_CACHE=0 "
             "PRIME_INT4_COMBINE_ROUNDS=8 PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD=1"
         )
@@ -2727,12 +2783,27 @@ def start(
         results = _fan(
             nodes,
             lambda h: _ssh(
-                h, f"{env} bash {trainer_launcher} trainer >/dev/null 2>&1; echo done", 300
+                h,
+                f"node_id={shlex.quote(h.removeprefix('n'))} {env} "
+                f"bash {trainer_launcher} trainer >/dev/null 2>&1; echo done",
+                300,
             ),
         )
         failed = [host for host, (code, _output) in results.items() if code]
         if failed:
             raise RuntimeError(f"trainer start failed on {failed}")
+
+    def launch_adapter():
+        print(f"starting adapter server on {trainer_head}")
+        node_id = trainer_head.removeprefix("n")
+        rc, out = _ssh(
+            trainer_head,
+            f"node_id={shlex.quote(node_id)} {runtime_env} RUN={shlex.quote(run)} "
+            f"bash {trainer_launcher} adapter-http >/dev/null 2>&1; echo done",
+            300,
+        )
+        if rc:
+            raise RuntimeError(f"adapter server start failed on {trainer_head}: {out}")
 
     def launch_orch():
         print(f"starting edge orchestrator on {orchestrator_host}")
@@ -2769,6 +2840,7 @@ def start(
         raise RuntimeError(f"old trainer stop failed on {stop_failures}")
     time.sleep(20)
 
+    launch_adapter()
     if mode == "cold":
         launch_orch()
         launch_trainer()
@@ -2787,7 +2859,7 @@ def start(
         _remote_ok(
             trainer_head,
             f"nohup setsid env RUN={run} RUN_NAME={name} INTERVAL=120 "
-            f"bash {remote_repo}/scripts/china/run_supervisor.sh >> /data/glm52-rl/run_supervisor.log 2>&1 </dev/null & disown",
+            f"bash {runtime_root}/china/run_supervisor.sh >> /data/glm52-rl/run_supervisor.log 2>&1 </dev/null & disown",
             "run supervisor start",
         )
         time.sleep(3)
@@ -2860,16 +2932,22 @@ def qualify(
             + "; use mode='restart' only when replacing it is intended"
         )
 
-    repository = "glm52-qualification" if selected["kind"] == "glm52" else "default"
-    repository_root = _repository_root(repository)
-    deploy_options = {} if repository == "default" else {"repository": repository}
-    for path in ("scripts/china/cluster.sh", relative_config):
+    repository_root = _repository_root()
+    deploy_options = {}
+    for path in (".agents/skills/training-ops/runtime/china/cluster.sh", relative_config):
         if not deploy(path, nodes=nodes, **deploy_options):
             raise RuntimeError(f"failed to deploy {path}")
 
     trainer_nodes = " ".join(host.removeprefix("n") for host in nodes)
+    runtime_env = (
+        f"deployment_root={shlex.quote(repository_root)} "
+        f"storage_root={shlex.quote(storage_root)} "
+        f"runs_path={shlex.quote(run_root)} "
+        f"trainer_container_name={shlex.quote(trainer_container)} "
+        f"master_node_id={shlex.quote(trainer_head.removeprefix('n'))}"
+    )
     env = (
-        f"trainer_nodes='{trainer_nodes}' RUN={shlex.quote(name)} "
+        f"{runtime_env} trainer_nodes='{trainer_nodes}' RUN={shlex.quote(name)} "
         f"RUN_NAME=run_{shlex.quote(name)} "
         f"TRAINER_CONFIG={repository_root}/{relative_config} "
         "PRIME_EP_PROFILE=0 PRIME_EP_AC_CACHE=0 PRIME_INT4_COMBINE_ROUNDS=1 "
@@ -2898,7 +2976,9 @@ def qualify(
         nodes,
         lambda host: _ssh(
             host,
-            f"{env} bash {repository_root}/scripts/china/cluster.sh trainer >/dev/null 2>&1; echo done",
+            f"node_id={shlex.quote(host.removeprefix('n'))} {env} "
+            f"bash {repository_root}/.agents/skills/training-ops/runtime/china/cluster.sh "
+            "trainer >/dev/null 2>&1; echo done",
             300,
         ),
     )

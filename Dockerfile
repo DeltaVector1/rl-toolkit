@@ -1,21 +1,21 @@
 FROM prime-rl:glm52-decensor
 USER root
-COPY --chmod=644 source/packages/prime-rl-configs/src/prime_rl/configs/shared.py /app/packages/prime-rl-configs/src/prime_rl/configs/shared.py
-COPY --chmod=644 source/packages/prime-rl-configs/src/prime_rl/configs/trainer.py /app/packages/prime-rl-configs/src/prime_rl/configs/trainer.py
-COPY --chmod=644 source/packages/prime-rl-configs/src/prime_rl/configs/orchestrator.py /app/packages/prime-rl-configs/src/prime_rl/configs/orchestrator.py
-COPY --chmod=644 source/packages/prime-rl-configs/src/prime_rl/configs/rl.py /app/packages/prime-rl-configs/src/prime_rl/configs/rl.py
-COPY --chmod=644 source/src/prime_rl/trainer/rl/train.py /app/src/prime_rl/trainer/rl/train.py
-COPY --chmod=644 source/src/prime_rl/trainer/model.py /app/src/prime_rl/trainer/model.py
-COPY --chmod=644 source/src/prime_rl/trainer/parallel_dims.py /app/src/prime_rl/trainer/parallel_dims.py
-COPY --chmod=644 source/src/prime_rl/trainer/fp8_checkpoint.py /app/src/prime_rl/trainer/fp8_checkpoint.py
-COPY --chmod=644 source/src/prime_rl/trainer/mxfp4.py /app/src/prime_rl/trainer/mxfp4.py
-COPY --chmod=644 source/src/prime_rl/trainer/models/layers/fp8_ada.py /app/src/prime_rl/trainer/models/layers/fp8_ada.py
-COPY --chmod=644 source/src/prime_rl/trainer/distributed/expert_parallel.py /app/src/prime_rl/trainer/distributed/expert_parallel.py
-COPY --chmod=644 source/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py /app/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py
-COPY --chmod=644 source/src/prime_rl/trainer/models/glm_moe_dsa/sparse_mla_attention.py /app/src/prime_rl/trainer/models/glm_moe_dsa/sparse_mla_attention.py
-COPY --chmod=644 source/src/prime_rl/trainer/models/layers/checkpointing.py /app/src/prime_rl/trainer/models/layers/checkpointing.py
-COPY --chmod=644 source/src/prime_rl/trainer/models/layers/lora/multi_linear.py /app/src/prime_rl/trainer/models/layers/lora/multi_linear.py
-COPY --chmod=644 source/src/prime_rl/trainer/models/layers/moe.py /app/src/prime_rl/trainer/models/layers/moe.py
+COPY --chmod=644 prime-rl/packages/prime-rl-configs/src/prime_rl/configs/shared.py /app/packages/prime-rl-configs/src/prime_rl/configs/shared.py
+COPY --chmod=644 prime-rl/packages/prime-rl-configs/src/prime_rl/configs/trainer.py /app/packages/prime-rl-configs/src/prime_rl/configs/trainer.py
+COPY --chmod=644 prime-rl/packages/prime-rl-configs/src/prime_rl/configs/orchestrator.py /app/packages/prime-rl-configs/src/prime_rl/configs/orchestrator.py
+COPY --chmod=644 prime-rl/packages/prime-rl-configs/src/prime_rl/configs/rl.py /app/packages/prime-rl-configs/src/prime_rl/configs/rl.py
+COPY --chmod=644 prime-rl/src/prime_rl/trainer/rl/train.py /app/src/prime_rl/trainer/rl/train.py
+COPY --chmod=644 prime-rl/src/prime_rl/trainer/model.py /app/src/prime_rl/trainer/model.py
+COPY --chmod=644 prime-rl/src/prime_rl/trainer/parallel_dims.py /app/src/prime_rl/trainer/parallel_dims.py
+COPY --chmod=644 prime-rl/src/prime_rl/trainer/fp8_checkpoint.py /app/src/prime_rl/trainer/fp8_checkpoint.py
+COPY --chmod=644 prime-rl/src/prime_rl/trainer/mxfp4.py /app/src/prime_rl/trainer/mxfp4.py
+COPY --chmod=644 prime-rl/src/prime_rl/trainer/models/layers/fp8_ada.py /app/src/prime_rl/trainer/models/layers/fp8_ada.py
+COPY --chmod=644 prime-rl/src/prime_rl/trainer/distributed/expert_parallel.py /app/src/prime_rl/trainer/distributed/expert_parallel.py
+COPY --chmod=644 prime-rl/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py /app/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py
+COPY --chmod=644 prime-rl/src/prime_rl/trainer/models/glm_moe_dsa/sparse_mla_attention.py /app/src/prime_rl/trainer/models/glm_moe_dsa/sparse_mla_attention.py
+COPY --chmod=644 prime-rl/src/prime_rl/trainer/models/layers/checkpointing.py /app/src/prime_rl/trainer/models/layers/checkpointing.py
+COPY --chmod=644 prime-rl/src/prime_rl/trainer/models/layers/lora/multi_linear.py /app/src/prime_rl/trainer/models/layers/lora/multi_linear.py
+COPY --chmod=644 prime-rl/src/prime_rl/trainer/models/layers/moe.py /app/src/prime_rl/trainer/models/layers/moe.py
 RUN sed -i \
     -e 's/nn.Parameter(self.to_sharded_dtensor(sharded_param))/nn.Parameter(self.to_sharded_dtensor(sharded_param), requires_grad=param.requires_grad)/' \
     -e 's/self.to_sharded_post_forward_dtensor(sharded_post_forward_tensor)$/self.to_sharded_post_forward_dtensor(sharded_post_forward_tensor), requires_grad=self.sharded_param.requires_grad/' \
@@ -25,13 +25,13 @@ RUN sed -i \
     -e '/IS_ROCM = tl.constexpr(is_ROCM())/a\\    HAS_MXFP8_PTX = tl.constexpr(is_sm_at_least_100() and not is_ROCM())' \
     -e 's/USE_PTX=not IS_ROCM/USE_PTX=HAS_MXFP8_PTX/g' \
     /app/.venv/lib/python3.12/site-packages/torchao/prototype/mx_formats/kernels.py
-COPY --chmod=644 source/src/prime_rl/utils/client.py /app/src/prime_rl/utils/client.py
-COPY --chmod=644 source/src/prime_rl/utils/monitor/__init__.py /app/src/prime_rl/utils/monitor/__init__.py
-COPY --chmod=644 source/src/prime_rl/utils/monitor/swanlab.py /app/src/prime_rl/utils/monitor/swanlab.py
-COPY --chmod=644 source/src/prime_rl/orchestrator/orchestrator.py /app/src/prime_rl/orchestrator/orchestrator.py
-COPY --chmod=644 source/src/prime_rl/orchestrator/dispatcher.py /app/src/prime_rl/orchestrator/dispatcher.py
-COPY --chmod=644 source/src/prime_rl/orchestrator/watcher.py /app/src/prime_rl/orchestrator/watcher.py
-COPY --chmod=644 source/src/prime_rl/inference/vllm/worker/filesystem.py /app/src/prime_rl/inference/vllm/worker/filesystem.py
-COPY --chmod=644 source/src/prime_rl/inference/vllm/server.py /app/src/prime_rl/inference/vllm/server.py
-COPY --chmod=644 source/deps/verifiers/verifiers/v1/harnesses/null/harness.py /app/deps/verifiers/verifiers/v1/harnesses/null/harness.py
+COPY --chmod=644 prime-rl/src/prime_rl/utils/client.py /app/src/prime_rl/utils/client.py
+COPY --chmod=644 prime-rl/src/prime_rl/utils/monitor/__init__.py /app/src/prime_rl/utils/monitor/__init__.py
+COPY --chmod=644 prime-rl/src/prime_rl/utils/monitor/swanlab.py /app/src/prime_rl/utils/monitor/swanlab.py
+COPY --chmod=644 prime-rl/src/prime_rl/orchestrator/orchestrator.py /app/src/prime_rl/orchestrator/orchestrator.py
+COPY --chmod=644 prime-rl/src/prime_rl/orchestrator/dispatcher.py /app/src/prime_rl/orchestrator/dispatcher.py
+COPY --chmod=644 prime-rl/src/prime_rl/orchestrator/watcher.py /app/src/prime_rl/orchestrator/watcher.py
+COPY --chmod=644 prime-rl/src/prime_rl/inference/vllm/worker/filesystem.py /app/src/prime_rl/inference/vllm/worker/filesystem.py
+COPY --chmod=644 prime-rl/src/prime_rl/inference/vllm/server.py /app/src/prime_rl/inference/vllm/server.py
+COPY --chmod=644 prime-rl/deps/verifiers/verifiers/v1/harnesses/null/harness.py /app/deps/verifiers/verifiers/v1/harnesses/null/harness.py
 USER appuser

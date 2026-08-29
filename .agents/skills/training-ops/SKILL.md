@@ -26,11 +26,15 @@ paths, containers, profiles, trend settings, and performance requirements.
 Do not add a host or replica count to Python code.
 
 `configs/current` contains the active run profile. `configs/paused` contains
-profiles that are not running. `configs/qualification` contains isolated
-trainer or inference checks.
+profiles that are not running. Optional trainer-only profiles must be
+registered in `configs/operations.toml`.
 
 Missing configuration is an error. Do not guess a host, run, model, config,
 or metric location.
+
+Operational launchers are in `.agents/skills/training-ops/runtime/`, grouped
+under `china/` and `h200/`. Use `training_ops.deploy()` for launcher changes;
+do not create a separate scripts directory.
 
 ## Read commands
 
@@ -56,9 +60,8 @@ process.
 ## Write commands
 
 ```python
-training_ops.deploy("source/path.py")
+training_ops.deploy("prime-rl/path.py")
 training_ops.start("muse19", profile="current")
-training_ops.qualify("muse-qualification")
 training_ops.repair("tunnels")
 training_ops.repair("engine:h200a")
 training_ops.repair("supervisors")

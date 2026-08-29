@@ -6,13 +6,13 @@ from typing import Any
 
 from datasets import load_dataset
 
-from decensor_v1.text import WORD_REQUIREMENTS
+from decensor_v1.text import word_requirements
 
 
-DECENSOR_DATASET = "NewEden/RL-seed-Decensor"
-MARKDOWN_SYSTEM_PROMPTS_DATASET = "Delta-Vector/Tauri-RL-Markdown-System-V2"
-PLAINTEXT_SYSTEM_PROMPTS_DATASET = "Delta-Vector/Tauri-RL-Plaintext-System-V2"
-STYLE_PROMPTS_DATASET = "Delta-Vector/Tauri-RL-Styles"
+decensor_dataset = "NewEden/RL-seed-Decensor"
+markdown_system_prompts_dataset = "Delta-Vector/Tauri-RL-Markdown-System-V2"
+plaintext_system_prompts_dataset = "Delta-Vector/Tauri-RL-Plaintext-System-V2"
+style_prompts_dataset = "Delta-Vector/Tauri-RL-Styles"
 
 
 def convert_sharegpt_messages(convo: list[dict]) -> list[dict[str, str]]:
@@ -141,14 +141,14 @@ def _load_text_column(dataset_name: str, column: str) -> list[str]:
 
 def load_system_prompts() -> dict[str, list[str]]:
     return {
-        "markdown": _load_text_column(MARKDOWN_SYSTEM_PROMPTS_DATASET, "prompt"),
-        "plaintext": _load_text_column(PLAINTEXT_SYSTEM_PROMPTS_DATASET, "prompt"),
-        "style": _load_text_column(STYLE_PROMPTS_DATASET, "text"),
+        "markdown": _load_text_column(markdown_system_prompts_dataset, "prompt"),
+        "plaintext": _load_text_column(plaintext_system_prompts_dataset, "prompt"),
+        "style": _load_text_column(style_prompts_dataset, "text"),
     }
 
 
 def iter_decensor_rows():
-    yield from load_dataset(DECENSOR_DATASET, split="train", streaming=True)
+    yield from load_dataset(decensor_dataset, split="train", streaming=True)
 
 
 def build_decensor_pool(
@@ -250,7 +250,7 @@ def build_rows(
         requirement_name = ""
         word_target = 0
         if enable_length_prompts:
-            requirement_name = WORD_REQUIREMENTS[idx % len(WORD_REQUIREMENTS)][0]
+            requirement_name = word_requirements[idx % len(word_requirements)][0]
             sys_parts.append(
                 f"<Response-Length>\n{requirement_name}\n</Response-Length>"
             )

@@ -1465,7 +1465,7 @@ def _validate_flash_attn_4_installed() -> None:
     if num_lines < 1000:
         raise ValueError(
             "flash-attn-cute has probably been overwritten by flash-attn, "
-            "run `scripts/fix-flash-attn-cute.sh` to fix this behaviour."
+            "rebuild the trainer image with the required FlashAttention package."
         )
 
 

@@ -1,23 +1,5 @@
 #!/usr/bin/env bash
-# Restart the local vLLM engine when it dies. Runs ON each H200 host.
-#
-# vLLM's EngineCore can die while the CONTAINER stays up: a worker RPC times
-# out ("TimeoutError: RPC call to sample_tokens timed out", preceded by "No
-# available shared memory broadcast block found in 60 seconds"), EngineCore
-# raises EngineDeadError, the API server shuts down, and docker still reports
-# the container as Up with the GPUs at 4 MiB. Observed 2026-08-06 03:13:30 on
-# both hosts with 63 requests in flight; the run then sat dead for 2.6 hours.
-#
-# The tunnel watchdog on n82 CANNOT see this -- the SSH forward still accepts
-# connections, so from n82 a dead engine is indistinguishable from a healthy
-# one until the request fails. And n82 has no ssh access to these hosts, so it
-# could not restart anything anyway. Hence a local self-healing loop.
-#
-# Neither container "Up" NOR /v1/models is a sufficient health signal. Observed
-# 2026-08-06 06:05 on h200a: models=200 while gen=000, "Running: 64" with
-# "throughput: 0.0" -- the API server was alive and answering while EngineCore
-# was hung and generating nothing. Only a real completion proves the engine
-# works, so that is what this probes.
+# Restart the local vLLM engine when a real completion fails.
 set -uo pipefail
 
 PORT=${PORT:-8000}
@@ -44,7 +26,7 @@ BUSY_STALL_FAILS_BEFORE_RESTART=${BUSY_STALL_FAILS_BEFORE_RESTART:-5}
 RESIDENT_ENGINE_MIN_MIB=${RESIDENT_ENGINE_MIN_MIB:-65536}
 # Tests can replace these commands without changing this file.
 # against a fake launcher instead of re-implementing its decisions.
-START=${START:-/data/glm52-rl/deployment/scripts/h200/start_inference.sh}
+START=${START:-/data/glm52-rl/deployment/.agents/skills/training-ops/runtime/h200/start_inference.sh}
 ENGINE_CONTAINER=${ENGINE_CONTAINER:-glm52-decensor-h200}
 RELOAD_TRIES=${RELOAD_TRIES:-40}
 RELOAD_WAIT=${RELOAD_WAIT:-30}

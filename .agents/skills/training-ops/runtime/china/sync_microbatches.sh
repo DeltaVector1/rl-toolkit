@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-run_dir=${RUN_DIR:?set RUN_DIR}
-nodes=${NODES:-"10.92.20.76 10.92.20.77 10.92.20.78 10.92.20.80 10.92.20.83 10.92.20.84 10.92.20.85"}
-interval=${INTERVAL:-1}
+run_dir=${run_dir:?set run_dir}
+nodes=${nodes:?set nodes}
+interval=${interval:-1}
 ssh_opts=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
 mkdir -p "$run_dir"
 exec 9>"$run_dir/.microbatch-sync.lock"
@@ -54,6 +54,6 @@ scan() {
 
 while true; do
   scan
-  [ "${ONCE:-0}" = 1 ] && exit
+  [ "${once:-0}" = 1 ] && exit
   sleep "$interval"
 done

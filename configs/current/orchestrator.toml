@@ -103,8 +103,7 @@ max_completion_tokens = 8192
 name = "refusals-classifier-eval"
 pool = { type = "static", num_workers = 16 }
 env.taskset.id = "refusals-classifier-eval-v1"
-env.taskset.dataset_path = "/data/glm52-rl/refusals-classifier-eval/periodic-4000.jsonl"
-env.taskset.expected_sha256 = "fec3d0af70a25e4fc95e9fccdb9437452bc15e02502a1fb76da6cf5d27b0edda"
+env.taskset.evaluation_set = "training"
 env.taskset.num_examples = -1
 env.agent.harness = { id = "null", runtime = { type = "subprocess" } }
 env.agent.max_output_tokens = 8192

@@ -61,9 +61,8 @@ The current profile trains Muse-Glimmer-30B with GRPO. It uses BF16 base
 weights and a rank-128 LoRA adapter on all supported attention and MLP linear
 weights.
 
-GLM-5.2 optimization work uses the sibling worktree
-`/home/mango/Misc/data-gen/glm52-decensor-glm52-optims` and its qualification
-profiles. Do not infer a GLM topology from the Muse profile below.
+GLM-5.2 is paused. Its code and settings are in this repository. Do not infer
+a GLM topology from the Muse profile below.
 
 - Eight trainer hosts use 64 RTX 4090 GPUs.
 - One inference host uses eight independent H200 replicas.
@@ -117,10 +116,34 @@ minutes. Do not start a background monitor.
 
 - `configs/current/` contains the current run settings.
 - `configs/paused/` contains paused settings.
-- `configs/qualification/` contains trainer-only settings.
 - `docs/RUNBOOK.md` contains commands.
 - `docs/HANDOFF.md` contains design history and past faults.
 - `docs/PERFORMANCE.md` contains measurements.
 - `docs/PINS.md` contains version pins.
 - `.agents/skills/training-ops/references/errors.md` maps known faults to
   repairs.
+
+## Repository preferences
+
+- Keep one project in each `environments/<name>/` directory. Do not mix
+  Ornith, decensor, or another project in one environment.
+- Put evaluation code under `evals/<name>/`. Keep evaluation datasets on the
+  Hugging Face Hub. Do not keep prompt copies in the repository.
+- Put internal operational launchers in
+  `.agents/skills/training-ops/runtime/`, grouped by host role when needed.
+  Do not leave launchers in a public `scripts/` directory.
+- Treat scripts, temporary configs, tests, reports, and scratch files as
+  disposable. Delete each item when its task is complete. Do not keep a
+  one-time script for later reuse without a current owner-approved use.
+- Load datasets from the Hugging Face Hub or the configured cache. Do not
+  copy prompt datasets into the repository.
+- Use simple English and simple file names. Do not add new all-caps
+  identifiers. Do not hide fallback paths, fallback metrics, or metric
+  changes. Report the selected path and metric source.
+- Keep comments short and useful. Do not add verbose comments, README files,
+  or extra Markdown unless the owner asks for them.
+- Clean the worktree after each task. Remove unused files, old configs, and
+  generated output before handoff.
+- If a requested feature cannot be used as requested, stop and ask the owner
+  before disabling it or choosing a fallback. Ask when a file, setting, or
+  dataset purpose is unclear. Do not silently replace settings such as MTP.

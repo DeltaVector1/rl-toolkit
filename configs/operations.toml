@@ -14,14 +14,15 @@ adapter = 8100
 batch = 29620
 
 [paths]
+storage_root = "/data/glm52-rl"
 remote_repository = "/data/glm52-rl/deployment"
-glm52_qualification_repository = "/data/glm52-rl/deployment-glm52-optims"
 runs = "/data/glm52-rl/runs"
 adapter_bucket = "hf://buckets/NewEden/muse-lora-checkpoints"
 
 [containers]
 trainer = "glm52-decensor-trainer"
 orchestrator = "glm52-decensor-orchestrator"
+adapter = "glm52-adapter-http"
 glm52_inference = "glm52-decensor-h200"
 muse_inference = "muse-glimmer-h200"
 
@@ -48,14 +49,6 @@ orchestrator = "configs/current/orchestrator.toml"
 kind = "glm52"
 trainer = "configs/paused/glm52/trainer.toml"
 orchestrator = "configs/paused/glm52/orchestrator.toml"
-
-[profiles.muse-qualification]
-kind = "muse"
-trainer = "configs/qualification/muse-trainer.toml"
-
-[profiles.muse-parity]
-kind = "muse"
-trainer = "configs/qualification/muse-parity.toml"
 
 [reward]
 minimum_steps = 10

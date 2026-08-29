@@ -4,7 +4,7 @@ import difflib
 import re
 from typing import Any
 
-WORD_REQUIREMENTS: tuple[tuple[str, int, int, int], ...] = (
+word_requirements: tuple[tuple[str, int, int, int], ...] = (
     ("Be verbose", 1400, 800, 2000),
     ("Respond tersely", 163, 75, 250),
     ("Respond in a medium-length response", 300, 200, 400),
@@ -311,7 +311,7 @@ def word_band(requirement: str, target: int = 0) -> tuple[int, int, int]:
     if target > 0:
         half = round(target * stated_range_fraction)
         return target, target - half, target + half
-    for name, static_target, minimum, maximum in WORD_REQUIREMENTS:
+    for name, static_target, minimum, maximum in word_requirements:
         if name == requirement:
             return static_target, minimum, maximum
     return 300, 200, 400

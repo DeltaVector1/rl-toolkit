@@ -26,7 +26,7 @@ PY
 )
 
 if grep -q 'refusals-classifier-eval-v1' "$config_file"; then
-  bash "$deployment/scripts/h200/start_refusals_classifier.sh"
+  bash "$deployment/.agents/skills/training-ops/runtime/h200/start_refusals_classifier.sh"
 fi
 
 tunnel() { # local_port  target_host:port  ssh_target  [compress]
@@ -68,23 +68,21 @@ sudo docker run -d --name glm52-decensor-orchestrator \
   --network host --restart no \
   --env-file /data/trinity/training.env \
   -e VLLM_API_KEY=unused \
-  -e PYTHONPATH="$deployment/environments/decensor/src":/app/src \
+  -e PYTHONPATH="$deployment/environments/decensor/src:$deployment/environments/ornith/src:$deployment/evals/refusals-classifier/src:/app/src" \
   -e HF_HOME=/data/glm52-rl/hf-cache \
-  -e HF_HUB_OFFLINE=1 \
-  -e HF_DATASETS_OFFLINE=1 \
   -v /data/glm52-rl:/data/glm52-rl \
   -v /data/muse-glimmer/model:/data/muse-glimmer/model:ro \
-  -v "$deployment/source/deps/renderers/renderers/base.py":/app/deps/renderers/renderers/base.py:ro \
-  -v "$deployment/source/deps/renderers/renderers/client.py":/app/deps/renderers/renderers/client.py:ro \
-  -v "$deployment/source/deps/verifiers/verifiers/v1/clients/eval.py":/app/deps/verifiers/verifiers/v1/clients/eval.py:ro \
-  -v "$deployment/source/src/prime_rl/orchestrator/algo/grpo.py":/app/src/prime_rl/orchestrator/algo/grpo.py:ro \
-  -v "$deployment/source/src/prime_rl/orchestrator/dispatcher.py":/app/src/prime_rl/orchestrator/dispatcher.py:ro \
-  -v "$deployment/source/src/prime_rl/orchestrator/orchestrator.py":/app/src/prime_rl/orchestrator/orchestrator.py:ro \
-  -v "$deployment/source/src/prime_rl/orchestrator/train_sink.py":/app/src/prime_rl/orchestrator/train_sink.py:ro \
-  -v "$deployment/source/src/prime_rl/orchestrator/train_source.py":/app/src/prime_rl/orchestrator/train_source.py:ro \
-  -v "$deployment/source/src/prime_rl/orchestrator/watcher.py":/app/src/prime_rl/orchestrator/watcher.py:ro \
-  -v "$deployment/source/src/prime_rl/utils/client.py":/app/src/prime_rl/utils/client.py:ro \
-  -v "$deployment/source/src/prime_rl/utils/checkpoint_delta.py":/app/src/prime_rl/utils/checkpoint_delta.py:ro \
+  -v "$deployment/prime-rl/deps/renderers/renderers/base.py":/app/deps/renderers/renderers/base.py:ro \
+  -v "$deployment/prime-rl/deps/renderers/renderers/client.py":/app/deps/renderers/renderers/client.py:ro \
+  -v "$deployment/prime-rl/deps/verifiers/verifiers/v1/clients/eval.py":/app/deps/verifiers/verifiers/v1/clients/eval.py:ro \
+  -v "$deployment/prime-rl/src/prime_rl/orchestrator/algo/grpo.py":/app/src/prime_rl/orchestrator/algo/grpo.py:ro \
+  -v "$deployment/prime-rl/src/prime_rl/orchestrator/dispatcher.py":/app/src/prime_rl/orchestrator/dispatcher.py:ro \
+  -v "$deployment/prime-rl/src/prime_rl/orchestrator/orchestrator.py":/app/src/prime_rl/orchestrator/orchestrator.py:ro \
+  -v "$deployment/prime-rl/src/prime_rl/orchestrator/train_sink.py":/app/src/prime_rl/orchestrator/train_sink.py:ro \
+  -v "$deployment/prime-rl/src/prime_rl/orchestrator/train_source.py":/app/src/prime_rl/orchestrator/train_source.py:ro \
+  -v "$deployment/prime-rl/src/prime_rl/orchestrator/watcher.py":/app/src/prime_rl/orchestrator/watcher.py:ro \
+  -v "$deployment/prime-rl/src/prime_rl/utils/client.py":/app/src/prime_rl/utils/client.py:ro \
+  -v "$deployment/prime-rl/src/prime_rl/utils/checkpoint_delta.py":/app/src/prime_rl/utils/checkpoint_delta.py:ro \
   --entrypoint /app/.venv/bin/orchestrator "$image" \
   @ "$config_file"
 echo "orchestrator started on $(hostname) with $(basename "$config_file")"
@@ -94,7 +92,7 @@ echo "orchestrator started on $(hostname) with $(basename "$config_file")"
 # as any trainer worker is gone, so the run cannot accumulate unusable batches.
 pkill -f '[t]rainer_failure_watchdog.sh' 2>/dev/null || true
 nohup setsid env RUN="$RUN" RUN_NAME="$RUN_NAME" \
-  bash "$deployment/scripts/h200/trainer_failure_watchdog.sh" \
+  bash "$deployment/.agents/skills/training-ops/runtime/h200/trainer_failure_watchdog.sh" \
   >>"/data/glm52-rl/trainer-failure-watchdog-$RUN.log" 2>&1 </dev/null &
 trainer_watchdog_pid=$!
 sleep 1
@@ -152,7 +150,7 @@ if [ "$transport" = filesystem ]; then
     DEST_HOST=china-trainer \
     ADAPTER_SOURCE_BASE="http://127.0.0.1:18100/$RUN/$RUN_NAME" \
     ADAPTER_ADMIN_URLS="$adapter_admin_urls" \
-    "$deployment/scripts/h200/sync_rollout_batches.sh" \
+    "$deployment/.agents/skills/training-ops/runtime/h200/sync_rollout_batches.sh" \
     >>"/data/glm52-rl/batch-sync-$RUN.log" 2>&1 </dev/null &
   publisher_pid=$!
   sleep 1

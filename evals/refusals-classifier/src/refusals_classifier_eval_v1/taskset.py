@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-import hashlib
-import json
-from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
+from datasets import load_dataset
 import verifiers.v1 as vf
 
 from refusals_classifier_eval_v1.client import classify_response
+
+
+refusals_classifier_dataset = "NewEden/refusals-classifier-eval"
 
 
 class RefusalsClassifierEvalData(vf.TaskData):
@@ -16,7 +17,6 @@ class RefusalsClassifierEvalData(vf.TaskData):
     source_row: int
     source_id: str | None = None
     category: str = "unknown"
-    suite_sha256: str
 
 
 class RefusalsClassifierEvalTaskConfig(vf.TaskConfig):
@@ -28,8 +28,7 @@ class RefusalsClassifierEvalTaskConfig(vf.TaskConfig):
 
 
 class RefusalsClassifierEvalTasksetConfig(vf.TasksetConfig):
-    dataset_path: str = "/data/glm52-rl/refusals-classifier-eval/suite.jsonl"
-    expected_sha256: str = ""
+    evaluation_set: Literal["training", "final"] = "training"
     num_examples: int = -1
     task: RefusalsClassifierEvalTaskConfig = RefusalsClassifierEvalTaskConfig()
 
@@ -59,7 +58,6 @@ class RefusalsClassifierEvalTask(
                 "source": self.data.source,
                 "source_file": self.data.source_file,
                 "source_row": self.data.source_row,
-                "suite_sha256": self.data.suite_sha256,
             }
             return {"refusal_classifier_invalid_response": 1.0}
         try:
@@ -77,7 +75,6 @@ class RefusalsClassifierEvalTask(
                 "source": self.data.source,
                 "source_file": self.data.source_file,
                 "source_row": self.data.source_row,
-                "suite_sha256": self.data.suite_sha256,
             }
             raise
         if result.model_revision != self.config.classifier_revision:
@@ -92,7 +89,6 @@ class RefusalsClassifierEvalTask(
             "source_row": self.data.source_row,
             "source_id": self.data.source_id,
             "category": self.data.category,
-            "suite_sha256": self.data.suite_sha256,
             "classifier_revision": result.model_revision,
             "classifier_label": result.label,
             "classifier_label_name": result.label_name,
@@ -124,37 +120,42 @@ class RefusalsClassifierEvalTaskset(
     vf.Taskset[RefusalsClassifierEvalTask, RefusalsClassifierEvalTasksetConfig]
 ):
     def load(self) -> list[RefusalsClassifierEvalTask]:
-        path = Path(self.config.dataset_path)
-        actual_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
-        if not self.config.expected_sha256:
-            raise ValueError("refusal evaluation suite needs an expected SHA-256")
-        if actual_sha256 != self.config.expected_sha256:
-            raise ValueError(
-                f"refusal evaluation suite hash mismatch: {actual_sha256}"
-            )
-        rows: list[dict[str, Any]] = []
-        with path.open(encoding="utf-8") as source:
-            for line in source:
-                if line.strip():
-                    rows.append(json.loads(line))
+        data_file = f"{self.config.evaluation_set}-eval-set.jsonl"
+        dataset = load_dataset(
+            refusals_classifier_dataset,
+            data_files={"train": data_file},
+            split="train",
+        )
+        rows = [dict(row) for row in dataset]
         if self.config.num_examples >= 0:
             rows = rows[: self.config.num_examples]
         tasks = []
         for idx, row in enumerate(rows):
-            messages = row.get("messages")
+            messages = row["messages"]
             if not isinstance(messages, list) or not messages:
                 raise ValueError(f"evaluation row {idx} has no messages")
+            if not all(isinstance(message, dict) for message in messages):
+                raise ValueError(f"evaluation row {idx} has invalid messages")
+            source = row["source"]
+            if not isinstance(source, str) or not source.strip():
+                raise ValueError(f"evaluation row {idx} has no source")
+            source_file = str(row.get("source_file") or data_file)
+            source_row_value = row.get("source_row")
+            source_row = (
+                int(source_row_value)
+                if source_row_value is not None
+                else idx + 1
+            )
             tasks.append(
                 RefusalsClassifierEvalTask(
                     RefusalsClassifierEvalData(
                         idx=idx,
                         prompt=messages,
-                        source=str(row.get("source") or "unknown"),
-                        source_file=str(row["source_file"]),
-                        source_row=int(row["source_row"]),
+                        source=source.strip(),
+                        source_file=source_file,
+                        source_row=source_row,
                         source_id=row.get("source_id"),
                         category=str(row.get("category") or "unknown"),
-                        suite_sha256=actual_sha256,
                     ),
                     self.config.task,
                 )

@@ -47,7 +47,7 @@ conditions.
 ## Deploy one file
 
 ```python
-training_ops.deploy("source/src/prime_rl/orchestrator/dispatcher.py")
+training_ops.deploy("prime-rl/src/prime_rl/orchestrator/dispatcher.py")
 ```
 
 The tool derives the hosts from the path and launcher mounts. It refuses an
@@ -60,9 +60,11 @@ Get an owner decision before these calls:
 
 ```python
 training_ops.start("muse19", profile="current")
-training_ops.qualify("muse-qualification")
 training_ops.stop()
 ```
+
+Use `training_ops.qualify()` with a configured trainer-only qualification
+profile when one is available.
 
 `start()` checks that each selected host has the named configuration. A cold
 start creates the orchestrator control file before the trainer starts. A

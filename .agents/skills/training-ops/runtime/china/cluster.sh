@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+image=prime-rl:glm52-fp8
+deployment=${deployment_root:?set deployment_root}
+storage=${storage_root:?set storage_root}
+runs=${runs_path:?set runs_path}
+trainer_container=${trainer_container_name:?set trainer_container_name}
+master_node=${master_node_id:?set master_node_id}
+RUN=${RUN:?set RUN}
+run_name=${RUN_NAME:-run_$RUN}
+trainer_config=${TRAINER_CONFIG:-$deployment/configs/current/trainer.toml}
+run_dir=$runs/$RUN/$run_name
+node=${node_id:-$(ip -4 -o addr show vlan130 | awk '{split($4, a, /[.\/]/); print a[4]}')}
+
+common=(
+  # Rotate container logs: multi-day debug-level output filled node roots.
+  --log-opt max-size=512m --log-opt max-file=3
+  --network host
+  --ipc host
+  --ulimit nofile=1048576:1048576
+  --ulimit memlock=-1:-1
+  --ulimit stack=67108864:67108864
+  # A failed 64-rank trainer can otherwise leave one multi-gigabyte Apport
+  # core per worker on the host root filesystem. These dumps filled n76 and
+  # prevented NCCL from writing its much smaller diagnostic trace.
+  --ulimit core=0:0
+  -v /data:/data
+  -e CUDA_DEVICE_ORDER=PCI_BUS_ID
+  -e PYTHONUNBUFFERED=1
+  -e OMP_NUM_THREADS=1
+  -e NCCL_SOCKET_IFNAME=vlan130
+  -e GLOO_SOCKET_IFNAME=vlan130
+  -e NCCL_IB_DISABLE=1
+  -e NCCL_P2P_DISABLE=1
+  -e NCCL_SOCKET_NTHREADS=1
+  -e NCCL_NSOCKS_PERTHREAD=1
+  # Native checkpoint FP8 restores enough VRAM headroom to use the faster x24
+  # communication settings without putting routed-expert allocations at risk.
+  -e NCCL_BUFFSIZE=1048576
+  # NCCL >=2.19 allocates host bounce buffers via cuMem/memfd (invisible in
+  # /dev/shm, counted as shmem) -- the 300GB/node "shared" spikes. Legacy path.
+  -e NCCL_CUMEM_HOST_ENABLE=0
+  # Four channels measured substantially faster than two. One hangs and must
+  # never be used.
+  -e NCCL_MIN_NCHANNELS=4
+  -e NCCL_MAX_NCHANNELS=4
+  -e TORCH_NCCL_TRACE_BUFFER_SIZE=1048576
+  -e TORCH_NCCL_DUMP_ON_TIMEOUT=1
+  -e TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+  -e TORCH_NCCL_ENABLE_MONITORING=1
+  -e TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=600
+)
+
+# A newly released model can require a newer Transformers package than the
+# pinned trainer image. Set TRANSFORMERS_OVERRIDE_DIR to a host directory that
+# contains the complete `transformers` Python package. The default is empty and
+# therefore does not change established GLM runs.
+transformers_mount=()
+if [ -n "${TRANSFORMERS_OVERRIDE_DIR:-}" ]; then
+  test -d "$TRANSFORMERS_OVERRIDE_DIR/transformers" || {
+    echo "TRANSFORMERS_OVERRIDE_DIR must contain transformers/" >&2
+    exit 1
+  }
+  transformers_mount=(-v "$TRANSFORMERS_OVERRIDE_DIR/transformers":/app/.venv/lib/python3.12/site-packages/transformers:ro)
+fi
+
+python_dependency_mounts=()
+if [ -n "${MUSE_PYTHON_OVERRIDE_DIR:-}" ]; then
+  test -d "$MUSE_PYTHON_OVERRIDE_DIR/safetensors" || {
+    echo "MUSE_PYTHON_OVERRIDE_DIR must contain safetensors/" >&2
+    exit 1
+  }
+  test -d "$MUSE_PYTHON_OVERRIDE_DIR/safetensors-0.8.0.dist-info" || {
+    echo "MUSE_PYTHON_OVERRIDE_DIR must contain safetensors-0.8.0.dist-info/" >&2
+    exit 1
+  }
+  python_dependency_mounts=(
+    -v "$MUSE_PYTHON_OVERRIDE_DIR/safetensors":/app/.venv/lib/python3.12/site-packages/safetensors:ro
+    -v "$MUSE_PYTHON_OVERRIDE_DIR/safetensors-0.8.0.dist-info":/app/.venv/lib/python3.12/site-packages/safetensors-0.7.0.dist-info:ro
+  )
+fi
+
+case ${1:-} in
+  trainer)
+    # trainer_nodes lists the participating nodes in rank order; a node's rank
+    # is its position in that list. Set it to drop a node from the job -- e.g.
+    # with n81 down, trainer_nodes="82 76 77 78 80 83 84" gives a 7-node,
+    # 56-rank job. NNODES follows automatically.
+    trainer_nodes=${trainer_nodes:?set trainer_nodes}
+    rank=-1
+    idx=0
+    for n in $trainer_nodes; do
+      if [ "$n" = "$node" ]; then rank=$idx; fi
+      idx=$((idx + 1))
+    done
+    nnodes=$idx
+    if [ "$rank" -lt 0 ]; then
+      echo "node $node is not in trainer_nodes ($trainer_nodes)" >&2; exit 1
+    fi
+    read -r rollout_transport trainer_output fake_data < <(
+      python3 - "$trainer_config" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as f:
+    config = tomllib.load(f)
+print(
+    config["rollout_transport"]["type"],
+    config["output_dir"],
+    int("fake" in config.get("data", {})),
+)
+PY
+    )
+    sudo install -d -o 1000 -g 1000 -m 0755 "$trainer_output"
+    if [ "$rank" -eq 0 ]; then
+      if [ "$rollout_transport" = filesystem ] && [ "$fake_data" = 0 ]; then
+        sync_log="$storage/microbatch-sync-$RUN.log"
+        nohup setsid env RUN_DIR="$trainer_output" \
+          "$deployment/.agents/skills/training-ops/runtime/china/sync_microbatches.sh" \
+          >>"$sync_log" 2>&1 </dev/null &
+      fi
+    fi
+    # The default fq_codel qdisc costs about a quarter of the all-to-all
+    # throughput on this link (65% of line rate against 87% with fq). Applied
+    # here so it is reapplied after a reboot; both calls are idempotent.
+    trainer_nic=$(ip -o link show vlan130 | sed -n 's/.*vlan130@\([^:]*\):.*/\1/p')
+    sudo sysctl -qw net.core.default_qdisc=fq || true
+    sudo tc qdisc replace dev "$trainer_nic" root fq || true
+    # TileLang compiles kernels into $HOME/.tilelang inside the container, which
+    # lands on the host root filesystem. Root is small and already near full on
+    # some nodes (n76 hit 100% and the trainer died with ENOSPC), while /data has
+    # hundreds of GB. Keep the cache on /data.
+    sudo install -d -o 1000 -g 1000 -m 0755 "$storage/cache/torchinductor"
+    sudo install -d -o 1000 -g 1000 -m 0755 "$storage/cache/tilelang"
+    # Triton compiles kernels into ~/.triton and filled n76 root twice.
+    sudo install -d -o 1000 -g 1000 -m 0755 "$storage/cache/triton"
+    sudo install -d -o 1000 -g 1000 -m 1777 "$storage/cache/tmp"
+    # Batch replay cache (PRIME_BATCH_CACHE), written by the container user.
+    sudo install -d -o 1000 -g 1000 -m 0755 "$storage/cache/batch_pp"
+    # nccl shm segments leak on every trainer crash (~33MB each, observed
+    # 1500+ per node = 50GB+); the container was just removed, so purge.
+    sudo rm -f /dev/shm/nccl-* 2>/dev/null || true
+    sudo docker rm -f "$trainer_container" >/dev/null 2>&1 || true
+    # Keep the optional checkpoint cache disabled. It is not selected by the
+    # current dequantized, node-local EP path, but its single slot per layer is
+    # not safe for multiple 1F1B micro-batches.
+    sudo docker run -d --name "$trainer_container" \
+      --gpus all "${common[@]}" \
+      -v "$storage/cache/torchinductor":/tmp/torchinductor_appuser \
+      -v "$storage/cache/tilelang":/home/appuser/.tilelang \
+      -v "$storage/cache/triton":/home/appuser/.triton \
+      -v "$storage/cache/tmp":/scratch-tmp \
+      "${transformers_mount[@]}" \
+      "${python_dependency_mounts[@]}" \
+      -e TMPDIR=/scratch-tmp \
+      -v "$deployment/prime-rl/src/prime_rl/trainer/fp8_checkpoint.py":/app/src/prime_rl/trainer/fp8_checkpoint.py:ro \
+      -v "$deployment/prime-rl/src/prime_rl/trainer/model.py":/app/src/prime_rl/trainer/model.py:ro \
+      -v "$deployment/prime-rl/src/prime_rl/trainer/models/layers/fp8_ada.py":/app/src/prime_rl/trainer/models/layers/fp8_ada.py:ro \
+      -v "$deployment/prime-rl/src/prime_rl/trainer/models/layers/moe.py":/app/src/prime_rl/trainer/models/layers/moe.py:ro \
+      -v "$deployment/prime-rl/src/prime_rl/trainer/models/layers/checkpointing.py":/app/src/prime_rl/trainer/models/layers/checkpointing.py:ro \
+      -v "$deployment/prime-rl/src/prime_rl/trainer/models/layers/norms.py":/app/src/prime_rl/trainer/models/layers/norms.py:ro \
+      -v "$deployment/prime-rl/src/prime_rl/trainer/models/layers/hf_ring_attn.py":/app/src/prime_rl/trainer/models/layers/hf_ring_attn.py:ro \
+      -v "$deployment/prime-rl/src/prime_rl/trainer/models/layers/lm_head_gemma.py":/app/src/prime_rl/trainer/models/layers/lm_head_gemma.py:ro \
+      -v "$deployment/prime-rl/src/prime_rl/trainer/distributed/expert_parallel.py":/app/src/prime_rl/trainer/distributed/expert_parallel.py:ro \
+      -v "$deployment/prime-rl/src/prime_rl/trainer/distributed/pipeline_parallel.py":/app/src/prime_rl/trainer/distributed/pipeline_parallel.py:ro \
+      -v "$deployment/prime-rl/src/prime_rl/trainer/distributed/pp_runner.py":/app/src/prime_rl/trainer/distributed/pp_runner.py:ro \
+      -v "$deployment/prime-rl/src/prime_rl/trainer/parallel_dims.py":/app/src/prime_rl/trainer/parallel_dims.py:ro \
+      -v "$deployment/prime-rl/src/prime_rl/utils/cp.py":/app/src/prime_rl/utils/cp.py:ro \
+      -v "$deployment/prime-rl/src/prime_rl/trainer/rl/train.py":/app/src/prime_rl/trainer/rl/train.py:ro \
+      -v "$deployment/prime-rl/src/prime_rl/trainer/rl/data.py":/app/src/prime_rl/trainer/rl/data.py:ro \
+      -v "$deployment/prime-rl/src/prime_rl/trainer/weights.py":/app/src/prime_rl/trainer/weights.py:ro \
+      -v "$deployment/prime-rl/src/prime_rl/trainer/utils.py":/app/src/prime_rl/trainer/utils.py:ro \
+      -v "$deployment/prime-rl/src/prime_rl/trainer/rl/broadcast/filesystem.py":/app/src/prime_rl/trainer/rl/broadcast/filesystem.py:ro \
+      -v "$deployment/prime-rl/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py":/app/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py:ro \
+      -v "$deployment/prime-rl/src/prime_rl/trainer/models/glm_moe_dsa/sparse_mla_attention.py":/app/src/prime_rl/trainer/models/glm_moe_dsa/sparse_mla_attention.py:ro \
+      -v "$deployment/prime-rl/src/prime_rl/trainer/models/layers/lora/multi_linear.py":/app/src/prime_rl/trainer/models/layers/lora/multi_linear.py:ro \
+      -v "$deployment/prime-rl/src/prime_rl/trainer/lora.py":/app/src/prime_rl/trainer/lora.py:ro \
+      -v "$deployment/prime-rl/src/prime_rl/trainer/models/kernels/sparse_mla_fwd.py":/app/src/prime_rl/trainer/models/kernels/sparse_mla_fwd.py:ro \
+      -v "$deployment/prime-rl/src/prime_rl/trainer/models/kernels/sparse_mla_bwd.py":/app/src/prime_rl/trainer/models/kernels/sparse_mla_bwd.py:ro \
+      -v "$deployment/prime-rl/src/prime_rl/trainer/model.py":/app/src/prime_rl/trainer/model.py:ro \
+      -v "$deployment/prime-rl/src/prime_rl/utils/vlm.py":/app/src/prime_rl/utils/vlm.py:ro \
+      -v "$deployment/prime-rl/packages/prime-rl-configs/src/prime_rl/configs/trainer.py":/app/packages/prime-rl-configs/src/prime_rl/configs/trainer.py:ro \
+      --env-file /data/trinity/training.env \
+      -e PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,garbage_collection_threshold:0.8}" \
+      -e TORCHINDUCTOR_COMPILE_THREADS=8 \
+      -e PRIME_EP_PROFILE="${PRIME_EP_PROFILE:-0}" \
+      -e PRIME_EP_PROFILE_EVERY="${PRIME_EP_PROFILE_EVERY:-150}" \
+      -e PRIME_EP_AC_CACHE="${PRIME_EP_AC_CACHE:-0}" \
+      -e PRIME_INT4_COMBINE_ROUNDS="${PRIME_INT4_COMBINE_ROUNDS:-1}" \
+      -e PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD="${PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD:-0}" \
+      -e PRIME_BATCH_CACHE="${PRIME_BATCH_CACHE:-}" \
+      -e PRIME_PP_MAX_MICRO="${PRIME_PP_MAX_MICRO:-}" \
+      -e PRIME_STATS_DEBUG="${PRIME_STATS_DEBUG:-}" \
+      -e PRIME_RL_RESUME_ADAPTER="${PRIME_RL_RESUME_ADAPTER:-}" \
+      -e PRIME_RL_RESUME_ADAPTER_STEP="${PRIME_RL_RESUME_ADAPTER_STEP:-}" \
+      --entrypoint /app/.venv/bin/torchrun "$image" \
+      --role=trainer \
+      --nnodes="$nnodes" \
+      --nproc-per-node=8 \
+      --node-rank="$rank" \
+      --local-addr="10.92.20.$node" \
+      --master-addr="10.92.20.$master_node" \
+      --master-port=29500 \
+      --log-dir="$run_dir/logs/trainer/torchrun" \
+      --tee=3 \
+      --redirects=3 \
+      --local-ranks-filter=0 \
+      -m prime_rl.trainer.rl.train \
+      @ "$trainer_config"
+    ;;
+  adapter-http)
+    adapter_node=${adapter_node_id:?set adapter_node_id}
+    adapter_port=${adapter_service_port:?set adapter_service_port}
+    adapter_container=${adapter_container_name:?set adapter_container_name}
+    test "$node" = "$adapter_node" || { echo "the adapter server runs on n$adapter_node" >&2; exit 1; }
+    broadcast_root=${BROADCAST_ROOT:-$runs}
+    test -d "$broadcast_root" || { echo "broadcast root does not exist: $broadcast_root" >&2; exit 1; }
+    sudo docker rm -f "$adapter_container" >/dev/null 2>&1 || true
+    sudo docker run -d --name "$adapter_container" --restart unless-stopped \
+      --network host \
+      -v "$broadcast_root":/broadcast:ro \
+      -v "$deployment/.agents/skills/training-ops/runtime/china/adapter_server.py":/app/adapter_server.py:ro \
+      --entrypoint /app/.venv/bin/python "$image" \
+      /app/adapter_server.py --port "$adapter_port" --directory /broadcast
+    ;;
+  *)
+    echo "usage: $0 trainer|adapter-http" >&2
+    exit 1
+    ;;
+esac

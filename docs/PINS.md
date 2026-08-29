@@ -25,15 +25,3 @@ only. Prompt and mixed batches do not use a full graph.
   `5ffbb76517e2415241536698a4ff55f73bbcb534`
 - `NewEden/RL-seed-Decensor` revision:
   `de87870ad0228f9253d5a5e8ac4cb968901a064e`
-
-## GLM-5.2 v0.8 port
-
-The ordered patch series uses Prime-RL v0.8.0 commit
-`60bc29547a8824ad1de7b9af8d265e2b27b2a72d`.
-
-Its dependency revisions are:
-
-- renderers: `d4707862ac83aa3773c21f4096aec72bd17b91e4`
-- verifiers: `d30a3f48e5f14b06b3081b2102ec32cc3149b849`
-
-Do not mix these revisions with the current deployment source.
