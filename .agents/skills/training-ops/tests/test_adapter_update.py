@@ -67,6 +67,25 @@ class AdapterUpdateTest(unittest.TestCase):
                 "glm52-decensor-h200", 8000, startup_timeout_seconds=180
             )
 
+    def test_engine_repair_uses_active_run_profile(self):
+        calls = []
+
+        def ssh(_host, script, timeout=120):
+            calls.append(script)
+            return 0, "issued"
+
+        with mock.patch.object(training_ops, "current_run", return_value="x85"), mock.patch.object(
+            training_ops, "_ssh", side_effect=ssh
+        ):
+            result = training_ops._repair_engine("h200a")
+
+        self.assertEqual(result, "issued")
+        self.assertTrue(any("glm52-decensor-h200" in call for call in calls))
+        self.assertTrue(any("start_inference.sh" in call for call in calls))
+        self.assertTrue(any("ENGINE_CONTAINER=glm52-decensor-h200" in call for call in calls))
+        self.assertFalse(any("muse-glimmer-h200" in call for call in calls))
+        self.assertFalse(any("start_muse_inference.sh" in call for call in calls))
+
     def test_healthy_engine_skips_a_second_restart(self):
         before = training_ops.Status(
             trainer_up=True,

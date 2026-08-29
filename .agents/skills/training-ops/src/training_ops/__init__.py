@@ -3120,7 +3120,9 @@ def _repair_engine(host: str) -> str:
     _check_host(host)
     if host not in inference_hosts:
         raise Refused(f"{host} is not an engine host. Use one of {inference_hosts}.")
-    muse_engine = _profile()["kind"] == "muse"
+    run = current_run()
+    profile = _profile_for_run(run)
+    muse_engine = profile["kind"] == "muse"
     engine_container = muse_inference_container if muse_engine else glm_inference_container
     engine_model = muse_model if muse_engine else glm_model
     start_script = (
