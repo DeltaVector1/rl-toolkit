@@ -3310,7 +3310,7 @@ def _repair_engine(host: str) -> str:
         if muse_engine
         else f"{runtime_root}/h200/start_inference.sh"
     )
-    startup_grace = 600 if muse_engine else 180
+    startup_grace = 600
     print(
         f"{host}: removing and restarting {engine_container}. The model load needs 5 to 10 minutes."
     )
@@ -3516,7 +3516,7 @@ def _repair_engine_watchdog(host: str) -> str:
         if muse_engine
         else f"{runtime_root}/h200/start_inference.sh"
     )
-    startup_grace = 600 if muse_engine else 180
+    startup_grace = 600
     specs = []
     for replica, port in enumerate(configured_ports):
         watchdog_container = f"{container}-{replica}" if muse_engine else container
