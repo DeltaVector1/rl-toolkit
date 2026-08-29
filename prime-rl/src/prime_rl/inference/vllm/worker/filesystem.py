@@ -139,18 +139,10 @@ def _wait_for_futures(
             cancel_event.set()
         for future in futures:
             future.cancel()
-        executor.shutdown(wait=False, cancel_futures=True)
-        # Running urllib workers can still hold a private staging file open.
-        # Drain them for one bounded socket timeout before the caller cleans it.
-        stop_at = time.monotonic() + _ADAPTER_LANE_TIMEOUT_S
-        for future in futures:
-            remaining = stop_at - time.monotonic()
-            if remaining <= 0 or future.done():
-                continue
-            try:
-                future.result(timeout=remaining)
-            except BaseException:
-                continue
+        # Do not let the caller clean a path while a worker can still write it.
+        # Socket reads and retry sleeps check the cancellation event and have
+        # bounded timeouts, so this join completes after cancellation.
+        executor.shutdown(wait=True, cancel_futures=True)
         raise
     else:
         executor.shutdown(wait=True)
