@@ -36,4 +36,4 @@ docker run -d --name glm52-decensor-h200 --restart unless-stopped \
   prime-rl:glm52-v080-glm52-h200-router \
   -lc 'set -e; patch --batch --forward -p1 -d /app/.venv/lib/python3.12/site-packages < /tmp/flashmla_sparse_mtp.patch || grep -q fp8_mixed_batch_chunk_size /app/.venv/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/flashmla_sparse.py; exec /app/.venv/bin/inference "$@"' bash \
   @ "$deployment/configs/runtime/glm52-inference.toml" \
-  --vllm-extra '{"gpu_memory_utilization":0.93,"kv_cache_dtype":"fp8","max_num_seqs":128,"max_num_batched_tokens":65536,"compilation_config":{"max_cudagraph_capture_size":256},"speculative_config":{"method":"mtp","num_speculative_tokens":1}}'
+  --vllm-extra '{"gpu_memory_utilization":0.925,"kv_cache_dtype":"fp8","max_num_seqs":128,"max_num_batched_tokens":65536,"compilation_config":{"max_cudagraph_capture_size":256},"speculative_config":{"method":"mtp","num_speculative_tokens":1}}'
