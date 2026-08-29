@@ -14,7 +14,6 @@ import sys
 import tempfile
 import threading
 import unittest
-import urllib.request
 from contextlib import nullcontext
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
@@ -3270,6 +3269,28 @@ raise SystemExit(99)
                     ["n82"], include_inference=False
                 )
         fan.assert_not_called()
+
+    def test_live_service_check_refuses_a_portless_inference_container(self):
+        with patch.object(
+            training_ops,
+            "_ssh",
+            return_value=(0, training_ops.protected_inference[0] + "\n"),
+        ), self.assertRaisesRegex(training_ops.Refused, "active"):
+            training_ops._assert_live_services_are_down([], include_inference=True)
+
+    def test_live_service_check_refuses_an_unknown_inference_gpu_owner(self):
+        with patch.object(
+            training_ops,
+            "_ssh",
+            side_effect=[(0, ""), (0, "1234\n")],
+        ) as ssh, self.assertRaisesRegex(training_ops.Refused, "gpu-owner"):
+            training_ops._assert_live_services_are_down([], include_inference=True)
+
+        self.assertEqual(ssh.call_count, 2)
+        self.assertIn(
+            "nvidia-smi --query-compute-apps=pid",
+            ssh.call_args_list[1].args[1],
+        )
 
     def test_live_service_check_retries_one_transient_banner_timeout(self):
         self.assertEqual(

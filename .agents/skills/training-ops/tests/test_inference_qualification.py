@@ -54,12 +54,14 @@ class InferenceQualificationTest(unittest.TestCase):
                 "_inference_qualification_identity",
                 return_value={"status": "absent"},
             ),
+            patch.object(training_ops, "_assert_live_services_are_down") as guard,
             patch.object(training_ops, "_inference_qualification_port_conflicts"),
             patch.object(training_ops, "deploy", side_effect=lambda path, nodes: deployed.append((path, nodes)) or True),
             patch.object(training_ops, "_remote_ok", side_effect=remote),
         ):
             result = training_ops.qualify_inference("glm52-mtp-h200")
 
+        guard.assert_called_once_with([], include_inference=True)
         self.assertEqual(result["container_id"], "a" * 64)
         self.assertEqual([nodes for _path, nodes in deployed], [[spec["host"]]] * len(spec["deploy_files"]))
         launch = next(command for _host, command, label, _timeout in remote_calls if label == "inference qualification launch")
@@ -78,6 +80,7 @@ class InferenceQualificationTest(unittest.TestCase):
                 "_inference_qualification_identity",
                 return_value={"status": "absent"},
             ),
+            patch.object(training_ops, "_assert_live_services_are_down"),
             patch.object(
                 training_ops,
                 "_inference_qualification_port_conflicts",
@@ -86,6 +89,21 @@ class InferenceQualificationTest(unittest.TestCase):
             patch.object(training_ops, "deploy") as deploy,
         ):
             with self.assertRaisesRegex(training_ops.Refused, "port conflict"):
+                training_ops.qualify_inference("glm52-mtp-h200")
+        deploy.assert_not_called()
+
+    def test_live_service_guard_is_fail_closed_before_deploy(self):
+        spec = dict(training_ops.glm52_mtp_h200_qualification)
+        with (
+            patch.object(training_ops, "_inference_qualification_spec", return_value=spec),
+            patch.object(
+                training_ops,
+                "_assert_live_services_are_down",
+                side_effect=training_ops.Refused("GPU owner is active"),
+            ),
+            patch.object(training_ops, "deploy") as deploy,
+        ):
+            with self.assertRaisesRegex(training_ops.Refused, "GPU owner"):
                 training_ops.qualify_inference("glm52-mtp-h200")
         deploy.assert_not_called()
 

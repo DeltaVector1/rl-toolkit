@@ -918,6 +918,30 @@ def _assert_live_services_are_down(nodes: list[str], include_inference: bool) ->
                 f"cannot check live inference services on {orchestrator_host}: {output.strip()}"
             )
         active.extend(f"{orchestrator_host}:{name}" for name in output.split())
+        if active:
+            raise Refused(
+                "the live deployment is active on the requested GPUs: "
+                + ", ".join(active)
+            )
+        code, output = check(
+            orchestrator_host,
+            "nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits",
+            inference_deadline,
+        )
+        if code:
+            raise RuntimeError(
+                f"cannot check live inference GPU owners on {orchestrator_host}: "
+                f"{output.strip()}"
+            )
+        gpu_owners = [line.strip() for line in output.splitlines() if line.strip()]
+        if any(not owner.isdigit() for owner in gpu_owners):
+            raise RuntimeError(
+                f"live inference GPU owner probe returned invalid output on "
+                f"{orchestrator_host}: {output.strip()}"
+            )
+        active.extend(
+            f"{orchestrator_host}:gpu-owner:{owner}" for owner in gpu_owners
+        )
         if time.monotonic() > inference_deadline:
             raise RuntimeError("live inference service check exceeded its deadline")
 
@@ -10045,6 +10069,7 @@ def qualify_inference(name: str) -> dict[str, object]:
     """Deploy and run one registered inference qualification in the foreground."""
     spec = _inference_qualification_spec(name)
     host = str(spec["host"])
+    _assert_live_services_are_down([], include_inference=True)
     ports_to_check = _inference_qualification_ports(spec)
     existing = _inference_qualification_identity(spec)
     if existing["status"] != "absent":
