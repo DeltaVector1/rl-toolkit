@@ -36,6 +36,7 @@ from prime_rl.configs.trainer import (
     TokenizerConfig,
 )
 from prime_rl.trainer.distributed import DeepEPExpertParallel, MXFP8AllToAllExpertParallel
+from prime_rl.trainer.distributed.expert_parallel import NativeFP8LoRAAllToAllExpertParallel
 from prime_rl.trainer.fp8_checkpoint import FP8CheckpointStorageReader
 from prime_rl.trainer.lora import apply_lora_to_model, freeze_all_except_lora_and_specified, strip_lora_from_state_dict
 from prime_rl.trainer.models import (
@@ -1398,9 +1399,40 @@ def apply_ep(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims)
     for transformer_block in iter_layers(language_model.layers):
         block_mlp = getattr(transformer_block, "mlp", None)
         if block_mlp is not None and isinstance(block_mlp, (MoE, LatentMoE)):
+            native_fp8_expert_lora = getattr(
+                block_mlp.experts,
+                "requires_received_expert_input",
+                False,
+            )
+            if native_fp8_expert_lora and config.ep_comm_backend != "torch":
+                raise ValueError("native FP8 routed-expert LoRA requires the torch EP backend")
             if config.ep_comm_backend == "torch":
                 quant = config.quantization
-                if (isinstance(quant, MXFP8Config) and quant.enable_a2a) or (
+                if native_fp8_expert_lora:
+                    if not isinstance(quant, FP8Config):
+                        raise TypeError("native FP8 routed-expert LoRA requires FP8 quantization")
+                    transport = quant.expert_activation_transport
+                    stage_selection = {}
+                    if transport == "bf16_forward_fp8_local_recompute_backward":
+                        if config.ac is None:
+                            raise RuntimeError(
+                                "local expert recompute has no activation-checkpoint configuration"
+                            )
+                        cutoff = config.ac.keep_routed_expert_activations_from_pp_stage
+                        if cutoff is None or not parallel_dims.pp_enabled:
+                            raise RuntimeError(
+                                "local expert recompute has no pipeline cutoff"
+                            )
+                        stage_selection = {
+                            "pp_stage": parallel_dims.get_mesh("pp").get_local_rank(),
+                            "pp_size": parallel_dims.pp,
+                            "local_recompute_cutoff": cutoff,
+                        }
+                    parallelize_plan = NativeFP8LoRAAllToAllExpertParallel(
+                        transport,
+                        **stage_selection,
+                    )
+                elif (isinstance(quant, MXFP8Config) and quant.enable_a2a) or (
                     isinstance(quant, FP8Config)
                     and (
                         config.global_ep

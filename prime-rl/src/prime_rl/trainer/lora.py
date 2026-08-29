@@ -24,6 +24,9 @@ from prime_rl.trainer.models.layers.lora.multi_moe import (
     MultiLoRAGroupedExperts,
     MultiLoRANonGatedGroupedExperts,
 )
+from prime_rl.trainer.models.layers.lora.native_fp8_moe import (
+    NativeFP8MultiLoRAGroupedExperts,
+)
 from prime_rl.trainer.models.layers.moe import (
     FP8CheckpointFeedForward,
     GptOssGroupedExperts,
@@ -280,6 +283,57 @@ def _find_target_modules(model: nn.Module, target_patterns: List[str]) -> List[s
     return target_modules
 
 
+def _validate_glm_lora_targets(
+    model: nn.Module,
+    configured_patterns: List[str],
+    target_modules: List[str],
+) -> None:
+    if getattr(getattr(model, "config", None), "model_type", None) != "glm_moe_dsa":
+        return
+
+    required = {
+        "q_a_proj",
+        "q_b_proj",
+        "kv_a_proj_with_mqa",
+        "kv_b_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+        "shared_expert",
+        "experts",
+    }
+    missing_patterns = required - set(configured_patterns)
+    if missing_patterns:
+        raise ValueError(
+            "GLM LoRA target list is incomplete: "
+            f"missing {sorted(missing_patterns)}"
+        )
+
+    expected = set()
+    attention = {"q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj"}
+    dense = {"gate_proj", "up_proj", "down_proj"}
+    for name, module in model.named_modules():
+        final_name = name.rsplit(".", 1)[-1]
+        if isinstance(module, nn.Linear) and final_name in attention:
+            expected.add(name)
+        elif isinstance(module, nn.Linear) and final_name in dense and ".mlp." in f".{name}.":
+            expected.add(name)
+        elif isinstance(module, FP8CheckpointFeedForward) and final_name == "shared_expert":
+            expected.add(name)
+        elif isinstance(module, GroupedExperts) and final_name == "experts":
+            expected.add(name)
+
+    missing = sorted(expected - set(target_modules))
+    unexpected = sorted(set(target_modules) - expected)
+    if missing or unexpected:
+        raise ValueError(
+            "GLM LoRA target inventory does not match this stage: "
+            f"missing={missing[:8]} ({len(missing)} total), "
+            f"unexpected={unexpected[:8]} ({len(unexpected)} total)"
+        )
+
+
 def _should_keep_trainable(param_name: str, modules_to_save_patterns: List[str]) -> bool:
     """Check if a parameter should remain fully trainable.
 
@@ -353,6 +407,7 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> None:
 
     if not target_modules:
         raise ValueError(f"No LoRA target modules found for patterns {config.target_modules}.")
+    _validate_glm_lora_targets(model, config.target_modules, target_modules)
 
     for module_name in target_modules:
         base_module = _get_module_by_name(model, module_name)
@@ -376,16 +431,25 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> None:
             )
         # Handle GroupedExperts (MoE)
         elif isinstance(base_module, GroupedExperts):
-            lora_module = MultiLoRAGroupedExperts(
-                base_layer=base_module,
-                rank=config.rank,
-                n_adapters=n_loras,
-                alpha=config.alpha,
-                dropout=config.dropout,
-            )
-            for adapter_index in range(n_loras):
-                for _, parameter in lora_module.named_parameters_for_adapter(adapter_index):
-                    parameter.data = parameter.data.to(torch.bfloat16)
+            if base_module.fp8_checkpoint:
+                lora_module = NativeFP8MultiLoRAGroupedExperts(
+                    base_layer=base_module,
+                    rank=config.rank,
+                    n_adapters=n_loras,
+                    alpha=config.alpha,
+                    dropout=config.dropout,
+                )
+            else:
+                lora_module = MultiLoRAGroupedExperts(
+                    base_layer=base_module,
+                    rank=config.rank,
+                    n_adapters=n_loras,
+                    alpha=config.alpha,
+                    dropout=config.dropout,
+                )
+                for adapter_index in range(n_loras):
+                    for _, parameter in lora_module.named_parameters_for_adapter(adapter_index):
+                        parameter.data = parameter.data.to(torch.bfloat16)
         # Handle NonGatedGroupedExperts (relu2 experts used by NemotronH's LatentMoE)
         elif isinstance(base_module, NonGatedGroupedExperts):
             lora_module = MultiLoRANonGatedGroupedExperts(

@@ -2,7 +2,7 @@ import warnings
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypeAlias
 
-from pydantic import Field, model_validator
+from pydantic import Field, StrictBool, model_validator
 
 from prime_rl.configs.shared import (
     BaseModelConfig,
@@ -36,6 +36,7 @@ class ActivationCheckpointConfig(BaseConfig):
         "reentrant_block",
         "reentrant_attention",
         "reentrant_attention_shared_expert",
+        "reentrant_attention_all_experts",
     ] = "full"
     """Activation checkpoint implementation. ``full`` uses the ordinary non-reentrant whole-block wrapper. ``reentrant_block`` recomputes a complete decoder block after its FSDP pre-backward hook has restored sharded parameters. ``reentrant_attention`` uses the same safe ordering for attention only and keeps MLP activations eager. ``reentrant_attention_shared_expert`` also recomputes only the shared-expert branch; routed experts and their all-to-all remain eager. Use a reentrant mode for native-FP8 attention with ``reshard_after_forward``. ``selective`` checkpoints only the subcomponents listed in ``targets`` inside supported custom decoder layers."""
 
@@ -45,11 +46,21 @@ class ActivationCheckpointConfig(BaseConfig):
     targets: list[str] = ["norm"]
     """Selective checkpoint targets. ``norm`` checkpoints every norm module inside selected layers. ``attention`` checkpoints the complete attention module. ``attn_proj`` checkpoints projection-side attention work outside the kernel (input/output projections, attention-local norms, RoPE, gating, model-specific MLA projection helpers). ``mlp`` checkpoints the entire dense MLP forward (not for MoE). ``mla_up_proj`` checkpoints MLA Q/KV up-projection where supported. ``routed_experts`` checkpoints routed expert compute in MoE layers (including LatentMoE). ``linear_attn`` checkpoints non-softmax token mixers (NemotronH Mamba, Qwen3.5-MoE GatedDeltaNet, AFMoE sliding-window attention)."""
 
+    keep_routed_expert_activations_from_pp_stage: int | None = Field(None, ge=0)
+
     @model_validator(mode="after")
     def validate_selective_targets(self):
         self.targets = list(dict.fromkeys(self.targets))
         if self.mode == "selective" and not self.targets:
             raise ValueError("Selective activation checkpointing requires at least one target.")
+        if (
+            self.keep_routed_expert_activations_from_pp_stage is not None
+            and self.mode != "reentrant_attention_all_experts"
+        ):
+            raise ValueError(
+                "keep_routed_expert_activations_from_pp_stage requires "
+                "mode='reentrant_attention_all_experts'"
+            )
         return self
 
 
@@ -155,7 +166,14 @@ class FP8Config(BaseConfig):
     """Diagnostic: dequantize shared-expert matrices only."""
     diagnose_linear_backward: bool = False
     """Report the first nonfinite native-FP8 linear backward for each shape."""
-    expert_activation_transport: Literal["bf16", "int4"] = "bf16"
+    expert_activation_transport: Literal[
+        "bf16",
+        "int4",
+        "fp8",
+        "bf16_forward_fp8_backward",
+        "bf16_forward_fp8_recompute_backward",
+        "bf16_forward_fp8_local_recompute_backward",
+    ] = "bf16"
     """Expert-parallel activation transport. ``int4`` keeps checkpoint weights
     in FP8, quantizes only forward all-to-all payloads to INT4, and sends
     backward payloads in FP8."""
@@ -205,8 +223,10 @@ class ModelConfig(BaseModelConfig):
     optim_cpu_offload: bool = True
     """Offload only optimizer states (momentum, variance) to CPU, keeping weights on GPU. Avoids the H2D all-gather overhead of FSDP CPU offload while still saving GPU memory."""
 
-    reshard_after_forward: bool = True
+    reshard_after_forward: StrictBool | Literal[4] = True
     """Reshard the model after each forward pass."""
+
+    native_fp8_expert_prefetch: bool = False
 
     dp_replicate: int = 1
     """Data parallel dim where model weights are replicated."""
@@ -245,6 +265,12 @@ class ModelConfig(BaseModelConfig):
     pp_transfer_sparse_indices: bool = False
     """Transfer sparse-attention index caches with pipeline activations. This
     permits balanced stage boundaries that start on IndexShare layers."""
+
+    pp_limit_receive_buffers: bool = False
+
+    pp_boundary_plan: Literal["balanced", "explicit"] = "balanced"
+
+    pp_layer_boundaries: list[int] | None = None
 
     cp_style: Literal["ring", "ulysses"] = "ring"
     """CP communication style. ``ring`` uses ring-attention all-gather/reduce-scatter (requires custom kernels per attention type). ``ulysses`` uses all-to-all to redistribute Q/K/V from sequence-sharded to head-sharded, runs vanilla attention locally on the full sequence, then all-to-all back — works out-of-the-box with any attention kernel (softmax FA, linear attention, mamba, etc.)."""
@@ -357,6 +383,40 @@ class ModelConfig(BaseModelConfig):
         if isinstance(self.ep, int) and self.ep <= 1:
             raise ValueError(f"model.ep_comm_backend='{self.ep_comm_backend}' requires model.ep > 1.")
 
+        return self
+
+    @model_validator(mode="after")
+    def validate_local_expert_recompute(self):
+        local_recompute = (
+            isinstance(self.quantization, FP8Config)
+            and self.quantization.expert_activation_transport
+            == "bf16_forward_fp8_local_recompute_backward"
+        )
+        if not local_recompute:
+            return self
+        if (
+            self.pp <= 1
+            or self.pp_schedule == "interleaved_1f1b"
+            or self.ep_comm_backend != "torch"
+            or (isinstance(self.ep, int) and self.ep <= 1)
+        ):
+            raise ValueError(
+                "local expert recompute requires non-interleaved pipeline parallelism and torch expert parallelism"
+            )
+        cutoff = (
+            self.ac.keep_routed_expert_activations_from_pp_stage
+            if self.ac is not None
+            else None
+        )
+        if (
+            self.ac is None
+            or self.ac.mode != "reentrant_attention_all_experts"
+            or cutoff is None
+            or cutoff >= self.pp
+        ):
+            raise ValueError(
+                "local expert recompute requires a valid eager routed-expert pipeline cutoff"
+            )
         return self
 
     @model_validator(mode="after")
