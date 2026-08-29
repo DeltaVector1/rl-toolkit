@@ -330,6 +330,38 @@ def _run_dir(run: str) -> str:
     )
 
 
+def _select_active_reward_rows(
+    rows: list[dict],
+    requested_run: str,
+    active_run: str | None,
+    active_start_epoch: float | None,
+) -> tuple[list[dict], int, int]:
+    """Select rows written by the active container, when it is this run."""
+    if (
+        active_run != requested_run
+        or active_start_epoch is None
+        or not math.isfinite(active_start_epoch)
+    ):
+        return rows, 0, 0
+
+    selected: list[dict] = []
+    excluded = 0
+    without_time = 0
+    for row in rows:
+        timestamp = row.get("time")
+        if not isinstance(timestamp, (int, float)) or isinstance(timestamp, bool):
+            without_time += 1
+            continue
+        if not math.isfinite(float(timestamp)):
+            without_time += 1
+            continue
+        if float(timestamp) < active_start_epoch:
+            excluded += 1
+        else:
+            selected.append(row)
+    return selected, excluded, without_time
+
+
 # -------------------------------------------------------------------- probes
 
 trainer_probe = r"""
@@ -2090,6 +2122,7 @@ class RewardReport:
     residual_std: float = 0.0
     verdict: str = "too few steps"
     note: str = ""
+    source: str = ""
 
     def report(self) -> str:
         L = [f"reward for {self.run} ({len(self.steps)} steps)"]
@@ -2114,6 +2147,8 @@ class RewardReport:
             f"threshold {trend_spread_multiplier:g} x residual = {trend_spread_multiplier * self.residual_std:.4f}"
         )
         L.append(f"result: {self.verdict}")
+        if self.source:
+            L.append(self.source)
         if self.note:
             L.append(self.note)
         return "\n".join(L)
@@ -2138,8 +2173,27 @@ def reward(run: str = "", quiet: bool = False, host: str = "") -> RewardReport:
     script = (
         _run_dir(run)
         + '\n[ -z "$d" ] && { echo NORUN; exit 0; }\n'
-        + "python3 - \"$d\" <<'PY'\n"
+        + "container_env=$(sudo docker inspect "
+        + shlex.quote(orchestrator_container)
+        + " --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null || true)\n"
+        + "active_run=$(printf '%s\\n' \"$container_env\" | sed -n 's/^RUN=//p' | head -1)\n"
+        + "active_run_source=RUN\n"
+        + "if [ -z \"$active_run\" ]; then\n"
+        + "  active_run=$(printf '%s\\n' \"$container_env\" | sed -n 's#^HF_HOME=/data/glm52-rl/runs/\\([^/]*\\)/.*#\\1#p' | head -1)\n"
+        + "  active_run_source=HF_HOME\n"
+        + "fi\n"
+        + "started_at=$(sudo docker inspect "
+        + shlex.quote(orchestrator_container)
+        + " --format '{{.State.StartedAt}}' 2>/dev/null | head -1)\n"
+        + "start_epoch=\n"
+        + "if [ -n \"$started_at\" ]; then start_epoch=$(date -u -d \"$started_at\" +%s.%N 2>/dev/null || true); fi\n"
+        + "python3 - \"$d\" \"$active_run\" \"$start_epoch\" \"$active_run_source\" <<'PY'\n"
         "import json,sys\n"
+        "active_run=sys.argv[2] or None\n"
+        "try: active_start=float(sys.argv[3]) if sys.argv[3] else None\n"
+        "except ValueError: active_start=None\n"
+        "active_source=sys.argv[4] or None\n"
+        "print('REWARD_META '+json.dumps({'active_run':active_run,'active_start_epoch':active_start,'active_run_source':active_source}))\n"
         "K={'eff':'train/agg/effective/reward/mean','all':'train/agg/all/reward/mean',\n"
         "   'p10':'train/agg/effective/reward/p10','p90':'train/agg/effective/reward/p90',\n"
         "   'err':'train/agg/all/has_error/mean','t':'time/step'}\n"
@@ -2150,7 +2204,7 @@ def reward(run: str = "", quiet: bool = False, host: str = "") -> RewardReport:
         "    try: r=json.loads(line)\n"
         "    except ValueError: invalid+=1; continue\n"
         "    if 'step' not in r: invalid+=1; continue\n"
-        "    out.append({'step':r['step'],**{k:r.get(v) for k,v in K.items()}})\n"
+        "    out.append({'step':r['step'],'time':r.get('time'),**{k:r.get(v) for k,v in K.items()}})\n"
         "print('REWARD_INVALID '+str(invalid))\n"
         "print('REWARD_JSON '+json.dumps(out))\n"
         "PY\n"
@@ -2160,6 +2214,7 @@ def reward(run: str = "", quiet: bool = False, host: str = "") -> RewardReport:
         raise RuntimeError(f"cannot read reward data on {metric_host}: {output.strip()}")
     rep = RewardReport(run=run)
     rows = None
+    reward_meta: dict[str, object] = {}
     invalid_lines = 0
     for line in output.splitlines():
         if line.startswith("REWARD_INVALID "):
@@ -2167,6 +2222,11 @@ def reward(run: str = "", quiet: bool = False, host: str = "") -> RewardReport:
                 invalid_lines = int(line.removeprefix("REWARD_INVALID "))
             except ValueError as error:
                 raise RuntimeError("reward invalid-line count is not an integer") from error
+        if line.startswith("REWARD_META "):
+            try:
+                reward_meta = json.loads(line.removeprefix("REWARD_META "))
+            except (TypeError, ValueError) as error:
+                raise RuntimeError("reward metadata is not valid JSON") from error
         if line.startswith("REWARD_JSON "):
             try:
                 rows = json.loads(line.removeprefix("REWARD_JSON "))
@@ -2191,6 +2251,38 @@ def reward(run: str = "", quiet: bool = False, host: str = "") -> RewardReport:
         raise RuntimeError(f"reward data on {metric_host} is not a list")
 
     rows = [r for r in rows if isinstance(r, dict) and r.get("eff") is not None]
+    active_run = reward_meta.get("active_run")
+    active_start_epoch = reward_meta.get("active_start_epoch")
+    if not isinstance(active_run, str):
+        active_run = None
+    if not isinstance(active_start_epoch, (int, float)) or isinstance(
+        active_start_epoch, bool
+    ):
+        active_start_epoch = None
+    active_run_source = reward_meta.get("active_run_source")
+    if not isinstance(active_run_source, str) or not active_run_source:
+        active_run_source = "unknown"
+    rows, excluded_rows, untimestamped_rows = _select_active_reward_rows(
+        rows, run, active_run, float(active_start_epoch)
+        if active_start_epoch is not None
+        else None,
+    )
+    if active_run == run and active_start_epoch is not None:
+        rep.source = (
+            f"source: active orchestrator run {active_run} from {active_run_source} "
+            f"started at Unix "
+            f"{float(active_start_epoch):.3f}; selected {len(rows)} current rows, "
+            f"excluded {excluded_rows} older rows"
+        )
+        if untimestamped_rows:
+            rep.source += f"; skipped {untimestamped_rows} rows without valid timestamps"
+    elif active_run:
+        rep.source = (
+            f"source: active orchestrator is {active_run}; no active-run filter "
+            f"was applied to requested run {run}"
+        )
+    else:
+        rep.source = "source: no active orchestrator run boundary was available; all rows used"
     rows.sort(key=lambda r: r["step"])
     rep.steps = [r["step"] for r in rows]
     rep.effective = [float(r["eff"]) for r in rows]
