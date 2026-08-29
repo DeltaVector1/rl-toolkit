@@ -10151,9 +10151,10 @@ def deploy(path: str, nodes: list[str] | None = None) -> bool:
             raise Refused("destination is not clear; pass nodes explicitly")
         if not nodes:
             raise Refused(f"no configured host mounts {path}")
-    if path in inference_qualification_deploy_files or path.startswith(
-        ("scripts/h200/", "configs/runtime/")
-    ):
+    inference_only = path.startswith(("scripts/h200/", "configs/runtime/")) or (
+        path in inference_qualification_deploy_files and not path.startswith("source/")
+    )
+    if inference_only:
         unsafe_nodes = [host for host in (nodes or []) if host not in inference_hosts]
         if unsafe_nodes:
             raise Refused(
