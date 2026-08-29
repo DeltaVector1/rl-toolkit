@@ -16,6 +16,7 @@ from prime_rl.glm52_routing import glm_routing_errors
 
 PROFILE_NAME = "glm52-mtp-h200"
 CONTEXT_TOKENS = 32768
+SUPPORTED_BLOCK_SIZES = frozenset({64})
 TARGET_MODULES = {
     "q_a_proj",
     "q_b_proj",
@@ -93,6 +94,18 @@ def static_errors(config: dict) -> list[str]:
         errors.append("parallel topology must be TP8/DP1")
     if extra.get("kv_cache_dtype") != "bfloat16":
         errors.append("target KV cache dtype must be bfloat16")
+    target_block_size = extra.get("block_size")
+    draft_block_size = speculative.get("block_size", target_block_size)
+    if target_block_size not in SUPPORTED_BLOCK_SIZES:
+        errors.append("target block_size must be the supported value 64")
+    if not isinstance(target_block_size, int) or target_block_size <= 0 or CONTEXT_TOKENS % target_block_size:
+        errors.append("target block_size must divide the 32768-token context")
+    if draft_block_size not in SUPPORTED_BLOCK_SIZES:
+        errors.append("draft block_size must be the supported value 64")
+    if not isinstance(draft_block_size, int) or draft_block_size <= 0 or CONTEXT_TOKENS % draft_block_size:
+        errors.append("draft block_size must divide the 32768-token context")
+    if target_block_size != draft_block_size:
+        errors.append("target and draft block_size must be identical")
     if extra.get("max_num_seqs") != 128:
         errors.append("max_num_seqs must be 128")
     if extra.get("max_num_batched_tokens") != CONTEXT_TOKENS:

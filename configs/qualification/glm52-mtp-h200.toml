@@ -34,6 +34,7 @@ backend_port = 8100
 # used as the route selector.
 [vllm_extra]
 kv_cache_dtype = "bfloat16"
+block_size = 64
 max_num_seqs = 128
 max_num_batched_tokens = 32768
 

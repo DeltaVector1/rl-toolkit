@@ -94,6 +94,32 @@ def test_profile_has_the_required_safe_mtp_contract():
     assert config["enable_return_routed_experts"] is True
 
 
+def test_mtp_block_size_is_supported_and_shared_by_target_and_draft():
+    config = tomllib.loads(
+        (ROOT / "configs/qualification/glm52-mtp-h200.toml").read_text()
+    )
+    preflight = _load_module(
+        ROOT / "scripts/glm52_h200_mtp_preflight.py", "glm52_mtp_preflight_block_size"
+    )
+    assert config["vllm_extra"]["block_size"] == 64
+    assert preflight.static_errors(config) == []
+
+    for block_size in (32, 96):
+        invalid = tomllib.loads(
+            (ROOT / "configs/qualification/glm52-mtp-h200.toml").read_text()
+        )
+        invalid["vllm_extra"]["block_size"] = block_size
+        errors = preflight.static_errors(invalid)
+        assert any("block_size" in error for error in errors)
+
+    mismatched = tomllib.loads(
+        (ROOT / "configs/qualification/glm52-mtp-h200.toml").read_text()
+    )
+    mismatched["vllm_extra"]["speculative_config"]["block_size"] = 32
+    errors = preflight.static_errors(mismatched)
+    assert any("identical" in error for error in errors)
+
+
 def test_both_launchers_mount_every_patched_vllm_file():
     overlay = _load_module(
         ROOT / "scripts/h200/flashmla_overlay_preflight.py", "overlay_preflight"
