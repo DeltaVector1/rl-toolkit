@@ -82,16 +82,17 @@ class DependencyBundleTest(unittest.TestCase):
             )
 
     def test_retries_failed_host_until_success_without_repeating_success(self):
-        scp_calls = []
+        upload_calls = []
         remote_calls = []
 
-        def fake_run(command, **_kwargs):
-            host = command[-1].split(":", 1)[0]
-            scp_calls.append(host)
-            if len(scp_calls) < 3:
+        def fake_run(command, **kwargs):
+            upload_calls.append((command, kwargs))
+            if len(upload_calls) == 1:
                 return training_ops.subprocess.CompletedProcess(
                     command, 1, "", "scp: Connection closed\n"
                 )
+            self.assertEqual(command[0], "ssh")
+            self.assertNotEqual(kwargs["stdin"], training_ops.subprocess.DEVNULL)
             return training_ops.subprocess.CompletedProcess(command, 0, "", "")
 
         def fake_ssh(host, script, timeout=0):
@@ -113,19 +114,25 @@ class DependencyBundleTest(unittest.TestCase):
         ):
             training_ops._deploy_dependencies([("a.py", ["n76"])])
 
-        self.assertEqual(scp_calls, ["n76", "n76", "n76"])
+        self.assertEqual(len(upload_calls), 2)
+        self.assertEqual(upload_calls[0][0][0], "scp")
+        self.assertEqual(upload_calls[1][0][0], "ssh")
+        self.assertIn("umask 077; cat > /tmp/trainer-dependencies-", upload_calls[1][0][-1])
         self.assertEqual(remote_calls, ["n76"])
-        self.assertEqual(errors.getvalue().count("scp: Connection closed"), 2)
+        self.assertEqual(errors.getvalue().count("scp: Connection closed"), 1)
         self.assertIn("attempt 1/3", errors.getvalue())
-        self.assertIn("attempt 2/3", errors.getvalue())
 
     def test_terminal_failure_is_bounded_at_three_attempts(self):
-        scp_calls = []
+        upload_calls = []
 
-        def fake_run(command, **_kwargs):
-            scp_calls.append(command[-1].split(":", 1)[0])
+        def fake_run(command, **kwargs):
+            upload_calls.append((command, kwargs))
+            if len(upload_calls) == 1:
+                return training_ops.subprocess.CompletedProcess(
+                    command, 1, "", "scp: Connection closed\n"
+                )
             return training_ops.subprocess.CompletedProcess(
-                command, 1, "", "scp: Connection closed\n"
+                command, 1, "", "ssh: stream closed\n"
             )
 
         def fake_ssh(_host, script, timeout=0):
@@ -147,8 +154,12 @@ class DependencyBundleTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "failed to deploy dependency bundle"):
                 training_ops._deploy_dependencies([("a.py", ["n76"])])
 
-        self.assertEqual(scp_calls, ["n76", "n76", "n76"])
-        self.assertEqual(errors.getvalue().count("scp: Connection closed"), 3)
+        self.assertEqual(len(upload_calls), 3)
+        self.assertEqual(upload_calls[0][0][0], "scp")
+        self.assertTrue(all(call[0][0] == "ssh" for call in upload_calls[1:]))
+        self.assertTrue(all(call[1]["timeout"] == 60 for call in upload_calls))
+        self.assertEqual(errors.getvalue().count("scp: Connection closed"), 1)
+        self.assertEqual(errors.getvalue().count("ssh: stream closed"), 2)
         self.assertIn("attempt 3/3", errors.getvalue())
 
     def test_checksum_match_skips_upload_without_marker(self):
@@ -207,22 +218,31 @@ class DependencyBundleTest(unittest.TestCase):
         self.assertEqual(len(ssh_calls), 2)
         self.assertIn("[ok]", output.getvalue())
 
-    def test_scp_timeout_retries_three_times_and_preserves_stderr(self):
-        scp_calls = []
+    def test_scp_timeout_then_ssh_stream_success_preserves_stderr(self):
+        upload_calls = []
         errors = io.StringIO()
+        remote_calls = []
 
         def fake_ssh(_host, script, timeout=0):
             if "checksums match" in script:
                 return 1, "missing"
             if script.startswith("rm -f"):
+                remote_calls.append("cleanup")
                 return 0, ""
-            self.fail(f"verification must not run after SCP timeout: {script}")
+            remote_calls.append("verify")
+            return 0, "installed"
 
         def fake_run(command, **kwargs):
-            scp_calls.append((command, kwargs))
-            raise training_ops.subprocess.TimeoutExpired(
-                command, kwargs["timeout"], stderr=b"scp: stalled\n"
-            )
+            upload_calls.append((command, kwargs))
+            if len(upload_calls) == 1:
+                raise training_ops.subprocess.TimeoutExpired(
+                    command, kwargs["timeout"], stderr=b"scp: stalled\n"
+                )
+            self.assertEqual(command[0], "ssh")
+            self.assertIn("umask 077; cat > /tmp/trainer-dependencies-", command[-1])
+            self.assertNotEqual(kwargs["stdin"], training_ops.subprocess.DEVNULL)
+            self.assertEqual(kwargs["timeout"], 60)
+            return training_ops.subprocess.CompletedProcess(command, 0, "", "")
 
         with (
             mock.patch.object(training_ops.subprocess, "run", side_effect=fake_run),
@@ -230,12 +250,13 @@ class DependencyBundleTest(unittest.TestCase):
             mock.patch.object(training_ops.time, "sleep"),
             contextlib.redirect_stderr(errors),
         ):
-            with self.assertRaisesRegex(RuntimeError, "failed to deploy dependency bundle"):
-                training_ops._deploy_dependencies([("a.py", ["n76"])])
+            training_ops._deploy_dependencies([("a.py", ["n76"])])
 
-        self.assertEqual(len(scp_calls), 3)
-        self.assertTrue(all(call[1]["timeout"] == 60 for call in scp_calls))
-        self.assertEqual(errors.getvalue().count("scp: stalled\n"), 3)
+        self.assertEqual(len(upload_calls), 2)
+        self.assertEqual(upload_calls[0][0][0], "scp")
+        self.assertEqual(upload_calls[1][0][0], "ssh")
+        self.assertEqual(remote_calls, ["cleanup", "verify"])
+        self.assertEqual(errors.getvalue().count("scp: stalled\n"), 1)
 
 
 if __name__ == "__main__":

@@ -105,6 +105,9 @@ glm_rollout_max_seconds = glm_requirements["rollout_seconds_max"]
 adapter_archive_bucket = paths["adapter_bucket"]
 adapter_archive_files = ("adapter_config.json", "adapter_model.safetensors")
 dependency_manifest_name = ".training-ops-manifest"
+_dependency_remote_archive_pattern = re.compile(
+    r"^/tmp/trainer-dependencies-[A-Za-z0-9._-]+\.tar$"
+)
 
 if set(inference_hosts) != set(inference_settings):
     raise RuntimeError("each inference host must have one [inference.<host>] entry")
@@ -2799,6 +2802,14 @@ def _dependency_checksum_script(
     return "\n".join(lines)
 
 
+def _validated_dependency_remote_archive(bundle: Path) -> str:
+    """Return the exact safe temporary archive path used on a trainer host."""
+    remote_archive = f"/tmp/{bundle.name}"
+    if _dependency_remote_archive_pattern.fullmatch(remote_archive) is None:
+        raise Refused(f"invalid trainer dependency temporary archive: {remote_archive}")
+    return remote_archive
+
+
 def _deploy_dependencies(required_files: list[tuple[str, list[str]]]) -> None:
     """Deploy trainer dependencies as one verified archive per host."""
     if not required_files:
@@ -2826,7 +2837,7 @@ def _deploy_dependencies(required_files: list[tuple[str, list[str]]]) -> None:
             f"trainer dependency bundle: uploading to {len(hosts_for_bundle)} hosts "
             f"with {workers} parallel workers"
         )
-        remote_archive = f"/tmp/{bundle.name}"
+        remote_archive = _validated_dependency_remote_archive(bundle)
 
         def one(host: str) -> str:
             selected = [
@@ -2858,29 +2869,45 @@ def _deploy_dependencies(required_files: list[tuple[str, list[str]]]) -> None:
                 result = "failed"
                 stderr = ""
                 try:
-                    uploaded = subprocess.run(
-                        scp_command + [str(bundle), f"{host}:{remote_archive}"],
-                        stdin=subprocess.DEVNULL,
-                        capture_output=True,
-                        text=True,
-                        timeout=deployment_bundle_scp_timeout_seconds,
-                    )
+                    if attempt == 1:
+                        upload_command = scp_command + [
+                            str(bundle),
+                            f"{host}:{remote_archive}",
+                        ]
+                        upload_stdin = subprocess.DEVNULL
+                    else:
+                        upload_command = ssh_command + [
+                            host,
+                            f"umask 077; cat > {shlex.quote(remote_archive)}",
+                        ]
+                        upload_stdin = bundle.open("rb")
+                    try:
+                        uploaded = subprocess.run(
+                            upload_command,
+                            stdin=upload_stdin,
+                            capture_output=True,
+                            text=True,
+                            timeout=deployment_bundle_scp_timeout_seconds,
+                        )
+                    finally:
+                        if upload_stdin is not subprocess.DEVNULL:
+                            upload_stdin.close()
                 except subprocess.TimeoutExpired as error:
                     stderr = error.stderr or ""
                     if isinstance(stderr, bytes):
                         stderr = stderr.decode(errors="replace")
-                    result = "scp TIMEOUT"
+                    result = "scp TIMEOUT" if attempt == 1 else "ssh stream TIMEOUT"
                     remove_partial_archive()
                 except OSError as error:
                     stderr = str(error)
-                    result = "scp failed"
+                    result = "scp failed" if attempt == 1 else "ssh stream failed"
                     remove_partial_archive()
                 else:
                     if uploaded.returncode:
                         stderr = uploaded.stderr or ""
                         if isinstance(stderr, bytes):
                             stderr = stderr.decode(errors="replace")
-                        result = "scp failed"
+                        result = "scp failed" if attempt == 1 else "ssh stream failed"
                         remove_partial_archive()
                     else:
                         try:
