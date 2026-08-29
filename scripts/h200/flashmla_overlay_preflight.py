@@ -172,106 +172,133 @@ def prepare(deployment: Path, overlay: Path, image: str) -> dict[str, object]:
     if overlay.exists() or overlay.is_symlink():
         if overlay.is_symlink() or not overlay.resolve().is_relative_to(deployment.resolve()):
             raise OverlayError(f"refusing unsafe overlay path: {overlay}")
-        shutil.rmtree(overlay)
-    overlay.mkdir(parents=True)
+    overlay.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=f".{overlay.name}.", dir=overlay.parent))
+    replaced = False
+    backup: Path | None = None
     for relative in FILES.values():
-        (overlay / relative).parent.mkdir(parents=True, exist_ok=True)
-    _run(
-        [
-            "docker",
-            "run",
-            "--rm",
-            "--user",
-            "0",
-            "--entrypoint",
-            "sh",
-            "-v",
-            f"{overlay}:/overlay",
-            image,
-            "-lc",
-            "cp /app/.venv/lib/python3.12/site-packages/vllm/envs.py /overlay/vllm/envs.py && "
-            "cp /app/.venv/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/flashmla_sparse.py "
-            "/overlay/vllm/v1/attention/backends/mla/flashmla_sparse.py && "
-            "cp /app/.venv/lib/python3.12/site-packages/vllm/model_executor/layers/logits_processor.py "
-            "/overlay/vllm/model_executor/layers/logits_processor.py && "
-            "cp /app/.venv/lib/python3.12/site-packages/vllm/model_executor/models/deepseek_v2.py "
-            "/overlay/vllm/model_executor/models/deepseek_v2.py && "
-            "cp /app/.venv/lib/python3.12/site-packages/vllm/v1/worker/gpu_model_runner.py "
-            "/overlay/vllm/v1/worker/gpu_model_runner.py && "
-            "cp /app/.venv/lib/python3.12/site-packages/vllm/v1/core/sched/output.py "
-            "/overlay/vllm/v1/core/sched/output.py && "
-            "cp /app/.venv/lib/python3.12/site-packages/vllm/v1/core/sched/scheduler.py "
-            "/overlay/vllm/v1/core/sched/scheduler.py && "
-            "cp /app/.venv/lib/python3.12/site-packages/vllm/model_executor/layers/attention/attention.py "
-            "/overlay/vllm/model_executor/layers/attention/attention.py && "
-            "cp /app/.venv/lib/python3.12/site-packages/vllm/model_executor/layers/attention/mla_attention.py "
-            "/overlay/vllm/model_executor/layers/attention/mla_attention.py && "
-            "cp /app/.venv/lib/python3.12/site-packages/vllm/model_executor/models/extract_hidden_states.py "
-            "/overlay/vllm/model_executor/models/extract_hidden_states.py && "
-            "cp /app/.venv/lib/python3.12/site-packages/vllm/models/deepseek_v32/nvidia/attention.py "
-            "/overlay/vllm/models/deepseek_v32/nvidia/attention.py && "
-            "chmod 0644 " + " ".join(f"/overlay/{relative}" for relative in FILES.values()),
-        ]
-    )
-    for relative in PATCHES:
-        _run(["git", "apply", "--check", "--unsafe-paths", str(deployment / relative)], cwd=overlay)
-        _run(["git", "apply", "--unsafe-paths", str(deployment / relative)], cwd=overlay)
-    for relative in FILES.values():
-        _run([sys.executable, "-m", "py_compile", str(overlay / relative)])
-    test_path = deployment / TEST_FILE
-    _run(
-        [
-            "docker",
-            "run",
-            "--rm",
-            "--entrypoint",
-            "sh",
-            "-v",
-            f"{overlay}:/overlay:ro",
-            "-v",
-            f"{test_path}:/tmp/test.py:ro",
-            "-e",
-            "VLLM_V026_SOURCE_ROOT=/overlay",
-            image,
-            "-lc",
-            "/app/.venv/bin/python /tmp/test.py && "
-            "grep -q 'get_selected_token_logprobs' /overlay/vllm/model_executor/layers/logits_processor.py && "
-            "grep -q 'class GlmMoeDsaForCausalLM' /overlay/vllm/model_executor/models/deepseek_v2.py && "
-            "grep -q 'compute_selected_token_logprobs' /overlay/vllm/model_executor/models/deepseek_v2.py && "
-            "grep -q 'prime_exact_target_prompt_logprobs' /overlay/vllm/v1/worker/gpu_model_runner.py && "
-            "grep -q 'prime_router_trace' /overlay/vllm/v1/worker/gpu_model_runner.py && "
-            "grep -q 'class RouterTracePacket' /overlay/vllm/v1/core/sched/output.py && "
-            "grep -q 'prime_router_trace_packet' /overlay/vllm/v1/core/sched/scheduler.py && "
-            "grep -q 'mark_h200_trace_flags' /overlay/vllm/v1/worker/gpu_model_runner.py",
-        ]
-    )
-    for relative in SOURCE_FILES.values():
-        source_path = deployment / relative
-        if not source_path.is_file() or source_path.is_symlink():
-            raise OverlayError(f"source file is missing or not regular: {source_path}")
-        _run([sys.executable, "-m", "py_compile", str(source_path)])
-    trace_source = deployment / SOURCE_FILES["parity_router_trace"]
-    if "def h200_trace_request(" not in trace_source.read_text():
-        raise OverlayError("parity_router_trace does not export h200_trace_request")
-    manifest = {
-        "preflight_passed": True,
-        "image": image,
-        "image_id": image_id(image),
-        "files": {name: sha256(overlay / relative) for name, relative in FILES.items()},
-        "runtime_mounts": RUNTIME_MOUNTS,
-        "patches": {relative: sha256(deployment / relative) for relative in PATCHES},
-        "test_sha256": sha256(test_path),
-        "source_files": {name: sha256(deployment / relative) for name, relative in SOURCE_FILES.items()},
-        "chunk_tokens": 2048,
-        "selected_target_prompt_logprobs": True,
-    }
-    with tempfile.NamedTemporaryFile("w", dir=overlay, delete=False) as stream:
-        json.dump(manifest, stream, indent=2, sort_keys=True)
-        stream.write("\n")
-        temporary = Path(stream.name)
-    os.replace(temporary, _manifest_path(overlay))
-    verify_manifest(deployment, overlay, image)
-    return manifest
+        (staging / relative).parent.mkdir(parents=True, exist_ok=True)
+    try:
+        _run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--user",
+                "0",
+                "--entrypoint",
+                "sh",
+                "-v",
+                f"{staging}:/overlay",
+                image,
+                "-lc",
+                "cp /app/.venv/lib/python3.12/site-packages/vllm/envs.py /overlay/vllm/envs.py && "
+                "cp /app/.venv/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/flashmla_sparse.py "
+                "/overlay/vllm/v1/attention/backends/mla/flashmla_sparse.py && "
+                "cp /app/.venv/lib/python3.12/site-packages/vllm/model_executor/layers/logits_processor.py "
+                "/overlay/vllm/model_executor/layers/logits_processor.py && "
+                "cp /app/.venv/lib/python3.12/site-packages/vllm/model_executor/models/deepseek_v2.py "
+                "/overlay/vllm/model_executor/models/deepseek_v2.py && "
+                "cp /app/.venv/lib/python3.12/site-packages/vllm/v1/worker/gpu_model_runner.py "
+                "/overlay/vllm/v1/worker/gpu_model_runner.py && "
+                "cp /app/.venv/lib/python3.12/site-packages/vllm/v1/core/sched/output.py "
+                "/overlay/vllm/v1/core/sched/output.py && "
+                "cp /app/.venv/lib/python3.12/site-packages/vllm/v1/core/sched/scheduler.py "
+                "/overlay/vllm/v1/core/sched/scheduler.py && "
+                "cp /app/.venv/lib/python3.12/site-packages/vllm/model_executor/layers/attention/attention.py "
+                "/overlay/vllm/model_executor/layers/attention/attention.py && "
+                "cp /app/.venv/lib/python3.12/site-packages/vllm/model_executor/layers/attention/mla_attention.py "
+                "/overlay/vllm/model_executor/layers/attention/mla_attention.py && "
+                "cp /app/.venv/lib/python3.12/site-packages/vllm/model_executor/models/extract_hidden_states.py "
+                "/overlay/vllm/model_executor/models/extract_hidden_states.py && "
+                "cp /app/.venv/lib/python3.12/site-packages/vllm/models/deepseek_v32/nvidia/attention.py "
+                "/overlay/vllm/models/deepseek_v32/nvidia/attention.py && "
+                "chmod 0644 " + " ".join(f"/overlay/{relative}" for relative in FILES.values()),
+            ]
+        )
+        for relative in PATCHES:
+            _run(["git", "apply", "--check", "--unsafe-paths", str(deployment / relative)], cwd=staging)
+            _run(["git", "apply", "--unsafe-paths", str(deployment / relative)], cwd=staging)
+        for relative in FILES.values():
+            _run([sys.executable, "-m", "py_compile", str(staging / relative)])
+        test_path = deployment / TEST_FILE
+        _run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--entrypoint",
+                "sh",
+                "-v",
+                f"{staging}:/overlay:ro",
+                "-v",
+                f"{test_path}:/tmp/test.py:ro",
+                "-e",
+                "VLLM_V026_SOURCE_ROOT=/overlay",
+                image,
+                "-lc",
+                "/app/.venv/bin/python /tmp/test.py && "
+                "grep -q 'get_selected_token_logprobs' /overlay/vllm/model_executor/layers/logits_processor.py && "
+                "grep -q 'class GlmMoeDsaForCausalLM' /overlay/vllm/model_executor/models/deepseek_v2.py && "
+                "grep -q 'compute_selected_token_logprobs' /overlay/vllm/model_executor/models/deepseek_v2.py && "
+                "grep -q 'prime_exact_target_prompt_logprobs' /overlay/vllm/v1/worker/gpu_model_runner.py && "
+                "grep -q 'prime_router_trace' /overlay/vllm/v1/worker/gpu_model_runner.py && "
+                "grep -q 'class RouterTracePacket' /overlay/vllm/v1/core/sched/output.py && "
+                "grep -q 'prime_router_trace_packet' /overlay/vllm/v1/core/sched/scheduler.py && "
+                "grep -q 'mark_h200_trace_flags' /overlay/vllm/v1/worker/gpu_model_runner.py",
+            ]
+        )
+        for relative in SOURCE_FILES.values():
+            source_path = deployment / relative
+            if not source_path.is_file() or source_path.is_symlink():
+                raise OverlayError(f"source file is missing or not regular: {source_path}")
+            _run([sys.executable, "-m", "py_compile", str(source_path)])
+        trace_source = deployment / SOURCE_FILES["parity_router_trace"]
+        if "def h200_trace_request(" not in trace_source.read_text():
+            raise OverlayError("parity_router_trace does not export h200_trace_request")
+        manifest = {
+            "preflight_passed": True,
+            "image": image,
+            "image_id": image_id(image),
+            "files": {name: sha256(staging / relative) for name, relative in FILES.items()},
+            "runtime_mounts": RUNTIME_MOUNTS,
+            "patches": {relative: sha256(deployment / relative) for relative in PATCHES},
+            "test_sha256": sha256(test_path),
+            "source_files": {name: sha256(deployment / relative) for name, relative in SOURCE_FILES.items()},
+            "chunk_tokens": 2048,
+            "selected_target_prompt_logprobs": True,
+        }
+        with tempfile.NamedTemporaryFile("w", dir=staging, delete=False) as stream:
+            json.dump(manifest, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+            temporary = Path(stream.name)
+        os.replace(temporary, _manifest_path(staging))
+        verify_manifest(deployment, staging, image)
+
+        if overlay.exists() or overlay.is_symlink():
+            backup = Path(tempfile.mkdtemp(prefix=f".{overlay.name}.old-", dir=overlay.parent))
+            backup.rmdir()
+            os.replace(overlay, backup)
+        try:
+            os.replace(staging, overlay)
+            replaced = True
+        except OSError:
+            if backup is not None and not overlay.exists():
+                os.replace(backup, overlay)
+                backup = None
+            raise
+        if backup is not None:
+            shutil.rmtree(backup)
+            backup = None
+        verify_manifest(deployment, overlay, image)
+        return manifest
+    except OSError as error:
+        raise OverlayError(f"overlay replacement failed: {error}") from error
+    finally:
+        if not replaced and staging.exists():
+            shutil.rmtree(staging)
+        if backup is not None and backup.exists():
+            shutil.rmtree(backup)
 
 
 def main() -> int:

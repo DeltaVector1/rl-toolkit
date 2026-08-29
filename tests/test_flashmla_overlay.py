@@ -107,6 +107,76 @@ class FlashMLAOverlayTests(unittest.TestCase):
             with self.assertRaises(overlay.OverlayError):
                 overlay.verify_manifest(self.deployment, self.overlay, "base")
 
+    def _prepare_run(self, command, *, cwd=None, env=None):
+        if command[0] != "docker":
+            return
+        mount = next(
+            (argument for argument in command if argument.endswith(":/overlay")),
+            None,
+        )
+        if mount is None:
+            return
+        staging = Path(mount[:-len(":/overlay")])
+        for relative in overlay.FILES.values():
+            path = staging / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(relative)
+
+    def test_prepare_refreshes_old_manifest_with_all_patches_and_mounts(self):
+        manifest = json.loads((self.overlay / "manifest.json").read_text())
+        manifest["runtime_mounts"] = None
+        (self.overlay / "manifest.json").write_text(json.dumps(manifest))
+        with (
+            mock.patch.object(overlay, "image_id", return_value=overlay.EXPECTED_IMAGE_ID),
+            mock.patch.object(overlay, "_run", side_effect=self._prepare_run),
+        ):
+            refreshed = overlay.prepare(self.deployment, self.overlay, "base")
+
+        self.assertEqual(refreshed["runtime_mounts"], overlay.RUNTIME_MOUNTS)
+        self.assertEqual(set(refreshed["patches"]), set(overlay.PATCHES))
+        self.assertEqual(json.loads((self.overlay / "manifest.json").read_text()), refreshed)
+        self.assertEqual(list(self.deployment.glob(f".{self.overlay.name}.*")), [])
+
+    def test_prepare_replaces_overlay_as_one_directory_transaction(self):
+        replacements = []
+        real_replace = overlay.os.replace
+
+        def record_replace(source, destination):
+            replacements.append((Path(source), Path(destination)))
+            return real_replace(source, destination)
+
+        with (
+            mock.patch.object(overlay, "image_id", return_value=overlay.EXPECTED_IMAGE_ID),
+            mock.patch.object(overlay, "_run", side_effect=self._prepare_run),
+            mock.patch.object(overlay.os, "replace", side_effect=record_replace),
+        ):
+            overlay.prepare(self.deployment, self.overlay, "base")
+
+        self.assertTrue(
+            any(
+                destination == self.overlay and source.parent == self.overlay.parent
+                for source, destination in replacements
+            )
+        )
+
+    def test_prepare_failure_keeps_old_overlay_and_cleans_staging(self):
+        marker = self.overlay / "old-marker"
+        marker.write_text("keep")
+
+        def fail_run(command, *, cwd=None, env=None):
+            if command[0] == "docker":
+                raise overlay.OverlayError("pinned image failed")
+
+        with (
+            mock.patch.object(overlay, "image_id", return_value=overlay.EXPECTED_IMAGE_ID),
+            mock.patch.object(overlay, "_run", side_effect=fail_run),
+        ):
+            with self.assertRaises(overlay.OverlayError):
+                overlay.prepare(self.deployment, self.overlay, "base")
+
+        self.assertEqual(marker.read_text(), "keep")
+        self.assertEqual(list(self.deployment.glob(f".{self.overlay.name}.*")), [])
+
 
 if __name__ == "__main__":
     unittest.main()

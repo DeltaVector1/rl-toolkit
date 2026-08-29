@@ -33,6 +33,13 @@ if [[ -z "$model_mount" || ! -f "$model_mount/config.json" ]]; then
 fi
 python3 "$deployment/scripts/glm52_h200_mtp_preflight.py" \
   --config "$inference_config" --model-config "$model_mount/config.json"
+if ! python3 "$overlay_preflight" verify \
+  --deployment "$deployment" --overlay "$overlay_root" --image "$image"; then
+  # Refresh stale or pre-schema overlays through the pinned-image preparation
+  # path.  The strict verification below remains mandatory after refresh.
+  python3 "$overlay_preflight" prepare \
+    --deployment "$deployment" --overlay "$overlay_root" --image "$image"
+fi
 python3 "$overlay_preflight" verify \
   --deployment "$deployment" --overlay "$overlay_root" --image "$image"
 
