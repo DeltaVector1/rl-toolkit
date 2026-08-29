@@ -3031,6 +3031,120 @@ exit "$fail"
         raise RuntimeError(f"resume adapter copy failed: {detail}")
 
 
+def _cold_run_paths(run: str) -> tuple[str, str, str]:
+    """Return the validated run root, run directory, and service directory."""
+    if not isinstance(run, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", run):
+        raise Refused("run name can contain only letters, digits, '_' and '-'")
+    if not isinstance(run_root, str):
+        raise Refused(f"configured runs path is unsafe: {run_root!r}")
+    root = Path(run_root)
+    if not root.is_absolute() or root == Path("/"):
+        raise Refused(f"configured runs path is unsafe: {run_root!r}")
+    # Keep this lexical check separate from Path.resolve(): the path is checked
+    # again on each remote host, where a symlink could otherwise escape runs/.
+    if any(part in {"", ".", ".."} for part in root.parts):
+        raise Refused(f"configured runs path is unsafe: {run_root!r}")
+    run_parent = root / run
+    run_dir = run_parent / f"run_{run}"
+    if run_parent.parent != root or run_dir.parent != run_parent or run_dir == root:
+        raise Refused(f"run path is unsafe: {run!r}")
+    return str(root), str(run_parent), str(run_dir)
+
+
+def _cold_cleanup_script(run: str) -> str:
+    """Build a bounded remote cleanup for one configured run only."""
+    runs_path, run_parent, run_dir = _cold_run_paths(run)
+    return f"""set -euo pipefail
+runs_path={shlex.quote(runs_path)}
+run_parent={shlex.quote(run_parent)}
+run_dir={shlex.quote(run_dir)}
+
+# Refuse symlinked path components before removing anything.  A missing run is
+# a valid cold-start state and must not cause the parent directory to be made.
+case "$run_parent" in
+  "$runs_path"/*) ;;
+  *) echo "cold cleanup refused: run is outside configured runs path" >&2; exit 1 ;;
+esac
+case "$run_dir" in
+  "$run_parent"/run_*) ;;
+  *) echo "cold cleanup refused: service directory is outside run" >&2; exit 1 ;;
+esac
+if [ -L "$runs_path" ] || [ -L "$run_parent" ] || [ -L "$run_dir" ]; then
+  echo "cold cleanup refused: configured run path is a symlink" >&2
+  exit 1
+fi
+if [ ! -e "$run_parent" ]; then
+  echo "cold cleanup: no state at $run_parent"
+  exit 0
+fi
+[ -d "$run_parent" ] || {{ echo "cold cleanup refused: run path is not a directory" >&2; exit 1; }}
+# Single-run trainers keep checkpoints at output_dir/checkpoints. Remove this
+# exact run's copy even when the service subdirectory was never created.
+remove_dir() {{
+  local path=$1 label=$2
+  if [ -d "$path" ] || [ -L "$path" ]; then
+    rm -rf -- "$path"
+    echo "cold cleanup: removed $label ($path)"
+    removed=$((removed + 1))
+  fi
+}}
+removed=0
+remove_dir "$run_parent/checkpoints" "trainer checkpoints and optimizer state"
+if [ ! -e "$run_dir" ]; then
+  echo "cold cleanup: no service state at $run_dir"
+  exit 0
+fi
+[ -d "$run_dir" ] || {{ echo "cold cleanup refused: service path is not a directory" >&2; exit 1; }}
+
+remove_file() {{
+  local path=$1
+  if [ -f "$path" ] || [ -L "$path" ]; then
+    rm -f -- "$path"
+    echo "cold cleanup: removed $path"
+    removed=$((removed + 1))
+  fi
+}}
+# These directories contain only generated run state.  In particular,
+# rollouts includes train_rollouts.bin and its .delivered/partial state;
+# broadcasts contains old adapters and STABLE markers; checkpoints contains
+# optimizer/progress state.  All paths remain below this exact run.
+remove_dir "$run_dir/rollouts" "rollout train_rollouts.bin batches and delivery markers"
+remove_dir "$run_dir/broadcasts" "broadcast adapters and STABLE markers"
+remove_dir "$run_dir/checkpoints" "trainer checkpoints and optimizer state"
+remove_dir "$run_dir/control" "orchestrator control state"
+remove_dir "$run_dir/.incoming" "in-flight delivery state"
+remove_dir "$run_dir/hf-cache" "run-local model/data cache"
+remove_file "$run_dir/.batch-sync.pid"
+remove_file "$run_dir/.batch-sync.lock"
+remove_file "$run_dir/.microbatch-sync.pid"
+remove_file "$run_dir/.microbatch-sync.lock"
+remove_file "$run_parent/parity-step1.json"
+echo "cold cleanup: complete ($removed entries) target=$run_dir"
+"""
+
+
+def _cold_start_cleanup(run: str, nodes: list[str]) -> None:
+    """Remove stale generated state for one run before a cold start."""
+    _cold_run_paths(run)  # Validate before any host action.
+    targets = list(dict.fromkeys([*nodes, orchestrator_host]))
+    targets = [_check_host(host) for host in targets]
+    script = _cold_cleanup_script(run)
+
+    def one(host: str) -> tuple[int, str]:
+        return _ssh(host, script, timeout=300)
+
+    results = _fan(targets, one)
+    failures = []
+    for host, (code, output) in results.items():
+        detail = " | ".join(line.strip() for line in output.splitlines() if line.strip())
+        if code:
+            failures.append(f"{host}: {detail or f'exit {code}'}")
+        else:
+            print(f"cold cleanup {run} on {host}: {detail or 'complete'}")
+    if failures:
+        raise RuntimeError("cold cleanup failed: " + "; ".join(failures))
+
+
 def start(
     run: str,
     mode: str = "cold",
@@ -3043,6 +3157,7 @@ def start(
     """Start a run from one configured profile."""
     if mode not in ("cold", "restart"):
         raise Refused('mode must be "cold" or "restart"')
+    _cold_run_paths(run)
     if (resume_adapter is None) != (resume_step is None):
         raise Refused("resume_adapter and resume_step must be set together")
     selected = _profile(profile)
@@ -3206,6 +3321,8 @@ def start(
         raise RuntimeError(f"old trainer stop failed on {stop_failures}")
     time.sleep(20)
 
+    if mode == "cold":
+        _cold_start_cleanup(run, nodes)
     launch_adapter()
     if mode == "cold":
         launch_orch()
