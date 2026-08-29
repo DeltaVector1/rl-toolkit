@@ -135,7 +135,7 @@ class AdapterStageTimeoutTest(unittest.TestCase):
             ssh_scripts.append((script, timeout))
             return 0, "reloaded exact engine watchdog(s) without restarting an engine\n"
 
-        with mock.patch.object(training_ops, "current_run", return_value="x85"), mock.patch.object(
+        with mock.patch.object(training_ops, "current_run", return_value="glm52"), mock.patch.object(
             training_ops, "deploy", side_effect=lambda *args: deployed.append(args) or True
         ), mock.patch.object(
             training_ops, "_ssh", side_effect=fake_ssh
@@ -150,7 +150,7 @@ class AdapterStageTimeoutTest(unittest.TestCase):
         self.assertIn("START=/data/glm52-rl/deployment/.agents/skills/training-ops/runtime/h200/start_inference.sh", script)
         self.assertIn("ENGINE_CONTAINER=glm52-decensor-h200", script)
         self.assertIn("PORT=8000", script)
-        self.assertIn("WATCHDOG_IDENTITY=engine-watchdog:h200a:x85:8000", script)
+        self.assertIn("WATCHDOG_IDENTITY=engine-watchdog:h200a:glm52:8000", script)
         self.assertIn("watchdog_legacy_matches", script)
         self.assertIn("watchdog settings mismatch", script)
         self.assertIn("watchdog identity is ambiguous after restart", script)

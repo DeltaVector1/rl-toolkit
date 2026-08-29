@@ -37,7 +37,7 @@ class OrchestratorRepairTest(unittest.TestCase):
                 return 0, "started exact orchestrator container glm52-decensor-orchestrator\n"
             return 0, ""
 
-        with mock.patch.object(training_ops, "current_run", return_value="x85"), mock.patch.object(
+        with mock.patch.object(training_ops, "current_run", return_value="glm52"), mock.patch.object(
             training_ops, "status", return_value=before
         ), mock.patch.object(training_ops, "deploy", return_value=True) as deploy:
             with mock.patch.object(training_ops, "_ssh", side_effect=fake_ssh):
@@ -56,7 +56,7 @@ class OrchestratorRepairTest(unittest.TestCase):
             orch_up=False,
             nodes=[training_ops.NodeState(host="n82", gpu_util=80, reachable=True)],
         )
-        with mock.patch.object(training_ops, "current_run", return_value="x85"), mock.patch.object(
+        with mock.patch.object(training_ops, "current_run", return_value="glm52"), mock.patch.object(
             training_ops, "status", return_value=before
         ), mock.patch.object(training_ops, "deploy") as deploy:
             with self.assertRaisesRegex(training_ops.Refused, "idle or waiting"):

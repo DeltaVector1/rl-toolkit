@@ -36,7 +36,7 @@ exit 0
 EOF
 chmod +x "$tmp/bin"/*
 
-TEST_TRAINER_OUTPUT="$tmp/storage/run_x85" \
+TEST_TRAINER_OUTPUT="$tmp/storage/run_glm52" \
 PATH="$tmp/bin:$PATH" \
 deployment_root="$root" \
 storage_root="$tmp/storage" \
@@ -46,14 +46,14 @@ master_node_id=82 \
 node_id=82 \
 trainer_nodes='82 76 77 78 80 83 84 85' \
 trainer_sync_targets='10.92.20.82 10.92.20.76 10.92.20.77 10.92.20.78 10.92.20.80 10.92.20.83 10.92.20.84 10.92.20.85' \
-RUN=x85 \
-RUN_NAME=run_x85 \
+RUN=glm52 \
+RUN_NAME=run_glm52 \
 TRAINER_CONFIG="$root/configs/paused/glm52/trainer.toml" \
 bash "$cluster" trainer >/dev/null 2>&1
 
-sync_log="$tmp/storage/microbatch-sync-x85.log"
+sync_log="$tmp/storage/microbatch-sync-glm52.log"
 test -f "$sync_log"
-grep -Fx '<run_dir='"$tmp/storage/run_x85"'>' "$sync_log"
+grep -Fx '<run_dir='"$tmp/storage/run_glm52"'>' "$sync_log"
 grep -Fx '<nodes=10.92.20.76 10.92.20.77 10.92.20.78 10.92.20.80 10.92.20.83 10.92.20.84 10.92.20.85>' "$sync_log"
 ! grep -Fq '<nodes=n82' "$sync_log"
 ! grep -Fq '<RUN_DIR=' "$sync_log"

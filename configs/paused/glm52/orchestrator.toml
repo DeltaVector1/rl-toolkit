@@ -1,4 +1,4 @@
-output_dir = "/data/glm52-rl/runs/x85/run_x85"
+output_dir = "/data/glm52-rl/runs/glm52/run_glm52"
 max_steps = 20
 seq_len = 32768
 batch_size = 1024
@@ -12,9 +12,9 @@ level = "info"
 
 [swanlab]
 project = "glm-runs"
-name = "orchestrator-x85"
+name = "orchestrator-glm52"
 group = "glm-runs"
-tags = ["x85", "glm-5.2", "lora-r32", "production", "20-step"]
+tags = ["glm-5.2", "decensor", "grpo", "lora-r32", "20-step"]
 
 [file_monitor]
 filename = "rollout-metrics.jsonl"
@@ -73,8 +73,8 @@ api_key_var = "VLLM_API_KEY"
 
 [weight_broadcast]
 type = "filesystem"
-source_url = "http://127.0.0.1:18100/x85"
-source_dir = "/data/glm52-rl/runs/x85"
+source_url = "http://127.0.0.1:18100/glm52"
+source_dir = "/data/glm52-rl/runs/glm52"
 
 [rollout_transport]
 type = "filesystem"

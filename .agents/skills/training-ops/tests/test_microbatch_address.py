@@ -11,7 +11,7 @@ import training_ops
 class MicrobatchAddressTest(unittest.TestCase):
     def test_profile_is_selected_from_active_run_output(self):
         self.assertEqual(
-            training_ops._profile_for_run("x85")["trainer"],
+            training_ops._profile_for_run("glm52")["trainer"],
             "configs/paused/glm52/trainer.toml",
         )
         self.assertEqual(

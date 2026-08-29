@@ -1,4 +1,4 @@
-output_dir = "/data/glm52-rl/runs/x85"
+output_dir = "/data/glm52-rl/runs/glm52"
 max_steps = 20
 dist_timeout_seconds = 5400
 enable_router_replay = false
@@ -9,12 +9,12 @@ ranks_filter = [0]
 
 [swanlab]
 project = "glm-runs"
-name = "trainer-x85"
+name = "trainer-glm52"
 group = "glm-runs"
-tags = ["x85", "glm-5.2", "lora-r32", "production", "20-step"]
+tags = ["glm-5.2", "decensor", "grpo", "lora-r32", "20-step"]
 
 [file_monitor]
-filename = "run_x85/trainer-metrics.jsonl"
+filename = "run_glm52/trainer-metrics.jsonl"
 
 [model]
 name = "/data/ZiphuAI/GLM-5.2-FP8"
