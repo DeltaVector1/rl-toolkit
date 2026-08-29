@@ -43,6 +43,17 @@ class MicrobatchAddressTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "not an IP address"):
                 training_ops._ssh_address("n76")
 
+    def test_inference_script_uses_the_run_profile_ports(self):
+        glm_script = training_ops._inference_script(
+            "h200a", training_ops.glm_model, training_ops.glm_inference_container, "glm52"
+        )
+        muse_script = training_ops._inference_script(
+            "h200a", training_ops.muse_model, training_ops.muse_inference_container, "muse"
+        )
+        self.assertIn("for port in 8000", glm_script)
+        self.assertNotIn("8001", glm_script)
+        self.assertIn("for port in 8001 8002 8003 8004 8005 8006 8007 8008", muse_script)
+
 
 if __name__ == "__main__":
     unittest.main()

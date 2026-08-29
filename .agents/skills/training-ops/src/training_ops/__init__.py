@@ -431,8 +431,10 @@ echo "WD $(pgrep -f 'bash .*[e]ngine_watchdog.sh' | wc -l)"
 """
 
 
-def _inference_script(host: str, model: str, container: str) -> str:
-    settings = _inference_config(host)
+def _inference_script(
+    host: str, model: str, container: str, kind: str | None = None
+) -> str:
+    settings = _inference_config(host, kind)
     gpu_count = settings.get("gpu_count")
     if not isinstance(gpu_count, int) or gpu_count < 1:
         raise RuntimeError(f"GPU count for {host} is invalid")
@@ -1272,7 +1274,7 @@ def acceptance(run: str = "", quiet: bool = False) -> AcceptanceReport:
 
 def logs(role: str = "trainer", lines: int = 200) -> str:
     """Read the current container tail without a separate SSH command."""
-    kind = _profile()["kind"]
+    kind = _profile_for_run(current_run())["kind"]
     inference_container = (
         muse_inference_container if kind == "muse" else glm_inference_container
     )
@@ -1364,7 +1366,8 @@ PY
 def status(run: str = "", quiet: bool = False) -> Status:
     """Probe every part of the run once and return the whole picture."""
     run = run or current_run()
-    muse_run = _profile()["kind"] == "muse"
+    kind = _profile_for_run(run)["kind"]
+    muse_run = kind == "muse"
     engine_model = muse_model if muse_run else glm_model
     engine_container = muse_inference_container if muse_run else glm_inference_container
     s = Status(
@@ -1378,7 +1381,7 @@ def status(run: str = "", quiet: bool = False) -> Status:
     def engine(h):
         return _ssh(
             h,
-            _inference_script(h, engine_model, engine_container),
+            _inference_script(h, engine_model, engine_container, kind),
             timeout=90,
         )
 
@@ -1631,13 +1634,16 @@ def tunnels() -> dict[int, str]:
 def engines(run: str = "") -> dict[str, EngineState]:
     """Probe every configured inference host with a real completion."""
     run = run or current_run()
-    muse_run = _profile()["kind"] == "muse"
+    kind = _profile_for_run(run)["kind"]
+    muse_run = kind == "muse"
     engine_model = muse_model if muse_run else glm_model
     engine_container = muse_inference_container if muse_run else glm_inference_container
     states = []
     for host, (rc, out) in _fan(
         inference_hosts,
-        lambda h: _ssh(h, _inference_script(h, engine_model, engine_container), timeout=90),
+        lambda h: _ssh(
+            h, _inference_script(h, engine_model, engine_container, kind), timeout=90
+        ),
     ).items():
         e = EngineState(host=host, reachable=(rc == 0))
         for line in out.splitlines():
