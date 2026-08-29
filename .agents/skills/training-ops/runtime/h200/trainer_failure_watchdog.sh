@@ -4,12 +4,12 @@ set -uo pipefail
 
 RUN=${RUN:?set RUN}
 RUN_NAME=${RUN_NAME:?set RUN_NAME}
-TRAINER_NODES=${TRAINER_NODES:-"82 76 77 78 80 83 84 85"}
+TRAINER_ADDRESSES=${TRAINER_ADDRESSES:?set TRAINER_ADDRESSES}
 INTERVAL=${INTERVAL:-30}
 STARTUP_GRACE=${STARTUP_GRACE:-900}
 MAX_MISSES=${MAX_MISSES:-2}
-TRAINER_CT=glm52-decensor-trainer
-ORCH_CT=glm52-decensor-orchestrator
+TRAINER_CT=${TRAINER_CT:?set TRAINER_CT}
+ORCH_CT=${ORCH_CT:?set ORCH_CT}
 run_dir="/data/glm52-rl/runs/$RUN/$RUN_NAME"
 
 log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
@@ -17,8 +17,8 @@ log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
 trainer_failures() {
   local output
   if ! output=$(ssh -o BatchMode=yes -o ConnectTimeout=30 china-trainer \
-    "failures=''; for id in $TRAINER_NODES; do
-       host=10.92.20.\$id
+    "failures=''; for host in $TRAINER_ADDRESSES; do
+       id=\${host##*.}
        state=\$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=20 \"\$host\" \\
          \"sudo docker ps --filter name=${TRAINER_CT} --format up 2>/dev/null | head -1\" \\
          2>/dev/null || true)

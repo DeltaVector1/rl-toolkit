@@ -285,7 +285,6 @@ echo "TRAINER_LOGAGE $(sudo docker logs -t --tail 1 __TRAINER__ 2>&1 | tail -1 |
 echo "ORCH_LOGAGE $(sudo docker logs -t --tail 1 __ORCH__ 2>&1 | tail -1 | cut -d' ' -f1)"
 echo "JUDGE $(curl -s -o /dev/null -m 10 -w '%{http_code}' http://127.0.0.1:__JUDGE__/v1/models)"
 echo "ADAPTER $(curl -s -o /dev/null -m 10 -w '%{http_code}' http://127.0.0.1:__ADAPTER__/)"
-echo "SUP_RUN $(pgrep -f 'bash .*[r]un_supervisor.sh' | wc -l)"
 echo "SUP_TUN $(pgrep -f 'bash .*[t]unnel_watchdog.sh' | wc -l)"
 echo "SUP_TUN_LOG $(tail -1 /data/glm52-rl/tunnel_watchdog.log 2>/dev/null | cut -d' ' -f1)"
 """
@@ -573,7 +572,6 @@ class Status:
     orch_log_age: float | None = None
     judge: str = "000"
     adapter: str = "000"
-    supervisor_run: bool = False
     supervisor_tunnel: bool = False
     supervisor_tunnel_log_age: float | None = None
     nodes: list[NodeState] = field(default_factory=list)
@@ -629,7 +627,7 @@ class Status:
                 f"orchestrator {_hms(self.orch_log_age)} ago"
             )
             L.append(
-                f"  supervisors: run={'yes' if self.supervisor_run else 'no'} "
+                f"  supervisors: local=disabled "
                 f"tunnel={'yes' if self.supervisor_tunnel else 'no'} "
                 f"batch-sync={'yes' if self.batch_sync else 'no'} "
                 f"trainer-check={'yes' if self.trainer_failure_watchdog else 'no'} "
@@ -1370,7 +1368,6 @@ def status(run: str = "", quiet: bool = False) -> Status:
     s.orch_log_age = _age(h.get("ORCH_LOGAGE", ""))
     s.judge = h.get("JUDGE", "000")
     s.adapter = h.get("ADAPTER", "000")
-    s.supervisor_run = int(h.get("SUP_RUN", 0) or 0) > 0
     s.supervisor_tunnel = int(h.get("SUP_TUN", 0) or 0) > 0
     s.supervisor_tunnel_log_age = _age(h.get("SUP_TUN_LOG", ""))
 
@@ -1474,8 +1471,6 @@ def _warnings(s: Status) -> list[str]:
             f"adapter server returned {s.adapter} on port {adapter_port}. "
             "If the engines cannot fetch the LoRA, they keep serving the base model and nothing learns."
         )
-    if not trainer_only and not s.supervisor_run:
-        w.append("fail-closed run supervisor is not running")
     if not trainer_only and not s.supervisor_tunnel:
         w.append("tunnel watchdog is not running")
     elif not trainer_only and s.supervisor_tunnel_log_age and s.supervisor_tunnel_log_age > 300:
@@ -2725,6 +2720,9 @@ def start(
     if missing_trainer_config:
         raise Refused(f"missing trainer config {trainer_config} on {missing_trainer_config}")
     trainer_nodes = " ".join(n.lstrip("n") for n in nodes)
+    trainer_addresses = " ".join(
+        f"10.92.20.{n.removeprefix('n')}" for n in nodes
+    )
     runtime_env = (
         f"deployment_root={shlex.quote(remote_repo)} "
         f"storage_root={shlex.quote(storage_root)} "
@@ -2810,7 +2808,11 @@ def start(
         print(f"starting edge orchestrator on {orchestrator_host}")
         rc, out = _ssh(
             orchestrator_host,
-            f"RUN={run} RUN_NAME={name} ORCH_CONFIG={edge_config} "
+            f"RUN={shlex.quote(run)} RUN_NAME={shlex.quote(name)} "
+            f"ORCH_CONFIG={shlex.quote(edge_config)} "
+            f"TRAINER_ADDRESSES={shlex.quote(trainer_addresses)} "
+            f"TRAINER_CT={shlex.quote(trainer_container)} "
+            f"ORCH_CT={shlex.quote(orchestrator_container)} "
             f"bash {orchestrator_launcher}",
             300,
         )
@@ -2818,6 +2820,11 @@ def start(
             raise RuntimeError(f"edge orchestrator start failed on {orchestrator_host}: {out}")
 
     print(f"stopping any previous containers for {run}")
+    _remote_ok(
+        trainer_head,
+        "pkill -f 'bash .*[r]un_supervisor.sh' 2>/dev/null || true; echo done",
+        "old local supervisor stop",
+    )
     _remote_ok(
         orchestrator_host,
         f"pkill -f '[s]ync_rollout_batches.sh' 2>/dev/null; "
@@ -2851,33 +2858,6 @@ def start(
         launch_orch()
 
     if supervisors:
-        _remote_ok(
-            trainer_head,
-            "pkill -f '[r]un_supervisor.sh' 2>/dev/null; echo done",
-            "old run supervisor stop",
-        )
-        time.sleep(3)
-        _remote_ok(
-            trainer_head,
-            f"nohup setsid env run={shlex.quote(run)} run_name={shlex.quote(name)} "
-            f"runs_path={shlex.quote(run_root)} "
-            f"trainer_hosts={shlex.quote(' '.join(nodes))} "
-            f"local_host={shlex.quote(trainer_head)} "
-            f"trainer_container_name={shlex.quote(trainer_container)} "
-            f"orchestrator_container_name={shlex.quote(orchestrator_container)} "
-            "interval=120 "
-            f"bash {runtime_root}/china/run_supervisor.sh >> /data/glm52-rl/run_supervisor.log 2>&1 </dev/null & disown",
-            "run supervisor start",
-        )
-        time.sleep(3)
-        n = _remote_ok(
-            trainer_head,
-            "pgrep -f 'bash .*[r]un_supervisor.sh' | wc -l",
-            "run supervisor check",
-        ).strip()
-        if not n.isdigit() or int(n) < 1:
-            raise RuntimeError(f"run supervisor did not start on {trainer_head}")
-        print(f"run supervisor: {n} process(es) for {run}")
         _repair_supervisors(profile)
     print(f"started {run} in {mode} mode. Call status() in a few minutes.")
 
@@ -3002,8 +2982,14 @@ def stop() -> None:
     """Stop the edge orchestrator, then the trainer. Supervisors stop first."""
     _remote_ok(
         trainer_head,
-        "pkill -f 'bash .*[r]un_supervisor.sh'; pkill -f 'bash .*[t]unnel_watchdog.sh'; echo done",
+        "pkill -f 'bash .*[r]un_supervisor.sh' 2>/dev/null || true; "
+        "pkill -f 'bash .*[t]unnel_watchdog.sh' 2>/dev/null || true; echo done",
         "supervisor stop",
+    )
+    _remote_ok(
+        orchestrator_host,
+        "pkill -f 'bash .*[t]rainer_failure_watchdog.sh' 2>/dev/null || true; echo done",
+        "edge trainer watchdog stop",
     )
     _remote_ok(
         orchestrator_host,

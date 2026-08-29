@@ -6,6 +6,9 @@ set -uo pipefail
 
 RUN=${RUN:?set RUN}
 RUN_NAME=${RUN_NAME:?set RUN_NAME}
+TRAINER_ADDRESSES=${TRAINER_ADDRESSES:?set TRAINER_ADDRESSES}
+TRAINER_CT=${TRAINER_CT:?set TRAINER_CT}
+ORCH_CT=${ORCH_CT:?set ORCH_CT}
 deployment=/data/glm52-rl/deployment
 image=prime-rl:glm52-decensor
 config_file=${ORCH_CONFIG:-$deployment/configs/current/orchestrator.toml}
@@ -64,8 +67,8 @@ for p in "${ports[@]}"; do
   ss -tln 2>/dev/null | grep -q "127.0.0.1:$p" && echo "tunnel :$p up" || echo "tunnel :$p DOWN"
 done
 
-sudo docker rm -f glm52-decensor-orchestrator >/dev/null 2>&1 || true
-sudo docker run -d --name glm52-decensor-orchestrator \
+sudo docker rm -f "$ORCH_CT" >/dev/null 2>&1 || true
+sudo docker run -d --name "$ORCH_CT" \
   --network host --restart no \
   --env-file /data/trinity/training.env \
   -e VLLM_API_KEY=unused \
@@ -94,13 +97,15 @@ echo "orchestrator started on $(hostname) with $(basename "$config_file")"
 # as any trainer worker is gone, so the run cannot accumulate unusable batches.
 pkill -f '[t]rainer_failure_watchdog.sh' 2>/dev/null || true
 nohup setsid env RUN="$RUN" RUN_NAME="$RUN_NAME" \
+  TRAINER_ADDRESSES="$TRAINER_ADDRESSES" \
+  TRAINER_CT="$TRAINER_CT" ORCH_CT="$ORCH_CT" \
   bash "$deployment/.agents/skills/training-ops/runtime/h200/trainer_failure_watchdog.sh" \
   >>"/data/glm52-rl/trainer-failure-watchdog-$RUN.log" 2>&1 </dev/null &
 trainer_watchdog_pid=$!
 sleep 1
 if ! kill -0 "$trainer_watchdog_pid" 2>/dev/null; then
   echo "ERROR: trainer failure watchdog exited during startup" >&2
-  sudo docker rm -f glm52-decensor-orchestrator >/dev/null 2>&1 || true
+  sudo docker rm -f "$ORCH_CT" >/dev/null 2>&1 || true
   exit 1
 fi
 echo "trainer failure watchdog started (pid $trainer_watchdog_pid)"
