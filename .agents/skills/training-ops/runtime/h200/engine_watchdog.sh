@@ -31,7 +31,7 @@ ENGINE_CONTAINER=${ENGINE_CONTAINER:-glm52-decensor-h200}
 RELOAD_TRIES=${RELOAD_TRIES:-40}
 RELOAD_WAIT=${RELOAD_WAIT:-30}
 STAGING_STATUS_TIMEOUT=${STAGING_STATUS_TIMEOUT:-5}
-STAGING_GRACE=${STAGING_GRACE:-7200}
+STAGING_GRACE=${STAGING_GRACE:-330}
 # /liveness runs the vLLM collective RPC. It can prove that the workers are
 # responsive while a tiny generation is delayed by a paused or busy engine.
 LIVENESS_TIMEOUT=${LIVENESS_TIMEOUT:-15}
