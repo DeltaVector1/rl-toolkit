@@ -42,8 +42,8 @@ adapter_source_base=${ADAPTER_SOURCE_BASE:-}
 adapter_admin_urls=${ADAPTER_ADMIN_URLS:-}
 # Prefetch is only an optimization. It must not hold a stable marker or the
 # next completed rollout batch. The outer timeout covers all curl retries.
-adapter_prefetch_timeout=${ADAPTER_PREFETCH_TIMEOUT:-120}
-adapter_request_timeout=${ADAPTER_REQUEST_TIMEOUT:-45}
+adapter_prefetch_timeout=${ADAPTER_PREFETCH_TIMEOUT:-7200}
+adapter_request_timeout=${ADAPTER_REQUEST_TIMEOUT:-3600}
 
 prefetch_adapter() {
   local relative=$1 adapter_relative source_url admin status pid

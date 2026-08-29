@@ -373,14 +373,23 @@ UPDATE_WEIGHTS_TIMEOUT_S = 720.0
 FULL_CHECKPOINT_STAGE_TIMEOUT_S = 7200.0
 
 
-async def _admin_post(client: AsyncClient, path: str, *, timeout_s: float = ADMIN_TIMEOUT_S, **kwargs) -> None:
+async def _admin_post(
+    client: AsyncClient,
+    path: str,
+    *,
+    timeout_s: float = ADMIN_TIMEOUT_S,
+    total_timeout_s: float | None = None,
+    **kwargs,
+) -> None:
     """POST an admin op with a bounded per-attempt timeout, retrying transient errors.
 
-    The total wall-clock budget across all retries is twice the per-attempt timeout.
+    The total wall-clock budget across all retries is twice the per-attempt
+    timeout unless the caller provides an explicit budget.
     """
+    retry_budget = 2 * timeout_s if total_timeout_s is None else total_timeout_s
     async for attempt in AsyncRetrying(
         retry=retry_if_exception(_is_retryable_admin_error),
-        stop=stop_after_delay(2 * timeout_s) | stop_after_attempt(10),
+        stop=stop_after_delay(retry_budget) | stop_after_attempt(10),
         wait=wait_exponential(multiplier=1, min=1, max=10),
         reraise=True,
     ):
@@ -430,7 +439,8 @@ async def stage_lora_adapter(admin_clients: list[AsyncClient], lora_path: Path |
                 client,
                 "/stage_lora_adapter",
                 json={"lora_path": lora_path_posix},
-                timeout_s=LORA_LOAD_TOTAL_TIMEOUT_S,
+                timeout_s=LORA_STAGE_ATTEMPT_TIMEOUT_S,
+                total_timeout_s=LORA_STAGE_TOTAL_TIMEOUT_S,
             )
             for client in admin_clients
         ]
@@ -546,9 +556,13 @@ def _is_retryable_lora_error(exception: BaseException) -> bool:
     return False
 
 
-# Adapter files cross the control tunnel before vLLM loads them.
+# Adapter files cross the control tunnel before vLLM loads them. A rank-32 GLM
+# adapter is about 28.5 GiB, so staging needs a longer transport budget than
+# the local adapter load.
 LORA_LOAD_READ_TIMEOUT_S = 300.0
 LORA_LOAD_TOTAL_TIMEOUT_S = 600.0
+LORA_STAGE_ATTEMPT_TIMEOUT_S = 3600.0
+LORA_STAGE_TOTAL_TIMEOUT_S = 7200.0
 
 
 async def load_lora_adapter(admin_clients: list[AsyncClient], lora_name: str, lora_path: Path | str) -> None:
