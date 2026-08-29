@@ -10,12 +10,14 @@ import training_ops
 
 class OrchestratorRepairTest(unittest.TestCase):
     def test_safety_probe_does_not_require_generation(self):
-        script = training_ops._orchestrator_resume_safety_script([8000], 900)
+        script = training_ops._orchestrator_resume_safety_script([8000])
+        self.assertEqual(training_ops.orchestrator_repair_staging_max_seconds, 7200)
         self.assertIn("/health", script)
         self.assertIn("/liveness", script)
         self.assertIn("/metrics", script)
         self.assertIn("/staging_status", script)
         self.assertIn("staging exceeds the bounded limit", script)
+        self.assertIn("limit=7200", script)
         self.assertNotIn("/v1/completions", script)
 
     def test_stopped_orchestrator_is_started_after_all_guards_pass(self):

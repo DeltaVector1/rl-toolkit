@@ -89,9 +89,7 @@ deployment_bundle_scp_timeout_seconds = limits.get(
 adapter_update_engine_startup_timeout_seconds = limits[
     "adapter_update_engine_startup_timeout_seconds"
 ]
-orchestrator_repair_staging_max_seconds = limits.get(
-    "adapter_update_engine_startup_timeout_seconds", 900
-)
+orchestrator_repair_staging_max_seconds = 7200
 if (
     isinstance(adapter_update_engine_startup_timeout_seconds, bool)
     or not isinstance(adapter_update_engine_startup_timeout_seconds, int)
