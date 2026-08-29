@@ -5,6 +5,8 @@ import pathlib
 import sys
 import tomllib
 
+import pytest
+
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 
@@ -91,3 +93,49 @@ def test_production_launcher_has_the_qualified_mount_and_identity_contract():
             f"source=$overlay_root/{overlay.FILES[name]},target={target},readonly"
             in launcher
         )
+
+
+def test_mtp_preflight_skips_only_the_obsolete_batch2048_gate(monkeypatch):
+    skill_source = ROOT / ".agents/skills/training-ops/src"
+    sys.path.insert(0, str(skill_source))
+    try:
+        import training_ops
+
+        remote_paths = []
+
+        def remote_json(_host, path):
+            remote_paths.append(path)
+            return {}
+
+        monkeypatch.setattr(training_ops, "_trainer_qualification_source_files", lambda _hosts: [])
+        monkeypatch.setattr(training_ops, "_trainer_image_digest_map", lambda _hosts: {})
+        monkeypatch.setattr(training_ops, "_remote_json", remote_json)
+        monkeypatch.setattr(training_ops, "_validate_remote_fixture", lambda *_args: [])
+        monkeypatch.setattr(training_ops, "_validate_live_parity_report", lambda *_args: [])
+        monkeypatch.setattr(training_ops, "_check_glm_adapter_range_server", lambda _path: None)
+        monkeypatch.setattr(training_ops, "_check_image_prime08", lambda *_args: [])
+
+        with pytest.raises(training_ops.Refused):
+            training_ops.production_start_preflight("glm52-mtp20")
+        assert any("glm52-native-stability20" in path for path in remote_paths)
+        assert not any("glm52-native-b2048" in path for path in remote_paths)
+
+        remote_paths.clear()
+        with pytest.raises(training_ops.Refused):
+            training_ops.production_start_preflight("glm52-production20")
+        assert any("glm52-native-b2048" in path for path in remote_paths)
+        assert any("glm52-native-stability20" in path for path in remote_paths)
+    finally:
+        sys.path.remove(str(skill_source))
+
+
+def test_start_passes_the_selected_profile_to_the_final_preflight():
+    skill_source = ROOT / ".agents/skills/training-ops/src"
+    sys.path.insert(0, str(skill_source))
+    try:
+        import inspect
+        import training_ops
+
+        assert "production_start_preflight(profile)" in inspect.getsource(training_ops.start)
+    finally:
+        sys.path.remove(str(skill_source))

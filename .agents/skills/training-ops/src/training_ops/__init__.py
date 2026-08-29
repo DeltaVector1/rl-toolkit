@@ -9836,8 +9836,12 @@ def _check_image_prime08(image: str, group: str) -> list[str]:
     return failures
 
 
-def production_start_preflight() -> dict[str, object]:
-    """Refuse a GLM production start until all pinned evidence is complete."""
+def production_start_preflight(profile_name: str = "current") -> dict[str, object]:
+    """Refuse a GLM production start until all pinned evidence is complete.
+
+    The dedicated MTP profile does not use the obsolete two-step batch-2048
+    evidence. All remaining production gates are shared by every profile.
+    """
     failures: list[str] = []
     inference_host = inference_hosts[0]
     current_sources = None
@@ -9874,10 +9878,15 @@ def production_start_preflight() -> dict[str, object]:
     except (OSError, Refused, tomllib.TOMLDecodeError) as error:
         failures.append(str(error))
 
-    for profile_name, relative in (
-        ("glm52-native-b2048", production_batch2048_profile),
-        ("glm52-native-stability20", production_stability20_profile),
-    ):
+    qualification_evidence = (
+        (("glm52-native-stability20", production_stability20_profile),)
+        if profile_name == "glm52-mtp20"
+        else (
+            ("glm52-native-b2048", production_batch2048_profile),
+            ("glm52-native-stability20", production_stability20_profile),
+        )
+    )
+    for evidence_name, relative in qualification_evidence:
         try:
             with (repo_root / relative).open("rb") as stream:
                 profile = tomllib.load(stream)
@@ -9889,17 +9898,17 @@ def production_start_preflight() -> dict[str, object]:
                 trainer_head, f"{output_dir}/qualification-result.json"
             )
             failures.extend(
-                f"{profile_name}: {failure}"
+                f"{evidence_name}: {failure}"
                 for failure in _validate_trainer_qualification(
-                    session, result, profile, profile_name
+                    session, result, profile, evidence_name
                 )
             )
             if current_sources is not None and not _qualification_sources_match(
-                session, result, profile, profile_name, current_sources
+                session, result, profile, evidence_name, current_sources
             ):
-                failures.append(f"{profile_name}: qualification source differs from current mounts")
+                failures.append(f"{evidence_name}: qualification source differs from current mounts")
             if current_images is not None and session.get("image_digests") != current_images:
-                failures.append(f"{profile_name}: qualification images differ from current images")
+                failures.append(f"{evidence_name}: qualification images differ from current images")
             metrics_path = str(
                 PurePosixPath(output_dir) / profile["file_monitor"]["filename"]
             )
@@ -9943,7 +9952,7 @@ def production_start_preflight() -> dict[str, object]:
                     or not isinstance(expected, str)
                     or re.fullmatch(r"[0-9a-f]{64}", expected) is None
                 ):
-                    failures.append(f"{profile_name}: evidence file identity is invalid")
+                    failures.append(f"{evidence_name}: evidence file identity is invalid")
                     continue
                 code, observed = _ssh(
                     trainer_head,
@@ -9951,8 +9960,8 @@ def production_start_preflight() -> dict[str, object]:
                     timeout=60,
                 )
                 if code or observed.strip() != expected:
-                    failures.append(f"{profile_name}: evidence file checksum differs: {path}")
-            if profile_name == "glm52-native-stability20":
+                    failures.append(f"{evidence_name}: evidence file checksum differs: {path}")
+            if evidence_name == "glm52-native-stability20":
                 stability_result = result
                 code, observed_result_sha256 = _ssh(
                     trainer_head,
@@ -9963,7 +9972,7 @@ def production_start_preflight() -> dict[str, object]:
                     r"[0-9a-f]{64}", observed_result_sha256.strip()
                 ) is None:
                     failures.append(
-                        f"{profile_name}: qualification result checksum is invalid"
+                        f"{evidence_name}: qualification result checksum is invalid"
                     )
                 else:
                     stability_result_sha256 = observed_result_sha256.strip()
@@ -9990,7 +9999,7 @@ def production_start_preflight() -> dict[str, object]:
                     or set(targets) != qualification_adapter_targets
                 ):
                     failures.append(
-                        f"{profile_name}: adapter configuration differs"
+                        f"{evidence_name}: adapter configuration differs"
                     )
                 adapter_header, observed_layout = (
                     _remote_safetensors_header_and_layout(
@@ -10005,7 +10014,7 @@ def production_start_preflight() -> dict[str, object]:
                     or adapter.get("layout") != observed_layout
                 ):
                     failures.append(
-                        f"{profile_name}: adapter tensor coverage or layout differs"
+                        f"{evidence_name}: adapter tensor coverage or layout differs"
                     )
                 checksum_path = str(
                     adapter_dir / "adapter_model.safetensors.sha256"
@@ -10026,10 +10035,10 @@ def production_start_preflight() -> dict[str, object]:
                 )
                 if code or checksum_content != f"{adapter_sha256}\n":
                     failures.append(
-                        f"{profile_name}: adapter checksum content differs"
+                        f"{evidence_name}: adapter checksum content differs"
                     )
         except (KeyError, OSError, Refused, RuntimeError, tomllib.TOMLDecodeError) as error:
-            failures.append(f"{profile_name}: {error}")
+            failures.append(f"{evidence_name}: {error}")
     try:
         adapter = (
             stability_result.get("adapter")
@@ -10087,7 +10096,7 @@ def production_start_preflight() -> dict[str, object]:
         raise Refused("GLM production start preflight failed: " + "; ".join(failures))
     result = {
         "parity_report": production_parity_report,
-        "batch2048_steps": [1, 2],
+        "batch2048_steps": [1, 2] if profile_name != "glm52-mtp20" else [],
         "stability20_steps": list(range(1, 21)),
         "step20_h200_gate": production_step20_h200_result,
         "trainer_mounts": 45,
@@ -10763,7 +10772,7 @@ def start(
         if mtp_existing.get("status") != "absent":
             _require_mtp_production_container_identity(mtp_spec, mtp_existing)
     if selected["kind"] == "glm52":
-        production_start_preflight()
+        production_start_preflight(profile)
     muse_run = selected["kind"] == "muse"
     if resume_adapter is not None:
         if not muse_run:
