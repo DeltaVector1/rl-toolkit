@@ -351,7 +351,7 @@ if hashlib.sha256(session_bytes).hexdigest() != expected_session_sha256:
     raise SystemExit("qualification session checksum differs")
 session = json.loads(session_bytes)
 source_files = session.get("source_files")
-if not isinstance(source_files, dict) or len(source_files) != 46:
+if not isinstance(source_files, dict) or len(source_files) != 49:
     raise SystemExit("qualification source manifest is invalid")
 root = Path(deployment).resolve(strict=True)
 observed = {}
@@ -492,6 +492,9 @@ PY
       -v "$deployment/source/src/prime_rl/trainer/models/glm_moe_dsa/sparse_mla_attention.py":/app/src/prime_rl/trainer/models/glm_moe_dsa/sparse_mla_attention.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/models/layers/lora/multi_linear.py":/app/src/prime_rl/trainer/models/layers/lora/multi_linear.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/models/layers/lora/native_fp8_moe.py":/app/src/prime_rl/trainer/models/layers/lora/native_fp8_moe.py:ro \
+      -v "$deployment/source/src/prime_rl/model_identity.py":/app/src/prime_rl/model_identity.py:ro \
+      -v "$deployment/source/src/prime_rl/trainer/models/kernels/fp8_indexer.py":/app/src/prime_rl/trainer/models/kernels/fp8_indexer.py:ro \
+      -v "$deployment/source/src/prime_rl/trainer/models/layers/rotary_emb.py":/app/src/prime_rl/trainer/models/layers/rotary_emb.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/lora.py":/app/src/prime_rl/trainer/lora.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/models/kernels/sparse_mla_fwd.py":/app/src/prime_rl/trainer/models/kernels/sparse_mla_fwd.py:ro \
       -v "$deployment/source/src/prime_rl/trainer/models/kernels/sparse_mla_bwd.py":/app/src/prime_rl/trainer/models/kernels/sparse_mla_bwd.py:ro \

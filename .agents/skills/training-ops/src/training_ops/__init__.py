@@ -8558,8 +8558,8 @@ def _qualification_sources_match(
         profile_name not in stability20_qualification_profiles
         or not _exact_stability_recovery(result, profile)
         or not isinstance(source_files, dict)
-        or len(source_files) != 46
-        or len(current_sources) != 46
+        or len(source_files) != 49
+        or len(current_sources) != 49
         or set(source_files) != set(current_sources)
         or source_files.get(qualification_train_source)
         != legacy_stability20_train_sha256
@@ -8654,7 +8654,7 @@ def _validate_trainer_qualification(
     source_files = session.get("source_files")
     if (
         not isinstance(source_files, dict)
-        or len(source_files) != 46
+        or len(source_files) != 49
         or "scripts/china/cluster.sh" not in source_files
     ):
         failures.append("qualification source file evidence is missing")
@@ -9860,8 +9860,8 @@ def production_start_preflight(profile_name: str = "current") -> dict[str, objec
             host for host in trainer_hosts if host != trainer_head
         ]
         current_sources = _trainer_qualification_source_files(ranked_hosts)
-        if len(current_sources) != 46:
-            failures.append("qualification source manifest is not exactly 46 files")
+        if len(current_sources) != 49:
+            failures.append("qualification source manifest is not exactly 49 files")
         current_images = _trainer_image_digest_map(
             ranked_hosts
         )
@@ -11082,7 +11082,7 @@ def _prepare_trainer_qualification_session(
     if output is None or output.parent != qualification_root:
         raise Refused("qualification output directory is not an exact child of its root")
     if (
-        len(source_files) != 46
+        len(source_files) != 49
         or "scripts/china/cluster.sh" not in source_files
         or any(
         not isinstance(path, str)

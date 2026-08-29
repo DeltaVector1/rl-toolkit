@@ -491,7 +491,7 @@ class EdgeOperationsTest(unittest.TestCase):
             profile = tomllib.load(stream)
         source_files = {
             f"source/file-{index}.py": hashlib.sha256(str(index).encode()).hexdigest()
-            for index in range(45)
+            for index in range(48)
         }
         source_files[training_ops.qualification_train_source] = (
             training_ops.legacy_stability20_train_sha256
