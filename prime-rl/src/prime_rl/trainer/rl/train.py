@@ -1121,6 +1121,20 @@ def train(config: TrainerConfig):
             config.model.lora,
         )
 
+    if parallel_dims.pp_enabled:
+        # Configure adapter gathering before the policy-0 export.
+        from prime_rl.trainer.weights import set_pp_gather_context
+
+        _ranks_per_stage = dist.get_world_size() // parallel_dims.pp
+        _stage_master_ranks = [
+            stage * _ranks_per_stage for stage in range(parallel_dims.pp)
+        ]
+        set_pp_gather_context(
+            parallel_dims.get_mesh("pp").get_group(),
+            is_stage_master=(dist.get_rank() % _ranks_per_stage) == 0,
+            stage_master_ranks=_stage_master_ranks,
+        )
+
     # Publish the untouched fresh adapter before the first rollout batch exists.
     # This gives inference an exact policy-0 snapshot without an optimizer step.
     if (
@@ -1199,22 +1213,6 @@ def train(config: TrainerConfig):
         )
 
         pp_rank = parallel_dims.get_mesh("pp").get_local_rank()
-        # Weight broadcast: tell the gatherer to merge stage dicts over the pp
-        # group. "Stage master" = the first rank within each stage, which is
-        # exactly the membership of the global master's pp group.
-        from prime_rl.trainer.weights import set_pp_gather_context
-
-        # pp is the slowest-varying mesh dim, so stage s owns the contiguous
-        # ranks [s*k, (s+1)*k) with k = world/pp; the stage master is the first.
-        _ranks_per_stage = dist.get_world_size() // parallel_dims.pp
-        _stage_master_ranks = [
-            stage * _ranks_per_stage for stage in range(parallel_dims.pp)
-        ]
-        set_pp_gather_context(
-            parallel_dims.get_mesh("pp").get_group(),
-            is_stage_master=(dist.get_rank() % _ranks_per_stage) == 0,
-            stage_master_ranks=_stage_master_ranks,
-        )
         local_virtual_stages = 2 if config.model.pp_schedule == "interleaved_1f1b" else 1
         ranges = pp_layer_ranges(
             model.model,
