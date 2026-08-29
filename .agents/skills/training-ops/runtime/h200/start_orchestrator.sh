@@ -59,6 +59,7 @@ fi
 sleep 6
 sudo install -d -o 1000 -g 1000 "/data/glm52-rl/runs/$RUN"
 sudo install -d -o 1000 -g 1000 "/data/glm52-rl/runs/$RUN/$RUN_NAME"
+sudo install -d -o 1000 -g 1000 "/data/glm52-rl/runs/$RUN/$RUN_NAME/hf-cache"
 for p in "${ports[@]}"; do
   ss -tln 2>/dev/null | grep -q "127.0.0.1:$p" && echo "tunnel :$p up" || echo "tunnel :$p DOWN"
 done
@@ -69,7 +70,7 @@ sudo docker run -d --name glm52-decensor-orchestrator \
   --env-file /data/trinity/training.env \
   -e VLLM_API_KEY=unused \
   -e PYTHONPATH="$deployment/environments/decensor/src:$deployment/environments/ornith/src:$deployment/evals/refusals-classifier/src:/app/src" \
-  -e HF_HOME=/data/glm52-rl/hf-cache \
+  -e HF_HOME="/data/glm52-rl/runs/$RUN/$RUN_NAME/hf-cache" \
   -v /data/glm52-rl:/data/glm52-rl \
   -v /data/muse-glimmer/model:/data/muse-glimmer/model:ro \
   -v glm52-fp8-model:/models/glm52-fp8:ro \
