@@ -81,6 +81,70 @@ class DependencyBundleTest(unittest.TestCase):
                 [("../a.py", ["n76"])], self.root
             )
 
+    def test_retries_failed_host_until_success_without_repeating_success(self):
+        scp_calls = []
+        remote_calls = []
+
+        def fake_run(command, **_kwargs):
+            host = command[-1].split(":", 1)[0]
+            scp_calls.append(host)
+            if len(scp_calls) < 3:
+                return training_ops.subprocess.CompletedProcess(
+                    command, 1, "", "scp: Connection closed\n"
+                )
+            return training_ops.subprocess.CompletedProcess(command, 0, "", "")
+
+        def fake_ssh(host, script, timeout=0):
+            if script.startswith("rm -f"):
+                return 0, ""
+            remote_calls.append(host)
+            return 0, "installed"
+
+        output = io.StringIO()
+        errors = io.StringIO()
+        with (
+            mock.patch.object(training_ops.subprocess, "run", side_effect=fake_run),
+            mock.patch.object(training_ops, "_ssh", side_effect=fake_ssh),
+            mock.patch.object(training_ops.time, "sleep"),
+            contextlib.redirect_stdout(output),
+            contextlib.redirect_stderr(errors),
+        ):
+            training_ops._deploy_dependencies([("a.py", ["n76"])])
+
+        self.assertEqual(scp_calls, ["n76", "n76", "n76"])
+        self.assertEqual(remote_calls, ["n76"])
+        self.assertEqual(errors.getvalue().count("scp: Connection closed"), 2)
+        self.assertIn("attempt 1/3", errors.getvalue())
+        self.assertIn("attempt 2/3", errors.getvalue())
+
+    def test_terminal_failure_is_bounded_at_three_attempts(self):
+        scp_calls = []
+
+        def fake_run(command, **_kwargs):
+            scp_calls.append(command[-1].split(":", 1)[0])
+            return training_ops.subprocess.CompletedProcess(
+                command, 1, "", "scp: Connection closed\n"
+            )
+
+        def fake_ssh(_host, script, timeout=0):
+            self.fail(f"verification must not run after failed scp: {script}")
+
+        output = io.StringIO()
+        errors = io.StringIO()
+        with (
+            mock.patch.object(training_ops.subprocess, "run", side_effect=fake_run),
+            mock.patch.object(training_ops, "_ssh", side_effect=fake_ssh),
+            mock.patch.object(training_ops.time, "sleep"),
+            contextlib.redirect_stdout(output),
+            contextlib.redirect_stderr(errors),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "failed to deploy dependency bundle"):
+                training_ops._deploy_dependencies([("a.py", ["n76"])])
+
+        self.assertEqual(scp_calls, ["n76", "n76", "n76"])
+        self.assertEqual(errors.getvalue().count("scp: Connection closed"), 3)
+        self.assertIn("attempt 3/3", errors.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

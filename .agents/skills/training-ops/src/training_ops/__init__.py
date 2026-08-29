@@ -80,6 +80,7 @@ stall_seconds = limits["stall_seconds"]
 final_validation_steps = limits["final_steps"]
 deployment_file_workers = limits["deployment_file_workers"]
 deployment_host_workers = limits["deployment_host_workers"]
+deployment_bundle_workers = limits.get("deployment_bundle_workers", 2)
 deployment_mkdir_timeout_seconds = limits["deployment_mkdir_timeout_seconds"]
 deployment_scp_timeout_seconds = limits["deployment_scp_timeout_seconds"]
 group_size = shared_requirements["group_size"]
@@ -2791,7 +2792,7 @@ def _deploy_dependencies(required_files: list[tuple[str, list[str]]]) -> None:
             f"trainer dependency bundle: created {len(destinations)} files "
             f"({bundle.stat().st_size} bytes)"
         )
-        workers = min(deployment_host_workers, len(hosts_for_bundle))
+        workers = min(deployment_bundle_workers, len(hosts_for_bundle))
         print(
             f"trainer dependency bundle: uploading to {len(hosts_for_bundle)} hosts "
             f"with {workers} parallel workers"
@@ -2813,38 +2814,67 @@ def _deploy_dependencies(required_files: list[tuple[str, list[str]]]) -> None:
                 except Exception:
                     pass
 
-            try:
-                uploaded = subprocess.run(
-                    scp_command + [str(bundle), f"{host}:{remote_archive}"],
-                    stdin=subprocess.DEVNULL,
-                    capture_output=True,
-                    text=True,
-                    timeout=deployment_scp_timeout_seconds,
+            for attempt in range(1, 4):
+                result = "failed"
+                stderr = ""
+                try:
+                    uploaded = subprocess.run(
+                        scp_command + [str(bundle), f"{host}:{remote_archive}"],
+                        stdin=subprocess.DEVNULL,
+                        capture_output=True,
+                        text=True,
+                        timeout=deployment_scp_timeout_seconds,
+                    )
+                except subprocess.TimeoutExpired as error:
+                    stderr = str(error.stderr or "")
+                    result = "scp TIMEOUT"
+                    remove_partial_archive()
+                except OSError as error:
+                    stderr = str(error)
+                    result = "scp failed"
+                    remove_partial_archive()
+                else:
+                    if uploaded.returncode:
+                        stderr = uploaded.stderr or ""
+                        result = "scp failed"
+                        remove_partial_archive()
+                    else:
+                        try:
+                            code, output = _ssh(
+                                host,
+                                _dependency_remote_script(
+                                    remote_archive, repository_root, selected
+                                ),
+                                timeout=deployment_scp_timeout_seconds,
+                            )
+                        except Exception as error:
+                            stderr = str(error)
+                            result = "remote failed"
+                            remove_partial_archive()
+                        else:
+                            if code:
+                                stderr = output
+                                result = f"remote failed ({code})"
+                                remove_partial_archive()
+                            else:
+                                return "ok"
+
+                print(
+                    f"trainer dependency bundle: {host} attempt {attempt}/3 failed "
+                    f"({result}); stderr:",
+                    file=sys.stderr,
                 )
-            except subprocess.TimeoutExpired:
-                remove_partial_archive()
-                return "scp TIMEOUT"
-            except OSError as error:
-                remove_partial_archive()
-                return f"scp failed: {error}"
-            if uploaded.returncode:
-                detail = ((uploaded.stdout or "") + (uploaded.stderr or "")).strip()
-                remove_partial_archive()
-                return f"scp failed: {detail[:120]}"
-            try:
-                code, output = _ssh(
-                    host,
-                    _dependency_remote_script(remote_archive, repository_root, selected),
-                    timeout=deployment_scp_timeout_seconds,
-                )
-            except Exception as error:
-                remove_partial_archive()
-                return f"remote failed: {error}"
-            if code:
-                detail = " | ".join(output.strip().splitlines()[-3:]) if output.strip() else "no output"
-                remove_partial_archive()
-                return f"remote failed ({code}): {detail[:160]}"
-            return "ok"
+                if stderr:
+                    print(
+                        stderr,
+                        file=sys.stderr,
+                        end="" if stderr.endswith("\n") else "\n",
+                    )
+                else:
+                    print("<empty>", file=sys.stderr)
+                if attempt < 3:
+                    time.sleep(attempt)
+            return result
 
         failures = []
         completed = 0
