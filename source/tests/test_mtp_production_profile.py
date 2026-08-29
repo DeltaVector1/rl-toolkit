@@ -40,6 +40,24 @@ def test_mtp20_profile_is_strict_and_uses_the_production_run_name():
     assert len(trainer["model"]["lora"]["target_modules"]) == 10
 
 
+def test_mtp_stability_profile_is_an_exact_distinct_output_copy():
+    operations = tomllib.loads((ROOT / "configs/operations.toml").read_text())
+    profile = operations["profiles"]["glm52-mtp-stability20"]
+    assert profile == {
+        "kind": "glm52",
+        "trainer": "configs/qualification/glm52-mtp-stability20.toml",
+    }
+    old = tomllib.loads(
+        (ROOT / "configs/qualification/glm52-native-stability20.toml").read_text()
+    )
+    new = tomllib.loads(
+        (ROOT / "configs/qualification/glm52-mtp-stability20.toml").read_text()
+    )
+    assert new["output_dir"] == "/data/glm52-rl/qualifications/glm52-mtp-stability20"
+    old["output_dir"] = new["output_dir"]
+    assert new == old
+
+
 def test_bad_mtp_identity_is_refused():
     operations = tomllib.loads((ROOT / "configs/operations.toml").read_text())
     profile = operations["profiles"]["glm52-mtp20"]
@@ -117,7 +135,7 @@ def test_mtp_preflight_skips_only_the_obsolete_batch2048_gate(monkeypatch):
 
         with pytest.raises(training_ops.Refused):
             training_ops.production_start_preflight("glm52-mtp20")
-        assert any("glm52-native-stability20" in path for path in remote_paths)
+        assert any("glm52-mtp-stability20" in path for path in remote_paths)
         assert not any("glm52-native-b2048" in path for path in remote_paths)
 
         remote_paths.clear()

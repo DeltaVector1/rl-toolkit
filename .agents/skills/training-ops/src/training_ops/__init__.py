@@ -7868,6 +7868,7 @@ production_parity_fixture = "/data/glm52-rl/qualifications/glm52-policy-parity/f
 production_parity_profile = "configs/qualification/glm52-policy-parity.toml"
 production_batch2048_profile = "configs/qualification/glm52-native-b2048.toml"
 production_stability20_profile = "configs/qualification/glm52-native-stability20.toml"
+production_mtp_stability20_profile = "configs/qualification/glm52-mtp-stability20.toml"
 production_step20_h200_profile = glm_step20_h200_gate["profile"]
 production_step20_h200_result = glm_step20_h200_gate["result"]
 qualification_train_source = "source/src/prime_rl/trainer/rl/train.py"
@@ -7890,6 +7891,9 @@ qualification_source_targets = {
     "experts",
 }
 qualification_adapter_targets = qualification_source_targets - {"shared_expert"}
+stability20_qualification_profiles = frozenset(
+    {"glm52-native-stability20", "glm52-mtp-stability20"}
+)
 
 
 def _glm52_adapter_inventory(
@@ -8551,7 +8555,7 @@ def _qualification_sources_match(
     if source_files == current_sources:
         return True
     if (
-        profile_name != "glm52-native-stability20"
+        profile_name not in stability20_qualification_profiles
         or not _exact_stability_recovery(result, profile)
         or not isinstance(source_files, dict)
         or len(source_files) != 46
@@ -8585,11 +8589,12 @@ def _validate_trainer_qualification(
     expected_step_counts = {
         "glm52-native-b2048": 2,
         "glm52-native-stability20": 20,
+        "glm52-mtp-stability20": 20,
     }
     if profile_name not in expected_step_counts:
         raise Refused("GLM qualification profile is invalid")
     expected_steps = expected_step_counts[profile_name]
-    expected_adapter = profile_name == "glm52-native-stability20"
+    expected_adapter = profile_name in stability20_qualification_profiles
     profile_sha = hashlib.sha256(
         (repo_root / f"configs/qualification/{profile_name}.toml").read_bytes()
     ).hexdigest()
@@ -8607,7 +8612,7 @@ def _validate_trainer_qualification(
     if recovery is not None and not recovered:
         failures.append("qualification recovery evidence is invalid")
     if recovered and (
-        profile_name != "glm52-native-stability20"
+        profile_name not in stability20_qualification_profiles
         or session.get("source_files", {}).get(qualification_train_source)
         != legacy_stability20_train_sha256
     ):
@@ -8741,7 +8746,7 @@ def _validate_trainer_qualification(
             elif input_sha256 == previous_input:
                 failures.append(f"qualification step {row['step']} reused the previous input")
             previous_input = input_sha256
-        if profile_name == "glm52-native-stability20":
+        if profile_name in stability20_qualification_profiles:
             steady_times = sorted(
                 float(row["time/forward_backward"])
                 for row in records[1:]
@@ -9879,7 +9884,7 @@ def production_start_preflight(profile_name: str = "current") -> dict[str, objec
         failures.append(str(error))
 
     qualification_evidence = (
-        (("glm52-native-stability20", production_stability20_profile),)
+        (("glm52-mtp-stability20", production_mtp_stability20_profile),)
         if profile_name == "glm52-mtp20"
         else (
             ("glm52-native-b2048", production_batch2048_profile),
@@ -11263,6 +11268,7 @@ def _qualify_connected(
     strict_qualification = name in {
         "glm52-native-b2048",
         "glm52-native-stability20",
+        "glm52-mtp-stability20",
     }
     if strict_qualification and nodes != [trainer_head] + [
         host for host in trainer_hosts if host != trainer_head
