@@ -3175,9 +3175,7 @@ def start(
     if trainer_head in nodes:  # rank 0 is the rendezvous master and carries the readable log
         nodes = [trainer_head] + [n for n in nodes if n != trainer_head]
     required_files = _start_dependency_inventory(selected, nodes)
-    for path, destinations in required_files:
-        if not deploy(path, nodes=destinations):
-            raise RuntimeError(f"failed to deploy {path}")
+    _deploy_dependencies(required_files)
     name = f"run_{run}"
     trainer_config = f"{remote_repo}/{selected['trainer']}"
     edge_config = f"{remote_repo}/{selected['orchestrator']}"
