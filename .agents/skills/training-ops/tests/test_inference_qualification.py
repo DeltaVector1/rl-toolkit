@@ -1,3 +1,4 @@
+import ast
 import unittest
 from unittest.mock import patch
 
@@ -5,6 +6,21 @@ import training_ops
 
 
 class InferenceQualificationTest(unittest.TestCase):
+    def test_all_preflight_local_imports_are_deployed(self):
+        spec = training_ops._inference_qualification_spec("glm52-mtp-h200")
+        preflight = training_ops.repo_root / "scripts/glm52_h200_mtp_preflight.py"
+        tree = ast.parse(preflight.read_text())
+        imported = {
+            f"source/src/{node.module.replace('.', '/')}.py"
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+            and node.module is not None
+            and node.module.startswith("prime_rl.")
+        }
+
+        self.assertTrue(imported)
+        self.assertTrue(imported <= set(spec["deploy_files"]))
+
     def test_registered_inventory_and_deploy_files_are_inference_scoped(self):
         spec = training_ops._inference_qualification_spec("glm52-mtp-h200")
         self.assertEqual(spec["host"], training_ops.inference_hosts[0])

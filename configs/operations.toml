@@ -221,6 +221,7 @@ output = "benchmarks/glm52-mtp-h200.json"
 deploy_files = [
   "configs/operations.toml",
   "configs/qualification/glm52-mtp-h200.toml",
+  "source/src/prime_rl/glm52_routing.py",
   "scripts/glm52_h200_mtp_preflight.py",
   "scripts/h200/benchmark_glm52_mtp.py",
   "scripts/h200/flashmla_overlay_preflight.py",
