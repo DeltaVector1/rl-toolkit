@@ -1,5 +1,5 @@
-output_dir = "/data/glm52-rl/runs/x84p"
-max_steps = 200
+output_dir = "/data/glm52-rl/runs/x85"
+max_steps = 20
 dist_timeout_seconds = 5400
 enable_router_replay = false
 
@@ -8,16 +8,16 @@ level = "debug"
 ranks_filter = [0]
 
 [swanlab]
-project = "prod-run"
-name = "trainer-x84p"
-group = "glm52-decensor-r32"
-tags = ["glm-5.2", "pp8", "decensor", "grpo", "native-fp8-base", "lora-r32", "lora-shared-expert", "64x4090", "b1024", "32768", "cp8", "lr8e-6", "production", "fp8-forward-backward", "int4-ep", "balanced-pp", "sparse-cache", "shared-expert-ac", "fp8-act-offload", "fp8-live-set", "inplace-ep", "bwd-2k", "fail-closed-rollouts", "lora-reconcile", "stream-fp8-bwd", "stream-int4-a2a", "int4-a2a-r8"]
+project = "glm-runs"
+name = "trainer-x85"
+group = "glm-runs"
+tags = ["x85", "glm-5.2", "lora-r32", "production", "20-step"]
 
 [file_monitor]
-filename = "run_x84p/trainer-metrics.jsonl"
+filename = "run_x85/trainer-metrics.jsonl"
 
 [model]
-name = "/data/glm52-rl/model-fp8"
+name = "/data/ZiphuAI/GLM-5.2-FP8"
 impl = "custom"
 seq_len = 32768
 attn = "flash_attention_2"
@@ -55,7 +55,7 @@ expert_activation_transport = "int4"
 rank = 32
 alpha = 64
 dropout = 0.0
-target_modules = ["q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "o_proj", "shared_expert"]
+target_modules = ["q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "o_proj", "experts", "shared_expert"]
 
 [model.ac]
 mode = "reentrant_attention_shared_expert"

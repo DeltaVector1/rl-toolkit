@@ -1,5 +1,5 @@
-output_dir = "/data/glm52-rl/runs/x84p/run_x84p"
-max_steps = 200
+output_dir = "/data/glm52-rl/runs/x85/run_x85"
+max_steps = 20
 seq_len = 32768
 batch_size = 1024
 group_size = 16
@@ -11,16 +11,16 @@ pool_size = 4
 level = "info"
 
 [swanlab]
-project = "prod-run"
-name = "orchestrator-x84p"
-group = "glm52-decensor-r32"
-tags = ["glm-5.2", "decensor", "grpo", "w8a8-rollouts", "native-fp8-trainer", "lora-r32", "lora-shared-expert", "16xh200-rollouts", "64x4090-trainer", "edge-gemma", "b1024", "32768", "out16384", "cp8", "lr8e-6", "production", "fp8-forward-backward", "int4-ep", "sparse-cache", "shared-expert-ac", "fp8-act-offload", "inplace-ep", "fail-closed-rollouts", "lora-reconcile", "stream-fp8-bwd", "stream-int4-a2a", "policy-abort-restart", "tail-spare-g32", "adapter-prefetch", "int4-a2a-r8"]
+project = "glm-runs"
+name = "orchestrator-x85"
+group = "glm-runs"
+tags = ["x85", "glm-5.2", "lora-r32", "production", "20-step"]
 
 [file_monitor]
 filename = "rollout-metrics.jsonl"
 
 [model]
-name = "/data/glm52-rl/model-fp8"
+name = "/data/glm52-rl/model-fp8-stream"
 
 [model.lora]
 name = "glm52-decensor-r32-node-local"
@@ -28,8 +28,8 @@ rank = 32
 alpha = 64
 
 [model.client]
-base_url = ["http://127.0.0.1:8000/v1", "http://127.0.0.1:8000/v1", "http://127.0.0.1:8000/v1", "http://127.0.0.1:8000/v1", "http://127.0.0.1:8000/v1", "http://127.0.0.1:8000/v1", "http://127.0.0.1:18101/v1", "http://127.0.0.1:18101/v1", "http://127.0.0.1:18101/v1", "http://127.0.0.1:18101/v1", "http://127.0.0.1:18101/v1", "http://127.0.0.1:18101/v1"]
-admin_base_url = ["http://127.0.0.1:8000/v1", "http://127.0.0.1:18101/v1"]
+base_url = ["http://127.0.0.1:8000/v1"]
+admin_base_url = ["http://127.0.0.1:8000/v1"]
 wait_for_ready_timeout = 7200
 skip_model_check = true
 
@@ -73,8 +73,8 @@ api_key_var = "VLLM_API_KEY"
 
 [weight_broadcast]
 type = "filesystem"
-source_url = "http://127.0.0.1:18100/x84p"
-source_dir = "/data/glm52-rl/runs/x84p"
+source_url = "http://127.0.0.1:18100/x85"
+source_dir = "/data/glm52-rl/runs/x85"
 
 [rollout_transport]
 type = "filesystem"
