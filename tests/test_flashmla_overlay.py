@@ -11,6 +11,9 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "scripts/h200"))
 import flashmla_overlay_preflight as overlay  # noqa: E402
 
 
+ROOT = Path(__file__).parents[1]
+
+
 class FlashMLAOverlayTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
@@ -25,7 +28,8 @@ class FlashMLAOverlayTests(unittest.TestCase):
         for relative in overlay.FILES.values():
             path = self.overlay / relative
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(relative)
+            path.write_text("pass\n")
+            path.chmod(0o644)
         launcher = self.deployment / "scripts/h200/start_inference.sh"
         launcher.parent.mkdir(parents=True, exist_ok=True)
         launcher.write_text(
@@ -92,7 +96,7 @@ class FlashMLAOverlayTests(unittest.TestCase):
                 overlay.verify_manifest(self.deployment, self.overlay, "base")
 
     def test_launcher_has_exact_read_only_mounts(self):
-        launcher = (Path(__file__).parents[1] / "scripts/h200/start_inference.sh").read_text()
+        launcher = (ROOT / "scripts/h200/start_inference.sh").read_text()
         for name, target in overlay.RUNTIME_MOUNTS.items():
             self.assertIn(
                 f"source=$overlay_root/{overlay.FILES[name]},target={target},readonly",
@@ -120,7 +124,21 @@ class FlashMLAOverlayTests(unittest.TestCase):
         for relative in overlay.FILES.values():
             path = staging / relative
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(relative)
+            path.write_text("pass\n")
+
+    def test_every_patch_target_is_mounted_and_compiles(self):
+        patch_targets = {
+            line.removeprefix("+++ b/")
+            for relative in overlay.PATCHES
+            for line in (ROOT / relative).read_text().splitlines()
+            if line.startswith("+++ b/")
+        }
+        self.assertEqual(len(overlay.FILES), 12)
+        self.assertEqual(patch_targets, set(overlay.FILES.values()))
+        self.assertEqual(set(overlay.FILES), set(overlay.RUNTIME_MOUNTS))
+        for relative in overlay.FILES.values():
+            path = self.overlay / relative
+            compile(path.read_text(), str(path), "exec")
 
     def test_prepare_refreshes_old_manifest_with_all_patches_and_mounts(self):
         manifest = json.loads((self.overlay / "manifest.json").read_text())

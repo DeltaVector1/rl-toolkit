@@ -30,6 +30,7 @@ FILES = {
     "flashmla": "vllm/v1/attention/backends/mla/flashmla_sparse.py",
     "logits_processor": "vllm/model_executor/layers/logits_processor.py",
     "deepseek_v2": "vllm/model_executor/models/deepseek_v2.py",
+    "trtllm_fp8_moe": "vllm/model_executor/layers/fused_moe/experts/trtllm_fp8_moe.py",
     "gpu_model_runner": "vllm/v1/worker/gpu_model_runner.py",
     "scheduler_output": "vllm/v1/core/sched/output.py",
     "scheduler": "vllm/v1/core/sched/scheduler.py",
@@ -46,6 +47,7 @@ RUNTIME_MOUNTS = {
     "flashmla": "/app/.venv/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/flashmla_sparse.py",
     "logits_processor": "/app/.venv/lib/python3.12/site-packages/vllm/model_executor/layers/logits_processor.py",
     "deepseek_v2": "/app/.venv/lib/python3.12/site-packages/vllm/model_executor/models/deepseek_v2.py",
+    "trtllm_fp8_moe": "/app/.venv/lib/python3.12/site-packages/vllm/model_executor/layers/fused_moe/experts/trtllm_fp8_moe.py",
     "attention": "/app/.venv/lib/python3.12/site-packages/vllm/model_executor/layers/attention/attention.py",
     "mla_attention": "/app/.venv/lib/python3.12/site-packages/vllm/model_executor/layers/attention/mla_attention.py",
     "extract_hidden_states": "/app/.venv/lib/python3.12/site-packages/vllm/model_executor/models/extract_hidden_states.py",
@@ -199,6 +201,8 @@ def prepare(deployment: Path, overlay: Path, image: str) -> dict[str, object]:
                 "/overlay/vllm/model_executor/layers/logits_processor.py && "
                 "cp /app/.venv/lib/python3.12/site-packages/vllm/model_executor/models/deepseek_v2.py "
                 "/overlay/vllm/model_executor/models/deepseek_v2.py && "
+                "cp /app/.venv/lib/python3.12/site-packages/vllm/model_executor/layers/fused_moe/experts/trtllm_fp8_moe.py "
+                "/overlay/vllm/model_executor/layers/fused_moe/experts/trtllm_fp8_moe.py && "
                 "cp /app/.venv/lib/python3.12/site-packages/vllm/v1/worker/gpu_model_runner.py "
                 "/overlay/vllm/v1/worker/gpu_model_runner.py && "
                 "cp /app/.venv/lib/python3.12/site-packages/vllm/v1/core/sched/output.py "

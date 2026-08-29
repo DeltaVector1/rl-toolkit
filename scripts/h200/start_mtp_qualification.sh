@@ -70,6 +70,7 @@ container_id=$(docker run -d \
   --mount "type=bind,source=$overlay_root/vllm/v1/attention/backends/mla/flashmla_sparse.py,target=/app/.venv/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/flashmla_sparse.py,readonly" \
   --mount "type=bind,source=$overlay_root/vllm/model_executor/layers/logits_processor.py,target=/app/.venv/lib/python3.12/site-packages/vllm/model_executor/layers/logits_processor.py,readonly" \
   --mount "type=bind,source=$overlay_root/vllm/model_executor/models/deepseek_v2.py,target=/app/.venv/lib/python3.12/site-packages/vllm/model_executor/models/deepseek_v2.py,readonly" \
+  --mount "type=bind,source=$overlay_root/vllm/model_executor/layers/fused_moe/experts/trtllm_fp8_moe.py,target=/app/.venv/lib/python3.12/site-packages/vllm/model_executor/layers/fused_moe/experts/trtllm_fp8_moe.py,readonly" \
   --mount "type=bind,source=$overlay_root/vllm/model_executor/layers/attention/attention.py,target=/app/.venv/lib/python3.12/site-packages/vllm/model_executor/layers/attention/attention.py,readonly" \
   --mount "type=bind,source=$overlay_root/vllm/model_executor/layers/attention/mla_attention.py,target=/app/.venv/lib/python3.12/site-packages/vllm/model_executor/layers/attention/mla_attention.py,readonly" \
   --mount "type=bind,source=$overlay_root/vllm/model_executor/models/extract_hidden_states.py,target=/app/.venv/lib/python3.12/site-packages/vllm/model_executor/models/extract_hidden_states.py,readonly" \
