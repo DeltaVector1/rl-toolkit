@@ -2282,6 +2282,169 @@ def watch(hours: float = 2.0, every: int = 300, run: str = "") -> list[Status]:
 # -------------------------------------------------------------------- writes
 
 
+def _microbatch_sync_config(run: str) -> tuple[str, list[str], str]:
+    """Resolve the current trainer output and exact peer addresses."""
+    selected = _profile("current")
+    trainer_path = repo_root / selected["trainer"]
+    try:
+        with trainer_path.open("rb") as stream:
+            config = tomllib.load(stream)
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise RuntimeError(f"cannot read current trainer config {trainer_path}: {error}") from error
+    output_dir = config.get("output_dir")
+    if not isinstance(output_dir, str) or not output_dir.startswith(f"{run_root}/"):
+        raise Refused(
+            f"current trainer output_dir {output_dir!r} is outside configured runs {run_root!r}"
+        )
+    if Path(output_dir).name != run:
+        raise Refused(
+            f"current trainer output_dir {output_dir!r} does not belong to current run {run!r}"
+        )
+    if any(part in {"", ".", ".."} for part in Path(output_dir).parts):
+        raise Refused(f"current trainer output_dir is unsafe: {output_dir!r}")
+    peers = [host for host in trainer_hosts if host != trainer_head and host not in blocked_hosts]
+    if not peers:
+        raise Refused("no configured trainer peers are available for microbatch sync")
+    peer_addresses = [_ssh_address(host) for host in peers]
+    return output_dir, peer_addresses, f"{runtime_root}/china/sync_microbatches.sh"
+
+
+def _microbatch_sync_repair_script(
+    run: str, source_dir: str, peer_addresses: list[str], sync_script: str
+) -> str:
+    """Build a bounded repair and post-launch verification on trainer head."""
+    expected_nodes = " ".join(peer_addresses)
+    log_file = f"{storage_root}/microbatch-sync-{run}.log"
+    return f"""set -euo pipefail
+run_dir={shlex.quote(source_dir)}
+sync_script={shlex.quote(sync_script)}
+expected_nodes={shlex.quote(expected_nodes)}
+log_file={shlex.quote(log_file)}
+pid_file="$run_dir/.microbatch-sync.pid"
+marker_file="$run_dir/.microbatch-sync.marker"
+ssh_opts=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
+
+test -x "$sync_script" || {{ echo "microbatch sync refused: deployed script is missing or not executable" >&2; exit 20; }}
+source=$(find "$run_dir/rollouts" -type f -name 'rank_0.bin' -print 2>/dev/null | sort -V | tail -1)
+[ -n "$source" ] || {{ echo "microbatch sync refused: source rank_0 is missing under $run_dir/rollouts" >&2; exit 21; }}
+source_generation=${{source#"$run_dir/"}}
+source_generation=${{source_generation%/*}}
+source_count=$(find "$(dirname "$source")" -maxdepth 1 -type f -name 'rank_*.bin' -printf '%f\\n' 2>/dev/null | wc -l)
+source_digest=$(sha256sum "$source" | cut -d' ' -f1)
+expected_marker="generation=$source_generation count=$source_count sha256=$source_digest"
+
+sync_process_matches() {{
+  local pid=$1 command_line
+  case "$pid" in ''|*[!0-9]*) return 1;; esac
+  [ "$pid" -gt 1 ] || return 1
+  [ -r "/proc/$pid/environ" ] && [ -r "/proc/$pid/cmdline" ] || return 1
+  cat "/proc/$pid/environ" 2>/dev/null | tr '\\0' '\\n' | grep -Fxq "run_dir=$run_dir" || return 1
+  command_line=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\\0' ' ') || return 1
+  case " $command_line " in *" $sync_script "*) return 0;; esac
+  return 1
+}}
+
+sync_process_healthy() {{
+  local pid=$1
+  sync_process_matches "$pid" || return 1
+  cat "/proc/$pid/environ" 2>/dev/null | tr '\\0' '\\n' | grep -Fxq "nodes=$expected_nodes"
+}}
+
+stop_sync_process() {{
+  local pid=$1 pgid
+  sync_process_matches "$pid" || return 0
+  pgid=$(awk '{{print $5}}' "/proc/$pid/stat" 2>/dev/null || true)
+  # The deployed launcher uses setsid, therefore the exact process is the
+  # process-group leader. Do not signal a broad or inherited process group.
+  if [ "$pgid" = "$pid" ]; then
+    kill -TERM -- "-$pgid" 2>/dev/null || true
+    for _ in $(seq 1 50); do
+      sync_process_matches "$pid" || break
+      sleep 0.1
+    done
+    if sync_process_matches "$pid"; then
+      kill -KILL -- "-$pgid" 2>/dev/null || true
+    fi
+  fi
+  for _ in $(seq 1 20); do
+    sync_process_matches "$pid" || break
+    sleep 0.1
+  done
+  if sync_process_matches "$pid"; then
+    echo "microbatch sync terminal error: process group $pgid did not exit" >&2
+    return 1
+  fi
+  rm -f -- "$run_dir/.microbatch-sync.pid" "$run_dir/.microbatch-sync.lock"
+}}
+
+healthy=""
+for proc_dir in /proc/[0-9]*; do
+  pid=${{proc_dir##*/}}
+  if sync_process_healthy "$pid"; then healthy="$pid"; break; fi
+done
+[ -z "$healthy" ] || {{ echo "microbatch sync refused: healthy current distributor pid=$healthy has resolved targets" >&2; exit 22; }}
+
+peer_mismatch=0
+for target in $expected_nodes; do
+  state=$(ssh -n "${{ssh_opts[@]}}" "$target" \\
+    "if [ -f '$source' ]; then sha256sum '$source' | cut -d' ' -f1; else echo MISSING; fi; if [ -f '$marker_file' ]; then cat '$marker_file'; else echo MISSING_MARKER; fi" 2>/dev/null || true)
+  peer_digest=$(printf '%s\\n' "$state" | sed -n '1p')
+  peer_marker=$(printf '%s\\n' "$state" | sed -n '2p')
+  if [ "$peer_digest" != "$source_digest" ] || [ "$peer_marker" != "$expected_marker" ]; then
+    peer_mismatch=1
+  fi
+done
+[ "$peer_mismatch" = 1 ] || {{ echo "microbatch sync refused: peers already match source hash and generation/count marker" >&2; exit 23; }}
+
+# Remove an old distributor only after exact /proc identity checks. This also
+# handles a missing PID file; no name-based kill is used.
+for proc_dir in /proc/[0-9]*; do
+  pid=${{proc_dir##*/}}
+  if sync_process_matches "$pid" && ! sync_process_healthy "$pid"; then
+    stop_sync_process "$pid" || exit 24
+  fi
+done
+mkdir -p "$run_dir"
+nohup setsid env run_dir="$run_dir" nodes="$expected_nodes" interval=1 \\
+  "$sync_script" >>"$log_file" 2>&1 </dev/null &
+pid=$!
+printf '%s\\n' "$pid" >"$pid_file"
+matched=0
+for _ in $(seq 1 50); do
+  if sync_process_matches "$pid"; then matched=1; break; fi
+  sleep 0.1
+done
+[ "$matched" = 1 ] || {{ echo "microbatch sync terminal error: launched process identity was not observed" >&2; exit 25; }}
+
+for _ in $(seq 1 120); do
+  source=$(find "$run_dir/rollouts" -type f -name 'rank_0.bin' -print 2>/dev/null | sort -V | tail -1)
+  if [ -n "$source" ]; then
+    source_generation=${{source#"$run_dir/"}}
+    source_generation=${{source_generation%/*}}
+    source_count=$(find "$(dirname "$source")" -maxdepth 1 -type f -name 'rank_*.bin' -printf '%f\\n' 2>/dev/null | wc -l)
+    source_digest=$(sha256sum "$source" | cut -d' ' -f1)
+    expected_marker="generation=$source_generation count=$source_count sha256=$source_digest"
+    good=1
+    for target in $expected_nodes; do
+      state=$(ssh -n "${{ssh_opts[@]}}" "$target" \\
+        "if [ -f '$source' ]; then sha256sum '$source' | cut -d' ' -f1; else echo MISSING; fi; if [ -f '$marker_file' ]; then cat '$marker_file'; else echo MISSING_MARKER; fi" 2>/dev/null || true)
+      peer_digest=$(printf '%s\\n' "$state" | sed -n '1p')
+      peer_marker=$(printf '%s\\n' "$state" | sed -n '2p')
+      [ "$peer_digest" = "$source_digest" ] && [ "$peer_marker" = "$expected_marker" ] || good=0
+    done
+    if [ "$good" = 1 ] && [ -f "$marker_file" ] && [ "$(cat "$marker_file")" = "$expected_marker" ]; then
+      echo "microbatch sync repaired pid=$pid generation=$source_generation count=$source_count sha256=$source_digest peers=$expected_nodes"
+      exit 0
+    fi
+  fi
+  sleep 0.5
+done
+echo "microbatch sync terminal error: peers did not reach source hash and generation/count marker" >&2
+stop_sync_process "$pid" || true
+exit 26
+"""
+
+
 def repair(what: str) -> str:
     """Apply a named repair to the configured hosts."""
     if what == "tunnels":
@@ -2290,9 +2453,28 @@ def repair(what: str) -> str:
         return _repair_engine(what.split(":", 1)[1])
     if what == "supervisors":
         return _repair_supervisors()
+    if what == "microbatch-sync":
+        return _repair_microbatch_sync()
     raise Refused(
-        f"unknown repair {what!r}. Use tunnels, engine:<host>, or supervisors."
+        f"unknown repair {what!r}. Use tunnels, engine:<host>, supervisors, or microbatch-sync."
     )
+
+
+def _repair_microbatch_sync() -> str:
+    """Restart the current run's exact rank-0 microbatch distributor."""
+    run = current_run()
+    source_dir, peer_addresses, sync_script = _microbatch_sync_config(run)
+    script = _microbatch_sync_repair_script(run, source_dir, peer_addresses, sync_script)
+    code, output = _ssh(trainer_head, script, timeout=300)
+    detail = output.strip()
+    if code:
+        raise RuntimeError(
+            f"microbatch sync repair failed on {trainer_head}: "
+            f"{detail or f'exit {code}'}"
+        )
+    result = detail.splitlines()[-1] if detail else "microbatch sync repaired"
+    print(result)
+    return result
 
 
 def _repair_tunnels() -> str:
@@ -3172,9 +3354,9 @@ sync_process_matches() {{
   [ "$pid" -gt 1 ] || return 1
   [ -r "/proc/$pid/environ" ] || return 1
   [ -r "/proc/$pid/cmdline" ] || return 1
-  tr '\\0' '\\n' <"/proc/$pid/environ" 2>/dev/null |
+  cat "/proc/$pid/environ" 2>/dev/null | tr '\\0' '\\n' |
     grep -Fxq "run_dir=$expected_run_dir" || return 1
-  command_line=$(tr '\\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null) || return 1
+  command_line=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\\0' ' ') || return 1
   case " $command_line " in
     *" $sync_script "*) return 0 ;;
     *) return 1 ;;
@@ -3182,7 +3364,51 @@ sync_process_matches() {{
 }}
 
 stop_sync_processes() {{
-  local pid_file pid stale_run_dir command_line
+  local pid_file pid stale_run_dir command_line proc_dir
+  stop_one_sync_process() {{
+    local pid=$1 expected_run_dir=$2
+    # Re-read the process identity immediately before signalling. This also
+    # protects against PID reuse after the /proc scan.
+    sync_process_matches "$pid" "$expected_run_dir" || return 0
+    command_line=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\\0' ' ' || true)
+    echo "cold cleanup: stopping microbatch sync pid=$pid run=$expected_run_dir command=$command_line"
+    # sync_microbatches.sh is started under setsid, so its PID is also the
+    # process-group ID. The single-process fallback remains PID exact and is
+    # only reached after the same exact identity check.
+    kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+    for _ in $(seq 1 50); do
+      sync_process_matches "$pid" "$expected_run_dir" || break
+      sleep 0.1
+    done
+    if sync_process_matches "$pid" "$expected_run_dir"; then
+      kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+    fi
+    # Remove only this run's control files after the process has exited.
+    rm -f -- "$expected_run_dir/.microbatch-sync.pid" "$expected_run_dir/.microbatch-sync.lock"
+  }}
+
+  # The PID file is an optimisation only. A process can outlive an unlink or
+  # lose the file during a failed startup, so inspect every configured service
+  # directory and every /proc entry. The matcher above is exact; this is not a
+  # name-based kill.
+  scan_run_dir() {{
+    local expected_run_dir=$1 proc_dir pid
+    [ -d "$expected_run_dir" ] || return 0
+    [ -L "$expected_run_dir" ] && return 0
+    for proc_dir in /proc/[0-9]*; do
+      pid=${{proc_dir##*/}}
+      sync_process_matches "$pid" "$expected_run_dir" &&
+        stop_one_sync_process "$pid" "$expected_run_dir"
+    done
+    return 0
+  }}
+  scan_run_dir "$run_dir"
+  for service_dir in "$runs_path"/*/run_*; do
+    [ "$service_dir" = "$run_dir" ] && continue
+    case "$service_dir" in
+      "$runs_path"/*/run_*) scan_run_dir "$service_dir" ;;
+    esac
+  done
   for pid_file in "$runs_path"/*/run_*/.microbatch-sync.pid; do
     [ -f "$pid_file" ] || continue
     stale_run_dir=${{pid_file%/.microbatch-sync.pid}}
@@ -3193,25 +3419,9 @@ stop_sync_processes() {{
     # Do not follow a symlink while deriving a process identity.
     [ -L "$stale_run_dir" ] && continue
     pid=$(cat "$pid_file" 2>/dev/null || true)
-    if ! sync_process_matches "$pid" "$stale_run_dir"; then
-      continue
-    fi
-    command_line=$(tr '\\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
-    echo "cold cleanup: stopping microbatch sync pid=$pid run=$stale_run_dir command=$command_line"
-    # sync_microbatches.sh is started under setsid, so its PID is also the
-    # process-group ID. The single-process fallback remains PID exact.
-    kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
-    for _ in $(seq 1 50); do
-      sync_process_matches "$pid" "$stale_run_dir" || break
-      sleep 0.1
-    done
-    if sync_process_matches "$pid" "$stale_run_dir"; then
-      kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
-    fi
-    if [ -f "$pid_file" ] && [ "$(cat "$pid_file" 2>/dev/null || true)" = "$pid" ]; then
-      rm -f -- "$pid_file"
-    fi
+    sync_process_matches "$pid" "$stale_run_dir" && stop_one_sync_process "$pid" "$stale_run_dir"
   done
+  return 0
 }}
 
 # Refuse symlinked path components before removing anything.  A missing run is
@@ -3275,6 +3485,8 @@ remove_file "$run_dir/.batch-sync.pid"
 remove_file "$run_dir/.batch-sync.lock"
 remove_file "$run_dir/.microbatch-sync.pid"
 remove_file "$run_dir/.microbatch-sync.lock"
+remove_file "$run_dir/.microbatch-sync.marker"
+remove_file "$run_dir/.microbatch-sync.marker.tmp"
 remove_file "$run_parent/parity-step1.json"
 echo "cold cleanup: complete ($removed entries) target=$run_dir"
 """
@@ -3727,7 +3939,7 @@ usage = f"""training-ops <action> [args]
   remote <group> <command>      run on trainer, inference, or all hosts
   versions [package ...]        show installed package versions
   watch [hours] [seconds]       monitor in the foreground
-  repair <name>                 repair tunnels, an engine, or supervisors
+  repair <name>                 repair tunnels, an engine, supervisors, or microbatch sync
   deploy <path>                 copy one repository file
   start <run> [mode] [profile]  start one configured profile
   archive <run> [step ...]      upload stable old LoRA adapters

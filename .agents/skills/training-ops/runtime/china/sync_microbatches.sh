@@ -61,9 +61,30 @@ scan() {
   done < <(find "$run_dir/rollouts" -type f -name 'rank_*.bin' -print0 2>/dev/null | sort -z)
 }
 
+write_marker() {
+  local source generation count digest marker tmp host
+  source=$(find "$run_dir/rollouts" -type f -name 'rank_0.bin' -print 2>/dev/null | sort -V | tail -1)
+  [ -n "$source" ] || return 0
+  generation=${source#"$run_dir/"}
+  generation=${generation%/*}
+  count=$(find "$(dirname "$source")" -maxdepth 1 -type f -name 'rank_*.bin' -printf '%f\n' 2>/dev/null | wc -l)
+  digest=$(sha256sum "$source" | cut -d' ' -f1)
+  marker="generation=$generation count=$count sha256=$digest"
+  tmp="$run_dir/.microbatch-sync.marker.tmp.$$"
+  printf '%s\n' "$marker" >"$tmp"
+  mv -f "$tmp" "$run_dir/.microbatch-sync.marker"
+  for host in $nodes; do
+    publish "$run_dir/.microbatch-sync.marker" "$host" || return 1
+  done
+}
+
 while true; do
   scan || {
     echo "microbatch sync stopped: publication failed" >&2
+    exit 1
+  }
+  write_marker || {
+    echo "microbatch sync stopped: marker publication failed" >&2
     exit 1
   }
   [ "${once:-0}" = 1 ] && exit

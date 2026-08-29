@@ -158,6 +158,61 @@ class ColdCleanupTest(unittest.TestCase):
             finally:
                 training_ops.run_root = old_root
 
+    def test_cleanup_finds_matching_process_after_pid_file_is_unlinked(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            old_root = training_ops.run_root
+            old_runtime = training_ops.runtime_root
+            try:
+                root = Path(temporary)
+                training_ops.run_root = str(root / "runs")
+                training_ops.runtime_root = str(
+                    Path(__file__).resolve().parents[1] / "runtime"
+                )
+                stale_dir = Path(training_ops.run_root) / "stale" / "run_stale"
+                (stale_dir / "rollouts").mkdir(parents=True)
+                process = subprocess.Popen(
+                    [
+                        "bash",
+                        str(Path(training_ops.runtime_root) / "china" / "sync_microbatches.sh"),
+                    ],
+                    env={
+                        **os.environ,
+                        "run_dir": str(stale_dir),
+                        "nodes": "10.92.20.76",
+                        "interval": "60",
+                    },
+                )
+                try:
+                    pid_file = stale_dir / ".microbatch-sync.pid"
+                    lock_file = stale_dir / ".microbatch-sync.lock"
+                    for _ in range(50):
+                        if pid_file.exists() and lock_file.exists():
+                            break
+                        time.sleep(0.02)
+                    self.assertTrue(pid_file.exists())
+                    pid_file.unlink()
+
+                    def fake_ssh(host, script, timeout=0):
+                        result = subprocess.run(
+                            ["bash", "-c", script], capture_output=True, text=True
+                        )
+                        return result.returncode, result.stdout + result.stderr
+
+                    with mock.patch.object(training_ops, "_ssh", side_effect=fake_ssh):
+                        training_ops._cold_start_cleanup("alpha", ["n76"])
+
+                    process.wait(timeout=3)
+                    self.assertIsNotNone(process.returncode)
+                    self.assertFalse(pid_file.exists())
+                    self.assertFalse(lock_file.exists())
+                finally:
+                    if process.poll() is None:
+                        process.terminate()
+                        process.wait(timeout=3)
+            finally:
+                training_ops.run_root = old_root
+                training_ops.runtime_root = old_runtime
+
 
 if __name__ == "__main__":
     unittest.main()
