@@ -9,6 +9,20 @@ import training_ops
 
 
 class MicrobatchAddressTest(unittest.TestCase):
+    def test_profile_is_selected_from_active_run_output(self):
+        self.assertEqual(
+            training_ops._profile_for_run("x85")["trainer"],
+            "configs/paused/glm52/trainer.toml",
+        )
+        self.assertEqual(
+            training_ops._profile_for_run("muse21")["trainer"],
+            "configs/current/trainer.toml",
+        )
+
+    def test_unknown_run_has_no_profile_fallback(self):
+        with self.assertRaisesRegex(training_ops.Refused, "no configured trainer profile"):
+            training_ops._profile_for_run("unknown-run")
+
     def test_ssh_alias_resolution_is_local_and_returns_internal_ip(self):
         result = training_ops.subprocess.CompletedProcess(
             ["ssh"], 0, "host n76\nhostname 10.92.20.76\n", ""

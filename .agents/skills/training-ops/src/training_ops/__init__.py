@@ -147,6 +147,34 @@ def _profile(name: str = "current") -> dict:
         raise RuntimeError(f"profile {name!r} has no readable orchestrator config")
     return profile
 
+
+def _profile_for_run(run: str) -> dict:
+    """Select the configured trainer profile whose output matches the run."""
+    if not isinstance(run, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", run):
+        raise Refused(f"active run name is invalid: {run!r}")
+    matches = []
+    for name in sorted(operations.get("profiles", {})):
+        profile = _profile(name)
+        trainer_path = repo_root / profile["trainer"]
+        try:
+            with trainer_path.open("rb") as stream:
+                config = tomllib.load(stream)
+        except (OSError, tomllib.TOMLDecodeError) as error:
+            raise RuntimeError(f"cannot read trainer config {trainer_path}: {error}") from error
+        output_dir = config.get("output_dir")
+        if isinstance(output_dir, str) and Path(output_dir).name == run:
+            matches.append((name, profile))
+    if not matches:
+        raise Refused(
+            f"no configured trainer profile has output_dir ending in {run!r}"
+        )
+    if len(matches) > 1:
+        names = ", ".join(name for name, _ in matches)
+        raise Refused(
+            f"multiple configured trainer profiles have output_dir ending in {run!r}: {names}"
+        )
+    return matches[0][1]
+
 ssh_command = [
     "ssh",
     "-o",
@@ -2284,7 +2312,7 @@ def watch(hours: float = 2.0, every: int = 300, run: str = "") -> list[Status]:
 
 def _microbatch_sync_config(run: str) -> tuple[str, list[str], str]:
     """Resolve the current trainer output and exact peer addresses."""
-    selected = _profile("current")
+    selected = _profile_for_run(run)
     trainer_path = repo_root / selected["trainer"]
     try:
         with trainer_path.open("rb") as stream:
