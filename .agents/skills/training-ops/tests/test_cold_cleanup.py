@@ -57,6 +57,9 @@ class ColdCleanupTest(unittest.TestCase):
 
                 self.assertEqual({host for host, _, _ in calls}, {"n76", "h200a"})
                 self.assertTrue(all(timeout == 300 for _, _, timeout in calls))
+                phases = ["stop" if "stop_only=1" in script else "delete" for _, script, _ in calls]
+                self.assertEqual(len(phases), 4)
+                self.assertLess(max(i for i, phase in enumerate(phases) if phase == "stop"), min(i for i, phase in enumerate(phases) if phase == "delete"))
                 self.assertTrue(target.exists())
                 self.assertFalse(stale.exists())
                 self.assertFalse(trainer_rollout.exists())
@@ -84,8 +87,9 @@ class ColdCleanupTest(unittest.TestCase):
                 training_ops.runtime_root = str(
                     Path(__file__).resolve().parents[1] / "runtime"
                 )
-                stale_dir = Path(training_ops.run_root) / "stale" / "run_stale"
-                (stale_dir / "rollouts").mkdir(parents=True)
+                stale_dir = Path(training_ops.run_root) / "alpha" / "run_alpha"
+                publisher_dir = stale_dir.parent
+                (publisher_dir / "rollouts").mkdir(parents=True)
                 process = subprocess.Popen(
                     [
                         "bash",
@@ -93,13 +97,13 @@ class ColdCleanupTest(unittest.TestCase):
                     ],
                     env={
                         **os.environ,
-                        "run_dir": str(stale_dir),
+                        "run_dir": str(publisher_dir),
                         "nodes": "10.92.20.76",
                         "interval": "60",
                     },
                 )
                 try:
-                    pid_file = stale_dir / ".microbatch-sync.pid"
+                    pid_file = publisher_dir / ".microbatch-sync.pid"
                     for _ in range(50):
                         if pid_file.exists():
                             break

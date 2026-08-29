@@ -4333,18 +4333,20 @@ def _cold_run_paths(run: str) -> tuple[str, str, str]:
     return str(root), str(run_parent), str(run_dir)
 
 
-def _cold_cleanup_script(run: str) -> str:
+def _cold_cleanup_script(run: str, *, stop_only: bool = False) -> str:
     """Build a bounded remote cleanup for one configured run only."""
     runs_path, run_parent, run_dir = _cold_run_paths(run)
     sync_script = f"{runtime_root}/china/sync_microbatches.sh"
+    stop_only_value = 1 if stop_only else 0
     return f"""set -euo pipefail
 runs_path={shlex.quote(runs_path)}
 run_parent={shlex.quote(run_parent)}
 run_dir={shlex.quote(run_dir)}
 sync_script={shlex.quote(sync_script)}
+stop_only={stop_only_value}
 
 # A PID file alone is not enough: the PID can be stale or reused. Require the
-# exact run_dir environment and sync command before sending a signal.
+# exact publisher output directory and sync command before sending a signal.
 sync_process_matches() {{
   local pid=$1 expected_run_dir=$2 command_line
   case "$pid" in
@@ -4387,7 +4389,7 @@ stop_sync_processes() {{
   }}
 
   # The PID file is an optimisation only. A process can outlive an unlink or
-  # lose the file during a failed startup, so inspect every configured service
+  # lose the file during a failed startup, so inspect every configured publisher
   # directory and every /proc entry. The matcher above is exact; this is not a
   # name-based kill.
   scan_run_dir() {{
@@ -4401,6 +4403,7 @@ stop_sync_processes() {{
     done
     return 0
   }}
+  scan_run_dir "$run_parent"
   scan_run_dir "$run_dir"
   for service_dir in "$runs_path"/*/run_*; do
     [ "$service_dir" = "$run_dir" ] && continue
@@ -4408,7 +4411,7 @@ stop_sync_processes() {{
       "$runs_path"/*/run_*) scan_run_dir "$service_dir" ;;
     esac
   done
-  for pid_file in "$runs_path"/*/run_*/.microbatch-sync.pid; do
+  for pid_file in "$run_parent/.microbatch-sync.pid" "$runs_path"/*/run_*/.microbatch-sync.pid; do
     [ -f "$pid_file" ] || continue
     stale_run_dir=${{pid_file%/.microbatch-sync.pid}}
     case "$stale_run_dir" in
@@ -4438,6 +4441,25 @@ if [ -L "$runs_path" ] || [ -L "$run_parent" ] || [ -L "$run_dir" ]; then
   exit 1
 fi
 stop_sync_processes
+remaining_sync=""
+for expected_run_dir in "$run_parent" "$run_dir"; do
+  [ -d "$expected_run_dir" ] || continue
+  [ -L "$expected_run_dir" ] && continue
+  for proc_dir in /proc/[0-9]*; do
+    pid=${{proc_dir##*/}}
+    if sync_process_matches "$pid" "$expected_run_dir"; then
+      remaining_sync="$remaining_sync $pid:$expected_run_dir"
+    fi
+  done
+done
+if [ -n "$remaining_sync" ]; then
+  echo "cold cleanup: microbatch sync remains:$remaining_sync" >&2
+  exit 1
+fi
+if [ "$stop_only" = 1 ]; then
+  echo "cold cleanup: microbatch publishers stopped for $run_parent"
+  exit 0
+fi
 if [ ! -e "$run_parent" ]; then
   echo "cold cleanup: no state at $run_parent"
   exit 0
@@ -4492,25 +4514,36 @@ echo "cold cleanup: complete ($removed entries) target=$run_dir"
 
 
 def _cold_start_cleanup(run: str, nodes: list[str]) -> None:
-    """Remove stale generated state for one run before a cold start."""
+    """Stop old microbatch publishers, then remove stale state for one run."""
     _cold_run_paths(run)  # Validate before any host action.
     targets = list(dict.fromkeys([*nodes, orchestrator_host]))
     targets = [_check_host(host) for host in targets]
-    script = _cold_cleanup_script(run)
 
-    def one(host: str) -> tuple[int, str]:
-        return _ssh(host, script, timeout=300)
+    def phase(script: str, label: str, error_label: str) -> None:
+        results = _fan(
+            targets,
+            lambda host: _ssh(host, script, timeout=300),
+        )
+        failures = []
+        for host, (code, output) in results.items():
+            detail = " | ".join(line.strip() for line in output.splitlines() if line.strip())
+            if code:
+                failures.append(f"{host}: {detail or f'exit {code}'}")
+            else:
+                print(f"cold cleanup {run} {label} on {host}: {detail or 'complete'}")
+        if failures:
+            raise RuntimeError(f"{error_label}: " + "; ".join(failures))
 
-    results = _fan(targets, one)
-    failures = []
-    for host, (code, output) in results.items():
-        detail = " | ".join(line.strip() for line in output.splitlines() if line.strip())
-        if code:
-            failures.append(f"{host}: {detail or f'exit {code}'}")
-        else:
-            print(f"cold cleanup {run} on {host}: {detail or 'complete'}")
-    if failures:
-        raise RuntimeError("cold cleanup failed: " + "; ".join(failures))
+    phase(
+        _cold_cleanup_script(run, stop_only=True),
+        "microbatch publishers stopped",
+        "cold publisher stop failed",
+    )
+    phase(
+        _cold_cleanup_script(run),
+        "state removed",
+        "cold cleanup failed",
+    )
 
 
 def start(
