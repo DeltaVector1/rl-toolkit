@@ -18,9 +18,9 @@ lora_target_modules = [
   "shared_expert",
   "experts",
 ]
-gpu_memory_utilization = 0.92
+gpu_memory_utilization = 0.95
 enable_prefix_caching = true
-enable_expert_parallel = false
+enable_expert_parallel = true
 enable_eplb = false
 enable_return_routed_experts = true
 api_server_count = 1

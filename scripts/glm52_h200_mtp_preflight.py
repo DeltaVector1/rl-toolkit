@@ -17,6 +17,7 @@ from prime_rl.glm52_routing import glm_routing_errors
 PROFILE_NAME = "glm52-mtp-h200"
 CONTEXT_TOKENS = 32768
 SUPPORTED_BLOCK_SIZES = frozenset({64})
+EXPECTED_GPU_MEMORY_UTILIZATION = 0.95
 TARGET_MODULES = {
     "q_a_proj",
     "q_b_proj",
@@ -80,8 +81,12 @@ def static_errors(config: dict) -> list[str]:
         errors.append("return_routed_experts must be enabled")
     if config.get("enable_prefix_caching") is not True:
         errors.append("prefix caching must be enabled")
-    if config.get("enable_expert_parallel") is not False:
-        errors.append("expert parallelism must remain disabled for this qualification")
+    if config.get("gpu_memory_utilization") != EXPECTED_GPU_MEMORY_UTILIZATION:
+        errors.append("H200 gpu_memory_utilization must be 0.95 (5% headroom)")
+    if config.get("enable_expert_parallel") is not True:
+        errors.append("expert parallelism must be enabled for TP8/EP8")
+    if config.get("enable_eplb") is not False:
+        errors.append("EPLB must remain disabled for this qualification")
     if model.get("name") != "/models/glm52-fp8":
         errors.append("model path must be /models/glm52-fp8")
     if model.get("dtype") != "bfloat16":

@@ -25,6 +25,11 @@ FlashMLA workspace chunking. Do not enable MTP in production until the
 qualification passes one-token decode, trainer/H200 parity, and long-run
 memory checks.
 
+The isolated MTP H200 profile is pinned to TP8/EP8/DP1,
+`gpu_memory_utilization = 0.95`, BF16 KV cache, and block size 64. EPLB stays
+disabled. The 0.95 setting reserves 5 percent of each H200 for runtime
+headroom while the qualification measures the resulting KV-cache capacity.
+
 ## Model and environment revisions
 
 - `zai-org/GLM-5.2-FP8`: `ba978f7d347eaf65d22f1a86833408afdb953541`

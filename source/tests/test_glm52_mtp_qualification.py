@@ -92,6 +92,34 @@ def test_profile_has_the_required_safe_mtp_contract():
     assert config["model"]["max_model_len"] == 32768
     assert config["max_lora_rank"] == 32
     assert config["enable_return_routed_experts"] is True
+    assert config["gpu_memory_utilization"] == 0.95
+    assert config["enable_expert_parallel"] is True
+    assert config["enable_eplb"] is False
+
+
+def test_mtp_preflight_requires_h200_headroom_and_ep_without_eplb():
+    config = tomllib.loads(
+        (ROOT / "configs/qualification/glm52-mtp-h200.toml").read_text()
+    )
+    preflight = _load_module(
+        ROOT / "scripts/glm52_h200_mtp_preflight.py", "glm52_mtp_preflight_memory_ep"
+    )
+    assert config["gpu_memory_utilization"] == 0.95
+    assert config["enable_expert_parallel"] is True
+    assert config["enable_eplb"] is False
+    assert preflight.static_errors(config) == []
+
+    for field, value, message in (
+        ("gpu_memory_utilization", 0.92, "gpu_memory_utilization"),
+        ("enable_expert_parallel", False, "expert parallelism"),
+        ("enable_eplb", True, "EPLB"),
+    ):
+        invalid = tomllib.loads(
+            (ROOT / "configs/qualification/glm52-mtp-h200.toml").read_text()
+        )
+        invalid[field] = value
+        errors = preflight.static_errors(invalid)
+        assert any(message.lower() in error.lower() for error in errors), field
 
 
 def test_mtp_block_size_is_supported_and_shared_by_target_and_draft():
