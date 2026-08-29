@@ -1,7 +1,9 @@
 """Loopback-only Muse bootstrap and checkpoint-staging endpoints."""
 
 import asyncio
+import json
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -34,6 +36,41 @@ _FILES = {
     "transformers-5.15.tar": Path("/data/muse-glimmer/transformers-5.15.tar"),
 }
 _LORA_LOAD_LOCK = asyncio.Lock()
+_DELTA_TRANSPORT = "chunked-shuffled-xor-zstd"
+
+
+def _positive_policy_url(source_url: str) -> bool:
+    """Return whether a source URL names a positive policy step."""
+    name = Path(urlsplit(source_url).path.rstrip("/")).name
+    if not name.startswith("step_"):
+        return False
+    try:
+        return int(name.removeprefix("step_")) > 0
+    except ValueError:
+        return False
+
+
+def _require_delta_for_url(source_url: str, requested: bool) -> bool:
+    # Positive policy URLs never use the full-adapter fallback.
+    return requested or _positive_policy_url(source_url)
+
+
+def _check_prefetched_adapter(destination: Path, source_url: str, require_delta: bool) -> None:
+    if not (destination / "READY").is_file():
+        raise RuntimeError("prefetched adapter cache is not ready")
+    if not require_delta:
+        return
+    try:
+        with (destination / "transport.json").open("r", encoding="utf-8") as source:
+            proof = json.load(source)
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        raise RuntimeError("delta adapter transport is required; prefetched cache is not an exact delta") from exc
+    if (
+        not isinstance(proof, dict)
+        or proof.get("mode") != _DELTA_TRANSPORT
+        or proof.get("source_url") != source_url
+    ):
+        raise RuntimeError("delta adapter transport is required; prefetched cache is not an exact delta")
 
 
 class MuseFileEndpoint:
@@ -101,8 +138,25 @@ class MuseFileEndpoint:
             source_url = data.get("lora_path")
             if not isinstance(source_url, str) or not source_url.startswith(("http://", "https://")):
                 raise HTTPException(status_code=400, detail="lora_path must be an HTTP URL")
-            destination = await asyncio.to_thread(stage_lora_adapter_files, source_url)
-            return {"status": "ok", "path": destination.as_posix()}
+            require_delta = data.get("require_delta", False)
+            if not isinstance(require_delta, bool):
+                raise HTTPException(status_code=400, detail="require_delta must be a boolean")
+            require_delta = _require_delta_for_url(source_url, require_delta)
+            started = asyncio.get_running_loop().time()
+            destination = await asyncio.to_thread(
+                stage_lora_adapter_files,
+                source_url,
+                require_delta=require_delta,
+            )
+            payload = {
+                "status": "ok",
+                "path": destination.as_posix(),
+                "stage_seconds": asyncio.get_running_loop().time() - started,
+            }
+            stage_state = adapter_stage_status()
+            if isinstance(stage_state.get("reconstruct_seconds"), (int, float)):
+                payload["reconstruct_seconds"] = float(stage_state["reconstruct_seconds"])
+            return payload
 
         @app.get("/staging_status")
         async def staging_status(request: Request):
@@ -132,13 +186,28 @@ class MuseFileEndpoint:
             """Stage a remote adapter and load it through vLLM's native handler."""
             require_loopback(request)
             data = await request.json()
+            require_delta = data.get("require_delta", False)
+            if not isinstance(require_delta, bool):
+                raise HTTPException(status_code=400, detail="require_delta must be a boolean")
+            prefetched = data.get("prefetched", False)
+            if not isinstance(prefetched, bool):
+                raise HTTPException(status_code=400, detail="prefetched must be a boolean")
             lora_request = LoadLoRAAdapterRequest.model_validate(data)
             async with _LORA_LOAD_LOCK:
                 source_url = None
                 destination = None
                 if lora_request.lora_path.startswith(("http://", "https://")):
                     source_url = lora_request.lora_path
-                    destination = await asyncio.to_thread(stage_lora_adapter_files, source_url)
+                    require_delta = _require_delta_for_url(source_url, require_delta)
+                    if prefetched:
+                        destination = adapter_cache_path(source_url)
+                        _check_prefetched_adapter(destination, source_url, require_delta)
+                    else:
+                        destination = await asyncio.to_thread(
+                            stage_lora_adapter_files,
+                            source_url,
+                            require_delta=require_delta,
+                        )
                     expected = adapter_cache_path(source_url)
                     if destination != expected:
                         raise RuntimeError("adapter cache path changed during staging")

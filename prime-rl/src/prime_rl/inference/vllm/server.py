@@ -19,6 +19,7 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from prime_rl.configs.inference import InferenceConfig
 from prime_rl.inference.vllm.worker.filesystem import (
+    _delta_stage_timeout_s,
     adapter_cache_path,
     adapter_reader_lock,
     adapter_stage_status,
@@ -214,11 +215,21 @@ async def stage_lora_adapter(raw_request: Request):
     _begin_lora_stage()
     started = time.perf_counter()
     try:
-        destination = await asyncio.to_thread(
+        stage_timeout = _delta_stage_timeout_s() if require_delta else None
+        stage_call = asyncio.to_thread(
             stage_lora_adapter_files,
             source_url,
             require_delta=require_delta,
         )
+        try:
+            destination = await asyncio.wait_for(
+                stage_call,
+                timeout=stage_timeout,
+            )
+        except asyncio.TimeoutError:
+            return JSONResponse(
+                {"error": "adapter delta staging exceeded its time limit"}, status_code=504
+            )
         payload = {
             "status": "ok",
             "path": destination.as_posix(),

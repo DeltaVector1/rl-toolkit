@@ -38,57 +38,6 @@ stripe_attempt_timeout=${STRIPE_ATTEMPT_TIMEOUT:-90}
 # spread their handshakes across four seconds so a failed first wave does not
 # force a complete retry pass.
 parallel_launch_delay=${PARALLEL_LAUNCH_DELAY:-0.25}
-adapter_source_base=${ADAPTER_SOURCE_BASE:-}
-adapter_admin_urls=${ADAPTER_ADMIN_URLS:-}
-# Prefetch is only an optimization. It must not hold a stable marker or the
-# next completed rollout batch. The outer timeout covers all curl retries.
-adapter_prefetch_timeout=${ADAPTER_PREFETCH_TIMEOUT:-7200}
-adapter_request_timeout=${ADAPTER_REQUEST_TIMEOUT:-3600}
-
-prefetch_adapter() {
-  local relative=$1 adapter_relative source_url admin status pid
-  local -a pids
-  [ -n "$adapter_source_base" ] || return 0
-  [ -n "$adapter_admin_urls" ] || return 0
-  case "$relative" in
-    broadcasts/step_*/STABLE) ;;
-    *) return 0 ;;
-  esac
-  adapter_relative=${relative%/STABLE}
-  source_url="${adapter_source_base%/}/$adapter_relative"
-  pids=()
-  for admin in $adapter_admin_urls; do
-    timeout --signal=TERM --kill-after=5 "$adapter_prefetch_timeout" \
-      curl --fail --silent --show-error \
-      --connect-timeout 10 --max-time "$adapter_request_timeout" \
-      --retry 2 --retry-all-errors --retry-delay 2 \
-      --retry-max-time "$adapter_prefetch_timeout" \
-      -H 'Content-Type: application/json' \
-      -d "{\"lora_path\":\"$source_url\"}" \
-      "${admin%/}/stage_lora_adapter" >/dev/null &
-    pids+=("$!")
-  done
-  status=0
-  for pid in "${pids[@]}"; do
-    wait "$pid" || status=1
-  done
-  if [ "$status" != 0 ]; then
-    echo "$(date -u +%FT%TZ) adapter prefetch incomplete for $relative" >&2
-    return 1
-  fi
-  echo "$(date -u +%FT%TZ) prefetched adapter for $relative"
-}
-
-prefetch_adapter_async() {
-  local relative=$1
-  (
-    if ! prefetch_adapter "$relative"; then
-      echo "$(date -u +%FT%TZ) adapter prefetch failed for $relative; policy watcher will stage it" >&2
-    fi
-  ) &
-  echo "$(date -u +%FT%TZ) adapter prefetch started for $relative (pid $!)"
-}
-
 copy_parallel() {
   local source=$1 destination=$2
   local size chunk_size parts_dir remote_parts status pid part part_name part_size attempt
@@ -232,9 +181,6 @@ pull_stable_markers() {
       "$dest_host:$remote_file" "$partial" || continue
     mv "$partial" "$final"
     echo "pulled $relative"
-    # Publish the marker first. A slow or failed optimization must not block
-    # delivery of this or later completed rollout batches.
-    prefetch_adapter_async "$relative"
   done < <(remote "find '$dest_dir/broadcasts' -type f -name STABLE -print 2>/dev/null" || true)
 }
 

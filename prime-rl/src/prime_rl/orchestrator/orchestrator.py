@@ -22,6 +22,7 @@ in ``setup()`` and drives them from ``main_loop()``.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 from typing import TYPE_CHECKING
@@ -158,6 +159,42 @@ POLICY_UPDATE_BATCH_WAIT_TIMEOUT_S = 1200
 # configures ``wait_for_weights_timeout`` (e.g. a from-scratch run). The
 # broadcast is always coming, so wait rather than fail immediately.
 STARTUP_WEIGHT_WAIT_TIMEOUT_S = 1200
+
+
+def _verify_startup_adapter_delta(
+    config: OrchestratorConfig,
+    lora_name: str | None,
+    step: int,
+    target_path,
+) -> None:
+    """Reject a positive resume unless its published adjacent delta is exact."""
+    if lora_name is None or step <= 0:
+        return
+    broadcast_dir = get_broadcast_dir(config.output_dir)
+    previous_path = get_step_path(broadcast_dir, step - 1)
+    if not (previous_path / "STABLE").is_file():
+        raise RuntimeError(
+            f"cannot resume LoRA policy v{step}: exact predecessor v{step - 1} is not STABLE"
+        )
+    manifest_path = target_path / "adapter_manifest.json"
+    try:
+        with manifest_path.open("r", encoding="utf-8") as source:
+            manifest = json.load(source)
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        raise RuntimeError(
+            f"cannot resume LoRA policy v{step}: exact adjacent delta manifest is unavailable"
+        ) from exc
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("version") != 1
+        or manifest.get("kind") != "lora-adapter"
+        or manifest.get("mode") != "delta"
+        or manifest.get("target_step") != step
+        or manifest.get("base_step") != step - 1
+    ):
+        raise RuntimeError(
+            f"cannot resume LoRA policy v{step}: published adapter is not the exact adjacent delta"
+        )
 
 
 class Orchestrator:
@@ -445,10 +482,18 @@ class Orchestrator:
                 weights_path = get_weight_dir(
                     config.output_dir, sync_version, check_exists=check_exists, wait_timeout=wait_timeout
                 )
+                _verify_startup_adapter_delta(config, self.lora_name, sync_version, weights_path)
                 weights_path = inference_weight_path(config, weights_path, self.lora_name)
             if self.model_express is not None:
                 await asyncio.to_thread(self.model_express.set_status, p2p_pb2.SOURCE_STATUS_READY)
-            await self.policy_inference.update_weights(weights_path, lora_name=self.lora_name, step=sync_version)
+            require_delta = self.lora_name is not None and sync_version > 0
+            await self.policy_inference.update_weights(
+                weights_path,
+                lora_name=self.lora_name,
+                step=sync_version,
+                require_delta=require_delta,
+                prefetched=False,
+            )
             if self.model_express is not None:
                 await asyncio.to_thread(self.model_express.set_status, p2p_pb2.SOURCE_STATUS_INITIALIZING)
                 # Complete the startup rendezvous before the watcher begins its next cycle.

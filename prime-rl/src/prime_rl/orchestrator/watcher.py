@@ -406,6 +406,17 @@ class WeightWatcher:
             if weights_path is None:
                 return
 
+            require_delta = self.ckpt_step > 0
+            if require_delta and self.verified_adapter_step != self.ckpt_step:
+                raise RuntimeError(
+                    f"cannot reconcile policy v{self.ckpt_step}: exact loaded policy is not verified"
+                )
+            if require_delta and self.verified_adapter_url is not None:
+                if str(weights_path) != self.verified_adapter_url:
+                    raise RuntimeError(
+                        f"cannot reconcile policy v{self.ckpt_step}: verified adapter URL changed"
+                    )
+
             checks = await asyncio.gather(
                 *(model_is_visible(client, self.policy.model_name) for client in self.inference.admin_clients)
             )
@@ -418,7 +429,13 @@ class WeightWatcher:
                 f"{len(self.inference.admin_clients)} inference endpoint(s); restoring it"
             )
             t0 = time.perf_counter()
-            await load_lora_adapter(missing, self.policy.model_name, weights_path)
+            await load_lora_adapter(
+                missing,
+                self.policy.model_name,
+                weights_path,
+                require_delta=require_delta,
+                prefetched=False,
+            )
             visible = await asyncio.gather(
                 *(model_is_visible(client, self.policy.model_name) for client in self.inference.admin_clients)
             )

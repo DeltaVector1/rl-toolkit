@@ -210,8 +210,6 @@ if [ "$transport" = filesystem ]; then
   fi
   nohup setsid env SOURCE_RUN_DIR="/data/glm52-rl/runs/$RUN/$RUN_NAME" \
     DEST_HOST="$trainer_ssh_target" \
-    ADAPTER_SOURCE_BASE="http://127.0.0.1:${lora_source_ports[0]}/$RUN/$RUN_NAME" \
-    ADAPTER_ADMIN_URLS="$adapter_admin_urls" \
     "$deployment/.agents/skills/training-ops/runtime/h200/sync_rollout_batches.sh" \
     >>"/data/glm52-rl/batch-sync-$RUN.log" 2>&1 </dev/null &
   publisher_pid=$!
