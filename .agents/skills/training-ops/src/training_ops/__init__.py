@@ -7374,6 +7374,29 @@ def _mounts_in(script: Path) -> set[str]:
     return set(re.findall(r'-v "\$deployment/(\S+?)":', script.read_text()))
 
 
+def _inference_qualification_launchers() -> tuple[Path, ...]:
+    """Return configured H200 qualification launcher paths."""
+    qualifications = operations.get("qualification", {})
+    if not isinstance(qualifications, dict):
+        return ()
+    launchers = []
+    for qualification in qualifications.values():
+        if not isinstance(qualification, dict):
+            continue
+        launcher = qualification.get("launcher")
+        if not isinstance(launcher, str):
+            continue
+        relative = PurePosixPath(launcher)
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or relative.parts[:2] != ("scripts", "h200")
+        ):
+            continue
+        launchers.append(repo_root.joinpath(*relative.parts))
+    return tuple(launchers)
+
+
 def mounted_files() -> list[str]:
     """The source paths that the trainer and H200 launchers mount.
 
@@ -7385,6 +7408,7 @@ def mounted_files() -> list[str]:
         repo_root / "scripts" / "h200" / "start_orchestrator.sh",
         repo_root / "scripts" / "h200" / "start_inference.sh",
         repo_root / "scripts" / "h200" / "start_muse_inference.sh",
+        *_inference_qualification_launchers(),
     )
     return sorted(set().union(*(_mounts_in(script) for script in scripts)))
 
@@ -9707,6 +9731,7 @@ def _mounted_on(path: str, host: str) -> bool:
             repo_root / "scripts" / "h200" / "start_orchestrator.sh",
             repo_root / "scripts" / "h200" / "start_inference.sh",
             repo_root / "scripts" / "h200" / "start_muse_inference.sh",
+            *_inference_qualification_launchers(),
         )
     else:
         scripts = (repo_root / "scripts" / "china" / "cluster.sh",)

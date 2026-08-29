@@ -299,6 +299,87 @@ class DeployTest(unittest.TestCase):
 
             self.assertCountEqual(copied_to, training_ops.inference_hosts)
 
+    def test_deploy_routes_glm52_routing_to_configured_mtp_launcher(self):
+        path = "source/src/prime_rl/glm52_routing.py"
+        want = hashlib.sha256((training_ops.repo_root / path).read_bytes()).hexdigest()
+        copied_to = []
+
+        def fake_run(command, **kwargs):
+            del kwargs
+            if command[0] == "scp":
+                copied_to.append(command[-1].split(":", 1)[0])
+            return Mock(returncode=0, stdout="", stderr="")
+
+        def fake_ssh(host, command, timeout=120):
+            del host, timeout
+            if command.startswith("if test -f "):
+                return 0, "different"
+            if command.startswith("test -f "):
+                return 0, want
+            return 0, ""
+
+        with (
+            patch.object(training_ops, "_ssh", side_effect=fake_ssh),
+            patch.object(
+                training_ops,
+                "_ssh_control_masters",
+                return_value=nullcontext(),
+            ),
+            patch.object(training_ops.subprocess, "run", side_effect=fake_run),
+        ):
+            self.assertTrue(training_ops.deploy(path))
+
+        self.assertEqual(copied_to, [training_ops.inference_hosts[0]])
+
+    def test_deploy_routes_source_from_any_configured_qualification_launcher(self):
+        path = "source/future_qualification.py"
+        launcher = "scripts/h200/start_future_qualification.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            source = repo / path
+            source.parent.mkdir(parents=True)
+            source.write_text("future\n")
+            want = hashlib.sha256(source.read_bytes()).hexdigest()
+            copied_to = []
+
+            def fake_mounts(script):
+                if script == repo / launcher:
+                    return {path}
+                return set()
+
+            def fake_run(command, **kwargs):
+                del kwargs
+                if command[0] == "scp":
+                    copied_to.append(command[-1].split(":", 1)[0])
+                return Mock(returncode=0, stdout="", stderr="")
+
+            def fake_ssh(host, command, timeout=120):
+                del host, timeout
+                if command.startswith("if test -f "):
+                    return 0, "different"
+                if command.startswith("test -f "):
+                    return 0, want
+                return 0, ""
+
+            with (
+                patch.object(training_ops, "repo_root", repo),
+                patch.dict(
+                    training_ops.operations["qualification"],
+                    {"future": {"launcher": launcher}},
+                ),
+                patch.object(training_ops, "_mounts_in", side_effect=fake_mounts),
+                patch.object(training_ops, "_ssh", side_effect=fake_ssh),
+                patch.object(
+                    training_ops,
+                    "_ssh_control_masters",
+                    return_value=nullcontext(),
+                ),
+                patch.object(training_ops.subprocess, "run", side_effect=fake_run),
+            ):
+                self.assertTrue(training_ops.deploy(path))
+
+            self.assertEqual(copied_to, [training_ops.inference_hosts[0]])
+
     def test_deploy_skips_scp_when_remote_file_matches(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
