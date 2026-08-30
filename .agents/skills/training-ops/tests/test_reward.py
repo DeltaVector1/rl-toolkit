@@ -76,6 +76,13 @@ class ActiveMetricRowsTest(unittest.TestCase):
 
 
 class AcceptanceProbeTest(unittest.TestCase):
+    def test_probe_uses_container_command_when_env_has_no_run(self):
+        script = training_ops._acceptance_probe_script("glm52", "trainer")
+
+        self.assertIn("container_cmd=", script)
+        self.assertIn("active_run_source=log-dir", script)
+        self.assertIn('docker logs --since "$started_at"', script)
+
     def test_current_fp8_config_does_not_require_removed_dequant_flags(self):
         report = training_ops._acceptance_from_text(
             "glm52",

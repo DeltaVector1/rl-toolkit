@@ -1246,6 +1246,7 @@ acceptance_log_pattern = (
 
 def _acceptance_probe_script(run: str, role: str) -> str:
     root = shlex.quote(f"{run_root}/{run}")
+    run_prefix = shlex.quote(f"{run_root}/")
     if role == "trainer":
         container = trainer_container
         metric_name = "trainer-metrics.jsonl"
@@ -1261,12 +1262,17 @@ def _acceptance_probe_script(run: str, role: str) -> str:
     return f"""
 cfg=$(sudo docker inspect {container} --format '{{{{range .Config.Cmd}}}}{{{{println .}}}}{{{{end}}}}' 2>/dev/null |
       grep -E '\\.toml$' | tail -1)
+container_cmd=$(sudo docker inspect {container} --format '{{{{range .Config.Cmd}}}}{{{{println .}}}}{{{{end}}}}' 2>/dev/null || true)
 container_env=$(sudo docker inspect {container} --format '{{{{range .Config.Env}}}}{{{{println .}}}}{{{{end}}}}' 2>/dev/null || true)
 active_run=$(printf '%s\\n' "$container_env" | sed -n 's/^RUN=//p' | head -1)
 active_run_source=RUN
 if [ -z "$active_run" ]; then
   active_run=$(printf '%s\\n' "$container_env" | sed -n 's#^HF_HOME=/data/glm52-rl/runs/\\([^/]*\\)/.*#\\1#p' | head -1)
   active_run_source=HF_HOME
+fi
+if [ -z "$active_run" ]; then
+  active_run=$(printf '%s\\n' "$container_cmd" | awk -v root={run_prefix} '$0 ~ "^--log-dir=" root {{ value=substr($0, 11 + length(root)); sub("/.*$", "", value); print value; exit }}')
+  active_run_source=log-dir
 fi
 started_at=$(sudo docker inspect {container} --format '{{{{.State.StartedAt}}}}' 2>/dev/null | head -1)
 start_epoch=
@@ -2111,11 +2117,16 @@ def steps(run: str = "", limit: int = 10) -> list[dict]:
     if not 1 <= int(limit) <= 200:
         raise Refused("step limit must be between 1 and 200")
     container = shlex.quote(trainer_container)
+    run_prefix = shlex.quote(f"{run_root}/")
     script = f"""
 path=$(find {shlex.quote(f'{run_root}/{run}')} -maxdepth 3 -type f -name trainer-metrics.jsonl -print 2>/dev/null | head -1)
 [ -n "$path" ] || exit 4
 container_env=$(sudo docker inspect {container} --format '{{{{range .Config.Env}}}}{{{{println .}}}}{{{{end}}}}' 2>/dev/null || true)
 active_run=$(printf '%s\\n' "$container_env" | sed -n 's/^RUN=//p' | head -1)
+if [ -z "$active_run" ]; then
+  container_cmd=$(sudo docker inspect {container} --format '{{{{range .Config.Cmd}}}}{{{{println .}}}}{{{{end}}}}' 2>/dev/null || true)
+  active_run=$(printf '%s\\n' "$container_cmd" | awk -v root={run_prefix} '$0 ~ "^--log-dir=" root {{ value=substr($0, 11 + length(root)); sub("/.*$", "", value); print value; exit }}')
+fi
 started_at=$(sudo docker inspect {container} --format '{{{{.State.StartedAt}}}}' 2>/dev/null | head -1)
 start_epoch=
 if [ -n "$started_at" ]; then start_epoch=$(date -u -d "$started_at" +%s.%N 2>/dev/null || true); fi
