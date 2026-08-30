@@ -107,9 +107,7 @@ async def request_judge_score(
     name: str,
     request: Callable[[], Awaitable[Any]],
     *,
-    judge_config: Any | None = None,
     attempt_count: int = 3,
-    attempt_timeout_seconds: float = 180.0,
     total_timeout_seconds: float = 550.0,
 ) -> EvaluationResult:
     attempts: list[dict[str, Any]] = []

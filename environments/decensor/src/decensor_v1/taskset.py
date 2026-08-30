@@ -229,7 +229,6 @@ class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
                 return await request_judge_score(
                     name,
                     lambda: run_agentic_review(task_config.judge, source),
-                    judge_config=task_config.judge,
                 )
 
         review_outcomes = await asyncio.gather(
