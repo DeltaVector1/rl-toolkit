@@ -4558,7 +4558,7 @@ def start(
     """Start a run from one configured profile."""
     if mode not in ("cold", "restart"):
         raise Refused('mode must be "cold" or "restart"')
-    _cold_run_paths(run)
+    _runs_path, _run_parent, service_run_dir = _cold_run_paths(run)
     if (resume_adapter is None) != (resume_step is None):
         raise Refused("resume_adapter and resume_step must be set together")
     selected = _profile(profile)
@@ -4692,6 +4692,48 @@ def start(
         if rc:
             raise RuntimeError(f"edge orchestrator start failed on {orchestrator_host}: {out}")
 
+    restart_marker = f"{service_run_dir}/.trainer-restart-started"
+
+    def mark_restart_start() -> None:
+        _remote_ok(
+            trainer_head,
+            f"test -d {shlex.quote(service_run_dir)} && "
+            f"touch {shlex.quote(restart_marker)}",
+            "trainer restart marker",
+        )
+
+    def wait_for_fresh_broadcast() -> None:
+        broadcast_dir = f"{service_run_dir}/broadcasts"
+        script = f"""set -eu
+marker={shlex.quote(restart_marker)}
+broadcast_dir={shlex.quote(broadcast_dir)}
+trap 'rm -f -- "$marker"' EXIT
+for _ in $(seq 1 {adapter_update_engine_startup_timeout_seconds}); do
+  stable=$(find "$broadcast_dir" -mindepth 2 -maxdepth 2 -type f -name STABLE -newer "$marker" -print -quit 2>/dev/null || true)
+  if [ -n "$stable" ]; then
+    echo "fresh adapter ready: ${{stable%/STABLE}}"
+    exit 0
+  fi
+  running=$(sudo docker ps --filter name=^{trainer_container}$ --format '{{{{.Names}}}}')
+  if [ "$running" != {shlex.quote(trainer_container)} ]; then
+    echo "trainer exited before publishing a fresh adapter" >&2
+    exit 1
+  fi
+  sleep 1
+done
+echo "trainer did not publish a fresh adapter within {adapter_update_engine_startup_timeout_seconds}s" >&2
+exit 1
+"""
+        code, output = _ssh(
+            trainer_head,
+            script,
+            timeout=adapter_update_engine_startup_timeout_seconds + 30,
+        )
+        if code:
+            detail = " | ".join(output.strip().splitlines()[-5:]) or "no output"
+            raise RuntimeError(f"fresh adapter wait failed on {trainer_head}: {detail}")
+        print(output.strip())
+
     print(f"stopping any previous containers for {run}")
     _remote_ok(
         trainer_head,
@@ -4728,8 +4770,9 @@ def start(
         launch_orch()
         launch_trainer()
     else:
+        mark_restart_start()
         launch_trainer()
-        time.sleep(60)
+        wait_for_fresh_broadcast()
         launch_orch()
 
     if supervisors:
