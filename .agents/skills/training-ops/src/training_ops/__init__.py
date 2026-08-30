@@ -1071,10 +1071,12 @@ def _acceptance_from_text(
     rep.weight_decay = _last(trainer_values, "optim.weight_decay")
 
     quant_type = _last(trainer_values, "model.quantization.type")
-    dequant_flags = [
+    dequantize_checkpoint = _last(
+        trainer_values, "model.quantization.dequantize_checkpoint"
+    )
+    optional_dequant_flags = [
         _last(trainer_values, key)
         for key in (
-            "model.quantization.dequantize_checkpoint",
             "model.quantization.dequantize_checkpoint_linears",
             "model.quantization.dequantize_checkpoint_moe",
         )
@@ -1092,8 +1094,10 @@ def _acceptance_from_text(
             and quant_type is None
         )
     else:
-        rep.native_fp8 = quant_type == "fp8" and all(
-            flag is False for flag in dequant_flags
+        rep.native_fp8 = (
+            quant_type == "fp8"
+            and dequantize_checkpoint is False
+            and not any(flag is True for flag in optional_dequant_flags)
         )
         rep.precision_ok = rep.native_fp8
 

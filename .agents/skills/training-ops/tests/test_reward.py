@@ -76,6 +76,41 @@ class ActiveMetricRowsTest(unittest.TestCase):
 
 
 class AcceptanceProbeTest(unittest.TestCase):
+    def test_current_fp8_config_does_not_require_removed_dequant_flags(self):
+        report = training_ops._acceptance_from_text(
+            "glm52",
+            """\
+[model.quantization]
+type = "fp8"
+dequantize_checkpoint = false
+""",
+            "",
+            "",
+            "",
+            "",
+            "too few steps",
+        )
+
+        self.assertTrue(report.native_fp8)
+
+    def test_explicit_optional_dequant_flag_rejects_native_fp8(self):
+        report = training_ops._acceptance_from_text(
+            "glm52",
+            """\
+[model.quantization]
+type = "fp8"
+dequantize_checkpoint = false
+dequantize_checkpoint_moe = true
+""",
+            "",
+            "",
+            "",
+            "",
+            "too few steps",
+        )
+
+        self.assertFalse(report.native_fp8)
+
     def test_decodes_run_boundary_metadata(self):
         decoded = training_ops._decode_acceptance_probe(
             "ACTIVE_RUN glm52\n"
