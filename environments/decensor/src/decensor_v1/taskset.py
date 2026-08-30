@@ -229,6 +229,7 @@ class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
                     lambda source=source: run_agentic_review(
                         task_config.judge, source
                     ),
+                    judge_config=task_config.judge,
                 )
                 for name, source in zip(review_names, review_sources, strict=True)
             )

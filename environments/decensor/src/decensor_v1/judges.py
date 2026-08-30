@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pydantic import Field
 from verifiers.v1.judge import JudgeConfig
 from verifiers.v1.types import SamplingConfig as JudgeSamplingConfig
 
@@ -16,3 +17,4 @@ class DecensorJudgeConfig(JudgeConfig):
     sampling: DecensorJudgeSampling = DecensorJudgeSampling()
     min_p: float = 0.05
     disable_thinking: bool = True
+    max_concurrent_requests: int = Field(default=8, ge=1)

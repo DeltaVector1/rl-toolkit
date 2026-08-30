@@ -21,6 +21,7 @@ from verifiers.v1.mcp.user import UserConfig
 from verifiers.v1.types import UserMessage
 
 from decensor_v1.state import DecensorState
+from decensor_v1.service import judge_request_slot
 from decensor_v1.follow_up import (
     FollowUpReview,
     choose_follow_up_strategy,
@@ -80,37 +81,38 @@ async def review_follow_up_message(
     extra_body: dict[str, Any],
 ) -> tuple[FollowUpReview, str]:
     tool = follow_up_review_tool()
-    completion = await asyncio.wait_for(
-        client.chat.completions.create(
-            model=config.model,
-            messages=[
-                {"role": "system", "content": follow_up_review_instructions},
-                {
-                    "role": "user",
-                    "content": json.dumps(
-                        {
-                            "original_request": original_request,
-                            "latest_assistant_answer": latest_assistant_answer,
-                            "proposed_user_message": proposed_user_message,
-                            "assigned_strategy": strategy,
-                        },
-                        ensure_ascii=False,
-                    ),
+    async with judge_request_slot(config):
+        completion = await asyncio.wait_for(
+            client.chat.completions.create(
+                model=config.model,
+                messages=[
+                    {"role": "system", "content": follow_up_review_instructions},
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "original_request": original_request,
+                                "latest_assistant_answer": latest_assistant_answer,
+                                "proposed_user_message": proposed_user_message,
+                                "assigned_strategy": strategy,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    },
+                ],
+                tools=[tool],
+                tool_choice={
+                    "type": "function",
+                    "function": {"name": review_result_name},
                 },
-            ],
-            tools=[tool],
-            tool_choice={
-                "type": "function",
-                "function": {"name": review_result_name},
-            },
-            parallel_tool_calls=False,
-            temperature=0.0,
-            max_tokens=768,
-            seed=seed,
-            **({"extra_body": extra_body} if extra_body else {}),
-        ),
-        timeout=90.0,
-    )
+                parallel_tool_calls=False,
+                temperature=0.0,
+                max_tokens=768,
+                seed=seed,
+                **({"extra_body": extra_body} if extra_body else {}),
+            ),
+            timeout=90.0,
+        )
     calls = list(completion.choices[0].message.tool_calls or [])
     if len(calls) != 1 or calls[0].function.name != review_result_name:
         raise ValueError("follow-up reviewer returned no valid review tool call")
@@ -128,6 +130,7 @@ class DecensorUserConfig(UserConfig):
     min_p: float = 0.0
     max_tokens: int = 256
     seed: int = 0
+    max_concurrent_requests: int = Field(default=8, ge=1)
 
 
 class DecensorUser(vf.User[DecensorUserConfig, DecensorState]):
