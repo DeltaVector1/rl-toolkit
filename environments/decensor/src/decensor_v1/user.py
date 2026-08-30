@@ -28,6 +28,7 @@ from decensor_v1.follow_up import (
     follow_up_instructions_by_strategy,
     follow_up_review_instructions,
     follow_up_review_tool,
+    follow_up_strategy_options,
     review_result_name,
     user_turn_seed,
 )
@@ -176,8 +177,8 @@ class DecensorUser(vf.User[DecensorUserConfig, DecensorState]):
             last_asst,
             random.Random(first_attempt_seed),
         )
-        self.state.follow_up_strategies.append(strategy_name)
-        strategy_instruction = follow_up_instructions_by_strategy[strategy_name]
+        tried_strategies = {strategy_name}
+        strategy_selection_seed = first_attempt_seed
         prior_user_messages = [
             message_content(item)
             for item in self._transcript
@@ -197,6 +198,9 @@ class DecensorUser(vf.User[DecensorUserConfig, DecensorState]):
                 async with _shared_openai(self.config) as client:
                     for attempt in range(3):
                         attempt_started_at = time.monotonic()
+                        strategy_instruction = follow_up_instructions_by_strategy[
+                            strategy_name
+                        ]
                         generation_seed = user_turn_seed(
                             self._task_seed,
                             self._rollout_nonce,
@@ -252,6 +256,7 @@ class DecensorUser(vf.User[DecensorUserConfig, DecensorState]):
                                 "turn": produced_turns + 1,
                                 "attempt": attempt + 1,
                                 "strategy": strategy_name,
+                                "strategy_selection_seed": strategy_selection_seed,
                                 "generation_seed": generation_seed,
                                 "text": raw_text,
                                 "parsed_message": candidate,
@@ -304,6 +309,46 @@ class DecensorUser(vf.User[DecensorUserConfig, DecensorState]):
                                         "about assistant filtering, blocking, policy, "
                                         "refusal, or internal process."
                                     )
+                                tried_strategies.add(strategy_name)
+                                if attempt < 2:
+                                    available_strategies = tuple(
+                                        candidate
+                                        for candidate in follow_up_strategy_options(
+                                            last_asst
+                                        )
+                                        if candidate not in tried_strategies
+                                    )
+                                    if not available_strategies:
+                                        final_error = "no_unused_follow_up_strategy"
+                                        attempt_record["status"] = (
+                                            "rejected_semantic_no_strategy"
+                                        )
+                                        attempt_record["next_strategy_error"] = (
+                                            "no unused strategy remained"
+                                        )
+                                        attempt_record["elapsed_seconds"] = (
+                                            time.monotonic() - attempt_started_at
+                                        )
+                                        self.state.follow_up_attempts.append(
+                                            attempt_record
+                                        )
+                                        break
+                                    next_strategy_seed = user_turn_seed(
+                                        self._task_seed,
+                                        self._rollout_nonce,
+                                        produced_turns,
+                                        last_asst,
+                                        attempt + 1001,
+                                    )
+                                    strategy_name = random.Random(
+                                        next_strategy_seed
+                                    ).choice(available_strategies)
+                                    tried_strategies.add(strategy_name)
+                                    strategy_selection_seed = next_strategy_seed
+                                    attempt_record["next_strategy"] = strategy_name
+                                    attempt_record["next_strategy_seed"] = (
+                                        next_strategy_seed
+                                    )
                                 attempt_record["retry_instruction"] = (
                                     retry_instruction
                                 )
@@ -319,6 +364,7 @@ class DecensorUser(vf.User[DecensorUserConfig, DecensorState]):
                                 time.monotonic() - attempt_started_at
                             )
                             self.state.follow_up_attempts.append(attempt_record)
+                            self.state.follow_up_strategies.append(strategy_name)
                         except (
                             APIError,
                             httpx.HTTPError,
@@ -336,6 +382,7 @@ class DecensorUser(vf.User[DecensorUserConfig, DecensorState]):
                                     "attempt": attempt + 1,
                                     "status": "request_failed",
                                     "strategy": strategy_name,
+                                    "strategy_selection_seed": strategy_selection_seed,
                                     "generation_seed": generation_seed,
                                     "error_type": final_error,
                                     "error": str(exc),

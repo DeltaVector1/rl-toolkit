@@ -125,9 +125,13 @@ def choose_follow_up_strategy(
     last_assistant_text: str,
     rng: random.Random,
 ) -> str:
+    return rng.choice(follow_up_strategy_options(last_assistant_text))
+
+
+def follow_up_strategy_options(last_assistant_text: str) -> tuple[str, ...]:
     text = (last_assistant_text or "").strip()
     if refusal_words.search(text):
-        return rng.choice(refusal_follow_up_strategies)
+        return refusal_follow_up_strategies
 
     candidates = list(normal_follow_up_strategies)
     word_count = len(re.findall(r"\S+", text))
@@ -137,7 +141,7 @@ def choose_follow_up_strategy(
         candidates.append("request_specifics")
     if word_count >= 60 and specific_detail.search(text):
         candidates.append("expand_useful_detail")
-    return rng.choice(candidates)
+    return tuple(candidates)
 
 
 def user_turn_seed(
