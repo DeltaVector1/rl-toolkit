@@ -302,7 +302,7 @@ class AdapterTransportStateTest(unittest.TestCase):
         runtime = REPOSITORY / ".agents/skills/training-ops/runtime/h200"
         for name in ("start_inference.sh", "start_muse_inference.sh"):
             source = (runtime / name).read_text(encoding="utf-8")
-            self.assertIn("PRIME_LORA_DOWNLOAD_STREAMS=24", source)
+            self.assertIn("PRIME_LORA_DOWNLOAD_STREAMS=16", source)
             self.assertIn('PRIME_LORA_SOURCE_PORTS="$lora_source_port_list"', source)
         worker_source = (REPOSITORY / "prime-rl/src/prime_rl/inference/vllm/worker/filesystem.py").read_text(encoding="utf-8")
         self.assertIn("download_streams = _configured_download_streams()", worker_source)
