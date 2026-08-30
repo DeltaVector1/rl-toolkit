@@ -40,6 +40,8 @@ class RangeHandler(SimpleHTTPRequestHandler):
         return source
 
     def copyfile(self, source, output):
+        if not hasattr(self, "remaining"):
+            return super().copyfile(source, output)
         while self.remaining:
             chunk = source.read(min(self.remaining, 16 * 1024 * 1024))
             if not chunk:
@@ -48,8 +50,13 @@ class RangeHandler(SimpleHTTPRequestHandler):
             self.remaining -= len(chunk)
 
 
+class AdapterServer(ThreadingHTTPServer):
+    daemon_threads = True
+    request_queue_size = 128
+
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--directory", required=True)
 parser.add_argument("--port", type=int, default=8100)
 args = parser.parse_args()
-ThreadingHTTPServer(("127.0.0.1", args.port), partial(RangeHandler, directory=args.directory)).serve_forever()
+AdapterServer(("127.0.0.1", args.port), partial(RangeHandler, directory=args.directory)).serve_forever()

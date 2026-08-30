@@ -1,4 +1,5 @@
 enable_lora = true
+router = "None"
 max_loras = 1
 max_cpu_loras = 2
 max_lora_rank = 128

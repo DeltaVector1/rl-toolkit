@@ -54,6 +54,8 @@ from prime_rl.utils.logger import get_logger
 # boundary cancels the remainder. This is deliberately shorter than the
 # measured long-generation tail; the boundary still has a hard upper bound.
 POLICY_GROUP_DRAIN_GRACE_S = 60
+TRANSIENT_RETRY_WINDOW_S = 180
+TRANSIENT_RETRIES_PER_ROLLOUT = 3
 
 
 class DispatcherMode(Enum):
@@ -173,6 +175,7 @@ class RolloutDispatcher:
         self.fresh_train_rollout_budget = self.max_inflight
         self.metrics = DispatcherMetrics()
         self.unhealthy_clients: dict[tuple[str, str | None], float] = {}
+        self.transient_retries: dict[uuid.UUID, tuple[float, int]] = {}
 
         # Orchestrator-owned permission. When clear, ``fill_inflight`` returns
         # without scheduling new groups. The dispatcher itself doesn't know
@@ -352,6 +355,7 @@ class RolloutDispatcher:
         discarded_episodes = 0
         for old_gid in old_group_ids:
             group = self.groups.pop(old_gid, None)
+            self.transient_retries.pop(old_gid, None)
             if group is None:
                 continue
             discarded_episodes += group.emitted
@@ -704,27 +708,35 @@ class RolloutDispatcher:
                 or transient_user_simulator_failure
             )
         ):
-            identity = client_identity(meta.client_config)
-            if not transient_user_simulator_failure:
-                # Policy transport failures are endpoint-local. Unpin and cool
-                # that endpoint before retrying. The user simulator is shared;
-                # moving the policy request cannot repair it, so retain the
-                # pinned client and retry only the missing group member.
-                self.unhealthy_clients[identity] = monotonic() + 60
-                group.pinned_client = None
-            group.rollouts_to_schedule += 1
-            if group.kind == "eval":
-                self.switch_mode(DispatcherMode.PREFER_EVAL, reason="an eval rollout is being retried")
-            detail = "; ".join(
-                f"{error.type}: {error.message}" for error in rollouts[0].errors[-2:]
-            )
+            started, retries = self.transient_retries.get(meta.group_id, (monotonic(), 0))
+            retry_limit = group.target_rollouts * TRANSIENT_RETRIES_PER_ROLLOUT
+            if monotonic() - started < TRANSIENT_RETRY_WINDOW_S and retries < retry_limit:
+                self.transient_retries[meta.group_id] = (started, retries + 1)
+                identity = client_identity(meta.client_config)
+                if not transient_user_simulator_failure:
+                    # Policy transport failures are endpoint-local. Unpin and cool
+                    # that endpoint before retrying. The user simulator is shared;
+                    # moving the policy request cannot repair it, so retain the
+                    # pinned client and retry only the missing group member.
+                    self.unhealthy_clients[identity] = monotonic() + 60
+                    group.pinned_client = None
+                group.rollouts_to_schedule += 1
+                if group.kind == "eval":
+                    self.switch_mode(DispatcherMode.PREFER_EVAL, reason="an eval rollout is being retried")
+                detail = "; ".join(
+                    f"{error.type}: {error.message}" for error in rollouts[0].errors[-2:]
+                )
+                get_logger().warning(
+                    f"Retrying transient rollout failure in group {meta.group_id} "
+                    f"({meta.env_name})"
+                    f"{' away from ' + identity[0] if not transient_user_simulator_failure else ''}: "
+                    f"{detail}"
+                )
+                return
+            self.transient_retries[meta.group_id] = (started, retry_limit)
             get_logger().warning(
-                f"Retrying transient rollout failure in group {meta.group_id} "
-                f"({meta.env_name})"
-                f"{' away from ' + identity[0] if not transient_user_simulator_failure else ''}: "
-                f"{detail}"
+                f"Transient retry limit reached in group {meta.group_id} ({meta.env_name})"
             )
-            return
 
         for r in rollouts:
             # A wall-clock harness timeout is a terminal rollout result. Do not
@@ -764,6 +776,11 @@ class RolloutDispatcher:
         if error is None or error.type not in ("ProviderError", "HarnessError"):
             return False
         message = error.message.lower()
+        failed_policy_call = any(
+            getattr(call, "model", None) == self.policy.model_name
+            and getattr(call, "error", None) is not None
+            for call in getattr(rollout, "calls", [])
+        )
         # A restarted vLLM process is healthy before it has the live LoRA.
         # Requests then fail with a policy-model 404. Do not emit those as
         # completed rollouts: unpin the endpoint and keep the GRPO group open
@@ -776,8 +793,11 @@ class RolloutDispatcher:
             return True
         # vLLM Router returns this 503 when every worker is unhealthy or
         # circuit-open. Keep the group open while workers recover.
-        if error.type == "ProviderError" and (
-            "no available workers" in message or "no_available_workers" in message
+        if (
+            error.type == "ProviderError"
+            and "503" in message
+            and ("no available workers" in message or "no_available_workers" in message)
+            and failed_policy_call
         ):
             return True
         # vLLM can occasionally produce a NaN in response metadata while the
@@ -802,11 +822,7 @@ class RolloutDispatcher:
             # turns as HarnessError. It is still a policy-client failure and
             # must be retried away from the client pinned to this GRPO group.
             return True
-        return any(
-            getattr(call, "model", None) == self.policy.model_name
-            and getattr(call, "error", None) is not None
-            for call in getattr(rollout, "calls", [])
-        )
+        return failed_policy_call
 
     @staticmethod
     def _is_transient_user_simulator_failure(rollout: Rollout) -> bool:
@@ -832,6 +848,7 @@ class RolloutDispatcher:
             group.emitted += 1
             if group.emitted >= group.target_rollouts:
                 self.groups.pop(meta.group_id, None)
+                self.transient_retries.pop(meta.group_id, None)
 
         for rollout in rollouts:
             rollout.kind = meta.kind
@@ -852,6 +869,7 @@ class RolloutDispatcher:
         (both in-flight and not-yet-scheduled). Returns the count for
         off-policy metrics."""
         group = self.groups.pop(group_id, None)
+        self.transient_retries.pop(group_id, None)
         task_idx = group.task_idx if group is not None else -1
 
         # Sync claim phase: pop matching tasks from ``self.inflight`` and
@@ -941,6 +959,7 @@ class RolloutDispatcher:
         tasks = list(self.inflight.keys())
         self.inflight.clear()
         self.groups.clear()
+        self.transient_retries.clear()
         if tasks:
             await safe_cancel_all(tasks)
 
@@ -962,6 +981,7 @@ class RolloutDispatcher:
             train_group_ids.add(meta.group_id)
         for gid in train_group_ids:
             self.groups.pop(gid, None)
+            self.transient_retries.pop(gid, None)
         if train_tasks:
             await safe_cancel_all(train_tasks)
         return cancelled
