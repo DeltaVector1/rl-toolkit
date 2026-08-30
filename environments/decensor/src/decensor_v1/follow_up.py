@@ -45,7 +45,6 @@ refusal_follow_up_strategies = (
     "add_constraint",
     "change_tone",
     "change_conditions",
-    "request_method",
     "reject_objection",
 )
 
