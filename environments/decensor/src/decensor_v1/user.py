@@ -224,29 +224,30 @@ class DecensorUser(vf.User[DecensorUserConfig, DecensorState]):
                                 retry_instruction
                             )
                         try:
-                            completion = await asyncio.wait_for(
-                                client.chat.completions.create(
-                                    model=self.config.model,
-                                    messages=[
-                                        {
-                                            "role": "system",
-                                            "content": follow_up_generation_instructions,
-                                        },
-                                        {
-                                            "role": "user",
-                                            "content": json.dumps(
-                                                request_data,
-                                                ensure_ascii=False,
-                                            ),
-                                        },
-                                    ],
-                                    temperature=self.config.temperature,
-                                    max_tokens=self.config.max_tokens,
-                                    seed=generation_seed,
-                                    extra_body=extra_body,
-                                ),
-                                timeout=180.0,
-                            )
+                            async with judge_request_slot(self.config):
+                                completion = await asyncio.wait_for(
+                                    client.chat.completions.create(
+                                        model=self.config.model,
+                                        messages=[
+                                            {
+                                                "role": "system",
+                                                "content": follow_up_generation_instructions,
+                                            },
+                                            {
+                                                "role": "user",
+                                                "content": json.dumps(
+                                                    request_data,
+                                                    ensure_ascii=False,
+                                                ),
+                                            },
+                                        ],
+                                        temperature=self.config.temperature,
+                                        max_tokens=self.config.max_tokens,
+                                        seed=generation_seed,
+                                        extra_body=extra_body,
+                                    ),
+                                    timeout=180.0,
+                                )
                             raw_text = str(
                                 completion.choices[0].message.content or ""
                             )

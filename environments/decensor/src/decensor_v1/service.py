@@ -14,6 +14,8 @@ from decensor_v1.scoring import EvaluationResult
 
 
 _judge_slot_directory = Path(tempfile.gettempdir()) / f"decensor-v1-judge-{os.getuid()}"
+_judge_capacity_file = "capacity"
+_judge_capacity_lock_file = "capacity.lock"
 
 
 def _judge_capacity(config: Any | None) -> int:
@@ -36,7 +38,32 @@ def _try_acquire_slot(path: Path) -> int | None:
     return descriptor
 
 
+def _ensure_judge_capacity(capacity: int) -> None:
+    _judge_slot_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock_path = _judge_slot_directory / _judge_capacity_lock_file
+    capacity_path = _judge_slot_directory / _judge_capacity_file
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        configured = capacity_path.read_text().strip() if capacity_path.exists() else ""
+        if configured:
+            try:
+                configured_capacity = int(configured)
+            except ValueError as error:
+                raise RuntimeError("judge request capacity metadata is invalid") from error
+            if configured_capacity != capacity:
+                raise RuntimeError(
+                    "judge request capacity differs from the shared worker capacity"
+                )
+        else:
+            capacity_path.write_text(f"{capacity}\n")
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
 async def _acquire_judge_slot(capacity: int) -> int:
+    _ensure_judge_capacity(capacity)
     paths = [
         _judge_slot_directory / f"slot-{slot}.lock"
         for slot in range(capacity)
