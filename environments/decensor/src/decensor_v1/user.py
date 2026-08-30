@@ -130,7 +130,7 @@ class DecensorUserConfig(UserConfig):
     min_p: float = 0.0
     max_tokens: int = 256
     seed: int = 0
-    max_concurrent_requests: int = Field(default=8, ge=1)
+    max_concurrent_requests: int = Field(default=32, ge=1)
 
 
 class DecensorUser(vf.User[DecensorUserConfig, DecensorState]):

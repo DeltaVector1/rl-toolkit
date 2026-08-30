@@ -222,15 +222,19 @@ class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
         review_names = [
             f"turn_{source.turns[0].turn}_review" for source in review_sources
         ]
-        review_outcomes = await asyncio.gather(
-            *(
-                request_judge_score(
+        per_rollout_review_limit = asyncio.Semaphore(2)
+
+        async def review_one(name: str, source: Any):
+            async with per_rollout_review_limit:
+                return await request_judge_score(
                     name,
-                    lambda source=source: run_agentic_review(
-                        task_config.judge, source
-                    ),
+                    lambda: run_agentic_review(task_config.judge, source),
                     judge_config=task_config.judge,
                 )
+
+        review_outcomes = await asyncio.gather(
+            *(
+                review_one(name, source)
                 for name, source in zip(review_names, review_sources, strict=True)
             )
         )

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import fcntl
 import os
+import platform
 import tempfile
 import time
 from collections.abc import Awaitable, Callable
@@ -13,7 +14,17 @@ from typing import Any
 from decensor_v1.scoring import EvaluationResult
 
 
-_judge_slot_directory = Path(tempfile.gettempdir()) / f"decensor-v1-judge-{os.getuid()}"
+try:
+    _judge_scope = f"pidns-{os.stat('/proc/self/ns/pid').st_ino}"
+except OSError:
+    _judge_scope = os.environ.get("HOSTNAME") or platform.node() or "default"
+_judge_scope = "".join(
+    character if character.isalnum() or character in "-_." else "_"
+    for character in _judge_scope
+)
+_judge_slot_directory = (
+    Path(tempfile.gettempdir()) / f"decensor-v1-judge-{os.getuid()}-{_judge_scope}"
+)
 _judge_capacity_file = "capacity"
 _judge_capacity_lock_file = "capacity.lock"
 
