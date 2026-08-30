@@ -61,7 +61,9 @@ def _ensure_judge_capacity(capacity: int) -> None:
             try:
                 configured_capacity = int(configured)
             except ValueError as error:
-                raise RuntimeError("judge request capacity metadata is invalid") from error
+                raise RuntimeError(
+                    "judge request capacity metadata is invalid"
+                ) from error
             if configured_capacity != capacity:
                 raise RuntimeError(
                     "judge request capacity differs from the shared worker capacity"
@@ -75,10 +77,7 @@ def _ensure_judge_capacity(capacity: int) -> None:
 
 async def _acquire_judge_slot(capacity: int) -> int:
     _ensure_judge_capacity(capacity)
-    paths = [
-        _judge_slot_directory / f"slot-{slot}.lock"
-        for slot in range(capacity)
-    ]
+    paths = [_judge_slot_directory / f"slot-{slot}.lock" for slot in range(capacity)]
     while True:
         for path in paths:
             descriptor = _try_acquire_slot(path)
@@ -103,6 +102,89 @@ async def judge_request_slot(config: Any | None):
         _release_judge_slot(descriptor)
 
 
+def judge_failure_summary(name: str, outcome: EvaluationResult) -> dict[str, Any]:
+    summaries: list[dict[str, Any]] = []
+    attempts = outcome.details.get("attempts", [])
+    if not isinstance(attempts, list):
+        attempts = []
+    for record in attempts:
+        if not isinstance(record, dict):
+            continue
+        status = record.get("status")
+        if not isinstance(status, str):
+            status = "unknown"
+        failure_types: list[str] = []
+        if status == "request_failed":
+            error_type = record.get("error_type")
+            if isinstance(error_type, str) and error_type:
+                failure_types.append(error_type)
+        elif status == "invalid_judge_response":
+            events = record.get("events", [])
+            if isinstance(events, list):
+                for event in events:
+                    if not isinstance(event, dict):
+                        continue
+                    if event.get("status") != "invalid_judge_response":
+                        continue
+                    error_type = event.get("error_type")
+                    if (
+                        isinstance(error_type, str)
+                        and error_type
+                        and error_type not in failure_types
+                    ):
+                        failure_types.append(error_type)
+        elif status == "total_timeout":
+            failure_types.append("TimeoutError")
+        if not failure_types:
+            failure_types.append(status)
+        elapsed_seconds = record.get("elapsed_seconds")
+        if isinstance(elapsed_seconds, (int, float)) and not isinstance(
+            elapsed_seconds, bool
+        ):
+            elapsed_seconds = round(float(elapsed_seconds), 3)
+        else:
+            elapsed_seconds = None
+        attempt = record.get("attempt")
+        if isinstance(attempt, bool) or not isinstance(attempt, int):
+            attempt = None
+        summaries.append(
+            {
+                "attempt": attempt,
+                "status": status,
+                "failure_types": failure_types,
+                "elapsed_seconds": elapsed_seconds,
+            }
+        )
+    return {"name": name, "attempts": summaries}
+
+
+def format_judge_failure_summary(summaries: list[dict[str, Any]]) -> str:
+    review_messages: list[str] = []
+    for summary in summaries:
+        name = summary.get("name", "unknown_review")
+        attempt_messages: list[str] = []
+        for attempt in summary.get("attempts", []):
+            attempt_number = attempt.get("attempt")
+            attempt_label = (
+                str(attempt_number) if attempt_number is not None else "unknown"
+            )
+            failure_types = ",".join(attempt.get("failure_types", ["unknown"]))
+            elapsed_seconds = attempt.get("elapsed_seconds")
+            elapsed_label = (
+                f"{float(elapsed_seconds):.1f}s"
+                if isinstance(elapsed_seconds, (int, float))
+                and not isinstance(elapsed_seconds, bool)
+                else "unknown duration"
+            )
+            attempt_messages.append(
+                f"attempt {attempt_label}: {failure_types} ({elapsed_label})"
+            )
+        review_messages.append(
+            f"{name}: " + ("; ".join(attempt_messages) or "no attempt record")
+        )
+    return "; ".join(review_messages) or "no failure details"
+
+
 async def request_judge_score(
     name: str,
     request: Callable[[], Awaitable[Any]],
@@ -111,10 +193,11 @@ async def request_judge_score(
     total_timeout_seconds: float = 550.0,
 ) -> EvaluationResult:
     attempts: list[dict[str, Any]] = []
+    request_started_at = time.monotonic()
     try:
         async with asyncio.timeout(total_timeout_seconds):
             for attempt_number in range(1, attempt_count + 1):
-                started_at = time.monotonic()
+                attempt_started_at = time.monotonic()
                 try:
                     response = await request()
                 except Exception as error:
@@ -125,7 +208,7 @@ async def request_judge_score(
                             "status": "request_failed",
                             "error_type": type(error).__name__,
                             "error": str(error),
-                            "elapsed_seconds": time.monotonic() - started_at,
+                            "elapsed_seconds": time.monotonic() - attempt_started_at,
                         }
                     )
                 else:
@@ -139,7 +222,7 @@ async def request_judge_score(
                         ),
                         "text": response.text or "",
                         "parsed": response.parsed,
-                        "elapsed_seconds": time.monotonic() - started_at,
+                        "elapsed_seconds": time.monotonic() - attempt_started_at,
                     }
                     events = getattr(response, "events", None)
                     if events is not None:
@@ -159,6 +242,8 @@ async def request_judge_score(
                 "name": name,
                 "attempt": None,
                 "status": "total_timeout",
+                "error_type": "TimeoutError",
+                "elapsed_seconds": time.monotonic() - request_started_at,
             }
         )
     return EvaluationResult(

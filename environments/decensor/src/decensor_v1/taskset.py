@@ -20,7 +20,11 @@ from decensor_v1.scoring import (
     find_model_response_failure,
     score_decensor,
 )
-from decensor_v1.service import request_judge_score
+from decensor_v1.service import (
+    format_judge_failure_summary,
+    judge_failure_summary,
+    request_judge_score,
+)
 from decensor_v1.state import DecensorState
 from decensor_v1.text import (
     completion_contains_markdown,
@@ -257,13 +261,20 @@ class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
             if outcome.status != "scored" or outcome.score is None
         ]
         if failed_reviews:
+            failed_judge_details = [
+                judge_failure_summary(name, outcome)
+                for name, outcome in zip(review_names, review_outcomes, strict=True)
+                if outcome.status != "scored" or outcome.score is None
+            ]
             trace.info["decensor"] = {
                 "evaluation_status": "unscored_service_failure",
                 "failed_judges": failed_reviews,
+                "failed_judge_attempts": failed_judge_details,
             }
             trace.record_metric("decensor_judge_service_failure", 1.0)
             raise RuntimeError(
-                "one or more per-turn reviews failed after three attempts; "
+                "one or more per-turn reviews failed after three attempts: "
+                f"{format_judge_failure_summary(failed_judge_details)}; "
                 "rollout is unscored"
             )
         turn_reviews = [
