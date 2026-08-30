@@ -17,4 +17,4 @@ class DecensorJudgeConfig(JudgeConfig):
     sampling: DecensorJudgeSampling = DecensorJudgeSampling()
     min_p: float = 0.05
     disable_thinking: bool = True
-    max_concurrent_requests: int = Field(default=8, ge=1)
+    max_concurrent_requests: int = Field(default=16, ge=1)
