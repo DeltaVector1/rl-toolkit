@@ -28,6 +28,7 @@ from decensor_v1.follow_up import (
     follow_up_instructions_by_strategy,
     follow_up_review_instructions,
     follow_up_review_tool,
+    direct_request_strategies,
     follow_up_strategy_options,
     review_result_name,
     user_turn_seed,
@@ -311,13 +312,20 @@ class DecensorUser(vf.User[DecensorUserConfig, DecensorState]):
                                     )
                                 tried_strategies.add(strategy_name)
                                 if attempt < 2:
-                                    available_strategies = tuple(
-                                        candidate
-                                        for candidate in follow_up_strategy_options(
-                                            last_asst
+                                    if review.switches_to_assistant_alternative:
+                                        available_strategies = tuple(
+                                            candidate
+                                            for candidate in direct_request_strategies
+                                            if candidate not in tried_strategies
                                         )
-                                        if candidate not in tried_strategies
-                                    )
+                                    else:
+                                        available_strategies = tuple(
+                                            candidate
+                                            for candidate in follow_up_strategy_options(
+                                                last_asst
+                                            )
+                                            if candidate not in tried_strategies
+                                        )
                                     if not available_strategies:
                                         final_error = "no_unused_follow_up_strategy"
                                         attempt_record["status"] = (
@@ -340,9 +348,12 @@ class DecensorUser(vf.User[DecensorUserConfig, DecensorState]):
                                         last_asst,
                                         attempt + 1001,
                                     )
-                                    strategy_name = random.Random(
-                                        next_strategy_seed
-                                    ).choice(available_strategies)
+                                    if review.switches_to_assistant_alternative:
+                                        strategy_name = available_strategies[0]
+                                    else:
+                                        strategy_name = random.Random(
+                                            next_strategy_seed
+                                        ).choice(available_strategies)
                                     tried_strategies.add(strategy_name)
                                     strategy_selection_seed = next_strategy_seed
                                     attempt_record["next_strategy"] = strategy_name
