@@ -1277,6 +1277,10 @@ def stage_lora_adapter_files(source_url: str, require_delta: bool = False) -> Pa
                     if (temporary / name).is_file() and (temporary / name).stat().st_size == int(files[name]["size"])
                 )
             _write_json(temporary / "manifest.json", manifest)
+            model_digest = files[_ADAPTER_FILES[1]].get("sha256")
+            if not isinstance(model_digest, str):
+                raise OSError("adapter source manifest has no model checksum")
+            (temporary / _ADAPTER_DIGEST).write_text(f"{model_digest}\n", encoding="ascii")
             ready = temporary / "READY"
             ready.write_text("ready\n", encoding="utf-8")
             with ready.open("rb") as stream:

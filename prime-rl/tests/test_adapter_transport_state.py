@@ -1,9 +1,16 @@
 import ast
+import functools
 import hashlib
+import http.server
 import importlib.util
 import io
 import json
+import os
+import socketserver
+import sys
 import tempfile
+import threading
+import types
 import tomllib
 import unittest
 from pathlib import Path
@@ -48,6 +55,47 @@ def load_watcher_delta_method(urlopen):
     }
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
     return namespace["_adapter_delta_base"]
+
+
+def load_filesystem_module():
+    path = ROOT / "src/prime_rl/inference/vllm/worker/filesystem.py"
+    module_name = "filesystem_sidecar_test"
+    modules = {
+        "torch": types.ModuleType("torch"),
+        "torch.nn": types.ModuleType("torch.nn"),
+        "vllm": types.ModuleType("vllm"),
+        "vllm.model_executor": types.ModuleType("vllm.model_executor"),
+        "vllm.model_executor.model_loader": types.ModuleType("vllm.model_executor.model_loader"),
+        "prime_rl": types.ModuleType("prime_rl"),
+        "prime_rl.utils": types.ModuleType("prime_rl.utils"),
+        "prime_rl.utils.checkpoint_delta": types.ModuleType("prime_rl.utils.checkpoint_delta"),
+    }
+    modules["torch.nn"].Module = object
+    modules["vllm.model_executor.model_loader"].DefaultModelLoader = object
+    modules["vllm.model_executor.model_loader"].get_model_loader = lambda _config: None
+    checkpoint_delta = modules["prime_rl.utils.checkpoint_delta"]
+    checkpoint_delta.DELTA_MANIFEST = "checkpoint_manifest.json"
+    checkpoint_delta.apply_xor_delta_file = lambda *args, **kwargs: None
+    checkpoint_delta.sha256_file = hashlib.sha256
+    saved = {name: sys.modules.get(name) for name in modules}
+    sys.modules.update(modules)
+    try:
+        spec = importlib.util.spec_from_file_location(module_name, path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        for name, previous in saved.items():
+            if previous is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
+
+
+class QuietDirectoryHandler(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, *_args):
+        return
 
 
 class AdapterTransportStateTest(unittest.TestCase):
@@ -149,6 +197,47 @@ class AdapterTransportStateTest(unittest.TestCase):
             self.assertEqual(manifest["mode"], "full")
             self.assertEqual(manifest["chunk_count"], 0)
             self.assertEqual(list(target.glob("*.transport-*")), [])
+
+    def test_full_stage_publishes_model_checksum_sidecar(self):
+        filesystem = load_filesystem_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "step_0"
+            source.mkdir()
+            config = b"{}\n"
+            model = bytes(range(251)) * 33
+            (source / "adapter_config.json").write_bytes(config)
+            (source / "adapter_model.safetensors").write_bytes(model)
+            manifest = {
+                "version": 1,
+                "kind": "lora-adapter",
+                "mode": "full",
+                "target_step": 0,
+                "base_step": None,
+                "files": [
+                    {"name": "adapter_config.json", "size": len(config), "sha256": hashlib.sha256(config).hexdigest()},
+                    {"name": "adapter_model.safetensors", "size": len(model), "sha256": hashlib.sha256(model).hexdigest()},
+                ],
+            }
+            (source / "adapter_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            handler = functools.partial(QuietDirectoryHandler, directory=str(root))
+            with socketserver.ThreadingTCPServer(("127.0.0.1", 0), handler) as server:
+                server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+                server_thread.start()
+                source_url = f"http://127.0.0.1:{server.server_address[1]}/step_0"
+                old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
+                os.environ["PRIME_LORA_CACHE_DIR"] = str(root / "cache")
+                try:
+                    destination = filesystem.stage_lora_adapter_files(source_url)
+                finally:
+                    if old_cache is None:
+                        os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+                    else:
+                        os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+                    server.shutdown()
+                    server_thread.join()
+            sidecar = destination / "adapter_model.safetensors.sha256"
+            self.assertEqual(sidecar.read_text(encoding="ascii").strip(), hashlib.sha256(model).hexdigest())
 
     def test_protocol_has_one_strict_delta_flag(self):
         worker = ROOT / "src/prime_rl/inference/vllm/worker/filesystem.py"
