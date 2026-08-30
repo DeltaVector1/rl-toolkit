@@ -607,6 +607,26 @@ def _sha256(path: Path, deadline: float | None = None) -> str:
     return digest.hexdigest()
 
 
+def _sha256_region(path: Path, offset: int, size: int, deadline: float | None = None) -> str:
+    digest = hashlib.sha256()
+    file_descriptor = os.open(path, os.O_RDONLY)
+    try:
+        remaining = size
+        position = offset
+        while remaining:
+            _check_deadline(deadline)
+            chunk = os.pread(file_descriptor, min(16 * 1024 * 1024, remaining), position)
+            if not chunk:
+                raise OSError("adapter output ended before completed chunk")
+            digest.update(chunk)
+            position += len(chunk)
+            remaining -= len(chunk)
+    finally:
+        os.close(file_descriptor)
+    _check_deadline(deadline)
+    return digest.hexdigest()
+
+
 def _decode_transport_chunk(payload: bytes, *, codec: str, raw_size: int) -> bytes:
     """Use the shared bounded decoder for one transport chunk."""
     try:
@@ -708,9 +728,12 @@ def _transport_raw_sha256(delta: bytes) -> str:
     return hashlib.sha256(shuffle_bf16_bytes(delta)).hexdigest()
 
 
-def _cleanup_delta_stage_artifacts(destination: Path) -> None:
+def _cleanup_delta_stage_artifacts(destination: Path, *, preserve_partial: bool = False) -> None:
     """Remove private delta staging paths after all transfer workers stop."""
-    for suffix in (".partial", ".parts", ".assembling"):
+    suffixes = (".parts", ".assembling")
+    if not preserve_partial:
+        suffixes = (".partial", *suffixes)
+    for suffix in suffixes:
         candidate = destination.with_name(f"{destination.name}{suffix}")
         try:
             if candidate.is_dir() and not candidate.is_symlink():
@@ -756,11 +779,14 @@ def _stage_chunked_xor_adapter(
     temporary = destination.with_name(f"{destination.name}.partial")
     transport_identity = json.dumps(transport, sort_keys=True, separators=(",", ":"))
     identity_path = temporary / "transport-manifest.json"
-    if identity_path.is_file():
+    if temporary.exists() and not temporary.is_dir():
+        temporary.unlink()
+    if temporary.is_dir():
         try:
-            if identity_path.read_text(encoding="utf-8") != transport_identity:
-                shutil.rmtree(temporary)
-        except OSError:
+            identity_matches = identity_path.read_text(encoding="utf-8") == transport_identity
+        except (FileNotFoundError, OSError):
+            identity_matches = False
+        if not identity_matches:
             shutil.rmtree(temporary)
     temporary.mkdir(exist_ok=True)
     identity_path.write_text(transport_identity, encoding="utf-8")
@@ -838,6 +864,44 @@ def _stage_chunked_xor_adapter(
         relative = Path(name)
         chunk_path = chunk_root / relative
         chunk_path.parent.mkdir(parents=True, exist_ok=True)
+        offset = int(item["offset"])
+        raw_size = int(item["raw_size"])
+        wire_size = int(item["wire_size"])
+        wire_sha256 = str(item["wire_sha256"])
+        raw_sha256 = str(item["raw_sha256"])
+        completed_path = chunk_path.with_name(f"{chunk_path.name}.done")
+
+        if completed_path.is_file():
+            try:
+                proof = json.loads(completed_path.read_text(encoding="utf-8"))
+                proof_matches = (
+                    isinstance(proof, dict)
+                    and proof.get("file") == name
+                    and proof.get("offset") == offset
+                    and proof.get("raw_size") == raw_size
+                    and proof.get("wire_size") == wire_size
+                    and proof.get("wire_sha256") == wire_sha256
+                    and proof.get("raw_sha256") == raw_sha256
+                    and isinstance(proof.get("output_sha256"), str)
+                    and re.fullmatch(r"[0-9a-f]{64}", proof["output_sha256"]) is not None
+                )
+            except (OSError, ValueError):
+                proof_matches = False
+            if proof_matches:
+                _check_deadline(deadline)
+                try:
+                    output_matches = (
+                        output_path.stat().st_size == target_size
+                        and _sha256_region(output_path, offset, raw_size, deadline)
+                        == proof["output_sha256"]
+                    )
+                except TimeoutError:
+                    raise
+                except (FileNotFoundError, OSError):
+                    output_matches = False
+                if output_matches:
+                    return
+            completed_path.unlink(missing_ok=True)
 
         chunk_lane = index % len(lane_urls)
 
@@ -850,7 +914,7 @@ def _stage_chunked_xor_adapter(
             chunk_urls[0],
             chunk_path,
             expected_size=int(item["wire_size"]),
-            expected_sha256=str(item["wire_sha256"]),
+            expected_sha256=wire_sha256,
             progress=lane_report,
             source_urls=chunk_urls,
             parallel_ranges=False,
@@ -862,35 +926,48 @@ def _stage_chunked_xor_adapter(
             return
         _check_deadline(deadline)
         encoded = chunk_path.read_bytes()
-        if len(encoded) != int(item["wire_size"]):
+        if len(encoded) != wire_size:
             raise OSError("adapter transport chunk size changed")
-        if _sha256(chunk_path, deadline) != item["wire_sha256"]:
+        if _sha256(chunk_path, deadline) != wire_sha256:
             raise OSError("adapter transport chunk checksum mismatch")
         _check_deadline(deadline)
         raw = _decode_transport_chunk(
             encoded,
             codec=str(transport["transport"]),
-            raw_size=int(item["raw_size"]),
+            raw_size=raw_size,
         )
         _check_deadline(deadline)
-        raw_sha256 = item.get("raw_sha256")
         if _transport_raw_sha256(raw) != raw_sha256:
             raise OSError("adapter transport decoded chunk checksum mismatch")
-        offset = int(item["offset"])
         if cancel_event.is_set():
             return
         base_fd = os.open(base_model, os.O_RDONLY)
         output_fd = os.open(output_path, os.O_RDWR)
         try:
-            base_chunk = os.pread(base_fd, len(raw), offset)
+            base_chunk = os.pread(base_fd, raw_size, offset)
             if len(base_chunk) != len(raw):
                 raise OSError("cached base adapter ended before transport chunk")
-            _pwrite_all(output_fd, _xor_bytes(base_chunk, raw), offset)
+            reconstructed = _xor_bytes(base_chunk, raw)
+            if len(reconstructed) != raw_size:
+                raise OSError("adapter transport reconstructed chunk has the wrong size")
+            _pwrite_all(output_fd, reconstructed, offset)
+            os.fsync(output_fd)
         finally:
             os.close(output_fd)
             os.close(base_fd)
         _check_deadline(deadline)
-        chunk_path.unlink()
+        _write_json(
+            completed_path,
+            {
+                "file": name,
+                "offset": offset,
+                "raw_size": raw_size,
+                "wire_size": wire_size,
+                "wire_sha256": wire_sha256,
+                "raw_sha256": raw_sha256,
+                "output_sha256": hashlib.sha256(reconstructed).hexdigest(),
+            },
+        )
 
     download_streams = _configured_download_streams()
     executor = ThreadPoolExecutor(max_workers=min(len(chunks), download_streams))
@@ -1336,7 +1413,10 @@ def stage_lora_adapter_files(source_url: str, require_delta: bool = False) -> Pa
             return destination
         except BaseException as exc:
             if require_delta or (isinstance(transport, dict) and transport.get("mode") == "delta"):
-                _cleanup_delta_stage_artifacts(destination)
+                _cleanup_delta_stage_artifacts(
+                    destination,
+                    preserve_partial=isinstance(exc, TimeoutError),
+                )
             _write_stage_status(
                 destination.parent,
                 {

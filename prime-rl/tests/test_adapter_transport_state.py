@@ -267,7 +267,8 @@ class AdapterTransportStateTest(unittest.TestCase):
         self.assertIn("source_urls=chunk_urls", worker_source)
         self.assertIn("parallel_ranges=False", worker_source)
         self.assertIn("executor.shutdown(wait=True, cancel_futures=True)", worker_source)
-        self.assertIn("_cleanup_delta_stage_artifacts(destination)", worker_source)
+        self.assertIn("_cleanup_delta_stage_artifacts(", worker_source)
+        self.assertIn("preserve_partial=isinstance(exc, TimeoutError)", worker_source)
         self.assertIn("deadline=delta_deadline", worker_source)
         self.assertIn("asyncio.wait_for(", server.read_text(encoding="utf-8"))
         watcher_source = watcher.read_text(encoding="utf-8")
@@ -358,6 +359,134 @@ class AdapterTransportStateTest(unittest.TestCase):
 
         self.assertEqual([call[0] for call in calls], ["http://lane-1/chunk", "http://lane-2/chunk"])
         self.assertEqual([call[1] for call in calls], [None, None])
+
+    def test_delta_timeout_keeps_only_matching_partial_progress(self):
+        filesystem = load_filesystem_module()
+        first_payload = b"first"
+        second_payload = b"second"
+        config = b"{}\n"
+        source_url = "http://source/step_2"
+        target = first_payload + second_payload
+        target_sha256 = hashlib.sha256(target).hexdigest()
+        manifest = {
+            "version": 1,
+            "kind": "lora-adapter",
+            "mode": "delta",
+            "transport": "chunked-shuffled-xor-zstd",
+            "target_step": 2,
+            "base_step": 1,
+            "files": {
+                "adapter_config.json": {
+                    "size": len(config),
+                    "sha256": hashlib.sha256(config).hexdigest(),
+                },
+                "adapter_model.safetensors": {
+                    "size": len(target),
+                    "sha256": target_sha256,
+                },
+            },
+        }
+        transport = {
+            "version": 1,
+            "mode": "delta",
+            "transport": "chunked-shuffled-xor-zstd",
+            "base_url": "http://source/step_1",
+            "base_sha256": "a" * 64,
+            "base_config_sha256": "b" * 64,
+            "target_sha256": target_sha256,
+            "target_size": len(target),
+            "config_sha256": hashlib.sha256(config).hexdigest(),
+            "config_size": len(config),
+            "chunks": [
+                {
+                    "file": "chunk-0",
+                    "offset": 0,
+                    "raw_size": len(first_payload),
+                    "wire_size": len(first_payload),
+                    "wire_sha256": hashlib.sha256(first_payload).hexdigest(),
+                    "raw_sha256": hashlib.sha256(first_payload).hexdigest(),
+                },
+                {
+                    "file": "chunk-1",
+                    "offset": len(first_payload),
+                    "raw_size": len(second_payload),
+                    "wire_size": len(second_payload),
+                    "wire_sha256": hashlib.sha256(second_payload).hexdigest(),
+                    "raw_sha256": hashlib.sha256(second_payload).hexdigest(),
+                },
+            ],
+        }
+        base_directory = tempfile.TemporaryDirectory()
+        base_model = Path(base_directory.name) / "base"
+        base_model.write_bytes(b"\0" * len(target))
+        old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
+        old_timeout = filesystem._delta_stage_timeout_s
+        old_manifest = filesystem._read_chunked_xor_manifest
+        old_source_manifest = filesystem._source_manifest
+        old_base = filesystem._verified_adapter_base
+        old_lanes = filesystem._adapter_source_urls
+        old_streams = filesystem._configured_download_streams
+        old_decode = filesystem._decode_transport_chunk
+        old_raw_digest = filesystem._transport_raw_sha256
+        old_xor = filesystem._xor_bytes
+        old_download = filesystem.download
+        downloaded = []
+        fail_second_chunk = True
+
+        def fake_download(_source, destination, **kwargs):
+            nonlocal fail_second_chunk
+            if destination.name.startswith("chunk-"):
+                self.assertFalse(kwargs.get("parallel_ranges", True))
+            downloaded.append(destination.name)
+            payload = {"chunk-0": first_payload, "chunk-1": second_payload}.get(destination.name, config)
+            destination.write_bytes(payload)
+            if destination.name == "chunk-1" and fail_second_chunk:
+                fail_second_chunk = False
+                raise TimeoutError("test deadline")
+
+        filesystem._delta_stage_timeout_s = lambda: 30.0
+        filesystem._read_chunked_xor_manifest = lambda *_args, **_kwargs: transport
+        filesystem._source_manifest = lambda *_args, **_kwargs: manifest
+        filesystem._verified_adapter_base = lambda *_args, **_kwargs: (base_model, base_model)
+        filesystem._adapter_source_urls = lambda _source: ["http://lane-1", "http://lane-2"]
+        filesystem._configured_download_streams = lambda: 1
+        filesystem._decode_transport_chunk = lambda payload, **_kwargs: payload
+        filesystem._transport_raw_sha256 = lambda payload: hashlib.sha256(payload).hexdigest()
+        filesystem._xor_bytes = lambda _base, payload: payload
+        filesystem.download = fake_download
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                os.environ["PRIME_LORA_CACHE_DIR"] = temporary
+                with self.assertRaises(TimeoutError):
+                    filesystem.stage_lora_adapter_files(source_url, require_delta=True)
+
+                destination = filesystem.adapter_cache_path(source_url)
+                partial = destination.with_name(f"{destination.name}.partial")
+                completed = partial / "transport-chunks" / "chunk-0.done"
+                self.assertTrue(completed.is_file())
+                self.assertTrue((partial / "adapter_model.safetensors").is_file())
+                downloaded_after_failure = list(downloaded)
+
+                filesystem.stage_lora_adapter_files(source_url, require_delta=True)
+                self.assertTrue((destination / "READY").is_file())
+                self.assertNotIn("chunk-0", downloaded[len(downloaded_after_failure) :])
+                self.assertIn("chunk-1", downloaded[len(downloaded_after_failure) :])
+        finally:
+            if old_cache is None:
+                os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+            else:
+                os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+            filesystem._delta_stage_timeout_s = old_timeout
+            filesystem._read_chunked_xor_manifest = old_manifest
+            filesystem._source_manifest = old_source_manifest
+            filesystem._verified_adapter_base = old_base
+            filesystem._adapter_source_urls = old_lanes
+            filesystem._configured_download_streams = old_streams
+            filesystem._decode_transport_chunk = old_decode
+            filesystem._transport_raw_sha256 = old_raw_digest
+            filesystem._xor_bytes = old_xor
+            filesystem.download = old_download
+            base_directory.cleanup()
 
 
 if __name__ == "__main__":
