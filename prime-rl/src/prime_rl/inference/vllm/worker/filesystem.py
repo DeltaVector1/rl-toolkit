@@ -47,7 +47,8 @@ def adapter_cache_path(source_url: str) -> Path:
 
 
 _PARALLEL_DOWNLOAD_THRESHOLD = 16 * 1024 * 1024
-_PARALLEL_DOWNLOAD_STREAMS = 8
+_DOWNLOAD_STREAMS_ENV = "PRIME_LORA_DOWNLOAD_STREAMS"
+_MAX_DOWNLOAD_STREAMS = 64
 _ADAPTER_FILES = ("adapter_config.json", "adapter_model.safetensors")
 _ADAPTER_MANIFEST = "adapter_manifest.json"
 _ADAPTER_DIGEST = "adapter_model.safetensors.sha256"
@@ -58,6 +59,21 @@ _ADAPTER_LANE_TIMEOUT_S = float(os.environ.get("PRIME_LORA_LANE_TIMEOUT_S", "45"
 _ADAPTER_LANE_RETRIES = int(os.environ.get("PRIME_LORA_LANE_RETRIES", "6"))
 _ADAPTER_STATUS_INTERVAL_S = float(os.environ.get("PRIME_LORA_STATUS_INTERVAL_S", "1"))
 _JSON_LOCK = threading.Lock()
+
+
+def _configured_download_streams() -> int:
+    raw_value = os.environ.get(_DOWNLOAD_STREAMS_ENV)
+    if raw_value is None or not raw_value.strip():
+        raise OSError(f"{_DOWNLOAD_STREAMS_ENV} must be configured")
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise OSError(f"{_DOWNLOAD_STREAMS_ENV} must be an integer") from exc
+    if value < 1 or value > _MAX_DOWNLOAD_STREAMS:
+        raise OSError(
+            f"{_DOWNLOAD_STREAMS_ENV} must be between 1 and {_MAX_DOWNLOAD_STREAMS}"
+        )
+    return value
 
 
 def _delta_stage_timeout_s() -> float:
@@ -873,7 +889,8 @@ def _stage_chunked_xor_adapter(
         _check_deadline(deadline)
         chunk_path.unlink()
 
-    executor = ThreadPoolExecutor(max_workers=min(len(chunks), _PARALLEL_DOWNLOAD_STREAMS))
+    download_streams = _configured_download_streams()
+    executor = ThreadPoolExecutor(max_workers=min(len(chunks), download_streams))
     futures = [executor.submit(fetch, index, item) for index, item in enumerate(chunks)]
     _wait_for_futures(executor, futures, deadline, cancel_event)
 
@@ -972,9 +989,7 @@ def download(
     # link. Adapter fan-out is opt-in and has its own setting.
     adapter_ports = explicit_source_urls or len(source_urls) > 1 or source_urls[0] != source_url
 
-    streams = len(source_urls) if adapter_ports else max(
-        1, int(os.environ.get("PRIME_LORA_DOWNLOAD_STREAMS", _PARALLEL_DOWNLOAD_STREAMS))
-    )
+    streams = len(source_urls) if adapter_ports else _configured_download_streams()
     if total < _PARALLEL_DOWNLOAD_THRESHOLD or streams == 1:
         # Preserve the old single-file resume path for small metadata files and
         # for an explicitly disabled parallel transfer.

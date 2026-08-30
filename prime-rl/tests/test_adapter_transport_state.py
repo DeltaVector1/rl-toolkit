@@ -226,7 +226,9 @@ class AdapterTransportStateTest(unittest.TestCase):
                 server_thread.start()
                 source_url = f"http://127.0.0.1:{server.server_address[1]}/step_0"
                 old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
+                old_streams = os.environ.get("PRIME_LORA_DOWNLOAD_STREAMS")
                 os.environ["PRIME_LORA_CACHE_DIR"] = str(root / "cache")
+                os.environ["PRIME_LORA_DOWNLOAD_STREAMS"] = "24"
                 try:
                     destination = filesystem.stage_lora_adapter_files(source_url)
                 finally:
@@ -234,6 +236,10 @@ class AdapterTransportStateTest(unittest.TestCase):
                         os.environ.pop("PRIME_LORA_CACHE_DIR", None)
                     else:
                         os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+                    if old_streams is None:
+                        os.environ.pop("PRIME_LORA_DOWNLOAD_STREAMS", None)
+                    else:
+                        os.environ["PRIME_LORA_DOWNLOAD_STREAMS"] = old_streams
                     server.shutdown()
                     server_thread.join()
             sidecar = destination / "adapter_model.safetensors.sha256"
@@ -266,17 +272,40 @@ class AdapterTransportStateTest(unittest.TestCase):
         self.assertIn('manifest.get("version") != 1', watcher_source)
         self.assertIn("next_step > 0", watcher_source)
 
-    def test_inventory_defines_bounded_eight_lane_transfer(self):
+    def test_download_stream_count_is_required_and_bounded(self):
+        filesystem = load_filesystem_module()
+        old_value = os.environ.get("PRIME_LORA_DOWNLOAD_STREAMS")
+        try:
+            for value in (None, "", "0", "65", "not-an-integer"):
+                if value is None:
+                    os.environ.pop("PRIME_LORA_DOWNLOAD_STREAMS", None)
+                else:
+                    os.environ["PRIME_LORA_DOWNLOAD_STREAMS"] = value
+                with self.assertRaises(OSError):
+                    filesystem._configured_download_streams()
+            os.environ["PRIME_LORA_DOWNLOAD_STREAMS"] = "24"
+            self.assertEqual(filesystem._configured_download_streams(), 24)
+        finally:
+            if old_value is None:
+                os.environ.pop("PRIME_LORA_DOWNLOAD_STREAMS", None)
+            else:
+                os.environ["PRIME_LORA_DOWNLOAD_STREAMS"] = old_value
+
+    def test_inventory_defines_bounded_24_lane_transfer(self):
         operations = REPOSITORY / "configs/operations.toml"
         with operations.open("rb") as stream:
             config = tomllib.load(stream)
         ports = config["ports"]
-        self.assertEqual(ports["lora_source_last"] - ports["lora_source_first"] + 1, 8)
+        self.assertEqual(ports["lora_source_last"] - ports["lora_source_first"] + 1, 24)
         self.assertEqual(config["limits"]["adapter_delta_stage_timeout_seconds"], 300)
         runtime = REPOSITORY / ".agents/skills/training-ops/runtime/h200"
         for name in ("start_inference.sh", "start_muse_inference.sh"):
             source = (runtime / name).read_text(encoding="utf-8")
+            self.assertIn("PRIME_LORA_DOWNLOAD_STREAMS=24", source)
             self.assertIn('PRIME_LORA_SOURCE_PORTS="$lora_source_port_list"', source)
+        worker_source = (REPOSITORY / "prime-rl/src/prime_rl/inference/vllm/worker/filesystem.py").read_text(encoding="utf-8")
+        self.assertIn("download_streams = _configured_download_streams()", worker_source)
+        self.assertNotIn("_PARALLEL_DOWNLOAD_STREAMS", worker_source)
 
 
 if __name__ == "__main__":
