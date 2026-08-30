@@ -4170,6 +4170,8 @@ def _trainer_dependency_inventory(
         if not base.is_dir():
             raise Refused(f"missing trainer dependency directory: {base}")
         for local in sorted(base.rglob("*")):
+            if "__pycache__" in local.parts or local.suffix in {".pyc", ".pyo"}:
+                continue
             if local.is_file():
                 add(local.relative_to(repo_root).as_posix(), destinations)
 
@@ -4211,6 +4213,8 @@ def _start_dependency_inventory(
         if not base.is_dir():
             raise Refused(f"missing start dependency directory: {base}")
         for local in sorted(base.rglob("*")):
+            if "__pycache__" in local.parts or local.suffix in {".pyc", ".pyo"}:
+                continue
             if local.is_file() and (suffix is None or local.suffix == suffix):
                 add(local.relative_to(repo_root).as_posix(), destinations)
 
