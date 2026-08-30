@@ -93,7 +93,7 @@ start_replica() {
   -e VLLM_SERVER_DEV_MODE=1 \
   -e PRIME_FULL_CHECKPOINT_CACHE_DIR=/data/muse-glimmer/weight-cache \
   -e PRIME_LORA_CACHE_DIR=/data/muse-glimmer/lora-cache \
-  -e PRIME_LORA_DOWNLOAD_STREAMS=16 \
+  -e PRIME_LORA_DOWNLOAD_STREAMS=32 \
   -e PRIME_LORA_SOURCE_PORTS="$lora_source_port_list" \
   -e PRIME_FULL_CHECKPOINT_PORTS="$weight_tunnel_ports" \
   -e CUDA_DEVICE_ORDER=PCI_BUS_ID \
