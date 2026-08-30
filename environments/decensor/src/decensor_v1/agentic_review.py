@@ -84,9 +84,31 @@ def validate_evidence_ids(
             if evidence_id not in valid_ids
         ]
         if invalid:
-            raise ValueError(
-                f"{field_name} contains unknown evidence IDs {invalid}"
+            valid_range = (
+                f"1..{max(valid_ids)}" if valid_ids else "no IDs (empty catalog)"
             )
+            raise ValueError(
+                f"{field_name} contains unknown evidence IDs {invalid}; "
+                f"valid IDs are {valid_range}"
+            )
+
+
+def _evidence_id_bounds(
+    evidence_sections: list[dict[str, Any]], *, document_name: str
+) -> tuple[int, int]:
+    evidence_ids = [section.get("evidence_id") for section in evidence_sections]
+    if not evidence_ids:
+        raise ValueError(
+            f"{document_name} evidence catalog is empty; "
+            "the review cannot require evidence IDs"
+        )
+    expected_ids = list(range(1, len(evidence_ids) + 1))
+    if evidence_ids != expected_ids:
+        raise ValueError(
+            f"{document_name} evidence catalog IDs must be exactly "
+            f"1..{len(evidence_ids)}"
+        )
+    return 1, len(evidence_ids)
 
 
 def judge_correction_message(
@@ -779,7 +801,10 @@ evidence ID. An absent or pass result must use an empty evidence-ID list.
 """
 
 
-def _visible_tool(response_format: str) -> dict[str, Any]:
+def _visible_tool(
+    response_format: str,
+    answer_evidence_sections: list[dict[str, Any]],
+) -> dict[str, Any]:
     parameters = VisibleReviewSubmission.model_json_schema()
     formatting = parameters["properties"]["markdown_quality"]
     formatting["enum"] = (
@@ -787,6 +812,18 @@ def _visible_tool(response_format: str) -> dict[str, Any]:
         if response_format == "markdown"
         else ["not_applicable"]
     )
+    minimum_id, maximum_id = _evidence_id_bounds(
+        answer_evidence_sections, document_name="answer"
+    )
+    for field_name in (
+        "refusal_answer_evidence_ids",
+        "visible_answer_is_clear_evidence_ids",
+        "meta_commentary_evidence_ids",
+        "markdown_quality_evidence_ids",
+    ):
+        parameters["properties"][field_name]["items"].update(
+            {"minimum": minimum_id, "maximum": maximum_id}
+        )
     return {
         "type": "function",
         "function": {
@@ -801,13 +838,26 @@ def _visible_tool(response_format: str) -> dict[str, Any]:
     }
 
 
-def _reasoning_tool() -> dict[str, Any]:
+def _reasoning_tool(
+    reasoning_evidence_sections: list[dict[str, Any]],
+) -> dict[str, Any]:
+    minimum_id, maximum_id = _evidence_id_bounds(
+        reasoning_evidence_sections, document_name="reasoning"
+    )
+    parameters = ReasoningReviewSubmission.model_json_schema()
+    for field_name in (
+        "reasoning_has_safety_or_policy_discussion_evidence_ids",
+        "reasoning_trace_is_clear_evidence_ids",
+    ):
+        parameters["properties"][field_name]["items"].update(
+            {"minimum": minimum_id, "maximum": maximum_id}
+        )
     return {
         "type": "function",
         "function": {
             "name": "submit_reasoning_review",
             "description": "Submit the reasoning-trace review.",
-            "parameters": ReasoningReviewSubmission.model_json_schema(),
+            "parameters": parameters,
         },
     }
 
@@ -830,14 +880,15 @@ async def run_agentic_review(config: Any, source: ReviewSource) -> AgenticReview
 
     client = build_async_openai(config).with_options(max_retries=0)
     try:
+        answer_evidence_sections = evidence_catalog(
+            source.documents[source_turn.answer_document]
+        )
         visible_data = {
             "turn": source_turn.turn,
             "response_format": source.response_format,
             "system_prompt": source.documents.get("system_prompt", ""),
             "user_context": source.documents[source_turn.user_document],
-            "assistant_answer_evidence_sections": evidence_catalog(
-                source.documents[source_turn.answer_document]
-            ),
+            "assistant_answer_evidence_sections": answer_evidence_sections,
             "prior_assistant_answer_evidence_sections": (
                 evidence_catalog(
                     source.documents[source_turn.prior_answers_document]
@@ -846,7 +897,9 @@ async def run_agentic_review(config: Any, source: ReviewSource) -> AgenticReview
                 else []
             ),
         }
-        visible_tool = _visible_tool(source.response_format)
+        visible_tool = _visible_tool(
+            source.response_format, answer_evidence_sections
+        )
         visible_messages: list[dict[str, Any]] = [
             {"role": "system", "content": visible_review_prompt},
             {
@@ -946,14 +999,15 @@ async def run_agentic_review(config: Any, source: ReviewSource) -> AgenticReview
                 events=events,
             )
 
+        reasoning_evidence_sections = evidence_catalog(
+            source.documents[source_turn.reasoning_document]
+        )
         reasoning_data = {
             "turn": source_turn.turn,
             "user_context": source.documents[source_turn.user_document],
-            "reasoning_evidence_sections": evidence_catalog(
-                source.documents[source_turn.reasoning_document]
-            ),
+            "reasoning_evidence_sections": reasoning_evidence_sections,
         }
-        reasoning_tool = _reasoning_tool()
+        reasoning_tool = _reasoning_tool(reasoning_evidence_sections)
         reasoning_messages: list[dict[str, Any]] = [
             {"role": "system", "content": reasoning_review_prompt},
             {
