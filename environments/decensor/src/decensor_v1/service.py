@@ -4,6 +4,7 @@ import asyncio
 import fcntl
 import os
 import platform
+import re
 import tempfile
 import time
 from collections.abc import Awaitable, Callable
@@ -27,6 +28,16 @@ _judge_slot_directory = (
 )
 _judge_capacity_file = "capacity"
 _judge_capacity_lock_file = "capacity.lock"
+
+
+def _safe_service_error(error: object) -> str:
+    message = " ".join(str(error).split())
+    message = re.sub(
+        r"(?i)(authorization|api[-_ ]?key|token)(\s*[:=]\s*)([^, }]+)",
+        r"\1\2[removed]",
+        message,
+    )
+    return message[:400]
 
 
 def _judge_capacity(config: Any | None) -> int:
@@ -114,10 +125,16 @@ def judge_failure_summary(name: str, outcome: EvaluationResult) -> dict[str, Any
         if not isinstance(status, str):
             status = "unknown"
         failure_types: list[str] = []
+        error_message: str | None = None
         if status == "request_failed":
             error_type = record.get("error_type")
             if isinstance(error_type, str) and error_type:
                 failure_types.append(error_type)
+            error_message = record.get("error")
+            if isinstance(error_message, str) and error_message:
+                error_message = _safe_service_error(error_message)
+            else:
+                error_message = None
         elif status == "invalid_judge_response":
             events = record.get("events", [])
             if isinstance(events, list):
@@ -152,6 +169,7 @@ def judge_failure_summary(name: str, outcome: EvaluationResult) -> dict[str, Any
                 "attempt": attempt,
                 "status": status,
                 "failure_types": failure_types,
+                "error": error_message,
                 "elapsed_seconds": elapsed_seconds,
             }
         )
@@ -178,6 +196,7 @@ def format_judge_failure_summary(summaries: list[dict[str, Any]]) -> str:
             )
             attempt_messages.append(
                 f"attempt {attempt_label}: {failure_types} ({elapsed_label})"
+                + (f" — {attempt['error']}" if attempt.get("error") else "")
             )
         review_messages.append(
             f"{name}: " + ("; ".join(attempt_messages) or "no attempt record")

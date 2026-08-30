@@ -390,7 +390,6 @@ def evidence_catalog(document: str) -> list[dict[str, Any]]:
 class ReviewTurn:
     turn: int
     user_document: str
-    prior_answers_document: str | None
     reasoning_document: str
     answer_document: str
 
@@ -446,7 +445,6 @@ def build_turn_review_sources(
         else [{"role": "assistant", "content": str(completion or "")}]
     )
     sources: list[ReviewSource] = []
-    prior_answers: list[str] = []
     assistant_turn = 0
     for message in messages:
         role = message_role(message)
@@ -460,26 +458,17 @@ def build_turn_review_sources(
         if system_prompt:
             documents["system_prompt"] = system_prompt
         user_document = f"turn_{assistant_turn}_user_context"
-        prior_answers_document = (
-            f"turn_{assistant_turn}_prior_answers" if prior_answers else None
-        )
         reasoning_document = f"turn_{assistant_turn}_reasoning"
         answer_document = f"turn_{assistant_turn}_answer"
         documents[user_document] = "\n\n".join(
             f"User request {index}:\n{text}"
             for index, text in enumerate(user_messages, start=1)
         )
-        if prior_answers_document is not None:
-            documents[prior_answers_document] = "\n\n".join(
-                f"Assistant answer {index}:\n{text}"
-                for index, text in enumerate(prior_answers, start=1)
-            )
         documents[reasoning_document] = extract_message_reasoning_trace(message)
         documents[answer_document] = strip_think_tags(message_content(message))
         review_turn = ReviewTurn(
             turn=assistant_turn,
             user_document=user_document,
-            prior_answers_document=prior_answers_document,
             reasoning_document=reasoning_document,
             answer_document=answer_document,
         )
@@ -490,7 +479,6 @@ def build_turn_review_sources(
                 turns=(review_turn,),
             )
         )
-        prior_answers.append(documents[answer_document])
     return sources
 
 
@@ -603,8 +591,6 @@ def validate_review(review: TranscriptReview, source: ReviewSource) -> None:
             turn.answer_document,
             "system_prompt",
         }
-        if turn.prior_answers_document is not None:
-            allowed_documents.add(turn.prior_answers_document)
         evidence_by_criterion = {item.criterion for item in result.evidence}
         if "refusal" not in evidence_by_criterion:
             raise ValueError(f"turn {result.turn} needs refusal evidence")
@@ -889,13 +875,6 @@ async def run_agentic_review(config: Any, source: ReviewSource) -> AgenticReview
             "system_prompt": source.documents.get("system_prompt", ""),
             "user_context": source.documents[source_turn.user_document],
             "assistant_answer_evidence_sections": answer_evidence_sections,
-            "prior_assistant_answer_evidence_sections": (
-                evidence_catalog(
-                    source.documents[source_turn.prior_answers_document]
-                )
-                if source_turn.prior_answers_document is not None
-                else []
-            ),
         }
         visible_tool = _visible_tool(
             source.response_format, answer_evidence_sections
