@@ -262,8 +262,9 @@ class AdapterTransportStateTest(unittest.TestCase):
             self.assertIn("require_delta", path.read_text(encoding="utf-8"))
         worker_source = worker.read_text(encoding="utf-8")
         self.assertIn("delta adapter transport is required", worker_source)
-        self.assertIn('chunk_url = f"{lane_url.rstrip(\'/\')}/{name}"', worker_source)
-        self.assertIn("source_urls=[chunk_url]", worker_source)
+        self.assertIn('chunk_urls = [f"{lane_url.rstrip(\'/\')}/{name}" for lane_url in lane_urls]', worker_source)
+        self.assertIn("source_urls=chunk_urls", worker_source)
+        self.assertIn("parallel_ranges=False", worker_source)
         self.assertIn("executor.shutdown(wait=True, cancel_futures=True)", worker_source)
         self.assertIn("_cleanup_delta_stage_artifacts(destination)", worker_source)
         self.assertIn("deadline=delta_deadline", worker_source)
@@ -306,6 +307,56 @@ class AdapterTransportStateTest(unittest.TestCase):
         worker_source = (REPOSITORY / "prime-rl/src/prime_rl/inference/vllm/worker/filesystem.py").read_text(encoding="utf-8")
         self.assertIn("download_streams = _configured_download_streams()", worker_source)
         self.assertNotIn("_PARALLEL_DOWNLOAD_STREAMS", worker_source)
+
+    def test_chunk_retries_rotate_lanes_without_nested_ranges(self):
+        filesystem = load_filesystem_module()
+        payload = b"chunk-payload"
+        calls = []
+
+        class Response(io.BytesIO):
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        def fake_urlopen(request, timeout):
+            calls.append((request.full_url, request.headers.get("Range"), timeout))
+            if len(calls) == 1:
+                raise OSError("first lane is unavailable")
+            return Response(payload)
+
+        class UnexpectedRangeExecutor:
+            def __init__(self, *_args, **_kwargs):
+                raise AssertionError("one chunk must not start nested range workers")
+
+        old_urlopen = filesystem.urllib.request.urlopen
+        old_executor = filesystem.ThreadPoolExecutor
+        old_sleep = filesystem.time.sleep
+        filesystem.urllib.request.urlopen = fake_urlopen
+        filesystem.ThreadPoolExecutor = UnexpectedRangeExecutor
+        filesystem.time.sleep = lambda _seconds: None
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                destination = Path(temporary) / "chunk"
+                filesystem.download(
+                    "http://lane-1/chunk",
+                    destination,
+                    expected_size=len(payload),
+                    expected_sha256=hashlib.sha256(payload).hexdigest(),
+                    source_urls=["http://lane-1/chunk", "http://lane-2/chunk"],
+                    parallel_ranges=False,
+                )
+                self.assertEqual(destination.read_bytes(), payload)
+        finally:
+            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem.ThreadPoolExecutor = old_executor
+            filesystem.time.sleep = old_sleep
+
+        self.assertEqual([call[0] for call in calls], ["http://lane-1/chunk", "http://lane-2/chunk"])
+        self.assertEqual([call[1] for call in calls], [None, None])
 
 
 if __name__ == "__main__":

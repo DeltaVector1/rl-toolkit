@@ -842,15 +842,15 @@ def _stage_chunked_xor_adapter(
         def lane_report(_lane: int, amount: int) -> None:
             report(index % len(lane_urls), amount)
 
-        lane_url = lane_urls[index % len(lane_urls)]
-        chunk_url = f"{lane_url.rstrip('/')}/{name}"
+        chunk_urls = [f"{lane_url.rstrip('/')}/{name}" for lane_url in lane_urls]
         download(
-            chunk_url,
+            chunk_urls[index % len(chunk_urls)],
             chunk_path,
             expected_size=int(item["wire_size"]),
             expected_sha256=str(item["wire_sha256"]),
             progress=lane_report,
-            source_urls=[chunk_url],
+            source_urls=chunk_urls,
+            parallel_ranges=False,
             deadline=deadline,
             cancel_event=cancel_event,
         )
@@ -965,6 +965,7 @@ def download(
     expected_sha256: str | None = None,
     progress=None,
     source_urls: list[str] | None = None,
+    parallel_ranges: bool = True,
     deadline: float | None = None,
     cancel_event: threading.Event | None = None,
 ) -> None:
@@ -989,7 +990,9 @@ def download(
     # link. Adapter fan-out is opt-in and has its own setting.
     adapter_ports = explicit_source_urls or len(source_urls) > 1 or source_urls[0] != source_url
 
-    streams = len(source_urls) if adapter_ports else _configured_download_streams()
+    streams = len(source_urls) if adapter_ports and parallel_ranges else 1
+    if not adapter_ports and parallel_ranges:
+        streams = _configured_download_streams()
     if total < _PARALLEL_DOWNLOAD_THRESHOLD or streams == 1:
         # Preserve the old single-file resume path for small metadata files and
         # for an explicitly disabled parallel transfer.
