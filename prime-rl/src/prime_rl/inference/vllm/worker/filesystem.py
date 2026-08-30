@@ -839,12 +839,15 @@ def _stage_chunked_xor_adapter(
         chunk_path = chunk_root / relative
         chunk_path.parent.mkdir(parents=True, exist_ok=True)
 
+        chunk_lane = index % len(lane_urls)
+
         def lane_report(_lane: int, amount: int) -> None:
-            report(index % len(lane_urls), amount)
+            report(chunk_lane, amount)
 
         chunk_urls = [f"{lane_url.rstrip('/')}/{name}" for lane_url in lane_urls]
+        chunk_urls = chunk_urls[chunk_lane:] + chunk_urls[:chunk_lane]
         download(
-            chunk_urls[index % len(chunk_urls)],
+            chunk_urls[0],
             chunk_path,
             expected_size=int(item["wire_size"]),
             expected_sha256=str(item["wire_sha256"]),

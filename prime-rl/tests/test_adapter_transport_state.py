@@ -263,6 +263,7 @@ class AdapterTransportStateTest(unittest.TestCase):
         worker_source = worker.read_text(encoding="utf-8")
         self.assertIn("delta adapter transport is required", worker_source)
         self.assertIn('chunk_urls = [f"{lane_url.rstrip(\'/\')}/{name}" for lane_url in lane_urls]', worker_source)
+        self.assertIn("chunk_urls = chunk_urls[chunk_lane:] + chunk_urls[:chunk_lane]", worker_source)
         self.assertIn("source_urls=chunk_urls", worker_source)
         self.assertIn("parallel_ranges=False", worker_source)
         self.assertIn("executor.shutdown(wait=True, cancel_futures=True)", worker_source)
