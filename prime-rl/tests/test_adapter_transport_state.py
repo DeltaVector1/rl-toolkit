@@ -41,6 +41,7 @@ def load_watcher_delta_method(urlopen):
     namespace = {
         "json": json,
         "urlopen": urlopen,
+        "_delta_stage_timeout_s": lambda: 30,
         "get_broadcast_dir": lambda output_dir: output_dir,
         "get_step_path": lambda broadcast_dir, step: broadcast_dir / f"step_{step}",
         "inference_weight_path": lambda _config, path, _lora_name: f"http://source/{path.name}",
@@ -125,7 +126,7 @@ class AdapterTransportStateTest(unittest.TestCase):
             watcher = SimpleNamespace(
                 config=SimpleNamespace(
                     output_dir=root,
-                    weight_broadcast=SimpleNamespace(timeout=30),
+                    weight_broadcast=SimpleNamespace(),
                 ),
                 lora_name="adapter",
                 verified_adapter_step=0,

@@ -77,7 +77,7 @@ from prime_rl.trainer.model import setup_tokenizer
 from prime_rl.trainer.rl.broadcast.nixl.model_express import ModelExpressSession
 from prime_rl.transport import TrainingBatch, setup_training_batch_sender
 from prime_rl.utils.async_utils import EventLoopLagMonitor, EventLoopLagStats, safe_cancel
-from prime_rl.utils.client import init_nccl_broadcast, init_nixl_broadcast
+from prime_rl.utils.client import _delta_stage_timeout_s, init_nccl_broadcast, init_nixl_broadcast
 from prime_rl.utils.config import to_toml_dict
 from prime_rl.utils.heartbeat import Heartbeat
 from prime_rl.utils.logger import format_time, get_logger, setup_logger
@@ -185,7 +185,7 @@ def _verify_startup_adapter_delta(
                 with (path / "adapter_manifest.json").open("r", encoding="utf-8") as source:
                     value = json.load(source)
             else:
-                with urlopen(f"{url.rstrip('/')}/adapter_manifest.json", timeout=config.weight_broadcast.timeout) as source:
+                with urlopen(f"{url.rstrip('/')}/adapter_manifest.json", timeout=_delta_stage_timeout_s()) as source:
                     value = json.load(source)
         except (FileNotFoundError, OSError, ValueError) as exc:
             raise RuntimeError(
