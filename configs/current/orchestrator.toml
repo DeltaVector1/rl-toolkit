@@ -83,11 +83,13 @@ max_completion_tokens = 16384
 base_url = "http://202.214.223.66:26406/v1"
 model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
 api_key_var = "VLLM_API_KEY"
+max_concurrent_requests = 24
 
 [train.env.env.taskset.task.user]
 base_url = "http://202.214.223.66:26406/v1"
 model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
 api_key_var = "VLLM_API_KEY"
+max_concurrent_requests = 24
 
 [eval]
 interval = 5
