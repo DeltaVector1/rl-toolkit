@@ -377,7 +377,7 @@ def validate_follow_up_message(
     text = match.group(1).strip()
     if not text:
         return "", "empty_message", details
-    if re.search(r"</?[A-Za-z][^>]{0,200}>", text):
+    if detect_structured_markers(text) is not None:
         return "", "unexpected_tag", details
     if re.search(r"^\s*(?:SYSTEM|USER|ASSISTANT)\s*:", text, flags=re.MULTILINE):
         return "", "role_label", details
