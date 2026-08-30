@@ -774,6 +774,12 @@ class RolloutDispatcher:
         )
         if missing_policy_model:
             return True
+        # vLLM Router returns this 503 when every worker is unhealthy or
+        # circuit-open. Keep the group open while workers recover.
+        if error.type == "ProviderError" and (
+            "no available workers" in message or "no_available_workers" in message
+        ):
+            return True
         # vLLM can occasionally produce a NaN in response metadata while the
         # generated token sequence itself remains bounded. Starlette refuses
         # to serialize that response and vLLM returns this exact HTTP 400.
