@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from dataclasses import dataclass
@@ -7,6 +8,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from decensor_v1.service import judge_request_slot
 from decensor_v1.text import (
     extract_message_reasoning_trace,
     message_content,
@@ -394,6 +396,14 @@ class AgenticReviewResponse:
     parsed: dict[str, Any] | None
     text: str
     events: list[dict[str, Any]]
+
+
+async def _judge_completion(client: Any, config: Any, **kwargs: Any) -> Any:
+    async with judge_request_slot(config):
+        return await asyncio.wait_for(
+            client.chat.completions.create(**kwargs),
+            timeout=180.0,
+        )
 
 
 def build_turn_review_sources(
@@ -848,7 +858,9 @@ async def run_agentic_review(config: Any, source: ReviewSource) -> AgenticReview
         visible_raw = ""
         model_call_count = 0
         for phase_attempt in range(1, 4):
-            visible_completion = await client.chat.completions.create(
+            visible_completion = await _judge_completion(
+                client,
+                config,
                 model=config.model,
                 messages=visible_messages,
                 tools=[visible_tool],
@@ -953,7 +965,9 @@ async def run_agentic_review(config: Any, source: ReviewSource) -> AgenticReview
         reasoning_raw = ""
         submitted: TranscriptReview | None = None
         for phase_attempt in range(1, 4):
-            reasoning_completion = await client.chat.completions.create(
+            reasoning_completion = await _judge_completion(
+                client,
+                config,
                 model=config.model,
                 messages=reasoning_messages,
                 tools=[reasoning_tool],

@@ -118,11 +118,7 @@ async def request_judge_score(
             for attempt_number in range(1, attempt_count + 1):
                 started_at = time.monotonic()
                 try:
-                    async with judge_request_slot(judge_config):
-                        response = await asyncio.wait_for(
-                            request(),
-                            timeout=attempt_timeout_seconds,
-                        )
+                    response = await request()
                 except Exception as error:
                     attempts.append(
                         {
