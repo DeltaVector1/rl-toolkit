@@ -1,3 +1,4 @@
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -44,6 +45,83 @@ class ActiveRewardRowsTest(unittest.TestCase):
         self.assertEqual([row["step"] for row in selected], [2])
         self.assertEqual(excluded, 0)
         self.assertEqual(without_time, 1)
+
+
+class ActiveMetricRowsTest(unittest.TestCase):
+    def test_filters_old_trainer_steps_at_active_run_boundary(self):
+        rows = [
+            {"step": 8, "time": 1788100109.0},
+            {"step": 1, "time": 1788110000.0},
+            {"step": 5, "time": 1788120000.0},
+        ]
+
+        selected, excluded, without_time = training_ops._select_active_metric_rows(
+            rows, "glm52", "glm52", 1788108469.312
+        )
+
+        self.assertEqual([row["step"] for row in selected], [1, 5])
+        self.assertEqual(excluded, 1)
+        self.assertEqual(without_time, 0)
+
+    def test_keeps_historical_rows_when_no_active_run_matches(self):
+        rows = [{"step": 8, "time": 100.0}]
+
+        selected, excluded, without_time = training_ops._select_active_metric_rows(
+            rows, "glm52", "other-run", 200.0
+        )
+
+        self.assertIs(selected, rows)
+        self.assertEqual(excluded, 0)
+        self.assertEqual(without_time, 0)
+
+
+class AcceptanceProbeTest(unittest.TestCase):
+    def test_decodes_run_boundary_metadata(self):
+        decoded = training_ops._decode_acceptance_probe(
+            "ACTIVE_RUN glm52\n"
+            "ACTIVE_RUN_SOURCE RUN\n"
+            "START_EPOCH 1788108469.312\n"
+        )
+
+        self.assertEqual(decoded["active_run"], "glm52")
+        self.assertEqual(decoded["active_run_source"], "RUN")
+        self.assertEqual(decoded["start_epoch"], "1788108469.312")
+
+    def test_acceptance_ignores_old_steps_and_failures(self):
+        trainer_rows = [
+            {"step": 8, "time": 1788100109.0, "time/forward_backward": 700.0},
+            {"step": 1, "time": 1788110000.0, "time/forward_backward": 700.0},
+            {"step": 5, "time": 1788120000.0, "time/forward_backward": 700.0},
+        ]
+        rollout_rows = [
+            {
+                "step": 8,
+                "time": 1788100109.0,
+                "train/agg/all/has_error/mean": 1.0,
+            },
+            {
+                "step": 1,
+                "time": 1788110000.0,
+                "train/agg/all/has_error/mean": 0.0,
+            },
+        ]
+
+        report = training_ops._acceptance_from_text(
+            "glm52",
+            "",
+            "",
+            "\n".join(json.dumps(row) for row in trainer_rows),
+            "\n".join(json.dumps(row) for row in rollout_rows),
+            "",
+            "too few steps",
+            trainer_active_run="glm52",
+            trainer_start_epoch=1788108469.312,
+            rollout_active_run="glm52",
+            rollout_start_epoch=1788108469.312,
+        )
+
+        self.assertEqual(report.completed_steps, 5)
+        self.assertEqual(report.failures, {})
 
 
 if __name__ == "__main__":

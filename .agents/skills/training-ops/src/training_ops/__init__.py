@@ -342,7 +342,7 @@ def _run_dir(run: str) -> str:
     )
 
 
-def _select_active_reward_rows(
+def _select_active_metric_rows(
     rows: list[dict],
     requested_run: str,
     active_run: str | None,
@@ -372,6 +372,28 @@ def _select_active_reward_rows(
         else:
             selected.append(row)
     return selected, excluded, without_time
+
+
+def _parse_epoch(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        epoch = float(value)
+    except (TypeError, ValueError):
+        return None
+    return epoch if math.isfinite(epoch) else None
+
+
+def _select_active_reward_rows(
+    rows: list[dict],
+    requested_run: str,
+    active_run: str | None,
+    active_start_epoch: float | None,
+) -> tuple[list[dict], int, int]:
+    """Keep the public reward-row helper name for existing callers."""
+    return _select_active_metric_rows(
+        rows, requested_run, active_run, active_start_epoch
+    )
 
 
 # -------------------------------------------------------------------- probes
@@ -1004,12 +1026,22 @@ def _acceptance_from_text(
     rollout_metrics: str,
     logs: str,
     reward_verdict: str,
+    trainer_active_run: str | None = None,
+    trainer_start_epoch: float | None = None,
+    rollout_active_run: str | None = None,
+    rollout_start_epoch: float | None = None,
 ) -> AcceptanceReport:
     """Build an acceptance report from text. This function never uses SSH."""
     trainer_values = _parse_toml_scalars(trainer_config)
     orch_values = _parse_toml_scalars(orchestrator_config)
     trainer_rows = _parse_jsonl_metrics(trainer_metrics)
     rollout_rows = _parse_jsonl_metrics(rollout_metrics)
+    trainer_rows, _, _ = _select_active_metric_rows(
+        trainer_rows, run, trainer_active_run, trainer_start_epoch
+    )
+    rollout_rows, _, _ = _select_active_metric_rows(
+        rollout_rows, run, rollout_active_run, rollout_start_epoch
+    )
     is_muse = run.lower().startswith("muse") or "muse-glimmer" in trainer_config.lower()
     profile = "muse" if is_muse else "glm52"
     rep = AcceptanceReport(
@@ -1225,6 +1257,19 @@ def _acceptance_probe_script(run: str, role: str) -> str:
     return f"""
 cfg=$(sudo docker inspect {container} --format '{{{{range .Config.Cmd}}}}{{{{println .}}}}{{{{end}}}}' 2>/dev/null |
       grep -E '\\.toml$' | tail -1)
+container_env=$(sudo docker inspect {container} --format '{{{{range .Config.Env}}}}{{{{println .}}}}{{{{end}}}}' 2>/dev/null || true)
+active_run=$(printf '%s\\n' "$container_env" | sed -n 's/^RUN=//p' | head -1)
+active_run_source=RUN
+if [ -z "$active_run" ]; then
+  active_run=$(printf '%s\\n' "$container_env" | sed -n 's#^HF_HOME=/data/glm52-rl/runs/\\([^/]*\\)/.*#\\1#p' | head -1)
+  active_run_source=HF_HOME
+fi
+started_at=$(sudo docker inspect {container} --format '{{{{.State.StartedAt}}}}' 2>/dev/null | head -1)
+start_epoch=
+if [ -n "$started_at" ]; then start_epoch=$(date -u -d "$started_at" +%s.%N 2>/dev/null || true); fi
+printf 'ACTIVE_RUN %s\\n' "$active_run"
+printf 'ACTIVE_RUN_SOURCE %s\\n' "$active_run_source"
+printf 'START_EPOCH %s\\n' "$start_epoch"
 metric=$(find {root} -maxdepth 3 -type f -name {shlex.quote(metric_name)} -print 2>/dev/null | head -1)
 emit() {{ printf '%s_B64 ' "$1"; if [ -n "$2" ] && [ -r "$2" ]; then "$3" "$2" | base64 -w0; fi; printf '\\n'; }}
 emit PATH "$cfg" cat
@@ -1232,9 +1277,13 @@ emit CONFIG "$cfg" cat
 emit METRICS "$metric" tail
 logs=""
 for ct in {containers}; do
+  if [ -n "$started_at" ]; then
+    current_logs=$(sudo docker logs --since "$started_at" --tail 20000 "$ct" 2>&1 || true)
+  else
+    current_logs=$(sudo docker logs --tail 20000 "$ct" 2>&1 || true)
+  fi
   logs="${{logs}}
-$(sudo docker logs --tail 20000 "$ct" 2>&1 |
-    grep -aiE {shlex.quote(acceptance_log_pattern)} | tail -200)"
+$(printf '%s' "$current_logs" | grep -aiE {shlex.quote(acceptance_log_pattern)} | tail -200)"
 done
 printf 'LOGS_B64 '; printf '%s' "$logs" | base64 -w0; printf '\\n'
 """
@@ -1243,6 +1292,12 @@ printf 'LOGS_B64 '; printf '%s' "$logs" | base64 -w0; printf '\\n'
 def _decode_acceptance_probe(out: str) -> dict[str, str]:
     decoded = {}
     for line in out.splitlines():
+        match = re.match(
+            r"^(ACTIVE_RUN_SOURCE|ACTIVE_RUN|START_EPOCH)(?: +(.*))?$", line
+        )
+        if match:
+            decoded[match.group(1).lower()] = (match.group(2) or "").strip()
+            continue
         match = re.match(r"^(PATH|CONFIG|METRICS|LOGS)_B64(?: +(.*))?$", line)
         if not match:
             continue
@@ -1305,6 +1360,10 @@ def acceptance(run: str = "", quiet: bool = False) -> AcceptanceReport:
         edge.get("metrics", ""),
         "\n".join((trainer.get("logs", ""), edge.get("logs", ""), *engine_logs)),
         reward_report.verdict,
+        trainer_active_run=trainer.get("active_run") or None,
+        trainer_start_epoch=_parse_epoch(trainer.get("start_epoch")),
+        rollout_active_run=edge.get("active_run") or None,
+        rollout_start_epoch=_parse_epoch(edge.get("start_epoch")),
     )
     rep.trainer_config_path = trainer.get("path", "")
     rep.orchestrator_config_path = edge.get("path", "")
@@ -2047,27 +2106,52 @@ def steps(run: str = "", limit: int = 10) -> list[dict]:
         raise Refused("run name contains invalid characters")
     if not 1 <= int(limit) <= 200:
         raise Refused("step limit must be between 1 and 200")
+    container = shlex.quote(trainer_container)
     script = f"""
 path=$(find {shlex.quote(f'{run_root}/{run}')} -maxdepth 3 -type f -name trainer-metrics.jsonl -print 2>/dev/null | head -1)
 [ -n "$path" ] || exit 4
-python3 - "$path" {int(limit)} <<'PY'
+container_env=$(sudo docker inspect {container} --format '{{{{range .Config.Env}}}}{{{{println .}}}}{{{{end}}}}' 2>/dev/null || true)
+active_run=$(printf '%s\\n' "$container_env" | sed -n 's/^RUN=//p' | head -1)
+started_at=$(sudo docker inspect {container} --format '{{{{.State.StartedAt}}}}' 2>/dev/null | head -1)
+start_epoch=
+if [ -n "$started_at" ]; then start_epoch=$(date -u -d "$started_at" +%s.%N 2>/dev/null || true); fi
+python3 - "$path" {int(limit)} {shlex.quote(run)} "$active_run" "$start_epoch" <<'PY'
 import json,sys
 rows=[]
 invalid=0
+excluded=0
+requested_run=sys.argv[3]
+active_run=sys.argv[4] or None
+try: active_start=float(sys.argv[5]) if sys.argv[5] else None
+except ValueError: active_start=None
+filter_rows=active_run == requested_run and active_start is not None
 for line in open(sys.argv[1]):
     try:
         row=json.loads(line)
     except ValueError:
         invalid+=1
         continue
-    if isinstance(row.get('step'), (int,float)) and isinstance(row.get('time/forward_backward'), (int,float)):
-        rows.append({{
-            'step':int(row['step']),
-            'forward_backward_seconds':float(row['time/forward_backward']),
-            'wait_seconds':float(row.get('time/wait_for_batch') or 0),
-            'tokens_per_second':float(row.get('perf/throughput') or 0),
-        }})
-print(json.dumps({{'rows':rows[-int(sys.argv[2]):], 'invalid_lines':invalid}}))
+    if not (isinstance(row.get('step'), (int,float)) and isinstance(row.get('time/forward_backward'), (int,float))):
+        continue
+    if filter_rows:
+        timestamp=row.get('time')
+        if not isinstance(timestamp, (int,float)) or isinstance(timestamp, bool):
+            excluded+=1
+            continue
+        try: timestamp=float(timestamp)
+        except (TypeError,ValueError):
+            excluded+=1
+            continue
+        if timestamp < active_start:
+            excluded+=1
+            continue
+    rows.append({{
+        'step':int(row['step']),
+        'forward_backward_seconds':float(row['time/forward_backward']),
+        'wait_seconds':float(row.get('time/wait_for_batch') or 0),
+        'tokens_per_second':float(row.get('perf/throughput') or 0),
+    }})
+print(json.dumps({{'rows':rows[-int(sys.argv[2]):], 'invalid_lines':invalid, 'excluded_lines':excluded}}))
 PY
 """
     code, output = _ssh(trainer_head, script, timeout=180)
@@ -2089,6 +2173,9 @@ PY
     invalid = int(result.get("invalid_lines") or 0)
     if invalid:
         print(f"invalid metric lines: {invalid}")
+    excluded = int(result.get("excluded_lines") or 0)
+    if excluded:
+        print(f"older metric lines excluded: {excluded}")
     return rows
 
 
