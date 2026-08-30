@@ -303,10 +303,7 @@ class DecensorUser(vf.User[DecensorUserConfig, DecensorState]):
                             attempt_record["review"] = review.model_dump()
                             if not review.accepted():
                                 final_error = "semantic_review_rejected"
-                                retry_instruction = (
-                                    f"{review.correction()} The review found: "
-                                    f"{review.reason}"
-                                )
+                                retry_instruction = review.correction()
                                 if strategy_name == "request_method":
                                     retry_instruction += (
                                         " Ask for practical steps that produce the "
