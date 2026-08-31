@@ -32,6 +32,7 @@ RELOAD_TRIES=${RELOAD_TRIES:-40}
 RELOAD_WAIT=${RELOAD_WAIT:-30}
 STAGING_STATUS_TIMEOUT=${STAGING_STATUS_TIMEOUT:-5}
 STAGING_GRACE=${STAGING_GRACE:-330}
+STAGING_PROGRESS_TIMEOUT=${STAGING_PROGRESS_TIMEOUT:-300}
 # /liveness runs the vLLM collective RPC. It can prove that the workers are
 # responsive while a tiny generation is delayed by a paused or busy engine.
 LIVENESS_TIMEOUT=${LIVENESS_TIMEOUT:-15}
@@ -39,6 +40,8 @@ LIVENESS_LOG_EVERY=${LIVENESS_LOG_EVERY:-10}
 misses=0
 liveness_deferrals=0
 last_generation_tokens=-1
+last_staging_bytes=-1
+last_staging_progress_at=0
 
 log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
 log "engine watchdog started (port=$PORT interval=${INTERVAL}s timeout=${TIMEOUT}s)"
@@ -67,6 +70,25 @@ while true; do
       's/.*"status"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
     staging_age=$(printf '%s\n' "$staging_response" | sed -n \
       's/.*"age_seconds"[[:space:]]*:[[:space:]]*\([0-9][0-9.]*\).*/\1/p')
+    staging_bytes=$(printf '%s\n' "$staging_response" | sed -n \
+      's/.*"bytes_done"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
+    now=$(date +%s)
+    if [ "$staging_state" = "staging" ] && [ -n "$staging_bytes" ] &&
+       [ "$staging_bytes" -gt "$last_staging_bytes" ]; then
+      last_staging_bytes=$staging_bytes
+      last_staging_progress_at=$now
+      log "adapter staging progressing (bytes=$staging_bytes); probe deferred"
+      misses=0
+      sleep "$INTERVAL"
+      continue
+    fi
+    if [ "$staging_state" = "staging" ] && [ "$last_staging_progress_at" -gt 0 ] &&
+       [ $((now - last_staging_progress_at)) -lt "$STAGING_PROGRESS_TIMEOUT" ]; then
+      log "adapter staging has no new bytes yet; probe deferred"
+      misses=0
+      sleep "$INTERVAL"
+      continue
+    fi
     if [ "$staging_state" = "staging" ] && [ -n "$staging_age" ] &&
        awk -v age="$staging_age" -v grace="$STAGING_GRACE" \
          'BEGIN {exit !(age >= 0 && age < grace)}'; then
@@ -74,6 +96,10 @@ while true; do
       misses=0
       sleep "$INTERVAL"
       continue
+    fi
+    if [ "$staging_state" != "staging" ]; then
+      last_staging_bytes=-1
+      last_staging_progress_at=0
     fi
     if [ "$staging_state" = "staging" ] && [ -n "$staging_age" ]; then
       log "adapter staging exceeded grace (age=${staging_age}s limit=${STAGING_GRACE}s)"
