@@ -751,7 +751,8 @@ class Status:
             )
             L.append(
                 f"trainer {trainer_state} | "
-                f"orchestrator {'up' if self.orch_up else 'down'} | "
+                f"orchestrator "
+                f"{'up' if self.orch_up else 'finished' if self.trainer_finished else 'down'} | "
                 f"tunnels {self.tunnels_ok}/{len(inference_tunnel_ports)} | judge {self.judge} | adapter {self.adapter}"
             )
         L.append(
@@ -1619,7 +1620,7 @@ def _warnings(s: Status) -> list[str]:
         detail = f" on {', '.join(failed_nodes)}" if failed_nodes else ""
         w.append(f"trainer cluster is not complete{detail}")
     trainer_only = s.mode == "trainer-only"
-    if not trainer_only and not s.orch_up:
+    if not trainer_only and not s.orch_up and not s.trainer_finished:
         w.append("orchestrator container is not up")
     if not trainer_only and s.tunnels_ok <= 20:
         w.append(
@@ -1681,7 +1682,7 @@ def _warnings(s: Status) -> list[str]:
         ("trainer", s.trainer_log_age),
         ("orchestrator", s.orch_log_age),
     )
-    for name, age in ages:
+    for name, age in (() if s.trainer_finished else ages):
         if age is not None and age > stall_seconds:
             if name == "trainer" and trainer_busy:
                 continue
