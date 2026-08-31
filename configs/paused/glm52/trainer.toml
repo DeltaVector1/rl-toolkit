@@ -1,7 +1,12 @@
-output_dir = "/data/glm52-rl/runs/glm52"
-max_steps = 20
+output_dir = "/data/glm52-rl/runs/glm-1"
+max_steps = 200
 dist_timeout_seconds = 5400
 enable_router_replay = false
+
+[parity_guard]
+max_unmasked_mismatch_kl = 0.1
+max_masked_mismatch_kl = 0.5
+max_masked_fraction = 0.06
 
 [log]
 level = "debug"
@@ -9,12 +14,12 @@ ranks_filter = [0]
 
 [swanlab]
 project = "glm-runs"
-name = "trainer-glm52"
+name = "trainer-glm-1"
 group = "glm-runs"
-tags = ["glm-5.2", "decensor", "grpo", "lora-r32", "20-step"]
+tags = ["glm-1", "glm-5.2", "decensor", "grpo", "lora-r32", "200-step"]
 
 [file_monitor]
-filename = "run_glm52/trainer-metrics.jsonl"
+filename = "run_glm-1/trainer-metrics.jsonl"
 
 [model]
 name = "/data/ZiphuAI/GLM-5.2-FP8"

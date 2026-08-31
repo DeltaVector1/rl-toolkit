@@ -3448,7 +3448,8 @@ def _repair_engine(host: str) -> str:
     rc, out = _ssh(
         host,
         f"sudo docker rm -f {engine_container} >/dev/null 2>&1; "
-        f"nohup setsid bash {start_script} >/root/start_inference.log 2>&1 </dev/null & "
+        f"nohup setsid env ENGINE_HOST={shlex.quote(host)} bash {start_script} "
+        ">/root/start_inference.log 2>&1 </dev/null & "
         "sleep 3; echo issued",
         timeout=180,
     )
@@ -3474,6 +3475,7 @@ def _repair_engine(host: str) -> str:
         watchdog_code, watchdog_output = _ssh(
             host,
             f"nohup setsid env STARTUP_GRACE={startup_grace} MODEL={engine_model} "
+            f"ENGINE_HOST={shlex.quote(host)} "
             f"START={start_script} ENGINE_CONTAINER={engine_container} "
             f"bash {runtime_root}/h200/engine_watchdog.sh "
             ">> /root/engine_watchdog.log 2>&1 </dev/null & disown",
@@ -3646,6 +3648,7 @@ def _repair_engine_watchdog(host: str) -> str:
     for replica, port in enumerate(configured_ports):
         watchdog_container = f"{container}-{replica}" if muse_engine else container
         environment = {
+            "ENGINE_HOST": host,
             "STARTUP_GRACE": str(startup_grace),
             "MODEL": model,
             "START": start_script,
@@ -3742,7 +3745,9 @@ def _repair_supervisors(profile: str = "current") -> str:
         else:
             start_code, start_output = _ssh(
                 h,
-                f"nohup setsid bash {runtime_root}/h200/engine_watchdog.sh >> /root/engine_watchdog.log 2>&1 </dev/null & disown",
+                f"nohup setsid env ENGINE_HOST={shlex.quote(h)} "
+                f"bash {runtime_root}/h200/engine_watchdog.sh "
+                ">> /root/engine_watchdog.log 2>&1 </dev/null & disown",
             )
         if start_code:
             raise RuntimeError(f"cannot start watchdogs on {h}: {start_output.strip()}")

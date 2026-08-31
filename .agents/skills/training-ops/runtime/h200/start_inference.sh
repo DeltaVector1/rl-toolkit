@@ -2,21 +2,31 @@
 set -euo pipefail
 
 deployment=/data/glm52-rl/deployment
-readarray -t lora_source_ports < <(python3 - "$deployment/configs/operations.toml" <<'PY'
+engine_host=${ENGINE_HOST:?ENGINE_HOST must name this host in operations.toml}
+readarray -t runtime_settings < <(python3 - "$deployment/configs/operations.toml" "$engine_host" <<'PY'
 import sys
 import tomllib
 
 with open(sys.argv[1], "rb") as stream:
     config = tomllib.load(stream)
+host = sys.argv[2]
+inference = config["inference"]
+if host not in inference:
+    raise SystemExit(f"unknown inference host: {host}")
 ports = config["ports"]
 first = ports["lora_source_first"]
 last = ports["lora_source_last"]
 if not isinstance(first, int) or not isinstance(last, int) or first < 1 or last < first:
     raise SystemExit("invalid lora source port range")
 print(",".join(str(port) for port in range(first, last + 1)))
+disable_nccl_shm = inference[host].get("disable_nccl_shm", False)
+if not isinstance(disable_nccl_shm, bool):
+    raise SystemExit(f"disable_nccl_shm for {host} must be true or false")
+print("1" if disable_nccl_shm else "0")
 PY
 )
-lora_source_port_list=${lora_source_ports[0]:?operations config has no LoRA source ports}
+lora_source_port_list=${runtime_settings[0]:?operations config has no LoRA source ports}
+disable_nccl_shm=${runtime_settings[1]:?operations config has no NCCL shared-memory setting}
 install -d -o 1000 -g 1000 -m 0755 /data/glm52-rl/lora-cache
 install -d -o 1000 -g 1000 -m 0755 "$deployment/cache/vllm"
 docker update --restart=no glm52-decensor-h200 glm52-decensor-h200-0 glm52-decensor-h200-1 >/dev/null 2>&1 || true
@@ -46,6 +56,7 @@ docker run -d --name glm52-decensor-h200 --restart unless-stopped \
   -e NCCL_SOCKET_IFNAME=eth0 \
   -e GLOO_SOCKET_IFNAME=eth0 \
   -e NCCL_IB_DISABLE=1 \
+  -e NCCL_SHM_DISABLE="$disable_nccl_shm" \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   -e VLLM_ENGINE_READY_TIMEOUT_S=7200 \
   -e PRIME_LORA_DOWNLOAD_STREAMS=32 \
@@ -54,4 +65,4 @@ docker run -d --name glm52-decensor-h200 --restart unless-stopped \
   prime-rl:glm52-v080-glm52-h200-router \
   -lc 'set -e; patch --batch --forward -p1 -d /app/.venv/lib/python3.12/site-packages < /tmp/flashmla_sparse_mtp.patch || grep -q "MIN_HEADS_FOR_BF16_PREFILL = 0" /app/.venv/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/flashmla_sparse.py; exec /app/.venv/bin/inference "$@"' bash \
   @ "$deployment/configs/runtime/glm52-inference.toml" \
-  --vllm-extra '{"gpu_memory_utilization":0.925,"kv_cache_dtype":"fp8","max_num_seqs":128,"max_num_batched_tokens":65536,"compilation_config":{"max_cudagraph_capture_size":256},"speculative_config":{"method":"mtp","num_speculative_tokens":1}}'
+  --vllm-extra '{"gpu_memory_utilization":0.928,"kv_cache_dtype":"fp8","max_num_seqs":128,"max_num_batched_tokens":65536,"compilation_config":{"max_cudagraph_capture_size":128},"speculative_config":{"method":"mtp","num_speculative_tokens":1}}'

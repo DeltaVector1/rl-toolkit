@@ -1,5 +1,5 @@
-output_dir = "/data/glm52-rl/runs/glm52/run_glm52"
-max_steps = 20
+output_dir = "/data/glm52-rl/runs/glm-1/run_glm-1"
+max_steps = 200
 seq_len = 32768
 batch_size = 1024
 group_size = 16
@@ -12,9 +12,9 @@ level = "info"
 
 [swanlab]
 project = "glm-runs"
-name = "orchestrator-glm52"
+name = "orchestrator-glm-1"
 group = "glm-runs"
-tags = ["glm-5.2", "decensor", "grpo", "lora-r32", "20-step"]
+tags = ["glm-1", "glm-5.2", "decensor", "grpo", "lora-r32", "200-step"]
 
 [file_monitor]
 filename = "rollout-metrics.jsonl"
@@ -28,8 +28,8 @@ rank = 32
 alpha = 64
 
 [model.client]
-base_url = ["http://127.0.0.1:8000/v1"]
-admin_base_url = ["http://127.0.0.1:8000/v1"]
+base_url = ["http://127.0.0.1:8000/v1", "http://127.0.0.1:18049/v1"]
+admin_base_url = ["http://127.0.0.1:8000/v1", "http://127.0.0.1:18049/v1"]
 wait_for_ready_timeout = 7200
 skip_model_check = true
 
@@ -75,8 +75,8 @@ max_concurrent_requests = 24
 
 [weight_broadcast]
 type = "filesystem"
-source_url = "http://127.0.0.1:18100/glm52"
-source_dir = "/data/glm52-rl/runs/glm52"
+source_url = "http://127.0.0.1:18100/glm-1"
+source_dir = "/data/glm52-rl/runs/glm-1"
 
 [rollout_transport]
 type = "filesystem"

@@ -79,6 +79,72 @@ for url in config["model"]["client"]["admin_base_url"]:
 PY
 )
 
+operations_file="$deployment/configs/operations.toml"
+if ! peer_settings=$(python3 - "$operations_file" "$config_file" <<'PY'
+import ipaddress
+import re
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as stream:
+    operations = tomllib.load(stream)
+with open(sys.argv[2], "rb") as stream:
+    edge = tomllib.load(stream)
+
+hosts = operations.get("hosts")
+inference_hosts = hosts.get("inference") if isinstance(hosts, dict) else None
+orchestrator = hosts.get("orchestrator") if isinstance(hosts, dict) else None
+if not isinstance(inference_hosts, list) or not all(isinstance(item, str) for item in inference_hosts):
+    raise SystemExit("operations config has no valid inference host list")
+peers = [item for item in inference_hosts if item != orchestrator]
+if len(peers) > 1:
+    raise SystemExit("two-H200 routing supports one inference peer")
+if not peers:
+    print("none - 0 0 - 0 0")
+    raise SystemExit
+
+peer_name = peers[0]
+peer = operations.get("inference", {}).get(peer_name)
+if not isinstance(peer, dict):
+    raise SystemExit(f"inference settings for {peer_name} are missing")
+host = peer.get("ssh_host")
+port = peer.get("ssh_port")
+user = peer.get("ssh_user")
+identity = peer.get("ssh_identity_file")
+api_port = peer.get("api_tunnel_port")
+if not isinstance(host, str):
+    raise SystemExit(f"inference.{peer_name}.ssh_host is missing")
+try:
+    ipaddress.ip_address(host)
+except ValueError as error:
+    raise SystemExit(f"inference.{peer_name}.ssh_host must be an IP address") from error
+if not isinstance(port, int) or not 1 <= port <= 65535:
+    raise SystemExit(f"inference.{peer_name}.ssh_port is invalid")
+if not isinstance(user, str) or re.fullmatch(r"[A-Za-z0-9_.-]+", user) is None:
+    raise SystemExit(f"inference.{peer_name}.ssh_user is invalid")
+if not isinstance(identity, str) or not identity.startswith("/") or any(part in {"", ".", ".."} for part in identity.split("/")[1:]):
+    raise SystemExit(f"inference.{peer_name}.ssh_identity_file is invalid")
+if not isinstance(api_port, int) or not 1 <= api_port <= 65535:
+    raise SystemExit(f"inference.{peer_name}.api_tunnel_port is invalid")
+
+client = edge.get("model", {}).get("client", {})
+urls = []
+for field in ("base_url", "admin_base_url"):
+    value = client.get(field, []) if isinstance(client, dict) else []
+    if isinstance(value, str):
+        urls.append(value)
+    elif isinstance(value, list):
+        urls.extend(item for item in value if isinstance(item, str))
+expected = f"http://127.0.0.1:{api_port}/v1"
+enabled = int(expected in urls)
+print(peer_name, host, port, user, identity, api_port, enabled)
+PY
+); then
+  echo "cannot read the configured inference peer" >&2
+  exit 2
+fi
+read -r peer_name peer_host peer_ssh_port peer_ssh_user peer_ssh_identity peer_api_port peer_enabled <<<"$peer_settings"
+
 if grep -q 'refusals-classifier-eval-v1' "$config_file"; then
   bash "$deployment/.agents/skills/training-ops/runtime/h200/start_refusals_classifier.sh"
 fi
@@ -95,10 +161,51 @@ tunnel() { # local_port  target_host:port  ssh_target  [compress]
     done" >/dev/null 2>&1 < /dev/null &
 }
 
+peer_tunnel() {
+  [ "$peer_enabled" = 1 ] || return 0
+  local signature="-L 127.0.0.1:$peer_api_port:127.0.0.1:8000"
+  pgrep -f -- "$signature" >/dev/null && return 0
+
+  local -a forwards=(
+    -L "127.0.0.1:$peer_api_port:127.0.0.1:8000"
+  )
+  for lora_source_port in "${lora_source_ports[@]}"; do
+    forwards+=(
+      -R "127.0.0.1:$lora_source_port:127.0.0.1:$lora_source_port"
+    )
+  done
+  local -a ssh_args=(
+    -NT
+    -o BatchMode=yes
+    -o IdentitiesOnly=yes
+    -o ConnectTimeout=30
+    -o ExitOnForwardFailure=yes
+    -o ServerAliveInterval=10
+    -o ServerAliveCountMax=3
+    -o TCPKeepAlive=yes
+    -o IPQoS=none
+    -i "$peer_ssh_identity"
+    -p "$peer_ssh_port"
+  )
+  local forward_text ssh_text peer_target
+  forward_text=$(printf ' %q' "${forwards[@]}")
+  ssh_text=$(printf ' %q' "${ssh_args[@]}")
+  peer_target=$(printf '%q' "$peer_ssh_user@$peer_host")
+  setsid nohup bash -c "while true; do
+      ssh$ssh_text$forward_text $peer_target
+      sleep 3
+    done" >/dev/null 2>&1 < /dev/null &
+  echo "peer tunnel :$peer_api_port -> $peer_name:8000; adapter source reverse ports ${lora_source_ports[0]}-${lora_source_ports[-1]}"
+}
+
 for lora_source_port in "${lora_source_ports[@]}"; do
   tunnel "$lora_source_port" "127.0.0.1:$adapter_port" "$trainer_ssh_target" no
 done
+peer_tunnel
 ports=("${lora_source_ports[@]}")
+if [ "$peer_enabled" = 1 ]; then
+  ports+=("$peer_api_port")
+fi
 if [[ " $adapter_admin_urls " == *":18111 "* ]]; then
   tunnel 18101 127.0.0.1:8000 "-p 40051 -i /root/.ssh/china_rollout_ed25519 root@152.236.142.243"
   tunnel 18111 127.0.0.1:8001 "-p 40051 -i /root/.ssh/china_rollout_ed25519 root@152.236.142.243"

@@ -2,7 +2,7 @@
 trainer_head = "n82"
 trainer_ssh = "china-trainer"
 trainers = ["n76", "n77", "n78", "n80", "n82", "n83", "n84", "n85"]
-inference = ["h200a"]
+inference = ["h200a", "h200b"]
 orchestrator = "h200a"
 metrics = ["h200a", "n82"]
 blocked = ["n79"]
@@ -10,6 +10,7 @@ blocked = ["n79"]
 [ports]
 inference_tunnel_first = 18001
 inference_tunnel_last = 18048
+inference_peer = 18049
 lora_source_first = 18100
 lora_source_last = 18131
 judge = 26406
@@ -43,6 +44,24 @@ gpu_count = 8
 tensor_parallel_size = 8
 ports = [8000]
 
+[inference.h200b]
+ssh_host = "146.88.194.6"
+ssh_port = 19023
+ssh_user = "root"
+ssh_identity_file = "/root/.ssh/china_rollout_ed25519"
+api_tunnel_port = 18049
+disable_nccl_shm = true
+
+[inference.h200b.muse]
+gpu_count = 8
+tensor_parallel_size = 1
+ports = [8001, 8002, 8003, 8004, 8005, 8006, 8007, 8008]
+
+[inference.h200b.glm52]
+gpu_count = 8
+tensor_parallel_size = 8
+ports = [8000]
+
 [profiles.current]
 kind = "muse"
 trainer = "configs/current/trainer.toml"
@@ -56,6 +75,10 @@ orchestrator = "configs/paused/glm52/orchestrator.toml"
 [profiles.glm52-native-small]
 kind = "glm52"
 trainer = "configs/qualification/glm52-native-small.toml"
+
+[profiles.glm52-fixed-token]
+kind = "glm52"
+trainer = "configs/qualification/glm52-fixed-token.toml"
 
 [reward]
 minimum_steps = 10
