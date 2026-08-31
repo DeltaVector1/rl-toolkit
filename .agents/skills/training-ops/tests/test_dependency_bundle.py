@@ -47,7 +47,7 @@ class DependencyBundleTest(unittest.TestCase):
         required = [("a.py", ["n76"]), ("nested/b.py", ["n77"])]
         output = io.StringIO()
         with (
-            mock.patch.object(training_ops.subprocess, "run", side_effect=fake_run),
+            mock.patch.object(training_ops, "_run_process", side_effect=fake_run),
             mock.patch.object(training_ops, "_ssh", side_effect=fake_ssh),
             contextlib.redirect_stdout(output),
         ):
@@ -106,7 +106,7 @@ class DependencyBundleTest(unittest.TestCase):
         output = io.StringIO()
         errors = io.StringIO()
         with (
-            mock.patch.object(training_ops.subprocess, "run", side_effect=fake_run),
+            mock.patch.object(training_ops, "_run_process", side_effect=fake_run),
             mock.patch.object(training_ops, "_ssh", side_effect=fake_ssh),
             mock.patch.object(training_ops.time, "sleep"),
             contextlib.redirect_stdout(output),
@@ -145,7 +145,7 @@ class DependencyBundleTest(unittest.TestCase):
         output = io.StringIO()
         errors = io.StringIO()
         with (
-            mock.patch.object(training_ops.subprocess, "run", side_effect=fake_run),
+            mock.patch.object(training_ops, "_run_process", side_effect=fake_run),
             mock.patch.object(training_ops, "_ssh", side_effect=fake_ssh),
             mock.patch.object(training_ops.time, "sleep"),
             contextlib.redirect_stdout(output),
@@ -177,7 +177,7 @@ class DependencyBundleTest(unittest.TestCase):
 
         output = io.StringIO()
         with (
-            mock.patch.object(training_ops.subprocess, "run", side_effect=fail_scp),
+            mock.patch.object(training_ops, "_run_process", side_effect=fail_scp),
             mock.patch.object(training_ops, "_ssh", side_effect=fake_ssh),
             contextlib.redirect_stdout(output),
         ):
@@ -205,7 +205,7 @@ class DependencyBundleTest(unittest.TestCase):
 
         output = io.StringIO()
         with (
-            mock.patch.object(training_ops.subprocess, "run", side_effect=fake_run),
+            mock.patch.object(training_ops, "_run_process", side_effect=fake_run),
             mock.patch.object(training_ops, "_ssh", side_effect=fake_ssh),
             contextlib.redirect_stdout(output),
         ):
@@ -245,7 +245,7 @@ class DependencyBundleTest(unittest.TestCase):
             return training_ops.subprocess.CompletedProcess(command, 0, "", "")
 
         with (
-            mock.patch.object(training_ops.subprocess, "run", side_effect=fake_run),
+            mock.patch.object(training_ops, "_run_process", side_effect=fake_run),
             mock.patch.object(training_ops, "_ssh", side_effect=fake_ssh),
             mock.patch.object(training_ops.time, "sleep"),
             contextlib.redirect_stderr(errors),

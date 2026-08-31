@@ -8,8 +8,10 @@ import hashlib
 import ipaddress
 import json
 import math
+import os
 import re
 import shlex
+import signal
 import statistics
 import subprocess
 import sys
@@ -225,20 +227,46 @@ def _check_host(host: str) -> str:
     return host
 
 
+def _run_process(
+    command: list[str], *, stdin, timeout: int
+) -> subprocess.CompletedProcess:
+    process = subprocess.Popen(
+        command,
+        stdin=stdin,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.communicate()
+        raise
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
 def _ssh(host: str, script: str, timeout: int = 120) -> tuple[int, str]:
     _check_host(host)
     try:
-        p = subprocess.run(
-            ssh_command + [host, script],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
+        result = _run_process(
+            ssh_command + [host, script], stdin=subprocess.DEVNULL, timeout=timeout
         )
-        output = p.stdout if p.returncode == 0 else p.stdout + p.stderr
-        return p.returncode, output
     except subprocess.TimeoutExpired:
         return 124, "TIMEOUT"
+    output = result.stdout if result.returncode == 0 else result.stdout + result.stderr
+    return result.returncode, output
 
 
 def _ssh_address(host: str) -> str:
@@ -1880,13 +1908,7 @@ def _adapter_bucket_run_folder(run: str) -> str:
 
 def _local_command(command: list[str], label: str, timeout: int) -> subprocess.CompletedProcess:
     try:
-        result = subprocess.run(
-            command,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+        result = _run_process(command, stdin=subprocess.DEVNULL, timeout=timeout)
     except FileNotFoundError as error:
         raise RuntimeError(f"{label} is not installed") from error
     except subprocess.TimeoutExpired as error:
@@ -3848,15 +3870,13 @@ def deploy(
 
     def one(h):
         try:
-            mkdir = subprocess.run(
+            mkdir = _run_process(
                 ssh_command
                 + [
                     h,
                     f"mkdir -p {shlex.quote(str(Path(remote).parent))}",
                 ],
                 stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
                 timeout=deployment_mkdir_timeout_seconds,
             )
         except subprocess.TimeoutExpired:
@@ -3865,11 +3885,9 @@ def deploy(
             detail = ((mkdir.stdout or "") + (mkdir.stderr or "")).strip()
             return f"mkdir failed: {detail[:80]}"
         try:
-            p = subprocess.run(
+            p = _run_process(
                 scp_command + [str(local), f"{h}:{remote}"],
                 stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
                 timeout=deployment_scp_timeout_seconds,
             )
         except subprocess.TimeoutExpired:
@@ -4166,11 +4184,9 @@ def _deploy_dependencies(required_files: list[tuple[str, list[str]]]) -> None:
                         ]
                         upload_stdin = bundle.open("rb")
                     try:
-                        uploaded = subprocess.run(
+                        uploaded = _run_process(
                             upload_command,
                             stdin=upload_stdin,
-                            capture_output=True,
-                            text=True,
                             timeout=deployment_bundle_scp_timeout_seconds,
                         )
                     finally:

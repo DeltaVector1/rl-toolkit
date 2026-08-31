@@ -1,4 +1,5 @@
 import sys
+import subprocess
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -42,6 +43,19 @@ class MicrobatchAddressTest(unittest.TestCase):
         with mock.patch.object(training_ops.subprocess, "run", return_value=result):
             with self.assertRaisesRegex(RuntimeError, "not an IP address"):
                 training_ops._ssh_address("n76")
+
+    def test_ssh_timeout_terminates_the_full_process_group(self):
+        process = mock.Mock(pid=4312, returncode=124)
+        process.communicate.side_effect = [
+            subprocess.TimeoutExpired(["ssh"], 1),
+            ("", ""),
+        ]
+        with mock.patch.object(training_ops.subprocess, "Popen", return_value=process) as popen:
+            with mock.patch.object(training_ops.os, "killpg") as killpg:
+                self.assertEqual(training_ops._ssh("n76", "true", timeout=1), (124, "TIMEOUT"))
+
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        killpg.assert_called_once_with(4312, training_ops.signal.SIGTERM)
 
     def test_inference_script_uses_the_run_profile_ports(self):
         glm_script = training_ops._inference_script(
