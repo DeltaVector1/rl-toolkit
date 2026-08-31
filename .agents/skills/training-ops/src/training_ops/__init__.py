@@ -227,6 +227,31 @@ def _check_host(host: str) -> str:
     return host
 
 
+def _ssh_destination(host: str) -> tuple[list[str], list[str], str]:
+    """Return SSH options, SCP options, and the configured destination."""
+    _check_host(host)
+    settings = inference_settings.get(host, {})
+    address = settings.get("ssh_host")
+    if address is None:
+        return [], [], host
+    port = settings.get("ssh_port")
+    user = settings.get("ssh_user")
+    identity = settings.get("ssh_identity_file")
+    if not isinstance(address, str) or not address:
+        raise RuntimeError(f"inference host {host} has an invalid ssh_host")
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        raise RuntimeError(f"inference host {host} has an invalid ssh_port")
+    if not isinstance(user, str) or not user:
+        raise RuntimeError(f"inference host {host} has an invalid ssh_user")
+    if not isinstance(identity, str) or not identity:
+        raise RuntimeError(f"inference host {host} has an invalid ssh_identity_file")
+    return (
+        ["-p", str(port), "-i", identity],
+        ["-P", str(port), "-i", identity],
+        f"{user}@{address}",
+    )
+
+
 def _run_process(
     command: list[str], *, stdin, timeout: int
 ) -> subprocess.CompletedProcess:
@@ -258,10 +283,12 @@ def _run_process(
 
 
 def _ssh(host: str, script: str, timeout: int = 120) -> tuple[int, str]:
-    _check_host(host)
+    ssh_options, _, destination = _ssh_destination(host)
     try:
         result = _run_process(
-            ssh_command + [host, script], stdin=subprocess.DEVNULL, timeout=timeout
+            ssh_command + ssh_options + [destination, script],
+            stdin=subprocess.DEVNULL,
+            timeout=timeout,
         )
     except subprocess.TimeoutExpired:
         return 124, "TIMEOUT"
@@ -271,10 +298,13 @@ def _ssh(host: str, script: str, timeout: int = 120) -> tuple[int, str]:
 
 def _ssh_address(host: str) -> str:
     """Return the IP selected by the configured SSH alias."""
-    _check_host(host)
+    ssh_options, _, destination = _ssh_destination(host)
+    configured = inference_settings.get(host, {}).get("ssh_host")
+    if configured is not None:
+        return configured
     try:
         result = subprocess.run(
-            ssh_command + ["-G", host],
+            ssh_command + ssh_options + ["-G", destination],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
@@ -533,18 +563,21 @@ def _inference_script(
     if not isinstance(gpu_count, int) or gpu_count < 1:
         raise RuntimeError(f"GPU count for {host} is invalid")
     tensor_parallel_size = settings.get("tensor_parallel_size")
+    data_parallel_size = settings.get("data_parallel_size", 1)
     if (
         not isinstance(tensor_parallel_size, int)
         or tensor_parallel_size < 1
-        or gpu_count % tensor_parallel_size
+        or not isinstance(data_parallel_size, int)
+        or data_parallel_size < 1
+        or gpu_count % (tensor_parallel_size * data_parallel_size)
     ):
-        raise RuntimeError(f"tensor parallel size for {host} is invalid")
+        raise RuntimeError(f"parallel sizes for {host} are invalid")
     ports = settings.get("ports")
     if not isinstance(ports, list) or not ports or not all(
         isinstance(port, int) and 1 <= port <= 65535 for port in ports
     ):
         raise RuntimeError(f"inference ports for {host} are invalid")
-    if len(ports) != gpu_count // tensor_parallel_size:
+    if len(ports) != gpu_count // (tensor_parallel_size * data_parallel_size):
         raise RuntimeError(f"inference replica count for {host} is inconsistent")
     return (
         inference_probe.replace("__MODEL__", model)
@@ -3874,11 +3907,13 @@ def deploy(
     remote_mode = "0755" if local.stat().st_mode & 0o111 else "0644"
 
     def one(h):
+        ssh_options, scp_options, destination = _ssh_destination(h)
         try:
             mkdir = _run_process(
                 ssh_command
+                + ssh_options
                 + [
-                    h,
+                    destination,
                     f"mkdir -p {shlex.quote(str(Path(remote).parent))}",
                 ],
                 stdin=subprocess.DEVNULL,
@@ -3891,7 +3926,9 @@ def deploy(
             return f"mkdir failed: {detail[:80]}"
         try:
             p = _run_process(
-                scp_command + [str(local), f"{h}:{remote}"],
+                scp_command
+                + scp_options
+                + [str(local), f"{destination}:{remote}"],
                 stdin=subprocess.DEVNULL,
                 timeout=deployment_scp_timeout_seconds,
             )
@@ -4175,16 +4212,17 @@ def _deploy_dependencies(required_files: list[tuple[str, list[str]]]) -> None:
             for attempt in range(1, 4):
                 result = "failed"
                 stderr = ""
+                ssh_options, scp_options, destination = _ssh_destination(host)
                 try:
                     if attempt == 1:
-                        upload_command = scp_command + [
+                        upload_command = scp_command + scp_options + [
                             str(bundle),
-                            f"{host}:{remote_archive}",
+                            f"{destination}:{remote_archive}",
                         ]
                         upload_stdin = subprocess.DEVNULL
                     else:
-                        upload_command = ssh_command + [
-                            host,
+                        upload_command = ssh_command + ssh_options + [
+                            destination,
                             f"umask 077; cat > {shlex.quote(remote_archive)}",
                         ]
                         upload_stdin = bundle.open("rb")

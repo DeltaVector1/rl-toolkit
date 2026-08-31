@@ -23,10 +23,22 @@ disable_nccl_shm = inference[host].get("disable_nccl_shm", False)
 if not isinstance(disable_nccl_shm, bool):
     raise SystemExit(f"disable_nccl_shm for {host} must be true or false")
 print("1" if disable_nccl_shm else "0")
+glm = inference[host]["glm52"]
+tp = glm.get("tensor_parallel_size")
+dp = glm.get("data_parallel_size", 1)
+gpu_count = glm.get("gpu_count")
+if not all(isinstance(value, int) and value > 0 for value in (tp, dp, gpu_count)):
+    raise SystemExit(f"invalid GLM parallel sizes for {host}")
+if tp * dp != gpu_count:
+    raise SystemExit(f"GLM TP times DP must equal gpu_count for {host}")
+print(tp)
+print(dp)
 PY
 )
 lora_source_port_list=${runtime_settings[0]:?operations config has no LoRA source ports}
 disable_nccl_shm=${runtime_settings[1]:?operations config has no NCCL shared-memory setting}
+tensor_parallel_size=${runtime_settings[2]:?operations config has no GLM tensor parallel size}
+data_parallel_size=${runtime_settings[3]:?operations config has no GLM data parallel size}
 install -d -o 1000 -g 1000 -m 0755 /data/glm52-rl/lora-cache
 install -d -o 1000 -g 1000 -m 0755 "$deployment/cache/vllm"
 docker update --restart=no glm52-decensor-h200 glm52-decensor-h200-0 glm52-decensor-h200-1 >/dev/null 2>&1 || true
@@ -65,4 +77,4 @@ docker run -d --name glm52-decensor-h200 --restart unless-stopped \
   prime-rl:glm52-v080-glm52-h200-router \
   -lc 'set -e; patch --batch --forward -p1 -d /app/.venv/lib/python3.12/site-packages < /tmp/flashmla_sparse_mtp.patch || grep -q "MIN_HEADS_FOR_BF16_PREFILL = 0" /app/.venv/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/flashmla_sparse.py; exec /app/.venv/bin/inference "$@"' bash \
   @ "$deployment/configs/runtime/glm52-inference.toml" \
-  --vllm-extra '{"gpu_memory_utilization":0.928,"kv_cache_dtype":"fp8","max_num_seqs":128,"max_num_batched_tokens":65536,"compilation_config":{"max_cudagraph_capture_size":128},"speculative_config":{"method":"mtp","num_speculative_tokens":1}}'
+  --vllm-extra "{\"tensor_parallel_size\":$tensor_parallel_size,\"data_parallel_size\":$data_parallel_size,\"gpu_memory_utilization\":0.928,\"kv_cache_dtype\":\"fp8\",\"max_num_seqs\":128,\"max_num_batched_tokens\":65536,\"compilation_config\":{\"max_cudagraph_capture_size\":128},\"speculative_config\":{\"method\":\"mtp\",\"num_speculative_tokens\":1}}"
