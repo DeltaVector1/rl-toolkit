@@ -181,8 +181,10 @@ async def load_lora_adapter(lora_request: LoadLoRAAdapterRequest, raw_request: R
             if remote_adapter:
                 source_url = lora_request.lora_path
                 if not prefetched:
-                    await engine_client(raw_request).collective_rpc(
-                        "stage_lora_adapter", args=(source_url, require_delta)
+                    await asyncio.to_thread(
+                        stage_lora_adapter_files,
+                        source_url,
+                        require_delta=require_delta,
                     )
                 lora_request.lora_path = adapter_cache_path(source_url).as_posix()
             lora_request.load_inplace = True

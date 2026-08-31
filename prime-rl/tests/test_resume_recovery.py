@@ -5,6 +5,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CLIENT_PATH = ROOT / "src/prime_rl/utils/client.py"
+ORCHESTRATOR_PATH = ROOT / "src/prime_rl/orchestrator/orchestrator.py"
 SERVER_PATH = ROOT / "src/prime_rl/inference/vllm/server.py"
 
 
@@ -47,6 +48,35 @@ class ResumeRecoveryTest(unittest.TestCase):
         self.assertIn('_set_engine_state("resuming")', source)
         self.assertIn('_set_engine_state("running")', source)
         self.assertIn('_set_engine_state("unknown")', source)
+
+    def test_startup_stages_once_per_host_before_loading(self):
+        source = ORCHESTRATOR_PATH.read_text(encoding="utf-8")
+        setup = ast.get_source_segment(
+            source,
+            next(
+                node
+                for node in ast.walk(ast.parse(source))
+                if isinstance(node, ast.AsyncFunctionDef) and node.name == "setup"
+            ),
+        )
+        stage_at = setup.index("await stage_lora_adapter(")
+        update_at = setup.index("await self.policy_inference.update_weights(", stage_at)
+        self.assertLess(stage_at, update_at)
+        self.assertIn("prefetched=prefetched", setup[update_at:])
+
+    def test_server_fallback_stages_in_the_host_process(self):
+        source = SERVER_PATH.read_text(encoding="utf-8")
+        load = ast.get_source_segment(
+            source,
+            next(
+                node
+                for node in ast.walk(ast.parse(source))
+                if isinstance(node, ast.AsyncFunctionDef) and node.name == "load_lora_adapter"
+            ),
+        )
+        self.assertIn("await asyncio.to_thread(", load)
+        self.assertIn("stage_lora_adapter_files", load)
+        self.assertNotIn('collective_rpc("stage_lora_adapter"', load)
 
 
 if __name__ == "__main__":

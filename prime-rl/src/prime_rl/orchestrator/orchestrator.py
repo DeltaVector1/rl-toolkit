@@ -77,7 +77,12 @@ from prime_rl.trainer.model import setup_tokenizer
 from prime_rl.trainer.rl.broadcast.nixl.model_express import ModelExpressSession
 from prime_rl.transport import TrainingBatch, setup_training_batch_sender
 from prime_rl.utils.async_utils import EventLoopLagMonitor, EventLoopLagStats, safe_cancel
-from prime_rl.utils.client import _delta_stage_timeout_s, init_nccl_broadcast, init_nixl_broadcast
+from prime_rl.utils.client import (
+    _delta_stage_timeout_s,
+    init_nccl_broadcast,
+    init_nixl_broadcast,
+    stage_lora_adapter,
+)
 from prime_rl.utils.config import to_toml_dict
 from prime_rl.utils.heartbeat import Heartbeat
 from prime_rl.utils.logger import format_time, get_logger, setup_logger
@@ -548,12 +553,20 @@ class Orchestrator:
             if self.model_express is not None:
                 await asyncio.to_thread(self.model_express.set_status, p2p_pb2.SOURCE_STATUS_READY)
             require_delta = self.lora_name is not None and sync_version > 0
+            prefetched = False
+            if self.lora_name is not None and isinstance(weights_path, str):
+                await stage_lora_adapter(
+                    self.policy_inference.admin_clients,
+                    weights_path,
+                    require_delta=require_delta,
+                )
+                prefetched = True
             await self.policy_inference.update_weights(
                 weights_path,
                 lora_name=self.lora_name,
                 step=sync_version,
                 require_delta=require_delta,
-                prefetched=False,
+                prefetched=prefetched,
             )
             if self.model_express is not None:
                 await asyncio.to_thread(self.model_express.set_status, p2p_pb2.SOURCE_STATUS_INITIALIZING)
