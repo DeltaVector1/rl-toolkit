@@ -762,8 +762,8 @@ def _is_retryable_lora_error(exception: BaseException) -> bool:
 # Adapter files cross the control tunnel before vLLM loads them. A rank-32 GLM
 # adapter is about 28.5 GiB, so staging needs a longer transport budget than
 # the local adapter load.
-LORA_LOAD_READ_TIMEOUT_S = 300.0
-LORA_LOAD_TOTAL_TIMEOUT_S = 600.0
+LORA_LOAD_READ_TIMEOUT_S = 900.0
+LORA_LOAD_TOTAL_TIMEOUT_S = 1200.0
 LORA_STAGE_ATTEMPT_TIMEOUT_S = 3600.0
 LORA_STAGE_TOTAL_TIMEOUT_S = 7200.0
 
