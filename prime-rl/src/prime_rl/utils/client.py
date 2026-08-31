@@ -583,11 +583,14 @@ async def stage_lora_adapter(
     if not admin_clients:
         raise RuntimeError("cannot stage an adapter without an inference endpoint")
 
-    def host_key(client: AsyncClient) -> tuple[str, str]:
+    def host_key(client: AsyncClient) -> tuple[str, str, int | None]:
         url = client.base_url
-        return (url.scheme, url.host or str(url))
+        effective_port = url.port
+        if effective_port is None:
+            effective_port = {"http": 80, "https": 443}.get(url.scheme)
+        return (url.scheme, url.host or str(url), effective_port)
 
-    hosts: dict[tuple[str, str], AsyncClient] = {}
+    hosts: dict[tuple[str, str, int | None], AsyncClient] = {}
     for client in admin_clients:
         hosts.setdefault(host_key(client), client)
 
