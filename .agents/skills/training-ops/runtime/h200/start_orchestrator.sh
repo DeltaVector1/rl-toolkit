@@ -161,19 +161,12 @@ tunnel() { # local_port  target_host:port  ssh_target  [compress]
     done" >/dev/null 2>&1 < /dev/null &
 }
 
-peer_tunnel() {
-  [ "$peer_enabled" = 1 ] || return 0
-  local signature="-L 127.0.0.1:$peer_api_port:127.0.0.1:8000"
+peer_tunnel_connection() {
+  local connection_name=$1 signature=$2
+  shift 2
+  local -a forwards=("$@")
   pgrep -f -- "$signature" >/dev/null && return 0
 
-  local -a forwards=(
-    -L "127.0.0.1:$peer_api_port:127.0.0.1:8000"
-  )
-  for lora_source_port in "${lora_source_ports[@]}"; do
-    forwards+=(
-      -R "127.0.0.1:$lora_source_port:127.0.0.1:$lora_source_port"
-    )
-  done
   local -a ssh_args=(
     -NT
     -o BatchMode=yes
@@ -187,15 +180,65 @@ peer_tunnel() {
     -i "$peer_ssh_identity"
     -p "$peer_ssh_port"
   )
-  local forward_text ssh_text peer_target
+  local forward_text ssh_text peer_target marker
   forward_text=$(printf ' %q' "${forwards[@]}")
   ssh_text=$(printf ' %q' "${ssh_args[@]}")
   peer_target=$(printf '%q' "$peer_ssh_user@$peer_host")
+  marker="peer-tunnel-$connection_name"
   setsid nohup bash -c "while true; do
       ssh$ssh_text$forward_text $peer_target
       sleep 3
-    done" >/dev/null 2>&1 < /dev/null &
-  echo "peer tunnel :$peer_api_port -> $peer_name:8000; adapter source reverse ports ${lora_source_ports[0]}-${lora_source_ports[-1]}"
+    done # $marker" >/dev/null 2>&1 < /dev/null &
+}
+
+peer_tunnel_remove_legacy() {
+  local api_signature="-L 127.0.0.1:$peer_api_port:127.0.0.1:8000"
+  local reverse_signature="-R 127.0.0.1:${lora_source_ports[0]}:127.0.0.1:${lora_source_ports[0]}"
+  local pid command_line pgid
+  for pid in $(pgrep -f -- "$api_signature" || true); do
+    command_line=$(ps -o args= -p "$pid" 2>/dev/null || true)
+    case "$command_line" in
+      *"$reverse_signature"*)
+        pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
+        case "$pgid" in
+          ''|*[!0-9]*|0|1|"$$") kill "$pid" 2>/dev/null || true ;;
+          *) kill -- "-$pgid" 2>/dev/null || true ;;
+        esac
+        sleep 1
+        return 0
+        ;;
+    esac
+  done
+}
+
+peer_tunnel() {
+  [ "$peer_enabled" = 1 ] || return 0
+  peer_tunnel_remove_legacy
+  peer_tunnel_connection "api" \
+    "-L 127.0.0.1:$peer_api_port:127.0.0.1:8000" \
+    -L "127.0.0.1:$peer_api_port:127.0.0.1:8000"
+
+  # Keep each SSH cipher worker to four source ports. This gives the 32
+  # concurrent HTTP lanes independent encryption workers without creating one
+  # SSH connection for every port.
+  local peer_lane_size=4
+  local lane_start=0 lane_number=0
+  local -a lane_ports lane_forwards
+  while [ "$lane_start" -lt "${#lora_source_ports[@]}" ]; do
+    lane_ports=("${lora_source_ports[@]:lane_start:peer_lane_size}")
+    lane_forwards=()
+    for lora_source_port in "${lane_ports[@]}"; do
+      lane_forwards+=(
+        -R "127.0.0.1:$lora_source_port:127.0.0.1:$lora_source_port"
+      )
+    done
+    peer_tunnel_connection "lora-$lane_number" \
+      "-R 127.0.0.1:${lane_ports[0]}:127.0.0.1:${lane_ports[0]}" \
+      "${lane_forwards[@]}"
+    lane_start=$((lane_start + peer_lane_size))
+    lane_number=$((lane_number + 1))
+  done
+  echo "peer tunnel :$peer_api_port -> $peer_name:8000; adapter source reverse ports ${lora_source_ports[0]}-${lora_source_ports[-1]} in $lane_number SSH lanes"
 }
 
 for lora_source_port in "${lora_source_ports[@]}"; do

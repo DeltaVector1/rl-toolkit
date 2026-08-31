@@ -3144,25 +3144,65 @@ esac
 """
 
 
-def _start_or_restart_orchestrator_script(container: str, was_running: bool) -> str:
-    """Resume the exact container state observed by the guarded repair."""
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+", container):
-        raise Refused(f"orchestrator container name is invalid: {container!r}")
+def _recreate_orchestrator_script(
+    run: str, profile: dict, was_running: bool
+) -> str:
+    """Recreate only the exact orchestrator with the active run settings."""
+    if not isinstance(run, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", run):
+        raise Refused(f"orchestrator run name is invalid: {run!r}")
+    if not isinstance(profile, dict):
+        raise Refused("orchestrator profile must be a mapping")
+    orchestrator_config = profile.get("orchestrator")
+    if not isinstance(orchestrator_config, str):
+        raise Refused(f"active profile for {run} has no orchestrator config")
+    config_path = PurePosixPath(orchestrator_config)
+    if (
+        config_path.is_absolute()
+        or config_path.as_posix() != orchestrator_config
+        or ".." in config_path.parts
+        or not (repo_root / config_path).is_file()
+    ):
+        raise Refused(f"active orchestrator config is unsafe: {orchestrator_config!r}")
     if not isinstance(was_running, bool):
         raise Refused("orchestrator running state must be a boolean")
-    quoted = shlex.quote(container)
+    for name, value in (
+        ("trainer", trainer_container),
+        ("orchestrator", orchestrator_container),
+    ):
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", value):
+            raise Refused(f"{name} container name is invalid: {value!r}")
+    trainer_nodes = [host for host in trainer_hosts if host not in blocked_hosts]
+    if trainer_head not in trainer_nodes:
+        raise Refused("configured trainer head is not in the active trainer hosts")
+    trainer_addresses = " ".join(_ssh_address(host) for host in trainer_nodes)
+    if not trainer_addresses:
+        raise Refused("configured trainer addresses are empty")
+
     expected = "true" if was_running else "false"
-    action = "restart --time 30" if was_running else "start"
-    verb = "restarted" if was_running else "started"
+    quoted_orchestrator = shlex.quote(orchestrator_container)
+    quoted_run = shlex.quote(run)
+    quoted_run_name = shlex.quote(f"run_{run}")
+    quoted_config = shlex.quote(f"{remote_repo}/{orchestrator_config}")
+    quoted_addresses = shlex.quote(trainer_addresses)
+    quoted_trainer = shlex.quote(trainer_container)
+    quoted_launcher = shlex.quote(orchestrator_launcher)
     return f"""set -euo pipefail
-container={quoted}
+container={quoted_orchestrator}
 name=$(sudo docker inspect --format '{{{{.Name}}}}' "$container" 2>/dev/null || true)
 [ "$name" = "/$container" ] || {{ echo "configured orchestrator container identity is not exact" >&2; exit 61; }}
 state=$(sudo docker inspect --format '{{{{.State.Running}}}}' "$container" 2>/dev/null || true)
-[ "$state" = {expected} ] || {{ echo "orchestrator state changed before repair resume" >&2; exit 62; }}
-sudo docker {action} "$container" >/dev/null
-test "$(sudo docker inspect --format '{{{{.State.Running}}}}' "$container" 2>/dev/null)" = true
-echo "{verb} exact orchestrator container $container"
+[ "$state" = {expected} ] || {{ echo "orchestrator state changed before recreation" >&2; exit 62; }}
+sudo docker rm -f "$container" >/dev/null
+RUN={quoted_run} RUN_NAME={quoted_run_name} \\
+  ORCH_CONFIG={quoted_config} \\
+  TRAINER_ADDRESSES={quoted_addresses} \\
+  TRAINER_CT={quoted_trainer} ORCH_CT={quoted_orchestrator} \\
+  bash {quoted_launcher}
+name=$(sudo docker inspect --format '{{{{.Name}}}}' "$container" 2>/dev/null || true)
+[ "$name" = "/$container" ] || {{ echo "recreated orchestrator container identity is not exact" >&2; exit 63; }}
+state=$(sudo docker inspect --format '{{{{.State.Running}}}}' "$container" 2>/dev/null || true)
+[ "$state" = true ] || {{ echo "recreated orchestrator container is not running" >&2; exit 64; }}
+echo "recreated exact orchestrator container $container"
 """
 
 
@@ -3189,6 +3229,7 @@ def repair(what: str) -> str:
 
 def _repair_adapter_update() -> str:
     run = current_run()
+    profile = _profile_for_run(run)
     config = _adapter_update_config(run)
     before = status(run, quiet=True)
     if not before.trainer_up or before.trainer_failed:
@@ -3321,14 +3362,12 @@ def _repair_adapter_update() -> str:
 
     resume_code, resume_output = _ssh(
         orchestrator_host,
-        _start_or_restart_orchestrator_script(
-            orchestrator_container, orchestrator_was_running
-        ),
+        _recreate_orchestrator_script(run, profile, orchestrator_was_running),
         timeout=180,
     )
     if resume_code:
         raise RuntimeError(f"orchestrator resume failed: {resume_output.strip()}")
-    resume_action = "restarted" if orchestrator_was_running else "started"
+    resume_action = "recreated"
     result = (
         f"adapter update repaired for {run}: {evidence}; stopped exact prefetch processes; "
         "deployed transfer timeout and host staging lock; "
@@ -3421,12 +3460,12 @@ def _repair_orchestrator() -> str:
         raise RuntimeError(f"orchestrator repair deployment failed for {client_path}")
     resume_code, resume_output = _ssh(
         orchestrator_host,
-        _start_or_restart_orchestrator_script(orchestrator_container, was_running),
+        _recreate_orchestrator_script(run, profile, was_running),
         timeout=180,
     )
     if resume_code:
         raise RuntimeError(f"orchestrator resume failed: {resume_output.strip()}")
-    action = "restarted" if was_running else "started"
+    action = "recreated"
     result = (
         f"{action} exact orchestrator {orchestrator_container} for {run}; "
         "trainer was idle, rollout requests were zero, inference health/liveness "

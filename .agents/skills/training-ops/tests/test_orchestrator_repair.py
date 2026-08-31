@@ -37,18 +37,64 @@ class OrchestratorRepairTest(unittest.TestCase):
                 return 0, "started exact orchestrator container glm52-decensor-orchestrator\n"
             return 0, ""
 
-        with mock.patch.object(training_ops, "current_run", return_value="glm52"), mock.patch.object(
+        with mock.patch.object(training_ops, "current_run", return_value="glm-1"), mock.patch.object(
             training_ops, "status", return_value=before
         ), mock.patch.object(training_ops, "deploy", return_value=True) as deploy:
-            with mock.patch.object(training_ops, "_ssh", side_effect=fake_ssh):
+            with mock.patch.object(training_ops, "_ssh", side_effect=fake_ssh), mock.patch.object(
+                training_ops, "_ssh_address", side_effect=lambda host: f"addr-{host}"
+            ):
                 result = training_ops._repair_orchestrator()
 
-        self.assertIn("started exact orchestrator", result)
+        self.assertIn("recreated exact orchestrator", result)
         deploy.assert_called_once_with("prime-rl/src/prime_rl/utils/client.py")
         self.assertIn("/health", ssh_scripts[1][0])
         self.assertIn("/liveness", ssh_scripts[1][0])
         self.assertIn("/staging_status", ssh_scripts[1][0])
-        self.assertIn("sudo docker start", ssh_scripts[-1][0])
+        self.assertIn('sudo docker rm -f "$container"', ssh_scripts[-1][0])
+        self.assertIn("bash /data/glm52-rl/deployment/.agents/skills/training-ops/runtime/h200/start_orchestrator.sh", ssh_scripts[-1][0])
+        self.assertNotIn("sudo docker start", ssh_scripts[-1][0])
+        self.assertNotIn("sudo docker restart", ssh_scripts[-1][0])
+        self.assertIn("RUN=glm-1", ssh_scripts[-1][0])
+        self.assertIn("RUN_NAME=run_glm-1", ssh_scripts[-1][0])
+        self.assertIn(
+            "ORCH_CONFIG=/data/glm52-rl/deployment/configs/paused/glm52/orchestrator.toml",
+            ssh_scripts[-1][0],
+        )
+        self.assertIn("TRAINER_CT=glm52-decensor-trainer", ssh_scripts[-1][0])
+        self.assertIn("ORCH_CT=glm52-decensor-orchestrator", ssh_scripts[-1][0])
+
+    def test_recreate_script_uses_active_profile_and_exact_launcher(self):
+        with mock.patch.object(
+            training_ops, "_ssh_address", side_effect=lambda host: f"addr-{host}"
+        ):
+            script = training_ops._recreate_orchestrator_script(
+                "glm52",
+                {
+                    "kind": "glm52",
+                    "orchestrator": "configs/paused/glm52/orchestrator.toml",
+                },
+                was_running=True,
+            )
+
+        self.assertIn("RUN=glm52", script)
+        self.assertIn("RUN_NAME=run_glm52", script)
+        self.assertIn(
+            "ORCH_CONFIG=/data/glm52-rl/deployment/configs/paused/glm52/orchestrator.toml",
+            script,
+        )
+        self.assertIn(
+            "TRAINER_ADDRESSES='addr-n76 addr-n77 addr-n78 addr-n80 addr-n82 addr-n83 addr-n84 addr-n85'",
+            script,
+        )
+        self.assertIn("TRAINER_CT=glm52-decensor-trainer", script)
+        self.assertIn("ORCH_CT=glm52-decensor-orchestrator", script)
+        self.assertIn(
+            "bash /data/glm52-rl/deployment/.agents/skills/training-ops/runtime/h200/start_orchestrator.sh",
+            script,
+        )
+        self.assertIn('sudo docker rm -f "$container"', script)
+        self.assertNotIn("sudo docker start", script)
+        self.assertNotIn("sudo docker restart", script)
 
     def test_busy_trainer_is_refused_before_deployment(self):
         before = training_ops.Status(
@@ -56,7 +102,7 @@ class OrchestratorRepairTest(unittest.TestCase):
             orch_up=False,
             nodes=[training_ops.NodeState(host="n82", gpu_util=80, reachable=True)],
         )
-        with mock.patch.object(training_ops, "current_run", return_value="glm52"), mock.patch.object(
+        with mock.patch.object(training_ops, "current_run", return_value="glm-1"), mock.patch.object(
             training_ops, "status", return_value=before
         ), mock.patch.object(training_ops, "deploy") as deploy:
             with self.assertRaisesRegex(training_ops.Refused, "idle or waiting"):

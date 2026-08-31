@@ -10,12 +10,12 @@ import training_ops
 
 class AdapterUpdateTest(unittest.TestCase):
     def test_config_uses_the_active_glm_profile(self):
-        config = training_ops._adapter_update_config("glm52")
+        config = training_ops._adapter_update_config("glm-1")
         self.assertEqual(config["kind"], "glm52")
         self.assertEqual(config["engine_container"], "glm52-decensor-h200")
         self.assertEqual(config["ports"], [8000])
-        self.assertEqual(config["run_marker"], "/glm52/")
-        self.assertEqual(config["service_marker"], "/run_glm52/")
+        self.assertEqual(config["run_marker"], "/glm-1/")
+        self.assertEqual(config["service_marker"], "/run_glm-1/")
 
     def test_stage_log_requires_a_transfer_timeout(self):
         good = "Failed to apply policy update 4\nReadTimeout /stage_lora_adapter"
@@ -84,15 +84,21 @@ class AdapterUpdateTest(unittest.TestCase):
             engines=[
                 training_ops.EngineState(
                     host="h200a", gen_code="200", probes_ok=1, probes_total=1
-                )
+                ),
+                training_ops.EngineState(
+                    host="h200b", gen_code="200", probes_ok=1, probes_total=1
+                ),
             ],
         )
         fan_results = iter(
             [
-                {"h200a": (0, "idle")},
-                {"h200a": (0, "stopped 0")},
-                {"h200a": (0, "adapter engine ready")},
-                {"h200a": (0, "idle")},
+                {"h200a": (0, "idle"), "h200b": (0, "idle")},
+                {"h200a": (0, "stopped 0"), "h200b": (0, "stopped 0")},
+                {
+                    "h200a": (0, "adapter engine ready"),
+                    "h200b": (0, "adapter engine ready"),
+                },
+                {"h200a": (0, "idle"), "h200b": (0, "idle")},
             ]
         )
         ssh_scripts = []
@@ -103,7 +109,7 @@ class AdapterUpdateTest(unittest.TestCase):
                 return 0, "stopped\n"
             return 0, ""
 
-        with mock.patch.object(training_ops, "current_run", return_value="glm52"), mock.patch.object(
+        with mock.patch.object(training_ops, "current_run", return_value="glm-1"), mock.patch.object(
             training_ops, "status", return_value=before
         ), mock.patch.object(
             training_ops, "_adapter_stage_evidence", return_value="Failed to apply policy update 4"
@@ -111,12 +117,27 @@ class AdapterUpdateTest(unittest.TestCase):
             training_ops, "_fan", side_effect=lambda *_args, **_kwargs: next(fan_results)
         ), mock.patch.object(training_ops, "deploy", return_value=True), mock.patch.object(
             training_ops, "_ssh", side_effect=ssh
+        ), mock.patch.object(
+            training_ops, "_ssh_address", side_effect=lambda host: f"addr-{host}"
         ):
             result = training_ops._repair_adapter_update()
 
-        self.assertIn("started exact orchestrator", result)
+        self.assertIn("recreated exact orchestrator", result)
         resume_script = ssh_scripts[-1]
-        self.assertIn("sudo docker start", resume_script)
+        self.assertIn('sudo docker rm -f "$container"', resume_script)
+        self.assertIn(
+            "bash /data/glm52-rl/deployment/.agents/skills/training-ops/runtime/h200/start_orchestrator.sh",
+            resume_script,
+        )
+        self.assertIn("RUN=glm-1", resume_script)
+        self.assertIn("RUN_NAME=run_glm-1", resume_script)
+        self.assertIn(
+            "ORCH_CONFIG=/data/glm52-rl/deployment/configs/paused/glm52/orchestrator.toml",
+            resume_script,
+        )
+        self.assertIn("TRAINER_CT=glm52-decensor-trainer", resume_script)
+        self.assertIn("ORCH_CT=glm52-decensor-orchestrator", resume_script)
+        self.assertNotIn("sudo docker start", resume_script)
         self.assertNotIn("sudo docker restart", resume_script)
 
     def test_stopped_status_refuses_if_container_is_running(self):
@@ -129,7 +150,7 @@ class AdapterUpdateTest(unittest.TestCase):
                 )
             ],
         )
-        with mock.patch.object(training_ops, "current_run", return_value="glm52"), mock.patch.object(
+        with mock.patch.object(training_ops, "current_run", return_value="glm-1"), mock.patch.object(
             training_ops, "status", return_value=before
         ), mock.patch.object(training_ops, "_ssh", return_value=(0, "running\n")), mock.patch.object(
             training_ops, "_adapter_stage_evidence"
@@ -145,7 +166,7 @@ class AdapterUpdateTest(unittest.TestCase):
             orch_up=False,
             nodes=[training_ops.NodeState(host="n82", gpu_util=80)],
         )
-        with mock.patch.object(training_ops, "current_run", return_value="glm52"), mock.patch.object(
+        with mock.patch.object(training_ops, "current_run", return_value="glm-1"), mock.patch.object(
             training_ops, "status", return_value=before
         ), mock.patch.object(training_ops, "_ssh") as ssh, mock.patch.object(
             training_ops, "_adapter_stage_evidence"
@@ -162,7 +183,7 @@ class AdapterUpdateTest(unittest.TestCase):
             calls.append(script)
             return 0, "issued"
 
-        with mock.patch.object(training_ops, "current_run", return_value="glm52"), mock.patch.object(
+        with mock.patch.object(training_ops, "current_run", return_value="glm-1"), mock.patch.object(
             training_ops, "_ssh", side_effect=ssh
         ):
             result = training_ops._repair_engine("h200a")
@@ -181,18 +202,24 @@ class AdapterUpdateTest(unittest.TestCase):
             engines=[
                 training_ops.EngineState(
                     host="h200a", gen_code="200", probes_ok=1, probes_total=1
-                )
+                ),
+                training_ops.EngineState(
+                    host="h200b", gen_code="200", probes_ok=1, probes_total=1
+                ),
             ],
         )
         fan_results = iter(
             [
-                {"h200a": (0, "idle")},
-                {"h200a": (0, "stopped 0")},
-                {"h200a": (0, "adapter engine ready")},
-                {"h200a": (0, "idle")},
+                {"h200a": (0, "idle"), "h200b": (0, "idle")},
+                {"h200a": (0, "stopped 0"), "h200b": (0, "stopped 0")},
+                {
+                    "h200a": (0, "adapter engine ready"),
+                    "h200b": (0, "adapter engine ready"),
+                },
+                {"h200a": (0, "idle"), "h200b": (0, "idle")},
             ]
         )
-        with mock.patch.object(training_ops, "current_run", return_value="glm52"), mock.patch.object(
+        with mock.patch.object(training_ops, "current_run", return_value="glm-1"), mock.patch.object(
             training_ops, "status", return_value=before
         ), mock.patch.object(
             training_ops, "_adapter_stage_evidence", return_value="Failed to apply policy update 4"
@@ -211,7 +238,7 @@ class AdapterUpdateTest(unittest.TestCase):
 
     def test_prefetch_script_only_signals_exact_curl_or_timeout(self):
         script = training_ops._adapter_prefetch_stop_script(
-            "/glm52/", "/run_glm52/", "/data/glm52-rl/runs/glm52/run_glm52"
+            "/glm-1/", "/run_glm-1/", "/data/glm52-rl/runs/glm-1/run_glm-1"
         )
         self.assertIn("case \"${exe##*/}\" in curl|timeout", script)
         self.assertIn("stage_lora_adapter", script)
@@ -221,7 +248,7 @@ class AdapterUpdateTest(unittest.TestCase):
 
     def test_repair_refuses_before_any_mutation_when_trainer_is_down(self):
         unhealthy = training_ops.Status(trainer_up=False, orch_up=True)
-        with mock.patch.object(training_ops, "current_run", return_value="glm52"), mock.patch.object(
+        with mock.patch.object(training_ops, "current_run", return_value="glm-1"), mock.patch.object(
             training_ops, "status", return_value=unhealthy
         ), mock.patch.object(training_ops, "_adapter_stage_evidence") as evidence, mock.patch.object(
             training_ops, "deploy"
