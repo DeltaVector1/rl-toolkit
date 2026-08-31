@@ -110,7 +110,7 @@ if not isinstance(peer, dict):
 host = peer.get("ssh_host")
 port = peer.get("ssh_port")
 user = peer.get("ssh_user")
-identity = peer.get("ssh_identity_file")
+identity = peer.get("peer_ssh_identity_file")
 api_port = peer.get("api_tunnel_port")
 if not isinstance(host, str):
     raise SystemExit(f"inference.{peer_name}.ssh_host is missing")
@@ -123,7 +123,7 @@ if not isinstance(port, int) or not 1 <= port <= 65535:
 if not isinstance(user, str) or re.fullmatch(r"[A-Za-z0-9_.-]+", user) is None:
     raise SystemExit(f"inference.{peer_name}.ssh_user is invalid")
 if not isinstance(identity, str) or not identity.startswith("/") or any(part in {"", ".", ".."} for part in identity.split("/")[1:]):
-    raise SystemExit(f"inference.{peer_name}.ssh_identity_file is invalid")
+    raise SystemExit(f"inference.{peer_name}.peer_ssh_identity_file is invalid")
 if not isinstance(api_port, int) or not 1 <= api_port <= 65535:
     raise SystemExit(f"inference.{peer_name}.api_tunnel_port is invalid")
 

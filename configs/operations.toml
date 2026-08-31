@@ -50,6 +50,7 @@ ssh_host = "38.255.28.19"
 ssh_port = 20099
 ssh_user = "root"
 ssh_identity_file = "/home/mango/.ssh/h200_rollout_ed25519"
+peer_ssh_identity_file = "/data/trinity/h200_rollout_ed25519"
 api_tunnel_port = 18049
 disable_nccl_shm = false
 
