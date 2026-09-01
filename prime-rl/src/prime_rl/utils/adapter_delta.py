@@ -475,7 +475,7 @@ def _predictive_mask_indices(mask: bytes, count: int, nonzero_count: int) -> np.
     return indices
 
 
-def decode_predictive_chunk(
+def _decode_predictive_chunk_with_correction(
     base2: bytes,
     base1: bytes,
     payload: bytes,
@@ -483,8 +483,7 @@ def decode_predictive_chunk(
     data_offset: int,
     *,
     max_output_size: int | None = None,
-) -> bytes:
-    """Decode one predictive chunk without trusting unbounded payload sizes."""
+) -> tuple[bytes, bytes]:
     header, mask_payload, values_payload = _predictive_payload_parts(payload)
     _, _, _, _, raw_size, payload_offset, payload_data_offset, unit_count, nonzero_count, _, _ = header
     if payload_offset != global_offset or payload_data_offset != data_offset:
@@ -523,7 +522,28 @@ def decode_predictive_chunk(
         ).astype(np.uint32)
         words = (predictor + signed[prefix_size:]) & np.uint32(0xFFFF)
         output[local_data_start:local_data_end] = words.astype("<u2").tobytes()
-    return bytes(output)
+    return bytes(output), values
+
+
+def decode_predictive_chunk(
+    base2: bytes,
+    base1: bytes,
+    payload: bytes,
+    global_offset: int,
+    data_offset: int,
+    *,
+    max_output_size: int | None = None,
+) -> bytes:
+    """Decode one predictive chunk without trusting unbounded payload sizes."""
+    target, _ = _decode_predictive_chunk_with_correction(
+        base2,
+        base1,
+        payload,
+        global_offset,
+        data_offset,
+        max_output_size=max_output_size,
+    )
+    return target
 
 
 def predictive_raw_sha256(payload: bytes) -> str:
@@ -562,7 +582,7 @@ def decode_linear_zigzag_sparse_chunk(
     """Decode the v2 transport API used by the inference worker."""
     if codec != _codec_name():
         raise ValueError("predictive chunk codec must be zstd")
-    target = decode_predictive_chunk(
+    return _decode_predictive_chunk_with_correction(
         base2,
         base1,
         payload,
@@ -570,7 +590,6 @@ def decode_linear_zigzag_sparse_chunk(
         data_offset,
         max_output_size=raw_size,
     )
-    return target, predictive_correction_bytes(payload)
 
 
 def _read_safetensors_header(path: Path) -> tuple[int, dict[str, Any], int]:

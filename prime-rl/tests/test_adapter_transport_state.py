@@ -326,6 +326,36 @@ class AdapterTransportStateTest(unittest.TestCase):
         self.assertIn('manifest.get("version") != 1', watcher_source)
         self.assertIn("next_step > 0", watcher_source)
 
+    def test_delta_cleanup_waits_for_relay_reader(self):
+        filesystem = load_filesystem_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            destination = root / "adapter"
+            partial = root / "adapter.partial"
+            partial.mkdir()
+            (partial / "RELAYING").write_text("relaying\n", encoding="utf-8")
+            lock_path = filesystem._adapter_reader_lock(destination)
+            lock_path.touch()
+            with lock_path.open("a+") as reader:
+                filesystem.fcntl.flock(reader, filesystem.fcntl.LOCK_SH)
+                result = []
+                cleanup = threading.Thread(
+                    target=lambda: result.append(
+                        filesystem._cleanup_delta_stage_artifacts(
+                            destination,
+                            deadline=time.monotonic() + 1.0,
+                        )
+                    )
+                )
+                cleanup.start()
+                time.sleep(0.05)
+                self.assertTrue(partial.is_dir())
+                filesystem.fcntl.flock(reader, filesystem.fcntl.LOCK_UN)
+            cleanup.join(timeout=2.0)
+            self.assertFalse(cleanup.is_alive())
+            self.assertEqual(result, [True])
+            self.assertFalse(partial.exists())
+
     def test_download_stream_count_is_required_and_bounded(self):
         filesystem = load_filesystem_module()
         old_value = os.environ.get("PRIME_LORA_DOWNLOAD_STREAMS")

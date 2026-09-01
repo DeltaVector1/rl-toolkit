@@ -54,6 +54,36 @@ class PredictiveAdapterCodecTest(unittest.TestCase):
             self.assertEqual(restored, target[offset:end])
             self.assertEqual(len(payload[: adapter_delta._predictive_header_size]), 64)
 
+    def test_linear_decoder_decompresses_mask_and_values_once(self):
+        base2 = safetensor_bytes([0x3F80, 0x4000, 0x4040, 0x4080])
+        base1 = safetensor_bytes([0x4000, 0x4040, 0x4080, 0x40A0])
+        target = safetensor_bytes([0x4040, 0x4080, 0x40A0, 0x40C0])
+        payload = adapter_delta.encode_predictive_chunk(base2, base1, target, 0, 16)
+        calls = []
+        original_decompress = adapter_delta._decompress_bounded
+
+        def counted_decompress(value, expected_size, *, maximum):
+            calls.append((len(value), expected_size, maximum))
+            return original_decompress(value, expected_size, maximum=maximum)
+
+        adapter_delta._decompress_bounded = counted_decompress
+        try:
+            restored, correction = adapter_delta.decode_linear_zigzag_sparse_chunk(
+                base2,
+                base1,
+                payload,
+                offset=0,
+                data_offset=16,
+                raw_size=len(target),
+                codec=adapter_delta._codec_name(),
+            )
+        finally:
+            adapter_delta._decompress_bounded = original_decompress
+
+        self.assertEqual(restored, target)
+        self.assertEqual(correction, adapter_delta.predictive_correction_bytes(payload))
+        self.assertEqual(len(calls), 2)
+
     def test_predictive_chunk_accepts_an_all_zero_residual(self):
         base = safetensor_bytes([0x3F80, 0x4000])
         payload = adapter_delta.encode_predictive_chunk(base, base, base, 0, 16)

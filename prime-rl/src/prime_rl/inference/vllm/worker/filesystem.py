@@ -1586,8 +1586,6 @@ def _stage_chunked_linear_adapter(
         cancel_event=cancel_event,
         retry_http_statuses={404, 503},
     )
-    if _sha256(config_incoming_path, deadline, cancel_event) != config_sha256:
-        raise OSError("version-two adapter configuration checksum mismatch")
     os.replace(config_incoming_path, config_path)
 
     # The origin publishes the exact v2 index before transfer workers start.
@@ -1684,8 +1682,6 @@ def _stage_chunked_linear_adapter(
             retry_http_statuses={404, 503},
         )
         _check_deadline(deadline, cancel_event)
-        if _sha256(incoming_path, deadline, cancel_event) != wire_sha256:
-            raise OSError("version-two adapter transport chunk checksum mismatch")
         os.replace(incoming_path, chunk_path)
         encoded = chunk_path.read_bytes()
         if len(encoded) != wire_size or _sha256(chunk_path, deadline, cancel_event) != wire_sha256:
@@ -1825,20 +1821,46 @@ def _stage_chunked_linear_adapter(
     return destination
 
 
-def _cleanup_delta_stage_artifacts(destination: Path, *, preserve_partial: bool = False) -> None:
+def _cleanup_delta_stage_artifacts(
+    destination: Path,
+    *,
+    preserve_partial: bool = False,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+) -> bool:
     """Remove private delta staging paths after all transfer workers stop."""
     suffixes = (".parts", ".assembling")
     if not preserve_partial:
         suffixes = (".partial", *suffixes)
-    for suffix in suffixes:
-        candidate = destination.with_name(f"{destination.name}{suffix}")
+    candidates = [destination.with_name(f"{destination.name}{suffix}") for suffix in suffixes]
+    if not any(candidate.exists() or candidate.is_symlink() for candidate in candidates):
+        return True
+    lock_path = _adapter_reader_lock(destination)
+    if lock_path.is_symlink():
+        raise OSError("adapter reader lock is a symbolic link")
+    try:
+        reader_lock = lock_path.open("a+")
+    except FileNotFoundError:
+        return True
+    with reader_lock:
         try:
-            if candidate.is_dir() and not candidate.is_symlink():
-                shutil.rmtree(candidate)
-            else:
-                candidate.unlink(missing_ok=True)
-        except FileNotFoundError:
-            continue
+            _acquire_stage_lock(reader_lock, deadline, cancel_event)
+        except TimeoutError:
+            return False
+        try:
+            for suffix, candidate in zip(suffixes, candidates):
+                try:
+                    if suffix == ".partial" and candidate.is_dir() and not candidate.is_symlink():
+                        (candidate / _RELAYING_MARKER).unlink(missing_ok=True)
+                    if candidate.is_dir() and not candidate.is_symlink():
+                        shutil.rmtree(candidate)
+                    else:
+                        candidate.unlink(missing_ok=True)
+                except FileNotFoundError:
+                    continue
+        finally:
+            fcntl.flock(reader_lock, fcntl.LOCK_UN)
+    return True
 
 
 def _stage_chunked_xor_adapter(
@@ -2700,12 +2722,11 @@ def stage_lora_adapter_files(
             return destination
         except BaseException as exc:
             if require_delta or (isinstance(transport, dict) and transport.get("mode") == "delta"):
-                partial = destination.with_name(f"{destination.name}.partial")
-                if partial.is_dir():
-                    (partial / _RELAYING_MARKER).unlink(missing_ok=True)
                 _cleanup_delta_stage_artifacts(
                     destination,
                     preserve_partial=isinstance(exc, TimeoutError),
+                    deadline=delta_deadline,
+                    cancel_event=cancel_event,
                 )
             _write_stage_status(
                 destination.parent,
