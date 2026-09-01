@@ -1,6 +1,10 @@
 import ast
+import io
+import json
+import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 
@@ -10,7 +14,90 @@ ORCHESTRATOR_PATH = ROOT / "src/prime_rl/orchestrator/orchestrator.py"
 SERVER_PATH = ROOT / "src/prime_rl/inference/vllm/server.py"
 
 
+def load_startup_validator(urlopen, validate_manifest, file_records):
+    source = ORCHESTRATOR_PATH.read_text(encoding="utf-8")
+    function = next(
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_verify_startup_adapter_delta"
+    )
+    namespace = {
+        "OrchestratorConfig": object,
+        "json": json,
+        "urlopen": urlopen,
+        "get_broadcast_dir": lambda output_dir: output_dir,
+        "get_step_path": lambda broadcast_dir, step: broadcast_dir / f"step_{step}",
+        "inference_weight_path": lambda _config, path, _lora_name: (
+            f"http://source/{path.name}"
+        ),
+        "_delta_stage_timeout_s": lambda: 30.0,
+        "validate_adapter_manifest": validate_manifest,
+        "_adapter_file_records": file_records,
+    }
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(ORCHESTRATOR_PATH), "exec"), namespace)
+    return namespace["_verify_startup_adapter_delta"]
+
+
 class ResumeRecoveryTest(unittest.TestCase):
+    def test_resume_uses_target_identity_when_public_predecessors_are_cleaned(self):
+        target_url = "http://source/step_6"
+        manifest = {
+            "version": 2,
+            "kind": "lora-adapter",
+            "mode": "delta",
+            "transport": "chunked-bf16-linear-zigzag-sparse-zstd",
+            "target_step": 6,
+            "base_step": 5,
+            "base2_step": 4,
+            "target_url": target_url,
+            "base_url": "http://source/step_5",
+            "base2_url": "http://source/step_4",
+            "target_size": 8,
+            "target_sha256": "a" * 64,
+            "config_size": 2,
+            "config_sha256": "b" * 64,
+            "base_size": 8,
+            "base_sha256": "c" * 64,
+            "base_config_size": 2,
+            "base_config_sha256": "d" * 64,
+            "base2_size": 8,
+            "base2_sha256": "e" * 64,
+            "base2_config_size": 2,
+            "base2_config_sha256": "f" * 64,
+            "data_offset": 0,
+            "files": [
+                {"name": "adapter_config.json", "size": 2, "sha256": "b" * 64},
+                {"name": "adapter_model.safetensors", "size": 8, "sha256": "a" * 64},
+            ],
+        }
+        calls = []
+
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        def fetch(url, timeout):
+            calls.append((url, timeout))
+            return Response(json.dumps(manifest).encode("utf-8"))
+
+        def validate(value, **kwargs):
+            self.assertEqual(value, manifest)
+            self.assertEqual(kwargs["target_step"], 6)
+            self.assertEqual(kwargs["base_url"], "http://source/step_5")
+            self.assertEqual(kwargs["base2_url"], "http://source/step_4")
+
+        def records(value):
+            return {item["name"]: item for item in value["files"]}
+
+        validator = load_startup_validator(fetch, validate, records)
+        with tempfile.TemporaryDirectory() as temporary:
+            validator(SimpleNamespace(output_dir=Path(temporary)), "adapter", 6, Path(temporary) / "step_6", target_url)
+        self.assertEqual(calls, [(target_url + "/adapter_manifest.json", 30.0)])
+
     def test_resume_has_a_longer_separate_budget(self):
         tree = ast.parse(CLIENT_PATH.read_text(encoding="utf-8"))
         values = {}

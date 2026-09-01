@@ -184,25 +184,27 @@ def _verify_startup_adapter_delta(
         return
     broadcast_dir = get_broadcast_dir(config.output_dir)
     previous_path = get_step_path(broadcast_dir, step - 1)
-    if not (previous_path / "STABLE").is_file():
+    previous_is_published = (previous_path / "STABLE").is_file()
+    previous_url = inference_weight_path(config, previous_path, lora_name)
+    if not previous_is_published and not isinstance(previous_url, str):
         raise RuntimeError(
-            f"cannot resume LoRA policy v{step}: exact predecessor v{step - 1} is not STABLE"
+            f"cannot resume LoRA policy v{step}: exact predecessor v{step - 1} "
+            "has no published path or source URL"
         )
 
     previous_previous_path = None
     previous_previous_url = None
+    previous_previous_is_published = False
     if step >= 2:
         previous_previous_path = get_step_path(broadcast_dir, step - 2)
-        if not (previous_previous_path / "STABLE").is_file():
-            raise RuntimeError(
-                f"cannot resume LoRA policy v{step}: exact predecessor v{step - 2} is not STABLE"
-            )
+        previous_previous_is_published = (previous_previous_path / "STABLE").is_file()
         previous_previous_url = inference_weight_path(
             config, previous_previous_path, lora_name
         )
-        if not isinstance(previous_previous_url, str):
+        if not previous_previous_is_published and not isinstance(previous_previous_url, str):
             raise RuntimeError(
-                f"cannot resume LoRA policy v{step}: second predecessor has no source URL"
+                f"cannot resume LoRA policy v{step}: exact predecessor v{step - 2} "
+                "has no published path or source URL"
             )
     def read_manifest(path, url: str | None) -> dict[str, object]:
         try:
@@ -221,7 +223,6 @@ def _verify_startup_adapter_delta(
         return value
 
     manifest = read_manifest(target_path, target_url)
-    previous_url = inference_weight_path(config, previous_path, lora_name)
     try:
         validate_adapter_manifest(
             manifest,
@@ -234,8 +235,28 @@ def _verify_startup_adapter_delta(
         raise RuntimeError(
             f"cannot resume LoRA policy v{step}: {exc}"
         ) from exc
-    previous_manifest = read_manifest(previous_path, previous_url if isinstance(previous_url, str) else None)
+    # A trainer may remove old public broadcast folders after the adapter
+    # server has retained their exact files. Version-two target manifests carry
+    # the complete size and digest identity for both predecessors, so the
+    # inference receiver can verify those cached files without exposing its
+    # private cache to this process. Use a local/source predecessor manifest
+    # when it is published; otherwise rely on the already validated target
+    # identity and reject older manifests that lack the required sizes.
+    previous_manifest = None
+    if previous_is_published:
+        previous_manifest = read_manifest(
+            previous_path, previous_url if isinstance(previous_url, str) else None
+        )
+    elif manifest.get("version") != 2:
+        raise RuntimeError(
+            f"cannot resume LoRA policy v{step}: predecessor v{step - 1} is unavailable "
+            "and its manifest has no complete identity"
+        )
     if step == 1:
+        if previous_manifest is None:
+            raise RuntimeError(
+                f"cannot resume LoRA policy v{step}: predecessor manifest is unavailable"
+            )
         if (
             previous_manifest.get("version") not in {1, 2}
             or previous_manifest.get("kind") != "lora-adapter"
@@ -244,7 +265,7 @@ def _verify_startup_adapter_delta(
             raise RuntimeError(
                 f"cannot resume LoRA policy v{step}: predecessor manifest is not policy v{step - 1}"
             )
-    else:
+    elif previous_manifest is not None:
         if (
             previous_manifest.get("kind") != "lora-adapter"
             or previous_manifest.get("mode") != "delta"
@@ -272,14 +293,26 @@ def _verify_startup_adapter_delta(
 
     try:
         target_files = _adapter_file_records(manifest)
-        previous_files = _adapter_file_records(previous_manifest)
+        previous_files = (
+            _adapter_file_records(previous_manifest)
+            if previous_manifest is not None
+            else None
+        )
     except RuntimeError as exc:
         raise RuntimeError(f"cannot resume LoRA policy v{step}: {exc}") from exc
     target_weights = target_files["adapter_model.safetensors"]
     target_config = target_files["adapter_config.json"]
-    previous_weights = previous_files["adapter_model.safetensors"]
-    previous_config = previous_files["adapter_config.json"]
-    if manifest.get("version") == 1 and (
+    previous_weights = (
+        previous_files["adapter_model.safetensors"]
+        if previous_files is not None
+        else None
+    )
+    previous_config = (
+        previous_files["adapter_config.json"]
+        if previous_files is not None
+        else None
+    )
+    if manifest.get("version") == 1 and previous_manifest is not None and (
         manifest.get("target_size") != target_weights.get("size")
         or manifest.get("target_sha256") != target_weights.get("sha256")
         or manifest.get("config_size") != target_config.get("size")
@@ -293,29 +326,41 @@ def _verify_startup_adapter_delta(
         )
     if manifest.get("version") == 2:
         assert previous_previous_path is not None
-        previous_previous_manifest = read_manifest(
-            previous_previous_path,
-            previous_previous_url if isinstance(previous_previous_url, str) else None,
-        )
-        if previous_previous_manifest.get("target_step") != step - 2:
-            raise RuntimeError(
-                f"cannot resume LoRA policy v{step}: second predecessor manifest is not policy v{step - 2}"
+        previous_previous_manifest = None
+        if previous_previous_is_published:
+            previous_previous_manifest = read_manifest(
+                previous_previous_path,
+                previous_previous_url if isinstance(previous_previous_url, str) else None,
             )
-        try:
-            previous_previous_files = _adapter_file_records(previous_previous_manifest)
-        except RuntimeError as exc:
-            raise RuntimeError(f"cannot resume LoRA policy v{step}: {exc}") from exc
-        previous_previous_weights = previous_previous_files["adapter_model.safetensors"]
-        previous_previous_config = previous_previous_files["adapter_config.json"]
+            if previous_previous_manifest.get("target_step") != step - 2:
+                raise RuntimeError(
+                    f"cannot resume LoRA policy v{step}: second predecessor manifest is not policy {step - 2}"
+                )
+        if previous_manifest is not None and previous_previous_manifest is not None:
+            try:
+                previous_previous_files = _adapter_file_records(previous_previous_manifest)
+            except RuntimeError as exc:
+                raise RuntimeError(f"cannot resume LoRA policy v{step}: {exc}") from exc
+            previous_previous_weights = previous_previous_files["adapter_model.safetensors"]
+            previous_previous_config = previous_previous_files["adapter_config.json"]
+        else:
+            previous_previous_weights = None
+            previous_previous_config = None
         if (
-            manifest.get("base_size") != previous_weights.get("size")
-            or manifest.get("base_sha256") != previous_weights.get("sha256")
-            or manifest.get("base_config_sha256") != previous_config.get("sha256")
-            or manifest.get("base_config_size") != previous_config.get("size")
-            or manifest.get("base2_size") != previous_previous_weights.get("size")
-            or manifest.get("base2_sha256") != previous_previous_weights.get("sha256")
-            or manifest.get("base2_config_sha256") != previous_previous_config.get("sha256")
-            or manifest.get("base2_config_size") != previous_previous_config.get("size")
+            previous_weights is not None
+            and (
+                manifest.get("base_size") != previous_weights.get("size")
+                or manifest.get("base_sha256") != previous_weights.get("sha256")
+                or manifest.get("base_config_sha256") != previous_config.get("sha256")
+                or manifest.get("base_config_size") != previous_config.get("size")
+            )
+            or previous_previous_weights is not None
+            and (
+                manifest.get("base2_size") != previous_previous_weights.get("size")
+                or manifest.get("base2_sha256") != previous_previous_weights.get("sha256")
+                or manifest.get("base2_config_sha256") != previous_previous_config.get("sha256")
+                or manifest.get("base2_config_size") != previous_previous_config.get("size")
+            )
         ):
             raise RuntimeError(
                 f"cannot resume LoRA policy v{step}: predictive adapter predecessor identity differs"

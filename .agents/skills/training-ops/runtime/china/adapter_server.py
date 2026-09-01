@@ -303,6 +303,22 @@ def _predictive_step_url(base_url: str, step: int) -> str:
     return f"{base_url.rstrip('/')}/step_{step}"
 
 
+def _has_newer_stable_step(active_run: Path, step: int) -> bool:
+    """Keep the public manifest for an older stable step unchanged."""
+    try:
+        candidates = active_run.iterdir()
+        for candidate in candidates:
+            match = step_pattern.fullmatch(candidate.name)
+            if match is None or int(match.group(1)) <= step:
+                continue
+            stable = candidate / stable_name
+            if stable.is_file() and not stable.is_symlink():
+                return True
+    except OSError as exc:
+        raise UpgradeError("cannot inspect active adapter steps") from exc
+    return False
+
+
 def _upgrade_v1_step(active_run: Path, target: Path, step: int, source_base_url: str) -> None:
     lock_path = active_run / lock_name
     if lock_path.is_symlink():
@@ -416,6 +432,8 @@ class RangeHandler(SimpleHTTPRequestHandler):
         if pieces[prefix_length + 1] == stable_name:
             return path
         active_run = Path(self.directory).resolve().joinpath(*self.upgrade_path)
+        if _has_newer_stable_step(active_run, step):
+            return path
         target = active_run / pieces[prefix_length]
         _upgrade_v1_step(active_run, target, step, self.source_base_url)
         return path
