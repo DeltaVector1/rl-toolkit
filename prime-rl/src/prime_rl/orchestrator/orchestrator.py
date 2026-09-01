@@ -72,7 +72,12 @@ from prime_rl.orchestrator.utils import (
     setup_policy_inference_pool,
     trim_process_memory,
 )
-from prime_rl.orchestrator.watcher import WeightWatcher, inference_weight_path
+from prime_rl.orchestrator.watcher import (
+    WeightWatcher,
+    _adapter_file_records,
+    inference_weight_path,
+    validate_adapter_manifest,
+)
 from prime_rl.trainer.model import setup_tokenizer
 from prime_rl.trainer.rl.broadcast.nixl.model_express import ModelExpressSession
 from prime_rl.transport import TrainingBatch, setup_training_batch_sender
@@ -184,6 +189,34 @@ def _verify_startup_adapter_delta(
             f"cannot resume LoRA policy v{step}: exact predecessor v{step - 1} is not STABLE"
         )
 
+    previous_previous_path = None
+    previous_previous_url = None
+    previous_third_url = None
+    if step >= 2:
+        previous_previous_path = get_step_path(broadcast_dir, step - 2)
+        if not (previous_previous_path / "STABLE").is_file():
+            raise RuntimeError(
+                f"cannot resume LoRA policy v{step}: exact predecessor v{step - 2} is not STABLE"
+            )
+        previous_previous_url = inference_weight_path(
+            config, previous_previous_path, lora_name
+        )
+        if not isinstance(previous_previous_url, str):
+            raise RuntimeError(
+                f"cannot resume LoRA policy v{step}: second predecessor has no source URL"
+            )
+    if step >= 3:
+        previous_third_path = get_step_path(broadcast_dir, step - 3)
+        if not (previous_third_path / "STABLE").is_file():
+            raise RuntimeError(
+                f"cannot resume LoRA policy v{step}: exact predecessor v{step - 3} is not STABLE"
+            )
+        previous_third_url = inference_weight_path(config, previous_third_path, lora_name)
+        if not isinstance(previous_third_url, str):
+            raise RuntimeError(
+                f"cannot resume LoRA policy v{step}: third predecessor has no source URL"
+            )
+
     def read_manifest(path, url: str | None) -> dict[str, object]:
         try:
             if url is None:
@@ -201,48 +234,53 @@ def _verify_startup_adapter_delta(
         return value
 
     manifest = read_manifest(target_path, target_url)
-    if (
-        manifest.get("version") != 1
-        or manifest.get("kind") != "lora-adapter"
-        or manifest.get("mode") != "delta"
-        or manifest.get("transport") != "chunked-shuffled-xor-zstd"
-        or manifest.get("target_step") != step
-        or manifest.get("base_step") != step - 1
-    ):
-        raise RuntimeError(
-            f"cannot resume LoRA policy v{step}: published adapter is not the exact adjacent delta"
-        )
-
     previous_url = inference_weight_path(config, previous_path, lora_name)
-    previous_manifest = read_manifest(previous_path, previous_url if isinstance(previous_url, str) else None)
-    if (
-        previous_manifest.get("version") != 1
-        or previous_manifest.get("kind") != "lora-adapter"
-        or previous_manifest.get("target_step") != step - 1
-    ):
-        raise RuntimeError(
-            f"cannot resume LoRA policy v{step}: predecessor manifest is not policy v{step - 1}"
+    try:
+        validate_adapter_manifest(
+            manifest,
+            target_step=step,
+            target_url=target_url,
+            base_url=previous_url if isinstance(previous_url, str) else None,
+            base2_url=previous_previous_url,
         )
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"cannot resume LoRA policy v{step}: {exc}"
+        ) from exc
+    previous_manifest = read_manifest(previous_path, previous_url if isinstance(previous_url, str) else None)
+    if step == 1:
+        if (
+            previous_manifest.get("version") not in {1, 2}
+            or previous_manifest.get("kind") != "lora-adapter"
+            or previous_manifest.get("target_step") != 0
+        ):
+            raise RuntimeError(
+                f"cannot resume LoRA policy v{step}: predecessor manifest is not policy v{step - 1}"
+            )
+    else:
+        try:
+            validate_adapter_manifest(
+                previous_manifest,
+                target_step=step - 1,
+                target_url=previous_url if isinstance(previous_url, str) else None,
+                base_url=previous_previous_url,
+                base2_url=previous_third_url,
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"cannot resume LoRA policy v{step}: predecessor manifest is not policy v{step - 1}: {exc}"
+            ) from exc
 
-    def manifest_files(value: dict[str, object]) -> dict[str, dict[str, object]]:
-        raw_files = value.get("files")
-        if not isinstance(raw_files, list):
-            raise RuntimeError(f"cannot resume LoRA policy v{step}: adapter manifest has no files")
-        files: dict[str, dict[str, object]] = {}
-        for item in raw_files:
-            if isinstance(item, dict) and isinstance(item.get("name"), str):
-                files[item["name"]] = item
-        if set(files) != {"adapter_config.json", "adapter_model.safetensors"}:
-            raise RuntimeError(f"cannot resume LoRA policy v{step}: adapter manifest has incomplete files")
-        return files
-
-    target_files = manifest_files(manifest)
-    previous_files = manifest_files(previous_manifest)
+    try:
+        target_files = _adapter_file_records(manifest)
+        previous_files = _adapter_file_records(previous_manifest)
+    except RuntimeError as exc:
+        raise RuntimeError(f"cannot resume LoRA policy v{step}: {exc}") from exc
     target_weights = target_files["adapter_model.safetensors"]
     target_config = target_files["adapter_config.json"]
     previous_weights = previous_files["adapter_model.safetensors"]
     previous_config = previous_files["adapter_config.json"]
-    if (
+    if manifest.get("version") == 1 and (
         manifest.get("target_size") != target_weights.get("size")
         or manifest.get("target_sha256") != target_weights.get("sha256")
         or manifest.get("config_size") != target_config.get("size")
@@ -254,6 +292,35 @@ def _verify_startup_adapter_delta(
         raise RuntimeError(
             f"cannot resume LoRA policy v{step}: adjacent adapter base or SHA-256 identity differs"
         )
+    if manifest.get("version") == 2:
+        assert previous_previous_path is not None
+        previous_previous_manifest = read_manifest(
+            previous_previous_path,
+            previous_previous_url if isinstance(previous_previous_url, str) else None,
+        )
+        if previous_previous_manifest.get("target_step") != step - 2:
+            raise RuntimeError(
+                f"cannot resume LoRA policy v{step}: second predecessor manifest is not policy v{step - 2}"
+            )
+        try:
+            previous_previous_files = _adapter_file_records(previous_previous_manifest)
+        except RuntimeError as exc:
+            raise RuntimeError(f"cannot resume LoRA policy v{step}: {exc}") from exc
+        previous_previous_weights = previous_previous_files["adapter_model.safetensors"]
+        previous_previous_config = previous_previous_files["adapter_config.json"]
+        if (
+            manifest.get("base_size") != previous_weights.get("size")
+            or manifest.get("base_sha256") != previous_weights.get("sha256")
+            or manifest.get("base_config_sha256") != previous_config.get("sha256")
+            or manifest.get("base_config_size") != previous_config.get("size")
+            or manifest.get("base2_size") != previous_previous_weights.get("size")
+            or manifest.get("base2_sha256") != previous_previous_weights.get("sha256")
+            or manifest.get("base2_config_sha256") != previous_previous_config.get("sha256")
+            or manifest.get("base2_config_size") != previous_previous_config.get("size")
+        ):
+            raise RuntimeError(
+                f"cannot resume LoRA policy v{step}: predictive adapter predecessor identity differs"
+            )
 
 
 class Orchestrator:
@@ -583,6 +650,9 @@ class Orchestrator:
                 self.policy_inference.update_model_name(self.lora_name)
                 self.policy.model_name = self.lora_name
             self.policy.version = sync_version
+            # Do not start rollout scheduling until every inference endpoint
+            # exposes the exact policy that was loaded.
+            await self.policy_inference.wait_for_ready(self.policy.model_name)
 
         self.train_source = TrainSource(self.train_envs, seed=42)
         self.eval_source: EvalSource | None = (

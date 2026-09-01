@@ -16,6 +16,7 @@ from urllib.parse import unquote, urlsplit
 relay_manifest_name = "relay_manifest.json"
 ready_marker_name = "READY"
 relay_transport = "chunked-shuffled-xor-zstd"
+predictive_transport = "chunked-bf16-linear-zigzag-sparse-zstd"
 full_transport = "full"
 digest_pattern = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -118,8 +119,13 @@ class RelayConfig:
 @contextmanager
 def reader_lock(cache_path: Path):
     lock_path = cache_path.parent / f".{cache_path.name}.readers.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+") as lock:
+    if lock_path.is_symlink() or not lock_path.is_file():
+        raise RelayRequestError(404, "adapter reader lock is missing")
+    try:
+        lock = lock_path.open("rb")
+    except OSError as exc:
+        raise RelayRequestError(404, "adapter reader lock is unavailable") from exc
+    with lock:
         fcntl.flock(lock, fcntl.LOCK_SH)
         try:
             yield
@@ -134,6 +140,77 @@ def _safe_relative_path(value: object) -> Path:
     if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
         raise RelayRequestError(500, "relay manifest has an unsafe file path")
     return Path(*path.parts)
+
+
+def _predictive_step_url(source_url: str, step: int) -> str:
+    parsed = urlsplit(source_url)
+    path = Path(parsed.path.rstrip("/")).parent / f"step_{step}"
+    return parsed._replace(path=str(path)).geturl()
+
+
+def _validate_predictive_source_manifest(manifest: dict[str, object], source_url: str) -> None:
+    """Validate the second-order adapter identity before serving any file."""
+    if (
+        manifest.get("version") != 2
+        or manifest.get("kind") != "lora-adapter"
+        or manifest.get("mode") != "delta"
+        or manifest.get("transport") != predictive_transport
+    ):
+        raise RelayRequestError(500, "relay source manifest selects an unsupported predictive transport")
+    target_step = manifest.get("target_step")
+    base_step = manifest.get("base_step")
+    base2_step = manifest.get("base2_step")
+    if (
+        type(target_step) is not int
+        or target_step < 2
+        or base_step != target_step - 1
+        or base2_step != target_step - 2
+    ):
+        raise RelayRequestError(500, "relay source manifest steps are not adjacent")
+    parsed_source = urlsplit(source_url)
+    if Path(parsed_source.path.rstrip("/")).name != f"step_{target_step}":
+        raise RelayRequestError(500, "relay source URL does not identify the target step")
+
+    def valid_digest(value: object) -> bool:
+        return isinstance(value, str) and digest_pattern.fullmatch(value) is not None
+
+    for prefix in ("target", "base", "base2"):
+        if (
+            type(manifest.get(f"{prefix}_size")) is not int
+            or manifest[f"{prefix}_size"] <= 0
+            or not valid_digest(manifest.get(f"{prefix}_sha256"))
+        ):
+            raise RelayRequestError(500, f"relay source manifest has an invalid {prefix} identity")
+    for name in ("config_sha256", "base_config_sha256", "base2_config_sha256"):
+        if not valid_digest(manifest.get(name)):
+            raise RelayRequestError(500, f"relay source manifest has an invalid {name}")
+    files = manifest.get("files")
+    if not isinstance(files, list):
+        raise RelayRequestError(500, "relay source manifest has no file records")
+    file_map = {
+        item.get("name"): item
+        for item in files
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    }
+    if set(file_map) != {"adapter_config.json", "adapter_model.safetensors"}:
+        raise RelayRequestError(500, "relay source manifest has an incomplete file set")
+    target_file = file_map["adapter_model.safetensors"]
+    config_file = file_map["adapter_config.json"]
+    if (
+        manifest.get("target_size") != target_file.get("size")
+        or manifest.get("target_sha256") != target_file.get("sha256")
+        or manifest.get("config_size") != config_file.get("size")
+        or manifest.get("config_sha256") != config_file.get("sha256")
+    ):
+        raise RelayRequestError(500, "relay source manifest target identity differs from its files")
+    for name, expected in (
+        ("target_url", source_url),
+        ("base_url", _predictive_step_url(source_url, target_step - 1)),
+        ("base2_url", _predictive_step_url(source_url, target_step - 2)),
+    ):
+        value = manifest.get(name)
+        if not isinstance(value, str) or value != expected:
+            raise RelayRequestError(500, f"relay source manifest {name} is not adjacent")
 
 
 def _load_file(cache_path: Path, source_url: str, requested_name: str) -> RelayFile:
@@ -157,12 +234,38 @@ def _load_file(cache_path: Path, source_url: str, requested_name: str) -> RelayF
     transport = manifest.get("transport")
     required_names = {"adapter_manifest.json", "adapter_config.json", "adapter_model.safetensors"}
     if (
-        manifest.get("version") != 1
+        manifest.get("version") not in {1, 2}
         or manifest.get("source_url") != source_url
-        or transport not in {relay_transport, full_transport}
+        or transport not in {relay_transport, predictive_transport, full_transport}
         or not isinstance(manifest.get("files"), dict)
     ):
         raise RelayRequestError(500, "relay manifest is invalid")
+    if transport == predictive_transport:
+        source_manifest_path = cache_path / "adapter_manifest.json"
+        try:
+            source_manifest = json.loads(source_manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise RelayRequestError(500, "relay source manifest cannot be read") from exc
+        if not isinstance(source_manifest, dict):
+            raise RelayRequestError(500, "relay source manifest is invalid")
+        _validate_predictive_source_manifest(source_manifest, source_url)
+        if manifest.get("version") == 1:
+            # Version one is the relay-index format. It remains valid for the
+            # new source transport when the source manifest is version two.
+            pass
+        for name in (
+            "target_step",
+            "base_step",
+            "base2_step",
+            "target_sha256",
+            "base_sha256",
+            "base2_sha256",
+            "target_size",
+            "base_size",
+            "base2_size",
+        ):
+            if name in manifest and manifest.get(name) != source_manifest.get(name):
+                raise RelayRequestError(500, f"relay manifest {name} differs from its source manifest")
     files = manifest["files"]
     for name, raw_spec in files.items():
         if not isinstance(name, str) or Path(name).name != name or name in {"", ".", ".."}:
@@ -170,7 +273,7 @@ def _load_file(cache_path: Path, source_url: str, requested_name: str) -> RelayF
         if not isinstance(raw_spec, dict):
             raise RelayRequestError(500, "relay manifest file entry is invalid")
         relative = _safe_relative_path(raw_spec.get("path"))
-        if transport == relay_transport and name not in required_names:
+        if transport in {relay_transport, predictive_transport} and name not in required_names:
             if relative != Path("transport-chunks") / name:
                 raise RelayRequestError(500, "relay manifest has an invalid chunk path")
         size = raw_spec.get("size")

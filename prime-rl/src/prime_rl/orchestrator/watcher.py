@@ -30,6 +30,107 @@ from prime_rl.utils.utils import get_latest_ckpt_step
 from prime_rl.utils.checkpoint_delta import build_xor_delta_checkpoint
 
 
+v1_adapter_transport = "chunked-shuffled-xor-zstd"
+v2_adapter_transport = "chunked-bf16-linear-zigzag-sparse-zstd"
+
+
+def _valid_digest(value: object) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(
+        character in "0123456789abcdef" for character in value
+    )
+
+
+def _adapter_file_records(manifest: dict[str, object]) -> dict[str, dict[str, object]]:
+    raw_files = manifest.get("files")
+    if not isinstance(raw_files, list):
+        raise RuntimeError("adapter manifest has no file records")
+    files: dict[str, dict[str, object]] = {}
+    for item in raw_files:
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+            raise RuntimeError("adapter manifest has an invalid file record")
+        name = item["name"]
+        if name in files or name not in {"adapter_config.json", "adapter_model.safetensors"}:
+            raise RuntimeError("adapter manifest has an invalid file set")
+        size = item.get("size")
+        digest = item.get("sha256")
+        if type(size) is not int or size < 0 or not _valid_digest(digest):
+            raise RuntimeError("adapter manifest has an invalid file identity")
+        files[name] = item
+    if set(files) != {"adapter_config.json", "adapter_model.safetensors"}:
+        raise RuntimeError("adapter manifest has an incomplete file set")
+    return files
+
+
+def validate_adapter_manifest(
+    manifest: dict[str, object],
+    *,
+    target_step: int,
+    target_url: str | None = None,
+    base_url: str | None = None,
+    base2_url: str | None = None,
+) -> dict[str, object]:
+    """Validate the exact adjacent transport selected by a policy update."""
+    if manifest.get("kind") != "lora-adapter" or manifest.get("mode") != "delta":
+        raise RuntimeError("adapter manifest is not a delta adapter")
+    if type(manifest.get("target_step")) is not int or manifest["target_step"] != target_step:
+        raise RuntimeError("adapter manifest target step is not the requested policy")
+    version = manifest.get("version")
+    if version == 1:
+        if manifest.get("transport") != v1_adapter_transport:
+            raise RuntimeError("adapter manifest selects an unsupported version-one transport")
+        if manifest.get("base_step") != target_step - 1:
+            raise RuntimeError("adapter manifest base step is not adjacent to its target")
+    elif version == 2:
+        if manifest.get("transport") != v2_adapter_transport:
+            raise RuntimeError("adapter manifest selects an unsupported predictive transport")
+        if target_step < 2:
+            raise RuntimeError("predictive adapter transport requires two predecessor steps")
+        if manifest.get("base_step") != target_step - 1 or manifest.get("base2_step") != target_step - 2:
+            raise RuntimeError("predictive adapter manifest steps are not adjacent")
+        for prefix in ("target", "base", "base2"):
+            size = manifest.get(f"{prefix}_size")
+            digest = manifest.get(f"{prefix}_sha256")
+            if type(size) is not int or size <= 0 or not _valid_digest(digest):
+                raise RuntimeError(f"predictive adapter manifest has an invalid {prefix} identity")
+        for name in ("config_sha256", "base_config_sha256", "base2_config_sha256"):
+            if not _valid_digest(manifest.get(name)):
+                raise RuntimeError(f"predictive adapter manifest has an invalid {name}")
+        for name in ("config_size", "base_config_size", "base2_config_size"):
+            value = manifest.get(name)
+            if type(value) is not int or value < 0:
+                raise RuntimeError(f"predictive adapter manifest has an invalid {name}")
+        data_offset = manifest.get("data_offset")
+        if type(data_offset) is not int or data_offset < 0 or data_offset % 2:
+            raise RuntimeError("predictive adapter manifest has an invalid data offset")
+    else:
+        raise RuntimeError("adapter manifest version is unsupported")
+
+    if version == 2:
+        if not isinstance(target_url, str) or manifest.get("target_url") != target_url:
+            raise RuntimeError("predictive adapter manifest target URL differs from the requested policy")
+        if not isinstance(base_url, str) or manifest.get("base_url") != base_url:
+            raise RuntimeError("predictive adapter manifest base URL differs from the adjacent policy")
+        if not isinstance(base2_url, str) or manifest.get("base2_url") != base2_url:
+            raise RuntimeError("predictive adapter manifest second base URL differs from the adjacent policy")
+    if target_url is not None and manifest.get("target_url") not in (None, target_url):
+        raise RuntimeError("adapter manifest target URL differs from the requested policy")
+    if base_url is not None and manifest.get("base_url") not in (None, base_url):
+        raise RuntimeError("adapter manifest base URL differs from the adjacent policy")
+    if version == 2:
+        files = _adapter_file_records(manifest)
+        if manifest["target_size"] != files["adapter_model.safetensors"]["size"]:
+            raise RuntimeError("predictive adapter target size differs from its file record")
+        if manifest["target_sha256"] != files["adapter_model.safetensors"]["sha256"]:
+            raise RuntimeError("predictive adapter target digest differs from its file record")
+        if manifest["config_size"] != files["adapter_config.json"]["size"]:
+            raise RuntimeError("predictive adapter config size differs from its file record")
+        if manifest["config_sha256"] != files["adapter_config.json"]["sha256"]:
+            raise RuntimeError("predictive adapter config digest differs from its file record")
+        if manifest["base_size"] != manifest["target_size"] or manifest["base2_size"] != manifest["target_size"]:
+            raise RuntimeError("predictive adapter predecessor sizes differ from the target")
+    return manifest
+
+
 def inference_weight_path(config: OrchestratorConfig, weights_path, lora_name: str | None):
     broadcast = config.weight_broadcast
     if not (broadcast.type == "filesystem" and broadcast.source_url):
@@ -239,6 +340,22 @@ class WeightWatcher:
                 f"cannot apply adapter policy v{next_step}: verified base URL changed"
             )
 
+        previous_previous_url = None
+        if next_step >= 2:
+            previous_previous_path = get_step_path(broadcast_dir, next_step - 2)
+            if not (previous_previous_path / "STABLE").is_file():
+                raise RuntimeError(
+                    f"cannot apply adapter policy v{next_step}: previous policy v{next_step - 2} "
+                    "is not marked STABLE"
+                )
+            previous_previous_url = inference_weight_path(
+                self.config, previous_previous_path, self.lora_name
+            )
+            if not isinstance(previous_previous_url, str):
+                raise RuntimeError(
+                    f"cannot apply adapter policy v{next_step}: second base has no source URL"
+                )
+
         if target_url is None:
             target_url = inference_weight_path(self.config, local_weights_path, self.lora_name)
         try:
@@ -251,17 +368,30 @@ class WeightWatcher:
             raise RuntimeError(
                 f"cannot apply adapter policy v{next_step}: {exc}"
             ) from exc
-        if (
-            manifest.get("version") != 1
-            or manifest.get("kind") != "lora-adapter"
-            or manifest.get("mode") != "delta"
-            or manifest.get("transport") != "chunked-shuffled-xor-zstd"
-            or manifest.get("target_step") != next_step
-            or manifest.get("base_step") != next_step - 1
-        ):
-            raise RuntimeError(
-                f"cannot apply adapter policy v{next_step}: manifest is not the adjacent delta"
-            )
+        if manifest.get("version") != 1:
+            try:
+                validate_adapter_manifest(
+                    manifest,
+                    target_step=next_step,
+                    target_url=target_url if isinstance(target_url, str) else None,
+                    base_url=previous_url,
+                    base2_url=previous_previous_url,
+                )
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    f"cannot apply adapter policy v{next_step}: {exc}"
+                ) from exc
+        else:
+            if (
+                manifest.get("kind") != "lora-adapter"
+                or manifest.get("mode") != "delta"
+                or manifest.get("transport") != "chunked-shuffled-xor-zstd"
+                or manifest.get("target_step") != next_step
+                or manifest.get("base_step") != next_step - 1
+            ):
+                raise RuntimeError(
+                    f"cannot apply adapter policy v{next_step}: manifest is not the adjacent delta"
+                )
         build_seconds = manifest.get("build_seconds")
         self.last_adapter_delta_build_time = (
             float(build_seconds) if isinstance(build_seconds, (int, float)) and build_seconds >= 0 else -1.0
@@ -415,6 +545,11 @@ class WeightWatcher:
             if lora_name is not None:
                 self.inference.update_model_name(lora_name)
                 self.policy.model_name = lora_name
+
+            # The staging call and weight update cover all endpoints, but a
+            # rollout must not use the new policy until both inference hosts
+            # report the adapter as visible.
+            await self.inference.wait_for_ready(self.policy.model_name)
 
             for observer in self.observers:
                 try:

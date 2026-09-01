@@ -2,6 +2,7 @@ import shutil
 import time
 from pathlib import Path
 from typing import Literal
+from urllib.parse import quote
 
 import torch.nn as nn
 from torch.distributed.tensor import DTensor
@@ -108,12 +109,66 @@ class FileSystemWeightBroadcast(WeightBroadcast):
                             get_broadcast_dir(self.multi_run_manager.get_run_dir(idx)),
                             broadcast_step - 1,
                         )
-                        manifest = publish_adapter_manifest(
-                            save_dir,
-                            previous_dir if previous_dir.is_dir() else None,
-                            target_step=broadcast_step,
-                            base_step=broadcast_step - 1 if previous_dir.is_dir() else None,
-                        )
+                        if broadcast_step >= 2:
+                            previous_previous_dir = get_step_path(
+                                get_broadcast_dir(self.multi_run_manager.get_run_dir(idx)),
+                                broadcast_step - 2,
+                            )
+                            if not previous_dir.is_dir() or not previous_previous_dir.is_dir():
+                                raise RuntimeError(
+                                    f"cannot publish adapter v{broadcast_step}: "
+                                    f"predecessors v{broadcast_step - 1} and v{broadcast_step - 2} "
+                                    "are not available"
+                                )
+                            if not (previous_dir / "STABLE").is_file() or not (
+                                previous_previous_dir / "STABLE"
+                            ).is_file():
+                                raise RuntimeError(
+                                    f"cannot publish adapter v{broadcast_step}: both predecessors "
+                                    "must be marked STABLE"
+                                )
+                            orchestrator_config = self.multi_run_manager.config[idx]
+                            source_url = getattr(
+                                orchestrator_config.weight_broadcast, "source_url", None
+                            )
+                            source_dir = getattr(
+                                orchestrator_config.weight_broadcast, "source_dir", None
+                            )
+                            if not isinstance(source_url, str) or not source_url or source_dir is None:
+                                raise RuntimeError(
+                                    f"cannot publish adapter v{broadcast_step}: predictive transport "
+                                    "requires weight_broadcast.source_url and source_dir"
+                                )
+                            try:
+                                source_root = Path(source_dir)
+                                target_relative = save_dir.relative_to(source_root).as_posix()
+                            except ValueError as exc:
+                                raise RuntimeError(
+                                    f"cannot publish adapter v{broadcast_step}: target is outside "
+                                    "weight_broadcast.source_dir"
+                                ) from exc
+                            target_base_url = source_url.rstrip("/")
+                            target_url = f"{target_base_url}/{quote(target_relative)}"
+                            base_url = f"{target_base_url}/{quote(previous_dir.relative_to(source_root).as_posix())}"
+                            base2_url = f"{target_base_url}/{quote(previous_previous_dir.relative_to(source_root).as_posix())}"
+                            manifest = publish_adapter_manifest(
+                                save_dir,
+                                previous_dir,
+                                base2_dir=previous_previous_dir,
+                                target_url=target_url,
+                                base_url=base_url,
+                                base2_url=base2_url,
+                                target_step=broadcast_step,
+                                base_step=broadcast_step - 1,
+                                base2_step=broadcast_step - 2,
+                            )
+                        else:
+                            manifest = publish_adapter_manifest(
+                                save_dir,
+                                previous_dir if previous_dir.is_dir() else None,
+                                target_step=broadcast_step,
+                                base_step=broadcast_step - 1 if previous_dir.is_dir() else None,
+                            )
                         self.logger.info(
                             f"Published adapter {manifest['mode']} transport: "
                             f"{manifest['encoded_size']} encoded bytes for "
