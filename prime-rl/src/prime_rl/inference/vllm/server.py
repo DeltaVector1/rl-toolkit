@@ -1,4 +1,5 @@
 import asyncio
+import math
 import threading
 import time
 from argparse import Namespace
@@ -20,6 +21,7 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 from prime_rl.configs.inference import InferenceConfig
 from prime_rl.inference.vllm.worker.filesystem import (
     _delta_stage_timeout_s,
+    _adapter_stage_publish_lock,
     adapter_cache_path,
     adapter_reader_lock,
     adapter_stage_status,
@@ -104,6 +106,15 @@ def _lora_stage_status() -> dict[str, Any]:
             "status": "staging",
             "age_seconds": round(max(0.0, time.monotonic() - _lora_stage_started_at), 3),
         }
+
+
+def _is_finite_number(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (OverflowError, ValueError):
+        return False
 
 
 def engine_client(request: Request) -> EngineClient:
@@ -214,24 +225,52 @@ async def stage_lora_adapter(raw_request: Request):
     require_delta = data.get("require_delta", False)
     if not isinstance(require_delta, bool):
         return JSONResponse({"error": "require_delta must be a boolean"}, status_code=400)
+    requested_timeout = data.get("stage_timeout_seconds")
+    configured_timeout = _delta_stage_timeout_s() if require_delta else None
+    if requested_timeout is not None:
+        if (
+            not require_delta
+            or isinstance(requested_timeout, bool)
+            or not isinstance(requested_timeout, (int, float))
+            or not _is_finite_number(requested_timeout)
+            or requested_timeout <= 0
+            or configured_timeout is None
+            or requested_timeout > configured_timeout
+        ):
+            return JSONResponse(
+                {"error": "stage_timeout_seconds must be within the configured delta limit"},
+                status_code=400,
+            )
+        stage_timeout = float(requested_timeout)
+    else:
+        stage_timeout = configured_timeout
     _begin_lora_stage()
     started = time.perf_counter()
-    try:
-        stage_timeout = _delta_stage_timeout_s() if require_delta else None
-        stage_call = asyncio.to_thread(
+    cancel_event = threading.Event()
+    committed_event = threading.Event()
+    stage_task = asyncio.create_task(
+        asyncio.to_thread(
             stage_lora_adapter_files,
             source_url,
             require_delta=require_delta,
+            stage_timeout_seconds=stage_timeout,
+            cancel_event=cancel_event,
+            committed_event=committed_event,
         )
-        try:
-            destination = await asyncio.wait_for(
-                stage_call,
-                timeout=stage_timeout,
-            )
-        except asyncio.TimeoutError:
-            return JSONResponse(
-                {"error": "adapter delta staging exceeded its time limit"}, status_code=504
-            )
+    )
+
+    async def monitor_disconnect() -> None:
+        while not stage_task.done():
+            if await raw_request.is_disconnected():
+                with _adapter_stage_publish_lock:
+                    if not committed_event.is_set():
+                        cancel_event.set()
+                return
+            await asyncio.sleep(0.25)
+
+    disconnect_task = asyncio.create_task(monitor_disconnect())
+
+    def success_payload(destination):
         payload = {
             "status": "ok",
             "path": destination.as_posix(),
@@ -241,7 +280,42 @@ async def stage_lora_adapter(raw_request: Request):
         if isinstance(stage_state.get("reconstruct_seconds"), (int, float)):
             payload["reconstruct_seconds"] = float(stage_state["reconstruct_seconds"])
         return payload
+
+    try:
+        try:
+            destination = await asyncio.wait_for(
+                asyncio.shield(stage_task),
+                timeout=stage_timeout,
+            )
+        except asyncio.TimeoutError:
+            with _adapter_stage_publish_lock:
+                if not committed_event.is_set():
+                    cancel_event.set()
+            try:
+                destination = await stage_task
+            except BaseException:
+                destination = None
+            if committed_event.is_set() and destination is not None:
+                return success_payload(destination)
+            return JSONResponse(
+                {"error": "adapter delta staging exceeded its time limit"}, status_code=504
+            )
+        except asyncio.CancelledError:
+            with _adapter_stage_publish_lock:
+                if not committed_event.is_set():
+                    cancel_event.set()
+            try:
+                await stage_task
+            except BaseException:
+                pass
+            raise
+        return success_payload(destination)
     finally:
+        disconnect_task.cancel()
+        try:
+            await disconnect_task
+        except asyncio.CancelledError:
+            pass
         _end_lora_stage()
 
 

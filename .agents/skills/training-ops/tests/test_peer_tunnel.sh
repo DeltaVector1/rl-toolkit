@@ -34,6 +34,7 @@ for port in $(seq 18100 18131); do
 done
 peer_enabled=1
 peer_api_port=18049
+relay_port=18160
 peer_name=h200b
 peer_host=38.255.28.19
 peer_ssh_port=20099
@@ -60,7 +61,7 @@ while IFS= read -r line; do
   esac
 done <"$log"
 for port in $(seq 18100 18131); do
-  test "$(grep -F -c -- "-R 127.0.0.1:$port:127.0.0.1:$port" "$log")" -eq 1
+  test "$(grep -F -c -- "-R 127.0.0.1:$port:127.0.0.1:$relay_port" "$log")" -eq 1
 done
 while IFS= read -r line; do
   reverse_count=$(grep -o -- '-R 127.0.0.1:' <<<"$line" | wc -l)

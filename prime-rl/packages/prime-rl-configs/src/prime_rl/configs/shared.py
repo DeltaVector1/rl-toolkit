@@ -147,6 +147,9 @@ class ClientConfig(BaseConfig):
     admin_base_url: list[str] | None = None
     """Separate base URLs for admin operations (weight updates, health checks). When set, admin clients bypass routers and hit each server directly — used in disaggregated P/D deployments where the router must not handle admin traffic."""
 
+    adapter_origin_base_urls: list[str] | None = None
+    """Admin URLs that host the canonical adapter source. They are staged before peer URLs."""
+
     elastic: ElasticConfig | None = None
     """Elastic inference pool config for DNS-based service discovery. When set, ``base_url`` is ignored and inference servers are discovered dynamically via DNS."""
 

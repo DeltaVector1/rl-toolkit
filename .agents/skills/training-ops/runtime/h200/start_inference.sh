@@ -19,6 +19,10 @@ last = ports["lora_source_last"]
 if not isinstance(first, int) or not isinstance(last, int) or first < 1 or last < first:
     raise SystemExit("invalid lora source port range")
 print(",".join(str(port) for port in range(first, last + 1)))
+cache_dir = config["paths"].get("adapter_cache")
+if not isinstance(cache_dir, str) or not cache_dir.startswith("/"):
+    raise SystemExit("paths.adapter_cache is missing")
+print(cache_dir)
 disable_nccl_shm = inference[host].get("disable_nccl_shm", False)
 if not isinstance(disable_nccl_shm, bool):
     raise SystemExit(f"disable_nccl_shm for {host} must be true or false")
@@ -36,10 +40,11 @@ print(dp)
 PY
 )
 lora_source_port_list=${runtime_settings[0]:?operations config has no LoRA source ports}
-disable_nccl_shm=${runtime_settings[1]:?operations config has no NCCL shared-memory setting}
-tensor_parallel_size=${runtime_settings[2]:?operations config has no GLM tensor parallel size}
-data_parallel_size=${runtime_settings[3]:?operations config has no GLM data parallel size}
-install -d -o 1000 -g 1000 -m 0755 /data/glm52-rl/lora-cache
+adapter_cache_dir=${runtime_settings[1]:?operations config has no adapter cache path}
+disable_nccl_shm=${runtime_settings[2]:?operations config has no NCCL shared-memory setting}
+tensor_parallel_size=${runtime_settings[3]:?operations config has no GLM tensor parallel size}
+data_parallel_size=${runtime_settings[4]:?operations config has no GLM data parallel size}
+install -d -o 1000 -g 1000 -m 0755 "$adapter_cache_dir"
 install -d -o 1000 -g 1000 -m 0755 "$deployment/cache/vllm"
 docker update --restart=no glm52-decensor-h200 glm52-decensor-h200-0 glm52-decensor-h200-1 >/dev/null 2>&1 || true
 docker rm -f glm52-decensor-h200 glm52-decensor-h200-0 glm52-decensor-h200-1 >/dev/null 2>&1 || true
@@ -71,7 +76,8 @@ docker run -d --name glm52-decensor-h200 --restart unless-stopped \
   -e NCCL_SHM_DISABLE="$disable_nccl_shm" \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   -e VLLM_ENGINE_READY_TIMEOUT_S=7200 \
-  -e PRIME_LORA_DOWNLOAD_STREAMS=32 \
+  -e PRIME_LORA_CACHE_DIR="$adapter_cache_dir" \
+  -e PRIME_LORA_DOWNLOAD_STREAMS=64 \
   -e PRIME_LORA_SOURCE_PORTS="$lora_source_port_list" \
   --entrypoint /bin/bash \
   prime-rl:glm52-v080-glm52-h200-router \

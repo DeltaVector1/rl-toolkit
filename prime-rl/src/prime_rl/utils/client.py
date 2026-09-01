@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import time
 import tomllib
@@ -82,6 +83,11 @@ class InferencePool(Protocol):
         """Update weights on all inference servers."""
         ...
 
+    @property
+    def adapter_origin_base_urls(self) -> list[str] | None:
+        """Return the configured admin URLs used as adapter origins."""
+        ...
+
     async def score(self, token_ids: list[int]) -> list[float]:
         """Prefill-score ``token_ids`` under the pool's model — one logprob per token."""
         ...
@@ -148,6 +154,13 @@ class StaticInferencePool:
         self._admin_clients = setup_admin_clients(client_config)
         self._skip_model_check = client_config.skip_model_check
         self._wait_for_ready_timeout = client_config.wait_for_ready_timeout
+        self._adapter_origin_base_urls = client_config.adapter_origin_base_urls
+        admin_origins = {
+            str(client.base_url).rstrip("/").removesuffix("/v1")
+            for client in self._admin_clients
+        }
+        if len(admin_origins) > 1 and not self._adapter_origin_base_urls:
+            raise ValueError("adapter origin base URLs are required for multiple admin endpoints")
         self._eval_cycle = cycle(self._eval_clients)
         self._scorer = PrefillScorer()
         self.model_name = model_name
@@ -159,6 +172,10 @@ class StaticInferencePool:
     @property
     def admin_clients(self) -> list[AsyncClient]:
         return self._admin_clients
+
+    @property
+    def adapter_origin_base_urls(self) -> list[str] | None:
+        return self._adapter_origin_base_urls
 
     def update_model_name(self, model_name: str) -> None:
         self.model_name = model_name
@@ -570,6 +587,7 @@ async def stage_lora_adapter(
     lora_path: Path | str,
     *,
     require_delta: bool = False,
+    origin_base_urls: list[str] | None = None,
 ) -> dict[str, float | int | None]:
     """Stage one adapter copy per inference host.
 
@@ -594,17 +612,57 @@ async def stage_lora_adapter(
     for client in admin_clients:
         hosts.setdefault(host_key(client), client)
 
-    async def _stage_one(client: AsyncClient) -> dict[str, float | None]:
+    def normalized_url(client: AsyncClient) -> str:
+        return str(client.base_url).rstrip("/").removesuffix("/v1")
+
+    if origin_base_urls is None:
+        ordered_hosts = list(hosts.values())
+        origin_count = len(ordered_hosts)
+        peer_groups = []
+    else:
+        configured = {
+            str(url).rstrip("/").removesuffix("/v1")
+            for url in origin_base_urls
+            if isinstance(url, str) and str(url).strip()
+        }
+        if not configured:
+            raise RuntimeError("adapter origin base URLs are not configured")
+        unknown_origins = configured - {normalized_url(client) for client in hosts.values()}
+        if unknown_origins:
+            raise RuntimeError(
+                "configured adapter origin is not an admin endpoint: "
+                + ", ".join(sorted(unknown_origins))
+            )
+        origin_hosts = [client for client in hosts.values() if normalized_url(client) in configured]
+        peer_hosts = [client for client in hosts.values() if normalized_url(client) not in configured]
+        if not origin_hosts:
+            raise RuntimeError("configured adapter origin is not an admin endpoint")
+        ordered_hosts = origin_hosts
+        origin_count = len(origin_hosts)
+        peer_groups = [peer_hosts] if peer_hosts else []
+
+    async def _stage_one(
+        client: AsyncClient,
+        *,
+        remaining_delta_seconds: float | None = None,
+    ) -> dict[str, float | None]:
         started = time.perf_counter()
-        stage_timeout_s = _delta_stage_timeout_s() if require_delta else LORA_STAGE_ATTEMPT_TIMEOUT_S
+        stage_timeout_s = (
+            remaining_delta_seconds
+            if remaining_delta_seconds is not None
+            else LORA_STAGE_ATTEMPT_TIMEOUT_S
+        )
         stage_total_timeout_s = stage_timeout_s if require_delta else LORA_STAGE_TOTAL_TIMEOUT_S
+        payload = {
+            "lora_path": lora_path_posix,
+            "require_delta": require_delta,
+        }
+        if remaining_delta_seconds is not None:
+            payload["stage_timeout_seconds"] = remaining_delta_seconds
         response = await _admin_post_response(
             client,
             "/stage_lora_adapter",
-            json={
-                "lora_path": lora_path_posix,
-                "require_delta": require_delta,
-            },
+            json=payload,
             timeout_s=stage_timeout_s,
             total_timeout_s=stage_total_timeout_s,
         )
@@ -628,11 +686,34 @@ async def stage_lora_adapter(
         }
 
     started = time.perf_counter()
-    results = await asyncio.gather(*(_stage_one(client) for client in hosts.values()))
-    wire_stage_seconds = max(
-        (float(result["wire_stage_seconds"]) for result in results),
-        default=time.perf_counter() - started,
-    )
+    delta_deadline = started + _delta_stage_timeout_s() if require_delta else None
+    results = []
+    group_seconds: list[float] = []
+    for group in [ordered_hosts, *peer_groups]:
+        group_started = time.perf_counter()
+        if delta_deadline is None:
+            results.extend(await asyncio.gather(*(_stage_one(client) for client in group)))
+        else:
+            remaining = delta_deadline - time.perf_counter()
+            if remaining <= 0:
+                raise TimeoutError("adapter delta staging exceeded its time limit")
+            try:
+                staged = await asyncio.wait_for(
+                    asyncio.gather(
+                        *(
+                            _stage_one(client, remaining_delta_seconds=remaining)
+                            for client in group
+                        )
+                    ),
+                    timeout=remaining,
+                )
+            except asyncio.TimeoutError as exc:
+                raise TimeoutError("adapter delta staging exceeded its time limit") from exc
+            results.extend(staged)
+        group_seconds.append(time.perf_counter() - group_started)
+    origin_stage_seconds = group_seconds[0] if group_seconds else 0.0
+    peer_stage_seconds = sum(group_seconds[1:])
+    wire_stage_seconds = time.perf_counter() - started
     reconstruct_values = [
         float(result["reconstruct_seconds"])
         for result in results
@@ -640,8 +721,12 @@ async def stage_lora_adapter(
     ]
     return {
         "wire_stage_seconds": wire_stage_seconds,
+        "origin_stage_seconds": origin_stage_seconds,
+        "peer_stage_seconds": peer_stage_seconds,
         "reconstruct_seconds": max(reconstruct_values) if reconstruct_values else None,
         "host_count": len(hosts),
+        "origin_host_count": origin_count,
+        "peer_host_count": len(hosts) - origin_count,
     }
 
 
@@ -797,9 +882,23 @@ def _delta_stage_timeout_s() -> float:
             if not isinstance(limits, dict) or "adapter_delta_stage_timeout_seconds" not in limits:
                 raise RuntimeError("operations config has no adapter delta stage timeout")
             value = limits["adapter_delta_stage_timeout_seconds"]
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not _is_finite_number(value)
+        or value <= 0
+    ):
         raise RuntimeError("adapter delta stage timeout must be positive")
     return float(value)
+
+
+def _is_finite_number(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (OverflowError, ValueError):
+        return False
 
 
 async def load_lora_adapter(

@@ -1,3 +1,4 @@
+import asyncio
 import ast
 import functools
 import hashlib
@@ -5,11 +6,13 @@ import http.server
 import importlib.util
 import io
 import json
+import math
 import os
 import socketserver
 import sys
 import tempfile
 import threading
+import time
 import types
 import tomllib
 import unittest
@@ -91,6 +94,47 @@ def load_filesystem_module():
                 sys.modules.pop(name, None)
             else:
                 sys.modules[name] = previous
+
+
+def load_server_stage_method(stage_worker, publish_lock=None):
+    path = ROOT / "src/prime_rl/inference/vllm/server.py"
+    source = path.read_text(encoding="utf-8")
+    function = next(
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "stage_lora_adapter"
+    )
+
+    class FakeJSONResponse:
+        def __init__(self, content, status_code):
+            self.content = content
+            self.status_code = status_code
+
+    class FakeRouter:
+        def post(self, *_args, **_kwargs):
+            return lambda function: function
+
+    namespace = {
+        "asyncio": asyncio,
+        "threading": threading,
+        "time": time,
+        "router": FakeRouter(),
+        "Request": object,
+        "JSONResponse": FakeJSONResponse,
+        "_delta_stage_timeout_s": lambda: 0.01,
+        "_adapter_stage_publish_lock": publish_lock or threading.Lock(),
+        "_is_finite_number": lambda value: (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+        ),
+        "_begin_lora_stage": lambda: None,
+        "_end_lora_stage": lambda: None,
+        "stage_lora_adapter_files": stage_worker,
+        "adapter_stage_status": lambda: {},
+    }
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)
+    return namespace["stage_lora_adapter"], FakeJSONResponse
 
 
 class QuietDirectoryHandler(http.server.SimpleHTTPRequestHandler):
@@ -244,6 +288,10 @@ class AdapterTransportStateTest(unittest.TestCase):
                     server_thread.join()
             sidecar = destination / "adapter_model.safetensors.sha256"
             self.assertEqual(sidecar.read_text(encoding="ascii").strip(), hashlib.sha256(model).hexdigest())
+            self.assertTrue((destination / "adapter_manifest.json").is_file())
+            relay_manifest = json.loads((destination / "relay_manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(relay_manifest["transport"], "full")
+            self.assertIn("adapter_model.safetensors", relay_manifest["files"])
 
     def test_protocol_has_one_strict_delta_flag(self):
         worker = ROOT / "src/prime_rl/inference/vllm/worker/filesystem.py"
@@ -294,6 +342,253 @@ class AdapterTransportStateTest(unittest.TestCase):
             else:
                 os.environ["PRIME_LORA_DOWNLOAD_STREAMS"] = old_value
 
+    def test_explicit_delta_stage_timeout_is_positive_and_bounded(self):
+        filesystem = load_filesystem_module()
+        old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
+        old_timeout = filesystem._delta_stage_timeout_s
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                os.environ["PRIME_LORA_CACHE_DIR"] = temporary
+                filesystem._delta_stage_timeout_s = lambda: 30.0
+                invalid_values = (
+                    (False, 1.0),
+                    (True, 0),
+                    (True, -1.0),
+                    (True, 31.0),
+                    (True, True),
+                    (True, "1"),
+                    (True, float("nan")),
+                    (True, float("inf")),
+                    (True, float("-inf")),
+                )
+                for require_delta, timeout in invalid_values:
+                    with self.assertRaisesRegex(OSError, "timeout is invalid"):
+                        filesystem.stage_lora_adapter_files(
+                            "http://source/step_1",
+                            require_delta=require_delta,
+                            stage_timeout_seconds=timeout,
+                        )
+        finally:
+            if old_cache is None:
+                os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+            else:
+                os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+            filesystem._delta_stage_timeout_s = old_timeout
+
+    def test_stage_timeout_returns_only_after_worker_stops(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            ready = Path(temporary) / "READY"
+            started = threading.Event()
+
+            def stage_worker(
+                _source_url,
+                *,
+                require_delta,
+                stage_timeout_seconds,
+                cancel_event,
+                committed_event,
+            ):
+                self.assertTrue(require_delta)
+                self.assertEqual(stage_timeout_seconds, 0.01)
+                self.assertFalse(committed_event.is_set())
+                started.set()
+                time.sleep(0.04)
+                if cancel_event.is_set():
+                    raise TimeoutError("cancelled")
+                ready.write_text("ready\n", encoding="utf-8")
+                return Path(temporary)
+
+            stage_method, response_type = load_server_stage_method(stage_worker)
+
+            class Request:
+                async def json(self):
+                    return {
+                        "lora_path": "http://source/step_1",
+                        "require_delta": True,
+                        "stage_timeout_seconds": 0.01,
+                    }
+
+                async def is_disconnected(self):
+                    return False
+
+            started_at = time.monotonic()
+            response = asyncio.run(stage_method(Request()))
+            elapsed = time.monotonic() - started_at
+
+            self.assertIsInstance(response, response_type)
+            self.assertEqual(response.status_code, 504)
+            self.assertTrue(started.is_set())
+            self.assertGreaterEqual(elapsed, 0.035)
+            self.assertFalse(ready.exists())
+            time.sleep(0.02)
+            self.assertFalse(ready.exists())
+
+    def test_publish_wins_timeout_race_returns_success(self):
+        for _ in range(10):
+            with tempfile.TemporaryDirectory() as temporary:
+                ready = Path(temporary) / "READY"
+                started = threading.Event()
+                publish_lock = threading.Lock()
+
+                def stage_worker(
+                    _source_url,
+                    *,
+                    require_delta,
+                    stage_timeout_seconds,
+                    cancel_event,
+                    committed_event,
+                ):
+                    self.assertTrue(require_delta)
+                    self.assertEqual(stage_timeout_seconds, 0.005)
+                    with publish_lock:
+                        started.set()
+                        time.sleep(0.02)
+                        if cancel_event.is_set():
+                            raise TimeoutError("cancelled")
+                        ready.write_text("ready\n", encoding="utf-8")
+                        committed_event.set()
+                    return Path(temporary)
+
+                stage_method, _ = load_server_stage_method(stage_worker, publish_lock)
+
+                class Request:
+                    async def json(self):
+                        return {
+                            "lora_path": "http://source/step_1",
+                            "require_delta": True,
+                            "stage_timeout_seconds": 0.005,
+                        }
+
+                    async def is_disconnected(self):
+                        return False
+
+                async def run_stage():
+                    task = asyncio.create_task(stage_method(Request()))
+                    await asyncio.to_thread(started.wait)
+                    return await task
+
+                response = asyncio.run(run_stage())
+                self.assertIsInstance(response, dict)
+                self.assertEqual(response["status"], "ok")
+                self.assertTrue(ready.exists())
+
+    def test_server_rejects_non_finite_stage_timeout(self):
+        def stage_worker(**_kwargs):
+            raise AssertionError("invalid timeout reached the worker")
+
+        stage_method, response_type = load_server_stage_method(stage_worker)
+
+        class Request:
+            def __init__(self, timeout):
+                self.timeout = timeout
+
+            async def json(self):
+                return {
+                    "lora_path": "http://source/step_1",
+                    "require_delta": True,
+                    "stage_timeout_seconds": self.timeout,
+                }
+
+        for timeout in (float("nan"), float("inf"), float("-inf")):
+            response = asyncio.run(stage_method(Request(timeout)))
+            self.assertIsInstance(response, response_type)
+            self.assertEqual(response.status_code, 400)
+
+    def test_request_cancellation_waits_for_worker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            ready = Path(temporary) / "READY"
+            started = threading.Event()
+            stopped = threading.Event()
+
+            def stage_worker(
+                _source_url,
+                *,
+                require_delta,
+                stage_timeout_seconds,
+                cancel_event,
+                committed_event,
+            ):
+                self.assertFalse(require_delta)
+                self.assertIsNone(stage_timeout_seconds)
+                self.assertFalse(committed_event.is_set())
+                started.set()
+                time.sleep(0.04)
+                if cancel_event.is_set():
+                    stopped.set()
+                    raise TimeoutError("cancelled")
+                ready.write_text("ready\n", encoding="utf-8")
+                return Path(temporary)
+
+            stage_method, _ = load_server_stage_method(stage_worker)
+
+            class Request:
+                async def json(self):
+                    return {
+                        "lora_path": "http://source/step_1",
+                        "require_delta": False,
+                    }
+
+                async def is_disconnected(self):
+                    return False
+
+            async def cancel_request():
+                task = asyncio.create_task(stage_method(Request()))
+                await asyncio.to_thread(started.wait)
+                started_at = time.monotonic()
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                return time.monotonic() - started_at
+
+            elapsed = asyncio.run(cancel_request())
+            self.assertTrue(stopped.is_set())
+            self.assertGreaterEqual(elapsed, 0.035)
+            self.assertFalse(ready.exists())
+
+    def test_request_disconnect_stops_worker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            ready = Path(temporary) / "READY"
+            started = threading.Event()
+            stopped = threading.Event()
+
+            def stage_worker(
+                _source_url,
+                *,
+                require_delta,
+                stage_timeout_seconds,
+                cancel_event,
+                committed_event,
+            ):
+                self.assertFalse(require_delta)
+                self.assertIsNone(stage_timeout_seconds)
+                self.assertFalse(committed_event.is_set())
+                started.set()
+                time.sleep(0.04)
+                if cancel_event.is_set():
+                    stopped.set()
+                    raise TimeoutError("cancelled")
+                ready.write_text("ready\n", encoding="utf-8")
+                return Path(temporary)
+
+            stage_method, response_type = load_server_stage_method(stage_worker)
+
+            class Request:
+                async def json(self):
+                    return {
+                        "lora_path": "http://source/step_1",
+                        "require_delta": False,
+                    }
+
+                async def is_disconnected(self):
+                    return True
+
+            response = asyncio.run(stage_method(Request()))
+            self.assertIsInstance(response, response_type)
+            self.assertEqual(response.status_code, 504)
+            self.assertTrue(started.is_set())
+            self.assertTrue(stopped.is_set())
+            self.assertFalse(ready.exists())
+
     def test_inventory_defines_bounded_32_lane_transfer(self):
         operations = REPOSITORY / "configs/operations.toml"
         with operations.open("rb") as stream:
@@ -302,9 +597,11 @@ class AdapterTransportStateTest(unittest.TestCase):
         self.assertEqual(ports["lora_source_last"] - ports["lora_source_first"] + 1, 32)
         self.assertEqual(config["limits"]["adapter_delta_stage_timeout_seconds"], 300)
         runtime = REPOSITORY / ".agents/skills/training-ops/runtime/h200"
-        for name in ("start_inference.sh", "start_muse_inference.sh"):
-            source = (runtime / name).read_text(encoding="utf-8")
-            self.assertIn("PRIME_LORA_DOWNLOAD_STREAMS=32", source)
+        glm_source = (runtime / "start_inference.sh").read_text(encoding="utf-8")
+        muse_source = (runtime / "start_muse_inference.sh").read_text(encoding="utf-8")
+        self.assertIn("PRIME_LORA_DOWNLOAD_STREAMS=64", glm_source)
+        self.assertIn("PRIME_LORA_DOWNLOAD_STREAMS=32", muse_source)
+        for source in (glm_source, muse_source):
             self.assertIn('PRIME_LORA_SOURCE_PORTS="$lora_source_port_list"', source)
         worker_source = (REPOSITORY / "prime-rl/src/prime_rl/inference/vllm/worker/filesystem.py").read_text(encoding="utf-8")
         self.assertIn("download_streams = _configured_download_streams()", worker_source)
@@ -390,6 +687,15 @@ class AdapterTransportStateTest(unittest.TestCase):
             "version": 1,
             "mode": "delta",
             "transport": "chunked-shuffled-xor-zstd",
+            "source_manifest": {
+                "version": 1,
+                "kind": "lora-adapter",
+                "mode": "delta",
+                "transport": "chunked-shuffled-xor-zstd",
+                "target_step": 2,
+                "base_step": 1,
+                "files": [],
+            },
             "base_url": "http://source/step_1",
             "base_sha256": "a" * 64,
             "base_config_sha256": "b" * 64,
@@ -462,6 +768,7 @@ class AdapterTransportStateTest(unittest.TestCase):
 
                 destination = filesystem.adapter_cache_path(source_url)
                 partial = destination.with_name(f"{destination.name}.partial")
+                self.assertFalse((destination / "READY").exists())
                 completed = partial / "transport-chunks" / "chunk-0.done"
                 self.assertTrue(completed.is_file())
                 self.assertTrue((partial / "adapter_model.safetensors").is_file())
@@ -469,6 +776,10 @@ class AdapterTransportStateTest(unittest.TestCase):
 
                 filesystem.stage_lora_adapter_files(source_url, require_delta=True)
                 self.assertTrue((destination / "READY").is_file())
+                self.assertTrue((destination / "adapter_manifest.json").is_file())
+                self.assertTrue((destination / "relay_manifest.json").is_file())
+                self.assertTrue((destination / "transport-chunks" / "chunk-0").is_file())
+                self.assertTrue((destination / "transport-chunks" / "chunk-1").is_file())
                 self.assertNotIn("chunk-0", downloaded[len(downloaded_after_failure) :])
                 self.assertIn("chunk-1", downloaded[len(downloaded_after_failure) :])
         finally:

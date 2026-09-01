@@ -1,6 +1,7 @@
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -52,6 +53,7 @@ _MAX_DOWNLOAD_STREAMS = 64
 _ADAPTER_FILES = ("adapter_config.json", "adapter_model.safetensors")
 _ADAPTER_MANIFEST = "adapter_manifest.json"
 _ADAPTER_DIGEST = "adapter_model.safetensors.sha256"
+_RELAY_MANIFEST = "relay_manifest.json"
 _ADAPTER_STATUS = ".adapter-stage-status.json"
 _ADAPTER_DELTA_TRANSPORT = "chunked-shuffled-xor-zstd"
 _ADAPTER_MAX_CHUNKS = 65536
@@ -59,6 +61,7 @@ _ADAPTER_LANE_TIMEOUT_S = float(os.environ.get("PRIME_LORA_LANE_TIMEOUT_S", "45"
 _ADAPTER_LANE_RETRIES = int(os.environ.get("PRIME_LORA_LANE_RETRIES", "6"))
 _ADAPTER_STATUS_INTERVAL_S = float(os.environ.get("PRIME_LORA_STATUS_INTERVAL_S", "1"))
 _JSON_LOCK = threading.Lock()
+_adapter_stage_publish_lock = threading.Lock()
 
 
 def _configured_download_streams() -> int:
@@ -102,31 +105,73 @@ def _delta_stage_timeout_s() -> float:
             if not isinstance(limits, dict) or "adapter_delta_stage_timeout_seconds" not in limits:
                 raise OSError("operations config has no adapter delta stage timeout")
             value = limits["adapter_delta_stage_timeout_seconds"]
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not _is_finite_number(value)
+        or value <= 0
+    ):
         raise OSError("adapter delta stage timeout must be positive")
     return float(value)
 
 
-def _check_deadline(deadline: float | None) -> None:
+def _is_finite_number(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (OverflowError, ValueError):
+        return False
+
+
+def _check_cancelled(cancel_event: threading.Event | None) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise TimeoutError("adapter staging was cancelled")
+
+
+def _check_deadline(
+    deadline: float | None,
+    cancel_event: threading.Event | None = None,
+) -> None:
+    _check_cancelled(cancel_event)
     if deadline is not None and time.monotonic() >= deadline:
         raise TimeoutError("adapter delta staging exceeded its time limit")
 
 
-def _acquire_stage_lock(lock, deadline: float | None) -> None:
+def _acquire_stage_lock(
+    lock,
+    deadline: float | None,
+    cancel_event: threading.Event | None = None,
+) -> None:
     if deadline is None:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        return
+        while True:
+            _check_cancelled(cancel_event)
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except BlockingIOError:
+                if cancel_event is None:
+                    time.sleep(0.1)
+                else:
+                    cancel_event.wait(0.1)
     while True:
-        _check_deadline(deadline)
+        _check_deadline(deadline, cancel_event)
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             return
         except BlockingIOError:
-            time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+            wait_for = min(0.1, max(0.0, deadline - time.monotonic()))
+            if cancel_event is None:
+                time.sleep(wait_for)
+            else:
+                cancel_event.wait(wait_for)
 
 
-def _request_timeout(deadline: float | None) -> float:
-    _check_deadline(deadline)
+def _request_timeout(
+    deadline: float | None,
+    cancel_event: threading.Event | None = None,
+) -> float:
+    _check_deadline(deadline, cancel_event)
     if deadline is None:
         return _ADAPTER_LANE_TIMEOUT_S
     return min(_ADAPTER_LANE_TIMEOUT_S, deadline - time.monotonic())
@@ -140,8 +185,10 @@ def _wait_for_futures(
 ) -> None:
     try:
         for future in futures:
+            _check_cancelled(cancel_event)
             if deadline is None:
                 future.result()
+                _check_cancelled(cancel_event)
                 continue
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -150,6 +197,7 @@ def _wait_for_futures(
                 future.result(timeout=remaining)
             except FutureTimeoutError as exc:
                 raise TimeoutError("adapter delta staging exceeded its time limit") from exc
+            _check_cancelled(cancel_event)
     except BaseException:
         if cancel_event is not None:
             cancel_event.set()
@@ -164,47 +212,77 @@ def _wait_for_futures(
         executor.shutdown(wait=True)
 
 
-def _content_length(source_url: str, deadline: float | None = None) -> int:
-    _check_deadline(deadline)
+def _content_length(
+    source_url: str,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+) -> int:
+    _check_deadline(deadline, cancel_event)
     with urllib.request.urlopen(
-        urllib.request.Request(source_url, method="HEAD"), timeout=_request_timeout(deadline)
+        urllib.request.Request(source_url, method="HEAD"),
+        timeout=_request_timeout(deadline, cancel_event),
     ) as response:
-        _check_deadline(deadline)
+        _check_deadline(deadline, cancel_event)
         try:
             return int(response.headers["Content-Length"])
         except (TypeError, ValueError) as exc:
             raise OSError(f"adapter source has no valid Content-Length: {source_url}") from exc
 
 
-def _read_source_text(source_url: str, deadline: float | None = None) -> str:
-    return _read_source_bytes(source_url, deadline=deadline).decode("utf-8")
+def _read_source_text(
+    source_url: str,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+) -> str:
+    return _read_source_bytes(
+        source_url,
+        deadline=deadline,
+        cancel_event=cancel_event,
+    ).decode("utf-8")
 
 
-def _read_source_bytes(source_url: str, deadline: float | None = None) -> bytes:
-    _check_deadline(deadline)
-    with urllib.request.urlopen(source_url, timeout=_request_timeout(deadline)) as response:
+def _read_source_bytes(
+    source_url: str,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+) -> bytes:
+    _check_deadline(deadline, cancel_event)
+    with urllib.request.urlopen(
+        source_url,
+        timeout=_request_timeout(deadline, cancel_event),
+    ) as response:
         chunks = []
         while True:
-            _check_deadline(deadline)
+            _check_deadline(deadline, cancel_event)
             chunk = response.read(16 * 1024 * 1024)
             if not chunk:
                 break
             chunks.append(chunk)
-        _check_deadline(deadline)
+        _check_deadline(deadline, cancel_event)
         return b"".join(chunks)
 
 
-def _source_manifest(source_url: str, deadline: float | None = None) -> dict[str, object]:
+def _source_manifest(
+    source_url: str,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+) -> dict[str, object]:
     """Read the immutable adapter manifest published beside a STABLE marker.
 
     Older broadcasts have only the model checksum sidecar. Keep that fallback,
     but always return a local manifest with a size and digest for every file.
     """
     source_root = source_url.rstrip("/")
-    _check_deadline(deadline)
+    _check_deadline(deadline, cancel_event)
     manifest_url = f"{source_root}/{_ADAPTER_MANIFEST}"
     try:
-        value = json.loads(_read_source_text(manifest_url, deadline=deadline))
+        value = json.loads(
+            _read_source_text(
+                manifest_url,
+                deadline=deadline,
+                cancel_event=cancel_event,
+            )
+        )
     except HTTPError as exc:
         if exc.code != 404:
             raise
@@ -217,7 +295,7 @@ def _source_manifest(source_url: str, deadline: float | None = None) -> dict[str
             raise OSError("adapter source manifest has no files")
         files: dict[str, dict[str, object]] = {}
         for item in raw_files:
-            _check_deadline(deadline)
+            _check_deadline(deadline, cancel_event)
             if not isinstance(item, dict):
                 raise OSError("invalid adapter source manifest file")
             name = item.get("name")
@@ -240,21 +318,35 @@ def _source_manifest(source_url: str, deadline: float | None = None) -> dict[str
     model_url = f"{source_root}/{_ADAPTER_FILES[1]}"
     config_url = f"{source_root}/{_ADAPTER_FILES[0]}"
     digest_text = _read_source_text(
-        f"{source_root}/{_ADAPTER_DIGEST}", deadline=deadline
+        f"{source_root}/{_ADAPTER_DIGEST}",
+        deadline=deadline,
+        cancel_event=cancel_event,
     ).strip().split()
     if not digest_text or re.fullmatch(r"[0-9a-f]{64}", digest_text[0]) is None:
         raise OSError("adapter source has no valid model checksum")
-    config_bytes = _read_source_bytes(config_url, deadline=deadline)
+    config_bytes = _read_source_bytes(
+        config_url,
+        deadline=deadline,
+        cancel_event=cancel_event,
+    )
     return {
         "version": 1,
         "source_url": source_url,
         "files": {
             _ADAPTER_FILES[0]: {
-                "size": _content_length(config_url, deadline=deadline),
+                "size": _content_length(
+                    config_url,
+                    deadline=deadline,
+                    cancel_event=cancel_event,
+                ),
                 "sha256": hashlib.sha256(config_bytes).hexdigest(),
             },
             _ADAPTER_FILES[1]: {
-                "size": _content_length(model_url, deadline=deadline),
+                "size": _content_length(
+                    model_url,
+                    deadline=deadline,
+                    cancel_event=cancel_event,
+                ),
                 "sha256": digest_text[0],
             },
         },
@@ -295,14 +387,20 @@ def _adapter_source_urls(source_url: str) -> list[str]:
 
 
 def _read_chunked_xor_manifest(
-    source_url: str, deadline: float | None = None
+    source_url: str,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, object] | None:
     """Read the exact version-one adapter transport manifest."""
     source_root = source_url.rstrip("/")
-    _check_deadline(deadline)
+    _check_deadline(deadline, cancel_event)
     try:
         value = json.loads(
-            _read_source_text(f"{source_root}/{_ADAPTER_MANIFEST}", deadline=deadline)
+            _read_source_text(
+                f"{source_root}/{_ADAPTER_MANIFEST}",
+                deadline=deadline,
+                cancel_event=cancel_event,
+            )
         )
     except HTTPError as exc:
         if exc.code == 404:
@@ -312,7 +410,7 @@ def _read_chunked_xor_manifest(
         raise OSError("invalid adapter transport manifest")
     mode = value.get("mode")
     if mode == "full":
-        return {"mode": "full"}
+        return {"mode": "full", "source_manifest": value}
     if mode != "delta" or value.get("kind") != "lora-adapter":
         raise OSError("adapter manifest selects an unsupported mode")
     if value.get("transport") != _ADAPTER_DELTA_TRANSPORT:
@@ -365,7 +463,7 @@ def _read_chunked_xor_manifest(
     chunks: list[dict[str, object]] = []
     seen_files: set[str] = set()
     for item in raw_chunks:
-        _check_deadline(deadline)
+        _check_deadline(deadline, cancel_event)
         if not isinstance(item, dict):
             raise OSError("adapter transport chunk is not an object")
         name = item.get("file")
@@ -376,7 +474,9 @@ def _read_chunked_xor_manifest(
         raw_sha256 = item.get("raw_sha256")
         if (
             not isinstance(name, str)
+            or not name
             or Path(name).name != name
+            or name in {*_ADAPTER_FILES, _ADAPTER_MANIFEST}
             or name in seen_files
             or type(offset) is not int
             or offset < 0
@@ -409,7 +509,7 @@ def _read_chunked_xor_manifest(
         expected_offset += int(item["raw_size"])
     if expected_offset != target_size:
         raise OSError("adapter transport chunks do not cover the target")
-    _check_deadline(deadline)
+    _check_deadline(deadline, cancel_event)
     chunk_count = value.get("chunk_count")
     if chunk_count is not None and chunk_count != len(chunks):
         raise OSError("adapter transport chunk count differs")
@@ -417,6 +517,7 @@ def _read_chunked_xor_manifest(
         "version": 1,
         "mode": "delta",
         "transport": _ADAPTER_DELTA_TRANSPORT,
+        "source_manifest": value,
         "base_url": base_url,
         "base_sha256": base_sha256,
         "target_sha256": target_sha256,
@@ -435,6 +536,201 @@ def _write_json(path: Path, value: dict[str, object]) -> None:
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(temporary, path)
+
+
+def _publish_relay_manifest(
+    directory: Path,
+    source_url: str,
+    source_manifest: dict[str, object],
+    transport: dict[str, object],
+    validated_files: dict[str, object],
+    *,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+) -> None:
+    """Publish the already validated files that the local relay may serve."""
+    mode = transport.get("mode")
+    if mode not in {"full", "delta"}:
+        raise OSError("adapter relay transport mode is invalid")
+
+    adapter_manifest_path = directory / _ADAPTER_MANIFEST
+    _write_json(adapter_manifest_path, source_manifest)
+    _check_deadline(deadline, cancel_event)
+    relay_files: dict[str, dict[str, object]] = {
+        _ADAPTER_MANIFEST: {
+            "path": _ADAPTER_MANIFEST,
+            "size": adapter_manifest_path.stat().st_size,
+            "sha256": _sha256(adapter_manifest_path, deadline, cancel_event),
+        }
+    }
+
+    for filename in _ADAPTER_FILES:
+        _check_deadline(deadline, cancel_event)
+        path = directory / filename
+        if path.is_symlink() or not path.is_file():
+            raise OSError(f"adapter relay file is missing: {filename}")
+        spec = validated_files.get(filename)
+        if not isinstance(spec, dict):
+            raise OSError(f"adapter relay validation is missing: {filename}")
+        size = spec.get("size")
+        digest = spec.get("sha256")
+        if (
+            type(size) is not int
+            or size < 0
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or path.stat().st_size != size
+        ):
+            raise OSError(f"adapter relay file checksum differs: {filename}")
+        relay_files[filename] = {
+            "path": filename,
+            "size": size,
+            "sha256": digest,
+        }
+
+    if mode == "delta":
+        chunks = transport.get("chunks")
+        if not isinstance(chunks, list) or not chunks:
+            raise OSError("adapter relay delta has no chunks")
+        chunk_root = directory / "transport-chunks"
+        if not chunk_root.is_dir():
+            raise OSError("adapter relay delta chunks are missing")
+        for completed_path in chunk_root.rglob("*.done"):
+            _check_deadline(deadline, cancel_event)
+            completed_path.unlink()
+        for item in chunks:
+            _check_deadline(deadline, cancel_event)
+            if not isinstance(item, dict) or not isinstance(item.get("file"), str):
+                raise OSError("adapter relay delta chunk is invalid")
+            filename = item["file"]
+            path = chunk_root / filename
+            if (
+                Path(filename).name != filename
+                or filename in relay_files
+                or path.is_symlink()
+                or not path.is_file()
+            ):
+                raise OSError("adapter relay delta chunk is missing")
+            wire_size = item.get("wire_size")
+            wire_sha256 = item.get("wire_sha256")
+            if (
+                type(wire_size) is not int
+                or wire_size <= 0
+                or not isinstance(wire_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", wire_sha256) is None
+                or path.stat().st_size != wire_size
+            ):
+                raise OSError(f"adapter relay delta chunk checksum differs: {filename}")
+            relay_files[filename] = {
+                "path": f"transport-chunks/{filename}",
+                "size": wire_size,
+                "sha256": wire_sha256,
+            }
+
+    _write_json(
+        directory / _RELAY_MANIFEST,
+        {
+            "version": 1,
+            "source_url": source_url,
+            "transport": _ADAPTER_DELTA_TRANSPORT if mode == "delta" else "full",
+            "files": relay_files,
+        },
+    )
+
+
+def _relay_manifest_matches(
+    directory: Path, source_url: str, transport: dict[str, object]
+) -> bool:
+    """Check the READY cache's relay index without hashing large files."""
+    if not (directory / "READY").is_file():
+        return False
+    try:
+        value = json.loads((directory / _RELAY_MANIFEST).read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError):
+        return False
+    if not isinstance(value, dict) or value.get("version") != 1:
+        return False
+    mode = transport.get("mode")
+    expected_transport = _ADAPTER_DELTA_TRANSPORT if mode == "delta" else "full"
+    if value.get("source_url") != source_url or value.get("transport") != expected_transport:
+        return False
+    files = value.get("files")
+    if not isinstance(files, dict):
+        return False
+    expected: dict[str, tuple[str, int, str | None]] = {}
+    manifest_path = directory / _ADAPTER_MANIFEST
+    if manifest_path.is_symlink():
+        return False
+    try:
+        manifest_size = manifest_path.stat().st_size
+    except OSError:
+        return False
+    expected[_ADAPTER_MANIFEST] = (
+        _ADAPTER_MANIFEST,
+        manifest_size,
+        _sha256(manifest_path),
+    )
+    config_size = transport.get("config_size")
+    config_sha256 = transport.get("config_sha256")
+    target_size = transport.get("target_size")
+    target_sha256 = transport.get("target_sha256")
+    if mode == "delta":
+        adapter_specs = {
+            _ADAPTER_FILES[0]: (config_size, config_sha256),
+            _ADAPTER_FILES[1]: (target_size, target_sha256),
+        }
+    elif mode == "full":
+        source_manifest = transport.get("source_manifest")
+        source_files = source_manifest.get("files") if isinstance(source_manifest, dict) else None
+        adapter_specs = {}
+        if isinstance(source_files, list):
+            for item in source_files:
+                if isinstance(item, dict) and isinstance(item.get("name"), str):
+                    adapter_specs[item["name"]] = (item.get("size"), item.get("sha256"))
+    else:
+        return False
+    for filename, (size, digest) in adapter_specs.items():
+        if filename not in _ADAPTER_FILES or type(size) is not int or size < 0 or not isinstance(digest, str):
+            return False
+        expected[filename] = (filename, size, digest)
+    if set(expected) != set(_ADAPTER_FILES) | {_ADAPTER_MANIFEST}:
+        return False
+
+    chunks = transport.get("chunks") if mode == "delta" else None
+    if mode == "delta":
+        if not isinstance(chunks, list) or not chunks:
+            return False
+        for item in chunks:
+            if not isinstance(item, dict):
+                return False
+            filename = item.get("file")
+            size = item.get("wire_size")
+            digest = item.get("wire_sha256")
+            if (
+                not isinstance(filename, str)
+                or Path(filename).name != filename
+                or filename in expected
+                or type(size) is not int
+                or size <= 0
+                or not isinstance(digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            ):
+                return False
+            expected[filename] = (f"transport-chunks/{filename}", size, digest)
+    if set(files) != set(expected):
+        return False
+    for filename, (relative, size, digest) in expected.items():
+        spec = files.get(filename)
+        if not isinstance(spec, dict) or spec.get("path") != relative or spec.get("size") != size:
+            return False
+        if not isinstance(spec.get("sha256"), str) or re.fullmatch(r"[0-9a-f]{64}", spec["sha256"]) is None:
+            return False
+        if digest is not None and spec["sha256"] != digest:
+            return False
+        path = directory / relative
+        if path.is_symlink() or not path.is_file() or path.stat().st_size != size:
+            return False
+    return True
 
 
 def _write_stage_status(cache_root: Path, value: dict[str, object]) -> None:
@@ -542,9 +838,7 @@ def _download_range(
     """Download one inclusive byte range and resume its local part file."""
     size = end - start + 1
     for attempt in range(_ADAPTER_LANE_RETRIES):
-        if cancel_event is not None and cancel_event.is_set():
-            return
-        _check_deadline(deadline)
+        _check_deadline(deadline, cancel_event)
         try:
             source_url = source_urls[(source_index + attempt) % len(source_urls)]
             present = destination.stat().st_size if destination.exists() else 0
@@ -557,21 +851,22 @@ def _download_range(
                 source_url,
                 headers={"Range": f"bytes={start + present}-{end}"},
             )
-            with urllib.request.urlopen(request, timeout=_request_timeout(deadline)) as response:
+            with urllib.request.urlopen(
+                request,
+                timeout=_request_timeout(deadline, cancel_event),
+            ) as response:
                 if response.status != 206:
                     raise OSError("adapter server did not honor byte range")
                 with destination.open("ab" if present else "wb") as output:
                     while present < size:
-                        if cancel_event is not None and cancel_event.is_set():
-                            return
-                        _check_deadline(deadline)
+                        _check_deadline(deadline, cancel_event)
                         chunk = response.read(min(16 * 1024 * 1024, size - present))
                         if not chunk:
                             raise OSError(f"adapter range ended early: {destination.name}")
-                        _check_deadline(deadline)
+                        _check_deadline(deadline, cancel_event)
                         output.write(chunk)
                         present += len(chunk)
-                        _check_deadline(deadline)
+                        _check_deadline(deadline, cancel_event)
                         if progress is not None:
                             progress(source_index, len(chunk))
             if destination.stat().st_size != size:
@@ -583,6 +878,7 @@ def _download_range(
             if attempt + 1 == _ADAPTER_LANE_RETRIES:
                 raise
             sleep_for = min(2**attempt, 10)
+            _check_cancelled(cancel_event)
             if deadline is not None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -594,27 +890,37 @@ def _download_range(
                 cancel_event.wait(sleep_for)
 
 
-def _sha256(path: Path, deadline: float | None = None) -> str:
+def _sha256(
+    path: Path,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
         while True:
-            _check_deadline(deadline)
+            _check_deadline(deadline, cancel_event)
             chunk = source.read(16 * 1024 * 1024)
             if not chunk:
                 break
             digest.update(chunk)
-    _check_deadline(deadline)
+    _check_deadline(deadline, cancel_event)
     return digest.hexdigest()
 
 
-def _sha256_region(path: Path, offset: int, size: int, deadline: float | None = None) -> str:
+def _sha256_region(
+    path: Path,
+    offset: int,
+    size: int,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+) -> str:
     digest = hashlib.sha256()
     file_descriptor = os.open(path, os.O_RDONLY)
     try:
         remaining = size
         position = offset
         while remaining:
-            _check_deadline(deadline)
+            _check_deadline(deadline, cancel_event)
             chunk = os.pread(file_descriptor, min(16 * 1024 * 1024, remaining), position)
             if not chunk:
                 raise OSError("adapter output ended before completed chunk")
@@ -623,7 +929,7 @@ def _sha256_region(path: Path, offset: int, size: int, deadline: float | None = 
             remaining -= len(chunk)
     finally:
         os.close(file_descriptor)
-    _check_deadline(deadline)
+    _check_deadline(deadline, cancel_event)
     return digest.hexdigest()
 
 
@@ -652,9 +958,10 @@ def _verified_adapter_base(
     *,
     expected_config_sha256: str | None = None,
     deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[Path, Path]:
     """Return a cached base only after checking its published identity."""
-    _check_deadline(deadline)
+    _check_deadline(deadline, cancel_event)
     base_dir = adapter_cache_path(base_url)
     model = base_dir / _ADAPTER_FILES[1]
     config = base_dir / _ADAPTER_FILES[0]
@@ -680,9 +987,13 @@ def _verified_adapter_base(
     checksum = base_dir / _ADAPTER_DIGEST
     if not checksum.is_file() or _read_checksum(checksum) != expected_sha256:
         raise OSError("cached base adapter sidecar checksum differs")
-    if expected_config_sha256 is not None and _sha256(config, deadline) != expected_config_sha256:
+    if expected_config_sha256 is not None and _sha256(
+        config,
+        deadline,
+        cancel_event,
+    ) != expected_config_sha256:
         raise OSError("cached base adapter configuration bytes differ")
-    _check_deadline(deadline)
+    _check_deadline(deadline, cancel_event)
     return model, config
 
 
@@ -749,10 +1060,13 @@ def _stage_chunked_xor_adapter(
     transport: dict[str, object],
     source_manifest: dict[str, object],
     deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+    committed_event: threading.Event | None = None,
 ) -> Path:
+    cancel_event = cancel_event or threading.Event()
     destination = adapter_cache_path(source_url)
     started = time.monotonic()
-    _check_deadline(deadline)
+    _check_deadline(deadline, cancel_event)
     base_url = transport["base_url"]
     base_sha256 = transport["base_sha256"]
     target_sha256 = transport["target_sha256"]
@@ -772,6 +1086,7 @@ def _stage_chunked_xor_adapter(
             else None
         ),
         deadline=deadline,
+        cancel_event=cancel_event,
     )
     chunks = transport["chunks"]
     assert isinstance(chunks, list)
@@ -813,7 +1128,7 @@ def _stage_chunked_xor_adapter(
 
     def report(lane: int, amount: int) -> None:
         nonlocal progress_bytes, last_status
-        _check_deadline(deadline)
+        _check_deadline(deadline, cancel_event)
         with progress_lock:
             progress_bytes += amount
             now = time.monotonic()
@@ -854,11 +1169,8 @@ def _stage_chunked_xor_adapter(
     if not output_path.is_file() or output_path.stat().st_size != target_size:
         _preallocate(output_path, target_size)
 
-    cancel_event = threading.Event()
-
     def fetch(index: int, item: dict[str, object]) -> None:
-        if cancel_event.is_set():
-            return
+        _check_cancelled(cancel_event)
         name = item["file"]
         assert isinstance(name, str)
         relative = Path(name)
@@ -888,11 +1200,17 @@ def _stage_chunked_xor_adapter(
             except (OSError, ValueError):
                 proof_matches = False
             if proof_matches:
-                _check_deadline(deadline)
+                _check_deadline(deadline, cancel_event)
                 try:
                     output_matches = (
                         output_path.stat().st_size == target_size
-                        and _sha256_region(output_path, offset, raw_size, deadline)
+                        and _sha256_region(
+                            output_path,
+                            offset,
+                            raw_size,
+                            deadline,
+                            cancel_event,
+                        )
                         == proof["output_sha256"]
                     )
                 except TimeoutError:
@@ -922,25 +1240,22 @@ def _stage_chunked_xor_adapter(
             cancel_event=cancel_event,
         )
 
-        if cancel_event.is_set():
-            return
-        _check_deadline(deadline)
+        _check_deadline(deadline, cancel_event)
         encoded = chunk_path.read_bytes()
         if len(encoded) != wire_size:
             raise OSError("adapter transport chunk size changed")
-        if _sha256(chunk_path, deadline) != wire_sha256:
+        if _sha256(chunk_path, deadline, cancel_event) != wire_sha256:
             raise OSError("adapter transport chunk checksum mismatch")
-        _check_deadline(deadline)
+        _check_deadline(deadline, cancel_event)
         raw = _decode_transport_chunk(
             encoded,
             codec=str(transport["transport"]),
             raw_size=raw_size,
         )
-        _check_deadline(deadline)
+        _check_deadline(deadline, cancel_event)
         if _transport_raw_sha256(raw) != raw_sha256:
             raise OSError("adapter transport decoded chunk checksum mismatch")
-        if cancel_event.is_set():
-            return
+        _check_cancelled(cancel_event)
         base_fd = os.open(base_model, os.O_RDONLY)
         output_fd = os.open(output_path, os.O_RDWR)
         try:
@@ -955,7 +1270,7 @@ def _stage_chunked_xor_adapter(
         finally:
             os.close(output_fd)
             os.close(base_fd)
-        _check_deadline(deadline)
+        _check_deadline(deadline, cancel_event)
         _write_json(
             completed_path,
             {
@@ -974,7 +1289,7 @@ def _stage_chunked_xor_adapter(
     futures = [executor.submit(fetch, index, item) for index, item in enumerate(chunks)]
     _wait_for_futures(executor, futures, deadline, cancel_event)
 
-    if _sha256(output_path, deadline) != target_sha256:
+    if _sha256(output_path, deadline, cancel_event) != target_sha256:
         raise OSError("reconstructed adapter checksum mismatch")
     if output_path.stat().st_size != target_size:
         raise OSError("reconstructed adapter size mismatch")
@@ -987,10 +1302,22 @@ def _stage_chunked_xor_adapter(
         expected_sha256=config_sha256,
         progress=report,
         deadline=deadline,
+        cancel_event=cancel_event,
     )
-    if _sha256(config_path, deadline) != config_sha256:
+    if _sha256(config_path, deadline, cancel_event) != config_sha256:
         raise OSError("adapter configuration checksum mismatch")
-    shutil.rmtree(chunk_root)
+    source_transport_manifest = transport.get("source_manifest")
+    if not isinstance(source_transport_manifest, dict):
+        raise OSError("adapter transport source manifest is unavailable for relay")
+    _publish_relay_manifest(
+        temporary,
+        source_url,
+        source_transport_manifest,
+        transport,
+        source_manifest["files"],
+        deadline=deadline,
+        cancel_event=cancel_event,
+    )
     (temporary / _ADAPTER_DIGEST).write_text(f"{target_sha256}\n", encoding="ascii")
     _write_json(temporary / "manifest.json", source_manifest)
     _write_json(
@@ -1003,22 +1330,25 @@ def _stage_chunked_xor_adapter(
             "target_sha256": target_sha256,
         },
     )
-    ready = temporary / "READY"
-    _check_deadline(deadline)
-    ready.write_text("ready\n", encoding="utf-8")
-    with ready.open("rb") as stream:
-        stream.flush()
-        os.fsync(stream.fileno())
-    with _adapter_reader_lock(destination).open("a+") as reader_lock:
-        _acquire_stage_lock(reader_lock, deadline)
-        _check_deadline(deadline)
-        if destination.exists():
-            retired = destination.with_name(
-                f"{destination.name}.retired-{time.time_ns()}-{os.getpid()}"
-            )
-            os.replace(destination, retired)
-        os.replace(temporary, destination)
-        fcntl.flock(reader_lock, fcntl.LOCK_UN)
+    with _adapter_stage_publish_lock:
+        ready = temporary / "READY"
+        _check_deadline(deadline, cancel_event)
+        ready.write_text("ready\n", encoding="utf-8")
+        with ready.open("rb") as stream:
+            stream.flush()
+            os.fsync(stream.fileno())
+        with _adapter_reader_lock(destination).open("a+") as reader_lock:
+            _acquire_stage_lock(reader_lock, deadline, cancel_event)
+            _check_deadline(deadline, cancel_event)
+            if destination.exists():
+                retired = destination.with_name(
+                    f"{destination.name}.retired-{time.time_ns()}-{os.getpid()}"
+                )
+                os.replace(destination, retired)
+            os.replace(temporary, destination)
+            if committed_event is not None:
+                committed_event.set()
+            fcntl.flock(reader_lock, fcntl.LOCK_UN)
     _cleanup_retired_adapters(destination.parent, destination.name)
     _cleanup_previous_adapter_caches(destination.parent, destination)
     _write_stage_status(
@@ -1049,7 +1379,7 @@ def download(
     deadline: float | None = None,
     cancel_event: threading.Event | None = None,
 ) -> None:
-    _check_deadline(deadline)
+    _check_deadline(deadline, cancel_event)
     explicit_source_urls = source_urls is not None
     source_urls = _adapter_source_urls(source_url) if source_urls is None else source_urls
     if not source_urls:
@@ -1057,11 +1387,19 @@ def download(
     total = (
         expected_size
         if expected_size is not None
-        else _content_length(source_urls[0], deadline=deadline)
+        else _content_length(
+            source_urls[0],
+            deadline=deadline,
+            cancel_event=cancel_event,
+        )
     )
-    _check_deadline(deadline)
+    _check_deadline(deadline, cancel_event)
     if destination.exists() and destination.stat().st_size == total:
-        if expected_sha256 is None or _sha256(destination, deadline) == expected_sha256:
+        if expected_sha256 is None or _sha256(
+            destination,
+            deadline,
+            cancel_event,
+        ) == expected_sha256:
             return
         destination.unlink()
 
@@ -1077,9 +1415,7 @@ def download(
         # Preserve the old single-file resume path for small metadata files and
         # for an explicitly disabled parallel transfer.
         for attempt in range(_ADAPTER_LANE_RETRIES):
-            if cancel_event is not None and cancel_event.is_set():
-                return
-            _check_deadline(deadline)
+            _check_deadline(deadline, cancel_event)
             try:
                 offset = destination.stat().st_size if destination.exists() else 0
                 if offset > total:
@@ -1089,26 +1425,31 @@ def download(
                     source_urls[attempt % len(source_urls)],
                     headers={"Range": f"bytes={offset}-"} if offset else {},
                 )
-                with urllib.request.urlopen(request, timeout=_request_timeout(deadline)) as response:
+                with urllib.request.urlopen(
+                    request,
+                    timeout=_request_timeout(deadline, cancel_event),
+                ) as response:
                     if offset and response.status != 206:
                         destination.unlink(missing_ok=True)
                         raise OSError("adapter server did not honor byte range")
                     with destination.open("ab" if offset else "wb") as output:
                         while offset < total:
-                            if cancel_event is not None and cancel_event.is_set():
-                                return
-                            _check_deadline(deadline)
+                            _check_deadline(deadline, cancel_event)
                             chunk = response.read(min(16 * 1024 * 1024, total - offset))
                             if not chunk:
                                 raise OSError(f"adapter file ended early: {destination.name}")
                             output.write(chunk)
                             offset += len(chunk)
-                            _check_deadline(deadline)
+                            _check_deadline(deadline, cancel_event)
                             if progress is not None:
                                 progress(0, len(chunk))
                 if destination.stat().st_size != total:
                     raise OSError(f"incomplete adapter file: {destination.name}")
-                if expected_sha256 is not None and _sha256(destination, deadline) != expected_sha256:
+                if expected_sha256 is not None and _sha256(
+                    destination,
+                    deadline,
+                    cancel_event,
+                ) != expected_sha256:
                     # A complete but bad file must not be resumed from EOF on
                     # the next bounded attempt.
                     destination.unlink(missing_ok=True)
@@ -1120,6 +1461,7 @@ def download(
                 if attempt + 1 == _ADAPTER_LANE_RETRIES:
                     raise
                 sleep_for = min(2**attempt, 10)
+                _check_cancelled(cancel_event)
                 if deadline is not None:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
@@ -1135,6 +1477,7 @@ def download(
     # across a 217 ms, lossy link. Independent range files are resumable and
     # let one reset retry without discarding the other completed ranges.
     parts_dir = destination.with_name(f"{destination.name}.parts")
+    _check_cancelled(cancel_event)
     parts_dir.mkdir(exist_ok=True)
     chunk = (total + streams - 1) // streams
     ranges = [
@@ -1184,44 +1527,78 @@ def download(
         for index, _, _ in ranges:
             with (parts_dir / f"part-{index:03d}").open("rb") as part:
                 while True:
-                    _check_deadline(deadline)
+                    _check_deadline(deadline, cancel_event)
                     chunk_data = part.read(16 * 1024 * 1024)
                     if not chunk_data:
                         break
                     output.write(chunk_data)
-                    _check_deadline(deadline)
+                    _check_deadline(deadline, cancel_event)
     if assembling.stat().st_size != total:
         raise OSError(f"assembled adapter file has the wrong size: {destination.name}")
-    if expected_sha256 is not None and _sha256(assembling, deadline) != expected_sha256:
+    if expected_sha256 is not None and _sha256(
+        assembling,
+        deadline,
+        cancel_event,
+    ) != expected_sha256:
         # Part sizes alone cannot detect a bad byte from a reset connection.
         # Drop the private parts after a whole-file mismatch so the next
         # stage attempt does not repeatedly assemble the same bad payload.
         shutil.rmtree(parts_dir)
         assembling.unlink(missing_ok=True)
         raise OSError(f"adapter checksum mismatch: {destination.name}")
+    _check_deadline(deadline, cancel_event)
     assembling.replace(destination)
     shutil.rmtree(parts_dir)
 
 
-def stage_lora_adapter_files(source_url: str, require_delta: bool = False) -> Path:
+def stage_lora_adapter_files(
+    source_url: str,
+    require_delta: bool = False,
+    *,
+    stage_timeout_seconds: float | None = None,
+    cancel_event: threading.Event | None = None,
+    committed_event: threading.Event | None = None,
+) -> Path:
     """Download one remote adapter into the host-shared cache.
 
     The API server can call this before it pauses generation. Worker-side
     loading calls the same helper as a fail-safe, but returns immediately when
     the prefetch already wrote ``READY``.
     """
+    _check_cancelled(cancel_event)
     destination = adapter_cache_path(source_url)
     destination.parent.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
-    delta_deadline = started + _delta_stage_timeout_s() if require_delta else None
+    configured_delta_timeout = _delta_stage_timeout_s() if require_delta else None
+    if stage_timeout_seconds is not None:
+        if (
+            not require_delta
+            or isinstance(stage_timeout_seconds, bool)
+            or not isinstance(stage_timeout_seconds, (int, float))
+            or not _is_finite_number(stage_timeout_seconds)
+            or stage_timeout_seconds <= 0
+            or configured_delta_timeout is None
+            or stage_timeout_seconds > configured_delta_timeout
+        ):
+            raise OSError("adapter delta stage timeout is invalid")
+        configured_delta_timeout = float(stage_timeout_seconds)
+    delta_deadline = (
+        started + configured_delta_timeout
+        if configured_delta_timeout is not None
+        else None
+    )
     # The cache is shared by all replicas on this host. One global writer is
     # intentional: per-URL writers caused old policies to queue behind one
     # another and made it possible to publish a stale policy after a newer one.
     with (destination.parent / "adapter-staging.lock").open("w") as host_lock:
-        _acquire_stage_lock(host_lock, delta_deadline)
+        _acquire_stage_lock(host_lock, delta_deadline, cancel_event)
         transport: dict[str, object] | None = None
         try:
-            transport = _read_chunked_xor_manifest(source_url, deadline=delta_deadline)
+            transport = _read_chunked_xor_manifest(
+                source_url,
+                deadline=delta_deadline,
+                cancel_event=cancel_event,
+            )
             if (
                 delta_deadline is None
                 and transport is not None
@@ -1234,6 +1611,7 @@ def stage_lora_adapter_files(source_url: str, require_delta: bool = False) -> Pa
                 if require_delta
                 or (transport is not None and transport.get("mode") == "delta")
                 else None,
+                cancel_event=cancel_event,
             )
             files = manifest["files"]
             assert isinstance(files, dict)
@@ -1264,11 +1642,20 @@ def stage_lora_adapter_files(source_url: str, require_delta: bool = False) -> Pa
                         and proof.get("mode") == _ADAPTER_DELTA_TRANSPORT
                         and proof.get("source_url") == source_url
                         and proof.get("target_sha256") == transport["target_sha256"]
+                        and _relay_manifest_matches(destination, source_url, transport)
                         and (destination / _ADAPTER_FILES[1]).is_file()
-                        and _sha256(destination / _ADAPTER_FILES[1], delta_deadline)
+                        and _sha256(
+                            destination / _ADAPTER_FILES[1],
+                            delta_deadline,
+                            cancel_event,
+                        )
                         == transport["target_sha256"]
                         and (destination / _ADAPTER_FILES[0]).is_file()
-                        and _sha256(destination / _ADAPTER_FILES[0], delta_deadline)
+                        and _sha256(
+                            destination / _ADAPTER_FILES[0],
+                            delta_deadline,
+                            cancel_event,
+                        )
                         == transport["config_sha256"]
                     ):
                         _write_stage_status(
@@ -1285,20 +1672,30 @@ def stage_lora_adapter_files(source_url: str, require_delta: bool = False) -> Pa
                         )
                         _cleanup_retired_adapters(destination.parent, destination.name)
                         _cleanup_previous_adapter_caches(destination.parent, destination)
+                        if committed_event is not None:
+                            with _adapter_stage_publish_lock:
+                                committed_event.set()
                         return destination
-                _check_deadline(delta_deadline)
+                _check_deadline(delta_deadline, cancel_event)
                 return _stage_chunked_xor_adapter(
-                    source_url, transport, manifest, deadline=delta_deadline
+                    source_url,
+                    transport,
+                    manifest,
+                    deadline=delta_deadline,
+                    cancel_event=cancel_event,
+                    committed_event=committed_event,
                 )
-            transport = None
-
             if (destination / "READY").is_file():
                 try:
                     with (destination / "manifest.json").open("r", encoding="utf-8") as source:
                         local_manifest = json.load(source)
                 except (FileNotFoundError, OSError, ValueError):
                     local_manifest = None
-                if local_manifest == manifest:
+                if (
+                    local_manifest == manifest
+                    and isinstance(transport, dict)
+                    and _relay_manifest_matches(destination, source_url, transport)
+                ):
                     _write_stage_status(
                         destination.parent,
                         {
@@ -1312,6 +1709,9 @@ def stage_lora_adapter_files(source_url: str, require_delta: bool = False) -> Pa
                     )
                     _cleanup_retired_adapters(destination.parent, destination.name)
                     _cleanup_previous_adapter_caches(destination.parent, destination)
+                    if committed_event is not None:
+                        with _adapter_stage_publish_lock:
+                            committed_event.set()
                     return destination
 
             total_bytes = sum(int(item["size"]) for item in files.values())
@@ -1354,6 +1754,7 @@ def stage_lora_adapter_files(source_url: str, require_delta: bool = False) -> Pa
                 },
             )
             temporary = destination.with_name(f"{destination.name}.partial")
+            _check_cancelled(cancel_event)
             temporary.mkdir(exist_ok=True)
             _write_json(temporary / "manifest.json", manifest)
             for filename in _ADAPTER_FILES:
@@ -1366,36 +1767,56 @@ def stage_lora_adapter_files(source_url: str, require_delta: bool = False) -> Pa
                     expected_size=int(item["size"]),
                     expected_sha256=expected_sha256 if isinstance(expected_sha256, str) else None,
                     progress=report,
+                    cancel_event=cancel_event,
                 )
                 if expected_sha256 is None:
-                    item["sha256"] = _sha256(temporary / filename)
+                    item["sha256"] = _sha256(
+                        temporary / filename,
+                        cancel_event=cancel_event,
+                    )
                 progress_bytes = sum(
                     int(files[name]["size"])
                     for name in _ADAPTER_FILES
                     if (temporary / name).is_file() and (temporary / name).stat().st_size == int(files[name]["size"])
                 )
             _write_json(temporary / "manifest.json", manifest)
+            source_transport_manifest = transport.get("source_manifest") if isinstance(transport, dict) else None
+            if not isinstance(source_transport_manifest, dict):
+                raise OSError("adapter source manifest is unavailable for relay")
+            _publish_relay_manifest(
+                temporary,
+                source_url,
+                source_transport_manifest,
+                transport,
+                files,
+                cancel_event=cancel_event,
+            )
             model_digest = files[_ADAPTER_FILES[1]].get("sha256")
             if not isinstance(model_digest, str):
                 raise OSError("adapter source manifest has no model checksum")
             (temporary / _ADAPTER_DIGEST).write_text(f"{model_digest}\n", encoding="ascii")
-            ready = temporary / "READY"
-            ready.write_text("ready\n", encoding="utf-8")
-            with ready.open("rb") as stream:
-                os.fsync(stream.fileno())
+            with _adapter_stage_publish_lock:
+                ready = temporary / "READY"
+                _check_cancelled(cancel_event)
+                ready.write_text("ready\n", encoding="utf-8")
+                with ready.open("rb") as stream:
+                    os.fsync(stream.fileno())
 
-            # Keep the exclusive lease through both renames. This removes the
-            # short missing-path window between retiring the old directory and
-            # publishing the new one.
-            with _adapter_reader_lock(destination).open("a+") as reader_lock:
-                fcntl.flock(reader_lock, fcntl.LOCK_EX)
-                if destination.exists():
-                    retired = destination.with_name(
-                        f"{destination.name}.retired-{time.time_ns()}-{os.getpid()}"
-                    )
-                    os.replace(destination, retired)
-                os.replace(temporary, destination)
-                fcntl.flock(reader_lock, fcntl.LOCK_UN)
+                # Keep the exclusive lease through both renames. This removes the
+                # short missing-path window between retiring the old directory and
+                # publishing the new one.
+                with _adapter_reader_lock(destination).open("a+") as reader_lock:
+                    _acquire_stage_lock(reader_lock, None, cancel_event)
+                    _check_cancelled(cancel_event)
+                    if destination.exists():
+                        retired = destination.with_name(
+                            f"{destination.name}.retired-{time.time_ns()}-{os.getpid()}"
+                        )
+                        os.replace(destination, retired)
+                    os.replace(temporary, destination)
+                    if committed_event is not None:
+                        committed_event.set()
+                    fcntl.flock(reader_lock, fcntl.LOCK_UN)
             _cleanup_retired_adapters(destination.parent, destination.name)
             _cleanup_previous_adapter_caches(destination.parent, destination)
             _write_stage_status(

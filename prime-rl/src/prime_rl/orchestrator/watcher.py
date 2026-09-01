@@ -155,8 +155,11 @@ class WeightWatcher:
                 self.inference.admin_clients,
                 source_path,
                 require_delta=False,
+                origin_base_urls=self.inference.adapter_origin_base_urls,
             )
             self.last_adapter_wire_stage_time = float(result.get("wire_stage_seconds", 0.0))
+            origin_stage = format_time(float(result.get("origin_stage_seconds", 0.0)))
+            peer_stage = format_time(float(result.get("peer_stage_seconds", 0.0)))
             reconstruct_seconds = result.get("reconstruct_seconds")
             self.last_adapter_reconstruct_time = (
                 float(reconstruct_seconds) if reconstruct_seconds is not None else -1.0
@@ -164,7 +167,8 @@ class WeightWatcher:
             self.last_stage_weights_time = time.perf_counter() - started
             get_logger().info(
                 f"Staged initial adapter policy v0 on every inference host in "
-                f"{format_time(self.last_stage_weights_time)}"
+                f"{format_time(self.last_stage_weights_time)} "
+                f"(origin {origin_stage}, peer {peer_stage})"
             )
         self.current_weights_path = source_path
         self.verified_adapter_step = 0
@@ -330,6 +334,7 @@ class WeightWatcher:
                         self.inference.admin_clients,
                         weights_path,
                         require_delta=require_delta,
+                        origin_base_urls=self.inference.adapter_origin_base_urls,
                     )
                     self.last_adapter_wire_stage_time = float(
                         stage_result.get("wire_stage_seconds", time.perf_counter() - stage_started)
@@ -339,6 +344,8 @@ class WeightWatcher:
                         self.last_adapter_reconstruct_time = float(reconstruct_seconds)
                     else:
                         self.last_adapter_reconstruct_time = -1.0
+                    origin_stage = format_time(float(stage_result.get("origin_stage_seconds", 0.0)))
+                    peer_stage = format_time(float(stage_result.get("peer_stage_seconds", 0.0)))
                 else:
                     await stage_full_checkpoint(self.inference.admin_clients, weights_path)
                 self.last_stage_weights_time = time.perf_counter() - stage_started
@@ -355,7 +362,7 @@ class WeightWatcher:
                     get_logger().info(
                         f"Adapter v{next_step} transfer: wire-stage "
                         f"{format_time(self.last_adapter_wire_stage_time)}, "
-                        f"reconstruct {reconstruct}"
+                        f"origin {origin_stage}, peer {peer_stage}, reconstruct {reconstruct}"
                     )
 
             # An observer can request a bounded safe boundary before we stop

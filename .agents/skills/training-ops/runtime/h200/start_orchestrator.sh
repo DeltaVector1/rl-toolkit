@@ -47,6 +47,42 @@ if [ -z "$adapter_port" ]; then
   echo "operations config has no adapter port" >&2
   exit 2
 fi
+operations_file="$deployment/configs/operations.toml"
+if ! relay_settings=$(python3 - "$operations_file" "$config_file" <<'PY'
+import sys
+import tomllib
+from urllib.parse import urlsplit
+
+with open(sys.argv[1], "rb") as stream:
+    operations = tomllib.load(stream)
+with open(sys.argv[2], "rb") as stream:
+    edge = tomllib.load(stream)
+relay_port = operations.get("ports", {}).get("adapter_relay")
+relay_container = operations.get("containers", {}).get("adapter_relay")
+cache_dir = operations.get("paths", {}).get("adapter_cache")
+source_url = edge.get("weight_broadcast", {}).get("source_url")
+model_name = edge.get("model", {}).get("name")
+glm_model = operations.get("models", {}).get("glm52")
+if not isinstance(relay_port, int) or not 1 <= relay_port <= 65535:
+    raise SystemExit("operations config has no valid adapter relay port")
+if not isinstance(relay_container, str) or not relay_container:
+    raise SystemExit("operations config has no adapter relay container")
+if not isinstance(cache_dir, str) or not cache_dir.startswith("/"):
+    raise SystemExit("operations config has no absolute adapter cache path")
+if not isinstance(source_url, str) or not source_url.startswith(("http://", "https://")):
+    raise SystemExit("orchestrator config has no canonical adapter source URL")
+if not isinstance(model_name, str) or not isinstance(glm_model, str):
+    raise SystemExit("model names are missing from the operations or orchestrator config")
+parsed = urlsplit(source_url)
+if parsed.hostname not in {"127.0.0.1", "localhost"} or parsed.query or parsed.fragment:
+    raise SystemExit("canonical adapter source URL must be loopback without query or fragment")
+print(relay_port, relay_container, cache_dir, source_url, int(model_name == glm_model))
+PY
+); then
+  echo "cannot read the configured adapter relay" >&2
+  exit 2
+fi
+read -r relay_port relay_container relay_cache_dir relay_source_url relay_is_glm <<<"$relay_settings"
 trainer_ssh_target=$(python3 - "$deployment/configs/operations.toml" <<'PY'
 import sys
 import tomllib
@@ -79,7 +115,6 @@ for url in config["model"]["client"]["admin_base_url"]:
 PY
 )
 
-operations_file="$deployment/configs/operations.toml"
 if ! peer_settings=$(python3 - "$operations_file" "$config_file" <<'PY'
 import ipaddress
 import re
@@ -144,6 +179,10 @@ PY
   exit 2
 fi
 read -r peer_name peer_host peer_ssh_port peer_ssh_user peer_ssh_identity peer_api_port peer_enabled <<<"$peer_settings"
+if [ "$peer_enabled" = 1 ] && [ "$relay_is_glm" != 1 ]; then
+  echo "adapter relay peer mode is only supported for the configured GLM model" >&2
+  exit 2
+fi
 
 if grep -q 'refusals-classifier-eval-v1' "$config_file"; then
   bash "$deployment/.agents/skills/training-ops/runtime/h200/start_refusals_classifier.sh"
@@ -192,28 +231,50 @@ peer_tunnel_connection() {
 }
 
 peer_tunnel_remove_legacy() {
+  local keep_current=${1:-0}
   local api_signature="-L 127.0.0.1:$peer_api_port:127.0.0.1:8000"
-  local reverse_signature="-R 127.0.0.1:${lora_source_ports[0]}:127.0.0.1:${lora_source_ports[0]}"
-  local pid command_line pgid
+  local reverse_signature="-R 127.0.0.1:${lora_source_ports[0]}:"
+  local current_signature pid command_line pgid lora_source_port
   for pid in $(pgrep -f -- "$api_signature" || true); do
     command_line=$(ps -o args= -p "$pid" 2>/dev/null || true)
     case "$command_line" in
-      *"$reverse_signature"*)
+      *"$api_signature"*)
+        if [ "$keep_current" = 1 ]; then
+          case "$command_line" in *"$reverse_signature"*) ;; *) continue ;; esac
+        fi
         pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
         case "$pgid" in
           ''|*[!0-9]*|0|1|"$$") kill "$pid" 2>/dev/null || true ;;
           *) kill -- "-$pgid" 2>/dev/null || true ;;
         esac
         sleep 1
-        return 0
         ;;
     esac
+  done
+  for lora_source_port in "${lora_source_ports[@]}"; do
+    reverse_signature="-R 127.0.0.1:${lora_source_port}:"
+    current_signature="-R 127.0.0.1:${lora_source_port}:127.0.0.1:$relay_port"
+    for pid in $(pgrep -f -- "$reverse_signature" || true); do
+      command_line=$(ps -o args= -p "$pid" 2>/dev/null || true)
+      case "$command_line" in
+        *"$reverse_signature"*)
+          case "$command_line" in
+            *"$current_signature"*) [ "$keep_current" = 1 ] && continue ;;
+          esac
+          pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
+          case "$pgid" in
+            ''|*[!0-9]*|0|1|"$$") kill "$pid" 2>/dev/null || true ;;
+            *) kill -- "-$pgid" 2>/dev/null || true ;;
+          esac
+          ;;
+      esac
+    done
   done
 }
 
 peer_tunnel() {
+  peer_tunnel_remove_legacy "$peer_enabled"
   [ "$peer_enabled" = 1 ] || return 0
-  peer_tunnel_remove_legacy
   peer_tunnel_connection "api" \
     "-L 127.0.0.1:$peer_api_port:127.0.0.1:8000" \
     -L "127.0.0.1:$peer_api_port:127.0.0.1:8000"
@@ -229,11 +290,11 @@ peer_tunnel() {
     lane_forwards=()
     for lora_source_port in "${lane_ports[@]}"; do
       lane_forwards+=(
-        -R "127.0.0.1:$lora_source_port:127.0.0.1:$lora_source_port"
+        -R "127.0.0.1:$lora_source_port:127.0.0.1:$relay_port"
       )
     done
     peer_tunnel_connection "lora-$lane_number" \
-      "-R 127.0.0.1:${lane_ports[0]}:127.0.0.1:${lane_ports[0]}" \
+      "-R 127.0.0.1:${lane_ports[0]}:127.0.0.1:$relay_port" \
       "${lane_forwards[@]}"
     lane_start=$((lane_start + peer_lane_size))
     lane_number=$((lane_number + 1))
@@ -248,6 +309,43 @@ peer_tunnel
 ports=("${lora_source_ports[@]}")
 if [ "$peer_enabled" = 1 ]; then
   ports+=("$peer_api_port")
+fi
+sudo install -d -o 1000 -g 1000 -m 0755 "$relay_cache_dir"
+if [ "$peer_enabled" = 1 ]; then
+  sudo docker rm -f "$relay_container" >/dev/null 2>&1 || true
+  if ! sudo docker run -d --name "$relay_container" --restart unless-stopped \
+    --network host \
+    --log-opt max-size=128m --log-opt max-file=2 \
+    -v "$relay_cache_dir":"$relay_cache_dir" \
+    -v "$deployment/prime-rl/src/prime_rl/inference/relay.py":/app/relay.py:ro \
+    --entrypoint /app/.venv/bin/python \
+    "$image" /app/relay.py \
+    --host 127.0.0.1 --port "$relay_port" \
+    --cache-dir "$relay_cache_dir" \
+    --source-port-first "${lora_source_ports[0]}" \
+    --source-port-last "${lora_source_ports[-1]}" \
+    --canonical-source-url "$relay_source_url" >/dev/null; then
+    echo "adapter relay failed to start" >&2
+    exit 1
+  fi
+  relay_ready=0
+  for _ in $(seq 1 60); do
+    running=$(sudo docker inspect "$relay_container" --format '{{.State.Running}}' 2>/dev/null || true)
+    if [ "$running" = true ] && ss -tln 2>/dev/null | grep -q "127.0.0.1:$relay_port"; then
+      relay_ready=1
+      break
+    fi
+    sleep 1
+  done
+  if [ "$relay_ready" != 1 ]; then
+    echo "adapter relay did not become ready on 127.0.0.1:$relay_port" >&2
+    sudo docker logs --tail 100 "$relay_container" >&2 || true
+    sudo docker rm -f "$relay_container" >/dev/null 2>&1 || true
+    exit 1
+  fi
+  ports+=("$relay_port")
+else
+  sudo docker rm -f "$relay_container" >/dev/null 2>&1 || true
 fi
 if [[ " $adapter_admin_urls " == *":18111 "* ]]; then
   tunnel 18101 127.0.0.1:8000 "-p 40051 -i /root/.ssh/china_rollout_ed25519 root@152.236.142.243"
@@ -291,6 +389,7 @@ sudo docker run -d --name "$ORCH_CT" \
   -v "$deployment/prime-rl/src/prime_rl/orchestrator/train_source.py":/app/src/prime_rl/orchestrator/train_source.py:ro \
   -v "$deployment/prime-rl/src/prime_rl/orchestrator/watcher.py":/app/src/prime_rl/orchestrator/watcher.py:ro \
   -v "$deployment/prime-rl/src/prime_rl/utils/client.py":/app/src/prime_rl/utils/client.py:ro \
+  -v "$deployment/prime-rl/packages/prime-rl-configs/src/prime_rl/configs/shared.py":/app/packages/prime-rl-configs/src/prime_rl/configs/shared.py:ro \
   -v "$deployment/prime-rl/src/prime_rl/utils/checkpoint_delta.py":/app/src/prime_rl/utils/checkpoint_delta.py:ro \
   -v "$deployment/prime-rl/src/prime_rl/utils/adapter_delta.py":/app/src/prime_rl/utils/adapter_delta.py:ro \
   --entrypoint /app/.venv/bin/orchestrator "$image" \

@@ -70,6 +70,7 @@ orchestrator_launcher = f"{runtime_root}/h200/start_orchestrator.sh"
 trainer_container = containers["trainer"]
 orchestrator_container = containers["orchestrator"]
 adapter_container = containers["adapter"]
+adapter_relay_container = containers["adapter_relay"]
 glm_inference_container = containers["glm52_inference"]
 muse_inference_container = containers["muse_inference"]
 glm_model = models["glm52"]
@@ -4948,7 +4949,7 @@ exit 1
     _remote_ok(
         orchestrator_host,
         f"pkill -f '[s]ync_rollout_batches.sh' 2>/dev/null; "
-        f"sudo docker rm -f {orchestrator_container} >/dev/null 2>&1; echo done",
+        f"sudo docker rm -f {orchestrator_container} {adapter_relay_container} >/dev/null 2>&1; echo done",
         "old orchestrator stop",
     )
     _remote_ok(
@@ -5115,7 +5116,7 @@ def stop() -> None:
     _remote_ok(
         orchestrator_host,
         f"pkill -f '[s]ync_rollout_batches.sh' 2>/dev/null; "
-        f"sudo docker rm -f {orchestrator_container} >/dev/null 2>&1; echo done",
+        f"sudo docker rm -f {orchestrator_container} {adapter_relay_container} >/dev/null 2>&1; echo done",
         "orchestrator stop",
     )
     _remote_ok(
