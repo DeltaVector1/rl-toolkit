@@ -1,6 +1,8 @@
 import hashlib
 import importlib.util
 import io
+import json
+import os
 import sys
 import tempfile
 import types
@@ -54,6 +56,94 @@ def load_filesystem_module():
 
 
 class DownloadSchedulerTest(unittest.TestCase):
+    def test_sequential_download_survives_parent_swap_at_output_open(self):
+        filesystem = load_filesystem_module()
+        payload = b"safe"
+
+        class Response(io.BytesIO):
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        def fake_urlopen(_request, timeout):
+            self.assertGreater(timeout, 0)
+            return Response(payload)
+
+        old_urlopen = filesystem.urllib.request.urlopen
+        old_open = filesystem.os.open
+        filesystem.urllib.request.urlopen = fake_urlopen
+        triggered = False
+        try:
+            with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryDirectory() as external:
+                root = Path(temporary)
+                cache = root / "cache"
+                cache.mkdir()
+                cache_original = root / "cache-original"
+                outside = Path(external)
+
+                def swap_before_output_open(path, flags, mode=0o777, *, dir_fd=None):
+                    nonlocal triggered
+                    if path == "output" and dir_fd is not None and not triggered:
+                        cache.rename(cache_original)
+                        cache.symlink_to(outside, target_is_directory=True)
+                        triggered = True
+                    return old_open(path, flags, mode, dir_fd=dir_fd)
+
+                filesystem.os.open = swap_before_output_open
+                filesystem.download(
+                    "http://lane/output",
+                    cache / "output",
+                    expected_size=len(payload),
+                    expected_sha256=hashlib.sha256(payload).hexdigest(),
+                    parallel_ranges=False,
+                )
+                self.assertTrue(triggered)
+                self.assertEqual((cache_original / "output").read_bytes(), payload)
+                self.assertFalse((outside / "output").exists())
+        finally:
+            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem.os.open = old_open
+
+    def test_sequential_download_resumes_existing_output(self):
+        filesystem = load_filesystem_module()
+        payload = b"safe"
+        calls = []
+
+        class Response(io.BytesIO):
+            status = 206
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        def fake_urlopen(request, **_kwargs):
+            calls.append(request.headers.get("Range"))
+            return Response(payload[2:])
+
+        old_urlopen = filesystem.urllib.request.urlopen
+        filesystem.urllib.request.urlopen = fake_urlopen
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                destination = Path(temporary) / "output"
+                destination.write_bytes(payload[:2])
+                filesystem.download(
+                    "http://lane/output",
+                    destination,
+                    expected_size=len(payload),
+                    expected_sha256=hashlib.sha256(payload).hexdigest(),
+                    parallel_ranges=False,
+                )
+                self.assertEqual(destination.read_bytes(), payload)
+        finally:
+            filesystem.urllib.request.urlopen = old_urlopen
+        self.assertEqual(calls, ["bytes=2-"])
+
     def test_glm_stream_count_accepts_96_lanes(self):
         filesystem = load_filesystem_module()
         old_value = filesystem.os.environ.get(filesystem._DOWNLOAD_STREAMS_ENV)
@@ -155,6 +245,67 @@ class DownloadSchedulerTest(unittest.TestCase):
 
         self.assertEqual(workers, [2])
         self.assertEqual(len(calls), 2)
+
+    def test_parallel_download_resumes_parts_and_removes_private_files(self):
+        filesystem = load_filesystem_module()
+        payload = b"abcdefgh"
+        calls = []
+
+        class Response(io.BytesIO):
+            status = 206
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        def fake_urlopen(request, **_kwargs):
+            range_value = request.headers["Range"]
+            start, end = (
+                int(value)
+                for value in range_value.removeprefix("bytes=").split("-")
+            )
+            calls.append((start, end))
+            return Response(payload[start : end + 1])
+
+        old_urlopen = filesystem.urllib.request.urlopen
+        old_threshold = filesystem._PARALLEL_DOWNLOAD_THRESHOLD
+        old_streams = filesystem._configured_download_streams
+        filesystem.urllib.request.urlopen = fake_urlopen
+        filesystem._PARALLEL_DOWNLOAD_THRESHOLD = 0
+        filesystem._configured_download_streams = lambda: 2
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                destination = Path(temporary) / "output"
+                parts = destination.with_name("output.parts")
+                parts.mkdir()
+                (parts / "manifest.json").write_text(
+                    json.dumps(
+                        {
+                            "source_url": "http://lane/output",
+                            "size": len(payload),
+                            "sha256": hashlib.sha256(payload).hexdigest(),
+                            "streams": 2,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                (parts / "part-000").write_bytes(payload[:2])
+                filesystem.download(
+                    "http://lane/output",
+                    destination,
+                    expected_size=len(payload),
+                    expected_sha256=hashlib.sha256(payload).hexdigest(),
+                    source_urls=["http://lane/output", "http://lane-2/output"],
+                )
+                self.assertEqual(destination.read_bytes(), payload)
+                self.assertFalse(parts.exists())
+        finally:
+            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem._PARALLEL_DOWNLOAD_THRESHOLD = old_threshold
+            filesystem._configured_download_streams = old_streams
+        self.assertEqual(sorted(calls), [(2, 3), (4, 7)])
 
     def test_chunk_retry_uses_short_timeout_and_next_lane(self):
         filesystem = load_filesystem_module()
