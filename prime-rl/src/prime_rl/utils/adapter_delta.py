@@ -214,6 +214,8 @@ def _decode_leb128_values(value: bytes, count: int) -> np.ndarray:
         return np.empty(0, dtype=np.uint16)
     if len(encoded) == 0:
         raise ValueError("predictive values contain a truncated varint")
+    if len(encoded) == count and not np.any(encoded & np.uint8(0x80)):
+        return encoded.astype(np.uint16, copy=True)
 
     starts_mask = np.empty(len(encoded), dtype=np.bool_)
     starts_mask[0] = True
