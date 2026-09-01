@@ -74,6 +74,19 @@ def load_manifest_reader(urlopen):
     return namespace["_read_adapter_manifest"]
 
 
+def load_manifest_prewarm_method():
+    path = ROOT / "src/prime_rl/orchestrator/watcher.py"
+    source = path.read_text(encoding="utf-8")
+    function = next(
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_prewarm_adapter_manifest"
+    )
+    namespace = {"asyncio": asyncio}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)
+    return namespace["_prewarm_adapter_manifest"]
+
+
 def load_filesystem_module():
     path = ROOT / "src/prime_rl/inference/vllm/worker/filesystem.py"
     module_name = "filesystem_sidecar_test"
@@ -288,6 +301,29 @@ class AdapterTransportStateTest(unittest.TestCase):
                 calls,
                 [("http://source/step_2/adapter_manifest.json", 30)],
             )
+
+    def test_manifest_prewarm_does_not_block_the_event_loop(self):
+        prewarm = load_manifest_prewarm_method()
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking_helper(*_args):
+            started.set()
+            release.wait(2)
+            return "manifest-location"
+
+        watcher = SimpleNamespace(_adapter_delta_base=blocking_helper)
+
+        async def exercise():
+            task = asyncio.create_task(prewarm(watcher, 2, Path("step_2"), "http://source/step_2"))
+            await asyncio.to_thread(started.wait, 1)
+            tick = asyncio.Event()
+            asyncio.get_running_loop().call_later(0.01, tick.set)
+            await asyncio.wait_for(tick.wait(), 0.5)
+            release.set()
+            return await task
+
+        self.assertEqual(asyncio.run(exercise()), "manifest-location")
 
     def test_bootstrap_does_not_duplicate_the_full_adapter(self):
         with tempfile.TemporaryDirectory() as temporary:

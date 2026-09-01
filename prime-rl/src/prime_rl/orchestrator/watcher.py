@@ -405,6 +405,19 @@ class WeightWatcher:
         )
         return manifest_location
 
+    async def _prewarm_adapter_manifest(
+        self,
+        next_step: int,
+        local_weights_path,
+        target_url: str,
+    ) -> str:
+        return await asyncio.to_thread(
+            self._adapter_delta_base,
+            next_step,
+            local_weights_path,
+            target_url,
+        )
+
     async def apply_policy_update(self, next_step: int) -> None:
         async with self.update_lock:
             if next_step <= self.ckpt_step:
@@ -447,7 +460,11 @@ class WeightWatcher:
                 elif self.lora_name is not None and next_step > 0 and isinstance(weights_path, str):
                     if local_weights_path is None:
                         raise RuntimeError("adapter delta target path is not local")
-                    manifest_path = self._adapter_delta_base(next_step, local_weights_path, weights_path)
+                    manifest_path = await self._prewarm_adapter_manifest(
+                        next_step,
+                        local_weights_path,
+                        weights_path,
+                    )
                     require_delta = True
                     build_time = (
                         format_time(self.last_adapter_delta_build_time)
