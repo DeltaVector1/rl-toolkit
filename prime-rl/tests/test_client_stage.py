@@ -13,7 +13,39 @@ ROOT = Path(__file__).resolve().parents[1]
 CLIENT_PATH = ROOT / "src/prime_rl/utils/client.py"
 
 
-def _load_stage_function():
+class _ManifestProbeResponse:
+    def __init__(self, version):
+        self.version = version
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return {
+            "version": self.version,
+            "transport": (
+                "chunked-bf16-linear-zigzag-sparse-zstd"
+                if self.version == 2
+                else "chunked-shuffled-xor-zstd"
+            ),
+        }
+
+
+class _ManifestProbeClient:
+    def __init__(self, version):
+        self.version = version
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return None
+
+    async def get(self, *_args, **_kwargs):
+        return _ManifestProbeResponse(self.version)
+
+
+def _load_stage_function(probe_version=1):
     source = CLIENT_PATH.read_text(encoding="utf-8")
     function = next(
         node
@@ -22,6 +54,15 @@ def _load_stage_function():
     )
     namespace = {
         "AsyncClient": httpx.AsyncClient,
+        "httpx": type(
+            "ProbeHttpx",
+            (),
+            {
+                "AsyncClient": lambda *_args, **_kwargs: _ManifestProbeClient(probe_version),
+                "HTTPError": httpx.HTTPError,
+                "Timeout": httpx.Timeout,
+            },
+        ),
         "Path": Path,
         "asyncio": asyncio,
         "time": time,
@@ -209,6 +250,37 @@ class StageLoraAdapterTest(unittest.TestCase):
         self.assertLess(peer_request["timeout_s"], origin_request["timeout_s"])
         self.assertLessEqual(origin_request["timeout_s"], 0.15)
         self.assertLessEqual(peer_request["timeout_s"], 0.15)
+
+    def test_predictive_origin_and_peer_stage_concurrently(self):
+        stage_lora_adapter, namespace = _load_stage_function(probe_version=2)
+        calls = []
+
+        class Response:
+            def json(self):
+                return {"status": "ok", "stage_seconds": 0.03}
+
+        async def fake_admin_post_response(client, _path, **_kwargs):
+            calls.append((client, time.perf_counter()))
+            await asyncio.sleep(0.03)
+            return Response()
+
+        namespace["_admin_post_response"] = fake_admin_post_response
+        origin = httpx.AsyncClient(base_url="http://127.0.0.1:8000")
+        peer = httpx.AsyncClient(base_url="http://127.0.0.1:18049")
+        result = asyncio.run(
+            stage_lora_adapter(
+                [peer, origin],
+                "http://adapter/step_2",
+                require_delta=True,
+                origin_base_urls=["http://127.0.0.1:8000"],
+            )
+        )
+
+        self.assertEqual({client for client, _ in calls}, {origin, peer})
+        self.assertLess(abs(calls[0][1] - calls[1][1]), 0.02)
+        self.assertEqual(result["origin_host_count"], 1)
+        self.assertEqual(result["peer_host_count"], 1)
+        self.assertLess(result["wire_stage_seconds"], 0.10)
 
 
 if __name__ == "__main__":

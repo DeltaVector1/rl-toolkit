@@ -15,6 +15,7 @@ from urllib.parse import unquote, urlsplit
 
 relay_manifest_name = "relay_manifest.json"
 ready_marker_name = "READY"
+relaying_marker_name = "RELAYING"
 relay_transport = "chunked-shuffled-xor-zstd"
 predictive_transport = "chunked-bf16-linear-zigzag-sparse-zstd"
 full_transport = "full"
@@ -192,7 +193,10 @@ def _validate_predictive_source_manifest(manifest: dict[str, object], source_url
         for item in files
         if isinstance(item, dict) and isinstance(item.get("name"), str)
     }
-    if set(file_map) != {"adapter_config.json", "adapter_model.safetensors"}:
+    if (
+        len(file_map) != len(files)
+        or set(file_map) != {"adapter_config.json", "adapter_model.safetensors"}
+    ):
         raise RelayRequestError(500, "relay source manifest has an incomplete file set")
     target_file = file_map["adapter_model.safetensors"]
     config_file = file_map["adapter_config.json"]
@@ -215,12 +219,21 @@ def _validate_predictive_source_manifest(manifest: dict[str, object], source_url
 
 def _load_file(cache_path: Path, source_url: str, requested_name: str) -> RelayFile:
     ready = cache_path / ready_marker_name
-    manifest_path = cache_path / relay_manifest_name
+    relaying_path = cache_path.with_name(f"{cache_path.name}.partial")
+    relaying = (
+        not ready.is_file()
+        and relaying_path.is_dir()
+        and (relaying_path / relaying_marker_name).is_file()
+        and not (relaying_path / relaying_marker_name).is_symlink()
+    )
+    if not ready.is_file() and not relaying:
+        raise RelayRequestError(404, "adapter is not ready")
+    published_path = cache_path if ready.is_file() else relaying_path
+    manifest_path = published_path / relay_manifest_name
     if (
-        cache_path.is_symlink()
-        or not cache_path.is_dir()
-        or not ready.is_file()
-        or ready.is_symlink()
+        published_path.is_symlink()
+        or not published_path.is_dir()
+        or (ready.is_file() and ready.is_symlink())
         or not manifest_path.is_file()
         or manifest_path.is_symlink()
     ):
@@ -241,7 +254,7 @@ def _load_file(cache_path: Path, source_url: str, requested_name: str) -> RelayF
     ):
         raise RelayRequestError(500, "relay manifest is invalid")
     if transport == predictive_transport:
-        source_manifest_path = cache_path / "adapter_manifest.json"
+        source_manifest_path = published_path / "adapter_manifest.json"
         try:
             source_manifest = json.loads(source_manifest_path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
@@ -285,22 +298,51 @@ def _load_file(cache_path: Path, source_url: str, requested_name: str) -> RelayF
     if transport == full_transport and set(files) != required_names:
         raise RelayRequestError(500, "full relay manifest contains transport chunks")
 
+    if relaying and transport == predictive_transport and requested_name == "adapter_model.safetensors":
+        raise RelayRequestError(404, "adapter model is not published until staging is complete")
     raw_spec = files.get(requested_name)
     if not isinstance(raw_spec, dict):
         raise RelayRequestError(404, "file is not published by the relay")
     relative = _safe_relative_path(raw_spec["path"])
     size = raw_spec["size"]
     digest = raw_spec["sha256"]
-    raw_candidate = cache_path / relative
+    raw_candidate = published_path / relative
     if raw_candidate.is_symlink():
         raise RelayRequestError(500, "relay manifest points to a symbolic link")
+    cursor = published_path
+    for part in relative.parts[:-1]:
+        cursor /= part
+        if cursor.is_symlink():
+            raise RelayRequestError(500, "relay manifest traverses a symbolic link")
     candidate = raw_candidate.resolve()
     try:
-        candidate.relative_to(cache_path.resolve())
+        candidate.relative_to(published_path.resolve())
     except ValueError as exc:
         raise RelayRequestError(500, "relay manifest escapes the adapter cache") from exc
     if not candidate.is_file() or candidate.stat().st_size != size:
         raise RelayRequestError(503, "relay file is incomplete")
+    if relaying and transport == predictive_transport and requested_name not in {
+        "adapter_manifest.json",
+        "adapter_config.json",
+    }:
+        # A chunk is visible only after the writer has validated its wire
+        # checksum and atomically published its completion proof.
+        proof_path = candidate.with_name(f"{candidate.name}.done")
+        if proof_path.is_symlink() or not proof_path.is_file():
+            raise RelayRequestError(503, "relay chunk is not complete")
+        try:
+            proof = json.loads(proof_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise RelayRequestError(503, "relay chunk completion proof is unavailable") from exc
+        if (
+            not isinstance(proof, dict)
+            or proof.get("file") != requested_name
+            or proof.get("wire_size") != size
+            or proof.get("wire_sha256") != digest
+            or not isinstance(proof.get("output_sha256"), str)
+            or digest_pattern.fullmatch(proof["output_sha256"]) is None
+        ):
+            raise RelayRequestError(503, "relay chunk completion proof is invalid")
     return RelayFile(path=candidate, size=size, sha256=digest)
 
 

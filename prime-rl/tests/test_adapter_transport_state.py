@@ -772,12 +772,16 @@ class AdapterTransportStateTest(unittest.TestCase):
 
         def fake_download(_source, destination, **kwargs):
             nonlocal fail_second_chunk
-            if destination.name.startswith("chunk-"):
+            if "chunk-" in destination.name:
                 self.assertFalse(kwargs.get("parallel_ranges", True))
             downloaded.append(destination.name)
-            payload = {"chunk-0": first_payload, "chunk-1": second_payload}.get(destination.name, config)
+            payload = config
+            if "chunk-0" in destination.name:
+                payload = first_payload
+            elif "chunk-1" in destination.name:
+                payload = second_payload
             destination.write_bytes(payload)
-            if destination.name == "chunk-1" and fail_second_chunk:
+            if "chunk-1" in destination.name and fail_second_chunk:
                 fail_second_chunk = False
                 raise TimeoutError("test deadline")
 
@@ -811,8 +815,9 @@ class AdapterTransportStateTest(unittest.TestCase):
                 self.assertTrue((destination / "relay_manifest.json").is_file())
                 self.assertTrue((destination / "transport-chunks" / "chunk-0").is_file())
                 self.assertTrue((destination / "transport-chunks" / "chunk-1").is_file())
-                self.assertNotIn("chunk-0", downloaded[len(downloaded_after_failure) :])
-                self.assertIn("chunk-1", downloaded[len(downloaded_after_failure) :])
+                resumed = downloaded[len(downloaded_after_failure) :]
+                self.assertFalse(any("chunk-0" in name for name in resumed))
+                self.assertTrue(any("chunk-1" in name for name in resumed))
         finally:
             if old_cache is None:
                 os.environ.pop("PRIME_LORA_CACHE_DIR", None)

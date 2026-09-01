@@ -683,34 +683,94 @@ async def stage_lora_adapter(
             "reconstruct_seconds": float(reconstruct_seconds)
             if reconstruct_seconds is not None
             else None,
+            "request_seconds": time.perf_counter() - started,
         }
 
     started = time.perf_counter()
     delta_deadline = started + _delta_stage_timeout_s() if require_delta else None
+    predictive_transport = False
+    if require_delta:
+        remaining = _delta_stage_timeout_s() - (time.perf_counter() - started)
+        if remaining <= 0:
+            raise TimeoutError("adapter delta staging exceeded its time limit")
+        try:
+            async with httpx.AsyncClient(follow_redirects=False) as probe:
+                response = await probe.get(
+                    f"{lora_path_posix.rstrip('/')}/adapter_manifest.json",
+                    timeout=httpx.Timeout(
+                        connect=min(10.0, remaining),
+                        read=min(10.0, remaining),
+                        write=min(10.0, remaining),
+                        pool=min(10.0, remaining),
+                    ),
+                )
+                response.raise_for_status()
+                manifest = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise RuntimeError("cannot determine adapter transport before staging") from exc
+        if not isinstance(manifest, dict):
+            raise RuntimeError("adapter transport manifest is not an object")
+        predictive_transport = (
+            manifest.get("version") == 2
+            and manifest.get("transport") == "chunked-bf16-linear-zigzag-sparse-zstd"
+        )
     results = []
     group_seconds: list[float] = []
-    for group in [ordered_hosts, *peer_groups]:
-        group_started = time.perf_counter()
-        if delta_deadline is None:
-            results.extend(await asyncio.gather(*(_stage_one(client) for client in group)))
-        else:
-            remaining = delta_deadline - time.perf_counter()
-            if remaining <= 0:
-                raise TimeoutError("adapter delta staging exceeded its time limit")
-            try:
-                staged = await asyncio.wait_for(
-                    asyncio.gather(
-                        *(
-                            _stage_one(client, remaining_delta_seconds=remaining)
-                            for client in group
-                        )
-                    ),
-                    timeout=remaining,
+    groups = [ordered_hosts, *peer_groups]
+    if predictive_transport:
+        # v2 origin and peer transfers share one absolute deadline. If the
+        # origin fails, cancel and await every peer task before returning.
+        remaining = delta_deadline - time.perf_counter()
+        if remaining <= 0:
+            raise TimeoutError("adapter delta staging exceeded its time limit")
+        tasks = [
+            asyncio.create_task(
+                _stage_one(client, remaining_delta_seconds=remaining)
+            )
+            for group in groups
+            for client in group
+        ]
+        try:
+            staged = await asyncio.wait_for(asyncio.gather(*tasks), timeout=remaining)
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        results.extend(staged)
+        position = 0
+        for group in groups:
+            group_results = staged[position : position + len(group)]
+            position += len(group)
+            group_seconds.append(
+                max(
+                    (float(item["request_seconds"]) for item in group_results),
+                    default=0.0,
                 )
-            except asyncio.TimeoutError as exc:
-                raise TimeoutError("adapter delta staging exceeded its time limit") from exc
-            results.extend(staged)
-        group_seconds.append(time.perf_counter() - group_started)
+            )
+    else:
+        for group in groups:
+            group_started = time.perf_counter()
+            if delta_deadline is None:
+                results.extend(await asyncio.gather(*(_stage_one(client) for client in group)))
+            else:
+                remaining = delta_deadline - time.perf_counter()
+                if remaining <= 0:
+                    raise TimeoutError("adapter delta staging exceeded its time limit")
+                try:
+                    staged = await asyncio.wait_for(
+                        asyncio.gather(
+                            *(
+                                _stage_one(client, remaining_delta_seconds=remaining)
+                                for client in group
+                            )
+                        ),
+                        timeout=remaining,
+                    )
+                except asyncio.TimeoutError as exc:
+                    raise TimeoutError("adapter delta staging exceeded its time limit") from exc
+                results.extend(staged)
+            group_seconds.append(time.perf_counter() - group_started)
     origin_stage_seconds = group_seconds[0] if group_seconds else 0.0
     peer_stage_seconds = sum(group_seconds[1:])
     wire_stage_seconds = time.perf_counter() - started

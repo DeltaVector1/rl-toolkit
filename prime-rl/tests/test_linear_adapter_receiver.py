@@ -50,6 +50,7 @@ def load_filesystem():
 class LinearAdapterReceiverTest(unittest.TestCase):
     def test_manifest_requires_two_adjacent_bases_and_even_coverage(self):
         filesystem = load_filesystem()
+        self.assertEqual(filesystem._PREDICTIVE_RECONSTRUCT_WORKERS, 32)
         target = b"t" * 8
         digest = hashlib.sha256(target).hexdigest()
         config = b"{}\n"
@@ -110,6 +111,10 @@ class LinearAdapterReceiverTest(unittest.TestCase):
             parsed = filesystem._read_chunked_linear_manifest("http://source/step_2")
             self.assertEqual(parsed["base2_url"], "http://source/step_0")
             self.assertEqual(parsed["chunks"][0]["data_offset"], 2)
+            manifest["chunks"][0]["data_offset"] = 0
+            with self.assertRaisesRegex(OSError, "identity is invalid"):
+                filesystem._read_chunked_linear_manifest("http://source/step_2")
+            manifest["chunks"][0]["data_offset"] = 2
             manifest["chunks"][0]["raw_size"] = 7
             with self.assertRaisesRegex(OSError, "identity is invalid"):
                 filesystem._read_chunked_linear_manifest("http://source/step_2")
@@ -180,6 +185,7 @@ class LinearAdapterReceiverTest(unittest.TestCase):
         old_source = filesystem._source_manifest
         old_decode = filesystem._decode_linear_transport_chunk
         old_timeout = filesystem._delta_stage_timeout_s
+        relaying_seen_before_chunk = False
         try:
             with tempfile.TemporaryDirectory() as temporary:
                 os.environ["PRIME_LORA_CACHE_DIR"] = temporary
@@ -197,8 +203,15 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                     (path / "READY").write_text("ready\n", encoding="utf-8")
 
                 def fake_download(_source, destination, **kwargs):
+                    nonlocal relaying_seen_before_chunk
                     destination.parent.mkdir(parents=True, exist_ok=True)
-                    destination.write_bytes(config if destination.name == "adapter_config.json" else wire)
+                    if "chunk-" in destination.name:
+                        relaying_seen_before_chunk = (
+                            destination.parent.parent / "RELAYING"
+                        ).is_file()
+                    destination.write_bytes(
+                        config if "adapter_config.json" in destination.name else wire
+                    )
                     if kwargs.get("progress"):
                         kwargs["progress"](0, destination.stat().st_size)
 
@@ -223,6 +236,7 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                 status = filesystem.adapter_stage_status()
                 self.assertEqual(status["status"], "ready")
                 self.assertGreaterEqual(status["reconstruct_seconds"], 0.0)
+                self.assertTrue(relaying_seen_before_chunk)
         finally:
             if old_cache is None:
                 os.environ.pop("PRIME_LORA_CACHE_DIR", None)

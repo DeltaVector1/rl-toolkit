@@ -54,6 +54,7 @@ _ADAPTER_FILES = ("adapter_config.json", "adapter_model.safetensors")
 _ADAPTER_MANIFEST = "adapter_manifest.json"
 _ADAPTER_DIGEST = "adapter_model.safetensors.sha256"
 _RELAY_MANIFEST = "relay_manifest.json"
+_RELAYING_MARKER = "RELAYING"
 _ADAPTER_STATUS = ".adapter-stage-status.json"
 _ADAPTER_DELTA_TRANSPORT = "chunked-shuffled-xor-zstd"
 _ADAPTER_LINEAR_TRANSPORT = "chunked-bf16-linear-zigzag-sparse-zstd"
@@ -62,6 +63,8 @@ _ADAPTER_KNOWN_CHUNK_CODECS = {"zstd"}
 _ADAPTER_MAX_CHUNKS = 65536
 _ADAPTER_LANE_TIMEOUT_S = float(os.environ.get("PRIME_LORA_LANE_TIMEOUT_S", "45"))
 _ADAPTER_LANE_RETRIES = int(os.environ.get("PRIME_LORA_LANE_RETRIES", "6"))
+_ADAPTER_VISIBILITY_RETRIES = 300
+_PREDICTIVE_RECONSTRUCT_WORKERS = 32
 _ADAPTER_CHUNK_TIMEOUT_S = float(os.environ.get("PRIME_LORA_CHUNK_TIMEOUT_S", "15"))
 _ADAPTER_STATUS_INTERVAL_S = float(os.environ.get("PRIME_LORA_STATUS_INTERVAL_S", "1"))
 _JSON_LOCK = threading.Lock()
@@ -731,6 +734,7 @@ def _read_chunked_linear_manifest(
             or type(chunk_data_offset) is not int
             or chunk_data_offset < 0
             or chunk_data_offset % 2
+            or chunk_data_offset != data_offset
             or type(raw_size) is not int
             or raw_size <= 0
             or raw_size % 2
@@ -807,7 +811,9 @@ def _read_chunked_xor_manifest(
             )
         )
     except HTTPError as exc:
-        raise OSError("adapter manifest is missing; transfer mode is unknown") from exc
+        if exc.code in {404, 503}:
+            raise OSError("adapter manifest is missing; transfer mode is unknown") from exc
+        raise OSError(f"adapter manifest request failed with HTTP status {exc.code}") from exc
     if not isinstance(raw, dict):
         raise OSError("invalid adapter transport manifest")
     if raw.get("version") == 2:
@@ -817,9 +823,50 @@ def _read_chunked_xor_manifest(
     raise OSError("adapter manifest version is unsupported")
 
 
+def _read_delta_manifest_with_visibility_wait(
+    source_url: str,
+    *,
+    deadline: float | None,
+    cancel_event: threading.Event | None,
+) -> dict[str, object]:
+    """Wait for the origin to publish a v2 manifest under one deadline."""
+    for attempt in range(_ADAPTER_VISIBILITY_RETRIES):
+        try:
+            return _read_chunked_xor_manifest(
+                source_url,
+                deadline=deadline,
+                cancel_event=cancel_event,
+            )
+        except OSError as exc:
+            if "adapter manifest is missing" not in str(exc):
+                raise
+            _check_deadline(deadline, cancel_event)
+            if attempt + 1 == _ADAPTER_VISIBILITY_RETRIES:
+                raise
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError("adapter delta staging exceeded its time limit") from exc
+            wait_for = 1.0 if remaining is None else min(1.0, remaining)
+            if cancel_event is None:
+                time.sleep(wait_for)
+            else:
+                cancel_event.wait(wait_for)
+    raise OSError("adapter manifest visibility wait ended without a result")
+
+
 def _write_json(path: Path, value: dict[str, object]) -> None:
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     temporary.write_text(json.dumps(value, separators=(",", ":")), encoding="utf-8")
+    with temporary.open("rb") as stream:
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+
+
+def _write_marker(path: Path, value: str) -> None:
+    """Publish a state marker with one atomic rename."""
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(value, encoding="ascii")
     with temporary.open("rb") as stream:
         stream.flush()
         os.fsync(stream.fileno())
@@ -833,6 +880,7 @@ def _publish_relay_manifest(
     transport: dict[str, object],
     validated_files: dict[str, object],
     *,
+    allow_partial: bool = False,
     deadline: float | None = None,
     cancel_event: threading.Event | None = None,
 ) -> None:
@@ -858,7 +906,7 @@ def _publish_relay_manifest(
     for filename in _ADAPTER_FILES:
         _check_deadline(deadline, cancel_event)
         path = directory / filename
-        if path.is_symlink() or not path.is_file():
+        if path.is_symlink() or (not allow_partial and not path.is_file()):
             raise OSError(f"adapter relay file is missing: {filename}")
         spec = validated_files.get(filename)
         if not isinstance(spec, dict):
@@ -870,7 +918,7 @@ def _publish_relay_manifest(
             or size < 0
             or not isinstance(digest, str)
             or re.fullmatch(r"[0-9a-f]{64}", digest) is None
-            or path.stat().st_size != size
+            or (not allow_partial and (not path.is_file() or path.stat().st_size != size))
         ):
             raise OSError(f"adapter relay file checksum differs: {filename}")
         relay_files[filename] = {
@@ -886,9 +934,10 @@ def _publish_relay_manifest(
         chunk_root = directory / "transport-chunks"
         if not chunk_root.is_dir():
             raise OSError("adapter relay delta chunks are missing")
-        for completed_path in chunk_root.rglob("*.done"):
-            _check_deadline(deadline, cancel_event)
-            completed_path.unlink()
+        if not allow_partial:
+            for completed_path in chunk_root.rglob("*.done"):
+                _check_deadline(deadline, cancel_event)
+                completed_path.unlink()
         for item in chunks:
             _check_deadline(deadline, cancel_event)
             if not isinstance(item, dict) or not isinstance(item.get("file"), str):
@@ -899,7 +948,7 @@ def _publish_relay_manifest(
                 Path(filename).name != filename
                 or filename in relay_files
                 or path.is_symlink()
-                or not path.is_file()
+                or (not allow_partial and not path.is_file())
             ):
                 raise OSError("adapter relay delta chunk is missing")
             wire_size = item.get("wire_size")
@@ -909,7 +958,10 @@ def _publish_relay_manifest(
                 or wire_size <= 0
                 or not isinstance(wire_sha256, str)
                 or re.fullmatch(r"[0-9a-f]{64}", wire_sha256) is None
-                or path.stat().st_size != wire_size
+                or (
+                    not allow_partial
+                    and (not path.is_file() or path.stat().st_size != wire_size)
+                )
             ):
                 raise OSError(f"adapter relay delta chunk checksum differs: {filename}")
             relay_files[filename] = {
@@ -1264,19 +1316,20 @@ def _decode_linear_transport_chunk(
     if codec not in _ADAPTER_KNOWN_CHUNK_CODECS:
         raise OSError("version-two adapter chunk codec is unsupported")
     try:
-        from prime_rl.utils.adapter_delta import decode_predictive_chunk, predictive_raw_sha256
+        from prime_rl.utils.adapter_delta import decode_linear_zigzag_sparse_chunk
     except ImportError as exc:
         raise OSError("version-two adapter transport decoder is unavailable") from exc
     try:
-        target = decode_predictive_chunk(
+        target, correction = decode_linear_zigzag_sparse_chunk(
             base2,
             base1,
             payload,
-            offset,
-            data_offset,
-            max_output_size=raw_size,
+            offset=offset,
+            data_offset=data_offset,
+            raw_size=raw_size,
+            codec=codec,
         )
-        correction_sha256 = predictive_raw_sha256(payload)
+        correction_sha256 = hashlib.sha256(correction).hexdigest()
     except Exception as exc:
         raise OSError("version-two adapter transport reconstruction failed") from exc
     if not isinstance(target, bytes) or not isinstance(correction_sha256, str):
@@ -1469,6 +1522,7 @@ def _stage_chunked_linear_adapter(
         )
     )
     reconstruct_lock = threading.Lock()
+    reconstruct_semaphore = threading.BoundedSemaphore(_PREDICTIVE_RECONSTRUCT_WORKERS)
     reconstruct_seconds = 0.0
     last_status = 0.0
 
@@ -1517,6 +1571,46 @@ def _stage_chunked_linear_adapter(
     output_path = temporary / _ADAPTER_FILES[1]
     if not output_path.is_file() or output_path.stat().st_size != target_size:
         _preallocate(output_path, target_size)
+
+    # Publish configuration atomically before the relay index. The peer must
+    # never observe a relay index that points at an unfinished config file.
+    config_path = temporary / _ADAPTER_FILES[0]
+    config_incoming_path = config_path.with_name(f".{config_path.name}.incoming")
+    download(
+        f"{source_url.rstrip('/')}/{_ADAPTER_FILES[0]}",
+        config_incoming_path,
+        expected_size=config_size,
+        expected_sha256=config_sha256,
+        progress=report,
+        deadline=deadline,
+        cancel_event=cancel_event,
+        retry_http_statuses={404, 503},
+    )
+    if _sha256(config_incoming_path, deadline, cancel_event) != config_sha256:
+        raise OSError("version-two adapter configuration checksum mismatch")
+    os.replace(config_incoming_path, config_path)
+
+    # The origin publishes the exact v2 index before transfer workers start.
+    # The relay uses RELAYING to expose only manifests, configuration, and
+    # chunks with a completed proof. It never exposes this incomplete model.
+    source_transport_manifest = transport.get("source_manifest")
+    if not isinstance(source_transport_manifest, dict):
+        raise OSError("version-two adapter source manifest is unavailable for relay")
+    reader_lock_path = _adapter_reader_lock(destination)
+    if reader_lock_path.is_symlink():
+        raise OSError("adapter reader lock is a symbolic link")
+    reader_lock_path.touch(exist_ok=True)
+    _publish_relay_manifest(
+        temporary,
+        source_url,
+        source_transport_manifest,
+        transport,
+        source_manifest["files"],
+        allow_partial=True,
+        deadline=deadline,
+        cancel_event=cancel_event,
+    )
+    _write_marker(temporary / _RELAYING_MARKER, "relaying\n")
 
     def fetch(index: int, item: dict[str, object]) -> None:
         nonlocal reconstruct_seconds
@@ -1575,9 +1669,10 @@ def _stage_chunked_linear_adapter(
 
         chunk_urls = [f"{lane_url.rstrip('/')}/{name}" for lane_url in lane_urls]
         chunk_urls = chunk_urls[chunk_lane:] + chunk_urls[:chunk_lane]
+        incoming_path = chunk_path.with_name(f".{chunk_path.name}.incoming")
         download(
             chunk_urls[0],
-            chunk_path,
+            incoming_path,
             expected_size=wire_size,
             expected_sha256=wire_sha256,
             progress=lane_report,
@@ -1586,45 +1681,49 @@ def _stage_chunked_linear_adapter(
             deadline=deadline,
             cancel_event=cancel_event,
             per_request_timeout_seconds=_configured_chunk_timeout(),
+            retry_http_statuses={404, 503},
         )
-        reconstruction_started = time.monotonic()
-        try:
-            _check_deadline(deadline, cancel_event)
-            encoded = chunk_path.read_bytes()
-            if len(encoded) != wire_size or _sha256(chunk_path, deadline, cancel_event) != wire_sha256:
-                raise OSError("version-two adapter transport chunk checksum mismatch")
-            base_fd2 = os.open(base2_model, os.O_RDONLY)
-            base_fd1 = os.open(base1_model, os.O_RDONLY)
-            output_fd = os.open(output_path, os.O_RDWR)
-            base2_chunk = os.pread(base_fd2, raw_size, offset)
-            base1_chunk = os.pread(base_fd1, raw_size, offset)
-            if len(base2_chunk) != raw_size or len(base1_chunk) != raw_size:
-                raise OSError("cached version-two base ended before transport chunk")
-            reconstructed, correction_sha256 = _decode_linear_transport_chunk(
-                base2_chunk,
-                base1_chunk,
-                encoded,
-                offset=offset,
-                data_offset=data_offset,
-                raw_size=raw_size,
-                codec=str(item["codec"]),
-            )
-            if correction_sha256 != raw_sha256:
-                raise OSError("version-two adapter correction checksum mismatch")
-            if len(reconstructed) != raw_size:
-                raise OSError("version-two adapter chunk has the wrong size")
-            _pwrite_all(output_fd, reconstructed, offset)
-            os.fsync(output_fd)
-            output_sha256 = hashlib.sha256(reconstructed).hexdigest()
-        finally:
-            if "output_fd" in locals():
-                os.close(output_fd)
-            if "base_fd1" in locals():
-                os.close(base_fd1)
-            if "base_fd2" in locals():
-                os.close(base_fd2)
-        with reconstruct_lock:
-            reconstruct_seconds += time.monotonic() - reconstruction_started
+        _check_deadline(deadline, cancel_event)
+        if _sha256(incoming_path, deadline, cancel_event) != wire_sha256:
+            raise OSError("version-two adapter transport chunk checksum mismatch")
+        os.replace(incoming_path, chunk_path)
+        encoded = chunk_path.read_bytes()
+        if len(encoded) != wire_size or _sha256(chunk_path, deadline, cancel_event) != wire_sha256:
+            raise OSError("version-two adapter transport chunk checksum mismatch")
+        with reconstruct_semaphore:
+            reconstruction_started = time.monotonic()
+            try:
+                base_fd2 = os.open(base2_model, os.O_RDONLY)
+                base_fd1 = os.open(base1_model, os.O_RDONLY)
+                output_fd = os.open(output_path, os.O_RDWR)
+                base2_chunk = os.pread(base_fd2, raw_size, offset)
+                base1_chunk = os.pread(base_fd1, raw_size, offset)
+                if len(base2_chunk) != raw_size or len(base1_chunk) != raw_size:
+                    raise OSError("cached version-two base ended before transport chunk")
+                reconstructed, correction_sha256 = _decode_linear_transport_chunk(
+                    base2_chunk,
+                    base1_chunk,
+                    encoded,
+                    offset=offset,
+                    data_offset=data_offset,
+                    raw_size=raw_size,
+                    codec=str(item["codec"]),
+                )
+                if correction_sha256 != raw_sha256:
+                    raise OSError("version-two adapter correction checksum mismatch")
+                if len(reconstructed) != raw_size:
+                    raise OSError("version-two adapter chunk has the wrong size")
+                _pwrite_all(output_fd, reconstructed, offset)
+                output_sha256 = hashlib.sha256(reconstructed).hexdigest()
+            finally:
+                if "output_fd" in locals():
+                    os.close(output_fd)
+                if "base_fd1" in locals():
+                    os.close(base_fd1)
+                if "base_fd2" in locals():
+                    os.close(base_fd2)
+            with reconstruct_lock:
+                reconstruct_seconds += time.monotonic() - reconstruction_started
         _check_deadline(deadline, cancel_event)
         _write_json(
             completed_path,
@@ -1645,6 +1744,11 @@ def _stage_chunked_linear_adapter(
     executor = ThreadPoolExecutor(max_workers=min(len(chunks), download_streams))
     futures = [executor.submit(fetch, index, item) for index, item in enumerate(chunks)]
     _wait_for_futures(executor, futures, deadline, cancel_event)
+    output_fd = os.open(output_path, os.O_RDONLY)
+    try:
+        os.fsync(output_fd)
+    finally:
+        os.close(output_fd)
     target_hash_started = time.monotonic()
     try:
         if _sha256(output_path, deadline, cancel_event) != target_sha256:
@@ -1655,21 +1759,8 @@ def _stage_chunked_linear_adapter(
     if output_path.stat().st_size != target_size:
         raise OSError("reconstructed version-two adapter size mismatch")
 
-    config_path = temporary / _ADAPTER_FILES[0]
-    download(
-        f"{source_url.rstrip('/')}/{_ADAPTER_FILES[0]}",
-        config_path,
-        expected_size=config_size,
-        expected_sha256=config_sha256,
-        progress=report,
-        deadline=deadline,
-        cancel_event=cancel_event,
-    )
-    if _sha256(config_path, deadline, cancel_event) != config_sha256:
+    if not config_path.is_file() or _sha256(config_path, deadline, cancel_event) != config_sha256:
         raise OSError("version-two adapter configuration checksum mismatch")
-    source_transport_manifest = transport.get("source_manifest")
-    if not isinstance(source_transport_manifest, dict):
-        raise OSError("version-two adapter source manifest is unavailable for relay")
     _publish_relay_manifest(
         temporary,
         source_url,
@@ -1697,6 +1788,7 @@ def _stage_chunked_linear_adapter(
     )
     with _adapter_stage_publish_lock:
         _check_deadline(deadline, cancel_event)
+        (temporary / _RELAYING_MARKER).unlink(missing_ok=True)
         ready = temporary / "READY"
         ready.write_text("ready\n", encoding="utf-8")
         with ready.open("rb") as stream:
@@ -2074,6 +2166,7 @@ def download(
     deadline: float | None = None,
     cancel_event: threading.Event | None = None,
     per_request_timeout_seconds: float | None = None,
+    retry_http_statuses: set[int] | None = None,
 ) -> None:
     _check_deadline(deadline, cancel_event)
     if per_request_timeout_seconds is not None and (
@@ -2119,7 +2212,12 @@ def download(
     if total < _PARALLEL_DOWNLOAD_THRESHOLD or streams == 1:
         # Preserve the old single-file resume path for small metadata files and
         # for an explicitly disabled parallel transfer.
-        for attempt in range(_ADAPTER_LANE_RETRIES):
+        attempt_limit = (
+            max(_ADAPTER_LANE_RETRIES, 64)
+            if retry_http_statuses
+            else _ADAPTER_LANE_RETRIES
+        )
+        for attempt in range(attempt_limit):
             _check_deadline(deadline, cancel_event)
             try:
                 offset = destination.stat().st_size if destination.exists() else 0
@@ -2169,10 +2267,27 @@ def download(
                     destination.unlink(missing_ok=True)
                     raise OSError(f"adapter checksum mismatch: {destination.name}")
                 return
+            except HTTPError as exc:
+                if retry_http_statuses is None or exc.code not in retry_http_statuses:
+                    raise
+                _check_deadline(deadline, cancel_event)
+                if attempt + 1 == attempt_limit:
+                    raise
+                sleep_for = min(2**attempt, 10)
+                _check_cancelled(cancel_event)
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("adapter delta staging exceeded its time limit")
+                    sleep_for = min(sleep_for, remaining)
+                if cancel_event is None:
+                    time.sleep(sleep_for)
+                else:
+                    cancel_event.wait(sleep_for)
             except OSError:
                 # Retry network timeouts; keep the absolute stage limit.
                 _check_deadline(deadline, cancel_event)
-                if attempt + 1 == _ADAPTER_LANE_RETRIES:
+                if attempt + 1 == attempt_limit:
                     raise
                 sleep_for = min(2**attempt, 10)
                 _check_cancelled(cancel_event)
@@ -2308,11 +2423,18 @@ def stage_lora_adapter_files(
         _acquire_stage_lock(host_lock, delta_deadline, cancel_event)
         transport: dict[str, object] | None = None
         try:
-            transport = _read_chunked_xor_manifest(
-                source_url,
-                deadline=delta_deadline,
-                cancel_event=cancel_event,
-            )
+            if require_delta:
+                transport = _read_delta_manifest_with_visibility_wait(
+                    source_url,
+                    deadline=delta_deadline,
+                    cancel_event=cancel_event,
+                )
+            else:
+                transport = _read_chunked_xor_manifest(
+                    source_url,
+                    deadline=delta_deadline,
+                    cancel_event=cancel_event,
+                )
             if (
                 delta_deadline is None
                 and transport is not None
@@ -2578,6 +2700,9 @@ def stage_lora_adapter_files(
             return destination
         except BaseException as exc:
             if require_delta or (isinstance(transport, dict) and transport.get("mode") == "delta"):
+                partial = destination.with_name(f"{destination.name}.partial")
+                if partial.is_dir():
+                    (partial / _RELAYING_MARKER).unlink(missing_ok=True)
                 _cleanup_delta_stage_artifacts(
                     destination,
                     preserve_partial=isinstance(exc, TimeoutError),
