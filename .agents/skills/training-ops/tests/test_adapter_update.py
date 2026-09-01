@@ -17,6 +17,19 @@ class AdapterUpdateTest(unittest.TestCase):
         self.assertEqual(config["run_marker"], "/glm-1/")
         self.assertEqual(config["service_marker"], "/run_glm-1/")
 
+    def test_glm_adapter_server_gets_predictive_upgrade_settings(self):
+        launcher = (
+            Path(__file__).resolve().parents[1]
+            / "runtime"
+            / "china"
+            / "cluster.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn("ADAPTER_PREDICTIVE_UPGRADE", launcher)
+        self.assertIn("ADAPTER_PREDICTIVE_RUN", launcher)
+        self.assertIn("ADAPTER_PREDICTIVE_SOURCE_URL", launcher)
+        self.assertIn("/broadcast/\"$predictive_run\":rw", launcher)
+        self.assertIn("prime_rl/utils/adapter_delta.py", launcher)
+
     def test_stage_log_requires_a_transfer_timeout(self):
         good = "Failed to apply policy update 4\nReadTimeout /stage_lora_adapter"
         self.assertEqual(

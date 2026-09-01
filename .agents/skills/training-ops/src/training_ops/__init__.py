@@ -4820,6 +4820,26 @@ def start(
         f"adapter_service_port={adapter_port} "
         f"adapter_container_name={shlex.quote(adapter_container)}"
     )
+    predictive_adapter_env = ""
+    if not muse_run:
+        try:
+            with open(edge_config, "rb") as stream:
+                edge_settings = tomllib.load(stream)
+        except (OSError, tomllib.TOMLDecodeError) as error:
+            raise Refused(f"cannot read GLM orchestrator config {edge_config}: {error}") from error
+        broadcast_settings = edge_settings.get("weight_broadcast")
+        source_url = (
+            broadcast_settings.get("source_url")
+            if isinstance(broadcast_settings, dict)
+            else None
+        )
+        if not isinstance(source_url, str) or not source_url.startswith(("http://", "https://")):
+            raise Refused("GLM orchestrator config has no adapter source URL")
+        predictive_adapter_env = (
+            " ADAPTER_PREDICTIVE_UPGRADE=1"
+            f" ADAPTER_PREDICTIVE_RUN={shlex.quote(run)}"
+            f" ADAPTER_PREDICTIVE_SOURCE_URL={shlex.quote(source_url.rstrip('/'))}"
+        )
     if muse_run:
         env = (
             f"{runtime_env} trainer_nodes='{trainer_nodes}' RUN={run} RUN_NAME={name} "
@@ -4884,7 +4904,8 @@ def start(
         node_id = trainer_head.removeprefix("n")
         rc, out = _ssh(
             trainer_head,
-            f"node_id={shlex.quote(node_id)} {runtime_env} RUN={shlex.quote(run)} "
+            f"node_id={shlex.quote(node_id)} {runtime_env} RUN={shlex.quote(run)}"
+            f"{predictive_adapter_env} "
             f"bash {trainer_launcher} adapter-http >/dev/null 2>&1; echo done",
             300,
         )

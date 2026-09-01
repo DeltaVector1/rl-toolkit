@@ -243,13 +243,42 @@ PY
     test "$node" = "$adapter_node" || { echo "the adapter server runs on n$adapter_node" >&2; exit 1; }
     broadcast_root=${BROADCAST_ROOT:-$runs}
     test -d "$broadcast_root" || { echo "broadcast root does not exist: $broadcast_root" >&2; exit 1; }
+    adapter_mounts=(-v "$broadcast_root":/broadcast:ro)
+    adapter_upgrade_args=()
+    if [ "${ADAPTER_PREDICTIVE_UPGRADE:-0}" = 1 ]; then
+      predictive_run=${ADAPTER_PREDICTIVE_RUN:?set ADAPTER_PREDICTIVE_RUN}
+      predictive_source_url=${ADAPTER_PREDICTIVE_SOURCE_URL:?set ADAPTER_PREDICTIVE_SOURCE_URL}
+      [[ "$predictive_run" =~ ^[A-Za-z0-9_-]+$ ]] || {
+        echo "ADAPTER_PREDICTIVE_RUN contains an unsafe run name" >&2
+        exit 1
+      }
+      active_run="$broadcast_root/$predictive_run"
+      test -d "$active_run" || {
+        echo "active predictive run does not exist: $active_run" >&2
+        exit 1
+      }
+      test ! -L "$active_run" || {
+        echo "active predictive run is a symlink: $active_run" >&2
+        exit 1
+      }
+      adapter_mounts+=(-v "$active_run":/broadcast/"$predictive_run":rw)
+      adapter_upgrade_args=(
+        --upgrade-run "$predictive_run"
+        --source-base-url "$predictive_source_url"
+      )
+    elif [ -n "${ADAPTER_PREDICTIVE_RUN:-}" ] || [ -n "${ADAPTER_PREDICTIVE_SOURCE_URL:-}" ]; then
+      echo "predictive adapter settings require ADAPTER_PREDICTIVE_UPGRADE=1" >&2
+      exit 1
+    fi
     sudo docker rm -f "$adapter_container" >/dev/null 2>&1 || true
     sudo docker run -d --name "$adapter_container" --restart unless-stopped \
       --network host \
-      -v "$broadcast_root":/broadcast:ro \
+      "${adapter_mounts[@]}" \
       -v "$deployment/.agents/skills/training-ops/runtime/china/adapter_server.py":/app/adapter_server.py:ro \
+      -v "$deployment/prime-rl/src/prime_rl/utils/adapter_delta.py":/app/src/prime_rl/utils/adapter_delta.py:ro \
       --entrypoint /app/.venv/bin/python "$image" \
-      /app/adapter_server.py --port "$adapter_port" --directory /broadcast
+      /app/adapter_server.py --port "$adapter_port" --directory /broadcast \
+      "${adapter_upgrade_args[@]}"
     ;;
   *)
     echo "usage: $0 trainer|adapter-http" >&2
