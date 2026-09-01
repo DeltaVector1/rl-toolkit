@@ -240,7 +240,7 @@ class AdapterUpdateTest(unittest.TestCase):
         with self.assertRaisesRegex(training_ops.Refused, "already succeeded"):
             training_ops._validate_adapter_stage_log(log)
 
-    def test_terminal_stage_status_can_prove_the_exact_timeout(self):
+    def test_terminal_stage_status_accepts_exact_timeout_and_manifest_500(self):
         config = training_ops._adapter_update_config("glm-1")
         broadcast = training_ops.AdapterBroadcast(
             path="/data/glm52-rl/runs/glm-1/run_glm-1/broadcasts/step_6",
@@ -257,16 +257,23 @@ class AdapterUpdateTest(unittest.TestCase):
             "path": cache,
             "elapsed_seconds": 262.336,
         }
-        failed = {
+        timeout = {
             "status": "failed",
             "source_url": source,
             "path": cache,
             "elapsed_seconds": 298.297,
             "error": "TimeoutError: adapter delta staging exceeded its time limit",
         }
+        manifest_500 = {
+            "status": "failed",
+            "source_url": source,
+            "path": cache,
+            "elapsed_seconds": 299.102,
+            "error": "OSError: adapter manifest request failed with HTTP status 500",
+        }
         results = {
-            "h200a": (0, json.dumps(ready)),
-            "h200b": (0, json.dumps(failed)),
+            "h200a": (0, json.dumps(timeout)),
+            "h200b": (0, json.dumps(manifest_500)),
         }
         with mock.patch.object(
             training_ops,
@@ -274,7 +281,11 @@ class AdapterUpdateTest(unittest.TestCase):
             return_value=broadcast,
         ), mock.patch.object(training_ops, "_fan", return_value=results):
             evidence = training_ops._adapter_stage_status_evidence("glm-1", config, "")
-        self.assertIn("policy update 6 timed out on h200b", evidence)
+        self.assertIn(
+            "policy update 6 failed on h200a (TimeoutError: adapter delta staging exceeded its time limit), "
+            "h200b (OSError: adapter manifest request failed with HTTP status 500)",
+            evidence,
+        )
 
     def test_terminal_stage_status_refuses_stale_unknown_and_success(self):
         config = training_ops._adapter_update_config("glm-1")
@@ -328,6 +339,14 @@ class AdapterUpdateTest(unittest.TestCase):
             {"h200a": (0, json.dumps(ready)), "h200b": (0, json.dumps(failed))},
             "already succeeded",
             log="Staged policy v6 on every inference host",
+        )
+        unrelated = dict(
+            failed,
+            error="OSError: adapter manifest request failed with HTTP status 404",
+        )
+        check(
+            {"h200a": (0, json.dumps(ready)), "h200b": (0, json.dumps(unrelated))},
+            "not an allowed transfer failure",
         )
 
     def test_stage_status_reader_rejects_symlinks(self):
@@ -470,7 +489,14 @@ class AdapterUpdateTest(unittest.TestCase):
             ),
             deploy.call_args_list,
         )
-        self.assertEqual(deploy.call_count, 5)
+        self.assertIn(
+            mock.call(
+                ".agents/skills/training-ops/runtime/h200/start_orchestrator.sh",
+                nodes=["h200a"],
+            ),
+            deploy.call_args_list,
+        )
+        self.assertEqual(deploy.call_count, 6)
 
     def test_stopped_status_refuses_if_container_is_running(self):
         before = training_ops.Status(
@@ -647,7 +673,7 @@ class AdapterUpdateTest(unittest.TestCase):
             {call.args[0] for call in restart_script.call_args_list},
             {"glm52-decensor-h200"},
         )
-        self.assertEqual(deploy.call_count, 5)
+        self.assertEqual(deploy.call_count, 6)
 
     def test_prefetch_script_only_signals_exact_curl_or_timeout(self):
         script = training_ops._adapter_prefetch_stop_script(

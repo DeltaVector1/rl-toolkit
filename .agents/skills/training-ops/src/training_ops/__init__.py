@@ -2985,17 +2985,28 @@ def _adapter_stage_status_evidence(run: str, config: dict, log: str) -> str:
             raise Refused(f"adapter stage duration on {host} is invalid")
         if state == "failed":
             error = record.get("error")
-            if not isinstance(error, str) or not re.search(
-                r"TimeoutError|timed out|time limit",
+            if not isinstance(error, str):
+                raise Refused(f"adapter stage failure on {host} has no error reason")
+            error = error.strip()
+            if re.search(r"TimeoutError|timed out|time limit", error, re.IGNORECASE):
+                reason = "timeout"
+            elif re.fullmatch(
+                r"(?:OSError: )?adapter manifest request failed with HTTP status 500",
                 error,
-                re.IGNORECASE,
             ):
-                raise Refused(f"adapter stage failure on {host} is not a transfer timeout")
-            failures.append(host)
+                reason = "manifest HTTP 500"
+            else:
+                raise Refused(
+                    f"adapter stage failure on {host} is not an allowed transfer failure"
+                )
+            failures.append((host, reason, error))
     if not failures:
         raise Refused("the latest adapter stage succeeded on every inference host")
+    failure_details = ", ".join(
+        f"{host} ({error})" for host, _reason, error in failures
+    )
     return (
-        f"policy update {latest.step} timed out on {','.join(failures)}; "
+        f"policy update {latest.step} failed on {failure_details}; "
         "exact terminal stage status matched every inference host"
     )
 
@@ -3570,6 +3581,7 @@ def _repair_adapter_update() -> str:
         ),
         ("prime-rl/src/prime_rl/utils/checkpoint_delta.py", inference_hosts),
         ("prime-rl/src/prime_rl/inference/relay.py", [orchestrator_host]),
+        (".agents/skills/training-ops/runtime/h200/start_orchestrator.sh", [orchestrator_host]),
         (".agents/skills/training-ops/runtime/h200/sync_rollout_batches.sh", None),
     )
     for path, nodes in deployment_targets:

@@ -337,9 +337,10 @@ sudo install -d -o 1000 -g 1000 -m 0755 "$relay_cache_dir"
 if [ "$peer_enabled" = 1 ]; then
   sudo docker rm -f "$relay_container" >/dev/null 2>&1 || true
   if ! sudo docker run -d --name "$relay_container" --restart unless-stopped \
+    --user 0:0 \
     --network host \
     --log-opt max-size=128m --log-opt max-file=2 \
-    -v "$relay_cache_dir":"$relay_cache_dir" \
+    -v "$relay_cache_dir":"$relay_cache_dir":ro \
     -v "$deployment/prime-rl/src/prime_rl/inference/relay.py":/app/relay.py:ro \
     --entrypoint /app/.venv/bin/python \
     "$image" /app/relay.py \
