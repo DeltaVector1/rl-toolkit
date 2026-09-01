@@ -2876,15 +2876,142 @@ def _validate_adapter_stage_log(log: str) -> str:
     return latest_failure.group(0)
 
 
-def _adapter_stage_evidence() -> str:
+def _adapter_stage_status_script(status_path: str) -> str:
+    return f"""python3 - <<'PY'
+import json
+import os
+import stat
+
+path = {json.dumps(status_path)}
+flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+if not getattr(os, "O_NOFOLLOW", 0):
+    raise SystemExit("O_NOFOLLOW is unavailable")
+info = os.lstat(path)
+if not stat.S_ISREG(info.st_mode):
+    raise SystemExit("adapter stage status is not a regular file")
+descriptor = os.open(path, flags)
+with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
+    value = json.load(stream)
+if not isinstance(value, dict):
+    raise SystemExit("adapter stage status is not an object")
+print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+PY
+"""
+
+
+def _latest_adapter_broadcast(run: str) -> AdapterBroadcast:
+    run_base = _validated_run_base(run)
+    code, output = _ssh(
+        trainer_head,
+        "test -d "
+        + shlex.quote(run_base)
+        + " && find "
+        + shlex.quote(run_base)
+        + " -type f -path '*/broadcasts/step_*/STABLE' -printf '%h\\n' | sort -u",
+        timeout=120,
+    )
+    if code:
+        raise RuntimeError(f"cannot inspect stable adapter broadcasts for {run}")
+    broadcasts = _parse_adapter_broadcasts(output, run_base)
+    if not broadcasts:
+        raise Refused(f"no stable adapter broadcast exists for {run}")
+    return broadcasts[-1]
+
+
+def _adapter_stage_status_evidence(run: str, config: dict, log: str) -> str:
+    latest = _latest_adapter_broadcast(run)
+    run_base = PurePosixPath(_validated_run_base(run))
+    try:
+        relative_path = PurePosixPath(latest.path).relative_to(run_base)
+    except ValueError as error:
+        raise Refused("latest adapter broadcast is outside the active run") from error
+    source_base = config.get("source_url")
+    if not isinstance(source_base, str) or not source_base.startswith(("http://", "https://")):
+        raise Refused("active adapter source URL is invalid")
+    expected_source = f"{source_base.rstrip('/')}/{relative_path.as_posix()}"
+    expected_path = (
+        f"{paths['adapter_cache'].rstrip('/')}/"
+        + hashlib.sha256(expected_source.encode()).hexdigest()
+    )
+
+    completed_steps = [
+        int(value)
+        for value in re.findall(r"Staged policy v(\d+) on every inference host", log)
+    ]
+    completed_steps.extend(
+        int(value) for value in re.findall(r"Updated weights to step (\d+)", log)
+    )
+    if completed_steps and max(completed_steps) >= latest.step:
+        raise Refused("the latest adapter policy update already succeeded")
+
+    status_path = f"{paths['adapter_cache'].rstrip('/')}/.adapter-stage-status.json"
+    script = _adapter_stage_status_script(status_path)
+    results = _fan(
+        inference_hosts,
+        lambda host: _ssh(host, script, timeout=90),
+    )
+    records: dict[str, dict] = {}
+    for host in inference_hosts:
+        code, output = results.get(host, (1, "missing status result"))
+        if code:
+            raise Refused(f"cannot read exact adapter stage status on {host}")
+        lines = [line for line in output.splitlines() if line.strip()]
+        if len(lines) != 1:
+            raise Refused(f"adapter stage status on {host} is not one JSON object")
+        try:
+            record = json.loads(lines[0])
+        except (TypeError, ValueError) as error:
+            raise Refused(f"adapter stage status on {host} is invalid") from error
+        if not isinstance(record, dict):
+            raise Refused(f"adapter stage status on {host} is not an object")
+        records[host] = record
+
+    failures = []
+    stage_limit = limits["adapter_delta_stage_timeout_seconds"]
+    for host, record in records.items():
+        state = record.get("status")
+        if state not in {"ready", "failed"}:
+            raise Refused(f"adapter stage status on {host} is not terminal")
+        if record.get("source_url") != expected_source or record.get("path") != expected_path:
+            raise Refused(f"adapter stage status on {host} is stale or mismatched")
+        elapsed = record.get("elapsed_seconds")
+        if (
+            isinstance(elapsed, bool)
+            or not isinstance(elapsed, (int, float))
+            or not math.isfinite(elapsed)
+            or elapsed < 0
+            or elapsed > stage_limit
+        ):
+            raise Refused(f"adapter stage duration on {host} is invalid")
+        if state == "failed":
+            error = record.get("error")
+            if not isinstance(error, str) or not re.search(
+                r"TimeoutError|timed out|time limit",
+                error,
+                re.IGNORECASE,
+            ):
+                raise Refused(f"adapter stage failure on {host} is not a transfer timeout")
+            failures.append(host)
+    if not failures:
+        raise Refused("the latest adapter stage succeeded on every inference host")
+    return (
+        f"policy update {latest.step} timed out on {','.join(failures)}; "
+        "exact terminal stage status matched every inference host"
+    )
+
+
+def _adapter_stage_evidence(run: str, config: dict) -> str:
     code, output = _ssh(
         orchestrator_host,
         f"sudo docker logs --tail 10000 {shlex.quote(orchestrator_container)} 2>&1",
         timeout=180,
     )
-    if code:
-        raise RuntimeError(f"cannot read adapter staging log on {orchestrator_host}")
-    return _validate_adapter_stage_log(output)
+    if not code:
+        try:
+            return _validate_adapter_stage_log(output)
+        except Refused:
+            pass
+    return _adapter_stage_status_evidence(run, config, output)
 
 
 def _adapter_idle_script(ports: list[int]) -> str:
@@ -3419,7 +3546,7 @@ def _repair_adapter_update() -> str:
     failed_idle = {host: output.strip() for host, (code, output) in idle.items() if code}
     if failed_idle:
         raise Refused(f"adapter repair requires idle healthy inference endpoints: {failed_idle}")
-    evidence = _adapter_stage_evidence()
+    evidence = _adapter_stage_evidence(run, config)
 
     stopped = _fan(
         inference_hosts,

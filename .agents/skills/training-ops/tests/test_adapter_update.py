@@ -240,6 +240,104 @@ class AdapterUpdateTest(unittest.TestCase):
         with self.assertRaisesRegex(training_ops.Refused, "already succeeded"):
             training_ops._validate_adapter_stage_log(log)
 
+    def test_terminal_stage_status_can_prove_the_exact_timeout(self):
+        config = training_ops._adapter_update_config("glm-1")
+        broadcast = training_ops.AdapterBroadcast(
+            path="/data/glm52-rl/runs/glm-1/run_glm-1/broadcasts/step_6",
+            step=6,
+        )
+        source = "http://127.0.0.1:18100/glm-1/run_glm-1/broadcasts/step_6"
+        cache = (
+            "/data/glm52-rl/lora-cache/"
+            + hashlib.sha256(source.encode()).hexdigest()
+        )
+        ready = {
+            "status": "ready",
+            "source_url": source,
+            "path": cache,
+            "elapsed_seconds": 262.336,
+        }
+        failed = {
+            "status": "failed",
+            "source_url": source,
+            "path": cache,
+            "elapsed_seconds": 298.297,
+            "error": "TimeoutError: adapter delta staging exceeded its time limit",
+        }
+        results = {
+            "h200a": (0, json.dumps(ready)),
+            "h200b": (0, json.dumps(failed)),
+        }
+        with mock.patch.object(
+            training_ops,
+            "_latest_adapter_broadcast",
+            return_value=broadcast,
+        ), mock.patch.object(training_ops, "_fan", return_value=results):
+            evidence = training_ops._adapter_stage_status_evidence("glm-1", config, "")
+        self.assertIn("policy update 6 timed out on h200b", evidence)
+
+    def test_terminal_stage_status_refuses_stale_unknown_and_success(self):
+        config = training_ops._adapter_update_config("glm-1")
+        broadcast = training_ops.AdapterBroadcast(
+            path="/data/glm52-rl/runs/glm-1/run_glm-1/broadcasts/step_6",
+            step=6,
+        )
+        source = "http://127.0.0.1:18100/glm-1/run_glm-1/broadcasts/step_6"
+        cache = (
+            "/data/glm52-rl/lora-cache/"
+            + hashlib.sha256(source.encode()).hexdigest()
+        )
+        ready = {
+            "status": "ready",
+            "source_url": source,
+            "path": cache,
+            "elapsed_seconds": 262.336,
+        }
+        failed = {
+            "status": "failed",
+            "source_url": source,
+            "path": cache,
+            "elapsed_seconds": 298.297,
+            "error": "TimeoutError: adapter delta staging exceeded its time limit",
+        }
+
+        def check(records, pattern, log=""):
+            with mock.patch.object(
+                training_ops,
+                "_latest_adapter_broadcast",
+                return_value=broadcast,
+            ), mock.patch.object(training_ops, "_fan", return_value=records):
+                with self.assertRaisesRegex(training_ops.Refused, pattern):
+                    training_ops._adapter_stage_status_evidence("glm-1", config, log)
+
+        stale = dict(failed, source_url=source + "-old")
+        check(
+            {"h200a": (0, json.dumps(ready)), "h200b": (0, json.dumps(stale))},
+            "stale or mismatched",
+        )
+        unknown = dict(failed, status="staging")
+        check(
+            {"h200a": (0, json.dumps(ready)), "h200b": (0, json.dumps(unknown))},
+            "not terminal",
+        )
+        check(
+            {"h200a": (0, json.dumps(ready)), "h200b": (0, json.dumps(ready))},
+            "succeeded on every",
+        )
+        check(
+            {"h200a": (0, json.dumps(ready)), "h200b": (0, json.dumps(failed))},
+            "already succeeded",
+            log="Staged policy v6 on every inference host",
+        )
+
+    def test_stage_status_reader_rejects_symlinks(self):
+        script = training_ops._adapter_stage_status_script(
+            "/data/glm52-rl/lora-cache/.adapter-stage-status.json"
+        )
+        self.assertIn("os.lstat(path)", script)
+        self.assertIn("stat.S_ISREG", script)
+        self.assertIn("O_NOFOLLOW", script)
+
     def test_idle_script_requires_health_and_request_metric(self):
         script = training_ops._adapter_idle_script([8000])
         self.assertIn("/health", script)
