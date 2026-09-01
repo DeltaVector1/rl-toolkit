@@ -852,8 +852,14 @@ class AdapterTransportStateTest(unittest.TestCase):
         old_raw_digest = filesystem._transport_raw_sha256
         old_xor = filesystem._xor_bytes
         old_download = filesystem.download
+        old_cleanup = filesystem._cleanup_delta_stage_artifacts
         downloaded = []
         fail_second_chunk = True
+        cleanup_contexts = []
+
+        def record_cleanup(*args, **kwargs):
+            cleanup_contexts.append(kwargs)
+            return old_cleanup(*args, **kwargs)
 
         def fake_download(_source, destination, **kwargs):
             nonlocal fail_second_chunk
@@ -880,6 +886,7 @@ class AdapterTransportStateTest(unittest.TestCase):
         filesystem._transport_raw_sha256 = lambda payload: hashlib.sha256(payload).hexdigest()
         filesystem._xor_bytes = lambda _base, payload: payload
         filesystem.download = fake_download
+        filesystem._cleanup_delta_stage_artifacts = record_cleanup
         try:
             with tempfile.TemporaryDirectory() as temporary:
                 os.environ["PRIME_LORA_CACHE_DIR"] = temporary
@@ -892,6 +899,10 @@ class AdapterTransportStateTest(unittest.TestCase):
                 completed = partial / "transport-chunks" / "chunk-0.done"
                 self.assertTrue(completed.is_file())
                 self.assertTrue((partial / "adapter_model.safetensors").is_file())
+                self.assertEqual(len(cleanup_contexts), 1)
+                self.assertIsNotNone(cleanup_contexts[0]["cancel_event"])
+                self.assertFalse(cleanup_contexts[0]["cancel_event"].is_set())
+                self.assertGreater(cleanup_contexts[0]["deadline"], time.monotonic())
                 downloaded_after_failure = list(downloaded)
 
                 filesystem.stage_lora_adapter_files(source_url, require_delta=True)
@@ -918,6 +929,7 @@ class AdapterTransportStateTest(unittest.TestCase):
             filesystem._transport_raw_sha256 = old_raw_digest
             filesystem._xor_bytes = old_xor
             filesystem.download = old_download
+            filesystem._cleanup_delta_stage_artifacts = old_cleanup
             base_directory.cleanup()
 
 

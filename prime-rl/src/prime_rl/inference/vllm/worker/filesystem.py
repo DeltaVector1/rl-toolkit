@@ -66,6 +66,7 @@ _ADAPTER_LANE_RETRIES = int(os.environ.get("PRIME_LORA_LANE_RETRIES", "6"))
 _ADAPTER_VISIBILITY_RETRIES = 300
 _PREDICTIVE_RECONSTRUCT_WORKERS = 32
 _ADAPTER_CHUNK_TIMEOUT_S = float(os.environ.get("PRIME_LORA_CHUNK_TIMEOUT_S", "15"))
+_ADAPTER_CLEANUP_TIMEOUT_S = 30.0
 _ADAPTER_STATUS_INTERVAL_S = float(os.environ.get("PRIME_LORA_STATUS_INTERVAL_S", "1"))
 _JSON_LOCK = threading.Lock()
 _adapter_stage_publish_lock = threading.Lock()
@@ -653,6 +654,8 @@ def _read_chunked_linear_manifest(
     config_size_value = config_size("config_size")
     base_size = positive_size("base_size")
     base2_size = positive_size("base2_size")
+    base_config_size = config_size("base_config_size")
+    base2_config_size = config_size("base2_config_size")
     if base_size != target_size or base2_size != target_size or target_size % 2:
         raise OSError("version-two adapter weights are not equal-sized even files")
     data_offset = value.get("data_offset")
@@ -780,10 +783,12 @@ def _read_chunked_linear_manifest(
         "base_url": base_url,
         "base_sha256": base_sha256,
         "base_size": base_size,
+        "base_config_size": base_config_size,
         "base_config_sha256": base_config_sha256,
         "base2_url": base2_url,
         "base2_sha256": base2_sha256,
         "base2_size": base2_size,
+        "base2_config_size": base2_config_size,
         "base2_config_sha256": base2_config_sha256,
         "data_offset": data_offset,
         "target_sha256": target_sha256,
@@ -1460,10 +1465,12 @@ def _stage_chunked_linear_adapter(
     base_url = transport["base_url"]
     base_sha256 = transport["base_sha256"]
     base_size = transport["base_size"]
+    base_config_size = transport["base_config_size"]
     base_config_sha256 = transport["base_config_sha256"]
     base2_url = transport["base2_url"]
     base2_sha256 = transport["base2_sha256"]
     base2_size = transport["base2_size"]
+    base2_config_size = transport["base2_config_size"]
     base2_config_sha256 = transport["base2_config_sha256"]
     target_sha256 = transport["target_sha256"]
     target_size = transport["target_size"]
@@ -1471,13 +1478,24 @@ def _stage_chunked_linear_adapter(
     config_size = transport["config_size"]
     if not all(isinstance(value, str) for value in (base_url, base_sha256, base2_url, base2_sha256, target_sha256, config_sha256, base_config_sha256, base2_config_sha256)):
         raise OSError("version-two adapter identity is invalid")
-    if not all(isinstance(value, int) for value in (base_size, base2_size, target_size, config_size)):
+    if not all(
+        isinstance(value, int)
+        for value in (
+            base_size,
+            base_config_size,
+            base2_size,
+            base2_config_size,
+            target_size,
+            config_size,
+        )
+    ):
         raise OSError("version-two adapter sizes are invalid")
     base2_model, _ = _verified_adapter_base(
         base2_url,
         base2_sha256,
         expected_size=base2_size,
         expected_config_sha256=base2_config_sha256,
+        expected_config_size=base2_config_size,
         deadline=deadline,
         cancel_event=cancel_event,
     )
@@ -1486,6 +1504,7 @@ def _stage_chunked_linear_adapter(
         base_sha256,
         expected_size=base_size,
         expected_config_sha256=base_config_sha256,
+        expected_config_size=base_config_size,
         deadline=deadline,
         cancel_event=cancel_event,
     )
@@ -2725,8 +2744,8 @@ def stage_lora_adapter_files(
                 _cleanup_delta_stage_artifacts(
                     destination,
                     preserve_partial=isinstance(exc, TimeoutError),
-                    deadline=delta_deadline,
-                    cancel_event=cancel_event,
+                    deadline=time.monotonic() + _ADAPTER_CLEANUP_TIMEOUT_S,
+                    cancel_event=threading.Event(),
                 )
             _write_stage_status(
                 destination.parent,
