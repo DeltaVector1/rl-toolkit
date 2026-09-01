@@ -6,6 +6,7 @@ import hashlib
 import json
 import mimetypes
 import re
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -40,6 +41,17 @@ class RelayFile:
     path: Path
     size: int
     sha256: str
+
+
+@dataclass(frozen=True)
+class RelayIndex:
+    transport: str
+    files: dict[str, dict[str, object]]
+
+
+_relay_index_cache_lock = threading.Lock()
+_relay_index_cache: dict[str, tuple[tuple[object, ...], RelayIndex]] = {}
+_MAX_RELAY_INDEX_CACHE_ENTRIES = 8
 
 
 class RelayConfig:
@@ -217,27 +229,41 @@ def _validate_predictive_source_manifest(manifest: dict[str, object], source_url
             raise RelayRequestError(500, f"relay source manifest {name} is not adjacent")
 
 
-def _load_file(cache_path: Path, source_url: str, requested_name: str) -> RelayFile:
-    ready = cache_path / ready_marker_name
-    relaying_path = cache_path.with_name(f"{cache_path.name}.partial")
-    relaying = (
-        not ready.is_file()
-        and relaying_path.is_dir()
-        and (relaying_path / relaying_marker_name).is_file()
-        and not (relaying_path / relaying_marker_name).is_symlink()
+def _stat_identity(path: Path) -> tuple[int, int, int, int] | None:
+    try:
+        stat = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise RelayRequestError(500, "relay cache metadata cannot be read") from exc
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+
+def _relay_index_signature(
+    cache_path: Path,
+    published_path: Path,
+    source_url: str,
+    *,
+    ready: Path,
+    relaying_path: Path,
+) -> tuple[object, ...]:
+    return (
+        cache_path.as_posix(),
+        published_path.as_posix(),
+        source_url,
+        "ready" if published_path == cache_path else "relaying",
+        _stat_identity(published_path / relay_manifest_name),
+        _stat_identity(published_path / "adapter_manifest.json"),
+        _stat_identity(ready),
+        _stat_identity(relaying_path / relaying_marker_name),
     )
-    if not ready.is_file() and not relaying:
-        raise RelayRequestError(404, "adapter is not ready")
-    published_path = cache_path if ready.is_file() else relaying_path
+
+
+def _build_relay_index(
+    published_path: Path,
+    source_url: str,
+) -> RelayIndex:
     manifest_path = published_path / relay_manifest_name
-    if (
-        published_path.is_symlink()
-        or not published_path.is_dir()
-        or (ready.is_file() and ready.is_symlink())
-        or not manifest_path.is_file()
-        or manifest_path.is_symlink()
-    ):
-        raise RelayRequestError(404, "adapter is not ready")
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -262,10 +288,6 @@ def _load_file(cache_path: Path, source_url: str, requested_name: str) -> RelayF
         if not isinstance(source_manifest, dict):
             raise RelayRequestError(500, "relay source manifest is invalid")
         _validate_predictive_source_manifest(source_manifest, source_url)
-        if manifest.get("version") == 1:
-            # Version one is the relay-index format. It remains valid for the
-            # new source transport when the source manifest is version two.
-            pass
         for name in (
             "target_step",
             "base_step",
@@ -297,7 +319,68 @@ def _load_file(cache_path: Path, source_url: str, requested_name: str) -> RelayF
         raise RelayRequestError(500, "relay manifest is missing an adapter file")
     if transport == full_transport and set(files) != required_names:
         raise RelayRequestError(500, "full relay manifest contains transport chunks")
+    return RelayIndex(transport=transport, files=files)
 
+
+def _cached_relay_index(
+    cache_path: Path,
+    published_path: Path,
+    source_url: str,
+    *,
+    ready: Path,
+    relaying_path: Path,
+) -> RelayIndex:
+    signature = _relay_index_signature(
+        cache_path, published_path, source_url, ready=ready, relaying_path=relaying_path
+    )
+    cache_key = cache_path.as_posix()
+    with _relay_index_cache_lock:
+        cached = _relay_index_cache.get(cache_key)
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+    index = _build_relay_index(published_path, source_url)
+    if _relay_index_signature(
+        cache_path, published_path, source_url, ready=ready, relaying_path=relaying_path
+    ) != signature:
+        raise RelayRequestError(503, "relay manifest changed during validation")
+    with _relay_index_cache_lock:
+        _relay_index_cache[cache_key] = (signature, index)
+        while len(_relay_index_cache) > _MAX_RELAY_INDEX_CACHE_ENTRIES:
+            _relay_index_cache.pop(next(iter(_relay_index_cache)))
+    return index
+
+
+def _load_file(cache_path: Path, source_url: str, requested_name: str) -> RelayFile:
+    ready = cache_path / ready_marker_name
+    relaying_path = cache_path.with_name(f"{cache_path.name}.partial")
+    ready_file = ready.is_file()
+    relaying = (
+        not ready_file
+        and relaying_path.is_dir()
+        and (relaying_path / relaying_marker_name).is_file()
+        and not (relaying_path / relaying_marker_name).is_symlink()
+    )
+    if not ready_file and not relaying:
+        raise RelayRequestError(404, "adapter is not ready")
+    published_path = cache_path if ready_file else relaying_path
+    manifest_path = published_path / relay_manifest_name
+    if (
+        published_path.is_symlink()
+        or not published_path.is_dir()
+        or (ready_file and ready.is_symlink())
+        or not manifest_path.is_file()
+        or manifest_path.is_symlink()
+    ):
+        raise RelayRequestError(404, "adapter is not ready")
+    index = _cached_relay_index(
+        cache_path,
+        published_path,
+        source_url,
+        ready=ready,
+        relaying_path=relaying_path,
+    )
+    transport = index.transport
+    files = index.files
     if relaying and transport == predictive_transport and requested_name == "adapter_model.safetensors":
         raise RelayRequestError(404, "adapter model is not published until staging is complete")
     raw_spec = files.get(requested_name)
@@ -326,23 +409,39 @@ def _load_file(cache_path: Path, source_url: str, requested_name: str) -> RelayF
         "adapter_config.json",
     }:
         # A chunk is visible only after the writer has validated its wire
-        # checksum and atomically published its completion proof.
-        proof_path = candidate.with_name(f"{candidate.name}.done")
-        if proof_path.is_symlink() or not proof_path.is_file():
-            raise RelayRequestError(503, "relay chunk is not complete")
-        try:
-            proof = json.loads(proof_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise RelayRequestError(503, "relay chunk completion proof is unavailable") from exc
-        if (
-            not isinstance(proof, dict)
-            or proof.get("file") != requested_name
-            or proof.get("wire_size") != size
-            or proof.get("wire_sha256") != digest
-            or not isinstance(proof.get("output_sha256"), str)
-            or digest_pattern.fullmatch(proof["output_sha256"]) is None
-        ):
-            raise RelayRequestError(503, "relay chunk completion proof is invalid")
+        # checksum and atomically published a wire or completed proof.
+        proofs = (
+            ("wire-ready", candidate.with_name(f"{candidate.name}.wire-ready")),
+            ("completed", candidate.with_name(f"{candidate.name}.done")),
+        )
+        proof_valid = False
+        for proof_type, proof_path in proofs:
+            if proof_path.is_symlink() or not proof_path.is_file():
+                continue
+            try:
+                proof = json.loads(proof_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(proof, dict):
+                continue
+            if (
+                proof.get("file") != requested_name
+                or proof.get("wire_size") != size
+                or proof.get("wire_sha256") != digest
+            ):
+                continue
+            if proof_type == "wire-ready" and proof.get("type") == "wire-ready":
+                proof_valid = True
+                break
+            if (
+                proof_type == "completed"
+                and isinstance(proof.get("output_sha256"), str)
+                and digest_pattern.fullmatch(proof["output_sha256"]) is not None
+            ):
+                proof_valid = True
+                break
+        if not proof_valid:
+            raise RelayRequestError(503, "relay chunk proof is unavailable or invalid")
     return RelayFile(path=candidate, size=size, sha256=digest)
 
 

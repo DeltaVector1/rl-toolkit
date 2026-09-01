@@ -228,6 +228,23 @@ class RelayTest(unittest.TestCase):
             self.request("/glm-1/run_glm-1/broadcasts/step_2/chunk-0")
         self.assertEqual(error.exception.code, 503)
         (partial / "transport-chunks/chunk-0").write_bytes(chunk)
+        wire_proof = {
+            "type": "wire-ready",
+            "file": "chunk-0",
+            "wire_size": len(chunk),
+            "wire_sha256": chunk_sha,
+        }
+        (partial / "transport-chunks/chunk-0.wire-ready").write_text(
+            json.dumps(wire_proof), encoding="utf-8"
+        )
+        with self.request("/glm-1/run_glm-1/broadcasts/step_2/chunk-0") as response:
+            self.assertEqual(response.read(), chunk)
+        (partial / "transport-chunks/chunk-0.wire-ready").write_text(
+            json.dumps({**wire_proof, "wire_sha256": "0" * 64}), encoding="utf-8"
+        )
+        with self.assertRaises(HTTPError) as error:
+            self.request("/glm-1/run_glm-1/broadcasts/step_2/chunk-0")
+        self.assertEqual(error.exception.code, 503)
         proof = {
             "file": "chunk-0",
             "wire_size": len(chunk),
@@ -239,6 +256,41 @@ class RelayTest(unittest.TestCase):
         )
         with self.request("/glm-1/run_glm-1/broadcasts/step_2/chunk-0") as response:
             self.assertEqual(response.read(), chunk)
+
+    def test_reloads_index_when_manifest_is_replaced(self):
+        selected = relay._load_file(
+            self.cache, self.source_url, "adapter_config.json"
+        )
+        self.assertEqual(selected.path.read_bytes(), b'{"r":32}\n')
+        manifest = json.loads(
+            (self.cache / relay.relay_manifest_name).read_text(encoding="utf-8")
+        )
+        manifest["transport"] = relay.full_transport
+        manifest["files"].pop("chunk-0")
+        (self.cache / relay.relay_manifest_name).write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
+        selected = relay._load_file(
+            self.cache, self.source_url, "adapter_model.safetensors"
+        )
+        self.assertEqual(selected.path.read_bytes(), b"model-bytes")
+
+    def test_reloads_index_when_partial_becomes_ready(self):
+        partial = self.cache.with_name(f"{self.cache.name}.partial")
+        self.cache.rename(partial)
+        (partial / relay.ready_marker_name).unlink()
+        (partial / relay.relaying_marker_name).write_text("relaying\n", encoding="utf-8")
+        selected = relay._load_file(
+            self.cache, self.source_url, "adapter_config.json"
+        )
+        self.assertEqual(selected.path.read_bytes(), b'{"r":32}\n')
+        (partial / relay.relaying_marker_name).unlink()
+        (partial / relay.ready_marker_name).write_text("ready\n", encoding="utf-8")
+        partial.rename(self.cache)
+        selected = relay._load_file(
+            self.cache, self.source_url, "adapter_model.safetensors"
+        )
+        self.assertEqual(selected.path.read_bytes(), b"model-bytes")
 
 
 if __name__ == "__main__":

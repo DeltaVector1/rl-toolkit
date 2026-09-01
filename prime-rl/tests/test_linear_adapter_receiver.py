@@ -188,6 +188,9 @@ class LinearAdapterReceiverTest(unittest.TestCase):
         old_decode = filesystem._decode_linear_transport_chunk
         old_timeout = filesystem._delta_stage_timeout_s
         relaying_seen_before_chunk = False
+        wire_proof_seen_during_decode = False
+        decode_calls = 0
+        chunk_download_calls = 0
         base_calls = []
         try:
             with tempfile.TemporaryDirectory() as temporary:
@@ -206,9 +209,10 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                     (path / "READY").write_text("ready\n", encoding="utf-8")
 
                 def fake_download(_source, destination, **kwargs):
-                    nonlocal relaying_seen_before_chunk
+                    nonlocal relaying_seen_before_chunk, chunk_download_calls
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     if "chunk-" in destination.name:
+                        chunk_download_calls += 1
                         relaying_seen_before_chunk = (
                             destination.parent.parent / "RELAYING"
                         ).is_file()
@@ -228,7 +232,38 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                 filesystem._verified_adapter_base = fake_base
                 filesystem._source_manifest = lambda *_args, **_kwargs: source_manifest
                 filesystem._delta_stage_timeout_s = lambda: 30.0
-                filesystem._decode_linear_transport_chunk = lambda *_args, **_kwargs: (target, digest(correction))
+
+                def fake_decode(*_args, **_kwargs):
+                    nonlocal decode_calls, wire_proof_seen_during_decode
+                    decode_calls += 1
+                    chunk_path = (
+                        filesystem.adapter_cache_path(source_url).with_name(
+                            f"{filesystem.adapter_cache_path(source_url).name}.partial"
+                        )
+                        / "transport-chunks"
+                        / "chunk-0"
+                    )
+                    wire_proof_seen_during_decode = chunk_path.with_name(
+                        f"{chunk_path.name}.wire-ready"
+                    ).is_file()
+                    if decode_calls == 1:
+                        raise OSError("test interruption after wire publication")
+                    return target, digest(correction)
+
+                filesystem._decode_linear_transport_chunk = fake_decode
+                with self.assertRaisesRegex(OSError, "test interruption"):
+                    filesystem._stage_chunked_linear_adapter(
+                        source_url,
+                        transport,
+                        source_manifest,
+                        deadline=None,
+                    )
+                partial = filesystem.adapter_cache_path(source_url).with_name(
+                    f"{filesystem.adapter_cache_path(source_url).name}.partial"
+                )
+                self.assertTrue(
+                    (partial / "transport-chunks" / "chunk-0.wire-ready").is_file()
+                )
                 result = filesystem._stage_chunked_linear_adapter(
                     source_url,
                     transport,
@@ -237,13 +272,21 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                 )
                 self.assertTrue((result / "READY").is_file())
                 self.assertEqual((result / "adapter_model.safetensors").read_bytes(), target)
+                self.assertTrue(wire_proof_seen_during_decode)
+                self.assertEqual(chunk_download_calls, 1)
+                self.assertFalse(
+                    (result / "transport-chunks" / "chunk-0.wire-ready").exists()
+                )
+                self.assertTrue(
+                    (result / "transport-chunks" / "chunk-0.done").is_file()
+                )
                 status = filesystem.adapter_stage_status()
                 self.assertEqual(status["status"], "ready")
                 self.assertGreaterEqual(status["reconstruct_seconds"], 0.0)
                 self.assertTrue(relaying_seen_before_chunk)
                 self.assertEqual(
                     [call[1]["expected_config_size"] for call in base_calls],
-                    [len(config), len(config)],
+                    [len(config), len(config), len(config), len(config)],
                 )
         finally:
             if old_cache is None:

@@ -55,6 +55,8 @@ _ADAPTER_MANIFEST = "adapter_manifest.json"
 _ADAPTER_DIGEST = "adapter_model.safetensors.sha256"
 _RELAY_MANIFEST = "relay_manifest.json"
 _RELAYING_MARKER = "RELAYING"
+_WIRE_READY_SUFFIX = ".wire-ready"
+_COMPLETED_SUFFIX = ".done"
 _ADAPTER_STATUS = ".adapter-stage-status.json"
 _ADAPTER_DELTA_TRANSPORT = "chunked-shuffled-xor-zstd"
 _ADAPTER_LINEAR_TRANSPORT = "chunked-bf16-linear-zigzag-sparse-zstd"
@@ -878,6 +880,55 @@ def _write_marker(path: Path, value: str) -> None:
     os.replace(temporary, path)
 
 
+def _proof_path(chunk_path: Path, suffix: str) -> Path:
+    return chunk_path.with_name(f"{chunk_path.name}{suffix}")
+
+
+def _proof_identity_matches(
+    proof_path: Path,
+    item: dict[str, object],
+    *,
+    completed: bool,
+) -> tuple[bool, dict[str, object] | None]:
+    """Check a chunk proof without following a symbolic link."""
+    if proof_path.is_symlink() or not proof_path.is_file():
+        return False, None
+    try:
+        proof = json.loads(proof_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False, None
+    if not isinstance(proof, dict):
+        return False, None
+    identity_matches = all(
+        proof.get(name) == item.get(name)
+        for name in (
+            "file",
+            "offset",
+            "data_offset",
+            "raw_size",
+            "wire_size",
+            "wire_sha256",
+            "raw_sha256",
+        )
+    )
+    if not identity_matches:
+        return False, proof
+    if not completed:
+        return proof.get("type") == "wire-ready", proof
+    return (
+        proof.get("correction_sha256") == item.get("raw_sha256")
+        and isinstance(proof.get("output_sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", proof["output_sha256"]) is not None,
+        proof,
+    )
+
+
+def _discard_proof(path: Path) -> None:
+    """Remove only a regular proof or a symbolic link to one."""
+    if path.is_symlink() or path.is_file():
+        path.unlink(missing_ok=True)
+
+
 def _publish_relay_manifest(
     directory: Path,
     source_url: str,
@@ -939,10 +990,6 @@ def _publish_relay_manifest(
         chunk_root = directory / "transport-chunks"
         if not chunk_root.is_dir():
             raise OSError("adapter relay delta chunks are missing")
-        if not allow_partial:
-            for completed_path in chunk_root.rglob("*.done"):
-                _check_deadline(deadline, cancel_event)
-                completed_path.unlink()
         for item in chunks:
             _check_deadline(deadline, cancel_event)
             if not isinstance(item, dict) or not isinstance(item.get("file"), str):
@@ -1530,16 +1577,19 @@ def _stage_chunked_linear_adapter(
     chunk_root.mkdir(exist_ok=True)
     total_wire_bytes = sum(int(item["wire_size"]) for item in chunks) + config_size
     progress_lock = threading.Lock()
-    progress_bytes = sum(
-        int(item["wire_size"])
-        for item in chunks
-        if (
-            isinstance(item, dict)
-            and isinstance(item.get("file"), str)
-            and (chunk_root / Path(str(item["file"])).name).is_file()
-            and (chunk_root / Path(str(item["file"])).name).stat().st_size == int(item["wire_size"])
-        )
-    )
+    progress_bytes = 0
+    for item in chunks:
+        if not isinstance(item, dict) or not isinstance(item.get("file"), str):
+            continue
+        chunk_path = chunk_root / Path(str(item["file"])).name
+        if not chunk_path.is_file() or chunk_path.stat().st_size != int(item["wire_size"]):
+            continue
+        done_path = _proof_path(chunk_path, _COMPLETED_SUFFIX)
+        wire_ready_path = _proof_path(chunk_path, _WIRE_READY_SUFFIX)
+        done_valid, _ = _proof_identity_matches(done_path, item, completed=True)
+        wire_ready_valid, _ = _proof_identity_matches(wire_ready_path, item, completed=False)
+        if done_valid or wire_ready_valid:
+            progress_bytes += int(item["wire_size"])
     reconstruct_lock = threading.Lock()
     reconstruct_semaphore = threading.BoundedSemaphore(_PREDICTIVE_RECONSTRUCT_WORKERS)
     reconstruct_seconds = 0.0
@@ -1608,8 +1658,8 @@ def _stage_chunked_linear_adapter(
     os.replace(config_incoming_path, config_path)
 
     # The origin publishes the exact v2 index before transfer workers start.
-    # The relay uses RELAYING to expose only manifests, configuration, and
-    # chunks with a completed proof. It never exposes this incomplete model.
+    # The relay uses RELAYING to expose manifests, configuration, and verified
+    # chunks. It never exposes this incomplete model.
     source_transport_manifest = transport.get("source_manifest")
     if not isinstance(source_transport_manifest, dict):
         raise OSError("version-two adapter source manifest is unavailable for relay")
@@ -1642,69 +1692,98 @@ def _stage_chunked_linear_adapter(
         wire_size = int(item["wire_size"])
         wire_sha256 = str(item["wire_sha256"])
         raw_sha256 = str(item["raw_sha256"])
-        completed_path = chunk_path.with_name(f"{chunk_path.name}.done")
-        if completed_path.is_file():
-            try:
-                proof = json.loads(completed_path.read_text(encoding="utf-8"))
-                proof_matches = (
-                    isinstance(proof, dict)
-                    and proof.get("file") == name
-                    and proof.get("offset") == offset
-                    and proof.get("data_offset") == data_offset
-                    and proof.get("raw_size") == raw_size
-                    and proof.get("wire_size") == wire_size
-                    and proof.get("wire_sha256") == wire_sha256
-                    and proof.get("raw_sha256") == raw_sha256
-                    and proof.get("correction_sha256") == raw_sha256
-                    and isinstance(proof.get("output_sha256"), str)
-                    and re.fullmatch(r"[0-9a-f]{64}", proof["output_sha256"]) is not None
-                )
-            except (OSError, ValueError):
-                proof_matches = False
-            if proof_matches:
-                resume_hash_started = time.monotonic()
-                try:
-                    if (
-                        output_path.stat().st_size == target_size
-                        and _sha256_region(output_path, offset, raw_size, deadline, cancel_event)
-                        == proof["output_sha256"]
-                    ):
-                        return
-                except TimeoutError:
-                    raise
-                except (FileNotFoundError, OSError):
-                    pass
-                finally:
-                    with reconstruct_lock:
-                        reconstruct_seconds += time.monotonic() - resume_hash_started
-            completed_path.unlink(missing_ok=True)
-
-        chunk_lane = index % len(lane_urls)
-
-        def lane_report(_lane: int, amount: int) -> None:
-            report(chunk_lane, amount)
-
-        chunk_urls = [f"{lane_url.rstrip('/')}/{name}" for lane_url in lane_urls]
-        chunk_urls = chunk_urls[chunk_lane:] + chunk_urls[:chunk_lane]
-        incoming_path = chunk_path.with_name(f".{chunk_path.name}.incoming")
-        download(
-            chunk_urls[0],
-            incoming_path,
-            expected_size=wire_size,
-            expected_sha256=wire_sha256,
-            progress=lane_report,
-            source_urls=chunk_urls,
-            parallel_ranges=False,
-            deadline=deadline,
-            cancel_event=cancel_event,
-            per_request_timeout_seconds=_configured_chunk_timeout(),
-            retry_http_statuses={404, 503},
+        completed_path = _proof_path(chunk_path, _COMPLETED_SUFFIX)
+        wire_ready_path = _proof_path(chunk_path, _WIRE_READY_SUFFIX)
+        completed_valid, completed_proof = _proof_identity_matches(
+            completed_path, item, completed=True
         )
-        _check_deadline(deadline, cancel_event)
-        os.replace(incoming_path, chunk_path)
-        encoded = chunk_path.read_bytes()
-        if len(encoded) != wire_size or _sha256(chunk_path, deadline, cancel_event) != wire_sha256:
-            raise OSError("version-two adapter transport chunk checksum mismatch")
+        if completed_valid and completed_proof is not None:
+            resume_hash_started = time.monotonic()
+            try:
+                if (
+                    output_path.stat().st_size == target_size
+                    and _sha256_region(output_path, offset, raw_size, deadline, cancel_event)
+                    == completed_proof["output_sha256"]
+                ):
+                    # A completed proof supersedes any wire-ready proof left
+                    # by an interrupted cleanup after the proof was published.
+                    _discard_proof(wire_ready_path)
+                    return
+            except TimeoutError:
+                raise
+            except (FileNotFoundError, OSError):
+                pass
+            finally:
+                with reconstruct_lock:
+                    reconstruct_seconds += time.monotonic() - resume_hash_started
+        if completed_path.exists() or completed_path.is_symlink():
+            _discard_proof(completed_path)
+
+        wire_ready_valid, _ = _proof_identity_matches(
+            wire_ready_path, item, completed=False
+        )
+        if wire_ready_valid:
+            try:
+                if (
+                    not chunk_path.is_symlink()
+                    and chunk_path.is_file()
+                    and chunk_path.stat().st_size == wire_size
+                    and _sha256(chunk_path, deadline, cancel_event) == wire_sha256
+                ):
+                    encoded = chunk_path.read_bytes()
+                else:
+                    wire_ready_valid = False
+            except (FileNotFoundError, OSError):
+                wire_ready_valid = False
+            if not wire_ready_valid:
+                _discard_proof(wire_ready_path)
+        if not wire_ready_valid:
+            if wire_ready_path.exists() or wire_ready_path.is_symlink():
+                _discard_proof(wire_ready_path)
+
+            chunk_lane = index % len(lane_urls)
+
+            def lane_report(_lane: int, amount: int) -> None:
+                report(chunk_lane, amount)
+
+            chunk_urls = [f"{lane_url.rstrip('/')}/{name}" for lane_url in lane_urls]
+            chunk_urls = chunk_urls[chunk_lane:] + chunk_urls[:chunk_lane]
+            incoming_path = chunk_path.with_name(f".{chunk_path.name}.incoming")
+            download(
+                chunk_urls[0],
+                incoming_path,
+                expected_size=wire_size,
+                expected_sha256=wire_sha256,
+                progress=lane_report,
+                source_urls=chunk_urls,
+                parallel_ranges=False,
+                deadline=deadline,
+                cancel_event=cancel_event,
+                per_request_timeout_seconds=_configured_chunk_timeout(),
+                retry_http_statuses={404, 503},
+            )
+            _check_deadline(deadline, cancel_event)
+            os.replace(incoming_path, chunk_path)
+            encoded = chunk_path.read_bytes()
+            if len(encoded) != wire_size or _sha256(chunk_path, deadline, cancel_event) != wire_sha256:
+                raise OSError("version-two adapter transport chunk checksum mismatch")
+
+            # Publish verified wire data before the expensive reconstruction.
+            # The atomic proof lets the peer fetch this chunk while this host
+            # reconstructs its local model file.
+            _write_json(
+                wire_ready_path,
+                {
+                    "type": "wire-ready",
+                    "file": name,
+                    "offset": offset,
+                    "data_offset": data_offset,
+                    "raw_size": raw_size,
+                    "wire_size": wire_size,
+                    "wire_sha256": wire_sha256,
+                    "raw_sha256": raw_sha256,
+                },
+            )
         with reconstruct_semaphore:
             reconstruction_started = time.monotonic()
             try:
@@ -1754,6 +1833,10 @@ def _stage_chunked_linear_adapter(
                 "output_sha256": output_sha256,
             },
         )
+        # Keep the completed proof visible before removing the earlier proof.
+        # This prevents a relay visibility gap between reconstruction and the
+        # completed state.
+        _discard_proof(wire_ready_path)
 
     download_streams = _configured_download_streams()
     executor = ThreadPoolExecutor(max_workers=min(len(chunks), download_streams))
