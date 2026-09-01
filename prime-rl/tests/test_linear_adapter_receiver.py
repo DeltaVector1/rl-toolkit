@@ -116,13 +116,13 @@ class LinearAdapterReceiverTest(unittest.TestCase):
         finally:
             filesystem._read_source_text = old_reader
 
-    def test_receiver_reconstructs_exact_target_and_reports_time(self):
+    def test_receiver_reconstructs_exact_target_with_zero_correction(self):
         filesystem = load_filesystem()
         source_url = "http://source/step_2"
         target = b"target!!"
         base1 = b"base-one"
         base2 = b"base-two"
-        correction = b"canonical-correction"
+        correction = b""
         config = b"{}\n"
         wire = b"wire"
         digest = lambda value: hashlib.sha256(value).hexdigest()

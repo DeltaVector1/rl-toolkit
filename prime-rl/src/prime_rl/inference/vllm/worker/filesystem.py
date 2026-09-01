@@ -1551,6 +1551,7 @@ def _stage_chunked_linear_adapter(
             except (OSError, ValueError):
                 proof_matches = False
             if proof_matches:
+                resume_hash_started = time.monotonic()
                 try:
                     if (
                         output_path.stat().st_size == target_size
@@ -1562,6 +1563,9 @@ def _stage_chunked_linear_adapter(
                     raise
                 except (FileNotFoundError, OSError):
                     pass
+                finally:
+                    with reconstruct_lock:
+                        reconstruct_seconds += time.monotonic() - resume_hash_started
             completed_path.unlink(missing_ok=True)
 
         chunk_lane = index % len(lane_urls)
@@ -1583,15 +1587,15 @@ def _stage_chunked_linear_adapter(
             cancel_event=cancel_event,
             per_request_timeout_seconds=_configured_chunk_timeout(),
         )
-        _check_deadline(deadline, cancel_event)
-        encoded = chunk_path.read_bytes()
-        if len(encoded) != wire_size or _sha256(chunk_path, deadline, cancel_event) != wire_sha256:
-            raise OSError("version-two adapter transport chunk checksum mismatch")
         reconstruction_started = time.monotonic()
-        base_fd2 = os.open(base2_model, os.O_RDONLY)
-        base_fd1 = os.open(base1_model, os.O_RDONLY)
-        output_fd = os.open(output_path, os.O_RDWR)
         try:
+            _check_deadline(deadline, cancel_event)
+            encoded = chunk_path.read_bytes()
+            if len(encoded) != wire_size or _sha256(chunk_path, deadline, cancel_event) != wire_sha256:
+                raise OSError("version-two adapter transport chunk checksum mismatch")
+            base_fd2 = os.open(base2_model, os.O_RDONLY)
+            base_fd1 = os.open(base1_model, os.O_RDONLY)
+            output_fd = os.open(output_path, os.O_RDWR)
             base2_chunk = os.pread(base_fd2, raw_size, offset)
             base1_chunk = os.pread(base_fd1, raw_size, offset)
             if len(base2_chunk) != raw_size or len(base1_chunk) != raw_size:
@@ -1611,10 +1615,14 @@ def _stage_chunked_linear_adapter(
                 raise OSError("version-two adapter chunk has the wrong size")
             _pwrite_all(output_fd, reconstructed, offset)
             os.fsync(output_fd)
+            output_sha256 = hashlib.sha256(reconstructed).hexdigest()
         finally:
-            os.close(output_fd)
-            os.close(base_fd1)
-            os.close(base_fd2)
+            if "output_fd" in locals():
+                os.close(output_fd)
+            if "base_fd1" in locals():
+                os.close(base_fd1)
+            if "base_fd2" in locals():
+                os.close(base_fd2)
         with reconstruct_lock:
             reconstruct_seconds += time.monotonic() - reconstruction_started
         _check_deadline(deadline, cancel_event)
@@ -1629,7 +1637,7 @@ def _stage_chunked_linear_adapter(
                 "wire_sha256": wire_sha256,
                 "raw_sha256": raw_sha256,
                 "correction_sha256": correction_sha256,
-                "output_sha256": hashlib.sha256(reconstructed).hexdigest(),
+                "output_sha256": output_sha256,
             },
         )
 
@@ -1637,8 +1645,13 @@ def _stage_chunked_linear_adapter(
     executor = ThreadPoolExecutor(max_workers=min(len(chunks), download_streams))
     futures = [executor.submit(fetch, index, item) for index, item in enumerate(chunks)]
     _wait_for_futures(executor, futures, deadline, cancel_event)
-    if _sha256(output_path, deadline, cancel_event) != target_sha256:
-        raise OSError("reconstructed version-two adapter checksum mismatch")
+    target_hash_started = time.monotonic()
+    try:
+        if _sha256(output_path, deadline, cancel_event) != target_sha256:
+            raise OSError("reconstructed version-two adapter checksum mismatch")
+    finally:
+        with reconstruct_lock:
+            reconstruct_seconds += time.monotonic() - target_hash_started
     if output_path.stat().st_size != target_size:
         raise OSError("reconstructed version-two adapter size mismatch")
 
