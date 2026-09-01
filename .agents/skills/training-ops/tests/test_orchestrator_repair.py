@@ -74,6 +74,58 @@ class OrchestratorRepairTest(unittest.TestCase):
         self.assertIn('echo "unknown staging status on $port"', script)
         self.assertIn("staging age is missing", script)
 
+    def test_orchestrator_state_reports_absent_container(self):
+        script = training_ops._orchestrator_state_script(
+            "glm52-decensor-orchestrator"
+        )
+        self.assertIn("if name=$(sudo docker inspect", script)
+        self.assertIn("echo absent", script)
+
+    def test_absent_orchestrator_recreation_checks_that_it_stays_absent(self):
+        with mock.patch.object(
+            training_ops, "_ssh_address", side_effect=lambda host: f"addr-{host}"
+        ):
+            script = training_ops._recreate_orchestrator_script(
+                "glm-1",
+                {
+                    "kind": "glm52",
+                    "orchestrator": "configs/paused/glm52/orchestrator.toml",
+                },
+                was_running=False,
+                observed_state="absent",
+            )
+        self.assertIn("[ absent = absent ]", script)
+        self.assertIn('[ -z "$name" ]', script)
+        self.assertIn("start_orchestrator.sh", script)
+
+    def test_absent_orchestrator_is_recreated_after_status_reports_down(self):
+        before = training_ops.Status(
+            trainer_up=True,
+            orch_up=False,
+            nodes=[training_ops.NodeState(host="n82", gpu_util=0, reachable=True)],
+            batch="batch 112/1024; 0 inflight",
+        )
+        ssh_scripts = []
+
+        def fake_ssh(_host, script, timeout=120):
+            ssh_scripts.append(script)
+            if "echo absent" in script:
+                return 0, "absent\n"
+            return 0, ""
+
+        with mock.patch.object(training_ops, "current_run", return_value="glm-1"), mock.patch.object(
+            training_ops, "status", return_value=before
+        ), mock.patch.object(training_ops, "deploy", return_value=True), mock.patch.object(
+            training_ops, "_ssh", side_effect=fake_ssh
+        ), mock.patch.object(
+            training_ops, "_ssh_address", side_effect=lambda host: f"addr-{host}"
+        ):
+            result = training_ops._repair_orchestrator()
+
+        self.assertIn("recreated exact orchestrator", result)
+        self.assertIn("[ absent = absent ]", ssh_scripts[-1])
+        self.assertIn("start_orchestrator.sh", ssh_scripts[-1])
+
     def test_stopped_orchestrator_is_started_after_all_guards_pass(self):
         before = training_ops.Status(
             trainer_up=True,
@@ -117,7 +169,7 @@ class OrchestratorRepairTest(unittest.TestCase):
         self.assertIn("TRAINER_CT=glm52-decensor-trainer", ssh_scripts[-1][0])
         self.assertIn("ORCH_CT=glm52-decensor-orchestrator", ssh_scripts[-1][0])
 
-    def test_running_orchestrator_with_inflight_requests_is_refused(self):
+    def test_running_orchestrator_is_refused_without_a_down_status(self):
         before = training_ops.Status(
             trainer_up=True,
             orch_up=True,
@@ -130,7 +182,7 @@ class OrchestratorRepairTest(unittest.TestCase):
         ), mock.patch.object(training_ops, "_ssh", return_value=(0, "running\n")), mock.patch.object(
             training_ops, "deploy"
         ) as deploy:
-            with self.assertRaisesRegex(training_ops.Refused, "zero active rollout requests"):
+            with self.assertRaisesRegex(training_ops.Refused, "healthy"):
                 training_ops._repair_orchestrator()
 
         deploy.assert_not_called()

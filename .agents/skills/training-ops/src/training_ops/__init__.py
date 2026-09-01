@@ -2804,9 +2804,49 @@ def _adapter_update_config(run: str) -> dict:
         "service_name": service_name,
         "run_marker": f"/{run}/",
         "service_marker": f"/{service_name}/",
+        "source_url": source_url.rstrip("/"),
         "ports": ports_by_host[orchestrator_host],
         "ports_by_host": ports_by_host,
     }
+
+
+def _adapter_server_launch_script(run: str, config: dict) -> str:
+    """Build the configured adapter-http launch without touching the trainer."""
+    if config.get("kind") != "glm52":
+        raise Refused("adapter-server repair is only supported for the active GLM profile")
+    source_url = config.get("source_url")
+    if not isinstance(source_url, str) or not source_url.startswith(("http://", "https://")):
+        raise Refused("active GLM profile has no valid adapter source URL")
+    values = {
+        "node_id": trainer_head.removeprefix("n"),
+        "deployment_root": remote_repo,
+        "storage_root": storage_root,
+        "runs_path": run_root,
+        "trainer_container_name": trainer_container,
+        "master_node_id": trainer_head.removeprefix("n"),
+        "adapter_node_id": trainer_head.removeprefix("n"),
+        "adapter_service_port": adapter_port,
+        "adapter_container_name": adapter_container,
+        "RUN": run,
+        "RUN_NAME": f"run_{run}",
+        "BROADCAST_ROOT": run_root,
+        "ADAPTER_PREDICTIVE_UPGRADE": 1,
+        "ADAPTER_PREDICTIVE_RUN": run,
+        "ADAPTER_PREDICTIVE_BROADCAST_PATH": f"{run}/run_{run}/broadcasts",
+        "ADAPTER_PREDICTIVE_SOURCE_URL": source_url,
+    }
+    assignments = " ".join(
+        f"{key}={shlex.quote(str(value))}" for key, value in values.items()
+    )
+    return f"set -euo pipefail\n{assignments} bash {shlex.quote(trainer_launcher)} adapter-http\n"
+
+
+def _adapter_server_health_script() -> str:
+    return f"""set -euo pipefail
+code=$(curl -sS -o /dev/null -m 30 -w '%{{http_code}}' http://127.0.0.1:{adapter_port}/)
+[ \"$code\" = 200 ] || {{ echo \"adapter server returned $code\" >&2; exit 71; }}
+echo \"adapter server ready on port {adapter_port}\"
+"""
 
 
 def _validate_adapter_stage_log(log: str) -> str:
@@ -3144,7 +3184,20 @@ def _orchestrator_state_script(container: str) -> str:
     quoted = shlex.quote(container)
     return f"""set -euo pipefail
 container={quoted}
-name=$(sudo docker inspect --format '{{{{.Name}}}}' "$container" 2>/dev/null || true)
+if name=$(sudo docker inspect --format '{{{{.Name}}}}' "$container" 2>/dev/null); then
+  :
+else
+  listed=$(sudo docker ps -a --filter "name=^$container$" --format '{{{{.Names}}}}' 2>/dev/null) || {{
+    echo "configured orchestrator container state is unknown" >&2
+    exit 62
+  }}
+  [ -z "$listed" ] || {{
+    echo "configured orchestrator container state is unknown" >&2
+    exit 62
+  }}
+  echo absent
+  exit 0
+fi
 [ "$name" = "/$container" ] || {{ echo "configured orchestrator container identity is not exact" >&2; exit 61; }}
 state=$(sudo docker inspect --format '{{{{.State.Running}}}}' "$container" 2>/dev/null || true)
 case "$state" in
@@ -3156,7 +3209,7 @@ esac
 
 
 def _recreate_orchestrator_script(
-    run: str, profile: dict, was_running: bool
+    run: str, profile: dict, was_running: bool, observed_state: str | None = None
 ) -> str:
     """Recreate only the exact orchestrator with the active run settings."""
     if not isinstance(run, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", run):
@@ -3176,6 +3229,15 @@ def _recreate_orchestrator_script(
         raise Refused(f"active orchestrator config is unsafe: {orchestrator_config!r}")
     if not isinstance(was_running, bool):
         raise Refused("orchestrator running state must be a boolean")
+    expected_state = observed_state or ("running" if was_running else "stopped")
+    if expected_state not in {"running", "stopped", "absent"}:
+        raise Refused(f"orchestrator state is invalid: {expected_state!r}")
+    if expected_state == "running" and not was_running:
+        raise Refused("running orchestrator state conflicts with status")
+    if expected_state == "stopped" and was_running:
+        raise Refused("stopped orchestrator state conflicts with status")
+    if expected_state == "absent" and was_running:
+        raise Refused("absent orchestrator state conflicts with status")
     for name, value in (
         ("trainer", trainer_container),
         ("orchestrator", orchestrator_container),
@@ -3189,7 +3251,7 @@ def _recreate_orchestrator_script(
     if not trainer_addresses:
         raise Refused("configured trainer addresses are empty")
 
-    expected = "true" if was_running else "false"
+    expected = "true" if expected_state == "running" else "false"
     quoted_orchestrator = shlex.quote(orchestrator_container)
     quoted_run = shlex.quote(run)
     quoted_run_name = shlex.quote(f"run_{run}")
@@ -3199,11 +3261,22 @@ def _recreate_orchestrator_script(
     quoted_launcher = shlex.quote(orchestrator_launcher)
     return f"""set -euo pipefail
 container={quoted_orchestrator}
-name=$(sudo docker inspect --format '{{{{.Name}}}}' "$container" 2>/dev/null || true)
-[ "$name" = "/$container" ] || {{ echo "configured orchestrator container identity is not exact" >&2; exit 61; }}
-state=$(sudo docker inspect --format '{{{{.State.Running}}}}' "$container" 2>/dev/null || true)
-[ "$state" = {expected} ] || {{ echo "orchestrator state changed before recreation" >&2; exit 62; }}
-sudo docker rm -f "$container" >/dev/null
+if [ {shlex.quote(expected_state)} = absent ]; then
+  if name=$(sudo docker inspect --format '{{{{.Name}}}}' "$container" 2>/dev/null); then
+    :
+  else
+    listed=$(sudo docker ps -a --filter "name=^$container$" --format '{{{{.Names}}}}' 2>/dev/null) || {{ echo "orchestrator state changed before recreation" >&2; exit 62; }}
+    [ -z "$listed" ] || {{ echo "orchestrator state changed before recreation" >&2; exit 62; }}
+    name=""
+  fi
+  [ -z "$name" ] || {{ echo "orchestrator state changed before recreation" >&2; exit 62; }}
+else
+  name=$(sudo docker inspect --format '{{{{.Name}}}}' "$container" 2>/dev/null || true)
+  [ "$name" = "/$container" ] || {{ echo "configured orchestrator container identity is not exact" >&2; exit 61; }}
+  state=$(sudo docker inspect --format '{{{{.State.Running}}}}' "$container" 2>/dev/null || true)
+  [ "$state" = {expected} ] || {{ echo "orchestrator state changed before recreation" >&2; exit 62; }}
+  sudo docker rm -f "$container" >/dev/null
+fi
 RUN={quoted_run} RUN_NAME={quoted_run_name} \\
   ORCH_CONFIG={quoted_config} \\
   TRAINER_ADDRESSES={quoted_addresses} \\
@@ -3231,11 +3304,63 @@ def repair(what: str) -> str:
         return _repair_microbatch_sync()
     if what == "adapter-update":
         return _repair_adapter_update()
+    if what == "adapter-server":
+        return _repair_adapter_server()
+    if what == "adapter-server:reload":
+        return _repair_adapter_server(force=True)
     if what == "orchestrator":
         return _repair_orchestrator()
     raise Refused(
-        f"unknown repair {what!r}. Use tunnels, engine-watchdog:<host>, engine:<host>, supervisors, microbatch-sync, adapter-update, or orchestrator."
+        f"unknown repair {what!r}. Use tunnels, engine-watchdog:<host>, engine:<host>, supervisors, microbatch-sync, adapter-update, adapter-server[:reload], or orchestrator."
     )
+
+
+def _repair_adapter_server(force: bool = False) -> str:
+    """Reload the active GLM adapter server through the configured launcher."""
+    run = current_run()
+    config = _adapter_update_config(run)
+    if config["kind"] != "glm52":
+        raise Refused("adapter-server repair is only supported for the active GLM profile")
+    before = status(run, quiet=True)
+    if not before.trainer_up or before.trainer_failed:
+        raise Refused("adapter-server repair requires a healthy trainer cluster")
+    if before.adapter == "200" and not force:
+        raise Refused(
+            "adapter server is healthy; use repair('adapter-server:reload') for an explicit reload"
+        )
+    inflight = re.search(r"(\d+) inflight", before.batch or "")
+    if inflight and int(inflight.group(1)) > 0:
+        raise Refused("adapter-server repair requires zero active rollout requests")
+
+    for path in (
+        ".agents/skills/training-ops/runtime/china/cluster.sh",
+        ".agents/skills/training-ops/runtime/china/adapter_server.py",
+        "prime-rl/src/prime_rl/utils/adapter_delta.py",
+    ):
+        if not deploy(path, [trainer_head]):
+            raise RuntimeError(f"adapter-server deployment failed for {path}")
+    code, output = _ssh(
+        trainer_head,
+        _adapter_server_launch_script(run, config),
+        timeout=300,
+    )
+    if code:
+        raise RuntimeError(f"adapter-server launcher failed on {trainer_head}: {output.strip()}")
+    health_code, health_output = _ssh(
+        trainer_head,
+        _adapter_server_health_script(),
+        timeout=60,
+    )
+    if health_code:
+        raise RuntimeError(
+            f"adapter-server health check failed on {trainer_head}: {health_output.strip()}"
+        )
+    result = (
+        f"reloaded active GLM adapter server {adapter_container} on {trainer_head}; "
+        f"adapter status was {before.adapter}, health passed on port {adapter_port}"
+    )
+    print(result)
+    return result
 
 
 def _repair_adapter_update() -> str:
@@ -3417,6 +3542,10 @@ def _repair_orchestrator() -> str:
     before = status(run, quiet=True)
     if not before.trainer_up or before.trainer_failed:
         raise Refused("orchestrator repair requires a healthy trainer cluster")
+    if before.orch_up:
+        raise Refused(
+            "orchestrator is healthy; repair requires status to report it down"
+        )
     if any(not node.reachable for node in before.nodes):
         raise Refused("orchestrator repair requires every trainer host to be reachable")
     if any(node.gpu_util >= 50 for node in before.nodes):
@@ -3432,7 +3561,11 @@ def _repair_orchestrator() -> str:
             f"{state_output.strip()}"
         )
     observed_state = state_output.strip().splitlines()
-    if len(observed_state) != 1 or observed_state[0] not in {"running", "stopped"}:
+    if len(observed_state) != 1 or observed_state[0] not in {
+        "running",
+        "stopped",
+        "absent",
+    }:
         raise Refused(
             "orchestrator repair found an ambiguous container state: "
             f"{state_output.strip() or 'no state'}"
@@ -3470,7 +3603,9 @@ def _repair_orchestrator() -> str:
         raise RuntimeError(f"orchestrator repair deployment failed for {client_path}")
     resume_code, resume_output = _ssh(
         orchestrator_host,
-        _recreate_orchestrator_script(run, profile, was_running),
+        _recreate_orchestrator_script(
+            run, profile, was_running, observed_state=observed_state[0]
+        ),
         timeout=180,
     )
     if resume_code:
@@ -5268,7 +5403,7 @@ usage = f"""training-ops <action> [args]
   remote <group> <command>      run on trainer, inference, or all hosts
   versions [package ...]        show installed package versions
   watch [hours] [seconds]       monitor in the foreground
-  repair <name>                 repair tunnels, an engine, supervisors, or microbatch sync
+  repair <name>                 repair tunnels, an engine, adapter server, orchestrator, supervisors, or microbatch sync
   deploy <path>                 copy one repository file
   start <run> [mode] [profile]  start one configured profile
   archive <run> [step ...]      upload stable old LoRA adapters

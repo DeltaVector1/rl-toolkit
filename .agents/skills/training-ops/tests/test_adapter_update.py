@@ -27,9 +27,56 @@ class AdapterUpdateTest(unittest.TestCase):
         config = training_ops._adapter_update_config("glm-1")
         self.assertEqual(config["kind"], "glm52")
         self.assertEqual(config["engine_container"], "glm52-decensor-h200")
+        self.assertEqual(config["source_url"], "http://127.0.0.1:18100/glm-1")
         self.assertEqual(config["ports"], [8000])
         self.assertEqual(config["run_marker"], "/glm-1/")
         self.assertEqual(config["service_marker"], "/run_glm-1/")
+
+    def test_adapter_server_launcher_uses_active_glm_settings(self):
+        script = training_ops._adapter_server_launch_script(
+            "glm-1", training_ops._adapter_update_config("glm-1")
+        )
+        self.assertIn("adapter-http", script)
+        self.assertIn("RUN=glm-1", script)
+        self.assertIn("ADAPTER_PREDICTIVE_RUN=glm-1", script)
+        self.assertIn(
+            "ADAPTER_PREDICTIVE_BROADCAST_PATH=glm-1/run_glm-1/broadcasts", script
+        )
+        self.assertIn("ADAPTER_PREDICTIVE_SOURCE_URL=http://127.0.0.1:18100/glm-1", script)
+        self.assertIn("node_id=82", script)
+        self.assertNotIn("cluster.sh trainer", script)
+
+    def test_adapter_server_repair_requires_reported_failure_unless_reload(self):
+        before = training_ops.Status(trainer_up=True, adapter="200", orch_up=False)
+        with mock.patch.object(training_ops, "current_run", return_value="glm-1"), mock.patch.object(
+            training_ops, "_adapter_update_config", return_value={"kind": "glm52"}
+        ), mock.patch.object(training_ops, "status", return_value=before), mock.patch.object(
+            training_ops, "deploy"
+        ) as deploy:
+            with self.assertRaisesRegex(training_ops.Refused, "adapter server is healthy"):
+                training_ops._repair_adapter_server()
+        deploy.assert_not_called()
+
+    def test_adapter_server_repair_does_not_start_trainer(self):
+        before = training_ops.Status(trainer_up=True, adapter="000", orch_up=False)
+        config = training_ops._adapter_update_config("glm-1")
+        ssh_scripts = []
+
+        def ssh(_host, script, timeout=120):
+            ssh_scripts.append(script)
+            return 0, "adapter server ready on port 8100\n"
+
+        with mock.patch.object(training_ops, "current_run", return_value="glm-1"), mock.patch.object(
+            training_ops, "_adapter_update_config", return_value=config
+        ), mock.patch.object(training_ops, "status", return_value=before), mock.patch.object(
+            training_ops, "deploy", return_value=True
+        ), mock.patch.object(training_ops, "_ssh", side_effect=ssh):
+            result = training_ops._repair_adapter_server()
+
+        self.assertIn("reloaded active GLM adapter server", result)
+        self.assertEqual(len(ssh_scripts), 2)
+        self.assertIn("adapter-http", ssh_scripts[0])
+        self.assertNotIn("trainer >/dev/null", ssh_scripts[0])
 
     def test_glm_adapter_server_gets_predictive_upgrade_settings(self):
         launcher = (
