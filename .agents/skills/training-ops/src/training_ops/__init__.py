@@ -3441,6 +3441,7 @@ def _repair_adapter_update() -> str:
             "prime-rl/src/prime_rl/inference/vllm/worker/filesystem.py",
             inference_hosts,
         ),
+        ("prime-rl/src/prime_rl/utils/checkpoint_delta.py", inference_hosts),
         ("prime-rl/src/prime_rl/inference/relay.py", [orchestrator_host]),
         (".agents/skills/training-ops/runtime/h200/sync_rollout_batches.sh", None),
     )
