@@ -49,7 +49,7 @@ def adapter_cache_path(source_url: str) -> Path:
 
 _PARALLEL_DOWNLOAD_THRESHOLD = 16 * 1024 * 1024
 _DOWNLOAD_STREAMS_ENV = "PRIME_LORA_DOWNLOAD_STREAMS"
-_MAX_DOWNLOAD_STREAMS = 64
+_MAX_DOWNLOAD_STREAMS = 128
 _ADAPTER_FILES = ("adapter_config.json", "adapter_model.safetensors")
 _ADAPTER_MANIFEST = "adapter_manifest.json"
 _ADAPTER_DIGEST = "adapter_model.safetensors.sha256"
@@ -59,6 +59,7 @@ _ADAPTER_DELTA_TRANSPORT = "chunked-shuffled-xor-zstd"
 _ADAPTER_MAX_CHUNKS = 65536
 _ADAPTER_LANE_TIMEOUT_S = float(os.environ.get("PRIME_LORA_LANE_TIMEOUT_S", "45"))
 _ADAPTER_LANE_RETRIES = int(os.environ.get("PRIME_LORA_LANE_RETRIES", "6"))
+_ADAPTER_CHUNK_TIMEOUT_S = float(os.environ.get("PRIME_LORA_CHUNK_TIMEOUT_S", "15"))
 _ADAPTER_STATUS_INTERVAL_S = float(os.environ.get("PRIME_LORA_STATUS_INTERVAL_S", "1"))
 _JSON_LOCK = threading.Lock()
 _adapter_stage_publish_lock = threading.Lock()
@@ -170,11 +171,53 @@ def _acquire_stage_lock(
 def _request_timeout(
     deadline: float | None,
     cancel_event: threading.Event | None = None,
+    maximum: float | None = None,
 ) -> float:
     _check_deadline(deadline, cancel_event)
+    timeout = _ADAPTER_LANE_TIMEOUT_S
+    if maximum is not None:
+        if not _is_finite_number(maximum) or maximum <= 0:
+            raise OSError("adapter request timeout must be positive")
+        timeout = min(timeout, float(maximum))
     if deadline is None:
-        return _ADAPTER_LANE_TIMEOUT_S
-    return min(_ADAPTER_LANE_TIMEOUT_S, deadline - time.monotonic())
+        return timeout
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("adapter delta staging exceeded its time limit")
+    return min(timeout, remaining)
+
+
+def _configured_chunk_timeout() -> float:
+    """Return the idle timeout for one resumable adapter chunk request."""
+    if not _is_finite_number(_ADAPTER_CHUNK_TIMEOUT_S) or _ADAPTER_CHUNK_TIMEOUT_S <= 0:
+        raise OSError("PRIME_LORA_CHUNK_TIMEOUT_S must be positive")
+    if not _is_finite_number(_ADAPTER_LANE_TIMEOUT_S) or _ADAPTER_LANE_TIMEOUT_S <= 0:
+        raise OSError("PRIME_LORA_LANE_TIMEOUT_S must be positive")
+    if _ADAPTER_CHUNK_TIMEOUT_S > _ADAPTER_LANE_TIMEOUT_S:
+        raise OSError("PRIME_LORA_CHUNK_TIMEOUT_S cannot exceed PRIME_LORA_LANE_TIMEOUT_S")
+    return _ADAPTER_CHUNK_TIMEOUT_S
+
+
+def _chunk_request_timeout(
+    deadline: float | None,
+    attempt: int,
+    configured_timeout: float,
+    cancel_event: threading.Event | None = None,
+) -> float:
+    """Bound a chunk attempt so a stalled lane can be retried promptly."""
+    timeout = configured_timeout
+    if not _is_finite_number(timeout) or timeout <= 0:
+        raise OSError("adapter request timeout must be positive")
+    if timeout > _ADAPTER_LANE_TIMEOUT_S:
+        raise OSError("adapter request timeout cannot exceed adapter lane timeout")
+    if deadline is None:
+        return timeout
+    _check_deadline(deadline, cancel_event)
+    attempts_left = max(1, _ADAPTER_LANE_RETRIES - attempt)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("adapter delta staging exceeded its time limit")
+    return min(timeout, remaining, max(0.25, remaining / (attempts_left + 1)))
 
 
 def _wait_for_futures(
@@ -1238,6 +1281,7 @@ def _stage_chunked_xor_adapter(
             parallel_ranges=False,
             deadline=deadline,
             cancel_event=cancel_event,
+            per_request_timeout_seconds=_configured_chunk_timeout(),
         )
 
         _check_deadline(deadline, cancel_event)
@@ -1378,8 +1422,14 @@ def download(
     parallel_ranges: bool = True,
     deadline: float | None = None,
     cancel_event: threading.Event | None = None,
+    per_request_timeout_seconds: float | None = None,
 ) -> None:
     _check_deadline(deadline, cancel_event)
+    if per_request_timeout_seconds is not None and (
+        not _is_finite_number(per_request_timeout_seconds)
+        or per_request_timeout_seconds <= 0
+    ):
+        raise OSError("adapter request timeout must be positive")
     explicit_source_urls = source_urls is not None
     source_urls = _adapter_source_urls(source_url) if source_urls is None else source_urls
     if not source_urls:
@@ -1408,7 +1458,11 @@ def download(
     # link. Adapter fan-out is opt-in and has its own setting.
     adapter_ports = explicit_source_urls or len(source_urls) > 1 or source_urls[0] != source_url
 
-    streams = len(source_urls) if adapter_ports and parallel_ranges else 1
+    streams = (
+        min(len(source_urls), _configured_download_streams())
+        if adapter_ports and parallel_ranges
+        else 1
+    )
     if not adapter_ports and parallel_ranges:
         streams = _configured_download_streams()
     if total < _PARALLEL_DOWNLOAD_THRESHOLD or streams == 1:
@@ -1427,7 +1481,16 @@ def download(
                 )
                 with urllib.request.urlopen(
                     request,
-                    timeout=_request_timeout(deadline, cancel_event),
+                    timeout=(
+                        _request_timeout(deadline, cancel_event)
+                        if per_request_timeout_seconds is None
+                        else _chunk_request_timeout(
+                            deadline,
+                            attempt,
+                            per_request_timeout_seconds,
+                            cancel_event,
+                        )
+                    ),
                 ) as response:
                     if offset and response.status != 206:
                         destination.unlink(missing_ok=True)
@@ -1455,9 +1518,9 @@ def download(
                     destination.unlink(missing_ok=True)
                     raise OSError(f"adapter checksum mismatch: {destination.name}")
                 return
-            except TimeoutError:
-                raise
             except OSError:
+                # Retry network timeouts; keep the absolute stage limit.
+                _check_deadline(deadline, cancel_event)
                 if attempt + 1 == _ADAPTER_LANE_RETRIES:
                     raise
                 sleep_for = min(2**attempt, 10)

@@ -6,6 +6,17 @@ model=/data/glm52-rl/refusals-classifier-eval/model-rp-validity-396m
 service=$deployment/evals/refusals-classifier/classifier_service.py
 image=${MUSE_VLLM_IMAGE:-vllm/vllm-openai:nightly-5a4c8d99242e9e069b604d0e9b969e77f7dd501d}
 container=refusals-classifier-eval
+classifier_port=$(python3 - "$deployment/configs/operations.toml" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as stream:
+    value = tomllib.load(stream)["ports"].get("refusal_classifier")
+if not isinstance(value, int) or not 1 <= value <= 65535:
+    raise SystemExit("operations config has no valid refusal classifier port")
+print(value)
+PY
+)
 
 test -f "$model/model.safetensors"
 test -f "$service"
@@ -24,13 +35,13 @@ sudo docker run -d --name "$container" --restart unless-stopped \
   /classifier_service.py \
   --model /model \
   --device cuda:0 \
-  --port 18150 \
+  --port "$classifier_port" \
   --batch-size 32 \
   --batch-wait-ms 20
 
 for _ in $(seq 1 120); do
-  if curl -fsS http://127.0.0.1:18150/health >/dev/null; then
-    curl -fsS http://127.0.0.1:18150/health
+  if curl -fsS "http://127.0.0.1:$classifier_port/health" >/dev/null; then
+    curl -fsS "http://127.0.0.1:$classifier_port/health"
     exit 0
   fi
   sleep 2

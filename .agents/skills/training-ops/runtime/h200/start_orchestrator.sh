@@ -57,7 +57,12 @@ with open(sys.argv[1], "rb") as stream:
     operations = tomllib.load(stream)
 with open(sys.argv[2], "rb") as stream:
     edge = tomllib.load(stream)
-relay_port = operations.get("ports", {}).get("adapter_relay")
+ports = operations.get("ports")
+if not isinstance(ports, dict):
+    raise SystemExit("operations config has no port inventory")
+relay_port = ports.get("adapter_relay")
+source_first = ports.get("lora_source_first")
+source_last = ports.get("lora_source_last")
 relay_container = operations.get("containers", {}).get("adapter_relay")
 cache_dir = operations.get("paths", {}).get("adapter_cache")
 source_url = edge.get("weight_broadcast", {}).get("source_url")
@@ -65,6 +70,33 @@ model_name = edge.get("model", {}).get("name")
 glm_model = operations.get("models", {}).get("glm52")
 if not isinstance(relay_port, int) or not 1 <= relay_port <= 65535:
     raise SystemExit("operations config has no valid adapter relay port")
+if (
+    not isinstance(source_first, int)
+    or not isinstance(source_last, int)
+    or not 1 <= source_first <= source_last <= 65535
+):
+    raise SystemExit("operations config has no valid adapter source range")
+port_values = {}
+for name, value in ports.items():
+    if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 65535:
+        raise SystemExit(f"operations port {name} is invalid")
+    port_values[name] = value
+source_ports = set(range(source_first, source_last + 1))
+reserved_names = set(port_values) - {"lora_source_first", "lora_source_last"}
+reserved_ports = {name: port_values[name] for name in reserved_names}
+collisions = {
+    name: value
+    for name, value in reserved_ports.items()
+    if value in source_ports
+}
+if collisions:
+    raise SystemExit(f"configured port overlaps the adapter source range: {collisions}")
+duplicate_ports = {}
+for name, value in reserved_ports.items():
+    duplicate_ports.setdefault(value, []).append(name)
+duplicates = [names for names in duplicate_ports.values() if len(names) > 1]
+if duplicates:
+    raise SystemExit(f"configured ports are duplicated: {duplicates}")
 if not isinstance(relay_container, str) or not relay_container:
     raise SystemExit("operations config has no adapter relay container")
 if not isinstance(cache_dir, str) or not cache_dir.startswith("/"):
@@ -76,6 +108,8 @@ if not isinstance(model_name, str) or not isinstance(glm_model, str):
 parsed = urlsplit(source_url)
 if parsed.hostname not in {"127.0.0.1", "localhost"} or parsed.query or parsed.fragment:
     raise SystemExit("canonical adapter source URL must be loopback without query or fragment")
+if parsed.port != source_first:
+    raise SystemExit("canonical adapter source URL must use lora_source_first")
 print(relay_port, relay_container, cache_dir, source_url, int(model_name == glm_model))
 PY
 ); then
@@ -104,16 +138,6 @@ transport=$(awk '
   /^\[/ { active=0 }
   active && $1 == "type" { gsub(/[ "\047]/, "", $3); print $3; exit }
 ' "$config_file")
-adapter_admin_urls=$(python3 - "$config_file" <<'PY'
-import sys
-import tomllib
-
-with open(sys.argv[1], "rb") as stream:
-    config = tomllib.load(stream)
-for url in config["model"]["client"]["admin_base_url"]:
-    print(url.removesuffix("/v1"), end=" ")
-PY
-)
 
 if ! peer_settings=$(python3 - "$operations_file" "$config_file" <<'PY'
 import ipaddress
@@ -279,9 +303,8 @@ peer_tunnel() {
     "-L 127.0.0.1:$peer_api_port:127.0.0.1:8000" \
     -L "127.0.0.1:$peer_api_port:127.0.0.1:8000"
 
-  # Keep each SSH cipher worker to four source ports. This gives the 32
-  # concurrent HTTP lanes independent encryption workers without creating one
-  # SSH connection for every port.
+  # Keep each SSH cipher worker to four source ports without creating one SSH
+  # connection for every port.
   local peer_lane_size=4
   local lane_start=0 lane_number=0
   local -a lane_ports lane_forwards
@@ -346,14 +369,6 @@ if [ "$peer_enabled" = 1 ]; then
   ports+=("$relay_port")
 else
   sudo docker rm -f "$relay_container" >/dev/null 2>&1 || true
-fi
-if [[ " $adapter_admin_urls " == *":18111 "* ]]; then
-  tunnel 18101 127.0.0.1:8000 "-p 40051 -i /root/.ssh/china_rollout_ed25519 root@152.236.142.243"
-  tunnel 18111 127.0.0.1:8001 "-p 40051 -i /root/.ssh/china_rollout_ed25519 root@152.236.142.243"
-  tunnel 18112 127.0.0.1:8002 "-p 40051 -i /root/.ssh/china_rollout_ed25519 root@152.236.142.243"
-  tunnel 18113 127.0.0.1:8003 "-p 40051 -i /root/.ssh/china_rollout_ed25519 root@152.236.142.243"
-  tunnel 18114 127.0.0.1:8004 "-p 40051 -i /root/.ssh/china_rollout_ed25519 root@152.236.142.243"
-  ports+=(18101 18111 18112 18113 18114)
 fi
 if [ "$transport" = zmq ]; then
   tunnel 29620 10.92.20.82:29620 "$trainer_ssh_target" yes

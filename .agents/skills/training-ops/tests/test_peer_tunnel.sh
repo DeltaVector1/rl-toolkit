@@ -29,12 +29,12 @@ end=$(grep -n '^for lora_source_port in' "$script" | cut -d: -f1)
 source <(sed -n "${start},$((end - 1))p" "$script")
 
 lora_source_ports=()
-for port in $(seq 18100 18131); do
+for port in $(seq 18100 18195); do
   lora_source_ports+=("$port")
 done
 peer_enabled=1
 peer_api_port=18049
-relay_port=18160
+relay_port=18196
 peer_name=h200b
 peer_host=38.255.28.19
 peer_ssh_port=20099
@@ -44,14 +44,14 @@ log="$tmp/peer-tunnel.log"
 
 PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$log" peer_tunnel
 for _ in $(seq 1 50); do
-  [ -f "$log" ] && [ "$(wc -l <"$log")" -eq 9 ] && break
+  [ -f "$log" ] && [ "$(wc -l <"$log")" -eq 25 ] && break
   sleep 0.1
 done
-test "$(wc -l <"$log")" -eq 9
+test "$(wc -l <"$log")" -eq 25
 
 api_pattern='-L 127.0.0.1:18049:127.0.0.1:8000'
 test "$(grep -F -c -- "$api_pattern" "$log")" -eq 1
-test "$(grep -F -c -- '-R 127.0.0.1:' "$log")" -eq 8
+test "$(grep -F -c -- '-R 127.0.0.1:' "$log")" -eq 24
 while IFS= read -r line; do
   case "$line" in
     *"$api_pattern"*"-R 127.0.0.1:"*)
@@ -60,7 +60,7 @@ while IFS= read -r line; do
       ;;
   esac
 done <"$log"
-for port in $(seq 18100 18131); do
+for port in $(seq 18100 18195); do
   test "$(grep -F -c -- "-R 127.0.0.1:$port:127.0.0.1:$relay_port" "$log")" -eq 1
 done
 while IFS= read -r line; do
@@ -71,5 +71,5 @@ done < <(grep -F -- '-R 127.0.0.1:' "$log")
 
 # A second launcher invocation finds the exact API and lane signatures.
 PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$log" peer_tunnel
-test "$(wc -l <"$log")" -eq 9
-printf 'peer tunnel uses one API connection and eight bounded self-healing lanes\n'
+test "$(wc -l <"$log")" -eq 25
+printf 'peer tunnel uses one API connection and twenty-four bounded self-healing lanes\n'

@@ -327,6 +327,8 @@ def main() -> None:
     args = build_parser().parse_args()
     if not 1 <= args.port <= 65535:
         raise SystemExit("relay port is invalid")
+    if args.source_port_first <= args.port <= args.source_port_last:
+        raise SystemExit("relay port overlaps the adapter source range")
     config = RelayConfig(
         cache_dir=args.cache_dir,
         canonical_sources=args.canonical_source_url,

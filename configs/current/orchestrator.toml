@@ -122,7 +122,7 @@ env.agent.max_output_tokens = 8192
 env.agent.timeout.rollout = 1200
 
 [eval.env.env.taskset.task]
-classifier_base_url = "http://127.0.0.1:18150"
+classifier_base_url = "http://127.0.0.1:18250"
 classifier_revision = "2084304ece320e87820140adfc8845761fb357a0"
 attempts = 3
 request_timeout_seconds = 60.0

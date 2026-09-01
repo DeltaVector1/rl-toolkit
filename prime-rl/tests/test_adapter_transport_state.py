@@ -18,6 +18,7 @@ import tomllib
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -150,7 +151,8 @@ class AdapterTransportStateTest(unittest.TestCase):
             target = root / "step_2"
             base.mkdir()
             target.mkdir()
-            original = bytes(range(251)) * 33
+            target_size = 2 * adapter_delta.default_chunk_size + 2
+            original = (bytes(range(251)) * ((target_size + 250) // 251))[:target_size]
             changed = bytearray(original)
             changed[0] = 17
             changed[4096] = 29
@@ -165,7 +167,6 @@ class AdapterTransportStateTest(unittest.TestCase):
                 base_url="http://source/step_1",
                 target_step=2,
                 base_step=1,
-                chunk_size=1024,
                 max_workers=2,
             )
 
@@ -181,6 +182,8 @@ class AdapterTransportStateTest(unittest.TestCase):
             self.assertEqual(manifest["version"], 1)
             self.assertEqual(manifest["mode"], "delta")
             self.assertEqual(manifest["base_step"], 1)
+            self.assertEqual(manifest["chunk_size"], adapter_delta.default_chunk_size)
+            self.assertEqual(manifest["chunk_count"], 3)
             self.assertEqual(bytes(rebuilt), bytes(changed))
             self.assertEqual(manifest["target_sha256"], hashlib.sha256(changed).hexdigest())
 
@@ -327,15 +330,15 @@ class AdapterTransportStateTest(unittest.TestCase):
         filesystem = load_filesystem_module()
         old_value = os.environ.get("PRIME_LORA_DOWNLOAD_STREAMS")
         try:
-            for value in (None, "", "0", "65", "not-an-integer"):
+            for value in (None, "", "0", "129", "not-an-integer"):
                 if value is None:
                     os.environ.pop("PRIME_LORA_DOWNLOAD_STREAMS", None)
                 else:
                     os.environ["PRIME_LORA_DOWNLOAD_STREAMS"] = value
                 with self.assertRaises(OSError):
                     filesystem._configured_download_streams()
-            os.environ["PRIME_LORA_DOWNLOAD_STREAMS"] = "32"
-            self.assertEqual(filesystem._configured_download_streams(), 32)
+            os.environ["PRIME_LORA_DOWNLOAD_STREAMS"] = "96"
+            self.assertEqual(filesystem._configured_download_streams(), 96)
         finally:
             if old_value is None:
                 os.environ.pop("PRIME_LORA_DOWNLOAD_STREAMS", None)
@@ -589,20 +592,48 @@ class AdapterTransportStateTest(unittest.TestCase):
             self.assertTrue(stopped.is_set())
             self.assertFalse(ready.exists())
 
-    def test_inventory_defines_bounded_32_lane_transfer(self):
+    def test_inventory_defines_bounded_96_lane_transfer(self):
         operations = REPOSITORY / "configs/operations.toml"
         with operations.open("rb") as stream:
             config = tomllib.load(stream)
         ports = config["ports"]
-        self.assertEqual(ports["lora_source_last"] - ports["lora_source_first"] + 1, 32)
+        self.assertEqual(ports["lora_source_first"], 18100)
+        self.assertEqual(ports["lora_source_last"], 18195)
+        self.assertEqual(ports["adapter_relay"], 18196)
+        self.assertEqual(ports["refusal_classifier"], 18250)
+        self.assertEqual(ports["lora_source_last"] - ports["lora_source_first"] + 1, 96)
         self.assertEqual(config["limits"]["adapter_delta_stage_timeout_seconds"], 300)
+        source_ports = set(range(ports["lora_source_first"], ports["lora_source_last"] + 1))
+        self.assertNotIn(ports["adapter_relay"], source_ports)
+        self.assertNotIn(ports["refusal_classifier"], source_ports)
+        self.assertNotEqual(ports["adapter_relay"], ports["refusal_classifier"])
+        reserved_ports = [
+            value
+            for name, value in ports.items()
+            if name not in {"lora_source_first", "lora_source_last"}
+        ]
+        self.assertEqual(len(reserved_ports), len(set(reserved_ports)))
+        for config_path in (
+            REPOSITORY / "configs/current/orchestrator.toml",
+            REPOSITORY / "configs/paused/glm52/orchestrator.toml",
+        ):
+            with config_path.open("rb") as stream:
+                edge_config = tomllib.load(stream)
+            source_url = edge_config["weight_broadcast"]["source_url"]
+            self.assertEqual(urlsplit(source_url).port, ports["lora_source_first"])
         runtime = REPOSITORY / ".agents/skills/training-ops/runtime/h200"
         glm_source = (runtime / "start_inference.sh").read_text(encoding="utf-8")
         muse_source = (runtime / "start_muse_inference.sh").read_text(encoding="utf-8")
-        self.assertIn("PRIME_LORA_DOWNLOAD_STREAMS=64", glm_source)
+        self.assertIn("PRIME_LORA_DOWNLOAD_STREAMS=96", glm_source)
         self.assertIn("PRIME_LORA_DOWNLOAD_STREAMS=32", muse_source)
         for source in (glm_source, muse_source):
             self.assertIn('PRIME_LORA_SOURCE_PORTS="$lora_source_port_list"', source)
+        orchestrator_source = (
+            REPOSITORY / ".agents/skills/training-ops/runtime/h200/start_orchestrator.sh"
+        ).read_text(encoding="utf-8")
+        for legacy_port in ("18101", "18111", "18112", "18113", "18114"):
+            self.assertNotIn(legacy_port, orchestrator_source)
+        self.assertIn("parsed.port != source_first", orchestrator_source)
         worker_source = (REPOSITORY / "prime-rl/src/prime_rl/inference/vllm/worker/filesystem.py").read_text(encoding="utf-8")
         self.assertIn("download_streams = _configured_download_streams()", worker_source)
         self.assertNotIn("_PARALLEL_DOWNLOAD_STREAMS", worker_source)

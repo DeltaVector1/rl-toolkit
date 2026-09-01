@@ -20,7 +20,7 @@ class RefusalsClassifierEvalData(vf.TaskData):
 
 
 class RefusalsClassifierEvalTaskConfig(vf.TaskConfig):
-    classifier_base_url: str = "http://127.0.0.1:18150"
+    classifier_base_url: str = "http://127.0.0.1:18250"
     classifier_revision: str = "2084304ece320e87820140adfc8845761fb357a0"
     attempts: int = 3
     request_timeout_seconds: float = 60.0

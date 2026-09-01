@@ -1,0 +1,209 @@
+import hashlib
+import importlib.util
+import io
+import sys
+import tempfile
+import types
+import unittest
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def load_filesystem_module():
+    modules = {
+        "torch": types.ModuleType("torch"),
+        "torch.nn": types.ModuleType("torch.nn"),
+        "vllm": types.ModuleType("vllm"),
+        "vllm.model_executor": types.ModuleType("vllm.model_executor"),
+        "vllm.model_executor.model_loader": types.ModuleType(
+            "vllm.model_executor.model_loader"
+        ),
+        "prime_rl": types.ModuleType("prime_rl"),
+        "prime_rl.utils": types.ModuleType("prime_rl.utils"),
+        "prime_rl.utils.checkpoint_delta": types.ModuleType(
+            "prime_rl.utils.checkpoint_delta"
+        ),
+    }
+    modules["torch.nn"].Module = object
+    modules["vllm.model_executor.model_loader"].DefaultModelLoader = object
+    modules["vllm.model_executor.model_loader"].get_model_loader = lambda _config: None
+    checkpoint_delta = modules["prime_rl.utils.checkpoint_delta"]
+    checkpoint_delta.DELTA_MANIFEST = "checkpoint_manifest.json"
+    checkpoint_delta.apply_xor_delta_file = lambda *args, **kwargs: None
+    checkpoint_delta.sha256_file = hashlib.sha256
+    saved = {name: sys.modules.get(name) for name in modules}
+    sys.modules.update(modules)
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "filesystem_scheduler_test",
+            ROOT / "src/prime_rl/inference/vllm/worker/filesystem.py",
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        for name, previous in saved.items():
+            if previous is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
+
+
+class DownloadSchedulerTest(unittest.TestCase):
+    def test_glm_stream_count_accepts_96_lanes(self):
+        filesystem = load_filesystem_module()
+        old_value = filesystem.os.environ.get(filesystem._DOWNLOAD_STREAMS_ENV)
+        filesystem.os.environ[filesystem._DOWNLOAD_STREAMS_ENV] = "96"
+        try:
+            self.assertEqual(filesystem._configured_download_streams(), 96)
+        finally:
+            if old_value is None:
+                filesystem.os.environ.pop(filesystem._DOWNLOAD_STREAMS_ENV, None)
+            else:
+                filesystem.os.environ[filesystem._DOWNLOAD_STREAMS_ENV] = old_value
+
+    def test_chunk_timeout_never_exceeds_stage_deadline(self):
+        filesystem = load_filesystem_module()
+        remaining = 0.05
+        timeout = filesystem._chunk_request_timeout(
+            filesystem.time.monotonic() + remaining,
+            attempt=0,
+            configured_timeout=15,
+        )
+        self.assertGreater(timeout, 0)
+        self.assertLessEqual(timeout, remaining)
+
+    def test_request_timeout_reports_a_deadline_crossing(self):
+        filesystem = load_filesystem_module()
+        old_monotonic = filesystem.time.monotonic
+        try:
+            for function, arguments in (
+                (filesystem._request_timeout, (101.0,)),
+                (filesystem._chunk_request_timeout, (101.0, 0, 15.0)),
+            ):
+                clock = iter((100.0, 102.0))
+                filesystem.time.monotonic = lambda: next(clock)
+                with self.assertRaisesRegex(TimeoutError, "exceeded its time limit"):
+                    function(*arguments)
+        finally:
+            filesystem.time.monotonic = old_monotonic
+
+    def test_parallel_ranges_use_configured_stream_cap(self):
+        filesystem = load_filesystem_module()
+        payload = b"x" * (20 * 1024 * 1024)
+        calls = []
+        workers = []
+
+        class Response(io.BytesIO):
+            status = 206
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        def fake_urlopen(request, timeout):
+            value = request.headers["Range"]
+            start, end = (int(part) for part in value.removeprefix("bytes=").split("-"))
+            calls.append((request.full_url, start, end, timeout))
+            return Response(payload[start : end + 1])
+
+        real_executor = filesystem.ThreadPoolExecutor
+
+        class RecordingExecutor:
+            def __init__(self, max_workers):
+                workers.append(max_workers)
+                self.executor = real_executor(max_workers=max_workers)
+
+            def submit(self, *args, **kwargs):
+                return self.executor.submit(*args, **kwargs)
+
+            def shutdown(self, *args, **kwargs):
+                return self.executor.shutdown(*args, **kwargs)
+
+        old_urlopen = filesystem.urllib.request.urlopen
+        old_executor = filesystem.ThreadPoolExecutor
+        old_streams = filesystem._configured_download_streams
+        filesystem.urllib.request.urlopen = fake_urlopen
+        filesystem.ThreadPoolExecutor = RecordingExecutor
+        filesystem._configured_download_streams = lambda: 2
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                destination = Path(temporary) / "adapter"
+                filesystem.download(
+                    "http://lane-1/adapter",
+                    destination,
+                    expected_size=len(payload),
+                    expected_sha256=hashlib.sha256(payload).hexdigest(),
+                    source_urls=[
+                        "http://lane-1/adapter",
+                        "http://lane-2/adapter",
+                        "http://lane-3/adapter",
+                        "http://lane-4/adapter",
+                    ],
+                )
+                self.assertEqual(destination.read_bytes(), payload)
+        finally:
+            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem.ThreadPoolExecutor = old_executor
+            filesystem._configured_download_streams = old_streams
+
+        self.assertEqual(workers, [2])
+        self.assertEqual(len(calls), 2)
+
+    def test_chunk_retry_uses_short_timeout_and_next_lane(self):
+        filesystem = load_filesystem_module()
+        payload = b"chunk"
+        calls = []
+
+        class Response(io.BytesIO):
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        def fake_urlopen(request, timeout):
+            calls.append((request.full_url, timeout))
+            if len(calls) == 1:
+                raise TimeoutError("lane read timed out")
+            return Response(payload)
+
+        old_urlopen = filesystem.urllib.request.urlopen
+        old_sleep = filesystem.time.sleep
+        filesystem.urllib.request.urlopen = fake_urlopen
+        filesystem.time.sleep = lambda _seconds: None
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                destination = Path(temporary) / "chunk"
+                filesystem.download(
+                    "http://lane-1/chunk",
+                    destination,
+                    expected_size=len(payload),
+                    expected_sha256=hashlib.sha256(payload).hexdigest(),
+                    source_urls=["http://lane-1/chunk", "http://lane-2/chunk"],
+                    parallel_ranges=False,
+                    deadline=filesystem.time.monotonic() + 100,
+                    per_request_timeout_seconds=15,
+                )
+                self.assertEqual(destination.read_bytes(), payload)
+        finally:
+            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem.time.sleep = old_sleep
+
+        self.assertEqual([call[0] for call in calls], [
+            "http://lane-1/chunk",
+            "http://lane-2/chunk",
+        ])
+        self.assertTrue(all(0 < call[1] <= 15 for call in calls))
+
+
+if __name__ == "__main__":
+    unittest.main()

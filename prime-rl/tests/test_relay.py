@@ -84,7 +84,7 @@ class RelayTest(unittest.TestCase):
             self.root,
             ["http://127.0.0.1:18100/glm-1"],
             18100,
-            18131,
+            18195,
         )
         self.server = relay.RelayServer(("127.0.0.1", 0), relay.RelayHandler, config)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
