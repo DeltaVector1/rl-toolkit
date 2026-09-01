@@ -3376,7 +3376,9 @@ def _repair_adapter_update() -> str:
     ):
         raise Refused("adapter repair requires the trainer to be waiting")
     orchestrator_was_running = before.orch_up
-    if not orchestrator_was_running:
+    if orchestrator_was_running:
+        observed_state = "running"
+    else:
         state_code, state_output = _ssh(
             orchestrator_host,
             _orchestrator_state_script(orchestrator_container),
@@ -3384,15 +3386,16 @@ def _repair_adapter_update() -> str:
         )
         if state_code:
             raise Refused(
-                "adapter repair requires the exact orchestrator container to be stopped: "
+                "adapter repair requires a stopped or absent exact orchestrator container: "
                 f"{state_output.strip()}"
             )
-        observed_state = state_output.strip().splitlines()[-1:]
-        if observed_state != ["stopped"]:
+        observed_states = state_output.strip().splitlines()
+        if len(observed_states) != 1 or observed_states[0] not in {"stopped", "absent"}:
             raise Refused(
-                "adapter repair requires a stopped exact orchestrator container; "
-                f"observed {observed_state[-1] if observed_state else 'no state'}"
+                "adapter repair requires a stopped or absent exact orchestrator container; "
+                f"observed {observed_states[-1] if observed_states else 'no state'}"
             )
+        observed_state = observed_states[0]
     if len(before.engines) != len(inference_hosts) or any(
         not engine.reachable
         or not engine.healthy
@@ -3524,7 +3527,9 @@ def _repair_adapter_update() -> str:
 
     resume_code, resume_output = _ssh(
         orchestrator_host,
-        _recreate_orchestrator_script(run, profile, orchestrator_was_running),
+        _recreate_orchestrator_script(
+            run, profile, orchestrator_was_running, observed_state=observed_state
+        ),
         timeout=180,
     )
     if resume_code:

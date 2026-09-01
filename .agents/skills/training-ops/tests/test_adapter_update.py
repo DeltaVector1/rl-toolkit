@@ -382,10 +382,67 @@ class AdapterUpdateTest(unittest.TestCase):
         ), mock.patch.object(training_ops, "_ssh", return_value=(0, "running\n")), mock.patch.object(
             training_ops, "_adapter_stage_evidence"
         ) as evidence, mock.patch.object(training_ops, "deploy") as deploy:
-            with self.assertRaisesRegex(training_ops.Refused, "stopped exact orchestrator"):
+            with self.assertRaisesRegex(training_ops.Refused, "stopped or absent exact orchestrator"):
                 training_ops._repair_adapter_update()
         evidence.assert_not_called()
         deploy.assert_not_called()
+
+    def test_absent_orchestrator_is_recreated_after_inference_reload(self):
+        before = training_ops.Status(
+            trainer_up=True,
+            orch_up=False,
+            engines=[
+                training_ops.EngineState(
+                    host="h200a", gen_code="200", probes_ok=1, probes_total=1
+                ),
+                training_ops.EngineState(
+                    host="h200b", gen_code="200", probes_ok=1, probes_total=1
+                ),
+            ],
+        )
+        fan_results = iter(
+            [
+                {"h200a": (0, "idle"), "h200b": (0, "idle")},
+                {"h200a": (0, "stopped 0"), "h200b": (0, "stopped 0")},
+                {
+                    "h200a": (0, "adapter engine ready"),
+                    "h200b": (0, "adapter engine ready"),
+                },
+                {
+                    "h200a": (0, "restarted exact inference container"),
+                    "h200b": (0, "restarted exact inference container"),
+                },
+                {
+                    "h200a": (0, "adapter engine ready"),
+                    "h200b": (0, "adapter engine ready"),
+                },
+                {"h200a": (0, "idle"), "h200b": (0, "idle")},
+            ]
+        )
+        ssh_scripts = []
+
+        def fake_ssh(_host, script, timeout=120):
+            ssh_scripts.append(script)
+            if "configured orchestrator container state is unknown" in script:
+                return 0, "absent\n"
+            return 0, ""
+
+        with mock.patch.object(training_ops, "current_run", return_value="glm-1"), mock.patch.object(
+            training_ops, "status", return_value=before
+        ), mock.patch.object(
+            training_ops, "_adapter_stage_evidence", return_value="Failed to apply policy update 4"
+        ), mock.patch.object(
+            training_ops, "_fan", side_effect=lambda *_args, **_kwargs: next(fan_results)
+        ), mock.patch.object(training_ops, "deploy", return_value=True), mock.patch.object(
+            training_ops, "_ssh", side_effect=fake_ssh
+        ), mock.patch.object(
+            training_ops, "_ssh_address", side_effect=lambda host: f"addr-{host}"
+        ):
+            result = training_ops._repair_adapter_update()
+
+        self.assertIn("recreated exact orchestrator", result)
+        self.assertIn("[ absent = absent ]", ssh_scripts[-1])
+        self.assertIn('[ -z "$name" ]', ssh_scripts[-1])
 
     def test_repair_refuses_while_trainer_is_busy(self):
         before = training_ops.Status(
