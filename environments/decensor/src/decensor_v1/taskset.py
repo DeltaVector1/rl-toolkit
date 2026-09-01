@@ -374,6 +374,7 @@ class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
         for reason in (
             "truncated",
             "unclosed_think",
+            "invalid_think_tags",
             "zero_words",
             "no_reasoning",
             "forbidden_internal_tag",

@@ -122,7 +122,10 @@ def judge_correction_message(
             "correction_required": True,
             "phase": phase,
             "validation_error": str(error),
-            "previous_submission": previous_submission,
+            "previous_submission_summary": (
+                "The previous tool submission was rejected and must not be reused. "
+                f"It contained {len(previous_submission)} characters."
+            ),
             "instruction": (
                 "Submit the tool again. Keep the scores unless the error requires "
                 "a change. Select valid evidence IDs from the supplied source "
@@ -339,43 +342,56 @@ class EvidenceUnit:
 
 
 def build_evidence_units(document: str, maximum_characters: int = 600) -> list[EvidenceUnit]:
+    if maximum_characters < 1:
+        raise ValueError("maximum_characters must be positive")
     boundaries = [
         match.end()
         for match in re.finditer(r"[.!?]+(?=\s|$)|\n+", document)
     ]
     if not boundaries or boundaries[-1] < len(document):
         boundaries.append(len(document))
-    units: list[EvidenceUnit] = []
+
+    segments: list[tuple[int, int]] = []
     segment_start = 0
     for boundary in boundaries:
-        start = segment_start
-        end = boundary
+        segments.append((segment_start, boundary))
         segment_start = boundary
-        while start < end and document[start].isspace():
-            start += 1
-        while end > start and document[end - 1].isspace():
-            end -= 1
+
+    units: list[EvidenceUnit] = []
+
+    def add_chunks(start: int, end: int) -> None:
         while start < end:
             chunk_end = min(start + maximum_characters, end)
             if chunk_end < end:
                 space = document.rfind(" ", start, chunk_end + 1)
                 if space > start:
                     chunk_end = space
-            while chunk_end > start and document[chunk_end - 1].isspace():
-                chunk_end -= 1
             if chunk_end <= start:
                 chunk_end = min(start + maximum_characters, end)
-            units.append(
-                EvidenceUnit(
-                    evidence_id=len(units) + 1,
-                    start=start,
-                    end=chunk_end,
-                    text=document[start:chunk_end],
+            text = document[start:chunk_end]
+            if text.strip():
+                units.append(
+                    EvidenceUnit(
+                        evidence_id=len(units) + 1,
+                        start=start,
+                        end=chunk_end,
+                        text=text,
+                    )
                 )
-            )
             start = chunk_end
-            while start < end and document[start].isspace():
-                start += 1
+
+    combined_start: int | None = None
+    combined_end: int | None = None
+    for segment_start, segment_end in segments:
+        if combined_start is None:
+            combined_start, combined_end = segment_start, segment_end
+        elif segment_end - combined_start <= maximum_characters:
+            combined_end = segment_end
+        else:
+            add_chunks(combined_start, combined_end)
+            combined_start, combined_end = segment_start, segment_end
+    if combined_start is not None and combined_end is not None:
+        add_chunks(combined_start, combined_end)
     return units
 
 
@@ -425,6 +441,11 @@ async def _judge_completion(client: Any, config: Any, **kwargs: Any) -> Any:
             client.chat.completions.create(**kwargs),
             timeout=180.0,
         )
+
+
+def _tool_name(call: Any) -> str | None:
+    function = getattr(call, "function", None)
+    return getattr(function, "name", None)
 
 
 def build_turn_review_sources(
@@ -902,7 +923,7 @@ async def run_agentic_review(config: Any, source: ReviewSource) -> AgenticReview
                 },
                 parallel_tool_calls=False,
                 temperature=0.0,
-                max_tokens=4096,
+                max_tokens=1024,
                 **({"extra_body": extra_body} if extra_body else {}),
             )
             model_call_count += 1
@@ -914,7 +935,7 @@ async def run_agentic_review(config: Any, source: ReviewSource) -> AgenticReview
                     "model_call": model_call_count,
                     "phase": "visible_review",
                     "phase_attempt": phase_attempt,
-                    "tool_calls": [call.function.name for call in visible_calls],
+                    "tool_calls": [_tool_name(call) for call in visible_calls],
                     "usage": (
                         visible_usage.model_dump()
                         if visible_usage is not None
@@ -926,15 +947,13 @@ async def run_agentic_review(config: Any, source: ReviewSource) -> AgenticReview
                 },
             )
             try:
-                if (
-                    len(visible_calls) != 1
-                    or visible_calls[0].function.name != "submit_visible_review"
-                ):
+                visible_call = visible_calls[0] if len(visible_calls) == 1 else None
+                if _tool_name(visible_call) != "submit_visible_review":
                     visible_raw = str(visible_message.content or "")
                     raise ValueError(
                         "judge returned no single visible review tool call"
                     )
-                visible_raw = str(visible_calls[0].function.arguments)
+                visible_raw = str(visible_call.function.arguments)
                 candidate = VisibleReviewSubmission.model_validate_json(visible_raw)
                 if candidate.turn != source_turn.turn:
                     raise ValueError("visible review turn does not match source turn")
@@ -1010,7 +1029,7 @@ async def run_agentic_review(config: Any, source: ReviewSource) -> AgenticReview
                 },
                 parallel_tool_calls=False,
                 temperature=0.0,
-                max_tokens=4096,
+                max_tokens=1024,
                 **({"extra_body": extra_body} if extra_body else {}),
             )
             model_call_count += 1
@@ -1022,7 +1041,7 @@ async def run_agentic_review(config: Any, source: ReviewSource) -> AgenticReview
                     "model_call": model_call_count,
                     "phase": "reasoning_review",
                     "phase_attempt": phase_attempt,
-                    "tool_calls": [call.function.name for call in reasoning_calls],
+                    "tool_calls": [_tool_name(call) for call in reasoning_calls],
                     "usage": (
                         reasoning_usage.model_dump()
                         if reasoning_usage is not None
@@ -1034,16 +1053,15 @@ async def run_agentic_review(config: Any, source: ReviewSource) -> AgenticReview
                 }
             )
             try:
-                if (
-                    len(reasoning_calls) != 1
-                    or reasoning_calls[0].function.name
-                    != "submit_reasoning_review"
-                ):
+                reasoning_call = (
+                    reasoning_calls[0] if len(reasoning_calls) == 1 else None
+                )
+                if _tool_name(reasoning_call) != "submit_reasoning_review":
                     reasoning_raw = str(reasoning_message.content or "")
                     raise ValueError(
                         "judge returned no single reasoning review tool call"
                     )
-                reasoning_raw = str(reasoning_calls[0].function.arguments)
+                reasoning_raw = str(reasoning_call.function.arguments)
                 candidate = ReasoningReviewSubmission.model_validate_json(
                     reasoning_raw
                 )

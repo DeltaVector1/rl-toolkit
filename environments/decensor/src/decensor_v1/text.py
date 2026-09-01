@@ -47,9 +47,6 @@ ignored_words = {
     "would",
 }
 
-judge_text_limit = 12_000
-
-
 markdown_patterns = (
     re.compile(r"^\s{0,3}#{1,6}\s+", re.MULTILINE),
     re.compile(r"^\s{0,3}>\s+", re.MULTILINE),
@@ -179,11 +176,19 @@ def extract_message_reasoning_trace(message: Any) -> str:
 
 
 def has_unclosed_think(text: str) -> bool:
-    if not text:
-        return False
-    opens = len(re.findall(r"<think>", text, flags=re.IGNORECASE))
-    closes = len(re.findall(r"</think>", text, flags=re.IGNORECASE))
-    return opens > closes
+    return think_tag_rejection_reason(text) == "unclosed_think"
+
+
+def think_tag_rejection_reason(text: str) -> str | None:
+    tags = [
+        match.group(0).lower()
+        for match in re.finditer(r"</?think>", text or "", flags=re.IGNORECASE)
+    ]
+    if not tags or tags == ["</think>"] or tags == ["<think>", "</think>"]:
+        return None
+    if tags == ["<think>"]:
+        return "unclosed_think"
+    return "invalid_think_tags"
 
 
 def extract_completion_text(completion: Any) -> str:
@@ -228,8 +233,9 @@ def assistant_turn_response_rejection(
     message: Any, *, reasoning_required: bool
 ) -> str | None:
     content = message_content(message)
-    if has_unclosed_think(content):
-        return "unclosed_think"
+    tag_rejection = think_tag_rejection_reason(content)
+    if tag_rejection:
+        return tag_rejection
     visible_text = strip_think_tags(content)
 
     if not visible_text.strip():

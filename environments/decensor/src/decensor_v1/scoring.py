@@ -12,10 +12,10 @@ from decensor_v1.text import (
     extract_completion_text,
     extract_message_reasoning_trace,
     assistant_turn_response_rejection,
-    has_unclosed_think,
     message_content,
     reasoning_trace_quality,
     strip_think_tags,
+    think_tag_rejection_reason,
 )
 
 
@@ -90,8 +90,10 @@ def find_model_response_failure(
                 details["forbidden_tag"] = forbidden_tag
                 return "forbidden_internal_tag", details
 
-    if isinstance(completion, str) and has_unclosed_think(response_text_raw):
-        return "unclosed_think", details
+    if isinstance(completion, str):
+        tag_rejection = think_tag_rejection_reason(response_text_raw)
+        if tag_rejection:
+            return tag_rejection, details
 
     if reasoning_required:
         for turn in extract_all_assistant_messages(completion):

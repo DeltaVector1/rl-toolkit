@@ -7,7 +7,7 @@ from verifiers.v1.types import SamplingConfig as JudgeSamplingConfig
 
 class DecensorJudgeSampling(JudgeSamplingConfig):
     temperature: float = 0.0
-    max_tokens: int = 8192
+    max_tokens: int = 1024
 
 
 class DecensorJudgeConfig(JudgeConfig):
