@@ -96,20 +96,71 @@ def _reject_symlink_path(path: Path, label: str = "adapter path") -> None:
 
 
 def _ensure_directory(path: Path, label: str = "adapter directory") -> None:
-    _reject_symlink_path(path, label)
-    path.mkdir(parents=True, exist_ok=True)
-    _reject_symlink_path(path, label)
-    if not path.is_dir():
-        raise OSError(f"{label} is not a directory: {path}")
+    directory_fd = _open_directory_nofollow(path, create=True, label=label)
+    os.close(directory_fd)
 
 
-def _open_nofollow(path: Path, flags: int, mode: int = 0o600) -> int:
+def _open_directory_nofollow(
+    path: Path,
+    *,
+    create: bool,
+    label: str,
+) -> int:
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+    if not nofollow or not directory_flag:
+        raise OSError("adapter filesystem requires O_NOFOLLOW and O_DIRECTORY")
+    absolute = path if path.is_absolute() else Path.cwd() / path
+    flags = os.O_RDONLY | directory_flag | nofollow
+    try:
+        current_fd = os.open(absolute.anchor, flags)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise OSError(f"{label} is not a safe directory: {path}") from exc
+    try:
+        for component in absolute.parts[1:]:
+            try:
+                next_fd = os.open(component, flags, dir_fd=current_fd)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(component, 0o755, dir_fd=current_fd)
+                next_fd = os.open(component, flags, dir_fd=current_fd)
+            except NotADirectoryError as exc:
+                try:
+                    component_stat = os.stat(
+                        component,
+                        dir_fd=current_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    raise exc
+                if stat.S_ISLNK(component_stat.st_mode):
+                    raise OSError(f"{label} is a symbolic link: {path}") from exc
+                raise
+            os.close(current_fd)
+            current_fd = next_fd
+    except BaseException:
+        os.close(current_fd)
+        raise
+    return current_fd
+
+
+def _open_nofollow(
+    path: Path | str,
+    flags: int,
+    mode: int = 0o600,
+    *,
+    dir_fd: int | None = None,
+) -> int:
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     if not nofollow:
         raise OSError("adapter filesystem requires O_NOFOLLOW")
-    _reject_symlink_path(path)
+    if dir_fd is None:
+        _reject_symlink_path(Path(path))
     try:
-        file_descriptor = os.open(path, flags | nofollow, mode)
+        file_descriptor = os.open(path, flags | nofollow, mode, dir_fd=dir_fd)
     except OSError as exc:
         if exc.errno in {getattr(os, "ELOOP", 40), 40}:
             raise OSError(f"adapter path is a symbolic link: {path}") from exc
@@ -124,34 +175,125 @@ def _open_nofollow(path: Path, flags: int, mode: int = 0o600) -> int:
 
 
 def _write_text_atomic(path: Path, value: str, *, encoding: str) -> None:
-    _reject_symlink_path(path)
-    temporary = path.with_name(
-        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    parent_fd = _open_directory_nofollow(
+        path.parent,
+        create=False,
+        label="adapter file parent",
     )
-    _reject_symlink_path(temporary)
-    file_descriptor = _open_nofollow(
-        temporary,
-        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-    )
+    temporary_name = f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
     try:
-        with os.fdopen(file_descriptor, "wb") as output:
+        file_descriptor = _open_nofollow(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            dir_fd=parent_fd,
+        )
+        try:
+            output = os.fdopen(file_descriptor, "wb")
+        except BaseException:
+            os.close(file_descriptor)
+            raise
+        try:
             output.write(value.encode(encoding))
             output.flush()
             os.fsync(output.fileno())
+        finally:
+            output.close()
+        try:
+            existing = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None and stat.S_ISLNK(existing.st_mode):
+            raise OSError(f"adapter output is a symbolic link: {path}")
+        os.replace(
+            temporary_name,
+            path.name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
     except BaseException:
-        temporary.unlink(missing_ok=True)
+        try:
+            os.unlink(temporary_name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
         raise
-    _reject_symlink_path(path)
-    os.replace(temporary, path)
+    finally:
+        os.close(parent_fd)
 
 
-def _read_bytes_nofollow(path: Path) -> bytes:
-    with os.fdopen(_open_nofollow(path, os.O_RDONLY), "rb") as source:
+def _read_bytes_nofollow(path: Path | str, *, dir_fd: int | None = None) -> bytes:
+    with os.fdopen(_open_nofollow(path, os.O_RDONLY, dir_fd=dir_fd), "rb") as source:
         return source.read()
 
 
-def _read_text_nofollow(path: Path, *, encoding: str) -> str:
-    return _read_bytes_nofollow(path).decode(encoding)
+def _read_text_nofollow(
+    path: Path | str,
+    *,
+    encoding: str,
+    dir_fd: int | None = None,
+) -> str:
+    return _read_bytes_nofollow(path, dir_fd=dir_fd).decode(encoding)
+
+
+def _open_directory_entry_nofollow(parent_fd: int, name: str, label: str) -> int:
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+    if not nofollow or not directory_flag:
+        raise OSError("adapter filesystem requires O_NOFOLLOW and O_DIRECTORY")
+    try:
+        return os.open(
+            name,
+            os.O_RDONLY | directory_flag | nofollow,
+            dir_fd=parent_fd,
+        )
+    except OSError as exc:
+        if exc.errno in {getattr(os, "ELOOP", 40), 40}:
+            raise OSError(f"{label} is a symbolic link: {name}") from exc
+        raise
+
+
+def _ensure_directory_entry(parent_fd: int, name: str, label: str) -> int:
+    try:
+        return _open_directory_entry_nofollow(parent_fd, name, label)
+    except FileNotFoundError:
+        try:
+            os.mkdir(name, 0o755, dir_fd=parent_fd)
+        except FileExistsError:
+            pass
+        return _open_directory_entry_nofollow(parent_fd, name, label)
+
+
+def _directory_entry_has_marker(parent_fd: int, name: str, marker: str, label: str) -> bool:
+    entry_fd = _open_directory_entry_nofollow(parent_fd, name, label)
+    try:
+        try:
+            marker_fd = _open_nofollow(marker, os.O_RDONLY, dir_fd=entry_fd)
+        except FileNotFoundError:
+            return False
+        else:
+            os.close(marker_fd)
+            return True
+    finally:
+        os.close(entry_fd)
+
+
+def _remove_directory_entry(parent_fd: int, name: str, label: str) -> None:
+    directory_fd = _open_directory_entry_nofollow(parent_fd, name, label)
+    try:
+        for child_name in os.listdir(directory_fd):
+            child_stat = os.stat(
+                child_name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            if stat.S_ISLNK(child_stat.st_mode):
+                raise OSError(f"{label} contains a symbolic link: {child_name}")
+            if stat.S_ISDIR(child_stat.st_mode):
+                _remove_directory_entry(directory_fd, child_name, label)
+            else:
+                os.unlink(child_name, dir_fd=directory_fd)
+    finally:
+        os.close(directory_fd)
+    os.rmdir(name, dir_fd=parent_fd)
 
 
 def _configured_download_streams() -> int:
@@ -607,6 +749,7 @@ def _read_chunked_v1_manifest(
         if (
             not isinstance(name, str)
             or not name
+            or name in {".", ".."}
             or Path(name).name != name
             or name in {*_ADAPTER_FILES, _ADAPTER_MANIFEST}
             or name in seen_files
@@ -810,6 +953,7 @@ def _read_chunked_linear_manifest(
         if (
             not isinstance(name, str)
             or not name
+            or name in {".", ".."}
             or Path(name).name != name
             or name in {*_ADAPTER_FILES, _ADAPTER_MANIFEST}
             or name in seen_files
@@ -1233,9 +1377,23 @@ def adapter_stage_status() -> dict[str, object]:
         _reject_symlink_path(path, "adapter status path")
         with os.fdopen(_open_nofollow(path, os.O_RDONLY), "r", encoding="utf-8") as source:
             value = json.load(source)
-    except (FileNotFoundError, OSError, ValueError):
+    except FileNotFoundError:
         return {"status": "idle", "bytes_done": 0, "bytes_total": 0}
-    return value if isinstance(value, dict) else {"status": "idle", "bytes_done": 0, "bytes_total": 0}
+    except (OSError, ValueError) as exc:
+        return {
+            "status": "failed",
+            "bytes_done": 0,
+            "bytes_total": 0,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    if not isinstance(value, dict):
+        return {
+            "status": "failed",
+            "bytes_done": 0,
+            "bytes_total": 0,
+            "error": "ValueError: adapter status is not an object",
+        }
+    return value
 
 
 def _adapter_reader_lock(path: Path) -> Path:
@@ -1257,74 +1415,124 @@ def adapter_reader_lock(path: Path):
 
 def _cleanup_retired_adapters(cache_root: Path, active_name: str) -> None:
     prefix = f"{active_name}.retired-"
-    for candidate in cache_root.iterdir():
-        if not candidate.name.startswith(prefix):
-            continue
-        _reject_symlink_path(candidate, "retired adapter path")
-        if not candidate.is_dir():
-            continue
-        lock_path = _adapter_reader_lock(cache_root / active_name)
-        try:
-            with os.fdopen(_open_nofollow(lock_path, os.O_RDWR | os.O_CREAT), "a+") as lock:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                shutil.rmtree(candidate)
-                fcntl.flock(lock, fcntl.LOCK_UN)
-        except (BlockingIOError, FileNotFoundError):
-            # A vLLM load still has the old directory open. Leave it for the
-            # next stage; deleting it here would create stale open files.
-            continue
+    try:
+        cache_fd = _open_directory_nofollow(
+            cache_root,
+            create=False,
+            label="adapter cache directory",
+        )
+    except FileNotFoundError:
+        return
+    try:
+        for name in os.listdir(cache_fd):
+            if not name.startswith(prefix):
+                continue
+            try:
+                entry_stat = os.stat(name, dir_fd=cache_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(entry_stat.st_mode):
+                raise OSError(f"retired adapter path is a symbolic link: {name}")
+            if not stat.S_ISDIR(entry_stat.st_mode):
+                continue
+            lock_name = f".{active_name}.readers.lock"
+            try:
+                lock_fd = _open_nofollow(
+                    lock_name,
+                    os.O_RDWR | os.O_CREAT,
+                    dir_fd=cache_fd,
+                )
+                with os.fdopen(lock_fd, "a+") as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    _remove_directory_entry(cache_fd, name, "retired adapter path")
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+            except (BlockingIOError, FileNotFoundError):
+                continue
+    finally:
+        os.close(cache_fd)
 
 
 def _cleanup_previous_adapter_caches(cache_root: Path, active: Path) -> None:
     """Remove old adapters while retaining the active predecessor."""
-    if not cache_root.exists():
+    try:
+        cache_fd = _open_directory_nofollow(
+            cache_root,
+            create=False,
+            label="adapter cache directory",
+        )
+    except FileNotFoundError:
         return
 
-    ready_candidates: list[Path] = []
-    for candidate in cache_root.iterdir():
-        if candidate == active or re.fullmatch(r"[0-9a-f]{64}", candidate.name) is None:
-            continue
-        _reject_symlink_path(candidate, "cached adapter path")
-        if not candidate.is_dir():
-            continue
-        _reject_symlink_path(candidate / "READY", "cached adapter ready marker")
-        if not (candidate / "READY").is_file():
-            continue
-        ready_candidates.append(candidate)
-
-    keep = {active}
     try:
-        transport = json.loads(
-            _read_text_nofollow(active / "transport.json", encoding="utf-8")
-        )
-    except (FileNotFoundError, OSError, ValueError):
-        transport = None
-    base_url = transport.get("base_url") if isinstance(transport, dict) else None
-    if isinstance(base_url, str):
-        predecessor = adapter_cache_path(base_url)
-        if predecessor in ready_candidates:
-            keep.add(predecessor)
-    base2_url = transport.get("base2_url") if isinstance(transport, dict) else None
-    if isinstance(base2_url, str):
-        predecessor = adapter_cache_path(base2_url)
-        if predecessor in ready_candidates:
-            keep.add(predecessor)
+        active_name = active.name
+        ready_candidates: list[str] = []
+        for name in os.listdir(cache_fd):
+            if name == active_name or re.fullmatch(r"[0-9a-f]{64}", name) is None:
+                continue
+            try:
+                entry_stat = os.stat(name, dir_fd=cache_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(entry_stat.st_mode):
+                raise OSError(f"cached adapter path is a symbolic link: {name}")
+            if not stat.S_ISDIR(entry_stat.st_mode):
+                continue
+            candidate_fd = _open_directory_entry_nofollow(
+                cache_fd,
+                name,
+                "cached adapter path",
+            )
+            try:
+                try:
+                    ready_fd = _open_nofollow("READY", os.O_RDONLY, dir_fd=candidate_fd)
+                except FileNotFoundError:
+                    continue
+                else:
+                    os.close(ready_fd)
+                ready_candidates.append(name)
+            finally:
+                os.close(candidate_fd)
 
-    for candidate in ready_candidates:
-        if candidate in keep:
-            continue
+        keep = {active_name}
         try:
-            reader_lock_path = _adapter_reader_lock(candidate)
-            with os.fdopen(
-                _open_nofollow(reader_lock_path, os.O_RDWR | os.O_CREAT),
-                "a+",
-            ) as reader_lock:
-                fcntl.flock(reader_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                if candidate.exists() and (candidate / "READY").is_file():
-                    shutil.rmtree(candidate)
-                fcntl.flock(reader_lock, fcntl.LOCK_UN)
-        except (BlockingIOError, FileNotFoundError):
-            continue
+            active_fd = _open_directory_entry_nofollow(
+                cache_fd,
+                active_name,
+                "active adapter path",
+            )
+            try:
+                transport = json.loads(
+                    _read_text_nofollow("transport.json", encoding="utf-8", dir_fd=active_fd)
+                )
+            finally:
+                os.close(active_fd)
+        except (FileNotFoundError, OSError, ValueError):
+            transport = None
+        for key in ("base_url", "base2_url"):
+            predecessor_url = transport.get(key) if isinstance(transport, dict) else None
+            if isinstance(predecessor_url, str):
+                predecessor_name = adapter_cache_path(predecessor_url).name
+                if predecessor_name in ready_candidates:
+                    keep.add(predecessor_name)
+
+        for name in ready_candidates:
+            if name in keep:
+                continue
+            try:
+                lock_name = f".{name}.readers.lock"
+                lock_fd = _open_nofollow(
+                    lock_name,
+                    os.O_RDWR | os.O_CREAT,
+                    dir_fd=cache_fd,
+                )
+                with os.fdopen(lock_fd, "a+") as reader_lock:
+                    fcntl.flock(reader_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    _remove_directory_entry(cache_fd, name, "cached adapter path")
+                    fcntl.flock(reader_lock, fcntl.LOCK_UN)
+            except (BlockingIOError, FileNotFoundError):
+                continue
+    finally:
+        os.close(cache_fd)
 
 
 def _download_range(
@@ -3046,16 +3254,31 @@ def full_checkpoint_cache_path(source_url: str) -> Path:
 def prune_full_checkpoint_cache(cache_root: Path, keep: Path) -> list[Path]:
     """Remove checkpoint directories that are older than the policy being staged."""
     removed: list[Path] = []
-    _reject_symlink_path(cache_root, "full checkpoint cache directory")
-    if not cache_root.exists():
+    try:
+        cache_fd = _open_directory_nofollow(
+            cache_root,
+            create=False,
+            label="full checkpoint cache directory",
+        )
+    except FileNotFoundError:
         return removed
     keep_names = {keep.name, f"{keep.name}.partial"}
-    for candidate in cache_root.iterdir():
-        _reject_symlink_path(candidate, "full checkpoint cache entry")
-        if not candidate.is_dir() or candidate.name in keep_names:
-            continue
-        shutil.rmtree(candidate)
-        removed.append(candidate)
+    try:
+        for name in os.listdir(cache_fd):
+            if name in keep_names:
+                continue
+            try:
+                entry_stat = os.stat(name, dir_fd=cache_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(entry_stat.st_mode):
+                raise OSError(f"full checkpoint cache entry is a symbolic link: {name}")
+            if not stat.S_ISDIR(entry_stat.st_mode):
+                continue
+            _remove_directory_entry(cache_fd, name, "full checkpoint cache entry")
+            removed.append(cache_root / name)
+    finally:
+        os.close(cache_fd)
     return removed
 
 
@@ -3066,88 +3289,149 @@ def stage_full_checkpoint_files(source_url: str) -> Path:
     _reject_symlink_path(destination, "full checkpoint destination")
     temporary = destination.with_name(f"{destination.name}.partial")
     _reject_symlink_path(temporary, "full checkpoint partial directory")
-    lock_path = destination.parent / f"{destination.name}.lock"
-    with os.fdopen(
-        _open_nofollow(lock_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC),
-        "w",
-    ) as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        _reject_symlink_path(destination / "READY", "full checkpoint ready marker")
-        if (destination / "READY").exists():
-            return destination
-        _ensure_directory(temporary, "full checkpoint partial directory")
-        index_name = "model.safetensors.index.json"
-        used_delta = False
-        try:
-            with urllib.request.urlopen(
-                f"{source_url.rstrip('/')}/{DELTA_MANIFEST}", timeout=60
-            ) as response:
-                delta_manifest = json.load(response)
-        except HTTPError as exc:
-            if exc.code != 404:
-                raise
-            delta_manifest = None
+    cache_fd = _open_directory_nofollow(
+        destination.parent,
+        create=False,
+        label="full checkpoint cache directory",
+    )
+    try:
+        lock_name = f"{destination.name}.lock"
+        with os.fdopen(
+            _open_nofollow(
+                lock_name,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                dir_fd=cache_fd,
+            ),
+            "w",
+        ) as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                if _directory_entry_has_marker(
+                    cache_fd,
+                    destination.name,
+                    "READY",
+                    "full checkpoint destination",
+                ):
+                    return destination
+            except FileNotFoundError:
+                pass
+            temporary_fd = _ensure_directory_entry(
+                cache_fd,
+                temporary.name,
+                "full checkpoint partial directory",
+            )
+            os.close(temporary_fd)
+            index_name = "model.safetensors.index.json"
+            used_delta = False
+            try:
+                with urllib.request.urlopen(
+                    f"{source_url.rstrip('/')}/{DELTA_MANIFEST}", timeout=60
+                ) as response:
+                    delta_manifest = json.load(response)
+            except HTTPError as exc:
+                if exc.code != 404:
+                    raise
+                delta_manifest = None
 
-        if isinstance(delta_manifest, dict) and delta_manifest.get("version") == 1:
-            base_url = delta_manifest.get("base_url")
-            if (
-                delta_manifest.get("target_url") == source_url
-                and isinstance(base_url, str)
-            ):
-                base_dir = full_checkpoint_cache_path(base_url)
-                if (base_dir / "READY").exists():
-                    files = delta_manifest.get("files")
-                    if not isinstance(files, list) or not files:
-                        raise OSError("delta manifest has no checkpoint files")
-                    for spec in files:
-                        filename = spec.get("filename")
-                        delta_name = spec.get("delta")
-                        if (
-                            not isinstance(filename, str)
-                            or Path(filename).name != filename
-                            or not filename.endswith(".safetensors")
-                            or not isinstance(delta_name, str)
-                            or Path(delta_name).name != delta_name
-                        ):
-                            raise OSError("unsafe checkpoint delta filename")
-                        delta_path = temporary / delta_name
-                        _reject_symlink_path(delta_path, "full checkpoint delta file")
-                        download(f"{source_url.rstrip('/')}/{delta_name}", delta_path)
-                        output_path = temporary / filename
-                        _reject_symlink_path(output_path, "full checkpoint shard")
-                        apply_xor_delta_file(
-                            base_dir / filename,
-                            delta_path,
-                            output_path,
-                            expected_size=int(spec["size"]),
-                            expected_sha256=str(spec["sha256"]),
+            if isinstance(delta_manifest, dict) and delta_manifest.get("version") == 1:
+                base_url = delta_manifest.get("base_url")
+                if (
+                    delta_manifest.get("target_url") == source_url
+                    and isinstance(base_url, str)
+                ):
+                    base_dir = full_checkpoint_cache_path(base_url)
+                    _reject_symlink_path(base_dir, "full checkpoint base directory")
+                    _reject_symlink_path(base_dir / "READY", "full checkpoint base ready marker")
+                    try:
+                        base_ready = _directory_entry_has_marker(
+                            cache_fd,
+                            base_dir.name,
+                            "READY",
+                            "full checkpoint base directory",
                         )
-                        _reject_symlink_path(delta_path, "full checkpoint delta file")
-                        delta_path.unlink()
-                    index_path = temporary / index_name
-                    download(f"{source_url.rstrip('/')}/{index_name}", index_path)
-                    if sha256_file(index_path) != delta_manifest.get("index_sha256"):
-                        raise OSError("checkpoint index checksum mismatch")
-                    used_delta = True
+                    except FileNotFoundError:
+                        base_ready = False
+                    if base_ready:
+                        files = delta_manifest.get("files")
+                        if not isinstance(files, list) or not files:
+                            raise OSError("delta manifest has no checkpoint files")
+                        for spec in files:
+                            filename = spec.get("filename")
+                            delta_name = spec.get("delta")
+                            if (
+                                not isinstance(filename, str)
+                                or Path(filename).name != filename
+                                or not filename.endswith(".safetensors")
+                                or not isinstance(delta_name, str)
+                                or Path(delta_name).name != delta_name
+                            ):
+                                raise OSError("unsafe checkpoint delta filename")
+                            delta_path = temporary / delta_name
+                            _reject_symlink_path(delta_path, "full checkpoint delta file")
+                            download(f"{source_url.rstrip('/')}/{delta_name}", delta_path)
+                            output_path = temporary / filename
+                            _reject_symlink_path(output_path, "full checkpoint shard")
+                            _reject_symlink_path(
+                                base_dir / filename,
+                                "full checkpoint base shard",
+                            )
+                            apply_xor_delta_file(
+                                base_dir / filename,
+                                delta_path,
+                                output_path,
+                                expected_size=int(spec["size"]),
+                                expected_sha256=str(spec["sha256"]),
+                            )
+                            _reject_symlink_path(delta_path, "full checkpoint delta file")
+                            delta_path.unlink()
+                        index_path = temporary / index_name
+                        download(f"{source_url.rstrip('/')}/{index_name}", index_path)
+                        if sha256_file(index_path) != delta_manifest.get("index_sha256"):
+                            raise OSError("checkpoint index checksum mismatch")
+                        used_delta = True
 
-        if not used_delta:
-            index_path = temporary / index_name
-            download(f"{source_url.rstrip('/')}/{index_name}", index_path)
-            with os.fdopen(_open_nofollow(index_path, os.O_RDONLY), "r", encoding="utf-8") as source:
-                index = json.load(source)
-            shard_names = sorted(set(index["weight_map"].values()))
-            if not shard_names:
-                raise OSError("full checkpoint index contains no weight shards")
-            for filename in shard_names:
-                if Path(filename).name != filename or not filename.endswith(".safetensors"):
-                    raise OSError(f"unsafe checkpoint shard name: {filename!r}")
-                download(f"{source_url.rstrip('/')}/{filename}", temporary / filename)
-        _write_text_atomic(temporary / "READY", "ready\n", encoding="utf-8")
-        shutil.rmtree(destination, ignore_errors=True)
-        temporary.rename(destination)
-        # Keep the old policy until the replacement is complete. Generation
-        # still uses it while staging, and a lossless delta needs its files.
-        prune_full_checkpoint_cache(destination.parent, destination)
+            if not used_delta:
+                index_path = temporary / index_name
+                download(f"{source_url.rstrip('/')}/{index_name}", index_path)
+                with os.fdopen(
+                    _open_nofollow(index_path, os.O_RDONLY),
+                    "r",
+                    encoding="utf-8",
+                ) as source:
+                    index = json.load(source)
+                shard_names = sorted(set(index["weight_map"].values()))
+                if not shard_names:
+                    raise OSError("full checkpoint index contains no weight shards")
+                for filename in shard_names:
+                    if Path(filename).name != filename or not filename.endswith(".safetensors"):
+                        raise OSError(f"unsafe checkpoint shard name: {filename!r}")
+                    download(f"{source_url.rstrip('/')}/{filename}", temporary / filename)
+            _write_text_atomic(temporary / "READY", "ready\n", encoding="utf-8")
+            try:
+                _open_directory_entry_nofollow(
+                    cache_fd,
+                    destination.name,
+                    "full checkpoint destination",
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                _remove_directory_entry(
+                    cache_fd,
+                    destination.name,
+                    "full checkpoint destination",
+                )
+            os.replace(
+                temporary.name,
+                destination.name,
+                src_dir_fd=cache_fd,
+                dst_dir_fd=cache_fd,
+            )
+            # Keep the old policy until the replacement is complete. Generation
+            # still uses it while staging, and a lossless delta needs its files.
+            prune_full_checkpoint_cache(destination.parent, destination)
+    finally:
+        os.close(cache_fd)
     return destination
 
 

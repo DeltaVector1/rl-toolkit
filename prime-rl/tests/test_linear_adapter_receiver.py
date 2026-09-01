@@ -48,6 +48,45 @@ def load_filesystem():
 
 
 class LinearAdapterReceiverTest(unittest.TestCase):
+    def test_v1_manifest_rejects_empty_and_dot_chunk_names(self):
+        filesystem = load_filesystem()
+        manifest = {
+            "version": 1,
+            "kind": "lora-adapter",
+            "mode": "delta",
+            "transport": "chunked-shuffled-xor-zstd",
+            "target_step": 2,
+            "base_step": 1,
+            "base_sha256": "a" * 64,
+            "target_sha256": "b" * 64,
+            "full_sha256": "b" * 64,
+            "target_size": 8,
+            "full_size": 8,
+            "config_sha256": "c" * 64,
+            "config_size": 0,
+            "base_config_sha256": "d" * 64,
+            "chunks": [
+                {
+                    "file": "chunk-0",
+                    "offset": 0,
+                    "raw_size": 8,
+                    "wire_size": 8,
+                    "wire_sha256": "e" * 64,
+                    "raw_sha256": "f" * 64,
+                    "codec": "zstd",
+                }
+            ],
+        }
+        old_reader = filesystem._read_source_text
+        filesystem._read_source_text = lambda *_args, **_kwargs: json.dumps(manifest)
+        try:
+            for invalid_name in ("", ".", ".."):
+                manifest["chunks"][0]["file"] = invalid_name
+                with self.assertRaisesRegex(OSError, "identity is invalid"):
+                    filesystem._read_chunked_v1_manifest("http://source/step_2")
+        finally:
+            filesystem._read_source_text = old_reader
+
     def test_manifest_requires_two_adjacent_bases_and_even_coverage(self):
         filesystem = load_filesystem()
         self.assertEqual(filesystem._PREDICTIVE_RECONSTRUCT_WORKERS, 32)
@@ -113,6 +152,11 @@ class LinearAdapterReceiverTest(unittest.TestCase):
             self.assertEqual(parsed["base_config_size"], len(config))
             self.assertEqual(parsed["base2_config_size"], len(config))
             self.assertEqual(parsed["chunks"][0]["data_offset"], 2)
+            for invalid_name in ("", ".", ".."):
+                manifest["chunks"][0]["file"] = invalid_name
+                with self.assertRaisesRegex(OSError, "identity is invalid"):
+                    filesystem._read_chunked_linear_manifest("http://source/step_2")
+            manifest["chunks"][0]["file"] = "chunk-0"
             manifest["chunks"][0]["data_offset"] = 0
             with self.assertRaisesRegex(OSError, "identity is invalid"):
                 filesystem._read_chunked_linear_manifest("http://source/step_2")
@@ -411,6 +455,37 @@ class LinearAdapterReceiverTest(unittest.TestCase):
             else:
                 os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
             filesystem._verified_adapter_base = old_base
+
+    def test_status_reports_filesystem_failures(self):
+        filesystem = load_filesystem()
+        old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
+        try:
+            with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryDirectory() as external:
+                os.environ["PRIME_LORA_CACHE_DIR"] = temporary
+                status_path = Path(temporary) / ".adapter-stage-status.json"
+                status_path.symlink_to(Path(external), target_is_directory=True)
+                status = filesystem.adapter_stage_status()
+                self.assertEqual(status["status"], "failed")
+                self.assertIn("symbolic link", status["error"])
+                status_path.unlink()
+                status_path.write_text("not json", encoding="utf-8")
+                self.assertEqual(filesystem.adapter_stage_status()["status"], "failed")
+        finally:
+            if old_cache is None:
+                os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+            else:
+                os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+
+    def test_cache_cleanup_rejects_a_symlinked_cache_root(self):
+        filesystem = load_filesystem()
+        with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryDirectory() as external:
+            cache_root = Path(temporary) / "cache"
+            cache_root.symlink_to(external, target_is_directory=True)
+            with self.assertRaisesRegex(OSError, "symbolic link"):
+                filesystem._cleanup_previous_adapter_caches(
+                    cache_root,
+                    cache_root / "active",
+                )
 
 
 if __name__ == "__main__":

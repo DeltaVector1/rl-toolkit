@@ -1,8 +1,10 @@
 import importlib.util
+import hashlib
 import json
 import struct
 import tempfile
 import unittest
+import zlib
 from pathlib import Path
 
 import numpy as np
@@ -14,6 +16,15 @@ SPEC = importlib.util.spec_from_file_location("predictive_adapter_delta", MODULE
 assert SPEC is not None and SPEC.loader is not None
 adapter_delta = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(adapter_delta)
+
+CHECKPOINT_DELTA_PATH = ROOT / "src/prime_rl/utils/checkpoint_delta.py"
+CHECKPOINT_DELTA_SPEC = importlib.util.spec_from_file_location(
+    "checkpoint_delta_safety",
+    CHECKPOINT_DELTA_PATH,
+)
+assert CHECKPOINT_DELTA_SPEC is not None and CHECKPOINT_DELTA_SPEC.loader is not None
+checkpoint_delta = importlib.util.module_from_spec(CHECKPOINT_DELTA_SPEC)
+CHECKPOINT_DELTA_SPEC.loader.exec_module(checkpoint_delta)
 
 
 def safetensor_bytes(words: list[int]) -> bytes:
@@ -40,6 +51,140 @@ def valid_safetensor_bytes(words: list[int], dtype: str = "BF16") -> bytes:
 
 
 class PredictiveAdapterCodecTest(unittest.TestCase):
+    def test_build_checkpoint_delta_round_trip(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            base = root / "base"
+            target = root / "target"
+            base.mkdir()
+            target.mkdir()
+            index = {"weight_map": {"x": "shard.safetensors"}}
+            (base / "model.safetensors.index.json").write_text(json.dumps(index), encoding="utf-8")
+            (target / "model.safetensors.index.json").write_text(json.dumps(index), encoding="utf-8")
+            base_bytes = bytes(range(32))
+            target_bytes = bytes(range(32, 64))
+            (base / "shard.safetensors").write_bytes(base_bytes)
+            (target / "shard.safetensors").write_bytes(target_bytes)
+
+            manifest_path = checkpoint_delta.build_xor_delta_checkpoint(
+                base,
+                target,
+                base_url="http://source/base",
+                target_url="http://source/target",
+            )
+            self.assertEqual(manifest_path, target / checkpoint_delta.DELTA_MANIFEST)
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            restored = root / "restored"
+            restored.mkdir()
+            checkpoint_delta.apply_xor_delta_file(
+                base / "shard.safetensors",
+                target / manifest["files"][0]["delta"],
+                restored / "shard.safetensors",
+                expected_size=len(target_bytes),
+                expected_sha256=hashlib.sha256(target_bytes).hexdigest(),
+            )
+            self.assertEqual((restored / "shard.safetensors").read_bytes(), target_bytes)
+
+    def test_checkpoint_delta_round_trip_uses_the_target_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            base = root / "base"
+            delta = root / "delta"
+            target = root / "target"
+            base.mkdir()
+            delta.mkdir()
+            target.mkdir()
+            base_bytes = bytes(range(16))
+            target_bytes = bytes(range(16, 32))
+            base_file = base / "shard.safetensors"
+            delta_file = delta / "shard.xor.zlib"
+            target_file = target / "shard.safetensors"
+            base_file.write_bytes(base_bytes)
+            delta_file.write_bytes(
+                zlib.compress(checkpoint_delta._xor_bytes(base_bytes, target_bytes))
+            )
+            checkpoint_delta.apply_xor_delta_file(
+                base_file,
+                delta_file,
+                target_file,
+                expected_size=len(target_bytes),
+                expected_sha256=hashlib.sha256(target_bytes).hexdigest(),
+            )
+            self.assertEqual(target_file.read_bytes(), target_bytes)
+
+    def test_checkpoint_delta_rejects_symlink_inputs_and_outputs(self):
+        with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryDirectory() as external:
+            root = Path(temporary)
+            outside = Path(external, "outside")
+            outside.write_bytes(b"outside")
+            base = root / "base"
+            delta = root / "delta"
+            target = root / "target"
+            base.write_bytes(b"base")
+            delta.write_bytes(zlib.compress(checkpoint_delta._xor_bytes(b"base", b"out!")))
+
+            base.unlink()
+            base.symlink_to(outside)
+            with self.assertRaisesRegex(OSError, "checkpoint base file is a symbolic link"):
+                checkpoint_delta.apply_xor_delta_file(
+                    base,
+                    delta,
+                    target,
+                    expected_size=4,
+                    expected_sha256=hashlib.sha256(b"out!").hexdigest(),
+                )
+            base.unlink()
+            base.write_bytes(b"base")
+
+            delta.unlink()
+            delta.symlink_to(outside)
+            with self.assertRaisesRegex(OSError, "checkpoint delta file is a symbolic link"):
+                checkpoint_delta.apply_xor_delta_file(
+                    base,
+                    delta,
+                    target,
+                    expected_size=4,
+                    expected_sha256=hashlib.sha256(b"out!").hexdigest(),
+                )
+            delta.unlink()
+            delta.write_bytes(zlib.compress(checkpoint_delta._xor_bytes(b"base", b"out!")))
+
+            target.symlink_to(outside)
+            with self.assertRaisesRegex(OSError, "checkpoint target file is a symbolic link"):
+                checkpoint_delta.apply_xor_delta_file(
+                    base,
+                    delta,
+                    target,
+                    expected_size=4,
+                    expected_sha256=hashlib.sha256(b"out!").hexdigest(),
+                )
+            target.unlink()
+
+            assembling = target.with_name("target.assembling")
+            assembling.symlink_to(outside)
+            with self.assertRaisesRegex(OSError, "temporary file is a symbolic link"):
+                checkpoint_delta.apply_xor_delta_file(
+                    base,
+                    delta,
+                    target,
+                    expected_size=4,
+                    expected_sha256="0" * 64,
+                )
+            assembling.unlink()
+            self.assertEqual(outside.read_bytes(), b"outside")
+
+            target_parent = root / "target-parent"
+            target_parent.symlink_to(external, target_is_directory=True)
+            with self.assertRaisesRegex(OSError, "symbolic link"):
+                checkpoint_delta.apply_xor_delta_file(
+                    base,
+                    delta,
+                    target_parent / "target",
+                    expected_size=4,
+                    expected_sha256="0" * 64,
+                )
+            self.assertFalse((Path(external) / "target").exists())
+
     def test_predictive_chunk_round_trip_includes_header_and_bf16_data(self):
         base2 = safetensor_bytes([0x3F80, 0x4000, 0x4040, 0x4080])
         base1 = safetensor_bytes([0x4000, 0x4040, 0x4080, 0x40A0])
