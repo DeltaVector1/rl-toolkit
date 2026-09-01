@@ -143,10 +143,16 @@ def inference_weight_path(config: OrchestratorConfig, weights_path, lora_name: s
     )
 
 
-def _read_adapter_manifest(path, source_url: str | None, timeout: float | int | None) -> tuple[dict[str, object], str]:
+def _read_adapter_manifest(
+    path,
+    source_url: str | None,
+    timeout: float | int | None,
+    *,
+    prefer_remote: bool = False,
+) -> tuple[dict[str, object], str]:
     """Read a published adapter manifest from local storage or its source URL."""
     manifest_path = path / "adapter_manifest.json"
-    if source_url is None or manifest_path.is_file():
+    if source_url is None or (manifest_path.is_file() and not prefer_remote):
         try:
             with manifest_path.open("r", encoding="utf-8") as source:
                 manifest = json.load(source)
@@ -363,6 +369,7 @@ class WeightWatcher:
                 local_weights_path,
                 target_url if isinstance(target_url, str) else None,
                 _delta_stage_timeout_s(),
+                prefer_remote=True,
             )
         except RuntimeError as exc:
             raise RuntimeError(

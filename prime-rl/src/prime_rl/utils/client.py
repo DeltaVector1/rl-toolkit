@@ -698,10 +698,10 @@ async def stage_lora_adapter(
                 response = await probe.get(
                     f"{lora_path_posix.rstrip('/')}/adapter_manifest.json",
                     timeout=httpx.Timeout(
-                        connect=min(10.0, remaining),
-                        read=min(10.0, remaining),
-                        write=min(10.0, remaining),
-                        pool=min(10.0, remaining),
+                        connect=remaining,
+                        read=remaining,
+                        write=remaining,
+                        pool=remaining,
                     ),
                 )
                 response.raise_for_status()

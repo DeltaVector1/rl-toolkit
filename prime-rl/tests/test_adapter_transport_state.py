@@ -61,6 +61,19 @@ def load_watcher_delta_method(urlopen):
     return namespace["_adapter_delta_base"]
 
 
+def load_manifest_reader(urlopen):
+    path = ROOT / "src/prime_rl/orchestrator/watcher.py"
+    source = path.read_text(encoding="utf-8")
+    function = next(
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef) and node.name == "_read_adapter_manifest"
+    )
+    namespace = {"json": json, "urlopen": urlopen}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)
+    return namespace["_read_adapter_manifest"]
+
+
 def load_filesystem_module():
     path = ROOT / "src/prime_rl/inference/vllm/worker/filesystem.py"
     module_name = "filesystem_sidecar_test"
@@ -233,6 +246,48 @@ class AdapterTransportStateTest(unittest.TestCase):
             self.assertEqual(result, f"{target_url}/adapter_manifest.json")
             self.assertEqual(watcher.last_adapter_delta_build_time, 2.5)
             self.assertEqual(calls, [(f"{target_url}/adapter_manifest.json", 30)])
+
+    def test_remote_manifest_is_used_when_local_manifest_is_old_version(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            local_manifest = {
+                "version": 1,
+                "transport": "chunked-shuffled-xor-zstd",
+            }
+            remote_manifest = {
+                "version": 2,
+                "transport": "chunked-bf16-linear-zigzag-sparse-zstd",
+            }
+            (root / "adapter_manifest.json").write_text(
+                json.dumps(local_manifest), encoding="utf-8"
+            )
+            calls = []
+
+            class Response(io.BytesIO):
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_args):
+                    self.close()
+
+            def fake_urlopen(url, timeout):
+                calls.append((url, timeout))
+                return Response(json.dumps(remote_manifest).encode("utf-8"))
+
+            reader = load_manifest_reader(fake_urlopen)
+            manifest, location = reader(
+                root,
+                "http://source/step_2",
+                30,
+                prefer_remote=True,
+            )
+
+            self.assertEqual(manifest, remote_manifest)
+            self.assertEqual(location, "http://source/step_2/adapter_manifest.json")
+            self.assertEqual(
+                calls,
+                [("http://source/step_2/adapter_manifest.json", 30)],
+            )
 
     def test_bootstrap_does_not_duplicate_the_full_adapter(self):
         with tempfile.TemporaryDirectory() as temporary:

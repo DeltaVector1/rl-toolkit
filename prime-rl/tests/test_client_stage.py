@@ -32,6 +32,8 @@ class _ManifestProbeResponse:
 
 
 class _ManifestProbeClient:
+    requests = []
+
     def __init__(self, version):
         self.version = version
 
@@ -42,6 +44,7 @@ class _ManifestProbeClient:
         return None
 
     async def get(self, *_args, **_kwargs):
+        self.requests.append(_kwargs["timeout"])
         return _ManifestProbeResponse(self.version)
 
 
@@ -252,6 +255,7 @@ class StageLoraAdapterTest(unittest.TestCase):
         self.assertLessEqual(peer_request["timeout_s"], 0.15)
 
     def test_predictive_origin_and_peer_stage_concurrently(self):
+        _ManifestProbeClient.requests.clear()
         stage_lora_adapter, namespace = _load_stage_function(probe_version=2)
         calls = []
 
@@ -281,6 +285,9 @@ class StageLoraAdapterTest(unittest.TestCase):
         self.assertEqual(result["origin_host_count"], 1)
         self.assertEqual(result["peer_host_count"], 1)
         self.assertLess(result["wire_stage_seconds"], 0.10)
+        self.assertEqual(len(_ManifestProbeClient.requests), 1)
+        self.assertGreater(_ManifestProbeClient.requests[0].read, 10.0)
+        self.assertLessEqual(_ManifestProbeClient.requests[0].read, 30.0)
 
 
 if __name__ == "__main__":
