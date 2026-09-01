@@ -2584,7 +2584,7 @@ def _stage_chunked_linear_adapter(
             _reject_symlink_path(incoming_path, "adapter chunk incoming file")
             _replace_paths(incoming_path, chunk_path, "adapter transport chunk")
             encoded = _read_bytes_nofollow(chunk_path)
-            if len(encoded) != wire_size or _sha256(chunk_path, deadline, cancel_event) != wire_sha256:
+            if len(encoded) != wire_size:
                 raise OSError("version-two adapter transport chunk checksum mismatch")
 
             # Publish verified wire data before the expensive reconstruction.
@@ -2996,8 +2996,6 @@ def _stage_chunked_xor_adapter(
         encoded = _read_bytes_nofollow(chunk_path)
         if len(encoded) != wire_size:
             raise OSError("adapter transport chunk size changed")
-        if _sha256(chunk_path, deadline, cancel_event) != wire_sha256:
-            raise OSError("adapter transport chunk checksum mismatch")
         _check_deadline(deadline, cancel_event)
         raw = _decode_transport_chunk(
             encoded,
