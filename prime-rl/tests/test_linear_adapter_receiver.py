@@ -461,6 +461,97 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                 os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
             filesystem._verified_adapter_base = old_base
 
+    def test_partial_cleanup_does_not_remove_a_swapped_directory(self):
+        filesystem = load_filesystem()
+        original_read = filesystem._read_text_nofollow
+        original_open = filesystem._open_directory_nofollow
+        try:
+            for version in ("v1", "v2"):
+                identity_name = "transport-manifest.json"
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    cache = root / "cache"
+                    cache.mkdir()
+                    partial = cache / "adapter.partial"
+                    partial.mkdir()
+                    (partial / identity_name).write_text("old", encoding="utf-8")
+                    (partial / "private-marker").write_text("private", encoding="utf-8")
+                    external = root / "external"
+                    external.mkdir()
+                    marker = external / "must-survive"
+                    marker.write_text("keep", encoding="utf-8")
+                    swapped = False
+
+                    def swap_after_identity_read(path, *args, **kwargs):
+                        nonlocal swapped
+                        value = original_read(path, *args, **kwargs)
+                        if path == identity_name and not swapped:
+                            swapped = True
+                            original_partial = root / "original-partial"
+                            partial.rename(original_partial)
+                            external.rename(partial)
+                        return value
+
+                    filesystem._read_text_nofollow = swap_after_identity_read
+                    with self.assertRaisesRegex(OSError, "replaced during cleanup"):
+                        filesystem._reset_staging_directory_identity(
+                            partial,
+                            identity_name,
+                            "new",
+                            f"{version} adapter partial directory",
+                        )
+                    self.assertTrue(swapped)
+                    self.assertEqual(
+                        (partial / "must-survive").read_text(encoding="utf-8"),
+                        "keep",
+                    )
+        finally:
+            filesystem._read_text_nofollow = original_read
+            filesystem._open_directory_nofollow = original_open
+
+    def test_replace_paths_keeps_both_ends_in_the_held_directory(self):
+        filesystem = load_filesystem()
+        original_open = filesystem._open_directory_nofollow
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                cache = root / "cache"
+                cache.mkdir()
+                incoming = cache / "incoming"
+                incoming.write_bytes(b"private adapter")
+                external = root / "external"
+                external.mkdir()
+                (external / "must-survive").write_text("keep", encoding="utf-8")
+                swapped = False
+
+                def swap_after_parent_open(path, *args, **kwargs):
+                    nonlocal swapped
+                    descriptor = original_open(path, *args, **kwargs)
+                    if Path(path) == cache and not swapped:
+                        swapped = True
+                        cache.rename(root / "original-cache")
+                        external.rename(cache)
+                    return descriptor
+
+                filesystem._open_directory_nofollow = swap_after_parent_open
+                filesystem._replace_paths(
+                    incoming,
+                    cache / "published",
+                    "adapter publish",
+                )
+                self.assertTrue(swapped)
+                self.assertEqual(
+                    (root / "original-cache" / "published").read_bytes(),
+                    b"private adapter",
+                )
+                self.assertFalse((cache / "published").exists())
+                self.assertEqual(
+                    (cache / "must-survive").read_text(encoding="utf-8"),
+                    "keep",
+                )
+        finally:
+            filesystem._open_directory_nofollow = original_open
+
     def test_status_reports_filesystem_failures(self):
         filesystem = load_filesystem()
         old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")

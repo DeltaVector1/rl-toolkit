@@ -112,6 +112,119 @@ class PredictiveAdapterCodecTest(unittest.TestCase):
             )
             self.assertEqual(target_file.read_bytes(), target_bytes)
 
+    def test_checkpoint_delta_keeps_output_in_the_held_cache_tree(self):
+        original_open = checkpoint_delta._open_directory_nofollow
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary) / "cache"
+                root.mkdir()
+                base_dir = root / "base"
+                delta_dir = root / "delta"
+                target_dir = root / "target"
+                base_dir.mkdir()
+                delta_dir.mkdir()
+                target_dir.mkdir()
+                base_bytes = b"base"
+                target_bytes = b"out!"
+                base_file = base_dir / "shard.safetensors"
+                delta_file = delta_dir / "shard.xor.zlib"
+                target_file = target_dir / "shard.safetensors"
+                base_file.write_bytes(base_bytes)
+                delta_file.write_bytes(
+                    zlib.compress(checkpoint_delta._xor_bytes(base_bytes, target_bytes))
+                )
+
+                external_root = Path(temporary) / "external"
+                external_root.mkdir()
+                external_delta = external_root / "delta"
+                external_target = external_root / "target"
+                external_delta.mkdir()
+                external_target.mkdir()
+                external_target_file = external_target / "shard.safetensors"
+                external_target_file.write_bytes(b"must-survive")
+                swapped = False
+
+                def swap_after_common_root_open(path, *args, **kwargs):
+                    nonlocal swapped
+                    descriptor = original_open(path, *args, **kwargs)
+                    if Path(path) == root and not swapped:
+                        swapped = True
+                        root.rename(Path(temporary) / "original-cache")
+                        external_root.rename(root)
+                    return descriptor
+
+                checkpoint_delta._open_directory_nofollow = swap_after_common_root_open
+                checkpoint_delta.apply_xor_delta_file(
+                    base_file,
+                    delta_file,
+                    target_file,
+                    expected_size=len(target_bytes),
+                    expected_sha256=hashlib.sha256(target_bytes).hexdigest(),
+                )
+                self.assertTrue(swapped)
+                self.assertEqual(
+                    (Path(temporary) / "original-cache" / "target" / "shard.safetensors").read_bytes(),
+                    target_bytes,
+                )
+                self.assertEqual(
+                    (root / "target" / "shard.safetensors").read_bytes(),
+                    b"must-survive",
+                )
+        finally:
+            checkpoint_delta._open_directory_nofollow = original_open
+
+    def test_checkpoint_delta_holds_target_before_delta_parent_can_move(self):
+        original_open = checkpoint_delta._open_directory_below
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary) / "cache"
+                root.mkdir()
+                base_dir = root / "base"
+                delta_dir = root / "delta"
+                target_dir = root / "target"
+                base_dir.mkdir()
+                delta_dir.mkdir()
+                target_dir.mkdir()
+                base_bytes = b"base"
+                target_bytes = b"out!"
+                (base_dir / "shard.safetensors").write_bytes(base_bytes)
+                (delta_dir / "shard.xor.zlib").write_bytes(
+                    zlib.compress(checkpoint_delta._xor_bytes(base_bytes, target_bytes))
+                )
+                external = Path(temporary) / "external-target"
+                external.mkdir()
+                (external / "shard.safetensors").write_bytes(b"must-survive")
+                swapped = False
+
+                def swap_when_delta_parent_opens(root_fd, root_path, path, label):
+                    nonlocal swapped
+                    descriptor = original_open(root_fd, root_path, path, label)
+                    if Path(path) == delta_dir and not swapped:
+                        swapped = True
+                        target_dir.rename(root / "original-target")
+                        external.rename(target_dir)
+                    return descriptor
+
+                checkpoint_delta._open_directory_below = swap_when_delta_parent_opens
+                checkpoint_delta.apply_xor_delta_file(
+                    base_dir / "shard.safetensors",
+                    delta_dir / "shard.xor.zlib",
+                    target_dir / "shard.safetensors",
+                    expected_size=len(target_bytes),
+                    expected_sha256=hashlib.sha256(target_bytes).hexdigest(),
+                )
+                self.assertTrue(swapped)
+                self.assertEqual(
+                    (root / "original-target" / "shard.safetensors").read_bytes(),
+                    target_bytes,
+                )
+                self.assertEqual(
+                    (target_dir / "shard.safetensors").read_bytes(),
+                    b"must-survive",
+                )
+        finally:
+            checkpoint_delta._open_directory_below = original_open
+
     def test_checkpoint_delta_rejects_symlink_inputs_and_outputs(self):
         with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryDirectory() as external:
             root = Path(temporary)

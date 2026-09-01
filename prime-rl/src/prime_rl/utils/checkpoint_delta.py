@@ -75,6 +75,49 @@ def _open_directory_nofollow(path: Path, *, create: bool, label: str) -> int:
     return current_fd
 
 
+def _open_directory_below(
+    root_fd: int,
+    root_path: Path,
+    path: Path,
+    label: str,
+) -> int:
+    """Open a directory below a held directory without using its path again."""
+    absolute_root = Path(os.path.abspath(root_path))
+    absolute_path = Path(os.path.abspath(path))
+    try:
+        relative = absolute_path.relative_to(absolute_root)
+    except ValueError as exc:
+        raise OSError(f"{label} is outside its held root: {path}") from exc
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    current_fd = os.dup(root_fd)
+    try:
+        for component in relative.parts:
+            try:
+                next_fd = os.open(component, flags, dir_fd=current_fd)
+            except OSError as exc:
+                if exc.errno in {
+                    getattr(os, "ELOOP", 40),
+                    getattr(os, "ENOTDIR", 20),
+                }:
+                    try:
+                        component_stat = os.stat(
+                            component,
+                            dir_fd=current_fd,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        raise exc
+                    if stat.S_ISLNK(component_stat.st_mode):
+                        raise OSError(f"{label} is a symbolic link: {path}") from exc
+                raise
+            os.close(current_fd)
+            current_fd = next_fd
+    except BaseException:
+        os.close(current_fd)
+        raise
+    return current_fd
+
+
 def _open_nofollow(
     path: Path | str,
     flags: int,
@@ -361,23 +404,53 @@ def apply_xor_delta_file(
         create=False,
         label="checkpoint base parent",
     )
+    common_root_path = Path(
+        os.path.commonpath(
+            (
+                os.path.abspath(delta_path.parent),
+                os.path.abspath(target_path.parent),
+            )
+        )
+    )
     try:
-        delta_parent_fd = _open_directory_nofollow(
-            delta_path.parent,
+        common_root_fd = _open_directory_nofollow(
+            common_root_path,
             create=False,
-            label="checkpoint delta parent",
+            label="checkpoint delta and target root",
         )
     except BaseException:
         os.close(base_parent_fd)
         raise
+    delta_parent_fd = target_parent_fd = -1
+    separate_parent_fds = False
     try:
-        target_parent_fd = _open_directory_nofollow(
+        target_parent_fd = _open_directory_below(
+            common_root_fd,
+            common_root_path,
             target_path.parent,
-            create=False,
             label="checkpoint target parent",
         )
     except BaseException:
-        os.close(delta_parent_fd)
+        os.close(common_root_fd)
+        os.close(base_parent_fd)
+        raise
+    try:
+        if delta_path.parent == target_path.parent:
+            delta_parent_fd = target_parent_fd
+        else:
+            separate_parent_fds = True
+            delta_parent_fd = _open_directory_below(
+                common_root_fd,
+                common_root_path,
+                delta_path.parent,
+                label="checkpoint delta parent",
+            )
+    except BaseException:
+        if target_parent_fd >= 0:
+            os.close(target_parent_fd)
+        if delta_parent_fd >= 0 and separate_parent_fds:
+            os.close(delta_parent_fd)
+        os.close(common_root_fd)
         os.close(base_parent_fd)
         raise
     base_input = delta_input = temporary_output = -1
@@ -480,5 +553,7 @@ def apply_xor_delta_file(
             if descriptor >= 0:
                 os.close(descriptor)
         os.close(target_parent_fd)
-        os.close(delta_parent_fd)
+        if separate_parent_fds:
+            os.close(delta_parent_fd)
+        os.close(common_root_fd)
         os.close(base_parent_fd)

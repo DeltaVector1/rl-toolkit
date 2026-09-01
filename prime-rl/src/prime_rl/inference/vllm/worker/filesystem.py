@@ -364,20 +364,67 @@ def _directory_entry_has_marker(parent_fd: int, name: str, marker: str, label: s
 def _remove_directory_entry(parent_fd: int, name: str, label: str) -> None:
     directory_fd = _open_directory_entry_nofollow(parent_fd, name, label)
     try:
-        for child_name in os.listdir(directory_fd):
-            child_stat = os.stat(
-                child_name,
-                dir_fd=directory_fd,
-                follow_symlinks=False,
-            )
-            if stat.S_ISLNK(child_stat.st_mode):
-                raise OSError(f"{label} contains a symbolic link: {child_name}")
-            if stat.S_ISDIR(child_stat.st_mode):
-                _remove_directory_entry(directory_fd, child_name, label)
-            else:
-                os.unlink(child_name, dir_fd=directory_fd)
+        _remove_opened_directory_contents(directory_fd, label)
+        current_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        held_stat = os.fstat(directory_fd)
+        if (current_stat.st_dev, current_stat.st_ino) != (
+            held_stat.st_dev,
+            held_stat.st_ino,
+        ):
+            raise OSError(f"{label} was replaced during cleanup: {name}")
+        os.rmdir(name, dir_fd=parent_fd)
+    except FileNotFoundError as exc:
+        raise OSError(f"{label} was replaced during cleanup: {name}") from exc
     finally:
         os.close(directory_fd)
+
+
+def _remove_opened_directory_contents(directory_fd: int, label: str) -> None:
+    for child_name in os.listdir(directory_fd):
+        child_stat = os.stat(
+            child_name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        if stat.S_ISLNK(child_stat.st_mode):
+            raise OSError(f"{label} contains a symbolic link: {child_name}")
+        if stat.S_ISDIR(child_stat.st_mode):
+            child_fd = _open_directory_entry_nofollow(
+                directory_fd,
+                child_name,
+                label,
+            )
+            try:
+                _remove_opened_directory_entry(
+                    directory_fd,
+                    child_name,
+                    child_fd,
+                    label,
+                )
+            finally:
+                os.close(child_fd)
+        else:
+            os.unlink(child_name, dir_fd=directory_fd)
+
+
+def _remove_opened_directory_entry(
+    parent_fd: int,
+    name: str,
+    directory_fd: int,
+    label: str,
+) -> None:
+    """Remove a directory through its already-held descriptor."""
+    _remove_opened_directory_contents(directory_fd, label)
+    try:
+        current_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError as exc:
+        raise OSError(f"{label} was replaced during cleanup: {name}") from exc
+    held_stat = os.fstat(directory_fd)
+    if (current_stat.st_dev, current_stat.st_ino) != (
+        held_stat.st_dev,
+        held_stat.st_ino,
+    ):
+        raise OSError(f"{label} was replaced during cleanup: {name}")
     os.rmdir(name, dir_fd=parent_fd)
 
 
@@ -394,30 +441,24 @@ def _remove_directory(path: Path, label: str) -> None:
 
 
 def _replace_paths(source: Path, destination: Path, label: str) -> None:
-    source_parent_fd = _open_directory_nofollow(
-        source.parent,
+    source_parent = Path(os.path.abspath(source.parent))
+    destination_parent = Path(os.path.abspath(destination.parent))
+    if source_parent != destination_parent:
+        raise OSError(f"{label} requires source and destination in one directory")
+    parent_fd = _open_directory_nofollow(
+        source_parent,
         create=False,
-        label=f"{label} source parent",
+        label=f"{label} parent",
     )
-    try:
-        destination_parent_fd = _open_directory_nofollow(
-            destination.parent,
-            create=False,
-            label=f"{label} destination parent",
-        )
-    except BaseException:
-        os.close(source_parent_fd)
-        raise
     try:
         os.replace(
             source.name,
             destination.name,
-            src_dir_fd=source_parent_fd,
-            dst_dir_fd=destination_parent_fd,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
         )
     finally:
-        os.close(destination_parent_fd)
-        os.close(source_parent_fd)
+        os.close(parent_fd)
 
 
 def _unlink_path(path: Path, label: str) -> None:
@@ -431,6 +472,55 @@ def _unlink_path(path: Path, label: str) -> None:
             os.unlink(path.name, dir_fd=parent_fd)
         except FileNotFoundError:
             pass
+    finally:
+        os.close(parent_fd)
+
+
+def _reset_staging_directory_identity(
+    path: Path,
+    identity_name: str,
+    identity: str,
+    label: str,
+) -> None:
+    """Remove a mismatched private directory through held descriptors."""
+    try:
+        parent_fd = _open_directory_nofollow(
+            path.parent,
+            create=False,
+            label=f"{label} parent",
+        )
+    except FileNotFoundError:
+        return
+    try:
+        try:
+            entry_stat = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(entry_stat.st_mode):
+            raise OSError(f"{label} is a symbolic link: {path}")
+        if not stat.S_ISDIR(entry_stat.st_mode):
+            os.unlink(path.name, dir_fd=parent_fd)
+            return
+        directory_fd = _open_directory_entry_nofollow(parent_fd, path.name, label)
+        try:
+            try:
+                existing = _read_text_nofollow(
+                    identity_name,
+                    encoding="utf-8",
+                    dir_fd=directory_fd,
+                )
+            except (FileNotFoundError, OSError):
+                existing = None
+            if existing == identity:
+                return
+            _remove_opened_directory_entry(
+                parent_fd,
+                path.name,
+                directory_fd,
+                label,
+            )
+        finally:
+            os.close(directory_fd)
     finally:
         os.close(parent_fd)
 
@@ -2264,19 +2354,12 @@ def _stage_chunked_linear_adapter(
     chunks = sorted(chunks, key=lambda item: int(item["offset"]))
     transport_identity = json.dumps(transport, sort_keys=True, separators=(",", ":"))
     identity_path = temporary / "transport-manifest.json"
-    temporary_stat = _path_stat(temporary, "adapter partial directory")
-    if temporary_stat is not None and not stat.S_ISDIR(temporary_stat.st_mode):
-        _unlink_path(temporary, "adapter partial directory")
-        temporary_stat = None
-    if temporary_stat is not None:
-        _reject_symlink_path(identity_path, "adapter transport manifest")
-        try:
-            with os.fdopen(_open_nofollow(identity_path, os.O_RDONLY), "r", encoding="utf-8") as source:
-                identity_matches = source.read() == transport_identity
-        except (FileNotFoundError, OSError):
-            identity_matches = False
-        if not identity_matches:
-            _remove_directory(temporary, "adapter partial directory")
+    _reset_staging_directory_identity(
+        temporary,
+        identity_path.name,
+        transport_identity,
+        "adapter partial directory",
+    )
     _ensure_directory(temporary, "adapter partial directory")
     _write_text_atomic(identity_path, transport_identity, encoding="utf-8")
     chunk_root = temporary / "transport-chunks"
@@ -2745,19 +2828,12 @@ def _stage_chunked_xor_adapter(
     chunks = sorted(chunks, key=lambda item: int(item["offset"]))
     transport_identity = json.dumps(transport, sort_keys=True, separators=(",", ":"))
     identity_path = temporary / "transport-manifest.json"
-    temporary_stat = _path_stat(temporary, "adapter partial directory")
-    if temporary_stat is not None and not stat.S_ISDIR(temporary_stat.st_mode):
-        _unlink_path(temporary, "adapter partial directory")
-        temporary_stat = None
-    if temporary_stat is not None:
-        _reject_symlink_path(identity_path, "adapter transport manifest")
-        try:
-            with os.fdopen(_open_nofollow(identity_path, os.O_RDONLY), "r", encoding="utf-8") as source:
-                identity_matches = source.read() == transport_identity
-        except (FileNotFoundError, OSError):
-            identity_matches = False
-        if not identity_matches:
-            _remove_directory(temporary, "adapter partial directory")
+    _reset_staging_directory_identity(
+        temporary,
+        identity_path.name,
+        transport_identity,
+        "adapter partial directory",
+    )
     _ensure_directory(temporary, "adapter partial directory")
     _write_text_atomic(identity_path, transport_identity, encoding="utf-8")
     chunk_root = temporary / "transport-chunks"
