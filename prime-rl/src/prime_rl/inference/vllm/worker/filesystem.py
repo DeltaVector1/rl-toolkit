@@ -2180,47 +2180,68 @@ def _verified_adapter_base(
             )
         except (FileNotFoundError, OSError, ValueError) as exc:
             raise OSError("cached base adapter has no valid manifest") from exc
-        if not isinstance(local_manifest, dict) or local_manifest.get("source_url") != base_url:
+        if (
+            not isinstance(local_manifest, dict)
+            or set(local_manifest) != {"version", "source_url", "files"}
+            or local_manifest.get("version") != 1
+            or local_manifest.get("source_url") != base_url
+        ):
             raise OSError("cached base adapter URL differs from requested base")
         files = local_manifest.get("files")
-        if not isinstance(files, dict):
+        if not isinstance(files, dict) or set(files) != set(_ADAPTER_FILES):
             raise OSError("cached base adapter manifest has no files")
         model_spec = files.get(_ADAPTER_FILES[1])
         config_spec = files.get(_ADAPTER_FILES[0])
-        if not isinstance(model_spec, dict) or model_spec.get("sha256") != expected_sha256:
+        if (
+            not isinstance(model_spec, dict)
+            or set(model_spec) != {"size", "sha256"}
+            or type(model_spec.get("size")) is not int
+            or model_spec["size"] <= 0
+            or not isinstance(model_spec.get("sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", model_spec["sha256"]) is None
+            or model_spec["sha256"] != expected_sha256
+        ):
             raise OSError("cached base adapter manifest checksum differs")
+        if (
+            not isinstance(config_spec, dict)
+            or set(config_spec) != {"size", "sha256"}
+            or type(config_spec.get("size")) is not int
+            or config_spec["size"] < 0
+            or not isinstance(config_spec.get("sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", config_spec["sha256"]) is None
+        ):
+            raise OSError("cached base adapter configuration checksum differs")
+        if model_stat.st_size != model_spec["size"] or config_stat.st_size != config_spec["size"]:
+            raise OSError("cached base adapter size differs")
         if expected_size is not None and (
             type(expected_size) is not int
             or expected_size <= 0
             or model_stat.st_size != expected_size
-            or model_spec.get("size") != expected_size
+            or model_spec["size"] != expected_size
         ):
             raise OSError("cached base adapter size differs")
         if expected_config_sha256 is not None and (
-            not isinstance(config_spec, dict) or config_spec.get("sha256") != expected_config_sha256
+            config_spec["sha256"] != expected_config_sha256
         ):
             raise OSError("cached base adapter configuration checksum differs")
         if expected_config_size is not None and (
             type(expected_config_size) is not int
             or expected_config_size < 0
             or config_stat.st_size != expected_config_size
-            or config_spec.get("size") != expected_config_size
+            or config_spec["size"] != expected_config_size
         ):
             raise OSError("cached base adapter configuration size differs")
-        checksum = _read_text_nofollow(
+        checksum = _read_bytes_nofollow(
             _ADAPTER_DIGEST,
-            encoding="ascii",
             dir_fd=base_fd,
-        ).strip()
-        if re.fullmatch(r"[0-9a-f]{64}", checksum) is None or checksum != expected_sha256:
+        )
+        if checksum != f"{expected_sha256}\n".encode("ascii"):
             raise OSError("cached base adapter sidecar checksum differs")
-        if _sha256_entry(base_fd, _ADAPTER_FILES[1], "cached base adapter model") != expected_sha256:
-            raise OSError("cached base adapter model bytes differ")
-        if expected_config_sha256 is not None and _sha256_entry(
+        if _sha256_entry(
             base_fd,
             _ADAPTER_FILES[0],
             "cached base adapter configuration",
-        ) != expected_config_sha256:
+        ) != config_spec["sha256"]:
             raise OSError("cached base adapter configuration bytes differ")
     finally:
         os.close(base_fd)
