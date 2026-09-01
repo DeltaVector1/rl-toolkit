@@ -207,28 +207,62 @@ def _encode_leb128(value: int) -> bytes:
 def _decode_leb128_values(value: bytes, count: int) -> np.ndarray:
     if count < 0:
         raise ValueError("predictive nonzero count cannot be negative")
-    output = np.empty(count, dtype=np.uint16)
-    position = 0
-    for index in range(count):
-        decoded = 0
-        length = 0
-        while True:
-            if position >= len(value) or length >= _predictive_max_varint_bytes:
-                raise ValueError("predictive values contain a truncated or oversized varint")
-            byte = value[position]
-            position += 1
-            decoded |= (byte & 0x7F) << (7 * length)
-            length += 1
-            if not byte & 0x80:
-                break
-        if length > 1 and decoded < (1 << (7 * (length - 1))):
-            raise ValueError("predictive values contain a non-canonical varint")
-        if decoded > 0xFFFF:
-            raise ValueError("predictive value exceeds uint16")
-        output[index] = decoded
-    if position != len(value):
-        raise ValueError("predictive values contain trailing bytes")
-    return output
+    encoded = np.frombuffer(value, dtype=np.uint8)
+    if count == 0:
+        if len(encoded):
+            raise ValueError("predictive values contain trailing bytes")
+        return np.empty(0, dtype=np.uint16)
+    if len(encoded) == 0:
+        raise ValueError("predictive values contain a truncated varint")
+
+    starts_mask = np.empty(len(encoded), dtype=np.bool_)
+    starts_mask[0] = True
+    starts_mask[1:] = (encoded[:-1] & np.uint8(0x80)) == 0
+    starts = np.flatnonzero(starts_mask)
+    if len(starts) != count:
+        raise ValueError("predictive values contain an incorrect varint count")
+
+    length = len(encoded)
+    second_position = starts + 1
+    second_missing = second_position >= length
+    second = encoded[np.minimum(second_position, length - 1)]
+    first = encoded[starts]
+    first_terminal = (first & np.uint8(0x80)) == 0
+    second_terminal = (second & np.uint8(0x80)) == 0
+    needs_second = ~first_terminal
+    if np.any(needs_second & second_missing):
+        raise ValueError("predictive values contain a truncated varint")
+
+    third_position = starts + 2
+    third_missing = third_position >= length
+    third = encoded[np.minimum(third_position, length - 1)]
+    needs_third = needs_second & ~second_terminal
+    if np.any(needs_third & third_missing):
+        raise ValueError("predictive values contain a truncated varint")
+    if np.any(needs_third & ((third & np.uint8(0x80)) != 0)):
+        raise ValueError("predictive values contain an oversized varint")
+
+    varint_length = np.where(
+        first_terminal,
+        1,
+        np.where(second_terminal, 2, 3),
+    )
+    decoded = (first & np.uint8(0x7F)).astype(np.uint32)
+    decoded += np.where(
+        varint_length >= 2,
+        (second & np.uint8(0x7F)).astype(np.uint32) << np.uint32(7),
+        np.uint32(0),
+    )
+    decoded += np.where(
+        varint_length >= 3,
+        (third & np.uint8(0x7F)).astype(np.uint32) << np.uint32(14),
+        np.uint32(0),
+    )
+    if np.any((varint_length > 1) & (decoded < (np.uint32(1) << (varint_length - 1) * 7))):
+        raise ValueError("predictive values contain a non-canonical varint")
+    if np.any(decoded > np.uint32(0xFFFF)):
+        raise ValueError("predictive value exceeds uint16")
+    return decoded.astype(np.uint16)
 
 
 def _round_float32_to_bf16(value: np.ndarray) -> np.ndarray:
@@ -305,11 +339,35 @@ def _predictive_units(
 def _predictive_canonical_values(residual: np.ndarray, widths: np.ndarray) -> tuple[bytes, bytes, int]:
     nonzero = residual != 0
     mask = np.packbits(nonzero, bitorder="little").tobytes()
-    values = bytearray()
-    for number, width in zip(residual[nonzero], widths[nonzero], strict=True):
-        modulus = 1 << int(width)
-        values.extend(_encode_leb128(_zigzag(_signed_residual(int(number), modulus))))
-    return mask, bytes(values), int(nonzero.sum())
+    numbers = residual[nonzero].astype(np.int32)
+    if len(numbers) == 0:
+        return mask, b"", 0
+    selected_widths = widths[nonzero].astype(np.int32)
+    modulus = np.left_shift(np.int32(1), selected_widths)
+    midpoint = modulus // np.int32(2)
+    signed = np.where(numbers < midpoint, numbers, numbers - modulus)
+    zigzag = np.where(signed >= 0, signed * 2, -signed * 2 - 1).astype(np.uint32)
+    lengths = (
+        np.ones(len(zigzag), dtype=np.int64)
+        + (zigzag >= np.uint32(0x80))
+        + (zigzag >= np.uint32(0x4000))
+    )
+    starts = np.empty(len(zigzag), dtype=np.int64)
+    starts[0] = 0
+    if len(starts) > 1:
+        np.cumsum(lengths[:-1], dtype=np.int64, out=starts[1:])
+    encoded = np.empty(int(lengths.sum()), dtype=np.uint8)
+    continuation = lengths > 1
+    encoded[starts] = (zigzag & np.uint32(0x7F)).astype(np.uint8) | np.where(
+        continuation, np.uint8(0x80), np.uint8(0)
+    )
+    second = lengths >= 2
+    encoded[starts[second] + 1] = ((zigzag[second] >> np.uint32(7)) & np.uint32(0x7F)).astype(np.uint8) | np.where(
+        lengths[second] >= 3, np.uint8(0x80), np.uint8(0)
+    )
+    third = lengths >= 3
+    encoded[starts[third] + 2] = ((zigzag[third] >> np.uint32(14)) & np.uint32(0x7F)).astype(np.uint8)
+    return mask, encoded.tobytes(), int(len(zigzag))
 
 
 def encode_predictive_chunk(

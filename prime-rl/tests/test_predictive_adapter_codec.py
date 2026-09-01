@@ -42,6 +42,18 @@ class PredictiveAdapterCodecTest(unittest.TestCase):
         self.assertEqual(restored, base)
         self.assertEqual(adapter_delta.predictive_raw_sha256(payload), adapter_delta.hashlib.sha256(b"").hexdigest())
 
+    def test_predictive_chunk_round_trip_with_millions_of_values(self):
+        word_count = 2_000_000
+        header = b'{"x":0} '
+        prefix = struct.pack("<Q", len(header)) + header
+        base2 = prefix + np.full(word_count, 0x3F80, dtype="<u2").tobytes()
+        base1 = prefix + np.full(word_count, 0x4000, dtype="<u2").tobytes()
+        target = prefix + np.full(word_count, 0x4000, dtype="<u2").tobytes()
+        payload = adapter_delta.encode_predictive_chunk(base2, base1, target, 0, len(prefix))
+        restored = adapter_delta.decode_predictive_chunk(base2, base1, payload, 0, len(prefix))
+        self.assertEqual(restored, target)
+        self.assertEqual(len(adapter_delta._decode_leb128_values(b"\x01" * word_count, word_count)), word_count)
+
     def test_predictive_chunk_rejects_noncanonical_values_and_trailing_data(self):
         base = safetensor_bytes([0x3F80, 0x4000])
         payload = bytearray(adapter_delta.encode_predictive_chunk(base, base, base, 0, 16))
