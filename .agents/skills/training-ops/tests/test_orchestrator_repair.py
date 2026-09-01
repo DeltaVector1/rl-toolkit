@@ -25,7 +25,7 @@ class OrchestratorRepairTest(unittest.TestCase):
             trainer_up=True,
             orch_up=False,
             nodes=[training_ops.NodeState(host="n82", gpu_util=0, reachable=True)],
-            batch="batch 0/1024; 0 inflight",
+            batch="batch 112/1024; 128 inflight",
         )
         ssh_scripts = []
 
@@ -62,6 +62,24 @@ class OrchestratorRepairTest(unittest.TestCase):
         )
         self.assertIn("TRAINER_CT=glm52-decensor-trainer", ssh_scripts[-1][0])
         self.assertIn("ORCH_CT=glm52-decensor-orchestrator", ssh_scripts[-1][0])
+
+    def test_running_orchestrator_with_inflight_requests_is_refused(self):
+        before = training_ops.Status(
+            trainer_up=True,
+            orch_up=True,
+            nodes=[training_ops.NodeState(host="n82", gpu_util=0, reachable=True)],
+            batch="batch 112/1024; 128 inflight",
+        )
+
+        with mock.patch.object(training_ops, "current_run", return_value="glm-1"), mock.patch.object(
+            training_ops, "status", return_value=before
+        ), mock.patch.object(training_ops, "_ssh", return_value=(0, "running\n")), mock.patch.object(
+            training_ops, "deploy"
+        ) as deploy:
+            with self.assertRaisesRegex(training_ops.Refused, "zero active rollout requests"):
+                training_ops._repair_orchestrator()
+
+        deploy.assert_not_called()
 
     def test_recreate_script_uses_active_profile_and_exact_launcher(self):
         with mock.patch.object(

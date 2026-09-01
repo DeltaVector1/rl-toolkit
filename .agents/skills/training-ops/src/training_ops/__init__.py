@@ -3411,10 +3411,6 @@ def _repair_orchestrator() -> str:
         raise Refused("orchestrator repair requires every trainer host to be reachable")
     if any(node.gpu_util >= 50 for node in before.nodes):
         raise Refused("orchestrator repair requires the trainer to be idle or waiting")
-    inflight = re.search(r"(\d+) inflight", before.batch or "")
-    if inflight and int(inflight.group(1)) > 0:
-        raise Refused("orchestrator repair requires zero active rollout requests")
-
     state_code, state_output = _ssh(
         orchestrator_host,
         _orchestrator_state_script(orchestrator_container),
@@ -3437,6 +3433,9 @@ def _repair_orchestrator() -> str:
             "orchestrator container state changed during the safety check; "
             "refusing an ambiguous resume"
         )
+    inflight = re.search(r"(\d+) inflight", before.batch or "")
+    if was_running and inflight and int(inflight.group(1)) > 0:
+        raise Refused("orchestrator repair requires zero active rollout requests")
 
     kind = profile["kind"]
     checks = _fan(
