@@ -302,6 +302,14 @@ class AdapterUpdateTest(unittest.TestCase):
                     "h200a": (0, "adapter engine ready"),
                     "h200b": (0, "adapter engine ready"),
                 },
+                {
+                    "h200a": (0, "restarted exact inference container"),
+                    "h200b": (0, "restarted exact inference container"),
+                },
+                {
+                    "h200a": (0, "adapter engine ready"),
+                    "h200b": (0, "adapter engine ready"),
+                },
                 {"h200a": (0, "idle"), "h200b": (0, "idle")},
             ]
         )
@@ -319,7 +327,7 @@ class AdapterUpdateTest(unittest.TestCase):
             training_ops, "_adapter_stage_evidence", return_value="Failed to apply policy update 4"
         ), mock.patch.object(
             training_ops, "_fan", side_effect=lambda *_args, **_kwargs: next(fan_results)
-        ), mock.patch.object(training_ops, "deploy", return_value=True), mock.patch.object(
+        ), mock.patch.object(training_ops, "deploy", return_value=True) as deploy, mock.patch.object(
             training_ops, "_ssh", side_effect=ssh
         ), mock.patch.object(
             training_ops, "_ssh_address", side_effect=lambda host: f"addr-{host}"
@@ -343,6 +351,21 @@ class AdapterUpdateTest(unittest.TestCase):
         self.assertIn("ORCH_CT=glm52-decensor-orchestrator", resume_script)
         self.assertNotIn("sudo docker start", resume_script)
         self.assertNotIn("sudo docker restart", resume_script)
+        self.assertIn(
+            mock.call(
+                "prime-rl/src/prime_rl/inference/vllm/worker/filesystem.py",
+                nodes=["h200a", "h200b"],
+            ),
+            deploy.call_args_list,
+        )
+        self.assertIn(
+            mock.call(
+                "prime-rl/src/prime_rl/inference/relay.py",
+                nodes=["h200a"],
+            ),
+            deploy.call_args_list,
+        )
+        self.assertEqual(deploy.call_count, 4)
 
     def test_stopped_status_refuses_if_container_is_running(self):
         before = training_ops.Status(
@@ -399,7 +422,7 @@ class AdapterUpdateTest(unittest.TestCase):
         self.assertFalse(any("muse-glimmer-h200" in call for call in calls))
         self.assertFalse(any("start_muse_inference.sh" in call for call in calls))
 
-    def test_healthy_engine_skips_a_second_restart(self):
+    def test_healthy_engines_are_reloaded_to_import_receiver_changes(self):
         before = training_ops.Status(
             trainer_up=True,
             orch_up=True,
@@ -420,15 +443,35 @@ class AdapterUpdateTest(unittest.TestCase):
                     "h200a": (0, "adapter engine ready"),
                     "h200b": (0, "adapter engine ready"),
                 },
+                {
+                    "h200a": (0, "restarted exact inference container"),
+                    "h200b": (0, "restarted exact inference container"),
+                },
+                {
+                    "h200a": (0, "adapter engine ready"),
+                    "h200b": (0, "adapter engine ready"),
+                },
                 {"h200a": (0, "idle"), "h200b": (0, "idle")},
             ]
         )
+
+        fan_call = 0
+
+        def fan(hosts, function, **_kwargs):
+            nonlocal fan_call
+            result = next(fan_results)
+            if fan_call == 3:
+                for host in hosts:
+                    function(host)
+            fan_call += 1
+            return result
+
         with mock.patch.object(training_ops, "current_run", return_value="glm-1"), mock.patch.object(
             training_ops, "status", return_value=before
         ), mock.patch.object(
             training_ops, "_adapter_stage_evidence", return_value="Failed to apply policy update 4"
         ), mock.patch.object(
-            training_ops, "_fan", side_effect=lambda *_args, **_kwargs: next(fan_results)
+            training_ops, "_fan", side_effect=fan
         ), mock.patch.object(training_ops, "deploy", return_value=True) as deploy, mock.patch.object(
             training_ops, "_ssh", return_value=(0, "")
         ), mock.patch.object(
@@ -436,9 +479,13 @@ class AdapterUpdateTest(unittest.TestCase):
         ) as restart_script:
             result = training_ops._repair_adapter_update()
 
-        self.assertIn("kept healthy inference", result)
-        restart_script.assert_not_called()
-        self.assertEqual(deploy.call_count, 3)
+        self.assertIn("reloaded exact GLM inference containers", result)
+        self.assertEqual(restart_script.call_count, 2)
+        self.assertEqual(
+            {call.args[0] for call in restart_script.call_args_list},
+            {"glm52-decensor-h200"},
+        )
+        self.assertEqual(deploy.call_count, 4)
 
     def test_prefetch_script_only_signals_exact_curl_or_timeout(self):
         script = training_ops._adapter_prefetch_stop_script(

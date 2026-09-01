@@ -3432,12 +3432,18 @@ def _repair_adapter_update() -> str:
     if failed_stop:
         raise RuntimeError(f"exact adapter prefetch stop failed: {failed_stop}")
 
-    for path in (
-        "prime-rl/src/prime_rl/utils/client.py",
-        "prime-rl/src/prime_rl/inference/vllm/worker/filesystem.py",
-        ".agents/skills/training-ops/runtime/h200/sync_rollout_batches.sh",
-    ):
-        if not deploy(path):
+    deployment_targets = (
+        ("prime-rl/src/prime_rl/utils/client.py", None),
+        (
+            "prime-rl/src/prime_rl/inference/vllm/worker/filesystem.py",
+            inference_hosts,
+        ),
+        ("prime-rl/src/prime_rl/inference/relay.py", [orchestrator_host]),
+        (".agents/skills/training-ops/runtime/h200/sync_rollout_batches.sh", None),
+    )
+    for path, nodes in deployment_targets:
+        deployed = deploy(path) if nodes is None else deploy(path, nodes=nodes)
+        if not deployed:
             raise RuntimeError(f"adapter repair deployment failed for {path}")
 
     engine_state = _fan(
@@ -3461,26 +3467,46 @@ def _repair_adapter_update() -> str:
     }
     if failed_state:
         raise RuntimeError(f"inference identity or staging check failed: {failed_state}")
-    restart_hosts = [host for host, (code, _) in engine_state.items() if code == 10]
-    restarted = {}
-    if restart_hosts:
-        restarted = _fan(
-            restart_hosts,
-            lambda host: _ssh(
-                host,
-                _restart_adapter_engine_script(
-                    config["engine_container"],
-                    config["ports_by_host"][host][0],
-                    adapter_update_engine_startup_timeout_seconds,
-                ),
-                timeout=adapter_update_engine_startup_timeout_seconds + 120,
+    reload_hosts = list(inference_hosts)
+    reloaded = _fan(
+        reload_hosts,
+        lambda host: _ssh(
+            host,
+            _restart_adapter_engine_script(
+                config["engine_container"],
+                config["ports_by_host"][host][0],
+                adapter_update_engine_startup_timeout_seconds,
             ),
-        )
-        failed_restart = {
-            host: output.strip() for host, (code, output) in restarted.items() if code
-        }
-        if failed_restart:
-            raise RuntimeError(f"inference restart failed: {failed_restart}")
+            timeout=adapter_update_engine_startup_timeout_seconds + 120,
+        ),
+    )
+    failed_reload = {
+        host: output.strip() for host, (code, output) in reloaded.items() if code
+    }
+    if failed_reload:
+        raise RuntimeError(f"inference reload failed: {failed_reload}")
+
+    post_engine_state = _fan(
+        inference_hosts,
+        lambda host: _ssh(
+            host,
+            _adapter_engine_state_script(
+                config["engine_container"],
+                config["ports_by_host"][host],
+                config["run_marker"],
+                config["service_marker"],
+                config["output_dir"],
+            ),
+            timeout=90,
+        ),
+    )
+    failed_post_state = {
+        host: output.strip()
+        for host, (code, output) in post_engine_state.items()
+        if code
+    }
+    if failed_post_state:
+        raise RuntimeError(f"inference identity or staging check failed after reload: {failed_post_state}")
 
     post_idle = _fan(
         inference_hosts,
@@ -3506,10 +3532,10 @@ def _repair_adapter_update() -> str:
     resume_action = "recreated"
     result = (
         f"adapter update repaired for {run}: {evidence}; stopped exact prefetch processes; "
-        "deployed transfer timeout and host staging lock; "
-        f"{'restarted' if restart_hosts else 'kept healthy'} inference on "
-        f"{','.join(restart_hosts) if restart_hosts else 'all configured hosts'}; "
-        f"{resume_action} exact orchestrator only"
+        "deployed the transfer client, receiver, relay, and batch synchronizer; "
+        f"reloaded exact GLM inference containers on {','.join(reload_hosts)} and "
+        "verified health, identity, and staging state; "
+        f"{resume_action} exact orchestrator and relay only after inference recovered"
     )
     print(result)
     return result
