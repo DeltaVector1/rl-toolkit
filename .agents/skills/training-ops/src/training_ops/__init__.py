@@ -2897,9 +2897,18 @@ for port in {port_list}; do
   staging=$(curl -sS -m 30 "http://127.0.0.1:$port/staging_status") || {{ echo "staging status request failed on $port" >&2; exit 37; }}
   staging_state=$(printf '%s\\n' "$staging" | sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p')
   staging_age=$(printf '%s\\n' "$staging" | sed -n 's/.*"age_seconds"[[:space:]]*:[[:space:]]*\\([0-9][0-9.]*\\).*/\\1/p')
-  [ "$staging_state" = idle ] || [ "$staging_state" = staging ] || {{ echo "unknown staging status on $port" >&2; exit 38; }}
-  [ -n "$staging_age" ] || {{ echo "staging age is missing on $port" >&2; exit 39; }}
-  awk -v age="$staging_age" -v limit={staging_max_seconds} 'BEGIN {{ exit !(age >= 0 && age <= limit) }}' || {{ echo "staging exceeds the bounded limit on $port" >&2; exit 40; }}
+  case "$staging_state" in
+    idle|ready|failed)
+      ;;
+    staging)
+      [ -n "$staging_age" ] || {{ echo "staging age is missing on $port" >&2; exit 39; }}
+      awk -v age="$staging_age" -v limit={staging_max_seconds} 'BEGIN {{ exit !(age >= 0 && age <= limit) }}' || {{ echo "staging exceeds the bounded limit on $port" >&2; exit 40; }}
+      ;;
+    *)
+      echo "unknown staging status on $port" >&2
+      exit 38
+      ;;
+  esac
   echo "port=$port health=$health liveness=$liveness running=$running staging=$staging_state age=$staging_age"
 done
 """

@@ -108,6 +108,30 @@ def _lora_stage_status() -> dict[str, Any]:
         }
 
 
+def _combined_lora_stage_status(
+    active: dict[str, Any], durable: dict[str, object]
+) -> dict[str, Any]:
+    """Return durable transfer details without hiding an active stage."""
+    state = dict(active)
+    active_status = active.get("status")
+    durable_status = durable.get("status")
+    if active_status == "staging":
+        state.update(durable)
+        state["status"] = "staging"
+        if "age_seconds" in active:
+            state["age_seconds"] = active["age_seconds"]
+        return state
+    if durable_status in {"failed", "ready"}:
+        state.update(durable)
+    elif durable_status == "staging":
+        state.update(durable)
+        state["status"] = "unknown"
+    elif durable_status not in {None, "idle"}:
+        state.update(durable)
+        state["status"] = "unknown"
+    return state
+
+
 def _is_finite_number(value: object) -> bool:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return False
@@ -321,11 +345,7 @@ async def stage_lora_adapter(raw_request: Request):
 
 @router.get("/staging_status")
 async def staging_status():
-    state = _lora_stage_status()
-    transfer = adapter_stage_status()
-    if transfer.get("status") in {"staging", "failed"}:
-        state.update(transfer)
-    return state
+    return _combined_lora_stage_status(_lora_stage_status(), adapter_stage_status())
 
 
 @router.post("/stage_full_checkpoint")

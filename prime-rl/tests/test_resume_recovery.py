@@ -1,6 +1,7 @@
 import ast
 import unittest
 from pathlib import Path
+from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -48,6 +49,51 @@ class ResumeRecoveryTest(unittest.TestCase):
         self.assertIn('_set_engine_state("resuming")', source)
         self.assertIn('_set_engine_state("running")', source)
         self.assertIn('_set_engine_state("unknown")', source)
+
+    def test_staging_status_does_not_hide_an_active_stage(self):
+        source = SERVER_PATH.read_text(encoding="utf-8")
+        self.assertIn("def _combined_lora_stage_status(", source)
+        self.assertIn('if active_status == "staging":', source)
+        self.assertIn('state["status"] = "staging"', source)
+        self.assertIn('durable_status in {"failed", "ready"}', source)
+        self.assertIn('elif durable_status == "staging":', source)
+        self.assertIn('state["status"] = "unknown"', source)
+
+    def test_active_stage_wins_over_terminal_transfer_record(self):
+        source = SERVER_PATH.read_text(encoding="utf-8")
+        function = next(
+            node
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_combined_lora_stage_status"
+        )
+        namespace = {"Any": Any}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), str(SERVER_PATH), "exec"), namespace)
+        combine = namespace["_combined_lora_stage_status"]
+
+        active = combine(
+            {"status": "staging", "age_seconds": 3.5},
+            {"status": "failed", "error": "old transfer"},
+        )
+        self.assertEqual(active["status"], "staging")
+        self.assertEqual(active["age_seconds"], 3.5)
+        self.assertEqual(active["error"], "old transfer")
+        self.assertEqual(
+            combine({"status": "idle", "age_seconds": 0.0}, {"status": "ready"})["status"],
+            "ready",
+        )
+        self.assertEqual(
+            combine({"status": "idle", "age_seconds": 0.0}, {"status": "failed"})["status"],
+            "failed",
+        )
+        self.assertEqual(
+            combine({"status": "idle", "age_seconds": 0.0}, {"status": "staging"})["status"],
+            "unknown",
+        )
+        self.assertEqual(
+            combine({"status": "idle", "age_seconds": 0.0}, {"status": "corrupt"})["status"],
+            "unknown",
+        )
 
     def test_startup_stages_once_per_host_before_loading(self):
         source = ORCHESTRATOR_PATH.read_text(encoding="utf-8")

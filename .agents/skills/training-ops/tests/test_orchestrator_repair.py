@@ -1,4 +1,7 @@
+import os
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -19,6 +22,57 @@ class OrchestratorRepairTest(unittest.TestCase):
         self.assertIn("staging exceeds the bounded limit", script)
         self.assertIn("limit=7200", script)
         self.assertNotIn("/v1/completions", script)
+
+    def test_terminal_stage_states_do_not_require_an_age(self):
+        script = training_ops._orchestrator_resume_safety_script([8000])
+        with tempfile.TemporaryDirectory() as temporary:
+            fake_curl = Path(temporary) / "curl"
+            fake_curl.write_text(
+                "#!/bin/sh\n"
+                "case \"$*\" in\n"
+                "  */health*|*/liveness*) printf '200' ;;\n"
+                "  */metrics*) printf 'vllm:num_requests_running 0\\n' ;;\n"
+                "  */staging_status*) printf '%s' \"$STAGING_RESPONSE\" ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            fake_curl.chmod(0o755)
+            environment = {
+                **os.environ,
+                "PATH": f"{temporary}:{os.environ['PATH']}",
+            }
+            for response in (
+                '{"status":"idle","age_seconds":0}',
+                '{"status":"ready"}',
+                '{"status":"failed","error":"transfer failed"}',
+                '{"status":"staging","age_seconds":7200}',
+            ):
+                environment["STAGING_RESPONSE"] = response
+                result = subprocess.run(
+                    ["bash", "-c", script],
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, response)
+
+            environment["STAGING_RESPONSE"] = '{"status":"staging","age_seconds":7201}'
+            result = subprocess.run(
+                ["bash", "-c", script],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("staging exceeds the bounded limit", result.stderr)
+
+    def test_safety_probe_rejects_unknown_stage_state(self):
+        script = training_ops._orchestrator_resume_safety_script([8000])
+        self.assertIn("idle|ready|failed", script)
+        self.assertIn('echo "unknown staging status on $port"', script)
+        self.assertIn("staging age is missing", script)
 
     def test_stopped_orchestrator_is_started_after_all_guards_pass(self):
         before = training_ops.Status(
