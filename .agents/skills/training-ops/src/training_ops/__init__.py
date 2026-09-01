@@ -22,6 +22,7 @@ import tomllib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
+from urllib.parse import urlsplit
 
 repo_root = Path(__file__).resolve().parents[5]
 operations_path = repo_root / "configs" / "operations.toml"
@@ -4835,9 +4836,27 @@ def start(
         )
         if not isinstance(source_url, str) or not source_url.startswith(("http://", "https://")):
             raise Refused("GLM orchestrator config has no adapter source URL")
+        if edge_settings.get("output_dir") != service_run_dir:
+            raise Refused("GLM orchestrator output directory does not match the active run")
+        parsed_source_url = urlsplit(source_url.rstrip("/"))
+        if (
+            parsed_source_url.hostname not in {"127.0.0.1", "localhost"}
+            or parsed_source_url.username
+            or parsed_source_url.password
+            or parsed_source_url.query
+            or parsed_source_url.fragment
+            or parsed_source_url.path.rstrip("/") != f"/{run}"
+        ):
+            raise Refused("GLM adapter source URL does not match the active run")
+        broadcast_path = (
+            PurePosixPath(service_run_dir) / "broadcasts"
+        ).relative_to(PurePosixPath(run_root)).as_posix()
+        if broadcast_path != f"{run}/run_{run}/broadcasts":
+            raise Refused("GLM adapter broadcast path does not match the active run")
         predictive_adapter_env = (
             " ADAPTER_PREDICTIVE_UPGRADE=1"
             f" ADAPTER_PREDICTIVE_RUN={shlex.quote(run)}"
+            f" ADAPTER_PREDICTIVE_BROADCAST_PATH={shlex.quote(broadcast_path)}"
             f" ADAPTER_PREDICTIVE_SOURCE_URL={shlex.quote(source_url.rstrip('/'))}"
         )
     if muse_run:

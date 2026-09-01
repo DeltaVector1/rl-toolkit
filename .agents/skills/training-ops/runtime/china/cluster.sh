@@ -244,29 +244,50 @@ PY
     broadcast_root=${BROADCAST_ROOT:-$runs}
     test -d "$broadcast_root" || { echo "broadcast root does not exist: $broadcast_root" >&2; exit 1; }
     adapter_mounts=(-v "$broadcast_root":/broadcast:ro)
+    adapter_dependency_mounts=()
     adapter_upgrade_args=()
     if [ "${ADAPTER_PREDICTIVE_UPGRADE:-0}" = 1 ]; then
       predictive_run=${ADAPTER_PREDICTIVE_RUN:?set ADAPTER_PREDICTIVE_RUN}
+      predictive_broadcast_path=${ADAPTER_PREDICTIVE_BROADCAST_PATH:?set ADAPTER_PREDICTIVE_BROADCAST_PATH}
       predictive_source_url=${ADAPTER_PREDICTIVE_SOURCE_URL:?set ADAPTER_PREDICTIVE_SOURCE_URL}
       [[ "$predictive_run" =~ ^[A-Za-z0-9_-]+$ ]] || {
         echo "ADAPTER_PREDICTIVE_RUN contains an unsafe run name" >&2
         exit 1
       }
-      active_run="$broadcast_root/$predictive_run"
-      test -d "$active_run" || {
-        echo "active predictive run does not exist: $active_run" >&2
+      expected_broadcast_path="$predictive_run/run_$predictive_run/broadcasts"
+      test "$predictive_broadcast_path" = "$expected_broadcast_path" || {
+        echo "ADAPTER_PREDICTIVE_BROADCAST_PATH is not the active run broadcast path" >&2
         exit 1
       }
-      test ! -L "$active_run" || {
-        echo "active predictive run is a symlink: $active_run" >&2
+      active_broadcasts="$broadcast_root/$predictive_broadcast_path"
+      for path in \
+        "$broadcast_root" \
+        "$broadcast_root/$predictive_run" \
+        "$broadcast_root/$predictive_run/run_$predictive_run" \
+        "$active_broadcasts"; do
+        test ! -L "$path" || {
+          echo "active predictive broadcast path contains a symlink: $path" >&2
+          exit 1
+        }
+      done
+      sudo install -d -o 1000 -g 1000 -m 0755 "$active_broadcasts"
+      test -d "$active_broadcasts" && test ! -L "$active_broadcasts" || {
+        echo "cannot create the active predictive broadcast path: $active_broadcasts" >&2
         exit 1
       }
-      adapter_mounts+=(-v "$active_run":/broadcast/"$predictive_run":rw)
+      predictive_source_url="${predictive_source_url%/}/run_$predictive_run/broadcasts"
+      adapter_mounts+=(-v "$active_broadcasts":/broadcast/"$predictive_broadcast_path":rw)
+      adapter_dependency_mounts=(
+        -v "$deployment/prime-rl/src/prime_rl/utils/adapter_delta.py":/app/src/prime_rl/utils/adapter_delta.py:ro
+      )
       adapter_upgrade_args=(
         --upgrade-run "$predictive_run"
+        --upgrade-path "$predictive_broadcast_path"
         --source-base-url "$predictive_source_url"
       )
-    elif [ -n "${ADAPTER_PREDICTIVE_RUN:-}" ] || [ -n "${ADAPTER_PREDICTIVE_SOURCE_URL:-}" ]; then
+    elif [ -n "${ADAPTER_PREDICTIVE_RUN:-}" ] || \
+      [ -n "${ADAPTER_PREDICTIVE_BROADCAST_PATH:-}" ] || \
+      [ -n "${ADAPTER_PREDICTIVE_SOURCE_URL:-}" ]; then
       echo "predictive adapter settings require ADAPTER_PREDICTIVE_UPGRADE=1" >&2
       exit 1
     fi
@@ -274,8 +295,8 @@ PY
     sudo docker run -d --name "$adapter_container" --restart unless-stopped \
       --network host \
       "${adapter_mounts[@]}" \
+      "${adapter_dependency_mounts[@]}" \
       -v "$deployment/.agents/skills/training-ops/runtime/china/adapter_server.py":/app/adapter_server.py:ro \
-      -v "$deployment/prime-rl/src/prime_rl/utils/adapter_delta.py":/app/src/prime_rl/utils/adapter_delta.py:ro \
       --entrypoint /app/.venv/bin/python "$image" \
       /app/adapter_server.py --port "$adapter_port" --directory /broadcast \
       "${adapter_upgrade_args[@]}"

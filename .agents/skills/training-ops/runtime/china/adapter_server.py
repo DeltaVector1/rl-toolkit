@@ -209,17 +209,35 @@ def _promote_cache(active_run: Path, pending: Path, newest_step: int) -> None:
     if root.is_symlink() or (root.exists() and not root.is_dir()):
         raise UpgradeError("adapter cache root is not a directory")
     root.mkdir(exist_ok=True)
+
+    prepared: dict[int, tuple[Path, Path, dict[str, object]]] = {}
     for step in (newest_step, newest_step - 1):
         source = pending / f"step_{step}"
         destination = root / f"step_{step}"
-        if not source.is_dir():
-            raise UpgradeError(f"prepared adapter cache step {step} is missing")
+        identity = _identity_from_published_directory(source, step, cache=True)
         if destination.exists() or destination.is_symlink():
-            if destination.is_dir() and not destination.is_symlink():
-                shutil.rmtree(destination)
-            else:
-                destination.unlink()
-        os.replace(source, destination)
+            existing = _identity_from_published_directory(destination, step, cache=True)
+            if existing != identity:
+                raise UpgradeError(f"adapter cache step {step} identity differs")
+        prepared[step] = source, destination, identity
+
+    for source, destination, _identity in prepared.values():
+        if destination.exists():
+            shutil.rmtree(source)
+        else:
+            os.replace(source, destination)
+
+    for step, (_source, destination, identity) in prepared.items():
+        if _identity_from_published_directory(destination, step, cache=True) != identity:
+            raise UpgradeError(f"published adapter cache step {step} identity differs")
+
+
+def _prune_cache(active_run: Path, newest_step: int) -> None:
+    root = active_run / cache_name
+    if root.is_symlink() or not root.is_dir():
+        raise UpgradeError("adapter cache root is not a directory")
+    for step in (newest_step, newest_step - 1):
+        _identity_from_published_directory(root / f"step_{step}", step, cache=True)
     for candidate in root.iterdir():
         match = step_pattern.fullmatch(candidate.name)
         if match is None or int(match.group(1)) >= newest_step - 1:
@@ -238,7 +256,7 @@ def _install_predictive_manifest(
 ) -> None:
     if (
         manifest.get("version") != 2
-        or manifest.get("mode") != "predictive"
+        or manifest.get("mode") != "delta"
         or manifest.get("target_step") != step
         or manifest.get("base_step") != step - 1
         or manifest.get("base2_step") != step - 2
@@ -346,8 +364,9 @@ def _upgrade_v1_step(active_run: Path, target: Path, step: int, source_base_url:
                     base_step=step - 1,
                     base2_step=step - 2,
                 )
-                _install_predictive_manifest(target, build, manifest, step)
                 _promote_cache(active_run, pending, step)
+                _install_predictive_manifest(target, build, manifest, step)
+                _prune_cache(active_run, step)
             finally:
                 if build.exists():
                     shutil.rmtree(build)
@@ -374,29 +393,31 @@ def _safe_request_path(handler: SimpleHTTPRequestHandler) -> tuple[Path, tuple[s
 
 
 class RangeHandler(SimpleHTTPRequestHandler):
-    def __init__(self, *args, upgrade_run=None, source_base_url=None, **kwargs):
-        self.upgrade_run = upgrade_run
+    def __init__(self, *args, upgrade_path=None, source_base_url=None, **kwargs):
+        self.upgrade_path = upgrade_path
         self.source_base_url = source_base_url
         super().__init__(*args, **kwargs)
 
     def _maybe_upgrade(self):
         path, pieces = _safe_request_path(self)
-        if self.upgrade_run is None:
+        if self.upgrade_path is None:
             return path
         if cache_name in pieces or any(part.startswith(".predictive-") for part in pieces):
             raise UpgradeError("private adapter state is not served")
-        if len(pieces) < 3 or pieces[0] != self.upgrade_run:
+        prefix_length = len(self.upgrade_path)
+        if len(pieces) < prefix_length + 2 or pieces[:prefix_length] != self.upgrade_path:
             return path
-        match = step_pattern.fullmatch(pieces[1])
+        match = step_pattern.fullmatch(pieces[prefix_length])
         if match is None:
             return path
         step = int(match.group(1))
         if step < 2:
             return path
-        if pieces[2] == stable_name:
+        if pieces[prefix_length + 1] == stable_name:
             return path
-        target = Path(self.directory).resolve() / self.upgrade_run / pieces[1]
-        _upgrade_v1_step(Path(self.directory).resolve() / self.upgrade_run, target, step, self.source_base_url)
+        active_run = Path(self.directory).resolve().joinpath(*self.upgrade_path)
+        target = active_run / pieces[prefix_length]
+        _upgrade_v1_step(active_run, target, step, self.source_base_url)
         return path
 
     def send_head(self):
@@ -453,33 +474,49 @@ class AdapterServer(ThreadingHTTPServer):
     request_queue_size = 128
 
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--directory", required=True)
-parser.add_argument("--port", type=int, default=8100)
-parser.add_argument("--upgrade-run")
-parser.add_argument("--source-base-url")
-args = parser.parse_args()
-if args.upgrade_run is not None:
-    if run_pattern.fullmatch(args.upgrade_run) is None:
-        parser.error("--upgrade-run contains an unsafe run name")
-    if not isinstance(args.source_base_url, str) or not args.source_base_url.startswith(("http://", "https://")):
-        parser.error("--source-base-url is required for predictive upgrade")
-    parsed_source = urlsplit(args.source_base_url.rstrip("/"))
-    if (
-        parsed_source.hostname not in {"127.0.0.1", "localhost"}
-        or parsed_source.username
-        or parsed_source.password
-        or parsed_source.query
-        or parsed_source.fragment
-        or parsed_source.path.rstrip("/") != f"/{args.upgrade_run}"
-    ):
-        parser.error("--source-base-url is not bound to --upgrade-run")
-AdapterServer(
-    ("127.0.0.1", args.port),
-    partial(
-        RangeHandler,
-        directory=args.directory,
-        upgrade_run=args.upgrade_run,
-        source_base_url=args.source_base_url.rstrip("/") if args.source_base_url else None,
-    ),
-).serve_forever()
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--directory", required=True)
+    parser.add_argument("--port", type=int, default=8100)
+    parser.add_argument("--upgrade-run")
+    parser.add_argument("--upgrade-path")
+    parser.add_argument("--source-base-url")
+    args = parser.parse_args()
+
+    upgrade_path = None
+    upgrade_values = (args.upgrade_run, args.upgrade_path, args.source_base_url)
+    if any(value is not None for value in upgrade_values):
+        if not all(value is not None for value in upgrade_values):
+            parser.error("predictive upgrade requires run, path, and source URL")
+        if run_pattern.fullmatch(args.upgrade_run) is None:
+            parser.error("--upgrade-run contains an unsafe run name")
+        expected_path = f"{args.upgrade_run}/run_{args.upgrade_run}/broadcasts"
+        if args.upgrade_path != expected_path:
+            parser.error("--upgrade-path is not the active run broadcast path")
+        if not args.source_base_url.startswith(("http://", "https://")):
+            parser.error("--source-base-url is required for predictive upgrade")
+        parsed_source = urlsplit(args.source_base_url.rstrip("/"))
+        if (
+            parsed_source.hostname not in {"127.0.0.1", "localhost"}
+            or parsed_source.username
+            or parsed_source.password
+            or parsed_source.query
+            or parsed_source.fragment
+            or parsed_source.path.rstrip("/") != f"/{expected_path}"
+        ):
+            parser.error("--source-base-url is not bound to --upgrade-path")
+        upgrade_path = tuple(expected_path.split("/"))
+
+    AdapterServer(
+        ("127.0.0.1", args.port),
+        partial(
+            RangeHandler,
+            directory=args.directory,
+            upgrade_path=upgrade_path,
+            source_base_url=args.source_base_url.rstrip("/") if args.source_base_url else None,
+        ),
+    ).serve_forever()
+
+
+if __name__ == "__main__":
+    main()

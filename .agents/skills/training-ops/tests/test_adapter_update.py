@@ -1,4 +1,8 @@
+import hashlib
+import importlib.util
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -6,6 +10,16 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import training_ops
+
+adapter_server_path = (
+    Path(__file__).resolve().parents[1] / "runtime" / "china" / "adapter_server.py"
+)
+adapter_server_spec = importlib.util.spec_from_file_location(
+    "training_ops_adapter_server", adapter_server_path
+)
+assert adapter_server_spec is not None and adapter_server_spec.loader is not None
+adapter_server = importlib.util.module_from_spec(adapter_server_spec)
+adapter_server_spec.loader.exec_module(adapter_server)
 
 
 class AdapterUpdateTest(unittest.TestCase):
@@ -26,9 +40,139 @@ class AdapterUpdateTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("ADAPTER_PREDICTIVE_UPGRADE", launcher)
         self.assertIn("ADAPTER_PREDICTIVE_RUN", launcher)
+        self.assertIn("ADAPTER_PREDICTIVE_BROADCAST_PATH", launcher)
         self.assertIn("ADAPTER_PREDICTIVE_SOURCE_URL", launcher)
-        self.assertIn("/broadcast/\"$predictive_run\":rw", launcher)
+        self.assertIn('sudo install -d -o 1000 -g 1000 -m 0755 "$active_broadcasts"', launcher)
+        self.assertIn('/broadcast/"$predictive_broadcast_path":rw', launcher)
+        self.assertNotIn('/broadcast/"$predictive_run":rw', launcher)
+        self.assertIn('--upgrade-path "$predictive_broadcast_path"', launcher)
+        self.assertIn('/run_$predictive_run/broadcasts"', launcher)
         self.assertIn("prime_rl/utils/adapter_delta.py", launcher)
+
+    def test_server_upgrades_only_the_exact_active_broadcast_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            active = root / "glm-1" / "run_glm-1" / "broadcasts"
+            target = active / "step_2"
+            target.mkdir(parents=True)
+            handler = adapter_server.RangeHandler.__new__(adapter_server.RangeHandler)
+            handler.directory = temporary
+            handler.upgrade_path = ("glm-1", "run_glm-1", "broadcasts")
+            handler.source_base_url = (
+                "http://127.0.0.1:18100/glm-1/run_glm-1/broadcasts"
+            )
+            handler.path = "/glm-1/run_glm-1/broadcasts/step_2/adapter_manifest.json"
+
+            with mock.patch.object(adapter_server, "_upgrade_v1_step") as upgrade:
+                path = handler._maybe_upgrade()
+            self.assertEqual(path, target / "adapter_manifest.json")
+            upgrade.assert_called_once_with(
+                active,
+                target,
+                2,
+                "http://127.0.0.1:18100/glm-1/run_glm-1/broadcasts",
+            )
+            self.assertEqual(
+                adapter_server._predictive_step_url(handler.source_base_url, 2),
+                "http://127.0.0.1:18100/glm-1/run_glm-1/broadcasts/step_2",
+            )
+
+            handler.path = "/glm-1/step_2/adapter_manifest.json"
+            with mock.patch.object(adapter_server, "_upgrade_v1_step") as upgrade:
+                handler._maybe_upgrade()
+            upgrade.assert_not_called()
+
+            handler.path = "/glm-1/run_glm-1/broadcasts/step_2/adapter_manifest.json"
+            with mock.patch.object(
+                adapter_server,
+                "_upgrade_v1_step",
+                side_effect=adapter_server.UpgradeError("missing exact base"),
+            ):
+                with self.assertRaisesRegex(adapter_server.UpgradeError, "missing exact base"):
+                    handler._maybe_upgrade()
+
+    def test_server_accepts_delta_as_the_public_predictive_manifest_mode(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "target"
+            build = root / "build"
+            target.mkdir()
+            build.mkdir()
+            chunk_name = "adapter_model.safetensors.transport-predictive-00000.bin"
+            (target / "adapter_manifest.json").write_text("old", encoding="utf-8")
+            (target / "adapter_model.safetensors.sha256").write_text("old", encoding="ascii")
+            (build / chunk_name).write_bytes(b"delta")
+            (build / "adapter_manifest.json").write_text("new", encoding="utf-8")
+            (build / "adapter_model.safetensors.sha256").write_text("new", encoding="ascii")
+            manifest = {
+                "version": 2,
+                "mode": "delta",
+                "target_step": 2,
+                "base_step": 1,
+                "base2_step": 0,
+                "chunks": [{"file": chunk_name, "wire_size": 5}],
+            }
+
+            adapter_server._install_predictive_manifest(target, build, manifest, 2)
+            self.assertEqual((target / "adapter_manifest.json").read_text(), "new")
+            with self.assertRaises(adapter_server.UpgradeError):
+                adapter_server._install_predictive_manifest(
+                    target,
+                    build,
+                    {**manifest, "mode": "predictive"},
+                    2,
+                )
+
+    def test_cache_keeps_the_old_base_until_both_new_entries_validate(self):
+        def write_entry(path, step, value):
+            path.mkdir(parents=True)
+            config = f"config-{value}".encode()
+            weights = f"weights-{value}".encode()
+            config_digest = hashlib.sha256(config).hexdigest()
+            weights_digest = hashlib.sha256(weights).hexdigest()
+            (path / "adapter_config.json").write_bytes(config)
+            (path / "adapter_model.safetensors").write_bytes(weights)
+            (path / "adapter_model.safetensors.sha256").write_text(
+                f"{weights_digest}\n", encoding="ascii"
+            )
+            (path / ".identity.json").write_text(
+                json.dumps(
+                    {
+                        "step": step,
+                        "config_size": len(config),
+                        "config_sha256": config_digest,
+                        "weights_size": len(weights),
+                        "weights_sha256": weights_digest,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            active = Path(temporary)
+            cache = active / adapter_server.cache_name
+            write_entry(cache / "step_0", 0, "zero")
+            write_entry(cache / "step_1", 1, "one")
+            pending = cache / ".pending-test"
+            write_entry(pending / "step_2", 2, "two")
+            write_entry(pending / "step_1", 1, "different")
+
+            with self.assertRaisesRegex(adapter_server.UpgradeError, "identity differs"):
+                adapter_server._promote_cache(active, pending, 2)
+            self.assertTrue((cache / "step_0").is_dir())
+            self.assertFalse((cache / "step_2").exists())
+
+            bad = pending / "step_1"
+            for child in bad.iterdir():
+                child.unlink()
+            bad.rmdir()
+            write_entry(bad, 1, "one")
+            adapter_server._promote_cache(active, pending, 2)
+            self.assertTrue((cache / "step_0").is_dir())
+            self.assertTrue((cache / "step_1").is_dir())
+            self.assertTrue((cache / "step_2").is_dir())
+            adapter_server._prune_cache(active, 2)
+            self.assertFalse((cache / "step_0").exists())
 
     def test_stage_log_requires_a_transfer_timeout(self):
         good = "Failed to apply policy update 4\nReadTimeout /stage_lora_adapter"
