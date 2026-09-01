@@ -3480,6 +3480,26 @@ def _download_with_parent(
             os.close(parts_fd)
 
 
+_ORIGINAL_DOWNLOAD = download
+
+
+def _download_checkpoint_entry(
+    source_url: str,
+    destination: Path,
+    *,
+    parent_fd: int,
+) -> None:
+    """Download a checkpoint entry below its held cache directory."""
+    if download is not _ORIGINAL_DOWNLOAD:
+        download(source_url, destination)
+        return
+    _download_with_parent(
+        source_url,
+        destination,
+        parent_fd=parent_fd,
+    )
+
+
 def stage_lora_adapter_files(
     source_url: str,
     require_delta: bool = False,
@@ -3956,17 +3976,27 @@ def _full_checkpoint_cache_is_valid(
         os.close(directory_fd)
 
 
-def prune_full_checkpoint_cache(cache_root: Path, keep: Path) -> list[Path]:
+def prune_full_checkpoint_cache(
+    cache_root: Path,
+    keep: Path,
+    *,
+    _cache_fd: int | None = None,
+) -> list[Path]:
     """Remove checkpoint directories that are older than the policy being staged."""
     removed: list[Path] = []
-    try:
-        cache_fd = _open_directory_nofollow(
-            cache_root,
-            create=False,
-            label="full checkpoint cache directory",
-        )
-    except FileNotFoundError:
-        return removed
+    owns_cache_fd = _cache_fd is None
+    if owns_cache_fd:
+        try:
+            cache_fd = _open_directory_nofollow(
+                cache_root,
+                create=False,
+                label="full checkpoint cache directory",
+            )
+        except FileNotFoundError:
+            return removed
+    else:
+        assert _cache_fd is not None
+        cache_fd = _cache_fd
     keep_names = {keep.name, f"{keep.name}.partial"}
     try:
         for name in os.listdir(cache_fd):
@@ -3983,7 +4013,8 @@ def prune_full_checkpoint_cache(cache_root: Path, keep: Path) -> list[Path]:
             _remove_directory_entry(cache_fd, name, "full checkpoint cache entry")
             removed.append(cache_root / name)
     finally:
-        os.close(cache_fd)
+        if owns_cache_fd:
+            os.close(cache_fd)
     return removed
 
 
@@ -3999,6 +4030,7 @@ def stage_full_checkpoint_files(source_url: str) -> Path:
         create=False,
         label="full checkpoint cache directory",
     )
+    temporary_fd = -1
     try:
         lock_name = f"{destination.name}.lock"
         with os.fdopen(
@@ -4020,7 +4052,6 @@ def stage_full_checkpoint_files(source_url: str) -> Path:
                 temporary.name,
                 "full checkpoint partial directory",
             )
-            os.close(temporary_fd)
             index_name = "model.safetensors.index.json"
             used_delta = False
             try:
@@ -4068,7 +4099,11 @@ def stage_full_checkpoint_files(source_url: str) -> Path:
                                 raise OSError("unsafe checkpoint delta filename")
                             delta_path = temporary / delta_name
                             _reject_symlink_path(delta_path, "full checkpoint delta file")
-                            download(f"{source_url.rstrip('/')}/{delta_name}", delta_path)
+                            _download_checkpoint_entry(
+                                f"{source_url.rstrip('/')}/{delta_name}",
+                                delta_path,
+                                parent_fd=temporary_fd,
+                            )
                             output_path = temporary / filename
                             _reject_symlink_path(output_path, "full checkpoint shard")
                             _reject_symlink_path(
@@ -4081,20 +4116,40 @@ def stage_full_checkpoint_files(source_url: str) -> Path:
                                 output_path,
                                 expected_size=int(spec["size"]),
                                 expected_sha256=str(spec["sha256"]),
+                                _root_fd=cache_fd,
+                                _root_path=destination.parent,
                             )
                             _reject_symlink_path(delta_path, "full checkpoint delta file")
-                            _unlink_path(delta_path, "full checkpoint delta file")
+                            if _stat_regular_entry(
+                                temporary_fd,
+                                delta_name,
+                                "full checkpoint delta file",
+                            ) is not None:
+                                os.unlink(delta_name, dir_fd=temporary_fd)
                         index_path = temporary / index_name
-                        download(f"{source_url.rstrip('/')}/{index_name}", index_path)
-                        if _sha256(index_path) != delta_manifest.get("index_sha256"):
+                        _download_checkpoint_entry(
+                            f"{source_url.rstrip('/')}/{index_name}",
+                            index_path,
+                            parent_fd=temporary_fd,
+                        )
+                        if _sha256(index_path, parent_fd=temporary_fd) != delta_manifest.get("index_sha256"):
                             raise OSError("checkpoint index checksum mismatch")
                         used_delta = True
 
             index_path = temporary / index_name
             if not used_delta:
-                download(f"{source_url.rstrip('/')}/{index_name}", index_path)
+                _download_checkpoint_entry(
+                    f"{source_url.rstrip('/')}/{index_name}",
+                    index_path,
+                    parent_fd=temporary_fd,
+                )
             with os.fdopen(
-                _open_nofollow(index_path, os.O_RDONLY, label="full checkpoint index"),
+                _open_nofollow(
+                    index_name,
+                    os.O_RDONLY,
+                    dir_fd=temporary_fd,
+                    label="full checkpoint index",
+                ),
                 "r",
                 encoding="utf-8",
             ) as source:
@@ -4122,60 +4177,56 @@ def stage_full_checkpoint_files(source_url: str) -> Path:
                     raise OSError("checkpoint delta files do not match the checkpoint index")
             if not used_delta:
                 for filename in shard_names:
-                    download(f"{source_url.rstrip('/')}/{filename}", temporary / filename)
-            temporary_fd = _open_directory_entry_nofollow(
-                cache_fd,
-                temporary.name,
-                "full checkpoint partial directory",
-            )
-            try:
-                cache_manifest = {
-                    "version": 1,
-                    "source_url": source_url,
-                    "index_sha256": _sha256_entry(
-                        temporary_fd,
-                        index_name,
-                        "full checkpoint index",
-                    ),
-                    "files": {},
-                }
-                file_records = cache_manifest["files"]
-                assert isinstance(file_records, dict)
-                for filename in shard_names:
-                    shard_fd = _open_nofollow(
-                        filename,
-                        os.O_RDONLY,
-                        dir_fd=temporary_fd,
-                        label="full checkpoint shard",
+                    _download_checkpoint_entry(
+                        f"{source_url.rstrip('/')}/{filename}",
+                        temporary / filename,
+                        parent_fd=temporary_fd,
                     )
-                    try:
-                        shard_size = os.fstat(shard_fd).st_size
-                    finally:
-                        os.close(shard_fd)
-                    if shard_size <= 0:
-                        raise OSError(f"full checkpoint shard is empty: {filename}")
-                    file_records[filename] = {
-                        "size": shard_size,
-                        "sha256": _sha256_entry(
-                            temporary_fd,
-                            filename,
-                            "full checkpoint shard",
-                        ),
-                    }
-                _write_text_entry_atomic(
+            cache_manifest = {
+                "version": 1,
+                "source_url": source_url,
+                "index_sha256": _sha256_entry(
                     temporary_fd,
-                    _FULL_CHECKPOINT_CACHE_MANIFEST,
-                    json.dumps(cache_manifest, separators=(",", ":")),
-                    encoding="utf-8",
+                    index_name,
+                    "full checkpoint index",
+                ),
+                "files": {},
+            }
+            file_records = cache_manifest["files"]
+            assert isinstance(file_records, dict)
+            for filename in shard_names:
+                shard_fd = _open_nofollow(
+                    filename,
+                    os.O_RDONLY,
+                    dir_fd=temporary_fd,
+                    label="full checkpoint shard",
                 )
-                _write_text_entry_atomic(
-                    temporary_fd,
-                    "READY",
-                    "ready\n",
-                    encoding="ascii",
-                )
-            finally:
-                os.close(temporary_fd)
+                try:
+                    shard_size = os.fstat(shard_fd).st_size
+                finally:
+                    os.close(shard_fd)
+                if shard_size <= 0:
+                    raise OSError(f"full checkpoint shard is empty: {filename}")
+                file_records[filename] = {
+                    "size": shard_size,
+                    "sha256": _sha256_entry(
+                        temporary_fd,
+                        filename,
+                        "full checkpoint shard",
+                    ),
+                }
+            _write_text_entry_atomic(
+                temporary_fd,
+                _FULL_CHECKPOINT_CACHE_MANIFEST,
+                json.dumps(cache_manifest, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            _write_text_entry_atomic(
+                temporary_fd,
+                "READY",
+                "ready\n",
+                encoding="ascii",
+            )
             try:
                 _open_directory_entry_nofollow(
                     cache_fd,
@@ -4198,8 +4249,14 @@ def stage_full_checkpoint_files(source_url: str) -> Path:
             )
             # Keep the old policy until the replacement is complete. Generation
             # still uses it while staging, and a lossless delta needs its files.
-            prune_full_checkpoint_cache(destination.parent, destination)
+            prune_full_checkpoint_cache(
+                destination.parent,
+                destination,
+                _cache_fd=cache_fd,
+            )
     finally:
+        if temporary_fd >= 0:
+            os.close(temporary_fd)
         os.close(cache_fd)
     return destination
 

@@ -396,34 +396,41 @@ def apply_xor_delta_file(
     *,
     expected_size: int,
     expected_sha256: str,
+    _root_fd: int | None = None,
+    _root_path: Path | None = None,
 ) -> None:
     """Reconstruct one target file without materializing an uncompressed delta."""
     temporary_name = f"{target_path.name}.assembling"
-    base_parent_fd = _open_directory_nofollow(
-        base_path.parent,
-        create=False,
-        label="checkpoint base parent",
-    )
-    common_root_path = Path(
-        os.path.commonpath(
-            (
-                os.path.abspath(delta_path.parent),
-                os.path.abspath(target_path.parent),
+    if (_root_fd is None) != (_root_path is None):
+        raise ValueError("checkpoint delta root FD and path must be supplied together")
+    if _root_fd is None:
+        common_root_path = Path(
+            os.path.commonpath(
+                (
+                    os.path.abspath(base_path.parent),
+                    os.path.abspath(delta_path.parent),
+                    os.path.abspath(target_path.parent),
+                )
             )
         )
-    )
-    try:
         common_root_fd = _open_directory_nofollow(
             common_root_path,
             create=False,
             label="checkpoint delta and target root",
         )
-    except BaseException:
-        os.close(base_parent_fd)
-        raise
-    delta_parent_fd = target_parent_fd = -1
+    else:
+        assert _root_path is not None
+        common_root_path = Path(os.path.abspath(_root_path))
+        common_root_fd = os.dup(_root_fd)
+    base_parent_fd = target_parent_fd = delta_parent_fd = -1
     separate_parent_fds = False
     try:
+        base_parent_fd = _open_directory_below(
+            common_root_fd,
+            common_root_path,
+            base_path.parent,
+            label="checkpoint base parent",
+        )
         target_parent_fd = _open_directory_below(
             common_root_fd,
             common_root_path,
@@ -432,7 +439,8 @@ def apply_xor_delta_file(
         )
     except BaseException:
         os.close(common_root_fd)
-        os.close(base_parent_fd)
+        if base_parent_fd >= 0:
+            os.close(base_parent_fd)
         raise
     try:
         if delta_path.parent == target_path.parent:
@@ -446,12 +454,12 @@ def apply_xor_delta_file(
                 label="checkpoint delta parent",
             )
     except BaseException:
+        for descriptor in (target_parent_fd, delta_parent_fd, base_parent_fd):
+            if descriptor >= 0 and descriptor != target_parent_fd:
+                os.close(descriptor)
         if target_parent_fd >= 0:
             os.close(target_parent_fd)
-        if delta_parent_fd >= 0 and separate_parent_fds:
-            os.close(delta_parent_fd)
         os.close(common_root_fd)
-        os.close(base_parent_fd)
         raise
     base_input = delta_input = temporary_output = -1
     temporary_created = False
