@@ -404,6 +404,11 @@ class LinearAdapterReceiverTest(unittest.TestCase):
             with self.assertRaisesRegex(OSError, "symbolic link"):
                 filesystem._write_json(manifest, {"safe": True})
 
+            output_parent = root / "output-parent"
+            output_parent.symlink_to(external, target_is_directory=True)
+            with self.assertRaisesRegex(OSError, "symbolic link"):
+                filesystem._preallocate(output_parent / "output", 8)
+
     def test_receiver_rejects_symlinked_chunk_directory(self):
         filesystem = load_filesystem()
         source_url = "http://source/step_2"
@@ -486,6 +491,176 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                     cache_root,
                     cache_root / "active",
                 )
+
+    def test_delta_cleanup_rejects_a_symlinked_candidate(self):
+        filesystem = load_filesystem()
+        old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
+        try:
+            with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryDirectory() as external:
+                os.environ["PRIME_LORA_CACHE_DIR"] = temporary
+                destination = filesystem.adapter_cache_path("http://source/step_1")
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                candidate = destination.with_name(f"{destination.name}.partial")
+                sentinel = Path(external) / "sentinel"
+                sentinel.write_text("keep", encoding="utf-8")
+                candidate.symlink_to(external, target_is_directory=True)
+                with self.assertRaisesRegex(OSError, "symbolic link"):
+                    filesystem._cleanup_delta_stage_artifacts(destination)
+                self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
+        finally:
+            if old_cache is None:
+                os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+            else:
+                os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+
+    def test_delta_cleanup_removes_a_regular_assembling_file(self):
+        filesystem = load_filesystem()
+        old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                os.environ["PRIME_LORA_CACHE_DIR"] = temporary
+                destination = filesystem.adapter_cache_path("http://source/step_1")
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                assembling = destination.with_name(f"{destination.name}.assembling")
+                assembling.write_bytes(b"private partial output")
+                self.assertTrue(filesystem._cleanup_delta_stage_artifacts(destination))
+                self.assertFalse(assembling.exists())
+        finally:
+            if old_cache is None:
+                os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+            else:
+                os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+
+    def test_full_checkpoint_ready_requires_index_and_shard_hashes(self):
+        filesystem = load_filesystem()
+        source_url = "http://source/checkpoint"
+        old_cache = os.environ.get("PRIME_FULL_CHECKPOINT_CACHE_DIR")
+        try:
+            with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryDirectory() as external:
+                os.environ["PRIME_FULL_CHECKPOINT_CACHE_DIR"] = temporary
+                destination = filesystem.full_checkpoint_cache_path(source_url)
+                destination.mkdir(parents=True)
+                index = {"weight_map": {"x": "model-00001.safetensors"}}
+                index_bytes = json.dumps(index, separators=(",", ":")).encode("utf-8")
+                shard_bytes = b"checkpoint shard"
+                (destination / "READY").write_bytes(b"ready\n")
+                (destination / "model.safetensors.index.json").write_bytes(index_bytes)
+                shard = destination / "model-00001.safetensors"
+                shard.write_bytes(shard_bytes)
+                parent_fd = filesystem._open_directory_nofollow(
+                    destination.parent,
+                    create=False,
+                    label="test checkpoint parent",
+                )
+                try:
+                    self.assertFalse(
+                        filesystem._full_checkpoint_cache_is_valid(
+                            parent_fd,
+                            destination.name,
+                            source_url,
+                        )
+                    )
+                    manifest = {
+                        "version": 1,
+                        "source_url": source_url,
+                        "index_sha256": hashlib.sha256(index_bytes).hexdigest(),
+                        "files": {
+                            shard.name: {
+                                "size": len(shard_bytes),
+                                "sha256": hashlib.sha256(shard_bytes).hexdigest(),
+                            }
+                        },
+                    }
+                    (destination / "checkpoint-cache.json").write_text(
+                        json.dumps(manifest),
+                        encoding="utf-8",
+                    )
+                    self.assertTrue(
+                        filesystem._full_checkpoint_cache_is_valid(
+                            parent_fd,
+                            destination.name,
+                            source_url,
+                        )
+                    )
+                    shard.write_bytes(b"tampered")
+                    self.assertFalse(
+                        filesystem._full_checkpoint_cache_is_valid(
+                            parent_fd,
+                            destination.name,
+                            source_url,
+                        )
+                    )
+                    shard.unlink()
+                    shard.symlink_to(Path(external) / "outside")
+                    with self.assertRaisesRegex(OSError, "symbolic link"):
+                        filesystem._full_checkpoint_cache_is_valid(
+                            parent_fd,
+                            destination.name,
+                            source_url,
+                        )
+                finally:
+                    os.close(parent_fd)
+        finally:
+            if old_cache is None:
+                os.environ.pop("PRIME_FULL_CHECKPOINT_CACHE_DIR", None)
+            else:
+                os.environ["PRIME_FULL_CHECKPOINT_CACHE_DIR"] = old_cache
+
+    def test_full_checkpoint_staging_does_not_return_an_incomplete_ready_cache(self):
+        filesystem = load_filesystem()
+        source_url = "http://source/checkpoint"
+        old_cache = os.environ.get("PRIME_FULL_CHECKPOINT_CACHE_DIR")
+        old_urlopen = filesystem.urllib.request.urlopen
+        old_download = filesystem.download
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                os.environ["PRIME_FULL_CHECKPOINT_CACHE_DIR"] = temporary
+                destination = filesystem.full_checkpoint_cache_path(source_url)
+                destination.mkdir(parents=True)
+                (destination / "READY").write_bytes(b"ready\n")
+                calls: list[str] = []
+                index_bytes = json.dumps(
+                    {"weight_map": {"x": "model-00001.safetensors"}},
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                shard_bytes = b"new checkpoint shard"
+
+                def no_delta_manifest(url: str, **_kwargs):
+                    raise filesystem.HTTPError(url, 404, "not found", {}, None)
+
+                def fake_download(_url, path, **_kwargs):
+                    calls.append(path.name)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(index_bytes if path.name.endswith(".json") else shard_bytes)
+
+                filesystem.urllib.request.urlopen = no_delta_manifest
+                filesystem.download = fake_download
+                result = filesystem.stage_full_checkpoint_files(source_url)
+                self.assertEqual(result, destination)
+                self.assertIn("model.safetensors.index.json", calls)
+                self.assertIn("model-00001.safetensors", calls)
+                parent_fd = filesystem._open_directory_nofollow(
+                    destination.parent,
+                    create=False,
+                    label="test checkpoint parent",
+                )
+                try:
+                    self.assertTrue(
+                        filesystem._full_checkpoint_cache_is_valid(
+                            parent_fd,
+                            destination.name,
+                            source_url,
+                        )
+                    )
+                finally:
+                    os.close(parent_fd)
+        finally:
+            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem.download = old_download
+            if old_cache is None:
+                os.environ.pop("PRIME_FULL_CHECKPOINT_CACHE_DIR", None)
+            else:
+                os.environ["PRIME_FULL_CHECKPOINT_CACHE_DIR"] = old_cache
 
 
 if __name__ == "__main__":

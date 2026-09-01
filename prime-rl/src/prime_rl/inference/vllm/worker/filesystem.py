@@ -64,6 +64,7 @@ _ADAPTER_LINEAR_TRANSPORT = "chunked-bf16-linear-zigzag-sparse-zstd"
 _ADAPTER_KNOWN_TRANSPORTS = {_ADAPTER_DELTA_TRANSPORT, _ADAPTER_LINEAR_TRANSPORT}
 _ADAPTER_KNOWN_CHUNK_CODECS = {"zstd"}
 _ADAPTER_MAX_CHUNKS = 65536
+_FULL_CHECKPOINT_CACHE_MANIFEST = "checkpoint-cache.json"
 _ADAPTER_LANE_TIMEOUT_S = float(os.environ.get("PRIME_LORA_LANE_TIMEOUT_S", "45"))
 _ADAPTER_LANE_RETRIES = int(os.environ.get("PRIME_LORA_LANE_RETRIES", "6"))
 _ADAPTER_VISIBILITY_RETRIES = 300
@@ -153,6 +154,7 @@ def _open_nofollow(
     mode: int = 0o600,
     *,
     dir_fd: int | None = None,
+    label: str = "adapter path",
 ) -> int:
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     if not nofollow:
@@ -163,11 +165,11 @@ def _open_nofollow(
         file_descriptor = os.open(path, flags | nofollow, mode, dir_fd=dir_fd)
     except OSError as exc:
         if exc.errno in {getattr(os, "ELOOP", 40), 40}:
-            raise OSError(f"adapter path is a symbolic link: {path}") from exc
+            raise OSError(f"{label} is a symbolic link: {path}") from exc
         raise
     try:
         if not stat.S_ISREG(os.fstat(file_descriptor).st_mode):
-            raise OSError(f"adapter path is not a regular file: {path}")
+            raise OSError(f"{label} is not a regular file: {path}")
     except BaseException:
         os.close(file_descriptor)
         raise
@@ -220,6 +222,45 @@ def _write_text_atomic(path: Path, value: str, *, encoding: str) -> None:
         os.close(parent_fd)
 
 
+def _write_text_entry_atomic(
+    parent_fd: int,
+    name: str,
+    value: str,
+    *,
+    encoding: str,
+) -> None:
+    temporary_name = f".{name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    file_descriptor = _open_nofollow(
+        temporary_name,
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+        dir_fd=parent_fd,
+        label="adapter temporary file",
+    )
+    try:
+        with os.fdopen(file_descriptor, "wb") as output:
+            output.write(value.encode(encoding))
+            output.flush()
+            os.fsync(output.fileno())
+        try:
+            existing = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None and stat.S_ISLNK(existing.st_mode):
+            raise OSError(f"adapter output is a symbolic link: {name}")
+        os.replace(
+            temporary_name,
+            name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+    except BaseException:
+        try:
+            os.unlink(temporary_name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
+        raise
+
+
 def _read_bytes_nofollow(path: Path | str, *, dir_fd: int | None = None) -> bytes:
     with os.fdopen(_open_nofollow(path, os.O_RDONLY, dir_fd=dir_fd), "rb") as source:
         return source.read()
@@ -232,6 +273,17 @@ def _read_text_nofollow(
     dir_fd: int | None = None,
 ) -> str:
     return _read_bytes_nofollow(path, dir_fd=dir_fd).decode(encoding)
+
+
+def _sha256_entry(parent_fd: int, name: str, label: str) -> str:
+    digest = hashlib.sha256()
+    with os.fdopen(
+        _open_nofollow(name, os.O_RDONLY, dir_fd=parent_fd, label=label),
+        "rb",
+    ) as source:
+        while chunk := source.read(16 * 1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _open_directory_entry_nofollow(parent_fd: int, name: str, label: str) -> int:
@@ -1786,14 +1838,24 @@ def _read_checksum(path: Path) -> str:
 def _preallocate(path: Path, size: int) -> None:
     if not hasattr(os, "posix_fallocate"):
         raise OSError("adapter receiver requires posix_fallocate")
-    file_descriptor = _open_nofollow(
-        path,
-        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+    parent_fd = _open_directory_nofollow(
+        path.parent,
+        create=False,
+        label="adapter preallocation parent",
     )
     try:
-        os.posix_fallocate(file_descriptor, 0, size)
+        file_descriptor = _open_nofollow(
+            path.name,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            dir_fd=parent_fd,
+            label="adapter preallocation file",
+        )
+        try:
+            os.posix_fallocate(file_descriptor, 0, size)
+        finally:
+            os.close(file_descriptor)
     finally:
-        os.close(file_descriptor)
+        os.close(parent_fd)
 
 
 def _pwrite_all(file_descriptor: int, value: bytes, offset: int) -> None:
@@ -2278,40 +2340,57 @@ def _cleanup_delta_stage_artifacts(
     suffixes = (".parts", ".assembling")
     if not preserve_partial:
         suffixes = (".partial", *suffixes)
-    candidates = [destination.with_name(f"{destination.name}{suffix}") for suffix in suffixes]
-    for candidate in candidates:
-        _reject_symlink_path(candidate, "adapter staging path")
-    if not any(candidate.exists() or candidate.is_symlink() for candidate in candidates):
-        return True
-    lock_path = _adapter_reader_lock(destination)
-    _reject_symlink_path(lock_path, "adapter reader lock")
+    candidate_names = [f"{destination.name}{suffix}" for suffix in suffixes]
     try:
-        reader_lock = os.fdopen(
-            _open_nofollow(lock_path, os.O_RDWR | os.O_CREAT),
-            "a+",
+        cache_fd = _open_directory_nofollow(
+            destination.parent,
+            create=False,
+            label="adapter staging parent",
         )
     except FileNotFoundError:
         return True
-    with reader_lock:
+    try:
+        existing_entries: list[tuple[str, bool]] = []
+        for name in candidate_names:
+            try:
+                entry_stat = os.stat(name, dir_fd=cache_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(entry_stat.st_mode):
+                raise OSError(f"adapter staging path is a symbolic link: {name}")
+            if not (stat.S_ISDIR(entry_stat.st_mode) or stat.S_ISREG(entry_stat.st_mode)):
+                raise OSError(f"adapter staging path has an unsafe file type: {name}")
+            existing_entries.append((name, stat.S_ISDIR(entry_stat.st_mode)))
+        if not existing_entries:
+            return True
+        lock_name = f".{destination.name}.readers.lock"
         try:
-            _acquire_stage_lock(reader_lock, deadline, cancel_event)
-        except TimeoutError:
-            return False
-        try:
-            for suffix, candidate in zip(suffixes, candidates):
-                try:
-                    if suffix == ".partial" and candidate.is_dir() and not candidate.is_symlink():
-                        relaying_marker = candidate / _RELAYING_MARKER
-                        _reject_symlink_path(relaying_marker, "adapter relaying marker")
-                        relaying_marker.unlink(missing_ok=True)
-                    if candidate.is_dir() and not candidate.is_symlink():
-                        shutil.rmtree(candidate)
+            reader_lock = os.fdopen(
+                _open_nofollow(
+                    lock_name,
+                    os.O_RDWR | os.O_CREAT,
+                    dir_fd=cache_fd,
+                    label="adapter reader lock",
+                ),
+                "a+",
+            )
+        except FileNotFoundError:
+            return True
+        with reader_lock:
+            try:
+                _acquire_stage_lock(reader_lock, deadline, cancel_event)
+            except TimeoutError:
+                return False
+            try:
+                for name, is_directory in existing_entries:
+                    if is_directory:
+                        _remove_directory_entry(cache_fd, name, "adapter staging path")
                     else:
-                        candidate.unlink(missing_ok=True)
-                except FileNotFoundError:
-                    continue
-        finally:
-            fcntl.flock(reader_lock, fcntl.LOCK_UN)
+                        os.unlink(name, dir_fd=cache_fd)
+            finally:
+                fcntl.flock(reader_lock, fcntl.LOCK_UN)
+    finally:
+        os.close(cache_fd)
     return True
 
 
@@ -3251,6 +3330,102 @@ def full_checkpoint_cache_path(source_url: str) -> Path:
     ).hexdigest()
 
 
+def _full_checkpoint_cache_is_valid(
+    cache_parent_fd: int,
+    directory_name: str,
+    source_url: str,
+) -> bool:
+    """Check the complete immutable contract before reusing a checkpoint."""
+    directory_fd = _open_directory_entry_nofollow(
+        cache_parent_fd,
+        directory_name,
+        "full checkpoint cache entry",
+    )
+    try:
+        if _read_bytes_nofollow("READY", dir_fd=directory_fd) != b"ready\n":
+            return False
+        try:
+            cache_manifest = json.loads(
+                _read_text_nofollow(
+                    _FULL_CHECKPOINT_CACHE_MANIFEST,
+                    encoding="utf-8",
+                    dir_fd=directory_fd,
+                )
+            )
+            index = json.loads(
+                _read_text_nofollow(
+                    "model.safetensors.index.json",
+                    encoding="utf-8",
+                    dir_fd=directory_fd,
+                )
+            )
+        except FileNotFoundError:
+            return False
+        if not isinstance(cache_manifest, dict) or cache_manifest.get("version") != 1:
+            return False
+        if cache_manifest.get("source_url") != source_url:
+            return False
+        if not isinstance(index, dict) or not isinstance(index.get("weight_map"), dict):
+            return False
+        raw_shard_names = list(index["weight_map"].values())
+        if not raw_shard_names or any(
+            not isinstance(name, str)
+            or not name
+            or name in {".", ".."}
+            or Path(name).name != name
+            or not name.endswith(".safetensors")
+            for name in raw_shard_names
+        ):
+            return False
+        shard_names = set(raw_shard_names)
+        files = cache_manifest.get("files")
+        if not isinstance(files, dict) or set(files) != shard_names:
+            return False
+        index_sha256 = cache_manifest.get("index_sha256")
+        if (
+            not isinstance(index_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", index_sha256) is None
+            or _sha256_entry(
+                directory_fd,
+                "model.safetensors.index.json",
+                "full checkpoint index",
+            )
+            != index_sha256
+        ):
+            return False
+        for name in sorted(shard_names):
+            spec = files.get(name)
+            if not isinstance(spec, dict):
+                return False
+            expected_size = spec.get("size")
+            expected_sha256 = spec.get("sha256")
+            if (
+                type(expected_size) is not int
+                or expected_size <= 0
+                or not isinstance(expected_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None
+            ):
+                return False
+            shard_fd = _open_nofollow(
+                name,
+                os.O_RDONLY,
+                dir_fd=directory_fd,
+                label="full checkpoint shard",
+            )
+            try:
+                if os.fstat(shard_fd).st_size != expected_size:
+                    return False
+            finally:
+                os.close(shard_fd)
+            if _sha256_entry(directory_fd, name, "full checkpoint shard") != expected_sha256:
+                return False
+        return True
+    except (FileNotFoundError, ValueError, TypeError, KeyError):
+        return False
+    finally:
+        os.close(directory_fd)
+
+
 def prune_full_checkpoint_cache(cache_root: Path, keep: Path) -> list[Path]:
     """Remove checkpoint directories that are older than the policy being staged."""
     removed: list[Path] = []
@@ -3306,12 +3481,7 @@ def stage_full_checkpoint_files(source_url: str) -> Path:
         ) as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             try:
-                if _directory_entry_has_marker(
-                    cache_fd,
-                    destination.name,
-                    "READY",
-                    "full checkpoint destination",
-                ):
+                if _full_checkpoint_cache_is_valid(cache_fd, destination.name, source_url):
                     return destination
             except FileNotFoundError:
                 pass
@@ -3390,23 +3560,92 @@ def stage_full_checkpoint_files(source_url: str) -> Path:
                             raise OSError("checkpoint index checksum mismatch")
                         used_delta = True
 
+            index_path = temporary / index_name
             if not used_delta:
-                index_path = temporary / index_name
                 download(f"{source_url.rstrip('/')}/{index_name}", index_path)
-                with os.fdopen(
-                    _open_nofollow(index_path, os.O_RDONLY),
-                    "r",
-                    encoding="utf-8",
-                ) as source:
-                    index = json.load(source)
-                shard_names = sorted(set(index["weight_map"].values()))
-                if not shard_names:
-                    raise OSError("full checkpoint index contains no weight shards")
+            with os.fdopen(
+                _open_nofollow(index_path, os.O_RDONLY, label="full checkpoint index"),
+                "r",
+                encoding="utf-8",
+            ) as source:
+                index = json.load(source)
+            if not isinstance(index, dict) or not isinstance(index.get("weight_map"), dict):
+                raise OSError("full checkpoint index has no weight map")
+            raw_shard_names = list(index["weight_map"].values())
+            if not raw_shard_names or any(
+                not isinstance(filename, str)
+                or not filename
+                or filename in {".", ".."}
+                or Path(filename).name != filename
+                or not filename.endswith(".safetensors")
+                for filename in raw_shard_names
+            ):
+                raise OSError("full checkpoint index contains unsafe weight shard names")
+            shard_names = sorted(set(raw_shard_names))
+            if used_delta:
+                delta_files = delta_manifest.get("files")
+                if not isinstance(delta_files, list) or {
+                    spec.get("filename")
+                    for spec in delta_files
+                    if isinstance(spec, dict)
+                } != set(shard_names):
+                    raise OSError("checkpoint delta files do not match the checkpoint index")
+            if not used_delta:
                 for filename in shard_names:
-                    if Path(filename).name != filename or not filename.endswith(".safetensors"):
-                        raise OSError(f"unsafe checkpoint shard name: {filename!r}")
                     download(f"{source_url.rstrip('/')}/{filename}", temporary / filename)
-            _write_text_atomic(temporary / "READY", "ready\n", encoding="utf-8")
+            temporary_fd = _open_directory_entry_nofollow(
+                cache_fd,
+                temporary.name,
+                "full checkpoint partial directory",
+            )
+            try:
+                cache_manifest = {
+                    "version": 1,
+                    "source_url": source_url,
+                    "index_sha256": _sha256_entry(
+                        temporary_fd,
+                        index_name,
+                        "full checkpoint index",
+                    ),
+                    "files": {},
+                }
+                file_records = cache_manifest["files"]
+                assert isinstance(file_records, dict)
+                for filename in shard_names:
+                    shard_fd = _open_nofollow(
+                        filename,
+                        os.O_RDONLY,
+                        dir_fd=temporary_fd,
+                        label="full checkpoint shard",
+                    )
+                    try:
+                        shard_size = os.fstat(shard_fd).st_size
+                    finally:
+                        os.close(shard_fd)
+                    if shard_size <= 0:
+                        raise OSError(f"full checkpoint shard is empty: {filename}")
+                    file_records[filename] = {
+                        "size": shard_size,
+                        "sha256": _sha256_entry(
+                            temporary_fd,
+                            filename,
+                            "full checkpoint shard",
+                        ),
+                    }
+                _write_text_entry_atomic(
+                    temporary_fd,
+                    _FULL_CHECKPOINT_CACHE_MANIFEST,
+                    json.dumps(cache_manifest, separators=(",", ":")),
+                    encoding="utf-8",
+                )
+                _write_text_entry_atomic(
+                    temporary_fd,
+                    "READY",
+                    "ready\n",
+                    encoding="ascii",
+                )
+            finally:
+                os.close(temporary_fd)
             try:
                 _open_directory_entry_nofollow(
                     cache_fd,
