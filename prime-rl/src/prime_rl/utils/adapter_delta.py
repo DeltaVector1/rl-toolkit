@@ -571,8 +571,7 @@ def decode_linear_zigzag_sparse_chunk(
     return target, predictive_correction_bytes(payload)
 
 
-def safetensors_data_offset(path: Path) -> int:
-    """Return the byte offset at which a safetensors file stores tensor data."""
+def _read_safetensors_header(path: Path) -> tuple[int, dict[str, Any], int]:
     size = path.stat().st_size
     if size < 8:
         raise ValueError("safetensors file is shorter than its header length")
@@ -590,7 +589,61 @@ def safetensors_data_offset(path: Path) -> int:
         raise ValueError("safetensors header is not valid JSON") from exc
     if not isinstance(parsed, dict):
         raise ValueError("safetensors header is not an object")
-    return 8 + header_length
+    return 8 + header_length, parsed, size
+
+
+def _validate_bf16_safetensors_header(
+    parsed: dict[str, Any], *, data_offset: int, file_size: int
+) -> None:
+    data_size = file_size - data_offset
+    records: list[tuple[int, int]] = []
+    for name, record in parsed.items():
+        if name == "__metadata__":
+            if not isinstance(record, dict):
+                raise ValueError("safetensors metadata must be an object")
+            continue
+        if not isinstance(record, dict) or record.get("dtype") != "BF16":
+            raise ValueError("predictive transport requires BF16 tensors")
+        shape = record.get("shape")
+        offsets = record.get("data_offsets")
+        if not isinstance(shape, list) or not all(
+            isinstance(dimension, int) and dimension >= 0 for dimension in shape
+        ):
+            raise ValueError("safetensors tensor shape is invalid")
+        if (
+            not isinstance(offsets, list)
+            or len(offsets) != 2
+            or not all(isinstance(value, int) and value >= 0 for value in offsets)
+            or offsets[1] < offsets[0]
+        ):
+            raise ValueError("safetensors tensor data offsets are invalid")
+        element_count = 1
+        for dimension in shape:
+            element_count *= dimension
+        start, end = offsets
+        if end - start != element_count * 2 or end > data_size:
+            raise ValueError("safetensors tensor data coverage is invalid")
+        records.append((start, end))
+    if not records:
+        raise ValueError("safetensors file contains no tensors")
+    records.sort()
+    cursor = 0
+    for start, end in records:
+        if start != cursor:
+            raise ValueError("safetensors tensor data coverage is not contiguous")
+        cursor = end
+    if cursor != data_size:
+        raise ValueError("safetensors tensor data does not cover the file")
+
+
+def safetensors_data_offset(path: Path, *, require_bf16: bool = False) -> int:
+    """Return the byte offset at which a safetensors file stores tensor data."""
+    data_offset, parsed, file_size = _read_safetensors_header(path)
+    if require_bf16:
+        _validate_bf16_safetensors_header(
+            parsed, data_offset=data_offset, file_size=file_size
+        )
+    return data_offset
 
 
 def sha256_file(path: Path) -> str:
@@ -791,12 +844,12 @@ def publish_adapter_manifest(
             raise ValueError("predictive base adapter configuration identity differs")
         if sha256_file(base2_dir / adapter_config_name) != target_config_sha256:
             raise ValueError("predictive second-base adapter configuration identity differs")
-        data_offset = safetensors_data_offset(target_weights)
+        data_offset = safetensors_data_offset(target_weights, require_bf16=True)
         if data_offset % 2 or target_weights.stat().st_size % 2:
             raise ValueError("predictive safetensors data and file size must be even-aligned")
-        if safetensors_data_offset(base_dir / adapter_weights_name) != data_offset:
+        if safetensors_data_offset(base_dir / adapter_weights_name, require_bf16=True) != data_offset:
             raise ValueError("predictive base safetensors data offset differs")
-        if safetensors_data_offset(base2_dir / adapter_weights_name) != data_offset:
+        if safetensors_data_offset(base2_dir / adapter_weights_name, require_bf16=True) != data_offset:
             raise ValueError("predictive second-base safetensors data offset differs")
         selected_mode = "predictive"
     else:
@@ -845,7 +898,7 @@ def publish_adapter_manifest(
     manifest: dict[str, Any] = {
         "version": 2 if selected_mode == "predictive" else 1,
         "kind": "lora-adapter",
-        "mode": selected_mode,
+        "mode": "delta" if selected_mode == "predictive" else selected_mode,
         "target_step": target_step,
         "base_step": base_step,
         "full_size": weights_record["size"],

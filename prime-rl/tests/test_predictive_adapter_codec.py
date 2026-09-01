@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import struct
 import tempfile
 import unittest
@@ -18,6 +19,24 @@ SPEC.loader.exec_module(adapter_delta)
 def safetensor_bytes(words: list[int]) -> bytes:
     header = b'{"x":0} '
     return struct.pack("<Q", len(header)) + header + np.asarray(words, dtype="<u2").tobytes()
+
+
+def valid_safetensor_bytes(words: list[int], dtype: str = "BF16") -> bytes:
+    data = np.asarray(words, dtype="<u2").tobytes()
+    element_size = 2 if dtype == "BF16" else 4
+    header = json.dumps(
+        {
+            "x": {
+                "dtype": dtype,
+                "shape": [len(data) // element_size],
+                "data_offsets": [0, len(data)],
+            }
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if (8 + len(header)) % 2:
+        header += b" "
+    return struct.pack("<Q", len(header)) + header + data
 
 
 class PredictiveAdapterCodecTest(unittest.TestCase):
@@ -75,9 +94,12 @@ class PredictiveAdapterCodecTest(unittest.TestCase):
             base1_words = [0x4000] * 1024
             target_words = [0x4000] * 1024
             target_words[700] = 0x4040
-            (directories[0] / "adapter_model.safetensors").write_bytes(safetensor_bytes(base2_words))
-            (directories[1] / "adapter_model.safetensors").write_bytes(safetensor_bytes(base1_words))
-            (directories[2] / "adapter_model.safetensors").write_bytes(safetensor_bytes(target_words))
+            (directories[0] / "adapter_model.safetensors").write_bytes(valid_safetensor_bytes(base2_words))
+            (directories[1] / "adapter_model.safetensors").write_bytes(valid_safetensor_bytes(base1_words))
+            (directories[2] / "adapter_model.safetensors").write_bytes(valid_safetensor_bytes(target_words))
+            data_offset = int.from_bytes(
+                (directories[2] / "adapter_model.safetensors").read_bytes()[:8], "little"
+            ) + 8
             manifest = adapter_delta.publish_adapter_manifest(
                 directories[2],
                 directories[1],
@@ -89,10 +111,14 @@ class PredictiveAdapterCodecTest(unittest.TestCase):
                 max_workers=1,
             )
             self.assertEqual(manifest["version"], 2)
+            self.assertEqual(manifest["mode"], "delta")
             self.assertEqual(manifest["transport"], adapter_delta.predictive_transport_name)
-            self.assertEqual(manifest["data_offset"], 16)
+            self.assertEqual(manifest["data_offset"], data_offset)
             self.assertEqual(manifest["chunk_alignment"], 2)
-            self.assertEqual(manifest["chunk_coverage"], {"offset": 0, "size": 2064})
+            self.assertEqual(
+                manifest["chunk_coverage"],
+                {"offset": 0, "size": (directories[2] / "adapter_model.safetensors").stat().st_size},
+            )
             self.assertEqual(manifest["base2_step"], 1)
             self.assertTrue(all(item["offset"] % 2 == 0 and item["raw_size"] % 2 == 0 for item in manifest["chunks"]))
             with self.assertRaises(ValueError):
@@ -105,6 +131,25 @@ class PredictiveAdapterCodecTest(unittest.TestCase):
                     base2_step=1,
                     chunk_size=1024,
                     max_workers=1,
+                )
+
+    def test_predictive_manifest_rejects_non_bf16_tensor(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            directories = [root / f"step_{step}" for step in (1, 2, 3)]
+            for directory in directories:
+                directory.mkdir()
+                (directory / "adapter_config.json").write_text("{}", encoding="utf-8")
+            words = [0x3F80] * 128
+            (directories[0] / "adapter_model.safetensors").write_bytes(valid_safetensor_bytes(words))
+            (directories[1] / "adapter_model.safetensors").write_bytes(valid_safetensor_bytes(words))
+            invalid_dtype = valid_safetensor_bytes(words).replace(b'"BF16"', b'"FP16"')
+            (directories[2] / "adapter_model.safetensors").write_bytes(invalid_dtype)
+            with self.assertRaisesRegex(ValueError, "requires BF16"):
+                adapter_delta.publish_adapter_manifest(
+                    directories[2], directories[1], base2_dir=directories[0],
+                    target_step=3, base_step=2, base2_step=1,
+                    chunk_size=1024, max_workers=1,
                 )
 
 
