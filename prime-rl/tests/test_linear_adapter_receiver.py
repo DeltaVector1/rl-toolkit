@@ -301,6 +301,117 @@ class LinearAdapterReceiverTest(unittest.TestCase):
             filesystem._decode_linear_transport_chunk = old_decode
             filesystem._delta_stage_timeout_s = old_timeout
 
+    def test_receiver_rejects_symlinked_partial_before_external_write(self):
+        filesystem = load_filesystem()
+        source_url = "http://source/step_2"
+        old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
+        try:
+            with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryDirectory() as external:
+                os.environ["PRIME_LORA_CACHE_DIR"] = temporary
+                destination = filesystem.adapter_cache_path(source_url)
+                partial = destination.with_name(f"{destination.name}.partial")
+                Path(external, "sentinel").write_text("do not change", encoding="utf-8")
+                partial.symlink_to(external, target_is_directory=True)
+                with self.assertRaisesRegex(OSError, "partial directory is a symbolic link"):
+                    filesystem._stage_chunked_linear_adapter(source_url, {}, {})
+                self.assertTrue(partial.is_symlink())
+                self.assertEqual(
+                    Path(external, "sentinel").read_text(encoding="utf-8"),
+                    "do not change",
+                )
+                self.assertEqual(list(Path(external).iterdir()), [Path(external, "sentinel")])
+
+                partial.unlink()
+                destination.symlink_to(external, target_is_directory=True)
+                with self.assertRaisesRegex(OSError, "destination is a symbolic link"):
+                    filesystem._stage_chunked_linear_adapter(source_url, {}, {})
+                self.assertTrue(destination.is_symlink())
+                self.assertEqual(list(Path(external).iterdir()), [Path(external, "sentinel")])
+        finally:
+            if old_cache is None:
+                os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+            else:
+                os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+
+    def test_inner_adapter_files_reject_symlinks(self):
+        filesystem = load_filesystem()
+        with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryDirectory() as external:
+            root = Path(temporary)
+            external_file = Path(external, "outside")
+            external_file.write_bytes(b"outside")
+
+            output = root / "output"
+            output.symlink_to(external_file)
+            with self.assertRaisesRegex(OSError, "symbolic link"):
+                filesystem._preallocate(output, 8)
+
+            incoming = root / "incoming"
+            incoming.symlink_to(external_file)
+            with self.assertRaisesRegex(OSError, "symbolic link"):
+                filesystem.download("http://source/file", incoming, expected_size=8)
+
+            proof = root / "chunk.done"
+            proof.symlink_to(external_file)
+            with self.assertRaisesRegex(OSError, "symbolic link"):
+                filesystem._proof_identity_matches(proof, {}, completed=True)
+
+            manifest = root / "manifest.json"
+            manifest.symlink_to(external_file)
+            with self.assertRaisesRegex(OSError, "symbolic link"):
+                filesystem._write_json(manifest, {"safe": True})
+
+    def test_receiver_rejects_symlinked_chunk_directory(self):
+        filesystem = load_filesystem()
+        source_url = "http://source/step_2"
+        transport = {
+            "base_url": "http://source/step_1",
+            "base_sha256": "a" * 64,
+            "base_size": 8,
+            "base_config_size": 3,
+            "base_config_sha256": "b" * 64,
+            "base2_url": "http://source/step_0",
+            "base2_sha256": "c" * 64,
+            "base2_size": 8,
+            "base2_config_size": 3,
+            "base2_config_sha256": "d" * 64,
+            "target_sha256": "e" * 64,
+            "target_size": 8,
+            "config_sha256": "f" * 64,
+            "config_size": 3,
+            "chunks": [],
+        }
+        old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
+        old_base = filesystem._verified_adapter_base
+        try:
+            with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryDirectory() as external:
+                os.environ["PRIME_LORA_CACHE_DIR"] = temporary
+                destination = filesystem.adapter_cache_path(source_url)
+                partial = destination.with_name(f"{destination.name}.partial")
+                partial.mkdir(parents=True)
+                (partial / "transport-manifest.json").write_text(
+                    json.dumps(transport, sort_keys=True, separators=(",", ":")),
+                    encoding="utf-8",
+                )
+                (partial / "transport-chunks").symlink_to(external, target_is_directory=True)
+                filesystem._verified_adapter_base = lambda *_args, **_kwargs: (
+                    Path(temporary) / "base-model",
+                    Path(temporary) / "base-config",
+                )
+                with self.assertRaisesRegex(OSError, "chunk directory is a symbolic link"):
+                    filesystem._stage_chunked_linear_adapter(
+                        source_url,
+                        transport,
+                        {},
+                    )
+                self.assertTrue((partial / "transport-chunks").is_symlink())
+                self.assertEqual(list(Path(external).iterdir()), [])
+        finally:
+            if old_cache is None:
+                os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+            else:
+                os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+            filesystem._verified_adapter_base = old_base
+
 
 if __name__ == "__main__":
     unittest.main()
