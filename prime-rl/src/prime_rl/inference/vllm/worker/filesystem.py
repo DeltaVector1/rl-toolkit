@@ -23,7 +23,6 @@ from vllm.model_executor.model_loader import DefaultModelLoader, get_model_loade
 from prime_rl.utils.checkpoint_delta import (
     DELTA_MANIFEST,
     apply_xor_delta_file,
-    sha256_file,
 )
 
 try:
@@ -434,6 +433,36 @@ def _unlink_path(path: Path, label: str) -> None:
             pass
     finally:
         os.close(parent_fd)
+
+
+def _path_stat(path: Path, label: str) -> os.stat_result | None:
+    try:
+        parent_fd = _open_directory_nofollow(
+            path.parent,
+            create=False,
+            label=f"{label} parent",
+        )
+    except FileNotFoundError:
+        return None
+    try:
+        try:
+            entry_stat = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        if stat.S_ISLNK(entry_stat.st_mode):
+            raise OSError(f"{label} is a symbolic link: {path}")
+        return entry_stat
+    finally:
+        os.close(parent_fd)
+
+
+def _path_regular_size(path: Path, label: str) -> int | None:
+    entry_stat = _path_stat(path, label)
+    if entry_stat is None:
+        return None
+    if not stat.S_ISREG(entry_stat.st_mode):
+        raise OSError(f"{label} is not a regular file: {path}")
+    return entry_stat.st_size
 
 
 def _configured_download_streams() -> int:
@@ -1290,9 +1319,19 @@ def _proof_identity_matches(
 
 def _discard_proof(path: Path) -> None:
     """Remove only a regular proof."""
-    _reject_symlink_path(path, "adapter proof path")
-    if path.is_file():
-        path.unlink(missing_ok=True)
+    try:
+        parent_fd = _open_directory_nofollow(
+            path.parent,
+            create=False,
+            label="adapter proof parent",
+        )
+    except FileNotFoundError:
+        return
+    try:
+        if _stat_regular_entry(parent_fd, path.name, "adapter proof path") is not None:
+            os.unlink(path.name, dir_fd=parent_fd)
+    finally:
+        os.close(parent_fd)
 
 
 def _publish_relay_manifest(
@@ -2225,9 +2264,11 @@ def _stage_chunked_linear_adapter(
     chunks = sorted(chunks, key=lambda item: int(item["offset"]))
     transport_identity = json.dumps(transport, sort_keys=True, separators=(",", ":"))
     identity_path = temporary / "transport-manifest.json"
-    if temporary.exists() and not temporary.is_dir():
-        temporary.unlink()
-    if temporary.is_dir():
+    temporary_stat = _path_stat(temporary, "adapter partial directory")
+    if temporary_stat is not None and not stat.S_ISDIR(temporary_stat.st_mode):
+        _unlink_path(temporary, "adapter partial directory")
+        temporary_stat = None
+    if temporary_stat is not None:
         _reject_symlink_path(identity_path, "adapter transport manifest")
         try:
             with os.fdopen(_open_nofollow(identity_path, os.O_RDONLY), "r", encoding="utf-8") as source:
@@ -2248,7 +2289,7 @@ def _stage_chunked_linear_adapter(
             continue
         chunk_path = chunk_root / Path(str(item["file"])).name
         _reject_symlink_path(chunk_path, "adapter transport chunk")
-        if not chunk_path.is_file() or chunk_path.stat().st_size != int(item["wire_size"]):
+        if _path_regular_size(chunk_path, "adapter transport chunk") != int(item["wire_size"]):
             continue
         done_path = _proof_path(chunk_path, _COMPLETED_SUFFIX)
         wire_ready_path = _proof_path(chunk_path, _WIRE_READY_SUFFIX)
@@ -2305,7 +2346,7 @@ def _stage_chunked_linear_adapter(
     lane_urls = _adapter_source_urls(source_url)
     output_path = temporary / _ADAPTER_FILES[1]
     _reject_symlink_path(output_path, "adapter output")
-    if not output_path.is_file() or output_path.stat().st_size != target_size:
+    if _path_regular_size(output_path, "adapter output") != target_size:
         _preallocate(output_path, target_size)
 
     # Publish configuration atomically before the relay index. The peer must
@@ -2376,7 +2417,7 @@ def _stage_chunked_linear_adapter(
             resume_hash_started = time.monotonic()
             try:
                 if (
-                    output_path.stat().st_size == target_size
+                    _path_regular_size(output_path, "adapter output") == target_size
                     and _sha256_region(output_path, offset, raw_size, deadline, cancel_event)
                     == completed_proof["output_sha256"]
                 ):
@@ -2391,7 +2432,7 @@ def _stage_chunked_linear_adapter(
             finally:
                 with reconstruct_lock:
                     reconstruct_seconds += time.monotonic() - resume_hash_started
-        if completed_path.exists() or completed_path.is_symlink():
+        if _path_stat(completed_path, "adapter completed proof") is not None:
             _discard_proof(completed_path)
 
         wire_ready_valid, _ = _proof_identity_matches(
@@ -2400,9 +2441,7 @@ def _stage_chunked_linear_adapter(
         if wire_ready_valid:
             try:
                 if (
-                    not chunk_path.is_symlink()
-                    and chunk_path.is_file()
-                    and chunk_path.stat().st_size == wire_size
+                    _path_regular_size(chunk_path, "adapter transport chunk") == wire_size
                     and _sha256(chunk_path, deadline, cancel_event) == wire_sha256
                 ):
                     encoded = _read_bytes_nofollow(chunk_path)
@@ -2413,7 +2452,7 @@ def _stage_chunked_linear_adapter(
             if not wire_ready_valid:
                 _discard_proof(wire_ready_path)
         if not wire_ready_valid:
-            if wire_ready_path.exists() or wire_ready_path.is_symlink():
+            if _path_stat(wire_ready_path, "adapter wire proof") is not None:
                 _discard_proof(wire_ready_path)
 
             chunk_lane = index % len(lane_urls)
@@ -2530,10 +2569,10 @@ def _stage_chunked_linear_adapter(
     finally:
         with reconstruct_lock:
             reconstruct_seconds += time.monotonic() - target_hash_started
-    if output_path.stat().st_size != target_size:
+    if _path_regular_size(output_path, "adapter output") != target_size:
         raise OSError("reconstructed version-two adapter size mismatch")
 
-    if not config_path.is_file() or _sha256(config_path, deadline, cancel_event) != config_sha256:
+    if _path_regular_size(config_path, "adapter configuration") is None or _sha256(config_path, deadline, cancel_event) != config_sha256:
         raise OSError("version-two adapter configuration checksum mismatch")
     _publish_relay_manifest(
         temporary,
@@ -2563,7 +2602,7 @@ def _stage_chunked_linear_adapter(
     with _adapter_stage_publish_lock:
         _check_deadline(deadline, cancel_event)
         _reject_symlink_path(temporary / _RELAYING_MARKER, "adapter relaying marker")
-        (temporary / _RELAYING_MARKER).unlink(missing_ok=True)
+        _unlink_path(temporary / _RELAYING_MARKER, "adapter relaying marker")
         ready = temporary / "READY"
         _write_text_atomic(ready, "ready\n", encoding="utf-8")
         with os.fdopen(
@@ -2572,7 +2611,7 @@ def _stage_chunked_linear_adapter(
         ) as reader_lock:
             _acquire_stage_lock(reader_lock, deadline, cancel_event)
             _check_deadline(deadline, cancel_event)
-            if destination.exists():
+            if _path_stat(destination, "adapter destination") is not None:
                 retired = destination.with_name(f"{destination.name}.retired-{time.time_ns()}-{os.getpid()}")
                 _replace_paths(destination, retired, "retired adapter")
             _replace_paths(temporary, destination, "adapter publish")
@@ -2706,9 +2745,11 @@ def _stage_chunked_xor_adapter(
     chunks = sorted(chunks, key=lambda item: int(item["offset"]))
     transport_identity = json.dumps(transport, sort_keys=True, separators=(",", ":"))
     identity_path = temporary / "transport-manifest.json"
-    if temporary.exists() and not temporary.is_dir():
-        temporary.unlink()
-    if temporary.is_dir():
+    temporary_stat = _path_stat(temporary, "adapter partial directory")
+    if temporary_stat is not None and not stat.S_ISDIR(temporary_stat.st_mode):
+        _unlink_path(temporary, "adapter partial directory")
+        temporary_stat = None
+    if temporary_stat is not None:
         _reject_symlink_path(identity_path, "adapter transport manifest")
         try:
             with os.fdopen(_open_nofollow(identity_path, os.O_RDONLY), "r", encoding="utf-8") as source:
@@ -2732,7 +2773,7 @@ def _stage_chunked_xor_adapter(
             continue
         chunk_path = chunk_root / Path(str(item["file"])).name
         _reject_symlink_path(chunk_path, "adapter transport chunk")
-        if chunk_path.is_file() and chunk_path.stat().st_size == int(item["wire_size"]):
+        if _path_regular_size(chunk_path, "adapter transport chunk") == int(item["wire_size"]):
             progress_bytes += int(item["wire_size"])
     last_status = 0.0
 
@@ -2777,7 +2818,7 @@ def _stage_chunked_xor_adapter(
     lane_urls = _adapter_source_urls(source_url)
     output_path = temporary / _ADAPTER_FILES[1]
     _reject_symlink_path(output_path, "adapter output")
-    if not output_path.is_file() or output_path.stat().st_size != target_size:
+    if _path_regular_size(output_path, "adapter output") != target_size:
         _preallocate(output_path, target_size)
 
     def fetch(index: int, item: dict[str, object]) -> None:
@@ -2796,7 +2837,7 @@ def _stage_chunked_xor_adapter(
         completed_path = chunk_path.with_name(f"{chunk_path.name}.done")
         _reject_symlink_path(completed_path, "adapter completed proof")
 
-        if completed_path.is_file():
+        if _path_regular_size(completed_path, "adapter completed proof") is not None:
             try:
                 proof = json.loads(_read_text_nofollow(completed_path, encoding="utf-8"))
                 proof_matches = (
@@ -2816,7 +2857,7 @@ def _stage_chunked_xor_adapter(
                 _check_deadline(deadline, cancel_event)
                 try:
                     output_matches = (
-                        output_path.stat().st_size == target_size
+                        _path_regular_size(output_path, "adapter output") == target_size
                         and _sha256_region(
                             output_path,
                             offset,
@@ -2832,7 +2873,7 @@ def _stage_chunked_xor_adapter(
                     output_matches = False
                 if output_matches:
                     return
-            completed_path.unlink(missing_ok=True)
+            _unlink_path(completed_path, "adapter completed proof")
 
         chunk_lane = index % len(lane_urls)
 
@@ -2906,7 +2947,7 @@ def _stage_chunked_xor_adapter(
     _reject_symlink_path(output_path, "adapter output")
     if _sha256(output_path, deadline, cancel_event) != target_sha256:
         raise OSError("reconstructed adapter checksum mismatch")
-    if output_path.stat().st_size != target_size:
+    if _path_regular_size(output_path, "adapter output") != target_size:
         raise OSError("reconstructed adapter size mismatch")
 
     config_path = temporary / _ADAPTER_FILES[0]
@@ -2956,7 +2997,7 @@ def _stage_chunked_xor_adapter(
         ) as reader_lock:
             _acquire_stage_lock(reader_lock, deadline, cancel_event)
             _check_deadline(deadline, cancel_event)
-            if destination.exists():
+            if _path_stat(destination, "adapter destination") is not None:
                 retired = destination.with_name(
                     f"{destination.name}.retired-{time.time_ns()}-{os.getpid()}"
                 )
@@ -2983,26 +3024,6 @@ def _stage_chunked_xor_adapter(
     return destination
 
 
-def _hold_download_parent(function):
-    @wraps(function)
-    def wrapped(*args, **kwargs):
-        destination = args[1] if len(args) > 1 else kwargs["destination"]
-        destination = Path(destination)
-        _reject_symlink_path(destination, "adapter download destination")
-        parent_fd = _open_directory_nofollow(
-            destination.parent,
-            create=False,
-            label="adapter download parent",
-        )
-        try:
-            return function(*args, **kwargs, _parent_fd=parent_fd)
-        finally:
-            os.close(parent_fd)
-
-    return wrapped
-
-
-@_hold_download_parent
 def download(
     source_url: str,
     destination: Path,
@@ -3016,7 +3037,47 @@ def download(
     cancel_event: threading.Event | None = None,
     per_request_timeout_seconds: float | None = None,
     retry_http_statuses: set[int] | None = None,
-    _parent_fd: int,
+) -> None:
+    destination = Path(destination)
+    _reject_symlink_path(destination, "adapter download destination")
+    parent_fd = _open_directory_nofollow(
+        destination.parent,
+        create=False,
+        label="adapter download parent",
+    )
+    try:
+        return _download_with_parent(
+            source_url,
+            destination,
+            expected_size=expected_size,
+            expected_sha256=expected_sha256,
+            progress=progress,
+            source_urls=source_urls,
+            parallel_ranges=parallel_ranges,
+            deadline=deadline,
+            cancel_event=cancel_event,
+            per_request_timeout_seconds=per_request_timeout_seconds,
+            retry_http_statuses=retry_http_statuses,
+            parent_fd=parent_fd,
+        )
+    finally:
+        os.close(parent_fd)
+
+
+def _download_with_parent(
+    source_url: str,
+    destination: Path,
+    *,
+    expected_size: int | None = None,
+    expected_sha256: str | None = None,
+    progress=None,
+    source_urls: list[str] | None = None,
+    parallel_ranges: bool = True,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+    per_request_timeout_seconds: float | None = None,
+    retry_http_statuses: set[int] | None = None,
+    parent_fd: int,
 ) -> None:
     _check_deadline(deadline, cancel_event)
     if per_request_timeout_seconds is not None and (
@@ -3039,7 +3100,7 @@ def download(
     )
     _check_deadline(deadline, cancel_event)
     destination_stat = _stat_regular_entry(
-        _parent_fd,
+        parent_fd,
         destination.name,
         "adapter download destination",
     )
@@ -3048,10 +3109,10 @@ def download(
             destination,
             deadline,
             cancel_event,
-            parent_fd=_parent_fd,
+            parent_fd=parent_fd,
         ) == expected_sha256:
             return
-        os.unlink(destination.name, dir_fd=_parent_fd)
+        os.unlink(destination.name, dir_fd=parent_fd)
 
     # Full-checkpoint tunnels are not adapter sources. Reusing their 128-port
     # list here created 128 adapter lanes on every replica and collapsed the
@@ -3077,13 +3138,13 @@ def download(
             _check_deadline(deadline, cancel_event)
             try:
                 destination_stat = _stat_regular_entry(
-                    _parent_fd,
+                    parent_fd,
                     destination.name,
                     "adapter download destination",
                 )
                 offset = destination_stat.st_size if destination_stat is not None else 0
                 if offset > total:
-                    os.unlink(destination.name, dir_fd=_parent_fd)
+                    os.unlink(destination.name, dir_fd=parent_fd)
                     offset = 0
                 request = urllib.request.Request(
                     source_urls[attempt % len(source_urls)],
@@ -3103,7 +3164,7 @@ def download(
                     ),
                 ) as response:
                     if offset and response.status != 206:
-                        os.unlink(destination.name, dir_fd=_parent_fd)
+                        os.unlink(destination.name, dir_fd=parent_fd)
                         raise OSError("adapter server did not honor byte range")
                     with os.fdopen(
                         _open_nofollow(
@@ -3111,7 +3172,7 @@ def download(
                             os.O_WRONLY
                             | os.O_CREAT
                             | (os.O_APPEND if offset else os.O_TRUNC),
-                            dir_fd=_parent_fd,
+                            dir_fd=parent_fd,
                             label="adapter download destination",
                         ),
                         "ab" if offset else "wb",
@@ -3127,7 +3188,7 @@ def download(
                             if progress is not None:
                                 progress(0, len(chunk))
                 destination_stat = _stat_regular_entry(
-                    _parent_fd,
+                    parent_fd,
                     destination.name,
                     "adapter download destination",
                 )
@@ -3137,11 +3198,11 @@ def download(
                     destination,
                     deadline,
                     cancel_event,
-                    parent_fd=_parent_fd,
+                    parent_fd=parent_fd,
                 ) != expected_sha256:
                     # A complete but bad file must not be resumed from EOF on
                     # the next bounded attempt.
-                    os.unlink(destination.name, dir_fd=_parent_fd)
+                    os.unlink(destination.name, dir_fd=parent_fd)
                     raise OSError(f"adapter checksum mismatch: {destination.name}")
                 return
             except HTTPError as exc:
@@ -3186,7 +3247,7 @@ def download(
     parts_name = parts_dir.name
     _check_cancelled(cancel_event)
     parts_fd = _ensure_directory_entry(
-        _parent_fd,
+        parent_fd,
         parts_name,
         "adapter parts directory",
     )
@@ -3222,9 +3283,9 @@ def download(
             # parts; never remove a published adapter directory here.
             os.close(parts_fd)
             parts_fd = -1
-            _remove_directory_entry(_parent_fd, parts_name, "adapter parts directory")
+            _remove_directory_entry(parent_fd, parts_name, "adapter parts directory")
             parts_fd = _ensure_directory_entry(
-                _parent_fd,
+                parent_fd,
                 parts_name,
                 "adapter parts directory",
             )
@@ -3258,7 +3319,7 @@ def download(
         assembling_fd = _open_nofollow(
             assembling.name,
             os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-            dir_fd=_parent_fd,
+            dir_fd=parent_fd,
             label="adapter assembling file",
         )
         try:
@@ -3286,7 +3347,7 @@ def download(
             if assembling_fd >= 0:
                 os.close(assembling_fd)
         assembling_stat = _stat_regular_entry(
-            _parent_fd,
+            parent_fd,
             assembling.name,
             "adapter assembling file",
         )
@@ -3296,27 +3357,27 @@ def download(
             assembling,
             deadline,
             cancel_event,
-            parent_fd=_parent_fd,
+            parent_fd=parent_fd,
         ) != expected_sha256:
             # Part sizes alone cannot detect a bad byte from a reset connection.
             # Drop the private parts after a whole-file mismatch so the next
             # stage attempt does not repeatedly assemble the same bad payload.
             os.close(parts_fd)
             parts_fd = -1
-            _remove_directory_entry(_parent_fd, parts_name, "adapter parts directory")
-            os.unlink(assembling.name, dir_fd=_parent_fd)
+            _remove_directory_entry(parent_fd, parts_name, "adapter parts directory")
+            os.unlink(assembling.name, dir_fd=parent_fd)
             raise OSError(f"adapter checksum mismatch: {destination.name}")
         _check_deadline(deadline, cancel_event)
-        _stat_regular_entry(_parent_fd, destination.name, "adapter download destination")
+        _stat_regular_entry(parent_fd, destination.name, "adapter download destination")
         os.replace(
             assembling.name,
             destination.name,
-            src_dir_fd=_parent_fd,
-            dst_dir_fd=_parent_fd,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
         )
         os.close(parts_fd)
         parts_fd = -1
-        _remove_directory_entry(_parent_fd, parts_name, "adapter parts directory")
+        _remove_directory_entry(parent_fd, parts_name, "adapter parts directory")
     finally:
         if parts_fd >= 0:
             os.close(parts_fd)
@@ -3419,7 +3480,7 @@ def stage_lora_adapter_files(
                 ):
                     raise OSError("adapter transport target differs from source manifest")
                 _reject_symlink_path(destination / "READY", "adapter ready marker")
-                if (destination / "READY").is_file():
+                if _path_regular_size(destination / "READY", "adapter ready marker") is not None:
                     try:
                         _reject_symlink_path(destination / "transport.json", "adapter transport record")
                         with os.fdopen(
@@ -3455,14 +3516,20 @@ def stage_lora_adapter_files(
                             )
                         )
                         and _relay_manifest_matches(destination, source_url, transport)
-                        and (destination / _ADAPTER_FILES[1]).is_file()
+                        and _path_regular_size(
+                            destination / _ADAPTER_FILES[1],
+                            "adapter model",
+                        ) is not None
                         and _sha256(
                             destination / _ADAPTER_FILES[1],
                             delta_deadline,
                             cancel_event,
                         )
                         == transport["target_sha256"]
-                        and (destination / _ADAPTER_FILES[0]).is_file()
+                        and _path_regular_size(
+                            destination / _ADAPTER_FILES[0],
+                            "adapter configuration",
+                        ) is not None
                         and _sha256(
                             destination / _ADAPTER_FILES[0],
                             delta_deadline,
@@ -3509,7 +3576,7 @@ def stage_lora_adapter_files(
                     )
                 raise OSError("adapter delta transport is unsupported")
             _reject_symlink_path(destination / "READY", "adapter ready marker")
-            if (destination / "READY").is_file():
+            if _path_regular_size(destination / "READY", "adapter ready marker") is not None:
                 try:
                     _reject_symlink_path(destination / "manifest.json", "adapter manifest")
                     with os.fdopen(
@@ -3608,7 +3675,7 @@ def stage_lora_adapter_files(
                 for name in _ADAPTER_FILES:
                     path = temporary / name
                     _reject_symlink_path(path, "adapter file")
-                    if path.is_file() and path.stat().st_size == int(files[name]["size"]):
+                    if _path_regular_size(path, "adapter file") == int(files[name]["size"]):
                         progress_bytes += int(files[name]["size"])
             _write_json(temporary / "manifest.json", manifest)
             source_transport_manifest = transport.get("source_manifest") if isinstance(transport, dict) else None
@@ -3644,7 +3711,7 @@ def stage_lora_adapter_files(
                 ) as reader_lock:
                     _acquire_stage_lock(reader_lock, None, cancel_event)
                     _check_cancelled(cancel_event)
-                    if destination.exists():
+                    if _path_stat(destination, "adapter destination") is not None:
                         retired = destination.with_name(
                             f"{destination.name}.retired-{time.time_ns()}-{os.getpid()}"
                         )
@@ -3919,10 +3986,10 @@ def stage_full_checkpoint_files(source_url: str) -> Path:
                                 expected_sha256=str(spec["sha256"]),
                             )
                             _reject_symlink_path(delta_path, "full checkpoint delta file")
-                            delta_path.unlink()
+                            _unlink_path(delta_path, "full checkpoint delta file")
                         index_path = temporary / index_name
                         download(f"{source_url.rstrip('/')}/{index_name}", index_path)
-                        if sha256_file(index_path) != delta_manifest.get("index_sha256"):
+                        if _sha256(index_path) != delta_manifest.get("index_sha256"):
                             raise OSError("checkpoint index checksum mismatch")
                         used_delta = True
 
