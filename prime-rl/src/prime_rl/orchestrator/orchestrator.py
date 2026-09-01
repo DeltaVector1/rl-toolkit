@@ -191,7 +191,6 @@ def _verify_startup_adapter_delta(
 
     previous_previous_path = None
     previous_previous_url = None
-    previous_third_url = None
     if step >= 2:
         previous_previous_path = get_step_path(broadcast_dir, step - 2)
         if not (previous_previous_path / "STABLE").is_file():
@@ -205,18 +204,6 @@ def _verify_startup_adapter_delta(
             raise RuntimeError(
                 f"cannot resume LoRA policy v{step}: second predecessor has no source URL"
             )
-    if step >= 3:
-        previous_third_path = get_step_path(broadcast_dir, step - 3)
-        if not (previous_third_path / "STABLE").is_file():
-            raise RuntimeError(
-                f"cannot resume LoRA policy v{step}: exact predecessor v{step - 3} is not STABLE"
-            )
-        previous_third_url = inference_weight_path(config, previous_third_path, lora_name)
-        if not isinstance(previous_third_url, str):
-            raise RuntimeError(
-                f"cannot resume LoRA policy v{step}: third predecessor has no source URL"
-            )
-
     def read_manifest(path, url: str | None) -> dict[str, object]:
         try:
             if url is None:
@@ -258,18 +245,30 @@ def _verify_startup_adapter_delta(
                 f"cannot resume LoRA policy v{step}: predecessor manifest is not policy v{step - 1}"
             )
     else:
-        try:
-            validate_adapter_manifest(
-                previous_manifest,
-                target_step=step - 1,
-                target_url=previous_url if isinstance(previous_url, str) else None,
-                base_url=previous_previous_url,
-                base2_url=previous_third_url,
+        if (
+            previous_manifest.get("kind") != "lora-adapter"
+            or previous_manifest.get("mode") != "delta"
+            or previous_manifest.get("target_step") != step - 1
+            or (
+                previous_manifest.get("version") == 1
+                and (
+                    previous_manifest.get("transport") != "chunked-shuffled-xor-zstd"
+                    or previous_manifest.get("base_step") != step - 2
+                )
             )
-        except RuntimeError as exc:
+            or (
+                previous_manifest.get("version") == 2
+                and (
+                    previous_manifest.get("transport") != "chunked-bf16-linear-zigzag-sparse-zstd"
+                    or previous_manifest.get("base_step") != step - 2
+                    or previous_manifest.get("base2_step") != step - 3
+                )
+            )
+            or previous_manifest.get("version") not in {1, 2}
+        ):
             raise RuntimeError(
-                f"cannot resume LoRA policy v{step}: predecessor manifest is not policy v{step - 1}: {exc}"
-            ) from exc
+                f"cannot resume LoRA policy v{step}: predecessor manifest is not policy v{step - 1}"
+            )
 
     try:
         target_files = _adapter_file_records(manifest)

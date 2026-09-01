@@ -207,8 +207,23 @@ class FileSystemWeightBroadcast(WeightBroadcast):
         if not self.world.is_master:
             return
         for idx in self.multi_run_manager.used_idxs:
-            maybe_clean(
-                get_broadcast_dir(self.multi_run_manager.get_run_dir(idx)),
-                self.multi_run_manager.progress[idx].step - 1,
-                interval_to_keep,
-            )
+            broadcast_dir = get_broadcast_dir(self.multi_run_manager.get_run_dir(idx))
+            current_step = self.multi_run_manager.progress[idx].step - 1
+            if self.lora_config is None:
+                maybe_clean(broadcast_dir, current_step, interval_to_keep)
+                continue
+            # The active policy may need both predecessors after a restart.
+            # Keep the current adapter and its two bases; remove only an older
+            # step after the new adapter has been published successfully.
+            candidate_step = current_step - 3
+            if candidate_step < 0:
+                continue
+            if interval_to_keep and candidate_step % interval_to_keep == 0:
+                self.logger.debug(
+                    f"Keeping path {get_step_path(broadcast_dir, candidate_step)} "
+                    "(on ckpt interval)"
+                )
+                continue
+            candidate_path = get_step_path(broadcast_dir, candidate_step)
+            self.logger.debug(f"Removing path {candidate_path}")
+            shutil.rmtree(candidate_path, ignore_errors=True)
