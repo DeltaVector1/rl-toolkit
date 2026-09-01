@@ -33,6 +33,7 @@ class _ManifestProbeResponse:
 
 class _ManifestProbeClient:
     requests = []
+    delay = 0.0
 
     def __init__(self, version):
         self.version = version
@@ -45,6 +46,8 @@ class _ManifestProbeClient:
 
     async def get(self, *_args, **_kwargs):
         self.requests.append(_kwargs["timeout"])
+        if self.delay:
+            await asyncio.sleep(self.delay)
         return _ManifestProbeResponse(self.version)
 
 
@@ -288,6 +291,24 @@ class StageLoraAdapterTest(unittest.TestCase):
         self.assertEqual(len(_ManifestProbeClient.requests), 1)
         self.assertGreater(_ManifestProbeClient.requests[0].read, 10.0)
         self.assertLessEqual(_ManifestProbeClient.requests[0].read, 30.0)
+
+    def test_slow_manifest_probe_cannot_outlive_delta_deadline(self):
+        _ManifestProbeClient.delay = 1.0
+        try:
+            stage_lora_adapter, namespace = _load_stage_function(probe_version=2)
+            namespace["_delta_stage_timeout_s"] = lambda: 0.05
+            client = httpx.AsyncClient(base_url="http://127.0.0.1:8000")
+
+            with self.assertRaisesRegex(TimeoutError, "exceeded its time limit"):
+                asyncio.run(
+                    stage_lora_adapter(
+                        [client],
+                        "http://adapter/step_2",
+                        require_delta=True,
+                    )
+                )
+        finally:
+            _ManifestProbeClient.delay = 0.0
 
 
 if __name__ == "__main__":

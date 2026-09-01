@@ -695,17 +695,22 @@ async def stage_lora_adapter(
             raise TimeoutError("adapter delta staging exceeded its time limit")
         try:
             async with httpx.AsyncClient(follow_redirects=False) as probe:
-                response = await probe.get(
-                    f"{lora_path_posix.rstrip('/')}/adapter_manifest.json",
-                    timeout=httpx.Timeout(
-                        connect=remaining,
-                        read=remaining,
-                        write=remaining,
-                        pool=remaining,
+                response = await asyncio.wait_for(
+                    probe.get(
+                        f"{lora_path_posix.rstrip('/')}/adapter_manifest.json",
+                        timeout=httpx.Timeout(
+                            connect=remaining,
+                            read=remaining,
+                            write=remaining,
+                            pool=remaining,
+                        ),
                     ),
+                    timeout=remaining,
                 )
                 response.raise_for_status()
                 manifest = response.json()
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError("adapter delta staging exceeded its time limit") from exc
         except (httpx.HTTPError, ValueError) as exc:
             raise RuntimeError("cannot determine adapter transport before staging") from exc
         if not isinstance(manifest, dict):
