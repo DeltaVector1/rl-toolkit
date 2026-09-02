@@ -5,7 +5,18 @@ trainers = ["n76", "n77", "n78", "n80", "n82", "n83", "n84", "n85"]
 inference = ["h200a", "h200b"]
 orchestrator = "h200a"
 metrics = ["h200a", "n82"]
+judge = "judge-ext"
 blocked = ["n79"]
+
+[hosts.trainer_lan]
+n76 = "10.92.20.76"
+n77 = "10.92.20.77"
+n78 = "10.92.20.78"
+n80 = "10.92.20.80"
+n82 = "10.92.20.82"
+n83 = "10.92.20.83"
+n84 = "10.92.20.84"
+n85 = "10.92.20.85"
 
 [ports]
 inference_tunnel_first = 18001
@@ -25,6 +36,57 @@ remote_repository = "/data/glm52-rl/deployment"
 runs = "/data/glm52-rl/runs"
 adapter_bucket = "hf://buckets/NewEden/muse-lora-checkpoints"
 adapter_cache = "/data/glm52-rl/lora-cache"
+
+[offline_sweep]
+dataset = "NewEden/RL-seed-Decensor"
+expected_prompts = 30000
+samples_per_prompt = 4
+vllm_venv = "/data/glm52-rl/offline-sweep/.venv"
+runner_venv = "/data/glm52-rl/offline-sweep/runner-venv"
+vllm_version = "0.28.0"
+model = "/data/ZiphuAI/GLM-5.2-FP8"
+output = "/data/glm52-rl/offline-sweep/output"
+
+[offline_sweep.glm_a]
+hosts = ["n76", "n77", "n78", "n80"]
+head = "n76"
+api_host = "10.92.20.76"
+served_model = "glm52-base-a"
+tensor_parallel_size = 8
+pipeline_parallel_size = 1
+data_parallel_size = 4
+data_parallel_size_local = 1
+data_parallel_rpc_port = 29210
+ray_head_port = 29000
+ray_dashboard_port = 29001
+api_port = 29200
+worker_port_first = 29002
+worker_port_last = 29199
+
+[offline_sweep.glm_b]
+hosts = ["n83", "n84", "n85"]
+head = "n83"
+api_host = "10.92.20.83"
+served_model = "glm52-base-b"
+tensor_parallel_size = 8
+pipeline_parallel_size = 1
+data_parallel_size = 3
+data_parallel_size_local = 1
+data_parallel_rpc_port = 29211
+ray_head_port = 29010
+ray_dashboard_port = 29011
+api_port = 29201
+worker_port_first = 29012
+worker_port_last = 29019
+
+[offline_sweep.gemma]
+host = "n82"
+api_host = "10.92.20.82"
+model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
+path = "/data/glm52-rl/offline-sweep/models/gemma-fp8"
+served_model = "gemma-judge"
+api_port = 29209
+data_parallel_size = 8
 
 [containers]
 trainer = "glm52-decensor-trainer"
@@ -102,6 +164,7 @@ deployment_bundle_workers = 2
 deployment_mkdir_timeout_seconds = 30
 deployment_scp_timeout_seconds = 300
 deployment_bundle_scp_timeout_seconds = 60
+large_file_transfer_timeout_seconds = 7200
 adapter_update_engine_startup_timeout_seconds = 900
 adapter_delta_stage_timeout_seconds = 300
 
