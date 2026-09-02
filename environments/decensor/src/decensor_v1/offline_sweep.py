@@ -235,6 +235,40 @@ def _row_to_prompt(
     )
 
 
+def _iter_dataset_rows(dataset_name: str, split: str) -> Iterable[dict[str, Any]]:
+    dataset_path = Path(dataset_name)
+    if not dataset_path.is_dir():
+        yield from load_dataset(dataset_name, split=split, streaming=True)
+        return
+
+    jsonl_files = sorted(
+        path
+        for path in dataset_path.iterdir()
+        if path.suffix == ".jsonl" and path.is_file()
+    )
+    if len(jsonl_files) != 1:
+        raise ValueError(
+            f"local dataset directory must contain exactly one JSONL file: {dataset_path}"
+        )
+    with jsonl_files[0].open(encoding="utf-8") as dataset_file:
+        for line_number, line in enumerate(dataset_file, start=1):
+            if not line.strip():
+                raise ValueError(
+                    f"local dataset has a blank row at line {line_number}"
+                )
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    f"local dataset has invalid JSON at line {line_number}"
+                ) from error
+            if not isinstance(row, dict):
+                raise ValueError(
+                    f"local dataset row {line_number} is not an object"
+                )
+            yield row
+
+
 def iter_sweep_prompts(
     config: SweepConfig, *, stats: dict[str, int] | None = None
 ) -> Iterator[SweepPrompt]:
@@ -245,7 +279,7 @@ def iter_sweep_prompts(
     This preserves stable source indices for later merging.
     """
 
-    dataset = load_dataset(config.dataset, split=config.split, streaming=True)
+    dataset = _iter_dataset_rows(config.dataset, config.split)
     for source_row_index, row in enumerate(dataset):
         if stats is not None:
             stats["source_rows_seen"] = source_row_index + 1
