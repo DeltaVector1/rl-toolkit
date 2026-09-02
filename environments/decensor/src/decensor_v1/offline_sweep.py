@@ -27,7 +27,7 @@ from openai import AsyncOpenAI
 from decensor_v1.agentic_review import build_turn_review_sources, run_agentic_review
 from decensor_v1.data import convert_sharegpt_messages, decensor_dataset
 from decensor_v1.scoring import find_model_response_failure
-from decensor_v1.service import request_judge_score
+from decensor_v1.service import _ensure_judge_capacity, request_judge_score
 
 
 default_sample_count = 4
@@ -74,8 +74,13 @@ class SweepConfig:
             raise ValueError("sample_count must be positive")
         if self.shard_count < 1 or not 0 <= self.shard_index < self.shard_count:
             raise ValueError("shard_index must be between zero and shard_count")
-        if self.policy_concurrency < 1 or self.judge_concurrency < 1:
-            raise ValueError("concurrency must be positive")
+        if any(
+            isinstance(concurrency, bool)
+            or not isinstance(concurrency, int)
+            or concurrency < 1
+            for concurrency in (self.policy_concurrency, self.judge_concurrency)
+        ):
+            raise ValueError("concurrency must be positive integers")
         if self.policy_timeout_seconds <= 0 or self.judge_timeout_seconds <= 0:
             raise ValueError("request timeouts must be positive")
         if self.response_format not in {"plaintext", "markdown"}:
@@ -569,6 +574,7 @@ def summarize_prompt(prompt: SweepPrompt, samples: Sequence[dict[str, Any]]) -> 
 async def run_sweep(config: SweepConfig, output_dir: str | Path) -> dict[str, Any]:
     """Run one deterministic sweep island and write four local output files."""
 
+    _ensure_judge_capacity(config.judge_concurrency)
     output_path = Path(output_dir)
     if output_path.exists():
         raise FileExistsError(f"output directory already exists: {output_path}")
