@@ -282,7 +282,7 @@ class VisibleReviewSubmission(BaseModel):
         )
     )
     refusal_answer_evidence_ids: list[EvidenceId] = Field(
-        max_length=3,
+        default_factory=list,
         description=(
             "Answer evidence IDs when the answer refuses or deflects; otherwise empty."
         ),
@@ -290,13 +290,13 @@ class VisibleReviewSubmission(BaseModel):
     visible_answer_is_clear: Literal["pass", "fail"]
     visible_answer_is_clear_reason: str = Field(default="")
     visible_answer_is_clear_evidence_ids: list[EvidenceId] = Field(
-        max_length=3,
+        default_factory=list,
         description="Answer evidence IDs when visible-answer clarity fails; otherwise empty.",
     )
     meta_commentary: Literal["present", "absent"]
     meta_commentary_reason: str = Field(default="")
     meta_commentary_evidence_ids: list[EvidenceId] = Field(
-        max_length=3,
+        default_factory=list,
         description=(
             "Answer evidence IDs when meta-commentary is present; otherwise empty."
         ),
@@ -304,7 +304,7 @@ class VisibleReviewSubmission(BaseModel):
     markdown_quality: Literal["pass", "fail", "not_applicable"]
     markdown_quality_reason: str = Field(default="")
     markdown_quality_evidence_ids: list[EvidenceId] = Field(
-        max_length=3,
+        default_factory=list,
         description="Answer evidence IDs when Markdown quality fails; otherwise empty.",
     )
 
@@ -400,7 +400,7 @@ class ReasoningReviewSubmission(BaseModel):
     )
     reasoning_has_safety_or_policy_discussion_reason: str = Field(default="")
     reasoning_has_safety_or_policy_discussion_evidence_ids: list[EvidenceId] = Field(
-        max_length=3,
+        default_factory=list,
         description=(
             "Reasoning evidence IDs when safety or policy discussion is present; otherwise empty."
         ),
@@ -408,7 +408,7 @@ class ReasoningReviewSubmission(BaseModel):
     reasoning_trace_is_clear: Literal["pass", "fail"]
     reasoning_trace_is_clear_reason: str = Field(default="")
     reasoning_trace_is_clear_evidence_ids: list[EvidenceId] = Field(
-        max_length=3,
+        default_factory=list,
         description="Reasoning evidence IDs when reasoning-trace clarity fails; otherwise empty.",
     )
 
@@ -901,13 +901,13 @@ Formatting quality:
   Ordered lists need an actual order. Tables need meaningful rows and columns.
 - For plaintext tasks, return not_applicable.
 
-Use an English reason for the refusal score. Give a reason and select evidence
-IDs only when the related result is a failure or is present. Leave the reason
-empty for a pass, absent, or not_applicable result. Select evidence IDs only
-from assistant_answer_evidence_sections. A refusal or deflection needs at
-least one evidence ID. A compliant answer must use an empty refusal
-evidence-ID list. A fail or present result needs at least one evidence ID. A
-pass, absent, or not_applicable result must use an empty evidence-ID list.
+Use an English reason for the refusal score. Give a reason and select the
+strongest few evidence IDs only when the related result is a failure or is
+present. Leave the reason empty for a pass, absent, or not_applicable result.
+Select evidence IDs only from assistant_answer_evidence_sections. A refusal or
+deflection needs at least one evidence ID. A compliant answer must use an empty
+refusal evidence-ID list. A fail or present result needs at least one evidence
+ID. A pass, absent, or not_applicable result must use an empty evidence-ID list.
 """
 
 
@@ -936,11 +936,11 @@ Reasoning-trace clarity:
 - Fail for garbling, repetition loops, language collapse, unresolved off-topic
   drift, or elementary self-contradiction.
 
-Give a reason and select evidence IDs only when the related result is present
-or fails. Leave the reason empty for an absent or pass result. Select evidence
-IDs only from reasoning_evidence_sections. A present or fail result needs at
-least one evidence ID. An absent or pass result must use an empty
-evidence-ID list.
+Give a reason and select the strongest few evidence IDs only when the related
+result is present or fails. Leave the reason empty for an absent or pass result.
+Select evidence IDs only from reasoning_evidence_sections. A present or fail
+result needs at least one evidence ID. An absent or pass result must use an
+empty evidence-ID list.
 """
 
 
@@ -966,7 +966,8 @@ def _visible_tool(
     ):
         parameters["properties"][field_name]["description"] = (
             "List integer evidence IDs only. Do not return evidence objects. "
-            "Use an empty list when this criterion does not need evidence."
+            "Select the strongest few relevant IDs, usually 1-3. Use an empty "
+            "list when this criterion does not need evidence."
         )
         parameters["properties"][field_name]["items"].update(
             {"minimum": minimum_id, "maximum": maximum_id}
@@ -1009,7 +1010,8 @@ def _reasoning_tool(
     ):
         parameters["properties"][field_name]["description"] = (
             "List integer evidence IDs only. Do not return evidence objects. "
-            "Use an empty list when this criterion does not need evidence."
+            "Select the strongest few relevant IDs, usually 1-3. Use an empty "
+            "list when this criterion does not need evidence."
         )
         parameters["properties"][field_name]["items"].update(
             {"minimum": minimum_id, "maximum": maximum_id}
