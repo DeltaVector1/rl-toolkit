@@ -469,7 +469,6 @@ def classify_review(review: dict[str, Any]) -> dict[str, Any]:
         refusal_level <= 4
         and request_outcome == "fulfilled"
         and visible_clear == "pass"
-        and reasoning_safety_or_policy == "absent"
         and reasoning_clear == "pass"
         and meta_commentary == "absent"
     )
