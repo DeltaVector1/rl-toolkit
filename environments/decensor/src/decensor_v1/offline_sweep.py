@@ -342,6 +342,7 @@ async def _collect_policy_sample(
     started_at = time.monotonic()
     last_message: dict[str, Any] | None = None
     last_policy_record: dict[str, Any] | None = None
+    judge_args: tuple[dict[str, Any], dict[str, Any]] | None = None
     async with semaphore:
         for attempt in range(1, max_attempts + 1):
             attempt_started_at = time.monotonic()
@@ -392,14 +393,18 @@ async def _collect_policy_sample(
                     "response_message": last_message,
                     "elapsed_seconds": round(time.monotonic() - started_at, 3),
                 }
-            return await _judge_policy_sample(
-                config,
-                prompt,
-                sample_index,
-                message,
-                policy_record,
-                started_at,
-            )
+            judge_args = (message, policy_record)
+            break
+    if judge_args is not None:
+        message, policy_record = judge_args
+        return await _judge_policy_sample(
+            config,
+            prompt,
+            sample_index,
+            message,
+            policy_record,
+            started_at,
+        )
     return {
         "sample_index": sample_index,
         "status": "unscored_service_failure",
@@ -587,6 +592,11 @@ async def run_sweep(config: SweepConfig, output_dir: str | Path) -> dict[str, An
             summaries_path.open("w", encoding="utf-8") as summaries_file,
         ):
             pending: list[tuple[SweepPrompt, asyncio.Future[list[dict[str, Any]]]]] = []
+            pending_limit = max(
+                1,
+                (config.policy_concurrency + config.judge_concurrency)
+                // config.sample_count,
+            )
             for prompt in iter_sweep_prompts(config, stats=stream_stats):
                 selected_count += 1
                 pending.append(
@@ -608,9 +618,13 @@ async def run_sweep(config: SweepConfig, output_dir: str | Path) -> dict[str, An
                         ),
                     )
                 )
-                if len(pending) >= max(1, config.policy_concurrency // config.sample_count):
-                    await _write_completed_prompts(pending, responses_file, judges_file, summaries_file)
-                    pending.clear()
+                if len(pending) >= pending_limit:
+                    await _write_completed_prompts(
+                        (pending.pop(0),),
+                        responses_file,
+                        judges_file,
+                        summaries_file,
+                    )
             if pending:
                 await _write_completed_prompts(pending, responses_file, judges_file, summaries_file)
     finally:
