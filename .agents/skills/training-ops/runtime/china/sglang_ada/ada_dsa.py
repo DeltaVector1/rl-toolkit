@@ -11,6 +11,10 @@ import triton
 import triton.language as tl
 
 
+def supports_fp8_kv_cache():
+    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (8, 9)
+
+
 @triton.jit
 def _fp8_mqa_logits_kernel(
     Q_ptr, KV_ptr, kv_scales_ptr, weights_ptr, cu_start_ptr, cu_end_ptr, logits_ptr,
