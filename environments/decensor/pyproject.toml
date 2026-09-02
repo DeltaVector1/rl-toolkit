@@ -9,6 +9,9 @@ dependencies = [
     "datasets",
 ]
 
+[project.scripts]
+decensor-offline-sweep = "decensor_v1.offline_sweep:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
