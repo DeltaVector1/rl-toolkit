@@ -692,6 +692,19 @@ def review_from_submissions(
     return review
 
 
+def _validate_markdown_quality(markdown_quality: str, response_format: str) -> None:
+    expected_markdown_quality = (
+        {"pass", "fail"}
+        if response_format == "markdown"
+        else {"not_applicable"}
+    )
+    if markdown_quality not in expected_markdown_quality:
+        raise ValueError(
+            "markdown_quality must be one of "
+            f"{sorted(expected_markdown_quality)} for {response_format}"
+        )
+
+
 def validate_review(review: TranscriptReview, source: ReviewSource) -> None:
     expected_turns = [turn.turn for turn in source.turns]
     actual_turns = [turn.turn for turn in review.turns]
@@ -754,16 +767,7 @@ def validate_review(review: TranscriptReview, source: ReviewSource) -> None:
                     f"{expected_document[criterion]}"
                 )
 
-        expected_markdown_quality = (
-            {"pass", "fail"}
-            if source.response_format == "markdown"
-            else {"not_applicable"}
-        )
-        if result.markdown_quality not in expected_markdown_quality:
-            raise ValueError(
-                f"turn {result.turn} markdown_quality must be one of "
-                f"{sorted(expected_markdown_quality)} for {source.response_format}"
-            )
+        _validate_markdown_quality(result.markdown_quality, source.response_format)
 
         for evidence in result.evidence:
             if evidence.document_id not in allowed_documents:
@@ -1158,6 +1162,9 @@ async def run_agentic_review(config: Any, source: ReviewSource) -> AgenticReview
                 candidate = VisibleReviewSubmission.model_validate(normalized_visible)
                 if candidate.turn != source_turn.turn:
                     raise ValueError("visible review turn does not match source turn")
+                _validate_markdown_quality(
+                    candidate.markdown_quality, source.response_format
+                )
                 validate_evidence_ids(
                     candidate,
                     (
