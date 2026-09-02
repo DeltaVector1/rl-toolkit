@@ -108,6 +108,7 @@ def normalize_evidence_id_fields(
     units = {
         unit.evidence_id: unit for unit in build_evidence_units(document)
     }
+    known_id_strings = {str(evidence_id): evidence_id for evidence_id in units}
     for field_name in field_names:
         values = payload.get(field_name)
         if not isinstance(values, list):
@@ -123,10 +124,22 @@ def normalize_evidence_id_fields(
                         f"{field_name}[{item_index}] has unsupported keys "
                         f"{sorted(extra_keys)}"
                     )
-                evidence_id = value.get("evidence_id")
-                if type(evidence_id) is not int:
+                submitted_id = value.get("evidence_id")
+                if type(submitted_id) is int:
+                    evidence_id = submitted_id
+                elif isinstance(submitted_id, str) and re.fullmatch(
+                    r"[1-9][0-9]*", submitted_id
+                ):
+                    evidence_id = known_id_strings.get(submitted_id)
+                    if evidence_id is None:
+                        raise ValueError(
+                            f"{field_name}[{item_index}] contains unknown evidence ID "
+                            f"{submitted_id}"
+                        )
+                else:
                     raise ValueError(
-                        f"{field_name}[{item_index}] evidence_id must be an integer"
+                        f"{field_name}[{item_index}] evidence_id must be an integer "
+                        "or a canonical string for a known evidence ID"
                     )
                 unit = units.get(evidence_id)
                 if unit is None:
