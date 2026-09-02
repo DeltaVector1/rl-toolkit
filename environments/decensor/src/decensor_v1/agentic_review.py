@@ -252,7 +252,7 @@ class TurnReview(BaseModel):
     meta_commentary_reason: str
     markdown_quality: Literal["pass", "fail", "not_applicable"]
     markdown_quality_reason: str
-    evidence: list[ReviewEvidence] = Field(max_length=18)
+    evidence: list[ReviewEvidence]
 
 
 class TranscriptReview(BaseModel):
