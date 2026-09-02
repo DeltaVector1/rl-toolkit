@@ -40,6 +40,7 @@ default_judge_timeout_seconds = 550.0
 class SweepConfig:
     dataset: str = decensor_dataset
     split: str = "train"
+    policy_engine: str = "openai"
     policy_model: str = ""
     policy_base_url: str = ""
     policy_api_key_var: str = "VLLM_API_KEY"
@@ -63,6 +64,8 @@ class SweepConfig:
     system_prompt: str = ""
 
     def __post_init__(self) -> None:
+        if self.policy_engine not in {"openai", "sglang"}:
+            raise ValueError("policy_engine must be openai or sglang")
         if not self.policy_model or not self.policy_base_url:
             raise ValueError("policy model and base URL are required")
         if not self.judge_model or not self.judge_base_url:
@@ -108,6 +111,7 @@ def load_offline_inventory(path: str | Path | None = None) -> dict[str, Any]:
         "expected_prompts",
         "model",
         "output",
+        "policy_engine",
     ):
         if name not in offline:
             raise ValueError(f"offline_sweep inventory has no {name!r}")
@@ -266,6 +270,17 @@ def _message_record(message: Any) -> dict[str, Any]:
     if role != "assistant":
         raise ValueError("policy response did not contain an assistant message")
     record.setdefault("content", "")
+    for field_name in (
+        "reasoning_content",
+        "reasoning",
+        "thinking",
+        "thinking_content",
+    ):
+        if record.get(field_name) is not None:
+            continue
+        field_value = getattr(message, field_name, None)
+        if field_value is not None:
+            record[field_name] = _json_value(field_value)
     return record
 
 
@@ -276,15 +291,21 @@ async def _policy_attempt(
     sample_index: int,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     seed = config.seed + prompt.source_row_index * 1_000_003 + sample_index
+    request: dict[str, Any] = {
+        "model": config.policy_model,
+        "messages": _messages_for_policy(prompt),
+        "temperature": config.policy_temperature,
+        "top_p": config.policy_top_p,
+        "max_tokens": config.policy_max_tokens,
+        "seed": seed,
+    }
+    if config.policy_engine == "sglang":
+        request["extra_body"] = {
+            "chat_template_kwargs": {"enable_thinking": True},
+            "separate_reasoning": True,
+        }
     completion = await asyncio.wait_for(
-        client.chat.completions.create(
-            model=config.policy_model,
-            messages=_messages_for_policy(prompt),
-            temperature=config.policy_temperature,
-            top_p=config.policy_top_p,
-            max_tokens=config.policy_max_tokens,
-            seed=seed,
-        ),
+        client.chat.completions.create(**request),
         timeout=config.policy_timeout_seconds,
     )
     choices = list(getattr(completion, "choices", []) or [])
@@ -603,6 +624,7 @@ async def run_sweep(config: SweepConfig, output_dir: str | Path) -> dict[str, An
         "prompts_processed": selected_count,
         "samples_per_prompt": config.sample_count,
         "responses_expected": selected_count * config.sample_count,
+        "policy_engine": config.policy_engine,
         "policy_model": config.policy_model,
         "policy_base_url": config.policy_base_url,
         "judge_model": config.judge_model,
@@ -737,6 +759,7 @@ def _read_system_prompt(args: argparse.Namespace) -> str:
 def _sweep_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output")
     parser.add_argument("--policy-model")
+    parser.add_argument("--policy-engine", choices=("openai", "sglang"))
     parser.add_argument("--policy-url")
     parser.add_argument("--judge-model")
     parser.add_argument("--judge-url")
@@ -803,6 +826,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     config = SweepConfig(
         dataset=args.dataset or inventory["dataset"],
         split=args.split,
+        policy_engine=args.policy_engine or inventory["policy_engine"],
         policy_model=args.policy_model or island["served_model"],
         policy_base_url=policy_url,
         policy_api_key_var=args.policy_api_key_var,

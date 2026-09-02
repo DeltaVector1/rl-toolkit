@@ -44,6 +44,7 @@ samples_per_prompt = 4
 vllm_venv = "/data/glm52-rl/offline-sweep/.venv"
 runner_venv = "/data/glm52-rl/offline-sweep/runner-venv"
 vllm_version = "0.28.0"
+policy_engine = "sglang"
 model = "/data/ZiphuAI/GLM-5.2-FP8"
 output = "/data/glm52-rl/offline-sweep/output"
 
