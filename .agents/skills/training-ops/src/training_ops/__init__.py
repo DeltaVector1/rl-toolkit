@@ -90,6 +90,7 @@ deployment_scp_timeout_seconds = limits["deployment_scp_timeout_seconds"]
 deployment_bundle_scp_timeout_seconds = limits.get(
     "deployment_bundle_scp_timeout_seconds", 60
 )
+large_file_transfer_timeout_seconds = limits["large_file_transfer_timeout_seconds"]
 adapter_update_engine_startup_timeout_seconds = limits[
     "adapter_update_engine_startup_timeout_seconds"
 ]
@@ -101,6 +102,14 @@ if (
 ):
     raise RuntimeError(
         "limits.adapter_update_engine_startup_timeout_seconds must be an integer >= 600"
+    )
+if (
+    isinstance(large_file_transfer_timeout_seconds, bool)
+    or not isinstance(large_file_transfer_timeout_seconds, int)
+    or large_file_transfer_timeout_seconds < 600
+):
+    raise RuntimeError(
+        "limits.large_file_transfer_timeout_seconds must be an integer >= 600"
     )
 group_size = shared_requirements["group_size"]
 max_output_length = shared_requirements["max_output_length"]
@@ -1883,6 +1892,7 @@ def run_on_hosts(
     groups = {
         "trainer": trainer_hosts,
         "inference": inference_hosts,
+        "judge": [hosts["judge"]],
         "all": list(dict.fromkeys([*trainer_hosts, *inference_hosts])),
     }
     if group not in groups:
@@ -1952,6 +1962,103 @@ def _local_command(command: list[str], label: str, timeout: int) -> subprocess.C
         detail = (result.stderr or result.stdout or "failed").strip().splitlines()[-1]
         raise RuntimeError(f"{label} failed: {detail[:160]}")
     return result
+
+
+def copy_file(local_path: str | Path, host: str, remote_path: str) -> bool:
+    """Copy one large local file to configured storage with resume support."""
+    if not isinstance(host, str) or not host:
+        raise Refused("copy destination host must be a non-empty string")
+    if not isinstance(remote_path, str) or not remote_path:
+        raise Refused("copy destination path must be a non-empty string")
+    try:
+        local = Path(local_path)
+    except TypeError as error:
+        raise Refused(f"local copy source is not a file: {local_path!r}") from error
+    if not local.is_file():
+        raise Refused(f"local copy source is not a file: {local}")
+
+    remote = PurePosixPath(remote_path)
+    root = PurePosixPath(storage_root.rstrip("/"))
+    if (
+        not remote.is_absolute()
+        or remote.as_posix() != remote_path
+        or any(part in {"", ".", ".."} for part in remote.parts)
+        or not remote.is_relative_to(root)
+        or remote == root
+    ):
+        raise Refused(
+            f"remote copy path must be a canonical file below {storage_root}: {remote_path!r}"
+        )
+
+    allowed_hosts = {*trainer_hosts, *inference_hosts, hosts["judge"]}
+    if host not in allowed_hosts:
+        raise Refused(f"copy destination host is not configured: {host}")
+    _check_host(host)
+    ssh_options, _, destination = _ssh_destination(host)
+    remote_text = remote.as_posix()
+    remote_parent = remote.parent.as_posix()
+    mkdir_code, mkdir_output = _ssh(
+        host,
+        f"mkdir -p {shlex.quote(remote_parent)}",
+        timeout=deployment_mkdir_timeout_seconds,
+    )
+    if mkdir_code:
+        detail = mkdir_output.strip().splitlines()[-1] if mkdir_output.strip() else "unknown error"
+        raise RuntimeError(f"create copy directory on {host} failed: {detail[:160]}")
+
+    try:
+        size = local.stat().st_size
+    except OSError as error:
+        raise RuntimeError(f"cannot stat local copy source {local}: {error}") from error
+    transport = shlex.join(ssh_command + ssh_options)
+    command = [
+        "rsync",
+        "--partial",
+        "--append-verify",
+        "--info=progress2,name0",
+        "--human-readable",
+        "--protect-args",
+        "--timeout=120",
+        "--rsh",
+        transport,
+        str(local),
+        f"{destination}:{remote_text}",
+    ]
+    try:
+        result = _run_process(
+            command,
+            stdin=subprocess.DEVNULL,
+            timeout=large_file_transfer_timeout_seconds,
+        )
+    except FileNotFoundError as error:
+        raise RuntimeError("rsync is not installed") from error
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(
+            f"copy {local} to {host}:{remote_text} timed out after "
+            f"{large_file_transfer_timeout_seconds}s"
+        ) from error
+    if result.returncode:
+        detail = ((result.stderr or "") + (result.stdout or "")).strip()
+        detail = detail.splitlines()[-1] if detail else "unknown error"
+        raise RuntimeError(f"copy {local} to {host}:{remote_text} failed: {detail[:160]}")
+
+    stat_code, stat_output = _ssh(
+        host,
+        f"stat -c %s -- {shlex.quote(remote_text)}",
+        timeout=deployment_mkdir_timeout_seconds,
+    )
+    stat_lines = stat_output.strip().splitlines()
+    remote_size_text = stat_lines[-1].strip() if stat_lines else ""
+    if stat_code or not re.fullmatch(r"[0-9]+", remote_size_text):
+        raise RuntimeError(f"cannot verify byte size of {host}:{remote_text}")
+    remote_size = int(remote_size_text)
+    if remote_size != size:
+        raise RuntimeError(
+            f"copy size mismatch for {host}:{remote_text}: "
+            f"local {size} bytes, remote {remote_size} bytes"
+        )
+    print(f"copied {size} bytes to {host}:{remote_text}")
+    return True
 
 
 def _sha256_file(path: Path, label: str) -> str:
