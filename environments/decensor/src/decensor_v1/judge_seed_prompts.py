@@ -55,6 +55,8 @@ score_names = {
     "markdown_quality",
     "counts_as_compliant",
 }
+
+
 @dataclass(frozen=True)
 class SourcePrompt:
     source_row_index: int
@@ -155,12 +157,9 @@ def _sample_failure_detail(sample: dict[str, Any]) -> str:
     policy_attempts = sample.get("policy_attempts")
     if isinstance(policy_attempts, list):
         for policy_attempt in reversed(policy_attempts):
-            if (
-                not isinstance(policy_attempt, dict)
-                or (
-                    policy_attempt.get("error") is None
-                    and policy_attempt.get("error_type") is None
-                )
+            if not isinstance(policy_attempt, dict) or (
+                policy_attempt.get("error") is None
+                and policy_attempt.get("error_type") is None
             ):
                 continue
             error_message = policy_attempt.get("error")
@@ -883,9 +882,8 @@ async def _judge_policy_sample(
             "elapsed_seconds": round(time.monotonic() - started, 3),
         }
         if outcome.status == "scored" and not audit_succeeded:
-            failure["error"] = (
-                "saved judge audit validation failed: "
-                + "; ".join(audit_failures)
+            failure["error"] = "saved judge audit validation failed: " + "; ".join(
+                audit_failures
             )
         return failure
     scoring = score_review(
@@ -1488,9 +1486,7 @@ async def _run_judge_seed_prompts_locked(
     concurrency_shares = _policy_concurrency_shares(
         config.policy_concurrency, len(clients)
     )
-    policy_semaphores = tuple(
-        asyncio.Semaphore(share) for share in concurrency_shares
-    )
+    policy_semaphores = tuple(asyncio.Semaphore(share) for share in concurrency_shares)
     started = time.monotonic()
     processed = 0
     sample_task_limit = max(1, config.policy_concurrency + config.judge_concurrency)
@@ -1521,9 +1517,7 @@ async def _run_judge_seed_prompts_locked(
         prompt: SourcePrompt, sample: int, group_pass: int
     ) -> dict[str, Any]:
         try:
-            endpoint_index = _endpoint_for_group(
-                prompt.source_row_index, len(clients)
-            )
+            endpoint_index = _endpoint_for_group(prompt.source_row_index, len(clients))
             return await _collect_policy_sample(
                 clients,
                 models,
