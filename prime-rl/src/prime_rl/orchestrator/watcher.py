@@ -7,8 +7,10 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections.abc import Awaitable, Callable
 from urllib.parse import quote
 from urllib.request import urlopen
+from typing import TypeVar
 
 from modelexpress import p2p_pb2
 
@@ -32,6 +34,27 @@ from prime_rl.utils.checkpoint_delta import build_xor_delta_checkpoint
 
 v1_adapter_transport = "chunked-shuffled-xor-zstd"
 v2_adapter_transport = "chunked-bf16-linear-zigzag-sparse-zstd"
+_RETRY_ATTEMPTS = 3
+_RETRY_BACKOFF_SECONDS = (0.5, 1.0)
+_Result = TypeVar("_Result")
+
+
+async def _run_with_retries(name: str, operation: Callable[[], Awaitable[_Result]]) -> _Result:
+    for attempt in range(1, _RETRY_ATTEMPTS + 1):
+        try:
+            return await operation()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if attempt == _RETRY_ATTEMPTS:
+                get_logger().exception(f"{name} failed on attempt {attempt}/{_RETRY_ATTEMPTS}; stopping")
+                raise
+            delay = _RETRY_BACKOFF_SECONDS[attempt - 1]
+            get_logger().exception(
+                f"{name} failed on attempt {attempt}/{_RETRY_ATTEMPTS}; retrying in {delay:.1f}s"
+            )
+            await asyncio.sleep(delay)
+    raise RuntimeError(f"{name} retry loop ended unexpectedly")
 
 
 def _valid_digest(value: object) -> bool:
@@ -226,25 +249,18 @@ class WeightWatcher:
         try:
             while not self.stopped.is_set():
                 if not self.bootstrap_staged:
-                    try:
-                        await self.stage_bootstrap_adapter()
-                    except Exception:
-                        get_logger().exception("Failed to stage the initial adapter; retrying")
+                    await _run_with_retries("Initial adapter staging", self.stage_bootstrap_adapter)
                     if not self.bootstrap_staged:
                         await asyncio.sleep(self.poll_interval)
                         continue
                 next_step = self.compute_next_ckpt_step()
                 if next_step > self.ckpt_step:
-                    try:
-                        await self.apply_policy_update(next_step)
-                    except Exception:
-                        get_logger().exception(f"Failed to apply policy update {next_step}; retrying")
+                    await _run_with_retries(
+                        f"Policy update {next_step}", lambda: self.apply_policy_update(next_step)
+                    )
                 elif time.monotonic() - self.last_reconcile_check_at >= self.reconcile_interval:
                     self.last_reconcile_check_at = time.monotonic()
-                    try:
-                        await self.reconcile_current_policy()
-                    except Exception:
-                        get_logger().exception("Failed to reconcile the current LoRA; retrying")
+                    await _run_with_retries("Current policy reconciliation", self.reconcile_current_policy)
                 await asyncio.sleep(self.poll_interval)
         except asyncio.CancelledError:
             return
