@@ -242,8 +242,12 @@ def _patch_qwen3_5_linear_attn_varlen():
 
     def _build_cp_context(self, local_seq_len: int, device: torch.device, cu_seqlens=None):
         cp_group = getattr(self, "cp_group", None)
-        if cp_group is None or build_cp_context is None:
+        if cp_group is None:
             return None
+        if build_cp_context is None or fla_causal_conv1d is None:
+            raise RuntimeError(
+                "Qwen3.5 context parallelism requires the FLA context-parallel convolution"
+            )
         global_seq_len = local_seq_len * self.cp_world_size
         if cu_seqlens is not None and int(cu_seqlens[-1].item()) == global_seq_len:
             global_cu_seqlens = cu_seqlens.to(device=device, dtype=torch.int32)
