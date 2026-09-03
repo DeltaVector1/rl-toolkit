@@ -428,25 +428,14 @@ async def _admin_post(
     total_timeout_s: float | None = None,
     **kwargs,
 ) -> None:
-    """POST an admin op with a bounded per-attempt timeout, retrying transient errors.
-
-    The total wall-clock budget across all retries is twice the per-attempt
-    timeout unless the caller provides an explicit budget.
-    """
-    retry_budget = 2 * timeout_s if total_timeout_s is None else total_timeout_s
-    async for attempt in AsyncRetrying(
-        retry=retry_if_exception(_is_retryable_admin_error),
-        stop=stop_after_delay(retry_budget) | stop_after_attempt(10),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        reraise=True,
-    ):
-        with attempt:
-            response = await client.post(
-                path,
-                timeout=httpx.Timeout(connect=10.0, read=timeout_s, write=60.0, pool=10.0),
-                **kwargs,
-            )
-            response.raise_for_status()
+    """POST an admin op with a bounded retry budget."""
+    await _admin_post_response(
+        client,
+        path,
+        timeout_s=timeout_s,
+        total_timeout_s=total_timeout_s,
+        **kwargs,
+    )
 
 
 async def _admin_post_response(

@@ -798,7 +798,10 @@ class LinearAdapterReceiverTest(unittest.TestCase):
 
                 filesystem.urllib.request.urlopen = no_delta_manifest
                 filesystem.download = fake_download
-                result = filesystem.stage_full_checkpoint_files(source_url)
+                result = filesystem.stage_full_checkpoint_files(
+                    source_url,
+                    download_fn=filesystem.download,
+                )
                 self.assertEqual(result, destination)
                 self.assertIn("model.safetensors.index.json", calls)
                 self.assertIn("model-00001.safetensors", calls)

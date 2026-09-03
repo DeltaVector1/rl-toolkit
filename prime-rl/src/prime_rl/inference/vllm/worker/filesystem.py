@@ -3478,18 +3478,16 @@ def _download_with_parent(
             os.close(parts_fd)
 
 
-_ORIGINAL_DOWNLOAD = download
-
-
 def _download_checkpoint_entry(
     source_url: str,
     destination: Path,
     *,
     parent_fd: int,
+    download_fn=None,
 ) -> None:
     """Download a checkpoint entry below its held cache directory."""
-    if download is not _ORIGINAL_DOWNLOAD:
-        download(source_url, destination)
+    if download_fn is not None:
+        download_fn(source_url, destination)
         return
     _download_with_parent(
         source_url,
@@ -4016,7 +4014,7 @@ def prune_full_checkpoint_cache(
     return removed
 
 
-def stage_full_checkpoint_files(source_url: str) -> Path:
+def stage_full_checkpoint_files(source_url: str, *, download_fn=None) -> Path:
     """Download and atomically publish one remote sharded safetensors checkpoint."""
     destination = full_checkpoint_cache_path(source_url)
     _ensure_directory(destination.parent, "full checkpoint cache directory")
@@ -4101,6 +4099,7 @@ def stage_full_checkpoint_files(source_url: str) -> Path:
                                 f"{source_url.rstrip('/')}/{delta_name}",
                                 delta_path,
                                 parent_fd=temporary_fd,
+                                download_fn=download_fn,
                             )
                             output_path = temporary / filename
                             _reject_symlink_path(output_path, "full checkpoint shard")
@@ -4129,6 +4128,7 @@ def stage_full_checkpoint_files(source_url: str) -> Path:
                             f"{source_url.rstrip('/')}/{index_name}",
                             index_path,
                             parent_fd=temporary_fd,
+                            download_fn=download_fn,
                         )
                         if _sha256(index_path, parent_fd=temporary_fd) != delta_manifest.get("index_sha256"):
                             raise OSError("checkpoint index checksum mismatch")
@@ -4140,6 +4140,7 @@ def stage_full_checkpoint_files(source_url: str) -> Path:
                     f"{source_url.rstrip('/')}/{index_name}",
                     index_path,
                     parent_fd=temporary_fd,
+                    download_fn=download_fn,
                 )
             with os.fdopen(
                 _open_nofollow(
@@ -4179,6 +4180,7 @@ def stage_full_checkpoint_files(source_url: str) -> Path:
                         f"{source_url.rstrip('/')}/{filename}",
                         temporary / filename,
                         parent_fd=temporary_fd,
+                        download_fn=download_fn,
                     )
             cache_manifest = {
                 "version": 1,
