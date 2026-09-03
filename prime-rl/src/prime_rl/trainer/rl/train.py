@@ -148,35 +148,6 @@ def bind_worker_to_gpu_numa_node() -> tuple[int, int] | None:
     return numa_node, len(cpus)
 
 
-def move_micro_batch_to_cuda(micro_batch) -> None:
-    """Move a micro-batch's tensors to the GPU in place, field by field.
-
-    Under pipeline parallelism every micro-batch is padded up to the global
-    16K target. Doing that padding on CPU meant materializing the whole padded
-    batch in host RAM on EVERY rank (8 per node) -- measured at ~50 GB/rank at
-    16K, which the kernel OOM-killer answered. Moving fields to the GPU first
-    drops each CPU copy as it goes, and the subsequent pads then allocate on
-    the GPU where the tensors were headed anyway.
-    """
-    for name in (
-        "input_ids",
-        "position_ids",
-        "advantages",
-        "inference_logprobs",
-        "ref_logprobs",
-        "loss_mask",
-        "temperatures",
-        "rl_weights",
-        "ce_weights",
-        "ref_kl_weights",
-        "mm_token_type_ids",
-        "routed_experts",
-    ):
-        t = micro_batch[name]
-        if t is not None:
-            micro_batch[name] = t.to("cuda", non_blocking=True)
-
-
 def pad_micro_batch_to_distributed_max(micro_batch, group) -> None:
     length = micro_batch["input_ids"].shape[1]
     max_length = torch.tensor(length, device="cuda")

@@ -94,7 +94,6 @@ from prime_rl.trainer.weights import (
 from prime_rl.trainer.world import get_world
 from prime_rl.utils.logger import get_logger
 from prime_rl.utils.sequence import get_cu_seqlens_from_position_ids
-from prime_rl.utils.utils import format_time
 from prime_rl.utils.vlm import get_language_model, get_vision_encoder, is_vlm_architecture
 
 
@@ -150,19 +149,6 @@ def _virtual_stage_prefetch_pairs(
         for current, preceding in zip(reversed(group), reversed(group[:-1]))
     ]
     return groups, forward_pairs, backward_pairs
-
-
-def pre_download_model(model_name: str) -> None:
-    """Pre-download model from HuggingFace Hub so all nodes have cached weights before training."""
-    if Path(model_name).exists():
-        get_logger().info(f"Model {model_name} found at local path, skipping download")
-        return
-    get_logger().info(f"Pre-downloading model {model_name}")
-    t0 = time.perf_counter()
-    path = snapshot_download(repo_id=model_name, repo_type="model")
-    get_logger().debug(
-        f"Finished pre-downloading model {model_name} to {path} in {format_time(time.perf_counter() - t0)}"
-    )
 
 
 def _patch_qwen3_5_moe_conversion_mapping():
@@ -1607,12 +1593,6 @@ def fix_model_post_empty(model: nn.Module):
     if "model.embed_tokens.embed_scale" in buffer_names:
         embed_scale = model.config.hidden_size**0.5
         model.model.embed_tokens.embed_scale.fill_(embed_scale)
-
-
-def reshard_module(model: nn.Module):
-    for module in model.modules():
-        if isinstance(module, FSDPModule):
-            module.reshard()
 
 
 def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
