@@ -327,7 +327,6 @@ def _predictive_units(
     if data_words:
         local_data_start = data_start - global_offset
         local_data_end = local_data_start + data_words * 2
-        base1_words = np.frombuffer(base1[local_data_start:local_data_end], dtype="<u2")
         target_words = np.frombuffer(target[local_data_start:local_data_end], dtype="<u2").astype(np.uint32)
         predictor = _bf16_predictor(
             base2[local_data_start:local_data_end],
