@@ -184,7 +184,7 @@ def think_tag_rejection_reason(text: str) -> str | None:
         match.group(0).lower()
         for match in re.finditer(r"</?think>", text or "", flags=re.IGNORECASE)
     ]
-    if not tags or tags == ["</think>"] or tags == ["<think>", "</think>"]:
+    if tags in ([], ["</think>"], ["<think>", "</think>"]):
         return None
     if tags == ["<think>"]:
         return "unclosed_think"
@@ -203,11 +203,7 @@ def extract_completion_text(completion: Any) -> str:
 def extract_all_assistant_texts(completion: Any) -> list[str]:
     if isinstance(completion, str):
         return [completion]
-    out: list[str] = []
-    for m in completion:
-        if message_role(m) == "assistant":
-            out.append(message_content(m))
-    return out
+    return [message_content(m) for m in completion if message_role(m) == "assistant"]
 
 
 def extract_all_assistant_messages(completion: Any) -> list[Any]:
@@ -215,7 +211,7 @@ def extract_all_assistant_messages(completion: Any) -> list[Any]:
         return [{"role": "assistant", "content": completion}]
     if not isinstance(completion, list):
         return []
-    return [m for m in completion if message_role(m) == "assistant"]
+    return [message for message in completion if message_role(message) == "assistant"]
 
 
 def contains_markdown(text: str) -> bool:
