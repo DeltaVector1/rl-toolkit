@@ -393,7 +393,6 @@ sudo docker run -d --name "$ORCH_CT" \
   -e PYTHONPATH="$deployment/environments/decensor/src:$deployment/environments/ornith/src:$deployment/evals/refusals-classifier/src:/app/src" \
   -e HF_HOME="/data/glm52-rl/runs/$RUN/$RUN_NAME/hf-cache" \
   -v /data/glm52-rl:/data/glm52-rl \
-  -v /data/muse-glimmer/model:/data/muse-glimmer/model:ro \
   -v glm52-fp8-model:/models/glm52-fp8:ro \
   -v "$deployment/prime-rl/deps/renderers/renderers/base.py":/app/deps/renderers/renderers/base.py:ro \
   -v "$deployment/prime-rl/deps/renderers/renderers/client.py":/app/deps/renderers/renderers/client.py:ro \

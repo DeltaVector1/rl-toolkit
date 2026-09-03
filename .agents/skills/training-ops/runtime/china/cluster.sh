@@ -66,22 +66,6 @@ if [ -n "${TRANSFORMERS_OVERRIDE_DIR:-}" ]; then
   transformers_mount=(-v "$TRANSFORMERS_OVERRIDE_DIR/transformers":/app/.venv/lib/python3.12/site-packages/transformers:ro)
 fi
 
-python_dependency_mounts=()
-if [ -n "${MUSE_PYTHON_OVERRIDE_DIR:-}" ]; then
-  test -d "$MUSE_PYTHON_OVERRIDE_DIR/safetensors" || {
-    echo "MUSE_PYTHON_OVERRIDE_DIR must contain safetensors/" >&2
-    exit 1
-  }
-  test -d "$MUSE_PYTHON_OVERRIDE_DIR/safetensors-0.8.0.dist-info" || {
-    echo "MUSE_PYTHON_OVERRIDE_DIR must contain safetensors-0.8.0.dist-info/" >&2
-    exit 1
-  }
-  python_dependency_mounts=(
-    -v "$MUSE_PYTHON_OVERRIDE_DIR/safetensors":/app/.venv/lib/python3.12/site-packages/safetensors:ro
-    -v "$MUSE_PYTHON_OVERRIDE_DIR/safetensors-0.8.0.dist-info":/app/.venv/lib/python3.12/site-packages/safetensors-0.7.0.dist-info:ro
-  )
-fi
-
 case ${1:-} in
   trainer)
     # trainer_nodes lists the participating nodes in rank order; a node's rank
@@ -170,7 +154,6 @@ PY
       -v "$storage/cache/triton":/home/appuser/.triton \
       -v "$storage/cache/tmp":/scratch-tmp \
       "${transformers_mount[@]}" \
-      "${python_dependency_mounts[@]}" \
       -e TMPDIR=/scratch-tmp \
       -v "$deployment/prime-rl/src/prime_rl/_compat.py":/app/src/prime_rl/_compat.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/parity_router_trace.py":/app/src/prime_rl/parity_router_trace.py:ro \

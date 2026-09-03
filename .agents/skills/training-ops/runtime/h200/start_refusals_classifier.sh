@@ -4,7 +4,7 @@ set -euo pipefail
 deployment=/data/glm52-rl/deployment
 model=/data/glm52-rl/refusals-classifier-eval/model-rp-validity-396m
 service=$deployment/evals/refusals-classifier/classifier_service.py
-image=${MUSE_VLLM_IMAGE:-vllm/vllm-openai:nightly-5a4c8d99242e9e069b604d0e9b969e77f7dd501d}
+image=${VLLM_IMAGE:-vllm/vllm-openai:nightly-5a4c8d99242e9e069b604d0e9b969e77f7dd501d}
 container=refusals-classifier-eval
 classifier_port=$(python3 - "$deployment/configs/operations.toml" <<'PY'
 import sys

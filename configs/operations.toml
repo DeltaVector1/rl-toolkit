@@ -34,51 +34,49 @@ batch = 29620
 storage_root = "/data/glm52-rl"
 remote_repository = "/data/glm52-rl/deployment"
 runs = "/data/glm52-rl/runs"
-adapter_bucket = "hf://buckets/NewEden/muse-lora-checkpoints"
 adapter_cache = "/data/glm52-rl/lora-cache"
 
-[offline_sweep]
+[judge_seed_prompts]
 dataset = "NewEden/RL-seed-Decensor"
+revision = "de87870ad0228f9253d5a5e8ac4cb968901a064e"
 expected_prompts = 30000
 samples_per_prompt = 4
-policy_venv = "/data/glm52-rl/offline-sweep/sglang-venv.new"
-policy_source = "/data/glm52-rl/offline-sweep/sglang-a587"
-judge_venv = "/data/glm52-rl/offline-sweep/.venv"
-runner_venv = "/data/glm52-rl/offline-sweep/runner-venv"
-judge_vllm_version = "0.28.0"
-policy_engine = "sglang"
+work_root = "/data/glm52-rl/judge-seed-prompts"
 model = "/data/ZiphuAI/GLM-5.2-FP8"
-output = "/data/glm52-rl/offline-sweep/output"
 
-[offline_sweep.glm_a]
-hosts = ["n76", "n77", "n78", "n80"]
+[judge_seed_prompts.rtx4090]
+hosts = ["n76", "n77", "n78", "n80", "n83", "n84", "n85"]
 head = "n76"
-api_host = "10.92.20.76"
-served_model = "glm52-base-a"
-tensor_parallel_size = 8
-pipeline_parallel_size = 4
-data_parallel_size = 1
-dist_init_port = 29000
-api_port = 29200
+policy_urls = ["http://10.92.20.76:29200/v1", "http://10.92.20.83:29201/v1"]
+policy_models = ["glm52-base-a", "glm52-base-b"]
+policy_engine = "sglang"
+judge = "rtx4090"
 
-[offline_sweep.glm_b]
-hosts = ["n83", "n84", "n85"]
-head = "n83"
-api_host = "10.92.20.83"
-served_model = "glm52-base-b"
-tensor_parallel_size = 8
-pipeline_parallel_size = 3
-data_parallel_size = 1
-dist_init_port = 29010
-api_port = 29201
+[judge_seed_prompts.h200a]
+host = "h200a"
+policy_url = "http://127.0.0.1:8000/v1"
+policy_model = "/models/glm52-fp8"
+policy_engine = "openai"
+judge = "external"
 
-[offline_sweep.gemma]
+[judge_seed_prompts.h200b]
+host = "h200b"
+policy_url = "http://127.0.0.1:8000/v1"
+policy_model = "/models/glm52-fp8"
+policy_engine = "openai"
+judge = "external"
+
+[judges.rtx4090]
 host = "n82"
-api_host = "10.92.20.82"
+api_url = "http://10.92.20.82:29209/v1"
+model = "gemma-judge"
+model_path = "/data/glm52-rl/judge-seed-prompts/models/gemma-fp8"
+data_parallel_size = 8
+
+[judges.external]
+host = "202.214.223.66"
+api_url = "http://202.214.223.66:26406/v1"
 model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
-path = "/data/glm52-rl/offline-sweep/models/gemma-fp8"
-served_model = "gemma-judge"
-api_port = 29209
 data_parallel_size = 8
 
 [containers]
@@ -87,16 +85,9 @@ orchestrator = "glm52-decensor-orchestrator"
 adapter = "glm52-adapter-http"
 adapter_relay = "glm52-adapter-relay"
 glm52_inference = "glm52-decensor-h200"
-muse_inference = "muse-glimmer-h200"
 
 [models]
 glm52 = "/models/glm52-fp8"
-muse = "/data/muse-glimmer/model"
-
-[inference.h200a.muse]
-gpu_count = 8
-tensor_parallel_size = 1
-ports = [8001, 8002, 8003, 8004, 8005, 8006, 8007, 8008]
 
 [inference.h200a.glm52]
 gpu_count = 8
@@ -113,11 +104,6 @@ peer_ssh_identity_file = "/data/trinity/h200_rollout_ed25519"
 api_tunnel_port = 18049
 disable_nccl_shm = false
 
-[inference.h200b.muse]
-gpu_count = 8
-tensor_parallel_size = 1
-ports = [8001, 8002, 8003, 8004, 8005, 8006, 8007, 8008]
-
 [inference.h200b.glm52]
 gpu_count = 8
 tensor_parallel_size = 8
@@ -125,14 +111,9 @@ data_parallel_size = 1
 ports = [8000]
 
 [profiles.current]
-kind = "muse"
+kind = "glm52"
 trainer = "configs/current/trainer.toml"
 orchestrator = "configs/current/orchestrator.toml"
-
-[profiles.glm52]
-kind = "glm52"
-trainer = "configs/paused/glm52/trainer.toml"
-orchestrator = "configs/paused/glm52/orchestrator.toml"
 
 [profiles.glm52-native-small]
 kind = "glm52"
@@ -167,12 +148,6 @@ max_output_length = 16384
 learning_rate = 8e-6
 max_gradient_norm = 1.0
 weight_decay = 0.0
-
-[requirements.muse]
-batch_size = 1024
-context_length = 65536
-trainer_seconds_max = 480
-rollout_seconds_max = 1200
 
 [requirements.glm52]
 batch_size = 1024

@@ -59,7 +59,7 @@ A copied Python module does not replace the copy in a running process.
 Get an owner decision before these calls:
 
 ```python
-training_ops.start("muse19", profile="current")
+training_ops.start("glm-1", profile="current")
 training_ops.stop()
 ```
 

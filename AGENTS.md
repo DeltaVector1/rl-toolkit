@@ -57,15 +57,12 @@ outcome, measurements, changed files, commit, checks, and remaining blocker.
 
 ## Current system
 
-The current profile trains Muse-Glimmer-30B with GRPO. It uses BF16 base
-weights and a rank-128 LoRA adapter on all supported attention and MLP linear
-weights.
-
-GLM-5.2 is paused. Its code and settings are in this repository. Do not infer
-a GLM topology from the Muse profile below.
+The current profile trains GLM-5.2 with GRPO. It uses native FP8 base weights
+and a rank-32 LoRA adapter on the supported attention, shared-expert, and
+routed-expert linear weights. The router stays frozen.
 
 - Eight trainer hosts use 64 RTX 4090 GPUs.
-- One inference host uses eight independent H200 replicas.
+- Two inference hosts each use eight H200 GPUs as one TP8 server.
 - One external judge host uses eight RTX 5090 GPUs.
 - The orchestrator runs on the inference host.
 - The adapter server runs on the trainer head.
@@ -76,9 +73,9 @@ separately.
 
 ## Full-weight warning
 
-A Muse BF16 checkpoint is 55.5 GiB. A measured transfer to two H200 hosts took
-about 37 minutes for each policy version. Warn the owner before any full-weight
-run. Do not include this time in trainer or rollout time.
+The GLM FP8 model on each H200 host is 755,632,050,320 bytes, approximately
+704 GiB. Warn the owner before a full model copy. Do not include full model
+copy time in trainer, adapter, or rollout time.
 
 ## Safety rules
 
@@ -115,7 +112,6 @@ minutes. Do not start a background monitor.
 ## Source of truth
 
 - `configs/current/` contains the current run settings.
-- `configs/paused/` contains paused settings.
 - `docs/RUNBOOK.md` contains commands.
 - `docs/HANDOFF.md` contains design history and past faults.
 - `docs/PERFORMANCE.md` contains measurements.

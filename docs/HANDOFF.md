@@ -3,36 +3,6 @@
 This file records decisions that are easy to lose. Use `git log` for the full
 change history.
 
-## Current Muse design
-
-The trainer uses 64 RTX 4090 GPUs with PP8, CP4 ring, and FSDP2. It trains a
-rank-128 LoRA adapter in BF16. The adapter covers every supported language
-attention and MLP linear weight. It does not cover the vision tower.
-
-The inference host runs eight TP1 H200 replicas. The orchestrator sends each
-GRPO group to one replica. A measured 128-request test reached 2,789 output
-tokens per second. Four TP2 replicas reached 1,619 output tokens per second.
-Keep TP1 data-parallel serving for this workload.
-
-The current Muse launcher uses the Transformers model implementation. It uses
-full CUDA graphs for decode-only batches. Prompt and mixed batches do not use
-a full graph. Test any new path in isolation before use.
-
-## Policy transport
-
-Training saves only the LoRA adapter. It does not merge the adapter into the
-base model during training. The inference service loads the same rank-128
-adapter into each replica.
-
-Full BF16 policy transport is not suitable for frequent updates. One policy
-file is 55.5 GiB. A transfer to two H200 hosts took about 37 minutes. Always
-report this separately.
-
-Rollout batches use immutable filesystem transport. Completed groups may carry
-into the next batch. A policy update discards each incomplete old-policy group
-and regenerates that complete group. A group must not contain two policy
-versions.
-
 ## Rollout service
 
 The rollout timeout is absolute. A harness timeout is terminal and does not
@@ -59,19 +29,14 @@ Compare selected-token FP32 log probabilities. Repeat the request alone and at
 several batch sizes. Test long positions and adapter reload. Do not use an
 objective change to hide a numeric difference.
 
-The Muse output head is the first useful comparison point. The trainer uses
-token chunks and vocabulary chunks with online log-sum-exp. Inference may use
-a different reduction order. Soft-cap placement and LoRA arithmetic must also
-match.
-
-## GLM-5.2 paused work
+## Current GLM-5.2 design
 
 GLM qualification and production files use the same repository and remote
 deployment path. `training_ops` copies every mounted Prime-RL file before a
 run starts.
 
-The last GLM run trained only attention projections. Future work must train the
-routed expert control, up, and down weights while the router stays frozen.
+The trainer targets the attention projections, shared experts, and routed
+experts. The router stays frozen.
 
 The native FP8 expert path must keep its low-memory backward. A past step failed
 when one rank had 1.5 MiB free and needed a 24 MiB output. The current source

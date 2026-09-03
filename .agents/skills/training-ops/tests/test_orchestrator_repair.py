@@ -89,7 +89,7 @@ class OrchestratorRepairTest(unittest.TestCase):
                 "glm-1",
                 {
                     "kind": "glm52",
-                    "orchestrator": "configs/paused/glm52/orchestrator.toml",
+                    "orchestrator": "configs/current/orchestrator.toml",
                 },
                 was_running=False,
                 observed_state="absent",
@@ -163,7 +163,7 @@ class OrchestratorRepairTest(unittest.TestCase):
         self.assertIn("RUN=glm-1", ssh_scripts[-1][0])
         self.assertIn("RUN_NAME=run_glm-1", ssh_scripts[-1][0])
         self.assertIn(
-            "ORCH_CONFIG=/data/glm52-rl/deployment/configs/paused/glm52/orchestrator.toml",
+            "ORCH_CONFIG=/data/glm52-rl/deployment/configs/current/orchestrator.toml",
             ssh_scripts[-1][0],
         )
         self.assertIn("TRAINER_CT=glm52-decensor-trainer", ssh_scripts[-1][0])
@@ -195,7 +195,7 @@ class OrchestratorRepairTest(unittest.TestCase):
                 "glm52",
                 {
                     "kind": "glm52",
-                    "orchestrator": "configs/paused/glm52/orchestrator.toml",
+                    "orchestrator": "configs/current/orchestrator.toml",
                 },
                 was_running=True,
             )
@@ -203,7 +203,7 @@ class OrchestratorRepairTest(unittest.TestCase):
         self.assertIn("RUN=glm52", script)
         self.assertIn("RUN_NAME=run_glm52", script)
         self.assertIn(
-            "ORCH_CONFIG=/data/glm52-rl/deployment/configs/paused/glm52/orchestrator.toml",
+            "ORCH_CONFIG=/data/glm52-rl/deployment/configs/current/orchestrator.toml",
             script,
         )
         self.assertIn(

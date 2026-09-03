@@ -47,7 +47,6 @@ inference_settings = operations["inference"]
 reward_settings = operations["reward"]
 limits = operations["limits"]
 shared_requirements = operations["requirements"]["shared"]
-muse_requirements = operations["requirements"]["muse"]
 glm_requirements = operations["requirements"]["glm52"]
 
 trainer_head = hosts["trainer_head"]
@@ -73,9 +72,8 @@ orchestrator_container = containers["orchestrator"]
 adapter_container = containers["adapter"]
 adapter_relay_container = containers["adapter_relay"]
 glm_inference_container = containers["glm52_inference"]
-muse_inference_container = containers["muse_inference"]
 glm_model = models["glm52"]
-muse_model = models["muse"]
+adapter_archive_bucket = paths.get("adapter_bucket")
 baseline_std = reward_settings["reference_spread"]
 baseline_run = reward_settings["reference_run"]
 minimum_trend_steps = reward_settings["minimum_steps"]
@@ -116,10 +114,6 @@ max_output_length = shared_requirements["max_output_length"]
 learning_rate = shared_requirements["learning_rate"]
 max_gradient_norm = shared_requirements["max_gradient_norm"]
 weight_decay = shared_requirements["weight_decay"]
-muse_batch_size = muse_requirements["batch_size"]
-muse_context_length = muse_requirements["context_length"]
-muse_compute_max_seconds = muse_requirements["trainer_seconds_max"]
-muse_rollout_max_seconds = muse_requirements["rollout_seconds_max"]
 glm_batch_size = glm_requirements["batch_size"]
 glm_context_length = glm_requirements["context_length"]
 glm_compute_min_seconds = glm_requirements["trainer_seconds_min"]
@@ -127,7 +121,6 @@ glm_compute_max_seconds = glm_requirements["trainer_seconds_max"]
 glm_rollout_min_seconds = glm_requirements["rollout_seconds_min"]
 glm_rollout_max_seconds = glm_requirements["rollout_seconds_max"]
 
-adapter_archive_bucket = paths["adapter_bucket"]
 adapter_archive_files = ("adapter_config.json", "adapter_model.safetensors")
 dependency_manifest_name = ".training-ops-manifest"
 _dependency_remote_archive_pattern = re.compile(
@@ -147,11 +140,10 @@ for inference_host in inference_hosts:
         )
 
 
-def _inference_config(host: str, kind: str | None = None) -> dict:
-    kind = kind or _profile()["kind"]
-    settings = inference_settings.get(host, {}).get(kind)
+def _inference_config(host: str) -> dict:
+    settings = inference_settings.get(host, {}).get("glm52")
     if not isinstance(settings, dict):
-        raise RuntimeError(f"inference settings for {host} and {kind} are missing")
+        raise RuntimeError(f"inference settings for {host} and glm52 are missing")
     return settings
 
 
@@ -160,8 +152,8 @@ def _profile(name: str = "current") -> dict:
     if name not in profiles:
         raise Refused(f"unknown profile {name!r}; choose from {', '.join(sorted(profiles))}")
     profile = dict(profiles[name])
-    if profile.get("kind") not in {"muse", "glm52"}:
-        raise RuntimeError(f"profile {name!r} has an invalid kind")
+    if profile.get("kind") != "glm52":
+        raise RuntimeError(f"profile {name!r} must use kind='glm52'")
     trainer = profile.get("trainer")
     if not isinstance(trainer, str) or not (repo_root / trainer).is_file():
         raise RuntimeError(f"profile {name!r} has no readable trainer config")
@@ -554,22 +546,14 @@ done
 [ "$ok" -eq "$total" ] && code=200 || code=000
 echo "GEN $code $longest"
 echo "PROBES $ok $total"
-if sudo docker ps -a --filter name=^__MUSE__-0$ --format '{{.Names}}' | grep -q .; then
-  replicas=$(sudo docker ps -a --filter name=__MUSE__- --format '{{.Names}}' | grep -E '^__MUSE__-[0-9]+$' | sort -V)
-  echo "RUNNING $(for c in $replicas; do sudo docker logs --since 60s $c 2>&1 | grep -aoE 'Running: [0-9]+' | grep -oE '[0-9]+' | awk 'BEGIN{m=0} {if ($1>m)m=$1} END{print m}'; done | awk '{s+=$1} END{print s+0}')"
-  echo "TPUT $(for c in $replicas; do sudo docker logs --since 60s $c 2>&1 | grep -aoE 'generation throughput: [0-9.]+' | grep -oE '[0-9.]+' | awk 'BEGIN{m=0} {if ($1>m)m=$1} END{print m}'; done | awk '{s+=$1} END{print s+0}')"
-else
-  echo "RUNNING $(sudo docker logs --since 60s __ENGINE__ 2>&1 | grep -aoE 'Running: [0-9]+' | grep -oE '[0-9]+' | awk 'BEGIN{m=0} {if ($1>m)m=$1} END{print m}')"
-  echo "TPUT $(sudo docker logs --since 60s __ENGINE__ 2>&1 | grep -aoE 'generation throughput: [0-9.]+' | grep -oE '[0-9.]+' | awk 'BEGIN{m=0} {if ($1>m)m=$1} END{print m}')"
-fi
+echo "RUNNING $(sudo docker logs --since 60s __ENGINE__ 2>&1 | grep -aoE 'Running: [0-9]+' | grep -oE '[0-9]+' | awk 'BEGIN{m=0} {if ($1>m)m=$1} END{print m}')"
+echo "TPUT $(sudo docker logs --since 60s __ENGINE__ 2>&1 | grep -aoE 'generation throughput: [0-9.]+' | grep -oE '[0-9.]+' | awk 'BEGIN{m=0} {if ($1>m)m=$1} END{print m}')"
 echo "WD $(pgrep -f 'bash .*[e]ngine_watchdog.sh' | wc -l)"
 """
 
 
-def _inference_script(
-    host: str, model: str, container: str, kind: str | None = None
-) -> str:
-    settings = _inference_config(host, kind)
+def _inference_script(host: str, model: str, container: str) -> str:
+    settings = _inference_config(host)
     gpu_count = settings.get("gpu_count")
     if not isinstance(gpu_count, int) or gpu_count < 1:
         raise RuntimeError(f"GPU count for {host} is invalid")
@@ -593,7 +577,6 @@ def _inference_script(
     return (
         inference_probe.replace("__MODEL__", model)
         .replace("__ENGINE__", container)
-        .replace("__MUSE__", muse_inference_container)
         .replace("__PORTS__", " ".join(map(str, ports)))
     )
 
@@ -721,22 +704,13 @@ class AcceptanceReport:
         L = [f"training requirements for {self.run}"]
         L.append(f"profile: {self.profile}")
         L.append(f"config: {values}")
-        if self.profile == "muse":
-            L.append(f"BF16 trainer: {precision}")
-            L.append(
-                f"trainer forward/backward only: {trainer} (alarm above 8m after step 1)"
-            )
-            L.append(
-                f"active rollout generation only: {generation} (alarm above 20m)"
-            )
-        else:
-            L.append(f"native FP8 trainer: {precision}")
-            L.append(
-                f"trainer forward/backward only: {trainer} (check 10-15m after step 1)"
-            )
-            L.append(
-                f"active rollout generation only: {generation} (approximate check 8-12m)"
-            )
+        L.append(f"native FP8 trainer: {precision}")
+        L.append(
+            f"trainer forward/backward only: {trainer} (check 10-15m after step 1)"
+        )
+        L.append(
+            f"active rollout generation only: {generation} (approximate check 8-12m)"
+        )
         L.append(
             "excluded from both times: policy/check waiting, judging/scoring, batch transfer, "
             "adapter transfer, and checkpoint save"
@@ -1115,15 +1089,9 @@ def _acceptance_from_text(
     rollout_rows, _, _ = _select_active_metric_rows(
         rollout_rows, run, rollout_active_run, rollout_start_epoch
     )
-    is_muse = run.lower().startswith("muse") or "muse-glimmer" in trainer_config.lower()
-    profile = "muse" if is_muse else "glm52"
-    rep = AcceptanceReport(
-        run=run, profile=profile, reward_verdict=reward_verdict
-    )
-    expected_batch = muse_batch_size if is_muse else glm_batch_size
-    expected_context = (
-        muse_context_length if is_muse else glm_context_length
-    )
+    rep = AcceptanceReport(run=run, profile="glm52", reward_verdict=reward_verdict)
+    expected_batch = glm_batch_size
+    expected_context = glm_context_length
 
     rep.batch_size = _last(orch_values, "batch_size")
     rep.group_size = _last(orch_values, "group_size")
@@ -1157,15 +1125,6 @@ def _acceptance_from_text(
     if not trainer_config.strip():
         rep.native_fp8 = None
         rep.precision_ok = None
-    elif is_muse:
-        optimization_dtype = _last(trainer_values, "model.optimization_dtype")
-        reduce_dtype = _last(trainer_values, "model.reduce_dtype")
-        rep.native_fp8 = False
-        rep.precision_ok = (
-            optimization_dtype == "bfloat16"
-            and reduce_dtype == "bfloat16"
-            and quant_type is None
-        )
     else:
         rep.native_fp8 = (
             quant_type == "fp8"
@@ -1236,64 +1195,35 @@ def _acceptance_from_text(
             f"weight decay is {_shown(rep.weight_decay)}; expected {weight_decay:g}"
         )
     if rep.precision_ok is not True:
-        if is_muse:
-            rep.alarms.append("trainer is not confirmed on unquantized BF16 weights")
-        else:
-            rep.alarms.append("trainer is not confirmed on native FP8 checkpoint weights")
+        rep.alarms.append("trainer is not confirmed on native FP8 checkpoint weights")
 
-    if is_muse:
-        bad_compute = [
-            step
-            for step, seconds in compute
-            if seconds > muse_compute_max_seconds
-        ]
-    else:
-        bad_compute = [
-            step
-            for step, seconds in compute
-            if seconds < glm_compute_min_seconds
-            or seconds > glm_compute_max_seconds
-        ]
+    bad_compute = [
+        step
+        for step, seconds in compute
+        if seconds < glm_compute_min_seconds
+        or seconds > glm_compute_max_seconds
+    ]
     if bad_compute:
-        if is_muse:
-            rep.alarms.append(
-                f"trainer forward/backward exceeds 8m after step 1 at steps "
-                f"{','.join(map(str, bad_compute[-8:]))}"
-            )
-        else:
-            rep.alarms.append(
-                f"trainer forward/backward is outside 10-15m after step 1 at steps "
-                f"{','.join(map(str, bad_compute[-8:]))}"
-            )
+        rep.alarms.append(
+            f"trainer forward/backward is outside 10-15m after step 1 at steps "
+            f"{','.join(map(str, bad_compute[-8:]))}"
+        )
     elif rep.completed_steps > 1 and not compute:
         rep.alarms.append(
             "no separate trainer forward/backward measurement after step 1"
         )
 
-    if is_muse:
-        bad_generation = [
-            step
-            for step, seconds in generation
-            if seconds > muse_rollout_max_seconds
-        ]
-    else:
-        bad_generation = [
-            step
-            for step, seconds in generation
-            if seconds < glm_rollout_min_seconds
-            or seconds > glm_rollout_max_seconds
-        ]
+    bad_generation = [
+        step
+        for step, seconds in generation
+        if seconds < glm_rollout_min_seconds
+        or seconds > glm_rollout_max_seconds
+    ]
     if bad_generation:
-        if is_muse:
-            rep.alarms.append(
-                f"active rollout generation exceeds 20m at steps "
-                f"{','.join(map(str, bad_generation[-8:]))}"
-            )
-        else:
-            rep.alarms.append(
-                f"active rollout generation is outside approximately 10m (8-12m alarm band) "
-                f"at steps {','.join(map(str, bad_generation[-8:]))}"
-            )
+        rep.alarms.append(
+            f"active rollout generation is outside approximately 10m (8-12m alarm band) "
+            f"at steps {','.join(map(str, bad_generation[-8:]))}"
+        )
     elif rollout_rows and not generation:
         rep.alarms.append("no separate active rollout generation measurement")
 
@@ -1301,7 +1231,7 @@ def _acceptance_from_text(
         rep.alarms.append(f"{category} failure evidence is present ({count})")
     if reward_verdict == "falling":
         rep.alarms.append("effective reward verdict is falling")
-    if not is_muse and not rep.large_batch_evidence:
+    if not rep.large_batch_evidence:
         rep.alarms.append("no measured batch-2048 validation evidence")
     if rep.completed_steps < final_validation_steps:
         rep.alarms.append(
@@ -1460,14 +1390,10 @@ def acceptance(run: str = "", quiet: bool = False) -> AcceptanceReport:
 
 def logs(role: str = "trainer", lines: int = 200) -> str:
     """Read the current container tail without a separate SSH command."""
-    kind = _profile_for_run(current_run())["kind"]
-    inference_container = (
-        muse_inference_container if kind == "muse" else glm_inference_container
-    )
     roles = {
         "trainer": (trainer_head, trainer_container),
         "orchestrator": (orchestrator_host, orchestrator_container),
-        **{host: (host, inference_container) for host in inference_hosts},
+        **{host: (host, glm_inference_container) for host in inference_hosts},
     }
     if role not in roles:
         raise Refused(f"log role must be one of: {', '.join(roles)}")
@@ -1491,11 +1417,41 @@ def logs(role: str = "trainer", lines: int = 200) -> str:
 
 
 def parity(run: str = "") -> dict:
-    """Summarize the step-1 token parity record on the owning trainer host."""
+    """Summarize the newest token parity record on configured trainer hosts."""
     run = run or current_run()
     if not re.fullmatch(r"[A-Za-z0-9_-]+", run):
         raise Refused("run name contains invalid characters")
-    path = f"{run_root}/{run}/parity-step1.json"
+    run_path = f"{run_root}/{run}"
+    find_script = f"""
+candidate=$(find {shlex.quote(run_path)} -maxdepth 4 -type f -name 'parity-step*.json' \\
+  -printf '%T@ %p\\n' 2>/dev/null | sort -nr | head -1)
+if [ -n \"$candidate\" ]; then
+  printf 'PARITY %s\\n' \"$candidate\"
+else
+  printf 'NO_PARITY\\n'
+fi
+"""
+    candidates = []
+    unavailable = []
+    for host, (code, output) in _fan(
+        trainer_hosts, lambda host: _ssh(host, find_script, timeout=180)
+    ).items():
+        if code:
+            unavailable.append(host)
+            continue
+        match = re.search(r"^PARITY ([0-9]+(?:\.[0-9]+)?) (.+)$", output, re.M)
+        if match:
+            candidates.append((float(match.group(1)), host, match.group(2).strip()))
+    if not candidates:
+        detail = f"; unavailable hosts: {', '.join(unavailable)}" if unavailable else ""
+        print(f"no parity record found for {run} on configured trainer hosts{detail}")
+        return {
+            "run": run,
+            "available": False,
+            "reason": "no parity record found",
+            "unavailable_hosts": unavailable,
+        }
+    _, parity_host, path = max(candidates, key=lambda item: item[0])
     script = f"""
 python3 - {shlex.quote(path)} <<'PY'
 import hashlib,json,math,sys
@@ -1537,14 +1493,18 @@ out={{
 print(json.dumps(out,sort_keys=True))
 PY
 """
-    code, output = _ssh(trainer_head, script, timeout=180)
+    code, output = _ssh(parity_host, script, timeout=180)
     if code:
-        raise RuntimeError(f"cannot read parity record {path} on {trainer_head}")
+        raise RuntimeError(f"cannot read parity record {path} on {parity_host}")
     try:
         summary = json.loads(output.strip().splitlines()[-1])
     except (ValueError, IndexError) as error:
         raise RuntimeError(f"parity record {path} is invalid") from error
-    summary["host"] = trainer_head
+    summary["run"] = run
+    summary["available"] = True
+    summary["path"] = path
+    summary["host"] = parity_host
+    summary["unavailable_hosts"] = unavailable
     print(json.dumps(summary, indent=2, sort_keys=True))
     return summary
 
@@ -1552,10 +1512,6 @@ PY
 def status(run: str = "", quiet: bool = False) -> Status:
     """Probe every part of the run once and return the whole picture."""
     run = run or current_run()
-    kind = _profile_for_run(run)["kind"]
-    muse_run = kind == "muse"
-    engine_model = muse_model if muse_run else glm_model
-    engine_container = muse_inference_container if muse_run else glm_inference_container
     s = Status(
         when=_dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), run=run
     )
@@ -1567,7 +1523,7 @@ def status(run: str = "", quiet: bool = False) -> Status:
     def engine(h):
         return _ssh(
             h,
-            _inference_script(h, engine_model, engine_container, kind),
+            _inference_script(h, glm_model, glm_inference_container),
             timeout=90,
         )
 
@@ -1820,15 +1776,11 @@ def tunnels() -> dict[int, str]:
 def engines(run: str = "") -> dict[str, EngineState]:
     """Probe every configured inference host with a real completion."""
     run = run or current_run()
-    kind = _profile_for_run(run)["kind"]
-    muse_run = kind == "muse"
-    engine_model = muse_model if muse_run else glm_model
-    engine_container = muse_inference_container if muse_run else glm_inference_container
     states = []
     for host, (rc, out) in _fan(
         inference_hosts,
         lambda h: _ssh(
-            h, _inference_script(h, engine_model, engine_container, kind), timeout=90
+            h, _inference_script(h, glm_model, glm_inference_container), timeout=90
         ),
     ).items():
         e = EngineState(host=host, reachable=(rc == 0))
@@ -1945,10 +1897,9 @@ def _parse_adapter_broadcasts(output: str, run_base: str) -> list[AdapterBroadca
 
 
 def _adapter_bucket_run_folder(run: str) -> str:
-    match = re.fullmatch(r"muse-?(\d+)", run)
-    if not match:
-        raise Refused("adapter archive requires a Muse run such as muse19")
-    return f"muse-{int(match.group(1))}-run"
+    if not isinstance(run, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", run):
+        raise Refused("adapter archive run name is invalid")
+    return f"{run}-run"
 
 
 def _local_command(command: list[str], label: str, timeout: int) -> subprocess.CompletedProcess:
@@ -2157,6 +2108,8 @@ def archive_adapters(
     finished: bool = False,
 ) -> list[int]:
     """Upload stable old LoRA adapters, then remove verified remote copies."""
+    if not isinstance(adapter_archive_bucket, str) or not adapter_archive_bucket:
+        raise Refused("adapter archive is not configured")
     run_base = _validated_run_base(run)
     bucket_run_folder = _adapter_bucket_run_folder(run)
     if steps_to_archive is not None:
@@ -2297,7 +2250,7 @@ start_epoch=
 if [ -n "$started_at" ]; then start_epoch=$(date -u -d "$started_at" +%s.%N 2>/dev/null || true); fi
 python3 - "$path" {int(limit)} {shlex.quote(run)} "$active_run" "$start_epoch" <<'PY'
 import json,sys
-rows=[]
+rows_by_step={{}}
 invalid=0
 excluded=0
 requested_run=sys.argv[3]
@@ -2311,8 +2264,9 @@ for line in open(sys.argv[1]):
     except ValueError:
         invalid+=1
         continue
-    if not (isinstance(row.get('step'), (int,float)) and isinstance(row.get('time/forward_backward'), (int,float))):
+    if not (isinstance(row.get('step'), (int,float)) and not isinstance(row.get('step'), bool)):
         continue
+    step=int(row['step'])
     if filter_rows:
         timestamp=row.get('time')
         if not isinstance(timestamp, (int,float)) or isinstance(timestamp, bool):
@@ -2325,12 +2279,23 @@ for line in open(sys.argv[1]):
         if timestamp < active_start:
             excluded+=1
             continue
-    rows.append({{
-        'step':int(row['step']),
-        'forward_backward_seconds':float(row['time/forward_backward']),
-        'wait_seconds':float(row.get('time/wait_for_batch') or 0),
-        'tokens_per_second':float(row.get('perf/throughput') or 0),
-    }})
+    item=rows_by_step.setdefault(step, {{'step':step}})
+    compute=row.get('time/forward_backward')
+    if isinstance(compute, (int,float)) and not isinstance(compute, bool):
+        item['forward_backward_seconds']=float(compute)
+    wait=row.get('time/wait_for_batch')
+    if isinstance(wait, (int,float)) and not isinstance(wait, bool):
+        item['wait_seconds']=float(wait)
+    throughput=row.get('perf/throughput')
+    if isinstance(throughput, (int,float)) and not isinstance(throughput, bool):
+        item['tokens_per_second']=float(throughput)
+rows=sorted(
+    (row for row in rows_by_step.values() if 'forward_backward_seconds' in row),
+    key=lambda row: row['step'],
+)
+for row in rows:
+    row.setdefault('wait_seconds', 0.0)
+    row.setdefault('tokens_per_second', 0.0)
 print(json.dumps({{'rows':rows[-int(sys.argv[2]):], 'invalid_lines':invalid, 'excluded_lines':excluded}}))
 PY
 """
@@ -2359,10 +2324,8 @@ PY
     return rows
 
 
-def package_versions(*names: str) -> dict[str, str]:
-    """Show installed versions without importing the packages."""
-    import importlib.metadata
-
+def package_versions(*names: str) -> dict[str, dict[str, str]]:
+    """Show versions from each configured live trainer and inference container."""
     packages = names or (
         "transformers",
         "safetensors",
@@ -2370,15 +2333,92 @@ def package_versions(*names: str) -> dict[str, str]:
         "huggingface-hub",
         "verifiers",
     )
-    versions = {}
-    for name in packages:
-        try:
-            versions[name] = importlib.metadata.version(name)
-        except importlib.metadata.PackageNotFoundError as error:
-            raise RuntimeError(f"package is not installed: {name}") from error
-    for name, version in versions.items():
-        print(f"{name} {version}")
-    return versions
+    if any(
+        not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name)
+        for name in packages
+    ):
+        raise Refused("package names must contain only letters, numbers, '.', '_' or '-'")
+    package_args = " ".join(shlex.quote(name) for name in packages)
+    probe = (
+        "import importlib.metadata as m,json,sys; out={}; "
+        "\nfor n in sys.argv[1:]:\n"
+        " try: out[n]=m.version(n)\n"
+        " except m.PackageNotFoundError: out[n]=None\n"
+        " except Exception as e: out[n]='ERROR:'+type(e).__name__\n"
+        "print(json.dumps(out,sort_keys=True))"
+    )
+    remote_code = shlex.quote(probe)
+    targets = {}
+    for host in trainer_hosts:
+        targets.setdefault(host, []).append(trainer_container)
+    for host in inference_hosts:
+        targets.setdefault(host, []).append(glm_inference_container)
+    reports: dict[str, dict[str, str]] = {}
+
+    def read_host(host: str) -> tuple[int, str]:
+        target_names = " ".join(shlex.quote(container) for container in targets[host])
+        script = f"""
+for container in {target_names}; do
+  if ! sudo docker ps --format '{{{{.Names}}}}' | grep -Fxq \"$container\"; then
+    continue
+  fi
+  python_path=$(sudo docker exec \"$container\" sh -lc 'if [ -x /app/.venv/bin/python ]; then printf /app/.venv/bin/python; else command -v python || command -v python3; fi' 2>/dev/null || true)
+  if [ -z \"$python_path\" ]; then
+    printf 'PACKAGE_ERROR %s no-python\\n' \"$container\"
+    continue
+  fi
+  result=$(sudo docker exec \"$container\" \"$python_path\" -c {remote_code} {package_args} 2>&1) || {{
+    printf 'PACKAGE_ERROR %s %s\\n' \"$container\" \"$result\"
+    continue
+  }}
+  printf 'PACKAGE_JSON %s %s\\n' \"$container\" \"$python_path\"
+  printf '%s\\n' \"$result\"
+done
+"""
+        return _ssh(host, script, timeout=180)
+
+    for host, (code, output) in _fan(targets, read_host).items():
+        if code:
+            reports[f"{host}/error"] = {"error": output.strip() or f"exit {code}"}
+            continue
+        lines = output.splitlines()
+        container = None
+        python_path = None
+        found = False
+        for line in lines:
+            match = re.fullmatch(r"PACKAGE_JSON (\S+) (\S+)", line)
+            if match:
+                container, python_path = match.groups()
+                continue
+            error_match = re.fullmatch(r"PACKAGE_ERROR (\S+) (.*)", line)
+            if error_match:
+                reports[f"{host}/{error_match.group(1)}"] = {
+                    "error": error_match.group(2) or "package query failed"
+                }
+                found = True
+                container = None
+                python_path = None
+                continue
+            if container and python_path and line.startswith("{"):
+                try:
+                    values = json.loads(line)
+                except ValueError:
+                    reports[f"{host}/{container}"] = {"error": "invalid package report"}
+                else:
+                    reports[f"{host}/{container}"] = {
+                        **{name: ("MISSING" if value is None else str(value)) for name, value in values.items()},
+                        "python": python_path,
+                    }
+                found = True
+                container = None
+                python_path = None
+        if not found:
+            reports[f"{host}/none"] = {"status": "no configured target container is running"}
+    print("package versions (live containers):")
+    for target, values in sorted(reports.items()):
+        details = ", ".join(f"{name}={value}" for name, value in values.items())
+        print(f"{target}: {details}")
+    return reports
 
 
 # ------------------------------------------------------------ reward reading
@@ -2893,20 +2933,17 @@ def _adapter_update_config(run: str) -> dict:
     if f"/{run}/" not in source_url.rstrip("/") + "/":
         raise Refused("adapter source URL is not bound to the active run")
 
-    kind = selected["kind"]
     ports_by_host = {}
     for host in inference_hosts:
-        configured_ports = _inference_config(host, kind).get("ports")
+        configured_ports = _inference_config(host).get("ports")
         if not isinstance(configured_ports, list) or not configured_ports:
             raise Refused(f"inference ports for {host} are missing")
         if not all(isinstance(port, int) and 1 <= port <= 65535 for port in configured_ports):
             raise Refused(f"inference ports for {host} are invalid")
         ports_by_host[host] = list(configured_ports)
     return {
-        "kind": kind,
-        "engine_container": muse_inference_container
-        if kind == "muse"
-        else glm_inference_container,
+        "kind": "glm52",
+        "engine_container": glm_inference_container,
         "output_dir": output_dir,
         "service_name": service_name,
         "run_marker": f"/{run}/",
@@ -2919,8 +2956,6 @@ def _adapter_update_config(run: str) -> dict:
 
 def _adapter_server_launch_script(run: str, config: dict) -> str:
     """Build the configured adapter-http launch without touching the trainer."""
-    if config.get("kind") != "glm52":
-        raise Refused("adapter-server repair is only supported for the active GLM profile")
     source_url = config.get("source_url")
     if not isinstance(source_url, str) or not source_url.startswith(("http://", "https://")):
         raise Refused("active GLM profile has no valid adapter source URL")
@@ -3858,13 +3893,12 @@ def _repair_orchestrator() -> str:
     if was_running and inflight and int(inflight.group(1)) > 0:
         raise Refused("orchestrator repair requires zero active rollout requests")
 
-    kind = profile["kind"]
     checks = _fan(
         inference_hosts,
         lambda host: _ssh(
             host,
             _orchestrator_resume_safety_script(
-                _inference_config(host, kind)["ports"],
+                _inference_config(host)["ports"],
             ),
             timeout=120,
         ),
@@ -3921,15 +3955,10 @@ def _repair_engine(host: str) -> str:
     if host not in inference_hosts:
         raise Refused(f"{host} is not an engine host. Use one of {inference_hosts}.")
     run = current_run()
-    profile = _profile_for_run(run)
-    muse_engine = profile["kind"] == "muse"
-    engine_container = muse_inference_container if muse_engine else glm_inference_container
-    engine_model = muse_model if muse_engine else glm_model
-    start_script = (
-        f"{runtime_root}/h200/start_muse_inference.sh"
-        if muse_engine
-        else f"{runtime_root}/h200/start_inference.sh"
-    )
+    _profile_for_run(run)
+    engine_container = glm_inference_container
+    engine_model = glm_model
+    start_script = f"{runtime_root}/h200/start_inference.sh"
     startup_grace = 600
     print(
         f"{host}: removing and restarting {engine_container}. The model load needs 5 to 10 minutes."
@@ -3950,31 +3979,14 @@ def _repair_engine(host: str) -> str:
     )
     if rc:
         raise RuntimeError(f"inference restart failed on {host}: {out.strip()}")
-    if muse_engine:
-        settings = _inference_config(host, "muse")
-        watchdogs = []
-        for replica, port in enumerate(settings["ports"]):
-            watchdogs.append(
-                f"nohup setsid env STARTUP_GRACE={startup_grace} MODEL={engine_model} "
-                f"MUSE_GPU_COUNT={settings['gpu_count']} "
-                f"MUSE_TP_SIZE={settings['tensor_parallel_size']} "
-                f"PORT={port} MUSE_REPLICA_INDEX={replica} START={start_script} "
-                f"ENGINE_CONTAINER={engine_container}-{replica} "
-                f"bash {runtime_root}/h200/engine_watchdog.sh "
-                f">> /root/engine_watchdog-{replica}.log 2>&1 </dev/null &"
-            )
-        watchdog_code, watchdog_output = _ssh(
-            host, " ".join(watchdogs) + " disown"
-        )
-    else:
-        watchdog_code, watchdog_output = _ssh(
-            host,
-            f"nohup setsid env STARTUP_GRACE={startup_grace} MODEL={engine_model} "
-            f"ENGINE_HOST={shlex.quote(host)} "
-            f"START={start_script} ENGINE_CONTAINER={engine_container} "
-            f"bash {runtime_root}/h200/engine_watchdog.sh "
-            ">> /root/engine_watchdog.log 2>&1 </dev/null & disown",
-        )
+    watchdog_code, watchdog_output = _ssh(
+        host,
+        f"nohup setsid env STARTUP_GRACE={startup_grace} MODEL={engine_model} "
+        f"ENGINE_HOST={shlex.quote(host)} "
+        f"START={start_script} ENGINE_CONTAINER={engine_container} "
+        f"bash {runtime_root}/h200/engine_watchdog.sh "
+        ">> /root/engine_watchdog.log 2>&1 </dev/null & disown",
+    )
     if watchdog_code:
         raise RuntimeError(
             f"watchdog restart failed on {host}: {watchdog_output.strip()}"
@@ -4046,7 +4058,7 @@ def _engine_watchdog_repair_script(watchdog_script: str, specs: list[dict]) -> s
         lines.append("      return 0")
         lines.append("    fi")
         lines.append(
-            "    if ! printf '%s\\n' \"$environment\" | grep -Eq '^(PORT|MODEL|START|ENGINE_CONTAINER|MUSE_|WATCHDOG_IDENTITY)'; then return 0; fi"
+            "    if ! printf '%s\\n' \"$environment\" | grep -Eq '^(PORT|MODEL|START|ENGINE_CONTAINER|WATCHDOG_IDENTITY)'; then return 0; fi"
         )
         lines.append("  fi")
     lines.extend(
@@ -4084,7 +4096,7 @@ def _engine_watchdog_repair_script(watchdog_script: str, specs: list[dict]) -> s
                 f"      (watchdog_matches \"$pid\" || watchdog_legacy_matches \"$pid\") || {{ echo {shlex.quote(f'watchdog settings mismatch for port {spec["environment"]["PORT"]}')} >&2; exit 74; }}",
                 "      candidates+=(\"$pid\")",
                 "    elif ! tr '\\0' '\\n' <\"/proc/$pid/environ\" 2>/dev/null | grep -Eq '^PORT='; then",
-                f"      if tr '\\0' '\\n' <\"/proc/$pid/environ\" 2>/dev/null | grep -Eq '^(PORT|MODEL|START|ENGINE_CONTAINER|MUSE_|WATCHDOG_IDENTITY)'; then echo {shlex.quote(f'watchdog settings mismatch for port {spec["environment"]["PORT"]}')} >&2; exit 74; fi",
+                f"      if tr '\\0' '\\n' <\"/proc/$pid/environ\" 2>/dev/null | grep -Eq '^(PORT|MODEL|START|ENGINE_CONTAINER|WATCHDOG_IDENTITY)'; then echo {shlex.quote(f'watchdog settings mismatch for port {spec["environment"]["PORT"]}')} >&2; exit 74; fi",
                 "    fi",
                 "  fi",
                 "done",
@@ -4122,47 +4134,32 @@ def _repair_engine_watchdog(host: str) -> str:
     if host not in inference_hosts:
         raise Refused(f"{host} is not an engine host. Use one of {inference_hosts}.")
     run = current_run()
-    profile = _profile_for_run(run)
-    kind = profile["kind"]
-    settings = _inference_config(host, kind)
+    _profile_for_run(run)
+    settings = _inference_config(host)
     configured_ports = settings.get("ports")
     if not isinstance(configured_ports, list) or not configured_ports:
         raise Refused(f"inference ports for {host} are missing")
     if not all(isinstance(port, int) and 1 <= port <= 65535 for port in configured_ports):
         raise Refused(f"inference ports for {host} are invalid")
-    muse_engine = kind == "muse"
-    model = muse_model if muse_engine else glm_model
-    container = muse_inference_container if muse_engine else glm_inference_container
-    start_script = (
-        f"{runtime_root}/h200/start_muse_inference.sh"
-        if muse_engine
-        else f"{runtime_root}/h200/start_inference.sh"
-    )
+    model = glm_model
+    container = glm_inference_container
+    start_script = f"{runtime_root}/h200/start_inference.sh"
     startup_grace = 600
     specs = []
     for replica, port in enumerate(configured_ports):
-        watchdog_container = f"{container}-{replica}" if muse_engine else container
         environment = {
             "ENGINE_HOST": host,
             "STARTUP_GRACE": str(startup_grace),
             "MODEL": model,
             "START": start_script,
-            "ENGINE_CONTAINER": watchdog_container,
+            "ENGINE_CONTAINER": container,
             "PORT": str(port),
             "WATCHDOG_IDENTITY": f"engine-watchdog:{host}:{run}:{port}",
         }
-        if muse_engine:
-            environment.update(
-                {
-                    "MUSE_GPU_COUNT": str(settings["gpu_count"]),
-                    "MUSE_TP_SIZE": str(settings["tensor_parallel_size"]),
-                    "MUSE_REPLICA_INDEX": str(replica),
-                }
-            )
         specs.append(
             {
                 "environment": environment,
-                "log": f"/root/engine_watchdog{f'-{replica}' if muse_engine else ''}.log",
+                "log": "/root/engine_watchdog.log",
             }
         )
     watchdog_path = f"{runtime_root}/h200/engine_watchdog.sh"
@@ -4201,7 +4198,7 @@ def _repair_supervisors(profile: str = "current") -> str:
         else:
             out.append(f"{pat} already runs")
     for h in inference_hosts:
-        muse_engine = _profile(profile)["kind"] == "muse"
+        _profile(profile)
         rc, count_text = _ssh(
             h,
             f"pgrep -f '^bash {runtime_root}/h200/engine_watchdog.sh$' | wc -l",
@@ -4209,11 +4206,7 @@ def _repair_supervisors(profile: str = "current") -> str:
         if rc or not count_text.strip().isdigit():
             raise RuntimeError(f"cannot read watchdog count on {h}: {count_text.strip()}")
         count = int(count_text.strip())
-        if muse_engine:
-            settings = _inference_config(h, "muse")
-            expected = len(settings["ports"])
-        else:
-            expected = 1
+        expected = 1
         if count == expected:
             out.append(f"{expected} engine watchdog(s) already run on {h}")
             continue
@@ -4223,27 +4216,15 @@ def _repair_supervisors(profile: str = "current") -> str:
         )
         if stop_code:
             raise RuntimeError(f"cannot stop watchdogs on {h}: {stop_output.strip()}")
-        if muse_engine:
-            start_script = f"{runtime_root}/h200/start_muse_inference.sh"
-            watchdogs = []
-            for replica, port in enumerate(settings["ports"]):
-                watchdogs.append(
-                    f"nohup setsid env STARTUP_GRACE=600 MODEL={muse_model} "
-                    f"MUSE_GPU_COUNT={settings['gpu_count']} "
-                    f"MUSE_TP_SIZE={settings['tensor_parallel_size']} "
-                    f"PORT={port} MUSE_REPLICA_INDEX={replica} START={start_script} "
-                    f"ENGINE_CONTAINER={muse_inference_container}-{replica} "
-                    f"bash {runtime_root}/h200/engine_watchdog.sh "
-                    f">> /root/engine_watchdog-{replica}.log 2>&1 </dev/null &"
-                )
-            start_code, start_output = _ssh(h, " ".join(watchdogs) + " disown")
-        else:
-            start_code, start_output = _ssh(
-                h,
-                f"nohup setsid env ENGINE_HOST={shlex.quote(h)} "
-                f"bash {runtime_root}/h200/engine_watchdog.sh "
-                ">> /root/engine_watchdog.log 2>&1 </dev/null & disown",
-            )
+        start_code, start_output = _ssh(
+            h,
+            f"nohup setsid env ENGINE_HOST={shlex.quote(h)} "
+            f"MODEL={shlex.quote(glm_model)} "
+            f"START={shlex.quote(f'{runtime_root}/h200/start_inference.sh')} "
+            f"ENGINE_CONTAINER={shlex.quote(glm_inference_container)} "
+            f"bash {runtime_root}/h200/engine_watchdog.sh "
+            ">> /root/engine_watchdog.log 2>&1 </dev/null & disown",
+        )
         if start_code:
             raise RuntimeError(f"cannot start watchdogs on {h}: {start_output.strip()}")
         out.append(f"restarted {expected} engine watchdog(s) on {h}")
@@ -4268,9 +4249,14 @@ def mounted_files() -> list[str]:
         repo_root / ".agents" / "skills" / "training-ops" / "runtime" / "china" / "cluster.sh",
         repo_root / ".agents" / "skills" / "training-ops" / "runtime" / "h200" / "start_orchestrator.sh",
         repo_root / ".agents" / "skills" / "training-ops" / "runtime" / "h200" / "start_inference.sh",
-        repo_root / ".agents" / "skills" / "training-ops" / "runtime" / "h200" / "start_muse_inference.sh",
     )
-    return sorted(set().union(*(_mounts_in(script) for script in scripts)))
+    paths = sorted(set().union(*(_mounts_in(script) for script in scripts)))
+    print("mounted source paths:")
+    if paths:
+        print("\n".join(paths))
+    else:
+        print("none")
+    return paths
 
 
 def _mounted_on(path: str, host: str) -> bool:
@@ -4278,7 +4264,6 @@ def _mounted_on(path: str, host: str) -> bool:
         scripts = (
             repo_root / ".agents" / "skills" / "training-ops" / "runtime" / "h200" / "start_orchestrator.sh",
             repo_root / ".agents" / "skills" / "training-ops" / "runtime" / "h200" / "start_inference.sh",
-            repo_root / ".agents" / "skills" / "training-ops" / "runtime" / "h200" / "start_muse_inference.sh",
         )
     else:
         scripts = (repo_root / ".agents" / "skills" / "training-ops" / "runtime" / "china" / "cluster.sh",)
@@ -5192,10 +5177,7 @@ def start(
     selected = _profile(profile)
     if "orchestrator" not in selected:
         raise Refused(f"profile {profile!r} is trainer-only; use qualify()")
-    muse_run = selected["kind"] == "muse"
     if resume_adapter is not None:
-        if not muse_run:
-            raise Refused("adapter-only resume is supported only for Muse runs")
         if not resume_adapter.startswith(f"{run_root}/"):
             raise Refused(f"resume adapter must be below {run_root}")
         if resume_step is None or resume_step < 0:
@@ -5235,85 +5217,75 @@ def start(
         f"adapter_container_name={shlex.quote(adapter_container)}"
     )
     predictive_adapter_env = ""
-    if not muse_run:
-        try:
-            with open(edge_config, "rb") as stream:
-                edge_settings = tomllib.load(stream)
-        except (OSError, tomllib.TOMLDecodeError) as error:
-            raise Refused(f"cannot read GLM orchestrator config {edge_config}: {error}") from error
-        broadcast_settings = edge_settings.get("weight_broadcast")
-        source_url = (
-            broadcast_settings.get("source_url")
-            if isinstance(broadcast_settings, dict)
-            else None
-        )
-        if not isinstance(source_url, str) or not source_url.startswith(("http://", "https://")):
-            raise Refused("GLM orchestrator config has no adapter source URL")
-        if edge_settings.get("output_dir") != service_run_dir:
-            raise Refused("GLM orchestrator output directory does not match the active run")
-        parsed_source_url = urlsplit(source_url.rstrip("/"))
-        if (
-            parsed_source_url.hostname not in {"127.0.0.1", "localhost"}
-            or parsed_source_url.username
-            or parsed_source_url.password
-            or parsed_source_url.query
-            or parsed_source_url.fragment
-            or parsed_source_url.path.rstrip("/") != f"/{run}"
-        ):
-            raise Refused("GLM adapter source URL does not match the active run")
-        broadcast_path = (
-            PurePosixPath(service_run_dir) / "broadcasts"
-        ).relative_to(PurePosixPath(run_root)).as_posix()
-        if broadcast_path != f"{run}/run_{run}/broadcasts":
-            raise Refused("GLM adapter broadcast path does not match the active run")
-        predictive_adapter_env = (
-            " ADAPTER_PREDICTIVE_UPGRADE=1"
-            f" ADAPTER_PREDICTIVE_RUN={shlex.quote(run)}"
-            f" ADAPTER_PREDICTIVE_BROADCAST_PATH={shlex.quote(broadcast_path)}"
-            f" ADAPTER_PREDICTIVE_SOURCE_URL={shlex.quote(source_url.rstrip('/'))}"
-        )
-    if muse_run:
-        env = (
-            f"{runtime_env} trainer_nodes='{trainer_nodes}' RUN={run} RUN_NAME={name} "
-            f"TRAINER_CONFIG={trainer_config} PRIME_EP_PROFILE=0 PRIME_EP_AC_CACHE=0 "
-            "PRIME_INT4_COMBINE_ROUNDS=1 PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD=0 "
-            "TRANSFORMERS_OVERRIDE_DIR=/data/muse-glimmer/transformers "
-            "MUSE_PYTHON_OVERRIDE_DIR=/data/muse-glimmer/python-overrides"
-        )
-        if resume_adapter is not None:
-            missing = [
+    try:
+        with open(edge_config, "rb") as stream:
+            edge_settings = tomllib.load(stream)
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise Refused(f"cannot read GLM orchestrator config {edge_config}: {error}") from error
+    broadcast_settings = edge_settings.get("weight_broadcast")
+    source_url = (
+        broadcast_settings.get("source_url")
+        if isinstance(broadcast_settings, dict)
+        else None
+    )
+    if not isinstance(source_url, str) or not source_url.startswith(("http://", "https://")):
+        raise Refused("GLM orchestrator config has no adapter source URL")
+    if edge_settings.get("output_dir") != service_run_dir:
+        raise Refused("GLM orchestrator output directory does not match the active run")
+    parsed_source_url = urlsplit(source_url.rstrip("/"))
+    if (
+        parsed_source_url.hostname not in {"127.0.0.1", "localhost"}
+        or parsed_source_url.username
+        or parsed_source_url.password
+        or parsed_source_url.query
+        or parsed_source_url.fragment
+        or parsed_source_url.path.rstrip("/") != f"/{run}"
+    ):
+        raise Refused("GLM adapter source URL does not match the active run")
+    broadcast_path = (
+        PurePosixPath(service_run_dir) / "broadcasts"
+    ).relative_to(PurePosixPath(run_root)).as_posix()
+    if broadcast_path != f"{run}/run_{run}/broadcasts":
+        raise Refused("GLM adapter broadcast path does not match the active run")
+    predictive_adapter_env = (
+        " ADAPTER_PREDICTIVE_UPGRADE=1"
+        f" ADAPTER_PREDICTIVE_RUN={shlex.quote(run)}"
+        f" ADAPTER_PREDICTIVE_BROADCAST_PATH={shlex.quote(broadcast_path)}"
+        f" ADAPTER_PREDICTIVE_SOURCE_URL={shlex.quote(source_url.rstrip('/'))}"
+    )
+    env = (
+        f"{runtime_env} trainer_nodes='{trainer_nodes}' RUN={run} RUN_NAME={name} "
+        f"TRAINER_CONFIG={trainer_config} PRIME_EP_PROFILE=0 PRIME_EP_AC_CACHE=0 "
+        "PRIME_INT4_COMBINE_ROUNDS=8 PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD=1"
+    )
+    if resume_adapter is not None:
+        missing = [
+            host
+            for host, (rc, _out) in _fan(
+                nodes, lambda host: _ssh(host, f"test -f {shlex.quote(resume_adapter)}")
+            ).items()
+            if rc
+        ]
+        if missing:
+            print(f"copying the resume adapter to {len(missing)} trainer nodes")
+            _copy_resume_adapter(resume_adapter, nodes)
+            still_missing = [
                 host
                 for host, (rc, _out) in _fan(
-                    nodes, lambda host: _ssh(host, f"test -f {shlex.quote(resume_adapter)}")
+                    nodes,
+                    lambda host: _ssh(
+                        host, f"test -f {shlex.quote(resume_adapter)}"
+                    ),
                 ).items()
                 if rc
             ]
-            if missing:
-                print(f"copying the resume adapter to {len(missing)} trainer nodes")
-                _copy_resume_adapter(resume_adapter, nodes)
-                still_missing = [
-                    host
-                    for host, (rc, _out) in _fan(
-                        nodes,
-                        lambda host: _ssh(
-                            host, f"test -f {shlex.quote(resume_adapter)}"
-                        ),
-                    ).items()
-                    if rc
-                ]
-                if still_missing:
-                    raise RuntimeError(
-                        f"resume adapter copy is incomplete on {still_missing}"
-                    )
-            env += (
-                f" PRIME_RL_RESUME_ADAPTER={shlex.quote(resume_adapter)}"
-                f" PRIME_RL_RESUME_ADAPTER_STEP={resume_step}"
-            )
-    else:
-        env = (
-            f"{runtime_env} trainer_nodes='{trainer_nodes}' RUN={run} RUN_NAME={name} "
-            f"TRAINER_CONFIG={trainer_config} PRIME_EP_PROFILE=0 PRIME_EP_AC_CACHE=0 "
-            "PRIME_INT4_COMBINE_ROUNDS=8 PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD=1"
+            if still_missing:
+                raise RuntimeError(
+                    f"resume adapter copy is incomplete on {still_missing}"
+                )
+        env += (
+            f" PRIME_RL_RESUME_ADAPTER={shlex.quote(resume_adapter)}"
+            f" PRIME_RL_RESUME_ADAPTER_STEP={resume_step}"
         )
 
     def launch_trainer():
@@ -5475,8 +5447,6 @@ def qualify(
         raise Refused(
             f"{relative_config} has no [data.fake]; use start() for an RL run"
         )
-    muse = selected["kind"] == "muse"
-
     rc, out = _ssh(
         orchestrator_host,
         f"sudo docker ps --filter name=^{orchestrator_container}$ --format '{{{{.Names}}}}'",
@@ -5523,11 +5493,6 @@ def qualify(
         "PRIME_EP_PROFILE=0 PRIME_EP_AC_CACHE=0 PRIME_INT4_COMBINE_ROUNDS=1 "
         "PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD=0"
     )
-    if muse:
-        env += (
-            " TRANSFORMERS_OVERRIDE_DIR=/data/muse-glimmer/transformers"
-            " MUSE_PYTHON_OVERRIDE_DIR=/data/muse-glimmer/python-overrides"
-        )
     for key, value in launch_env.items():
         env += f" {key}={shlex.quote(value)}"
 

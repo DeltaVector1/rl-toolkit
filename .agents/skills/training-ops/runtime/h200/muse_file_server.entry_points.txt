@@ -1,3 +1,0 @@
-[vllm.endpoint_plugins]
-muse_file_server = muse_file_endpoint:make_plugin
-

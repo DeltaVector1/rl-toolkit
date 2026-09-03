@@ -461,7 +461,7 @@ class AdapterUpdateTest(unittest.TestCase):
         self.assertIn("RUN=glm-1", resume_script)
         self.assertIn("RUN_NAME=run_glm-1", resume_script)
         self.assertIn(
-            "ORCH_CONFIG=/data/glm52-rl/deployment/configs/paused/glm52/orchestrator.toml",
+            "ORCH_CONFIG=/data/glm52-rl/deployment/configs/current/orchestrator.toml",
             resume_script,
         )
         self.assertIn("TRAINER_CT=glm52-decensor-trainer", resume_script)
@@ -607,8 +607,6 @@ class AdapterUpdateTest(unittest.TestCase):
         self.assertTrue(any("glm52-decensor-h200" in call for call in calls))
         self.assertTrue(any("start_inference.sh" in call for call in calls))
         self.assertTrue(any("ENGINE_CONTAINER=glm52-decensor-h200" in call for call in calls))
-        self.assertFalse(any("muse-glimmer-h200" in call for call in calls))
-        self.assertFalse(any("start_muse_inference.sh" in call for call in calls))
 
     def test_healthy_engines_are_reloaded_to_import_receiver_changes(self):
         before = training_ops.Status(

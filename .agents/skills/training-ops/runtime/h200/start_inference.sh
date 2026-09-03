@@ -51,7 +51,6 @@ docker rm -f glm52-decensor-h200 glm52-decensor-h200-0 glm52-decensor-h200-1 >/d
 docker update --restart=no glm52-decensor-trainer >/dev/null 2>&1 || true
 docker rm -f glm52-decensor-trainer >/dev/null 2>&1 || true
 
-# Use FlashMLA's separate prefill and decode path before MTP starts.
 docker run -d --name glm52-decensor-h200 --restart unless-stopped \
   --user root \
   --log-opt max-size=512m --log-opt max-file=3 \
@@ -83,4 +82,4 @@ docker run -d --name glm52-decensor-h200 --restart unless-stopped \
   prime-rl:glm52-v080-glm52-h200-router \
   -lc 'set -e; patch --batch --forward -p1 -d /app/.venv/lib/python3.12/site-packages < /tmp/flashmla_sparse_mtp.patch || grep -q "MIN_HEADS_FOR_BF16_PREFILL = 0" /app/.venv/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/flashmla_sparse.py; exec /app/.venv/bin/inference "$@"' bash \
   @ "$deployment/configs/runtime/glm52-inference.toml" \
-  --vllm-extra "{\"tensor_parallel_size\":$tensor_parallel_size,\"data_parallel_size\":$data_parallel_size,\"gpu_memory_utilization\":0.920,\"kv_cache_dtype\":\"fp8\",\"max_num_seqs\":128,\"max_num_batched_tokens\":65536,\"compilation_config\":{\"max_cudagraph_capture_size\":128},\"speculative_config\":{\"method\":\"mtp\",\"num_speculative_tokens\":1}}"
+  --vllm-extra "{\"tensor_parallel_size\":$tensor_parallel_size,\"data_parallel_size\":$data_parallel_size,\"gpu_memory_utilization\":0.920,\"kv_cache_dtype\":\"fp8\",\"max_num_seqs\":128,\"max_num_batched_tokens\":65536,\"compilation_config\":{\"max_cudagraph_capture_size\":128}}"

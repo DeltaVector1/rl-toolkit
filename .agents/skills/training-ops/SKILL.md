@@ -25,9 +25,8 @@ Read `configs/operations.toml`. It is the only inventory for hosts, ports,
 paths, containers, profiles, trend settings, and performance requirements.
 Do not add a host or replica count to Python code.
 
-`configs/current` contains the active run profile. `configs/paused` contains
-profiles that are not running. Optional trainer-only profiles must be
-registered in `configs/operations.toml`.
+`configs/current` contains the active run profile. Optional trainer-only
+profiles must be registered in `configs/operations.toml`.
 
 Missing configuration is an error. Do not guess a host, run, model, config,
 or metric location.
@@ -61,7 +60,7 @@ process.
 
 ```python
 training_ops.deploy("prime-rl/path.py")
-training_ops.start("muse19", profile="current")
+training_ops.start("glm-1", profile="current")
 training_ops.repair("tunnels")
 training_ops.repair("engine:h200a")
 training_ops.repair("supervisors")

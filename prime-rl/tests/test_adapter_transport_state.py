@@ -734,21 +734,15 @@ class AdapterTransportStateTest(unittest.TestCase):
             if name not in {"lora_source_first", "lora_source_last"}
         ]
         self.assertEqual(len(reserved_ports), len(set(reserved_ports)))
-        for config_path in (
-            REPOSITORY / "configs/current/orchestrator.toml",
-            REPOSITORY / "configs/paused/glm52/orchestrator.toml",
-        ):
-            with config_path.open("rb") as stream:
-                edge_config = tomllib.load(stream)
-            source_url = edge_config["weight_broadcast"]["source_url"]
-            self.assertEqual(urlsplit(source_url).port, ports["lora_source_first"])
+        config_path = REPOSITORY / "configs/current/orchestrator.toml"
+        with config_path.open("rb") as stream:
+            edge_config = tomllib.load(stream)
+        source_url = edge_config["weight_broadcast"]["source_url"]
+        self.assertEqual(urlsplit(source_url).port, ports["lora_source_first"])
         runtime = REPOSITORY / ".agents/skills/training-ops/runtime/h200"
         glm_source = (runtime / "start_inference.sh").read_text(encoding="utf-8")
-        muse_source = (runtime / "start_muse_inference.sh").read_text(encoding="utf-8")
         self.assertIn("PRIME_LORA_DOWNLOAD_STREAMS=96", glm_source)
-        self.assertIn("PRIME_LORA_DOWNLOAD_STREAMS=32", muse_source)
-        for source in (glm_source, muse_source):
-            self.assertIn('PRIME_LORA_SOURCE_PORTS="$lora_source_port_list"', source)
+        self.assertIn('PRIME_LORA_SOURCE_PORTS="$lora_source_port_list"', glm_source)
         orchestrator_source = (
             REPOSITORY / ".agents/skills/training-ops/runtime/h200/start_orchestrator.sh"
         ).read_text(encoding="utf-8")

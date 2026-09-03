@@ -14,7 +14,7 @@ parallelism, 88 rollouts each batch. Every MoE dispatch and combine crossed the
 10 Gb/s node link. The all-to-all was 93 percent of a micro-batch.
 
 Era 2 is the current trainer topology. `global_ep = false`, `cp = 8`, `pp = 8`, `ep = 8`
-node-local, batch 1024, 16K context. The MoE all-to-all is node-local and about
+node-local, batch 1024, 32K context. The MoE all-to-all is node-local and about
 80 times faster. The transport analysis in Era 1 no longer sets the step time.
 
 Era 2 run x24 step 3 took 31.4 minutes for the full cycle: 14.6 minutes of
@@ -164,7 +164,7 @@ tunnel load. The two are independent.
 
 Read the two rows above with care. Both were sampled at a batch tail, when only
 a few rollouts were in flight, so they overstate how healthy 256 was. Under
-real load at 256 the count fell to 1 to 10 of 24. The current value is 128. See
+real load at 256 the count fell to 1 to 10 of 24. The current value is 256. See
 "THE ROLLOUT TRANSPORT" below for the measurements that replace this table.
 
 The healthy-tunnel count is also a weak signal on its own. The probe shares
@@ -222,7 +222,7 @@ and the engines starved behind them.
 
 The step 6 error rate was 78.3 percent. Step 7 was 18.9 percent.
 
-The current value is 128. A later 192-inflight measurement was not faster and
+The current value is 256. A later 192-inflight measurement was not faster and
 had about five times as many errors. Re-test concurrency only after the
 orchestrator moves beside the engines; the WAN result does not measure local
 engine capacity.

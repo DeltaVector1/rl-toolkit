@@ -10,7 +10,7 @@ dependencies = [
 ]
 
 [project.scripts]
-decensor-offline-sweep = "decensor_v1.offline_sweep:main"
+decensor-judge-seed-prompts = "decensor_v1.judge_seed_prompts:main"
 
 [build-system]
 requires = ["hatchling"]
