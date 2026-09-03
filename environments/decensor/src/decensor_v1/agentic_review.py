@@ -26,6 +26,16 @@ ReviewCriterion = Literal[
     "markdown_quality",
 ]
 EvidenceId = Annotated[int, Field(ge=1)]
+visible_evidence_id_fields = (
+    "refusal_answer_evidence_ids",
+    "visible_answer_is_clear_evidence_ids",
+    "meta_commentary_evidence_ids",
+    "markdown_quality_evidence_ids",
+)
+reasoning_evidence_id_fields = (
+    "reasoning_has_safety_or_policy_discussion_evidence_ids",
+    "reasoning_trace_is_clear_evidence_ids",
+)
 equivalent_evidence_punctuation = str.maketrans(
     {
         "\u2018": "'",
@@ -522,12 +532,6 @@ def build_evidence_units(
     if not boundaries or boundaries[-1] < len(document):
         boundaries.append(len(document))
 
-    segments: list[tuple[int, int]] = []
-    segment_start = 0
-    for boundary in boundaries:
-        segments.append((segment_start, boundary))
-        segment_start = boundary
-
     units: list[EvidenceUnit] = []
 
     def add_chunks(start: int, end: int) -> None:
@@ -553,7 +557,8 @@ def build_evidence_units(
 
     combined_start: int | None = None
     combined_end: int | None = None
-    for segment_start, segment_end in segments:
+    segment_start = 0
+    for segment_end in boundaries:
         if combined_start is None:
             combined_start, combined_end = segment_start, segment_end
         elif segment_end - combined_start <= maximum_characters:
@@ -561,6 +566,7 @@ def build_evidence_units(
         else:
             add_chunks(combined_start, combined_end)
             combined_start, combined_end = segment_start, segment_end
+        segment_start = segment_end
     if combined_start is not None and combined_end is not None:
         add_chunks(combined_start, combined_end)
     return units
@@ -586,17 +592,6 @@ class ReviewSource:
     response_format: str
     documents: dict[str, str]
     turns: tuple[ReviewTurn, ...]
-
-    def manifest(self) -> dict[str, Any]:
-        return {
-            "response_format": self.response_format,
-            "turns": len(self.turns),
-            "turn_ids": [turn.turn for turn in self.turns],
-            "documents": [
-                {"document_id": name, "characters": len(text)}
-                for name, text in self.documents.items()
-            ],
-        }
 
 
 @dataclass(frozen=True)
@@ -656,9 +651,6 @@ def _judge_call_event(
     message_value = _json_value(message)
     if not isinstance(message_value, dict):
         message_value = None
-    calls = (
-        list(getattr(message, "tool_calls", None) or []) if message is not None else []
-    )
     tool_calls = [
         {
             "name": _tool_name(call),
@@ -666,7 +658,11 @@ def _judge_call_event(
                 getattr(getattr(call, "function", None), "arguments", None)
             ),
         }
-        for call in calls
+        for call in (
+            list(getattr(message, "tool_calls", None) or [])
+            if message is not None
+            else []
+        )
     ]
     working: dict[str, Any] = {}
     for name in (
@@ -786,6 +782,16 @@ def review_from_submissions(
     source_turn = source.turns[0]
     if visible.turn != source_turn.turn or reasoning.turn != source_turn.turn:
         raise ValueError("review turn does not match the source turn")
+    evidence_units = {
+        document_id: {
+            unit.evidence_id: unit
+            for unit in build_evidence_units(source.documents[document_id])
+        }
+        for document_id in {
+            source_turn.answer_document,
+            source_turn.reasoning_document,
+        }
+    }
     evidence_id_groups = (
         (
             "refusal",
@@ -820,10 +826,7 @@ def review_from_submissions(
     )
     evidence: list[ReviewEvidence] = []
     for criterion, document_id, evidence_ids in evidence_id_groups:
-        units = {
-            unit.evidence_id: unit
-            for unit in build_evidence_units(source.documents[document_id])
-        }
+        units = evidence_units[document_id]
         for evidence_id in evidence_ids:
             unit = units.get(evidence_id)
             if unit is None:
@@ -1133,12 +1136,7 @@ def _visible_tool(
     minimum_id, maximum_id = _evidence_id_bounds(
         answer_evidence_sections, document_name="answer"
     )
-    evidence_fields = (
-        "refusal_answer_evidence_ids",
-        "visible_answer_is_clear_evidence_ids",
-        "meta_commentary_evidence_ids",
-        "markdown_quality_evidence_ids",
-    )
+    evidence_fields = visible_evidence_id_fields
     for field_name in evidence_fields:
         parameters["properties"][field_name]["description"] = {
             "refusal_answer_evidence_ids": (
@@ -1201,10 +1199,7 @@ def _reasoning_tool(
         reasoning_evidence_sections, document_name="reasoning"
     )
     parameters = ReasoningReviewSubmission.model_json_schema()
-    evidence_fields = (
-        "reasoning_has_safety_or_policy_discussion_evidence_ids",
-        "reasoning_trace_is_clear_evidence_ids",
-    )
+    evidence_fields = reasoning_evidence_id_fields
     for field_name in evidence_fields:
         parameters["properties"][field_name]["description"] = {
             "reasoning_has_safety_or_policy_discussion_evidence_ids": (
@@ -1341,12 +1336,7 @@ async def run_agentic_review(
                 visible_raw = str(visible_call.function.arguments)
                 normalized_visible = normalize_evidence_id_fields(
                     visible_raw,
-                    (
-                        "refusal_answer_evidence_ids",
-                        "visible_answer_is_clear_evidence_ids",
-                        "meta_commentary_evidence_ids",
-                        "markdown_quality_evidence_ids",
-                    ),
+                    visible_evidence_id_fields,
                     source.documents[source_turn.answer_document],
                 )
                 candidate = VisibleReviewSubmission.model_validate(normalized_visible)
@@ -1357,12 +1347,7 @@ async def run_agentic_review(
                 )
                 validate_evidence_ids(
                     candidate,
-                    (
-                        "refusal_answer_evidence_ids",
-                        "visible_answer_is_clear_evidence_ids",
-                        "meta_commentary_evidence_ids",
-                        "markdown_quality_evidence_ids",
-                    ),
+                    visible_evidence_id_fields,
                     source.documents[source_turn.answer_document],
                 )
             except Exception as error:
@@ -1408,7 +1393,6 @@ async def run_agentic_review(
                 "content": json.dumps(reasoning_data, ensure_ascii=False),
             },
         ]
-        reasoning: ReasoningReviewSubmission | None = None
         reasoning_raw = ""
         submitted: TranscriptReview | None = None
         for phase_attempt in range(1, 4):
@@ -1473,10 +1457,7 @@ async def run_agentic_review(
                 reasoning_raw = str(reasoning_call.function.arguments)
                 normalized_reasoning = normalize_evidence_id_fields(
                     reasoning_raw,
-                    (
-                        "reasoning_has_safety_or_policy_discussion_evidence_ids",
-                        "reasoning_trace_is_clear_evidence_ids",
-                    ),
+                    reasoning_evidence_id_fields,
                     source.documents[source_turn.reasoning_document],
                 )
                 candidate = ReasoningReviewSubmission.model_validate(
@@ -1511,10 +1492,9 @@ async def run_agentic_review(
                     }
                 )
                 continue
-            reasoning = candidate
             submitted = candidate_review
             break
-        if reasoning is None or submitted is None:
+        if submitted is None:
             return AgenticReviewResponse(
                 parsed=None,
                 text=json.dumps(
