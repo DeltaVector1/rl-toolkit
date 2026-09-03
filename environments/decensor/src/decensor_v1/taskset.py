@@ -126,22 +126,20 @@ class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         branches = trace.branches
         messages = branches[-1].messages if branches else []
-        conversation = [
-            self._message_dict(message)
-            for message in messages
-            if message.role != "system"
-        ]
         prompt: list[dict[str, Any]] = [
             {"role": "system", "content": self.data.system_prompt or ""}
         ]
         completion: list[dict[str, Any]] = []
         seen_first_user = False
-        for message in conversation:
-            if not seen_first_user and message["role"] == "user":
-                prompt.append(message)
+        for message in messages:
+            if message.role == "system":
+                continue
+            message_dict = self._message_dict(message)
+            if not seen_first_user and message_dict["role"] == "user":
+                prompt.append(message_dict)
                 seen_first_user = True
             else:
-                completion.append(message)
+                completion.append(message_dict)
         return prompt, completion
 
     @vf.reward(weight=1.0)
