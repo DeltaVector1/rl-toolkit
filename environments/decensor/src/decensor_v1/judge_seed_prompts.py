@@ -691,64 +691,50 @@ def _validate_tool_calls(
             ) from error
         if not isinstance(parsed, dict):
             raise ValueError("judge output tool call arguments must be a JSON object")
-        if check == "visible_review":
-            field_names = visible_evidence_fields
-            model_type = VisibleReviewSubmission
-            try:
-                if document is None:
-                    raise ValueError("visible judge audit needs the answer document")
-                required = set(model_type.model_json_schema().get("required", []))
-                missing = sorted(required - set(parsed))
-                if missing:
-                    raise ValueError(
-                        "visible judge tool arguments omit required fields: "
-                        + ", ".join(missing)
-                    )
-                normalized = normalize_evidence_id_fields(
-                    arguments,
-                    field_names,
-                    document,
-                )
-                candidate = model_type.model_validate(normalized)
-                if candidate.turn != 1:
-                    raise ValueError("saved visible review turn must be 1")
-                if response_format is not None:
-                    _validate_markdown_quality(
-                        candidate.markdown_quality, response_format
-                    )
-                validate_evidence_ids(candidate, field_names, document)
-            except Exception as error:
+        review_spec = {
+            "visible_review": (
+                visible_evidence_fields,
+                VisibleReviewSubmission,
+                "answer",
+                "visible",
+            ),
+            "reasoning_review": (
+                reasoning_evidence_fields,
+                ReasoningReviewSubmission,
+                "reasoning",
+                "reasoning",
+            ),
+        }.get(check)
+        if review_spec is None:
+            continue
+        field_names, model_type, document_name, review_name = review_spec
+        try:
+            if document is None:
                 raise ValueError(
-                    "visible judge tool arguments failed validation"
-                ) from error
-        elif check == "reasoning_review":
-            field_names = reasoning_evidence_fields
-            model_type = ReasoningReviewSubmission
-            try:
-                if document is None:
-                    raise ValueError(
-                        "reasoning judge audit needs the reasoning document"
-                    )
-                required = set(model_type.model_json_schema().get("required", []))
-                missing = sorted(required - set(parsed))
-                if missing:
-                    raise ValueError(
-                        "reasoning judge tool arguments omit required fields: "
-                        + ", ".join(missing)
-                    )
-                normalized = normalize_evidence_id_fields(
-                    arguments,
-                    field_names,
-                    document,
+                    f"{review_name} judge audit needs the {document_name} document"
                 )
-                candidate = model_type.model_validate(normalized)
-                if candidate.turn != 1:
-                    raise ValueError("saved reasoning review turn must be 1")
-                validate_evidence_ids(candidate, field_names, document)
-            except Exception as error:
+            required = set(model_type.model_json_schema().get("required", []))
+            missing = sorted(required - set(parsed))
+            if missing:
                 raise ValueError(
-                    "reasoning judge tool arguments failed validation"
-                ) from error
+                    f"{review_name} judge tool arguments omit required fields: "
+                    + ", ".join(missing)
+                )
+            normalized = normalize_evidence_id_fields(
+                arguments,
+                field_names,
+                document,
+            )
+            candidate = model_type.model_validate(normalized)
+            if candidate.turn != 1:
+                raise ValueError(f"saved {review_name} review turn must be 1")
+            if check == "visible_review" and response_format is not None:
+                _validate_markdown_quality(candidate.markdown_quality, response_format)
+            validate_evidence_ids(candidate, field_names, document)
+        except Exception as error:
+            raise ValueError(
+                f"{review_name} judge tool arguments failed validation"
+            ) from error
 
 
 def _has_successful_judge_audit(
