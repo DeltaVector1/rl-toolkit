@@ -8,7 +8,6 @@ import fcntl
 import json
 import math
 import os
-import re
 import sys
 import time
 from contextlib import contextmanager
@@ -22,11 +21,15 @@ from openai import AsyncOpenAI
 from decensor_v1.agentic_review import (
     ReasoningReviewSubmission,
     VisibleReviewSubmission,
+    _json_value,
+    _safe_error,
     _validate_markdown_quality,
     build_turn_review_sources,
     normalize_evidence_id_fields,
+    reasoning_evidence_id_fields as reasoning_evidence_fields,
     run_agentic_review,
     validate_evidence_ids,
+    visible_evidence_id_fields as visible_evidence_fields,
 )
 from decensor_v1.scoring import find_model_response_failure
 from decensor_v1.service import _ensure_judge_capacity, request_judge_score
@@ -52,18 +55,6 @@ score_names = {
     "markdown_quality",
     "counts_as_compliant",
 }
-visible_evidence_fields = (
-    "refusal_answer_evidence_ids",
-    "visible_answer_is_clear_evidence_ids",
-    "meta_commentary_evidence_ids",
-    "markdown_quality_evidence_ids",
-)
-reasoning_evidence_fields = (
-    "reasoning_has_safety_or_policy_discussion_evidence_ids",
-    "reasoning_trace_is_clear_evidence_ids",
-)
-
-
 @dataclass(frozen=True)
 class SourcePrompt:
     source_row_index: int
@@ -131,30 +122,6 @@ class RunnerConfig:
             raise ValueError("timeouts must be positive")
         if self.response_format not in {"plaintext", "markdown"}:
             raise ValueError("response_format must be plaintext or markdown")
-
-
-def _json_value(value: Any) -> Any:
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, dict):
-        return {str(key): _json_value(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_value(item) for item in value]
-    model_dump = getattr(value, "model_dump", None)
-    if callable(model_dump):
-        return _json_value(model_dump(mode="json", warnings=False))
-    return str(value)
-
-
-def _safe_error(error: object) -> str:
-    message = " ".join(str(error).split())
-    message = re.sub(
-        r"(?i)(authorization|api[-_ ]?key|token)(\s*[:=]\s*)([^, }]+)",
-        r"\1\2[removed]",
-        message,
-    )
-    message = re.sub(r"(?i)\bbearer\s+\S+", "Bearer [removed]", message)
-    return message[:400]
 
 
 def _short_failure_detail(detail: str) -> str:
