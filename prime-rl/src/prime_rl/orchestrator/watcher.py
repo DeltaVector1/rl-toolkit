@@ -8,9 +8,9 @@ import asyncio
 import json
 import time
 from collections.abc import Awaitable, Callable
+from typing import Any
 from urllib.parse import quote
 from urllib.request import urlopen
-from typing import TypeVar
 
 from modelexpress import p2p_pb2
 
@@ -34,24 +34,21 @@ from prime_rl.utils.checkpoint_delta import build_xor_delta_checkpoint
 
 v1_adapter_transport = "chunked-shuffled-xor-zstd"
 v2_adapter_transport = "chunked-bf16-linear-zigzag-sparse-zstd"
-_RETRY_ATTEMPTS = 3
-_RETRY_BACKOFF_SECONDS = (0.5, 1.0)
-_Result = TypeVar("_Result")
 
 
-async def _run_with_retries(name: str, operation: Callable[[], Awaitable[_Result]]) -> _Result:
-    for attempt in range(1, _RETRY_ATTEMPTS + 1):
+async def _run_with_retries(name: str, operation: Callable[[], Awaitable[Any]]) -> Any:
+    for attempt in range(1, 4):
         try:
             return await operation()
         except asyncio.CancelledError:
             raise
         except Exception:
-            if attempt == _RETRY_ATTEMPTS:
-                get_logger().exception(f"{name} failed on attempt {attempt}/{_RETRY_ATTEMPTS}; stopping")
+            if attempt == 3:
+                get_logger().exception(f"{name} failed on attempt {attempt}/3; stopping")
                 raise
-            delay = _RETRY_BACKOFF_SECONDS[attempt - 1]
+            delay = 0.5 * 2 ** (attempt - 1)
             get_logger().exception(
-                f"{name} failed on attempt {attempt}/{_RETRY_ATTEMPTS}; retrying in {delay:.1f}s"
+                f"{name} failed on attempt {attempt}/3; retrying in {delay:.1f}s"
             )
             await asyncio.sleep(delay)
     raise RuntimeError(f"{name} retry loop ended unexpectedly")
