@@ -740,8 +740,8 @@ class RolloutDispatcher:
 
         for r in rollouts:
             # A wall-clock harness timeout is a terminal rollout result. Do not
-            # reschedule it: muse12 retried one zero-turn timeout indefinitely
-            # and held a 1008/1024 batch for more than 90 minutes. The empty
+            # reschedule it: an earlier run retried one zero-turn timeout
+            # indefinitely and held a batch open for more than 90 minutes. The empty
             # trajectory guard below turns it into an explicit failed member;
             # TrainSink then rejects the complete GRPO group and replenishes it.
             if not r.has_error and r.num_turns == 0:

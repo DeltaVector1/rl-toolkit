@@ -25,22 +25,6 @@ from prime_rl.utils.checkpoint_delta import (
     apply_xor_delta_file,
 )
 
-try:
-    from prime_rl.inference.vllm.worker.weight_transfer import load_weights_checkpoint_layerwise
-except ImportError:
-    # The official Muse vLLM image contains the upstream layerwise reload
-    # lifecycle but not Prime-RL's small compatibility wrapper.
-    def load_weights_checkpoint_layerwise(model, weights_iterator, model_config, vllm_config) -> None:
-        from vllm.model_executor.model_loader.reload import (
-            finalize_layerwise_reload,
-            initialize_layerwise_reload,
-        )
-
-        initialize_layerwise_reload(model)
-        model.load_weights(weights_iterator)
-        finalize_layerwise_reload(model, model_config)
-
-
 def adapter_cache_path(source_url: str) -> Path:
     return Path(os.environ.get("PRIME_LORA_CACHE_DIR", "/tmp/prime-rl-lora")) / hashlib.sha256(
         source_url.encode()
@@ -4292,6 +4276,8 @@ class FileSystemWeightUpdateWorker(Worker):
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
         )
         weights_iterator = model_loader._get_weights_iterator(local_source)
+        from prime_rl.inference.vllm.worker.weight_transfer import load_weights_checkpoint_layerwise
+
         load_weights_checkpoint_layerwise(
             model,
             weights_iterator,
