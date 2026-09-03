@@ -593,6 +593,17 @@ class ReviewSource:
     documents: dict[str, str]
     turns: tuple[ReviewTurn, ...]
 
+    def manifest(self) -> dict[str, Any]:
+        return {
+            "response_format": self.response_format,
+            "turns": len(self.turns),
+            "turn_ids": [turn.turn for turn in self.turns],
+            "documents": [
+                {"document_id": name, "characters": len(text)}
+                for name, text in self.documents.items()
+            ],
+        }
+
 
 @dataclass(frozen=True)
 class AgenticReviewResponse:
@@ -782,16 +793,6 @@ def review_from_submissions(
     source_turn = source.turns[0]
     if visible.turn != source_turn.turn or reasoning.turn != source_turn.turn:
         raise ValueError("review turn does not match the source turn")
-    evidence_units = {
-        document_id: {
-            unit.evidence_id: unit
-            for unit in build_evidence_units(source.documents[document_id])
-        }
-        for document_id in {
-            source_turn.answer_document,
-            source_turn.reasoning_document,
-        }
-    }
     evidence_id_groups = (
         (
             "refusal",
@@ -825,8 +826,15 @@ def review_from_submissions(
         ),
     )
     evidence: list[ReviewEvidence] = []
+    evidence_units: dict[str, dict[int, EvidenceUnit]] = {}
     for criterion, document_id, evidence_ids in evidence_id_groups:
-        units = evidence_units[document_id]
+        units = evidence_units.get(document_id)
+        if units is None:
+            units = {
+                unit.evidence_id: unit
+                for unit in build_evidence_units(source.documents[document_id])
+            }
+            evidence_units[document_id] = units
         for evidence_id in evidence_ids:
             unit = units.get(evidence_id)
             if unit is None:
