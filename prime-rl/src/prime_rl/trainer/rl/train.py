@@ -27,7 +27,7 @@ from prime_rl.trainer.multi_ckpt import setup_multi_checkpoint_manager
 from prime_rl.trainer.optim import setup_optimizer, setup_multi_optimizer
 from prime_rl.trainer.scheduler import setup_scheduler, setup_multi_scheduler
 from prime_rl.configs.trainer import TrainerConfig
-from prime_rl.trainer.rl.data import DataLoader, FakeDataLoader, RolloutCacheDataLoader
+from prime_rl.trainer.rl.data import DataLoader, FakeDataLoader
 from prime_rl.utils.cp import (
     gather_for_cp,
     gather_for_cp_wo_grad,
@@ -768,7 +768,6 @@ def _write_qualification_result(
             "samples_per_micro_batch": fake.samples_per_micro_batch,
             "group_size": fake.group_size,
             "sequence_length": config.model.seq_len,
-            "rollout_cache": False,
         },
         "lora": {
             "rank": config.model.lora.rank,
@@ -826,7 +825,6 @@ def train(config: TrainerConfig):
         }
         if (
             fake is None
-            or config.data.rollout_cache is not None
             or fake.batch_size != 64
             or fake.samples_per_micro_batch != 32
             or fake.group_size != 16
@@ -904,11 +902,7 @@ def train(config: TrainerConfig):
         torch.device("cuda", world.local_rank),
         config.model.lora,
     )
-    replay_rollouts = (
-        config.data.rollout_cache is not None
-        and config.data.rollout_cache.mode == "replay"
-    )
-    trainer_only = config.data.fake is not None or replay_rollouts
+    trainer_only = config.data.fake is not None
 
     # Resolve ep="auto" to a concrete integer before creating parallel dims
     resolve_ep(config.model)
@@ -1260,29 +1254,16 @@ def train(config: TrainerConfig):
             parallel_dims.get_mesh("dp").get_local_rank(),
         )
     else:
-        real_dataloader = None
-        if not replay_rollouts:
-            real_dataloader = DataLoader(
-                config.output_dir,
-                progress.step,
-                parallel_dims.get_mesh("dp").size(),
-                parallel_dims.get_mesh("dp").get_local_rank(),
-                config.model.seq_len,
-                config.model.cp,
-                bin_cost,
-                config.rollout_transport,
-            )
-        if config.data.rollout_cache is not None:
-            dataloader = RolloutCacheDataLoader(
-                config.data.rollout_cache,
-                real_dataloader,
-                config.model.seq_len,
-                parallel_dims.get_mesh("dp").size(),
-                parallel_dims.get_mesh("dp").get_local_rank(),
-                config.model.cp,
-            )
-        else:
-            dataloader = real_dataloader
+        dataloader = DataLoader(
+            config.output_dir,
+            progress.step,
+            parallel_dims.get_mesh("dp").size(),
+            parallel_dims.get_mesh("dp").get_local_rank(),
+            config.model.seq_len,
+            config.model.cp,
+            bin_cost,
+            config.rollout_transport,
+        )
 
     qualification_input_sha256: dict[int, str] = {}
 

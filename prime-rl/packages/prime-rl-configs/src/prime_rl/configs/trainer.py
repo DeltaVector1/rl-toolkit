@@ -650,38 +650,9 @@ class FakeDataLoaderConfig(BaseConfig):
         return self
 
 
-class RolloutCacheConfig(BaseConfig):
-    mode: Literal["record", "replay"]
-    directory: Path
-    policy_id: str = Field(min_length=1)
-    repeats: int = Field(1, ge=1, le=256)
-    combine_partial_batches: bool = False
-    recorded_cp_size: int | None = Field(None, ge=1)
-
-    @model_validator(mode="after")
-    def repeats_apply_to_replay_only(self):
-        if self.mode == "record" and self.repeats != 1:
-            raise ValueError("rollout cache record mode requires repeats=1")
-        if self.mode == "record" and self.combine_partial_batches:
-            raise ValueError(
-                "rollout cache record mode cannot combine partial batches"
-            )
-        if self.mode == "record" and self.recorded_cp_size is not None:
-            raise ValueError("rollout cache record mode cannot change the recorded topology")
-        return self
-
-
 class DataLoaderConfig(BaseConfig):
     fake: FakeDataLoaderConfig | None = None
     """Use a fake data loader sampling random micro-batches (for debugging)."""
-
-    rollout_cache: RolloutCacheConfig | None = None
-
-    @model_validator(mode="after")
-    def choose_one_debug_source(self):
-        if self.fake is not None and self.rollout_cache is not None:
-            raise ValueError("fake data and rollout cache cannot be enabled together")
-        return self
 
 
 class ParityGuardConfig(BaseConfig):
@@ -823,17 +794,6 @@ class TrainerConfig(BaseConfig):
 
     env_vars: EnvVars = {}
     """Extra environment variables for the trainer process(es). Merged on top of the launcher defaults."""
-
-    @model_validator(mode="after")
-    def validate_rollout_cache(self):
-        cache = self.data.rollout_cache
-        if cache is not None and cache.mode == "record" and self.max_steps != 1:
-            raise ValueError("rollout cache record mode requires max_steps=1")
-        if cache is not None and self.max_concurrent_runs != 1:
-            raise ValueError("rollout cache supports one run only")
-        if cache is not None and self.optim.lr != 0:
-            raise ValueError("rollout cache qualification requires optim.lr=0")
-        return self
 
     @model_validator(mode="after")
     def deepep_disables_grad_clipping(self):
