@@ -179,31 +179,6 @@ def decode_delta_chunk(base: bytes, encoded: bytes, codec: str) -> bytes:
     return _xor(base, decode_adapter_chunk(encoded, codec=codec, max_output_size=len(base)))
 
 
-def _signed_residual(value: int, modulus: int) -> int:
-    value %= modulus
-    midpoint = modulus // 2
-    return value if value < midpoint else value - modulus
-
-
-def _zigzag(value: int) -> int:
-    return value * 2 if value >= 0 else -value * 2 - 1
-
-
-def _unzigzag(value: int) -> int:
-    return (value >> 1) ^ -(value & 1)
-
-
-def _encode_leb128(value: int) -> bytes:
-    if value < 0 or value > 0xFFFF:
-        raise ValueError("predictive residual is outside the uint16 range")
-    output = bytearray()
-    while value >= 0x80:
-        output.append((value & 0x7F) | 0x80)
-        value >>= 7
-    output.append(value)
-    return bytes(output)
-
-
 def _decode_leb128_values(value: bytes, count: int) -> np.ndarray:
     if count < 0:
         raise ValueError("predictive nonzero count cannot be negative")

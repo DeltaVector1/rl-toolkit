@@ -428,18 +428,6 @@ def _remove_opened_directory_entry(
     os.rmdir(name, dir_fd=parent_fd)
 
 
-def _remove_directory(path: Path, label: str) -> None:
-    parent_fd = _open_directory_nofollow(
-        path.parent,
-        create=False,
-        label=f"{label} parent",
-    )
-    try:
-        _remove_directory_entry(parent_fd, path.name, label)
-    finally:
-        os.close(parent_fd)
-
-
 def _replace_paths(source: Path, destination: Path, label: str) -> None:
     source_parent = Path(os.path.abspath(source.parent))
     destination_parent = Path(os.path.abspath(destination.parent))
@@ -2247,13 +2235,6 @@ def _verified_adapter_base(
         os.close(base_fd)
     _check_deadline(deadline, cancel_event)
     return model, config
-
-
-def _read_checksum(path: Path) -> str:
-    value = _read_text_nofollow(path, encoding="ascii").strip()
-    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
-        raise OSError(f"invalid adapter checksum: {path.name}")
-    return value
 
 
 def _preallocate(path: Path, size: int) -> None:

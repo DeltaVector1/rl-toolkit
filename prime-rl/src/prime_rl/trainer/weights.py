@@ -130,10 +130,6 @@ def set_pp_gather_context(
     _IS_STAGE_MASTER = is_stage_master
 
 
-def pp_enabled_for_gather() -> bool:
-    return _PP_GROUP is not None
-
-
 def is_pp_stage_master() -> bool:
     return _IS_STAGE_MASTER
 
