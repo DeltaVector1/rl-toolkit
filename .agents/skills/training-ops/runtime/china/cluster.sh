@@ -156,7 +156,6 @@ PY
       "${transformers_mount[@]}" \
       -e TMPDIR=/scratch-tmp \
       -v "$deployment/prime-rl/src/prime_rl/_compat.py":/app/src/prime_rl/_compat.py:ro \
-      -v "$deployment/prime-rl/src/prime_rl/parity_router_trace.py":/app/src/prime_rl/parity_router_trace.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/fp8_checkpoint.py":/app/src/prime_rl/trainer/fp8_checkpoint.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/model.py":/app/src/prime_rl/trainer/model.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/models/layers/fp8_ada.py":/app/src/prime_rl/trainer/models/layers/fp8_ada.py:ro \
@@ -173,7 +172,6 @@ PY
       -v "$deployment/prime-rl/src/prime_rl/utils/adapter_delta.py":/app/src/prime_rl/utils/adapter_delta.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/rl/train.py":/app/src/prime_rl/trainer/rl/train.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/rl/data.py":/app/src/prime_rl/trainer/rl/data.py:ro \
-      -v "$deployment/prime-rl/src/prime_rl/trainer/rl/token_export.py":/app/src/prime_rl/trainer/rl/token_export.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/runs.py":/app/src/prime_rl/trainer/runs.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/weights.py":/app/src/prime_rl/trainer/weights.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/utils.py":/app/src/prime_rl/trainer/utils.py:ro \

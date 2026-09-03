@@ -45,12 +45,6 @@ from prime_rl.trainer.rl.loss import (
     shift_tensor_left,
     shift_tensor_right,
 )
-from prime_rl.trainer.rl.token_export import setup_token_exporter
-from prime_rl.parity_router_trace import (
-    prepare_trainer_bundle_communication,
-    publish_trainer_bundle,
-    trace_dir_env,
-)
 from prime_rl.trainer.model import (
     DTYPE_MAP,
     forward,
@@ -1290,14 +1284,6 @@ def train(config: TrainerConfig):
         else:
             dataloader = real_dataloader
 
-    token_exporter = setup_token_exporter(config, parallel_dims, world, logger, model)
-    parity_bundle_enabled = trace_dir_env in config.env_vars
-    if parity_bundle_enabled and not parallel_dims.pp_enabled:
-        raise ValueError("trainer parity bundle requires pipeline parallel training")
-    parity_bundle_communication = prepare_trainer_bundle_communication(
-        parity_bundle_enabled, torch.device("cuda", world.local_rank)
-    )
-    parity_bundle_readiness = None
     qualification_input_sha256: dict[int, str] = {}
 
     gc_handler = GarbageCollection(config.gc.interval) if config.gc else None
@@ -1669,7 +1655,6 @@ def train(config: TrainerConfig):
                         rl_weights=rl_weights,
                         ce_weights=ce_weights,
                         ref_kl_weights=ref_kl_weights,
-                        export_micro_batch=micro_batch,
                         micro_step=micro_step,
                     )
                 )
@@ -1804,15 +1789,6 @@ def train(config: TrainerConfig):
                     mismatch_env_to_indices.setdefault(env_name, []).append(idx)
                 for env_name, indices in mismatch_env_to_indices.items():
                     tensors[f"mismatch_kl/{env_name}"].append(mismatch_kl[indices])
-
-            token_exporter.export(
-                progress.step,
-                micro_step,
-                micro_batch,
-                out,
-                sequence_lengths,
-                config.loss,
-            )
 
             if is_tt_moe_model(model):
                 load_balance_stats = get_load_balance_stats(model)
@@ -1957,14 +1933,6 @@ def train(config: TrainerConfig):
                 )
                 for k, v in loss_tensors.items():
                     tensors[k].append(v.detach().to("cpu"))
-                token_exporter.export(
-                    progress.step,
-                    side["micro_step"],
-                    side["export_micro_batch"],
-                    o,
-                    sl,
-                    config.loss,
-                )
                 return loss
 
             # Stage buffers are fixed size, so every micro-batch must share one
@@ -1976,7 +1944,6 @@ def train(config: TrainerConfig):
                     f"micro-batch count mismatch across ranks (max={_n[0].item()}, "
                     f"min={-_n[1].item()}); the pipeline schedule would deadlock"
                 )
-            parity_bundle_readiness = _n
             pp_side_inputs = pad_pp_side_inputs(pp_side_inputs, cp_world_size=parallel_dims.cp)
             if pp_stage_modules is None:
                 raise RuntimeError("pipeline stage modules were not initialized")
@@ -2181,21 +2148,6 @@ def train(config: TrainerConfig):
                 for k, v in lb_stats.items():
                     if v is not None:
                         tensors[k].append(v)
-
-        if config.enable_token_export:
-            dist.barrier()
-            publish_trainer_bundle(
-                token_exporter.parity_source(),
-                parity_bundle_enabled,
-                parity_bundle_communication,
-                parity_bundle_readiness,
-            )
-            ready_run_ids = {
-                multi_run_manager.idx_2_id[idx]
-                for idx in multi_run_manager.ready_to_update_idxs
-                if idx in multi_run_manager.idx_2_id
-            }
-            token_exporter.mark_stable(ready_run_ids)
 
         # Synchronize forward/loss diagnostics before validating gradients.
         # A rejected update must still preserve its measured parity evidence.
@@ -2564,8 +2516,6 @@ def train(config: TrainerConfig):
         logger.info(f"Saving trace to {trace_file}")
         prof.export_chrome_trace(trace_file)
         logger.info(f"Saved trace to {trace_file}")
-
-    token_exporter.close()
 
     # Write final checkpoint (only for single-run mode; multi-run checkpoints are managed by MultiCheckpointManager)
     if config.max_concurrent_runs == 1 and ckpt_manager is not None:

@@ -2,8 +2,6 @@ output_dir = "/data/glm52-rl/qualifications/glm52-fixed-token"
 max_steps = 1
 dist_timeout_seconds = 5400
 enable_router_replay = false
-enable_token_export = false
-
 [data.fake]
 batch_size = 8
 generate_samples = false

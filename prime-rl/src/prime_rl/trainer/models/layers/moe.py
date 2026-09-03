@@ -682,7 +682,6 @@ class TokenChoiceTopKRouter(nn.Module):
         self.route_norm = route_norm
         self.route_scale = route_scale
         self.force_balanced = False
-        self.parity_trace_layer: int | None = None
         self.use_fp32_router_output = False
 
     def forward(
@@ -690,9 +689,6 @@ class TokenChoiceTopKRouter(nn.Module):
         x: torch.Tensor,
         expert_bias: torch.Tensor | None = None,
         routed_experts: torch.Tensor | None = None,
-        expert_bias_is_static: bool = False,
-        expert_bias_source_sha256: str | None = None,
-        expert_bias_cache_sha256: str | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -716,11 +712,6 @@ class TokenChoiceTopKRouter(nn.Module):
         assert routed_experts is None or routed_experts.shape[-1] == self.top_k, (
             f"routed_experts shape: {routed_experts.shape}, top_k: {self.top_k}"
         )
-        router_debug_active = False
-        if self.parity_trace_layer is not None:
-            from prime_rl.parity_router_trace import router_debug_enabled
-
-            router_debug_active = router_debug_enabled(self.parity_trace_layer)
         if self.use_fp32_router_output:
             gate_weight = self.gate.weight
             if gate_weight.dtype == torch.bfloat16:
@@ -731,9 +722,6 @@ class TokenChoiceTopKRouter(nn.Module):
                 scores = self.gate(gate_input)
         else:
             scores = self.gate(x)
-        if router_debug_active:
-            raw_router_logits = scores.to(torch.float32)
-
         # By default, sigmoid or softmax is performed in float32 to avoid loss explosion
         if self.score_func == "sigmoid":
             scores = scores.to(torch.float32)
@@ -754,22 +742,6 @@ class TokenChoiceTopKRouter(nn.Module):
         selection_scores = scores
         if selection_bias is not None:
             selection_scores = selection_scores + selection_bias.to(torch.float32)
-
-        if router_debug_active:
-            from prime_rl.parity_router_trace import write_router_debug_chunk
-
-            write_router_debug_chunk(
-                self.parity_trace_layer,
-                x,
-                raw_router_logits,
-                scores,
-                selection_scores,
-                selection_bias,
-                expert_bias_source_sha256,
-                expert_bias_cache_sha256,
-                expert_bias_is_static,
-            )
-            del raw_router_logits
 
         if routed_experts is not None:
             selected_experts_indices = routed_experts
@@ -801,16 +773,6 @@ class TokenChoiceTopKRouter(nn.Module):
         if self.route_norm:
             denominator = top_scores.sum(dim=-1, keepdim=True) + 1e-20
             top_scores = top_scores / denominator
-
-        if self.parity_trace_layer is not None:
-            from prime_rl.parity_router_trace import write_route_chunk
-
-            write_route_chunk(
-                self.parity_trace_layer,
-                selected_experts_indices,
-                top_scores,
-                route_output_scale=self.route_scale,
-            )
 
         # group tokens together by expert indices from 0 to num_experts and pass that to experts forward
         num_tokens_per_expert = torch.histc(
@@ -1141,9 +1103,6 @@ class MoE(nn.Module):
             x,
             expert_bias,
             routed_experts=routed_experts,
-            expert_bias_is_static=static_expert_bias,
-            expert_bias_source_sha256=getattr(self, "_fp32_expert_bias_source_sha256", None),
-            expert_bias_cache_sha256=getattr(self, "_fp32_expert_bias_cache_sha256", None),
         )
 
         # tokens_per_expert will be used to update the expert bias for load balancing.
