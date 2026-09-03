@@ -1,14 +1,13 @@
 diff --git a/vllm/v1/attention/backends/mla/flashmla_sparse.py b/vllm/v1/attention/backends/mla/flashmla_sparse.py
 --- a/vllm/v1/attention/backends/mla/flashmla_sparse.py
 +++ b/vllm/v1/attention/backends/mla/flashmla_sparse.py
-@@ -57,9 +57,9 @@ logger = init_logger(__name__)
+@@ -58,7 +58,7 @@ logger = init_logger(__name__)
  # prefill kernel requires padding the number of heads to 128 while the decode does not
  # so when the per-rank head count is below MIN_HEADS_FOR_BF16_PREFILL we use the mixed
  # batch mode (#1).
 -MIN_HEADS_FOR_BF16_PREFILL = 32
+-
 +MIN_HEADS_FOR_BF16_PREFILL = 0
- 
++
  """
  NOTE: FlashMLA Sparse uses an fp8 cache with the following format
- 
- For DeepSeek V3.2, in the "FP8 with scale" format, each token's KV cache is 656
