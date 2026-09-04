@@ -12,12 +12,12 @@ import httpx
 import verifiers.v1 as vf
 from openai import APIError, AsyncOpenAI
 from pydantic import Field
+from pydantic_config import BaseConfig
 
 try:
     from verifiers.v1.clients.config import resolve_api_key
 except ImportError:
     from verifiers.v1.configs.client import resolve_api_key
-from verifiers.v1.mcp.user import UserConfig
 from verifiers.v1.types import UserMessage
 
 from decensor_v1.state import DecensorState
@@ -120,7 +120,7 @@ async def review_follow_up_message(
     return FollowUpReview.model_validate_json(arguments), arguments
 
 
-class DecensorUserConfig(UserConfig):
+class DecensorUserConfig(BaseConfig):
     in_process: bool = True
     model: str = "google/gemma-4-26B-A4B-it"
     base_url: str = "http://198.13.252.41:40002/v1"
@@ -133,7 +133,10 @@ class DecensorUserConfig(UserConfig):
     max_concurrent_requests: int = Field(default=24, ge=1)
 
 
-class DecensorUser(vf.User[DecensorUserConfig, DecensorState]):
+class DecensorUser:
+    config: DecensorUserConfig
+    state: DecensorState
+
     async def setup_task(self, task: Any) -> None:
         self._transcript: list[dict[str, str]] = []
         self._initial_user_request = ""
@@ -231,7 +234,9 @@ class DecensorUser(vf.User[DecensorUserConfig, DecensorState]):
                                         messages=[
                                             {
                                                 "role": "system",
-                                                "content": follow_up_generation_instructions,
+                                                "content": (
+                                                    follow_up_generation_instructions
+                                                ),
                                             },
                                             {
                                                 "role": "user",
@@ -422,7 +427,3 @@ class DecensorUser(vf.User[DecensorUserConfig, DecensorState]):
         self._accepted_follow_ups.append(text)
         self._transcript.append({"role": "user", "content": text})
         return [UserMessage(content=text)]
-
-
-if __name__ == "__main__":
-    DecensorUser.run()
