@@ -20,8 +20,11 @@ training_ops.parity()
 From the repository shell:
 
 ```bash
-PYTHONPATH=.agents/skills/training-ops/src python3 -m training_ops status
+python3 -m training_ops status
 ```
+
+The shell profile exports the training-ops source path. If this import fails,
+fix that export instead of adding a different command to each runbook entry.
 
 Use this foreground monitor for an active run:
 
@@ -63,8 +66,8 @@ training_ops.start("glm-1", profile="current")
 training_ops.stop()
 ```
 
-Use `training_ops.qualify()` with a configured trainer-only qualification
-profile when one is available.
+Use `training_ops.qualify()` with one of the configured trainer-only profiles:
+`glm52-native-small` or `glm52-fixed-token`.
 
 `start()` checks that each selected host has the named configuration. A cold
 start creates the orchestrator control file before the trainer starts. A
@@ -72,6 +75,10 @@ restart starts the trainer first because that control file already exists.
 
 Do not edit a run name into a copy of an old configuration. Update the named
 profile in `configs/operations.toml` and its files.
+
+The GLM-5.3 judge is a separate service on `h200b`. Its service profile is
+`inference.h200b.glm53_judge` in `configs/operations.toml`. Starting or
+stopping it is a live service change and needs owner approval.
 
 ## Direct host read
 

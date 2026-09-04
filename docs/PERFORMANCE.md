@@ -1,370 +1,118 @@
-# GLM-5.2 DECENSOR RL. PERFORMANCE MEASUREMENTS
+# Performance measurements
 
-This document holds the transport and throughput measurements. It was moved out
-of `AGENTS.md`, which is loaded into every session and must stay short.
+These are measured results. Keep trainer, rollout, adapter save, network
+transfer, H200 activation, judging, and full model copy as separate values.
 
-Language: ASD-STE100 Simplified Technical English.
+## Current limits
 
-# READ THE ERA BEFORE YOU USE A NUMBER
+- Trainer forward and backward target: 10 to 15 minutes after step 1.
+- Rollout target: about 10 minutes for 1,024 rollouts.
+- Production settings: batch 1,024, group 16, context 32,768, output limit
+  16,384.
+- Final test: at least 50 complete production steps.
 
-The cluster changed topology. Numbers from one era do not apply to the other.
+## Trainer
 
-Era 1 is global expert parallelism. `global_ep = true`, `cp = 4`, no pipeline
-parallelism, 88 rollouts each batch. Every MoE dispatch and combine crossed the
-10 Gb/s node link. The all-to-all was 93 percent of a micro-batch.
-
-Era 2 is the current trainer topology. `global_ep = false`, `cp = 8`, `pp = 8`, `ep = 8`
-node-local, batch 1024, 32K context. The MoE all-to-all is node-local and about
-80 times faster. The transport analysis in Era 1 no longer sets the step time.
-
-Era 2 run x24 step 3 took 31.4 minutes for the full cycle: 14.6 minutes of
-trainer compute and 16.8 minutes waiting for rollouts. Trainer throughput was
-2645 tokens/s, MFU 3.2 percent, and peak memory 46.5 GiB.
-
-The MFU is 3.2 percent. The step time has much space to decrease.
-
-# 2026-08-27 BATCH-2048 NSIGHT BOUNDED RUN
-
-The trainer used PP8, CP8, node-local EP8, native FP8 base weights, BF16
-optimization, rank-32 full LoRA, and a frozen router. Fake trainer-only data
-provided batch 64 at sequence length 32,768. The launcher traced CUDA and NVTX
-on global rank 24 on n78. CPU sampling and backtraces were off.
-
-Forward and backward started at 03:20:29 UTC. It did not finish before the
-five-minute limit. The last check at 03:25:45 UTC was 316 seconds after the
-start. Sampled GPU utilization during the step was 90 to 100 percent. The run
-did not complete a step, so it does not provide a valid step-time comparison.
-
-There was no OOM, nonfinite value, TileLang `rhs is null` error, NCCL error, or
-optimizer update. The operator stopped the isolated trainer containers on all
-eight hosts. All 64 GPUs then reported 0 percent utilization and no compute
-process.
-
-Nsight did not create an `.nsys-rep` because the bounded stop occurred before
-the training code called `cudaProfilerStop()`. Kernel, CUDA API, and NVTX
-summaries are therefore unavailable. The per-host logs are preserved as
-`nsys-bounded-20260827-docker.log` in the qualification output directory.
-
-# X26 EDGE FILESYSTEM TEST
-
-Test x26 ran on 2026-08-07. The orchestrator ran on h200a and sent completed
-batches to n82. The trainer and rollout settings stayed at batch 1024, group
-16, 128 rollouts in flight, and 16K context.
-
-| Step | Collection | Attempts | Trainable | Errors | Batch file | Transfer |
-|---|---:|---:|---:|---:|---:|---:|
-| 1 | 20m 5s | 1,056 | 1,029 | 2.5% | 84.2 MB | 28.8 s |
-| 2 | 18m 41s | 1,024 | 1,023 | 0.1% | 92.5 MB | 29.4 s |
-
-The measured collection rates were 51.2 and 54.8 trainable rollouts each
-minute. Both destination SHA-256 hashes matched the source. The transfer
-overlapped the next collection.
-
-These results measure rollout collection and file transfer. They do not
-measure a completed trainer step. The trainer failed during its first forward
-pass on two attempts. The first process failure was n80 rank 35. The remaining
-ranks then reported NCCL remote-process errors.
-
-# THE SETTINGS THAT STILL APPLY
-
-These came from Era 1 but they tune the NIC, not the parallelism. The
-`training-ops/runtime/china/cluster.sh` launcher still applies them.
-
-# NCCL socket count
-
-NCCL opened `NCCL_SOCKET_NTHREADS=4` times `NCCL_NSOCKS_PERTHREAD=4`, which is
-16 sockets for each rank. That made 128 TCP flows share one 10 Gb/s NIC on each
-node. The flows then congested each other.
-
-Measured on the real 64-rank expert-parallel group:
-
-| Sockets per rank | INT4 dispatch | FP8 gradient | BF16 |
-|---|---:|---:|---:|
-| 16 (4 x 4, the default) | 0.506 s | 0.964 s | 1.551 s |
-| 8 (2 x 2) | 0.437 s | 0.628 s | 1.236 s |
-| 2 (1 x 2) | 0.329 s | 0.650 s | 1.101 s |
-| 1 (1 x 1, current) | 0.285 s | 0.558 s | 0.885 s |
-
-Use 1 socket for each rank.
-
-# NCCL channel count
-
-| `NCCL_*_NCHANNELS` | Time for each layer | Wire efficiency |
+| Test | Result | Peak GPU memory |
 |---|---:|---:|
-| default | 1835 ms | 44% |
-| 2 | 1888 ms | 45% |
-| 4 | 1527 ms | 55% |
-| 8 (current) | 970 ms | 87% |
-| 16 | 972 ms | 87% |
+| Batch-2,048 trainer-only, 20 steps | 11m37s to 11m44s; median 11m41s | 43.2 GiB |
+| Production-shaped 20-step test | about 10 to 14 minutes | not recorded |
+| Historical x24 step 3 | 14m36s; 2,645 tokens/s | 46.5 GiB |
 
-The measurement favored 8. The current launcher sets 4. This discrepancy is
-unresolved; changing it changes trainer performance and needs a measured run.
-One channel hangs and must not be used.
+The batch-2,048 test completed 20 of 20 steps without an OOM. The requested
+3-to-5-minute trainer time has not been shown.
 
-The value 87 percent is the measured ceiling of this NIC, so almost nothing is
-left on the wire.
+Do not enable activation offload. A prior test used 486 GiB of 503 GiB host
+memory and stopped the node. With activation offload disabled, the host used
+about 3 GiB and had about 460 GiB available.
 
-# Queueing discipline
+The activation-checkpoint expert cache costs about 3.8 GiB for each GPU. It
+also has unsafe single-slot reuse under the 1F1B schedule. Keep it disabled.
 
-`fq` gives 87 percent wire efficiency. The default `fq_codel` gives 65 percent.
-The `training-ops/runtime/china/cluster.sh` launcher applies `fq` before it
-starts the trainer.
+## Adapter movement
 
-BBR congestion control is worse here: 36 percent. Stay on `cubic`.
+The rank-32 expert adapter is BF16 and is about 28.65 GiB, or 30,767,549,784
+bytes. The base model remains FP8.
 
-Jumbo frames were tested end to end. MTU 9000 passes the switch with no loss,
-but the all-to-all became slower: 0.452 s against 0.285 s. Stay at MTU 1500.
-
-# The expert activation-checkpoint cache
-
-`PRIME_EP_AC_CACHE=1` keeps the INT4 payload that each rank received in the
-forward pass and uses it again on the recompute. It costs about 3.8 GB for each
-GPU.
-
-Do not enable it on the current trainer. x26 failed twice when rank 35 needed a
-308 MiB grouped-expert output with only 287.62 MiB free. The cache also has
-only one dispatch and combine slot for each layer while 1F1B has multiple
-micro-batches in flight. The slot can be overwritten before its matching
-recompute.
-
-`PRIME_EP_AC_CACHE=0` recomputes the same INT4 payload and repeats the
-node-local all-to-all. This changes performance, not the model values, and
-restores sufficient memory headroom. Selective activation checkpointing stays
-enabled.
-
-# THE LINK TO THE ENGINES
-
-This is a long public link, not a datacentre network. Measured from n82: 217
-milliseconds round trip, and packet loss between 3 and 33 percent that differs
-between the two hosts.
-
-Widening from 8 to 24 tunnels raised historical collection from about 4/min
-to 13-16/min. x25 uses 48 ports, 18001-18048.
-
-Uncompressed bulk transfer measured less than 130 KB/s. Compressed transfer
-measured 4.9 MB/s. Therefore a batch can cross the link, but it must use a
-resumable, integrity-checked bulk transport. Individual rollout responses and
-WAN ZMQ do not provide that guarantee.
-
-# THE TUNNEL CONCURRENCY CEILING
-
-The tunnels limit the number of rollouts in flight. They do not limit the batch
-size. The two values are independent.
-
-| Rollouts in flight | Healthy tunnels | Engine concurrency |
-|---|---:|---:|
-| 256 | 20 to 22 of 24 | 45 to 70 |
-| 1024 | 10 of 24 | 1 to 6 |
-
-At 1024 the watchdog rebuilt 10 to 14 tunnels every 45 seconds and they failed
-again at the same rate.
-
-Set `batch_size` for the gradient quality. Set `max_inflight_rollouts` for the
-tunnel load. The two are independent.
-
-Read the two rows above with care. Both were sampled at a batch tail, when only
-a few rollouts were in flight, so they overstate how healthy 256 was. Under
-real load at 256 the count fell to 1 to 10 of 24. The current value is 256. See
-"THE ROLLOUT TRANSPORT" below for the measurements that replace this table.
-
-The healthy-tunnel count is also a weak signal on its own. The probe shares
-each tunnel with rollout traffic, so it starves on links that still carry
-rollouts. Confirm against the engines before acting on it.
-
-# THE ROLLOUT TRANSPORT
-
-The step time is set by rollout collection, not by the trainer. Measured over
-steps 1 to 7 of run x24:
-
-| Step | Total | Trainer compute | Waiting for rollouts |
-|---|---:|---:|---:|
-| 1 | 96.2m | 11.3m | 84.8m |
-| 2 | 52.2m | 12.3m | 39.8m |
-| 3 | 31.4m | 14.6m | 16.8m |
-| 4 | 65.1m | 14.7m | 50.2m |
-| 5 | 47.7m | 8.4m | 39.2m |
-| 6 | 135.1m | 6.3m | 128.7m |
-| 7 | 183.8m | 12.1m | 171.5m |
-
-The trainer finishes in 6 to 15 minutes and then idles. Step 6 was 95 percent
-idle. Do not tune the trainer to reduce the step time. A 15 minute step needs
-68 rollouts each minute.
-
-# What limited the rollouts
-
-Every dropped rollout was a transport failure. Step 6 lost 78.4 percent of its
-rollouts, and every signature was `ReadTimeout`. The `zero_advantage` filter
-dropped 0.5 percent, gibberish 0.2 percent, and truncation 0 percent. Rollout
-throughput and rollout loss are the same problem.
-
-Three faults, in the order they were found:
-
-The rollout tunnels had no compression, while the batch tunnel had it. The
-batch tunnel measured under 130 KB/s without it and 4.9 MB/s with it.
-
-The SSH keepalive was 10 x 3, so 30 seconds of lost keepalives killed a tunnel.
-Keepalives are ordinary packets on a link that loses 10 to 33 percent of them,
-so SSH killed live tunnels and every request in flight on them.
-
-`build_async_openai` in verifiers left the OpenAI SDK defaults: `connect=5.0s`
-and `read=600s`. A wedged request therefore held one of the fixed in-flight
-slots for 10 minutes. Measured before the fix: 121 rollouts in flight while the
-two engines ran 3 between them. Most of the in-flight count was dead requests
-and the engines starved behind them.
-
-# The effect
-
-| Configuration | Collection | Full batch of 1024 | ReadTimeouts |
-|---|---:|---:|---:|
-| 256 in flight, no compression | 9.7/min | 106 min | 2.2/min |
-| plus compression and patient keepalive | 13.0/min | 79 min | 0.75/min |
-| plus 128 in flight and bounded timeouts | 15.7/min | 65 min | 0.22/min |
-
-The step 6 error rate was 78.3 percent. Step 7 was 18.9 percent.
-
-The current value is 256. A later 192-inflight measurement was not faster and
-had about five times as many errors. Re-test concurrency only after the
-orchestrator moves beside the engines; the WAN result does not measure local
-engine capacity.
-
-# WHAT ACTUALLY CROSSES THE LINK
-
-Measured on a single `/inference/v1/generate` call, 2026-08-07:
-
-| Field | Share of compressed bytes |
+| Part | Measured time |
 |---|---:|
-| `routed_experts` | 95.5% |
-| `logprobs` | ~4% |
-| `token_ids`, `finish_reason`, `index` | <1% |
+| Trainer save and broadcast | 2m19s to 4m32s |
+| Network transfer after relay repairs | 3m20s to 4m12s |
+| H200 adapter activation | 4m18s to 4m40s |
 
-`routed_experts` is 711 bytes for each generated token. It is already encoded
-as tightly as it can be: `dtype` is `uint8`, exactly 1 byte for each element,
-and it gzips only 1.4 times because it is already binary. Its shape is
-`[positions, 78 MoE layers, 8 experts]`, so each token costs 78 x 8 = 624
-expert indices.
+Positive-delta network transfers on 2026-08-30 took 3m50s, 4m01s, and 4m12s.
+The matching H200 activation times were 4m21s, 4m18s, and 4m40s.
 
-That is 2.79 MB for each rollout on the wire, and about 5.2 Mbit/s at 14
-rollouts a minute, over a path that loses 7.5 percent of its packets.
+The full GLM FP8 model is 755,632,050,320 bytes, about 704 GiB. This is not an
+adapter transfer. Warn the owner before a full model copy, and report that time
+separately.
 
-The useful content, the tokens and their logprobs, is under 5 percent of it.
+Before the transport repairs, uncompressed bulk transfer was below 130 KiB/s.
+Compressed transfer reached 4.9 MiB/s. Resumable transfer, file validation,
+relay recovery, and staging the adapter once per host produced the times above.
 
-This described x24 with router replay enabled. x25 disables router replay and
-routed-expert return together, so this field no longer limits batch size.
+## Rollouts and full cycles
 
-`enable_router_replay = true` is what asks for it. The trainer replays the
-engine's expert choices instead of choosing its own, so the two forward passes
-agree. Without it the payload falls by about 20 times.
+| Test | Rollout time | Trainer time | Full cycle |
+|---|---:|---:|---:|
+| Historical x24 step 3 | 16m48s | 14m36s | 31m24s |
+| Policy-7 measured cycle | 21m28s | 10m59s | overlap applies |
+| Other recent batches | 17m36s to 21m55s | 10 to 14 minutes | not recorded |
 
-The LoRA adapts `q_a_proj`, `q_b_proj`, `kv_a_proj_with_mqa`, and `o_proj`
-only. The router is not adapted and its weights are frozen and identical on
-both sides, so the only source of routing disagreement is numeric: the trainer
-runs bf16 with `moe_router_dtype = "float32"` and the engine runs W8A16. How
-much that actually flips a top-8 selection is not known and has not been
-measured.
+Trainer work and rollout collection overlap. Do not add all values unless the
+timestamps show that they ran in sequence.
 
-Current mismatch KL with replay on: masked 0.19 to 0.21, unmasked 0.012,
-entropy 0.47. Those are the numbers a run without replay must not spoil. For
-comparison, the FP8 trainer experiment pushed masked mismatch KL to 7 to 9
-nats and entropy to 9.2, and the reward collapsed.
+The latest measured rollout times do not pass the target of about 10 minutes.
+The current 48-tunnel inventory returns HTTP 200, but tunnel health alone does
+not prove rollout throughput.
 
-# THE TOPOLOGY, AND WHAT IT RULES OUT
+Historical WAN measurements had about 217 ms round-trip delay and packet loss
+from 3 to 33 percent. Large request counts caused tunnel resets and read
+timeouts. Compression, patient keepalive settings, bounded request timeouts,
+and durable batch files reduced these failures.
 
-```
-H200 (docker) --internet, 7.5% loss, 210 ms--> jump 202.101.73.12 --LAN--> n82
-```
+## Numeric agreement
 
-The engines reach n82 through `ProxyJump`, so each tunnel is SSH inside SSH and
-the lossy leg carries two layers of channel flow control.
+An old native W8A8 trainer test did not agree with H200 W8A16 inference:
 
-The bulk data travels H200 to n82, so the H200 is the sender and its congestion
-control is the one that matters. BBR cannot be loaded there: the engine hosts
-are Docker containers without `CAP_SYS_MODULE`, and the host has not loaded
-`tcp_bbr` either.
-
-A userspace FEC tunnel (kcptun, UDPspeeder, frp over KCP) would fix the loss
-without any kernel module, but it needs a port. Measured from an engine host:
-UDP and arbitrary TCP to the jump host both time out. Only SSH on port 31331
-crosses. Ask the provider to open one UDP port if this route is wanted.
-
-The tested host settings were BBR on n82 for the two engine routes only, plus
-`tcp_slow_start_after_idle=0`, `tcp_mtu_probing=1`, and a 32 MB buffer ceiling.
-Do not set BBR globally on n82. It is a trainer node and NCCL crosses the same
-interface, where cubic measured 87 percent against BBR's 36 percent.
-
-# THE MEMORY MEASUREMENTS
-
-| Condition | Host memory |
-|---|---|
-| Activation offloading on | 486 GB of 503 GB, then the node stopped |
-| Activation offloading off | about 3 GB used, 460 GB available |
-
-This memory is real. An earlier note called it an accounting artifact. That
-note was wrong and is retracted. The kernel trace showed `shmem_fault`,
-`shmem_alloc_folio`, `__alloc_pages`, and `out_of_memory`.
-
-The pipeline stage balance moved the peak GPU memory from 24.6 GB to 21.9 GB
-for each GPU.
-
-# THE PRECISION MEASUREMENTS
-
-| Metric | FP8 trainer weights | bf16 trainer weights |
-|---|---|---|
-| Mismatch KL | 7 to 9 nats | 0.2 nats |
-| Positive advantage | 0.003 | 0.3 |
-| Entropy | 9.2 nats | 0.45 nats |
-| Gradient norm | 200000 to 330000 | 0.013 to 0.043 |
-
-The vocabulary entropy limit is 11.95 nats. The gradient clip limit is 1.0.
-
-The cause is that the engines use W8A16 and the trainer FP8 path uses W8A8. The
-trainer was less exact than the engines, so the trust region masked almost
-every positive advantage.
-
-The open improvement is to make the trainer use W8A16. That recovers the FP8
-memory and keeps the mismatch KL low. Start at `_dequant_weight` in
-`fp8_ada.py`.
-
-# ERA 1 ARCHIVE
-
-Keep these numbers for reference only. They describe global expert parallelism,
-which x25 and x26 did not use.
-
-Each node has one 10 Gb/s link, `vlan130`, MTU 1500, shared by its 8 GPUs. The
-second port is not cabled.
-
-The 75 MoE layers hold 725 billion routed-expert parameters. Sharded across all
-64 GPUs that is 11.3 GB for each GPU. Node-local expert parallelism would need
-90.6 GB for each GPU, which does not fit, so Era 1 required `global_ep` and
-every dispatch and combine crossed the network.
-
-One micro-batch of 4096 tokens for each data rank, measured with per-layer CUDA
-event timers:
-
-| Phase | Time | Passes for each layer |
-|---|---:|---|
-| Forward dispatch all-to-all | 46.2 s | 2 |
-| Forward combine all-to-all | 45.3 s | 2 |
-| Backward dispatch all-to-all | 36.6 s | 1 |
-| Backward combine all-to-all | 35.8 s | 1 |
-| Expert count metadata all-to-all | 0.4 s | 2 |
-| Attention, expert GEMM, router, output head | 12.9 s | |
-
-All-to-all was 93 percent of the micro-batch, so kernel tuning could not move
-the step time.
-
-The remaining gap between the theoretical wire time and the measured time was expert load
-imbalance. `all_to_all_single` finishes at the pace of its busiest peer.
-
-| Split skew | Time for each layer | Wire efficiency |
+| Metric | W8A8 trainer | BF16 trainer comparison |
 |---|---:|---:|
-| 1 (uniform) | 942 ms | 90% |
-| 2 | 1827 ms | 46% |
-| 4 | 3567 ms | 24% |
+| Mismatch KL | 7 to 9 nats | about 0.2 nats |
+| Entropy | 9.2 nats | about 0.45 nats |
+| Gradient norm | 200,000 to 330,000 | 0.013 to 0.043 |
 
-The measured 103 to 108 seconds sat between skew 1 and skew 2, so live routing
-carried about a 1.5 times imbalance. `enable_router_replay` is on, so the
-trainer replays the routing of the inference engine and cannot flatten this.
+The W8A8 result caused reward loss and was reverted. A low-memory W8A16
+trainer path is still open work. Start in
+`prime-rl/src/prime_rl/trainer/models/layers/fp8_ada.py`.
 
-An earlier benchmark used idle GPUs and uniform splits. It reported a 1.89
-times benefit from extra NCCL channels where 1.06 times was delivered. Any
-transport benchmark must model both contention and skew.
+For the current path, compare selected-token FP32 log probabilities for the
+same tokens and adapter. Test trainer scoring, inference prefill, eager decode,
+CUDA-graph decode, long positions, and adapter reload. Do not change a parity
+limit to hide a mismatch.
+
+## Network settings
+
+The old 64-rank network test favored one NCCL socket per rank. It measured
+0.285 seconds for INT4 dispatch, 0.558 seconds for FP8 gradient traffic, and
+0.885 seconds for BF16 traffic.
+
+Eight NCCL channels measured 970 ms for each layer. Four channels measured
+1,527 ms. The launcher still sets four channels, so this difference needs a
+controlled current-topology test before a change.
+
+Use `fq`, cubic congestion control, and MTU 1500. In the old test, `fq` reached
+87 percent wire use; `fq_codel` reached 65 percent. BBR reached 36 percent.
+MTU 9000 was slower than MTU 1500.
+
+The current trainer uses PP8, CP8, and node-local EP8. Do not apply timings
+from the removed global expert-parallel design to this topology.
+
+## Open measurements
+
+- A full 50-step production run has not passed.
+- Rollout collection has not reached the 10-minute target.
+- The complete MTP paired test at 32K context has not passed.
+- The mixed H200 CUDA-graph memory difference is not explained. One host used
+  10.89 GiB and the other used 2.04 GiB in the compared test.
+- The measured reward slope from steps 11 to 40 was +0.0039 against a noise
+  range of plus or minus 0.0165. This is not a reward trend.
