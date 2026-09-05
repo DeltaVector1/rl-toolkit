@@ -12,20 +12,10 @@ FAILS_BEFORE_RESTART=${FAILS_BEFORE_RESTART:-2}
 # this grace so stale misses from the old engine cannot trigger a second
 # replacement during that load.
 STARTUP_GRACE=${STARTUP_GRACE:-0}
-# A LoRA collective can temporarily stop token progress while requests remain
-# registered in the engine. Two such stalls at policy updates on 2026-08-11
-# finished on the peer engine but made this watchdog discard h200b after only
-# two minutes. Give a busy engine a longer bounded grace. A dead or empty
-# EngineCore still uses FAILS_BEFORE_RESTART.
+# Give a busy engine more time during a LoRA load.
 BUSY_STALL_FAILS_BEFORE_RESTART=${BUSY_STALL_FAILS_BEFORE_RESTART:-5}
-# A blocked LoRA collective can report zero running requests while the complete
-# engine remains resident. This happened at x64p policy v3: h200b held
-# 132155 MiB but the ordinary two-probe limit restarted it. Treat a resident
-# engine like a busy one for the bounded grace. Empty dead engines use the
-# ordinary limit and still restart quickly.
+# Treat a resident engine as busy even when it reports zero requests.
 RESIDENT_ENGINE_MIN_MIB=${RESIDENT_ENGINE_MIN_MIB:-65536}
-# Tests can replace these commands without changing this file.
-# against a fake launcher instead of re-implementing its decisions.
 START=${START:-/data/glm52-rl/deployment/.agents/skills/training-ops/runtime/h200/start_inference.sh}
 ENGINE_CONTAINER=${ENGINE_CONTAINER:-glm52-decensor-h200}
 RELOAD_TRIES=${RELOAD_TRIES:-40}

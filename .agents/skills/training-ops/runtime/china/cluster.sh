@@ -36,14 +36,11 @@ common=(
   -e NCCL_P2P_DISABLE=1
   -e NCCL_SOCKET_NTHREADS=1
   -e NCCL_NSOCKS_PERTHREAD=1
-  # Native checkpoint FP8 restores enough VRAM headroom to use the faster x24
-  # communication settings without putting routed-expert allocations at risk.
+  # Native FP8 leaves enough memory for these communication settings.
   -e NCCL_BUFFSIZE=1048576
-  # NCCL >=2.19 allocates host bounce buffers via cuMem/memfd (invisible in
-  # /dev/shm, counted as shmem) -- the 300GB/node "shared" spikes. Legacy path.
+  # Avoid large NCCL host buffers.
   -e NCCL_CUMEM_HOST_ENABLE=0
-  # Four channels measured substantially faster than two. One hangs and must
-  # never be used.
+  # One channel hangs. Four channels are faster than two.
   -e NCCL_MIN_NCHANNELS=4
   -e NCCL_MAX_NCHANNELS=4
   -e TORCH_NCCL_TRACE_BUFFER_SIZE=1048576
