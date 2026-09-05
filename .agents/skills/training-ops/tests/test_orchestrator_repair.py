@@ -187,6 +187,31 @@ class OrchestratorRepairTest(unittest.TestCase):
 
         deploy.assert_not_called()
 
+    def test_failed_running_orchestrator_can_be_recreated(self):
+        self.assertIn("ORCH_FAILED", training_ops.orchestrator_probe)
+        before = training_ops.Status(
+            trainer_up=True,
+            orch_failed=True,
+            nodes=[training_ops.NodeState(host="n82", gpu_util=0, reachable=True)],
+            batch="batch 1024/1024; 0 inflight",
+        )
+
+        def fake_ssh(_host, script, timeout=120):
+            if "configured orchestrator container state is unknown" in script:
+                return 0, "running\n"
+            return 0, ""
+
+        with mock.patch.object(training_ops, "current_run", return_value="glm-1"), mock.patch.object(
+            training_ops, "status", return_value=before
+        ), mock.patch.object(training_ops, "deploy", return_value=True), mock.patch.object(
+            training_ops, "_ssh", side_effect=fake_ssh
+        ), mock.patch.object(
+            training_ops, "_ssh_address", side_effect=lambda host: f"addr-{host}"
+        ):
+            result = training_ops._repair_orchestrator()
+
+        self.assertIn("recreated exact orchestrator", result)
+
     def test_recreate_script_uses_active_profile_and_exact_launcher(self):
         with mock.patch.object(
             training_ops, "_ssh_address", side_effect=lambda host: f"addr-{host}"

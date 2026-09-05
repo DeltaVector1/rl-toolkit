@@ -495,6 +495,11 @@ echo "TRAINER_LOGAGE $(sudo docker logs -t --tail 1 __TRAINER__ 2>&1 | tail -1 |
 orchestrator_probe = r"""
 strip() { sed "s/\\x1b\\[[0-9;]*m//g"; }
 echo "ORCH_UP $(sudo docker ps --filter name=__ORCH__ --format up 2>/dev/null | head -1)"
+last=$(sudo docker logs --tail 1 __ORCH__ 2>&1 | strip | tail -1)
+case "$last" in
+  *'Failed to finish run'|*'No space left on device'*) echo "ORCH_FAILED 1" ;;
+  *) echo "ORCH_FAILED 0" ;;
+esac
 echo "BATCH_SYNC $(pgrep -f 'bash .*[s]ync_rollout_batches.sh' | wc -l)"
 echo "TRAINER_FAIL_WD $(pgrep -f 'bash .*[t]rainer_failure_watchdog.sh' | wc -l)"
 echo "ORCH_LAST $(sudo docker logs __ORCH__ 2>&1 | strip | grep -a 'SUCCESS Step' | tail -1)"
@@ -732,6 +737,7 @@ class Status:
     trainer_finished: bool = False
     trainer_failed: bool = False
     orch_up: bool = False
+    orch_failed: bool = False
     batch_sync: bool = False
     trainer_failure_watchdog: bool = False
     trainer_steps: int = 0
@@ -778,7 +784,7 @@ class Status:
             L.append(
                 f"trainer {trainer_state} | "
                 f"orchestrator "
-                f"{'up' if self.orch_up else 'finished' if self.trainer_finished else 'down'} | "
+                f"{'failed' if self.orch_failed else 'up' if self.orch_up else 'finished' if self.trainer_finished else 'down'} | "
                 f"judge {self.judge} | adapter {self.adapter}"
             )
         L.append(
@@ -1539,6 +1545,7 @@ def status(run: str = "", quiet: bool = False) -> Status:
     edge_orch = _kv(edge_orch_out) if edge_orch_rc == 0 else {}
     edge_keys = (
         "ORCH_UP",
+        "ORCH_FAILED",
         "BATCH_SYNC",
         "TRAINER_FAIL_WD",
         "ORCH_LAST",
@@ -1553,7 +1560,8 @@ def status(run: str = "", quiet: bool = False) -> Status:
         h.update({key: edge_orch[key] for key in edge_keys if key in edge_orch})
     s.mode = h.get("MODE", "rl")
     head_trainer_up = h.get("TRAINER_UP", "") == "up"
-    s.orch_up = h.get("ORCH_UP", "") == "up"
+    s.orch_failed = int(h.get("ORCH_FAILED", 0) or 0) > 0
+    s.orch_up = h.get("ORCH_UP", "") == "up" and not s.orch_failed
     s.batch_sync = int(h.get("BATCH_SYNC", 0) or 0) > 0
     s.trainer_failure_watchdog = int(h.get("TRAINER_FAIL_WD", 0) or 0) > 0
     s.trainer_steps = int(h.get("TRAINER_STEPS", 0) or 0)
@@ -1625,7 +1633,9 @@ def _warnings(s: Status) -> list[str]:
         detail = f" on {', '.join(failed_nodes)}" if failed_nodes else ""
         w.append(f"trainer cluster is not complete{detail}")
     trainer_only = s.mode == "trainer-only"
-    if not trainer_only and not s.orch_up and not s.trainer_finished:
+    if not trainer_only and s.orch_failed:
+        w.append("orchestrator process failed")
+    elif not trainer_only and not s.orch_up and not s.trainer_finished:
         w.append("orchestrator container is not up")
     inflight = re.search(r"(\d+) inflight", s.batch or "")
     live = [e for e in s.engines if e.reachable]
@@ -3608,7 +3618,7 @@ def _repair_adapter_update() -> str:
         for node in before.nodes
     ):
         raise Refused("adapter repair requires the trainer to be waiting")
-    orchestrator_was_running = before.orch_up
+    orchestrator_was_running = before.orch_up or before.orch_failed
     if orchestrator_was_running:
         observed_state = "running"
     else:
@@ -3837,7 +3847,7 @@ def _repair_orchestrator() -> str:
             f"{state_output.strip() or 'no state'}"
         )
     was_running = observed_state[0] == "running"
-    if was_running != before.orch_up:
+    if was_running != (before.orch_up or before.orch_failed):
         raise Refused(
             "orchestrator container state changed during the safety check; "
             "refusing an ambiguous resume"
