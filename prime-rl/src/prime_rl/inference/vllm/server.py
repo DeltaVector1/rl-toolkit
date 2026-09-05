@@ -28,9 +28,6 @@ from prime_rl.inference.vllm.worker.filesystem import (
     stage_full_checkpoint_files,
     stage_lora_adapter_files,
 )
-from prime_rl.utils.logger import get_logger
-
-logger = get_logger()
 from prime_rl.inference.patches import (
     monkey_patch_dp_coordinator_startup_timeout,
     monkey_patch_harmony_stop_token_propagation,
@@ -38,6 +35,9 @@ from prime_rl.inference.patches import (
     monkey_patch_strip_routed_experts_from_chat,
     monkey_patch_tokenize_params_validation,
 )
+from prime_rl.utils.logger import get_logger
+
+logger = get_logger()
 
 # NOTE: Fix harmony stop token propagation for GPT-OSS models
 # Upstream issue still open: https://github.com/vllm-project/vllm/issues/22519
@@ -419,10 +419,10 @@ async def custom_init_app_state(
         state.serving_tokens = prime_serving
 
 
-import vllm.entrypoints.openai.api_server
-import vllm.v1.utils
-from vllm.entrypoints.openai.api_server import build_app as _original_build_app
-from vllm.v1.utils import run_api_server_worker_proc as _original_run_api_server_worker_proc
+import vllm.entrypoints.openai.api_server  # noqa: E402
+import vllm.v1.utils  # noqa: E402
+from vllm.entrypoints.openai.api_server import build_app as _original_build_app  # noqa: E402
+from vllm.v1.utils import run_api_server_worker_proc as _original_run_api_server_worker_proc  # noqa: E402
 
 
 def custom_build_app(args: Namespace, supported_tasks: tuple, model_config=None):

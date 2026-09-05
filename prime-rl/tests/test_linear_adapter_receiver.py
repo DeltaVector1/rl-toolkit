@@ -248,7 +248,8 @@ class LinearAdapterReceiverTest(unittest.TestCase):
         correction = b""
         config = b"{}\n"
         wire = b"wire"
-        digest = lambda value: hashlib.sha256(value).hexdigest()
+        def digest(value):
+            return hashlib.sha256(value).hexdigest()
         transport = {
             "version": 2,
             "mode": "delta",

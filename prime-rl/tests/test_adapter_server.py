@@ -29,7 +29,6 @@ class QuietAdapterHandler(load_server().RangeHandler):
 
 class AdapterServerTest(unittest.TestCase):
     def test_old_stable_manifest_is_not_upgraded_after_newer_step_exists(self):
-        server_module = load_server()
         run_path = "run_glm-1/broadcasts"
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

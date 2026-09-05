@@ -1,5 +1,4 @@
 import hashlib
-import http.client
 import importlib.util
 import json
 import sys
