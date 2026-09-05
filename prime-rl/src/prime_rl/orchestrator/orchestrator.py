@@ -747,6 +747,16 @@ class Orchestrator:
         to the train / eval sink. Both sinks return a finalized batch (or
         ``None``) from ``add()``; we just dispatch on the result."""
         while not self.stopped.is_set():
+            for task in self.component_tasks:
+                if not task.done():
+                    continue
+                if task.cancelled():
+                    raise RuntimeError(f"{task.get_name()} stopped unexpectedly")
+                error = task.exception()
+                if error is not None:
+                    raise RuntimeError(f"{task.get_name()} failed") from error
+                raise RuntimeError(f"{task.get_name()} exited unexpectedly")
+
             if self.draining and self.dispatcher.is_idle:
                 get_logger().info("Pipeline drained, exiting main loop")
                 self.stopped.set()
