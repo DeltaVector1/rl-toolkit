@@ -2958,7 +2958,12 @@ echo \"adapter server ready on port {adapter_port}\"
 
 def _validate_adapter_stage_log(log: str) -> str:
     """Require a current adapter transfer failure, not a generic error."""
-    failures = list(re.finditer(r"Failed to apply policy update \d+", log))
+    failures = list(
+        re.finditer(
+            r"(?:Failed to apply policy update \d+|Policy update \d+ failed on attempt 3/3; stopping)",
+            log,
+        )
+    )
     if not failures:
         raise Refused("no failed adapter policy update is present in the orchestrator log")
     latest_failure = failures[-1]

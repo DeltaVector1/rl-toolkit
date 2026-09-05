@@ -227,6 +227,14 @@ class AdapterUpdateTest(unittest.TestCase):
             training_ops._validate_adapter_stage_log(good),
             "Failed to apply policy update 4",
         )
+        current = (
+            "Policy update 4 failed on attempt 3/3; stopping\n"
+            "TimeoutError: adapter delta staging exceeded its time limit"
+        )
+        self.assertEqual(
+            training_ops._validate_adapter_stage_log(current),
+            "Policy update 4 failed on attempt 3/3; stopping",
+        )
         with self.assertRaises(training_ops.Refused):
             training_ops._validate_adapter_stage_log(
                 "Failed to apply policy update 4\nadapter request failed"
