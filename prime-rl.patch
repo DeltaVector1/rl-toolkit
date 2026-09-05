@@ -6089,7 +6089,7 @@ index 0b87fa7..bce8800 100644
          for rollout, advantage in zip(group, advantages.tolist(), strict=True):
              rollout.assign_advantages(advantage)
 diff --git a/src/prime_rl/orchestrator/dispatcher.py b/src/prime_rl/orchestrator/dispatcher.py
-index 998ff6f..24782e6 100644
+index 998ff6f..af787d3 100644
 --- a/src/prime_rl/orchestrator/dispatcher.py
 +++ b/src/prime_rl/orchestrator/dispatcher.py
 @@ -29,6 +29,7 @@ import uuid
@@ -6100,13 +6100,11 @@ index 998ff6f..24782e6 100644
  from typing import Literal
  
  import verifiers.v1 as vf
-@@ -49,6 +50,14 @@ from prime_rl.utils.client import InferencePool, client_identity
+@@ -49,6 +50,12 @@ from prime_rl.utils.client import InferencePool, client_identity
  from prime_rl.utils.logger import get_logger
  
  
-+# Let already-running members close useful GRPO groups before a strict policy
-+# boundary cancels the remainder. This is deliberately shorter than the
-+# measured long-generation tail; the boundary still has a hard upper bound.
++# Let active requests finish their GRPO group before a policy change.
 +POLICY_GROUP_DRAIN_GRACE_S = 60
 +TRANSIENT_RETRY_WINDOW_S = 180
 +TRANSIENT_RETRIES_PER_ROLLOUT = 3
@@ -6115,7 +6113,7 @@ index 998ff6f..24782e6 100644
  class DispatcherMode(Enum):
      """Which kind of work the dispatcher schedules next."""
  
-@@ -155,18 +164,34 @@ class RolloutDispatcher:
+@@ -155,18 +162,34 @@ class RolloutDispatcher:
          # Bounded so the dispatcher backpressures on a slow sink. One entry per
          # episode — the sinks count episodes, never loose traces.
          self.out_q: asyncio.Queue[list[Rollout]] = asyncio.Queue(maxsize=max(8, self.max_inflight))
@@ -6151,7 +6149,7 @@ index 998ff6f..24782e6 100644
  
          self.stopped = asyncio.Event()
          self.task: asyncio.Task | None = None
-@@ -183,6 +208,19 @@ class RolloutDispatcher:
+@@ -183,6 +206,19 @@ class RolloutDispatcher:
      def inflight_train_count(self) -> int:
          return sum(m.rollout_count for m in self.inflight.values() if m.kind == "train")
  
@@ -6171,7 +6169,7 @@ index 998ff6f..24782e6 100644
      @property
      def inflight_eval_count(self) -> int:
          return sum(m.rollout_count for m in self.inflight.values() if m.kind == "eval")
-@@ -223,6 +261,20 @@ class RolloutDispatcher:
+@@ -223,6 +259,20 @@ class RolloutDispatcher:
          triggered eval drain naturally."""
          self.train_scheduling_disabled = True
  
@@ -6192,7 +6190,7 @@ index 998ff6f..24782e6 100644
      @property
      def max_off_policy_level(self) -> int:
          steps = [m.off_policy_steps for m in self.inflight.values() if m.kind == "train"]
-@@ -268,48 +320,133 @@ class RolloutDispatcher:
+@@ -268,48 +318,130 @@ class RolloutDispatcher:
              self.task = None
  
      async def on_version_pending(self, step: int) -> None:
@@ -6211,11 +6209,8 @@ index 998ff6f..24782e6 100644
 -            if meta.kind != "train":
 +        """Stop admission and restart incomplete live-policy groups at ``step``.
 +
-+        A fused MoE LoRA load needs an empty vLLM scheduler. Waiting for every
-+        long-tail request made policy updates take 5 to 10 minutes in x71p.
-+        Cancelling only unfinished members would corrupt the GRPO baseline, so
-+        preserve each prompt and regenerate its complete group under the new
-+        policy. Eval remains a version-pinned measurement and drains naturally.
++        A LoRA load needs an empty vLLM scheduler. Regenerate a complete group
++        after cancellation so the GRPO baseline stays valid.
 +        """
 +        # Set this before any cancellation so fill_inflight cannot schedule a
 +        # task between the snapshot and the group reset.
@@ -6354,7 +6349,7 @@ index 998ff6f..24782e6 100644
              if self.available_permits <= 0:
                  return
  
-@@ -326,7 +463,7 @@ class RolloutDispatcher:
+@@ -326,7 +458,7 @@ class RolloutDispatcher:
                  scheduled = await self.try_schedule("eval")
                  if not scheduled:
                      return
@@ -6363,7 +6358,7 @@ index 998ff6f..24782e6 100644
                  if not self.dispatch_allowed.is_set():
                      return
                  scheduled = await self.try_schedule("train")
-@@ -359,6 +496,11 @@ class RolloutDispatcher:
+@@ -359,6 +491,11 @@ class RolloutDispatcher:
              if cost <= self.available_permits:
                  return await self.schedule_group_rollout(gid, group)
  
@@ -6375,7 +6370,7 @@ index 998ff6f..24782e6 100644
          fresh = self.next_fresh_group(kind, envs)
          if fresh is None:
              return False
-@@ -375,7 +517,10 @@ class RolloutDispatcher:
+@@ -375,7 +512,10 @@ class RolloutDispatcher:
          else:
              assert self.eval_source is not None
              source = self.eval_source
@@ -6387,7 +6382,7 @@ index 998ff6f..24782e6 100644
          if example is None:
              return None
  
-@@ -383,7 +528,7 @@ class RolloutDispatcher:
+@@ -383,7 +523,7 @@ class RolloutDispatcher:
          group_size = envs.get(env_name).config.group_size
          eval_step: int | None = example.get("eval_step") if kind == "eval" else None
  
@@ -6396,7 +6391,7 @@ index 998ff6f..24782e6 100644
              kind=kind,
              env_name=env_name,
              task_idx=example["task_idx"],
-@@ -393,6 +538,9 @@ class RolloutDispatcher:
+@@ -393,6 +533,9 @@ class RolloutDispatcher:
              eval_step=eval_step,
              policy_version_at_start=self.policy.version,
          )
@@ -6406,7 +6401,7 @@ index 998ff6f..24782e6 100644
  
      async def schedule_group_rollout(self, group_id: uuid.UUID, group: GroupState) -> bool:
          """Dispatch one ``run`` / ``run_group`` task for this group.
-@@ -411,14 +559,32 @@ class RolloutDispatcher:
+@@ -411,14 +554,32 @@ class RolloutDispatcher:
          else:
              pool, model_name, live_sourced = self._train_pool_for(group.env_name)
  
@@ -6440,7 +6435,7 @@ index 998ff6f..24782e6 100644
                  client = await pool.select_train_client(load)
              if group_id not in self.groups:
                  return False
-@@ -526,13 +692,71 @@ class RolloutDispatcher:
+@@ -526,13 +687,71 @@ class RolloutDispatcher:
                  r.capture_error(exc)
              is_synth_exception = True
  
@@ -6513,7 +6508,7 @@ index 998ff6f..24782e6 100644
              if r.has_error:
                  self.metrics.record_error(kind=meta.kind, env_name=meta.env_name)
                  if not is_synth_exception and r.error is not None:
-@@ -547,6 +771,71 @@ class RolloutDispatcher:
+@@ -547,6 +766,71 @@ class RolloutDispatcher:
              for r in rollouts:
                  await self.emit_episode(meta, group, [r])
  
@@ -6585,7 +6580,7 @@ index 998ff6f..24782e6 100644
      async def emit_episode(self, meta: InflightRollout, group: GroupState | None, rollouts: list[Rollout]) -> None:
          """Stamp prime-rl metadata onto one completed episode and put it on
          ``out_q``. Pops the group from ``self.groups`` once every owed episode
-@@ -559,6 +848,7 @@ class RolloutDispatcher:
+@@ -559,6 +843,7 @@ class RolloutDispatcher:
              group.emitted += 1
              if group.emitted >= group.target_rollouts:
                  self.groups.pop(meta.group_id, None)
@@ -6593,7 +6588,7 @@ index 998ff6f..24782e6 100644
  
          for rollout in rollouts:
              rollout.kind = meta.kind
-@@ -569,6 +859,8 @@ class RolloutDispatcher:
+@@ -569,6 +854,8 @@ class RolloutDispatcher:
              if meta.kind == "eval":
                  assert eval_step is not None, "eval rollout missing eval_step"
                  rollout.eval_step = eval_step
@@ -6602,7 +6597,7 @@ index 998ff6f..24782e6 100644
          await self.out_q.put(rollouts)
  
      async def drop_group(self, group_id: uuid.UUID) -> int:
-@@ -577,6 +869,7 @@ class RolloutDispatcher:
+@@ -577,6 +864,7 @@ class RolloutDispatcher:
          (both in-flight and not-yet-scheduled). Returns the count for
          off-policy metrics."""
          group = self.groups.pop(group_id, None)
@@ -6610,7 +6605,7 @@ index 998ff6f..24782e6 100644
          task_idx = group.task_idx if group is not None else -1
  
          # Sync claim phase: pop matching tasks from ``self.inflight`` and
-@@ -666,6 +959,7 @@ class RolloutDispatcher:
+@@ -666,6 +954,7 @@ class RolloutDispatcher:
          tasks = list(self.inflight.keys())
          self.inflight.clear()
          self.groups.clear()
@@ -6618,7 +6613,7 @@ index 998ff6f..24782e6 100644
          if tasks:
              await safe_cancel_all(tasks)
  
-@@ -687,6 +981,7 @@ class RolloutDispatcher:
+@@ -687,6 +976,7 @@ class RolloutDispatcher:
              train_group_ids.add(meta.group_id)
          for gid in train_group_ids:
              self.groups.pop(gid, None)
@@ -6627,7 +6622,7 @@ index 998ff6f..24782e6 100644
              await safe_cancel_all(train_tasks)
          return cancelled
 diff --git a/src/prime_rl/orchestrator/orchestrator.py b/src/prime_rl/orchestrator/orchestrator.py
-index 400d078..66d659e 100644
+index 400d078..6beb94e 100644
 --- a/src/prime_rl/orchestrator/orchestrator.py
 +++ b/src/prime_rl/orchestrator/orchestrator.py
 @@ -22,9 +22,11 @@ in ``setup()`` and drives them from ``main_loop()``.
@@ -6680,7 +6675,7 @@ index 400d078..66d659e 100644
  from prime_rl.utils.usage_reporter import UsageReporter
  from prime_rl.utils.utils import (
      clean_exit,
-@@ -100,10 +119,52 @@ SHUTDOWN_TIMEOUT_S = 300
+@@ -100,10 +119,34 @@ SHUTDOWN_TIMEOUT_S = 300
  # dataset; fail loudly instead of spinning
  MAX_CONSECUTIVE_EMPTY_BATCHES = 10
  
@@ -6688,22 +6683,8 @@ index 400d078..66d659e 100644
 -# dispatcher is paused via ``update_dispatch_gate`` once this is exceeded;
 -# resumed when the watcher advances ``policy.version``.
 -TARGET_LAG = 1
-+# Keep one complete GRPO group beyond the exact batch target. It carries into
-+# the next batch and prevents one long-tail member of the last group from
-+# holding an otherwise complete batch. No rollout is selected or dropped.
-+# Keep several independent groups open at the tail. One spare still made x72p
-+# wait for the slowest few requests in two partially complete groups at step 3.
-+# Eight spares fill the existing 128-request cap initially. Four spares still
-+# left x72p rollout 31 at 1008/1024 behind one long member while 69 other
-+# incomplete members were buffered. Eight spares improved rollout 33 to 17m35s,
-+# but rollout 34 fell to 20 live requests with 135 members spread across open
-+# groups. Sixteen spares let freed request slots open more groups without
-+# changing the 128-request cap. A clean follow-up reached 880/1024 with 317
-+# buffered members and only 75 live; the 256-row allowance had eight credits
-+# left, less than one group, so fresh groups closed again. Thirty-two groups
-+# bound the measured partial-group backlog while the independent dispatcher
-+# limiter still enforces 128 actual in-flight requests. Completed overflow
-+# carries into the next batch; trainer batch and GRPO group sizes do not change.
++# Keep complete GRPO groups available when the last active request is slow.
++# Completed overflow carries into the next batch.
 +ROLLOUT_TAIL_SPARE_GROUPS = 32
 +
 +
@@ -6728,16 +6709,12 @@ index 400d078..66d659e 100644
 +            budget = max(budget, refill)
 +    return budget
 +
-+# A staged adapter applies at a train-batch boundary when the collecting batch
-+# is still inside the configured off-policy limit. An in-flight update restarted
-+# 19 complete GRPO groups during x72p rollout 22 and increased collection from
-+# 15 minutes to 35 minutes. Let the valid old-policy batch finish instead. The
-+# timeout keeps a genuinely wedged batch from holding an update indefinitely.
++# Let a valid old-policy batch finish before an adapter update.
 +POLICY_UPDATE_BATCH_WAIT_TIMEOUT_S = 1200
  
  # Default wait for the trainer's startup weight broadcast when no ckpt block
  # configures ``wait_for_weights_timeout`` (e.g. a from-scratch run). The
-@@ -111,6 +172,125 @@ TARGET_LAG = 1
+@@ -111,6 +154,125 @@ TARGET_LAG = 1
  STARTUP_WEIGHT_WAIT_TIMEOUT_S = 1200
  
  
@@ -6863,7 +6840,7 @@ index 400d078..66d659e 100644
  class Orchestrator:
      # Set in ``__init__``
      config: OrchestratorConfig
-@@ -148,6 +328,7 @@ class Orchestrator:
+@@ -148,6 +310,7 @@ class Orchestrator:
      eval_source: EvalSource | None
      lora_name: str | None
      resume_step: int | None
@@ -6871,7 +6848,7 @@ index 400d078..66d659e 100644
      lag_task: asyncio.Task | None
  
      def __init__(self, config: OrchestratorConfig) -> None:
-@@ -175,9 +356,12 @@ class Orchestrator:
+@@ -175,9 +338,12 @@ class Orchestrator:
          # Trigger timestamps so eval success logs can report epoch duration
          self.eval_triggered_at = {}
          self.consecutive_empty_batches = 0
@@ -6885,7 +6862,7 @@ index 400d078..66d659e 100644
          self.wait_for_policy_time = 0.0
          self.component_tasks = []
  
-@@ -193,6 +377,7 @@ class Orchestrator:
+@@ -193,6 +359,7 @@ class Orchestrator:
          self.eval_source = None
          self.lora_name = None
          self.resume_step = None
@@ -6893,7 +6870,7 @@ index 400d078..66d659e 100644
          self.lag_task = None
          self.model_express = None
  
-@@ -229,9 +414,13 @@ class Orchestrator:
+@@ -229,9 +396,13 @@ class Orchestrator:
          if self.mm_token_type_ids_mapping == {}:
              self.mm_token_type_ids_mapping = None
  
@@ -6908,7 +6885,7 @@ index 400d078..66d659e 100644
              prime_config=config.prime_monitor,
              file_config=config.file_monitor,
              output_dir=config.output_dir,
-@@ -280,10 +469,31 @@ class Orchestrator:
+@@ -280,10 +451,31 @@ class Orchestrator:
              get_logger().success("Eval environment(s) ready")
  
          if config.ckpt is not None and config.ckpt.resume_step is not None and self.ckpt_manager is not None:
@@ -6941,7 +6918,7 @@ index 400d078..66d659e 100644
  
          # Resume below may bump ``policy.version`` and the LoRA model name
          self.policy.model_name = self.policy_inference.model_name
-@@ -340,19 +550,23 @@ class Orchestrator:
+@@ -340,19 +532,23 @@ class Orchestrator:
          self.lora_name = config.model.lora.name if config.model.lora else None
  
          if self.resume_step is not None and self.ckpt_manager is not None:
@@ -6969,7 +6946,7 @@ index 400d078..66d659e 100644
              if config.weight_broadcast.type == "nixl":
                  weights_path = None
              else:
-@@ -362,9 +576,34 @@ class Orchestrator:
+@@ -362,9 +558,34 @@ class Orchestrator:
                  weights_path = get_weight_dir(
                      config.output_dir, sync_version, check_exists=check_exists, wait_timeout=wait_timeout
                  )
@@ -7005,7 +6982,7 @@ index 400d078..66d659e 100644
              if self.model_express is not None:
                  await asyncio.to_thread(self.model_express.set_status, p2p_pb2.SOURCE_STATUS_INITIALIZING)
                  # Complete the startup rendezvous before the watcher begins its next cycle.
-@@ -379,6 +618,9 @@ class Orchestrator:
+@@ -379,6 +600,9 @@ class Orchestrator:
                  self.policy_inference.update_model_name(self.lora_name)
                  self.policy.model_name = self.lora_name
              self.policy.version = sync_version
@@ -7015,7 +6992,7 @@ index 400d078..66d659e 100644
  
          self.train_source = TrainSource(self.train_envs, seed=42)
          self.eval_source: EvalSource | None = (
-@@ -412,15 +654,22 @@ class Orchestrator:
+@@ -412,15 +636,22 @@ class Orchestrator:
              mm_token_type_ids_mapping=self.mm_token_type_ids_mapping,
              batch_size=config.batch_size,
              token_batch_size=config.token_batch_size,
@@ -7039,7 +7016,7 @@ index 400d078..66d659e 100644
              lora_name=self.lora_name,
              ckpt_step=self.policy.version,
              model_express=self.model_express,
-@@ -454,6 +703,7 @@ class Orchestrator:
+@@ -454,6 +685,7 @@ class Orchestrator:
          """Run the orchestrator until shutdown. Drives setup, spawns the
          background tasks, runs the main loop in this task, then cleans up."""
          await self.setup()
@@ -7047,7 +7024,7 @@ index 400d078..66d659e 100644
          config = self.config
          get_logger().info(f"Starting orchestrator loop (max_steps={config.max_steps or 'infinite'})")
          start_time = time.perf_counter()
-@@ -464,6 +714,12 @@ class Orchestrator:
+@@ -464,6 +696,12 @@ class Orchestrator:
          # monitor each ``log.interval`` seconds for the pipeline-view log
          self.lag_task = asyncio.create_task(self.lag_monitor.run(), name="event_loop_lag")
          await self.periodic_logger.start()
@@ -7060,7 +7037,7 @@ index 400d078..66d659e 100644
          self.component_tasks = [
              asyncio.create_task(self.dispatcher.start(), name="dispatcher"),
              asyncio.create_task(self.watcher.start(), name="watcher"),
-@@ -524,6 +780,9 @@ class Orchestrator:
+@@ -524,6 +762,9 @@ class Orchestrator:
              # Train rollouts belong to the batch window currently collecting (``progress.step``),
              # eval rollouts to the step whose eval triggered them.
              kind = episode[0].kind
@@ -7070,7 +7047,7 @@ index 400d078..66d659e 100644
              step = episode[0].eval_step if kind == "eval" else self.progress.step
              assert step is not None
              run: vf.RunInfo = (
-@@ -553,10 +812,15 @@ class Orchestrator:
+@@ -553,10 +794,15 @@ class Orchestrator:
                  continue
  
              train_batch = await self.train_sink.add(episode)
@@ -7086,7 +7063,7 @@ index 400d078..66d659e 100644
  
      async def finalize_train_batch(self, batch: TrainBatch) -> None:
          """Ship one ``TrainBatch`` out to the trainer and handle the I/O
-@@ -604,13 +868,13 @@ class Orchestrator:
+@@ -604,13 +850,13 @@ class Orchestrator:
                  f"({n_trainable / len(batch.rollouts):.1%}) — consider reviewing task difficulty / filter config"
              )
  
@@ -7104,7 +7081,7 @@ index 400d078..66d659e 100644
          if not config.bench and self.policy.version < required_version:
              get_logger().info(
                  f"Holding batch {step} until the trainer publishes policy v{required_version} "
-@@ -643,7 +907,9 @@ class Orchestrator:
+@@ -643,7 +889,9 @@ class Orchestrator:
  
          await self.sender.send(TrainingBatch(examples=batch.samples, step=step))
          self.progress.step += 1
@@ -7115,7 +7092,7 @@ index 400d078..66d659e 100644
          # Checkpoint the step we just shipped (resume point: continue at step + 1).
          save_ckpt_time = await self.maybe_save_ckpt(step)
          trim_process_memory()
-@@ -744,6 +1010,13 @@ class Orchestrator:
+@@ -744,6 +992,13 @@ class Orchestrator:
          ``(console_body, wandb_payload)``. Per-env ``(env=N, …)``
          breakdowns inline only when there's more than one train / eval env;
          the eval halves drop entirely when nothing is accumulating."""
@@ -7129,7 +7106,7 @@ index 400d078..66d659e 100644
          disp_gauges = self.dispatcher.gauges()
          disp_drain = self.dispatcher.metrics.drained(
              train_envs={e.name for e in self.train_envs},
-@@ -755,6 +1028,8 @@ class Orchestrator:
+@@ -755,6 +1010,8 @@ class Orchestrator:
          inflight_by_env = self.dispatcher.inflight_by_env
          inflight_train = self.dispatcher.inflight_train_count
          inflight_eval = self.dispatcher.inflight_eval_count
@@ -7138,7 +7115,7 @@ index 400d078..66d659e 100644
          train_batch, train_target, _train_unit = self.train_sink.batch_progress()
          train_buffered = self.train_sink.buffered_count()
          train_batch_by_env = self.train_sink.pending_batch_by_env()
-@@ -771,6 +1046,10 @@ class Orchestrator:
+@@ -771,6 +1028,10 @@ class Orchestrator:
              train_batch_part += " (" + ", ".join(f"{n}={v}" for n, v in pairs) + ")"
          if train_buffered:
              train_batch_part += f" (+{train_buffered} buffered)"
@@ -7149,7 +7126,7 @@ index 400d078..66d659e 100644
  
          eval_batch_part = ""
          for env, _step, eb, exp, _ebuf in eval_batches:
-@@ -903,7 +1182,65 @@ class Orchestrator:
+@@ -903,7 +1164,63 @@ class Orchestrator:
          await asyncio.to_thread(self.ckpt_manager.save, self.progress, step)
          return time.perf_counter() - t
  
@@ -7165,9 +7142,7 @@ index 400d078..66d659e 100644
 +        )
 +        buffered = self.train_sink.buffered_count()
 +        group = max(1, getattr(self.config, "group_size", 1))
-+        # The spare is normal full-group overflow for the next step. It removes
-+        # the exact-batch barrier that held x71p step 8 at 1008 + 15 buffered
-+        # while one long-tail request finished.
++        # Full-group overflow carries into the next step.
 +        budget = rollout_budget(
 +            batch_size=self.config.batch_size,
 +            current=current,
@@ -7216,7 +7191,7 @@ index 400d078..66d659e 100644
          """Pause/resume the dispatcher based on how far the in-flight batch runs
          ahead of ``policy.version``. ``progress.step`` is always the batch being
          collected — advanced right after shipping — so both call sites (ship time
-@@ -918,42 +1255,106 @@ class Orchestrator:
+@@ -918,42 +1235,106 @@ class Orchestrator:
              and self.config.max_steps is not None
              and self.progress.step >= self.config.max_steps - 1
          )
@@ -8315,10 +8290,10 @@ index d660cd8..6c70292 100644
 +            "watcher/last_reconcile_time": self.last_reconcile_time,
          }
 diff --git a/src/prime_rl/trainer/distributed/expert_parallel.py b/src/prime_rl/trainer/distributed/expert_parallel.py
-index ed6f9ac..0fbb008 100644
+index ed6f9ac..7c93214 100644
 --- a/src/prime_rl/trainer/distributed/expert_parallel.py
 +++ b/src/prime_rl/trainer/distributed/expert_parallel.py
-@@ -1,82 +1,1836 @@
+@@ -1,82 +1,1829 @@
 +import os
 +import time
 +
@@ -8942,14 +8917,7 @@ index ed6f9ac..0fbb008 100644
 +    if received_input is not None:
 +        received_input.prepare(output_rows, cols)
 +
-+    # The operation is the sole consumer of its input, and its backward does
-+    # not need the forward values. If the input allocation is large enough for
-+    # the returned rows, reuse it for the BF16 result. Quantize the complete
-+    # source before overwriting it in that case. If routing imbalance requires
-+    # a larger result, allocate that result before any packed transport buffer
-+    # and quantize only one send round at a time. The latter ordering removed a
-+    # measured step-8 dispatch peak where a 498 MiB result had only 413.5 MiB
-+    # physically free while full packed send and receive buffers were live.
++    # Reuse input storage when it can hold the returned rows.
 +    if reuse_input:
 +        # The input and final output share storage.  Do not overwrite any BF16
 +        # source rows until every round has sent them.  Retain the compact INT4
@@ -10232,10 +10200,10 @@ index 0000000..507a930
 +    return len(group.fsdp_params)
 diff --git a/src/prime_rl/trainer/distributed/pipeline_parallel.py b/src/prime_rl/trainer/distributed/pipeline_parallel.py
 new file mode 100644
-index 0000000..df40332
+index 0000000..a04ddbd
 --- /dev/null
 +++ b/src/prime_rl/trainer/distributed/pipeline_parallel.py
-@@ -0,0 +1,334 @@
+@@ -0,0 +1,318 @@
 +"""Pipeline parallelism for the GLM MoE DSA trainer.
 +
 +Why this exists: the expert all-to-all is ~88% of every micro batch, and on this
@@ -10347,23 +10315,7 @@ index 0000000..df40332
 +    # best[(stage, start)] -> (max_cost, sum_sq_cost, boundary_list)
 +    from functools import lru_cache
 +
-+    # Balance PEAK MEMORY, not layer count. Under 1F1B stage s keeps
-+    # (pp_size - s) micro-batches live, so its footprint is
-+    #     layers * (per-layer weights + per-layer activations * in-flight)
-+    # Minimising the largest stage ignores the in-flight term and loads the
-+    # early stages hardest, which is where the host mirror hits its ceiling
-+    # first (measured x16: 488 GB shared on stage 0 versus 112 GB on stage 7).
-+    #
-+    # Weighting by activations ALONE is worse, not better: it hands the last
-+    # stage 32 of 78 layers, and weights dominate at ~1.5 GB/layer, so that
-+    # stage needs 52 GB on a 48 GB card. Both terms have to be in the cost.
-+    #
-+    # Constants measured on x16 (10-layer stage 0, 8 micro-batches in flight):
-+    #   at rest 15018 MiB  -> 1.50 GB per layer of weights
-+    #   at peak 25938 MiB  -> (25938-15018)/(10*8) = 0.137 GB per layer per
-+    #                         in-flight micro-batch
-+    # Only their ratio matters to the optimiser, so drift in absolute values is
-+    # harmless as long as weights stay roughly an order of magnitude larger.
++    # Balance weight memory and live activation memory for each stage.
 +    _GB_WEIGHTS_PER_LAYER = 1.50
 +    _GB_ACTS_PER_LAYER_PER_MICROBATCH = 0.137
 +
@@ -14572,7 +14524,7 @@ index ac360a0..0bf6f4b 100644
          threads=threads,
      )
 diff --git a/src/prime_rl/trainer/models/layers/checkpointing.py b/src/prime_rl/trainer/models/layers/checkpointing.py
-index ef4c41c..eafb8a2 100644
+index ef4c41c..cb85edd 100644
 --- a/src/prime_rl/trainer/models/layers/checkpointing.py
 +++ b/src/prime_rl/trainer/models/layers/checkpointing.py
 @@ -1,40 +1,43 @@
@@ -14741,7 +14693,7 @@ index ef4c41c..eafb8a2 100644
      if mlp is not None and _is_dense_mlp(mlp):
          supported_targets.add("mlp")
      if mlp is not None and (hasattr(mlp, "_run_routed_experts") or hasattr(mlp, "_run_local_routed_experts")):
-@@ -128,24 +183,116 @@ def set_selective_activation_checkpointing(layer: nn.Module, targets: Iterable[s
+@@ -128,24 +183,111 @@ def set_selective_activation_checkpointing(layer: nn.Module, targets: Iterable[s
      mlp = getattr(layer, "mlp", None)
      linear_attn = _get_linear_attn_module(layer)
      attn_proj_is_subsumed = "linear_attn" in enabled_targets and linear_attn is self_attn
@@ -14788,11 +14740,8 @@ index ef4c41c..eafb8a2 100644
 +    """Checkpoint a complete decoder block at its FSDP ownership boundary.
 +
 +    FSDP installs its pre-backward unshard hook on the block output. Reentrant
-+    checkpoint recomputation starts only after that hook has restored the
-+    block's parameters. This is the safe native-FP8 attention path. Do not
-+    replace it with an inner non-reentrant ``attention``, ``attn_proj``, or
-+    ``mla_up_proj`` checkpoint: x53d and x54e measured all-NaN sparse Q from
-+    that ordering while ``reshard_after_forward`` was enabled.
++    checkpoint recomputation starts after that hook restores the block's
++    parameters.
 +    """
 +
 +    checkpoint_method(
@@ -14810,9 +14759,7 @@ index ef4c41c..eafb8a2 100644
 +
 +    The checkpoint stays reentrant. The owning decoder block remains the FSDP
 +    unit, so its output pre-backward hook restores the FP8 parameters before
-+    attention recompute starts. MLP activations remain eager. Do not replace
-+    this with the selective non-reentrant ``attention`` target; x53d and x54e
-+    measured nonfinite sparse-Q activations in that ordering.
++    attention recompute starts. MLP activations remain eager.
 +    """
 +
 +    self_attn = getattr(layer, "self_attn", None)
@@ -14867,10 +14814,10 @@ index ef4c41c..eafb8a2 100644
      return type(layer).__module__.startswith("prime_rl.trainer.models.")
 diff --git a/src/prime_rl/trainer/models/layers/fp8_ada.py b/src/prime_rl/trainer/models/layers/fp8_ada.py
 new file mode 100644
-index 0000000..051e9ac
+index 0000000..14ea839
 --- /dev/null
 +++ b/src/prime_rl/trainer/models/layers/fp8_ada.py
-@@ -0,0 +1,3178 @@
+@@ -0,0 +1,3151 @@
 +import math
 +import os
 +import re
@@ -16477,11 +16424,7 @@ index 0000000..051e9ac
 +            x.shape[0], 1, output_size, device=x.device, dtype=x.dtype
 +        )
 +    except torch.OutOfMemoryError:
-+        # A routed-row peak can coincide with allocator fragmentation. x72p
-+        # rank 18 failed a 24 MiB allocation while PyTorch reported 1.16 GiB
-+        # reserved but unallocated. Release only unused cached blocks and make
-+        # one bounded retry. A true live-set OOM still fails immediately on
-+        # the second allocation.
++        # Release unused cached blocks before one bounded retry.
 +        torch.cuda.empty_cache()
 +        out = torch.empty(
 +            x.shape[0], 1, output_size, device=x.device, dtype=x.dtype
@@ -16514,9 +16457,7 @@ index 0000000..051e9ac
 +    # backward.  The dense expert implementation has the same zero-padding
 +    # contract.
 +    result = out[:, 0]
-+    # ``out`` is new storage owned by this dispatch. An out-of-place mask made
-+    # a second 118-to-524 MiB expert result at the production shape and OOMed
-+    # x60l after the inverse-permutation allocation was removed.
++    # Mask in place to avoid a second expert result.
 +    result.masked_fill_((rows >= offsets[-1]).unsqueeze(-1), 0)
 +    return result
 +
@@ -16600,15 +16541,7 @@ index 0000000..051e9ac
 +
 +
 +def _index_select_rows_with_cache_retry(x, indices):
-+    """Gather one bounded expert row chunk, with one fragmentation retry.
-+
-+    The production allocator can have enough unused reserved memory in total
-+    while no cached block is large enough for a contiguous BF16 row gather.
-+    x74p rank 17 failed a 48 MiB gather with 179 MiB reserved but unused. A
-+    one-time cache release preserves the bounded-row path and turns that
-+    allocator-fragmentation case into physically available memory. A true
-+    live-set OOM still fails on the second allocation.
-+    """
++    """Gather rows with one retry after releasing unused cached memory."""
 +    try:
 +        return x.index_select(0, indices)
 +    except torch.OutOfMemoryError:
@@ -16617,13 +16550,7 @@ index 0000000..051e9ac
 +
 +
 +def _index_copy_real_rows_with_cache_retry(destination, indices, source, real):
-+    """Scatter one bounded real-row chunk with one fragmentation retry.
-+
-+    Keep this on PyTorch's already-loaded indexing path. A custom Triton
-+    scatter first encountered a new kernel variant during x79p step 4 and
-+    failed while loading its CUDA module at the full model live set. The
-+    4,096-row bound limits the boolean source gather to 48 MiB here.
-+    """
++    """Scatter real rows with one retry after releasing cached memory."""
 +    try:
 +        destination.index_copy_(0, indices[real].long(), source[real])
 +    except torch.OutOfMemoryError:
@@ -16703,11 +16630,7 @@ index 0000000..051e9ac
 +    def forward(ctx, x, w1, s1, w2, s2, w3, s3, offsets, owner):
 +        offload = _FP8_EXPERT_ACTIVATION_OFFLOAD and x.is_cuda
 +        if offload:
-+            # An eager 1F1B stage retains one expert context for each live
-+            # microbatch. Keeping q1 and q3 on the GPU used several GiB and
-+            # left x60m unable to allocate even a 48 MiB W2 chunk. Stream the
-+            # W1/W3 pair, retain its exact per-token FP8 values in pinned host
-+            # memory, and keep only the small inverse scales on the GPU.
++            # Keep FP8 activations in pinned host memory between passes.
 +            gated = x.new_empty(x.shape[0], w1.shape[1])
 +            q1_host = q3_host = None
 +            qs1_parts = []
@@ -16900,10 +16823,7 @@ index 0000000..051e9ac
 +                chunk_offsets,
 +                shared_input=True,
 +            )
-+            # The W2 result is hidden-size wide. Release the gathered input
-+            # before W2 allocates its output. In x72p step 39, retaining this
-+            # 24 MiB tensor left only 1.5 MiB free and the following 24 MiB
-+            # grouped-matrix output failed on rank 18.
++            # Release the gathered input before W2 allocates its output.
 +            del chunk_x, safe_indices
 +            q1, qs1 = ops.scaled_fp8_quant(z1, use_per_token_if_dynamic=True)
 +            q3, qs3 = ops.scaled_fp8_quant(z3, use_per_token_if_dynamic=True)
@@ -20449,7 +20369,7 @@ index 1ad250c..85c4267 100644
              )
          return TensorMicroBatch(
 diff --git a/src/prime_rl/trainer/rl/train.py b/src/prime_rl/trainer/rl/train.py
-index 295d3ad..543c63d 100644
+index 295d3ad..a5277ea 100644
 --- a/src/prime_rl/trainer/rl/train.py
 +++ b/src/prime_rl/trainer/rl/train.py
 @@ -1,8 +1,16 @@
@@ -21726,7 +21646,7 @@ index 295d3ad..543c63d 100644
              multi_run_manager.wait_for_run(0)
              for idx in multi_run_manager.used_idxs:
                  multi_run_manager.ready_to_update[idx] = True
-@@ -292,16 +1310,117 @@ def train(config: TrainerConfig):
+@@ -292,16 +1310,112 @@ def train(config: TrainerConfig):
          wait_for_batch_start_time = time.perf_counter()
          dataloader.wait_for_batch()
          wait_for_batch_time = time.perf_counter() - wait_for_batch_start_time
@@ -21804,12 +21724,7 @@ index 295d3ad..543c63d 100644
 +                )
 +                continue
 +
-+            # Schedule1F1B requires at least one micro-batch for each pipeline
-+            # stage. An engine restart can make almost all rollouts fail and
-+            # leave a much smaller packed trainer batch. x60r received two
-+            # micro-batches under PP8 and PyTorch stopped the complete trainer.
-+            # All ranks have already agreed on the count and identity above;
-+            # consume and discard a uniformly undersized rollout batch.
++            # Schedule1F1B needs one micro-batch for each pipeline stage.
 +            _minimum_count = torch.tensor(
 +                len(micro_batches), dtype=torch.int64, device="cuda"
 +            )
@@ -21850,7 +21765,7 @@ index 295d3ad..543c63d 100644
          memory_profiler = None
          if config.memory_profiler_path is not None:
              memory_profiler = MemoryProfiler(progress.step, config.memory_profiler_path)
-@@ -321,17 +1440,23 @@ def train(config: TrainerConfig):
+@@ -321,17 +1435,23 @@ def train(config: TrainerConfig):
          for micro_batch in micro_batches:
              mask = micro_batch["loss_mask"]
              rl_w = micro_batch["rl_weights"]
@@ -21877,7 +21792,7 @@ index 295d3ad..543c63d 100644
  
          logger.debug(f"Starting forward and backward pass ({batch_size=})")
          tensors = Tensors()  # Used to accumulate tensor statistics across micro-batches and ranks for logging
-@@ -339,22 +1464,63 @@ def train(config: TrainerConfig):
+@@ -339,22 +1459,63 @@ def train(config: TrainerConfig):
          cp_rank = parallel_dims.world_mesh["cp"].get_local_rank() if cp_enabled else 0
          cp_group = parallel_dims.world_mesh["cp"].get_group() if cp_enabled else None
          cp_size = parallel_dims.cp
@@ -21951,7 +21866,7 @@ index 295d3ad..543c63d 100644
  
              if routed_experts is None and config.enable_router_replay:
                  raise ValueError(
-@@ -370,7 +1536,11 @@ def train(config: TrainerConfig):
+@@ -370,7 +1531,11 @@ def train(config: TrainerConfig):
              # just {"pixel_values": ...} for Gemma3-VL) — we move every
              # tensor to CUDA and let the model's forward sort them.
              mm_kwargs_raw = micro_batch.get("mm_kwargs")
@@ -21964,7 +21879,7 @@ index 295d3ad..543c63d 100644
              if mm_kwargs is not None and config.model.vlm is None:
                  raise ValueError(
                      "Received multimodal samples but [model.vlm] is not set. "
-@@ -385,12 +1555,19 @@ def train(config: TrainerConfig):
+@@ -385,12 +1550,19 @@ def train(config: TrainerConfig):
              seq_lens = micro_batch["seq_lens"].to("cuda")
  
              labels = shift_tensor_left(input_ids)
@@ -21985,7 +21900,7 @@ index 295d3ad..543c63d 100644
                  if not defer_vlm_cp_to_model:
                      input_ids, position_ids = setup_cp_params(
                          input_ids,
-@@ -403,8 +1580,15 @@ def train(config: TrainerConfig):
+@@ -403,8 +1575,15 @@ def train(config: TrainerConfig):
                      )
                  seq_lens_are_pre_shard = True
                  labels = shard_for_cp(labels, cp_rank=cp_rank, cp_world_size=cp_size)
@@ -22002,7 +21917,7 @@ index 295d3ad..543c63d 100644
  
              if config.model.lora:
                  lora_num_tokens = micro_batch["lora_num_tokens"].to("cuda")
-@@ -412,20 +1596,55 @@ def train(config: TrainerConfig):
+@@ -412,20 +1591,55 @@ def train(config: TrainerConfig):
                      chunk_size = labels.shape[1]
                      # Convert to cumsum, adjust for CP chunk, convert back to num_tokens
                      cu_offsets = lora_num_tokens.cumsum(dim=0, dtype=torch.int32)
@@ -22063,7 +21978,7 @@ index 295d3ad..543c63d 100644
                  out = forward(
                      model,
                      input_ids,
-@@ -441,7 +1660,9 @@ def train(config: TrainerConfig):
+@@ -441,7 +1655,9 @@ def train(config: TrainerConfig):
  
              if out.get("logprobs") is None:
                  # VanillaOutputLinear was used - need to compute logprobs externally with per-token temps
@@ -22074,7 +21989,7 @@ index 295d3ad..543c63d 100644
                  logits = out["logits"]
                  # Per-token temperature scaling: temperatures is [batch, seq], logits is [batch, seq, vocab]
                  scaled_logits = logits / temperatures.unsqueeze(-1)
-@@ -451,15 +1672,22 @@ def train(config: TrainerConfig):
+@@ -451,15 +1667,22 @@ def train(config: TrainerConfig):
  
              if cp_enabled:
                  out["logprobs"] = gather_for_cp(out["logprobs"], cp_group)
@@ -22101,7 +22016,7 @@ index 295d3ad..543c63d 100644
              )
  
              # Compute loss
-@@ -467,12 +1695,20 @@ def train(config: TrainerConfig):
+@@ -467,12 +1690,20 @@ def train(config: TrainerConfig):
              loss, loss_tensors = compute_loss(
                  trainer_logprobs=out["logprobs"].squeeze().split(sequence_lengths),
                  inference_logprobs=inference_logprobs.squeeze().split(sequence_lengths),
@@ -22126,7 +22041,7 @@ index 295d3ad..543c63d 100644
                  rl_loss_fn=rl_loss_fn,
                  rl_scale=rl_scale,
                  ce_scale=ce_scale,
-@@ -489,7 +1725,11 @@ def train(config: TrainerConfig):
+@@ -489,7 +1720,11 @@ def train(config: TrainerConfig):
              tensors["loss"].append(loss.detach().to("cpu").unsqueeze(0))
  
              env_names = micro_batch["env_names"]
@@ -22139,7 +22054,7 @@ index 295d3ad..543c63d 100644
              env_to_indices: dict[str, list[int]] = {}
              for idx, env_name in enumerate(masked_env_names):
                  env_to_indices.setdefault(env_name, []).append(idx)
-@@ -504,18 +1744,26 @@ def train(config: TrainerConfig):
+@@ -504,18 +1739,26 @@ def train(config: TrainerConfig):
                  mismatch_mask = loss_mask
                  has_mismatch_tokens = True
              else:
@@ -22169,7 +22084,7 @@ index 295d3ad..543c63d 100644
                  ]
                  mismatch_env_to_indices: dict[str, list[int]] = {}
                  for idx, env_name in enumerate(mismatch_env_names):
-@@ -523,15 +1771,6 @@ def train(config: TrainerConfig):
+@@ -523,15 +1766,6 @@ def train(config: TrainerConfig):
                  for env_name, indices in mismatch_env_to_indices.items():
                      tensors[f"mismatch_kl/{env_name}"].append(mismatch_kl[indices])
  
@@ -22185,7 +22100,7 @@ index 295d3ad..543c63d 100644
              if is_tt_moe_model(model):
                  load_balance_stats = get_load_balance_stats(model)
                  for k, v in load_balance_stats.items():
-@@ -545,36 +1784,466 @@ def train(config: TrainerConfig):
+@@ -545,36 +1779,466 @@ def train(config: TrainerConfig):
              # Debug log with *local, micro step* stats
              micro_step_message = f"Micro Step {micro_step}/{len(micro_batches)} | Loss {tensors['loss'][-1].mean().item():.4f} | Entropy {tensors['entropy/all'][-1].mean().item():.4f}"
              if has_mismatch_tokens:
@@ -22664,7 +22579,7 @@ index 295d3ad..543c63d 100644
  
          zero_grad_ratio = get_zero_gradient_ratio(model.parameters(), parallel_dims.dp_replicate)
  
-@@ -585,16 +2254,36 @@ def train(config: TrainerConfig):
+@@ -585,16 +2249,36 @@ def train(config: TrainerConfig):
          # Update learning rate scheduler
          scheduler.step()
  
@@ -22702,7 +22617,7 @@ index 295d3ad..543c63d 100644
              broadcast_weights_time = 0
          else:
              broadcast_unused = (
-@@ -605,8 +2294,11 @@ def train(config: TrainerConfig):
+@@ -605,8 +2289,11 @@ def train(config: TrainerConfig):
              if not broadcast_unused:
                  broadcast_weights_start_time = time.perf_counter()
                  weight_broadcast.broadcast_weights(model, step=progress.step)
@@ -22716,7 +22631,7 @@ index 295d3ad..543c63d 100644
                  if config.weight_broadcast.type == "filesystem":
                      interval_to_keep = config.ckpt and config.ckpt.interval
                      weight_broadcast.maybe_clean(interval_to_keep)
-@@ -637,7 +2329,9 @@ def train(config: TrainerConfig):
+@@ -637,7 +2324,9 @@ def train(config: TrainerConfig):
                  # Single-run: Save full checkpoint
                  logger.info(f"Saving checkpoint at step {progress.step}")
                  save_ckpt_start_time = time.perf_counter()
@@ -22727,7 +22642,7 @@ index 295d3ad..543c63d 100644
                  save_ckpt_time += time.perf_counter() - save_ckpt_start_time
  
              ckpt_manager.maybe_clean()
-@@ -656,18 +2350,29 @@ def train(config: TrainerConfig):
+@@ -656,18 +2345,29 @@ def train(config: TrainerConfig):
          if memory_profiler is not None:
              memory_profiler.step()
  
@@ -22762,7 +22677,7 @@ index 295d3ad..543c63d 100644
  
          # Log step metrics
          step_time = time.perf_counter() - step_start_time
-@@ -680,7 +2385,9 @@ def train(config: TrainerConfig):
+@@ -680,7 +2380,9 @@ def train(config: TrainerConfig):
          if "max_vio/mean" in tensor_stats:
              step_message += f" | Max Vio {tensor_stats['max_vio/mean']:.4f}"
          if "routing_confidence/mean" in tensor_stats:
@@ -22773,7 +22688,7 @@ index 295d3ad..543c63d 100644
          logger.success(step_message)
  
          # Log performance metrics
-@@ -689,6 +2396,7 @@ def train(config: TrainerConfig):
+@@ -689,6 +2391,7 @@ def train(config: TrainerConfig):
              "perf/throughput_per_gpu": throughput / world.world_size,
              "perf/mfu": mfu,
              "perf/peak_memory": peak_memory,
@@ -22781,7 +22696,7 @@ index 295d3ad..543c63d 100644
              "step": progress.step,
          }
          monitor.log(perf_metrics, step=progress.step)
-@@ -710,7 +2418,9 @@ def train(config: TrainerConfig):
+@@ -710,7 +2413,9 @@ def train(config: TrainerConfig):
              tensor_stats["kl_ent_ratio/mean"] = mismatch_kl_mean / entropy_mean
  
          tensor_stats["step"] = progress.step
@@ -22792,7 +22707,7 @@ index 295d3ad..543c63d 100644
  
          # Log time metrics
          time_metrics = {
-@@ -753,7 +2463,11 @@ def train(config: TrainerConfig):
+@@ -753,7 +2458,11 @@ def train(config: TrainerConfig):
                  if config.max_concurrent_runs == 1:
                      lr = optimizer.param_groups[0]["lr"]
                  else:
@@ -22805,7 +22720,7 @@ index 295d3ad..543c63d 100644
                  run_stats.append(
                      RunStats(
                          run_id=run_id,
-@@ -785,8 +2499,6 @@ def train(config: TrainerConfig):
+@@ -785,8 +2494,6 @@ def train(config: TrainerConfig):
          prof.export_chrome_trace(trace_file)
          logger.info(f"Saved trace to {trace_file}")
  
@@ -22814,7 +22729,7 @@ index 295d3ad..543c63d 100644
      # Write final checkpoint (only for single-run mode; multi-run checkpoints are managed by MultiCheckpointManager)
      if config.max_concurrent_runs == 1 and ckpt_manager is not None:
          if not (config.ckpt and config.ckpt.weights_only):
-@@ -799,7 +2511,40 @@ def train(config: TrainerConfig):
+@@ -799,7 +2506,40 @@ def train(config: TrainerConfig):
          weight_ckpt_manager.save(progress.step, model, tokenizer)
          weight_ckpt_manager.maybe_clean()
  
@@ -24641,7 +24556,7 @@ index 0000000..ab22921
 +        os.close(common_root_fd)
 +        os.close(base_parent_fd)
 diff --git a/src/prime_rl/utils/client.py b/src/prime_rl/utils/client.py
-index 56f1403..b9b7b57 100644
+index 56f1403..ffc9a80 100644
 --- a/src/prime_rl/utils/client.py
 +++ b/src/prime_rl/utils/client.py
 @@ -1,7 +1,10 @@
@@ -25175,7 +25090,7 @@ index 56f1403..b9b7b57 100644
  ) -> None:
      """Update weights on static inference servers.
  
-@@ -413,33 +828,62 @@ async def update_weights(
+@@ -413,33 +828,55 @@ async def update_weights(
      """
      logger = get_logger()
  
@@ -25184,14 +25099,7 @@ index 56f1403..b9b7b57 100644
  
      if lora_name is not None and weight_dir is not None:
 -        await load_lora_adapter(admin_clients, lora_name, weight_dir)
-+        # vLLM's fused MoE LoRA load is a worker collective. Running it while
-+        # decode requests remain registered repeatedly stalled h200b in x64p:
-+        # the token counter stopped and EngineCore logged one unavailable
-+        # shared-memory broadcast block per minute until the watchdog restart.
-+        # The dispatcher's version-pending hook drains registered requests
-+        # before this function runs. Pause here to prevent the engine from
-+        # admitting work during the collective. Always resume, including after
-+        # a bounded load failure.
++        # Pause admission while the collective LoRA load runs.
 +        await _pause_engines(admin_clients, step=step)
 +        try:
 +            await load_lora_adapter(
@@ -25247,7 +25155,7 @@ index 56f1403..b9b7b57 100644
          finally:
              await _resume_engines(admin_clients)
  
-@@ -457,18 +901,68 @@ def _is_retryable_lora_error(exception: BaseException) -> bool:
+@@ -457,18 +894,68 @@ def _is_retryable_lora_error(exception: BaseException) -> bool:
      return False
  
  
@@ -25326,7 +25234,7 @@ index 56f1403..b9b7b57 100644
      """Make a HTTP post request to the vLLM server to load a LoRA adapter.
  
      Uses our wrapper around vLLM's /v1/load_lora_adapter. The prefix cache is not reset
-@@ -479,22 +973,50 @@ async def load_lora_adapter(admin_clients: list[AsyncClient], lora_name: str, lo
+@@ -479,22 +966,50 @@ async def load_lora_adapter(admin_clients: list[AsyncClient], lora_name: str, lo
      which can happen due to NFS propagation delays.
      """
      logger = get_logger()
