@@ -679,12 +679,6 @@ def _collect_live_glm_moe_bias_layers(
             "shape": list(value.shape),
             "sha256": hashlib.sha256(raw).hexdigest(),
         }
-        if layer_index == 3 and os.environ.get("RANK", "0") == "0":
-            data_ptr = value.data_ptr() if hasattr(value, "data_ptr") else 0
-            get_logger().info(
-                f"GLM routing layer=3 live dtype={value.dtype} id={id(value)} "
-                f"data_ptr={data_ptr} sha256={local_layers[f'model.layers.{layer_index}.mlp.expert_bias']['sha256']}"
-            )
     return local_layers
 
 
@@ -791,12 +785,6 @@ def restore_glm_moe_bias_values(
                         f"does not match layer {layer_index} target {tuple(target.shape)}"
                     )
                 source_bytes = source.contiguous().view(torch.uint8).numpy().tobytes()
-                if int(layer_index) == 3 and os.environ.get("RANK", "0") == "0":
-                    data_ptr = target.data_ptr() if hasattr(target, "data_ptr") else 0
-                    get_logger().info(
-                        f"GLM routing layer=3 before_copy dtype={target.dtype} id={id(target)} "
-                        f"data_ptr={data_ptr}"
-                    )
                 local_layers[f"model.layers.{layer_index}.mlp.expert_bias"] = {
                     "layer": int(layer_index),
                     "dtype": str(source.dtype),
@@ -810,12 +798,6 @@ def restore_glm_moe_bias_values(
                         device=target.device, dtype=torch.float32
                     ).detach().clone()
                     mlp._fp32_expert_bias_source_sha256 = _glm_moe_bias_sha256(source)
-                if int(layer_index) == 3 and os.environ.get("RANK", "0") == "0":
-                    data_ptr = target.data_ptr() if hasattr(target, "data_ptr") else 0
-                    get_logger().info(
-                        f"GLM routing layer=3 after_copy dtype={target.dtype} id={id(target)} "
-                        f"data_ptr={data_ptr}"
-                    )
                 restored += 1
 
     if restored != len(local_layers):
