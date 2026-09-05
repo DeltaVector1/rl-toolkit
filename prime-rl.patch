@@ -12462,7 +12462,7 @@ index e5b0003..f8f7887 100644
      for name, param in model.named_parameters():
          if param.requires_grad and "lora_A" not in name and "lora_B" not in name:
 diff --git a/src/prime_rl/trainer/model.py b/src/prime_rl/trainer/model.py
-index d2d6703..110d59e 100644
+index d2d6703..5046d00 100644
 --- a/src/prime_rl/trainer/model.py
 +++ b/src/prime_rl/trainer/model.py
 @@ -1,3 +1,8 @@
@@ -12640,7 +12640,7 @@ index d2d6703..110d59e 100644
              for param in mlp.router.parameters():
                  param.requires_grad = False
                  num_frozen += 1
-@@ -411,26 +493,348 @@ def freeze_moe_router(model: nn.Module) -> None:
+@@ -411,26 +493,330 @@ def freeze_moe_router(model: nn.Module) -> None:
 
 
  def apply_fp32_moe_router(model: nn.Module) -> None:
@@ -12838,12 +12838,6 @@ index d2d6703..110d59e 100644
 +            "shape": list(value.shape),
 +            "sha256": hashlib.sha256(raw).hexdigest(),
 +        }
-+        if layer_index == 3 and os.environ.get("RANK", "0") == "0":
-+            data_ptr = value.data_ptr() if hasattr(value, "data_ptr") else 0
-+            get_logger().info(
-+                f"GLM routing layer=3 live dtype={value.dtype} id={id(value)} "
-+                f"data_ptr={data_ptr} sha256={local_layers[f'model.layers.{layer_index}.mlp.expert_bias']['sha256']}"
-+            )
 +    return local_layers
 +
 +
@@ -12950,12 +12944,6 @@ index d2d6703..110d59e 100644
 +                        f"does not match layer {layer_index} target {tuple(target.shape)}"
 +                    )
 +                source_bytes = source.contiguous().view(torch.uint8).numpy().tobytes()
-+                if int(layer_index) == 3 and os.environ.get("RANK", "0") == "0":
-+                    data_ptr = target.data_ptr() if hasattr(target, "data_ptr") else 0
-+                    get_logger().info(
-+                        f"GLM routing layer=3 before_copy dtype={target.dtype} id={id(target)} "
-+                        f"data_ptr={data_ptr}"
-+                    )
 +                local_layers[f"model.layers.{layer_index}.mlp.expert_bias"] = {
 +                    "layer": int(layer_index),
 +                    "dtype": str(source.dtype),
@@ -12969,12 +12957,6 @@ index d2d6703..110d59e 100644
 +                        device=target.device, dtype=torch.float32
 +                    ).detach().clone()
 +                    mlp._fp32_expert_bias_source_sha256 = _glm_moe_bias_sha256(source)
-+                if int(layer_index) == 3 and os.environ.get("RANK", "0") == "0":
-+                    data_ptr = target.data_ptr() if hasattr(target, "data_ptr") else 0
-+                    get_logger().info(
-+                        f"GLM routing layer=3 after_copy dtype={target.dtype} id={id(target)} "
-+                        f"data_ptr={data_ptr}"
-+                    )
 +                restored += 1
 +
 +    if restored != len(local_layers):
@@ -12997,7 +12979,7 @@ index d2d6703..110d59e 100644
 
 
  def freeze_sparse_indexer(model: nn.Module) -> None:
-@@ -457,12 +861,12 @@ def freeze_sparse_indexer(model: nn.Module) -> None:
+@@ -457,12 +843,12 @@ def freeze_sparse_indexer(model: nn.Module) -> None:
 
 
  def apply_force_balanced_routing(model: nn.Module) -> None:
@@ -13012,7 +12994,7 @@ index d2d6703..110d59e 100644
          mlp = layer.mlp if hasattr(layer, "mlp") else layer.feed_forward if hasattr(layer, "feed_forward") else None
          if isinstance(mlp, (MoE, LatentMoE)):
              mlp.router.force_balanced = True
-@@ -488,7 +892,7 @@ def configure_moe_ep_backend(model: nn.Module, config: ModelConfig) -> None:
+@@ -488,7 +874,7 @@ def configure_moe_ep_backend(model: nn.Module, config: ModelConfig) -> None:
 
          configure_num_sms(config.deepep_num_sms)
      language_model = get_language_model(model)
@@ -13021,7 +13003,7 @@ index d2d6703..110d59e 100644
          if not isinstance(transformer_block.mlp, (MoE, LatentMoE)):
              continue
          transformer_block.mlp.set_ep_comm_backend(backend)
-@@ -501,11 +905,13 @@ def get_load_balance_stats(
+@@ -501,11 +887,13 @@ def get_load_balance_stats(
      per_layer_max_vio = []
      per_layer_routing_confidence = []
      language_model = get_language_model(model)
@@ -13036,7 +13018,7 @@ index d2d6703..110d59e 100644
          tokens_per_expert: torch.Tensor = block_mlp.tokens_per_expert
          num_routed_tokens = tokens_per_expert.sum() / block_mlp.router.top_k
          if try_to_avoid_padding_experts:
-@@ -590,11 +996,27 @@ def get_model(
+@@ -590,11 +978,27 @@ def get_model(
          if subconfig is not None and hasattr(subconfig, "use_cache"):
              subconfig.use_cache = False
      model_config.use_grouped_mm = config.moe_use_grouped_mm
@@ -13069,7 +13051,7 @@ index d2d6703..110d59e 100644
 
      if config.index_cache is not None:
          model_config.use_index_cache = True
-@@ -762,22 +1184,55 @@ def setup_processor(config: ModelConfig):
+@@ -762,22 +1166,55 @@ def setup_processor(config: ModelConfig):
      return processor
 
 
@@ -13127,7 +13109,7 @@ index d2d6703..110d59e 100644
              dp_mod_ep_mesh_dim_names.append("dp_replicate")
          dp_mod_ep_mesh_dim_names.append("dp_shard_mod_ep")
 
-@@ -793,50 +1248,82 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
+@@ -793,50 +1230,82 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
          get_logger().info(f"Applied FSDP to vision encoder (frozen={config.vlm.freeze_vision_encoder})")
 
      language_model = get_language_model(model, override=config.vlm.language_model_attr if is_vlm_training else None)
@@ -13239,7 +13221,7 @@ index d2d6703..110d59e 100644
      else:
          get_logger().warning("Model uses tied word embeddings, so skipping the last-layer no-reshard optimization.")
 
-@@ -845,7 +1332,7 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
+@@ -845,7 +1314,7 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
          mesh=hsdp_mesh,
          mp_policy=mp_policy,
          offload_policy=offload_policy,
@@ -13248,7 +13230,7 @@ index d2d6703..110d59e 100644
      )
 
      if not parallel_dims.ep_enabled:
-@@ -854,57 +1341,80 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
+@@ -854,57 +1323,80 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
      # if EP is enabled, d2h syncs in the dispatch/combine can interfere with FSDP prefetch, that's why we set it below manually
      # the rest of the function handles only that
 
@@ -13366,7 +13348,7 @@ index d2d6703..110d59e 100644
      torch.distributed.barrier()
 
      def _init_buffers_post_meta():
-@@ -940,7 +1450,12 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
+@@ -940,7 +1432,12 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
          snapshot_is_hf = model.is_hf_state_dict(snapshot_keys)
          snapshot_is_prime = model.is_prime_state_dict(snapshot_keys)
 
@@ -13380,7 +13362,7 @@ index d2d6703..110d59e 100644
              logger.warning(
                  "Found HF weight format in snapshot state dict and PrimeRL weight format in model state dict. Trying to auto-convert..."
              )
-@@ -977,10 +1492,17 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
+@@ -977,10 +1474,17 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
      state_dict = strip_lora_from_state_dict(state_dict)
      if model.config.tie_word_embeddings:
          state_dict.pop("lm_head.weight")
@@ -13402,7 +13384,7 @@ index d2d6703..110d59e 100644
      # Restore weight tying broken by to_empty() for HF models
      if not isinstance(model, PreTrainedModelPrimeRL) and model.config.tie_word_embeddings:
          model.tie_weights()
-@@ -1001,6 +1523,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
+@@ -1001,6 +1505,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
              generator = torch.Generator(device="cuda").manual_seed(seed_tensor.item())
          for module in lora_modules:
              module._init_lora_parameters(generator)
@@ -13410,7 +13392,7 @@ index d2d6703..110d59e 100644
      logger.debug(f"Loaded weights using HF DCP in {time.perf_counter() - load_dcp_start_time:.2f} seconds")
 
 
-@@ -1076,16 +1599,29 @@ def fix_model_post_empty(model: nn.Module):
+@@ -1076,16 +1581,29 @@ def fix_model_post_empty(model: nn.Module):
          model.model.embed_tokens.embed_scale.fill_(embed_scale)
 
 
@@ -13446,7 +13428,7 @@ index d2d6703..110d59e 100644
      selective_layers = 0
      full_layers = 0
      fallback_layer_types: set[str] = set()
-@@ -1095,7 +1631,28 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
+@@ -1095,7 +1613,28 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
          if layer_id % ac_config.freq != 0:
              continue
 
@@ -13476,7 +13458,7 @@ index d2d6703..110d59e 100644
              model_supported_targets.update(get_supported_targets(transformer_block))
              set_selective_activation_checkpointing(transformer_block, target_list)
              selective_layers += 1
-@@ -1126,19 +1683,45 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
+@@ -1126,19 +1665,45 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
          )
          return
 
@@ -13527,7 +13509,7 @@ index d2d6703..110d59e 100644
      """Swap dense linears and MoE expert GEMMs to the configured low-precision path.
 
      Runs after the LM head is injected but before LoRA / EP / FSDP so the swapped
-@@ -1152,7 +1735,54 @@ def apply_quantization(model: nn.Module, config: ModelConfig) -> None:
+@@ -1152,7 +1717,54 @@ def apply_quantization(model: nn.Module, config: ModelConfig) -> None:
          return
 
      if isinstance(quant, FP8Config):
@@ -13583,7 +13565,7 @@ index d2d6703..110d59e 100644
      elif isinstance(quant, MXFP8Config):
          capability = torch.cuda.get_device_capability()
          if capability < (10, 0):
-@@ -1166,12 +1796,58 @@ def apply_quantization(model: nn.Module, config: ModelConfig) -> None:
+@@ -1166,12 +1778,58 @@ def apply_quantization(model: nn.Module, config: ModelConfig) -> None:
 
  def apply_ep(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
      language_model = get_language_model(model)
@@ -13644,7 +13626,7 @@ index d2d6703..110d59e 100644
                      parallelize_plan = MXFP8AllToAllExpertParallel()
                  else:
                      parallelize_plan = ExpertParallel()
-@@ -1274,8 +1950,22 @@ def setup_model(
+@@ -1274,8 +1932,22 @@ def setup_model(
 
      # 1. We load to meta device by default
      model = get_model(config, device=torch.device("meta"), dtype=DTYPE_MAP[config.optimization_dtype])
@@ -13667,7 +13649,7 @@ index d2d6703..110d59e 100644
      possible_to_load_to_meta = can_reinit_empty_buffers(model)
 
      if config.debug.random_init and not possible_to_load_to_meta:
-@@ -1287,6 +1977,7 @@ def setup_model(
+@@ -1287,6 +1959,7 @@ def setup_model(
      if not possible_to_load_to_meta:
          logger.warning("Cannot load model to meta device only, loading to CPU instead.")
          model = get_model(config, device=torch.device("cpu"), dtype=DTYPE_MAP[config.optimization_dtype])
@@ -13675,7 +13657,7 @@ index d2d6703..110d59e 100644
          configure_moe_ep_backend(model, config)
 
      lm_head_chunk_size: int | None = None
-@@ -1295,7 +1986,14 @@ def setup_model(
+@@ -1295,7 +1968,14 @@ def setup_model(
 
      inject_prime_lm_head(model, chunk_size=lm_head_chunk_size)
 
@@ -13691,7 +13673,7 @@ index d2d6703..110d59e 100644
 
      frozen_vision_encoder = configure_trainable_parameters(model, config)
 
-@@ -1313,6 +2011,8 @@ def setup_model(
+@@ -1313,6 +1993,8 @@ def setup_model(
      if config.debug.force_balanced_routing:
          apply_force_balanced_routing(model)
 
@@ -13700,7 +13682,7 @@ index d2d6703..110d59e 100644
      if parallel_dims.ep_enabled:
          apply_ep(model, config, parallel_dims)
          # EP replaces params with DTensors that default to requires_grad=True,
-@@ -1333,6 +2033,7 @@ def setup_model(
+@@ -1333,6 +2015,7 @@ def setup_model(
          apply_compile(model, config.compile)
 
      setup_fsdp(model, config, parallel_dims)
@@ -13708,7 +13690,7 @@ index d2d6703..110d59e 100644
 
      if not possible_to_load_to_meta:
          _move_buffers_to_cuda(model, config)
-@@ -1356,11 +2057,15 @@ def setup_model(
+@@ -1356,11 +2039,15 @@ def setup_model(
                      model.tie_weights()
 
              _move_buffers_to_cuda(model, config)
@@ -13724,7 +13706,7 @@ index d2d6703..110d59e 100644
      return model
 
 
-@@ -1373,6 +2078,7 @@ def forward(
+@@ -1373,6 +2060,7 @@ def forward(
      labels: Int[Tensor, "batch seq"] | None = None,
      temperature: Tensor | None = None,
      routed_experts: Int[Tensor, "batch seq layers topk"] | None = None,
@@ -13732,7 +13714,7 @@ index d2d6703..110d59e 100644
      # Generic multimodal kwargs (e.g. {"pixel_values": ...,
      # "image_grid_thw": ...} for Qwen3-VL; just {"pixel_values": ...}
      # for Gemma3). Passed straight through to ``model(**kwargs)`` so
-@@ -1383,12 +2089,20 @@ def forward(
+@@ -1383,12 +2071,20 @@ def forward(
      # True when seq_lens holds the full pre-CP-shard document boundaries
      # (kept global because documents can straddle the shard cut).
      seq_lens_are_pre_shard: bool = False,
@@ -13754,7 +13736,7 @@ index d2d6703..110d59e 100644
 
      if mm_kwargs:
          # Forward the per-model multimodal tensors verbatim, plus the
-@@ -1408,6 +2122,11 @@ def forward(
+@@ -1408,6 +2104,11 @@ def forward(
 
      if routed_experts is not None:
          kwargs["routed_experts"] = routed_experts
