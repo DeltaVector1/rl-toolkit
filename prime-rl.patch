@@ -8,7 +8,7 @@ index 304d6cc..52aead1 100644
      """
 +    # Resolve the lazy export before tokenizer threads start.
 +    from transformers import AutoTokenizer  # noqa: F401
- 
+
      def factory() -> Renderer:
          tokenizer = load_tokenizer(tokenizer_name_or_path)
 diff --git a/deps/renderers/renderers/client.py b/deps/renderers/renderers/client.py
@@ -17,11 +17,11 @@ index 026df02..5679840 100644
 +++ b/deps/renderers/renderers/client.py
 @@ -18,7 +18,7 @@ from collections.abc import Mapping
  from typing import Any, cast
- 
+
  import httpx
 -from openai import AsyncOpenAI
 +from openai import APIConnectionError, AsyncOpenAI
- 
+
  from renderers.base import (
      Message,
 @@ -284,10 +284,22 @@ async def generate(
@@ -48,7 +48,7 @@ index 026df02..5679840 100644
 +                "retrying disconnected generate request (%d/2): %s", attempt + 1, exc
 +            )
 +            await asyncio.sleep(0.5 * 2**attempt)
- 
+
      choice = (data.get("choices") or [{}])[0]
      completion_ids = choice.get("token_ids") or []
 diff --git a/deps/verifiers/verifiers/v1/clients/eval.py b/deps/verifiers/verifiers/v1/clients/eval.py
@@ -58,19 +58,19 @@ index 6a7df33..1ee1567 100644
 @@ -12,8 +12,10 @@ new wire format (incl. non-OpenAI providers like Anthropic) is just a new `Diale
  change. Endpoint config (base url, api key, billing headers) comes from the client config.
  """
- 
+
 -from collections.abc import Mapping
 +import asyncio
 +import logging
  import re
 +from collections.abc import Mapping
- 
+
  import httpx
  from pydantic import ValidationError
 @@ -25,6 +27,8 @@ from verifiers.v1.errors import model_error
  from verifiers.v1.graph import PendingTurn
  from verifiers.v1.types import Response, SamplingConfig
- 
+
 +logger = logging.getLogger(__name__)
 +
  # These fields describe the localhost request, its original bytes, or its connection. HTTPX
@@ -131,7 +131,7 @@ index 96f85d7..545b5e9 100644
 @@ -1,13 +1,13 @@
  import json
  from pathlib import Path
- 
+
 -from verifiers.v1.configs.harness import HarnessConfig
 -from verifiers.v1.harness import Harness
 +from openai import APIStatusError, AsyncOpenAI
@@ -142,9 +142,9 @@ index 96f85d7..545b5e9 100644
  from verifiers.v1.runtimes import ProgramResult, Runtime
  from verifiers.v1.trace import Trace
 -from verifiers.v1.task import TaskData
- 
+
  PROGRAM_SOURCE = (Path(__file__).resolve().parent / "program.py").read_text()
- 
+
 @@ -19,12 +19,12 @@ class NullHarnessConfig(HarnessConfig):
  class NullHarness(Harness[NullHarnessConfig]):
      APPENDS_SYSTEM_PROMPT = True
@@ -154,11 +154,11 @@ index 96f85d7..545b5e9 100644
 +    SUPPORTS_MESSAGE_PROMPT = True
      EXECUTES_CODE = False
 -    NEEDS_CONTAINER = False
- 
+
      async def setup(self, runtime: Runtime) -> None:
 -        await runtime.prepare_uv_script(PROGRAM_SOURCE, self.config.resolved_env)
 +        pass
- 
+
      async def launch(
          self,
 @@ -34,9 +34,28 @@ class NullHarness(Harness[NullHarnessConfig]):
@@ -261,7 +261,7 @@ index fe6b696..d8fa5c7 100644
      WandbWithExtrasConfig,
  )
 @@ -391,6 +392,11 @@ FilterConfig: TypeAlias = Annotated[
- 
+
  class FileSystemWeightBroadcastConfig(BaseConfig):
      type: Literal["filesystem"] = "filesystem"
 +    source_url: str | None = None
@@ -269,30 +269,30 @@ index fe6b696..d8fa5c7 100644
 +
 +    source_dir: Path | None = None
 +    """Local directory exposed at ``source_url``."""
- 
- 
+
+
  class InMemoryWeightBroadcastConfig(BaseConfig):
 @@ -492,6 +498,8 @@ class OrchestratorConfig(BaseConfig):
- 
+
      wandb: WandbWithExtrasConfig | None = None
- 
+
 +    swanlab: SwanlabConfig | None = None
 +
      prime_monitor: PrimeMonitorConfig | None = None
- 
+
      file_monitor: FileMonitorConfig | None = None
 diff --git a/packages/prime-rl-configs/src/prime_rl/configs/rl.py b/packages/prime-rl-configs/src/prime_rl/configs/rl.py
 index 48b9e6a..1a3cf55 100644
 --- a/packages/prime-rl-configs/src/prime_rl/configs/rl.py
 +++ b/packages/prime-rl-configs/src/prime_rl/configs/rl.py
 @@ -150,6 +150,8 @@ class SharedNIXLWeightBroadcastConfig(SharedInMemoryWeightBroadcastConfig):
- 
+
  class SharedFileSystemWeightBroadcastConfig(BaseConfig):
      type: Literal["filesystem"] = "filesystem"
 +    source_url: str | None = None
 +    source_dir: Path | None = None
- 
- 
+
+
  SharedWeightBroadcastConfig: TypeAlias = Annotated[
 @@ -411,7 +413,10 @@ class RLConfig(BaseConfig):
              self.orchestrator.weight_broadcast = orchestrator_config_type(**common_config, **transport_config)
@@ -305,7 +305,7 @@ index 48b9e6a..1a3cf55 100644
 +            )
          if self.inference is not None:
              self.inference.weight_broadcast = InferenceWeightBroadcastConfig(type=self.weight_broadcast.type)
- 
+
 diff --git a/packages/prime-rl-configs/src/prime_rl/configs/shared.py b/packages/prime-rl-configs/src/prime_rl/configs/shared.py
 index bc28605..29574f5 100644
 --- a/packages/prime-rl-configs/src/prime_rl/configs/shared.py
@@ -313,17 +313,17 @@ index bc28605..29574f5 100644
 @@ -147,6 +147,9 @@ class ClientConfig(BaseConfig):
      admin_base_url: list[str] | None = None
      """Separate base URLs for admin operations (weight updates, health checks). When set, admin clients bypass routers and hit each server directly — used in disaggregated P/D deployments where the router must not handle admin traffic."""
- 
+
 +    adapter_origin_base_urls: list[str] | None = None
 +    """Admin URLs that host the canonical adapter source. They are staged before peer URLs."""
 +
      elastic: ElasticConfig | None = None
      """Elastic inference pool config for DNS-based service discovery. When set, ``base_url`` is ignored and inference servers are discovered dynamically via DNS."""
- 
+
 @@ -221,6 +224,16 @@ class WandbWithExtrasConfig(WandbConfig):
      """Extras logging configuration. If None, no extras are logged."""
- 
- 
+
+
 +class SwanlabConfig(BaseConfig):
 +    project: str = "prime-rl"
 +    workspace: str | None = None
@@ -336,7 +336,7 @@ index bc28605..29574f5 100644
 +
  class FileMonitorConfig(BaseConfig):
      """Enable the local JSONL metric sink (``<output_dir>/metrics.jsonl``).
- 
+
 diff --git a/packages/prime-rl-configs/src/prime_rl/configs/trainer.py b/packages/prime-rl-configs/src/prime_rl/configs/trainer.py
 index d18ce52..e10aa13 100644
 --- a/packages/prime-rl-configs/src/prime_rl/configs/trainer.py
@@ -344,10 +344,10 @@ index d18ce52..e10aa13 100644
 @@ -2,18 +2,19 @@ import warnings
  from pathlib import Path
  from typing import Annotated, Any, Literal, TypeAlias
- 
+
 -from pydantic import Field, model_validator
 +from pydantic import Field, StrictBool, model_validator
- 
+
  from prime_rl.configs.shared import (
      BaseModelConfig,
      EnvVars,
@@ -362,10 +362,10 @@ index d18ce52..e10aa13 100644
 +    ZMQTransportConfig,
  )
  from prime_rl.utils.config import BaseConfig
- 
+
 @@ -29,20 +30,40 @@ class GCConfig(BaseConfig):
- 
- 
+
+
  class ActivationCheckpointConfig(BaseConfig):
 -    mode: Literal["full", "selective"] = "full"
 -    """``full`` checkpoints whole transformer blocks; ``selective`` checkpoints only the subcomponents listed in ``targets`` inside supported custom decoder layers."""
@@ -378,10 +378,10 @@ index d18ce52..e10aa13 100644
 +        "reentrant_attention_all_experts",
 +    ] = "full"
 +    """Activation checkpoint implementation. ``full`` uses the ordinary non-reentrant whole-block wrapper. ``reentrant_block`` recomputes a complete decoder block after its FSDP pre-backward hook has restored sharded parameters. ``reentrant_attention`` uses the same safe ordering for attention only and keeps MLP activations eager. Use a reentrant mode for native-FP8 attention with ``reshard_after_forward``. ``selective`` checkpoints only the subcomponents listed in ``targets`` inside supported custom decoder layers."""
- 
+
      freq: int = Field(1, ge=1)
      """Apply activation checkpointing to every N layers."""
- 
+
      targets: list[str] = ["norm"]
 -    """Selective checkpoint targets. ``norm`` checkpoints every norm module inside selected layers. ``attn_proj`` checkpoints projection-side attention work outside the kernel (input/output projections, attention-local norms, RoPE, gating, model-specific MLA projection helpers). ``mlp`` checkpoints the entire dense MLP forward (not for MoE). ``mla_up_proj`` checkpoints MLA Q/KV up-projection where supported. ``routed_experts`` checkpoints routed expert compute in MoE layers (including LatentMoE). ``linear_attn`` checkpoints non-softmax token mixers (NemotronH Mamba, Qwen3.5-MoE GatedDeltaNet, AFMoE sliding-window attention)."""
 +    """Selective checkpoint targets. ``norm`` checkpoints every norm module inside selected layers. ``attention`` checkpoints the complete attention module. ``attn_proj`` checkpoints projection-side attention work outside the kernel (input/output projections, attention-local norms, RoPE, gating, model-specific MLA projection helpers). ``mlp`` checkpoints the entire dense MLP forward (not for MoE). ``mla_up_proj`` checkpoints MLA Q/KV up-projection where supported. ``routed_experts`` checkpoints routed expert compute in MoE layers (including LatentMoE). ``linear_attn`` checkpoints non-softmax token mixers (NemotronH Mamba, Qwen3.5-MoE GatedDeltaNet, AFMoE sliding-window attention)."""
@@ -390,7 +390,7 @@ index d18ce52..e10aa13 100644
 +    """For ``reentrant_attention_all_experts``, keep routed-expert backward
 +    state on this pipeline stage and later stages. Earlier stages still
 +    recompute routed experts. This is disabled by default."""
- 
+
      @model_validator(mode="after")
      def validate_selective_targets(self):
          self.targets = list(dict.fromkeys(self.targets))
@@ -405,26 +405,26 @@ index d18ce52..e10aa13 100644
 +                "mode='reentrant_attention_all_experts'"
 +            )
          return self
- 
- 
+
+
 @@ -99,6 +120,9 @@ class LoRAConfig(BaseConfig):
      modules_to_save: list[str] = []
      """Module names or regex patterns to keep fully trainable (not freeze). Same matching rules as ``target_modules``."""
- 
+
 +    initial_adapter_path: str | None = None
 +    """Optional PEFT adapter file or directory used to initialize slot zero before FSDP wrapping. This restores policy weights only; optimizer state is new."""
 +
- 
+
  class DebugModelConfig(BaseConfig):
      num_layers: int | None = None
 @@ -108,7 +132,7 @@ class DebugModelConfig(BaseConfig):
      """Randomly initialize the model instead of loading weights."""
- 
+
      force_balanced_routing: bool = False
 -    """Replace MoE token-choice routing with a round-robin assignment so every expert sees an equal share. Intended for fake-data smoke tests where untrained routing would otherwise OOM under severe imbalance. Gating scores are still gathered from the override indices so the forward pass stays consistent."""
 +    """Replace MoE token-choice routing with a round-robin assignment so every expert sees an equal share. Intended for balanced-routing checks where untrained routing would otherwise OOM under severe imbalance. Gating scores are still gathered from the override indices so the forward pass stays consistent."""
- 
- 
+
+
  MXFP8Recipe: TypeAlias = Literal["mxfp8_rceil", "mxfp8_rceil_wgrad_with_hp"]
 @@ -133,7 +157,24 @@ _DEFAULT_FP8_IGNORE_PATTERNS: list[str] = [
  class FP8Config(BaseConfig):
@@ -448,19 +448,19 @@ index d18ce52..e10aa13 100644
 +    w8a16_modules: list[str] = []
 +    fused_qkv_a_fp8: bool = False
 +    """Use one packed checkpoint-FP8 projection for GLM Q-A and KV-A."""
- 
- 
+
+
  class MXFP8Config(BaseConfig):
 @@ -169,11 +210,17 @@ class ModelConfig(BaseModelConfig):
      fsdp_cpu_offload: bool = False
      """Enable FSDP CPU offloading for parameters, gradients, and optimizer states. Uses pinned memory for efficient CPU↔GPU transfers."""
- 
+
 +    cold_cpu_offload: bool = False
 +    """Keep frozen embeddings, output head, routers, and shared experts on CPU between uses."""
 +
      optim_cpu_offload: bool = True
      """Offload only optimizer states (momentum, variance) to CPU, keeping weights on GPU. Avoids the H2D all-gather overhead of FSDP CPU offload while still saving GPU memory."""
- 
+
 -    reshard_after_forward: bool = True
 -    """Reshard the model after each forward pass."""
 +    reshard_after_forward: StrictBool | Literal[4] = True
@@ -468,23 +468,23 @@ index d18ce52..e10aa13 100644
 +
 +    native_fp8_expert_prefetch: bool = False
 +    """Prefetch native-FP8 expert parameters before expert compute."""
- 
+
      dp_replicate: int = 1
      """Data parallel dim where model weights are replicated."""
 @@ -181,6 +228,9 @@ class ModelConfig(BaseModelConfig):
      ep: int | Literal["auto"] = "auto"
      """Expert parallelism degree for MoE layers. 1 disables EP. ``auto`` resolves to ``min(fsdp_island_size, 8)`` for MoE models (where ``fsdp_island_size = world_size // dp_replicate``), and to 1 for non-MoE models. Set an explicit integer to override."""
- 
+
 +    global_ep: bool = False
 +    """Extend expert parallelism across the data-replica dimension."""
 +
      ep_comm_backend: EPCommBackend = "torch"
      """Communication backend for expert parallelism. ``torch`` uses TorchTitan all-to-all collectives; ``deepep`` uses DeepEP custom kernels."""
- 
+
 @@ -193,6 +243,32 @@ class ModelConfig(BaseModelConfig):
      cp: int = 1
      """Context parallelism degree. 1 disables CP."""
- 
+
 +    pp: int = 1
 +    """Pipeline parallelism degree. 1 disables PP. Splits the decoder layers into
 +    ``pp`` contiguous stages. ``pp`` is the slowest-varying mesh dimension, so with
@@ -513,19 +513,19 @@ index d18ce52..e10aa13 100644
 +
      cp_style: Literal["ring", "ulysses"] = "ring"
      """CP communication style. ``ring`` uses ring-attention all-gather/reduce-scatter (requires custom kernels per attention type). ``ulysses`` uses all-to-all to redistribute Q/K/V from sequence-sharded to head-sharded, runs vanilla attention locally on the full sequence, then all-to-all back — works out-of-the-box with any attention kernel (softmax FA, linear attention, mamba, etc.)."""
- 
+
 @@ -206,13 +282,18 @@ class ModelConfig(BaseModelConfig):
      """dtype for gradient/parameter reductions."""
- 
+
      moe_router_dtype: Literal["bfloat16", "float32"] = "float32"
 -    """Compute dtype for MoE router gates. ``float32`` (default) keeps router gate weights in fp32 through forward and backward (exempt from FSDP bf16 parameter casting) and computes the gate GEMM and routing logits in fp32, matching models trained with fp32 routing (e.g. GLM-5.x via Megatron's ``--moe-router-dtype fp32``). ``bfloat16`` computes the gate GEMM in the model compute dtype. Router score functions (sigmoid/softmax) run in fp32 regardless. Only affects the custom MoE implementation; a no-op for non-MoE and HF-impl models."""
 +    """Compute dtype for custom MoE router outputs. ``float32`` (default) computes the gate output and routing scores in fp32. GLM-MoE keeps its loaded BF16 gate weights and uses the H200-compatible BF16 gate matmul with an fp32 result. Other custom MoE routers keep the existing fp32 gate-weight behavior. ``bfloat16`` computes the gate matmul in the model compute dtype. Only affects the custom MoE implementation."""
- 
+
      moe_use_grouped_mm: bool = True
      """Use grouped mm for MoE layers. Requires compute capability ≥ 9.0."""
- 
+
      quantization: QuantizationConfig | None = None
- 
+
 +    fp8_embed_head: bool = False
 +    """Use row-wise FP8 token embeddings from a converted checkpoint."""
 +    fp8_lm_head: bool = False
@@ -533,11 +533,11 @@ index d18ce52..e10aa13 100644
 +
      index_cache: IndexCacheConfig | None = None
      """DSA IndexCache sub-configuration. If set, sparse-attention top-k indices are reused across decoder layers per the configured schedule (mirrors vLLM's IndexCache HF overrides). If None, every layer recomputes its own indices."""
- 
+
 @@ -301,10 +382,44 @@ class ModelConfig(BaseModelConfig):
- 
+
          return self
- 
+
 +    @model_validator(mode="after")
 +    def validate_local_expert_recompute(self):
 +        local_recompute = (
@@ -578,12 +578,12 @@ index d18ce52..e10aa13 100644
 -            raise ValueError("MXFP8 quantization requires model.ep_comm_backend='torch'.")
 +            raise ValueError(f"{self.quantization.type.upper()} quantization requires model.ep_comm_backend='torch'.")
          return self
- 
- 
+
+
 @@ -501,12 +616,56 @@ class FakeDataLoaderConfig(BaseConfig):
      generate_samples: bool = False
      """Generate separate samples and pack them into a single micro-batch instead of using random tensors."""
- 
+
 +    samples_per_micro_batch: int | None = Field(None, ge=1)
 +    """Generate exactly this many samples in each packed micro-batch."""
 +
@@ -617,12 +617,12 @@ index d18ce52..e10aa13 100644
 +            )
 +        return self
 +
- 
+
  class DataLoaderConfig(BaseConfig):
      fake: FakeDataLoaderConfig | None = None
      """Use a fake data loader sampling random micro-batches (for debugging)."""
- 
- 
+
+
 +class ParityGuardConfig(BaseConfig):
 +    max_unmasked_mismatch_kl: float = Field(0.1, ge=0)
 +    """Reject the step when retained-token mismatch exceeds this value."""
@@ -636,44 +636,44 @@ index d18ce52..e10aa13 100644
 +
  class BaseWeightBroadcastConfig(BaseConfig):
      pass
- 
+
 @@ -569,6 +728,9 @@ class TrainerConfig(BaseConfig):
- 
+
      data: DataLoaderConfig = DataLoaderConfig()
- 
+
 +    parity_guard: ParityGuardConfig | None = None
 +    """Optional fail-closed trainer-to-inference parity limits."""
 +
      loss: LossConfig = DefaultLossConfig()
      """Loss config for the rl loss component (see ``setup_rl_loss_fn``). The ce / ref_kl components are fixed and do not read this."""
- 
+
 @@ -582,13 +744,15 @@ class TrainerConfig(BaseConfig):
      weight_broadcast: WeightBroadcastConfig = FileSystemWeightBroadcastConfig()
      """Transport used to broadcast updated weights from trainer to inference."""
- 
+
 -    rollout_transport: TransportConfig = FileSystemTransportConfig()
 +    rollout_transport: TransportConfig = ZMQTransportConfig()
      """Transport used to ship rollouts from orchestrator to trainer."""
- 
+
      log: TrainerLogConfig = TrainerLogConfig()
- 
+
      wandb: WandbConfig | None = None
- 
+
 +    swanlab: SwanlabConfig | None = None
 +
      file_monitor: FileMonitorConfig | None = None
      """Local JSONL metric sink. If set, trainer metrics are appended to ``<output_dir>/metrics.jsonl``."""
- 
+
 @@ -628,17 +792,23 @@ class TrainerConfig(BaseConfig):
      max_concurrent_runs: int = Field(1, ge=1)
      """Maximum number of concurrent runs to allow. If 1, only one run may run at a time."""
- 
+
 -    enable_token_export: bool = False
 -    """Opt-in per-token JSONL export for rollout debugging. When enabled, writes token ids and aligned trainer metrics after each forward pass."""
 -
      env_vars: EnvVars = {}
      """Extra environment variables for the trainer process(es). Merged on top of the launcher defaults."""
- 
+
      @model_validator(mode="after")
      def deepep_disables_grad_clipping(self):
 -        if self.model.ep_comm_backend == "deepep" and self.optim.max_norm is not None:
@@ -696,7 +696,7 @@ index d18ce52..e10aa13 100644
 @@ -734,4 +904,13 @@ class TrainerConfig(BaseConfig):
          if self.enable_router_replay and self.model.impl not in ("custom", "auto"):
              raise ValueError("Router replay is only supported with the custom implementation or auto mode")
- 
+
 +        if (
 +            self.enable_router_replay
 +            and self.data.fake is not None
@@ -766,14 +766,14 @@ index 268c383..9148269 100644
 -    _hub_kernels = None  # transformers < 5.5, no patch needed
 +    hub_kernels = None
 +
- 
+
 -if _hub_kernels is not None:
 +if hub_kernels is not None:
      from huggingface_hub.errors import OfflineModeIsEnabled
- 
+
 -    _original_lazy_load_kernel = _hub_kernels.lazy_load_kernel
 +    original_lazy_load_kernel = hub_kernels.lazy_load_kernel
- 
+
 -    def _patched_lazy_load_kernel(kernel_name, mapping=_hub_kernels._KERNEL_MODULE_MAPPING):
 +    def patched_lazy_load_kernel(
 +        kernel_name,
@@ -787,7 +787,7 @@ index 268c383..9148269 100644
 -            # _patch_mamba2_use_triton_ssd() uses mamba_ssm directly.
              mapping[kernel_name] = None
              return None
- 
+
 -    _hub_kernels.lazy_load_kernel = _patched_lazy_load_kernel
 +    hub_kernels.lazy_load_kernel = patched_lazy_load_kernel
 diff --git a/src/prime_rl/inference/relay.py b/src/prime_rl/inference/relay.py
@@ -1394,10 +1394,10 @@ index 28e2f57..30ad6d9 100644
 +import time
  from argparse import Namespace
  from typing import Any
- 
+
 @@ -16,17 +19,25 @@ from vllm.logger import init_logger
  from vllm.utils.argparse_utils import FlexibleArgumentParser
- 
+
  from prime_rl.configs.inference import InferenceConfig
 -from prime_rl.utils.logger import get_logger
 -
@@ -1422,7 +1422,7 @@ index 28e2f57..30ad6d9 100644
 +from prime_rl.utils.logger import get_logger
 +
 +logger = get_logger()
- 
+
  # NOTE: Fix harmony stop token propagation for GPT-OSS models
  # Upstream issue still open: https://github.com/vllm-project/vllm/issues/22519
 @@ -37,9 +48,6 @@ monkey_patch_tokenize_params_validation()
@@ -1436,7 +1436,7 @@ index 28e2f57..30ad6d9 100644
  # replay). The chat-completions path encodes them as a base64 np.save string the PD
  # router cannot merge, which fails eval rollouts (they use chat completions). Strip
 @@ -55,6 +63,82 @@ logger = init_logger("vllm.entrypoints.openai.api_server")
- 
+
  # Create our own router for custom endpoints
  router = APIRouter()
 +lora_load_lock = asyncio.Lock()
@@ -1515,11 +1515,11 @@ index 28e2f57..30ad6d9 100644
 +        return math.isfinite(float(value))
 +    except (OverflowError, ValueError):
 +        return False
- 
- 
+
+
  def engine_client(request: Request) -> EngineClient:
 @@ -74,14 +158,35 @@ WORKER_EXTENSION_CLS = {
- 
+
  @router.post("/pause")
  async def pause(request: Request):
 -    logger.debug("Received /pause request (mode=keep, clear_cache=False)")
@@ -1537,8 +1537,8 @@ index 28e2f57..30ad6d9 100644
 +        raise
 +    _set_engine_state("paused")
      return {"status": "paused"}
- 
- 
+
+
 +@router.get("/resume_status")
 +async def resume_status():
 +    return {"state": _get_engine_state()}
@@ -1555,10 +1555,10 @@ index 28e2f57..30ad6d9 100644
 +        raise
 +    _set_engine_state("running")
      return {"status": "resumed"}
- 
- 
+
+
 @@ -94,32 +199,164 @@ async def update_weights(request: Request):
- 
+
  @router.post("/load_lora_adapter")
  async def load_lora_adapter(lora_request: LoadLoRAAdapterRequest, raw_request: Request):
 -    """Wrapper around vLLM's /v1/load_lora_adapter.
@@ -1745,13 +1745,13 @@ index 28e2f57..30ad6d9 100644
 +        return JSONResponse({"error": "checkpoint_url must be an HTTP URL"}, status_code=400)
 +    destination = await asyncio.to_thread(stage_full_checkpoint_files, source_url)
 +    return {"status": "ok", "path": destination.as_posix()}
- 
- 
+
+
  @router.get("/liveness")
 @@ -182,10 +419,10 @@ async def custom_init_app_state(
          state.serving_tokens = prime_serving
- 
- 
+
+
 -import vllm.entrypoints.openai.api_server
 -import vllm.v1.utils
 -from vllm.entrypoints.openai.api_server import build_app as _original_build_app
@@ -1760,13 +1760,13 @@ index 28e2f57..30ad6d9 100644
 +import vllm.v1.utils  # noqa: E402
 +from vllm.entrypoints.openai.api_server import build_app as _original_build_app  # noqa: E402
 +from vllm.v1.utils import run_api_server_worker_proc as _original_run_api_server_worker_proc  # noqa: E402
- 
- 
+
+
  def custom_build_app(args: Namespace, supported_tasks: tuple, model_config=None):
 @@ -221,9 +458,16 @@ def server(config: InferenceConfig, vllm_extra: dict[str, Any] | None = None):
      from vllm.entrypoints.cli.serve import run_headless, run_multi_api_server
      from vllm.entrypoints.openai.api_server import run_server
- 
+
 -    # Signal worker processes to disable LoRA on MoE layers when LoRA targets don't include experts
 -    if config.lora_target_modules and not any("expert" in m for m in config.lora_target_modules):
 +    # Shared-expert LoRA uses ordinary linear layers. Keep the fused routed-MoE
@@ -1779,7 +1779,7 @@ index 28e2f57..30ad6d9 100644
          os.environ["PRIME_NO_MOE_LORA"] = "1"
 +    else:
 +        os.environ.pop("PRIME_NO_MOE_LORA", None)
- 
+
      namespace = config.to_vllm()
      if vllm_extra:
 diff --git a/src/prime_rl/inference/vllm/worker/filesystem.py b/src/prime_rl/inference/vllm/worker/filesystem.py
@@ -1805,10 +1805,10 @@ index 1049d17..0cc8068 100644
 +from pathlib import Path
  from typing import TYPE_CHECKING
 +from urllib.parse import urlsplit, urlunsplit
- 
+
  from torch.nn import Module
  from vllm.model_executor.model_loader import DefaultModelLoader, get_model_loader
- 
+
 -from prime_rl.inference.vllm.worker.weight_transfer import load_weights_checkpoint_layerwise
 +from prime_rl.utils.checkpoint_delta import (
 +    DELTA_MANIFEST,
@@ -6015,13 +6015,13 @@ index 1049d17..0cc8068 100644
 +        os.close(cache_fd)
 +    return destination
 +
- 
+
  # This is to get type hints for the Worker class but not actually extend it at runtime as this is required by vLLM worker extension
  if TYPE_CHECKING:
 @@ -25,8 +4246,16 @@ class FileSystemWeightUpdateWorker(Worker):
          """No-op RPC used by the API server liveness endpoint."""
          return None
- 
+
 +    def stage_lora_adapter(self, source_url: str, require_delta: bool = False) -> None:
 +        stage_lora_adapter_files(source_url, require_delta=require_delta)
 +
@@ -6049,8 +6049,8 @@ index 0b87fa7..bce8800 100644
 --- a/src/prime_rl/orchestrator/algo/grpo.py
 +++ b/src/prime_rl/orchestrator/algo/grpo.py
 @@ -13,31 +13,25 @@ if TYPE_CHECKING:
- 
- 
+
+
  class GRPOAlgorithm(Algorithm):
 -    """Group Relative Policy Optimization: sample a group of rollouts from the
 -    policy per example; credit = reward minus the group mean (optionally
@@ -6059,7 +6059,7 @@ index 0b87fa7..bce8800 100644
      def __init__(self, config: GRPOAlgoConfig, policy_pool: InferencePool):
          super().__init__(config, policy_pool)
          self.length_penalty = config.length_penalty
- 
+
      async def score_group(self, group: list[Rollout]) -> None:
          rewards = torch.tensor([rollout.reward for rollout in group], dtype=torch.float32)
 -        length_penalty = self.length_penalty
@@ -6098,12 +6098,12 @@ index 998ff6f..af787d3 100644
  from enum import Enum, auto
 +from time import monotonic
  from typing import Literal
- 
+
  import verifiers.v1 as vf
 @@ -49,6 +50,12 @@ from prime_rl.utils.client import InferencePool, client_identity
  from prime_rl.utils.logger import get_logger
- 
- 
+
+
 +# Let active requests finish their GRPO group before a policy change.
 +POLICY_GROUP_DRAIN_GRACE_S = 60
 +TRANSIENT_RETRY_WINDOW_S = 180
@@ -6112,13 +6112,13 @@ index 998ff6f..af787d3 100644
 +
  class DispatcherMode(Enum):
      """Which kind of work the dispatcher schedules next."""
- 
+
 @@ -155,18 +162,34 @@ class RolloutDispatcher:
          # Bounded so the dispatcher backpressures on a slow sink. One entry per
          # episode — the sinks count episodes, never loose traces.
          self.out_q: asyncio.Queue[list[Rollout]] = asyncio.Queue(maxsize=max(8, self.max_inflight))
 +        self.queued_train_episodes = 0
- 
+
          self.mode: DispatcherMode = DispatcherMode.PREFER_TRAIN
          # Set by the orchestrator after the final train step; pipeline then
          # winds down without scheduling new train rollouts
@@ -6129,7 +6129,7 @@ index 998ff6f..af787d3 100644
          self.metrics = DispatcherMetrics()
 +        self.unhealthy_clients: dict[tuple[str, str | None], float] = {}
 +        self.transient_retries: dict[uuid.UUID, tuple[float, int]] = {}
- 
+
 -        # Orchestrator-owned gate. When clear, ``fill_inflight`` returns
 +        # Orchestrator-owned permission. When clear, ``fill_inflight`` returns
          # without scheduling new groups. The dispatcher itself doesn't know
@@ -6146,13 +6146,13 @@ index 998ff6f..af787d3 100644
 +        # boundary. Queued results with these ids must not reach a sink.
 +        self.abandoned_group_ids: set[uuid.UUID] = set()
 +        self.policy_restart_groups: dict[int, set[uuid.UUID]] = {}
- 
+
          self.stopped = asyncio.Event()
          self.task: asyncio.Task | None = None
 @@ -183,6 +206,19 @@ class RolloutDispatcher:
      def inflight_train_count(self) -> int:
          return sum(m.rollout_count for m in self.inflight.values() if m.kind == "train")
- 
+
 +
 +    @property
 +    def queued_train_count(self) -> int:
@@ -6172,7 +6172,7 @@ index 998ff6f..af787d3 100644
 @@ -223,6 +259,20 @@ class RolloutDispatcher:
          triggered eval drain naturally."""
          self.train_scheduling_disabled = True
- 
+
 +    def set_fresh_train_rollout_budget(self, budget: int) -> None:
 +        budget = max(0, budget)
 +        allowed = budget > 0
@@ -6192,7 +6192,7 @@ index 998ff6f..af787d3 100644
          steps = [m.off_policy_steps for m in self.inflight.values() if m.kind == "train"]
 @@ -268,48 +318,130 @@ class RolloutDispatcher:
              self.task = None
- 
+
      async def on_version_pending(self, step: int) -> None:
 -        """Bump off-policy counters and drop groups past
 -        ``max_off_policy_steps`` (drop_group emits ``Cancelled`` markers so
@@ -6255,7 +6255,7 @@ index 998ff6f..af787d3 100644
 +            group.policy_version_at_start = step
 +            self.groups[uuid.uuid4()] = group
 +            restarted += 1
- 
+
 -        for gid in stale_groups:
 -            removed = await self.drop_group(gid)
 -            cancelled += removed
@@ -6266,7 +6266,7 @@ index 998ff6f..af787d3 100644
 +                f"Policy v{step}: restarting {restarted} incomplete GRPO group(s) from their original prompts "
 +                f"({cancelled_rollouts} live and {discarded_episodes} completed rollout(s) discarded)"
 +            )
- 
+
 -        if cancelled:
 -            get_logger().warning(
 -                f"Cancelled {cancelled} train rollouts past max_off_policy_steps={self.max_off_policy_steps}. "
@@ -6329,13 +6329,13 @@ index 998ff6f..af787d3 100644
 +    def restarted_group_ids(self, step: int) -> set[uuid.UUID]:
 +        """Old group ids invalidated while preparing policy ``step``."""
 +        return set(self.policy_restart_groups.get(step, set()))
- 
+
      async def on_new_version(self, step: int) -> None:
 -        """No-op: the dispatcher drains in ``on_version_pending`` (pre-pause)."""
 +        """Allow scheduling after the pre-pause request drain and update."""
 +        self.weight_update_pending = False
 +        self.policy_group_drain_pending = False
- 
+
      async def fill_inflight(self) -> None:
          """Schedule new rollouts up to ``max_inflight``, honoring
          ``self.mode``. Eval scheduling ignores the orchestrator's dispatch
@@ -6348,7 +6348,7 @@ index 998ff6f..af787d3 100644
 +                return
              if self.available_permits <= 0:
                  return
- 
+
 @@ -326,7 +458,7 @@ class RolloutDispatcher:
                  scheduled = await self.try_schedule("eval")
                  if not scheduled:
@@ -6361,7 +6361,7 @@ index 998ff6f..af787d3 100644
 @@ -359,6 +491,11 @@ class RolloutDispatcher:
              if cost <= self.available_permits:
                  return await self.schedule_group_rollout(gid, group)
- 
+
 +        if kind == "train" and (
 +            not self.fresh_train_groups_allowed.is_set() or self.policy_group_drain_pending
 +        ):
@@ -6381,11 +6381,11 @@ index 998ff6f..af787d3 100644
 +        example = source.next_example(available_permits)
          if example is None:
              return None
- 
+
 @@ -383,7 +523,7 @@ class RolloutDispatcher:
          group_size = envs.get(env_name).config.group_size
          eval_step: int | None = example.get("eval_step") if kind == "eval" else None
- 
+
 -        return GroupState(
 +        fresh = GroupState(
              kind=kind,
@@ -6398,13 +6398,13 @@ index 998ff6f..af787d3 100644
 +        if kind == "train":
 +            self.fresh_train_rollout_budget -= group_size
 +        return fresh
- 
+
      async def schedule_group_rollout(self, group_id: uuid.UUID, group: GroupState) -> bool:
          """Dispatch one ``run`` / ``run_group`` task for this group.
 @@ -411,14 +554,32 @@ class RolloutDispatcher:
          else:
              pool, model_name, live_sourced = self._train_pool_for(group.env_name)
- 
+
 +        if group.pinned_client is not None and self.unhealthy_clients.get(
 +            client_identity(group.pinned_client), 0
 +        ) > monotonic():
@@ -6438,7 +6438,7 @@ index 998ff6f..af787d3 100644
 @@ -526,13 +687,71 @@ class RolloutDispatcher:
                  r.capture_error(exc)
              is_synth_exception = True
- 
+
 +        transient_policy_failure = (
 +            len(rollouts) == 1 and self._is_transient_policy_failure(rollouts[0])
 +        )
@@ -6511,7 +6511,7 @@ index 998ff6f..af787d3 100644
 @@ -547,6 +766,71 @@ class RolloutDispatcher:
              for r in rollouts:
                  await self.emit_episode(meta, group, [r])
- 
+
 +    def _is_transient_policy_failure(self, rollout: Rollout) -> bool:
 +        error = rollout.error
 +        if error is None or error.type not in ("ProviderError", "HarnessError"):
@@ -6585,7 +6585,7 @@ index 998ff6f..af787d3 100644
              if group.emitted >= group.target_rollouts:
                  self.groups.pop(meta.group_id, None)
 +                self.transient_retries.pop(meta.group_id, None)
- 
+
          for rollout in rollouts:
              rollout.kind = meta.kind
 @@ -569,6 +854,8 @@ class RolloutDispatcher:
@@ -6595,7 +6595,7 @@ index 998ff6f..af787d3 100644
 +        if meta.kind == "train":
 +            self.queued_train_episodes += 1
          await self.out_q.put(rollouts)
- 
+
      async def drop_group(self, group_id: uuid.UUID) -> int:
 @@ -577,6 +864,7 @@ class RolloutDispatcher:
          (both in-flight and not-yet-scheduled). Returns the count for
@@ -6603,7 +6603,7 @@ index 998ff6f..af787d3 100644
          group = self.groups.pop(group_id, None)
 +        self.transient_retries.pop(group_id, None)
          task_idx = group.task_idx if group is not None else -1
- 
+
          # Sync claim phase: pop matching tasks from ``self.inflight`` and
 @@ -666,6 +954,7 @@ class RolloutDispatcher:
          tasks = list(self.inflight.keys())
@@ -6612,7 +6612,7 @@ index 998ff6f..af787d3 100644
 +        self.transient_retries.clear()
          if tasks:
              await safe_cancel_all(tasks)
- 
+
 @@ -687,6 +976,7 @@ class RolloutDispatcher:
              train_group_ids.add(meta.group_id)
          for gid in train_group_ids:
@@ -6627,14 +6627,14 @@ index 400d078..6beb94e 100644
 +++ b/src/prime_rl/orchestrator/orchestrator.py
 @@ -22,9 +22,11 @@ in ``setup()`` and drives them from ``main_loop()``.
  from __future__ import annotations
- 
+
  import asyncio
 +import json
  import os
  import time
  from typing import TYPE_CHECKING
 +from urllib.request import urlopen
- 
+
  import tomli_w
  import verifiers.v1 as vf
 @@ -70,17 +72,34 @@ from prime_rl.orchestrator.utils import (
@@ -6678,7 +6678,7 @@ index 400d078..6beb94e 100644
 @@ -100,10 +119,34 @@ SHUTDOWN_TIMEOUT_S = 300
  # dataset; fail loudly instead of spinning
  MAX_CONSECUTIVE_EMPTY_BATCHES = 10
- 
+
 -# Maximum batches the orchestrator may run ahead of the trainer. The
 -# dispatcher is paused via ``update_dispatch_gate`` once this is exceeded;
 -# resumed when the watcher advances ``policy.version``.
@@ -6711,13 +6711,13 @@ index 400d078..6beb94e 100644
 +
 +# Let a valid old-policy batch finish before an adapter update.
 +POLICY_UPDATE_BATCH_WAIT_TIMEOUT_S = 1200
- 
+
  # Default wait for the trainer's startup weight broadcast when no ckpt block
  # configures ``wait_for_weights_timeout`` (e.g. a from-scratch run). The
 @@ -111,6 +154,125 @@ TARGET_LAG = 1
  STARTUP_WEIGHT_WAIT_TIMEOUT_S = 1200
- 
- 
+
+
 +def _verify_startup_adapter_delta(
 +    config: OrchestratorConfig,
 +    lora_name: str | None,
@@ -6846,7 +6846,7 @@ index 400d078..6beb94e 100644
      resume_step: int | None
 +    resume_policy_step: int | None
      lag_task: asyncio.Task | None
- 
+
      def __init__(self, config: OrchestratorConfig) -> None:
 @@ -175,9 +338,12 @@ class Orchestrator:
          # Trigger timestamps so eval success logs can report epoch duration
@@ -6861,7 +6861,7 @@ index 400d078..6beb94e 100644
 +        self.batch_completed = asyncio.Event()
          self.wait_for_policy_time = 0.0
          self.component_tasks = []
- 
+
 @@ -193,6 +359,7 @@ class Orchestrator:
          self.eval_source = None
          self.lora_name = None
@@ -6869,11 +6869,11 @@ index 400d078..6beb94e 100644
 +        self.resume_policy_step = None
          self.lag_task = None
          self.model_express = None
- 
+
 @@ -229,9 +396,13 @@ class Orchestrator:
          if self.mm_token_type_ids_mapping == {}:
              self.mm_token_type_ids_mapping = None
- 
+
 -        get_logger().info(f"Initializing monitor (wandb={config.wandb}, prime_monitor={config.prime_monitor})")
 +        get_logger().info(
 +            f"Initializing monitor (wandb={config.wandb}, swanlab={config.swanlab}, "
@@ -6887,7 +6887,7 @@ index 400d078..6beb94e 100644
              output_dir=config.output_dir,
 @@ -280,10 +451,31 @@ class Orchestrator:
              get_logger().success("Eval environment(s) ready")
- 
+
          if config.ckpt is not None and config.ckpt.resume_step is not None and self.ckpt_manager is not None:
 -            if config.ckpt.resume_step == -1:
 +            if config.ckpt.resume_step == -1 and config.ckpt.skip_progress:
@@ -6915,12 +6915,12 @@ index 400d078..6beb94e 100644
 +                config.ckpt.resume_step == -1 and config.ckpt.skip_progress
 +            ):
 +                self.resume_policy_step = self.resume_step
- 
+
          # Resume below may bump ``policy.version`` and the LoRA model name
          self.policy.model_name = self.policy_inference.model_name
 @@ -340,19 +532,23 @@ class Orchestrator:
          self.lora_name = config.model.lora.name if config.model.lora else None
- 
+
          if self.resume_step is not None and self.ckpt_manager is not None:
 -            self.ckpt_manager.load(self.progress, step=self.resume_step)
 +            if not config.ckpt.skip_progress:
@@ -6936,7 +6936,7 @@ index 400d078..6beb94e 100644
 +            )
          else:
              get_logger().info("Training from scratch")
- 
+
          # Sync inference to the incoming policy before the first step when resuming or when using
          # an in-memory transport, which rendezvouses with the trainer's startup broadcast.
 -        if self.resume_step is not None or config.weight_broadcast.type in ("nccl", "nixl"):
@@ -6989,7 +6989,7 @@ index 400d078..6beb94e 100644
 +            # Do not start rollout scheduling until every inference endpoint
 +            # exposes the exact policy that was loaded.
 +            await self.policy_inference.wait_for_ready(self.policy.model_name)
- 
+
          self.train_source = TrainSource(self.train_envs, seed=42)
          self.eval_source: EvalSource | None = (
 @@ -412,15 +636,22 @@ class Orchestrator:
@@ -7049,7 +7049,7 @@ index 400d078..6beb94e 100644
              run: vf.RunInfo = (
 @@ -553,10 +794,15 @@ class Orchestrator:
                  continue
- 
+
              train_batch = await self.train_sink.add(episode)
 +            self.dispatcher.mark_episode_consumed(kind)
 +            if train_batch is None:
@@ -7060,13 +7060,13 @@ index 400d078..6beb94e 100644
 +                self.dispatcher.set_fresh_train_rollout_budget(0)
                  await self.finalize_train_batch(train_batch)
 +                self.update_rollout_budget()
- 
+
      async def finalize_train_batch(self, batch: TrainBatch) -> None:
          """Ship one ``TrainBatch`` out to the trainer and handle the I/O
 @@ -604,13 +850,13 @@ class Orchestrator:
                  f"({n_trainable / len(batch.rollouts):.1%}) — consider reviewing task difficulty / filter config"
              )
- 
+
 -        # Ship batch ``step`` only once the trainer has published v{step-1-TARGET_LAG}.
 +        # Ship batch ``step`` only once the trainer has published a policy within the configured lag.
          # Without this, fast envs fill batches from buffered rollouts, the
@@ -7082,7 +7082,7 @@ index 400d078..6beb94e 100644
              get_logger().info(
                  f"Holding batch {step} until the trainer publishes policy v{required_version} "
 @@ -643,7 +889,9 @@ class Orchestrator:
- 
+
          await self.sender.send(TrainingBatch(examples=batch.samples, step=step))
          self.progress.step += 1
 -        self.update_dispatch_gate()
@@ -7123,13 +7123,13 @@ index 400d078..6beb94e 100644
 +            train_batch_part += f" (+{queued_train} queued)"
 +        if scheduling_train:
 +            train_batch_part += f" (+{scheduling_train} scheduling)"
- 
+
          eval_batch_part = ""
          for env, _step, eb, exp, _ebuf in eval_batches:
 @@ -903,7 +1164,63 @@ class Orchestrator:
          await asyncio.to_thread(self.ckpt_manager.save, self.progress, step)
          return time.perf_counter() - t
- 
+
 -    def update_dispatch_gate(self) -> None:
 +    def update_rollout_budget(self) -> None:
 +        if self.config.batch_size is None:
@@ -7224,7 +7224,7 @@ index 400d078..6beb94e 100644
 +                    )
 +                    self.dispatch_paused_at = None
 +            dispatch_permission.set()
- 
+
      async def on_version_pending(self, step: int) -> None:
          """``VersionObserver`` hook, fired at publish confirmation (pre-apply):
          ``policy.version`` already carries the new version, so wake a held ship."""
@@ -7239,7 +7239,7 @@ index 400d078..6beb94e 100644
 +            )
 +            self.update_rollout_budget()
          self.version_advanced.set()
- 
+
 +    async def wait_for_policy_update_boundary(self, step: int) -> None:
 +        """Let the collecting train batch ship before invalidating groups.
 +
@@ -7299,12 +7299,12 @@ index 400d078..6beb94e 100644
              await asyncio.to_thread(self.model_express.set_status, p2p_pb2.SOURCE_STATUS_INITIALIZING)
 -        self.update_dispatch_gate()
 +        self.update_dispatch_permission()
- 
+
      async def stop(self) -> None:
          """Bounded best-effort teardown of all components. Has a global
          timeout so a wedged peer can't keep the process alive forever —
          training artifacts are already persisted before this is reached."""
- 
+
 +        self.batch_completed.set()
 +
          async def teardown() -> None:
@@ -7316,8 +7316,8 @@ index 2b135ae..9376b90 100644
 +++ b/src/prime_rl/orchestrator/train_sink.py
 @@ -32,6 +32,14 @@ from prime_rl.transport import TrainingSample
  from prime_rl.utils.logger import get_logger
- 
- 
+
+
 +# Transient policy-endpoint failures are retried in the dispatcher and do not
 +# reach the sink. Repeated failures that do reach this point usually mean an
 +# environment or judge fault. Stop before the orchestrator can spend a full
@@ -7346,7 +7346,7 @@ index 2b135ae..9376b90 100644
 +        self.training_policy_version = training_policy_version
          self.pre_filters = pre_filters
          self.post_filters = post_filters
- 
+
 @@ -83,17 +95,67 @@ class TrainSink:
          # Episodes arrived per group — the finalization count (an episode may
          # add several traces to ``pending_groups`` but counts once here).
@@ -7358,12 +7358,12 @@ index 2b135ae..9376b90 100644
          # re-sums per arrival.
          self.pending_tokens: int = 0
 +        self.consecutive_errored_groups: int = 0
- 
+
          # Reset by the orchestrator after each ship via ``reset_pre_filter_stats``
          self.pre_filter_seen = 0
          self.pre_filter_dropped = 0
          self.pre_filter_dropped_by_name: dict[str, int] = {}
- 
+
 +    def _is_stale(self, rollout: Rollout) -> bool:
 +        sampler = self.train_envs.get(rollout.env_name).sampler
 +        return (
@@ -7414,7 +7414,7 @@ index 2b135ae..9376b90 100644
 +
      def group_size_for(self, env_name: str) -> int:
          return self.train_envs.get(env_name).config.group_size
- 
+
 @@ -130,9 +192,15 @@ class TrainSink:
          pushed (or left) the batch over its threshold. Arrivals into
          still-incomplete groups never ship a batch."""
@@ -7434,7 +7434,7 @@ index 2b135ae..9376b90 100644
 @@ -150,6 +218,19 @@ class TrainSink:
              return self.process_batch()
          return None
- 
+
 +    def abandon_groups(self, group_ids: set[uuid.UUID]) -> int:
 +        """Discard partial groups that will restart under a new policy.
 +
@@ -7453,7 +7453,7 @@ index 2b135ae..9376b90 100644
          message graph. Training is renderer-only across all modes (RL/OPD student, SFT teacher),
 @@ -170,9 +251,9 @@ class TrainSink:
          await self.train_envs.get(rollout.env_name).algorithm.finalize_rollout(rollout)
- 
+
      async def process_group(self, group_id: uuid.UUID) -> None:
 -        """Finalize one GRPO group: drop errored rollouts (the whole group
 -        when ``requires_group_scoring`` and any failed), assign advantages,
@@ -7548,11 +7548,11 @@ index 2b135ae..9376b90 100644
 +                f"rollouts={len(group)} | dropped complete group: untrainable member"
              )
              return
- 
+
 @@ -211,6 +343,21 @@ class TrainSink:
          # owns the grouping mechanics.
          await env.algorithm.finalize_group(survivors)
- 
+
 +        # ``Rollout.is_trainable`` becomes meaningful only after advantages
 +        # are assigned. A uniform-reward GRPO group has all-zero advantages:
 +        # shipping it consumes one of the 64 batch groups but produces no
@@ -7582,7 +7582,7 @@ index 2b135ae..9376b90 100644
 @@ -250,12 +396,22 @@ class TrainSink:
              f"reward={avg_reward:.4f} | filters: {filter_str}"
          )
- 
+
 -    def process_batch(self) -> TrainBatch:
 +    def process_batch(self) -> TrainBatch | None:
          """Pop a cohort off ``pending_batch`` (by rollout count when
@@ -7624,7 +7624,7 @@ index 8c005e1..54d792f 100644
              self.cursors[env.name] = 0
 -            self.env_costs[env.name] = env.config.group_size if env.requires_group_scoring else 1
 +            self.env_costs[env.name] = env.config.group_size
- 
+
          self.env_names = [e.name for e in self.envs]
          self.weights: list[float] = [float(e.config.ratio) for e in self.envs]
 diff --git a/src/prime_rl/orchestrator/watcher.py b/src/prime_rl/orchestrator/watcher.py
@@ -7633,7 +7633,7 @@ index d660cd8..6c70292 100644
 +++ b/src/prime_rl/orchestrator/watcher.py
 @@ -5,7 +5,12 @@ orchestrator's barrier bounds the in-flight lead."""
  from __future__ import annotations
- 
+
  import asyncio
 +import json
  import time
@@ -7641,9 +7641,9 @@ index d660cd8..6c70292 100644
 +from typing import Any
 +from urllib.parse import quote
 +from urllib.request import urlopen
- 
+
  from modelexpress import p2p_pb2
- 
+
 @@ -13,10 +18,177 @@ from prime_rl.configs.orchestrator import OrchestratorConfig
  from prime_rl.orchestrator.types import Policy, VersionObserver
  from prime_rl.trainer.rl.broadcast.nixl.model_express import ModelExpressSession
@@ -7820,8 +7820,8 @@ index d660cd8..6c70292 100644
 +    if not isinstance(manifest, dict):
 +        raise RuntimeError("published adapter manifest is not an object")
 +    return manifest, location
- 
- 
+
+
  class WeightWatcher:
 @@ -32,6 +204,7 @@ class WeightWatcher:
          lora_name: str | None,
@@ -7837,7 +7837,7 @@ index d660cd8..6c70292 100644
          self.poll_interval = poll_interval
 +        self.reconcile_interval = reconcile_interval
          self.model_express = model_express
- 
+
          self.last_update_weights_time: float = 0.0
 +        self.last_stage_weights_time: float = 0.0
 +        self.last_adapter_delta_build_time: float = -1.0
@@ -7857,7 +7857,7 @@ index d660cd8..6c70292 100644
 +        self.verified_adapter_step: int | None = ckpt_step if lora_name is not None else None
 +        self.verified_adapter_url: str | None = None
 +        self.bootstrap_staged = lora_name is None or ckpt_step != 0 or model_express is not None
- 
+
          self.task: asyncio.Task | None = None
          self.update_lock = asyncio.Lock()
 @@ -55,13 +245,56 @@ class WeightWatcher:
@@ -7881,7 +7881,7 @@ index d660cd8..6c70292 100644
                  await asyncio.sleep(self.poll_interval)
          except asyncio.CancelledError:
              return
- 
+
 +    async def stage_bootstrap_adapter(self) -> None:
 +        """Stage policy zero without loading it or advancing policy state."""
 +        broadcast_dir = get_broadcast_dir(self.config.output_dir)
@@ -7919,7 +7919,7 @@ index d660cd8..6c70292 100644
          self.stopped.set()
          # Let an in-flight apply finish before dying: the trainer blocks inside
 @@ -85,8 +318,119 @@ class WeightWatcher:
- 
+
          broadcast_dir = get_broadcast_dir(self.config.output_dir)
          latest_ckpt_step = get_latest_ckpt_step(broadcast_dir) or 0
 +        if self.lora_name is not None:
@@ -7930,7 +7930,7 @@ index d660cd8..6c70292 100644
 +                return self.ckpt_step + 1
 +            return self.ckpt_step
          return max(self.policy.version, latest_ckpt_step)
- 
+
 +    def _adapter_delta_base(
 +        self,
 +        next_step: int,
@@ -8039,7 +8039,7 @@ index d660cd8..6c70292 100644
          async with self.update_lock:
              if next_step <= self.ckpt_step:
 @@ -95,6 +439,8 @@ class WeightWatcher:
- 
+
              t0 = time.perf_counter()
              weights_path = None
 +            local_weights_path = None
@@ -8087,7 +8087,7 @@ index d660cd8..6c70292 100644
 +                        f"(build {build_time})"
 +                    )
              self.last_wait_for_ckpt_time = time.perf_counter() - t0
- 
+
 -            # Publish confirmed: the policy version advances here, before the
 -            # apply — inference pauses during the update, so nothing can generate
 -            # under the new number from the old weights, and a ship held on this
@@ -8150,7 +8150,7 @@ index d660cd8..6c70292 100644
 +                        f"Observer {type(observer).__name__}.wait_for_policy_update_boundary"
 +                        f"({next_step}) raised: {exc!r}; applying the update now"
 +                    )
- 
+
 -            # Drain off-policy rollouts BEFORE pausing the inference engines.
 -            # Aborting a rollout triggers vLLM's KV-connector cleanup (NIXL's
 -            # ``_reqs_not_processed``), which is only propagated to the workers
@@ -8166,7 +8166,7 @@ index d660cd8..6c70292 100644
                  try:
                      await observer.on_version_pending(next_step)
 @@ -136,14 +558,35 @@ class WeightWatcher:
- 
+
              get_logger().debug(f"Updating weights to step {next_step}")
              t1 = time.perf_counter()
 -            await self.inference.update_weights(weights_path, lora_name=self.lora_name, step=next_step)
@@ -8186,7 +8186,7 @@ index d660cd8..6c70292 100644
 +            self.ckpt_step = next_step
 +            self.policy.version = next_step
 +            self.current_weights_path = weights_path
- 
+
              if self.lora_name is not None:
 -                self.inference.update_model_name(self.lora_name)
 -                self.policy.model_name = self.lora_name
@@ -8201,13 +8201,13 @@ index d660cd8..6c70292 100644
 +            # rollout must not use the new policy until both inference hosts
 +            # report the adapter as visible.
 +            await self.inference.wait_for_ready(self.policy.model_name)
- 
+
              for observer in self.observers:
                  try:
 @@ -156,6 +599,70 @@ class WeightWatcher:
              if self.model_express is not None:
                  await self.wait_for_model_express_status(p2p_pb2.SOURCE_STATUS_INITIALIZING)
- 
+
 +    async def reconcile_current_policy(self) -> None:
 +        """Restore the current LoRA on endpoints that restarted after an update.
 +
@@ -8290,7 +8290,7 @@ index d660cd8..6c70292 100644
 +            "watcher/last_reconcile_time": self.last_reconcile_time,
          }
 diff --git a/src/prime_rl/trainer/distributed/expert_parallel.py b/src/prime_rl/trainer/distributed/expert_parallel.py
-index ed6f9ac..7c93214 100644
+index ed6f9ac..b354eef 100644
 --- a/src/prime_rl/trainer/distributed/expert_parallel.py
 +++ b/src/prime_rl/trainer/distributed/expert_parallel.py
 @@ -1,82 +1,1829 @@
@@ -8441,6 +8441,7 @@ index ed6f9ac..7c93214 100644
 +            f"a2a={a2a:.1f}s ({100 * a2a / max(wall, 1e-9):.0f}% of wall) | {parts}",
 +            flush=True,
 +        )
++    _ep_t0 = time.perf_counter()
 +
 +
 +def _empty_with_cache_retry(*size, **kwargs):
@@ -8450,7 +8451,6 @@ index ed6f9ac..7c93214 100644
 +    except torch.OutOfMemoryError:
 +        torch.cuda.empty_cache()
 +        return torch.empty(*size, **kwargs)
-+    _ep_t0 = time.perf_counter()
 +
 +
 +def _round_splits(
@@ -9084,8 +9084,8 @@ index ed6f9ac..7c93214 100644
 +        received_input.finish_copy(routed_input.device)
 +
 +    return dequantized
- 
- 
+
+
 -class _MXFP8Dispatch(torch.autograd.Function):
 +def _streaming_fp8_backward(
 +    grad_output,
@@ -9363,7 +9363,7 @@ index ed6f9ac..7c93214 100644
 +        ctx.backward_transport = backward_transport
 +        ctx.has_backward_transport_arg = has_backward_transport_arg
 +        return output
- 
+
      @staticmethod
      def backward(ctx, grad_output):
 -        grad_input = grad_output.new_empty((sum(ctx.input_splits),) + tuple(grad_output.shape[1:]))
@@ -9477,8 +9477,8 @@ index ed6f9ac..7c93214 100644
 +                group=group,
 +            )
          return grad_input, None, None, None
- 
- 
+
+
 -class _DequantMXGradInBwd(torch.autograd.Function):
 +def _validate_fp8_dispatch(
 +    value: torch.Tensor,
@@ -9715,7 +9715,7 @@ index ed6f9ac..7c93214 100644
 +            )
 +            received_input.finish_copy(output.device)
 +        return dequantized
- 
+
      @staticmethod
      def backward(ctx, grad_output):
 -        if isinstance(grad_output, MXTensor):
@@ -9755,8 +9755,8 @@ index ed6f9ac..7c93214 100644
 +        grad_input = grad_input.to(grad_output.dtype)
 +        grad_input.mul_(grad_scale.to(grad_output.dtype)[:, None])
 +        return grad_input, None, None, None, None, None, None
- 
- 
+
+
  class MXFP8AllToAllExpertParallel(ExpertParallel):
 +    def __init__(self, *args, **kwargs):
 +        super().__init__(*args, **kwargs)
@@ -9840,7 +9840,7 @@ index ed6f9ac..7c93214 100644
 +        if received_input is None:
 +            return routed_input, num_tokens_per_expert_group
 +        return routed_input, num_tokens_per_expert_group, received_input
- 
+
      def _token_combine(self, mod, routed_output, device_mesh):
 -        routed_output = _DequantMXGradInBwd.apply(routed_output, routed_output.dtype)
 -        return a2a_combine_hp_fwd_mxfp8_bwd(
@@ -9853,8 +9853,8 @@ index ed6f9ac..7c93214 100644
 +            self._cache_slot(self._combine_cache),
 +            None,
          )
- 
- 
+
+
 -class DeepEPExpertParallel(ParallelStyle):
 -    """Expert-parallel style backed by DeepEP dispatch/combine.
 +def _resolve_native_fp8_expert_transport(
@@ -9885,13 +9885,13 @@ index ed6f9ac..7c93214 100644
 +        local_name if active else "bf16_forward_fp8_recompute_backward",
 +        active,
 +    )
- 
+
 -    Only handles weight sharding (Shard(0) on expert dim) and stores the EP
 -    process group on the module. PrimeRL drives DeepEP dispatch/combine from
 -    `MoE.forward()` so communication stays outside the selective-AC checkpoint
 -    boundary while local expert matmuls remain checkpointable.
 -    """
- 
+
 +class NativeFP8LoRAAllToAllExpertParallel(MXFP8AllToAllExpertParallel):
 +    """Shard the native FP8 base and every routed-expert LoRA factor."""
 +
@@ -10157,7 +10157,7 @@ index ed6f9ac..7c93214 100644
 +                ),
 +            )
          mod._ep_group = device_mesh.get_group()
- 
+
      def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
 diff --git a/src/prime_rl/trainer/distributed/partial_reshard.py b/src/prime_rl/trainer/distributed/partial_reshard.py
 new file mode 100644
@@ -11976,11 +11976,11 @@ index e5b0003..f8f7887 100644
 +import math
  import re
  from typing import Dict, List
- 
+
  import torch
  import torch.nn as nn
 +import torch.nn.functional as F
- 
+
  from prime_rl.configs.trainer import LoRAConfig
 -from prime_rl.trainer.models.layers.lora import MultiLoRALinear, MultiLoRAModule
 +from prime_rl.trainer.models.layers.fp8_ada import (
@@ -12016,11 +12016,11 @@ index e5b0003..f8f7887 100644
 +)
  from prime_rl.trainer.runs import get_multi_run_manager
  from prime_rl.utils.logger import get_logger
- 
+
 @@ -67,6 +92,169 @@ def _matches_pattern(name: str, pattern: str) -> bool:
          return pattern in name.split(".")
- 
- 
+
+
 +class MultiLoRAFP8CheckpointFeedForward(MultiLoRAModule):
 +    """LoRA for an always-on shared expert with native FP8 base weights.
 +
@@ -12186,9 +12186,9 @@ index e5b0003..f8f7887 100644
 +
  def _find_target_modules(model: nn.Module, target_patterns: List[str]) -> List[str]:
      """Find all module names that match any of the target patterns.
- 
+
 @@ -79,7 +267,18 @@ def _find_target_modules(model: nn.Module, target_patterns: List[str]) -> List[s
- 
+
      for name, module in model.named_modules():
          # Check if module is Linear or one of the supported expert classes
 -        if not isinstance(module, (nn.Linear, GroupedExperts, NonGatedGroupedExperts, GptOssGroupedExperts)):
@@ -12205,12 +12205,12 @@ index e5b0003..f8f7887 100644
 +            ),
 +        ):
              continue
- 
+
          for pattern in target_patterns:
 @@ -90,6 +289,83 @@ def _find_target_modules(model: nn.Module, target_patterns: List[str]) -> List[s
      return target_modules
- 
- 
+
+
 +def _validate_glm_lora_targets(
 +    model: nn.Module,
 +    configured_patterns: List[str],
@@ -12290,16 +12290,16 @@ index e5b0003..f8f7887 100644
 +
  def _should_keep_trainable(param_name: str, modules_to_save_patterns: List[str]) -> bool:
      """Check if a parameter should remain fully trainable.
- 
+
 @@ -163,12 +439,16 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> None:
- 
+
      if not target_modules:
          raise ValueError(f"No LoRA target modules found for patterns {config.target_modules}.")
 +    _validate_glm_lora_targets(model, config.target_modules, target_modules)
- 
+
      for module_name in target_modules:
          base_module = _get_module_by_name(model, module_name)
- 
+
          # Handle Linear layers
 -        if isinstance(base_module, nn.Linear):
 +        if isinstance(
@@ -12354,10 +12354,10 @@ index e5b0003..f8f7887 100644
 +                "NonGatedGroupedExperts, or GptOssGroupedExperts. Skipping."
              )
              continue
- 
+
          lora_module.register_with_runs(get_multi_run_manager(), module_name)
          _set_module_by_name(model, module_name, lora_module)
- 
+
 +    if config.initial_adapter_path is not None:
 +        # MultiRunManager resets a slot when it discovers a new orchestrator
 +        # run. Loading here would be silently erased by that later reset.
@@ -12370,12 +12370,12 @@ index e5b0003..f8f7887 100644
 +        get_multi_run_manager().register_creation_hook(load_after_run_reset)
 +
      freeze_all_except_lora_and_specified(model, config)
- 
+
      total_params = sum(p.numel() for p in model.parameters())
 @@ -234,12 +543,69 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> None:
      logger.info(f"LoRA: {adapted_or_trainable:,} adapted or fully trainable out of {total_params:,} parameters")
- 
- 
+
+
 +def load_initial_lora_adapter(model: nn.Module, adapter_path: str, adapter_idx: int = 0) -> None:
 +    """Load one exported PEFT adapter into a freshly created MultiLoRA slot.
 +
@@ -12444,11 +12444,11 @@ index e5b0003..f8f7887 100644
 -    return False
 +    """Return whether the model contains a LoRA layer."""
 +    return any(isinstance(module, MultiLoRAModule) for module in model.modules())
- 
- 
+
+
  def clean_lora_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
 @@ -281,8 +647,11 @@ def save_lora_config(model: nn.Module, save_path, rank: int, alpha: float, dropo
- 
+
      for name, module in model.named_modules():
          if isinstance(module, MultiLoRAModule):
 -            module_suffix = name.split(".")[-1]
@@ -12458,7 +12458,7 @@ index e5b0003..f8f7887 100644
 +            else:
 +                module_suffix = name.split(".")[-1]
 +                target_modules.add(module_suffix)
- 
+
      for name, param in model.named_parameters():
          if param.requires_grad and "lora_A" not in name and "lora_B" not in name:
 diff --git a/src/prime_rl/trainer/model.py b/src/prime_rl/trainer/model.py
@@ -12533,8 +12533,8 @@ index d2d6703..110d59e 100644
  from prime_rl.utils.sequence import get_cu_seqlens_from_position_ids
 -from prime_rl.utils.utils import format_time
  from prime_rl.utils.vlm import get_language_model, get_vision_encoder, is_vlm_architecture
- 
- 
+
+
 -def pre_download_model(model_name: str) -> None:
 -    """Pre-download model from HuggingFace Hub so all nodes have cached weights before training."""
 -    if Path(model_name).exists():
@@ -12598,11 +12598,11 @@ index d2d6703..110d59e 100644
 +        for current, preceding in zip(reversed(group), reversed(group[:-1]))
 +    ]
 +    return groups, forward_pairs, backward_pairs
- 
- 
+
+
  def _patch_qwen3_5_moe_conversion_mapping():
 @@ -172,8 +242,12 @@ def _patch_qwen3_5_linear_attn_varlen():
- 
+
      def _build_cp_context(self, local_seq_len: int, device: torch.device, cu_seqlens=None):
          cp_group = getattr(self, "cp_group", None)
 -        if cp_group is None or build_cp_context is None:
@@ -12622,13 +12622,13 @@ index d2d6703..110d59e 100644
 +    is_glm_moe_dsa = getattr(getattr(model, "config", None), "model_type", None) == "glm_moe_dsa"
 +    model._glm_freeze_moe_router = True
      num_frozen = 0
- 
+
 -    for layer in language_model.layers:
 +    for layer in iter_layers(language_model.layers):
          mlp = layer.mlp if hasattr(layer, "mlp") else layer.feed_forward if hasattr(layer, "feed_forward") else None
          if mlp is None:
              continue
- 
+
          # Custom implementation: MoE/LatentMoE class with router attribute
          if isinstance(mlp, (MoE, LatentMoE)):
 +            if is_glm_moe_dsa:
@@ -12641,8 +12641,8 @@ index d2d6703..110d59e 100644
                  param.requires_grad = False
                  num_frozen += 1
 @@ -411,26 +493,348 @@ def freeze_moe_router(model: nn.Module) -> None:
- 
- 
+
+
  def apply_fp32_moe_router(model: nn.Module) -> None:
 -    """Cast MoE router gates to fp32 so routing runs in fp32 in forward and backward.
 -
@@ -12653,7 +12653,7 @@ index d2d6703..110d59e 100644
      language_model = get_language_model(model)
 +    is_glm_moe_dsa = getattr(getattr(model, "config", None), "model_type", None) == "glm_moe_dsa"
      num_routers = 0
- 
+
 -    for layer in language_model.layers:
 +    for layer in iter_layers(language_model.layers):
          mlp = layer.mlp if hasattr(layer, "mlp") else layer.feed_forward if hasattr(layer, "feed_forward") else None
@@ -12665,7 +12665,7 @@ index d2d6703..110d59e 100644
 +            if not is_glm_moe_dsa:
 +                mlp.router.to(torch.float32)
              num_routers += 1
- 
+
      # No-op for non-MoE and HF-impl models: moe_router_dtype='float32' is the default,
      # so absence of custom-impl MoE routers is the common case, not an error.
      if num_routers > 0:
@@ -12994,26 +12994,26 @@ index d2d6703..110d59e 100644
 +        value = value.to_local()
 +    value = value.detach().to(device="cpu").contiguous()
 +    return hashlib.sha256(value.view(torch.uint8).numpy().tobytes()).hexdigest()
- 
- 
+
+
  def freeze_sparse_indexer(model: nn.Module) -> None:
 @@ -457,12 +861,12 @@ def freeze_sparse_indexer(model: nn.Module) -> None:
- 
- 
+
+
  def apply_force_balanced_routing(model: nn.Module) -> None:
 -    """Force MoE token-choice routers into round-robin assignment for fake-data smoke tests."""
 +    """Force MoE token-choice routers into round-robin assignment for balanced-routing checks."""
      logger = get_logger()
      language_model = get_language_model(model)
      num_routers = 0
- 
+
 -    for layer in language_model.layers:
 +    for layer in iter_layers(language_model.layers):
          mlp = layer.mlp if hasattr(layer, "mlp") else layer.feed_forward if hasattr(layer, "feed_forward") else None
          if isinstance(mlp, (MoE, LatentMoE)):
              mlp.router.force_balanced = True
 @@ -488,7 +892,7 @@ def configure_moe_ep_backend(model: nn.Module, config: ModelConfig) -> None:
- 
+
          configure_num_sms(config.deepep_num_sms)
      language_model = get_language_model(model)
 -    for transformer_block in language_model.layers:
@@ -13066,13 +13066,13 @@ index d2d6703..110d59e 100644
 +        and config.quantization.enable_grouped_gemm
 +        and not model_config.fp8_source_checkpoint
 +    )
- 
+
      if config.index_cache is not None:
          model_config.use_index_cache = True
 @@ -762,22 +1184,55 @@ def setup_processor(config: ModelConfig):
      return processor
- 
- 
+
+
 +def _glm_router_fsdp_policy(model: nn.Module, config: ModelConfig) -> MixedPrecisionPolicy | None:
 +    model_type = getattr(getattr(model, "config", None), "model_type", None)
 +    frozen_glm = bool(getattr(config, "freeze_moe_router", False)) and model_type == "glm_moe_dsa"
@@ -13092,7 +13092,7 @@ index d2d6703..110d59e 100644
 +    cold_offload_policy: OffloadPolicy = (
 +        CPUOffloadPolicy(pin_memory=True) if config.cold_cpu_offload else offload_policy
 +    )
- 
+
 +    requested_reshard = config.reshard_after_forward
      fsdp_config = {
          "mp_policy": mp_policy,
@@ -13106,7 +13106,7 @@ index d2d6703..110d59e 100644
 +        "reshard_after_forward": True,
 +    }
 +    native_fp8 = getattr(model.config, "fp8_checkpoint", False)
- 
+
      hsdp_mesh = parallel_dims.get_mesh("hsdp")
 +    partial_reshard_mesh: DeviceMesh | None = None
 +    if type(requested_reshard) is int:
@@ -13118,7 +13118,7 @@ index d2d6703..110d59e 100644
 +            f"Keeping transformer-block parameters sharded across {requested_reshard} ranks until backward"
 +        )
 +    native_block_fsdp_config = {**packed_fsdp_config, "reshard_after_forward": True}
- 
+
      dp_mod_ep_mesh: DeviceMesh | None = None
      if parallel_dims.ep_enabled:
          dp_mod_ep_mesh_dim_names = []
@@ -13126,14 +13126,14 @@ index d2d6703..110d59e 100644
 +        if parallel_dims.dp_replicate_enabled and not parallel_dims.global_ep:
              dp_mod_ep_mesh_dim_names.append("dp_replicate")
          dp_mod_ep_mesh_dim_names.append("dp_shard_mod_ep")
- 
+
 @@ -793,50 +1248,82 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
          get_logger().info(f"Applied FSDP to vision encoder (frozen={config.vlm.freeze_vision_encoder})")
- 
+
      language_model = get_language_model(model, override=config.vlm.language_model_attr if is_vlm_training else None)
 -    transformer_layers = language_model.layers
 +    transformer_layers = iter_layers(language_model.layers)
- 
+
      for transformer_block in transformer_layers:
          block_mlp = getattr(transformer_block, "mlp", None)
 -        if parallel_dims.ep_enabled and block_mlp is not None and isinstance(block_mlp, (MoE, LatentMoE)):
@@ -13161,7 +13161,7 @@ index d2d6703..110d59e 100644
 +
 +            if parallel_dims.ep_enabled:
 +                block_mlp.experts.set_gradient_divide_factor(parallel_dims.fsdp_gradient_divide_factor)
- 
+
          if config.moe_router_dtype == "float32" and isinstance(block_mlp, (MoE, LatentMoE)):
 -            # Own FSDP unit with an fp32 policy so the gate weight is not cast to
 -            # bf16 for forward and its gradients reduce in fp32.
@@ -13181,7 +13181,7 @@ index d2d6703..110d59e 100644
 +                    offload_policy=cold_offload_policy,
 +                    reshard_after_forward=fsdp_config["reshard_after_forward"],
 +                )
- 
+
          fully_shard(
              transformer_block,
              mesh=hsdp_mesh,
@@ -13192,9 +13192,9 @@ index d2d6703..110d59e 100644
 +            install_w8a16_reshard_wait(transformer_block)
 +        if partial_reshard_mesh is not None:
 +            set_partial_reshard_mesh(transformer_block, partial_reshard_mesh)
- 
+
      shard_norm_and_lm_head = hasattr(model, "config") and not model.config.tie_word_embeddings
- 
+
      if shard_norm_and_lm_head:
 -        # This optimization breaks weight tying
 +        # This optimization breaks weight tying.
@@ -13238,7 +13238,7 @@ index d2d6703..110d59e 100644
 +            )
      else:
          get_logger().warning("Model uses tied word embeddings, so skipping the last-layer no-reshard optimization.")
- 
+
 @@ -845,7 +1332,7 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
          mesh=hsdp_mesh,
          mp_policy=mp_policy,
@@ -13246,19 +13246,19 @@ index d2d6703..110d59e 100644
 -        reshard_after_forward=config.reshard_after_forward,
 +        reshard_after_forward=fsdp_config["reshard_after_forward"],
      )
- 
+
      if not parallel_dims.ep_enabled:
 @@ -854,57 +1341,80 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
      # if EP is enabled, d2h syncs in the dispatch/combine can interfere with FSDP prefetch, that's why we set it below manually
      # the rest of the function handles only that
- 
+
 -    transformer_blocks = list(language_model.layers)
 -    next_transformer_blocks = transformer_blocks[1:] + [None]
 +    virtual_stage_blocks, forward_prefetch_pairs, backward_prefetch_pairs = _virtual_stage_prefetch_pairs(
 +        language_model
 +    )
 +    transformer_blocks = [block for group in virtual_stage_blocks for block in group]
- 
+
      embed_module = getattr(language_model, "embed_tokens", None) or getattr(language_model, "embeddings", None)
      if embed_module is not None and len(language_model.layers) > 0:
          if shard_norm_and_lm_head:
@@ -13293,14 +13293,14 @@ index d2d6703..110d59e 100644
 +            transformer_block.set_modules_to_forward_prefetch(prefetch_modules)
 +        else:
 +            transformer_block.set_modules_to_forward_prefetch([next_transformer_block])
- 
+
 -    # backward
 -    reversed_transformer_blocks = list(reversed(language_model.layers))
 -    prev_transformer_blocks = reversed_transformer_blocks[1:] + [None]
 +    if transformer_blocks and language_model.norm is not None and model.lm_head is not None:
 +        if shard_norm_and_lm_head:
 +            virtual_stage_blocks[-1][-1].set_modules_to_forward_prefetch([language_model.norm, model.lm_head])
- 
+
 +    # backward
      if language_model.norm is not None and model.lm_head is not None and len(language_model.layers) > 0:
          if shard_norm_and_lm_head:
@@ -13341,8 +13341,8 @@ index d2d6703..110d59e 100644
 +
 +    if transformer_blocks and embed_module is not None and shard_norm_and_lm_head:
 +        virtual_stage_blocks[0][0].set_modules_to_backward_prefetch([embed_module])
- 
- 
+
+
  def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
 -    device = "cpu" if config.fsdp_cpu_offload else "cuda"
 +    device = "cpu" if config.fsdp_cpu_offload or config.cold_cpu_offload else "cuda"
@@ -13364,12 +13364,12 @@ index d2d6703..110d59e 100644
 +            if not cold:
 +                module.to_empty(device="cuda", recurse=False)
      torch.distributed.barrier()
- 
+
      def _init_buffers_post_meta():
 @@ -940,7 +1450,12 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
          snapshot_is_hf = model.is_hf_state_dict(snapshot_keys)
          snapshot_is_prime = model.is_prime_state_dict(snapshot_keys)
- 
+
 -        if snapshot_is_hf and not snapshot_is_prime and model.is_prime_state_dict(model_keys):
 +        if (
 +            snapshot_is_hf
@@ -13408,12 +13408,12 @@ index d2d6703..110d59e 100644
              module._init_lora_parameters(generator)
 +    restore_glm_moe_bias_values(model, snapshot_path, parallel_dims)
      logger.debug(f"Loaded weights using HF DCP in {time.perf_counter() - load_dcp_start_time:.2f} seconds")
- 
- 
+
+
 @@ -1076,16 +1599,29 @@ def fix_model_post_empty(model: nn.Module):
          model.model.embed_tokens.embed_scale.fill_(embed_scale)
- 
- 
+
+
 -def reshard_module(model: nn.Module):
 -    for module in model.modules():
 -        if isinstance(module, FSDPModule):
@@ -13449,7 +13449,7 @@ index d2d6703..110d59e 100644
 @@ -1095,7 +1631,28 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
          if layer_id % ac_config.freq != 0:
              continue
- 
+
 -        if ac_config.mode == "selective" and supports_selective_activation_checkpointing(transformer_block):
 +        if ac_config.mode == "reentrant_block":
 +            # Keep the checkpoint boundary identical to the FSDP unit. FSDP's
@@ -13479,15 +13479,15 @@ index d2d6703..110d59e 100644
 @@ -1126,19 +1683,45 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
          )
          return
- 
+
 -    logger.info(f"Applied activation checkpointing (freq={ac_config.freq})")
 +    logger.info(
 +        f"Applied activation checkpointing (mode={ac_config.mode}, "
 +        f"freq={ac_config.freq}, layers={full_layers}, "
 +        f"keep_routed_expert_activations={keep_routed_expert_activations})"
 +    )
- 
- 
+
+
  def apply_compile(model: nn.Module, compile_config: CompileConfig):
      torch._dynamo.config.capture_scalar_outputs = True
      language_model = get_language_model(model)
@@ -13499,8 +13499,8 @@ index d2d6703..110d59e 100644
 -    get_logger().info(f"Compiled {len(language_model.layers)} layers (fullgraph={compile_config.fullgraph})")
 +        layer.compile(fullgraph=compile_config.fullgraph)
 +    get_logger().info(f"Compiled {len(layers)} layers (fullgraph={compile_config.fullgraph})")
- 
- 
+
+
 -def apply_quantization(model: nn.Module, config: ModelConfig) -> None:
 +def _fp8_ignore_patterns(quant: FP8Config) -> list[str]:
 +    return [
@@ -13525,11 +13525,11 @@ index d2d6703..110d59e 100644
 +    parallel_dims: ParallelDims | None = None,
 +) -> None:
      """Swap dense linears and MoE expert GEMMs to the configured low-precision path.
- 
+
      Runs after the LM head is injected but before LoRA / EP / FSDP so the swapped
 @@ -1152,7 +1735,54 @@ def apply_quantization(model: nn.Module, config: ModelConfig) -> None:
          return
- 
+
      if isinstance(quant, FP8Config):
 -        replace_linear_with_fp8_blockwise_linear(model, ignore_modules=quant.ignore_patterns)
 +        set_diagnose_linear_backward(quant.diagnose_linear_backward)
@@ -13584,7 +13584,7 @@ index d2d6703..110d59e 100644
          capability = torch.cuda.get_device_capability()
          if capability < (10, 0):
 @@ -1166,12 +1796,58 @@ def apply_quantization(model: nn.Module, config: ModelConfig) -> None:
- 
+
  def apply_ep(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
      language_model = get_language_model(model)
 -    for transformer_block in language_model.layers:
@@ -13645,12 +13645,12 @@ index d2d6703..110d59e 100644
                  else:
                      parallelize_plan = ExpertParallel()
 @@ -1274,8 +1950,22 @@ def setup_model(
- 
+
      # 1. We load to meta device by default
      model = get_model(config, device=torch.device("meta"), dtype=DTYPE_MAP[config.optimization_dtype])
 +    model._glm_freeze_moe_router = bool(config.freeze_moe_router)
      configure_moe_ep_backend(model, config)
- 
+
 +    # Trim to this rank's pipeline stage before anything else touches the model,
 +    # so quantization, LoRA, EP sharding, AC and FSDP only ever see the layers
 +    # this rank owns. Doing it here also means the checkpoint loader below only
@@ -13665,7 +13665,7 @@ index d2d6703..110d59e 100644
 +        preserve_glm_moe_bias_precision(model)
 +
      possible_to_load_to_meta = can_reinit_empty_buffers(model)
- 
+
      if config.debug.random_init and not possible_to_load_to_meta:
 @@ -1287,6 +1977,7 @@ def setup_model(
      if not possible_to_load_to_meta:
@@ -13673,12 +13673,12 @@ index d2d6703..110d59e 100644
          model = get_model(config, device=torch.device("cpu"), dtype=DTYPE_MAP[config.optimization_dtype])
 +        model._glm_freeze_moe_router = bool(config.freeze_moe_router)
          configure_moe_ep_backend(model, config)
- 
+
      lm_head_chunk_size: int | None = None
 @@ -1295,7 +1986,14 @@ def setup_model(
- 
+
      inject_prime_lm_head(model, chunk_size=lm_head_chunk_size)
- 
+
 -    apply_quantization(model, config)
 +    # Drop norm/head on non-final stages only after the head has been injected,
 +    # since inject_prime_lm_head requires a real nn.Linear to replace.
@@ -13688,13 +13688,13 @@ index d2d6703..110d59e 100644
 +        apply_pp_boundaries(model, pp_rank, parallel_dims.pp)
 +
 +    apply_quantization(model, config, parallel_dims)
- 
+
      frozen_vision_encoder = configure_trainable_parameters(model, config)
- 
+
 @@ -1313,6 +2011,8 @@ def setup_model(
      if config.debug.force_balanced_routing:
          apply_force_balanced_routing(model)
- 
+
 +    preserve_glm_moe_bias_precision(model)
 +
      if parallel_dims.ep_enabled:
@@ -13702,28 +13702,28 @@ index d2d6703..110d59e 100644
          # EP replaces params with DTensors that default to requires_grad=True,
 @@ -1333,6 +2033,7 @@ def setup_model(
          apply_compile(model, config.compile)
- 
+
      setup_fsdp(model, config, parallel_dims)
 +    preserve_glm_moe_bias_precision(model)
- 
+
      if not possible_to_load_to_meta:
          _move_buffers_to_cuda(model, config)
 @@ -1356,11 +2057,15 @@ def setup_model(
                      model.tie_weights()
- 
+
              _move_buffers_to_cuda(model, config)
 +            preserve_glm_moe_bias_precision(model)
          # - or load from HF with dcp
          else:
              load_dcp_from_hf(model, config, parallel_dims)
 +            preserve_glm_moe_bias_precision(model)
- 
+
      _reset_runtime_moe_buffers(model)
 +    if possible_to_load_to_meta and not loading_from_checkpoint_later:
 +        validate_glm_moe_bias_values(model, parallel_dims)
      return model
- 
- 
+
+
 @@ -1373,6 +2078,7 @@ def forward(
      labels: Int[Tensor, "batch seq"] | None = None,
      temperature: Tensor | None = None,
@@ -13751,11 +13751,11 @@ index d2d6703..110d59e 100644
 +        kwargs["inputs_embeds"] = inputs_embeds
 +    else:
 +        kwargs["input_ids"] = input_ids
- 
+
      if mm_kwargs:
          # Forward the per-model multimodal tensors verbatim, plus the
 @@ -1408,6 +2122,11 @@ def forward(
- 
+
      if routed_experts is not None:
          kwargs["routed_experts"] = routed_experts
 +    if sparse_indices_cache is not None:
@@ -13763,9 +13763,9 @@ index d2d6703..110d59e 100644
 +    if pipeline_layer_indices is not None:
 +        kwargs["pipeline_layer_indices"] = pipeline_layer_indices
 +        kwargs["pipeline_apply_norm"] = pipeline_apply_norm
- 
+
      out = model(**kwargs)
- 
+
 diff --git a/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py b/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py
 index 6364936..32211bb 100644
 --- a/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py
@@ -13774,11 +13774,11 @@ index 6364936..32211bb 100644
 +import os
  import warnings
  from typing import Optional, Union
- 
+
 @@ -26,6 +27,40 @@ from prime_rl.trainer.models.layers.norms import RMSNorm, RMSNormConfig
  from prime_rl.trainer.models.layers.rotary_emb import RotaryEmbedding, RotaryEmbeddingConfig
- 
- 
+
+
 +_LAYER_PROFILE = os.environ.get("PRIME_EP_PROFILE", "") == "1"
 +_LAYER_PROFILE_EVERY = int(os.environ.get("PRIME_LAYER_PROFILE_EVERY", "180"))
 +_LAYER_PROFILE_EVENTS: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event, torch.cuda.Event]]] = {}
@@ -13823,7 +13823,7 @@ index 6364936..32211bb 100644
 +        self.layer_idx = layer_idx
          self.hidden_size = config.hidden_size
          self.self_attn = GlmMoeDsaAttention(_sparse_mla_attention_args(config, layer_idx))
- 
+
 @@ -65,6 +101,21 @@ class GlmMoeDsaDecoderLayer(GradientCheckpointingLayer):
              load_balance_coeff=1e-3,
              use_grouped_mm=config.use_grouped_mm,
@@ -13885,7 +13885,7 @@ index 6364936..32211bb 100644
 +        hidden_states = residual + _real(hidden_states)
 +        if _LAYER_PROFILE:
 +            profile_middle.record()
- 
+
          residual = hidden_states
          hidden_states = self.post_attention_layernorm(hidden_states)
          hidden_states = self.mlp(hidden_states, routed_experts=routed_experts)
@@ -13903,12 +13903,12 @@ index 6364936..32211bb 100644
 +                (profile_start, profile_middle, profile_end),
 +            )
          return hidden_states, cached_indices
- 
- 
+
+
 @@ -150,6 +236,14 @@ class GlmMoeDsaPreTrainedModel(PreTrainedModelPrimeRL):
      def conversion_chain(cls, config):
          return conversion_chain(config)
- 
+
 +    @classmethod
 +    def convert_adapter_to_hf(cls, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
 +        for old_key in list(state_dict):
@@ -13923,7 +13923,7 @@ index 6364936..32211bb 100644
 @@ -187,7 +281,12 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
          if len(self.layers) == 0:
              return None, 0, 1
- 
+
 -        layer = self.layers[0]
 +        # Under pipeline parallelism apply_pp_boundaries replaces this
 +        # Pipeline stages store layers by their global index.
@@ -13932,7 +13932,7 @@ index 6364936..32211bb 100644
 +        else:
 +            layer = self.layers[0]
          return getattr(layer, "_cp_group", None), getattr(layer, "_cp_rank", 0), getattr(layer, "_cp_world_size", 1)
- 
+
      def _gather_position_ids_for_cp(
 @@ -207,10 +306,26 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
          position_ids: Optional[torch.LongTensor] = None,
@@ -13976,7 +13976,7 @@ index 6364936..32211bb 100644
 @@ -245,9 +357,18 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
          else:
              ks, ke = ks_full, ke_full
- 
+
 -        cached_indices = None
 +        cached_indices = sparse_indices_cache
          use_index_cache = getattr(self.config, "use_index_cache", False)
@@ -13997,7 +13997,7 @@ index 6364936..32211bb 100644
 @@ -259,8 +380,13 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
              )
              cached_indices = next_cached_indices if use_index_cache else None
- 
+
 -        hidden_states = self.norm(hidden_states)
 -        return BaseModelOutputWithPast(last_hidden_state=hidden_states)
 +        # Only the last pipeline stage owns the final normalization.
@@ -14007,18 +14007,18 @@ index 6364936..32211bb 100644
 +            last_hidden_state=hidden_states,
 +            past_key_values=cached_indices,
 +        )
- 
- 
+
+
  @auto_docstring
 @@ -276,7 +402,7 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
          self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
- 
+
          warnings.warn("GlmMoeDsaForCausalLM is experimental, higher trainer<->inference KL mismatch may be observed.")
 -        warnings.warn("`model.attn` is ignored, GlmMoeDsa uses only sparse attention.")
 +        warnings.warn("`model.attn` is ignored; GlmMoeDsa selects its model-specific attention path.")
- 
+
          self.post_init()
- 
+
 @@ -293,9 +419,11 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
          logits_to_keep: Union[int, torch.Tensor] = 0,
          temperature: Optional[torch.Tensor] = None,
@@ -14065,7 +14065,7 @@ index 6364936..32211bb 100644
              temperature=temperature,
          )
 +        return output
- 
+
      def init_buffers_post_meta(self):
          buffer_names = [name for name, _ in self.named_buffers()]
 diff --git a/src/prime_rl/trainer/models/glm_moe_dsa/sparse_mla_attention.py b/src/prime_rl/trainer/models/glm_moe_dsa/sparse_mla_attention.py
@@ -14077,7 +14077,7 @@ index 1cc6c91..34b8806 100644
  import torch.distributed as dist
  from torch import nn
 +from torch.nn.attention.flex_attention import flex_attention
- 
+
  from prime_rl.trainer.models.kernels.fp8_indexer import fp8_indexer
 +from prime_rl.trainer.models.layers.lora.multi_linear import (
 +    MultiLoRALinear,
@@ -14086,7 +14086,7 @@ index 1cc6c91..34b8806 100644
  from prime_rl.trainer.models.layers.norms import LayerNorm, RMSNorm, RMSNormConfig
  from prime_rl.trainer.models.layers.rotary_emb import rotate_half
  from prime_rl.utils.cp import gather_for_cp
- 
+
 +_flex_attention = torch.compile(flex_attention, dynamic=True)
 +_ADA_FLEX_OPTIONS = {
 +    "BLOCK_M": 16,
@@ -14112,8 +14112,8 @@ index 1cc6c91..34b8806 100644
 +            q, kv, out, do.contiguous(), indices, lse, sm_scale=ctx.sm_scale
 +        )
          return dq, dkv, None, None
- 
- 
+
+
 @@ -60,6 +80,22 @@ def apply_rope_interleave_single(
      sin = sin.unsqueeze(unsqueeze_dim)
      b, h, s, d = t.shape
@@ -14135,12 +14135,12 @@ index 1cc6c91..34b8806 100644
 +        if sin.dtype not in _REAL:
 +            sin = sin.to(common)
      return (t * cos) + (rotate_half(t) * sin)
- 
- 
+
+
 @@ -177,10 +213,32 @@ class GlmMoeDsaAttention(nn.Module):
      def cp_enabled(self) -> bool:
          return self._cp_world_size > 1
- 
+
 -    def attn_projections(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 -        q_latent = self.q_a_layernorm(self.q_a_proj(hidden_states))
 -        compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
@@ -14172,12 +14172,12 @@ index 1cc6c91..34b8806 100644
 +            [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
 +        )
          return q_latent, self.kv_a_layernorm(k_compressed), k_rope
- 
+
      def mla_up_proj(
 @@ -216,6 +274,22 @@ class GlmMoeDsaAttention(nn.Module):
          w_v = kv_b_w[:, self.qk_nope_head_dim :, :]
          q_absorbed = torch.einsum("bshd,hdk->bshk", q_nope, w_k_nope)
- 
+
 +        active_lora_factors = getattr(self.kv_b_proj, "active_lora_factors", None)
 +        if active_lora_factors is not None:
 +            lora_a, lora_b, lora_scaling = active_lora_factors()
@@ -14196,11 +14196,11 @@ index 1cc6c91..34b8806 100644
 +
          sparse_q = torch.cat([q_absorbed, q_rope], dim=-1)
          sparse_kv = torch.cat([k_compressed_normed_full, k_rope_full], dim=-1).unsqueeze(2)
- 
+
 @@ -224,7 +298,15 @@ class GlmMoeDsaAttention(nn.Module):
          assert sparse_kv.shape[1] == s_full + 1
          return sparse_q, sparse_kv, w_v
- 
+
 -    def _mla_unabsorb(self, out: torch.Tensor, w_v: torch.Tensor) -> torch.Tensor:
 +    def _mla_unabsorb(self, out: torch.Tensor, w_v) -> torch.Tensor:
 +        if isinstance(w_v, tuple):
@@ -14212,7 +14212,7 @@ index 1cc6c91..34b8806 100644
 +            result.add_(value_update)
 +            return result
          return torch.einsum("bshk,hdk->bshd", out, w_v)
- 
+
      def output_proj(self, attn_output: torch.Tensor, w_v: torch.Tensor) -> torch.Tensor:
 @@ -240,6 +322,7 @@ class GlmMoeDsaAttention(nn.Module):
          ks: torch.Tensor | None = None,
@@ -14221,11 +14221,11 @@ index 1cc6c91..34b8806 100644
 +        block_mask=None,
      ) -> tuple[torch.Tensor, torch.Tensor | None]:
          q_latent, k_compressed_normed, k_rope = self.attn_projections(hidden_states)
- 
+
 @@ -247,6 +330,24 @@ class GlmMoeDsaAttention(nn.Module):
              k_compressed_normed = gather_for_cp(k_compressed_normed, self._cp_group)
              k_rope = gather_for_cp(k_rope, self._cp_group)
- 
+
 +        if block_mask is not None:
 +            sparse_q, sparse_kv, w_v = self.mla_up_proj(
 +                q_latent_local=q_latent,
@@ -14256,17 +14256,17 @@ index 4ccbc58..6dac6b5 100644
  # ensures dlsym finds it before the stub's own exports.
  import ctypes as _ctypes
 +import os
- 
+
  try:
      _ctypes.CDLL("libcudart.so", mode=_ctypes.RTLD_GLOBAL)
 -except Exception:
 -    # This is expected on CPU-only machines
 +except OSError:
      pass
- 
+
  import tilelang
 @@ -35,7 +35,7 @@ def preprocess(
- 
+
      @T.prim_func
      def preprocess_kernel(
 -        O: T.Tensor(shape, dtype),
@@ -14316,7 +14316,7 @@ index 4ccbc58..6dac6b5 100644
      dtype=T.bfloat16,
      accum_dtype=T.float32,
 @@ -134,7 +150,7 @@ def bwd(
- 
+
      H = H_kv
      padded_H = max(tilelang.math.next_power_of_2(H_kv), 16)
 -    block_H = min(64, padded_H)
@@ -14327,7 +14327,7 @@ index 4ccbc58..6dac6b5 100644
 @@ -245,27 +261,50 @@ def bwd(
                          if bi_i < BS // split_store:
                              acc_dkv_tail_shared[bi_i, d_i] = acc_dkv_tail[bi_i + s * (BS // split_store), d_i]
- 
+
 -                    for bi_i, d_i in T.Parallel(BS // split_store, D // 4):
 -                        T.atomic_addx4(
 -                            dKV[
@@ -14393,12 +14393,12 @@ index 4ccbc58..6dac6b5 100644
 +                                ],
 +                                acc_dkv_tail_shared[bi_i, d_i],
 +                            )
- 
+
              T.copy(acc_dq, dQ_shared)
              T.copy(acc_dq_tail, dQ_tail_shared)
 @@ -292,7 +331,25 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None):
      assert lse.shape == (B, S, H)
- 
+
      preprocess_kernel = preprocess(H, D)
 -    bwd_kernel = bwd(H, D, D_tail, topk, kv_group, sm_scale, True)
 +    if torch.cuda.get_device_capability(q.device)[0] < 9:
@@ -14421,28 +14421,28 @@ index 4ccbc58..6dac6b5 100644
 +    else:
 +        bwd_kernel = bwd(H, D, D_tail, topk, kv_group, sm_scale, True)
      postprocess_kernel = postprocess(D, D_tail, kv_group)
- 
+
      delta = preprocess_kernel(o, do)
 diff --git a/src/prime_rl/trainer/models/kernels/sparse_mla_fwd.py b/src/prime_rl/trainer/models/kernels/sparse_mla_fwd.py
 index ac360a0..0bf6f4b 100644
 --- a/src/prime_rl/trainer/models/kernels/sparse_mla_fwd.py
 +++ b/src/prime_rl/trainer/models/kernels/sparse_mla_fwd.py
 @@ -9,11 +9,13 @@ import ctypes as _ctypes
- 
+
  try:
      _ctypes.CDLL("libcudart.so", mode=_ctypes.RTLD_GLOBAL)
 -except Exception:
 -    # This is expected on CPU-only machines
 +except OSError:
      pass
- 
+
 +import os
 +
  import tilelang
 +import torch
  from tilelang import language as T
- 
- 
+
+
 @@ -34,6 +36,7 @@ def sparse_mla_fwd(
      is_causal=True,
      CP0=True,
@@ -14454,7 +14454,7 @@ index ac360a0..0bf6f4b 100644
 @@ -73,13 +76,9 @@ def sparse_mla_fwd(
      D = dim
      D_tail = tail_dim
- 
+
 -    if head_kv > 64:
 -        assert head_kv % 64 == 0, "head_kv should be a multiple of 64"
 -        REPLICATE_H = head_kv // 64
@@ -14465,22 +14465,22 @@ index ac360a0..0bf6f4b 100644
 +    H_per_block = min(block_H, padded_H)
 +    assert padded_H % H_per_block == 0
 +    REPLICATE_H = padded_H // H_per_block
- 
+
      @T.prim_func
      def main(
 @@ -124,7 +123,7 @@ def sparse_mla_fwd(
              # (where local q_i no longer matches the global K position).
              max_kv_i = seq_len_kv - 2
- 
+
 -            H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * 64)
 +            H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * H_per_block)
              H1 = H0 + H_per_block
- 
+
              T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)
 @@ -172,10 +171,22 @@ def sparse_mla_fwd(
                  T.copy(acc_s, S_shared)
                  T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
- 
+
 +            # A fully masked query has no valid K row. Return the exact zero
 +            # output and +inf LSE so backward reconstructs zero probabilities.
 +            # Dividing by sumexp=0 and storing -inf LSE produced NaNs that
@@ -14499,13 +14499,13 @@ index ac360a0..0bf6f4b 100644
 +                    T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale,
 +                    T.infinity(sumexp.dtype),
 +                )
- 
+
              T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
              T.copy(sumexp, Lse[b_i, s_i, H0:H1])
 @@ -196,6 +207,20 @@ def sparse_mla_fwd_interface(q, kv, indices, sm_scale=None, d_v=512, block_I=64,
      _, _, _, topk = indices.shape
      assert indices.shape == (batch, seq_len, kv_group, topk)
- 
+
 +    block_H = 64
 +    if torch.cuda.get_device_capability(q.device)[0] < 9:
 +        block_I = int(os.environ.get("PRIME_SPARSE_FWD_BLOCK_SIZE", "32"))
@@ -14564,16 +14564,16 @@ index ef4c41c..cb85edd 100644
 -so new models should follow them directly rather than adding private aliases.
 -"""
 +"""Selective activation checkpointing hooks for custom decoder layers."""
- 
+
  from collections.abc import Iterable
 +from contextvars import ContextVar
  from functools import wraps
- 
+
  import torch
  import torch.nn as nn
 +from torch.utils._pytree import tree_flatten, tree_unflatten
  from torch.utils.checkpoint import checkpoint
- 
+
 -SELECTIVE_AC_TARGETS = frozenset({"norm", "attn_proj", "mlp", "mla_up_proj", "routed_experts", "linear_attn"})
 +SELECTIVE_AC_TARGETS = frozenset(
 +    {
@@ -14604,13 +14604,13 @@ index ef4c41c..cb85edd 100644
 +    """
 +
 +    return _REENTRANT_BLOCK_PHASE.get() is not None
- 
- 
+
+
  def _is_norm_module(module: nn.Module) -> bool:
 @@ -45,7 +48,13 @@ def _should_checkpoint(module: nn.Module) -> bool:
      return torch.is_grad_enabled() and module.training
- 
- 
+
+
 -def checkpoint_method(module: nn.Module, method_name: str) -> None:
 +def checkpoint_method(
 +    module: nn.Module,
@@ -14625,7 +14625,7 @@ index ef4c41c..cb85edd 100644
 @@ -57,10 +66,53 @@ def checkpoint_method(module: nn.Module, method_name: str) -> None:
          if not _should_checkpoint(module):
              return original(*args, **kwargs)
- 
+
 -        def fn(*checkpoint_args):
 -            return original(*checkpoint_args, **kwargs)
 -
@@ -14677,19 +14677,19 @@ index ef4c41c..cb85edd 100644
 +            use_reentrant=use_reentrant,
 +            preserve_rng_state=preserve_rng_state,
 +        )
- 
+
      setattr(module, method_name, checkpointed)
      setattr(module, _PATCHED_METHODS_ATTR, patched_methods.union({method_name}))
 @@ -97,16 +149,19 @@ def _get_linear_attn_module(layer: nn.Module) -> nn.Module | None:
- 
- 
+
+
  def get_supported_targets(layer: nn.Module) -> frozenset[str]:
 -    """Infer which selective activation checkpoint targets a decoder layer supports."""
      supported_targets = {"norm"}
      self_attn = getattr(layer, "self_attn", None)
      mlp = getattr(layer, "mlp", None)
      linear_attn = _get_linear_attn_module(layer)
- 
+
 +    if self_attn is not None:
 +        supported_targets.add("attention")
      if _supports_attn_proj(self_attn):
@@ -14742,8 +14742,8 @@ index ef4c41c..cb85edd 100644
          checkpoint_method(linear_attn, "forward")
      if "norm" in enabled_targets:
          _configure_norm_checkpointing(layer)
- 
- 
+
+
 +def set_reentrant_block_checkpointing(layer: nn.Module) -> None:
 +    """Checkpoint a complete decoder block at its FSDP ownership boundary.
 +
@@ -17985,21 +17985,21 @@ index fd9b59e..40a6ef9 100644
  import math
 +import os
 +from dataclasses import dataclass
- 
+
  import torch
 +import torch.nn.functional as F
 +import triton
 +import triton.language as tl
  from torch import nn
 +from torch.distributed.tensor import DTensor
- 
+
 +from prime_rl.trainer.models.layers.fp8_ada import (
 +    FP8CheckpointFusedQKVA,
 +    FP8CheckpointFusedQKVASlice,
 +)
  from prime_rl.trainer.models.layers.lora.base import MultiLoRAModule, get_lora_num_tokens, get_multilora_scaling
- 
- 
+
+
 +_REPORTED_NONFINITE_LORA: set[str] = set()
 +
 +
@@ -18179,8 +18179,8 @@ index fd9b59e..40a6ef9 100644
 +        lora_B.transpose(-2, -1),
 +        offsets,
 +    )
- 
- 
+
+
  def _run_lora_for_loop(
 @@ -25,20 +202,146 @@ def _run_lora_for_loop(
  ) -> torch.Tensor:
@@ -18197,8 +18197,8 @@ index fd9b59e..40a6ef9 100644
 +        a_out = torch.matmul(x[start : offsets[i]], lora_A[i].transpose(-2, -1))
 +        lora_out_splits.append(torch.matmul(a_out, lora_B[i].transpose(-2, -1)))
      return torch.cat(lora_out_splits, dim=0)
- 
- 
+
+
 +class _SingleLoRA(torch.autograd.Function):
 +    @staticmethod
 +    def forward(ctx, x, lora_A, lora_B, fqn):
@@ -18336,7 +18336,7 @@ index fd9b59e..40a6ef9 100644
 -    Linear + multi-LoRA with grouped GEMM.
 -    """
 +    """Linear + multi-LoRA with grouped GEMM."""
- 
+
      def __init__(
          self,
 @@ -52,7 +355,6 @@ class MultiLoRALinear(MultiLoRAModule):
@@ -18346,7 +18346,7 @@ index fd9b59e..40a6ef9 100644
 -
          if rank % 8 != 0 or base_layer.in_features % 8 != 0 or base_layer.out_features % 8 != 0:
              use_grouped_mm = False
- 
+
 @@ -63,12 +365,11 @@ class MultiLoRALinear(MultiLoRAModule):
          self.use_grouped_mm = use_grouped_mm
          self.in_features = base_layer.in_features
@@ -18391,15 +18391,15 @@ index fd9b59e..40a6ef9 100644
          )
 -
          self.reset_parameters()
- 
+
      def reset_parameters(self, index: int | None = None) -> None:
 @@ -108,54 +407,59 @@ class MultiLoRALinear(MultiLoRAModule):
              nn.init.zeros_(self.lora_B[index])
- 
+
      def named_parameters_for_adapter(self, idx: int) -> list[tuple[str, nn.Parameter]]:
 -        """Get named parameters for a specific adapter index.
 +        return [("lora_A", self.lora_A[idx]), ("lora_B", self.lora_B[idx])]
- 
+
 -        Args:
 -            idx: The adapter index to get parameters for
 +    def get_lora_param_counts(self) -> tuple[int, int]:
@@ -18407,7 +18407,7 @@ index fd9b59e..40a6ef9 100644
 +            self.lora_A[0].numel() + self.lora_B[0].numel(),
 +            self.base_layer.weight.numel(),
 +        )
- 
+
 -        Returns:
 -            List of (name, parameter) tuples for the specified adapter
 -        """
@@ -18425,12 +18425,12 @@ index fd9b59e..40a6ef9 100644
 +            self.lora_B[adapter_index],
 +            self._scaling_factors[adapter_index],
 +        )
- 
+
 -    def get_lora_param_counts(self) -> tuple[int, int]:
 -        """Get the number of LoRA adapter parameters and adapted base parameters.
 +    def _adapter_output_2d(self, x: torch.Tensor) -> torch.Tensor:
 +        lora_x = self.lora_dropout(x)
- 
+
 -        Returns:
 -            A tuple of (adapter_params, adapted_params) where:
 -            - adapter_params: Number of parameters in ONE LoRA adapter (lora_A + lora_B)
@@ -18447,7 +18447,7 @@ index fd9b59e..40a6ef9 100644
 +                getattr(self.base_layer, "_fp8_fqn", "<unassigned-lora-linear>"),
 +            )
 +            return self._scaling_factors[0] * lora_out
- 
+
 -    def forward(self, x: torch.Tensor) -> torch.Tensor:
 -        """
 -        x: [..., in_features]
@@ -18475,7 +18475,7 @@ index fd9b59e..40a6ef9 100644
 +            self._scaling_factors, self._lora_num_tokens
 +        ).unsqueeze(-1)
 +        return scaling * lora_out
- 
+
 -        # Apply per-token scaling
 -        per_token_scaling = torch.repeat_interleave(self._scaling_factors, self._lora_num_tokens).unsqueeze(-1)
 -        return (base_out + per_token_scaling * lora_out).view(new_shape)
@@ -18488,7 +18488,7 @@ index fd9b59e..40a6ef9 100644
 +        shape = x.shape[:-1] + (self.out_features,)
 +        x = x.view(-1, x.shape[-1])
 +        return (self.base_layer(x) + self._adapter_output_2d(x)).view(shape)
- 
+
      def __repr__(self) -> str:
          return (
 diff --git a/src/prime_rl/trainer/models/layers/lora/native_fp8_moe.py b/src/prime_rl/trainer/models/layers/lora/native_fp8_moe.py
@@ -18679,17 +18679,17 @@ index 4fc40d1..5d92593 100644
 @@ -4,15 +4,77 @@
  # This source code is licensed under the BSD-style license found in the
  # LICENSE file in the root directory of this source tree.
- 
+
 +import hashlib
  from dataclasses import dataclass
  from typing import Literal
- 
+
  import torch
  import torch.nn.functional as F
  from torch import nn
 +from torch.distributed.tensor import DTensor
  from torchtitan.distributed.expert_parallel import expert_parallel
- 
+
  from prime_rl.configs.trainer import EPCommBackend
 +from prime_rl.trainer.models.layers.fp8_ada import (
 +    _Linear,
@@ -18751,8 +18751,8 @@ index 4fc40d1..5d92593 100644
 +    module._fp32_expert_bias_validation = None
 +    module._fp32_expert_bias = value
 +    return _validate_static_expert_bias(module)
- 
- 
+
+
  @dataclass
 @@ -31,6 +93,10 @@ class MoEArgs:
      use_grouped_mm: bool = True  # grouped mm or for-loop for the experts computation
@@ -18762,13 +18762,13 @@ index 4fc40d1..5d92593 100644
 +    fp8_checkpoint_routed: bool | None = None
 +    fp8_checkpoint_shared: bool | None = None
 +    mxfp4: bool = False
- 
- 
+
+
  # can be used as dense FFN layer or shared experts in MoE layers
 @@ -85,6 +151,60 @@ class BCFeedForward(nn.Module):
          nn.init.trunc_normal_(self.w3, mean=0.0, std=init_std)
- 
- 
+
+
 +class MXFP4FeedForward(nn.Module):
 +    def __init__(self, dim: int, hidden_dim: int):
 +        super().__init__()
@@ -18828,8 +18828,8 @@ index 4fc40d1..5d92593 100644
  def _run_experts_for_loop_impl(
 @@ -181,6 +301,30 @@ def _run_experts_grouped_mm_impl(
      return out
- 
- 
+
+
 +@torch.compiler.disable
 +def _run_experts_mxfp4(
 +    w1: torch.Tensor,
@@ -18904,10 +18904,10 @@ index 4fc40d1..5d92593 100644
 +        self.fp8_checkpoint = fp8_checkpoint
 +        self.mxfp4 = mxfp4
          self.ep_comm_backend: EPCommBackend = "torch"
- 
+
      def set_ep_comm_backend(self, backend: EPCommBackend) -> None:
          self.ep_comm_backend = backend
- 
+
      def _forward_deepep(self, x: torch.Tensor, num_tokens_per_expert: torch.Tensor) -> torch.Tensor:
 -        w1 = self.w1.to_local()
 -        w2 = self.w2.to_local()
@@ -18987,11 +18987,11 @@ index 4fc40d1..5d92593 100644
 +            )
          if self.ep_comm_backend == "deepep":
              return self._forward_deepep(x, num_tokens_per_expert)
- 
+
 @@ -396,6 +634,24 @@ def _selected_probability_mass_sum(
          return selected_prob_mass.sum(dim=-1).sum()
- 
- 
+
+
 +class _BF16RouterGemm(torch.autograd.Function):
 +    @staticmethod
 +    def forward(ctx, hidden_states: torch.Tensor, gate_weight: torch.Tensor) -> torch.Tensor:
@@ -19021,7 +19021,7 @@ index 4fc40d1..5d92593 100644
 -        # (exempt from FSDP bf16 casting) and the gate GEMM runs in fp32.
 -        self.fp32_gate = False
 +        self.use_fp32_router_output = False
- 
+
      def forward(
 -        self, x: torch.Tensor, expert_bias: torch.Tensor | None = None, routed_experts: torch.Tensor | None = None
 +        self,
@@ -19067,7 +19067,7 @@ index 4fc40d1..5d92593 100644
 +        selection_scores = scores
 +        if selection_bias is not None:
 +            selection_scores = selection_scores + selection_bias.to(torch.float32)
- 
+
          if routed_experts is not None:
 -            top_scores = scores.gather(dim=1, index=routed_experts)
              selected_experts_indices = routed_experts
@@ -19095,14 +19095,14 @@ index 4fc40d1..5d92593 100644
 +            top_scores, selected_experts_indices = torch.topk(
 +                scores, k=self.top_k, dim=1
 +            )
- 
+
          routing_confidence_sum = _selected_probability_mass_sum(scores, top_scores, self.score_func)
- 
+
          if self.route_norm:
              denominator = top_scores.sum(dim=-1, keepdim=True) + 1e-20
              top_scores = top_scores / denominator
 -        top_scores = top_scores * self.route_scale
- 
+
          # group tokens together by expert indices from 0 to num_experts and pass that to experts forward
          num_tokens_per_expert = torch.histc(
 @@ -525,7 +809,7 @@ class TokenReorderer(nn.Module):
@@ -19113,27 +19113,27 @@ index 4fc40d1..5d92593 100644
 +    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
          """
          Reorders token indices to match the order of experts for MoE routing.
- 
+
 @@ -552,29 +836,78 @@ class TokenReorderer(nn.Module):
- 
+
          # Reorder the token indices to match the order of the experts
          # token_indices_experts_sorted shape (bs*slen*top_k,)
 -        token_indices_experts_sorted = torch.argsort(selected_experts_indices, stable=True)
 +        expert_order = torch.argsort(selected_experts_indices, stable=True)
- 
+
 -        top_scores_experts_sorted = top_scores.view(-1)[token_indices_experts_sorted]
 -        token_indices_experts_sorted = token_indices_experts_sorted // self.top_k
 +        top_scores_experts_sorted = top_scores.view(-1)[expert_order]
 +        token_indices_experts_sorted = expert_order // self.top_k
- 
+
          return (
              top_scores_experts_sorted,
              token_indices_experts_sorted,
              num_tokens_per_expert,
 +            expert_order,
          )
- 
- 
+
+
 +def combine_expert_outputs(
 +    shared_output: torch.Tensor,
 +    routed_output: torch.Tensor,
@@ -19173,7 +19173,7 @@ index 4fc40d1..5d92593 100644
  class MoE(nn.Module):
      def __init__(self, moe_args: MoEArgs, dim: int, hidden_dim: int):
          super().__init__()
- 
+
          num_experts = moe_args.num_experts
 +        fp8_checkpoint_routed = (
 +            moe_args.fp8_checkpoint
@@ -19214,7 +19214,7 @@ index 4fc40d1..5d92593 100644
 @@ -646,10 +985,35 @@ class MoE(nn.Module):
          if self.score_before_experts:
              routed_input = (routed_input.to(torch.float32) * top_scores_experts_sorted.reshape(-1, 1)).to(x.dtype)
- 
+
 -        routed_output = self.experts(routed_input, num_tokens_per_expert)
 +        local_recompute = getattr(
 +            self.experts,
@@ -19233,7 +19233,7 @@ index 4fc40d1..5d92593 100644
 +            )
 +        else:
 +            routed_output = self.experts(routed_input, num_tokens_per_expert)
- 
+
 -        if not self.score_before_experts:
 -            routed_output = (routed_output.to(torch.float32) * top_scores_experts_sorted.reshape(-1, 1)).to(x.dtype)
 +        if not self.score_before_experts and not local_recompute:
@@ -19247,17 +19247,17 @@ index 4fc40d1..5d92593 100644
 +                    routed_output.to(torch.float32)
 +                    * top_scores_experts_sorted.reshape(-1, 1)
 +                ).to(x.dtype)
- 
+
          return routed_output
- 
+
 @@ -668,44 +1032,31 @@ class MoE(nn.Module):
          from prime_rl.trainer.distributed.expert_parallel import get_ep_group
- 
+
          if x.shape[0] == 0:
 -            shared_output = self.shared_expert(x) if self.shared_expert is not None else None
 -            return x.new_zeros(x.shape) if shared_output is None else shared_output
 +            return x.new_zeros(x.shape)
- 
+
          group = get_ep_group(self.experts)
          chunk_size = min(self.deepep_token_chunk_size or x.shape[0], x.shape[0])
 -
@@ -19280,7 +19280,7 @@ index 4fc40d1..5d92593 100644
 -
 -        pending_state = dispatch_chunk(0, chunk_size)
          routed_outputs: list[torch.Tensor] = []
- 
+
 -        for chunk_start in range(chunk_size, x.shape[0], chunk_size):
 +        for chunk_start in range(0, x.shape[0], chunk_size):
              chunk_end = min(chunk_start + chunk_size, x.shape[0])
@@ -19303,17 +19303,17 @@ index 4fc40d1..5d92593 100644
 +                combine_tokens(self._run_local_routed_experts(hidden_states, num_tokens_per_expert), dispatch_state)
 +            )
 +            sync_combine()
- 
+
 -        shared_output = self.shared_expert(x) if self.shared_expert is not None else None
 -        sync_combine()
          routed_output = routed_outputs[0] if len(routed_outputs) == 1 else torch.cat(routed_outputs, dim=0)
 -        return routed_output if shared_output is None else shared_output + routed_output
 +        return routed_output
- 
+
      def forward(
          self,
 @@ -731,12 +1082,28 @@ class MoE(nn.Module):
- 
+
          # top_scores and selected_experts_indices shape (bs*slen*top_k,)
          # num_tokens_per_expert shape (num_experts,)
 +        static_expert_bias = getattr(self, "_use_static_expert_bias", False)
@@ -19339,7 +19339,7 @@ index 4fc40d1..5d92593 100644
 +            expert_bias,
 +            routed_experts=routed_experts,
 +        )
- 
+
          # tokens_per_expert will be used to update the expert bias for load balancing.
          # and also to count the expert usage
 @@ -744,11 +1111,15 @@ class MoE(nn.Module):
@@ -19350,14 +19350,14 @@ index 4fc40d1..5d92593 100644
 +            if self.load_balance_coeff is not None:
 +                self.tokens_per_expert.add_(num_tokens_per_expert)
              self.routing_confidence_sum.add_(routing_confidence_sum)
- 
+
          if self.ep_comm_backend == "deepep":
              routed_output = self._run_deepep_routed_experts(x, selected_experts_indices, top_scores)
 +            routed_output = routed_output * self.router.route_scale
 +            if self.shared_expert is not None:
 +                routed_output = self.shared_expert(x) + routed_output
              return routed_output.reshape(bs, slen, dim)
- 
+
          # top_scores and token_indices_experts_sorted shape (bs*slen*top_k,)
 @@ -763,6 +1134,7 @@ class MoE(nn.Module):
              top_scores_experts_sorted,
@@ -19365,7 +19365,7 @@ index 4fc40d1..5d92593 100644
              num_tokens_per_expert,
 +            expert_order,
          ) = self.reorderer(top_scores, selected_experts_indices)
- 
+
          routed_output = self._run_routed_experts(
 @@ -771,13 +1143,18 @@ class MoE(nn.Module):
              num_tokens_per_expert,
@@ -19376,7 +19376,7 @@ index 4fc40d1..5d92593 100644
              out = self.shared_expert(x)
          else:
              out = torch.zeros_like(x)
- 
+
 -        routed_indices = token_indices_experts_sorted.reshape(-1, 1).expand(-1, dim)
 -        out = out.scatter_add(dim=0, index=routed_indices, src=routed_output)
 +        out = combine_expert_outputs(
@@ -19387,18 +19387,18 @@ index 4fc40d1..5d92593 100644
 +        )
          out = out.reshape(bs, slen, dim)
          return out
- 
+
 @@ -972,10 +1349,10 @@ class NemotronHRouter(nn.Module):
              # are intentionally skipped here.
              selected_experts_indices = routed_experts
          else:
 -            scores_for_choice = scores + self.e_score_correction_bias
 +            scores_for_choice = scores + self.e_score_correction_bias.to(torch.float32)
- 
+
              if expert_bias is not None:
 -                scores_for_choice = scores_for_choice + expert_bias
 +                scores_for_choice = scores_for_choice + expert_bias.to(torch.float32)
- 
+
              # Group-based routing
              if self.n_group > 1:
 @@ -1158,35 +1535,26 @@ class LatentMoE(nn.Module):
@@ -19423,7 +19423,7 @@ index 4fc40d1..5d92593 100644
 -
 -        pending_state = dispatch_chunk(0, chunk_size)
          routed_outputs: list[torch.Tensor] = []
- 
+
 -        for chunk_start in range(chunk_size, latent_x.shape[0], chunk_size):
 +        for chunk_start in range(0, latent_x.shape[0], chunk_size):
              chunk_end = min(chunk_start + chunk_size, latent_x.shape[0])
@@ -19446,7 +19446,7 @@ index 4fc40d1..5d92593 100644
 +                combine_tokens(self._run_local_routed_experts(hidden_states, num_tokens_per_expert), dispatch_state)
 +            )
 +            sync_combine()
- 
+
          shared_output = self.shared_expert(x)
 -        sync_combine()
          routed_output = routed_outputs[0] if len(routed_outputs) == 1 else torch.cat(routed_outputs, dim=0)
@@ -19455,7 +19455,7 @@ index 4fc40d1..5d92593 100644
 @@ -1201,12 +1569,25 @@ class LatentMoE(nn.Module):
              _, _, top_k = routed_experts.shape
              routed_experts = routed_experts.reshape(-1, top_k)
- 
+
 +        static_expert_bias = getattr(self, "_use_static_expert_bias", False)
 +        if static_expert_bias and getattr(self, "_fp32_expert_bias_source_sha256", None) is None:
 +            raise RuntimeError("Frozen GLM routing requires an exact source bias hash")
@@ -19472,13 +19472,13 @@ index 4fc40d1..5d92593 100644
 -            x_flat, self.expert_bias, routed_experts=routed_experts
 +            x_flat, expert_bias, routed_experts=routed_experts
          )
- 
+
          with torch.no_grad():
 -            self.tokens_per_expert.add_(num_tokens_per_expert)
 +            if self.load_balance_coeff is not None:
 +                self.tokens_per_expert.add_(num_tokens_per_expert)
              self.routing_confidence_sum.add_(routing_confidence_sum)
- 
+
          if self.ep_comm_backend == "deepep":
 @@ -1217,6 +1598,7 @@ class LatentMoE(nn.Module):
              top_scores_experts_sorted,
@@ -19486,12 +19486,12 @@ index 4fc40d1..5d92593 100644
              num_tokens_per_expert,
 +            expert_order,
          ) = self.reorderer(top_scores, selected_experts_indices)
- 
+
          routed_output = self._run_routed_experts(
 @@ -1228,8 +1610,12 @@ class LatentMoE(nn.Module):
- 
+
          out = self.shared_expert(x_flat)
- 
+
 -        token_indices_full = token_indices_experts_sorted.reshape(-1, 1).expand(-1, dim)
 -        out = out.scatter_add(dim=0, index=token_indices_full, src=routed_output)
 +        out = combine_expert_outputs(
@@ -19502,7 +19502,7 @@ index 4fc40d1..5d92593 100644
 +        )
          out = out.reshape(bs, slen, dim)
          return out
- 
+
 diff --git a/src/prime_rl/trainer/models/layers/norms.py b/src/prime_rl/trainer/models/layers/norms.py
 index d5d23ee..140bf45 100644
 --- a/src/prime_rl/trainer/models/layers/norms.py
@@ -19534,12 +19534,12 @@ index d5d23ee..140bf45 100644
          hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
 -        return self.weight * hidden_states.to(input_dtype)
 +        return weight * hidden_states.to(input_dtype)
- 
+
      def extra_repr(self):
          return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 @@ -56,4 +74,12 @@ class LayerNorm(nn.Module):
          self.bias = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
- 
+
      def forward(self, x: torch.Tensor):
 -        return F.layer_norm(x.float(), (self.dim,), self.weight.float(), self.bias.float(), self.eps).type_as(x)
 +        # `.type_as(x)` PROPAGATES float8: an fp8 input yields an fp8 output,
@@ -19732,16 +19732,16 @@ index ca30983..db646a7 100644
      ep: int
      world_size: int
 +    global_ep: bool = False
- 
+
      _world_mesh: DeviceMesh = None
      _submeshes: dict = None
 +    _partial_reshard_meshes: dict[int, DeviceMesh] = None
- 
+
      def __post_init__(self):
          self._submeshes = {}
 +        self._partial_reshard_meshes = {}
          self._validate()
- 
+
      def _validate(self):
 @@ -121,6 +124,8 @@ class ParallelDims:
          if self.dp_replicate_enabled:
@@ -19755,7 +19755,7 @@ index ca30983..db646a7 100644
 @@ -218,6 +223,52 @@ class ParallelDims:
              return self._submeshes[name]
          return mesh[name]
- 
+
 +    def get_partial_reshard_mesh(self, shard_size: int) -> DeviceMesh:
 +        if shard_size in self._partial_reshard_meshes:
 +            return self._partial_reshard_meshes[shard_size]
@@ -19815,7 +19815,7 @@ index ca30983..db646a7 100644
          world_size=dist.get_world_size(),
 +        global_ep=config.global_ep,
      )
- 
+
      # Validate sequence length against parallel dimensions requirements
 diff --git a/src/prime_rl/trainer/rl/broadcast/filesystem.py b/src/prime_rl/trainer/rl/broadcast/filesystem.py
 index d0a453f..af206eb 100644
@@ -19826,7 +19826,7 @@ index d0a453f..af206eb 100644
  from pathlib import Path
  from typing import Literal
 +from urllib.parse import quote
- 
+
  import torch.nn as nn
  from torch.distributed.tensor import DTensor
 @@ -17,6 +18,7 @@ from prime_rl.trainer.weights import (
@@ -19835,8 +19835,8 @@ index d0a453f..af206eb 100644
  from prime_rl.trainer.world import get_world
 +from prime_rl.utils.adapter_delta import publish_adapter_manifest
  from prime_rl.utils.utils import get_broadcast_dir, get_step_path
- 
- 
+
+
 @@ -59,15 +61,25 @@ class FileSystemWeightBroadcast(WeightBroadcast):
                  # For adapter-only, MultiRunManager creates state dict directly for each run
                  # All ranks must participate in DTensor gathering, but only master saves
@@ -19856,7 +19856,7 @@ index d0a453f..af206eb 100644
 +                    if keep_local:
                          state_dict[key] = value.to("cpu", non_blocking=False)
 +                state_dict = merge_pp_state_dict(state_dict, is_master=self.world.is_master)
- 
+
              # TODO: Broadcast ready to update in sync, then we dont need to gather on not ready
              if self.world.is_master:
                  try:
@@ -19954,9 +19954,9 @@ index d0a453f..af206eb 100644
 +                            f"{manifest['build_seconds']}s using "
 +                            f"{manifest['chunk_count']} chunks"
 +                        )
- 
+
                      self._notify_orchestrator(save_dir)
- 
+
                      # If the run is deleted, remove the run directory
                      # This is avoid the creation of zombie runs when the directory is deleted while we are broadcasting which recreates the directory
 -                    if self.multi_run_manager.get_orchestrator_config(self.multi_run_manager.idx_2_id[idx]) is None:
@@ -19965,7 +19965,7 @@ index d0a453f..af206eb 100644
 +                        and self.multi_run_manager.get_orchestrator_config(run_id) is None
 +                    ):
                          shutil.rmtree(self.multi_run_manager.get_run_dir(idx))
- 
+
                  except FileNotFoundError:
                      self.logger.warning(f"Run {idx} is deleted, skipping")
                  except Exception as e:
@@ -19973,10 +19973,10 @@ index d0a453f..af206eb 100644
 +                    raise
                  finally:
                      self.multi_run_manager.ready_to_update[idx] = False
- 
+
 @@ -111,9 +204,20 @@ class FileSystemWeightBroadcast(WeightBroadcast):
          stable_file.touch()
- 
+
      def maybe_clean(self, interval_to_keep: int | None):
 +        if not self.world.is_master:
 +            return
@@ -20016,8 +20016,8 @@ index 1ad250c..85c4267 100644
  from typing import TypedDict
 @@ -18,6 +24,82 @@ from prime_rl.transport import (
  )
- 
- 
+
+
 +_REFERENCE_ROUTE_FIELDS = {
 +    "schema_version",
 +    "encoding",
@@ -20096,10 +20096,10 @@ index 1ad250c..85c4267 100644
 +
  class TensorMicroBatch(TypedDict):
      """A micro batch of data for training."""
- 
+
 @@ -60,16 +142,76 @@ class TensorMicroBatch(TypedDict):
- 
- 
+
+
  class FakeDataLoader:
 -    def __init__(self, config: FakeDataLoaderConfig, seq_len: int, dp_world_size: int):
 +    def __init__(
@@ -20116,7 +20116,7 @@ index 1ad250c..85c4267 100644
 +        if not 0 <= dp_rank < dp_world_size:
 +            raise ValueError(f"invalid dp_rank={dp_rank} for dp_world_size={dp_world_size}")
 +        self.dp_rank = dp_rank
- 
+
          self.batch_size = config.batch_size
 +        if self.batch_size % self.dp_world_size:
 +            raise ValueError(
@@ -20176,7 +20176,7 @@ index 1ad250c..85c4267 100644
 +            )
          self.batch_counter = 0
          self.multi_run_manager = get_multi_run_manager()
- 
+
 @@ -87,24 +229,99 @@ class FakeDataLoader:
          for micro_batch_idx in range(self.num_micro_batches):
              seed = self.dp_rank * 1000000 + self.batch_counter * 1000 + micro_batch_idx
@@ -20187,10 +20187,10 @@ index 1ad250c..85c4267 100644
 +                micro_batches.append(self._get_reference_micro_batch(reference))
 +            else:
 +                micro_batches.append(get_micro_batch_fn(generator))
- 
+
          self.batch_counter += 1
          return micro_batches
- 
+
 +    def _get_reference_micro_batch(self, reference: dict) -> TensorMicroBatch:
 +        input_ids = torch.tensor(reference["input_ids"], dtype=torch.long)
 +        inference_logprobs = torch.tensor(
@@ -20249,7 +20249,7 @@ index 1ad250c..85c4267 100644
          input_ids = []
          position_ids = []
          sequence_lengths = []
- 
+
 -        while total_seq_len < self.seq_len:
 -            # Generate reasonably long documents
 -            seq_len_to_generate = torch.randint(1, self.seq_len // 8, (1,), generator=generator).item()
@@ -20284,7 +20284,7 @@ index 1ad250c..85c4267 100644
 +        for seq_len_to_generate in sequence_lengths:
              tmp_input_ids = torch.randint(0, 120000, (seq_len_to_generate,), generator=generator).long()
              tmp_position_ids = torch.arange(seq_len_to_generate).long()
- 
+
 @@ -114,11 +331,28 @@ class FakeDataLoader:
          input_ids = torch.cat(input_ids, dim=0)
          position_ids = torch.cat(position_ids, dim=0)
@@ -20308,7 +20308,7 @@ index 1ad250c..85c4267 100644
          inference_logprobs = torch.randn(input_ids.shape[0], generator=generator)
          lora_num_tokens = torch.zeros(self.multi_run_manager.max_runs, dtype=torch.int32)
          lora_num_tokens[0] = input_ids.shape[0]
- 
+
 +        rl_weights = torch.zeros(input_ids.shape[0]) if self.ce_only else None
 +        ce_weights = torch.ones(input_ids.shape[0]) if self.ce_only else None
 +
@@ -20357,13 +20357,13 @@ index 1ad250c..85c4267 100644
 @@ -200,8 +437,8 @@ class DataLoader:
                  start_step=start_step,
              )
- 
+
 -        non_dp_world_size = self.world.world_size // dp_world_size
 -        dp_rank = self.world.rank // non_dp_world_size
 +        if not 0 <= dp_rank < dp_world_size:
 +            raise ValueError(f"invalid dp_rank={dp_rank} for dp_world_size={dp_world_size}")
          self.multi_run_manager = get_multi_run_manager()
- 
+
          self.receiver: MicroBatchReceiver = setup_micro_batch_receiver(output_dir, dp_rank, start_step, config)
 @@ -243,7 +480,9 @@ class DataLoader:
                      dtype=_torch_dtype(packed_routed_experts.dtype),
@@ -20382,7 +20382,7 @@ index 295d3ad..03a4e29 100644
 +++ b/src/prime_rl/trainer/rl/train.py
 @@ -1,8 +1,16 @@
  import prime_rl._compat  # noqa: F401 — patch ring_flash_attn compat before import
- 
+
  from contextlib import nullcontext
 +import hashlib
 +import json
@@ -20395,7 +20395,7 @@ index 295d3ad..03a4e29 100644
  import time
 -from datetime import timedelta
 +from datetime import datetime, timedelta, timezone
- 
+
  # Import environment before any other imports
  # ruff: noqa: I001
 @@ -12,6 +20,7 @@ from prime_rl.trainer.rl.broadcast import setup_weight_broadcast
@@ -20459,8 +20459,8 @@ index 295d3ad..03a4e29 100644
 +)
  from ring_flash_attn import substitute_hf_flash_attn
  from torchtitan.distributed.utils import clip_grad_norm_
- 
- 
+
+
 +def _parse_cpu_list(value: str) -> set[int]:
 +    cpus = set()
 +    for part in value.strip().split(","):
@@ -21210,11 +21210,11 @@ index 295d3ad..03a4e29 100644
 +            f"Bound local GPU {world.local_rank} worker to NUMA node "
 +            f"{numa_binding[0]} ({numa_binding[1]} CPUs)"
 +        )
- 
+
      # Print warning if running in benchmark mode
      if config.bench is not None:
          logger.warning(f"Running in benchmark mode (max_steps={config.max_steps})")
- 
+
      # Setup the monitor
 -    logger.info(f"Initializing monitor ({config.wandb})")
 +    logger.info(
@@ -21228,7 +21228,7 @@ index 295d3ad..03a4e29 100644
 +        output_dir=config.output_dir,
 +        run_config=config,
      )
- 
+
      # Setup heartbeat (only on rank 0)
 @@ -101,17 +871,24 @@ def train(config: TrainerConfig):
      health_server = None
@@ -21250,7 +21250,7 @@ index 295d3ad..03a4e29 100644
 +                config.metrics_server.port, config.metrics_server.host
 +            )
              health_server.start()
- 
+
      # Set precision
      setup_torch_distributed(
 -        timeout=timedelta(seconds=config.dist_timeout_seconds), enable_gloo=config.model.fsdp_cpu_offload
@@ -21260,7 +21260,7 @@ index 295d3ad..03a4e29 100644
      # Configurable to support ROCm/AMD GPUs where reduced precision
      # matmul corrupts softmax over large vocabularies. Override via config
 @@ -120,41 +897,125 @@ def train(config: TrainerConfig):
- 
+
      # Setup multi run manager and offsets (including LoRA validation/scaling hooks if applicable)
      multi_run_manager = setup_multi_run_manager(
 -        config.output_dir, config.max_concurrent_runs, torch.device("cuda", world.local_rank), config.model.lora
@@ -21270,10 +21270,10 @@ index 295d3ad..03a4e29 100644
 +        config.model.lora,
      )
 +    trainer_only = config.data.fake is not None
- 
+
      # Resolve ep="auto" to a concrete integer before creating parallel dims
      resolve_ep(config.model)
- 
+
      # Initialize parallel dimensions
      parallel_dims = get_parallel_dims(config.model)
 +    if qualification_identity is not None and (
@@ -21293,7 +21293,7 @@ index 295d3ad..03a4e29 100644
 +        qualification_runtime_records = _qualification_runtime_records(
 +            qualification_identity, world, qualification_session
 +        )
- 
+
      # For single-run, check for checkpoint to resume from
      checkpoint_step = None
      if config.max_concurrent_runs == 1:
@@ -21303,7 +21303,7 @@ index 295d3ad..03a4e29 100644
 +        ckpt_manager, weight_ckpt_manager = setup_ckpt_managers(
 +            config.output_dir, config.ckpt, config.model.lora
 +        )
- 
+
 -        if config.ckpt and config.ckpt.resume_step is not None and ckpt_manager is not None:
 +        if (
 +            config.ckpt
@@ -21321,7 +21321,7 @@ index 295d3ad..03a4e29 100644
 +            config.output_dir
 +        )
          logger.info("Initialized multi-run checkpoint manager")
- 
+
      # Initialize the model and tokenizer
      logger.info(f"Initializing model ({config.model})")
      loading_from_ckpt_later = config.ckpt and checkpoint_step is not None
@@ -21379,16 +21379,16 @@ index 295d3ad..03a4e29 100644
 +        logger.info(
 +            f"Loaded {len(parameters)} local tensors from complete adapter {resume_adapter}"
 +        )
- 
+
      logger.info(f"Initializing tokenizer ({config.tokenizer})")
      tokenizer = setup_tokenizer(config.tokenizer)
- 
+
 -    if config.model.vlm is not None and not getattr(model, "supports_packed_multimodal_training", False):
 +    if config.model.vlm is not None and not getattr(
 +        model, "supports_packed_multimodal_training", False
 +    ):
          raise ValueError("Packed multimodal training requires model support")
- 
+
      # Set up the loss function for the RL loss type (ce / ref_kl are fixed)
 @@ -172,7 +1033,9 @@ def train(config: TrainerConfig):
              lora=config.model.lora is not None,
@@ -21402,9 +21402,9 @@ index 295d3ad..03a4e29 100644
          optimizer = setup_multi_optimizer(config.optim, parallel_dims)
          scheduler = setup_multi_scheduler(optimizer, config.scheduler, config.max_steps)
 @@ -185,10 +1048,29 @@ def train(config: TrainerConfig):
- 
+
      logger.info(f"Using `{config.scheduler.type}` scheduler ({config.scheduler})")
- 
+
 -    # Set up weight broadcast (skip when using fake data since there's no inference server)
 -    if config.data.fake:
 +    fresh_lora_policy = (
@@ -21437,7 +21437,7 @@ index 295d3ad..03a4e29 100644
 @@ -198,12 +1080,50 @@ def train(config: TrainerConfig):
              config.model.lora,
          )
- 
+
 +    if parallel_dims.pp_enabled:
 +        # Configure adapter gathering before the policy-0 export.
 +        from prime_rl.trainer.weights import set_pp_gather_context
@@ -21499,7 +21499,7 @@ index 295d3ad..03a4e29 100644
          # we'd have already raised above.
          if config.model.cp_style == "ulysses":
              setup_model_cp(model, cp_group, cp_rank, parallel_dims.cp)
- 
+
 +    # Pipeline parallelism: build one or two local virtual stages before the loop.
 +    pp_stage_module = None
 +    pp_stage_modules = None
@@ -21587,11 +21587,11 @@ index 295d3ad..03a4e29 100644
 +        multi_run_manager.wait_for_run(0)
 +        for idx in multi_run_manager.used_idxs:
 +            multi_run_manager.progress[idx].step = progress.step
- 
+
      logger.info(
          f"Starting from step {progress.step} (total_tokens={progress.total_tokens}, total_samples={progress.total_samples})"
 @@ -240,20 +1245,27 @@ def train(config: TrainerConfig):
- 
+
      # Set up the data loader (Optionally, use a fake data loader for debugging)
      logger.info(f"Initializing data loader ({config.data})")
 +    bin_cost = build_bin_cost(model.config)
@@ -21615,12 +21615,12 @@ index 295d3ad..03a4e29 100644
 +            bin_cost,
              config.rollout_transport,
          )
- 
+
 -    token_exporter = setup_token_exporter(config, parallel_dims, world, logger)
 +    qualification_input_sha256: dict[int, str] = {}
- 
+
      gc_handler = GarbageCollection(config.gc.interval) if config.gc else None
- 
+
 @@ -261,7 +1273,9 @@ def train(config: TrainerConfig):
      maybe_record_function = nullcontext
      if config.trace_path:
@@ -21640,7 +21640,7 @@ index 295d3ad..03a4e29 100644
 +        is_last_step = (
 +            config.max_steps is not None and progress.step == config.max_steps
 +        )
- 
+
          logger.debug(f"Starting training step {progress.step}")
          step_start_time = time.perf_counter()
 @@ -281,7 +1297,9 @@ def train(config: TrainerConfig):
@@ -21682,7 +21682,7 @@ index 295d3ad..03a4e29 100644
 -        load_data_time = time.perf_counter() - load_data_start_time
 +        load_data_time = time.perf_counter() - load_batch_start_time
          logger.debug(f"Loaded batch in {load_data_time:.2f} seconds")
- 
+
 +        # Reject a corrupt batch instead of dying on it. On 2026-08-06 10:13 a
 +        # micro-batch arrived with input_ids of shape [1, 9142729177965406720]
 +        # -- a sequence length just under 2^63, i.e. garbage deserialized as
@@ -21797,7 +21797,7 @@ index 295d3ad..03a4e29 100644
 +        rl_scale, ce_scale, ref_kl_scale = (
 +            max(scale, 1) for scale in global_scales.tolist()
 +        )
- 
+
          logger.debug(f"Starting forward and backward pass ({batch_size=})")
          tensors = Tensors()  # Used to accumulate tensor statistics across micro-batches and ranks for logging
 @@ -339,22 +1459,63 @@ def train(config: TrainerConfig):
@@ -21822,7 +21822,7 @@ index 295d3ad..03a4e29 100644
 +            pp_target_length = int(_max_t.item())
 +            if cp_enabled and pp_target_length % cp_size:
 +                pp_target_length += cp_size - (pp_target_length % cp_size)
- 
+
          for micro_step, micro_batch in enumerate(micro_batches):
 -            input_ids = micro_batch["input_ids"].to("cuda")
 -            position_ids = micro_batch["position_ids"].to("cuda")
@@ -21871,7 +21871,7 @@ index 295d3ad..03a4e29 100644
 +            if routed_experts is not None and not pp_enabled:
 +                # PP defers this cast to GPU-consumption time in _next_side.
 +                routed_experts = routed_experts.to(torch.int32)
- 
+
              if routed_experts is None and config.enable_router_replay:
                  raise ValueError(
 @@ -370,7 +1531,11 @@ def train(config: TrainerConfig):
@@ -21889,16 +21889,16 @@ index 295d3ad..03a4e29 100644
                      "Received multimodal samples but [model.vlm] is not set. "
 @@ -385,12 +1550,19 @@ def train(config: TrainerConfig):
              seq_lens = micro_batch["seq_lens"].to("cuda")
- 
+
              labels = shift_tensor_left(input_ids)
 +            logprob_mask = shift_tensor_left(loss_mask)
 +            if ce_weights is not None:
 +                logprob_mask |= shift_tensor_left(ce_weights != 0)
 +            if ref_kl_weights is not None:
 +                logprob_mask |= shift_tensor_left(ref_kl_weights != 0)
- 
+
              seq_lens_are_pre_shard = False
- 
+
              if cp_enabled:
                  # MRoPE batches must merge image embeddings before sharding.
 -                defer_vlm_cp_to_model = mm_kwargs is not None and "image_grid_thw" in mm_kwargs
@@ -21922,7 +21922,7 @@ index 295d3ad..03a4e29 100644
 +                    )
 +
 +            labels = labels.masked_fill(~logprob_mask, -100)
- 
+
              if config.model.lora:
                  lora_num_tokens = micro_batch["lora_num_tokens"].to("cuda")
 @@ -412,20 +1591,55 @@ def train(config: TrainerConfig):
@@ -21941,10 +21941,10 @@ index 295d3ad..03a4e29 100644
 +                        ),
                      )
                  set_lora_num_tokens(lora_num_tokens)
- 
+
 -            temperatures = micro_batch["temperatures"].to("cuda")
 +            temperatures = micro_batch["temperatures"].to(_dev)
- 
+
              # Shard temperatures for context parallelism if enabled
              if cp_enabled:
 -                temperatures = shard_for_cp(temperatures, cp_rank=cp_rank, cp_world_size=cp_size)
@@ -21977,7 +21977,7 @@ index 295d3ad..03a4e29 100644
 +                    )
 +                )
 +                continue
- 
+
              # Forward pass with per-token temperatures
 -            with maybe_record_function("forward"), maybe_activation_offloading(config.model.ac_offloading):
 +            with maybe_record_function("forward"), maybe_activation_offloading(
@@ -21987,7 +21987,7 @@ index 295d3ad..03a4e29 100644
                      model,
                      input_ids,
 @@ -441,7 +1655,9 @@ def train(config: TrainerConfig):
- 
+
              if out.get("logprobs") is None:
                  # VanillaOutputLinear was used - need to compute logprobs externally with per-token temps
 -                assert out.get("logits") is not None, "Logits must be provided to compute logprobs"
@@ -21998,14 +21998,14 @@ index 295d3ad..03a4e29 100644
                  # Per-token temperature scaling: temperatures is [batch, seq], logits is [batch, seq, vocab]
                  scaled_logits = logits / temperatures.unsqueeze(-1)
 @@ -451,15 +1667,22 @@ def train(config: TrainerConfig):
- 
+
              if cp_enabled:
                  out["logprobs"] = gather_for_cp(out["logprobs"], cp_group)
 -                out["entropy"] = gather_for_cp_wo_grad(out["entropy"], cp_size, cp_group)
 +                out["entropy"] = gather_for_cp_wo_grad(
 +                    out["entropy"], cp_size, cp_group
 +                )
- 
+
 -            vocab_size = getattr(model.config, "vocab_size", None) or model.config.text_config.vocab_size
 +            vocab_size = (
 +                getattr(model.config, "vocab_size", None)
@@ -22022,7 +22022,7 @@ index 295d3ad..03a4e29 100644
 +                out["entropy"],
 +                pad_value=torch.log(torch.tensor(float(vocab_size))).item(),
              )
- 
+
              # Compute loss
 @@ -467,12 +1690,20 @@ def train(config: TrainerConfig):
              loss, loss_tensors = compute_loss(
@@ -22051,7 +22051,7 @@ index 295d3ad..03a4e29 100644
                  ce_scale=ce_scale,
 @@ -489,7 +1720,11 @@ def train(config: TrainerConfig):
              tensors["loss"].append(loss.detach().to("cpu").unsqueeze(0))
- 
+
              env_names = micro_batch["env_names"]
 -            masked_env_names = [env_name for env_name, keep in zip(env_names, loss_mask.flatten().tolist()) if keep]
 +            masked_env_names = [
@@ -22095,7 +22095,7 @@ index 295d3ad..03a4e29 100644
 @@ -523,15 +1766,6 @@ def train(config: TrainerConfig):
                  for env_name, indices in mismatch_env_to_indices.items():
                      tensors[f"mismatch_kl/{env_name}"].append(mismatch_kl[indices])
- 
+
 -            token_exporter.export(
 -                progress.step,
 -                micro_step,
@@ -22124,7 +22124,7 @@ index 295d3ad..03a4e29 100644
              if "routing_confidence" in tensors:
                  micro_step_message += f" | Routing Conf. {tensors['routing_confidence'][-1].mean().item():.4f}"
              logger.debug(micro_step_message)
- 
+
 -        if config.enable_token_export:
 -            dist.barrier()
 -            ready_run_ids = {
@@ -22488,7 +22488,7 @@ index 295d3ad..03a4e29 100644
 +                    "Parity guard rejected step before optimizer update and weight broadcast: "
 +                    + "; ".join(violations)
 +                )
- 
+
          # compute_loss already divided by the global token count. Undo FSDP's per-rank averaging
          # across dp_cp so the final gradient is the true per-token mean over the global batch.
 -        for param in model.parameters():
@@ -22537,7 +22537,7 @@ index 295d3ad..03a4e29 100644
 +            raise RuntimeError(
 +                f"Non-finite gradient at step {progress.step}; refusing to update or broadcast."
 +            )
- 
+
          # Optionally, clip the gradients
          grad_norm: torch.Tensor | None = None
          if config.optim.max_norm is not None:
@@ -22556,13 +22556,13 @@ index 295d3ad..03a4e29 100644
 +                raise RuntimeError(f"Non-finite gradient norm at step {progress.step}; refusing to update or broadcast.")
 +            if dist.get_rank() == 0:
 +                logger.info(f"grad_norm full precision: {grad_norm.item():.6e}")
- 
+
          zero_grad_ratio = get_zero_gradient_ratio(model.parameters(), parallel_dims.dp_replicate)
- 
+
 @@ -585,16 +2221,36 @@ def train(config: TrainerConfig):
          # Update learning rate scheduler
          scheduler.step()
- 
+
 +        if os.environ.get("PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD", "") == "1":
 +            torch.cuda.synchronize()
 +            host_empty_cache = getattr(torch._C, "_host_emptyCache", None)
@@ -22584,7 +22584,7 @@ index 295d3ad..03a4e29 100644
 +            )
 +            dist.all_reduce(maximum_forward_backward, op=dist.ReduceOp.MAX)
 +            forward_backward_time = float(maximum_forward_backward.item())
- 
+
          # Broadcast the model just produced (policy v{progress.step}) so the orchestrator can
          # sample its next step from it. In-memory transports retain their two-step shutdown
          # window; filesystem broadcast still writes every version for resume.
@@ -22620,17 +22620,17 @@ index 295d3ad..03a4e29 100644
 +                    progress.step, model, [optimizer], scheduler, progress
 +                )
                  save_ckpt_time += time.perf_counter() - save_ckpt_start_time
- 
+
              ckpt_manager.maybe_clean()
 @@ -656,18 +2317,29 @@ def train(config: TrainerConfig):
          if memory_profiler is not None:
              memory_profiler.step()
- 
+
 -        # Synchronize the tensor metrics across all steps and ranks
 -        tensor_stats = tensors.compute_stats()
 +        # Forward/loss tensor metrics were synchronized before gradient
 +        # validation so rejected updates preserve the same parity evidence.
- 
+
          # Compute step metrics
 -        num_local_tokens = seq_len * batch_size
 +        # Under PP every micro-batch was padded up to pp_target_length after
@@ -22654,7 +22654,7 @@ index 295d3ad..03a4e29 100644
 +        _peak = torch.tensor(torch.cuda.max_memory_reserved() / 1024**3, device="cuda")
 +        dist.all_reduce(_peak, op=dist.ReduceOp.MAX)
 +        peak_memory = _peak.item()  # GiB, max across ranks
- 
+
          # Log step metrics
          step_time = time.perf_counter() - step_start_time
 @@ -680,7 +2352,9 @@ def train(config: TrainerConfig):
@@ -22666,7 +22666,7 @@ index 295d3ad..03a4e29 100644
 +                f" | Routing Conf. {tensor_stats['routing_confidence/mean']:.4f}"
 +            )
          logger.success(step_message)
- 
+
          # Log performance metrics
 @@ -689,6 +2363,7 @@ def train(config: TrainerConfig):
              "perf/throughput_per_gpu": throughput / world.world_size,
@@ -22678,13 +22678,13 @@ index 295d3ad..03a4e29 100644
          monitor.log(perf_metrics, step=progress.step)
 @@ -710,7 +2385,9 @@ def train(config: TrainerConfig):
              tensor_stats["kl_ent_ratio/mean"] = mismatch_kl_mean / entropy_mean
- 
+
          tensor_stats["step"] = progress.step
 -        monitor.log(filter_rl_trainer_tensor_stats_for_wandb(tensor_stats), step=progress.step)
 +        monitor.log(
 +            filter_rl_trainer_tensor_stats_for_wandb(tensor_stats), step=progress.step
 +        )
- 
+
          # Log time metrics
          time_metrics = {
 @@ -753,7 +2430,11 @@ def train(config: TrainerConfig):
@@ -22703,7 +22703,7 @@ index 295d3ad..03a4e29 100644
 @@ -785,8 +2466,6 @@ def train(config: TrainerConfig):
          prof.export_chrome_trace(trace_file)
          logger.info(f"Saved trace to {trace_file}")
- 
+
 -    token_exporter.close()
 -
      # Write final checkpoint (only for single-run mode; multi-run checkpoints are managed by MultiCheckpointManager)
@@ -22712,7 +22712,7 @@ index 295d3ad..03a4e29 100644
 @@ -799,7 +2478,40 @@ def train(config: TrainerConfig):
          weight_ckpt_manager.save(progress.step, model, tokenizer)
          weight_ckpt_manager.maybe_clean()
- 
+
 -    logger.info(f"Peak memory: {max(to_col_format(monitor.history)['perf/peak_memory']):.1f} GiB")
 +    logger.info(
 +        f"Peak memory: {max(to_col_format(monitor.history)['perf/peak_memory']):.1f} GiB"
@@ -22749,7 +22749,7 @@ index 295d3ad..03a4e29 100644
 +            raise RuntimeError("qualification result write failed")
 +
      logger.success("RL trainer finished!")
- 
+
      # Stop metrics/health server if configured
 diff --git a/src/prime_rl/trainer/runs.py b/src/prime_rl/trainer/runs.py
 index 24dd48d..fa59891 100644
@@ -22758,7 +22758,7 @@ index 24dd48d..fa59891 100644
 @@ -330,6 +330,36 @@ class MultiRunManager:
          for hook in self._deletion_hooks:
              hook(deleted_idx, deleted_run)
- 
+
 +    def create_trainer_only_run(
 +        self,
 +        lora_config: LoRAConfig,
@@ -22832,8 +22832,8 @@ index 8d0ff56..67d7207 100644
 +++ b/src/prime_rl/trainer/weights.py
 @@ -105,6 +105,106 @@ def save_state_dict(
              torch.save(state_dict, save_dir / weights_name)
- 
- 
+
+
 +# ── pipeline parallelism context ─────────────────────────────────────────────
 +# Set once by train.py when pp > 1. Under PP each rank's model holds only its
 +# stage's layers, so the master's local state_dict is a fraction of the model;
@@ -22940,7 +22940,7 @@ index 8d0ff56..67d7207 100644
 @@ -113,18 +213,41 @@ def gather_weights_on_master(
          warnings.filterwarnings("ignore", category=FutureWarning, module="torch.distributed")
          warnings.filterwarnings("ignore", category=UserWarning, module="torch.distributed.*")
- 
+
 +        # Under PP every stage master materialises its stage; otherwise only
 +        # the global master does.
 +        build_local = is_master or (_PP_GROUP is not None and _IS_STAGE_MASTER)
@@ -22949,7 +22949,7 @@ index 8d0ff56..67d7207 100644
              if isinstance(value, DTensor):
                  # only gather after the downcast to dtype as it will be faster
                  value = cast(DTensor, value.to(dtype)).full_tensor()
- 
+
 -            if is_master:
 +            if build_local:
                  key = get_fqns(model, key)
@@ -22978,7 +22978,7 @@ index 8d0ff56..67d7207 100644
 +            else:
 +                cpu_state = {}
          torch.distributed.barrier()
- 
+
      # Always clean up the state dict for HF compatibility
 diff --git a/src/prime_rl/utils/adapter_delta.py b/src/prime_rl/utils/adapter_delta.py
 new file mode 100644
@@ -24541,7 +24541,7 @@ index 56f1403..ffc9a80 100644
 +++ b/src/prime_rl/utils/client.py
 @@ -1,7 +1,10 @@
  from __future__ import annotations
- 
+
  import asyncio
 +import math
  import os
@@ -24553,7 +24553,7 @@ index 56f1403..ffc9a80 100644
 @@ -69,10 +72,22 @@ class InferencePool(Protocol):
          """Wait for inference pool to be ready."""
          ...
- 
+
 -    async def update_weights(self, weight_dir: Path | None, lora_name: str | None = None, step: int = 0) -> None:
 +    async def update_weights(
 +        self,
@@ -24565,7 +24565,7 @@ index 56f1403..ffc9a80 100644
 +    ) -> None:
          """Update weights on all inference servers."""
          ...
- 
+
 +    @property
 +    def adapter_origin_base_urls(self) -> list[str] | None:
 +        """Return the configured admin URLs used as adapter origins."""
@@ -24591,18 +24591,18 @@ index 56f1403..ffc9a80 100644
 @@ -151,6 +173,10 @@ class StaticInferencePool:
      def admin_clients(self) -> list[AsyncClient]:
          return self._admin_clients
- 
+
 +    @property
 +    def adapter_origin_base_urls(self) -> list[str] | None:
 +        return self._adapter_origin_base_urls
 +
      def update_model_name(self, model_name: str) -> None:
          self.model_name = model_name
- 
+
 @@ -172,8 +198,22 @@ class StaticInferencePool:
          )
          await maybe_check_has_model(self._admin_clients, model_name, skip_model_check=self._skip_model_check)
- 
+
 -    async def update_weights(self, weight_dir: Path | None, lora_name: str | None = None, step: int = 0) -> None:
 -        await update_weights(self._admin_clients, weight_dir, lora_name=lora_name, step=step)
 +    async def update_weights(
@@ -24621,13 +24621,13 @@ index 56f1403..ffc9a80 100644
 +            require_delta=require_delta,
 +            prefetched=prefetched,
 +        )
- 
+
      async def score(self, token_ids: list[int]) -> list[float]:
          """Prefill-score ``token_ids`` under this pool's model (one logprob per
 @@ -296,6 +336,24 @@ async def maybe_check_has_model(
      logger.debug(f"Model {model_name} was found in the inference pool")
- 
- 
+
+
 +async def model_is_visible(admin_client: AsyncClient, model_name: str) -> bool:
 +    """Return whether one endpoint currently exposes ``model_name``.
 +
@@ -24679,8 +24679,8 @@ index 56f1403..ffc9a80 100644
 +        total_timeout_s=total_timeout_s,
 +        **kwargs,
 +    )
- 
- 
+
+
 -async def _admin_post(client: AsyncClient, path: str, *, timeout_s: float = ADMIN_TIMEOUT_S, **kwargs) -> None:
 -    """POST an admin op with a bounded per-attempt timeout, retrying transient errors.
 -
@@ -24709,8 +24709,8 @@ index 56f1403..ffc9a80 100644
              response.raise_for_status()
 +            return response
 +    raise RuntimeError(f"admin operation did not complete: {path}")
- 
- 
+
+
  async def _pause_engines(admin_clients: list[AsyncClient], *, step: int) -> None:
 -    """Pause all inference engines, waiting for in-flight requests to drain."""
 +    """Abort registered requests and pause every inference scheduler.
@@ -24726,11 +24726,11 @@ index 56f1403..ffc9a80 100644
 +        *[_admin_post(client, "/pause", params={"mode": "abort", "clear_cache": "false"}) for client in admin_clients]
      )
      logger.debug("All inference engines paused")
- 
+
 @@ -387,19 +483,338 @@ async def _pause_engines(admin_clients: list[AsyncClient], *, step: int) -> None
  async def _resume_engines(admin_clients: list[AsyncClient]) -> None:
      """Resume all inference engines after weight update.
- 
+
 -    Resuming is idempotent (it just clears the paused flag), so retrying transient
 -    failures is safe; a dropped /resume would leave engines paused indefinitely.
 +    Resuming is idempotent. A timeout does not prove that the request failed:
@@ -24820,8 +24820,8 @@ index 56f1403..ffc9a80 100644
 +
 +    await asyncio.gather(*[_resume_one(client) for client in admin_clients])
      logger.debug("All inference engines resumed")
- 
- 
+
+
 +async def stage_lora_adapter(
 +    admin_clients: list[AsyncClient],
 +    lora_path: Path | str,
@@ -25069,14 +25069,14 @@ index 56f1403..ffc9a80 100644
 +    prefetched: bool = False,
  ) -> None:
      """Update weights on static inference servers.
- 
+
 @@ -413,33 +828,55 @@ async def update_weights(
      """
      logger = get_logger()
- 
+
 -    weight_dir_posix = weight_dir.as_posix() if weight_dir is not None else None
 +    weight_dir_posix = str(weight_dir) if weight_dir is not None else None
- 
+
      if lora_name is not None and weight_dir is not None:
 -        await load_lora_adapter(admin_clients, lora_name, weight_dir)
 +        # Pause admission while the collective LoRA load runs.
@@ -25094,7 +25094,7 @@ index 56f1403..ffc9a80 100644
      else:
          # Pause engines so all DP workers drain in-flight work and can join the NCCL broadcast
          await _pause_engines(admin_clients, step=step)
- 
+
          try:
              # Create ready marker before servers enter receive path (used by NCCL broadcast)
 -            if weight_dir is not None:
@@ -25103,7 +25103,7 @@ index 56f1403..ffc9a80 100644
                  nccl_ready_file.parent.mkdir(parents=True, exist_ok=True)
                  nccl_ready_file.touch()
                  logger.debug(f"Created NCCL_READY marker at {nccl_ready_file}")
- 
+
 -            await asyncio.gather(
 -                *[
 -                    _admin_post(
@@ -25134,11 +25134,11 @@ index 56f1403..ffc9a80 100644
 +            await asyncio.gather(*[_update(admin_client) for admin_client in admin_clients])
          finally:
              await _resume_engines(admin_clients)
- 
+
 @@ -457,18 +894,68 @@ def _is_retryable_lora_error(exception: BaseException) -> bool:
      return False
- 
- 
+
+
 -# Per-attempt and total bounds for `/load_lora_adapter`. A LoRA load is fast
 -# (small adapter file + KV cache reset, single-digit seconds in practice) but
 -# the global admin AsyncClient uses `timeout=None`, so a stuck server hangs
@@ -25200,8 +25200,8 @@ index 56f1403..ffc9a80 100644
 +        return math.isfinite(float(value))
 +    except (OverflowError, ValueError):
 +        return False
- 
- 
+
+
 -async def load_lora_adapter(admin_clients: list[AsyncClient], lora_name: str, lora_path: Path) -> None:
 +async def load_lora_adapter(
 +    admin_clients: list[AsyncClient],
@@ -25212,7 +25212,7 @@ index 56f1403..ffc9a80 100644
 +    prefetched: bool = False,
 +) -> None:
      """Make a HTTP post request to the vLLM server to load a LoRA adapter.
- 
+
      Uses our wrapper around vLLM's /v1/load_lora_adapter. The prefix cache is not reset
 @@ -479,22 +966,50 @@ async def load_lora_adapter(admin_clients: list[AsyncClient], lora_name: str, lo
      which can happen due to NFS propagation delays.
@@ -25220,7 +25220,7 @@ index 56f1403..ffc9a80 100644
      logger = get_logger()
 -    lora_path_posix = lora_path.as_posix()
 +    lora_path_posix = str(lora_path)
- 
+
      @retry(
          retry=retry_if_exception(_is_retryable_lora_error),
 -        stop=stop_after_delay(LORA_LOAD_TOTAL_TIMEOUT_S) | stop_after_attempt(10),
@@ -25270,9 +25270,9 @@ index 56f1403..ffc9a80 100644
 +                )
 +                return
 +            raise
- 
+
      await asyncio.gather(*[_load_lora_adapter(admin_client) for admin_client in admin_clients])
- 
+
 diff --git a/src/prime_rl/utils/cp.py b/src/prime_rl/utils/cp.py
 index a3b483d..1abd42f 100644
 --- a/src/prime_rl/utils/cp.py
@@ -25280,13 +25280,13 @@ index a3b483d..1abd42f 100644
 @@ -81,7 +81,8 @@ def setup_sparse_mla_cp(model: nn.Module, cp_group: dist.ProcessGroup, cp_rank:
      if not hasattr(model.model, "layers"):
          return
- 
+
 -    for layer in model.model.layers:
 +    from prime_rl.trainer.model import iter_layers
 +    for layer in iter_layers(model.model.layers):
          if not hasattr(layer, "set_context_parallel_attributes"):
              continue
- 
+
 @@ -172,9 +173,33 @@ def setup_cp_attention_params(
      seq_lens: torch.Tensor,
      cp_style: CPStyle = "ring",
@@ -25322,15 +25322,15 @@ index a3b483d..1abd42f 100644
 +        seq_lens,
          total_tokens=total_tokens,
      )
- 
+
 diff --git a/src/prime_rl/utils/monitor/__init__.py b/src/prime_rl/utils/monitor/__init__.py
 index e7c8346..8bf7444 100644
 --- a/src/prime_rl/utils/monitor/__init__.py
 +++ b/src/prime_rl/utils/monitor/__init__.py
 @@ -2,17 +2,19 @@ from pathlib import Path
- 
+
  from transformers.tokenization_utils import PreTrainedTokenizer
- 
+
 -from prime_rl.configs.shared import FileMonitorConfig, PrimeMonitorConfig, WandbWithExtrasConfig
 +from prime_rl.configs.shared import FileMonitorConfig, PrimeMonitorConfig, SwanlabConfig, WandbWithExtrasConfig
  from prime_rl.utils.config import BaseConfig
@@ -25340,7 +25340,7 @@ index e7c8346..8bf7444 100644
  from prime_rl.utils.monitor.prime import PrimeMonitor
 +from prime_rl.utils.monitor.swanlab import SwanlabMonitor
  from prime_rl.utils.monitor.wandb import WandbMonitor
- 
+
  __all__ = [
      "Monitor",
      "WandbMonitor",
@@ -25359,7 +25359,7 @@ index e7c8346..8bf7444 100644
 @@ -86,6 +89,16 @@ def setup_monitor(
              )
          )
- 
+
 +    if swanlab_config is not None:
 +        monitors.append(
 +            SwanlabMonitor(
@@ -25460,20 +25460,20 @@ index c40c93c..33403ff 100644
 -    language_model_attr = "model.my_lm"
 -"""
 +"""Vision-language model architecture metadata and component access."""
- 
+
  from dataclasses import dataclass
- 
+
 @@ -17,13 +8,12 @@ from transformers.configuration_utils import PretrainedConfig
- 
+
  @dataclass(frozen=True)
  class VLMModelInfo:
 -    """Per-model-family VLM architecture metadata."""
 +    """Attribute paths for one VLM family."""
- 
+
      vision_encoder_attr: str
      language_model_attr: str
- 
- 
+
+
 -# Central registry: model_type -> architecture info.
  VLM_REGISTRY: dict[str, VLMModelInfo] = {
      "qwen3_vl": VLMModelInfo(vision_encoder_attr="model.visual", language_model_attr="model.language_model"),
@@ -25481,11 +25481,11 @@ index c40c93c..33403ff 100644
 @@ -32,88 +22,51 @@ VLM_REGISTRY: dict[str, VLMModelInfo] = {
      "gemma4": VLMModelInfo(vision_encoder_attr="model.vision_tower", language_model_attr="model.language_model"),
  }
- 
+
 -# Text-only default
  DEFAULT_LAYER_PREFIX = "model.layers."
- 
- 
+
+
 -# ---------------------------------------------------------------------------
 -# Model component access
 -# ---------------------------------------------------------------------------
@@ -25510,8 +25510,8 @@ index c40c93c..33403ff 100644
 -
 -    return None
 +    return _resolve_attr(model, info.vision_encoder_attr) if info is not None else None
- 
- 
+
+
  def get_language_model(model: nn.Module, override: str | None = None) -> nn.Module:
 -    """Get the language model module (the part with transformer layers).
 -
@@ -25533,14 +25533,14 @@ index c40c93c..33403ff 100644
 -
 -    # Text-only models: language model is directly at model.model
      return model.model
- 
- 
+
+
  def is_vlm_architecture(model_config: PretrainedConfig) -> bool:
 -    """Check if the model config belongs to a known VLM architecture."""
 +    """Return whether the config is a registered VLM architecture."""
      return _get_model_info_from_config(model_config) is not None
- 
- 
+
+
  def get_final_logit_softcapping(model_config: PretrainedConfig) -> float | None:
 -    """Read ``final_logit_softcapping`` from the text config.
 -
@@ -25550,8 +25550,8 @@ index c40c93c..33403ff 100644
 -    """
 +    """Return text-model final-logit softcapping when it is configured."""
      return getattr(model_config.get_text_config(), "final_logit_softcapping", None)
- 
- 
+
+
  def get_layer_prefix(model_config: PretrainedConfig, override: str | None = None) -> str:
 -    """Return the weight key prefix for language model layers.
 -
@@ -25571,12 +25571,12 @@ index c40c93c..33403ff 100644
 -# Internal
 -# ---------------------------------------------------------------------------
 +    return info.language_model_attr + ".layers." if info is not None else DEFAULT_LAYER_PREFIX
- 
- 
+
+
  def _get_model_info(model: nn.Module) -> VLMModelInfo | None:
 @@ -127,7 +80,6 @@ def _get_model_info_from_config(model_config: PretrainedConfig) -> VLMModelInfo
- 
- 
+
+
  def _resolve_attr(obj, dotted_path: str):
 -    """Resolve a dotted attribute path like 'model.visual' on an object."""
      for part in dotted_path.split("."):
