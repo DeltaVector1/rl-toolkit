@@ -17,9 +17,6 @@ gpu_memory_utilization = 0.92
 enable_prefix_caching = true
 enable_expert_parallel = true
 enable_eplb = false
-# x35 showed that route replay only reduced mismatch KL from 3.83 to 3.17.
-# Do not send the 624 route bytes per generated token in the x36 Triton-MoE
-# parity check.
 enable_return_routed_experts = false
 api_server_count = 1
 
