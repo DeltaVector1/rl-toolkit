@@ -119,22 +119,8 @@ SHUTDOWN_TIMEOUT_S = 300
 # dataset; fail loudly instead of spinning
 MAX_CONSECUTIVE_EMPTY_BATCHES = 10
 
-# Keep one complete GRPO group beyond the exact batch target. It carries into
-# the next batch and prevents one long-tail member of the last group from
-# holding an otherwise complete batch. No rollout is selected or dropped.
-# Keep several independent groups open at the tail. One spare still made x72p
-# wait for the slowest few requests in two partially complete groups at step 3.
-# Eight spares fill the existing 128-request cap initially. Four spares still
-# left x72p rollout 31 at 1008/1024 behind one long member while 69 other
-# incomplete members were buffered. Eight spares improved rollout 33 to 17m35s,
-# but rollout 34 fell to 20 live requests with 135 members spread across open
-# groups. Sixteen spares let freed request slots open more groups without
-# changing the 128-request cap. A clean follow-up reached 880/1024 with 317
-# buffered members and only 75 live; the 256-row allowance had eight credits
-# left, less than one group, so fresh groups closed again. Thirty-two groups
-# bound the measured partial-group backlog while the independent dispatcher
-# limiter still enforces 128 actual in-flight requests. Completed overflow
-# carries into the next batch; trainer batch and GRPO group sizes do not change.
+# Keep complete GRPO groups available when the last active request is slow.
+# Completed overflow carries into the next batch.
 ROLLOUT_TAIL_SPARE_GROUPS = 32
 
 
@@ -159,11 +145,7 @@ def rollout_budget(
             budget = max(budget, refill)
     return budget
 
-# A staged adapter applies at a train-batch boundary when the collecting batch
-# is still inside the configured off-policy limit. An in-flight update restarted
-# 19 complete GRPO groups during x72p rollout 22 and increased collection from
-# 15 minutes to 35 minutes. Let the valid old-policy batch finish instead. The
-# timeout keeps a genuinely wedged batch from holding an update indefinitely.
+# Let a valid old-policy batch finish before an adapter update.
 POLICY_UPDATE_BATCH_WAIT_TIMEOUT_S = 1200
 
 # Default wait for the trainer's startup weight broadcast when no ckpt block
@@ -1193,9 +1175,7 @@ class Orchestrator:
         )
         buffered = self.train_sink.buffered_count()
         group = max(1, getattr(self.config, "group_size", 1))
-        # The spare is normal full-group overflow for the next step. It removes
-        # the exact-batch barrier that held x71p step 8 at 1008 + 15 buffered
-        # while one long-tail request finished.
+        # Full-group overflow carries into the next step.
         budget = rollout_budget(
             batch_size=self.config.batch_size,
             current=current,

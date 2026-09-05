@@ -219,11 +219,8 @@ def set_reentrant_block_checkpointing(layer: nn.Module) -> None:
     """Checkpoint a complete decoder block at its FSDP ownership boundary.
 
     FSDP installs its pre-backward unshard hook on the block output. Reentrant
-    checkpoint recomputation starts only after that hook has restored the
-    block's parameters. This is the safe native-FP8 attention path. Do not
-    replace it with an inner non-reentrant ``attention``, ``attn_proj``, or
-    ``mla_up_proj`` checkpoint: x53d and x54e measured all-NaN sparse Q from
-    that ordering while ``reshard_after_forward`` was enabled.
+    checkpoint recomputation starts after that hook restores the block's
+    parameters.
     """
 
     checkpoint_method(
@@ -241,9 +238,7 @@ def set_reentrant_attention_checkpointing(layer: nn.Module) -> None:
 
     The checkpoint stays reentrant. The owning decoder block remains the FSDP
     unit, so its output pre-backward hook restores the FP8 parameters before
-    attention recompute starts. MLP activations remain eager. Do not replace
-    this with the selective non-reentrant ``attention`` target; x53d and x54e
-    measured nonfinite sparse-Q activations in that ordering.
+    attention recompute starts. MLP activations remain eager.
     """
 
     self_attn = getattr(layer, "self_attn", None)

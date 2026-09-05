@@ -50,9 +50,7 @@ from prime_rl.utils.client import InferencePool, client_identity
 from prime_rl.utils.logger import get_logger
 
 
-# Let already-running members close useful GRPO groups before a strict policy
-# boundary cancels the remainder. This is deliberately shorter than the
-# measured long-generation tail; the boundary still has a hard upper bound.
+# Let active requests finish their GRPO group before a policy change.
 POLICY_GROUP_DRAIN_GRACE_S = 60
 TRANSIENT_RETRY_WINDOW_S = 180
 TRANSIENT_RETRIES_PER_ROLLOUT = 3
@@ -322,11 +320,8 @@ class RolloutDispatcher:
     async def on_version_pending(self, step: int) -> None:
         """Stop admission and restart incomplete live-policy groups at ``step``.
 
-        A fused MoE LoRA load needs an empty vLLM scheduler. Waiting for every
-        long-tail request made policy updates take 5 to 10 minutes in x71p.
-        Cancelling only unfinished members would corrupt the GRPO baseline, so
-        preserve each prompt and regenerate its complete group under the new
-        policy. Eval remains a version-pinned measurement and drains naturally.
+        A LoRA load needs an empty vLLM scheduler. Regenerate a complete group
+        after cancellation so the GRPO baseline stays valid.
         """
         # Set this before any cancellation so fill_inflight cannot schedule a
         # task between the snapshot and the group reset.

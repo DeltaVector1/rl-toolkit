@@ -1378,12 +1378,7 @@ def train(config: TrainerConfig):
                 )
                 continue
 
-            # Schedule1F1B requires at least one micro-batch for each pipeline
-            # stage. An engine restart can make almost all rollouts fail and
-            # leave a much smaller packed trainer batch. x60r received two
-            # micro-batches under PP8 and PyTorch stopped the complete trainer.
-            # All ranks have already agreed on the count and identity above;
-            # consume and discard a uniformly undersized rollout batch.
+            # Schedule1F1B needs one micro-batch for each pipeline stage.
             _minimum_count = torch.tensor(
                 len(micro_batches), dtype=torch.int64, device="cuda"
             )

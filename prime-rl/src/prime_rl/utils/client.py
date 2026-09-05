@@ -831,14 +831,7 @@ async def update_weights(
     weight_dir_posix = str(weight_dir) if weight_dir is not None else None
 
     if lora_name is not None and weight_dir is not None:
-        # vLLM's fused MoE LoRA load is a worker collective. Running it while
-        # decode requests remain registered repeatedly stalled h200b in x64p:
-        # the token counter stopped and EngineCore logged one unavailable
-        # shared-memory broadcast block per minute until the watchdog restart.
-        # The dispatcher's version-pending hook drains registered requests
-        # before this function runs. Pause here to prevent the engine from
-        # admitting work during the collective. Always resume, including after
-        # a bounded load failure.
+        # Pause admission while the collective LoRA load runs.
         await _pause_engines(admin_clients, step=step)
         try:
             await load_lora_adapter(

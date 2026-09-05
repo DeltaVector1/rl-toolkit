@@ -109,23 +109,7 @@ def balanced_boundaries(num_layers: int, pp_size: int, allowed: list[int] | None
     # best[(stage, start)] -> (max_cost, sum_sq_cost, boundary_list)
     from functools import lru_cache
 
-    # Balance PEAK MEMORY, not layer count. Under 1F1B stage s keeps
-    # (pp_size - s) micro-batches live, so its footprint is
-    #     layers * (per-layer weights + per-layer activations * in-flight)
-    # Minimising the largest stage ignores the in-flight term and loads the
-    # early stages hardest, which is where the host mirror hits its ceiling
-    # first (measured x16: 488 GB shared on stage 0 versus 112 GB on stage 7).
-    #
-    # Weighting by activations ALONE is worse, not better: it hands the last
-    # stage 32 of 78 layers, and weights dominate at ~1.5 GB/layer, so that
-    # stage needs 52 GB on a 48 GB card. Both terms have to be in the cost.
-    #
-    # Constants measured on x16 (10-layer stage 0, 8 micro-batches in flight):
-    #   at rest 15018 MiB  -> 1.50 GB per layer of weights
-    #   at peak 25938 MiB  -> (25938-15018)/(10*8) = 0.137 GB per layer per
-    #                         in-flight micro-batch
-    # Only their ratio matters to the optimiser, so drift in absolute values is
-    # harmless as long as weights stay roughly an order of magnitude larger.
+    # Balance weight memory and live activation memory for each stage.
     _GB_WEIGHTS_PER_LAYER = 1.50
     _GB_ACTS_PER_LAYER_PER_MICROBATCH = 0.137
 

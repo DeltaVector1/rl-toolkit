@@ -618,14 +618,7 @@ def _streaming_int4_forward(
     if received_input is not None:
         received_input.prepare(output_rows, cols)
 
-    # The operation is the sole consumer of its input, and its backward does
-    # not need the forward values. If the input allocation is large enough for
-    # the returned rows, reuse it for the BF16 result. Quantize the complete
-    # source before overwriting it in that case. If routing imbalance requires
-    # a larger result, allocate that result before any packed transport buffer
-    # and quantize only one send round at a time. The latter ordering removed a
-    # measured step-8 dispatch peak where a 498 MiB result had only 413.5 MiB
-    # physically free while full packed send and receive buffers were live.
+    # Reuse input storage when it can hold the returned rows.
     if reuse_input:
         # The input and final output share storage.  Do not overwrite any BF16
         # source rows until every round has sent them.  Retain the compact INT4

@@ -1604,11 +1604,7 @@ def _dispatch_grouped_mm(
             x.shape[0], 1, output_size, device=x.device, dtype=x.dtype
         )
     except torch.OutOfMemoryError:
-        # A routed-row peak can coincide with allocator fragmentation. x72p
-        # rank 18 failed a 24 MiB allocation while PyTorch reported 1.16 GiB
-        # reserved but unallocated. Release only unused cached blocks and make
-        # one bounded retry. A true live-set OOM still fails immediately on
-        # the second allocation.
+        # Release unused cached blocks before one bounded retry.
         torch.cuda.empty_cache()
         out = torch.empty(
             x.shape[0], 1, output_size, device=x.device, dtype=x.dtype
@@ -1641,9 +1637,7 @@ def _dispatch_grouped_mm(
     # backward.  The dense expert implementation has the same zero-padding
     # contract.
     result = out[:, 0]
-    # ``out`` is new storage owned by this dispatch. An out-of-place mask made
-    # a second 118-to-524 MiB expert result at the production shape and OOMed
-    # x60l after the inverse-permutation allocation was removed.
+    # Mask in place to avoid a second expert result.
     result.masked_fill_((rows >= offsets[-1]).unsqueeze(-1), 0)
     return result
 
@@ -1727,15 +1721,7 @@ def _expert_chunk_offsets(offsets, start, end):
 
 
 def _index_select_rows_with_cache_retry(x, indices):
-    """Gather one bounded expert row chunk, with one fragmentation retry.
-
-    The production allocator can have enough unused reserved memory in total
-    while no cached block is large enough for a contiguous BF16 row gather.
-    x74p rank 17 failed a 48 MiB gather with 179 MiB reserved but unused. A
-    one-time cache release preserves the bounded-row path and turns that
-    allocator-fragmentation case into physically available memory. A true
-    live-set OOM still fails on the second allocation.
-    """
+    """Gather rows with one retry after releasing unused cached memory."""
     try:
         return x.index_select(0, indices)
     except torch.OutOfMemoryError:
@@ -1744,13 +1730,7 @@ def _index_select_rows_with_cache_retry(x, indices):
 
 
 def _index_copy_real_rows_with_cache_retry(destination, indices, source, real):
-    """Scatter one bounded real-row chunk with one fragmentation retry.
-
-    Keep this on PyTorch's already-loaded indexing path. A custom Triton
-    scatter first encountered a new kernel variant during x79p step 4 and
-    failed while loading its CUDA module at the full model live set. The
-    4,096-row bound limits the boolean source gather to 48 MiB here.
-    """
+    """Scatter real rows with one retry after releasing cached memory."""
     try:
         destination.index_copy_(0, indices[real].long(), source[real])
     except torch.OutOfMemoryError:
@@ -1830,11 +1810,7 @@ class _Experts(torch.autograd.Function):
     def forward(ctx, x, w1, s1, w2, s2, w3, s3, offsets, owner):
         offload = _FP8_EXPERT_ACTIVATION_OFFLOAD and x.is_cuda
         if offload:
-            # An eager 1F1B stage retains one expert context for each live
-            # microbatch. Keeping q1 and q3 on the GPU used several GiB and
-            # left x60m unable to allocate even a 48 MiB W2 chunk. Stream the
-            # W1/W3 pair, retain its exact per-token FP8 values in pinned host
-            # memory, and keep only the small inverse scales on the GPU.
+            # Keep FP8 activations in pinned host memory between passes.
             gated = x.new_empty(x.shape[0], w1.shape[1])
             q1_host = q3_host = None
             qs1_parts = []
@@ -2027,10 +2003,7 @@ class _InplacePermutedExperts(torch.autograd.Function):
                 chunk_offsets,
                 shared_input=True,
             )
-            # The W2 result is hidden-size wide. Release the gathered input
-            # before W2 allocates its output. In x72p step 39, retaining this
-            # 24 MiB tensor left only 1.5 MiB free and the following 24 MiB
-            # grouped-matrix output failed on rank 18.
+            # Release the gathered input before W2 allocates its output.
             del chunk_x, safe_indices
             q1, qs1 = ops.scaled_fp8_quant(z1, use_per_token_if_dynamic=True)
             q3, qs3 = ops.scaled_fp8_quant(z3, use_per_token_if_dynamic=True)
