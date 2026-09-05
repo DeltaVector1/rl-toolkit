@@ -20369,7 +20369,7 @@ index 1ad250c..85c4267 100644
              )
          return TensorMicroBatch(
 diff --git a/src/prime_rl/trainer/rl/train.py b/src/prime_rl/trainer/rl/train.py
-index 295d3ad..a5277ea 100644
+index 295d3ad..03a4e29 100644
 --- a/src/prime_rl/trainer/rl/train.py
 +++ b/src/prime_rl/trainer/rl/train.py
 @@ -1,8 +1,16 @@
@@ -22100,7 +22100,7 @@ index 295d3ad..a5277ea 100644
              if is_tt_moe_model(model):
                  load_balance_stats = get_load_balance_stats(model)
                  for k, v in load_balance_stats.items():
-@@ -545,36 +1779,466 @@ def train(config: TrainerConfig):
+@@ -545,36 +1779,438 @@ def train(config: TrainerConfig):
              # Debug log with *local, micro step* stats
              micro_step_message = f"Micro Step {micro_step}/{len(micro_batches)} | Loss {tensors['loss'][-1].mean().item():.4f} | Entropy {tensors['entropy/all'][-1].mean().item():.4f}"
              if has_mismatch_tokens:
@@ -22548,38 +22548,10 @@ index 295d3ad..a5277ea 100644
 +                raise RuntimeError(f"Non-finite gradient norm at step {progress.step}; refusing to update or broadcast.")
 +            if dist.get_rank() == 0:
 +                logger.info(f"grad_norm full precision: {grad_norm.item():.6e}")
-+
-+        if (
-+            pp_enabled
-+            and dist.get_rank() % (dist.get_world_size() // parallel_dims.pp) == 0
-+        ):
-+            import sys
-+
-+            from torch.distributed.tensor import DTensor as _DT
-+
-+            stage_gradient_l1 = 0.0
-+            parameters_with_gradient = 0
-+            for parameter in model.parameters():
-+                if parameter.grad is None:
-+                    continue
-+                parameters_with_gradient += 1
-+                gradient = (
-+                    parameter.grad.to_local()
-+                    if isinstance(parameter.grad, _DT)
-+                    else parameter.grad
-+                )
-+                stage_gradient_l1 += float(gradient.abs().sum())
-+            print(
-+                f"[grad-check] step={progress.step} stage={pp_rank} "
-+                f"lora_grad_l1={stage_gradient_l1:.6e} "
-+                f"params_with_grad={parameters_with_gradient}",
-+                file=sys.stderr,
-+                flush=True,
-+            )
  
          zero_grad_ratio = get_zero_gradient_ratio(model.parameters(), parallel_dims.dp_replicate)
  
-@@ -585,16 +2249,36 @@ def train(config: TrainerConfig):
+@@ -585,16 +2221,36 @@ def train(config: TrainerConfig):
          # Update learning rate scheduler
          scheduler.step()
  
@@ -22617,7 +22589,7 @@ index 295d3ad..a5277ea 100644
              broadcast_weights_time = 0
          else:
              broadcast_unused = (
-@@ -605,8 +2289,11 @@ def train(config: TrainerConfig):
+@@ -605,8 +2261,11 @@ def train(config: TrainerConfig):
              if not broadcast_unused:
                  broadcast_weights_start_time = time.perf_counter()
                  weight_broadcast.broadcast_weights(model, step=progress.step)
@@ -22631,7 +22603,7 @@ index 295d3ad..a5277ea 100644
                  if config.weight_broadcast.type == "filesystem":
                      interval_to_keep = config.ckpt and config.ckpt.interval
                      weight_broadcast.maybe_clean(interval_to_keep)
-@@ -637,7 +2324,9 @@ def train(config: TrainerConfig):
+@@ -637,7 +2296,9 @@ def train(config: TrainerConfig):
                  # Single-run: Save full checkpoint
                  logger.info(f"Saving checkpoint at step {progress.step}")
                  save_ckpt_start_time = time.perf_counter()
@@ -22642,7 +22614,7 @@ index 295d3ad..a5277ea 100644
                  save_ckpt_time += time.perf_counter() - save_ckpt_start_time
  
              ckpt_manager.maybe_clean()
-@@ -656,18 +2345,29 @@ def train(config: TrainerConfig):
+@@ -656,18 +2317,29 @@ def train(config: TrainerConfig):
          if memory_profiler is not None:
              memory_profiler.step()
  
@@ -22677,7 +22649,7 @@ index 295d3ad..a5277ea 100644
  
          # Log step metrics
          step_time = time.perf_counter() - step_start_time
-@@ -680,7 +2380,9 @@ def train(config: TrainerConfig):
+@@ -680,7 +2352,9 @@ def train(config: TrainerConfig):
          if "max_vio/mean" in tensor_stats:
              step_message += f" | Max Vio {tensor_stats['max_vio/mean']:.4f}"
          if "routing_confidence/mean" in tensor_stats:
@@ -22688,7 +22660,7 @@ index 295d3ad..a5277ea 100644
          logger.success(step_message)
  
          # Log performance metrics
-@@ -689,6 +2391,7 @@ def train(config: TrainerConfig):
+@@ -689,6 +2363,7 @@ def train(config: TrainerConfig):
              "perf/throughput_per_gpu": throughput / world.world_size,
              "perf/mfu": mfu,
              "perf/peak_memory": peak_memory,
@@ -22696,7 +22668,7 @@ index 295d3ad..a5277ea 100644
              "step": progress.step,
          }
          monitor.log(perf_metrics, step=progress.step)
-@@ -710,7 +2413,9 @@ def train(config: TrainerConfig):
+@@ -710,7 +2385,9 @@ def train(config: TrainerConfig):
              tensor_stats["kl_ent_ratio/mean"] = mismatch_kl_mean / entropy_mean
  
          tensor_stats["step"] = progress.step
@@ -22707,7 +22679,7 @@ index 295d3ad..a5277ea 100644
  
          # Log time metrics
          time_metrics = {
-@@ -753,7 +2458,11 @@ def train(config: TrainerConfig):
+@@ -753,7 +2430,11 @@ def train(config: TrainerConfig):
                  if config.max_concurrent_runs == 1:
                      lr = optimizer.param_groups[0]["lr"]
                  else:
@@ -22720,7 +22692,7 @@ index 295d3ad..a5277ea 100644
                  run_stats.append(
                      RunStats(
                          run_id=run_id,
-@@ -785,8 +2494,6 @@ def train(config: TrainerConfig):
+@@ -785,8 +2466,6 @@ def train(config: TrainerConfig):
          prof.export_chrome_trace(trace_file)
          logger.info(f"Saved trace to {trace_file}")
  
@@ -22729,7 +22701,7 @@ index 295d3ad..a5277ea 100644
      # Write final checkpoint (only for single-run mode; multi-run checkpoints are managed by MultiCheckpointManager)
      if config.max_concurrent_runs == 1 and ckpt_manager is not None:
          if not (config.ckpt and config.ckpt.weights_only):
-@@ -799,7 +2506,40 @@ def train(config: TrainerConfig):
+@@ -799,7 +2478,40 @@ def train(config: TrainerConfig):
          weight_ckpt_manager.save(progress.step, model, tokenizer)
          weight_ckpt_manager.maybe_clean()
  
