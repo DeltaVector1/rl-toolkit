@@ -2212,34 +2212,6 @@ def train(config: TrainerConfig):
             if dist.get_rank() == 0:
                 logger.info(f"grad_norm full precision: {grad_norm.item():.6e}")
 
-        if (
-            pp_enabled
-            and dist.get_rank() % (dist.get_world_size() // parallel_dims.pp) == 0
-        ):
-            import sys
-
-            from torch.distributed.tensor import DTensor as _DT
-
-            stage_gradient_l1 = 0.0
-            parameters_with_gradient = 0
-            for parameter in model.parameters():
-                if parameter.grad is None:
-                    continue
-                parameters_with_gradient += 1
-                gradient = (
-                    parameter.grad.to_local()
-                    if isinstance(parameter.grad, _DT)
-                    else parameter.grad
-                )
-                stage_gradient_l1 += float(gradient.abs().sum())
-            print(
-                f"[grad-check] step={progress.step} stage={pp_rank} "
-                f"lora_grad_l1={stage_gradient_l1:.6e} "
-                f"params_with_grad={parameters_with_gradient}",
-                file=sys.stderr,
-                flush=True,
-            )
-
         zero_grad_ratio = get_zero_gradient_ratio(model.parameters(), parallel_dims.dp_replicate)
 
         # Update the model parameters
