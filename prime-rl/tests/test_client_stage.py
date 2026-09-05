@@ -3,10 +3,13 @@ import asyncio
 import httpx
 import math
 import os
+import re
 import time
 import tomllib
 import unittest
+from collections.abc import Mapping
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -51,12 +54,28 @@ class _ManifestProbeClient:
         return _ManifestProbeResponse(self.version)
 
 
+def _adapter_identity(step=1):
+    return {
+        "source_url": f"http://adapter/step_{step}",
+        "target_sha256": f"{step:x}" * 64,
+        "target_size": 8,
+        "config_sha256": "b" * 64,
+        "config_size": 2,
+    }
+
+
 def _load_stage_function(probe_version=1):
     source = CLIENT_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
     function = next(
         node
-        for node in ast.walk(ast.parse(source))
+        for node in ast.walk(tree)
         if isinstance(node, ast.AsyncFunctionDef) and node.name == "stage_lora_adapter"
+    )
+    identity_validator = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_validate_adapter_identity"
     )
     namespace = {
         "AsyncClient": httpx.AsyncClient,
@@ -70,6 +89,8 @@ def _load_stage_function(probe_version=1):
             },
         ),
         "Path": Path,
+        "re": __import__("re"),
+        "AdapterIdentity": dict[str, object],
         "asyncio": asyncio,
         "time": time,
         "LORA_STAGE_ATTEMPT_TIMEOUT_S": 30.0,
@@ -77,7 +98,10 @@ def _load_stage_function(probe_version=1):
         "_delta_stage_timeout_s": lambda: 30.0,
         "_admin_post_response": None,
     }
-    exec(compile(ast.Module(body=[function], type_ignores=[]), str(CLIENT_PATH), "exec"), namespace)
+    exec(
+        compile(ast.Module(body=[identity_validator, function], type_ignores=[]), str(CLIENT_PATH), "exec"),
+        namespace,
+    )
     return namespace["stage_lora_adapter"], namespace
 
 
@@ -100,7 +124,242 @@ def _load_delta_timeout_function():
     return namespace["_delta_stage_timeout_s"]
 
 
+def _load_adapter_load_function():
+    source = CLIENT_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    names = {
+        "_validate_adapter_identity",
+        "_validate_loaded_receipt",
+        "_is_retryable_lora_error",
+        "load_lora_adapter",
+    }
+    nodes = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names
+    ]
+    namespace = {
+        "AdapterIdentity": dict[str, object],
+        "AsyncClient": object,
+        "Mapping": Mapping,
+        "Path": Path,
+        "asyncio": asyncio,
+        "get_logger": lambda: SimpleNamespace(debug=lambda *_args: None, warning=lambda *_args: None),
+        "httpx": httpx,
+        "re": re,
+        "retry": lambda **_kwargs: lambda function: function,
+        "retry_if_exception": lambda *_args, **_kwargs: None,
+        "stop_after_attempt": lambda *_args, **_kwargs: None,
+        "stop_after_delay": lambda *_args, **_kwargs: None,
+        "wait_exponential": lambda *_args, **_kwargs: None,
+        "LORA_LOAD_READ_TIMEOUT_S": 0.1,
+        "LORA_LOAD_TOTAL_TIMEOUT_S": 0.1,
+    }
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(CLIENT_PATH), "exec"), namespace)
+    return namespace["load_lora_adapter"]
+
+
 class StageLoraAdapterTest(unittest.TestCase):
+    def test_load_accepts_only_matching_loaded_receipt(self):
+        load_lora_adapter = _load_adapter_load_function()
+        expected = _adapter_identity()
+        receipt = {
+            **expected,
+            "lora_name": "adapter-slot1",
+            "server_instance": "server-a",
+        }
+
+        class Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"status": "ok", "loaded_receipt": receipt}
+
+        class Client:
+            base_url = "http://h200-a"
+
+            async def post(self, *_args, **_kwargs):
+                return Response()
+
+        result = asyncio.run(
+            load_lora_adapter(
+                [Client()],
+                "adapter-slot1",
+                expected["source_url"],
+                expected_identity=expected,
+            )
+        )
+        self.assertEqual(result, [receipt])
+
+    def test_load_rejects_mismatched_target_receipt(self):
+        load_lora_adapter = _load_adapter_load_function()
+        expected = _adapter_identity()
+        receipt = {
+            **expected,
+            "target_sha256": "b" * 64,
+            "lora_name": "adapter-slot1",
+            "server_instance": "server-a",
+        }
+
+        class Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"status": "ok", "loaded_receipt": receipt}
+
+        class Client:
+            base_url = "http://h200-a"
+
+            async def post(self, *_args, **_kwargs):
+                return Response()
+
+        with self.assertRaisesRegex(RuntimeError, "target_sha256"):
+            asyncio.run(
+                load_lora_adapter(
+                    [Client()],
+                    "adapter-slot1",
+                    expected["source_url"],
+                    expected_identity=expected,
+                )
+            )
+
+    def test_load_rejects_missing_config_identity(self):
+        load_lora_adapter = _load_adapter_load_function()
+        expected = _adapter_identity()
+        receipt = {**expected, "lora_name": "adapter-slot1", "server_instance": "server-a"}
+        receipt.pop("config_sha256")
+        receipt.pop("config_size")
+        payload = {"status": "ok", "loaded_receipt": receipt}
+
+        class Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return payload
+
+        class Client:
+            base_url = "http://h200-a"
+
+            async def post(self, *_args, **_kwargs):
+                return Response()
+
+        with self.assertRaisesRegex(RuntimeError, "configuration"):
+            asyncio.run(
+                load_lora_adapter(
+                    [Client()],
+                    "adapter-slot1",
+                    expected["source_url"],
+                    expected_identity=expected,
+                )
+            )
+
+        missing_expected = dict(expected)
+        missing_expected.pop("config_sha256")
+        missing_expected.pop("config_size")
+        payload["loaded_receipt"] = {
+            **expected,
+            "lora_name": "adapter-slot1",
+            "server_instance": "server-a",
+        }
+        with self.assertRaisesRegex(RuntimeError, "configuration"):
+            asyncio.run(
+                load_lora_adapter(
+                    [Client()],
+                    "adapter-slot1",
+                    expected["source_url"],
+                    expected_identity=missing_expected,
+                )
+            )
+
+    def test_remote_load_rejects_empty_client_set(self):
+        load_lora_adapter = _load_adapter_load_function()
+        expected = _adapter_identity()
+        with self.assertRaisesRegex(RuntimeError, "without an inference endpoint"):
+            asyncio.run(
+                load_lora_adapter(
+                    [],
+                    "adapter-slot1",
+                    expected["source_url"],
+                    expected_identity=expected,
+                )
+            )
+
+    def test_load_timeout_does_not_accept_old_visible_slot(self):
+        load_lora_adapter = _load_adapter_load_function()
+        expected = _adapter_identity()
+        old_receipt = {
+            **expected,
+            "target_sha256": "b" * 64,
+            "lora_name": "adapter-slot1",
+            "server_instance": "server-a",
+        }
+
+        class Response:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self.payload
+
+        class Client:
+            base_url = "http://h200-a"
+            status_calls = 0
+
+            async def post(self, *_args, **_kwargs):
+                raise TimeoutError("load response timed out")
+
+            async def get(self, *_args, **_kwargs):
+                self.status_calls += 1
+                return Response({"status": "idle", "loaded_receipts": {"adapter-slot1": old_receipt}})
+
+        client = Client()
+        with self.assertRaises(TimeoutError):
+            asyncio.run(
+                load_lora_adapter(
+                    [client],
+                    "adapter-slot1",
+                    expected["source_url"],
+                    expected_identity=expected,
+                )
+            )
+        self.assertEqual(client.status_calls, 1)
+
+    def test_load_timeout_after_restart_has_no_receipt(self):
+        load_lora_adapter = _load_adapter_load_function()
+        expected = _adapter_identity()
+
+        class Client:
+            base_url = "http://h200-a"
+
+            async def post(self, *_args, **_kwargs):
+                raise TimeoutError("load response timed out")
+
+            async def get(self, *_args, **_kwargs):
+                class Response:
+                    def raise_for_status(self):
+                        return None
+
+                    def json(self):
+                        return {"status": "idle", "loaded_receipts": {}}
+
+                return Response()
+
+        with self.assertRaises(TimeoutError):
+            asyncio.run(
+                load_lora_adapter(
+                    [Client()],
+                    "adapter-slot1",
+                    expected["source_url"],
+                    expected_identity=expected,
+                )
+            )
+
     def test_client_rejects_non_finite_delta_limit(self):
         timeout = _load_delta_timeout_function()
         old_value = os.environ.get("PRIME_LORA_DELTA_STAGE_TIMEOUT_S")
@@ -121,7 +380,7 @@ class StageLoraAdapterTest(unittest.TestCase):
 
         class Response:
             def json(self):
-                return {"status": "ok", "stage_seconds": 1.0}
+                return {"status": "ok", "stage_seconds": 1.0, "adapter_identity": _adapter_identity()}
 
         async def fake_admin_post_response(client, path, **kwargs):
             calls.append(client)
@@ -143,7 +402,7 @@ class StageLoraAdapterTest(unittest.TestCase):
 
         class Response:
             def json(self):
-                return {"status": "ok", "stage_seconds": 1.0}
+                return {"status": "ok", "stage_seconds": 1.0, "adapter_identity": _adapter_identity()}
 
         async def fake_admin_post_response(client, path, **kwargs):
             calls.append(client)
@@ -165,7 +424,7 @@ class StageLoraAdapterTest(unittest.TestCase):
 
         class Response:
             def json(self):
-                return {"status": "ok", "stage_seconds": 1.0}
+                return {"status": "ok", "stage_seconds": 1.0, "adapter_identity": _adapter_identity()}
 
         async def fake_admin_post_response(client, path, **kwargs):
             calls.append(client)
@@ -191,7 +450,7 @@ class StageLoraAdapterTest(unittest.TestCase):
 
         class Response:
             def json(self):
-                return {"status": "ok", "stage_seconds": 0.03}
+                return {"status": "ok", "stage_seconds": 0.03, "adapter_identity": _adapter_identity()}
 
         async def fake_admin_post_response(_client, _path, **_kwargs):
             await asyncio.sleep(0.03)
@@ -218,7 +477,7 @@ class StageLoraAdapterTest(unittest.TestCase):
 
         class Response:
             def json(self):
-                return {"status": "ok", "stage_seconds": 0.0}
+                return {"status": "ok", "stage_seconds": 0.0, "adapter_identity": _adapter_identity()}
 
         origin = httpx.AsyncClient(base_url="http://127.0.0.1:8000")
         peer = httpx.AsyncClient(base_url="http://127.0.0.1:18049")
@@ -264,7 +523,7 @@ class StageLoraAdapterTest(unittest.TestCase):
 
         class Response:
             def json(self):
-                return {"status": "ok", "stage_seconds": 0.03}
+                return {"status": "ok", "stage_seconds": 0.03, "adapter_identity": _adapter_identity(2)}
 
         async def fake_admin_post_response(client, _path, **_kwargs):
             calls.append((client, time.perf_counter()))

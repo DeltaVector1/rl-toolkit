@@ -87,22 +87,154 @@ def load_manifest_prewarm_method():
     return namespace["_prewarm_adapter_manifest"]
 
 
+def load_receiver_ack_writer():
+    path = ROOT / "src/prime_rl/orchestrator/watcher.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    nodes = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"_receiver_id", "_ack_identity", "_write_receivers_ready"}
+    ]
+    namespace = {
+        "json": json,
+        "os": os,
+        "tempfile": tempfile,
+        "_validate_loaded_receipt": lambda receipt, **_kwargs: dict(receipt),
+    }
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
+    return namespace["_write_receivers_ready"]
+
+
 def load_broadcast_cleanup_method():
     path = ROOT / "src/prime_rl/trainer/rl/broadcast/filesystem.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
-    function = next(
+    nodes = [
         node
         for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "maybe_clean"
-    )
+        if isinstance(node, ast.FunctionDef)
+        and node.name
+        in {
+            "_valid_digest",
+            "_published_adapter_identity",
+            "_receiver_ids",
+            "_receiver_ack_identity",
+            "_validate_receiver_ack",
+            "maybe_clean",
+        }
+    ]
     namespace = {
+        "Path": Path,
+        "json": json,
+        "re": __import__("re"),
         "shutil": __import__("shutil"),
+        "quote": lambda value: value,
         "get_broadcast_dir": lambda output_dir: output_dir,
         "get_step_path": lambda broadcast_dir, step: broadcast_dir / f"step_{step}",
         "maybe_clean": lambda *_args: None,
     }
-    exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
     return namespace["maybe_clean"]
+
+
+def write_published_step(root: Path, step: int) -> Path:
+    path = root / f"step_{step}"
+    path.mkdir()
+    config = b"{}"
+    weights = b"weights"
+    (path / "STABLE").touch()
+    (path / "adapter_config.json").write_bytes(config)
+    (path / "adapter_model.safetensors").write_bytes(weights)
+    (path / "adapter_model.safetensors.sha256").write_text(
+        hashlib.sha256(weights).hexdigest() + "\n", encoding="ascii"
+    )
+    (path / "adapter_manifest.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "files": [
+                    {"name": "adapter_config.json", "size": len(config), "sha256": hashlib.sha256(config).hexdigest()},
+                    {"name": "adapter_model.safetensors", "size": len(weights), "sha256": hashlib.sha256(weights).hexdigest()},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def write_receiver_ack(step_path: Path, root: Path, step: int, *, run_name="run_test", endpoints=None, **overrides):
+    target = hashlib.sha256(b"weights").hexdigest()
+    config_digest = hashlib.sha256(b"{}").hexdigest()
+    source_url = f"http://source/broadcasts/step_{step}"
+    identity = {
+        "version": 1,
+        "run_name": run_name,
+        "step": step,
+        "source_url": source_url,
+        "target_sha256": target,
+        "target_size": 7,
+        "config_sha256": config_digest,
+        "config_size": 2,
+        "slot": "adapter" if step == 0 else f"adapter-slot{step % 2}",
+    }
+    identity.update(overrides)
+    endpoints = endpoints or ["http://h200-a", "http://h200-b"]
+    identity["receivers"] = [
+        {
+            "endpoint": endpoint,
+            "receipt": {
+                "source_url": identity["source_url"],
+                "target_sha256": identity["target_sha256"],
+                "target_size": identity["target_size"],
+                "config_sha256": identity["config_sha256"],
+                "config_size": identity["config_size"],
+                "lora_name": identity["slot"],
+                "server_instance": f"server-{index}",
+            },
+        }
+        for index, endpoint in enumerate(endpoints)
+    ]
+    (step_path / "receivers-ready.json").write_text(json.dumps(identity), encoding="utf-8")
+
+
+def load_broadcast_weights_method():
+    path = ROOT / "src/prime_rl/trainer/rl/broadcast/filesystem.py"
+    function = next(
+        node
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        if isinstance(node, ast.FunctionDef) and node.name == "broadcast_weights"
+    )
+    fake_model = type(
+        "FakeModel",
+        (),
+        {
+            "is_prime_state_dict": lambda _self, _state_dict: True,
+            "convert_to_hf": lambda _self, _state_dict: None,
+        },
+    )
+    namespace = {
+        "nn": types.SimpleNamespace(Module=object),
+        "time": time,
+        "shutil": __import__("shutil"),
+        "DTensor": object,
+        "PreTrainedModelPrimeRL": fake_model,
+        "gather_weights_on_master": lambda *_args, **_kwargs: {},
+        "get_broadcast_dir": lambda output_dir: output_dir,
+        "get_step_path": lambda broadcast_dir, step: broadcast_dir / f"step_{step}",
+        "save_state_dict": lambda *_args, **_kwargs: None,
+        "save_lora_config": lambda *_args, **_kwargs: None,
+        "publish_adapter_manifest": lambda *_args, **_kwargs: {
+            "mode": "linear",
+            "encoded_size": 0,
+            "full_size": 0,
+            "build_seconds": 0.0,
+            "chunk_count": 0,
+        },
+        "quote": lambda value: value,
+    }
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)
+    return namespace["broadcast_weights"], fake_model
 
 
 def load_filesystem_module():
@@ -177,6 +309,11 @@ def load_server_stage_method(stage_worker, publish_lock=None):
         "_end_lora_stage": lambda: None,
         "stage_lora_adapter_files": stage_worker,
         "adapter_stage_status": lambda: {},
+        "_read_verified_adapter_identity": lambda source_url, _destination: {
+            "source_url": source_url,
+            "target_sha256": "a" * 64,
+            "target_size": 8,
+        },
     }
     exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)
     return namespace["stage_lora_adapter"], FakeJSONResponse
@@ -188,16 +325,84 @@ class QuietDirectoryHandler(http.server.SimpleHTTPRequestHandler):
 
 
 class AdapterTransportStateTest(unittest.TestCase):
-    def test_lora_broadcast_cleanup_does_not_keep_checkpoint_intervals(self):
-        cleanup = load_broadcast_cleanup_method()
+    def test_broadcast_file_not_found_only_skips_deleted_run(self):
+        broadcast_weights, fake_model = load_broadcast_weights_method()
+        cases = (
+            ("trainer-only run", "run_trainer_only", None, False, True),
+            ("missing config, existing directory", "run_missing_config", None, False, True),
+            ("existing run", "run_existing", object(), False, True),
+            ("truly deleted run", "run_deleted", None, True, False),
+        )
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            for name, run_id, config, delete_run, should_raise in cases:
+                with self.subTest(name):
+                    run_dir = root / run_id
+                    run_dir.mkdir()
+                    message = f"missing publication for {run_id}"
+                    warnings = []
+                    manager = SimpleNamespace(
+                        ready_to_update_idxs=[0],
+                        ready_to_update={0: True},
+                        idx_2_id={0: run_id},
+                        progress={0: SimpleNamespace(step=1)},
+                        config={
+                            0: SimpleNamespace(
+                                model=SimpleNamespace(lora=SimpleNamespace(rank=1, alpha=1.0))
+                            )
+                        },
+                        get_state_dict_for_run=lambda _idx: {},
+                        get_run_dir=lambda _idx: run_dir,
+                        get_orchestrator_config=lambda _run_id: config,
+                    )
+
+                    def notify(_save_dir):
+                        if delete_run:
+                            __import__("shutil").rmtree(run_dir)
+                        raise FileNotFoundError(message)
+
+                    broadcast = SimpleNamespace(
+                        lora_config=None,
+                        save_format="safetensors",
+                        save_sharded=False,
+                        world=SimpleNamespace(is_master=True),
+                        multi_run_manager=manager,
+                        logger=SimpleNamespace(
+                            debug=lambda *_args: None,
+                            info=lambda *_args: None,
+                            warning=warnings.append,
+                            error=lambda *_args: None,
+                        ),
+                        _notify_orchestrator=notify,
+                    )
+                    if should_raise:
+                        try:
+                            broadcast_weights(broadcast, fake_model(), 0)
+                        except FileNotFoundError as caught:
+                            self.assertEqual(str(caught), message)
+                            self.assertEqual(caught.args, (message,))
+                            self.assertIsNotNone(caught.__traceback__)
+                        else:
+                            self.fail(f"expected FileNotFoundError: {message}")
+                    else:
+                        broadcast_weights(broadcast, fake_model(), 0)
+                        self.assertFalse(run_dir.exists())
+                        self.assertEqual(len(warnings), 1)
+                    self.assertFalse(manager.ready_to_update[0])
+
+    def test_lora_broadcast_cleanup_retains_without_receiver_ack(self):
+        cleanup = load_broadcast_cleanup_method()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "broadcasts"
+            root.mkdir()
             for step in range(7):
                 (root / f"step_{step}").mkdir()
             manager = SimpleNamespace(
                 used_idxs=[0],
                 progress={0: SimpleNamespace(step=7)},
                 get_run_dir=lambda _idx: root,
+                idx_2_id={0: "run_test"},
+                get_orchestrator_config=lambda _run_id: SimpleNamespace(),
             )
             broadcast = SimpleNamespace(
                 world=SimpleNamespace(is_master=True),
@@ -206,8 +411,215 @@ class AdapterTransportStateTest(unittest.TestCase):
                 logger=SimpleNamespace(debug=lambda *_args: None),
             )
             cleanup(broadcast, 3)
-            self.assertFalse((root / "step_3").exists())
+            self.assertTrue((root / "step_3").exists())
             self.assertTrue((root / "step_4").exists())
+
+    def test_lora_cleanup_uses_delayed_ack_and_preserves_ack_bases(self):
+        cleanup = load_broadcast_cleanup_method()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "broadcasts"
+            root.mkdir()
+            for step in range(10):
+                write_published_step(root, step)
+            (root / "unknown_dir").mkdir()
+            (root / "unknown.txt").write_text("keep", encoding="utf-8")
+
+            config = SimpleNamespace(
+                model=SimpleNamespace(
+                    lora=SimpleNamespace(name="adapter"),
+                    client=SimpleNamespace(
+                        base_url=["http://h200-a/v1", "http://h200-b/v1"],
+                        admin_base_url=None,
+                    ),
+                ),
+                weight_broadcast=SimpleNamespace(source_url="http://source", source_dir=root.parent),
+            )
+            manager = SimpleNamespace(
+                used_idxs=[0],
+                progress={0: SimpleNamespace(step=11)},
+                get_run_dir=lambda _idx: root,
+                idx_2_id={0: "run_test"},
+                get_orchestrator_config=lambda _run_id: config,
+            )
+            broadcast = SimpleNamespace(
+                world=SimpleNamespace(is_master=True),
+                multi_run_manager=manager,
+                lora_config=object(),
+                logger=SimpleNamespace(debug=lambda *_args: None, warning=lambda *_args: None),
+            )
+            cleanup(broadcast, None)
+            self.assertTrue((root / "step_0").exists())
+            self.assertTrue((root / "step_5").exists())
+
+            (root / "step_1" / "receivers-ready.json").write_text("stale", encoding="utf-8")
+            for path in (root / "step_1").iterdir():
+                if path.name != "receivers-ready.json":
+                    path.unlink()
+            write_receiver_ack(root / "step_8", root, 8)
+            cleanup(broadcast, None)
+            for step in range(6):
+                self.assertFalse((root / f"step_{step}").exists())
+            for step in (6, 7, 8, 9):
+                self.assertTrue((root / f"step_{step}").exists())
+            self.assertTrue((root / "unknown_dir").exists())
+            self.assertTrue((root / "unknown.txt").exists())
+
+    def test_lora_cleanup_rejects_invalid_highest_ack(self):
+        cleanup = load_broadcast_cleanup_method()
+        for field, value in (
+            ("run_name", "wrong_run"),
+            ("source_url", "http://wrong"),
+            ("target_sha256", "f" * 64),
+            ("config_sha256", "e" * 64),
+            ("version", True),
+            ("slot", []),
+            ("slot", {}),
+            ("target_size", True),
+        ):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary) / "broadcasts"
+                root.mkdir()
+                write_published_step(root, 3)
+                write_receiver_ack(root / "step_3", root, 3, **{field: value})
+                config = SimpleNamespace(
+                    model=SimpleNamespace(
+                        lora=SimpleNamespace(name="adapter"),
+                        client=SimpleNamespace(
+                            base_url=["http://h200-a/v1", "http://h200-b/v1"],
+                            admin_base_url=None,
+                        ),
+                    ),
+                    weight_broadcast=SimpleNamespace(source_url="http://source", source_dir=root.parent),
+                )
+                manager = SimpleNamespace(
+                    used_idxs=[0],
+                    progress={0: SimpleNamespace(step=4)},
+                    get_run_dir=lambda _idx: root,
+                    idx_2_id={0: "run_test"},
+                    get_orchestrator_config=lambda _run_id: config,
+                )
+                broadcast = SimpleNamespace(
+                    world=SimpleNamespace(is_master=True),
+                    multi_run_manager=manager,
+                    lora_config=object(),
+                    logger=SimpleNamespace(debug=lambda *_args: None, warning=lambda *_args: None),
+                )
+                with self.assertRaises(RuntimeError):
+                    cleanup(broadcast, None)
+
+    def test_lora_cleanup_rejects_partial_receiver_ack(self):
+        cleanup = load_broadcast_cleanup_method()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "broadcasts"
+            root.mkdir()
+            write_published_step(root, 3)
+            write_receiver_ack(root / "step_3", root, 3, endpoints=["http://h200-a"])
+            config = SimpleNamespace(
+                model=SimpleNamespace(
+                    lora=SimpleNamespace(name="adapter"),
+                    client=SimpleNamespace(
+                        base_url=["http://h200-a/v1", "http://h200-b/v1"],
+                        admin_base_url=None,
+                    ),
+                ),
+                weight_broadcast=SimpleNamespace(source_url="http://source", source_dir=root.parent),
+            )
+            manager = SimpleNamespace(
+                used_idxs=[0],
+                progress={0: SimpleNamespace(step=4)},
+                get_run_dir=lambda _idx: root,
+                idx_2_id={0: "run_test"},
+                get_orchestrator_config=lambda _run_id: config,
+            )
+            broadcast = SimpleNamespace(
+                world=SimpleNamespace(is_master=True),
+                multi_run_manager=manager,
+                lora_config=object(),
+                logger=SimpleNamespace(debug=lambda *_args: None, warning=lambda *_args: None),
+            )
+            with self.assertRaises(RuntimeError):
+                cleanup(broadcast, None)
+
+    def test_receiver_ack_writer_publishes_startup_and_reuses_identity(self):
+        write_ack = load_receiver_ack_writer()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            clients = [
+                SimpleNamespace(base_url="http://h200-b/v1"),
+                SimpleNamespace(base_url="http://h200-a/v1"),
+            ]
+
+            def publish(step, slot, server_suffix):
+                step_path = root / f"step_{step}"
+                step_path.mkdir()
+                (step_path / "STABLE").touch()
+                identity = {
+                    "source_url": f"http://source/step_{step}",
+                    "target_sha256": "a" * 64,
+                    "target_size": 8,
+                    "config_sha256": "b" * 64,
+                    "config_size": 2,
+                }
+                receipts = [
+                    {
+                        **identity,
+                        "lora_name": slot,
+                        "server_instance": f"{server_suffix}-b",
+                    },
+                    {
+                        **identity,
+                        "lora_name": slot,
+                        "server_instance": f"{server_suffix}-a",
+                    },
+                ]
+                write_ack(
+                    step_path,
+                    run_name="run_test",
+                    step=step,
+                    source_url=identity["source_url"],
+                    slot=slot,
+                    adapter_identity=identity,
+                    admin_clients=clients,
+                    receipts=receipts,
+                )
+                return step_path, identity, receipts
+
+            startup, identity, receipts = publish(0, "adapter", "old")
+            startup_ack = json.loads((startup / "receivers-ready.json").read_text())
+            self.assertEqual(
+                [item["endpoint"] for item in startup_ack["receivers"]],
+                ["http://h200-a", "http://h200-b"],
+            )
+            self.assertEqual((startup / "receivers-ready.json").stat().st_mode & 0o777, 0o644)
+            original = (startup / "receivers-ready.json").read_text()
+            write_ack(
+                startup,
+                run_name="run_test",
+                step=0,
+                source_url=identity["source_url"],
+                slot="adapter-slot0",
+                adapter_identity=identity,
+                admin_clients=clients,
+                receipts=[
+                    {**item, "lora_name": "adapter-slot0", "server_instance": "new"}
+                    for item in receipts
+                ],
+            )
+            self.assertEqual((startup / "receivers-ready.json").read_text(), original)
+
+            normal, identity, _ = publish(1, "adapter-slot1", "current")
+            self.assertTrue((normal / "receivers-ready.json").is_file())
+            with self.assertRaisesRegex(RuntimeError, "duplicate endpoint"):
+                write_ack(
+                    normal,
+                    run_name="run_test",
+                    step=1,
+                    source_url=identity["source_url"],
+                    slot="adapter-slot1",
+                    adapter_identity=identity,
+                    admin_clients=[clients[0], clients[0]],
+                    receipts=[receipts[0], receipts[1]],
+                )
 
     def test_exact_adjacent_delta_round_trip(self):
         with tempfile.TemporaryDirectory() as temporary:

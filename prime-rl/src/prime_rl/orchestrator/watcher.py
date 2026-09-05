@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import tempfile
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -21,6 +23,7 @@ from prime_rl.utils.async_utils import safe_cancel
 from prime_rl.utils.client import (
     InferencePool,
     _delta_stage_timeout_s,
+    _validate_loaded_receipt,
     load_lora_adapter,
     model_is_visible,
     stage_full_checkpoint,
@@ -34,6 +37,112 @@ from prime_rl.utils.checkpoint_delta import build_xor_delta_checkpoint
 
 v1_adapter_transport = "chunked-shuffled-xor-zstd"
 v2_adapter_transport = "chunked-bf16-linear-zigzag-sparse-zstd"
+
+
+def _receiver_id(client) -> str:
+    return str(client.base_url).rstrip("/").removesuffix("/v1")
+
+
+def _ack_identity(value):
+    if not isinstance(value, dict):
+        return value
+    identity = dict(value)
+    identity.pop("slot", None)
+    receivers = identity.get("receivers")
+    if isinstance(receivers, list):
+        identity["receivers"] = []
+        for item in receivers:
+            if not isinstance(item, dict):
+                identity["receivers"].append(item)
+                continue
+            stable_item = dict(item)
+            receipt = stable_item.get("receipt")
+            if isinstance(receipt, dict):
+                stable_receipt = dict(receipt)
+                stable_receipt.pop("server_instance", None)
+                stable_receipt.pop("lora_name", None)
+                stable_item["receipt"] = stable_receipt
+            identity["receivers"].append(stable_item)
+    return identity
+
+
+def _write_receivers_ready(
+    step_path,
+    *,
+    run_name: str,
+    step: int,
+    source_url: str,
+    slot: str,
+    adapter_identity: dict[str, object],
+    admin_clients,
+    receipts,
+) -> None:
+    if not step_path.is_dir() or not (step_path / "STABLE").is_file():
+        raise RuntimeError(f"cannot publish receiver ACK for unpublished adapter step {step}")
+    if not admin_clients or not isinstance(receipts, list) or len(receipts) != len(admin_clients):
+        raise RuntimeError("receiver ACK requires one successful receipt per configured endpoint")
+
+    endpoint_ids = [_receiver_id(client) for client in admin_clients]
+    if len(set(endpoint_ids)) != len(endpoint_ids):
+        raise RuntimeError("receiver ACK has duplicate endpoint")
+
+    records = []
+    for endpoint, receipt in zip(endpoint_ids, receipts):
+        validated = _validate_loaded_receipt(
+            receipt,
+            source_url=source_url,
+            lora_name=slot,
+            expected=adapter_identity,
+        )
+        records.append({"endpoint": endpoint, "receipt": validated})
+    records.sort(key=lambda item: item["endpoint"])
+    payload = {
+        "version": 1,
+        "run_name": run_name,
+        "step": step,
+        "source_url": source_url,
+        "target_sha256": adapter_identity["target_sha256"],
+        "target_size": adapter_identity["target_size"],
+        "config_sha256": adapter_identity["config_sha256"],
+        "config_size": adapter_identity["config_size"],
+        "slot": slot,
+        "receivers": records,
+    }
+    marker = step_path / "receivers-ready.json"
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+    if marker.exists():
+        try:
+            existing = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"receiver ACK is invalid at {marker}") from exc
+        if _ack_identity(existing) != _ack_identity(payload):
+            raise RuntimeError(f"receiver ACK is immutable and differs at {marker}")
+        return
+    temporary = None
+    try:
+        output = tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=step_path,
+            prefix=f".{marker.name}.",
+            suffix=".tmp",
+            delete=False,
+        )
+        temporary = output.name
+        with output:
+            output.write(encoded)
+            output.flush()
+            os.fsync(output.fileno())
+        os.chmod(temporary, 0o644)
+        os.replace(temporary, marker)
+        directory = os.open(step_path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if temporary is not None:
+            os.unlink(temporary) if os.path.exists(temporary) else None
 
 
 async def _run_with_retries(name: str, operation: Callable[[], Awaitable[Any]]) -> Any:
@@ -494,6 +603,7 @@ class WeightWatcher:
             # both inference hosts before stopping old-policy generation. This
             # keeps useful complete groups flowing during the transfer and
             # reduces the engine pause to the local in-place load.
+            adapter_identity = None
             if isinstance(weights_path, str):
                 stage_started = time.perf_counter()
                 if self.lora_name is not None:
@@ -503,6 +613,7 @@ class WeightWatcher:
                         require_delta=require_delta,
                         origin_base_urls=self.inference.adapter_origin_base_urls,
                     )
+                    adapter_identity = stage_result["adapter_identity"]
                     self.last_adapter_wire_stage_time = float(
                         stage_result.get("wire_stage_seconds", time.perf_counter() - stage_started)
                     )
@@ -559,13 +670,26 @@ class WeightWatcher:
             get_logger().debug(f"Updating weights to step {next_step}")
             t1 = time.perf_counter()
             lora_name = f"{self.lora_name}-slot{next_step % 2}" if self.lora_name is not None else None
-            await self.inference.update_weights(
+            receipts = await self.inference.update_weights(
                 weights_path,
                 lora_name=lora_name,
                 step=next_step,
                 require_delta=require_delta,
                 prefetched=True,
+                expected_adapter_identity=adapter_identity,
             )
+            if self.lora_name is not None and isinstance(weights_path, str):
+                assert local_weights_path is not None
+                _write_receivers_ready(
+                    local_weights_path,
+                    run_name=self.config.output_dir.name,
+                    step=next_step,
+                    source_url=weights_path,
+                    slot=lora_name,
+                    adapter_identity=adapter_identity,
+                    admin_clients=self.inference.admin_clients,
+                    receipts=receipts,
+                )
             self.last_update_weights_time = time.perf_counter() - t1
             if self.lora_name is not None:
                 self.last_adapter_load_time = self.last_update_weights_time
@@ -641,12 +765,18 @@ class WeightWatcher:
                 f"{len(self.inference.admin_clients)} inference endpoint(s); restoring it"
             )
             t0 = time.perf_counter()
+            stage_result = await stage_lora_adapter(
+                missing,
+                weights_path,
+                require_delta=require_delta,
+            )
             await load_lora_adapter(
                 missing,
                 self.policy.model_name,
                 weights_path,
                 require_delta=require_delta,
-                prefetched=False,
+                prefetched=True,
+                expected_identity=stage_result["adapter_identity"],
             )
             visible = await asyncio.gather(
                 *(model_is_visible(client, self.policy.model_name) for client in self.inference.admin_clients)

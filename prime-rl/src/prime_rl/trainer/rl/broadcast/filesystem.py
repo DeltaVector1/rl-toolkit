@@ -1,3 +1,5 @@
+import json
+import re
 import shutil
 import time
 from pathlib import Path
@@ -20,6 +22,153 @@ from prime_rl.trainer.weights import (
 from prime_rl.trainer.world import get_world
 from prime_rl.utils.adapter_delta import publish_adapter_manifest
 from prime_rl.utils.utils import get_broadcast_dir, get_step_path
+
+
+def _valid_digest(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def _published_adapter_identity(step_path: Path) -> dict[str, object]:
+    if (step_path / "STABLE").is_symlink() or not (step_path / "STABLE").is_file():
+        raise RuntimeError(f"adapter step is not STABLE: {step_path}")
+    manifest_path = step_path / "adapter_manifest.json"
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise RuntimeError(f"adapter manifest is missing: {manifest_path}")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"adapter manifest is invalid: {manifest_path}") from exc
+    files = manifest.get("files") if isinstance(manifest, dict) else None
+    if not isinstance(files, list):
+        raise RuntimeError(f"adapter manifest has no files: {manifest_path}")
+    if len(files) != 2 or any(not isinstance(item, dict) for item in files):
+        raise RuntimeError(f"adapter manifest has an invalid file set: {manifest_path}")
+    records = {}
+    for item in files:
+        name = item.get("name")
+        if name in records or name not in {"adapter_config.json", "adapter_model.safetensors"}:
+            raise RuntimeError(f"adapter manifest has an invalid file set: {manifest_path}")
+        records[name] = item
+    if set(records) != {"adapter_config.json", "adapter_model.safetensors"}:
+        raise RuntimeError(f"adapter manifest has an invalid file set: {manifest_path}")
+    identity = {}
+    for name, prefix in (("adapter_model.safetensors", "target"), ("adapter_config.json", "config")):
+        record = records[name]
+        size = record.get("size")
+        digest = record.get("sha256")
+        path = step_path / name
+        if (
+            type(size) is not int
+            or size < 0
+            or not _valid_digest(digest)
+            or path.is_symlink()
+            or not path.is_file()
+            or path.stat().st_size != size
+        ):
+            raise RuntimeError(f"published adapter file identity is invalid: {path}")
+        identity[f"{prefix}_size"] = size
+        identity[f"{prefix}_sha256"] = digest
+    sidecar = step_path / "adapter_model.safetensors.sha256"
+    if sidecar.is_symlink() or not sidecar.is_file() or sidecar.read_text(encoding="ascii").strip() != identity["target_sha256"]:
+        raise RuntimeError(f"published adapter checksum sidecar is invalid: {sidecar}")
+    return identity
+
+
+def _receiver_ids(config) -> list[str]:
+    client = getattr(getattr(config, "model", None), "client", None)
+    urls = getattr(client, "admin_base_url", None) or getattr(client, "base_url", None)
+    if not isinstance(urls, (list, tuple)) or not urls:
+        raise RuntimeError("receiver ACK has no configured inference endpoints")
+    endpoint_ids = [str(url).rstrip("/").removesuffix("/v1") for url in urls]
+    if any(not endpoint for endpoint in endpoint_ids) or len(set(endpoint_ids)) != len(endpoint_ids):
+        raise RuntimeError("receiver ACK has duplicate or empty configured endpoints")
+    return sorted(endpoint_ids)
+
+
+def _receiver_ack_identity(config, step_path: Path, step: int, run_name: str) -> dict[str, object]:
+    published = _published_adapter_identity(step_path)
+    broadcast = config.weight_broadcast
+    source_url = getattr(broadcast, "source_url", None)
+    source_dir = getattr(broadcast, "source_dir", None)
+    if not isinstance(source_url, str) or not source_url or source_dir is None:
+        raise RuntimeError("receiver ACK requires configured adapter source URL and directory")
+    try:
+        relative = step_path.resolve().relative_to(Path(source_dir).resolve()).as_posix()
+    except ValueError as exc:
+        raise RuntimeError("receiver ACK step is outside the configured adapter source directory") from exc
+    lora = getattr(getattr(config, "model", None), "lora", None)
+    base_name = getattr(lora, "name", None)
+    if not isinstance(base_name, str) or not base_name:
+        raise RuntimeError("receiver ACK requires a configured LoRA name")
+    return {
+        "version": 1,
+        "run_name": run_name,
+        "step": step,
+        "source_url": f"{source_url.rstrip('/')}/{quote(relative)}",
+        **published,
+        "slot": base_name if step == 0 else f"{base_name}-slot{step % 2}",
+        "receivers": None,
+    }
+
+
+def _validate_receiver_ack(ack_path: Path, config, step_path: Path, current_step: int, run_name: str) -> int:
+    if ack_path.is_symlink() or not ack_path.is_file():
+        raise RuntimeError(f"receiver ACK is not a regular file: {ack_path}")
+    try:
+        ack = json.loads(ack_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"receiver ACK is invalid: {ack_path}") from exc
+    if not isinstance(ack, dict):
+        raise RuntimeError(f"receiver ACK is not an object: {ack_path}")
+    step_name = step_path.name.removeprefix("step_")
+    step = int(step_name)
+    expected = _receiver_ack_identity(config, step_path, step, run_name)
+    if step > current_step:
+        raise RuntimeError(f"receiver ACK is from a future step: {ack_path}")
+    if set(ack) != set(expected):
+        raise RuntimeError(f"receiver ACK fields are invalid: {ack_path}")
+    for name, value in expected.items():
+        if name != "receivers" and type(ack.get(name)) is not type(value):
+            raise RuntimeError(f"receiver ACK {name} has an invalid type: {ack_path}")
+        if name == "slot":
+            base_name = value.removesuffix(f"-slot{step % 2}")
+            if ack.get(name) not in {value, base_name}:
+                raise RuntimeError(f"receiver ACK {name} differs from the published step: {ack_path}")
+        elif name != "receivers" and ack.get(name) != value:
+            raise RuntimeError(f"receiver ACK {name} differs from the published step: {ack_path}")
+    receivers = ack.get("receivers")
+    if not isinstance(receivers, list) or len(receivers) != len(_receiver_ids(config)):
+        raise RuntimeError(f"receiver ACK endpoint set is incomplete: {ack_path}")
+    expected_endpoints = _receiver_ids(config)
+    actual_endpoints = []
+    receipt_fields = {
+        "source_url": "source_url",
+        "target_sha256": "target_sha256",
+        "target_size": "target_size",
+        "config_sha256": "config_sha256",
+        "config_size": "config_size",
+    }
+    for item in receivers:
+        if not isinstance(item, dict) or set(item) != {"endpoint", "receipt"}:
+            raise RuntimeError(f"receiver ACK record is invalid: {ack_path}")
+        endpoint = item["endpoint"]
+        receipt = item["receipt"]
+        if not isinstance(endpoint, str) or endpoint in actual_endpoints or not isinstance(receipt, dict):
+            raise RuntimeError(f"receiver ACK record is invalid: {ack_path}")
+        if set(receipt) != {
+            "source_url", "target_sha256", "target_size", "config_sha256", "config_size",
+            "lora_name", "server_instance",
+        }:
+            raise RuntimeError(f"receiver ACK receipt is invalid: {ack_path}")
+        actual_endpoints.append(endpoint)
+        for receipt_name, ack_name in receipt_fields.items():
+            if type(receipt.get(receipt_name)) is not type(ack[ack_name]) or receipt.get(receipt_name) != ack[ack_name]:
+                raise RuntimeError(f"receiver ACK receipt differs in {receipt_name}: {ack_path}")
+        if receipt.get("lora_name") != ack["slot"] or not isinstance(receipt.get("server_instance"), str) or not receipt["server_instance"]:
+            raise RuntimeError(f"receiver ACK receipt slot or server is invalid: {ack_path}")
+    if actual_endpoints != expected_endpoints:
+        raise RuntimeError(f"receiver ACK endpoint set differs from configuration: {ack_path}")
+    return step
 
 
 class FileSystemWeightBroadcast(WeightBroadcast):
@@ -188,7 +337,15 @@ class FileSystemWeightBroadcast(WeightBroadcast):
                         shutil.rmtree(self.multi_run_manager.get_run_dir(idx))
 
                 except FileNotFoundError:
-                    self.logger.warning(f"Run {idx} is deleted, skipping")
+                    run_dir = self.multi_run_manager.get_run_dir(idx)
+                    if (
+                        run_id != "run_trainer_only"
+                        and self.multi_run_manager.get_orchestrator_config(run_id) is None
+                        and not run_dir.exists()
+                    ):
+                        self.logger.warning(f"Run {idx} is deleted, skipping")
+                    else:
+                        raise
                 except Exception as e:
                     self.logger.error(f"Error broadcasting weights for run {idx}: {e}")
                     raise
@@ -212,12 +369,55 @@ class FileSystemWeightBroadcast(WeightBroadcast):
             if self.lora_config is None:
                 maybe_clean(broadcast_dir, current_step, interval_to_keep)
                 continue
-            # The active policy may need both predecessors after a restart.
-            # Keep the current adapter and its two bases; remove only an older
-            # step after the new adapter has been published successfully.
-            candidate_step = current_step - 3
-            if candidate_step < 0:
+            run_id = self.multi_run_manager.idx_2_id[idx]
+            if run_id == "run_trainer_only":
+                self.logger.debug(f"Retaining LoRA broadcasts for {run_id}: no receiver ACK is possible")
                 continue
-            candidate_path = get_step_path(broadcast_dir, candidate_step)
-            self.logger.debug(f"Removing path {candidate_path}")
-            shutil.rmtree(candidate_path, ignore_errors=True)
+            orchestrator_config = self.multi_run_manager.get_orchestrator_config(run_id)
+            if orchestrator_config is None:
+                self.logger.warning(f"Retaining LoRA broadcasts for {run_id}: orchestrator config is unavailable")
+                continue
+            highest_ack_step = None
+            highest_ack_path = None
+            for step_path in broadcast_dir.iterdir():
+                if (
+                    step_path.is_symlink()
+                    or not step_path.is_dir()
+                    or re.fullmatch(r"step_[0-9]+", step_path.name) is None
+                ):
+                    continue
+                step = int(step_path.name.removeprefix("step_"))
+                ack_path = step_path / "receivers-ready.json"
+                if not ack_path.exists() and not ack_path.is_symlink():
+                    continue
+                if step > current_step:
+                    raise RuntimeError(f"receiver ACK is from a future step: {ack_path}")
+                if highest_ack_step is None or step > highest_ack_step:
+                    highest_ack_step = step
+                    highest_ack_path = ack_path
+            if highest_ack_path is None:
+                self.logger.debug(f"Retaining LoRA broadcasts for {run_id}: no receiver ACK yet")
+                continue
+            assert highest_ack_step is not None
+            _validate_receiver_ack(
+                highest_ack_path,
+                orchestrator_config,
+                get_step_path(broadcast_dir, highest_ack_step),
+                current_step,
+                run_id,
+            )
+            retention_floor = min(current_step - 2, highest_ack_step - 2)
+            if retention_floor <= 0:
+                continue
+            for candidate_path in broadcast_dir.iterdir():
+                if (
+                    candidate_path.is_symlink()
+                    or not candidate_path.is_dir()
+                    or re.fullmatch(r"step_[0-9]+", candidate_path.name) is None
+                ):
+                    continue
+                candidate_step = int(candidate_path.name.removeprefix("step_"))
+                if candidate_step >= retention_floor:
+                    continue
+                self.logger.debug(f"Removing path {candidate_path}")
+                shutil.rmtree(candidate_path)

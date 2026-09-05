@@ -1,7 +1,11 @@
 import asyncio
+import hashlib
+import json
 import math
+import re
 import threading
 import time
+import uuid
 from argparse import Namespace
 from typing import Any
 
@@ -64,6 +68,8 @@ logger = init_logger("vllm.entrypoints.openai.api_server")
 # Create our own router for custom endpoints
 router = APIRouter()
 lora_load_lock = asyncio.Lock()
+_loaded_lora_receipts: dict[str, dict[str, object]] = {}
+_server_instance_id = uuid.uuid4().hex
 _lora_stage_lock = threading.Lock()
 _lora_stage_count = 0
 _lora_stage_started_at: float | None = None
@@ -149,6 +155,101 @@ def models(request: Request) -> OpenAIServingModels:
     return request.app.state.openai_serving_models
 
 
+def _read_verified_adapter_identity(source_url: str, destination) -> dict[str, object]:
+    """Read the identity already verified when the cache reached READY."""
+    if not isinstance(source_url, str) or not source_url.startswith(("http://", "https://")):
+        raise RuntimeError("adapter source URL is not remote")
+    ready = destination / "READY"
+    if ready.is_symlink() or not ready.is_file() or ready.read_text(encoding="ascii") != "ready\n":
+        raise RuntimeError("adapter cache is not ready")
+
+    manifest_path = destination / "manifest.json"
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise RuntimeError("adapter cache manifest is missing")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("adapter cache manifest is invalid") from exc
+    if not isinstance(manifest, dict) or manifest.get("version") != 1:
+        raise RuntimeError("adapter cache manifest has an unsupported version")
+    if manifest.get("source_url") != source_url:
+        raise RuntimeError("adapter cache source identity differs from the requested source")
+
+    files = manifest.get("files")
+    if not isinstance(files, dict):
+        raise RuntimeError("adapter cache manifest has no file records")
+    target = files.get("adapter_model.safetensors")
+    config = files.get("adapter_config.json")
+    if not isinstance(target, dict) or not isinstance(config, dict):
+        raise RuntimeError("adapter cache manifest is missing adapter files")
+    target_sha256 = target.get("sha256")
+    target_size = target.get("size")
+    if (
+        not isinstance(target_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", target_sha256) is None
+        or type(target_size) is not int
+        or target_size <= 0
+    ):
+        raise RuntimeError("adapter cache target identity is invalid")
+    config_sha256 = config.get("sha256")
+    config_size = config.get("size")
+    if (
+        not isinstance(config_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", config_sha256) is None
+        or type(config_size) is not int
+        or config_size < 0
+    ):
+        raise RuntimeError("adapter cache configuration identity is invalid")
+    for name, record in (("adapter_model.safetensors", target), ("adapter_config.json", config)):
+        size = record.get("size")
+        digest = record.get("sha256")
+        path = destination / name
+        if (
+            not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or type(size) is not int
+            or size < 0
+            or path.is_symlink()
+            or not path.is_file()
+            or path.stat().st_size != size
+        ):
+            raise RuntimeError(f"adapter cache {name} identity is invalid")
+    config_path = destination / "adapter_config.json"
+    try:
+        config_bytes = config_path.read_bytes()
+    except OSError as exc:
+        raise RuntimeError("adapter cache configuration cannot be read") from exc
+    if len(config_bytes) != config_size or hashlib.sha256(config_bytes).hexdigest() != config_sha256:
+        raise RuntimeError("adapter cache configuration bytes differ from manifest")
+    sidecar = destination / "adapter_model.safetensors.sha256"
+    if sidecar.is_symlink() or not sidecar.is_file() or sidecar.read_text(encoding="ascii").strip() != target_sha256:
+        raise RuntimeError("adapter cache target sidecar differs from manifest")
+
+    identity: dict[str, object] = {
+        "source_url": source_url,
+        "target_sha256": target_sha256,
+        "target_size": target_size,
+        "config_sha256": config_sha256,
+        "config_size": config_size,
+    }
+
+    transport_path = destination / "transport.json"
+    if transport_path.exists():
+        if transport_path.is_symlink() or not transport_path.is_file():
+            raise RuntimeError("adapter cache transport record is invalid")
+        try:
+            transport = json.loads(transport_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("adapter cache transport record is invalid") from exc
+        if not isinstance(transport, dict) or transport.get("source_url") != source_url:
+            raise RuntimeError("adapter cache transport source differs from manifest")
+        if transport.get("target_sha256") != target_sha256:
+            raise RuntimeError("adapter cache transport target differs from manifest")
+        if transport.get("config_sha256") not in (None, config_sha256):
+            raise RuntimeError("adapter cache transport configuration differs from manifest")
+    return identity
+
+
 WORKER_EXTENSION_CLS = {
     "nccl": "prime_rl.inference.vllm.worker.nccl.NCCLWeightUpdateWorker",
     "filesystem": "prime_rl.inference.vllm.worker.filesystem.FileSystemWeightUpdateWorker",
@@ -211,8 +312,11 @@ async def load_lora_adapter(lora_request: LoadLoRAAdapterRequest, raw_request: R
         if not isinstance(prefetched, bool):
             return JSONResponse(content={"error": "prefetched must be a boolean"}, status_code=400)
         if remote_adapter:
+            _loaded_lora_receipts.pop(lora_request.lora_name, None)
+        if remote_adapter:
             _begin_lora_stage()
         try:
+            adapter_identity = None
             if remote_adapter:
                 source_url = lora_request.lora_path
                 if not prefetched:
@@ -221,19 +325,41 @@ async def load_lora_adapter(lora_request: LoadLoRAAdapterRequest, raw_request: R
                         source_url,
                         require_delta=require_delta,
                     )
-                lora_request.lora_path = adapter_cache_path(source_url).as_posix()
+                destination = adapter_cache_path(source_url)
+                lora_request.lora_path = destination.as_posix()
             lora_request.load_inplace = True
             if remote_adapter:
-                with adapter_reader_lock(adapter_cache_path(source_url)):
+                with adapter_reader_lock(destination):
+                    adapter_identity = _read_verified_adapter_identity(source_url, destination)
                     response = await handler.load_lora_adapter(lora_request)
             else:
+                _loaded_lora_receipts.pop(lora_request.lora_name, None)
                 response = await handler.load_lora_adapter(lora_request)
             stored = handler.lora_requests.get(lora_request.lora_name)
             if stored is not None:
                 stored.load_inplace = False
             if isinstance(response, ErrorResponse):
                 return JSONResponse(content=response.model_dump(), status_code=response.error.code)
-            return {"status": "ok"}
+            if not remote_adapter:
+                return {"status": "ok"}
+            stored_name = getattr(stored, "lora_name", None) if stored is not None else None
+            stored_path = getattr(stored, "lora_path", None) if stored is not None else None
+            if (
+                not isinstance(adapter_identity, dict)
+                or stored_name != lora_request.lora_name
+                or str(stored_path) != lora_request.lora_path
+            ):
+                return JSONResponse(
+                    {"error": "loaded adapter identity is unavailable or mismatched"},
+                    status_code=500,
+                )
+            receipt = {
+                **adapter_identity,
+                "lora_name": lora_request.lora_name,
+                "server_instance": _server_instance_id,
+            }
+            _loaded_lora_receipts[lora_request.lora_name] = receipt
+            return {"status": "ok", "loaded_receipt": receipt}
         finally:
             if remote_adapter:
                 _end_lora_stage()
@@ -300,6 +426,7 @@ async def stage_lora_adapter(raw_request: Request):
             "path": destination.as_posix(),
             "stage_seconds": time.perf_counter() - started,
         }
+        payload["adapter_identity"] = _read_verified_adapter_identity(source_url, destination)
         stage_state = adapter_stage_status()
         if isinstance(stage_state.get("reconstruct_seconds"), (int, float)):
             payload["reconstruct_seconds"] = float(stage_state["reconstruct_seconds"])
@@ -344,8 +471,26 @@ async def stage_lora_adapter(raw_request: Request):
 
 
 @router.get("/staging_status")
-async def staging_status():
-    return _combined_lora_stage_status(_lora_stage_status(), adapter_stage_status())
+async def staging_status(raw_request: Request):
+    state = _combined_lora_stage_status(_lora_stage_status(), adapter_stage_status())
+    handler = models(raw_request)
+    loaded = getattr(handler, "lora_requests", None)
+    receipts = {}
+    if isinstance(loaded, dict):
+        for name, receipt in list(_loaded_lora_receipts.items()):
+            source_url = receipt.get("source_url")
+            stored = loaded.get(name)
+            expected_path = (
+                adapter_cache_path(source_url).as_posix()
+                if isinstance(source_url, str)
+                else None
+            )
+            if stored is None or str(getattr(stored, "lora_path", "")) != expected_path:
+                _loaded_lora_receipts.pop(name, None)
+                continue
+            receipts[name] = dict(receipt)
+    state["loaded_receipts"] = receipts
+    return state
 
 
 @router.post("/stage_full_checkpoint")

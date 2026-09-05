@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import math
 import os
+import re
 import time
 import tomllib
 from collections.abc import Mapping
@@ -25,11 +26,69 @@ from prime_rl.utils.logger import get_logger
 # distinguishes servers; ``X-data-parallel-rank`` distinguishes DP shards within a
 # server, since the router uses that header to route to specific GPU ranks.
 ClientIdentity = tuple[str, str | None]
+AdapterIdentity = dict[str, object]
 
 
 def client_identity(client: vf.ClientConfig) -> ClientIdentity:
     """Stable identity for load balancing across inference clients."""
     return (client.base_url, client.headers.get("X-data-parallel-rank"))
+
+
+def _validate_adapter_identity(value: object, source_url: str | None = None) -> AdapterIdentity:
+    if not isinstance(value, dict):
+        raise RuntimeError("adapter identity is missing")
+    actual_source = value.get("source_url")
+    target_sha256 = value.get("target_sha256")
+    target_size = value.get("target_size")
+    if (
+        not isinstance(actual_source, str)
+        or (source_url is not None and actual_source != source_url)
+        or not isinstance(target_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", target_sha256) is None
+        or type(target_size) is not int
+        or target_size <= 0
+    ):
+        raise RuntimeError("adapter identity is invalid")
+    config_sha256 = value.get("config_sha256")
+    config_size = value.get("config_size")
+    if (
+        not isinstance(config_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", config_sha256) is None
+        or type(config_size) is not int
+        or config_size < 0
+    ):
+        raise RuntimeError("adapter identity configuration is invalid")
+    for name in ("target_step", "base_step", "base2_step"):
+        step = value.get(name)
+        if step is not None and (type(step) is not int or step < 0):
+            raise RuntimeError(f"adapter identity {name} is invalid")
+    for name in ("base_url", "base_sha256", "base2_url", "base2_sha256"):
+        identity = value.get(name)
+        if identity is not None and not isinstance(identity, str):
+            raise RuntimeError(f"adapter identity {name} is invalid")
+    return dict(value)
+
+
+def _validate_loaded_receipt(
+    value: object,
+    *,
+    source_url: str,
+    lora_name: str,
+    expected: Mapping[str, object] | None,
+) -> AdapterIdentity:
+    receipt = _validate_adapter_identity(value, source_url)
+    if receipt.get("lora_name") != lora_name:
+        raise RuntimeError("loaded adapter receipt has the wrong LoRA name")
+    if not isinstance(receipt.get("server_instance"), str) or not receipt["server_instance"]:
+        raise RuntimeError("loaded adapter receipt has no server instance")
+    if expected is not None:
+        expected_identity = _validate_adapter_identity(dict(expected), source_url)
+        for name, expected_value in expected_identity.items():
+            if name in {"lora_name", "server_instance"}:
+                continue
+            if expected_value is not None and receipt.get(name) != expected_value:
+                raise RuntimeError(f"loaded adapter receipt differs in {name}")
+    return receipt
 
 
 @runtime_checkable
@@ -79,7 +138,8 @@ class InferencePool(Protocol):
         step: int = 0,
         require_delta: bool = False,
         prefetched: bool = False,
-    ) -> None:
+        expected_adapter_identity: Mapping[str, object] | None = None,
+    ) -> list[AdapterIdentity] | None:
         """Update weights on all inference servers."""
         ...
 
@@ -205,14 +265,16 @@ class StaticInferencePool:
         step: int = 0,
         require_delta: bool = False,
         prefetched: bool = False,
-    ) -> None:
-        await update_weights(
+        expected_adapter_identity: Mapping[str, object] | None = None,
+    ) -> list[AdapterIdentity] | None:
+        return await update_weights(
             self._admin_clients,
             weight_dir,
             lora_name=lora_name,
             step=step,
             require_delta=require_delta,
             prefetched=prefetched,
+            expected_adapter_identity=expected_adapter_identity,
         )
 
     async def score(self, token_ids: list[int]) -> list[float]:
@@ -577,7 +639,7 @@ async def stage_lora_adapter(
     *,
     require_delta: bool = False,
     origin_base_urls: list[str] | None = None,
-) -> dict[str, float | int | None]:
+) -> dict[str, object]:
     """Stage one adapter copy per inference host.
 
     A LoRA delta is valid only for the adjacent policy version. The receiver
@@ -586,7 +648,7 @@ async def stage_lora_adapter(
     """
     lora_path_posix = str(lora_path)
     if not lora_path_posix.startswith(("http://", "https://")):
-        return {"wire_stage_seconds": 0.0, "host_count": 0}
+        return {"wire_stage_seconds": 0.0, "host_count": 0, "adapter_identity": None}
     if not admin_clients:
         raise RuntimeError("cannot stage an adapter without an inference endpoint")
 
@@ -634,7 +696,7 @@ async def stage_lora_adapter(
         client: AsyncClient,
         *,
         remaining_delta_seconds: float | None = None,
-    ) -> dict[str, float | None]:
+    ) -> dict[str, object]:
         started = time.perf_counter()
         stage_timeout_s = (
             remaining_delta_seconds
@@ -661,6 +723,9 @@ async def stage_lora_adapter(
             raise RuntimeError(f"invalid adapter stage response from {client.base_url}") from exc
         if not isinstance(payload, dict) or payload.get("status") != "ok":
             raise RuntimeError(f"adapter stage failed on {client.base_url}: {payload!r}")
+        adapter_identity = _validate_adapter_identity(
+            payload.get("adapter_identity"), lora_path_posix
+        )
         stage_seconds = payload.get("stage_seconds")
         if not isinstance(stage_seconds, (int, float)) or stage_seconds < 0:
             stage_seconds = time.perf_counter() - started
@@ -673,6 +738,7 @@ async def stage_lora_adapter(
             if reconstruct_seconds is not None
             else None,
             "request_seconds": time.perf_counter() - started,
+            "adapter_identity": adapter_identity,
         }
 
     started = time.perf_counter()
@@ -773,6 +839,11 @@ async def stage_lora_adapter(
         for result in results
         if result["reconstruct_seconds"] is not None
     ]
+    identities = [result["adapter_identity"] for result in results]
+    if not identities or any(identity != identities[0] for identity in identities[1:]):
+        raise RuntimeError("inference hosts reported different adapter identities")
+    adapter_identity = identities[0]
+    assert isinstance(adapter_identity, dict)
     return {
         "wire_stage_seconds": wire_stage_seconds,
         "origin_stage_seconds": origin_stage_seconds,
@@ -781,6 +852,7 @@ async def stage_lora_adapter(
         "host_count": len(hosts),
         "origin_host_count": origin_count,
         "peer_host_count": len(hosts) - origin_count,
+        "adapter_identity": adapter_identity,
     }
 
 
@@ -815,7 +887,8 @@ async def update_weights(
     step: int = 0,
     require_delta: bool = False,
     prefetched: bool = False,
-) -> None:
+    expected_adapter_identity: Mapping[str, object] | None = None,
+) -> list[AdapterIdentity] | None:
     """Update weights on static inference servers.
 
     Pauses all engines first to drain in-flight requests, then performs the
@@ -834,15 +907,17 @@ async def update_weights(
         # Pause admission while the collective LoRA load runs.
         await _pause_engines(admin_clients, step=step)
         try:
-            await load_lora_adapter(
+            receipts = await load_lora_adapter(
                 admin_clients,
                 lora_name,
                 weight_dir,
                 require_delta=require_delta,
                 prefetched=prefetched,
+                expected_identity=expected_adapter_identity,
             )
         finally:
             await _resume_engines(admin_clients)
+        return receipts
     else:
         # Pause engines so all DP workers drain in-flight work and can join the NCCL broadcast
         await _pause_engines(admin_clients, step=step)
@@ -955,7 +1030,8 @@ async def load_lora_adapter(
     *,
     require_delta: bool = False,
     prefetched: bool = False,
-) -> None:
+    expected_identity: Mapping[str, object] | None = None,
+) -> list[AdapterIdentity]:
     """Make a HTTP post request to the vLLM server to load a LoRA adapter.
 
     Uses our wrapper around vLLM's /v1/load_lora_adapter. The prefix cache is not reset
@@ -967,6 +1043,28 @@ async def load_lora_adapter(
     """
     logger = get_logger()
     lora_path_posix = str(lora_path)
+    remote_adapter = lora_path_posix.startswith(("http://", "https://"))
+    if remote_adapter and not admin_clients:
+        raise RuntimeError("cannot load a remote adapter without an inference endpoint")
+    effective_expected_identity = expected_identity
+    if remote_adapter and effective_expected_identity is None:
+        raise RuntimeError("remote LoRA load has no verified staged adapter identity")
+
+    async def _read_loaded_receipt(admin_client: AsyncClient) -> AdapterIdentity:
+        response = await admin_client.get(
+            "/staging_status",
+            timeout=httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0),
+        )
+        response.raise_for_status()
+        payload = response.json()
+        receipts = payload.get("loaded_receipts") if isinstance(payload, dict) else None
+        receipt = receipts.get(lora_name) if isinstance(receipts, dict) else None
+        return _validate_loaded_receipt(
+            receipt,
+            source_url=lora_path_posix,
+            lora_name=lora_name,
+            expected=effective_expected_identity,
+        )
 
     @retry(
         retry=retry_if_exception(_is_retryable_lora_error),
@@ -977,7 +1075,7 @@ async def load_lora_adapter(
         wait=wait_exponential(multiplier=1, min=1, max=10),
         reraise=True,
     )
-    async def _load_lora_adapter(admin_client: AsyncClient) -> None:
+    async def _load_lora_adapter(admin_client: AsyncClient) -> AdapterIdentity | None:
         logger.debug(f"Sending request to load LoRA adapter {lora_name} from {lora_path}")
         try:
             # Some vLLM workers finish the collective LoRA load but never
@@ -1002,16 +1100,37 @@ async def load_lora_adapter(
                 timeout=LORA_LOAD_READ_TIMEOUT_S,
             )
             response.raise_for_status()
+            if not remote_adapter:
+                return None
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise RuntimeError(f"invalid LoRA load response from {admin_client.base_url}") from exc
+            if not isinstance(payload, dict) or payload.get("status") != "ok":
+                raise RuntimeError(f"LoRA load failed on {admin_client.base_url}: {payload!r}")
+            receipt = payload.get("loaded_receipt") if isinstance(payload, dict) else None
+            return _validate_loaded_receipt(
+                receipt,
+                source_url=lora_path_posix,
+                lora_name=lora_name,
+                expected=effective_expected_identity,
+            )
         except (TimeoutError, httpx.TimeoutException, httpx.TransportError):
-            if await model_is_visible(admin_client, lora_name):
-                logger.warning(
-                    f"LoRA load response from {admin_client.base_url} did not finish, "
-                    f"but adapter {lora_name} is visible; accepting the completed load"
-                )
-                return
+            if lora_path_posix.startswith(("http://", "https://")):
+                try:
+                    receipt = await _read_loaded_receipt(admin_client)
+                except Exception:
+                    receipt = None
+                if receipt is not None:
+                    logger.warning(
+                        f"LoRA load response from {admin_client.base_url} did not finish, "
+                        "but its exact loaded adapter receipt is available; accepting the load"
+                    )
+                    return receipt
             raise
 
-    await asyncio.gather(*[_load_lora_adapter(admin_client) for admin_client in admin_clients])
+    results = await asyncio.gather(*[_load_lora_adapter(admin_client) for admin_client in admin_clients])
+    return [result for result in results if result is not None]
 
 
 async def unload_lora_adapter(admin_clients: list[AsyncClient], lora_name: str) -> None:

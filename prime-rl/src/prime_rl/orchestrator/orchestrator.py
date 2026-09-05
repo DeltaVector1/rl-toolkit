@@ -75,6 +75,7 @@ from prime_rl.orchestrator.utils import (
 from prime_rl.orchestrator.watcher import (
     WeightWatcher,
     _adapter_file_records,
+    _write_receivers_ready,
     inference_weight_path,
     validate_adapter_manifest,
 )
@@ -551,6 +552,7 @@ class Orchestrator:
             sync_version = self.resume_policy_step if self.resume_policy_step is not None else 0
             if config.weight_broadcast.type == "nixl":
                 weights_path = None
+                local_weights_path = None
             else:
                 check_exists = config.weight_broadcast.type == "filesystem"
                 # Without a ckpt block, fall back to a default timeout instead of not waiting at all.
@@ -558,6 +560,7 @@ class Orchestrator:
                 weights_path = get_weight_dir(
                     config.output_dir, sync_version, check_exists=check_exists, wait_timeout=wait_timeout
                 )
+                local_weights_path = weights_path
                 source_weights_path = inference_weight_path(config, weights_path, self.lora_name)
                 _verify_startup_adapter_delta(
                     config,
@@ -571,21 +574,36 @@ class Orchestrator:
                 await asyncio.to_thread(self.model_express.set_status, p2p_pb2.SOURCE_STATUS_READY)
             require_delta = self.lora_name is not None and sync_version > 0
             prefetched = False
+            adapter_identity = None
             if self.lora_name is not None and isinstance(weights_path, str):
-                await stage_lora_adapter(
+                stage_result = await stage_lora_adapter(
                     self.policy_inference.admin_clients,
                     weights_path,
                     require_delta=require_delta,
                     origin_base_urls=self.policy_inference.adapter_origin_base_urls,
                 )
+                adapter_identity = stage_result["adapter_identity"]
                 prefetched = True
-            await self.policy_inference.update_weights(
+            receipts = await self.policy_inference.update_weights(
                 weights_path,
                 lora_name=self.lora_name,
                 step=sync_version,
                 require_delta=require_delta,
                 prefetched=prefetched,
+                expected_adapter_identity=adapter_identity,
             )
+            if self.lora_name is not None and isinstance(weights_path, str):
+                assert local_weights_path is not None
+                _write_receivers_ready(
+                    local_weights_path,
+                    run_name=config.output_dir.name,
+                    step=sync_version,
+                    source_url=weights_path,
+                    slot=self.lora_name,
+                    adapter_identity=adapter_identity,
+                    admin_clients=self.policy_inference.admin_clients,
+                    receipts=receipts,
+                )
             if self.model_express is not None:
                 await asyncio.to_thread(self.model_express.set_status, p2p_pb2.SOURCE_STATUS_INITIALIZING)
                 # Complete the startup rendezvous before the watcher begins its next cycle.

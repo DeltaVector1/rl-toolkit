@@ -1,7 +1,13 @@
 import ast
+import asyncio
+import contextlib
+import hashlib
 import io
 import json
+import re
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,7 +45,233 @@ def load_startup_validator(urlopen, validate_manifest, file_records):
     return namespace["_verify_startup_adapter_delta"]
 
 
+def load_server_load_endpoints(destination, handler):
+    source = SERVER_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    names = {"_read_verified_adapter_identity", "load_lora_adapter", "staging_status"}
+    nodes = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names
+    ]
+
+    class FakeRouter:
+        def get(self, *_args, **_kwargs):
+            return lambda function: function
+
+        def post(self, *_args, **_kwargs):
+            return lambda function: function
+
+    class FakeJSONResponse:
+        def __init__(self, content, status_code):
+            self.content = content
+            self.status_code = status_code
+
+    class FakeErrorResponse:
+        def __init__(self, code=422):
+            self.error = SimpleNamespace(code=code)
+
+        def model_dump(self):
+            return {"error": "backend load failed"}
+
+    namespace = {
+        "Any": Any,
+        "LoadLoRAAdapterRequest": object,
+        "Request": object,
+        "adapter_cache_path": lambda _source_url: destination,
+        "adapter_reader_lock": contextlib.nullcontext,
+        "adapter_stage_status": lambda: {"status": "idle"},
+        "asyncio": asyncio,
+        "ErrorResponse": FakeErrorResponse,
+        "JSONResponse": FakeJSONResponse,
+        "hashlib": hashlib,
+        "json": json,
+        "models": lambda _request: handler,
+        "re": re,
+        "router": FakeRouter(),
+        "stage_lora_adapter_files": lambda *_args, **_kwargs: destination,
+        "_begin_lora_stage": lambda: None,
+        "_combined_lora_stage_status": lambda active, durable: {**active, **durable},
+        "_end_lora_stage": lambda: None,
+        "_lora_stage_status": lambda: {"status": "idle"},
+        "_loaded_lora_receipts": {},
+        "_server_instance_id": "server-a",
+        "lora_load_lock": asyncio.Lock(),
+    }
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SERVER_PATH), "exec"), namespace)
+    return (
+        namespace["load_lora_adapter"],
+        namespace["staging_status"],
+        namespace,
+        FakeJSONResponse,
+        FakeErrorResponse,
+    )
+
+
+def write_cached_adapter(destination, source_url, target_sha256="a" * 64, transport=None):
+    destination.mkdir(parents=True)
+    config = b"{}"
+    weights = b"weights"
+    (destination / "READY").write_text("ready\n", encoding="ascii")
+    (destination / "adapter_config.json").write_bytes(config)
+    (destination / "adapter_model.safetensors").write_bytes(weights)
+    (destination / "adapter_model.safetensors.sha256").write_text(target_sha256 + "\n", encoding="ascii")
+    (destination / "manifest.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "source_url": source_url,
+                "files": {
+                    "adapter_config.json": {
+                        "size": len(config),
+                        "sha256": hashlib.sha256(config).hexdigest(),
+                    },
+                    "adapter_model.safetensors": {"size": len(weights), "sha256": target_sha256},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    if transport is not None:
+        (destination / "transport.json").write_text(json.dumps(transport), encoding="utf-8")
+
+
 class ResumeRecoveryTest(unittest.TestCase):
+    def test_server_load_receipt_requires_backend_success_and_exact_slot(self):
+        source_url = "http://source/step_2"
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "cache"
+            write_cached_adapter(
+                destination,
+                source_url,
+                transport={
+                    "mode": "delta",
+                    "source_url": source_url,
+                    "base_url": "http://source/step_1",
+                    "base_sha256": "c" * 64,
+                    "base2_url": "http://source/step_0",
+                    "base2_sha256": "d" * 64,
+                    "target_sha256": "a" * 64,
+                },
+            )
+
+            class Request:
+                async def json(self):
+                    return {"require_delta": False, "prefetched": True}
+
+            class Handler:
+                def __init__(self):
+                    self.lora_requests = {}
+                    self.response = object()
+                    self.path_override = None
+                    self.active = 0
+                    self.max_active = 0
+
+                async def load_lora_adapter(self, request):
+                    self.active += 1
+                    self.max_active = max(self.max_active, self.active)
+                    try:
+                        await asyncio.sleep(0.005)
+                        if isinstance(self.response, Exception):
+                            return self.response
+                        self.lora_requests[request.lora_name] = SimpleNamespace(
+                            lora_name=request.lora_name,
+                            lora_path=self.path_override or request.lora_path,
+                            load_inplace=request.load_inplace,
+                        )
+                        return self.response
+                    finally:
+                        self.active -= 1
+
+            handler = Handler()
+            load, status, namespace, response_type, error_type = load_server_load_endpoints(
+                destination, handler
+            )
+
+            class LoadRequest:
+                def __init__(self, name="adapter-slot1", path=source_url):
+                    self.lora_name = name
+                    self.lora_path = path
+                    self.load_inplace = False
+
+            success = asyncio.run(load(LoadRequest(), Request()))
+            self.assertEqual(success["status"], "ok")
+            self.assertEqual(success["loaded_receipt"]["source_url"], source_url)
+            self.assertEqual(success["loaded_receipt"]["config_sha256"], hashlib.sha256(b"{}").hexdigest())
+            self.assertEqual(namespace["_loaded_lora_receipts"]["adapter-slot1"], success["loaded_receipt"])
+            self.assertEqual(asyncio.run(status(Request()))["loaded_receipts"]["adapter-slot1"], success["loaded_receipt"])
+
+            async def status_during_staging():
+                stage_started = threading.Event()
+
+                def slow_stage(*_args, **_kwargs):
+                    stage_started.set()
+                    time.sleep(0.05)
+                    return destination
+
+                namespace["stage_lora_adapter_files"] = slow_stage
+
+                class UnprefetchedRequest(Request):
+                    async def json(self):
+                        return {"require_delta": False, "prefetched": False}
+
+                task = asyncio.create_task(load(LoadRequest(), UnprefetchedRequest()))
+                if not await asyncio.to_thread(stage_started.wait, 1.0):
+                    raise AssertionError("staging did not start")
+                state = await status(Request())
+                await task
+                return state
+
+            in_progress = asyncio.run(status_during_staging())
+            self.assertNotIn("adapter-slot1", in_progress["loaded_receipts"])
+
+            (destination / "adapter_config.json").write_bytes(b"[]")
+            with self.assertRaisesRegex(RuntimeError, "configuration bytes"):
+                asyncio.run(load(LoadRequest(), Request()))
+            (destination / "adapter_config.json").write_bytes(b"{}")
+
+            handler.response = error_type()
+            failed = asyncio.run(load(LoadRequest(), Request()))
+            self.assertIsInstance(failed, response_type)
+            self.assertEqual(failed.status_code, 422)
+            self.assertNotIn("adapter-slot1", namespace["_loaded_lora_receipts"])
+
+            handler.response = object()
+            local = asyncio.run(load(LoadRequest(path="/local/adapter"), Request()))
+            self.assertEqual(local["status"], "ok")
+            self.assertNotIn("adapter-slot1", namespace["_loaded_lora_receipts"])
+
+            remote = asyncio.run(load(LoadRequest(), Request()))
+            self.assertEqual(remote["status"], "ok")
+            handler.lora_requests.pop("adapter-slot1")
+            self.assertNotIn("adapter-slot1", asyncio.run(status(Request()))["loaded_receipts"])
+            self.assertNotIn("adapter-slot1", namespace["_loaded_lora_receipts"])
+
+            handler.response = object()
+            handler.path_override = "/wrong/path"
+            mismatched = asyncio.run(load(LoadRequest("adapter-slot-mismatch"), Request()))
+            self.assertIsInstance(mismatched, response_type)
+            self.assertEqual(mismatched.status_code, 500)
+            self.assertNotIn("adapter-slot-mismatch", namespace["_loaded_lora_receipts"])
+            handler.path_override = None
+
+            async def concurrent_loads():
+                return await asyncio.gather(
+                    load(LoadRequest("adapter-slot-concurrent"), Request()),
+                    load(LoadRequest("adapter-slot-concurrent"), Request()),
+                )
+
+            concurrent = asyncio.run(concurrent_loads())
+            self.assertEqual([item["status"] for item in concurrent], ["ok", "ok"])
+            self.assertEqual(handler.max_active, 1)
+
+            restarted_handler = Handler()
+            _, restarted_status, restarted_namespace, _, _ = load_server_load_endpoints(
+                destination, restarted_handler
+            )
+            self.assertEqual(asyncio.run(restarted_status(Request()))["loaded_receipts"], {})
+            self.assertEqual(restarted_namespace["_loaded_lora_receipts"], {})
+
     def test_resume_uses_target_identity_when_public_predecessors_are_cleaned(self):
         target_url = "http://source/step_6"
         manifest = {

@@ -143,12 +143,17 @@ publish() {
 }
 
 scan() {
-  local file
+  local file relative
   if [ -f "$source_dir/control/orch.toml" ] &&
      [ $(( $(date +%s) - $(stat -c %Y "$source_dir/control/orch.toml") )) -ge 2 ] &&
      [ ! -f "$source_dir/control/orch.toml.delivered" ]; then
     publish "$source_dir/control/orch.toml" || true
   fi
+  while IFS= read -r -d '' file; do
+    relative=${file#"$source_dir"/}
+    [[ "$relative" =~ ^broadcasts/step_[0-9]+/receivers-ready\.json$ ]] || continue
+    [ -f "$file.delivered" ] || publish "$file" || true
+  done < <(find "$source_dir/broadcasts" -mindepth 2 -maxdepth 2 -type f -name receivers-ready.json -print0 2>/dev/null | sort -z)
   while IFS= read -r -d '' file; do
     [ -f "$file.delivered" ] || publish "$file" || true
   done < <(find "$source_dir/rollouts" -type f -name train_rollouts.bin -print0 2>/dev/null | sort -z)
