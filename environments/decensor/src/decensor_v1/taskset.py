@@ -235,7 +235,7 @@ class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
                 return await request_judge_score(
                     name,
                     lambda: run_agentic_review(task_config.judge, source),
-                    attempt_count=1,
+                    attempt_count=3,
                     total_timeout_seconds=(
                         review_phase_count
                         * review_attempts_per_phase
