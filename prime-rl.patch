@@ -1783,10 +1783,10 @@ index 28e2f57..30ad6d9 100644
      namespace = config.to_vllm()
      if vllm_extra:
 diff --git a/src/prime_rl/inference/vllm/worker/filesystem.py b/src/prime_rl/inference/vllm/worker/filesystem.py
-index 1049d17..0cc8068 100644
+index 1049d17..1e197be 100644
 --- a/src/prime_rl/inference/vllm/worker/filesystem.py
 +++ b/src/prime_rl/inference/vllm/worker/filesystem.py
-@@ -1,9 +1,4230 @@
+@@ -1,9 +1,4165 @@
 +import fcntl
 +import hashlib
 +import json
@@ -3808,39 +3808,6 @@ index 1049d17..0cc8068 100644
 +    return digest.hexdigest()
 +
 +
-+def _sha256_region(
-+    path: Path,
-+    offset: int,
-+    size: int,
-+    deadline: float | None = None,
-+    cancel_event: threading.Event | None = None,
-+    *,
-+    parent_fd: int | None = None,
-+) -> str:
-+    digest = hashlib.sha256()
-+    file_descriptor = _open_nofollow(
-+        path.name if parent_fd is not None else path,
-+        os.O_RDONLY,
-+        dir_fd=parent_fd,
-+        label="adapter checksum file",
-+    )
-+    try:
-+        remaining = size
-+        position = offset
-+        while remaining:
-+            _check_deadline(deadline, cancel_event)
-+            chunk = os.pread(file_descriptor, min(16 * 1024 * 1024, remaining), position)
-+            if not chunk:
-+                raise OSError("adapter output ended before completed chunk")
-+            digest.update(chunk)
-+            position += len(chunk)
-+            remaining -= len(chunk)
-+    finally:
-+        os.close(file_descriptor)
-+    _check_deadline(deadline, cancel_event)
-+    return digest.hexdigest()
-+
-+
 +def _decode_transport_chunk(payload: bytes, *, codec: str, raw_size: int) -> bytes:
 +    """Use the shared bounded decoder for one transport chunk."""
 +    try:
@@ -4269,28 +4236,13 @@ index 1049d17..0cc8068 100644
 +        _reject_symlink_path(chunk_path, "adapter transport chunk")
 +        _reject_symlink_path(completed_path, "adapter completed proof")
 +        _reject_symlink_path(wire_ready_path, "adapter wire proof")
-+        completed_valid, completed_proof = _proof_identity_matches(
++        completed_valid, _ = _proof_identity_matches(
 +            completed_path, item, completed=True
 +        )
-+        if completed_valid and completed_proof is not None:
-+            resume_hash_started = time.monotonic()
-+            try:
-+                if (
-+                    _path_regular_size(output_path, "adapter output") == target_size
-+                    and _sha256_region(output_path, offset, raw_size, deadline, cancel_event)
-+                    == completed_proof["output_sha256"]
-+                ):
-+                    # A completed proof supersedes any wire-ready proof left
-+                    # by an interrupted cleanup after the proof was published.
-+                    _discard_proof(wire_ready_path)
-+                    return
-+            except TimeoutError:
-+                raise
-+            except (FileNotFoundError, OSError):
-+                pass
-+            finally:
-+                with reconstruct_lock:
-+                    reconstruct_seconds += time.monotonic() - resume_hash_started
++        if completed_valid:
++            # The final file checksum validates all resumed regions together.
++            _discard_proof(wire_ready_path)
++            return
 +        if _path_stat(completed_path, "adapter completed proof") is not None:
 +            _discard_proof(completed_path)
 +
@@ -4706,25 +4658,8 @@ index 1049d17..0cc8068 100644
 +            except (OSError, ValueError):
 +                proof_matches = False
 +            if proof_matches:
-+                _check_deadline(deadline, cancel_event)
-+                try:
-+                    output_matches = (
-+                        _path_regular_size(output_path, "adapter output") == target_size
-+                        and _sha256_region(
-+                            output_path,
-+                            offset,
-+                            raw_size,
-+                            deadline,
-+                            cancel_event,
-+                        )
-+                        == proof["output_sha256"]
-+                    )
-+                except TimeoutError:
-+                    raise
-+                except (FileNotFoundError, OSError):
-+                    output_matches = False
-+                if output_matches:
-+                    return
++                # The final file checksum validates all resumed regions together.
++                return
 +            _unlink_path(completed_path, "adapter completed proof")
 +
 +        chunk_lane = index % len(lane_urls)
@@ -6018,7 +5953,7 @@ index 1049d17..0cc8068 100644
 
  # This is to get type hints for the Worker class but not actually extend it at runtime as this is required by vLLM worker extension
  if TYPE_CHECKING:
-@@ -25,8 +4246,16 @@ class FileSystemWeightUpdateWorker(Worker):
+@@ -25,8 +4181,16 @@ class FileSystemWeightUpdateWorker(Worker):
          """No-op RPC used by the API server liveness endpoint."""
          return None
 
@@ -6035,7 +5970,7 @@ index 1049d17..0cc8068 100644
          # Get vLLM model runner and model
          # When enforce_eager=True, model isn't wrapped by torch.compile so no .runnable attr
          model_runner = self.model_runner
-@@ -47,6 +4276,8 @@ class FileSystemWeightUpdateWorker(Worker):
+@@ -47,6 +4211,8 @@ class FileSystemWeightUpdateWorker(Worker):
              allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
          )
          weights_iterator = model_loader._get_weights_iterator(local_source)
