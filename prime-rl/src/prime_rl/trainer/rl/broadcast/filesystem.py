@@ -218,12 +218,6 @@ class FileSystemWeightBroadcast(WeightBroadcast):
             candidate_step = current_step - 3
             if candidate_step < 0:
                 continue
-            if interval_to_keep and candidate_step % interval_to_keep == 0:
-                self.logger.debug(
-                    f"Keeping path {get_step_path(broadcast_dir, candidate_step)} "
-                    "(on ckpt interval)"
-                )
-                continue
             candidate_path = get_step_path(broadcast_dir, candidate_step)
             self.logger.debug(f"Removing path {candidate_path}")
             shutil.rmtree(candidate_path, ignore_errors=True)

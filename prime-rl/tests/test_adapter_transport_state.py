@@ -87,6 +87,24 @@ def load_manifest_prewarm_method():
     return namespace["_prewarm_adapter_manifest"]
 
 
+def load_broadcast_cleanup_method():
+    path = ROOT / "src/prime_rl/trainer/rl/broadcast/filesystem.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    function = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "maybe_clean"
+    )
+    namespace = {
+        "shutil": __import__("shutil"),
+        "get_broadcast_dir": lambda output_dir: output_dir,
+        "get_step_path": lambda broadcast_dir, step: broadcast_dir / f"step_{step}",
+        "maybe_clean": lambda *_args: None,
+    }
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)
+    return namespace["maybe_clean"]
+
+
 def load_filesystem_module():
     path = ROOT / "src/prime_rl/inference/vllm/worker/filesystem.py"
     module_name = "filesystem_sidecar_test"
@@ -170,6 +188,27 @@ class QuietDirectoryHandler(http.server.SimpleHTTPRequestHandler):
 
 
 class AdapterTransportStateTest(unittest.TestCase):
+    def test_lora_broadcast_cleanup_does_not_keep_checkpoint_intervals(self):
+        cleanup = load_broadcast_cleanup_method()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for step in range(7):
+                (root / f"step_{step}").mkdir()
+            manager = SimpleNamespace(
+                used_idxs=[0],
+                progress={0: SimpleNamespace(step=7)},
+                get_run_dir=lambda _idx: root,
+            )
+            broadcast = SimpleNamespace(
+                world=SimpleNamespace(is_master=True),
+                multi_run_manager=manager,
+                lora_config=object(),
+                logger=SimpleNamespace(debug=lambda *_args: None),
+            )
+            cleanup(broadcast, 3)
+            self.assertFalse((root / "step_3").exists())
+            self.assertTrue((root / "step_4").exists())
+
     def test_exact_adjacent_delta_round_trip(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -1,6 +1,6 @@
-From f5805e66280e4e71e9bca2d6f8be5d4c3ea8b29a Mon Sep 17 00:00:00 2001
+From 9e6bf25e702f07b813c52a1e78a5a43787ddcc6d Mon Sep 17 00:00:00 2001
 From: patch-builder <patch-builder@localhost>
-Date: Sat, 5 Sep 2026 16:48:00 +0000
+Date: Sat, 5 Sep 2026 16:53:00 +0000
 Subject: [PATCH] Prime-RL trainer and runtime overlay
 
 Base-Prime-RL: f50ec5c4c8c45864ec535dead2c3b630de50d068
@@ -22503,7 +22503,7 @@ index ca30983..db646a7 100644
  
      # Validate sequence length against parallel dimensions requirements
 diff --git a/src/prime_rl/trainer/rl/broadcast/filesystem.py b/src/prime_rl/trainer/rl/broadcast/filesystem.py
-index d0a453f..44ea183 100644
+index d0a453f..af206eb 100644
 --- a/src/prime_rl/trainer/rl/broadcast/filesystem.py
 +++ b/src/prime_rl/trainer/rl/broadcast/filesystem.py
 @@ -2,6 +2,7 @@ import shutil
@@ -22659,7 +22659,7 @@ index d0a453f..44ea183 100644
                  finally:
                      self.multi_run_manager.ready_to_update[idx] = False
  
-@@ -111,9 +204,26 @@ class FileSystemWeightBroadcast(WeightBroadcast):
+@@ -111,9 +204,20 @@ class FileSystemWeightBroadcast(WeightBroadcast):
          stable_file.touch()
  
      def maybe_clean(self, interval_to_keep: int | None):
@@ -22681,12 +22681,6 @@ index d0a453f..44ea183 100644
 +            # step after the new adapter has been published successfully.
 +            candidate_step = current_step - 3
 +            if candidate_step < 0:
-+                continue
-+            if interval_to_keep and candidate_step % interval_to_keep == 0:
-+                self.logger.debug(
-+                    f"Keeping path {get_step_path(broadcast_dir, candidate_step)} "
-+                    "(on ckpt interval)"
-+                )
 +                continue
 +            candidate_path = get_step_path(broadcast_dir, candidate_step)
 +            self.logger.debug(f"Removing path {candidate_path}")
@@ -23068,7 +23062,7 @@ index 1ad250c..85c4267 100644
              )
          return TensorMicroBatch(
 diff --git a/src/prime_rl/trainer/rl/train.py b/src/prime_rl/trainer/rl/train.py
-index 295d3ad..aeed02b 100644
+index 295d3ad..543c63d 100644
 --- a/src/prime_rl/trainer/rl/train.py
 +++ b/src/prime_rl/trainer/rl/train.py
 @@ -1,8 +1,16 @@
@@ -25321,18 +25315,21 @@ index 295d3ad..aeed02b 100644
              broadcast_weights_time = 0
          else:
              broadcast_unused = (
-@@ -605,7 +2294,9 @@ def train(config: TrainerConfig):
+@@ -605,8 +2294,11 @@ def train(config: TrainerConfig):
              if not broadcast_unused:
                  broadcast_weights_start_time = time.perf_counter()
                  weight_broadcast.broadcast_weights(model, step=progress.step)
 -                broadcast_weights_time = time.perf_counter() - broadcast_weights_start_time
+-                # Clean up old broadcast directories (unless at ckpt interval if using filesystem weight broadcast)
 +                broadcast_weights_time = (
 +                    time.perf_counter() - broadcast_weights_start_time
 +                )
-                 # Clean up old broadcast directories (unless at ckpt interval if using filesystem weight broadcast)
++                # Keep interval snapshots only for full-weight broadcasts.
++                # LoRA broadcasts keep the three versions required by delta transport.
                  if config.weight_broadcast.type == "filesystem":
                      interval_to_keep = config.ckpt and config.ckpt.interval
-@@ -637,7 +2328,9 @@ def train(config: TrainerConfig):
+                     weight_broadcast.maybe_clean(interval_to_keep)
+@@ -637,7 +2329,9 @@ def train(config: TrainerConfig):
                  # Single-run: Save full checkpoint
                  logger.info(f"Saving checkpoint at step {progress.step}")
                  save_ckpt_start_time = time.perf_counter()
@@ -25343,7 +25340,7 @@ index 295d3ad..aeed02b 100644
                  save_ckpt_time += time.perf_counter() - save_ckpt_start_time
  
              ckpt_manager.maybe_clean()
-@@ -656,18 +2349,29 @@ def train(config: TrainerConfig):
+@@ -656,18 +2350,29 @@ def train(config: TrainerConfig):
          if memory_profiler is not None:
              memory_profiler.step()
  
@@ -25378,7 +25375,7 @@ index 295d3ad..aeed02b 100644
  
          # Log step metrics
          step_time = time.perf_counter() - step_start_time
-@@ -680,7 +2384,9 @@ def train(config: TrainerConfig):
+@@ -680,7 +2385,9 @@ def train(config: TrainerConfig):
          if "max_vio/mean" in tensor_stats:
              step_message += f" | Max Vio {tensor_stats['max_vio/mean']:.4f}"
          if "routing_confidence/mean" in tensor_stats:
@@ -25389,7 +25386,7 @@ index 295d3ad..aeed02b 100644
          logger.success(step_message)
  
          # Log performance metrics
-@@ -689,6 +2395,7 @@ def train(config: TrainerConfig):
+@@ -689,6 +2396,7 @@ def train(config: TrainerConfig):
              "perf/throughput_per_gpu": throughput / world.world_size,
              "perf/mfu": mfu,
              "perf/peak_memory": peak_memory,
@@ -25397,7 +25394,7 @@ index 295d3ad..aeed02b 100644
              "step": progress.step,
          }
          monitor.log(perf_metrics, step=progress.step)
-@@ -710,7 +2417,9 @@ def train(config: TrainerConfig):
+@@ -710,7 +2418,9 @@ def train(config: TrainerConfig):
              tensor_stats["kl_ent_ratio/mean"] = mismatch_kl_mean / entropy_mean
  
          tensor_stats["step"] = progress.step
@@ -25408,7 +25405,7 @@ index 295d3ad..aeed02b 100644
  
          # Log time metrics
          time_metrics = {
-@@ -753,7 +2462,11 @@ def train(config: TrainerConfig):
+@@ -753,7 +2463,11 @@ def train(config: TrainerConfig):
                  if config.max_concurrent_runs == 1:
                      lr = optimizer.param_groups[0]["lr"]
                  else:
@@ -25421,7 +25418,7 @@ index 295d3ad..aeed02b 100644
                  run_stats.append(
                      RunStats(
                          run_id=run_id,
-@@ -785,8 +2498,6 @@ def train(config: TrainerConfig):
+@@ -785,8 +2499,6 @@ def train(config: TrainerConfig):
          prof.export_chrome_trace(trace_file)
          logger.info(f"Saved trace to {trace_file}")
  
@@ -25430,7 +25427,7 @@ index 295d3ad..aeed02b 100644
      # Write final checkpoint (only for single-run mode; multi-run checkpoints are managed by MultiCheckpointManager)
      if config.max_concurrent_runs == 1 and ckpt_manager is not None:
          if not (config.ckpt and config.ckpt.weights_only):
-@@ -799,7 +2510,40 @@ def train(config: TrainerConfig):
+@@ -799,7 +2511,40 @@ def train(config: TrainerConfig):
          weight_ckpt_manager.save(progress.step, model, tokenizer)
          weight_ckpt_manager.maybe_clean()
  

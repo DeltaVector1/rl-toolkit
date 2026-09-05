@@ -2297,7 +2297,8 @@ def train(config: TrainerConfig):
                 broadcast_weights_time = (
                     time.perf_counter() - broadcast_weights_start_time
                 )
-                # Clean up old broadcast directories (unless at ckpt interval if using filesystem weight broadcast)
+                # Keep interval snapshots only for full-weight broadcasts.
+                # LoRA broadcasts keep the three versions required by delta transport.
                 if config.weight_broadcast.type == "filesystem":
                     interval_to_keep = config.ckpt and config.ckpt.interval
                     weight_broadcast.maybe_clean(interval_to_keep)
