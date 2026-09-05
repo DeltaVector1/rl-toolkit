@@ -426,6 +426,78 @@ class AdapterTransportStateTest(unittest.TestCase):
             self.assertEqual(relay_manifest["transport"], "full")
             self.assertIn("adapter_model.safetensors", relay_manifest["files"])
 
+    def test_missing_delta_base_uses_the_published_full_adapter(self):
+        filesystem = load_filesystem_module()
+        config = b"{}\n"
+        model = b"full adapter"
+        files = {
+            "adapter_config.json": {
+                "size": len(config),
+                "sha256": hashlib.sha256(config).hexdigest(),
+            },
+            "adapter_model.safetensors": {
+                "size": len(model),
+                "sha256": hashlib.sha256(model).hexdigest(),
+            },
+        }
+        source_manifest = {
+            "version": 2,
+            "kind": "lora-adapter",
+            "mode": "delta",
+            "files": [{"name": name, **record} for name, record in files.items()],
+        }
+        transport = {
+            "mode": "delta",
+            "transport": filesystem._ADAPTER_LINEAR_TRANSPORT,
+            "source_manifest": source_manifest,
+            "target_sha256": files["adapter_model.safetensors"]["sha256"],
+            "target_size": len(model),
+            "config_sha256": files["adapter_config.json"]["sha256"],
+            "config_size": len(config),
+        }
+        old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
+        old_transport = filesystem._read_chunked_xor_manifest
+        old_manifest = filesystem._source_manifest
+        old_stage = filesystem._stage_chunked_linear_adapter
+        old_download = filesystem.download
+        old_timeout = filesystem._delta_stage_timeout_s
+
+        def download(_source, destination, **_kwargs):
+            destination.write_bytes(config if destination.name.endswith(".json") else model)
+
+        filesystem._read_chunked_xor_manifest = lambda *_args, **_kwargs: transport
+        filesystem._source_manifest = lambda *_args, **_kwargs: {
+            "version": 1,
+            "source_url": "http://source/step_4",
+            "files": files,
+        }
+        filesystem._stage_chunked_linear_adapter = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            FileNotFoundError("base is not cached")
+        )
+        filesystem.download = download
+        filesystem._delta_stage_timeout_s = lambda: 30.0
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                os.environ["PRIME_LORA_CACHE_DIR"] = temporary
+                destination = filesystem.stage_lora_adapter_files("http://source/step_4")
+                self.assertEqual((destination / "adapter_model.safetensors").read_bytes(), model)
+                relay = json.loads((destination / "relay_manifest.json").read_text())
+                self.assertEqual(relay["transport"], "full")
+                with self.assertRaises(FileNotFoundError):
+                    filesystem.stage_lora_adapter_files(
+                        "http://source/step_5", require_delta=True
+                    )
+        finally:
+            if old_cache is None:
+                os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+            else:
+                os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+            filesystem._read_chunked_xor_manifest = old_transport
+            filesystem._source_manifest = old_manifest
+            filesystem._stage_chunked_linear_adapter = old_stage
+            filesystem.download = old_download
+            filesystem._delta_stage_timeout_s = old_timeout
+
     def test_protocol_has_one_strict_delta_flag(self):
         worker = ROOT / "src/prime_rl/inference/vllm/worker/filesystem.py"
         client = ROOT / "src/prime_rl/utils/client.py"

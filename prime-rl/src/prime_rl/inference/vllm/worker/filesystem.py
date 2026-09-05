@@ -3635,15 +3635,25 @@ def stage_lora_adapter_files(
                         return destination
                 _check_deadline(delta_deadline, cancel_event)
                 if transport.get("transport") == _ADAPTER_LINEAR_TRANSPORT:
-                    return _stage_chunked_linear_adapter(
-                        source_url,
-                        transport,
-                        manifest,
-                        deadline=delta_deadline,
-                        cancel_event=cancel_event,
-                        committed_event=committed_event,
-                    )
-                if transport.get("transport") == _ADAPTER_DELTA_TRANSPORT:
+                    try:
+                        return _stage_chunked_linear_adapter(
+                            source_url,
+                            transport,
+                            manifest,
+                            deadline=delta_deadline,
+                            cancel_event=cancel_event,
+                            committed_event=committed_event,
+                        )
+                    except FileNotFoundError:
+                        if require_delta:
+                            raise
+                        transport = {
+                            "mode": "full",
+                            "source_manifest": transport["source_manifest"],
+                        }
+                if transport.get("mode") == "full":
+                    pass
+                elif transport.get("transport") == _ADAPTER_DELTA_TRANSPORT:
                     return _stage_chunked_xor_adapter(
                         source_url,
                         transport,
@@ -3652,7 +3662,8 @@ def stage_lora_adapter_files(
                         cancel_event=cancel_event,
                         committed_event=committed_event,
                     )
-                raise OSError("adapter delta transport is unsupported")
+                else:
+                    raise OSError("adapter delta transport is unsupported")
             _reject_symlink_path(destination / "READY", "adapter ready marker")
             if _path_regular_size(destination / "READY", "adapter ready marker") is not None:
                 try:
