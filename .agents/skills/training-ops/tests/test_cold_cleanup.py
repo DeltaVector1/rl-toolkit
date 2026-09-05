@@ -18,6 +18,7 @@ class ColdCleanupTest(unittest.TestCase):
         self.assertIn("cache=/data/glm52-rl/lora-cache", script)
         self.assertIn('flock -n "$lock"', script)
         self.assertIn("find '$path' -xdev -depth -delete", script)
+        self.assertIn("adapter-staging.lock) continue", script)
         self.assertIn("unknown adapter cache entry", script)
         self.assertNotIn("rm -rf", script)
 

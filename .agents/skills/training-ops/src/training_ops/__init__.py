@@ -5266,6 +5266,7 @@ for path in "$cache"/*; do
   [ -e "$path" ] || continue
   name=${{path##*/}}
   case "$name" in
+    adapter-staging.lock) continue ;;
     [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*|\
     *.partial|*.parts|*.assembling|*.retired-*) ;;
     *) echo "unknown adapter cache entry: $path" >&2; exit 33 ;;
