@@ -6557,7 +6557,7 @@ index 998ff6f..af787d3 100644
              await safe_cancel_all(train_tasks)
          return cancelled
 diff --git a/src/prime_rl/orchestrator/orchestrator.py b/src/prime_rl/orchestrator/orchestrator.py
-index 400d078..6beb94e 100644
+index 400d078..cd4d3ab 100644
 --- a/src/prime_rl/orchestrator/orchestrator.py
 +++ b/src/prime_rl/orchestrator/orchestrator.py
 @@ -22,9 +22,11 @@ in ``setup()`` and drives them from ``main_loop()``.
@@ -6972,7 +6972,24 @@ index 400d078..6beb94e 100644
          self.component_tasks = [
              asyncio.create_task(self.dispatcher.start(), name="dispatcher"),
              asyncio.create_task(self.watcher.start(), name="watcher"),
-@@ -524,6 +762,9 @@ class Orchestrator:
+@@ -509,6 +747,16 @@ class Orchestrator:
+         to the train / eval sink. Both sinks return a finalized batch (or
+         ``None``) from ``add()``; we just dispatch on the result."""
+         while not self.stopped.is_set():
++            for task in self.component_tasks:
++                if not task.done():
++                    continue
++                if task.cancelled():
++                    raise RuntimeError(f"{task.get_name()} stopped unexpectedly")
++                error = task.exception()
++                if error is not None:
++                    raise RuntimeError(f"{task.get_name()} failed") from error
++                raise RuntimeError(f"{task.get_name()} exited unexpectedly")
++
+             if self.draining and self.dispatcher.is_idle:
+                 get_logger().info("Pipeline drained, exiting main loop")
+                 self.stopped.set()
+@@ -524,6 +772,9 @@ class Orchestrator:
              # Train rollouts belong to the batch window currently collecting (``progress.step``),
              # eval rollouts to the step whose eval triggered them.
              kind = episode[0].kind
@@ -6982,7 +6999,7 @@ index 400d078..6beb94e 100644
              step = episode[0].eval_step if kind == "eval" else self.progress.step
              assert step is not None
              run: vf.RunInfo = (
-@@ -553,10 +794,15 @@ class Orchestrator:
+@@ -553,10 +804,15 @@ class Orchestrator:
                  continue
 
              train_batch = await self.train_sink.add(episode)
@@ -6998,7 +7015,7 @@ index 400d078..6beb94e 100644
 
      async def finalize_train_batch(self, batch: TrainBatch) -> None:
          """Ship one ``TrainBatch`` out to the trainer and handle the I/O
-@@ -604,13 +850,13 @@ class Orchestrator:
+@@ -604,13 +860,13 @@ class Orchestrator:
                  f"({n_trainable / len(batch.rollouts):.1%}) — consider reviewing task difficulty / filter config"
              )
 
@@ -7016,7 +7033,7 @@ index 400d078..6beb94e 100644
          if not config.bench and self.policy.version < required_version:
              get_logger().info(
                  f"Holding batch {step} until the trainer publishes policy v{required_version} "
-@@ -643,7 +889,9 @@ class Orchestrator:
+@@ -643,7 +899,9 @@ class Orchestrator:
 
          await self.sender.send(TrainingBatch(examples=batch.samples, step=step))
          self.progress.step += 1
@@ -7027,7 +7044,7 @@ index 400d078..6beb94e 100644
          # Checkpoint the step we just shipped (resume point: continue at step + 1).
          save_ckpt_time = await self.maybe_save_ckpt(step)
          trim_process_memory()
-@@ -744,6 +992,13 @@ class Orchestrator:
+@@ -744,6 +1002,13 @@ class Orchestrator:
          ``(console_body, wandb_payload)``. Per-env ``(env=N, …)``
          breakdowns inline only when there's more than one train / eval env;
          the eval halves drop entirely when nothing is accumulating."""
@@ -7041,7 +7058,7 @@ index 400d078..6beb94e 100644
          disp_gauges = self.dispatcher.gauges()
          disp_drain = self.dispatcher.metrics.drained(
              train_envs={e.name for e in self.train_envs},
-@@ -755,6 +1010,8 @@ class Orchestrator:
+@@ -755,6 +1020,8 @@ class Orchestrator:
          inflight_by_env = self.dispatcher.inflight_by_env
          inflight_train = self.dispatcher.inflight_train_count
          inflight_eval = self.dispatcher.inflight_eval_count
@@ -7050,7 +7067,7 @@ index 400d078..6beb94e 100644
          train_batch, train_target, _train_unit = self.train_sink.batch_progress()
          train_buffered = self.train_sink.buffered_count()
          train_batch_by_env = self.train_sink.pending_batch_by_env()
-@@ -771,6 +1028,10 @@ class Orchestrator:
+@@ -771,6 +1038,10 @@ class Orchestrator:
              train_batch_part += " (" + ", ".join(f"{n}={v}" for n, v in pairs) + ")"
          if train_buffered:
              train_batch_part += f" (+{train_buffered} buffered)"
@@ -7061,7 +7078,7 @@ index 400d078..6beb94e 100644
 
          eval_batch_part = ""
          for env, _step, eb, exp, _ebuf in eval_batches:
-@@ -903,7 +1164,63 @@ class Orchestrator:
+@@ -903,7 +1174,63 @@ class Orchestrator:
          await asyncio.to_thread(self.ckpt_manager.save, self.progress, step)
          return time.perf_counter() - t
 
@@ -7126,7 +7143,7 @@ index 400d078..6beb94e 100644
          """Pause/resume the dispatcher based on how far the in-flight batch runs
          ahead of ``policy.version``. ``progress.step`` is always the batch being
          collected — advanced right after shipping — so both call sites (ship time
-@@ -918,42 +1235,106 @@ class Orchestrator:
+@@ -918,42 +1245,106 @@ class Orchestrator:
              and self.config.max_steps is not None
              and self.progress.step >= self.config.max_steps - 1
          )
