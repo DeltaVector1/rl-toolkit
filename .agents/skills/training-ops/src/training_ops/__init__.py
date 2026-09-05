@@ -5188,6 +5188,16 @@ remove_dir "$run_dir/checkpoints" "trainer checkpoints and optimizer state"
 remove_dir "$run_dir/control" "orchestrator control state"
 remove_dir "$run_dir/.incoming" "in-flight delivery state"
 remove_dir "$run_dir/hf-cache" "run-local model/data cache"
+for tracking_dir in "$run_dir"/run-20*; do
+  [ -e "$tracking_dir" ] || continue
+  [ -d "$tracking_dir" ] && [ ! -L "$tracking_dir" ] || {{
+    echo "cold cleanup refused invalid tracking path: $tracking_dir" >&2
+    exit 1
+  }}
+  remove_dir "$tracking_dir" "old tracking data"
+done
+remove_file "$run_dir/final_summary.json"
+remove_file "$run_dir/rollout-metrics.jsonl"
 remove_file "$run_dir/.batch-sync.pid"
 remove_file "$run_dir/.batch-sync.lock"
 remove_file "$run_dir/.microbatch-sync.pid"
