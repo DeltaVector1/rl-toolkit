@@ -40,7 +40,7 @@ _judge_capacity_owner_pid: int | None = None
 _judge_capacity_owner_value: int | None = None
 
 
-def _safe_service_error(error: object) -> str:
+def safe_service_error(error: object) -> str:
     message = " ".join(str(error).split())
     message = re.sub(
         r"(?i)(authorization|api[-_ ]?key|token)(\s*[:=]\s*)([^, }]+)",
@@ -308,7 +308,7 @@ def judge_failure_summary(name: str, outcome: EvaluationResult) -> dict[str, Any
                 failure_types.append(error_type)
             error_message = record.get("error")
             if isinstance(error_message, str) and error_message:
-                error_message = _safe_service_error(error_message)
+                error_message = safe_service_error(error_message)
             else:
                 error_message = None
         elif status == "invalid_judge_response":
@@ -393,42 +393,32 @@ async def request_judge_score(
         async with asyncio.timeout(total_timeout_seconds):
             for attempt_number in range(1, attempt_count + 1):
                 attempt_started_at = time.monotonic()
-                try:
-                    response = await request()
-                except Exception as error:
-                    attempts.append(
-                        {
-                            "name": name,
-                            "attempt": attempt_number,
-                            "status": "request_failed",
-                            "error_type": type(error).__name__,
-                            "error": str(error),
-                            "elapsed_seconds": time.monotonic() - attempt_started_at,
-                        }
+                response = await request()
+                failure_status = getattr(response, "failure_status", None)
+                attempt_record = {
+                    "name": name,
+                    "attempt": attempt_number,
+                    "status": (
+                        "scored"
+                        if response.parsed is not None
+                        else "invalid_judge_response"
+                        if failure_status == "invalid_model_response"
+                        else "request_failed"
+                    ),
+                    "text": response.text or "",
+                    "parsed": response.parsed,
+                    "elapsed_seconds": time.monotonic() - attempt_started_at,
+                }
+                events = getattr(response, "events", None)
+                if events is not None:
+                    attempt_record["events"] = events
+                attempts.append(attempt_record)
+                if response.parsed is not None:
+                    return EvaluationResult(
+                        status="scored",
+                        score=response.parsed,
+                        details={"attempts": attempts},
                     )
-                else:
-                    attempt_record = {
-                        "name": name,
-                        "attempt": attempt_number,
-                        "status": (
-                            "scored"
-                            if response.parsed is not None
-                            else "invalid_judge_response"
-                        ),
-                        "text": response.text or "",
-                        "parsed": response.parsed,
-                        "elapsed_seconds": time.monotonic() - attempt_started_at,
-                    }
-                    events = getattr(response, "events", None)
-                    if events is not None:
-                        attempt_record["events"] = events
-                    attempts.append(attempt_record)
-                    if response.parsed is not None:
-                        return EvaluationResult(
-                            status="scored",
-                            score=response.parsed,
-                            details={"attempts": attempts},
-                        )
                 if attempt_number < attempt_count:
                     await asyncio.sleep(0.5 * attempt_number)
     except TimeoutError:
@@ -441,7 +431,9 @@ async def request_judge_score(
                 "elapsed_seconds": time.monotonic() - request_started_at,
             }
         )
-    return EvaluationResult(
-        status="unscored_service_failure",
-        details={"attempts": attempts},
+    status = (
+        "invalid_model_response"
+        if any(record.get("status") == "invalid_judge_response" for record in attempts)
+        else "unscored_service_failure"
     )
+    return EvaluationResult(status=status, details={"attempts": attempts})

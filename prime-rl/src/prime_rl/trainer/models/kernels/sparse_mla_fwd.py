@@ -9,8 +9,7 @@ import ctypes as _ctypes
 
 try:
     _ctypes.CDLL("libcudart.so", mode=_ctypes.RTLD_GLOBAL)
-except Exception:
-    # This is expected on CPU-only machines
+except OSError:
     pass
 
 import os

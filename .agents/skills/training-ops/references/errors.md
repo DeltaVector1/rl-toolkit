@@ -12,18 +12,6 @@ not already restarting it, use:
 training_ops.repair("engine:<host>")
 ```
 
-## Inference tunnels do not pass data
-
-Confirm that inference throughput is also low. A tunnel probe can time out
-when it shares a busy link. If the endpoints are idle and the tunnel probes
-fail, use:
-
-```python
-training_ops.repair("tunnels")
-```
-
-This repair does not touch the batch-transfer port.
-
 ## A supervisor stopped
 
 Use `training_ops.alive()` to confirm the process and its log are stale. Then

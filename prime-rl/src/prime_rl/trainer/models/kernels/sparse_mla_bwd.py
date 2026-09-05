@@ -10,8 +10,7 @@ import os
 
 try:
     _ctypes.CDLL("libcudart.so", mode=_ctypes.RTLD_GLOBAL)
-except Exception:
-    # This is expected on CPU-only machines
+except OSError:
     pass
 
 import tilelang
@@ -36,7 +35,7 @@ def preprocess(
 
     @T.prim_func
     def preprocess_kernel(
-        O: T.Tensor(shape, dtype),
+        output: T.Tensor(shape, dtype),
         dO: T.Tensor(shape, dtype),
         Delta: T.Tensor([B, S, H], accum_dtype),
     ):
@@ -47,7 +46,15 @@ def preprocess(
             acc = T.alloc_fragment([block_ND, block_ND], accum_dtype)
             T.clear(acc)
             for k in T.Pipelined(T.ceildiv(D, block_ND), num_stages=num_stages):
-                T.copy(O[bz, by * block_ND : (by + 1) * block_ND, bx, k * block_ND : (k + 1) * block_ND], o)
+                T.copy(
+                    output[
+                        bz,
+                        by * block_ND : (by + 1) * block_ND,
+                        bx,
+                        k * block_ND : (k + 1) * block_ND,
+                    ],
+                    o,
+                )
                 T.copy(dO[bz, by * block_ND : (by + 1) * block_ND, bx, k * block_ND : (k + 1) * block_ND], do)
                 for i, j in T.Parallel(block_ND, block_ND):
                     acc[i, j] += o[i, j] * do[i, j]

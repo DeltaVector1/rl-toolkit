@@ -63,8 +63,8 @@ Trainer work and rollout collection overlap. Do not add all values unless the
 timestamps show that they ran in sequence.
 
 The latest measured rollout times do not pass the target of about 10 minutes.
-The current 48-tunnel inventory returns HTTP 200, but tunnel health alone does
-not prove rollout throughput.
+The current orchestrator sends requests directly to the two H200 servers.
+Endpoint health alone does not prove rollout throughput.
 
 Historical WAN measurements had about 217 ms round-trip delay and packet loss
 from 3 to 33 percent. Large request counts caused tunnel resets and read

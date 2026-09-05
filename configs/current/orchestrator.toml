@@ -55,6 +55,7 @@ ratio = 1.0
 pool = { type = "static", num_workers = 16 }
 env.taskset.id = "decensor-v1"
 env.taskset.num_examples = 2000
+env.taskset.difficulty = "easy"
 env.agent.harness = { id = "null", runtime = { type = "subprocess" } }
 env.agent.max_output_tokens = 16384
 env.agent.timeout.rollout = 3600

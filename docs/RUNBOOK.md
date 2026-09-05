@@ -39,7 +39,6 @@ Do not run it in the background. Do not use an interval above 600 seconds.
 Run `status()` first. Apply only the repair that matches its report.
 
 ```python
-training_ops.repair("tunnels")
 training_ops.repair("engine:h200a")
 training_ops.repair("supervisors")
 ```
@@ -75,10 +74,6 @@ restart starts the trainer first because that control file already exists.
 
 Do not edit a run name into a copy of an old configuration. Update the named
 profile in `configs/operations.toml` and its files.
-
-The GLM-5.3 judge is a separate service on `h200b`. Its service profile is
-`inference.h200b.glm53_judge` in `configs/operations.toml`. Starting or
-stopping it is a live service change and needs owner approval.
 
 ## Direct host read
 

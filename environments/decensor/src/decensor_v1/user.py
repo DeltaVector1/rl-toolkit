@@ -10,8 +10,8 @@ from typing import Any
 
 import httpx
 import verifiers.v1 as vf
-from openai import APIError, AsyncOpenAI
-from pydantic import Field
+from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI
+from pydantic import Field, ValidationError
 from pydantic_config import BaseConfig
 
 try:
@@ -21,7 +21,7 @@ except ImportError:
 from verifiers.v1.types import UserMessage
 
 from decensor_v1.state import DecensorState
-from decensor_v1.service import judge_request_slot
+from decensor_v1.service import judge_request_slot, safe_service_error
 from decensor_v1.follow_up import (
     FollowUpReview,
     choose_follow_up_strategy,
@@ -383,14 +383,20 @@ class DecensorUser:
                             self.state.follow_up_attempts.append(attempt_record)
                             self.state.follow_up_strategies.append(strategy_name)
                         except (
-                            APIError,
-                            httpx.HTTPError,
+                            APIConnectionError,
+                            APIStatusError,
+                            APITimeoutError,
+                            httpx.TransportError,
                             TimeoutError,
-                            IndexError,
-                            AttributeError,
-                            TypeError,
+                            ValidationError,
                             ValueError,
+                            IndexError,
                         ) as exc:
+                            if isinstance(exc, APIStatusError) and not (
+                                exc.status_code in {408, 409, 429}
+                                or exc.status_code >= 500
+                            ):
+                                raise
                             final_error = type(exc).__name__
                             text = ""
                             self.state.follow_up_attempts.append(
@@ -402,7 +408,7 @@ class DecensorUser:
                                     "strategy_selection_seed": strategy_selection_seed,
                                     "generation_seed": generation_seed,
                                     "error_type": final_error,
-                                    "error": str(exc),
+                                    "error": safe_service_error(exc),
                                     "elapsed_seconds": time.monotonic()
                                     - attempt_started_at,
                                 }

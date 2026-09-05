@@ -86,9 +86,6 @@ def extract_think_trace(text: str) -> str:
     matches = re.findall(r"<think>(.*?)</think>", text, flags=re.DOTALL | re.IGNORECASE)
     if matches:
         return "\n".join(matches).strip()
-    m_auto = re.search(r"^(.*?)</think>", text, flags=re.DOTALL | re.IGNORECASE)
-    if m_auto:
-        return m_auto.group(1).strip()
     match = re.search(r"<think>(.*?)$", text, flags=re.DOTALL | re.IGNORECASE)
     if match:
         return match.group(1).strip()
@@ -169,14 +166,10 @@ def extract_provider_reasoning_trace(message: Any) -> str:
 
 
 def extract_message_reasoning_trace(message: Any) -> str:
-    content_trace = extract_think_trace(message_content(message))
-    if content_trace:
-        return content_trace
-    return extract_provider_reasoning_trace(message)
-
-
-def has_unclosed_think(text: str) -> bool:
-    return think_tag_rejection_reason(text) == "unclosed_think"
+    provider_trace = extract_provider_reasoning_trace(message)
+    if provider_trace:
+        return provider_trace
+    return extract_think_trace(message_content(message))
 
 
 def think_tag_rejection_reason(text: str) -> str | None:
@@ -184,7 +177,7 @@ def think_tag_rejection_reason(text: str) -> str | None:
         match.group(0).lower()
         for match in re.finditer(r"</?think>", text or "", flags=re.IGNORECASE)
     ]
-    if tags in ([], ["</think>"], ["<think>", "</think>"]):
+    if tags in ([], ["<think>", "</think>"]):
         return None
     if tags == ["<think>"]:
         return "unclosed_think"
@@ -356,6 +349,8 @@ def detect_structured_markers(text: str) -> str | None:
         "Response-Length",
         "user-turn-output",
         "conversation",
+        "thinking",
+        "thought",
     ):
         if re.search(rf"</?{re.escape(tag)}(?:\s[^>]*)?>", text, flags=re.IGNORECASE):
             return tag

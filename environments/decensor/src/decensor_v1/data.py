@@ -9,50 +9,10 @@ from datasets import load_dataset
 from decensor_v1.text import word_requirements
 
 
-decensor_dataset = "NewEden/RL-seed-Decensor"
+decensor_dataset = "NewEden/RL-seed-Decensor-Difficulty"
 markdown_system_prompts_dataset = "Delta-Vector/Tauri-RL-Markdown-System-V2"
 plaintext_system_prompts_dataset = "Delta-Vector/Tauri-RL-Plaintext-System-V2"
 style_prompts_dataset = "Delta-Vector/Tauri-RL-Styles"
-
-
-def convert_sharegpt_messages(convo: list[dict]) -> list[dict[str, str]]:
-    out: list[dict[str, str]] = []
-    for turn in convo:
-        if not isinstance(turn, dict):
-            continue
-        frm = str(turn.get("from", "")).lower()
-        val = str(turn.get("value", "") or "").strip()
-        if not val:
-            continue
-        if frm == "system":
-            role = "system"
-        elif frm in ("human", "user"):
-            role = "user"
-        elif frm in ("gpt", "assistant", "chatgpt", "bard"):
-            role = "assistant"
-        else:
-            continue
-        out.append({"role": role, "content": val})
-    return out
-
-
-def truncate_to_k_user_turns(
-    messages: list[dict[str, str]], k: int
-) -> list[dict[str, str]] | None:
-    if k < 1:
-        return None
-    msgs = [m for m in messages if m.get("role") != "system"]
-    user_seen = 0
-    cut = -1
-    for i, m in enumerate(msgs):
-        if m.get("role") == "user":
-            user_seen += 1
-            if user_seen == k:
-                cut = i
-                break
-    if cut < 0:
-        return None
-    return msgs[: cut + 1]
 
 
 def sample_turn_counts(
@@ -147,8 +107,20 @@ def load_system_prompts() -> dict[str, list[str]]:
     }
 
 
-def iter_decensor_rows():
-    yield from load_dataset(decensor_dataset, split="train", streaming=True)
+def iter_decensor_rows(difficulty: str):
+    if difficulty not in {"easy", "medium", "hard"}:
+        raise ValueError("difficulty must be easy, medium, or hard")
+    columns = [
+        "source_index",
+        "prompt",
+        "primary_harm_type_code",
+        "bucket_ID",
+    ]
+    dataset = load_dataset(decensor_dataset, split="train", streaming=True)
+    dataset = dataset.select_columns(columns)
+    for row in dataset:
+        if row["bucket_ID"] == difficulty:
+            yield row
 
 
 def build_decensor_pool(
@@ -156,63 +128,60 @@ def build_decensor_pool(
     decay: float,
     max_turns: int,
     seed: int,
+    difficulty: str,
 ) -> list[tuple[list[dict[str, str]], int, str, int]]:
     if target <= 0:
         return []
     all_rows: list[dict[str, Any]] = []
-    rows_by_asst_turns: dict[int, dict[str, list[int]]] = {}
-    for row in iter_decensor_rows():
-        conv = row.get("conversations") or []
-        n_asst = sum(
-            1
-            for m in conv
-            if isinstance(m, dict)
-            and str(m.get("from", "")).lower() in ("gpt", "assistant")
-        )
-        harms = row.get("harm_types") or [row.get("harm_label") or "unknown"]
-        primary = str(harms[0]) if harms else "unknown"
+    rows_by_harm: dict[str, list[int]] = {}
+    for row in iter_decensor_rows(difficulty):
+        prompt = row.get("prompt")
+        if (
+            not isinstance(prompt, list)
+            or len(prompt) != 1
+            or not isinstance(prompt[0], dict)
+            or prompt[0].get("role") != "user"
+            or not isinstance(prompt[0].get("content"), str)
+            or not prompt[0]["content"].strip()
+        ):
+            raise ValueError("each difficulty row must contain one user prompt")
+        harm_type = row.get("primary_harm_type_code")
+        if not isinstance(harm_type, str) or not harm_type:
+            raise ValueError("each difficulty row must contain a primary harm type")
+        source_index = row.get("source_index")
+        if not isinstance(source_index, int):
+            raise ValueError("each difficulty row must contain an integer source index")
         idx = len(all_rows)
-        all_rows.append({"conversations": conv, "harm_type": primary})
-        rows_by_asst_turns.setdefault(n_asst, {}).setdefault(primary, []).append(idx)
+        all_rows.append(
+            {
+                "prompt": prompt[0]["content"].strip(),
+                "harm_type": harm_type,
+                "source_index": source_index,
+            }
+        )
+        rows_by_harm.setdefault(harm_type, []).append(idx)
 
-    alloc_per_k: dict[int, int] = {}
-    for k in sample_turn_counts(target, decay, max_turns, seed):
-        alloc_per_k[k] = alloc_per_k.get(k, 0) + 1
+    if not all_rows:
+        raise ValueError(f"the difficulty dataset has no {difficulty} rows")
+
+    selected = stratified_sample_by_key(rows_by_harm, target, seed + 7919)
+    turn_counts = sample_turn_counts(target, decay, max_turns, seed)
+    if len(selected) != target or len(turn_counts) != target:
+        raise ValueError("could not build the requested number of tasks")
 
     out: list[tuple[list[dict[str, str]], int, str, int]] = []
-    for k, need in alloc_per_k.items():
-        candidate_rows_by_harm: dict[str, list[int]] = {}
-        for asst_count, harm_map in rows_by_asst_turns.items():
-            if asst_count < k:
-                continue
-            if k == 1 and asst_count != 1:
-                continue
-            for harm, idxs in harm_map.items():
-                candidate_rows_by_harm.setdefault(harm, []).extend(idxs)
-        if not candidate_rows_by_harm:
-            for asst_count, harm_map in rows_by_asst_turns.items():
-                if asst_count < k:
-                    continue
-                for harm, idxs in harm_map.items():
-                    candidate_rows_by_harm.setdefault(harm, []).extend(idxs)
-
-        for row_idx in stratified_sample_by_key(
-            candidate_rows_by_harm, need, seed + k * 7919
-        ):
-            conv = all_rows[int(row_idx)].get("conversations") or []
-            msgs = convert_sharegpt_messages(conv)
-            truncated = truncate_to_k_user_turns(msgs, k)
-            if truncated is not None:
-                out.append(
-                    (
-                        truncated,
-                        k,
-                        str(all_rows[int(row_idx)]["harm_type"]),
-                        int(row_idx),
-                    )
-                )
+    for row_idx, turn_count in zip(selected, turn_counts, strict=True):
+        row = all_rows[int(row_idx)]
+        out.append(
+            (
+                [{"role": "user", "content": str(row["prompt"])}],
+                turn_count,
+                str(row["harm_type"]),
+                int(row["source_index"]),
+            )
+        )
     random.Random(seed).shuffle(out)
-    return out[:target]
+    return out
 
 
 def build_rows(
@@ -224,9 +193,16 @@ def build_rows(
     markdown_probability: float,
     enable_length_prompts: bool,
     output_prompt: str | None,
+    difficulty: str,
 ) -> list[dict[str, Any]]:
     system_prompts = load_system_prompts()
-    pool = build_decensor_pool(num_examples, turn_decay_ratio, max_turns, seed + 2)
+    pool = build_decensor_pool(
+        num_examples,
+        turn_decay_ratio,
+        max_turns,
+        seed + 2,
+        difficulty,
+    )
     response_formats = assign_response_formats(
         len(pool),
         markdown_probability,

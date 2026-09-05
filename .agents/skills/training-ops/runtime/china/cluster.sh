@@ -183,8 +183,8 @@ PY
       -v "$deployment/prime-rl/src/prime_rl/trainer/lora.py":/app/src/prime_rl/trainer/lora.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/models/kernels/sparse_mla_fwd.py":/app/src/prime_rl/trainer/models/kernels/sparse_mla_fwd.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/models/kernels/sparse_mla_bwd.py":/app/src/prime_rl/trainer/models/kernels/sparse_mla_bwd.py:ro \
-      -v "$deployment/prime-rl/src/prime_rl/trainer/model.py":/app/src/prime_rl/trainer/model.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/utils/vlm.py":/app/src/prime_rl/utils/vlm.py:ro \
+      -v "$deployment/prime-rl/packages/prime-rl-configs/src/prime_rl/configs/shared.py":/app/packages/prime-rl-configs/src/prime_rl/configs/shared.py:ro \
       -v "$deployment/prime-rl/packages/prime-rl-configs/src/prime_rl/configs/trainer.py":/app/packages/prime-rl-configs/src/prime_rl/configs/trainer.py:ro \
       --env-file /data/trinity/training.env \
       -e PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,garbage_collection_threshold:0.8}" \

@@ -55,12 +55,8 @@ inference_hosts = list(hosts["inference"])
 orchestrator_host = hosts["orchestrator"]
 metric_hosts = list(hosts["metrics"])
 blocked_hosts = set(hosts["blocked"])
-inference_tunnel_ports = list(
-    range(ports["inference_tunnel_first"], ports["inference_tunnel_last"] + 1)
-)
-judge_port = ports["judge"]
 adapter_port = ports["adapter"]
-batch_port = ports["batch"]
+judge_api_url = operations["judges"]["external"]["api_url"].rstrip("/")
 remote_repo = paths["remote_repository"]
 storage_root = paths["storage_root"]
 run_root = paths["runs"]
@@ -124,7 +120,7 @@ glm_rollout_max_seconds = glm_requirements["rollout_seconds_max"]
 adapter_archive_files = ("adapter_config.json", "adapter_model.safetensors")
 dependency_manifest_name = ".training-ops-manifest"
 _dependency_remote_archive_pattern = re.compile(
-    r"^/tmp/trainer-dependencies-[A-Za-z0-9._-]+\.tar$"
+    r"^/tmp/trainer-dependencies-[A-Za-z0-9._-]+\.tar(?:\.gz)?$"
 )
 
 if set(inference_hosts) != set(inference_settings):
@@ -460,13 +456,6 @@ def _select_active_reward_rows(
 # -------------------------------------------------------------------- probes
 
 trainer_probe = r"""
-ok=0; bad=""
-for p in $(seq __TUNNEL_FIRST__ __TUNNEL_LAST__); do
-  c=$(curl -s -o /dev/null -m 5 -w "%{http_code}" http://127.0.0.1:$p/v1/models 2>/dev/null)
-  if [ "$c" = "200" ]; then ok=$((ok+1)); else bad="$bad $p"; fi
-done
-echo "TUNNELS_OK $ok"
-echo "TUNNELS_BAD $bad"
 strip() { sed "s/\x1b\[[0-9;]*m//g"; }
 echo "TRAINER_UP $(sudo docker ps --filter name=__TRAINER__ --format up 2>/dev/null | head -1)"
 trainer_cfg=$(sudo docker inspect __TRAINER__ --format '{{range .Config.Cmd}}{{println .}}{{end}}' 2>/dev/null | grep -E '\.toml$' | tail -1)
@@ -486,10 +475,7 @@ echo "BATCH $(sudo docker logs --tail 40 __ORCH__ 2>&1 | grep -oE 'batch [0-9]+/
 echo "FAILS5M $(sudo docker logs --since 5m __ORCH__ 2>&1 | grep -ac 'Rollout failed')"
 echo "TRAINER_LOGAGE $(sudo docker logs -t --tail 1 __TRAINER__ 2>&1 | tail -1 | cut -d' ' -f1)"
 echo "ORCH_LOGAGE $(sudo docker logs -t --tail 1 __ORCH__ 2>&1 | tail -1 | cut -d' ' -f1)"
-echo "JUDGE $(curl -s -o /dev/null -m 10 -w '%{http_code}' http://127.0.0.1:__JUDGE__/v1/models)"
 echo "ADAPTER $(curl -s -o /dev/null -m 10 -w '%{http_code}' http://127.0.0.1:__ADAPTER__/)"
-echo "SUP_TUN $(pgrep -f 'bash .*[t]unnel_watchdog.sh' | wc -l)"
-echo "SUP_TUN_LOG $(tail -1 /data/glm52-rl/tunnel_watchdog.log 2>/dev/null | cut -d' ' -f1)"
 """
 
 
@@ -515,6 +501,7 @@ echo "ORCH_LAST $(sudo docker logs __ORCH__ 2>&1 | strip | grep -a 'SUCCESS Step
 echo "BATCH $(sudo docker logs --tail 40 __ORCH__ 2>&1 | grep -oE 'batch [0-9]+/[0-9]+[^;]*; [0-9]+ inflight' | tail -1)"
 echo "FAILS5M $(sudo docker logs --since 5m __ORCH__ 2>&1 | grep -ac 'Rollout failed')"
 echo "ORCH_LOGAGE $(sudo docker logs -t --tail 1 __ORCH__ 2>&1 | tail -1 | cut -d' ' -f1)"
+echo "JUDGE $(curl -s -o /dev/null -m 10 -w '%{http_code}' __JUDGE_URL__/models)"
 """
 
 node_probe = r"""
@@ -585,10 +572,7 @@ def _head_script() -> str:
     return (
         trainer_probe.replace("__TRAINER__", trainer_container)
         .replace("__ORCH__", orchestrator_container)
-        .replace("__JUDGE__", str(judge_port))
         .replace("__ADAPTER__", str(adapter_port))
-        .replace("__TUNNEL_FIRST__", str(inference_tunnel_ports[0]))
-        .replace("__TUNNEL_LAST__", str(inference_tunnel_ports[-1]))
     )
 
 
@@ -744,8 +728,6 @@ class Status:
     when: str = ""
     run: str = ""
     mode: str = "rl"
-    tunnels_ok: int = 0
-    tunnels_bad: list[int] = field(default_factory=list)
     trainer_up: bool = False
     trainer_finished: bool = False
     trainer_failed: bool = False
@@ -762,8 +744,6 @@ class Status:
     orch_log_age: float | None = None
     judge: str = "000"
     adapter: str = "000"
-    supervisor_tunnel: bool = False
-    supervisor_tunnel_log_age: float | None = None
     nodes: list[NodeState] = field(default_factory=list)
     engines: list[EngineState] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -799,7 +779,7 @@ class Status:
                 f"trainer {trainer_state} | "
                 f"orchestrator "
                 f"{'up' if self.orch_up else 'finished' if self.trainer_finished else 'down'} | "
-                f"tunnels {self.tunnels_ok}/{len(inference_tunnel_ports)} | judge {self.judge} | adapter {self.adapter}"
+                f"judge {self.judge} | adapter {self.adapter}"
             )
         L.append(
             f"run steps {self.trainer_steps} | failures in 5m {self.fails_5m} | {self.batch or 'no batch line'}"
@@ -819,10 +799,8 @@ class Status:
             )
             L.append(
                 f"  supervisors: local=disabled "
-                f"tunnel={'yes' if self.supervisor_tunnel else 'no'} "
                 f"batch-sync={'yes' if self.batch_sync else 'no'} "
-                f"trainer-check={'yes' if self.trainer_failure_watchdog else 'no'} "
-                f"(tunnel log {_hms(self.supervisor_tunnel_log_age)} old)"
+                f"trainer-check={'yes' if self.trainer_failure_watchdog else 'no'}"
             )
         L.append("trainer nodes")
         for n in self.nodes:
@@ -1545,7 +1523,9 @@ def status(run: str = "", quiet: bool = False) -> Status:
             f_edge_orch = ex.submit(
                 _ssh,
                 orchestrator_host,
-                orchestrator_probe.replace("__ORCH__", orchestrator_container),
+                orchestrator_probe.replace("__ORCH__", orchestrator_container).replace(
+                    "__JUDGE_URL__", judge_api_url
+                ),
                 120,
             )
             f_nodes = ex.submit(_fan, trainer_hosts, node)
@@ -1565,14 +1545,13 @@ def status(run: str = "", quiet: bool = False) -> Status:
         "BATCH",
         "FAILS5M",
         "ORCH_LOGAGE",
+        "JUDGE",
     )
     for key in edge_keys:
         h.pop(key, None)
     if edge_orch_rc == 0:
         h.update({key: edge_orch[key] for key in edge_keys if key in edge_orch})
-    s.tunnels_ok = int(h.get("TUNNELS_OK", 0) or 0)
     s.mode = h.get("MODE", "rl")
-    s.tunnels_bad = [int(p) for p in h.get("TUNNELS_BAD", "").split()]
     head_trainer_up = h.get("TRAINER_UP", "") == "up"
     s.orch_up = h.get("ORCH_UP", "") == "up"
     s.batch_sync = int(h.get("BATCH_SYNC", 0) or 0) > 0
@@ -1589,8 +1568,6 @@ def status(run: str = "", quiet: bool = False) -> Status:
     s.orch_log_age = _age(h.get("ORCH_LOGAGE", ""))
     s.judge = h.get("JUDGE", "000")
     s.adapter = h.get("ADAPTER", "000")
-    s.supervisor_tunnel = int(h.get("SUP_TUN", 0) or 0) > 0
-    s.supervisor_tunnel_log_age = _age(h.get("SUP_TUN_LOG", ""))
 
     for host, (rc, out) in nodes_out.items():
         n = NodeState(host=host, reachable=(rc == 0))
@@ -1650,16 +1627,6 @@ def _warnings(s: Status) -> list[str]:
     trainer_only = s.mode == "trainer-only"
     if not trainer_only and not s.orch_up and not s.trainer_finished:
         w.append("orchestrator container is not up")
-    if not trainer_only and s.tunnels_ok <= 20:
-        w.append(
-            f"only {s.tunnels_ok}/{len(inference_tunnel_ports)} tunnels answer. Check the engines before you believe this. "
-            "If they are generating, the probe is starved by load, not by dead tunnels."
-        )
-    elif not trainer_only and s.tunnels_ok < 36:
-        w.append(
-            f"{s.tunnels_ok}/{len(inference_tunnel_ports)} tunnels answer. "
-            "Compare against the engine concurrency below."
-        )
     inflight = re.search(r"(\d+) inflight", s.batch or "")
     live = [e for e in s.engines if e.reachable]
     if inflight and int(inflight.group(1)) > 40 and live:
@@ -1668,7 +1635,7 @@ def _warnings(s: Status) -> list[str]:
             w.append(
                 f"{inflight.group(1)} rollouts in flight but the engines generate {tput:.1f} tok/s "
                 "and run nothing. Sample again before acting. If it holds, the requests are queued "
-                "in the tunnels; lower max_inflight_rollouts, which is independent of batch_size."
+                "before inference; lower max_inflight_rollouts, which is independent of batch_size."
             )
     for e in (() if trainer_only else s.engines):
         if e.reachable and not e.healthy:
@@ -1691,13 +1658,6 @@ def _warnings(s: Status) -> list[str]:
         w.append(
             f"adapter server returned {s.adapter} on port {adapter_port}. "
             "If the engines cannot fetch the LoRA, they keep serving the base model and nothing learns."
-        )
-    if not trainer_only and not s.supervisor_tunnel:
-        w.append("tunnel watchdog is not running")
-    elif not trainer_only and s.supervisor_tunnel_log_age and s.supervisor_tunnel_log_age > 300:
-        w.append(
-            f"tunnel watchdog process exists but its log is {_hms(s.supervisor_tunnel_log_age)} old; "
-            "a process that writes no log line does not work"
         )
     if s.orch_up and not s.batch_sync:
         w.append("durable batch publisher is not running; completed rollout batches cannot reach the trainer")
@@ -1749,28 +1709,6 @@ def current_run() -> str:
         return m.group(1)
     detail = command.strip() or out.strip() or f"container {trainer_container} has no run path"
     raise RuntimeError(f"cannot identify the active run on {trainer_head}: {detail}")
-
-
-def tunnels() -> dict[int, str]:
-    """HTTP code for each rollout tunnel port."""
-    rc, out = _ssh(
-        trainer_head,
-        f'for p in $(seq {inference_tunnel_ports[0]} {inference_tunnel_ports[-1]}); do printf "%s " $p; '
-        'curl -s -o /dev/null -m 6 -w "%{http_code}\\n" http://127.0.0.1:$p/v1/models 2>/dev/null || echo 000; done',
-        timeout=240,
-    )
-    if rc:
-        raise RuntimeError(f"cannot check tunnels on {trainer_head}: {out.strip()}")
-    res = {port: "000" for port in inference_tunnel_ports}
-    for line in out.splitlines():
-        p = line.split()
-        if len(p) == 2 and p[0].isdigit():
-            res[int(p[0])] = p[1]
-    ok = sum(1 for v in res.values() if v == "200")
-    print(
-        f"tunnels {ok}/{len(res)} answering; bad: {[p for p, v in res.items() if v != '200']}"
-    )
-    return res
 
 
 def engines(run: str = "") -> dict[str, EngineState]:
@@ -3589,8 +3527,6 @@ echo "recreated exact orchestrator container $container"
 
 def repair(what: str) -> str:
     """Apply a named repair to the configured hosts."""
-    if what == "tunnels":
-        return _repair_tunnels()
     if what.startswith("engine-watchdog:"):
         return _repair_engine_watchdog(what.split(":", 1)[1])
     if what.startswith("engine:"):
@@ -3608,7 +3544,7 @@ def repair(what: str) -> str:
     if what == "orchestrator":
         return _repair_orchestrator()
     raise Refused(
-        f"unknown repair {what!r}. Use tunnels, engine-watchdog:<host>, engine:<host>, supervisors, microbatch-sync, adapter-update, adapter-server[:reload], or orchestrator."
+        f"unknown repair {what!r}. Use engine-watchdog:<host>, engine:<host>, supervisors, microbatch-sync, adapter-update, adapter-server[:reload], or orchestrator."
     )
 
 
@@ -3949,24 +3885,6 @@ def _repair_orchestrator() -> str:
     return result
 
 
-def _repair_tunnels() -> str:
-    rc, out = _ssh(
-        trainer_head,
-        f"k=0; for p in $(seq {inference_tunnel_ports[0]} {inference_tunnel_ports[-1]}); do "
-        'c=$(curl -s -o /dev/null -m 6 -w "%{http_code}" http://127.0.0.1:$p/v1/models 2>/dev/null); '
-        'if [ "$c" != "200" ]; then '
-        'pid=$(sudo ss -H -lntp "sport = :$p" | sed -n "s/.*pid=\\([0-9][0-9]*\\).*/\\1/p" | head -1); '
-        '[ -n "$pid" ] && sudo kill $pid && k=$((k+1)); fi; done; echo "killed $k"',
-        timeout=300,
-    )
-    if rc:
-        raise RuntimeError(f"tunnel repair failed on {trainer_head}: {out.strip()}")
-    msg = out.strip().splitlines()[-1] if out.strip() else "no output"
-    print(f"tunnels: {msg}. The H200 supervisors rebuild within about 5 seconds.")
-    print(f"The batch tunnel on port {batch_port} was not touched.")
-    return msg
-
-
 def _repair_engine(host: str) -> str:
     _check_host(host)
     if host not in inference_hosts:
@@ -4196,24 +4114,6 @@ def _repair_engine_watchdog(host: str) -> str:
 
 def _repair_supervisors(profile: str = "current") -> str:
     out = []
-    for pat, cmd, log in (
-        (
-            "bash .*tunnel_watchdog.sh",
-            f"nohup setsid env ports={shlex.quote(' '.join(map(str, inference_tunnel_ports)))} "
-            f"timeout=20 interval=45 bash {runtime_root}/china/tunnel_watchdog.sh "
-            ">> /data/glm52-rl/tunnel_watchdog.log 2>&1 </dev/null & disown",
-            "/data/glm52-rl/tunnel_watchdog.log",
-        ),
-    ):
-        if not alive(pat, trainer_head, log):
-            code, restart_output = _ssh(trainer_head, cmd)
-            if code:
-                raise RuntimeError(
-                    f"cannot restart {pat} on {trainer_head}: {restart_output.strip()}"
-                )
-            out.append(f"restarted {pat}")
-        else:
-            out.append(f"{pat} already runs")
     for h in inference_hosts:
         _profile(profile)
         rc, count_text = _ssh(
@@ -4487,8 +4387,8 @@ def _create_dependency_bundle(
         ),
         encoding="utf-8",
     )
-    bundle = directory / f"trainer-dependencies-{directory.name}.tar"
-    with tarfile.open(bundle, mode="w") as archive:
+    bundle = directory / f"trainer-dependencies-{directory.name}.tar.gz"
+    with tarfile.open(bundle, mode="w:gz") as archive:
         for path in sorted(files):
             archive.add(files[path], arcname=path, recursive=False)
         archive.add(manifest, arcname=dependency_manifest_name, recursive=False)
@@ -4580,6 +4480,11 @@ for member in "${{install_paths[@]}}"; do
   mkdir -p -- "$(dirname -- "$destination")" || die "cannot create destination for $member"
   [ ! -L "$destination" ] || die "destination is a symlink: $member"
   cp -p -- "$source" "$destination" || die "cannot install $member"
+  if [ -x "$source" ]; then
+    chmod 0755 -- "$destination" || die "cannot set executable mode: $member"
+  else
+    chmod 0644 -- "$destination" || die "cannot set file mode: $member"
+  fi
   [ -f "$destination" ] && [ ! -L "$destination" ] || die "invalid installed path: $member"
   source_digest=$(sha256sum -- "$source" | cut -d' ' -f1) || die "cannot checksum $member"
   got=$(sha256sum -- "$destination" | cut -d' ' -f1) || die "cannot verify $member"
@@ -4590,20 +4495,22 @@ echo "installed ${{#install_paths[@]}} trainer dependency files"
 
 
 def _dependency_checksum_script(
-    repository_root: str, expected: list[tuple[str, str]]
+    repository_root: str, expected: list[tuple[str, str, str]]
 ) -> str:
     """Build one read-only remote check for the expected dependency files."""
     lines = [
         "set -euo pipefail",
         f"repository={shlex.quote(repository_root)}",
     ]
-    for path, digest in expected:
+    for path, digest, mode in expected:
         lines.extend(
             [
                 f"file=\"$repository\"/{shlex.quote(path)}",
                 '[ -f "$file" ] && [ ! -L "$file" ]',
                 'got=$(sha256sum -- "$file" | cut -d\' \' -f1)',
                 f'[ "$got" = {shlex.quote(digest)} ]',
+                'got_mode=$(stat -c %a -- "$file")',
+                f'[ "$got_mode" = {shlex.quote(mode)} ]',
             ]
         )
     lines.append("printf '%s\\n' 'checksums match'")
@@ -4616,6 +4523,34 @@ def _validated_dependency_remote_archive(bundle: Path) -> str:
     if _dependency_remote_archive_pattern.fullmatch(remote_archive) is None:
         raise Refused(f"invalid trainer dependency temporary archive: {remote_archive}")
     return remote_archive
+
+
+def _retry_dependency_copy(label: str, copy, cleanup) -> None:
+    """Run one dependency copy at most three times."""
+    last_detail = "failed"
+    for attempt in range(1, 4):
+        try:
+            code, detail = copy()
+        except subprocess.TimeoutExpired as error:
+            code = 1
+            detail = error.stderr or "timed out"
+        except OSError as error:
+            code = 1
+            detail = str(error)
+        if isinstance(detail, bytes):
+            detail = detail.decode(errors="replace")
+        last_detail = str(detail or "failed").strip()
+        if code == 0:
+            return
+        cleanup()
+        print(
+            f"trainer dependency bundle: {label} attempt {attempt}/3 failed: "
+            f"{last_detail[:160]}",
+            file=sys.stderr,
+        )
+        if attempt < 3:
+            time.sleep(attempt)
+    raise RuntimeError(f"trainer dependency bundle: {label} failed: {last_detail[:160]}")
 
 
 def _deploy_dependencies(required_files: list[tuple[str, list[str]]]) -> None:
@@ -4646,12 +4581,90 @@ def _deploy_dependencies(required_files: list[tuple[str, list[str]]]) -> None:
             f"with {workers} parallel workers"
         )
         remote_archive = _validated_dependency_remote_archive(bundle)
+        trainer_targets = [
+            host for host in hosts_for_bundle if host in trainer_hosts
+        ]
+        relay_base = remote_archive.removesuffix(".tar.gz")
+        relay_archive = relay_base + "-relay.tar.gz"
+        edge_relay_archive = relay_base + "-edge-relay.tar.gz"
+        if any(
+            _dependency_remote_archive_pattern.fullmatch(path) is None
+            for path in (relay_archive, edge_relay_archive)
+        ):
+            raise Refused("invalid trainer dependency relay path")
+
+        if trainer_targets:
+            _, scp_options, destination = _ssh_destination(orchestrator_host)
+            upload_command = scp_command + scp_options + [
+                str(bundle),
+                f"{destination}:{edge_relay_archive}",
+            ]
+
+            def upload_to_edge() -> tuple[int, str]:
+                result = _run_process(
+                    upload_command,
+                    stdin=subprocess.DEVNULL,
+                    timeout=deployment_bundle_scp_timeout_seconds,
+                )
+                return result.returncode, result.stderr or result.stdout
+
+            _retry_dependency_copy(
+                f"upload to {orchestrator_host}",
+                upload_to_edge,
+                lambda: _ssh(
+                    orchestrator_host,
+                    f"rm -f -- {shlex.quote(edge_relay_archive)}",
+                    timeout=deployment_mkdir_timeout_seconds,
+                ),
+            )
+
+            def relay_to_trainer() -> tuple[int, str]:
+                return _ssh(
+                    orchestrator_host,
+                    "scp -q -o BatchMode=yes -o ConnectTimeout=25 "
+                    "-o StrictHostKeyChecking=accept-new -- "
+                    f"{shlex.quote(edge_relay_archive)} "
+                    f"{shlex.quote('china-trainer:' + relay_archive)}",
+                    timeout=deployment_bundle_scp_timeout_seconds,
+                )
+
+            _retry_dependency_copy(
+                f"relay to {trainer_head}",
+                relay_to_trainer,
+                lambda: _ssh(
+                    trainer_head,
+                    f"rm -f -- {shlex.quote(relay_archive)}",
+                    timeout=deployment_mkdir_timeout_seconds,
+                ),
+            )
+            relay_code, relay_output = _ssh(
+                trainer_head,
+                f"test $(stat -c %s -- {shlex.quote(relay_archive)}) -eq {bundle.stat().st_size}",
+                timeout=deployment_mkdir_timeout_seconds,
+            )
+            if relay_code:
+                raise RuntimeError(
+                    "trainer dependency relay size check failed: "
+                    + relay_output.strip()[:160]
+                )
+            print(
+                f"trainer dependency bundle: relayed through {orchestrator_host} "
+                f"and staged once on {trainer_head} "
+                f"for {len(trainer_targets)} trainer hosts"
+            )
 
         def one(host: str) -> str:
             selected = [
                 path for path, selected_hosts in destinations.items() if host in selected_hosts
             ]
-            expected = [(path, manifest_entries[path]) for path in selected]
+            expected = [
+                (
+                    path,
+                    manifest_entries[path],
+                    "0755" if (repo_root / path).stat().st_mode & 0o111 else "0644",
+                )
+                for path in selected
+            ]
             try:
                 code, output = _ssh(
                     host,
@@ -4678,27 +4691,57 @@ def _deploy_dependencies(required_files: list[tuple[str, list[str]]]) -> None:
                 stderr = ""
                 ssh_options, scp_options, destination = _ssh_destination(host)
                 try:
-                    if attempt == 1:
-                        upload_command = scp_command + scp_options + [
-                            str(bundle),
-                            f"{destination}:{remote_archive}",
-                        ]
-                        upload_stdin = subprocess.DEVNULL
-                    else:
-                        upload_command = ssh_command + ssh_options + [
-                            destination,
-                            f"umask 077; cat > {shlex.quote(remote_archive)}",
-                        ]
-                        upload_stdin = bundle.open("rb")
-                    try:
-                        uploaded = _run_process(
-                            upload_command,
-                            stdin=upload_stdin,
+                    if host in trainer_hosts:
+                        if host == trainer_head:
+                            relay_command = (
+                                f"cp -- {shlex.quote(relay_archive)} "
+                                f"{shlex.quote(remote_archive)}"
+                            )
+                        else:
+                            peer = hosts["trainer_lan"].get(host)
+                            if not isinstance(peer, str) or not peer:
+                                raise RuntimeError(
+                                    f"trainer LAN address is missing for {host}"
+                                )
+                            relay_command = (
+                                "scp -q -o BatchMode=yes -o ConnectTimeout=10 "
+                                "-o StrictHostKeyChecking=accept-new -- "
+                                f"{shlex.quote(relay_archive)} "
+                                f"{shlex.quote(peer + ':' + remote_archive)}"
+                            )
+                        relay_code, relay_output = _ssh(
+                            trainer_head,
+                            relay_command,
                             timeout=deployment_bundle_scp_timeout_seconds,
                         )
-                    finally:
-                        if upload_stdin is not subprocess.DEVNULL:
-                            upload_stdin.close()
+                        uploaded = subprocess.CompletedProcess(
+                            args=relay_command,
+                            returncode=relay_code,
+                            stdout="",
+                            stderr=relay_output,
+                        )
+                    else:
+                        if attempt == 1:
+                            upload_command = scp_command + scp_options + [
+                                str(bundle),
+                                f"{destination}:{remote_archive}",
+                            ]
+                            upload_stdin = subprocess.DEVNULL
+                        else:
+                            upload_command = ssh_command + ssh_options + [
+                                destination,
+                                f"umask 077; cat > {shlex.quote(remote_archive)}",
+                            ]
+                            upload_stdin = bundle.open("rb")
+                        try:
+                            uploaded = _run_process(
+                                upload_command,
+                                stdin=upload_stdin,
+                                timeout=deployment_bundle_scp_timeout_seconds,
+                            )
+                        finally:
+                            if upload_stdin is not subprocess.DEVNULL:
+                                upload_stdin.close()
                 except subprocess.TimeoutExpired as error:
                     stderr = error.stderr or ""
                     if isinstance(stderr, bytes):
@@ -4756,20 +4799,33 @@ def _deploy_dependencies(required_files: list[tuple[str, list[str]]]) -> None:
 
         failures = []
         completed = 0
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {executor.submit(one, host): host for host in hosts_for_bundle}
-            for future in as_completed(futures):
-                host = futures[future]
-                try:
-                    result = future.result()
-                except Exception as error:
-                    result = f"failed: {error}"
-                completed += 1
-                if result not in {"ok", "skipped"}:
-                    failures.append(f"{host}: {result}")
-                print(
-                    f"trainer dependency bundle: {host} "
-                    f"[{result}] ({completed}/{len(hosts_for_bundle)})"
+        try:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {executor.submit(one, host): host for host in hosts_for_bundle}
+                for future in as_completed(futures):
+                    host = futures[future]
+                    try:
+                        result = future.result()
+                    except Exception as error:
+                        result = f"failed: {error}"
+                    completed += 1
+                    if result not in {"ok", "skipped"}:
+                        failures.append(f"{host}: {result}")
+                    print(
+                        f"trainer dependency bundle: {host} "
+                        f"[{result}] ({completed}/{len(hosts_for_bundle)})"
+                    )
+        finally:
+            if trainer_targets:
+                _ssh(
+                    trainer_head,
+                    f"rm -f -- {shlex.quote(relay_archive)}",
+                    timeout=deployment_mkdir_timeout_seconds,
+                )
+                _ssh(
+                    orchestrator_host,
+                    f"rm -f -- {shlex.quote(edge_relay_archive)}",
+                    timeout=deployment_mkdir_timeout_seconds,
                 )
         if failures:
             raise RuntimeError("failed to deploy dependency bundle: " + "; ".join(failures))
@@ -5234,8 +5290,9 @@ def start(
         f"adapter_container_name={shlex.quote(adapter_container)}"
     )
     predictive_adapter_env = ""
+    local_edge_config = repo_root / selected["orchestrator"]
     try:
-        with open(edge_config, "rb") as stream:
+        with local_edge_config.open("rb") as stream:
             edge_settings = tomllib.load(stream)
     except (OSError, tomllib.TOMLDecodeError) as error:
         raise Refused(f"cannot read GLM orchestrator config {edge_config}: {error}") from error
@@ -5348,6 +5405,26 @@ def start(
         if rc:
             raise RuntimeError(f"edge orchestrator start failed on {orchestrator_host}: {out}")
 
+    def wait_for_orchestrator_control() -> None:
+        control_file = f"{service_run_dir}/control/orch.toml"
+        script = f"""set -eu
+for _ in $(seq 1 60); do
+  if [ -s {shlex.quote(control_file)} ]; then
+    echo ready
+    exit 0
+  fi
+  sleep 1
+done
+echo "orchestrator control file did not arrive" >&2
+exit 1
+"""
+        code, output = _ssh(trainer_head, script, timeout=70)
+        if code:
+            detail = output.strip() or "no output"
+            raise RuntimeError(
+                f"orchestrator control file did not reach {trainer_head}: {detail}"
+            )
+
     restart_marker = f"{service_run_dir}/.trainer-restart-started"
 
     def mark_restart_start() -> None:
@@ -5424,6 +5501,7 @@ exit 1
     launch_adapter()
     if mode == "cold":
         launch_orch()
+        wait_for_orchestrator_control()
         launch_trainer()
     else:
         mark_restart_start()
@@ -5624,7 +5702,6 @@ actions = {
     "status": lambda a: status(*a),
     "acceptance": lambda a: acceptance(*a),
     "reward": lambda a: reward(a[0] if a else "", host=a[1] if len(a) > 1 else ""),
-    "tunnels": lambda a: tunnels(),
     "engines": lambda a: engines(*a),
     "logs": lambda a: logs(a[0] if a else "trainer", int(a[1]) if len(a) > 1 else 200),
     "parity": lambda a: parity(*a),
@@ -5656,14 +5733,13 @@ usage = f"""training-ops <action> [args]
   acceptance [run]              check training requirements
   reward [run] [host]           show reward and its measured trend
   steps [run] [count]           show recent trainer times
-  tunnels                       check {len(inference_tunnel_ports)} inference tunnels
   engines                       test every configured inference endpoint
   logs [role] [lines]           read one service log
   parity [run]                  read the trainer parity record
   remote <group> <command>      run on trainer, inference, or all hosts
   versions [package ...]        show installed package versions
   watch [hours] [seconds]       monitor in the foreground
-  repair <name>                 repair tunnels, an engine, adapter server, orchestrator, supervisors, or microbatch sync
+  repair <name>                 repair an engine, adapter server, orchestrator, supervisors, or microbatch sync
   deploy <path>                 copy one repository file
   start <run> [mode] [profile]  start one configured profile
   archive <run> [step ...]      upload stable old LoRA adapters

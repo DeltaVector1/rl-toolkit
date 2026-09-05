@@ -9,6 +9,8 @@ from decensor_v1.agentic_review import (
     TranscriptReview,
     aggregate_review,
     build_turn_review_sources,
+    review_attempts_per_phase,
+    review_phase_count,
     run_agentic_review,
 )
 from decensor_v1.data import build_rows
@@ -31,7 +33,7 @@ from decensor_v1.text import (
     extract_all_assistant_texts,
     word_band,
 )
-from decensor_v1.user import DecensorUser, DecensorUserConfig
+from decensor_v1.user import DecensorUserConfig
 
 
 _review_slots = asyncio.Semaphore(2)
@@ -67,6 +69,7 @@ class DecensorTaskConfig(vf.TaskConfig):
 class DecensorTasksetConfig(vf.TasksetConfig):
     num_examples: int = 2000
     dataset_seed: int = 42
+    difficulty: str = "easy"
     turn_decay_ratio: float = 0.5
     max_turns: int = 6
     style_probability: float = 0.25
@@ -92,14 +95,6 @@ def _scoring_config(config: DecensorTaskConfig) -> ScoringConfig:
 
 
 class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
-    if hasattr(vf, "User"):
-        user = DecensorUser
-
-        def user_server(self):
-            user = super().user_server()
-            user._task_data = self.data
-            return user
-
     async def setup(self, trace: vf.Trace, runtime: vf.Runtime) -> None:
         trace.state.target_turns = self.data.target_turns
 
@@ -115,7 +110,14 @@ class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
             "role": message.role,
             "content": message.content or "",
         }
-        for key in ("reasoning", "reasoning_content", "thinking"):
+        for key in (
+            "reasoning",
+            "reasoning_content",
+            "thinking",
+            "thinking_content",
+            "thinking_blocks",
+            "reasoning_details",
+        ):
             value = getattr(message, key, None)
             if value:
                 message_dict[key] = value
@@ -233,6 +235,15 @@ class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
                 return await request_judge_score(
                     name,
                     lambda: run_agentic_review(task_config.judge, source),
+                    attempt_count=1,
+                    total_timeout_seconds=(
+                        review_phase_count
+                        * review_attempts_per_phase
+                        * float(
+                            getattr(task_config.judge, "timeout_seconds", 180.0)
+                        )
+                        + 10.0
+                    ),
                 )
 
         review_outcomes = await asyncio.gather(
@@ -266,14 +277,29 @@ class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
                 for name, outcome in zip(review_names, review_outcomes, strict=True)
                 if outcome.status != "scored" or outcome.score is None
             ]
+            failure_status = (
+                "unscored_service_failure"
+                if any(
+                    outcome.status == "unscored_service_failure"
+                    for outcome in review_outcomes
+                )
+                else "invalid_model_response"
+            )
             trace.info["decensor"] = {
-                "evaluation_status": "unscored_service_failure",
+                "evaluation_status": failure_status,
                 "failed_judges": failed_reviews,
                 "failed_judge_attempts": failed_judge_details,
             }
-            trace.record_metric("decensor_judge_service_failure", 1.0)
+            trace.record_metric(
+                "decensor_judge_service_failure",
+                float(failure_status == "unscored_service_failure"),
+            )
+            trace.record_metric(
+                "decensor_invalid_judge_response",
+                float(failure_status == "invalid_model_response"),
+            )
             raise RuntimeError(
-                "one or more per-turn reviews failed after three attempts: "
+                "one or more per-turn reviews failed after their review attempts: "
                 f"{format_judge_failure_summary(failed_judge_details)}; "
                 "rollout is unscored"
             )
@@ -302,7 +328,9 @@ class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
         trace.info["judge_review_aggregation"] = {
             "refusal": "maximum across turns",
             "visible_answer_is_clear": "fail if any turn fails",
-            "reasoning_has_safety_or_policy_discussion": "present if any turn is present",
+            "reasoning_has_safety_or_policy_discussion": (
+                "present if any turn is present"
+            ),
             "reasoning_trace_is_clear": "fail if any turn fails",
             "meta_commentary": "present if any turn is present",
             "markdown_is_correct": "fail if any applicable turn fails",
@@ -406,6 +434,7 @@ class DecensorTaskset(vf.Taskset[DecensorTask, DecensorTasksetConfig]):
             markdown_probability=config.markdown_probability,
             enable_length_prompts=config.enable_length_prompts,
             output_prompt=config.reasoning_output_prompt,
+            difficulty=config.difficulty,
         )
         tasks: list[DecensorTask] = []
         for index, row in enumerate(rows):

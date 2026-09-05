@@ -603,6 +603,11 @@ def load_initial_lora_adapter(model: nn.Module, adapter_path: str, adapter_idx: 
     )
 
 
+def has_lora_layers(model: nn.Module) -> bool:
+    """Return whether the model contains a LoRA layer."""
+    return any(isinstance(module, MultiLoRAModule) for module in model.modules())
+
+
 def clean_lora_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     """Remove LoRA parameters and fix LoRA base layer key names for HF compatibility."""
     clean_state_dict = {}

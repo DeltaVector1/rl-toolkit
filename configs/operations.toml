@@ -19,59 +19,18 @@ n84 = "10.92.20.84"
 n85 = "10.92.20.85"
 
 [ports]
-inference_tunnel_first = 18001
-inference_tunnel_last = 18048
 inference_peer = 18049
 lora_source_first = 18100
 lora_source_last = 18195
 adapter_relay = 18196
 refusal_classifier = 18250
-judge = 26406
 adapter = 8100
-batch = 29620
 
 [paths]
 storage_root = "/data/glm52-rl"
 remote_repository = "/data/glm52-rl/deployment"
 runs = "/data/glm52-rl/runs"
 adapter_cache = "/data/glm52-rl/lora-cache"
-
-[judge_seed_prompts]
-dataset = "NewEden/RL-seed-Decensor"
-revision = "de87870ad0228f9253d5a5e8ac4cb968901a064e"
-expected_prompts = 30000
-samples_per_prompt = 4
-work_root = "/data/glm52-rl/judge-seed-prompts"
-model = "/data/ZiphuAI/GLM-5.2-FP8"
-
-[judge_seed_prompts.rtx4090]
-hosts = ["n76", "n77", "n78", "n80", "n83", "n84", "n85"]
-head = "n76"
-policy_urls = ["http://10.92.20.76:29200/v1", "http://10.92.20.83:29201/v1"]
-policy_models = ["glm52-base-a", "glm52-base-b"]
-policy_engine = "sglang"
-judge = "rtx4090"
-
-[judge_seed_prompts.h200a]
-host = "h200a"
-policy_url = "http://127.0.0.1:8000/v1"
-policy_model = "/models/glm52-fp8"
-policy_engine = "openai"
-judge = "external"
-
-[judge_seed_prompts.h200b]
-host = "h200b"
-policy_url = "http://127.0.0.1:8000/v1"
-policy_model = "/models/glm52-fp8"
-policy_engine = "openai"
-judge = "external"
-
-[judges.rtx4090]
-host = "n82"
-api_url = "http://10.92.20.82:29209/v1"
-model = "gemma-judge"
-model_path = "/data/glm52-rl/judge-seed-prompts/models/gemma-fp8"
-data_parallel_size = 8
 
 [judges.external]
 host = "202.214.223.66"

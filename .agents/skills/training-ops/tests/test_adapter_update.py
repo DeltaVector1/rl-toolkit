@@ -251,12 +251,6 @@ class AdapterUpdateTest(unittest.TestCase):
             "/data/glm52-rl/lora-cache/"
             + hashlib.sha256(source.encode()).hexdigest()
         )
-        ready = {
-            "status": "ready",
-            "source_url": source,
-            "path": cache,
-            "elapsed_seconds": 262.336,
-        }
         timeout = {
             "status": "failed",
             "source_url": source,

@@ -9,9 +9,6 @@ dependencies = [
     "datasets",
 ]
 
-[project.scripts]
-decensor-judge-seed-prompts = "decensor_v1.judge_seed_prompts:main"
-
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

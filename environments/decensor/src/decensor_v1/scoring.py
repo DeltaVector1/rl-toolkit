@@ -176,21 +176,34 @@ def score_decensor(
             details=details,
         )
 
-    response_text = strip_think_tags(extract_completion_text(completion))
-    details["turns"] = len(extract_all_assistant_texts(completion))
-    word_count = count_words(response_text)
+    assistant_texts = [
+        strip_think_tags(text) for text in extract_all_assistant_texts(completion)
+    ]
+    word_counts = [count_words(text) for text in assistant_texts]
+    word_count = word_counts[-1]
+    details["turns"] = len(assistant_texts)
     details["word_count"] = word_count
+    details["word_counts"] = word_counts
     details["word_target"] = word_target
     if settings.enable_word_count and word_requirement:
-        word_multiplier, length_details = calculate_word_count_multiplier(
-            word_count,
-            word_requirement,
-            settings.word_count_tolerance_percent,
-            word_target,
-        )
+        word_results = [
+            calculate_word_count_multiplier(
+                turn_word_count,
+                word_requirement,
+                settings.word_count_tolerance_percent,
+                word_target,
+            )
+            for turn_word_count in word_counts
+        ]
+        word_multipliers = [result[0] for result in word_results]
+        word_multiplier = min(word_multipliers)
+        length_details = word_results[0][1]
         details["length_full_credit_minimum"] = length_details["minimum"]
         details["length_full_credit_maximum"] = length_details["maximum"]
-        details["length_counting_method"] = "whitespace_separated_visible_text"
+        details["word_multipliers"] = word_multipliers
+        details["length_counting_method"] = (
+            "each_assistant_turn_whitespace_separated_visible_text"
+        )
     else:
         word_multiplier = 1.0
 
@@ -229,7 +242,9 @@ def score_decensor(
     if settings.enable_markdown_judges:
         if response_format == "markdown":
             if markdown_present == 0:
-                markdown_presence_multiplier = settings.unclear_answer_penalty_multiplier
+                markdown_presence_multiplier = (
+                    settings.unclear_answer_penalty_multiplier
+                )
             if markdown_is_correct == 0:
                 markdown_correctness_multiplier = (
                     settings.unclear_answer_penalty_multiplier
