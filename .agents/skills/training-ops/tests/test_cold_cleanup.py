@@ -13,6 +13,37 @@ import training_ops
 
 
 class ColdCleanupTest(unittest.TestCase):
+    def test_adapter_cache_cleanup_is_bounded_and_lock_aware(self):
+        script = training_ops._adapter_cache_cleanup_script()
+        self.assertIn("cache=/data/glm52-rl/lora-cache", script)
+        self.assertIn('flock -n "$lock"', script)
+        self.assertIn("find '$path' -xdev -depth -delete", script)
+        self.assertIn("unknown adapter cache entry", script)
+        self.assertNotIn("rm -rf", script)
+
+    def test_adapter_cache_cleanup_requires_idle_hosts(self):
+        idle = {
+            "h200a": (0, "port=8000 running=0"),
+            "h200b": (0, "port=8000 running=0"),
+        }
+        cleared = {
+            "h200a": (0, "removed=2 free_gib=100"),
+            "h200b": (0, "removed=1 free_gib=500"),
+        }
+        with mock.patch.object(
+            training_ops, "_fan", side_effect=[idle, cleared]
+        ), mock.patch("builtins.print") as output:
+            training_ops._cold_adapter_cache_cleanup()
+        self.assertEqual(output.call_count, 2)
+
+        with mock.patch.object(
+            training_ops,
+            "_fan",
+            return_value={"h200a": (34, "active requests"), "h200b": (0, "idle")},
+        ):
+            with self.assertRaisesRegex(training_ops.Refused, "requires idle"):
+                training_ops._cold_adapter_cache_cleanup()
+
     def test_cleanup_is_limited_to_one_run_and_reports_paths(self):
         with tempfile.TemporaryDirectory() as temporary:
             old_root = training_ops.run_root

@@ -5232,6 +5232,68 @@ def _cold_start_cleanup(run: str, nodes: list[str]) -> None:
     )
 
 
+def _adapter_cache_cleanup_script() -> str:
+    """Remove unused adapter data before a cold run."""
+    cache = paths["adapter_cache"].rstrip("/")
+    if not cache.startswith("/") or cache in {"", "/"}:
+        raise Refused("adapter cache path is unsafe")
+    return f"""set -euo pipefail
+cache={shlex.quote(cache)}
+[ -d "$cache" ] || {{ echo "adapter cache does not exist: $cache" >&2; exit 31; }}
+[ ! -L "$cache" ] || {{ echo "adapter cache is a symbolic link" >&2; exit 32; }}
+removed=0
+for path in "$cache"/*; do
+  [ -e "$path" ] || continue
+  name=${{path##*/}}
+  case "$name" in
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*|\
+    *.partial|*.parts|*.assembling|*.retired-*) ;;
+    *) echo "unknown adapter cache entry: $path" >&2; exit 33 ;;
+  esac
+  base=${{name%%.*}}
+  base=${{base%%.retired-*}}
+  case "$base" in
+    *[!0-9a-f]*|'') echo "invalid adapter cache entry: $path" >&2; exit 34 ;;
+  esac
+  [ "${{#base}}" -eq 64 ] || {{ echo "invalid adapter cache entry: $path" >&2; exit 34; }}
+  lock="$cache/.$base.readers.lock"
+  if ! sudo flock -n "$lock" -c "sudo find '$path' -xdev -depth -delete"; then
+    echo "adapter cache entry is in use: $path" >&2
+    exit 35
+  fi
+  removed=$((removed + 1))
+done
+sudo find "$cache" -maxdepth 1 -type f \
+  \\( -name '.adapter-stage-status.json' -o -name 'adapter-staging.lock' \\) -delete
+free=$(df -BG --output=avail "$cache" | tail -1 | tr -dc '0-9')
+echo "removed=$removed free_gib=$free"
+"""
+
+
+def _cold_adapter_cache_cleanup() -> None:
+    """Require idle inference, then clear old adapter data on every inference host."""
+    idle = _fan(
+        inference_hosts,
+        lambda host: _ssh(
+            host,
+            _adapter_idle_script(_inference_config(host)["ports"]),
+            timeout=90,
+        ),
+    )
+    busy = {host: output.strip() for host, (code, output) in idle.items() if code}
+    if busy:
+        raise Refused(f"cold adapter cleanup requires idle inference: {busy}")
+    results = _fan(
+        inference_hosts,
+        lambda host: _ssh(host, _adapter_cache_cleanup_script(), timeout=600),
+    )
+    failures = {host: output.strip() for host, (code, output) in results.items() if code}
+    if failures:
+        raise RuntimeError(f"cold adapter cleanup failed: {failures}")
+    for host, (_code, output) in results.items():
+        print(f"cold adapter cleanup on {host}: {output.strip()}")
+
+
 def start(
     run: str,
     mode: str = "cold",
@@ -5498,6 +5560,7 @@ exit 1
 
     if mode == "cold":
         _cold_start_cleanup(run, nodes)
+        _cold_adapter_cache_cleanup()
     launch_adapter()
     if mode == "cold":
         launch_orch()
