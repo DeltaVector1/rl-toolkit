@@ -2018,39 +2018,6 @@ def _sha256(
     return digest.hexdigest()
 
 
-def _sha256_region(
-    path: Path,
-    offset: int,
-    size: int,
-    deadline: float | None = None,
-    cancel_event: threading.Event | None = None,
-    *,
-    parent_fd: int | None = None,
-) -> str:
-    digest = hashlib.sha256()
-    file_descriptor = _open_nofollow(
-        path.name if parent_fd is not None else path,
-        os.O_RDONLY,
-        dir_fd=parent_fd,
-        label="adapter checksum file",
-    )
-    try:
-        remaining = size
-        position = offset
-        while remaining:
-            _check_deadline(deadline, cancel_event)
-            chunk = os.pread(file_descriptor, min(16 * 1024 * 1024, remaining), position)
-            if not chunk:
-                raise OSError("adapter output ended before completed chunk")
-            digest.update(chunk)
-            position += len(chunk)
-            remaining -= len(chunk)
-    finally:
-        os.close(file_descriptor)
-    _check_deadline(deadline, cancel_event)
-    return digest.hexdigest()
-
-
 def _decode_transport_chunk(payload: bytes, *, codec: str, raw_size: int) -> bytes:
     """Use the shared bounded decoder for one transport chunk."""
     try:
@@ -2479,28 +2446,13 @@ def _stage_chunked_linear_adapter(
         _reject_symlink_path(chunk_path, "adapter transport chunk")
         _reject_symlink_path(completed_path, "adapter completed proof")
         _reject_symlink_path(wire_ready_path, "adapter wire proof")
-        completed_valid, completed_proof = _proof_identity_matches(
+        completed_valid, _ = _proof_identity_matches(
             completed_path, item, completed=True
         )
-        if completed_valid and completed_proof is not None:
-            resume_hash_started = time.monotonic()
-            try:
-                if (
-                    _path_regular_size(output_path, "adapter output") == target_size
-                    and _sha256_region(output_path, offset, raw_size, deadline, cancel_event)
-                    == completed_proof["output_sha256"]
-                ):
-                    # A completed proof supersedes any wire-ready proof left
-                    # by an interrupted cleanup after the proof was published.
-                    _discard_proof(wire_ready_path)
-                    return
-            except TimeoutError:
-                raise
-            except (FileNotFoundError, OSError):
-                pass
-            finally:
-                with reconstruct_lock:
-                    reconstruct_seconds += time.monotonic() - resume_hash_started
+        if completed_valid:
+            # The final file checksum validates all resumed regions together.
+            _discard_proof(wire_ready_path)
+            return
         if _path_stat(completed_path, "adapter completed proof") is not None:
             _discard_proof(completed_path)
 
@@ -2916,25 +2868,8 @@ def _stage_chunked_xor_adapter(
             except (OSError, ValueError):
                 proof_matches = False
             if proof_matches:
-                _check_deadline(deadline, cancel_event)
-                try:
-                    output_matches = (
-                        _path_regular_size(output_path, "adapter output") == target_size
-                        and _sha256_region(
-                            output_path,
-                            offset,
-                            raw_size,
-                            deadline,
-                            cancel_event,
-                        )
-                        == proof["output_sha256"]
-                    )
-                except TimeoutError:
-                    raise
-                except (FileNotFoundError, OSError):
-                    output_matches = False
-                if output_matches:
-                    return
+                # The final file checksum validates all resumed regions together.
+                return
             _unlink_path(completed_path, "adapter completed proof")
 
         chunk_lane = index % len(lane_urls)
