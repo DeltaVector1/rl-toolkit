@@ -20,23 +20,12 @@ remote() {
   fi
 }
 
-# One WAN TCP stream collapses under the measured loss. Shorter x64p batches
-# can be 55-60 MiB and took more than four minutes on one rsync stream, so
-# stripe every material production batch rather than only files above 64 MiB.
+# Use parallel streams for material batches on the WAN path.
 parallel_threshold=${PARALLEL_THRESHOLD:-16777216}
 parallel_streams=${PARALLEL_STREAMS:-16}
-# A stripe that makes no I/O progress for one minute is dead on this path.
-# Retry its partial file promptly instead of holding the trainer for the old
-# two-minute rsync timeout. Active slow transfers are not timed out.
 stripe_io_timeout=${STRIPE_IO_TIMEOUT:-60}
-# rsync's I/O timeout did not terminate a wedged SSH child on x72p step 16.
-# Bound each small stripe attempt by wall time as well. A timeout keeps the
-# remote partial file, and the next attempt resumes it with --append-verify.
 stripe_attempt_timeout=${STRIPE_ATTEMPT_TIMEOUT:-90}
-# Starting all 16 SSH handshakes in one instant produced repeatable
-# kex/reset failures on the jump path. Keep the independent TCP streams, but
-# spread their handshakes across four seconds so a failed first wave does not
-# force a complete retry pass.
+# Spread SSH handshakes across four seconds.
 parallel_launch_delay=${PARALLEL_LAUNCH_DELAY:-0.25}
 copy_parallel() {
   local source=$1 destination=$2
@@ -57,8 +46,6 @@ copy_parallel() {
   fi
   expected_sizes=$(find "$parts_dir" -maxdepth 1 -type f -name 'part-*' -printf '%f %s\n' | sort)
 
-  # A single SSH key-exchange reset occurred in x58g. Retry only absent or
-  # short stripes, then require the complete size manifest before assembly.
   status=1
   for attempt in 1 2 3; do
     if ! remote "find '$remote_parts' -maxdepth 1 -type f -name 'part-*' -printf '%f %s\\n'" \
