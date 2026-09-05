@@ -593,7 +593,7 @@ class Orchestrator:
                 await stage_lora_adapter(
                     self.policy_inference.admin_clients,
                     weights_path,
-                    require_delta=False,
+                    require_delta=require_delta,
                     origin_base_urls=self.policy_inference.adapter_origin_base_urls,
                 )
                 prefetched = True

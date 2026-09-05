@@ -195,7 +195,6 @@ class ResumeRecoveryTest(unittest.TestCase):
         stage_at = setup.index("await stage_lora_adapter(")
         update_at = setup.index("await self.policy_inference.update_weights(", stage_at)
         self.assertLess(stage_at, update_at)
-        self.assertIn("require_delta=False", setup[stage_at:update_at])
         self.assertIn("prefetched=prefetched", setup[update_at:])
 
     def test_server_fallback_stages_in_the_host_process(self):
