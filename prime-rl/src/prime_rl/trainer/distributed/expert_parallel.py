@@ -142,6 +142,7 @@ def _ep_profile_tick() -> None:
             f"a2a={a2a:.1f}s ({100 * a2a / max(wall, 1e-9):.0f}% of wall) | {parts}",
             flush=True,
         )
+    _ep_t0 = time.perf_counter()
 
 
 def _empty_with_cache_retry(*size, **kwargs):
@@ -151,7 +152,6 @@ def _empty_with_cache_retry(*size, **kwargs):
     except torch.OutOfMemoryError:
         torch.cuda.empty_cache()
         return torch.empty(*size, **kwargs)
-    _ep_t0 = time.perf_counter()
 
 
 def _round_splits(
