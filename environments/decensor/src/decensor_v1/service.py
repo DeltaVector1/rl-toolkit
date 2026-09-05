@@ -393,7 +393,22 @@ async def request_judge_score(
         async with asyncio.timeout(total_timeout_seconds):
             for attempt_number in range(1, attempt_count + 1):
                 attempt_started_at = time.monotonic()
-                response = await request()
+                try:
+                    response = await request()
+                except Exception as error:
+                    attempts.append(
+                        {
+                            "name": name,
+                            "attempt": attempt_number,
+                            "status": "request_failed",
+                            "error_type": type(error).__name__,
+                            "error": safe_service_error(error),
+                            "elapsed_seconds": time.monotonic() - attempt_started_at,
+                        }
+                    )
+                    if attempt_number < attempt_count:
+                        await asyncio.sleep(0.5 * attempt_number)
+                    continue
                 failure_status = getattr(response, "failure_status", None)
                 attempt_record = {
                     "name": name,
