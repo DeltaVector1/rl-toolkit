@@ -1783,10 +1783,10 @@ index 28e2f57..30ad6d9 100644
      namespace = config.to_vllm()
      if vllm_extra:
 diff --git a/src/prime_rl/inference/vllm/worker/filesystem.py b/src/prime_rl/inference/vllm/worker/filesystem.py
-index 1049d17..ff55ce5 100644
+index 1049d17..0cc8068 100644
 --- a/src/prime_rl/inference/vllm/worker/filesystem.py
 +++ b/src/prime_rl/inference/vllm/worker/filesystem.py
-@@ -1,9 +1,4241 @@
+@@ -1,9 +1,4230 @@
 +import fcntl
 +import hashlib
 +import json
@@ -5425,25 +5425,15 @@ index 1049d17..ff55ce5 100644
 +                        return destination
 +                _check_deadline(delta_deadline, cancel_event)
 +                if transport.get("transport") == _ADAPTER_LINEAR_TRANSPORT:
-+                    try:
-+                        return _stage_chunked_linear_adapter(
-+                            source_url,
-+                            transport,
-+                            manifest,
-+                            deadline=delta_deadline,
-+                            cancel_event=cancel_event,
-+                            committed_event=committed_event,
-+                        )
-+                    except FileNotFoundError:
-+                        if require_delta:
-+                            raise
-+                        transport = {
-+                            "mode": "full",
-+                            "source_manifest": transport["source_manifest"],
-+                        }
-+                if transport.get("mode") == "full":
-+                    pass
-+                elif transport.get("transport") == _ADAPTER_DELTA_TRANSPORT:
++                    return _stage_chunked_linear_adapter(
++                        source_url,
++                        transport,
++                        manifest,
++                        deadline=delta_deadline,
++                        cancel_event=cancel_event,
++                        committed_event=committed_event,
++                    )
++                if transport.get("transport") == _ADAPTER_DELTA_TRANSPORT:
 +                    return _stage_chunked_xor_adapter(
 +                        source_url,
 +                        transport,
@@ -5452,8 +5442,7 @@ index 1049d17..ff55ce5 100644
 +                        cancel_event=cancel_event,
 +                        committed_event=committed_event,
 +                    )
-+                else:
-+                    raise OSError("adapter delta transport is unsupported")
++                raise OSError("adapter delta transport is unsupported")
 +            _reject_symlink_path(destination / "READY", "adapter ready marker")
 +            if _path_regular_size(destination / "READY", "adapter ready marker") is not None:
 +                try:
@@ -6029,7 +6018,7 @@ index 1049d17..ff55ce5 100644
  
  # This is to get type hints for the Worker class but not actually extend it at runtime as this is required by vLLM worker extension
  if TYPE_CHECKING:
-@@ -25,8 +4257,16 @@ class FileSystemWeightUpdateWorker(Worker):
+@@ -25,8 +4246,16 @@ class FileSystemWeightUpdateWorker(Worker):
          """No-op RPC used by the API server liveness endpoint."""
          return None
  
@@ -6046,7 +6035,7 @@ index 1049d17..ff55ce5 100644
          # Get vLLM model runner and model
          # When enforce_eager=True, model isn't wrapped by torch.compile so no .runnable attr
          model_runner = self.model_runner
-@@ -47,6 +4287,8 @@ class FileSystemWeightUpdateWorker(Worker):
+@@ -47,6 +4276,8 @@ class FileSystemWeightUpdateWorker(Worker):
              allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
          )
          weights_iterator = model_loader._get_weights_iterator(local_source)
@@ -6638,7 +6627,7 @@ index 998ff6f..24782e6 100644
              await safe_cancel_all(train_tasks)
          return cancelled
 diff --git a/src/prime_rl/orchestrator/orchestrator.py b/src/prime_rl/orchestrator/orchestrator.py
-index 400d078..e96f10a 100644
+index 400d078..66d659e 100644
 --- a/src/prime_rl/orchestrator/orchestrator.py
 +++ b/src/prime_rl/orchestrator/orchestrator.py
 @@ -22,9 +22,11 @@ in ``setup()`` and drives them from ``main_loop()``.
@@ -7002,7 +6991,7 @@ index 400d078..e96f10a 100644
 +                await stage_lora_adapter(
 +                    self.policy_inference.admin_clients,
 +                    weights_path,
-+                    require_delta=False,
++                    require_delta=require_delta,
 +                    origin_base_urls=self.policy_inference.adapter_origin_base_urls,
 +                )
 +                prefetched = True
