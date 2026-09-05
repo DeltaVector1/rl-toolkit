@@ -282,11 +282,7 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
             return None, 0, 1
 
         # Under pipeline parallelism apply_pp_boundaries replaces this
-        # ModuleList with nn.ModuleDict keyed by GLOBAL layer index as a STRING
-        # (pipeline_parallel.py:139), so `self.layers[0]` raises KeyError: 0 --
-        # both because the key is a str and because a non-first stage does not
-        # own layer 0 at all. Every layer on a stage carries the same cp
-        # attributes, so take whichever comes first.
+        # Pipeline stages store layers by their global index.
         if isinstance(self.layers, nn.ModuleDict):
             layer = next(iter(self.layers.values()))
         else:
@@ -326,6 +322,10 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
             Per-document lengths of the packed row (PrimeRL packed-batch contract). Unused.
         seq_lens_are_pre_shard (`bool`, *optional*, defaults to `False`):
             Whether `seq_lens` holds pre-CP-shard (global) document boundaries. Unused.
+        pipeline_layer_indices (`tuple[int, ...]`, *optional*):
+            Global indices of the layers owned by this pipeline stage.
+        pipeline_apply_norm (`bool`, *optional*, defaults to `True`):
+            Whether to apply the final model normalization.
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -346,10 +346,7 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
         )
         ke_full = torch.arange(1, S_full + 1, dtype=torch.int32, device=flat_position_ids.device)
 
-        # Position embeddings are computed over the full sequence: K uses cos/sin[0:S_full]
-        # while Q uses the local CP slice. ks/ke are computed in K's global coordinate
-        # system and then sharded to the local Q range so the indexer's per-token
-        # causal/varlen mask aligns with the gathered K.
+        # K uses the full sequence. Q uses the local context-parallel slice.
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids_full)
 
@@ -362,12 +359,7 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
 
         cached_indices = sparse_indices_cache
         use_index_cache = getattr(self.config, "use_index_cache", False)
-        # Under pipeline parallelism self.layers is an nn.ModuleDict keyed by
-        # GLOBAL layer index as a string (pipeline_parallel.py:139). It cannot be
-        # sliced, and enumerate() would hand back a local 0-based index while
-        # routed_experts is indexed by global layer -- silently replaying the
-        # wrong layer's router on every stage after the first. Keying by global
-        # index is the whole reason that ModuleDict exists, so use it.
+        # Router replay uses global layer indices.
         if pipeline_layer_indices is not None:
             layer_items = [
                 (index, self.layers[str(index)]) for index in pipeline_layer_indices
@@ -388,10 +380,7 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
             )
             cached_indices = next_cached_indices if use_index_cache else None
 
-        # apply_pp_boundaries sets norm to None on every stage but the last
-        # (pipeline_parallel.py:161) -- the head is ~1.9 GB in bf16 and the
-        # non-final stages never use it. Only the last stage normalizes; the
-        # others hand their hidden states straight to the next stage.
+        # Only the last pipeline stage owns the final normalization.
         if pipeline_apply_norm and self.norm is not None:
             hidden_states = self.norm(hidden_states)
         return BaseModelOutputWithPast(
@@ -457,6 +446,10 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
             Routed experts for each token in the sequence. Only used for router replay.
         sparse_indices_cache (`torch.LongTensor` of shape `(batch_size, sequence_length, index_n_heads, index_topk)`, *optional*):
             Sparse attention indices computed by an earlier pipeline stage.
+        pipeline_layer_indices (`tuple[int, ...]`, *optional*):
+            Global indices of the layers owned by this pipeline stage.
+        pipeline_apply_norm (`bool`, *optional*, defaults to `True`):
+            Whether the model applies its final normalization.
         """
         assert use_cache is None, "use_cache is not supported for custom glm_moe_dsa for now"
         assert past_key_values is None, "past_key_values is not supported for custom glm_moe_dsa for now"
