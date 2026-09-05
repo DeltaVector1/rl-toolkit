@@ -1479,9 +1479,10 @@ def train(config: TrainerConfig):
                 pp_target_length += cp_size - (pp_target_length % cp_size)
 
         for micro_step, micro_batch in enumerate(micro_batches):
-            pad_micro_batch_to_distributed_max(micro_batch, dp_cp_group)
             if pp_enabled:
                 pad_micro_batch_to_length(micro_batch, pp_target_length)
+            else:
+                pad_micro_batch_to_distributed_max(micro_batch, dp_cp_group)
             _dev = "cpu" if pp_enabled else "cuda"
             input_ids = micro_batch["input_ids"].to(_dev)
             position_ids = micro_batch["position_ids"].to(_dev)
