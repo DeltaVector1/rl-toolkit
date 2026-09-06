@@ -381,9 +381,10 @@ peer_kill_owned() {
 }
 
 peer_remote_ports_ready() {
-  local timeout=${1:-5} peer_target remote_ports port
+  local probe_seconds=${1:-5} peer_target remote_ports port
   peer_target=$(printf '%q' "$peer_ssh_user@$peer_host")
-  if ! remote_ports=$(ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout="$timeout" \
+  if ! remote_ports=$(timeout --signal=TERM --kill-after=1s "$probe_seconds" \
+      ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout="$probe_seconds" \
       -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes \
       -o IPQoS=none -i "$peer_ssh_identity" -p "$peer_ssh_port" \
       "$peer_target" "ss -H -ltn | awk '{print \$4}'" 2>/dev/null); then

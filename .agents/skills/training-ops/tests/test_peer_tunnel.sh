@@ -219,6 +219,9 @@ unset KILL_LOG PEER_GROUP_COMMANDS
 cat >"$tmp/bin/ssh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+if [ -n "${PEER_REMOTE_SLEEP:-}" ]; then
+  sleep "$PEER_REMOTE_SLEEP"
+fi
 if [ "${PEER_REMOTE_FAIL:-0}" = 1 ]; then
   exit 1
 fi
@@ -238,4 +241,14 @@ if PATH="$tmp/bin:$PATH" PEER_REMOTE_FAIL=1 PEER_REMOTE_MISSING=0 peer_remote_po
   echo "remote SSH failure was accepted" >&2
   exit 1
 fi
+export PEER_REMOTE_SLEEP=20
+started=$(date +%s)
+if PATH="$tmp/bin:$PATH" peer_remote_ports_ready 1; then
+  echo "hung remote probe was accepted" >&2
+  exit 1
+fi
+elapsed=$(( $(date +%s) - started ))
+printf 'hung remote probe wall_seconds=%s\n' "$elapsed"
+test "$elapsed" -le 3
+unset PEER_REMOTE_SLEEP
 printf 'peer tunnel uses one API connection and twenty-four bounded self-healing lanes\n'
