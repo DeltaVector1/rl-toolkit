@@ -3,7 +3,7 @@ max_steps = 1
 dist_timeout_seconds = 5400
 enable_router_replay = false
 [env_vars]
-PRIME_PROFILE_PP_STAGE = "1"
+PRIME_PROFILE_PP_STAGE = "0"
 PRIME_PROFILE_PP_RANK = "8"
 PRIME_LORA_MM_PROFILE = "sm89-r32"
 

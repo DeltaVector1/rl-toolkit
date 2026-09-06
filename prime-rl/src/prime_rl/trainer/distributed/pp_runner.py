@@ -17,11 +17,13 @@ Design notes, because the obvious approaches do not fit this trainer:
 """
 
 import os
+import sys
 from collections.abc import Mapping, Sequence
 from typing import Any, Callable
 
 import torch
 import torch.nn as nn
+from torch.profiler import ProfilerActivity, profile
 
 
 def minimum_pipeline_microbatches(schedule_name: str, pp_size: int) -> int:
@@ -314,9 +316,21 @@ class PipelineStageModule(nn.Module):
             transfer_sparse_indices if send_sparse_indices is None else send_sparse_indices
         )
         self.profile_stage = os.environ.get("PRIME_PROFILE_PP_STAGE") == "1"
+        profile_rank = int(os.environ.get("PRIME_PROFILE_PP_RANK", "-1"))
+        self.profile_rank = (
+            profile_rank >= 0
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_rank() == profile_rank
+        )
         self._forward_events = []
         self._backward_events = []
-        if self.profile_stage:
+        self._forward_calls = 0
+        self._backward_calls = 0
+        self._forward_profile_done = False
+        self._backward_profile_done = False
+        self._backward_profiler = None
+        self._profile_reports = []
+        if self.profile_stage or self.profile_rank:
             self.register_full_backward_pre_hook(self._record_backward_start)
             self.register_full_backward_hook(self._record_backward_end)
         self._side: dict[tuple[int, int], dict] = {}
@@ -324,14 +338,50 @@ class PipelineStageModule(nn.Module):
         self._active_microbatch: int | None = None
 
     def _record_backward_start(self, _module, _grad_output) -> None:
-        event = torch.cuda.Event(enable_timing=True)
-        event.record()
-        self._backward_events.append([event, None])
+        if self.profile_stage:
+            event = torch.cuda.Event(enable_timing=True)
+            event.record()
+            self._backward_events.append([event, None])
+        if self.profile_rank:
+            self._backward_calls += 1
+        if (
+            self.profile_rank
+            and not self.is_first
+            and self._backward_calls == 8
+            and not self._backward_profile_done
+        ):
+            self._backward_profile_done = True
+            self._backward_profiler = profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]
+            ).__enter__()
 
     def _record_backward_end(self, _module, _grad_input, _grad_output) -> None:
-        event = torch.cuda.Event(enable_timing=True)
-        event.record()
-        self._backward_events[-1][1] = event
+        if self.profile_stage:
+            event = torch.cuda.Event(enable_timing=True)
+            event.record()
+            self._backward_events[-1][1] = event
+        profiler = self._backward_profiler
+        self._backward_profiler = None
+        if profiler is not None:
+            profiler.__exit__(None, None, None)
+            self._profile_reports.append(("PP full backward profile", profiler))
+
+    def close_backward_profiler(self) -> None:
+        profiler = self._backward_profiler
+        self._backward_profiler = None
+        if profiler is not None:
+            profiler.__exit__(None, None, None)
+
+    def emit_profile_reports(self) -> None:
+        for label, profiler in self._profile_reports:
+            print(
+                f"{label}:\n"
+                + profiler.key_averages().table(
+                    sort_by="self_device_time_total", row_limit=40
+                ),
+                flush=True,
+            )
+        self._profile_reports.clear()
 
     def profile_times_ms(self, *, clear: bool = False) -> tuple[float, float]:
         if not self.profile_stage:
@@ -433,8 +483,24 @@ class PipelineStageModule(nn.Module):
         if self.profile_stage:
             start = torch.cuda.Event(enable_timing=True)
             start.record()
-        with maybe_activation_offloading(self.offload_cfg):
-            output = self._forward_inner(x, sparse_indices_cache)
+        profiler = None
+        if self.profile_rank:
+            self._forward_calls += 1
+        if self.profile_rank and self._forward_calls == 8 and not self._forward_profile_done:
+            self._forward_profile_done = True
+            profiler = profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]
+            ).__enter__()
+        try:
+            with maybe_activation_offloading(self.offload_cfg):
+                output = self._forward_inner(x, sparse_indices_cache)
+        except BaseException:
+            if profiler is not None:
+                profiler.__exit__(*sys.exc_info())
+            raise
+        if profiler is not None:
+            profiler.__exit__(None, None, None)
+            self._profile_reports.append(("PP forward profile", profiler))
         if start is not None:
             end = torch.cuda.Event(enable_timing=True)
             end.record()

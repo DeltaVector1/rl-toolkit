@@ -2030,13 +2030,7 @@ def train(config: TrainerConfig):
             # last stage's per-micro-batch outputs, which are scalar losses --
             # "zero-dimensional tensor cannot be concatenated". The loss closure
             # already accumulates what the metrics need.
-            profile_rank = int(os.environ.get("PRIME_PROFILE_PP_RANK", "-1"))
-            schedule_profiler = (
-                profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
-                if dist.get_rank() == profile_rank
-                else nullcontext()
-            )
-            with schedule_profiler:
+            try:
                 if pp_rank == 0:
                     pp_schedule.step(pp_inputs, return_outputs=False)
                 elif pp_rank == parallel_dims.pp - 1:
@@ -2049,13 +2043,11 @@ def train(config: TrainerConfig):
                     )
                 else:
                     pp_schedule.step(return_outputs=False)
-            if dist.get_rank() == profile_rank:
-                logger.info(
-                    "PP CUDA profile:\n"
-                    + schedule_profiler.key_averages().table(
-                        sort_by="self_device_time_total", row_limit=40
-                    )
-                )
+            finally:
+                for stage_module in pp_stage_modules:
+                    stage_module.close_backward_profiler()
+            for stage_module in pp_stage_modules:
+                stage_module.emit_profile_reports()
             local_schedule_ms = 0.0
             if dist.get_rank() == 0 or profile_pp_stage:
                 torch.cuda.synchronize()
