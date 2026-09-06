@@ -98,7 +98,13 @@ You may read and measure the system. You may edit this repository and run
 local tests. You may repair a known tunnel, inference, or supervisor fault
 after `training_ops.status()` shows that fault.
 
-Get an owner decision before you:
+For the current neutral GLM performance effort, the owner authorizes needed
+repairs and test restarts. This does not authorize unrelated work.
+For this effort, if an actual forward or backward pass exceeds ten minutes,
+stop the test, preserve relevant logs, and trace the cause before a fresh
+retry. GPU utilization alone does not prove progress.
+
+Get an owner decision before you, except for that scoped permission:
 
 - stop or restart a run;
 - start a new run name;
