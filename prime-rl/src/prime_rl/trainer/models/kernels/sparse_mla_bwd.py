@@ -125,12 +125,14 @@ def bwd(
     indices_dtype=T.int32,
     dtype=T.bfloat16,
     accum_dtype=T.float32,
+    direct_dkv_store=False,
 ):
     assert is_causal is True, "non-casual is not supported now"
     assert topk % block_size == 0, "otherwise will load some index=0 thus causing wrong kv to be loaded"
     assert dtype == T.bfloat16
     assert accum_dtype == T.float32
     assert indices_dtype == T.int32
+    assert isinstance(direct_dkv_store, bool)
 
     if sm_scale is None:
         sm_scale = (D + D_tail) ** (-0.5)
@@ -179,6 +181,8 @@ def bwd(
 
             P_shared_cast = T.alloc_shared([block_H, BS], dtype)
             dP_shared_cast = T.alloc_shared([block_H, BS], dtype)
+            dQ_shared = T.alloc_shared([block_H, D], dtype)
+            dQ_tail_shared = T.alloc_shared([block_H, D_tail], dtype)
 
             acc_p = T.alloc_fragment([block_H, BS], accum_dtype)
             acc_dp = T.alloc_fragment([block_H, BS], accum_dtype)
@@ -186,8 +190,9 @@ def bwd(
             acc_dq_tail = T.alloc_fragment([block_H, D_tail], accum_dtype)
             acc_dkv = T.alloc_fragment([BS, D], accum_dtype)
             acc_dkv_tail = T.alloc_fragment([BS, D_tail], accum_dtype)
-            acc_dkv_shared = T.alloc_shared([BS // split_store, D], accum_dtype)
-            acc_dkv_tail_shared = T.alloc_shared([BS // split_store, D_tail], accum_dtype)
+            if vectorized_atomic or not direct_dkv_store:
+                acc_dkv_shared = T.alloc_shared([BS // split_store, D], accum_dtype)
+                acc_dkv_tail_shared = T.alloc_shared([BS // split_store, D_tail], accum_dtype)
 
             # See sparse_mla_fwd: sentinel is at index S_kv - 1 (zero KV), valid indices
             # live in [0, S_kv - 1). Using this single bound makes the kernel work for
@@ -251,13 +256,14 @@ def bwd(
                 T.gemm(dP_shared_cast, Q_tail_shared, acc_dkv_tail, transpose_A=True, policy=T.GemmWarpPolicy.FullCol)
 
                 for s in range(split_store):
-                    for bi_i, d_i in T.Parallel(BS, D):
-                        if bi_i < BS // split_store:
-                            acc_dkv_shared[bi_i, d_i] = acc_dkv[bi_i + s * (BS // split_store), d_i]
+                    if vectorized_atomic or not direct_dkv_store:
+                        for bi_i, d_i in T.Parallel(BS, D):
+                            if bi_i < BS // split_store:
+                                acc_dkv_shared[bi_i, d_i] = acc_dkv[bi_i + s * (BS // split_store), d_i]
 
-                    for bi_i, d_i in T.Parallel(BS, D_tail):
-                        if bi_i < BS // split_store:
-                            acc_dkv_tail_shared[bi_i, d_i] = acc_dkv_tail[bi_i + s * (BS // split_store), d_i]
+                        for bi_i, d_i in T.Parallel(BS, D_tail):
+                            if bi_i < BS // split_store:
+                                acc_dkv_tail_shared[bi_i, d_i] = acc_dkv_tail[bi_i + s * (BS // split_store), d_i]
 
                     if vectorized_atomic:
                         for bi_i, d_i in T.Parallel(BS // split_store, D // 4):
@@ -290,7 +296,7 @@ def bwd(
                                     bz // NH,
                                     d_i,
                                 ],
-                                acc_dkv_shared[bi_i, d_i],
+                                acc_dkv[source_row, d_i] if direct_dkv_store else acc_dkv_shared[bi_i, d_i],
                             )
 
                         for bi_i, d_i in T.Parallel(BS // split_store, D_tail):
@@ -301,17 +307,16 @@ def bwd(
                                     bz // NH,
                                     D + d_i,
                                 ],
-                                acc_dkv_tail_shared[bi_i, d_i],
+                                acc_dkv_tail[source_row, d_i]
+                                if direct_dkv_store
+                                else acc_dkv_tail_shared[bi_i, d_i],
                             )
 
-            # Q_shared and Q_tail_shared are no longer read after the loop.
-            # Wait before overwriting them with the final dQ staging values.
-            T.sync_threads()
-            T.copy(acc_dq, Q_shared)
-            T.copy(acc_dq_tail, Q_tail_shared)
+            T.copy(acc_dq, dQ_shared)
+            T.copy(acc_dq_tail, dQ_tail_shared)
 
-            T.copy(Q_shared, dQ[by, s_i, bz * block_H : (bz + 1) * block_H, :D])
-            T.copy(Q_tail_shared, dQ[by, s_i, bz * block_H : (bz + 1) * block_H, D:])
+            T.copy(dQ_shared, dQ[by, s_i, bz * block_H : (bz + 1) * block_H, :D])
+            T.copy(dQ_tail_shared, dQ[by, s_i, bz * block_H : (bz + 1) * block_H, D:])
 
     return sparse_mla_bwd_kernel
 
@@ -331,11 +336,21 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None):
     assert indices.shape == (B, S, kv_group, topk)
     assert lse.shape == (B, S, H)
 
+    direct_value = os.environ.get("PRIME_SPARSE_BWD_DIRECT_DKV", "0")
+    if direct_value not in {"0", "1"}:
+        raise ValueError("PRIME_SPARSE_BWD_DIRECT_DKV must be 0 or 1")
+    direct_dkv_store = direct_value == "1"
+    capability = torch.cuda.get_device_capability(q.device)
+    if direct_dkv_store and capability != (8, 9):
+        raise ValueError("PRIME_SPARSE_BWD_DIRECT_DKV requires an SM89 CUDA device")
+
     preprocess_kernel = preprocess(H, D)
-    if torch.cuda.get_device_capability(q.device)[0] < 9:
+    if capability[0] < 9:
         block_size = int(os.environ.get("PRIME_SPARSE_BWD_BLOCK_SIZE", "16"))
         block_heads = int(os.environ.get("PRIME_SPARSE_BWD_BLOCK_HEADS", "16"))
         threads = int(os.environ.get("PRIME_SPARSE_BWD_THREADS", "64"))
+        if direct_dkv_store and (block_size, threads) != (16, 64):
+            raise ValueError("PRIME_SPARSE_BWD_DIRECT_DKV requires SM89 block=16 threads=64")
         bwd_kernel = bwd(
             H,
             D,
@@ -348,9 +363,19 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None):
             block_H=block_heads,
             threads=threads,
             vectorized_atomic=False,
+            direct_dkv_store=direct_dkv_store,
         )
     else:
-        bwd_kernel = bwd(H, D, D_tail, topk, kv_group, sm_scale, True)
+        bwd_kernel = bwd(
+            H,
+            D,
+            D_tail,
+            topk,
+            kv_group,
+            sm_scale,
+            True,
+            direct_dkv_store=direct_dkv_store,
+        )
     postprocess_kernel = postprocess(D, D_tail, kv_group)
 
     delta = preprocess_kernel(o, do)
