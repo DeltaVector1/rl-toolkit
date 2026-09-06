@@ -52,6 +52,141 @@ class ActiveRewardRowsTest(unittest.TestCase):
         self.assertEqual(without_time, 1)
 
 
+class StepsReaderTest(unittest.TestCase):
+    def trainer_config(self, directory, output_dir, filename):
+        path = Path(directory) / "trainer.toml"
+        path.write_text(
+            f'output_dir = "{output_dir}"\n'
+            "[file_monitor]\n"
+            f'filename = "{filename}"\n',
+            encoding="utf-8",
+        )
+        return path
+
+    def fake_steps_ssh(self, calls, metrics_path, code=0, error=""):
+        def ssh(host, script, timeout=180):
+            calls.append(script)
+            if code:
+                return code, error
+            return code, json.dumps(
+                {
+                    "metrics_path": metrics_path,
+                    "rows": [
+                        {
+                            "step": 2,
+                            "forward_backward_seconds": 204.8,
+                            "wait_seconds": 0.0,
+                            "tokens_per_second": 2.0,
+                        }
+                    ],
+                    "invalid_lines": 0,
+                    "excluded_lines": 0,
+                }
+            )
+
+        return ssh
+
+    def test_uses_configured_output_and_custom_filename(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.trainer_config(
+                directory,
+                "/data/glm52-rl/qualifications/custom-run",
+                "step-times.jsonl",
+            )
+            expected = "/data/glm52-rl/qualifications/custom-run/step-times.jsonl"
+            with (
+                mock.patch.object(
+                    training_ops,
+                    "_profile_for_run",
+                    return_value={"trainer": str(config)},
+                ) as profile,
+                mock.patch.object(
+                    training_ops,
+                    "_ssh",
+                    side_effect=self.fake_steps_ssh(calls, expected),
+                ),
+                redirect_stdout(StringIO()) as output,
+            ):
+                rows = training_ops.steps("custom-run")
+        self.assertEqual(rows[0]["step"], 2)
+        profile.assert_called_once_with("custom-run", required=False)
+        rendered = output.getvalue()
+        self.assertIn(f"step source=configured path={expected}", rendered)
+        self.assertIn("204.8s", rendered)
+        self.assertIn(f"path={expected}", calls[0])
+        self.assertNotIn("find ", calls[0])
+
+    def test_uses_legacy_archive_search_without_profile(self):
+        calls = []
+        expected = "/data/glm52-rl/runs/archived/run/trainer-metrics.jsonl"
+        with (
+            mock.patch.object(training_ops, "_profile_for_run", return_value=None),
+            mock.patch.object(
+                training_ops,
+                "_ssh",
+                side_effect=self.fake_steps_ssh(calls, expected),
+            ),
+            redirect_stdout(StringIO()) as output,
+        ):
+            training_ops.steps("archived")
+        self.assertIn("step source=archive", output.getvalue())
+        self.assertIn("find /data/glm52-rl/runs/archived", calls[0])
+        self.assertIn("trainer-metrics.jsonl", calls[0])
+
+    def test_rejects_malformed_or_ambiguous_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "bad.toml"
+            config.write_text("output_dir = [", encoding="utf-8")
+            with mock.patch.object(
+                training_ops,
+                "_profile_for_run",
+                return_value={"trainer": str(config)},
+            ):
+                with self.assertRaisesRegex(RuntimeError, "cannot read trainer config"):
+                    training_ops.steps("bad")
+        with mock.patch.object(
+            training_ops,
+            "_profile_for_run",
+            side_effect=training_ops.Refused("multiple configured trainer profiles"),
+        ):
+            with self.assertRaisesRegex(training_ops.Refused, "multiple configured"):
+                training_ops.steps("ambiguous")
+
+    def test_reports_missing_configured_remote_file(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.trainer_config(
+                directory,
+                "/data/glm52-rl/qualifications/missing",
+                "custom-metrics.jsonl",
+            )
+            expected = "/data/glm52-rl/qualifications/missing/custom-metrics.jsonl"
+            with (
+                mock.patch.object(
+                    training_ops,
+                    "_profile_for_run",
+                    return_value={"trainer": str(config)},
+                ),
+                mock.patch.object(
+                    training_ops,
+                    "_ssh",
+                    side_effect=self.fake_steps_ssh(
+                        calls,
+                        expected,
+                        code=4,
+                        error=f"missing trainer metrics: {expected}",
+                    ),
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "source=configured") as raised:
+                    training_ops.steps("missing")
+        message = str(raised.exception)
+        self.assertIn(expected, message)
+        self.assertIn("exit=4", message)
+        self.assertIn("cannot read trainer steps", message)
+
+
 class ParityReaderTest(unittest.TestCase):
     def run_reader(self, record):
         with tempfile.TemporaryDirectory() as directory:

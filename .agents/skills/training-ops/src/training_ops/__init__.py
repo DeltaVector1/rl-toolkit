@@ -2298,11 +2298,47 @@ def steps(run: str = "", limit: int = 10) -> list[dict]:
         raise Refused("run name contains invalid characters")
     if not 1 <= int(limit) <= 200:
         raise Refused("step limit must be between 1 and 200")
+    profile = _profile_for_run(run, required=False)
+    source = "archive"
+    configured_path = None
+    lookup_path = f"{run_root}/{run}"
+    if profile is not None:
+        trainer_path = repo_root / profile["trainer"]
+        try:
+            with trainer_path.open("rb") as stream:
+                trainer_config = tomllib.load(stream)
+        except (OSError, tomllib.TOMLDecodeError) as error:
+            raise RuntimeError(f"cannot read trainer config {trainer_path}: {error}") from error
+        output_dir = trainer_config.get("output_dir")
+        file_monitor = trainer_config.get("file_monitor")
+        filename = file_monitor.get("filename") if isinstance(file_monitor, dict) else None
+        if not isinstance(output_dir, str) or not output_dir:
+            raise RuntimeError(f"trainer config {trainer_path} has no output_dir")
+        if not isinstance(filename, str) or not filename:
+            raise RuntimeError(f"trainer config {trainer_path} has no file_monitor.filename")
+        configured_path = str(Path(output_dir) / filename)
+        lookup_path = configured_path
+        source = "configured"
     container = shlex.quote(trainer_container)
     run_prefix = shlex.quote(f"{run_root}/")
+    if configured_path is None:
+        path_setup = f"""
+path=$(find {shlex.quote(lookup_path)} -maxdepth 3 -type f -name trainer-metrics.jsonl -print 2>/dev/null | head -1)
+if [ -z "$path" ]; then
+  printf 'missing trainer metrics under %s\\n' {shlex.quote(lookup_path)} >&2
+  exit 4
+fi
+"""
+    else:
+        path_setup = f"""
+path={shlex.quote(configured_path)}
+if [ ! -f "$path" ]; then
+  printf 'missing trainer metrics: %s\\n' "$path" >&2
+  exit 4
+fi
+"""
     script = f"""
-path=$(find {shlex.quote(f'{run_root}/{run}')} -maxdepth 3 -type f -name trainer-metrics.jsonl -print 2>/dev/null | head -1)
-[ -n "$path" ] || exit 4
+{path_setup}
 container_env=$(sudo docker inspect {container} --format '{{{{range .Config.Env}}}}{{{{println .}}}}{{{{end}}}}' 2>/dev/null || true)
 active_run=$(printf '%s\\n' "$container_env" | sed -n 's/^RUN=//p' | head -1)
 if [ -z "$active_run" ]; then
@@ -2360,24 +2396,35 @@ rows=sorted(
 for row in rows:
     row.setdefault('wait_seconds', 0.0)
     row.setdefault('tokens_per_second', 0.0)
-print(json.dumps({{'rows':rows[-int(sys.argv[2]):], 'invalid_lines':invalid, 'excluded_lines':excluded}}))
+print(json.dumps({{'metrics_path':sys.argv[1], 'rows':rows[-int(sys.argv[2]):], 'invalid_lines':invalid, 'excluded_lines':excluded}}))
 PY
 """
     code, output = _ssh(trainer_head, script, timeout=180)
     if code:
-        raise RuntimeError(f"cannot read trainer steps on {trainer_head}: {output.strip()}")
+        detail = output.strip()
+        raise RuntimeError(
+            f"cannot read trainer steps on {trainer_head}: source={source} "
+            f"path={lookup_path} exit={code}"
+            + (f": {detail}" if detail else "")
+        )
     try:
         result = json.loads(output.strip().splitlines()[-1])
     except (ValueError, IndexError) as error:
         raise RuntimeError("trainer step output is invalid") from error
+    if not isinstance(result, dict):
+        raise RuntimeError("trainer step output is not an object")
     rows = result.get("rows")
     if not isinstance(rows, list):
         raise RuntimeError("trainer step output has no row list")
+    metrics_path = result.get("metrics_path")
+    if not isinstance(metrics_path, str) or not metrics_path:
+        raise RuntimeError("trainer step output has no metrics path")
+    print(f"step source={source} path={metrics_path}")
     print("step  forward/backward  wait  tokens/s")
     for row in rows:
         print(
-            f"{row['step']:>4}  {_hms(row['forward_backward_seconds']):>16}  "
-            f"{_hms(row['wait_seconds']):>4}  {row['tokens_per_second']:.1f}"
+            f"{row['step']:>4}  {row['forward_backward_seconds']:>16.1f}s  "
+            f"{row['wait_seconds']:>8.1f}s  {row['tokens_per_second']:.1f}"
         )
     invalid = int(result.get("invalid_lines") or 0)
     if invalid:
@@ -2771,7 +2818,8 @@ def watch(hours: float = 2.0, every: int = 300, run: str = "") -> list[Status]:
                 if trainer_busy:
                     print(
                         f"-- trainer GPUs remain busy after {_hms(still)} without a counter change; "
-                        "forward/backward or off-policy backpressure is active.",
+                        "GPU use is high, but no step or batch progress is confirmed. "
+                        "Check the compute timer and enforce the configured limit.",
                         flush=True,
                     )
                 else:
