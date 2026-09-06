@@ -178,11 +178,13 @@ class TestingPerfTask(vf.Task[TestingPerfData, vf.State, TestingPerfTaskConfig])
             raw: str | None = None
             try:
                 response = await asyncio.wait_for(
-                    judge.complete(prompt, trace=trace),
+                    judge.complete(prompt, trace=trace, schema=TurnReview),
                     timeout=config.timeout_seconds,
                 )
                 raw = response.text
-                review = judge.parse(response)
+                if response.parsed is None:
+                    raise ValueError("judge returned no structured review")
+                review = TurnReview.model_validate(response.parsed)
             # Judge service and strict-parser failures retry alike.
             except Exception as error:
                 attempts.append(

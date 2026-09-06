@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.join(check_dir, "src"))
 
 import verifiers.v1 as vf  # noqa: E402
 from testing_perf_env.environment import TestingPerfEnv  # noqa: E402
-from testing_perf_env.judge import TestingPerfJudge  # noqa: E402
+from testing_perf_env.judge import TestingPerfJudge, TurnReview  # noqa: E402
 from testing_perf_env.taskset import (  # noqa: E402
     TestingPerfData,
     TestingPerfTask,
@@ -128,6 +128,9 @@ async def run() -> None:
     assert profile_env.taskset.max_turns == 6
     assert profile_env.taskset.task.judge.base_url.startswith("http://202.214.223.66:")
     assert profile_env.taskset.task.judge.model.startswith("RedHatAI/gemma-")
+    assert profile_env.taskset.task.judge.sampling.extra_body[
+        "chat_template_kwargs"
+    ] == {"enable_thinking": False}
 
     taskset_config = TestingPerfTasksetConfig(
         id="testing-perf-env", num_examples=5, dataset_seed=1, max_turns=6
@@ -171,10 +174,12 @@ async def run() -> None:
         )
     ] * 2
 
-    async def mocked_complete(self, messages, *, trace=None, **kwargs):
+    async def mocked_complete(self, messages, *, trace=None, schema=None, **kwargs):
+        assert schema is TurnReview
         text = responses.pop(0)
         response = vf.JudgeResponse(
             text=text,
+            parsed=TurnReview.model_validate_json(text),
             usage=vf.Usage(prompt_tokens=2, completion_tokens=5),
         )
         if trace is not None:
@@ -220,7 +225,10 @@ async def run() -> None:
 
         bad_responses = iter(["not-json", "still-not-json", "{}"])
 
-        async def malformed_complete(self, messages, *, trace=None, **kwargs):
+        async def malformed_complete(
+            self, messages, *, trace=None, schema=None, **kwargs
+        ):
+            assert schema is TurnReview
             response = vf.JudgeResponse(text=next(bad_responses))
             if trace is not None:
                 trace.record_judge(response)
@@ -241,7 +249,10 @@ async def run() -> None:
 
         stale_calls = 0
 
-        async def stale_record_complete(self, messages, *, trace=None, **kwargs):
+        async def stale_record_complete(
+            self, messages, *, trace=None, schema=None, **kwargs
+        ):
+            assert schema is TurnReview
             nonlocal stale_calls
             stale_calls += 1
             if stale_calls == 1:
@@ -269,7 +280,10 @@ async def run() -> None:
         assert stale_attempts[1]["error"]["status_code"] == 503
         assert "demo-token" not in str(stale_attempts[1]["error"])
 
-        async def service_failed_complete(self, messages, *, trace=None, **kwargs):
+        async def service_failed_complete(
+            self, messages, *, trace=None, schema=None, **kwargs
+        ):
+            assert schema is TurnReview
             raise ConnectionError("mock judge is offline")
 
         TestingPerfJudge.complete = service_failed_complete

@@ -79,6 +79,9 @@ retry_delay_seconds = 0.1
 temperature = 0.0
 max_tokens = 256
 
+[train.env.env.taskset.task.judge.sampling.extra_body.chat_template_kwargs]
+enable_thinking = false
+
 [weight_broadcast]
 type = "filesystem"
 source_url = "http://127.0.0.1:18100/glm-perf-1"
