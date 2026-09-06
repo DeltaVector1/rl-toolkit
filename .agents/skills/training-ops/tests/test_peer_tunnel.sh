@@ -17,6 +17,23 @@ cat >"$tmp/bin/pgrep" <<'EOF'
 set -euo pipefail
 pattern=${3:?missing pgrep pattern}
 if [ -r "${PEER_TEST_LOG:?}" ] && grep -Fq -- "$pattern" "$PEER_TEST_LOG"; then
+  case "$pattern" in
+    china-tunnel-lora-*)
+      echo $((10000 + ${pattern##*-}))
+      ;;
+    '-L 127.0.0.1:'*)
+      port=${pattern#-L 127.0.0.1:}
+      port=${port%%:*}
+      if [ "$port" -ge 18100 ] && [ "$port" -le 18195 ]; then
+        echo $((10000 + (port - 18100) / 4))
+      else
+        echo 1234
+      fi
+      ;;
+    *)
+      echo 1234
+      ;;
+  esac
   exit 0
 fi
 exit 1
@@ -24,10 +41,26 @@ EOF
 cat >"$tmp/bin/setsid" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-printf '%s\n' "$*" | tr '\n' ' ' >>"${PEER_TEST_LOG:?}"
-printf '\n' >>"${PEER_TEST_LOG:?}"
+line=$(printf '%s\n' "$*" | tr '\n' ' ')
+printf '%s\n' "$line" >>"${PEER_TEST_LOG:?}"
+EOF
+cat >"$tmp/bin/ps" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = "-o" ] && [ "${2:-}" = "args=" ]; then
+  pid=${4:?missing process id}
+  if [ "$pid" -ge 10000 ] 2>/dev/null; then
+    lane=$((pid - 10000))
+    grep -E "done # china-tunnel-lora-${lane}[[:space:]]*$" "${PEER_TEST_LOG:?}" | tail -n 1 | sed 's/[[:space:]]*$//' || true
+  else
+    tail -n 1 "${PEER_TEST_LOG:?}" 2>/dev/null | sed 's/[[:space:]]*$//' || true
+  fi
+elif [ "${1:-}" = "-o" ] && [ "${2:-}" = "pgid=" ]; then
+  echo "${4:?missing process id}"
+fi
 EOF
 chmod +x "$tmp/bin/pgrep" "$tmp/bin/setsid"
+chmod +x "$tmp/bin/ps"
 
 start=$(grep -n '^tunnel() {' "$script" | cut -d: -f1)
 end=$(grep -n '^china_tunnel_remove_legacy$' "$script" | cut -d: -f1)
@@ -82,25 +115,30 @@ china_log="$tmp/china-tunnel.log"
 trainer_ssh_target=china-trainer
 adapter_port=8100
 PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$china_log" china_tunnel_remove_legacy
-china_lane_size=4
 china_lane_start=0
 china_lane_number=0
 china_lane_ports=()
 china_lane_forwards=()
-while [ "$china_lane_start" -lt "${#lora_source_ports[@]}" ]; do
-  china_lane_ports=("${lora_source_ports[@]:china_lane_start:china_lane_size}")
-  china_lane_forwards=()
-  for lora_source_port in "${china_lane_ports[@]}"; do
-    china_lane_forwards+=(
-      -L "127.0.0.1:$lora_source_port:127.0.0.1:$adapter_port"
-    )
+run_china_lanes() {
+  china_lane_start=0
+  china_lane_number=0
+  while [ "$china_lane_start" -lt "${#lora_source_ports[@]}" ]; do
+    china_lane_ports=("${lora_source_ports[@]:china_lane_start:4}")
+    china_lane_forwards=()
+    for lora_source_port in "${china_lane_ports[@]}"; do
+      china_lane_forwards+=(
+        -L "127.0.0.1:$lora_source_port:127.0.0.1:$adapter_port"
+      )
+    done
+    PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$china_log" china_tunnel_connection "lora-$china_lane_number" \
+      "${china_lane_forwards[@]}"
+    china_lane_start=$((china_lane_start + 4))
+    china_lane_number=$((china_lane_number + 1))
   done
-  PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$china_log" china_tunnel_connection "lora-$china_lane_number" \
-    "-L 127.0.0.1:${china_lane_ports[0]}:127.0.0.1:$adapter_port" \
-    "${china_lane_forwards[@]}"
-  china_lane_start=$((china_lane_start + china_lane_size))
-  china_lane_number=$((china_lane_number + 1))
-done
+}
+
+# A fresh launch creates twenty-four four-forward lanes.
+run_china_lanes
 for _ in $(seq 1 50); do
   [ -f "$china_log" ] && [ "$(wc -l <"$china_log")" -eq 24 ] && break
   sleep 0.1
@@ -111,4 +149,15 @@ while IFS= read -r line; do
   test "$forward_count" -le 4
   grep -Fq -- '-o ExitOnForwardFailure=yes' <<<"$line"
 done <"$china_log"
+# A repeat launch preserves all matching groups without adding processes.
+run_china_lanes
+test "$(wc -l <"$china_log")" -eq 24
+# A target change removes only the owned old groups before regrouping.
+trainer_ssh_target=china-trainer-regrouped
+run_china_lanes
+for _ in $(seq 1 50); do
+  [ "$(wc -l <"$china_log")" -eq 48 ] && break
+  sleep 0.1
+done
+test "$(wc -l <"$china_log")" -eq 48
 printf 'peer tunnel uses one API connection and twenty-four bounded self-healing lanes\n'
