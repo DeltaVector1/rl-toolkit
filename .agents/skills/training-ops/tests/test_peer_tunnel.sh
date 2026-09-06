@@ -201,7 +201,7 @@ group_commands="$tmp/group-commands"
 kill_log="$tmp/kill-log"
 printf '%s\n' \
   '1234 bash -c while true; do ssh -R 127.0.0.1:18100:127.0.0.1:18196 root@38.255.28.19; done # peer-tunnel-lora-0' \
-  '1234 unrelated-daemon' >"$group_commands"
+  '1234 ssh -i /other/key -p 20099 -R 127.0.0.1:18100:127.0.0.1:18196 unrelated@peer' >"$group_commands"
 kill() { printf '%s\n' "$*" >>"$KILL_LOG"; }
 export KILL_LOG="$kill_log" PEER_GROUP_COMMANDS="$group_commands"
 PATH="$tmp/bin:$PATH"

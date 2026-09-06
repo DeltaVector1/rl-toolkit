@@ -350,11 +350,13 @@ peer_tunnel_remove_legacy() {
 }
 
 peer_kill_owned() {
-  local pid=$1 command_line=$2 pgid group_command group_safe group_seen
+  local pid=$1 command_line=$2 pgid group_command group_safe group_seen peer_forward
   case "$command_line" in
     *"while true; do"*"# peer-tunnel-"*) ;;
     *) return 0 ;;
   esac
+  peer_forward=$(grep -o -- '-[LR] [^ ]*' <<<"$command_line" | head -n 1)
+  [ -n "$peer_forward" ] || { kill "$pid" 2>/dev/null || true; return 0; }
   pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
   case "$pgid" in
     ''|*[!0-9]*|0|1|"$$") kill "$pid" 2>/dev/null || true ;;
@@ -364,7 +366,8 @@ peer_kill_owned() {
       while IFS= read -r group_command; do
         group_seen=1
         case "$group_command" in
-          *"# peer-tunnel-"*|*"ssh "*|*" sleep 3"*) ;;
+          *"# peer-tunnel-"*|*" sleep 3"*) ;;
+          *"ssh "*"-i $peer_ssh_identity"*"-p $peer_ssh_port "*"$peer_forward"*) ;;
           *) group_safe=0; break ;;
         esac
       done < <(ps -eo pgid=,args= | awk -v group="$pgid" '$1 == group {sub(/^[^ ]+ +/, ""); print}')
@@ -378,9 +381,9 @@ peer_kill_owned() {
 }
 
 peer_remote_ports_ready() {
-  local peer_target remote_ports port
+  local timeout=${1:-5} peer_target remote_ports port
   peer_target=$(printf '%q' "$peer_ssh_user@$peer_host")
-  if ! remote_ports=$(ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=3 \
+  if ! remote_ports=$(ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout="$timeout" \
       -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes \
       -o IPQoS=none -i "$peer_ssh_identity" -p "$peer_ssh_port" \
       "$peer_target" "ss -H -ltn | awk '{print \$4}'" 2>/dev/null); then
@@ -568,8 +571,8 @@ if [ "$tunnels_only" = 1 ]; then
   remote_ready=1
   if [ "$peer_enabled" = 1 ]; then
     remote_ready=0
-    for _ in $(seq 1 30); do
-      if peer_remote_ports_ready; then
+    for _ in $(seq 1 10); do
+      if peer_remote_ports_ready 5; then
         remote_ready=1
         break
       fi
