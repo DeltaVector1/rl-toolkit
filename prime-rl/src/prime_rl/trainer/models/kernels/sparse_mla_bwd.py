@@ -255,8 +255,30 @@ def bwd(
                 T.clear(acc_dkv_tail)
                 T.gemm(dP_shared_cast, Q_tail_shared, acc_dkv_tail, transpose_A=True, policy=T.GemmWarpPolicy.FullCol)
 
-                for s in range(split_store):
-                    if vectorized_atomic or not direct_dkv_store:
+                if direct_dkv_store:
+                    for bi_i, d_i in T.Parallel(BS, D):
+                        T.atomic_add(
+                            dKV[
+                                by,
+                                Indices[by, s_i, bz // NH, i_i * BS + bi_i],
+                                bz // NH,
+                                d_i,
+                            ],
+                            acc_dkv[bi_i, d_i],
+                        )
+
+                    for bi_i, d_i in T.Parallel(BS, D_tail):
+                        T.atomic_add(
+                            dKV[
+                                by,
+                                Indices[by, s_i, bz // NH, i_i * BS + bi_i],
+                                bz // NH,
+                                D + d_i,
+                            ],
+                            acc_dkv_tail[bi_i, d_i],
+                        )
+                else:
+                    for s in range(split_store):
                         for bi_i, d_i in T.Parallel(BS, D):
                             if bi_i < BS // split_store:
                                 acc_dkv_shared[bi_i, d_i] = acc_dkv[bi_i + s * (BS // split_store), d_i]
@@ -265,52 +287,50 @@ def bwd(
                             if bi_i < BS // split_store:
                                 acc_dkv_tail_shared[bi_i, d_i] = acc_dkv_tail[bi_i + s * (BS // split_store), d_i]
 
-                    if vectorized_atomic:
-                        for bi_i, d_i in T.Parallel(BS // split_store, D // 4):
-                            T.atomic_addx4(
-                                dKV[
-                                    by,
-                                    Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
-                                    bz // NH,
-                                    d_i * 4,
-                                ],
-                                acc_dkv_shared[bi_i, d_i * 4],
-                            )
+                        if vectorized_atomic:
+                            for bi_i, d_i in T.Parallel(BS // split_store, D // 4):
+                                T.atomic_addx4(
+                                    dKV[
+                                        by,
+                                        Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
+                                        bz // NH,
+                                        d_i * 4,
+                                    ],
+                                    acc_dkv_shared[bi_i, d_i * 4],
+                                )
 
-                        for bi_i, d_i in T.Parallel(BS // split_store, D_tail // 4):
-                            T.atomic_addx4(
-                                dKV[
-                                    by,
-                                    Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
-                                    bz // NH,
-                                    D + d_i * 4,
-                                ],
-                                acc_dkv_tail_shared[bi_i, d_i * 4],
-                            )
-                    else:
-                        for bi_i, d_i in T.Parallel(BS // split_store, D):
-                            T.atomic_add(
-                                dKV[
-                                    by,
-                                    Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
-                                    bz // NH,
-                                    d_i,
-                                ],
-                                acc_dkv[source_row, d_i] if direct_dkv_store else acc_dkv_shared[bi_i, d_i],
-                            )
+                            for bi_i, d_i in T.Parallel(BS // split_store, D_tail // 4):
+                                T.atomic_addx4(
+                                    dKV[
+                                        by,
+                                        Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
+                                        bz // NH,
+                                        D + d_i * 4,
+                                    ],
+                                    acc_dkv_tail_shared[bi_i, d_i * 4],
+                                )
+                        else:
+                            for bi_i, d_i in T.Parallel(BS // split_store, D):
+                                T.atomic_add(
+                                    dKV[
+                                        by,
+                                        Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
+                                        bz // NH,
+                                        d_i,
+                                    ],
+                                    acc_dkv_shared[bi_i, d_i],
+                                )
 
-                        for bi_i, d_i in T.Parallel(BS // split_store, D_tail):
-                            T.atomic_add(
-                                dKV[
-                                    by,
-                                    Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
-                                    bz // NH,
-                                    D + d_i,
-                                ],
-                                acc_dkv_tail[source_row, d_i]
-                                if direct_dkv_store
-                                else acc_dkv_tail_shared[bi_i, d_i],
-                            )
+                            for bi_i, d_i in T.Parallel(BS // split_store, D_tail):
+                                T.atomic_add(
+                                    dKV[
+                                        by,
+                                        Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
+                                        bz // NH,
+                                        D + d_i,
+                                    ],
+                                    acc_dkv_tail_shared[bi_i, d_i],
+                                )
 
             T.copy(acc_dq, dQ_shared)
             T.copy(acc_dq_tail, dQ_tail_shared)
