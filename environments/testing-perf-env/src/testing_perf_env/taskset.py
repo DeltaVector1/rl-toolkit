@@ -32,6 +32,7 @@ class TestingPerfData(vf.TaskData):
     requirements: list[str]
     follow_ups: list[str]
     target_turns: int = Field(ge=2, le=6)
+    target_words: int = Field(ge=400, le=700)
     response_format: Literal["plain", "markdown"]
 
 
@@ -51,6 +52,7 @@ _task_templates: tuple[dict[str, Any], ...] = (
     {
         "task_id": "trip-checklist",
         "topic": "a two-day rainy city trip",
+        "target_words": 400,
         "requirements": [
             "include a waterproof jacket",
             "include comfortable shoes",
@@ -67,6 +69,7 @@ _task_templates: tuple[dict[str, Any], ...] = (
     {
         "task_id": "file-plan",
         "topic": "organising digital project files",
+        "target_words": 500,
         "requirements": [
             "use folders for source, notes, and exports",
             "give files a consistent date format",
@@ -83,6 +86,7 @@ _task_templates: tuple[dict[str, Any], ...] = (
     {
         "task_id": "study-plan",
         "topic": "a one-week study plan for a history exam",
+        "target_words": 600,
         "requirements": [
             "divide work across five weekdays",
             "include review and practice questions",
@@ -99,6 +103,7 @@ _task_templates: tuple[dict[str, Any], ...] = (
     {
         "task_id": "garden-plan",
         "topic": "a small balcony herb garden",
+        "target_words": 700,
         "requirements": [
             "name three herbs",
             "mention sunlight and drainage",
@@ -124,6 +129,7 @@ def _prompt(row: dict[str, Any], response_format: str) -> str:
     requirements = "; ".join(row["requirements"])
     return (
         f"Create a practical plan for {row['topic']}. {format_request} "
+        f"Aim for about {row['target_words']} words in each answer. "
         f"The first answer must address these points: {requirements}."
     )
 
@@ -150,6 +156,7 @@ class TestingPerfTask(vf.Task[TestingPerfData, vf.State, TestingPerfTaskConfig])
             "task": self.data.prompt_text,
             "requirements": self.data.requirements,
             "response_format": self.data.response_format,
+            "target_words": self.data.target_words,
             "turn": turn,
             "current_user_request": user_requests[turn - 1],
             "visible_response": answers[-1],
@@ -161,7 +168,9 @@ class TestingPerfTask(vf.Task[TestingPerfData, vf.State, TestingPerfTaskConfig])
             "task_adherence, coherence in [0, 1], and an evidence array with "
             "one to four short strings. Use 1.0 for complete work, 0.5 for "
             "partial work, and 0.0 for absent or contradictory work. Higher "
-            "numbers mean better work.\n\n" + json.dumps(payload, ensure_ascii=False)
+            "numbers mean better work. The user asks for about "
+            f"{self.data.target_words} words in each answer.\n\n"
+            + json.dumps(payload, ensure_ascii=False)
         )
 
     async def _review_turn(
@@ -256,11 +265,22 @@ class TestingPerfTask(vf.Task[TestingPerfData, vf.State, TestingPerfTaskConfig])
     async def testing_perf_reward(self, trace: vf.Trace) -> float:
         answers = [self._visible_text(message) for message in trace.assistant_messages]
         target_turns = self.data.target_turns
+        target_words = self.data.target_words
+        word_counts = [len(answer.split()) for answer in answers]
+        length_scores = [
+            0.0
+            if word_count == 0
+            else min(word_count, target_words) / max(word_count, target_words)
+            for word_count in word_counts
+        ]
         trace.info["testing_perf"] = {
             "target_turns": target_turns,
             "completed_turns": len(answers),
             "response_format": self.data.response_format,
             "visible_output_only": True,
+            "target_words": target_words,
+            "word_counts": word_counts,
+            "length_scores": length_scores,
         }
         trace.record_metric("testing_perf_target_turns", float(target_turns))
         trace.record_metric("testing_perf_completed_turns", float(len(answers)))
@@ -288,8 +308,14 @@ class TestingPerfTask(vf.Task[TestingPerfData, vf.State, TestingPerfTaskConfig])
             for turn in range(1, target_turns + 1)
         ]
         scores = [
-            (review.correctness + review.task_adherence + review.coherence) / 3
-            for review in reviews
+            (
+                review.correctness
+                + review.task_adherence
+                + review.coherence
+                + length_score
+            )
+            / 4
+            for review, length_score in zip(reviews, length_scores, strict=True)
         ]
         score = sum(scores) / len(scores)
         attempts = [
@@ -307,6 +333,9 @@ class TestingPerfTask(vf.Task[TestingPerfData, vf.State, TestingPerfTaskConfig])
             {
                 "evaluation_status": "scored",
                 "score": score,
+                "target_words": target_words,
+                "word_counts": word_counts,
+                "length_scores": length_scores,
                 "turn_reviews": [review.model_dump() for review in reviews],
                 "judge_calls": len(attempts),
                 "judge_reviews": len(reviews),
@@ -350,8 +379,12 @@ class TestingPerfTaskset(vf.Taskset[TestingPerfTask, TestingPerfTasksetConfig]):
                         prompt=_prompt(row, response_format),
                         task_id=row["task_id"],
                         requirements=list(row["requirements"]),
-                        follow_ups=list(row["follow_ups"]),
+                        follow_ups=[
+                            f"{follow_up} Keep each answer near {row['target_words']} words."
+                            for follow_up in row["follow_ups"]
+                        ],
                         target_turns=target_turns,
+                        target_words=row["target_words"],
                         response_format=response_format,
                     ),
                     config.task,

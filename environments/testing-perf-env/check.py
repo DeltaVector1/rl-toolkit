@@ -71,6 +71,7 @@ def make_task(target_turns: int = 2, max_attempts: int = 3) -> TestingPerfTask:
             requirements=["name two groups", "include one review step"],
             follow_ups=["Add one way to review the plan."],
             target_turns=target_turns,
+            target_words=400,
             response_format="plain",
         ),
         TestingPerfTaskConfig(
@@ -148,6 +149,15 @@ async def run() -> None:
     taskset = vf.load_taskset(taskset_config)
     loaded_tasks = list(taskset)
     assert [task.data.target_turns for task in loaded_tasks] == [2, 3, 4, 5, 6]
+    assert [task.data.target_words for task in loaded_tasks] == [
+        500,
+        600,
+        700,
+        400,
+        500,
+    ]
+    assert "about 500 words in each answer" in loaded_tasks[0].data.prompt_text
+    assert "near 500 words" in loaded_tasks[0].data.follow_ups[0]
     for max_turns in range(2, 7):
         bounded = TestingPerfTasksetConfig(
             id="testing-perf-env", num_examples=1, max_turns=max_turns
@@ -176,9 +186,9 @@ async def run() -> None:
     responses = [
         json.dumps(
             {
-                "correctness": 0.9,
-                "task_adherence": 0.8,
-                "coherence": 0.7,
+                "correctness": 1.0,
+                "task_adherence": 1.0,
+                "coherence": 1.0,
                 "evidence": ["covers the requested groups"],
             }
         )
@@ -186,6 +196,7 @@ async def run() -> None:
 
     async def mocked_complete(self, messages, *, trace=None, schema=None, **kwargs):
         assert schema is TurnReview
+        assert "400 words in each answer" in messages
         text = responses.pop(0)
         response = vf.JudgeResponse(
             text=text,
@@ -199,11 +210,15 @@ async def run() -> None:
     TestingPerfJudge.complete = mocked_complete
     try:
         task = make_task()
-        trace = make_trace(task, ["sort by use", "review the groups"])
+        exact_answer = "word " * task.data.target_words
+        trace = make_trace(task, [exact_answer, exact_answer])
         await task.score(trace)
-        high_score = trace.rewards["testing_perf_reward"].score
-        assert high_score > 0.7
+        exact_score = trace.rewards["testing_perf_reward"].score
+        assert exact_score == 1.0
         assert trace.info["testing_perf"]["evaluation_status"] == "scored"
+        assert trace.info["testing_perf"]["target_words"] == 400
+        assert trace.info["testing_perf"]["word_counts"] == [400, 400]
+        assert trace.info["testing_perf"]["length_scores"] == [1.0, 1.0]
         assert trace.info["testing_perf"]["judge_calls"] == 2
         assert trace.info["testing_perf"]["judge_input_tokens"] == 4
         assert trace.info["testing_perf"]["judge_output_tokens"] == 10
@@ -213,18 +228,57 @@ async def run() -> None:
             [
                 json.dumps(
                     {
-                        "correctness": 0.1,
-                        "task_adherence": 0.2,
-                        "coherence": 0.3,
-                        "evidence": ["misses requested details"],
+                        "correctness": 1.0,
+                        "task_adherence": 1.0,
+                        "coherence": 1.0,
+                        "evidence": ["covers the requested groups"],
                     }
                 )
             ]
             * 2
         )
-        low_trace = make_trace(task, ["sort by use", "review the groups"])
-        await task.score(low_trace)
-        assert low_trace.rewards["testing_perf_reward"].score < high_score
+        short_trace = make_trace(task, ["word " * 200] * 2)
+        await task.score(short_trace)
+        short_score = short_trace.rewards["testing_perf_reward"].score
+        assert 0.0 < short_score < exact_score
+        assert short_trace.info["testing_perf"]["word_counts"] == [200, 200]
+        assert short_trace.info["testing_perf"]["length_scores"] == [0.5, 0.5]
+
+        responses.extend(
+            [
+                json.dumps(
+                    {
+                        "correctness": 1.0,
+                        "task_adherence": 1.0,
+                        "coherence": 1.0,
+                        "evidence": ["covers the requested groups"],
+                    }
+                )
+            ]
+            * 2
+        )
+        overlong_trace = make_trace(task, ["word " * 800] * 2)
+        await task.score(overlong_trace)
+        assert overlong_trace.rewards["testing_perf_reward"].score == short_score
+        assert overlong_trace.info["testing_perf"]["word_counts"] == [800, 800]
+        assert overlong_trace.info["testing_perf"]["length_scores"] == [0.5, 0.5]
+
+        responses.extend(
+            [
+                json.dumps(
+                    {
+                        "correctness": 0.0,
+                        "task_adherence": 0.0,
+                        "coherence": 0.0,
+                        "evidence": ["no quality evidence"],
+                    }
+                )
+            ]
+            * 2
+        )
+        zero_trace = make_trace(task, [exact_answer, exact_answer])
+        await task.score(zero_trace)
+        assert zero_trace.rewards["testing_perf_reward"].score == 0.25
 
         empty_trace = make_trace(task, ["", "review the groups"])
         await task.score(empty_trace)
