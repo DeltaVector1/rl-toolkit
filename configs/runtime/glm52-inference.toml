@@ -12,6 +12,7 @@ lora_target_modules = [
     "gate_proj",
     "up_proj",
     "down_proj",
+    "experts",
 ]
 gpu_memory_utilization = 0.92
 enable_prefix_caching = true
