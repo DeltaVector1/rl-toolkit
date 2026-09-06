@@ -50,12 +50,23 @@ cat >"$tmp/bin/ps" <<'EOF'
 set -euo pipefail
 if [ "${1:-}" = "-o" ] && [ "${2:-}" = "args=" ]; then
   pid=${4:?missing process id}
-  if [ "$pid" -ge 10000 ] 2>/dev/null; then
+  if [ "${TUNNEL_OWNER_PID:-}" = "$pid" ]; then
+    cat "${TUNNEL_OWNER_COMMAND:?}"
+  elif [ "${TUNNEL_SUPERVISOR_PID:-}" = "$pid" ]; then
+    cat "${TUNNEL_SUPERVISOR_COMMAND:?}"
+  elif [ "$pid" -ge 10000 ] 2>/dev/null; then
     lane=$((pid - 10000))
     grep -E "done # china-tunnel-lora-${lane}[[:space:]]*$" "${PEER_TEST_LOG:?}" | tail -n 1 | sed 's/[[:space:]]*$//' || true
   else
     query=$(<"${PEER_QUERY:?}")
     grep -F -- "$query" "${PEER_TEST_LOG:?}" | tail -n 1 | sed 's/[[:space:]]*$//' || true
+  fi
+elif [ "${1:-}" = "-o" ] && [ "${2:-}" = "ppid=" ]; then
+  pid=${4:?missing process id}
+  if [ "${TUNNEL_OWNER_PID:-}" = "$pid" ]; then
+    printf '%s\n' "${TUNNEL_OWNER_PPID:?}"
+  else
+    printf '%s\n' 1
   fi
 elif [ "${1:-}" = "-o" ] && [ "${2:-}" = "pgid=" ]; then
   echo "${4:?missing process id}"
@@ -63,8 +74,13 @@ elif [ "${1:-}" = "-eo" ]; then
   [ -n "${PEER_GROUP_COMMANDS:-}" ] && cat "$PEER_GROUP_COMMANDS"
 fi
 EOF
+cat >"$tmp/bin/ss" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+cat "${TUNNEL_SS_OUTPUT:?missing tunnel ss output}"
+EOF
 chmod +x "$tmp/bin/pgrep" "$tmp/bin/setsid"
-chmod +x "$tmp/bin/ps"
+chmod +x "$tmp/bin/ps" "$tmp/bin/ss"
 
 start=$(grep -n '^tunnel() {' "$script" | cut -d: -f1)
 end=$(grep -n '^china_tunnel_remove_legacy$' "$script" | cut -d: -f1)
@@ -215,6 +231,57 @@ if grep -Fq -- '-1234' "$kill_log"; then
 fi
 unset -f kill
 unset KILL_LOG PEER_GROUP_COMMANDS
+
+# Readiness accepts a listener only when its SSH child and grouped supervisor
+# both match the configured target and every lane forward.
+china_forwards=()
+for port in $(seq 18100 18103); do
+  china_forwards+=(-L "127.0.0.1:$port:127.0.0.1:8100")
+done
+printf '%s\n' \
+  'ssh -NT -L 127.0.0.1:18100:127.0.0.1:8100 -L 127.0.0.1:18101:127.0.0.1:8100 -L 127.0.0.1:18102:127.0.0.1:8100 -L 127.0.0.1:18103:127.0.0.1:8100 china-trainer' \
+  >"$tmp/tunnel-owner"
+printf '%s\n' \
+  'bash -c while true; do ssh -NT -L 127.0.0.1:18100:127.0.0.1:8100 -L 127.0.0.1:18101:127.0.0.1:8100 -L 127.0.0.1:18102:127.0.0.1:8100 -L 127.0.0.1:18103:127.0.0.1:8100 china-trainer; sleep 3; done # china-tunnel-lora-0' \
+  >"$tmp/tunnel-supervisor"
+: >"$tmp/tunnel-ss"
+for port in $(seq 18100 18103); do
+  printf 'LISTEN 0 128 127.0.0.1:%s 0.0.0.0:* users:(("ssh",pid=4242,fd=5))\n' "$port" >>"$tmp/tunnel-ss"
+done
+export TUNNEL_OWNER_PID=4242 TUNNEL_OWNER_PPID=4241 TUNNEL_SUPERVISOR_PID=4241 \
+  TUNNEL_OWNER_COMMAND="$tmp/tunnel-owner" TUNNEL_SUPERVISOR_COMMAND="$tmp/tunnel-supervisor" \
+  TUNNEL_SS_OUTPUT="$tmp/tunnel-ss"
+for port in $(seq 18100 18103); do
+  PATH="$tmp/bin:$PATH" tunnel_listener_ready "$port" china-tunnel-lora-0 china-trainer 4 "${china_forwards[@]}"
+done
+
+# A listener owned by the old orphan process is rejected when its target is wrong.
+printf '%s\n' \
+  'ssh -NT -L 127.0.0.1:18100:127.0.0.1:8100 wrong-trainer' \
+  >"$tmp/tunnel-owner"
+export TUNNEL_OWNER_PID=4242 TUNNEL_OWNER_PPID=1
+if PATH="$tmp/bin:$PATH" tunnel_listener_ready 18100 china-tunnel-lora-0 china-trainer 4 "${china_forwards[@]}"; then
+  echo "unrelated orphan listener was accepted" >&2
+  exit 1
+fi
+
+# An exact single-forward orphan is safe to remove, and reports a retry state.
+printf '%s\n' \
+  'ssh -NT -L 127.0.0.1:18100:127.0.0.1:8100 china-trainer' \
+  >"$tmp/tunnel-owner"
+orphan_kill_log="$tmp/orphan-kill"
+kill() { printf '%s\n' "$*" >"$orphan_kill_log"; return 0; }
+if PATH="$tmp/bin:$PATH" tunnel_listener_ready 18100 china-tunnel-lora-0 china-trainer 1 \
+    -L "127.0.0.1:18100:127.0.0.1:8100"; then
+  echo "orphan cleanup was reported ready" >&2
+  exit 1
+else
+  test "$?" -eq 2
+fi
+test "$(cat "$orphan_kill_log")" = 4242
+unset -f kill
+unset TUNNEL_OWNER_PID TUNNEL_OWNER_PPID TUNNEL_SUPERVISOR_PID \
+  TUNNEL_OWNER_COMMAND TUNNEL_SUPERVISOR_COMMAND TUNNEL_SS_OUTPUT
 
 cat >"$tmp/bin/ssh" <<'EOF'
 #!/usr/bin/env bash

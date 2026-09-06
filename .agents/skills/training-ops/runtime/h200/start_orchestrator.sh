@@ -395,6 +395,55 @@ peer_remote_ports_ready() {
   done
 }
 
+tunnel_command_has() {
+  local command_line=$1 token=$2
+  case " $command_line " in
+    *" $token "*|*" $token;"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+tunnel_listener_ready() {
+  local port=$1 marker=$2 target=$3 forward_count=$4
+  shift 4
+  local -a forwards=("$@")
+  local listener pid ppid owner_command supervisor_command forward forward_total
+  listener=$(ss -H -ltnp 2>/dev/null | awk -v port=":$port" '$4 ~ port "$" {print; exit}')
+  [ -n "$listener" ] || return 1
+  pid=$(sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' <<<"$listener")
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  owner_command=$(ps -o args= -p "$pid" 2>/dev/null || true)
+  ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+  if [ "$ppid" = 1 ]; then
+    forward_total=$(grep -o -- '-[LR] ' <<<"$owner_command" | wc -l)
+    if [ "$forward_total" -eq 1 ] && [ "$forward_count" -eq 1 ]; then
+      tunnel_command_has "$owner_command" ssh || return 1
+      tunnel_command_has "$owner_command" "$target" || return 1
+      tunnel_command_has "$owner_command" "${forwards[0]}" || return 1
+      if kill "$pid" 2>/dev/null; then
+        echo "removed unowned legacy SSH listener on port $port" >&2
+        return 2
+      fi
+    fi
+    return 1
+  fi
+  forward_total=$(grep -o -- '-[LR] ' <<<"$owner_command" | wc -l)
+  [ "$forward_total" -eq "$forward_count" ] || return 1
+  for forward in "${forwards[@]}"; do
+    tunnel_command_has "$owner_command" "$forward" || return 1
+  done
+  tunnel_command_has "$owner_command" ssh || return 1
+  supervisor_command=$(ps -o args= -p "$ppid" 2>/dev/null || true)
+  case "$supervisor_command" in *"while true; do"*) ;; *) return 1 ;; esac
+  tunnel_command_has "$supervisor_command" "$target" || return 1
+  tunnel_command_has "$supervisor_command" "# $marker" || return 1
+  forward_total=$(grep -o -- '-[LR] ' <<<"$supervisor_command" | wc -l)
+  [ "$forward_total" -eq "$forward_count" ] || return 1
+  for forward in "${forwards[@]}"; do
+    tunnel_command_has "$supervisor_command" "$forward" || return 1
+  done
+}
+
 china_tunnel_remove_legacy() {
   local only_marker=${1:-}
   local lora_source_port pattern pid command_line pgid group_command group_safe group_seen cleanup_port
@@ -550,23 +599,48 @@ fi
 peer_tunnel
 if [ "$tunnels_only" = 1 ]; then
   tunnels_ready=0
+  readiness_port=""
   for _ in $(seq 1 30); do
     tunnels_ready=1
     for port in "${lora_source_ports[@]}"; do
-      if ! ss -tln 2>/dev/null | grep -q "127.0.0.1:$port"; then
+      port_index=$((port - lora_source_ports[0]))
+      lane_number=$((port_index / china_lane_size))
+      lane_start=$((lane_number * china_lane_size))
+      lane_ports=("${lora_source_ports[@]:lane_start:china_lane_size}")
+      lane_forwards=()
+      for lane_port in "${lane_ports[@]}"; do
+        lane_forwards+=(
+          -L "127.0.0.1:$lane_port:127.0.0.1:$adapter_port"
+        )
+      done
+      listener_status=0
+      tunnel_listener_ready "$port" "china-tunnel-lora-$lane_number" \
+        "$trainer_ssh_target" "${#lane_ports[@]}" "${lane_forwards[@]}" || listener_status=$?
+      if [ "$listener_status" -ne 0 ]; then
         tunnels_ready=0
+        readiness_port=$port
         break
       fi
     done
-    if [ "$tunnels_ready" = 1 ] && [ "$peer_enabled" = 1 ] &&
-       ! ss -tln 2>/dev/null | grep -q "127.0.0.1:$peer_api_port"; then
-      tunnels_ready=0
+    if [ "$tunnels_ready" = 1 ] && [ "$peer_enabled" = 1 ]; then
+      listener_status=0
+      tunnel_listener_ready "$peer_api_port" peer-tunnel-api \
+        "$peer_ssh_user@$peer_host" 1 \
+        -L "127.0.0.1:$peer_api_port:127.0.0.1:8000" || listener_status=$?
+      if [ "$listener_status" -ne 0 ]; then
+        tunnels_ready=0
+        readiness_port=$peer_api_port
+      fi
     fi
     [ "$tunnels_ready" = 1 ] && break
     sleep 1
   done
   if [ "$tunnels_ready" != 1 ]; then
-    echo "adapter tunnel reconciliation did not establish all configured forwards" >&2
+    if [ -n "$readiness_port" ]; then
+      echo "adapter tunnel readiness failed for local port $readiness_port: listener owner is not the expected grouped SSH supervisor" >&2
+    else
+      echo "adapter tunnel reconciliation did not establish all configured forwards" >&2
+    fi
     exit 1
   fi
   remote_ready=1
