@@ -2,7 +2,7 @@ enable_lora = true
 router = "None"
 max_loras = 1
 max_cpu_loras = 2
-max_lora_rank = 128
+max_lora_rank = 32
 lora_target_modules = [
     "q_a_proj",
     "q_b_proj",
