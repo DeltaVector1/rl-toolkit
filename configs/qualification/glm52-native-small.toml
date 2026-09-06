@@ -1,9 +1,10 @@
 output_dir = "/data/glm52-rl/qualifications/glm52-native-small"
-max_steps = 2
+max_steps = 1
 dist_timeout_seconds = 5400
 enable_router_replay = false
 [env_vars]
 PRIME_PROFILE_PP_STAGE = "1"
+PRIME_PROFILE_PP_RANK = "8"
 PRIME_LORA_MM_PROFILE = "sm89-r32"
 
 [data.fake]

@@ -2053,7 +2053,7 @@ def train(config: TrainerConfig):
                 logger.info(
                     "PP CUDA profile:\n"
                     + schedule_profiler.key_averages().table(
-                        sort_by="self_cpu_time_total", row_limit=40
+                        sort_by="self_device_time_total", row_limit=40
                     )
                 )
             local_schedule_ms = 0.0
