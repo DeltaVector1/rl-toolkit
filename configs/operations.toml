@@ -52,7 +52,7 @@ glm52 = "/models/glm52-fp8"
 gpu_count = 8
 tensor_parallel_size = 8
 data_parallel_size = 1
-mtp_tokens = 0
+mtp_tokens = 1
 ports = [8000]
 
 [inference.h200b]

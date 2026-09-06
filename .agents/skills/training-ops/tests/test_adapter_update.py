@@ -56,7 +56,10 @@ class AdapterUpdateTest(unittest.TestCase):
         self.assertEqual(b.returncode, 0, b.stderr)
         a_extra = json.loads(a.stdout.splitlines()[-1])
         b_extra = json.loads(b.stdout.splitlines()[-1])
-        self.assertNotIn("speculative_config", a_extra)
+        self.assertEqual(
+            a_extra["speculative_config"],
+            {"method": "mtp", "num_speculative_tokens": 1},
+        )
         self.assertEqual(
             b_extra["speculative_config"],
             {"method": "mtp", "num_speculative_tokens": 1},
@@ -68,12 +71,12 @@ class AdapterUpdateTest(unittest.TestCase):
         self.assertLess(launcher.index("runtime_output=$(python3"), launcher.index("docker update"))
 
         invalid_configs = (
-            operations.replace("mtp_tokens = 0\n", "", 1),
-            operations.replace("mtp_tokens = 0", "mtp_tokens = true", 1),
+            operations.replace("mtp_tokens = 1\nports = [8000]", "ports = [8000]", 1),
+            operations.replace("mtp_tokens = 1", "mtp_tokens = true", 1),
             operations.replace("mtp_tokens = 1", "mtp_tokens = -1", 1),
         )
         for config_text in invalid_configs:
-            result = read_settings("h200a" if "mtp_tokens = -1" not in config_text else "h200b", config_text)
+            result = read_settings("h200a", config_text)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("mtp_tokens", result.stderr)
 
