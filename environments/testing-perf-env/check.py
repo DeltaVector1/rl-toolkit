@@ -113,6 +113,15 @@ def make_trace(task: TestingPerfTask, answers: list[str]) -> vf.Trace:
 
 async def run() -> None:
     with open(
+        os.path.join(check_dir, "..", "..", "configs", "operations.toml"), "rb"
+    ) as stream:
+        operations_config = tomllib.load(stream)
+    profiles = operations_config["profiles"]
+    assert profiles["current"]["orchestrator_image"] == "prime-rl:glm52-decensor"
+    assert profiles["testing-perf"]["orchestrator_image"] == (
+        "prime-rl:glm52-v080-glm52-h200-router"
+    )
+    with open(
         os.path.join(
             check_dir, "..", "..", "configs", "testing-perf", "orchestrator.toml"
         ),

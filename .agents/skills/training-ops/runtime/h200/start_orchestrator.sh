@@ -10,8 +10,46 @@ TRAINER_ADDRESSES=${TRAINER_ADDRESSES:?set TRAINER_ADDRESSES}
 TRAINER_CT=${TRAINER_CT:?set TRAINER_CT}
 ORCH_CT=${ORCH_CT:?set ORCH_CT}
 deployment=/data/glm52-rl/deployment
-image=prime-rl:glm52-decensor
 config_file=${ORCH_CONFIG:-$deployment/configs/current/orchestrator.toml}
+operations_file="$deployment/configs/operations.toml"
+if ! image=$(python3 - "$operations_file" "$config_file" <<'PY'
+import os
+import sys
+import tomllib
+
+operations_path, config_path = sys.argv[1:]
+with open(operations_path, "rb") as stream:
+    operations = tomllib.load(stream)
+repository_root = os.path.dirname(os.path.dirname(operations_path))
+if not os.path.isabs(config_path):
+    config_path = os.path.join(repository_root, config_path)
+selected = os.path.realpath(config_path)
+matches = []
+for name, profile in operations.get("profiles", {}).items():
+    if not isinstance(profile, dict):
+        continue
+    configured = profile.get("orchestrator")
+    if not isinstance(configured, str):
+        continue
+    candidate = os.path.realpath(os.path.join(repository_root, configured))
+    if candidate == selected:
+        matches.append((name, profile))
+if len(matches) != 1:
+    raise SystemExit(f"orchestrator config must select one operations profile: {config_path}")
+profile_name, profile = matches[0]
+value = profile.get("orchestrator_image")
+if not isinstance(value, str) or not value.strip():
+    raise SystemExit(f"operations profile {profile_name!r} has no orchestrator_image")
+print(value)
+PY
+); then
+  echo "cannot select an orchestrator image from operations profile" >&2
+  exit 2
+fi
+if [ -z "$image" ]; then
+  echo "operations profile selected an empty orchestrator image" >&2
+  exit 2
+fi
 readarray -t lora_source_ports < <(python3 - "$deployment/configs/operations.toml" <<'PY'
 import sys
 import tomllib
@@ -47,7 +85,6 @@ if [ -z "$adapter_port" ]; then
   echo "operations config has no adapter port" >&2
   exit 2
 fi
-operations_file="$deployment/configs/operations.toml"
 if ! relay_settings=$(python3 - "$operations_file" "$config_file" <<'PY'
 import sys
 import tomllib
