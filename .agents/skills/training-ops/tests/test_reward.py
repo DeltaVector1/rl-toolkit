@@ -1,7 +1,12 @@
 import json
+import subprocess
 import sys
+import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -45,6 +50,156 @@ class ActiveRewardRowsTest(unittest.TestCase):
         self.assertEqual([row["step"] for row in selected], [2])
         self.assertEqual(excluded, 0)
         self.assertEqual(without_time, 1)
+
+
+class ParityReaderTest(unittest.TestCase):
+    def run_reader(self, record):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "parity.json"
+            path.write_text(json.dumps(record), encoding="utf-8")
+            result = subprocess.run(
+                ["bash", "-c", training_ops._parity_reader_script(str(path))],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        return result
+
+    def valid_record(self):
+        return {
+            "sequence_lengths": [2, 1],
+            "position_ids": [0, 1, 0],
+            "loss_mask": [True, False, True],
+            "delta": [0.1, 0.2, -0.1],
+            "trainer_logprobs": [-1.0, -2.0, -3.0],
+            "reference_logprobs": [-1.1, -2.2, -2.9],
+        }
+
+    def test_reader_reports_record_and_selected_tokens(self):
+        result = self.run_reader(self.valid_record())
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["record_tokens"], 3)
+        self.assertEqual(report["selected_tokens"], 2)
+        self.assertAlmostEqual(report["loss_mask_excluded_fraction"], 1 / 3)
+        self.assertNotIn("masked_fraction", report)
+
+    def test_reader_rejects_invalid_arrays_and_empty_selection(self):
+        cases = []
+        mismatched = self.valid_record()
+        mismatched["delta"] = [0.1]
+        cases.append(mismatched)
+        for value in (None, float("nan"), float("inf"), float("-inf")):
+            nonfinite = self.valid_record()
+            nonfinite["delta"][0] = value
+            cases.append(nonfinite)
+        empty = self.valid_record()
+        empty["loss_mask"] = [False, False, False]
+        cases.append(empty)
+        overflow = self.valid_record()
+        overflow["delta"][0] = 1000.0
+        overflow["trainer_logprobs"][0] = -1.0
+        overflow["reference_logprobs"][0] = -1001.0
+        inconsistent = self.valid_record()
+        inconsistent["delta"][0] = 0.5
+        cases.append(inconsistent)
+
+        for record in cases:
+            result = self.run_reader(record)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("invalid parity record", result.stderr)
+
+        result = self.run_reader(overflow)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("K3 proxy overflow", result.stderr)
+
+        result = self.run_reader([])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("top-level JSON must be an object", result.stderr)
+
+    def test_parity_uses_configured_direct_record(self):
+        calls = []
+
+        def fake_ssh(host, script, timeout=180):
+            calls.append(script)
+            if script.startswith("python3 - "):
+                return 0, json.dumps({"record_tokens": 3, "selected_tokens": 2})
+            if "direct-parity.json" in script:
+                return 0, "PARITY 100.0 /data/glm52-rl/qualifications/glm52-fixed-token/direct-parity.json\n"
+            raise AssertionError("unexpected parity probe")
+
+        def fake_fan(hosts, function, workers=None):
+            host = hosts[0]
+            return {host: function(host)}
+
+        with (
+            mock.patch.object(training_ops, "_profile_for_run", return_value={"trainer": "configs/qualification/glm52-fixed-token.toml"}),
+            mock.patch.object(training_ops, "_fan", side_effect=fake_fan),
+            mock.patch.object(training_ops, "_ssh", side_effect=fake_ssh),
+            redirect_stdout(StringIO()),
+        ):
+            report = training_ops.parity("glm-perf-1")
+
+        self.assertEqual(report["source"], "configured")
+        self.assertIn("-maxdepth 0", calls[0])
+        self.assertIn("/data/glm52-rl/qualifications/glm52-fixed-token/direct-parity.json", calls[0])
+        self.assertNotIn("parity-step", calls[0])
+
+    def test_parity_uses_configured_full_run_records(self):
+        calls = []
+
+        def fake_ssh(host, script, timeout=180):
+            calls.append(script)
+            if script.startswith("python3 - "):
+                return 0, json.dumps({"record_tokens": 3, "selected_tokens": 2})
+            if "parity-step" in script:
+                return 0, "PARITY 100.0 /data/glm52-rl/runs/glm-perf-1/parity-step20.json\n"
+            raise AssertionError("unexpected parity probe")
+
+        def fake_fan(hosts, function, workers=None):
+            host = hosts[0]
+            return {host: function(host)}
+
+        with (
+            mock.patch.object(training_ops, "_profile_for_run", return_value={"trainer": "configs/testing-perf/trainer.toml", "orchestrator": "configs/testing-perf/orchestrator.toml"}),
+            mock.patch.object(training_ops, "_fan", side_effect=fake_fan),
+            mock.patch.object(training_ops, "_ssh", side_effect=fake_ssh),
+            redirect_stdout(StringIO()),
+        ):
+            report = training_ops.parity("glm-perf-1")
+
+        self.assertEqual(report["source"], "configured")
+        self.assertIn("/data/glm52-rl/runs/glm-perf-1", calls[0])
+        self.assertIn("parity-step*.json", calls[0])
+        self.assertNotIn("direct-parity.json", calls[0])
+
+    def test_parity_uses_archive_search_without_profile(self):
+        calls = []
+
+        def fake_ssh(host, script, timeout=180):
+            calls.append(script)
+            if script.startswith("python3 - "):
+                return 0, json.dumps({"record_tokens": 3, "selected_tokens": 2})
+            if "parity-step" in script:
+                return 0, "PARITY 100.0 /data/glm52-rl/runs/archived/parity-step1.json\n"
+            raise AssertionError("unexpected parity probe")
+
+        def fake_fan(hosts, function, workers=None):
+            host = hosts[0]
+            return {host: function(host)}
+
+        with (
+            mock.patch.object(training_ops, "_profile_for_run", return_value=None),
+            mock.patch.object(training_ops, "_fan", side_effect=fake_fan),
+            mock.patch.object(training_ops, "_ssh", side_effect=fake_ssh),
+            redirect_stdout(StringIO()),
+        ):
+            report = training_ops.parity("archived")
+
+        self.assertEqual(report["source"], "archive")
+        self.assertIn("/data/glm52-rl/runs/archived", calls[0])
+        self.assertIn("parity-step*.json", calls[0])
 
 
 class ActiveMetricRowsTest(unittest.TestCase):

@@ -159,7 +159,7 @@ def _profile(name: str = "current") -> dict:
     return profile
 
 
-def _profile_for_run(run: str) -> dict:
+def _profile_for_run(run: str, required: bool = True) -> dict | None:
     """Select the configured trainer profile whose output matches the run."""
     if not isinstance(run, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", run):
         raise Refused(f"active run name is invalid: {run!r}")
@@ -173,8 +173,12 @@ def _profile_for_run(run: str) -> dict:
         except (OSError, tomllib.TOMLDecodeError) as error:
             raise RuntimeError(f"cannot read trainer config {trainer_path}: {error}") from error
         output_dir = config.get("output_dir")
-        if isinstance(output_dir, str) and Path(output_dir).name == run:
+        if not isinstance(output_dir, str) or not output_dir:
+            raise RuntimeError(f"trainer config {trainer_path} has no output_dir")
+        if Path(output_dir).name == run:
             matches.append((name, profile))
+    if not matches and not required:
+        return None
     if not matches:
         raise Refused(
             f"no configured trainer profile has output_dir ending in {run!r}"
@@ -1414,15 +1418,134 @@ def logs(role: str = "trainer", lines: int = 200) -> str:
     return output
 
 
+def _parity_reader_script(path: str) -> str:
+    return """python3 - """ + shlex.quote(path) + r""" <<'PY'
+import hashlib,json,math,sys
+
+path=sys.argv[1]
+try:
+    with open(path,'rb') as stream:
+        raw=stream.read()
+except OSError as error:
+    raise SystemExit(f"invalid parity record: cannot read file: {error}")
+try:
+    data=json.loads(raw)
+except (TypeError,ValueError) as error:
+    raise SystemExit(f"invalid parity record: invalid JSON: {error}")
+if not isinstance(data,dict):
+    raise SystemExit('invalid parity record: top-level JSON must be an object')
+
+def fail(message):
+    raise SystemExit(f"invalid parity record: {message}")
+
+lengths=data.get('sequence_lengths')
+if (not isinstance(lengths,list) or not lengths or
+    any(type(length) is not int or length <= 0 for length in lengths)):
+    fail('sequence_lengths must contain positive integers')
+record_tokens=sum(lengths)
+
+def array(name):
+    values=data.get(name)
+    if not isinstance(values,list) or len(values) != record_tokens:
+        fail(f"{name} length must equal record token count {record_tokens}")
+    return values
+
+positions=array('position_ids')
+if any(type(value) is not int for value in positions):
+    fail('position_ids must contain integers')
+mask=array('loss_mask')
+if any(type(value) is not bool for value in mask):
+    fail('loss_mask must contain booleans')
+
+def finite_array(name):
+    values=array(name)
+    if any(
+        isinstance(value,bool) or not isinstance(value,(int,float)) or
+        not math.isfinite(float(value)) for value in values
+    ):
+        fail(f'{name} must contain finite numbers')
+    return values
+
+delta=finite_array('delta')
+trainer=finite_array('trainer_logprobs')
+reference=finite_array('reference_logprobs')
+if any(
+    not math.isclose(actual, predicted - baseline, rel_tol=1e-6, abs_tol=1e-6)
+    for actual, predicted, baseline in zip(delta, trainer, reference)
+):
+    fail('delta must equal trainer_logprobs - reference_logprobs')
+valid=[value for value,keep in zip(delta,mask) if keep]
+valid_trainer=[value for value,keep in zip(trainer,mask) if keep]
+valid_reference=[value for value,keep in zip(reference,mask) if keep]
+if not valid:
+    fail('loss_mask selects no tokens')
+ordered=sorted(abs(value) for value in valid)
+try:
+    proxy=math.fsum(math.expm1(value)-value for value in valid)/len(valid)
+except (OverflowError,ValueError) as error:
+    fail(f'K3 proxy overflow: {error}')
+if not math.isfinite(proxy):
+    fail('K3 proxy is not finite')
+expected=[]
+for length in lengths:
+    expected.extend(range(length))
+out={
+  'sha256':hashlib.sha256(raw).hexdigest(),
+  'record_tokens':record_tokens,
+  'sequences':len(lengths),
+  'selected_tokens':len(valid),
+  'loss_mask_excluded_fraction':1.0-len(valid)/record_tokens,
+  'position_mismatches':sum(a!=b for a,b in zip(positions,expected)),
+  'mean_abs_delta':sum(abs(value) for value in valid)/len(valid),
+  'mean_delta':sum(valid)/len(valid),
+  'mean_trainer_logprob':sum(valid_trainer)/len(valid_trainer),
+  'mean_reference_logprob':sum(valid_reference)/len(valid_reference),
+  'p95_abs_delta':ordered[min(int(0.95*len(ordered)),len(ordered)-1)],
+  'max_abs_delta':max(ordered),
+  'mismatch_kl_proxy':proxy,
+}
+print(json.dumps(out,sort_keys=True))
+PY
+"""
+
+
 def parity(run: str = "") -> dict:
     """Summarize the newest token parity record on configured trainer hosts."""
+    explicit_run = bool(run)
     run = run or current_run()
     if not re.fullmatch(r"[A-Za-z0-9_-]+", run):
         raise Refused("run name contains invalid characters")
-    run_path = f"{run_root}/{run}"
+    profile = _profile_for_run(run, required=not explicit_run)
+    if profile is None:
+        source = "archive"
+        find_path = f"{run_root}/{run}"
+        find_options = "-maxdepth 4 -type f -name 'parity-step*.json'"
+    else:
+        source = "configured"
+        trainer_path = repo_root / profile["trainer"]
+        try:
+            with trainer_path.open("rb") as stream:
+                trainer_config = tomllib.load(stream)
+        except (OSError, tomllib.TOMLDecodeError) as error:
+            raise RuntimeError(f"cannot read trainer config {trainer_path}: {error}") from error
+        output_dir = trainer_config.get("output_dir")
+        if not isinstance(output_dir, str) or not output_dir:
+            raise RuntimeError(f"trainer config {trainer_path} has no output_dir")
+        data_config = trainer_config.get("data", {})
+        fake_config = data_config.get("fake", {}) if isinstance(data_config, dict) else {}
+        trainer_only = (
+            profile.get("orchestrator") is None
+            and isinstance(fake_config, dict)
+            and isinstance(fake_config.get("reference_path"), str)
+        )
+        if trainer_only:
+            find_path = output_dir.rstrip("/") + "/direct-parity.json"
+            find_options = "-maxdepth 0 -type f"
+        else:
+            find_path = output_dir
+            find_options = "-maxdepth 4 -type f -name 'parity-step*.json'"
     find_script = f"""
-candidate=$(find {shlex.quote(run_path)} -maxdepth 4 -type f -name 'parity-step*.json' \\
-  -printf '%T@ %p\\n' 2>/dev/null | sort -nr | head -1)
+candidate=$(find {shlex.quote(find_path)} {find_options} -printf '%T@ %p\\n' 2>/dev/null | sort -nr | head -1)
 if [ -n \"$candidate\" ]; then
   printf 'PARITY %s\\n' \"$candidate\"
 else
@@ -1450,56 +1573,18 @@ fi
             "unavailable_hosts": unavailable,
         }
     _, parity_host, path = max(candidates, key=lambda item: item[0])
-    script = f"""
-python3 - {shlex.quote(path)} <<'PY'
-import hashlib,json,math,sys
-p=sys.argv[1]
-try:
-    raw=open(p,'rb').read()
-except FileNotFoundError:
-    raise SystemExit(3)
-d=json.loads(raw)
-lengths=d['sequence_lengths']
-expected=[]
-for length in lengths:
-    expected.extend(range(length))
-positions=d['position_ids']
-mask=d['loss_mask']
-delta=d['delta']
-trainer=d['trainer_logprobs']
-reference=d['reference_logprobs']
-valid=[x for x,keep in zip(delta,mask) if keep]
-valid_trainer=[x for x,keep in zip(trainer,mask) if keep]
-valid_reference=[x for x,keep in zip(reference,mask) if keep]
-ordered=sorted(abs(x) for x in valid)
-proxy=sum(math.exp(min(x,80.0))-x-1.0 for x in valid)/max(len(valid),1)
-out={{
-  'sha256':hashlib.sha256(raw).hexdigest(),
-  'tokens':len(delta),
-  'sequences':len(lengths),
-  'valid_tokens':len(valid),
-  'masked_fraction':1.0-len(valid)/max(len(delta),1),
-  'position_mismatches':sum(a!=b for a,b in zip(positions,expected)) + abs(len(positions)-len(expected)),
-  'mean_abs_delta':sum(abs(x) for x in valid)/max(len(valid),1),
-  'mean_delta':sum(valid)/max(len(valid),1),
-  'mean_trainer_logprob':sum(valid_trainer)/max(len(valid_trainer),1),
-  'mean_reference_logprob':sum(valid_reference)/max(len(valid_reference),1),
-  'p95_abs_delta':ordered[min(int(0.95*len(ordered)),len(ordered)-1)] if ordered else 0.0,
-  'max_abs_delta':max(ordered,default=0.0),
-  'mismatch_kl_proxy':proxy,
-}}
-print(json.dumps(out,sort_keys=True))
-PY
-"""
+    script = _parity_reader_script(path)
     code, output = _ssh(parity_host, script, timeout=180)
     if code:
-        raise RuntimeError(f"cannot read parity record {path} on {parity_host}")
+        detail = output.strip().splitlines()[-1] if output.strip() else "reader failed"
+        raise RuntimeError(f"cannot read parity record {path} on {parity_host}: {detail}")
     try:
         summary = json.loads(output.strip().splitlines()[-1])
     except (ValueError, IndexError) as error:
         raise RuntimeError(f"parity record {path} is invalid") from error
     summary["run"] = run
     summary["available"] = True
+    summary["source"] = source
     summary["path"] = path
     summary["host"] = parity_host
     summary["unavailable_hosts"] = unavailable
