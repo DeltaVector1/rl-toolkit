@@ -23,8 +23,12 @@ remote() {
 # Use parallel streams for material batches on the WAN path.
 parallel_threshold=${PARALLEL_THRESHOLD:-16777216}
 parallel_streams=${PARALLEL_STREAMS:-16}
+parallel_active_limit=${parallel_active_limit:-16}
 stripe_io_timeout=${STRIPE_IO_TIMEOUT:-60}
 stripe_attempt_timeout=${STRIPE_ATTEMPT_TIMEOUT:-90}
+case "$parallel_active_limit" in
+  ''|*[!0-9]*|0) echo "parallel_active_limit must be a positive integer" >&2; exit 2 ;;
+esac
 # Spread SSH handshakes across four seconds.
 parallel_launch_delay=${PARALLEL_LAUNCH_DELAY:-0.25}
 copy_parallel() {
@@ -46,30 +50,41 @@ copy_parallel() {
   fi
   expected_sizes=$(find "$parts_dir" -maxdepth 1 -type f -name 'part-*' -printf '%f %s\n' | sort)
 
-  status=1
   for attempt in 1 2 3; do
     if ! remote "find '$remote_parts' -maxdepth 1 -type f -name 'part-*' -printf '%f %s\\n'" \
       >"$parts_dir/remote-sizes"; then
-      : >"$parts_dir/remote-sizes"
+      echo "parallel transfer attempt $attempt cannot read remote part sizes for $source" >&2
+      status=1
+      continue
     fi
     pids=()
+    status=0
     for part in "$parts_dir"/part-*; do
       part_name=$(basename "$part")
       part_size=$(stat -c %s "$part")
       if grep -qx "$part_name $part_size" "$parts_dir/remote-sizes"; then
         continue
       fi
+      while [ "${#pids[@]}" -ge "$parallel_active_limit" ]; do
+        if ! wait "${pids[0]}"; then
+          status=1
+        fi
+        pids=("${pids[@]:1}")
+      done
       timeout --signal=TERM --kill-after=10 "$stripe_attempt_timeout" \
         rsync -az --partial --append-verify --timeout="$stripe_io_timeout" \
         -e "ssh ${ssh_opts[*]}" "$part" "$dest_host:$remote_parts/$part_name" &
       pids+=("$!")
       sleep "$parallel_launch_delay"
     done
-    status=0
     for pid in "${pids[@]}"; do
       wait "$pid" || status=1
     done
-    remote_sizes=$(remote "find '$remote_parts' -maxdepth 1 -type f -name 'part-*' -printf '%f %s\\n' | sort" || true)
+    if ! remote_sizes=$(remote "find '$remote_parts' -maxdepth 1 -type f -name 'part-*' -printf '%f %s\\n' | sort"); then
+      echo "parallel transfer attempt $attempt cannot verify remote part sizes for $source" >&2
+      status=1
+      continue
+    fi
     if [ "$status" = 0 ] && [ "$remote_sizes" = "$expected_sizes" ]; then
       status=0
       break

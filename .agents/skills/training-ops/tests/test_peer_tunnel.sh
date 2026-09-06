@@ -30,7 +30,7 @@ EOF
 chmod +x "$tmp/bin/pgrep" "$tmp/bin/setsid"
 
 start=$(grep -n '^tunnel() {' "$script" | cut -d: -f1)
-end=$(grep -n '^for lora_source_port in' "$script" | cut -d: -f1)
+end=$(grep -n '^china_tunnel_remove_legacy$' "$script" | cut -d: -f1)
 source <(sed -n "${start},$((end - 1))p" "$script")
 
 lora_source_ports=()
@@ -77,4 +77,38 @@ done < <(grep -F -- '-R 127.0.0.1:' "$log")
 # A second launcher invocation finds the exact API and lane signatures.
 PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$log" peer_tunnel
 test "$(wc -l <"$log")" -eq 25
+
+china_log="$tmp/china-tunnel.log"
+trainer_ssh_target=china-trainer
+adapter_port=8100
+PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$china_log" china_tunnel_remove_legacy
+china_lane_size=4
+china_lane_start=0
+china_lane_number=0
+china_lane_ports=()
+china_lane_forwards=()
+while [ "$china_lane_start" -lt "${#lora_source_ports[@]}" ]; do
+  china_lane_ports=("${lora_source_ports[@]:china_lane_start:china_lane_size}")
+  china_lane_forwards=()
+  for lora_source_port in "${china_lane_ports[@]}"; do
+    china_lane_forwards+=(
+      -L "127.0.0.1:$lora_source_port:127.0.0.1:$adapter_port"
+    )
+  done
+  PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$china_log" china_tunnel_connection "lora-$china_lane_number" \
+    "-L 127.0.0.1:${china_lane_ports[0]}:127.0.0.1:$adapter_port" \
+    "${china_lane_forwards[@]}"
+  china_lane_start=$((china_lane_start + china_lane_size))
+  china_lane_number=$((china_lane_number + 1))
+done
+for _ in $(seq 1 50); do
+  [ -f "$china_log" ] && [ "$(wc -l <"$china_log")" -eq 24 ] && break
+  sleep 0.1
+done
+test "$(wc -l <"$china_log")" -eq 24
+while IFS= read -r line; do
+  forward_count=$(grep -o -- '-L 127.0.0.1:' <<<"$line" | wc -l)
+  test "$forward_count" -le 4
+  grep -Fq -- '-o ExitOnForwardFailure=yes' <<<"$line"
+done <"$china_log"
 printf 'peer tunnel uses one API connection and twenty-four bounded self-healing lanes\n'

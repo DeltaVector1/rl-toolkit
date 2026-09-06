@@ -333,6 +333,69 @@ peer_tunnel_remove_legacy() {
   done
 }
 
+china_tunnel_remove_legacy() {
+  local lora_source_port pattern pid command_line pgid group_command group_safe group_seen
+  for lora_source_port in "${lora_source_ports[@]}"; do
+    pattern="-L 127.0.0.1:$lora_source_port:127.0.0.1:$adapter_port"
+    for pid in $(pgrep -f -- "$pattern" || true); do
+      command_line=$(ps -o args= -p "$pid" 2>/dev/null || true)
+      case "$command_line" in
+        *"while true; do"*"$pattern"*"$trainer_ssh_target"*)
+          case "$command_line" in *china-tunnel-*) continue ;; esac
+          pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
+          case "$pgid" in
+            ''|*[!0-9]*|0|1|"$$") kill "$pid" 2>/dev/null || true ;;
+            *)
+              group_safe=1
+              group_seen=0
+              while IFS= read -r group_command; do
+                group_seen=1
+                case "$group_command" in
+                  *"$pattern"*"$trainer_ssh_target"*|*"sleep 3"*) ;;
+                  *) group_safe=0; break ;;
+                esac
+              done < <(ps -eo pgid=,args= | awk -v group="$pgid" '$1 == group {sub(/^[^ ]+ +/, ""); print}')
+              if [ "$group_safe" = 1 ] && [ "$group_seen" = 1 ]; then
+                kill -- "-$pgid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+              else
+                kill "$pid" 2>/dev/null || true
+              fi
+              ;;
+          esac
+          ;;
+      esac
+    done
+  done
+}
+
+china_tunnel_connection() {
+  local connection_name=$1 signature=$2
+  shift 2
+  local -a forwards=("$@")
+  pgrep -f -- "china-tunnel-$connection_name" >/dev/null && return 0
+
+  local -a ssh_args=(
+    -NT
+    -o BatchMode=yes
+    -o ConnectTimeout=30
+    -o ExitOnForwardFailure=yes
+    -o ServerAliveInterval=10
+    -o ServerAliveCountMax=3
+    -o TCPKeepAlive=yes
+    -o IPQoS=none
+    -o Compression=no
+  )
+  local forward_text ssh_text target marker
+  forward_text=$(printf ' %q' "${forwards[@]}")
+  ssh_text=$(printf ' %q' "${ssh_args[@]}")
+  target=$(printf '%q' "$trainer_ssh_target")
+  marker="china-tunnel-$connection_name"
+  setsid nohup bash -c "while true; do
+      ssh$ssh_text$forward_text $target
+      sleep 3
+    done # $marker" >/dev/null 2>&1 < /dev/null &
+}
+
 peer_tunnel() {
   peer_tunnel_remove_legacy "$peer_enabled"
   [ "$peer_enabled" = 1 ] || return 0
@@ -362,9 +425,28 @@ peer_tunnel() {
   echo "peer tunnel :$peer_api_port -> $peer_name:8000; adapter source reverse ports ${lora_source_ports[0]}-${lora_source_ports[-1]} in $lane_number SSH lanes"
 }
 
-for lora_source_port in "${lora_source_ports[@]}"; do
-  tunnel "$lora_source_port" "127.0.0.1:$adapter_port" "$trainer_ssh_target" no
+china_tunnel_remove_legacy
+china_lane_size=${china_lane_size:-4}
+case "$china_lane_size" in
+  ''|*[!0-9]*|0) echo "china_lane_size must be a positive integer" >&2; exit 2 ;;
+esac
+china_lane_start=0 china_lane_number=0
+china_lane_ports=() china_lane_forwards=()
+while [ "$china_lane_start" -lt "${#lora_source_ports[@]}" ]; do
+  china_lane_ports=("${lora_source_ports[@]:china_lane_start:china_lane_size}")
+  china_lane_forwards=()
+  for lora_source_port in "${china_lane_ports[@]}"; do
+    china_lane_forwards+=(
+      -L "127.0.0.1:$lora_source_port:127.0.0.1:$adapter_port"
+    )
+  done
+  china_tunnel_connection "lora-$china_lane_number" \
+    "-L 127.0.0.1:${china_lane_ports[0]}:127.0.0.1:$adapter_port" \
+    "${china_lane_forwards[@]}"
+  china_lane_start=$((china_lane_start + china_lane_size))
+  china_lane_number=$((china_lane_number + 1))
 done
+echo "China adapter forwards ${lora_source_ports[0]}-${lora_source_ports[-1]} in $china_lane_number SSH lanes"
 peer_tunnel
 ports=("${lora_source_ports[@]}")
 if [ "$peer_enabled" = 1 ]; then
