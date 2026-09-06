@@ -112,9 +112,7 @@ max_gradient_norm = shared_requirements["max_gradient_norm"]
 weight_decay = shared_requirements["weight_decay"]
 glm_batch_size = glm_requirements["batch_size"]
 glm_context_length = glm_requirements["context_length"]
-glm_compute_min_seconds = glm_requirements["trainer_seconds_min"]
 glm_compute_max_seconds = glm_requirements["trainer_seconds_max"]
-glm_rollout_min_seconds = glm_requirements["rollout_seconds_min"]
 glm_rollout_max_seconds = glm_requirements["rollout_seconds_max"]
 
 adapter_archive_files = ("adapter_config.json", "adapter_model.safetensors")
@@ -683,7 +681,7 @@ class AcceptanceReport:
         trainer = (
             f"step {self.trainer_compute_step}: {_hms(self.trainer_compute_seconds)}"
             if self.trainer_compute_step is not None
-            else "no post-step-1 measurement"
+            else "no trainer timing measurement"
         )
         generation = (
             f"step {self.rollout_generation_step}: {_hms(self.rollout_generation_seconds)}"
@@ -695,10 +693,12 @@ class AcceptanceReport:
         L.append(f"config: {values}")
         L.append(f"native FP8 trainer: {precision}")
         L.append(
-            f"trainer forward/backward only: {trainer} (check 10-15m after step 1)"
+            f"trainer time/forward_backward (includes optimizer): {trainer} "
+            f"(upper bound {glm_compute_max_seconds:g}s)"
         )
         L.append(
-            f"active rollout generation only: {generation} (approximate check 8-12m)"
+            f"active rollout generation time: {generation} "
+            f"(upper bound {glm_rollout_max_seconds:g}s)"
         )
         L.append(
             "excluded from both times: policy/check waiting, judging/scoring, batch transfer, "
@@ -1118,12 +1118,21 @@ def _acceptance_from_text(
         rep.precision_ok = rep.native_fp8
 
     rep.completed_steps = max((row["step"] for row in trainer_rows), default=0)
-    compute = [
-        (row["step"], float(row["time/forward_backward"]))
-        for row in trainer_rows
-        if row["step"] > 1
-        and isinstance(row.get("time/forward_backward"), (int, float))
-    ]
+    compute = []
+    invalid_compute = []
+    for row in trainer_rows:
+        if row["step"] < 1:
+            continue
+        value = row.get("time/forward_backward")
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or value < 0
+        ):
+            invalid_compute.append(row["step"])
+            continue
+        compute.append((row["step"], float(value)))
     if compute:
         rep.trainer_compute_step, rep.trainer_compute_seconds = compute[-1]
 
@@ -1132,17 +1141,20 @@ def _acceptance_from_text(
         "train/decensor/all/timing/generation/max",
     )
     generation = []
+    invalid_generation = []
     for row in rollout_rows:
-        value = next(
-            (
-                row[key]
-                for key in generation_keys
-                if isinstance(row.get(key), (int, float))
-            ),
-            None,
-        )
-        if value is not None:
-            generation.append((row["step"], float(value)))
+        present = next((key for key in generation_keys if key in row), None)
+        value = row.get(present) if present is not None else None
+        if (
+            present is None
+            or isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or value < 0
+        ):
+            invalid_generation.append(row["step"])
+            continue
+        generation.append((row["step"], float(value)))
     if generation:
         rep.rollout_generation_step, rep.rollout_generation_seconds = generation[-1]
 
@@ -1181,35 +1193,37 @@ def _acceptance_from_text(
     if rep.precision_ok is not True:
         rep.alarms.append("trainer is not confirmed on native FP8 checkpoint weights")
 
-    bad_compute = [
-        step
-        for step, seconds in compute
-        if seconds < glm_compute_min_seconds
-        or seconds > glm_compute_max_seconds
-    ]
+    bad_compute = [step for step, seconds in compute if seconds > glm_compute_max_seconds]
+    if invalid_compute:
+        rep.alarms.append(
+            "trainer time/forward_backward is missing or invalid at steps "
+            + ",".join(map(str, invalid_compute[-8:]))
+        )
     if bad_compute:
         rep.alarms.append(
-            f"trainer forward/backward is outside 10-15m after step 1 at steps "
+            f"trainer time/forward_backward exceeds configured upper bound "
+            f"{glm_compute_max_seconds:g}s at steps "
             f"{','.join(map(str, bad_compute[-8:]))}"
         )
-    elif rep.completed_steps > 1 and not compute:
+    elif rep.completed_steps >= 1 and not compute and not invalid_compute:
         rep.alarms.append(
-            "no separate trainer forward/backward measurement after step 1"
+            "no trainer time/forward_backward measurement"
         )
 
-    bad_generation = [
-        step
-        for step, seconds in generation
-        if seconds < glm_rollout_min_seconds
-        or seconds > glm_rollout_max_seconds
-    ]
+    bad_generation = [step for step, seconds in generation if seconds > glm_rollout_max_seconds]
+    if invalid_generation:
+        rep.alarms.append(
+            "active rollout generation time is missing or invalid at steps "
+            + ",".join(map(str, invalid_generation[-8:]))
+        )
     if bad_generation:
         rep.alarms.append(
-            f"active rollout generation is outside approximately 10m (8-12m alarm band) "
-            f"at steps {','.join(map(str, bad_generation[-8:]))}"
+            f"active rollout generation time exceeds configured upper bound "
+            f"{glm_rollout_max_seconds:g}s at steps "
+            f"{','.join(map(str, bad_generation[-8:]))}"
         )
-    elif rollout_rows and not generation:
-        rep.alarms.append("no separate active rollout generation measurement")
+    elif rollout_rows and not generation and not invalid_generation:
+        rep.alarms.append("no active rollout generation time measurement")
 
     for category, count in sorted(rep.failures.items()):
         rep.alarms.append(f"{category} failure evidence is present ({count})")

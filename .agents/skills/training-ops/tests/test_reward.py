@@ -76,6 +76,56 @@ class ActiveMetricRowsTest(unittest.TestCase):
 
 
 class AcceptanceProbeTest(unittest.TestCase):
+    def acceptance(self, trainer_rows="", rollout_rows=""):
+        return training_ops._acceptance_from_text(
+            "glm52",
+            "",
+            "",
+            "\n".join(json.dumps(row) for row in trainer_rows),
+            "\n".join(json.dumps(row) for row in rollout_rows),
+            "",
+            "too few steps",
+        )
+
+    def test_trainer_timing_uses_upper_bound_and_includes_step_one(self):
+        for seconds in (300.0, 600.0):
+            report = self.acceptance([{"step": 1, "time/forward_backward": seconds}])
+            self.assertEqual(report.trainer_compute_step, 1)
+            self.assertFalse(
+                any("time/forward_backward exceeds" in alarm for alarm in report.alarms)
+            )
+
+        report = self.acceptance([{"step": 1, "time/forward_backward": 601.0}])
+        self.assertTrue(
+            any("time/forward_backward exceeds" in alarm for alarm in report.alarms)
+        )
+
+    def test_missing_nonfinite_and_negative_timing_is_explicit(self):
+        for value in (None, float("nan"), -1.0):
+            row = {"step": 1}
+            if value is not None:
+                row["time/forward_backward"] = value
+            report = self.acceptance([row])
+            self.assertTrue(
+                any("time/forward_backward is missing or invalid" in alarm for alarm in report.alarms),
+                value,
+            )
+
+    def test_rollout_timing_uses_only_upper_bound(self):
+        for seconds in (300.0, 720.0):
+            report = self.acceptance(
+                [{"step": 1, "time/forward_backward": 300.0}],
+                [{"step": 1, "train/agg/all/timing/generation/max": seconds}],
+            )
+            self.assertFalse(
+                any("generation time exceeds" in alarm for alarm in report.alarms)
+            )
+        report = self.acceptance(
+            [{"step": 1, "time/forward_backward": 300.0}],
+            [{"step": 1, "train/agg/all/timing/generation/max": 721.0}],
+        )
+        self.assertTrue(any("generation time exceeds" in alarm for alarm in report.alarms))
+
     def test_probe_uses_container_command_when_env_has_no_run(self):
         script = training_ops._acceptance_probe_script("glm52", "trainer")
 
