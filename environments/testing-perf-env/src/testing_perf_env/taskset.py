@@ -168,8 +168,8 @@ class TestingPerfTask(vf.Task[TestingPerfData, vf.State, TestingPerfTaskConfig])
             "task_adherence, coherence in [0, 1], and an evidence array with "
             "one to four short strings. Use 1.0 for complete work, 0.5 for "
             "partial work, and 0.0 for absent or contradictory work. Higher "
-            "numbers mean better work. The user asks for about "
-            f"{self.data.target_words} words in each answer.\n\n"
+            "numbers mean better work. Word count is scored separately; do not "
+            "use it when assigning these three scores.\n\n"
             + json.dumps(payload, ensure_ascii=False)
         )
 

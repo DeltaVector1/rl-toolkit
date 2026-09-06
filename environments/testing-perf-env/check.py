@@ -196,7 +196,7 @@ async def run() -> None:
 
     async def mocked_complete(self, messages, *, trace=None, schema=None, **kwargs):
         assert schema is TurnReview
-        assert "400 words in each answer" in messages
+        assert "Word count is scored separately" in messages
         text = responses.pop(0)
         response = vf.JudgeResponse(
             text=text,
