@@ -414,25 +414,14 @@ tunnel_listener_ready() {
   case "$pid" in ''|*[!0-9]*) return 1 ;; esac
   owner_command=$(ps -o args= -p "$pid" 2>/dev/null || true)
   ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
-  if [ "$ppid" = 1 ]; then
-    forward_total=$(grep -o -- '-[LR] ' <<<"$owner_command" | wc -l)
-    if [ "$forward_total" -eq 1 ] && [ "$forward_count" -eq 1 ]; then
-      tunnel_command_has "$owner_command" ssh || return 1
-      tunnel_command_has "$owner_command" "$target" || return 1
-      tunnel_command_has "$owner_command" "${forwards[0]}" || return 1
-      if kill "$pid" 2>/dev/null; then
-        echo "removed unowned legacy SSH listener on port $port" >&2
-        return 2
-      fi
-    fi
-    return 1
-  fi
+  [ "$ppid" != 1 ] || return 1
   forward_total=$(grep -o -- '-[LR] ' <<<"$owner_command" | wc -l)
   [ "$forward_total" -eq "$forward_count" ] || return 1
+  tunnel_command_has "$owner_command" ssh || return 1
+  tunnel_command_has "$owner_command" "$target" || return 1
   for forward in "${forwards[@]}"; do
     tunnel_command_has "$owner_command" "$forward" || return 1
   done
-  tunnel_command_has "$owner_command" ssh || return 1
   supervisor_command=$(ps -o args= -p "$ppid" 2>/dev/null || true)
   case "$supervisor_command" in *"while true; do"*) ;; *) return 1 ;; esac
   tunnel_command_has "$supervisor_command" "$target" || return 1

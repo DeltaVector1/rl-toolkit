@@ -255,17 +255,17 @@ for port in $(seq 18100 18103); do
   PATH="$tmp/bin:$PATH" tunnel_listener_ready "$port" china-tunnel-lora-0 china-trainer 4 "${china_forwards[@]}"
 done
 
-# A listener owned by the old orphan process is rejected when its target is wrong.
+# A grouped supervisor is rejected when its SSH child uses the wrong target.
 printf '%s\n' \
-  'ssh -NT -L 127.0.0.1:18100:127.0.0.1:8100 wrong-trainer' \
+  'ssh -NT -L 127.0.0.1:18100:127.0.0.1:8100 -L 127.0.0.1:18101:127.0.0.1:8100 -L 127.0.0.1:18102:127.0.0.1:8100 -L 127.0.0.1:18103:127.0.0.1:8100 wrong-trainer' \
   >"$tmp/tunnel-owner"
-export TUNNEL_OWNER_PID=4242 TUNNEL_OWNER_PPID=1
+export TUNNEL_OWNER_PID=4242 TUNNEL_OWNER_PPID=4241
 if PATH="$tmp/bin:$PATH" tunnel_listener_ready 18100 china-tunnel-lora-0 china-trainer 4 "${china_forwards[@]}"; then
-  echo "unrelated orphan listener was accepted" >&2
+  echo "wrong child target was accepted" >&2
   exit 1
 fi
 
-# An exact single-forward orphan is safe to remove, and reports a retry state.
+# An orphan listener is rejected without readiness-time cleanup.
 printf '%s\n' \
   'ssh -NT -L 127.0.0.1:18100:127.0.0.1:8100 china-trainer' \
   >"$tmp/tunnel-owner"
@@ -273,12 +273,12 @@ orphan_kill_log="$tmp/orphan-kill"
 kill() { printf '%s\n' "$*" >"$orphan_kill_log"; return 0; }
 if PATH="$tmp/bin:$PATH" tunnel_listener_ready 18100 china-tunnel-lora-0 china-trainer 1 \
     -L "127.0.0.1:18100:127.0.0.1:8100"; then
-  echo "orphan cleanup was reported ready" >&2
+  echo "orphan listener was accepted" >&2
   exit 1
 else
-  test "$?" -eq 2
+  test "$?" -eq 1
 fi
-test "$(cat "$orphan_kill_log")" = 4242
+test ! -s "$orphan_kill_log"
 unset -f kill
 unset TUNNEL_OWNER_PID TUNNEL_OWNER_PPID TUNNEL_SUPERVISOR_PID \
   TUNNEL_OWNER_COMMAND TUNNEL_SUPERVISOR_COMMAND TUNNEL_SS_OUTPUT
