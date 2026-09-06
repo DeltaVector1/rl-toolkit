@@ -123,10 +123,19 @@ copy_partial() {
 publish() {
   local source=$1 relative=${1#"$source_dir"/}
   local final="$dest_dir/$relative" partial="$dest_dir/.incoming/$relative"
-  local digest remote_digest
+  local digest remote_digest probe_status
 
   digest=$(sha256sum "$source" | cut -d' ' -f1)
-  remote_digest=$(remote "sha256sum '$final' 2>/dev/null | cut -d' ' -f1" || true)
+  if remote_digest=$(remote "if [ -f '$final' ]; then sha256sum '$final'; else exit 3; fi"); then
+    remote_digest=${remote_digest%% *}
+  else
+    probe_status=$?
+    if [ "$probe_status" -ne 3 ]; then
+      echo "cannot probe destination checksum for $relative" >&2
+      return 1
+    fi
+    remote_digest=
+  fi
   if [ "$remote_digest" = "$digest" ]; then
     printf '%s\n' "$digest" >"$source.delivered"
     return
@@ -142,10 +151,11 @@ publish() {
   if ! copy_partial "$source" "$partial"; then
     return 1
   fi
-  if ! remote_digest=$(remote "sha256sum '$partial' 2>/dev/null | cut -d' ' -f1"); then
+  if ! remote_digest=$(remote "sha256sum '$partial'"); then
     echo "cannot read transferred checksum for $relative" >&2
     return 1
   fi
+  remote_digest=${remote_digest%% *}
   [ "$remote_digest" = "$digest" ] || {
     echo "checksum failed for $relative" >&2
     return 1
@@ -158,20 +168,21 @@ publish() {
 }
 
 scan() {
-  local file relative
+  local file relative status=0
   if [ -f "$source_dir/control/orch.toml" ] &&
      [ $(( $(date +%s) - $(stat -c %Y "$source_dir/control/orch.toml") )) -ge 2 ] &&
      [ ! -f "$source_dir/control/orch.toml.delivered" ]; then
-    publish "$source_dir/control/orch.toml" || true
+    publish "$source_dir/control/orch.toml" || status=1
   fi
   while IFS= read -r -d '' file; do
     relative=${file#"$source_dir"/}
     [[ "$relative" =~ ^broadcasts/step_[0-9]+/receivers-ready\.json$ ]] || continue
-    [ -f "$file.delivered" ] || publish "$file" || true
+    [ -f "$file.delivered" ] || publish "$file" || status=1
   done < <(find "$source_dir/broadcasts" -mindepth 2 -maxdepth 2 -type f -name receivers-ready.json -print0 2>/dev/null | sort -z)
   while IFS= read -r -d '' file; do
-    [ -f "$file.delivered" ] || publish "$file" || true
+    [ -f "$file.delivered" ] || publish "$file" || status=1
   done < <(find "$source_dir/rollouts" -type f -name train_rollouts.bin -print0 2>/dev/null | sort -z)
+  return "$status"
 }
 
 pull_stable_markers() {
@@ -192,7 +203,13 @@ pull_stable_markers() {
 }
 
 while true; do
-  scan || echo "$(date -u +%FT%TZ) batch scan failed; retrying" >&2
+  if ! scan; then
+    if [ "${ONCE:-0}" = 1 ]; then
+      echo "$(date -u +%FT%TZ) batch scan failed" >&2
+      exit 1
+    fi
+    echo "$(date -u +%FT%TZ) batch scan failed; retrying" >&2
+  fi
   pull_stable_markers || echo "$(date -u +%FT%TZ) stable-marker pull failed; retrying" >&2
   [ "${ONCE:-0}" = 1 ] && exit
   sleep "$interval"
