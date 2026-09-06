@@ -53,7 +53,7 @@ and a one-time rank-8 profiler. It is not full RL or an acceptance run.
 
 The 64-rank stats component test produced exact matching statistics:
 
-| Path | Time | Peak reserved GPU memory |
+| Path | Time | Peak allocated GPU memory |
 |---|---:|---:|
 | old padded gather | 2,652 ms | 5,904 MiB |
 | uneven gather | 343 ms | 778 MiB |
