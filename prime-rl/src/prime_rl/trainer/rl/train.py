@@ -2030,22 +2030,18 @@ def train(config: TrainerConfig):
             # last stage's per-micro-batch outputs, which are scalar losses --
             # "zero-dimensional tensor cannot be concatenated". The loss closure
             # already accumulates what the metrics need.
-            try:
-                if pp_rank == 0:
-                    pp_schedule.step(pp_inputs, return_outputs=False)
-                elif pp_rank == parallel_dims.pp - 1:
-                    # The schedule indexes target_mbs unconditionally on the last
-                    # stage; the loss closure ignores the value, so a zero per
-                    # micro-batch is enough to satisfy it.
-                    pp_schedule.step(
-                        target=torch.zeros(len(pp_side_inputs), device="cuda"),
-                        return_outputs=False,
-                    )
-                else:
-                    pp_schedule.step(return_outputs=False)
-            finally:
-                for stage_module in pp_stage_modules:
-                    stage_module.close_backward_profiler()
+            if pp_rank == 0:
+                pp_schedule.step(pp_inputs, return_outputs=False)
+            elif pp_rank == parallel_dims.pp - 1:
+                # The schedule indexes target_mbs unconditionally on the last
+                # stage; the loss closure ignores the value, so a zero per
+                # micro-batch is enough to satisfy it.
+                pp_schedule.step(
+                    target=torch.zeros(len(pp_side_inputs), device="cuda"),
+                    return_outputs=False,
+                )
+            else:
+                pp_schedule.step(return_outputs=False)
             for stage_module in pp_stage_modules:
                 stage_module.emit_profile_reports()
             local_schedule_ms = 0.0

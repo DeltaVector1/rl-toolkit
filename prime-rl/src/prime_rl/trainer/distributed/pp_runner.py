@@ -16,6 +16,7 @@ Design notes, because the obvious approaches do not fit this trainer:
   forward from its side inputs and returns it, and ``loss_fn`` is the identity.
 """
 
+from contextlib import contextmanager
 import os
 import sys
 from collections.abc import Mapping, Sequence
@@ -325,10 +326,8 @@ class PipelineStageModule(nn.Module):
         self._forward_events = []
         self._backward_events = []
         self._forward_calls = 0
-        self._backward_calls = 0
         self._forward_profile_done = False
         self._backward_profile_done = False
-        self._backward_profiler = None
         self._profile_reports = []
         if self.profile_stage or self.profile_rank:
             self.register_full_backward_pre_hook(self._record_backward_start)
@@ -342,35 +341,30 @@ class PipelineStageModule(nn.Module):
             event = torch.cuda.Event(enable_timing=True)
             event.record()
             self._backward_events.append([event, None])
-        if self.profile_rank:
-            self._backward_calls += 1
-        if (
-            self.profile_rank
-            and not self.is_first
-            and self._backward_calls == 8
-            and not self._backward_profile_done
-        ):
-            self._backward_profile_done = True
-            self._backward_profiler = profile(
-                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]
-            ).__enter__()
 
     def _record_backward_end(self, _module, _grad_input, _grad_output) -> None:
         if self.profile_stage:
             event = torch.cuda.Event(enable_timing=True)
             event.record()
             self._backward_events[-1][1] = event
-        profiler = self._backward_profiler
-        self._backward_profiler = None
-        if profiler is not None:
-            profiler.__exit__(None, None, None)
-            self._profile_reports.append(("PP full backward profile", profiler))
-
-    def close_backward_profiler(self) -> None:
-        profiler = self._backward_profiler
-        self._backward_profiler = None
-        if profiler is not None:
-            profiler.__exit__(None, None, None)
+    @contextmanager
+    def profile_backward_call(self, chunk_id: int):
+        profiler = None
+        if self.profile_rank and not self.is_first and chunk_id == 7 and not self._backward_profile_done:
+            self._backward_profile_done = True
+            profiler = profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]
+            ).__enter__()
+        try:
+            yield
+        except BaseException:
+            if profiler is not None:
+                profiler.__exit__(*sys.exc_info())
+            raise
+        else:
+            if profiler is not None:
+                profiler.__exit__(None, None, None)
+                self._profile_reports.append(("PP full backward profile", profiler))
 
     def emit_profile_reports(self) -> None:
         for label, profiler in self._profile_reports:
@@ -616,6 +610,17 @@ def _keyed_pipeline_stage_cls():
                 )
             finally:
                 self.submod.clear_active_microbatch()
+
+        def backward_one_chunk(
+            self, bwd_chunk_id, loss=None, full_backward=True, last_backward=False
+        ):
+            with self.submod.profile_backward_call(bwd_chunk_id):
+                return super().backward_one_chunk(
+                    bwd_chunk_id,
+                    loss=loss,
+                    full_backward=full_backward,
+                    last_backward=last_backward,
+                )
 
     return KeyedPipelineStage
 
