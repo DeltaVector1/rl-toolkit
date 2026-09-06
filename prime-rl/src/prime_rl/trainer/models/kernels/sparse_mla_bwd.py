@@ -336,13 +336,13 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None):
     assert indices.shape == (B, S, kv_group, topk)
     assert lse.shape == (B, S, H)
 
-    direct_value = os.environ.get("PRIME_SPARSE_BWD_DIRECT_DKV", "0")
+    direct_value = os.environ.get("prime_sparse_bwd_direct_dkv", "0")
     if direct_value not in {"0", "1"}:
-        raise ValueError("PRIME_SPARSE_BWD_DIRECT_DKV must be 0 or 1")
+        raise ValueError("prime_sparse_bwd_direct_dkv must be 0 or 1")
     direct_dkv_store = direct_value == "1"
     capability = torch.cuda.get_device_capability(q.device)
     if direct_dkv_store and capability != (8, 9):
-        raise ValueError("PRIME_SPARSE_BWD_DIRECT_DKV requires an SM89 CUDA device")
+        raise ValueError("prime_sparse_bwd_direct_dkv requires an SM89 CUDA device")
 
     preprocess_kernel = preprocess(H, D)
     if capability[0] < 9:
@@ -350,7 +350,7 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None):
         block_heads = int(os.environ.get("PRIME_SPARSE_BWD_BLOCK_HEADS", "16"))
         threads = int(os.environ.get("PRIME_SPARSE_BWD_THREADS", "64"))
         if direct_dkv_store and (block_size, threads) != (16, 64):
-            raise ValueError("PRIME_SPARSE_BWD_DIRECT_DKV requires SM89 block=16 threads=64")
+            raise ValueError("prime_sparse_bwd_direct_dkv requires SM89 block=16 threads=64")
         bwd_kernel = bwd(
             H,
             D,
@@ -366,16 +366,7 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None):
             direct_dkv_store=direct_dkv_store,
         )
     else:
-        bwd_kernel = bwd(
-            H,
-            D,
-            D_tail,
-            topk,
-            kv_group,
-            sm_scale,
-            True,
-            direct_dkv_store=direct_dkv_store,
-        )
+        bwd_kernel = bwd(H, D, D_tail, topk, kv_group, sm_scale, True)
     postprocess_kernel = postprocess(D, D_tail, kv_group)
 
     delta = preprocess_kernel(o, do)
