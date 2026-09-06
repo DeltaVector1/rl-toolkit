@@ -24,3 +24,7 @@ class TestingPerfUser(vf.User[TestingPerfUserConfig, TestingPerfState]):
 
 
 __all__ = ["TestingPerfUser", "TestingPerfUserConfig"]
+
+
+if __name__ == "__main__":
+    TestingPerfUser.run()
