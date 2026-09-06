@@ -4,6 +4,8 @@ import contextlib
 import hashlib
 import io
 import json
+import math
+import os
 import re
 import tempfile
 import threading
@@ -45,10 +47,19 @@ def load_startup_validator(urlopen, validate_manifest, file_records):
     return namespace["_verify_startup_adapter_delta"]
 
 
-def load_server_load_endpoints(destination, handler):
+def load_server_load_endpoints(destination, handler, reader_lock=None):
     source = SERVER_PATH.read_text(encoding="utf-8")
     tree = ast.parse(source)
-    names = {"_read_verified_adapter_identity", "load_lora_adapter", "staging_status"}
+    names = {
+        "_adapter_requires_routed_experts",
+        "_is_finite_number",
+        "_read_verified_adapter_identity",
+        "_set_moe_lora_mode",
+        "_target_has_routed_experts",
+        "_validate_adapter_target_compatibility",
+        "load_lora_adapter",
+        "staging_status",
+    }
     nodes = [
         node
         for node in ast.walk(tree)
@@ -76,10 +87,12 @@ def load_server_load_endpoints(destination, handler):
 
     namespace = {
         "Any": Any,
+        "OpenAIServingModels": object,
+        "Path": Path,
         "LoadLoRAAdapterRequest": object,
         "Request": object,
         "adapter_cache_path": lambda _source_url: destination,
-        "adapter_reader_lock": contextlib.nullcontext,
+        "adapter_reader_lock": reader_lock or contextlib.nullcontext,
         "adapter_stage_status": lambda: {"status": "idle"},
         "asyncio": asyncio,
         "ErrorResponse": FakeErrorResponse,
@@ -108,9 +121,15 @@ def load_server_load_endpoints(destination, handler):
     )
 
 
-def write_cached_adapter(destination, source_url, target_sha256="a" * 64, transport=None):
+def write_cached_adapter(
+    destination,
+    source_url,
+    target_sha256="a" * 64,
+    transport=None,
+    target_modules=("o_proj",),
+):
     destination.mkdir(parents=True)
-    config = b"{}"
+    config = json.dumps({"target_modules": list(target_modules)}).encode("utf-8")
     weights = b"weights"
     (destination / "READY").write_text("ready\n", encoding="ascii")
     (destination / "adapter_config.json").write_bytes(config)
@@ -162,6 +181,11 @@ class ResumeRecoveryTest(unittest.TestCase):
             class Handler:
                 def __init__(self):
                     self.lora_requests = {}
+                    self.engine_client = SimpleNamespace(
+                        vllm_config=SimpleNamespace(
+                            lora_config=SimpleNamespace(target_modules=None)
+                        )
+                    )
                     self.response = object()
                     self.path_override = None
                     self.active = 0
@@ -197,7 +221,10 @@ class ResumeRecoveryTest(unittest.TestCase):
             success = asyncio.run(load(LoadRequest(), Request()))
             self.assertEqual(success["status"], "ok")
             self.assertEqual(success["loaded_receipt"]["source_url"], source_url)
-            self.assertEqual(success["loaded_receipt"]["config_sha256"], hashlib.sha256(b"{}").hexdigest())
+            self.assertEqual(
+                success["loaded_receipt"]["config_sha256"],
+                hashlib.sha256(b'{"target_modules": ["o_proj"]}').hexdigest(),
+            )
             self.assertEqual(namespace["_loaded_lora_receipts"]["adapter-slot1"], success["loaded_receipt"])
             self.assertEqual(asyncio.run(status(Request()))["loaded_receipts"]["adapter-slot1"], success["loaded_receipt"])
 
@@ -226,9 +253,11 @@ class ResumeRecoveryTest(unittest.TestCase):
             self.assertNotIn("adapter-slot1", in_progress["loaded_receipts"])
 
             (destination / "adapter_config.json").write_bytes(b"[]")
-            with self.assertRaisesRegex(RuntimeError, "configuration bytes"):
+            with self.assertRaisesRegex(RuntimeError, "adapter_config.json identity is invalid"):
                 asyncio.run(load(LoadRequest(), Request()))
-            (destination / "adapter_config.json").write_bytes(b"{}")
+            (destination / "adapter_config.json").write_bytes(
+                b'{"target_modules": ["o_proj"]}'
+            )
 
             handler.response = error_type()
             failed = asyncio.run(load(LoadRequest(), Request()))
@@ -237,7 +266,7 @@ class ResumeRecoveryTest(unittest.TestCase):
             self.assertNotIn("adapter-slot1", namespace["_loaded_lora_receipts"])
 
             handler.response = object()
-            local = asyncio.run(load(LoadRequest(path="/local/adapter"), Request()))
+            local = asyncio.run(load(LoadRequest(path=str(destination)), Request()))
             self.assertEqual(local["status"], "ok")
             self.assertNotIn("adapter-slot1", namespace["_loaded_lora_receipts"])
 
@@ -271,6 +300,188 @@ class ResumeRecoveryTest(unittest.TestCase):
             )
             self.assertEqual(asyncio.run(restarted_status(Request()))["loaded_receipts"], {})
             self.assertEqual(restarted_namespace["_loaded_lora_receipts"], {})
+
+    def test_server_rejects_routed_expert_adapter_when_targets_exclude_experts(self):
+        source_url = "http://source/expert"
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "cache"
+            write_cached_adapter(destination, source_url, target_modules=("experts", "o_proj"))
+
+            class Handler:
+                def __init__(self):
+                    self.lora_requests = {}
+                    self.loaded = False
+                    self.engine_client = SimpleNamespace(
+                        vllm_config=SimpleNamespace(
+                            lora_config=SimpleNamespace(target_modules=["o_proj"])
+                        )
+                    )
+
+                async def load_lora_adapter(self, _request):
+                    self.loaded = True
+                    return object()
+
+            class Request:
+                async def json(self):
+                    return {"require_delta": False, "prefetched": True}
+
+            class LoadRequest:
+                lora_name = "expert-adapter"
+                lora_path = source_url
+                load_inplace = False
+
+            handler = Handler()
+            load, _, _, response_type, _ = load_server_load_endpoints(destination, handler)
+            result = asyncio.run(load(LoadRequest(), Request()))
+            self.assertIsInstance(result, response_type)
+            self.assertEqual(result.status_code, 400)
+            self.assertIn("routed experts", result.content["error"])
+            self.assertFalse(handler.loaded)
+            local_request = LoadRequest()
+            local_request.lora_path = str(destination)
+            local_result = asyncio.run(load(local_request, Request()))
+            self.assertIsInstance(local_result, response_type)
+            self.assertEqual(local_result.status_code, 400)
+            self.assertFalse(handler.loaded)
+            handler.engine_client.vllm_config.lora_config = None
+            disabled = asyncio.run(load(LoadRequest(), Request()))
+            self.assertIsInstance(disabled, response_type)
+            self.assertEqual(disabled.status_code, 400)
+            self.assertIn("LoRA is disabled", disabled.content["error"])
+
+    def test_server_allows_expert_attention_and_unrestricted_targets(self):
+        cases = [
+            (("experts", "o_proj"), ["experts", "o_proj"]),
+            (("o_proj",), ["o_proj"]),
+            (("experts",), None),
+        ]
+        for index, (adapter_targets, configured_targets) in enumerate(cases):
+            with self.subTest(index=index):
+                source_url = f"http://source/case-{index}"
+                with tempfile.TemporaryDirectory() as temporary:
+                    destination = Path(temporary) / "cache"
+                    write_cached_adapter(
+                        destination, source_url, target_modules=adapter_targets
+                    )
+
+                    class Handler:
+                        def __init__(self):
+                            self.lora_requests = {}
+                            self.engine_client = SimpleNamespace(
+                                vllm_config=SimpleNamespace(
+                                    lora_config=SimpleNamespace(
+                                        target_modules=configured_targets
+                                    )
+                                )
+                            )
+
+                        async def load_lora_adapter(self, request):
+                            self.lora_requests[request.lora_name] = SimpleNamespace(
+                                lora_name=request.lora_name,
+                                lora_path=request.lora_path,
+                            )
+                            return object()
+
+                    class Request:
+                        async def json(self):
+                            return {"require_delta": False, "prefetched": True}
+
+                    class LoadRequest:
+                        lora_name = "adapter"
+                        lora_path = source_url
+                        load_inplace = False
+
+                    handler = Handler()
+                    load, _, _, _, _ = load_server_load_endpoints(destination, handler)
+                    result = asyncio.run(load(LoadRequest(), Request()))
+                    self.assertEqual(result["status"], "ok")
+
+    def test_server_validates_remote_adapter_inside_reader_lock(self):
+        source_url = "http://source/locked"
+        lock_active = False
+        validator_checked_in_lock = False
+
+        @contextlib.contextmanager
+        def reader_lock(_destination):
+            nonlocal lock_active
+            lock_active = True
+            try:
+                yield
+            finally:
+                lock_active = False
+
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "cache"
+            write_cached_adapter(destination, source_url, target_modules=("o_proj",))
+
+            class Handler:
+                def __init__(self):
+                    self.lora_requests = {}
+                    self.engine_client = SimpleNamespace(
+                        vllm_config=SimpleNamespace(
+                            lora_config=SimpleNamespace(target_modules=["o_proj"])
+                        )
+                    )
+
+                async def load_lora_adapter(self, request):
+                    self.lora_requests[request.lora_name] = SimpleNamespace(
+                        lora_name=request.lora_name,
+                        lora_path=request.lora_path,
+                    )
+                    return object()
+
+            class Request:
+                async def json(self):
+                    return {"require_delta": False, "prefetched": True}
+
+            class LoadRequest:
+                lora_name = "locked-adapter"
+                lora_path = source_url
+                load_inplace = False
+
+            handler = Handler()
+            load, _, namespace, _, _ = load_server_load_endpoints(
+                destination, handler, reader_lock
+            )
+            original_validator = namespace["_validate_adapter_target_compatibility"]
+
+            def checked_validator(path, target_handler):
+                nonlocal validator_checked_in_lock
+                validator_checked_in_lock = lock_active
+                return original_validator(path, target_handler)
+
+            namespace["_validate_adapter_target_compatibility"] = checked_validator
+            result = asyncio.run(load(LoadRequest(), Request()))
+            self.assertEqual(result["status"], "ok")
+            self.assertTrue(validator_checked_in_lock)
+
+    def test_server_uses_effective_lora_targets_for_moe_mode(self):
+        source = SERVER_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        helpers = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name in {"_set_moe_lora_mode", "_target_has_routed_experts", "_is_finite_number"}
+        ]
+        namespace = {"os": os, "math": math}
+        exec(compile(ast.Module(body=helpers, type_ignores=[]), str(SERVER_PATH), "exec"), namespace)
+        set_mode = namespace["_set_moe_lora_mode"]
+
+        self.assertTrue(namespace["_is_finite_number"](1.0))
+        self.assertFalse(namespace["_is_finite_number"](float("nan")))
+        self.assertFalse(namespace["_is_finite_number"]("1"))
+        os.environ.pop("PRIME_NO_MOE_LORA", None)
+        set_mode(["o_proj"])
+        self.assertEqual(os.environ.get("PRIME_NO_MOE_LORA"), "1")
+        set_mode(["experts"])
+        self.assertNotIn("PRIME_NO_MOE_LORA", os.environ)
+        set_mode(None)
+        self.assertNotIn("PRIME_NO_MOE_LORA", os.environ)
+        self.assertGreater(
+            source.index("_set_moe_lora_mode(args.lora_target_modules)"),
+            source.index("parse_args(args=[], namespace=namespace)"),
+        )
 
     def test_resume_uses_target_identity_when_public_predecessors_are_cleaned(self):
         target_url = "http://source/step_6"

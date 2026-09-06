@@ -7,6 +7,7 @@ import threading
 import time
 import uuid
 from argparse import Namespace
+from pathlib import Path
 from typing import Any
 
 import uvloop
@@ -145,6 +146,54 @@ def _is_finite_number(value: object) -> bool:
         return math.isfinite(float(value))
     except (OverflowError, ValueError):
         return False
+
+
+def _target_has_routed_experts(target: str) -> bool:
+    return "experts" in target.split(".")
+
+
+def _adapter_requires_routed_experts(adapter_path: str | Path) -> bool:
+    config_path = Path(adapter_path) / "adapter_config.json"
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError("adapter configuration cannot be read") from exc
+    if not isinstance(config, dict):
+        raise ValueError("adapter configuration must be an object")
+    targets = config.get("target_modules")
+    if isinstance(targets, str):
+        targets = [targets]
+    if not isinstance(targets, list) or any(not isinstance(target, str) for target in targets):
+        raise ValueError("adapter configuration target_modules is invalid")
+    return any(_target_has_routed_experts(target) for target in targets)
+
+
+def _validate_adapter_target_compatibility(adapter_path: str | Path, handler: OpenAIServingModels) -> None:
+    if not _adapter_requires_routed_experts(adapter_path):
+        return
+    lora_config = handler.engine_client.vllm_config.lora_config
+    if lora_config is None:
+        raise ValueError("adapter requires routed experts, but server LoRA is disabled")
+    if lora_config.target_modules is None:
+        return
+    configured_targets = lora_config.target_modules
+    if not any(_target_has_routed_experts(target) for target in configured_targets):
+        raise ValueError(
+            "adapter target_modules requires routed experts, but the effective "
+            "server lora_target_modules excludes 'experts'"
+        )
+
+
+def _set_moe_lora_mode(target_modules: list[str] | None) -> None:
+    import os
+
+    routed_moe_lora = any(
+        _target_has_routed_experts(target) for target in (target_modules or [])
+    )
+    if target_modules and not routed_moe_lora:
+        os.environ["PRIME_NO_MOE_LORA"] = "1"
+    else:
+        os.environ.pop("PRIME_NO_MOE_LORA", None)
 
 
 def engine_client(request: Request) -> EngineClient:
@@ -331,9 +380,17 @@ async def load_lora_adapter(lora_request: LoadLoRAAdapterRequest, raw_request: R
             if remote_adapter:
                 with adapter_reader_lock(destination):
                     adapter_identity = _read_verified_adapter_identity(source_url, destination)
+                    try:
+                        _validate_adapter_target_compatibility(destination, handler)
+                    except ValueError as exc:
+                        return JSONResponse({"error": str(exc)}, status_code=400)
                     response = await handler.load_lora_adapter(lora_request)
             else:
                 _loaded_lora_receipts.pop(lora_request.lora_name, None)
+                try:
+                    _validate_adapter_target_compatibility(lora_request.lora_path, handler)
+                except ValueError as exc:
+                    return JSONResponse({"error": str(exc)}, status_code=400)
                 response = await handler.load_lora_adapter(lora_request)
             stored = handler.lora_requests.get(lora_request.lora_name)
             if stored is not None:
@@ -598,21 +655,8 @@ vllm.v1.utils.run_api_server_worker_proc = custom_run_api_server_worker_proc
 # Only difference we do some config translation (i.e. pass populated namespace
 # to `parse_args`) and additional arg validation
 def server(config: InferenceConfig, vllm_extra: dict[str, Any] | None = None):
-    import os
-
     from vllm.entrypoints.cli.serve import run_headless, run_multi_api_server
     from vllm.entrypoints.openai.api_server import run_server
-
-    # Shared-expert LoRA uses ordinary linear layers. Keep the fused routed-MoE
-    # kernels in their non-LoRA mode unless the target is the routed `experts`
-    # module itself. A substring check incorrectly classified `shared_experts`.
-    routed_moe_lora = any(
-        "experts" in target.split(".") for target in (config.lora_target_modules or [])
-    )
-    if config.lora_target_modules and not routed_moe_lora:
-        os.environ["PRIME_NO_MOE_LORA"] = "1"
-    else:
-        os.environ.pop("PRIME_NO_MOE_LORA", None)
 
     namespace = config.to_vllm()
     if vllm_extra:
@@ -624,6 +668,7 @@ def server(config: InferenceConfig, vllm_extra: dict[str, Any] | None = None):
     args = parser.parse_args(args=[], namespace=namespace)
     assert args is not None
     validate_parsed_serve_args(args)
+    _set_moe_lora_mode(args.lora_target_modules)
 
     # Set the worker extension class based on the broadcast backend
     args.worker_extension_cls = WORKER_EXTENSION_CLS[config.weight_broadcast.type]
