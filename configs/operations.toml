@@ -82,6 +82,11 @@ trainer = "configs/qualification/glm52-native-small.toml"
 kind = "glm52"
 trainer = "configs/qualification/glm52-fixed-token.toml"
 
+[profiles.testing-perf]
+kind = "glm52"
+trainer = "configs/testing-perf/trainer.toml"
+orchestrator = "configs/testing-perf/orchestrator.toml"
+
 [reward]
 minimum_steps = 10
 spread_multiplier = 2.0

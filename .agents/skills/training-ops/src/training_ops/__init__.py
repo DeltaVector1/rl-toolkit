@@ -3904,8 +3904,6 @@ def _repair_engine(host: str) -> str:
     _check_host(host)
     if host not in inference_hosts:
         raise Refused(f"{host} is not an engine host. Use one of {inference_hosts}.")
-    run = current_run()
-    _profile_for_run(run)
     engine_container = glm_inference_container
     engine_model = glm_model
     start_script = f"{runtime_root}/h200/start_inference.sh"
@@ -4937,6 +4935,7 @@ def _start_dependency_inventory(
     for root in (
         "environments/decensor/src",
         "environments/ornith/src",
+        "environments/testing-perf-env/src",
         "evals/refusals-classifier",
     ):
         add_files(root, [orchestrator_host], suffix=".py")
