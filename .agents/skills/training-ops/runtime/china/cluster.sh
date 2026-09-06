@@ -81,20 +81,65 @@ case ${1:-} in
     if [ "$rank" -lt 0 ]; then
       echo "node $node is not in trainer_nodes ($trainer_nodes)" >&2; exit 1
     fi
-    read -r rollout_transport trainer_output fake_data < <(
-      python3 - "$trainer_config" <<'PY'
+    trainer_env_file=$(mktemp)
+    chmod 600 "$trainer_env_file"
+    trap 'rm -f -- "$trainer_env_file"' EXIT
+    if ! read -r rollout_transport trainer_output fake_data < <(
+      python3 - "$trainer_config" "$trainer_env_file" <<'PY'
+import re
 import sys
 import tomllib
 
-with open(sys.argv[1], "rb") as f:
-    config = tomllib.load(f)
+try:
+    with open(sys.argv[1], "rb") as f:
+        config = tomllib.load(f)
+    env_vars = config.get("env_vars", {})
+    if not isinstance(env_vars, dict):
+        raise ValueError
+    protected = {
+        "CUDA_VISIBLE_DEVICES",
+        "WANDB_SHARED_MODE",
+        "WANDB_SHARED_RUN_ID",
+        "WANDB_SHARED_LABEL",
+    }
+    env_lines = []
+    for key, value in env_vars.items():
+        if (
+            not isinstance(key, str)
+            or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) is None
+            or key in protected
+            or not isinstance(value, str)
+            or any(char in value for char in "\x00\r\n")
+        ):
+            raise ValueError
+        env_lines.append(f"{key}={value}\n")
+    with open(sys.argv[2], "w", encoding="utf-8", newline="") as f:
+        f.writelines(env_lines)
+except (OSError, tomllib.TOMLDecodeError, KeyError, TypeError, ValueError):
+    print("invalid trainer config or env_vars", file=sys.stderr)
+    raise SystemExit(2)
+
 print(
     config["rollout_transport"]["type"],
     config["output_dir"],
     int("fake" in config.get("data", {})),
 )
 PY
-    )
+    ); then
+      echo "cannot parse trainer config" >&2
+      exit 2
+    fi
+    trainer_env_keys=()
+    while IFS='=' read -r env_key _; do
+      [ -n "$env_key" ] && trainer_env_keys+=("$env_key")
+    done < "$trainer_env_file"
+    has_trainer_env_override() {
+      local candidate=$1 env_key
+      for env_key in "${trainer_env_keys[@]}"; do
+        [ "$env_key" = "$candidate" ] && return 0
+      done
+      return 1
+    }
     sudo install -d -o 1000 -g 1000 -m 0755 "$trainer_output"
     if [ "$rank" -eq 0 ]; then
       if [ "$rollout_transport" = filesystem ] && [ "$fake_data" = 0 ]; then
@@ -145,7 +190,7 @@ PY
     # Keep the optional checkpoint cache disabled. It is not selected by the
     # current dequantized, node-local EP path, but its single slot per layer is
     # not safe for multiple 1F1B micro-batches.
-    sudo docker run -d --name "$trainer_container" \
+    trainer_docker_args=(
       --gpus all "${common[@]}" \
       -v "$storage/cache/torchinductor":/tmp/torchinductor_appuser \
       -v "$storage/cache/tilelang":/home/appuser/.tilelang \
@@ -197,6 +242,25 @@ PY
       -e PRIME_STATS_DEBUG="${PRIME_STATS_DEBUG:-}" \
       -e PRIME_RL_RESUME_ADAPTER="${PRIME_RL_RESUME_ADAPTER:-}" \
       -e PRIME_RL_RESUME_ADAPTER_STEP="${PRIME_RL_RESUME_ADAPTER_STEP:-}" \
+      --env-file "$trainer_env_file"
+    )
+    trainer_filtered_args=()
+    arg_index=0
+    while [ "$arg_index" -lt "${#trainer_docker_args[@]}" ]; do
+      if [ "${trainer_docker_args[$arg_index]}" = "-e" ] &&
+        [ "$((arg_index + 1))" -lt "${#trainer_docker_args[@]}" ]; then
+        env_assignment=${trainer_docker_args[$((arg_index + 1))]}
+        env_key=${env_assignment%%=*}
+        if has_trainer_env_override "$env_key"; then
+          arg_index=$((arg_index + 2))
+          continue
+        fi
+      fi
+      trainer_filtered_args+=("${trainer_docker_args[$arg_index]}")
+      arg_index=$((arg_index + 1))
+    done
+    sudo docker run -d --name "$trainer_container" \
+      "${trainer_filtered_args[@]}" \
       --entrypoint /app/.venv/bin/torchrun "$image" \
       --role=trainer \
       --nnodes="$nnodes" \
@@ -211,6 +275,8 @@ PY
       --local-ranks-filter=0 \
       -m prime_rl.trainer.rl.train \
       @ "$trainer_config"
+    rm -f -- "$trainer_env_file"
+    trap - EXIT
     ;;
   adapter-http)
     adapter_node=${adapter_node_id:?set adapter_node_id}
