@@ -12,6 +12,54 @@ import training_ops
 
 
 class OrchestratorRepairTest(unittest.TestCase):
+    def test_adapter_tunnels_uses_explicit_profile_and_tunnels_only(self):
+        ssh_calls = []
+
+        def fake_ssh(host, script, timeout=120):
+            ssh_calls.append((host, script, timeout))
+            return 0, "adapter tunnel reconciliation complete\n"
+
+        with mock.patch.object(training_ops, "deploy", return_value=True) as deploy, mock.patch.object(
+            training_ops, "_ssh", side_effect=fake_ssh
+        ), mock.patch.object(
+            training_ops, "_ssh_address", side_effect=lambda host: f"addr-{host}"
+        ):
+            result = training_ops._repair_adapter_tunnels("testing-perf")
+
+        self.assertEqual(result, "adapter tunnel reconciliation complete")
+        deploy.assert_called_once_with(
+            ".agents/skills/training-ops/runtime/h200/start_orchestrator.sh",
+            nodes=[training_ops.orchestrator_host],
+        )
+        self.assertEqual(len(ssh_calls), 1)
+        host, script, timeout = ssh_calls[0]
+        self.assertEqual(host, training_ops.orchestrator_host)
+        self.assertEqual(timeout, 180)
+        self.assertIn("RUN=glm-perf-1 RUN_NAME=run_glm-perf-1", script)
+        self.assertIn(
+            "ORCH_CONFIG=/data/glm52-rl/deployment/configs/testing-perf/orchestrator.toml",
+            script,
+        )
+        self.assertIn("TRAINER_ADDRESSES='addr-n76 addr-n77 addr-n78 addr-n80 addr-n82 addr-n83 addr-n84 addr-n85'", script)
+        self.assertTrue(script.endswith("--tunnels-only"))
+
+    def test_adapter_tunnels_does_not_fall_back_from_trainer_only_run(self):
+        with mock.patch.object(training_ops, "current_run", return_value="glm52-native-small"):
+            with self.assertRaisesRegex(training_ops.Refused, "no orchestrator config"):
+                training_ops._repair_adapter_tunnels()
+
+    def test_tunnels_only_exits_before_service_start(self):
+        launcher = (
+            Path(__file__).resolve().parents[4]
+            / ".agents/skills/training-ops/runtime/h200/start_orchestrator.sh"
+        )
+        source = launcher.read_text(encoding="utf-8")
+        mode_start = source.index("if [ \"$tunnels_only\" = 1 ]; then")
+        docker_start = source.index("sudo docker", mode_start)
+        self.assertIn("unknown launcher argument", source)
+        self.assertIn("adapter tunnel reconciliation did not establish", source)
+        self.assertLess(mode_start, docker_start)
+
     def test_safety_probe_does_not_require_generation(self):
         script = training_ops._orchestrator_resume_safety_script([8000])
         self.assertEqual(training_ops.orchestrator_repair_staging_max_seconds, 7200)

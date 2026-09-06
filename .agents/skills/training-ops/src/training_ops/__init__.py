@@ -3558,8 +3558,15 @@ def repair(what: str) -> str:
         return _repair_adapter_server(force=True)
     if what == "orchestrator":
         return _repair_orchestrator()
+    if what == "adapter-tunnels":
+        return _repair_adapter_tunnels()
+    if what.startswith("adapter-tunnels:"):
+        profile_name = what.split(":", 1)[1]
+        if not profile_name:
+            raise Refused("adapter-tunnels requires a configured profile name")
+        return _repair_adapter_tunnels(profile_name)
     raise Refused(
-        f"unknown repair {what!r}. Use engine-watchdog:<host>, engine:<host>, supervisors, microbatch-sync, adapter-update, adapter-server[:reload], or orchestrator."
+        f"unknown repair {what!r}. Use engine-watchdog:<host>, engine:<host>, supervisors, microbatch-sync, adapter-update, adapter-server[:reload], orchestrator, or adapter-tunnels[:profile]."
     )
 
 
@@ -3896,6 +3903,52 @@ def _repair_orchestrator() -> str:
         "trainer was idle, rollout requests were zero, inference health/liveness "
         "passed, staging was bounded, and the resume-timeout client was deployed"
     )
+    print(result)
+    return result
+
+
+def _repair_adapter_tunnels(profile_name: str | None = None) -> str:
+    """Reconcile the configured adapter tunnels without starting services."""
+    if profile_name:
+        profile = _profile(profile_name)
+    else:
+        profile = _profile_for_run(current_run())
+    orchestrator_config = profile.get("orchestrator")
+    if not isinstance(orchestrator_config, str):
+        raise Refused("selected profile has no orchestrator config for adapter tunnels")
+    try:
+        with (repo_root / orchestrator_config).open("rb") as stream:
+            edge = tomllib.load(stream)
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise RuntimeError(f"cannot read orchestrator config {orchestrator_config}: {error}") from error
+    output_dir = edge.get("output_dir")
+    if not isinstance(output_dir, str) or not output_dir.startswith(run_root.rstrip("/") + "/"):
+        raise Refused("selected orchestrator config has no configured run output directory")
+    output_path = PurePosixPath(output_dir.rstrip("/"))
+    run = output_path.parent.name
+    run_name = output_path.name
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", run) or run_name != f"run_{run}":
+        raise Refused("selected orchestrator output directory is not an exact run path")
+    trainer_nodes = [host for host in trainer_hosts if host not in blocked_hosts]
+    trainer_addresses = " ".join(_ssh_address(host) for host in trainer_nodes)
+    if not trainer_addresses:
+        raise Refused("configured trainer addresses are empty")
+    if not deploy(
+        ".agents/skills/training-ops/runtime/h200/start_orchestrator.sh",
+        nodes=[orchestrator_host],
+    ):
+        raise RuntimeError("adapter tunnel launcher deployment failed")
+    command = (
+        f"RUN={shlex.quote(run)} RUN_NAME={shlex.quote(run_name)} "
+        f"ORCH_CONFIG={shlex.quote(f'{remote_repo}/{orchestrator_config}')} "
+        f"TRAINER_ADDRESSES={shlex.quote(trainer_addresses)} "
+        f"TRAINER_CT={shlex.quote(trainer_container)} ORCH_CT={shlex.quote(orchestrator_container)} "
+        f"bash {shlex.quote(orchestrator_launcher)} --tunnels-only"
+    )
+    code, output = _ssh(orchestrator_host, command, timeout=180)
+    if code:
+        raise RuntimeError(f"adapter tunnel reconciliation failed: {output.strip() or f'exit {code}'}")
+    result = output.strip().splitlines()[-1] if output.strip() else "adapter tunnel reconciliation complete"
     print(result)
     return result
 

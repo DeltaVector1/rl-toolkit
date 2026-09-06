@@ -4,6 +4,14 @@
 # China link.
 set -uo pipefail
 
+tunnels_only=0
+for argument in "$@"; do
+  case "$argument" in
+    --tunnels-only) tunnels_only=1 ;;
+    *) echo "unknown launcher argument: $argument" >&2; exit 2 ;;
+  esac
+done
+
 RUN=${RUN:?set RUN}
 RUN_NAME=${RUN_NAME:?set RUN_NAME}
 TRAINER_ADDRESSES=${TRAINER_ADDRESSES:?set TRAINER_ADDRESSES}
@@ -245,7 +253,7 @@ if [ "$peer_enabled" = 1 ] && [ "$relay_is_glm" != 1 ]; then
   exit 2
 fi
 
-if grep -q 'refusals-classifier-eval-v1' "$config_file"; then
+if [ "$tunnels_only" = 0 ] && grep -q 'refusals-classifier-eval-v1' "$config_file"; then
   bash "$deployment/.agents/skills/training-ops/runtime/h200/start_refusals_classifier.sh"
 fi
 
@@ -460,7 +468,9 @@ peer_tunnel() {
     lane_start=$((lane_start + peer_lane_size))
     lane_number=$((lane_number + 1))
   done
-  echo "peer tunnel :$peer_api_port -> $peer_name:8000; adapter source reverse ports ${lora_source_ports[0]}-${lora_source_ports[-1]} in $lane_number SSH lanes"
+  if [ "${tunnels_only:-0}" = 0 ]; then
+    echo "peer tunnel :$peer_api_port -> $peer_name:8000; adapter source reverse ports ${lora_source_ports[0]}-${lora_source_ports[-1]} in $lane_number SSH lanes"
+  fi
 }
 
 china_tunnel_remove_legacy
@@ -480,8 +490,34 @@ while [ "$china_lane_start" -lt "${#lora_source_ports[@]}" ]; do
   china_lane_start=$((china_lane_start + china_lane_size))
   china_lane_number=$((china_lane_number + 1))
 done
-echo "China adapter forwards ${lora_source_ports[0]}-${lora_source_ports[-1]} in $china_lane_number SSH lanes"
+if [ "$tunnels_only" = 0 ]; then
+  echo "China adapter forwards ${lora_source_ports[0]}-${lora_source_ports[-1]} in $china_lane_number SSH lanes"
+fi
 peer_tunnel
+if [ "$tunnels_only" = 1 ]; then
+  tunnels_ready=0
+  for _ in $(seq 1 30); do
+    tunnels_ready=1
+    for port in "${lora_source_ports[@]}"; do
+      if ! ss -tln 2>/dev/null | grep -q "127.0.0.1:$port"; then
+        tunnels_ready=0
+        break
+      fi
+    done
+    if [ "$tunnels_ready" = 1 ] && [ "$peer_enabled" = 1 ] &&
+       ! ss -tln 2>/dev/null | grep -q "127.0.0.1:$peer_api_port"; then
+      tunnels_ready=0
+    fi
+    [ "$tunnels_ready" = 1 ] && break
+    sleep 1
+  done
+  if [ "$tunnels_ready" != 1 ]; then
+    echo "adapter tunnel reconciliation did not establish all configured forwards" >&2
+    exit 1
+  fi
+  echo "adapter tunnel reconciliation complete"
+  exit 0
+fi
 ports=("${lora_source_ports[@]}")
 if [ "$peer_enabled" = 1 ]; then
   ports+=("$peer_api_port")
