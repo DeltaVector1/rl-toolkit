@@ -5,6 +5,8 @@ import unittest
 from collections import defaultdict
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
+import textwrap
 
 try:
     import torch
@@ -15,6 +17,7 @@ except ModuleNotFoundError:  # pragma: no cover - the trainer image provides Tor
 
 
 utils_path = Path(__file__).parents[1] / "src/prime_rl/trainer/utils.py"
+train_path = Path(__file__).parents[1] / "src/prime_rl/trainer/rl/train.py"
 
 
 def load_utils():
@@ -32,6 +35,16 @@ def load_utils():
     return namespace["flexible_all_gather"], namespace["Tensors"]
 
 
+def load_gradient_guard():
+    source = train_path.read_text(encoding="utf-8")
+    start_marker = "        found_nonfinite = torch.zeros("
+    end_marker = "        # Optionally, clip the gradients"
+    assert source.count(start_marker) == 1
+    start = source.index(start_marker)
+    end = source.index(end_marker, start)
+    return ast.parse(textwrap.dedent(source[start:end])).body
+
+
 class TrainerUtilsTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -46,6 +59,80 @@ class TrainerUtilsTest(unittest.TestCase):
     def tearDownClass(cls):
         if dist is not None and dist.is_initialized():
             dist.destroy_process_group()
+
+    def run_gradient_guard(self, parameters):
+        logger = SimpleNamespace(errors=[])
+        logger.error = lambda *args: logger.errors.append(args)
+        monitor = SimpleNamespace(logs=[])
+        monitor.log = lambda *args, **kwargs: monitor.logs.append((args, kwargs))
+        namespace = {
+            "torch": torch,
+            "dist": dist,
+            "model": SimpleNamespace(named_parameters=lambda: list(parameters)),
+            "parallel_dims": SimpleNamespace(fsdp_gradient_divide_factor=2),
+            "logger": logger,
+            "monitor": monitor,
+            "progress": SimpleNamespace(step=1),
+            "tensor_stats": {},
+        }
+        function = ast.FunctionDef(
+            name="run_guard",
+            args=ast.arguments(
+                posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]
+            ),
+            body=load_gradient_guard(),
+            decorator_list=[],
+        )
+        module = ast.Module(body=[function], type_ignores=[])
+        exec(compile(ast.fix_missing_locations(module), str(train_path), "exec"), namespace)
+        try:
+            namespace["run_guard"]()
+        except RuntimeError as error:
+            if "Non-finite gradient at step" not in str(error):
+                raise
+            return True, logger
+        return False, logger
+
+    def test_finite_gradient_guard_collective_paths(self):
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        self.assertGreaterEqual(world_size, 2)
+        from torch.distributed._tensor import DTensor, Replicate
+        from torch.distributed.device_mesh import init_device_mesh
+
+        mesh = init_device_mesh("cuda", (world_size,))
+        linear = torch.nn.Linear(2, 2, device="cuda")
+
+        if rank == 0:
+            local = torch.ones_like(linear.weight)
+            grad = DTensor.from_local(local, mesh, [Replicate()])
+            parameters = [("weight", SimpleNamespace(grad=grad)), ("bias", SimpleNamespace(grad=None))]
+        elif rank == 1:
+            grad = torch.ones_like(linear.weight)
+            parameters = [("weight", SimpleNamespace(grad=grad)), ("bias", SimpleNamespace(grad=None))]
+        else:
+            parameters = [("weight", SimpleNamespace(grad=None)), ("bias", SimpleNamespace(grad=None))]
+        rejected, _ = self.run_gradient_guard(parameters)
+        self.assertFalse(rejected)
+        if rank in (0, 1):
+            local_grad = grad.to_local() if hasattr(grad, "to_local") else grad
+            self.assertTrue(torch.equal(local_grad, torch.full_like(local_grad, 2)))
+
+        rejected, _ = self.run_gradient_guard(
+            [("weight", SimpleNamespace(grad=None)), ("bias", SimpleNamespace(grad=None))]
+        )
+        self.assertFalse(rejected)
+
+        for value in (float("nan"), float("inf")):
+            bad_grad = torch.full_like(linear.weight, value) if rank == 0 else None
+            parameters = [("weight", SimpleNamespace(grad=bad_grad)), ("bias", SimpleNamespace(grad=None))]
+            rejected, logger = self.run_gradient_guard(parameters)
+            self.assertTrue(rejected)
+            rejection_count = torch.tensor(int(rejected), device="cuda", dtype=torch.int32)
+            dist.all_reduce(rejection_count, op=dist.ReduceOp.SUM)
+            self.assertEqual(rejection_count.item(), world_size)
+            if rank == 0:
+                self.assertTrue(any("weight" in str(args) for args in logger.errors))
 
     def test_uneven_noncontiguous_duplicates_and_stats(self):
         rank = dist.get_rank()

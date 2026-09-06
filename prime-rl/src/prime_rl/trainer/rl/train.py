@@ -2138,8 +2138,7 @@ def train(config: TrainerConfig):
         # compute_loss already divided by the global token count. Undo FSDP's per-rank averaging
         # across dp_cp so the final gradient is the true per-token mean over the global batch.
         found_nonfinite = torch.zeros((), device="cuda", dtype=torch.int32)
-        nonfinite_grad_names: list[str] = []
-        for name, param in model.named_parameters():
+        for _, param in model.named_parameters():
             if param.grad is not None:
                 param.grad.mul_(parallel_dims.fsdp_gradient_divide_factor)
                 grad = (
@@ -2149,14 +2148,6 @@ def train(config: TrainerConfig):
                 )
                 is_nonfinite = (~torch.isfinite(grad).all()).to(dtype=torch.int32)
                 found_nonfinite = torch.maximum(found_nonfinite, is_nonfinite)
-                if is_nonfinite.item():
-                    nonfinite_grad_names.append(name)
-        if nonfinite_grad_names:
-            logger.error(
-                "Non-finite local gradients at step {}: {}",
-                progress.step,
-                nonfinite_grad_names,
-            )
 
         # Do not silently replace NaN/Inf values with zero. That changes the
         # optimizer direction and made the later finite-norm guard ineffective.
@@ -2164,6 +2155,22 @@ def train(config: TrainerConfig):
         # collective gradient clipping path.
         dist.all_reduce(found_nonfinite, op=dist.ReduceOp.MAX)
         if found_nonfinite.item():
+            nonfinite_grad_names = []
+            for name, param in model.named_parameters():
+                if param.grad is not None:
+                    grad = (
+                        param.grad.to_local()
+                        if hasattr(param.grad, "to_local")
+                        else param.grad
+                    )
+                    if (~torch.isfinite(grad).all()).item():
+                        nonfinite_grad_names.append(name)
+            if nonfinite_grad_names:
+                logger.error(
+                    "Non-finite local gradients at step {}: {}",
+                    progress.step,
+                    nonfinite_grad_names,
+                )
             rejected_metrics = {
                 **tensor_stats,
                 "diagnostic/nonfinite_gradient": 1.0,
