@@ -179,8 +179,6 @@ def bwd(
 
             P_shared_cast = T.alloc_shared([block_H, BS], dtype)
             dP_shared_cast = T.alloc_shared([block_H, BS], dtype)
-            dQ_shared = T.alloc_shared([block_H, D], dtype)
-            dQ_tail_shared = T.alloc_shared([block_H, D_tail], dtype)
 
             acc_p = T.alloc_fragment([block_H, BS], accum_dtype)
             acc_dp = T.alloc_fragment([block_H, BS], accum_dtype)
@@ -306,11 +304,14 @@ def bwd(
                                 acc_dkv_tail_shared[bi_i, d_i],
                             )
 
-            T.copy(acc_dq, dQ_shared)
-            T.copy(acc_dq_tail, dQ_tail_shared)
+            # Q_shared and Q_tail_shared are no longer read after the loop.
+            # Wait before overwriting them with the final dQ staging values.
+            T.sync_threads()
+            T.copy(acc_dq, Q_shared)
+            T.copy(acc_dq_tail, Q_tail_shared)
 
-            T.copy(dQ_shared, dQ[by, s_i, bz * block_H : (bz + 1) * block_H, :D])
-            T.copy(dQ_tail_shared, dQ[by, s_i, bz * block_H : (bz + 1) * block_H, D:])
+            T.copy(Q_shared, dQ[by, s_i, bz * block_H : (bz + 1) * block_H, :D])
+            T.copy(Q_tail_shared, dQ[by, s_i, bz * block_H : (bz + 1) * block_H, D:])
 
     return sparse_mla_bwd_kernel
 
