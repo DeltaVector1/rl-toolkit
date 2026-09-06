@@ -369,8 +369,8 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None):
         block_size = int(os.environ.get("PRIME_SPARSE_BWD_BLOCK_SIZE", "16"))
         block_heads = int(os.environ.get("PRIME_SPARSE_BWD_BLOCK_HEADS", "16"))
         threads = int(os.environ.get("PRIME_SPARSE_BWD_THREADS", "64"))
-        if direct_dkv_store and (block_size, threads) != (16, 64):
-            raise ValueError("prime_sparse_bwd_direct_dkv requires SM89 block=16 threads=64")
+        if direct_dkv_store and (block_size != 16 or threads not in {64, 128}):
+            raise ValueError("prime_sparse_bwd_direct_dkv requires SM89 block=16 threads=64 or 128")
         bwd_kernel = bwd(
             H,
             D,
