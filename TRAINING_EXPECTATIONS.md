@@ -12,9 +12,10 @@ these direct checks pass.
 - Use the native FP8 trainer path and measure it against H200 FP8 inference.
 - Use batch 1,024, group 16, context 32,768, maximum output 16,384, learning
   rate `8e-6`, maximum gradient norm 1.0, and weight decay 0.
-- Actual forward and backward passes must stay within 10 minutes. If either
-  exceeds 10 minutes, stop the test, preserve relevant logs, and trace the
-  cause before a fresh retry. GPU utilization alone does not prove progress.
+- The combined forward and backward elapsed time, from the start of forward to
+  the end of backward, must stay within 10 minutes. If it exceeds 10 minutes,
+  stop the test, preserve relevant logs, and trace the cause before a fresh
+  retry. GPU utilization alone does not prove progress.
 - Active rollout generation should take about 10 minutes per batch.
 - Validate the path to batch 2,048 before using that batch in production.
 

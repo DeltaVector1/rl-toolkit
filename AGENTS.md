@@ -100,9 +100,10 @@ after `training_ops.status()` shows that fault.
 
 For the current neutral GLM performance effort, the owner authorizes needed
 repairs and test restarts. This does not authorize unrelated work.
-For this effort, if an actual forward or backward pass exceeds ten minutes,
-stop the test, preserve relevant logs, and trace the cause before a fresh
-retry. GPU utilization alone does not prove progress.
+For this effort, if combined forward and backward elapsed time, from the start
+of forward to the end of backward, exceeds ten minutes, stop the test,
+preserve relevant logs, and trace the cause before a fresh retry. GPU
+utilization alone does not prove progress.
 
 Get an owner decision before you, except for that scoped permission:
 
