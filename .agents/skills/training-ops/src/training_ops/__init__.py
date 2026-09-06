@@ -4935,10 +4935,14 @@ def _start_dependency_inventory(
     for root in (
         "environments/decensor/src",
         "environments/ornith/src",
-        "environments/testing-perf-env/src",
         "evals/refusals-classifier",
     ):
         add_files(root, [orchestrator_host], suffix=".py")
+    add_files(
+        "environments/testing-perf-env/src",
+        [*trainer_destinations, orchestrator_host],
+        suffix=".py",
+    )
 
     missing = [path for path in inventory if not (repo_root / path).is_file()]
     if missing:

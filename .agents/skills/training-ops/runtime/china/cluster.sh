@@ -27,6 +27,7 @@ common=(
   --ulimit core=0:0
   -v /data:/data
   -e CUDA_DEVICE_ORDER=PCI_BUS_ID
+  -e PYTHONPATH="$deployment/environments/testing-perf-env/src:/app/src"
   -e PYTHONUNBUFFERED=1
   -e OMP_NUM_THREADS=1
   -e PRIME_TRAINER_NODE="$node"
