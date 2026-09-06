@@ -60,7 +60,6 @@ env.taskset.dataset_seed = 42
 env.taskset.max_turns = 6
 env.taskset.markdown_ratio = 0.5
 env.assistant.harness = { id = "null" }
-env.assistant.runtime = { type = "subprocess" }
 env.assistant.max_output_tokens = 16384
 env.assistant.timeout.rollout = 3600
 

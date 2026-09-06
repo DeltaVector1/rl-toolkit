@@ -119,6 +119,7 @@ async def run() -> None:
         "rb",
     ) as stream:
         orchestrator_config = tomllib.load(stream)
+    assert "runtime" not in orchestrator_config["train"]["env"][0]["env"]["assistant"]
     profile_env = vf.resolve_env_config(orchestrator_config["train"]["env"][0]["env"])
     assert isinstance(vf.load_environment(profile_env), TestingPerfEnv)
     assert profile_env.id == profile_env.taskset.id == "testing-perf-env"
