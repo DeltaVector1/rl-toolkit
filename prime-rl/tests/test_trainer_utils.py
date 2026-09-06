@@ -39,7 +39,8 @@ class TrainerUtilsTest(unittest.TestCase):
             raise unittest.SkipTest("run under torchrun in the trainer image")
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
         dist.init_process_group("nccl", timeout=timedelta(seconds=120))
-        cls.gather, cls.tensors_type = load_utils()
+        gather, cls.tensors_type = load_utils()
+        cls.gather = staticmethod(gather)
 
     @classmethod
     def tearDownClass(cls):
@@ -49,17 +50,19 @@ class TrainerUtilsTest(unittest.TestCase):
     def test_uneven_noncontiguous_duplicates_and_stats(self):
         rank = dist.get_rank()
         world_size = dist.get_world_size()
-        local_size = rank + 1
+        self.assertGreaterEqual(world_size, 2)
+        local_size = rank + 2
         source = torch.arange(local_size * 2, device="cuda", dtype=torch.float32) + rank * 100
         local = source[::2]
         self.assertFalse(local.is_contiguous())
         gathered = self.gather(local)
-        self.assertEqual(gathered.numel(), world_size * (world_size + 1) // 2)
+        self.assertEqual(gathered.numel(), world_size * (world_size + 3) // 2)
         offset = 0
         for owner in range(world_size):
-            expected = torch.arange(owner + 1, device="cuda", dtype=torch.float32) * 2 + owner * 100
-            self.assertTrue(torch.equal(gathered[offset : offset + owner + 1], expected))
-            offset += owner + 1
+            owner_size = owner + 2
+            expected = torch.arange(owner_size, device="cuda", dtype=torch.float32) * 2 + owner * 100
+            self.assertTrue(torch.equal(gathered[offset : offset + owner_size], expected))
+            offset += owner_size
 
         values = [1.0, 1.0, float(rank)]
         stats = self.tensors_type()
@@ -75,6 +78,18 @@ class TrainerUtilsTest(unittest.TestCase):
         self.assertEqual(metrics["score/min"], expected.min().item())
         self.assertEqual(metrics["score/max"], expected.max().item())
         self.assertEqual(dict(stats), {})
+
+        sparse = self.tensors_type()
+        if rank == world_size - 1:
+            sparse["sparse"].append(torch.tensor([2.0, 2.0, 7.0], device="cuda"))
+        sparse_metrics = sparse.compute_stats()
+        sparse_expected = torch.tensor([2.0, 2.0, 7.0], device="cuda")
+        self.assertEqual(sparse_metrics["sparse/mean"], sparse_expected.mean().item())
+        self.assertEqual(sparse_metrics["sparse/median"], torch.median(sparse_expected).item())
+        self.assertEqual(sparse_metrics["sparse/std"], sparse_expected.std().item())
+        self.assertEqual(sparse_metrics["sparse/min"], sparse_expected.min().item())
+        self.assertEqual(sparse_metrics["sparse/max"], sparse_expected.max().item())
+        self.assertEqual(dict(sparse), {})
 
         empty = self.tensors_type()
         empty["empty"].append(torch.empty(0, device="cuda"))
