@@ -4,7 +4,7 @@ dist_timeout_seconds = 5400
 enable_router_replay = false
 [env_vars]
 PRIME_PROFILE_PP_STAGE = "1"
-PRIME_LORA_MM_PROFILE = "legacy"
+PRIME_LORA_MM_PROFILE = "sm89-r32"
 
 [data.fake]
 batch_size = 16
