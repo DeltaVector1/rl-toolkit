@@ -1,6 +1,7 @@
 import hashlib
 import importlib.util
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -23,6 +24,59 @@ adapter_server_spec.loader.exec_module(adapter_server)
 
 
 class AdapterUpdateTest(unittest.TestCase):
+    def test_inference_launcher_forwards_mtp_settings_before_docker(self):
+        launcher_path = (
+            Path(__file__).resolve().parents[1]
+            / "runtime"
+            / "h200"
+            / "start_inference.sh"
+        )
+        launcher = launcher_path.read_text(encoding="utf-8")
+        start = launcher.index("<<'PY'\n") + len("<<'PY'\n")
+        end = launcher.index("\nPY\n)", start)
+        reader = launcher[start:end]
+        operations_path = Path(__file__).resolve().parents[4] / "configs/operations.toml"
+        operations = operations_path.read_text(encoding="utf-8")
+
+        def read_settings(host, config_text=operations):
+            with tempfile.NamedTemporaryFile("w", suffix=".toml") as stream:
+                stream.write(config_text)
+                stream.flush()
+                return subprocess.run(
+                    [sys.executable, "-", stream.name, host],
+                    input=reader,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+
+        a = read_settings("h200a")
+        b = read_settings("h200b")
+        self.assertEqual(a.returncode, 0, a.stderr)
+        self.assertEqual(b.returncode, 0, b.stderr)
+        a_extra = json.loads(a.stdout.splitlines()[-1])
+        b_extra = json.loads(b.stdout.splitlines()[-1])
+        self.assertNotIn("speculative_config", a_extra)
+        self.assertEqual(
+            b_extra["speculative_config"],
+            {"method": "mtp", "num_speculative_tokens": 1},
+        )
+        self.assertEqual(a_extra["max_num_batched_tokens"], 32768)
+        self.assertEqual(a_extra["compilation_config"], {"max_cudagraph_capture_size": 128})
+        self.assertIn("runtime_output=$(python3", launcher)
+        self.assertLess(launcher.index("runtime_output=$(python3"), launcher.index("install -d"))
+        self.assertLess(launcher.index("runtime_output=$(python3"), launcher.index("docker update"))
+
+        invalid_configs = (
+            operations.replace("mtp_tokens = 0\n", "", 1),
+            operations.replace("mtp_tokens = 0", "mtp_tokens = true", 1),
+            operations.replace("mtp_tokens = 1", "mtp_tokens = -1", 1),
+        )
+        for config_text in invalid_configs:
+            result = read_settings("h200a" if "mtp_tokens = -1" not in config_text else "h200b", config_text)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("mtp_tokens", result.stderr)
+
     def test_config_uses_the_active_glm_profile(self):
         config = training_ops._adapter_update_config("glm-1")
         self.assertEqual(config["kind"], "glm52")

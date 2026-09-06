@@ -3,9 +3,10 @@ set -euo pipefail
 
 deployment=/data/glm52-rl/deployment
 engine_host=${ENGINE_HOST:?ENGINE_HOST must name this host in operations.toml}
-readarray -t runtime_settings < <(python3 - "$deployment/configs/operations.toml" "$engine_host" <<'PY'
+runtime_output=$(python3 - "$deployment/configs/operations.toml" "$engine_host" <<'PY'
 import sys
 import tomllib
+import json
 
 with open(sys.argv[1], "rb") as stream:
     config = tomllib.load(stream)
@@ -35,15 +36,31 @@ if not all(isinstance(value, int) and value > 0 for value in (tp, dp, gpu_count)
     raise SystemExit(f"invalid GLM parallel sizes for {host}")
 if tp * dp != gpu_count:
     raise SystemExit(f"GLM TP times DP must equal gpu_count for {host}")
-print(tp)
-print(dp)
+mtp_tokens = glm.get("mtp_tokens")
+if type(mtp_tokens) is not int or mtp_tokens < 0:
+    raise SystemExit(f"mtp_tokens for {host} must be a non-negative integer")
+vllm_extra = {
+    "tensor_parallel_size": tp,
+    "data_parallel_size": dp,
+    "gpu_memory_utilization": 0.920,
+    "kv_cache_dtype": "fp8",
+    "max_num_seqs": 128,
+    "max_num_batched_tokens": 32768,
+    "compilation_config": {"max_cudagraph_capture_size": 128},
+}
+if mtp_tokens:
+    vllm_extra["speculative_config"] = {
+        "method": "mtp",
+        "num_speculative_tokens": mtp_tokens,
+    }
+print(json.dumps(vllm_extra, separators=(",", ":")))
 PY
 )
+readarray -t runtime_settings <<< "$runtime_output"
 lora_source_port_list=${runtime_settings[0]:?operations config has no LoRA source ports}
 adapter_cache_dir=${runtime_settings[1]:?operations config has no adapter cache path}
 disable_nccl_shm=${runtime_settings[2]:?operations config has no NCCL shared-memory setting}
-tensor_parallel_size=${runtime_settings[3]:?operations config has no GLM tensor parallel size}
-data_parallel_size=${runtime_settings[4]:?operations config has no GLM data parallel size}
+vllm_extra=${runtime_settings[3]:?operations config has no vLLM extra settings}
 install -d -o 1000 -g 1000 -m 0755 "$adapter_cache_dir"
 install -d -o 1000 -g 1000 -m 0755 "$deployment/cache/vllm"
 docker update --restart=no glm52-decensor-h200 glm52-decensor-h200-0 glm52-decensor-h200-1 >/dev/null 2>&1 || true
@@ -82,4 +99,4 @@ docker run -d --name glm52-decensor-h200 --restart unless-stopped \
   prime-rl:glm52-v080-glm52-h200-router \
   -lc 'set -e; patch --batch --forward -p1 -d /app/.venv/lib/python3.12/site-packages < /tmp/flashmla_sparse_mtp.patch || grep -q "MIN_HEADS_FOR_BF16_PREFILL = 0" /app/.venv/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/flashmla_sparse.py; exec /app/.venv/bin/inference "$@"' bash \
   @ "$deployment/configs/runtime/glm52-inference.toml" \
-  --vllm-extra "{\"tensor_parallel_size\":$tensor_parallel_size,\"data_parallel_size\":$data_parallel_size,\"gpu_memory_utilization\":0.920,\"kv_cache_dtype\":\"fp8\",\"max_num_seqs\":128,\"max_num_batched_tokens\":32768,\"compilation_config\":{\"max_cudagraph_capture_size\":128}}"
+  --vllm-extra "$vllm_extra"
