@@ -125,7 +125,15 @@ publish() {
   local final="$dest_dir/$relative" partial="$dest_dir/.incoming/$relative"
   local digest remote_digest probe_status
 
-  digest=$(sha256sum "$source" | cut -d' ' -f1)
+  if ! digest=$(sha256sum "$source"); then
+    echo "cannot read local checksum for $relative" >&2
+    return 1
+  fi
+  digest=${digest%% *}
+  if [ -z "$digest" ]; then
+    echo "local checksum is empty for $relative" >&2
+    return 1
+  fi
   if remote_digest=$(remote "if [ -f '$final' ]; then sha256sum '$final'; else exit 3; fi"); then
     remote_digest=${remote_digest%% *}
   else

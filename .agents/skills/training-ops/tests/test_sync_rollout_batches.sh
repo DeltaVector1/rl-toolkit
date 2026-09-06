@@ -49,6 +49,15 @@ flock 9; active=$(sed -n '1p' "$ACTIVE_STATE")
 printf '%s\n%s\n' "$((active - 1))" "$max" >"$ACTIVE_STATE"; flock -u 9
 EOF
 chmod +x "$tmp/bin/ssh" "$tmp/bin/rsync"
+cat >"$tmp/bin/sha256sum" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${SYNC_TEST_MODE:-}" = localhash_failure ] && [ "${1:-}" = "${LOCAL_HASH_TARGET:-}" ]; then
+  exit 1
+fi
+exec /usr/bin/sha256sum "$@"
+EOF
+chmod +x "$tmp/bin/sha256sum"
 
 run_case() {
   local mode=$1 source_dir=$2 remote_dir=$3 log=$4
@@ -71,6 +80,7 @@ run_case() {
     FAIL_MARKER="$tmp/fail-marker" \
     TRANSIENT_MARKER="$tmp/transient-marker" \
     RSYNC_MARKER="$tmp/rsync-marker" \
+    LOCAL_HASH_TARGET="$source_dir/rollouts/step_1/train_rollouts.bin" \
     ONCE=1 \
     "$sync_script" >"$log" 2>&1
 }
@@ -81,6 +91,14 @@ run_case success "$success_source" "$success_remote" "$tmp/success.log"
 test -f "$success_remote/rollouts/step_1/train_rollouts.bin"
 test -f "$success_source/rollouts/step_1/train_rollouts.bin.delivered"
 test "$(sed -n '2p' "$tmp/active-state")" -le 4
+
+if run_case localhash_failure "$tmp/localhash-source" "$tmp/localhash-remote" "$tmp/localhash.log"; then
+  echo 'local checksum failure must make --once fail' >&2
+  exit 1
+fi
+grep -q 'cannot read local checksum' "$tmp/localhash.log"
+! test -e "$tmp/localhash-source/rollouts/step_1/train_rollouts.bin.delivered"
+! test -e "$tmp/localhash-remote/rollouts/step_1/train_rollouts.bin"
 
 run_case success "$success_source" "$success_remote" "$tmp/resume.log"
 test "$(wc -l <"$tmp/resume.log")" -lt 2
