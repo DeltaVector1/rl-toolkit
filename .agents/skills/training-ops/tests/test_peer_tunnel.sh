@@ -16,6 +16,7 @@ cat >"$tmp/bin/pgrep" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 pattern=${3:?missing pgrep pattern}
+printf '%s' "$pattern" >"${PEER_QUERY:?}"
 if [ -r "${PEER_TEST_LOG:?}" ] && grep -Fq -- "$pattern" "$PEER_TEST_LOG"; then
   case "$pattern" in
     china-tunnel-lora-*)
@@ -24,7 +25,7 @@ if [ -r "${PEER_TEST_LOG:?}" ] && grep -Fq -- "$pattern" "$PEER_TEST_LOG"; then
     '-L 127.0.0.1:'*)
       port=${pattern#-L 127.0.0.1:}
       port=${port%%:*}
-      if [ "$port" -ge 18100 ] && [ "$port" -le 18195 ]; then
+      if [ "${PEER_CHINA_MODE:-0}" = 1 ] && [ "$port" -ge 18100 ] && [ "$port" -le 18195 ]; then
         echo $((10000 + (port - 18100) / 4))
       else
         echo 1234
@@ -53,10 +54,13 @@ if [ "${1:-}" = "-o" ] && [ "${2:-}" = "args=" ]; then
     lane=$((pid - 10000))
     grep -E "done # china-tunnel-lora-${lane}[[:space:]]*$" "${PEER_TEST_LOG:?}" | tail -n 1 | sed 's/[[:space:]]*$//' || true
   else
-    tail -n 1 "${PEER_TEST_LOG:?}" 2>/dev/null | sed 's/[[:space:]]*$//' || true
+    query=$(<"${PEER_QUERY:?}")
+    grep -F -- "$query" "${PEER_TEST_LOG:?}" | tail -n 1 | sed 's/[[:space:]]*$//' || true
   fi
 elif [ "${1:-}" = "-o" ] && [ "${2:-}" = "pgid=" ]; then
   echo "${4:?missing process id}"
+elif [ "${1:-}" = "-eo" ]; then
+  [ -n "${PEER_GROUP_COMMANDS:-}" ] && cat "$PEER_GROUP_COMMANDS"
 fi
 EOF
 chmod +x "$tmp/bin/pgrep" "$tmp/bin/setsid"
@@ -79,8 +83,9 @@ peer_ssh_port=20099
 peer_ssh_user=root
 peer_ssh_identity=/data/trinity/h200_rollout_ed25519
 log="$tmp/peer-tunnel.log"
+query="$tmp/peer-query"
 
-PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$log" peer_tunnel
+PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$log" PEER_QUERY="$query" peer_tunnel
 for _ in $(seq 1 50); do
   [ -f "$log" ] && [ "$(wc -l <"$log")" -eq 25 ] && break
   sleep 0.1
@@ -108,13 +113,13 @@ while IFS= read -r line; do
 done < <(grep -F -- '-R 127.0.0.1:' "$log")
 
 # A second launcher invocation finds the exact API and lane signatures.
-PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$log" peer_tunnel
+PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$log" PEER_QUERY="$query" peer_tunnel
 test "$(wc -l <"$log")" -eq 25
 
 china_log="$tmp/china-tunnel.log"
 trainer_ssh_target=china-trainer
 adapter_port=8100
-PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$china_log" china_tunnel_remove_legacy
+PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$china_log" PEER_QUERY="$query" PEER_CHINA_MODE=1 china_tunnel_remove_legacy
 china_lane_start=0
 china_lane_number=0
 china_lane_ports=()
@@ -130,7 +135,7 @@ run_china_lanes() {
         -L "127.0.0.1:$lora_source_port:127.0.0.1:$adapter_port"
       )
     done
-    PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$china_log" china_tunnel_connection "lora-$china_lane_number" \
+    PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$china_log" PEER_QUERY="$query" PEER_CHINA_MODE=1 china_tunnel_connection "lora-$china_lane_number" \
       "${china_lane_forwards[@]}"
     china_lane_start=$((china_lane_start + 4))
     china_lane_number=$((china_lane_number + 1))
@@ -160,4 +165,77 @@ for _ in $(seq 1 50); do
   sleep 0.1
 done
 test "$(wc -l <"$china_log")" -eq 48
+
+# A same-signature process with the wrong peer target is not reused.
+printf '%s\n' 'while true; do ssh -R 127.0.0.1:18100:127.0.0.1:18196 wrong@peer; sleep 3; done # peer-tunnel-lora-0' >"$log"
+PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$log" PEER_QUERY="$query" peer_tunnel_connection lora-0 \
+  '-R 127.0.0.1:18100:127.0.0.1:18196' \
+  -R 127.0.0.1:18100:127.0.0.1:18196 \
+  -R 127.0.0.1:18101:127.0.0.1:18196 \
+  -R 127.0.0.1:18102:127.0.0.1:18196 \
+  -R 127.0.0.1:18103:127.0.0.1:18196
+for _ in $(seq 1 50); do
+  [ "$(wc -l <"$log")" -eq 2 ] && break
+  sleep 0.1
+done
+test "$(wc -l <"$log")" -eq 2
+grep -Fq -- 'root@38.255.28.19' "$log"
+
+# A process missing a lane forward is not reused.
+printf '%s\n' 'while true; do ssh -R 127.0.0.1:18100:127.0.0.1:18196 root@38.255.28.19; sleep 3; done # peer-tunnel-lora-0' >"$log"
+PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$log" PEER_QUERY="$query" peer_tunnel_connection lora-0 \
+  '-R 127.0.0.1:18100:127.0.0.1:18196' \
+  -R 127.0.0.1:18100:127.0.0.1:18196 \
+  -R 127.0.0.1:18101:127.0.0.1:18196 \
+  -R 127.0.0.1:18102:127.0.0.1:18196 \
+  -R 127.0.0.1:18103:127.0.0.1:18196
+for _ in $(seq 1 50); do
+  [ "$(wc -l <"$log")" -eq 2 ] && break
+  sleep 0.1
+done
+test "$(wc -l <"$log")" -eq 2
+test "$(grep -F -c -- '-R 127.0.0.1:18103:127.0.0.1:18196' "$log")" -eq 1
+
+# A peer marker does not authorize killing an unrelated process in its group.
+group_commands="$tmp/group-commands"
+kill_log="$tmp/kill-log"
+printf '%s\n' \
+  '1234 bash -c while true; do ssh -R 127.0.0.1:18100:127.0.0.1:18196 root@38.255.28.19; done # peer-tunnel-lora-0' \
+  '1234 unrelated-daemon' >"$group_commands"
+kill() { printf '%s\n' "$*" >>"$KILL_LOG"; }
+export KILL_LOG="$kill_log" PEER_GROUP_COMMANDS="$group_commands"
+PATH="$tmp/bin:$PATH"
+export PATH
+peer_kill_owned 1234 \
+  'while true; do ssh -R 127.0.0.1:18100:127.0.0.1:18196 root@38.255.28.19; done # peer-tunnel-lora-0'
+test "$(grep -F -c -- '1234' "$kill_log")" -eq 1
+if grep -Fq -- '-1234' "$kill_log"; then
+  echo "unrelated peer group received a group kill" >&2
+  exit 1
+fi
+unset -f kill
+unset KILL_LOG PEER_GROUP_COMMANDS
+
+cat >"$tmp/bin/ssh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${PEER_REMOTE_FAIL:-0}" = 1 ]; then
+  exit 1
+fi
+if [ "${PEER_REMOTE_MISSING:-0}" = 1 ]; then
+  for port in $(seq 18100 18194); do printf '127.0.0.1:%s\n' "$port"; done
+else
+  for port in $(seq 18100 18195); do printf '127.0.0.1:%s\n' "$port"; done
+fi
+EOF
+chmod +x "$tmp/bin/ssh"
+PATH="$tmp/bin:$PATH" PEER_REMOTE_FAIL=0 PEER_REMOTE_MISSING=0 peer_remote_ports_ready
+if PATH="$tmp/bin:$PATH" PEER_REMOTE_FAIL=0 PEER_REMOTE_MISSING=1 peer_remote_ports_ready; then
+  echo "remote missing reverse port was accepted" >&2
+  exit 1
+fi
+if PATH="$tmp/bin:$PATH" PEER_REMOTE_FAIL=1 PEER_REMOTE_MISSING=0 peer_remote_ports_ready; then
+  echo "remote SSH failure was accepted" >&2
+  exit 1
+fi
 printf 'peer tunnel uses one API connection and twenty-four bounded self-healing lanes\n'

@@ -273,7 +273,6 @@ peer_tunnel_connection() {
   local connection_name=$1 signature=$2
   shift 2
   local -a forwards=("$@")
-  pgrep -f -- "$signature" >/dev/null && return 0
 
   local -a ssh_args=(
     -NT
@@ -288,11 +287,26 @@ peer_tunnel_connection() {
     -i "$peer_ssh_identity"
     -p "$peer_ssh_port"
   )
-  local forward_text ssh_text peer_target marker
+  local forward_text ssh_text peer_target marker pid command_line process_matches forward_count
   forward_text=$(printf ' %q' "${forwards[@]}")
   ssh_text=$(printf ' %q' "${ssh_args[@]}")
   peer_target=$(printf '%q' "$peer_ssh_user@$peer_host")
   marker="peer-tunnel-$connection_name"
+  for pid in $(pgrep -f -- "$signature" || true); do
+    command_line=$(ps -o args= -p "$pid" 2>/dev/null || true)
+    process_matches=1
+    for forward in "${forwards[@]}"; do
+      case "$command_line" in *"$forward"*) ;; *) process_matches=0; break ;; esac
+    done
+    forward_count=$(grep -o -- '-[LR] ' <<<"$command_line" | wc -l)
+    [ "$forward_count" -eq "$(( ${#forwards[@]} / 2 ))" ] || process_matches=0
+    case "$command_line" in
+      *"ssh -NT "*"-o IdentitiesOnly=yes"*"-o ExitOnForwardFailure=yes"*"-i $peer_ssh_identity"*"-p $peer_ssh_port "*"$peer_target"*"# $marker") ;;
+      *) process_matches=0 ;;
+    esac
+    [ "$process_matches" = 1 ] && return 0
+    peer_kill_owned "$pid" "$command_line"
+  done
   setsid nohup bash -c "while true; do
       ssh$ssh_text$forward_text $peer_target
       sleep 3
@@ -303,19 +317,16 @@ peer_tunnel_remove_legacy() {
   local keep_current=${1:-0}
   local api_signature="-L 127.0.0.1:$peer_api_port:127.0.0.1:8000"
   local reverse_signature="-R 127.0.0.1:${lora_source_ports[0]}:"
-  local current_signature pid command_line pgid lora_source_port
+  local current_signature pid command_line lora_source_port
   for pid in $(pgrep -f -- "$api_signature" || true); do
     command_line=$(ps -o args= -p "$pid" 2>/dev/null || true)
     case "$command_line" in
       *"$api_signature"*)
+        case "$command_line" in *"while true; do"*"# peer-tunnel-"*) ;; *) continue ;; esac
         if [ "$keep_current" = 1 ]; then
           case "$command_line" in *"$reverse_signature"*) ;; *) continue ;; esac
         fi
-        pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
-        case "$pgid" in
-          ''|*[!0-9]*|0|1|"$$") kill "$pid" 2>/dev/null || true ;;
-          *) kill -- "-$pgid" 2>/dev/null || true ;;
-        esac
+        peer_kill_owned "$pid" "$command_line"
         sleep 1
         ;;
     esac
@@ -327,17 +338,56 @@ peer_tunnel_remove_legacy() {
       command_line=$(ps -o args= -p "$pid" 2>/dev/null || true)
       case "$command_line" in
         *"$reverse_signature"*)
+          case "$command_line" in *"while true; do"*"# peer-tunnel-"*) ;; *) continue ;; esac
           case "$command_line" in
             *"$current_signature"*) [ "$keep_current" = 1 ] && continue ;;
           esac
-          pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
-          case "$pgid" in
-            ''|*[!0-9]*|0|1|"$$") kill "$pid" 2>/dev/null || true ;;
-            *) kill -- "-$pgid" 2>/dev/null || true ;;
-          esac
+          peer_kill_owned "$pid" "$command_line"
           ;;
       esac
     done
+  done
+}
+
+peer_kill_owned() {
+  local pid=$1 command_line=$2 pgid group_command group_safe group_seen
+  case "$command_line" in
+    *"while true; do"*"# peer-tunnel-"*) ;;
+    *) return 0 ;;
+  esac
+  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
+  case "$pgid" in
+    ''|*[!0-9]*|0|1|"$$") kill "$pid" 2>/dev/null || true ;;
+    *)
+      group_safe=1
+      group_seen=0
+      while IFS= read -r group_command; do
+        group_seen=1
+        case "$group_command" in
+          *"# peer-tunnel-"*|*"ssh "*|*" sleep 3"*) ;;
+          *) group_safe=0; break ;;
+        esac
+      done < <(ps -eo pgid=,args= | awk -v group="$pgid" '$1 == group {sub(/^[^ ]+ +/, ""); print}')
+      if [ "$group_safe" = 1 ] && [ "$group_seen" = 1 ]; then
+        kill -- "-$pgid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+      else
+        kill "$pid" 2>/dev/null || true
+      fi
+      ;;
+  esac
+}
+
+peer_remote_ports_ready() {
+  local peer_target remote_ports port
+  peer_target=$(printf '%q' "$peer_ssh_user@$peer_host")
+  if ! remote_ports=$(ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=3 \
+      -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes \
+      -o IPQoS=none -i "$peer_ssh_identity" -p "$peer_ssh_port" \
+      "$peer_target" "ss -H -ltn | awk '{print \$4}'" 2>/dev/null); then
+    return 1
+  fi
+  for port in "${lora_source_ports[@]}"; do
+    printf '%s\n' "$remote_ports" | grep -Eq "([.:])$port$" || return 1
   done
 }
 
@@ -513,6 +563,21 @@ if [ "$tunnels_only" = 1 ]; then
   done
   if [ "$tunnels_ready" != 1 ]; then
     echo "adapter tunnel reconciliation did not establish all configured forwards" >&2
+    exit 1
+  fi
+  remote_ready=1
+  if [ "$peer_enabled" = 1 ]; then
+    remote_ready=0
+    for _ in $(seq 1 30); do
+      if peer_remote_ports_ready; then
+        remote_ready=1
+        break
+      fi
+      sleep 1
+    done
+  fi
+  if [ "$remote_ready" != 1 ]; then
+    echo "adapter tunnel reconciliation did not establish all remote reverse forwards" >&2
     exit 1
   fi
   echo "adapter tunnel reconciliation complete"
