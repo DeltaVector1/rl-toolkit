@@ -1485,10 +1485,10 @@ index 0000000..a82c3ad
 +if __name__ == "__main__":
 +    main()
 diff --git a/src/prime_rl/inference/vllm/server.py b/src/prime_rl/inference/vllm/server.py
-index 28e2f572ffaa708ae108214b28d44609f3e9b9f0..b05a2e03dab2796a4268afc8ee4e41d09e2eafdd 100644
+index 28e2f572..b862ff4e 100644
 --- a/src/prime_rl/inference/vllm/server.py
 +++ b/src/prime_rl/inference/vllm/server.py
-@@ -1,4 +1,11 @@
+@@ -1,5 +1,13 @@
  import asyncio
 +import hashlib
 +import json
@@ -1498,9 +1498,11 @@ index 28e2f572ffaa708ae108214b28d44609f3e9b9f0..b05a2e03dab2796a4268afc8ee4e41d0
 +import time
 +import uuid
  from argparse import Namespace
++from pathlib import Path
  from typing import Any
 
-@@ -16,17 +23,25 @@ from vllm.logger import init_logger
+ import uvloop
+@@ -16,17 +24,25 @@ from vllm.logger import init_logger
  from vllm.utils.argparse_utils import FlexibleArgumentParser
 
  from prime_rl.configs.inference import InferenceConfig
@@ -1530,7 +1532,7 @@ index 28e2f572ffaa708ae108214b28d44609f3e9b9f0..b05a2e03dab2796a4268afc8ee4e41d0
 
  # NOTE: Fix harmony stop token propagation for GPT-OSS models
  # Upstream issue still open: https://github.com/vllm-project/vllm/issues/22519
-@@ -37,9 +52,6 @@ monkey_patch_tokenize_params_validation()
+@@ -37,9 +53,6 @@ monkey_patch_tokenize_params_validation()
  # NOTE: Register Nano V3 reasoning parser so configs can use
  # `reasoning_parser = "nano_v3"` without a vLLM plugin file.
  monkey_patch_nano_v3_reasoning_parser()
@@ -1540,7 +1542,7 @@ index 28e2f572ffaa708ae108214b28d44609f3e9b9f0..b05a2e03dab2796a4268afc8ee4e41d0
  # NOTE: routed_experts are consumed only via the serialized /generate path (router
  # replay). The chat-completions path encodes them as a base64 np.save string the PD
  # router cannot merge, which fails eval rollouts (they use chat completions). Strip
-@@ -55,6 +67,84 @@ logger = init_logger("vllm.entrypoints.openai.api_server")
+@@ -55,6 +68,132 @@ logger = init_logger("vllm.entrypoints.openai.api_server")
 
  # Create our own router for custom endpoints
  router = APIRouter()
@@ -1622,10 +1624,58 @@ index 28e2f572ffaa708ae108214b28d44609f3e9b9f0..b05a2e03dab2796a4268afc8ee4e41d0
 +        return math.isfinite(float(value))
 +    except (OverflowError, ValueError):
 +        return False
++
++
++def _target_has_routed_experts(target: str) -> bool:
++    return "experts" in target.split(".")
++
++
++def _adapter_requires_routed_experts(adapter_path: str | Path) -> bool:
++    config_path = Path(adapter_path) / "adapter_config.json"
++    try:
++        config = json.loads(config_path.read_text(encoding="utf-8"))
++    except (OSError, ValueError) as exc:
++        raise ValueError("adapter configuration cannot be read") from exc
++    if not isinstance(config, dict):
++        raise ValueError("adapter configuration must be an object")
++    targets = config.get("target_modules")
++    if isinstance(targets, str):
++        targets = [targets]
++    if not isinstance(targets, list) or any(not isinstance(target, str) for target in targets):
++        raise ValueError("adapter configuration target_modules is invalid")
++    return any(_target_has_routed_experts(target) for target in targets)
++
++
++def _validate_adapter_target_compatibility(adapter_path: str | Path, handler: OpenAIServingModels) -> None:
++    if not _adapter_requires_routed_experts(adapter_path):
++        return
++    lora_config = handler.engine_client.vllm_config.lora_config
++    if lora_config is None:
++        raise ValueError("adapter requires routed experts, but server LoRA is disabled")
++    if lora_config.target_modules is None:
++        return
++    configured_targets = lora_config.target_modules
++    if not any(_target_has_routed_experts(target) for target in configured_targets):
++        raise ValueError(
++            "adapter target_modules requires routed experts, but the effective "
++            "server lora_target_modules excludes 'experts'"
++        )
++
++
++def _set_moe_lora_mode(target_modules: list[str] | None) -> None:
++    import os
++
++    routed_moe_lora = any(
++        _target_has_routed_experts(target) for target in (target_modules or [])
++    )
++    if target_modules and not routed_moe_lora:
++        os.environ["PRIME_NO_MOE_LORA"] = "1"
++    else:
++        os.environ.pop("PRIME_NO_MOE_LORA", None)
 
 
  def engine_client(request: Request) -> EngineClient:
-@@ -65,6 +155,101 @@ def models(request: Request) -> OpenAIServingModels:
+@@ -65,6 +204,101 @@ def models(request: Request) -> OpenAIServingModels:
      return request.app.state.openai_serving_models
 
 
@@ -1727,7 +1777,7 @@ index 28e2f572ffaa708ae108214b28d44609f3e9b9f0..b05a2e03dab2796a4268afc8ee4e41d0
  WORKER_EXTENSION_CLS = {
      "nccl": "prime_rl.inference.vllm.worker.nccl.NCCLWeightUpdateWorker",
      "filesystem": "prime_rl.inference.vllm.worker.filesystem.FileSystemWeightUpdateWorker",
-@@ -74,14 +259,35 @@ WORKER_EXTENSION_CLS = {
+@@ -74,14 +308,35 @@ WORKER_EXTENSION_CLS = {
 
  @router.post("/pause")
  async def pause(request: Request):
@@ -1766,7 +1816,7 @@ index 28e2f572ffaa708ae108214b28d44609f3e9b9f0..b05a2e03dab2796a4268afc8ee4e41d0
      return {"status": "resumed"}
 
 
-@@ -94,32 +300,208 @@ async def update_weights(request: Request):
+@@ -94,32 +349,216 @@ async def update_weights(request: Request):
 
  @router.post("/load_lora_adapter")
  async def load_lora_adapter(lora_request: LoadLoRAAdapterRequest, raw_request: Request):
@@ -1818,9 +1868,17 @@ index 28e2f572ffaa708ae108214b28d44609f3e9b9f0..b05a2e03dab2796a4268afc8ee4e41d0
 +            if remote_adapter:
 +                with adapter_reader_lock(destination):
 +                    adapter_identity = _read_verified_adapter_identity(source_url, destination)
++                    try:
++                        _validate_adapter_target_compatibility(destination, handler)
++                    except ValueError as exc:
++                        return JSONResponse({"error": str(exc)}, status_code=400)
 +                    response = await handler.load_lora_adapter(lora_request)
 +            else:
 +                _loaded_lora_receipts.pop(lora_request.lora_name, None)
++                try:
++                    _validate_adapter_target_compatibility(lora_request.lora_path, handler)
++                except ValueError as exc:
++                    return JSONResponse({"error": str(exc)}, status_code=400)
 +                response = await handler.load_lora_adapter(lora_request)
 +            stored = handler.lora_requests.get(lora_request.lora_name)
 +            if stored is not None:
@@ -2000,7 +2058,7 @@ index 28e2f572ffaa708ae108214b28d44609f3e9b9f0..b05a2e03dab2796a4268afc8ee4e41d0
 
 
  @router.get("/liveness")
-@@ -182,10 +564,10 @@ async def custom_init_app_state(
+@@ -182,10 +621,10 @@ async def custom_init_app_state(
          state.serving_tokens = prime_serving
 
 
@@ -2015,25 +2073,30 @@ index 28e2f572ffaa708ae108214b28d44609f3e9b9f0..b05a2e03dab2796a4268afc8ee4e41d0
 
 
  def custom_build_app(args: Namespace, supported_tasks: tuple, model_config=None):
-@@ -221,9 +603,16 @@ def server(config: InferenceConfig, vllm_extra: dict[str, Any] | None = None):
+@@ -216,15 +655,9 @@ vllm.v1.utils.run_api_server_worker_proc = custom_run_api_server_worker_proc
+ # Only difference we do some config translation (i.e. pass populated namespace
+ # to `parse_args`) and additional arg validation
+ def server(config: InferenceConfig, vllm_extra: dict[str, Any] | None = None):
+-    import os
+-
      from vllm.entrypoints.cli.serve import run_headless, run_multi_api_server
      from vllm.entrypoints.openai.api_server import run_server
 
 -    # Signal worker processes to disable LoRA on MoE layers when LoRA targets don't include experts
 -    if config.lora_target_modules and not any("expert" in m for m in config.lora_target_modules):
-+    # Shared-expert LoRA uses ordinary linear layers. Keep the fused routed-MoE
-+    # kernels in their non-LoRA mode unless the target is the routed `experts`
-+    # module itself. A substring check incorrectly classified `shared_experts`.
-+    routed_moe_lora = any(
-+        "experts" in target.split(".") for target in (config.lora_target_modules or [])
-+    )
-+    if config.lora_target_modules and not routed_moe_lora:
-         os.environ["PRIME_NO_MOE_LORA"] = "1"
-+    else:
-+        os.environ.pop("PRIME_NO_MOE_LORA", None)
-
+-        os.environ["PRIME_NO_MOE_LORA"] = "1"
+-
      namespace = config.to_vllm()
      if vllm_extra:
+         for key, value in vllm_extra.items():
+@@ -235,6 +668,7 @@ def server(config: InferenceConfig, vllm_extra: dict[str, Any] | None = None):
+     args = parser.parse_args(args=[], namespace=namespace)
+     assert args is not None
+     validate_parsed_serve_args(args)
++    _set_moe_lora_mode(args.lora_target_modules)
+
+     # Set the worker extension class based on the broadcast backend
+     args.worker_extension_cls = WORKER_EXTENSION_CLS[config.weight_broadcast.type]
 diff --git a/src/prime_rl/inference/vllm/worker/filesystem.py b/src/prime_rl/inference/vllm/worker/filesystem.py
 index 1049d17..1e197be 100644
 --- a/src/prime_rl/inference/vllm/worker/filesystem.py
@@ -10878,10 +10941,10 @@ index 0000000..a04ddbd
 +    get_logger().info(f"PP stage {pp_rank}/{pp_size}: dropped norm and output head")
 diff --git a/src/prime_rl/trainer/distributed/pp_runner.py b/src/prime_rl/trainer/distributed/pp_runner.py
 new file mode 100644
-index 0000000..0855a2f
+index 00000000..908aeae3
 --- /dev/null
 +++ b/src/prime_rl/trainer/distributed/pp_runner.py
-@@ -0,0 +1,1120 @@
+@@ -0,0 +1,1191 @@
 +"""Pipeline-parallel execution of one optimizer step.
 +
 +Design notes, because the obvious approaches do not fit this trainer:
@@ -10900,12 +10963,15 @@ index 0000000..0855a2f
 +  forward from its side inputs and returns it, and ``loss_fn`` is the identity.
 +"""
 +
++from contextlib import contextmanager
 +import os
++import sys
 +from collections.abc import Mapping, Sequence
 +from typing import Any, Callable
 +
 +import torch
 +import torch.nn as nn
++from torch.profiler import ProfilerActivity, profile
 +
 +
 +def minimum_pipeline_microbatches(schedule_name: str, pp_size: int) -> int:
@@ -11198,9 +11264,19 @@ index 0000000..0855a2f
 +            transfer_sparse_indices if send_sparse_indices is None else send_sparse_indices
 +        )
 +        self.profile_stage = os.environ.get("PRIME_PROFILE_PP_STAGE") == "1"
++        profile_rank = int(os.environ.get("PRIME_PROFILE_PP_RANK", "-1"))
++        self.profile_rank = (
++            profile_rank >= 0
++            and torch.distributed.is_initialized()
++            and torch.distributed.get_rank() == profile_rank
++        )
 +        self._forward_events = []
 +        self._backward_events = []
-+        if self.profile_stage:
++        self._forward_calls = 0
++        self._forward_profile_done = False
++        self._backward_profile_done = False
++        self._profile_reports = []
++        if self.profile_stage or self.profile_rank:
 +            self.register_full_backward_pre_hook(self._record_backward_start)
 +            self.register_full_backward_hook(self._record_backward_end)
 +        self._side: dict[tuple[int, int], dict] = {}
@@ -11208,14 +11284,45 @@ index 0000000..0855a2f
 +        self._active_microbatch: int | None = None
 +
 +    def _record_backward_start(self, _module, _grad_output) -> None:
-+        event = torch.cuda.Event(enable_timing=True)
-+        event.record()
-+        self._backward_events.append([event, None])
++        if self.profile_stage:
++            event = torch.cuda.Event(enable_timing=True)
++            event.record()
++            self._backward_events.append([event, None])
 +
 +    def _record_backward_end(self, _module, _grad_input, _grad_output) -> None:
-+        event = torch.cuda.Event(enable_timing=True)
-+        event.record()
-+        self._backward_events[-1][1] = event
++        if self.profile_stage:
++            event = torch.cuda.Event(enable_timing=True)
++            event.record()
++            self._backward_events[-1][1] = event
++    @contextmanager
++    def profile_backward_call(self, chunk_id: int):
++        profiler = None
++        if self.profile_rank and not self.is_first and chunk_id == 7 and not self._backward_profile_done:
++            self._backward_profile_done = True
++            profiler = profile(
++                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]
++            ).__enter__()
++        try:
++            yield
++        except BaseException:
++            if profiler is not None:
++                profiler.__exit__(*sys.exc_info())
++            raise
++        else:
++            if profiler is not None:
++                profiler.__exit__(None, None, None)
++                self._profile_reports.append(("PP full backward profile", profiler))
++
++    def emit_profile_reports(self) -> None:
++        for label, profiler in self._profile_reports:
++            print(
++                f"{label}:\n"
++                + profiler.key_averages().table(
++                    sort_by="self_device_time_total", row_limit=40
++                ),
++                flush=True,
++            )
++        self._profile_reports.clear()
 +
 +    def profile_times_ms(self, *, clear: bool = False) -> tuple[float, float]:
 +        if not self.profile_stage:
@@ -11317,8 +11424,24 @@ index 0000000..0855a2f
 +        if self.profile_stage:
 +            start = torch.cuda.Event(enable_timing=True)
 +            start.record()
-+        with maybe_activation_offloading(self.offload_cfg):
-+            output = self._forward_inner(x, sparse_indices_cache)
++        profiler = None
++        if self.profile_rank:
++            self._forward_calls += 1
++        if self.profile_rank and self._forward_calls == 8 and not self._forward_profile_done:
++            self._forward_profile_done = True
++            profiler = profile(
++                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]
++            ).__enter__()
++        try:
++            with maybe_activation_offloading(self.offload_cfg):
++                output = self._forward_inner(x, sparse_indices_cache)
++        except BaseException:
++            if profiler is not None:
++                profiler.__exit__(*sys.exc_info())
++            raise
++        if profiler is not None:
++            profiler.__exit__(None, None, None)
++            self._profile_reports.append(("PP forward profile", profiler))
 +        if start is not None:
 +            end = torch.cuda.Event(enable_timing=True)
 +            end.record()
@@ -11434,6 +11557,17 @@ index 0000000..0855a2f
 +                )
 +            finally:
 +                self.submod.clear_active_microbatch()
++
++        def backward_one_chunk(
++            self, bwd_chunk_id, loss=None, full_backward=True, last_backward=False
++        ):
++            with self.submod.profile_backward_call(bwd_chunk_id):
++                return super().backward_one_chunk(
++                    bwd_chunk_id,
++                    loss=loss,
++                    full_backward=full_backward,
++                    last_backward=last_backward,
++                )
 +
 +    return KeyedPipelineStage
 +
@@ -20917,7 +21051,7 @@ index 1ad250c..85c4267 100644
              )
          return TensorMicroBatch(
 diff --git a/src/prime_rl/trainer/rl/train.py b/src/prime_rl/trainer/rl/train.py
-index 295d3ad15e58c9536af46f075dde99230024e632..598d73dd82f7c7d5670ed53dca689b9b1847f4af 100644
+index 295d3ad1..60ae3769 100644
 --- a/src/prime_rl/trainer/rl/train.py
 +++ b/src/prime_rl/trainer/rl/train.py
 @@ -1,8 +1,16 @@
@@ -22649,7 +22783,7 @@ index 295d3ad15e58c9536af46f075dde99230024e632..598d73dd82f7c7d5670ed53dca689b9b
              if is_tt_moe_model(model):
                  load_balance_stats = get_load_balance_stats(model)
                  for k, v in load_balance_stats.items():
-@@ -545,36 +1780,438 @@ def train(config: TrainerConfig):
+@@ -545,36 +1780,433 @@ def train(config: TrainerConfig):
              # Debug log with *local, micro step* stats
              micro_step_message = f"Micro Step {micro_step}/{len(micro_batches)} | Loss {tensors['loss'][-1].mean().item():.4f} | Entropy {tensors['entropy/all'][-1].mean().item():.4f}"
              if has_mismatch_tokens:
@@ -22913,32 +23047,20 @@ index 295d3ad15e58c9536af46f075dde99230024e632..598d73dd82f7c7d5670ed53dca689b9b
 +            # last stage's per-micro-batch outputs, which are scalar losses --
 +            # "zero-dimensional tensor cannot be concatenated". The loss closure
 +            # already accumulates what the metrics need.
-+            profile_rank = int(os.environ.get("PRIME_PROFILE_PP_RANK", "-1"))
-+            schedule_profiler = (
-+                profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
-+                if dist.get_rank() == profile_rank
-+                else nullcontext()
-+            )
-+            with schedule_profiler:
-+                if pp_rank == 0:
-+                    pp_schedule.step(pp_inputs, return_outputs=False)
-+                elif pp_rank == parallel_dims.pp - 1:
-+                    # The schedule indexes target_mbs unconditionally on the last
-+                    # stage; the loss closure ignores the value, so a zero per
-+                    # micro-batch is enough to satisfy it.
-+                    pp_schedule.step(
-+                        target=torch.zeros(len(pp_side_inputs), device="cuda"),
-+                        return_outputs=False,
-+                    )
-+                else:
-+                    pp_schedule.step(return_outputs=False)
-+            if dist.get_rank() == profile_rank:
-+                logger.info(
-+                    "PP CUDA profile:\n"
-+                    + schedule_profiler.key_averages().table(
-+                        sort_by="self_cpu_time_total", row_limit=40
-+                    )
++            if pp_rank == 0:
++                pp_schedule.step(pp_inputs, return_outputs=False)
++            elif pp_rank == parallel_dims.pp - 1:
++                # The schedule indexes target_mbs unconditionally on the last
++                # stage; the loss closure ignores the value, so a zero per
++                # micro-batch is enough to satisfy it.
++                pp_schedule.step(
++                    target=torch.zeros(len(pp_side_inputs), device="cuda"),
++                    return_outputs=False,
 +                )
++            else:
++                pp_schedule.step(return_outputs=False)
++            for stage_module in pp_stage_modules:
++                stage_module.emit_profile_reports()
 +            local_schedule_ms = 0.0
 +            if dist.get_rank() == 0 or profile_pp_stage:
 +                torch.cuda.synchronize()
@@ -23034,8 +23156,7 @@ index 295d3ad15e58c9536af46f075dde99230024e632..598d73dd82f7c7d5670ed53dca689b9b
          # across dp_cp so the final gradient is the true per-token mean over the global batch.
 -        for param in model.parameters():
 +        found_nonfinite = torch.zeros((), device="cuda", dtype=torch.int32)
-+        nonfinite_grad_names: list[str] = []
-+        for name, param in model.named_parameters():
++        for _, param in model.named_parameters():
              if param.grad is not None:
                  param.grad.mul_(parallel_dims.fsdp_gradient_divide_factor)
 +                grad = (
@@ -23045,14 +23166,6 @@ index 295d3ad15e58c9536af46f075dde99230024e632..598d73dd82f7c7d5670ed53dca689b9b
 +                )
 +                is_nonfinite = (~torch.isfinite(grad).all()).to(dtype=torch.int32)
 +                found_nonfinite = torch.maximum(found_nonfinite, is_nonfinite)
-+                if is_nonfinite.item():
-+                    nonfinite_grad_names.append(name)
-+        if nonfinite_grad_names:
-+            logger.error(
-+                "Non-finite local gradients at step {}: {}",
-+                progress.step,
-+                nonfinite_grad_names,
-+            )
 +
 +        # Do not silently replace NaN/Inf values with zero. That changes the
 +        # optimizer direction and made the later finite-norm guard ineffective.
@@ -23060,6 +23173,22 @@ index 295d3ad15e58c9536af46f075dde99230024e632..598d73dd82f7c7d5670ed53dca689b9b
 +        # collective gradient clipping path.
 +        dist.all_reduce(found_nonfinite, op=dist.ReduceOp.MAX)
 +        if found_nonfinite.item():
++            nonfinite_grad_names = []
++            for name, param in model.named_parameters():
++                if param.grad is not None:
++                    grad = (
++                        param.grad.to_local()
++                        if hasattr(param.grad, "to_local")
++                        else param.grad
++                    )
++                    if (~torch.isfinite(grad).all()).item():
++                        nonfinite_grad_names.append(name)
++            if nonfinite_grad_names:
++                logger.error(
++                    "Non-finite local gradients at step {}: {}",
++                    progress.step,
++                    nonfinite_grad_names,
++                )
 +            rejected_metrics = {
 +                **tensor_stats,
 +                "diagnostic/nonfinite_gradient": 1.0,
@@ -23100,7 +23229,7 @@ index 295d3ad15e58c9536af46f075dde99230024e632..598d73dd82f7c7d5670ed53dca689b9b
 
          zero_grad_ratio = get_zero_gradient_ratio(model.parameters(), parallel_dims.dp_replicate)
 
-@@ -585,16 +2222,36 @@ def train(config: TrainerConfig):
+@@ -585,16 +2217,36 @@ def train(config: TrainerConfig):
          # Update learning rate scheduler
          scheduler.step()
 
@@ -23138,7 +23267,7 @@ index 295d3ad15e58c9536af46f075dde99230024e632..598d73dd82f7c7d5670ed53dca689b9b
              broadcast_weights_time = 0
          else:
              broadcast_unused = (
-@@ -605,8 +2262,11 @@ def train(config: TrainerConfig):
+@@ -605,8 +2257,11 @@ def train(config: TrainerConfig):
              if not broadcast_unused:
                  broadcast_weights_start_time = time.perf_counter()
                  weight_broadcast.broadcast_weights(model, step=progress.step)
@@ -23152,7 +23281,7 @@ index 295d3ad15e58c9536af46f075dde99230024e632..598d73dd82f7c7d5670ed53dca689b9b
                  if config.weight_broadcast.type == "filesystem":
                      interval_to_keep = config.ckpt and config.ckpt.interval
                      weight_broadcast.maybe_clean(interval_to_keep)
-@@ -637,7 +2297,9 @@ def train(config: TrainerConfig):
+@@ -637,7 +2292,9 @@ def train(config: TrainerConfig):
                  # Single-run: Save full checkpoint
                  logger.info(f"Saving checkpoint at step {progress.step}")
                  save_ckpt_start_time = time.perf_counter()
@@ -23163,7 +23292,7 @@ index 295d3ad15e58c9536af46f075dde99230024e632..598d73dd82f7c7d5670ed53dca689b9b
                  save_ckpt_time += time.perf_counter() - save_ckpt_start_time
 
              ckpt_manager.maybe_clean()
-@@ -656,18 +2318,29 @@ def train(config: TrainerConfig):
+@@ -656,18 +2313,29 @@ def train(config: TrainerConfig):
          if memory_profiler is not None:
              memory_profiler.step()
 
@@ -23198,7 +23327,7 @@ index 295d3ad15e58c9536af46f075dde99230024e632..598d73dd82f7c7d5670ed53dca689b9b
 
          # Log step metrics
          step_time = time.perf_counter() - step_start_time
-@@ -680,7 +2353,9 @@ def train(config: TrainerConfig):
+@@ -680,7 +2348,9 @@ def train(config: TrainerConfig):
          if "max_vio/mean" in tensor_stats:
              step_message += f" | Max Vio {tensor_stats['max_vio/mean']:.4f}"
          if "routing_confidence/mean" in tensor_stats:
@@ -23209,7 +23338,7 @@ index 295d3ad15e58c9536af46f075dde99230024e632..598d73dd82f7c7d5670ed53dca689b9b
          logger.success(step_message)
 
          # Log performance metrics
-@@ -689,6 +2364,7 @@ def train(config: TrainerConfig):
+@@ -689,6 +2359,7 @@ def train(config: TrainerConfig):
              "perf/throughput_per_gpu": throughput / world.world_size,
              "perf/mfu": mfu,
              "perf/peak_memory": peak_memory,
@@ -23217,7 +23346,7 @@ index 295d3ad15e58c9536af46f075dde99230024e632..598d73dd82f7c7d5670ed53dca689b9b
              "step": progress.step,
          }
          monitor.log(perf_metrics, step=progress.step)
-@@ -710,7 +2386,9 @@ def train(config: TrainerConfig):
+@@ -710,7 +2381,9 @@ def train(config: TrainerConfig):
              tensor_stats["kl_ent_ratio/mean"] = mismatch_kl_mean / entropy_mean
 
          tensor_stats["step"] = progress.step
@@ -23228,7 +23357,7 @@ index 295d3ad15e58c9536af46f075dde99230024e632..598d73dd82f7c7d5670ed53dca689b9b
 
          # Log time metrics
          time_metrics = {
-@@ -753,7 +2431,11 @@ def train(config: TrainerConfig):
+@@ -753,7 +2426,11 @@ def train(config: TrainerConfig):
                  if config.max_concurrent_runs == 1:
                      lr = optimizer.param_groups[0]["lr"]
                  else:
@@ -23241,7 +23370,7 @@ index 295d3ad15e58c9536af46f075dde99230024e632..598d73dd82f7c7d5670ed53dca689b9b
                  run_stats.append(
                      RunStats(
                          run_id=run_id,
-@@ -785,8 +2467,6 @@ def train(config: TrainerConfig):
+@@ -785,8 +2462,6 @@ def train(config: TrainerConfig):
          prof.export_chrome_trace(trace_file)
          logger.info(f"Saved trace to {trace_file}")
 
@@ -23250,7 +23379,7 @@ index 295d3ad15e58c9536af46f075dde99230024e632..598d73dd82f7c7d5670ed53dca689b9b
      # Write final checkpoint (only for single-run mode; multi-run checkpoints are managed by MultiCheckpointManager)
      if config.max_concurrent_runs == 1 and ckpt_manager is not None:
          if not (config.ckpt and config.ckpt.weights_only):
-@@ -799,7 +2479,40 @@ def train(config: TrainerConfig):
+@@ -799,7 +2474,40 @@ def train(config: TrainerConfig):
          weight_ckpt_manager.save(progress.step, model, tokenizer)
          weight_ckpt_manager.maybe_clean()
 
@@ -23334,28 +23463,56 @@ index 24dd48d..fa59891 100644
      # Run Discovery, Synchronization, and Eviction
      # =========================================================================
 diff --git a/src/prime_rl/trainer/utils.py b/src/prime_rl/trainer/utils.py
-index bc0f2e8..4c4b84d 100644
+index bc0f2e8c..ca65ff2d 100644
 --- a/src/prime_rl/trainer/utils.py
 +++ b/src/prime_rl/trainer/utils.py
-@@ -562,7 +562,16 @@ class Tensors(defaultdict):
+@@ -512,8 +512,8 @@ def export_benchmark_json(history: dict[str, list[Any]], output_path: Path) -> N
+
+ def flexible_all_gather(tensor: Tensor) -> Tensor:
+     """
+-    All-gather a 1D tensor between all ranks, with potentially different numbr of element per rank.
+-    Returns a tensor of shape (world_size * max_numel, dtype=tensor.dtype, device=tensor.device)
++    All-gather a 1D tensor between ranks with potentially different lengths.
++    Returns a tensor with the sum of all local lengths.
+     """
+
+     assert tensor.ndim == 1, "Can only flexibly all-gather 1D tensors"
+@@ -527,6 +527,11 @@ def flexible_all_gather(tensor: Tensor) -> Tensor:
+     all_numel_tensors = [torch.tensor(0, device=tensor.device) for _ in range(dist.get_world_size())]
+     dist.all_gather(all_numel_tensors, local_numel_tensor)
+     all_numels = [numel.item() for numel in all_numel_tensors]
++    if len(set(all_numels)) > 1 and dist.get_backend() == "nccl":
++        tensor = tensor.contiguous()
++        all_tensors = [tensor.new_empty(numel) for numel in all_numels]
++        dist.all_gather(all_tensors, tensor)
++        return torch.cat(all_tensors)
+     max_numel = int(max(all_numels))
+
+     # Pad the tensor with zeros if it has less elements than the maximum
+@@ -562,7 +567,11 @@ class Tensors(defaultdict):
          for key in keys:
              # All-gather tensors across steps and ranks (get global distribution)
              values = self.pop(key, [])
 -            tensors = torch.cat(values, dim=0).to("cuda") if values else torch.empty(0, device="cuda")
-+            # Cast to float32 before gathering. Under pipeline parallelism a rank
-+            # that owns no loss (any stage but the last) contributes an empty
-+            # tensor, and an empty tensor defaults to float32 while real values
-+            # may be bfloat16. flexible_all_gather sizes its buffers from the
-+            # LOCAL dtype, so mismatched dtypes desync the all-gather and every
-+            # statistic after the first one comes back as nan. These are logging
-+            # statistics, so widening to float32 costs nothing.
++            # Use one dtype because empty pipeline ranks default to float32 while
++            # real values may be bfloat16; these are logging statistics.
 +            tensors = (
 +                torch.cat(values, dim=0).to("cuda").float() if values else torch.empty(0, device="cuda", dtype=torch.float32)
 +            )
              assert tensors.ndim == 1, "Can only aggregate 1D tensors"
              tensors = flexible_all_gather(tensors)
              assert tensors.ndim == 1, "Can only aggregate 1D tensors"
-@@ -661,8 +670,10 @@ def maybe_clean(path: Path, step: int, interval_to_keep: int | None) -> None:
+@@ -583,9 +592,6 @@ class Tensors(defaultdict):
+             metrics[f"{key}/min"] = tensors.min().item()
+             metrics[f"{key}/max"] = tensors.max().item()
+
+-            # Add back all-gathered tensors to self
+-            self[key].append(tensors.tolist())
+-
+         return metrics
+
+
+@@ -661,8 +667,10 @@ def maybe_clean(path: Path, step: int, interval_to_keep: int | None) -> None:
      ckpt from ``step - 1``; ``step - 2`` is therefore safe to remove unless it falls on a
      checkpoint interval that we want to preserve.
      """

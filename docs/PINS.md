@@ -21,8 +21,13 @@ The Dockerfile `COPY` is a separate image-build step. Deployment copies the
 local `prime-rl/` overlay to configured host paths, and launchers bind-mount
 files into `/app/src`; deployment does not modify an existing image. The local
 directory is not a separate Git checkout. `prime-rl.patch` is the portable
-copy of that overlay; it is currently stale and not regenerated. It is not
-applied by the Dockerfile and is not a complete current deployment source.
+copy of that overlay, refreshed against base
+`f50ec5c4c8c45864ec535dead2c3b630de50d068` for four source files. Its other 47
+blocks, including dependency blocks, are unchanged. Source/package hunks
+passed apply-check against this base with `deps/*` excluded. Dependency hunks
+were preserved, not reapplied to fresh dependency trees. It is not applied by
+the Dockerfile. This patch does not apply unchanged to reviewed upstream
+`26b3131`; that upgrade is not deployed.
 
 ## Models
 

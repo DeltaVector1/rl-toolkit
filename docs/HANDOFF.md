@@ -64,7 +64,7 @@ memory measurements.
 
 - The expert-target omission was confirmed and repaired at `9da34c2`; the
   load-boundary guard is at `a2fd4c2`.
-- A is configured with MTP 0. B is configured with MTP 1 in
+- A and B are now configured with MTP 1. B is configured in
   `6a3e756`. B was ready at 22:28:01 UTC with TP8, EP8, rank-32 expert LoRA,
   32K context, and CUDA graphs 128. Reported weights, graph, and KV memory
   were 94.7 GiB, 2.11 GiB, and 396,160 tokens; baseline B KV capacity was
@@ -77,6 +77,15 @@ memory measurements.
   host reached 226.22 tokens/s. This is a component indication, not a
   controlled full-run improvement. The B graph and MTP path stayed intact.
   Immediate repeated inputs reused the prefix cache.
+- The prior A MTP 0 historical control took 225.89, 203.57, and 225.13
+  tokens/s (median 225.13). With MTP 1, the same-host A test took 285.51,
+  286.86, and 268.93 tokens/s (median 285.51, about 26.8% higher). Across
+  32 requests including warmup, all requests returned HTTP 200; 8,192
+  generated token log-probabilities were finite, with no errors, restarts, or
+  preemptions. MTP accepted 3,294 of 4,844 draft tokens (about 68%). Graphs
+  and context were unchanged. A's reported KV capacity was 368,960 tokens
+  versus the prior 416,512; activation
+  allocations differed, so this is not a pure causal speed claim.
 - The MTP run total was 21.976009 s for 768 finite generated tokens, with all
   HTTP responses successful.
 - A separate B concurrent test completed 3 rounds of 8 requests: all 24 HTTP
@@ -84,7 +93,8 @@ memory measurements.
   preemptions, or restarts, and 57.99, 55.59, and 59.74 tokens/s. KV drained;
   memory plateaued at 141,085 MiB after round 1. This has no concurrent MTP 0
   baseline, so it is not a speed comparison.
-- This remains a small MTP trial, not production approval. Baseline and MTP
+- The trainer/inference MTP comparison is complete for this diagnostic. There
+  is no full rollout-throughput claim or production approval. Baseline and MTP
   tests had differing measured activation allocations, so the KV-capacity
   difference does not support a pure causal claim.
 - A historical, different-workload H200 32K prefill test passed two 96-request
@@ -118,6 +128,13 @@ documentation](https://docs.vllm.ai/en/latest/features/speculative_decoding/mtp/
 - Measured H200 image: `prime-rl:glm52-v080-glm52-h200-router`, vLLM 0.26;
   the orchestrator image is `prime-rl:glm52-decensor`.
 - Upstream `26b3131` was reviewed but is not upgraded.
+- `prime-rl.patch` was refreshed against base
+  `f50ec5c4c8c45864ec535dead2c3b630de50d068` for four source files. Its other
+  47 blocks, including dependency blocks, are unchanged. Source/package hunks
+  passed apply-check against this base with `deps/*` excluded. Dependency
+  hunks were preserved, not reapplied to fresh dependency trees. This patch
+  does not apply unchanged to reviewed upstream `26b3131`; that upgrade is not
+  deployed.
 - Keep the trainer timing limit at 600 seconds and the rollout limit at 720
   seconds. `watch()` reports only; it does not stop a test. The operator must
   stop and trace a test that exceeds the configured limit. A busy GPU is not

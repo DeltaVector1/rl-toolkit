@@ -71,8 +71,9 @@ trainer peak memory measurements.
   but no trained nonzero-adapter parity result is established.
 - The expert-target omission was confirmed and repaired at `9da34c2`; the
   load-boundary guard is at `a2fd4c2`.
-- H200 A uses MTP 0. B uses MTP 1 from `6a3e756`. B was ready at 22:28:01 UTC
-  with TP8, EP8, rank-32 expert LoRA, 32K context, and graphs 128. Weights,
+- H200 A and B now use MTP 1. B is configured from `6a3e756` and was ready at
+  22:28:01 UTC with TP8, EP8, rank-32 expert LoRA, 32K context, and graphs 128.
+  Weights,
   graph, and KV memory were 94.7 GiB, 2.11 GiB, and 396,160 tokens; baseline B
   KV capacity was 478,720 tokens. Three 32,512-prompt plus 256-output samples
   took 8.360, 6.743, and 6.873 s, or 34.95 tokens/s versus 27.08 before MTP,
@@ -87,14 +88,24 @@ trainer peak memory measurements.
   226.22 tokens/s. This is a component indication, not a controlled full-run
   improvement. The B graph and MTP path stayed intact. Immediate repeated
   inputs reused the prefix cache.
+- The prior A MTP 0 historical control took 225.89, 203.57, and 225.13
+  tokens/s (median 225.13). With MTP 1, the same-host A test took 285.51,
+  286.86, and 268.93 tokens/s (median 285.51, about 26.8% higher). Across
+  32 requests including warmup, all requests returned HTTP 200; 8,192
+  generated token log-probabilities were finite, with no errors, restarts, or
+  preemptions. MTP accepted 3,294 of 4,844 draft tokens (about 68%). Graphs
+  and context were unchanged. A's reported KV capacity was 368,960 tokens
+  versus the prior 416,512; activation
+  allocations differed, so this is not a pure causal speed claim.
 - A separate B concurrent test completed 3 rounds of 8 requests: all 24 HTTP
   responses were successful, with 6,144 finite generated tokens, zero errors,
   preemptions, or restarts, and 57.99, 55.59, and 59.74 tokens/s. KV drained;
   memory plateaued at 141,085 MiB after round 1. No concurrent MTP 0 baseline
-  exists, so this is not a speed comparison. This remains a small MTP trial,
-  not production approval. Baseline and MTP tests had differing measured
-  activation allocations, so the KV-capacity difference does not support a
-  pure causal claim.
+  exists, so this is not a speed comparison. The trainer/inference MTP
+  comparison is complete for this diagnostic. There is no full rollout-
+  throughput claim or production approval. Baseline and MTP tests had
+  differing measured activation allocations, so the KV-capacity difference
+  does not support a pure causal claim.
 
 A historical, different-workload H200 32K prefill test passed two 96-request
 runs at 1,459.6 and 1,454.5 tokens/s with 32,768 prefill tokens, rank 32,
@@ -158,6 +169,12 @@ was reviewed but is not upgraded.
 The local `prime-rl/` overlay is copied to configured host paths at deploy;
 launchers bind-mount files into `/app/src`. Dockerfile `COPY` is a separate
 image build step, and deploy does not modify an existing image or hot-reload a
-running process. The portable patch is not currently regenerated.
+running process. `prime-rl.patch` was refreshed against base
+`f50ec5c4c8c45864ec535dead2c3b630de50d068` for four source files. Its other 47
+  blocks, including dependency blocks, are unchanged. Source/package hunks
+  passed apply-check against this base with `deps/*` excluded. Dependency
+  hunks were preserved, not reapplied to fresh dependency trees. This patch
+  does not apply unchanged to reviewed upstream `26b3131`; that upgrade is not
+  deployed.
 
 No Decensor environment or reward edits were made in these fixes.

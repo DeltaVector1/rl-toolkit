@@ -112,8 +112,13 @@ profile in `configs/operations.toml` and its files.
 The local `prime-rl/` overlay is copied to configured host paths at deploy;
 launchers bind-mount files into `/app/src`. Dockerfile `COPY` is a separate
 image build step, and deploy does not modify an existing image or hot-reload a
-running process. The portable patch is not currently regenerated. Do not
-restart an old cold run without an owner decision.
+running process. `prime-rl.patch` was refreshed against base
+`f50ec5c4c8c45864ec535dead2c3b630de50d068` for four source files. Its other 47
+blocks, including dependency blocks, are unchanged. Source/package hunks
+passed apply-check against this base with `deps/*` excluded. Dependency hunks
+were preserved, not reapplied to fresh dependency trees. This patch does not
+apply unchanged to reviewed upstream `26b3131`; that upgrade is not deployed.
+Do not restart an old cold run without an owner decision.
 
 No Decensor environment or reward edits were made in these fixes.
 
