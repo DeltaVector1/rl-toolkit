@@ -5460,13 +5460,19 @@ def start(
             lambda h: _ssh(
                 h,
                 f"node_id={shlex.quote(h.removeprefix('n'))} {env} "
-                f"bash {trainer_launcher} trainer >/dev/null 2>&1; echo done",
+                f"bash {trainer_launcher} trainer",
                 300,
             ),
         )
-        failed = [host for host, (code, _output) in results.items() if code]
+        failed = {
+            host: " | ".join(output.strip().splitlines()[-5:])
+            if output.strip()
+            else "no output"
+            for host, (code, output) in results.items()
+            if code
+        }
         if failed:
-            raise RuntimeError(f"trainer start failed on {failed}")
+            raise RuntimeError(f"trainer start failed: {failed}")
 
     def launch_adapter():
         print(f"starting adapter server on {trainer_head}")
@@ -5475,11 +5481,12 @@ def start(
             trainer_head,
             f"node_id={shlex.quote(node_id)} {runtime_env} RUN={shlex.quote(run)}"
             f"{predictive_adapter_env} "
-            f"bash {trainer_launcher} adapter-http >/dev/null 2>&1; echo done",
+            f"bash {trainer_launcher} adapter-http",
             300,
         )
         if rc:
-            raise RuntimeError(f"adapter server start failed on {trainer_head}: {out}")
+            detail = " | ".join(out.strip().splitlines()[-5:]) if out.strip() else "no output"
+            raise RuntimeError(f"adapter server start failed on {trainer_head}: {detail}")
 
     def launch_orch():
         print(f"starting edge orchestrator on {orchestrator_host}")
@@ -5700,13 +5707,19 @@ def qualify(
             host,
             f"node_id={shlex.quote(host.removeprefix('n'))} {env} "
             f"bash {repository_root}/.agents/skills/training-ops/runtime/china/cluster.sh "
-            "trainer >/dev/null 2>&1; echo done",
+            "trainer",
             300,
         ),
     )
-    failed = [host for host, (rc, _out) in results.items() if rc]
+    failed = {
+        host: " | ".join(output.strip().splitlines()[-5:])
+        if output.strip()
+        else "no output"
+        for host, (rc, output) in results.items()
+        if rc
+    }
     if failed:
-        raise RuntimeError(f"qualification trainer launch failed on {failed}")
+        raise RuntimeError(f"qualification trainer launch failed: {failed}")
     print(
         f"started trainer-only qualification {name} on {len(nodes)} nodes; "
         "call status() or watch()"
