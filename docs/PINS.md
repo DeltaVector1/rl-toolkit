@@ -8,13 +8,21 @@ new requirement to pin every package or dataset.
 - Prime-RL base: `f50ec5c4c8c45864ec535dead2c3b630de50d068`
 - Renderers base: `bdb96b0c84a307e2b71c6a366c9d718c3ac7fe78`
 - Verifiers base: `295a0650585af8754eaf98c6fa9071314b5a531c`
-- Trainer image: `prime-rl:glm52-decensor`
+- Measured trainer image: `prime-rl:glm52-fp8`
 - Python in the measured trainer image: 3.12
 - PyTorch in the measured trainer image: `2.11.0+cu128`
+- NCCL in the measured trainer image: `2.28.9`
+- Measured H200 image: `prime-rl:glm52-v080-glm52-h200-router`
+- Measured H200 vLLM: `0.26`
+- Orchestrator image: `prime-rl:glm52-decensor`
+- Upstream `26b3131` was reviewed but is not upgraded.
 
-The Dockerfile copies the local `prime-rl/` overlay onto the prebuilt trainer
-image. The local directory is not a separate Git checkout. `prime-rl.patch`
-is the portable copy of that overlay; it is not applied by the Dockerfile.
+The Dockerfile `COPY` is a separate image-build step. Deployment copies the
+local `prime-rl/` overlay to configured host paths, and launchers bind-mount
+files into `/app/src`; deployment does not modify an existing image. The local
+directory is not a separate Git checkout. `prime-rl.patch` is the portable
+copy of that overlay; it is currently stale and not regenerated. It is not
+applied by the Dockerfile and is not a complete current deployment source.
 
 ## Models
 
