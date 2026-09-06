@@ -13,7 +13,7 @@ generate_samples = true
 
 [log]
 level = "debug"
-ranks_filter = [0]
+ranks_filter = [0, 8]
 
 [file_monitor]
 filename = "trainer-metrics.jsonl"
