@@ -9,6 +9,8 @@ import verifiers.v1 as vf
 from pydantic import Field
 
 from testing_perf_env.judge import TestingPerfJudge, TestingPerfJudgeConfig, TurnReview
+from testing_perf_env.state import TestingPerfState
+from testing_perf_env.user import TestingPerfUser, TestingPerfUserConfig
 
 
 def _safe_error(error: Exception) -> dict[str, Any]:
@@ -37,6 +39,7 @@ class TestingPerfData(vf.TaskData):
 
 
 class TestingPerfTaskConfig(vf.TaskConfig):
+    user: TestingPerfUserConfig = TestingPerfUserConfig()
     judge: TestingPerfJudgeConfig = TestingPerfJudgeConfig()
 
 
@@ -134,7 +137,13 @@ def _prompt(row: dict[str, Any], response_format: str) -> str:
     )
 
 
-class TestingPerfTask(vf.Task[TestingPerfData, vf.State, TestingPerfTaskConfig]):
+class TestingPerfTask(vf.Task[TestingPerfData, TestingPerfState, TestingPerfTaskConfig]):
+    user = TestingPerfUser
+
+    async def setup(self, trace: vf.Trace, runtime: vf.Runtime) -> None:
+        trace.state.target_turns = self.data.target_turns
+        trace.state.follow_ups = list(self.data.follow_ups)
+
     @vf.stop
     async def done(self, trace: vf.Trace) -> bool:
         return trace.num_turns >= self.data.target_turns

@@ -1,4 +1,4 @@
-"""Focused mocked-backend check for the installed verifiers.v1 integration."""
+"""Focused compatibility check for the original verifiers.v1 integration."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import json
 import os
 import sys
 import tomllib
-from types import SimpleNamespace
 
 check_dir = os.path.dirname(__file__)
 sys.path.insert(0, os.path.join(check_dir, "src"))
@@ -21,41 +20,21 @@ from testing_perf_env.taskset import (  # noqa: E402
     TestingPerfTaskConfig,
     TestingPerfTasksetConfig,
 )
-
-
-class FakeInteraction:
-    def __init__(self, replies: list[str]):
-        self.replies = replies
-        self.calls: list = []
-        self.index = 0
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *args):
-        return False
-
-    async def turn(self, message=None):
-        self.calls.append(message)
-        reply = self.replies[self.index]
-        self.index += 1
-        return SimpleNamespace(
-            terminated=self.index >= len(self.replies),
-            last_reply=reply,
-        )
+from testing_perf_env.state import TestingPerfState  # noqa: E402
+from testing_perf_env.user import TestingPerfUser, TestingPerfUserConfig  # noqa: E402
 
 
 class FakeAssistant:
-    def __init__(self, replies: list[str]):
-        self.interaction_instance = FakeInteraction(replies)
+    def __init__(self):
+        self.calls = 0
 
-    def interaction(self, task):
-        return self.interaction_instance
+    async def run(self, task):
+        self.calls += 1
 
 
 class FakeAgents:
-    def __init__(self, replies: list[str]):
-        self.assistant = FakeAssistant(replies)
+    def __init__(self):
+        self.assistant = FakeAssistant()
 
 
 class FakeServiceError(ConnectionError):
@@ -69,7 +48,13 @@ def make_task(target_turns: int = 2, max_attempts: int = 3) -> TestingPerfTask:
             prompt="Make a short plan for sorting a desk. Use plain text.",
             task_id="desk-plan",
             requirements=["name two groups", "include one review step"],
-            follow_ups=["Add one way to review the plan."],
+            follow_ups=[
+                "Add one way to review the plan.",
+                "Group the plan into two sections.",
+                "Add one practical reminder.",
+                "Summarise the plan in one line.",
+                "Give the plan a short title.",
+            ],
             target_turns=target_turns,
             target_words=400,
             response_format="plain",
@@ -87,7 +72,8 @@ def make_task(target_turns: int = 2, max_attempts: int = 3) -> TestingPerfTask:
 def make_trace(task: TestingPerfTask, answers: list[str]) -> vf.Trace:
     trace = vf.Trace(
         task=vf.TraceTask(type=type(task).__name__, data=task.data),
-        agent=vf.AgentInfo(config=vf.AgentConfig(harness={"id": "null"})),
+        state=TestingPerfState(),
+        agent=vf.AgentInfo(model="mock", harness=vf.HarnessConfig(id="null")),
     )
     parent: int | None = None
     for index, answer in enumerate(answers):
@@ -120,7 +106,7 @@ async def run() -> None:
     profiles = operations_config["profiles"]
     assert profiles["current"]["orchestrator_image"] == "prime-rl:glm52-decensor"
     assert profiles["testing-perf"]["orchestrator_image"] == (
-        "prime-rl:glm52-v080-glm52-h200-router"
+        "prime-rl:glm52-decensor"
     )
     with open(
         os.path.join(
@@ -147,7 +133,7 @@ async def run() -> None:
         id="testing-perf-env", num_examples=5, dataset_seed=1, max_turns=6
     )
     taskset = vf.load_taskset(taskset_config)
-    loaded_tasks = list(taskset)
+    loaded_tasks = taskset.select()
     assert [task.data.target_turns for task in loaded_tasks] == [2, 3, 4, 5, 6]
     assert [task.data.target_words for task in loaded_tasks] == [
         500,
@@ -162,7 +148,7 @@ async def run() -> None:
         bounded = TestingPerfTasksetConfig(
             id="testing-perf-env", num_examples=1, max_turns=max_turns
         )
-        assert 2 <= next(iter(vf.load_taskset(bounded))).data.target_turns <= max_turns
+        assert 2 <= vf.load_taskset(bounded).select(1)[0].data.target_turns <= max_turns
     env_config = vf.resolve_env_config(
         {
             "id": "testing-perf-env",
@@ -172,15 +158,32 @@ async def run() -> None:
     env = vf.load_environment(env_config)
     assert isinstance(env, TestingPerfEnv)
 
-    agents = FakeAgents(["first", "second"])
+    agents = FakeAgents()
     await env.run(make_task(), agents)
-    assert agents.assistant.interaction_instance.calls == [
-        None,
-        "Add one way to review the plan.",
-    ]
-    six_turn_agents = FakeAgents(["reply"] * 6)
-    await env.run(loaded_tasks[-1], six_turn_agents)
-    assert len(six_turn_agents.assistant.interaction_instance.calls) == 6
+    assert agents.assistant.calls == 1
+
+    from verifiers.v1.mcp.server import _call_state
+
+    for target_turns in (2, 6):
+        task = make_task(target_turns=target_turns)
+        trace = make_trace(task, [])
+        await task.setup(trace, None)
+        user = TestingPerfUser(TestingPerfUserConfig())
+        token = _call_state.set(trace.state)
+        try:
+            await user.setup_task(task.data)
+            follow_ups = []
+            for index in range(target_turns - 1):
+                messages = await user.respond(f"answer-{index}")
+                assert len(messages) == 1
+                follow_ups.append(messages[0].content)
+            assert await user.respond("final-answer") == []
+        finally:
+            _call_state.reset(token)
+        assert follow_ups == task.data.follow_ups[: target_turns - 1]
+        assert trace.state.next_follow_up == target_turns - 1
+        assert not await task.done(make_trace(task, ["reply"] * (target_turns - 1)))
+        assert await task.done(make_trace(task, ["reply"] * target_turns))
 
     original_complete = TestingPerfJudge.complete
     responses = [
@@ -213,7 +216,7 @@ async def run() -> None:
         exact_answer = "word " * task.data.target_words
         trace = make_trace(task, [exact_answer, exact_answer])
         await task.score(trace)
-        exact_score = trace.rewards["testing_perf_reward"].score
+        exact_score = trace.rewards["testing_perf_reward"]
         assert exact_score == 1.0
         assert trace.info["testing_perf"]["evaluation_status"] == "scored"
         assert trace.info["testing_perf"]["target_words"] == 400
@@ -239,7 +242,7 @@ async def run() -> None:
         )
         short_trace = make_trace(task, ["word " * 200] * 2)
         await task.score(short_trace)
-        short_score = short_trace.rewards["testing_perf_reward"].score
+        short_score = short_trace.rewards["testing_perf_reward"]
         assert 0.0 < short_score < exact_score
         assert short_trace.info["testing_perf"]["word_counts"] == [200, 200]
         assert short_trace.info["testing_perf"]["length_scores"] == [0.5, 0.5]
@@ -259,7 +262,7 @@ async def run() -> None:
         )
         overlong_trace = make_trace(task, ["word " * 800] * 2)
         await task.score(overlong_trace)
-        assert overlong_trace.rewards["testing_perf_reward"].score == short_score
+        assert overlong_trace.rewards["testing_perf_reward"] == short_score
         assert overlong_trace.info["testing_perf"]["word_counts"] == [800, 800]
         assert overlong_trace.info["testing_perf"]["length_scores"] == [0.5, 0.5]
 
@@ -278,11 +281,11 @@ async def run() -> None:
         )
         zero_trace = make_trace(task, [exact_answer, exact_answer])
         await task.score(zero_trace)
-        assert zero_trace.rewards["testing_perf_reward"].score == 0.25
+        assert zero_trace.rewards["testing_perf_reward"] == 0.25
 
         empty_trace = make_trace(task, ["", "review the groups"])
         await task.score(empty_trace)
-        assert empty_trace.rewards["testing_perf_reward"].score == 0
+        assert empty_trace.rewards["testing_perf_reward"] == 0
         assert empty_trace.info["testing_perf"]["evaluation_status"] == (
             "invalid_model_response"
         )
@@ -306,7 +309,7 @@ async def run() -> None:
             pass
         else:
             raise AssertionError("exhausted malformed judges must fail scoring")
-        assert failed.rewards["testing_perf_reward"] is None
+        assert failed.rewards.get("testing_perf_reward") is None
         assert failed.info["testing_perf"]["evaluation_status"] == (
             "unscored_invalid_judge_response"
         )
@@ -358,7 +361,7 @@ async def run() -> None:
             pass
         else:
             raise AssertionError("exhausted service attempts must fail scoring")
-        assert service_failed.rewards["testing_perf_reward"] is None
+        assert service_failed.rewards.get("testing_perf_reward") is None
         assert service_failed.info["testing_perf"]["evaluation_status"] == (
             "unscored_service_failure"
         )
@@ -369,4 +372,4 @@ async def run() -> None:
 
 if __name__ == "__main__":
     asyncio.run(run())
-    print("testing-perf-env mocked framework check: ok")
+    print("testing-perf-env original-image compatibility check: ok")

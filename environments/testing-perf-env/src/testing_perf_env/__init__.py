@@ -6,6 +6,8 @@ from testing_perf_env.taskset import (
     TestingPerfTaskset,
     TestingPerfTasksetConfig,
 )
+from testing_perf_env.state import TestingPerfState
+from testing_perf_env.user import TestingPerfUser, TestingPerfUserConfig
 
 __all__ = [
     "TestingPerfData",
@@ -15,4 +17,7 @@ __all__ = [
     "TestingPerfTaskConfig",
     "TestingPerfTaskset",
     "TestingPerfTasksetConfig",
+    "TestingPerfState",
+    "TestingPerfUser",
+    "TestingPerfUserConfig",
 ]

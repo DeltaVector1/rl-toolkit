@@ -15,13 +15,7 @@ class TestingPerfEnvConfig(vf.EnvConfig):
 
 class TestingPerfEnv(vf.Env[TestingPerfEnvConfig]):
     async def run(self, task: vf.Task, agents: vf.Agents) -> None:
-        async with agents.assistant.interaction(task) as assistant:
-            target_turns = max(2, min(6, int(task.data.target_turns)))
-            segment = await assistant.turn()
-            for follow_up in task.data.follow_ups[: target_turns - 1]:
-                if segment.terminated:
-                    break
-                segment = await assistant.turn(follow_up)
+        await agents.assistant.run(task)
 
 
 __all__ = ["TestingPerfEnv"]
