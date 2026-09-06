@@ -512,8 +512,8 @@ def export_benchmark_json(history: dict[str, list[Any]], output_path: Path) -> N
 
 def flexible_all_gather(tensor: Tensor) -> Tensor:
     """
-    All-gather a 1D tensor between all ranks, with potentially different numbr of element per rank.
-    Returns a tensor of shape (world_size * max_numel, dtype=tensor.dtype, device=tensor.device)
+    All-gather a 1D tensor between ranks with potentially different lengths.
+    Returns a tensor with the sum of all local lengths.
     """
 
     assert tensor.ndim == 1, "Can only flexibly all-gather 1D tensors"
@@ -527,6 +527,11 @@ def flexible_all_gather(tensor: Tensor) -> Tensor:
     all_numel_tensors = [torch.tensor(0, device=tensor.device) for _ in range(dist.get_world_size())]
     dist.all_gather(all_numel_tensors, local_numel_tensor)
     all_numels = [numel.item() for numel in all_numel_tensors]
+    if len(set(all_numels)) > 1 and dist.get_backend() == "nccl":
+        tensor = tensor.contiguous()
+        all_tensors = [tensor.new_empty(numel) for numel in all_numels]
+        dist.all_gather(all_tensors, tensor)
+        return torch.cat(all_tensors)
     max_numel = int(max(all_numels))
 
     # Pad the tensor with zeros if it has less elements than the maximum
@@ -562,13 +567,8 @@ class Tensors(defaultdict):
         for key in keys:
             # All-gather tensors across steps and ranks (get global distribution)
             values = self.pop(key, [])
-            # Cast to float32 before gathering. Under pipeline parallelism a rank
-            # that owns no loss (any stage but the last) contributes an empty
-            # tensor, and an empty tensor defaults to float32 while real values
-            # may be bfloat16. flexible_all_gather sizes its buffers from the
-            # LOCAL dtype, so mismatched dtypes desync the all-gather and every
-            # statistic after the first one comes back as nan. These are logging
-            # statistics, so widening to float32 costs nothing.
+            # Use one dtype because empty pipeline ranks default to float32 while
+            # real values may be bfloat16; these are logging statistics.
             tensors = (
                 torch.cat(values, dim=0).to("cuda").float() if values else torch.empty(0, device="cuda", dtype=torch.float32)
             )
@@ -591,9 +591,6 @@ class Tensors(defaultdict):
             metrics[f"{key}/std"] = tensors.std().item()
             metrics[f"{key}/min"] = tensors.min().item()
             metrics[f"{key}/max"] = tensors.max().item()
-
-            # Add back all-gathered tensors to self
-            self[key].append(tensors.tolist())
 
         return metrics
 
