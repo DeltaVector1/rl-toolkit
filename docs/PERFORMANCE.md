@@ -19,7 +19,7 @@ weight transfer, H200 activation, judging, and save time separate.
 
 `glm-perf-2` started on 2026-09-07. All eight trainers were up by 15:34 UTC.
 At 16:00 UTC, no optimizer step had completed; the first complete 16/1,024
-group was recorded at 15:58:21. All eight environments had expert activation
+group was recorded at 15:58:21. All eight trainers had expert activation
 offload 0 and `sm89-r32`. Inference A and B remained MTP 1 with 32K context and
 existing graphs.
 
