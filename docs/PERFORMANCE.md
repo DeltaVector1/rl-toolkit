@@ -17,6 +17,16 @@ weight transfer, H200 activation, judging, and save time separate.
 
 ## Current neutral production-shaped run
 
+Latest attempt: 0 optimizer steps. Both H200s loaded the correct step-0
+adapter (B at 17:26:15 UTC, A at 17:26:20). A received all bytes in
+2,674.547 seconds and finished staging in 2,713.330 seconds. B received all
+bytes in 82.705 seconds and finished staging in 116.598 seconds. These are
+full startup-copy measurements, not positive-step update measurements.
+The orchestrator then failed to write its receiver confirmation into the
+root-owned H200A `broadcasts/step_0` directory. Training was stopped; engines
+and complete adapters were preserved. Fresh rollout and compute timings for
+this restart remain unmeasured.
+
 `glm-perf-2` started on 2026-09-07; all eight trainers were up by 15:34 UTC.
 The first attempt entered an API retry storm at 16:03:52 after about 1,800
 seconds and stopped at 16:05:14 with 0 optimizer steps, 32/1,024 collected

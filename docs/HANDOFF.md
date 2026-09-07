@@ -5,6 +5,14 @@ port, container, and profile value.
 
 ## Current state
 
+- Latest attempt stopped with 0 optimizer steps. Both H200s loaded the correct
+  `glm-perf-2` step-0 adapter (B at 17:26:15 UTC, A at 17:26:20). A staging
+  took 2,713.330 seconds; B took 116.598 seconds. The orchestrator then failed
+  to write `broadcasts/step_0/.receivers-ready.json.<tmp>` on H200A because
+  the step directory was root-owned with mode 0755. Trainers and orchestrator
+  were stopped; inference engines and complete adapters were preserved.
+  The directory ownership and its creator need repair before retry. Reuse
+  the saved complete adapter; do not regenerate it and repeat the full copy.
 - No completed full production RL result is established. The neutral
   `glm-perf-1` run stopped after more than 43 minutes. Its batch contained
   16,520,157 effective tokens, including 11,935,614 generated tokens. At about
