@@ -812,11 +812,8 @@ class RolloutDispatcher:
             for marker in ("connection", "timed out", "timeout", "readtimeout")
         ):
             return False
-        if error.type == "HarnessError":
-            # The custom null harness wraps httpx.ReadTimeout after useful
-            # turns as HarnessError. It is still a policy-client failure and
-            # must be retried away from the client pinned to this GRPO group.
-            return True
+        # A timeout without a failed policy call can be an outer episode
+        # deadline, not a policy transport failure.
         return failed_policy_call
 
     @staticmethod

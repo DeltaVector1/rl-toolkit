@@ -1,14 +1,35 @@
+import ast
+import asyncio
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import training_ops
+
+
+def _load_function(path, name, namespace=None):
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    node = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == name
+    )
+    node.decorator_list = []
+    node.returns = None
+    for arg in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs):
+        arg.annotation = None
+    values = dict(namespace or {})
+    module = ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[]))
+    exec(compile(module, str(path), "exec"), values)
+    return values[name]
 
 
 class OrchestratorRepairTest(unittest.TestCase):
@@ -35,7 +56,7 @@ class OrchestratorRepairTest(unittest.TestCase):
         host, script, timeout = ssh_calls[0]
         self.assertEqual(host, training_ops.orchestrator_host)
         self.assertEqual(timeout, 180)
-        self.assertIn("RUN=glm-perf-1 RUN_NAME=run_glm-perf-1", script)
+        self.assertIn("RUN=glm-perf-2 RUN_NAME=run_glm-perf-2", script)
         self.assertIn(
             "ORCH_CONFIG=/data/glm52-rl/deployment/configs/testing-perf/orchestrator.toml",
             script,
@@ -59,6 +80,84 @@ class OrchestratorRepairTest(unittest.TestCase):
         self.assertIn("unknown launcher argument", source)
         self.assertIn("adapter tunnel reconciliation did not establish", source)
         self.assertLess(mode_start, docker_start)
+
+    def test_null_harness_bridge_disables_hidden_sdk_deadline_and_retry(self):
+        root = Path(__file__).resolve().parents[4]
+        harness_path = root / "prime-rl/deps/verifiers/verifiers/v1/harnesses/null/harness.py"
+        launcher = (
+            root / ".agents/skills/training-ops/runtime/h200/start_orchestrator.sh"
+        ).read_text(encoding="utf-8")
+        event = asyncio.Event()
+        client = SimpleNamespace(close=mock.AsyncMock())
+
+        async def pending(**_kwargs):
+            await event.wait()
+
+        create = mock.AsyncMock(side_effect=pending)
+        client.chat = SimpleNamespace(completions=SimpleNamespace(create=create))
+        client_factory = mock.Mock(return_value=client)
+
+        launch = _load_function(
+            harness_path,
+            "launch",
+            {
+                "APIStatusError": type("APIStatusError", (Exception,), {}),
+                "AsyncOpenAI": client_factory,
+                "ProgramResult": lambda **kwargs: kwargs,
+                "message_to_wire": lambda message: message,
+            },
+        )
+        harness = SimpleNamespace(resolve_prompt=lambda _data: ("system", "prompt"))
+        with self.assertRaises(asyncio.TimeoutError):
+            asyncio.run(
+                asyncio.wait_for(
+                    launch(
+                        harness,
+                        SimpleNamespace(model="mock"),
+                        SimpleNamespace(task=SimpleNamespace(data={})),
+                        None,
+                        "http://127.0.0.1",
+                        "secret",
+                        {},
+                    ),
+                    timeout=0.05,
+                )
+            )
+        self.assertEqual(create.await_count, 1)
+        client_factory.assert_called_once()
+        client_kwargs = client_factory.call_args.kwargs
+        self.assertIsNone(client_kwargs["timeout"])
+        self.assertEqual(client_kwargs["max_retries"], 0)
+        self.assertEqual(client.close.await_count, 1)
+        harness_mount = (
+            '-v "$deployment/prime-rl/deps/verifiers/verifiers/v1/'
+            'harnesses/null/harness.py":/app/deps/verifiers/verifiers/v1/'
+            'harnesses/null/harness.py:ro \\\n'
+        )
+        self.assertIn(harness_mount, launcher)
+        docker_start = launcher.index('sudo docker run -d --name "$ORCH_CT"')
+        entrypoint = launcher.index(
+            '--entrypoint /app/.venv/bin/orchestrator', docker_start
+        )
+        self.assertLess(docker_start, launcher.index(harness_mount))
+        self.assertLess(launcher.index(harness_mount), entrypoint)
+
+    def test_harness_timeout_retries_only_after_failed_policy_call(self):
+        root = Path(__file__).resolve().parents[4]
+        dispatcher_path = root / "prime-rl/src/prime_rl/orchestrator/dispatcher.py"
+        check = _load_function(
+            dispatcher_path, "_is_transient_policy_failure", {"Rollout": object}
+        )
+        probe = SimpleNamespace(policy=SimpleNamespace(model_name="policy"))
+        rollout = lambda typ, msg, calls=(): SimpleNamespace(
+            error=SimpleNamespace(type=typ, message=msg), calls=list(calls)
+        )
+        transient = SimpleNamespace(model="policy", error=SimpleNamespace())
+        self.assertFalse(check(probe, rollout("HarnessError", "API timeout")))
+        self.assertTrue(check(probe, rollout("HarnessError", "API timeout", [transient])))
+        self.assertTrue(
+            check(probe, rollout("ProviderError", "connection timeout", [transient]))
+        )
 
     def test_safety_probe_does_not_require_generation(self):
         script = training_ops._orchestrator_resume_safety_script([8000])

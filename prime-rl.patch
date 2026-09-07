@@ -226,7 +226,7 @@ index 6a7df33..1ee1567 100644
              try:
                  response.raise_for_status()
 diff --git a/deps/verifiers/verifiers/v1/harnesses/null/harness.py b/deps/verifiers/verifiers/v1/harnesses/null/harness.py
-index 96f85d7..545b5e9 100644
+index 96f85d7..42973ff 100644
 --- a/deps/verifiers/verifiers/v1/harnesses/null/harness.py
 +++ b/deps/verifiers/verifiers/v1/harnesses/null/harness.py
 @@ -1,13 +1,13 @@
@@ -262,7 +262,7 @@ index 96f85d7..545b5e9 100644
 
      async def launch(
          self,
-@@ -34,9 +34,28 @@ class NullHarness(Harness[NullHarnessConfig]):
+@@ -34,9 +34,33 @@ class NullHarness(Harness[NullHarnessConfig]):
          endpoint: str,
          secret: str,
          mcp_urls: dict[str, str],
@@ -280,7 +280,12 @@ index 96f85d7..545b5e9 100644
 +                messages.append({"role": "user", "content": prompt})
 +            elif prompt is not None:
 +                messages.extend(message_to_wire(message) for message in prompt)
-+            client = AsyncOpenAI(base_url=endpoint, api_key=secret)
++            client = AsyncOpenAI(
++                base_url=endpoint,
++                api_key=secret,
++                timeout=None,
++                max_retries=0,
++            )
 +            try:
 +                await client.chat.completions.create(model=ctx.model, messages=messages)
 +            except APIStatusError:
@@ -293,7 +298,7 @@ index 96f85d7..545b5e9 100644
          env = {**self.config.resolved_env}
          args = [
              f"--base-url={endpoint}",
-@@ -45,27 +64,23 @@ class NullHarness(Harness[NullHarnessConfig]):
+@@ -45,27 +69,23 @@ class NullHarness(Harness[NullHarnessConfig]):
          ]
          if system_prompt:
              args.append(f"--system-prompt={system_prompt}")
@@ -6339,7 +6344,7 @@ index 0b87fa7..bce8800 100644
          for rollout, advantage in zip(group, advantages.tolist(), strict=True):
              rollout.assign_advantages(advantage)
 diff --git a/src/prime_rl/orchestrator/dispatcher.py b/src/prime_rl/orchestrator/dispatcher.py
-index 998ff6f..af787d3 100644
+index 998ff6f..e9ebe23 100644
 --- a/src/prime_rl/orchestrator/dispatcher.py
 +++ b/src/prime_rl/orchestrator/dispatcher.py
 @@ -29,6 +29,7 @@ import uuid
@@ -6758,7 +6763,7 @@ index 998ff6f..af787d3 100644
              if r.has_error:
                  self.metrics.record_error(kind=meta.kind, env_name=meta.env_name)
                  if not is_synth_exception and r.error is not None:
-@@ -547,6 +766,71 @@ class RolloutDispatcher:
+@@ -547,6 +766,68 @@ class RolloutDispatcher:
              for r in rollouts:
                  await self.emit_episode(meta, group, [r])
 
@@ -6808,11 +6813,8 @@ index 998ff6f..af787d3 100644
 +            for marker in ("connection", "timed out", "timeout", "readtimeout")
 +        ):
 +            return False
-+        if error.type == "HarnessError":
-+            # The custom null harness wraps httpx.ReadTimeout after useful
-+            # turns as HarnessError. It is still a policy-client failure and
-+            # must be retried away from the client pinned to this GRPO group.
-+            return True
++        # A timeout without a failed policy call can be an outer episode
++        # deadline, not a policy transport failure.
 +        return failed_policy_call
 +
 +    @staticmethod
@@ -6830,7 +6832,7 @@ index 998ff6f..af787d3 100644
      async def emit_episode(self, meta: InflightRollout, group: GroupState | None, rollouts: list[Rollout]) -> None:
          """Stamp prime-rl metadata onto one completed episode and put it on
          ``out_q``. Pops the group from ``self.groups`` once every owed episode
-@@ -559,6 +843,7 @@ class RolloutDispatcher:
+@@ -559,6 +840,7 @@ class RolloutDispatcher:
              group.emitted += 1
              if group.emitted >= group.target_rollouts:
                  self.groups.pop(meta.group_id, None)
@@ -6838,7 +6840,7 @@ index 998ff6f..af787d3 100644
 
          for rollout in rollouts:
              rollout.kind = meta.kind
-@@ -569,6 +854,8 @@ class RolloutDispatcher:
+@@ -569,6 +851,8 @@ class RolloutDispatcher:
              if meta.kind == "eval":
                  assert eval_step is not None, "eval rollout missing eval_step"
                  rollout.eval_step = eval_step
@@ -6847,7 +6849,7 @@ index 998ff6f..af787d3 100644
          await self.out_q.put(rollouts)
 
      async def drop_group(self, group_id: uuid.UUID) -> int:
-@@ -577,6 +864,7 @@ class RolloutDispatcher:
+@@ -577,6 +861,7 @@ class RolloutDispatcher:
          (both in-flight and not-yet-scheduled). Returns the count for
          off-policy metrics."""
          group = self.groups.pop(group_id, None)
@@ -6855,7 +6857,7 @@ index 998ff6f..af787d3 100644
          task_idx = group.task_idx if group is not None else -1
 
          # Sync claim phase: pop matching tasks from ``self.inflight`` and
-@@ -666,6 +954,7 @@ class RolloutDispatcher:
+@@ -666,6 +951,7 @@ class RolloutDispatcher:
          tasks = list(self.inflight.keys())
          self.inflight.clear()
          self.groups.clear()
@@ -6863,7 +6865,7 @@ index 998ff6f..af787d3 100644
          if tasks:
              await safe_cancel_all(tasks)
 
-@@ -687,6 +976,7 @@ class RolloutDispatcher:
+@@ -687,6 +973,7 @@ class RolloutDispatcher:
              train_group_ids.add(meta.group_id)
          for gid in train_group_ids:
              self.groups.pop(gid, None)

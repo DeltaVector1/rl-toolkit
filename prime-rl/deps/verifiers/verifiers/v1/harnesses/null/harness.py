@@ -46,7 +46,12 @@ class NullHarness(Harness[NullHarnessConfig]):
                 messages.append({"role": "user", "content": prompt})
             elif prompt is not None:
                 messages.extend(message_to_wire(message) for message in prompt)
-            client = AsyncOpenAI(base_url=endpoint, api_key=secret)
+            client = AsyncOpenAI(
+                base_url=endpoint,
+                api_key=secret,
+                timeout=None,
+                max_retries=0,
+            )
             try:
                 await client.chat.completions.create(model=ctx.model, messages=messages)
             except APIStatusError:
