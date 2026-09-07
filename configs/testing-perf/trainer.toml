@@ -1,7 +1,11 @@
-output_dir = "/data/glm52-rl/runs/glm-perf-1"
+output_dir = "/data/glm52-rl/runs/glm-perf-2"
 max_steps = 20
 dist_timeout_seconds = 5400
 enable_router_replay = false
+
+[env_vars]
+PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD = "0"
+PRIME_LORA_MM_PROFILE = "sm89-r32"
 
 [parity_guard]
 max_unmasked_mismatch_kl = 0.1
@@ -14,12 +18,12 @@ ranks_filter = [0]
 
 [swanlab]
 project = "glm-runs"
-name = "trainer-glm-perf-1"
+name = "trainer-glm-perf-2"
 group = "glm-runs"
-tags = ["glm-perf-1", "glm-5.2", "testing-perf", "grpo", "lora-r32", "20-step-check"]
+tags = ["glm-perf-2", "glm-5.2", "testing-perf", "grpo", "lora-r32", "20-step-check"]
 
 [file_monitor]
-filename = "run_glm-perf-1/trainer-metrics.jsonl"
+filename = "run_glm-perf-2/trainer-metrics.jsonl"
 
 [model]
 name = "/data/ZiphuAI/GLM-5.2-FP8"

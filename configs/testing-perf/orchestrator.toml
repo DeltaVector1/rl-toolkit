@@ -1,4 +1,4 @@
-output_dir = "/data/glm52-rl/runs/glm-perf-1/run_glm-perf-1"
+output_dir = "/data/glm52-rl/runs/glm-perf-2/run_glm-perf-2"
 max_steps = 20
 seq_len = 32768
 batch_size = 1024
@@ -12,9 +12,9 @@ level = "info"
 
 [swanlab]
 project = "glm-runs"
-name = "orchestrator-glm-perf-1"
+name = "orchestrator-glm-perf-2"
 group = "glm-runs"
-tags = ["glm-perf-1", "glm-5.2", "testing-perf", "grpo", "lora-r32", "20-step-check"]
+tags = ["glm-perf-2", "glm-5.2", "testing-perf", "grpo", "lora-r32", "20-step-check"]
 
 [file_monitor]
 filename = "rollout-metrics.jsonl"
@@ -83,8 +83,8 @@ enable_thinking = false
 
 [weight_broadcast]
 type = "filesystem"
-source_url = "http://127.0.0.1:18100/glm-perf-1"
-source_dir = "/data/glm52-rl/runs/glm-perf-1"
+source_url = "http://127.0.0.1:18100/glm-perf-2"
+source_dir = "/data/glm52-rl/runs/glm-perf-2"
 
 [rollout_transport]
 type = "filesystem"
