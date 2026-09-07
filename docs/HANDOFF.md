@@ -5,14 +5,27 @@ port, container, and profile value.
 
 ## Current state
 
-- Latest attempt stopped with 0 optimizer steps. Both H200s loaded the correct
+- Restart invoked at 23:45:14 UTC using `7fffd7d`. It is the same neutral
+  `glm-perf-2` run, with fresh rollouts and a 20-step target. Completion is
+  not yet confirmed. Root owns live operation and monitoring.
+- Ownership repair `7912cc0` fixes both H200 broadcast-directory creators.
+  The exact H200A directories now pass an actual UID 1000 write check.
+  The complete saved step-0 adapter is readable on all eight trainer hosts.
+  `7fffd7d` restores its per-expert tensors through `initial_adapter_path`
+  after the run resets its adapter slot. CPU/Gloo tests passed BF16 native
+  experts, sharded parameters, exact re-export, and rejection before mutation.
+  This recovery is for the zero-B step-0 adapter only. Do not use it to resume
+  a trained adapter: fresh-policy initialization still zeros B. The generic
+  resume path also needs repair before use with a trained native adapter.
+- The previous attempt stopped with 0 optimizer steps. Both H200s loaded the correct
   `glm-perf-2` step-0 adapter (B at 17:26:15 UTC, A at 17:26:20). A staging
   took 2,713.330 seconds; B took 116.598 seconds. The orchestrator then failed
   to write `broadcasts/step_0/.receivers-ready.json.<tmp>` on H200A because
   the step directory was root-owned with mode 0755. Trainers and orchestrator
   were stopped; inference engines and complete adapters were preserved.
-  The directory ownership and its creator need repair before retry. Reuse
-  the saved complete adapter; do not regenerate it and repeat the full copy.
+  Directory ownership and its creators are now repaired. The restart reuses
+  the saved complete adapter; confirm its source SHA and H200 cache remain
+  unchanged before reporting that the full copy was avoided.
 - No completed full production RL result is established. The neutral
   `glm-perf-1` run stopped after more than 43 minutes. Its batch contained
   16,520,157 effective tokens, including 11,935,614 generated tokens. At about
