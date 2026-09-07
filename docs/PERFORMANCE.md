@@ -1,5 +1,7 @@
 # Performance measurements
 
+Updated 2026-09-07 UTC.
+
 These are measured results. Keep trainer, rollout, adapter transfer, full-
 weight transfer, H200 activation, judging, and save time separate.
 
@@ -28,7 +30,8 @@ zero at step 0.
 Metrics were identical. These values do not show a compute-speed change. The
 stopped `glm-perf-1` batch contained 16,520,157 tokens; it did not complete a
 training step. It is not comparable with the historical 2,097,152-token
-result, and no neutral 20-step or 50-step pass is established.
+result, and no full neutral production RL 20-step or 50-step pass is
+established.
 
 Two actual 8-GPU tests per rank passed in 3.58 to 3.62 s with nonfinite
 gradients rejected.
@@ -46,8 +49,14 @@ zero-learning-rate diagnostic, not an acceptance result.
 
 `glm52-native-small` now has `max_steps = 20` for a fresh synthetic memory
 test. Each step uses 16 x 32,768 = 524,288 fresh synthetic tokens with a seed
-and batch counter, real LR0 backward, no router replay, export, or checkpoint,
-and a one-time rank-8 profiler. It is not full RL or an acceptance run.
+and batch counter, real LR0 backward, no adapter export, no RL rollout, no
+router replay, and no checkpoint, with a one-time rank-8 profiler. The test
+completed 20/20 steps on all 8 trainer hosts; all exited 0 with no OOM. Step 1
+forward/backward took 272.7 s. Steps 2-20 had a median of 204.8 s and a range
+of 201.3-208.4 s. Step total time had a median of 205.5 s and a range of
+202.0-209.2 s. Peak reserved memory was 42.2168 GiB
+at step 1, 42.6543 GiB at step 2, then flat at 42.9277 GiB for steps 3-20.
+This is a synthetic memory test, not full RL or an acceptance run.
 
 ## Stats component measurements
 
@@ -97,6 +106,8 @@ trainer peak memory measurements.
   and context were unchanged. A's reported KV capacity was 368,960 tokens
   versus the prior 416,512; activation
   allocations differed, so this is not a pure causal speed claim.
+- Both H200 services use active KV block size 64. Reported KV capacity was
+  368,960 tokens (18.81 GiB) on A and 396,160 tokens (20.19 GiB) on B.
 - A separate B concurrent test completed 3 rounds of 8 requests: all 24 HTTP
   responses were successful, with 6,144 finite generated tokens, zero errors,
   preemptions, or restarts, and 57.99, 55.59, and 59.74 tokens/s. KV drained;
@@ -106,6 +117,14 @@ trainer peak memory measurements.
   throughput claim or production approval. Baseline and MTP tests had
   differing measured activation allocations, so the KV-capacity difference
   does not support a pure causal claim.
+- Three same-adapter B unload/reload probes took 4.186 to 4.193 s each. Each
+  8 x 32,512-input plus 256-output probe returned HTTP 200 with finite output
+  and no errors. These are cached adapter reload checks, not new policy or
+  WAN timing.
+- A short A concurrency benchmark completed 128 of 128 requests using 512
+  input and at most 64 output tokens in 18.7 s: 8,071 generated tokens,
+  431.43 tokens/s, no OOM, preemption, or restart, and peak concurrency 128.
+  This is not long-rollout throughput.
 
 A historical, different-workload H200 32K prefill test passed two 96-request
 runs at 1,459.6 and 1,454.5 tokens/s with 32,768 prefill tokens, rank 32,
@@ -126,6 +145,11 @@ Stronger zstd at level 9 on 16 chunks (raw 266,571,096 bytes) saved 2.27% and
 added 29.6% CPU encode time; it was rejected. A 64 MiB workspace path
 (18.04 s versus 10.50 s) was also rejected. No full new WAN result under 5
 minutes is established.
+
+CPU damped-compression used 16 chunks x 5 coefficients and passed 80 exact
+round trips total. Deployed coefficient 1 produced the smallest
+18,057,344-byte artifact; alternatives were 56% to 160% larger, so no
+compression setting change is proposed.
 
 Grouped 24-process, four-forward China tunnels are validated with 96
 listeners. Restarting n82 `logind` cleared its exhausted session table (8192
