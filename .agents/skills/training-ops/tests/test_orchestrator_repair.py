@@ -81,6 +81,13 @@ class OrchestratorRepairTest(unittest.TestCase):
         self.assertIn("adapter tunnel reconciliation did not establish", source)
         self.assertLess(mode_start, docker_start)
 
+    def test_watch_idle_message_requests_transfer_check(self):
+        source = (
+            Path(__file__).resolve().parents[1] / "src/training_ops/__init__.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("check adapter transfer progress and logs", source)
+        self.assertNotIn("Read references/errors.md and repair before waiting further", source)
+
     def test_null_harness_bridge_disables_hidden_sdk_deadline_and_retry(self):
         root = Path(__file__).resolve().parents[4]
         harness_path = root / "prime-rl/deps/verifiers/verifiers/v1/harnesses/null/harness.py"

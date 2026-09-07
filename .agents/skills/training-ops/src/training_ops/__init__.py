@@ -2824,8 +2824,8 @@ def watch(hours: float = 2.0, every: int = 300, run: str = "") -> list[Status]:
                     )
                 else:
                     print(
-                        f"stalled: step count and batch progress have not changed for {_hms(still)}. "
-                        "Read references/errors.md and repair before waiting further.",
+                        f"no step or batch counter changed for {_hms(still)}; "
+                        "check adapter transfer progress and logs before deciding it is stalled or restarting.",
                         flush=True,
                     )
         remaining = min(every, max(0, deadline - time.time()))
