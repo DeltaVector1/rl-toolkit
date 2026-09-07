@@ -43,8 +43,8 @@ router replay, and no checkpoint, with a one-time rank-8 profiler. The test
 completed 20/20 steps on all 8 trainer hosts; all exited 0 with no OOM. Step 1
 forward/backward took 272.7 s. Steps 2-20 had a median of 204.8 s and a range
 of 201.3-208.4 s. Step total time had a median of 205.5 s and a range of
-202.0-209.2 s. Peak reserved memory was 42.2168 GiB
-at step 1, 42.6543 GiB at step 2, then flat at 42.9277 GiB for steps 3-20.
+202.0-209.2 s. Peak reserved memory was 42.2168 GiB at step 1, 42.6543 GiB
+at step 2, then flat at 42.9277 GiB for steps 3-20.
 This is a synthetic memory test, not full RL or an acceptance run.
 
 An earlier PP16 qualification measured 227.13 s for pure PP work and 270.79 s
