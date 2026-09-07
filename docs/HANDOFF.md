@@ -5,12 +5,24 @@ port, container, and profile value.
 
 ## Current state
 
-- No full production RL run is active. The neutral `glm-perf-1` run stopped
-  after more than 43 minutes.
-- That stopped run's batch contained 16,520,157 tokens; it did not complete a
-  training step. The historical comparison processed 2,097,152 tokens, so the
-  runs are not comparable. No full neutral production RL 20-step or 50-step
-  pass is established.
+- No completed full production RL result is established. The neutral
+  `glm-perf-1` run stopped after more than 43 minutes. Its batch contained
+  16,520,157 effective tokens, including 11,935,614 generated tokens. At about
+  2.1k tokens/s, that output volume implies about 95 minutes; this is an
+  estimate, not a measured run time. The historical comparison processed
+  2,097,152 tokens, so the runs are not comparable.
+- A fresh production-shaped neutral `glm-perf-2` run started on 2026-09-07.
+  All eight trainers were up by 15:34 UTC. At 16:00 UTC, no optimizer step had
+  completed; the first complete 16/1,024 group was recorded at 15:58:21. All
+  eight environments had expert activation offload 0 and `sm89-r32`.
+  Inference A and B remained MTP 1 with 32K context and existing graphs.
+  The initial full uncompressed adapter was 30,767,549,784 bytes. A was 44.2%
+  complete at about 15:58 with a 10.94 MiB/s interval; this is not positive
+  step-update timing. A had 105 preemptions versus B 0 at 15:51; both remained
+  active with no OOM or restarts. Different image `nvcc` paths selected
+  different FlashInfer/fusion paths; this runtime-path difference is unfixed.
+  The first full step, performance, stability, and 20-step completion remain
+  pending, so this run has no production pass claim.
 - Trainer-only qualification is `glm52-fixed-token` on 64 GPUs (8 packed
   microbatches x 32,768 tokens, 262,144 total) with 512 selected tokens,
   learning rate 0, and adapter B zero at step 0.

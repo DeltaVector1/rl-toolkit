@@ -13,7 +13,29 @@ weight transfer, H200 activation, judging, and save time separate.
 - Rollout reported time limit: 720 seconds.
 - Production settings remain batch 1,024, group 16, context 32,768, and output
   limit 16,384.
-- No full 50-step neutral production run has passed.
+- No full 20-step or 50-step neutral production run has passed.
+
+## Current neutral production-shaped run
+
+`glm-perf-2` started on 2026-09-07. All eight trainers were up by 15:34 UTC.
+At 16:00 UTC, no optimizer step had completed; the first complete 16/1,024
+group was recorded at 15:58:21. All eight environments had expert activation
+offload 0 and `sm89-r32`. Inference A and B remained MTP 1 with 32K context and
+existing graphs.
+
+The initial full uncompressed adapter was 30,767,549,784 bytes. A was 44.2%
+complete at about 15:58 with a 10.94 MiB/s interval; this is not positive
+step-update timing. A had 105 preemptions versus B 0 at 15:51; both remained
+active with no OOM or restarts. Different image `nvcc` paths selected different
+FlashInfer/fusion paths, and this runtime-path difference is unfixed. The first
+full step, performance, stability, and 20-step completion remain pending; no
+production pass claim is made.
+
+The earlier stopped `glm-perf-1` batch contained 16,520,157 effective tokens,
+including 11,935,614 generated tokens. At about 2.1k tokens/s, that output
+volume implies about 95 minutes; this is an estimate, not a measured run time.
+The 524,288-token synthetic memory step took 3m25s, but it is not full-run
+timing or a production result.
 
 ## Neutral trainer qualification
 
