@@ -194,15 +194,30 @@ scan() {
 }
 
 pull_stable_markers() {
-  local remote_file relative final partial
+  local remote_file relative final partial final_dir path
   [ "$dest_host" = local ] && return
   while IFS= read -r remote_file; do
     [ -n "$remote_file" ] || continue
     relative=${remote_file#"$dest_dir"/}
     final="$source_dir/$relative"
-    [ -f "$final" ] && continue
     partial="$source_dir/.incoming/$relative"
-    mkdir -p "$(dirname "$partial")" "$(dirname "$final")"
+    final_dir=$(dirname "$final")
+    [[ "$relative" =~ ^broadcasts/step_[0-9]+/STABLE$ ]] || {
+      echo "refusing unexpected stable marker path: $relative" >&2
+      return 1
+    }
+    for path in "$source_dir/broadcasts" "$final_dir"; do
+      [ ! -L "$path" ] || {
+        echo "refusing stable marker symlink path: $path" >&2
+        return 1
+      }
+    done
+    mkdir -p "$(dirname "$partial")" || return 1
+    install -d -o 1000 -g 1000 -m 0755 "$source_dir/broadcasts" "$final_dir" || {
+      echo "cannot prepare stable marker directory for UID 1000: $final_dir" >&2
+      return 1
+    }
+    [ -f "$final" ] && continue
     rsync -a --partial --timeout=60 -e "ssh ${ssh_opts[*]}" \
       "$dest_host:$remote_file" "$partial" || continue
     mv "$partial" "$final"

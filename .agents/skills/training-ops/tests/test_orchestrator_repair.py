@@ -81,6 +81,27 @@ class OrchestratorRepairTest(unittest.TestCase):
         self.assertIn("adapter tunnel reconciliation did not establish", source)
         self.assertLess(mode_start, docker_start)
 
+    def test_orchestrator_prepares_broadcast_steps_for_appuser(self):
+        launcher = (
+            Path(__file__).resolve().parents[4]
+            / ".agents/skills/training-ops/runtime/h200/start_orchestrator.sh"
+        )
+        source = launcher.read_text(encoding="utf-8")
+        start = source.index('broadcast_dir="/data/glm52-rl/runs/$RUN/$RUN_NAME/broadcasts"')
+        end = source.index('for p in "${ports[@]}"', start)
+        preflight = source[start:end]
+        self.assertIn(
+            'sudo install -d -o 1000 -g 1000 -m 0755 "$broadcast_dir" "$broadcast_dir/step_0"',
+            preflight,
+        )
+        self.assertIn('[[ "$step_dir" =~ /step_[0-9]+$ ]]', preflight)
+        self.assertIn('[ ! -L "$step_dir" ]', preflight)
+        self.assertIn('sudo install -d -o 1000 -g 1000 -m 0755 "$step_dir"', preflight)
+        self.assertIn("sudo -u '#1000' test -w \"$step_dir\"", preflight)
+        self.assertIn("sudo -u '#1000' test -w \"$broadcast_dir\"", preflight)
+        self.assertNotIn("chown -R", preflight)
+        self.assertLess(source.index('broadcast_dir="'), source.index('sudo docker run -d --name "$ORCH_CT"'))
+
     def test_watch_idle_message_requests_transfer_check(self):
         source = (
             Path(__file__).resolve().parents[1] / "src/training_ops/__init__.py"

@@ -701,6 +701,35 @@ sleep 6
 sudo install -d -o 1000 -g 1000 "/data/glm52-rl/runs/$RUN"
 sudo install -d -o 1000 -g 1000 "/data/glm52-rl/runs/$RUN/$RUN_NAME"
 sudo install -d -o 1000 -g 1000 "/data/glm52-rl/runs/$RUN/$RUN_NAME/hf-cache"
+broadcast_dir="/data/glm52-rl/runs/$RUN/$RUN_NAME/broadcasts"
+for path in "$broadcast_dir" "$broadcast_dir/step_0"; do
+  [ ! -L "$path" ] || {
+    echo "broadcast path is a symlink: $path" >&2
+    exit 1
+  }
+done
+for step_dir in "$broadcast_dir"/step_*; do
+  [ -d "$step_dir" ] || continue
+  [[ "$step_dir" =~ /step_[0-9]+$ ]] || continue
+  [ ! -L "$step_dir" ] || {
+    echo "broadcast step path is a symlink: $step_dir" >&2
+    exit 1
+  }
+done
+sudo install -d -o 1000 -g 1000 -m 0755 "$broadcast_dir" "$broadcast_dir/step_0"
+for step_dir in "$broadcast_dir"/step_*; do
+  [ -d "$step_dir" ] || continue
+  [[ "$step_dir" =~ /step_[0-9]+$ ]] || continue
+  sudo install -d -o 1000 -g 1000 -m 0755 "$step_dir"
+  sudo -u '#1000' test -w "$step_dir" || {
+    echo "broadcast step path is not writable by UID 1000: $step_dir" >&2
+    exit 1
+  }
+done
+sudo -u '#1000' test -w "$broadcast_dir" && sudo -u '#1000' test -w "$broadcast_dir/step_0" || {
+  echo "broadcast paths are not writable by UID 1000: $broadcast_dir" >&2
+  exit 1
+}
 for p in "${ports[@]}"; do
   ss -tln 2>/dev/null | grep -q "127.0.0.1:$p" && echo "tunnel :$p up" || echo "tunnel :$p DOWN"
 done

@@ -32,6 +32,7 @@ set -euo pipefail
 args=("$@")
 source=${args[$#-2]}
 destination=${args[$#-1]#remote:}
+source=${source#remote:}
 if [ "${SYNC_TEST_MODE:-}" = probe_failure ]; then
   : >"${RSYNC_MARKER:?}"
 fi
@@ -158,5 +159,29 @@ if ! test -f "$watch_remote/rollouts/step_1/train_rollouts.bin"; then
 fi
 test -f "$watch_source/rollouts/step_1/train_rollouts.bin.delivered"
 grep -q 'batch scan failed; retrying' "$watch_log"
+
+pull_source="$tmp/pull-source"
+pull_remote="$tmp/pull-remote"
+mkdir -p "$pull_source/broadcasts/step_0" "$pull_source/broadcasts/step_1"
+: >"$pull_source/broadcasts/step_0/STABLE"
+chmod 0555 "$pull_source/broadcasts/step_0" "$pull_source/broadcasts/step_1"
+mkdir -p "$pull_remote/broadcasts/step_0" "$pull_remote/broadcasts/step_1"
+: >"$pull_remote/broadcasts/step_0/STABLE"
+: >"$pull_remote/broadcasts/step_1/STABLE"
+PATH="$tmp/bin:$PATH" \
+  SOURCE_RUN_DIR="$pull_source" \
+  DEST_RUN_DIR="$pull_remote" \
+  DEST_HOST=remote \
+  ACTIVE_STATE="$tmp/active-state" \
+  ACTIVE_LOCK="$tmp/active-lock" \
+  ONCE=1 \
+  "$sync_script" >"$tmp/pull.log" 2>&1 || {
+    cat "$tmp/pull.log" >&2
+    exit 1
+  }
+test -f "$pull_source/broadcasts/step_0/STABLE" || { cat "$tmp/pull.log" >&2; find "$pull_source" -print >&2; exit 1; }
+test -f "$pull_source/broadcasts/step_1/STABLE" || { cat "$tmp/pull.log" >&2; find "$pull_source" -print >&2; exit 1; }
+test "$(stat -c %a "$pull_source/broadcasts/step_0")" -eq 755
+test "$(stat -c %a "$pull_source/broadcasts/step_1")" -eq 755
 
 printf 'rollout transfer success, resume, interrupted retry, status failure, and max-active bound pass\n'
