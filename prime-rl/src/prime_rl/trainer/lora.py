@@ -543,6 +543,72 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> None:
     logger.info(f"LoRA: {adapted_or_trainable:,} adapted or fully trainable out of {total_params:,} parameters")
 
 
+def _initial_lora_adapter_entries(
+    model: nn.Module, adapter_idx: int
+) -> list[tuple[str, nn.Parameter, int | None]]:
+    entries: list[tuple[str, nn.Parameter, int | None]] = []
+    native_names = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
+    for module_name, module in model.named_modules():
+        if not isinstance(module, MultiLoRAModule):
+            continue
+        if adapter_idx >= module.n_adapters:
+            raise ValueError(
+                f"Initial LoRA adapter index {adapter_idx} is invalid for "
+                f"{module_name} with {module.n_adapters} slots"
+            )
+        for param_name, param in module.named_parameters_for_adapter(adapter_idx):
+            if isinstance(module, NativeFP8MultiLoRAGroupedExperts):
+                projection, factor = param_name.split("_lora_")
+                exported_name = native_names.get(projection)
+                if exported_name is None or param.ndim != 3:
+                    raise ValueError(f"Invalid native expert adapter parameter: {module_name}.{param_name}")
+                for expert_index in range(param.shape[0]):
+                    entries.append(
+                        (
+                            f"{module_name}.{expert_index}.{exported_name}.lora_{factor}.weight",
+                            param,
+                            expert_index,
+                        )
+                    )
+            else:
+                entries.append((f"{module_name}.{param_name}.weight", param, None))
+    return entries
+
+
+def _validate_initial_lora_adapter_inventory(
+    adapter_shapes: dict[str, tuple[int, ...]], local_shapes: dict[str, tuple[int, ...]]
+) -> None:
+    import torch.distributed as dist
+
+    if dist.is_available() and dist.is_initialized():
+        gathered: list[dict[str, tuple[int, ...]] | None] = [None] * dist.get_world_size()
+        dist.all_gather_object(gathered, local_shapes)
+    else:
+        gathered = [local_shapes]
+    expected: dict[str, tuple[int, ...]] = {}
+    conflicts = []
+    for rank_shapes in gathered:
+        if rank_shapes is None:
+            raise RuntimeError("Initial LoRA adapter inventory gather is incomplete")
+        for key, shape in rank_shapes.items():
+            previous = expected.setdefault(key, shape)
+            if previous != shape:
+                conflicts.append(key)
+    missing = sorted(set(expected) - set(adapter_shapes))
+    unexpected = sorted(set(adapter_shapes) - set(expected))
+    mismatched = sorted(
+        key for key in set(expected) & set(adapter_shapes) if expected[key] != adapter_shapes[key]
+    )
+    if conflicts or missing or unexpected or mismatched:
+        raise ValueError(
+            "Initial LoRA adapter inventory differs from the complete distributed model: "
+            f"conflicts={conflicts[:5]} ({len(conflicts)} total), "
+            f"missing={missing[:5]} ({len(missing)} total), "
+            f"unexpected={unexpected[:5]} ({len(unexpected)} total), "
+            f"shape_mismatch={mismatched[:5]} ({len(mismatched)} total)"
+        )
+
+
 def load_initial_lora_adapter(model: nn.Module, adapter_path: str, adapter_idx: int = 0) -> None:
     """Load one exported PEFT adapter into a freshly created MultiLoRA slot.
 
@@ -561,45 +627,57 @@ def load_initial_lora_adapter(model: nn.Module, adapter_path: str, adapter_idx: 
         raise FileNotFoundError(f"Initial LoRA adapter not found: {path}")
 
     state_dict = load_file(str(path), device="cpu")
-    expected: dict[str, nn.Parameter] = {}
-    for module_name, module in model.named_modules():
-        if not isinstance(module, MultiLoRAModule):
-            continue
-        if adapter_idx >= module.n_adapters:
-            raise ValueError(
-                f"Initial LoRA adapter index {adapter_idx} is invalid for "
-                f"{module_name} with {module.n_adapters} slots"
-            )
-        for param_name, param in module.named_parameters_for_adapter(adapter_idx):
-            expected[f"{module_name}.{param_name}.weight"] = param
-
+    if adapter_idx < 0:
+        raise ValueError(f"Initial LoRA adapter index {adapter_idx} is invalid")
+    entries = _initial_lora_adapter_entries(model, adapter_idx)
     if hasattr(type(model), "convert_adapter_to_hf"):
-        expected = type(model).convert_adapter_to_hf(expected)
+        converted_entries = []
+        for key, parameter, expert_index in entries:
+            if expert_index is None:
+                converted = type(model).convert_adapter_to_hf({key: parameter})
+                if len(converted) != 1:
+                    raise ValueError(f"Adapter key conversion is not one-to-one: {key}")
+                key = next(iter(converted))
+            converted_entries.append((key, parameter, expert_index))
+        entries = converted_entries
 
-    missing = sorted(set(expected) - set(state_dict))
-    unexpected = sorted(set(state_dict) - set(expected))
-    if missing:
-        raise ValueError(
-            "Initial LoRA adapter keys do not match the local pipeline stage: "
-            f"missing={missing[:5]} ({len(missing)} total)"
-        )
+    expected = {
+        key: tuple(parameter.shape[1:] if expert_index is not None else parameter.shape)
+        for key, parameter, expert_index in entries
+    }
+    _validate_initial_lora_adapter_inventory(
+        {key: tuple(value.shape) for key, value in state_dict.items()}, expected
+    )
     # Every PP stage loads the same global adapter file but constructs only its
-    # own layers. Keys for the other stages are therefore expected here. A
-    # missing or misspelled key still fails on the stage that owns that layer.
+    # own layers. Inventory validation above covers the complete model before
+    # any rank-specific parameter is changed.
 
+    from torch.distributed.tensor import DTensor, distribute_tensor
+
+    grouped: dict[int, list[tuple[str, nn.Parameter, int]]] = {}
     with torch.no_grad():
-        for key, param in expected.items():
-            value = state_dict[key]
-            if tuple(value.shape) != tuple(param.shape):
-                raise ValueError(
-                    f"Initial LoRA adapter shape mismatch for {key}: "
-                    f"checkpoint={tuple(value.shape)}, model={tuple(param.shape)}"
-                )
-            param.copy_(value.to(device=param.device, dtype=param.dtype))
+        for key, parameter, expert_index in entries:
+            if expert_index is None:
+                value = state_dict[key]
+                value = value.to(device=parameter.device, dtype=parameter.dtype)
+                if isinstance(parameter, DTensor):
+                    value = distribute_tensor(value, parameter.device_mesh, parameter.placements)
+                parameter.copy_(value)
+            else:
+                grouped.setdefault(id(parameter), []).append((key, parameter, expert_index))
+        for values in grouped.values():
+            parameter = values[0][1]
+            stacked = []
+            for key, _, _ in sorted(values, key=lambda item: item[2]):
+                stacked.append(state_dict[key])
+            value = torch.stack(stacked).to(device=parameter.device, dtype=parameter.dtype)
+            if isinstance(parameter, DTensor):
+                value = distribute_tensor(value, parameter.device_mesh, parameter.placements)
+            parameter.copy_(value)
 
     get_logger().info(
-        f"Loaded {len(expected)} initial LoRA tensors from {path} into adapter slot "
-        f"{adapter_idx}; ignored {len(unexpected)} tensors owned by other pipeline stages"
+        f"Loaded {len(expected)} local initial LoRA tensors from {path} into adapter slot "
+        f"{adapter_idx}"
     )
 
 

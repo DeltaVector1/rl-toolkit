@@ -27,28 +27,28 @@ class MultiLoRAModule(nn.Module):
 
 
 class TinyOrdinary(MultiLoRAModule):
-    def __init__(self, mesh, name: str, n_adapters: int = 1) -> None:
+    def __init__(self, mesh, name: str, n_adapters: int = 1, offset: int = 0) -> None:
         super().__init__(n_adapters)
         self._name = name
         width = 3
         rank = 2
         self.lora_a = nn.ParameterList(
-            [nn.Parameter(_shard(torch.empty(rank, width), mesh)) for _ in range(n_adapters)]
+            [nn.Parameter(_shard(torch.empty(rank, width, dtype=torch.bfloat16), mesh)) for _ in range(n_adapters)]
         )
         self.lora_b = nn.ParameterList(
-            [nn.Parameter(_shard(torch.empty(width, rank), mesh)) for _ in range(n_adapters)]
+            [nn.Parameter(_shard(torch.empty(width, rank, dtype=torch.bfloat16), mesh)) for _ in range(n_adapters)]
         )
         for index in range(n_adapters):
             with torch.no_grad():
-                self.lora_a[index].copy_(_shard(torch.arange(rank * width, dtype=torch.bfloat16).reshape(rank, width) + index, mesh))
-                self.lora_b[index].copy_(_shard(torch.arange(width * rank, dtype=torch.bfloat16).reshape(width, rank) + 10 + index, mesh))
+                self.lora_a[index].copy_(_shard(torch.arange(rank * width, dtype=torch.bfloat16).reshape(rank, width) + offset + index, mesh))
+                self.lora_b[index].copy_(_shard(torch.arange(width * rank, dtype=torch.bfloat16).reshape(width, rank) + offset + 10 + index, mesh))
 
     def named_parameters_for_adapter(self, index: int):
         return [(f"{self._name}.lora_A", self.lora_a[index]), (f"{self._name}.lora_B", self.lora_b[index])]
 
 
 class NativeFP8MultiLoRAGroupedExperts(MultiLoRAModule):
-    def __init__(self, mesh, num_experts: int = 4, n_adapters: int = 1) -> None:
+    def __init__(self, mesh, num_experts: int = 4, n_adapters: int = 1, offset: int = 0) -> None:
         super().__init__(n_adapters)
         self.num_experts = num_experts
         self._width = 3
@@ -59,10 +59,10 @@ class NativeFP8MultiLoRAGroupedExperts(MultiLoRAModule):
             ("w2", (num_experts, self._rank, self._hidden), (num_experts, self._width, self._rank)),
             ("w3", (num_experts, self._rank, self._width), (num_experts, self._hidden, self._rank)),
         ):
-            setattr(self, f"{projection}_lora_A", nn.ParameterList([nn.Parameter(_shard(torch.empty(shape_a), mesh))]))
-            setattr(self, f"{projection}_lora_B", nn.ParameterList([nn.Parameter(_shard(torch.empty(shape_b), mesh))]))
+            setattr(self, f"{projection}_lora_A", nn.ParameterList([nn.Parameter(_shard(torch.empty(shape_a, dtype=torch.bfloat16), mesh))]))
+            setattr(self, f"{projection}_lora_B", nn.ParameterList([nn.Parameter(_shard(torch.empty(shape_b, dtype=torch.bfloat16), mesh))]))
         with torch.no_grad():
-            value = 1
+            value = 1 + offset
             for projection in ("w1", "w2", "w3"):
                 for factor in ("A", "B"):
                     parameter = getattr(self, f"{projection}_lora_{factor}")[0]
@@ -85,19 +85,19 @@ def _shard(value: torch.Tensor, mesh):
 
 
 class TinyStage(nn.Module):
-    def __init__(self, mesh) -> None:
+    def __init__(self, mesh, offset: int = 0) -> None:
         super().__init__()
-        self.attn = TinyOrdinary(mesh, "q_proj")
+        self.attn = TinyOrdinary(mesh, "q_proj", offset=offset)
         self.mlp = nn.Module()
-        self.mlp.shared_expert = TinyOrdinary(mesh, "gate_proj")
-        self.experts = NativeFP8MultiLoRAGroupedExperts(mesh)
+        self.mlp.shared_expert = TinyOrdinary(mesh, "gate_proj", offset=offset)
+        self.experts = NativeFP8MultiLoRAGroupedExperts(mesh, offset=offset)
 
 
 class TinyModel(nn.Module):
-    def __init__(self, mesh, stages: list[str]) -> None:
+    def __init__(self, mesh, stages: list[str], offset: int = 0) -> None:
         super().__init__()
         for stage in stages:
-            self.add_module(stage, TinyStage(mesh))
+            self.add_module(stage, TinyStage(mesh, offset=offset))
 
     @classmethod
     def convert_adapter_to_hf(cls, state_dict):
@@ -110,7 +110,11 @@ class TinyModel(nn.Module):
 
 def _extract_function(source: Path, name: str, globals_dict: dict):
     tree = ast.parse(source.read_text(), filename=str(source))
-    node = next(node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name)
+    node = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name
+    )
     module = ast.Module(body=[node], type_ignores=[])
     ast.fix_missing_locations(module)
     exec(compile(module, str(source), "exec"), globals_dict)
@@ -157,28 +161,16 @@ def _export(model, entries):
     return model.convert_adapter_to_hf(state)
 
 
-def _assert_loaded(model, state, stages):
-    for key, value in state.items():
-        if not any(key.startswith(f"{stage}.") for stage in stages):
-            continue
-        # Compare through the loader's inventory key, using an explicit module scan.
-        found = False
-        for module_name, candidate in model.named_modules():
-            exported_name = module_name.replace(".mlp.shared_expert", ".mlp.shared_experts")
-            if key.startswith(exported_name + ".") and isinstance(candidate, MultiLoRAModule):
-                suffix = key[len(exported_name) + 1 :]
-                if isinstance(candidate, NativeFP8MultiLoRAGroupedExperts):
-                    expert, projection, _, factor, _ = suffix.split(".")
-                    parameter = getattr(candidate, f"{ {'gate_proj':'w1','down_proj':'w2','up_proj':'w3'}[projection] }_lora_{factor}")[0]
-                    actual = parameter.full_tensor()[int(expert)] if isinstance(parameter, DTensor) else parameter[int(expert)]
-                else:
-                    target, _, factor, _ = suffix.split(".")
-                    parameter = candidate.lora_a[0] if factor == "A" else candidate.lora_b[0]
-                    actual = parameter.full_tensor() if isinstance(parameter, DTensor) else parameter
-                assert torch.equal(actual.cpu(), value), f"loaded value differs for {key}"
-                found = True
-                break
-        assert found, f"no local module for {key}"
+def _assert_reexport_matches(model, expected_state, entries, stages):
+    actual = _export(model, entries)
+    expected = {
+        key: value
+        for key, value in expected_state.items()
+        if any(key.startswith(f"{stage}.") for stage in stages)
+    }
+    assert actual.keys() == expected.keys(), "re-export key inventory differs"
+    for key, value in expected.items():
+        assert torch.equal(actual[key], value), f"loaded value differs for {key}"
 
 
 def _snapshot(model):
@@ -212,7 +204,7 @@ def _inventory_failures(state, load, root: Path, rank: int) -> None:
         if rank == 0:
             _write(path, variant)
         dist.barrier()
-        model_copy = TinyModel(_mesh, ["stage0", "stage1"])
+        model_copy = TinyModel(_mesh, ["stage0", "stage1"], offset=2000)
         before = _snapshot(model_copy)
         try:
             load(model_copy, str(path))
@@ -233,18 +225,19 @@ def _worker(rank: int, world_size: int, port: int, source: str, root: str) -> No
         _mesh = init_device_mesh("cpu", (world_size,))
         entries, _validate, load = _load_draft(Path(source))
         work = Path(root)
-        model = TinyModel(_mesh, ["stage0", "stage1"])
+        model = TinyModel(_mesh, ["stage0", "stage1"], offset=0)
         state = _export(model, entries)
         path = work / "adapter_model.safetensors"
         if rank == 0:
             _write(path, state)
         dist.barrier()
-        fresh = TinyModel(_mesh, ["stage0", "stage1"])
+        fresh = TinyModel(_mesh, ["stage0", "stage1"], offset=1000)
         load(fresh, str(path))
-        _assert_loaded(fresh, state, ["stage0", "stage1"])
+        _assert_reexport_matches(fresh, state, entries, ["stage0", "stage1"])
+        reexport = _export(fresh, entries)
         if rank == 0:
             second = work / "adapter_model-reexport.safetensors"
-            _write(second, _export(fresh, entries))
+            _write(second, reexport)
             assert path.read_bytes() == second.read_bytes(), "re-export is not byte-identical"
         dist.barrier()
         _inventory_failures(state, load, work, rank)
@@ -252,13 +245,14 @@ def _worker(rank: int, world_size: int, port: int, source: str, root: str) -> No
         # Each rank represents a different pipeline stage. The global file has both stages.
         if rank == 0:
             # This export-only model is not distributed, so rank 1 can reach the barrier.
-            global_model = TinyModel(None, ["stage0", "stage1"])
+            global_model = TinyModel(None, ["stage0", "stage1"], offset=3000)
             union_state = _export(global_model, entries)
             _write(work / "adapter-union.safetensors", union_state)
         dist.barrier()
-        local = TinyModel(_mesh, [f"stage{rank}"])
+        local = TinyModel(None, [f"stage{rank}"], offset=4000)
         load(local, str(work / "adapter-union.safetensors"))
-        _assert_loaded(local, union_state if rank == 0 else load_file(str(work / "adapter-union.safetensors"), device="cpu"), [f"stage{rank}"])
+        union_state = union_state if rank == 0 else load_file(str(work / "adapter-union.safetensors"), device="cpu")
+        _assert_reexport_matches(local, union_state, entries, [f"stage{rank}"])
         if rank == 0:
             print("PASS: saved adapter round-trip, native experts, inventory rejection, and PP key union")
     finally:
@@ -278,7 +272,7 @@ def main() -> None:
     try:
         mp.spawn(_worker, args=(2, port, str(args.source), root), nprocs=2, join=True)
     finally:
-        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(root)
 
 
 if __name__ == "__main__":
