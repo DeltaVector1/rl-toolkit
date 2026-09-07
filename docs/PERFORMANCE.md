@@ -17,19 +17,34 @@ weight transfer, H200 activation, judging, and save time separate.
 
 ## Current neutral production-shaped run
 
-`glm-perf-2` started on 2026-09-07. All eight trainers were up by 15:34 UTC.
-At 16:00 UTC, no optimizer step had completed; the first complete 16/1,024
-group was recorded at 15:58:21. All eight trainers had expert activation
-offload 0 and `sm89-r32`. Inference A and B remained MTP 1 with 32K context and
-existing graphs.
+`glm-perf-2` started on 2026-09-07; all eight trainers were up by 15:34 UTC.
+The first attempt entered an API retry storm at 16:03:52 after about 1,800
+seconds and stopped at 16:05:14 with 0 optimizer steps, 32/1,024 collected
+rollouts, and
+127 buffered rollouts. A had 105 preemptions versus B 0 at 15:51; both were
+active with no OOM or restarts. The initial full uncompressed adapter was
+30,767,549,784 bytes; A reached 44.2% at about 15:58 with a 10.94 MiB/s
+interval, not positive step-update timing.
 
-The initial full uncompressed adapter was 30,767,549,784 bytes. A was 44.2%
-complete at about 15:58 with a 10.94 MiB/s interval; this is not positive
-step-update timing. A had 105 preemptions versus B 0 at 15:51; both remained
-active with no OOM or restarts. Different image `nvcc` paths selected different
-FlashInfer/fusion paths, and this runtime-path difference is unfixed. The first
-full step, performance, stability, and 20-step completion remain pending; no
-production pass claim is made.
+A same-run restart was invoked at 16:33:01 UTC and returned at 16:38:45.
+It brought all eight trainers up at about 16:34-16:35 UTC and
+the orchestrator at about 16:38 UTC. At 16:47 UTC, its initial adapter
+bootstrap was pending and it still had 0 optimizer steps. The old 18.337 GB
+partial was rejected because its source SHA differed (`2c2d5927...5072c`
+versus `948490...b17f2`); it was not reused, and no value change is proven.
+BF16-random A/zero B initialization is probable; the FP8 base was unchanged.
+All eight trainers had expert activation offload 0 and `sm89-r32`; inference A
+and B remained MTP 1 with 32K context and existing graphs. Different image
+`nvcc` paths selected different FlashInfer/fusion paths, and this runtime-path
+difference is unfixed. The first full step, performance, stability, and 20-step completion
+remain pending; no production pass claim is made.
+
+The first attempt's null harness used an SDK 600-second default timeout and two
+retries inside the 3,600-second rollout limit; the dispatcher also retried every
+timeout `HarnessError`. Commit `eb5ffad` disables the inner timeout/retries,
+requires a recorded failed policy call to retry a harness timeout, and mounts
+the updated harness.
+Sixteen focused tests, `bash -n`, and patch-block reverse checks passed.
 
 The earlier stopped `glm-perf-1` batch contained 16,520,157 effective tokens,
 including 11,935,614 generated tokens. At about 2.1k tokens/s, that output
@@ -50,10 +65,10 @@ zero at step 0.
 | current `eb54291` | 135.4668 s, 137.1223 s total | 41.1816 GiB |
 
 Metrics were identical. These values do not show a compute-speed change. The
-stopped `glm-perf-1` batch contained 16,520,157 tokens; it did not complete a
-training step. It is not comparable with the historical 2,097,152-token
-result, and no full neutral production RL 20-step or 50-step pass is
-established.
+stopped `glm-perf-1` batch contained 16,520,157 effective tokens, including
+11,935,614 generated tokens; it did not complete a training step. It is not
+comparable with the historical 2,097,152-token result, and no full neutral
+production RL 20-step or 50-step pass is established.
 
 Two actual 8-GPU tests per rank passed in 3.58 to 3.62 s with nonfinite
 gradients rejected.

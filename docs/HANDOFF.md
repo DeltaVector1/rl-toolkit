@@ -11,24 +11,40 @@ port, container, and profile value.
   2.1k tokens/s, that output volume implies about 95 minutes; this is an
   estimate, not a measured run time. The historical comparison processed
   2,097,152 tokens, so the runs are not comparable.
-- A fresh production-shaped neutral `glm-perf-2` run started on 2026-09-07.
-  All eight trainers were up by 15:34 UTC. At 16:00 UTC, no optimizer step had
-  completed; the first complete 16/1,024 group was recorded at 15:58:21. All
-  eight trainers had expert activation offload 0 and `sm89-r32`.
+- A fresh production-shaped neutral `glm-perf-2` run started on 2026-09-07;
+  all eight trainers were up by 15:34 UTC. The first attempt entered an API
+  retry storm at 16:03:52 after about 1,800 seconds and stopped at 16:05:14
+  with 0 optimizer steps, 32/1,024 collected rollouts, and 127 buffered
+  rollouts. A had
+  105 preemptions versus B 0 at 15:51; both were active with no OOM or
+  restarts. The initial full uncompressed adapter was 30,767,549,784 bytes;
+  A reached 44.2% at about 15:58 with a 10.94 MiB/s interval, not positive
+  step-update timing.
+- A same-run restart was invoked at 16:33:01 UTC and returned at 16:38:45.
+  It brought all eight trainers up at about 16:34-16:35 UTC
+  and the orchestrator at about 16:38 UTC. At 16:47 UTC, its initial adapter
+  bootstrap was pending and it still had 0 optimizer steps. The old 18.337 GB
+  partial was rejected because its source SHA differed (`2c2d5927...5072c`
+  versus `948490...b17f2`); it was not reused, and no value change is proven.
+  BF16-random A/zero B initialization is probable; the FP8 base was unchanged.
+  All eight trainers had expert activation offload 0 and `sm89-r32`.
   Inference A and B remained MTP 1 with 32K context and existing graphs.
-  The initial full uncompressed adapter was 30,767,549,784 bytes. A was 44.2%
-  complete at about 15:58 with a 10.94 MiB/s interval; this is not positive
-  step-update timing. A had 105 preemptions versus B 0 at 15:51; both remained
-  active with no OOM or restarts. Different image `nvcc` paths selected
-  different FlashInfer/fusion paths; this runtime-path difference is unfixed.
-  The first full step, performance, stability, and 20-step completion remain
-  pending, so this run has no production pass claim.
+  Different image `nvcc` paths selected different FlashInfer/fusion paths; this
+  runtime-path difference is unfixed. The first full step, performance, stability, and
+  20-step completion remain pending, so this run has no production pass claim.
 - The original cold start failed before trainers arrived: `install -d` assigned
   ownership only to the broadcasts leaf, leaving new run parents root-owned;
-  `control/.incoming` then failed with permission denied. The user-approved
+  creation of `control` and `.incoming` then failed with permission denied.
+  The user-approved
   repair in `8bc0602` creates the run parent, service, and broadcasts
   directories explicitly as UID/GID 1000. The exact n82 directories were
   repaired before retry; 26 focused tests and `bash -n` passed.
+- The null harness had an SDK 600-second default timeout and two retries inside
+  the 3,600-second rollout limit; the dispatcher also retried every timeout
+  `HarnessError`. `eb5ffad` disables the inner timeout/retries, requires a
+  recorded failed policy call to retry a harness timeout, and mounts the
+  updated harness. Sixteen focused
+  tests, `bash -n`, and patch-block reverse checks passed.
 - Trainer-only qualification is `glm52-fixed-token` on 64 GPUs (8 packed
   microbatches x 32,768 tokens, 262,144 total) with 512 selected tokens,
   learning rate 0, and adapter B zero at step 0.
