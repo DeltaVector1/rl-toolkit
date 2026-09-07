@@ -146,7 +146,17 @@ class AdapterUpdateTest(unittest.TestCase):
         self.assertIn("ADAPTER_PREDICTIVE_RUN", launcher)
         self.assertIn("ADAPTER_PREDICTIVE_BROADCAST_PATH", launcher)
         self.assertIn("ADAPTER_PREDICTIVE_SOURCE_URL", launcher)
-        self.assertIn('sudo install -d -o 1000 -g 1000 -m 0755 "$active_broadcasts"', launcher)
+        install = (
+            'sudo install -d -o 1000 -g 1000 -m 0755 \\\n'
+            '        "$broadcast_root/$predictive_run" \\\n'
+            '        "$broadcast_root/$predictive_run/run_$predictive_run" \\\n'
+            '        "$active_broadcasts"'
+        )
+        self.assertIn(install, launcher)
+        self.assertLess(
+            launcher.index(install),
+            launcher.index('sudo docker run -d --name "$adapter_container"'),
+        )
         self.assertIn('/broadcast/"$predictive_broadcast_path":rw', launcher)
         self.assertNotIn('/broadcast/"$predictive_run":rw', launcher)
         self.assertIn('--upgrade-path "$predictive_broadcast_path"', launcher)

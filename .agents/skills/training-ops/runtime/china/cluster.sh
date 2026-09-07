@@ -312,7 +312,10 @@ PY
           exit 1
         }
       done
-      sudo install -d -o 1000 -g 1000 -m 0755 "$active_broadcasts"
+      sudo install -d -o 1000 -g 1000 -m 0755 \
+        "$broadcast_root/$predictive_run" \
+        "$broadcast_root/$predictive_run/run_$predictive_run" \
+        "$active_broadcasts"
       test -d "$active_broadcasts" && test ! -L "$active_broadcasts" || {
         echo "cannot create the active predictive broadcast path: $active_broadcasts" >&2
         exit 1
