@@ -49,6 +49,25 @@ A one-microbatch profile on rank 8 recorded 1.15 s in forward all-to-all,
 These are diagnostic samples, not whole-step fractions. Communication
 wrapper rows overlap with NCCL kernel rows; do not add both.
 
+## Two-step adapter-update check
+
+`glm52-lora-update` completed at 04:49:01 on commit `2fec9b6`, with the same
+16 x 32K inputs and initial adapter, LR `8e-6`, and stage profiling enabled.
+All eight containers exited with code 0 and no OOM flag.
+
+| Step | Reported forward/backward | Total | Peak reserved | A gradient norm | B weight norm |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 251.89 s | 252.59 s | 42.22 GiB | 0 | 0.0922512 |
+| 2 | 177.89 s | 178.58 s | 42.65 GiB | 0.0000475536 | 0.193373 |
+
+The B weights started at zero. The check proves updates and a nonzero A
+gradient on the next step. These aggregate norms include replicated ranks;
+they are update evidence, not a norm of a deduplicated adapter. The text log
+had a formatting error; values above come from the diagnostic JSON metrics.
+Stage-0 backward event timing is not valid because its inputs require no
+gradients. First-step profiling also adds overhead. Do not use either as a
+pure kernel timing.
+
 ## Historical neutral production-shaped runs
 
 Latest stopped attempt (Sep 8): **0 optimizer steps**. After the graph-cap

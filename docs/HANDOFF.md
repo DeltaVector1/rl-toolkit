@@ -9,6 +9,10 @@ port, container, and profile value.
   Warm forward/backward time was 177.66-179.92 seconds (median 178.39).
   Peak reserved memory stayed at 42.93 GiB for steps 3-20. All eight trainer
   containers exited with code 0 and no OOM flag by 04:38:09.
+- `glm52-lora-update` then passed two steps at LR `8e-6`, finishing 04:49:01.
+  Step 2 took 177.89 seconds reported forward/backward, with 42.65 GiB peak
+  memory. B weights changed after step 1; A gradients were nonzero on step 2.
+  All eight containers exited with code 0 and no OOM flag.
 - The test uses 524,288 fresh synthetic tokens (16 x 32,768), PP8/CP8/EP8,
   learning rate 0, and the same saved initial adapter as the baseline. It uses
   an FP8 base with BF16 rank-32 LoRA on attention, shared-expert, and
@@ -102,10 +106,11 @@ port, container, and profile value.
 
 ## Remaining checks
 
-1. Run the separate two-step adapter-update check at LR `8e-6`. The completed
-   LR0 test does not prove behavior after weights change. Its rollout,
-   adapter, judging, and save times are not applicable; measure these in a
-   real run. The earlier real batch had 17.2 times more tokens than this test.
+1. Test the separate one-round BF16 expert-combine candidate. The default
+   uses eight column transfers. Compare exact transport results, updated
+   adapter metrics, speed, and memory before selecting it. The earlier real
+   batch had 17.2 times more tokens than the synthetic tests. Rollout,
+   adapter, judging, and save times still need a real run.
 2. Keep the 600-second trainer and 720-second rollout limits. Stop and trace a
    run that exceeds them; busy GPUs do not prove progress.
 3. Before a production retry, verify configured source files, recursive

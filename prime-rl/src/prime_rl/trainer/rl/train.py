@@ -2255,12 +2255,10 @@ def train(config: TrainerConfig):
                 )
             if world.is_master:
                 logger.info(
-                    "prime_lora_update_check step=%d A-grad-norm=%.6e B-weight-norm=%.6e "
-                    "missing-A-grad=%d",
-                    progress.step,
-                    before_a_sq**0.5,
-                    after_b_sq**0.5,
-                    before_a_missing,
+                    f"prime_lora_update_check step={progress.step} "
+                    f"A-grad-norm={before_a_sq**0.5:.6e} "
+                    f"B-weight-norm={after_b_sq**0.5:.6e} "
+                    f"missing-A-grad={before_a_missing}"
                 )
 
         # Update learning rate scheduler
