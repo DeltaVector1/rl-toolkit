@@ -20,7 +20,6 @@ from prime_rl.trainer.rl.broadcast import setup_weight_broadcast
 from prime_rl.utils.act_offloading import maybe_activation_offloading
 import torch
 import torch.distributed as dist
-from torch import nn
 from torch.distributed.distributed_c10d import _set_pg_timeout
 from torch.profiler import profile, ProfilerActivity, record_function
 from prime_rl.trainer.ckpt import setup_ckpt_managers
@@ -383,38 +382,6 @@ def initialize_fresh_lora_policy(
             "all B matrices must be zero, and the scaling factor must match alpha/rank"
         )
     return len(fresh_b), int(nonzero_b_shards.item())
-
-
-@torch.no_grad()
-def _lora_update_check_stats(
-    model: nn.Module, device: torch.device | None = None
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Collect distributed LoRA update evidence without per-parameter host copies."""
-    device = device or torch.device("cuda", torch.cuda.current_device())
-    stats = torch.zeros(5, dtype=torch.float64, device=device)
-    finite = torch.ones((), dtype=torch.int32, device=device)
-    for name, parameter in model.named_parameters():
-        if "lora_A" not in name and "lora_B" not in name:
-            continue
-        if "lora_B" in name:
-            stats[4].add_(1.0)
-            value = parameter.to_local() if hasattr(parameter, "to_local") else parameter
-            finite.mul_(torch.isfinite(value).all().to(dtype=torch.int32))
-            value_norm = torch.linalg.vector_norm(value, dtype=torch.float32)
-            stats[1].add_(value_norm.square().to(dtype=torch.float64))
-            continue
-        stats[3].add_(1.0)
-        gradient = parameter.grad
-        if gradient is None:
-            stats[2].add_(1.0)
-            continue
-        gradient = gradient.to_local() if hasattr(gradient, "to_local") else gradient
-        finite.mul_(torch.isfinite(gradient).all().to(dtype=torch.int32))
-        gradient_norm = torch.linalg.vector_norm(gradient, dtype=torch.float32)
-        stats[0].add_(gradient_norm.square().to(dtype=torch.float64))
-    dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-    dist.all_reduce(finite, op=dist.ReduceOp.MIN)
-    return stats, finite
 
 
 def parity_guard_failures(tensor_stats: dict, guard) -> list[str]:
@@ -810,29 +777,6 @@ def train(config: TrainerConfig):
     )
     logger.info(f"Starting RL trainer in {world} in {config.output_dir}")
     qualification_identity = _qualification_environment()
-    lora_update_check = os.environ.get("prime_lora_update_check") == "1"
-    if lora_update_check:
-        if (
-            config.data.fake is None
-            or config.data.fake.batch_size != 16
-            or not config.data.fake.generate_samples
-            or config.max_steps != 2
-            or config.optim.lr != 8e-6
-            or config.model.seq_len != 32768
-            or config.model.pp != 8
-            or config.model.cp != 8
-            or config.model.ep != 8
-            or config.model.cp_style != "ring"
-            or os.environ.get("prime_sparse_bwd_skip_sentinel") != "1"
-            or config.model.lora is None
-            or config.model.lora.rank != 32
-            or config.model.lora.initial_adapter_path is None
-        ):
-            raise RuntimeError(
-                "prime_lora_update_check requires fake batch 16, PP8/CP8/EP8 "
-                "ring topology, sentinel flag 1, two steps, LR 8e-6, 32K context, "
-                "rank-32 LoRA, and an initial adapter"
-            )
     if qualification_identity is not None:
         fake = config.data.fake
         expected_steps = {
@@ -1260,27 +1204,6 @@ def train(config: TrainerConfig):
         )
 
     qualification_input_sha256: dict[int, str] = {}
-
-    lora_update_initial_stats = None
-    if lora_update_check:
-        lora_update_initial_stats, initial_finite = _lora_update_check_stats(model)
-        initial_b_sq = float(lora_update_initial_stats[1].item())
-        initial_a_count = int(lora_update_initial_stats[3].item())
-        initial_b_count = int(lora_update_initial_stats[4].item())
-        if (
-            not bool(initial_finite.item())
-            or initial_a_count <= 0
-            or initial_b_count <= 0
-            or initial_b_sq != 0.0
-        ):
-            raise RuntimeError(
-                "prime_lora_update_check requires LoRA A/B parameters, finite values, "
-                "and an exact zero-B initial adapter"
-            )
-        if world.is_master:
-            logger.info(
-                "prime_lora_update_check initial B norm=0.000000e+00"
-            )
 
     gc_handler = GarbageCollection(config.gc.interval) if config.gc else None
 
@@ -2225,41 +2148,9 @@ def train(config: TrainerConfig):
 
         zero_grad_ratio = get_zero_gradient_ratio(model.parameters(), parallel_dims.dp_replicate)
 
-        lora_update_before_stats = None
-        lora_update_before_finite = None
-        if lora_update_check:
-            lora_update_before_stats, lora_update_before_finite = _lora_update_check_stats(model)
-
         # Update the model parameters
         optimizer.step()
         optimizer.zero_grad()
-
-        lora_update_after_stats = None
-        lora_update_after_finite = None
-        if lora_update_check:
-            lora_update_after_stats, lora_update_after_finite = _lora_update_check_stats(model)
-            before_a_sq = float(lora_update_before_stats[0].item())
-            before_a_missing = int(lora_update_before_stats[2].item())
-            after_b_sq = float(lora_update_after_stats[1].item())
-            if not bool(lora_update_before_finite.item()) or not bool(lora_update_after_finite.item()):
-                raise RuntimeError(
-                    f"prime_lora_update_check found non-finite LoRA values at step {progress.step}"
-                )
-            if progress.step == 1 and after_b_sq <= 0.0:
-                raise RuntimeError(
-                    "prime_lora_update_check found no nonzero B update after step 1"
-                )
-            if progress.step == 2 and (before_a_missing or before_a_sq <= 0.0):
-                raise RuntimeError(
-                    "prime_lora_update_check found no nonzero A gradient on step 2"
-                )
-            if world.is_master:
-                logger.info(
-                    f"prime_lora_update_check step={progress.step} "
-                    f"A-grad-norm={before_a_sq**0.5:.6e} "
-                    f"B-weight-norm={after_b_sq**0.5:.6e} "
-                    f"missing-A-grad={before_a_missing}"
-                )
 
         # Update learning rate scheduler
         scheduler.step()
@@ -2419,13 +2310,6 @@ def train(config: TrainerConfig):
         }
         if grad_norm is not None:
             optim_metrics["optim/grad_norm"] = grad_norm.item()
-        if lora_update_check:
-            optim_metrics["diagnostic/lora_update_a_grad_norm"] = float(
-                lora_update_before_stats[0].sqrt().item()
-            )
-            optim_metrics["diagnostic/lora_update_b_weight_norm"] = float(
-                lora_update_after_stats[1].sqrt().item()
-            )
         monitor.log(optim_metrics, step=progress.step)
 
         # Compute derived metrics
