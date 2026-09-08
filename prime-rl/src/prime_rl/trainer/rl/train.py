@@ -1359,6 +1359,8 @@ def train(config: TrainerConfig):
             memory_profiler = MemoryProfiler(progress.step, config.memory_profiler_path)
 
         forward_backward_start_time = time.perf_counter()
+        if dist.get_rank() == 0:
+            logger.info(f"TRAINER_FORWARD_BACKWARD_START step={progress.step}")
         seq_len = micro_batches[0]["input_ids"].shape[1]
 
         # Normalize each loss component by its own global (dp_cp) token count, so every rank
@@ -2171,17 +2173,17 @@ def train(config: TrainerConfig):
             current_lr = optimizer.get_current_lr()
         forward_backward_end_time = time.perf_counter()
         forward_backward_time = forward_backward_end_time - forward_backward_start_time
-        if dist.get_rank() == 0:
-            logger.info(
-                f"TRAINER_FORWARD_BACKWARD_COMPLETE step={progress.step} "
-                f"seconds={forward_backward_time:.6f}"
-            )
         if qualification_identity is not None:
             maximum_forward_backward = torch.tensor(
                 forward_backward_time, dtype=torch.float64, device="cuda"
             )
             dist.all_reduce(maximum_forward_backward, op=dist.ReduceOp.MAX)
             forward_backward_time = float(maximum_forward_backward.item())
+        if dist.get_rank() == 0:
+            logger.info(
+                f"TRAINER_FORWARD_BACKWARD_COMPLETE step={progress.step} "
+                f"seconds={forward_backward_time:.6f}"
+            )
 
         # Broadcast the model just produced (policy v{progress.step}) so the orchestrator can
         # sample its next step from it. In-memory transports retain their two-step shutdown

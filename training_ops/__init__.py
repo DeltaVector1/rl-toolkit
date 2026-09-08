@@ -427,12 +427,12 @@ def _parse_trainer_compute(value: str) -> tuple[int, float | None] | None:
         return None
     try:
         step = int(parts[0])
-        seconds = float(parts[1]) if len(parts) == 2 else None
     except (TypeError, ValueError):
         return None
-    if step < 0 or seconds is not None and (
-        not math.isfinite(seconds) or seconds < 0
-    ):
+    if step < 0:
+        return None
+    seconds = _parse_seconds(parts[1]) if len(parts) == 2 else None
+    if len(parts) == 2 and seconds is None:
         return None
     return step, seconds
 
@@ -461,24 +461,22 @@ def _select_active_reward_rows(
 
 trainer_compute_probe = r"""
 started_at=$(sudo docker inspect __TRAINER__ --format '{{.State.StartedAt}}' 2>/dev/null | head -1)
-if [ -n "$started_at" ]; then
-  trainer_log=$(sudo docker logs -t --since "$started_at" __TRAINER__ 2>&1 | strip)
+started_epoch=$(date -u -d "$started_at" +%s.%N 2>/dev/null || true)
+if [ -z "$started_at" ] || [ -z "$started_epoch" ]; then
+  echo "TRAINER_COMPUTE_STATE unknown"
 else
-  trainer_log=$(sudo docker logs -t __TRAINER__ 2>&1 | strip)
-fi
-compute=$(printf '%s\n' "$trainer_log" | awk '
-/Starting training step [0-9]+/ {
-  current=$0
-  sub(/^.*Starting training step /, "", current)
-  sub(/[^0-9].*$/, "", current)
+  trainer_log=$(sudo docker logs -t --since "$started_at" __TRAINER__ 2>&1 | strip)
+  compute=$(printf '%s\n' "$trainer_log" | awk '
+/TRAINER_FORWARD_BACKWARD_START step=[0-9]+/ {
+  line=$0
+  sub(/^.*step=/, "", line)
+  current=line
+  sub(/ .*/, "", current)
   active=0
   completed=""
   pp=""
-  started="-"
-}
-/Starting forward and backward pass/ && current != "" {
-  active=1
   started=$1
+  active=1
 }
 /PP step: [0-9]+ micro-batches in [0-9]+([.][0-9]+)?s/ && active {
   pp=$0
@@ -508,27 +506,33 @@ END {
     print ""
   }
 }')
-read -r compute_step compute_seconds compute_pp compute_active compute_start <<EOF
+  read -r compute_step compute_seconds compute_pp compute_active compute_start <<EOF
 $compute
 EOF
-compute_elapsed=""
-if [ "$compute_active" = 1 ] && [ "$compute_start" != "-" ]; then
-  compute_start_epoch=$(date -u -d "$compute_start" +%s.%N 2>/dev/null || true)
-  now_epoch=$(date -u +%s.%N)
-  if [ -n "$compute_start_epoch" ]; then
-    compute_elapsed=$(awk -v now="$now_epoch" -v start="$compute_start_epoch" \
-      'BEGIN { if (now >= start) printf "%.6f", now - start }')
+  compute_elapsed=""
+  if [ "$compute_active" = 1 ] && [ "$compute_start" != "-" ]; then
+    compute_start_epoch=$(date -u -d "$compute_start" +%s.%N 2>/dev/null || true)
+    now_epoch=$(date -u +%s.%N)
+    if [ -n "$compute_start_epoch" ]; then
+      compute_elapsed=$(awk -v now="$now_epoch" -v start="$compute_start_epoch" \
+        'BEGIN { if (now >= start) printf "%.6f", now - start }')
+    fi
   fi
-fi
-if [ "$compute_step" = "" ]; then
-  echo "TRAINER_COMPUTE"
-else
-  if [ "$compute_seconds" = "-" ]; then compute_seconds=""; fi
-  if [ "$compute_pp" = "-" ]; then compute_pp=""; fi
-  echo "TRAINER_COMPUTE $compute_step${compute_seconds:+ $compute_seconds}"
-  echo "TRAINER_COMPUTE_PP_SECONDS $compute_pp"
-  echo "TRAINER_COMPUTE_ACTIVE $compute_active"
-  echo "TRAINER_COMPUTE_ELAPSED_SECONDS $compute_elapsed"
+  if [ "$compute_step" = "" ]; then
+    echo "TRAINER_COMPUTE_STATE pending"
+  else
+    if [ "$compute_seconds" = "-" ]; then compute_seconds=""; fi
+    if [ "$compute_pp" = "-" ]; then compute_pp=""; fi
+    echo "TRAINER_COMPUTE $compute_step${compute_seconds:+ $compute_seconds}"
+    echo "TRAINER_COMPUTE_PP_SECONDS $compute_pp"
+    echo "TRAINER_COMPUTE_ACTIVE $compute_active"
+    echo "TRAINER_COMPUTE_ELAPSED_SECONDS $compute_elapsed"
+    if [ "$compute_active" = 1 ]; then
+      echo "TRAINER_COMPUTE_STATE active"
+    else
+      echo "TRAINER_COMPUTE_STATE complete"
+    fi
+  fi
 fi
 """
 
@@ -826,6 +830,7 @@ class Status:
     batch_sync: bool = False
     trainer_failure_watchdog: bool = False
     trainer_steps: int = 0
+    trainer_compute_state: str = "pending"
     trainer_compute_step: int | None = None
     trainer_compute_seconds: float | None = None
     trainer_compute_pp_seconds: float | None = None
@@ -880,19 +885,30 @@ class Status:
         L.append(
             f"run steps {self.trainer_steps} | failures in 5m {self.fails_5m} | {self.batch or 'no batch line'}"
         )
-        if self.trainer_compute_step is not None:
-            if self.trainer_compute_seconds is None:
-                compute = f"step {self.trainer_compute_step} active"
-                if self.trainer_compute_elapsed_seconds is not None:
-                    compute += f" {self.trainer_compute_elapsed_seconds:.2f}s"
-            else:
-                compute = (
-                    f"step {self.trainer_compute_step} "
-                    f"{self.trainer_compute_seconds:.2f}s (forward/backward complete)"
-                )
-            if self.trainer_compute_pp_seconds is not None:
-                compute += f"; PP {self.trainer_compute_pp_seconds:.2f}s"
-            L.append(f"  trainer compute: {compute}")
+        if self.trainer_compute_state == "unknown":
+            compute = "unknown"
+        elif (
+            self.trainer_compute_state == "active"
+            and self.trainer_compute_active
+            and self.trainer_compute_step is not None
+        ):
+            compute = f"step {self.trainer_compute_step} active"
+            if self.trainer_compute_elapsed_seconds is not None:
+                compute += f" {self.trainer_compute_elapsed_seconds:.2f}s"
+        elif (
+            self.trainer_compute_state == "complete"
+            and self.trainer_compute_step is not None
+            and self.trainer_compute_seconds is not None
+        ):
+            compute = (
+                f"step {self.trainer_compute_step} "
+                f"{self.trainer_compute_seconds:.2f}s (forward/backward complete)"
+            )
+        else:
+            compute = "pending"
+        if self.trainer_compute_pp_seconds is not None:
+            compute += f"; PP {self.trainer_compute_pp_seconds:.2f}s"
+        L.append(f"  trainer compute: {compute}")
         if self.trainer_last:
             L.append(f"  trainer: {self.trainer_last[:150]}")
         elif self.trainer_current:
@@ -1800,6 +1816,9 @@ def status(run: str = "", quiet: bool = False) -> Status:
     s.batch_sync = int(h.get("BATCH_SYNC", 0) or 0) > 0
     s.trainer_failure_watchdog = int(h.get("TRAINER_FAIL_WD", 0) or 0) > 0
     s.trainer_steps = int(h.get("TRAINER_STEPS", 0) or 0)
+    state = h.get("TRAINER_COMPUTE_STATE", "pending")
+    if state in {"pending", "active", "complete", "unknown"}:
+        s.trainer_compute_state = state
     compute = _parse_trainer_compute(h.get("TRAINER_COMPUTE", ""))
     if compute is not None:
         s.trainer_compute_step, s.trainer_compute_seconds = compute
@@ -1873,16 +1892,16 @@ def _warnings(s: Status) -> list[str]:
     ):
         w.append(
             f"trainer compute step {s.trainer_compute_step} exceeds configured upper bound "
-            f"{trainer_seconds_max:g}s"
+            f"{trainer_seconds_max:g}s; operator must stop"
         )
     if (
         s.trainer_compute_active
         and s.trainer_compute_elapsed_seconds is not None
-        and s.trainer_compute_elapsed_seconds > stall_seconds
+        and s.trainer_compute_elapsed_seconds > trainer_seconds_max
     ):
         w.append(
             f"trainer compute step {s.trainer_compute_step} has been active for "
-            f"more than {stall_seconds:g}s"
+            f"more than {trainer_seconds_max:g}s; operator must stop"
         )
     if s.trainer_failed:
         w.append(f"trainer process failed after {s.trainer_steps} completed steps")
@@ -2962,7 +2981,7 @@ def watch(hours: float = 2.0, every: int = 300, run: str = "") -> list[Status]:
                     print(
                         f"-- trainer GPUs remain busy after {_hms(still)} without a counter change; "
                         "GPU use is high, but no step or batch progress is confirmed. "
-                        "Check the compute timer and enforce the configured limit.",
+                        "Check the compute timer; operator must stop if it exceeds the configured limit.",
                         flush=True,
                     )
                 else:
