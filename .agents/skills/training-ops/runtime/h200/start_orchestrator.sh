@@ -18,47 +18,14 @@ TRAINER_ADDRESSES=${TRAINER_ADDRESSES:?set TRAINER_ADDRESSES}
 TRAINER_CT=${TRAINER_CT:?set TRAINER_CT}
 ORCH_CT=${ORCH_CT:?set ORCH_CT}
 deployment=/data/glm52-rl/deployment
-config_file=${ORCH_CONFIG:-$deployment/configs/current/orchestrator.toml}
-operations_file="$deployment/configs/operations.toml"
-if ! image=$(python3 - "$operations_file" "$config_file" <<'PY'
-import os
-import sys
-import tomllib
-
-operations_path, config_path = sys.argv[1:]
-with open(operations_path, "rb") as stream:
-    operations = tomllib.load(stream)
-repository_root = os.path.dirname(os.path.dirname(operations_path))
-if not os.path.isabs(config_path):
-    config_path = os.path.join(repository_root, config_path)
-selected = os.path.realpath(config_path)
-matches = []
-for name, profile in operations.get("profiles", {}).items():
-    if not isinstance(profile, dict):
-        continue
-    configured = profile.get("orchestrator")
-    if not isinstance(configured, str):
-        continue
-    candidate = os.path.realpath(os.path.join(repository_root, configured))
-    if candidate == selected:
-        matches.append((name, profile))
-if len(matches) != 1:
-    raise SystemExit(f"orchestrator config must select one operations profile: {config_path}")
-profile_name, profile = matches[0]
-value = profile.get("orchestrator_image")
-if not isinstance(value, str) or not value.strip():
-    raise SystemExit(f"operations profile {profile_name!r} has no orchestrator_image")
-print(value)
-PY
-); then
-  echo "cannot select an orchestrator image from operations profile" >&2
+config_file=${ORCH_CONFIG:-$deployment/configs/general-agent/orchestrator.toml}
+nodes_file="$deployment/configs/nodes.toml"
+test -f "$config_file" || {
+  echo "orchestrator config is missing: $config_file" >&2
   exit 2
-fi
-if [ -z "$image" ]; then
-  echo "operations profile selected an empty orchestrator image" >&2
-  exit 2
-fi
-readarray -t lora_source_ports < <(python3 - "$deployment/configs/operations.toml" <<'PY'
+}
+image=prime-rl:glm52-decensor
+readarray -t lora_source_ports < <(python3 - "$nodes_file" <<'PY'
 import sys
 import tomllib
 
@@ -74,10 +41,10 @@ for port in range(first, last + 1):
 PY
 )
 if [ "${#lora_source_ports[@]}" -lt 1 ]; then
-  echo "operations config has no LoRA source ports" >&2
+  echo "nodes config has no LoRA source ports" >&2
   exit 2
 fi
-adapter_port=$(python3 - "$deployment/configs/operations.toml" <<'PY'
+adapter_port=$(python3 - "$nodes_file" <<'PY'
 import sys
 import tomllib
 
@@ -85,46 +52,46 @@ with open(sys.argv[1], "rb") as stream:
     config = tomllib.load(stream)
 value = config["ports"].get("adapter")
 if not isinstance(value, int) or not 1 <= value <= 65535:
-    raise SystemExit("operations config has no valid adapter port")
+    raise SystemExit("nodes config has no valid adapter port")
 print(value)
 PY
 )
 if [ -z "$adapter_port" ]; then
-  echo "operations config has no adapter port" >&2
+  echo "nodes config has no adapter port" >&2
   exit 2
 fi
-if ! relay_settings=$(python3 - "$operations_file" "$config_file" <<'PY'
+if ! relay_settings=$(python3 - "$nodes_file" "$config_file" <<'PY'
 import sys
 import tomllib
 from urllib.parse import urlsplit
 
 with open(sys.argv[1], "rb") as stream:
-    operations = tomllib.load(stream)
+    nodes = tomllib.load(stream)
 with open(sys.argv[2], "rb") as stream:
     edge = tomllib.load(stream)
-ports = operations.get("ports")
+ports = nodes.get("ports")
 if not isinstance(ports, dict):
-    raise SystemExit("operations config has no port inventory")
+    raise SystemExit("nodes config has no port inventory")
 relay_port = ports.get("adapter_relay")
 source_first = ports.get("lora_source_first")
 source_last = ports.get("lora_source_last")
-relay_container = operations.get("containers", {}).get("adapter_relay")
-cache_dir = operations.get("paths", {}).get("adapter_cache")
+relay_container = nodes.get("containers", {}).get("adapter_relay")
+cache_dir = nodes.get("paths", {}).get("adapter_cache")
 source_url = edge.get("weight_broadcast", {}).get("source_url")
 model_name = edge.get("model", {}).get("name")
-glm_model = operations.get("models", {}).get("glm52")
+glm_model = nodes.get("models", {}).get("glm52")
 if not isinstance(relay_port, int) or not 1 <= relay_port <= 65535:
-    raise SystemExit("operations config has no valid adapter relay port")
+    raise SystemExit("nodes config has no valid adapter relay port")
 if (
     not isinstance(source_first, int)
     or not isinstance(source_last, int)
     or not 1 <= source_first <= source_last <= 65535
 ):
-    raise SystemExit("operations config has no valid adapter source range")
+    raise SystemExit("nodes config has no valid adapter source range")
 port_values = {}
 for name, value in ports.items():
     if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 65535:
-        raise SystemExit(f"operations port {name} is invalid")
+        raise SystemExit(f"nodes port {name} is invalid")
     port_values[name] = value
 source_ports = set(range(source_first, source_last + 1))
 reserved_names = set(port_values) - {"lora_source_first", "lora_source_last"}
@@ -143,13 +110,13 @@ duplicates = [names for names in duplicate_ports.values() if len(names) > 1]
 if duplicates:
     raise SystemExit(f"configured ports are duplicated: {duplicates}")
 if not isinstance(relay_container, str) or not relay_container:
-    raise SystemExit("operations config has no adapter relay container")
+    raise SystemExit("nodes config has no adapter relay container")
 if not isinstance(cache_dir, str) or not cache_dir.startswith("/"):
-    raise SystemExit("operations config has no absolute adapter cache path")
+    raise SystemExit("nodes config has no absolute adapter cache path")
 if not isinstance(source_url, str) or not source_url.startswith(("http://", "https://")):
     raise SystemExit("orchestrator config has no canonical adapter source URL")
 if not isinstance(model_name, str) or not isinstance(glm_model, str):
-    raise SystemExit("model names are missing from the operations or orchestrator config")
+    raise SystemExit("model names are missing from the nodes or orchestrator config")
 parsed = urlsplit(source_url)
 if parsed.hostname not in {"127.0.0.1", "localhost"} or parsed.query or parsed.fragment:
     raise SystemExit("canonical adapter source URL must be loopback without query or fragment")
@@ -162,7 +129,7 @@ PY
   exit 2
 fi
 read -r relay_port relay_container relay_cache_dir relay_source_url relay_is_glm <<<"$relay_settings"
-trainer_ssh_target=$(python3 - "$deployment/configs/operations.toml" <<'PY'
+trainer_ssh_target=$(python3 - "$nodes_file" <<'PY'
 import sys
 import tomllib
 
@@ -170,12 +137,12 @@ with open(sys.argv[1], "rb") as stream:
     config = tomllib.load(stream)
 target = config["hosts"]["trainer_ssh"]
 if not isinstance(target, str) or not target:
-    raise SystemExit("operations config has no trainer SSH target")
+    raise SystemExit("nodes config has no trainer SSH target")
 print(target)
 PY
 )
 if [ -z "$trainer_ssh_target" ]; then
-  echo "operations config has no trainer SSH target" >&2
+  echo "nodes config has no trainer SSH target" >&2
   exit 2
 fi
 transport=$(awk '
@@ -184,22 +151,22 @@ transport=$(awk '
   active && $1 == "type" { gsub(/[ "\047]/, "", $3); print $3; exit }
 ' "$config_file")
 
-if ! peer_settings=$(python3 - "$operations_file" "$config_file" <<'PY'
+if ! peer_settings=$(python3 - "$nodes_file" "$config_file" <<'PY'
 import ipaddress
 import re
 import sys
 import tomllib
 
 with open(sys.argv[1], "rb") as stream:
-    operations = tomllib.load(stream)
+    nodes = tomllib.load(stream)
 with open(sys.argv[2], "rb") as stream:
     edge = tomllib.load(stream)
 
-hosts = operations.get("hosts")
+hosts = nodes.get("hosts")
 inference_hosts = hosts.get("inference") if isinstance(hosts, dict) else None
 orchestrator = hosts.get("orchestrator") if isinstance(hosts, dict) else None
 if not isinstance(inference_hosts, list) or not all(isinstance(item, str) for item in inference_hosts):
-    raise SystemExit("operations config has no valid inference host list")
+    raise SystemExit("nodes config has no valid inference host list")
 peers = [item for item in inference_hosts if item != orchestrator]
 if len(peers) > 1:
     raise SystemExit("two-H200 routing supports one inference peer")
@@ -208,7 +175,7 @@ if not peers:
     raise SystemExit
 
 peer_name = peers[0]
-peer = operations.get("inference", {}).get(peer_name)
+peer = nodes.get("inference", {}).get(peer_name)
 if not isinstance(peer, dict):
     raise SystemExit(f"inference settings for {peer_name} are missing")
 host = peer.get("ssh_host")
@@ -739,8 +706,7 @@ sudo docker run -d --name "$ORCH_CT" \
   --network host --restart no \
   --env-file /data/trinity/training.env \
   -e VLLM_API_KEY=unused \
-  -e PRIME_RL_OPERATIONS_CONFIG="$deployment/configs/operations.toml" \
-  -e PYTHONPATH="$deployment/environments/decensor/src:$deployment/environments/ornith/src:$deployment/environments/testing-perf-env/src:$deployment/environments/general-agent:$deployment/evals/refusals-classifier/src:/app/src" \
+  -e PYTHONPATH="$deployment/environments/general-agent:/app/src" \
   -e HF_HOME="/data/glm52-rl/runs/$RUN/$RUN_NAME/hf-cache" \
   -v /data/glm52-rl:/data/glm52-rl \
   -v glm52-fp8-model:/models/glm52-fp8:ro \

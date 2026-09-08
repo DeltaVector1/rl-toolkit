@@ -2,8 +2,13 @@
 set -euo pipefail
 
 deployment=/data/glm52-rl/deployment
-engine_host=${ENGINE_HOST:?ENGINE_HOST must name this host in operations.toml}
-runtime_output=$(python3 - "$deployment/configs/operations.toml" "$engine_host" <<'PY'
+engine_host=${ENGINE_HOST:?ENGINE_HOST must name this host in nodes.toml}
+inference_config=${INFERENCE_CONFIG:-$deployment/configs/general-agent/inference.toml}
+test -f "$inference_config" || {
+  echo "inference config is missing: $inference_config" >&2
+  exit 2
+}
+runtime_output=$(python3 - "$deployment/configs/nodes.toml" "$engine_host" <<'PY'
 import sys
 import tomllib
 import json
@@ -63,10 +68,10 @@ print(json.dumps(vllm_extra, separators=(",", ":")))
 PY
 )
 readarray -t runtime_settings <<< "$runtime_output"
-lora_source_port_list=${runtime_settings[0]:?operations config has no LoRA source ports}
-adapter_cache_dir=${runtime_settings[1]:?operations config has no adapter cache path}
-disable_nccl_shm=${runtime_settings[2]:?operations config has no NCCL shared-memory setting}
-vllm_extra=${runtime_settings[3]:?operations config has no vLLM extra settings}
+lora_source_port_list=${runtime_settings[0]:?nodes config has no LoRA source ports}
+adapter_cache_dir=${runtime_settings[1]:?nodes config has no adapter cache path}
+disable_nccl_shm=${runtime_settings[2]:?nodes config has no NCCL shared-memory setting}
+vllm_extra=${runtime_settings[3]:?nodes config has no vLLM extra settings}
 install -d -o 1000 -g 1000 -m 0755 "$adapter_cache_dir"
 install -d -o 1000 -g 1000 -m 0755 "$deployment/cache/vllm"
 docker update --restart=no glm52-decensor-h200 glm52-decensor-h200-0 glm52-decensor-h200-1 >/dev/null 2>&1 || true
@@ -104,5 +109,5 @@ docker run -d --name glm52-decensor-h200 --restart unless-stopped \
   --entrypoint /bin/bash \
   prime-rl:glm52-v080-glm52-h200-router \
   -lc 'set -e; patch --batch --forward -p1 -d /app/.venv/lib/python3.12/site-packages < /tmp/flashmla_sparse_mtp.patch || grep -q "MIN_HEADS_FOR_BF16_PREFILL = 0" /app/.venv/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/flashmla_sparse.py; exec /app/.venv/bin/inference "$@"' bash \
-  @ "$deployment/configs/runtime/glm52-inference.toml" \
+  @ "$inference_config" \
   --vllm-extra "$vllm_extra"
