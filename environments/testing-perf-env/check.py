@@ -19,6 +19,8 @@ from testing_perf_env.taskset import (  # noqa: E402
     TestingPerfTask,
     TestingPerfTaskConfig,
     TestingPerfTasksetConfig,
+    _word_band,
+    _sample_turn_counts,
 )
 from testing_perf_env.state import TestingPerfState  # noqa: E402
 from testing_perf_env.user import TestingPerfUser, TestingPerfUserConfig  # noqa: E402
@@ -56,7 +58,7 @@ def make_task(target_turns: int = 2, max_attempts: int = 3) -> TestingPerfTask:
                 "Give the plan a short title.",
             ],
             target_turns=target_turns,
-            target_words=400,
+            target_words=300,
             response_format="plain",
         ),
         TestingPerfTaskConfig(
@@ -134,21 +136,38 @@ async def run() -> None:
     )
     taskset = vf.load_taskset(taskset_config)
     loaded_tasks = taskset.select()
-    assert [task.data.target_turns for task in loaded_tasks] == [2, 3, 4, 5, 6]
+    assert [task.data.target_turns for task in loaded_tasks] == [1, 2, 3, 1, 1]
     assert [task.data.target_words for task in loaded_tasks] == [
-        500,
-        600,
-        700,
-        400,
-        500,
+        163,
+        300,
+        1400,
+        163,
+        300,
     ]
-    assert "about 500 words in each answer" in loaded_tasks[0].data.prompt_text
-    assert "near 500 words" in loaded_tasks[0].data.follow_ups[0]
-    for max_turns in range(2, 7):
+    assert "Respond tersely" in loaded_tasks[0].data.prompt_text
+    assert "about 163 words in each answer (acceptable range 75-250)" in loaded_tasks[0].data.prompt_text
+    assert "near 163 words (75-250)" in loaded_tasks[0].data.follow_ups[0]
+    sampled_turns = _sample_turn_counts(2000, 6, 42)
+    assert [
+        sampled_turns.count(turn)
+        for turn in range(1, 7)
+    ] == [1016, 508, 254, 127, 63, 32]
+    for total in range(1, 201):
+        for max_turns in range(1, 7):
+            sampled = _sample_turn_counts(total, max_turns, 42)
+            assert len(sampled) == total
+            assert all(1 <= turn <= max_turns for turn in sampled)
+    try:
+        _word_band(400)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("unsupported word target accepted")
+    for max_turns in range(1, 7):
         bounded = TestingPerfTasksetConfig(
             id="testing-perf-env", num_examples=1, max_turns=max_turns
         )
-        assert 2 <= vf.load_taskset(bounded).select(1)[0].data.target_turns <= max_turns
+        assert 1 <= vf.load_taskset(bounded).select(1)[0].data.target_turns <= max_turns
     env_config = vf.resolve_env_config(
         {
             "id": "testing-perf-env",
@@ -164,7 +183,7 @@ async def run() -> None:
 
     from verifiers.v1.mcp.server import _call_state
 
-    for target_turns in (2, 6):
+    for target_turns in (1, 2, 6):
         task = make_task(target_turns=target_turns)
         trace = make_trace(task, [])
         await task.setup(trace, None)
@@ -219,8 +238,8 @@ async def run() -> None:
         exact_score = trace.rewards["testing_perf_reward"]
         assert exact_score == 1.0
         assert trace.info["testing_perf"]["evaluation_status"] == "scored"
-        assert trace.info["testing_perf"]["target_words"] == 400
-        assert trace.info["testing_perf"]["word_counts"] == [400, 400]
+        assert trace.info["testing_perf"]["target_words"] == 300
+        assert trace.info["testing_perf"]["word_counts"] == [300, 300]
         assert trace.info["testing_perf"]["length_scores"] == [1.0, 1.0]
         assert trace.info["testing_perf"]["judge_calls"] == 2
         assert trace.info["testing_perf"]["judge_input_tokens"] == 4
@@ -240,11 +259,11 @@ async def run() -> None:
             ]
             * 2
         )
-        short_trace = make_trace(task, ["word " * 200] * 2)
+        short_trace = make_trace(task, ["word " * 100] * 2)
         await task.score(short_trace)
         short_score = short_trace.rewards["testing_perf_reward"]
         assert 0.0 < short_score < exact_score
-        assert short_trace.info["testing_perf"]["word_counts"] == [200, 200]
+        assert short_trace.info["testing_perf"]["word_counts"] == [100, 100]
         assert short_trace.info["testing_perf"]["length_scores"] == [0.5, 0.5]
 
         responses.extend(

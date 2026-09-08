@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import re
 from typing import Any, Literal
 
@@ -33,8 +34,8 @@ class TestingPerfData(vf.TaskData):
     task_id: str
     requirements: list[str]
     follow_ups: list[str]
-    target_turns: int = Field(ge=2, le=6)
-    target_words: int = Field(ge=400, le=700)
+    target_turns: int = Field(ge=1, le=6)
+    target_words: int = Field(ge=75, le=2000)
     response_format: Literal["plain", "markdown"]
 
 
@@ -46,7 +47,7 @@ class TestingPerfTaskConfig(vf.TaskConfig):
 class TestingPerfTasksetConfig(vf.TasksetConfig):
     num_examples: int = Field(default=8, ge=1)
     dataset_seed: int = 42
-    max_turns: int = Field(default=4, ge=2, le=6)
+    max_turns: int = Field(default=6, ge=1, le=6)
     markdown_ratio: float = Field(default=0.5, ge=0, le=1)
     task: TestingPerfTaskConfig = TestingPerfTaskConfig()
 
@@ -55,7 +56,6 @@ _task_templates: tuple[dict[str, Any], ...] = (
     {
         "task_id": "trip-checklist",
         "topic": "a two-day rainy city trip",
-        "target_words": 400,
         "requirements": [
             "include a waterproof jacket",
             "include comfortable shoes",
@@ -72,7 +72,6 @@ _task_templates: tuple[dict[str, Any], ...] = (
     {
         "task_id": "file-plan",
         "topic": "organising digital project files",
-        "target_words": 500,
         "requirements": [
             "use folders for source, notes, and exports",
             "give files a consistent date format",
@@ -89,7 +88,6 @@ _task_templates: tuple[dict[str, Any], ...] = (
     {
         "task_id": "study-plan",
         "topic": "a one-week study plan for a history exam",
-        "target_words": 600,
         "requirements": [
             "divide work across five weekdays",
             "include review and practice questions",
@@ -106,7 +104,6 @@ _task_templates: tuple[dict[str, Any], ...] = (
     {
         "task_id": "garden-plan",
         "topic": "a small balcony herb garden",
-        "target_words": 700,
         "requirements": [
             "name three herbs",
             "mention sunlight and drainage",
@@ -123,7 +120,49 @@ _task_templates: tuple[dict[str, Any], ...] = (
 )
 
 
-def _prompt(row: dict[str, Any], response_format: str) -> str:
+_word_bands: tuple[tuple[int, int, int, str], ...] = (
+    (1400, 800, 2000, "Be verbose"),
+    (163, 75, 250, "Respond tersely"),
+    (300, 200, 400, "Respond in a medium-length response"),
+)
+
+
+def _sample_turn_counts(total: int, max_turns: int, seed: int) -> list[int]:
+    if total <= 0:
+        return []
+    weights = [0.5 ** (turn - 1) for turn in range(1, max_turns + 1)]
+    weight_total = sum(weights)
+    shares = [total * weight / weight_total for weight in weights]
+    counts = [int(share) for share in shares]
+    remaining = total - sum(counts)
+    order = sorted(
+        range(max_turns),
+        key=lambda index: (shares[index] - counts[index], -index),
+        reverse=True,
+    )
+    for index in order[:remaining]:
+        counts[index] += 1
+    assert sum(counts) == total
+    sampled = [turn for turn, count in enumerate(counts, start=1) for _ in range(count)]
+    random.Random(seed).shuffle(sampled)
+    return sampled
+
+
+def _word_band(target_words: int) -> tuple[int, int]:
+    for target, minimum, maximum, _ in _word_bands:
+        if target_words == target:
+            return minimum, maximum
+    raise ValueError(f"unsupported neutral word target: {target_words}")
+
+
+def _prompt(
+    row: dict[str, Any],
+    response_format: str,
+    target_words: int,
+    minimum: int,
+    maximum: int,
+    requirement: str,
+) -> str:
     format_request = (
         "Use Markdown headings and bullets."
         if response_format == "markdown"
@@ -132,7 +171,8 @@ def _prompt(row: dict[str, Any], response_format: str) -> str:
     requirements = "; ".join(row["requirements"])
     return (
         f"Create a practical plan for {row['topic']}. {format_request} "
-        f"Aim for about {row['target_words']} words in each answer. "
+        f"{requirement}. Aim for about {target_words} words in each answer "
+        f"(acceptable range {minimum}-{maximum}). "
         f"The first answer must address these points: {requirements}."
     )
 
@@ -275,11 +315,18 @@ class TestingPerfTask(vf.Task[TestingPerfData, TestingPerfState, TestingPerfTask
         answers = [self._visible_text(message) for message in trace.assistant_messages]
         target_turns = self.data.target_turns
         target_words = self.data.target_words
+        minimum_words, maximum_words = _word_band(target_words)
         word_counts = [len(answer.split()) for answer in answers]
         length_scores = [
             0.0
             if word_count == 0
-            else min(word_count, target_words) / max(word_count, target_words)
+            else 1.0
+            if minimum_words <= word_count <= maximum_words
+            else (
+                word_count / minimum_words
+                if word_count < minimum_words
+                else maximum_words / word_count
+            )
             for word_count in word_counts
         ]
         trace.info["testing_perf"] = {
@@ -288,6 +335,7 @@ class TestingPerfTask(vf.Task[TestingPerfData, TestingPerfState, TestingPerfTask
             "response_format": self.data.response_format,
             "visible_output_only": True,
             "target_words": target_words,
+            "target_word_range": [minimum_words, maximum_words],
             "word_counts": word_counts,
             "length_scores": length_scores,
         }
@@ -343,6 +391,7 @@ class TestingPerfTask(vf.Task[TestingPerfData, TestingPerfState, TestingPerfTask
                 "evaluation_status": "scored",
                 "score": score,
                 "target_words": target_words,
+                "target_word_range": [minimum_words, maximum_words],
                 "word_counts": word_counts,
                 "length_scores": length_scores,
                 "turn_reviews": [review.model_dump() for review in reviews],
@@ -371,29 +420,42 @@ class TestingPerfTaskset(vf.Taskset[TestingPerfTask, TestingPerfTasksetConfig]):
     def load(self) -> list[TestingPerfTask]:
         config = self.config
         tasks: list[TestingPerfTask] = []
+        target_turns = _sample_turn_counts(
+            config.num_examples, config.max_turns, config.dataset_seed
+        )
         for index in range(config.num_examples):
             row = _task_templates[(index + config.dataset_seed) % len(_task_templates)]
+            target_words, minimum_words, maximum_words, requirement = _word_bands[
+                (index + config.dataset_seed) % len(_word_bands)
+            ]
             response_format = (
                 "markdown"
                 if (index * 997 + config.dataset_seed) % 100
                 < config.markdown_ratio * 100
                 else "plain"
             )
-            target_turns = 2 + (index % (config.max_turns - 1))
             tasks.append(
                 TestingPerfTask(
                     TestingPerfData(
                         idx=index,
                         name=row["task_id"],
-                        prompt=_prompt(row, response_format),
+                        prompt=_prompt(
+                            row,
+                            response_format,
+                            target_words,
+                            minimum_words,
+                            maximum_words,
+                            requirement,
+                        ),
                         task_id=row["task_id"],
                         requirements=list(row["requirements"]),
                         follow_ups=[
-                            f"{follow_up} Keep each answer near {row['target_words']} words."
+                            f"{follow_up} Keep each answer near {target_words} words "
+                            f"({minimum_words}-{maximum_words})."
                             for follow_up in row["follow_ups"]
                         ],
-                        target_turns=target_turns,
-                        target_words=row["target_words"],
+                        target_turns=target_turns[index],
+                        target_words=target_words,
                         response_format=response_format,
                     ),
                     config.task,
