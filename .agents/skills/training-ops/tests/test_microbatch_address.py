@@ -10,15 +10,22 @@ import training_ops
 
 
 class MicrobatchAddressTest(unittest.TestCase):
-    def test_profile_is_selected_from_active_run_output(self):
+    def test_run_config_is_selected_from_active_run_output(self):
+        selected = training_ops._config_for_run("glm-perf-3")
         self.assertEqual(
-            training_ops._profile_for_run("glm-1")["trainer"],
-            "configs/current/trainer.toml",
+            selected["trainer"],
+            "configs/general-agent/trainer.toml",
+        )
+        self.assertEqual(
+            training_ops._config_dir("configs/general-agent"),
+            selected,
         )
 
-    def test_unknown_run_has_no_profile_fallback(self):
-        with self.assertRaisesRegex(training_ops.Refused, "no configured trainer profile"):
-            training_ops._profile_for_run("unknown-run")
+    def test_unknown_run_has_no_config_fallback(self):
+        with self.assertRaisesRegex(
+            training_ops.Refused, "no run config directory has output_dir"
+        ):
+            training_ops._config_for_run("unknown-run")
 
     def test_ssh_alias_resolution_is_local_and_returns_internal_ip(self):
         result = training_ops.subprocess.CompletedProcess(
@@ -53,7 +60,7 @@ class MicrobatchAddressTest(unittest.TestCase):
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
         killpg.assert_called_once_with(4312, training_ops.signal.SIGTERM)
 
-    def test_inference_script_uses_the_run_profile_ports(self):
+    def test_inference_script_uses_the_run_config_ports(self):
         glm_script = training_ops._inference_script(
             "h200a", training_ops.glm_model, training_ops.glm_inference_container
         )
