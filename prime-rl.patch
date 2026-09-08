@@ -21128,10 +21128,10 @@ index 1ad250c..85c4267 100644
                  .unsqueeze(0)
              )
          return TensorMicroBatch(
-diff --git a/src/prime_rl/trainer/rl/train.py b/src/prime_rl/trainer/rl/train.py
-index 295d3ad1..60ae3769 100644
---- a/src/prime_rl/trainer/rl/train.py
-+++ b/src/prime_rl/trainer/rl/train.py
+diff --git a/home/mango/Misc/data-gen/glm52-decensor/build/trainer-patch-6rm4hrck/before.py b/home/mango/Misc/data-gen/glm52-decensor/build/trainer-patch-6rm4hrck/after.py
+index 295d3ad..09b6e40 100644
+--- a/home/mango/Misc/data-gen/glm52-decensor/build/trainer-patch-6rm4hrck/before.py
++++ b/home/mango/Misc/data-gen/glm52-decensor/build/trainer-patch-6rm4hrck/after.py
 @@ -1,8 +1,16 @@
  import prime_rl._compat  # noqa: F401 — patch ring_flash_attn compat before import
 
@@ -21185,7 +21185,7 @@ index 295d3ad1..60ae3769 100644
  )
  from prime_rl.trainer.parallel_dims import get_parallel_dims, resolve_ep
  from prime_rl.trainer.perf import get_perf_counter
-@@ -58,36 +72,792 @@ from prime_rl.trainer.utils import (
+@@ -58,36 +72,764 @@ from prime_rl.trainer.utils import (
      print_benchmark,
  )
  from prime_rl.trainer.world import get_world
@@ -21728,34 +21728,6 @@ index 295d3ad1..60ae3769 100644
 +        os.close(directory)
 +
 +
-+def _validate_resume_adapter_inventory(
-+    adapter_shapes: dict[str, tuple[int, ...]],
-+    expected_by_rank: list[dict[str, tuple[int, ...]]],
-+) -> None:
-+    expected: dict[str, tuple[int, ...]] = {}
-+    conflicts: list[str] = []
-+    for rank_expected in expected_by_rank:
-+        for key, shape in rank_expected.items():
-+            previous = expected.setdefault(key, shape)
-+            if previous != shape:
-+                conflicts.append(key)
-+    missing = sorted(set(expected) - set(adapter_shapes))
-+    unexpected = sorted(set(adapter_shapes) - set(expected))
-+    mismatched = sorted(
-+        key
-+        for key in set(expected) & set(adapter_shapes)
-+        if expected[key] != adapter_shapes[key]
-+    )
-+    if conflicts or missing or unexpected or mismatched:
-+        raise ValueError(
-+            "Resume adapter inventory differs from the complete distributed LoRA model: "
-+            f"conflicts={conflicts[:5]} ({len(conflicts)} total), "
-+            f"missing={missing[:5]} ({len(missing)} total), "
-+            f"unexpected={unexpected[:5]} ({len(unexpected)} total), "
-+            f"shape_mismatch={mismatched[:5]} ({len(mismatched)} total)"
-+        )
-+
-+
 +def _load_qualification_session(
 +    config: TrainerConfig, identity: dict[str, str]
 +) -> dict:
@@ -21982,7 +21954,7 @@ index 295d3ad1..60ae3769 100644
      )
 
      # Setup heartbeat (only on rank 0)
-@@ -101,17 +871,24 @@ def train(config: TrainerConfig):
+@@ -101,17 +843,24 @@ def train(config: TrainerConfig):
      health_server = None
      if config.metrics_server is not None and world.local_rank == 0:
          if world.is_master:
@@ -22011,7 +21983,7 @@ index 295d3ad1..60ae3769 100644
      )
      # Configurable to support ROCm/AMD GPUs where reduced precision
      # matmul corrupts softmax over large vocabularies. Override via config
-@@ -120,41 +897,125 @@ def train(config: TrainerConfig):
+@@ -120,41 +869,86 @@ def train(config: TrainerConfig):
 
      # Setup multi run manager and offsets (including LoRA validation/scaling hooks if applicable)
      multi_run_manager = setup_multi_run_manager(
@@ -22078,6 +22050,7 @@ index 295d3ad1..60ae3769 100644
      logger.info(f"Initializing model ({config.model})")
      loading_from_ckpt_later = config.ckpt and checkpoint_step is not None
      model = setup_model(config.model, parallel_dims, loading_from_ckpt_later)
+-
 +    if trainer_only and config.model.lora is not None:
 +        multi_run_manager.create_trainer_only_run(config.model.lora)
 +    group_timeout = timedelta(seconds=config.dist_timeout_seconds)
@@ -22093,45 +22066,6 @@ index 295d3ad1..60ae3769 100644
 +    resume_adapter = (
 +        os.environ.get("PRIME_RL_RESUME_ADAPTER") if checkpoint_step is None else None
 +    )
-+    if resume_adapter:
-+        from safetensors.torch import load_file
-+        from torch.distributed.tensor import DTensor, distribute_tensor
-+
-+        adapter = load_file(resume_adapter)
-+        expected: dict[str, tuple[int, ...]] = {}
-+        parameters = {}
-+        for name, parameter in model.named_parameters():
-+            if ".lora_A.0" not in name and ".lora_B.0" not in name:
-+                continue
-+            key = (
-+                name.replace("._checkpoint_wrapped_module", "")
-+                .replace(".lora_A.0", ".lora_A.weight")
-+                .replace(".lora_B.0", ".lora_B.weight")
-+            )
-+            expected[key] = tuple(parameter.shape)
-+            parameters[key] = parameter
-+        expected_by_rank: list[dict[str, tuple[int, ...]] | None] = [
-+            None
-+        ] * dist.get_world_size()
-+        dist.all_gather_object(expected_by_rank, expected)
-+        if any(value is None for value in expected_by_rank):
-+            raise RuntimeError("Resume adapter inventory gather is incomplete")
-+        _validate_resume_adapter_inventory(
-+            {key: tuple(value.shape) for key, value in adapter.items()},
-+            [value for value in expected_by_rank if value is not None],
-+        )
-+        with torch.no_grad():
-+            for key, parameter in parameters.items():
-+                value = adapter[key].to("cuda", dtype=parameter.dtype)
-+                if isinstance(parameter, DTensor):
-+                    value = distribute_tensor(
-+                        value, parameter.device_mesh, parameter.placements
-+                    )
-+                parameter.copy_(value)
-+        logger.info(
-+            f"Loaded {len(parameters)} local tensors from complete adapter {resume_adapter}"
-+        )
-
      logger.info(f"Initializing tokenizer ({config.tokenizer})")
      tokenizer = setup_tokenizer(config.tokenizer)
 
@@ -22142,7 +22076,7 @@ index 295d3ad1..60ae3769 100644
          raise ValueError("Packed multimodal training requires model support")
 
      # Set up the loss function for the RL loss type (ce / ref_kl are fixed)
-@@ -172,7 +1033,9 @@ def train(config: TrainerConfig):
+@@ -172,7 +966,9 @@ def train(config: TrainerConfig):
              lora=config.model.lora is not None,
              cpu_offload=config.model.optim_cpu_offload,
          )
@@ -22153,7 +22087,7 @@ index 295d3ad1..60ae3769 100644
      else:
          optimizer = setup_multi_optimizer(config.optim, parallel_dims)
          scheduler = setup_multi_scheduler(optimizer, config.scheduler, config.max_steps)
-@@ -185,10 +1048,29 @@ def train(config: TrainerConfig):
+@@ -185,10 +981,29 @@ def train(config: TrainerConfig):
 
      logger.info(f"Using `{config.scheduler.type}` scheduler ({config.scheduler})")
 
@@ -22186,7 +22120,7 @@ index 295d3ad1..60ae3769 100644
      else:
          logger.info(f"Initializing weight broadcast ({config.weight_broadcast})")
          weight_broadcast = setup_weight_broadcast(
-@@ -198,12 +1080,50 @@ def train(config: TrainerConfig):
+@@ -198,12 +1013,50 @@ def train(config: TrainerConfig):
              config.model.lora,
          )
 
@@ -22238,7 +22172,7 @@ index 295d3ad1..60ae3769 100644
          else:
              from prime_rl.trainer.models.layers.ulysses_attn import (
                  substitute_hf_ulysses_attn,
-@@ -221,18 +1141,103 @@ def train(config: TrainerConfig):
+@@ -221,18 +1074,108 @@ def train(config: TrainerConfig):
          assert_cp_style_supports_model(config.model.cp_style, model)
          # sparse MLA is softmax (works with both ring and ulysses).
          setup_sparse_mla_cp(model, cp_group, cp_rank, parallel_dims.cp)
@@ -22339,10 +22273,15 @@ index 295d3ad1..60ae3769 100644
 +        multi_run_manager.wait_for_run(0)
 +        for idx in multi_run_manager.used_idxs:
 +            multi_run_manager.progress[idx].step = progress.step
++        from prime_rl.trainer.lora import load_initial_lora_adapter
++
++        # Run creation resets adapter slots and invokes initial-adapter hooks.
++        # Restore the requested resume adapter after that reset sequence.
++        load_initial_lora_adapter(model, resume_adapter, adapter_idx=0)
 
      logger.info(
          f"Starting from step {progress.step} (total_tokens={progress.total_tokens}, total_samples={progress.total_samples})"
-@@ -240,20 +1245,27 @@ def train(config: TrainerConfig):
+@@ -240,20 +1183,27 @@ def train(config: TrainerConfig):
 
      # Set up the data loader (Optionally, use a fake data loader for debugging)
      logger.info(f"Initializing data loader ({config.data})")
@@ -22373,7 +22312,7 @@ index 295d3ad1..60ae3769 100644
 
      gc_handler = GarbageCollection(config.gc.interval) if config.gc else None
 
-@@ -261,7 +1273,9 @@ def train(config: TrainerConfig):
+@@ -261,7 +1211,9 @@ def train(config: TrainerConfig):
      maybe_record_function = nullcontext
      if config.trace_path:
          logger.info(f"Tracing to {config.trace_path}")
@@ -22384,7 +22323,7 @@ index 295d3ad1..60ae3769 100644
          maybe_record_function = record_function
      start_step = progress.step
      while True:
-@@ -269,7 +1283,9 @@ def train(config: TrainerConfig):
+@@ -269,7 +1221,9 @@ def train(config: TrainerConfig):
          torch.cuda.reset_peak_memory_stats()
          if gc_handler is not None:
              gc_handler.run(progress.step)
@@ -22395,7 +22334,7 @@ index 295d3ad1..60ae3769 100644
 
          logger.debug(f"Starting training step {progress.step}")
          step_start_time = time.perf_counter()
-@@ -281,7 +1297,9 @@ def train(config: TrainerConfig):
+@@ -281,7 +1235,9 @@ def train(config: TrainerConfig):
              and weight_broadcast is not None
              and config.weight_broadcast.type in ("nccl", "nixl")
          ):
@@ -22406,7 +22345,7 @@ index 295d3ad1..60ae3769 100644
              multi_run_manager.wait_for_run(0)
              for idx in multi_run_manager.used_idxs:
                  multi_run_manager.ready_to_update[idx] = True
-@@ -292,16 +1310,112 @@ def train(config: TrainerConfig):
+@@ -292,16 +1248,112 @@ def train(config: TrainerConfig):
          wait_for_batch_start_time = time.perf_counter()
          dataloader.wait_for_batch()
          wait_for_batch_time = time.perf_counter() - wait_for_batch_start_time
@@ -22525,7 +22464,7 @@ index 295d3ad1..60ae3769 100644
          memory_profiler = None
          if config.memory_profiler_path is not None:
              memory_profiler = MemoryProfiler(progress.step, config.memory_profiler_path)
-@@ -321,17 +1435,23 @@ def train(config: TrainerConfig):
+@@ -321,17 +1373,23 @@ def train(config: TrainerConfig):
          for micro_batch in micro_batches:
              mask = micro_batch["loss_mask"]
              rl_w = micro_batch["rl_weights"]
@@ -22552,7 +22491,7 @@ index 295d3ad1..60ae3769 100644
 
          logger.debug(f"Starting forward and backward pass ({batch_size=})")
          tensors = Tensors()  # Used to accumulate tensor statistics across micro-batches and ranks for logging
-@@ -339,22 +1459,64 @@ def train(config: TrainerConfig):
+@@ -339,22 +1397,64 @@ def train(config: TrainerConfig):
          cp_rank = parallel_dims.world_mesh["cp"].get_local_rank() if cp_enabled else 0
          cp_group = parallel_dims.world_mesh["cp"].get_group() if cp_enabled else None
          cp_size = parallel_dims.cp
@@ -22627,7 +22566,7 @@ index 295d3ad1..60ae3769 100644
 
              if routed_experts is None and config.enable_router_replay:
                  raise ValueError(
-@@ -370,7 +1532,11 @@ def train(config: TrainerConfig):
+@@ -370,7 +1470,11 @@ def train(config: TrainerConfig):
              # just {"pixel_values": ...} for Gemma3-VL) — we move every
              # tensor to CUDA and let the model's forward sort them.
              mm_kwargs_raw = micro_batch.get("mm_kwargs")
@@ -22640,7 +22579,7 @@ index 295d3ad1..60ae3769 100644
              if mm_kwargs is not None and config.model.vlm is None:
                  raise ValueError(
                      "Received multimodal samples but [model.vlm] is not set. "
-@@ -385,12 +1551,19 @@ def train(config: TrainerConfig):
+@@ -385,12 +1489,19 @@ def train(config: TrainerConfig):
              seq_lens = micro_batch["seq_lens"].to("cuda")
 
              labels = shift_tensor_left(input_ids)
@@ -22661,7 +22600,7 @@ index 295d3ad1..60ae3769 100644
                  if not defer_vlm_cp_to_model:
                      input_ids, position_ids = setup_cp_params(
                          input_ids,
-@@ -403,8 +1576,15 @@ def train(config: TrainerConfig):
+@@ -403,8 +1514,15 @@ def train(config: TrainerConfig):
                      )
                  seq_lens_are_pre_shard = True
                  labels = shard_for_cp(labels, cp_rank=cp_rank, cp_world_size=cp_size)
@@ -22678,7 +22617,7 @@ index 295d3ad1..60ae3769 100644
 
              if config.model.lora:
                  lora_num_tokens = micro_batch["lora_num_tokens"].to("cuda")
-@@ -412,20 +1592,55 @@ def train(config: TrainerConfig):
+@@ -412,20 +1530,55 @@ def train(config: TrainerConfig):
                      chunk_size = labels.shape[1]
                      # Convert to cumsum, adjust for CP chunk, convert back to num_tokens
                      cu_offsets = lora_num_tokens.cumsum(dim=0, dtype=torch.int32)
@@ -22739,7 +22678,7 @@ index 295d3ad1..60ae3769 100644
                  out = forward(
                      model,
                      input_ids,
-@@ -441,7 +1656,9 @@ def train(config: TrainerConfig):
+@@ -441,7 +1594,9 @@ def train(config: TrainerConfig):
 
              if out.get("logprobs") is None:
                  # VanillaOutputLinear was used - need to compute logprobs externally with per-token temps
@@ -22750,7 +22689,7 @@ index 295d3ad1..60ae3769 100644
                  logits = out["logits"]
                  # Per-token temperature scaling: temperatures is [batch, seq], logits is [batch, seq, vocab]
                  scaled_logits = logits / temperatures.unsqueeze(-1)
-@@ -451,15 +1668,22 @@ def train(config: TrainerConfig):
+@@ -451,15 +1606,22 @@ def train(config: TrainerConfig):
 
              if cp_enabled:
                  out["logprobs"] = gather_for_cp(out["logprobs"], cp_group)
@@ -22777,7 +22716,7 @@ index 295d3ad1..60ae3769 100644
              )
 
              # Compute loss
-@@ -467,12 +1691,20 @@ def train(config: TrainerConfig):
+@@ -467,12 +1629,20 @@ def train(config: TrainerConfig):
              loss, loss_tensors = compute_loss(
                  trainer_logprobs=out["logprobs"].squeeze().split(sequence_lengths),
                  inference_logprobs=inference_logprobs.squeeze().split(sequence_lengths),
@@ -22802,7 +22741,7 @@ index 295d3ad1..60ae3769 100644
                  rl_loss_fn=rl_loss_fn,
                  rl_scale=rl_scale,
                  ce_scale=ce_scale,
-@@ -489,7 +1721,11 @@ def train(config: TrainerConfig):
+@@ -489,7 +1659,11 @@ def train(config: TrainerConfig):
              tensors["loss"].append(loss.detach().to("cpu").unsqueeze(0))
 
              env_names = micro_batch["env_names"]
@@ -22815,7 +22754,7 @@ index 295d3ad1..60ae3769 100644
              env_to_indices: dict[str, list[int]] = {}
              for idx, env_name in enumerate(masked_env_names):
                  env_to_indices.setdefault(env_name, []).append(idx)
-@@ -504,18 +1740,26 @@ def train(config: TrainerConfig):
+@@ -504,18 +1678,26 @@ def train(config: TrainerConfig):
                  mismatch_mask = loss_mask
                  has_mismatch_tokens = True
              else:
@@ -22845,7 +22784,7 @@ index 295d3ad1..60ae3769 100644
                  ]
                  mismatch_env_to_indices: dict[str, list[int]] = {}
                  for idx, env_name in enumerate(mismatch_env_names):
-@@ -523,15 +1767,6 @@ def train(config: TrainerConfig):
+@@ -523,15 +1705,6 @@ def train(config: TrainerConfig):
                  for env_name, indices in mismatch_env_to_indices.items():
                      tensors[f"mismatch_kl/{env_name}"].append(mismatch_kl[indices])
 
@@ -22861,7 +22800,7 @@ index 295d3ad1..60ae3769 100644
              if is_tt_moe_model(model):
                  load_balance_stats = get_load_balance_stats(model)
                  for k, v in load_balance_stats.items():
-@@ -545,36 +1780,433 @@ def train(config: TrainerConfig):
+@@ -545,36 +1718,433 @@ def train(config: TrainerConfig):
              # Debug log with *local, micro step* stats
              micro_step_message = f"Micro Step {micro_step}/{len(micro_batches)} | Loss {tensors['loss'][-1].mean().item():.4f} | Entropy {tensors['entropy/all'][-1].mean().item():.4f}"
              if has_mismatch_tokens:
@@ -23307,7 +23246,7 @@ index 295d3ad1..60ae3769 100644
 
          zero_grad_ratio = get_zero_gradient_ratio(model.parameters(), parallel_dims.dp_replicate)
 
-@@ -585,16 +2217,36 @@ def train(config: TrainerConfig):
+@@ -585,16 +2155,36 @@ def train(config: TrainerConfig):
          # Update learning rate scheduler
          scheduler.step()
 
@@ -23345,7 +23284,7 @@ index 295d3ad1..60ae3769 100644
              broadcast_weights_time = 0
          else:
              broadcast_unused = (
-@@ -605,8 +2257,11 @@ def train(config: TrainerConfig):
+@@ -605,8 +2195,11 @@ def train(config: TrainerConfig):
              if not broadcast_unused:
                  broadcast_weights_start_time = time.perf_counter()
                  weight_broadcast.broadcast_weights(model, step=progress.step)
@@ -23359,7 +23298,7 @@ index 295d3ad1..60ae3769 100644
                  if config.weight_broadcast.type == "filesystem":
                      interval_to_keep = config.ckpt and config.ckpt.interval
                      weight_broadcast.maybe_clean(interval_to_keep)
-@@ -637,7 +2292,9 @@ def train(config: TrainerConfig):
+@@ -637,7 +2230,9 @@ def train(config: TrainerConfig):
                  # Single-run: Save full checkpoint
                  logger.info(f"Saving checkpoint at step {progress.step}")
                  save_ckpt_start_time = time.perf_counter()
@@ -23370,7 +23309,7 @@ index 295d3ad1..60ae3769 100644
                  save_ckpt_time += time.perf_counter() - save_ckpt_start_time
 
              ckpt_manager.maybe_clean()
-@@ -656,18 +2313,29 @@ def train(config: TrainerConfig):
+@@ -656,18 +2251,29 @@ def train(config: TrainerConfig):
          if memory_profiler is not None:
              memory_profiler.step()
 
@@ -23405,7 +23344,7 @@ index 295d3ad1..60ae3769 100644
 
          # Log step metrics
          step_time = time.perf_counter() - step_start_time
-@@ -680,7 +2348,9 @@ def train(config: TrainerConfig):
+@@ -680,7 +2286,9 @@ def train(config: TrainerConfig):
          if "max_vio/mean" in tensor_stats:
              step_message += f" | Max Vio {tensor_stats['max_vio/mean']:.4f}"
          if "routing_confidence/mean" in tensor_stats:
@@ -23416,7 +23355,7 @@ index 295d3ad1..60ae3769 100644
          logger.success(step_message)
 
          # Log performance metrics
-@@ -689,6 +2359,7 @@ def train(config: TrainerConfig):
+@@ -689,6 +2297,7 @@ def train(config: TrainerConfig):
              "perf/throughput_per_gpu": throughput / world.world_size,
              "perf/mfu": mfu,
              "perf/peak_memory": peak_memory,
@@ -23424,7 +23363,7 @@ index 295d3ad1..60ae3769 100644
              "step": progress.step,
          }
          monitor.log(perf_metrics, step=progress.step)
-@@ -710,7 +2381,9 @@ def train(config: TrainerConfig):
+@@ -710,7 +2319,9 @@ def train(config: TrainerConfig):
              tensor_stats["kl_ent_ratio/mean"] = mismatch_kl_mean / entropy_mean
 
          tensor_stats["step"] = progress.step
@@ -23435,7 +23374,7 @@ index 295d3ad1..60ae3769 100644
 
          # Log time metrics
          time_metrics = {
-@@ -753,7 +2426,11 @@ def train(config: TrainerConfig):
+@@ -753,7 +2364,11 @@ def train(config: TrainerConfig):
                  if config.max_concurrent_runs == 1:
                      lr = optimizer.param_groups[0]["lr"]
                  else:
@@ -23448,7 +23387,7 @@ index 295d3ad1..60ae3769 100644
                  run_stats.append(
                      RunStats(
                          run_id=run_id,
-@@ -785,8 +2462,6 @@ def train(config: TrainerConfig):
+@@ -785,8 +2400,6 @@ def train(config: TrainerConfig):
          prof.export_chrome_trace(trace_file)
          logger.info(f"Saved trace to {trace_file}")
 
@@ -23457,7 +23396,7 @@ index 295d3ad1..60ae3769 100644
      # Write final checkpoint (only for single-run mode; multi-run checkpoints are managed by MultiCheckpointManager)
      if config.max_concurrent_runs == 1 and ckpt_manager is not None:
          if not (config.ckpt and config.ckpt.weights_only):
-@@ -799,7 +2474,40 @@ def train(config: TrainerConfig):
+@@ -799,7 +2412,40 @@ def train(config: TrainerConfig):
          weight_ckpt_manager.save(progress.step, model, tokenizer)
          weight_ckpt_manager.maybe_clean()
 

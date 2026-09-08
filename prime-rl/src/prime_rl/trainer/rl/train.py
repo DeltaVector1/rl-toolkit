@@ -609,34 +609,6 @@ def _write_atomic_json(path: Path, value: dict, session_id: str) -> None:
         os.close(directory)
 
 
-def _validate_resume_adapter_inventory(
-    adapter_shapes: dict[str, tuple[int, ...]],
-    expected_by_rank: list[dict[str, tuple[int, ...]]],
-) -> None:
-    expected: dict[str, tuple[int, ...]] = {}
-    conflicts: list[str] = []
-    for rank_expected in expected_by_rank:
-        for key, shape in rank_expected.items():
-            previous = expected.setdefault(key, shape)
-            if previous != shape:
-                conflicts.append(key)
-    missing = sorted(set(expected) - set(adapter_shapes))
-    unexpected = sorted(set(adapter_shapes) - set(expected))
-    mismatched = sorted(
-        key
-        for key in set(expected) & set(adapter_shapes)
-        if expected[key] != adapter_shapes[key]
-    )
-    if conflicts or missing or unexpected or mismatched:
-        raise ValueError(
-            "Resume adapter inventory differs from the complete distributed LoRA model: "
-            f"conflicts={conflicts[:5]} ({len(conflicts)} total), "
-            f"missing={missing[:5]} ({len(missing)} total), "
-            f"unexpected={unexpected[:5]} ({len(unexpected)} total), "
-            f"shape_mismatch={mismatched[:5]} ({len(mismatched)} total)"
-        )
-
-
 def _load_qualification_session(
     config: TrainerConfig, identity: dict[str, str]
 ) -> dict:
@@ -971,45 +943,6 @@ def train(config: TrainerConfig):
     resume_adapter = (
         os.environ.get("PRIME_RL_RESUME_ADAPTER") if checkpoint_step is None else None
     )
-    if resume_adapter:
-        from safetensors.torch import load_file
-        from torch.distributed.tensor import DTensor, distribute_tensor
-
-        adapter = load_file(resume_adapter)
-        expected: dict[str, tuple[int, ...]] = {}
-        parameters = {}
-        for name, parameter in model.named_parameters():
-            if ".lora_A.0" not in name and ".lora_B.0" not in name:
-                continue
-            key = (
-                name.replace("._checkpoint_wrapped_module", "")
-                .replace(".lora_A.0", ".lora_A.weight")
-                .replace(".lora_B.0", ".lora_B.weight")
-            )
-            expected[key] = tuple(parameter.shape)
-            parameters[key] = parameter
-        expected_by_rank: list[dict[str, tuple[int, ...]] | None] = [
-            None
-        ] * dist.get_world_size()
-        dist.all_gather_object(expected_by_rank, expected)
-        if any(value is None for value in expected_by_rank):
-            raise RuntimeError("Resume adapter inventory gather is incomplete")
-        _validate_resume_adapter_inventory(
-            {key: tuple(value.shape) for key, value in adapter.items()},
-            [value for value in expected_by_rank if value is not None],
-        )
-        with torch.no_grad():
-            for key, parameter in parameters.items():
-                value = adapter[key].to("cuda", dtype=parameter.dtype)
-                if isinstance(parameter, DTensor):
-                    value = distribute_tensor(
-                        value, parameter.device_mesh, parameter.placements
-                    )
-                parameter.copy_(value)
-        logger.info(
-            f"Loaded {len(parameters)} local tensors from complete adapter {resume_adapter}"
-        )
-
     logger.info(f"Initializing tokenizer ({config.tokenizer})")
     tokenizer = setup_tokenizer(config.tokenizer)
 
@@ -1238,6 +1171,11 @@ def train(config: TrainerConfig):
         multi_run_manager.wait_for_run(0)
         for idx in multi_run_manager.used_idxs:
             multi_run_manager.progress[idx].step = progress.step
+        from prime_rl.trainer.lora import load_initial_lora_adapter
+
+        # Run creation resets adapter slots and invokes initial-adapter hooks.
+        # Restore the requested resume adapter after that reset sequence.
+        load_initial_lora_adapter(model, resume_adapter, adapter_idx=0)
 
     logger.info(
         f"Starting from step {progress.step} (total_tokens={progress.total_tokens}, total_samples={progress.total_samples})"

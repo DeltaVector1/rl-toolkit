@@ -23,6 +23,13 @@ port, container, and profile value.
   training throughput. The neutral tasks are easy for this model.
   The trace file includes previous restarts: filter `timing.start` to the
   current attempt before reporting failures, lengths, or reward statistics.
+- The trained-adapter resume loader is now fixed locally, not deployed to
+  the live run. It uses the native-expert loader after run-slot reset hooks,
+  so a step-0 hook cannot overwrite trained B weights. The two-rank CPU/Gloo
+  test passed nonzero B restoration, exact export, invalid-file rejection,
+  and source-order checks. The matching trainer patch block is refreshed.
+  Cross-run resume still needs broadcast history and metadata handling in
+  training-ops; this is not a complete live-resume qualification.
 - The 23:45 restart loaded the saved adapter correctly and reused both H200
   caches in 3.3 seconds. It was stopped at 00:04:56 after about 13 minutes
   of generation, 0 complete groups, and 4 buffered rollouts. No compute step
@@ -43,8 +50,8 @@ port, container, and profile value.
   after the run resets its adapter slot. CPU/Gloo tests passed BF16 native
   experts, sharded parameters, exact re-export, and rejection before mutation.
   This recovery is for the zero-B step-0 adapter only. Do not use it to resume
-  a trained adapter: fresh-policy initialization still zeros B. The generic
-  resume path also needs repair before use with a trained native adapter.
+  a trained adapter: fresh-policy initialization still zeros B. The live
+  generic resume path is not repaired until the local loader change is deployed.
 - The previous attempt stopped with 0 optimizer steps. Both H200s loaded the correct
   `glm-perf-2` step-0 adapter (B at 17:26:15 UTC, A at 17:26:20). A staging
   took 2,713.330 seconds; B took 116.598 seconds. The orchestrator then failed
