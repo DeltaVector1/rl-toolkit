@@ -20,9 +20,10 @@ conclusions. Keep reports short.
   Read `TRAINING_EXPECTATIONS.md` before a training test or run.
 - Use the `training-ops` skill. Do not write another SSH helper.
 - Use `uv run training-ops status` for a read-only status check.
-- First report `pwd`, repository root, `HEAD`, and `git status`; stop on a
-  mismatch. Before a start, check all required source files, recursive imports,
-  mounts, patches, and remote file modes together.
+- First report `pwd`, repository root, `HEAD`, and `git status`; stop on an
+  unexplained mismatch. Announced commits from the assigned writer are
+  expected during local review. Before a start, check all required source
+  files, recursive imports, mounts, patches, and remote file modes together.
 - Use `training_ops.watch()` in the foreground with an interval of 600 seconds
   or less. After ten minutes without completion, report the measured state and
   first blocker.
