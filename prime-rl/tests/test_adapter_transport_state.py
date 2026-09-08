@@ -16,6 +16,7 @@ import time
 import types
 import tomllib
 import unittest
+from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlsplit
@@ -837,6 +838,139 @@ class AdapterTransportStateTest(unittest.TestCase):
             relay_manifest = json.loads((destination / "relay_manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(relay_manifest["transport"], "full")
             self.assertIn("adapter_model.safetensors", relay_manifest["files"])
+
+    def test_full_cache_reuse_rebinds_url_without_model_download(self):
+        filesystem = load_filesystem_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            old_url = "http://source/old/run_old/broadcasts/step_0"
+            new_url = "http://source/new/run_new/broadcasts/step_0"
+            old_cache_dir = os.environ.get("PRIME_LORA_CACHE_DIR")
+            os.environ["PRIME_LORA_CACHE_DIR"] = str(root)
+            old_cache = filesystem.adapter_cache_path(old_url)
+            new_cache = filesystem.adapter_cache_path(new_url)
+            old_cache.mkdir(parents=True)
+            config = b"{}\n"
+            model = b"model-bytes"
+            config_spec = {"size": len(config), "sha256": hashlib.sha256(config).hexdigest()}
+            model_spec = {"size": len(model), "sha256": hashlib.sha256(model).hexdigest()}
+            files = {"adapter_config.json": config_spec, "adapter_model.safetensors": model_spec}
+            (old_cache / "adapter_config.json").write_bytes(config)
+            (old_cache / "adapter_model.safetensors").write_bytes(model)
+            (old_cache / "manifest.json").write_text(
+                json.dumps({"version": 1, "source_url": old_url, "files": files}),
+                encoding="utf-8",
+            )
+            (old_cache / "adapter_model.safetensors.sha256").write_text(
+                model_spec["sha256"] + "\n", encoding="ascii"
+            )
+            (old_cache / "READY").write_text("ready\n", encoding="ascii")
+            new_manifest = {"version": 1, "source_url": new_url, "files": files}
+            transport_manifest = {
+                "version": 1,
+                "kind": "lora-adapter",
+                "mode": "full",
+                "target_step": 0,
+                "base_step": None,
+                "files": [
+                    {"name": name, **spec} for name, spec in files.items()
+                ],
+            }
+            committed = threading.Event()
+            try:
+                with mock.patch.object(
+                    filesystem,
+                    "_read_chunked_xor_manifest",
+                    return_value={"mode": "full", "source_manifest": transport_manifest},
+                ), mock.patch.object(
+                    filesystem, "_source_manifest", return_value=new_manifest
+                ), mock.patch.object(
+                    filesystem, "download", side_effect=AssertionError("WAN download")
+                ), mock.patch.object(filesystem, "_cleanup_previous_adapter_caches"):
+                    destination = filesystem.stage_lora_adapter_files(
+                        new_url,
+                        committed_event=committed,
+                    )
+            finally:
+                if old_cache_dir is None:
+                    os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+                else:
+                    os.environ["PRIME_LORA_CACHE_DIR"] = old_cache_dir
+            self.assertEqual(destination, new_cache)
+            self.assertTrue(committed.is_set())
+            self.assertEqual(json.loads((new_cache / "manifest.json").read_text())["source_url"], new_url)
+            self.assertEqual(
+                json.loads((new_cache / "relay_manifest.json").read_text())["source_url"],
+                new_url,
+            )
+            self.assertTrue((new_cache / "READY").is_file())
+            self.assertEqual((new_cache / "adapter_model.safetensors").read_bytes(), model)
+            self.assertNotEqual(
+                (new_cache / "adapter_model.safetensors").stat().st_ino,
+                (old_cache / "adapter_model.safetensors").stat().st_ino,
+            )
+            (new_cache / "adapter_model.safetensors").write_bytes(b"new-model")
+            self.assertEqual((old_cache / "adapter_model.safetensors").read_bytes(), model)
+
+    def test_full_cache_reuse_rejects_changed_identity_and_symlink(self):
+        filesystem = load_filesystem_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            old_url = "http://source/old/run_old/broadcasts/step_0"
+            new_url = "http://source/new/run_new/broadcasts/step_0"
+            old_cache_dir = os.environ.get("PRIME_LORA_CACHE_DIR")
+            os.environ["PRIME_LORA_CACHE_DIR"] = str(root)
+            old_cache = filesystem.adapter_cache_path(old_url)
+            new_cache = filesystem.adapter_cache_path(new_url)
+            old_cache.mkdir(parents=True)
+            config = b"{}\n"
+            model = b"old"
+            files = {
+                "adapter_config.json": {"size": len(config), "sha256": hashlib.sha256(config).hexdigest()},
+                "adapter_model.safetensors": {"size": len(model), "sha256": hashlib.sha256(model).hexdigest()},
+            }
+            (old_cache / "adapter_config.json").write_bytes(config)
+            (old_cache / "adapter_model.safetensors").write_bytes(model)
+            (old_cache / "manifest.json").write_text(json.dumps({"version": 1, "source_url": old_url, "files": files}))
+            (old_cache / "adapter_model.safetensors.sha256").write_text(files["adapter_model.safetensors"]["sha256"] + "\n")
+            (old_cache / "READY").write_text("ready\n")
+            transport = {"mode": "full", "source_manifest": {"version": 1, "mode": "full", "target_step": 0, "files": [{"name": n, **s} for n, s in files.items()]}}
+            try:
+                changed = dict(files)
+                changed["adapter_model.safetensors"] = {"size": 3, "sha256": "a" * 64}
+                self.assertFalse(
+                    filesystem._reuse_full_adapter_cache(
+                        new_url,
+                        new_cache,
+                        {"version": 1, "source_url": new_url, "files": changed},
+                        transport,
+                    )
+                )
+                changed_config = dict(files)
+                changed_config["adapter_config.json"] = {"size": 3, "sha256": "b" * 64}
+                self.assertFalse(
+                    filesystem._reuse_full_adapter_cache(
+                        new_url,
+                        new_cache,
+                        {"version": 1, "source_url": new_url, "files": changed_config},
+                        transport,
+                    )
+                )
+                (old_cache / "adapter_model.safetensors").unlink()
+                (old_cache / "adapter_model.safetensors").symlink_to(root / "outside")
+                (root / "outside").write_bytes(model)
+                with self.assertRaises(OSError):
+                    filesystem._reuse_full_adapter_cache(
+                        new_url,
+                        new_cache,
+                        {"version": 1, "source_url": new_url, "files": files},
+                        transport,
+                    )
+            finally:
+                if old_cache_dir is None:
+                    os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+                else:
+                    os.environ["PRIME_LORA_CACHE_DIR"] = old_cache_dir
 
     def test_protocol_has_one_strict_delta_flag(self):
         worker = ROOT / "src/prime_rl/inference/vllm/worker/filesystem.py"

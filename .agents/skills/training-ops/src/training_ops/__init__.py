@@ -5126,6 +5126,13 @@ def _start_dependency_inventory(
         [*trainer_destinations, orchestrator_host],
         suffix=".py",
     )
+    with (repo_root / selected["orchestrator"]).open("rb") as stream:
+        train_envs = tomllib.load(stream).get("train", {}).get("env", [])
+    if any(
+        env.get("id") == "general-agent" or env.get("env", {}).get("id") == "general-agent"
+        for env in train_envs
+    ):
+        add_files("environments/general-agent/general_agent", [orchestrator_host], suffix=".py")
 
     missing = [path for path in inventory if not (repo_root / path).is_file()]
     if missing:
@@ -5443,16 +5450,98 @@ def _cold_start_cleanup(run: str, nodes: list[str]) -> None:
     )
 
 
-def _adapter_cache_cleanup_script() -> str:
+def _initial_adapter_cache_identity(relative_config: str, host: str) -> dict[str, int | str] | None:
+    """Read the configured initial adapter identity without hashing its model."""
+    config_path = repo_root / relative_config
+    try:
+        with config_path.open("rb") as stream:
+            config = tomllib.load(stream)
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise Refused(f"cannot read trainer config {config_path}: {error}") from error
+    initial = config.get("model", {}).get("lora", {}).get("initial_adapter_path")
+    if initial is None:
+        return None
+    if not isinstance(initial, str) or not initial.startswith(f"{run_root}/"):
+        raise Refused(
+            "initial adapter path must be below the configured runs path for cache reuse"
+        )
+    quoted = shlex.quote(initial)
+    script = f"""set -euo pipefail
+configured={quoted}
+if [ -d \"$configured\" ]; then
+  adapter=\"$configured/adapter_model.safetensors\"
+  adapter_dir=\"$configured\"
+else
+  adapter=\"$configured\"
+  adapter_dir=$(dirname \"$configured\")
+fi
+config_file=\"$adapter_dir/adapter_config.json\"
+test -f \"$adapter\"
+test -f \"$adapter.sha256\"
+test -f \"$config_file\"
+target_sha=$(sed -n '1p' \"$adapter.sha256\" | tr -d '[:space:]')
+target_size=$(stat -c '%s' \"$adapter\")
+config_sha=$(sha256sum \"$config_file\" | cut -d' ' -f1)
+config_size=$(stat -c '%s' \"$config_file\")
+printf '%s\\n%s\\n%s\\n%s\\n' \"$target_sha\" \"$target_size\" \"$config_sha\" \"$config_size\"
+"""
+    code, output = _ssh(host, script, timeout=30)
+    if code:
+        raise Refused(
+            f"initial adapter identity is unavailable on {host}: "
+            + (output.strip() or f"exit {code}")
+        )
+    fields = output.strip().splitlines()
+    if len(fields) != 4 or re.fullmatch(r"[0-9a-f]{64}", fields[0]) is None:
+        raise Refused(f"initial adapter identity is invalid on {host}")
+    try:
+        target_size = int(fields[1])
+        config_size = int(fields[3])
+    except ValueError as error:
+        raise Refused(f"initial adapter sizes are invalid on {host}") from error
+    if target_size <= 0 or config_size < 0 or re.fullmatch(r"[0-9a-f]{64}", fields[2]) is None:
+        raise Refused(f"initial adapter identity is invalid on {host}")
+    return {
+        "target_sha256": fields[0],
+        "target_size": target_size,
+        "config_sha256": fields[2],
+        "config_size": config_size,
+    }
+
+
+def _adapter_cache_cleanup_script(
+    preserve_identity: dict[str, int | str] | None = None,
+) -> str:
     """Remove unused adapter data before a cold run."""
     cache = paths["adapter_cache"].rstrip("/")
     if not cache.startswith("/") or cache in {"", "/"}:
         raise Refused("adapter cache path is unsafe")
+    identity = preserve_identity or {}
+    target_sha = identity.get("target_sha256", "")
+    target_size = identity.get("target_size", "")
+    config_sha = identity.get("config_sha256", "")
+    config_size = identity.get("config_size", "")
+    if identity and (
+        not isinstance(target_sha, str)
+        or re.fullmatch(r"[0-9a-f]{64}", target_sha) is None
+        or type(target_size) is not int
+        or target_size <= 0
+        or not isinstance(config_sha, str)
+        or re.fullmatch(r"[0-9a-f]{64}", config_sha) is None
+        or type(config_size) is not int
+        or config_size < 0
+    ):
+        raise Refused("initial adapter cache identity is invalid")
     return f"""set -euo pipefail
 cache={shlex.quote(cache)}
+preserve_target_sha={shlex.quote(str(target_sha))}
+preserve_target_size={shlex.quote(str(target_size))}
+preserve_config_sha={shlex.quote(str(config_sha))}
+preserve_config_size={shlex.quote(str(config_size))}
 [ -d "$cache" ] || {{ echo "adapter cache does not exist: $cache" >&2; exit 31; }}
 [ ! -L "$cache" ] || {{ echo "adapter cache is a symbolic link" >&2; exit 32; }}
 removed=0
+preserved=0
 for path in "$cache"/*; do
   [ -e "$path" ] || continue
   name=${{path##*/}}
@@ -5468,6 +5557,52 @@ for path in "$cache"/*; do
     *[!0-9a-f]*|'') echo "invalid adapter cache entry: $path" >&2; exit 34 ;;
   esac
   [ "${{#base}}" -eq 64 ] || {{ echo "invalid adapter cache entry: $path" >&2; exit 34; }}
+  if [ "$name" = "$base" ] && [ -n "$preserve_target_sha" ] && [ "$preserved" -eq 0 ]; then
+    [ ! -L "$path" ] || {{ echo "adapter cache entry is a symbolic link: $path" >&2; exit 36; }}
+    [ -d "$path" ] || {{ echo "adapter cache entry is not a directory: $path" >&2; exit 37; }}
+    if python3 - "$path" "$preserve_target_sha" "$preserve_target_size" "$preserve_config_sha" "$preserve_config_size" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+target_sha, target_size, config_sha, config_size = sys.argv[2:]
+try:
+    ready = root / "READY"
+    if ready.is_symlink() or ready.read_text(encoding="ascii") != "ready\\n":
+        raise ValueError
+    manifest_file = root / "manifest.json"
+    if manifest_file.is_symlink():
+        raise ValueError
+    manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+    if manifest.get("version") != 1 or not isinstance(manifest.get("source_url"), str):
+        raise ValueError
+    files = manifest["files"]
+    if set(files) != {{"adapter_model.safetensors", "adapter_config.json"}}:
+        raise ValueError
+    target = files["adapter_model.safetensors"]
+    config = files["adapter_config.json"]
+    sidecar = root / "adapter_model.safetensors.sha256"
+    if sidecar.is_symlink() or sidecar.read_text(encoding="ascii").strip() != target_sha:
+        raise ValueError
+    if target["sha256"] != target_sha or int(target["size"]) != int(target_size):
+        raise ValueError
+    if config["sha256"] != config_sha or int(config["size"]) != int(config_size):
+        raise ValueError
+    for name, size in (("adapter_model.safetensors", target_size), ("adapter_config.json", config_size)):
+        path = root / name
+        if path.is_symlink() or not path.is_file() or path.stat().st_size != int(size):
+            raise ValueError
+except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+raise SystemExit(0)
+PY
+    then
+      echo "preserving matching adapter cache: $path"
+      preserved=1
+      continue
+    fi
+  fi
   lock="$cache/.$base.readers.lock"
   if ! sudo flock -n "$lock" -c "sudo find '$path' -xdev -depth -delete"; then
     echo "adapter cache entry is in use: $path" >&2
@@ -5482,7 +5617,9 @@ echo "removed=$removed free_gib=$free"
 """
 
 
-def _cold_adapter_cache_cleanup() -> None:
+def _cold_adapter_cache_cleanup(
+    preserve_identity: dict[str, int | str] | None = None,
+) -> None:
     """Require idle inference, then clear old adapter data on every inference host."""
     idle = _fan(
         inference_hosts,
@@ -5497,7 +5634,11 @@ def _cold_adapter_cache_cleanup() -> None:
         raise Refused(f"cold adapter cleanup requires idle inference: {busy}")
     results = _fan(
         inference_hosts,
-        lambda host: _ssh(host, _adapter_cache_cleanup_script(), timeout=600),
+        lambda host: _ssh(
+            host,
+            _adapter_cache_cleanup_script(preserve_identity),
+            timeout=600,
+        ),
     )
     failures = {host: output.strip() for host, (code, output) in results.items() if code}
     if failures:
@@ -5550,6 +5691,11 @@ def start(
     ]
     if missing_trainer_config:
         raise Refused(f"missing trainer config {trainer_config} on {missing_trainer_config}")
+    initial_adapter_identity = (
+        _initial_adapter_cache_identity(selected["trainer"], trainer_head)
+        if mode == "cold"
+        else None
+    )
     trainer_nodes = " ".join(n.lstrip("n") for n in nodes)
     trainer_addresses = " ".join(_ssh_address(node) for node in nodes)
     runtime_env = (
@@ -5779,7 +5925,7 @@ exit 1
 
     if mode == "cold":
         _cold_start_cleanup(run, nodes)
-        _cold_adapter_cache_cleanup()
+        _cold_adapter_cache_cleanup(initial_adapter_identity)
     launch_adapter()
     if mode == "cold":
         launch_orch()

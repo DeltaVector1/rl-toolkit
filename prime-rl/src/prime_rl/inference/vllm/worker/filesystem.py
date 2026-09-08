@@ -4,6 +4,7 @@ import json
 import math
 import os
 import re
+import shutil
 import stat
 import threading
 import time
@@ -1914,6 +1915,177 @@ def _cleanup_previous_adapter_caches(cache_root: Path, active: Path) -> None:
         os.close(cache_fd)
 
 
+def _full_cache_matches_manifest(
+    candidate: Path,
+    files: dict[str, object],
+) -> bool:
+    """Check a READY full cache using its already-published file proof."""
+    _reject_symlink_path(candidate, "cached adapter path")
+    try:
+        directory_fd = _open_directory_nofollow(
+            candidate,
+            create=False,
+            label="cached adapter path",
+        )
+    except FileNotFoundError:
+        return False
+    try:
+        try:
+            if _read_bytes_nofollow("READY", dir_fd=directory_fd) != b"ready\n":
+                return False
+            _reject_symlink_path(candidate / "manifest.json", "cached adapter manifest")
+            manifest = json.loads(
+                _read_text_nofollow("manifest.json", encoding="utf-8", dir_fd=directory_fd)
+            )
+            sidecar = _read_text_nofollow(
+                _ADAPTER_DIGEST,
+                encoding="ascii",
+                dir_fd=directory_fd,
+            ).strip()
+        except (FileNotFoundError, ValueError, UnicodeError):
+            return False
+        if (
+            not isinstance(manifest, dict)
+            or manifest.get("version") != 1
+            or not isinstance(manifest.get("source_url"), str)
+            or not manifest["source_url"].startswith(("http://", "https://"))
+            or manifest.get("files") != files
+        ):
+            return False
+        model_spec = files.get(_ADAPTER_FILES[1])
+        if not isinstance(model_spec, dict) or sidecar != model_spec.get("sha256"):
+            return False
+        for filename, spec in files.items():
+            if not isinstance(spec, dict) or type(spec.get("size")) is not int:
+                return False
+            entry = _stat_regular_entry(directory_fd, filename, "cached adapter file")
+            if entry is None or entry.st_size != spec["size"]:
+                return False
+        return True
+    finally:
+        os.close(directory_fd)
+
+
+def _reuse_full_adapter_cache(
+    source_url: str,
+    destination: Path,
+    manifest: dict[str, object],
+    transport: dict[str, object],
+    *,
+    cancel_event: threading.Event | None = None,
+    committed_event: threading.Event | None = None,
+) -> bool:
+    """Publish a new URL entry from one verified local full cache."""
+    if transport.get("mode") != "full":
+        return False
+    source_manifest = transport.get("source_manifest")
+    files = manifest.get("files")
+    if not isinstance(source_manifest, dict) or not isinstance(files, dict):
+        raise OSError("full adapter cache reuse has no source manifest")
+    if source_manifest.get("target_step") != 0:
+        return False
+    cache_root = destination.parent
+    try:
+        entries = sorted(os.listdir(cache_root))
+    except FileNotFoundError:
+        return False
+    for name in entries:
+        if name == destination.name or re.fullmatch(r"[0-9a-f]{64}", name) is None:
+            continue
+        candidate = cache_root / name
+        _reject_symlink_path(candidate, "cached adapter path")
+        candidate_stat = _path_stat(candidate, "cached adapter path")
+        if candidate_stat is None:
+            continue
+        if not stat.S_ISDIR(candidate_stat.st_mode):
+            raise OSError(f"cached adapter path is not a directory: {candidate}")
+        with adapter_reader_lock(candidate):
+            if not _full_cache_matches_manifest(candidate, files):
+                continue
+            _check_cancelled(cancel_event)
+            temporary = destination.with_name(f"{destination.name}.partial")
+            _reject_symlink_path(temporary, "adapter partial directory")
+            if _path_stat(temporary, "adapter partial directory") is not None:
+                parent_fd = _open_directory_nofollow(
+                    cache_root,
+                    create=False,
+                    label="adapter partial directory parent",
+                )
+                try:
+                    _remove_directory_entry(
+                        parent_fd,
+                        temporary.name,
+                        "adapter partial directory",
+                    )
+                finally:
+                    os.close(parent_fd)
+            _ensure_directory(temporary, "adapter partial directory")
+            try:
+                _write_json(temporary / "manifest.json", manifest)
+                for filename in _ADAPTER_FILES:
+                    _check_cancelled(cancel_event)
+                    _reject_symlink_path(candidate / filename, "cached adapter file")
+                    _reject_symlink_path(temporary / filename, "adapter file")
+                    shutil.copyfile(candidate / filename, temporary / filename)
+                _publish_relay_manifest(
+                    temporary,
+                    source_url,
+                    source_manifest,
+                    transport,
+                    files,
+                    cancel_event=cancel_event,
+                )
+                model_sha256 = files[_ADAPTER_FILES[1]]["sha256"]
+                _write_text_atomic(
+                    temporary / _ADAPTER_DIGEST,
+                    f"{model_sha256}\n",
+                    encoding="ascii",
+                )
+                with _adapter_stage_publish_lock:
+                    _check_cancelled(cancel_event)
+                    _write_text_atomic(temporary / "READY", "ready\n", encoding="ascii")
+                    with os.fdopen(
+                        _open_nofollow(
+                            _adapter_reader_lock(destination),
+                            os.O_RDWR | os.O_CREAT,
+                        ),
+                        "a+",
+                    ) as reader_lock:
+                        _acquire_stage_lock(reader_lock, None, cancel_event)
+                        if _path_stat(destination, "adapter destination") is not None:
+                            retired = destination.with_name(
+                                f"{destination.name}.retired-{time.time_ns()}-{os.getpid()}"
+                            )
+                            _replace_paths(destination, retired, "retired adapter")
+                        _replace_paths(temporary, destination, "adapter cache reuse")
+                        if committed_event is not None:
+                            committed_event.set()
+                        fcntl.flock(reader_lock, fcntl.LOCK_UN)
+                print(f"adapter cache reuse: local full cache imported for {source_url}")
+                return True
+            except BaseException:
+                try:
+                    if _path_stat(temporary, "adapter partial directory") is not None:
+                        parent_fd = _open_directory_nofollow(
+                            cache_root,
+                            create=False,
+                            label="adapter partial directory parent",
+                        )
+                        try:
+                            _remove_directory_entry(
+                                parent_fd,
+                                temporary.name,
+                                "adapter partial directory",
+                            )
+                        finally:
+                            os.close(parent_fd)
+                except (FileNotFoundError, OSError):
+                    pass
+                raise
+    print(f"adapter cache reuse: no verified full cache for {source_url}; using network staging")
+    return False
+
+
 def _download_range(
     source_urls: list[str],
     source_index: int,
@@ -3621,6 +3793,34 @@ def stage_lora_adapter_files(
                     if committed_event is not None:
                         with _adapter_stage_publish_lock:
                             committed_event.set()
+                    return destination
+
+            if isinstance(transport, dict) and transport.get("mode") == "full":
+                if _reuse_full_adapter_cache(
+                    source_url,
+                    destination,
+                    manifest,
+                    transport,
+                    cancel_event=cancel_event,
+                    committed_event=committed_event,
+                ):
+                    total_bytes = sum(int(item["size"]) for item in files.values())
+                    _cleanup_retired_adapters(destination.parent, destination.name)
+                    _cleanup_previous_adapter_caches(destination.parent, destination)
+                    _write_stage_status(
+                        destination.parent,
+                        {
+                            "status": "ready",
+                            "source_url": source_url,
+                            "path": destination.as_posix(),
+                            "transport": "full",
+                            "bytes_done": total_bytes,
+                            "bytes_total": total_bytes,
+                            "reuse": "local-cache",
+                            "updated_at": time.time(),
+                            "elapsed_seconds": round(time.monotonic() - started, 3),
+                        },
+                    )
                     return destination
 
             total_bytes = sum(int(item["size"]) for item in files.values())

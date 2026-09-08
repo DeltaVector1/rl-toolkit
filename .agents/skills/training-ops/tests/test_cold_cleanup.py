@@ -1,3 +1,5 @@
+import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -21,6 +23,67 @@ class ColdCleanupTest(unittest.TestCase):
         self.assertIn("adapter-staging.lock) continue", script)
         self.assertIn("unknown adapter cache entry", script)
         self.assertNotIn("rm -rf", script)
+
+    def test_adapter_cache_cleanup_preserves_exact_initial_identity(self):
+        target = b"model"
+        config = b"{}\n"
+        identity = {
+            "target_sha256": hashlib.sha256(target).hexdigest(),
+            "target_size": len(target),
+            "config_sha256": hashlib.sha256(config).hexdigest(),
+            "config_size": len(config),
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary) / "cache"
+            cache.mkdir()
+            matching = cache / ("a" * 64)
+            matching.mkdir()
+            (matching / "READY").write_text("ready\n", encoding="ascii")
+            (matching / "adapter_model.safetensors").write_bytes(target)
+            (matching / "adapter_config.json").write_bytes(config)
+            (matching / "adapter_model.safetensors.sha256").write_text(
+                identity["target_sha256"] + "\n", encoding="ascii"
+            )
+            (matching / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "source_url": "http://old/step_0",
+                        "files": {
+                            "adapter_model.safetensors": {
+                                "size": len(target),
+                                "sha256": identity["target_sha256"],
+                            },
+                            "adapter_config.json": {
+                                "size": len(config),
+                                "sha256": identity["config_sha256"],
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            stale = cache / ("b" * 64)
+            stale.mkdir()
+            (stale / "READY").write_text("ready\n", encoding="ascii")
+            malformed = cache / ("c" * 64)
+            malformed.mkdir()
+            old_cache = training_ops.paths["adapter_cache"]
+            training_ops.paths["adapter_cache"] = str(cache)
+            try:
+                script = training_ops._adapter_cache_cleanup_script(identity).replace(
+                    "sudo ", ""
+                )
+                result = subprocess.run(
+                    ["bash", "-c", script], capture_output=True, text=True
+                )
+            finally:
+                training_ops.paths["adapter_cache"] = old_cache
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue(matching.exists())
+            self.assertFalse(stale.exists())
+            self.assertFalse(malformed.exists())
+            self.assertIn("preserving matching adapter cache", result.stdout)
 
     def test_adapter_cache_cleanup_requires_idle_hosts(self):
         idle = {
