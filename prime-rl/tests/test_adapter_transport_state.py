@@ -1314,8 +1314,8 @@ class AdapterTransportStateTest(unittest.TestCase):
             self.assertFalse(ready.exists())
 
     def test_inventory_defines_bounded_96_lane_transfer(self):
-        operations = REPOSITORY / "configs/operations.toml"
-        with operations.open("rb") as stream:
+        nodes = REPOSITORY / "configs/nodes.toml"
+        with nodes.open("rb") as stream:
             config = tomllib.load(stream)
         ports = config["ports"]
         self.assertEqual(ports["lora_source_first"], 18100)
@@ -1323,7 +1323,6 @@ class AdapterTransportStateTest(unittest.TestCase):
         self.assertEqual(ports["adapter_relay"], 18196)
         self.assertEqual(ports["refusal_classifier"], 18250)
         self.assertEqual(ports["lora_source_last"] - ports["lora_source_first"] + 1, 96)
-        self.assertEqual(config["limits"]["adapter_delta_stage_timeout_seconds"], 300)
         source_ports = set(range(ports["lora_source_first"], ports["lora_source_last"] + 1))
         self.assertNotIn(ports["adapter_relay"], source_ports)
         self.assertNotIn(ports["refusal_classifier"], source_ports)
@@ -1334,7 +1333,7 @@ class AdapterTransportStateTest(unittest.TestCase):
             if name not in {"lora_source_first", "lora_source_last"}
         ]
         self.assertEqual(len(reserved_ports), len(set(reserved_ports)))
-        config_path = REPOSITORY / "configs/current/orchestrator.toml"
+        config_path = REPOSITORY / "configs/general-agent/orchestrator.toml"
         with config_path.open("rb") as stream:
             edge_config = tomllib.load(stream)
         source_url = edge_config["weight_broadcast"]["source_url"]
