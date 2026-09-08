@@ -126,6 +126,7 @@ def bwd(
     dtype=T.bfloat16,
     accum_dtype=T.float32,
     skip_sentinel_stores=False,
+    dkv_partitions=1,
 ):
     assert is_causal is True, "non-casual is not supported now"
     assert topk % block_size == 0, "otherwise will load some index=0 thus causing wrong kv to be loaded"
@@ -133,6 +134,8 @@ def bwd(
     assert accum_dtype == T.float32
     assert indices_dtype == T.int32
     assert isinstance(skip_sentinel_stores, bool)
+    if not isinstance(dkv_partitions, int) or dkv_partitions not in (1, 2, 4):
+        raise ValueError("dkv_partitions must be one of 1, 2, or 4")
 
     if sm_scale is None:
         sm_scale = (D + D_tail) ** (-0.5)
@@ -145,6 +148,8 @@ def bwd(
     H_kv = H // kv_group
     q_shape = [B, S, H, D + D_tail]
     k_shape = [B, S_kv, kv_group, D + D_tail]
+    # Flatten partition and batch so the default one-buffer path keeps its rank.
+    dkv_shape = [B * dkv_partitions, S_kv, kv_group, D + D_tail]
     o_shape = [B, S, H, D]
     indices_shape = [B, S, kv_group, topk]
     delta_shape = [B, S, H]
@@ -169,9 +174,10 @@ def bwd(
         Lse: T.Tensor(lse_shape, accum_dtype),
         Delta: T.Tensor(delta_shape, accum_dtype),
         dQ: T.Tensor(q_shape, dtype),
-        dKV: T.Tensor(k_shape, accum_dtype),
+        dKV: T.Tensor(dkv_shape, accum_dtype),
     ):
         with T.Kernel(S, B, kv_group * NH, threads=threads) as (s_i, by, bz):
+            dkv_batch = by if dkv_partitions == 1 else by + (s_i % dkv_partitions) * B
             Q_shared = T.alloc_shared([block_H, D], dtype)
             Q_tail_shared = T.alloc_shared([block_H, D_tail], dtype)
             KV_shared = T.alloc_shared([BS, D], dtype)
@@ -268,7 +274,7 @@ def bwd(
                             if not skip_sentinel_stores or Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)] <= max_kv_i:
                                 T.atomic_addx4(
                                     dKV[
-                                        by,
+                                        dkv_batch,
                                         Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
                                         bz // NH,
                                         d_i * 4,
@@ -280,7 +286,7 @@ def bwd(
                             if not skip_sentinel_stores or Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)] <= max_kv_i:
                                 T.atomic_addx4(
                                     dKV[
-                                        by,
+                                        dkv_batch,
                                         Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
                                         bz // NH,
                                         D + d_i * 4,
@@ -292,7 +298,7 @@ def bwd(
                             if not skip_sentinel_stores or Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)] <= max_kv_i:
                                 T.atomic_add(
                                     dKV[
-                                        by,
+                                        dkv_batch,
                                         Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
                                         bz // NH,
                                         d_i,
@@ -304,7 +310,7 @@ def bwd(
                             if not skip_sentinel_stores or Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)] <= max_kv_i:
                                 T.atomic_add(
                                     dKV[
-                                        by,
+                                        dkv_batch,
                                         Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
                                         bz // NH,
                                         D + d_i,
@@ -321,11 +327,13 @@ def bwd(
     return sparse_mla_bwd_kernel
 
 
-def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None):
+def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None, dkv_partitions=1):
     assert q.is_contiguous()
     assert kv.is_contiguous()
     assert indices.is_contiguous()
     assert lse.is_contiguous()
+    if not isinstance(dkv_partitions, int) or dkv_partitions not in (1, 2, 4):
+        raise ValueError("dkv_partitions must be one of 1, 2, or 4")
     B, S, H, dim_plus_tail_dim = q.shape
     _, S_kv, kv_group, _ = kv.shape
     assert kv.shape[-1] == dim_plus_tail_dim
@@ -357,14 +365,24 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None):
             threads=threads,
             vectorized_atomic=False,
             skip_sentinel_stores=skip_sentinel_value == "1",
+            dkv_partitions=dkv_partitions,
         )
     else:
-        bwd_kernel = bwd(H, D, D_tail, topk, kv_group, sm_scale, True)
+        bwd_kernel = bwd(H, D, D_tail, topk, kv_group, sm_scale, True, dkv_partitions=dkv_partitions)
     postprocess_kernel = postprocess(D, D_tail, kv_group)
 
     delta = preprocess_kernel(o, do)
-    dkv = torch.zeros_like(kv, dtype=torch.float32)
-    dq = bwd_kernel(q, kv, do, indices, lse, delta, dkv)
+    if dkv_partitions == 1:
+        dkv = torch.zeros_like(kv, dtype=torch.float32)
+        dq = bwd_kernel(q, kv, do, indices, lse, delta, dkv)
+    else:
+        dkv_parts = torch.zeros(
+            (dkv_partitions * B, S_kv, kv_group, dim_plus_tail_dim),
+            device=kv.device,
+            dtype=torch.float32,
+        )
+        dq = bwd_kernel(q, kv, do, indices, lse, delta, dkv_parts)
+        dkv = dkv_parts.view(dkv_partitions, B, S_kv, kv_group, dim_plus_tail_dim).sum(dim=0)
     dkv = postprocess_kernel(dkv)
 
     return dq, dkv
