@@ -15,7 +15,41 @@ weight transfer, H200 activation, judging, and save time separate.
   limit 16,384.
 - No full 20-step or 50-step neutral production run has passed.
 
-## Current neutral production-shaped run
+## Current controlled sparse-stability run
+
+`glm52-sparse-stability` started 2026-09-08 at 03:36 UTC; compute started at
+03:37:01. All 20 steps completed at 04:37:59. Warm forward/backward time
+was 177.66-179.92 s (median 178.39 s). Peak reserved memory stayed at
+42.927734375 GiB for steps 3-20. All eight containers exited with code 0
+and OOMKilled=false by 04:38:09. This passes the controlled LR0 memory
+check, not production training or learned-policy stability.
+
+Current H200 inventory is FULL CUDA graph capture at 256 scheduled tokens,
+with up to 128 requests under MTP 1. The capture-token count and request count
+are separate limits.
+
+The workload is 524,288 fresh synthetic tokens (16 x 32,768), FP8 base,
+BF16 rank-32 LoRA on attention, shared-expert, and routed-expert linear
+weights, frozen router, PP8/CP8/EP8, learning rate 0, and the same saved
+initial adapter as the baseline. Reported forward/backward time includes
+existing statistics and optimizer work; it is not pure forward/backward
+kernel time.
+
+| Step | Baseline reported | Baseline total | Candidate reported | Candidate total |
+|---:|---:|---:|---:|---:|
+| 1 | 275.9 s | 280.7 s | 248.0 s | 253.0 s |
+| 2 | 209.2 s | 209.9 s | 178.3 s | 179.0 s |
+
+Steps 1 and 2 match baseline loss, entropy, gradient norm, and peak memory.
+Candidate step 2 is 14.8% faster on the reported forward/backward metric, with
+42.65 GiB peak memory and no OOM. Raw metric values remain in the run record.
+
+A one-microbatch profile on rank 8 recorded 1.15 s in forward all-to-all,
+0.60 s in forward all-gather, and 1.26 s in sparse attention backward.
+These are diagnostic samples, not whole-step fractions. Communication
+wrapper rows overlap with NCCL kernel rows; do not add both.
+
+## Historical neutral production-shaped runs
 
 Latest stopped attempt (Sep 8): **0 optimizer steps**. After the graph-cap
 repair, the first usable rollout batch took 3,731.08s (62m11s), with
@@ -171,8 +205,8 @@ trainer peak memory measurements.
 - The expert-target omission was confirmed and repaired at `9da34c2`; the
   load-boundary guard is at `a2fd4c2`.
 - H200 A and B now use MTP 1. B is configured from `6a3e756` and was ready at
-  22:28:01 UTC with TP8, EP8, rank-32 expert LoRA, 32K context, and graphs 128.
-  Weights,
+  22:28:01 UTC with TP8, EP8, rank-32 expert LoRA, 32K context, and FULL CUDA
+  graph capture at 256 scheduled tokens for up to 128 requests. Weights,
   graph, and KV memory were 94.7 GiB, 2.11 GiB, and 396,160 tokens; baseline B
   KV capacity was 478,720 tokens. Three 32,512-prompt plus 256-output samples
   took 8.360, 6.743, and 6.873 s, or 34.95 tokens/s versus 27.08 before MTP,
@@ -278,7 +312,12 @@ adapter transfer. Warn before a full model copy and report that time separately.
 The measured trainer image is `prime-rl:glm52-fp8` with PyTorch 2.11.0+cu128
 and NCCL 2.28.9. The measured H200 image is
 `prime-rl:glm52-v080-glm52-h200-router` with vLLM 0.26. Upstream `26b3131`
-was reviewed but is not upgraded.
+was reviewed but is not upgraded. Latest fetched upstream is
+`04a61d3b75c3c99f263b2c133e822f998909adf7` (2026-09-07T11:20:40-07:00); it
+differs from `26b3131` only by `MuonNCCLall_to_allstartupwarmup` in the new
+`trainer/optim/__init__.py`. The current base has monolithic
+`trainer/optim.py`, so the full patch does not apply unchanged. No latest
+upstream deployment is claimed.
 
 The local `prime-rl/` overlay is copied to configured host paths at deploy;
 launchers bind-mount files into `/app/src`. Dockerfile `COPY` is a separate

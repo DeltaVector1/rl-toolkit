@@ -5,293 +5,115 @@ port, container, and profile value.
 
 ## Current state
 
-- The Sep 8 attempt is stopped with **0 optimizer steps**. Forward/backward
-  began at 01:24:20 UTC and was still unfinished when the stop was issued
-  at about 01:38 UTC. The operator missed the 600-second cutoff by about
-  four minutes. Do not report this as a completed compute measurement.
-  Status at 01:39:39 confirmed all trainers and the orchestrator stopped;
-  both H200 engines and saved adapters remain available. The foreground
-  monitor was stopped after this confirmation.
-- The first usable batch took 3,731.08 seconds (62m11s) to collect. It
-  accepted 1,024 of 2,336 rollouts (43.8%), containing 9,018,062 input plus
-  output tokens and 277 packed microbatches. Recorded rollout errors were
-  0%; equal-reward groups required replacement. Next-batch generation
-  overlapped trainer compute. Neither collection nor compute passed its
-  time requirement. No OOM was observed; the highest sampled trainer memory
-  was about 44 GiB. Full-step parity and positive-step adapter transfer are
-  not measured because no optimizer step completed.
-- The 278,422,029-byte rollout file appeared on H200A at 01:20:42 and n82
-  at 01:23:25, about 2m43s apart; this includes delivery work, not pure wire
-  time. Trainer batch loading then took 5.42s. The production batch has
-  17.2 times the tokens of the 524,288-token synthetic memory test; its
-  three-minute result was not a production-step measurement.
-- A ten-second trainer network sample measured 0.63-1.25 Gbit/s per
-  direction on 10-Gbit/s interfaces. This does not show link saturation or
-  identify the compute bottleneck. Next checks must isolate trainer stage
-  costs and H200 KV-cache recomputation, without changing score filtering
-  or presenting fewer tokens as a kernel improvement.
-- At 00:59 UTC, `glm-perf-2` had 736/1,024 accepted rollouts, 81 buffered,
-  and 0 optimizer steps. Both H200s generated about 4,554 tokens/s combined.
-  A has repeated KV-cache preemptions; B later also showed pressure. Current
-  graph allocations are similar (3.38/3.52 GiB), not the older 10.89/2.04
-  GiB split. No fusion, context, MTP, or memory-limit change was made.
-- `training_ops.copy_file()` now uses ordinary checksum-based rsync instead
-  of append-only verification. Equal-size changed files previously stayed
-  stale despite a success report. Local replacement/partial-resume tests and
-  an actual same-size replacement on n82 passed. All 85 training-ops tests
-  pass after correcting two stale test expectations. This generic helper is
-  separate from live adapter transport. The temporary test archives were
-  removed locally and on n82 after verification; source and checks remain.
-- Native KV offload is not deployed. CPU-only engine configuration passed on
-  both H200s with `kv_offloading_size=64` and `enable_cumem_allocator=True`.
-  Without CuMem, the current expandable-segments allocator fails validation.
-  The 64 GiB buffer is shared across TP ranks, not per GPU. Actual sparse-MLA,
-  MTP, LoRA, cache reload, and throughput still need a bounded live comparison.
-- Both H200s restarted at 00:08:42 UTC with `4aa1772`; trainer restart
-  invoked at 00:09:13. Root owns live operation and foreground monitoring.
-  This remains neutral `glm-perf-2`, fresh rollouts, and a 20-step target.
-  At 00:21 UTC there were still 0 optimizer steps and 63 buffered rollouts.
-  Both engines report FULL graphs at 256 scheduled tokens and 128 requests.
-  At 00:19:37, A generated 2,553.0 tokens/s and B 2,679.7 tokens/s (5,232.7
-  combined). This is an early decode sample, not a complete rollout average.
-  Fresh generation began about 00:18:32; initial cached staging took 3.0s.
-- At 00:32 UTC: 160/1,024 accepted rollouts, 118 buffered, 0 optimizer
-  steps, and about 4,763 generated tokens/s combined. Collection has exceeded
-  the 720-second requirement; this is not a passed speed test. A current-attempt
-  trace sample had 288 scored rollouts and no errors. Median generation was
-  214.6s per rollout; median scoring was 3.2s. Seven of eleven complete groups
-  had identical rewards. The sink unconditionally discards zero-advantage
-  groups and generates replacements. Do not disable this to claim useful
-  training throughput. The neutral tasks are easy for this model.
-  The trace file includes previous restarts: filter `timing.start` to the
-  current attempt before reporting failures, lengths, or reward statistics.
-- The trained-adapter resume loader is now fixed locally, not deployed to
-  the live run. It uses the native-expert loader after run-slot reset hooks,
-  so a step-0 hook cannot overwrite trained B weights. The two-rank CPU/Gloo
-  test passed nonzero B restoration, exact export, invalid-file rejection,
-  and source-order checks. The matching trainer patch block is refreshed.
-  Cross-run resume still needs broadcast history and metadata handling in
-  training-ops; this is not a complete live-resume qualification.
-- The 23:45 restart loaded the saved adapter correctly and reused both H200
-  caches in 3.3 seconds. It was stopped at 00:04:56 after about 13 minutes
-  of generation, 0 complete groups, and 4 buffered rollouts. No compute step
-  occurred. Combined generation was about 1,500-1,690 tokens/s.
-- The CUDA graph cap was 128 tokens. At 128 requests with MTP1, decode can
-  schedule 256 tokens; vLLM 0.26 dispatches above-cap batches without graphs.
-  `4aa1772` derives the cap from requests times (1 + MTP tokens), giving 256,
-  and enables graph metrics. Installed-image argument validation passed.
-  Context, MTP, request count, memory fraction, and parallelism are unchanged.
-- `ad21e56` corrects the neutral workload: seeded decayed 1-6 turns and mixed
-  short/medium/long responses instead of uniform 2-6 turns with 400-700 words
-  every turn. The isolated trainer-image compatibility check passed. This
-  workload change is not a trainer-speed improvement. Decensor is unchanged.
-- Ownership repair `7912cc0` fixes both H200 broadcast-directory creators.
-  The exact H200A directories now pass an actual UID 1000 write check.
-  The complete saved step-0 adapter is readable on all eight trainer hosts.
-  `7fffd7d` restores its per-expert tensors through `initial_adapter_path`
-  after the run resets its adapter slot. CPU/Gloo tests passed BF16 native
-  experts, sharded parameters, exact re-export, and rejection before mutation.
-  This recovery is for the zero-B step-0 adapter only. Do not use it to resume
-  a trained adapter: fresh-policy initialization still zeros B. The live
-  generic resume path is not repaired until the local loader change is deployed.
-- The previous attempt stopped with 0 optimizer steps. Both H200s loaded the correct
-  `glm-perf-2` step-0 adapter (B at 17:26:15 UTC, A at 17:26:20). A staging
-  took 2,713.330 seconds; B took 116.598 seconds. The orchestrator then failed
-  to write `broadcasts/step_0/.receivers-ready.json.<tmp>` on H200A because
-  the step directory was root-owned with mode 0755. Trainers and orchestrator
-  were stopped; inference engines and complete adapters were preserved.
-  Directory ownership and its creators are now repaired. The restart reuses
-  the saved complete adapter; confirm its source SHA and H200 cache remain
-  unchanged before reporting that the full copy was avoided.
-- No completed full production RL result is established. The neutral
-  `glm-perf-1` run stopped after more than 43 minutes. Its batch contained
-  16,520,157 effective tokens, including 11,935,614 generated tokens. At about
-  2.1k tokens/s, that output volume implies about 95 minutes; this is an
-  estimate, not a measured run time. The historical comparison processed
-  2,097,152 tokens, so the runs are not comparable.
-- A fresh production-shaped neutral `glm-perf-2` run started on 2026-09-07;
-  all eight trainers were up by 15:34 UTC. The first attempt entered an API
-  retry storm at 16:03:52 after about 1,800 seconds and stopped at 16:05:14
-  with 0 optimizer steps, 32/1,024 collected rollouts, and 127 buffered
-  rollouts. A had
-  105 preemptions versus B 0 at 15:51; both were active with no OOM or
-  restarts. The initial full uncompressed adapter was 30,767,549,784 bytes;
-  A reached 44.2% at about 15:58 with a 10.94 MiB/s interval, not positive
-  step-update timing.
-- A same-run restart was invoked at 16:33:01 UTC and returned at 16:38:45.
-  It brought all eight trainers up at about 16:34-16:35 UTC
-  and the orchestrator at about 16:38 UTC. At 16:47 UTC, its initial adapter
-  bootstrap was pending and it still had 0 optimizer steps. The old 18.337 GB
-  partial was rejected because its source SHA differed (`2c2d5927...5072c`
-  versus `948490...b17f2`); it was not reused, and no value change is proven.
-  BF16-random A/zero B initialization is probable; the FP8 base was unchanged.
-  All eight trainers had expert activation offload 0 and `sm89-r32`.
-  Inference A and B remained MTP 1 with 32K context and existing graphs.
-  Different image `nvcc` paths selected different FlashInfer/fusion paths; this
-  runtime-path difference is unfixed. The first full step, performance, stability, and
-  20-step completion remain pending, so this run has no production pass claim.
-- The original cold start failed before trainers arrived: `install -d` assigned
-  ownership only to the broadcasts leaf, leaving new run parents root-owned;
-  creation of `control` and `.incoming` then failed with permission denied.
-  The user-approved
-  repair in `8bc0602` creates the run parent, service, and broadcasts
-  directories explicitly as UID/GID 1000. The exact n82 directories were
-  repaired before retry; 26 focused tests and `bash -n` passed.
-- The null harness had an SDK 600-second default timeout and two retries inside
-  the 3,600-second rollout limit; the dispatcher also retried every timeout
-  `HarnessError`. `eb5ffad` disables the inner timeout/retries, requires a
-  recorded failed policy call to retry a harness timeout, and mounts the
-  updated harness. Sixteen focused
-  tests, `bash -n`, and patch-block reverse checks passed.
-- Trainer-only qualification is `glm52-fixed-token` on 64 GPUs (8 packed
-  microbatches x 32,768 tokens, 262,144 total) with 512 selected tokens,
-  learning rate 0, and adapter B zero at step 0.
+- `glm52-sparse-stability` completed 20/20 synthetic steps at 04:37:59 UTC.
+  Warm forward/backward time was 177.66-179.92 seconds (median 178.39).
+  Peak reserved memory stayed at 42.93 GiB for steps 3-20. All eight trainer
+  containers exited with code 0 and no OOM flag by 04:38:09.
+- The test uses 524,288 fresh synthetic tokens (16 x 32,768), PP8/CP8/EP8,
+  learning rate 0, and the same saved initial adapter as the baseline. It uses
+  an FP8 base with BF16 rank-32 LoRA on attention, shared-expert, and
+  routed-expert linear weights. The router is frozen.
+- Steps 1 and 2 match the baseline loss, entropy, gradient norm, and peak
+  memory. Candidate step 2 is 14.8% faster on the reported forward/backward
+  metric. Peak memory was 42.65 GiB and no OOM occurred. Detailed timings are
+  in `docs/PERFORMANCE.md`.
+- This is a controlled synthetic check, not a production qualification. Real
+  production remains at 0 optimizer steps; the 20-step requirement is not
+  passed. Root owns live monitoring.
 
-## Trainer qualification
+## Repository and operating references
 
-The following are elapsed qualification measurements with identical metrics:
+- The active config is `configs/qualification/glm52-sparse-stability.toml`.
+  Do not use the older `configs/current/` decensor profile to resume this run.
+- The next draft RL profile is `configs/general-agent/{trainer,orchestrator}.toml`.
+- `configs/operations.toml` is the source for hosts, paths, ports, containers,
+  and profiles. Do not copy these values into another launcher.
+- `docs/RUNBOOK.md` contains run procedures. `docs/PERFORMANCE.md` contains
+  measured timings and historical production results.
+- `docs/PINS.md` records the reviewed and fetched upstream versions and the
+  general-agent package and dataset revisions.
+- The latest local `prime-rl.patch` refresh is `3759+sentinel`: two source
+  blocks changed and the other 49 are unchanged. The current apply-check covers
+  those two blocks; earlier full source/package apply-checks are historical.
+  Dependency blocks are preserved and were not reapplied.
+- The training-ops skill is under `.agents/skills/training-ops/`; the Prime
+  Agent uses the matching skill under `.prime/agent/skills/training-ops/`.
+- The normal read-only checks are:
 
-- old utility (`a2fd4c2`): 133.8006 s and 135.4288 s total;
-- stats utility (`894f2bb`): 136.0182 s and 137.6988 s total;
-- current finite-gradient guard (`eb54291`): 135.4668 s and 137.1223 s total,
-  peak 41.1816 GiB.
+  ```python
+  import training_ops
+  training_ops.status()
+  training_ops.reward()
+  training_ops.steps(limit=20)
+  training_ops.watch(hours=2)
+  ```
 
-The old and stats qualification peaks were 41.1816 GiB and 41.0645 GiB.
+  `watch()` is a foreground monitor. Keep its interval at or below ten
+  minutes. Root owns any live start, stop, or restart.
 
-These values do not establish a compute-speed change. Two actual 8-GPU tests
-per rank passed in 3.58 to 3.62 s with nonfinite gradients rejected.
+## Adapter and transport status
 
-A one-step MTP fixed-token diagnostic with 512 selected tokens reported
-134.9929 s forward/backward, 136.7785 s total, 41.1816 GiB peak memory,
-0.001953 masked fraction, 0.011633 masked K3, and 0.013462 unmasked K3. All
-8 trainer hosts exited 0 with no OOM. Direct 64-token-selected parity measured
-0.05851924324 mean absolute delta and 0.8908292055 maximum. This is a
-zero-learning-rate diagnostic, not an acceptance result.
+- The native-aware trained-adapter loader is deployed in trainer dependencies
+  through qualification `901` on all eight hosts. It passed the two-rank
+  CPU/Gloo checks for nonzero B restoration, exact export, invalid rejection,
+  and source-order checks. Nonzero-trained live resume is not qualified.
+- Cross-run resume still needs broadcast history and metadata handling in
+  training-ops. The step-0 initial adapter path is not proof that trained
+  adapter resume is ready.
+- Adapter cache `3759` is committed locally but not deployed. H200 engines
+  still run old code; both READY old step-0 caches remain available. Positive
+  step adapter delivery is not measured.
+- Shared prefetch `3971` and the partition prototype are isolated and
+  untested. Do not claim a transport improvement from them.
+- Never copy the full GLM weights casually: the H200 model is
+  755,632,050,320 bytes (about 704 GiB).
 
-`glm52-native-small` now has `max_steps = 20` for a fresh synthetic memory
-test. Each step uses 16 x 32,768 = 524,288 fresh synthetic tokens with a seed
-and batch counter, real LR0 backward, no adapter export, no RL rollout, no
-router replay, and no checkpoint, with a one-time rank-8 profiler. The test
-completed 20/20 steps on all 8 trainer hosts; all exited 0 with no OOM. Step 1
-forward/backward took 272.7 s. Steps 2-20 had a median of 204.8 s and a range
-of 201.3-208.4 s. Step total time had a median of 205.5 s and a range of
-202.0-209.2 s. Peak reserved memory was 42.2168 GiB at step 1, 42.6543 GiB
-at step 2, then flat at 42.9277 GiB for steps 3-20.
-This is a synthetic memory test, not full RL or an acceptance run.
+## Known faults and completed repairs
 
-An earlier PP16 qualification measured 227.13 s for pure PP work and 270.79 s
-for the reported value including optimizer and profiler work, with 42.2 GiB
-peak memory. It was not a full batch-1,024 result.
+- The latest production-shaped attempt stopped at 0 optimizer steps after a
+  rollout over the 720-second limit and unfinished compute over the 600-second
+  limit. It is historical, not a pass; detailed measurements are in
+  `docs/PERFORMANCE.md`.
+- Earlier H200 broadcast directories were root-owned. Repairs `8bc0602` and
+  `7912cc0` create and repair the run directories for UID/GID 1000. Confirm
+  ownership and source SHA before any new live run.
+- The null harness retry storm was repaired in `eb5ffad`: inner timeout and
+  retries are disabled, and a harness timeout retries only after a recorded
+  failed policy call. Focused tests and shell checks passed.
+- Native KV offload is not deployed. CPU-only validation passed with
+  `kv_offloading_size=64` and `enable_cumem_allocator=True`; a live sparse-MLA,
+  MTP, LoRA, cache, and throughput comparison is still required.
+- General-agent Hub 0.1.4 is local under `environments/general-agent`.
+  Its 4,413 usable tasks have not established a deployed evaluation. The
+  official dataset repository revision is
+  `e3f0ec777c02b734ad1a7d246cf06a709dc3e6e2`. Budget fix `92f06f4c` passed
+  five actual-image CPU tests, but the real probe remains blocked by an
+  output-directory permission error.
 
-The 64-rank stats component test matched all statistics: the old path used
-2,652 ms and 5,904 MiB, and the new path used 343 ms and 778 MiB. The host-list
-component test used 2.998 s and 4.89 GiB before the change, and 0.081 s and
-0.968 GiB after it. These are component measurements, not full trainer peak
-memory measurements.
+## Current inference and parity constraints
 
-## Parity
+- H200 inference remains MTP 1 with EP8, FULL CUDA graph capture at 256
+  scheduled tokens, and up to 128 requests. Context is 32K and the output
+  limit is 16K. The MTP and reload measurements are component checks only;
+  they are not full rollout-throughput approval. See `docs/PERFORMANCE.md`.
+- Compare parity at equal selected-token counts and with the same activation
+  allocation. Existing direct parity is diagnostic; no trained nonzero-adapter
+  parity result is established. See `docs/PERFORMANCE.md`.
 
-- Direct 64-token-selected parity: mean absolute delta 0.04733 and maximum
-  0.40776.
-- Aggregate 512-token record from the old non-MTP reference: masked K3 mean
-  0.1469, maximum 0.4887; unmasked K3 mean 0.0107. Guards passed, but no
-  trained nonzero-adapter parity result is established.
-- The parity reader now reports record and selected token counts and rejects
-  invalid, empty, non-finite, or contradictory records.
+## Remaining checks
 
-## H200 inference
+1. Run the separate two-step adapter-update check at LR `8e-6`. The completed
+   LR0 test does not prove behavior after weights change. Its rollout,
+   adapter, judging, and save times are not applicable; measure these in a
+   real run. The earlier real batch had 17.2 times more tokens than this test.
+2. Keep the 600-second trainer and 720-second rollout limits. Stop and trace a
+   run that exceeds them; busy GPUs do not prove progress.
+3. Before a production retry, verify configured source files, recursive
+   imports, launcher mounts, patch targets, remote modes, broadcast ownership,
+   and adapter source SHA as one set.
+4. Deploy and qualify trained-adapter resume only after broadcast history and
+   metadata handling are repaired. Preserve nonzero B through reset hooks.
+5. Resolve the general-agent output-directory permission issue before claiming
+   a real probe. Do not change neutral, decensor, or reward settings for it.
 
-- The expert-target omission was confirmed and repaired at `9da34c2`; the
-  load-boundary guard is at `a2fd4c2`.
-- A and B are now configured with MTP 1. B is configured in
-  `6a3e756`. B was ready at 22:28:01 UTC with TP8, EP8, rank-32 expert LoRA,
-  32K context, and CUDA graphs 128. Reported weights, graph, and KV memory
-  were 94.7 GiB, 2.11 GiB, and 396,160 tokens; baseline B KV capacity was
-  478,720 tokens. Three 32,512-prompt plus 256-output samples took 8.360,
-  6.743, and 6.873 s (34.95 tokens/s versus 27.08 before MTP), with 83%
-  draft acceptance and no OOM or restart.
-- In an exact 8 x 32,512-input plus 256-output warm pair, B first took
-  34.429 s with 0 prefix hits; the immediate second took 8.285 s (247.18
-  tokens/s) with 259,072 of 260,096 prefix hits. A warm run on a different
-  host reached 226.22 tokens/s. This is a component indication, not a
-  controlled full-run improvement. The B graph and MTP path stayed intact.
-  Immediate repeated inputs reused the prefix cache.
-- The prior A MTP 0 historical control took 225.89, 203.57, and 225.13
-  tokens/s (median 225.13). With MTP 1, the same-host A test took 285.51,
-  286.86, and 268.93 tokens/s (median 285.51, about 26.8% higher). Across
-  32 requests including warmup, all requests returned HTTP 200; 8,192
-  generated token log-probabilities were finite, with no errors, restarts, or
-  preemptions. MTP accepted 3,294 of 4,844 draft tokens (about 68%). Graphs
-  and context were unchanged. A's reported KV capacity was 368,960 tokens
-  versus the prior 416,512; activation
-  allocations differed, so this is not a pure causal speed claim.
-- Both H200 services use active KV block size 64. Reported KV capacity was
-  368,960 tokens (18.81 GiB) on A and 396,160 tokens (20.19 GiB) on B.
-- The MTP run total was 21.976009 s for 768 finite generated tokens, with all
-  HTTP responses successful.
-- A separate B concurrent test completed 3 rounds of 8 requests: all 24 HTTP
-  responses were successful, with 6,144 finite generated tokens, zero errors,
-  preemptions, or restarts, and 57.99, 55.59, and 59.74 tokens/s. KV drained;
-  memory plateaued at 141,085 MiB after round 1. This has no concurrent MTP 0
-  baseline, so it is not a speed comparison.
-- Three same-adapter B unload/reload probes took 4.186 to 4.193 s each. Each
-  8 x 32,512-input plus 256-output probe returned HTTP 200 with finite output
-  and no errors. These are cached adapter reload checks, not new policy or
-  WAN timing.
-- A short A concurrency benchmark completed 128 of 128 requests using 512
-  input and at most 64 output tokens in 18.7 s: 8,071 generated tokens,
-  431.43 tokens/s, no OOM, preemption, or restart, and peak concurrency 128.
-  This is not long-rollout throughput.
-- The trainer/inference MTP comparison is complete for this diagnostic. There
-  is no full rollout-throughput claim or production approval. Baseline and MTP
-  tests had differing measured activation allocations, so the KV-capacity
-  difference does not support a pure causal claim.
-- A historical, different-workload H200 32K prefill test passed two 96-request
-  runs at 1,459.6 and 1,454.5 tokens/s with 32,768 prefill tokens, rank 32,
-  graphs 128, TP8, and EP8. The 65,536-token control crashed; its root cause
-  is unknown.
-
-MTP is vLLM's Multi-Token Prediction path; see the [vLLM MTP
-documentation](https://docs.vllm.ai/en/latest/features/speculative_decoding/mtp/).
-
-## Transfer and transport
-
-- Saved encoded artifact size for trained adapter steps 3, 4, and 5 was 3.20,
-  2.51, and 2.23 GB. This is not a WAN transfer measurement. Both H200 hosts
-  still have only the cached `glm-perf-1` step 0; full positive-step delivery
-  is pending.
-- Stronger zstd at level 9 on 16 chunks (raw 266,571,096 bytes) saved 2.27%
-  and added 29.6% CPU encode time, so it was rejected. A 64 MiB workspace path (18.04 s versus 10.50 s) was
-  also rejected. No full new WAN result under 5 minutes is established.
-- CPU damped-compression used 16 chunks x 5 coefficients and passed 80 exact
-  round trips total. Deployed coefficient 1 produced the smallest
-  18,057,344-byte artifact; alternatives were 56% to 160% larger, so no
-  compression setting change is proposed.
-- Grouped 24-process, four-forward China tunnels are validated with 96
-  listeners. Restarting n82 `logind` cleared its exhausted session table
-  (8192 limit); the shared root cause of earlier SSH-session warnings remains
-  unresolved.
-- Native cancellation now clears resources. The B relay is intentionally
-  absent during trainer-only work.
-
-## Versions and next checks
-
-- Measured trainer image: `prime-rl:glm52-fp8`, PyTorch 2.11.0+cu128,
-  NCCL 2.28.9.
-- Measured H200 image: `prime-rl:glm52-v080-glm52-h200-router`, vLLM 0.26;
-  the orchestrator image is `prime-rl:glm52-decensor`.
-- Upstream `26b3131` was reviewed but is not upgraded.
-- `prime-rl.patch` was refreshed against base
-  `f50ec5c4c8c45864ec535dead2c3b630de50d068` for four source files. Its other
-  47 blocks, including dependency blocks, are unchanged. Source/package hunks
-  passed apply-check against this base with `deps/*` excluded. Dependency
-  hunks were preserved, not reapplied to fresh dependency trees. This patch
-  does not apply unchanged to reviewed upstream `26b3131`; that upgrade is not
-  deployed.
-- Keep the trainer timing limit at 600 seconds and the rollout limit at 720
-  seconds. `watch()` reports only; it does not stop a test. The operator must
-  stop and trace a test that exceeds the configured limit. A busy GPU is not
-  proof of progress.
-- Historical `glm-1` measurements are not the current neutral result. Do not
-  restart that old run without an owner decision.
-- No Decensor environment or reward edits were made in these fixes.
+No Decensor environment or reward edits were made for these measurements.
