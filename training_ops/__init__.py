@@ -5125,14 +5125,8 @@ def _start_dependency_inventory(
     with (repo_root / selected["orchestrator"]).open("rb") as stream:
         train_envs = tomllib.load(stream).get("train", {}).get("env", [])
     environment_sources = {
-        "general-agent": {
-            "files": (),
-            "python_roots": ("environments/general-agent/general_agent",),
-        },
-        "decensor-v1": {
-            "files": ("environments/decensor/pyproject.toml",),
-            "python_roots": ("environments/decensor/src/decensor_v1",),
-        },
+        "general-agent": ("environments/general-agent/general_agent",),
+        "decensor-v1": ("environments/decensor/src/decensor_v1",),
     }
     if not isinstance(train_envs, list):
         raise Refused("orchestrator train.env must be a list")
@@ -5153,9 +5147,7 @@ def _start_dependency_inventory(
         source = environment_sources.get(environment_id)
         if source is None:
             raise Refused(f"unsupported orchestrator environment id: {environment_id}")
-        for path in source["files"]:
-            add(path, [orchestrator_host])
-        for source_root in source["python_roots"]:
+        for source_root in source:
             add_files(source_root, [orchestrator_host], suffix=".py")
 
     missing = [path for path in inventory if not (repo_root / path).is_file()]
