@@ -1,6 +1,6 @@
 # Rules
 
-- Never touch a host listed in `hosts.blocked` in `configs/operations.toml`.
+- Never touch a host listed in `hosts.blocked` in `configs/nodes.toml`.
 - Never delete `/data/ZiphuAI`, `/data/trinity`, or
   `/data/nv-community_GLM-5.2-NVFP4`.
 - Never delete the only GLM model at `/data/glm52-rl/model` on n85.

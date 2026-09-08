@@ -11,14 +11,15 @@ conclusions. Keep reports short.
 - Give each task one goal and name the exact worktree, expected commit, files
   or services, allowed read/edit/commit/live actions, approach, and checks.
   Use `fork_turns="none"` unless recent context is required.
-- Use one writer per branch and one operator per live qualification. Preserve
+- Use one writer per branch and one operator per live test. Preserve
   existing changed and untracked files.
 
 ## Start and report
 
-- Read `configs/operations.toml` for hosts, paths, ports, containers, and
-  profiles. Read `TRAINING_EXPECTATIONS.md` before a training test or run.
+- Read `configs/nodes.toml` for hosts, paths, ports, containers, and topology.
+  Read `TRAINING_EXPECTATIONS.md` before a training test or run.
 - Use the `training-ops` skill. Do not write another SSH helper.
+- Use `uv run training-ops status` for a read-only status check.
 - First report `pwd`, repository root, `HEAD`, and `git status`; stop on a
   mismatch. Before a start, check all required source files, recursive imports,
   mounts, patches, and remote file modes together.
@@ -50,8 +51,9 @@ conclusions. Keep reports short.
 
 - Keep each project in its own `environments/<name>/` directory and put
   evaluation code under `evals/<name>/`. Load datasets from the Hub or cache.
-- Put training-ops scripts under `.agents/skills/training-ops/runtime/`.
+- Put training-ops scripts under `training_ops/runtime/`.
   Remove temporary files when their task ends and do not add extra docs unless
   requested. Preserve files used by other active tasks.
-- Use simple English and names. Do not silently replace a requested method,
-  setting, or metric; report the code and metric source.
+- Use simple English and names. Do not add new all-caps identifiers. Do not
+  silently replace a requested method, setting, or metric; report the code and
+  metric source.
