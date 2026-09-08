@@ -35,14 +35,10 @@ initial adapter as the baseline. Reported forward/backward time includes
 existing statistics and optimizer work; it is not pure forward/backward
 kernel time.
 
-| Step | Baseline reported | Baseline total | Candidate reported | Candidate total |
-|---:|---:|---:|---:|---:|
-| 1 | 275.9 s | 280.7 s | 248.0 s | 253.0 s |
-| 2 | 209.2 s | 209.9 s | 178.3 s | 179.0 s |
-
-Steps 1 and 2 match baseline loss, entropy, gradient norm, and peak memory.
-Candidate step 2 is 14.8% faster on the reported forward/backward metric, with
-42.65 GiB peak memory and no OOM. Raw metric values remain in the run record.
+The 20-step LR0 run passed at 04:37:59. Warm forward/backward time was
+177.66-179.92 s (median 178.39 s), with 42.9277 GiB peak reserved memory for
+steps 3-20. This is a controlled synthetic memory result, not production
+training or learned-policy stability.
 
 A one-microbatch profile on rank 8 recorded 1.15 s in forward all-to-all,
 0.60 s in forward all-gather, and 1.26 s in sparse attention backward.
@@ -51,22 +47,32 @@ wrapper rows overlap with NCCL kernel rows; do not add both.
 
 ## Two-step adapter-update check
 
-`glm52-lora-update` completed at 04:49:01 on commit `2fec9b6`, with the same
-16 x 32K inputs and initial adapter, LR `8e-6`, and stage profiling enabled.
-All eight containers exited with code 0 and no OOM flag.
+The two-step nonzero-LoRA check used the same 16 x 32K inputs and initial
+adapter at LR `8e-6`. All eight containers exited with code 0 and no OOM flag.
 
 | Step | Reported forward/backward | Total | Peak reserved | A gradient norm | B weight norm |
 |---:|---:|---:|---:|---:|---:|
-| 1 | 251.89 s | 252.59 s | 42.22 GiB | 0 | 0.0922512 |
-| 2 | 177.89 s | 178.58 s | 42.65 GiB | 0.0000475536 | 0.193373 |
+| 1 | not retained | not retained | not retained | 0 | 0.0922512 |
+| 2 | 177.89248 s | 178.58255 s | 42.6543 GiB | 0.0000475536 | 0.193373 |
 
 The B weights started at zero. The check proves updates and a nonzero A
 gradient on the next step. These aggregate norms include replicated ranks;
 they are update evidence, not a norm of a deduplicated adapter. The text log
 had a formatting error; values above come from the diagnostic JSON metrics.
 Stage-0 backward event timing is not valid because its inputs require no
-gradients. First-step profiling also adds overhead. Do not use either as a
-pure kernel timing.
+gradients. Profiling adds overhead. Do not use either as pure kernel timing.
+
+The one-round BF16 combine candidate completed at 05:09:24. Step 1 was
+250.41158 s forward/backward and 251.09143 s total. Step 2 was 176.55202 s
+forward/backward and 177.23730 s total, with 42.6543 GiB peak reserved
+memory. Its 0.75% step-2 gain versus 177.89248 s was too small, and estimated
+balanced scratch was 672 MiB larger, so it was not selected. The default
+eight-column transport remains.
+
+The GPU8-rank exact BF16 transport output/gradcheck passed in `8457f51` for
+balanced, uneven, and zero-peer cases. The ownership test bug was fixed; it was
+not a production bug. Reducing profiler forward calls from 100 to 30 changed
+1.15 s to 1.001 s, but the transport bytes did not change.
 
 ## Historical neutral production-shaped runs
 
@@ -89,9 +95,11 @@ measurement exists. No OOM was observed; sampled peak memory was about
 
 A ten-second sample across trainer NICs measured 0.63-1.25 Gbit/s per
 direction on 10-Gbit/s links. It does not establish network saturation.
-The accepted batch contains 17.2 times the tokens of the three-minute
-synthetic memory test. This attempt fails the speed requirements and does
-not establish full-step or 20-step stability.
+The accepted batch contained 17.2 times the tokens of the 524,288-token,
+three-minute controlled test. This attempt fails the speed requirements and
+does not establish full-step or 20-step stability. All trainers are now
+stopped cleanly; there is no active watch. Rollout, adapter delivery, judging,
+and save measurements for a new production run remain unverified.
 
 Earlier attempt: 0 optimizer steps. Restart began 23:45:14 and
 returned 23:50:58 UTC. Initial saved-adapter staging used both ready caches

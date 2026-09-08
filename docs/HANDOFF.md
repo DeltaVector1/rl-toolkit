@@ -9,21 +9,25 @@ port, container, and profile value.
   Warm forward/backward time was 177.66-179.92 seconds (median 178.39).
   Peak reserved memory stayed at 42.93 GiB for steps 3-20. All eight trainer
   containers exited with code 0 and no OOM flag by 04:38:09.
-- `glm52-lora-update` then passed two steps at LR `8e-6`, finishing 04:49:01.
-  Step 2 took 177.89 seconds reported forward/backward, with 42.65 GiB peak
-  memory. B weights changed after step 1; A gradients were nonzero on step 2.
-  All eight containers exited with code 0 and no OOM flag.
+- The two-step nonzero-LoRA check passed at LR `8e-6`. Step 2 reported
+  177.89248 seconds forward/backward and 178.58255 seconds total, with
+  42.6543 GiB peak memory. Step-1 B norm was `0.0922512`; step-2 A-gradient
+  norm was `4.75536e-5`.
 - The test uses 524,288 fresh synthetic tokens (16 x 32,768), PP8/CP8/EP8,
   learning rate 0, and the same saved initial adapter as the baseline. It uses
   an FP8 base with BF16 rank-32 LoRA on attention, shared-expert, and
   routed-expert linear weights. The router is frozen.
-- Steps 1 and 2 match the baseline loss, entropy, gradient norm, and peak
-  memory. Candidate step 2 is 14.8% faster on the reported forward/backward
-  metric. Peak memory was 42.65 GiB and no OOM occurred. Detailed timings are
-  in `docs/PERFORMANCE.md`.
-- This is a controlled synthetic check, not a production qualification. Real
-  production remains at 0 optimizer steps; the 20-step requirement is not
-  passed. Root owns live monitoring.
+- A one-round BF16 combine candidate completed at 05:09:24 UTC. Step 1 was
+  250.41158 seconds forward/backward and 251.09143 seconds total. Step 2 was
+  176.55202 seconds forward/backward and 177.23730 seconds total, with
+  42.6543 GiB peak memory. The 0.75% step-2 gain versus 177.89248 seconds was
+  too small, and the candidate used an estimated 672 MiB more balanced scratch,
+  so it was not selected. All eight containers exited with code 0 and
+  `OOMKilled=false`.
+- These are controlled synthetic checks, not a production qualification. All
+  trainers stopped cleanly; no active watch remains. The 20-step production
+  requirement is not passed. The 524,288-token controlled test is not proof of
+  a 3-minute production step; the stopped real batch had 9,018,062 tokens.
 
 ## Repository and operating references
 
@@ -66,7 +70,12 @@ port, container, and profile value.
   adapter resume is ready.
 - Adapter cache `3759` is committed locally but not deployed. H200 engines
   still run old code; both READY old step-0 caches remain available. Positive
-  step adapter delivery is not measured.
+  step adapter delivery is not measured. The H200 old-worker cache fix is also
+  not deployed. New production rollout and adapter delivery remain unverified.
+- GPU8-rank exact BF16 transport output/gradcheck passed in `8457f51` for
+  balanced, uneven, and zero-peer cases. The ownership test bug was fixed; it
+  was not a production transport fault. Reducing profiler forward calls from
+  100 to 30 changed 1.15 to 1.001 seconds, but did not change bytes.
 - Shared prefetch `3971` and the partition prototype are isolated and
   untested. Do not claim a transport improvement from them.
 - Never copy the full GLM weights casually: the H200 model is
@@ -93,6 +102,9 @@ port, container, and profile value.
   `e3f0ec777c02b734ad1a7d246cf06a709dc3e6e2`. Budget fix `92f06f4c` passed
   five actual-image CPU tests, but the real probe remains blocked by an
   output-directory permission error.
+- The only remaining general-agent blocker is owner approval for the
+  `/data/glm52-rl/runs/general-agent-check/budget-probe` ownership repair after
+  `PermissionError`. Do not bypass that approval.
 
 ## Current inference and parity constraints
 
@@ -106,11 +118,8 @@ port, container, and profile value.
 
 ## Remaining checks
 
-1. Test the separate one-round BF16 expert-combine candidate. The default
-   uses eight column transfers. Compare exact transport results, updated
-   adapter metrics, speed, and memory before selecting it. The earlier real
-   batch had 17.2 times more tokens than the synthetic tests. Rollout,
-   adapter, judging, and save times still need a real run.
+1. Get owner approval for the general-agent budget-probe ownership repair.
+   Rollout, adapter, judging, and save times still need a real run.
 2. Keep the 600-second trainer and 720-second rollout limits. Stop and trace a
    run that exceeds them; busy GPUs do not prove progress.
 3. Before a production retry, verify configured source files, recursive

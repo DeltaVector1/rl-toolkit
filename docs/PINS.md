@@ -56,3 +56,23 @@ not deployed.
 
 - Package version: `0.1.4`
 - Official dataset repository revision: `e3f0ec777c02b734ad1a7d246cf06a709dc3e6e2`
+- The draft rollout limit is 720 seconds. Completion-budget change `92f06f4c`
+  passed five actual-image CPU tests; the real probe remains blocked by
+  `PermissionError` on `/data/glm52-rl/runs/general-agent-check/budget-probe`.
+  Owner approval is required for that ownership repair; do not bypass it.
+
+## Qualification evidence
+
+- The 20-step LR0 synthetic check passed with warm forward/backward time
+  177.66-179.92 seconds (median 178.39) and 42.9277 GiB peak memory for
+  steps 3-20. The nonzero-LoRA two-step check reported 177.89248 seconds on
+  step 2, 178.58255 seconds total, 42.6543 GiB peak memory, B norm 0.0922512
+  after step 1, and A-gradient norm `4.75536e-5` on step 2.
+- The one-round BF16 combine candidate finished at 05:09:24 UTC but was not
+  selected: step 2 was 176.55202 seconds, only 0.75% faster, with estimated
+  balanced scratch 672 MiB larger. Exact BF16 transport output/gradcheck
+  passed in `8457f51` for balanced, uneven, and zero-peer cases.
+- These are controlled checks. The 524,288-token synthetic run is not a
+  three-minute production proof; the stopped real batch had 9,018,062 tokens.
+  All trainers are stopped cleanly. Production rollout and adapter delivery
+  remain unverified. The H200 old-worker cache fix is not deployed.
