@@ -15,8 +15,13 @@ port, container, and profile value.
   stale despite a success report. Local replacement/partial-resume tests and
   an actual same-size replacement on n82 passed. All 85 training-ops tests
   pass after correcting two stale test expectations. This generic helper is
-  separate from live adapter transport. Small test archives remain in `build/`
-  locally and on n82; the cleanup command was denied by the command policy.
+  separate from live adapter transport. The temporary test archives were
+  removed locally and on n82 after verification; source and checks remain.
+- Native KV offload is not deployed. CPU-only engine configuration passed on
+  both H200s with `kv_offloading_size=64` and `enable_cumem_allocator=True`.
+  Without CuMem, the current expandable-segments allocator fails validation.
+  The 64 GiB buffer is shared across TP ranks, not per GPU. Actual sparse-MLA,
+  MTP, LoRA, cache reload, and throughput still need a bounded live comparison.
 - Both H200s restarted at 00:08:42 UTC with `4aa1772`; trainer restart
   invoked at 00:09:13. Root owns live operation and foreground monitoring.
   This remains neutral `glm-perf-2`, fresh rollouts, and a 20-step target.
