@@ -14,6 +14,37 @@ import training_ops
 
 
 class TrainerComputeProbeTest(unittest.TestCase):
+    def run_probe(self, log):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "sudo").write_text(
+                "#!/bin/sh\nexec \"$@\"\n", encoding="utf-8"
+            )
+            (root / "docker").write_text(
+                "#!/bin/sh\n"
+                "case \"$*\" in\n"
+                "  inspect*) printf '2026-09-08T22:00:00.000000000Z\\n' ;;\n"
+                "  *logs*) printf '%s\\n' \"$TRAINER_LOG\" ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            (root / "sudo").chmod(0o755)
+            (root / "docker").chmod(0o755)
+            script = (
+                "strip() { sed 's/\\x1b\\[[0-9;]*m//g'; };\n"
+                + training_ops.trainer_compute_probe
+            )
+            environment = {"PATH": f"{directory}:/usr/bin:/bin", "TRAINER_LOG": log}
+            result = subprocess.run(
+                ["bash", "-c", script],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return training_ops._kv(result.stdout)
+
     def test_parses_current_step_with_optional_pp_completion(self):
         self.assertEqual(training_ops._parse_trainer_compute("2"), (2, None))
         self.assertEqual(
@@ -28,6 +59,47 @@ class TrainerComputeProbeTest(unittest.TestCase):
         status = training_ops.Status(
             trainer_compute_step=2,
             trainer_compute_seconds=600.01,
+        )
+        self.assertIn(
+            "trainer compute step 2 exceeds configured upper bound 600s",
+            training_ops._warnings(status),
+        )
+
+    def test_stale_prior_step_and_pp_without_completion_stay_active(self):
+        report = self.run_probe(
+            "2026-09-08T22:00:01Z Starting training step 1\n"
+            "2026-09-08T22:00:02Z Starting forward and backward pass (batch_size=1024)\n"
+            "2026-09-08T22:04:00Z PP step: 55 micro-batches in 300.00s\n"
+            "2026-09-08T22:04:01Z TRAINER_FORWARD_BACKWARD_COMPLETE step=1 seconds=301.000000\n"
+            "2026-09-08T22:05:00Z Starting training step 2\n"
+            "2026-09-08T22:05:01Z Starting forward and backward pass (batch_size=1024)\n"
+            "2026-09-08T22:09:50Z PP step: 55 micro-batches in 454.89s\n"
+        )
+        self.assertEqual(training_ops._parse_trainer_compute(report["TRAINER_COMPUTE"]), (2, None))
+        self.assertEqual(report["TRAINER_COMPUTE_PP_SECONDS"], "454.89")
+        self.assertEqual(report["TRAINER_COMPUTE_ACTIVE"], "1")
+        self.assertTrue(float(report["TRAINER_COMPUTE_ELAPSED_SECONDS"]) >= 0)
+
+    def test_matching_completion_ignores_later_adapter_work(self):
+        report = self.run_probe(
+            "2026-09-08T22:00:01Z Starting training step 2\n"
+            "2026-09-08T22:00:02Z Starting forward and backward pass (batch_size=1024)\n"
+            "2026-09-08T22:09:50Z PP step: 55 micro-batches in 454.89s\n"
+            "2026-09-08T22:10:00Z TRAINER_FORWARD_BACKWARD_COMPLETE step=2 seconds=601.000000\n"
+            "2026-09-08T22:10:01Z Starting broadcasting weights to inference engine via shared filesystem\n"
+            "2026-09-08T22:12:00Z Saving checkpoint at step 2\n"
+        )
+        self.assertEqual(
+            training_ops._parse_trainer_compute(report["TRAINER_COMPUTE"]),
+            (2, 601.0),
+        )
+        self.assertEqual(report["TRAINER_COMPUTE_PP_SECONDS"], "454.89")
+        self.assertEqual(report["TRAINER_COMPUTE_ACTIVE"], "0")
+        self.assertEqual(report["TRAINER_COMPUTE_ELAPSED_SECONDS"], "")
+        status = training_ops.Status(
+            trainer_compute_step=2,
+            trainer_compute_seconds=601.0,
+            trainer_compute_pp_seconds=454.89,
         )
         self.assertIn(
             "trainer compute step 2 exceeds configured upper bound 600s",

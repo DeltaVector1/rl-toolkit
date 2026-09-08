@@ -421,7 +421,7 @@ def _parse_epoch(value: str | None) -> float | None:
 
 
 def _parse_trainer_compute(value: str) -> tuple[int, float | None] | None:
-    """Parse the current step and optional raw PP completion duration."""
+    """Parse the current step and optional authoritative completion duration."""
     parts = value.split()
     if len(parts) not in (1, 2):
         return None
@@ -435,6 +435,14 @@ def _parse_trainer_compute(value: str) -> tuple[int, float | None] | None:
     ):
         return None
     return step, seconds
+
+
+def _parse_seconds(value: str) -> float | None:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    return seconds if math.isfinite(seconds) and seconds >= 0 else None
 
 
 def _select_active_reward_rows(
@@ -452,32 +460,76 @@ def _select_active_reward_rows(
 # -------------------------------------------------------------------- probes
 
 trainer_compute_probe = r"""
-compute=$(sudo docker logs __TRAINER__ 2>&1 | strip | awk '
+started_at=$(sudo docker inspect __TRAINER__ --format '{{.State.StartedAt}}' 2>/dev/null | head -1)
+if [ -n "$started_at" ]; then
+  trainer_log=$(sudo docker logs -t --since "$started_at" __TRAINER__ 2>&1 | strip)
+else
+  trainer_log=$(sudo docker logs -t __TRAINER__ 2>&1 | strip)
+fi
+compute=$(printf '%s\n' "$trainer_log" | awk '
 /Starting training step [0-9]+/ {
   current=$0
   sub(/^.*Starting training step /, "", current)
   sub(/[^0-9].*$/, "", current)
   active=0
   completed=""
+  pp=""
+  started="-"
 }
 /Starting forward and backward pass/ && current != "" {
   active=1
-  completed=""
+  started=$1
 }
 /PP step: [0-9]+ micro-batches in [0-9]+([.][0-9]+)?s/ && active {
-  completed=$0
-  sub(/^.*PP step: [0-9]+ micro-batches in /, "", completed)
-  sub(/s.*$/, "", completed)
-  active=0
+  pp=$0
+  sub(/^.*PP step: [0-9]+ micro-batches in /, "", pp)
+  sub(/s.*$/, "", pp)
+}
+/TRAINER_FORWARD_BACKWARD_COMPLETE step=[0-9]+ seconds=[0-9]+([.][0-9]+)?/ && current != "" {
+  line=$0
+  sub(/^.*step=/, "", line)
+  step=line
+  sub(/ .*/, "", step)
+  if (step == current) {
+    completed=$0
+    sub(/^.*seconds=/, "", completed)
+    sub(/[^0-9.].*$/, "", completed)
+    active=0
+  }
 }
 END {
   if (current != "") {
     printf "%s", current
     if (completed != "") printf " %s", completed
+    else printf " -"
+    if (pp != "") printf " %s", pp
+    else printf " -"
+    printf " %s %s", active, started
     print ""
   }
 }')
-echo "TRAINER_COMPUTE $compute"
+read -r compute_step compute_seconds compute_pp compute_active compute_start <<EOF
+$compute
+EOF
+compute_elapsed=""
+if [ "$compute_active" = 1 ] && [ "$compute_start" != "-" ]; then
+  compute_start_epoch=$(date -u -d "$compute_start" +%s.%N 2>/dev/null || true)
+  now_epoch=$(date -u +%s.%N)
+  if [ -n "$compute_start_epoch" ]; then
+    compute_elapsed=$(awk -v now="$now_epoch" -v start="$compute_start_epoch" \
+      'BEGIN { if (now >= start) printf "%.6f", now - start }')
+  fi
+fi
+if [ "$compute_step" = "" ]; then
+  echo "TRAINER_COMPUTE"
+else
+  if [ "$compute_seconds" = "-" ]; then compute_seconds=""; fi
+  if [ "$compute_pp" = "-" ]; then compute_pp=""; fi
+  echo "TRAINER_COMPUTE $compute_step${compute_seconds:+ $compute_seconds}"
+  echo "TRAINER_COMPUTE_PP_SECONDS $compute_pp"
+  echo "TRAINER_COMPUTE_ACTIVE $compute_active"
+  echo "TRAINER_COMPUTE_ELAPSED_SECONDS $compute_elapsed"
+fi
 """
 
 trainer_probe = r"""
@@ -776,6 +828,9 @@ class Status:
     trainer_steps: int = 0
     trainer_compute_step: int | None = None
     trainer_compute_seconds: float | None = None
+    trainer_compute_pp_seconds: float | None = None
+    trainer_compute_active: bool = False
+    trainer_compute_elapsed_seconds: float | None = None
     trainer_last: str = ""
     trainer_current: str = ""
     orch_last: str = ""
@@ -827,12 +882,16 @@ class Status:
         )
         if self.trainer_compute_step is not None:
             if self.trainer_compute_seconds is None:
-                compute = f"step {self.trainer_compute_step} in progress"
+                compute = f"step {self.trainer_compute_step} active"
+                if self.trainer_compute_elapsed_seconds is not None:
+                    compute += f" {self.trainer_compute_elapsed_seconds:.2f}s"
             else:
                 compute = (
                     f"step {self.trainer_compute_step} "
-                    f"{self.trainer_compute_seconds:.2f}s (PP complete)"
+                    f"{self.trainer_compute_seconds:.2f}s (forward/backward complete)"
                 )
+            if self.trainer_compute_pp_seconds is not None:
+                compute += f"; PP {self.trainer_compute_pp_seconds:.2f}s"
             L.append(f"  trainer compute: {compute}")
         if self.trainer_last:
             L.append(f"  trainer: {self.trainer_last[:150]}")
@@ -1744,6 +1803,13 @@ def status(run: str = "", quiet: bool = False) -> Status:
     compute = _parse_trainer_compute(h.get("TRAINER_COMPUTE", ""))
     if compute is not None:
         s.trainer_compute_step, s.trainer_compute_seconds = compute
+        s.trainer_compute_pp_seconds = _parse_seconds(
+            h.get("TRAINER_COMPUTE_PP_SECONDS", "")
+        )
+        s.trainer_compute_active = h.get("TRAINER_COMPUTE_ACTIVE", "") == "1"
+        s.trainer_compute_elapsed_seconds = _parse_seconds(
+            h.get("TRAINER_COMPUTE_ELAPSED_SECONDS", "")
+        )
     s.trainer_last = h.get("TRAINER_LAST", "")
     s.trainer_current = h.get("TRAINER_CURRENT", "")
     s.trainer_finished = int(h.get("TRAINER_FINISHED", 0) or 0) > 0
@@ -1808,6 +1874,15 @@ def _warnings(s: Status) -> list[str]:
         w.append(
             f"trainer compute step {s.trainer_compute_step} exceeds configured upper bound "
             f"{trainer_seconds_max:g}s"
+        )
+    if (
+        s.trainer_compute_active
+        and s.trainer_compute_elapsed_seconds is not None
+        and s.trainer_compute_elapsed_seconds > stall_seconds
+    ):
+        w.append(
+            f"trainer compute step {s.trainer_compute_step} has been active for "
+            f"more than {stall_seconds:g}s"
         )
     if s.trainer_failed:
         w.append(f"trainer process failed after {s.trainer_steps} completed steps")
@@ -2873,6 +2948,7 @@ def watch(hours: float = 2.0, every: int = 300, run: str = "") -> list[Status]:
             s.batch,
             s.trainer_compute_step,
             s.trainer_compute_seconds,
+            s.trainer_compute_active,
         )
         if key != last_key:
             last_key, last_change = key, time.time()

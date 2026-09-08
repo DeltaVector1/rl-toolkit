@@ -2169,7 +2169,13 @@ def train(config: TrainerConfig):
             current_lr = optimizer.param_groups[0]["lr"]
         else:
             current_lr = optimizer.get_current_lr()
-        forward_backward_time = time.perf_counter() - forward_backward_start_time
+        forward_backward_end_time = time.perf_counter()
+        forward_backward_time = forward_backward_end_time - forward_backward_start_time
+        if dist.get_rank() == 0:
+            logger.info(
+                f"TRAINER_FORWARD_BACKWARD_COMPLETE step={progress.step} "
+                f"seconds={forward_backward_time:.6f}"
+            )
         if qualification_identity is not None:
             maximum_forward_backward = torch.tensor(
                 forward_backward_time, dtype=torch.float64, device="cuda"
