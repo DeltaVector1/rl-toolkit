@@ -17,8 +17,7 @@ port, container, and profile value.
   tokens (32 x 32,768). Step 1 took 376.2107728468254 seconds and step 2
   took 305.7785394010134 seconds forward/backward; peak memory was 42.21875
   and 42.890625 GiB. All eight trainers exited 0 with `OOMKilled=false`.
-  This is not a three-minute production result. Trainers are now idle and no
-  active watch remains.
+  This is not a three-minute production result.
 - The test uses 524,288 fresh synthetic tokens (16 x 32,768), PP8/CP8/EP8,
   learning rate 0, and the same saved initial adapter as the baseline. It uses
   an FP8 base with BF16 rank-32 LoRA on attention, shared-expert, and
@@ -31,15 +30,29 @@ port, container, and profile value.
   so it was not selected. All eight containers exited with code 0 and
   `OOMKilled=false`.
 - These are controlled synthetic checks, not a production qualification. All
-  trainers stopped cleanly; no active watch remains. The 20-step production
-  requirement is not passed. The 524,288-token controlled test is not proof of
-  a 3-minute production step; the stopped real batch had 9,018,062 tokens.
+  synthetic checks exited cleanly. The 524,288-token controlled test is not
+  proof of a 3-minute production step; the stopped real batch had 9,018,062
+  tokens.
+- `glm-perf-3` is the current 200-step general-agent production-shaped run.
+  It started at about 12:46 UTC with eight trainers and two H200 engines. At
+  13:05 UTC it had 0 optimizer steps and 144/1,024 accepted rollouts after
+  about 19 minutes. A separate snapshot had 331 completed traces:
+  187 reward-1 and 144 reward-0
+  rows, 157 task timeouts, 19 output-limit stops, 152 no-tools-final stops,
+  and 3 context-limit stops. There were no model/tool errors; mean rollout
+  time was 508.15 s. The first collection already misses the 720-second batch
+  speed target. The environment budget cancels the awaited policy request
+  locally and scores the resulting task state. Server-side cancellation after
+  disconnect is not yet verified. It has no full-batch timing or stability
+  pass. The run is tracked
+  in [SwanLab](https://swanlab.cn/@MangyMangaur/glm-runs/runs/0czdctwl).
 
 ## Repository and operating references
 
-- The active config is `configs/qualification/glm52-sparse-stability.toml`.
-  Do not use the older `configs/current/` decensor profile to resume this run.
-- The next draft RL profile is `configs/general-agent/{trainer,orchestrator}.toml`.
+- The active files are `configs/general-agent/{trainer,orchestrator}.toml`,
+  with `max_steps = 200`. Startup omitted `configs/operations.toml` from
+  deployment. Commit `2aec4fb` fixed the shared deployment list; the next
+  start succeeded.
 - `configs/operations.toml` is the source for hosts, paths, ports, containers,
   and profiles. Do not copy these values into another launcher.
 - `docs/RUNBOOK.md` contains run procedures. `docs/PERFORMANCE.md` contains
@@ -74,10 +87,10 @@ port, container, and profile value.
 - Cross-run resume still needs broadcast history and metadata handling in
   training-ops. The step-0 initial adapter path is not proof that trained
   adapter resume is ready.
-- Adapter cache `3759` is committed locally but not deployed. H200 engines
-  still run old code; both READY old step-0 caches match. Positive-step adapter
-  delivery is not measured. Deploy the worker and restart both H200 workers
-  before a fresh production run to avoid a WAN retransfer.
+- Adapter worker `3759` is deployed. The initial step-0 adapter matched the
+  existing cache: A took 12.911 s, B 9.474 s, and orchestration took 22.6 s,
+  with no WAN fallback. The adapter size was 30,767,549,784 bytes. Positive-step
+  adapter transfer and parity remain unmeasured.
 - GPU8-rank exact BF16 transport output/gradcheck passed in `8457f51` for
   balanced, uneven, and zero-peer cases. The ownership test bug was fixed; it
   was not a production transport fault. Reducing profiler forward calls from
@@ -89,7 +102,7 @@ port, container, and profile value.
 
 ## Known faults and completed repairs
 
-- The latest production-shaped attempt stopped at 0 optimizer steps after a
+- A historical production-shaped attempt stopped at 0 optimizer steps after a
   rollout over the 720-second limit and unfinished compute over the 600-second
   limit. It is historical, not a pass; detailed measurements are in
   `docs/PERFORMANCE.md`.
@@ -103,48 +116,50 @@ port, container, and profile value.
   `kv_offloading_size=64` and `enable_cumem_allocator=True`; a live sparse-MLA,
   MTP, LoRA, cache, and throughput comparison is still required.
 - General-agent Hub 0.1.4 is local under `environments/general-agent`.
-  Its 4,413 usable tasks have not established a deployed evaluation. The
+  Its 4,413 usable tasks have only a completed historical smoke; the current
+  production-shaped run is `glm-perf-3`. The
   official dataset repository revision is
   `e3f0ec777c02b734ad1a7d246cf06a709dc3e6e2`. Budget fix `92f06f4c` passed
   five actual-image CPU tests. The owner-approved
   `/data/glm52-rl/runs/general-agent-check/budget-probe` repair is complete
   with owner `1000:1000` and mode `755`.
-- A real `game_balance_t4` smoke used two rollouts and finished at 11:01:56 UTC.
+- The historical `game_balance_t4` smoke used two rollouts and finished at 11:01:56 UTC.
   Wall time was 174.521595 seconds; generation times were 173.79682 and
   174.38272 seconds. Rewards were 0 and 1, with no errors. Both used 16,384
   output tokens and 4/5 turns, and both stopped at
   `max_total_completion_tokens_reached`; they were truncated by the budget,
-  not proven to finish naturally. No production run was started.
+  not proven to finish naturally. No production run was started during that
+  historical smoke.
 
 ## Current inference and parity constraints
 
-- H200 inference remains MTP 1 with EP8, FULL CUDA graph capture at 256
-  scheduled tokens, and up to 128 requests. Context is 32K and the output
-  limit is 16K. The MTP and reload measurements are component checks only;
-  they are not full rollout-throughput approval. See `docs/PERFORMANCE.md`.
+- H200 inference is MTP 1 with TP8/EP8, FULL_AND_PIECEWISE CUDA graph capture
+  at 256 scheduled tokens, and up to 128 requests. Context is 32K and the
+  output limit is 16K. The MTP and reload measurements are component checks
+  only; they are not full rollout-throughput approval. See
+  `docs/PERFORMANCE.md`.
 - Both H200 engines are ready after A completed 68 FULL and 68 PIECEWISE graph
   captures. Initialization took 294.10 seconds; final API checks were HTTP 200
   (A 613 ms, B 112 ms). The image digests differ, so full image-parity
-  qualification is still open. Old step-0 caches are preserved, and new-run
-  rebind is not live-qualified.
+  qualification is still open. The current run reused the exact cached step-0
+  adapter; positive update delivery and parity remain unmeasured.
 - Compare parity at equal selected-token counts and with the same activation
   allocation. Existing direct parity is diagnostic; no trained nonzero-adapter
   parity result is established. See `docs/PERFORMANCE.md`.
 
 ## Remaining checks
 
-1. Run the full general-agent batch only after the owner-approved smoke result
-   is accepted. Full-batch speed, a 20-step production run, rollout, judging,
-   save, and trained-adapter qualification remain unverified.
-2. Keep the 600-second trainer and 720-second rollout limits. Stop and trace a
-   run that exceeds them; busy GPUs do not prove progress.
-3. Before a production retry, verify configured source files, recursive
+1. Continue the current `glm-perf-3` run under the existing 600-second compute
+   limit. Its first collection already failed the separate 720-second batch
+   speed target; that target is not a new automatic stop command. Full-batch
+   speed, 200-step stability, rollout, judging, save, and trained-adapter
+   qualification remain unverified. Do not claim all rollouts are healthy.
+2. Before a production retry, verify configured source files, recursive
    imports, launcher mounts, patch targets, remote modes, broadcast ownership,
    and adapter source SHA as one set.
-4. Deploy and qualify trained-adapter resume only after broadcast history and
+3. Deploy and qualify trained-adapter resume only after broadcast history and
    metadata handling are repaired. Preserve nonzero B through reset hooks.
-5. Before a fresh production run, deploy worker `3759` and restart both H200
-   workers. Their matching READY step-0 caches are valid, but the old worker
-   code remains deployed; this restart avoids a WAN retransfer.
+4. Keep the deployed worker `3759` and exact cached step-0 adapter. Positive
+   update transfer and parity still require a measured run.
 
 No Decensor environment or reward edits were made for these measurements.

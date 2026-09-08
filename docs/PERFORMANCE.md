@@ -13,12 +13,30 @@ weight transfer, H200 activation, judging, and save time separate.
 - Rollout reported time limit: 720 seconds.
 - Production settings remain batch 1,024, group 16, context 32,768, and output
   limit 16,384.
-- No full 20-step or 50-step neutral production run has passed.
+- No full 20-step, 50-step, or 200-step neutral production run has passed.
 
 Both H200 engines are ready after A completed 68 FULL and 68 PIECEWISE graph
 captures. Initialization took 294.10 s; final API checks were HTTP 200 (A
 613 ms, B 112 ms). The image digests differ, so full image-parity qualification
-and a new-run rebind remain unverified.
+remains unverified. The current run reused the exact cached step-0 adapter;
+positive update delivery and parity remain unmeasured.
+
+## Current glm-perf-3 production-shaped run
+
+The `configs/general-agent/{trainer,orchestrator}.toml` profiles use
+`max_steps = 200` from commit `e3862bc`. Commit `2aec4fb` fixed the deployment
+list, which had omitted `configs/operations.toml`. The run started at about
+12:46 UTC with eight trainers and two H200 engines. At 13:05 UTC it had
+0 optimizer steps and 144/1,024 accepted rollouts after about 19 minutes.
+A separate snapshot had 331 completed traces
+with 187 reward-1 and 144 reward-0 rows, 157 task timeouts, 19 output-limit
+stops, 152 no-tools-final stops, and 3 context-limit stops. There were no
+model/tool errors; mean rollout time was 508.15 s. The first collection
+already exceeds 720 s as a batch-speed acceptance target. The environment
+budget cancels the awaited policy request locally and scores the resulting
+task state. Server-side cancellation after disconnect is not yet verified.
+This is not a full-batch timing or stability pass.
+See the [SwanLab run](https://swanlab.cn/@MangyMangaur/glm-runs/runs/0czdctwl).
 
 ## Current controlled sparse-stability run
 
@@ -29,9 +47,9 @@ was 177.66-179.92 s (median 178.39 s). Peak reserved memory stayed at
 and OOMKilled=false by 04:38:09. This passes the controlled LR0 memory
 check, not production training or learned-policy stability.
 
-Current H200 inventory is FULL CUDA graph capture at 256 scheduled tokens,
-with up to 128 requests under MTP 1. The capture-token count and request count
-are separate limits.
+Current H200 inventory is FULL_AND_PIECEWISE CUDA graph capture at 256
+scheduled tokens, with up to 128 requests under MTP 1, TP8, and EP8. The
+capture-token count and request count are separate limits.
 
 The workload is 524,288 fresh synthetic tokens (16 x 32,768), FP8 base,
 BF16 rank-32 LoRA on attention, shared-expert, and routed-expert linear
@@ -90,7 +108,8 @@ not a production bug. Reducing profiler forward calls from 100 to 30 changed
 
 ## Historical neutral production-shaped runs
 
-Latest stopped attempt (Sep 8): **0 optimizer steps**. After the graph-cap
+Historical stopped attempt before `glm-perf-3` (Sep 8): **0 optimizer steps**.
+After the graph-cap
 repair, the first usable rollout batch took 3,731.08s (62m11s), with
 1,024/2,336 accepted rollouts (43.8%), 0% recorded rollout errors, and
 9,018,062 accepted input plus output tokens. It produced 277 packed
@@ -110,21 +129,20 @@ measurement exists. No OOM was observed; sampled peak memory was about
 A ten-second sample across trainer NICs measured 0.63-1.25 Gbit/s per
 direction on 10-Gbit/s links. It does not establish network saturation.
 The accepted batch contained 17.2 times the tokens of the 524,288-token,
-three-minute controlled test. This attempt fails the speed requirements and
-does not establish full-step or 20-step stability. All trainers are now
-stopped cleanly; there is no active watch. Rollout, adapter delivery, judging,
-and save measurements for a new production run remain unverified.
+three-minute controlled test. This historical attempt failed the speed
+requirements and did not establish full-step or 20-step stability. Its rollout,
+adapter delivery, judging, and save measurements remain unverified.
 
 ## General-agent budget smoke
 
 The owner-approved budget-probe directory is now `1000:1000` with mode `755`.
-The real `game_balance_t4` smoke used two rollouts and finished at 11:01:56
+The historical `game_balance_t4` smoke used two rollouts and finished at 11:01:56
 UTC in 174.521595 s. Generation times were 173.79682 s and 174.38272 s;
 rewards were 0 and 1, with no errors. The rollouts used 16,384 output tokens
 and 4/5 turns, and both stopped at `max_total_completion_tokens_reached`.
 They were truncated by the budget, not shown to finish naturally. No production
-run started. Full-batch speed, 20-step training, and adapter qualification
-remain unverified.
+run started during that smoke. Full-batch speed, 20-step training, and adapter
+qualification remain unverified.
 
 Earlier attempt: 0 optimizer steps. Restart began 23:45:14 and
 returned 23:50:58 UTC. Initial saved-adapter staging used both ready caches
@@ -313,9 +331,10 @@ documentation](https://docs.vllm.ai/en/latest/features/speculative_decoding/mtp/
 ## Adapter transfer and transport
 
 Saved encoded artifact size for trained adapter steps 3, 4, and 5 was 3.20,
-2.51, and 2.23 GB. This is not a WAN transfer measurement. Both H200 hosts
-still have only cached `glm-perf-1` step 0, so full positive-step delivery is
-pending.
+2.51, and 2.23 GB. This is not a WAN transfer measurement. The current run
+reused the exact cached step-0 adapter: A took 12.911 s, B 9.474 s, and
+orchestration took 22.6 s with no WAN fallback. The adapter size was
+30,767,549,784 bytes. Positive-step delivery and parity remain unmeasured.
 
 Stronger zstd at level 9 on 16 chunks (raw 266,571,096 bytes) saved 2.27% and
 added 29.6% CPU encode time; it was rejected. A 64 MiB workspace path
