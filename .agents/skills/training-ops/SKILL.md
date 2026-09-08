@@ -25,6 +25,9 @@ Read `configs/operations.toml`. It is the only inventory for hosts, ports,
 paths, containers, profiles, trend settings, and performance requirements.
 Do not add a host or replica count to Python code.
 
+Read `TRAINING_EXPECTATIONS.md` before a qualification or production run.
+Use `python3 -m training_ops --help` for the installed command surface.
+
 `configs/current` contains the active run profile. Optional trainer-only
 profiles must be registered in `configs/operations.toml`.
 
@@ -41,6 +44,7 @@ do not create a separate scripts directory.
 training_ops.status()
 training_ops.reward()
 training_ops.steps(limit=20)
+training_ops.acceptance()
 training_ops.logs("trainer")
 training_ops.logs("orchestrator")
 training_ops.engines()
@@ -51,6 +55,10 @@ training_ops.mounted_files()
 
 Use `reward().verdict` as written. Do not claim a change when the verdict is
 `inside the noise`.
+
+Keep trainer, rollout, waiting, judging, adapter preparation, transfer,
+loading, and full-weight transfer measurements separate. A timed-out network
+test failed; report its bytes, elapsed time, and errors.
 
 `watch()` runs in the foreground. Do not run it in a thread or background
 process.
@@ -67,6 +75,10 @@ training_ops.stop()
 
 `start`, `qualify`, and `stop` change live services. Get the required owner
 decision first. `repair` is allowed only for an error that `status()` shows.
+
+Do not use a full rollout batch to debug trainer execution or change a
+measurement limit to make a run pass. A cached adapter does not qualify a new
+adapter update, transfer, load, or parity path.
 
 `deploy()` selects destinations from the operations config and launcher mount
 lists. Pass `nodes=[...]` when the destination cannot be derived. It refuses

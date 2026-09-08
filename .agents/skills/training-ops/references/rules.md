@@ -7,10 +7,16 @@
 - Keep secrets in `/data/trinity/training.env`.
 - Do not use QLoRA or INT4 model weights.
 - Do not use a cached rollout batch.
+- Do not use a full rollout batch to debug trainer execution.
+- Do not change a measurement limit to make a failed run pass.
 - Run monitoring in the foreground.
 - Do not leave the run without a progress check for more than ten minutes.
 - Report trainer compute, rollout collection, adapter transfer, and waiting as
   separate times.
 - Report the reward verdict from `training_ops.reward()`.
 - Measure before giving a cause.
+- Treat a network timeout as a failed test and report bytes, elapsed time, and
+  errors.
+- Warn before copying the 755,632,050,320-byte GLM model; keep that time
+  separate from adapter and rollout measurements.
 - Starting, stopping, or changing an experiment needs an owner decision.
