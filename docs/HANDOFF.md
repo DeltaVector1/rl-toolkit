@@ -8,8 +8,11 @@ port, container, and profile value.
 - Both H200s restarted at 00:08:42 UTC with `4aa1772`; trainer restart
   invoked at 00:09:13. Root owns live operation and foreground monitoring.
   This remains neutral `glm-perf-2`, fresh rollouts, and a 20-step target.
-  There are still 0 completed optimizer steps. New graph use and speed are
-  not yet measured.
+  At 00:21 UTC there were still 0 optimizer steps and 63 buffered rollouts.
+  Both engines report FULL graphs at 256 scheduled tokens and 128 requests.
+  At 00:19:37, A generated 2,553.0 tokens/s and B 2,679.7 tokens/s (5,232.7
+  combined). This is an early decode sample, not a complete rollout average.
+  Fresh generation began about 00:18:32; initial cached staging took 3.0s.
 - The 23:45 restart loaded the saved adapter correctly and reused both H200
   caches in 3.3 seconds. It was stopped at 00:04:56 after about 13 minutes
   of generation, 0 complete groups, and 4 buffered rollouts. No compute step

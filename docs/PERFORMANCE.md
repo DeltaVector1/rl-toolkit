@@ -28,9 +28,14 @@ Fresh generation began about 23:51:25. The run stopped at 00:04:56 with
 The graph cap of 128 tokens did not cover a full 128-request MTP1 decode
 (256 tokens). Commit `4aa1772` raises the derived cap and enables graph
 metrics. Both engines restarted at 00:08:42; trainer restart began 00:09:13.
-Speed after the change is not yet measured. The neutral turn/length mix also
-changed in `ad21e56`; compare tokens/s and equal-token compute measurements,
-not raw step time alone, across that workload change.
+At 00:19:37, A generated 2,553.0 tokens/s and B 2,679.7 tokens/s, 5,232.7
+combined. Both logged FULL graph execution for 256 tokens at 128 active
+requests. Initial cached staging took 3.0s; generation began about 00:18:32.
+At 00:21 there were 63 buffered rollouts, no complete groups, and 0 optimizer
+steps. These are early decode samples, not complete-rollout averages.
+The neutral turn/length mix also changed in `ad21e56`; compare tokens/s and
+equal-token compute measurements, not raw step time alone, across that
+workload change.
 
 Earlier attempt: 0 optimizer steps. Both H200s loaded the correct step-0
 adapter (B at 17:26:15 UTC, A at 17:26:20). A received all bytes in
