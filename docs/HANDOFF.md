@@ -69,9 +69,9 @@ port, container, and profile value.
   training-ops. The step-0 initial adapter path is not proof that trained
   adapter resume is ready.
 - Adapter cache `3759` is committed locally but not deployed. H200 engines
-  still run old code; both READY old step-0 caches remain available. Positive
-  step adapter delivery is not measured. The H200 old-worker cache fix is also
-  not deployed. New production rollout and adapter delivery remain unverified.
+  still run old code; both READY old step-0 caches match. Positive-step adapter
+  delivery is not measured. Deploy the worker and restart both H200 workers
+  before a fresh production run to avoid a WAN retransfer.
 - GPU8-rank exact BF16 transport output/gradcheck passed in `8457f51` for
   balanced, uneven, and zero-peer cases. The ownership test bug was fixed; it
   was not a production transport fault. Reducing profiler forward calls from
@@ -100,11 +100,15 @@ port, container, and profile value.
   Its 4,413 usable tasks have not established a deployed evaluation. The
   official dataset repository revision is
   `e3f0ec777c02b734ad1a7d246cf06a709dc3e6e2`. Budget fix `92f06f4c` passed
-  five actual-image CPU tests, but the real probe remains blocked by an
-  output-directory permission error.
-- The only remaining general-agent blocker is owner approval for the
-  `/data/glm52-rl/runs/general-agent-check/budget-probe` ownership repair after
-  `PermissionError`. Do not bypass that approval.
+  five actual-image CPU tests. The owner-approved
+  `/data/glm52-rl/runs/general-agent-check/budget-probe` repair is complete
+  with owner `1000:1000` and mode `755`.
+- A real `game_balance_t4` smoke used two rollouts and finished at 11:01:56 UTC.
+  Wall time was 174.521595 seconds; generation times were 173.79682 and
+  174.38272 seconds. Rewards were 0 and 1, with no errors. Both used 16,384
+  output tokens and 4/5 turns, and both stopped at
+  `max_total_completion_tokens_reached`; they were truncated by the budget,
+  not proven to finish naturally. No production run was started.
 
 ## Current inference and parity constraints
 
@@ -118,8 +122,9 @@ port, container, and profile value.
 
 ## Remaining checks
 
-1. Get owner approval for the general-agent budget-probe ownership repair.
-   Rollout, adapter, judging, and save times still need a real run.
+1. Run the full general-agent batch only after the owner-approved smoke result
+   is accepted. Full-batch speed, a 20-step production run, rollout, judging,
+   save, and trained-adapter qualification remain unverified.
 2. Keep the 600-second trainer and 720-second rollout limits. Stop and trace a
    run that exceeds them; busy GPUs do not prove progress.
 3. Before a production retry, verify configured source files, recursive
@@ -127,7 +132,8 @@ port, container, and profile value.
    and adapter source SHA as one set.
 4. Deploy and qualify trained-adapter resume only after broadcast history and
    metadata handling are repaired. Preserve nonzero B through reset hooks.
-5. Resolve the general-agent output-directory permission issue before claiming
-   a real probe. Do not change neutral, decensor, or reward settings for it.
+5. Before a fresh production run, deploy worker `3759` and restart both H200
+   workers. Their matching READY step-0 caches are valid, but the old worker
+   code remains deployed; this restart avoids a WAN retransfer.
 
 No Decensor environment or reward edits were made for these measurements.

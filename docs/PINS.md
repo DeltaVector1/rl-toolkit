@@ -57,9 +57,14 @@ not deployed.
 - Package version: `0.1.4`
 - Official dataset repository revision: `e3f0ec777c02b734ad1a7d246cf06a709dc3e6e2`
 - The draft rollout limit is 720 seconds. Completion-budget change `92f06f4c`
-  passed five actual-image CPU tests; the real probe remains blocked by
-  `PermissionError` on `/data/glm52-rl/runs/general-agent-check/budget-probe`.
-  Owner approval is required for that ownership repair; do not bypass it.
+  passed five actual-image CPU tests. The owner-approved
+  `/data/glm52-rl/runs/general-agent-check/budget-probe` repair is complete
+  with owner `1000:1000` and mode `755`.
+- A two-rollout `game_balance_t4` smoke finished at 11:01:56 UTC in
+  174.521595 seconds. Generation took 173.79682 and 174.38272 seconds; rewards
+  were 0 and 1, errors were null, and the 16,384-token outputs stopped at the
+  cumulative budget after 4/5 turns. This is not a natural-completion or
+  production result.
 
 ## Qualification evidence
 
@@ -75,4 +80,6 @@ not deployed.
 - These are controlled checks. The 524,288-token synthetic run is not a
   three-minute production proof; the stopped real batch had 9,018,062 tokens.
   All trainers are stopped cleanly. Production rollout and adapter delivery
-  remain unverified. The H200 old-worker cache fix is not deployed.
+  remain unverified. Both H200 READY step-0 caches match. Worker `3759` is not
+  deployed; deploy it and restart both workers before a fresh production run
+  to avoid a WAN retransfer.

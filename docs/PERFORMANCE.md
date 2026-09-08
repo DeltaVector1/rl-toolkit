@@ -52,7 +52,7 @@ adapter at LR `8e-6`. All eight containers exited with code 0 and no OOM flag.
 
 | Step | Reported forward/backward | Total | Peak reserved | A gradient norm | B weight norm |
 |---:|---:|---:|---:|---:|---:|
-| 1 | not retained | not retained | not retained | 0 | 0.0922512 |
+| 1 | 251.89272 s | 252.58639 s | 42.2168 GiB | 0 | 0.0922512 |
 | 2 | 177.89248 s | 178.58255 s | 42.6543 GiB | 0.0000475536 | 0.193373 |
 
 The B weights started at zero. The check proves updates and a nonzero A
@@ -100,6 +100,17 @@ three-minute controlled test. This attempt fails the speed requirements and
 does not establish full-step or 20-step stability. All trainers are now
 stopped cleanly; there is no active watch. Rollout, adapter delivery, judging,
 and save measurements for a new production run remain unverified.
+
+## General-agent budget smoke
+
+The owner-approved budget-probe directory is now `1000:1000` with mode `755`.
+The real `game_balance_t4` smoke used two rollouts and finished at 11:01:56
+UTC in 174.521595 s. Generation times were 173.79682 s and 174.38272 s;
+rewards were 0 and 1, with no errors. The rollouts used 16,384 output tokens
+and 4/5 turns, and both stopped at `max_total_completion_tokens_reached`.
+They were truncated by the budget, not shown to finish naturally. No production
+run started. Full-batch speed, 20-step training, and adapter qualification
+remain unverified.
 
 Earlier attempt: 0 optimizer steps. Restart began 23:45:14 and
 returned 23:50:58 UTC. Initial saved-adapter staging used both ready caches
