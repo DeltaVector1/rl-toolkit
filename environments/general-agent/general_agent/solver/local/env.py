@@ -56,6 +56,39 @@ class ToolComposableEnv(vf.ToolEnv):
         await super().setup_state(state)
         await self.taskset.setup(state)
 
+    async def get_model_response(
+        self,
+        state: vf.State,
+        prompt: vf.Messages,
+        client=None,
+        model: str | None = None,
+        tool_defs=None,
+        sampling_args=None,
+    ):
+        """Keep each model request within the cumulative completion budget."""
+        effective_args = dict(sampling_args or state["sampling_args"] or {})
+        limit = self.max_total_completion_tokens
+        usage = self.get_state_usage(state)
+        if limit > 0:
+            used = 0 if usage is None else int(usage.get("output_tokens", 0))
+            remaining = limit - used
+            if remaining > 0:
+                keys = [key for key in ("max_tokens", "max_completion_tokens") if key in effective_args]
+                if not keys:
+                    effective_args["max_tokens"] = remaining
+                else:
+                    for key in keys:
+                        value = effective_args[key]
+                        effective_args[key] = remaining if value is None else min(int(value), remaining)
+        return await super().get_model_response(
+            state,
+            prompt,
+            client=client,
+            model=model,
+            tool_defs=tool_defs,
+            sampling_args=effective_args,
+        )
+
     async def env_response(self, messages: vf.Messages, state: vf.State, **kwargs) -> vf.Messages:
         """Dispatch task-specific tool calls.
 
