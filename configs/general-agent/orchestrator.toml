@@ -1,5 +1,5 @@
 output_dir = "/data/glm52-rl/runs/glm-perf-3/run_glm-perf-3"
-max_steps = 20
+max_steps = 200
 seq_len = 32768
 batch_size = 1024
 group_size = 16
@@ -14,7 +14,7 @@ level = "info"
 project = "glm-runs"
 name = "orchestrator-glm-perf-3"
 group = "glm-runs"
-tags = ["glm-perf-3", "glm-5.2", "general-agent", "grpo", "lora-r32", "20-step-check"]
+tags = ["glm-perf-3", "glm-5.2", "general-agent", "grpo", "lora-r32", "200-step-run"]
 
 [file_monitor]
 filename = "rollout-metrics.jsonl"

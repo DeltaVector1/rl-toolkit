@@ -1,5 +1,5 @@
 output_dir = "/data/glm52-rl/runs/glm-perf-3"
-max_steps = 20
+max_steps = 200
 dist_timeout_seconds = 5400
 enable_router_replay = false
 
@@ -21,7 +21,7 @@ ranks_filter = [0]
 project = "glm-runs"
 name = "trainer-glm-perf-3"
 group = "glm-runs"
-tags = ["glm-perf-3", "glm-5.2", "general-agent", "grpo", "lora-r32", "20-step-check"]
+tags = ["glm-perf-3", "glm-5.2", "general-agent", "grpo", "lora-r32", "200-step-run"]
 
 [file_monitor]
 filename = "run_glm-perf-3/trainer-metrics.jsonl"
