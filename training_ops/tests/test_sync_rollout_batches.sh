@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)
-sync_script="$root/.agents/skills/training-ops/runtime/h200/sync_rollout_batches.sh"
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+sync_script="$root/training_ops/runtime/h200/sync_rollout_batches.sh"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 

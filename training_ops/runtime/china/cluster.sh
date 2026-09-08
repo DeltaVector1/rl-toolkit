@@ -161,7 +161,7 @@ PY
           sync_log="$storage/microbatch-sync-$RUN.log"
           nohup setsid env \
             run_dir="$trainer_output" nodes="${sync_nodes[*]}" \
-            "$deployment/.agents/skills/training-ops/runtime/china/sync_microbatches.sh" \
+            "$deployment/training_ops/runtime/china/sync_microbatches.sh" \
             >>"$sync_log" 2>&1 </dev/null &
         fi
       fi
@@ -341,7 +341,7 @@ PY
       --network host \
       "${adapter_mounts[@]}" \
       "${adapter_dependency_mounts[@]}" \
-      -v "$deployment/.agents/skills/training-ops/runtime/china/adapter_server.py":/app/adapter_server.py:ro \
+      -v "$deployment/training_ops/runtime/china/adapter_server.py":/app/adapter_server.py:ro \
       --entrypoint /app/.venv/bin/python "$image" \
       /app/adapter_server.py --port "$adapter_port" --directory /broadcast \
       "${adapter_upgrade_args[@]}"

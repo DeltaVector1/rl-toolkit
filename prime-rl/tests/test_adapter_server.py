@@ -11,7 +11,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SERVER_PATH = ROOT.parent / ".agents/skills/training-ops/runtime/china/adapter_server.py"
+SERVER_PATH = ROOT.parent / "training_ops/runtime/china/adapter_server.py"
 
 
 def load_server():

@@ -16,7 +16,7 @@ STARTUP_GRACE=${STARTUP_GRACE:-0}
 BUSY_STALL_FAILS_BEFORE_RESTART=${BUSY_STALL_FAILS_BEFORE_RESTART:-5}
 # Treat a resident engine as busy even when it reports zero requests.
 RESIDENT_ENGINE_MIN_MIB=${RESIDENT_ENGINE_MIN_MIB:-65536}
-START=${START:-/data/glm52-rl/deployment/.agents/skills/training-ops/runtime/h200/start_inference.sh}
+START=${START:-/data/glm52-rl/deployment/training_ops/runtime/h200/start_inference.sh}
 ENGINE_CONTAINER=${ENGINE_CONTAINER:-glm52-decensor-h200}
 RELOAD_TRIES=${RELOAD_TRIES:-40}
 RELOAD_WAIT=${RELOAD_WAIT:-30}

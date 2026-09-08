@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)
-cluster="$root/.agents/skills/training-ops/runtime/china/cluster.sh"
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+cluster="$root/training_ops/runtime/china/cluster.sh"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 

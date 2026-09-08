@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import training_ops
 
@@ -51,7 +51,7 @@ class AdapterUpdateTest(unittest.TestCase):
         start = launcher.index("<<'PY'\n") + len("<<'PY'\n")
         end = launcher.index("\nPY\n)", start)
         reader = launcher[start:end]
-        operations_path = Path(__file__).resolve().parents[4] / "configs/operations.toml"
+        operations_path = Path(__file__).resolve().parents[2] / "configs/operations.toml"
         operations = operations_path.read_text(encoding="utf-8")
 
         def read_settings(host, config_text=operations):
@@ -540,7 +540,7 @@ class AdapterUpdateTest(unittest.TestCase):
         resume_script = ssh_scripts[-1]
         self.assertIn('sudo docker rm -f "$container"', resume_script)
         self.assertIn(
-            "bash /data/glm52-rl/deployment/.agents/skills/training-ops/runtime/h200/start_orchestrator.sh",
+            "bash /data/glm52-rl/deployment/training_ops/runtime/h200/start_orchestrator.sh",
             resume_script,
         )
         self.assertIn("RUN=glm-1", resume_script)
@@ -576,7 +576,7 @@ class AdapterUpdateTest(unittest.TestCase):
         )
         self.assertIn(
             mock.call(
-                ".agents/skills/training-ops/runtime/h200/start_orchestrator.sh",
+                "training_ops/runtime/h200/start_orchestrator.sh",
                 nodes=["h200a"],
             ),
             deploy.call_args_list,

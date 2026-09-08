@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)
-script="$root/.agents/skills/training-ops/runtime/h200/start_orchestrator.sh"
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+script="$root/training_ops/runtime/h200/start_orchestrator.sh"
 relay_block=$(sed -n '/sudo docker run -d --name/,/--canonical-source-url/p' "$script")
 [[ "$relay_block" == *"--user 0:0"* && "$relay_block" == *'-v "$relay_cache_dir":"$relay_cache_dir":ro'* ]] || {
   echo "relay must run as root with a read-only adapter cache" >&2

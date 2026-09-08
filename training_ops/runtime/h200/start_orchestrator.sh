@@ -254,7 +254,7 @@ if [ "$peer_enabled" = 1 ] && [ "$relay_is_glm" != 1 ]; then
 fi
 
 if [ "$tunnels_only" = 0 ] && grep -q 'refusals-classifier-eval-v1' "$config_file"; then
-  bash "$deployment/.agents/skills/training-ops/runtime/h200/start_refusals_classifier.sh"
+  bash "$deployment/training_ops/runtime/h200/start_refusals_classifier.sh"
 fi
 
 tunnel() { # local_port  target_host:port  ssh_target  [compress]
@@ -769,7 +769,7 @@ pkill -f '[t]rainer_failure_watchdog.sh' 2>/dev/null || true
 nohup setsid env RUN="$RUN" RUN_NAME="$RUN_NAME" \
   TRAINER_ADDRESSES="$TRAINER_ADDRESSES" \
   TRAINER_CT="$TRAINER_CT" ORCH_CT="$ORCH_CT" \
-  bash "$deployment/.agents/skills/training-ops/runtime/h200/trainer_failure_watchdog.sh" \
+  bash "$deployment/training_ops/runtime/h200/trainer_failure_watchdog.sh" \
   >>"/data/glm52-rl/trainer-failure-watchdog-$RUN.log" 2>&1 </dev/null &
 trainer_watchdog_pid=$!
 sleep 1
@@ -825,7 +825,7 @@ if [ "$transport" = filesystem ]; then
   fi
   nohup setsid env SOURCE_RUN_DIR="/data/glm52-rl/runs/$RUN/$RUN_NAME" \
     DEST_HOST="$trainer_ssh_target" \
-    "$deployment/.agents/skills/training-ops/runtime/h200/sync_rollout_batches.sh" \
+    "$deployment/training_ops/runtime/h200/sync_rollout_batches.sh" \
     >>"/data/glm52-rl/batch-sync-$RUN.log" 2>&1 </dev/null &
   publisher_pid=$!
   sleep 1

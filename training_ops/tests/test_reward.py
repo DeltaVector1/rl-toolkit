@@ -8,7 +8,7 @@ from io import StringIO
 from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import training_ops
 
@@ -284,7 +284,7 @@ class ParityReaderTest(unittest.TestCase):
     def test_parity_uses_configured_full_run_records(self):
         calls = []
         profile = training_ops._profile("testing-perf")
-        trainer_path = Path(__file__).resolve().parents[4] / profile["trainer"]
+        trainer_path = Path(__file__).resolve().parents[2] / profile["trainer"]
         with trainer_path.open("rb") as stream:
             output_dir = training_ops.tomllib.load(stream)["output_dir"]
         run = Path(output_dir).name

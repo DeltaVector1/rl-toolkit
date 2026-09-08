@@ -26,3 +26,4 @@ __pycache__/
 .work/
 .ipynb_checkpoints/
 .venv/
+*.egg-info/

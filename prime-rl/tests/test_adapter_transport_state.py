@@ -1324,12 +1324,12 @@ class AdapterTransportStateTest(unittest.TestCase):
             edge_config = tomllib.load(stream)
         source_url = edge_config["weight_broadcast"]["source_url"]
         self.assertEqual(urlsplit(source_url).port, ports["lora_source_first"])
-        runtime = REPOSITORY / ".agents/skills/training-ops/runtime/h200"
+        runtime = REPOSITORY / "training_ops/runtime/h200"
         glm_source = (runtime / "start_inference.sh").read_text(encoding="utf-8")
         self.assertIn("PRIME_LORA_DOWNLOAD_STREAMS=96", glm_source)
         self.assertIn('PRIME_LORA_SOURCE_PORTS="$lora_source_port_list"', glm_source)
         orchestrator_source = (
-            REPOSITORY / ".agents/skills/training-ops/runtime/h200/start_orchestrator.sh"
+            REPOSITORY / "training_ops/runtime/h200/start_orchestrator.sh"
         ).read_text(encoding="utf-8")
         for legacy_port in ("18101", "18111", "18112", "18113", "18114"):
             self.assertNotIn(legacy_port, orchestrator_source)

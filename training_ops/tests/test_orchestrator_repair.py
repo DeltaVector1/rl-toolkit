@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import training_ops
 
@@ -49,7 +49,7 @@ class OrchestratorRepairTest(unittest.TestCase):
 
         self.assertEqual(result, "adapter tunnel reconciliation complete")
         deploy.assert_called_once_with(
-            ".agents/skills/training-ops/runtime/h200/start_orchestrator.sh",
+            "training_ops/runtime/h200/start_orchestrator.sh",
             nodes=[training_ops.orchestrator_host],
         )
         self.assertEqual(len(ssh_calls), 1)
@@ -71,8 +71,8 @@ class OrchestratorRepairTest(unittest.TestCase):
 
     def test_tunnels_only_exits_before_service_start(self):
         launcher = (
-            Path(__file__).resolve().parents[4]
-            / ".agents/skills/training-ops/runtime/h200/start_orchestrator.sh"
+            Path(__file__).resolve().parents[2]
+            / "training_ops/runtime/h200/start_orchestrator.sh"
         )
         source = launcher.read_text(encoding="utf-8")
         mode_start = source.index("if [ \"$tunnels_only\" = 1 ]; then")
@@ -83,8 +83,8 @@ class OrchestratorRepairTest(unittest.TestCase):
 
     def test_orchestrator_prepares_broadcast_steps_for_appuser(self):
         launcher = (
-            Path(__file__).resolve().parents[4]
-            / ".agents/skills/training-ops/runtime/h200/start_orchestrator.sh"
+            Path(__file__).resolve().parents[2]
+            / "training_ops/runtime/h200/start_orchestrator.sh"
         )
         source = launcher.read_text(encoding="utf-8")
         start = source.index('broadcast_dir="/data/glm52-rl/runs/$RUN/$RUN_NAME/broadcasts"')
@@ -104,16 +104,16 @@ class OrchestratorRepairTest(unittest.TestCase):
 
     def test_watch_idle_message_requests_transfer_check(self):
         source = (
-            Path(__file__).resolve().parents[1] / "src/training_ops/__init__.py"
+            Path(__file__).resolve().parents[1] / "__init__.py"
         ).read_text(encoding="utf-8")
         self.assertIn("check adapter transfer progress and logs", source)
         self.assertNotIn("Read references/errors.md and repair before waiting further", source)
 
     def test_null_harness_bridge_disables_hidden_sdk_deadline_and_retry(self):
-        root = Path(__file__).resolve().parents[4]
+        root = Path(__file__).resolve().parents[2]
         harness_path = root / "prime-rl/deps/verifiers/verifiers/v1/harnesses/null/harness.py"
         launcher = (
-            root / ".agents/skills/training-ops/runtime/h200/start_orchestrator.sh"
+            root / "training_ops/runtime/h200/start_orchestrator.sh"
         ).read_text(encoding="utf-8")
         event = asyncio.Event()
         client = SimpleNamespace(close=mock.AsyncMock())
@@ -171,7 +171,7 @@ class OrchestratorRepairTest(unittest.TestCase):
         self.assertLess(launcher.index(harness_mount), entrypoint)
 
     def test_harness_timeout_retries_only_after_failed_policy_call(self):
-        root = Path(__file__).resolve().parents[4]
+        root = Path(__file__).resolve().parents[2]
         dispatcher_path = root / "prime-rl/src/prime_rl/orchestrator/dispatcher.py"
         check = _load_function(
             dispatcher_path, "_is_transient_policy_failure", {"Rollout": object}
@@ -332,7 +332,7 @@ class OrchestratorRepairTest(unittest.TestCase):
         self.assertIn("/liveness", ssh_scripts[1][0])
         self.assertIn("/staging_status", ssh_scripts[1][0])
         self.assertIn('sudo docker rm -f "$container"', ssh_scripts[-1][0])
-        self.assertIn("bash /data/glm52-rl/deployment/.agents/skills/training-ops/runtime/h200/start_orchestrator.sh", ssh_scripts[-1][0])
+        self.assertIn("bash /data/glm52-rl/deployment/training_ops/runtime/h200/start_orchestrator.sh", ssh_scripts[-1][0])
         self.assertNotIn("sudo docker start", ssh_scripts[-1][0])
         self.assertNotIn("sudo docker restart", ssh_scripts[-1][0])
         self.assertIn("RUN=glm-1", ssh_scripts[-1][0])
@@ -413,7 +413,7 @@ class OrchestratorRepairTest(unittest.TestCase):
         self.assertIn("TRAINER_CT=glm52-decensor-trainer", script)
         self.assertIn("ORCH_CT=glm52-decensor-orchestrator", script)
         self.assertIn(
-            "bash /data/glm52-rl/deployment/.agents/skills/training-ops/runtime/h200/start_orchestrator.sh",
+            "bash /data/glm52-rl/deployment/training_ops/runtime/h200/start_orchestrator.sh",
             script,
         )
         self.assertIn('sudo docker rm -f "$container"', script)

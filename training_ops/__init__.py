@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
-repo_root = Path(__file__).resolve().parents[5]
+repo_root = Path(__file__).resolve().parents[1]
 operations_path = repo_root / "configs" / "operations.toml"
 
 
@@ -60,7 +60,7 @@ judge_api_url = operations["judges"]["external"]["api_url"].rstrip("/")
 remote_repo = paths["remote_repository"]
 storage_root = paths["storage_root"]
 run_root = paths["runs"]
-runtime_root = f"{remote_repo}/.agents/skills/training-ops/runtime"
+runtime_root = f"{remote_repo}/training_ops/runtime"
 trainer_launcher = f"{runtime_root}/china/cluster.sh"
 orchestrator_launcher = f"{runtime_root}/h200/start_orchestrator.sh"
 trainer_container = containers["trainer"]
@@ -3718,8 +3718,8 @@ def _repair_adapter_server(force: bool = False) -> str:
         raise Refused("adapter-server repair requires zero active rollout requests")
 
     for path in (
-        ".agents/skills/training-ops/runtime/china/cluster.sh",
-        ".agents/skills/training-ops/runtime/china/adapter_server.py",
+        "training_ops/runtime/china/cluster.sh",
+        "training_ops/runtime/china/adapter_server.py",
         "prime-rl/src/prime_rl/utils/adapter_delta.py",
     ):
         if not deploy(path, [trainer_head]):
@@ -3828,8 +3828,8 @@ def _repair_adapter_update() -> str:
         ),
         ("prime-rl/src/prime_rl/utils/checkpoint_delta.py", inference_hosts),
         ("prime-rl/src/prime_rl/inference/relay.py", [orchestrator_host]),
-        (".agents/skills/training-ops/runtime/h200/start_orchestrator.sh", [orchestrator_host]),
-        (".agents/skills/training-ops/runtime/h200/sync_rollout_batches.sh", None),
+        ("training_ops/runtime/h200/start_orchestrator.sh", [orchestrator_host]),
+        ("training_ops/runtime/h200/sync_rollout_batches.sh", None),
     )
     for path, nodes in deployment_targets:
         deployed = deploy(path) if nodes is None else deploy(path, nodes=nodes)
@@ -4064,7 +4064,7 @@ def _repair_adapter_tunnels(profile_name: str | None = None) -> str:
     if not trainer_addresses:
         raise Refused("configured trainer addresses are empty")
     if not deploy(
-        ".agents/skills/training-ops/runtime/h200/start_orchestrator.sh",
+        "training_ops/runtime/h200/start_orchestrator.sh",
         nodes=[orchestrator_host],
     ):
         raise RuntimeError("adapter tunnel launcher deployment failed")
@@ -4294,7 +4294,7 @@ def _repair_engine_watchdog(host: str) -> str:
             }
         )
     watchdog_path = f"{runtime_root}/h200/engine_watchdog.sh"
-    if not deploy(".agents/skills/training-ops/runtime/h200/engine_watchdog.sh", [host]):
+    if not deploy("training_ops/runtime/h200/engine_watchdog.sh", [host]):
         raise RuntimeError(f"watchdog deployment failed on {host}")
     code, output = _ssh(
         host,
@@ -4359,9 +4359,9 @@ def mounted_files() -> list[str]:
     copy baked into the image.
     """
     scripts = (
-        repo_root / ".agents" / "skills" / "training-ops" / "runtime" / "china" / "cluster.sh",
-        repo_root / ".agents" / "skills" / "training-ops" / "runtime" / "h200" / "start_orchestrator.sh",
-        repo_root / ".agents" / "skills" / "training-ops" / "runtime" / "h200" / "start_inference.sh",
+        repo_root / "training_ops" / "runtime" / "china" / "cluster.sh",
+        repo_root / "training_ops" / "runtime" / "h200" / "start_orchestrator.sh",
+        repo_root / "training_ops" / "runtime" / "h200" / "start_inference.sh",
     )
     paths = sorted(set().union(*(_mounts_in(script) for script in scripts)))
     print("mounted source paths:")
@@ -4375,11 +4375,11 @@ def mounted_files() -> list[str]:
 def _mounted_on(path: str, host: str) -> bool:
     if host in inference_hosts:
         scripts = (
-            repo_root / ".agents" / "skills" / "training-ops" / "runtime" / "h200" / "start_orchestrator.sh",
-            repo_root / ".agents" / "skills" / "training-ops" / "runtime" / "h200" / "start_inference.sh",
+            repo_root / "training_ops" / "runtime" / "h200" / "start_orchestrator.sh",
+            repo_root / "training_ops" / "runtime" / "h200" / "start_inference.sh",
         )
     else:
-        scripts = (repo_root / ".agents" / "skills" / "training-ops" / "runtime" / "china" / "cluster.sh",)
+        scripts = (repo_root / "training_ops" / "runtime" / "china" / "cluster.sh",)
     return any(path in _mounts_in(script) for script in scripts)
 
 
@@ -4437,9 +4437,9 @@ def deploy(
             ]
         elif path.startswith(("environments/", "evals/")):
             nodes = [orchestrator_host]
-        elif path.startswith((".agents/skills/training-ops/runtime/h200/", "configs/runtime/")):
+        elif path.startswith(("training_ops/runtime/h200/", "configs/runtime/")):
             nodes = inference_hosts
-        elif path.startswith(".agents/skills/training-ops/runtime/china/"):
+        elif path.startswith("training_ops/runtime/china/"):
             nodes = trainer_hosts
         elif path.endswith("/trainer.toml"):
             nodes = trainer_hosts
@@ -5054,7 +5054,7 @@ def _trainer_dependency_inventory(
                 add(local.relative_to(repo_root).as_posix(), destinations)
 
     add_files(
-        ".agents/skills/training-ops/runtime/china",
+        "training_ops/runtime/china",
         nodes,
     )
     for path in mounted_files():
@@ -5098,11 +5098,11 @@ def _start_dependency_inventory(
 
     trainer_destinations = list(dict.fromkeys([*nodes, trainer_head]))
     add_files(
-        ".agents/skills/training-ops/runtime/china",
+        "training_ops/runtime/china",
         trainer_destinations,
     )
     add_files(
-        ".agents/skills/training-ops/runtime/h200",
+        "training_ops/runtime/h200",
         inference_hosts,
     )
 
@@ -6036,7 +6036,7 @@ def qualify(
         lambda host: _ssh(
             host,
             f"node_id={shlex.quote(host.removeprefix('n'))} {env} "
-            f"bash {repository_root}/.agents/skills/training-ops/runtime/china/cluster.sh "
+            f"bash {repository_root}/training_ops/runtime/china/cluster.sh "
             "trainer",
             300,
         ),
@@ -6183,7 +6183,7 @@ usage = f"""training-ops <action> [args]
   mounts                        list live-mounted source files
   stop                          stop the run but keep inference loaded
 
-Read {Path(__file__).resolve().parents[2] / 'SKILL.md'} first.
+Read {repo_root / '.agents/skills/training-ops/SKILL.md'} first.
 """
 
 
