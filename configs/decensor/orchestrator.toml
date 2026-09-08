@@ -56,10 +56,10 @@ pool = { type = "static", num_workers = 16 }
 env.taskset.id = "decensor-v1"
 env.taskset.num_examples = 2000
 env.taskset.difficulty = "easy"
-env.assistant.harness = { id = "null" }
-env.assistant.runtime = { type = "subprocess" }
-env.assistant.max_output_tokens = 16384
-env.assistant.timeout.rollout = 3600
+env.agent.harness = { id = "null" }
+env.agent.runtime = { type = "subprocess" }
+env.agent.max_output_tokens = 16384
+env.agent.timeout.rollout = 3600
 
 [train.env.sampling]
 max_completion_tokens = 16384
