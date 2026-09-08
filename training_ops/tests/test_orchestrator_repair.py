@@ -33,7 +33,7 @@ def _load_function(path, name, namespace=None):
 
 
 class OrchestratorRepairTest(unittest.TestCase):
-    def test_adapter_tunnels_uses_explicit_profile_and_tunnels_only(self):
+    def test_adapter_tunnels_uses_explicit_config_dir_and_tunnels_only(self):
         ssh_calls = []
 
         def fake_ssh(host, script, timeout=120):
@@ -45,7 +45,7 @@ class OrchestratorRepairTest(unittest.TestCase):
         ), mock.patch.object(
             training_ops, "_ssh_address", side_effect=lambda host: f"addr-{host}"
         ):
-            result = training_ops._repair_adapter_tunnels("testing-perf")
+            result = training_ops._repair_adapter_tunnels("configs/general-agent")
 
         self.assertEqual(result, "adapter tunnel reconciliation complete")
         deploy.assert_called_once_with(
@@ -56,16 +56,20 @@ class OrchestratorRepairTest(unittest.TestCase):
         host, script, timeout = ssh_calls[0]
         self.assertEqual(host, training_ops.orchestrator_host)
         self.assertEqual(timeout, 180)
-        self.assertIn("RUN=glm-perf-2 RUN_NAME=run_glm-perf-2", script)
+        self.assertIn("RUN=glm-perf-3 RUN_NAME=run_glm-perf-3", script)
         self.assertIn(
-            "ORCH_CONFIG=/data/glm52-rl/deployment/configs/testing-perf/orchestrator.toml",
+            "ORCH_CONFIG=/data/glm52-rl/deployment/configs/general-agent/orchestrator.toml",
             script,
         )
         self.assertIn("TRAINER_ADDRESSES='addr-n76 addr-n77 addr-n78 addr-n80 addr-n82 addr-n83 addr-n84 addr-n85'", script)
         self.assertTrue(script.endswith("--tunnels-only"))
 
     def test_adapter_tunnels_does_not_fall_back_from_trainer_only_run(self):
-        with mock.patch.object(training_ops, "current_run", return_value="glm52-native-small"):
+        with mock.patch.object(
+            training_ops,
+            "_config_for_run",
+            return_value={"trainer": "configs/general-agent/trainer.toml"},
+        ), mock.patch.object(training_ops, "current_run", return_value="glm-perf-3"):
             with self.assertRaisesRegex(training_ops.Refused, "no orchestrator config"):
                 training_ops._repair_adapter_tunnels()
 
@@ -261,10 +265,10 @@ class OrchestratorRepairTest(unittest.TestCase):
             training_ops, "_ssh_address", side_effect=lambda host: f"addr-{host}"
         ):
             script = training_ops._recreate_orchestrator_script(
-                "glm-1",
+                "glm-perf-3",
                 {
                     "kind": "glm52",
-                    "orchestrator": "configs/current/orchestrator.toml",
+                    "orchestrator": "configs/general-agent/orchestrator.toml",
                 },
                 was_running=False,
                 observed_state="absent",
@@ -288,7 +292,7 @@ class OrchestratorRepairTest(unittest.TestCase):
                 return 0, "absent\n"
             return 0, ""
 
-        with mock.patch.object(training_ops, "current_run", return_value="glm-1"), mock.patch.object(
+        with mock.patch.object(training_ops, "current_run", return_value="glm-perf-3"), mock.patch.object(
             training_ops, "status", return_value=before
         ), mock.patch.object(training_ops, "deploy", return_value=True), mock.patch.object(
             training_ops, "_ssh", side_effect=fake_ssh
@@ -318,7 +322,7 @@ class OrchestratorRepairTest(unittest.TestCase):
                 return 0, "started exact orchestrator container glm52-decensor-orchestrator\n"
             return 0, ""
 
-        with mock.patch.object(training_ops, "current_run", return_value="glm-1"), mock.patch.object(
+        with mock.patch.object(training_ops, "current_run", return_value="glm-perf-3"), mock.patch.object(
             training_ops, "status", return_value=before
         ), mock.patch.object(training_ops, "deploy", return_value=True) as deploy:
             with mock.patch.object(training_ops, "_ssh", side_effect=fake_ssh), mock.patch.object(
@@ -335,10 +339,10 @@ class OrchestratorRepairTest(unittest.TestCase):
         self.assertIn("bash /data/glm52-rl/deployment/training_ops/runtime/h200/start_orchestrator.sh", ssh_scripts[-1][0])
         self.assertNotIn("sudo docker start", ssh_scripts[-1][0])
         self.assertNotIn("sudo docker restart", ssh_scripts[-1][0])
-        self.assertIn("RUN=glm-1", ssh_scripts[-1][0])
-        self.assertIn("RUN_NAME=run_glm-1", ssh_scripts[-1][0])
+        self.assertIn("RUN=glm-perf-3", ssh_scripts[-1][0])
+        self.assertIn("RUN_NAME=run_glm-perf-3", ssh_scripts[-1][0])
         self.assertIn(
-            "ORCH_CONFIG=/data/glm52-rl/deployment/configs/current/orchestrator.toml",
+            "ORCH_CONFIG=/data/glm52-rl/deployment/configs/general-agent/orchestrator.toml",
             ssh_scripts[-1][0],
         )
         self.assertIn("TRAINER_CT=glm52-decensor-trainer", ssh_scripts[-1][0])
@@ -352,7 +356,7 @@ class OrchestratorRepairTest(unittest.TestCase):
             batch="batch 112/1024; 128 inflight",
         )
 
-        with mock.patch.object(training_ops, "current_run", return_value="glm-1"), mock.patch.object(
+        with mock.patch.object(training_ops, "current_run", return_value="glm-perf-3"), mock.patch.object(
             training_ops, "status", return_value=before
         ), mock.patch.object(training_ops, "_ssh", return_value=(0, "running\n")), mock.patch.object(
             training_ops, "deploy"
@@ -376,7 +380,7 @@ class OrchestratorRepairTest(unittest.TestCase):
                 return 0, "running\n"
             return 0, ""
 
-        with mock.patch.object(training_ops, "current_run", return_value="glm-1"), mock.patch.object(
+        with mock.patch.object(training_ops, "current_run", return_value="glm-perf-3"), mock.patch.object(
             training_ops, "status", return_value=before
         ), mock.patch.object(training_ops, "deploy", return_value=True), mock.patch.object(
             training_ops, "_ssh", side_effect=fake_ssh
@@ -387,7 +391,7 @@ class OrchestratorRepairTest(unittest.TestCase):
 
         self.assertIn("recreated exact orchestrator", result)
 
-    def test_recreate_script_uses_active_profile_and_exact_launcher(self):
+    def test_recreate_script_uses_active_config_and_exact_launcher(self):
         with mock.patch.object(
             training_ops, "_ssh_address", side_effect=lambda host: f"addr-{host}"
         ):
@@ -395,7 +399,7 @@ class OrchestratorRepairTest(unittest.TestCase):
                 "glm52",
                 {
                     "kind": "glm52",
-                    "orchestrator": "configs/current/orchestrator.toml",
+                    "orchestrator": "configs/general-agent/orchestrator.toml",
                 },
                 was_running=True,
             )
@@ -403,7 +407,7 @@ class OrchestratorRepairTest(unittest.TestCase):
         self.assertIn("RUN=glm52", script)
         self.assertIn("RUN_NAME=run_glm52", script)
         self.assertIn(
-            "ORCH_CONFIG=/data/glm52-rl/deployment/configs/current/orchestrator.toml",
+            "ORCH_CONFIG=/data/glm52-rl/deployment/configs/general-agent/orchestrator.toml",
             script,
         )
         self.assertIn(
@@ -426,7 +430,7 @@ class OrchestratorRepairTest(unittest.TestCase):
             orch_up=False,
             nodes=[training_ops.NodeState(host="n82", gpu_util=80, reachable=True)],
         )
-        with mock.patch.object(training_ops, "current_run", return_value="glm-1"), mock.patch.object(
+        with mock.patch.object(training_ops, "current_run", return_value="glm-perf-3"), mock.patch.object(
             training_ops, "status", return_value=before
         ), mock.patch.object(training_ops, "deploy") as deploy:
             with self.assertRaisesRegex(training_ops.Refused, "idle or waiting"):

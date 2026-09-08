@@ -24,10 +24,10 @@ adapter_server_spec.loader.exec_module(adapter_server)
 
 
 class AdapterUpdateTest(unittest.TestCase):
-    def test_start_inventory_deploys_operations_config_to_participants(self):
+    def test_start_inventory_deploys_nodes_config_to_participants(self):
         selected = {
-            "trainer": "configs/testing-perf/trainer.toml",
-            "orchestrator": "configs/testing-perf/orchestrator.toml",
+            "trainer": "configs/general-agent/trainer.toml",
+            "orchestrator": "configs/general-agent/orchestrator.toml",
         }
         with mock.patch.object(training_ops, "_check_host", side_effect=lambda host: host), mock.patch.object(
             training_ops, "mounted_files", return_value=[]
@@ -36,7 +36,7 @@ class AdapterUpdateTest(unittest.TestCase):
                 training_ops._start_dependency_inventory(selected, training_ops.trainer_hosts)
             )
         self.assertEqual(
-            set(inventory["configs/operations.toml"]),
+            set(inventory["configs/nodes.toml"]),
             set(training_ops.trainer_hosts + training_ops.inference_hosts),
         )
 
@@ -51,10 +51,10 @@ class AdapterUpdateTest(unittest.TestCase):
         start = launcher.index("<<'PY'\n") + len("<<'PY'\n")
         end = launcher.index("\nPY\n)", start)
         reader = launcher[start:end]
-        operations_path = Path(__file__).resolve().parents[2] / "configs/operations.toml"
-        operations = operations_path.read_text(encoding="utf-8")
+        nodes_path = Path(training_ops.repo_root) / "configs/nodes.toml"
+        nodes = nodes_path.read_text(encoding="utf-8")
 
-        def read_settings(host, config_text=operations):
+        def read_settings(host, config_text=nodes):
             with tempfile.NamedTemporaryFile("w", suffix=".toml") as stream:
                 stream.write(config_text)
                 stream.flush()
@@ -87,41 +87,41 @@ class AdapterUpdateTest(unittest.TestCase):
         self.assertLess(launcher.index("runtime_output=$(python3"), launcher.index("docker update"))
 
         invalid_configs = (
-            operations.replace("mtp_tokens = 1\nports = [8000]", "ports = [8000]", 1),
-            operations.replace("mtp_tokens = 1", "mtp_tokens = true", 1),
-            operations.replace("mtp_tokens = 1", "mtp_tokens = -1", 1),
+            nodes.replace("mtp_tokens = 1\nports = [8000]", "ports = [8000]", 1),
+            nodes.replace("mtp_tokens = 1", "mtp_tokens = true", 1),
+            nodes.replace("mtp_tokens = 1", "mtp_tokens = -1", 1),
         )
         for config_text in invalid_configs:
             result = read_settings("h200a", config_text)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("mtp_tokens", result.stderr)
 
-    def test_config_uses_the_active_glm_profile(self):
-        config = training_ops._adapter_update_config("glm-1")
+    def test_config_uses_the_active_glm_run_config(self):
+        config = training_ops._adapter_update_config("glm-perf-3")
         self.assertEqual(config["kind"], "glm52")
         self.assertEqual(config["engine_container"], "glm52-decensor-h200")
-        self.assertEqual(config["source_url"], "http://127.0.0.1:18100/glm-1")
+        self.assertEqual(config["source_url"], "http://127.0.0.1:18100/glm-perf-3")
         self.assertEqual(config["ports"], [8000])
-        self.assertEqual(config["run_marker"], "/glm-1/")
-        self.assertEqual(config["service_marker"], "/run_glm-1/")
+        self.assertEqual(config["run_marker"], "/glm-perf-3/")
+        self.assertEqual(config["service_marker"], "/run_glm-perf-3/")
 
     def test_adapter_server_launcher_uses_active_glm_settings(self):
         script = training_ops._adapter_server_launch_script(
-            "glm-1", training_ops._adapter_update_config("glm-1")
+            "glm-perf-3", training_ops._adapter_update_config("glm-perf-3")
         )
         self.assertIn("adapter-http", script)
-        self.assertIn("RUN=glm-1", script)
-        self.assertIn("ADAPTER_PREDICTIVE_RUN=glm-1", script)
+        self.assertIn("RUN=glm-perf-3", script)
+        self.assertIn("ADAPTER_PREDICTIVE_RUN=glm-perf-3", script)
         self.assertIn(
-            "ADAPTER_PREDICTIVE_BROADCAST_PATH=glm-1/run_glm-1/broadcasts", script
+            "ADAPTER_PREDICTIVE_BROADCAST_PATH=glm-perf-3/run_glm-perf-3/broadcasts", script
         )
-        self.assertIn("ADAPTER_PREDICTIVE_SOURCE_URL=http://127.0.0.1:18100/glm-1", script)
+        self.assertIn("ADAPTER_PREDICTIVE_SOURCE_URL=http://127.0.0.1:18100/glm-perf-3", script)
         self.assertIn("node_id=82", script)
         self.assertNotIn("cluster.sh trainer", script)
 
     def test_adapter_server_repair_requires_reported_failure_unless_reload(self):
         before = training_ops.Status(trainer_up=True, adapter="200", orch_up=False)
-        with mock.patch.object(training_ops, "current_run", return_value="glm-1"), mock.patch.object(
+        with mock.patch.object(training_ops, "current_run", return_value="glm-perf-3"), mock.patch.object(
             training_ops, "_adapter_update_config", return_value={"kind": "glm52"}
         ), mock.patch.object(training_ops, "status", return_value=before), mock.patch.object(
             training_ops, "deploy"
@@ -132,14 +132,14 @@ class AdapterUpdateTest(unittest.TestCase):
 
     def test_adapter_server_repair_does_not_start_trainer(self):
         before = training_ops.Status(trainer_up=True, adapter="000", orch_up=False)
-        config = training_ops._adapter_update_config("glm-1")
+        config = training_ops._adapter_update_config("glm-perf-3")
         ssh_scripts = []
 
         def ssh(_host, script, timeout=120):
             ssh_scripts.append(script)
             return 0, "adapter server ready on port 8100\n"
 
-        with mock.patch.object(training_ops, "current_run", return_value="glm-1"), mock.patch.object(
+        with mock.patch.object(training_ops, "current_run", return_value="glm-perf-3"), mock.patch.object(
             training_ops, "_adapter_update_config", return_value=config
         ), mock.patch.object(training_ops, "status", return_value=before), mock.patch.object(
             training_ops, "deploy", return_value=True
@@ -182,16 +182,16 @@ class AdapterUpdateTest(unittest.TestCase):
     def test_server_upgrades_only_the_exact_active_broadcast_path(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            active = root / "glm-1" / "run_glm-1" / "broadcasts"
+            active = root / "glm-perf-3" / "run_glm-perf-3" / "broadcasts"
             target = active / "step_2"
             target.mkdir(parents=True)
             handler = adapter_server.RangeHandler.__new__(adapter_server.RangeHandler)
             handler.directory = temporary
-            handler.upgrade_path = ("glm-1", "run_glm-1", "broadcasts")
+            handler.upgrade_path = ("glm-perf-3", "run_glm-perf-3", "broadcasts")
             handler.source_base_url = (
-                "http://127.0.0.1:18100/glm-1/run_glm-1/broadcasts"
+                "http://127.0.0.1:18100/glm-perf-3/run_glm-perf-3/broadcasts"
             )
-            handler.path = "/glm-1/run_glm-1/broadcasts/step_2/adapter_manifest.json"
+            handler.path = "/glm-perf-3/run_glm-perf-3/broadcasts/step_2/adapter_manifest.json"
 
             with mock.patch.object(adapter_server, "_upgrade_v1_step") as upgrade:
                 path = handler._maybe_upgrade()
@@ -200,19 +200,19 @@ class AdapterUpdateTest(unittest.TestCase):
                 active,
                 target,
                 2,
-                "http://127.0.0.1:18100/glm-1/run_glm-1/broadcasts",
+                "http://127.0.0.1:18100/glm-perf-3/run_glm-perf-3/broadcasts",
             )
             self.assertEqual(
                 adapter_server._predictive_step_url(handler.source_base_url, 2),
-                "http://127.0.0.1:18100/glm-1/run_glm-1/broadcasts/step_2",
+                "http://127.0.0.1:18100/glm-perf-3/run_glm-perf-3/broadcasts/step_2",
             )
 
-            handler.path = "/glm-1/step_2/adapter_manifest.json"
+            handler.path = "/glm-perf-3/step_2/adapter_manifest.json"
             with mock.patch.object(adapter_server, "_upgrade_v1_step") as upgrade:
                 handler._maybe_upgrade()
             upgrade.assert_not_called()
 
-            handler.path = "/glm-1/run_glm-1/broadcasts/step_2/adapter_manifest.json"
+            handler.path = "/glm-perf-3/run_glm-perf-3/broadcasts/step_2/adapter_manifest.json"
             with mock.patch.object(
                 adapter_server,
                 "_upgrade_v1_step",
@@ -332,12 +332,12 @@ class AdapterUpdateTest(unittest.TestCase):
             training_ops._validate_adapter_stage_log(log)
 
     def test_terminal_stage_status_accepts_exact_timeout_and_manifest_500(self):
-        config = training_ops._adapter_update_config("glm-1")
+        config = training_ops._adapter_update_config("glm-perf-3")
         broadcast = training_ops.AdapterBroadcast(
-            path="/data/glm52-rl/runs/glm-1/run_glm-1/broadcasts/step_6",
+            path="/data/glm52-rl/runs/glm-perf-3/run_glm-perf-3/broadcasts/step_6",
             step=6,
         )
-        source = "http://127.0.0.1:18100/glm-1/run_glm-1/broadcasts/step_6"
+        source = "http://127.0.0.1:18100/glm-perf-3/run_glm-perf-3/broadcasts/step_6"
         cache = (
             "/data/glm52-rl/lora-cache/"
             + hashlib.sha256(source.encode()).hexdigest()
@@ -365,7 +365,7 @@ class AdapterUpdateTest(unittest.TestCase):
             "_latest_adapter_broadcast",
             return_value=broadcast,
         ), mock.patch.object(training_ops, "_fan", return_value=results):
-            evidence = training_ops._adapter_stage_status_evidence("glm-1", config, "")
+            evidence = training_ops._adapter_stage_status_evidence("glm-perf-3", config, "")
         self.assertIn(
             "policy update 6 failed on h200a (TimeoutError: adapter delta staging exceeded its time limit), "
             "h200b (OSError: adapter manifest request failed with HTTP status 500)",
@@ -373,12 +373,12 @@ class AdapterUpdateTest(unittest.TestCase):
         )
 
     def test_terminal_stage_status_refuses_stale_unknown_and_success(self):
-        config = training_ops._adapter_update_config("glm-1")
+        config = training_ops._adapter_update_config("glm-perf-3")
         broadcast = training_ops.AdapterBroadcast(
-            path="/data/glm52-rl/runs/glm-1/run_glm-1/broadcasts/step_6",
+            path="/data/glm52-rl/runs/glm-perf-3/run_glm-perf-3/broadcasts/step_6",
             step=6,
         )
-        source = "http://127.0.0.1:18100/glm-1/run_glm-1/broadcasts/step_6"
+        source = "http://127.0.0.1:18100/glm-perf-3/run_glm-perf-3/broadcasts/step_6"
         cache = (
             "/data/glm52-rl/lora-cache/"
             + hashlib.sha256(source.encode()).hexdigest()
@@ -404,7 +404,7 @@ class AdapterUpdateTest(unittest.TestCase):
                 return_value=broadcast,
             ), mock.patch.object(training_ops, "_fan", return_value=records):
                 with self.assertRaisesRegex(training_ops.Refused, pattern):
-                    training_ops._adapter_stage_status_evidence("glm-1", config, log)
+                    training_ops._adapter_stage_status_evidence("glm-perf-3", config, log)
 
         stale = dict(failed, source_url=source + "-old")
         check(
@@ -523,7 +523,7 @@ class AdapterUpdateTest(unittest.TestCase):
                 return 0, "stopped\n"
             return 0, ""
 
-        with mock.patch.object(training_ops, "current_run", return_value="glm-1"), mock.patch.object(
+        with mock.patch.object(training_ops, "current_run", return_value="glm-perf-3"), mock.patch.object(
             training_ops, "status", return_value=before
         ), mock.patch.object(
             training_ops, "_adapter_stage_evidence", return_value="Failed to apply policy update 4"
@@ -543,10 +543,10 @@ class AdapterUpdateTest(unittest.TestCase):
             "bash /data/glm52-rl/deployment/training_ops/runtime/h200/start_orchestrator.sh",
             resume_script,
         )
-        self.assertIn("RUN=glm-1", resume_script)
-        self.assertIn("RUN_NAME=run_glm-1", resume_script)
+        self.assertIn("RUN=glm-perf-3", resume_script)
+        self.assertIn("RUN_NAME=run_glm-perf-3", resume_script)
         self.assertIn(
-            "ORCH_CONFIG=/data/glm52-rl/deployment/configs/current/orchestrator.toml",
+            "ORCH_CONFIG=/data/glm52-rl/deployment/configs/general-agent/orchestrator.toml",
             resume_script,
         )
         self.assertIn("TRAINER_CT=glm52-decensor-trainer", resume_script)
@@ -593,7 +593,7 @@ class AdapterUpdateTest(unittest.TestCase):
                 )
             ],
         )
-        with mock.patch.object(training_ops, "current_run", return_value="glm-1"), mock.patch.object(
+        with mock.patch.object(training_ops, "current_run", return_value="glm-perf-3"), mock.patch.object(
             training_ops, "status", return_value=before
         ), mock.patch.object(training_ops, "_ssh", return_value=(0, "running\n")), mock.patch.object(
             training_ops, "_adapter_stage_evidence"
@@ -643,7 +643,7 @@ class AdapterUpdateTest(unittest.TestCase):
                 return 0, "absent\n"
             return 0, ""
 
-        with mock.patch.object(training_ops, "current_run", return_value="glm-1"), mock.patch.object(
+        with mock.patch.object(training_ops, "current_run", return_value="glm-perf-3"), mock.patch.object(
             training_ops, "status", return_value=before
         ), mock.patch.object(
             training_ops, "_adapter_stage_evidence", return_value="Failed to apply policy update 4"
@@ -666,7 +666,7 @@ class AdapterUpdateTest(unittest.TestCase):
             orch_up=False,
             nodes=[training_ops.NodeState(host="n82", gpu_util=80)],
         )
-        with mock.patch.object(training_ops, "current_run", return_value="glm-1"), mock.patch.object(
+        with mock.patch.object(training_ops, "current_run", return_value="glm-perf-3"), mock.patch.object(
             training_ops, "status", return_value=before
         ), mock.patch.object(training_ops, "_ssh") as ssh, mock.patch.object(
             training_ops, "_adapter_stage_evidence"
@@ -676,14 +676,14 @@ class AdapterUpdateTest(unittest.TestCase):
         ssh.assert_not_called()
         evidence.assert_not_called()
 
-    def test_engine_repair_uses_active_run_profile(self):
+    def test_engine_repair_uses_active_run_config(self):
         calls = []
 
         def ssh(_host, script, timeout=120):
             calls.append(script)
             return 0, "issued"
 
-        with mock.patch.object(training_ops, "current_run", return_value="glm-1"), mock.patch.object(
+        with mock.patch.object(training_ops, "current_run", return_value="glm-perf-3"), mock.patch.object(
             training_ops, "_ssh", side_effect=ssh
         ):
             result = training_ops._repair_engine("h200a")
@@ -737,7 +737,7 @@ class AdapterUpdateTest(unittest.TestCase):
             fan_call += 1
             return result
 
-        with mock.patch.object(training_ops, "current_run", return_value="glm-1"), mock.patch.object(
+        with mock.patch.object(training_ops, "current_run", return_value="glm-perf-3"), mock.patch.object(
             training_ops, "status", return_value=before
         ), mock.patch.object(
             training_ops, "_adapter_stage_evidence", return_value="Failed to apply policy update 4"
@@ -760,7 +760,7 @@ class AdapterUpdateTest(unittest.TestCase):
 
     def test_prefetch_script_only_signals_exact_curl_or_timeout(self):
         script = training_ops._adapter_prefetch_stop_script(
-            "/glm-1/", "/run_glm-1/", "/data/glm52-rl/runs/glm-1/run_glm-1"
+            "/glm-perf-3/", "/run_glm-perf-3/", "/data/glm52-rl/runs/glm-perf-3/run_glm-perf-3"
         )
         self.assertIn("case \"${exe##*/}\" in curl|timeout", script)
         self.assertIn("stage_lora_adapter", script)
@@ -770,7 +770,7 @@ class AdapterUpdateTest(unittest.TestCase):
 
     def test_repair_refuses_before_any_mutation_when_trainer_is_down(self):
         unhealthy = training_ops.Status(trainer_up=False, orch_up=True)
-        with mock.patch.object(training_ops, "current_run", return_value="glm-1"), mock.patch.object(
+        with mock.patch.object(training_ops, "current_run", return_value="glm-perf-3"), mock.patch.object(
             training_ops, "status", return_value=unhealthy
         ), mock.patch.object(training_ops, "_adapter_stage_evidence") as evidence, mock.patch.object(
             training_ops, "deploy"
