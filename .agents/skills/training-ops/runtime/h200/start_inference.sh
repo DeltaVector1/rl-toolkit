@@ -39,14 +39,20 @@ if tp * dp != gpu_count:
 mtp_tokens = glm.get("mtp_tokens")
 if type(mtp_tokens) is not int or mtp_tokens < 0:
     raise SystemExit(f"mtp_tokens for {host} must be a non-negative integer")
+max_num_seqs = 128
+max_num_batched_tokens = 32768
+max_cudagraph_capture_size = max_num_seqs * (1 + mtp_tokens)
 vllm_extra = {
     "tensor_parallel_size": tp,
     "data_parallel_size": dp,
     "gpu_memory_utilization": 0.920,
     "kv_cache_dtype": "fp8",
-    "max_num_seqs": 128,
-    "max_num_batched_tokens": 32768,
-    "compilation_config": {"max_cudagraph_capture_size": 128},
+    "max_num_seqs": max_num_seqs,
+    "max_num_batched_tokens": max_num_batched_tokens,
+    "compilation_config": {
+        "max_cudagraph_capture_size": max_cudagraph_capture_size
+    },
+    "cudagraph_metrics": True,
 }
 if mtp_tokens:
     vllm_extra["speculative_config"] = {
