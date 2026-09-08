@@ -24,6 +24,22 @@ adapter_server_spec.loader.exec_module(adapter_server)
 
 
 class AdapterUpdateTest(unittest.TestCase):
+    def test_start_inventory_deploys_operations_config_to_participants(self):
+        selected = {
+            "trainer": "configs/testing-perf/trainer.toml",
+            "orchestrator": "configs/testing-perf/orchestrator.toml",
+        }
+        with mock.patch.object(training_ops, "_check_host", side_effect=lambda host: host), mock.patch.object(
+            training_ops, "mounted_files", return_value=[]
+        ):
+            inventory = dict(
+                training_ops._start_dependency_inventory(selected, training_ops.trainer_hosts)
+            )
+        self.assertEqual(
+            set(inventory["configs/operations.toml"]),
+            set(training_ops.trainer_hosts + training_ops.inference_hosts),
+        )
+
     def test_inference_launcher_forwards_mtp_settings_before_docker(self):
         launcher_path = (
             Path(__file__).resolve().parents[1]

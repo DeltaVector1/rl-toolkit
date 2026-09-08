@@ -5107,6 +5107,7 @@ def _start_dependency_inventory(
     )
 
     configured_hosts = list(dict.fromkeys([*trainer_hosts, *inference_hosts]))
+    add("configs/operations.toml", configured_hosts)
     for path in mounted_files():
         if not path.startswith("prime-rl/"):
             continue
