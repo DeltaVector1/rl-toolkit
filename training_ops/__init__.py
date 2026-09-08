@@ -420,6 +420,31 @@ def _parse_epoch(value: str | None) -> float | None:
     return epoch if math.isfinite(epoch) else None
 
 
+def _parse_trainer_compute(value: str) -> tuple[int, float | None] | None:
+    """Parse the current step and optional authoritative completion duration."""
+    parts = value.split()
+    if len(parts) not in (1, 2):
+        return None
+    try:
+        step = int(parts[0])
+    except (TypeError, ValueError):
+        return None
+    if step < 0:
+        return None
+    seconds = _parse_seconds(parts[1]) if len(parts) == 2 else None
+    if len(parts) == 2 and seconds is None:
+        return None
+    return step, seconds
+
+
+def _parse_seconds(value: str) -> float | None:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    return seconds if math.isfinite(seconds) and seconds >= 0 else None
+
+
 def _select_active_reward_rows(
     rows: list[dict],
     requested_run: str,
@@ -434,6 +459,83 @@ def _select_active_reward_rows(
 
 # -------------------------------------------------------------------- probes
 
+trainer_compute_probe = r"""
+started_at=$(sudo docker inspect __TRAINER__ --format '{{.State.StartedAt}}' 2>/dev/null | head -1)
+started_epoch=$(date -u -d "$started_at" +%s.%N 2>/dev/null || true)
+if [ -z "$started_at" ] || [ -z "$started_epoch" ]; then
+  echo "TRAINER_COMPUTE_STATE unknown"
+else
+  trainer_log=$(sudo docker logs -t --since "$started_at" __TRAINER__ 2>&1 | strip)
+  compute=$(printf '%s\n' "$trainer_log" | awk '
+/TRAINER_FORWARD_BACKWARD_START step=[0-9]+/ {
+  line=$0
+  sub(/^.*step=/, "", line)
+  current=line
+  sub(/ .*/, "", current)
+  active=0
+  completed=""
+  pp=""
+  started=$1
+  active=1
+}
+/PP step: [0-9]+ micro-batches in [0-9]+([.][0-9]+)?s/ && active {
+  pp=$0
+  sub(/^.*PP step: [0-9]+ micro-batches in /, "", pp)
+  sub(/s.*$/, "", pp)
+}
+/TRAINER_FORWARD_BACKWARD_COMPLETE step=[0-9]+ seconds=[0-9]+([.][0-9]+)?/ && current != "" {
+  line=$0
+  sub(/^.*step=/, "", line)
+  step=line
+  sub(/ .*/, "", step)
+  if (step == current) {
+    completed=$0
+    sub(/^.*seconds=/, "", completed)
+    sub(/[^0-9.].*$/, "", completed)
+    active=0
+  }
+}
+END {
+  if (current != "") {
+    printf "%s", current
+    if (completed != "") printf " %s", completed
+    else printf " -"
+    if (pp != "") printf " %s", pp
+    else printf " -"
+    printf " %s %s", active, started
+    print ""
+  }
+}')
+  read -r compute_step compute_seconds compute_pp compute_active compute_start <<EOF
+$compute
+EOF
+  compute_elapsed=""
+  if [ "$compute_active" = 1 ] && [ "$compute_start" != "-" ]; then
+    compute_start_epoch=$(date -u -d "$compute_start" +%s.%N 2>/dev/null || true)
+    now_epoch=$(date -u +%s.%N)
+    if [ -n "$compute_start_epoch" ]; then
+      compute_elapsed=$(awk -v now="$now_epoch" -v start="$compute_start_epoch" \
+        'BEGIN { if (now >= start) printf "%.6f", now - start }')
+    fi
+  fi
+  if [ "$compute_step" = "" ]; then
+    echo "TRAINER_COMPUTE_STATE pending"
+  else
+    if [ "$compute_seconds" = "-" ]; then compute_seconds=""; fi
+    if [ "$compute_pp" = "-" ]; then compute_pp=""; fi
+    echo "TRAINER_COMPUTE $compute_step${compute_seconds:+ $compute_seconds}"
+    echo "TRAINER_COMPUTE_PP_SECONDS $compute_pp"
+    echo "TRAINER_COMPUTE_ACTIVE $compute_active"
+    echo "TRAINER_COMPUTE_ELAPSED_SECONDS $compute_elapsed"
+    if [ "$compute_active" = 1 ]; then
+      echo "TRAINER_COMPUTE_STATE active"
+    else
+      echo "TRAINER_COMPUTE_STATE complete"
+    fi
+  fi
+fi
+"""
+
 trainer_probe = r"""
 strip() { sed "s/\x1b\[[0-9;]*m//g"; }
 echo "TRAINER_UP $(sudo docker ps --filter name=__TRAINER__ --format up 2>/dev/null | head -1)"
@@ -447,6 +549,7 @@ echo "ORCH_UP $(sudo docker ps --filter name=__ORCH__ --format up 2>/dev/null | 
 echo "TRAINER_STEPS $(sudo docker logs __TRAINER__ 2>&1 | strip | grep -ac 'SUCCESS Step')"
 echo "TRAINER_LAST $(sudo docker logs __TRAINER__ 2>&1 | strip | grep -a 'SUCCESS Step' | tail -1)"
 echo "TRAINER_CURRENT $(sudo docker logs --tail 1 __TRAINER__ 2>&1 | strip | tail -1)"
+__TRAINER_COMPUTE__
 echo "TRAINER_FINISHED $(sudo docker logs __TRAINER__ 2>&1 | strip | grep -aEc 'RL trainer finished|Trainer finished')"
 echo "TRAINER_FAILED $(sudo docker logs __TRAINER__ 2>&1 | strip | grep -aEc 'prime_rl\.trainer\.rl\.train FAILED|CheckpointException')"
 echo "ORCH_LAST $(sudo docker logs __ORCH__ 2>&1 | strip | grep -a 'SUCCESS Step' | tail -1)"
@@ -465,6 +568,7 @@ echo "TRAINER_UP $(sudo docker ps --filter name=__TRAINER__ --format up 2>/dev/n
 echo "TRAINER_STEPS $(sudo docker logs __TRAINER__ 2>&1 | strip | grep -ac 'SUCCESS Step')"
 echo "TRAINER_LAST $(sudo docker logs __TRAINER__ 2>&1 | strip | grep -a 'SUCCESS Step' | tail -1)"
 echo "TRAINER_CURRENT $(sudo docker logs --tail 1 __TRAINER__ 2>&1 | strip | tail -1)"
+__TRAINER_COMPUTE__
 echo "TRAINER_FINISHED $(sudo docker logs __TRAINER__ 2>&1 | strip | grep -aEc 'RL trainer finished|Trainer finished')"
 echo "TRAINER_FAILED $(sudo docker logs __TRAINER__ 2>&1 | strip | grep -aEc 'prime_rl\.trainer\.rl\.train FAILED|CheckpointException')"
 echo "TRAINER_LOGAGE $(sudo docker logs -t --tail 1 __TRAINER__ 2>&1 | tail -1 | cut -d' ' -f1)"
@@ -555,6 +659,10 @@ def _inference_script(host: str, model: str, container: str) -> str:
 def _head_script() -> str:
     return (
         trainer_probe.replace("__TRAINER__", trainer_container)
+        .replace(
+            "__TRAINER_COMPUTE__",
+            trainer_compute_probe.replace("__TRAINER__", trainer_container),
+        )
         .replace("__ORCH__", orchestrator_container)
         .replace("__ADAPTER__", str(adapter_port))
     )
@@ -722,6 +830,12 @@ class Status:
     batch_sync: bool = False
     trainer_failure_watchdog: bool = False
     trainer_steps: int = 0
+    trainer_compute_state: str = "pending"
+    trainer_compute_step: int | None = None
+    trainer_compute_seconds: float | None = None
+    trainer_compute_pp_seconds: float | None = None
+    trainer_compute_active: bool = False
+    trainer_compute_elapsed_seconds: float | None = None
     trainer_last: str = ""
     trainer_current: str = ""
     orch_last: str = ""
@@ -771,6 +885,30 @@ class Status:
         L.append(
             f"run steps {self.trainer_steps} | failures in 5m {self.fails_5m} | {self.batch or 'no batch line'}"
         )
+        if self.trainer_compute_state == "unknown":
+            compute = "unknown"
+        elif (
+            self.trainer_compute_state == "active"
+            and self.trainer_compute_active
+            and self.trainer_compute_step is not None
+        ):
+            compute = f"step {self.trainer_compute_step} active"
+            if self.trainer_compute_elapsed_seconds is not None:
+                compute += f" {self.trainer_compute_elapsed_seconds:.2f}s"
+        elif (
+            self.trainer_compute_state == "complete"
+            and self.trainer_compute_step is not None
+            and self.trainer_compute_seconds is not None
+        ):
+            compute = (
+                f"step {self.trainer_compute_step} "
+                f"{self.trainer_compute_seconds:.2f}s (forward/backward complete)"
+            )
+        else:
+            compute = "pending"
+        if self.trainer_compute_pp_seconds is not None:
+            compute += f"; PP {self.trainer_compute_pp_seconds:.2f}s"
+        L.append(f"  trainer compute: {compute}")
         if self.trainer_last:
             L.append(f"  trainer: {self.trainer_last[:150]}")
         elif self.trainer_current:
@@ -1626,7 +1764,10 @@ def status(run: str = "", quiet: bool = False) -> Status:
             f_head = ex.submit(
                 _ssh,
                 trainer_head,
-                trainer_only_probe.replace("__TRAINER__", trainer_container),
+                trainer_only_probe.replace("__TRAINER__", trainer_container).replace(
+                    "__TRAINER_COMPUTE__",
+                    trainer_compute_probe.replace("__TRAINER__", trainer_container),
+                ),
                 120,
             )
             f_nodes = ex.submit(_fan, trainer_hosts, node)
@@ -1675,6 +1816,19 @@ def status(run: str = "", quiet: bool = False) -> Status:
     s.batch_sync = int(h.get("BATCH_SYNC", 0) or 0) > 0
     s.trainer_failure_watchdog = int(h.get("TRAINER_FAIL_WD", 0) or 0) > 0
     s.trainer_steps = int(h.get("TRAINER_STEPS", 0) or 0)
+    state = h.get("TRAINER_COMPUTE_STATE", "pending")
+    if state in {"pending", "active", "complete", "unknown"}:
+        s.trainer_compute_state = state
+    compute = _parse_trainer_compute(h.get("TRAINER_COMPUTE", ""))
+    if compute is not None:
+        s.trainer_compute_step, s.trainer_compute_seconds = compute
+        s.trainer_compute_pp_seconds = _parse_seconds(
+            h.get("TRAINER_COMPUTE_PP_SECONDS", "")
+        )
+        s.trainer_compute_active = h.get("TRAINER_COMPUTE_ACTIVE", "") == "1"
+        s.trainer_compute_elapsed_seconds = _parse_seconds(
+            h.get("TRAINER_COMPUTE_ELAPSED_SECONDS", "")
+        )
     s.trainer_last = h.get("TRAINER_LAST", "")
     s.trainer_current = h.get("TRAINER_CURRENT", "")
     s.trainer_finished = int(h.get("TRAINER_FINISHED", 0) or 0) > 0
@@ -1732,6 +1886,23 @@ def status(run: str = "", quiet: bool = False) -> Status:
 
 def _warnings(s: Status) -> list[str]:
     w = []
+    if (
+        s.trainer_compute_seconds is not None
+        and s.trainer_compute_seconds > trainer_seconds_max
+    ):
+        w.append(
+            f"trainer compute step {s.trainer_compute_step} exceeds configured upper bound "
+            f"{trainer_seconds_max:g}s; operator must stop"
+        )
+    if (
+        s.trainer_compute_active
+        and s.trainer_compute_elapsed_seconds is not None
+        and s.trainer_compute_elapsed_seconds > trainer_seconds_max
+    ):
+        w.append(
+            f"trainer compute step {s.trainer_compute_step} has been active for "
+            f"more than {trainer_seconds_max:g}s; operator must stop"
+        )
     if s.trainer_failed:
         w.append(f"trainer process failed after {s.trainer_steps} completed steps")
     elif not s.trainer_up and not s.trainer_finished:
@@ -2791,7 +2962,13 @@ def watch(hours: float = 2.0, every: int = 300, run: str = "") -> list[Status]:
             continue
         history.append(s)
         print(s.report(), flush=True)
-        key = (s.trainer_steps, s.batch)
+        key = (
+            s.trainer_steps,
+            s.batch,
+            s.trainer_compute_step,
+            s.trainer_compute_seconds,
+            s.trainer_compute_active,
+        )
         if key != last_key:
             last_key, last_change = key, time.time()
         else:
@@ -2804,7 +2981,7 @@ def watch(hours: float = 2.0, every: int = 300, run: str = "") -> list[Status]:
                     print(
                         f"-- trainer GPUs remain busy after {_hms(still)} without a counter change; "
                         "GPU use is high, but no step or batch progress is confirmed. "
-                        "Check the compute timer and enforce the configured limit.",
+                        "Check the compute timer; operator must stop if it exceeds the configured limit.",
                         flush=True,
                     )
                 else:

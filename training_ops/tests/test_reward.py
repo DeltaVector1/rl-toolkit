@@ -13,6 +13,125 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import training_ops
 
 
+class TrainerComputeProbeTest(unittest.TestCase):
+    def run_probe(self, log, started_at="2026-09-08T22:00:00.000000000Z"):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "sudo").write_text(
+                "#!/bin/sh\nexec \"$@\"\n", encoding="utf-8"
+            )
+            (root / "docker").write_text(
+                "#!/bin/sh\n"
+                "case \"$*\" in\n"
+                "  inspect*) printf '%s\\n' \"$TRAINER_STARTED_AT\" ;;\n"
+                "  *logs*) printf '%s\\n' \"$TRAINER_LOG\" ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            (root / "sudo").chmod(0o755)
+            (root / "docker").chmod(0o755)
+            script = (
+                "strip() { sed 's/\\x1b\\[[0-9;]*m//g'; };\n"
+                + training_ops.trainer_compute_probe
+            )
+            environment = {
+                "PATH": f"{directory}:/usr/bin:/bin",
+                "TRAINER_LOG": log,
+                "TRAINER_STARTED_AT": started_at,
+            }
+            result = subprocess.run(
+                ["bash", "-c", script],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return training_ops._kv(result.stdout)
+
+    def test_parses_current_step_with_optional_pp_completion(self):
+        self.assertEqual(training_ops._parse_trainer_compute("2"), (2, None))
+        self.assertEqual(
+            training_ops._parse_trainer_compute("2 454.89"), (2, 454.89)
+        )
+
+    def test_rejects_malformed_or_negative_compute_report(self):
+        for value in ("", "2 nope", "2 -1", "2 1 extra"):
+            self.assertIsNone(training_ops._parse_trainer_compute(value))
+
+    def test_compute_limit_remains_enforced(self):
+        status = training_ops.Status(
+            trainer_compute_step=2,
+            trainer_compute_seconds=600.01,
+        )
+        self.assertIn(
+            "trainer compute step 2 exceeds configured upper bound 600s; operator must stop",
+            training_ops._warnings(status),
+        )
+        active = training_ops.Status(
+            trainer_compute_state="active",
+            trainer_compute_step=2,
+            trainer_compute_active=True,
+            trainer_compute_elapsed_seconds=600.01,
+        )
+        self.assertIn(
+            "trainer compute step 2 has been active for more than 600s; operator must stop",
+            training_ops._warnings(active),
+        )
+
+    def test_stale_prior_step_and_pp_without_completion_stay_active(self):
+        report = self.run_probe(
+            "2026-09-08T22:00:01Z TRAINER_FORWARD_BACKWARD_START step=1\n"
+            "2026-09-08T22:04:00Z PP step: 55 micro-batches in 300.00s\n"
+            "2026-09-08T22:04:01Z TRAINER_FORWARD_BACKWARD_COMPLETE step=1 seconds=301.000000\n"
+            "2026-09-08T22:05:00Z TRAINER_FORWARD_BACKWARD_START step=2\n"
+            "2026-09-08T22:09:50Z PP step: 55 micro-batches in 454.89s\n"
+        )
+        self.assertEqual(training_ops._parse_trainer_compute(report["TRAINER_COMPUTE"]), (2, None))
+        self.assertEqual(report["TRAINER_COMPUTE_PP_SECONDS"], "454.89")
+        self.assertEqual(report["TRAINER_COMPUTE_ACTIVE"], "1")
+        self.assertEqual(report["TRAINER_COMPUTE_STATE"], "active")
+        self.assertTrue(float(report["TRAINER_COMPUTE_ELAPSED_SECONDS"]) >= 0)
+
+    def test_matching_completion_ignores_later_adapter_work(self):
+        report = self.run_probe(
+            "2026-09-08T22:00:01Z TRAINER_FORWARD_BACKWARD_START step=2\n"
+            "2026-09-08T22:09:50Z PP step: 55 micro-batches in 454.89s\n"
+            "2026-09-08T22:10:00Z TRAINER_FORWARD_BACKWARD_COMPLETE step=2 seconds=601.000000\n"
+            "2026-09-08T22:10:01Z Starting broadcasting weights to inference engine via shared filesystem\n"
+            "2026-09-08T22:12:00Z Saving checkpoint at step 2\n"
+        )
+        self.assertEqual(
+            training_ops._parse_trainer_compute(report["TRAINER_COMPUTE"]),
+            (2, 601.0),
+        )
+        self.assertEqual(report["TRAINER_COMPUTE_PP_SECONDS"], "454.89")
+        self.assertEqual(report["TRAINER_COMPUTE_ACTIVE"], "0")
+        self.assertEqual(report["TRAINER_COMPUTE_STATE"], "complete")
+        self.assertEqual(report["TRAINER_COMPUTE_ELAPSED_SECONDS"], "")
+        status = training_ops.Status(
+            trainer_compute_step=2,
+            trainer_compute_seconds=601.0,
+            trainer_compute_pp_seconds=454.89,
+        )
+        self.assertIn(
+            "trainer compute step 2 exceeds configured upper bound 600s; operator must stop",
+            training_ops._warnings(status),
+        )
+
+    def test_missing_or_invalid_container_start_does_not_read_logs(self):
+        for started_at in ("", "not-a-timestamp"):
+            report = self.run_probe(
+                "2026-09-08T22:00:01Z TRAINER_FORWARD_BACKWARD_START step=2\n",
+                started_at=started_at,
+            )
+            self.assertEqual(report["TRAINER_COMPUTE_STATE"], "unknown")
+            self.assertNotIn("TRAINER_COMPUTE", report)
+
+    def test_status_reports_pending_without_an_explicit_start(self):
+        self.assertIn("trainer compute: pending", training_ops.Status().report())
+
+
 class ActiveRewardRowsTest(unittest.TestCase):
     def test_selects_rows_after_active_container_start(self):
         rows = [
