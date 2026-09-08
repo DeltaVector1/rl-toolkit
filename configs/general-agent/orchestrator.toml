@@ -56,7 +56,7 @@ pool = { type = "static", num_workers = 16 }
 id = "general-agent"
 args = { tasks_dir = "/data/glm52-rl/runs/general-agent-check/general-agent", exclude_tasks = ["loyalty_rewards_t3", "loyalty_rewards_t4", "railway_dispatch_t1", "railway_dispatch_t4"], max_turns = 100 }
 env.agent.max_output_tokens = 16384
-env.agent.timeout.rollout = 3600
+env.agent.timeout.rollout = 720
 
 [train.env.sampling]
 max_completion_tokens = 16384

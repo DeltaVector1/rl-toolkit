@@ -6,6 +6,7 @@ enable_router_replay = false
 [env_vars]
 PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD = "0"
 PRIME_LORA_MM_PROFILE = "sm89-r32"
+prime_sparse_bwd_skip_sentinel = "1"
 
 [parity_guard]
 max_unmasked_mismatch_kl = 0.1
