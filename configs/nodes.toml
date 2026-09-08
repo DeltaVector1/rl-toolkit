@@ -1,0 +1,72 @@
+[hosts]
+trainer_head = "n82"
+trainer_ssh = "china-trainer"
+trainers = ["n76", "n77", "n78", "n80", "n82", "n83", "n84", "n85"]
+inference = ["h200a", "h200b"]
+orchestrator = "h200a"
+metrics = ["h200a", "n82"]
+judge = "judge-ext"
+blocked = ["n79"]
+
+[hosts.trainer_lan]
+n76 = "10.92.20.76"
+n77 = "10.92.20.77"
+n78 = "10.92.20.78"
+n80 = "10.92.20.80"
+n82 = "10.92.20.82"
+n83 = "10.92.20.83"
+n84 = "10.92.20.84"
+n85 = "10.92.20.85"
+
+[ports]
+inference_peer = 18049
+lora_source_first = 18100
+lora_source_last = 18195
+adapter_relay = 18196
+refusal_classifier = 18250
+adapter = 8100
+
+[paths]
+storage_root = "/data/glm52-rl"
+remote_repository = "/data/glm52-rl/deployment"
+runs = "/data/glm52-rl/runs"
+adapter_cache = "/data/glm52-rl/lora-cache"
+
+[judges.external]
+host = "202.214.223.66"
+api_url = "http://202.214.223.66:26406/v1"
+model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
+data_parallel_size = 8
+
+[containers]
+trainer = "glm52-decensor-trainer"
+orchestrator = "glm52-decensor-orchestrator"
+adapter = "glm52-adapter-http"
+adapter_relay = "glm52-adapter-relay"
+glm52_inference = "glm52-decensor-h200"
+
+[models]
+glm52 = "/models/glm52-fp8"
+
+[inference.h200a.glm52]
+gpu_count = 8
+tensor_parallel_size = 8
+data_parallel_size = 1
+mtp_tokens = 1
+ports = [8000]
+
+[inference.h200b]
+ssh_host = "38.255.28.19"
+ssh_port = 20099
+ssh_user = "root"
+ssh_identity_file = "/home/mango/.ssh/h200_rollout_ed25519"
+peer_ssh_identity_file = "/data/trinity/h200_rollout_ed25519"
+api_tunnel_port = 18049
+disable_nccl_shm = false
+
+[inference.h200b.glm52]
+gpu_count = 8
+tensor_parallel_size = 8
+data_parallel_size = 1
+mtp_tokens = 1
+ports = [8000]

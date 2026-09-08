@@ -98,7 +98,7 @@ class StepsReaderTest(unittest.TestCase):
             with (
                 mock.patch.object(
                     training_ops,
-                    "_profile_for_run",
+                    "_config_for_run",
                     return_value={"trainer": str(config)},
                 ) as profile,
                 mock.patch.object(
@@ -121,7 +121,7 @@ class StepsReaderTest(unittest.TestCase):
         calls = []
         expected = "/data/glm52-rl/runs/archived/run/trainer-metrics.jsonl"
         with (
-            mock.patch.object(training_ops, "_profile_for_run", return_value=None),
+            mock.patch.object(training_ops, "_config_for_run", return_value=None),
             mock.patch.object(
                 training_ops,
                 "_ssh",
@@ -140,14 +140,14 @@ class StepsReaderTest(unittest.TestCase):
             config.write_text("output_dir = [", encoding="utf-8")
             with mock.patch.object(
                 training_ops,
-                "_profile_for_run",
+                "_config_for_run",
                 return_value={"trainer": str(config)},
             ):
                 with self.assertRaisesRegex(RuntimeError, "cannot read trainer config"):
                     training_ops.steps("bad")
         with mock.patch.object(
             training_ops,
-            "_profile_for_run",
+            "_config_for_run",
             side_effect=training_ops.Refused("multiple configured trainer profiles"),
         ):
             with self.assertRaisesRegex(training_ops.Refused, "multiple configured"):
@@ -165,7 +165,7 @@ class StepsReaderTest(unittest.TestCase):
             with (
                 mock.patch.object(
                     training_ops,
-                    "_profile_for_run",
+                    "_config_for_run",
                     return_value={"trainer": str(config)},
                 ),
                 mock.patch.object(
@@ -255,35 +255,42 @@ class ParityReaderTest(unittest.TestCase):
 
     def test_parity_uses_configured_direct_record(self):
         calls = []
+        with tempfile.TemporaryDirectory() as directory:
+            trainer_path = Path(directory) / "trainer.toml"
+            trainer_path.write_text(
+                'output_dir = "/data/glm52-rl/runs/glm-perf-1"\n'
+                '[data.fake]\nreference_path = "/tmp/reference"\n',
+                encoding="utf-8",
+            )
 
-        def fake_ssh(host, script, timeout=180):
-            calls.append(script)
-            if script.startswith("python3 - "):
-                return 0, json.dumps({"record_tokens": 3, "selected_tokens": 2})
-            if "direct-parity.json" in script:
-                return 0, "PARITY 100.0 /data/glm52-rl/qualifications/glm52-fixed-token/direct-parity.json\n"
-            raise AssertionError("unexpected parity probe")
+            def fake_ssh(host, script, timeout=180):
+                calls.append(script)
+                if script.startswith("python3 - "):
+                    return 0, json.dumps({"record_tokens": 3, "selected_tokens": 2})
+                if "direct-parity.json" in script:
+                    return 0, "PARITY 100.0 /data/glm52-rl/runs/glm-perf-1/direct-parity.json\n"
+                raise AssertionError("unexpected parity probe")
 
-        def fake_fan(hosts, function, workers=None):
-            host = hosts[0]
-            return {host: function(host)}
+            def fake_fan(hosts, function, workers=None):
+                host = hosts[0]
+                return {host: function(host)}
 
-        with (
-            mock.patch.object(training_ops, "_profile_for_run", return_value={"trainer": "configs/qualification/glm52-fixed-token.toml"}),
-            mock.patch.object(training_ops, "_fan", side_effect=fake_fan),
-            mock.patch.object(training_ops, "_ssh", side_effect=fake_ssh),
-            redirect_stdout(StringIO()),
-        ):
-            report = training_ops.parity("glm-perf-1")
+            with (
+                mock.patch.object(training_ops, "_config_for_run", return_value={"trainer": str(trainer_path)}),
+                mock.patch.object(training_ops, "_fan", side_effect=fake_fan),
+                mock.patch.object(training_ops, "_ssh", side_effect=fake_ssh),
+                redirect_stdout(StringIO()),
+            ):
+                report = training_ops.parity("glm-perf-1")
 
         self.assertEqual(report["source"], "configured")
         self.assertIn("-maxdepth 0", calls[0])
-        self.assertIn("/data/glm52-rl/qualifications/glm52-fixed-token/direct-parity.json", calls[0])
+        self.assertIn("/data/glm52-rl/runs/glm-perf-1/direct-parity.json", calls[0])
         self.assertNotIn("parity-step", calls[0])
 
     def test_parity_uses_configured_full_run_records(self):
         calls = []
-        profile = training_ops._profile("testing-perf")
+        profile = training_ops._config_dir("configs/general-agent")
         trainer_path = Path(__file__).resolve().parents[2] / profile["trainer"]
         with trainer_path.open("rb") as stream:
             output_dir = training_ops.tomllib.load(stream)["output_dir"]
@@ -302,7 +309,7 @@ class ParityReaderTest(unittest.TestCase):
             return {host: function(host)}
 
         with (
-            mock.patch.object(training_ops, "_profile_for_run", return_value={"trainer": "configs/testing-perf/trainer.toml", "orchestrator": "configs/testing-perf/orchestrator.toml"}),
+            mock.patch.object(training_ops, "_config_for_run", return_value={"trainer": "configs/general-agent/trainer.toml", "orchestrator": "configs/general-agent/orchestrator.toml"}),
             mock.patch.object(training_ops, "_fan", side_effect=fake_fan),
             mock.patch.object(training_ops, "_ssh", side_effect=fake_ssh),
             redirect_stdout(StringIO()),
@@ -330,7 +337,7 @@ class ParityReaderTest(unittest.TestCase):
             return {host: function(host)}
 
         with (
-            mock.patch.object(training_ops, "_profile_for_run", return_value=None),
+            mock.patch.object(training_ops, "_config_for_run", return_value=None),
             mock.patch.object(training_ops, "_fan", side_effect=fake_fan),
             mock.patch.object(training_ops, "_ssh", side_effect=fake_ssh),
             redirect_stdout(StringIO()),

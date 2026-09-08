@@ -9,7 +9,7 @@ trainer_container=${trainer_container_name:?set trainer_container_name}
 master_node=${master_node_id:?set master_node_id}
 RUN=${RUN:?set RUN}
 run_name=${RUN_NAME:-run_$RUN}
-trainer_config=${TRAINER_CONFIG:-$deployment/configs/current/trainer.toml}
+trainer_config=${TRAINER_CONFIG:-$deployment/configs/general-agent/trainer.toml}
 run_dir=$runs/$RUN/$run_name
 node=${node_id:-$(ip -4 -o addr show vlan130 | awk '{split($4, a, /[.\/]/); print a[4]}')}
 
@@ -27,7 +27,7 @@ common=(
   --ulimit core=0:0
   -v /data:/data
   -e CUDA_DEVICE_ORDER=PCI_BUS_ID
-  -e PYTHONPATH="$deployment/environments/testing-perf-env/src:/app/src"
+  -e PYTHONPATH="$deployment/environments/general-agent:/app/src"
   -e PYTHONUNBUFFERED=1
   -e OMP_NUM_THREADS=1
   -e PRIME_TRAINER_NODE="$node"

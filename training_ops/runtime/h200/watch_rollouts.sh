@@ -9,7 +9,7 @@ test -r "$renderer"
 if ! sudo docker inspect "$container" >/dev/null 2>&1; then
   runtime_dir=$(cd -- "$(dirname -- "$0")" && pwd)
   repository=$(cd -- "$runtime_dir/../../../../.." && pwd)
-  python3 - "$repository/configs/operations.toml" <<'PY'
+  python3 - "$repository/configs/nodes.toml" <<'PY'
 import json
 import sys
 import tomllib

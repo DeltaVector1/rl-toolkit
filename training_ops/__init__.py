@@ -25,29 +25,26 @@ from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
 repo_root = Path(__file__).resolve().parents[1]
-operations_path = repo_root / "configs" / "operations.toml"
+nodes_path = repo_root / "configs" / "nodes.toml"
+default_config_dir = "configs/general-agent"
 
 
-def _read_operations(path: Path = operations_path) -> dict:
+def _read_nodes(path: Path = nodes_path) -> dict:
     try:
         with path.open("rb") as stream:
             data = tomllib.load(stream)
     except (OSError, tomllib.TOMLDecodeError) as error:
-        raise RuntimeError(f"cannot read operations config {path}: {error}") from error
+        raise RuntimeError(f"cannot read nodes config {path}: {error}") from error
     return data
 
 
-operations = _read_operations()
-hosts = operations["hosts"]
-ports = operations["ports"]
-paths = operations["paths"]
-containers = operations["containers"]
-models = operations["models"]
-inference_settings = operations["inference"]
-reward_settings = operations["reward"]
-limits = operations["limits"]
-shared_requirements = operations["requirements"]["shared"]
-glm_requirements = operations["requirements"]["glm52"]
+nodes = _read_nodes()
+hosts = nodes["hosts"]
+ports = nodes["ports"]
+paths = nodes["paths"]
+containers = nodes["containers"]
+models = nodes["models"]
+inference_settings = nodes["inference"]
 
 trainer_head = hosts["trainer_head"]
 trainer_hosts = list(hosts["trainers"])
@@ -56,7 +53,7 @@ orchestrator_host = hosts["orchestrator"]
 metric_hosts = list(hosts["metrics"])
 blocked_hosts = set(hosts["blocked"])
 adapter_port = ports["adapter"]
-judge_api_url = operations["judges"]["external"]["api_url"].rstrip("/")
+judge_api_url = nodes["judges"]["external"]["api_url"].rstrip("/")
 remote_repo = paths["remote_repository"]
 storage_root = paths["storage_root"]
 run_root = paths["runs"]
@@ -70,51 +67,23 @@ adapter_relay_container = containers["adapter_relay"]
 glm_inference_container = containers["glm52_inference"]
 glm_model = models["glm52"]
 adapter_archive_bucket = paths.get("adapter_bucket")
-baseline_std = reward_settings["reference_spread"]
-baseline_run = reward_settings["reference_run"]
-minimum_trend_steps = reward_settings["minimum_steps"]
-trend_spread_multiplier = reward_settings["spread_multiplier"]
-stall_seconds = limits["stall_seconds"]
-final_validation_steps = limits["final_steps"]
-deployment_file_workers = limits["deployment_file_workers"]
-deployment_host_workers = limits["deployment_host_workers"]
-deployment_bundle_workers = limits.get("deployment_bundle_workers", 2)
-deployment_mkdir_timeout_seconds = limits["deployment_mkdir_timeout_seconds"]
-deployment_scp_timeout_seconds = limits["deployment_scp_timeout_seconds"]
-deployment_bundle_scp_timeout_seconds = limits.get(
-    "deployment_bundle_scp_timeout_seconds", 60
-)
-large_file_transfer_timeout_seconds = limits["large_file_transfer_timeout_seconds"]
-adapter_update_engine_startup_timeout_seconds = limits[
-    "adapter_update_engine_startup_timeout_seconds"
-]
-orchestrator_repair_staging_max_seconds = 7200
-if (
-    isinstance(adapter_update_engine_startup_timeout_seconds, bool)
-    or not isinstance(adapter_update_engine_startup_timeout_seconds, int)
-    or adapter_update_engine_startup_timeout_seconds < 600
-):
-    raise RuntimeError(
-        "limits.adapter_update_engine_startup_timeout_seconds must be an integer >= 600"
-    )
-if (
-    isinstance(large_file_transfer_timeout_seconds, bool)
-    or not isinstance(large_file_transfer_timeout_seconds, int)
-    or large_file_transfer_timeout_seconds < 600
-):
-    raise RuntimeError(
-        "limits.large_file_transfer_timeout_seconds must be an integer >= 600"
-    )
-group_size = shared_requirements["group_size"]
-max_output_length = shared_requirements["max_output_length"]
-learning_rate = shared_requirements["learning_rate"]
-max_gradient_norm = shared_requirements["max_gradient_norm"]
-weight_decay = shared_requirements["weight_decay"]
-glm_batch_size = glm_requirements["batch_size"]
-glm_context_length = glm_requirements["context_length"]
-glm_compute_max_seconds = glm_requirements["trainer_seconds_max"]
-glm_rollout_max_seconds = glm_requirements["rollout_seconds_max"]
 
+minimum_trend_steps = 10
+trend_spread_multiplier = 2.0
+stall_seconds = 600
+final_validation_steps = 50
+deployment_file_workers = 4
+deployment_host_workers = 4
+deployment_bundle_workers = 2
+deployment_mkdir_timeout_seconds = 30
+deployment_scp_timeout_seconds = 300
+deployment_bundle_scp_timeout_seconds = 60
+large_file_transfer_timeout_seconds = 7200
+adapter_update_engine_startup_timeout_seconds = 900
+adapter_delta_stage_timeout_seconds = 300
+trainer_seconds_max = 600
+rollout_seconds_max = 720
+orchestrator_repair_staging_max_seconds = 7200
 adapter_archive_files = ("adapter_config.json", "adapter_model.safetensors")
 dependency_manifest_name = ".training-ops-manifest"
 _dependency_remote_archive_pattern = re.compile(
@@ -123,14 +92,10 @@ _dependency_remote_archive_pattern = re.compile(
 
 if set(inference_hosts) != set(inference_settings):
     raise RuntimeError("each inference host must have one [inference.<host>] entry")
-profile_kinds = {
-    profile.get("kind") for profile in operations.get("profiles", {}).values()
-}
 for inference_host in inference_hosts:
-    missing_kinds = profile_kinds - set(inference_settings[inference_host])
-    if missing_kinds:
+    if "glm52" not in inference_settings[inference_host]:
         raise RuntimeError(
-            f"inference settings for {inference_host} are missing {sorted(missing_kinds)}"
+            f"inference settings for {inference_host} are missing glm52"
         )
 
 
@@ -141,32 +106,48 @@ def _inference_config(host: str) -> dict:
     return settings
 
 
-def _profile(name: str = "current") -> dict:
-    profiles = operations.get("profiles", {})
-    if name not in profiles:
-        raise Refused(f"unknown profile {name!r}; choose from {', '.join(sorted(profiles))}")
-    profile = dict(profiles[name])
-    if profile.get("kind") != "glm52":
-        raise RuntimeError(f"profile {name!r} must use kind='glm52'")
-    trainer = profile.get("trainer")
-    if not isinstance(trainer, str) or not (repo_root / trainer).is_file():
-        raise RuntimeError(f"profile {name!r} has no readable trainer config")
-    orchestrator = profile.get("orchestrator")
-    if orchestrator is not None and (
-        not isinstance(orchestrator, str) or not (repo_root / orchestrator).is_file()
-    ):
-        raise RuntimeError(f"profile {name!r} has no readable orchestrator config")
-    return profile
+def _config_dir(config_dir: str = default_config_dir, *, require_orchestrator: bool = False) -> dict:
+    """Resolve one explicit run directory without a profile registry."""
+    if not isinstance(config_dir, str) or not config_dir:
+        raise Refused("run config directory must be a non-empty path")
+    path = Path(config_dir)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        raise Refused(f"run config directory is unsafe: {config_dir!r}")
+    resolved = (repo_root / path).resolve()
+    configs_root = (repo_root / "configs").resolve()
+    if not resolved.is_relative_to(configs_root):
+        raise Refused(f"run config directory must be below configs/: {config_dir!r}")
+    trainer = path / "trainer.toml"
+    orchestrator = path / "orchestrator.toml"
+    if not (repo_root / trainer).is_file():
+        raise Refused(f"run config directory has no trainer.toml: {config_dir}")
+    selected = {"kind": "glm52", "trainer": trainer.as_posix()}
+    if (repo_root / orchestrator).is_file():
+        selected["orchestrator"] = orchestrator.as_posix()
+    elif require_orchestrator:
+        raise Refused(f"run config directory has no orchestrator.toml: {config_dir}")
+    return selected
 
 
-def _profile_for_run(run: str, required: bool = True) -> dict | None:
-    """Select the configured trainer profile whose output matches the run."""
+def _config_for_run(
+    run: str,
+    required: bool = True,
+    config_dir: str | None = None,
+) -> dict | None:
+    """Select a real run directory whose output matches the run."""
     if not isinstance(run, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", run):
         raise Refused(f"active run name is invalid: {run!r}")
+    if config_dir is not None:
+        candidates = [_config_dir(config_dir)]
+    else:
+        configs_root = repo_root / "configs"
+        candidates = [
+            _config_dir(trainer.parent.relative_to(repo_root).as_posix())
+            for trainer in sorted(configs_root.rglob("trainer.toml"))
+        ]
     matches = []
-    for name in sorted(operations.get("profiles", {})):
-        profile = _profile(name)
-        trainer_path = repo_root / profile["trainer"]
+    for selected in candidates:
+        trainer_path = repo_root / selected["trainer"]
         try:
             with trainer_path.open("rb") as stream:
                 config = tomllib.load(stream)
@@ -176,19 +157,15 @@ def _profile_for_run(run: str, required: bool = True) -> dict | None:
         if not isinstance(output_dir, str) or not output_dir:
             raise RuntimeError(f"trainer config {trainer_path} has no output_dir")
         if Path(output_dir).name == run:
-            matches.append((name, profile))
+            matches.append(selected)
     if not matches and not required:
         return None
     if not matches:
-        raise Refused(
-            f"no configured trainer profile has output_dir ending in {run!r}"
-        )
+        raise Refused(f"no run config directory has output_dir ending in {run!r}")
     if len(matches) > 1:
-        names = ", ".join(name for name, _ in matches)
-        raise Refused(
-            f"multiple configured trainer profiles have output_dir ending in {run!r}: {names}"
-        )
-    return matches[0][1]
+        names = ", ".join(item["trainer"] for item in matches)
+        raise Refused(f"multiple run config directories match {run!r}: {names}")
+    return matches[0]
 
 ssh_command = [
     "ssh",
@@ -698,11 +675,11 @@ class AcceptanceReport:
         L.append(f"native FP8 trainer: {precision}")
         L.append(
             f"trainer time/forward_backward (includes optimizer): {trainer} "
-            f"(upper bound {glm_compute_max_seconds:g}s)"
+            f"(upper bound {trainer_seconds_max:g}s)"
         )
         L.append(
             f"active rollout generation time: {generation} "
-            f"(upper bound {glm_rollout_max_seconds:g}s)"
+            f"(upper bound {rollout_seconds_max:g}s)"
         )
         L.append(
             "excluded from both times: policy/check waiting, judging/scoring, batch transfer, "
@@ -933,6 +910,19 @@ def _numbers(values: dict[str, list[object]], keys: tuple[str, ...]) -> list[flo
     return out
 
 
+def _expected_value(values: dict[str, list[object]], keys: tuple[str, ...]):
+    """Return one run setting, or None when it is absent or inconsistent."""
+    found = []
+    for key in keys:
+        found.extend(values.get(key, []))
+    if not found:
+        return None
+    first = found[0]
+    if all(value == first for value in found[1:]):
+        return first
+    return None
+
+
 def _parse_jsonl_metrics(text: str) -> list[dict]:
     """Merge valid JSONL monitor records by step."""
     by_step: dict[int, dict] = {}
@@ -1078,8 +1068,27 @@ def _acceptance_from_text(
         rollout_rows, run, rollout_active_run, rollout_start_epoch
     )
     rep = AcceptanceReport(run=run, profile="glm52", reward_verdict=reward_verdict)
-    expected_batch = glm_batch_size
-    expected_context = glm_context_length
+    expected_batch = _expected_value(orch_values, ("batch_size",))
+    expected_group = _expected_value(orch_values, ("group_size",))
+    expected_context = _expected_value(trainer_values, ("model.seq_len",))
+    expected_output = _expected_value(
+        orch_values,
+        (
+            "train.sampling.max_completion_tokens",
+            "train.env.sampling.max_completion_tokens",
+            "train.env.env.agent.max_output_tokens",
+        ),
+    )
+    expected_learning_rate = _expected_value(
+        trainer_values, ("optim.lr",)
+    )
+    orch_learning_rate = _expected_value(orch_values, ("optim.lr",))
+    if expected_learning_rate is None or orch_learning_rate != expected_learning_rate:
+        expected_learning_rate = None
+    expected_max_norm = _expected_value(trainer_values, ("optim.max_norm",))
+    expected_weight_decay = _expected_value(
+        trainer_values, ("optim.weight_decay",)
+    )
 
     rep.batch_size = _last(orch_values, "batch_size")
     rep.group_size = _last(orch_values, "group_size")
@@ -1170,34 +1179,36 @@ def _acceptance_from_text(
             rep.alarms.append(f"{name} is {_shown(actual)}; expected {want}")
 
     expected("batch size", rep.batch_size, expected_batch)
-    expected("group size", rep.group_size, group_size)
+    expected("group size", rep.group_size, expected_group)
     expected("context length", rep.context_length, expected_context)
     if not rep.max_output_lengths or any(
-        v != max_output_length for v in rep.max_output_lengths
+        expected_output is None or v != expected_output for v in rep.max_output_lengths
     ):
         shown = ",".join(map(str, rep.max_output_lengths)) or "?"
         rep.alarms.append(
-            f"maximum output length is {shown}; expected {max_output_length}"
+            f"maximum output length is {shown}; expected {expected_output}"
         )
     if len(rep.learning_rates) < 2 or any(
-        not _near(v, learning_rate) for v in rep.learning_rates
+        expected_learning_rate is None
+        or not _near(v, float(expected_learning_rate))
+        for v in rep.learning_rates
     ):
         shown = ",".join(f"{v:g}" for v in rep.learning_rates) or "?"
         rep.alarms.append(
-            f"trainer/orchestrator learning rates are {shown}; expected {learning_rate:g}"
+            f"trainer/orchestrator learning rates are {shown}; expected {expected_learning_rate}"
         )
-    if rep.max_norm is None or not _near(rep.max_norm, max_gradient_norm):
+    if expected_max_norm is None or rep.max_norm is None or not _near(rep.max_norm, float(expected_max_norm)):
         rep.alarms.append(
-            f"maximum gradient norm is {_shown(rep.max_norm)}; expected {max_gradient_norm:g}"
+            f"maximum gradient norm is {_shown(rep.max_norm)}; expected {expected_max_norm}"
         )
-    if rep.weight_decay is None or not _near(rep.weight_decay, weight_decay):
+    if expected_weight_decay is None or rep.weight_decay is None or not _near(rep.weight_decay, float(expected_weight_decay)):
         rep.alarms.append(
-            f"weight decay is {_shown(rep.weight_decay)}; expected {weight_decay:g}"
+            f"weight decay is {_shown(rep.weight_decay)}; expected {expected_weight_decay}"
         )
     if rep.precision_ok is not True:
         rep.alarms.append("trainer is not confirmed on native FP8 checkpoint weights")
 
-    bad_compute = [step for step, seconds in compute if seconds > glm_compute_max_seconds]
+    bad_compute = [step for step, seconds in compute if seconds > trainer_seconds_max]
     if invalid_compute:
         rep.alarms.append(
             "trainer time/forward_backward is missing or invalid at steps "
@@ -1206,7 +1217,7 @@ def _acceptance_from_text(
     if bad_compute:
         rep.alarms.append(
             f"trainer time/forward_backward exceeds configured upper bound "
-            f"{glm_compute_max_seconds:g}s at steps "
+            f"{trainer_seconds_max:g}s at steps "
             f"{','.join(map(str, bad_compute[-8:]))}"
         )
     elif rep.completed_steps >= 1 and not compute and not invalid_compute:
@@ -1214,7 +1225,7 @@ def _acceptance_from_text(
             "no trainer time/forward_backward measurement"
         )
 
-    bad_generation = [step for step, seconds in generation if seconds > glm_rollout_max_seconds]
+    bad_generation = [step for step, seconds in generation if seconds > rollout_seconds_max]
     if invalid_generation:
         rep.alarms.append(
             "active rollout generation time is missing or invalid at steps "
@@ -1223,7 +1234,7 @@ def _acceptance_from_text(
     if bad_generation:
         rep.alarms.append(
             f"active rollout generation time exceeds configured upper bound "
-            f"{glm_rollout_max_seconds:g}s at steps "
+            f"{rollout_seconds_max:g}s at steps "
             f"{','.join(map(str, bad_generation[-8:]))}"
         )
     elif rollout_rows and not generation and not invalid_generation:
@@ -1515,7 +1526,7 @@ def parity(run: str = "") -> dict:
     run = run or current_run()
     if not re.fullmatch(r"[A-Za-z0-9_-]+", run):
         raise Refused("run name contains invalid characters")
-    profile = _profile_for_run(run, required=not explicit_run)
+    profile = _config_for_run(run, required=not explicit_run)
     if profile is None:
         source = "archive"
         find_path = f"{run_root}/{run}"
@@ -2281,7 +2292,7 @@ def steps(run: str = "", limit: int = 10) -> list[dict]:
         raise Refused("run name contains invalid characters")
     if not 1 <= int(limit) <= 200:
         raise Refused("step limit must be between 1 and 200")
-    profile = _profile_for_run(run, required=False)
+    profile = _config_for_run(run, required=False)
     source = "archive"
     configured_path = None
     lookup_path = f"{run_root}/{run}"
@@ -2553,9 +2564,6 @@ class RewardReport:
             f"effective reward: mean {self.mean:.4f}, standard deviation {self.std:.4f} across steps"
         )
         L.append(
-            f"baseline {baseline_run}: standard deviation {baseline_std:.4f} at batch 256 over 36 steps"
-        )
-        L.append(
             f"fit: {self.total_change:+.4f} over the window, residual spread {self.residual_std:.4f}, "
             f"threshold {trend_spread_multiplier:g} x residual = {trend_spread_multiplier * self.residual_std:.4f}"
         )
@@ -2754,12 +2762,6 @@ def _reward_note(r: RewardReport) -> str:
                 f"{r.p10[-1]:.4f}. The reward is a product of five factors, so the bottom stays pinned at zero. "
                 "The distribution is widening at the top even when the mean is flat."
             )
-    if len(r.steps) >= minimum_trend_steps and r.std:
-        cmp = "below" if r.std < baseline_std else "above"
-        notes.append(
-            f"Step-to-step spread is {r.std:.4f}, {cmp} the {baseline_run} baseline of {baseline_std:.4f}. "
-            "That comparison is the reason the batch size was raised."
-        )
     return "\n".join(notes)
 
 
@@ -2824,7 +2826,7 @@ def watch(hours: float = 2.0, every: int = 300, run: str = "") -> list[Status]:
 
 def _microbatch_sync_config(run: str) -> tuple[str, list[str], str]:
     """Resolve the current trainer output and exact peer addresses."""
-    selected = _profile_for_run(run)
+    selected = _config_for_run(run)
     trainer_path = repo_root / selected["trainer"]
     try:
         with trainer_path.open("rb") as stream:
@@ -2987,7 +2989,7 @@ exit 26
 
 def _adapter_update_config(run: str) -> dict:
     """Resolve adapter update paths from the selected profile."""
-    selected = _profile_for_run(run)
+    selected = _config_for_run(run)
     orchestrator_path = selected.get("orchestrator")
     if not isinstance(orchestrator_path, str):
         raise Refused(f"profile for {run} has no orchestrator config")
@@ -3209,7 +3211,7 @@ def _adapter_stage_status_evidence(run: str, config: dict, log: str) -> str:
         records[host] = record
 
     failures = []
-    stage_limit = limits["adapter_delta_stage_timeout_seconds"]
+    stage_limit = adapter_delta_stage_timeout_seconds
     for host, record in records.items():
         state = record.get("status")
         if state not in {"ready", "failed"}:
@@ -3691,12 +3693,12 @@ def repair(what: str) -> str:
     if what == "adapter-tunnels":
         return _repair_adapter_tunnels()
     if what.startswith("adapter-tunnels:"):
-        profile_name = what.split(":", 1)[1]
-        if not profile_name:
-            raise Refused("adapter-tunnels requires a configured profile name")
-        return _repair_adapter_tunnels(profile_name)
+        config_dir = what.split(":", 1)[1]
+        if not config_dir:
+            raise Refused("adapter-tunnels requires a run config directory")
+        return _repair_adapter_tunnels(config_dir)
     raise Refused(
-        f"unknown repair {what!r}. Use engine-watchdog:<host>, engine:<host>, supervisors, microbatch-sync, adapter-update, adapter-server[:reload], orchestrator, or adapter-tunnels[:profile]."
+        f"unknown repair {what!r}. Use engine-watchdog:<host>, engine:<host>, supervisors, microbatch-sync, adapter-update, adapter-server[:reload], orchestrator, or adapter-tunnels[:config-dir]."
     )
 
 
@@ -3750,7 +3752,7 @@ def _repair_adapter_server(force: bool = False) -> str:
 
 def _repair_adapter_update() -> str:
     run = current_run()
-    profile = _profile_for_run(run)
+    profile = _config_for_run(run)
     config = _adapter_update_config(run)
     before = status(run, quiet=True)
     if not before.trainer_up or before.trainer_failed:
@@ -3953,7 +3955,7 @@ def _repair_microbatch_sync() -> str:
 def _repair_orchestrator() -> str:
     """Resume the exact orchestrator after proving all peers are safe."""
     run = current_run()
-    profile = _profile_for_run(run)
+    profile = _config_for_run(run)
     if not isinstance(profile.get("orchestrator"), str):
         raise Refused(f"active profile for {run} has no orchestrator config")
 
@@ -4037,12 +4039,12 @@ def _repair_orchestrator() -> str:
     return result
 
 
-def _repair_adapter_tunnels(profile_name: str | None = None) -> str:
+def _repair_adapter_tunnels(config_dir: str | None = None) -> str:
     """Reconcile the configured adapter tunnels without starting services."""
-    if profile_name:
-        profile = _profile(profile_name)
+    if config_dir:
+        profile = _config_dir(config_dir, require_orchestrator=True)
     else:
-        profile = _profile_for_run(current_run())
+        profile = _config_for_run(current_run())
     orchestrator_config = profile.get("orchestrator")
     if not isinstance(orchestrator_config, str):
         raise Refused("selected profile has no orchestrator config for adapter tunnels")
@@ -4265,7 +4267,7 @@ def _repair_engine_watchdog(host: str) -> str:
     if host not in inference_hosts:
         raise Refused(f"{host} is not an engine host. Use one of {inference_hosts}.")
     run = current_run()
-    _profile_for_run(run)
+    _config_for_run(run)
     settings = _inference_config(host)
     configured_ports = settings.get("ports")
     if not isinstance(configured_ports, list) or not configured_ports:
@@ -4308,10 +4310,13 @@ def _repair_engine_watchdog(host: str) -> str:
     return result
 
 
-def _repair_supervisors(profile: str = "current") -> str:
+def _repair_supervisors(config_dir: str | None = None) -> str:
     out = []
+    if config_dir is None:
+        _config_for_run(current_run())
+    else:
+        _config_dir(config_dir, require_orchestrator=True)
     for h in inference_hosts:
-        _profile(profile)
         rc, count_text = _ssh(
             h,
             f"pgrep -f '^bash {runtime_root}/h200/engine_watchdog.sh$' | wc -l",
@@ -4389,7 +4394,7 @@ def _repository_root(name: str = "default") -> str:
         raise Refused(f"unknown repository {name!r}; choose default")
     root = paths.get("remote_repository")
     if not isinstance(root, str) or not root.startswith("/"):
-        raise Refused(f"repository {name!r} is missing from operations config")
+        raise Refused(f"repository {name!r} is missing from nodes config")
     return root.rstrip("/")
 
 
@@ -4437,7 +4442,7 @@ def deploy(
             ]
         elif path.startswith(("environments/", "evals/")):
             nodes = [orchestrator_host]
-        elif path.startswith(("training_ops/runtime/h200/", "configs/runtime/")):
+        elif path.startswith("training_ops/runtime/h200/") or path == "configs/general-agent/inference.toml":
             nodes = inference_hosts
         elif path.startswith("training_ops/runtime/china/"):
             nodes = trainer_hosts
@@ -5107,7 +5112,8 @@ def _start_dependency_inventory(
     )
 
     configured_hosts = list(dict.fromkeys([*trainer_hosts, *inference_hosts]))
-    add("configs/operations.toml", configured_hosts)
+    add("configs/nodes.toml", configured_hosts)
+    add("configs/general-agent/inference.toml", inference_hosts)
     for path in mounted_files():
         if not path.startswith("prime-rl/"):
             continue
@@ -5116,17 +5122,6 @@ def _start_dependency_inventory(
 
     add(selected["trainer"], nodes)
     add(selected["orchestrator"], [orchestrator_host])
-    for root in (
-        "environments/decensor/src",
-        "environments/ornith/src",
-        "evals/refusals-classifier",
-    ):
-        add_files(root, [orchestrator_host], suffix=".py")
-    add_files(
-        "environments/testing-perf-env/src",
-        [*trainer_destinations, orchestrator_host],
-        suffix=".py",
-    )
     with (repo_root / selected["orchestrator"]).open("rb") as stream:
         train_envs = tomllib.load(stream).get("train", {}).get("env", [])
     if any(
@@ -5655,17 +5650,15 @@ def start(
     supervisors: bool = True,
     resume_adapter: str | None = None,
     resume_step: int | None = None,
-    profile: str = "current",
+    config_dir: str = default_config_dir,
 ) -> None:
-    """Start a run from one configured profile."""
+    """Start a run from one explicit run config directory."""
     if mode not in ("cold", "restart"):
         raise Refused('mode must be "cold" or "restart"')
     _runs_path, _run_parent, service_run_dir = _cold_run_paths(run)
     if (resume_adapter is None) != (resume_step is None):
         raise Refused("resume_adapter and resume_step must be set together")
-    selected = _profile(profile)
-    if "orchestrator" not in selected:
-        raise Refused(f"profile {profile!r} is trainer-only; use qualify()")
+    selected = _config_dir(config_dir, require_orchestrator=True)
     if resume_adapter is not None:
         if not resume_adapter.startswith(f"{run_root}/"):
             raise Refused(f"resume adapter must be below {run_root}")
@@ -5939,7 +5932,7 @@ exit 1
         launch_orch()
 
     if supervisors:
-        _repair_supervisors(profile)
+        _repair_supervisors(config_dir)
     print(f"started {run} in {mode} mode. Call status() in a few minutes.")
 
 
@@ -5947,6 +5940,7 @@ def qualify(
     name: str,
     mode: str = "cold",
     nodes: list[str] | None = None,
+    config_dir: str = default_config_dir,
 ) -> None:
     """Start one configured trainer-only qualification."""
     if mode not in ("cold", "restart"):
@@ -5957,10 +5951,10 @@ def qualify(
     if trainer_head in nodes:
         nodes = [trainer_head] + [host for host in nodes if host != trainer_head]
 
-    selected = _profile(name)
+    selected = _config_dir(config_dir)
     launch_env = _qualification_launch_env(selected)
     if "orchestrator" in selected:
-        raise Refused(f"profile {name!r} is a full run; use start()")
+        raise Refused(f"run config directory {config_dir!r} is a full run; use start()")
     relative_config = selected["trainer"]
     local_config = repo_root / relative_config
     if not local_config.is_file():
@@ -6110,7 +6104,17 @@ def _start_action(arguments: list[str]):
     return start(
         arguments[0],
         arguments[1] if len(arguments) > 1 else "cold",
-        profile=arguments[2] if len(arguments) > 2 else "current",
+        config_dir=arguments[2] if len(arguments) > 2 else default_config_dir,
+    )
+
+
+def _qualify_action(arguments: list[str]):
+    if not arguments:
+        raise Refused("qualify needs a run name")
+    return qualify(
+        arguments[0],
+        arguments[1] if len(arguments) > 1 else "cold",
+        config_dir=arguments[2] if len(arguments) > 2 else default_config_dir,
     )
 
 
@@ -6148,7 +6152,7 @@ actions = {
     "deploy": lambda a: deploy(*a),
     "start": _start_action,
     "archive": _archive_action,
-    "qualify": lambda a: qualify(*a),
+    "qualify": _qualify_action,
     "stop": lambda a: stop(),
     "mounts": lambda a: print("\n".join(mounted_files())),
 }
@@ -6176,10 +6180,10 @@ usage = f"""training-ops <action> [args]
   watch [hours] [seconds]       monitor in the foreground
   repair <name>                 repair an engine, adapter server, orchestrator, supervisors, or microbatch sync
   deploy <path>                 copy one repository file
-  start <run> [mode] [profile]  start one configured profile
+  start <run> [mode] [config-dir]  start one run config directory
   archive <run> [step ...]      upload stable old LoRA adapters
                                 add --finished after another run is active
-  qualify <profile>             start a trainer-only profile
+  qualify <name> [mode] [config-dir]  start a trainer-only config directory
   mounts                        list live-mounted source files
   stop                          stop the run but keep inference loaded
 

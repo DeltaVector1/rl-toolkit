@@ -6,14 +6,14 @@ model=/data/glm52-rl/refusals-classifier-eval/model-rp-validity-396m
 service=$deployment/evals/refusals-classifier/classifier_service.py
 image=${VLLM_IMAGE:-vllm/vllm-openai:nightly-5a4c8d99242e9e069b604d0e9b969e77f7dd501d}
 container=refusals-classifier-eval
-classifier_port=$(python3 - "$deployment/configs/operations.toml" <<'PY'
+classifier_port=$(python3 - "$deployment/configs/nodes.toml" <<'PY'
 import sys
 import tomllib
 
 with open(sys.argv[1], "rb") as stream:
     value = tomllib.load(stream)["ports"].get("refusal_classifier")
 if not isinstance(value, int) or not 1 <= value <= 65535:
-    raise SystemExit("operations config has no valid refusal classifier port")
+    raise SystemExit("nodes config has no valid refusal classifier port")
 print(value)
 PY
 )
