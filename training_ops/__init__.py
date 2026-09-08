@@ -89,6 +89,7 @@ dependency_manifest_name = ".training-ops-manifest"
 _dependency_remote_archive_pattern = re.compile(
     r"^/tmp/trainer-dependencies-[A-Za-z0-9._-]+\.tar(?:\.gz)?$"
 )
+_run_name_pattern = re.compile(r"[A-Za-z0-9_-]+")
 
 if set(inference_hosts) != set(inference_settings):
     raise RuntimeError("each inference host must have one [inference.<host>] entry")
@@ -1817,16 +1818,23 @@ def current_run() -> str:
         trainer_head,
         f"sudo docker inspect {trainer_container} --format '{{{{range .Config.Env}}}}{{{{println .}}}}{{{{end}}}}' 2>/dev/null | grep -E '^RUN='",
     )
-    m = re.search(r"^RUN=(\S+)", out, re.M)
-    if m:
-        return m.group(1)
+    if rc == 0:
+        for line in out.splitlines():
+            if not line.startswith("RUN="):
+                continue
+            run = line[4:].strip()
+            if _run_name_pattern.fullmatch(run):
+                return run
     rc, command = _ssh(
         trainer_head,
         f"sudo docker inspect {trainer_container} --format '{{{{range .Config.Cmd}}}}{{{{println .}}}}{{{{end}}}}' 2>/dev/null",
     )
-    m = re.search(rf"^--log-dir={re.escape(run_root)}/([^/]+)/", command, re.M)
-    if m:
-        return m.group(1)
+    if rc == 0:
+        m = re.search(
+            rf"^--log-dir={re.escape(run_root)}/([A-Za-z0-9_-]+)/", command, re.M
+        )
+        if m:
+            return m.group(1)
     detail = command.strip() or out.strip() or f"container {trainer_container} has no run path"
     raise RuntimeError(f"cannot identify the active run on {trainer_head}: {detail}")
 
