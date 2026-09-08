@@ -5,7 +5,6 @@ import math
 import os
 import re
 import time
-import tomllib
 from collections.abc import Mapping
 from itertools import cycle
 from pathlib import Path
@@ -976,34 +975,18 @@ LORA_LOAD_READ_TIMEOUT_S = 900.0
 LORA_LOAD_TOTAL_TIMEOUT_S = 1200.0
 LORA_STAGE_ATTEMPT_TIMEOUT_S = 3600.0
 LORA_STAGE_TOTAL_TIMEOUT_S = 7200.0
+default_delta_stage_timeout_s = 300.0
 
 
 def _delta_stage_timeout_s() -> float:
     configured = os.environ.get("PRIME_LORA_DELTA_STAGE_TIMEOUT_S")
-    if configured is not None:
+    if configured is None:
+        value = default_delta_stage_timeout_s
+    else:
         try:
             value = float(configured)
         except ValueError as exc:
             raise RuntimeError("PRIME_LORA_DELTA_STAGE_TIMEOUT_S must be a number") from exc
-    else:
-        config_path = Path(
-            os.environ.get(
-                "PRIME_RL_OPERATIONS_CONFIG",
-                "/data/glm52-rl/deployment/configs/operations.toml",
-            )
-        )
-        try:
-            with config_path.open("rb") as stream:
-                config = tomllib.load(stream)
-        except FileNotFoundError as exc:
-            raise RuntimeError(f"operations config is missing: {config_path}") from exc
-        except (OSError, tomllib.TOMLDecodeError) as exc:
-            raise RuntimeError(f"cannot read operations config: {config_path}") from exc
-        else:
-            limits = config.get("limits")
-            if not isinstance(limits, dict) or "adapter_delta_stage_timeout_seconds" not in limits:
-                raise RuntimeError("operations config has no adapter delta stage timeout")
-            value = limits["adapter_delta_stage_timeout_seconds"]
     if (
         isinstance(value, bool)
         or not isinstance(value, (int, float))

@@ -1051,6 +1051,21 @@ class AdapterTransportStateTest(unittest.TestCase):
             else:
                 os.environ["PRIME_LORA_DOWNLOAD_STREAMS"] = old_value
 
+    def test_delta_stage_timeout_defaults_without_operations_config(self):
+        filesystem = load_filesystem_module()
+        old_timeout = os.environ.pop("PRIME_LORA_DELTA_STAGE_TIMEOUT_S", None)
+        old_operations = os.environ.get("PRIME_RL_OPERATIONS_CONFIG")
+        try:
+            os.environ["PRIME_RL_OPERATIONS_CONFIG"] = "/missing/operations.toml"
+            self.assertEqual(filesystem._delta_stage_timeout_s(), 300.0)
+        finally:
+            if old_timeout is not None:
+                os.environ["PRIME_LORA_DELTA_STAGE_TIMEOUT_S"] = old_timeout
+            if old_operations is None:
+                os.environ.pop("PRIME_RL_OPERATIONS_CONFIG", None)
+            else:
+                os.environ["PRIME_RL_OPERATIONS_CONFIG"] = old_operations
+
     def test_explicit_delta_stage_timeout_is_positive_and_bounded(self):
         filesystem = load_filesystem_module()
         old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")

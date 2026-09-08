@@ -8,7 +8,6 @@ import shutil
 import stat
 import threading
 import time
-import tomllib
 import urllib.request
 from urllib.error import HTTPError
 from contextlib import contextmanager
@@ -35,6 +34,7 @@ def adapter_cache_path(source_url: str) -> Path:
 _PARALLEL_DOWNLOAD_THRESHOLD = 16 * 1024 * 1024
 _DOWNLOAD_STREAMS_ENV = "PRIME_LORA_DOWNLOAD_STREAMS"
 _MAX_DOWNLOAD_STREAMS = 128
+default_delta_stage_timeout_s = 300.0
 _ADAPTER_FILES = ("adapter_config.json", "adapter_model.safetensors")
 _ADAPTER_MANIFEST = "adapter_manifest.json"
 _ADAPTER_DIGEST = "adapter_model.safetensors.sha256"
@@ -545,30 +545,13 @@ def _configured_download_streams() -> int:
 
 def _delta_stage_timeout_s() -> float:
     configured = os.environ.get("PRIME_LORA_DELTA_STAGE_TIMEOUT_S")
-    if configured is not None:
+    if configured is None:
+        value = default_delta_stage_timeout_s
+    else:
         try:
             value = float(configured)
         except ValueError as exc:
             raise OSError("PRIME_LORA_DELTA_STAGE_TIMEOUT_S must be a number") from exc
-    else:
-        config_path = Path(
-            os.environ.get(
-                "PRIME_RL_OPERATIONS_CONFIG",
-                "/data/glm52-rl/deployment/configs/operations.toml",
-            )
-        )
-        try:
-            with config_path.open("rb") as stream:
-                config = tomllib.load(stream)
-        except FileNotFoundError as exc:
-            raise OSError(f"operations config is missing: {config_path}") from exc
-        except (OSError, tomllib.TOMLDecodeError) as exc:
-            raise OSError(f"cannot read operations config: {config_path}") from exc
-        else:
-            limits = config.get("limits")
-            if not isinstance(limits, dict) or "adapter_delta_stage_timeout_seconds" not in limits:
-                raise OSError("operations config has no adapter delta stage timeout")
-            value = limits["adapter_delta_stage_timeout_seconds"]
     if (
         isinstance(value, bool)
         or not isinstance(value, (int, float))
