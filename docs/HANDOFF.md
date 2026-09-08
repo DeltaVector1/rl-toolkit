@@ -1,13 +1,28 @@
 # Current handoff
 
-Updated 2026-09-07 UTC. Use `configs/operations.toml` for every host, path,
+Updated 2026-09-08 UTC. Use `configs/operations.toml` for every host, path,
 port, container, and profile value.
 
 ## Current state
 
-- Restart invoked at 23:45:14 UTC using `7fffd7d`. It is the same neutral
-  `glm-perf-2` run, with fresh rollouts and a 20-step target. Completion is
-  not yet confirmed. Root owns live operation and monitoring.
+- Both H200s restarted at 00:08:42 UTC with `4aa1772`; trainer restart
+  invoked at 00:09:13. Root owns live operation and foreground monitoring.
+  This remains neutral `glm-perf-2`, fresh rollouts, and a 20-step target.
+  There are still 0 completed optimizer steps. New graph use and speed are
+  not yet measured.
+- The 23:45 restart loaded the saved adapter correctly and reused both H200
+  caches in 3.3 seconds. It was stopped at 00:04:56 after about 13 minutes
+  of generation, 0 complete groups, and 4 buffered rollouts. No compute step
+  occurred. Combined generation was about 1,500-1,690 tokens/s.
+- The CUDA graph cap was 128 tokens. At 128 requests with MTP1, decode can
+  schedule 256 tokens; vLLM 0.26 dispatches above-cap batches without graphs.
+  `4aa1772` derives the cap from requests times (1 + MTP tokens), giving 256,
+  and enables graph metrics. Installed-image argument validation passed.
+  Context, MTP, request count, memory fraction, and parallelism are unchanged.
+- `ad21e56` corrects the neutral workload: seeded decayed 1-6 turns and mixed
+  short/medium/long responses instead of uniform 2-6 turns with 400-700 words
+  every turn. The isolated trainer-image compatibility check passed. This
+  workload change is not a trainer-speed improvement. Decensor is unchanged.
 - Ownership repair `7912cc0` fixes both H200 broadcast-directory creators.
   The exact H200A directories now pass an actual UID 1000 write check.
   The complete saved step-0 adapter is readable on all eight trainer hosts.

@@ -1,6 +1,6 @@
 # Performance measurements
 
-Updated 2026-09-07 UTC.
+Updated 2026-09-08 UTC.
 
 These are measured results. Keep trainer, rollout, adapter transfer, full-
 weight transfer, H200 activation, judging, and save time separate.
@@ -17,7 +17,22 @@ weight transfer, H200 activation, judging, and save time separate.
 
 ## Current neutral production-shaped run
 
-Latest attempt: 0 optimizer steps. Both H200s loaded the correct step-0
+Latest completed attempt: 0 optimizer steps. Restart began 23:45:14 and
+returned 23:50:58 UTC. Initial saved-adapter staging used both ready caches
+in 3.3 seconds (origin 3.0 seconds, peer 283 ms), with the same full-file SHA.
+This is cached startup, not a positive-step adapter update measurement.
+Fresh generation began about 23:51:25. The run stopped at 00:04:56 with
+0 complete groups and 4 buffered rollouts. Combined H200 output was about
+1,500-1,690 tokens/s. No forward/backward measurement exists for this attempt.
+
+The graph cap of 128 tokens did not cover a full 128-request MTP1 decode
+(256 tokens). Commit `4aa1772` raises the derived cap and enables graph
+metrics. Both engines restarted at 00:08:42; trainer restart began 00:09:13.
+Speed after the change is not yet measured. The neutral turn/length mix also
+changed in `ad21e56`; compare tokens/s and equal-token compute measurements,
+not raw step time alone, across that workload change.
+
+Earlier attempt: 0 optimizer steps. Both H200s loaded the correct step-0
 adapter (B at 17:26:15 UTC, A at 17:26:20). A received all bytes in
 2,674.547 seconds and finished staging in 2,713.330 seconds. B received all
 bytes in 82.705 seconds and finished staging in 116.598 seconds. These are
