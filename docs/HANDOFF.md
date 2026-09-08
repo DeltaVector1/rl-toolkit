@@ -13,6 +13,16 @@ port, container, and profile value.
   At 00:19:37, A generated 2,553.0 tokens/s and B 2,679.7 tokens/s (5,232.7
   combined). This is an early decode sample, not a complete rollout average.
   Fresh generation began about 00:18:32; initial cached staging took 3.0s.
+- At 00:32 UTC: 160/1,024 accepted rollouts, 118 buffered, 0 optimizer
+  steps, and about 4,763 generated tokens/s combined. Collection has exceeded
+  the 720-second requirement; this is not a passed speed test. A current-attempt
+  trace sample had 288 scored rollouts and no errors. Median generation was
+  214.6s per rollout; median scoring was 3.2s. Seven of eleven complete groups
+  had identical rewards. The sink unconditionally discards zero-advantage
+  groups and generates replacements. Do not disable this to claim useful
+  training throughput. The neutral tasks are easy for this model.
+  The trace file includes previous restarts: filter `timing.start` to the
+  current attempt before reporting failures, lengths, or reward statistics.
 - The 23:45 restart loaded the saved adapter correctly and reused both H200
   caches in 3.3 seconds. It was stopped at 00:04:56 after about 13 minutes
   of generation, 0 complete groups, and 4 buffered rollouts. No compute step
