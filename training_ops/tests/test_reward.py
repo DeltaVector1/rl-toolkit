@@ -13,6 +13,28 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import training_ops
 
 
+class TrainerComputeProbeTest(unittest.TestCase):
+    def test_parses_current_step_with_optional_pp_completion(self):
+        self.assertEqual(training_ops._parse_trainer_compute("2"), (2, None))
+        self.assertEqual(
+            training_ops._parse_trainer_compute("2 454.89"), (2, 454.89)
+        )
+
+    def test_rejects_malformed_or_negative_compute_report(self):
+        for value in ("", "2 nope", "2 -1", "2 1 extra"):
+            self.assertIsNone(training_ops._parse_trainer_compute(value))
+
+    def test_compute_limit_remains_enforced(self):
+        status = training_ops.Status(
+            trainer_compute_step=2,
+            trainer_compute_seconds=600.01,
+        )
+        self.assertIn(
+            "trainer compute step 2 exceeds configured upper bound 600s",
+            training_ops._warnings(status),
+        )
+
+
 class ActiveRewardRowsTest(unittest.TestCase):
     def test_selects_rows_after_active_container_start(self):
         rows = [
