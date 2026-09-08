@@ -3,7 +3,7 @@ set -euo pipefail
 
 deployment=/data/glm52-rl/deployment
 engine_host=${ENGINE_HOST:?ENGINE_HOST must name this host in nodes.toml}
-inference_config=${INFERENCE_CONFIG:-$deployment/configs/general-agent/inference.toml}
+inference_config=${inference_config:-$deployment/configs/general-agent/inference.toml}
 test -f "$inference_config" || {
   echo "inference config is missing: $inference_config" >&2
   exit 2
