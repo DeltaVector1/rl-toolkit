@@ -125,12 +125,14 @@ def bwd(
     indices_dtype=T.int32,
     dtype=T.bfloat16,
     accum_dtype=T.float32,
+    skip_sentinel_stores=False,
 ):
     assert is_causal is True, "non-casual is not supported now"
     assert topk % block_size == 0, "otherwise will load some index=0 thus causing wrong kv to be loaded"
     assert dtype == T.bfloat16
     assert accum_dtype == T.float32
     assert indices_dtype == T.int32
+    assert isinstance(skip_sentinel_stores, bool)
 
     if sm_scale is None:
         sm_scale = (D + D_tail) ** (-0.5)
@@ -263,48 +265,52 @@ def bwd(
 
                     if vectorized_atomic:
                         for bi_i, d_i in T.Parallel(BS // split_store, D // 4):
-                            T.atomic_addx4(
-                                dKV[
-                                    by,
-                                    Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
-                                    bz // NH,
-                                    d_i * 4,
-                                ],
-                                acc_dkv_shared[bi_i, d_i * 4],
-                            )
+                            if not skip_sentinel_stores or Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)] <= max_kv_i:
+                                T.atomic_addx4(
+                                    dKV[
+                                        by,
+                                        Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
+                                        bz // NH,
+                                        d_i * 4,
+                                    ],
+                                    acc_dkv_shared[bi_i, d_i * 4],
+                                )
 
                         for bi_i, d_i in T.Parallel(BS // split_store, D_tail // 4):
-                            T.atomic_addx4(
-                                dKV[
-                                    by,
-                                    Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
-                                    bz // NH,
-                                    D + d_i * 4,
-                                ],
-                                acc_dkv_tail_shared[bi_i, d_i * 4],
-                            )
+                            if not skip_sentinel_stores or Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)] <= max_kv_i:
+                                T.atomic_addx4(
+                                    dKV[
+                                        by,
+                                        Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
+                                        bz // NH,
+                                        D + d_i * 4,
+                                    ],
+                                    acc_dkv_tail_shared[bi_i, d_i * 4],
+                                )
                     else:
                         for bi_i, d_i in T.Parallel(BS // split_store, D):
-                            T.atomic_add(
-                                dKV[
-                                    by,
-                                    Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
-                                    bz // NH,
-                                    d_i,
-                                ],
-                                acc_dkv_shared[bi_i, d_i],
-                            )
+                            if not skip_sentinel_stores or Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)] <= max_kv_i:
+                                T.atomic_add(
+                                    dKV[
+                                        by,
+                                        Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
+                                        bz // NH,
+                                        d_i,
+                                    ],
+                                    acc_dkv_shared[bi_i, d_i],
+                                )
 
                         for bi_i, d_i in T.Parallel(BS // split_store, D_tail):
-                            T.atomic_add(
-                                dKV[
-                                    by,
-                                    Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
-                                    bz // NH,
-                                    D + d_i,
-                                ],
-                                acc_dkv_tail_shared[bi_i, d_i],
-                            )
+                            if not skip_sentinel_stores or Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)] <= max_kv_i:
+                                T.atomic_add(
+                                    dKV[
+                                        by,
+                                        Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
+                                        bz // NH,
+                                        D + d_i,
+                                    ],
+                                    acc_dkv_tail_shared[bi_i, d_i],
+                                )
 
             T.copy(acc_dq, dQ_shared)
             T.copy(acc_dq_tail, dQ_tail_shared)
@@ -335,6 +341,9 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None):
         block_size = int(os.environ.get("PRIME_SPARSE_BWD_BLOCK_SIZE", "16"))
         block_heads = int(os.environ.get("PRIME_SPARSE_BWD_BLOCK_HEADS", "16"))
         threads = int(os.environ.get("PRIME_SPARSE_BWD_THREADS", "64"))
+        skip_sentinel_value = os.environ.get("prime_sparse_bwd_skip_sentinel", "0")
+        if skip_sentinel_value not in {"0", "1"}:
+            raise ValueError("prime_sparse_bwd_skip_sentinel must be 0 or 1")
         bwd_kernel = bwd(
             H,
             D,
@@ -347,6 +356,7 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None):
             block_H=block_heads,
             threads=threads,
             vectorized_atomic=False,
+            skip_sentinel_stores=skip_sentinel_value == "1",
         )
     else:
         bwd_kernel = bwd(H, D, D_tail, topk, kv_group, sm_scale, True)

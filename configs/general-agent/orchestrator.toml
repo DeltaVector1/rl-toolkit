@@ -1,0 +1,77 @@
+output_dir = "/data/glm52-rl/runs/glm-perf-3/run_glm-perf-3"
+max_steps = 20
+seq_len = 32768
+batch_size = 1024
+group_size = 16
+max_inflight_rollouts = 256
+max_off_policy_steps = 4
+pool_size = 4
+
+[log]
+level = "info"
+
+[swanlab]
+project = "glm-runs"
+name = "orchestrator-glm-perf-3"
+group = "glm-runs"
+tags = ["glm-perf-3", "glm-5.2", "general-agent", "grpo", "lora-r32", "20-step-check"]
+
+[file_monitor]
+filename = "rollout-metrics.jsonl"
+
+[model]
+name = "/models/glm52-fp8"
+
+[model.lora]
+name = "glm52-general-agent-r32-node-local"
+rank = 32
+alpha = 64
+
+[model.client]
+base_url = ["http://127.0.0.1:8000/v1", "http://127.0.0.1:18049/v1"]
+admin_base_url = ["http://127.0.0.1:8000/v1", "http://127.0.0.1:18049/v1"]
+adapter_origin_base_urls = ["http://127.0.0.1:8000/v1"]
+wait_for_ready_timeout = 7200
+skip_model_check = true
+
+[optim]
+lr = 8e-6
+
+[renderer]
+name = "default"
+tool_parser = "glm"
+reasoning_parser = "think"
+enable_thinking = true
+clear_thinking = true
+
+[train.sampling]
+temperature = 1.0
+max_completion_tokens = 16384
+extra_body = { min_tokens = 16 }
+
+[[train.env]]
+name = "general-agent"
+ratio = 1.0
+pool = { type = "static", num_workers = 16 }
+id = "general-agent"
+args = { tasks_dir = "/data/glm52-rl/runs/general-agent-check/general-agent", exclude_tasks = ["loyalty_rewards_t3", "loyalty_rewards_t4", "railway_dispatch_t1", "railway_dispatch_t4"], max_turns = 100 }
+env.agent.max_output_tokens = 16384
+env.agent.timeout.rollout = 3600
+
+[train.env.sampling]
+max_completion_tokens = 16384
+
+[weight_broadcast]
+type = "filesystem"
+source_url = "http://127.0.0.1:18100/glm-perf-3"
+source_dir = "/data/glm52-rl/runs/glm-perf-3"
+
+[rollout_transport]
+type = "filesystem"
+
+[ckpt]
+interval = 5
+resume_step = -1
+skip_progress = true
+keep_last = 2
+keep_interval = 100

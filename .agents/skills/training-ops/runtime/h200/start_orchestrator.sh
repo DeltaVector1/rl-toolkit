@@ -740,7 +740,7 @@ sudo docker run -d --name "$ORCH_CT" \
   --env-file /data/trinity/training.env \
   -e VLLM_API_KEY=unused \
   -e PRIME_RL_OPERATIONS_CONFIG="$deployment/configs/operations.toml" \
-  -e PYTHONPATH="$deployment/environments/decensor/src:$deployment/environments/ornith/src:$deployment/environments/testing-perf-env/src:$deployment/evals/refusals-classifier/src:/app/src" \
+  -e PYTHONPATH="$deployment/environments/decensor/src:$deployment/environments/ornith/src:$deployment/environments/testing-perf-env/src:$deployment/environments/general-agent:$deployment/evals/refusals-classifier/src:/app/src" \
   -e HF_HOME="/data/glm52-rl/runs/$RUN/$RUN_NAME/hf-cache" \
   -v /data/glm52-rl:/data/glm52-rl \
   -v glm52-fp8-model:/models/glm52-fp8:ro \
