@@ -85,6 +85,14 @@ trainer = "configs/qualification/glm52-native-small.toml"
 kind = "glm52"
 trainer = "configs/qualification/glm52-sparse-sentinel.toml"
 
+[profiles.glm52-sparse-stability]
+kind = "glm52"
+trainer = "configs/qualification/glm52-sparse-stability.toml"
+
+[profiles.glm52-sparse-baseline]
+kind = "glm52"
+trainer = "configs/qualification/glm52-sparse-baseline.toml"
+
 [profiles.glm52-fixed-token]
 kind = "glm52"
 trainer = "configs/qualification/glm52-fixed-token.toml"

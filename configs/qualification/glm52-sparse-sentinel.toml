@@ -1,4 +1,4 @@
-output_dir = "/data/glm52-rl/qualifications/glm52-sparse-sentinel"
+output_dir = "/data/glm52-rl/qualifications/glm52-sparse-sentinel-controlled"
 max_steps = 2
 dist_timeout_seconds = 5400
 enable_router_replay = false
@@ -61,6 +61,7 @@ expert_activation_transport = "bf16_forward_fp8_local_recompute_backward"
 w8a16_modules = []
 
 [model.lora]
+initial_adapter_path = "/data/glm52-rl/runs/glm-perf-2/run_glm-perf-2/broadcasts/step_0/adapter_model.safetensors"
 rank = 32
 alpha = 64
 dropout = 0.0
