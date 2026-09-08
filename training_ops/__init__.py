@@ -5124,11 +5124,39 @@ def _start_dependency_inventory(
     add(selected["orchestrator"], [orchestrator_host])
     with (repo_root / selected["orchestrator"]).open("rb") as stream:
         train_envs = tomllib.load(stream).get("train", {}).get("env", [])
-    if any(
-        env.get("id") == "general-agent" or env.get("env", {}).get("id") == "general-agent"
-        for env in train_envs
-    ):
-        add_files("environments/general-agent/general_agent", [orchestrator_host], suffix=".py")
+    environment_sources = {
+        "general-agent": {
+            "files": (),
+            "python_roots": ("environments/general-agent/general_agent",),
+        },
+        "decensor-v1": {
+            "files": ("environments/decensor/pyproject.toml",),
+            "python_roots": ("environments/decensor/src/decensor_v1",),
+        },
+    }
+    if not isinstance(train_envs, list):
+        raise Refused("orchestrator train.env must be a list")
+    for environment in train_envs:
+        if not isinstance(environment, dict):
+            raise Refused("orchestrator train.env entries must be mappings")
+        environment_id = environment.get("id")
+        if environment_id is None:
+            nested_environment = environment.get("env")
+            if isinstance(nested_environment, dict):
+                environment_id = nested_environment.get("id")
+                if environment_id is None:
+                    taskset = nested_environment.get("taskset")
+                    if isinstance(taskset, dict):
+                        environment_id = taskset.get("id")
+        if not isinstance(environment_id, str) or not environment_id:
+            raise Refused("orchestrator train.env entry has no id")
+        source = environment_sources.get(environment_id)
+        if source is None:
+            raise Refused(f"unsupported orchestrator environment id: {environment_id}")
+        for path in source["files"]:
+            add(path, [orchestrator_host])
+        for source_root in source["python_roots"]:
+            add_files(source_root, [orchestrator_host], suffix=".py")
 
     missing = [path for path in inventory if not (repo_root / path).is_file()]
     if missing:

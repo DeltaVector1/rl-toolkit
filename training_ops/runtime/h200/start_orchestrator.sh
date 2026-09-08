@@ -706,7 +706,7 @@ sudo docker run -d --name "$ORCH_CT" \
   --network host --restart no \
   --env-file /data/trinity/training.env \
   -e VLLM_API_KEY=unused \
-  -e PYTHONPATH="$deployment/environments/general-agent:/app/src" \
+  -e PYTHONPATH="$deployment/environments/decensor/src:$deployment/environments/general-agent:/app/src" \
   -e HF_HOME="/data/glm52-rl/runs/$RUN/$RUN_NAME/hf-cache" \
   -v /data/glm52-rl:/data/glm52-rl \
   -v glm52-fp8-model:/models/glm52-fp8:ro \
