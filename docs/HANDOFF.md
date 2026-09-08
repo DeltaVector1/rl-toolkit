@@ -5,6 +5,31 @@ port, container, and profile value.
 
 ## Current state
 
+- The Sep 8 attempt is stopped with **0 optimizer steps**. Forward/backward
+  began at 01:24:20 UTC and was still unfinished when the stop was issued
+  at about 01:38 UTC. The operator missed the 600-second cutoff by about
+  four minutes. Do not report this as a completed compute measurement.
+  Status at 01:39:39 confirmed all trainers and the orchestrator stopped;
+  both H200 engines and saved adapters remain available. The foreground
+  monitor was stopped after this confirmation.
+- The first usable batch took 3,731.08 seconds (62m11s) to collect. It
+  accepted 1,024 of 2,336 rollouts (43.8%), containing 9,018,062 input plus
+  output tokens and 277 packed microbatches. Recorded rollout errors were
+  0%; equal-reward groups required replacement. Next-batch generation
+  overlapped trainer compute. Neither collection nor compute passed its
+  time requirement. No OOM was observed; the highest sampled trainer memory
+  was about 44 GiB. Full-step parity and positive-step adapter transfer are
+  not measured because no optimizer step completed.
+- The 278,422,029-byte rollout file appeared on H200A at 01:20:42 and n82
+  at 01:23:25, about 2m43s apart; this includes delivery work, not pure wire
+  time. Trainer batch loading then took 5.42s. The production batch has
+  17.2 times the tokens of the 524,288-token synthetic memory test; its
+  three-minute result was not a production-step measurement.
+- A ten-second trainer network sample measured 0.63-1.25 Gbit/s per
+  direction on 10-Gbit/s interfaces. This does not show link saturation or
+  identify the compute bottleneck. Next checks must isolate trainer stage
+  costs and H200 KV-cache recomputation, without changing score filtering
+  or presenting fewer tokens as a kernel improvement.
 - At 00:59 UTC, `glm-perf-2` had 736/1,024 accepted rollouts, 81 buffered,
   and 0 optimizer steps. Both H200s generated about 4,554 tokens/s combined.
   A has repeated KV-cache preemptions; B later also showed pressure. Current

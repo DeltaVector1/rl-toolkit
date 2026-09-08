@@ -17,7 +17,30 @@ weight transfer, H200 activation, judging, and save time separate.
 
 ## Current neutral production-shaped run
 
-Latest completed attempt: 0 optimizer steps. Restart began 23:45:14 and
+Latest stopped attempt (Sep 8): **0 optimizer steps**. After the graph-cap
+repair, the first usable rollout batch took 3,731.08s (62m11s), with
+1,024/2,336 accepted rollouts (43.8%), 0% recorded rollout errors, and
+9,018,062 accepted input plus output tokens. It produced 277 packed
+microbatches. Equal-reward groups were discarded by the unchanged training
+filter. Sustained decode samples were about 4.2-4.8k tokens/s across both
+H200 hosts, with KV-cache preemptions. Decode samples are not batch speed.
+
+The 278,422,029-byte rollout file appeared on H200A at 01:20:42 and n82 at
+01:23:25, about 2m43s apart; this is delivery elapsed time, not isolated
+network time. Trainer batch loading took 5.42s. Forward/backward began at
+01:24:20 and had no completion marker when the operator stopped the run at
+about 01:38 UTC. The stop was about four minutes late relative to the
+600-second limit. No completed compute timing or trained-adapter transfer
+measurement exists. No OOM was observed; sampled peak memory was about
+44 GiB. Next-batch rollouts ran concurrently with compute.
+
+A ten-second sample across trainer NICs measured 0.63-1.25 Gbit/s per
+direction on 10-Gbit/s links. It does not establish network saturation.
+The accepted batch contains 17.2 times the tokens of the three-minute
+synthetic memory test. This attempt fails the speed requirements and does
+not establish full-step or 20-step stability.
+
+Earlier attempt: 0 optimizer steps. Restart began 23:45:14 and
 returned 23:50:58 UTC. Initial saved-adapter staging used both ready caches
 in 3.3 seconds (origin 3.0 seconds, peer 283 ms), with the same full-file SHA.
 This is cached startup, not a positive-step adapter update measurement.
