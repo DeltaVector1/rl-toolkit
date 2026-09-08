@@ -13,6 +13,12 @@ port, container, and profile value.
   177.89248 seconds forward/backward and 178.58255 seconds total, with
   42.6543 GiB peak memory. Step-1 B norm was `0.0922512`; step-2 A-gradient
   norm was `4.75536e-5`.
+- The completed LR0 scaling check used batch 32: 1,048,576 fresh synthetic
+  tokens (32 x 32,768). Step 1 took 376.2107728468254 seconds and step 2
+  took 305.7785394010134 seconds forward/backward; peak memory was 42.21875
+  and 42.890625 GiB. All eight trainers exited 0 with `OOMKilled=false`.
+  This is not a three-minute production result. Trainers are now idle and no
+  active watch remains.
 - The test uses 524,288 fresh synthetic tokens (16 x 32,768), PP8/CP8/EP8,
   learning rate 0, and the same saved initial adapter as the baseline. It uses
   an FP8 base with BF16 rank-32 LoRA on attention, shared-expert, and
@@ -116,6 +122,11 @@ port, container, and profile value.
   scheduled tokens, and up to 128 requests. Context is 32K and the output
   limit is 16K. The MTP and reload measurements are component checks only;
   they are not full rollout-throughput approval. See `docs/PERFORMANCE.md`.
+- Both H200 engines are ready after A completed 68 FULL and 68 PIECEWISE graph
+  captures. Initialization took 294.10 seconds; final API checks were HTTP 200
+  (A 613 ms, B 112 ms). The image digests differ, so full image-parity
+  qualification is still open. Old step-0 caches are preserved, and new-run
+  rebind is not live-qualified.
 - Compare parity at equal selected-token counts and with the same activation
   allocation. Existing direct parity is diagnostic; no trained nonzero-adapter
   parity result is established. See `docs/PERFORMANCE.md`.

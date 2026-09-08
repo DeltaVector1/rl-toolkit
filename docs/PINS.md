@@ -83,3 +83,10 @@ not deployed.
   remain unverified. Both H200 READY step-0 caches match. Worker `3759` is not
   deployed; deploy it and restart both workers before a fresh production run
   to avoid a WAN retransfer.
+- The LR0 batch-scaling check used 1,048,576 synthetic tokens. Step 1/2
+  forward-backward times were 376.2107728468254/305.7785394010134 seconds,
+  with 42.21875/42.890625 GiB peak memory. All eight trainers exited 0 with
+  `OOMKilled=false`; this is not a three-minute production result.
+- Both H200 engines are ready after 68 FULL and 68 PIECEWISE captures on A.
+  Initialization was 294.10 seconds and final API checks were HTTP 200. Image
+  digests differ, so full parity and new-run rebind remain unverified.

@@ -15,6 +15,11 @@ weight transfer, H200 activation, judging, and save time separate.
   limit 16,384.
 - No full 20-step or 50-step neutral production run has passed.
 
+Both H200 engines are ready after A completed 68 FULL and 68 PIECEWISE graph
+captures. Initialization took 294.10 s; final API checks were HTTP 200 (A
+613 ms, B 112 ms). The image digests differ, so full image-parity qualification
+and a new-run rebind remain unverified.
+
 ## Current controlled sparse-stability run
 
 `glm52-sparse-stability` started 2026-09-08 at 03:36 UTC; compute started at
@@ -39,6 +44,15 @@ The 20-step LR0 run passed at 04:37:59. Warm forward/backward time was
 177.66-179.92 s (median 178.39 s), with 42.9277 GiB peak reserved memory for
 steps 3-20. This is a controlled synthetic memory result, not production
 training or learned-policy stability.
+
+## Batch scaling check
+
+The completed LR0 scaling check used 32 x 32,768 = 1,048,576 fresh synthetic
+tokens. Step 1 forward/backward was 376.2107728468254 s and step 2 was
+305.7785394010134 s. Peak reserved memory was 42.21875 and 42.890625 GiB;
+gradient norms were 0.0242919921875 and 0.0244140625. All eight trainers
+exited 0 with `OOMKilled=false`. The 16-sample warm reference was 178.3875 s
+for 524,288 tokens. Neither result is a three-minute production proof.
 
 A one-microbatch profile on rank 8 recorded 1.15 s in forward all-to-all,
 0.60 s in forward all-gather, and 1.26 s in sparse attention backward.
