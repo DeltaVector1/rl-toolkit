@@ -70,6 +70,38 @@ class DependencyBundleTest(unittest.TestCase):
         self.assertEqual(copy.call_count, 2)
         cleanup.assert_called_once_with()
 
+    def test_copy_file_uses_content_checked_resumable_rsync(self):
+        local = self.root / "archive.bin"
+        local.write_bytes(b"replacement")
+        host = training_ops.trainer_hosts[0]
+        remote = f"{training_ops.storage_root}/copy-file/archive.bin"
+        commands = []
+        ssh_scripts = []
+
+        def fake_ssh(_host, script, timeout=0):
+            ssh_scripts.append(script)
+            if script.startswith("mkdir -p "):
+                return 0, ""
+            if script.startswith("stat -c %s -- "):
+                return 0, f"{local.stat().st_size}\n"
+            self.fail(f"unexpected SSH script: {script}")
+
+        def fake_run(command, **kwargs):
+            commands.append(command)
+            return training_ops.subprocess.CompletedProcess(command, 0, "", "")
+
+        with (
+            mock.patch.object(training_ops, "_ssh", side_effect=fake_ssh),
+            mock.patch.object(training_ops, "_run_process", side_effect=fake_run),
+        ):
+            self.assertTrue(training_ops.copy_file(local, host, remote))
+
+        self.assertEqual(len(commands), 1)
+        self.assertIn("--partial", commands[0])
+        self.assertIn("--checksum", commands[0])
+        self.assertNotIn("--append-verify", commands[0])
+        self.assertFalse(any(script.startswith("truncate ") for script in ssh_scripts))
+
     def test_trainer_bundle_uses_one_edge_upload(self):
         uploads = []
         remote_calls = []

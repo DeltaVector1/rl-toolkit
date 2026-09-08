@@ -283,13 +283,18 @@ class ParityReaderTest(unittest.TestCase):
 
     def test_parity_uses_configured_full_run_records(self):
         calls = []
+        profile = training_ops._profile("testing-perf")
+        trainer_path = Path(__file__).resolve().parents[4] / profile["trainer"]
+        with trainer_path.open("rb") as stream:
+            output_dir = training_ops.tomllib.load(stream)["output_dir"]
+        run = Path(output_dir).name
 
         def fake_ssh(host, script, timeout=180):
             calls.append(script)
             if script.startswith("python3 - "):
                 return 0, json.dumps({"record_tokens": 3, "selected_tokens": 2})
             if "parity-step" in script:
-                return 0, "PARITY 100.0 /data/glm52-rl/runs/glm-perf-1/parity-step20.json\n"
+                return 0, f"PARITY 100.0 {output_dir}/parity-step20.json\n"
             raise AssertionError("unexpected parity probe")
 
         def fake_fan(hosts, function, workers=None):
@@ -302,10 +307,10 @@ class ParityReaderTest(unittest.TestCase):
             mock.patch.object(training_ops, "_ssh", side_effect=fake_ssh),
             redirect_stdout(StringIO()),
         ):
-            report = training_ops.parity("glm-perf-1")
+            report = training_ops.parity(run)
 
         self.assertEqual(report["source"], "configured")
-        self.assertIn("/data/glm52-rl/runs/glm-perf-1", calls[0])
+        self.assertIn(output_dir, calls[0])
         self.assertIn("parity-step*.json", calls[0])
         self.assertNotIn("direct-parity.json", calls[0])
 

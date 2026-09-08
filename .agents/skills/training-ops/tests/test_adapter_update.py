@@ -65,7 +65,7 @@ class AdapterUpdateTest(unittest.TestCase):
             {"method": "mtp", "num_speculative_tokens": 1},
         )
         self.assertEqual(a_extra["max_num_batched_tokens"], 32768)
-        self.assertEqual(a_extra["compilation_config"], {"max_cudagraph_capture_size": 128})
+        self.assertEqual(a_extra["compilation_config"], {"max_cudagraph_capture_size": 256})
         self.assertIn("runtime_output=$(python3", launcher)
         self.assertLess(launcher.index("runtime_output=$(python3"), launcher.index("install -d"))
         self.assertLess(launcher.index("runtime_output=$(python3"), launcher.index("docker update"))

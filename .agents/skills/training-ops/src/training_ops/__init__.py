@@ -2008,28 +2008,11 @@ def copy_file(local_path: str | Path, host: str, remote_path: str) -> bool:
         size = local.stat().st_size
     except OSError as error:
         raise RuntimeError(f"cannot stat local copy source {local}: {error}") from error
-    existing_code, existing_output = _ssh(
-        host,
-        f"stat -c %s -- {shlex.quote(remote_text)}",
-        timeout=deployment_mkdir_timeout_seconds,
-    )
-    existing_lines = existing_output.strip().splitlines()
-    existing_size_text = existing_lines[-1].strip() if existing_lines else ""
-    if not existing_code and re.fullmatch(r"[0-9]+", existing_size_text):
-        if int(existing_size_text) > size:
-            truncate_code, truncate_output = _ssh(
-                host,
-                f"truncate -s 0 -- {shlex.quote(remote_text)}",
-                timeout=deployment_mkdir_timeout_seconds,
-            )
-            if truncate_code:
-                detail = truncate_output.strip().splitlines()[-1] if truncate_output.strip() else "unknown error"
-                raise RuntimeError(f"reset oversized copy on {host}:{remote_text} failed: {detail[:160]}")
     transport = shlex.join(ssh_command + ssh_options)
     command = [
         "rsync",
         "--partial",
-        "--append-verify",
+        "--checksum",
         "--info=progress2,name0",
         "--human-readable",
         "--protect-args",

@@ -5,6 +5,18 @@ port, container, and profile value.
 
 ## Current state
 
+- At 00:59 UTC, `glm-perf-2` had 736/1,024 accepted rollouts, 81 buffered,
+  and 0 optimizer steps. Both H200s generated about 4,554 tokens/s combined.
+  A has repeated KV-cache preemptions; B later also showed pressure. Current
+  graph allocations are similar (3.38/3.52 GiB), not the older 10.89/2.04
+  GiB split. No fusion, context, MTP, or memory-limit change was made.
+- `training_ops.copy_file()` now uses ordinary checksum-based rsync instead
+  of append-only verification. Equal-size changed files previously stayed
+  stale despite a success report. Local replacement/partial-resume tests and
+  an actual same-size replacement on n82 passed. All 85 training-ops tests
+  pass after correcting two stale test expectations. This generic helper is
+  separate from live adapter transport. Small test archives remain in `build/`
+  locally and on n82; the cleanup command was denied by the command policy.
 - Both H200s restarted at 00:08:42 UTC with `4aa1772`; trainer restart
   invoked at 00:09:13. Root owns live operation and foreground monitoring.
   This remains neutral `glm-perf-2`, fresh rollouts, and a 20-step target.
