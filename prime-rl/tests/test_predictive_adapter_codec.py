@@ -559,6 +559,30 @@ class PredictiveAdapterCodecTest(unittest.TestCase):
                 Path.open = original_open
             self.assertFalse(list(target.glob("*.transport-*")))
 
+    def test_atomic_write_removes_only_its_partial_on_replace_error(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "output"
+            unrelated = root / ".unrelated.partial"
+            unrelated.write_bytes(b"keep")
+            original_replace = adapter_delta.os.replace
+            seen = []
+
+            def fail_replace(source, destination):
+                seen.append(Path(source))
+                raise OSError("replace failed")
+
+            adapter_delta.os.replace = fail_replace
+            try:
+                with self.assertRaisesRegex(OSError, "replace failed"):
+                    adapter_delta._atomic_write(output, b"value")
+            finally:
+                adapter_delta.os.replace = original_replace
+            self.assertEqual(len(seen), 1)
+            self.assertFalse(seen[0].exists())
+            self.assertTrue(unrelated.exists())
+            self.assertFalse(output.exists())
+
     def test_predictive_manifest_rejects_non_bf16_tensor(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

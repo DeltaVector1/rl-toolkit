@@ -660,11 +660,18 @@ def _chunk_ranges(size: int, chunk_size: int) -> list[tuple[int, int]]:
 
 def _atomic_write(path: Path, value: bytes) -> None:
     temporary = path.with_name(f".{path.name}.{os.getpid()}.partial")
-    with temporary.open("wb") as output:
-        output.write(value)
-        output.flush()
-        os.fsync(output.fileno())
-    os.replace(temporary, path)
+    try:
+        with temporary.open("wb") as output:
+            output.write(value)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    except Exception:
+        try:
+            temporary.unlink()
+        except Exception:
+            pass
+        raise
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
