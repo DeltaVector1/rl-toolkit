@@ -357,6 +357,9 @@ class AdapterUpdateTest(unittest.TestCase):
             "status": "failed",
             "source_url": source,
             "path": cache,
+            "policy_step": 6,
+            "stage_timeout_seconds": 300,
+            "acceptance_target_seconds": 300,
             "elapsed_seconds": 298.297,
             "error": "TimeoutError: adapter delta staging exceeded its time limit",
         }
@@ -364,6 +367,9 @@ class AdapterUpdateTest(unittest.TestCase):
             "status": "failed",
             "source_url": source,
             "path": cache,
+            "policy_step": 6,
+            "stage_timeout_seconds": 300,
+            "acceptance_target_seconds": 300,
             "elapsed_seconds": 299.102,
             "error": "OSError: adapter manifest request failed with HTTP status 500",
         }
@@ -383,6 +389,37 @@ class AdapterUpdateTest(unittest.TestCase):
             evidence,
         )
 
+    def test_step_one_terminal_status_uses_900_limit_and_reports_target_overrun(self):
+        config = training_ops._adapter_update_config("glm-perf-3")
+        broadcast = training_ops.AdapterBroadcast(
+            path="/data/glm52-rl/runs/glm-perf-3/run_glm-perf-3/broadcasts/step_1",
+            step=1,
+        )
+        source = "http://127.0.0.1:18100/glm-perf-3/run_glm-perf-3/broadcasts/step_1"
+        cache = "/data/glm52-rl/lora-cache/" + hashlib.sha256(source.encode()).hexdigest()
+        failed = {
+            "status": "failed",
+            "source_url": source,
+            "path": cache,
+            "policy_step": 1,
+            "stage_timeout_seconds": 900,
+            "acceptance_target_seconds": 300,
+            "elapsed_seconds": 600.0,
+            "error": "TimeoutError: adapter delta staging exceeded its time limit",
+        }
+        with mock.patch.object(
+            training_ops,
+            "_latest_adapter_broadcast",
+            return_value=broadcast,
+        ), mock.patch.object(
+            training_ops,
+            "_fan",
+            return_value={"h200a": (0, json.dumps(failed)), "h200b": (0, json.dumps(failed))},
+        ):
+            evidence = training_ops._adapter_stage_status_evidence("glm-perf-3", config, "")
+        self.assertIn("operational limit 900s", evidence)
+        self.assertIn("300s acceptance target exceeded on h200a, h200b", evidence)
+
     def test_terminal_stage_status_refuses_stale_unknown_and_success(self):
         config = training_ops._adapter_update_config("glm-perf-3")
         broadcast = training_ops.AdapterBroadcast(
@@ -398,12 +435,18 @@ class AdapterUpdateTest(unittest.TestCase):
             "status": "ready",
             "source_url": source,
             "path": cache,
+            "policy_step": 6,
+            "stage_timeout_seconds": 300,
+            "acceptance_target_seconds": 300,
             "elapsed_seconds": 262.336,
         }
         failed = {
             "status": "failed",
             "source_url": source,
             "path": cache,
+            "policy_step": 6,
+            "stage_timeout_seconds": 300,
+            "acceptance_target_seconds": 300,
             "elapsed_seconds": 298.297,
             "error": "TimeoutError: adapter delta staging exceeded its time limit",
         }

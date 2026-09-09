@@ -26,7 +26,9 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 from prime_rl.configs.inference import InferenceConfig
 from prime_rl.inference.vllm.worker.filesystem import (
     _delta_stage_timeout_s,
+    _adapter_step_from_source_url,
     _adapter_stage_publish_lock,
+    adapter_stage_limit_seconds,
     adapter_cache_path,
     adapter_reader_lock,
     adapter_stage_status,
@@ -432,6 +434,35 @@ async def stage_lora_adapter(raw_request: Request):
     require_delta = data.get("require_delta", False)
     if not isinstance(require_delta, bool):
         return JSONResponse({"error": "require_delta must be a boolean"}, status_code=400)
+    requested_step = data.get("policy_step")
+    if requested_step is not None and (
+        type(requested_step) is not int or requested_step <= 0
+    ):
+        return JSONResponse({"error": "policy_step must be a positive integer"}, status_code=400)
+    if require_delta:
+        if requested_step is None:
+            return JSONResponse(
+                {"error": "policy_step is required for delta adapter staging"},
+                status_code=400,
+            )
+        try:
+            policy_step = _adapter_step_from_source_url(source_url)
+        except OSError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        if requested_step is not None and requested_step != policy_step:
+            return JSONResponse(
+                {"error": "policy_step differs from the validated adapter path"},
+                status_code=400,
+            )
+        stage_limit = adapter_stage_limit_seconds(policy_step)
+    else:
+        if requested_step is not None:
+            return JSONResponse(
+                {"error": "policy_step is only valid for delta adapter staging"},
+                status_code=400,
+            )
+        policy_step = None
+        stage_limit = None
     requested_timeout = data.get("stage_timeout_seconds")
     configured_timeout = _delta_stage_timeout_s() if require_delta else None
     if requested_timeout is not None:
@@ -443,6 +474,8 @@ async def stage_lora_adapter(raw_request: Request):
             or requested_timeout <= 0
             or configured_timeout is None
             or requested_timeout > configured_timeout
+            or stage_limit is None
+            or requested_timeout > stage_limit
         ):
             return JSONResponse(
                 {"error": "stage_timeout_seconds must be within the configured delta limit"},
@@ -450,7 +483,12 @@ async def stage_lora_adapter(raw_request: Request):
             )
         stage_timeout = float(requested_timeout)
     else:
-        stage_timeout = configured_timeout
+        stage_timeout = stage_limit if require_delta else configured_timeout
+    if require_delta and (configured_timeout is None or configured_timeout < stage_limit):
+        return JSONResponse(
+            {"error": "configured adapter stage limit is below the policy limit"},
+            status_code=500,
+        )
     _begin_lora_stage()
     started = time.perf_counter()
     cancel_event = threading.Event()
@@ -461,6 +499,7 @@ async def stage_lora_adapter(raw_request: Request):
             source_url,
             require_delta=require_delta,
             stage_timeout_seconds=stage_timeout,
+            policy_step=policy_step,
             cancel_event=cancel_event,
             committed_event=committed_event,
         )
@@ -483,6 +522,14 @@ async def stage_lora_adapter(raw_request: Request):
             "path": destination.as_posix(),
             "stage_seconds": time.perf_counter() - started,
         }
+        if policy_step is not None:
+            payload.update(
+                {
+                    "policy_step": policy_step,
+                    "stage_limit_seconds": stage_limit,
+                    "acceptance_target_seconds": 300.0,
+                }
+            )
         payload["adapter_identity"] = _read_verified_adapter_identity(source_url, destination)
         stage_state = adapter_stage_status()
         if isinstance(stage_state.get("reconstruct_seconds"), (int, float)):
@@ -506,7 +553,13 @@ async def stage_lora_adapter(raw_request: Request):
             if committed_event.is_set() and destination is not None:
                 return success_payload(destination)
             return JSONResponse(
-                {"error": "adapter delta staging exceeded its time limit"}, status_code=504
+                {
+                    "error": "adapter delta staging exceeded its time limit",
+                    "policy_step": policy_step,
+                    "stage_limit_seconds": stage_limit,
+                    "acceptance_target_seconds": 300.0,
+                },
+                status_code=504,
             )
         except asyncio.CancelledError:
             with _adapter_stage_publish_lock:

@@ -24,6 +24,7 @@ class _ManifestProbeResponse:
         return None
 
     def json(self):
+        step = 2 if self.version == 2 else 1
         return {
             "version": self.version,
             "transport": (
@@ -31,6 +32,9 @@ class _ManifestProbeResponse:
                 if self.version == 2
                 else "chunked-shuffled-xor-zstd"
             ),
+            "target_step": step,
+            "base_step": step - 1,
+            "base2_step": step - 2 if self.version == 2 else None,
         }
 
 
@@ -77,6 +81,11 @@ def _load_stage_function(probe_version=1):
         for node in ast.walk(tree)
         if isinstance(node, ast.FunctionDef) and node.name == "_validate_adapter_identity"
     )
+    stage_limit = next(
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef) and node.name == "adapter_stage_limit_seconds"
+    )
     namespace = {
         "AsyncClient": httpx.AsyncClient,
         "httpx": type(
@@ -93,13 +102,18 @@ def _load_stage_function(probe_version=1):
         "AdapterIdentity": dict[str, object],
         "asyncio": asyncio,
         "time": time,
+        "urlsplit": __import__("urllib.parse", fromlist=["urlsplit"]).urlsplit,
         "LORA_STAGE_ATTEMPT_TIMEOUT_S": 30.0,
         "LORA_STAGE_TOTAL_TIMEOUT_S": 30.0,
         "_delta_stage_timeout_s": lambda: 30.0,
         "_admin_post_response": None,
     }
     exec(
-        compile(ast.Module(body=[identity_validator, function], type_ignores=[]), str(CLIENT_PATH), "exec"),
+        compile(
+            ast.Module(body=[identity_validator, stage_limit, function], type_ignores=[]),
+            str(CLIENT_PATH),
+            "exec",
+        ),
         namespace,
     )
     return namespace["stage_lora_adapter"], namespace
@@ -374,6 +388,11 @@ class StageLoraAdapterTest(unittest.TestCase):
             else:
                 os.environ["PRIME_LORA_DELTA_STAGE_TIMEOUT_S"] = old_value
 
+    def test_adapter_stage_limits_are_exact_at_step_boundaries(self):
+        _stage_lora_adapter, namespace = _load_stage_function()
+        limit = namespace["adapter_stage_limit_seconds"]
+        self.assertEqual([limit(step) for step in (1, 2, 3, 4)], [900.0, 600.0, 300.0, 300.0])
+
     def test_distinct_ports_each_stage(self):
         stage_lora_adapter, namespace = _load_stage_function()
         calls = []
@@ -467,6 +486,7 @@ class StageLoraAdapterTest(unittest.TestCase):
                     [origin, peer],
                     "http://adapter/step_1",
                     require_delta=True,
+                    policy_step=1,
                     origin_base_urls=["http://127.0.0.1:8000"],
                 )
             )
@@ -495,6 +515,7 @@ class StageLoraAdapterTest(unittest.TestCase):
                 [peer, origin],
                 "http://adapter/step_1",
                 require_delta=True,
+                policy_step=1,
                 origin_base_urls=["http://127.0.0.1:8000"],
             )
         )
@@ -538,6 +559,7 @@ class StageLoraAdapterTest(unittest.TestCase):
                 [peer, origin],
                 "http://adapter/step_2",
                 require_delta=True,
+                policy_step=2,
                 origin_base_urls=["http://127.0.0.1:8000"],
             )
         )
@@ -564,6 +586,7 @@ class StageLoraAdapterTest(unittest.TestCase):
                         [client],
                         "http://adapter/step_2",
                         require_delta=True,
+                        policy_step=2,
                     )
                 )
         finally:

@@ -24,6 +24,7 @@ from prime_rl.utils.client import (
     InferencePool,
     _delta_stage_timeout_s,
     _validate_loaded_receipt,
+    adapter_stage_limit_seconds,
     load_lora_adapter,
     model_is_visible,
     stage_full_checkpoint,
@@ -332,6 +333,8 @@ class WeightWatcher:
         self.last_adapter_wire_stage_time: float = 0.0
         self.last_adapter_reconstruct_time: float = -1.0
         self.last_adapter_load_time: float = 0.0
+        self.last_adapter_policy_step: int = 0
+        self.last_adapter_stage_limit_seconds: float = 0.0
         self.last_wait_for_ckpt_time: float = 0.0
         self.update_count: int = 0
         self.reconcile_count: int = 0
@@ -611,7 +614,14 @@ class WeightWatcher:
                         self.inference.admin_clients,
                         weights_path,
                         require_delta=require_delta,
+                        policy_step=next_step,
                         origin_base_urls=self.inference.adapter_origin_base_urls,
+                    )
+                    self.last_adapter_policy_step = int(stage_result.get("policy_step", next_step))
+                    self.last_adapter_stage_limit_seconds = float(
+                        stage_result.get(
+                            "stage_limit_seconds", adapter_stage_limit_seconds(next_step)
+                        )
                     )
                     adapter_identity = stage_result["adapter_identity"]
                     self.last_adapter_wire_stage_time = float(
@@ -641,6 +651,11 @@ class WeightWatcher:
                         f"Adapter v{next_step} transfer: wire-stage "
                         f"{format_time(self.last_adapter_wire_stage_time)}, "
                         f"origin {origin_stage}, peer {peer_stage}, reconstruct {reconstruct}"
+                    )
+                    get_logger().info(
+                        f"Adapter v{next_step} staging limit "
+                        f"{self.last_adapter_stage_limit_seconds:g}s "
+                        "(300s acceptance target)"
                     )
 
             # An observer can request a bounded safe boundary before we stop
@@ -769,7 +784,11 @@ class WeightWatcher:
                 missing,
                 weights_path,
                 require_delta=require_delta,
+                policy_step=self.ckpt_step if require_delta else None,
             )
+            if require_delta:
+                self.last_adapter_policy_step = int(stage_result["policy_step"])
+                self.last_adapter_stage_limit_seconds = float(stage_result["stage_limit_seconds"])
             await load_lora_adapter(
                 missing,
                 self.policy.model_name,
@@ -816,6 +835,9 @@ class WeightWatcher:
             "watcher/last_adapter_wire_stage_time": self.last_adapter_wire_stage_time,
             "watcher/last_adapter_reconstruct_time": self.last_adapter_reconstruct_time,
             "watcher/last_adapter_load_time": self.last_adapter_load_time,
+            "watcher/last_adapter_policy_step": float(self.last_adapter_policy_step),
+            "watcher/last_adapter_stage_limit_seconds": self.last_adapter_stage_limit_seconds,
+            "watcher/adapter_stage_acceptance_target_seconds": 300.0,
             "watcher/last_wait_for_ckpt_time": self.last_wait_for_ckpt_time,
             "watcher/last_reconcile_time": self.last_reconcile_time,
         }

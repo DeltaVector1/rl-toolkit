@@ -34,7 +34,7 @@ def adapter_cache_path(source_url: str) -> Path:
 _PARALLEL_DOWNLOAD_THRESHOLD = 16 * 1024 * 1024
 _DOWNLOAD_STREAMS_ENV = "PRIME_LORA_DOWNLOAD_STREAMS"
 _MAX_DOWNLOAD_STREAMS = 128
-default_delta_stage_timeout_s = 300.0
+default_delta_stage_timeout_s = 900.0
 _ADAPTER_FILES = ("adapter_config.json", "adapter_model.safetensors")
 _ADAPTER_MANIFEST = "adapter_manifest.json"
 _ADAPTER_DIGEST = "adapter_model.safetensors.sha256"
@@ -58,6 +58,27 @@ _ADAPTER_CLEANUP_TIMEOUT_S = 30.0
 _ADAPTER_STATUS_INTERVAL_S = float(os.environ.get("PRIME_LORA_STATUS_INTERVAL_S", "1"))
 _JSON_LOCK = threading.Lock()
 _adapter_stage_publish_lock = threading.Lock()
+
+
+def adapter_stage_limit_seconds(policy_step: int) -> float:
+    """Return the bounded operational staging limit for one adapter step."""
+    if type(policy_step) is not int or policy_step <= 0:
+        raise OSError("adapter policy step must be a positive integer")
+    if policy_step == 1:
+        return 900.0
+    if policy_step == 2:
+        return 600.0
+    return 300.0
+
+
+def _adapter_step_from_source_url(source_url: str) -> int:
+    match = re.fullmatch(r"step_(\d+)", Path(urlsplit(source_url).path.rstrip("/")).name)
+    if match is None:
+        raise OSError("adapter source URL does not identify one policy step")
+    step = int(match.group(1))
+    if step <= 0:
+        raise OSError("adapter source URL does not identify a positive policy step")
+    return step
 
 
 def _reject_symlink_path(path: Path, label: str = "adapter path") -> None:
@@ -3556,6 +3577,7 @@ def stage_lora_adapter_files(
     require_delta: bool = False,
     *,
     stage_timeout_seconds: float | None = None,
+    policy_step: int | None = None,
     cancel_event: threading.Event | None = None,
     committed_event: threading.Event | None = None,
 ) -> Path:
@@ -3575,6 +3597,18 @@ def stage_lora_adapter_files(
     )
     started = time.monotonic()
     configured_delta_timeout = _delta_stage_timeout_s() if require_delta else None
+    status_metadata: dict[str, object] = {}
+    if require_delta:
+        source_step = _adapter_step_from_source_url(source_url)
+        if policy_step is not None and policy_step != source_step:
+            raise OSError("requested adapter policy step differs from its source URL")
+        policy_step = source_step
+        stage_limit = adapter_stage_limit_seconds(policy_step)
+        status_metadata = {
+            "policy_step": policy_step,
+            "stage_timeout_seconds": stage_limit,
+            "acceptance_target_seconds": 300.0,
+        }
     if stage_timeout_seconds is not None:
         if (
             not require_delta
@@ -3584,6 +3618,7 @@ def stage_lora_adapter_files(
             or stage_timeout_seconds <= 0
             or configured_delta_timeout is None
             or stage_timeout_seconds > configured_delta_timeout
+            or stage_timeout_seconds > stage_limit
         ):
             raise OSError("adapter delta stage timeout is invalid")
         configured_delta_timeout = float(stage_timeout_seconds)
@@ -3596,6 +3631,10 @@ def stage_lora_adapter_files(
     # intentional: per-URL writers caused old policies to queue behind one
     # another and made it possible to publish a stale policy after a newer one.
     host_lock_path = destination.parent / "adapter-staging.lock"
+
+    def write_stage_status(value: dict[str, object]) -> None:
+        _write_stage_status(destination.parent, {**value, **status_metadata})
+
     with os.fdopen(
         _open_nofollow(host_lock_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC),
         "w",
@@ -3615,6 +3654,13 @@ def stage_lora_adapter_files(
                     deadline=delta_deadline,
                     cancel_event=cancel_event,
                 )
+            if require_delta:
+                source_manifest = transport.get("source_manifest") if isinstance(transport, dict) else None
+                if (
+                    not isinstance(source_manifest, dict)
+                    or source_manifest.get("target_step") != policy_step
+                ):
+                    raise OSError("validated adapter manifest does not identify the requested policy step")
             if (
                 delta_deadline is None
                 and transport is not None
@@ -3705,8 +3751,7 @@ def stage_lora_adapter_files(
                         )
                         == transport["config_sha256"]
                     ):
-                        _write_stage_status(
-                            destination.parent,
+                        write_stage_status(
                             {
                                 "status": "ready",
                                 "source_url": source_url,
@@ -3760,8 +3805,7 @@ def stage_lora_adapter_files(
                     and isinstance(transport, dict)
                     and _relay_manifest_matches(destination, source_url, transport)
                 ):
-                    _write_stage_status(
-                        destination.parent,
+                    write_stage_status(
                         {
                             "status": "ready",
                             "source_url": source_url,
@@ -3790,8 +3834,7 @@ def stage_lora_adapter_files(
                     total_bytes = sum(int(item["size"]) for item in files.values())
                     _cleanup_retired_adapters(destination.parent, destination.name)
                     _cleanup_previous_adapter_caches(destination.parent, destination)
-                    _write_stage_status(
-                        destination.parent,
+                    write_stage_status(
                         {
                             "status": "ready",
                             "source_url": source_url,
@@ -3819,8 +3862,7 @@ def stage_lora_adapter_files(
                     if now - last_status < _ADAPTER_STATUS_INTERVAL_S and progress_bytes < total_bytes:
                         return
                     last_status = now
-                    _write_stage_status(
-                        destination.parent,
+                    write_stage_status(
                         {
                             "status": "staging",
                             "source_url": source_url,
@@ -3833,8 +3875,7 @@ def stage_lora_adapter_files(
                         },
                     )
 
-            _write_stage_status(
-                destination.parent,
+            write_stage_status(
                 {
                     "status": "staging",
                     "source_url": source_url,
@@ -3918,8 +3959,7 @@ def stage_lora_adapter_files(
                     fcntl.flock(reader_lock, fcntl.LOCK_UN)
             _cleanup_retired_adapters(destination.parent, destination.name)
             _cleanup_previous_adapter_caches(destination.parent, destination)
-            _write_stage_status(
-                destination.parent,
+            write_stage_status(
                 {
                     "status": "ready",
                     "source_url": source_url,
@@ -3939,8 +3979,7 @@ def stage_lora_adapter_files(
                     deadline=time.monotonic() + _ADAPTER_CLEANUP_TIMEOUT_S,
                     cancel_event=threading.Event(),
                 )
-            _write_stage_status(
-                destination.parent,
+            write_stage_status(
                 {
                     "status": "failed",
                     "source_url": source_url,
@@ -4364,8 +4403,17 @@ class FileSystemWeightUpdateWorker(Worker):
         """No-op RPC used by the API server liveness endpoint."""
         return None
 
-    def stage_lora_adapter(self, source_url: str, require_delta: bool = False) -> None:
-        stage_lora_adapter_files(source_url, require_delta=require_delta)
+    def stage_lora_adapter(
+        self,
+        source_url: str,
+        require_delta: bool = False,
+        policy_step: int | None = None,
+    ) -> None:
+        stage_lora_adapter_files(
+            source_url,
+            require_delta=require_delta,
+            policy_step=policy_step,
+        )
 
     def stage_full_checkpoint(self, source_url: str) -> str:
         return stage_full_checkpoint_files(source_url).as_posix()

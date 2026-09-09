@@ -81,6 +81,7 @@ deployment_bundle_scp_timeout_seconds = 60
 large_file_transfer_timeout_seconds = 7200
 adapter_update_engine_startup_timeout_seconds = 900
 adapter_delta_stage_timeout_seconds = 300
+adapter_stage_acceptance_target_seconds = 300
 trainer_seconds_max = 600
 rollout_seconds_max = 720
 orchestrator_repair_staging_max_seconds = 7200
@@ -89,6 +90,16 @@ dependency_manifest_name = ".training-ops-manifest"
 _dependency_remote_archive_pattern = re.compile(
     r"^/tmp/trainer-dependencies-[A-Za-z0-9._-]+\.tar(?:\.gz)?$"
 )
+
+
+def _adapter_stage_limit_seconds(policy_step: int) -> int:
+    if type(policy_step) is not int or policy_step <= 0:
+        raise Refused("adapter policy step must be a positive integer")
+    if policy_step == 1:
+        return 900
+    if policy_step == 2:
+        return 600
+    return adapter_delta_stage_timeout_seconds
 
 if set(inference_hosts) != set(inference_settings):
     raise RuntimeError("each inference host must have one [inference.<host>] entry")
@@ -3388,7 +3399,10 @@ def _adapter_stage_status_evidence(run: str, config: dict, log: str) -> str:
         records[host] = record
 
     failures = []
-    stage_limit = adapter_delta_stage_timeout_seconds
+    if latest.step <= 0:
+        raise Refused("latest adapter broadcast is not a positive policy update")
+    stage_limit = _adapter_stage_limit_seconds(latest.step)
+    target_exceeded = []
     for host, record in records.items():
         state = record.get("status")
         if state not in {"ready", "failed"}:
@@ -3404,6 +3418,14 @@ def _adapter_stage_status_evidence(run: str, config: dict, log: str) -> str:
             or elapsed > stage_limit
         ):
             raise Refused(f"adapter stage duration on {host} is invalid")
+        if record.get("policy_step") != latest.step:
+            raise Refused(f"adapter stage status on {host} has the wrong policy step")
+        if record.get("stage_timeout_seconds") != stage_limit:
+            raise Refused(f"adapter stage status on {host} has the wrong operational limit")
+        if record.get("acceptance_target_seconds") != adapter_stage_acceptance_target_seconds:
+            raise Refused(f"adapter stage status on {host} has the wrong acceptance target")
+        if elapsed > adapter_stage_acceptance_target_seconds:
+            target_exceeded.append(host)
         if state == "failed":
             error = record.get("error")
             if not isinstance(error, str):
@@ -3428,6 +3450,8 @@ def _adapter_stage_status_evidence(run: str, config: dict, log: str) -> str:
     )
     return (
         f"policy update {latest.step} failed on {failure_details}; "
+        f"operational limit {stage_limit:g}s; "
+        f"300s acceptance target {'exceeded on ' + ', '.join(target_exceeded) if target_exceeded else 'not exceeded'}; "
         "exact terminal stage status matched every inference host"
     )
 

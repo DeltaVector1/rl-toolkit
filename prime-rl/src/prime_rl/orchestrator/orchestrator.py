@@ -85,6 +85,7 @@ from prime_rl.transport import TrainingBatch, setup_training_batch_sender
 from prime_rl.utils.async_utils import EventLoopLagMonitor, EventLoopLagStats, safe_cancel
 from prime_rl.utils.client import (
     _delta_stage_timeout_s,
+    adapter_stage_limit_seconds,
     init_nccl_broadcast,
     init_nixl_broadcast,
     stage_lora_adapter,
@@ -580,10 +581,17 @@ class Orchestrator:
                     self.policy_inference.admin_clients,
                     weights_path,
                     require_delta=require_delta,
+                    policy_step=sync_version if require_delta else None,
                     origin_base_urls=self.policy_inference.adapter_origin_base_urls,
                 )
                 adapter_identity = stage_result["adapter_identity"]
                 prefetched = True
+                if require_delta:
+                    get_logger().info(
+                        f"Adapter v{sync_version} staging limit "
+                        f"{float(stage_result.get('stage_limit_seconds', adapter_stage_limit_seconds(sync_version))):g}s "
+                        "(300s acceptance target)"
+                    )
             receipts = await self.policy_inference.update_weights(
                 weights_path,
                 lora_name=self.lora_name,

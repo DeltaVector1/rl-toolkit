@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from itertools import cycle
 from pathlib import Path
 from typing import Protocol, runtime_checkable
+from urllib.parse import urlsplit
 
 import httpx
 import verifiers.v1 as vf
@@ -637,6 +638,7 @@ async def stage_lora_adapter(
     lora_path: Path | str,
     *,
     require_delta: bool = False,
+    policy_step: int | None = None,
     origin_base_urls: list[str] | None = None,
 ) -> dict[str, object]:
     """Stage one adapter copy per inference host.
@@ -646,8 +648,18 @@ async def stage_lora_adapter(
     requirement explicitly and returns measured staging time for each host.
     """
     lora_path_posix = str(lora_path)
+    if policy_step is not None and (
+        type(policy_step) is not int or policy_step <= 0
+    ):
+        raise RuntimeError("adapter policy step must be a positive integer")
+    if require_delta and policy_step is None:
+        raise RuntimeError("adapter policy step is required for delta staging")
     if not lora_path_posix.startswith(("http://", "https://")):
-        return {"wire_stage_seconds": 0.0, "host_count": 0, "adapter_identity": None}
+        return {
+            "wire_stage_seconds": 0.0,
+            "host_count": 0,
+            "adapter_identity": None,
+        }
     if not admin_clients:
         raise RuntimeError("cannot stage an adapter without an inference endpoint")
 
@@ -707,6 +719,8 @@ async def stage_lora_adapter(
             "lora_path": lora_path_posix,
             "require_delta": require_delta,
         }
+        if policy_step is not None:
+            payload["policy_step"] = policy_step
         if remaining_delta_seconds is not None:
             payload["stage_timeout_seconds"] = remaining_delta_seconds
         response = await _admin_post_response(
@@ -741,10 +755,11 @@ async def stage_lora_adapter(
         }
 
     started = time.perf_counter()
-    delta_deadline = started + _delta_stage_timeout_s() if require_delta else None
+    configured_delta_timeout = _delta_stage_timeout_s() if require_delta else None
+    delta_deadline = None
     predictive_transport = False
     if require_delta:
-        remaining = _delta_stage_timeout_s() - (time.perf_counter() - started)
+        remaining = configured_delta_timeout - (time.perf_counter() - started)
         if remaining <= 0:
             raise TimeoutError("adapter delta staging exceeded its time limit")
         try:
@@ -769,6 +784,33 @@ async def stage_lora_adapter(
             raise RuntimeError("cannot determine adapter transport before staging") from exc
         if not isinstance(manifest, dict):
             raise RuntimeError("adapter transport manifest is not an object")
+        source_name = Path(urlsplit(lora_path_posix).path.rstrip("/")).name
+        match = re.fullmatch(r"step_(\d+)", source_name)
+        target_step = manifest.get("target_step")
+        if (
+            match is None
+            or type(target_step) is not int
+            or target_step <= 0
+            or int(match.group(1)) != target_step
+        ):
+            raise RuntimeError("cannot determine adapter policy step from validated manifest")
+        if manifest.get("version") == 1:
+            if manifest.get("base_step") != target_step - 1:
+                raise RuntimeError("adapter manifest steps are not consecutive")
+        elif manifest.get("version") == 2:
+            if (
+                manifest.get("base_step") != target_step - 1
+                or manifest.get("base2_step") != target_step - 2
+            ):
+                raise RuntimeError("adapter manifest steps are not consecutive")
+        else:
+            raise RuntimeError("adapter manifest version is unsupported")
+        if policy_step is None:
+            policy_step = target_step
+        elif policy_step != target_step:
+            raise RuntimeError("requested adapter policy step differs from its manifest")
+        stage_limit = adapter_stage_limit_seconds(policy_step)
+        delta_deadline = started + min(stage_limit, configured_delta_timeout)
         predictive_transport = (
             manifest.get("version") == 2
             and manifest.get("transport") == "chunked-bf16-linear-zigzag-sparse-zstd"
@@ -852,6 +894,9 @@ async def stage_lora_adapter(
         "origin_host_count": origin_count,
         "peer_host_count": len(hosts) - origin_count,
         "adapter_identity": adapter_identity,
+        "policy_step": policy_step,
+        "stage_limit_seconds": stage_limit if require_delta else None,
+        "acceptance_target_seconds": 300.0 if require_delta else None,
     }
 
 
@@ -975,7 +1020,18 @@ LORA_LOAD_READ_TIMEOUT_S = 900.0
 LORA_LOAD_TOTAL_TIMEOUT_S = 1200.0
 LORA_STAGE_ATTEMPT_TIMEOUT_S = 3600.0
 LORA_STAGE_TOTAL_TIMEOUT_S = 7200.0
-default_delta_stage_timeout_s = 300.0
+default_delta_stage_timeout_s = 900.0
+
+
+def adapter_stage_limit_seconds(policy_step: int) -> float:
+    """Return the bounded operational staging limit for one adapter step."""
+    if type(policy_step) is not int or policy_step <= 0:
+        raise RuntimeError("adapter policy step must be a positive integer")
+    if policy_step == 1:
+        return 900.0
+    if policy_step == 2:
+        return 600.0
+    return 300.0
 
 
 def _delta_stage_timeout_s() -> float:

@@ -8,6 +8,7 @@ import io
 import json
 import math
 import os
+import re
 import socketserver
 import subprocess
 import sys
@@ -300,7 +301,11 @@ def load_server_stage_method(stage_worker, publish_lock=None):
         "router": FakeRouter(),
         "Request": object,
         "JSONResponse": FakeJSONResponse,
-        "_delta_stage_timeout_s": lambda: 0.01,
+        "_delta_stage_timeout_s": lambda: 900.0,
+        "_adapter_step_from_source_url": lambda source_url: int(
+            re.fullmatch(r"step_(\d+)", Path(source_url.rstrip("/")).name).group(1)
+        ),
+        "adapter_stage_limit_seconds": lambda _step: 900.0,
         "_adapter_stage_publish_lock": publish_lock or threading.Lock(),
         "_is_finite_number": lambda value: (
             isinstance(value, (int, float))
@@ -995,7 +1000,7 @@ class AdapterTransportStateTest(unittest.TestCase):
         )
         self.assertEqual(
             function_arguments(worker, "stage_lora_adapter"),
-            ["self", "source_url", "require_delta"],
+            ["self", "source_url", "require_delta", "policy_step"],
         )
         for path in (client, server, watcher):
             self.assertIn("require_delta", path.read_text(encoding="utf-8"))
@@ -1069,7 +1074,7 @@ class AdapterTransportStateTest(unittest.TestCase):
         old_operations = os.environ.get("PRIME_RL_OPERATIONS_CONFIG")
         try:
             os.environ["PRIME_RL_OPERATIONS_CONFIG"] = "/missing/operations.toml"
-            self.assertEqual(filesystem._delta_stage_timeout_s(), 300.0)
+            self.assertEqual(filesystem._delta_stage_timeout_s(), 900.0)
         finally:
             if old_timeout is not None:
                 os.environ["PRIME_LORA_DELTA_STAGE_TIMEOUT_S"] = old_timeout
@@ -1121,10 +1126,12 @@ class AdapterTransportStateTest(unittest.TestCase):
                 *,
                 require_delta,
                 stage_timeout_seconds,
+                policy_step,
                 cancel_event,
                 committed_event,
             ):
                 self.assertTrue(require_delta)
+                self.assertEqual(policy_step, 1)
                 self.assertEqual(stage_timeout_seconds, 0.01)
                 self.assertFalse(committed_event.is_set())
                 started.set()
@@ -1141,6 +1148,7 @@ class AdapterTransportStateTest(unittest.TestCase):
                     return {
                         "lora_path": "http://source/step_1",
                         "require_delta": True,
+                        "policy_step": 1,
                         "stage_timeout_seconds": 0.01,
                     }
 
@@ -1171,10 +1179,12 @@ class AdapterTransportStateTest(unittest.TestCase):
                     *,
                     require_delta,
                     stage_timeout_seconds,
+                    policy_step,
                     cancel_event,
                     committed_event,
                 ):
                     self.assertTrue(require_delta)
+                    self.assertEqual(policy_step, 1)
                     self.assertEqual(stage_timeout_seconds, 0.005)
                     with publish_lock:
                         started.set()
@@ -1192,6 +1202,7 @@ class AdapterTransportStateTest(unittest.TestCase):
                         return {
                             "lora_path": "http://source/step_1",
                             "require_delta": True,
+                            "policy_step": 1,
                             "stage_timeout_seconds": 0.005,
                         }
 
@@ -1222,6 +1233,7 @@ class AdapterTransportStateTest(unittest.TestCase):
                 return {
                     "lora_path": "http://source/step_1",
                     "require_delta": True,
+                    "policy_step": 1,
                     "stage_timeout_seconds": self.timeout,
                 }
 
@@ -1241,10 +1253,12 @@ class AdapterTransportStateTest(unittest.TestCase):
                 *,
                 require_delta,
                 stage_timeout_seconds,
+                policy_step,
                 cancel_event,
                 committed_event,
             ):
                 self.assertFalse(require_delta)
+                self.assertIsNone(policy_step)
                 self.assertIsNone(stage_timeout_seconds)
                 self.assertFalse(committed_event.is_set())
                 started.set()
@@ -1292,10 +1306,12 @@ class AdapterTransportStateTest(unittest.TestCase):
                 *,
                 require_delta,
                 stage_timeout_seconds,
+                policy_step,
                 cancel_event,
                 committed_event,
             ):
                 self.assertFalse(require_delta)
+                self.assertIsNone(policy_step)
                 self.assertIsNone(stage_timeout_seconds)
                 self.assertFalse(committed_event.is_set())
                 started.set()
