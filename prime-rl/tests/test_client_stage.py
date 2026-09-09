@@ -468,6 +468,33 @@ class StageLoraAdapterTest(unittest.TestCase):
         self.assertEqual(result["origin_host_count"], 1)
         self.assertEqual(result["peer_host_count"], 1)
 
+    def test_stage_retries_same_identity_three_times(self):
+        stage_lora_adapter, namespace = _load_stage_function()
+        calls = []
+        inner_attempt_limits = []
+
+        class Response:
+            def json(self):
+                return {
+                    "status": "ok",
+                    "stage_seconds": 0.0,
+                    "adapter_identity": _adapter_identity(),
+                }
+
+        async def fake_admin_post_response(_client, _path, **_kwargs):
+            calls.append(1)
+            inner_attempt_limits.append(_kwargs["max_attempts"])
+            if len(calls) < 3:
+                raise RuntimeError("temporary stage fault")
+            return Response()
+
+        namespace["_admin_post_response"] = fake_admin_post_response
+        client = httpx.AsyncClient(base_url="http://127.0.0.1:8000")
+        result = asyncio.run(stage_lora_adapter([client], "http://adapter/step_1"))
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(inner_attempt_limits, [1, 1, 1])
+        self.assertEqual(result["adapter_identity"], _adapter_identity())
+
     def test_delta_limit_covers_origin_and_peer_together(self):
         stage_lora_adapter, namespace = _load_stage_function()
 

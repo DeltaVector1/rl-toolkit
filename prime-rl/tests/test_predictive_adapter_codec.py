@@ -69,6 +69,16 @@ def odd_offset_safetensor_bytes(words: list[int]) -> bytes:
 
 
 class PredictiveAdapterCodecTest(unittest.TestCase):
+    def test_adapter_chunk_rejects_malicious_declared_zstd_size(self):
+        payload = adapter_delta._compress(b"hello")
+        malicious = payload[:4] + b"\xe0" + (1 << 40).to_bytes(8, "little") + payload[6:]
+        with self.assertRaisesRegex(OSError, "size mismatch"):
+            adapter_delta.decode_adapter_chunk(
+                malicious,
+                codec=adapter_delta.full_transport_name,
+                max_output_size=5,
+            )
+
     def test_build_checkpoint_delta_round_trip(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -853,8 +853,9 @@ class AdapterTransportStateTest(unittest.TestCase):
             (target / "adapter_model.safetensors").write_bytes(bytes(range(251)) * 33)
             manifest = adapter_delta.publish_adapter_manifest(target, target_step=0)
             self.assertEqual(manifest["mode"], "full")
-            self.assertEqual(manifest["chunk_count"], 0)
-            self.assertEqual(list(target.glob("*.transport-*")), [])
+            self.assertEqual(manifest["transport"], "chunked-full-zstd")
+            self.assertEqual(manifest["chunk_count"], 1)
+            self.assertEqual(len(list(target.glob("*.transport-*"))), 1)
 
     def test_full_stage_publishes_model_checksum_sidecar(self):
         filesystem = load_filesystem_module()
@@ -863,20 +864,10 @@ class AdapterTransportStateTest(unittest.TestCase):
             source = root / "step_0"
             source.mkdir()
             config = b"{}\n"
-            model = bytes(range(251)) * 33
+            model = b"a" * (adapter_delta.default_chunk_size + 17)
             (source / "adapter_config.json").write_bytes(config)
             (source / "adapter_model.safetensors").write_bytes(model)
-            manifest = {
-                "version": 1,
-                "kind": "lora-adapter",
-                "mode": "full",
-                "target_step": 0,
-                "base_step": None,
-                "files": [
-                    {"name": "adapter_config.json", "size": len(config), "sha256": hashlib.sha256(config).hexdigest()},
-                    {"name": "adapter_model.safetensors", "size": len(model), "sha256": hashlib.sha256(model).hexdigest()},
-                ],
-            }
+            manifest = adapter_delta.publish_adapter_manifest(source, target_step=0, max_workers=2)
             (source / "adapter_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
             handler = functools.partial(QuietDirectoryHandler, directory=str(root))
             with socketserver.ThreadingTCPServer(("127.0.0.1", 0), handler) as server:
@@ -903,9 +894,78 @@ class AdapterTransportStateTest(unittest.TestCase):
             sidecar = destination / "adapter_model.safetensors.sha256"
             self.assertEqual(sidecar.read_text(encoding="ascii").strip(), hashlib.sha256(model).hexdigest())
             self.assertTrue((destination / "adapter_manifest.json").is_file())
+            self.assertNotIn(
+                "transport",
+                json.loads((destination / "adapter_manifest.json").read_text(encoding="utf-8")),
+            )
             relay_manifest = json.loads((destination / "relay_manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(relay_manifest["transport"], "full")
             self.assertIn("adapter_model.safetensors", relay_manifest["files"])
+
+    def test_policy_zero_full_zstd_exact_sha_and_raw_fallback(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            compressed = root / "compressed"
+            compressed.mkdir()
+            (compressed / "adapter_config.json").write_text("{}", encoding="utf-8")
+            compressed_bytes = b"a" * (adapter_delta.default_chunk_size + 17)
+            (compressed / "adapter_model.safetensors").write_bytes(compressed_bytes)
+            manifest = adapter_delta.publish_adapter_manifest(compressed, target_step=0, max_workers=2)
+            self.assertEqual(manifest["transport"], adapter_delta.full_transport_name)
+            restored = bytearray(len(compressed_bytes))
+            for item in manifest["chunks"]:
+                raw = adapter_delta.decode_adapter_chunk(
+                    (compressed / item["file"]).read_bytes(),
+                    codec=manifest["transport"],
+                    max_output_size=item["raw_size"],
+                )
+                start = item["offset"]
+                restored[start : start + item["raw_size"]] = raw
+                self.assertEqual(hashlib.sha256(raw).hexdigest(), item["raw_sha256"])
+            self.assertEqual(bytes(restored), compressed_bytes)
+
+            incompressible = root / "incompressible"
+            incompressible.mkdir()
+            (incompressible / "adapter_config.json").write_text("{}", encoding="utf-8")
+            incompressible_bytes = b"".join(
+                hashlib.sha256(str(index).encode("ascii")).digest() for index in range(260)
+            )
+            (incompressible / "adapter_model.safetensors").write_bytes(incompressible_bytes)
+            fallback = adapter_delta.publish_adapter_manifest(incompressible, target_step=0)
+            self.assertNotIn("transport", fallback)
+            self.assertEqual(fallback["chunk_count"], 0)
+
+    def test_full_zstd_rejects_policy_zero_manifest_at_later_url(self):
+        filesystem = load_filesystem_module()
+        digest = "a" * 64
+        manifest = {
+            "version": 1,
+            "kind": "lora-adapter",
+            "mode": "full",
+            "transport": "chunked-full-zstd",
+            "target_step": 0,
+            "full_size": 1,
+            "full_sha256": digest,
+            "target_size": 1,
+            "target_sha256": digest,
+            "config_size": 0,
+            "config_sha256": digest,
+            "chunks": [],
+        }
+        old_reader = filesystem._read_source_text
+        filesystem._read_source_text = lambda *_args, **_kwargs: json.dumps(manifest)
+        try:
+            with self.assertRaisesRegex(OSError, "policy zero"):
+                filesystem._read_chunked_v1_manifest("http://source/step_9")
+        finally:
+            filesystem._read_source_text = old_reader
+
+    def test_retryable_stage_errors_keep_matching_partial_data(self):
+        filesystem = load_filesystem_module()
+        self.assertTrue(filesystem._preserve_adapter_stage_partial(OSError("connection reset")))
+        self.assertTrue(filesystem._preserve_adapter_stage_partial(TimeoutError("request timed out")))
+        self.assertFalse(filesystem._preserve_adapter_stage_partial(OSError("checksum mismatch")))
+        self.assertFalse(filesystem._preserve_adapter_stage_partial(OSError("path is a symbolic link")))
 
     def test_full_cache_reuse_rebinds_url_without_model_download(self):
         filesystem = load_filesystem_module()

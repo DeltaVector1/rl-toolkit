@@ -331,15 +331,15 @@ class DownloadSchedulerTest(unittest.TestCase):
                     stream_cap=filesystem.full_download_streams,
                 )
                 self.assertEqual(full.read_bytes(), payload)
-                self.assertEqual(workers, [96])
-                self.assertEqual(len(calls), 96)
-                self.assertEqual(set(calls), set(source_urls))
+                self.assertEqual(workers, [48])
+                self.assertEqual(len(calls), 48)
+                self.assertEqual(set(calls), set(source_urls[:48]))
 
                 calls.clear()
                 global_copy = root / "global"
                 run_download(source_urls[0], global_copy, payload)
                 self.assertEqual(global_copy.read_bytes(), payload)
-                self.assertEqual(workers, [96, 48])
+                self.assertEqual(workers, [48, 48])
                 self.assertEqual(len(calls), 48)
 
                 source_urls = source_urls[:3]
@@ -353,7 +353,7 @@ class DownloadSchedulerTest(unittest.TestCase):
                     stream_cap=filesystem.full_download_streams,
                 )
                 self.assertEqual(small.read_bytes(), payload)
-                self.assertEqual(workers, [96, 48, 3])
+                self.assertEqual(workers, [48, 48, 3])
                 self.assertEqual(len(calls), 3)
 
                 empty = root / "empty"
@@ -364,7 +364,7 @@ class DownloadSchedulerTest(unittest.TestCase):
                     stream_cap=filesystem.full_download_streams,
                 )
                 self.assertEqual(empty.read_bytes(), b"")
-                self.assertEqual(workers, [96, 48, 3])
+                self.assertEqual(workers, [48, 48, 3])
         finally:
             filesystem.urllib.request.urlopen = old_urlopen
             filesystem.ThreadPoolExecutor = old_executor

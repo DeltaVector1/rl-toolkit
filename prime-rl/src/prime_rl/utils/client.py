@@ -506,13 +506,14 @@ async def _admin_post_response(
     *,
     timeout_s: float = ADMIN_TIMEOUT_S,
     total_timeout_s: float | None = None,
+    max_attempts: int = 10,
     **kwargs,
 ) -> httpx.Response:
     """POST an admin operation and return its successful response."""
     retry_budget = 2 * timeout_s if total_timeout_s is None else total_timeout_s
     async for attempt in AsyncRetrying(
         retry=retry_if_exception(_is_retryable_admin_error),
-        stop=stop_after_delay(retry_budget) | stop_after_attempt(10),
+        stop=stop_after_delay(retry_budget) | stop_after_attempt(max_attempts),
         wait=wait_exponential(multiplier=1, min=1, max=10),
         reraise=True,
     ):
@@ -732,6 +733,7 @@ async def stage_lora_adapter(
             json=payload,
             timeout_s=stage_timeout_s,
             total_timeout_s=stage_total_timeout_s,
+            max_attempts=1,
         )
         try:
             payload = response.json()
@@ -756,6 +758,43 @@ async def stage_lora_adapter(
             "request_seconds": time.perf_counter() - started,
             "adapter_identity": adapter_identity,
         }
+
+    async def _stage_one_with_retries(
+        client: AsyncClient,
+        *,
+        absolute_deadline: float | None = None,
+    ) -> dict[str, object]:
+        for attempt in range(1, 4):
+            remaining = None
+            if absolute_deadline is not None:
+                remaining = absolute_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("adapter delta staging exceeded its time limit")
+            try:
+                return await _stage_one(
+                    client,
+                    remaining_delta_seconds=remaining,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                retryable = True
+                if isinstance(exc, RuntimeError):
+                    message = str(exc).lower()
+                    retryable = not any(
+                        marker in message
+                        for marker in ("identity", "checksum", "policy step", "manifest")
+                    )
+                if attempt == 3 or not retryable:
+                    raise
+                delay = min(0.5 * 2 ** (attempt - 1), 10.0)
+                if absolute_deadline is not None:
+                    remaining = absolute_deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("adapter delta staging exceeded its time limit") from exc
+                    delay = min(delay, remaining)
+                await asyncio.sleep(delay)
+        raise RuntimeError("adapter stage retry loop ended unexpectedly")
 
     started = time.perf_counter()
     configured_delta_timeout = _delta_stage_timeout_s() if require_delta else None
@@ -836,7 +875,7 @@ async def stage_lora_adapter(
             raise TimeoutError("adapter delta staging exceeded its time limit")
         tasks = [
             asyncio.create_task(
-                _stage_one(client, remaining_delta_seconds=remaining)
+                _stage_one_with_retries(client, absolute_deadline=delta_deadline)
             )
             for group in groups
             for client in group
@@ -863,7 +902,7 @@ async def stage_lora_adapter(
         for group in groups:
             group_started = time.perf_counter()
             if delta_deadline is None:
-                results.extend(await asyncio.gather(*(_stage_one(client) for client in group)))
+                results.extend(await asyncio.gather(*(_stage_one_with_retries(client) for client in group)))
             else:
                 remaining = delta_deadline - time.monotonic()
                 if remaining <= 0:
@@ -872,7 +911,10 @@ async def stage_lora_adapter(
                     staged = await asyncio.wait_for(
                         asyncio.gather(
                             *(
-                                _stage_one(client, remaining_delta_seconds=remaining)
+                                _stage_one_with_retries(
+                                    client,
+                                    absolute_deadline=delta_deadline,
+                                )
                                 for client in group
                             )
                         ),
