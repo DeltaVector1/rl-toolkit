@@ -1,5 +1,5 @@
 output_dir = "/data/glm52-rl/runs/glm-decensor-1"
-max_steps = 20
+max_steps = 50
 dist_timeout_seconds = 5400
 enable_router_replay = false
 
@@ -21,7 +21,7 @@ ranks_filter = [0]
 project = "glm-runs"
 name = "trainer-glm-decensor-1"
 group = "glm-runs"
-tags = ["glm-decensor-1", "glm-5.2", "decensor", "grpo", "lora-r32", "20-step-check"]
+tags = ["glm-decensor-1", "glm-5.2", "decensor", "grpo", "lora-r32", "50-step"]
 
 [file_monitor]
 filename = "run_glm-decensor-1/trainer-metrics.jsonl"
