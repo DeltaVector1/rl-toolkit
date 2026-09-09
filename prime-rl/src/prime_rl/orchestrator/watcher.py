@@ -217,6 +217,13 @@ def validate_adapter_manifest(
         expected_base2_step = 0 if target_step == 1 else target_step - 2
         if manifest.get("base_step") != target_step - 1 or manifest.get("base2_step") != expected_base2_step:
             raise RuntimeError("predictive adapter manifest steps are not adjacent")
+        expected_predictor = (
+            "bf16-first-order-exact"
+            if target_step == 1
+            else "bf16-float32-second-order-rne"
+        )
+        if manifest.get("predictor") != expected_predictor:
+            raise RuntimeError("predictive adapter manifest predictor does not match its step")
         for prefix in ("target", "base", "base2"):
             size = manifest.get(f"{prefix}_size")
             digest = manifest.get(f"{prefix}_sha256")

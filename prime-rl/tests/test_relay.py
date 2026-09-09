@@ -179,6 +179,7 @@ class RelayTest(unittest.TestCase):
             "config_sha256": config_sha,
             "base_config_sha256": config_sha,
             "base2_config_sha256": config_sha,
+            "predictor": "bf16-float32-second-order-rne",
             "files": [
                 {"name": "adapter_config.json", "size": len(config), "sha256": config_sha},
                 {"name": "adapter_model.safetensors", "size": len(model), "sha256": model_sha},

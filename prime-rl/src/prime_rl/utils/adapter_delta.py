@@ -257,14 +257,22 @@ def _round_float32_to_bf16(value: np.ndarray) -> np.ndarray:
     return rounded.astype("<u2", copy=False)
 
 
-def _bf16_predictor(base2: bytes, base1: bytes) -> np.ndarray:
+def _bf16_predictor(
+    base2: bytes,
+    base1: bytes,
+    *,
+    predictor: str = _predictive_second_order,
+) -> np.ndarray:
     if len(base1) != len(base2) or len(base1) % 2:
         raise ValueError("BF16 predictive data must have an even, equal size")
     first = np.frombuffer(base1, dtype="<u2").astype(np.uint32)
     second = np.frombuffer(base2, dtype="<u2").astype(np.uint32)
-    if base1 == base2:
-        # Do not use 2*x-x for the same base. It can change BF16 bit patterns.
+    if predictor == _predictive_first_order:
+        if base1 != base2:
+            raise ValueError("first-order predictive data requires the same base")
         return first.astype("<u2", copy=False)
+    if predictor != _predictive_second_order:
+        raise ValueError("predictive BF16 predictor is unsupported")
     first_float = (first << np.uint32(16)).view(np.float32)
     second_float = (second << np.uint32(16)).view(np.float32)
     with np.errstate(over="ignore", invalid="ignore"):
@@ -292,6 +300,7 @@ def _predictive_units(
     *,
     global_offset: int,
     data_offset: int,
+    predictor: str,
 ) -> tuple[np.ndarray, np.ndarray]:
     if not (len(base2) == len(base1) == len(target)):
         raise ValueError("predictive chunks must have equal sizes")
@@ -309,11 +318,12 @@ def _predictive_units(
         local_data_start = data_start - global_offset
         local_data_end = local_data_start + data_words * 2
         target_words = np.frombuffer(target[local_data_start:local_data_end], dtype="<u2").astype(np.uint32)
-        predictor = _bf16_predictor(
+        predicted = _bf16_predictor(
             base2[local_data_start:local_data_end],
             base1[local_data_start:local_data_end],
+            predictor=predictor,
         ).astype(np.uint32)
-        residual[prefix_size:] = (target_words - predictor) & np.uint32(0xFFFF)
+        residual[prefix_size:] = (target_words - predicted) & np.uint32(0xFFFF)
         widths[prefix_size:] = np.uint16(16)
     return residual, widths
 
@@ -358,6 +368,7 @@ def encode_predictive_chunk(
     target: bytes,
     global_offset: int,
     data_offset: int,
+    predictor: str = _predictive_second_order,
 ) -> bytes:
     """Encode one exact BF16 safetensors chunk against two adjacent bases."""
     residual, widths = _predictive_units(
@@ -366,6 +377,7 @@ def encode_predictive_chunk(
         target,
         global_offset=global_offset,
         data_offset=data_offset,
+        predictor=predictor,
     )
     mask, values, nonzero_count = _predictive_canonical_values(residual, widths)
     mask_payload = _compress(mask)
@@ -392,6 +404,7 @@ def _encode_predictive_chunk(
     target: bytes,
     global_offset: int,
     data_offset: int,
+    predictor: str,
 ) -> tuple[bytes, bytes]:
     residual, widths = _predictive_units(
         base2,
@@ -399,6 +412,7 @@ def _encode_predictive_chunk(
         target,
         global_offset=global_offset,
         data_offset=data_offset,
+        predictor=predictor,
     )
     mask, values, nonzero_count = _predictive_canonical_values(residual, widths)
     mask_payload = _compress(mask)
@@ -463,6 +477,7 @@ def _decode_predictive_chunk_with_correction(
     data_offset: int,
     *,
     max_output_size: int | None = None,
+    predictor: str = _predictive_second_order,
 ) -> tuple[bytes, bytes]:
     header, mask_payload, values_payload = _predictive_payload_parts(payload)
     _, _, _, _, raw_size, payload_offset, payload_data_offset, unit_count, nonzero_count, _, _ = header
@@ -496,11 +511,12 @@ def _decode_predictive_chunk_with_correction(
     if data_words:
         local_data_start = data_start - global_offset
         local_data_end = local_data_start + data_words * 2
-        predictor = _bf16_predictor(
+        predicted = _bf16_predictor(
             base2[local_data_start:local_data_end],
             base1[local_data_start:local_data_end],
+            predictor=predictor,
         ).astype(np.uint32)
-        words = (predictor + signed[prefix_size:]) & np.uint32(0xFFFF)
+        words = (predicted + signed[prefix_size:]) & np.uint32(0xFFFF)
         output[local_data_start:local_data_end] = words.astype("<u2").tobytes()
     return bytes(output), values
 
@@ -513,6 +529,7 @@ def decode_predictive_chunk(
     data_offset: int,
     *,
     max_output_size: int | None = None,
+    predictor: str = _predictive_second_order,
 ) -> bytes:
     """Decode one predictive chunk without trusting unbounded payload sizes."""
     target, _ = _decode_predictive_chunk_with_correction(
@@ -522,6 +539,7 @@ def decode_predictive_chunk(
         global_offset,
         data_offset,
         max_output_size=max_output_size,
+        predictor=predictor,
     )
     return target
 
@@ -558,6 +576,7 @@ def decode_linear_zigzag_sparse_chunk(
     data_offset: int,
     raw_size: int,
     codec: str,
+    predictor: str = _predictive_second_order,
 ) -> tuple[bytes, bytes]:
     """Decode the v2 transport API used by the inference worker."""
     if codec != _codec_name():
@@ -569,6 +588,7 @@ def decode_linear_zigzag_sparse_chunk(
         offset,
         data_offset,
         max_output_size=raw_size,
+        predictor=predictor,
     )
 
 
@@ -699,6 +719,7 @@ def _write_encoded_chunks(
     max_workers: int,
     base2_path: Path | None = None,
     data_offset: int | None = None,
+    predictor: str | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     target_size = target_path.stat().st_size
     ranges = _chunk_ranges(target_size, chunk_size)
@@ -758,7 +779,12 @@ def _write_encoded_chunks(
                     assert base_chunk is not None
                     pending[index] = pool.submit(_encode_delta_chunk, base_chunk, target_chunk)
                 elif mode == "predictive":
-                    if base_chunk is None or base2_chunk is None or data_offset is None:
+                    if (
+                        base_chunk is None
+                        or base2_chunk is None
+                        or data_offset is None
+                        or predictor is None
+                    ):
                         raise ValueError("predictive chunks require two bases and a data offset")
                     pending[index] = pool.submit(
                         _encode_predictive_chunk,
@@ -767,6 +793,7 @@ def _write_encoded_chunks(
                         target_chunk,
                         start,
                         data_offset,
+                        predictor,
                     )
                 else:
                     pending[index] = pool.submit(bytes, target_chunk)
@@ -852,18 +879,31 @@ def publish_adapter_manifest(
             raise ValueError("predictive base adapter configuration identity differs")
         if sha256_file(base2_dir / adapter_config_name) != target_config_sha256:
             raise ValueError("predictive second-base adapter configuration identity differs")
-        try:
-            data_offset = safetensors_data_offset(target_weights, require_bf16=True)
-            if data_offset % 2 or target_weights.stat().st_size % 2:
-                raise ValueError("predictive safetensors data and file size must be even-aligned")
-            if safetensors_data_offset(base_dir / adapter_weights_name, require_bf16=True) != data_offset:
-                raise ValueError("predictive base safetensors data offset differs")
-            if safetensors_data_offset(base2_dir / adapter_weights_name, require_bf16=True) != data_offset:
-                raise ValueError("predictive second-base safetensors data offset differs")
-        except ValueError:
+        def predictive_offset(path: Path) -> int | None:
+            try:
+                return safetensors_data_offset(path, require_bf16=True)
+            except ValueError as exc:
+                if str(exc) == "predictive transport requires BF16 tensors":
+                    return None
+                raise
+
+        data_offset = predictive_offset(target_weights)
+        base_offset = predictive_offset(base_dir / adapter_weights_name)
+        base2_offset = predictive_offset(base2_dir / adapter_weights_name)
+        if (
+            data_offset is None
+            or base_offset is None
+            or base2_offset is None
+        ):
             data_offset = None
             selected_mode = "delta"
         else:
+            if data_offset % 2 or target_weights.stat().st_size % 2:
+                raise ValueError("predictive safetensors data and file size must be even-aligned")
+            if base_offset != data_offset:
+                raise ValueError("predictive base safetensors data offset differs")
+            if base2_offset != data_offset:
+                raise ValueError("predictive second-base safetensors data offset differs")
             predictor_name = _predictive_first_order if same_base_predictive else _predictive_second_order
             selected_mode = "predictive"
     else:
@@ -884,32 +924,17 @@ def publish_adapter_manifest(
         )
 
     if selected_mode in {"delta", "predictive"}:
-        try:
-            weight_chunks, weight_encoded_size = _write_encoded_chunks(
-                target_weights,
-                base_dir / adapter_weights_name,
-                target_dir,
-                mode=selected_mode,
-                chunk_size=chunk_size,
-                max_workers=max_workers,
-                base2_path=base2_dir / adapter_weights_name if selected_mode == "predictive" and base2_dir is not None else None,
-                data_offset=data_offset,
-            )
-        except ValueError:
-            if selected_mode != "predictive":
-                raise
-            _remove_transport_chunks(target_dir)
-            selected_mode = "delta"
-            data_offset = None
-            predictor_name = None
-            weight_chunks, weight_encoded_size = _write_encoded_chunks(
-                target_weights,
-                base_dir / adapter_weights_name,
-                target_dir,
-                mode=selected_mode,
-                chunk_size=chunk_size,
-                max_workers=max_workers,
-            )
+        weight_chunks, weight_encoded_size = _write_encoded_chunks(
+            target_weights,
+            base_dir / adapter_weights_name,
+            target_dir,
+            mode=selected_mode,
+            chunk_size=chunk_size,
+            max_workers=max_workers,
+            base2_path=base2_dir / adapter_weights_name if selected_mode == "predictive" and base2_dir is not None else None,
+            data_offset=data_offset,
+            predictor=predictor_name,
+        )
     else:
         weight_chunks = []
         weight_encoded_size = target_weights.stat().st_size

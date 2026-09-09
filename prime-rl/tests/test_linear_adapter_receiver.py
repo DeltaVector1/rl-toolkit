@@ -254,6 +254,7 @@ class LinearAdapterReceiverTest(unittest.TestCase):
             "version": 2,
             "mode": "delta",
             "transport": "chunked-bf16-linear-zigzag-sparse-zstd",
+            "predictor": "bf16-float32-second-order-rne",
             "source_manifest": {
                 "version": 2,
                 "kind": "lora-adapter",
