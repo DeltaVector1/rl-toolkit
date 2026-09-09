@@ -403,6 +403,7 @@ tunnel_listener_ready() {
 china_tunnel_remove_legacy() {
   local only_marker=${1:-}
   local lora_source_port pattern pid command_line pgid group_command group_safe group_seen cleanup_port
+  local source_port forward_total configured_total
   local -a cleanup_ports=()
   for cleanup_port in "${@:2}"; do
     case "$cleanup_port" in
@@ -426,7 +427,23 @@ china_tunnel_remove_legacy() {
       else
         case "$command_line" in
           *"while true; do"*"$pattern"*"$trainer_ssh_target"*)
-            case "$command_line" in *china-tunnel-*) continue ;; esac
+            case "$command_line" in
+              *"# china-tunnel-lora-"*)
+                # During migration, remove only old four-forward China
+                # supervisors whose complete source range is configured.
+                forward_total=$(grep -o -- '-L ' <<<"$command_line" | wc -l)
+                configured_total=0
+                for source_port in "${lora_source_ports[@]}"; do
+                  case "$command_line" in
+                    *"-L 127.0.0.1:$source_port:127.0.0.1:$adapter_port"*)
+                      configured_total=$((configured_total + 1))
+                      ;;
+                  esac
+                done
+                [ "$forward_total" -eq 4 ] && [ "$configured_total" -eq 4 ] || continue
+                ;;
+              *) ;;
+            esac
             ;;
           *) continue ;;
         esac
@@ -508,9 +525,9 @@ peer_tunnel() {
     "-L 127.0.0.1:$peer_api_port:127.0.0.1:8000" \
     -L "127.0.0.1:$peer_api_port:127.0.0.1:8000"
 
-  # Keep each SSH supervisor to one source port so each download worker has a
-  # distinct TCP connection.
-  local peer_lane_size=1
+  # Keep each SSH cipher worker to four source ports without creating one SSH
+  # connection for every port.
+  local peer_lane_size=4
   local lane_start=0 lane_number=0
   local -a lane_ports lane_forwards
   while [ "$lane_start" -lt "${#lora_source_ports[@]}" ]; do

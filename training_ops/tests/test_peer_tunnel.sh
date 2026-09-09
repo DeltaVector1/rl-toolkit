@@ -25,6 +25,10 @@ if [ -r "${PEER_TEST_LOG:?}" ] && grep -Fq -- "$pattern" "$PEER_TEST_LOG"; then
     '-L 127.0.0.1:'*)
       port=${pattern#-L 127.0.0.1:}
       port=${port%%:*}
+      if [ "${PEER_STALE_GROUP_ACTIVE:-0}" = 1 ]; then
+        echo 10000
+        exit 0
+      fi
       if [ "${PEER_CHINA_MODE:-0}" = 1 ] && [ "$port" -ge 18100 ] && [ "$port" -le 18195 ]; then
         echo $((10000 + (port - 18100)))
       else
@@ -55,6 +59,10 @@ if [ "${1:-}" = "-o" ] && [ "${2:-}" = "args=" ]; then
   elif [ "${TUNNEL_SUPERVISOR_PID:-}" = "$pid" ]; then
     cat "${TUNNEL_SUPERVISOR_COMMAND:?}"
   elif [ "$pid" -ge 10000 ] 2>/dev/null; then
+    if [ "${PEER_STALE_GROUP_ACTIVE:-0}" = 1 ] && [ -r "${PEER_STALE_GROUP_COMMAND:-}" ]; then
+      cat "$PEER_STALE_GROUP_COMMAND"
+      exit 0
+    fi
     lane=$((pid - 10000))
     grep -E "done # china-tunnel-lora-${lane}[[:space:]]*$" "${PEER_TEST_LOG:?}" | tail -n 1 | sed 's/[[:space:]]*$//' || true
   else
@@ -103,14 +111,14 @@ query="$tmp/peer-query"
 
 PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$log" PEER_QUERY="$query" peer_tunnel
 for _ in $(seq 1 50); do
-  [ -f "$log" ] && [ "$(wc -l <"$log")" -eq 97 ] && break
+  [ -f "$log" ] && [ "$(wc -l <"$log")" -eq 25 ] && break
   sleep 0.1
 done
-test "$(wc -l <"$log")" -eq 97
+test "$(wc -l <"$log")" -eq 25
 
 api_pattern='-L 127.0.0.1:18049:127.0.0.1:8000'
 test "$(grep -F -c -- "$api_pattern" "$log")" -eq 1
-test "$(grep -F -c -- '-R 127.0.0.1:' "$log")" -eq 96
+test "$(grep -F -c -- '-R 127.0.0.1:' "$log")" -eq 24
 while IFS= read -r line; do
   case "$line" in
     *"$api_pattern"*"-R 127.0.0.1:"*)
@@ -124,13 +132,13 @@ for port in $(seq 18100 18195); do
 done
 while IFS= read -r line; do
   reverse_count=$(grep -o -- '-R 127.0.0.1:' <<<"$line" | wc -l)
-  test "$reverse_count" -eq 1
+  test "$reverse_count" -eq 4
   grep -Fq -- '-o ExitOnForwardFailure=yes' <<<"$line"
 done < <(grep -F -- '-R 127.0.0.1:' "$log")
 
 # A second launcher invocation finds the exact API and lane signatures.
 PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$log" PEER_QUERY="$query" peer_tunnel
-test "$(wc -l <"$log")" -eq 97
+test "$(wc -l <"$log")" -eq 25
 
 china_log="$tmp/china-tunnel.log"
 trainer_ssh_target=china-trainer
@@ -159,6 +167,25 @@ run_china_lanes() {
   done
 }
 
+# A migration launch removes an old four-port China supervisor before
+# creating ninety-six one-port supervisors.
+stale_group_command="$tmp/stale-group-command"
+printf '%s\n' 'while true; do ssh -NT -L 127.0.0.1:18104:127.0.0.1:8100 -L 127.0.0.1:18105:127.0.0.1:8100 -L 127.0.0.1:18106:127.0.0.1:8100 -L 127.0.0.1:18107:127.0.0.1:8100 china-trainer; sleep 3; done # china-tunnel-lora-1' >"$stale_group_command"
+printf '%s\n' "$(<"$stale_group_command")" >"$china_log"
+stale_group_kill_log="$tmp/stale-group-kill"
+kill() {
+  printf '%s\n' "$*" >>"$stale_group_kill_log"
+  PEER_STALE_GROUP_ACTIVE=0
+  export PEER_STALE_GROUP_ACTIVE
+  sed -i '/# china-tunnel-lora-1$/d' "$china_log"
+}
+export PEER_STALE_GROUP_ACTIVE=1 PEER_STALE_GROUP_COMMAND="$stale_group_command"
+PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$china_log" PEER_QUERY="$query" PEER_CHINA_MODE=1 china_tunnel_remove_legacy
+test "${PEER_STALE_GROUP_ACTIVE:-1}" -eq 0
+test -s "$stale_group_kill_log"
+unset PEER_STALE_GROUP_ACTIVE PEER_STALE_GROUP_COMMAND
+unset -f kill
+
 # A fresh launch creates ninety-six one-forward lanes.
 run_china_lanes
 for _ in $(seq 1 50); do
@@ -166,6 +193,7 @@ for _ in $(seq 1 50); do
   sleep 0.1
 done
 test "$(wc -l <"$china_log")" -eq 96
+test "$(awk '/18104:127.0.0.1:8100/ && /18107:127.0.0.1:8100/ {count++} END {print count + 0}' "$china_log")" -eq 0
 while IFS= read -r line; do
   forward_count=$(grep -o -- '-L 127.0.0.1:' <<<"$line" | wc -l)
   test "$forward_count" -eq 1

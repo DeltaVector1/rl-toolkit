@@ -830,7 +830,7 @@ class AdapterTransportStateTest(unittest.TestCase):
                 old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
                 old_streams = os.environ.get("PRIME_LORA_DOWNLOAD_STREAMS")
                 os.environ["PRIME_LORA_CACHE_DIR"] = str(root / "cache")
-                os.environ["PRIME_LORA_DOWNLOAD_STREAMS"] = "24"
+                os.environ["PRIME_LORA_DOWNLOAD_STREAMS"] = "96"
                 try:
                     destination = filesystem.stage_lora_adapter_files(source_url)
                 finally:
@@ -1352,7 +1352,7 @@ class AdapterTransportStateTest(unittest.TestCase):
         self.assertEqual(urlsplit(source_url).port, ports["lora_source_first"])
         runtime = REPOSITORY / "training_ops/runtime/h200"
         glm_source = (runtime / "start_inference.sh").read_text(encoding="utf-8")
-        self.assertIn("PRIME_LORA_DOWNLOAD_STREAMS=24", glm_source)
+        self.assertIn("PRIME_LORA_DOWNLOAD_STREAMS=96", glm_source)
         self.assertIn('PRIME_LORA_SOURCE_PORTS="$lora_source_port_list"', glm_source)
         source_generator = glm_source.split(
             'runtime_output=$(python3 - "$deployment/configs/nodes.toml" "$engine_host" <<\'PY\'\n',
@@ -1368,8 +1368,7 @@ class AdapterTransportStateTest(unittest.TestCase):
         generated_ports = [
             int(value) for value in source_result.stdout.splitlines()[0].split(",")
         ]
-        self.assertEqual(generated_ports[:24], list(range(18100, 18196, 4)))
-        self.assertEqual(sorted(generated_ports), list(range(18100, 18196)))
+        self.assertEqual(generated_ports, list(range(18100, 18196)))
         orchestrator_source = (
             REPOSITORY / "training_ops/runtime/h200/start_orchestrator.sh"
         ).read_text(encoding="utf-8")
