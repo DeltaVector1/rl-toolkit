@@ -14,7 +14,7 @@ level = "info"
 project = "glm-runs"
 name = "orchestrator-glm-decensor-1"
 group = "glm-runs"
-tags = ["glm-decensor-1", "glm-5.2", "decensor", "grpo", "lora-r32", "20-step-check"]
+tags = ["glm-decensor-1", "glm-5.2", "decensor", "grpo", "lora-r32", "50-step"]
 
 [file_monitor]
 filename = "rollout-metrics.jsonl"
