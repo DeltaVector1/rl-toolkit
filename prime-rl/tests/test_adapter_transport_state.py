@@ -326,6 +326,17 @@ class QuietDirectoryHandler(http.server.SimpleHTTPRequestHandler):
 
 
 class AdapterTransportStateTest(unittest.TestCase):
+    def test_default_chunk_sizes_keep_v1_and_v2_transport_contracts(self):
+        target_size = 30_767_549_784
+        self.assertEqual(
+            len(adapter_delta._chunk_ranges(target_size, adapter_delta.default_chunk_size)),
+            459,
+        )
+        self.assertEqual(
+            len(adapter_delta._chunk_ranges(target_size, adapter_delta.predictive_chunk_size)),
+            1834,
+        )
+
     def test_broadcast_file_not_found_only_skips_deleted_run(self):
         broadcast_weights, fake_model = load_broadcast_weights_method()
         cases = (

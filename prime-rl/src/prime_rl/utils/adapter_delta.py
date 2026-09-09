@@ -21,7 +21,8 @@ adapter_config_name = "adapter_config.json"
 adapter_weights_name = "adapter_model.safetensors"
 adapter_transport_name = "chunked-shuffled-xor"
 predictive_transport_name = "chunked-bf16-linear-zigzag-sparse-zstd"
-default_chunk_size = 16 * 1024 * 1024
+default_chunk_size = 64 * 1024 * 1024
+predictive_chunk_size = 16 * 1024 * 1024
 default_workers = 8
 max_workers_limit = 8
 io_chunk_size = 16 * 1024 * 1024
@@ -797,7 +798,7 @@ def publish_adapter_manifest(
     target_step: int | None = None,
     base_step: int | None = None,
     base2_step: int | None = None,
-    chunk_size: int = default_chunk_size,
+    chunk_size: int | None = None,
     max_workers: int = default_workers,
 ) -> dict[str, Any]:
     """Publish full or exact delta chunks for one adapter directory.
@@ -858,6 +859,11 @@ def publish_adapter_manifest(
             base_url = None
             base_step = None
         selected_mode = "delta" if base_dir is not None else "full"
+
+    if chunk_size is None:
+        chunk_size = (
+            predictive_chunk_size if selected_mode == "predictive" else default_chunk_size
+        )
 
     if selected_mode in {"delta", "predictive"}:
         weight_chunks, weight_encoded_size = _write_encoded_chunks(
