@@ -694,7 +694,7 @@ def _write_encoded_chunks(
     max_workers: int,
     base2_path: Path | None = None,
     data_offset: int | None = None,
-) -> tuple[list[dict[str, Any]], int]:
+) -> tuple[list[dict[str, Any]], int, str, str | None, str | None]:
     target_size = target_path.stat().st_size
     ranges = _chunk_ranges(target_size, chunk_size)
     if base_path is not None and base_path.stat().st_size != target_size:
@@ -709,6 +709,26 @@ def _write_encoded_chunks(
     target = target_path.open("rb")
     base = base_path.open("rb") if base_path is not None else None
     base2 = base2_path.open("rb") if base2_path is not None else None
+    readers = (
+        ("target", target, target_path),
+        ("base", base, base_path),
+        ("base2", base2, base2_path),
+    )
+    digest_by_identity: dict[tuple[int, int], Any] = {}
+    digest_owner_by_identity: dict[tuple[int, int], str] = {}
+    digest_owner: dict[str, bool] = {}
+    digests: dict[str, Any] = {}
+    for name, source, path in readers:
+        if source is None or path is None:
+            continue
+        identity = os.fstat(source.fileno())
+        key = (identity.st_dev, identity.st_ino)
+        digest = digest_by_identity.get(key)
+        if digest is None:
+            digest = hashlib.sha256()
+            digest_by_identity[key] = digest
+        digests[name] = digest
+        digest_owner[name] = digest_owner_by_identity.setdefault(key, name) == name
 
     def save_chunk(index: int, raw: bytes, payload: bytes, offset: int, raw_size: int) -> None:
         name = f"{target_path.name}.transport-{mode}-{index:06d}"
@@ -743,12 +763,18 @@ def _write_encoded_chunks(
                 target_chunk = target.read(end - start)
                 if len(target_chunk) != end - start:
                     raise OSError(f"adapter file ended early: {target_path.name}")
+                if digest_owner["target"]:
+                    digests["target"].update(target_chunk)
                 base_chunk = base.read(end - start) if base is not None else None
                 if base is not None and len(base_chunk) != end - start:
                     raise OSError(f"base adapter file ended early: {base_path.name}")
+                if base is not None and digest_owner["base"]:
+                    digests["base"].update(base_chunk)
                 base2_chunk = base2.read(end - start) if base2 is not None else None
                 if base2 is not None and len(base2_chunk) != end - start:
                     raise OSError(f"second base adapter file ended early: {base2_path.name}")
+                if base2 is not None and digest_owner["base2"]:
+                    digests["base2"].update(base2_chunk)
                 if mode == "delta":
                     assert base_chunk is not None
                     pending[index] = pool.submit(_encode_delta_chunk, base_chunk, target_chunk)
@@ -778,7 +804,13 @@ def _write_encoded_chunks(
             base2.close()
 
     chunks.sort(key=lambda item: int(item["offset"]))
-    return chunks, written_size
+    return (
+        chunks,
+        written_size,
+        digests["target"].hexdigest(),
+        digests["base"].hexdigest() if base is not None else None,
+        digests["base2"].hexdigest() if base2 is not None else None,
+    )
 
 
 def _file_record(path: Path) -> dict[str, Any]:
@@ -865,8 +897,17 @@ def publish_adapter_manifest(
             predictive_chunk_size if selected_mode == "predictive" else default_chunk_size
         )
 
+    target_weights_sha256: str | None = None
+    base_weights_sha256: str | None = None
+    base2_weights_sha256: str | None = None
     if selected_mode in {"delta", "predictive"}:
-        weight_chunks, weight_encoded_size = _write_encoded_chunks(
+        (
+            weight_chunks,
+            weight_encoded_size,
+            target_weights_sha256,
+            base_weights_sha256,
+            base2_weights_sha256,
+        ) = _write_encoded_chunks(
             target_weights,
             base_dir / adapter_weights_name,
             target_dir,
@@ -891,10 +932,17 @@ def publish_adapter_manifest(
         _remove_transport_chunks(target_dir)
         raise ValueError("predictive transport is not smaller than the full adapter")
 
-    files = [
-        _file_record(target_config),
-        _file_record(target_weights),
-    ]
+    files = [_file_record(target_config)]
+    if target_weights_sha256 is None:
+        files.append(_file_record(target_weights))
+    else:
+        files.append(
+            {
+                "name": target_weights.name,
+                "size": target_weights.stat().st_size,
+                "sha256": target_weights_sha256,
+            }
+        )
     weights_record = files[1]
     manifest: dict[str, Any] = {
         "version": 2 if selected_mode == "predictive" else 1,
@@ -962,14 +1010,18 @@ def publish_adapter_manifest(
         )
     if base_dir is not None:
         manifest["base_size"] = (base_dir / adapter_weights_name).stat().st_size
-        manifest["base_sha256"] = sha256_file(base_dir / adapter_weights_name)
+        if base_weights_sha256 is None:
+            base_weights_sha256 = sha256_file(base_dir / adapter_weights_name)
+        manifest["base_sha256"] = base_weights_sha256
         base_config = base_dir / adapter_config_name
         if base_config.is_file():
             manifest["base_config_sha256"] = sha256_file(base_config)
     if selected_mode == "predictive" and base2_dir is not None:
         base2_weights = base2_dir / adapter_weights_name
         manifest["base2_size"] = base2_weights.stat().st_size
-        manifest["base2_sha256"] = sha256_file(base2_weights)
+        if base2_weights_sha256 is None:
+            base2_weights_sha256 = sha256_file(base2_weights)
+        manifest["base2_sha256"] = base2_weights_sha256
         base2_config = base2_dir / adapter_config_name
         manifest["base2_config_size"] = base2_config.stat().st_size
         manifest["base2_config_sha256"] = sha256_file(base2_config)
