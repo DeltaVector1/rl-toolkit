@@ -449,43 +449,9 @@ class PredictiveAdapterCodecTest(unittest.TestCase):
         target_words = [0x8000, 0x0000, 0x7F7F, 0xFF7F, 0x7FC2, 0xFFC1, 0x7F80]
         base = safetensor_bytes(base_words)
         target = safetensor_bytes(target_words)
-        payload = adapter_delta.encode_predictive_chunk(
-            base,
-            base,
-            target,
-            0,
-            16,
-            predictor="bf16-first-order-exact",
-        )
-        self.assertEqual(
-            adapter_delta.decode_predictive_chunk(
-                base,
-                base,
-                payload,
-                0,
-                16,
-                predictor="bf16-first-order-exact",
-            ),
-            target,
-        )
-
-    def test_later_v2_equal_bases_keep_the_second_order_predictor(self):
-        base = safetensor_bytes([0x8000])
-        target = safetensor_bytes([0x0000])
         payload = adapter_delta.encode_predictive_chunk(base, base, target, 0, 16)
         self.assertEqual(
             adapter_delta.decode_predictive_chunk(base, base, payload, 0, 16),
-            target,
-        )
-        self.assertNotEqual(
-            adapter_delta.decode_predictive_chunk(
-                base,
-                base,
-                payload,
-                0,
-                16,
-                predictor="bf16-first-order-exact",
-            ),
             target,
         )
 

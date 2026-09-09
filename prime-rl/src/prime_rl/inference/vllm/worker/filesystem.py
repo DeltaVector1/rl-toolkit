@@ -1111,23 +1111,22 @@ def _read_chunked_linear_manifest(
     base_config_sha256 = digest("base_config_sha256")
     base2_sha256 = digest("base2_sha256")
     base2_config_sha256 = digest("base2_config_sha256")
-    expected_predictor = (
-        "bf16-first-order-exact"
-        if target_step == 1
-        else "bf16-float32-second-order-rne"
-    )
     if target_step == 1 and (
         base_url != base2_url
         or base_sha256 != base2_sha256
         or base_size != base2_size
         or base_config_sha256 != base2_config_sha256
         or base_config_size != base2_config_size
+        or value.get("predictor") != "bf16-first-order-exact"
     ):
         raise OSError("step-one predictive adapter bases are not the same identity")
     if (
         value.get("chunk_alignment") != 2
         or value.get("chunk_coverage") != {"offset": 0, "size": target_size}
-        or value.get("predictor") != expected_predictor
+        or value.get("predictor") not in {
+            "bf16-first-order-exact",
+            "bf16-float32-second-order-rne",
+        }
         or value.get("value_encoding") != "sparse-zigzag-leb128"
         or value.get("mask_encoding") != "zstd-bit-mask-little-endian"
     ):
@@ -1245,7 +1244,6 @@ def _read_chunked_linear_manifest(
         "base2_config_size": base2_config_size,
         "base2_config_sha256": base2_config_sha256,
         "data_offset": data_offset,
-        "predictor": value["predictor"],
         "target_sha256": target_sha256,
         "target_size": target_size,
         "config_sha256": config_sha256,
@@ -2215,7 +2213,6 @@ def _decode_linear_transport_chunk(
     data_offset: int,
     raw_size: int,
     codec: str,
-    predictor: str = "bf16-float32-second-order-rne",
 ) -> tuple[bytes, str]:
     """Decode one version-two chunk and return its canonical correction digest."""
     if codec not in _ADAPTER_KNOWN_CHUNK_CODECS:
@@ -2233,7 +2230,6 @@ def _decode_linear_transport_chunk(
             data_offset=data_offset,
             raw_size=raw_size,
             codec=codec,
-            predictor=predictor,
         )
         correction_sha256 = hashlib.sha256(correction).hexdigest()
     except Exception as exc:
@@ -2463,23 +2459,15 @@ def _stage_chunked_linear_adapter(
         deadline=deadline,
         cancel_event=cancel_event,
     )
-    if (
-        base_url == base2_url
-        and base_sha256 == base2_sha256
-        and base_config_sha256 == base2_config_sha256
-        and base_config_size == base2_config_size
-    ):
-        base1_model = base2_model
-    else:
-        base1_model, _ = _verified_adapter_base(
-            base_url,
-            base_sha256,
-            expected_size=base_size,
-            expected_config_sha256=base_config_sha256,
-            expected_config_size=base_config_size,
-            deadline=deadline,
-            cancel_event=cancel_event,
-        )
+    base1_model, _ = _verified_adapter_base(
+        base_url,
+        base_sha256,
+        expected_size=base_size,
+        expected_config_sha256=base_config_sha256,
+        expected_config_size=base_config_size,
+        deadline=deadline,
+        cancel_event=cancel_event,
+    )
     chunks = transport["chunks"]
     if not isinstance(chunks, list):
         raise OSError("version-two adapter chunks are invalid")
@@ -2717,7 +2705,6 @@ def _stage_chunked_linear_adapter(
                     data_offset=data_offset,
                     raw_size=raw_size,
                     codec=str(item["codec"]),
-                    predictor=str(transport["predictor"]),
                 )
                 if correction_sha256 != raw_sha256:
                     raise OSError("version-two adapter correction checksum mismatch")
@@ -2797,7 +2784,6 @@ def _stage_chunked_linear_adapter(
             "base_sha256": base_sha256,
             "base2_url": base2_url,
             "base2_sha256": base2_sha256,
-            "predictor": transport["predictor"],
             "target_sha256": target_sha256,
         },
     )
@@ -3698,7 +3684,6 @@ def stage_lora_adapter_files(
                                 and proof.get("transport") == _ADAPTER_LINEAR_TRANSPORT
                                 and proof.get("base2_url") == transport.get("base2_url")
                                 and proof.get("base2_sha256") == transport.get("base2_sha256")
-                                and proof.get("predictor") == transport.get("predictor")
                             )
                         )
                         and proof.get("source_url") == source_url

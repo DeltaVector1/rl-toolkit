@@ -202,15 +202,9 @@ def _validate_predictive_source_manifest(manifest: dict[str, object], source_url
         or manifest.get("base_sha256") != manifest.get("base2_sha256")
         or manifest.get("base_size") != manifest.get("base2_size")
         or manifest.get("base_config_sha256") != manifest.get("base2_config_sha256")
+        or manifest.get("predictor") != "bf16-first-order-exact"
     ):
         raise RelayRequestError(500, "step-one predictive adapter bases are not the same identity")
-    expected_predictor = (
-        "bf16-first-order-exact"
-        if target_step == 1
-        else "bf16-float32-second-order-rne"
-    )
-    if manifest.get("predictor") != expected_predictor:
-        raise RelayRequestError(500, "relay source manifest predictor does not match its step")
     files = manifest.get("files")
     if not isinstance(files, list):
         raise RelayRequestError(500, "relay source manifest has no file records")
@@ -226,9 +220,6 @@ def _validate_predictive_source_manifest(manifest: dict[str, object], source_url
         raise RelayRequestError(500, "relay source manifest has an incomplete file set")
     target_file = file_map["adapter_model.safetensors"]
     config_file = file_map["adapter_config.json"]
-    target_size = manifest["target_size"]
-    if manifest["base_size"] != target_size or manifest["base2_size"] != target_size:
-        raise RelayRequestError(500, "relay source predecessor sizes differ from the target")
     if (
         manifest.get("target_size") != target_file.get("size")
         or manifest.get("target_sha256") != target_file.get("sha256")
