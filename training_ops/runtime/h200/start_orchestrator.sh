@@ -419,6 +419,78 @@ china_tunnel_grouped_legacy_match() {
   [ "$configured_total" -eq 4 ]
 }
 
+china_tunnel_ssh_child_match() {
+  local pid=$1 command_line
+  local executable source_port forward_count index
+  local -a command_args expected_args
+  expected_args=(
+    -NT
+    -o BatchMode=yes
+    -o ConnectTimeout=30
+    -o ExitOnForwardFailure=yes
+    -o ServerAliveInterval=10
+    -o ServerAliveCountMax=3
+    -o TCPKeepAlive=yes
+    -o IPQoS=none
+    -o Compression=no
+  )
+  executable=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
+  case "$executable" in
+    ''|/usr/bin/ssh) ;;
+    *) return 1 ;;
+  esac
+  command_line=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' ' ') || return 1
+  read -r -a command_args <<<"$command_line"
+  case "${command_args[0]:-}" in
+    ssh|/usr/bin/ssh) ;;
+    *) return 1 ;;
+  esac
+  [ "${#command_args[@]}" -ge "$(( ${#expected_args[@]} + 4 ))" ] || return 1
+  for index in "${!expected_args[@]}"; do
+    [ "${command_args[index + 1]}" = "${expected_args[index]}" ] || return 1
+  done
+  [ "${command_args[-1]}" = "$trainer_ssh_target" ] || return 1
+  forward_count=$(( ${#command_args[@]} - ${#expected_args[@]} - 2 ))
+  [ "$forward_count" -eq 2 ] || [ "$forward_count" -eq 8 ] || return 1
+  for ((index = ${#expected_args[@]} + 1; index < ${#command_args[@]} - 1; index += 2)); do
+    [ "${command_args[index]}" = "-L" ] || return 1
+    case "${command_args[index + 1]}" in
+      127.0.0.1:*:127.0.0.1:"$adapter_port") ;;
+      *) return 1 ;;
+    esac
+    source_port=${command_args[index + 1]#127.0.0.1:}
+    source_port=${source_port%%:*}
+    case " ${lora_source_ports[*]} " in
+      *" $source_port "*) ;;
+      *) return 1 ;;
+    esac
+  done
+}
+
+china_tunnel_remove_orphan_children() {
+  local source_port listener pid ppid seen_pid
+  local -a listener_pids=()
+  for source_port in "${lora_source_ports[@]}"; do
+    while IFS= read -r listener; do
+      pid=$(sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' <<<"$listener")
+      case "$pid" in ''|*[!0-9]*) continue ;; esac
+      seen_pid=0
+      for listener_pid in "${listener_pids[@]}"; do
+        [ "$listener_pid" = "$pid" ] && seen_pid=1
+      done
+      [ "$seen_pid" = 0 ] || continue
+      ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+      [ "$ppid" = 1 ] || continue
+      china_tunnel_ssh_child_match "$pid" || continue
+      listener_pids+=("$pid")
+      china_legacy_cleanup_required=1
+      china_legacy_cleanup_pids+=("$pid")
+      china_legacy_cleanup_orphan_pids+=("$pid")
+      kill "$pid" 2>/dev/null || true
+    done < <(ss -H -ltnp 2>/dev/null | awk -v local_port="127.0.0.1:$source_port" '$4 == local_port')
+  done
+}
+
 china_tunnel_remove_legacy() {
   local only_marker=${1:-}
   local lora_source_port pattern pid command_line pgid group_command group_safe group_seen cleanup_port
@@ -499,7 +571,12 @@ china_tunnel_remove_legacy() {
 
 china_tunnel_wait_legacy_clear() {
   local pid pgid group_processes source_port listener_remaining
-  for _ in $(seq 1 30); do
+  for wait_cycle in $(seq 1 30); do
+    if [ "$wait_cycle" -eq 15 ]; then
+      for pid in "${china_legacy_cleanup_orphan_pids[@]}"; do
+        china_tunnel_ssh_child_match "$pid" && kill -KILL "$pid" 2>/dev/null || true
+      done
+    fi
     listener_remaining=0
     for pid in "${china_legacy_cleanup_pids[@]}"; do
       [ -z "$(ps -o args= -p "$pid" 2>/dev/null || true)" ] || {
@@ -604,7 +681,9 @@ peer_tunnel() {
 china_legacy_cleanup_required=0
 china_legacy_cleanup_pids=()
 china_legacy_cleanup_pgids=()
+china_legacy_cleanup_orphan_pids=()
 china_tunnel_remove_legacy
+china_tunnel_remove_orphan_children
 if [ "$china_legacy_cleanup_required" = 1 ] && ! china_tunnel_wait_legacy_clear; then
   exit 1
 fi

@@ -12,6 +12,21 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
 mkdir -p "$tmp/bin"
+real_cat=$(command -v cat)
+cat >"$tmp/bin/cat" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  /proc/*/cmdline)
+    pid=${1#/proc/}
+    pid=${pid%/cmdline}
+    fixture="${CHINA_PROC_FIXTURES:?missing China proc fixtures}/$pid"
+    [ -s "$fixture" ] || exit 1
+    exec "$REAL_CAT" "$fixture"
+    ;;
+  *) exec "$REAL_CAT" "$@" ;;
+esac
+EOF
 cat >"$tmp/bin/pgrep" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -58,6 +73,8 @@ if [ "${1:-}" = "-o" ] && [ "${2:-}" = "args=" ]; then
     cat "${TUNNEL_OWNER_COMMAND:?}"
   elif [ "${TUNNEL_SUPERVISOR_PID:-}" = "$pid" ]; then
     cat "${TUNNEL_SUPERVISOR_COMMAND:?}"
+  elif [ -n "${CHINA_PROC_FIXTURES:-}" ] && [ -s "$CHINA_PROC_FIXTURES/$pid" ]; then
+    "$REAL_CAT" "$CHINA_PROC_FIXTURES/$pid" | tr '\0' ' '
   elif [ "$pid" -ge 10000 ] 2>/dev/null; then
     if [ "${PEER_STALE_GROUP_ACTIVE:-0}" = 1 ] && [ -r "${PEER_STALE_GROUP_COMMAND:-}" ]; then
       cat "$PEER_STALE_GROUP_COMMAND"
@@ -89,8 +106,9 @@ if [ -n "${TUNNEL_SS_OUTPUT:-}" ] && [ "${PEER_STALE_LISTENERS_ACTIVE:-}" != 0 ]
   cat "${TUNNEL_SS_OUTPUT:?missing tunnel ss output}"
 fi
 EOF
-chmod +x "$tmp/bin/pgrep" "$tmp/bin/setsid"
+chmod +x "$tmp/bin/cat" "$tmp/bin/pgrep" "$tmp/bin/setsid"
 chmod +x "$tmp/bin/ps" "$tmp/bin/ss"
+export REAL_CAT="$real_cat"
 
 start=$(grep -n '^tunnel() {' "$script" | cut -d: -f1)
 end=$(grep -n '^china_legacy_cleanup_required=0$' "$script" | cut -d: -f1)
@@ -181,6 +199,9 @@ kill() {
   PEER_STALE_GROUP_ACTIVE=0
   export PEER_STALE_GROUP_ACTIVE
   sed -i '/# china-tunnel-lora-1$/d' "$china_log"
+  case " $* " in
+    *" 20001"*) : >"$CHINA_PROC_FIXTURES/20001" ;;
+  esac
 }
 
 unrelated_group_command="$tmp/unrelated-group-command"
@@ -200,6 +221,60 @@ PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$china_log" PEER_QUERY="$query" PEER_CHINA_
 test "${PEER_STALE_GROUP_ACTIVE:-1}" -eq 0
 test -s "$stale_group_kill_log"
 unset PEER_STALE_GROUP_ACTIVE PEER_STALE_GROUP_COMMAND
+
+proc_fixtures="$tmp/proc-cmdline"
+mkdir -p "$proc_fixtures"
+write_child_cmdline() {
+  local output=$1
+  shift
+  printf '%s\0' \
+    /usr/bin/ssh -NT \
+    -o BatchMode=yes \
+    -o ConnectTimeout=30 \
+    -o ExitOnForwardFailure=yes \
+    -o ServerAliveInterval=10 \
+    -o ServerAliveCountMax=3 \
+    -o TCPKeepAlive=yes \
+    -o IPQoS=none \
+    -o Compression=no \
+    "$@" >"$output"
+}
+write_child_cmdline "$proc_fixtures/20001" \
+  -L 127.0.0.1:18104:127.0.0.1:8100 \
+  -L 127.0.0.1:18105:127.0.0.1:8100 \
+  -L 127.0.0.1:18106:127.0.0.1:8100 \
+  -L 127.0.0.1:18107:127.0.0.1:8100 \
+  china-trainer
+write_child_cmdline "$proc_fixtures/20002" \
+  -L 127.0.0.1:18110:127.0.0.1:8100 \
+  -L 127.0.0.1:18111:127.0.0.1:8100 \
+  -L 127.0.0.1:18112:127.0.0.1:8100 \
+  -L 127.0.0.1:18113:127.0.0.1:8100 \
+  unrelated-trainer
+write_child_cmdline "$proc_fixtures/20003" \
+  -L 127.0.0.1:18114:127.0.0.1:8100 \
+  -L 127.0.0.1:18195:127.0.0.1:8100 \
+  -L 127.0.0.1:18196:127.0.0.1:8100 \
+  -L 127.0.0.1:18116:127.0.0.1:8100 \
+  china-trainer
+orphan_ss="$tmp/orphan-ss"
+printf 'LISTEN 0 128 127.0.0.1:18104 0.0.0.0:* users:(("ssh",pid=20001,fd=5))\n' >"$orphan_ss"
+printf 'LISTEN 0 128 127.0.0.1:18105 0.0.0.0:* users:(("ssh",pid=20001,fd=6))\n' >>"$orphan_ss"
+printf 'LISTEN 0 128 127.0.0.1:18106 0.0.0.0:* users:(("ssh",pid=20001,fd=7))\n' >>"$orphan_ss"
+printf 'LISTEN 0 128 127.0.0.1:18107 0.0.0.0:* users:(("ssh",pid=20001,fd=8))\n' >>"$orphan_ss"
+printf 'LISTEN 0 128 127.0.0.1:18110 0.0.0.0:* users:(("ssh",pid=20002,fd=5))\n' >>"$orphan_ss"
+printf 'LISTEN 0 128 127.0.0.1:18114 0.0.0.0:* users:(("ssh",pid=20003,fd=5))\n' >>"$orphan_ss"
+export REAL_CAT="$real_cat" CHINA_PROC_FIXTURES="$proc_fixtures" TUNNEL_SS_OUTPUT="$orphan_ss"
+PATH="$tmp/bin:$PATH" china_tunnel_remove_orphan_children
+test ! -s "$proc_fixtures/20001"
+test -s "$proc_fixtures/20002"
+test -s "$proc_fixtures/20003"
+test ! -s "$stale_group_kill_log" || ! grep -Fq -- '20002' "$stale_group_kill_log"
+test ! -s "$stale_group_kill_log" || ! grep -Fq -- '20003' "$stale_group_kill_log"
+unset CHINA_PROC_FIXTURES TUNNEL_SS_OUTPUT
+china_legacy_cleanup_pids=()
+china_legacy_cleanup_pgids=()
+china_legacy_cleanup_orphan_pids=()
 
 stale_listener_output="$tmp/stale-listeners"
 : >"$stale_listener_output"
