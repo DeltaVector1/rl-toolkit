@@ -1,5 +1,5 @@
 output_dir = "/data/glm52-rl/runs/glm-decensor-1"
-max_steps = 20
+max_steps = 50
 dist_timeout_seconds = 5400
 enable_router_replay = false
 

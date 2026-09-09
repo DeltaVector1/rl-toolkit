@@ -1,5 +1,5 @@
 output_dir = "/data/glm52-rl/runs/glm-decensor-1/run_glm-decensor-1"
-max_steps = 20
+max_steps = 50
 seq_len = 32768
 batch_size = 1024
 group_size = 16
@@ -50,12 +50,64 @@ max_completion_tokens = 16384
 extra_body = { min_tokens = 16 }
 
 [[train.env]]
-name = "decensor"
+name = "decensor-easy"
 ratio = 1.0
 pool = { type = "static", num_workers = 16 }
 env.taskset.id = "decensor-v1"
 env.taskset.num_examples = 2000
 env.taskset.difficulty = "easy"
+env.agent.harness = { id = "null" }
+env.agent.max_output_tokens = 16384
+env.agent.timeout.rollout = 3600
+
+[train.env.sampling]
+max_completion_tokens = 16384
+
+[train.env.env.taskset.task.judge]
+base_url = "http://202.214.223.66:26406/v1"
+model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
+api_key_var = "VLLM_API_KEY"
+max_concurrent_requests = 48
+
+[train.env.env.taskset.task.user]
+base_url = "http://202.214.223.66:26406/v1"
+model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
+api_key_var = "VLLM_API_KEY"
+max_concurrent_requests = 48
+
+[[train.env]]
+name = "decensor-medium"
+ratio = 1.0
+pool = { type = "static", num_workers = 16 }
+env.taskset.id = "decensor-v1"
+env.taskset.num_examples = 2000
+env.taskset.difficulty = "medium"
+env.agent.harness = { id = "null" }
+env.agent.max_output_tokens = 16384
+env.agent.timeout.rollout = 3600
+
+[train.env.sampling]
+max_completion_tokens = 16384
+
+[train.env.env.taskset.task.judge]
+base_url = "http://202.214.223.66:26406/v1"
+model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
+api_key_var = "VLLM_API_KEY"
+max_concurrent_requests = 48
+
+[train.env.env.taskset.task.user]
+base_url = "http://202.214.223.66:26406/v1"
+model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
+api_key_var = "VLLM_API_KEY"
+max_concurrent_requests = 48
+
+[[train.env]]
+name = "decensor-hard"
+ratio = 1.0
+pool = { type = "static", num_workers = 16 }
+env.taskset.id = "decensor-v1"
+env.taskset.num_examples = 2000
+env.taskset.difficulty = "hard"
 env.agent.harness = { id = "null" }
 env.agent.max_output_tokens = 16384
 env.agent.timeout.rollout = 3600
