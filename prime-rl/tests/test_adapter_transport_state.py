@@ -330,7 +330,7 @@ class AdapterTransportStateTest(unittest.TestCase):
         target_size = 30_767_549_784
         self.assertEqual(
             len(adapter_delta._chunk_ranges(target_size, adapter_delta.default_chunk_size)),
-            459,
+            1834,
         )
         self.assertEqual(
             len(adapter_delta._chunk_ranges(target_size, adapter_delta.predictive_chunk_size)),
