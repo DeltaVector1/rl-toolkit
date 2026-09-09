@@ -508,9 +508,9 @@ peer_tunnel() {
     "-L 127.0.0.1:$peer_api_port:127.0.0.1:8000" \
     -L "127.0.0.1:$peer_api_port:127.0.0.1:8000"
 
-  # Keep each SSH cipher worker to four source ports without creating one SSH
-  # connection for every port.
-  local peer_lane_size=4
+  # Keep each SSH supervisor to one source port so each download worker has a
+  # distinct TCP connection.
+  local peer_lane_size=1
   local lane_start=0 lane_number=0
   local -a lane_ports lane_forwards
   while [ "$lane_start" -lt "${#lora_source_ports[@]}" ]; do
@@ -533,7 +533,7 @@ peer_tunnel() {
 }
 
 china_tunnel_remove_legacy
-china_lane_size=4
+china_lane_size=1
 china_lane_start=0 china_lane_number=0
 china_lane_ports=() china_lane_forwards=()
 while [ "$china_lane_start" -lt "${#lora_source_ports[@]}" ]; do
@@ -593,7 +593,7 @@ if [ "$tunnels_only" = 1 ]; then
   done
   if [ "$tunnels_ready" != 1 ]; then
     if [ -n "$readiness_port" ]; then
-      echo "adapter tunnel readiness failed for local port $readiness_port: listener owner is not the expected grouped SSH supervisor" >&2
+      echo "adapter tunnel readiness failed for local port $readiness_port: listener owner is not the expected SSH supervisor" >&2
     else
       echo "adapter tunnel reconciliation did not establish all configured forwards" >&2
     fi

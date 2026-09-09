@@ -362,14 +362,15 @@ class DownloadSchedulerTest(unittest.TestCase):
         ])
         self.assertTrue(all(0 < call[1] <= 15 for call in calls))
 
-    def test_range_retry_wraps_to_a_distinct_tunnel_group(self):
+    def test_range_retry_rotates_to_a_distinct_tunnel_supervisor(self):
         filesystem = load_filesystem_module()
         payload = b"chunk"
         source_urls = [
             f"http://127.0.0.1:{port}/chunk"
-            for lane_offset in range(4)
-            for port in range(18100 + lane_offset, 18196, 4)
+            for port in range(18100, 18196)
         ]
+        self.assertEqual(len(source_urls), 96)
+        self.assertEqual(len(set(source_urls)), 96)
         calls = []
 
         class Response(io.BytesIO):
@@ -412,8 +413,8 @@ class DownloadSchedulerTest(unittest.TestCase):
 
         self.assertEqual(calls, [source_urls[23], source_urls[24]])
         self.assertEqual(
-            [(int(url.split(":")[2].split("/", 1)[0]) - 18100) // 4 for url in calls],
-            [23, 0],
+            [int(url.split(":")[2].split("/", 1)[0]) for url in calls],
+            [18123, 18124],
         )
 
 
