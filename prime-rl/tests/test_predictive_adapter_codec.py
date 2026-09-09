@@ -433,11 +433,88 @@ class PredictiveAdapterCodecTest(unittest.TestCase):
             (directories[1] / "adapter_model.safetensors").write_bytes(valid_safetensor_bytes(words))
             invalid_dtype = valid_safetensor_bytes(words).replace(b'"BF16"', b'"FP16"')
             (directories[2] / "adapter_model.safetensors").write_bytes(invalid_dtype)
-            with self.assertRaisesRegex(ValueError, "requires BF16"):
+            manifest = adapter_delta.publish_adapter_manifest(
+                directories[2], directories[1], base2_dir=directories[0],
+                target_step=3, base_step=2, base2_step=1,
+                chunk_size=1024, max_workers=1,
+            )
+            self.assertEqual(manifest["version"], 1)
+            self.assertEqual(manifest["mode"], "delta")
+            self.assertEqual(manifest["target_sha256"], adapter_delta.sha256_file(
+                directories[2] / "adapter_model.safetensors"
+            ))
+
+    def test_same_base_predictive_round_trip_preserves_bf16_bits(self):
+        base_words = [0x0000, 0x8000, 0x7F80, 0xFF80, 0x7FC1, 0xFFC2, 0x0080]
+        target_words = [0x8000, 0x0000, 0x7F7F, 0xFF7F, 0x7FC2, 0xFFC1, 0x7F80]
+        base = safetensor_bytes(base_words)
+        target = safetensor_bytes(target_words)
+        payload = adapter_delta.encode_predictive_chunk(base, base, target, 0, 16)
+        self.assertEqual(
+            adapter_delta.decode_predictive_chunk(base, base, payload, 0, 16),
+            target,
+        )
+
+    def test_step_one_manifest_uses_one_verified_base_and_rejects_aliases(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            base = root / "step_0"
+            target = root / "step_1"
+            other = root / "other"
+            for directory in (base, target, other):
+                directory.mkdir()
+                (directory / "adapter_config.json").write_text("{}", encoding="utf-8")
+            base_words = [0x3F80] * 1024
+            target_words = list(base_words)
+            target_words[11] = 0x3F81
+            for directory, words in ((base, base_words), (target, target_words), (other, base_words)):
+                (directory / "adapter_model.safetensors").write_bytes(valid_safetensor_bytes(words))
+            manifest = adapter_delta.publish_adapter_manifest(
+                target,
+                base,
+                base2_dir=base,
+                target_url="http://source/step_1",
+                base_url="http://source/step_0",
+                base2_url="http://source/step_0",
+                target_step=1,
+                base_step=0,
+                base2_step=0,
+                chunk_size=1024,
+                max_workers=1,
+            )
+            self.assertEqual(manifest["version"], 2)
+            self.assertEqual(manifest["predictor"], "bf16-first-order-exact")
+            self.assertEqual(manifest["base_step"], 0)
+            self.assertEqual(manifest["base2_step"], 0)
+            self.assertEqual(manifest["base_url"], manifest["base2_url"])
+            self.assertEqual(manifest["base_sha256"], manifest["base2_sha256"])
+            with self.assertRaisesRegex(ValueError, "equal base URLs"):
                 adapter_delta.publish_adapter_manifest(
-                    directories[2], directories[1], base2_dir=directories[0],
-                    target_step=3, base_step=2, base2_step=1,
-                    chunk_size=1024, max_workers=1,
+                    target,
+                    base,
+                    base2_dir=base,
+                    target_url="http://source/step_1",
+                    base_url="http://source/step_0",
+                    base2_url="http://source/step_2",
+                    target_step=1,
+                    base_step=0,
+                    base2_step=0,
+                    chunk_size=1024,
+                    max_workers=1,
+                )
+            with self.assertRaisesRegex(ValueError, "step zero as both bases"):
+                adapter_delta.publish_adapter_manifest(
+                    target,
+                    base,
+                    base2_dir=other,
+                    target_url="http://source/step_1",
+                    base_url="http://source/step_0",
+                    base2_url="http://source/step_0",
+                    target_step=1,
+                    base_step=0,
+                    base2_step=0,
+                    chunk_size=1024,
+                    max_workers=1,
                 )
 
 

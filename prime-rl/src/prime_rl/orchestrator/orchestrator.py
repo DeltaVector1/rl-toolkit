@@ -170,7 +170,7 @@ def _verify_startup_adapter_delta(
     previous_url = inference_weight_path(config, previous_path, lora_name)
 
     previous_previous_path = None
-    previous_previous_url = None
+    previous_previous_url = previous_url if step == 1 else None
     if step >= 2:
         previous_previous_path = get_step_path(broadcast_dir, step - 2)
         previous_previous_url = inference_weight_path(
