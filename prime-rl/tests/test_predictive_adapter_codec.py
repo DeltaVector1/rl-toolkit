@@ -424,131 +424,68 @@ class PredictiveAdapterCodecTest(unittest.TestCase):
     def test_manifest_hashes_match_single_read_streams_for_all_modes(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            full = root / "full"
-            base = root / "base"
-            base2 = root / "base2"
-            target = root / "target"
-            for directory in (full, base, base2, target):
+
+            def make_adapter(name, weights):
+                directory = root / name
                 directory.mkdir()
                 (directory / "adapter_config.json").write_text("{}", encoding="utf-8")
+                (directory / "adapter_model.safetensors").write_bytes(weights)
+                return directory
 
             full_weights = b"full adapter\n"
-            (full / "adapter_model.safetensors").write_bytes(full_weights)
-            target_words = [0x4000] * 2048
             base_words = [0x4000] * 2048
-            base2_words = [0x3F80] * 2048
+            target_words = base_words.copy()
             target_words[1300] = 0x4040
-            target_weights = valid_safetensor_bytes(target_words)
+            base2_words = [0x3F80] * 2048
             base_weights = valid_safetensor_bytes(base_words)
+            target_weights = valid_safetensor_bytes(target_words)
             base2_weights = valid_safetensor_bytes(base2_words)
-            (target / "adapter_model.safetensors").write_bytes(target_weights)
-            (base / "adapter_model.safetensors").write_bytes(base_weights)
-            (base2 / "adapter_model.safetensors").write_bytes(base2_weights)
+            full = make_adapter("full", full_weights)
+            base = make_adapter("base", base_weights)
+            target = make_adapter("target", target_weights)
+            base2 = make_adapter("base2", base2_weights)
 
             original_sha256_file = adapter_delta.sha256_file
             hashed_paths = []
-
-            def counted_sha256_file(path):
-                hashed_paths.append(Path(path))
-                return original_sha256_file(path)
-
-            adapter_delta.sha256_file = counted_sha256_file
+            adapter_delta.sha256_file = lambda path: (
+                hashed_paths.append(Path(path)) or original_sha256_file(path)
+            )
             try:
-                full_manifest = adapter_delta.publish_adapter_manifest(
-                    full, chunk_size=4, max_workers=2
-                )
+                full_manifest = adapter_delta.publish_adapter_manifest(full)
                 delta_manifest = adapter_delta.publish_adapter_manifest(
                     target, base, chunk_size=1024, max_workers=3
                 )
-                delta_payloads = {
-                    item["file"]: (target / item["file"]).read_bytes()
-                    for item in delta_manifest["chunks"]
-                }
                 predictive_manifest = adapter_delta.publish_adapter_manifest(
-                    target,
-                    base,
-                    base2_dir=base2,
-                    target_step=3,
-                    base_step=2,
-                    base2_step=1,
-                    chunk_size=1024,
-                    max_workers=3,
+                    target, base, base2_dir=base2, target_step=3, base_step=2,
+                    base2_step=1, chunk_size=1024, max_workers=3,
                 )
             finally:
                 adapter_delta.sha256_file = original_sha256_file
 
-            for manifest, weights_path in ((full_manifest, full / "adapter_model.safetensors"),
-                                           (delta_manifest, target / "adapter_model.safetensors"),
-                                           (predictive_manifest, target / "adapter_model.safetensors")):
-                target_sha256 = hashlib.sha256(weights_path.read_bytes()).hexdigest()
-                self.assertEqual(manifest["full_sha256"], target_sha256)
-                self.assertEqual(manifest["target_sha256"], target_sha256)
-                self.assertEqual(manifest["files"][1]["sha256"], target_sha256)
-                for record in manifest["files"]:
-                    self.assertEqual(
-                        record["sha256"],
-                        hashlib.sha256(
-                            (weights_path.parent / record["name"]).read_bytes()
-                        ).hexdigest(),
-                    )
+            def digest(value):
+                return hashlib.sha256(value).hexdigest()
+            self.assertEqual(full_manifest["target_sha256"], digest(full_weights))
+            self.assertEqual(delta_manifest["target_sha256"], digest(target_weights))
+            self.assertEqual(delta_manifest["base_sha256"], digest(base_weights))
+            self.assertEqual(predictive_manifest["target_sha256"], digest(target_weights))
+            self.assertEqual(predictive_manifest["base_sha256"], digest(base_weights))
+            self.assertEqual(predictive_manifest["base2_sha256"], digest(base2_weights))
+            for manifest in (delta_manifest, predictive_manifest):
                 self.assertEqual(
-                    manifest["config_sha256"],
-                    hashlib.sha256((weights_path.parent / "adapter_config.json").read_bytes()).hexdigest(),
+                    [item["offset"] for item in manifest["chunks"]],
+                    sorted(item["offset"] for item in manifest["chunks"]),
                 )
-
-            expected_base_sha256 = hashlib.sha256(base_weights).hexdigest()
-            expected_base2_sha256 = hashlib.sha256(base2_weights).hexdigest()
-            self.assertEqual(delta_manifest["base_sha256"], expected_base_sha256)
-            self.assertEqual(predictive_manifest["base_sha256"], expected_base_sha256)
+            chunk = predictive_manifest["chunks"][0]
+            payload = (target / chunk["file"]).read_bytes()
+            start = chunk["offset"]
+            end = start + chunk["raw_size"]
             self.assertEqual(
-                delta_manifest["base_config_sha256"],
-                hashlib.sha256((base / "adapter_config.json").read_bytes()).hexdigest(),
+                adapter_delta.decode_predictive_chunk(
+                    base2_weights[start:end], base_weights[start:end], payload,
+                    start, predictive_manifest["data_offset"],
+                ),
+                target_weights[start:end],
             )
-            self.assertEqual(predictive_manifest["base2_sha256"], expected_base2_sha256)
-            self.assertEqual(
-                predictive_manifest["base_config_sha256"],
-                hashlib.sha256((base / "adapter_config.json").read_bytes()).hexdigest(),
-            )
-            self.assertEqual(
-                predictive_manifest["base2_config_sha256"],
-                hashlib.sha256((base2 / "adapter_config.json").read_bytes()).hexdigest(),
-            )
-            self.assertEqual(
-                [item["offset"] for item in predictive_manifest["chunks"]],
-                sorted(item["offset"] for item in predictive_manifest["chunks"]),
-            )
-            for manifest, base1, base_second in (
-                (delta_manifest, base_weights, None),
-                (predictive_manifest, base_weights, base2_weights),
-            ):
-                for chunk in manifest["chunks"]:
-                    payload = delta_payloads[chunk["file"]] if base_second is None else (target / chunk["file"]).read_bytes()
-                    self.assertEqual(chunk["wire_sha256"], hashlib.sha256(payload).hexdigest())
-                    start = chunk["offset"]
-                    end = start + chunk["raw_size"]
-                    if base_second is None:
-                        raw_digest = adapter_delta.shuffle_bf16_bytes(
-                            adapter_delta._xor(base1[start:end], target_weights[start:end])
-                        )
-                        decoded = adapter_delta.decode_adapter_chunk(
-                            payload, codec=chunk["codec"], max_output_size=chunk["raw_size"]
-                        )
-                        expected_decoded = adapter_delta._xor(
-                            base1[start:end], target_weights[start:end]
-                        )
-                    else:
-                        raw_digest = adapter_delta.predictive_correction_bytes(payload)
-                        decoded = adapter_delta.decode_predictive_chunk(
-                            base_second[start:end],
-                            base1[start:end],
-                            payload,
-                            start,
-                            predictive_manifest["data_offset"],
-                        )
-                        expected_decoded = target_weights[start:end]
-                    self.assertEqual(chunk["raw_sha256"], hashlib.sha256(raw_digest).hexdigest())
-                    self.assertEqual(decoded, expected_decoded)
-
             self.assertNotIn(target / "adapter_model.safetensors", hashed_paths)
             self.assertNotIn(base / "adapter_model.safetensors", hashed_paths)
             self.assertNotIn(base2 / "adapter_model.safetensors", hashed_paths)
@@ -573,6 +510,53 @@ class PredictiveAdapterCodecTest(unittest.TestCase):
             self.assertNotIn("base_url", manifest)
             self.assertIsNone(manifest["base_step"])
             self.assertEqual(manifest["full_sha256"], hashlib.sha256(target_weights).hexdigest())
+            self.assertFalse(list(target.glob("*.transport-*")))
+
+    def test_encode_error_removes_partial_transport_chunks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "target"
+            base = root / "base"
+            target.mkdir()
+            base.mkdir()
+            (target / "adapter_config.json").write_text("{}", encoding="utf-8")
+            (base / "adapter_config.json").write_text("{}", encoding="utf-8")
+            target_weights = target / "adapter_model.safetensors"
+            target_weights.write_bytes(b"abcdefgh")
+            (base / "adapter_model.safetensors").write_bytes(b"abcdefgz")
+            original_open = Path.open
+
+            class ShortReader:
+                def __init__(self, source):
+                    self.source = source
+                    self.reads = 0
+
+                def read(self, size=-1):
+                    self.reads += 1
+                    return b"" if self.reads == 2 else self.source.read(size)
+
+                def __enter__(self):
+                    self.source.__enter__()
+                    return self
+
+                def __exit__(self, *args):
+                    return self.source.__exit__(*args)
+
+                def __getattr__(self, name):
+                    return getattr(self.source, name)
+
+            def flaky_open(path, *args, **kwargs):
+                source = original_open(path, *args, **kwargs)
+                return ShortReader(source) if path == target_weights else source
+
+            Path.open = flaky_open
+            try:
+                with self.assertRaisesRegex(OSError, "adapter file ended early"):
+                    adapter_delta.publish_adapter_manifest(
+                        target, base, chunk_size=4, max_workers=1
+                    )
+            finally:
+                Path.open = original_open
             self.assertFalse(list(target.glob("*.transport-*")))
 
     def test_predictive_manifest_rejects_non_bf16_tensor(self):

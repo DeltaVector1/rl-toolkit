@@ -796,6 +796,12 @@ def _write_encoded_chunks(
             for index, (start, end) in enumerate(ranges):
                 if index in pending:
                     drain(index, start, end)
+    except Exception:
+        try:
+            _remove_transport_chunks(destination)
+        except Exception:
+            pass
+        raise
     finally:
         target.close()
         if base is not None:
