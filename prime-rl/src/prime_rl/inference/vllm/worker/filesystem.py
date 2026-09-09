@@ -45,6 +45,7 @@ _WIRE_READY_SUFFIX = ".wire-ready"
 _COMPLETED_SUFFIX = ".done"
 _ADAPTER_STATUS = ".adapter-stage-status.json"
 _ADAPTER_DELTA_TRANSPORT = "chunked-shuffled-xor-zstd"
+_ADAPTER_FULL_TRANSPORT = "chunked-full-zstd"
 _ADAPTER_LINEAR_TRANSPORT = "chunked-bf16-linear-zigzag-sparse-zstd"
 _ADAPTER_KNOWN_TRANSPORTS = {_ADAPTER_DELTA_TRANSPORT, _ADAPTER_LINEAR_TRANSPORT}
 _ADAPTER_KNOWN_CHUNK_CODECS = {"zstd"}
@@ -897,6 +898,76 @@ def _adapter_source_urls(source_url: str) -> list[str]:
     return source_urls
 
 
+def _read_v1_transport_chunks(
+    value: dict[str, object],
+    target_size: int,
+    deadline: float | None,
+    cancel_event: threading.Event | None,
+    label: str,
+) -> list[dict[str, object]]:
+    raw_chunks = value.get("chunks")
+    if not isinstance(raw_chunks, list) or not raw_chunks or len(raw_chunks) > _ADAPTER_MAX_CHUNKS:
+        raise OSError(f"{label} has an invalid chunk list")
+    chunks: list[dict[str, object]] = []
+    seen_files: set[str] = set()
+
+    def valid_digest(item: object) -> bool:
+        return isinstance(item, str) and re.fullmatch(r"[0-9a-f]{64}", item) is not None
+
+    for item in raw_chunks:
+        _check_deadline(deadline, cancel_event)
+        if not isinstance(item, dict):
+            raise OSError(f"{label} chunk is not an object")
+        name = item.get("file")
+        offset = item.get("offset")
+        raw_size = item.get("raw_size")
+        wire_size = item.get("wire_size")
+        wire_sha256 = item.get("wire_sha256")
+        raw_sha256 = item.get("raw_sha256")
+        if (
+            not isinstance(name, str)
+            or not name
+            or name in {".", ".."}
+            or Path(name).name != name
+            or name in {*_ADAPTER_FILES, _ADAPTER_MANIFEST}
+            or name in seen_files
+            or type(offset) is not int
+            or offset < 0
+            or type(raw_size) is not int
+            or raw_size <= 0
+            or type(wire_size) is not int
+            or wire_size <= 0
+            or offset + raw_size > target_size
+            or not valid_digest(wire_sha256)
+            or not valid_digest(raw_sha256)
+            or item.get("codec") != "zstd"
+        ):
+            raise OSError(f"{label} chunk identity is invalid")
+        seen_files.add(name)
+        chunks.append(
+            {
+                "file": name,
+                "offset": offset,
+                "raw_size": raw_size,
+                "wire_size": wire_size,
+                "wire_sha256": wire_sha256,
+                "raw_sha256": raw_sha256,
+            }
+        )
+    chunks.sort(key=lambda item: int(item["offset"]))
+    expected_offset = 0
+    for item in chunks:
+        if item["offset"] != expected_offset:
+            raise OSError(f"{label} chunks do not cover the target exactly")
+        expected_offset += int(item["raw_size"])
+    if expected_offset != target_size:
+        raise OSError(f"{label} chunks do not cover the target")
+    chunk_count = value.get("chunk_count")
+    if chunk_count is not None and chunk_count != len(chunks):
+        raise OSError(f"{label} chunk count differs")
+    return chunks
+
+
 def _read_chunked_v1_manifest(
     source_url: str,
     deadline: float | None = None,
@@ -921,7 +992,60 @@ def _read_chunked_v1_manifest(
         raise OSError("invalid adapter transport manifest")
     mode = value.get("mode")
     if mode == "full":
-        return {"mode": "full", "source_manifest": value}
+        if value.get("transport") != _ADAPTER_FULL_TRANSPORT:
+            return {"mode": "full", "source_manifest": value}
+        if value.get("kind") != "lora-adapter" or value.get("target_step") != 0:
+            raise OSError("full zstd adapter manifest is not policy zero")
+        target_size = value.get("target_size")
+        full_size = value.get("full_size")
+        target_sha256 = value.get("target_sha256")
+        full_sha256 = value.get("full_sha256")
+        config_size = value.get("config_size")
+        config_sha256 = value.get("config_sha256")
+
+        def valid_digest(item: object) -> bool:
+            return isinstance(item, str) and re.fullmatch(r"[0-9a-f]{64}", item) is not None
+
+        if (
+            type(target_size) is not int
+            or target_size <= 0
+            or full_size != target_size
+            or not valid_digest(target_sha256)
+            or full_sha256 != target_sha256
+            or type(config_size) is not int
+            or config_size < 0
+            or not valid_digest(config_sha256)
+        ):
+            raise OSError("full zstd adapter manifest is missing target identity")
+        files = value.get("files")
+        file_map = {
+            item.get("name"): item
+            for item in files
+            if isinstance(item, dict) and isinstance(item.get("name"), str)
+        } if isinstance(files, list) else {}
+        if (
+            len(file_map) != 2
+            or set(file_map) != set(_ADAPTER_FILES)
+            or file_map[_ADAPTER_FILES[1]].get("size") != target_size
+            or file_map[_ADAPTER_FILES[1]].get("sha256") != target_sha256
+            or file_map[_ADAPTER_FILES[0]].get("size") != config_size
+            or file_map[_ADAPTER_FILES[0]].get("sha256") != config_sha256
+        ):
+            raise OSError("full zstd adapter manifest files differ from target identity")
+        chunks = _read_v1_transport_chunks(
+            value, target_size, deadline, cancel_event, "full zstd adapter manifest"
+        )
+        return {
+            "version": 1,
+            "mode": "full",
+            "transport": _ADAPTER_FULL_TRANSPORT,
+            "source_manifest": value,
+            "target_sha256": target_sha256,
+            "target_size": target_size,
+            "config_sha256": config_sha256,
+            "config_size": config_size,
+            "chunks": chunks,
+        }
     if mode != "delta" or value.get("kind") != "lora-adapter":
         raise OSError("adapter manifest selects an unsupported mode")
     if value.get("transport") != _ADAPTER_DELTA_TRANSPORT:
@@ -968,63 +1092,10 @@ def _read_chunked_v1_manifest(
     ):
         raise OSError("adapter transport manifest is missing target identity")
 
-    raw_chunks = value.get("chunks")
-    if not isinstance(raw_chunks, list) or not raw_chunks or len(raw_chunks) > _ADAPTER_MAX_CHUNKS:
-        raise OSError("adapter transport manifest has an invalid chunk list")
-    chunks: list[dict[str, object]] = []
-    seen_files: set[str] = set()
-    for item in raw_chunks:
-        _check_deadline(deadline, cancel_event)
-        if not isinstance(item, dict):
-            raise OSError("adapter transport chunk is not an object")
-        name = item.get("file")
-        offset = item.get("offset")
-        raw_size = item.get("raw_size")
-        wire_size = item.get("wire_size")
-        wire_sha256 = item.get("wire_sha256")
-        raw_sha256 = item.get("raw_sha256")
-        if (
-            not isinstance(name, str)
-            or not name
-            or name in {".", ".."}
-            or Path(name).name != name
-            or name in {*_ADAPTER_FILES, _ADAPTER_MANIFEST}
-            or name in seen_files
-            or type(offset) is not int
-            or offset < 0
-            or type(raw_size) is not int
-            or raw_size <= 0
-            or type(wire_size) is not int
-            or wire_size <= 0
-            or offset + raw_size > target_size
-            or not valid_digest(wire_sha256)
-            or not valid_digest(raw_sha256)
-            or item.get("codec") != "zstd"
-        ):
-            raise OSError("adapter transport chunk identity is invalid")
-        seen_files.add(name)
-        chunks.append(
-            {
-                "file": name,
-                "offset": offset,
-                "raw_size": raw_size,
-                "wire_size": wire_size,
-                "wire_sha256": wire_sha256,
-                "raw_sha256": raw_sha256,
-            }
-        )
-    chunks.sort(key=lambda item: int(item["offset"]))
-    expected_offset = 0
-    for item in chunks:
-        if item["offset"] != expected_offset:
-            raise OSError("adapter transport chunks do not cover the target exactly")
-        expected_offset += int(item["raw_size"])
-    if expected_offset != target_size:
-        raise OSError("adapter transport chunks do not cover the target")
+    chunks = _read_v1_transport_chunks(
+        value, target_size, deadline, cancel_event, "adapter transport manifest"
+    )
     _check_deadline(deadline, cancel_event)
-    chunk_count = value.get("chunk_count")
-    if chunk_count is not None and chunk_count != len(chunks):
-        raise OSError("adapter transport chunk count differs")
     return {
         "version": 1,
         "mode": "delta",
@@ -1431,9 +1502,16 @@ def _publish_relay_manifest(
         transport_name = transport.get("transport")
         if mode == "delta" and transport_name not in _ADAPTER_KNOWN_TRANSPORTS:
             raise OSError("adapter relay transport is unsupported")
+        if mode == "full" and transport_name not in {None, _ADAPTER_FULL_TRANSPORT}:
+            raise OSError("adapter relay full transport is unsupported")
 
         adapter_manifest_path = directory / _ADAPTER_MANIFEST
-        _write_json(adapter_manifest_path, source_manifest, parent_fd=directory_fd)
+        relay_source_manifest = source_manifest
+        if mode == "full" and transport_name == _ADAPTER_FULL_TRANSPORT:
+            relay_source_manifest = dict(source_manifest)
+            for key in ("transport", "chunks", "chunk_count", "encoded_size"):
+                relay_source_manifest.pop(key, None)
+        _write_json(adapter_manifest_path, relay_source_manifest, parent_fd=directory_fd)
         _check_deadline(deadline, cancel_event)
         manifest_stat = _stat_regular_entry(
             directory_fd,
@@ -2910,10 +2988,29 @@ def _preserve_adapter_stage_partial(exception: BaseException) -> bool:
         return True
     if not isinstance(exception, OSError):
         return False
+    if isinstance(exception, (FileNotFoundError, PermissionError, IsADirectoryError, NotADirectoryError)):
+        return False
     message = str(exception).lower()
     return not any(
         marker in message
-        for marker in ("checksum", "symbolic link", "unsafe", "corrupt", "identity mismatch")
+        for marker in (
+            "checksum",
+            "hash",
+            "sha256",
+            "digest",
+            "symbolic link",
+            "symlink",
+            "unsafe",
+            "corrupt",
+            "identity mismatch",
+            "protocol",
+            "invalid",
+            "unsupported",
+            "wrong size",
+            "size mismatch",
+            "size changed",
+            "ended early",
+        )
     )
 
 
@@ -2926,6 +3023,7 @@ def _stage_chunked_xor_adapter(
     committed_event: threading.Event | None = None,
     status_metadata: dict[str, object] | None = None,
 ) -> Path:
+    full_zstd = transport.get("transport") == _ADAPTER_FULL_TRANSPORT
     cancel_event = cancel_event or threading.Event()
     destination = adapter_cache_path(source_url)
     started = time.monotonic()
@@ -2933,27 +3031,30 @@ def _stage_chunked_xor_adapter(
     temporary = destination.with_name(f"{destination.name}.partial")
     _reject_symlink_path(destination, "adapter destination")
     _reject_symlink_path(temporary, "adapter partial directory")
-    base_url = transport["base_url"]
-    base_sha256 = transport["base_sha256"]
+    base_url = transport.get("base_url")
+    base_sha256 = transport.get("base_sha256")
     target_sha256 = transport["target_sha256"]
     target_size = transport["target_size"]
     config_sha256 = transport["config_sha256"]
-    assert isinstance(base_url, str)
-    assert isinstance(base_sha256, str)
+    if not full_zstd:
+        assert isinstance(base_url, str)
+        assert isinstance(base_sha256, str)
     assert isinstance(target_sha256, str)
     assert isinstance(target_size, int)
     assert isinstance(config_sha256, str)
-    base_model, _ = _verified_adapter_base(
-        base_url,
-        base_sha256,
-        expected_config_sha256=(
-            transport["base_config_sha256"]
-            if isinstance(transport.get("base_config_sha256"), str)
-            else None
-        ),
-        deadline=deadline,
-        cancel_event=cancel_event,
-    )
+    base_model = None
+    if not full_zstd:
+        base_model, _ = _verified_adapter_base(
+            base_url,
+            base_sha256,
+            expected_config_sha256=(
+                transport["base_config_sha256"]
+                if isinstance(transport.get("base_config_sha256"), str)
+                else None
+            ),
+            deadline=deadline,
+            cancel_event=cancel_event,
+        )
     chunks = transport["chunks"]
     assert isinstance(chunks, list)
     chunks = sorted(chunks, key=lambda item: int(item["offset"]))
@@ -3001,7 +3102,7 @@ def _stage_chunked_xor_adapter(
                     "status": "staging",
                     "source_url": source_url,
                     "path": destination.as_posix(),
-                    "transport": _ADAPTER_DELTA_TRANSPORT,
+                    "transport": _ADAPTER_FULL_TRANSPORT if full_zstd else _ADAPTER_DELTA_TRANSPORT,
                     "bytes_done": progress_bytes,
                     "bytes_total": total_wire_bytes,
                     "lane": lane,
@@ -3015,7 +3116,7 @@ def _stage_chunked_xor_adapter(
             "status": "staging",
             "source_url": source_url,
             "path": destination.as_posix(),
-            "transport": _ADAPTER_DELTA_TRANSPORT,
+            "transport": _ADAPTER_FULL_TRANSPORT if full_zstd else _ADAPTER_DELTA_TRANSPORT,
             "bytes_done": progress_bytes,
             "bytes_total": total_wire_bytes,
             "updated_at": time.time(),
@@ -3091,29 +3192,42 @@ def _stage_chunked_xor_adapter(
         if len(encoded) != wire_size:
             raise OSError("adapter transport chunk size changed")
         _check_deadline(deadline, cancel_event)
-        raw = _decode_transport_chunk(
-            encoded,
-            codec=str(transport["transport"]),
-            raw_size=raw_size,
-        )
+        try:
+            raw = _decode_transport_chunk(
+                encoded,
+                codec=str(transport["transport"]),
+                raw_size=raw_size,
+            )
+        except OSError:
+            if full_zstd:
+                _unlink_path(chunk_path, "corrupt adapter transport chunk")
+            raise
         _check_deadline(deadline, cancel_event)
         if _transport_raw_sha256(raw) != raw_sha256:
+            if full_zstd:
+                _unlink_path(chunk_path, "corrupt adapter transport chunk")
             raise OSError("adapter transport decoded chunk checksum mismatch")
         _check_cancelled(cancel_event)
-        base_fd = _open_nofollow(base_model, os.O_RDONLY)
         output_fd = _open_nofollow(output_path, os.O_RDWR)
         try:
-            base_chunk = os.pread(base_fd, raw_size, offset)
-            if len(base_chunk) != len(raw):
-                raise OSError("cached base adapter ended before transport chunk")
-            reconstructed = _xor_bytes(base_chunk, raw)
+            if full_zstd:
+                reconstructed = raw
+            else:
+                assert base_model is not None
+                base_fd = _open_nofollow(base_model, os.O_RDONLY)
+                try:
+                    base_chunk = os.pread(base_fd, raw_size, offset)
+                finally:
+                    os.close(base_fd)
+                if len(base_chunk) != len(raw):
+                    raise OSError("cached base adapter ended before transport chunk")
+                reconstructed = _xor_bytes(base_chunk, raw)
             if len(reconstructed) != raw_size:
                 raise OSError("adapter transport reconstructed chunk has the wrong size")
             _pwrite_all(output_fd, reconstructed, offset)
             os.fsync(output_fd)
         finally:
             os.close(output_fd)
-            os.close(base_fd)
         _check_deadline(deadline, cancel_event)
         _write_json(
             completed_path,
@@ -3169,11 +3283,11 @@ def _stage_chunked_xor_adapter(
     _write_json(
         temporary / "transport.json",
         {
-            "mode": _ADAPTER_DELTA_TRANSPORT,
+            "mode": "full" if full_zstd else _ADAPTER_DELTA_TRANSPORT,
+            "transport": _ADAPTER_FULL_TRANSPORT if full_zstd else _ADAPTER_DELTA_TRANSPORT,
             "source_url": source_url,
-            "base_url": base_url,
-            "base_sha256": base_sha256,
             "target_sha256": target_sha256,
+            **({} if full_zstd else {"base_url": base_url, "base_sha256": base_sha256}),
         },
     )
     with _adapter_stage_publish_lock:
@@ -3202,7 +3316,7 @@ def _stage_chunked_xor_adapter(
             "status": "ready",
             "source_url": source_url,
             "path": destination.as_posix(),
-            "transport": _ADAPTER_DELTA_TRANSPORT,
+            "transport": _ADAPTER_FULL_TRANSPORT if full_zstd else _ADAPTER_DELTA_TRANSPORT,
             "bytes_done": total_wire_bytes,
             "bytes_total": total_wire_bytes,
             "updated_at": time.time(),
@@ -3846,6 +3960,21 @@ def stage_lora_adapter_files(
                         with _adapter_stage_publish_lock:
                             committed_event.set()
                     return destination
+
+            if (
+                isinstance(transport, dict)
+                and transport.get("mode") == "full"
+                and transport.get("transport") == _ADAPTER_FULL_TRANSPORT
+            ):
+                return _stage_chunked_xor_adapter(
+                    source_url,
+                    transport,
+                    manifest,
+                    deadline=delta_deadline,
+                    cancel_event=cancel_event,
+                    committed_event=committed_event,
+                    status_metadata=status_metadata,
+                )
 
             if isinstance(transport, dict) and transport.get("mode") == "full":
                 if _reuse_full_adapter_cache(

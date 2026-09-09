@@ -20,6 +20,7 @@ adapter_manifest_name = "adapter_manifest.json"
 adapter_config_name = "adapter_config.json"
 adapter_weights_name = "adapter_model.safetensors"
 adapter_transport_name = "chunked-shuffled-xor"
+full_transport_name = "chunked-full-zstd"
 predictive_transport_name = "chunked-bf16-linear-zigzag-sparse-zstd"
 default_chunk_size = 16 * 1024 * 1024
 predictive_chunk_size = 16 * 1024 * 1024
@@ -76,7 +77,7 @@ def _compress(value: bytes) -> bytes:
 
 
 def _decompress(value: bytes, codec: str) -> bytes:
-    if codec.startswith(adapter_transport_name):
+    if codec.startswith(adapter_transport_name) or codec.startswith(full_transport_name):
         if "zstd" not in codec:
             raise ValueError("adapter transport must use zstd")
         codec = "zstd"
@@ -170,7 +171,10 @@ def _encode_delta_chunk(base: bytes, target: bytes) -> tuple[bytes, bytes]:
 def decode_adapter_chunk(payload: bytes, *, codec: str, max_output_size: int) -> bytes:
     if max_output_size <= 0:
         raise ValueError("adapter chunk output limit must be positive")
-    decoded = unshuffle_bf16_bytes(_decompress(payload, codec))
+    transport = codec
+    decoded = _decompress(payload, transport)
+    if not transport.startswith(full_transport_name):
+        decoded = unshuffle_bf16_bytes(decoded)
     if len(decoded) != max_output_size:
         raise ValueError("adapter chunk does not match its declared size")
     return decoded
@@ -744,7 +748,7 @@ def _write_encoded_chunks(
     if base2_path is not None and base2_path.stat().st_size != target_size:
         raise ValueError("second adjacent adapter files must have the same size")
 
-    codec = _codec_name() if mode in {"delta", "predictive"} else "identity"
+    codec = _codec_name() if mode in {"delta", "predictive", "full-zstd"} else "identity"
     chunks: list[dict[str, Any]] = []
     pending: dict[int, Future[Any]] = {}
     written_size = 0
@@ -775,7 +779,7 @@ def _write_encoded_chunks(
     def drain(index: int, start: int, end: int) -> None:
         nonlocal written_size
         result = pending.pop(index).result()
-        if mode in {"delta", "predictive"}:
+        if mode in {"delta", "predictive", "full-zstd"}:
             raw, payload = result
         else:
             raw = payload = result
@@ -812,6 +816,11 @@ def _write_encoded_chunks(
                         target_chunk,
                         start,
                         data_offset,
+                    )
+                elif mode == "full-zstd":
+                    pending[index] = pool.submit(
+                        lambda value: (value, _compress(value)),
+                        target_chunk,
                     )
                 else:
                     pending[index] = pool.submit(bytes, target_chunk)
@@ -918,7 +927,12 @@ def publish_adapter_manifest(
         if base_dir is None:
             base_url = None
             base_step = None
-        selected_mode = "delta" if base_dir is not None else "full"
+        if base_dir is not None:
+            selected_mode = "delta"
+        elif target_step == 0:
+            selected_mode = "full-zstd"
+        else:
+            selected_mode = "full"
 
     if chunk_size is None:
         chunk_size = (
@@ -928,7 +942,12 @@ def publish_adapter_manifest(
     target_weights_sha256: str | None = None
     base_weights_sha256: str | None = None
     base2_weights_sha256: str | None = None
-    if selected_mode in {"delta", "predictive"}:
+    if selected_mode in {"delta", "predictive", "full-zstd"}:
+        encoded_base = (
+            base_dir / adapter_weights_name
+            if selected_mode in {"delta", "predictive"} and base_dir is not None
+            else None
+        )
         (
             weight_chunks,
             weight_encoded_size,
@@ -937,18 +956,25 @@ def publish_adapter_manifest(
             base2_weights_sha256,
         ) = _write_encoded_chunks(
             target_weights,
-            base_dir / adapter_weights_name,
+            encoded_base,
             target_dir,
             mode=selected_mode,
             chunk_size=chunk_size,
             max_workers=max_workers,
-            base2_path=base2_dir / adapter_weights_name if selected_mode == "predictive" and base2_dir is not None else None,
+            base2_path=(
+                base2_dir / adapter_weights_name
+                if selected_mode == "predictive" and base2_dir is not None
+                else None
+            ),
             data_offset=data_offset,
         )
     else:
         weight_chunks = []
         weight_encoded_size = target_weights.stat().st_size
     if selected_mode == "delta" and weight_encoded_size >= target_weights.stat().st_size:
+        _remove_transport_chunks(target_dir)
+        raise ValueError("delta transport is not smaller than the full adapter")
+    if selected_mode == "full-zstd" and weight_encoded_size >= target_weights.stat().st_size:
         _remove_transport_chunks(target_dir)
         selected_mode = "full"
         weight_chunks = []
@@ -975,7 +1001,11 @@ def publish_adapter_manifest(
     manifest: dict[str, Any] = {
         "version": 2 if selected_mode == "predictive" else 1,
         "kind": "lora-adapter",
-        "mode": "delta" if selected_mode == "predictive" else selected_mode,
+        "mode": (
+            "delta"
+            if selected_mode == "predictive"
+            else ("full" if selected_mode == "full-zstd" else selected_mode)
+        ),
         "target_step": target_step,
         "base_step": base_step,
         "full_size": weights_record["size"],
@@ -998,6 +1028,20 @@ def publish_adapter_manifest(
         manifest["base2_url"] = base2_url
     if selected_mode == "delta":
         manifest["transport"] = f"{adapter_transport_name}-{_codec_name()}"
+        manifest["chunks"] = [
+            {
+                "file": item["file"],
+                "offset": item["offset"],
+                "raw_size": item["raw_size"],
+                "wire_size": item["wire_size"],
+                "wire_sha256": item["wire_sha256"],
+                "raw_sha256": item["raw_sha256"],
+                "codec": item["codec"],
+            }
+            for item in weight_chunks
+        ]
+    elif selected_mode == "full-zstd":
+        manifest["transport"] = full_transport_name
         manifest["chunks"] = [
             {
                 "file": item["file"],
