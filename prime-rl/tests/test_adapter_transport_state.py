@@ -1068,6 +1068,12 @@ class AdapterTransportStateTest(unittest.TestCase):
         self.assertIn("asyncio.wait_for(", server.read_text(encoding="utf-8"))
         watcher_source = watcher.read_text(encoding="utf-8")
         self.assertIn('manifest.get("version") != 1', watcher_source)
+        policy_update = watcher_source[watcher_source.index('f"Policy update'):]
+        self.assertIn("attempts=1", policy_update[:250])
+        self.assertIn("for attempt in range(1, attempts + 1)", watcher_source)
+        self.assertIn("failed on attempt {attempt}/{attempts}", watcher_source)
+        self.assertIn("delta_deadline = time.monotonic()", watcher_source)
+        self.assertIn("delta_deadline=delta_deadline if require_delta else None", watcher_source)
         self.assertIn("next_step > 0", watcher_source)
 
     def test_delta_cleanup_waits_for_relay_reader(self):
@@ -1166,6 +1172,44 @@ class AdapterTransportStateTest(unittest.TestCase):
             else:
                 os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
             filesystem._delta_stage_timeout_s = old_timeout
+
+    def test_delta_default_deadline_and_status_use_policy_limit(self):
+        filesystem = load_filesystem_module()
+        old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
+        old_timeout = filesystem._delta_stage_timeout_s
+        old_manifest = filesystem._read_delta_manifest_with_visibility_wait
+        old_cleanup = filesystem._cleanup_delta_stage_artifacts
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                os.environ["PRIME_LORA_CACHE_DIR"] = temporary
+                filesystem._delta_stage_timeout_s = lambda: 900.0
+                filesystem._cleanup_delta_stage_artifacts = lambda *_args, **_kwargs: None
+                for step, limit in ((2, 600.0), (3, 300.0)):
+                    deadlines = []
+
+                    def fail_manifest(*_args, **kwargs):
+                        deadlines.append(kwargs["deadline"])
+                        raise OSError("manifest unavailable")
+
+                    filesystem._read_delta_manifest_with_visibility_wait = fail_manifest
+                    with self.assertRaisesRegex(OSError, "manifest unavailable"):
+                        filesystem.stage_lora_adapter_files(
+                            f"http://source/step_{step}", require_delta=True
+                        )
+                    self.assertEqual(len(deadlines), 1)
+                    self.assertLessEqual(deadlines[0] - time.monotonic(), limit)
+                    status = filesystem.adapter_stage_status()
+                    self.assertEqual(status["policy_step"], step)
+                    self.assertEqual(status["stage_timeout_seconds"], limit)
+                    self.assertEqual(status["acceptance_target_seconds"], 300.0)
+        finally:
+            if old_cache is None:
+                os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+            else:
+                os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+            filesystem._delta_stage_timeout_s = old_timeout
+            filesystem._read_delta_manifest_with_visibility_wait = old_manifest
+            filesystem._cleanup_delta_stage_artifacts = old_cleanup
 
     def test_stage_timeout_returns_only_after_worker_stops(self):
         with tempfile.TemporaryDirectory() as temporary:

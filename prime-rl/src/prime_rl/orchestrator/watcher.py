@@ -145,22 +145,31 @@ def _write_receivers_ready(
             os.unlink(temporary) if os.path.exists(temporary) else None
 
 
-async def _run_with_retries(name: str, operation: Callable[[], Awaitable[Any]]) -> Any:
-    for attempt in range(1, 4):
+async def _run_with_retries(
+    name: str,
+    operation: Callable[[], Awaitable[Any]],
+    *,
+    attempts: int = 3,
+) -> Any:
+    if type(attempts) is not int or attempts <= 0:
+        raise ValueError("retry attempts must be positive")
+    for attempt in range(1, attempts + 1):
         try:
             return await operation()
         except asyncio.CancelledError:
             raise
         except Exception:
-            if attempt == 3:
-                get_logger().exception(f"{name} failed on attempt {attempt}/3; stopping")
+            if attempt == attempts:
+                get_logger().exception(
+                    f"{name} failed on attempt {attempt}/{attempts}; stopping"
+                )
                 raise
             delay = 0.5 * 2 ** (attempt - 1)
             get_logger().exception(
-                f"{name} failed on attempt {attempt}/3; retrying in {delay:.1f}s"
+                f"{name} failed on attempt {attempt}/{attempts}; retrying in {delay:.1f}s"
             )
             await asyncio.sleep(delay)
-    raise RuntimeError(f"{name} retry loop ended unexpectedly")
+    raise RuntimeError(f"{name} retry loop ended unexpectedly after {attempts} attempts")
 
 
 def _valid_digest(value: object) -> bool:
@@ -364,11 +373,20 @@ class WeightWatcher:
                 next_step = self.compute_next_ckpt_step()
                 if next_step > self.ckpt_step:
                     await _run_with_retries(
-                        f"Policy update {next_step}", lambda: self.apply_policy_update(next_step)
+                        f"Policy update {next_step}",
+                        lambda: self.apply_policy_update(next_step),
+                        attempts=1,
                     )
                 elif time.monotonic() - self.last_reconcile_check_at >= self.reconcile_interval:
                     self.last_reconcile_check_at = time.monotonic()
-                    await _run_with_retries("Current policy reconciliation", self.reconcile_current_policy)
+                    reconcile_attempts = (
+                        1 if self.lora_name is not None and self.ckpt_step > 0 else 3
+                    )
+                    await _run_with_retries(
+                        "Current policy reconciliation",
+                        self.reconcile_current_policy,
+                        attempts=reconcile_attempts,
+                    )
                 await asyncio.sleep(self.poll_interval)
         except asyncio.CancelledError:
             return
@@ -443,6 +461,7 @@ class WeightWatcher:
         next_step: int,
         local_weights_path,
         target_url: str | None = None,
+        deadline: float | None = None,
     ) -> str:
         """Return the verified adjacent base URL and published delta manifest."""
         if self.lora_name is None or next_step <= 0:
@@ -488,11 +507,18 @@ class WeightWatcher:
 
         if target_url is None:
             target_url = inference_weight_path(self.config, local_weights_path, self.lora_name)
+        manifest_timeout = adapter_stage_limit_seconds(next_step)
+        if deadline is not None:
+            manifest_timeout = deadline - time.monotonic()
+            if manifest_timeout <= 0:
+                raise TimeoutError(
+                    f"cannot apply adapter policy v{next_step}: staging deadline expired"
+                )
         try:
             manifest, manifest_location = _read_adapter_manifest(
                 local_weights_path,
                 target_url if isinstance(target_url, str) else None,
-                adapter_stage_limit_seconds(next_step),
+                manifest_timeout,
                 prefer_remote=True,
             )
         except RuntimeError as exc:
@@ -534,12 +560,14 @@ class WeightWatcher:
         next_step: int,
         local_weights_path,
         target_url: str,
+        deadline: float | None = None,
     ) -> str:
         return await asyncio.to_thread(
             self._adapter_delta_base,
             next_step,
             local_weights_path,
             target_url,
+            deadline,
         )
 
     async def apply_policy_update(self, next_step: int) -> None:
@@ -584,10 +612,12 @@ class WeightWatcher:
                 elif self.lora_name is not None and next_step > 0 and isinstance(weights_path, str):
                     if local_weights_path is None:
                         raise RuntimeError("adapter delta target path is not local")
+                    delta_deadline = time.monotonic() + adapter_stage_limit_seconds(next_step)
                     manifest_path = await self._prewarm_adapter_manifest(
                         next_step,
                         local_weights_path,
                         weights_path,
+                        delta_deadline,
                     )
                     require_delta = True
                     build_time = (
@@ -613,7 +643,8 @@ class WeightWatcher:
                         self.inference.admin_clients,
                         weights_path,
                         require_delta=require_delta,
-                        policy_step=next_step,
+                        policy_step=next_step if require_delta else None,
+                        delta_deadline=delta_deadline if require_delta else None,
                         origin_base_urls=self.inference.adapter_origin_base_urls,
                     )
                     self.last_adapter_policy_step = int(stage_result.get("policy_step", next_step))

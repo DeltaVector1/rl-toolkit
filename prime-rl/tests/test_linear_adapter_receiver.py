@@ -374,6 +374,11 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                         transport,
                         source_manifest,
                         deadline=None,
+                        status_metadata={
+                            "policy_step": 3,
+                            "stage_timeout_seconds": 300.0,
+                            "acceptance_target_seconds": 300.0,
+                        },
                     )
                 partial = filesystem.adapter_cache_path(source_url).with_name(
                     f"{filesystem.adapter_cache_path(source_url).name}.partial"
@@ -386,6 +391,11 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                     transport,
                     source_manifest,
                     deadline=None,
+                    status_metadata={
+                        "policy_step": 3,
+                        "stage_timeout_seconds": 300.0,
+                        "acceptance_target_seconds": 300.0,
+                    },
                 )
                 self.assertTrue((result / "READY").is_file())
                 self.assertEqual((result / "adapter_model.safetensors").read_bytes(), target)
@@ -400,6 +410,9 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                 status = filesystem.adapter_stage_status()
                 self.assertEqual(status["status"], "ready")
                 self.assertGreaterEqual(status["reconstruct_seconds"], 0.0)
+                self.assertEqual(status["policy_step"], 3)
+                self.assertEqual(status["stage_timeout_seconds"], 300.0)
+                self.assertEqual(status["acceptance_target_seconds"], 300.0)
                 self.assertTrue(relaying_seen_before_chunk)
                 self.assertEqual(
                     [call[1]["expected_config_size"] for call in base_calls],

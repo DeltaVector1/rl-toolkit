@@ -639,6 +639,7 @@ async def stage_lora_adapter(
     *,
     require_delta: bool = False,
     policy_step: int | None = None,
+    delta_deadline: float | None = None,
     origin_base_urls: list[str] | None = None,
 ) -> dict[str, object]:
     """Stage one adapter copy per inference host.
@@ -654,6 +655,8 @@ async def stage_lora_adapter(
         raise RuntimeError("adapter policy step must be a positive integer")
     if require_delta and policy_step is None:
         raise RuntimeError("adapter policy step is required for delta staging")
+    if delta_deadline is not None and not require_delta:
+        raise RuntimeError("adapter delta deadline requires delta staging")
     if not lora_path_posix.startswith(("http://", "https://")):
         return {
             "wire_stage_seconds": 0.0,
@@ -756,7 +759,6 @@ async def stage_lora_adapter(
 
     started = time.perf_counter()
     configured_delta_timeout = _delta_stage_timeout_s() if require_delta else None
-    delta_deadline = None
     stage_limit = None
     predictive_transport = False
     if require_delta:
@@ -766,8 +768,12 @@ async def stage_lora_adapter(
         if policy_step is None:
             raise RuntimeError("adapter policy step is required for delta staging")
         stage_limit = adapter_stage_limit_seconds(policy_step)
-        delta_deadline = started + min(stage_limit, configured_delta_timeout)
-        remaining = delta_deadline - time.perf_counter()
+        selected_deadline = time.monotonic() + min(stage_limit, configured_delta_timeout)
+        if delta_deadline is None:
+            delta_deadline = selected_deadline
+        else:
+            delta_deadline = min(delta_deadline, selected_deadline)
+        remaining = delta_deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("adapter delta staging exceeded its time limit")
         try:
@@ -825,7 +831,7 @@ async def stage_lora_adapter(
     if predictive_transport:
         # v2 origin and peer transfers share one absolute deadline. If the
         # origin fails, cancel and await every peer task before returning.
-        remaining = delta_deadline - time.perf_counter()
+        remaining = delta_deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("adapter delta staging exceeded its time limit")
         tasks = [
@@ -859,7 +865,7 @@ async def stage_lora_adapter(
             if delta_deadline is None:
                 results.extend(await asyncio.gather(*(_stage_one(client) for client in group)))
             else:
-                remaining = delta_deadline - time.perf_counter()
+                remaining = delta_deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError("adapter delta staging exceeded its time limit")
                 try:

@@ -33,6 +33,7 @@ def load_startup_validator(urlopen, validate_manifest, file_records):
     namespace = {
         "OrchestratorConfig": object,
         "json": json,
+        "time": time,
         "urlopen": urlopen,
         "get_broadcast_dir": lambda output_dir: output_dir,
         "get_step_path": lambda broadcast_dir, step: broadcast_dir / f"step_{step}",
@@ -98,6 +99,13 @@ def load_server_load_endpoints(destination, handler, reader_lock=None):
         "adapter_cache_path": lambda _source_url: destination,
         "adapter_reader_lock": reader_lock or contextlib.nullcontext,
         "adapter_stage_status": lambda: {"status": "idle"},
+        "_adapter_step_from_source_url": lambda source_url: int(
+            re.fullmatch(r"step_(\d+)", Path(source_url.rstrip("/")).name).group(1)
+        ),
+        "adapter_stage_limit_seconds": lambda step: {
+            1: 900.0,
+            2: 600.0,
+        }.get(step, 300.0),
         "asyncio": asyncio,
         "ErrorResponse": FakeErrorResponse,
         "JSONResponse": FakeJSONResponse,
@@ -215,12 +223,20 @@ class ResumeRecoveryTest(unittest.TestCase):
             load, status, namespace, response_type, error_type = load_server_load_endpoints(
                 destination, handler
             )
+            stage_calls = []
+            namespace["stage_lora_adapter_files"] = lambda *args, **kwargs: (
+                stage_calls.append((args, kwargs)) or destination
+            )
 
             class LoadRequest:
                 def __init__(self, name="adapter-slot1", path=source_url):
                     self.lora_name = name
                     self.lora_path = path
                     self.load_inplace = False
+
+            class UnprefetchedDeltaRequest(Request):
+                async def json(self):
+                    return {"require_delta": True, "prefetched": False}
 
             success = asyncio.run(load(LoadRequest(), Request()))
             self.assertEqual(success["status"], "ok")
@@ -231,6 +247,12 @@ class ResumeRecoveryTest(unittest.TestCase):
             )
             self.assertEqual(namespace["_loaded_lora_receipts"]["adapter-slot1"], success["loaded_receipt"])
             self.assertEqual(asyncio.run(status(Request()))["loaded_receipts"]["adapter-slot1"], success["loaded_receipt"])
+
+            delta_success = asyncio.run(load(LoadRequest(), UnprefetchedDeltaRequest()))
+            self.assertEqual(delta_success["status"], "ok")
+            self.assertEqual(len(stage_calls), 1)
+            self.assertEqual(stage_calls[0][1]["policy_step"], 2)
+            self.assertEqual(stage_calls[0][1]["stage_timeout_seconds"], 600.0)
 
             async def status_during_staging():
                 stage_started = threading.Event()

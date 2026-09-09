@@ -2422,6 +2422,7 @@ def _stage_chunked_linear_adapter(
     deadline: float | None = None,
     cancel_event: threading.Event | None = None,
     committed_event: threading.Event | None = None,
+    status_metadata: dict[str, object] | None = None,
 ) -> Path:
     """Stage a version-two adapter from two exact cached predecessors."""
     cancel_event = cancel_event or threading.Event()
@@ -2514,6 +2515,9 @@ def _stage_chunked_linear_adapter(
     reconstruct_seconds = 0.0
     last_status = 0.0
 
+    def write_stage_status(value: dict[str, object]) -> None:
+        _write_stage_status(destination.parent, {**value, **(status_metadata or {})})
+
     def report(lane: int, amount: int) -> None:
         nonlocal progress_bytes, last_status
         _check_deadline(deadline, cancel_event)
@@ -2525,8 +2529,7 @@ def _stage_chunked_linear_adapter(
             last_status = now
             with reconstruct_lock:
                 reconstructed_time = reconstruct_seconds
-            _write_stage_status(
-                destination.parent,
+            write_stage_status(
                 {
                     "status": "staging",
                     "source_url": source_url,
@@ -2541,8 +2544,7 @@ def _stage_chunked_linear_adapter(
                 },
             )
 
-    _write_stage_status(
-        destination.parent,
+    write_stage_status(
         {
             "status": "staging",
             "source_url": source_url,
@@ -2819,8 +2821,7 @@ def _stage_chunked_linear_adapter(
     _cleanup_previous_adapter_caches(destination.parent, destination)
     with reconstruct_lock:
         total_reconstruct_seconds = reconstruct_seconds
-    _write_stage_status(
-        destination.parent,
+    write_stage_status(
         {
             "status": "ready",
             "source_url": source_url,
@@ -2908,6 +2909,7 @@ def _stage_chunked_xor_adapter(
     deadline: float | None = None,
     cancel_event: threading.Event | None = None,
     committed_event: threading.Event | None = None,
+    status_metadata: dict[str, object] | None = None,
 ) -> Path:
     cancel_event = cancel_event or threading.Event()
     destination = adapter_cache_path(source_url)
@@ -2967,6 +2969,9 @@ def _stage_chunked_xor_adapter(
             progress_bytes += int(item["wire_size"])
     last_status = 0.0
 
+    def write_stage_status(value: dict[str, object]) -> None:
+        _write_stage_status(destination.parent, {**value, **(status_metadata or {})})
+
     def report(lane: int, amount: int) -> None:
         nonlocal progress_bytes, last_status
         _check_deadline(deadline, cancel_event)
@@ -2976,8 +2981,7 @@ def _stage_chunked_xor_adapter(
             if now - last_status < _ADAPTER_STATUS_INTERVAL_S and progress_bytes < total_wire_bytes:
                 return
             last_status = now
-            _write_stage_status(
-                destination.parent,
+            write_stage_status(
                 {
                     "status": "staging",
                     "source_url": source_url,
@@ -2991,8 +2995,7 @@ def _stage_chunked_xor_adapter(
                 },
             )
 
-    _write_stage_status(
-        destination.parent,
+    write_stage_status(
         {
             "status": "staging",
             "source_url": source_url,
@@ -3179,8 +3182,7 @@ def _stage_chunked_xor_adapter(
             fcntl.flock(reader_lock, fcntl.LOCK_UN)
     _cleanup_retired_adapters(destination.parent, destination.name)
     _cleanup_previous_adapter_caches(destination.parent, destination)
-    _write_stage_status(
-        destination.parent,
+    write_stage_status(
         {
             "status": "ready",
             "source_url": source_url,
@@ -3604,6 +3606,7 @@ def stage_lora_adapter_files(
             raise OSError("requested adapter policy step differs from its source URL")
         policy_step = source_step
         stage_limit = adapter_stage_limit_seconds(policy_step)
+        configured_delta_timeout = min(configured_delta_timeout, stage_limit)
         status_metadata = {
             "policy_step": policy_step,
             "stage_timeout_seconds": stage_limit,
@@ -3777,6 +3780,7 @@ def stage_lora_adapter_files(
                         deadline=delta_deadline,
                         cancel_event=cancel_event,
                         committed_event=committed_event,
+                        status_metadata=status_metadata,
                     )
                 if transport.get("transport") == _ADAPTER_DELTA_TRANSPORT:
                     return _stage_chunked_xor_adapter(
@@ -3786,6 +3790,7 @@ def stage_lora_adapter_files(
                         deadline=delta_deadline,
                         cancel_event=cancel_event,
                         committed_event=committed_event,
+                        status_metadata=status_metadata,
                     )
                 raise OSError("adapter delta transport is unsupported")
             _reject_symlink_path(destination / "READY", "adapter ready marker")

@@ -370,11 +370,23 @@ async def load_lora_adapter(lora_request: LoadLoRAAdapterRequest, raw_request: R
             adapter_identity = None
             if remote_adapter:
                 source_url = lora_request.lora_path
+                policy_step = None
+                if require_delta:
+                    try:
+                        policy_step = _adapter_step_from_source_url(source_url)
+                    except OSError as exc:
+                        return JSONResponse({"error": str(exc)}, status_code=400)
                 if not prefetched:
                     await asyncio.to_thread(
                         stage_lora_adapter_files,
                         source_url,
                         require_delta=require_delta,
+                        policy_step=policy_step,
+                        stage_timeout_seconds=(
+                            adapter_stage_limit_seconds(policy_step)
+                            if policy_step is not None
+                            else None
+                        ),
                     )
                 destination = adapter_cache_path(source_url)
                 lora_request.lora_path = destination.as_posix()

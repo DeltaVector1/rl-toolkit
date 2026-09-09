@@ -161,6 +161,7 @@ def _verify_startup_adapter_delta(
     step: int,
     target_path,
     target_url: str | None = None,
+    deadline: float | None = None,
 ) -> None:
     """Reject a positive resume unless its published adjacent delta is exact."""
     if lora_name is None or step <= 0:
@@ -186,9 +187,16 @@ def _verify_startup_adapter_delta(
                 with (path / "adapter_manifest.json").open("r", encoding="utf-8") as source:
                     value = json.load(source)
             else:
+                timeout = adapter_stage_limit_seconds(step)
+                if deadline is not None:
+                    timeout = deadline - time.monotonic()
+                    if timeout <= 0:
+                        raise RuntimeError(
+                            f"cannot resume LoRA policy v{step}: staging deadline expired"
+                        )
                 with urlopen(
                     f"{url.rstrip('/')}/adapter_manifest.json",
-                    timeout=adapter_stage_limit_seconds(step),
+                    timeout=timeout,
                 ) as source:
                     value = json.load(source)
         except (FileNotFoundError, OSError, ValueError) as exc:
@@ -553,9 +561,15 @@ class Orchestrator:
         # an in-memory transport, which rendezvouses with the trainer's startup broadcast.
         if self.resume_policy_step is not None or config.weight_broadcast.type in ("nccl", "nixl"):
             sync_version = self.resume_policy_step if self.resume_policy_step is not None else 0
+            require_delta = self.lora_name is not None and sync_version > 0
+            startup_delta_deadline = None
             if config.weight_broadcast.type == "nixl":
                 weights_path = None
                 local_weights_path = None
+                if require_delta:
+                    startup_delta_deadline = (
+                        time.monotonic() + adapter_stage_limit_seconds(sync_version)
+                    )
             else:
                 check_exists = config.weight_broadcast.type == "filesystem"
                 # Without a ckpt block, fall back to a default timeout instead of not waiting at all.
@@ -565,17 +579,21 @@ class Orchestrator:
                 )
                 local_weights_path = weights_path
                 source_weights_path = inference_weight_path(config, weights_path, self.lora_name)
+                if require_delta:
+                    startup_delta_deadline = (
+                        time.monotonic() + adapter_stage_limit_seconds(sync_version)
+                    )
                 _verify_startup_adapter_delta(
                     config,
                     self.lora_name,
                     sync_version,
                     weights_path,
                     source_weights_path if isinstance(source_weights_path, str) else None,
+                    deadline=startup_delta_deadline,
                 )
                 weights_path = source_weights_path
             if self.model_express is not None:
                 await asyncio.to_thread(self.model_express.set_status, p2p_pb2.SOURCE_STATUS_READY)
-            require_delta = self.lora_name is not None and sync_version > 0
             prefetched = False
             adapter_identity = None
             if self.lora_name is not None and isinstance(weights_path, str):
@@ -584,6 +602,7 @@ class Orchestrator:
                     weights_path,
                     require_delta=require_delta,
                     policy_step=sync_version if require_delta else None,
+                    delta_deadline=startup_delta_deadline,
                     origin_base_urls=self.policy_inference.adapter_origin_base_urls,
                 )
                 adapter_identity = stage_result["adapter_identity"]

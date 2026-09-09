@@ -611,6 +611,34 @@ class StageLoraAdapterTest(unittest.TestCase):
                 self.assertGreater(_ManifestProbeClient.requests[0].read, expected_limit - 0.01)
                 self.assertLessEqual(_ManifestProbeClient.requests[0].read, expected_limit)
 
+    def test_external_delta_deadline_is_not_reset_after_probe_setup(self):
+        _ManifestProbeClient.requests.clear()
+        stage_lora_adapter, namespace = _load_stage_function(probe_version=2, probe_step=3)
+        namespace["_delta_stage_timeout_s"] = lambda: 900.0
+
+        class Response:
+            def json(self):
+                return {
+                    "status": "ok",
+                    "stage_seconds": 0.0,
+                    "adapter_identity": _adapter_identity(3),
+                }
+
+        async def fake_admin_post_response(_client, _path, **_kwargs):
+            return Response()
+
+        namespace["_admin_post_response"] = fake_admin_post_response
+        asyncio.run(
+            stage_lora_adapter(
+                [httpx.AsyncClient(base_url="http://127.0.0.1:8000")],
+                "http://adapter/step_3",
+                require_delta=True,
+                policy_step=3,
+                delta_deadline=time.perf_counter() + 0.2,
+            )
+        )
+        self.assertLessEqual(_ManifestProbeClient.requests[0].read, 0.2)
+
     def test_slow_manifest_probe_cannot_outlive_delta_deadline(self):
         _ManifestProbeClient.delay = 1.0
         try:
