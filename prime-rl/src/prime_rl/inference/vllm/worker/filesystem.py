@@ -1117,10 +1117,10 @@ def _read_chunked_linear_manifest(
     base2_size = positive_size("base2_size")
     base_config_size = config_size("base_config_size")
     base2_config_size = config_size("base2_config_size")
-    if base_size != target_size or base2_size != target_size or target_size % 2:
-        raise OSError("version-two adapter weights are not equal-sized even files")
+    if base_size != target_size or base2_size != target_size:
+        raise OSError("version-two adapter weights are not equal-sized files")
     data_offset = value.get("data_offset")
-    if type(data_offset) is not int or data_offset < 0 or data_offset % 2 or data_offset > target_size:
+    if type(data_offset) is not int or data_offset < 0 or data_offset > target_size:
         raise OSError("version-two adapter data offset is invalid")
     target_sha256 = digest("target_sha256")
     if value.get("full_sha256", target_sha256) != target_sha256:
@@ -1195,14 +1195,11 @@ def _read_chunked_linear_manifest(
             or name in seen_files
             or type(offset) is not int
             or offset < 0
-            or offset % 2
             or type(chunk_data_offset) is not int
             or chunk_data_offset < 0
-            or chunk_data_offset % 2
             or chunk_data_offset != data_offset
             or type(raw_size) is not int
             or raw_size <= 0
-            or raw_size % 2
             or offset + raw_size > target_size
             or type(wire_size) is not int
             or wire_size <= 0
@@ -1212,6 +1209,10 @@ def _read_chunked_linear_manifest(
             or re.fullmatch(r"[0-9a-f]{64}", raw_sha256) is None
             or item.get("codec") not in _ADAPTER_KNOWN_CHUNK_CODECS
         ):
+            raise OSError("version-two adapter chunk identity is invalid")
+        data_start = max(offset, data_offset)
+        data_size = offset + raw_size - data_start
+        if data_size and ((data_start - data_offset) % 2 or data_size % 2):
             raise OSError("version-two adapter chunk identity is invalid")
         seen_files.add(name)
         chunks.append(

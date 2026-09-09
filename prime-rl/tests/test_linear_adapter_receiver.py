@@ -239,6 +239,76 @@ class LinearAdapterReceiverTest(unittest.TestCase):
         finally:
             filesystem._read_source_text = old_reader
 
+    def test_manifest_accepts_odd_safetensors_offset_and_file_size(self):
+        filesystem = load_filesystem()
+        target = b"t" * 9
+        config = b"{}\n"
+
+        def digest(value):
+            return hashlib.sha256(value).hexdigest()
+
+        manifest = {
+            "version": 2,
+            "kind": "lora-adapter",
+            "mode": "delta",
+            "transport": "chunked-bf16-linear-zigzag-sparse-zstd",
+            "target_step": 2,
+            "base_step": 1,
+            "base2_step": 0,
+            "target_url": "http://source/step_2",
+            "base_url": "http://source/step_1",
+            "base2_url": "http://source/step_0",
+            "target_size": len(target),
+            "target_sha256": digest(target),
+            "full_size": len(target),
+            "full_sha256": digest(target),
+            "config_size": len(config),
+            "config_sha256": digest(config),
+            "base_size": len(target),
+            "base_sha256": "a" * 64,
+            "base_config_size": len(config),
+            "base_config_sha256": "b" * 64,
+            "base2_size": len(target),
+            "base2_sha256": "c" * 64,
+            "base2_config_size": len(config),
+            "base2_config_sha256": "d" * 64,
+            "data_offset": 3,
+            "chunk_alignment": 2,
+            "chunk_coverage": {"offset": 0, "size": len(target)},
+            "predictor": "bf16-float32-second-order-rne",
+            "value_encoding": "sparse-zigzag-leb128",
+            "mask_encoding": "zstd-bit-mask-little-endian",
+            "chunk_count": 1,
+            "chunks": [
+                {
+                    "file": "chunk-0",
+                    "offset": 0,
+                    "data_offset": 3,
+                    "raw_size": len(target),
+                    "wire_size": 4,
+                    "wire_sha256": "e" * 64,
+                    "raw_sha256": "f" * 64,
+                    "codec": "zstd",
+                }
+            ],
+            "files": [
+                {"name": "adapter_config.json", "size": len(config), "sha256": digest(config)},
+                {"name": "adapter_model.safetensors", "size": len(target), "sha256": digest(target)},
+            ],
+        }
+        old_reader = filesystem._read_source_text
+        filesystem._read_source_text = lambda *_args, **_kwargs: json.dumps(manifest)
+        try:
+            parsed = filesystem._read_chunked_linear_manifest("http://source/step_2")
+            self.assertEqual(parsed["target_size"], len(target))
+            self.assertEqual(parsed["data_offset"], 3)
+            self.assertEqual(parsed["chunks"][0]["raw_size"], len(target))
+            manifest["chunks"][0]["raw_size"] = 8
+            with self.assertRaisesRegex(OSError, "identity is invalid"):
+                filesystem._read_chunked_linear_manifest("http://source/step_2")
+        finally:
+            filesystem._read_source_text = old_reader
+
     def test_receiver_reconstructs_exact_target_with_zero_correction(self):
         filesystem = load_filesystem()
         source_url = "http://source/step_2"

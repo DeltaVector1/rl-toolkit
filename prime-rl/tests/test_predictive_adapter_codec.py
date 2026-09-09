@@ -50,6 +50,24 @@ def valid_safetensor_bytes(words: list[int], dtype: str = "BF16") -> bytes:
     return struct.pack("<Q", len(header)) + header + data
 
 
+def odd_offset_safetensor_bytes(words: list[int]) -> bytes:
+    data = np.asarray(words, dtype="<u2").tobytes()
+    header = json.dumps(
+        {
+            "x": {
+                "dtype": "BF16",
+                "shape": [len(words)],
+                "data_offsets": [0, len(data)],
+            }
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if (8 + len(header)) % 2 == 0:
+        header += b" "
+    assert (8 + len(header)) % 2 == 1
+    return struct.pack("<Q", len(header)) + header + data
+
+
 class PredictiveAdapterCodecTest(unittest.TestCase):
     def test_build_checkpoint_delta_round_trip(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -360,6 +378,60 @@ class PredictiveAdapterCodecTest(unittest.TestCase):
         restored = adapter_delta.decode_predictive_chunk(base2, base1, payload, 0, len(prefix))
         self.assertEqual(restored, target)
         self.assertEqual(len(adapter_delta._decode_leb128_values(b"\x01" * word_count, word_count)), word_count)
+
+    def test_predictive_odd_header_and_file_round_trip_preserves_sha(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            directories = [root / f"step_{step}" for step in (1, 2, 3)]
+            values = ([0x3F80] * 1024, [0x4000] * 1024, [0x4080] * 1024)
+            for directory, words in zip(directories, values):
+                directory.mkdir()
+                (directory / "adapter_config.json").write_text("{}", encoding="utf-8")
+                (directory / "adapter_model.safetensors").write_bytes(
+                    odd_offset_safetensor_bytes(words)
+                )
+            target = directories[2] / "adapter_model.safetensors"
+            target_bytes = target.read_bytes()
+            data_offset = adapter_delta.safetensors_data_offset(target, require_bf16=True)
+            self.assertEqual(data_offset % 2, 1)
+            self.assertEqual(len(target_bytes) % 2, 1)
+
+            manifest = adapter_delta.publish_adapter_manifest(
+                directories[2],
+                directories[1],
+                base2_dir=directories[0],
+                target_url="http://source/step_3",
+                base_url="http://source/step_2",
+                base2_url="http://source/step_1",
+                target_step=3,
+                base_step=2,
+                base2_step=1,
+                chunk_size=1024,
+                max_workers=1,
+            )
+            self.assertEqual(manifest["data_offset"], data_offset)
+            self.assertEqual(manifest["target_sha256"], hashlib.sha256(target_bytes).hexdigest())
+            self.assertTrue(
+                any(item["offset"] % 2 for item in manifest["chunks"] if item["offset"] >= data_offset)
+            )
+            base2_bytes = (directories[0] / "adapter_model.safetensors").read_bytes()
+            base1_bytes = (directories[1] / "adapter_model.safetensors").read_bytes()
+            restored = bytearray(len(target_bytes))
+            for item in manifest["chunks"]:
+                start = item["offset"]
+                end = start + item["raw_size"]
+                payload = (directories[2] / item["file"]).read_bytes()
+                restored[start:end] = adapter_delta.decode_predictive_chunk(
+                    base2_bytes[start:end],
+                    base1_bytes[start:end],
+                    payload,
+                    start,
+                    data_offset,
+                )
+            self.assertEqual(bytes(restored), target_bytes)
+            self.assertEqual(
+                hashlib.sha256(restored).hexdigest(), manifest["target_sha256"]
+            )
 
     def test_predictive_chunk_rejects_noncanonical_values_and_trailing_data(self):
         base = safetensor_bytes([0x3F80, 0x4000])

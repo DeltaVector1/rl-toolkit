@@ -658,6 +658,41 @@ def _chunk_ranges(size: int, chunk_size: int) -> list[tuple[int, int]]:
     return [(offset, min(offset + chunk_size, size)) for offset in range(0, size, chunk_size)]
 
 
+def _predictive_chunk_ranges(
+    size: int,
+    chunk_size: int,
+    data_offset: int,
+) -> list[tuple[int, int]]:
+    """Split a safetensors file without splitting a BF16 value.
+
+    The JSON header is a byte stream and can have any length. Tensor data is
+    BF16, so every data chunk must start at an even distance from the data
+    start, not at an even absolute file offset.
+    """
+    if size < 0:
+        raise ValueError("adapter file size cannot be negative")
+    if chunk_size <= 0 or chunk_size % 2:
+        raise ValueError("adapter chunk size must be a positive even number")
+    if data_offset < 0 or data_offset > size:
+        raise ValueError("predictive data offset is outside the adapter file")
+    ranges: list[tuple[int, int]] = []
+    offset = 0
+    while offset < data_offset:
+        end = min(offset + chunk_size, data_offset)
+        ranges.append((offset, end))
+        offset = end
+    offset = data_offset
+    while offset < size:
+        end = min(offset + chunk_size, size)
+        if (end - offset) % 2:
+            end -= 1
+        if end <= offset:
+            raise ValueError("predictive tensor data is not BF16-aligned")
+        ranges.append((offset, end))
+        offset = end
+    return ranges
+
+
 def _atomic_write(path: Path, value: bytes) -> None:
     temporary = path.with_name(f".{path.name}.{os.getpid()}.partial")
     try:
@@ -698,7 +733,12 @@ def _write_encoded_chunks(
     data_offset: int | None = None,
 ) -> tuple[list[dict[str, Any]], int, str, str | None, str | None]:
     target_size = target_path.stat().st_size
-    ranges = _chunk_ranges(target_size, chunk_size)
+    if mode == "predictive":
+        if data_offset is None:
+            raise ValueError("predictive chunks require a data offset")
+        ranges = _predictive_chunk_ranges(target_size, chunk_size, data_offset)
+    else:
+        ranges = _chunk_ranges(target_size, chunk_size)
     if base_path is not None and base_path.stat().st_size != target_size:
         raise ValueError("adjacent adapter files must have the same size")
     if base2_path is not None and base2_path.stat().st_size != target_size:
@@ -863,8 +903,6 @@ def publish_adapter_manifest(
         if sha256_file(base2_dir / adapter_config_name) != target_config_sha256:
             raise ValueError("predictive second-base adapter configuration identity differs")
         data_offset = safetensors_data_offset(target_weights, require_bf16=True)
-        if data_offset % 2 or target_weights.stat().st_size % 2:
-            raise ValueError("predictive safetensors data and file size must be even-aligned")
         if safetensors_data_offset(base_dir / adapter_weights_name, require_bf16=True) != data_offset:
             raise ValueError("predictive base safetensors data offset differs")
         if safetensors_data_offset(base2_dir / adapter_weights_name, require_bf16=True) != data_offset:
