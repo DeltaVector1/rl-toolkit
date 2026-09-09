@@ -1063,7 +1063,7 @@ class AdapterTransportStateTest(unittest.TestCase):
         self.assertIn("parallel_ranges=False", worker_source)
         self.assertIn("executor.shutdown(wait=True, cancel_futures=True)", worker_source)
         self.assertIn("_cleanup_delta_stage_artifacts(", worker_source)
-        self.assertIn("preserve_partial=isinstance(exc, TimeoutError)", worker_source)
+        self.assertIn("preserve_partial=_preserve_adapter_stage_partial(exc)", worker_source)
         self.assertIn("deadline=delta_deadline", worker_source)
         self.assertIn("asyncio.wait_for(", server.read_text(encoding="utf-8"))
         watcher_source = watcher.read_text(encoding="utf-8")
@@ -1075,6 +1075,33 @@ class AdapterTransportStateTest(unittest.TestCase):
         self.assertIn("delta_deadline = time.monotonic()", watcher_source)
         self.assertIn("delta_deadline=delta_deadline if require_delta else None", watcher_source)
         self.assertIn("next_step > 0", watcher_source)
+
+    def test_stage_failure_preserves_transport_but_removes_invalid_partial(self):
+        filesystem = load_filesystem_module()
+        self.assertTrue(
+            filesystem._preserve_adapter_stage_partial(OSError("connection reset by peer"))
+        )
+        self.assertTrue(
+            filesystem._preserve_adapter_stage_partial(TimeoutError("request timed out"))
+        )
+        for message in (
+            "adapter range ended early",
+            "adapter file ended early",
+            "incomplete adapter range",
+            "incomplete adapter file",
+        ):
+            with self.subTest(message=message):
+                self.assertTrue(filesystem._preserve_adapter_stage_partial(OSError(message)))
+        for message in (
+            "adapter checksum mismatch",
+            "adapter digest mismatch",
+            "adapter identity is invalid",
+            "adapter protocol error",
+            "adapter path is a symbolic link",
+            "adapter payload is corrupt",
+        ):
+            with self.subTest(message=message):
+                self.assertFalse(filesystem._preserve_adapter_stage_partial(OSError(message)))
 
     def test_delta_cleanup_waits_for_relay_reader(self):
         filesystem = load_filesystem_module()
@@ -1494,6 +1521,7 @@ class AdapterTransportStateTest(unittest.TestCase):
             self.assertNotIn(legacy_port, orchestrator_source)
         self.assertIn("parsed.port != source_first", orchestrator_source)
         worker_source = (REPOSITORY / "prime-rl/src/prime_rl/inference/vllm/worker/filesystem.py").read_text(encoding="utf-8")
+        self.assertIn("full_download_streams = 48", worker_source)
         self.assertIn("download_streams = _configured_download_streams()", worker_source)
         self.assertNotIn("_PARALLEL_DOWNLOAD_STREAMS", worker_source)
 

@@ -34,7 +34,7 @@ def adapter_cache_path(source_url: str) -> Path:
 _PARALLEL_DOWNLOAD_THRESHOLD = 16 * 1024 * 1024
 _DOWNLOAD_STREAMS_ENV = "PRIME_LORA_DOWNLOAD_STREAMS"
 _MAX_DOWNLOAD_STREAMS = 128
-full_download_streams = 96
+full_download_streams = 48
 default_delta_stage_timeout_s = 900.0
 _ADAPTER_FILES = ("adapter_config.json", "adapter_model.safetensors")
 _ADAPTER_MANIFEST = "adapter_manifest.json"
@@ -2904,6 +2904,53 @@ def _cleanup_delta_stage_artifacts(
     return True
 
 
+def _preserve_adapter_stage_partial(exception: BaseException) -> bool:
+    """Keep matching private stage data across retryable transport errors."""
+    message = str(exception).lower()
+    if any(
+        marker in message
+        for marker in (
+            "checksum",
+            "digest",
+            "identity",
+            "protocol",
+            "manifest",
+            "symbolic link",
+            "symlink",
+            "unsafe",
+            "path",
+            "corrupt",
+            "invalid",
+            "malformed",
+            "wrong size",
+            "size mismatch",
+            "did not honor byte range",
+        )
+    ):
+        return False
+    if isinstance(exception, TimeoutError):
+        return True
+    if isinstance(exception, HTTPError):
+        return exception.code == 429 or 500 <= exception.code <= 599
+    if not isinstance(exception, OSError):
+        return False
+    return any(
+        marker in message
+        for marker in (
+            "connection reset",
+            "connection refused",
+            "connection aborted",
+            "timed out",
+            "temporary failure",
+            "adapter range ended early",
+            "adapter file ended early",
+            "incomplete adapter range",
+            "incomplete adapter file",
+            "remote end closed",
+        )
+    )
+
+
 def _stage_chunked_xor_adapter(
     source_url: str,
     transport: dict[str, object],
@@ -3996,10 +4043,12 @@ def stage_lora_adapter_files(
             )
             return destination
         except BaseException as exc:
-            if require_delta or (isinstance(transport, dict) and transport.get("mode") == "delta"):
+            if require_delta or (
+                isinstance(transport, dict) and transport.get("mode") in {"delta", "full"}
+            ):
                 _cleanup_delta_stage_artifacts(
                     destination,
-                    preserve_partial=isinstance(exc, TimeoutError),
+                    preserve_partial=_preserve_adapter_stage_partial(exc),
                     deadline=time.monotonic() + _ADAPTER_CLEANUP_TIMEOUT_S,
                     cancel_event=threading.Event(),
                 )
