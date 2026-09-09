@@ -367,8 +367,8 @@ class DownloadSchedulerTest(unittest.TestCase):
         payload = b"chunk"
         source_urls = [
             f"http://127.0.0.1:{port}/chunk"
-            for offset in range(4)
-            for port in range(18100 + offset, 18196, 4)
+            for offset in range(2)
+            for port in range(18100 + offset, 18196, 2)
         ]
         self.assertEqual(len(source_urls), 96)
         self.assertEqual(len(set(source_urls)), 96)
@@ -415,7 +415,7 @@ class DownloadSchedulerTest(unittest.TestCase):
         self.assertEqual(calls, [source_urls[23], source_urls[24]])
         self.assertEqual(
             [int(url.split(":")[2].split("/", 1)[0]) for url in calls],
-            [18192, 18101],
+            [18146, 18148],
         )
 
 

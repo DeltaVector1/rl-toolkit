@@ -1436,7 +1436,7 @@ class AdapterTransportStateTest(unittest.TestCase):
             self.assertTrue(stopped.is_set())
             self.assertFalse(ready.exists())
 
-    def test_inventory_defines_bounded_24_stream_transfer(self):
+    def test_inventory_defines_bounded_48_stream_transfer(self):
         nodes = REPOSITORY / "configs/nodes.toml"
         with nodes.open("rb") as stream:
             config = tomllib.load(stream)
@@ -1463,7 +1463,7 @@ class AdapterTransportStateTest(unittest.TestCase):
         self.assertEqual(urlsplit(source_url).port, ports["lora_source_first"])
         runtime = REPOSITORY / "training_ops/runtime/h200"
         glm_source = (runtime / "start_inference.sh").read_text(encoding="utf-8")
-        self.assertIn("PRIME_LORA_DOWNLOAD_STREAMS=24", glm_source)
+        self.assertIn("PRIME_LORA_DOWNLOAD_STREAMS=48", glm_source)
         self.assertIn('PRIME_LORA_SOURCE_PORTS="$lora_source_port_list"', glm_source)
         source_generator = glm_source.split(
             'runtime_output=$(python3 - "$deployment/configs/nodes.toml" "$engine_host" <<\'PY\'\n',
@@ -1483,8 +1483,8 @@ class AdapterTransportStateTest(unittest.TestCase):
             generated_ports,
             [
                 port
-                for offset in range(4)
-                for port in range(18100 + offset, 18196, 4)
+                for offset in range(2)
+                for port in range(18100 + offset, 18196, 2)
             ],
         )
         orchestrator_source = (

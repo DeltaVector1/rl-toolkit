@@ -134,14 +134,14 @@ query="$tmp/peer-query"
 
 PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$log" PEER_QUERY="$query" peer_tunnel
 for _ in $(seq 1 50); do
-  [ -f "$log" ] && [ "$(wc -l <"$log")" -eq 25 ] && break
+  [ -f "$log" ] && [ "$(wc -l <"$log")" -eq 49 ] && break
   sleep 0.1
 done
-test "$(wc -l <"$log")" -eq 25
+test "$(wc -l <"$log")" -eq 49
 
 api_pattern='-L 127.0.0.1:18049:127.0.0.1:8000'
 test "$(grep -F -c -- "$api_pattern" "$log")" -eq 1
-test "$(grep -F -c -- '-R 127.0.0.1:' "$log")" -eq 24
+test "$(grep -F -c -- '-R 127.0.0.1:' "$log")" -eq 48
 while IFS= read -r line; do
   case "$line" in
     *"$api_pattern"*"-R 127.0.0.1:"*)
@@ -155,19 +155,19 @@ for port in $(seq 18100 18195); do
 done
 while IFS= read -r line; do
   reverse_count=$(grep -o -- '-R 127.0.0.1:' <<<"$line" | wc -l)
-  test "$reverse_count" -eq 4
+  test "$reverse_count" -eq 2
   grep -Fq -- '-o ExitOnForwardFailure=yes' <<<"$line"
 done < <(grep -F -- '-R 127.0.0.1:' "$log")
 
 # A second launcher invocation finds the exact API and lane signatures.
 PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$log" PEER_QUERY="$query" peer_tunnel
-test "$(wc -l <"$log")" -eq 25
+test "$(wc -l <"$log")" -eq 49
 
 china_log="$tmp/china-tunnel.log"
 trainer_ssh_target=china-trainer
 adapter_port=8100
 PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$china_log" PEER_QUERY="$query" PEER_CHINA_MODE=1 china_tunnel_remove_legacy
-china_lane_size=4
+china_lane_size=2
 china_lane_start=0
 china_lane_number=0
 china_lane_ports=()
@@ -191,7 +191,7 @@ run_china_lanes() {
 }
 
 # A migration launch removes an old four-port China supervisor before
-# creating twenty-four four-port supervisors.
+# creating forty-eight two-forward supervisors.
 stale_group_command="$tmp/stale-group-command"
 stale_group_kill_log="$tmp/stale-group-kill"
 kill() {
@@ -211,6 +211,16 @@ export PEER_STALE_GROUP_ACTIVE=1 PEER_STALE_GROUP_COMMAND="$unrelated_group_comm
 PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$china_log" PEER_QUERY="$query" PEER_CHINA_MODE=1 china_tunnel_remove_legacy
 test "${PEER_STALE_GROUP_ACTIVE:-0}" -eq 1
 test ! -s "$stale_group_kill_log"
+unset PEER_STALE_GROUP_ACTIVE PEER_STALE_GROUP_COMMAND
+: >"$china_log"
+
+# A migration launch also removes an old one-forward owned supervisor.
+printf '%s\n' 'while true; do ssh -NT -L 127.0.0.1:18100:127.0.0.1:8100 china-trainer; sleep 3; done # china-tunnel-lora-0' >"$stale_group_command"
+printf '%s\n' "$(<"$stale_group_command")" >"$china_log"
+export PEER_STALE_GROUP_ACTIVE=1 PEER_STALE_GROUP_COMMAND="$stale_group_command"
+PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$china_log" PEER_QUERY="$query" PEER_CHINA_MODE=1 china_tunnel_remove_legacy
+test "${PEER_STALE_GROUP_ACTIVE:-1}" -eq 0
+test -s "$stale_group_kill_log"
 unset PEER_STALE_GROUP_ACTIVE PEER_STALE_GROUP_COMMAND
 : >"$china_log"
 
@@ -304,30 +314,30 @@ test "$wait_status" -ne 0
 unset PEER_STALE_LISTENERS_ACTIVE PEER_TEARDOWN_POLLS TUNNEL_SS_OUTPUT
 unset -f sleep kill
 
-# A fresh launch creates twenty-four four-forward lanes.
+# A fresh launch creates forty-eight two-forward lanes.
 run_china_lanes
 for _ in $(seq 1 50); do
-  [ -f "$china_log" ] && [ "$(wc -l <"$china_log")" -eq 24 ] && break
+  [ -f "$china_log" ] && [ "$(wc -l <"$china_log")" -eq 48 ] && break
   sleep 0.1
 done
-test "$(wc -l <"$china_log")" -eq 24
-test "$(awk '/18104:127.0.0.1:8100/ && /18107:127.0.0.1:8100/ {count++} END {print count + 0}' "$china_log")" -eq 1
+test "$(wc -l <"$china_log")" -eq 48
+test "$(awk '/18104:127.0.0.1:8100/ && /18105:127.0.0.1:8100/ {count++} END {print count + 0}' "$china_log")" -eq 1
 while IFS= read -r line; do
   forward_count=$(grep -o -- '-L 127.0.0.1:' <<<"$line" | wc -l)
-  test "$forward_count" -eq 4
+  test "$forward_count" -eq 2
   grep -Fq -- '-o ExitOnForwardFailure=yes' <<<"$line"
 done <"$china_log"
 # A repeat launch preserves all matching groups without adding processes.
 run_china_lanes
-test "$(wc -l <"$china_log")" -eq 24
+test "$(wc -l <"$china_log")" -eq 48
 # A target change removes only the owned old groups before regrouping.
 trainer_ssh_target=china-trainer-regrouped
 run_china_lanes
 for _ in $(seq 1 50); do
-  [ "$(wc -l <"$china_log")" -eq 48 ] && break
+  [ "$(wc -l <"$china_log")" -eq 96 ] && break
   sleep 0.1
 done
-test "$(wc -l <"$china_log")" -eq 48
+test "$(wc -l <"$china_log")" -eq 96
 
 # A same-signature process with the wrong peer target is not reused.
 printf '%s\n' 'while true; do ssh -R 127.0.0.1:18100:127.0.0.1:18196 wrong@peer; sleep 3; done # peer-tunnel-lora-0' >"$log"
@@ -363,14 +373,14 @@ test "$(grep -F -c -- '-R 127.0.0.1:18103:127.0.0.1:18196' "$log")" -eq 1
 group_commands="$tmp/group-commands"
 kill_log="$tmp/kill-log"
 printf '%s\n' \
-  '1234 bash -c while true; do ssh -R 127.0.0.1:18100:127.0.0.1:18196 root@38.255.28.19; done # peer-tunnel-lora-0' \
+  '1234 bash -c while true; do ssh -NT -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -o IPQoS=none -i /data/trinity/h200_rollout_ed25519 -p 20099 -R 127.0.0.1:18100:127.0.0.1:18196 -R 127.0.0.1:18101:127.0.0.1:18196 root@38.255.28.19; done # peer-tunnel-lora-0' \
   '1234 ssh -i /other/key -p 20099 -R 127.0.0.1:18100:127.0.0.1:18196 unrelated@peer' >"$group_commands"
 kill() { printf '%s\n' "$*" >>"$KILL_LOG"; }
 export KILL_LOG="$kill_log" PEER_GROUP_COMMANDS="$group_commands"
 PATH="$tmp/bin:$PATH"
 export PATH
 peer_kill_owned 1234 \
-  'while true; do ssh -R 127.0.0.1:18100:127.0.0.1:18196 root@38.255.28.19; done # peer-tunnel-lora-0'
+  'while true; do ssh -NT -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -o IPQoS=none -i /data/trinity/h200_rollout_ed25519 -p 20099 -R 127.0.0.1:18100:127.0.0.1:18196 -R 127.0.0.1:18101:127.0.0.1:18196 root@38.255.28.19; done # peer-tunnel-lora-0'
 test "$(grep -F -c -- '1234' "$kill_log")" -eq 1
 if grep -Fq -- '-1234' "$kill_log"; then
   echo "unrelated peer group received a group kill" >&2
@@ -379,41 +389,42 @@ fi
 unset -f kill
 unset KILL_LOG PEER_GROUP_COMMANDS
 
-# Readiness accepts a listener only when its SSH child and single-port
+# Readiness accepts a listener only when its SSH child and two-port
 # supervisor both match the configured target.
-china_forwards=(-L "127.0.0.1:18100:127.0.0.1:8100")
+trainer_ssh_target=china-trainer
+china_forwards=(-L "127.0.0.1:18100:127.0.0.1:8100" -L "127.0.0.1:18101:127.0.0.1:8100")
 printf '%s\n' \
-  'ssh -NT -L 127.0.0.1:18100:127.0.0.1:8100 china-trainer' \
+  'ssh -NT -o BatchMode=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -o IPQoS=none -o Compression=no -L 127.0.0.1:18100:127.0.0.1:8100 -L 127.0.0.1:18101:127.0.0.1:8100 china-trainer' \
   >"$tmp/tunnel-owner"
 printf '%s\n' \
-  'bash -c while true; do ssh -NT -L 127.0.0.1:18100:127.0.0.1:8100 china-trainer; sleep 3; done # china-tunnel-lora-0' \
+  'bash -c while true; do ssh -NT -o BatchMode=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -o IPQoS=none -o Compression=no -L 127.0.0.1:18100:127.0.0.1:8100 -L 127.0.0.1:18101:127.0.0.1:8100 china-trainer; sleep 3; done # china-tunnel-lora-0' \
   >"$tmp/tunnel-supervisor"
 : >"$tmp/tunnel-ss"
 printf 'LISTEN 0 128 127.0.0.1:18100 0.0.0.0:* users:(("ssh",pid=4242,fd=5))\n' >>"$tmp/tunnel-ss"
 export TUNNEL_OWNER_PID=4242 TUNNEL_OWNER_PPID=4241 TUNNEL_SUPERVISOR_PID=4241 \
   TUNNEL_OWNER_COMMAND="$tmp/tunnel-owner" TUNNEL_SUPERVISOR_COMMAND="$tmp/tunnel-supervisor" \
   TUNNEL_SS_OUTPUT="$tmp/tunnel-ss"
-PATH="$tmp/bin:$PATH" tunnel_listener_ready 18100 china-tunnel-lora-0 china-trainer 1 "${china_forwards[@]}"
+PATH="$tmp/bin:$PATH" tunnel_listener_ready 18100 china-tunnel-lora-0 china-trainer 2 "${china_forwards[@]}"
 
 # A single-port supervisor is rejected when its SSH child uses the wrong target.
 printf '%s\n' \
-  'ssh -NT -L 127.0.0.1:18100:127.0.0.1:8100 wrong-trainer' \
+  'ssh -NT -o BatchMode=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -o IPQoS=none -o Compression=no -L 127.0.0.1:18100:127.0.0.1:8100 -L 127.0.0.1:18101:127.0.0.1:8100 wrong-trainer' \
   >"$tmp/tunnel-owner"
 export TUNNEL_OWNER_PID=4242 TUNNEL_OWNER_PPID=4241
-if PATH="$tmp/bin:$PATH" tunnel_listener_ready 18100 china-tunnel-lora-0 china-trainer 1 "${china_forwards[@]}"; then
+if PATH="$tmp/bin:$PATH" tunnel_listener_ready 18100 china-tunnel-lora-0 china-trainer 2 "${china_forwards[@]}"; then
   echo "wrong child target was accepted" >&2
   exit 1
 fi
 
 # An orphan listener is rejected without readiness-time cleanup.
 printf '%s\n' \
-  'ssh -NT -L 127.0.0.1:18100:127.0.0.1:8100 china-trainer' \
+  'ssh -NT -o BatchMode=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -o IPQoS=none -o Compression=no -L 127.0.0.1:18100:127.0.0.1:8100 -L 127.0.0.1:18101:127.0.0.1:8100 china-trainer' \
   >"$tmp/tunnel-owner"
 orphan_kill_log="$tmp/orphan-kill"
 kill() { printf '%s\n' "$*" >"$orphan_kill_log"; return 0; }
 export TUNNEL_OWNER_PPID=1
-if PATH="$tmp/bin:$PATH" tunnel_listener_ready 18100 china-tunnel-lora-0 china-trainer 1 \
-    -L "127.0.0.1:18100:127.0.0.1:8100"; then
+if PATH="$tmp/bin:$PATH" tunnel_listener_ready 18100 china-tunnel-lora-0 china-trainer 2 \
+    "${china_forwards[@]}"; then
   echo "orphan listener was accepted" >&2
   exit 1
 else
@@ -459,4 +470,4 @@ elapsed=$(( $(date +%s) - started ))
 printf 'hung remote probe wall_seconds=%s\n' "$elapsed"
 test "$elapsed" -le 3
 unset PEER_REMOTE_SLEEP
-printf 'peer tunnel uses one API connection and twenty-four bounded four-port lanes\n'
+printf 'peer tunnel uses one API connection and forty-eight bounded two-port lanes\n'

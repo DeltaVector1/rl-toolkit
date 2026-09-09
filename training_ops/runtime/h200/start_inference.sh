@@ -24,9 +24,9 @@ first = ports["lora_source_first"]
 last = ports["lora_source_last"]
 if not isinstance(first, int) or not isinstance(last, int) or first < 1 or last < first:
     raise SystemExit("invalid lora source port range")
-# Keep the worker source order interleaved across the four forwards in each
+# Keep the worker source order interleaved across the two forwards in each
 # China supervisor.
-lane_size = 4
+lane_size = 2
 print(",".join(
     str(port)
     for offset in range(lane_size)
@@ -111,7 +111,7 @@ docker run -d --name glm52-decensor-h200 --restart unless-stopped \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   -e VLLM_ENGINE_READY_TIMEOUT_S=7200 \
   -e PRIME_LORA_CACHE_DIR="$adapter_cache_dir" \
-  -e PRIME_LORA_DOWNLOAD_STREAMS=24 \
+  -e PRIME_LORA_DOWNLOAD_STREAMS=48 \
   -e PRIME_LORA_SOURCE_PORTS="$lora_source_port_list" \
   --entrypoint /bin/bash \
   prime-rl:glm52-v080-glm52-h200-router \
