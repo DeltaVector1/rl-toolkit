@@ -1,4 +1,4 @@
-output_dir = "/data/glm52-rl/runs/glm-decensor-difficulty-3"
+output_dir = "/data/glm52-rl/runs/glm-decensor-difficulty-4"
 max_steps = 50
 dist_timeout_seconds = 5400
 enable_router_replay = false
@@ -19,12 +19,12 @@ ranks_filter = [0]
 
 [swanlab]
 project = "glm-runs"
-name = "trainer-glm-decensor-difficulty-3"
+name = "trainer-glm-decensor-difficulty-4"
 group = "glm-runs"
-tags = ["decensor-diff-3", "glm-5.2", "decensor", "grpo", "lora-r32", "50-step"]
+tags = ["decensor-diff-4", "glm-5.2", "decensor", "grpo", "lora-r32", "50-step"]
 
 [file_monitor]
-filename = "run_glm-decensor-difficulty-3/trainer-metrics.jsonl"
+filename = "run_glm-decensor-difficulty-4/trainer-metrics.jsonl"
 
 [model]
 name = "/data/ZiphuAI/GLM-5.2-FP8"
