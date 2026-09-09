@@ -21,7 +21,7 @@ ranks_filter = [0]
 project = "glm-runs"
 name = "trainer-glm-decensor-difficulty-1"
 group = "glm-runs"
-tags = ["glm-decensor-difficulty-1", "glm-5.2", "decensor", "grpo", "lora-r32", "50-step"]
+tags = ["decensor-diff-1", "glm-5.2", "decensor", "grpo", "lora-r32", "50-step"]
 
 [file_monitor]
 filename = "run_glm-decensor-difficulty-1/trainer-metrics.jsonl"
