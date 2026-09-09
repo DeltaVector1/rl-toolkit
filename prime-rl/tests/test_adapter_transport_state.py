@@ -1353,6 +1353,7 @@ class AdapterTransportStateTest(unittest.TestCase):
         runtime = REPOSITORY / "training_ops/runtime/h200"
         glm_source = (runtime / "start_inference.sh").read_text(encoding="utf-8")
         self.assertIn("PRIME_LORA_DOWNLOAD_STREAMS=24", glm_source)
+        self.assertIn("PRIME_LORA_CHUNK_TIMEOUT_S=45", glm_source)
         self.assertIn('PRIME_LORA_SOURCE_PORTS="$lora_source_port_list"', glm_source)
         source_generator = glm_source.split(
             'runtime_output=$(python3 - "$deployment/configs/nodes.toml" "$engine_host" <<\'PY\'\n',
