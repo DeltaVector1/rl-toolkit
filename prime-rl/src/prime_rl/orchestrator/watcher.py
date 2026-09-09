@@ -212,10 +212,9 @@ def validate_adapter_manifest(
     elif version == 2:
         if manifest.get("transport") != v2_adapter_transport:
             raise RuntimeError("adapter manifest selects an unsupported predictive transport")
-        if target_step < 1:
-            raise RuntimeError("predictive adapter transport requires a predecessor step")
-        expected_base2_step = 0 if target_step == 1 else target_step - 2
-        if manifest.get("base_step") != target_step - 1 or manifest.get("base2_step") != expected_base2_step:
+        if target_step < 2:
+            raise RuntimeError("predictive adapter transport requires two predecessor steps")
+        if manifest.get("base_step") != target_step - 1 or manifest.get("base2_step") != target_step - 2:
             raise RuntimeError("predictive adapter manifest steps are not adjacent")
         for prefix in ("target", "base", "base2"):
             size = manifest.get(f"{prefix}_size")
@@ -236,15 +235,6 @@ def validate_adapter_manifest(
         raise RuntimeError("adapter manifest version is unsupported")
 
     if version == 2:
-        if target_step == 1:
-            if base_url != base2_url or manifest.get("base_sha256") != manifest.get("base2_sha256"):
-                raise RuntimeError("step-one predictive adapter bases are not the same identity")
-            if manifest.get("base_size") != manifest.get("base2_size"):
-                raise RuntimeError("step-one predictive adapter base sizes differ")
-            if manifest.get("base_config_sha256") != manifest.get("base2_config_sha256"):
-                raise RuntimeError("step-one predictive adapter base configurations differ")
-            if manifest.get("base_config_size") != manifest.get("base2_config_size"):
-                raise RuntimeError("step-one predictive adapter base configuration sizes differ")
         if not isinstance(target_url, str) or manifest.get("target_url") != target_url:
             raise RuntimeError("predictive adapter manifest target URL differs from the requested policy")
         if not isinstance(base_url, str) or manifest.get("base_url") != base_url:
@@ -478,7 +468,7 @@ class WeightWatcher:
                 f"cannot apply adapter policy v{next_step}: verified base URL changed"
             )
 
-        previous_previous_url = previous_url if next_step == 1 else None
+        previous_previous_url = None
         if next_step >= 2:
             previous_previous_path = get_step_path(broadcast_dir, next_step - 2)
             if not (previous_previous_path / "STABLE").is_file():

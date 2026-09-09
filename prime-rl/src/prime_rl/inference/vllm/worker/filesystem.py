@@ -1045,11 +1045,11 @@ def _read_chunked_linear_manifest(
     base2_step = value.get("base2_step")
     if (
         type(target_step) is not int
-        or target_step < 1
+        or target_step < 2
         or type(base_step) is not int
         or type(base2_step) is not int
         or base_step != target_step - 1
-        or base2_step != (0 if target_step == 1 else target_step - 2)
+        or base2_step != target_step - 2
     ):
         raise OSError("version-two adapter manifest steps are not consecutive")
     parsed_source = urlsplit(source_url)
@@ -1111,22 +1111,10 @@ def _read_chunked_linear_manifest(
     base_config_sha256 = digest("base_config_sha256")
     base2_sha256 = digest("base2_sha256")
     base2_config_sha256 = digest("base2_config_sha256")
-    if target_step == 1 and (
-        base_url != base2_url
-        or base_sha256 != base2_sha256
-        or base_size != base2_size
-        or base_config_sha256 != base2_config_sha256
-        or base_config_size != base2_config_size
-        or value.get("predictor") != "bf16-first-order-exact"
-    ):
-        raise OSError("step-one predictive adapter bases are not the same identity")
     if (
         value.get("chunk_alignment") != 2
         or value.get("chunk_coverage") != {"offset": 0, "size": target_size}
-        or value.get("predictor") not in {
-            "bf16-first-order-exact",
-            "bf16-float32-second-order-rne",
-        }
+        or value.get("predictor") != "bf16-float32-second-order-rne"
         or value.get("value_encoding") != "sparse-zigzag-leb128"
         or value.get("mask_encoding") != "zstd-bit-mask-little-endian"
     ):

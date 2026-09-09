@@ -34,8 +34,6 @@ _predictive_header = struct.Struct("<4sBBHQQQQQQQ")
 _predictive_header_size = _predictive_header.size
 _predictive_max_varint_bytes = 3
 _predictive_max_raw_size = 256 * 1024 * 1024
-_predictive_first_order = "bf16-first-order-exact"
-_predictive_second_order = "bf16-float32-second-order-rne"
 
 
 def _load_zstd():
@@ -262,9 +260,6 @@ def _bf16_predictor(base2: bytes, base1: bytes) -> np.ndarray:
         raise ValueError("BF16 predictive data must have an even, equal size")
     first = np.frombuffer(base1, dtype="<u2").astype(np.uint32)
     second = np.frombuffer(base2, dtype="<u2").astype(np.uint32)
-    if base1 == base2:
-        # Do not use 2*x-x for the same base. It can change BF16 bit patterns.
-        return first.astype("<u2", copy=False)
     first_float = (first << np.uint32(16)).view(np.float32)
     second_float = (second << np.uint32(16)).view(np.float32)
     with np.errstate(over="ignore", invalid="ignore"):
@@ -824,19 +819,12 @@ def publish_adapter_manifest(
     _remove_transport_chunks(target_dir)
     data_offset: int | None = None
     predictive_requested = base2_dir is not None or base2_url is not None or base2_step is not None
-    predictor_name: str | None = None
     if predictive_requested:
         if base_dir is None or base2_dir is None:
             raise ValueError("predictive transport requires both adjacent base directories")
         if not all(isinstance(step, int) and step >= 0 for step in (target_step, base_step, base2_step)):
             raise ValueError("predictive transport requires target, base, and second-base steps")
-        same_base_predictive = target_step == 1
-        if same_base_predictive:
-            if base_step != 0 or base2_step != 0 or base_dir.resolve() != base2_dir.resolve():
-                raise ValueError("step-one predictive transport requires step zero as both bases")
-            if not isinstance(base_url, str) or base_url != base2_url:
-                raise ValueError("step-one predictive transport requires equal base URLs")
-        elif target_step != base_step + 1 or base_step != base2_step + 1:
+        if target_step != base_step + 1 or base_step != base2_step + 1:
             raise ValueError("predictive transport requires three adjacent policy steps")
         base_dir = base_dir.resolve()
         base2_dir = base2_dir.resolve()
@@ -852,20 +840,14 @@ def publish_adapter_manifest(
             raise ValueError("predictive base adapter configuration identity differs")
         if sha256_file(base2_dir / adapter_config_name) != target_config_sha256:
             raise ValueError("predictive second-base adapter configuration identity differs")
-        try:
-            data_offset = safetensors_data_offset(target_weights, require_bf16=True)
-            if data_offset % 2 or target_weights.stat().st_size % 2:
-                raise ValueError("predictive safetensors data and file size must be even-aligned")
-            if safetensors_data_offset(base_dir / adapter_weights_name, require_bf16=True) != data_offset:
-                raise ValueError("predictive base safetensors data offset differs")
-            if safetensors_data_offset(base2_dir / adapter_weights_name, require_bf16=True) != data_offset:
-                raise ValueError("predictive second-base safetensors data offset differs")
-        except ValueError:
-            data_offset = None
-            selected_mode = "delta"
-        else:
-            predictor_name = _predictive_first_order if same_base_predictive else _predictive_second_order
-            selected_mode = "predictive"
+        data_offset = safetensors_data_offset(target_weights, require_bf16=True)
+        if data_offset % 2 or target_weights.stat().st_size % 2:
+            raise ValueError("predictive safetensors data and file size must be even-aligned")
+        if safetensors_data_offset(base_dir / adapter_weights_name, require_bf16=True) != data_offset:
+            raise ValueError("predictive base safetensors data offset differs")
+        if safetensors_data_offset(base2_dir / adapter_weights_name, require_bf16=True) != data_offset:
+            raise ValueError("predictive second-base safetensors data offset differs")
+        selected_mode = "predictive"
     else:
         usable_base = (
             base_dir is not None
@@ -884,32 +866,16 @@ def publish_adapter_manifest(
         )
 
     if selected_mode in {"delta", "predictive"}:
-        try:
-            weight_chunks, weight_encoded_size = _write_encoded_chunks(
-                target_weights,
-                base_dir / adapter_weights_name,
-                target_dir,
-                mode=selected_mode,
-                chunk_size=chunk_size,
-                max_workers=max_workers,
-                base2_path=base2_dir / adapter_weights_name if selected_mode == "predictive" and base2_dir is not None else None,
-                data_offset=data_offset,
-            )
-        except ValueError:
-            if selected_mode != "predictive":
-                raise
-            _remove_transport_chunks(target_dir)
-            selected_mode = "delta"
-            data_offset = None
-            predictor_name = None
-            weight_chunks, weight_encoded_size = _write_encoded_chunks(
-                target_weights,
-                base_dir / adapter_weights_name,
-                target_dir,
-                mode=selected_mode,
-                chunk_size=chunk_size,
-                max_workers=max_workers,
-            )
+        weight_chunks, weight_encoded_size = _write_encoded_chunks(
+            target_weights,
+            base_dir / adapter_weights_name,
+            target_dir,
+            mode=selected_mode,
+            chunk_size=chunk_size,
+            max_workers=max_workers,
+            base2_path=base2_dir / adapter_weights_name if selected_mode == "predictive" and base2_dir is not None else None,
+            data_offset=data_offset,
+        )
     else:
         weight_chunks = []
         weight_encoded_size = target_weights.stat().st_size
@@ -923,17 +889,7 @@ def publish_adapter_manifest(
         base_step = None
     if selected_mode == "predictive" and weight_encoded_size >= target_weights.stat().st_size:
         _remove_transport_chunks(target_dir)
-        selected_mode = "delta"
-        predictor_name = None
-        data_offset = None
-        weight_chunks, weight_encoded_size = _write_encoded_chunks(
-            target_weights,
-            base_dir / adapter_weights_name,
-            target_dir,
-            mode=selected_mode,
-            chunk_size=chunk_size,
-            max_workers=max_workers,
-        )
+        raise ValueError("predictive transport is not smaller than the full adapter")
 
     files = [
         _file_record(target_config),
@@ -986,7 +942,7 @@ def publish_adapter_manifest(
                 "data_offset": data_offset,
                 "chunk_alignment": 2,
                 "chunk_coverage": {"offset": 0, "size": weights_record["size"]},
-                "predictor": predictor_name,
+                "predictor": "bf16-float32-second-order-rne",
                 "value_encoding": "sparse-zigzag-leb128",
                 "mask_encoding": "zstd-bit-mask-little-endian",
                 "chunks": [

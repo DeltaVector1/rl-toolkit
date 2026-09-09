@@ -175,9 +175,9 @@ def _validate_predictive_source_manifest(manifest: dict[str, object], source_url
     base2_step = manifest.get("base2_step")
     if (
         type(target_step) is not int
-        or target_step < 1
+        or target_step < 2
         or base_step != target_step - 1
-        or base2_step != (0 if target_step == 1 else target_step - 2)
+        or base2_step != target_step - 2
     ):
         raise RelayRequestError(500, "relay source manifest steps are not adjacent")
     parsed_source = urlsplit(source_url)
@@ -197,14 +197,6 @@ def _validate_predictive_source_manifest(manifest: dict[str, object], source_url
     for name in ("config_sha256", "base_config_sha256", "base2_config_sha256"):
         if not valid_digest(manifest.get(name)):
             raise RelayRequestError(500, f"relay source manifest has an invalid {name}")
-    if target_step == 1 and (
-        manifest.get("base_url") != manifest.get("base2_url")
-        or manifest.get("base_sha256") != manifest.get("base2_sha256")
-        or manifest.get("base_size") != manifest.get("base2_size")
-        or manifest.get("base_config_sha256") != manifest.get("base2_config_sha256")
-        or manifest.get("predictor") != "bf16-first-order-exact"
-    ):
-        raise RelayRequestError(500, "step-one predictive adapter bases are not the same identity")
     files = manifest.get("files")
     if not isinstance(files, list):
         raise RelayRequestError(500, "relay source manifest has no file records")
@@ -230,7 +222,7 @@ def _validate_predictive_source_manifest(manifest: dict[str, object], source_url
     for name, expected in (
         ("target_url", source_url),
         ("base_url", _predictive_step_url(source_url, target_step - 1)),
-        ("base2_url", _predictive_step_url(source_url, 0 if target_step == 1 else target_step - 2)),
+        ("base2_url", _predictive_step_url(source_url, target_step - 2)),
     ):
         value = manifest.get(name)
         if not isinstance(value, str) or value != expected:

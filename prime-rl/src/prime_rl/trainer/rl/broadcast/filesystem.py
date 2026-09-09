@@ -258,19 +258,15 @@ class FileSystemWeightBroadcast(WeightBroadcast):
                             get_broadcast_dir(self.multi_run_manager.get_run_dir(idx)),
                             broadcast_step - 1,
                         )
-                        if broadcast_step >= 1:
-                            previous_previous_dir = previous_dir
-                            previous_previous_step = broadcast_step - 1
-                            if broadcast_step >= 2:
-                                previous_previous_dir = get_step_path(
-                                    get_broadcast_dir(self.multi_run_manager.get_run_dir(idx)),
-                                    broadcast_step - 2,
-                                )
-                                previous_previous_step = broadcast_step - 2
+                        if broadcast_step >= 2:
+                            previous_previous_dir = get_step_path(
+                                get_broadcast_dir(self.multi_run_manager.get_run_dir(idx)),
+                                broadcast_step - 2,
+                            )
                             if not previous_dir.is_dir() or not previous_previous_dir.is_dir():
                                 raise RuntimeError(
                                     f"cannot publish adapter v{broadcast_step}: "
-                                    f"predecessors v{broadcast_step - 1} and v{previous_previous_step} "
+                                    f"predecessors v{broadcast_step - 1} and v{broadcast_step - 2} "
                                     "are not available"
                                 )
                             if not (previous_dir / "STABLE").is_file() or not (
@@ -303,7 +299,7 @@ class FileSystemWeightBroadcast(WeightBroadcast):
                             target_base_url = source_url.rstrip("/")
                             target_url = f"{target_base_url}/{quote(target_relative)}"
                             base_url = f"{target_base_url}/{quote(previous_dir.relative_to(source_root).as_posix())}"
-                            base2_url = base_url if broadcast_step == 1 else f"{target_base_url}/{quote(previous_previous_dir.relative_to(source_root).as_posix())}"
+                            base2_url = f"{target_base_url}/{quote(previous_previous_dir.relative_to(source_root).as_posix())}"
                             manifest = publish_adapter_manifest(
                                 save_dir,
                                 previous_dir,
@@ -313,7 +309,7 @@ class FileSystemWeightBroadcast(WeightBroadcast):
                                 base2_url=base2_url,
                                 target_step=broadcast_step,
                                 base_step=broadcast_step - 1,
-                                base2_step=previous_previous_step,
+                                base2_step=broadcast_step - 2,
                             )
                         else:
                             manifest = publish_adapter_manifest(
