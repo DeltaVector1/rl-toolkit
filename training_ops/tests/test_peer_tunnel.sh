@@ -85,13 +85,15 @@ EOF
 cat >"$tmp/bin/ss" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-cat "${TUNNEL_SS_OUTPUT:?missing tunnel ss output}"
+if [ -n "${TUNNEL_SS_OUTPUT:-}" ] && [ "${PEER_STALE_LISTENERS_ACTIVE:-}" != 0 ]; then
+  cat "${TUNNEL_SS_OUTPUT:?missing tunnel ss output}"
+fi
 EOF
 chmod +x "$tmp/bin/pgrep" "$tmp/bin/setsid"
 chmod +x "$tmp/bin/ps" "$tmp/bin/ss"
 
 start=$(grep -n '^tunnel() {' "$script" | cut -d: -f1)
-end=$(grep -n '^china_tunnel_remove_legacy$' "$script" | cut -d: -f1)
+end=$(grep -n '^china_legacy_cleanup_required=0$' "$script" | cut -d: -f1)
 source <(sed -n "${start},$((end - 1))p" "$script")
 
 lora_source_ports=()
@@ -106,6 +108,9 @@ peer_host=38.255.28.19
 peer_ssh_port=20099
 peer_ssh_user=root
 peer_ssh_identity=/data/trinity/h200_rollout_ed25519
+china_legacy_cleanup_required=0
+china_legacy_cleanup_pids=()
+china_legacy_cleanup_pgids=()
 log="$tmp/peer-tunnel.log"
 query="$tmp/peer-query"
 
@@ -170,8 +175,6 @@ run_china_lanes() {
 # A migration launch removes an old four-port China supervisor before
 # creating ninety-six one-port supervisors.
 stale_group_command="$tmp/stale-group-command"
-printf '%s\n' 'while true; do ssh -NT -L 127.0.0.1:18104:127.0.0.1:8100 -L 127.0.0.1:18105:127.0.0.1:8100 -L 127.0.0.1:18106:127.0.0.1:8100 -L 127.0.0.1:18107:127.0.0.1:8100 china-trainer; sleep 3; done # china-tunnel-lora-1' >"$stale_group_command"
-printf '%s\n' "$(<"$stale_group_command")" >"$china_log"
 stale_group_kill_log="$tmp/stale-group-kill"
 kill() {
   printf '%s\n' "$*" >>"$stale_group_kill_log"
@@ -179,12 +182,52 @@ kill() {
   export PEER_STALE_GROUP_ACTIVE
   sed -i '/# china-tunnel-lora-1$/d' "$china_log"
 }
+
+unrelated_group_command="$tmp/unrelated-group-command"
+printf '%s\n' 'while true; do ssh -NT -L 127.0.0.1:18104:127.0.0.1:8100 -L 127.0.0.1:18105:127.0.0.1:8100 -L 127.0.0.1:18106:127.0.0.1:8100 -L 127.0.0.1:18107:127.0.0.1:8100 china-trainer; sleep 3; done # unrelated-supervisor' >"$unrelated_group_command"
+printf '%s\n' "$(<"$unrelated_group_command")" >"$china_log"
+export PEER_STALE_GROUP_ACTIVE=1 PEER_STALE_GROUP_COMMAND="$unrelated_group_command"
+PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$china_log" PEER_QUERY="$query" PEER_CHINA_MODE=1 china_tunnel_remove_legacy
+test "${PEER_STALE_GROUP_ACTIVE:-0}" -eq 1
+test ! -s "$stale_group_kill_log"
+unset PEER_STALE_GROUP_ACTIVE PEER_STALE_GROUP_COMMAND
+: >"$china_log"
+
+printf '%s\n' 'while true; do ssh -NT -L 127.0.0.1:18104:127.0.0.1:8100 -L 127.0.0.1:18105:127.0.0.1:8100 -L 127.0.0.1:18106:127.0.0.1:8100 -L 127.0.0.1:18107:127.0.0.1:8100 china-trainer; sleep 3; done # china-tunnel-lora-1' >"$stale_group_command"
+printf '%s\n' "$(<"$stale_group_command")" >"$china_log"
 export PEER_STALE_GROUP_ACTIVE=1 PEER_STALE_GROUP_COMMAND="$stale_group_command"
 PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$china_log" PEER_QUERY="$query" PEER_CHINA_MODE=1 china_tunnel_remove_legacy
 test "${PEER_STALE_GROUP_ACTIVE:-1}" -eq 0
 test -s "$stale_group_kill_log"
 unset PEER_STALE_GROUP_ACTIVE PEER_STALE_GROUP_COMMAND
-unset -f kill
+
+stale_listener_output="$tmp/stale-listeners"
+: >"$stale_listener_output"
+for port in $(seq 18100 18195); do
+  printf 'LISTEN 0 128 127.0.0.1:%s 0.0.0.0:*\n' "$port" >>"$stale_listener_output"
+done
+export TUNNEL_SS_OUTPUT="$stale_listener_output" PEER_STALE_LISTENERS_ACTIVE=1 PEER_TEARDOWN_POLLS=2
+sleep() {
+  if [ "${PEER_TEARDOWN_POLLS:-0}" -gt 0 ]; then
+    PEER_TEARDOWN_POLLS=$((PEER_TEARDOWN_POLLS - 1))
+    export PEER_TEARDOWN_POLLS
+    if [ "$PEER_TEARDOWN_POLLS" -eq 0 ]; then
+      PEER_STALE_LISTENERS_ACTIVE=0
+      export PEER_STALE_LISTENERS_ACTIVE
+    fi
+  fi
+}
+PATH="$tmp/bin:$PATH" china_tunnel_wait_legacy_clear
+test "${PEER_TEARDOWN_POLLS:-1}" -eq 0
+PEER_STALE_LISTENERS_ACTIVE=1
+export PEER_STALE_LISTENERS_ACTIVE
+set +e
+PATH="$tmp/bin:$PATH" china_tunnel_wait_legacy_clear
+wait_status=$?
+set -e
+test "$wait_status" -ne 0
+unset PEER_STALE_LISTENERS_ACTIVE PEER_TEARDOWN_POLLS TUNNEL_SS_OUTPUT
+unset -f sleep kill
 
 # A fresh launch creates ninety-six one-forward lanes.
 run_china_lanes
@@ -341,4 +384,4 @@ elapsed=$(( $(date +%s) - started ))
 printf 'hung remote probe wall_seconds=%s\n' "$elapsed"
 test "$elapsed" -le 3
 unset PEER_REMOTE_SLEEP
-printf 'peer tunnel uses one API connection and ninety-six bounded one-port lanes\n'
+printf 'peer tunnel uses one API connection and twenty-four bounded four-port lanes\n'

@@ -400,10 +400,29 @@ tunnel_listener_ready() {
   done
 }
 
+china_tunnel_grouped_legacy_match() {
+  local command_line=$1 source_port forward_total configured_total
+  case "$command_line" in
+    *"while true; do"*"$trainer_ssh_target"*"# china-tunnel-lora-"*) ;;
+    *) return 1 ;;
+  esac
+  forward_total=$(grep -o -- '-L ' <<<"$command_line" | wc -l)
+  [ "$forward_total" -eq 4 ] || return 1
+  configured_total=0
+  for source_port in "${lora_source_ports[@]}"; do
+    case "$command_line" in
+      *"-L 127.0.0.1:$source_port:127.0.0.1:$adapter_port"*)
+        configured_total=$((configured_total + 1))
+        ;;
+    esac
+  done
+  [ "$configured_total" -eq 4 ]
+}
+
 china_tunnel_remove_legacy() {
   local only_marker=${1:-}
   local lora_source_port pattern pid command_line pgid group_command group_safe group_seen cleanup_port
-  local source_port forward_total configured_total
+  local grouped_legacy
   local -a cleanup_ports=()
   for cleanup_port in "${@:2}"; do
     case "$cleanup_port" in
@@ -419,6 +438,7 @@ china_tunnel_remove_legacy() {
     pattern="-L 127.0.0.1:$lora_source_port:127.0.0.1:$adapter_port"
     for pid in $(pgrep -f -- "$pattern" || true); do
       command_line=$(ps -o args= -p "$pid" 2>/dev/null || true)
+      grouped_legacy=0
       if [ -n "$only_marker" ]; then
         case "$command_line" in
           *"while true; do"*"$pattern"*"# $only_marker") ;;
@@ -427,28 +447,26 @@ china_tunnel_remove_legacy() {
       else
         case "$command_line" in
           *"while true; do"*"$pattern"*"$trainer_ssh_target"*)
-            case "$command_line" in
-              *"# china-tunnel-lora-"*)
-                # During migration, remove only old four-forward China
-                # supervisors whose complete source range is configured.
-                forward_total=$(grep -o -- '-L ' <<<"$command_line" | wc -l)
-                configured_total=0
-                for source_port in "${lora_source_ports[@]}"; do
-                  case "$command_line" in
-                    *"-L 127.0.0.1:$source_port:127.0.0.1:$adapter_port"*)
-                      configured_total=$((configured_total + 1))
-                      ;;
-                  esac
-                done
-                [ "$forward_total" -eq 4 ] && [ "$configured_total" -eq 4 ] || continue
-                ;;
-              *) ;;
-            esac
+            china_tunnel_grouped_legacy_match "$command_line" || continue
+            grouped_legacy=1
             ;;
           *) continue ;;
         esac
       fi
       pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
+      if [ "$grouped_legacy" = 1 ]; then
+        china_legacy_cleanup_required=1
+        china_legacy_cleanup_pids+=("$pid")
+        case "$pgid" in
+          ''|*[!0-9]*|0|1) ;;
+          *)
+            case " ${china_legacy_cleanup_pgids[*]} " in
+              *" $pgid "*) ;;
+              *) china_legacy_cleanup_pgids+=("$pgid") ;;
+            esac
+            ;;
+        esac
+      fi
       case "$pgid" in
         ''|*[!0-9]*|0|1|"$$") kill "$pid" 2>/dev/null || true ;;
         *)
@@ -477,6 +495,40 @@ china_tunnel_remove_legacy() {
       esac
     done
   done
+}
+
+china_tunnel_wait_legacy_clear() {
+  local pid pgid group_processes source_port listener_remaining
+  for _ in $(seq 1 30); do
+    listener_remaining=0
+    for pid in "${china_legacy_cleanup_pids[@]}"; do
+      [ -z "$(ps -o args= -p "$pid" 2>/dev/null || true)" ] || {
+        listener_remaining=1
+        break
+      }
+    done
+    if [ "$listener_remaining" = 0 ]; then
+      for pgid in "${china_legacy_cleanup_pgids[@]}"; do
+        group_processes=$(ps -eo pgid=,args= 2>/dev/null | awk -v group="$pgid" '$1 == group {print; exit}' || true)
+        [ -z "$group_processes" ] || {
+          listener_remaining=1
+          break
+        }
+      done
+    fi
+    if [ "$listener_remaining" = 0 ]; then
+      for source_port in "${lora_source_ports[@]}"; do
+        if ss -H -ltn 2>/dev/null | awk -v port=":$source_port" '$4 ~ port "$" {found=1} END {exit !found}'; then
+          listener_remaining=1
+          break
+        fi
+      done
+    fi
+    [ "$listener_remaining" = 0 ] && return 0
+    sleep 1
+  done
+  echo "stale China adapter tunnels did not stop before one-port migration" >&2
+  return 1
 }
 
 china_tunnel_connection() {
@@ -549,7 +601,13 @@ peer_tunnel() {
   fi
 }
 
+china_legacy_cleanup_required=0
+china_legacy_cleanup_pids=()
+china_legacy_cleanup_pgids=()
 china_tunnel_remove_legacy
+if [ "$china_legacy_cleanup_required" = 1 ] && ! china_tunnel_wait_legacy_clear; then
+  exit 1
+fi
 china_lane_size=1
 china_lane_start=0 china_lane_number=0
 china_lane_ports=() china_lane_forwards=()
