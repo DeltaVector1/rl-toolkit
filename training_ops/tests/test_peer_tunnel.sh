@@ -167,7 +167,7 @@ china_log="$tmp/china-tunnel.log"
 trainer_ssh_target=china-trainer
 adapter_port=8100
 PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$china_log" PEER_QUERY="$query" PEER_CHINA_MODE=1 china_tunnel_remove_legacy
-china_lane_size=1
+china_lane_size=4
 china_lane_start=0
 china_lane_number=0
 china_lane_ports=()
@@ -191,7 +191,7 @@ run_china_lanes() {
 }
 
 # A migration launch removes an old four-port China supervisor before
-# creating ninety-six one-port supervisors.
+# creating twenty-four four-port supervisors.
 stale_group_command="$tmp/stale-group-command"
 stale_group_kill_log="$tmp/stale-group-kill"
 kill() {
@@ -304,30 +304,30 @@ test "$wait_status" -ne 0
 unset PEER_STALE_LISTENERS_ACTIVE PEER_TEARDOWN_POLLS TUNNEL_SS_OUTPUT
 unset -f sleep kill
 
-# A fresh launch creates ninety-six one-forward lanes.
+# A fresh launch creates twenty-four four-forward lanes.
 run_china_lanes
 for _ in $(seq 1 50); do
-  [ -f "$china_log" ] && [ "$(wc -l <"$china_log")" -eq 96 ] && break
+  [ -f "$china_log" ] && [ "$(wc -l <"$china_log")" -eq 24 ] && break
   sleep 0.1
 done
-test "$(wc -l <"$china_log")" -eq 96
-test "$(awk '/18104:127.0.0.1:8100/ && /18107:127.0.0.1:8100/ {count++} END {print count + 0}' "$china_log")" -eq 0
+test "$(wc -l <"$china_log")" -eq 24
+test "$(awk '/18104:127.0.0.1:8100/ && /18107:127.0.0.1:8100/ {count++} END {print count + 0}' "$china_log")" -eq 1
 while IFS= read -r line; do
   forward_count=$(grep -o -- '-L 127.0.0.1:' <<<"$line" | wc -l)
-  test "$forward_count" -eq 1
+  test "$forward_count" -eq 4
   grep -Fq -- '-o ExitOnForwardFailure=yes' <<<"$line"
 done <"$china_log"
 # A repeat launch preserves all matching groups without adding processes.
 run_china_lanes
-test "$(wc -l <"$china_log")" -eq 96
+test "$(wc -l <"$china_log")" -eq 24
 # A target change removes only the owned old groups before regrouping.
 trainer_ssh_target=china-trainer-regrouped
 run_china_lanes
 for _ in $(seq 1 50); do
-  [ "$(wc -l <"$china_log")" -eq 192 ] && break
+  [ "$(wc -l <"$china_log")" -eq 48 ] && break
   sleep 0.1
 done
-test "$(wc -l <"$china_log")" -eq 192
+test "$(wc -l <"$china_log")" -eq 48
 
 # A same-signature process with the wrong peer target is not reused.
 printf '%s\n' 'while true; do ssh -R 127.0.0.1:18100:127.0.0.1:18196 wrong@peer; sleep 3; done # peer-tunnel-lora-0' >"$log"

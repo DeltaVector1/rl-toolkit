@@ -604,7 +604,7 @@ china_tunnel_wait_legacy_clear() {
     [ "$listener_remaining" = 0 ] && return 0
     sleep 1
   done
-  echo "stale China adapter tunnels did not stop before one-port migration" >&2
+  echo "stale China adapter tunnels did not stop before migration" >&2
   return 1
 }
 
@@ -687,7 +687,7 @@ china_tunnel_remove_orphan_children
 if [ "$china_legacy_cleanup_required" = 1 ] && ! china_tunnel_wait_legacy_clear; then
   exit 1
 fi
-china_lane_size=1
+china_lane_size=4
 china_lane_start=0 china_lane_number=0
 china_lane_ports=() china_lane_forwards=()
 while [ "$china_lane_start" -lt "${#lora_source_ports[@]}" ]; do

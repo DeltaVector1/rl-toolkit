@@ -70,7 +70,11 @@ class AdapterUpdateTest(unittest.TestCase):
         b = read_settings("h200b")
         self.assertEqual(a.returncode, 0, a.stderr)
         self.assertEqual(b.returncode, 0, b.stderr)
-        expected_source_ports = [str(port) for port in range(18100, 18196)]
+        expected_source_ports = [
+            str(port)
+            for offset in range(4)
+            for port in range(18100 + offset, 18196, 4)
+        ]
         for result in (a, b):
             source_ports = result.stdout.splitlines()[0].split(",")
             self.assertEqual(source_ports, expected_source_ports)
@@ -89,7 +93,7 @@ class AdapterUpdateTest(unittest.TestCase):
         self.assertEqual(a_extra["max_num_batched_tokens"], 32768)
         self.assertEqual(a_extra["compilation_config"], {"max_cudagraph_capture_size": 256})
         self.assertIn("runtime_output=$(python3", launcher)
-        self.assertIn("-e PRIME_LORA_DOWNLOAD_STREAMS=96", launcher)
+        self.assertIn("-e PRIME_LORA_DOWNLOAD_STREAMS=24", launcher)
         self.assertLess(launcher.index("runtime_output=$(python3"), launcher.index("install -d"))
         self.assertLess(launcher.index("runtime_output=$(python3"), launcher.index("docker update"))
 
