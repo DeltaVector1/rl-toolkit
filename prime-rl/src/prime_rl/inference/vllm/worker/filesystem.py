@@ -2493,7 +2493,9 @@ def _xor_bytes(left: bytes, right: bytes) -> bytes:
         raise OSError("adapter transport XOR failed") from exc
 
 
-def _transport_raw_sha256(delta: bytes) -> str:
+def _transport_raw_sha256(delta: bytes, *, codec: str = _ADAPTER_DELTA_TRANSPORT) -> str:
+    if codec == _ADAPTER_FULL_TRANSPORT:
+        return hashlib.sha256(delta).hexdigest()
     try:
         from prime_rl.utils.adapter_delta import shuffle_bf16_bytes
     except ImportError as exc:
@@ -3224,7 +3226,7 @@ def _stage_chunked_xor_adapter(
                 _unlink_path(chunk_path, "corrupt adapter transport chunk")
             raise
         _check_deadline(deadline, cancel_event)
-        if _transport_raw_sha256(raw) != raw_sha256:
+        if _transport_raw_sha256(raw, codec=str(transport["transport"])) != raw_sha256:
             if full_zstd:
                 _unlink_path(chunk_path, "corrupt adapter transport chunk")
             raise OSError("adapter transport decoded chunk checksum mismatch")

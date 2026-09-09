@@ -864,7 +864,9 @@ class AdapterTransportStateTest(unittest.TestCase):
             source = root / "step_0"
             source.mkdir()
             config = b"{}\n"
-            model = b"a" * (adapter_delta.default_chunk_size + 17)
+            model = (b"\x01\x02" * ((adapter_delta.default_chunk_size + 18) // 2))[
+                : adapter_delta.default_chunk_size + 17
+            ]
             (source / "adapter_config.json").write_bytes(config)
             (source / "adapter_model.safetensors").write_bytes(model)
             manifest = adapter_delta.publish_adapter_manifest(source, target_step=0, max_workers=2)
@@ -901,6 +903,50 @@ class AdapterTransportStateTest(unittest.TestCase):
             relay_manifest = json.loads((destination / "relay_manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(relay_manifest["transport"], "full")
             self.assertIn("adapter_model.safetensors", relay_manifest["files"])
+
+    def test_full_stage_rejects_corrupt_wire_chunk(self):
+        filesystem = load_filesystem_module()
+        old_retries = filesystem._ADAPTER_LANE_RETRIES
+        filesystem._ADAPTER_LANE_RETRIES = 1
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "step_0"
+            source.mkdir()
+            config = b"{}\n"
+            model = b"\x01\x02" * 32
+            (source / "adapter_config.json").write_bytes(config)
+            (source / "adapter_model.safetensors").write_bytes(model)
+            manifest = adapter_delta.publish_adapter_manifest(source, target_step=0)
+            self.assertEqual(manifest["transport"], adapter_delta.full_transport_name)
+            chunk = source / manifest["chunks"][0]["file"]
+            payload = bytearray(chunk.read_bytes())
+            payload[-1] ^= 1
+            chunk.write_bytes(payload)
+            (source / "adapter_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            handler = functools.partial(QuietDirectoryHandler, directory=str(root))
+            with socketserver.ThreadingTCPServer(("127.0.0.1", 0), handler) as server:
+                server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+                server_thread.start()
+                source_url = f"http://127.0.0.1:{server.server_address[1]}/step_0"
+                old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
+                old_streams = os.environ.get("PRIME_LORA_DOWNLOAD_STREAMS")
+                os.environ["PRIME_LORA_CACHE_DIR"] = str(root / "cache")
+                os.environ["PRIME_LORA_DOWNLOAD_STREAMS"] = "4"
+                try:
+                    with self.assertRaisesRegex(OSError, "checksum"):
+                        filesystem.stage_lora_adapter_files(source_url)
+                finally:
+                    if old_cache is None:
+                        os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+                    else:
+                        os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+                    if old_streams is None:
+                        os.environ.pop("PRIME_LORA_DOWNLOAD_STREAMS", None)
+                    else:
+                        os.environ["PRIME_LORA_DOWNLOAD_STREAMS"] = old_streams
+                    filesystem._ADAPTER_LANE_RETRIES = old_retries
+                    server.shutdown()
+                    server_thread.join()
 
     def test_policy_zero_full_zstd_exact_sha_and_raw_fallback(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1745,7 +1791,7 @@ class AdapterTransportStateTest(unittest.TestCase):
         filesystem._adapter_source_urls = lambda _source: ["http://lane-1", "http://lane-2"]
         filesystem._configured_download_streams = lambda: 1
         filesystem._decode_transport_chunk = lambda payload, **_kwargs: payload
-        filesystem._transport_raw_sha256 = lambda payload: hashlib.sha256(payload).hexdigest()
+        filesystem._transport_raw_sha256 = lambda payload, **_kwargs: hashlib.sha256(payload).hexdigest()
         filesystem._xor_bytes = lambda _base, payload: payload
         filesystem.download = fake_download
         filesystem._cleanup_delta_stage_artifacts = record_cleanup
