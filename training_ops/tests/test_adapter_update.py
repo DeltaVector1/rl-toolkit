@@ -693,6 +693,55 @@ class AdapterUpdateTest(unittest.TestCase):
         self.assertTrue(any("start_inference.sh" in call for call in calls))
         self.assertTrue(any("ENGINE_CONTAINER=glm52-decensor-h200" in call for call in calls))
 
+    def test_watchdog_cleanup_uses_engine_identity_not_script_path(self):
+        script = training_ops._engine_watchdog_identity_script(
+            "h200a",
+            "glm52-decensor-h200",
+            "/data/glm52-rl/deployment/training_ops/runtime/h200/engine_watchdog.sh",
+            "/data/glm52-rl/deployment/training_ops/runtime/h200/start_inference.sh",
+            "/models/glm52-fp8",
+            600,
+            ensure_running=True,
+        )
+
+        self.assertIn(
+            r"bash\ */engine_watchdog.sh|/bin/bash\ */engine_watchdog.sh",
+            script,
+        )
+        self.assertIn("grep -Fxq ENGINE_HOST=h200a", script)
+        self.assertIn("grep -Fxq ENGINE_CONTAINER=glm52-decensor-h200", script)
+        self.assertIn("STARTUP_GRACE=600", script)
+        self.assertIn(
+            "START=/data/glm52-rl/deployment/training_ops/runtime/h200/start_inference.sh",
+            script,
+        )
+        self.assertIn("canonical engine watchdog already running", script)
+        self.assertIn("kill -TERM -- \"-$pid\"", script)
+        self.assertNotIn("pkill", script)
+        self.assertNotIn("pgrep", script)
+
+    def test_supervisor_repair_reconciles_stale_watchdogs(self):
+        calls = []
+
+        def ssh(host, script, timeout=120):
+            calls.append((host, script, timeout))
+            return 0, "reconciled one canonical engine watchdog\n"
+
+        with mock.patch.object(training_ops, "current_run", return_value="glm-perf-3"), mock.patch.object(
+            training_ops, "_config_for_run"
+        ), mock.patch.object(training_ops, "_ssh", side_effect=ssh):
+            result = training_ops._repair_supervisors()
+
+        self.assertIn("h200a: reconciled one canonical engine watchdog", result)
+        self.assertEqual({host for host, _, _ in calls}, {"h200a", "h200b"})
+        for host, script, timeout in calls:
+            self.assertEqual(timeout, 120)
+            self.assertIn(f"grep -Fxq ENGINE_HOST={host}", script)
+            self.assertIn("grep -Fxq ENGINE_CONTAINER=glm52-decensor-h200", script)
+            self.assertIn("STARTUP_GRACE=600", script)
+            self.assertNotIn("pkill", script)
+            self.assertNotIn("pgrep", script)
+
     def test_healthy_engines_are_reloaded_to_import_receiver_changes(self):
         before = training_ops.Status(
             trainer_up=True,

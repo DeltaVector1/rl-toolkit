@@ -4262,6 +4262,149 @@ def _repair_adapter_tunnels(config_dir: str | None = None) -> str:
     return result
 
 
+def _engine_watchdog_identity_script(
+    host: str,
+    engine_container: str,
+    watchdog_script: str,
+    start_script: str,
+    model: str,
+    startup_grace: int,
+    *,
+    ensure_running: bool,
+) -> str:
+    """Stop stale watchdogs for one configured engine identity."""
+    values = {
+        "ENGINE_HOST": host,
+        "ENGINE_CONTAINER": engine_container,
+    }
+    lines = [
+        "set -euo pipefail",
+        f"watchdog_script={shlex.quote(watchdog_script)}",
+        f"start_script={shlex.quote(start_script)}",
+        f"model={shlex.quote(model)}",
+        f"startup_grace={shlex.quote(str(startup_grace))}",
+        "watchdog_command_matches() {",
+        "  local pid=$1 command_line",
+        "  case \"$pid\" in ''|*[!0-9]*) return 1;; esac",
+        "  [ \"$pid\" -gt 1 ] || return 1",
+        "  [ -r \"/proc/$pid/cmdline\" ] || return 1",
+        "  command_line=$(cat \"/proc/$pid/cmdline\" 2>/dev/null | tr '\\0' ' ' || true)",
+        "  command_line=${command_line% }",
+        "  case \"$command_line\" in",
+        r"    bash\ */engine_watchdog.sh|/bin/bash\ */engine_watchdog.sh|/usr/bin/bash\ */engine_watchdog.sh) return 0;;",
+        "  esac",
+        "  return 1",
+        "}",
+        "watchdog_environment() {",
+        "  local pid=$1",
+        "  [ -r \"/proc/$pid/environ\" ] || return 1",
+        "  cat \"/proc/$pid/environ\" 2>/dev/null | tr '\\0' '\\n'",
+        "}",
+        "watchdog_matches() {",
+        "  local pid=$1 environment",
+        "  watchdog_command_matches \"$pid\" || return 1",
+        "  environment=$(watchdog_environment \"$pid\" || true)",
+    ]
+    for key, value in values.items():
+        lines.append(
+            f"  printf '%s\\n' \"$environment\" | grep -Fxq {shlex.quote(f'{key}={value}')} || return 1"
+        )
+    lines.extend(
+        [
+            "  return 0",
+            "}",
+            "canonical_watchdog_matches() {",
+            "  local pid=$1 command_line environment",
+            "  watchdog_matches \"$pid\" || return 1",
+            "  command_line=$(cat \"/proc/$pid/cmdline\" 2>/dev/null | tr '\\0' ' ' || true)",
+            "  command_line=${command_line% }",
+            "  case \"$command_line\" in",
+            '    "bash $watchdog_script"|"/bin/bash $watchdog_script"|"/usr/bin/bash $watchdog_script") ;;',
+            "    *) return 1;;",
+            "  esac",
+            "  environment=$(watchdog_environment \"$pid\" || true)",
+            f"  printf '%s\\n' \"$environment\" | grep -Fxq {shlex.quote(f'START={start_script}')} || return 1",
+            f"  printf '%s\\n' \"$environment\" | grep -Fxq {shlex.quote(f'MODEL={model}')} || return 1",
+            f"  printf '%s\\n' \"$environment\" | grep -Fxq {shlex.quote(f'STARTUP_GRACE={startup_grace}')} || return 1",
+            "  return 0",
+            "}",
+            "stop_watchdog() {",
+            "  local pid=$1 pgid",
+            "  watchdog_matches \"$pid\" || return 0",
+            "  pgid=$(awk '{print $5}' \"/proc/$pid/stat\" 2>/dev/null || true)",
+            '  [ "$pgid" = "$pid" ] || { echo "watchdog identity is not its own process group: pid=$pid pgid=$pgid" >&2; return 1; }',
+            '  kill -TERM -- "-$pid" 2>/dev/null || true',
+            '  for _ in $(seq 1 50); do watchdog_matches "$pid" || break; sleep 0.1; done',
+            '  if watchdog_matches "$pid"; then kill -KILL -- "-$pid" 2>/dev/null || true; fi',
+            '  for _ in $(seq 1 20); do watchdog_matches "$pid" || break; sleep 0.1; done',
+            '  watchdog_matches "$pid" && { echo "watchdog did not exit: pid=$pid" >&2; return 1; }',
+            "}",
+            "matches=()",
+            "canonical_matches=()",
+            "for proc_dir in /proc/[0-9]*; do",
+            "  pid=${proc_dir##*/}",
+            "  watchdog_matches \"$pid\" && matches+=(\"$pid\")",
+            "  canonical_watchdog_matches \"$pid\" && canonical_matches+=(\"$pid\")",
+            "done",
+        ]
+    )
+    if ensure_running:
+        lines.extend(
+            [
+                'if [ "${#matches[@]}" = 1 ] && [ "${#canonical_matches[@]}" = 1 ]; then',
+                '  echo "canonical engine watchdog already running"',
+                "  exit 0",
+                "fi",
+            ]
+        )
+    lines.extend(
+        [
+            'for pid in "${matches[@]}"; do stop_watchdog "$pid"; done',
+            "matches=()",
+            "for proc_dir in /proc/[0-9]*; do",
+            "  pid=${proc_dir##*/}",
+            "  watchdog_matches \"$pid\" && matches+=(\"$pid\")",
+            "done",
+            '[ "${#matches[@]}" = 0 ] || { echo "target engine watchdog did not stop: ${matches[*]}" >&2; exit 71; }',
+        ]
+    )
+    if ensure_running:
+        canonical_environment = {
+            **values,
+            "STARTUP_GRACE": str(startup_grace),
+            "MODEL": model,
+            "START": start_script,
+        }
+        environment = " ".join(
+            f"{key}={shlex.quote(value)}"
+            for key, value in canonical_environment.items()
+        )
+        lines.extend(
+            [
+                f"env {environment} nohup setsid bash \"$watchdog_script\" >>/root/engine_watchdog.log 2>&1 </dev/null &",
+                "new_pid=$!",
+                "matched=0",
+                "for _ in $(seq 1 50); do",
+                "  if canonical_watchdog_matches \"$new_pid\"; then matched=1; break; fi",
+                "  sleep 0.1",
+                "done",
+                '[ "$matched" = 1 ] || { echo "canonical engine watchdog was not observed" >&2; exit 72; }',
+                "matches=()",
+                "canonical_matches=()",
+                "for proc_dir in /proc/[0-9]*; do",
+                "  pid=${proc_dir##*/}",
+                "  watchdog_matches \"$pid\" && matches+=(\"$pid\")",
+                "  canonical_watchdog_matches \"$pid\" && canonical_matches+=(\"$pid\")",
+                "done",
+                '[ "${#matches[@]}" = 1 ] && [ "${#canonical_matches[@]}" = 1 ] || { echo "target engine watchdog identity is ambiguous" >&2; exit 73; }',
+                'echo "reconciled one canonical engine watchdog"',
+            ]
+        )
+    else:
+        lines.append('echo "stopped target engine watchdogs"')
+    return "\n".join(lines) + "\n"
+
+
 def _repair_engine(host: str) -> str:
     _check_host(host)
     if host not in inference_hosts:
@@ -4273,9 +4416,18 @@ def _repair_engine(host: str) -> str:
     print(
         f"{host}: removing and restarting {engine_container}. The model load needs 5 to 10 minutes."
     )
+    watchdog_script = f"{runtime_root}/h200/engine_watchdog.sh"
     stop_code, stop_output = _ssh(
         host,
-        f"pkill -f '^bash {runtime_root}/h200/engine_watchdog.sh$' 2>/dev/null; echo stopped",
+        _engine_watchdog_identity_script(
+            host,
+            engine_container,
+            watchdog_script,
+            start_script,
+            engine_model,
+            startup_grace,
+            ensure_running=False,
+        ),
     )
     if stop_code:
         raise RuntimeError(f"cannot stop the watchdog on {host}: {stop_output.strip()}")
@@ -4291,11 +4443,15 @@ def _repair_engine(host: str) -> str:
         raise RuntimeError(f"inference restart failed on {host}: {out.strip()}")
     watchdog_code, watchdog_output = _ssh(
         host,
-        f"nohup setsid env STARTUP_GRACE={startup_grace} MODEL={engine_model} "
-        f"ENGINE_HOST={shlex.quote(host)} "
-        f"START={start_script} ENGINE_CONTAINER={engine_container} "
-        f"bash {runtime_root}/h200/engine_watchdog.sh "
-        ">> /root/engine_watchdog.log 2>&1 </dev/null & disown",
+        _engine_watchdog_identity_script(
+            host,
+            engine_container,
+            watchdog_script,
+            start_script,
+            engine_model,
+            startup_grace,
+            ensure_running=True,
+        ),
     )
     if watchdog_code:
         raise RuntimeError(
@@ -4494,35 +4650,23 @@ def _repair_supervisors(config_dir: str | None = None) -> str:
     else:
         _config_dir(config_dir, require_orchestrator=True)
     for h in inference_hosts:
-        rc, count_text = _ssh(
+        start_script = f"{runtime_root}/h200/start_inference.sh"
+        code, output = _ssh(
             h,
-            f"pgrep -f '^bash {runtime_root}/h200/engine_watchdog.sh$' | wc -l",
+            _engine_watchdog_identity_script(
+                h,
+                glm_inference_container,
+                f"{runtime_root}/h200/engine_watchdog.sh",
+                start_script,
+                glm_model,
+                600,
+                ensure_running=True,
+            ),
         )
-        if rc or not count_text.strip().isdigit():
-            raise RuntimeError(f"cannot read watchdog count on {h}: {count_text.strip()}")
-        count = int(count_text.strip())
-        expected = 1
-        if count == expected:
-            out.append(f"{expected} engine watchdog(s) already run on {h}")
-            continue
-        stop_code, stop_output = _ssh(
-            h,
-            f"pkill -f '^bash {runtime_root}/h200/engine_watchdog.sh$' 2>/dev/null; true",
-        )
-        if stop_code:
-            raise RuntimeError(f"cannot stop watchdogs on {h}: {stop_output.strip()}")
-        start_code, start_output = _ssh(
-            h,
-            f"nohup setsid env ENGINE_HOST={shlex.quote(h)} "
-            f"MODEL={shlex.quote(glm_model)} "
-            f"START={shlex.quote(f'{runtime_root}/h200/start_inference.sh')} "
-            f"ENGINE_CONTAINER={shlex.quote(glm_inference_container)} "
-            f"bash {runtime_root}/h200/engine_watchdog.sh "
-            ">> /root/engine_watchdog.log 2>&1 </dev/null & disown",
-        )
-        if start_code:
-            raise RuntimeError(f"cannot start watchdogs on {h}: {start_output.strip()}")
-        out.append(f"restarted {expected} engine watchdog(s) on {h}")
+        if code:
+            raise RuntimeError(f"cannot reconcile watchdogs on {h}: {output.strip()}")
+        result = output.strip().splitlines()[-1] if output.strip() else "reconciled one canonical engine watchdog"
+        out.append(f"{h}: {result}")
     msg = "; ".join(out)
     print(msg)
     print("Use start(run, mode='restart') to replace a run supervisor.")
