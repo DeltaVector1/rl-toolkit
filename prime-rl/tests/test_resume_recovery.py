@@ -40,6 +40,10 @@ def load_startup_validator(urlopen, validate_manifest, file_records):
             f"http://source/{path.name}"
         ),
         "_delta_stage_timeout_s": lambda: 30.0,
+        "adapter_stage_limit_seconds": lambda step: {
+            1: 900.0,
+            2: 600.0,
+        }.get(step, 300.0),
         "validate_adapter_manifest": validate_manifest,
         "_adapter_file_records": file_records,
     }
@@ -539,7 +543,38 @@ class ResumeRecoveryTest(unittest.TestCase):
         validator = load_startup_validator(fetch, validate, records)
         with tempfile.TemporaryDirectory() as temporary:
             validator(SimpleNamespace(output_dir=Path(temporary)), "adapter", 6, Path(temporary) / "step_6", target_url)
-        self.assertEqual(calls, [(target_url + "/adapter_manifest.json", 30.0)])
+        self.assertEqual(calls, [(target_url + "/adapter_manifest.json", 300.0)])
+
+    def test_resume_manifest_probe_uses_exact_policy_step_limit(self):
+        for step, expected_limit in ((1, 900.0), (2, 600.0), (3, 300.0)):
+            with self.subTest(step=step):
+                calls = []
+
+                class Response(io.BytesIO):
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *_args):
+                        self.close()
+
+                def fetch(url, timeout):
+                    calls.append((url, timeout))
+                    return Response(json.dumps({"version": 2}).encode("utf-8"))
+
+                validator = load_startup_validator(fetch, lambda *_args, **_kwargs: None, lambda _value: {})
+                with tempfile.TemporaryDirectory() as temporary:
+                    target_url = f"http://source/step_{step}"
+                    validator(
+                        SimpleNamespace(output_dir=Path(temporary)),
+                        "adapter",
+                        step,
+                        Path(temporary) / f"step_{step}",
+                        target_url,
+                    )
+                self.assertEqual(
+                    calls,
+                    [(target_url + "/adapter_manifest.json", expected_limit)],
+                )
 
     def test_resume_has_a_longer_separate_budget(self):
         tree = ast.parse(CLIENT_PATH.read_text(encoding="utf-8"))

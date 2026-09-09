@@ -56,6 +56,10 @@ def load_watcher_delta_method(urlopen):
         "json": json,
         "urlopen": urlopen,
         "_delta_stage_timeout_s": lambda: 30,
+        "adapter_stage_limit_seconds": lambda step: {
+            1: 900.0,
+            2: 600.0,
+        }.get(step, 300.0),
         "get_broadcast_dir": lambda output_dir: output_dir,
         "get_step_path": lambda broadcast_dir, step: broadcast_dir / f"step_{step}",
         "inference_weight_path": lambda _config, path, _lora_name: f"http://source/{path.name}",
@@ -727,7 +731,54 @@ class AdapterTransportStateTest(unittest.TestCase):
 
             self.assertEqual(result, f"{target_url}/adapter_manifest.json")
             self.assertEqual(watcher.last_adapter_delta_build_time, 2.5)
-            self.assertEqual(calls, [(f"{target_url}/adapter_manifest.json", 30)])
+            self.assertEqual(calls, [(f"{target_url}/adapter_manifest.json", 900.0)])
+
+    def test_watcher_manifest_probe_uses_exact_policy_step_limit(self):
+        for target_step, expected_limit in ((1, 900.0), (2, 600.0), (3, 300.0)):
+            with self.subTest(target_step=target_step), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                for step in range(target_step + 1):
+                    (root / f"step_{step}").mkdir()
+                    (root / f"step_{step}" / "STABLE").touch()
+                target_url = f"http://source/step_{target_step}"
+                manifest = {
+                    "version": 1,
+                    "kind": "lora-adapter",
+                    "mode": "delta",
+                    "transport": "chunked-shuffled-xor-zstd",
+                    "target_step": target_step,
+                    "base_step": target_step - 1,
+                }
+                calls = []
+
+                class Response(io.BytesIO):
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *_args):
+                        self.close()
+
+                def fake_urlopen(url, timeout):
+                    calls.append((url, timeout))
+                    return Response(json.dumps(manifest).encode("utf-8"))
+
+                method = load_watcher_delta_method(fake_urlopen)
+                watcher = SimpleNamespace(
+                    config=SimpleNamespace(
+                        output_dir=root,
+                        weight_broadcast=SimpleNamespace(),
+                    ),
+                    lora_name="adapter",
+                    verified_adapter_step=target_step - 1,
+                    verified_adapter_url=None,
+                    last_adapter_delta_build_time=-1.0,
+                )
+                method(watcher, target_step, root / f"step_{target_step}")
+
+                self.assertEqual(
+                    calls,
+                    [(f"{target_url}/adapter_manifest.json", expected_limit)],
+                )
 
     def test_remote_manifest_is_used_when_local_manifest_is_old_version(self):
         with tempfile.TemporaryDirectory() as temporary:

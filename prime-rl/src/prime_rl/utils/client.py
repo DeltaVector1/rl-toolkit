@@ -757,9 +757,17 @@ async def stage_lora_adapter(
     started = time.perf_counter()
     configured_delta_timeout = _delta_stage_timeout_s() if require_delta else None
     delta_deadline = None
+    stage_limit = None
     predictive_transport = False
     if require_delta:
-        remaining = configured_delta_timeout - (time.perf_counter() - started)
+        # The caller has already supplied the policy step. Select its
+        # operational limit before probing the manifest so a later step
+        # cannot spend the full server maximum in this request.
+        if policy_step is None:
+            raise RuntimeError("adapter policy step is required for delta staging")
+        stage_limit = adapter_stage_limit_seconds(policy_step)
+        delta_deadline = started + min(stage_limit, configured_delta_timeout)
+        remaining = delta_deadline - time.perf_counter()
         if remaining <= 0:
             raise TimeoutError("adapter delta staging exceeded its time limit")
         try:
@@ -805,12 +813,8 @@ async def stage_lora_adapter(
                 raise RuntimeError("adapter manifest steps are not consecutive")
         else:
             raise RuntimeError("adapter manifest version is unsupported")
-        if policy_step is None:
-            policy_step = target_step
-        elif policy_step != target_step:
+        if policy_step != target_step:
             raise RuntimeError("requested adapter policy step differs from its manifest")
-        stage_limit = adapter_stage_limit_seconds(policy_step)
-        delta_deadline = started + min(stage_limit, configured_delta_timeout)
         predictive_transport = (
             manifest.get("version") == 2
             and manifest.get("transport") == "chunked-bf16-linear-zigzag-sparse-zstd"

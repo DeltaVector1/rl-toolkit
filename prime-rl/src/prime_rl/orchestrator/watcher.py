@@ -22,7 +22,6 @@ from prime_rl.trainer.rl.broadcast.nixl.model_express import ModelExpressSession
 from prime_rl.utils.async_utils import safe_cancel
 from prime_rl.utils.client import (
     InferencePool,
-    _delta_stage_timeout_s,
     _validate_loaded_receipt,
     adapter_stage_limit_seconds,
     load_lora_adapter,
@@ -493,7 +492,7 @@ class WeightWatcher:
             manifest, manifest_location = _read_adapter_manifest(
                 local_weights_path,
                 target_url if isinstance(target_url, str) else None,
-                _delta_stage_timeout_s(),
+                adapter_stage_limit_seconds(next_step),
                 prefer_remote=True,
             )
         except RuntimeError as exc:

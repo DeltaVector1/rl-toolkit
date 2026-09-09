@@ -17,14 +17,15 @@ CLIENT_PATH = ROOT / "src/prime_rl/utils/client.py"
 
 
 class _ManifestProbeResponse:
-    def __init__(self, version):
+    def __init__(self, version, step=None):
         self.version = version
+        self.step = step if step is not None else (2 if version == 2 else 1)
 
     def raise_for_status(self):
         return None
 
     def json(self):
-        step = 2 if self.version == 2 else 1
+        step = self.step
         return {
             "version": self.version,
             "transport": (
@@ -42,8 +43,9 @@ class _ManifestProbeClient:
     requests = []
     delay = 0.0
 
-    def __init__(self, version):
+    def __init__(self, version, step=None):
         self.version = version
+        self.step = step
 
     async def __aenter__(self):
         return self
@@ -55,7 +57,7 @@ class _ManifestProbeClient:
         self.requests.append(_kwargs["timeout"])
         if self.delay:
             await asyncio.sleep(self.delay)
-        return _ManifestProbeResponse(self.version)
+        return _ManifestProbeResponse(self.version, self.step)
 
 
 def _adapter_identity(step=1):
@@ -68,7 +70,7 @@ def _adapter_identity(step=1):
     }
 
 
-def _load_stage_function(probe_version=1):
+def _load_stage_function(probe_version=1, probe_step=None):
     source = CLIENT_PATH.read_text(encoding="utf-8")
     tree = ast.parse(source)
     function = next(
@@ -92,7 +94,9 @@ def _load_stage_function(probe_version=1):
             "ProbeHttpx",
             (),
             {
-                "AsyncClient": lambda *_args, **_kwargs: _ManifestProbeClient(probe_version),
+                "AsyncClient": lambda *_args, **_kwargs: _ManifestProbeClient(
+                    probe_version, probe_step
+                ),
                 "HTTPError": httpx.HTTPError,
                 "Timeout": httpx.Timeout,
             },
@@ -572,6 +576,40 @@ class StageLoraAdapterTest(unittest.TestCase):
         self.assertEqual(len(_ManifestProbeClient.requests), 1)
         self.assertGreater(_ManifestProbeClient.requests[0].read, 10.0)
         self.assertLessEqual(_ManifestProbeClient.requests[0].read, 30.0)
+
+    def test_manifest_probe_uses_selected_policy_step_limit(self):
+        for policy_step, expected_limit in ((2, 600.0), (3, 300.0)):
+            with self.subTest(policy_step=policy_step):
+                _ManifestProbeClient.requests.clear()
+                stage_lora_adapter, namespace = _load_stage_function(
+                    probe_version=2, probe_step=policy_step
+                )
+                namespace["_delta_stage_timeout_s"] = lambda: 900.0
+
+                class Response:
+                    def json(self):
+                        return {
+                            "status": "ok",
+                            "stage_seconds": 0.0,
+                            "adapter_identity": _adapter_identity(policy_step),
+                        }
+
+                async def fake_admin_post_response(_client, _path, **_kwargs):
+                    return Response()
+
+                namespace["_admin_post_response"] = fake_admin_post_response
+                client = httpx.AsyncClient(base_url="http://127.0.0.1:8000")
+                asyncio.run(
+                    stage_lora_adapter(
+                        [client],
+                        f"http://adapter/step_{policy_step}",
+                        require_delta=True,
+                        policy_step=policy_step,
+                    )
+                )
+                self.assertEqual(len(_ManifestProbeClient.requests), 1)
+                self.assertGreater(_ManifestProbeClient.requests[0].read, expected_limit - 0.01)
+                self.assertLessEqual(_ManifestProbeClient.requests[0].read, expected_limit)
 
     def test_slow_manifest_probe_cannot_outlive_delta_deadline(self):
         _ManifestProbeClient.delay = 1.0
