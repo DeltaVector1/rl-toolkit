@@ -9,6 +9,7 @@ import json
 import math
 import os
 import socketserver
+import subprocess
 import sys
 import tempfile
 import threading
@@ -1353,6 +1354,22 @@ class AdapterTransportStateTest(unittest.TestCase):
         glm_source = (runtime / "start_inference.sh").read_text(encoding="utf-8")
         self.assertIn("PRIME_LORA_DOWNLOAD_STREAMS=24", glm_source)
         self.assertIn('PRIME_LORA_SOURCE_PORTS="$lora_source_port_list"', glm_source)
+        source_generator = glm_source.split(
+            'runtime_output=$(python3 - "$deployment/configs/nodes.toml" "$engine_host" <<\'PY\'\n',
+            1,
+        )[1].split("\nPY\n", 1)[0]
+        source_result = subprocess.run(
+            [sys.executable, "-", str(nodes), "h200a"],
+            input=source_generator,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        generated_ports = [
+            int(value) for value in source_result.stdout.splitlines()[0].split(",")
+        ]
+        self.assertEqual(generated_ports[:24], list(range(18100, 18196, 4)))
+        self.assertEqual(sorted(generated_ports), list(range(18100, 18196)))
         orchestrator_source = (
             REPOSITORY / "training_ops/runtime/h200/start_orchestrator.sh"
         ).read_text(encoding="utf-8")

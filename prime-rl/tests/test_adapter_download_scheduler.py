@@ -362,6 +362,60 @@ class DownloadSchedulerTest(unittest.TestCase):
         ])
         self.assertTrue(all(0 < call[1] <= 15 for call in calls))
 
+    def test_range_retry_wraps_to_a_distinct_tunnel_group(self):
+        filesystem = load_filesystem_module()
+        payload = b"chunk"
+        source_urls = [
+            f"http://127.0.0.1:{port}/chunk"
+            for lane_offset in range(4)
+            for port in range(18100 + lane_offset, 18196, 4)
+        ]
+        calls = []
+
+        class Response(io.BytesIO):
+            status = 206
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        def fake_urlopen(request, **_kwargs):
+            calls.append(request.full_url)
+            if len(calls) == 1:
+                raise OSError("first tunnel is unavailable")
+            return Response(payload)
+
+        old_urlopen = filesystem.urllib.request.urlopen
+        old_sleep = filesystem.time.sleep
+        filesystem.urllib.request.urlopen = fake_urlopen
+        filesystem.time.sleep = lambda _seconds: None
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                parent = Path(temporary)
+                parent_fd = filesystem.os.open(parent, filesystem.os.O_RDONLY)
+                try:
+                    filesystem._download_range(
+                        source_urls,
+                        23,
+                        parent / "chunk",
+                        parent_fd,
+                        0,
+                        len(payload) - 1,
+                    )
+                finally:
+                    filesystem.os.close(parent_fd)
+        finally:
+            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem.time.sleep = old_sleep
+
+        self.assertEqual(calls, [source_urls[23], source_urls[24]])
+        self.assertEqual(
+            [(int(url.split(":")[2].split("/", 1)[0]) - 18100) // 4 for url in calls],
+            [23, 0],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

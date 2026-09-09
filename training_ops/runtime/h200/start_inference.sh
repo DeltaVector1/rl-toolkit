@@ -24,7 +24,15 @@ first = ports["lora_source_first"]
 last = ports["lora_source_last"]
 if not isinstance(first, int) or not isinstance(last, int) or first < 1 or last < first:
     raise SystemExit("invalid lora source port range")
-print(",".join(str(port) for port in range(first, last + 1)))
+# The orchestrator groups four consecutive source ports per SSH tunnel. Keep
+# the first 24 worker lanes on one port from each tunnel.
+lane_size = 4
+source_ports = [
+    port
+    for lane_offset in range(lane_size)
+    for port in range(first + lane_offset, last + 1, lane_size)
+]
+print(",".join(str(port) for port in source_ports))
 cache_dir = config["paths"].get("adapter_cache")
 if not isinstance(cache_dir, str) or not cache_dir.startswith("/"):
     raise SystemExit("paths.adapter_cache is missing")
