@@ -34,7 +34,7 @@ def adapter_cache_path(source_url: str) -> Path:
 _PARALLEL_DOWNLOAD_THRESHOLD = 16 * 1024 * 1024
 _DOWNLOAD_STREAMS_ENV = "PRIME_LORA_DOWNLOAD_STREAMS"
 _MAX_DOWNLOAD_STREAMS = 128
-_FULL_DOWNLOAD_STREAMS = 96
+full_download_streams = 96
 default_delta_stage_timeout_s = 900.0
 _ADAPTER_FILES = ("adapter_config.json", "adapter_model.safetensors")
 _ADAPTER_MANIFEST = "adapter_manifest.json"
@@ -3561,45 +3561,6 @@ def _download_with_parent(
             os.close(parts_fd)
 
 
-def _download_full_adapter_file(
-    source_url: str,
-    destination: Path,
-    *,
-    expected_size: int | None = None,
-    expected_sha256: str | None = None,
-    progress=None,
-    deadline: float | None = None,
-    cancel_event: threading.Event | None = None,
-    per_request_timeout_seconds: float | None = None,
-    retry_http_statuses: set[int] | None = None,
-) -> None:
-    """Download one full adapter file with the dedicated full-copy cap."""
-    destination = Path(destination)
-    _reject_symlink_path(destination, "adapter download destination")
-    parent_fd = _open_directory_nofollow(
-        destination.parent,
-        create=False,
-        label="adapter download parent",
-    )
-    try:
-        return _download_with_parent(
-            source_url,
-            destination,
-            expected_size=expected_size,
-            expected_sha256=expected_sha256,
-            progress=progress,
-            parallel_ranges=True,
-            deadline=deadline,
-            cancel_event=cancel_event,
-            per_request_timeout_seconds=per_request_timeout_seconds,
-            retry_http_statuses=retry_http_statuses,
-            stream_cap=_FULL_DOWNLOAD_STREAMS,
-            parent_fd=parent_fd,
-        )
-    finally:
-        os.close(parent_fd)
-
-
 def _download_checkpoint_entry(
     source_url: str,
     destination: Path,
@@ -3942,29 +3903,41 @@ def stage_lora_adapter_files(
             _reject_symlink_path(temporary, "adapter partial directory")
             _ensure_directory(temporary, "adapter partial directory")
             _write_json(temporary / "manifest.json", manifest)
-            for filename in _ADAPTER_FILES:
-                item = files[filename]
-                assert isinstance(item, dict)
-                expected_sha256 = item.get("sha256")
-                _download_full_adapter_file(
-                    f"{source_url.rstrip('/')}/{filename}",
-                    temporary / filename,
-                    expected_size=int(item["size"]),
-                    expected_sha256=expected_sha256 if isinstance(expected_sha256, str) else None,
-                    progress=report,
-                    cancel_event=cancel_event,
-                )
-                if expected_sha256 is None:
-                    item["sha256"] = _sha256(
-                        temporary / filename,
+            temporary_fd = _open_directory_nofollow(
+                temporary,
+                create=False,
+                label="adapter partial directory",
+            )
+            try:
+                for filename in _ADAPTER_FILES:
+                    item = files[filename]
+                    assert isinstance(item, dict)
+                    expected_sha256 = item.get("sha256")
+                    destination_path = temporary / filename
+                    _reject_symlink_path(destination_path, "adapter download destination")
+                    _download_with_parent(
+                        f"{source_url.rstrip('/')}/{filename}",
+                        destination_path,
+                        expected_size=int(item["size"]),
+                        expected_sha256=expected_sha256 if isinstance(expected_sha256, str) else None,
+                        progress=report,
                         cancel_event=cancel_event,
+                        stream_cap=full_download_streams,
+                        parent_fd=temporary_fd,
                     )
-                progress_bytes = 0
-                for name in _ADAPTER_FILES:
-                    path = temporary / name
-                    _reject_symlink_path(path, "adapter file")
-                    if _path_regular_size(path, "adapter file") == int(files[name]["size"]):
-                        progress_bytes += int(files[name]["size"])
+                    if expected_sha256 is None:
+                        item["sha256"] = _sha256(
+                            destination_path,
+                            cancel_event=cancel_event,
+                        )
+                    progress_bytes = 0
+                    for name in _ADAPTER_FILES:
+                        path = temporary / name
+                        _reject_symlink_path(path, "adapter file")
+                        if _path_regular_size(path, "adapter file") == int(files[name]["size"]):
+                            progress_bytes += int(files[name]["size"])
+            finally:
+                os.close(temporary_fd)
             _write_json(temporary / "manifest.json", manifest)
             source_transport_manifest = transport.get("source_manifest") if isinstance(transport, dict) else None
             if not isinstance(source_transport_manifest, dict):

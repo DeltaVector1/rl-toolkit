@@ -253,7 +253,7 @@ class DownloadSchedulerTest(unittest.TestCase):
         self.assertEqual(workers, [2])
         self.assertEqual(len(calls), 2)
 
-    def test_full_download_uses_96_workers_with_96_source_urls(self):
+    def test_full_and_global_download_worker_caps(self):
         filesystem = load_filesystem_module()
         payload = b"x" * (16 * 1024 * 1024)
         source_urls = [f"http://lane-{index}/adapter" for index in range(96)]
@@ -270,72 +270,13 @@ class DownloadSchedulerTest(unittest.TestCase):
                 self.close()
 
         def fake_urlopen(request, timeout):
-            value = request.headers["Range"]
+            value = request.headers.get("Range")
+            if value is None:
+                return Response(payload)
             start, end = (int(part) for part in value.removeprefix("bytes=").split("-"))
             calls.append(request.full_url)
             self.assertGreater(timeout, 0)
             return Response(payload[start : end + 1])
-
-        real_executor = filesystem.ThreadPoolExecutor
-
-        class RecordingExecutor:
-            def __init__(self, max_workers):
-                workers.append(max_workers)
-                self.executor = real_executor(max_workers=max_workers)
-
-            def submit(self, *args, **kwargs):
-                return self.executor.submit(*args, **kwargs)
-
-            def shutdown(self, *args, **kwargs):
-                return self.executor.shutdown(*args, **kwargs)
-
-        old_urlopen = filesystem.urllib.request.urlopen
-        old_executor = filesystem.ThreadPoolExecutor
-        old_lanes = filesystem._adapter_source_urls
-        old_streams = filesystem._configured_download_streams
-        filesystem.urllib.request.urlopen = fake_urlopen
-        filesystem.ThreadPoolExecutor = RecordingExecutor
-        filesystem._adapter_source_urls = lambda _source: source_urls
-        filesystem._configured_download_streams = lambda: 48
-        try:
-            with tempfile.TemporaryDirectory() as temporary:
-                destination = Path(temporary) / "adapter"
-                filesystem._download_full_adapter_file(
-                    source_urls[0],
-                    destination,
-                    expected_size=len(payload),
-                    expected_sha256=hashlib.sha256(payload).hexdigest(),
-                )
-                self.assertEqual(destination.read_bytes(), payload)
-        finally:
-            filesystem.urllib.request.urlopen = old_urlopen
-            filesystem.ThreadPoolExecutor = old_executor
-            filesystem._adapter_source_urls = old_lanes
-            filesystem._configured_download_streams = old_streams
-
-        self.assertEqual(workers, [96])
-        self.assertEqual(len(calls), 96)
-        self.assertEqual(set(calls), set(source_urls))
-
-    def test_full_download_caps_workers_to_file_size_and_source_urls(self):
-        filesystem = load_filesystem_module()
-        workers = []
-
-        class Response(io.BytesIO):
-            status = 206
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                self.close()
-
-        def fake_urlopen(request, **_kwargs):
-            value = request.headers.get("Range")
-            if value is None:
-                return Response(b"")
-            start, end = (int(part) for part in value.removeprefix("bytes=").split("-"))
-            return Response(b"x" * (end - start + 1))
 
         real_executor = filesystem.ThreadPoolExecutor
 
@@ -358,39 +299,78 @@ class DownloadSchedulerTest(unittest.TestCase):
         filesystem.urllib.request.urlopen = fake_urlopen
         filesystem.ThreadPoolExecutor = RecordingExecutor
         filesystem._PARALLEL_DOWNLOAD_THRESHOLD = 0
-        filesystem._adapter_source_urls = lambda _source: [
-            "http://lane-0/adapter",
-            "http://lane-1/adapter",
-            "http://lane-2/adapter",
-        ]
+        filesystem._adapter_source_urls = lambda _source: source_urls
         filesystem._configured_download_streams = lambda: 48
+
+        def run_download(source_url, destination, expected, stream_cap=None):
+            parent_fd = filesystem._open_directory_nofollow(
+                destination.parent,
+                create=False,
+                label="test download parent",
+            )
+            try:
+                filesystem._download_with_parent(
+                    source_url,
+                    destination,
+                    expected_size=len(expected),
+                    expected_sha256=hashlib.sha256(expected).hexdigest(),
+                    stream_cap=stream_cap,
+                    parent_fd=parent_fd,
+                )
+            finally:
+                filesystem.os.close(parent_fd)
+
         try:
             with tempfile.TemporaryDirectory() as temporary:
-                destination = Path(temporary) / "adapter"
-                filesystem._download_full_adapter_file(
-                    "http://lane-0/adapter",
-                    destination,
-                    expected_size=5,
-                    expected_sha256=hashlib.sha256(b"xxxxx").hexdigest(),
+                root = Path(temporary)
+                full = root / "full"
+                run_download(
+                    source_urls[0],
+                    full,
+                    payload,
+                    stream_cap=filesystem.full_download_streams,
                 )
-                self.assertEqual(destination.read_bytes(), b"xxxxx")
+                self.assertEqual(full.read_bytes(), payload)
+                self.assertEqual(workers, [96])
+                self.assertEqual(len(calls), 96)
+                self.assertEqual(set(calls), set(source_urls))
 
-                empty = Path(temporary) / "empty"
-                filesystem._download_full_adapter_file(
-                    "http://lane-0/empty",
+                calls.clear()
+                global_copy = root / "global"
+                run_download(source_urls[0], global_copy, payload)
+                self.assertEqual(global_copy.read_bytes(), payload)
+                self.assertEqual(workers, [96, 48])
+                self.assertEqual(len(calls), 48)
+
+                source_urls = source_urls[:3]
+                payload = b"xxxxx"
+                calls.clear()
+                small = root / "small"
+                run_download(
+                    source_urls[0],
+                    small,
+                    payload,
+                    stream_cap=filesystem.full_download_streams,
+                )
+                self.assertEqual(small.read_bytes(), payload)
+                self.assertEqual(workers, [96, 48, 3])
+                self.assertEqual(len(calls), 3)
+
+                empty = root / "empty"
+                run_download(
+                    source_urls[0],
                     empty,
-                    expected_size=0,
-                    expected_sha256=hashlib.sha256(b"").hexdigest(),
+                    b"",
+                    stream_cap=filesystem.full_download_streams,
                 )
                 self.assertEqual(empty.read_bytes(), b"")
+                self.assertEqual(workers, [96, 48, 3])
         finally:
             filesystem.urllib.request.urlopen = old_urlopen
             filesystem.ThreadPoolExecutor = old_executor
             filesystem._PARALLEL_DOWNLOAD_THRESHOLD = old_threshold
             filesystem._adapter_source_urls = old_lanes
             filesystem._configured_download_streams = old_streams
-
-        self.assertEqual(workers, [3])
 
     def test_parallel_download_resumes_parts_and_removes_private_files(self):
         filesystem = load_filesystem_module()
