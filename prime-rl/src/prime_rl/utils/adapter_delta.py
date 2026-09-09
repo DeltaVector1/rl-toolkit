@@ -675,13 +675,8 @@ def _atomic_write(path: Path, value: bytes) -> None:
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.partial")
-    with temporary.open("w", encoding="utf-8") as output:
-        json.dump(value, output, separators=(",", ":"))
-        output.write("\n")
-        output.flush()
-        os.fsync(output.fileno())
-    os.replace(temporary, path)
+    encoded = json.dumps(value, separators=(",", ":")).encode("utf-8") + b"\n"
+    _atomic_write(path, encoded)
 
 
 def _remove_transport_chunks(directory: Path) -> None:
@@ -716,26 +711,9 @@ def _write_encoded_chunks(
     target = target_path.open("rb")
     base = base_path.open("rb") if base_path is not None else None
     base2 = base2_path.open("rb") if base2_path is not None else None
-    readers = (
-        ("target", target, target_path),
-        ("base", base, base_path),
-        ("base2", base2, base2_path),
-    )
-    digest_by_identity: dict[tuple[int, int], Any] = {}
-    digest_owner_by_identity: dict[tuple[int, int], str] = {}
-    digest_owner: dict[str, bool] = {}
-    digests: dict[str, Any] = {}
-    for name, source, path in readers:
-        if source is None or path is None:
-            continue
-        identity = os.fstat(source.fileno())
-        key = (identity.st_dev, identity.st_ino)
-        digest = digest_by_identity.get(key)
-        if digest is None:
-            digest = hashlib.sha256()
-            digest_by_identity[key] = digest
-        digests[name] = digest
-        digest_owner[name] = digest_owner_by_identity.setdefault(key, name) == name
+    target_digest = hashlib.sha256()
+    base_digest = hashlib.sha256() if base is not None else None
+    base2_digest = hashlib.sha256() if base2 is not None else None
 
     def save_chunk(index: int, raw: bytes, payload: bytes, offset: int, raw_size: int) -> None:
         name = f"{target_path.name}.transport-{mode}-{index:06d}"
@@ -770,18 +748,17 @@ def _write_encoded_chunks(
                 target_chunk = target.read(end - start)
                 if len(target_chunk) != end - start:
                     raise OSError(f"adapter file ended early: {target_path.name}")
-                if digest_owner["target"]:
-                    digests["target"].update(target_chunk)
+                target_digest.update(target_chunk)
                 base_chunk = base.read(end - start) if base is not None else None
                 if base is not None and len(base_chunk) != end - start:
                     raise OSError(f"base adapter file ended early: {base_path.name}")
-                if base is not None and digest_owner["base"]:
-                    digests["base"].update(base_chunk)
+                if base is not None:
+                    base_digest.update(base_chunk)
                 base2_chunk = base2.read(end - start) if base2 is not None else None
                 if base2 is not None and len(base2_chunk) != end - start:
                     raise OSError(f"second base adapter file ended early: {base2_path.name}")
-                if base2 is not None and digest_owner["base2"]:
-                    digests["base2"].update(base2_chunk)
+                if base2 is not None:
+                    base2_digest.update(base2_chunk)
                 if mode == "delta":
                     assert base_chunk is not None
                     pending[index] = pool.submit(_encode_delta_chunk, base_chunk, target_chunk)
@@ -820,9 +797,9 @@ def _write_encoded_chunks(
     return (
         chunks,
         written_size,
-        digests["target"].hexdigest(),
-        digests["base"].hexdigest() if base is not None else None,
-        digests["base2"].hexdigest() if base2 is not None else None,
+        target_digest.hexdigest(),
+        base_digest.hexdigest() if base_digest is not None else None,
+        base2_digest.hexdigest() if base2_digest is not None else None,
     )
 
 
@@ -1023,8 +1000,6 @@ def publish_adapter_manifest(
         )
     if base_dir is not None:
         manifest["base_size"] = (base_dir / adapter_weights_name).stat().st_size
-        if base_weights_sha256 is None:
-            base_weights_sha256 = sha256_file(base_dir / adapter_weights_name)
         manifest["base_sha256"] = base_weights_sha256
         base_config = base_dir / adapter_config_name
         if base_config.is_file():
@@ -1032,8 +1007,6 @@ def publish_adapter_manifest(
     if selected_mode == "predictive" and base2_dir is not None:
         base2_weights = base2_dir / adapter_weights_name
         manifest["base2_size"] = base2_weights.stat().st_size
-        if base2_weights_sha256 is None:
-            base2_weights_sha256 = sha256_file(base2_weights)
         manifest["base2_sha256"] = base2_weights_sha256
         base2_config = base2_dir / adapter_config_name
         manifest["base2_config_size"] = base2_config.stat().st_size

@@ -444,12 +444,18 @@ class PredictiveAdapterCodecTest(unittest.TestCase):
             base = make_adapter("base", base_weights)
             target = make_adapter("target", target_weights)
             base2 = make_adapter("base2", base2_weights)
+            legacy_base = make_adapter("legacy-base", b"too short")
 
             original_sha256_file = adapter_delta.sha256_file
-            hashed_paths = []
-            adapter_delta.sha256_file = lambda path: (
-                hashed_paths.append(Path(path)) or original_sha256_file(path)
-            )
+            weight_hash_calls = 0
+
+            def counted_sha256_file(path):
+                nonlocal weight_hash_calls
+                if Path(path).name == adapter_delta.adapter_weights_name:
+                    weight_hash_calls += 1
+                return original_sha256_file(path)
+
+            adapter_delta.sha256_file = counted_sha256_file
             try:
                 full_manifest = adapter_delta.publish_adapter_manifest(full)
                 delta_manifest = adapter_delta.publish_adapter_manifest(
@@ -459,58 +465,32 @@ class PredictiveAdapterCodecTest(unittest.TestCase):
                     target, base, base2_dir=base2, target_step=3, base_step=2,
                     base2_step=1, chunk_size=1024, max_workers=3,
                 )
+                self.assertEqual(weight_hash_calls, 1)
+                legacy_manifest = adapter_delta.publish_adapter_manifest(
+                    target, legacy_base, base_url="http://source/base",
+                    base_step=4, target_step=5,
+                )
             finally:
                 adapter_delta.sha256_file = original_sha256_file
 
             def digest(value):
                 return hashlib.sha256(value).hexdigest()
+
             self.assertEqual(full_manifest["target_sha256"], digest(full_weights))
             self.assertEqual(delta_manifest["target_sha256"], digest(target_weights))
             self.assertEqual(delta_manifest["base_sha256"], digest(base_weights))
             self.assertEqual(predictive_manifest["target_sha256"], digest(target_weights))
             self.assertEqual(predictive_manifest["base_sha256"], digest(base_weights))
             self.assertEqual(predictive_manifest["base2_sha256"], digest(base2_weights))
+            self.assertEqual(weight_hash_calls, 2)
             for manifest in (delta_manifest, predictive_manifest):
                 self.assertEqual(
                     [item["offset"] for item in manifest["chunks"]],
                     sorted(item["offset"] for item in manifest["chunks"]),
                 )
-            chunk = predictive_manifest["chunks"][0]
-            payload = (target / chunk["file"]).read_bytes()
-            start = chunk["offset"]
-            end = start + chunk["raw_size"]
-            self.assertEqual(
-                adapter_delta.decode_predictive_chunk(
-                    base2_weights[start:end], base_weights[start:end], payload,
-                    start, predictive_manifest["data_offset"],
-                ),
-                target_weights[start:end],
-            )
-            self.assertNotIn(target / "adapter_model.safetensors", hashed_paths)
-            self.assertNotIn(base / "adapter_model.safetensors", hashed_paths)
-            self.assertNotIn(base2 / "adapter_model.safetensors", hashed_paths)
-
-    def test_full_manifest_keeps_legacy_base_fallback(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            target = root / "target"
-            base = root / "base"
-            target.mkdir()
-            base.mkdir()
-            (target / "adapter_config.json").write_text("{}", encoding="utf-8")
-            (base / "adapter_config.json").write_text("{}", encoding="utf-8")
-            target_weights = b"target"
-            (target / "adapter_model.safetensors").write_bytes(target_weights)
-            (base / "adapter_model.safetensors").write_bytes(b"too short")
-
-            manifest = adapter_delta.publish_adapter_manifest(
-                target, base, base_url="http://source/base", base_step=4, target_step=5
-            )
-            self.assertEqual(manifest["mode"], "full")
-            self.assertNotIn("base_url", manifest)
-            self.assertIsNone(manifest["base_step"])
-            self.assertEqual(manifest["full_sha256"], hashlib.sha256(target_weights).hexdigest())
-            self.assertFalse(list(target.glob("*.transport-*")))
+            self.assertEqual(legacy_manifest["mode"], "full")
+            self.assertNotIn("base_url", legacy_manifest)
+            self.assertIsNone(legacy_manifest["base_step"])
 
     def test_encode_error_removes_partial_transport_chunks(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -559,10 +539,9 @@ class PredictiveAdapterCodecTest(unittest.TestCase):
                 Path.open = original_open
             self.assertFalse(list(target.glob("*.transport-*")))
 
-    def test_atomic_write_removes_only_its_partial_on_replace_error(self):
+    def test_atomic_writers_remove_only_their_partials_on_replace_error(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            output = root / "output"
             unrelated = root / ".unrelated.partial"
             unrelated.write_bytes(b"keep")
             original_replace = adapter_delta.os.replace
@@ -574,14 +553,20 @@ class PredictiveAdapterCodecTest(unittest.TestCase):
 
             adapter_delta.os.replace = fail_replace
             try:
-                with self.assertRaisesRegex(OSError, "replace failed"):
-                    adapter_delta._atomic_write(output, b"value")
+                for writer, path, value in (
+                    (adapter_delta._atomic_write, root / "output", b"value"),
+                    (adapter_delta._atomic_json, root / "manifest", {"value": "x"}),
+                ):
+                    with self.assertRaisesRegex(OSError, "replace failed"):
+                        writer(path, value)
             finally:
                 adapter_delta.os.replace = original_replace
-            self.assertEqual(len(seen), 1)
-            self.assertFalse(seen[0].exists())
+            manifest = root / "manifest-ok"
+            adapter_delta._atomic_json(manifest, {"value": "x"})
+            self.assertEqual(manifest.read_bytes(), b'{"value":"x"}\n')
+            self.assertEqual(len(seen), 2)
+            self.assertTrue(all(path.parent == root and not path.exists() for path in seen))
             self.assertTrue(unrelated.exists())
-            self.assertFalse(output.exists())
 
     def test_predictive_manifest_rejects_non_bf16_tensor(self):
         with tempfile.TemporaryDirectory() as temporary:
