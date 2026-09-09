@@ -329,6 +329,19 @@ class AdapterUpdateTest(unittest.TestCase):
             training_ops._validate_adapter_stage_log(current),
             "Policy update 4 failed on attempt 3/3; stopping",
         )
+        one_attempt = (
+            "Policy update 4 failed on attempt 1/1; stopping\n"
+            "TimeoutError: adapter delta staging exceeded its time limit"
+        )
+        self.assertEqual(
+            training_ops._validate_adapter_stage_log(one_attempt),
+            "Policy update 4 failed on attempt 1/1; stopping",
+        )
+        with self.assertRaises(training_ops.Refused):
+            training_ops._validate_adapter_stage_log(
+                "Policy update 4 failed on attempt 1/3; retrying\n"
+                "TimeoutError: adapter delta staging exceeded its time limit"
+            )
         with self.assertRaises(training_ops.Refused):
             training_ops._validate_adapter_stage_log(
                 "Failed to apply policy update 4\nadapter request failed"
@@ -616,6 +629,21 @@ class AdapterUpdateTest(unittest.TestCase):
         )
         self.assertIn(
             mock.call(
+                "prime-rl/src/prime_rl/inference/vllm/server.py",
+                nodes=["h200a", "h200b"],
+            ),
+            deploy.call_args_list,
+        )
+        for path in (
+            "prime-rl/src/prime_rl/orchestrator/orchestrator.py",
+            "prime-rl/src/prime_rl/orchestrator/watcher.py",
+        ):
+            self.assertIn(
+                mock.call(path, nodes=["h200a"]),
+                deploy.call_args_list,
+            )
+        self.assertIn(
+            mock.call(
                 "prime-rl/src/prime_rl/inference/relay.py",
                 nodes=["h200a"],
             ),
@@ -635,7 +663,7 @@ class AdapterUpdateTest(unittest.TestCase):
             ),
             deploy.call_args_list,
         )
-        self.assertEqual(deploy.call_count, 6)
+        self.assertEqual(deploy.call_count, 9)
 
     def test_stopped_status_refuses_if_container_is_running(self):
         before = training_ops.Status(
@@ -859,7 +887,7 @@ class AdapterUpdateTest(unittest.TestCase):
             {call.args[0] for call in restart_script.call_args_list},
             {"glm52-decensor-h200"},
         )
-        self.assertEqual(deploy.call_count, 6)
+        self.assertEqual(deploy.call_count, 9)
 
     def test_prefetch_script_only_signals_exact_curl_or_timeout(self):
         script = training_ops._adapter_prefetch_stop_script(

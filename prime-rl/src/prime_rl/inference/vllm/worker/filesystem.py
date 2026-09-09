@@ -3763,6 +3763,7 @@ def stage_lora_adapter_files(
                                 "bytes_done": 0,
                                 "bytes_total": 0,
                                 "updated_at": time.time(),
+                                "elapsed_seconds": round(time.monotonic() - started, 3),
                             },
                         )
                         _cleanup_retired_adapters(destination.parent, destination.name)
@@ -3818,6 +3819,7 @@ def stage_lora_adapter_files(
                             "bytes_done": sum(int(item["size"]) for item in files.values()),
                             "bytes_total": sum(int(item["size"]) for item in files.values()),
                             "updated_at": time.time(),
+                            "elapsed_seconds": round(time.monotonic() - started, 3),
                         },
                     )
                     _cleanup_retired_adapters(destination.parent, destination.name)

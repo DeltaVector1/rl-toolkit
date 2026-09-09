@@ -1685,6 +1685,7 @@ class AdapterTransportStateTest(unittest.TestCase):
                 self.assertTrue((destination / "relay_manifest.json").is_file())
                 self.assertTrue((destination / "transport-chunks" / "chunk-0").is_file())
                 self.assertTrue((destination / "transport-chunks" / "chunk-1").is_file())
+                self.assertGreaterEqual(filesystem.adapter_stage_status()["elapsed_seconds"], 0.0)
                 resumed = downloaded[len(downloaded_after_failure) :]
                 self.assertFalse(any("chunk-0" in name for name in resumed))
                 self.assertTrue(any("chunk-1" in name for name in resumed))

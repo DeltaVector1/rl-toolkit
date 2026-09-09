@@ -3280,7 +3280,7 @@ def _validate_adapter_stage_log(log: str) -> str:
     """Require a current adapter transfer failure, not a generic error."""
     failures = list(
         re.finditer(
-            r"(?:Failed to apply policy update \d+|Policy update \d+ failed on attempt 3/3; stopping)",
+            r"(?:Failed to apply policy update \d+|Policy update \d+ failed on attempt (?P<attempt>\d+)/(?P=attempt); stopping)",
             log,
         )
     )
@@ -4025,10 +4025,13 @@ def _repair_adapter_update() -> str:
 
     deployment_targets = (
         ("prime-rl/src/prime_rl/utils/client.py", None),
+        ("prime-rl/src/prime_rl/inference/vllm/server.py", inference_hosts),
         (
             "prime-rl/src/prime_rl/inference/vllm/worker/filesystem.py",
             inference_hosts,
         ),
+        ("prime-rl/src/prime_rl/orchestrator/orchestrator.py", [orchestrator_host]),
+        ("prime-rl/src/prime_rl/orchestrator/watcher.py", [orchestrator_host]),
         ("prime-rl/src/prime_rl/utils/checkpoint_delta.py", inference_hosts),
         ("prime-rl/src/prime_rl/inference/relay.py", [orchestrator_host]),
         ("training_ops/runtime/h200/start_orchestrator.sh", [orchestrator_host]),
