@@ -34,6 +34,7 @@ def adapter_cache_path(source_url: str) -> Path:
 _PARALLEL_DOWNLOAD_THRESHOLD = 16 * 1024 * 1024
 _DOWNLOAD_STREAMS_ENV = "PRIME_LORA_DOWNLOAD_STREAMS"
 _MAX_DOWNLOAD_STREAMS = 128
+_FULL_DOWNLOAD_STREAMS = 96
 default_delta_stage_timeout_s = 900.0
 _ADAPTER_FILES = ("adapter_config.json", "adapter_model.safetensors")
 _ADAPTER_MANIFEST = "adapter_manifest.json"
@@ -3251,6 +3252,7 @@ def _download_with_parent(
     cancel_event: threading.Event | None = None,
     per_request_timeout_seconds: float | None = None,
     retry_http_statuses: set[int] | None = None,
+    stream_cap: int | None = None,
     parent_fd: int,
 ) -> None:
     _check_deadline(deadline, cancel_event)
@@ -3293,14 +3295,16 @@ def _download_with_parent(
     # link. Adapter fan-out is opt-in and has its own setting.
     adapter_ports = explicit_source_urls or len(source_urls) > 1 or source_urls[0] != source_url
 
-    streams = (
-        min(len(source_urls), _configured_download_streams())
-        if adapter_ports and parallel_ranges
-        else 1
-    )
-    if not adapter_ports and parallel_ranges:
-        streams = _configured_download_streams()
-    if total < _PARALLEL_DOWNLOAD_THRESHOLD or streams == 1:
+    configured_streams = _configured_download_streams() if parallel_ranges else 1
+    if stream_cap is not None and parallel_ranges:
+        streams = min(len(source_urls), stream_cap)
+    elif adapter_ports and parallel_ranges:
+        streams = min(len(source_urls), configured_streams)
+    elif not adapter_ports and parallel_ranges:
+        streams = configured_streams
+    else:
+        streams = 1
+    if total <= 0 or total < _PARALLEL_DOWNLOAD_THRESHOLD or streams == 1:
         # Preserve the old single-file resume path for small metadata files and
         # for an explicitly disabled parallel transfer.
         attempt_limit = (
@@ -3555,6 +3559,45 @@ def _download_with_parent(
     finally:
         if parts_fd >= 0:
             os.close(parts_fd)
+
+
+def _download_full_adapter_file(
+    source_url: str,
+    destination: Path,
+    *,
+    expected_size: int | None = None,
+    expected_sha256: str | None = None,
+    progress=None,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+    per_request_timeout_seconds: float | None = None,
+    retry_http_statuses: set[int] | None = None,
+) -> None:
+    """Download one full adapter file with the dedicated full-copy cap."""
+    destination = Path(destination)
+    _reject_symlink_path(destination, "adapter download destination")
+    parent_fd = _open_directory_nofollow(
+        destination.parent,
+        create=False,
+        label="adapter download parent",
+    )
+    try:
+        return _download_with_parent(
+            source_url,
+            destination,
+            expected_size=expected_size,
+            expected_sha256=expected_sha256,
+            progress=progress,
+            parallel_ranges=True,
+            deadline=deadline,
+            cancel_event=cancel_event,
+            per_request_timeout_seconds=per_request_timeout_seconds,
+            retry_http_statuses=retry_http_statuses,
+            stream_cap=_FULL_DOWNLOAD_STREAMS,
+            parent_fd=parent_fd,
+        )
+    finally:
+        os.close(parent_fd)
 
 
 def _download_checkpoint_entry(
@@ -3903,7 +3946,7 @@ def stage_lora_adapter_files(
                 item = files[filename]
                 assert isinstance(item, dict)
                 expected_sha256 = item.get("sha256")
-                download(
+                _download_full_adapter_file(
                     f"{source_url.rstrip('/')}/{filename}",
                     temporary / filename,
                     expected_size=int(item["size"]),
