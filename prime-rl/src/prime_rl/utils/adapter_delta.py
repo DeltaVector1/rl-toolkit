@@ -433,7 +433,7 @@ def _predictive_payload_parts(payload: bytes) -> tuple[tuple[int, ...], bytes, b
     if raw_size > _predictive_max_raw_size or unit_count > raw_size or nonzero_count > unit_count:
         raise ValueError("predictive payload counts are outside the permitted range")
     mask_size, values_size = header[-2:]
-    if mask_size <= 0 or values_size <= 0:
+    if mask_size <= 0 or (values_size <= 0 and nonzero_count != 0):
         raise ValueError("predictive payload sections cannot be empty")
     expected_size = _predictive_header_size + mask_size + values_size
     if expected_size != len(payload):
@@ -454,6 +454,18 @@ def _predictive_mask_indices(mask: bytes, count: int, nonzero_count: int) -> np.
     if len(indices) != nonzero_count:
         raise ValueError("predictive mask count is invalid")
     return indices
+
+
+def _predictive_values(values_payload: bytes, nonzero_count: int) -> bytes:
+    maximum_values_size = nonzero_count * _predictive_max_varint_bytes
+    values_size = _decompressed_size(values_payload) if values_payload else 0
+    if values_size < nonzero_count or values_size > maximum_values_size:
+        raise ValueError("predictive values size is outside the permitted range")
+    return (
+        _decompress_bounded(values_payload, values_size, maximum=maximum_values_size)
+        if values_payload
+        else b""
+    )
 
 
 def _decode_predictive_chunk_with_correction(
@@ -479,11 +491,7 @@ def _decode_predictive_chunk_with_correction(
         raise ValueError("predictive unit count does not match the chunk layout")
     mask_size = (unit_count + 7) // 8
     mask = _decompress_bounded(mask_payload, mask_size, maximum=mask_size)
-    maximum_values_size = nonzero_count * _predictive_max_varint_bytes
-    values_size = _decompressed_size(values_payload)
-    if values_size < nonzero_count or values_size > maximum_values_size:
-        raise ValueError("predictive values size is outside the permitted range")
-    values = _decompress_bounded(values_payload, values_size, maximum=maximum_values_size)
+    values = _predictive_values(values_payload, nonzero_count)
     indices = _predictive_mask_indices(mask, unit_count, nonzero_count)
     encoded_values = _decode_leb128_values(values, nonzero_count)
     residual = np.zeros(unit_count, dtype=np.uint32)
@@ -531,11 +539,7 @@ def predictive_raw_sha256(payload: bytes) -> str:
     """Return the digest of the canonical sparse zigzag value stream."""
     header, _, values_payload = _predictive_payload_parts(payload)
     nonzero_count = header[8]
-    values_size = _decompressed_size(values_payload)
-    maximum_values_size = nonzero_count * _predictive_max_varint_bytes
-    if values_size < nonzero_count or values_size > maximum_values_size:
-        raise ValueError("predictive values size is outside the permitted range")
-    values = _decompress_bounded(values_payload, values_size, maximum=maximum_values_size)
+    values = _predictive_values(values_payload, nonzero_count)
     return hashlib.sha256(values).hexdigest()
 
 
@@ -543,11 +547,7 @@ def predictive_correction_bytes(payload: bytes) -> bytes:
     """Return the canonical sparse zigzag bytes from one predictive chunk."""
     header, _, values_payload = _predictive_payload_parts(payload)
     nonzero_count = header[8]
-    values_size = _decompressed_size(values_payload)
-    maximum_values_size = nonzero_count * _predictive_max_varint_bytes
-    if values_size < nonzero_count or values_size > maximum_values_size:
-        raise ValueError("predictive values size is outside the permitted range")
-    return _decompress_bounded(values_payload, values_size, maximum=maximum_values_size)
+    return _predictive_values(values_payload, nonzero_count)
 
 
 def decode_linear_zigzag_sparse_chunk(

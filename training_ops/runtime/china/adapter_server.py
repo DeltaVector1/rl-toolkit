@@ -28,6 +28,9 @@ class UpgradeError(RuntimeError):
     pass
 
 
+_identity_cache: dict[tuple[Path, bool, tuple[tuple[int, int, int, int, int], ...]], dict[str, object]] = {}
+
+
 def _json_object(path: Path, description: str) -> dict[str, object]:
     if path.is_symlink() or not path.is_file():
         raise UpgradeError(f"{description} is missing")
@@ -49,6 +52,37 @@ def _sha256(path: Path) -> str:
     except OSError as exc:
         raise UpgradeError(f"cannot read {path.name}") from exc
     return digest.hexdigest()
+
+
+def _sha256_fd(fd: int, name: str) -> str:
+    digest = hashlib.sha256()
+    offset = 0
+    try:
+        while chunk := os.pread(fd, 16 * 1024 * 1024, offset):
+            digest.update(chunk)
+            offset += len(chunk)
+    except OSError as exc:
+        raise UpgradeError(f"cannot read {name}") from exc
+    return digest.hexdigest()
+
+
+def _stat_identity_from_stat(stat: os.stat_result) -> tuple[int, int, int, int, int]:
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+
+def _stat_identity(path: Path) -> tuple[int, int, int, int, int]:
+    try:
+        stat = path.stat()
+    except OSError as exc:
+        raise UpgradeError(f"cannot stat {path.name}") from exc
+    return _stat_identity_from_stat(stat)
+
+
+def _fd_stat_identity(fd: int) -> tuple[int, int, int, int, int]:
+    try:
+        return _stat_identity_from_stat(os.fstat(fd))
+    except OSError as exc:
+        raise UpgradeError("cannot stat served adapter file") from exc
 
 
 def _file_records(manifest: dict[str, object], description: str) -> dict[str, dict[str, object]]:
@@ -83,6 +117,7 @@ def _identity_from_published_directory(
     step: int,
     *,
     cache: bool,
+    weight_fd: int | None = None,
 ) -> dict[str, object]:
     if directory.is_symlink() or not directory.is_dir():
         raise UpgradeError(f"adapter step {step} directory is missing")
@@ -129,9 +164,6 @@ def _identity_from_published_directory(
         if path.is_symlink() or not path.is_file() or path.stat().st_size != record["size"]:
             raise UpgradeError(f"{description} file is incomplete: {name}")
 
-    actual_config_digest = _sha256(directory / adapter_config_name)
-    if actual_config_digest != records[adapter_config_name]["sha256"]:
-        raise UpgradeError(f"{description} configuration checksum differs")
     digest_path = directory / adapter_digest_name
     if digest_path.is_symlink() or not digest_path.is_file():
         raise UpgradeError(f"{description} weight checksum is missing")
@@ -141,13 +173,48 @@ def _identity_from_published_directory(
         raise UpgradeError(f"{description} weight checksum cannot be read") from exc
     if sidecar_digest != records[adapter_weights_name]["sha256"]:
         raise UpgradeError(f"{description} weight checksum differs")
-    return {
+    opened_weight_stat = _fd_stat_identity(weight_fd) if weight_fd is not None else None
+    identity_path = directory / (".identity.json" if cache else adapter_manifest_name)
+    stat_paths = [
+        directory / adapter_config_name,
+        directory / adapter_weights_name,
+        identity_path,
+        digest_path,
+    ]
+    if not cache:
+        stat_paths.append(directory / stable_name)
+    cache_key = (
+        directory.resolve(),
+        cache,
+        tuple(_stat_identity(path) for path in stat_paths),
+    )
+    if opened_weight_stat is not None and opened_weight_stat != cache_key[2][1]:
+        raise UpgradeError(f"{description} weights changed before validation")
+    cached = _identity_cache.get(cache_key)
+    if cached is not None:
+        return cached.copy()
+
+    actual_config_digest = _sha256(directory / adapter_config_name)
+    if actual_config_digest != records[adapter_config_name]["sha256"]:
+        raise UpgradeError(f"{description} configuration checksum differs")
+    actual_weights_digest = (
+        _sha256_fd(weight_fd, adapter_weights_name)
+        if weight_fd is not None
+        else _sha256(directory / adapter_weights_name)
+    )
+    if actual_weights_digest != records[adapter_weights_name]["sha256"]:
+        raise UpgradeError(f"{description} weight checksum differs")
+    if weight_fd is not None and _fd_stat_identity(weight_fd) != opened_weight_stat:
+        raise UpgradeError(f"{description} weights changed during validation")
+    validated_identity = {
         "step": step,
         "config_size": records[adapter_config_name]["size"],
         "config_sha256": records[adapter_config_name]["sha256"],
         "weights_size": records[adapter_weights_name]["size"],
         "weights_sha256": records[adapter_weights_name]["sha256"],
     }
+    _identity_cache[cache_key] = validated_identity
+    return validated_identity.copy()
 
 
 def _cache_directory(active_run: Path, step: int) -> Path:
@@ -439,18 +506,47 @@ class RangeHandler(SimpleHTTPRequestHandler):
         return path
 
     def send_head(self):
+        source = None
         try:
+            _request_path, pieces = _safe_request_path(self)
             path = self._maybe_upgrade()
+            prefix = self.upgrade_path
+            step_path = None
+            step = None
+            if prefix is not None:
+                prefix_length = len(prefix)
+                if len(pieces) > prefix_length and pieces[:prefix_length] == prefix:
+                    match = step_pattern.fullmatch(pieces[prefix_length])
+                    if match is not None:
+                        step = int(match.group(1))
+                        step_path = Path(self.directory).resolve().joinpath(
+                            *pieces[: prefix_length + 1]
+                        )
+            if not os.path.isdir(path):
+                try:
+                    source = os.fdopen(
+                        os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)),
+                        "rb",
+                    )
+                except OSError:
+                    self.send_error(404)
+                    return None
+            if step_path is not None and step is not None:
+                weight_path = step_path / adapter_weights_name
+                weight_fd = source.fileno() if source is not None and path == weight_path else None
+                _identity_from_published_directory(
+                    step_path,
+                    step,
+                    cache=False,
+                    weight_fd=weight_fd,
+                )
         except UpgradeError as exc:
+            if source is not None:
+                source.close()
             self.send_error(500, str(exc))
             return None
         if os.path.isdir(path):
             return super().send_head()
-        try:
-            source = open(path, "rb")
-        except OSError:
-            self.send_error(404)
-            return None
         size = os.fstat(source.fileno()).st_size
         start, end = 0, size - 1
         if value := self.headers.get("Range"):

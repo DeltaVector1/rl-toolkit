@@ -373,9 +373,17 @@ class PredictiveAdapterCodecTest(unittest.TestCase):
     def test_predictive_chunk_accepts_an_all_zero_residual(self):
         base = safetensor_bytes([0x3F80, 0x4000])
         payload = adapter_delta.encode_predictive_chunk(base, base, base, 0, 16)
+        header = list(adapter_delta._predictive_header.unpack(payload[: adapter_delta._predictive_header_size]))
+        mask_size = header[-2]
+        header[-1] = 0
+        payload = (
+            adapter_delta._predictive_header.pack(*header)
+            + payload[adapter_delta._predictive_header_size : adapter_delta._predictive_header_size + mask_size]
+        )
         restored = adapter_delta.decode_predictive_chunk(base, base, payload, 0, 16)
         self.assertEqual(restored, base)
         self.assertEqual(adapter_delta.predictive_raw_sha256(payload), adapter_delta.hashlib.sha256(b"").hexdigest())
+        self.assertEqual(adapter_delta.predictive_correction_bytes(payload), b"")
 
     def test_predictive_chunk_round_trip_with_millions_of_values(self):
         word_count = 2_000_000
