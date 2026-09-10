@@ -4345,6 +4345,10 @@ def _repair_adapter_update() -> str:
         ("prime-rl/src/prime_rl/utils/client.py", None),
         ("prime-rl/src/prime_rl/inference/vllm/server.py", inference_hosts),
         (
+            "prime-rl/src/prime_rl/inference/vllm/adapter_stage_worker.py",
+            inference_hosts,
+        ),
+        (
             "prime-rl/src/prime_rl/inference/vllm/worker/filesystem.py",
             inference_hosts,
         ),
