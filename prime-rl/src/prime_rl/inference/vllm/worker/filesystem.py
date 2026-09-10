@@ -4647,6 +4647,10 @@ def stage_lora_adapter_files(
         else None
     )
     operation_deadline = delta_deadline or (started + default_delta_stage_timeout_s)
+    status_metadata = {
+        **status_metadata,
+        "operation_timeout_seconds": round(operation_deadline - started, 3),
+    }
     _ensure_directory(destination.parent, "adapter cache directory")
     reconcile_retired_adapter(
         destination,

@@ -484,6 +484,10 @@ class RangeHandler(SimpleHTTPRequestHandler):
         self.source_base_url = source_base_url
         super().__init__(*args, **kwargs)
 
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(30)
+
     def _maybe_upgrade(self):
         path, pieces = _safe_request_path(self)
         if self.upgrade_path is None:
@@ -578,12 +582,15 @@ class RangeHandler(SimpleHTTPRequestHandler):
     def copyfile(self, source, output):
         if not hasattr(self, "remaining"):
             return super().copyfile(source, output)
-        while self.remaining:
-            chunk = source.read(min(self.remaining, 16 * 1024 * 1024))
-            if not chunk:
-                break
-            output.write(chunk)
-            self.remaining -= len(chunk)
+        try:
+            while self.remaining:
+                chunk = source.read(min(self.remaining, 16 * 1024 * 1024))
+                if not chunk:
+                    break
+                output.write(chunk)
+                self.remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            return
 
 
 class AdapterServer(ThreadingHTTPServer):
