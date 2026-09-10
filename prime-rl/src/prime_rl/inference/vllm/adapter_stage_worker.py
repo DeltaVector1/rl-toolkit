@@ -8,6 +8,8 @@ import sys
 
 from prime_rl.inference.vllm.worker.filesystem import stage_lora_adapter_files
 
+_MAX_RESULT_BYTES = 1_000_000
+
 
 def main() -> None:
     stage_id = None
@@ -54,7 +56,19 @@ def main() -> None:
                 "error": str(exc)[:4096],
             }
         )
-    sys.stdout.write(json.dumps(result, separators=(",", ":")))
+    output = json.dumps(result, separators=(",", ":"))
+    if len(output.encode("utf-8")) > _MAX_RESULT_BYTES:
+        output = json.dumps(
+            {
+                "stage_id": stage_id,
+                "pid": os.getpid(),
+                "status": "error",
+                "error_type": "RuntimeError",
+                "error": "adapter stage worker result is too large",
+            },
+            separators=(",", ":"),
+        )
+    sys.stdout.write(output)
     sys.stdout.flush()
 
 

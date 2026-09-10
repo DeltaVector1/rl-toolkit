@@ -58,6 +58,10 @@ _PREDICTIVE_RECONSTRUCT_WORKERS = 32
 _ADAPTER_CHUNK_TIMEOUT_S = float(os.environ.get("PRIME_LORA_CHUNK_TIMEOUT_S", "15"))
 _ADAPTER_CLEANUP_TIMEOUT_S = 30.0
 _ADAPTER_STATUS_INTERVAL_S = float(os.environ.get("PRIME_LORA_STATUS_INTERVAL_S", "1"))
+_ADAPTER_METADATA_MAX_BYTES = 2 * 1024 * 1024
+_ADAPTER_MARKER_MAX_BYTES = 4 * 1024
+_ADAPTER_CLEANUP_ENTRY_LIMIT = 256
+_ADAPTER_CLEANUP_CANDIDATE_LIMIT = 64
 _JSON_LOCK = threading.Lock()
 _adapter_stage_publish_lock = threading.Lock()
 
@@ -290,9 +294,36 @@ def _write_text_entry_atomic(
         raise
 
 
-def _read_bytes_nofollow(path: Path | str, *, dir_fd: int | None = None) -> bytes:
-    with os.fdopen(_open_nofollow(path, os.O_RDONLY, dir_fd=dir_fd), "rb") as source:
-        return source.read()
+def _read_bytes_nofollow(
+    path: Path | str,
+    *,
+    dir_fd: int | None = None,
+    max_bytes: int | None = None,
+) -> bytes:
+    file_descriptor = _open_nofollow(path, os.O_RDONLY, dir_fd=dir_fd)
+    try:
+        if max_bytes is not None:
+            if type(max_bytes) is not int or max_bytes < 0:
+                raise ValueError("maximum read size must be non-negative")
+            if os.fstat(file_descriptor).st_size > max_bytes:
+                raise OSError(f"file exceeds the {max_bytes}-byte read limit: {path}")
+        with os.fdopen(file_descriptor, "rb") as source:
+            file_descriptor = -1
+            if max_bytes is None:
+                return source.read()
+            chunks: list[bytes] = []
+            remaining = max_bytes
+            while True:
+                chunk = source.read(min(1024 * 1024, remaining + 1))
+                if not chunk:
+                    return b"".join(chunks)
+                chunks.append(chunk)
+                remaining -= len(chunk)
+                if remaining < 0:
+                    raise OSError(f"file exceeds the {max_bytes}-byte read limit: {path}")
+    finally:
+        if file_descriptor >= 0:
+            os.close(file_descriptor)
 
 
 def _read_text_nofollow(
@@ -300,8 +331,9 @@ def _read_text_nofollow(
     *,
     encoding: str,
     dir_fd: int | None = None,
+    max_bytes: int | None = None,
 ) -> str:
-    return _read_bytes_nofollow(path, dir_fd=dir_fd).decode(encoding)
+    return _read_bytes_nofollow(path, dir_fd=dir_fd, max_bytes=max_bytes).decode(encoding)
 
 
 def _sha256_entry(parent_fd: int, name: str, label: str) -> str:
@@ -369,10 +401,22 @@ def _directory_entry_has_marker(parent_fd: int, name: str, marker: str, label: s
         os.close(entry_fd)
 
 
-def _remove_directory_entry(parent_fd: int, name: str, label: str) -> None:
+def _remove_directory_entry(
+    parent_fd: int,
+    name: str,
+    label: str,
+    *,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+) -> None:
     directory_fd = _open_directory_entry_nofollow(parent_fd, name, label)
     try:
-        _remove_opened_directory_contents(directory_fd, label)
+        _remove_opened_directory_contents(
+            directory_fd,
+            label,
+            deadline=deadline,
+            cancel_event=cancel_event,
+        )
         current_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         held_stat = os.fstat(directory_fd)
         if (current_stat.st_dev, current_stat.st_ino) != (
@@ -387,8 +431,24 @@ def _remove_directory_entry(parent_fd: int, name: str, label: str) -> None:
         os.close(directory_fd)
 
 
-def _remove_opened_directory_contents(directory_fd: int, label: str) -> None:
-    for child_name in os.listdir(directory_fd):
+def _remove_opened_directory_contents(
+    directory_fd: int,
+    label: str,
+    *,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+) -> None:
+    child_count = 0
+    with os.scandir(directory_fd) as entries:
+        child_names = []
+        for entry in entries:
+            _check_deadline(deadline, cancel_event)
+            child_count += 1
+            if child_count > _ADAPTER_CLEANUP_ENTRY_LIMIT:
+                raise OSError(f"{label} contains too many entries")
+            child_names.append(entry.name)
+    for child_name in child_names:
+        _check_deadline(deadline, cancel_event)
         child_stat = os.stat(
             child_name,
             dir_fd=directory_fd,
@@ -408,6 +468,8 @@ def _remove_opened_directory_contents(directory_fd: int, label: str) -> None:
                     child_name,
                     child_fd,
                     label,
+                    deadline=deadline,
+                    cancel_event=cancel_event,
                 )
             finally:
                 os.close(child_fd)
@@ -420,9 +482,17 @@ def _remove_opened_directory_entry(
     name: str,
     directory_fd: int,
     label: str,
+    *,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> None:
     """Remove a directory through its already-held descriptor."""
-    _remove_opened_directory_contents(directory_fd, label)
+    _remove_opened_directory_contents(
+        directory_fd,
+        label,
+        deadline=deadline,
+        cancel_event=cancel_event,
+    )
     try:
         current_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     except FileNotFoundError as exc:
@@ -745,11 +815,14 @@ def _read_source_text(
     source_url: str,
     deadline: float | None = None,
     cancel_event: threading.Event | None = None,
+    *,
+    max_bytes: int | None = None,
 ) -> str:
     return _read_source_bytes(
         source_url,
         deadline=deadline,
         cancel_event=cancel_event,
+        max_bytes=max_bytes,
     ).decode("utf-8")
 
 
@@ -757,19 +830,43 @@ def _read_source_bytes(
     source_url: str,
     deadline: float | None = None,
     cancel_event: threading.Event | None = None,
+    *,
+    max_bytes: int | None = None,
 ) -> bytes:
+    if max_bytes is not None and (type(max_bytes) is not int or max_bytes < 0):
+        raise ValueError("maximum read size must be non-negative")
     _check_deadline(deadline, cancel_event)
     with urllib.request.urlopen(
         source_url,
         timeout=_request_timeout(deadline, cancel_event),
     ) as response:
+        headers = getattr(response, "headers", {})
+        content_length = headers.get("Content-Length") if hasattr(headers, "get") else None
+        if content_length is not None:
+            try:
+                content_length_value = int(content_length)
+            except (TypeError, ValueError) as exc:
+                raise OSError(f"source has an invalid Content-Length: {source_url}") from exc
+            if content_length_value < 0:
+                raise OSError(f"source has a negative Content-Length: {source_url}")
+            if max_bytes is not None and content_length_value > max_bytes:
+                raise OSError(
+                    f"source exceeds the {max_bytes}-byte read limit: {source_url}"
+                )
         chunks = []
+        total = 0
         while True:
             _check_deadline(deadline, cancel_event)
-            chunk = response.read(16 * 1024 * 1024)
+            read_size = 16 * 1024 * 1024
+            if max_bytes is not None:
+                read_size = min(read_size, max_bytes - total + 1)
+            chunk = response.read(read_size)
             if not chunk:
                 break
             chunks.append(chunk)
+            total += len(chunk)
+            if max_bytes is not None and total > max_bytes:
+                raise OSError(f"source exceeds the {max_bytes}-byte read limit: {source_url}")
         _check_deadline(deadline, cancel_event)
         return b"".join(chunks)
 
@@ -793,6 +890,7 @@ def _source_manifest(
                 manifest_url,
                 deadline=deadline,
                 cancel_event=cancel_event,
+                max_bytes=_ADAPTER_METADATA_MAX_BYTES,
             )
         )
     except HTTPError as exc:
@@ -833,6 +931,7 @@ def _source_manifest(
         f"{source_root}/{_ADAPTER_DIGEST}",
         deadline=deadline,
         cancel_event=cancel_event,
+        max_bytes=_ADAPTER_MARKER_MAX_BYTES,
     ).strip().split()
     if not digest_text or re.fullmatch(r"[0-9a-f]{64}", digest_text[0]) is None:
         raise OSError("adapter source has no valid model checksum")
@@ -840,6 +939,7 @@ def _source_manifest(
         config_url,
         deadline=deadline,
         cancel_event=cancel_event,
+        max_bytes=_ADAPTER_METADATA_MAX_BYTES,
     )
     return {
         "version": 1,
@@ -982,6 +1082,7 @@ def _read_chunked_v1_manifest(
                 f"{source_root}/{_ADAPTER_MANIFEST}",
                 deadline=deadline,
                 cancel_event=cancel_event,
+                max_bytes=_ADAPTER_METADATA_MAX_BYTES,
             )
         )
     except HTTPError as exc:
@@ -1130,6 +1231,7 @@ def _read_chunked_linear_manifest(
             f"{source_root}/{_ADAPTER_MANIFEST}",
             deadline=deadline,
             cancel_event=cancel_event,
+            max_bytes=_ADAPTER_METADATA_MAX_BYTES,
         )
     )
     if not isinstance(value, dict) or value.get("version") != 2:
@@ -1354,6 +1456,7 @@ def _read_chunked_xor_manifest(
                 f"{source_root}/{_ADAPTER_MANIFEST}",
                 deadline=deadline,
                 cancel_event=cancel_event,
+                max_bytes=_ADAPTER_METADATA_MAX_BYTES,
             )
         )
     except HTTPError as exc:
@@ -1434,7 +1537,13 @@ def _proof_identity_matches(
     if not proof_path.is_file():
         return False, None
     try:
-        proof = json.loads(_read_text_nofollow(proof_path, encoding="utf-8"))
+        proof = json.loads(
+            _read_text_nofollow(
+                proof_path,
+                encoding="utf-8",
+                max_bytes=_ADAPTER_METADATA_MAX_BYTES,
+            )
+        )
     except (OSError, ValueError):
         return False, None
     if not isinstance(proof, dict):
@@ -1655,21 +1764,22 @@ def _relay_manifest_matches(
     """Check the READY cache's relay index without hashing large files."""
     directory_fd = _directory_fd
     try:
-        with os.fdopen(
-            _open_nofollow(
+        value = json.loads(
+            _read_text_nofollow(
                 _RELAY_MANIFEST,
-                os.O_RDONLY,
+                encoding="utf-8",
                 dir_fd=directory_fd,
-                label="adapter relay manifest",
-            ),
-            "r",
-            encoding="utf-8",
-        ) as source:
-            value = json.load(source)
+                max_bytes=_ADAPTER_METADATA_MAX_BYTES,
+            )
+        )
     except (FileNotFoundError, OSError, ValueError):
         return False
     try:
-        ready = _read_bytes_nofollow("READY", dir_fd=directory_fd)
+        ready = _read_bytes_nofollow(
+            "READY",
+            dir_fd=directory_fd,
+            max_bytes=_ADAPTER_MARKER_MAX_BYTES,
+        )
     except (FileNotFoundError, OSError):
         return False
     if ready != b"ready\n":
@@ -1795,6 +1905,12 @@ def _relay_manifest_matches(
                 return False
         if entry_stat is None or entry_stat.st_size != size:
             return False
+        if filename in _ADAPTER_FILES and _sha256_entry(
+            directory_fd,
+            filename,
+            "adapter relay file",
+        ) != digest:
+            return False
     return True
 
 
@@ -1812,14 +1928,45 @@ def _write_stage_status(
     if value.get("status") == "ready":
         value = {**value, "ready_at_monotonic": time.monotonic()}
         try:
+            manifest_path = Path(str(value["path"])) / "manifest.json"
             manifest = json.loads(
-                (Path(str(value["path"])) / "manifest.json").read_text(encoding="utf-8")
+                _read_text_nofollow(
+                    manifest_path,
+                    encoding="utf-8",
+                    max_bytes=_ADAPTER_METADATA_MAX_BYTES,
+                )
             )
             target = manifest["files"]["adapter_model.safetensors"]
             if isinstance(target, dict) and isinstance(target.get("sha256"), str):
                 value = {**value, "target_sha256": target["sha256"]}
         except (KeyError, OSError, TypeError, ValueError):
             pass
+        verified_files = value.get("verified_files")
+        stage_path = value.get("path")
+        if isinstance(verified_files, dict) and isinstance(stage_path, str):
+            try:
+                stage_fd = _open_directory_nofollow(
+                    Path(stage_path),
+                    create=False,
+                    label="adapter ready directory",
+                )
+                try:
+                    file_stats: dict[str, dict[str, int]] = {}
+                    for name in _ADAPTER_FILES:
+                        entry = _stat_regular_entry(stage_fd, name, "adapter ready file")
+                        if entry is None:
+                            raise OSError(f"adapter ready file is missing: {name}")
+                        file_stats[name] = {
+                            "dev": int(entry.st_dev),
+                            "ino": int(entry.st_ino),
+                            "size": int(entry.st_size),
+                            "mtime_ns": int(entry.st_mtime_ns),
+                        }
+                    value = {**value, "file_stats": file_stats}
+                finally:
+                    os.close(stage_fd)
+            except (OSError, TypeError, ValueError):
+                value.pop("file_stats", None)
     with _JSON_LOCK:
         _write_json(cache_root / _ADAPTER_STATUS, value, parent_fd=cache_fd)
 
@@ -1833,17 +1980,14 @@ def adapter_stage_status() -> dict[str, object]:
             label="adapter cache directory",
         )
         try:
-            with os.fdopen(
-                _open_nofollow(
+            value = json.loads(
+                _read_text_nofollow(
                     _ADAPTER_STATUS,
-                    os.O_RDONLY,
+                    encoding="utf-8",
                     dir_fd=cache_fd,
-                    label="adapter status path",
-                ),
-                "r",
-                encoding="utf-8",
-            ) as source:
-                value = json.load(source)
+                    max_bytes=_ADAPTER_METADATA_MAX_BYTES,
+                )
+            )
         finally:
             os.close(cache_fd)
     except FileNotFoundError:
@@ -1939,7 +2083,13 @@ def adapter_reader_lock(path: Path, *, deadline: float | None = None):
         os.close(parent_fd)
 
 
-def _cleanup_retired_adapters(cache_root: Path, active_name: str) -> None:
+def _cleanup_retired_adapters(
+    cache_root: Path,
+    active_name: str,
+    *,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+) -> None:
     prefix = f"{active_name}.retired-"
     try:
         cache_fd = _open_directory_nofollow(
@@ -1950,7 +2100,17 @@ def _cleanup_retired_adapters(cache_root: Path, active_name: str) -> None:
     except FileNotFoundError:
         return
     try:
-        for name in os.listdir(cache_fd):
+        entry_count = 0
+        with os.scandir(cache_fd) as entries:
+            names = []
+            for entry in entries:
+                _check_deadline(deadline, cancel_event)
+                entry_count += 1
+                if entry_count > _ADAPTER_CLEANUP_ENTRY_LIMIT:
+                    raise OSError("adapter cache has too many cleanup entries")
+                names.append(entry.name)
+        for name in names:
+            _check_deadline(deadline, cancel_event)
             if not name.startswith(prefix):
                 continue
             try:
@@ -1970,7 +2130,13 @@ def _cleanup_retired_adapters(cache_root: Path, active_name: str) -> None:
                 )
                 with os.fdopen(lock_fd, "a+") as lock:
                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    _remove_directory_entry(cache_fd, name, "retired adapter path")
+                    _remove_directory_entry(
+                        cache_fd,
+                        name,
+                        "retired adapter path",
+                        deadline=deadline,
+                        cancel_event=cancel_event,
+                    )
                     fcntl.flock(lock, fcntl.LOCK_UN)
             except (BlockingIOError, FileNotFoundError):
                 continue
@@ -1978,9 +2144,15 @@ def _cleanup_retired_adapters(cache_root: Path, active_name: str) -> None:
         os.close(cache_fd)
 
 
-def reconcile_retired_adapter(destination: Path, source_url: str | None = None) -> None:
+def reconcile_retired_adapter(
+    destination: Path,
+    source_url: str | None = None,
+    *,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+) -> None:
     """Restore a complete retired cache if a stage died between renames."""
-    deadline = time.monotonic() + 5.0
+    deadline = deadline or (time.monotonic() + default_delta_stage_timeout_s)
     with adapter_reader_lock(destination, deadline=deadline):
         parent_fd = _open_directory_nofollow(destination.parent, create=False, label="adapter cache")
         try:
@@ -1988,9 +2160,19 @@ def reconcile_retired_adapter(destination: Path, source_url: str | None = None) 
                 try:
                     def metadata(name: str, encoding: str) -> str:
                         entry = _stat_regular_entry(directory_fd, name, "adapter metadata")
-                        if entry is None or entry.st_size > 1_048_576:
+                        maximum = (
+                            _ADAPTER_MARKER_MAX_BYTES
+                            if name in {"READY", _ADAPTER_DIGEST}
+                            else _ADAPTER_METADATA_MAX_BYTES
+                        )
+                        if entry is None or entry.st_size > maximum:
                             raise ValueError("adapter metadata is too large")
-                        return _read_text_nofollow(name, encoding=encoding, dir_fd=directory_fd)
+                        return _read_text_nofollow(
+                            name,
+                            encoding=encoding,
+                            dir_fd=directory_fd,
+                            max_bytes=maximum,
+                        )
 
                     if metadata("READY", "ascii") != "ready\n":
                         return False
@@ -2033,19 +2215,28 @@ def reconcile_retired_adapter(destination: Path, source_url: str | None = None) 
             if current_fd is not None:
                 try:
                     if valid(current_fd):
-                        _cleanup_retired_adapters(destination.parent, destination.name)
+                        _cleanup_retired_adapters(
+                            destination.parent,
+                            destination.name,
+                            deadline=deadline,
+                            cancel_event=cancel_event,
+                        )
                 finally:
                     os.close(current_fd)
                 return
             restored = False
             prefix = f"{destination.name}.retired-"
             names = []
+            entry_count = 0
             with os.scandir(parent_fd) as entries:
                 for entry in entries:
-                    _check_deadline(deadline)
+                    _check_deadline(deadline, cancel_event)
+                    entry_count += 1
+                    if entry_count > _ADAPTER_CLEANUP_ENTRY_LIMIT:
+                        raise OSError("adapter cache has too many recovery entries")
                     if entry.name.startswith(prefix):
                         names.append(entry.name)
-                        if len(names) > 64:
+                        if len(names) > _ADAPTER_CLEANUP_CANDIDATE_LIMIT:
                             raise OSError("too many retired adapter candidates")
             for name in sorted(names, reverse=True):
                 try:
@@ -2053,6 +2244,7 @@ def reconcile_retired_adapter(destination: Path, source_url: str | None = None) 
                 except (FileNotFoundError, OSError):
                     continue
                 try:
+                    _check_deadline(deadline, cancel_event)
                     if valid(candidate_fd):
                         os.replace(name, destination.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
                         restored = True
@@ -2060,12 +2252,23 @@ def reconcile_retired_adapter(destination: Path, source_url: str | None = None) 
                 finally:
                     os.close(candidate_fd)
             if restored:
-                _cleanup_retired_adapters(destination.parent, destination.name)
+                _cleanup_retired_adapters(
+                    destination.parent,
+                    destination.name,
+                    deadline=deadline,
+                    cancel_event=cancel_event,
+                )
         finally:
             os.close(parent_fd)
 
 
-def _cleanup_previous_adapter_caches(cache_root: Path, active: Path) -> None:
+def _cleanup_previous_adapter_caches(
+    cache_root: Path,
+    active: Path,
+    *,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+) -> None:
     """Remove old adapters while retaining the active predecessor."""
     try:
         cache_fd = _open_directory_nofollow(
@@ -2079,9 +2282,21 @@ def _cleanup_previous_adapter_caches(cache_root: Path, active: Path) -> None:
     try:
         active_name = active.name
         ready_candidates: list[str] = []
-        for name in os.listdir(cache_fd):
+        entry_count = 0
+        with os.scandir(cache_fd) as entries:
+            names = []
+            for entry in entries:
+                _check_deadline(deadline, cancel_event)
+                entry_count += 1
+                if entry_count > _ADAPTER_CLEANUP_ENTRY_LIMIT:
+                    raise OSError("adapter cache has too many cleanup entries")
+                names.append(entry.name)
+        for name in names:
+            _check_deadline(deadline, cancel_event)
             if name == active_name or re.fullmatch(r"[0-9a-f]{64}", name) is None:
                 continue
+            if len(ready_candidates) >= _ADAPTER_CLEANUP_CANDIDATE_LIMIT:
+                raise OSError("too many cached adapter candidates")
             try:
                 entry_stat = os.stat(name, dir_fd=cache_fd, follow_symlinks=False)
             except FileNotFoundError:
@@ -2115,7 +2330,12 @@ def _cleanup_previous_adapter_caches(cache_root: Path, active: Path) -> None:
             )
             try:
                 transport = json.loads(
-                    _read_text_nofollow("transport.json", encoding="utf-8", dir_fd=active_fd)
+                    _read_text_nofollow(
+                        "transport.json",
+                        encoding="utf-8",
+                        dir_fd=active_fd,
+                        max_bytes=_ADAPTER_METADATA_MAX_BYTES,
+                    )
                 )
             finally:
                 os.close(active_fd)
@@ -2140,7 +2360,13 @@ def _cleanup_previous_adapter_caches(cache_root: Path, active: Path) -> None:
                 )
                 with os.fdopen(lock_fd, "a+") as reader_lock:
                     fcntl.flock(reader_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    _remove_directory_entry(cache_fd, name, "cached adapter path")
+                    _remove_directory_entry(
+                        cache_fd,
+                        name,
+                        "cached adapter path",
+                        deadline=deadline,
+                        cancel_event=cancel_event,
+                    )
                     fcntl.flock(reader_lock, fcntl.LOCK_UN)
             except (BlockingIOError, FileNotFoundError):
                 continue
@@ -2164,16 +2390,29 @@ def _full_cache_matches_manifest(
         return False
     try:
         try:
-            if _read_bytes_nofollow("READY", dir_fd=directory_fd) != b"ready\n":
+            if (
+                _read_bytes_nofollow(
+                    "READY",
+                    dir_fd=directory_fd,
+                    max_bytes=_ADAPTER_MARKER_MAX_BYTES,
+                )
+                != b"ready\n"
+            ):
                 return False
             _reject_symlink_path(candidate / "manifest.json", "cached adapter manifest")
             manifest = json.loads(
-                _read_text_nofollow("manifest.json", encoding="utf-8", dir_fd=directory_fd)
+                _read_text_nofollow(
+                    "manifest.json",
+                    encoding="utf-8",
+                    dir_fd=directory_fd,
+                    max_bytes=_ADAPTER_METADATA_MAX_BYTES,
+                )
             )
             sidecar = _read_text_nofollow(
                 _ADAPTER_DIGEST,
                 encoding="ascii",
                 dir_fd=directory_fd,
+                max_bytes=_ADAPTER_MARKER_MAX_BYTES,
             ).strip()
         except (FileNotFoundError, ValueError, UnicodeError):
             return False
@@ -2193,6 +2432,8 @@ def _full_cache_matches_manifest(
                 return False
             entry = _stat_regular_entry(directory_fd, filename, "cached adapter file")
             if entry is None or entry.st_size != spec["size"]:
+                return False
+            if _sha256_entry(directory_fd, filename, "cached adapter file") != spec.get("sha256"):
                 return False
         return True
     finally:
@@ -2221,103 +2462,135 @@ def _reuse_full_adapter_cache(
         return False
     cache_root = destination.parent
     try:
-        entries = sorted(os.listdir(cache_root))
+        cache_fd = _open_directory_nofollow(
+            cache_root,
+            create=False,
+            label="adapter cache directory",
+        )
     except FileNotFoundError:
         return False
-    for name in entries:
-        if name == destination.name or re.fullmatch(r"[0-9a-f]{64}", name) is None:
-            continue
-        candidate = cache_root / name
-        _reject_symlink_path(candidate, "cached adapter path")
-        candidate_stat = _path_stat(candidate, "cached adapter path")
-        if candidate_stat is None:
-            continue
-        if not stat.S_ISDIR(candidate_stat.st_mode):
-            raise OSError(f"cached adapter path is not a directory: {candidate}")
-        with adapter_reader_lock(candidate, deadline=deadline):
-            if not _full_cache_matches_manifest(candidate, files):
+    try:
+        entry_count = 0
+        candidate_count = 0
+        with os.scandir(cache_fd) as entries:
+            names = []
+            for entry in entries:
+                _check_deadline(deadline, cancel_event)
+                entry_count += 1
+                if entry_count > _ADAPTER_CLEANUP_ENTRY_LIMIT:
+                    raise OSError("adapter cache has too many reuse entries")
+                names.append(entry.name)
+        for name in sorted(names):
+            if name == destination.name or re.fullmatch(r"[0-9a-f]{64}", name) is None:
                 continue
-            _check_cancelled(cancel_event)
-            temporary = destination.with_name(f"{destination.name}.partial")
-            _reject_symlink_path(temporary, "adapter partial directory")
-            if _path_stat(temporary, "adapter partial directory") is not None:
-                parent_fd = _open_directory_nofollow(
+            candidate_count += 1
+            if candidate_count > _ADAPTER_CLEANUP_CANDIDATE_LIMIT:
+                raise OSError("too many full adapter cache candidates")
+            _check_deadline(deadline, cancel_event)
+            candidate = cache_root / name
+            _reject_symlink_path(candidate, "cached adapter path")
+            candidate_stat = _path_stat(candidate, "cached adapter path")
+            if candidate_stat is None:
+                continue
+            if not stat.S_ISDIR(candidate_stat.st_mode):
+                raise OSError(f"cached adapter path is not a directory: {candidate}")
+            with adapter_reader_lock(candidate, deadline=deadline):
+                if not _full_cache_matches_manifest(candidate, files):
+                    continue
+                _check_cancelled(cancel_event)
+                temporary = destination.with_name(f"{destination.name}.partial")
+                _reject_symlink_path(temporary, "adapter partial directory")
+                _preflight_adapter_space(
                     cache_root,
-                    create=False,
-                    label="adapter partial directory parent",
+                    [
+                        (temporary / _ADAPTER_FILES[0], int(files[_ADAPTER_FILES[0]]["size"])),
+                        (temporary / _ADAPTER_FILES[1], int(files[_ADAPTER_FILES[1]]["size"])),
+                    ],
                 )
-                try:
-                    _remove_directory_entry(
-                        parent_fd,
-                        temporary.name,
-                        "adapter partial directory",
+                if _path_stat(temporary, "adapter partial directory") is not None:
+                    parent_fd = _open_directory_nofollow(
+                        cache_root,
+                        create=False,
+                        label="adapter partial directory parent",
                     )
-                finally:
-                    os.close(parent_fd)
-            _ensure_directory(temporary, "adapter partial directory")
-            try:
-                _write_json(temporary / "manifest.json", manifest)
-                for filename in _ADAPTER_FILES:
-                    _check_cancelled(cancel_event)
-                    _reject_symlink_path(candidate / filename, "cached adapter file")
-                    _reject_symlink_path(temporary / filename, "adapter file")
-                    shutil.copyfile(candidate / filename, temporary / filename)
-                _publish_relay_manifest(
-                    temporary,
-                    source_url,
-                    source_manifest,
-                    transport,
-                    files,
-                    deadline=deadline,
-                    cancel_event=cancel_event,
-                )
-                model_sha256 = files[_ADAPTER_FILES[1]]["sha256"]
-                _write_text_atomic(
-                    temporary / _ADAPTER_DIGEST,
-                    f"{model_sha256}\n",
-                    encoding="ascii",
-                )
-                with _adapter_stage_publish_lock:
-                    _check_cancelled(cancel_event)
-                    _write_text_atomic(temporary / "READY", "ready\n", encoding="ascii")
-                    with os.fdopen(
-                        _open_nofollow(
-                            _adapter_reader_lock(destination),
-                            os.O_RDWR | os.O_CREAT,
-                        ),
-                        "a+",
-                    ) as reader_lock:
-                        _acquire_stage_lock(reader_lock, deadline, cancel_event)
-                        if _path_stat(destination, "adapter destination") is not None:
-                            retired = destination.with_name(
-                                f"{destination.name}.retired-{time.time_ns()}-{os.getpid()}"
-                            )
-                            _replace_paths(destination, retired, "retired adapter")
-                        _replace_paths(temporary, destination, "adapter cache reuse")
-                        if committed_event is not None:
-                            committed_event.set()
-                        fcntl.flock(reader_lock, fcntl.LOCK_UN)
-                print(f"adapter cache reuse: local full cache imported for {source_url}")
-                return True
-            except BaseException:
-                try:
-                    if _path_stat(temporary, "adapter partial directory") is not None:
-                        parent_fd = _open_directory_nofollow(
-                            cache_root,
-                            create=False,
-                            label="adapter partial directory parent",
+                    try:
+                        _remove_directory_entry(
+                            parent_fd,
+                            temporary.name,
+                            "adapter partial directory",
+                            deadline=deadline,
+                            cancel_event=cancel_event,
                         )
-                        try:
-                            _remove_directory_entry(
-                                parent_fd,
-                                temporary.name,
-                                "adapter partial directory",
+                    finally:
+                        os.close(parent_fd)
+                _ensure_directory(temporary, "adapter partial directory")
+                try:
+                    _write_json(temporary / "manifest.json", manifest)
+                    for filename in _ADAPTER_FILES:
+                        _check_cancelled(cancel_event)
+                        _reject_symlink_path(candidate / filename, "cached adapter file")
+                        _reject_symlink_path(temporary / filename, "adapter file")
+                        shutil.copyfile(candidate / filename, temporary / filename)
+                    _publish_relay_manifest(
+                        temporary,
+                        source_url,
+                        source_manifest,
+                        transport,
+                        files,
+                        deadline=deadline,
+                        cancel_event=cancel_event,
+                    )
+                    model_sha256 = files[_ADAPTER_FILES[1]]["sha256"]
+                    _write_text_atomic(
+                        temporary / _ADAPTER_DIGEST,
+                        f"{model_sha256}\n",
+                        encoding="ascii",
+                    )
+                    with _adapter_stage_publish_lock:
+                        _check_cancelled(cancel_event)
+                        _write_text_atomic(temporary / "READY", "ready\n", encoding="ascii")
+                        with os.fdopen(
+                            _open_nofollow(
+                                _adapter_reader_lock(destination),
+                                os.O_RDWR | os.O_CREAT,
+                            ),
+                            "a+",
+                        ) as reader_lock:
+                            _acquire_stage_lock(reader_lock, deadline, cancel_event)
+                            if _path_stat(destination, "adapter destination") is not None:
+                                retired = destination.with_name(
+                                    f"{destination.name}.retired-{time.time_ns()}-{os.getpid()}"
+                                )
+                                _replace_paths(destination, retired, "retired adapter")
+                            _replace_paths(temporary, destination, "adapter cache reuse")
+                            if committed_event is not None:
+                                committed_event.set()
+                            fcntl.flock(reader_lock, fcntl.LOCK_UN)
+                    print(f"adapter cache reuse: local full cache imported for {source_url}")
+                    return True
+                except BaseException:
+                    try:
+                        if _path_stat(temporary, "adapter partial directory") is not None:
+                            parent_fd = _open_directory_nofollow(
+                                cache_root,
+                                create=False,
+                                label="adapter partial directory parent",
                             )
-                        finally:
-                            os.close(parent_fd)
-                except (FileNotFoundError, OSError):
-                    pass
-                raise
+                            try:
+                                _remove_directory_entry(
+                                    parent_fd,
+                                    temporary.name,
+                                    "adapter partial directory",
+                                    deadline=deadline,
+                                    cancel_event=cancel_event,
+                                )
+                            finally:
+                                os.close(parent_fd)
+                    except (FileNotFoundError, OSError):
+                        pass
+                    raise
+    finally:
+        os.close(cache_fd)
     print(f"adapter cache reuse: no verified full cache for {source_url}; using network staging")
     return False
 
@@ -2512,7 +2785,14 @@ def _verified_adapter_base(
     finally:
         os.close(parent_fd)
     try:
-        if _read_bytes_nofollow("READY", dir_fd=base_fd) != b"ready\n":
+        if (
+            _read_bytes_nofollow(
+                "READY",
+                dir_fd=base_fd,
+                max_bytes=_ADAPTER_MARKER_MAX_BYTES,
+            )
+            != b"ready\n"
+        ):
             raise OSError("required base adapter is not cached")
         model_stat = _stat_regular_entry(base_fd, _ADAPTER_FILES[1], "cached adapter model")
         config_stat = _stat_regular_entry(
@@ -2524,7 +2804,12 @@ def _verified_adapter_base(
             raise OSError("required base adapter is not cached")
         try:
             local_manifest = json.loads(
-                _read_text_nofollow("manifest.json", encoding="utf-8", dir_fd=base_fd)
+                _read_text_nofollow(
+                    "manifest.json",
+                    encoding="utf-8",
+                    dir_fd=base_fd,
+                    max_bytes=_ADAPTER_METADATA_MAX_BYTES,
+                )
             )
         except (FileNotFoundError, OSError, ValueError) as exc:
             raise OSError("cached base adapter has no valid manifest") from exc
@@ -2582,6 +2867,7 @@ def _verified_adapter_base(
         checksum = _read_bytes_nofollow(
             _ADAPTER_DIGEST,
             dir_fd=base_fd,
+            max_bytes=_ADAPTER_MARKER_MAX_BYTES,
         )
         if checksum != f"{expected_sha256}\n".encode("ascii"):
             raise OSError("cached base adapter sidecar checksum differs")
@@ -2591,6 +2877,12 @@ def _verified_adapter_base(
             "cached base adapter configuration",
         ) != config_spec["sha256"]:
             raise OSError("cached base adapter configuration bytes differ")
+        if _sha256_entry(
+            base_fd,
+            _ADAPTER_FILES[1],
+            "cached base adapter model",
+        ) != model_spec["sha256"]:
+            raise OSError("cached base adapter model bytes differ")
     finally:
         os.close(base_fd)
     _check_deadline(deadline, cancel_event)
@@ -2633,13 +2925,18 @@ def _allocated_bytes(path: Path, label: str) -> int:
 def _preflight_adapter_space(
     root: Path,
     allocations: list[tuple[Path, int]],
+    *,
+    extra_bytes: int = 0,
 ) -> None:
     """Check only bytes this stage must allocate; cached bases need no reserve."""
+    if type(extra_bytes) is not int or extra_bytes < 0:
+        raise OSError("adapter extra allocation size is invalid")
     required = 0
     for path, size in allocations:
         if type(size) is not int or size < 0:
             raise OSError(f"adapter allocation size is invalid: {path}")
         required += max(0, size - _allocated_bytes(path, "adapter staging file"))
+    required += extra_bytes
     try:
         available = shutil.disk_usage(root).free
     except OSError as exc:
@@ -2648,6 +2945,56 @@ def _preflight_adapter_space(
         raise OSError(
             f"insufficient adapter staging space: need {required} bytes, "
             f"have {available} bytes free"
+        )
+
+
+def _preflight_full_adapter_download_space(
+    temporary: Path,
+    files: dict[str, object],
+) -> None:
+    """Reserve the peak temporary and range-part space for a full download."""
+    config = files.get(_ADAPTER_FILES[0])
+    model = files.get(_ADAPTER_FILES[1])
+    if not isinstance(config, dict) or not isinstance(model, dict):
+        raise OSError("full adapter manifest has no file sizes")
+    config_size = config.get("size")
+    model_size = model.get("size")
+    if (
+        type(config_size) is not int
+        or config_size < 0
+        or type(model_size) is not int
+        or model_size <= 0
+    ):
+        raise OSError("full adapter manifest has invalid file sizes")
+    streams = _configured_download_streams()
+    if model_size >= _PARALLEL_DOWNLOAD_THRESHOLD and streams > 1:
+        chunk = (model_size + streams - 1) // streams
+        part_allocations = []
+        for index, start in enumerate(range(0, model_size, chunk)):
+            part_size = min(start + chunk, model_size) - start
+            part_allocations.append(
+                (
+                    temporary
+                    / f"{_ADAPTER_FILES[1]}.parts"
+                    / f"part-{index:03d}",
+                    part_size,
+                )
+            )
+        _preflight_adapter_space(
+            temporary.parent,
+            [
+                (temporary / _ADAPTER_FILES[0], config_size),
+                (temporary / f"{_ADAPTER_FILES[1]}.assembling", model_size),
+                *part_allocations,
+            ],
+        )
+    else:
+        _preflight_adapter_space(
+            temporary.parent,
+            [
+                (temporary / _ADAPTER_FILES[0], config_size),
+                (temporary / _ADAPTER_FILES[1], model_size),
+            ],
         )
 
 
@@ -2835,6 +3182,7 @@ def _stage_chunked_linear_adapter(
             "source_url": source_url,
             "path": destination.as_posix(),
             "transport": _ADAPTER_LINEAR_TRANSPORT,
+            "verified_files": source_manifest["files"],
             "bytes_done": progress_bytes,
             "bytes_total": total_wire_bytes,
             "updated_at": time.time(),
@@ -3164,14 +3512,25 @@ def _stage_chunked_linear_adapter(
             if committed_event is not None:
                 committed_event.set()
             fcntl.flock(reader_lock, fcntl.LOCK_UN)
-    _cleanup_retired_adapters(destination.parent, destination.name)
-    _cleanup_previous_adapter_caches(destination.parent, destination)
+    _cleanup_retired_adapters(
+        destination.parent,
+        destination.name,
+        deadline=deadline,
+        cancel_event=cancel_event,
+    )
+    _cleanup_previous_adapter_caches(
+        destination.parent,
+        destination,
+        deadline=deadline,
+        cancel_event=cancel_event,
+    )
     write_stage_status(
         {
             "status": "ready",
             "source_url": source_url,
             "path": destination.as_posix(),
             "transport": _ADAPTER_LINEAR_TRANSPORT,
+            "verified_files": source_manifest["files"],
             "bytes_done": total_wire_bytes,
             "bytes_total": total_wire_bytes,
             "updated_at": time.time(),
@@ -3236,7 +3595,13 @@ def _cleanup_delta_stage_artifacts(
             try:
                 for name, is_directory in existing_entries:
                     if is_directory:
-                        _remove_directory_entry(cache_fd, name, "adapter staging path")
+                        _remove_directory_entry(
+                            cache_fd,
+                            name,
+                            "adapter staging path",
+                            deadline=deadline,
+                            cancel_event=cancel_event,
+                        )
                     else:
                         os.unlink(name, dir_fd=cache_fd)
             finally:
@@ -3420,6 +3785,7 @@ def _stage_chunked_xor_adapter(
             "source_url": source_url,
             "path": destination.as_posix(),
             "transport": _ADAPTER_FULL_TRANSPORT if full_zstd else _ADAPTER_DELTA_TRANSPORT,
+            "verified_files": source_manifest["files"],
             "bytes_done": progress_bytes,
             "bytes_total": total_wire_bytes,
             "updated_at": time.time(),
@@ -3463,7 +3829,13 @@ def _stage_chunked_xor_adapter(
 
         if _path_regular_size(completed_path, "adapter completed proof") is not None:
             try:
-                proof = json.loads(_read_text_nofollow(completed_path, encoding="utf-8"))
+                proof = json.loads(
+                    _read_text_nofollow(
+                        completed_path,
+                        encoding="utf-8",
+                        max_bytes=_ADAPTER_METADATA_MAX_BYTES,
+                    )
+                )
                 proof_matches = (
                     isinstance(proof, dict)
                     and proof.get("file") == name
@@ -3649,14 +4021,25 @@ def _stage_chunked_xor_adapter(
             if committed_event is not None:
                 committed_event.set()
             fcntl.flock(reader_lock, fcntl.LOCK_UN)
-    _cleanup_retired_adapters(destination.parent, destination.name)
-    _cleanup_previous_adapter_caches(destination.parent, destination)
+    _cleanup_retired_adapters(
+        destination.parent,
+        destination.name,
+        deadline=deadline,
+        cancel_event=cancel_event,
+    )
+    _cleanup_previous_adapter_caches(
+        destination.parent,
+        destination,
+        deadline=deadline,
+        cancel_event=cancel_event,
+    )
     write_stage_status(
         {
             "status": "ready",
             "source_url": source_url,
             "path": destination.as_posix(),
             "transport": _ADAPTER_FULL_TRANSPORT if full_zstd else _ADAPTER_DELTA_TRANSPORT,
+            "verified_files": source_manifest["files"],
             "bytes_done": total_wire_bytes,
             "bytes_total": total_wire_bytes,
             "updated_at": time.time(),
@@ -3910,17 +4293,14 @@ def _download_with_parent(
     }
     try:
         try:
-            with os.fdopen(
-                _open_nofollow(
+            existing_identity = json.loads(
+                _read_text_nofollow(
                     "manifest.json",
-                    os.O_RDONLY,
+                    encoding="utf-8",
                     dir_fd=parts_fd,
-                    label="adapter parts manifest",
-                ),
-                "r",
-                encoding="utf-8",
-            ) as source:
-                existing_identity = json.load(source)
+                    max_bytes=_ADAPTER_METADATA_MAX_BYTES,
+                )
+            )
         except (FileNotFoundError, OSError, ValueError):
             existing_identity = None
         if existing_identity != identity:
@@ -3928,7 +4308,13 @@ def _download_with_parent(
             # parts; never remove a published adapter directory here.
             os.close(parts_fd)
             parts_fd = -1
-            _remove_directory_entry(parent_fd, parts_name, "adapter parts directory")
+            _remove_directory_entry(
+                parent_fd,
+                parts_name,
+                "adapter parts directory",
+                deadline=deadline,
+                cancel_event=cancel_event,
+            )
             parts_fd = _ensure_directory_entry(
                 parent_fd,
                 parts_name,
@@ -4009,7 +4395,13 @@ def _download_with_parent(
             # stage attempt does not repeatedly assemble the same bad payload.
             os.close(parts_fd)
             parts_fd = -1
-            _remove_directory_entry(parent_fd, parts_name, "adapter parts directory")
+            _remove_directory_entry(
+                parent_fd,
+                parts_name,
+                "adapter parts directory",
+                deadline=deadline,
+                cancel_event=cancel_event,
+            )
             os.unlink(assembling.name, dir_fd=parent_fd)
             raise OSError(f"adapter checksum mismatch: {destination.name}")
         _check_deadline(deadline, cancel_event)
@@ -4022,7 +4414,13 @@ def _download_with_parent(
         )
         os.close(parts_fd)
         parts_fd = -1
-        _remove_directory_entry(parent_fd, parts_name, "adapter parts directory")
+        _remove_directory_entry(
+            parent_fd,
+            parts_name,
+            "adapter parts directory",
+            deadline=deadline,
+            cancel_event=cancel_event,
+        )
     finally:
         if parts_fd >= 0:
             os.close(parts_fd)
@@ -4062,17 +4460,11 @@ def stage_lora_adapter_files(
     the prefetch already wrote ``READY``.
     """
     _check_cancelled(cancel_event)
-    destination = adapter_cache_path(source_url)
-    _ensure_directory(destination.parent, "adapter cache directory")
-    reconcile_retired_adapter(destination, source_url)
-    _reject_symlink_path(destination, "adapter destination")
-    _reject_symlink_path(
-        destination.with_name(f"{destination.name}.partial"),
-        "adapter partial directory",
-    )
     started = time.monotonic()
+    destination = adapter_cache_path(source_url)
     configured_delta_timeout = _delta_stage_timeout_s() if require_delta else None
     status_metadata: dict[str, object] = {}
+    stage_limit: float | None = None
     if require_delta:
         source_step = _adapter_step_from_source_url(source_url)
         if policy_step is not None and policy_step != source_step:
@@ -4104,6 +4496,18 @@ def stage_lora_adapter_files(
         else None
     )
     operation_deadline = delta_deadline or (started + default_delta_stage_timeout_s)
+    _ensure_directory(destination.parent, "adapter cache directory")
+    reconcile_retired_adapter(
+        destination,
+        source_url,
+        deadline=operation_deadline,
+        cancel_event=cancel_event,
+    )
+    _reject_symlink_path(destination, "adapter destination")
+    _reject_symlink_path(
+        destination.with_name(f"{destination.name}.partial"),
+        "adapter partial directory",
+    )
     # The cache is shared by all replicas on this host. One global writer is
     # intentional: per-URL writers caused old policies to queue behind one
     # another and made it possible to publish a stale policy after a newer one.
@@ -4157,13 +4561,6 @@ def stage_lora_adapter_files(
                     or source_manifest.get("target_step") != policy_step
                 ):
                     raise OSError("validated adapter manifest does not identify the requested policy step")
-            if (
-                delta_deadline is None
-                and transport is not None
-                and transport.get("mode") == "delta"
-            ):
-                delta_deadline = time.monotonic() + _delta_stage_timeout_s()
-                operation_deadline = delta_deadline
             manifest = _source_manifest(
                 source_url,
                 deadline=operation_deadline,
@@ -4191,12 +4588,13 @@ def stage_lora_adapter_files(
                 if _path_regular_size(destination / "READY", "adapter ready marker") is not None:
                     try:
                         _reject_symlink_path(destination / "transport.json", "adapter transport record")
-                        with os.fdopen(
-                            _open_nofollow(destination / "transport.json", os.O_RDONLY),
-                            "r",
-                            encoding="utf-8",
-                        ) as source:
-                            proof = json.load(source)
+                        proof = json.loads(
+                            _read_text_nofollow(
+                                destination / "transport.json",
+                                encoding="utf-8",
+                                max_bytes=_ADAPTER_METADATA_MAX_BYTES,
+                            )
+                        )
                     except (FileNotFoundError, OSError, ValueError):
                         proof = None
                     if (
@@ -4252,14 +4650,25 @@ def stage_lora_adapter_files(
                                 "source_url": source_url,
                                 "path": destination.as_posix(),
                                 "transport": transport["transport"],
+                                "verified_files": files,
                                 "bytes_done": 0,
                                 "bytes_total": 0,
                                 "updated_at": time.time(),
                                 "elapsed_seconds": round(time.monotonic() - started, 3),
                             },
                         )
-                        _cleanup_retired_adapters(destination.parent, destination.name)
-                        _cleanup_previous_adapter_caches(destination.parent, destination)
+                        _cleanup_retired_adapters(
+                            destination.parent,
+                            destination.name,
+                            deadline=operation_deadline,
+                            cancel_event=cancel_event,
+                        )
+                        _cleanup_previous_adapter_caches(
+                            destination.parent,
+                            destination,
+                            deadline=operation_deadline,
+                            cancel_event=cancel_event,
+                        )
                         if committed_event is not None:
                             with _adapter_stage_publish_lock:
                                 committed_event.set()
@@ -4290,12 +4699,13 @@ def stage_lora_adapter_files(
             if _path_regular_size(destination / "READY", "adapter ready marker") is not None:
                 try:
                     _reject_symlink_path(destination / "manifest.json", "adapter manifest")
-                    with os.fdopen(
-                        _open_nofollow(destination / "manifest.json", os.O_RDONLY),
-                        "r",
-                        encoding="utf-8",
-                    ) as source:
-                        local_manifest = json.load(source)
+                    local_manifest = json.loads(
+                        _read_text_nofollow(
+                            destination / "manifest.json",
+                            encoding="utf-8",
+                            max_bytes=_ADAPTER_METADATA_MAX_BYTES,
+                        )
+                    )
                 except (FileNotFoundError, OSError, ValueError):
                     local_manifest = None
                 if (
@@ -4313,10 +4723,21 @@ def stage_lora_adapter_files(
                             "bytes_total": 0,
                             "updated_at": time.time(),
                             "elapsed_seconds": round(time.monotonic() - started, 3),
+                            "verified_files": files,
                         },
                     )
-                    _cleanup_retired_adapters(destination.parent, destination.name)
-                    _cleanup_previous_adapter_caches(destination.parent, destination)
+                    _cleanup_retired_adapters(
+                        destination.parent,
+                        destination.name,
+                        deadline=operation_deadline,
+                        cancel_event=cancel_event,
+                    )
+                    _cleanup_previous_adapter_caches(
+                        destination.parent,
+                        destination,
+                        deadline=operation_deadline,
+                        cancel_event=cancel_event,
+                    )
                     if committed_event is not None:
                         with _adapter_stage_publish_lock:
                             committed_event.set()
@@ -4348,8 +4769,18 @@ def stage_lora_adapter_files(
                     deadline=operation_deadline,
                 ):
                     total_bytes = sum(int(item["size"]) for item in files.values())
-                    _cleanup_retired_adapters(destination.parent, destination.name)
-                    _cleanup_previous_adapter_caches(destination.parent, destination)
+                    _cleanup_retired_adapters(
+                        destination.parent,
+                        destination.name,
+                        deadline=operation_deadline,
+                        cancel_event=cancel_event,
+                    )
+                    _cleanup_previous_adapter_caches(
+                        destination.parent,
+                        destination,
+                        deadline=operation_deadline,
+                        cancel_event=cancel_event,
+                    )
                     cache_hit = True
                     write_stage_status(
                         {
@@ -4360,6 +4791,7 @@ def stage_lora_adapter_files(
                             "bytes_done": 0,
                             "bytes_total": 0,
                             "reuse": "local-cache",
+                            "verified_files": files,
                             "updated_at": time.time(),
                             "elapsed_seconds": round(time.monotonic() - started, 3),
                         },
@@ -4367,6 +4799,10 @@ def stage_lora_adapter_files(
                     return destination
 
             total_bytes = sum(int(item["size"]) for item in files.values())
+            _preflight_full_adapter_download_space(
+                destination.with_name(f"{destination.name}.partial"),
+                files,
+            )
             progress_lock = threading.Lock()
             progress_bytes = 0
             last_status = 0.0
@@ -4399,6 +4835,7 @@ def stage_lora_adapter_files(
                     "path": destination.as_posix(),
                     "bytes_done": 0,
                     "bytes_total": total_bytes,
+                    "verified_files": files,
                     "updated_at": time.time(),
                     "elapsed_seconds": 0.0,
                 },
@@ -4492,8 +4929,18 @@ def stage_lora_adapter_files(
                     if committed_event is not None:
                         committed_event.set()
                     fcntl.flock(reader_lock, fcntl.LOCK_UN)
-            _cleanup_retired_adapters(destination.parent, destination.name)
-            _cleanup_previous_adapter_caches(destination.parent, destination)
+            _cleanup_retired_adapters(
+                destination.parent,
+                destination.name,
+                deadline=operation_deadline,
+                cancel_event=cancel_event,
+            )
+            _cleanup_previous_adapter_caches(
+                destination.parent,
+                destination,
+                deadline=operation_deadline,
+                cancel_event=cancel_event,
+            )
             write_stage_status(
                 {
                     "status": "ready",
@@ -4501,6 +4948,7 @@ def stage_lora_adapter_files(
                     "path": destination.as_posix(),
                     "bytes_done": total_bytes,
                     "bytes_total": total_bytes,
+                    "verified_files": files,
                     "updated_at": time.time(),
                     "elapsed_seconds": round(time.monotonic() - started, 3),
                 },
