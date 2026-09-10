@@ -612,7 +612,7 @@ class ResumeRecoveryTest(unittest.TestCase):
                     [(target_url + "/adapter_manifest.json", expected_limit)],
                 )
 
-    def test_resume_has_a_longer_separate_budget(self):
+    def test_resume_uses_the_per_step_phase_budget(self):
         tree = ast.parse(CLIENT_PATH.read_text(encoding="utf-8"))
         values = {}
         for node in tree.body:
@@ -621,10 +621,9 @@ class ResumeRecoveryTest(unittest.TestCase):
                 if isinstance(target, ast.Name) and target.id.startswith("RESUME_"):
                     values[target.id] = ast.literal_eval(node.value)
 
-        self.assertEqual(values["RESUME_ATTEMPT_TIMEOUT_S"], 900.0)
-        self.assertEqual(values["RESUME_TOTAL_TIMEOUT_S"], 1800.0)
-        self.assertEqual(values["RESUME_CONFIRM_TIMEOUT_S"], 120.0)
-        self.assertGreater(values["RESUME_ATTEMPT_TIMEOUT_S"], 300.0)
+        self.assertEqual(values["RESUME_ATTEMPT_TIMEOUT_S"], 600.0)
+        self.assertEqual(values["RESUME_TOTAL_TIMEOUT_S"], 600.0)
+        self.assertEqual(values["RESUME_CONFIRM_TIMEOUT_S"], 600.0)
 
     def test_resume_timeout_is_confirmed_before_failure(self):
         source = CLIENT_PATH.read_text(encoding="utf-8")
@@ -641,7 +640,7 @@ class ResumeRecoveryTest(unittest.TestCase):
         self.assertIn('state == "running"', resume)
         self.assertIn("timed out, but", resume)
         self.assertIn("was not confirmed", resume)
-        self.assertIn("route_missing and await _is_live(client)", resume)
+        self.assertIn("route_missing and await _is_live(client, confirm_deadline)", resume)
         self.assertIn("except (TimeoutError, httpx.TimeoutException, httpx.TransportError)", resume)
 
     def test_server_exposes_explicit_resume_state(self):

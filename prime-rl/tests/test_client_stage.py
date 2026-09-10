@@ -88,6 +88,11 @@ def _load_stage_function(probe_version=1, probe_step=None):
         for node in ast.walk(ast.parse(source))
         if isinstance(node, ast.FunctionDef) and node.name == "adapter_stage_limit_seconds"
     )
+    finite_number = next(
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef) and node.name == "_is_finite_number"
+    )
     async def cancel_and_reap(tasks):
         for task in tasks:
             task.cancel()
@@ -110,16 +115,18 @@ def _load_stage_function(probe_version=1, probe_step=None):
         "AdapterIdentity": dict[str, object],
         "asyncio": asyncio,
         "time": time,
+        "math": math,
+        "_cancel_and_reap": cancel_and_reap,
+        "POLICY_PHASE_TIMEOUT_S": 600.0,
         "urlsplit": __import__("urllib.parse", fromlist=["urlsplit"]).urlsplit,
         "LORA_STAGE_ATTEMPT_TIMEOUT_S": 30.0,
         "LORA_STAGE_TOTAL_TIMEOUT_S": 30.0,
         "_delta_stage_timeout_s": lambda: 30.0,
         "_admin_post_response": None,
-        "_cancel_and_reap": cancel_and_reap,
     }
     exec(
         compile(
-            ast.Module(body=[identity_validator, stage_limit, function], type_ignores=[]),
+            ast.Module(body=[identity_validator, stage_limit, finite_number, function], type_ignores=[]),
             str(CLIENT_PATH),
             "exec",
         ),
@@ -161,12 +168,19 @@ def _load_adapter_load_function():
         for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names
     ]
+    async def cancel_and_reap(tasks):
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
     namespace = {
         "AdapterIdentity": dict[str, object],
         "AsyncClient": object,
         "Mapping": Mapping,
         "Path": Path,
         "asyncio": asyncio,
+        "time": time,
+        "math": math,
+        "_cancel_and_reap": cancel_and_reap,
         "get_logger": lambda: SimpleNamespace(debug=lambda *_args: None, warning=lambda *_args: None),
         "httpx": httpx,
         "re": re,
@@ -177,12 +191,147 @@ def _load_adapter_load_function():
         "wait_exponential": lambda *_args, **_kwargs: None,
         "LORA_LOAD_READ_TIMEOUT_S": 0.1,
         "LORA_LOAD_TOTAL_TIMEOUT_S": 0.1,
+        "POLICY_PHASE_TIMEOUT_S": 600.0,
     }
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(CLIENT_PATH), "exec"), namespace)
     return namespace["load_lora_adapter"]
 
 
+def _load_health_functions():
+    source = CLIENT_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    nodes = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name in {"_cancel_and_reap", "maybe_check_has_model", "check_health"}
+    ]
+
+    async def cancel_and_reap(tasks):
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    namespace = {
+        "AsyncClient": object,
+        "asyncio": asyncio,
+        "httpx": httpx,
+        "time": time,
+        "NotFoundError": type("NotFoundError", (Exception,), {}),
+        "get_logger": lambda: SimpleNamespace(
+            debug=lambda *_args: None,
+            warning=lambda *_args: None,
+            error=lambda *_args: None,
+        ),
+        "_cancel_and_reap": cancel_and_reap,
+    }
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(CLIENT_PATH), "exec"), namespace)
+    return namespace["maybe_check_has_model"], namespace["check_health"]
+
+
+def _load_admin_post_function():
+    source = CLIENT_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    names = {"_is_retryable_admin_error", "_admin_post_response"}
+    nodes = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names
+    ]
+    namespace = {
+        "asyncio": asyncio,
+        "httpx": httpx,
+        "AsyncClient": object,
+        "ADMIN_TIMEOUT_S": 300.0,
+    }
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(CLIENT_PATH), "exec"), namespace)
+    return namespace["_admin_post_response"]
+
+
 class StageLoraAdapterTest(unittest.TestCase):
+    def test_health_rejects_http_500(self):
+        _maybe_check_has_model, check_health = _load_health_functions()
+
+        class Client:
+            base_url = "http://h200-a"
+
+            async def get(self, path, **_kwargs):
+                return httpx.Response(500, request=httpx.Request("GET", f"{self.base_url}{path}"))
+
+        with self.assertRaises(TimeoutError):
+            asyncio.run(check_health([Client()], interval=0.001, log_interval=100, timeout=0.002))
+
+    def test_health_deadline_includes_slow_requests(self):
+        _maybe_check_has_model, check_health = _load_health_functions()
+
+        class Client:
+            base_url = "http://h200-a"
+
+            async def get(self, _path, **_kwargs):
+                await asyncio.sleep(0.2)
+
+        started = time.perf_counter()
+        with self.assertRaises(TimeoutError):
+            asyncio.run(check_health([Client()], interval=0.001, log_interval=100, timeout=0.05))
+        self.assertLess(time.perf_counter() - started, 0.15)
+
+    def test_model_check_raises_for_http_500(self):
+        maybe_check_has_model, _check_health = _load_health_functions()
+
+        class Client:
+            base_url = "http://h200-a"
+
+            async def get(self, path, **_kwargs):
+                return httpx.Response(500, request=httpx.Request("GET", f"{self.base_url}{path}"))
+
+        with self.assertRaises(httpx.HTTPStatusError):
+            asyncio.run(maybe_check_has_model([Client()], "glm"))
+
+    def test_load_deadline_caps_retry_sleep_to_subsecond_budget(self):
+        load_lora_adapter = _load_adapter_load_function()
+        expected = _adapter_identity()
+
+        class Client:
+            base_url = "http://h200-a"
+
+            async def post(self, *_args, **_kwargs):
+                raise httpx.ReadTimeout("load response timed out")
+
+            async def get(self, *_args, **_kwargs):
+                raise httpx.ReadTimeout("status response timed out")
+
+        started = time.perf_counter()
+        with self.assertRaises(TimeoutError):
+            asyncio.run(
+                load_lora_adapter(
+                    [Client()],
+                    "adapter-slot1",
+                    expected["source_url"],
+                    expected_identity=expected,
+                    deadline=time.monotonic() + 0.05,
+                )
+            )
+        self.assertLess(time.perf_counter() - started, 0.5)
+
+    def test_admin_post_deadline_cancels_slow_request(self):
+        admin_post_response = _load_admin_post_function()
+
+        class Client:
+            async def post(self, *_args, **_kwargs):
+                await asyncio.sleep(0.2)
+
+        started = time.perf_counter()
+        with self.assertRaises(TimeoutError):
+            asyncio.run(
+                admin_post_response(
+                    Client(),
+                    "/pause",
+                    timeout_s=10.0,
+                    deadline=time.monotonic() + 0.05,
+                )
+            )
+        self.assertLess(time.perf_counter() - started, 0.15)
+
     def test_load_accepts_only_matching_loaded_receipt(self):
         load_lora_adapter = _load_adapter_load_function()
         expected = _adapter_identity()

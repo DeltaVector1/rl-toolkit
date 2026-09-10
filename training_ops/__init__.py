@@ -216,6 +216,29 @@ def _active_policy_probe_config(run: str) -> tuple[str, str] | None:
         return None
     return f"{output_dir.rstrip('/')}/broadcasts", lora_name
 
+
+def _status_runtime_identity(run: str) -> tuple[str, str, str, int, str]:
+    """Return exact run, transport, and tunnel identity expected by status."""
+    profile = _config_for_run(run, required=False)
+    run_name = f"run_{run}"
+    transport = "filesystem"
+    if profile is not None and isinstance(profile.get("orchestrator"), str):
+        path = repo_root / profile["orchestrator"]
+        try:
+            with path.open("rb") as stream:
+                config = tomllib.load(stream)
+        except (OSError, tomllib.TOMLDecodeError) as error:
+            raise RuntimeError(f"cannot read orchestrator config {path}: {error}") from error
+        output_dir = config.get("output_dir")
+        if isinstance(output_dir, str) and output_dir.startswith(run_root.rstrip("/") + "/"):
+            run_name = Path(output_dir).name
+        rollout = config.get("rollout_transport")
+        if isinstance(rollout, dict) and isinstance(rollout.get("type"), str):
+            transport = rollout["type"]
+    zmq_port = 29620 if transport == "zmq" else 0
+    zmq_target = f"{hosts['trainer_lan'][trainer_head]}:{zmq_port}" if zmq_port else ""
+    return run_name, transport, f"{run_root.rstrip('/')}/{run}/{run_name}", zmq_port, zmq_target
+
 ssh_command = [
     "ssh",
     "-o",
@@ -587,14 +610,16 @@ fi
 
 trainer_probe = r"""
 strip() { sed "s/\x1b\[[0-9;]*m//g"; }
-echo "TRAINER_UP $(sudo docker ps --filter name=^__TRAINER__$ --format up 2>/dev/null | head -1)"
+trainer_state=$(sudo docker inspect --type container __TRAINER__ --format '{{.Name}} {{.State.Running}} {{.State.Status}}' 2>/dev/null | head -1)
+[ "$trainer_state" = "/__TRAINER__ true running" ] && echo "TRAINER_UP up" || echo "TRAINER_UP down"
 trainer_cfg=$(sudo docker inspect __TRAINER__ --format '{{range .Config.Cmd}}{{println .}}{{end}}' 2>/dev/null | grep -E '\.toml$' | tail -1)
 if [ -n "$trainer_cfg" ] && grep -q '^\[data\.fake\]' "$trainer_cfg" 2>/dev/null; then
   echo "MODE trainer-only"
 else
   echo "MODE rl"
 fi
-echo "ORCH_UP $(sudo docker ps --filter name=^__ORCH__$ --format up 2>/dev/null | head -1)"
+orch_state=$(sudo docker inspect --type container __ORCH__ --format '{{.Name}} {{.State.Running}} {{.State.Status}}' 2>/dev/null | head -1)
+[ "$orch_state" = "/__ORCH__ true running" ] && echo "ORCH_UP up" || echo "ORCH_UP down"
 echo "TRAINER_STEPS $(sudo docker logs __TRAINER__ 2>&1 | strip | grep -ac 'SUCCESS Step')"
 echo "TRAINER_LAST $(sudo docker logs __TRAINER__ 2>&1 | strip | grep -a 'SUCCESS Step' | tail -1)"
 echo "TRAINER_CURRENT $(sudo docker logs --tail 1 __TRAINER__ 2>&1 | strip | tail -1)"
@@ -606,14 +631,30 @@ echo "BATCH $(sudo docker logs --tail 40 __ORCH__ 2>&1 | grep -oE 'batch [0-9]+/
 echo "FAILS5M $(sudo docker logs --since 5m __ORCH__ 2>&1 | grep -ac 'Rollout failed')"
 echo "TRAINER_LOGAGE $(sudo docker logs -t --tail 1 __TRAINER__ 2>&1 | tail -1 | cut -d' ' -f1)"
 echo "ORCH_LOGAGE $(sudo docker logs -t --tail 1 __ORCH__ 2>&1 | tail -1 | cut -d' ' -f1)"
-echo "ADAPTER $(curl -s -o /dev/null -m 10 -w '%{http_code}' http://127.0.0.1:__ADAPTER__/)"
+adapter_state=$(sudo docker inspect --type container __ADAPTER_CONTAINER__ --format '{{.Name}} {{.State.Running}} {{.State.Status}} {{.State.Pid}}' 2>/dev/null | head -1)
+adapter_name=$(printf '%s' "$adapter_state" | awk '{print $1}')
+adapter_running=$(printf '%s' "$adapter_state" | awk '{print $2}')
+adapter_status=$(printf '%s' "$adapter_state" | awk '{print $3}')
+adapter_pid=$(printf '%s' "$adapter_state" | awk '{print $4}')
+adapter_listener=$(ss -H -ltnp 2>/dev/null | awk -v port=":__ADAPTER__" '$4 ~ port "$" {print; exit}')
+adapter_listener_pid=$(sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' <<<"$adapter_listener")
+adapter_listener_ok=0
+if [ "$adapter_name" = "/__ADAPTER_CONTAINER__" ] && [ "$adapter_running" = true ] &&
+   [ "$adapter_status" = running ] &&
+   [ -n "$adapter_pid" ] && [ "$adapter_listener_pid" = "$adapter_pid" ]; then
+  adapter_command=$(ps -o args= -p "$adapter_pid" 2>/dev/null || true)
+  [ -n "$adapter_command" ] && adapter_listener_ok=1
+fi
+adapter_code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' http://127.0.0.1:__ADAPTER__/)
+[ "$adapter_listener_ok" = 1 ] && echo "ADAPTER $adapter_code" || echo "ADAPTER 000"
 """
 
 
 trainer_only_probe = r"""
 strip() { sed "s/\x1b\[[0-9;]*m//g"; }
 echo "MODE trainer-only"
-echo "TRAINER_UP $(sudo docker ps --filter name=^__TRAINER__$ --format up 2>/dev/null | head -1)"
+trainer_state=$(sudo docker inspect --type container __TRAINER__ --format '{{.Name}} {{.State.Running}} {{.State.Status}}' 2>/dev/null | head -1)
+[ "$trainer_state" = "/__TRAINER__ true running" ] && echo "TRAINER_UP up" || echo "TRAINER_UP down"
 echo "TRAINER_STEPS $(sudo docker logs __TRAINER__ 2>&1 | strip | grep -ac 'SUCCESS Step')"
 echo "TRAINER_LAST $(sudo docker logs __TRAINER__ 2>&1 | strip | grep -a 'SUCCESS Step' | tail -1)"
 echo "TRAINER_CURRENT $(sudo docker logs --tail 1 __TRAINER__ 2>&1 | strip | tail -1)"
@@ -626,19 +667,62 @@ echo "TRAINER_LOGAGE $(sudo docker logs -t --tail 1 __TRAINER__ 2>&1 | tail -1 |
 
 orchestrator_probe = r"""
 strip() { sed "s/\\x1b\\[[0-9;]*m//g"; }
-echo "ORCH_UP $(sudo docker ps --filter name=^__ORCH__$ --format up 2>/dev/null | head -1)"
+orch_state=$(sudo docker inspect --type container __ORCH__ --format '{{.Name}} {{.State.Running}} {{.State.Status}}' 2>/dev/null | head -1)
+[ "$orch_state" = "/__ORCH__ true running" ] && echo "ORCH_UP up" || echo "ORCH_UP down"
 last=$(sudo docker logs --tail 1 __ORCH__ 2>&1 | strip | tail -1)
 case "$last" in
   *'Failed to finish run'|*'No space left on device'*) echo "ORCH_FAILED 1" ;;
   *) echo "ORCH_FAILED 0" ;;
 esac
-echo "BATCH_SYNC $(pgrep -f 'bash .*[s]ync_rollout_batches.sh' | wc -l)"
-echo "TRAINER_FAIL_WD $(pgrep -f 'bash .*[t]rainer_failure_watchdog.sh' | wc -l)"
+run_dir="__RUN_DIR__"
+batch_sync_ok=0
+if [ "__ROLLOUT_TRANSPORT__" != filesystem ]; then
+  batch_sync_ok=1
+else
+  batch_pid=$(cat "$run_dir/.batch-sync.pid" 2>/dev/null || true)
+  case "$batch_pid" in ''|*[!0-9]*) ;; *)
+    batch_command=$(cat "/proc/$batch_pid/cmdline" 2>/dev/null | tr '\0' ' ' | sed 's/[[:space:]]*$//' || true)
+    batch_environment=$(cat "/proc/$batch_pid/environ" 2>/dev/null | tr '\0' '\n' || true)
+    case "$batch_command" in *"__BATCH_SYNC_SCRIPT__"*)
+      grep -Fxq "SOURCE_RUN_DIR=$run_dir" <<<"$batch_environment" &&
+      grep -Fxq "DEST_HOST=__TRAINER_SSH__" <<<"$batch_environment" && batch_sync_ok=1 ;;
+    esac
+  ;; esac
+fi
+echo "BATCH_SYNC $batch_sync_ok"
+trainer_fail_wd=0
+for proc_dir in /proc/[0-9]*; do
+  pid=${proc_dir##*/}
+  [ -r "/proc/$pid/cmdline" ] && [ -r "/proc/$pid/environ" ] || continue
+  command_line=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' ' ' | sed 's/[[:space:]]*$//' || true)
+  case "$command_line" in *"__TRAINER_WATCHDOG_SCRIPT__"*) ;; *) continue ;; esac
+  environment=$(cat "/proc/$pid/environ" 2>/dev/null | tr '\0' '\n' || true)
+  grep -Fxq "RUN=__RUN__" <<<"$environment" || continue
+  grep -Fxq "RUN_NAME=__RUN_NAME__" <<<"$environment" || continue
+  grep -Fxq "TRAINER_ADDRESSES=__TRAINER_ADDRESSES__" <<<"$environment" || continue
+  grep -Fxq "TRAINER_CT=__TRAINER_CT__" <<<"$environment" || continue
+  grep -Fxq "ORCH_CT=__ORCH__" <<<"$environment" || continue
+  trainer_fail_wd=$((trainer_fail_wd + 1))
+done
+echo "TRAINER_FAIL_WD $trainer_fail_wd"
 echo "ORCH_LAST $(sudo docker logs __ORCH__ 2>&1 | strip | grep -a 'SUCCESS Step' | tail -1)"
 echo "BATCH $(sudo docker logs --tail 40 __ORCH__ 2>&1 | grep -oE 'batch [0-9]+/[0-9]+[^;]*; [0-9]+ inflight' | tail -1)"
 echo "FAILS5M $(sudo docker logs --since 5m __ORCH__ 2>&1 | grep -ac 'Rollout failed')"
 echo "ORCH_LOGAGE $(sudo docker logs -t --tail 1 __ORCH__ 2>&1 | tail -1 | cut -d' ' -f1)"
 echo "JUDGE $(curl -s -o /dev/null -m 10 -w '%{http_code}' __JUDGE_URL__/models)"
+zmq_ok=1
+if [ "__ZMQ_PORT__" != 0 ]; then
+  zmq_ok=0
+  zmq_listener=$(ss -H -ltnp 2>/dev/null | awk -v port=":__ZMQ_PORT__" '$4 ~ port "$" {print; exit}')
+  zmq_pid=$(sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' <<<"$zmq_listener")
+  zmq_command=$(ps -o args= -p "$zmq_pid" 2>/dev/null || true)
+  zmq_parent_pid=$(ps -o ppid= -p "$zmq_pid" 2>/dev/null | tr -d ' ')
+  zmq_parent_command=$(ps -o args= -p "$zmq_parent_pid" 2>/dev/null || true)
+  case "$zmq_command" in *"ssh -NT"*"-L 127.0.0.1:__ZMQ_PORT__:__ZMQ_TARGET__"*"__TRAINER_SSH__"*)
+    case "$zmq_parent_command" in *"# zmq-tunnel-__ZMQ_PORT__"*) zmq_ok=1 ;; esac ;;
+  esac
+fi
+echo "ZMQ_TUNNEL $zmq_ok"
 """
 
 node_probe = r"""
@@ -646,10 +730,25 @@ nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader,nounits
   | awk -F, '{m+=$1; u+=$2; n++} END{printf "GPU %d %d %d\n", m/n, u/n, n}'
 free -g | sed -n 2p | awk '{print "MEM " $7 " " $5}'
 df -BG --output=avail,pcent /data | tail -1 | awk '{gsub(/G|%/, ""); print "DISK " $1 " " $2}'
-echo "CT $(sudo docker ps --filter name=^__TRAINER__$ --format '{{.Status}}' 2>/dev/null | head -1)"
+echo "CT $(sudo docker inspect --type container __TRAINER__ --format '{{.Name}} {{.State.Running}} {{.State.Status}}' 2>/dev/null | head -1)"
 """
 
 inference_probe = r"""
+container_state=$(sudo docker inspect --type container __ENGINE__ --format '{{.Name}} {{.State.Running}} {{.State.Status}} {{.State.Pid}}' 2>/dev/null | head -1)
+container_name=$(printf '%s' "$container_state" | awk '{print $1}')
+container_running=$(printf '%s' "$container_state" | awk '{print $2}')
+container_status=$(printf '%s' "$container_state" | awk '{print $3}')
+container_pid=$(printf '%s' "$container_state" | awk '{print $4}')
+container_ok=0
+[ "$container_name" = "/__ENGINE__" ] && [ "$container_running" = true ] &&
+  [ "$container_status" = running ] && [ "$container_pid" -gt 1 ] 2>/dev/null && container_ok=1
+api_listener_ok=0
+api_listener=$(ss -H -ltnp 2>/dev/null | awk -v port=":__API_PORT__" '$4 ~ port "$" {print; exit}')
+api_pid=$(sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' <<<"$api_listener")
+if [ "$container_ok" = 1 ] && [ -n "$api_pid" ] && [ "$api_pid" = "$container_pid" ]; then
+  api_command=$(ps -o args= -p "$api_pid" 2>/dev/null || true)
+  [ -n "$api_command" ] && api_listener_ok=1
+fi
 nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits \
   | awk '{u+=$1; n++} END{printf "GPU %d %d\n", u/n, n}'
 ok=0
@@ -670,7 +769,10 @@ fi
 if [ -n "$policy_marker" ]; then
   policy_values=$(python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); print("\t".join(str(value.get(name, "")) for name in ("step","slot","target_sha256","target_size","config_sha256","config_size")))' "$policy_marker" 2>/dev/null || true)
   read -r policy_step policy_slot policy_target_sha256 policy_target_size policy_config_sha256 policy_config_size <<<"$policy_values"
-  if [ -n "$policy_step" ] && [ -n "$policy_slot" ] && [ -n "$policy_target_sha256" ] \
+  case "$policy_step" in ''|*[!0-9]*) policy_step= ;; esac
+  expected_slot="__POLICY_LORA_NAME__"
+  [ "$policy_step" -gt 0 ] 2>/dev/null && expected_slot="__POLICY_LORA_NAME__-slot$((policy_step % 2))"
+  if [ -n "$policy_step" ] && [ -n "$policy_slot" ] && [ "$policy_slot" = "$expected_slot" ] && [ -n "$policy_target_sha256" ] \
     && [ -n "$policy_target_size" ] && [ -n "$policy_config_sha256" ] && [ -n "$policy_config_size" ]; then
     policy_state=ready
   fi
@@ -715,10 +817,31 @@ done
 [ "$code" = "" ] && code=000
 echo "GEN $code $longest"
 echo "PROBES $ok $total"
+echo "CONTAINER $container_ok"
+echo "API_LISTENER $api_listener_ok"
 echo "POLICY $policy_state ${policy_step:-unknown}"
 echo "RUNNING $(sudo docker logs --since 60s __ENGINE__ 2>&1 | grep -aoE 'Running: [0-9]+' | grep -oE '[0-9]+' | awk 'BEGIN{m=0} {if ($1>m)m=$1} END{print m}')"
 echo "TPUT $(sudo docker logs --since 60s __ENGINE__ 2>&1 | grep -aoE 'generation throughput: [0-9.]+' | grep -oE '[0-9.]+' | awk 'BEGIN{m=0} {if ($1>m)m=$1} END{print m}')"
-echo "WD $(pgrep -f 'bash .*[e]ngine_watchdog.sh' | wc -l)"
+watchdog_ok=0
+watchdog_script="__WATCHDOG_SCRIPT__"
+watchdog_identity="engine-watchdog:__ENGINE_HOST__:__RUN__:__API_PORT__"
+for proc_dir in /proc/[0-9]*; do
+  pid=${proc_dir##*/}
+  [ -r "/proc/$pid/cmdline" ] && [ -r "/proc/$pid/environ" ] || continue
+  command_line=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' ' ' | sed 's/[[:space:]]*$//' || true)
+  case "$command_line" in
+    "bash $watchdog_script"|"/bin/bash $watchdog_script"|"/usr/bin/bash $watchdog_script") ;;
+    *) continue ;;
+  esac
+  environment=$(cat "/proc/$pid/environ" 2>/dev/null | tr '\0' '\n' || true)
+  grep -Fxq "WATCHDOG_IDENTITY=$watchdog_identity" <<<"$environment" || continue
+  grep -Fxq "PORT=__API_PORT__" <<<"$environment" || continue
+  grep -Fxq "ENGINE_CONTAINER=__ENGINE__" <<<"$environment" || continue
+  grep -Fxq "START=__START_SCRIPT__" <<<"$environment" || continue
+  grep -Fxq "MODEL=__MODEL__" <<<"$environment" || continue
+  watchdog_ok=$((watchdog_ok + 1))
+done
+echo "WD $watchdog_ok"
 """
 
 
@@ -727,6 +850,8 @@ def _inference_script(
     model: str,
     container: str,
     policy_broadcast_dir: str = "",
+    policy_lora_name: str = "",
+    run: str = "",
 ) -> str:
     settings = _inference_config(host)
     gpu_count = settings.get("gpu_count")
@@ -754,6 +879,13 @@ def _inference_script(
         .replace("__ENGINE__", container)
         .replace("__PORTS__", " ".join(map(str, ports)))
         .replace("__POLICY_BROADCAST_DIR__", policy_broadcast_dir)
+        .replace("__POLICY_LORA_NAME__", policy_lora_name)
+        .replace("__ENGINE_HOST__", host)
+        .replace("__RUN__", run)
+        .replace("__API_PORT__", str(ports[0]))
+        .replace("__WATCHDOG_SCRIPT__", f"{runtime_root}/h200/engine_watchdog.sh")
+        .replace("__START_SCRIPT__", f"{runtime_root}/h200/start_inference.sh")
+        .replace("__MODEL__", model)
     )
 
 
@@ -766,6 +898,7 @@ def _head_script() -> str:
         )
         .replace("__ORCH__", orchestrator_container)
         .replace("__ADAPTER__", str(adapter_port))
+        .replace("__ADAPTER_CONTAINER__", adapter_container)
     )
 
 
@@ -815,13 +948,21 @@ class EngineState:
     running: int = 0
     throughput: float = 0.0
     watchdog: bool = False
+    container: bool = False
+    api_listener: bool = False
     policy_state: str = "ready"
     policy_step: int | None = None
     reachable: bool = True
 
     @property
     def healthy(self) -> bool:
-        return self.gen_code == "200" and self.policy_state == "ready"
+        return (
+            self.gen_code == "200"
+            and self.policy_state == "ready"
+            and self.container is True
+            and self.api_listener is True
+            and self.watchdog is True
+        )
 
 
 @dataclass
@@ -948,6 +1089,7 @@ class Status:
     orch_log_age: float | None = None
     judge: str = "000"
     adapter: str = "000"
+    zmq_tunnel: bool = False
     nodes: list[NodeState] = field(default_factory=list)
     engines: list[EngineState] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -1148,7 +1290,11 @@ def _numbers(values: dict[str, list[object]], keys: tuple[str, ...]) -> list[flo
     out = []
     for key in keys:
         for value in values.get(key, []):
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+            ):
                 out.append(float(value))
     return out
 
@@ -1855,6 +2001,8 @@ def status(run: str = "", quiet: bool = False) -> Status:
     trainer_only = _trainer_mode() == "trainer-only"
     policy_probe = None if trainer_only else _active_policy_probe_config(run)
     policy_broadcast_dir = policy_probe[0] if policy_probe is not None else ""
+    policy_lora_name = policy_probe[1] if policy_probe is not None else ""
+    run_name, rollout_transport, run_dir, zmq_port, zmq_target = _status_runtime_identity(run)
 
     def node(h):
         return _ssh(h, node_probe.replace("__TRAINER__", trainer_container), timeout=60)
@@ -1863,7 +2011,12 @@ def status(run: str = "", quiet: bool = False) -> Status:
         return _ssh(
             h,
             _inference_script(
-                h, glm_model, glm_inference_container, policy_broadcast_dir
+                h,
+                glm_model,
+                glm_inference_container,
+                policy_broadcast_dir,
+                policy_lora_name,
+                run,
             ),
             timeout=90,
         )
@@ -1886,12 +2039,26 @@ def status(run: str = "", quiet: bool = False) -> Status:
             engines_out = {}
         else:
             f_head = ex.submit(_ssh, trainer_head, _head_script(), 300)
+            trainer_nodes = [host for host in trainer_hosts if host not in blocked_hosts]
+            trainer_addresses = " ".join(_ssh_address(host) for host in trainer_nodes)
+            if not trainer_addresses:
+                raise RuntimeError("configured trainer addresses are empty")
             f_edge_orch = ex.submit(
                 _ssh,
                 orchestrator_host,
-                orchestrator_probe.replace("__ORCH__", orchestrator_container).replace(
-                    "__JUDGE_URL__", judge_api_url
-                ),
+                orchestrator_probe.replace("__ORCH__", orchestrator_container)
+                .replace("__JUDGE_URL__", judge_api_url)
+                .replace("__RUN__", run)
+                .replace("__RUN_NAME__", run_name)
+                .replace("__RUN_DIR__", run_dir)
+                .replace("__ROLLOUT_TRANSPORT__", rollout_transport)
+                .replace("__BATCH_SYNC_SCRIPT__", f"{runtime_root}/h200/sync_rollout_batches.sh")
+                .replace("__TRAINER_WATCHDOG_SCRIPT__", f"{runtime_root}/h200/trainer_failure_watchdog.sh")
+                .replace("__TRAINER_ADDRESSES__", trainer_addresses)
+                .replace("__TRAINER_CT__", trainer_container)
+                .replace("__TRAINER_SSH__", hosts["trainer_ssh"])
+                .replace("__ZMQ_PORT__", str(zmq_port))
+                .replace("__ZMQ_TARGET__", zmq_target),
                 120,
             )
             f_nodes = ex.submit(_fan, trainer_hosts, node)
@@ -1923,7 +2090,7 @@ def status(run: str = "", quiet: bool = False) -> Status:
     s.orch_failed = int(h.get("ORCH_FAILED", 0) or 0) > 0
     s.orch_up = h.get("ORCH_UP", "") == "up" and not s.orch_failed
     s.batch_sync = int(h.get("BATCH_SYNC", 0) or 0) > 0
-    s.trainer_failure_watchdog = int(h.get("TRAINER_FAIL_WD", 0) or 0) > 0
+    s.trainer_failure_watchdog = int(h.get("TRAINER_FAIL_WD", 0) or 0) == 1
     s.trainer_steps = int(h.get("TRAINER_STEPS", 0) or 0)
     state = h.get("TRAINER_COMPUTE_STATE", "pending")
     if state in {"pending", "active", "complete", "unknown"}:
@@ -1949,6 +2116,7 @@ def status(run: str = "", quiet: bool = False) -> Status:
     s.orch_log_age = _age(h.get("ORCH_LOGAGE", ""))
     s.judge = h.get("JUDGE", "000")
     s.adapter = h.get("ADAPTER", "000")
+    s.zmq_tunnel = h.get("ZMQ_TUNNEL", "0") == "1"
 
     for host, (rc, out) in nodes_out.items():
         n = NodeState(host=host, reachable=(rc == 0))
@@ -1965,7 +2133,7 @@ def status(run: str = "", quiet: bool = False) -> Status:
         s.nodes.append(n)
 
     cluster_trainers_up = len(s.nodes) == len(trainer_hosts) and all(
-        n.reachable and n.container.startswith("Up") for n in s.nodes
+        n.reachable and n.container == f"/{trainer_container} true running" for n in s.nodes
     )
     s.trainer_up = head_trainer_up and cluster_trainers_up
 
@@ -1984,7 +2152,11 @@ def status(run: str = "", quiet: bool = False) -> Status:
             elif p[:1] == ["TPUT"] and len(p) >= 2:
                 e.throughput = float(p[1])
             elif p[:1] == ["WD"] and len(p) >= 2:
-                e.watchdog = int(p[1]) > 0
+                e.watchdog = p[1] == "1"
+            elif p[:1] == ["CONTAINER"] and len(p) >= 2:
+                e.container = p[1] == "1"
+            elif p[:1] == ["API_LISTENER"] and len(p) >= 2:
+                e.api_listener = p[1] == "1"
             elif p[:1] == ["POLICY"] and len(p) >= 2:
                 e.policy_state = p[1]
                 if len(p) >= 3 and p[2].isdigit():
@@ -2046,7 +2218,13 @@ def _warnings(s: Status) -> list[str]:
             w.append(
                 f"{e.host} is staging the active policy adapter; completion health is pending"
             )
-        elif e.reachable and not e.healthy:
+        if e.reachable and e.container is False:
+            w.append(f"{e.host} is not running the exact configured inference container")
+        if e.reachable and e.api_listener is False:
+            w.append(f"{e.host} API listener PID/command does not match the configured container")
+        if e.reachable and e.policy_state != "ready":
+            w.append(f"{e.host} active LoRA name/slot or policy identity is not exact ({e.policy_state})")
+        if e.reachable and not e.healthy:
             if e.watchdog:
                 w.append(
                     f"{e.host} failed a real completion probe (code {e.gen_code}), but its watchdog is active. "
@@ -2056,7 +2234,7 @@ def _warnings(s: Status) -> list[str]:
                 w.append(
                     f"{e.host} failed a real completion probe (code {e.gen_code}). Run repair('engine:{e.host}')."
                 )
-        if e.reachable and not e.watchdog:
+        if e.reachable and e.watchdog is False:
             w.append(f"{e.host} has no engine watchdog running")
     if not trainer_only and s.judge != "200":
         w.append(
@@ -2066,6 +2244,10 @@ def _warnings(s: Status) -> list[str]:
         w.append(
             f"adapter server returned {s.adapter} on port {adapter_port}. "
             "If the engines cannot fetch the LoRA, they keep serving the base model and nothing learns."
+        )
+    if not trainer_only and not s.zmq_tunnel:
+        w.append(
+            "configured ZMQ tunnel listener is missing or its PID/command/forward target does not match"
         )
     if s.orch_up and not s.batch_sync:
         w.append("durable batch publisher is not running; completed rollout batches cannot reach the trainer")
@@ -2124,13 +2306,19 @@ def engines(run: str = "") -> dict[str, EngineState]:
     run = run or current_run()
     policy_probe = _active_policy_probe_config(run)
     policy_broadcast_dir = policy_probe[0] if policy_probe is not None else ""
+    policy_lora_name = policy_probe[1] if policy_probe is not None else ""
     states = []
     for host, (rc, out) in _fan(
         inference_hosts,
         lambda h: _ssh(
             h,
             _inference_script(
-                h, glm_model, glm_inference_container, policy_broadcast_dir
+                h,
+                glm_model,
+                glm_inference_container,
+                policy_broadcast_dir,
+                policy_lora_name,
+                run,
             ),
             timeout=90,
         ),
@@ -2149,7 +2337,11 @@ def engines(run: str = "") -> dict[str, EngineState]:
             elif p[:1] == ["TPUT"] and len(p) >= 2:
                 e.throughput = float(p[1])
             elif p[:1] == ["WD"] and len(p) >= 2:
-                e.watchdog = int(p[1]) > 0
+                e.watchdog = p[1] == "1"
+            elif p[:1] == ["CONTAINER"] and len(p) >= 2:
+                e.container = p[1] == "1"
+            elif p[:1] == ["API_LISTENER"] and len(p) >= 2:
+                e.api_listener = p[1] == "1"
             elif p[:1] == ["POLICY"] and len(p) >= 2:
                 e.policy_state = p[1]
                 if len(p) >= 3 and p[2].isdigit():

@@ -16,7 +16,6 @@ import verifiers.v1 as vf
 from httpx import AsyncClient
 from openai import AsyncOpenAI, NotFoundError
 from renderers import RendererConfig
-from tenacity import AsyncRetrying, retry, retry_if_exception, stop_after_attempt, stop_after_delay, wait_exponential
 from verifiers.v1.clients.config import EvalClientConfig, TrainClientConfig
 
 from prime_rl.configs.shared import ClientConfig
@@ -383,7 +382,7 @@ def setup_admin_clients(client_config: ClientConfig) -> list[AsyncClient]:
             base_url=base_url,
             headers=headers,
             limits=httpx.Limits(max_connections=4, max_keepalive_connections=1),
-            timeout=httpx.Timeout(None),
+            timeout=httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0),
         )
 
     return [_setup_admin_client(base_url) for base_url in urls]
@@ -396,10 +395,26 @@ async def maybe_check_has_model(
         return
     logger = get_logger()
     logger.debug(f"Checking if model {model_name} is in the inference pool")
-    results = await asyncio.gather(*[admin_client.get("/v1/models") for admin_client in admin_clients])
+    async def _models(client: AsyncClient) -> httpx.Response:
+        response = await client.get(
+            "/v1/models",
+            timeout=httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0),
+        )
+        response.raise_for_status()
+        return response
+
+    tasks = [asyncio.create_task(_models(admin_client)) for admin_client in admin_clients]
+    try:
+        results = await asyncio.gather(*tasks)
+    except BaseException:
+        await _cancel_and_reap(tasks)
+        raise
     for admin_client, result in zip(admin_clients, results):
-        models = result.json()["data"]
-        if not any(model["id"] == model_name for model in models):
+        payload = result.json()
+        models = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(models, list) or not all(isinstance(model, dict) for model in models):
+            raise RuntimeError(f"model response from {admin_client.base_url} has invalid data")
+        if not any(model.get("id") == model_name for model in models):
             raise ValueError(f"Model {model_name} was not found in the inference pool on {admin_client.base_url}")
     logger.debug(f"Model {model_name} was found in the inference pool")
 
@@ -428,28 +443,66 @@ async def check_health(
     logger = get_logger()
 
     async def _check_health(admin_client: AsyncClient) -> None:
-        wait_time = 0
+        started = time.monotonic()
+        deadline = started + max(0.0, float(timeout))
         logger.debug("Starting pinging /health to check health")
-        while wait_time < timeout:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
             try:
-                await admin_client.get("/health")
-                logger.debug(f"Inference pool is ready after {wait_time} seconds")
+                request_timeout = min(30.0, remaining)
+                response = await asyncio.wait_for(
+                    admin_client.get(
+                        "/health",
+                        timeout=httpx.Timeout(
+                            connect=min(10.0, request_timeout),
+                            read=request_timeout,
+                            write=request_timeout,
+                            pool=min(10.0, request_timeout),
+                        ),
+                    ),
+                    timeout=request_timeout,
+                )
+                if response.status_code == 404:
+                    logger.warning("The route /health does not exist. Skipping health check.")
+                    return
+                response.raise_for_status()
+                logger.debug(f"Inference pool is ready after {time.monotonic() - started:.3f} seconds")
                 return
             except NotFoundError:
                 logger.warning("The route /health does not exist. Skipping health check.")
                 return
-            except Exception as e:
-                if wait_time % log_interval == 0 and wait_time > 0:
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 404:
+                    logger.warning("The route /health does not exist. Skipping health check.")
+                    return
+                elapsed = time.monotonic() - started
+                if elapsed >= log_interval:
                     logger.warning(
-                        f"Inference server was not reached after {wait_time} seconds (Error: {e}) on {admin_client.base_url}"
+                        f"Inference server was not reached after {elapsed:.1f} seconds (Error: {e}) on {admin_client.base_url}"
                     )
-                await asyncio.sleep(interval)
-                wait_time += interval
-        msg = f"Inference server is not ready after {wait_time} (>{timeout}) seconds. Aborting..."
+            except Exception as e:
+                elapsed = time.monotonic() - started
+                if elapsed >= log_interval:
+                    logger.warning(
+                        f"Inference server was not reached after {elapsed:.1f} seconds (Error: {e}) on {admin_client.base_url}"
+                    )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(max(0.0, interval), remaining))
+        elapsed = time.monotonic() - started
+        msg = f"Inference server is not ready after {elapsed:.3f} seconds (>{timeout}) seconds. Aborting..."
         logger.error(msg)
         raise TimeoutError(msg)
 
-    await asyncio.gather(*[_check_health(admin_client) for admin_client in admin_clients])
+    tasks = [asyncio.create_task(_check_health(admin_client)) for admin_client in admin_clients]
+    try:
+        await asyncio.gather(*tasks)
+    except BaseException:
+        await _cancel_and_reap(tasks)
+        raise
 
 
 NCCL_READY_MARKER = "NCCL_READY"
@@ -462,28 +515,31 @@ def _is_retryable_admin_error(exception: BaseException) -> bool:
         # client errors (4xx) won't fix themselves on retry.
         return exception.response.status_code >= 500
     # Retry on transport-level failures (timeouts, connection resets, etc.) so the
-    # per-attempt read timeout below turns a stuck server into a bounded retry loop
-    # instead of hanging forever on the global timeout=None admin client.
-    if isinstance(exception, (httpx.TimeoutException, httpx.TransportError)):
+    # per-attempt read timeout below turns a stuck server into a bounded retry loop.
+    if isinstance(exception, (TimeoutError, httpx.TimeoutException, httpx.TransportError)):
         return True
     return False
 
 
-# Per-attempt read timeout for admin ops, overridable per call. The admin
-# AsyncClient uses `timeout=None`, so without this a stuck server would hang the
-# weight update forever: the read timeout converts a hang into a TimeoutException
-# that tenacity retries. Sized for `/pause`, which drains in-flight requests
+# Per-attempt read timeout for admin ops, overridable per call. The read
+# timeout converts a hang into a TimeoutException that the retry loop can
+# handle. Sized for `/pause`, which drains in-flight requests
 # (mode="keep") and so can legitimately take a while.
 ADMIN_TIMEOUT_S = 300.0
+POLICY_PHASE_TIMEOUT_S = 600.0
 # `/update_weights` runs a collective NCCL receive across all DP workers, which
 # can take longer than the other admin ops.
 UPDATE_WEIGHTS_TIMEOUT_S = 720.0
 FULL_CHECKPOINT_STAGE_TIMEOUT_S = 600.0
-# A TP8 LoRA load can leave the engine busy after the load request has completed.
-# Keep resume separate from the shorter pause and update budgets.
-RESUME_ATTEMPT_TIMEOUT_S = 900.0
-RESUME_TOTAL_TIMEOUT_S = 1800.0
-RESUME_CONFIRM_TIMEOUT_S = 120.0
+# Per-step LoRA policy phases use one absolute 600-second deadline.
+RESUME_ATTEMPT_TIMEOUT_S = 600.0
+RESUME_TOTAL_TIMEOUT_S = 600.0
+RESUME_CONFIRM_TIMEOUT_S = 600.0
+# Full-model bootstrap keeps its historical, separate resume confirmation
+# budget. It is never used when a per-step deadline is supplied.
+FULL_RESUME_ATTEMPT_TIMEOUT_S = 900.0
+FULL_RESUME_TOTAL_TIMEOUT_S = 1800.0
+FULL_RESUME_CONFIRM_TIMEOUT_S = 120.0
 RESUME_PROBE_TIMEOUT_S = 10.0
 RESUME_PROBE_INTERVAL_S = 2.0
 
@@ -494,6 +550,7 @@ async def _admin_post(
     *,
     timeout_s: float = ADMIN_TIMEOUT_S,
     total_timeout_s: float | None = None,
+    deadline: float | None = None,
     **kwargs,
 ) -> None:
     """POST an admin op with a bounded retry budget."""
@@ -502,6 +559,7 @@ async def _admin_post(
         path,
         timeout_s=timeout_s,
         total_timeout_s=total_timeout_s,
+        deadline=deadline,
         **kwargs,
     )
 
@@ -512,29 +570,60 @@ async def _admin_post_response(
     *,
     timeout_s: float = ADMIN_TIMEOUT_S,
     total_timeout_s: float | None = None,
+    deadline: float | None = None,
     max_attempts: int = 10,
     **kwargs,
 ) -> httpx.Response:
     """POST an admin operation and return its successful response."""
-    retry_budget = 2 * timeout_s if total_timeout_s is None else total_timeout_s
-    async for attempt in AsyncRetrying(
-        retry=retry_if_exception(_is_retryable_admin_error),
-        stop=stop_after_delay(retry_budget) | stop_after_attempt(max_attempts),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        reraise=True,
-    ):
-        with attempt:
-            response = await client.post(
-                path,
-                timeout=httpx.Timeout(connect=10.0, read=timeout_s, write=60.0, pool=10.0),
-                **kwargs,
-            )
+    loop = asyncio.get_running_loop()
+    if deadline is None:
+        retry_budget = 2 * timeout_s if total_timeout_s is None else total_timeout_s
+        deadline = loop.time() + retry_budget
+    elif total_timeout_s is not None:
+        deadline = min(deadline, loop.time() + total_timeout_s)
+    delay = 1.0
+    for attempt in range(max_attempts):
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise TimeoutError(f"admin operation timed out: {path}")
+        attempt_timeout = min(timeout_s, remaining)
+        try:
+            try:
+                response = await asyncio.wait_for(
+                    client.post(
+                        path,
+                        timeout=httpx.Timeout(
+                            connect=min(10.0, attempt_timeout),
+                            read=attempt_timeout,
+                            write=min(60.0, attempt_timeout),
+                            pool=min(10.0, attempt_timeout),
+                        ),
+                        **kwargs,
+                    ),
+                    timeout=attempt_timeout,
+                )
+            except asyncio.TimeoutError as exc:
+                raise TimeoutError(f"admin request timed out: {path}") from exc
             response.raise_for_status()
             return response
+        except BaseException as exc:
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            if (
+                not _is_retryable_admin_error(exc)
+                or attempt + 1 >= max_attempts
+                or deadline - loop.time() <= 0
+            ):
+                raise
+            remaining = deadline - loop.time()
+            await asyncio.sleep(min(delay, remaining))
+            delay = min(delay * 2.0, 10.0)
     raise RuntimeError(f"admin operation did not complete: {path}")
 
 
-async def _pause_engines(admin_clients: list[AsyncClient], *, step: int) -> None:
+async def _pause_engines(
+    admin_clients: list[AsyncClient], *, step: int, deadline: float | None = None
+) -> None:
     """Abort registered requests and pause every inference scheduler.
 
     The dispatcher has preserved every prompt that needs regeneration.
@@ -543,13 +632,34 @@ async def _pause_engines(admin_clients: list[AsyncClient], *, step: int) -> None
     """
     logger = get_logger()
     logger.info(f"Updating policy in-flight to v{step}")
-    await asyncio.gather(
-        *[_admin_post(client, "/pause", params={"mode": "abort", "clear_cache": "false"}) for client in admin_clients]
-    )
+    tasks = [
+        asyncio.create_task(
+            _admin_post(
+                client,
+                "/pause",
+                params={"mode": "abort", "clear_cache": "false"},
+                deadline=deadline,
+            )
+        )
+        for client in admin_clients
+    ]
+    try:
+        if deadline is None:
+            await asyncio.gather(*tasks)
+        else:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise TimeoutError("policy pause phase exceeded its 600-second deadline")
+            await asyncio.wait_for(asyncio.gather(*tasks), timeout=remaining)
+    except BaseException:
+        await _cancel_and_reap(tasks)
+        raise
     logger.debug("All inference engines paused")
 
 
-async def _resume_engines(admin_clients: list[AsyncClient]) -> None:
+async def _resume_engines(
+    admin_clients: list[AsyncClient], *, deadline: float | None = None
+) -> None:
     """Resume all inference engines after weight update.
 
     Resuming is idempotent. A timeout does not prove that the request failed:
@@ -558,16 +668,25 @@ async def _resume_engines(admin_clients: list[AsyncClient]) -> None:
     """
     logger = get_logger()
 
-    async def _read_resume_state(client: AsyncClient) -> tuple[str | None, bool, bool]:
+    async def _read_resume_state(
+        client: AsyncClient, phase_deadline: float | None
+    ) -> tuple[str | None, bool, bool]:
         """Return state, route availability, and explicit route absence."""
         try:
+            remaining = (
+                phase_deadline - asyncio.get_running_loop().time()
+                if phase_deadline is not None
+                else RESUME_PROBE_TIMEOUT_S
+            )
+            if remaining <= 0:
+                return None, False, False
             response = await client.get(
                 "/resume_status",
                 timeout=httpx.Timeout(
                     connect=10.0,
-                    read=RESUME_PROBE_TIMEOUT_S,
-                    write=10.0,
-                    pool=10.0,
+                    read=min(RESUME_PROBE_TIMEOUT_S, remaining),
+                    write=min(10.0, remaining),
+                    pool=min(10.0, remaining),
                 ),
             )
         except (TimeoutError, httpx.TimeoutException, httpx.TransportError):
@@ -580,50 +699,72 @@ async def _resume_engines(admin_clients: list[AsyncClient]) -> None:
             raise RuntimeError(f"invalid resume state from {client.base_url}: {state!r}")
         return state, True, False
 
-    async def _is_live(client: AsyncClient) -> bool:
+    async def _is_live(client: AsyncClient, phase_deadline: float | None) -> bool:
         try:
+            remaining = (
+                phase_deadline - asyncio.get_running_loop().time()
+                if phase_deadline is not None
+                else RESUME_PROBE_TIMEOUT_S
+            )
+            if remaining <= 0:
+                return False
             response = await client.get(
                 "/liveness",
                 timeout=httpx.Timeout(
                     connect=10.0,
-                    read=RESUME_PROBE_TIMEOUT_S,
-                    write=10.0,
-                    pool=10.0,
+                    read=min(RESUME_PROBE_TIMEOUT_S, remaining),
+                    write=min(10.0, remaining),
+                    pool=min(10.0, remaining),
                 ),
             )
         except (TimeoutError, httpx.TimeoutException, httpx.TransportError):
             return False
         return response.status_code == 200
 
-    async def _confirm_resume(client: AsyncClient) -> tuple[bool, bool]:
-        deadline = asyncio.get_running_loop().time() + RESUME_CONFIRM_TIMEOUT_S
+    async def _confirm_resume(
+        client: AsyncClient, phase_deadline: float | None
+    ) -> tuple[bool, bool]:
+        confirm_deadline = (
+            phase_deadline
+            if phase_deadline is not None
+            else asyncio.get_running_loop().time() + FULL_RESUME_CONFIRM_TIMEOUT_S
+        )
         state_endpoint_available = False
         while True:
-            state, route_available, route_missing = await _read_resume_state(client)
+            state, route_available, route_missing = await _read_resume_state(client, confirm_deadline)
             if route_available:
                 state_endpoint_available = True
-                if state == "running" and await _is_live(client):
+                if state == "running" and await _is_live(client, confirm_deadline):
                     return True, True
-            elif route_missing and await _is_live(client):
+            elif route_missing and await _is_live(client, confirm_deadline):
                 # Older servers have no state route. Liveness is weaker evidence,
                 # so the log must identify that this path was used.
                 return True, False
 
-            remaining = deadline - asyncio.get_running_loop().time()
+            remaining = confirm_deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 return False, state_endpoint_available
             await asyncio.sleep(min(RESUME_PROBE_INTERVAL_S, remaining))
 
-    async def _resume_one(client: AsyncClient) -> None:
+    async def _resume_one(client: AsyncClient, phase_deadline: float | None) -> None:
         try:
             await _admin_post(
                 client,
                 "/resume",
-                timeout_s=RESUME_ATTEMPT_TIMEOUT_S,
-                total_timeout_s=RESUME_TOTAL_TIMEOUT_S,
+                timeout_s=(
+                    FULL_RESUME_ATTEMPT_TIMEOUT_S
+                    if phase_deadline is None
+                    else RESUME_ATTEMPT_TIMEOUT_S
+                ),
+                total_timeout_s=(
+                    FULL_RESUME_TOTAL_TIMEOUT_S
+                    if phase_deadline is None
+                    else None
+                ),
+                deadline=phase_deadline,
             )
         except (TimeoutError, httpx.TimeoutException, httpx.TransportError) as exc:
-            confirmed, state_endpoint_available = await _confirm_resume(client)
+            confirmed, state_endpoint_available = await _confirm_resume(client, phase_deadline)
             if confirmed:
                 evidence = "resume state and liveness" if state_endpoint_available else "liveness only"
                 logger.warning(
@@ -636,7 +777,18 @@ async def _resume_engines(admin_clients: list[AsyncClient]) -> None:
                 "resume state and liveness probes"
             ) from exc
 
-    await asyncio.gather(*[_resume_one(client) for client in admin_clients])
+    tasks = [asyncio.create_task(_resume_one(client, deadline)) for client in admin_clients]
+    try:
+        if deadline is None:
+            await asyncio.gather(*tasks)
+        else:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise TimeoutError("policy resume phase exceeded its 600-second deadline")
+            await asyncio.wait_for(asyncio.gather(*tasks), timeout=remaining)
+    except BaseException:
+        await _cancel_and_reap(tasks)
+        raise
     logger.debug("All inference engines resumed")
 
 
@@ -758,7 +910,7 @@ async def stage_lora_adapter(
         )
         def metric(name: str, fallback: float | None = None) -> float | None:
             value = payload.get(name, fallback)
-            return float(value) if isinstance(value, (int, float)) and value >= 0 else None
+            return float(value) if _is_finite_number(value) and float(value) >= 0 else None
 
         total_stage_seconds = metric("total_stage_wall_seconds", metric("stage_seconds"))
         if total_stage_seconds is None:
@@ -836,7 +988,11 @@ async def stage_lora_adapter(
         if policy_step is None:
             raise RuntimeError("adapter policy step is required for delta staging")
         stage_limit = adapter_stage_limit_seconds(policy_step)
-        selected_deadline = time.monotonic() + min(stage_limit, configured_delta_timeout)
+        # A policy adapter stage has one absolute phase deadline. Keep any
+        # caller-provided deadline as the stricter bound, and never reset it
+        # while probing the manifest or retrying a host.
+        selected_deadline = time.monotonic() + POLICY_PHASE_TIMEOUT_S
+        selected_deadline = min(selected_deadline, time.monotonic() + min(stage_limit, configured_delta_timeout))
         if delta_deadline is None:
             delta_deadline = selected_deadline
         else:
@@ -1072,8 +1228,10 @@ async def update_weights(
 
     if lora_name is not None and weight_dir is not None:
         # Pause admission while the collective LoRA load runs.
-        await _pause_engines(admin_clients, step=step)
+        pause_deadline = time.monotonic() + POLICY_PHASE_TIMEOUT_S
+        await _pause_engines(admin_clients, step=step, deadline=pause_deadline)
         try:
+            load_deadline = time.monotonic() + POLICY_PHASE_TIMEOUT_S
             receipts = await load_lora_adapter(
                 admin_clients,
                 lora_name,
@@ -1081,9 +1239,11 @@ async def update_weights(
                 require_delta=require_delta,
                 prefetched=prefetched,
                 expected_identity=expected_adapter_identity,
+                deadline=load_deadline,
             )
         finally:
-            await _resume_engines(admin_clients)
+            resume_deadline = time.monotonic() + POLICY_PHASE_TIMEOUT_S
+            await _resume_engines(admin_clients, deadline=resume_deadline)
         return receipts
     else:
         # Pause engines so all DP workers drain in-flight work and can join the NCCL broadcast
@@ -1118,7 +1278,12 @@ async def update_weights(
                         timeout_s=UPDATE_WEIGHTS_TIMEOUT_S,
                     )
 
-            await asyncio.gather(*[_update(admin_client) for admin_client in admin_clients])
+            tasks = [asyncio.create_task(_update(admin_client)) for admin_client in admin_clients]
+            try:
+                await asyncio.gather(*tasks)
+            except BaseException:
+                await _cancel_and_reap(tasks)
+                raise
         finally:
             await _resume_engines(admin_clients)
 
@@ -1131,7 +1296,7 @@ def _is_retryable_lora_error(exception: BaseException) -> bool:
     # Retry on transport-level failures (timeouts, connection resets, etc.) so
     # the per-call read timeout below turns a stuck server into a bounded retry
     # loop instead of propagating as a hard failure on the first hiccup.
-    if isinstance(exception, (httpx.TimeoutException, httpx.TransportError)):
+    if isinstance(exception, (TimeoutError, httpx.TimeoutException, httpx.TransportError)):
         return True
     return False
 
@@ -1193,6 +1358,7 @@ async def load_lora_adapter(
     require_delta: bool = False,
     prefetched: bool = False,
     expected_identity: Mapping[str, object] | None = None,
+    deadline: float | None = None,
 ) -> list[AdapterIdentity]:
     """Make a HTTP post request to the vLLM server to load a LoRA adapter.
 
@@ -1211,11 +1377,21 @@ async def load_lora_adapter(
     effective_expected_identity = expected_identity
     if remote_adapter and effective_expected_identity is None:
         raise RuntimeError("remote LoRA load has no verified staged adapter identity")
+    if deadline is None:
+        deadline = time.monotonic() + LORA_LOAD_TOTAL_TIMEOUT_S
 
     async def _read_loaded_receipt(admin_client: AsyncClient) -> AdapterIdentity:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("LoRA load phase exceeded its 600-second deadline")
         response = await admin_client.get(
             "/staging_status",
-            timeout=httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0),
+            timeout=httpx.Timeout(
+                connect=min(10.0, remaining),
+                read=min(30.0, remaining),
+                write=min(30.0, remaining),
+                pool=min(30.0, remaining),
+            ),
         )
         response.raise_for_status()
         payload = response.json()
@@ -1228,68 +1404,75 @@ async def load_lora_adapter(
             expected=effective_expected_identity,
         )
 
-    @retry(
-        retry=retry_if_exception(_is_retryable_lora_error),
-        # An engine restart takes 5 to 10 minutes. Keep retrying for the
-        # complete wall-clock budget instead of stopping after ten fast
-        # connection failures.
-        stop=stop_after_delay(LORA_LOAD_TOTAL_TIMEOUT_S),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        reraise=True,
-    )
     async def _load_lora_adapter(admin_client: AsyncClient) -> AdapterIdentity | None:
-        logger.debug(f"Sending request to load LoRA adapter {lora_name} from {lora_path}")
-        try:
-            # Some vLLM workers finish the collective LoRA load but never
-            # finish the HTTP response. Enforce one absolute deadline in
-            # addition to httpx's idle read timeout.
-            response = await asyncio.wait_for(
-                admin_client.post(
-                    "/load_lora_adapter",
-                    json={
-                        "lora_name": lora_name,
-                        "lora_path": lora_path_posix,
-                        "require_delta": require_delta,
-                        "prefetched": prefetched,
-                    },
-                    timeout=httpx.Timeout(
-                        connect=10.0,
-                        read=LORA_LOAD_READ_TIMEOUT_S,
-                        write=60.0,
-                        pool=10.0,
-                    ),
-                ),
-                timeout=LORA_LOAD_READ_TIMEOUT_S,
-            )
-            response.raise_for_status()
-            if not remote_adapter:
-                return None
+        delay = 1.0
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("LoRA load phase exceeded its 600-second deadline")
+            logger.debug(f"Sending request to load LoRA adapter {lora_name} from {lora_path}")
             try:
-                payload = response.json()
-            except ValueError as exc:
-                raise RuntimeError(f"invalid LoRA load response from {admin_client.base_url}") from exc
-            if not isinstance(payload, dict) or payload.get("status") != "ok":
-                raise RuntimeError(f"LoRA load failed on {admin_client.base_url}: {payload!r}")
-            receipt = payload.get("loaded_receipt") if isinstance(payload, dict) else None
-            return _validate_loaded_receipt(
-                receipt,
-                source_url=lora_path_posix,
-                lora_name=lora_name,
-                expected=effective_expected_identity,
-            )
-        except (TimeoutError, httpx.TimeoutException, httpx.TransportError):
-            if lora_path_posix.startswith(("http://", "https://")):
+                read_timeout = min(LORA_LOAD_READ_TIMEOUT_S, remaining)
+                # Some vLLM workers finish the collective LoRA load but never
+                # finish the HTTP response. Enforce one absolute deadline in
+                # addition to httpx's idle read timeout.
+                response = await asyncio.wait_for(
+                    admin_client.post(
+                        "/load_lora_adapter",
+                        json={
+                            "lora_name": lora_name,
+                            "lora_path": lora_path_posix,
+                            "require_delta": require_delta,
+                            "prefetched": prefetched,
+                        },
+                        timeout=httpx.Timeout(
+                            connect=min(10.0, read_timeout),
+                            read=read_timeout,
+                            write=min(60.0, read_timeout),
+                            pool=min(10.0, read_timeout),
+                        ),
+                    ),
+                    timeout=read_timeout,
+                )
+                response.raise_for_status()
+                if not remote_adapter:
+                    return None
                 try:
-                    receipt = await _read_loaded_receipt(admin_client)
-                except Exception:
-                    receipt = None
-                if receipt is not None:
-                    logger.warning(
-                        f"LoRA load response from {admin_client.base_url} did not finish, "
-                        "but its exact loaded adapter receipt is available; accepting the load"
-                    )
-                    return receipt
-            raise
+                    payload = response.json()
+                except ValueError as exc:
+                    raise RuntimeError(f"invalid LoRA load response from {admin_client.base_url}") from exc
+                if not isinstance(payload, dict) or payload.get("status") != "ok":
+                    raise RuntimeError(f"LoRA load failed on {admin_client.base_url}: {payload!r}")
+                receipt = payload.get("loaded_receipt") if isinstance(payload, dict) else None
+                return _validate_loaded_receipt(
+                    receipt,
+                    source_url=lora_path_posix,
+                    lora_name=lora_name,
+                    expected=effective_expected_identity,
+                )
+            except (TimeoutError, httpx.TimeoutException, httpx.TransportError) as exc:
+                if remote_adapter:
+                    try:
+                        receipt = await _read_loaded_receipt(admin_client)
+                    except Exception:
+                        receipt = None
+                    if receipt is not None:
+                        logger.warning(
+                            f"LoRA load response from {admin_client.base_url} did not finish, "
+                            "but its exact loaded adapter receipt is available; accepting the load"
+                        )
+                        return receipt
+                retry_error: BaseException = exc
+            except Exception as exc:
+                retry_error = exc
+
+            if not _is_retryable_lora_error(retry_error):
+                raise retry_error
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("LoRA load phase exceeded its 600-second deadline") from retry_error
+            await asyncio.sleep(min(delay, remaining))
+            delay = min(delay * 2.0, 10.0)
 
     tasks = [asyncio.create_task(_load_lora_adapter(admin_client)) for admin_client in admin_clients]
     try:
@@ -1306,11 +1489,21 @@ async def unload_lora_adapter(admin_clients: list[AsyncClient], lora_name: str) 
 
     async def _unload_lora_adapter(admin_client: AsyncClient) -> None:
         logger.debug(f"Sending request to unload LoRA adapter {lora_name}")
-        await admin_client.post("/v1/unload_lora_adapter", json={"lora_name": lora_name})
+        response = await admin_client.post(
+            "/v1/unload_lora_adapter",
+            json={"lora_name": lora_name},
+            timeout=httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0),
+        )
+        response.raise_for_status()
         # TODO: The first one can fail, but subsequent ones should succeed.
         # response.raise_for_status()
 
-    await asyncio.gather(*[_unload_lora_adapter(admin_client) for admin_client in admin_clients])
+    tasks = [asyncio.create_task(_unload_lora_adapter(admin_client)) for admin_client in admin_clients]
+    try:
+        await asyncio.gather(*tasks)
+    except BaseException:
+        await _cancel_and_reap(tasks)
+        raise
 
 
 async def init_nccl_broadcast(

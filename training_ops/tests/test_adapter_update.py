@@ -567,10 +567,12 @@ class AdapterUpdateTest(unittest.TestCase):
             orch_up=False,
             engines=[
                 training_ops.EngineState(
-                    host="h200a", gen_code="200", probes_ok=1, probes_total=1
+                    host="h200a", gen_code="200", probes_ok=1, probes_total=1,
+                    container=True, api_listener=True, watchdog=True
                 ),
                 training_ops.EngineState(
-                    host="h200b", gen_code="200", probes_ok=1, probes_total=1
+                    host="h200b", gen_code="200", probes_ok=1, probes_total=1,
+                    container=True, api_listener=True, watchdog=True
                 ),
             ],
         )
@@ -682,7 +684,8 @@ class AdapterUpdateTest(unittest.TestCase):
             orch_up=False,
             engines=[
                 training_ops.EngineState(
-                    host="h200a", gen_code="200", probes_ok=1, probes_total=1
+                    host="h200a", gen_code="200", probes_ok=1, probes_total=1,
+                    container=True, api_listener=True, watchdog=True
                 )
             ],
         )
@@ -702,10 +705,12 @@ class AdapterUpdateTest(unittest.TestCase):
             orch_up=False,
             engines=[
                 training_ops.EngineState(
-                    host="h200a", gen_code="200", probes_ok=1, probes_total=1
+                    host="h200a", gen_code="200", probes_ok=1, probes_total=1,
+                    container=True, api_listener=True, watchdog=True
                 ),
                 training_ops.EngineState(
-                    host="h200b", gen_code="200", probes_ok=1, probes_total=1
+                    host="h200b", gen_code="200", probes_ok=1, probes_total=1,
+                    container=True, api_listener=True, watchdog=True
                 ),
             ],
         )
@@ -859,10 +864,12 @@ class AdapterUpdateTest(unittest.TestCase):
             orch_up=True,
             engines=[
                 training_ops.EngineState(
-                    host="h200a", gen_code="200", probes_ok=1, probes_total=1
+                    host="h200a", gen_code="200", probes_ok=1, probes_total=1,
+                    container=True, api_listener=True, watchdog=True
                 ),
                 training_ops.EngineState(
-                    host="h200b", gen_code="200", probes_ok=1, probes_total=1
+                    host="h200b", gen_code="200", probes_ok=1, probes_total=1,
+                    container=True, api_listener=True, watchdog=True
                 ),
             ],
         )
