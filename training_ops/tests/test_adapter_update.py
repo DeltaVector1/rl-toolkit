@@ -78,13 +78,13 @@ class AdapterUpdateTest(unittest.TestCase):
         expected_source_ports = [
             str(port)
             for offset in range(2)
-            for port in range(18100 + offset, 18196, 2)
+            for port in range(18100 + offset, 18228, 2)
         ]
         for result in (a, b):
             source_ports = result.stdout.splitlines()[0].split(",")
             self.assertEqual(source_ports, expected_source_ports)
-            self.assertEqual(len(source_ports), 96)
-            self.assertEqual(len(set(source_ports)), 96)
+            self.assertEqual(len(source_ports), 128)
+            self.assertEqual(len(set(source_ports)), 128)
         a_extra = json.loads(a.stdout.splitlines()[-1])
         b_extra = json.loads(b.stdout.splitlines()[-1])
         self.assertEqual(
@@ -104,7 +104,7 @@ class AdapterUpdateTest(unittest.TestCase):
         )
         self.assertNotIn("configs/general-agent/inference.toml", launcher)
         self.assertIn('@ "$inference_config"', launcher)
-        self.assertIn("-e PRIME_LORA_DOWNLOAD_STREAMS=48", launcher)
+        self.assertIn("-e PRIME_LORA_DOWNLOAD_STREAMS=128", launcher)
         self.assertLess(launcher.index("runtime_output=$(python3"), launcher.index("install -d"))
         self.assertLess(launcher.index("runtime_output=$(python3"), launcher.index("docker update"))
 
