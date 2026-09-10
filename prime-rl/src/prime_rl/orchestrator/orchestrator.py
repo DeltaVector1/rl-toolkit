@@ -1315,9 +1315,9 @@ class Orchestrator:
     async def on_version_pending(self, step: int) -> None:
         """``VersionObserver`` hook, fired at publish confirmation (pre-apply):
         ``policy.version`` already carries the new version, so wake a held ship."""
+        restarted = self.dispatcher.restarted_group_ids(step)
         if self.model_express is not None:
             await asyncio.to_thread(self.model_express.set_status, p2p_pb2.SOURCE_STATUS_READY)
-        restarted = self.dispatcher.restarted_group_ids(step)
         if restarted:
             discarded = self.train_sink.abandon_groups(restarted)
             get_logger().info(

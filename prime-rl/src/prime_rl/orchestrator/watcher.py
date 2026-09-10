@@ -406,10 +406,17 @@ class WeightWatcher:
                 require_delta=False,
                 origin_base_urls=self.inference.adapter_origin_base_urls,
             )
-            self.last_adapter_wire_stage_time = float(result.get("wire_stage_seconds", 0.0))
+            transfer_seconds = result.get("transfer_wall_seconds")
+            self.last_adapter_wire_stage_time = (
+                float(transfer_seconds)
+                if isinstance(transfer_seconds, (int, float)) and transfer_seconds >= 0
+                else -1.0
+            )
             origin_stage = format_time(float(result.get("origin_stage_seconds", 0.0)))
             peer_stage = format_time(float(result.get("peer_stage_seconds", 0.0)))
-            reconstruct_seconds = result.get("reconstruct_seconds")
+            reconstruct_seconds = result.get(
+                "reconstruction_wall_seconds", result.get("reconstruct_seconds")
+            )
             self.last_adapter_reconstruct_time = (
                 float(reconstruct_seconds) if reconstruct_seconds is not None else -1.0
             )
@@ -654,10 +661,15 @@ class WeightWatcher:
                         )
                     )
                     adapter_identity = stage_result["adapter_identity"]
-                    self.last_adapter_wire_stage_time = float(
-                        stage_result.get("wire_stage_seconds", time.perf_counter() - stage_started)
+                    transfer_seconds = stage_result.get("transfer_wall_seconds")
+                    self.last_adapter_wire_stage_time = (
+                        float(transfer_seconds)
+                        if isinstance(transfer_seconds, (int, float)) and transfer_seconds >= 0
+                        else -1.0
                     )
-                    reconstruct_seconds = stage_result.get("reconstruct_seconds")
+                    reconstruct_seconds = stage_result.get(
+                        "reconstruction_wall_seconds", stage_result.get("reconstruct_seconds")
+                    )
                     if reconstruct_seconds is not None:
                         self.last_adapter_reconstruct_time = float(reconstruct_seconds)
                     else:
@@ -677,9 +689,14 @@ class WeightWatcher:
                         if self.last_adapter_reconstruct_time >= 0
                         else "not reported by inference host"
                     )
+                    transfer = (
+                        format_time(self.last_adapter_wire_stage_time)
+                        if self.last_adapter_wire_stage_time >= 0
+                        else "not reported by inference host"
+                    )
                     get_logger().info(
-                        f"Adapter v{next_step} transfer: wire-stage "
-                        f"{format_time(self.last_adapter_wire_stage_time)}, "
+                        f"Adapter v{next_step} transfer: transfer "
+                        f"{transfer}, "
                         f"origin {origin_stage}, peer {peer_stage}, reconstruct {reconstruct}"
                     )
                     get_logger().info(
@@ -739,7 +756,7 @@ class WeightWatcher:
             if self.lora_name is not None:
                 self.last_adapter_load_time = self.last_update_weights_time
             self.update_count += 1
-            get_logger().debug(f"Updated weights to step {next_step} in {format_time(self.last_update_weights_time)}")
+            get_logger().info(f"Updated weights to step {next_step} in {format_time(self.last_update_weights_time)}")
             self.ckpt_step = next_step
             self.policy.version = next_step
             self.current_weights_path = weights_path

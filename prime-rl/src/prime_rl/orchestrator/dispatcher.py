@@ -326,14 +326,9 @@ class RolloutDispatcher:
         # Set this before any cancellation so fill_inflight cannot schedule a
         # task between the snapshot and the group reset.
         self.weight_update_pending = True
-        old_group_ids = {
-            gid
-            for gid, group in self.groups.items()
-            if group.kind == "train"
-            and self.train_envs.get(group.env_name).sampler.samples_from_live_policy
-        }
+        old_group_ids = self._live_policy_group_ids()
+        self.policy_restart_groups.setdefault(step, set()).update(old_group_ids)
         self.abandoned_group_ids.update(old_group_ids)
-        self.policy_restart_groups[step] = set(old_group_ids)
 
         tasks_to_cancel: list[asyncio.Task] = []
         cancelled_rollouts = 0
@@ -424,9 +419,24 @@ class RolloutDispatcher:
         """Return whether a queued episode belongs to an invalidated group."""
         return group_id in self.abandoned_group_ids
 
+    def _live_policy_group_ids(self) -> set[uuid.UUID]:
+        return {
+            gid
+            for gid, group in self.groups.items()
+            if group.kind == "train"
+            and self.train_envs.get(group.env_name).sampler.samples_from_live_policy
+        }
+
     def restarted_group_ids(self, step: int) -> set[uuid.UUID]:
-        """Old group ids invalidated while preparing policy ``step``."""
-        return set(self.policy_restart_groups.get(step, set()))
+        """All group ids invalidated while preparing policy ``step``."""
+        # The orchestrator calls this observer before awaiting the engine
+        # pause. Stop train admission synchronously so no new live-policy
+        # group can be created between the observer snapshot and the
+        # dispatcher's async transition callback.
+        self.weight_update_pending = True
+        ids = self.policy_restart_groups.setdefault(step, set())
+        ids.update(self._live_policy_group_ids())
+        return set(ids)
 
     async def on_new_version(self, step: int) -> None:
         """Allow scheduling after the pre-pause request drain and update."""

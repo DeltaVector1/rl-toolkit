@@ -1851,13 +1851,46 @@ def adapter_stage_status() -> dict[str, object]:
     return value
 
 
+def _stage_timing_fields(
+    started: float,
+    *,
+    transfer_started: float | None = None,
+    transfer_finished: float | None = None,
+    reconstruction_started: float | None = None,
+    reconstruction_finished: float | None = None,
+    reconstruction_worker_seconds: float = 0.0,
+    verification_started: float | None = None,
+    verification_finished: float | None = None,
+    cache_hit: bool = False,
+) -> dict[str, object]:
+    def elapsed(begin: float | None, end: float | None) -> float:
+        if begin is None or end is None:
+            return 0.0
+        return max(0.0, end - begin)
+
+    now = time.monotonic()
+    reconstruction_wall_seconds = elapsed(reconstruction_started, reconstruction_finished)
+    return {
+        "transfer_wall_seconds": round(elapsed(transfer_started, transfer_finished), 3),
+        "reconstruction_wall_seconds": round(reconstruction_wall_seconds, 3),
+        "reconstruct_seconds": round(reconstruction_wall_seconds, 3),
+        "reconstruction_worker_seconds": round(max(0.0, reconstruction_worker_seconds), 3),
+        "final_verification_wall_seconds": round(
+            elapsed(verification_started, verification_finished), 3
+        ),
+        "total_stage_wall_seconds": round(max(0.0, now - started), 3),
+        "cache_hit": cache_hit,
+    }
+
+
 def _adapter_reader_lock(path: Path) -> Path:
     return path.parent / f".{path.name}.readers.lock"
 
 
 @contextmanager
-def adapter_reader_lock(path: Path):
+def adapter_reader_lock(path: Path, *, deadline: float | None = None):
     """Hold a shared lease while vLLM reads an adapter from the cache."""
+    deadline = deadline or (time.monotonic() + _ADAPTER_CLEANUP_TIMEOUT_S)
     lock_path = _adapter_reader_lock(path)
     parent_fd = _open_directory_nofollow(
         lock_path.parent,
@@ -1874,7 +1907,16 @@ def adapter_reader_lock(path: Path):
             ),
             "a+",
         ) as lock:
-            fcntl.flock(lock, fcntl.LOCK_SH)
+            while True:
+                _check_deadline(deadline)
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("adapter reader lock acquisition exceeded its time limit")
+                    time.sleep(min(0.1, remaining))
             try:
                 yield path
             finally:
@@ -2064,8 +2106,10 @@ def _reuse_full_adapter_cache(
     *,
     cancel_event: threading.Event | None = None,
     committed_event: threading.Event | None = None,
+    deadline: float | None = None,
 ) -> bool:
     """Publish a new URL entry from one verified local full cache."""
+    deadline = deadline or (time.monotonic() + _ADAPTER_CLEANUP_TIMEOUT_S)
     if transport.get("mode") != "full":
         return False
     source_manifest = transport.get("source_manifest")
@@ -2089,7 +2133,7 @@ def _reuse_full_adapter_cache(
             continue
         if not stat.S_ISDIR(candidate_stat.st_mode):
             raise OSError(f"cached adapter path is not a directory: {candidate}")
-        with adapter_reader_lock(candidate):
+        with adapter_reader_lock(candidate, deadline=deadline):
             if not _full_cache_matches_manifest(candidate, files):
                 continue
             _check_cancelled(cancel_event)
@@ -2123,6 +2167,7 @@ def _reuse_full_adapter_cache(
                     source_manifest,
                     transport,
                     files,
+                    deadline=deadline,
                     cancel_event=cancel_event,
                 )
                 model_sha256 = files[_ADAPTER_FILES[1]]["sha256"]
@@ -2141,7 +2186,7 @@ def _reuse_full_adapter_cache(
                         ),
                         "a+",
                     ) as reader_lock:
-                        _acquire_stage_lock(reader_lock, None, cancel_event)
+                        _acquire_stage_lock(reader_lock, deadline, cancel_event)
                         if _path_stat(destination, "adapter destination") is not None:
                             retired = destination.with_name(
                                 f"{destination.name}.retired-{time.time_ns()}-{os.getpid()}"
@@ -2235,9 +2280,10 @@ def _download_range(
             if entry_stat is None or entry_stat.st_size != size:
                 raise OSError(f"incomplete adapter range: {destination.name}")
             return
-        except TimeoutError:
-            raise
         except OSError:
+            # socket.timeout is retryable; only the absolute stage deadline
+            # remains terminal.
+            _check_deadline(deadline, cancel_event)
             if attempt + 1 == _ADAPTER_LANE_RETRIES:
                 raise
             sleep_for = min(2**attempt, 10)
@@ -2473,6 +2519,37 @@ def _preallocate(path: Path, size: int) -> None:
         os.close(parent_fd)
 
 
+def _allocated_bytes(path: Path, label: str) -> int:
+    entry_stat = _path_stat(path, label)
+    if entry_stat is None:
+        return 0
+    blocks = getattr(entry_stat, "st_blocks", None)
+    if blocks is None:
+        return entry_stat.st_size
+    return max(0, int(blocks)) * 512
+
+
+def _preflight_adapter_space(
+    root: Path,
+    allocations: list[tuple[Path, int]],
+) -> None:
+    """Check only bytes this stage must allocate; cached bases need no reserve."""
+    required = 0
+    for path, size in allocations:
+        if type(size) is not int or size < 0:
+            raise OSError(f"adapter allocation size is invalid: {path}")
+        required += max(0, size - _allocated_bytes(path, "adapter staging file"))
+    try:
+        available = shutil.disk_usage(root).free
+    except OSError as exc:
+        raise OSError(f"adapter staging free-space check failed: {root}") from exc
+    if available < required:
+        raise OSError(
+            f"insufficient adapter staging space: need {required} bytes, "
+            f"have {available} bytes free"
+        )
+
+
 def _pwrite_all(file_descriptor: int, value: bytes, offset: int) -> None:
     written = 0
     while written < len(value):
@@ -2600,11 +2677,33 @@ def _stage_chunked_linear_adapter(
             progress_bytes += int(item["wire_size"])
     reconstruct_lock = threading.Lock()
     reconstruct_semaphore = threading.BoundedSemaphore(_PREDICTIVE_RECONSTRUCT_WORKERS)
-    reconstruct_seconds = 0.0
+    reconstruct_worker_seconds = 0.0
+    reconstruction_started = None
+    reconstruction_finished = None
+    transfer_started = None
+    transfer_finished = None
+    verification_started = None
+    verification_finished = None
     last_status = 0.0
 
     def write_stage_status(value: dict[str, object]) -> None:
-        _write_stage_status(destination.parent, {**value, **(status_metadata or {})})
+        _write_stage_status(
+            destination.parent,
+            {
+                **value,
+                **_stage_timing_fields(
+                    started,
+                    transfer_started=transfer_started,
+                    transfer_finished=transfer_finished,
+                    reconstruction_started=reconstruction_started,
+                    reconstruction_finished=reconstruction_finished,
+                    reconstruction_worker_seconds=reconstruct_worker_seconds,
+                    verification_started=verification_started,
+                    verification_finished=verification_finished,
+                ),
+                **(status_metadata or {}),
+            },
+        )
 
     def report(lane: int, amount: int) -> None:
         nonlocal progress_bytes, last_status
@@ -2615,8 +2714,6 @@ def _stage_chunked_linear_adapter(
             if now - last_status < _ADAPTER_STATUS_INTERVAL_S and progress_bytes < total_wire_bytes:
                 return
             last_status = now
-            with reconstruct_lock:
-                reconstructed_time = reconstruct_seconds
             write_stage_status(
                 {
                     "status": "staging",
@@ -2626,7 +2723,6 @@ def _stage_chunked_linear_adapter(
                     "bytes_done": progress_bytes,
                     "bytes_total": total_wire_bytes,
                     "lane": lane,
-                    "reconstruct_seconds": round(reconstructed_time, 3),
                     "updated_at": time.time(),
                     "elapsed_seconds": round(now - started, 3),
                 },
@@ -2640,23 +2736,60 @@ def _stage_chunked_linear_adapter(
             "transport": _ADAPTER_LINEAR_TRANSPORT,
             "bytes_done": progress_bytes,
             "bytes_total": total_wire_bytes,
-            "reconstruct_seconds": 0.0,
             "updated_at": time.time(),
             "elapsed_seconds": 0.0,
         },
     )
     lane_urls = _adapter_source_urls(source_url)
     output_path = temporary / _ADAPTER_FILES[1]
+    config_path = temporary / _ADAPTER_FILES[0]
+    config_incoming_path = config_path.with_name(f".{config_path.name}.incoming")
     _reject_symlink_path(output_path, "adapter output")
+    _reject_symlink_path(config_path, "adapter configuration file")
+    _reject_symlink_path(config_incoming_path, "adapter configuration incoming file")
+    chunk_allocations: list[tuple[Path, int]] = []
+    for item in chunks:
+        chunk_path = chunk_root / Path(str(item["file"])).name
+        incoming_path = chunk_path.with_name(f".{chunk_path.name}.incoming")
+        _reject_symlink_path(chunk_path, "adapter transport chunk")
+        _reject_symlink_path(incoming_path, "adapter chunk incoming file")
+        wire_size = int(item["wire_size"])
+        reusable = False
+        for proof_path, completed in (
+            (_proof_path(chunk_path, _COMPLETED_SUFFIX), True),
+            (_proof_path(chunk_path, _WIRE_READY_SUFFIX), False),
+        ):
+            proof_valid, _ = _proof_identity_matches(
+                proof_path, item, completed=completed
+            )
+            if not proof_valid:
+                continue
+            try:
+                reusable = (
+                    _path_regular_size(chunk_path, "adapter transport chunk") == wire_size
+                    and _sha256(chunk_path, deadline, cancel_event)
+                    == str(item["wire_sha256"])
+                )
+            except (FileNotFoundError, OSError):
+                reusable = False
+            if reusable:
+                break
+        if not reusable:
+            # The old final wire file remains until incoming is atomically
+            # renamed over it, so reserve the incoming allocation as peak use.
+            chunk_allocations.append((incoming_path, wire_size))
+    _preflight_adapter_space(
+        temporary,
+        [(output_path, target_size), (config_incoming_path, config_size)]
+        + chunk_allocations,
+    )
     if _path_regular_size(output_path, "adapter output") != target_size:
         _preallocate(output_path, target_size)
 
     # Publish configuration atomically before the relay index. The peer must
     # never observe a relay index that points at an unfinished config file.
-    config_path = temporary / _ADAPTER_FILES[0]
-    config_incoming_path = config_path.with_name(f".{config_path.name}.incoming")
-    _reject_symlink_path(config_path, "adapter configuration file")
-    _reject_symlink_path(config_incoming_path, "adapter configuration incoming file")
+    with reconstruct_lock:
+        transfer_started = time.monotonic()
     download(
         f"{source_url.rstrip('/')}/{_ADAPTER_FILES[0]}",
         config_incoming_path,
@@ -2667,6 +2800,8 @@ def _stage_chunked_linear_adapter(
         cancel_event=cancel_event,
         retry_http_statuses={404, 503},
     )
+    with reconstruct_lock:
+        transfer_finished = time.monotonic()
     _reject_symlink_path(config_path, "adapter configuration file")
     _replace_paths(config_incoming_path, config_path, "adapter configuration")
 
@@ -2695,7 +2830,8 @@ def _stage_chunked_linear_adapter(
     _write_marker(temporary / _RELAYING_MARKER, "relaying\n")
 
     def fetch(index: int, item: dict[str, object]) -> None:
-        nonlocal reconstruct_seconds
+        nonlocal reconstruct_worker_seconds, reconstruction_started, reconstruction_finished
+        nonlocal transfer_started, transfer_finished
         _check_cancelled(cancel_event)
         name = item["file"]
         if not isinstance(name, str):
@@ -2716,9 +2852,18 @@ def _stage_chunked_linear_adapter(
             completed_path, item, completed=True
         )
         if completed_valid:
-            # The final file checksum validates all resumed regions together.
-            _discard_proof(wire_ready_path)
-            return
+            try:
+                completed_valid = (
+                    _path_regular_size(chunk_path, "adapter transport chunk") == wire_size
+                    and _sha256(chunk_path, deadline, cancel_event) == wire_sha256
+                )
+            except (FileNotFoundError, OSError):
+                completed_valid = False
+            if completed_valid:
+                # The final file checksum validates all resumed regions together.
+                _discard_proof(wire_ready_path)
+                return
+            _discard_proof(completed_path)
         if _path_stat(completed_path, "adapter completed proof") is not None:
             _discard_proof(completed_path)
 
@@ -2750,6 +2895,10 @@ def _stage_chunked_linear_adapter(
             chunk_urls = [f"{lane_url.rstrip('/')}/{name}" for lane_url in lane_urls]
             chunk_urls = chunk_urls[chunk_lane:] + chunk_urls[:chunk_lane]
             incoming_path = chunk_path.with_name(f".{chunk_path.name}.incoming")
+            transfer_started_at = time.monotonic()
+            with reconstruct_lock:
+                if transfer_started is None or transfer_started_at < transfer_started:
+                    transfer_started = transfer_started_at
             download(
                 chunk_urls[0],
                 incoming_path,
@@ -2763,6 +2912,10 @@ def _stage_chunked_linear_adapter(
                 per_request_timeout_seconds=_configured_chunk_timeout(),
                 retry_http_statuses={404, 503},
             )
+            transfer_finished_at = time.monotonic()
+            with reconstruct_lock:
+                if transfer_finished is None or transfer_finished_at > transfer_finished:
+                    transfer_finished = transfer_finished_at
             _check_deadline(deadline, cancel_event)
             _reject_symlink_path(incoming_path, "adapter chunk incoming file")
             _replace_paths(incoming_path, chunk_path, "adapter transport chunk")
@@ -2787,7 +2940,10 @@ def _stage_chunked_linear_adapter(
                 },
             )
         with reconstruct_semaphore:
-            reconstruction_started = time.monotonic()
+            reconstruction_started_at = time.monotonic()
+            with reconstruct_lock:
+                if reconstruction_started is None or reconstruction_started_at < reconstruction_started:
+                    reconstruction_started = reconstruction_started_at
             try:
                 base_fd2 = _open_nofollow(base2_model, os.O_RDONLY)
                 base_fd1 = _open_nofollow(base1_model, os.O_RDONLY)
@@ -2818,8 +2974,11 @@ def _stage_chunked_linear_adapter(
                     os.close(base_fd1)
                 if "base_fd2" in locals():
                     os.close(base_fd2)
+            reconstruction_finished_at = time.monotonic()
             with reconstruct_lock:
-                reconstruct_seconds += time.monotonic() - reconstruction_started
+                reconstruct_worker_seconds += reconstruction_finished_at - reconstruction_started_at
+                if reconstruction_finished is None or reconstruction_finished_at > reconstruction_finished:
+                    reconstruction_finished = reconstruction_finished_at
         _check_deadline(deadline, cancel_event)
         _write_json(
             completed_path,
@@ -2849,13 +3008,12 @@ def _stage_chunked_linear_adapter(
         os.fsync(output_fd)
     finally:
         os.close(output_fd)
-    target_hash_started = time.monotonic()
+    verification_started = time.monotonic()
     try:
         if _sha256(output_path, deadline, cancel_event) != target_sha256:
             raise OSError("reconstructed version-two adapter checksum mismatch")
     finally:
-        with reconstruct_lock:
-            reconstruct_seconds += time.monotonic() - target_hash_started
+        verification_finished = time.monotonic()
     if _path_regular_size(output_path, "adapter output") != target_size:
         raise OSError("reconstructed version-two adapter size mismatch")
 
@@ -2907,8 +3065,6 @@ def _stage_chunked_linear_adapter(
             fcntl.flock(reader_lock, fcntl.LOCK_UN)
     _cleanup_retired_adapters(destination.parent, destination.name)
     _cleanup_previous_adapter_caches(destination.parent, destination)
-    with reconstruct_lock:
-        total_reconstruct_seconds = reconstruct_seconds
     write_stage_status(
         {
             "status": "ready",
@@ -2917,7 +3073,6 @@ def _stage_chunked_linear_adapter(
             "transport": _ADAPTER_LINEAR_TRANSPORT,
             "bytes_done": total_wire_bytes,
             "bytes_total": total_wire_bytes,
-            "reconstruct_seconds": round(total_reconstruct_seconds, 3),
             "updated_at": time.time(),
             "elapsed_seconds": round(time.monotonic() - started, 3),
         },
@@ -3099,6 +3254,14 @@ def _stage_chunked_xor_adapter(
         total_wire_bytes += config_size
     progress_lock = threading.Lock()
     progress_bytes = 0
+    timing_lock = threading.Lock()
+    transfer_started = None
+    transfer_finished = None
+    reconstruction_started = None
+    reconstruction_finished = None
+    reconstruction_worker_seconds = 0.0
+    verification_started = None
+    verification_finished = None
     for item in chunks:
         if not isinstance(item, dict) or not isinstance(item.get("file"), str):
             continue
@@ -3109,7 +3272,23 @@ def _stage_chunked_xor_adapter(
     last_status = 0.0
 
     def write_stage_status(value: dict[str, object]) -> None:
-        _write_stage_status(destination.parent, {**value, **(status_metadata or {})})
+        _write_stage_status(
+            destination.parent,
+            {
+                **value,
+                **_stage_timing_fields(
+                    started,
+                    transfer_started=transfer_started,
+                    transfer_finished=transfer_finished,
+                    reconstruction_started=reconstruction_started,
+                    reconstruction_finished=reconstruction_finished,
+                    reconstruction_worker_seconds=reconstruction_worker_seconds,
+                    verification_started=verification_started,
+                    verification_finished=verification_finished,
+                ),
+                **(status_metadata or {}),
+            },
+        )
 
     def report(lane: int, amount: int) -> None:
         nonlocal progress_bytes, last_status
@@ -3149,11 +3328,23 @@ def _stage_chunked_xor_adapter(
 
     lane_urls = _adapter_source_urls(source_url)
     output_path = temporary / _ADAPTER_FILES[1]
+    config_path = temporary / _ADAPTER_FILES[0]
     _reject_symlink_path(output_path, "adapter output")
+    _reject_symlink_path(config_path, "adapter configuration file")
+    allocations = [(output_path, target_size)] + [
+        (chunk_root / Path(str(item["file"])).name, int(item["wire_size"]))
+        for item in chunks
+    ]
+    if isinstance(config_size, int):
+        allocations.append((config_path, config_size))
+    _preflight_adapter_space(temporary, allocations)
     if _path_regular_size(output_path, "adapter output") != target_size:
         _preallocate(output_path, target_size)
 
     def fetch(index: int, item: dict[str, object]) -> None:
+        nonlocal transfer_started, transfer_finished
+        nonlocal reconstruction_started, reconstruction_finished
+        nonlocal reconstruction_worker_seconds
         _check_cancelled(cancel_event)
         name = item["file"]
         assert isinstance(name, str)
@@ -3197,6 +3388,10 @@ def _stage_chunked_xor_adapter(
 
         chunk_urls = [f"{lane_url.rstrip('/')}/{name}" for lane_url in lane_urls]
         chunk_urls = chunk_urls[chunk_lane:] + chunk_urls[:chunk_lane]
+        transfer_started_at = time.monotonic()
+        with timing_lock:
+            if transfer_started is None or transfer_started_at < transfer_started:
+                transfer_started = transfer_started_at
         download(
             chunk_urls[0],
             chunk_path,
@@ -3209,6 +3404,10 @@ def _stage_chunked_xor_adapter(
             cancel_event=cancel_event,
             per_request_timeout_seconds=_configured_chunk_timeout(),
         )
+        transfer_finished_at = time.monotonic()
+        with timing_lock:
+            if transfer_finished is None or transfer_finished_at > transfer_finished:
+                transfer_finished = transfer_finished_at
 
         _check_deadline(deadline, cancel_event)
         encoded = _read_bytes_nofollow(chunk_path)
@@ -3231,6 +3430,10 @@ def _stage_chunked_xor_adapter(
                 _unlink_path(chunk_path, "corrupt adapter transport chunk")
             raise OSError("adapter transport decoded chunk checksum mismatch")
         _check_cancelled(cancel_event)
+        reconstruction_started_at = time.monotonic()
+        with timing_lock:
+            if reconstruction_started is None or reconstruction_started_at < reconstruction_started:
+                reconstruction_started = reconstruction_started_at
         output_fd = _open_nofollow(output_path, os.O_RDWR)
         try:
             if full_zstd:
@@ -3251,6 +3454,11 @@ def _stage_chunked_xor_adapter(
             os.fsync(output_fd)
         finally:
             os.close(output_fd)
+        reconstruction_finished_at = time.monotonic()
+        with timing_lock:
+            reconstruction_worker_seconds += reconstruction_finished_at - reconstruction_started_at
+            if reconstruction_finished is None or reconstruction_finished_at > reconstruction_finished:
+                reconstruction_finished = reconstruction_finished_at
         _check_deadline(deadline, cancel_event)
         _write_json(
             completed_path,
@@ -3271,13 +3479,17 @@ def _stage_chunked_xor_adapter(
     _wait_for_futures(executor, futures, deadline, cancel_event)
 
     _reject_symlink_path(output_path, "adapter output")
+    verification_started = time.monotonic()
     if _sha256(output_path, deadline, cancel_event) != target_sha256:
         raise OSError("reconstructed adapter checksum mismatch")
     if _path_regular_size(output_path, "adapter output") != target_size:
         raise OSError("reconstructed adapter size mismatch")
+    verification_finished = time.monotonic()
 
-    config_path = temporary / _ADAPTER_FILES[0]
-    _reject_symlink_path(config_path, "adapter configuration file")
+    config_transfer_started = time.monotonic()
+    with timing_lock:
+        if transfer_started is None or config_transfer_started < transfer_started:
+            transfer_started = config_transfer_started
     download(
         f"{source_url.rstrip('/')}/{_ADAPTER_FILES[0]}",
         config_path,
@@ -3287,6 +3499,10 @@ def _stage_chunked_xor_adapter(
         deadline=deadline,
         cancel_event=cancel_event,
     )
+    config_transfer_finished = time.monotonic()
+    with timing_lock:
+        if transfer_finished is None or config_transfer_finished > transfer_finished:
+            transfer_finished = config_transfer_finished
     if _sha256(config_path, deadline, cancel_event) != config_sha256:
         raise OSError("adapter configuration checksum mismatch")
     source_transport_manifest = transport.get("source_manifest")
@@ -3785,31 +4001,51 @@ def stage_lora_adapter_files(
         if configured_delta_timeout is not None
         else None
     )
+    operation_deadline = delta_deadline or (started + default_delta_stage_timeout_s)
     # The cache is shared by all replicas on this host. One global writer is
     # intentional: per-URL writers caused old policies to queue behind one
     # another and made it possible to publish a stale policy after a newer one.
     host_lock_path = destination.parent / "adapter-staging.lock"
+    transfer_started = None
+    transfer_finished = None
+    verification_started = None
+    verification_finished = None
+    cache_hit = False
 
     def write_stage_status(value: dict[str, object]) -> None:
-        _write_stage_status(destination.parent, {**value, **status_metadata})
+        _write_stage_status(
+            destination.parent,
+            {
+                **value,
+                **_stage_timing_fields(
+                    started,
+                    transfer_started=transfer_started,
+                    transfer_finished=transfer_finished,
+                    verification_started=verification_started,
+                    verification_finished=verification_finished,
+                    cache_hit=cache_hit,
+                ),
+                **status_metadata,
+            },
+        )
 
     with os.fdopen(
         _open_nofollow(host_lock_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC),
         "w",
     ) as host_lock:
-        _acquire_stage_lock(host_lock, delta_deadline, cancel_event)
+        _acquire_stage_lock(host_lock, operation_deadline, cancel_event)
         transport: dict[str, object] | None = None
         try:
             if require_delta:
                 transport = _read_delta_manifest_with_visibility_wait(
                     source_url,
-                    deadline=delta_deadline,
+                    deadline=operation_deadline,
                     cancel_event=cancel_event,
                 )
             else:
                 transport = _read_chunked_xor_manifest(
                     source_url,
-                    deadline=delta_deadline,
+                    deadline=operation_deadline,
                     cancel_event=cancel_event,
                 )
             if require_delta:
@@ -3825,12 +4061,10 @@ def stage_lora_adapter_files(
                 and transport.get("mode") == "delta"
             ):
                 delta_deadline = time.monotonic() + _delta_stage_timeout_s()
+                operation_deadline = delta_deadline
             manifest = _source_manifest(
                 source_url,
-                deadline=delta_deadline
-                if require_delta
-                or (transport is not None and transport.get("mode") == "delta")
-                else None,
+                deadline=operation_deadline,
                 cancel_event=cancel_event,
             )
             files = manifest["files"]
@@ -3894,7 +4128,7 @@ def stage_lora_adapter_files(
                         ) is not None
                         and _sha256(
                             destination / _ADAPTER_FILES[1],
-                            delta_deadline,
+                            operation_deadline,
                             cancel_event,
                         )
                         == transport["target_sha256"]
@@ -3904,11 +4138,12 @@ def stage_lora_adapter_files(
                         ) is not None
                         and _sha256(
                             destination / _ADAPTER_FILES[0],
-                            delta_deadline,
+                            operation_deadline,
                             cancel_event,
                         )
                         == transport["config_sha256"]
                     ):
+                        cache_hit = True
                         write_stage_status(
                             {
                                 "status": "ready",
@@ -3927,13 +4162,13 @@ def stage_lora_adapter_files(
                             with _adapter_stage_publish_lock:
                                 committed_event.set()
                         return destination
-                _check_deadline(delta_deadline, cancel_event)
+                _check_deadline(operation_deadline, cancel_event)
                 if transport.get("transport") == _ADAPTER_LINEAR_TRANSPORT:
                     return _stage_chunked_linear_adapter(
                         source_url,
                         transport,
                         manifest,
-                        deadline=delta_deadline,
+                        deadline=operation_deadline,
                         cancel_event=cancel_event,
                         committed_event=committed_event,
                         status_metadata=status_metadata,
@@ -3943,7 +4178,7 @@ def stage_lora_adapter_files(
                         source_url,
                         transport,
                         manifest,
-                        deadline=delta_deadline,
+                        deadline=operation_deadline,
                         cancel_event=cancel_event,
                         committed_event=committed_event,
                         status_metadata=status_metadata,
@@ -3966,13 +4201,14 @@ def stage_lora_adapter_files(
                     and isinstance(transport, dict)
                     and _relay_manifest_matches(destination, source_url, transport)
                 ):
+                    cache_hit = True
                     write_stage_status(
                         {
                             "status": "ready",
                             "source_url": source_url,
                             "path": destination.as_posix(),
-                            "bytes_done": sum(int(item["size"]) for item in files.values()),
-                            "bytes_total": sum(int(item["size"]) for item in files.values()),
+                            "bytes_done": 0,
+                            "bytes_total": 0,
                             "updated_at": time.time(),
                             "elapsed_seconds": round(time.monotonic() - started, 3),
                         },
@@ -3993,7 +4229,7 @@ def stage_lora_adapter_files(
                     source_url,
                     transport,
                     manifest,
-                    deadline=delta_deadline,
+                    deadline=operation_deadline,
                     cancel_event=cancel_event,
                     committed_event=committed_event,
                     status_metadata=status_metadata,
@@ -4007,18 +4243,20 @@ def stage_lora_adapter_files(
                     transport,
                     cancel_event=cancel_event,
                     committed_event=committed_event,
+                    deadline=operation_deadline,
                 ):
                     total_bytes = sum(int(item["size"]) for item in files.values())
                     _cleanup_retired_adapters(destination.parent, destination.name)
                     _cleanup_previous_adapter_caches(destination.parent, destination)
+                    cache_hit = True
                     write_stage_status(
                         {
                             "status": "ready",
                             "source_url": source_url,
                             "path": destination.as_posix(),
                             "transport": "full",
-                            "bytes_done": total_bytes,
-                            "bytes_total": total_bytes,
+                            "bytes_done": 0,
+                            "bytes_total": 0,
                             "reuse": "local-cache",
                             "updated_at": time.time(),
                             "elapsed_seconds": round(time.monotonic() - started, 3),
@@ -4073,6 +4311,7 @@ def stage_lora_adapter_files(
                 create=False,
                 label="adapter partial directory",
             )
+            transfer_started = time.monotonic()
             try:
                 for filename in _ADAPTER_FILES:
                     item = files[filename]
@@ -4087,6 +4326,7 @@ def stage_lora_adapter_files(
                         expected_sha256=expected_sha256 if isinstance(expected_sha256, str) else None,
                         progress=report,
                         cancel_event=cancel_event,
+                        deadline=operation_deadline,
                         stream_cap=full_download_streams,
                         parent_fd=temporary_fd,
                     )
@@ -4103,6 +4343,8 @@ def stage_lora_adapter_files(
                             progress_bytes += int(files[name]["size"])
             finally:
                 os.close(temporary_fd)
+            transfer_finished = time.monotonic()
+            verification_started = transfer_finished
             _write_json(temporary / "manifest.json", manifest)
             source_transport_manifest = transport.get("source_manifest") if isinstance(transport, dict) else None
             if not isinstance(source_transport_manifest, dict):
@@ -4113,6 +4355,7 @@ def stage_lora_adapter_files(
                 source_transport_manifest,
                 transport,
                 files,
+                deadline=operation_deadline,
                 cancel_event=cancel_event,
             )
             model_digest = files[_ADAPTER_FILES[1]].get("sha256")
@@ -4123,6 +4366,7 @@ def stage_lora_adapter_files(
                 f"{model_digest}\n",
                 encoding="ascii",
             )
+            verification_finished = time.monotonic()
             with _adapter_stage_publish_lock:
                 ready = temporary / "READY"
                 _check_cancelled(cancel_event)
@@ -4135,7 +4379,7 @@ def stage_lora_adapter_files(
                     _open_nofollow(_adapter_reader_lock(destination), os.O_RDWR | os.O_CREAT),
                     "a+",
                 ) as reader_lock:
-                    _acquire_stage_lock(reader_lock, None, cancel_event)
+                    _acquire_stage_lock(reader_lock, operation_deadline, cancel_event)
                     _check_cancelled(cancel_event)
                     if _path_stat(destination, "adapter destination") is not None:
                         retired = destination.with_name(
@@ -4164,12 +4408,35 @@ def stage_lora_adapter_files(
             if require_delta or (
                 isinstance(transport, dict) and transport.get("mode") in {"delta", "full"}
             ):
-                _cleanup_delta_stage_artifacts(
-                    destination,
-                    preserve_partial=_preserve_adapter_stage_partial(exc),
-                    deadline=time.monotonic() + _ADAPTER_CLEANUP_TIMEOUT_S,
-                    cancel_event=threading.Event(),
-                )
+                cleanup_failure: BaseException | None = None
+                try:
+                    cleaned = _cleanup_delta_stage_artifacts(
+                        destination,
+                        preserve_partial=_preserve_adapter_stage_partial(exc),
+                        deadline=time.monotonic() + _ADAPTER_CLEANUP_TIMEOUT_S,
+                        cancel_event=threading.Event(),
+                    )
+                    if not cleaned:
+                        cleanup_failure = OSError("adapter staging cleanup timed out")
+                except BaseException as cleanup_exc:
+                    cleanup_failure = cleanup_exc
+                if cleanup_failure is not None:
+                    write_stage_status(
+                        {
+                            "status": "failed",
+                            "source_url": source_url,
+                            "path": destination.as_posix(),
+                            "error": (
+                                f"{type(exc).__name__}: {exc}; cleanup failed: "
+                                f"{type(cleanup_failure).__name__}: {cleanup_failure}"
+                            ),
+                            "updated_at": time.time(),
+                            "elapsed_seconds": round(time.monotonic() - started, 3),
+                        },
+                    )
+                    raise OSError(
+                        f"adapter staging cleanup failed: {cleanup_failure}"
+                    ) from exc
             write_stage_status(
                 {
                     "status": "failed",

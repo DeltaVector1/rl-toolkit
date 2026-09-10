@@ -117,7 +117,12 @@ def _inference_config(host: str) -> dict:
     return settings
 
 
-def _config_dir(config_dir: str = default_config_dir, *, require_orchestrator: bool = False) -> dict:
+def _config_dir(
+    config_dir: str = default_config_dir,
+    *,
+    require_orchestrator: bool = False,
+    require_inference: bool = False,
+) -> dict:
     """Resolve one explicit run directory without a profile registry."""
     if not isinstance(config_dir, str) or not config_dir:
         raise Refused("run config directory must be a non-empty path")
@@ -133,11 +138,23 @@ def _config_dir(config_dir: str = default_config_dir, *, require_orchestrator: b
     if not (repo_root / trainer).is_file():
         raise Refused(f"run config directory has no trainer.toml: {config_dir}")
     selected = {"kind": "glm52", "trainer": trainer.as_posix()}
+    inference = path / "inference.toml"
+    if (repo_root / inference).is_file():
+        selected["inference"] = inference.as_posix()
+    elif require_inference:
+        raise Refused(f"run config directory has no inference.toml: {config_dir}")
     if (repo_root / orchestrator).is_file():
         selected["orchestrator"] = orchestrator.as_posix()
     elif require_orchestrator:
         raise Refused(f"run config directory has no orchestrator.toml: {config_dir}")
     return selected
+
+
+def _selected_inference_config(selected: dict) -> str:
+    inference = selected.get("inference")
+    if not isinstance(inference, str) or not (repo_root / inference).is_file():
+        raise Refused("selected run config directory has no inference.toml")
+    return inference
 
 
 def _config_for_run(
@@ -177,6 +194,27 @@ def _config_for_run(
         names = ", ".join(item["trainer"] for item in matches)
         raise Refused(f"multiple run config directories match {run!r}: {names}")
     return matches[0]
+
+
+def _active_policy_probe_config(run: str) -> tuple[str, str] | None:
+    """Return the durable receiver-ACK directory and configured LoRA name."""
+    profile = _config_for_run(run, required=False)
+    if profile is None or not isinstance(profile.get("orchestrator"), str):
+        return None
+    path = repo_root / profile["orchestrator"]
+    try:
+        with path.open("rb") as stream:
+            config = tomllib.load(stream)
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise RuntimeError(f"cannot read orchestrator config {path}: {error}") from error
+    output_dir = config.get("output_dir")
+    lora = config.get("model", {}).get("lora", {})
+    lora_name = lora.get("name") if isinstance(lora, dict) else None
+    if not isinstance(output_dir, str) or not output_dir.startswith("/"):
+        raise RuntimeError(f"orchestrator config {path} has no absolute output_dir")
+    if not isinstance(lora_name, str) or not lora_name:
+        return None
+    return f"{output_dir.rstrip('/')}/broadcasts", lora_name
 
 ssh_command = [
     "ssh",
@@ -549,14 +587,14 @@ fi
 
 trainer_probe = r"""
 strip() { sed "s/\x1b\[[0-9;]*m//g"; }
-echo "TRAINER_UP $(sudo docker ps --filter name=__TRAINER__ --format up 2>/dev/null | head -1)"
+echo "TRAINER_UP $(sudo docker ps --filter name=^__TRAINER__$ --format up 2>/dev/null | head -1)"
 trainer_cfg=$(sudo docker inspect __TRAINER__ --format '{{range .Config.Cmd}}{{println .}}{{end}}' 2>/dev/null | grep -E '\.toml$' | tail -1)
 if [ -n "$trainer_cfg" ] && grep -q '^\[data\.fake\]' "$trainer_cfg" 2>/dev/null; then
   echo "MODE trainer-only"
 else
   echo "MODE rl"
 fi
-echo "ORCH_UP $(sudo docker ps --filter name=__ORCH__ --format up 2>/dev/null | head -1)"
+echo "ORCH_UP $(sudo docker ps --filter name=^__ORCH__$ --format up 2>/dev/null | head -1)"
 echo "TRAINER_STEPS $(sudo docker logs __TRAINER__ 2>&1 | strip | grep -ac 'SUCCESS Step')"
 echo "TRAINER_LAST $(sudo docker logs __TRAINER__ 2>&1 | strip | grep -a 'SUCCESS Step' | tail -1)"
 echo "TRAINER_CURRENT $(sudo docker logs --tail 1 __TRAINER__ 2>&1 | strip | tail -1)"
@@ -575,7 +613,7 @@ echo "ADAPTER $(curl -s -o /dev/null -m 10 -w '%{http_code}' http://127.0.0.1:__
 trainer_only_probe = r"""
 strip() { sed "s/\x1b\[[0-9;]*m//g"; }
 echo "MODE trainer-only"
-echo "TRAINER_UP $(sudo docker ps --filter name=__TRAINER__ --format up 2>/dev/null | head -1)"
+echo "TRAINER_UP $(sudo docker ps --filter name=^__TRAINER__$ --format up 2>/dev/null | head -1)"
 echo "TRAINER_STEPS $(sudo docker logs __TRAINER__ 2>&1 | strip | grep -ac 'SUCCESS Step')"
 echo "TRAINER_LAST $(sudo docker logs __TRAINER__ 2>&1 | strip | grep -a 'SUCCESS Step' | tail -1)"
 echo "TRAINER_CURRENT $(sudo docker logs --tail 1 __TRAINER__ 2>&1 | strip | tail -1)"
@@ -588,7 +626,7 @@ echo "TRAINER_LOGAGE $(sudo docker logs -t --tail 1 __TRAINER__ 2>&1 | tail -1 |
 
 orchestrator_probe = r"""
 strip() { sed "s/\\x1b\\[[0-9;]*m//g"; }
-echo "ORCH_UP $(sudo docker ps --filter name=__ORCH__ --format up 2>/dev/null | head -1)"
+echo "ORCH_UP $(sudo docker ps --filter name=^__ORCH__$ --format up 2>/dev/null | head -1)"
 last=$(sudo docker logs --tail 1 __ORCH__ 2>&1 | strip | tail -1)
 case "$last" in
   *'Failed to finish run'|*'No space left on device'*) echo "ORCH_FAILED 1" ;;
@@ -608,7 +646,7 @@ nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader,nounits
   | awk -F, '{m+=$1; u+=$2; n++} END{printf "GPU %d %d %d\n", m/n, u/n, n}'
 free -g | sed -n 2p | awk '{print "MEM " $7 " " $5}'
 df -BG --output=avail,pcent /data | tail -1 | awk '{gsub(/G|%/, ""); print "DISK " $1 " " $2}'
-echo "CT $(sudo docker ps --filter name=__TRAINER__ --format '{{.Status}}' 2>/dev/null | head -1)"
+echo "CT $(sudo docker ps --filter name=^__TRAINER__$ --format '{{.Status}}' 2>/dev/null | head -1)"
 """
 
 inference_probe = r"""
@@ -617,28 +655,79 @@ nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits \
 ok=0
 total=0
 longest=0
+policy_state=unknown
+policy_step=
+policy_slot=
+policy_target_sha256=
+policy_target_size=
+policy_config_sha256=
+policy_config_size=
+policy_marker=
+if [ -n "__POLICY_BROADCAST_DIR__" ] && [ -d "__POLICY_BROADCAST_DIR__" ]; then
+  policy_marker=$(find "__POLICY_BROADCAST_DIR__" -mindepth 2 -maxdepth 2 \
+    -type f -name receivers-ready.json -printf '%p\n' 2>/dev/null | sort -V | tail -1)
+fi
+if [ -n "$policy_marker" ]; then
+  policy_values=$(python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); print("\t".join(str(value.get(name, "")) for name in ("step","slot","target_sha256","target_size","config_sha256","config_size")))' "$policy_marker" 2>/dev/null || true)
+  read -r policy_step policy_slot policy_target_sha256 policy_target_size policy_config_sha256 policy_config_size <<<"$policy_values"
+  if [ -n "$policy_step" ] && [ -n "$policy_slot" ] && [ -n "$policy_target_sha256" ] \
+    && [ -n "$policy_target_size" ] && [ -n "$policy_config_sha256" ] && [ -n "$policy_config_size" ]; then
+    policy_state=ready
+  fi
+fi
 for port in __PORTS__; do
   total=$((total+1))
   started=$(date +%s%N)
-  code=$(curl -s -o /dev/null -m 25 -w '%{http_code}' -X POST "http://127.0.0.1:$port/v1/completions" \
-      -H 'Content-Type: application/json' \
-      -d '{"model":"__MODEL__","prompt":"hi","max_tokens":3}')
+  stage_json=$(curl -fsS -m 10 "http://127.0.0.1:$port/staging_status" 2>/dev/null || true)
+  stage_state=$(printf '%s' "$stage_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status", ""))' 2>/dev/null || true)
+  if [ "$stage_state" = staging ]; then
+    policy_state=staging
+    code=STAGING
+  elif [ "$policy_state" != ready ]; then
+    code=POLICY_UNKNOWN
+  else
+    active_model=$(printf '%s' "$stage_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); slot=sys.argv[1]; expected={"target_step":int(sys.argv[2]),"target_sha256":sys.argv[3],"target_size":int(sys.argv[4]),"config_sha256":sys.argv[5],"config_size":int(sys.argv[6])}; receipts=d.get("loaded_receipts", {}); receipt=receipts.get(slot) if isinstance(receipts, dict) else None; print(slot if isinstance(receipt, dict) and all(receipt.get(k)==v for k,v in expected.items()) else "")' "$policy_slot" "$policy_step" "$policy_target_sha256" "$policy_target_size" "$policy_config_sha256" "$policy_config_size" 2>/dev/null || true)
+    if [ -z "$active_model" ]; then
+      code=POLICY_MISMATCH
+    else
+      code=$(curl -s -o /dev/null -m 25 -w '%{http_code}' -X POST "http://127.0.0.1:$port/v1/completions" \
+          -H 'Content-Type: application/json' \
+          -d "{\"model\":\"$active_model\",\"prompt\":\"hi\",\"max_tokens\":3}")
+    fi
+  fi
+  if [ "$code" = 200 ]; then
+    :
+  elif [ "$code" = STAGING ]; then
+    policy_state=staging
+  elif [ "$policy_state" = ready ]; then
+    policy_state=mismatch
+  fi
+  if [ "$code" = 200 ]; then
+    ok=$((ok+1))
+  fi
   ended=$(date +%s%N)
   elapsed=$(( (ended-started)/1000000 ))
   [ "$elapsed" -gt "$longest" ] && longest=$elapsed
-  [ "$code" = 200 ] && ok=$((ok+1))
 done
 [ "$total" -gt 0 ] || exit 3
-[ "$ok" -eq "$total" ] && code=200 || code=000
+[ "$policy_state" = staging ] && code=STAGING
+[ "$policy_state" = ready ] && [ "$ok" -eq "$total" ] && code=200
+[ "$code" = "" ] && code=000
 echo "GEN $code $longest"
 echo "PROBES $ok $total"
+echo "POLICY $policy_state ${policy_step:-unknown}"
 echo "RUNNING $(sudo docker logs --since 60s __ENGINE__ 2>&1 | grep -aoE 'Running: [0-9]+' | grep -oE '[0-9]+' | awk 'BEGIN{m=0} {if ($1>m)m=$1} END{print m}')"
 echo "TPUT $(sudo docker logs --since 60s __ENGINE__ 2>&1 | grep -aoE 'generation throughput: [0-9.]+' | grep -oE '[0-9.]+' | awk 'BEGIN{m=0} {if ($1>m)m=$1} END{print m}')"
 echo "WD $(pgrep -f 'bash .*[e]ngine_watchdog.sh' | wc -l)"
 """
 
 
-def _inference_script(host: str, model: str, container: str) -> str:
+def _inference_script(
+    host: str,
+    model: str,
+    container: str,
+    policy_broadcast_dir: str = "",
+) -> str:
     settings = _inference_config(host)
     gpu_count = settings.get("gpu_count")
     if not isinstance(gpu_count, int) or gpu_count < 1:
@@ -664,6 +753,7 @@ def _inference_script(host: str, model: str, container: str) -> str:
         inference_probe.replace("__MODEL__", model)
         .replace("__ENGINE__", container)
         .replace("__PORTS__", " ".join(map(str, ports)))
+        .replace("__POLICY_BROADCAST_DIR__", policy_broadcast_dir)
     )
 
 
@@ -725,11 +815,13 @@ class EngineState:
     running: int = 0
     throughput: float = 0.0
     watchdog: bool = False
+    policy_state: str = "ready"
+    policy_step: int | None = None
     reachable: bool = True
 
     @property
     def healthy(self) -> bool:
-        return self.gen_code == "200"
+        return self.gen_code == "200" and self.policy_state == "ready"
 
 
 @dataclass
@@ -957,6 +1049,8 @@ class Status:
                 L.append(
                     f"{e.host:<6} probes={e.probes_ok}/{e.probes_total} in {e.gen_ms:>6d} ms  {e.gpu_util:3d}% util  "
                     f"running={e.running:<4d} {e.throughput:8.1f} tok/s  "
+                    f"policy={e.policy_state}"
+                    f"{f' v{e.policy_step}' if e.policy_step is not None else ''}  "
                     f"watchdog={'yes' if e.watchdog else 'no'}"
                 )
         for w in self.warnings:
@@ -1759,6 +1853,8 @@ def status(run: str = "", quiet: bool = False) -> Status:
         when=_dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), run=run
     )
     trainer_only = _trainer_mode() == "trainer-only"
+    policy_probe = None if trainer_only else _active_policy_probe_config(run)
+    policy_broadcast_dir = policy_probe[0] if policy_probe is not None else ""
 
     def node(h):
         return _ssh(h, node_probe.replace("__TRAINER__", trainer_container), timeout=60)
@@ -1766,7 +1862,9 @@ def status(run: str = "", quiet: bool = False) -> Status:
     def engine(h):
         return _ssh(
             h,
-            _inference_script(h, glm_model, glm_inference_container),
+            _inference_script(
+                h, glm_model, glm_inference_container, policy_broadcast_dir
+            ),
             timeout=90,
         )
 
@@ -1887,6 +1985,10 @@ def status(run: str = "", quiet: bool = False) -> Status:
                 e.throughput = float(p[1])
             elif p[:1] == ["WD"] and len(p) >= 2:
                 e.watchdog = int(p[1]) > 0
+            elif p[:1] == ["POLICY"] and len(p) >= 2:
+                e.policy_state = p[1]
+                if len(p) >= 3 and p[2].isdigit():
+                    e.policy_step = int(p[2])
         s.engines.append(e)
 
     s.warnings = _warnings(s)
@@ -1940,7 +2042,11 @@ def _warnings(s: Status) -> list[str]:
                 "before inference; lower max_inflight_rollouts, which is independent of batch_size."
             )
     for e in (() if trainer_only else s.engines):
-        if e.reachable and not e.healthy:
+        if e.reachable and e.policy_state == "staging":
+            w.append(
+                f"{e.host} is staging the active policy adapter; completion health is pending"
+            )
+        elif e.reachable and not e.healthy:
             if e.watchdog:
                 w.append(
                     f"{e.host} failed a real completion probe (code {e.gen_code}), but its watchdog is active. "
@@ -2016,11 +2122,17 @@ def current_run() -> str:
 def engines(run: str = "") -> dict[str, EngineState]:
     """Probe every configured inference host with a real completion."""
     run = run or current_run()
+    policy_probe = _active_policy_probe_config(run)
+    policy_broadcast_dir = policy_probe[0] if policy_probe is not None else ""
     states = []
     for host, (rc, out) in _fan(
         inference_hosts,
         lambda h: _ssh(
-            h, _inference_script(h, glm_model, glm_inference_container), timeout=90
+            h,
+            _inference_script(
+                h, glm_model, glm_inference_container, policy_broadcast_dir
+            ),
+            timeout=90,
         ),
     ).items():
         e = EngineState(host=host, reachable=(rc == 0))
@@ -2038,11 +2150,16 @@ def engines(run: str = "") -> dict[str, EngineState]:
                 e.throughput = float(p[1])
             elif p[:1] == ["WD"] and len(p) >= 2:
                 e.watchdog = int(p[1]) > 0
+            elif p[:1] == ["POLICY"] and len(p) >= 2:
+                e.policy_state = p[1]
+                if len(p) >= 3 and p[2].isdigit():
+                    e.policy_step = int(p[2])
         states.append(e)
     for e in states:
         print(
             f"{e.host}: {e.probes_ok}/{e.probes_total} probes in {e.gen_ms} ms, "
-            f"running={e.running}, {e.throughput} tok/s"
+            f"running={e.running}, {e.throughput} tok/s, policy={e.policy_state}"
+            f"{f' v{e.policy_step}' if e.policy_step is not None else ''}"
         )
     return {e.host: e for e in states}
 
@@ -4298,6 +4415,7 @@ def _engine_watchdog_identity_script(
     startup_grace: int,
     *,
     ensure_running: bool,
+    inference_config: str | None = None,
 ) -> str:
     """Stop stale watchdogs for one configured engine identity."""
     values = {
@@ -4353,6 +4471,14 @@ def _engine_watchdog_identity_script(
             f"  printf '%s\\n' \"$environment\" | grep -Fxq {shlex.quote(f'START={start_script}')} || return 1",
             f"  printf '%s\\n' \"$environment\" | grep -Fxq {shlex.quote(f'MODEL={model}')} || return 1",
             f"  printf '%s\\n' \"$environment\" | grep -Fxq {shlex.quote(f'STARTUP_GRACE={startup_grace}')} || return 1",
+        ]
+    )
+    if inference_config is not None:
+        lines.append(
+            f"  printf '%s\\n' \"$environment\" | grep -Fxq {shlex.quote(f'inference_config={inference_config}')} || return 1"
+        )
+    lines.extend(
+        [
             "  return 0",
             "}",
             "stop_watchdog() {",
@@ -4402,6 +4528,8 @@ def _engine_watchdog_identity_script(
             "MODEL": model,
             "START": start_script,
         }
+        if inference_config is not None:
+            canonical_environment["inference_config"] = inference_config
         environment = " ".join(
             f"{key}={shlex.quote(value)}"
             for key, value in canonical_environment.items()
@@ -4436,6 +4564,8 @@ def _repair_engine(host: str) -> str:
     _check_host(host)
     if host not in inference_hosts:
         raise Refused(f"{host} is not an engine host. Use one of {inference_hosts}.")
+    selected = _config_for_run(current_run())
+    inference_config = f"{remote_repo}/{_selected_inference_config(selected)}"
     engine_container = glm_inference_container
     engine_model = glm_model
     start_script = f"{runtime_root}/h200/start_inference.sh"
@@ -4454,6 +4584,7 @@ def _repair_engine(host: str) -> str:
             engine_model,
             startup_grace,
             ensure_running=False,
+            inference_config=inference_config,
         ),
     )
     if stop_code:
@@ -4461,7 +4592,8 @@ def _repair_engine(host: str) -> str:
     rc, out = _ssh(
         host,
         f"sudo docker rm -f {engine_container} >/dev/null 2>&1; "
-        f"nohup setsid env ENGINE_HOST={shlex.quote(host)} bash {start_script} "
+        f"nohup setsid env ENGINE_HOST={shlex.quote(host)} "
+        f"inference_config={shlex.quote(inference_config)} bash {start_script} "
         ">/root/start_inference.log 2>&1 </dev/null & "
         "sleep 3; echo issued",
         timeout=180,
@@ -4478,6 +4610,7 @@ def _repair_engine(host: str) -> str:
             engine_model,
             startup_grace,
             ensure_running=True,
+            inference_config=inference_config,
         ),
     )
     if watchdog_code:
@@ -4514,6 +4647,8 @@ def _engine_watchdog_repair_script(watchdog_script: str, specs: list[dict]) -> s
     for index, spec in enumerate(specs):
         lines.append(f"  if [ \"${{watchdog_identity:-}}\" = {index!r} ]; then")
         for key, value in spec["environment"].items():
+            if key == "inference_config":
+                continue
             lines.append(
                 f"    printf '%s\\n' \"$environment\" | grep -Fxq {shlex.quote(f'{key}={value}')} || return 1"
             )
@@ -4544,7 +4679,7 @@ def _engine_watchdog_repair_script(watchdog_script: str, specs: list[dict]) -> s
             f"    if printf '%s\\n' \"$environment\" | grep -Fxq {shlex.quote('PORT=' + port)}; then"
         )
         for key, value in spec["environment"].items():
-            if key != "WATCHDOG_IDENTITY":
+            if key not in {"WATCHDOG_IDENTITY", "inference_config"}:
                 lines.append(
                     f"      printf '%s\\n' \"$environment\" | grep -Fxq {shlex.quote(f'{key}={value}')} || return 1"
                 )
@@ -4627,7 +4762,8 @@ def _repair_engine_watchdog(host: str) -> str:
     if host not in inference_hosts:
         raise Refused(f"{host} is not an engine host. Use one of {inference_hosts}.")
     run = current_run()
-    _config_for_run(run)
+    selected = _config_for_run(run)
+    inference_config = f"{remote_repo}/{_selected_inference_config(selected)}"
     settings = _inference_config(host)
     configured_ports = settings.get("ports")
     if not isinstance(configured_ports, list) or not configured_ports:
@@ -4646,6 +4782,7 @@ def _repair_engine_watchdog(host: str) -> str:
             "MODEL": model,
             "START": start_script,
             "ENGINE_CONTAINER": container,
+            "inference_config": inference_config,
             "PORT": str(port),
             "WATCHDOG_IDENTITY": f"engine-watchdog:{host}:{run}:{port}",
         }
@@ -4673,9 +4810,14 @@ def _repair_engine_watchdog(host: str) -> str:
 def _repair_supervisors(config_dir: str | None = None) -> str:
     out = []
     if config_dir is None:
-        _config_for_run(current_run())
+        selected = _config_for_run(current_run())
     else:
-        _config_dir(config_dir, require_orchestrator=True)
+        selected = _config_dir(
+            config_dir,
+            require_orchestrator=True,
+            require_inference=True,
+        )
+    inference_config = f"{remote_repo}/{_selected_inference_config(selected)}"
     for h in inference_hosts:
         start_script = f"{runtime_root}/h200/start_inference.sh"
         code, output = _ssh(
@@ -4688,6 +4830,7 @@ def _repair_supervisors(config_dir: str | None = None) -> str:
                 glm_model,
                 600,
                 ensure_running=True,
+                inference_config=inference_config,
             ),
         )
         if code:
@@ -4790,7 +4933,7 @@ def deploy(
             ]
         elif path.startswith(("environments/", "evals/")):
             nodes = [orchestrator_host]
-        elif path.startswith("training_ops/runtime/h200/") or path == "configs/general-agent/inference.toml":
+        elif path.startswith("training_ops/runtime/h200/") or path.endswith("/inference.toml"):
             nodes = inference_hosts
         elif path.startswith("training_ops/runtime/china/"):
             nodes = trainer_hosts
@@ -5461,7 +5604,7 @@ def _start_dependency_inventory(
 
     configured_hosts = list(dict.fromkeys([*trainer_hosts, *inference_hosts]))
     add("configs/nodes.toml", configured_hosts)
-    add("configs/general-agent/inference.toml", inference_hosts)
+    add(_selected_inference_config(selected), inference_hosts)
     for path in mounted_files():
         if not path.startswith("prime-rl/"):
             continue
@@ -6026,7 +6169,11 @@ def start(
     _runs_path, _run_parent, service_run_dir = _cold_run_paths(run)
     if (resume_adapter is None) != (resume_step is None):
         raise Refused("resume_adapter and resume_step must be set together")
-    selected = _config_dir(config_dir, require_orchestrator=True)
+    selected = _config_dir(
+        config_dir,
+        require_orchestrator=True,
+        require_inference=True,
+    )
     if resume_adapter is not None:
         if not resume_adapter.startswith(f"{run_root}/"):
             raise Refused(f"resume adapter must be below {run_root}")
